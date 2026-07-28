@@ -67,9 +67,22 @@ parâmetro de slug de modelo na API pública — é o que impede um módulo de
 
 Só erro TRANSITÓRIO retenta (`rate_limit`, `provider_5xx`, `network`).
 `authentication`, `permission`, `invalid_request`, `aborted`, `timeout`,
-`response_invalid` e `budget_exhausted` são terminais de primeira. `Retry-After`
-do provider vence o backoff local. Cancelamento nunca é tratado como erro
-retryable.
+`response_invalid`, `budget_exhausted` e `missing_tenant_context` são terminais
+de primeira. `Retry-After` do provider vence o backoff local. Cancelamento nunca
+é tratado como erro retryable. Quando o fallback falha, é o erro DELE que sobe —
+mascarar um 401 do fallback atrás do 5xx do primário esconde a causa e induz
+retry externo.
+
+**Invariantes que o gateway impõe** (todas com teste dedicado):
+
+| Invariante | Onde |
+|---|---|
+| Chamada sem `tenant_id + agent_id` no ALS é rejeitada (`missing_tenant_context`). Trabalho global usa `runWithSystemContext()`. | `gateway.ts` |
+| Quota é RESERVA atômica antes do I/O, liquidada com o custo real depois — não check-then-act | `budget.ts` |
+| Deadline absoluto é DERIVADO (`LLM_TURN_DEADLINE_MS`) quando o caller não declara; nunca reinicia a cada retry | `gateway.ts` |
+| Erro nunca carrega corpo/mensagem do provider — só `kind`, `status`, `request_id` | `errors.ts` |
+| 200 sem conteúdo utilizável é `response_invalid`, não sucesso | `providers/**` |
+| `workload` é obrigatório; não existe default | `types.ts` + gate em `tests/unit/lib/llm-workload-declaration.spec.ts` |
 
 **Como fixar provider/modelo ou desligar fallback num incidente:** troque o
 modelo pelo Admin (`/dashboard/llm-settings`) — a mudança propaga para todas as

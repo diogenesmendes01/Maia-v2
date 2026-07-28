@@ -74,6 +74,13 @@ Namespaces de terceiros (`CLAUDE_*`, `ANTHROPIC_*`, `POSTGRES_*`, `REDIS_*`, `SM
 - `src/runtime/decision/prod-env.ts`: o HaikuClientAdapter criava um `AbortController`, encadeava o sinal do caller nele e nunca o passava adiante — cancelar a classificação não cancelava a requisição HTTP.
 - Falha ao persistir o ledger de custo deixou de ser engolida (`.catch(() => undefined)`) e passou a emitir counter alertável.
 - A seleção de provider deixou de ser congelada no carregamento do módulo.
+- **Quota de LLM deixou de ser check-then-act** (review da PR #531): virou reserva atômica por `tenant_id + agent_id` antes de qualquer requisição ao provider, liquidada com o custo real depois. Antes, N chamadas simultâneas liam o mesmo gasto acumulado e passavam todas — a quota falhava exatamente no retry storm.
+- **Erro de provider não propaga mais o corpo da resposta.** Um `400` costuma ecoar o input (que é conversa de cliente); truncar em 200 caracteres preservava justamente o começo do eco. A mensagem passa a ser montada só com `kind`, `status` e `request_id`, e `cause` foi removido do erro para não vazar por serializador de log.
+- **Chamada sem contexto de tenant no ALS é rejeitada** (`missing_tenant_context`) em vez de executada sem quota. Trabalho genuinamente global declara `runWithSystemContext()`.
+- **Deadline absoluto passou a ser derivado** de `LLM_TURN_DEADLINE_MS` quando o caller não declara um: a mecânica existia mas o campo era opcional e ninguém o passava, então na prática o gateway rodava sem teto agregado.
+- **`response_invalid` deixou de ser letra morta**: um 200 sem conteúdo utilizável (ex.: `choices: []`) era registrado como `status="ok"` com resposta vazia.
+- **Escopo de tenant em todas as métricas tenant-aware** — antes só `maia_llm_requests_total` o carregava.
+- **`workload` é obrigatório** e o escape hatch `legacy` foi removido, com gate de CI provando que todo call site declara política.
 - **Allow-list de `process.env` encolhida** (#515): a migração dos call sites de LLM removeu as leituras diretas de `ANTHROPIC_API_KEY` em `src/cognition/{calendar-pattern-detector,capability-proposer}.ts`, `src/cognition/drift/**`, `src/cognition/role-selector/llm-suggester.ts` e `src/shared/risk/llm-gate.ts` — as cinco entradas saíram do orçamento de migração em `eslint.config.js` e do espelho em `tests/unit/config/no-direct-env-reads.spec.ts`. A chave passa a entrar pelo `config` tipado num único ponto (`src/lib/llm/providers/**`).
 
 ### Added — Plataforma de funcionários digitais (rodada 2026-06-10)

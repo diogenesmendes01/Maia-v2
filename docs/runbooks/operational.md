@@ -426,7 +426,33 @@ diretas ao SDK não eram contadas de forma alguma):
 | `maia_llm_scope_missing_total{workload}` | counter | > 0 = chamada sem tenant/agent no ALS (custo não atribuível) |
 | `maia_llm_cost_ledger_failures_total` | counter | > 0 = custo sendo perdido |
 | `maia_llm_budget_exhausted_total{tenant_id,agent_id,workload}` | counter | quota diária estourada |
-| `maia_llm_budget_check_failures_total{workload}` | counter | > 0 = quota degradou ABERTO (não está protegendo) |
+| `maia_llm_budget_check_failures_total{workload}` | counter | > 0 = Redis fora, quota degradou ABERTO (não está protegendo) |
+| `maia_llm_budget_settle_failures_total` | counter | > 0 = reserva não liquidada; contador fica conservador até o TTL |
+
+Salvo `maia_llm_scope_missing_total` e os counters de falha, todas as métricas
+acima carregam `tenant_id` + `agent_id` — inclusive duração, timeout,
+cancelamento, fallback, tokens e attempts. Antes só `requests_total` levava o
+escopo, e um tenant sozinho estourando latência ficava diluído na média de
+todos.
+
+**Como a quota funciona.** Não é uma checagem antes da chamada: é uma RESERVA
+atômica (`INCRBYFLOAT` num contador diário por `tenant+agent` no Redis) feita
+antes de qualquer I/O de provider, liquidada com o custo real depois da
+resposta. Checar-e-seguir deixava N chamadas concorrentes lerem o mesmo valor e
+passarem todas — falhava justamente no retry storm. O contador é semeado a
+partir do ledger na primeira escrita do dia (restart não zera a quota) e expira
+em 36h; a verdade contábil continua no Postgres.
+
+**Erros que o gateway recusa de primeira** (terminais, sem retry e sem
+fallback): `authentication`, `permission`, `invalid_request`,
+`budget_exhausted`, `response_invalid` (200 sem conteúdo utilizável — antes
+virava `status="ok"` com resposta vazia) e `missing_tenant_context` (chamada
+sem `tenant_id`/`agent_id` no ALS; trabalho global deve rodar sob
+`runWithSystemContext()`).
+
+**Mensagens de erro não carregam corpo do provider.** Só `kind`, `status` e
+`request_id`. Um `400` costuma ecoar o input, e o input é conversa de cliente —
+leve o `request_id` para o suporte do provider.
 
 `trace_id`, `pessoa_id`, conversa e mensagem **não** são labels (cardinalidade);
 aparecem só no log estruturado `llm_gateway.call`.
@@ -443,7 +469,15 @@ carregamento do módulo, e módulos de cognição não exigem mais
 
 **Cortar gasto:** `LLM_DAILY_BUDGET_USD` (por tenant+agent, USD/dia). `0`
 desliga. Estouro rejeita a chamada ANTES de qualquer requisição ao provider,
-com erro não retentável.
+com erro não retentável. Para zerar a quota de um tenant no meio do dia, apague
+a chave `maia:llm:budget:<AAAA-MM-DD>:["<tenant>","<agent>"]` no Redis — ela é
+recriada a partir do ledger na chamada seguinte.
+
+**Limitar a duração de uma chamada:** `LLM_TURN_DEADLINE_MS` (default 120000) é
+o orçamento wall-clock TOTAL de uma chamada quando o caller não declara um
+deadline — cobre todas as tentativas, backoff, fallback e parsing, e não
+reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
+excede o que resta do deadline.
 
 > Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
 >>>>>>> fc7afccd (refactor(llm): governança do gateway — orçamento, invalidação e runbook (#508))
