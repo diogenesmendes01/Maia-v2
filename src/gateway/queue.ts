@@ -118,6 +118,8 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             { job_id: job.id, mensagem_id: job.data.mensagem_id, ...correlationLogFields() },
             'agent.job.start',
           );
+          counter(METRIC.TURN_STARTED, { origin: attempt === 1 ? 'queue' : 'recovery' });
+          if (attempt > 1) counter(METRIC.TURN_RECOVERED, { queue: 'agent' });
           // Issue #369: the worker callstack runs the channel resolver + cross-tenant
           // adoption (`src/agent/core.ts`) BEFORE the real tenant tuple is known, so
           // the job payload carries no tenant/agent to open `runWithTenantContext`
@@ -135,7 +137,24 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // stores — tenant context is fail-CLOSED (missing ⇒ throw), correlation is
           // fail-SOFT (missing ⇒ null) — so nesting cannot make one inherit the
           // other's semantics.
-          await runWithSystemContext(() => processor(job));
+          //
+          // Issue #514 §5 — turn outcome + latency are measured HERE rather than
+          // inside `agent/core.ts` for two reasons: (a) this is the only place
+          // that sees both the success and the throw for every turn, including
+          // the ones that die before the core's own bookkeeping; (b) it keeps
+          // the instrumentation off the files #503 is rewriting.
+          const t0 = Date.now();
+          try {
+            await runWithSystemContext(() => processor(job));
+            recordTurnOutcome(job, 'completed', t0);
+          } catch (err) {
+            // A turn that throws with retries left is RETRYABLE, not failed —
+            // conflating the two would make the failure-rate SLI count every
+            // transient blip as a lost turn.
+            const exhausted = (job.attemptsMade ?? 0) + 1 >= (job.opts.attempts ?? 3);
+            recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0);
+            throw err;
+          }
         },
       );
     },
@@ -182,6 +201,28 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
     );
   });
   return worker;
+}
+
+/**
+ * Issue #514 §5 — record a turn's terminal outcome and its two latencies.
+ *
+ * `maia_turn_duration_ms` is the PROCESS time (what this worker spent).
+ * `maia_turn_e2e_latency_ms` is measured from the PERSISTED inbound timestamp
+ * carried on the payload — that is the number the SLO is written against
+ * ("Turn latency mede timestamps persistidos, não apenas duração do processo")
+ * and it survives a worker restart, a debounce reset and a recovery re-arm.
+ */
+function recordTurnOutcome(
+  job: Job<AgentJob>,
+  outcome: 'completed' | 'retryable' | 'failed',
+  startedAtMs: number,
+): void {
+  counter(METRIC.TURN_COMPLETED, { outcome, queue: 'agent' });
+  histogram(METRIC.TURN_DURATION_MS, Date.now() - startedAtMs, { outcome });
+  if (typeof job.data.received_at_ms === 'number') {
+    const e2e = Date.now() - job.data.received_at_ms;
+    if (e2e >= 0) histogram(METRIC.TURN_E2E_LATENCY_MS, e2e, { outcome });
+  }
 }
 
 /**

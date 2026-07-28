@@ -1227,7 +1227,13 @@ async function handleIncoming(
   // outer `handleIncoming` handler (real bug — surface it), again leaving the
   // row pending (we never reach the "processed" write).
   try {
-    await enqueueAgent({ mensagem_id: stored.id });
+    // Issue #514 §5 — carry the PERSISTED inbound timestamp so the E2E latency
+    // SLI is measured from when the message actually arrived, not from when a
+    // worker happened to pick it up.
+    await enqueueAgent({
+      mensagem_id: stored.id,
+      received_at_ms: stored.created_at?.getTime(),
+    });
   } catch (err) {
     if (err instanceof QueueRedisUnavailableError) {
       logger.warn(

@@ -16,6 +16,8 @@ import { isBaileysConnected } from '@/gateway/baileys.js';
 import { isDbConnected, probeDb } from '@/db/client.js';
 import { startRedisMemoryCollector } from '@/observability/redis-memory-collector.js';
 import { registerTurnStateGauges } from '@/observability/turn-state-collector.js';
+import { registerQueueGauges } from '@/observability/queue-metrics.js';
+import { agentQueue, unroutedQueue } from '@/gateway/queue.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
@@ -33,6 +35,17 @@ export async function buildServer() {
   // estados. Snapshot compartilhado com TTL — um scrape faz uma query, não uma
   // por série.
   registerTurnStateGauges();
+
+  // Issue #514 §5 (Fila) — queue depth per state + oldest waiting job age.
+  // Complements #503's turn-state gauges: those measure where turns are stuck
+  // in the STATE MACHINE, these measure the BullMQ backlog feeding it. A
+  // latency incident needs both to be attributable.
+  //
+  // Registered as scrape-time gauges so the numbers stay correct with multiple
+  // replicas: every replica reports the same shared Redis queue, and a
+  // `max by (queue, state)` in the recording rules collapses the duplicates.
+  registerQueueGauges(agentQueue, 'agent');
+  registerQueueGauges(unroutedQueue, 'unrouted-replay');
 
   // Sonda sintética (spec §1.6) — sinal PRIMÁRIO de outage, DURÁVEL (lido de
   // synthetic_probe_state.last_ok_at, não in-memory): segundos desde o último
