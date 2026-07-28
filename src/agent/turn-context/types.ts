@@ -89,6 +89,18 @@ export const SECTION_BUDGETS = {
 
 export type BudgetedSection = keyof typeof SECTION_BUDGETS;
 
+/**
+ * Item cap for the gap list inside the self-awareness ("## Autoconhecimento")
+ * section — the "Ainda não tem: …" clause.
+ *
+ * The `capabilities` budget has TWO contributing lists with different natural
+ * sizes: skill names (short identifiers) and capability descriptions (free-form
+ * sentences). They share one `max_bytes` ceiling — that is what makes the
+ * SECTION bounded rather than just one of its clauses — but each gets its own
+ * item cap, because "5 skills" and "3 gaps" are independent editorial choices.
+ */
+export const SELF_AWARENESS_GAP_MAX_ITEMS = 3;
+
 /** Roll-up published once per turn, and logged with the trace id. */
 export type TurnContextDiagnostics = {
   query_count: number;

@@ -33,7 +33,7 @@ import {
   type TurnContextResult,
   type TurnContextSection,
 } from './turn-context/metrics.js';
-import { SECTION_BUDGETS } from './turn-context/types.js';
+import { SECTION_BUDGETS, SELF_AWARENESS_GAP_MAX_ITEMS } from './turn-context/types.js';
 import {
   DOMAIN_KEYWORDS,
   type ToolExecutionSummary,
@@ -924,16 +924,48 @@ async function buildPromptUninstrumented(
       (a, b) =>
         Number(b.confidence) - Number(a.confidence) || a.skill_name.localeCompare(b.skill_name),
     );
-    const topSkills = applyBudget(
+    // Issue #511 round 2 review: the budget used to measure ONLY `skill_name`,
+    // while up to three `capability_description` values — the LONG, free-form,
+    // tenant-controlled field — rendered outside any ceiling. A budget that
+    // does not measure the big field is not a ceiling.
+    //
+    // Both lists now share the section's single `max_bytes`, applied in render
+    // order: skills first, then gaps against whatever is left. Sharing one
+    // allowance (rather than giving each its own) is what makes the SECTION
+    // bounded instead of just each clause. Each list keeps its own item cap,
+    // and both report under the `capabilities` label, so the counters describe
+    // the section as a whole.
+    const skillsBudgeted = applyBudget(
       'capabilities',
       sortedSkills,
       SECTION_BUDGETS.capabilities,
       (s) => utf8Bytes(s.skill_name),
       (s, maxBytes) => ({ ...s, skill_name: truncateUtf8(s.skill_name, maxBytes) }),
-    ).items;
+    );
+    const topSkills = skillsBudgeted.items;
     const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
     const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
-    const mentionableGaps = capabilities.mentionableGaps;
+
+    const gapsBudgeted = applyBudget(
+      'capabilities',
+      capabilities.mentionableGaps,
+      {
+        max_items: SELF_AWARENESS_GAP_MAX_ITEMS,
+        max_bytes: Math.max(0, SECTION_BUDGETS.capabilities.max_bytes - skillsBudgeted.bytes),
+      },
+      (g) => utf8Bytes(g.capability_description),
+      (g, maxBytes) => ({
+        ...g,
+        capability_description: truncateUtf8(g.capability_description, maxBytes),
+      }),
+    );
+    // A pathological skill list can consume the whole allowance, clipping a gap
+    // description to nothing. Rendering "Ainda não tem: ." would be noise, so
+    // drop the emptied entries — the loss is already on
+    // `maia_turn_context_truncated_total`, so this is not a silent drop.
+    const mentionableGaps = gapsBudgeted.items.filter(
+      (g) => g.capability_description.length > 0,
+    );
 
     const lines = [
       masteredSkills.length
@@ -944,7 +976,6 @@ async function buildPromptUninstrumented(
         : '',
       mentionableGaps.length
         ? `Ainda não tem: ${mentionableGaps
-            .slice(0, 3)
             .map((g) => wrapGap(g.capability_description))
             .join(', ')}.`
         : '',

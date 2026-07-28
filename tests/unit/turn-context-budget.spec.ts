@@ -179,6 +179,12 @@ describe('#511 section budgets', () => {
    * Round-1 review, P1: `history` and `entity_states` declared budgets that
    * nothing enforced. A declared-but-unenforced budget is worse than no budget
    * — it reads like a guarantee. Every declared section must be wired.
+   *
+   * NOTE: this is the WEAK guard. It only proves a section name reaches
+   * `applyBudget` somewhere — it passed in round 1 while `capabilities`
+   * measured `skill_name` and let `capability_description` through unbounded.
+   * The real guard is `turn-context-section-bounds.spec.ts`, which renders a
+   * prompt from pathological inputs and asserts each section's actual size.
    */
   it('every declared budget is actually applied by the prompt builder', async () => {
     const src = await readFile(
