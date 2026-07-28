@@ -5,6 +5,13 @@ import { logger } from '@/lib/logger.js';
 import { recordLLMCost } from '@/lib/cost-ledger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { getCurrentMainModel, getCurrentFastModel } from '@/lib/llm-settings.js';
+// Issue #509 §3 — provider capability matrix + strict-mode adaptation of the
+// canonical tool schemas. Decided by the backend, never by the model.
+import {
+  supportsStrictToolSchemas,
+  toStrictJsonSchema,
+  recordStrictDowngrade,
+} from '@/lib/tool-schema-provider.js';
 
 export type LLMMessage = {
   role: 'user' | 'assistant';
@@ -178,12 +185,46 @@ export function toOpenAIMessages(system: string, messages: LLMMessage[]): OAIMes
   return out;
 }
 
-export function toOpenAITools(tools: ToolSchema[] | undefined): OAITool[] | undefined {
+/**
+ * Map canonical tool schemas (issue #509) onto the OpenAI function shape.
+ *
+ * When `model` is given AND the backend capability matrix says that model
+ * supports strict function calling, each schema is rewritten into the
+ * strict-mode subset and shipped with `strict: true`. A schema that cannot be
+ * expressed there (union root, dynamic map, untyped value) is sent AS IS
+ * without `strict` and the downgrade is counted — the model is then less
+ * constrained while generating, but nothing about enforcement changes: Zod
+ * revalidates every call in `_dispatcher.ts` and every gate still runs.
+ *
+ * `model` is optional so existing callers keep the previous behaviour exactly.
+ */
+export function toOpenAITools(
+  tools: ToolSchema[] | undefined,
+  model?: string,
+): OAITool[] | undefined {
   if (!tools || tools.length === 0) return undefined;
-  return tools.map((t) => ({
-    type: 'function',
-    function: { name: t.name, description: t.description, parameters: t.input_schema },
-  }));
+  const strictCapable = supportsStrictToolSchemas('openrouter', model);
+  return tools.map((t) => {
+    const fn: { name: string; description: string; parameters: Record<string, unknown>; strict?: boolean } = {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    };
+    if (model !== undefined) {
+      if (!strictCapable) {
+        recordStrictDowngrade('openrouter', model, 'model_not_strict_capable');
+      } else {
+        const strict = toStrictJsonSchema(t.input_schema);
+        if (strict) {
+          fn.parameters = strict;
+          fn.strict = true;
+        } else {
+          recordStrictDowngrade('openrouter', model, 'schema_not_strict_convertible');
+        }
+      }
+    }
+    return { type: 'function', function: fn } as OAITool;
+  });
 }
 
 export function fromOpenAIResponse(res: OpenAI.Chat.Completions.ChatCompletion): LLMResponse {
@@ -254,7 +295,9 @@ class OpenRouterProvider implements LLMProvider {
       {
         model,
         messages: toOpenAIMessages(params.system, params.messages),
-        tools: toOpenAITools(params.tools),
+        // Issue #509 — pass the model so the strict-mode capability matrix can
+        // decide whether `function.strict` is attached for this request.
+        tools: toOpenAITools(params.tools, model),
         max_tokens: params.max_tokens ?? 1024,
         temperature: params.temperature ?? 0.2,
       },
