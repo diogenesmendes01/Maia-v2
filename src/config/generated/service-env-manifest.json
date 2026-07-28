@@ -181,6 +181,13 @@
           "restartRequired": true
         },
         {
+          "name": "LLM_TURN_DEADLINE_MS",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
           "name": "LLM_DAILY_BUDGET_USD",
           "secret": false,
           "required": false,
@@ -1228,6 +1235,7 @@
             "CLAUDE_MODEL_FAST",
             "CLAUDE_MAX_RETRIES",
             "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
@@ -1401,6 +1409,7 @@
             "CLAUDE_MODEL_FAST",
             "CLAUDE_MAX_RETRIES",
             "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
@@ -1572,6 +1581,7 @@
             "CLAUDE_MODEL_FAST",
             "CLAUDE_MAX_RETRIES",
             "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",

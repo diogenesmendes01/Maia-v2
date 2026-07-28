@@ -125,10 +125,24 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
   const tier = req.tier ?? policy.default_tier;
   const scope = currentScope();
 
+  /**
+   * Deadline ABSOLUTO da chamada inteira. Quando o caller não declara um, o
+   * gateway DERIVA um a partir de `LLM_TURN_DEADLINE_MS`.
+   *
+   * A mecânica de deadline compartilhado existia desde a primeira versão, mas
+   * o campo era opcional e quase nenhum caller o passava — na prática o
+   * gateway rodava com `Infinity`, e cada tentativa podia consumir o timeout
+   * por requisição inteiro, mais backoff, mais fallback. Ou seja: o mecanismo
+   * certo, nunca acionado. Derivar aqui é o que torna o limite real para o
+   * caller que não declara nada; a issue #507 continua podendo passar um
+   * deadline mais apertado, e o gateway sempre usa o menor tempo restante.
+   */
+  const deadlineAt = ctx.deadline_at ?? startedAt + config.LLM_TURN_DEADLINE_MS;
+
   // (1) Cancelamento antecipado: um caller que já abortou não paga nem pela
   // leitura de settings. Precede QUALQUER I/O.
   if (ctx.signal?.aborted) throw abortedError();
-  if (ctx.deadline_at !== undefined && ctx.deadline_at <= Date.now()) {
+  if (deadlineAt <= Date.now()) {
     throw new LLMGatewayError({
       kind: 'timeout',
       detail: 'deadline exceeded before first attempt',
@@ -256,26 +270,22 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
    */
   let actualCostUsd: number | null = null;
 
-  const link = linkSignal(ctx.signal, ctx.deadline_at);
+  const link = linkSignal(ctx.signal, deadlineAt);
   const maxAttempts = Math.max(1, policy.max_attempts ?? config.CLAUDE_MAX_RETRIES);
   let attempts = 0;
   let lastError: LLMGatewayError | null = null;
   let lastRawError: unknown = null;
 
-  const remainingMs = (): number =>
-    ctx.deadline_at === undefined ? Number.POSITIVE_INFINITY : ctx.deadline_at - Date.now();
+  /** Sempre finito: o deadline é derivado quando o caller não declara um. */
+  const remainingMs = (): number => deadlineAt - Date.now();
 
   /**
    * Teto por tentativa: o menor entre `CLAUDE_TIMEOUT_MS` e o que sobrou do
    * deadline. Antes da #508, `CLAUDE_TIMEOUT_MS` existia em `src/config/env.ts`
    * sem nenhum consumidor no hot path — este é o consumidor.
    */
-  const attemptTimeout = (): number => {
-    const left = remainingMs();
-    return Number.isFinite(left)
-      ? Math.max(1, Math.min(config.CLAUDE_TIMEOUT_MS, left))
-      : config.CLAUDE_TIMEOUT_MS;
-  };
+  const attemptTimeout = (): number =>
+    Math.max(1, Math.min(config.CLAUDE_TIMEOUT_MS, remainingMs()));
 
   const finish = async (
     resolved: ResolvedModel,

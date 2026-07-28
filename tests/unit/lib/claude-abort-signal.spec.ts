@@ -145,12 +145,31 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     vi.useRealTimers();
   });
 
-  it('forwards { signal } to anthropic.messages.create as RequestOptions', async () => {
+  /**
+   * Issue #508: the gateway now always derives an absolute deadline
+   * (`LLM_TURN_DEADLINE_MS`) when the caller doesn't declare one, so the signal
+   * handed to the SDK is composed from the caller's signal + the deadline
+   * timer — no longer the caller's object by identity. The property that
+   * matters is unchanged, and this asserts it directly and more strongly than
+   * the old identity check did: while the request is IN FLIGHT, aborting the
+   * caller aborts the signal the SDK is holding.
+   */
+  it('propagates caller cancellation to the signal anthropic.messages.create holds', async () => {
     const { callLLM } = await import('@/lib/claude.js');
-    anthropicCreateMock.mockResolvedValueOnce(happyAnthropicResponse());
+
+    let sdkSignal: AbortSignal | undefined;
+    anthropicCreateMock.mockImplementationOnce(
+      (_params: unknown, options: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          sdkSignal = options.signal;
+          options.signal?.addEventListener('abort', () => reject(makeAbortError()), {
+            once: true,
+          });
+        }),
+    );
 
     const controller = new AbortController();
-    await withScope(() =>
+    const promise = withScope(() =>
       callLLM({
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
@@ -158,11 +177,16 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
       }),
     );
 
+    // Give the call time to reach the SDK.
+    await new Promise((r) => setTimeout(r, 20));
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
-    // RequestOptions is the second positional arg.
-    const requestOptions = anthropicCreateMock.mock.calls[0]?.[1];
-    expect(requestOptions).toBeDefined();
-    expect(requestOptions.signal).toBe(controller.signal);
+    expect(sdkSignal).toBeInstanceOf(AbortSignal);
+    expect(sdkSignal?.aborted).toBe(false);
+
+    controller.abort('caller_cancelled');
+
+    expect(sdkSignal?.aborted).toBe(true);
+    await expect(promise).rejects.toBeDefined();
   });
 
   it('pre-aborted signal short-circuits before the SDK and model lookup (item 4)', async () => {
@@ -313,12 +337,23 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     vi.doUnmock('@/config/env.js');
   });
 
-  it('forwards { signal } to openai.chat.completions.create as RequestOptions', async () => {
+  /** See the Anthropic-side note above: composed signal, same guarantee. */
+  it('propagates caller cancellation to the signal openai.chat.completions.create holds', async () => {
     const { callLLM } = await import('@/lib/claude.js');
-    openaiCreateMock.mockResolvedValueOnce(happyOpenAIResponse());
+
+    let sdkSignal: AbortSignal | undefined;
+    openaiCreateMock.mockImplementationOnce(
+      (_params: unknown, options: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          sdkSignal = options.signal;
+          options.signal?.addEventListener('abort', () => reject(makeAbortError()), {
+            once: true,
+          });
+        }),
+    );
 
     const controller = new AbortController();
-    await withScope(() =>
+    const promise = withScope(() =>
       callLLM({
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
@@ -326,10 +361,14 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
       }),
     );
 
+    await new Promise((r) => setTimeout(r, 20));
     expect(openaiCreateMock).toHaveBeenCalledTimes(1);
-    const requestOptions = openaiCreateMock.mock.calls[0]?.[1];
-    expect(requestOptions).toBeDefined();
-    expect(requestOptions.signal).toBe(controller.signal);
+    expect(sdkSignal?.aborted).toBe(false);
+
+    controller.abort('caller_cancelled');
+
+    expect(sdkSignal?.aborted).toBe(true);
+    await expect(promise).rejects.toBeDefined();
   });
 
   it('does not retry when OpenAI SDK rejects with AbortError', async () => {

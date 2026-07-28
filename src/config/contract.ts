@@ -388,6 +388,19 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  LLM_TURN_DEADLINE_MS: {
+    name: 'LLM_TURN_DEADLINE_MS',
+    description:
+      'Orçamento wall-clock TOTAL (ms) de uma chamada de LLM quando o caller não declara um deadline: cobre todas as tentativas, backoff, fallback e parsing. Instante absoluto, nunca reiniciado a cada retry (issue #508). O caller pode passar um deadline mais curto; nunca um mais longo na prática, já que o gateway usa o menor tempo restante.',
+    group: 'llm',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(120000),
+    example: '120000',
+    fixture: '120000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   LLM_DAILY_BUDGET_USD: {
     name: 'LLM_DAILY_BUDGET_USD',
     description:

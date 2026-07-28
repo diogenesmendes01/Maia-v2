@@ -110,7 +110,14 @@ export type LLMExecutionContext = {
   trace_id?: string;
   /** Cancelamento do caller. Chega até a requisição HTTP do SDK. */
   signal?: AbortSignal;
-  /** Instante absoluto (ms epoch) em que a chamada inteira deve estar morta. */
+  /**
+   * Instante absoluto (ms epoch) em que a chamada inteira deve estar morta.
+   *
+   * Opcional, mas NUNCA ausente na prática: quando o caller não declara um, o
+   * gateway deriva a partir de `LLM_TURN_DEADLINE_MS`. Declarar serve para
+   * APERTAR o limite (é o que a issue #507 faz por turno), nunca para afrouxá-lo
+   * — o gateway sempre usa o menor tempo restante.
+   */
   deadline_at?: number;
 };
 
