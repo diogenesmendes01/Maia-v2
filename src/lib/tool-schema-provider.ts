@@ -84,16 +84,51 @@ const STRICT_UNSUPPORTED_KEYWORDS = [
   'default',
 ] as const;
 
-class NotStrictConvertible extends Error {}
+/**
+ * Why a contract cannot be expressed in the strict subset. A CLOSED set — it is
+ * a metric label. Each value names a property of the CONTRACT, so the metric
+ * tells an operator exactly what to change to make a tool strict-eligible.
+ */
+export type StrictRejectReason =
+  | 'union_root'
+  | 'dynamic_map'
+  | 'untyped_value'
+  | 'optional_not_null_safe'
+  | 'non_object_root';
+
+export type StrictAdaptation =
+  | { readonly ok: true; readonly schema: JsonObject }
+  | { readonly ok: false; readonly reason: StrictRejectReason };
+
+class NotStrictConvertible extends Error {
+  constructor(readonly reason: StrictRejectReason) {
+    super(reason);
+  }
+}
 
 function humanizeDropped(dropped: Array<[string, unknown]>): string {
   return dropped.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
 }
 
+/**
+ * Does this canonical node accept `null`?
+ *
+ * The canonical converter renders `.nullable()` as `anyOf: [T, {type:'null'}]`
+ * (and a bare `z.null()` as `{type:'null'}`), so this is an exact read of the
+ * Zod contract — not a guess.
+ */
+function admitsNull(node: JsonObject): boolean {
+  if (node.type === 'null') return true;
+  if (Array.isArray(node.anyOf)) {
+    return (node.anyOf as JsonObject[]).some((branch) => admitsNull(branch));
+  }
+  return false;
+}
+
 function toStrictNode(node: JsonObject): JsonObject {
   // The permissive empty schema (`z.unknown()` / `z.any()`): strict mode
   // requires every subschema to be typed, so the tool cannot go strict.
-  if (Object.keys(node).length === 0) throw new NotStrictConvertible();
+  if (Object.keys(node).length === 0) throw new NotStrictConvertible('untyped_value');
 
   const out: JsonObject = {};
   const dropped: Array<[string, unknown]> = [];
@@ -117,30 +152,48 @@ function toStrictNode(node: JsonObject): JsonObject {
     // A dynamic map (`z.record`) becomes `additionalProperties: <schema>`,
     // which strict mode forbids — it demands exactly `false`.
     if (out.additionalProperties !== false && out.additionalProperties !== undefined) {
-      throw new NotStrictConvertible();
+      throw new NotStrictConvertible('dynamic_map');
     }
     // A union-rooted contract has `anyOf` at the root; strict mode requires a
     // plain object with `properties` there.
-    if (out.anyOf !== undefined) throw new NotStrictConvertible();
+    if (out.anyOf !== undefined) throw new NotStrictConvertible('union_root');
     out.additionalProperties = false;
+
     const properties = (out.properties ?? {}) as JsonObject;
-    const strictProps: JsonObject = {};
-    for (const [key, child] of Object.entries(properties)) {
-      strictProps[key] = toStrictNode(child as JsonObject);
-    }
-    out.properties = strictProps;
-    // Strict mode requires EVERY property in `required`. Optionality is not
-    // representable, so an optional field becomes `anyOf: [T, {type:'null'}]`
-    // and the model must send an explicit null instead of omitting the key.
     const previouslyRequired = new Set(((node.required ?? []) as string[]) ?? []);
-    const keys = Object.keys(strictProps);
-    for (const key of keys) {
-      if (previouslyRequired.has(key)) continue;
-      const child = strictProps[key] as JsonObject;
-      strictProps[key] = Array.isArray(child.anyOf)
-        ? { ...child, anyOf: [...(child.anyOf as unknown[]), { type: 'null' }] }
-        : { anyOf: [child, { type: 'null' }] };
+    const strictProps: JsonObject = {};
+
+    for (const [key, child] of Object.entries(properties)) {
+      const childNode = child as JsonObject;
+      // ────────────────────────────────────────────────────────────────────
+      // The equivalence guard (PR #530 review round 1, P1).
+      //
+      // Strict mode CANNOT express "optional": it demands every property in
+      // `required`. The obvious workaround — force the key and widen it with
+      // `{type:'null'}` — silently INVERTS the direction of authority, which is
+      // the whole point of this issue. `register_transaction.data_pagamento`
+      // and `cancel_transaction.motivo` are `.optional()` but NOT `.nullable()`:
+      // Zod accepts their ABSENCE and REJECTS `null`. Under constrained
+      // decoding the model would be forced to emit the key, would legitimately
+      // emit `null` to mean "absent", and `_dispatcher.ts` would then reject the
+      // whole call as `invalid_args` — a failure the model could not avoid.
+      //
+      // So we refuse strict for the tool instead of shipping a schema that
+      // contradicts the authoritative contract. A field that is `.nullable()`
+      // already admits `null` in Zod, so forcing it IS faithful and stays
+      // eligible. Making the Zod contract nullable to please a provider would
+      // be the tail wagging the dog; making the provider envelope honest is not.
+      // ────────────────────────────────────────────────────────────────────
+      if (!previouslyRequired.has(key) && !admitsNull(childNode)) {
+        throw new NotStrictConvertible('optional_not_null_safe');
+      }
+      strictProps[key] = toStrictNode(childNode);
     }
+
+    out.properties = strictProps;
+    // Every surviving optional already accepts `null` in Zod, so promoting all
+    // keys to `required` does not widen or narrow what the backend accepts.
+    const keys = Object.keys(strictProps);
     if (keys.length > 0) out.required = keys;
     else delete out.required;
   }
@@ -154,18 +207,27 @@ function toStrictNode(node: JsonObject): JsonObject {
 }
 
 /**
- * Rewrite a canonical schema into the strict-mode subset, or return `null` when
- * the contract cannot be expressed there (union root, dynamic map, untyped
- * value). `null` means "send the canonical schema without `strict`" — a
- * DOWNGRADE of generation quality, never of enforcement.
+ * Rewrite a canonical schema into the strict-mode subset.
+ *
+ * INVARIANT: the strict copy must accept EXACTLY what the authoritative Zod
+ * contract accepts. Anything that cannot be expressed faithfully is refused
+ * (`ok: false` + a reason), which means "send the canonical schema without
+ * `strict`" — a downgrade of GENERATION quality, never of enforcement, and
+ * never a schema that contradicts the backend.
+ *
+ * Dropping the unsupported keywords is the one deliberate widening: the strict
+ * copy becomes MORE permissive than Zod, so the worst case is an `invalid_args`
+ * the model could already have produced without strict mode. The reverse
+ * direction — a schema that forces the model into a value Zod rejects — is what
+ * this function refuses to emit.
  */
-export function toStrictJsonSchema(schema: JsonObject): JsonObject | null {
+export function toStrictJsonSchema(schema: JsonObject): StrictAdaptation {
   try {
     const out = toStrictNode(schema);
-    if (out.type !== 'object') return null;
-    return out;
+    if (out.type !== 'object') return { ok: false, reason: 'non_object_root' };
+    return { ok: true, schema: out };
   } catch (err) {
-    if (err instanceof NotStrictConvertible) return null;
+    if (err instanceof NotStrictConvertible) return { ok: false, reason: err.reason };
     throw err;
   }
 }
@@ -177,7 +239,7 @@ export function toStrictJsonSchema(schema: JsonObject): JsonObject | null {
 export function recordStrictDowngrade(
   provider: string,
   model: string,
-  reason: 'model_not_strict_capable' | 'schema_not_strict_convertible',
+  reason: 'model_not_strict_capable' | StrictRejectReason,
 ): void {
   incCounter('maia_tool_schema_provider_downgrade_total', { provider, model, reason });
 }

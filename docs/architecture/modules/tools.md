@@ -89,11 +89,27 @@ One canonical schema, two envelopes (`src/lib/tool-schema-provider.ts`):
 
 - Anthropic — `input_schema`, verbatim.
 - OpenAI/OpenRouter — `function.parameters`, plus `strict: true` only for models
-  in the backend capability matrix `STRICT_CAPABLE_MODEL_PREFIXES`. A contract
-  that cannot be expressed in the strict subset (union root, dynamic map,
-  untyped value) is sent WITHOUT `strict` and counted in
-  `maia_tool_schema_provider_downgrade_total`. A downgrade weakens generation,
-  never enforcement.
+  in the backend capability matrix `STRICT_CAPABLE_MODEL_PREFIXES`, and only
+  when the strict rewrite is FAITHFUL to the Zod contract. Otherwise the
+  canonical schema is sent WITHOUT `strict` and the reason is counted in
+  `maia_tool_schema_provider_downgrade_total{reason}`. A downgrade weakens
+  generation, never enforcement.
+
+Strict mode cannot express "optional": it demands every property in `required`.
+A tool is therefore strict-eligible only when every `.optional()` field is also
+`.nullable()` — otherwise constrained decoding would force the model to emit the
+key, it would emit `null` to mean "absent", and Zod would reject the call as
+`invalid_args`. The adapter refuses rather than ship a schema that contradicts
+the backend; making the Zod contract nullable to please a provider would invert
+the direction of authority. Rejection reasons (all metric labels):
+
+| `reason` | What to change to become strict-eligible |
+|---|---|
+| `optional_not_null_safe` | make the optional field `.nullable()` too, when `null` is semantically correct |
+| `dynamic_map` | replace `z.record(...)` with a closed object |
+| `untyped_value` | give `z.unknown()` / `z.any()` a real type |
+| `union_root` | flatten the root `z.discriminatedUnion` into one object |
+| `model_not_strict_capable` | nothing in the contract — the model is not in the matrix |
 
 ### Rollback
 

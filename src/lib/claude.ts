@@ -190,11 +190,13 @@ export function toOpenAIMessages(system: string, messages: LLMMessage[]): OAIMes
  *
  * When `model` is given AND the backend capability matrix says that model
  * supports strict function calling, each schema is rewritten into the
- * strict-mode subset and shipped with `strict: true`. A schema that cannot be
- * expressed there (union root, dynamic map, untyped value) is sent AS IS
- * without `strict` and the downgrade is counted — the model is then less
- * constrained while generating, but nothing about enforcement changes: Zod
- * revalidates every call in `_dispatcher.ts` and every gate still runs.
+ * strict-mode subset and shipped with `strict: true` — but ONLY when that
+ * rewrite is FAITHFUL to the Zod contract. A schema that cannot be expressed
+ * faithfully (union root, dynamic map, untyped value, or an `.optional()` field
+ * that is not `.nullable()`) is sent AS IS without `strict` and the downgrade is
+ * counted with its reason. The model is then less constrained while generating,
+ * but nothing about enforcement changes: Zod revalidates every call in
+ * `_dispatcher.ts` and every gate still runs.
  *
  * `model` is optional so existing callers keep the previous behaviour exactly.
  */
@@ -215,11 +217,11 @@ export function toOpenAITools(
         recordStrictDowngrade('openrouter', model, 'model_not_strict_capable');
       } else {
         const strict = toStrictJsonSchema(t.input_schema);
-        if (strict) {
-          fn.parameters = strict;
+        if (strict.ok) {
+          fn.parameters = strict.schema;
           fn.strict = true;
         } else {
-          recordStrictDowngrade('openrouter', model, 'schema_not_strict_convertible');
+          recordStrictDowngrade('openrouter', model, strict.reason);
         }
       }
     }

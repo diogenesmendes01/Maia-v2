@@ -16,6 +16,8 @@ import { toOpenAITools, type ToolSchema } from '../../../src/lib/claude.js';
 import { toolInputToJsonSchema } from '../../../src/tools/schema-json.js';
 import { REGISTRY } from '../../../src/tools/_registry.js';
 
+const UUID = '11111111-2222-4333-8444-555555555555';
+
 describe('#509 capability matrix — decided by the backend, never by the model', () => {
   it('anthropic never claims strict support (no such flag on the Messages API)', () => {
     expect(supportsStrictToolSchemas('anthropic', 'claude-sonnet-4-6')).toBe(false);
@@ -39,25 +41,33 @@ describe('#509 capability matrix — decided by the backend, never by the model'
 
 describe('#509 toStrictJsonSchema', () => {
   it('marks every property required and nulls the optional ones', () => {
+    // `b` is optional AND null-safe (`anyOf` already admits null), so promoting
+    // it to `required` accepts exactly what Zod accepts.
     const strict = toStrictJsonSchema({
-      type: 'object',
-      properties: { a: { type: 'string' }, b: { type: 'number' } },
-      required: ['a'],
-      additionalProperties: false,
-    });
-    expect(strict).toEqual({
       type: 'object',
       properties: {
         a: { type: 'string' },
         b: { anyOf: [{ type: 'number' }, { type: 'null' }] },
       },
-      required: ['a', 'b'],
+      required: ['a'],
       additionalProperties: false,
+    });
+    expect(strict).toEqual({
+      ok: true,
+      schema: {
+        type: 'object',
+        properties: {
+          a: { type: 'string' },
+          b: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+        },
+        required: ['a', 'b'],
+        additionalProperties: false,
+      },
     });
   });
 
   it('drops unsupported keywords but restates them in the description', () => {
-    const strict = toStrictJsonSchema({
+    const res = toStrictJsonSchema({
       type: 'object',
       properties: {
         v: { type: 'number', exclusiveMinimum: 0, description: 'valor' },
@@ -65,8 +75,12 @@ describe('#509 toStrictJsonSchema', () => {
       },
       required: ['v', 'd'],
       additionalProperties: false,
-    })!;
-    const props = strict.properties as Record<string, Record<string, unknown>>;
+    });
+    expect(res.ok).toBe(true);
+    const props = (res as { schema: Record<string, unknown> }).schema.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
     expect(props.v.exclusiveMinimum).toBeUndefined();
     expect(String(props.v.description)).toContain('exclusiveMinimum=0');
     expect(props.d.pattern).toBeUndefined();
@@ -82,7 +96,7 @@ describe('#509 toStrictJsonSchema', () => {
           { type: 'object', properties: {}, additionalProperties: false },
         ],
       }),
-    ).toBeNull();
+    ).toEqual({ ok: false, reason: 'union_root' });
   });
 
   it('refuses a dynamic map (additionalProperties must be exactly false)', () => {
@@ -93,7 +107,7 @@ describe('#509 toStrictJsonSchema', () => {
         required: ['m'],
         additionalProperties: false,
       }),
-    ).toBeNull();
+    ).toEqual({ ok: false, reason: 'dynamic_map' });
   });
 
   it('refuses an untyped value (z.unknown)', () => {
@@ -104,25 +118,131 @@ describe('#509 toStrictJsonSchema', () => {
         required: ['any'],
         additionalProperties: false,
       }),
-    ).toBeNull();
+    ).toEqual({ ok: false, reason: 'untyped_value' });
   });
 
   it('recurses into arrays and closes nested objects', () => {
-    const strict = toStrictJsonSchema({
+    const res = toStrictJsonSchema({
       type: 'object',
       properties: {
         list: {
           type: 'array',
           maxItems: 3,
-          items: { type: 'object', properties: { x: { type: 'string' } }, additionalProperties: false },
+          items: {
+            type: 'object',
+            properties: { x: { type: 'string' } },
+            required: ['x'],
+            additionalProperties: false,
+          },
         },
       },
       required: ['list'],
       additionalProperties: false,
-    })!;
-    const list = (strict.properties as Record<string, Record<string, unknown>>).list;
+    });
+    expect(res.ok).toBe(true);
+    const schema = (res as { schema: Record<string, unknown> }).schema;
+    const list = (schema.properties as Record<string, Record<string, unknown>>).list;
     expect(list.maxItems).toBeUndefined();
     expect((list.items as Record<string, unknown>).additionalProperties).toBe(false);
+  });
+});
+
+/**
+ * PR #530 review round 1, [P1] — the equivalence guard.
+ *
+ * Strict mode cannot express "optional". Forcing the key and widening it with
+ * `{type:'null'}` (what the adapter used to do) makes the schema shown to the
+ * model CONTRADICT the authoritative Zod contract: under constrained decoding
+ * the model is forced to emit the key, legitimately emits `null` to mean
+ * "absent", and the dispatcher rejects the whole call as `invalid_args`.
+ *
+ * The adapter must therefore REFUSE strict for such a contract instead of
+ * shipping one that cannot be satisfied.
+ */
+describe('#530 P1 — strict never contradicts the Zod contract', () => {
+  it('the divergence is real: Zod REJECTS null on an optional non-nullable field', () => {
+    // `cancel_transaction.motivo` is `.optional()` and NOT `.nullable()`.
+    const zod = REGISTRY.cancel_transaction!.input_schema;
+    expect(zod.safeParse({ entidade_id: UUID, transacao_id: UUID }).success).toBe(true);
+    expect(zod.safeParse({ entidade_id: UUID, transacao_id: UUID, motivo: null }).success).toBe(
+      false,
+    );
+  });
+
+  it('refuses strict for a contract with an optional non-nullable field', () => {
+    const built = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
+    expect(toStrictJsonSchema(built.input_schema)).toEqual({
+      ok: false,
+      reason: 'optional_not_null_safe',
+    });
+  });
+
+  it('end to end: a strict-capable model gets NO strict flag for such a tool', () => {
+    const built = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
+    const out = toOpenAITools(
+      [{ name: built.name, description: built.description, input_schema: built.input_schema }],
+      'openai/gpt-4.1',
+    )!;
+    expect((out[0].function as Record<string, unknown>).strict).toBeUndefined();
+    // And the canonical schema goes out untouched — `motivo` is NOT forced.
+    const params = out[0].function.parameters as Record<string, unknown>;
+    expect(params).toEqual(built.input_schema);
+    expect(params.required).toEqual(['entidade_id', 'transacao_id']);
+  });
+
+  it('every field the strict copy forces is one Zod accepts as null', () => {
+    // The only shape that survives: optional AND nullable.
+    const nullSafe = toStrictJsonSchema({
+      type: 'object',
+      properties: {
+        req: { type: 'string' },
+        opt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      },
+      required: ['req'],
+      additionalProperties: false,
+    });
+    expect(nullSafe.ok).toBe(true);
+    expect((nullSafe as { schema: Record<string, unknown> }).schema.required).toEqual([
+      'req',
+      'opt',
+    ]);
+  });
+
+  it('a `.default()` field is refused too (Zod fills it on ABSENCE, not on null)', () => {
+    // `register_transaction.origem` is `z.enum([...]).default('whatsapp')`:
+    // optional to the caller, but `null` is not a legal value for it.
+    const zod = REGISTRY.register_transaction!.input_schema;
+    expect(
+      zod.safeParse({
+        entidade_id: UUID,
+        conta_id: UUID,
+        natureza: 'despesa',
+        valor: 1,
+        data_competencia: '2026-03-01',
+        status: 'paga',
+        descricao: 'x',
+        origem: null,
+      }).success,
+    ).toBe(false);
+    const built = toolInputToJsonSchema(REGISTRY.register_transaction!);
+    expect(toStrictJsonSchema(built.input_schema).ok).toBe(false);
+  });
+
+  it('nested objects are guarded too, not just the root', () => {
+    expect(
+      toStrictJsonSchema({
+        type: 'object',
+        properties: {
+          outer: {
+            type: 'object',
+            properties: { inner: { type: 'string' } },
+            additionalProperties: false,
+          },
+        },
+        required: ['outer'],
+        additionalProperties: false,
+      }),
+    ).toEqual({ ok: false, reason: 'optional_not_null_safe' });
   });
 });
 
@@ -187,9 +307,20 @@ describe('#509 provider equivalence — both providers get the same contract', (
   });
 
   it('strict adaptation never loosens: required only grows, objects stay closed', () => {
-    const built = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
-    const strict = toStrictJsonSchema(built.input_schema)!;
-    const before = new Set((built.input_schema.required ?? []) as string[]);
+    // A null-safe contract — the only kind the adapter will now render strict.
+    const canonical = {
+      type: 'object',
+      properties: {
+        req: { type: 'string' },
+        opt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      },
+      required: ['req'],
+      additionalProperties: false,
+    };
+    const res = toStrictJsonSchema(canonical);
+    expect(res.ok).toBe(true);
+    const strict = (res as { schema: Record<string, unknown> }).schema;
+    const before = new Set(canonical.required);
     const after = new Set((strict.required ?? []) as string[]);
     for (const key of before) expect(after.has(key)).toBe(true);
     expect(strict.additionalProperties).toBe(false);
