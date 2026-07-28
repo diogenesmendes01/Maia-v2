@@ -50,6 +50,7 @@ import { resolveScopeForJid } from './jid-tenant-resolver.js';
 import { normalizeLineE164 } from './channel-resolver.js';
 import { getLineSessionManager } from './line-session-manager.js';
 import { channelsRepo } from '@/db/repositories/channel-repos.js';
+import { lifecycle } from '@/runtime/lifecycle/controller.js';
 
 let socket: WASocket | null = null;
 let connected = false;
@@ -276,6 +277,15 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
   if (conn === 'open') {
     connected = true;
     reconnectAttempts = 0;
+    // Issue #512 review round 1 (P1 on `src/index.ts:189`): the lifecycle
+    // component reaches `ready` HERE, on the first real `open` — not when
+    // `startBaileys()` returns. `startBaileys()` only arms the socket, so
+    // marking it ready there made a cold start (or a QR that was never
+    // scanned) look identical to a transient reconnect: readiness reported
+    // `degraded` and, with READINESS_REQUIRE_WHATSAPP_LIVE=false, answered 200
+    // for an instance that had never been able to send a single message.
+    // `degraded` is only honest AFTER the session has been established once.
+    lifecycle.setComponent('whatsapp_session', 'ready');
     // §1.1 — captura a LINHA desta sessão (identidade do canal) e registra a
     // sessão primária no manager (observabilidade fase 1–2; transporte do
     // canal primário na fase 3). Best-effort — nunca bloqueia a conexão.
@@ -296,6 +306,17 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     lastDisconnectAt = new Date();
     const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
     logger.warn({ reason }, 'baileys.connection_closed');
+    // Issue #512: a `loggedOut` close means the pairing is GONE — the session
+    // cannot recover on its own and the instance genuinely cannot serve the
+    // channel, so it fails closed. Any other close is the routine reconnect
+    // loop: keep whatever the component already was (`ready` degrades to
+    // `degraded` only for a session that was established once), so a WhatsApp
+    // hiccup does not flap the whole fleet out of rotation.
+    if (reason === DisconnectReason.loggedOut) {
+      lifecycle.setComponent('whatsapp_session', 'failed', 'logged out — re-pairing required');
+    } else if (lifecycle.getComponent('whatsapp_session').state === 'ready') {
+      lifecycle.setComponent('whatsapp_session', 'degraded', 'socket closed — reconnecting');
+    }
     // Espelha a transição no manager (invariante 6): loggedOut encerra a
     // posse da linha; qualquer outro close é recuperável (reconnect loop).
     if (primaryChannel) {

@@ -223,6 +223,17 @@ Regras que o código garante (`src/runtime/lifecycle/`):
 - **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
   HTTP; a mensagem completa vai só para o log).
 
+> **Cold start / pareamento.** No papel `all`, `whatsapp_session` só vira
+> `ready` no primeiro `connection.update = open` real — não quando
+> `startBaileys()` retorna. Enquanto o número não estiver pareado, `/readyz`
+> responde **503** de propósito: a instância não consegue enviar nada. O
+> `/setup` continua acessível (é rota HTTP, não passa pelo `/readyz`), então o
+> fluxo de pareamento por QR/código funciona normalmente — acesse o host
+> diretamente, não pelo pool do load balancer. Depois do primeiro `open`, uma
+> queda de socket vira `degraded` e a instância **permanece** em rotação
+> (anti-flapping); um `loggedOut` vira `failed` e tira de rotação, porque aí a
+> sessão realmente acabou e exige novo pareamento.
+
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 sempre que o processo responde
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 → boot ainda em andamento
