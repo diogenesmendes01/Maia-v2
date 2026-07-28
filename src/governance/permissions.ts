@@ -23,20 +23,48 @@ export type ResolvedPermission = {
   effective_limits: EffectiveLimits;
 };
 
+/**
+ * Resolve which entities this person may act on, and under which profile.
+ *
+ * Issue #511 — the profile lookup was inside the loop: one `profilesRepo.byId`
+ * per permission, so a person with 100 entity permissions cost 101 round-trips
+ * on the fixed 10-connection pool BEFORE the turn had done anything. Profiles
+ * are now fetched in a single batched, tenant-scoped statement, making the cost
+ * exactly two queries regardless of how many entities the person can reach.
+ *
+ * Authorization semantics are unchanged, deliberately:
+ *   - an unresolvable profile still SKIPS the permission (no profile → no
+ *     grant, the fail-closed reading), it does not fall back to a default;
+ *   - limits are still merged per permission by `mergeLimits`, so an explicit
+ *     `limites` override still wins over the profile default;
+ *   - iteration order still follows `perms`, so the resulting `entidades` array
+ *     and the rendered scope block stay byte-identical to before.
+ *
+ * The batch read is ALSO strictly safer than the loop it replaces:
+ * `profilesRepo.byIds` binds (tenant_id, agent_id) from ALS, while the
+ * `byId` it replaces matched on the profile id alone — a `permissoes` row
+ * pointing at a foreign profile id used to resolve to that other tenant's
+ * action list and spend limit.
+ */
 export async function resolveScope(
   pessoa: Pessoa,
 ): Promise<{ entidades: string[]; byEntity: Map<string, ResolvedPermission> }> {
   if (pessoa.status !== 'ativa') return { entidades: [], byEntity: new Map() };
   const perms = await permissoesRepo.forPessoa(pessoa.id);
+  const withEntity = perms.filter((p) => p.entidade_id);
+  if (withEntity.length === 0) return { entidades: [], byEntity: new Map() };
+
+  const profiles = await profilesRepo.byIds(withEntity.map((p) => p.profile_id));
+  const byProfileId = new Map(profiles.map((pr) => [pr.id, pr]));
+
   const byEntity = new Map<string, ResolvedPermission>();
   const entidades: string[] = [];
-  for (const p of perms) {
-    if (!p.entidade_id) continue;
-    const profile = await profilesRepo.byId(p.profile_id);
+  for (const p of withEntity) {
+    const profile = byProfileId.get(p.profile_id);
     if (!profile) continue;
     const effective_limits = mergeLimits(p, profile);
-    byEntity.set(p.entidade_id, { permissao: p, profile, effective_limits });
-    entidades.push(p.entidade_id);
+    byEntity.set(p.entidade_id!, { permissao: p, profile, effective_limits });
+    entidades.push(p.entidade_id!);
   }
   return { entidades, byEntity };
 }

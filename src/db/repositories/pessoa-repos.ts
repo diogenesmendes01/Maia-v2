@@ -1,4 +1,4 @@
-import { eq, and, sql } from 'drizzle-orm';
+import { eq, and, sql, inArray, asc } from 'drizzle-orm';
 import { db, withTx, pgErrorCode } from '../client.js';
 import {
   pessoas,
@@ -572,6 +572,44 @@ export const profilesRepo = {
       .where(eq(permission_profiles.id, id))
       .limit(1);
     return rows[0] ?? null;
+  },
+  /**
+   * Issue #511 — batch sibling of `byId`, replacing the per-permission lookup
+   * loop in `resolveScope` (`src/governance/permissions.ts`).
+   *
+   * TENANT-SCOPED, unlike `byId`. `permission_profiles` carries NOT NULL
+   * `tenant_id` + `agent_id` (schema `src/db/schema.ts` `permission_profiles`),
+   * and a profile is what decides which ACTIONS and which SPEND LIMIT a person
+   * gets — reading one by id alone would let a `permissoes` row pointing at a
+   * foreign profile id resolve to that other tenant's action list. `byId` is
+   * left unscoped for now (its only remaining caller is the interactive
+   * `scripts/pessoa-add.ts`, which runs outside a tenant frame); the hot path
+   * moves here, so the turn now resolves scope under an exact tenant predicate.
+   *
+   * Missing ids are simply absent from the result — the caller decides what an
+   * unresolvable profile means. `resolveScope` skips the permission entirely,
+   * which is the fail-closed reading: no profile, no grant.
+   *
+   * Deterministic ordering by id (the same permission set must render the same
+   * prompt every turn) and an explicit row cap so one tenant cannot make a
+   * single statement unbounded.
+   */
+  async byIds(ids: string[], limit = 500): Promise<PermissionProfile[]> {
+    if (ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(permission_profiles)
+      .where(
+        and(
+          eq(permission_profiles.tenant_id, tenant_id),
+          eq(permission_profiles.agent_id, agent_id),
+          inArray(permission_profiles.id, Array.from(new Set(ids))),
+        ),
+      )
+      .orderBy(asc(permission_profiles.id))
+      .limit(limit);
   },
   async list(): Promise<PermissionProfile[]> {
     return db.select().from(permission_profiles);

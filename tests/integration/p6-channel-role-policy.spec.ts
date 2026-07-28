@@ -157,9 +157,12 @@ vi.mock('@/db/repositories.js', () => ({
   entidadesRepo: { byIds: entidadesByIds },
   factsRepo: { listMentionableForScopes: factsListMentionableForScopes },
   rulesRepo: { listActive: rulesListActive },
-  entityStatesRepo: { byId: entityStatesById },
+  entityStatesRepo: { byId: entityStatesById, byIds: vi.fn(async () => []) },
   memoryEntryRepo: { findRelevant: memoryEntryFindRelevant },
-  behavioralHintRepo: { findActiveForScope: behavioralHintFindActiveForScope },
+  behavioralHintRepo: {
+    findActiveForScope: behavioralHintFindActiveForScope,
+    findActiveForScopes: vi.fn(async () => []),
+  },
   capabilitiesSkillRepo: { listAll: capabilitiesSkillListAll },
   capabilityGapsRepo: {
     listByLevel: capabilityGapsListByLevel,

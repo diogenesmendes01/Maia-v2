@@ -35,7 +35,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   entidadesRepo: { byIds: h.entidadesByIds },
   factsRepo: { listMentionableForScopes: h.factsListMentionableForScopes },
   rulesRepo: { listActive: h.rulesListActive },
-  entityStatesRepo: { byId: h.entityStatesById },
+  entityStatesRepo: { byId: h.entityStatesById, byIds: vi.fn(async () => []) },
 }));
 
 vi.mock('../../src/config/env.js', () => ({

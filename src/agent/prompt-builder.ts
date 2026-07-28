@@ -673,9 +673,13 @@ async function buildPromptUninstrumented(
   ]);
   const rules = await rulesRepo.listActive('classificacao');
 
+  // #511: index once instead of a linear scan per entity — the scope block and
+  // the state block below both look entities up by id.
+  const entById = new Map(ents.map((e) => [e.id, e]));
+
   const profileBlock = Array.from(ctx.scope.byEntity.entries())
     .map(([eid, rp]) => {
-      const ent = ents.find((e) => e.id === eid);
+      const ent = entById.get(eid);
       const limite =
         rp.effective_limits.valor_max === null
           ? 'sem limite individual (teto global aplica)'
@@ -697,11 +701,24 @@ async function buildPromptUninstrumented(
     )
     .join('\n');
 
+  // Issue #511 — was one `entityStatesRepo.byId(eid)` per entity: the dominant
+  // N+1 of the turn. A single tenant-scoped `WHERE entidade_id IN (…)` replaces
+  // it, so scope size no longer multiplies round-trips on the 10-connection
+  // pool. `?.` mirrors the optional-repo idiom used by the sections below —
+  // older test mocks that only stub the per-id method degrade to "no states"
+  // instead of throwing.
+  //
+  // Rendering still walks `ctx.scope.entidades`, so the block's ORDER is
+  // unchanged (scope order, not DB order) and entities without a state row are
+  // still skipped — the prompt is byte-identical to the pre-batch output.
+  const entityStates = (await entityStatesRepo?.byIds?.(ctx.scope.entidades)) ?? [];
+  const stateByEntityId = new Map(entityStates.map((s) => [s.entidade_id, s]));
+
   const entityStateBlocks: string[] = [];
   for (const eid of ctx.scope.entidades) {
-    const st = await entityStatesRepo.byId(eid);
+    const st = stateByEntityId.get(eid);
     if (!st) continue;
-    const ent = ents.find((e) => e.id === eid);
+    const ent = entById.get(eid);
     entityStateBlocks.push(
       `  - ${ent?.nome ?? eid}: saldo=${st.saldo_consolidado ?? '?'}, próximo_venc=${st.proximo_vencimento ?? '?'}`,
     );
@@ -775,17 +792,21 @@ async function buildPromptUninstrumented(
         : []),
       { scope_type: 'agent', subject_id: null },
     ];
-    const allHints: BehavioralHint[] = [];
-    for (const sq of scopeQueries) {
-      // Skip interlocutor/conversation queries when subject id is missing.
-      if (sq.scope_type !== 'agent' && !sq.subject_id) continue;
-      const hints =
-        (await behavioralHintRepo?.findActiveForScope?.({
-          scope_type: sq.scope_type,
-          subject_id: sq.subject_id ?? null,
-        })) ?? [];
-      allHints.push(...hints);
-    }
+    // Issue #511 — was one round-trip PER SCOPE (up to five sequential queries
+    // for a turn with a resolved role and channel). `findActiveForScopes` OR's
+    // the scope tuples into a single statement with the same tenant, revoked,
+    // lifecycle-visibility and expiry filters, so the hint set is identical —
+    // minus the duplicates the loop could produce when a hint matched two
+    // scopes.
+    //
+    // The "skip when the subject id is missing" rule moves to this filter,
+    // unchanged: an interlocutor/conversation/role/channel tuple without a
+    // subject would otherwise match EVERY hint of that scope type.
+    const scopedQueries = scopeQueries.filter(
+      (sq) => sq.scope_type === 'agent' || !!sq.subject_id,
+    );
+    const allHints: BehavioralHint[] =
+      (await behavioralHintRepo?.findActiveForScopes?.(scopedQueries)) ?? [];
     if (allHints.length > 0) {
       // P83-C6: hints are derived from observed conversations and so
       // may carry untrusted text. Wrap them as <hint> data.
