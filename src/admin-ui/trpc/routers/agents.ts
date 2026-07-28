@@ -38,6 +38,9 @@ import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schem
 import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP } from '../../../tools/archetype-packs.js';
 import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
 import { TOOL_PACKS, resolvePackTools } from '../../../tools/grant-math.js';
+// Módulo puro (sem registry/db) — mesma gramática de nome que o bridge usa em
+// runtime, para o console não inventar um nome de tool MCP diferente (#481).
+import { mcpToolName } from '../../../tools/mcp-tool-names.js';
 
 const AgentIdSchema = z
   .string()
@@ -291,6 +294,119 @@ function extractActivePrinciples(activeProfileBody: unknown): string[] | null {
   return principles;
 }
 
+/** Entrada de pack no contrato de `getCapabilities`. */
+type CapabilityPack = {
+  id: string;
+  name: string;
+  risk_level: string | null;
+  tools: string[];
+  known: boolean;
+  /** true = pack de servidor externo (MCP), gerido em /setup/mcp. */
+  external: boolean;
+};
+
+/**
+ * Dependências mínimas (estruturais) de `resolveMcpPacks` — evita amarrar o
+ * helper ao tipo completo do contexto tRPC e mantém o mock dos testes enxuto.
+ */
+type McpCapabilityCtx = {
+  repos: {
+    mcpServersRepo: {
+      listByTenant(tenant_id: string): Promise<Array<{ name: string; status: string }>>;
+    };
+    mcpServerToolsRepo: {
+      listExecutable(args: {
+        tenant_id: string;
+      }): Promise<Array<{ tool_name: string; risk_class: string; server_name: string }>>;
+    };
+  };
+};
+
+const MCP_PACK_PREFIX = 'mcp.';
+const RISK_ORDER = ['low', 'medium', 'high', 'critical'] as const;
+
+/**
+ * Issue #481 item 3 — resolve os packs `mcp.<server>` do grant contra as SoTs
+ * de MCP. Retorna um mapa pack_id → entrada pronta para o card.
+ *
+ * Fail-soft por design: se as SoTs de MCP não responderem, cada pack MCP cai
+ * na entrada "crua" (id, 0 tools) — o card degrada como hoje em vez de a tela
+ * inteira de capacidades quebrar. NÃO é fail-open de segurança: nada aqui
+ * concede acesso; a execução é revalidada no bridge a cada chamada.
+ */
+async function resolveMcpPacks(
+  ctx: McpCapabilityCtx,
+  tenantId: string,
+  grantedPacks: readonly string[],
+): Promise<Map<string, CapabilityPack>> {
+  const out = new Map<string, CapabilityPack>();
+  const mcpPackIds = grantedPacks.filter(
+    (id) => TOOL_PACKS[id] === undefined && id.startsWith(MCP_PACK_PREFIX),
+  );
+  if (mcpPackIds.length === 0) return out;
+
+  let sots:
+    | [
+        Array<{ name: string; status: string }>,
+        Array<{ tool_name: string; risk_class: string; server_name: string }>,
+      ]
+    | null;
+  try {
+    sots = await Promise.all([
+      ctx.repos.mcpServersRepo.listByTenant(tenantId),
+      ctx.repos.mcpServerToolsRepo.listExecutable({ tenant_id: tenantId }),
+    ]);
+  } catch {
+    sots = null;
+  }
+  if (sots === null) return out;
+  const [servers, executable] = sots;
+
+  const serverByName = new Map(servers.map((s) => [s.name, s]));
+  const toolsByServer = new Map<string, Array<{ tool_name: string; risk_class: string }>>();
+  for (const t of executable) {
+    const list = toolsByServer.get(t.server_name);
+    if (list) list.push(t);
+    else toolsByServer.set(t.server_name, [t]);
+  }
+
+  for (const packId of mcpPackIds) {
+    const serverName = packId.slice(MCP_PACK_PREFIX.length);
+    const server = serverByName.get(serverName);
+    const tools = toolsByServer.get(serverName) ?? [];
+    // Pack apontando para server inexistente/removido: mantém o id cru, que
+    // é o sinal honesto de "grant órfão" para o operador.
+    if (!server) {
+      out.set(packId, {
+        id: packId,
+        name: packId,
+        risk_level: null,
+        tools: [],
+        known: false,
+        external: true,
+      });
+      continue;
+    }
+    const risk = tools.reduce<string | null>((acc, t) => {
+      const a = acc === null ? -1 : RISK_ORDER.indexOf(acc as (typeof RISK_ORDER)[number]);
+      const b = RISK_ORDER.indexOf(t.risk_class as (typeof RISK_ORDER)[number]);
+      return b > a ? t.risk_class : acc;
+    }, null);
+    out.set(packId, {
+      id: packId,
+      // Server desativado ainda aparece — mas o operador precisa ver POR QUE
+      // o pack não rende ferramentas (listExecutable já exclui server
+      // inativo, então `tools` vem vazia).
+      name: server.status === 'active' ? `MCP · ${serverName}` : `MCP · ${serverName} (desativado)`,
+      risk_level: risk,
+      tools: tools.map((t) => mcpToolName(serverName, t.tool_name)),
+      known: true,
+      external: true,
+    });
+  }
+  return out;
+}
+
 export const agentsRouter = router({
   list: protectedProcedure.input(ListInputSchema).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);
@@ -350,6 +466,22 @@ export const agentsRouter = router({
    * grant row (packs/tools/denied) + resolução pack→tools via o registry
    * (grant-math, fail-closed). Edição de packs/denies: updateCapabilities
    * (fase 4); aquisição de tools NOVAS continua via propostas.
+   *
+   * Issue #481 item 3 — packs `mcp.<server>` NÃO vivem no catálogo estático
+   * (são dados por tenant, criados em /setup/mcp). Antes caíam no ramo
+   * "desconhecido" e apareciam no card com o id cru e 0 ferramentas. Agora
+   * são resolvidos contra as SoTs de MCP: nome do server (mcp_servers) e
+   * ferramentas realmente EXECUTÁVEIS (aprovadas + read-only + server ativo,
+   * `mcpServerToolsRepo.listExecutable`) — a mesma lista que o bridge usa em
+   * runtime, então o console não promete o que o dispatcher recusaria.
+   *
+   * `effective_tools`/`effective_tool_count` continuam sendo SÓ tools do
+   * REGISTRY, de propósito: (a) a visibilidade MCP é gated por
+   * FEATURE_MCP_TOOLS no processo do runtime (default OFF) e capada por
+   * turno, e (b) `denied_tools` não se aplica a nomes `mcp:*` (o bridge não
+   * consulta hard-denies) — contá-las aqui prometeria um controle que não
+   * existe. Os packs externos são marcados com `external: true` para o card
+   * poder explicar a diferença.
    */
   getCapabilities: protectedProcedure
     .input(GetByIdInputSchema)
@@ -373,15 +505,29 @@ export const agentsRouter = router({
         : [...BASE_AGENT_PACKS];
       const deniedTools = grant?.denied_tools ?? [];
       const deniedSet = new Set(deniedTools);
+      const mcpPacks = await resolveMcpPacks(ctx, tenantId, grantedPacks);
       const packs = grantedPacks.map((id) => {
         const def = TOOL_PACKS[id];
-        return {
-          id,
-          name: def?.name ?? id,
-          risk_level: def?.risk_level ?? null,
-          tools: def ? [...def.tools] : [],
-          known: def !== undefined,
-        };
+        if (def) {
+          return {
+            id,
+            name: def.name ?? id,
+            risk_level: def.risk_level ?? null,
+            tools: [...def.tools],
+            known: true,
+            external: false,
+          };
+        }
+        return (
+          mcpPacks.get(id) ?? {
+            id,
+            name: id,
+            risk_level: null,
+            tools: [] as string[],
+            known: false,
+            external: false,
+          }
+        );
       });
       const effectiveTools = [
         ...new Set([

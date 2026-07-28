@@ -269,6 +269,8 @@ type Capabilities = {
     risk_level: string | null;
     tools: string[];
     known: boolean;
+    /** Issue #481 — pack de servidor MCP externo (gerido em /setup/mcp). */
+    external: boolean;
   }>;
   granted_tools: string[];
   denied_tools: string[];
@@ -303,7 +305,12 @@ function OverviewTab({
     <Card>
       <CardHeader
         title="Capacidades da função"
-        description={`${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.`}
+        description={
+          `${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.` +
+          (capabilities.packs.some((p) => p.external)
+            ? ' Ferramentas de servidores MCP externos são contadas por pack (dependem da flag MCP do runtime).'
+            : '')
+        }
         actions={
           canManage && (
             <Button
@@ -327,6 +334,10 @@ function OverviewTab({
               <code className="font-mono text-2xs text-zinc-400">{pack.id}</code>
             </span>
             <span className="flex items-center gap-1.5">
+              {/* Issue #481 — packs MCP não entram no total do cabeçalho:
+                  a visibilidade deles é gated por FEATURE_MCP_TOOLS no
+                  runtime e hard-deny não se aplica a nomes `mcp:*`. */}
+              {pack.external && <Badge tone="info">externo (MCP)</Badge>}
               {pack.risk_level && <StatusBadge status={pack.risk_level} />}
               <Badge tone="neutral">
                 {pack.tools.length} ferramenta{pack.tools.length === 1 ? '' : 's'}

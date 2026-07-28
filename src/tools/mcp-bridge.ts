@@ -28,6 +28,7 @@ import {
   mcpServerToolsRepo,
   mcpPackId,
 } from '@/db/repositories.js';
+import { isMcpToolName, mcpToolName, parseMcpToolName } from './mcp-tool-names.js';
 import { mcpCallTool } from '@/lib/mcp-client.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { audit } from '@/governance/audit.js';
@@ -46,28 +47,14 @@ export type McpToolContext = {
   request_id: string;
 };
 
-const MCP_PREFIX = 'mcp:';
 const MAX_VISIBLE_MCP_TOOLS = 10;
 const MAX_RESULT_BYTES = 32 * 1024;
 const MAX_DESCRIPTION_CHARS = 400;
 
-export function isMcpToolName(name: string): boolean {
-  return name.startsWith(MCP_PREFIX);
-}
-
-export function mcpToolName(serverName: string, tool: string): string {
-  return `${MCP_PREFIX}${serverName}:${tool}`;
-}
-
-export function parseMcpToolName(
-  name: string,
-): { serverName: string; tool: string } | null {
-  if (!isMcpToolName(name)) return null;
-  const rest = name.slice(MCP_PREFIX.length);
-  const sep = rest.indexOf(':');
-  if (sep <= 0 || sep === rest.length - 1) return null;
-  return { serverName: rest.slice(0, sep), tool: rest.slice(sep + 1) };
-}
+// A gramática do nome vive em `mcp-tool-names.ts` (módulo puro) para que o
+// console possa importá-la sem o grafo do hot path — issue #481 item 3. O
+// re-export mantém a API pública deste módulo (usada por `_dispatcher.ts`).
+export { isMcpToolName, mcpToolName, parseMcpToolName };
 
 /** Packs `mcp.<server>` presentes no grant do agente corrente (ALS). */
 async function grantedMcpServerNames(): Promise<Set<string>> {

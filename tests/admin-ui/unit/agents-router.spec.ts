@@ -82,12 +82,25 @@ type GrantRow = {
  *     the raw pg error leak as a 500 — closes the TOCTOU window flagged
  *     by Codex Adversarial Review on PR #187 round 1 (issue #184).
  */
+type McpServerRow = { name: string; tenant_id: string; status: string };
+type McpToolRow = {
+  tenant_id: string;
+  server_name: string;
+  tool_name: string;
+  risk_class: string;
+};
+
 function makeRepos(
   opts: {
     tenants?: string[];
     agents?: Agent[];
     profiles?: Profile[];
     grants?: GrantRow[];
+    /** Issue #481 — SoTs de MCP consultadas por getCapabilities. */
+    mcpServers?: McpServerRow[];
+    mcpTools?: McpToolRow[];
+    /** Simula indisponibilidade das SoTs de MCP (fail-soft do card). */
+    mcpThrows?: boolean;
     failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
     simulateAgentPkConflict?: boolean;
   } = {},
@@ -547,6 +560,23 @@ function makeRepos(
           },
         });
         return { ok: true as const, grant: row };
+      },
+    },
+    // Issue #481 item 3 — getCapabilities resolve packs `mcp.<server>` contra
+    // estas SoTs. `listExecutable` já devolve SÓ o que o bridge executaria
+    // (aprovada + read-only + server ativo), então o mock recebe a lista
+    // pronta — o filtro é responsabilidade do repo real (coberto no leak
+    // suite / integração).
+    mcpServersRepo: {
+      async listByTenant(tenant_id: string) {
+        if (opts.mcpThrows) throw new Error('mcp SoT unavailable');
+        return (opts.mcpServers ?? []).filter((s) => s.tenant_id === tenant_id);
+      },
+    },
+    mcpServerToolsRepo: {
+      async listExecutable(args: { tenant_id: string }) {
+        if (opts.mcpThrows) throw new Error('mcp SoT unavailable');
+        return (opts.mcpTools ?? []).filter((t) => t.tenant_id === args.tenant_id);
       },
     },
     adminAuditLogRepo: {
@@ -1825,5 +1855,148 @@ describe('agentsRouter.updateCapabilities', () => {
       previous: unknown;
     };
     expect(summary.previous).toBeNull();
+  });
+});
+
+/**
+ * Issue #481 item 3 — packs `mcp.<server>` no card "Capacidades da função".
+ *
+ * Antes: como não existem no catálogo estático (`TOOL_PACKS`), caíam no ramo
+ * "desconhecido" e o card mostrava o id cru com 0 ferramentas. Agora são
+ * resolvidos contra as SoTs de MCP (nome do server + tools EXECUTÁVEIS — a
+ * mesma lista que o bridge usa em runtime).
+ */
+describe('agentsRouter.getCapabilities — packs MCP (#481)', () => {
+  const agent: Agent = {
+    id: 'agent-mcp',
+    tenant_id: 'tenant-A',
+    nome: 'Agente MCP',
+    status: 'active',
+    metadata: {},
+    created_at: new Date('2024-01-01T00:00:00Z'),
+    updated_at: new Date('2024-01-01T00:00:00Z'),
+  };
+  const grantWithMcp: GrantRow = {
+    id: 'grant-mcp',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-mcp',
+    granted_packs: ['baseline.core', 'mcp.acme'],
+    granted_tools: [],
+    denied_tools: [],
+    granted_by: 'seed',
+    reason: 'seed',
+  };
+  const acmeServer: McpServerRow = { name: 'acme', tenant_id: 'tenant-A', status: 'active' };
+  const acmeTools: McpToolRow[] = [
+    { tenant_id: 'tenant-A', server_name: 'acme', tool_name: 'list_orders', risk_class: 'low' },
+    { tenant_id: 'tenant-A', server_name: 'acme', tool_name: 'get_invoice', risk_class: 'high' },
+  ];
+
+  it('resolves name + real tool count from the MCP SoTs', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [acmeServer],
+      mcpTools: acmeTools,
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({
+      id: 'agent-mcp',
+    });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack).toBeDefined();
+    expect(pack.name).toBe('MCP · acme');
+    expect(pack.known).toBe(true);
+    expect(pack.external).toBe(true);
+    // Nome canônico do bridge — `mcp:<server>:<tool>`.
+    expect(pack.tools).toEqual(['mcp:acme:list_orders', 'mcp:acme:get_invoice']);
+    // risk_level = maior risk_class entre as tools executáveis.
+    expect(pack.risk_level).toBe('high');
+  });
+
+  it('never counts MCP tools in effective_tool_count (visibilidade é flag do runtime)', async () => {
+    const withMcp = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [acmeServer],
+      mcpTools: acmeTools,
+    });
+    const withoutMcp = makeRepos({
+      agents: [agent],
+      grants: [{ ...grantWithMcp, granted_packs: ['baseline.core'] }],
+    });
+    const a = await caller('owner', 'tenant-A', 'u1', withMcp).getCapabilities({ id: 'agent-mcp' });
+    const b = await caller('owner', 'tenant-A', 'u1', withoutMcp).getCapabilities({
+      id: 'agent-mcp',
+    });
+    expect(a.effective_tool_count).toBe(b.effective_tool_count);
+    expect(a.effective_tools.some((t) => t.startsWith('mcp:'))).toBe(false);
+  });
+
+  it('does not consult the MCP SoTs when no mcp.* pack is granted', async () => {
+    // mcpThrows garante que qualquer consulta seria detectada — sem pack MCP
+    // o resolver curto-circuita antes das queries.
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [{ ...grantWithMcp, granted_packs: ['baseline.core', 'domain.finance'] }],
+      mcpThrows: true,
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    expect(res.packs.map((p) => p.id)).toEqual(['baseline.core', 'domain.finance']);
+    expect(res.packs.every((p) => p.external === false)).toBe(true);
+  });
+
+  it('grant órfão (server removido) mantém o id cru e known=false', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [],
+      mcpTools: [],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.name).toBe('mcp.acme');
+    expect(pack.known).toBe(false);
+    expect(pack.external).toBe(true);
+    expect(pack.tools).toEqual([]);
+  });
+
+  it('server desativado é rotulado e rende 0 ferramentas', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [{ ...acmeServer, status: 'disabled' }],
+      // listExecutable já exclui server inativo — o mock reflete isso.
+      mcpTools: [],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.name).toBe('MCP · acme (desativado)');
+    expect(pack.tools).toEqual([]);
+  });
+
+  it('SoT de MCP indisponível degrada o card, não derruba a tela', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [grantWithMcp], mcpThrows: true });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.tools).toEqual([]);
+    expect(pack.known).toBe(false);
+    // O resto do card continua correto.
+    expect(res.packs.some((p) => p.id === 'baseline.core' && p.tools.length > 0)).toBe(true);
+  });
+
+  it('cross-tenant: server homônimo de outro tenant não resolve o pack', async () => {
+    const repos = makeRepos({
+      tenants: ['tenant-A', 'tenant-B'],
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [{ name: 'acme', tenant_id: 'tenant-B', status: 'active' }],
+      mcpTools: [
+        { tenant_id: 'tenant-B', server_name: 'acme', tool_name: 'leak_me', risk_class: 'low' },
+      ],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.known).toBe(false);
+    expect(pack.tools).toEqual([]);
   });
 });
