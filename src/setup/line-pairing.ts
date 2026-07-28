@@ -207,6 +207,34 @@ export async function startChannelPairing(args: {
         });
         return;
       }
+      // Review PR #528 (P1) — a tentativa ainda é a CORRENTE?
+      //
+      // `abortPairing` só consegue resolver a promise se o `open` ainda não
+      // tiver disparado. Se o operador cancelou DURANTE a promoção do auth
+      // state, a sessão antiga chegava aqui com `matched: true` e ATIVAVA a
+      // linha — o oposto exato do que cancelar significa. O guard de
+      // identidade que já protegia o estado em memória passa a proteger
+      // também o efeito colateral: sem posse corrente, o auth promovido é
+      // destruído e nada é ativado.
+      if (!stillCurrent()) {
+        await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(
+          () => undefined,
+        );
+        logger.warn(
+          { channel_id: channel.id },
+          'pairing_session.superseded_result_discarded',
+        );
+        await auditScoped(channel, {
+          acao: 'pairing_session_failed',
+          metadata: {
+            channel_id: channel.id,
+            declared_line: declared,
+            reason: 'superseded_by_abort_or_retry',
+            ...actorMetadata(args.actor),
+          },
+        });
+        return;
+      }
       // Posse provada — ativa. 23505 do índice global (091) ⇒ a linha já
       // está ativa em OUTRO workspace: fail-closed, remove o auth promovido
       // (mantê-lo permitiria subir uma sessão de linha não-autorizada).

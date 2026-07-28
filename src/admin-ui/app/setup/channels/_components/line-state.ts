@@ -10,6 +10,7 @@ import type { BadgeTone } from '../../../../components/ui/badge.js';
 export type LineState =
   | 'declared'
   | 'pairing'
+  | 'aborting'
   | 'verified_offline'
   | 'connected'
   | 'recovering'
@@ -34,6 +35,11 @@ const STATES: Record<LineState, StatePresentation> = {
     label: 'pareando',
     tone: 'info',
     help: 'Sessão de pareamento aberta. Leia o QR ou digite o código no WhatsApp.',
+  },
+  aborting: {
+    label: 'cancelando',
+    tone: 'warning',
+    help: 'Cancelamento pedido. A linha reabre quando o runtime confirmar que a sessão morreu.',
   },
   verified_offline: {
     label: 'verificada',
@@ -115,7 +121,9 @@ export type LineAction = 'pair' | 'repair' | 'disable' | null;
  * atual de forma auditada.
  */
 export function primaryAction(line: { state: string; active: boolean }): LineAction {
-  if (line.state === 'pairing') return null;
+  // `aborting` não oferece CTA: o backend rejeita um novo start até confirmar
+  // o abort, e um botão que só devolve CONFLICT é uma mentira de UI.
+  if (line.state === 'pairing' || line.state === 'aborting') return null;
   if (line.active) return 'repair';
   if (line.state === 'logged_out') return 'repair';
   return 'pair';

@@ -64,6 +64,9 @@ export default function LinePairingModal({
   const start = trpc.channelLines.startPairing.useMutation();
   const abort = trpc.channelLines.abortPairing.useMutation();
 
+  // Poll constante enquanto o modal está aberto — inclusive em `aborting`, em
+  // que a tela precisa reabrir sozinha assim que o runtime confirmar o
+  // cancelamento e devolver a linha para `declared`.
   const status = trpc.channelLines.getPairingStatus.useQuery(
     { tenantId, agentId, channelId },
     { refetchInterval: POLL_MS, refetchOnWindowFocus: true },
@@ -71,6 +74,12 @@ export default function LinePairingModal({
 
   const state = status.data?.state ?? 'declared';
   const isPairing = state === 'pairing';
+  /**
+   * Cancelamento pedido, aguardando o runtime confirmar. O backend REJEITA um
+   * novo start até lá (a sessão antiga ainda pode estar viva); a UI espera
+   * junto em vez de oferecer um botão que só devolveria CONFLICT.
+   */
+  const isAborting = state === 'aborting';
   const material = status.data?.material ?? null;
 
   // Relógio do countdown. Só corre durante o pareamento — um timer de 1s
@@ -80,6 +89,7 @@ export default function LinePairingModal({
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isPairing]);
+
 
   // Toda transição relevante invalida a listagem do caller (o estado da
   // linha aparece na tabela).
@@ -152,6 +162,10 @@ export default function LinePairingModal({
           <Button variant="secondary" onClick={() => void handleAbort()} loading={abort.isPending}>
             Cancelar pareamento
           </Button>
+        ) : isAborting ? (
+          <Button variant="secondary" disabled loading>
+            Cancelando…
+          </Button>
         ) : (
           <>
             <Button variant="secondary" onClick={onClose}>
@@ -181,7 +195,15 @@ export default function LinePairingModal({
           </Alert>
         )}
 
-        {!isPairing && (
+        {isAborting && (
+          <Alert tone="info">
+            Encerrando a sessão de pareamento. A linha volta a aceitar um novo
+            pareamento assim que o runtime confirmar — evita que a tentativa
+            antiga conclua sozinha e ative a linha.
+          </Alert>
+        )}
+
+        {!isPairing && !isAborting && (
           <>
             {/* Não usa <Field> aqui de propósito: Field renderiza um <label>
                 e aninhar <button> dentro de <label> duplica a ativação. */}

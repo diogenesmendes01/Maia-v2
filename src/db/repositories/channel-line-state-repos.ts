@@ -28,6 +28,8 @@ import type { ChannelLineStateRow } from '../schema.js';
 export type LineState =
   | 'declared'
   | 'pairing'
+  /** Abort pedido, aguardando o runtime confirmar que a sessão morreu. */
+  | 'aborting'
   | 'verified_offline'
   | 'connected'
   | 'recovering'
@@ -269,12 +271,27 @@ export const channelLineStateRepo = {
         return { ok: true as const, row: current, idempotent: true };
       }
 
+      // Abort é IDEMPOTENTE de verdade: um segundo pedido enquanto o primeiro
+      // ainda não foi consumido devolve a mesma operação em vez de trocar o
+      // `command_id` — trocar quebraria o CAS que o worker usa para confirmar
+      // o abort (review PR #528, P1).
+      if (args.command === 'abort_pairing' && current?.command === 'abort_pairing') {
+        return { ok: true as const, row: current, idempotent: true };
+      }
+
       if (args.command === 'start_pairing') {
         const alive =
           current?.state === 'pairing' &&
           current.pairing_expires_at !== null &&
           current.pairing_expires_at.getTime() > now.getTime();
-        if (alive) return { ok: false as const, reason: 'pairing_in_progress' as const };
+        // Review PR #528 (P1): `aborting` também BLOQUEIA um novo start. A
+        // sequência start → cancelar → tentar de novo (antes do tick) fazia o
+        // novo comando sobrescrever o abort pendente: a sessão antiga nunca
+        // era abortada, seguia viva e podia concluir e ATIVAR a linha. O
+        // estado só reabre depois que o runtime CONFIRMA o abort.
+        if (alive || current?.state === 'aborting') {
+          return { ok: false as const, reason: 'pairing_in_progress' as const };
+        }
       }
 
       const base = {
@@ -311,14 +328,14 @@ export const channelLineStateRepo = {
           : args.command === 'abort_pairing'
             ? {
                 ...base,
-                // Abortar volta para `declared` SÓ se havia pairing em curso —
-                // um abort sobre uma linha conectada não pode "desconectá-la"
-                // no modelo de estado.
+                // Havia pareamento em curso ⇒ vai para `aborting`, NÃO para
+                // `declared`: a linha só reabre para um novo start quando o
+                // runtime confirmar que a sessão morreu. Um abort sobre uma
+                // linha conectada não muda estado (não é um "desconectar").
                 ...(current === null || current.state === 'pairing'
                   ? {
-                      state: 'declared' as const,
+                      state: 'aborting' as const,
                       reason_code: 'operator_abort',
-                      pairing_expires_at: null,
                     }
                   : {}),
               }
@@ -707,6 +724,47 @@ export const channelLineStateRepo = {
         tenant_id: channel_line_state.tenant_id,
         agent_id: channel_line_state.agent_id,
       });
+  },
+
+  /**
+   * Resgata aborts órfãos. Se o processo que detinha a PairingSession morreu
+   * ANTES de confirmar o abort, a row ficaria presa em `aborting` para sempre
+   * e a linha nunca mais poderia ser pareada. A morte do processo já cumpriu o
+   * efeito do abort (o socket foi junto), então a row volta para `declared`.
+   *
+   * O critério é a LEASE, não a identidade do dono — mesmo racional de
+   * `failStalePairings`.
+   */
+  async releaseStaleAborts(): Promise<Array<{ channel_id: string }>> {
+    const now = new Date();
+    return db
+      .update(channel_line_state)
+      .set({
+        state: 'declared',
+        reason_code: 'operator_abort',
+        command: null,
+        command_method: null,
+        command_claimed_at: null,
+        owner_instance: null,
+        owner_lease_expires_at: null,
+        pairing_expires_at: null,
+        pairing_material: null,
+        pairing_material_key_id: null,
+        pairing_material_kind: null,
+        pairing_material_expires_at: null,
+        last_transition_at: now,
+        updated_at: now,
+      })
+      .where(
+        and(
+          eq(channel_line_state.state, 'aborting'),
+          sql`${channel_line_state.command} IS NULL`,
+          sql`(${channel_line_state.owner_instance} IS NULL
+                OR ${channel_line_state.owner_lease_expires_at} IS NULL
+                OR ${channel_line_state.owner_lease_expires_at} < ${now})`,
+        ),
+      )
+      .returning({ channel_id: channel_line_state.channel_id });
   },
 
   /** Sweep barato do material vencido (o estado da tentativa continua). */

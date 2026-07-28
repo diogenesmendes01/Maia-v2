@@ -81,9 +81,16 @@ CREATE TABLE IF NOT EXISTS channel_line_state (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
 
+  -- `aborting` (review PR #528, P1): estado INTERMEDIÁRIO entre o operador
+  -- pedir o cancelamento e o runtime confirmar que a PairingSession morreu.
+  -- Sem ele, o abort devolvia a linha para `declared` NA HORA e um
+  -- `start_pairing` imediato sobrescrevia o comando de abort antes do tick —
+  -- a sessão antiga nunca era abortada e ainda podia concluir e ATIVAR a
+  -- linha. O oposto do que "cancelar" significa.
   CONSTRAINT channel_line_state_state_chk CHECK (state IN (
     'declared',
     'pairing',
+    'aborting',
     'verified_offline',
     'connected',
     'recovering',

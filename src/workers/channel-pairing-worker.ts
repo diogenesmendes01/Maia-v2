@@ -173,15 +173,32 @@ async function executeStartPairing(row: {
   }
 }
 
+/**
+ * Cancelamento. A row já está em `aborting` (o console a colocou lá), o que
+ * BLOQUEIA um novo `start_pairing` — é isto que impede a sequência
+ * start → cancelar → tentar de novo de sobrescrever o abort e deixar a sessão
+ * antiga viva (review PR #528, P1).
+ *
+ * Só DEPOIS de `abortChannelPairing` resolver — a sessão realmente morreu — a
+ * linha volta para `declared` e aceita um novo pareamento.
+ */
 async function executeAbort(row: {
   channel_id: string;
   tenant_id: string;
   agent_id: string;
+  command_id: string | null;
   actor_id: string | null;
   actor_role: string | null;
   correlation_id: string | null;
 }): Promise<void> {
   await abortChannelPairing(row.channel_id);
+  await channelLineStateRepo.transition({
+    channel_id: row.channel_id,
+    state: 'declared',
+    reason_code: 'operator_abort',
+    expected_command_id: row.command_id,
+    release_owner: true,
+  });
   await runWithTenantContext({ tenant_id: row.tenant_id, agent_id: row.agent_id }, () =>
     audit({
       acao: 'pairing_session_aborted',
@@ -252,6 +269,12 @@ async function sweepStalePairings(): Promise<void> {
         },
       }),
     ).catch(() => undefined);
+  }
+  // Aborts órfãos: o processo que detinha a sessão morreu antes de confirmar.
+  // A morte já cumpriu o efeito do abort — a linha volta a ser pareável em vez
+  // de ficar presa em `aborting` para sempre.
+  for (const row of await channelLineStateRepo.releaseStaleAborts()) {
+    logger.info({ channel_id: row.channel_id }, 'channel_pairing.stale_abort_released');
   }
   await channelLineStateRepo.expireStaleMaterial();
 }

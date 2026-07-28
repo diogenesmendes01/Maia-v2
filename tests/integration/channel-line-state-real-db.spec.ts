@@ -222,7 +222,138 @@ d('channel_line_state — idempotência e concorrência', () => {
     expect((conflicts[0] as { reason: string }).reason).toBe('pairing_in_progress');
   });
 
-  it('abort é idempotente e devolve a linha para declared, limpando o material', async () => {
+  it('SEQUÊNCIA start → abort → start ANTES do tick: o segundo start é rejeitado', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    const abortKey = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: abortKey,
+      ...ACTOR,
+    });
+
+    // Antes do fix: o abort devolvia a linha para `declared` na hora, este
+    // start passava, sobrescrevia o comando de abort — e a sessão antiga
+    // seguia viva, podendo concluir e ATIVAR a linha.
+    const retry = await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    expect(retry).toEqual({ ok: false, reason: 'pairing_in_progress' });
+
+    const state = await channelLineStateRepo.getStateForScope(scope);
+    expect(state?.state).toBe('aborting');
+    expect(state?.command).toBe('abort_pairing');
+    expect(state?.command_id).toBe(abortKey);
+  });
+
+  it('confirmado o abort, um novo start passa', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    const abortKey = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: abortKey,
+      ...ACTOR,
+    });
+    // O worker confirma que a sessão morreu.
+    await channelLineStateRepo.transition({
+      channel_id: channelId,
+      state: 'declared',
+      reason_code: 'operator_abort',
+      expected_command_id: abortKey,
+      release_owner: true,
+    });
+
+    const retry = await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    expect(retry.ok).toBe(true);
+  });
+
+  it('abort repetido antes do tick não troca o command_id (CAS do worker preservado)', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    const firstAbort = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: firstAbort,
+      ...ACTOR,
+    });
+    const second = await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    expect(second).toMatchObject({ ok: true, idempotent: true });
+    expect((await channelLineStateRepo.getStateForScope(scope))?.command_id).toBe(firstAbort);
+  });
+
+  it('abort órfão (dono morto) é resgatado: a linha volta a ser pareável', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+    });
+    const abortKey = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'abort_pairing',
+      command_id: abortKey,
+      ...ACTOR,
+    });
+    await channelLineStateRepo.claimNextCommand('dead-instance', 1);
+    await channelLineStateRepo.clearCommand({
+      channel_id: channelId,
+      command_id: abortKey,
+      owner_instance: 'dead-instance',
+      lease_ms: 1,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const released = await channelLineStateRepo.releaseStaleAborts();
+    expect(released.map((r) => r.channel_id)).toContain(channelId);
+    expect((await channelLineStateRepo.getStateForScope(scope))?.state).toBe('declared');
+  });
+
+  it('abort é idempotente e devolve a linha para aborting, limpando o material', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
     const startKey = randomUUID();
@@ -253,12 +384,13 @@ d('channel_line_state — idempotência e concorrência', () => {
     }
 
     const state = await channelLineStateRepo.getStateForScope(scope);
-    expect(state?.state).toBe('declared');
+    // `aborting`, não `declared`: a linha só reabre quando o runtime confirmar.
+    expect(state?.state).toBe('aborting');
     expect(state?.pairing_material).toBeNull();
     expect(state?.reason_code).toBe('operator_abort');
   });
 
-  it('após abort, um novo start abre normalmente (retry não reutiliza a tentativa anterior)', async () => {
+  it('após abort CONFIRMADO, um novo start abre normalmente (retry não reutiliza a tentativa anterior)', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
     await channelLineStateRepo.requestCommand({
@@ -268,11 +400,19 @@ d('channel_line_state — idempotência e concorrência', () => {
       command_id: randomUUID(),
       ...ACTOR,
     });
+    const abortKey = randomUUID();
     await channelLineStateRepo.requestCommand({
       scope,
       command: 'abort_pairing',
-      command_id: randomUUID(),
+      command_id: abortKey,
       ...ACTOR,
+    });
+    await channelLineStateRepo.transition({
+      channel_id: channelId,
+      state: 'declared',
+      reason_code: 'operator_abort',
+      expected_command_id: abortKey,
+      release_owner: true,
     });
     const retry = await channelLineStateRepo.requestCommand({
       scope,
@@ -330,11 +470,20 @@ d('channel_line_state — material cifrado e restart', () => {
       command_id: oldKey,
       ...ACTOR,
     });
+    const abortKey = randomUUID();
     await channelLineStateRepo.requestCommand({
       scope,
       command: 'abort_pairing',
-      command_id: randomUUID(),
+      command_id: abortKey,
       ...ACTOR,
+    });
+    // O runtime confirma o abort — só então a linha reabre para um novo start.
+    await channelLineStateRepo.transition({
+      channel_id: channelId,
+      state: 'declared',
+      reason_code: 'operator_abort',
+      expected_command_id: abortKey,
+      release_owner: true,
     });
     await channelLineStateRepo.requestCommand({
       scope,

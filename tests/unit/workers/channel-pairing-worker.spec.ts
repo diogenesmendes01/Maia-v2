@@ -33,6 +33,7 @@ const {
     putPairingMaterial: vi.fn(async () => true),
     transition: vi.fn(async () => true),
     failStalePairings: vi.fn(async () => []),
+    releaseStaleAborts: vi.fn(async () => []),
     expireStaleMaterial: vi.fn(async () => 0),
   },
   auditMock: vi.fn(async () => undefined),
@@ -116,6 +117,7 @@ beforeEach(() => {
     });
   });
   repoMock.failStalePairings.mockResolvedValue([]);
+  repoMock.releaseStaleAborts.mockResolvedValue([]);
   repoMock.renewOwnerLeases.mockResolvedValue(0);
   repoMock.clearCommand.mockResolvedValue(true);
   repoMock.putPairingMaterial.mockResolvedValue(true);
@@ -286,6 +288,38 @@ describe('abort e repair', () => {
     const aborted = auditCalls.find((c) => c.acao === 'pairing_session_aborted');
     expect(aborted?.ctx).toMatchObject({ tenant_id: 'tenant-A', agent_id: 'agent-a' });
     expect(aborted?.metadata).toMatchObject({ actor_id: 'user-1', actor_role: 'owner' });
+  });
+
+  it('a linha só volta para declared DEPOIS que a sessão foi realmente abortada', async () => {
+    const order: string[] = [];
+    abortPairingMock.mockImplementation(async () => {
+      order.push('abort');
+    });
+    repoMock.transition.mockImplementation(async (a: { state: string }) => {
+      order.push(`transition:${a.state}`);
+      return true;
+    });
+    claimOnce(commandRow({ command: 'abort_pairing', command_method: null }));
+    await runChannelPairingWorker();
+
+    // A ordem é o invariante: reabrir a linha ANTES de matar a sessão é
+    // exatamente o que permitia a tentativa antiga concluir e ativar.
+    expect(order).toEqual(['abort', 'transition:declared']);
+    expect(repoMock.transition).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: 'declared',
+        reason_code: 'operator_abort',
+        expected_command_id: COMMAND_ID,
+        release_owner: true,
+      }),
+    );
+  });
+
+  it('aborts órfãos (dono morto) são resgatados no sweep', async () => {
+    repoMock.releaseStaleAborts.mockResolvedValue([{ channel_id: CHANNEL_ID }]);
+    claimOnce(null);
+    await runChannelPairingWorker();
+    expect(repoMock.releaseStaleAborts).toHaveBeenCalled();
   });
 
   it('repair delega ao recovery POR ALVO e devolve a linha para declared', async () => {

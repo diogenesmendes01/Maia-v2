@@ -159,6 +159,48 @@ describe('startChannelPairing — serialização concorrente (review #498 alto 4
   });
 });
 
+describe('resultado SUPERSEDED não ativa a linha (review PR #528, P1)', () => {
+  it('abort DURANTE a promoção: matched=true chega tarde, o canal NÃO é ativado', async () => {
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    // O operador cancela. A PairingSession, porém, já tinha disparado `open`
+    // — `abortPairing` não consegue mais resolver a promise dela, e ela
+    // resolve sozinha com matched=true logo depois.
+    await abortChannelPairing(CHANNEL.id);
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    // ESTE é o bug que a #528 apontou: antes, a tentativa cancelada ativava a
+    // linha assim mesmo.
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    expect(channelPairingStatus(CHANNEL.id).phase).toBe('idle');
+    // O auth promovido é destruído — manter permitiria subir uma sessão de
+    // uma linha que o operador acabou de recusar.
+    expect(rmMock).toHaveBeenCalled();
+    const failed = auditCalls.find((c) => c.acao === 'pairing_session_failed');
+    expect(failed?.ctx).toEqual({ tenant_id: 'tenant-pair', agent_id: 'agent-pair' });
+  });
+
+  it('uma tentativa NOVA também invalida o resultado da anterior', async () => {
+    const first = pendingPairing();
+    managerMock.startPairingSession.mockReturnValueOnce(first.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    await abortChannelPairing(CHANNEL.id);
+    const second = pendingPairing();
+    managerMock.startPairingSession.mockReturnValueOnce(second.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'code' });
+
+    first.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    expect(channelPairingStatus(CHANNEL.id).phase).toBe('pairing');
+  });
+});
+
 describe('audits sob ALS do dono do canal (review #498 alto 2)', () => {
   it('started/verified auditam com tenant/agent do canal — nunca bucket system', async () => {
     const gate = pendingPairing();

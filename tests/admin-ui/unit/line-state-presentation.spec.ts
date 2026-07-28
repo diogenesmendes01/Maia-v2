@@ -21,6 +21,7 @@ import {
 const ALL_STATES: LineState[] = [
   'declared',
   'pairing',
+  'aborting',
   'verified_offline',
   'connected',
   'recovering',
@@ -66,6 +67,12 @@ describe('primaryAction — a CTA não pode contradizer a posse', () => {
 
   it('durante o pareamento não há CTA primária — só acompanhar/cancelar', () => {
     expect(primaryAction({ state: 'pairing', active: false })).toBeNull();
+  });
+
+  it('durante o CANCELAMENTO também não há CTA: o backend rejeitaria o start', () => {
+    // Um botão "Parear" em `aborting` só devolveria CONFLICT — a sessão antiga
+    // ainda pode estar viva. A UI espera a confirmação junto com o backend.
+    expect(primaryAction({ state: 'aborting', active: false })).toBeNull();
   });
 });
 
