@@ -226,58 +226,39 @@ export async function downloadAndDigestBackupObject(
 }
 
 /**
- * Walk the bucket prefix and delete dumps older than
- * `BACKUP_RETENTION_CLOUD_DAYS`. No-op if S3 isn't configured. Errors are
- * logged and counted but never thrown — backup retention is best-effort.
+ * List the object keys under the backup prefix.
  *
- * Returns `{ scanned, deleted }` so the caller can audit a meaningful number.
+ * REPLACES `pruneCloud`, removed in the round-1 P1 fix. That function selected
+ * objects to DELETE by `LastModified`, swallowed a per-chunk failure and
+ * returned a partial count that the caller audited as `completed` — so a pass
+ * could destroy an artifact under legal hold and report success for a job that
+ * half-worked.
+ *
+ * Deletion is now planned from `backup_runs` + `backup_manifests` and executed
+ * by `src/ops/backup/retention.ts`, one confirmed object at a time. This
+ * listing exists only to RECONCILE: keys here with no run row are reported to
+ * the operator, never deleted on a guess — an unidentified object may be
+ * exactly the one somebody is holding.
  */
-export async function pruneCloud(): Promise<{ scanned: number; deleted: number }> {
-  if (!config.BACKUP_S3_BUCKET) return { scanned: 0, deleted: 0 };
-  const cutoff = Date.now() - config.BACKUP_RETENTION_CLOUD_DAYS * 86_400_000;
+export async function listBackupObjectKeys(): Promise<string[]> {
+  if (!config.BACKUP_S3_BUCKET) return [];
   const client = getS3Client();
-  let scanned = 0;
-  const keysToDelete: string[] = [];
+  const keys: string[] = [];
   let continuationToken: string | undefined;
   do {
-    const listRes: import('@aws-sdk/client-s3').ListObjectsV2CommandOutput =
-      await client.send(
-        new ListObjectsV2Command({
-          Bucket: config.BACKUP_S3_BUCKET,
-          Prefix: `${config.BACKUP_S3_PREFIX}/`,
-          ContinuationToken: continuationToken,
-        }),
-      );
+    const listRes: import('@aws-sdk/client-s3').ListObjectsV2CommandOutput = await client.send(
+      new ListObjectsV2Command({
+        Bucket: config.BACKUP_S3_BUCKET,
+        Prefix: `${config.BACKUP_S3_PREFIX}/`,
+        ContinuationToken: continuationToken,
+      }),
+    );
     for (const obj of listRes.Contents ?? []) {
-      scanned += 1;
-      const lastModified = obj.LastModified?.getTime() ?? 0;
-      if (obj.Key && lastModified < cutoff) {
-        keysToDelete.push(obj.Key);
-      }
+      if (obj.Key) keys.push(obj.Key);
     }
     continuationToken = listRes.IsTruncated ? listRes.NextContinuationToken : undefined;
   } while (continuationToken);
-  if (keysToDelete.length === 0) return { scanned, deleted: 0 };
-  // S3 DeleteObjects accepts up to 1000 keys per request; chunk defensively.
-  let deleted = 0;
-  for (let i = 0; i < keysToDelete.length; i += 1000) {
-    const chunk = keysToDelete.slice(i, i + 1000);
-    try {
-      const res = await client.send(
-        new DeleteObjectsCommand({
-          Bucket: config.BACKUP_S3_BUCKET,
-          Delete: { Objects: chunk.map((Key) => ({ Key })) },
-        }),
-      );
-      deleted += res.Deleted?.length ?? 0;
-    } catch (err) {
-      logger.warn(
-        { err: (err as Error).message, chunk_size: chunk.length },
-        'backup.cloud_prune_chunk_failed',
-      );
-    }
-  }
-  return { scanned, deleted };
+  return keys;
 }
 
 /** Test-only: reset the cached client between specs. */

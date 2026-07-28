@@ -9,8 +9,15 @@
  */
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { db } from '@/db/client.js';
-import { backup_manifests, backup_runs, restore_drills } from '@/db/schema.js';
+import {
+  backup_manifests,
+  backup_runs,
+  legal_holds,
+  restore_drills,
+  retention_runs,
+} from '@/db/schema.js';
 import type { SignedManifest } from '@/ops/backup/manifest.js';
+import type { RetentionCandidate } from '@/ops/backup/retention.js';
 import type { BackupEvidenceStore, BackupTrigger } from '@/ops/backup/service.js';
 import type { BackupState } from '@/ops/backup/state-machine.js';
 
@@ -55,6 +62,115 @@ export const backupEvidenceStore: BackupEvidenceStore = {
     });
   },
 };
+
+/**
+ * Artifacts retention may consider, for one destination (issue #520 §10).
+ *
+ * The join to `backup_manifests` is what makes `has_manifest` real: an artifact
+ * with no signed manifest cannot be identified, so the planner refuses to
+ * delete it. Selection is by EVIDENCE (`delete_after`, state, manifest), never
+ * by file mtime or `LastModified` — that was the round-1 P1 finding.
+ */
+export async function listRetentionCandidates(
+  destination: 'local' | 's3',
+): Promise<RetentionCandidate[]> {
+  const rows = await db.execute<{
+    backup_id: string;
+    artifact_ref: string | null;
+    state: string;
+    delete_after: string | null;
+    has_manifest: boolean;
+  }>(sql`
+    SELECT r.id AS backup_id,
+           r.artifact_ref,
+           r.state,
+           r.delete_after::text AS delete_after,
+           (m.id IS NOT NULL) AS has_manifest
+      FROM ${backup_runs} r
+      LEFT JOIN ${backup_manifests} m ON m.backup_run_id = r.id
+     WHERE r.destination_kind = ${destination}
+       AND r.state <> 'deleted'
+       AND r.artifact_ref IS NOT NULL
+     ORDER BY r.delete_after ASC NULLS LAST
+  `);
+  return rows.rows.map((r) => ({
+    backup_id: r.backup_id,
+    artifact_ref: r.artifact_ref ?? '',
+    state: r.state as RetentionCandidate['state'],
+    destination_kind: destination,
+    delete_after: r.delete_after ? new Date(r.delete_after) : null,
+    has_manifest: r.has_manifest === true,
+  }));
+}
+
+/**
+ * Is ANY legal hold active right now?
+ *
+ * A dump is a container of every tenant's data, so a hold anywhere freezes the
+ * whole artifact. Returns `null` when the question could not be answered — the
+ * caller FAILS the pass rather than treating "I could not check" as "no hold".
+ */
+export async function anyActiveLegalHold(
+  at: Date,
+): Promise<{ held: boolean; hold_ids: string[] } | null> {
+  try {
+    const res = await db.execute<{ id: string }>(sql`
+      SELECT id FROM ${legal_holds}
+       WHERE status = 'active'
+         AND effective_from <= ${at}
+         AND (effective_until IS NULL OR effective_until > ${at})
+       LIMIT 50
+    `);
+    const ids = res.rows.map((r) => r.id);
+    return { held: ids.length > 0, hold_ids: ids };
+  } catch {
+    return null;
+  }
+}
+
+/** Move a run row to `deleted` once its artifact is confirmed gone. */
+export async function markRunDeleted(backupId: string): Promise<void> {
+  await db
+    .update(backup_runs)
+    .set({ state: 'deleted', updated_at: new Date() })
+    .where(eq(backup_runs.id, backupId));
+}
+
+/** Persist the retention pass itself (the evidence that it ran, and how). */
+export async function recordRetentionRun(row: {
+  correlation_id: string;
+  data_class: string;
+  dry_run: boolean;
+  policy_version: string;
+  status: 'completed' | 'partial' | 'failed';
+  scanned: number;
+  eligible: number;
+  deleted: number;
+  skipped_held: number;
+  failed: number;
+  cursor_watermark: Date | null;
+  error_code: string | null;
+}): Promise<void> {
+  await db.insert(retention_runs).values({
+    // Backup artifacts are DB-wide; the reserved `system` sentinel is their
+    // explicit home (migration 102 only forbids the legacy `default`).
+    tenant_id: 'system',
+    agent_id: 'system',
+    correlation_id: row.correlation_id,
+    data_class: row.data_class,
+    dry_run: row.dry_run,
+    policy_version: row.policy_version,
+    status: row.status,
+    scanned: row.scanned,
+    eligible: row.eligible,
+    deleted: row.deleted,
+    skipped_held: row.skipped_held,
+    failed: row.failed,
+    cursor_watermark: row.cursor_watermark,
+    error_code: row.error_code,
+    finished_at: new Date(),
+  });
+}
 
 export interface ReadinessFacts {
   last_local_verified_at: Date | null;

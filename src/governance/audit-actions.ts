@@ -68,6 +68,11 @@ export const AUDIT_ACTIONS = [
   'backup_completed',
   'backup_failed',
   'backup_s3_upload_failed',
+  // Emitted by the pre-#520 `cloud_backup_rotation` worker. The worker was
+  // replaced by `backup_retention` (manifest-driven, hold-aware, conclusive
+  // outcome) in the #520 round-1 fix, so nothing emits these any more — they
+  // stay in the enum because HISTORICAL audit rows carry them and the watcher
+  // must keep resolving the label.
   'backup_cloud_rotation_completed',
   'backup_cloud_rotation_failed',
   'restore_test_passed',

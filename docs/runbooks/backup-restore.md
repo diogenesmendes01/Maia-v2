@@ -117,6 +117,28 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 
 **A retenção não apaga nada hoje.** `RETENTION_DRY_RUN=true` é o default e, sem uma `RETENTION_POLICY` aprovada pelo DPO, `resolveRetention` devolve `purgeable: false` para todas as classes. Ver a [matriz](../architecture/concerns/data-retention-matrix.md) para as perguntas em aberto e o procedimento de ativação.
 
+### Retenção de artefatos (`backup_retention`, domingos 04:00)
+
+Substituiu o `cloud_backup_rotation`, que selecionava por `LastModified`, engolia falha de chunk e auditava sucesso para passe parcial. O job atual:
+
+- planeja **cada** exclusão a partir de `backup_runs` + `backup_manifests` — nunca por mtime;
+- avalia **legal hold** sob o lock de retenção antes de tocar em qualquer coisa; hold ativo em QUALQUER tenant congela todos os artefatos, porque um dump é um contêiner dos dados de todos;
+- **confirma** cada exclusão (delete que "deu certo" mas não apagou conta como falha);
+- audita desfecho **conclusivo**: `retention_run_completed` só quando nada falhou, senão `retention_run_failed` + alerta.
+
+```sql
+-- Passes de retenção e o que cada um fez
+SELECT started_at, data_class, dry_run, status, scanned, eligible,
+       deleted, skipped_held, failed, error_code, cursor_watermark
+FROM retention_runs ORDER BY started_at DESC LIMIT 10;
+```
+
+`skipped_held > 0` é o legal hold funcionando. `status='partial'` é retomável — o `cursor_watermark` diz onde recomeçar.
+
+**Artefatos sem manifesto** (`unidentified` na auditoria) NÃO são apagados: sem manifesto não dá para provar o que o arquivo é, e apagar no chute é exatamente o defeito que o mtime causava. Artefatos anteriores à #520 caem aqui e precisam ser aposentados à mão, depois de conferidos.
+
+O único lugar onde mtime sobrevive é a varredura de `.partial` órfão — que por construção não tem manifesto e não é backup, e sim resíduo de uma run que morreu.
+
 **Legal hold** — criação e liberação exigem papel e são auditadas. Um hold ativo bloqueia o purge aplicável; a liberação **não** dispara exclusão, apenas permite reavaliação.
 
 **Solicitação LGPD** — o pedido é persistido por tenant, a identidade é verificada **fora do LLM** (o banco recusa avançar sem o carimbo humano — `privacy_requests_identity_chk`), e um export só existe com prazo de expiração. O LLM nunca autoriza nem executa exclusão.
@@ -133,6 +155,7 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 Registrado aqui para que ninguém opere com expectativa errada:
 
 - O drill (`npm run restore:test`) ainda usa o dump **local** mais recente e não baixa/decifra o artefato off-site nem escreve em `restore_drills`.
-- O executor de retenção por classe (jobs em lote, cursor, purge com avaliação de hold) e o workflow de execução das solicitações de privacidade ainda não existem — só o mecanismo de decisão e o schema.
+- O executor de retenção existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes de dado — mensagens, mídia, memória, traces — só existem o mecanismo de decisão e o schema; não há job que os varra.
+- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco.
 - A reconciliação de tombstones pós-restore é **manual** (passo 3.6): o planejador e o gate estão implementados e testados, mas não há job que os execute automaticamente.
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado.

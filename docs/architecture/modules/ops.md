@@ -19,6 +19,9 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/single-flight.ts` | Namespaced global advisory locks for backup / drill / retention / reconciliation |
 | `src/ops/backup/service.ts` | `runVerifiedBackup` — the ONE runner shared by cron and CLI |
 | `src/ops/backup/adapters.ts` | Real IO behind the service's ports (`pg_dump`, fs, S3, DB) |
+| `src/ops/backup/remote-verify.ts` | Proving the OFF-SITE copy: provider-computed checksum or full re-download. Never the uploader's own metadata |
+| `src/ops/backup/upload-deadline.ts` | Cancellable upload: aborts, awaits settlement, reaps any orphan object |
+| `src/ops/backup/retention.ts` | Manifest-driven, hold-aware artifact deletion with confirmation and a conclusive outcome |
 | `src/ops/backup/rpo.ts` | RPO/RTO readiness: level + evidence + remediation per check |
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
 | `src/ops/retention/legal-hold.ts` | Deterministic hold evaluator (backend decides) |

@@ -1,17 +1,28 @@
-import { readdirSync, statSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { config } from '@/config/env.js';
 import { audit } from '@/governance/audit.js';
+import type { AuditAction } from '@/governance/audit-actions.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 import { pool } from '@/db/client.js';
-import { isS3Configured, pruneCloud } from './backup-s3.js';
+import { deleteBackupObject, headBackupObject, isS3Configured } from './backup-s3.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { resolveProfile } from '@/config/profiles.js';
 import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profile.js';
 import { createBackupPorts } from '@/ops/backup/adapters.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
-import { OPS_LOCK_KEYS, withOpsLock } from '@/ops/backup/single-flight.js';
+import { runArtifactRetention } from '@/ops/backup/retention.js';
+import { OPS_LOCK_KEYS, requireOpsLock, withOpsLock } from '@/ops/backup/single-flight.js';
+import { UNAPPROVED_POLICY_VERSION } from '@/ops/retention/data-classes.js';
+import {
+  anyActiveLegalHold,
+  listRetentionCandidates,
+  markRunDeleted,
+  recordRetentionRun,
+} from '@/db/repositories/ops-repos.js';
 
 /**
  * Nightly backup runner — issue #520.
@@ -112,9 +123,9 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
   }
 
   const run = result.result;
-  // Local retention still runs nightly, but it is no longer the ONLY lifecycle
-  // signal — see pruneLocal's note on why mtime alone is not enough.
-  pruneLocal();
+  // Debris only. Artifact retention is a separate, hold-aware, manifest-driven
+  // job (`runBackupRetention`) — never a side effect of taking a backup.
+  sweepPartials();
 
   if (run.outcome !== 'completed') {
     await sendAlert({
@@ -133,73 +144,155 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
 }
 
 /**
- * Weekly cron — prunes cloud backups older than BACKUP_RETENTION_CLOUD_DAYS.
- * Local rotation runs nightly inside `executeBackup` via `pruneLocal`.
+ * Weekly cron — manifest-driven, hold-aware artifact retention.
+ *
+ * ROUND-1 REVIEW FINDING (P1). This used to call `pruneCloud`, which selected
+ * objects by `LastModified`, swallowed a per-chunk delete failure and returned
+ * a partial count that this function audited as
+ * `backup_cloud_rotation_completed`. Two separate defects: an artifact under
+ * LEGAL HOLD could be destroyed, and a half-finished pass reported success — so
+ * the evidence lied about the one thing it exists to prove.
+ *
+ * Now every deletion is planned from `backup_runs` + `backup_manifests`, legal
+ * hold is evaluated under the retention lock before anything is touched, each
+ * delete is CONFIRMED, and the audited outcome is conclusive: `completed` only
+ * when nothing failed.
  */
-export async function runCloudBackupRotation(): Promise<void> {
-  // Genuinely-GLOBAL maintenance (issue #323 phase 2): `pruneCloud` only walks
-  // and deletes objects in the S3 backup bucket (no DB read at all) and the
-  // only DB writes are ownerless `backup_cloud_rotation_*` audit rows.
+export async function runBackupRetention(): Promise<void> {
+  // Genuinely-GLOBAL maintenance: a dump has no owning tenant, so the pass runs
+  // under the reserved `system` sentinel (issue #323 phase 2).
   await runWithSystemContext(async () => {
-    if (!isS3Configured()) {
-      logger.debug('backup.rotation_skipped_no_s3');
-      return;
-    }
-    try {
-      const { scanned, deleted } = await pruneCloud();
-      logger.info({ scanned, deleted }, 'backup.cloud_rotation_done');
-      await audit({
-        acao: 'backup_cloud_rotation_completed',
-        metadata: { scanned, deleted, retention_days: config.BACKUP_RETENTION_CLOUD_DAYS },
-      });
-    } catch (err) {
-      const message = (err as Error).message;
-      logger.error({ err: message }, 'backup.cloud_rotation_failed');
-      await audit({
-        acao: 'backup_cloud_rotation_failed',
-        metadata: { error: message },
-      });
-    }
+    const correlationId = randomUUID();
+    const profile = resolveBackupProfile(backupConfigInput());
+
+    // Destructive work is single-flight and FAILS CLOSED on contention: losing
+    // the race must not be mistaken for "nothing to do".
+    await requireOpsLock(
+      OPS_LOCK_KEYS.retention_run,
+      { pool, onWarn: (event, detail) => logger.warn(detail, event) },
+      async () => {
+        for (const destination of ['local', 's3'] as const) {
+          if (destination === 's3' && !isS3Configured()) continue;
+          await runOneRetentionPass(destination, profile.retention.dryRun, correlationId);
+        }
+      },
+    );
   });
 }
 
+async function runOneRetentionPass(
+  destination: 'local' | 's3',
+  dryRun: boolean,
+  correlationId: string,
+): Promise<void> {
+  await audit({
+    acao: 'retention_run_started',
+    metadata: { correlation_id: correlationId, destination, dry_run: dryRun },
+  });
+
+  const outcome = await runArtifactRetention(
+    {
+      now: () => new Date(),
+      listCandidates: listRetentionCandidates,
+      anyActiveHold: anyActiveLegalHold,
+      deleteArtifact: async (candidate) => {
+        if (candidate.destination_kind === 's3') {
+          await deleteBackupObject(`${config.BACKUP_S3_PREFIX}/${candidate.artifact_ref}`);
+        } else {
+          await rm(join(config.BACKUP_DIR, candidate.artifact_ref), { force: true });
+        }
+      },
+      confirmDeleted: async (candidate) => {
+        if (candidate.destination_kind === 's3') {
+          return (
+            (await headBackupObject(`${config.BACKUP_S3_PREFIX}/${candidate.artifact_ref}`)) === null
+          );
+        }
+        return !existsSync(join(config.BACKUP_DIR, candidate.artifact_ref));
+      },
+      markDeleted: markRunDeleted,
+      audit: (acao, metadata) => audit({ acao: acao as AuditAction, metadata }),
+      log: (event, detail) => logger.warn(detail, event),
+    },
+    destination,
+    { dryRun, correlationId },
+  );
+
+  await recordRetentionRun({
+    correlation_id: correlationId,
+    data_class: 'backup.artifact',
+    dry_run: dryRun,
+    policy_version: UNAPPROVED_POLICY_VERSION,
+    status: outcome.status,
+    scanned: outcome.scanned,
+    eligible: outcome.eligible,
+    deleted: outcome.deleted,
+    skipped_held: outcome.skipped_held,
+    failed: outcome.failed,
+    cursor_watermark: outcome.cursor_watermark,
+    error_code: outcome.error_code,
+  }).catch((err: unknown) => {
+    logger.error({ err: (err as Error).name }, 'backup.retention_run_not_recorded');
+  });
+
+  // The audited action is derived from the OUTCOME — a partial pass can never
+  // be recorded as completed.
+  await audit({
+    acao: outcome.status === 'completed' ? 'retention_run_completed' : 'retention_run_failed',
+    metadata: {
+      correlation_id: correlationId,
+      destination,
+      dry_run: dryRun,
+      status: outcome.status,
+      scanned: outcome.scanned,
+      eligible: outcome.eligible,
+      deleted: outcome.deleted,
+      skipped_held: outcome.skipped_held,
+      unidentified: outcome.unidentified,
+      failed: outcome.failed,
+      error_code: outcome.error_code,
+    },
+  });
+
+  if (outcome.status !== 'completed') {
+    await sendAlert({
+      subject: `Backup retention ${outcome.status.toUpperCase()} (${destination})`,
+      body:
+        `Retention pass ${correlationId} ended ${outcome.status} ` +
+        `(deleted=${outcome.deleted} failed=${outcome.failed} error=${outcome.error_code ?? 'n/a'}).\n` +
+        'Inspect retention_runs for this correlation id.',
+    }).catch(() => null);
+  }
+}
+
 /**
- * Local disk rotation.
+ * Sweep ORPHANED `.partial` files.
  *
- * Two behaviours worth naming:
- *  - `.partial` files are swept aggressively (a leftover from a crashed run is
- *    never a restore candidate and must not accumulate);
- *  - final artifacts are still removed by age. Issue §10 is explicit that mtime
- *    must not be the ONLY source of truth for retention — the authoritative
- *    lifecycle lives in `backup_runs.delete_after` + the manifest. Wiring the
- *    manifest-driven reaper (with legal-hold evaluation before each delete) is
- *    the follow-up slice; until then this stays a pure DISK-SPACE guard on the
- *    local copy, and the off-site copy — the one that matters for recovery —
- *    is governed by `runCloudBackupRotation`.
+ * This is the ONLY place mtime survives, and legitimately: a `.partial` has by
+ * construction no manifest and is not a backup — it is the debris of a crashed
+ * run. Final artifacts are never touched here; their lifecycle belongs to
+ * `runBackupRetention`, which consults the manifest and legal hold.
  */
-function pruneLocal(): void {
-  const cutoff = Date.now() - config.BACKUP_RETENTION_LOCAL_DAYS * 86_400_000;
+function sweepPartials(): void {
   let files: string[];
   try {
     files = readdirSync(config.BACKUP_DIR);
   } catch {
     return;
   }
+  // A partial older than two dump budgets is definitively orphaned — no run
+  // still in flight could own it.
+  const cutoff = Date.now() - config.BACKUP_DUMP_TIMEOUT_MS * 2;
   for (const name of files) {
-    if (!name.startsWith('maia-')) continue;
-    const isPartial = name.endsWith('.partial');
-    if (!isPartial && !name.endsWith('.dump')) continue;
+    if (!name.startsWith('maia-') || !name.endsWith('.partial')) continue;
     const path = join(config.BACKUP_DIR, name);
     try {
-      const mtime = statSync(path).mtimeMs;
-      // A partial older than one dump budget is definitively orphaned.
-      const partialCutoff = Date.now() - config.BACKUP_DUMP_TIMEOUT_MS * 2;
-      if (isPartial ? mtime < partialCutoff : mtime < cutoff) {
+      if (statSync(path).mtimeMs < cutoff) {
         rmSync(path);
-        logger.info({ file: name, partial: isPartial }, 'backup.pruned');
+        logger.info({ file: name }, 'backup.partial_swept');
       }
     } catch (err) {
-      logger.warn({ err: (err as Error).message, file: name }, 'backup.prune_failed');
+      logger.warn({ err: (err as Error).message, file: name }, 'backup.partial_sweep_failed');
     }
   }
 }

@@ -22,10 +22,12 @@ import { tryGetCurrentContext, isSystemContext } from '../../src/db/tenant-conte
 const auditMock = vi.fn().mockResolvedValue(undefined);
 const sendAlertMock = vi.fn().mockResolvedValue(undefined);
 const isS3ConfiguredMock = vi.fn();
-const pruneCloudMock = vi.fn();
 const runVerifiedBackupMock = vi.fn();
+const runArtifactRetentionMock = vi.fn();
 const withOpsLockMock = vi.fn();
+const requireOpsLockMock = vi.fn();
 const createBackupPortsMock = vi.fn(() => ({}) as never);
+const recordRetentionRunMock = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('node:fs', () => ({
   readdirSync: vi.fn(() => []),
@@ -40,7 +42,17 @@ vi.mock('../../src/lib/logger.js', () => ({
 vi.mock('../../src/db/client.js', () => ({ pool: {}, db: {} }));
 vi.mock('../../src/workers/backup-s3.js', () => ({
   isS3Configured: isS3ConfiguredMock,
-  pruneCloud: pruneCloudMock,
+  deleteBackupObject: vi.fn(),
+  headBackupObject: vi.fn(),
+}));
+vi.mock('../../src/ops/backup/retention.js', () => ({
+  runArtifactRetention: runArtifactRetentionMock,
+}));
+vi.mock('../../src/db/repositories/ops-repos.js', () => ({
+  anyActiveLegalHold: vi.fn(),
+  listRetentionCandidates: vi.fn(),
+  markRunDeleted: vi.fn(),
+  recordRetentionRun: recordRetentionRunMock,
 }));
 vi.mock('../../src/ops/backup/adapters.js', () => ({
   createBackupPorts: createBackupPortsMock,
@@ -49,8 +61,9 @@ vi.mock('../../src/ops/backup/service.js', () => ({
   runVerifiedBackup: runVerifiedBackupMock,
 }));
 vi.mock('../../src/ops/backup/single-flight.js', () => ({
-  OPS_LOCK_KEYS: { backup_run: 'maia_ops_backup_run' },
+  OPS_LOCK_KEYS: { backup_run: 'maia_ops_backup_run', retention_run: 'maia_ops_retention_run' },
   withOpsLock: withOpsLockMock,
+  requireOpsLock: requireOpsLockMock,
 }));
 vi.mock('../../src/config/env.js', () => ({
   config: {
@@ -93,14 +106,36 @@ function backupResult(over: Record<string, unknown> = {}) {
   };
 }
 
+function retentionOutcome(over: Record<string, unknown> = {}) {
+  return {
+    status: 'completed',
+    scanned: 3,
+    eligible: 1,
+    deleted: 1,
+    skipped_held: 0,
+    unidentified: 0,
+    failed: 0,
+    error_code: null,
+    cursor_watermark: null,
+    ...over,
+  };
+}
+
 beforeEach(() => {
   auditMock.mockClear();
   sendAlertMock.mockClear();
   isS3ConfiguredMock.mockReset();
-  pruneCloudMock.mockReset();
   runVerifiedBackupMock.mockReset();
+  runArtifactRetentionMock.mockReset();
   withOpsLockMock.mockReset();
+  requireOpsLockMock.mockReset();
+  recordRetentionRunMock.mockClear();
   runVerifiedBackupMock.mockResolvedValue(backupResult());
+  runArtifactRetentionMock.mockResolvedValue(retentionOutcome());
+  // The retention lock is fail-closed: `requireOpsLock` runs the body or throws.
+  requireOpsLockMock.mockImplementation(
+    async (_key: string, _deps: unknown, fn: () => Promise<unknown>) => fn(),
+  );
   lockRuns();
 });
 
@@ -184,40 +219,84 @@ describe('nightly_backup worker', () => {
   });
 });
 
-describe('cloud_backup_rotation worker', () => {
-  it('prunes cloud backups and audits the rotation result', async () => {
+describe('backup_retention worker', () => {
+  it('runs the manifest-driven executor and audits a conclusive outcome', async () => {
     isS3ConfiguredMock.mockReturnValue(true);
-    pruneCloudMock.mockResolvedValue({ scanned: 5, deleted: 2 });
-    const { runCloudBackupRotation } = await import('../../src/workers/backup.js');
-    await runCloudBackupRotation();
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
 
-    expect(pruneCloudMock).toHaveBeenCalledTimes(1);
+    // Both destinations.
+    expect(runArtifactRetentionMock).toHaveBeenCalledTimes(2);
+    expect(runArtifactRetentionMock.mock.calls.map((c) => c[1])).toEqual(['local', 's3']);
     expect(auditMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        acao: 'backup_cloud_rotation_completed',
-        metadata: expect.objectContaining({ scanned: 5, deleted: 2 }),
+        acao: 'retention_run_completed',
+        metadata: expect.objectContaining({ deleted: 1, skipped_held: 0 }),
       }),
     );
   });
 
-  it('skips and never opens the context-consuming path when S3 is unconfigured', async () => {
+  it('audits FAILED — never completed — for a partial pass', async () => {
+    // The exact half of the finding about the evidence lying.
     isS3ConfiguredMock.mockReturnValue(false);
-    const { runCloudBackupRotation } = await import('../../src/workers/backup.js');
-    await runCloudBackupRotation();
+    runArtifactRetentionMock.mockResolvedValue(
+      retentionOutcome({ status: 'partial', deleted: 1, failed: 2, error_code: 'delete_failed' }),
+    );
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
 
-    expect(pruneCloudMock).not.toHaveBeenCalled();
-    expect(auditMock).not.toHaveBeenCalled();
+    const actions = auditMock.mock.calls.map((c) => c[0].acao);
+    expect(actions).toContain('retention_run_failed');
+    expect(actions).not.toContain('retention_run_completed');
+  });
+
+  it('alerts on a non-conclusive pass', async () => {
+    isS3ConfiguredMock.mockReturnValue(false);
+    runArtifactRetentionMock.mockResolvedValue(
+      retentionOutcome({ status: 'failed', deleted: 0, failed: 1 }),
+    );
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: expect.stringContaining('FAILED') }),
+    );
+  });
+
+  it('takes the retention lock FAIL-CLOSED (a lost race is not "nothing to do")', async () => {
+    isS3ConfiguredMock.mockReturnValue(false);
+    requireOpsLockMock.mockRejectedValue(new Error('ops_lock_unavailable'));
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await expect(runBackupRetention()).rejects.toThrow('ops_lock_unavailable');
+    expect(runArtifactRetentionMock).not.toHaveBeenCalled();
+  });
+
+  it('skips the S3 pass when no destination is configured', async () => {
+    isS3ConfiguredMock.mockReturnValue(false);
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(runArtifactRetentionMock).toHaveBeenCalledTimes(1);
+    expect(runArtifactRetentionMock.mock.calls[0]![1]).toBe('local');
+  });
+
+  it('persists the pass in retention_runs, including a partial one', async () => {
+    isS3ConfiguredMock.mockReturnValue(false);
+    runArtifactRetentionMock.mockResolvedValue(retentionOutcome({ status: 'partial', failed: 1 }));
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(recordRetentionRunMock).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'partial', data_class: 'backup.artifact' }),
+    );
   });
 
   it('runs under the reserved system context (not default/default)', async () => {
-    isS3ConfiguredMock.mockReturnValue(true);
+    isS3ConfiguredMock.mockReturnValue(false);
     let observed: { tenant_id: string; agent_id: string } | null = null;
-    pruneCloudMock.mockImplementation(async () => {
+    runArtifactRetentionMock.mockImplementation(async () => {
       observed = tryGetCurrentContext();
-      return { scanned: 0, deleted: 0 };
+      return retentionOutcome();
     });
-    const { runCloudBackupRotation } = await import('../../src/workers/backup.js');
-    await runCloudBackupRotation();
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
 
     expect(observed).not.toBeNull();
     expect(isSystemContext(observed!)).toBe(true);
