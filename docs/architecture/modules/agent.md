@@ -47,11 +47,18 @@ Cost, measured by `tests/unit/turn-context-baseline.spec.ts`:
 | entities | 1 | 10 | 100 |
 |---|---|---|---|
 | before #511 | 17 | 35 | 215 |
-| after (cold cache) | 15 | 15 | 15 |
-| after (warm cache) | 13 | 13 | 13 |
+| after, cold cache (legacy `self_state` path) | 15 | 15 | 15 |
+| after, warm cache (legacy `self_state` path) | 14 | 14 | 14 |
+| after, cold cache (operational profile v2) | 14 | 14 | 14 |
+| after, warm cache (operational profile v2) | 13 | 13 | 13 |
+
+Totals are per turn: the prompt build plus `resolveScope`'s two queries. The
+cache is worth one query, because only the operational-profile branch is
+cacheable — see below.
 
 The slope is zero — scope size no longer multiplies round-trips against the
-fixed 10-connection pool in `src/db/client.ts`.
+fixed 10-connection pool in `src/db/client.ts`. That, not the cache, is where
+the win is.
 
 **What is cached, and what is not.** `CACHEABLE_RESOURCES` in
 `turn-context/cache.ts` is a closed union — currently just `identity`. Caching
@@ -63,13 +70,22 @@ always read Postgres. Keys are
 the legacy `'default'` literal) throws rather than producing a shared bucket.
 
 **The rule for adding a resource:** a resource may only be cached once EVERY
-mutation that changes it publishes an invalidation after commit. `capabilities`
-(skills catalogue) and `gaps` were cached in the first cut and removed for
-exactly this reason — only profile activation published, so a revoked skill
-could stay visible on another replica for a full TTL. Identity's publishers live
-in `src/db/repositories/profile-repos.ts` (`transition`,
+mutation that changes it publishes an invalidation after commit. Three things
+have already been removed under that rule:
+
+- `capabilities` (skills catalogue) and `gaps` — only profile activation
+  published, so a revoked skill could stay visible on another replica for a
+  full TTL;
+- the legacy `self_state` fallback inside `identity` —
+  `selfStateRepo.appendLearning` rewrites `resumo_aprendizados` from the
+  fire-and-forget reflection path with no publisher.
+
+So `identity` caches the rendered **operational profile v2 only**; the
+`self_state` fallback is read every turn. Identity's publishers live in
+`src/db/repositories/profile-repos.ts` (`transition`,
 `approveAndActivateAtomic`, `adminRollbackAtomic`, `seedNewActiveAtomic`) and
-`admin-repos.ts` (the approval flow).
+`admin-repos.ts` (the approval flow). No path mutates an active row's
+`profile_body` in place, so that coverage is complete.
 
 Staleness has three bounds: an invalidation published after commit and fanned
 out over a per-tenant Redis channel, a positive TTL, and a shorter negative TTL.

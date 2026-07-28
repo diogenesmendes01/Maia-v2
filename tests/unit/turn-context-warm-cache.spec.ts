@@ -30,7 +30,16 @@ const h = vi.hoisted(() => {
       calls[name] = (calls[name] ?? 0) + 1;
       return impl(...args);
     });
-  return { calls, count };
+  return {
+    calls,
+    count,
+    /**
+     * When set, the agent has an ACTIVE operational profile v2 and the prompt
+     * takes the cached branch. `null` (default) exercises the legacy
+     * `self_state` fallback, which is deliberately NOT cached.
+     */
+    activeProfile: null as { version: number; status: string; profile_body: unknown } | null,
+  };
 });
 
 vi.mock('../../src/config/env.js', () => ({
@@ -52,7 +61,7 @@ vi.mock('../../src/lib/logger.js', () => ({
 
 vi.mock('../../src/db/repositories.js', () => ({
   operationalProfileVersionsRepo: {
-    getActive: h.count('operationalProfileVersionsRepo.getActive', async () => null),
+    getActive: h.count('operationalProfileVersionsRepo.getActive', async () => h.activeProfile),
   },
   selfStateRepo: {
     getActive: h.count('selfStateRepo.getActive', async () => ({
@@ -135,6 +144,7 @@ function totalCalls(): number {
 describe('#511 warm-cache query budget', () => {
   beforeEach(() => {
     for (const k of Object.keys(h.calls)) delete h.calls[k];
+    h.activeProfile = null;
     turnContextCache.resetForTests();
     // Round-1 review (P2): the cache refuses to STORE until it holds a
     // confirmed subscription to the tenant's invalidation channel. Stand up a
@@ -167,7 +177,7 @@ describe('#511 warm-cache query budget', () => {
     expect(totalCalls()).toBe(13);
   });
 
-  it('drops from 13 to 11 queries on the second turn of the same agent', async () => {
+  it('drops from 13 to 12 queries on the legacy self_state path', async () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const cold = totalCalls();
 
@@ -176,12 +186,13 @@ describe('#511 warm-cache query budget', () => {
     const warm = totalCalls();
 
     expect(cold).toBe(13);
-    expect(warm).toBe(11);
+    expect(warm).toBe(12);
 
-    // Only the two identity reads are served from cache. Everything else is
-    // re-read every turn — either because it must be (conversation state,
-    // financial state, per-subject knowledge) or because it has no
-    // invalidation publisher yet (capabilities, gaps).
+    // Only the operational-profile lookup is served from cache (as a negative
+    // entry: "no active profile v2"). Everything else is re-read every turn —
+    // because it must be (conversation state, financial state, per-subject
+    // knowledge) or because it has no invalidation publisher (capabilities,
+    // gaps, and the self_state fallback).
     expect(Object.keys(h.calls).sort()).toEqual([
       'behavioralHintRepo.findActiveForScopes',
       'capabilitiesSkillRepo.listAll',
@@ -194,7 +205,44 @@ describe('#511 warm-cache query budget', () => {
       'mensagensRepo.recentInConversation',
       'procedureExecutionsRepo.findActiveForConversa',
       'rulesRepo.listActive',
+      'selfStateRepo.getActive',
     ]);
+  });
+
+  /**
+   * Round-2 review, P2. `identity` used to cache the DERIVED value across both
+   * branches, including the `self_state` fallback — but
+   * `selfStateRepo.appendLearning` rewrites `resumo_aprendizados` from the
+   * fire-and-forget reflection path with no publisher, so another replica could
+   * render a stale summary until the TTL.
+   */
+  it('re-reads self_state every turn, so a new learning shows up immediately', async () => {
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    for (const k of Object.keys(h.calls)) delete h.calls[k];
+
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+
+    expect(h.calls['selfStateRepo.getActive']).toBe(1);
+    // The profile lookup IS still cached — only the uncovered branch was pulled
+    // out, not the whole resource.
+    expect(h.calls['operationalProfileVersionsRepo.getActive']).toBeUndefined();
+  });
+
+  it('caches the rendered profile when an operational profile v2 IS active', async () => {
+    h.activeProfile = { version: 7, status: 'active', profile_body: {} };
+
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    const cold = totalCalls();
+    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    const warm = totalCalls();
+
+    // The v2 path never reads self_state at all, so cold is one lower and the
+    // cache removes the remaining identity query.
+    expect(cold).toBe(12);
+    expect(warm).toBe(11);
+    expect(h.calls['operationalProfileVersionsRepo.getActive']).toBeUndefined();
+    expect(h.calls['selfStateRepo.getActive']).toBeUndefined();
   });
 
   it('a revoked skill is visible on the very next turn (no TTL window)', async () => {

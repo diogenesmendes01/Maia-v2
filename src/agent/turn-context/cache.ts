@@ -63,10 +63,20 @@ import { recordCacheOutcome } from './metrics.js';
  * enforcement mechanism for "never cache authorization", so adding a member is
  * a security decision, not a performance one.
  *
- *  - `identity` — the active operational profile / self state. Every mutation
- *                 that changes what `getActive()` returns publishes an
- *                 invalidation after commit; see the list in
- *                 `src/db/repositories/profile-repos.ts`.
+ *  - `identity` — the rendered ACTIVE OPERATIONAL PROFILE (v2) only. Every
+ *                 mutation that changes what
+ *                 `operationalProfileVersionsRepo.getActive()` returns
+ *                 publishes an invalidation after commit; see
+ *                 `publishIdentityInvalidation` in
+ *                 `src/db/repositories/profile-repos.ts`. No path mutates an
+ *                 active row's `profile_body` in place, so the coverage is
+ *                 complete.
+ *
+ *                 The legacy `self_state` FALLBACK is deliberately NOT cached:
+ *                 `selfStateRepo.appendLearning` rewrites
+ *                 `resumo_aprendizados` from the fire-and-forget reflection
+ *                 path with no publisher, so a cached copy could go stale on
+ *                 another replica until the TTL.
  *
  * A resource only belongs here once EVERY mutation that changes it publishes.
  * `capabilities` (skills catalogue) and `gaps` were cached in the first cut of

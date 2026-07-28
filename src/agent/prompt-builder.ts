@@ -662,7 +662,25 @@ async function buildPromptUninstrumented(
   // worst render a slightly old persona, never an old permission. The cached
   // value is the DERIVED render output, not the row, so the (pure)
   // `renderOperationalProfile` call is amortised too.
-  const identity = (await readCached('identity', async () => {
+  // Issue #511 round 2 review — ONLY the profile-v2 branch is cached.
+  //
+  // Every mutation that changes what `operationalProfileVersionsRepo.getActive()`
+  // returns publishes an `identity` invalidation after commit (see
+  // `publishIdentityInvalidation` in `src/db/repositories/profile-repos.ts`);
+  // no code path mutates an active row's `profile_body` in place. That branch
+  // is therefore fully covered.
+  //
+  // The `self_state` FALLBACK is not, and is read directly every turn:
+  // `selfStateRepo.appendLearning` rewrites `resumo_aprendizados` from the
+  // fire-and-forget reflection path (`src/agent/reflection.ts`) with no
+  // publisher, so caching it would let another replica render a stale summary
+  // until the TTL. Same rule that took `capabilities` and `gaps` out of the
+  // cache: a resource is only cacheable once EVERY mutation publishes.
+  //
+  // A `null` result is negative-cached, and that stays correct — activating a
+  // profile publishes, so the "no active profile v2" answer is dropped the
+  // moment it stops being true.
+  const activeProfileIdentity = await readCached('identity', async () => {
     const profile = await operationalProfileVersionsRepo.getActive();
     if (profile && profile.status === 'active') {
       const rendered: RenderedProfile = renderOperationalProfile({ version: profile });
@@ -675,21 +693,27 @@ async function buildPromptUninstrumented(
     if (profile) {
       // Profile loaded but status !== 'active' — runtime defense, should never
       // happen if the DB invariant holds. Log + fall back to self_state.
+      // Fires on a cache MISS only, so the negative TTL rate-limits it.
       logger.warn(
         { has_profile: true, status: profile.status },
         'identity.profile_v2_invalid_fallback_to_self_state',
       );
     }
+    return null;
+  });
+
+  let systemPromptBody: string;
+  let selfVersionLabel: string;
+  let resumoAprendizadosBody: string;
+  if (activeProfileIdentity) {
+    ({ systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = activeProfileIdentity);
+  } else {
+    // Deliberately uncached — see above.
     const self = await selfStateRepo.getActive();
-    return {
-      systemPromptBody: self?.system_prompt ?? 'Você é a Maia.',
-      selfVersionLabel: `self_state_v${self?.versao ?? 0}`,
-      resumoAprendizadosBody: self?.resumo_aprendizados ?? '(vazio)',
-    };
-  }))!;
-  // The loader always returns a value (it has its own fallbacks), so `identity`
-  // is never the negative-cache `null`. The non-null assertion documents that.
-  const { systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = identity;
+    systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
+    selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
+    resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
+  }
 
   // Issue #511 — these five reads have no dependency on one another and used to
   // run strictly one after the other. `Promise.all` (not `allSettled`) is the
