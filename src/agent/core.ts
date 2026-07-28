@@ -522,7 +522,21 @@ async function runAgentForMensagemInner(
 
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
-    if (!tel) return;
+    if (!tel) {
+      // #503 — sem telefone não há identidade a resolver: o inbound é
+      // inaproveitável. Antes esta saída era um `return` mudo e o turno ficava
+      // `running` para sempre (sem lease até #504, o recovery nunca o
+      // reencontraria). Descarte EXPLÍCITO, com outcome.
+      logger.warn({ mensagem_id }, 'agent.inbound_without_telefone');
+      await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
+      await mensagensRepo.markProcessed(inbound.id, 0).catch((err) =>
+        logger.warn(
+          { err: (err as Error).message, mensagem_id },
+          'agent.mark_processed_failed',
+        ),
+      );
+      return;
+    }
     // Fase 0 (spec roteamento v4 §1.6): a identidade da conversa inclui o
     // canal — o resolver casa/cria a conversa DO canal que recebeu o inbound.
     const resolved = await resolveIdentity({ telefone_whatsapp: tel, channel_id });
@@ -579,6 +593,11 @@ async function runAgentForMensagemInner(
   const conv = await loadConversaWithPessoa(inbound.conversa_id!);
   if (!conv) {
     logger.warn({ mensagem_id }, 'agent.conversa_missing');
+    // #503 — a conversa acabou de ser resolvida/criada; não a encontrar aqui é
+    // inconsistência TRANSITÓRIA (replica lag, conversa encerrada em corrida),
+    // não uma decisão de negócio. Nenhuma tool rodou, então retry é seguro.
+    // Antes era `return` mudo e o turno ficava `running` órfão.
+    await failTurnRetryable(turn, { code: 'conversa_missing', mensagem_id: inbound.id });
     return;
   }
   const { conversa: c, pessoa } = conv;
