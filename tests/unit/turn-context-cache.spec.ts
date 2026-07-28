@@ -87,10 +87,23 @@ describe('#511 turn-context cache — keys', () => {
   it('never lists an authorization-bearing resource as cacheable', () => {
     // The union IS the guard: caching permissions/grants/balances must not be
     // expressible. If this list grows, the growth was a security decision.
-    expect([...CACHEABLE_RESOURCES].sort()).toEqual(['capabilities', 'gaps', 'identity']);
+    expect([...CACHEABLE_RESOURCES].sort()).toEqual(['identity']);
     for (const forbidden of ['permissions', 'scope', 'grants', 'balance', 'pending']) {
       expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain(forbidden);
     }
+  });
+
+  /**
+   * Round-1 review, P1: `capabilities` and `gaps` were cached while only
+   * profile activation published an invalidation, so a REVOKED skill or a
+   * resolved gap stayed visible on other replicas for up to a full TTL. They
+   * were removed rather than half-covered. The rule this pins is the general
+   * one: a resource may only be cached once EVERY mutation that changes it
+   * publishes after commit.
+   */
+  it('does not cache capabilities or gaps (no publisher coverage yet)', () => {
+    expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain('capabilities');
+    expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain('gaps');
   });
 });
 

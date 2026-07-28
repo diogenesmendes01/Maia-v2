@@ -63,20 +63,24 @@ import { recordCacheOutcome } from './metrics.js';
  * enforcement mechanism for "never cache authorization", so adding a member is
  * a security decision, not a performance one.
  *
- *  - `identity`     — active operational profile / self state. Changes only
- *                     through an audited activation, which publishes.
- *  - `capabilities` — skills catalogue + mentionable gaps. Descriptive
- *                     self-knowledge; grants nothing. NOTE: the skill CATALOGUE
- *                     is not the skill GRANT — what an agent may actually run
- *                     is re-resolved per turn by the runtime tool filter and
- *                     re-checked by the dispatcher, neither of which reads this.
- *  - `gaps`         — the mentionable/proposed gap list rendered as the
- *                     "known limitations" block. Pure transparency copy.
+ *  - `identity` — the active operational profile / self state. Every mutation
+ *                 that changes what `getActive()` returns publishes an
+ *                 invalidation after commit; see the list in
+ *                 `src/db/repositories/profile-repos.ts`.
+ *
+ * A resource only belongs here once EVERY mutation that changes it publishes.
+ * `capabilities` (skills catalogue) and `gaps` were cached in the first cut of
+ * this issue and have been REMOVED: only profile activation published, so a
+ * revoked skill or a resolved gap stayed visible on other replicas for up to a
+ * full TTL. That is an authorization-shaped failure wearing a performance
+ * costume, and the correct trade is to give up the two saved queries until the
+ * publisher coverage exists (skill activation/rollback/revocation and the gap
+ * lifecycle transitions are a wider surface than this change should carry).
  *
  * Each resource is loaded ATOMICALLY: a load that throws is not cached at all,
  * so a partially-failed section can never be pinned for a TTL.
  */
-export const CACHEABLE_RESOURCES = ['identity', 'capabilities', 'gaps'] as const;
+export const CACHEABLE_RESOURCES = ['identity'] as const;
 export type CacheableResource = (typeof CACHEABLE_RESOURCES)[number];
 
 /** Cache shape version. Bump when a cached section's payload changes shape. */

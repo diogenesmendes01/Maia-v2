@@ -55,6 +55,35 @@ export class ProfileTransitionError extends Error {
   }
 }
 
+/**
+ * Issue #511 — publish the `identity` turn-context cache invalidation for a
+ * (tenant, agent) whose ACTIVE operational profile just changed.
+ *
+ * Call sites are every mutation that changes what `getActive()` returns:
+ * activation, freeze, rollback and the seed path. Transitions that only touch
+ * `proposed`/`rejected` rows are deliberately NOT here — they cannot change the
+ * active profile, and a spurious publish is pointless cache churn.
+ *
+ * ALWAYS called AFTER the transaction commits, never inside it. From inside, a
+ * replica receiving the event before COMMIT would re-read the pre-commit
+ * snapshot and pin the OLD identity for a full TTL — strictly worse than not
+ * publishing at all.
+ *
+ * Best-effort: `publishTurnContextInvalidation` already swallows broker
+ * failures (staleness then falls back to the TTL bound). The extra guard here
+ * covers the dynamic import itself, so a governance mutation that already
+ * committed and audited can never fail because a cache hint could not be sent.
+ */
+async function publishIdentityInvalidation(tenant_id: string, agent_id: string): Promise<void> {
+  try {
+    const { publishTurnContextInvalidation } = await import('@/agent/turn-context/cache.js');
+    await publishTurnContextInvalidation({ tenant_id, agent_id, resource: 'identity' });
+  } catch {
+    // Deliberately silent: the mutation succeeded, and the cache degrades to
+    // its TTL bound. `publishTurnContextInvalidation` logs its own failures.
+  }
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
@@ -242,7 +271,13 @@ export const operationalProfileVersionsRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
 
-    return await withTx(async (tx) => {
+    // #511: `transition` is the broad status mutator — it covers freeze,
+    // rollback and frozen→active re-activation, i.e. most of the ways the
+    // active profile changes outside the approval flow. Publish after commit
+    // when the transition touched the ACTIVE row in either direction; the
+    // source status is captured here because it is only known inside the tx.
+    let fromStatus: ProfileStatus | null = null;
+    const result = await withTx(async (tx) => {
       // (0) Lock the parent `agents` row FIRST so we serialize against every
       //     OTHER writer that touches `(tenant, agent)` profile state
       //     (`approveAndActivateAtomic`, `proposeAndAuditAtomic`,
@@ -276,6 +311,7 @@ export const operationalProfileVersionsRepo = {
       if (!row) return { ok: false as const, reason: 'not_found' as const };
 
       const from = row.status as ProfileStatus;
+      fromStatus = from;
 
       // (1.5) Codex Adversarial Review of PR #182 round 1 fail-open guard:
       //       if the caller passed an `expected_from`, enforce that the
@@ -377,6 +413,18 @@ export const operationalProfileVersionsRepo = {
       }
       return { ok: true as const, updated: updated[0]! };
     });
+
+    // #511: publish only when the active profile actually moved — a row
+    // entering OR leaving `active` both change what `getActive()` returns. A
+    // proposed→rejected transition changes nothing the prompt reads.
+    if (
+      result.ok &&
+      (result.updated.status === 'active' ||
+        (fromStatus as ProfileStatus | null) === 'active')
+    ) {
+      await publishIdentityInvalidation(tenant_id, agent_id);
+    }
+    return result;
   },
 
   /**
@@ -859,6 +907,9 @@ export const operationalProfileVersionsRepo = {
         current_predecessor: string | null;
       }
   > {
+    // #511: set as the LAST thing inside the tx callback, so a throw before
+    // that point publishes nothing. See `publishIdentityInvalidation`.
+    let activated = false;
     try {
       return await withTx(async (tx) => {
         const r = await this.approveAndActivateInTx(tx, {
@@ -890,6 +941,7 @@ export const operationalProfileVersionsRepo = {
             comment: args.comment,
           },
         });
+        activated = true;
         return {
           ok: true as const,
           activated: r.activated,
@@ -918,6 +970,8 @@ export const operationalProfileVersionsRepo = {
         }
       }
       throw err;
+    } finally {
+      if (activated) await publishIdentityInvalidation(args.tenant_id, args.agent_id);
     }
   },
 
@@ -1217,7 +1271,7 @@ export const operationalProfileVersionsRepo = {
     | { ok: false; reason: 'target_invalid_status'; actual_status: ProfileStatus }
     | { ok: false; reason: 'transition_failed' }
   > {
-    return await withTx(async (tx) => {
+    const result = await withTx(async (tx) => {
       // (0) Parent-agent lock — serializes against every other writer of
       // this (tenant, agent)'s profile state.
       const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
@@ -1338,6 +1392,11 @@ export const operationalProfileVersionsRepo = {
         rolled_back: { id: active.id, version: active.version },
       };
     });
+
+    // #511: a rollback swaps which version occupies the active slot, so every
+    // replica's cached identity is stale the moment this commits.
+    if (result.ok) await publishIdentityInvalidation(args.tenant_id, args.agent_id);
+    return result;
   },
 
   // Próxima version sequencial para (tenant_id, agent_id) corrente.
@@ -1436,7 +1495,9 @@ export const operationalProfileVersionsRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
 
-    return withTx(async (tx) => {
+    // #511: seeding promotes a brand-new version straight into the active
+    // slot, so it changes `getActive()` exactly like an approval does.
+    const seeded = await withTx(async (tx) => {
       // 1) Allocate next version via the shared helper. This (a) takes the
       //    parent agent FOR UPDATE lock and (b) reads MAX(version) behind
       //    it. Throws on missing agent — historically this method was
@@ -1600,6 +1661,9 @@ export const operationalProfileVersionsRepo = {
 
       return { new_active: inserted, frozen_previous: frozenPrevious };
     });
+
+    await publishIdentityInvalidation(tenant_id, agent_id);
+    return seeded;
   },
 };
 

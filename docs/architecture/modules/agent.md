@@ -48,19 +48,28 @@ Cost, measured by `tests/unit/turn-context-baseline.spec.ts`:
 |---|---|---|---|
 | before #511 | 17 | 35 | 215 |
 | after (cold cache) | 15 | 15 | 15 |
-| after (warm cache) | 10 | 10 | 10 |
+| after (warm cache) | 13 | 13 | 13 |
 
 The slope is zero — scope size no longer multiplies round-trips against the
 fixed 10-connection pool in `src/db/client.ts`.
 
 **What is cached, and what is not.** `CACHEABLE_RESOURCES` in
-`turn-context/cache.ts` is a closed union: `identity`, `capabilities`, `gaps`.
-Caching anything authorization-bearing is not expressible, which is what makes a
-Redis outage survivable — no cached value carries a grant, so no cached value
-can keep a revoked one alive. `resolveScope` and the dispatcher's
-execution-time re-check always read Postgres. Keys are
+`turn-context/cache.ts` is a closed union — currently just `identity`. Caching
+anything authorization-bearing is not expressible, which is what makes a Redis
+outage survivable: no cached value carries a grant, so no cached value can keep
+a revoked one alive. `resolveScope` and the dispatcher's execution-time re-check
+always read Postgres. Keys are
 `maia:turn_ctx:v1:{tenant}:{agent}:{resource}` and a degenerate scope (empty or
 the legacy `'default'` literal) throws rather than producing a shared bucket.
+
+**The rule for adding a resource:** a resource may only be cached once EVERY
+mutation that changes it publishes an invalidation after commit. `capabilities`
+(skills catalogue) and `gaps` were cached in the first cut and removed for
+exactly this reason — only profile activation published, so a revoked skill
+could stay visible on another replica for a full TTL. Identity's publishers live
+in `src/db/repositories/profile-repos.ts` (`transition`,
+`approveAndActivateAtomic`, `adminRollbackAtomic`, `seedNewActiveAtomic`) and
+`admin-repos.ts` (the approval flow).
 
 Staleness has three bounds: an invalidation published after commit and fanned
 out over a per-tenant Redis channel, a positive TTL, and a shorter negative TTL.

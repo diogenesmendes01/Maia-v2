@@ -585,15 +585,11 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  * - Retorna null quando não há nada a injetar (chamador omite a seção).
  */
 async function buildGapMentionSection(): Promise<string | null> {
-  // Issue #511 — cached under `gaps`, separately from `capabilities` so the two
-  // sections keep INDEPENDENT degradation: a failure of the gap read must not
-  // also blank the self-awareness block, which is how it behaved before.
+  // Issue #511 round 1 review — no longer cached; see the `capabilities` note
+  // above. A gap that was resolved must stop being announced immediately, not
+  // after a TTL.
   const gaps =
-    (await readCached(
-      'gaps',
-      async () =>
-        (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [],
-    )) ?? [];
+    (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
   if (gaps.length === 0) return null;
   // #511: the 5-gap cap is now metered instead of silent (token bloat guard).
   const lines = applyBudget(
@@ -912,19 +908,15 @@ async function buildPromptUninstrumented(
   };
 
   const loadSelfAwarenessSection = async (): Promise<string> => {
-    // Issue #511 — cached under `capabilities`. The skills CATALOGUE and the
-    // gap list are descriptive self-knowledge: they say what the agent believes
-    // it is good at, not what it is allowed to do. What it may actually run is
-    // re-resolved every turn by `computeRuntimeVisibleTools` and re-checked at
-    // execution by the dispatcher, neither of which reads this cache — so a
-    // stale entry here cannot widen a grant.
-    //
-    // Both reads live inside ONE cache load, so a failure of either leaves the
-    // entry unwritten rather than pinning a half-empty capability picture.
-    const capabilities = (await readCached('capabilities', async () => ({
+    // Issue #511 round 1 review — these were cached under `capabilities` and
+    // are now read directly every turn. Only profile activation published an
+    // invalidation, so a REVOKED skill or a resolved gap stayed visible on
+    // other replicas for up to a full TTL. Two saved queries are not worth
+    // showing an agent a capability it no longer has.
+    const capabilities = {
       skills: (await capabilitiesSkillRepo?.listAll?.()) ?? [],
       mentionableGaps: (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [],
-    })))!;
+    };
     // Deterministic order before the cut: sort by confidence, then by name so
     // two skills with equal confidence never swap places between turns (which
     // would change the prompt bytes for no reason and defeat prompt caching).

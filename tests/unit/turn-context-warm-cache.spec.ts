@@ -7,12 +7,18 @@ import type { Mensagem, Pessoa, Conversa } from '../../src/db/schema.js';
  * The cold number (13 prompt queries) is asserted in
  * `turn-context-baseline.spec.ts` with the cache feature OFF. This spec turns it
  * ON and pins what the cache is actually worth on the second turn of an agent:
- * the five identity/capability/gap reads disappear, taking the prompt to 8.
+ * the two identity reads disappear, taking the prompt to 11.
  *
- * It also pins the property that makes the cache safe to enable at all — the
- * five reads that DO survive are exactly the ones nothing may cache: recent
- * messages, entities, entity states (financial), facts, and the per-subject
- * memory/hint reads.
+ * Round-1 review, P1: this used to be 8, because `capabilities` and `gaps` were
+ * cached too. They were removed — only profile activation published an
+ * invalidation, so a revoked skill or a resolved gap could stay visible on
+ * another replica for a full TTL. Three queries back is the price of not
+ * showing an agent a capability it no longer has.
+ *
+ * It also pins the property that makes the cache safe to enable at all — every
+ * surviving read is one nothing may cache: recent messages, entities, entity
+ * states (financial), facts, rules, the per-subject memory/hint reads, and the
+ * capability/gap reads that now have no publisher coverage.
  */
 
 type Counters = Record<string, number>;
@@ -127,7 +133,7 @@ describe('#511 warm-cache query budget', () => {
     turnContextCache.resetForTests();
   });
 
-  it('drops from 13 to 8 queries on the second turn of the same agent', async () => {
+  it('drops from 13 to 11 queries on the second turn of the same agent', async () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const cold = totalCalls();
 
@@ -136,12 +142,17 @@ describe('#511 warm-cache query budget', () => {
     const warm = totalCalls();
 
     expect(cold).toBe(13);
-    expect(warm).toBe(8);
+    expect(warm).toBe(11);
 
-    // The reads that survive are exactly the ones nothing may cache:
-    // conversation state, financial state, and per-subject knowledge.
+    // Only the two identity reads are served from cache. Everything else is
+    // re-read every turn — either because it must be (conversation state,
+    // financial state, per-subject knowledge) or because it has no
+    // invalidation publisher yet (capabilities, gaps).
     expect(Object.keys(h.calls).sort()).toEqual([
       'behavioralHintRepo.findActiveForScopes',
+      'capabilitiesSkillRepo.listAll',
+      'capabilityGapsRepo.listByLevel',
+      'capabilityGapsRepo.listByLevels',
       'entidadesRepo.byIds',
       'entityStatesRepo.byIds',
       'factsRepo.listMentionableForScopes',
@@ -150,6 +161,19 @@ describe('#511 warm-cache query budget', () => {
       'procedureExecutionsRepo.findActiveForConversa',
       'rulesRepo.listActive',
     ]);
+  });
+
+  it('a revoked skill is visible on the very next turn (no TTL window)', async () => {
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    for (const k of Object.keys(h.calls)) delete h.calls[k];
+
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+
+    // The catalogue is re-read every turn, so a revocation that commits
+    // between two turns takes effect on the next one — not after a TTL.
+    expect(h.calls['capabilitiesSkillRepo.listAll']).toBe(1);
+    expect(h.calls['capabilityGapsRepo.listByLevel']).toBe(1);
+    expect(h.calls['capabilityGapsRepo.listByLevels']).toBe(1);
   });
 
   it('does NOT reuse one agent cached identity for another agent', async () => {
