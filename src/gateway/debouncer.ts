@@ -5,6 +5,7 @@ import {
   recordRedisOomDegraded,
 } from '@/lib/redis.js';
 import { agentQueue } from './queue.js';
+import { withCorrelation } from './job-correlation.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -406,7 +407,10 @@ export async function scheduleDebouncedAgent(params: {
       });
     }
 
-    const data: AgentJob = { mensagem_id };
+    // Issue #514 §1 — the debounced path arms the job through the same
+    // correlation stamper as `enqueueAgent`, so a debounced turn and a direct
+    // turn are indistinguishable to the consumer's trace restoration.
+    const data: AgentJob = withCorrelation({ mensagem_id });
     await agentQueue.add(JOB_NAME, data, {
       jobId,
       delay,

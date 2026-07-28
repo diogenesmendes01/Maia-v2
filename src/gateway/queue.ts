@@ -10,6 +10,14 @@ import { sendAlert } from '@/lib/alerts.js';
 import { isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
+import {
+  correlationLogFields,
+  deriveTraceId,
+  runWithCorrelation,
+} from '@/observability/correlation.js';
+import { counter, histogram } from '@/observability/metrics.js';
+import { METRIC } from '@/observability/taxonomy.js';
+import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
@@ -64,23 +72,72 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
   worker = new Worker<AgentJob>(
     'agent',
     async (job, token) => {
-      // Drain guard FIRST — before any side effect, before the ALS context.
+      // Drain guard FIRST — before any side effect, before ANY context, and
+      // before ANY turn metric (issue #512 + #514). Three reasons it must stay
+      // ahead of the instrumentation below:
+      //   1. a job the drain re-parks never STARTED a turn, so it must not
+      //      appear in `maia_turn_started_total` or the latency histogram;
+      //   2. `DelayedError` has to escape untouched so BullMQ treats the job as
+      //      re-parked rather than failed — wrapping it in the outcome
+      //      try/catch would record a phantom `retryable`;
+      //   3. no attempt is consumed, so bumping the attempt counter would
+      //      overstate retries during every deploy.
       await deferIfNotAcceptingWork(job, token, 'agent');
-      logger.debug({ job_id: job.id, mensagem_id: job.data.mensagem_id }, 'agent.job.start');
-      // Issue #369: the worker callstack runs the channel resolver + cross-tenant
-      // adoption (`src/agent/core.ts`) BEFORE the real tenant tuple is known, so
-      // the job payload (`AgentJob = { mensagem_id }`) carries no tenant/agent to
-      // open `runWithTenantContext` with here. Wrap the whole handler in the
-      // sanctioned `system` ALS context so the pre-resolution window is NEVER
-      // contextless — closing the fail-closed blind spot (`tenant-context.ts`
-      // `MissingTenantContextError`) that blocked the #323 flip. Once the tenant
-      // is resolved, `core.ts` opens a NESTED `runWithTenantContext({tenant_id,
-      // agent_id})` that overrides this for the inner scope, so behaviour after
-      // resolution is unchanged. The cross-tenant adoption helpers bypass the
-      // tenant guard by design and the `'system'` sentinel is explicitly NOT
-      // rejected by `assertNotDefaultLiteral`, so the outer context is inert for
-      // them.
-      await runWithSystemContext(() => processor(job));
+
+      // Issue #514 §1 — restore the turn's root trace on the consumer side.
+      // `attemptsMade` is 0 on the first pass, so `+1` yields a 1-based attempt
+      // ordinal; a BullMQ retry of the SAME job keeps the trace id and bumps
+      // the attempt, which is exactly the "recovery preserves root trace, new
+      // attempt id" contract. Falling back to `deriveTraceId(mensagem_id)`
+      // makes jobs armed before this deploy correlate identically.
+      const trace_id = job.data.trace_id ?? deriveTraceId(job.data.mensagem_id);
+      const attempt = (job.attemptsMade ?? 0) + 1;
+      await runWithCorrelation(
+        {
+          trace_id,
+          turn_id: job.data.mensagem_id,
+          attempt,
+          origin: 'queue',
+          received_at_ms: job.data.received_at_ms ?? null,
+          enqueued_at_ms: job.data.enqueued_at_ms ?? null,
+        },
+        async () => {
+          // queue.wait — measured from the persisted arm timestamp, not from a
+          // process-local clock, so it survives a worker restart.
+          if (typeof job.data.enqueued_at_ms === 'number') {
+            const waited = Date.now() - job.data.enqueued_at_ms;
+            if (waited >= 0) histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
+          }
+          counter(METRIC.QUEUE_JOB_ATTEMPTS, {
+            queue: 'agent',
+            // Bounded label: first pass vs any retry. The exact ordinal stays
+            // in the log/trace (taxonomy forbids unbounded numeric labels).
+            phase: attempt === 1 ? 'first' : 'retry',
+          });
+          logger.debug(
+            { job_id: job.id, mensagem_id: job.data.mensagem_id, ...correlationLogFields() },
+            'agent.job.start',
+          );
+          // Issue #369: the worker callstack runs the channel resolver + cross-tenant
+          // adoption (`src/agent/core.ts`) BEFORE the real tenant tuple is known, so
+          // the job payload carries no tenant/agent to open `runWithTenantContext`
+          // with here. Wrap the whole handler in the sanctioned `system` ALS context
+          // so the pre-resolution window is NEVER contextless — closing the
+          // fail-closed blind spot (`tenant-context.ts` `MissingTenantContextError`)
+          // that blocked the #323 flip. Once the tenant is resolved, `core.ts` opens a
+          // NESTED `runWithTenantContext({tenant_id, agent_id})` that overrides this
+          // for the inner scope, so behaviour after resolution is unchanged. The
+          // cross-tenant adoption helpers bypass the tenant guard by design and the
+          // `'system'` sentinel is explicitly NOT rejected by
+          // `assertNotDefaultLiteral`, so the outer context is inert for them.
+          //
+          // Issue #514: the correlation ALS wraps this one. They are independent
+          // stores — tenant context is fail-CLOSED (missing ⇒ throw), correlation is
+          // fail-SOFT (missing ⇒ null) — so nesting cannot make one inherit the
+          // other's semantics.
+          await runWithSystemContext(() => processor(job));
+        },
+      );
     },
     {
       connection,
@@ -174,7 +231,12 @@ export class QueueRedisUnavailableError extends Error {
  */
 export async function enqueueAgent(data: AgentJob): Promise<void> {
   try {
-    await agentQueue.add('process-message', data, {
+    // Issue #514 §1 — stamp the correlation fields onto the payload. An
+    // explicit `trace_id` from the caller always wins (the recovery sweep and
+    // the unrouted replay both re-enqueue an existing turn); otherwise the id
+    // is DERIVED from `mensagem_id`, so re-enqueueing the same row always
+    // lands on the same root trace.
+    await agentQueue.add('process-message', withCorrelation(data), {
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },
     });

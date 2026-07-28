@@ -97,7 +97,11 @@ describe('debouncer.scheduleDebouncedAgent', () => {
     expect(h.queueAdd).toHaveBeenCalledTimes(1);
     const [name, data, opts] = h.queueAdd.mock.calls[0]!;
     expect(name).toBe('process-message-debounced');
-    expect(data).toEqual({ mensagem_id: 'm1' });
+    // Issue #514 §1: the debounced payload now carries the turn correlation
+    // too, so it is indistinguishable from the direct path on the consumer.
+    expect(data).toMatchObject({ mensagem_id: 'm1' });
+    expect(typeof (data as { trace_id?: unknown }).trace_id).toBe('string');
+    expect(typeof (data as { enqueued_at_ms?: unknown }).enqueued_at_ms).toBe('number');
     expect(opts).toMatchObject({
       jobId: `debounce:${SCOPED}`,
       delay: 5000,
@@ -134,7 +138,7 @@ describe('debouncer.scheduleDebouncedAgent', () => {
     }
     expect(remove).toHaveBeenCalledTimes(1);
     expect(h.queueAdd).toHaveBeenCalledTimes(1);
-    expect(h.queueAdd.mock.calls[0]![1]).toEqual({ mensagem_id: 'm2' });
+    expect(h.queueAdd.mock.calls[0]![1]).toMatchObject({ mensagem_id: 'm2' });
 
     // first_enqueued_at must NOT advance — that's how max-hold ticks.
     const state = JSON.parse(h.store.get(_internal.STATE_KEY(SCOPED))!);
