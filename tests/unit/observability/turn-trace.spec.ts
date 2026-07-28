@@ -38,6 +38,7 @@ const {
   decisionFor,
   riskScoreFor,
   runtimeTraceHotPathEnabled,
+  MandatoryTraceEnvelopeError,
 } = await import('@/observability/turn-trace.js');
 const { renderPrometheus, _resetForTests } = await import('@/lib/metrics.js');
 const { _resetLabelGuardForTests } = await import('@/observability/labels.js');
@@ -248,15 +249,30 @@ describe('issue #514 — runtime trace on the hot path', () => {
       cfg.traceEnabled = true;
     });
 
-    it('RETHROWS when a MANDATORY envelope cannot be written (fail-loud)', async () => {
-      traceMock.mockRejectedValue(new Error('db down'));
-      await expect(
-        traceTurnDecision({
+    it('throws a TYPED error when a MANDATORY envelope cannot be written', async () => {
+      // Review round 1 [P1]: a RAW rethrow is not enough — `agent/core.ts` only
+      // blocks on typed errors, so a raw DB error let the turn continue to
+      // ReAct. The type is the contract; the caller-level proof lives in
+      // `tests/unit/agent-core-trace-envelope-fail-closed.spec.ts`.
+      const cause = new Error('db down');
+      traceMock.mockRejectedValue(cause);
+      let thrown: unknown;
+      try {
+        await traceTurnDecision({
           base: baseFixture(),
           // call_tool ⇒ side_effect_level medium ⇒ envelope required
           packet: packetFixture({ action_mode: 'call_tool' }),
-        }),
-      ).rejects.toThrow('db down');
+        });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(MandatoryTraceEnvelopeError);
+      const err = thrown as InstanceType<typeof MandatoryTraceEnvelopeError>;
+      expect(err.code).toBe('MANDATORY_TRACE_ENVELOPE_FAILED');
+      expect(err.tenant_id).toBe('acme');
+      expect(err.side_effect_level).toBe('medium');
+      // The original failure is preserved for the incident log.
+      expect(err.cause_error).toBe(cause);
     });
 
     it('swallows the failure when the envelope is NOT required', async () => {

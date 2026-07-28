@@ -66,7 +66,9 @@ vi.mock('@/config/env.js', () => ({
   },
 }));
 
-const { traceTurnDecision, toContextStub } = await import('@/observability/turn-trace.js');
+const { traceTurnDecision, toContextStub, MandatoryTraceEnvelopeError } = await import(
+  '@/observability/turn-trace.js'
+);
 const { redactPacket } = await import('@/control-plane/runtime-trace/lib/redaction.js');
 const { verifyHmac, canonicalJson } = await import('@/control-plane/runtime-trace/lib/hmac.js');
 const { runWithCorrelation, deriveTraceId } = await import('@/observability/correlation.js');
@@ -220,13 +222,20 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
   });
 
   it('a MANDATORY envelope failure aborts the turn (P10b invariant 12)', async () => {
-    dbTransactionMock.mockRejectedValueOnce(new Error('postgres unavailable'));
-    await expect(
-      traceTurnDecision({
+    const cause = new Error('postgres unavailable');
+    dbTransactionMock.mockRejectedValueOnce(cause);
+    let thrown: unknown;
+    try {
+      await traceTurnDecision({
         base: baseFixture('acme', deriveTraceId('turn-e2e-5')),
         packet: packetFixture({ action_mode: 'call_tool' }),
-      }),
-    ).rejects.toThrow('postgres unavailable');
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    // Typed, so `agent/core.ts` recognises it as a block (review round 1 [P1]).
+    expect(thrown).toBeInstanceOf(MandatoryTraceEnvelopeError);
+    expect((thrown as { cause_error?: unknown }).cause_error).toBe(cause);
   });
 
   it('a NON-mandatory envelope failure does not abort a read-only turn', async () => {

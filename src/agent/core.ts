@@ -80,6 +80,8 @@ import {
   runDecisionEngineForTurn,
   DecisionEngineFailClosedError,
 } from '@/runtime/decision/integration.js';
+// Issue #514 — a failed MANDATORY trace envelope is a turn-blocking condition.
+import { MandatoryTraceEnvelopeError } from '@/observability/turn-trace.js';
 import {
   buildBaseContextPacketFromTurn,
   applyToolReductions,
@@ -1206,9 +1208,27 @@ async function runAgentForMensagemInner(
       }
     }
   } catch (err) {
-    if (err instanceof DecisionEngineFailClosedError) {
-      // fail-closed: the always-on engine errored → block the turn, reply to
-      // user, skip LLM (there is no legacy fallback path anymore)
+    // Issue #514 review round 1 [P1]: `MandatoryTraceEnvelopeError` joins the
+    // block set. A required runtime-trace envelope that could not be written
+    // means the turn has no evidence record, so it MUST NOT reach ReAct, tools
+    // or outbound (P10b invariant 12). Falling through to
+    // `wiring_error_continuing` below would do exactly that.
+    if (
+      err instanceof DecisionEngineFailClosedError ||
+      err instanceof MandatoryTraceEnvelopeError
+    ) {
+      if (err instanceof MandatoryTraceEnvelopeError) {
+        logger.error(
+          {
+            err: err.cause_error,
+            tenant_id: err.tenant_id,
+            side_effect_level: err.side_effect_level,
+          },
+          'agent.runtime_trace.mandatory_envelope_failed_blocking_turn',
+        );
+      }
+      // fail-closed: block the turn, reply to user, skip LLM (there is no
+      // legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
       // #503 — o resultado do envio DECIDE o outcome. Antes o `.catch` engolia
       // a falha e o turno era concluído como `fallback_delivered` mesmo quando

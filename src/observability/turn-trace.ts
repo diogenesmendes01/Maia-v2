@@ -54,6 +54,34 @@ import { correlationLogFields, tryGetCorrelation } from './correlation.js';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * A MANDATORY envelope could not be written, so the turn must not proceed.
+ *
+ * Review round 1 [P1]: the previous revision rethrew the raw DB error. Its
+ * caller (`src/agent/core.ts`) only recognises typed block errors — everything
+ * else is logged as `wiring_error_continuing` and the turn falls through to
+ * `runReActLoop`, which could then run a tool or send an outbound with NO
+ * envelope. That silently inverted the fail-closed guarantee the PR claimed.
+ *
+ * A distinct type (rather than reusing `DecisionEngineFailClosedError`) keeps
+ * the incident legible: the engine did NOT crash, the evidence write did.
+ * `cause_error` carries the original for the log.
+ */
+export class MandatoryTraceEnvelopeError extends Error {
+  readonly code = 'MANDATORY_TRACE_ENVELOPE_FAILED';
+  constructor(
+    readonly cause_error: unknown,
+    readonly tenant_id: string,
+    readonly side_effect_level: SideEffectLevel,
+  ) {
+    super(
+      `Runtime trace: mandatory envelope write failed for tenant=${tenant_id} ` +
+        `side_effect_level=${side_effect_level}; turn MUST be blocked (P10b invariant 12)`,
+    );
+    this.name = 'MandatoryTraceEnvelopeError';
+  }
+}
+
+/**
  * `runtime_trace_envelopes.{trace_id,conversa_id,turno_id}` are UUID columns.
  * Anything else must not reach the INSERT — a malformed id would turn an
  * observability write into a turn-breaking DB error.
@@ -266,8 +294,14 @@ export async function traceTurnDecision(
       'runtime_trace.hot_path_envelope_failed',
     );
     if (required) {
-      // FAIL-LOUD: the caller must not proceed with the side effect.
-      throw err;
+      // FAIL-LOUD, as a TYPED error the caller recognises as a block. Throwing
+      // the raw DB error here is what let the turn continue to ReAct in the
+      // previous revision (review round 1 [P1]).
+      throw new MandatoryTraceEnvelopeError(
+        err,
+        input.base.tenant_id,
+        decision.side_effect_level,
+      );
     }
     return null;
   }
