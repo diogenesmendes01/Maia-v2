@@ -8,7 +8,8 @@
 export { executeLLM } from './gateway.js';
 export { isLLMConfigured, getProvider } from './providers/index.js';
 export { invalidateModelCache, resolveModel, resolveModelPair } from './model-resolver.js';
-export { isBudgetEnabled, invalidateSpendCache } from './budget.js';
+export { isBudgetEnabled, reserveBudget, settleReservation } from './budget.js';
+export type { BudgetReservation } from './budget.js';
 export {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
   publishLLMSettingsInvalidation,

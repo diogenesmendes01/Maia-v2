@@ -48,6 +48,26 @@ async function rateFor(model: string): Promise<{ input: number; output: number }
   return USD_CENTS_PER_1K_TOKENS[model] ?? FALLBACK_RATE;
 }
 
+/**
+ * Custo em USD de uma chamada, pela MESMA tabela de preços que o ledger usa
+ * para registrar o gasto real (issue #508).
+ *
+ * Exportado para que a reserva de orçamento (`src/lib/llm/budget.ts`) estime
+ * o custo ANTES da chamada com a mesma aritmética que vai liquidá-la depois —
+ * duas tabelas de preço divergentes fariam a quota reservar um valor e cobrar
+ * outro.
+ */
+export async function estimateLLMCostUsd(input: {
+  model: string;
+  tokens_input: number;
+  tokens_output: number;
+}): Promise<number> {
+  const rate = await rateFor(input.model);
+  const usd_cents =
+    (input.tokens_input / 1000) * rate.input + (input.tokens_output / 1000) * rate.output;
+  return usd_cents / 100;
+}
+
 export async function recordLLMCost(input: {
   provider: string;
   model: string;

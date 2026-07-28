@@ -16,14 +16,40 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { anthropicCreateMock, getSettingsMock, readDailyUsdMock, incCounterMock, publishMock } =
-  vi.hoisted(() => ({
+const {
+  anthropicCreateMock,
+  getSettingsMock,
+  readDailyUsdMock,
+  estimateCostMock,
+  incCounterMock,
+  publishMock,
+  redisState,
+  incrByFloatMock,
+  expireMock,
+} = vi.hoisted(() => {
+  const state = new Map<string, number>();
+  return {
     anthropicCreateMock: vi.fn(),
     getSettingsMock: vi.fn(),
     readDailyUsdMock: vi.fn(),
+    estimateCostMock: vi.fn(),
     incCounterMock: vi.fn(),
     publishMock: vi.fn(async () => 1),
-  }));
+    redisState: state,
+    /**
+     * Duplo ATÔMICO de `INCRBYFLOAT`: lê e escreve sem `await` no meio, que é
+     * exatamente a garantia que o Redis dá. É o que permite este spec
+     * distinguir reserva de check-then-act — com a versão antiga (ler, comparar,
+     * seguir) o teste de concorrência abaixo deixaria as 200 chamadas passarem.
+     */
+    incrByFloatMock: vi.fn(async (key: string, delta: number | string) => {
+      const next = (state.get(key) ?? 0) + Number(delta);
+      state.set(key, next);
+      return String(next);
+    }),
+    expireMock: vi.fn(async () => 1),
+  };
+});
 
 vi.mock('@anthropic-ai/sdk', () => {
   const Anthropic = vi.fn(function (this: unknown) {
@@ -48,6 +74,7 @@ vi.mock('@/lib/llm-settings.js', () => ({
 vi.mock('@/lib/cost-ledger.js', () => ({
   recordLLMCost: vi.fn(async () => undefined),
   readDailyLLMUsd: readDailyUsdMock,
+  estimateLLMCostUsd: estimateCostMock,
 }));
 
 vi.mock('@/lib/metrics.js', () => ({
@@ -55,7 +82,9 @@ vi.mock('@/lib/metrics.js', () => ({
   observeHistogram: vi.fn(),
 }));
 
-vi.mock('@/lib/redis.js', () => ({ redis: { publish: publishMock } }));
+vi.mock('@/lib/redis.js', () => ({
+  redis: { publish: publishMock, incrbyfloat: incrByFloatMock, expire: expireMock },
+}));
 
 vi.mock('@/config/env.js', async () => {
   const actual = await vi.importActual<typeof import('@/config/env.js')>('@/config/env.js');
@@ -75,7 +104,7 @@ vi.mock('@/config/env.js', async () => {
 
 import { executeLLM } from '@/lib/llm/gateway.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
-import { invalidateSpendCache, isBudgetEnabled } from '@/lib/llm/budget.js';
+import { isBudgetEnabled, _internal as budgetInternal } from '@/lib/llm/budget.js';
 import {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
   handleLLMSettingsInvalidation,
@@ -103,19 +132,30 @@ const REQ = {
   messages: [{ role: 'user' as const, content: 'oi' }],
 };
 
+/** Custo estimado/real de UMA chamada nos testes: 0,50 USD → 10 cabem em 5. */
+const UNIT_COST_USD = 0.5;
+
+function spendCounter(scope = { tenant_id: 'acme', agent_id: 'ana' }): number {
+  return redisState.get(budgetInternal.budgetKey(scope)) ?? 0;
+}
+
 beforeEach(() => {
   anthropicCreateMock.mockReset();
   incCounterMock.mockClear();
   publishMock.mockClear();
+  expireMock.mockClear();
+  incrByFloatMock.mockClear();
+  redisState.clear();
   readDailyUsdMock.mockReset();
   readDailyUsdMock.mockResolvedValue(0);
+  estimateCostMock.mockReset();
+  estimateCostMock.mockResolvedValue(UNIT_COST_USD);
   getSettingsMock.mockReset();
   getSettingsMock.mockResolvedValue({
     main: { value: 'settings-main', source: 'global' },
     fast: { value: 'settings-fast', source: 'global' },
   });
   invalidateModelCache();
-  invalidateSpendCache();
 });
 
 describe('orçamento diário por tenant+agent', () => {
@@ -123,11 +163,25 @@ describe('orçamento diário por tenant+agent', () => {
     expect(isBudgetEnabled()).toBe(true);
   });
 
-  it('gasto abaixo do teto deixa a chamada passar', async () => {
-    readDailyUsdMock.mockResolvedValue(4.99);
+  it('gasto abaixo do teto, com folga para a reserva, deixa passar', async () => {
+    readDailyUsdMock.mockResolvedValue(4.0);
     anthropicCreateMock.mockResolvedValueOnce(okReply());
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ));
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Diferença semântica que a reserva introduz: 4,99 gasto está ABAIXO do teto
+   * de 5, mas a chamada custa ~0,50 e levaria a 5,49. Checar o passado deixava
+   * passar; reservar o futuro recusa. É esse "só descobre depois de gastar"
+   * que o achado aponta.
+   */
+  it('recusa quando a reserva estouraria o teto, mesmo com gasto atual abaixo dele', async () => {
+    readDailyUsdMock.mockResolvedValue(4.99);
+    await expect(
+      runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)),
+    ).rejects.toMatchObject({ kind: 'budget_exhausted' });
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
   });
 
   it('gasto no teto rejeita ANTES de qualquer I/O de provider', async () => {
@@ -135,10 +189,39 @@ describe('orçamento diário por tenant+agent', () => {
     await expect(
       runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)),
     ).rejects.toMatchObject({ kind: 'budget_exhausted' });
-    // O ponto da quota: nada foi gasto.
+    // O ponto da quota: nada foi gasto. (A resolução de modelo PODE ter
+    // ocorrido — é leitura de settings, não I/O de provider, e a estimativa
+    // de custo depende do modelo escolhido.)
     expect(anthropicCreateMock).not.toHaveBeenCalled();
-    // Nem sequer resolvemos modelo — a quota vem antes.
-    expect(getSettingsMock).not.toHaveBeenCalled();
+  });
+
+  it('a recusa devolve a própria reserva — quota negada não consome quota', async () => {
+    readDailyUsdMock.mockResolvedValue(5);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM(REQ),
+    ).catch(() => undefined);
+    // Sem o rollback, cada tentativa negada deixaria 0,50 preso no contador e
+    // a quota encolheria a cada recusa — o pior comportamento possível durante
+    // um retry storm.
+    expect(spendCounter()).toBeCloseTo(5, 6);
+  });
+
+  it('a liquidação ajusta a reserva para o custo REAL', async () => {
+    anthropicCreateMock.mockResolvedValueOnce(okReply());
+    // Reserva assume o teto de saída (0,50); o custo real da resposta é 0,02.
+    estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValueOnce(0.02);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ));
+    expect(spendCounter()).toBeCloseTo(0.02, 6);
+  });
+
+  it('chamada que falhou devolve a reserva inteira', async () => {
+    anthropicCreateMock.mockRejectedValue(
+      Object.assign(new Error('nope'), { status: 401 }),
+    );
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM(REQ),
+    ).catch(() => undefined);
+    expect(spendCounter()).toBeCloseTo(0, 6);
   });
 
   it('budget_exhausted não é retentável e não gera fallback', async () => {
@@ -186,13 +269,51 @@ describe('orçamento diário por tenant+agent', () => {
     expect(err.message).not.toContain('1234');
   });
 
-  it('falha ao ler o ledger degrada ABERTO, mas com sinal operacional', async () => {
-    readDailyUsdMock.mockRejectedValue(new Error('db down'));
+  it('Redis indisponível degrada ABERTO, mas com sinal operacional', async () => {
+    incrByFloatMock.mockRejectedValueOnce(new Error('redis down'));
     anthropicCreateMock.mockResolvedValueOnce(okReply());
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ));
+    // Custo é controle financeiro, não de segurança: derrubar o tráfego do
+    // tenant por um hiccup de cache seria incidente pior. Mas a degradação
+    // precisa ser alertável, não invisível.
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
     expect(counterCalls('maia_llm_budget_check_failures_total').length).toBe(1);
   });
+
+  /**
+   * O teste que o achado pede: 200 chamadas concorrentes contra um teto que
+   * comporta 10.
+   *
+   * Com a versão anterior (ler o gasto acumulado, comparar, seguir) TODAS as
+   * 200 liam o mesmo valor inicial e passavam — gasto arbitrário exatamente no
+   * cenário em que a quota existe para proteger. Com a reserva atômica, o
+   * contador já reflete as reservas concorrentes no momento da comparação.
+   */
+  it('200 chamadas concorrentes respeitam o teto (reserva atômica, não check-then-act)', async () => {
+    const CONCURRENCY = 200;
+    const FITS = 10; // teto 5 USD / 0,50 por chamada
+    anthropicCreateMock.mockResolvedValue(okReply());
+
+    const results = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      Promise.allSettled(
+        Array.from({ length: CONCURRENCY }, () => executeLLM(REQ)),
+      ),
+    );
+
+    const ok = results.filter((r) => r.status === 'fulfilled').length;
+    const rejected = results.filter(
+      (r) =>
+        r.status === 'rejected' &&
+        (r.reason as { kind?: string }).kind === 'budget_exhausted',
+    ).length;
+
+    expect(ok).toBe(FITS);
+    expect(rejected).toBe(CONCURRENCY - FITS);
+    // Nenhuma chamada a mais chegou ao provider.
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(FITS);
+    // E o contador nunca ultrapassou o teto.
+    expect(spendCounter()).toBeLessThanOrEqual(5 + 1e-6);
+  }, 30000);
 
   /**
    * Este teste substitui um que FIXAVA o bug: ele afirmava que "sem contexto

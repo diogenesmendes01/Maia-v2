@@ -22,7 +22,9 @@
  * propõe").
  */
 import { config } from '@/config/env.js';
-import { assertWithinBudget, invalidateSpendCache } from './budget.js';
+import { estimateLLMCostUsd } from '@/lib/cost-ledger.js';
+import { reserveBudget, settleReservation } from './budget.js';
+import type { BudgetReservation } from './budget.js';
 import { LLMGatewayError, classifyProviderError, isAbortError } from './errors.js';
 import { resolveModelPair } from './model-resolver.js';
 import { getProvider } from './providers/index.js';
@@ -205,21 +207,36 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (4) Orçamento por tenant+agent ANTES de qualquer I/O de provider — o ponto
-  // de uma quota é não gastar. Rejeita com `budget_exhausted` (não retentável).
+  // (4) Uma leitura de settings resolve primário E fallback. É leitura de
+  // configuração, não I/O de provider — pode preceder a reserva de quota, e
+  // precisa: a estimativa de custo depende do modelo escolhido.
+  const { primary, fast } = await resolveModelPair(tier);
+
+  // (5) RESERVA de orçamento — atômica, antes de qualquer I/O de provider.
+  // Não é uma checagem: o contador é incrementado com a estimativa e só então
+  // comparado, para que chamadas concorrentes nunca decidam sobre o mesmo
+  // número. A diferença para o custo real é liquidada no `finally`.
+  let reservation: BudgetReservation = { key: '', reserved_usd: 0, active: false };
   try {
-    await assertWithinBudget({ scope, workload: req.workload });
+    reservation = await reserveBudget({
+      scope,
+      workload: req.workload,
+      model: primary.model,
+      system: req.system,
+      messages: req.messages,
+      max_tokens: req.max_tokens,
+    });
   } catch (budgetErr) {
     const err =
       budgetErr instanceof LLMGatewayError
         ? budgetErr
-        : new LLMGatewayError({ kind: 'budget_exhausted', detail: 'budget check failed' });
+        : new LLMGatewayError({ kind: 'budget_exhausted', detail: 'budget reservation failed' });
     await emitUsage(
       {
         workload: req.workload,
         tier,
         provider: provider.name,
-        model: 'unresolved',
+        model: primary.model,
         status: 'budget_exhausted',
         attempts: 0,
         duration_ms: Date.now() - startedAt,
@@ -232,8 +249,12 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (5) Uma leitura de settings resolve primário E fallback.
-  const { primary, fast } = await resolveModelPair(tier);
+  /**
+   * Custo REAL da chamada bem sucedida, ou `null` se nenhuma chamada gastou.
+   * Liquidado contra a reserva no `finally` — devolvendo a diferença (que
+   * costuma ser negativa, já que a reserva assume `max_tokens` de saída).
+   */
+  let actualCostUsd: number | null = null;
 
   const link = linkSignal(ctx.signal, ctx.deadline_at);
   const maxAttempts = Math.max(1, policy.max_attempts ?? config.CLAUDE_MAX_RETRIES);
@@ -261,6 +282,16 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     res: LLMResponse,
     fallbackFrom?: string,
   ): Promise<LLMResponse> => {
+    // Custo REAL da resposta, pela mesma tabela de preços do ledger. Só é
+    // calculado quando há reserva ativa — com a quota desligada, nada a
+    // liquidar (e nada a importar).
+    if (reservation.active) {
+      actualCostUsd = await estimateLLMCostUsd({
+        model: resolved.model,
+        tokens_input: res.usage.input_tokens,
+        tokens_output: res.usage.output_tokens,
+      }).catch(() => null);
+    }
     await emitUsage(
       {
         workload: req.workload,
@@ -281,7 +312,6 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     // O gasto que acabou de acontecer torna o número cacheado do orçamento
     // obsoleto; soltar aqui é o que impede a quota de ficar sempre um passo
     // atrás durante uma rajada.
-    if (scope) invalidateSpendCache(scope);
     return res;
   };
 
@@ -451,6 +481,10 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     }
   } finally {
     link.dispose();
+    // Liquida SEMPRE — sucesso, erro, timeout ou cancelamento. Sem isto, uma
+    // chamada que falhou deixaria a estimativa presa no contador e a quota
+    // encolheria a cada falha, que é justamente quando o retry storm começa.
+    await settleReservation(reservation, actualCostUsd ?? 0);
   }
 }
 
