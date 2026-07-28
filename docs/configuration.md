@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 131 | 17 |
+| `runtime` | 135 | 17 |
 | `admin-ui` | 22 | 4 |
 | `migrator` | 10 | 2 |
 | `backup` | 27 | 6 |
@@ -213,6 +213,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `FEATURE_OUTBOUND_DEDUP` | string | `false` | não | `runtime` | sim | Ledger de idempotência de saída (#227) em outbound_messages. |
 | `FEATURE_MESSAGE_DEBOUNCE` | string | `false` | não | `runtime` | sim | Agrupa textos picotados do mesmo remetente numa única rodada. Mídia sempre passa direto. |
 | `FEATURE_PROCEDURE_RUNTIME` | string | `true` | não | `runtime` | sim | Kill switch do runtime de procedimentos (selector + engine + avaliador). Default ON; a rodada ReAct base não depende dele. |
+| `FEATURE_TURN_CONTEXT_CACHE` | string | `false` | não | `runtime` | sim | Cache do contexto estático do turno (#511) — hoje só a seção `identity` (perfil operacional v2 renderizado). Default OFF: é a única parte da #511 que pode servir conteúdo velho, então sobe no escuro e é ligada por ambiente depois de observar a invalidação cross-replica. Desligar degrada para leitura direta pelo MESMO caminho, nunca para a waterfall legada — o kill switch custa latência, não correção. |
 
 ### Sonda sintética
 
@@ -281,6 +282,9 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 |---|---|---|---|---|---|---|
 | `POLICY_RESOLVER_CACHE_TTL_MS` | number | `300000` | não | `runtime` | sim | TTL (ms) do PolicyResolverCache. |
 | `POLICY_RESOLVER_CACHE_MAX_ENTRIES` | number | `10000` | não | `runtime` | sim | Teto LRU do PolicyResolverCache. |
+| `TURN_CONTEXT_CACHE_TTL_MS` | number | `300000` | não | `runtime` | sim | TTL (ms) de uma entrada POSITIVA do cache de contexto do turno (#511). Limita o staleness quando o barramento de invalidação no Redis está inalcançável. |
+| `TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS` | number | `30000` | não | `runtime` | sim | TTL (ms) de uma entrada NEGATIVA ("este agente não tem perfil operacional ativo") do cache de contexto do turno (#511). Deliberadamente menor que o TTL positivo: um miss costuma significar operador no meio do setup, e um perfil recém-ativado não pode esperar um TTL positivo inteiro para aparecer. |
+| `TURN_CONTEXT_CACHE_MAX_ENTRIES` | number | `5000` | não | `runtime` | sim | Teto de entradas do cache de contexto do turno (#511). Existe para limitar memória se a contagem de tuplas (tenant, agent) explodir, não para otimizar hit rate — o working set é de uma entrada por tupla. |
 | `SYNC_LATENCY_P95_BASELINE_MS` | number | — | não | `runtime` | sim | Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado. |
 | `SYNC_LATENCY_P95_BUDGET_PERCENT` | number | `20` | não | `runtime` | sim | Percentual extra permitido sobre a baseline. |
 

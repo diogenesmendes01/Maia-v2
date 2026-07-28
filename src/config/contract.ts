@@ -1684,6 +1684,66 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_CONTEXT_CACHE: {
+    name: 'FEATURE_TURN_CONTEXT_CACHE',
+    description:
+      'Cache do contexto estático do turno (#511) — hoje só a seção `identity` (perfil operacional v2 renderizado). ' +
+      'Default OFF: é a única parte da #511 que pode servir conteúdo velho, então sobe no escuro e é ligada por ambiente ' +
+      'depois de observar a invalidação cross-replica. Desligar degrada para leitura direta pelo MESMO caminho, nunca ' +
+      'para a waterfall legada — o kill switch custa latência, não correção.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    activeWhen: 'truthy',
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_CONTEXT_CACHE_TTL_MS: {
+    name: 'TURN_CONTEXT_CACHE_TTL_MS',
+    description:
+      'TTL (ms) de uma entrada POSITIVA do cache de contexto do turno (#511). Limita o staleness quando o barramento ' +
+      'de invalidação no Redis está inalcançável.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(300_000),
+    example: '300000',
+    fixture: '300000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS: {
+    name: 'TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS',
+    description:
+      'TTL (ms) de uma entrada NEGATIVA ("este agente não tem perfil operacional ativo") do cache de contexto do turno ' +
+      '(#511). Deliberadamente menor que o TTL positivo: um miss costuma significar operador no meio do setup, e um ' +
+      'perfil recém-ativado não pode esperar um TTL positivo inteiro para aparecer.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(30_000),
+    example: '30000',
+    fixture: '30000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_CONTEXT_CACHE_MAX_ENTRIES: {
+    name: 'TURN_CONTEXT_CACHE_MAX_ENTRIES',
+    description:
+      'Teto de entradas do cache de contexto do turno (#511). Existe para limitar memória se a contagem de tuplas ' +
+      '(tenant, agent) explodir, não para otimizar hit rate — o working set é de uma entrada por tupla.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(5_000),
+    example: '5000',
+    fixture: '5000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   SYNC_LATENCY_P95_BASELINE_MS: {
     name: 'SYNC_LATENCY_P95_BASELINE_MS',
     description: 'Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado.',

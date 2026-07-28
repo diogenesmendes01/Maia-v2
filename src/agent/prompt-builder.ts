@@ -14,6 +14,7 @@ import {
   procedureDefinitionsRepo,
   operationalProfileVersionsRepo,
 } from '@/db/repositories.js';
+import { runWithQueryCounter } from '@/db/query-counter.js';
 import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role, ProcedureExecution } from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
@@ -24,6 +25,15 @@ import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
+import { applyBudget, truncateUtf8, utf8Bytes } from './turn-context/budget.js';
+import { readCached } from './turn-context/cache.js';
+import {
+  recordSectionStatus,
+  recordTurnContextLoad,
+  type TurnContextResult,
+  type TurnContextSection,
+} from './turn-context/metrics.js';
+import { SECTION_BUDGETS, SELF_AWARENESS_GAP_MAX_ITEMS } from './turn-context/types.js';
 import {
   DOMAIN_KEYWORDS,
   type ToolExecutionSummary,
@@ -575,10 +585,23 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  * - Retorna null quando não há nada a injetar (chamador omite a seção).
  */
 async function buildGapMentionSection(): Promise<string | null> {
+  // Issue #511 round 1 review — no longer cached; see the `capabilities` note
+  // above. A gap that was resolved must stop being announced immediately, not
+  // after a TTL.
   const gaps =
     (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
   if (gaps.length === 0) return null;
-  const lines = gaps.slice(0, 5).map((g) => {
+  // #511: the 5-gap cap is now metered instead of silent (token bloat guard).
+  const lines = applyBudget(
+    'gaps',
+    gaps,
+    SECTION_BUDGETS.gaps,
+    (g) => utf8Bytes(g.capability_description),
+    (g, maxBytes) => ({
+      ...g,
+      capability_description: truncateUtf8(g.capability_description, maxBytes),
+    }),
+  ).items.map((g) => {
     const proposedSuffix =
       g.current_level === GapLevel.PROPOSED ? ' (proposta de melhoria já enviada)' : '';
     return `- Se o usuário perguntar sobre ${g.capability_description}, você pode explicar honestamente que isso é uma limitação atual${proposedSuffix}.`;
@@ -586,54 +609,166 @@ async function buildGapMentionSection(): Promise<string | null> {
   return `## Limitações conhecidas (mencionar com transparência se vier à tona)\n${lines.join('\n')}`;
 }
 
+/**
+ * Issue #511 — instrumented entry point.
+ *
+ * The prompt build is the single most query-hungry step of a turn, and until
+ * now it had no number attached: the waterfall below issues one query per
+ * entity state, one per behavioural-hint scope, one per optional section. This
+ * wrapper opens a query-counter frame (`src/db/query-counter.ts`, fed by the
+ * instrumented drizzle client) and publishes the round-trip count and duration
+ * so the batch/cache work has a measured baseline to beat.
+ *
+ * Phase label is `legacy` — it names the pre-#511 waterfall specifically, so a
+ * dashboard can watch the legacy and loader-backed paths side by side during
+ * the cutover instead of averaging them together.
+ *
+ * The counter frame is per-call and ALS-scoped: concurrent turns never share a
+ * frame, and the count is reported from `finally` so a throwing build still
+ * publishes what it spent before failing.
+ */
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
+  const started_at = Date.now();
+  return runWithQueryCounter(async (counter) => {
+    let result: TurnContextResult = 'ok';
+    try {
+      return await buildPromptUninstrumented(ctx);
+    } catch (err) {
+      result = 'error';
+      throw err;
+    } finally {
+      recordTurnContextLoad({
+        phase: 'legacy',
+        result,
+        duration_ms: Date.now() - started_at,
+        query_count: counter.count,
+      });
+    }
+  });
+}
+
+async function buildPromptUninstrumented(
+  ctx: PromptContext,
+): Promise<{ system: string; messages: LLMMessage[] }> {
   // P4: operational profile v2. An active profile renders via
   // renderOperationalProfile; a missing or non-'active' profile falls back to
   // self_state (runtime defense — never expose a `proposed`/`frozen` profile
   // even if the DB invariant slips).
-  let renderedV2: RenderedProfile | null;
-  let selfVersionLabel: string;
-  let systemPromptBody: string;
-  let resumoAprendizadosBody: string;
-
-  const profile = await operationalProfileVersionsRepo.getActive();
-  if (profile && profile.status === 'active') {
-    renderedV2 = renderOperationalProfile({ version: profile });
-    systemPromptBody = renderedV2.system_prompt_block;
-    selfVersionLabel = `op_profile_v${profile.version}`;
-    resumoAprendizadosBody = '(perfil v2 ativo)';
-  } else {
+  //
+  // Issue #511 — this pair of reads is cached under the `identity` resource.
+  // Identity is the textbook cacheable section: it changes only through an
+  // audited activation (which publishes an invalidation after commit), it is
+  // read on every single turn, and it grants nothing — so a stale read can at
+  // worst render a slightly old persona, never an old permission. The cached
+  // value is the DERIVED render output, not the row, so the (pure)
+  // `renderOperationalProfile` call is amortised too.
+  // Issue #511 round 2 review — ONLY the profile-v2 branch is cached.
+  //
+  // Every mutation that changes what `operationalProfileVersionsRepo.getActive()`
+  // returns publishes an `identity` invalidation after commit (see
+  // `publishIdentityInvalidation` in `src/db/repositories/profile-repos.ts`);
+  // no code path mutates an active row's `profile_body` in place. That branch
+  // is therefore fully covered.
+  //
+  // The `self_state` FALLBACK is not, and is read directly every turn:
+  // `selfStateRepo.appendLearning` rewrites `resumo_aprendizados` from the
+  // fire-and-forget reflection path (`src/agent/reflection.ts`) with no
+  // publisher, so caching it would let another replica render a stale summary
+  // until the TTL. Same rule that took `capabilities` and `gaps` out of the
+  // cache: a resource is only cacheable once EVERY mutation publishes.
+  //
+  // A `null` result is negative-cached, and that stays correct — activating a
+  // profile publishes, so the "no active profile v2" answer is dropped the
+  // moment it stops being true.
+  const activeProfileIdentity = await readCached('identity', async () => {
+    const profile = await operationalProfileVersionsRepo.getActive();
+    if (profile && profile.status === 'active') {
+      const rendered: RenderedProfile = renderOperationalProfile({ version: profile });
+      return {
+        systemPromptBody: rendered.system_prompt_block,
+        selfVersionLabel: `op_profile_v${profile.version}`,
+        resumoAprendizadosBody: '(perfil v2 ativo)',
+      };
+    }
     if (profile) {
       // Profile loaded but status !== 'active' — runtime defense, should never
       // happen if the DB invariant holds. Log + fall back to self_state.
+      // Fires on a cache MISS only, so the negative TTL rate-limits it.
       logger.warn(
         { has_profile: true, status: profile.status },
         'identity.profile_v2_invalid_fallback_to_self_state',
       );
     }
+    return null;
+  });
+
+  let systemPromptBody: string;
+  let selfVersionLabel: string;
+  let resumoAprendizadosBody: string;
+  if (activeProfileIdentity) {
+    ({ systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = activeProfileIdentity);
+  } else {
+    // Deliberately uncached — see above.
     const self = await selfStateRepo.getActive();
     systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
     selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
     resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
   }
 
-  const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
-  const ents = await entidadesRepo.byIds(ctx.scope.entidades);
+  // Issue #511 — these five reads have no dependency on one another and used to
+  // run strictly one after the other. `Promise.all` (not `allSettled`) is the
+  // right primitive here precisely because they are NOT optional: each one
+  // previously threw straight out of `buildPrompt`, and that contract is
+  // preserved — first rejection still fails the turn. The only thing that
+  // changes is that the turn now waits for the SLOWEST rather than the SUM.
+  //
   // PR #82 review (Superpowers Critical #1): route legacy factsBlock
   // through the memory_entry sensitivity filter. listMentionableForScopes
   // drops any fact whose corresponding memory_entry row has
   // mention_allowed=false or needs_review=true. Sensitive content captured
   // before P2 stays out of the prompt while the classifier reviews it.
-  const facts = await factsRepo.listMentionableForScopes([
-    'global',
-    `pessoa:${ctx.pessoa.id}`,
-    ...ctx.scope.entidades.map((e) => `entidade:${e}`),
+  const [recentRaw, ents, facts, rules, entityStates] = await Promise.all([
+    mensagensRepo.recentInConversation(ctx.conversa.id, SECTION_BUDGETS.history.max_items),
+    entidadesRepo.byIds(ctx.scope.entidades),
+    factsRepo.listMentionableForScopes([
+      'global',
+      `pessoa:${ctx.pessoa.id}`,
+      ...ctx.scope.entidades.map((e) => `entidade:${e}`),
+    ]),
+    rulesRepo.listActive('classificacao'),
+    // Issue #511 — was one `entityStatesRepo.byId(eid)` per entity: the dominant
+    // N+1 of the turn. A single tenant-scoped `WHERE entidade_id IN (…)`
+    // replaces it, so scope size no longer multiplies round-trips on the
+    // 10-connection pool. `?.` mirrors the optional-repo idiom used below —
+    // older test mocks that only stub the per-id method degrade to "no states"
+    // instead of throwing.
+    (async () => (await entityStatesRepo?.byIds?.(ctx.scope.entidades)) ?? [])(),
   ]);
-  const rules = await rulesRepo.listActive('classificacao');
+
+  // #511 round 1 review: `history` declared a budget but never went through
+  // `applyBudget`, so the item cap was enforced (by the repo's LIMIT) while the
+  // byte ceiling was not — one long message could still blow the prompt.
+  //
+  // `recentInConversation` returns NEWEST-FIRST (the render below reverses it),
+  // so a prefix keeps the most recent turns and drops the oldest. That is the
+  // right end to cut: recency is what the model needs. The oversized-single-
+  // message case is clipped rather than dropped, so a turn whose latest message
+  // is huge still shows the model what was just said.
+  const recent = applyBudget(
+    'history',
+    recentRaw,
+    SECTION_BUDGETS.history,
+    (m) => utf8Bytes(m.conteudo ?? ''),
+    (m, maxBytes) => ({ ...m, conteudo: truncateUtf8(m.conteudo ?? '', maxBytes) }),
+  ).items;
+
+  // #511: index once instead of a linear scan per entity — the scope block and
+  // the state block below both look entities up by id.
+  const entById = new Map(ents.map((e) => [e.id, e]));
 
   const profileBlock = Array.from(ctx.scope.byEntity.entries())
     .map(([eid, rp]) => {
-      const ent = ents.find((e) => e.id === eid);
+      const ent = entById.get(eid);
       const limite =
         rp.effective_limits.valor_max === null
           ? 'sem limite individual (teto global aplica)'
@@ -642,41 +777,77 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     })
     .join('\n');
 
-  const factsBlock = facts
-    .slice(0, 20)
-    .map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`)
-    .join('\n');
+  // Issue #511 — the `.slice(0, 20)` caps that used to live here were
+  // deterministic but INVISIBLE: a tenant whose 200 facts were being cut to 20
+  // looked exactly like a tenant that had 20. `applyBudget` keeps the same cut,
+  // adds a byte ceiling (20 facts carrying 50 KB payloads each is still a
+  // megabyte of prompt), and counts every dropped item onto
+  // `maia_turn_context_truncated_total`.
+  const factsBlock = applyBudget(
+    'facts',
+    facts.map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`),
+    SECTION_BUDGETS.facts,
+    utf8Bytes,
+    truncateUtf8,
+  ).items.join('\n');
 
-  const rulesBlock = rules
-    .slice(0, 20)
-    .map(
+  const rulesBlock = applyBudget(
+    'rules',
+    rules.map(
       (r) =>
         `  - [#${r.id.slice(0, 8)}] (${r.tipo}, conf ${r.confianca}) ${wrapRule(`${r.contexto} → ${r.acao}`)}`,
-    )
-    .join('\n');
+    ),
+    SECTION_BUDGETS.rules,
+    utf8Bytes,
+    truncateUtf8,
+  ).items.join('\n');
 
-  const entityStateBlocks: string[] = [];
+  // Rendering walks `ctx.scope.entidades`, so the state block's ORDER is scope
+  // order (not DB order) and entities without a state row are still skipped —
+  // the block is byte-identical to the pre-batch output.
+  const stateByEntityId = new Map(entityStates.map((s) => [s.entidade_id, s]));
+
+  const entityStateLines: string[] = [];
   for (const eid of ctx.scope.entidades) {
-    const st = await entityStatesRepo.byId(eid);
+    const st = stateByEntityId.get(eid);
     if (!st) continue;
-    const ent = ents.find((e) => e.id === eid);
-    entityStateBlocks.push(
+    const ent = entById.get(eid);
+    entityStateLines.push(
       `  - ${ent?.nome ?? eid}: saldo=${st.saldo_consolidado ?? '?'}, próximo_venc=${st.proximo_vencimento ?? '?'}`,
     );
   }
+  // #511 round 1 review: `entity_states` declared a budget but never went
+  // through `applyBudget`, so an elephant tenant's scope rendered unbounded.
+  // Entity NAMES are tenant-controlled free text, so the byte ceiling matters
+  // here as much as the item cap.
+  const entityStateBlocks = applyBudget(
+    'entity_states',
+    entityStateLines,
+    SECTION_BUDGETS.entity_states,
+    utf8Bytes,
+    truncateUtf8,
+  ).items;
 
   // P2: Load memory_entry respecting visibility flags, behavioral hints, and
-  // self-awareness (capabilities + gaps). Wrapped in try/catch so any DB
-  // failure or missing repo (e.g. older test mocks) degrades gracefully —
-  // the existing prompt is still produced.
-  let memorySection = '';
-  let hintsSection = '';
-  let selfAwarenessSection = '';
-  let roleSection = '';
-  let procedureSection = '';
-  let gapMentionSection = '';
+  // self-awareness (capabilities + gaps).
+  //
+  // Issue #511 — these six sections are INDEPENDENT of one another, and used to
+  // run one after the other: the turn paid the sum of their latencies before
+  // the first LLM token. They now run concurrently under `Promise.allSettled`,
+  // so the turn pays the MAXIMUM instead of the sum. Six concurrent reads
+  // against a 10-connection pool (`src/db/client.ts`) is a deliberate ceiling —
+  // enough to collapse the waterfall, not enough for one turn to starve the
+  // pool for everyone else.
+  //
+  // `allSettled` (never `all`) is what preserves the existing contract: each of
+  // these is OPTIONAL, so one failing must degrade its own section and leave
+  // the other five intact. What changes is that the failure is no longer
+  // swallowed — the section name lands in `degradedSections` and is logged, so
+  // "the prompt was thin" stops being indistinguishable from "there was nothing
+  // to say".
+  const degradedSections: string[] = [];
 
-  try {
+  const loadMemorySection = async (): Promise<string> => {
     const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
       interlocutor_id: ctx.pessoa?.id,
       conversa_id: ctx.conversa?.id,
@@ -687,7 +858,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
       // these through the agent core.
       role_id: ctx.current_role_id ?? undefined,
       channel_id: ctx.current_channel_id ?? undefined,
-      limit: 30,
+      limit: SECTION_BUDGETS.memories.max_items,
     })) ?? [];
 
     // Respect proactive_use: if false, only include when current message
@@ -705,21 +876,24 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
     // Split: only mention_allowed enters the prompt literally. The hidden-
     // influence subset is represented via behavioral hints derived from it.
     const mentionableMemories = usableMemories.filter((m) => m.mention_allowed);
+    if (mentionableMemories.length === 0) return '';
 
-    if (mentionableMemories.length > 0) {
-      // P83-C6: wrap memory content in <memory> tags so the LLM treats
-      // it as DATA, not as instruction. Without this, a stored memory
-      // that contains "ignore previous rules…" would be interpolated raw
-      // into the system prompt and could override governance.
-      memorySection =
-        '\n## Memória relevante\n' +
-        mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully — DB unavailable or repo unmocked in tests.
-  }
+    // P83-C6: wrap memory content in <memory> tags so the LLM treats
+    // it as DATA, not as instruction. Without this, a stored memory
+    // that contains "ignore previous rules…" would be interpolated raw
+    // into the system prompt and could override governance.
+    const lines = mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`);
+    const budgeted = applyBudget(
+      'memories',
+      lines,
+      SECTION_BUDGETS.memories,
+      utf8Bytes,
+      truncateUtf8,
+    );
+    return '\n## Memória relevante\n' + budgeted.items.join('\n');
+  };
 
-  try {
+  const loadHintsSection = async (): Promise<string> => {
     const scopeQueries: Array<{ scope_type: string; subject_id?: string | null }> = [
       { scope_type: 'interlocutor', subject_id: ctx.pessoa?.id },
       { scope_type: 'conversation', subject_id: ctx.conversa?.id },
@@ -733,36 +907,89 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
         : []),
       { scope_type: 'agent', subject_id: null },
     ];
-    const allHints: BehavioralHint[] = [];
-    for (const sq of scopeQueries) {
-      // Skip interlocutor/conversation queries when subject id is missing.
-      if (sq.scope_type !== 'agent' && !sq.subject_id) continue;
-      const hints =
-        (await behavioralHintRepo?.findActiveForScope?.({
-          scope_type: sq.scope_type,
-          subject_id: sq.subject_id ?? null,
-        })) ?? [];
-      allHints.push(...hints);
-    }
-    if (allHints.length > 0) {
-      // P83-C6: hints are derived from observed conversations and so
-      // may carry untrusted text. Wrap them as <hint> data.
-      hintsSection =
-        '\n## Instruções comportamentais ativas\n' +
-        allHints.map((h) => `- ${wrapHint(h.hint_text)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
+    // Issue #511 — was one round-trip PER SCOPE (up to five sequential queries
+    // for a turn with a resolved role and channel). `findActiveForScopes` OR's
+    // the scope tuples into a single statement with the same tenant, revoked,
+    // lifecycle-visibility and expiry filters, so the hint set is identical —
+    // minus the duplicates the loop could produce when a hint matched two
+    // scopes.
+    //
+    // The "skip when the subject id is missing" rule moves to this filter,
+    // unchanged: an interlocutor/conversation/role/channel tuple without a
+    // subject would otherwise match EVERY hint of that scope type.
+    const scopedQueries = scopeQueries.filter(
+      (sq) => sq.scope_type === 'agent' || !!sq.subject_id,
+    );
+    const allHints: BehavioralHint[] =
+      (await behavioralHintRepo?.findActiveForScopes?.(scopedQueries)) ?? [];
+    if (allHints.length === 0) return '';
 
-  try {
-    const allSkills = (await capabilitiesSkillRepo?.listAll?.()) ?? [];
-    const topSkills = [...allSkills]
-      .sort((a, b) => Number(b.confidence) - Number(a.confidence))
-      .slice(0, 5);
+    // P83-C6: hints are derived from observed conversations and so
+    // may carry untrusted text. Wrap them as <hint> data.
+    const lines = allHints.map((h) => `- ${wrapHint(h.hint_text)}`);
+    const budgeted = applyBudget('hints', lines, SECTION_BUDGETS.hints, utf8Bytes, truncateUtf8);
+    return '\n## Instruções comportamentais ativas\n' + budgeted.items.join('\n');
+  };
+
+  const loadSelfAwarenessSection = async (): Promise<string> => {
+    // Issue #511 round 1 review — these were cached under `capabilities` and
+    // are now read directly every turn. Only profile activation published an
+    // invalidation, so a REVOKED skill or a resolved gap stayed visible on
+    // other replicas for up to a full TTL. Two saved queries are not worth
+    // showing an agent a capability it no longer has.
+    const capabilities = {
+      skills: (await capabilitiesSkillRepo?.listAll?.()) ?? [],
+      mentionableGaps: (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [],
+    };
+    // Deterministic order before the cut: sort by confidence, then by name so
+    // two skills with equal confidence never swap places between turns (which
+    // would change the prompt bytes for no reason and defeat prompt caching).
+    const sortedSkills = [...capabilities.skills].sort(
+      (a, b) =>
+        Number(b.confidence) - Number(a.confidence) || a.skill_name.localeCompare(b.skill_name),
+    );
+    // Issue #511 round 2 review: the budget used to measure ONLY `skill_name`,
+    // while up to three `capability_description` values — the LONG, free-form,
+    // tenant-controlled field — rendered outside any ceiling. A budget that
+    // does not measure the big field is not a ceiling.
+    //
+    // Both lists now share the section's single `max_bytes`, applied in render
+    // order: skills first, then gaps against whatever is left. Sharing one
+    // allowance (rather than giving each its own) is what makes the SECTION
+    // bounded instead of just each clause. Each list keeps its own item cap,
+    // and both report under the `capabilities` label, so the counters describe
+    // the section as a whole.
+    const skillsBudgeted = applyBudget(
+      'capabilities',
+      sortedSkills,
+      SECTION_BUDGETS.capabilities,
+      (s) => utf8Bytes(s.skill_name),
+      (s, maxBytes) => ({ ...s, skill_name: truncateUtf8(s.skill_name, maxBytes) }),
+    );
+    const topSkills = skillsBudgeted.items;
     const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
     const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
-    const mentionableGaps = (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [];
+
+    const gapsBudgeted = applyBudget(
+      'capabilities',
+      capabilities.mentionableGaps,
+      {
+        max_items: SELF_AWARENESS_GAP_MAX_ITEMS,
+        max_bytes: Math.max(0, SECTION_BUDGETS.capabilities.max_bytes - skillsBudgeted.bytes),
+      },
+      (g) => utf8Bytes(g.capability_description),
+      (g, maxBytes) => ({
+        ...g,
+        capability_description: truncateUtf8(g.capability_description, maxBytes),
+      }),
+    );
+    // A pathological skill list can consume the whole allowance, clipping a gap
+    // description to nothing. Rendering "Ainda não tem: ." would be noise, so
+    // drop the emptied entries — the loss is already on
+    // `maia_turn_context_truncated_total`, so this is not a silent drop.
+    const mentionableGaps = gapsBudgeted.items.filter(
+      (g) => g.capability_description.length > 0,
+    );
 
     const lines = [
       masteredSkills.length
@@ -773,29 +1000,22 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
         : '',
       mentionableGaps.length
         ? `Ainda não tem: ${mentionableGaps
-            .slice(0, 3)
             .map((g) => wrapGap(g.capability_description))
             .join(', ')}.`
         : '',
     ].filter(Boolean);
 
-    if (lines.length > 0) {
-      selfAwarenessSection = '\n## Autoconhecimento\n' + lines.join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
+    return lines.length > 0 ? '\n## Autoconhecimento\n' + lines.join('\n') : '';
+  };
 
   // P6 Task 9: injeta "## Modo operacional" entre selfAwareness e procedure
   // para respeitar a precedência da spec §10.7 (CHANNEL POLICY > PROCEDURE).
   // Tolerante a ausência de role e omitido para o role default (ver
   // buildRoleSection — MULTI_CHANNEL removido / sempre on após #411).
-  try {
+  const loadRoleSection = async (): Promise<string> => {
     const section = await buildRoleSection(ctx.activeRole);
-    if (section) roleSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — role section é não-essencial ao turno base.
-  }
+    return section ? '\n' + section : '';
+  };
 
   // P3b Task 8: if there's an active procedure_execution for this conversa,
   // surface it in the system prompt so the model can follow the step's
@@ -807,7 +1027,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
   // (`ctx.activeExecution`) over a fresh DB roundtrip. `undefined` means the
   // caller didn't provide one (legacy / test) → fall back to lookup. `null`
   // means the caller looked and found nothing → skip the section entirely.
-  try {
+  const loadProcedureSection = async (): Promise<string> => {
     if (ctx.conversa?.id) {
       const activeExec =
         ctx.activeExecution !== undefined
@@ -833,7 +1053,7 @@ export async function buildPrompt(ctx: PromptContext): Promise<{ system: string;
               ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
               : null;
             const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
-            procedureSection = `\n## Procedimento em execução
+            return `\n## Procedimento em execução
 Você está executando "${def.nome}" v${def.version_number}, passo atual: "${currentStep.id}".
 Intenção do passo: ${currentStep.intencao ?? 'não especificada'}.
 Como executar: ${currentStep.como ?? 'não especificado'}.${matchingCriterion ? `\nCritério de sucesso (${matchingCriterion.type}).` : ''}${currentStep.armadilhas?.length ? `\nArmadilhas comuns: ${currentStep.armadilhas.join('; ')}.` : ''}
@@ -844,19 +1064,57 @@ ${stateJson}`;
         }
       }
     }
-  } catch {
-    // Degrade gracefully — procedure runtime must not break baseline prompt.
-  }
+    return '';
+  };
 
   // P5 Task 10: surface gaps em nível mentionable/proposed para que o agente
   // possa ser transparente sobre limitações conhecidas se vierem à tona.
   // Flag-gated (DIALOGICAL_ACQUISITION). Tolerante a falhas: qualquer erro
   // de repo degrada para "sem seção" sem quebrar o prompt.
-  try {
+  const loadGapMentionSection = async (): Promise<string> => {
     const section = await buildGapMentionSection();
-    if (section) gapMentionSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — gap mention é não-essencial ao turno.
+    return section ? '\n' + section : '';
+  };
+
+  // Fan out. Order of the tuple is the order the sections are concatenated into
+  // the system prompt below — keeping the two aligned means a reordering
+  // mistake shows up as a compile error, not as a silently reordered prompt.
+  const optionalLoaders: Array<[string, () => Promise<string>]> = [
+    ['memories', loadMemorySection],
+    ['hints', loadHintsSection],
+    ['capabilities', loadSelfAwarenessSection],
+    ['role', loadRoleSection],
+    ['procedure', loadProcedureSection],
+    ['gaps', loadGapMentionSection],
+  ];
+  const settled = await Promise.allSettled(optionalLoaders.map(([, load]) => load()));
+  const sections = settled.map((outcome, i) => {
+    const name = optionalLoaders[i]![0];
+    if (outcome.status === 'fulfilled') {
+      recordSectionStatus(name as TurnContextSection, outcome.value ? 'loaded' : 'empty');
+      return outcome.value;
+    }
+    // Degrade gracefully — same availability contract as the per-block
+    // try/catch this replaces — but the failure is now COUNTED and NAMED
+    // instead of vanishing into an empty catch.
+    degradedSections.push(name);
+    recordSectionStatus(name as TurnContextSection, 'degraded');
+    logger.warn(
+      { section: name, err: (outcome.reason as Error)?.message },
+      'turn_context.section_degraded',
+    );
+    return '';
+  });
+  const [memorySection, hintsSection, selfAwarenessSection, roleSection, procedureSection, gapMentionSection] =
+    sections as [string, string, string, string, string, string];
+
+  if (degradedSections.length > 0) {
+    // One structured line per turn carrying the degraded section NAMES only —
+    // never their content (issue §Observabilidade).
+    logger.warn(
+      { degraded_sections: degradedSections, conversa_id: ctx.conversa?.id },
+      'turn_context.degraded',
+    );
   }
 
   // Issue #73 — scope-change sentinel + backend events + contradiction overlay.

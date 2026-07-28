@@ -595,6 +595,40 @@ export const entityStatesRepo = {
       .limit(1);
     return rows[0] ?? null;
   },
+  /**
+   * Issue #511 — batch sibling of `byId`, replacing the per-entity loop that
+   * built `entityStateBlocks` in `src/agent/prompt-builder.ts`. That loop was
+   * the dominant N+1 of the turn: a tenant with 100 entities in scope paid 100
+   * round-trips on the fixed 10-connection pool (`src/db/client.ts`) before the
+   * first LLM token, and every other tenant waited behind it.
+   *
+   * Carries the SAME (tenant_id, agent_id) predicate as `byId` — see the long
+   * note above on why the `entidade_id`-only PK makes that predicate load
+   * bearing rather than decorative. Entities not owned by the running tuple are
+   * simply absent from the result, exactly as `byId` returns null for them.
+   *
+   * Deterministic ordering by `entidade_id` so the rendered "## Estado atual"
+   * block is byte-stable for the same scope across turns (a reordered prompt is
+   * a different prompt to the model, and to the prompt cache). The caller
+   * re-sorts into scope order; ordering here just removes DB nondeterminism.
+   */
+  async byIds(entidade_ids: string[], limit = 500): Promise<EntityState[]> {
+    if (entidade_ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(entity_states)
+      .where(
+        and(
+          inArray(entity_states.entidade_id, Array.from(new Set(entidade_ids))),
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
+      )
+      .orderBy(entity_states.entidade_id)
+      .limit(limit);
+  },
   // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.
   // The conflict target is the `entidade_id` PK only, and the OLD SET
   // (`{ ...input, updated_at }`) did NOT re-stamp tenant/agent NOR gate the

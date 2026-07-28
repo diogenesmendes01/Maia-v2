@@ -68,7 +68,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
   factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
-  entityStatesRepo: { byId: vi.fn().mockResolvedValue(null) },
+  entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../../src/db/client.js', () => {

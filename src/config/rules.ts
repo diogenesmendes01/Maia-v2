@@ -318,6 +318,31 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     }
   }
 
+  // Cache de contexto do turno (#511): o TTL NEGATIVO existe justamente para
+  // ser mais curto que o positivo. Uma entrada negativa é "este agente não tem
+  // perfil operacional ativo" — resposta que muda no instante em que o operador
+  // ativa um perfil. Invertida a ordem, um perfil recém-ativado demoraria MAIS
+  // para aparecer do que um perfil alterado, que é o oposto da intenção.
+  //
+  // Warning, não error: nada quebra, é afinação sem sentido. Abortar o boot por
+  // causa de um botão de tuning seria desproporcional.
+  const turnCtxTtl = num(c.TURN_CONTEXT_CACHE_TTL_MS);
+  const turnCtxNegTtl = num(c.TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS);
+  if (turnCtxTtl !== undefined && turnCtxNegTtl !== undefined && turnCtxNegTtl > turnCtxTtl) {
+    push({
+      scope: 'contract',
+      severity: 'warning',
+      variable: 'TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS',
+      rule: 'turn-context-cache/negative-ttl-order',
+      message:
+        `TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS=${turnCtxNegTtl} é maior que ` +
+        `TURN_CONTEXT_CACHE_TTL_MS=${turnCtxTtl}.`,
+      remediation:
+        'Deixe o TTL negativo menor ou igual ao positivo — ele cobre "sem perfil ativo", ' +
+        'que deve expirar rápido para uma ativação recente aparecer.',
+    });
+  }
+
   // Alertas: canal desconhecido é erro (um typo silenciaria o alerta).
   for (const ch of channels) {
     if (!['log', 'email', 'telegram'].includes(ch)) {
