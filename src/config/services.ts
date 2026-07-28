@@ -14,6 +14,7 @@ import {
   type MaiaProfile,
   MAIA_SERVICES,
   type MaiaService,
+  describeRequiredWhen,
 } from '@/config/metadata.js';
 
 export interface ServiceManifestEntry {
@@ -50,7 +51,7 @@ export function manifestForService(
     required: isRequired(spec, profile),
     group: spec.group,
     restartRequired: spec.restartRequired,
-    ...(spec.requiredWhen ? { requiredWhen: spec.requiredWhen } : {}),
+    ...(spec.requiredWhen ? { requiredWhen: describeRequiredWhen(spec.requiredWhen) } : {}),
   }));
   return {
     service,

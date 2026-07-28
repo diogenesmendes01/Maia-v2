@@ -166,8 +166,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `BACKUP_S3_BUCKET` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Bucket de destino do backup remoto. Sem ele, o backup é só local. Obrigatória em: staging, production. |
 | `BACKUP_S3_ENDPOINT` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Endpoint custom para provedores S3-compatíveis (Backblaze B2, Cloudflare R2, Wasabi). Vazio = AWS S3 nativo. |
 | `BACKUP_S3_REGION` | string | `us-east-1` | não | `runtime`, `backup`, `maintenance` | sim | Região do bucket. |
-| `BACKUP_S3_ACCESS_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Access key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET definido. |
-| `BACKUP_S3_SECRET_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Secret key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET definido. |
+| `BACKUP_S3_ACCESS_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Access key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET está definida. |
+| `BACKUP_S3_SECRET_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Secret key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET está definida. |
 | `BACKUP_S3_PREFIX` | string | `maia` | não | `runtime`, `backup`, `maintenance` | sim | Prefixo dentro do bucket (sem barra inicial nem final). |
 
 ### Custo
@@ -220,7 +220,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `RUNTIME_TRACE_HMAC_MASTER_SECRET` | string | — | sim | `runtime` | sim | Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis. Obrigatória em: staging, production. |
 | `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` | string | — | sim | `runtime` | sim | Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria. |
 | `RUNTIME_TRACE_DEBUG_S3_BUCKET` | string | — | não | `runtime` | sim | Bucket dos snapshots cifrados do modo debug (TTL 24h). |
-| `RUNTIME_TRACE_DEBUG_AES_KEY` | string | — | sim | `runtime` | sim | Chave AES-GCM (base64) dos snapshots de debug. Obrigatória quando RUNTIME_TRACE_DEBUG_S3_BUCKET definido. |
+| `RUNTIME_TRACE_DEBUG_AES_KEY` | string | — | sim | `runtime` | sim | Chave AES-GCM (base64) dos snapshots de debug. Obrigatória quando RUNTIME_TRACE_DEBUG_S3_BUCKET está definida. |
 | `RUNTIME_TRACE_BODY_ORPHAN_SEC` | number | `300` | não | `runtime` | sim | Idade máxima (s) de um envelope pendente antes do alerta do recoverer. |
 | `RUNTIME_TRACE_MATVIEW_REFRESH_SEC` | number | `300` | não | `runtime` | sim | Intervalo (s) de refresh da matview unified_trace_events. |
 

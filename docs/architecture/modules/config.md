@@ -37,7 +37,8 @@
 | Need | Where |
 |---|---|
 | Add a new env var | Add the entry to `ENV_CONTRACT` in `contract.ts`, run `npm run config:generate`, commit the artifacts |
-| Add a conditional/cross-field requirement | `rules.ts`, scope `contract` (scope `boot` only when the loader itself must refuse to start) |
+| Make a variable required only under a condition | `requiredWhen` on the entry — an **executable** `RequiredWhen` condition (`equals` / `includes` / `truthy` / `present` / `anyOf` / `allOf`), never prose. The validator evaluates it (`contract/required-when`) and the docs sentence is derived from it |
+| Add another cross-field requirement | `rules.ts`, scope `contract` (scope `boot` only when the loader itself must refuse to start) |
 | Deprecate a var | Set `deprecatedSince` + `replacement`; the validator emits `contract/deprecated` |
 | Remove a var | Delete the entry **and** add a `Tombstone` — never a silent removal, never a rename |
 | Add a new feature flag | Contract entry in the `feature-flags` group, default `false`; extend `feature-flags.ts`; document the gate in the relevant runbook |
@@ -86,6 +87,7 @@ npm run config:init -- --profile development
 | `tests/unit/config/parity.spec.ts` | Compose/Dockerfile ↔ contract parity; Node/npm version parity |
 | `tests/unit/config/no-direct-env-reads.spec.ts` | The `process.env` allow-list is exact and the ESLint rule is live |
 | `tests/unit/config/env-file.spec.ts` | `parseEnvFile` ↔ `dotenv.parse` parity (inline comments, quoting, escapes, multi-line) |
+| `tests/unit/config/required-when.spec.ts` | Every `requiredWhen` in the contract, both branches; the case list is asserted to equal the contract's |
 
 ## In-flight changes
 

@@ -11,7 +11,14 @@
  * touches no filesystem, and never interpolates a secret VALUE into a message.
  */
 import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
-import { type MaiaProfile, isPlaceholderValue } from '@/config/metadata.js';
+import { CONTRACT_ENTRIES } from '@/config/contract.js';
+import {
+  type EnvVarSpec,
+  type MaiaProfile,
+  describeRequiredWhen,
+  evaluateRequiredWhen,
+  isPlaceholderValue,
+} from '@/config/metadata.js';
 
 /** Where a rule is enforced. */
 export type RuleScope = 'boot' | 'contract';
@@ -24,6 +31,14 @@ export interface CrossFieldFinding {
   readonly rule: string;
   readonly message: string;
   readonly remediation: string;
+  /**
+   * Variables whose `requiredWhen` this finding already enforces. Several
+   * hand-written rules predate the executable `requiredWhen` and carry the
+   * legacy boot message (some with `variable: null`, to preserve the historical
+   * `<root>` Zod path), so the generic pass below uses this to avoid reporting
+   * the same missing variable twice.
+   */
+  readonly covers?: readonly string[];
 }
 
 /**
@@ -36,6 +51,8 @@ export interface CrossFieldView {
   readonly values: Record<string, unknown>;
   readonly raw: Record<string, string | undefined>;
   readonly profile: MaiaProfile;
+  /** Entries the generic `requiredWhen` pass covers. Defaults to the contract. */
+  readonly entries?: readonly EnvVarSpec[];
 }
 
 const str = (v: unknown): string | undefined =>
@@ -85,6 +102,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'llm/provider-key',
       message: 'ANTHROPIC_API_KEY required when LLM_PROVIDER=anthropic',
+      covers: ['ANTHROPIC_API_KEY'],
       remediation: 'Defina ANTHROPIC_API_KEY (prefixo sk-ant-) ou troque LLM_PROVIDER.',
     });
   }
@@ -95,6 +113,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'llm/provider-key',
       message: 'OPENROUTER_API_KEY required when LLM_PROVIDER=openrouter',
+      covers: ['OPENROUTER_API_KEY'],
       remediation: 'Defina OPENROUTER_API_KEY (prefixo sk-or-) ou troque LLM_PROVIDER.',
     });
   }
@@ -105,6 +124,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'embeddings/provider-key',
       message: 'VOYAGE_API_KEY required when EMBEDDING_PROVIDER=voyage',
+      covers: ['VOYAGE_API_KEY'],
       remediation: 'Defina VOYAGE_API_KEY ou troque EMBEDDING_PROVIDER.',
     });
   }
@@ -115,6 +135,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'embeddings/provider-key',
       message: 'OPENAI_API_KEY required when EMBEDDING_PROVIDER=openai',
+      covers: ['OPENAI_API_KEY'],
       remediation: 'Defina OPENAI_API_KEY ou troque EMBEDDING_PROVIDER.',
     });
   }
@@ -125,6 +146,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'embeddings/provider-key',
       message: 'COHERE_API_KEY required when EMBEDDING_PROVIDER=cohere',
+      covers: ['COHERE_API_KEY'],
       remediation: 'Defina COHERE_API_KEY ou troque EMBEDDING_PROVIDER.',
     });
   }
@@ -137,6 +159,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'alerts/telegram-credentials',
       message: 'Telegram alerts require TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID',
+      covers: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'],
       remediation: 'Defina os dois, ou remova `telegram` de ALERT_CHANNELS.',
     });
   }
@@ -147,6 +170,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: null,
       rule: 'alerts/email-destination',
       message: 'Email alerts require ALERT_EMAIL_TO',
+      covers: ['ALERT_EMAIL_TO'],
       remediation: 'Defina ALERT_EMAIL_TO, ou remova `email` de ALERT_CHANNELS.',
     });
   }
@@ -330,6 +354,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: 'SMTP_HOST',
       rule: 'alerts/email-transport',
       message: 'ALERT_CHANNELS inclui email mas SMTP_HOST não está definido.',
+      covers: ['SMTP_HOST'],
       remediation: 'Defina SMTP_HOST (e SMTP_PORT/SMTP_USER/SMTP_PASS conforme o provedor).',
     });
   }
@@ -489,6 +514,31 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         });
       }
     }
+  }
+
+  // -------------------------------------------------------------------
+  // requiredWhen — dependências condicionais declaradas no contrato,
+  // EXECUTADAS. Antes disso `requiredWhen` era prosa: aparecia na mensagem de
+  // uma variável já marcada `requiredIn`, mas a condição nunca rodava, então
+  // FEATURE_OUTBOUND_VOICE=true sem OPENAI_API_KEY validava limpo (achado
+  // [P2] da rodada 1 da PR #522). Roda por ÚLTIMO e pula o que uma regra
+  // específica (com a mensagem de boot legada) já reportou.
+  // -------------------------------------------------------------------
+  const alreadyCovered = new Set(out.flatMap((f) => f.covers ?? []));
+  for (const spec of view.entries ?? CONTRACT_ENTRIES) {
+    if (!spec.requiredWhen || alreadyCovered.has(spec.name)) continue;
+    const present = str(raw[spec.name]?.trim()) !== undefined;
+    if (present) continue;
+    if (!evaluateRequiredWhen(spec.requiredWhen, { values: c, raw })) continue;
+    const condition = describeRequiredWhen(spec.requiredWhen);
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: spec.name,
+      rule: 'contract/required-when',
+      message: `${spec.name} é obrigatória quando ${condition}, e não está definida.`,
+      remediation: `Defina ${spec.name}, ou desfaça a condição (${condition}).`,
+    });
   }
 
   return out;

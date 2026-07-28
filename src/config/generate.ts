@@ -23,6 +23,7 @@ import {
   type ConfigGroup,
   type EnvVarSpec,
   type MaiaProfile,
+  describeRequiredWhen,
 } from '@/config/metadata.js';
 
 const BANNER_ENV = [
@@ -173,7 +174,8 @@ export function renderEnvExample(): string {
       const def = documentedDefault(spec);
       const meta: string[] = [];
       if (def !== undefined) meta.push(`default: ${def}`);
-      if (spec.requiredWhen) meta.push(`obrigatória quando ${spec.requiredWhen}`);
+      if (spec.requiredWhen)
+        meta.push(`obrigatória quando ${describeRequiredWhen(spec.requiredWhen)}`);
       if (spec.requiredIn?.length) meta.push(`obrigatória em: ${spec.requiredIn.join(', ')}`);
       if (spec.secret) meta.push('SEGREDO');
       if (!spec.restartRequired) meta.push('aplicável sem restart');
@@ -288,7 +290,8 @@ export function renderConfigDoc(): string {
       const type = facts.enumValues ? facts.enumValues.map((v) => `\`${v}\``).join(' \\| ') : facts.type;
       const def = documentedDefault(spec);
       const notes: string[] = [mdEscape(spec.description)];
-      if (spec.requiredWhen) notes.push(`Obrigatória quando ${mdEscape(spec.requiredWhen)}.`);
+      if (spec.requiredWhen)
+        notes.push(`Obrigatória quando ${mdEscape(describeRequiredWhen(spec.requiredWhen))}.`);
       if (spec.requiredIn?.length) notes.push(`Obrigatória em: ${spec.requiredIn.join(', ')}.`);
       const restricted = allowedProfiles(spec);
       if (restricted.length < MAIA_PROFILES.length) {
@@ -373,7 +376,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     if (facts.enumValues) prop.enum = [...facts.enumValues];
     const def = documentedDefault(spec);
     if (def !== undefined) prop.default = def;
-    if (spec.requiredWhen) prop['x-maia-required-when'] = spec.requiredWhen;
+    if (spec.requiredWhen) prop['x-maia-required-when'] = describeRequiredWhen(spec.requiredWhen);
     if (spec.requiredIn) prop['x-maia-required-in'] = [...spec.requiredIn];
     if (spec.deprecatedSince) {
       prop.deprecated = true;

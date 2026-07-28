@@ -28,6 +28,7 @@ import {
   type MaiaProfile,
   type MaiaService,
   type Tombstone,
+  describeRequiredWhen,
 } from '@/config/metadata.js';
 import { isStrictProfile, resolveProfile } from '@/config/profiles.js';
 import { evaluateCrossFieldRules } from '@/config/rules.js';
@@ -137,7 +138,7 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
         rule: 'profile/required',
         message: `${spec.name} é obrigatória no profile ${profile}.`,
         remediation: spec.requiredWhen
-          ? `Defina ${spec.name} (${spec.requiredWhen}).`
+          ? `Defina ${spec.name} (${describeRequiredWhen(spec.requiredWhen)}).`
           : `Defina ${spec.name}.`,
       });
     }
@@ -177,7 +178,7 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
       ? null
       : new Set(entries.map((s) => s.name));
 
-  const crossField = evaluateCrossFieldRules({ values, raw: env, profile });
+  const crossField = evaluateCrossFieldRules({ values, raw: env, profile, entries });
   for (const f of crossField) {
     if (input.allowPlaceholders && f.rule === 'secret/placeholder') continue;
     if (scopeNames && f.variable !== null && !scopeNames.has(f.variable)) continue;

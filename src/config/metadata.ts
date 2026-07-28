@@ -96,6 +96,87 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
 ];
 
 /**
+ * EXECUTABLE conditional requirement.
+ *
+ * `requiredWhen` used to be a prose string. Prose does not run: PR #522 review
+ * round 1 found that `FEATURE_OUTBOUND_VOICE=true` without `OPENAI_API_KEY`
+ * validated clean even though the contract said the key was required, and the
+ * same hole existed for the trace-debug AES key and the dev-auth token. The
+ * condition is now data the validator EVALUATES, and the human sentence in the
+ * docs is DERIVED from it (`describeRequiredWhen`), so the two cannot drift.
+ */
+export type RequiredWhen =
+  /** The variable's effective value equals `equals`. */
+  | { readonly var: string; readonly equals: string }
+  /** The variable is a comma-list (e.g. ALERT_CHANNELS) containing `includes`. */
+  | { readonly var: string; readonly includes: string }
+  /** The variable is an enabled boolean flag (`true` / `1`). */
+  | { readonly var: string; readonly truthy: true }
+  /** The variable is set to a non-empty value. */
+  | { readonly var: string; readonly present: true }
+  | { readonly anyOf: readonly RequiredWhen[] }
+  | { readonly allOf: readonly RequiredWhen[] };
+
+/**
+ * What a condition is evaluated against: the schema-parsed view when available
+ * (coerced numbers, booleans, `ALERT_CHANNELS` already split) and the raw
+ * environment as fallback, so a condition still evaluates when its subject
+ * failed schema validation or is outside the parsed subset.
+ */
+export interface ConditionView {
+  readonly values: Record<string, unknown>;
+  readonly raw: Record<string, string | undefined>;
+}
+
+function effectiveValue(name: string, view: ConditionView): unknown {
+  const parsed = view.values[name];
+  if (parsed !== undefined) return parsed;
+  const raw = view.raw[name];
+  return raw !== undefined && raw.trim() !== '' ? raw : undefined;
+}
+
+function asList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => String(v).trim());
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+/** Evaluate a conditional requirement. Pure; never throws. */
+export function evaluateRequiredWhen(cond: RequiredWhen, view: ConditionView): boolean {
+  if ('anyOf' in cond) return cond.anyOf.some((c) => evaluateRequiredWhen(c, view));
+  if ('allOf' in cond) return cond.allOf.every((c) => evaluateRequiredWhen(c, view));
+
+  const value = effectiveValue(cond.var, view);
+  if ('equals' in cond) return value !== undefined && String(value) === cond.equals;
+  if ('includes' in cond) return asList(value).includes(cond.includes);
+  if ('truthy' in cond) return value === true || value === 'true' || value === '1';
+  // `present`
+  return value !== undefined && String(value).trim() !== '';
+}
+
+/** Human sentence for a condition — the ONLY source of the documented prose. */
+export function describeRequiredWhen(cond: RequiredWhen): string {
+  if ('anyOf' in cond) return cond.anyOf.map(describeRequiredWhen).join(' ou ');
+  if ('allOf' in cond) return cond.allOf.map(describeRequiredWhen).join(' e ');
+  if ('equals' in cond) return `${cond.var}=${cond.equals}`;
+  if ('includes' in cond) return `${cond.var} contém ${cond.includes}`;
+  if ('truthy' in cond) return `${cond.var}=true`;
+  return `${cond.var} está definida`;
+}
+
+/** Every variable a condition depends on (for docs and template closure). */
+export function requiredWhenDependencies(cond: RequiredWhen): string[] {
+  if ('anyOf' in cond) return cond.anyOf.flatMap(requiredWhenDependencies);
+  if ('allOf' in cond) return cond.allOf.flatMap(requiredWhenDependencies);
+  return [cond.var];
+}
+
+/**
  * One canonical variable definition. `schema` is the single Zod source of
  * truth: the runtime object schema, the JSON Schema, the generated docs and
  * the validator all derive from it.
@@ -138,8 +219,12 @@ export interface EnvVarSpec {
   readonly fixture?: string;
   /** Per-profile override of `fixture` (e.g. https URLs outside development). */
   readonly fixtureByProfile?: Partial<Record<MaiaProfile, string>>;
-  /** Human-readable conditional requirement, e.g. "LLM_PROVIDER=anthropic". */
-  readonly requiredWhen?: string;
+  /**
+   * Conditional requirement, EVALUATED by the validator (rule
+   * `contract/required-when`) and rendered to prose for the docs. Never a
+   * free-form string — see `RequiredWhen`.
+   */
+  readonly requiredWhen?: RequiredWhen;
   /** Release/date the variable was deprecated in. Presence ⇒ warning. */
   readonly deprecatedSince?: string;
   /** Variable that replaces a deprecated one. */

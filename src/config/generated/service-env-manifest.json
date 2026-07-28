@@ -475,7 +475,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_SECRET_KEY",
@@ -483,7 +483,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_PREFIX",
@@ -715,7 +715,7 @@
           "required": false,
           "group": "runtime-trace",
           "restartRequired": true,
-          "requiredWhen": "RUNTIME_TRACE_DEBUG_S3_BUCKET definido"
+          "requiredWhen": "RUNTIME_TRACE_DEBUG_S3_BUCKET está definida"
         },
         {
           "name": "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1890,7 +1890,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_SECRET_KEY",
@@ -1898,7 +1898,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_PREFIX",
@@ -2312,7 +2312,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_SECRET_KEY",
@@ -2320,7 +2320,7 @@
           "required": false,
           "group": "backup",
           "restartRequired": true,
-          "requiredWhen": "BACKUP_S3_BUCKET definido"
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
         },
         {
           "name": "BACKUP_S3_PREFIX",
