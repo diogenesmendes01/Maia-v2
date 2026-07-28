@@ -222,7 +222,11 @@ export const channelLinesRouter = router({
       }
 
       const correlationId = randomUUID();
-      const result = await ctx.repos.channelLineStateRepo.requestCommand({
+      // Review PR #528 (P2) — comando, estado e `admin_audit_log` no MESMO
+      // commit. Em escritas separadas, uma queda entre elas deixava o comando
+      // vivo e EXECUTÁVEL sem trilha (invariante 4 do AGENTS.md). O replay
+      // idempotente não gera audit novo: a operação não aconteceu de novo.
+      const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
         scope,
         command: 'start_pairing',
         method: input.method,
@@ -230,6 +234,19 @@ export const channelLinesRouter = router({
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         correlation_id: correlationId,
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'channel_pairing_requested',
+          // NUNCA QR, código, token ou auth state — só metadata operacional.
+          change_summary: {
+            agent_id: input.agentId,
+            method: input.method,
+            correlation_id: correlationId,
+            idempotency_key: input.idempotencyKey,
+            reason: input.comment,
+          },
+        },
       });
       if (!result.ok) {
         throw new TRPCError({
@@ -238,28 +255,6 @@ export const channelLinesRouter = router({
             result.reason === 'pairing_in_progress'
               ? 'Já existe um pareamento em curso para esta linha. Cancele antes de repetir.'
               : 'Linha não encontrada neste tenant/agente',
-        });
-      }
-
-      // Idempotente: o replay da MESMA chave não gera novo audit (a operação
-      // não aconteceu de novo).
-      if (!result.idempotent) {
-        await ctx.repos.adminAuditLogRepo.append({
-          tenant_id: tenantId,
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          action: 'channel_pairing_requested',
-          resource_type: 'channel',
-          resource_id: input.channelId,
-          // NUNCA QR, código, token ou auth state — só metadata operacional.
-          change_summary: {
-            agent_id: input.agentId,
-            method: input.method,
-            correlation_id: correlationId,
-            idempotency_key: input.idempotencyKey,
-            attempt: result.row.pairing_attempts,
-            reason: input.comment,
-          },
         });
       }
 
@@ -284,27 +279,23 @@ export const channelLinesRouter = router({
         agent_id: input.agentId,
         channel_id: input.channelId,
       };
-      const result = await ctx.repos.channelLineStateRepo.requestCommand({
+      const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
         scope,
         command: 'abort_pairing',
         command_id: randomUUID(),
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         correlation_id: randomUUID(),
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'pairing_session_aborted',
+          change_summary: { agent_id: input.agentId, reason: input.comment },
+        },
       });
       if (!result.ok) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'pairing_session_aborted',
-        resource_type: 'channel',
-        resource_id: input.channelId,
-        change_summary: { agent_id: input.agentId, reason: input.comment },
-      });
       return { aborted: true };
     }),
 
@@ -330,44 +321,32 @@ export const channelLinesRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
       }
 
-      // `channelsRepo.deactivate` é ALS-scoped por contrato; o triplete já foi
-      // provado acima pelo `getForScope`.
-      const deactivated = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => ctx.repos.channelsRepo.deactivate(input.channelId),
-      );
-      if (deactivated.rowCount === 0) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
-      await ctx.repos.channelLineStateRepo.markDisabled(scope, 'operator_disabled');
-
-      // Review PR #528 (P1) — desativar a row para o ROTEAMENTO na hora (a
-      // propriedade de segurança), mas o SOCKET vive no runtime. Sem este
-      // comando a sessão continuava registrada no transporte, os timers de
-      // reconexão seguiam disparando e um `connection.update` atrasado
-      // regravava `connected` por cima do `disabled`.
-      await ctx.repos.channelLineStateRepo.requestCommand({
+      // Review PR #528 (P1 + P2) — quatro escritas num único commit:
+      // desativa o ROTEAMENTO (a propriedade de segurança, imediata), marca
+      // `disabled`, enfileira a derrubada do SOCKET (que vive no runtime) e
+      // audita. Soltas, uma queda no meio deixava a linha desativada sem
+      // trilha, ou com trilha e sem o comando de parada.
+      const result = await ctx.repos.channelLineStateRepo.disableLineWithAudit({
         scope,
-        command: 'stop_line',
-        command_id: randomUUID(),
+        reason_code: 'operator_disabled',
+        stop_command_id: randomUUID(),
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         correlation_id: randomUUID(),
-      });
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'channel_disabled',
-        resource_type: 'channel',
-        resource_id: input.channelId,
-        change_summary: {
-          agent_id: input.agentId,
-          external_id: line.external_id,
-          reason: input.comment,
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'channel_disabled',
+          change_summary: {
+            agent_id: input.agentId,
+            external_id: line.external_id,
+            reason: input.comment,
+          },
         },
       });
+      if (!result.ok) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
+      }
       return { disabled: true };
     }),
 
@@ -401,32 +380,28 @@ export const channelLinesRouter = router({
       }
 
       const correlationId = randomUUID();
-      const result = await ctx.repos.channelLineStateRepo.requestCommand({
+      const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
         scope,
         command: 'repair',
         command_id: randomUUID(),
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         correlation_id: correlationId,
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'channel_repair_requested',
+          change_summary: {
+            agent_id: input.agentId,
+            external_id: line.external_id,
+            correlation_id: correlationId,
+            reason: input.comment,
+          },
+        },
       });
       if (!result.ok) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
       }
-
-      await ctx.repos.adminAuditLogRepo.append({
-        tenant_id: tenantId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        action: 'channel_repair_requested',
-        resource_type: 'channel',
-        resource_id: input.channelId,
-        change_summary: {
-          agent_id: input.agentId,
-          external_id: line.external_id,
-          correlation_id: correlationId,
-          reason: input.comment,
-        },
-      });
       return { queued: true, correlation_id: correlationId };
     }),
 });

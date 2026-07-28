@@ -22,8 +22,38 @@
  */
 import { and, eq, isNotNull, lt, sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
-import { channels, channel_line_state } from '../schema.js';
+import { channels, channel_line_state, admin_audit_log } from '../schema.js';
 import type { ChannelLineStateRow } from '../schema.js';
+
+/** Handle de transação, como `withTx` o entrega. */
+type Tx = Parameters<Parameters<typeof withTx>[0]>[0];
+
+export interface RequestCommandArgs {
+  scope: LineScope;
+  command: LineCommand;
+  method?: PairingMethod;
+  command_id: string;
+  actor_id: string;
+  actor_role: string;
+  correlation_id: string;
+  /** TTL da tentativa de pareamento (default 15 min, igual à PairingSession). */
+  pairing_ttl_ms?: number;
+}
+
+export type RequestCommandResult =
+  | { ok: true; row: ChannelLineStateRow; idempotent: boolean }
+  | { ok: false; reason: 'channel_not_found' | 'pairing_in_progress' };
+
+/**
+ * Trilha administrativa que acompanha o comando na MESMA transação
+ * (review PR #528, P2).
+ */
+export interface LineCommandAudit {
+  actor_id: string;
+  actor_role: string;
+  action: string;
+  change_summary: Record<string, unknown>;
+}
 
 export type LineState =
   | 'declared'
@@ -158,91 +188,19 @@ function normalizeOverview(raw: {
   };
 }
 
-export const channelLineStateRepo = {
-  /**
-   * Listagem do console: TODOS os canais do (tenant, agent) — ativos E
-   * inativos. O canal whatsapp nasce inativo ("declarado"); a listagem antiga
-   * (`listActive`) o fazia desaparecer logo após ser criado.
-   */
-  async listLinesForScope(scope: {
-    tenant_id: string;
-    agent_id: string;
-  }): Promise<LineOverviewRow[]> {
-    const rows = await db
-      .select(overviewColumns())
-      .from(channels)
-      .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
-      .where(
-        and(eq(channels.tenant_id, scope.tenant_id), eq(channels.agent_id, scope.agent_id)),
-      )
-      .orderBy(channels.channel_type, channels.external_id);
-    return rows.map(normalizeOverview);
-  },
 
-  /** Uma linha, provando o triplete. `null` = não existe NESTE escopo. */
-  async getForScope(scope: LineScope): Promise<LineOverviewRow | null> {
-    const rows = await db
-      .select(overviewColumns())
-      .from(channels)
-      .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
-      .where(
-        and(
-          eq(channels.tenant_id, scope.tenant_id),
-          eq(channels.agent_id, scope.agent_id),
-          eq(channels.id, scope.channel_id),
-        ),
-      )
-      .limit(1);
-    return rows[0] ? normalizeOverview(rows[0]) : null;
-  },
-
-  /**
-   * Estado + material cifrado de UMA linha, provando o triplete. Usado só
-   * pelo `getPairingStatus` do console; devolve o envelope como está (a
-   * decifra acontece na camada que renderiza, nunca no log).
-   */
-  async getStateForScope(scope: LineScope): Promise<ChannelLineStateRow | null> {
-    const rows = await db
-      .select()
-      .from(channel_line_state)
-      .where(
-        and(
-          eq(channel_line_state.tenant_id, scope.tenant_id),
-          eq(channel_line_state.agent_id, scope.agent_id),
-          eq(channel_line_state.channel_id, scope.channel_id),
-        ),
-      )
-      .limit(1);
-    return rows[0] ?? null;
-  },
-
-  /**
-   * Enfileira um comando do console para o runtime, com as regras de
-   * concorrência da issue (§7):
-   *   - mesma `command_id` ⇒ IDEMPOTENTE (devolve a sessão existente);
-   *   - `start_pairing` com pairing vivo de OUTRA chave ⇒ `pairing_in_progress`;
-   *   - `abort_pairing` é sempre aceito (idempotente);
-   *   - a row é criada on-demand (canais anteriores à 103).
-   *
-   * Tudo em UMA transação com `SELECT … FOR UPDATE` na row do canal: duas
-   * requisições concorrentes serializam e a segunda vê o pairing da primeira.
-   */
-  async requestCommand(args: {
-    scope: LineScope;
-    command: LineCommand;
-    method?: PairingMethod;
-    command_id: string;
-    actor_id: string;
-    actor_role: string;
-    correlation_id: string;
-    /** TTL da tentativa de pareamento (default 15 min, igual à PairingSession). */
-    pairing_ttl_ms?: number;
-  }): Promise<
-    | { ok: true; row: ChannelLineStateRow; idempotent: boolean }
-    | { ok: false; reason: 'channel_not_found' | 'pairing_in_progress' }
-  > {
+/**
+ * Corpo do enfileiramento, parametrizado pela TRANSACAO. Extraido para que
+ * comando, estado e admin_audit_log caiam no MESMO commit (review PR #528, P2)
+ * e para que disableLineWithAudit reaproveite exatamente a mesma logica de
+ * concorrencia em vez de duplica-la.
+ */
+async function requestCommandInTx(
+  tx: Tx,
+  args: RequestCommandArgs,
+): Promise<RequestCommandResult> {
     const ttl = args.pairing_ttl_ms ?? 15 * 60_000;
-    return withTx(async (tx) => {
+    {
       // O canal precisa existir NESTE escopo — a checagem vive dentro da tx
       // para não abrir janela TOCTOU com um DELETE concorrente.
       const chan = await tx
@@ -366,12 +324,213 @@ export const channelLineStateRepo = {
         .where(eq(channel_line_state.channel_id, args.scope.channel_id))
         .returning();
       return { ok: true as const, row: updated[0]!, idempotent: false };
+    }
+}
+
+/** Trilha administrativa, na transacao do chamador. */
+async function appendLineAudit(
+  tx: Tx,
+  scope: LineScope,
+  entry: LineCommandAudit,
+): Promise<void> {
+  await tx.insert(admin_audit_log).values({
+    tenant_id: scope.tenant_id,
+    actor_id: entry.actor_id,
+    actor_role: entry.actor_role,
+    action: entry.action,
+    resource_type: 'channel',
+    resource_id: scope.channel_id,
+    change_summary: entry.change_summary,
+  });
+}
+
+export const channelLineStateRepo = {
+  /**
+   * Listagem do console: TODOS os canais do (tenant, agent) — ativos E
+   * inativos. O canal whatsapp nasce inativo ("declarado"); a listagem antiga
+   * (`listActive`) o fazia desaparecer logo após ser criado.
+   */
+  async listLinesForScope(scope: {
+    tenant_id: string;
+    agent_id: string;
+  }): Promise<LineOverviewRow[]> {
+    const rows = await db
+      .select(overviewColumns())
+      .from(channels)
+      .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
+      .where(
+        and(eq(channels.tenant_id, scope.tenant_id), eq(channels.agent_id, scope.agent_id)),
+      )
+      .orderBy(channels.channel_type, channels.external_id);
+    return rows.map(normalizeOverview);
+  },
+
+  /** Uma linha, provando o triplete. `null` = não existe NESTE escopo. */
+  async getForScope(scope: LineScope): Promise<LineOverviewRow | null> {
+    const rows = await db
+      .select(overviewColumns())
+      .from(channels)
+      .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
+      .where(
+        and(
+          eq(channels.tenant_id, scope.tenant_id),
+          eq(channels.agent_id, scope.agent_id),
+          eq(channels.id, scope.channel_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ? normalizeOverview(rows[0]) : null;
+  },
+
+  /**
+   * Estado + material cifrado de UMA linha, provando o triplete. Usado só
+   * pelo `getPairingStatus` do console; devolve o envelope como está (a
+   * decifra acontece na camada que renderiza, nunca no log).
+   */
+  async getStateForScope(scope: LineScope): Promise<ChannelLineStateRow | null> {
+    const rows = await db
+      .select()
+      .from(channel_line_state)
+      .where(
+        and(
+          eq(channel_line_state.tenant_id, scope.tenant_id),
+          eq(channel_line_state.agent_id, scope.agent_id),
+          eq(channel_line_state.channel_id, scope.channel_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Enfileira um comando do console para o runtime, com as regras de
+   * concorrência da issue (§7):
+   *   - mesma `command_id` ⇒ IDEMPOTENTE (devolve a sessão existente);
+   *   - `start_pairing` com pairing vivo de OUTRA chave ⇒ `pairing_in_progress`;
+   *   - `abort_pairing` é sempre aceito (idempotente);
+   *   - a row é criada on-demand (canais anteriores à 103).
+   *
+   * Tudo em UMA transação com `SELECT … FOR UPDATE` na row do canal: duas
+   * requisições concorrentes serializam e a segunda vê o pairing da primeira.
+   */
+  async requestCommand(args: RequestCommandArgs): Promise<RequestCommandResult> {
+    return withTx((tx) => requestCommandInTx(tx, args));
+  },
+
+  /**
+   * Idem, mas o comando e a linha de `admin_audit_log` caem no MESMO commit
+   * (review PR #528, P2).
+   *
+   * Antes eram duas transações: se o processo ou o banco caísse entre elas, o
+   * comando sobrevivia e era EXECUTADO sem trilha — violação direta da
+   * invariante 4 do AGENTS.md ("audit every decision"). Mesmo contrato de
+   * `channelsRepo.createWithAudit`: uma falha no insert de auditoria desfaz o
+   * comando, nunca o contrário.
+   *
+   * Um replay idempotente não gera audit novo (a operação não aconteceu de
+   * novo) — e, como nada é escrito, não há o que desfazer.
+   */
+  async requestCommandWithAudit(
+    args: RequestCommandArgs & { audit: LineCommandAudit },
+  ): Promise<RequestCommandResult> {
+    return withTx(async (tx) => {
+      const result = await requestCommandInTx(tx, args);
+      if (result.ok && !result.idempotent) {
+        await appendLineAudit(tx, args.scope, {
+          ...args.audit,
+          change_summary: {
+            ...args.audit.change_summary,
+            // Número da tentativa: só existe depois da escrita, e vale a pena
+            // na trilha ("3ª tentativa desta linha").
+            attempt: result.row.pairing_attempts,
+          },
+        });
+      }
+      return result;
     });
   },
 
   /**
-   * Marca a linha como desabilitada pelo operador. Chamado junto (mesma
-   * transação lógica do router) com `channelsRepo.deactivate`.
+   * Desabilita a linha: para o roteamento, marca o estado, enfileira a
+   * derrubada do socket e audita — TUDO no mesmo commit (review PR #528, P2).
+   * Eram quatro escritas soltas; uma queda no meio deixava a linha desativada
+   * sem trilha, ou com trilha e sem o comando de parada.
+   */
+  async disableLineWithAudit(args: {
+    scope: LineScope;
+    reason_code: string;
+    stop_command_id: string;
+    actor_id: string;
+    actor_role: string;
+    correlation_id: string;
+    audit: LineCommandAudit;
+  }): Promise<{ ok: true } | { ok: false; reason: 'channel_not_found' }> {
+    return withTx(async (tx) => {
+      const now = new Date();
+      // Escopo EXPLÍCITO no WHERE (não ALS): o contrato é validar o triplete
+      // como recebido.
+      const deactivated = await tx
+        .update(channels)
+        .set({ active: false, updated_at: now })
+        .where(
+          and(
+            eq(channels.tenant_id, args.scope.tenant_id),
+            eq(channels.agent_id, args.scope.agent_id),
+            eq(channels.id, args.scope.channel_id),
+          ),
+        )
+        .returning({ id: channels.id });
+      if (deactivated.length === 0) {
+        return { ok: false as const, reason: 'channel_not_found' as const };
+      }
+
+      await tx
+        .insert(channel_line_state)
+        .values({
+          channel_id: args.scope.channel_id,
+          tenant_id: args.scope.tenant_id,
+          agent_id: args.scope.agent_id,
+          state: 'disabled',
+          reason_code: args.reason_code,
+          last_transition_at: now,
+          disconnected_at: now,
+        })
+        .onConflictDoUpdate({
+          target: channel_line_state.channel_id,
+          set: {
+            state: 'disabled',
+            reason_code: args.reason_code,
+            pairing_material: null,
+            pairing_material_key_id: null,
+            pairing_material_kind: null,
+            pairing_material_expires_at: null,
+            pairing_expires_at: null,
+            disconnected_at: now,
+            last_transition_at: now,
+            updated_at: now,
+          },
+        });
+
+      // O socket vive no runtime — desativar a row não o encerra (P1).
+      await requestCommandInTx(tx, {
+        scope: args.scope,
+        command: 'stop_line',
+        command_id: args.stop_command_id,
+        actor_id: args.actor_id,
+        actor_role: args.actor_role,
+        correlation_id: args.correlation_id,
+      });
+
+      await appendLineAudit(tx, args.scope, args.audit);
+      return { ok: true as const };
+    });
+  },
+
+
+  /**
+   * Marca a linha como desabilitada pelo operador, sem transação composta.
+   * O caminho do console é `disableLineWithAudit`; este fica para chamadores
+   * que já provaram o escopo e não precisam do commit único.
    */
   async markDisabled(scope: LineScope, reason_code: string): Promise<void> {
     const now = new Date();

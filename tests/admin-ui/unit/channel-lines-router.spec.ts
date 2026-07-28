@@ -129,6 +129,52 @@ function makeCtx(role: string, opts: LineOpts = {}) {
             }
           );
         },
+        /**
+         * P2 do review PR #528: comando + `admin_audit_log` no MESMO commit.
+         * O stub reproduz o contrato — a trilha só é escrita quando houve
+         * escrita de verdade (nunca num replay idempotente).
+         */
+        async requestCommandWithAudit(
+          args: Record<string, unknown> & { audit: Record<string, unknown> },
+        ) {
+          commands.push(args);
+          const result = opts.requestResult ?? {
+            ok: true,
+            idempotent: false,
+            row: { pairing_attempts: 1, pairing_expires_at: new Date('2026-07-28T12:15:00Z') },
+          };
+          if (result.ok && !result.idempotent) {
+            const audit = args.audit as { change_summary: Record<string, unknown> };
+            audits.push({
+              tenant_id: (args.scope as { tenant_id: string }).tenant_id,
+              resource_type: 'channel',
+              resource_id: (args.scope as { channel_id: string }).channel_id,
+              ...args.audit,
+              change_summary: {
+                ...audit.change_summary,
+                attempt: (result as { row: { pairing_attempts: number } }).row.pairing_attempts,
+              },
+            });
+          }
+          return result;
+        },
+        async disableLineWithAudit(
+          args: Record<string, unknown> & { audit: Record<string, unknown> },
+        ) {
+          const scope = args.scope as { tenant_id: string; channel_id: string };
+          if (opts.deactivateRowCount === 0) {
+            return { ok: false, reason: 'channel_not_found' };
+          }
+          disabled.push(scope.channel_id);
+          commands.push({ ...args, command: 'stop_line' });
+          audits.push({
+            tenant_id: scope.tenant_id,
+            resource_type: 'channel',
+            resource_id: scope.channel_id,
+            ...args.audit,
+          });
+          return { ok: true };
+        },
         async markDisabled() {
           return undefined;
         },
@@ -444,6 +490,66 @@ describe('auditoria — ator administrativo presente, segredo ausente', () => {
       expect(a.actor_id).toBe('user-1');
       expect(a.actor_role).toBe('owner');
     }
+  });
+
+  it('comando e trilha viajam JUNTOS para o repo — nunca em escritas separadas', async () => {
+    // Review PR #528 (P2): se o processo caísse entre as duas escritas, o
+    // comando sobrevivia e era executado sem `channel_pairing_requested`.
+    // O contrato agora é: quem escreve o comando escreve a trilha, no mesmo
+    // commit. O router não tem mais como emitir uma sem a outra.
+    const { ctx, commands } = makeCtx('owner');
+    const c = caller(ctx);
+    await c.startPairing({
+      agentId: 'agent-a',
+      channelId: CHANNEL_ID,
+      method: 'qr',
+      idempotencyKey: IDEMPOTENCY_KEY,
+      comment: REASON,
+    });
+    await c.abortPairing({ agentId: 'agent-a', channelId: CHANNEL_ID, comment: REASON });
+    await c.requestRepair({ agentId: 'agent-a', channelId: CHANNEL_ID, comment: REASON });
+    await c.disable({ agentId: 'agent-a', channelId: CHANNEL_ID, comment: REASON });
+
+    for (const cmd of commands) {
+      expect(cmd.audit, `comando ${String(cmd.command)} sem trilha atrelada`).toBeDefined();
+      const audit = cmd.audit as { actor_id: string; action: string };
+      expect(audit.actor_id).toBe('user-1');
+      expect(audit.action).toBeTruthy();
+    }
+  });
+
+  it('replay idempotente NÃO escreve trilha (a operação não aconteceu de novo)', async () => {
+    const { ctx, audits } = makeCtx('owner', {
+      requestResult: {
+        ok: true,
+        idempotent: true,
+        row: { pairing_attempts: 1, pairing_expires_at: null },
+      },
+    });
+    await caller(ctx).startPairing({
+      agentId: 'agent-a',
+      channelId: CHANNEL_ID,
+      method: 'qr',
+      idempotencyKey: IDEMPOTENCY_KEY,
+      comment: REASON,
+    });
+    expect(audits).toHaveLength(0);
+  });
+
+  it('comando rejeitado (pairing_in_progress) não deixa trilha órfã', async () => {
+    const { ctx, audits } = makeCtx('owner', {
+      requestResult: { ok: false, reason: 'pairing_in_progress' },
+    });
+    await expect(
+      caller(ctx).startPairing({
+        agentId: 'agent-a',
+        channelId: CHANNEL_ID,
+        method: 'qr',
+        idempotencyKey: IDEMPOTENCY_KEY,
+        comment: REASON,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(audits).toHaveLength(0);
   });
 
   it('abort é idempotente do ponto de vista do chamador e sempre audita', async () => {

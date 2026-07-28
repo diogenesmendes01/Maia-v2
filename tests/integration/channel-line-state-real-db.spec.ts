@@ -38,6 +38,7 @@ async function wipe(): Promise<void> {
   const c = await pool.connect();
   try {
     for (const t of [T, T2]) {
+      await c.query(`DELETE FROM admin_audit_log WHERE tenant_id = $1`, [t]);
       await c.query(`DELETE FROM channel_line_state WHERE tenant_id = $1`, [t]);
       await c.query(`DELETE FROM channels WHERE tenant_id = $1`, [t]);
     }
@@ -423,6 +424,145 @@ d('channel_line_state — idempotência e concorrência', () => {
     });
     expect(retry.ok).toBe(true);
     expect((retry as { row: { pairing_attempts: number } }).row.pairing_attempts).toBe(2);
+  });
+});
+
+d('channel_line_state — comando e auditoria no MESMO commit (review PR #528, P2)', () => {
+  const AUDIT = {
+    actor_id: 'i518-user',
+    actor_role: 'owner' as const,
+    action: 'channel_pairing_requested',
+    change_summary: { agent_id: A, method: 'qr', reason: 'teste de atomicidade' },
+  };
+
+  async function auditRows(): Promise<number> {
+    const c = await pool.connect();
+    try {
+      const r = await c.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM admin_audit_log WHERE tenant_id = $1 AND resource_id = $2`,
+        [T, channelId],
+      );
+      return Number(r.rows[0]!.n);
+    } finally {
+      c.release();
+    }
+  }
+
+  it('comando e trilha aparecem juntos', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const res = await channelLineStateRepo.requestCommandWithAudit({
+      scope: { tenant_id: T, agent_id: A, channel_id: channelId },
+      command: 'start_pairing',
+      method: 'qr',
+      command_id: randomUUID(),
+      ...ACTOR,
+      audit: AUDIT,
+    });
+    expect(res.ok).toBe(true);
+    expect(await auditRows()).toBe(1);
+  });
+
+  it('trilha que falha DESFAZ o comando — nunca sobra comando sem auditoria', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+
+    // `action` NULL viola NOT NULL em admin_audit_log: simula a falha do
+    // segundo write. Antes eram dois commits, e o comando sobrevivia sozinho.
+    await expect(
+      channelLineStateRepo.requestCommandWithAudit({
+        scope,
+        command: 'start_pairing',
+        method: 'qr',
+        command_id: randomUUID(),
+        ...ACTOR,
+        audit: { ...AUDIT, action: null as unknown as string },
+      }),
+    ).rejects.toThrow();
+
+    expect(await auditRows()).toBe(0);
+    // O comando NÃO ficou pendente: o rollback levou os dois juntos.
+    expect(await channelLineStateRepo.getStateForScope(scope)).toBeNull();
+  });
+
+  it('replay idempotente não duplica a trilha', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    const key = randomUUID();
+    for (let i = 0; i < 3; i += 1) {
+      await channelLineStateRepo.requestCommandWithAudit({
+        scope,
+        command: 'start_pairing',
+        method: 'qr',
+        command_id: key,
+        ...ACTOR,
+        audit: AUDIT,
+      });
+    }
+    expect(await auditRows()).toBe(1);
+  });
+
+  it('disable: roteamento, estado, comando de parada e trilha num commit só', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const activeId = await seedChannel(T, A, `+55116${Date.now() % 100000000}`, true);
+    const scope = { tenant_id: T, agent_id: A, channel_id: activeId };
+
+    const res = await channelLineStateRepo.disableLineWithAudit({
+      scope,
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      ...ACTOR,
+      audit: { ...AUDIT, action: 'channel_disabled' },
+    });
+    expect(res.ok).toBe(true);
+
+    const state = await channelLineStateRepo.getStateForScope(scope);
+    expect(state?.state).toBe('disabled');
+    expect(state?.command).toBe('stop_line');
+
+    const c = await pool.connect();
+    try {
+      const chan = await c.query<{ active: boolean }>(
+        `SELECT active FROM channels WHERE id = $1`,
+        [activeId],
+      );
+      expect(chan.rows[0]!.active).toBe(false);
+      const audit = await c.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM admin_audit_log
+          WHERE tenant_id = $1 AND resource_id = $2 AND action = 'channel_disabled'`,
+        [T, activeId],
+      );
+      expect(Number(audit.rows[0]!.n)).toBe(1);
+    } finally {
+      c.release();
+    }
+  });
+
+  it('disable de linha fora do escopo não desativa nem audita nada', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const res = await channelLineStateRepo.disableLineWithAudit({
+      scope: { tenant_id: T, agent_id: A, channel_id: foreignChannelId },
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      ...ACTOR,
+      audit: { ...AUDIT, action: 'channel_disabled' },
+    });
+    expect(res).toEqual({ ok: false, reason: 'channel_not_found' });
+
+    const c = await pool.connect();
+    try {
+      const chan = await c.query<{ active: boolean }>(
+        `SELECT active FROM channels WHERE id = $1`,
+        [foreignChannelId],
+      );
+      expect(chan.rows[0]!.active).toBe(false); // seed nasce inativo; segue intacto
+      const audit = await c.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM admin_audit_log WHERE resource_id = $1`,
+        [foreignChannelId],
+      );
+      expect(Number(audit.rows[0]!.n)).toBe(0);
+    } finally {
+      c.release();
+    }
   });
 });
 
