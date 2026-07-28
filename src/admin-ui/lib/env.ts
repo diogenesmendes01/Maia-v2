@@ -1,59 +1,53 @@
 /**
- * P8.5 — Environment variable parser + feature-flag accessors.
+ * Admin UI environment accessor.
  *
- * Validates required env vars at startup. Feature flags default to false in
- * production; enable via env (.env.local in dev).
+ * Issue #515 — this file USED to carry a second, independent Zod schema. Two
+ * schemas meant the Admin UI and the runtime could disagree about what a
+ * variable means, what it defaults to, and whether it is required — and the
+ * duplicate had no consumers, so nobody would notice the divergence until an
+ * operator did, in production.
+ *
+ * It is now a thin adapter over the single canonical contract:
+ *   - the schema comes from `objectSchemaForService('admin-ui')`, i.e. exactly
+ *     the subset of `src/config/contract.ts` this service is allowed to read;
+ *   - `docs/configuration.md` and `.env.example` document the same variables
+ *     from the same source;
+ *   - `npm run config:check` validates an Admin UI `.env` with the same rules.
+ *
+ * Deliberately imports ONLY `@/config/contract.js` (which imports only `zod`),
+ * so this module stays safe to pull into any Next.js build target.
  */
-import { z } from 'zod';
+import { objectSchemaForService } from '@/config/contract.js';
 
-const FlagSchema = z
-  .enum(['true', 'false'])
-  .transform((v) => v === 'true');
+const envSchema = objectSchemaForService('admin-ui');
 
-const envSchema = z.object({
-  NODE_ENV: z.string().default('development'),
-  NEXTAUTH_SECRET: z.string().min(8).optional(),
-  NEXTAUTH_URL: z.string().url().default('http://localhost:4000'),
-  NEXT_PUBLIC_API_URL: z.string().url().default('http://localhost:3000'),
-  DATABASE_URL: z.string().min(1).optional(),
-
-  FEATURE_ADMIN_UI_V1: FlagSchema.default('false'),
-  FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS: FlagSchema.default('false'),
-  FEATURE_ADMIN_UI_BULK_REJECT: FlagSchema.default('true'),
-  FEATURE_ADMIN_UI_REDECIDE: FlagSchema.default('false'),
-
-  /**
-   * Dev-only shared-secret token validated by the magic-link CredentialsProvider.
-   * MUST be set + non-empty for the email-only stub to authorize a sign-in. In
-   * production (NODE_ENV=production OR ALLOW_DEV_AUTH=false) the CredentialsProvider
-   * itself is removed at construction time — see ./auth.ts.
-   *
-   * The token is shared (not per-user) on purpose: it gates dev access to the
-   * admin UI while OIDC/SAML is wired (P10). Setting it requires shell access
-   * to the deployment, which is what makes the stub fail-closed.
-   */
-  ADMIN_UI_DEV_LOGIN_TOKEN: z.string().min(16).optional(),
-
-  /**
-   * Explicit allow-list for the dev-only auth path. Defaults to false; must be
-   * 'true' in addition to FEATURE_ADMIN_UI_V1 for the magic-link stub to load.
-   * Production deployments MUST leave this false — set it only in .env.local.
-   */
-  ALLOW_DEV_AUTH: FlagSchema.default('false'),
-});
-
-export type Env = z.infer<typeof envSchema>;
+export type Env = ReturnType<typeof envSchema.parse>;
 
 let cached: Env | null = null;
 
+/**
+ * Parsed Admin UI configuration. Throws on invalid configuration — fail
+ * closed, never a silent default. Cached because the process environment does
+ * not change under a running Next.js server.
+ */
 export function getEnv(): Env {
   if (cached) return cached;
   const parsed = envSchema.safeParse(process.env);
   if (!parsed.success) {
-    throw new Error(`P8.5 env validation failed: ${parsed.error.message}`);
+    // Message only — Zod issue messages name the variable and the constraint,
+    // never the value. See src/config/redact.ts for the shared guarantee.
+    const detail = parsed.error.issues
+      .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+      .join('; ');
+    throw new Error(`Admin UI env validation failed (contrato #515): ${detail}`);
   }
-  cached = parsed.data;
+  cached = parsed.data as Env;
   return cached;
+}
+
+/** Test seam: drop the memoised parse so a spec can flip env vars in-process. */
+export function _resetEnvCacheForTests(): void {
+  cached = null;
 }
 
 export type FeatureFlag =

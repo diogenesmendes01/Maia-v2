@@ -1,0 +1,2342 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://maia.local/schemas/env-contract.json",
+  "title": "Maia environment contract",
+  "x-maia-contract-version": "1.0.0",
+  "type": "object",
+  "required": [
+    "DATABASE_URL",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "REDIS_URL",
+    "WHATSAPP_NUMBER_MAIA",
+    "OWNER_TELEFONE_WHATSAPP",
+    "OWNER_NOME"
+  ],
+  "properties": {
+    "NODE_ENV": {
+      "type": "string",
+      "description": "Modo da plataforma Node (otimizações do runtime). NÃO é o profile da Maia — use MAIA_ENV.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "development",
+        "test",
+        "production"
+      ],
+      "default": "development",
+      "examples": [
+        "development"
+      ]
+    },
+    "MAIA_ENV": {
+      "type": "string",
+      "description": "Profile da Maia: development | staging | production. Decide quais regras de validação são obrigatórias. Quando ausente, é derivado de NODE_ENV.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "development"
+      ]
+    },
+    "TZ": {
+      "type": "string",
+      "description": "Timezone IANA usada em toda formatação/agendamento.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "America/Sao_Paulo",
+      "examples": [
+        "America/Sao_Paulo"
+      ]
+    },
+    "APP_PORT": {
+      "type": "string",
+      "description": "Porta HTTP do servidor Fastify.",
+      "x-maia-type": "number",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3000",
+      "examples": [
+        "3000"
+      ]
+    },
+    "LOG_LEVEL": {
+      "type": "string",
+      "description": "Nível mínimo de log (pino).",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ],
+      "default": "info",
+      "examples": [
+        "info"
+      ]
+    },
+    "MAIA_REJECT_DEFAULT_LITERAL": {
+      "type": "string",
+      "description": "Fail-closed do literal 'default' em tenant_id/agent_id (issue #323). Default ON; `false` é o rollback de emergência sem redeploy.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": false,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "DATABASE_URL": {
+      "type": "string",
+      "description": "DSN completo do Postgres (inclui credenciais).",
+      "x-maia-type": "string",
+      "x-maia-group": "database",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "POSTGRES_USER": {
+      "type": "string",
+      "description": "Usuário do Postgres (usado pelo compose e pelo pg_dump).",
+      "x-maia-type": "string",
+      "x-maia-group": "database",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "maia"
+      ]
+    },
+    "POSTGRES_PASSWORD": {
+      "type": "string",
+      "description": "Senha do Postgres (mínimo 8 caracteres).",
+      "x-maia-type": "string",
+      "x-maia-group": "database",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "POSTGRES_DB": {
+      "type": "string",
+      "description": "Nome do banco.",
+      "x-maia-type": "string",
+      "x-maia-group": "database",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "maia"
+      ]
+    },
+    "POSTGRES_PORT": {
+      "type": "string",
+      "description": "Porta do Postgres.",
+      "x-maia-type": "number",
+      "x-maia-group": "database",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5432",
+      "examples": [
+        "5432"
+      ]
+    },
+    "REDIS_URL": {
+      "type": "string",
+      "description": "URL do Redis (filas BullMQ, dedup, debounce, rate limit).",
+      "x-maia-type": "string",
+      "x-maia-group": "redis",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "REDIS_PORT": {
+      "type": "string",
+      "description": "Porta do Redis (usada pelo compose).",
+      "x-maia-type": "number",
+      "x-maia-group": "redis",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "6379",
+      "examples": [
+        "6379"
+      ]
+    },
+    "LLM_PROVIDER": {
+      "type": "string",
+      "description": "Provider do LLM principal: anthropic (direto) ou openrouter (gateway).",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "anthropic",
+        "openrouter"
+      ],
+      "default": "anthropic",
+      "examples": [
+        "openrouter"
+      ]
+    },
+    "ANTHROPIC_API_KEY": {
+      "type": "string",
+      "description": "Chave da API Anthropic. Prefixo obrigatório `sk-ant-`.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "LLM_PROVIDER=anthropic"
+    },
+    "OPENROUTER_API_KEY": {
+      "type": "string",
+      "description": "Chave da API OpenRouter. Prefixo obrigatório `sk-or-`.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "LLM_PROVIDER=openrouter"
+    },
+    "OPENROUTER_MODEL_MAIN": {
+      "type": "string",
+      "description": "Slug do modelo principal no OpenRouter (a versão usa ponto: 4.6). Exige tool-calling.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": false,
+      "default": "anthropic/claude-sonnet-4.6",
+      "examples": [
+        "anthropic/claude-sonnet-4.6"
+      ]
+    },
+    "OPENROUTER_MODEL_FAST": {
+      "type": "string",
+      "description": "Slug do modelo rápido no OpenRouter (classificação, judge).",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": false,
+      "default": "anthropic/claude-haiku-4.5",
+      "examples": [
+        "anthropic/claude-haiku-4.5"
+      ]
+    },
+    "CLAUDE_MODEL_MAIN": {
+      "type": "string",
+      "description": "Modelo principal na API Anthropic direta.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": false,
+      "default": "claude-sonnet-4-6",
+      "examples": [
+        "claude-sonnet-4-6"
+      ]
+    },
+    "CLAUDE_MODEL_FAST": {
+      "type": "string",
+      "description": "Modelo rápido na API Anthropic direta.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": false,
+      "default": "claude-haiku-4-5-20251001",
+      "examples": [
+        "claude-haiku-4-5-20251001"
+      ]
+    },
+    "CLAUDE_MAX_RETRIES": {
+      "type": "string",
+      "description": "Retries em chamada de LLM.",
+      "x-maia-type": "number",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3",
+      "examples": [
+        "3"
+      ]
+    },
+    "CLAUDE_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Timeout (ms) de chamada de LLM.",
+      "x-maia-type": "number",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30000",
+      "examples": [
+        "30000"
+      ]
+    },
+    "DECISION_ENGINE_BUDGET_MS": {
+      "type": "string",
+      "description": "Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification.",
+      "x-maia-type": "number",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "2500",
+      "examples": [
+        "2500"
+      ]
+    },
+    "OPENAI_API_KEY": {
+      "type": "string",
+      "description": "Chave OpenAI (Whisper, TTS e embeddings openai). Prefixo `sk-`.",
+      "x-maia-type": "string",
+      "x-maia-group": "speech",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "EMBEDDING_PROVIDER=openai ou FEATURE_OUTBOUND_VOICE=true"
+    },
+    "WHISPER_PROVIDER": {
+      "type": "string",
+      "description": "Provider de transcrição de áudio.",
+      "x-maia-type": "string",
+      "x-maia-group": "speech",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "openai"
+      ],
+      "default": "openai",
+      "examples": [
+        "openai"
+      ]
+    },
+    "WHISPER_MODEL": {
+      "type": "string",
+      "description": "Modelo de transcrição.",
+      "x-maia-type": "string",
+      "x-maia-group": "speech",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "whisper-1",
+      "examples": [
+        "whisper-1"
+      ]
+    },
+    "EMBEDDING_PROVIDER": {
+      "type": "string",
+      "description": "Provider de embeddings: voyage | openai | cohere.",
+      "x-maia-type": "string",
+      "x-maia-group": "embeddings",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "voyage",
+        "openai",
+        "cohere"
+      ],
+      "default": "voyage",
+      "examples": [
+        "voyage"
+      ]
+    },
+    "EMBEDDING_MODEL": {
+      "type": "string",
+      "description": "Modelo de embeddings. O prefixo deve casar com o provider (voyage-*, text-embedding-*, embed-*).",
+      "x-maia-type": "string",
+      "x-maia-group": "embeddings",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "voyage-3",
+      "examples": [
+        "voyage-3"
+      ]
+    },
+    "EMBEDDING_DIMENSIONS": {
+      "type": "string",
+      "description": "Dimensões do vetor. Precisa casar com o modelo E com a coluna pgvector já migrada.",
+      "x-maia-type": "number",
+      "x-maia-group": "embeddings",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1024",
+      "examples": [
+        "1024"
+      ]
+    },
+    "VOYAGE_API_KEY": {
+      "type": "string",
+      "description": "Chave da Voyage AI.",
+      "x-maia-type": "string",
+      "x-maia-group": "embeddings",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "EMBEDDING_PROVIDER=voyage"
+    },
+    "COHERE_API_KEY": {
+      "type": "string",
+      "description": "Chave da Cohere.",
+      "x-maia-type": "string",
+      "x-maia-group": "embeddings",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "EMBEDDING_PROVIDER=cohere"
+    },
+    "BAILEYS_AUTH_DIR": {
+      "type": "string",
+      "description": "Raiz do estado de sessão do Baileys. Precisa conter um segmento \"baileys\"; raízes de sistema e o CWD são recusados (o recovery apaga diretórios sob esta raiz).",
+      "x-maia-type": "string",
+      "x-maia-group": "whatsapp",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "./.baileys-auth",
+      "examples": [
+        "./.baileys-auth"
+      ]
+    },
+    "WHATSAPP_NUMBER_MAIA": {
+      "type": "string",
+      "description": "Número E.164 da linha da Maia.",
+      "x-maia-type": "string",
+      "x-maia-group": "whatsapp",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "+5511000000000"
+      ]
+    },
+    "MAIA_DISPLAY_NAME": {
+      "type": "string",
+      "description": "Nome exibido do agente.",
+      "x-maia-type": "string",
+      "x-maia-group": "whatsapp",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "Maia",
+      "examples": [
+        "Maia"
+      ]
+    },
+    "OWNER_TELEFONE_WHATSAPP": {
+      "type": "string",
+      "description": "Número E.164 do owner. Precisa ser diferente de WHATSAPP_NUMBER_MAIA.",
+      "x-maia-type": "string",
+      "x-maia-group": "owner",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "+5511999999999"
+      ]
+    },
+    "OWNER_NOME": {
+      "type": "string",
+      "description": "Nome do owner.",
+      "x-maia-type": "string",
+      "x-maia-group": "owner",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "Mendes"
+      ]
+    },
+    "VALOR_LIMITE_SEM_CONFIRMACAO": {
+      "type": "string",
+      "description": "Teto (BRL) para executar sem confirmação extra. Ordem obrigatória: SEM_CONFIRMACAO <= DUAL_APPROVAL <= LIMITE_DURO.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1000",
+      "examples": [
+        "1000.00"
+      ]
+    },
+    "VALOR_DUAL_APPROVAL": {
+      "type": "string",
+      "description": "Acima deste valor (BRL) a operação exige aprovação dupla (4-eyes).",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "20000",
+      "examples": [
+        "5000.00"
+      ]
+    },
+    "VALOR_LIMITE_DURO": {
+      "type": "string",
+      "description": "Teto absoluto (BRL). Acima disso a operação é negada.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "50000",
+      "examples": [
+        "10000.00"
+      ]
+    },
+    "DUAL_APPROVAL_TIMEOUT_HOURS": {
+      "type": "string",
+      "description": "Janela (h) para a segunda aprovação antes de expirar.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "6",
+      "examples": [
+        "6"
+      ]
+    },
+    "AUDIT_MODE_TTL_HOURS": {
+      "type": "string",
+      "description": "TTL (h) do modo auditoria.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "24",
+      "examples": [
+        "24"
+      ]
+    },
+    "IDEMPOTENCY_BUCKET_MINUTES": {
+      "type": "string",
+      "description": "Janela (min) do bucket de idempotência.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5",
+      "examples": [
+        "5"
+      ]
+    },
+    "PENDING_QUESTION_TTL_MINUTES": {
+      "type": "string",
+      "description": "TTL (min) de pergunta pendente.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "120",
+      "examples": [
+        "120"
+      ]
+    },
+    "PENDING_ACTION_TTL_HOURS": {
+      "type": "string",
+      "description": "TTL (h) de ação pendente.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "6",
+      "examples": [
+        "6"
+      ]
+    },
+    "RATE_LIMIT_MSGS_PER_HOUR": {
+      "type": "string",
+      "description": "Teto de mensagens processadas por hora por remetente.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30",
+      "examples": [
+        "30"
+      ]
+    },
+    "WHATSAPP_RECONNECT_ALERT_MIN": {
+      "type": "string",
+      "description": "Minutos desconectado antes de alertar.",
+      "x-maia-type": "number",
+      "x-maia-group": "governance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5",
+      "examples": [
+        "5"
+      ]
+    },
+    "MAIA_MULTI_LINE": {
+      "type": "string",
+      "description": "Liga o LineSessionManager como dono do transporte por canal (fase 3). Default off = paridade mono-linha.",
+      "x-maia-type": "string",
+      "x-maia-group": "routing",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "MAIA_CHANNEL_ROUTING_MODE": {
+      "type": "string",
+      "description": "shadow (só loga divergência) | exact_first (exact-match com fallback) | strict (exige staging operante, falha tipado no miss).",
+      "x-maia-type": "string",
+      "x-maia-group": "routing",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "shadow",
+        "exact_first",
+        "strict"
+      ],
+      "default": "shadow",
+      "examples": [
+        "shadow"
+      ]
+    },
+    "MAIA_STAGING_KEYRING": {
+      "type": "string",
+      "description": "Keyring JSON { key_id: base64(32B) } do staging cifrado de inbound não-roteado. Obrigatório no modo strict.",
+      "x-maia-type": "string",
+      "x-maia-group": "routing",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "MAIA_CHANNEL_ROUTING_MODE=strict"
+    },
+    "MAIA_STAGING_ACTIVE_KEY_ID": {
+      "type": "string",
+      "description": "Id da chave ativa dentro de MAIA_STAGING_KEYRING.",
+      "x-maia-type": "string",
+      "x-maia-group": "routing",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "MAIA_CHANNEL_ROUTING_MODE=strict",
+      "examples": [
+        "k1"
+      ]
+    },
+    "ALERT_CHANNELS": {
+      "type": "string",
+      "description": "Canais de alerta separados por vírgula: log, email, telegram. Cada canal exige suas credenciais/destino.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "email",
+      "examples": [
+        "log"
+      ]
+    },
+    "SMTP_HOST": {
+      "type": "string",
+      "description": "Host SMTP do canal de e-mail.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "ALERT_CHANNELS contém email",
+      "examples": [
+        "smtp.example.com"
+      ]
+    },
+    "SMTP_PORT": {
+      "type": "string",
+      "description": "Porta SMTP.",
+      "x-maia-type": "number",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "587"
+      ]
+    },
+    "SMTP_USER": {
+      "type": "string",
+      "description": "Usuário SMTP.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "maia@example.com"
+      ]
+    },
+    "SMTP_PASS": {
+      "type": "string",
+      "description": "Senha SMTP.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true
+    },
+    "ALERT_EMAIL_TO": {
+      "type": "string",
+      "description": "Destinatário dos alertas por e-mail.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "ALERT_CHANNELS contém email",
+      "examples": [
+        "ops@example.com"
+      ]
+    },
+    "TELEGRAM_BOT_TOKEN": {
+      "type": "string",
+      "description": "Token do bot do Telegram.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "ALERT_CHANNELS contém telegram"
+    },
+    "TELEGRAM_CHAT_ID": {
+      "type": "string",
+      "description": "Chat de destino dos alertas no Telegram.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "ALERT_CHANNELS contém telegram",
+      "examples": [
+        "-1001234567890"
+      ]
+    },
+    "DLQ_ALERT_THRESHOLD": {
+      "type": "string",
+      "description": "Tamanho da DLQ que dispara alerta.",
+      "x-maia-type": "number",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "10",
+      "examples": [
+        "10"
+      ]
+    },
+    "BACKUP_DIR": {
+      "type": "string",
+      "description": "Diretório local dos dumps.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "./backups",
+      "examples": [
+        "./backups"
+      ]
+    },
+    "BACKUP_RETENTION_LOCAL_DAYS": {
+      "type": "string",
+      "description": "Retenção local (dias).",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "7",
+      "examples": [
+        "7"
+      ]
+    },
+    "BACKUP_RETENTION_CLOUD_DAYS": {
+      "type": "string",
+      "description": "Retenção remota (dias).",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30",
+      "examples": [
+        "30"
+      ]
+    },
+    "BACKUP_S3_BUCKET": {
+      "type": "string",
+      "description": "Bucket de destino do backup remoto. Sem ele, o backup é só local.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "maia-backups"
+      ]
+    },
+    "BACKUP_S3_ENDPOINT": {
+      "type": "string",
+      "description": "Endpoint custom para provedores S3-compatíveis (Backblaze B2, Cloudflare R2, Wasabi). Vazio = AWS S3 nativo.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "https://s3.us-west-002.backblazeb2.com"
+      ]
+    },
+    "BACKUP_S3_REGION": {
+      "type": "string",
+      "description": "Região do bucket.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "us-east-1",
+      "examples": [
+        "us-east-1"
+      ]
+    },
+    "BACKUP_S3_ACCESS_KEY": {
+      "type": "string",
+      "description": "Access key do bucket de backup.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "backup",
+        "maintenance",
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "BACKUP_S3_BUCKET definido"
+    },
+    "BACKUP_S3_SECRET_KEY": {
+      "type": "string",
+      "description": "Secret key do bucket de backup.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "backup",
+        "maintenance",
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "BACKUP_S3_BUCKET definido"
+    },
+    "BACKUP_S3_PREFIX": {
+      "type": "string",
+      "description": "Prefixo dentro do bucket (sem barra inicial nem final).",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "maia",
+      "examples": [
+        "maia"
+      ]
+    },
+    "DAILY_LLM_USD_THRESHOLD": {
+      "type": "string",
+      "description": "Teto diário (USD) do cost monitor. Acima dispara alerta.",
+      "x-maia-type": "number",
+      "x-maia-group": "cost",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5",
+      "examples": [
+        "5"
+      ]
+    },
+    "FEATURE_MCP_TOOLS": {
+      "type": "string",
+      "description": "MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest).",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PROACTIVE_MESSAGES": {
+      "type": "string",
+      "description": "Mensagens proativas do agente.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_OFX_IMPORT": {
+      "type": "string",
+      "description": "Importação de extratos OFX.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_DASHBOARD": {
+      "type": "string",
+      "description": "Dashboard operacional embutido no runtime.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PENDING_GATE": {
+      "type": "string",
+      "description": "Gate de resolução de perguntas pendentes.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PRESENCE": {
+      "type": "string",
+      "description": "Sinais de presença (typing, read receipts).",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_ONE_TAP": {
+      "type": "string",
+      "description": "Respostas one-tap (enquete/reação como resposta).",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_MESSAGE_UPDATE": {
+      "type": "string",
+      "description": "Tratamento de edição/remoção de mensagem.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PENDING_REMINDER": {
+      "type": "string",
+      "description": "Lembretes de pendências.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_VIEW_ONCE_SENSITIVE": {
+      "type": "string",
+      "description": "Respostas sensíveis (saldos, comparativos) enviadas com viewOnce, gatilhado por preferência da pessoa.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PDF_REPORTS": {
+      "type": "string",
+      "description": "Relatórios PDF (extrato/comparativo) enviados como documento.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_OUTBOUND_VOICE": {
+      "type": "string",
+      "description": "Áudio de saída via OpenAI TTS (reutiliza OPENAI_API_KEY).",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_OUTBOUND_DEDUP": {
+      "type": "string",
+      "description": "Ledger de idempotência de saída (#227) em outbound_messages.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_MESSAGE_DEBOUNCE": {
+      "type": "string",
+      "description": "Agrupa textos picotados do mesmo remetente numa única rodada. Mídia sempre passa direto.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_PROCEDURE_RUNTIME": {
+      "type": "string",
+      "description": "Kill switch do runtime de procedimentos (selector + engine + avaliador). Default ON; a rodada ReAct base não depende dele.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "MAIA_SYNTHETIC_PROBE": {
+      "type": "string",
+      "description": "Sonda sintética ponta-a-ponta. Inerte enquanto false. Exige MAIA_CHANNEL_ROUTING_MODE em exact_first ou strict.",
+      "x-maia-type": "string",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "MAIA_PROBE_LLM_JUDGE": {
+      "type": "string",
+      "description": "Asserção secundária por LLM-as-judge na sonda (custo/ruído: off por default).",
+      "x-maia-type": "string",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "MAIA_PROBE_CRON": {
+      "type": "string",
+      "description": "Cadência do tick da sonda (1 cenário por tick).",
+      "x-maia-type": "string",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "*/10 * * * *",
+      "examples": [
+        "*/10 * * * *"
+      ]
+    },
+    "MAIA_PROBE_SLO_MS": {
+      "type": "string",
+      "description": "Deadline (ms) do efeito colateral. Sem efeito no SLO ⇒ silent.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30000",
+      "examples": [
+        "30000"
+      ]
+    },
+    "MAIA_PROBE_SLO_WARN_MS": {
+      "type": "string",
+      "description": "Acima deste tempo (ms) mas dentro do SLO ⇒ slow.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "15000",
+      "examples": [
+        "15000"
+      ]
+    },
+    "MAIA_PROBE_ALERT_AFTER_K": {
+      "type": "string",
+      "description": "K falhas consecutivas para transicionar saudável→degradado e alertar.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3",
+      "examples": [
+        "3"
+      ]
+    },
+    "MAIA_PROBE_AUTOSILENCE_AFTER_N": {
+      "type": "string",
+      "description": "N falhas consecutivas ativam o auto-silêncio (para de gastar LLM em loop).",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "10",
+      "examples": [
+        "10"
+      ]
+    },
+    "MAIA_PROBE_SILENCED_BACKOFF_MS": {
+      "type": "string",
+      "description": "Intervalo (ms) de sondagem de recuperação durante o auto-silêncio.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3600000",
+      "examples": [
+        "3600000"
+      ]
+    },
+    "MAIA_PROBE_RUN_TTL_MS": {
+      "type": "string",
+      "description": "TTL (ms) do cleanup de rows de run órfãs.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300000",
+      "examples": [
+        "300000"
+      ]
+    },
+    "MAIA_PROBE_LEASE_MS": {
+      "type": "string",
+      "description": "Lease (ms) de single-flight da sonda.",
+      "x-maia-type": "number",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "120000",
+      "examples": [
+        "120000"
+      ]
+    },
+    "MAIA_PROBE_ALERT_MODE": {
+      "type": "string",
+      "description": "log_only (default, staging-safe: log + métrica) ou alert (entrega por sendAlert com retry durável).",
+      "x-maia-type": "string",
+      "x-maia-group": "probe",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "log_only",
+        "alert"
+      ],
+      "default": "log_only",
+      "examples": [
+        "log_only"
+      ]
+    },
+    "RUNTIME_TRACE_HMAC_KEY_VERSION": {
+      "type": "string",
+      "description": "Versão da chave HMAC em uso (rotação a cada 90d).",
+      "x-maia-type": "number",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1",
+      "examples": [
+        "1"
+      ]
+    },
+    "RUNTIME_TRACE_HMAC_MASTER_SECRET": {
+      "type": "string",
+      "description": "Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis.",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ]
+    },
+    "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS": {
+      "type": "string",
+      "description": "Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria.",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true
+    },
+    "RUNTIME_TRACE_DEBUG_S3_BUCKET": {
+      "type": "string",
+      "description": "Bucket dos snapshots cifrados do modo debug (TTL 24h).",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "maia-trace-debug"
+      ]
+    },
+    "RUNTIME_TRACE_DEBUG_AES_KEY": {
+      "type": "string",
+      "description": "Chave AES-GCM (base64) dos snapshots de debug.",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "RUNTIME_TRACE_DEBUG_S3_BUCKET definido"
+    },
+    "RUNTIME_TRACE_BODY_ORPHAN_SEC": {
+      "type": "string",
+      "description": "Idade máxima (s) de um envelope pendente antes do alerta do recoverer.",
+      "x-maia-type": "number",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300",
+      "examples": [
+        "300"
+      ]
+    },
+    "RUNTIME_TRACE_MATVIEW_REFRESH_SEC": {
+      "type": "string",
+      "description": "Intervalo (s) de refresh da matview unified_trace_events.",
+      "x-maia-type": "number",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300",
+      "examples": [
+        "300"
+      ]
+    },
+    "OUTBOUND_SWEEPER_STALE_PENDING_SEC": {
+      "type": "string",
+      "description": "Rows 'pending' mais antigas que isso são promovidas a 'unknown' (terminal).",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300",
+      "examples": [
+        "300"
+      ]
+    },
+    "OUTBOUND_SWEEPER_RETENTION_DAYS": {
+      "type": "string",
+      "description": "Retenção (dias) de rows terminais em outbound_messages.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30",
+      "examples": [
+        "30"
+      ]
+    },
+    "OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE": {
+      "type": "string",
+      "description": "Tamanho do chunk do DELETE de retenção (evita lock de tabela inteira).",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1000",
+      "examples": [
+        "1000"
+      ]
+    },
+    "OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT": {
+      "type": "string",
+      "description": "Teto de promoções stale-pending por tenant por passe (fairness).",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "500",
+      "examples": [
+        "500"
+      ]
+    },
+    "OUTBOX_RELAYER_BATCH_PER_TENANT": {
+      "type": "string",
+      "description": "Efeitos pendentes despachados por (tenant, agent) por passe.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "100",
+      "examples": [
+        "100"
+      ]
+    },
+    "OUTBOX_RELAYER_BASE_BACKOFF_SEC": {
+      "type": "string",
+      "description": "Base (s) do backoff exponencial em falha transitória.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30",
+      "examples": [
+        "30"
+      ]
+    },
+    "OUTBOX_RELAYER_MAX_BACKOFF_SEC": {
+      "type": "string",
+      "description": "Teto (s) do backoff.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3600",
+      "examples": [
+        "3600"
+      ]
+    },
+    "OUTBOX_RELAYER_RETENTION_DAYS": {
+      "type": "string",
+      "description": "Retenção (dias) de rows terminais do outbox de efeitos.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30",
+      "examples": [
+        "30"
+      ]
+    },
+    "OUTBOX_RELAYER_RETENTION_BATCH_SIZE": {
+      "type": "string",
+      "description": "Chunk do DELETE de retenção do relayer.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1000",
+      "examples": [
+        "1000"
+      ]
+    },
+    "OUTBOX_MAX_PER_SECOND": {
+      "type": "string",
+      "description": "Backpressure de saída: envios por segundo por instância de agente.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "2",
+      "examples": [
+        "2"
+      ]
+    },
+    "OUTBOX_MAX_PER_HOUR": {
+      "type": "string",
+      "description": "Backpressure de saída: envios por hora por instância de agente.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "120",
+      "examples": [
+        "120"
+      ]
+    },
+    "OCCURRENCE_LEASE_TTL_SECONDS": {
+      "type": "string",
+      "description": "TTL (s) do lease de uma ocorrência antes de outro worker reclamar.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300",
+      "examples": [
+        "300"
+      ]
+    },
+    "OUTBOX_LEASE_TTL_SECONDS": {
+      "type": "string",
+      "description": "TTL (s) do lease do outbox.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "60",
+      "examples": [
+        "60"
+      ]
+    },
+    "OUTBOX_WORKER_CONCURRENCY": {
+      "type": "string",
+      "description": "Concorrência do worker de outbox.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "4",
+      "examples": [
+        "4"
+      ]
+    },
+    "OUTBOX_DRAIN_LOOP_PASSES": {
+      "type": "string",
+      "description": "Passes de drain por tick.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5",
+      "examples": [
+        "5"
+      ]
+    },
+    "OUTBOX_DRAIN_LOOP_SLEEP_MS": {
+      "type": "string",
+      "description": "Sleep (ms) entre ticks de drain.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "200",
+      "examples": [
+        "200"
+      ]
+    },
+    "MESSAGE_DEBOUNCE_MS": {
+      "type": "string",
+      "description": "Janela (ms) do debounce de mensagens; cada texto novo reinicia o timer.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5000",
+      "examples": [
+        "5000"
+      ]
+    },
+    "MESSAGE_DEBOUNCE_MAX_MS": {
+      "type": "string",
+      "description": "Teto absoluto (ms) do debounce.",
+      "x-maia-type": "number",
+      "x-maia-group": "outbox",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "30000",
+      "examples": [
+        "30000"
+      ]
+    },
+    "PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD": {
+      "type": "string",
+      "description": "Limiar (0,1] de confiança do selector de procedimentos. 0 auto-iniciaria em qualquer candidato.",
+      "x-maia-type": "number",
+      "x-maia-group": "procedures",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "0.6",
+      "examples": [
+        "0.6"
+      ]
+    },
+    "PROCEDURE_TTL_DAYS": {
+      "type": "string",
+      "description": "Dias de inatividade após os quais o reaper marca a execução como 'abandoned'.",
+      "x-maia-type": "number",
+      "x-maia-group": "procedures",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "7",
+      "examples": [
+        "7"
+      ]
+    },
+    "REAPER_BATCH_SIZE": {
+      "type": "string",
+      "description": "Teto de leitura por tupla (tenant, agent) por tick do reaper.",
+      "x-maia-type": "number",
+      "x-maia-group": "procedures",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1000",
+      "examples": [
+        "1000"
+      ]
+    },
+    "REAPER_GLOBAL_BUDGET": {
+      "type": "string",
+      "description": "Orçamento GLOBAL de execuções ceifadas por tick, somando todas as tuplas.",
+      "x-maia-type": "number",
+      "x-maia-group": "procedures",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "5000",
+      "examples": [
+        "5000"
+      ]
+    },
+    "CONTRADICTION_OVERLAY_TTL_HOURS": {
+      "type": "string",
+      "description": "Janela (h) em que uma contradição resolvida ainda aparece no prompt.",
+      "x-maia-type": "number",
+      "x-maia-group": "procedures",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "24",
+      "examples": [
+        "24"
+      ]
+    },
+    "POLICY_RESOLVER_CACHE_TTL_MS": {
+      "type": "string",
+      "description": "TTL (ms) do PolicyResolverCache.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "300000",
+      "examples": [
+        "300000"
+      ]
+    },
+    "POLICY_RESOLVER_CACHE_MAX_ENTRIES": {
+      "type": "string",
+      "description": "Teto LRU do PolicyResolverCache.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "10000",
+      "examples": [
+        "10000"
+      ]
+    },
+    "SYNC_LATENCY_P95_BASELINE_MS": {
+      "type": "string",
+      "description": "Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "1200"
+      ]
+    },
+    "SYNC_LATENCY_P95_BUDGET_PERCENT": {
+      "type": "string",
+      "description": "Percentual extra permitido sobre a baseline.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "20",
+      "examples": [
+        "20"
+      ]
+    },
+    "SETUP_TOKEN_OVERRIDE": {
+      "type": "string",
+      "description": "Override do token de bootstrap. Desencorajado em produção (env vaza mais que arquivo 0600), mas não proibido — deploys scriptados legítimos usam.",
+      "x-maia-type": "string",
+      "x-maia-group": "setup",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true
+    },
+    "ADMIN_UI_PORT": {
+      "type": "string",
+      "description": "Porta do container Next.js do Admin UI.",
+      "x-maia-type": "number",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "4000",
+      "examples": [
+        "4000"
+      ]
+    },
+    "NEXTAUTH_URL": {
+      "type": "string",
+      "description": "URL pública do Admin UI. Precisa ser https fora de development.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "http://localhost:4000",
+      "examples": [
+        "http://localhost:4000"
+      ]
+    },
+    "NEXTAUTH_SECRET": {
+      "type": "string",
+      "description": "Segredo de assinatura do NextAuth (gere com `openssl rand -base64 48`). Placeholders são recusados fora de development.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ]
+    },
+    "AUTH_TRUST_HOST": {
+      "type": "string",
+      "description": "Confia no Host vindo do proxy reverso (Coolify, nginx, ALB). Sem isso o NextAuth v5 recusa hosts que não batem com NEXTAUTH_URL.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "true"
+      ]
+    },
+    "NEXT_PUBLIC_API_URL": {
+      "type": "string",
+      "description": "URL do runtime Fastify consumida pelo Admin UI. Precisa ser https fora de development.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "http://localhost:3000",
+      "examples": [
+        "http://localhost:3000"
+      ]
+    },
+    "FEATURE_ADMIN_UI_V1": {
+      "type": "string",
+      "description": "Gate mestre do Admin UI v1.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS": {
+      "type": "string",
+      "description": "Snapshots de debug no Admin UI.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "FEATURE_ADMIN_UI_BULK_REJECT": {
+      "type": "string",
+      "description": "Rejeição em lote no inbox do Admin UI.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "FEATURE_ADMIN_UI_REDECIDE": {
+      "type": "string",
+      "description": "Re-decisão manual a partir do Admin UI.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "ALLOW_DEV_AUTH": {
+      "type": "string",
+      "description": "Habilita o provider de login de desenvolvimento. PROIBIDO fora de development — o boot recusa.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "ADMIN_UI_DEV_LOGIN_TOKEN": {
+      "type": "string",
+      "description": "Token compartilhado do login de desenvolvimento (mínimo 16 caracteres).",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "ALLOW_DEV_AUTH=true"
+    },
+    "OIDC_ISSUER": {
+      "type": "string",
+      "description": "Issuer do IdP. Precisa ser https em staging/production.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "https://login.example.com/realms/maia"
+      ]
+    },
+    "OIDC_CLIENT_ID": {
+      "type": "string",
+      "description": "Client id registrado no IdP.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "maia-admin"
+      ]
+    },
+    "OIDC_CLIENT_SECRET": {
+      "type": "string",
+      "description": "Client secret do IdP.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ]
+    },
+    "OIDC_TENANT_SLUGS": {
+      "type": "string",
+      "description": "Lista (vírgula) não vazia de app_users.tenant_id que o IdP pode autenticar. Nunca cai para o literal `default`.",
+      "x-maia-type": "string",
+      "x-maia-group": "admin-ui",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-in": [
+        "staging",
+        "production"
+      ],
+      "examples": [
+        "primary"
+      ]
+    }
+  },
+  "x-maia-tombstones": [
+    {
+      "name": "FEATURE_MULTI_CHANNEL",
+      "removed_in": "PR #411",
+      "reason": "A resolução de canal passou a ter catch-all single-tenant; o toggle é always-on / inexistente. Mantê-lo no ambiente sugere um gate que não existe mais.",
+      "replacement": null,
+      "fails_on": "any-value"
+    },
+    {
+      "name": "FEATURE_COGNITIVE_GRAPH",
+      "removed_in": "PR #412",
+      "reason": "O grafo cognitivo roda incondicionalmente (paridade com o caminho imperativo comprovada). Os budgets SYNC_LATENCY_P95_* seguem existindo — eles limitam latência, não o grafo.",
+      "replacement": null,
+      "fails_on": "any-value"
+    },
+    {
+      "name": "FEATURE_CONTEXT_PACKET_V1",
+      "removed_in": "PR #406",
+      "reason": "O hot-path do context packet foi deletado (o loop do agente sempre usa buildPrompt). Configurar a flag é um no-op que induziria o operador a erro.",
+      "replacement": null,
+      "fails_on": "truthy"
+    },
+    {
+      "name": "FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH",
+      "removed_in": "PR #406",
+      "reason": "Kill switch da flag removida acima — sem caminho para desligar.",
+      "replacement": null,
+      "fails_on": "truthy"
+    },
+    {
+      "name": "APROVAR_MENSAGENS_PROATIVAS",
+      "removed_in": "issue #515",
+      "reason": "Nunca pertenceu ao schema: aparecia no `.env.example` sem nenhum consumidor. O gate real de mensagens proativas é FEATURE_PROACTIVE_MESSAGES.",
+      "replacement": "FEATURE_PROACTIVE_MESSAGES",
+      "fails_on": "any-value"
+    }
+  ]
+}

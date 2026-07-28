@@ -219,6 +219,55 @@ export default [
     },
   },
 
+  // Issue #515 — configuration contract lock. `src/config/contract.ts` is the
+  // single source of truth for every Maia variable, and configuration must be
+  // consumed through a service loader (`src/config/load.ts` and friends), never
+  // read ad hoc from `process.env`. A direct read bypasses the schema, the
+  // defaults, the per-profile rules and the per-service allow-list — which is
+  // exactly how `.env.example` drifted away from the schema in the first place.
+  //
+  // The `ignores` list below is the EXPLICIT allow-list of files that still
+  // read directly. It is a migration budget, not a permanent exemption: shrink
+  // it, never grow it. A NEW direct read anywhere else fails `npm run lint`.
+  {
+    files: ['src/**/*.ts'],
+    ignores: [
+      // Authorised loaders — this is where env legitimately enters the process.
+      'src/config/env.ts',
+      'src/config/load.ts',
+      // Admin UI: a separate Next.js app with its own build; migrating it to
+      // the shared loader is tracked as the Admin rollout step of #515.
+      'src/admin-ui/**',
+      // Pending migration (inventoried in docs/configuration.md).
+      'src/agent/prompt-builder.ts',
+      'src/cognition/calendar-pattern-detector.ts',
+      'src/cognition/capability-proposer.ts',
+      'src/cognition/drift/**',
+      'src/cognition/role-selector/llm-suggester.ts',
+      'src/db/tenant-context.ts',
+      'src/lib/mcp-client.ts',
+      'src/runtime/context-packet/test-fixtures.ts',
+      'src/runtime/feature-flags/context-packet-flag.ts',
+      'src/setup/index.ts',
+      'src/shared/risk/llm-gate.ts',
+      'src/workers/procedure-execution-reaper.ts',
+    ],
+    rules: {
+      'no-restricted-properties': [
+        'error',
+        {
+          object: 'process',
+          property: 'env',
+          message:
+            'Contrato de configuração (#515): não leia process.env direto. Declare a variável em ' +
+            'src/config/contract.ts e consuma pelo loader do serviço (src/config/load.ts, ' +
+            'migration-config.ts, admin-config.ts, backup-config.ts) ou pelo singleton ' +
+            '@/config/env.js. Exceções ficam na allow-list explícita em eslint.config.js.',
+        },
+      ],
+    },
+  },
+
   // Scripts use the same TS rules but without the type-aware parser.
   // tsconfig.json includes only src/, and pulling scripts/ into the
   // type-aware project would force the build to compile them (they run

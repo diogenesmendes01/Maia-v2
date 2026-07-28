@@ -89,6 +89,27 @@ jobs:
       - name: AI docs governance
         run: npm run docs:ai:check
 
+      - name: Config contract drift (#515)
+        # `.env.example`, docs/configuration.md, the JSON Schema, the
+        # per-service manifest and the per-profile fixtures are GENERATED from
+        # src/config/contract.ts. This fails the build when the contract moved
+        # and the artifacts were not regenerated — the drift that made
+        # `.env.example` stop matching the schema in the first place.
+        run: npm run config:check:drift
+
+      - name: Config contract — .env.example is structurally valid
+        # Structural mode: placeholders are accepted (the example ships
+        # `sk-ant-...`), but every schema and cross-field rule still applies.
+        run: npm run config:check -- --profile development --env-file .env.example --allow-placeholders
+
+      - name: Config contract — per-profile fixtures pass STRICT validation
+        # Proof the contract is satisfiable: the synthetic fixtures carry no
+        # placeholders and must pass each profile's full rule set.
+        run: |
+          for p in development staging production; do
+            npm run config:check -- --profile "$p" --env-file "src/config/generated/fixtures/$p.env"
+          done
+
       - name: PR body governance
         if: github.event_name == 'pull_request'
         run: npm run pr:body:check
