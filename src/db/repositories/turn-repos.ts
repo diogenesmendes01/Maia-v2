@@ -606,6 +606,74 @@ export const agentTurnsRepo = {
   },
 
   /**
+   * Divergência POR PAR (tenant, agent), CROSS-TENANT e sem ALS.
+   *
+   * A variante escopada acima só enxerga o par corrente, e o worker a chamava
+   * apenas para os pares que a fonte de recovery já havia enumerado — de modo
+   * que a divergência CENTRAL da issue (um turno `retryable` com
+   * `processada_em` preenchido) podia nunca virar métrica, justamente porque
+   * aquele par não tinha trabalho pendente na fila. Este método varre a base
+   * inteira, uma query só, e devolve apenas os pares COM divergência.
+   *
+   * Roda fora de contexto de tenant por construção (é um dispatcher, como as
+   * demais enumerações); o escopo está no GROUP BY, não num WHERE de ALS.
+   */
+  async countLegacyProjectionMismatchByPair(): Promise<
+    Array<{
+      tenant_id: string;
+      agent_id: string;
+      terminal_without_projection: number;
+      projection_without_terminal: number;
+    }>
+  > {
+    const result = await db.execute<{
+      tenant_id: string;
+      agent_id: string;
+      terminal_without_projection: string;
+      projection_without_terminal: string;
+    }>(sql`
+      SELECT
+        i.tenant_id,
+        i.agent_id,
+        count(*) FILTER (
+          WHERE t.status IN ('completed', 'ignored', 'superseded', 'dead_letter')
+            AND m.processada_em IS NULL
+        )::text AS terminal_without_projection,
+        count(*) FILTER (
+          WHERE t.status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')
+            AND m.processada_em IS NOT NULL
+        )::text AS projection_without_terminal
+      FROM ${agent_turn_inputs} i
+      JOIN ${agent_turns} t
+        ON t.id = i.turn_id AND t.tenant_id = i.tenant_id AND t.agent_id = i.agent_id
+      JOIN ${mensagens} m
+        ON m.id = i.mensagem_id AND m.tenant_id = i.tenant_id AND m.agent_id = i.agent_id
+      GROUP BY i.tenant_id, i.agent_id
+      HAVING count(*) FILTER (
+               WHERE t.status IN ('completed', 'ignored', 'superseded', 'dead_letter')
+                 AND m.processada_em IS NULL
+             ) > 0
+          OR count(*) FILTER (
+               WHERE t.status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')
+                 AND m.processada_em IS NOT NULL
+             ) > 0
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{
+        tenant_id: string;
+        agent_id: string;
+        terminal_without_projection: string;
+        projection_without_terminal: string;
+      }>,
+    ).map((r) => ({
+      tenant_id: r.tenant_id,
+      agent_id: r.agent_id,
+      terminal_without_projection: Number(r.terminal_without_projection),
+      projection_without_terminal: Number(r.projection_without_terminal),
+    }));
+  },
+
+  /**
    * Um lote do backfill (issue #503 §7). Cria um turno por mensagem inbound
    * histórica AINDA sem turno, mapeando a projeção legada:
    *   - `processada_em IS NOT NULL` -> `completed` / `legacy_processed`, com

@@ -27,6 +27,7 @@ const repo = {
   findById: vi.fn(),
   replayDeadLetterTx: vi.fn(),
   countLegacyProjectionMismatch: vi.fn(),
+  countLegacyProjectionMismatchByPair: vi.fn(),
 };
 const auditSpy = vi.fn();
 // `config` é substituído por inteiro, então precisa carregar também o que o
@@ -315,7 +316,7 @@ describe('turn lifecycle — AUTORITATIVO: falha de transição é BLOQUEANTE', 
   });
 
   it('o probe de divergência continua NÃO-bloqueante mesmo autoritativo', async () => {
-    repo.countLegacyProjectionMismatch.mockRejectedValue(boom());
+    repo.countLegacyProjectionMismatchByPair.mockRejectedValue(boom());
     await expect(reportLegacyProjectionDivergence()).resolves.toBeNull();
   });
 });

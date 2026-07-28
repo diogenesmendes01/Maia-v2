@@ -26,6 +26,7 @@ import { config } from '@/config/env.js';
 import { agentTurnsRepo, type TurnTransitionResult } from '@/db/repositories/turn-repos.js';
 import type { AgentTurn, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import {
@@ -532,30 +533,64 @@ export async function replayDeadLetteredTurn(args: {
 export async function reportLegacyProjectionDivergence(): Promise<{
   terminal_without_projection: number;
   projection_without_terminal: number;
+  pairs: number;
 } | null> {
   if (!turnStateMachineEnabled()) return null;
   // `blocking: false` SEMPRE: o probe é observabilidade. Derrubar o sweep de
   // recovery porque a medição de divergência falhou seria trocar um problema
   // de visibilidade por um de disponibilidade.
-  return guarded('projection_divergence', async () => {
-    const counts = await agentTurnsRepo.countLegacyProjectionMismatch();
-    const total = counts.terminal_without_projection + counts.projection_without_terminal;
-    if (total === 0) return counts;
-    incCounter(
-      'maia_turn_legacy_projection_mismatch_total',
-      { kind: 'terminal_without_projection' },
-      counts.terminal_without_projection,
-    );
-    incCounter(
-      'maia_turn_legacy_projection_mismatch_total',
-      { kind: 'projection_without_terminal' },
-      counts.projection_without_terminal,
-    );
-    logger.warn({ ...counts }, 'turn.legacy_projection_mismatch');
-    await audit({
-      acao: 'turn_state_inconsistency_detected',
-      metadata: { ...counts },
-    });
-    return counts;
-  }, { blocking: false });
+  return guarded(
+    'projection_divergence',
+    async () => {
+      // CROSS-TENANT por construção. A versão anterior media só os pares que a
+      // fonte de recovery já tinha enumerado, então a divergência central da
+      // issue — turno `retryable` com `processada_em` preenchido — podia nunca
+      // gerar métrica, precisamente porque aquele par não tinha nada na fila.
+      const perPair = await agentTurnsRepo.countLegacyProjectionMismatchByPair();
+      const totals = { terminal_without_projection: 0, projection_without_terminal: 0 };
+      for (const p of perPair) {
+        totals.terminal_without_projection += p.terminal_without_projection;
+        totals.projection_without_terminal += p.projection_without_terminal;
+      }
+      if (perPair.length === 0) return { ...totals, pairs: 0 };
+
+      // Métrica SEM label de tenant (cardinalidade): o par vai na auditoria e
+      // no log, que é onde o operador precisa dele.
+      incCounter(
+        'maia_turn_legacy_projection_mismatch_total',
+        { kind: 'terminal_without_projection' },
+        totals.terminal_without_projection,
+      );
+      incCounter(
+        'maia_turn_legacy_projection_mismatch_total',
+        { kind: 'projection_without_terminal' },
+        totals.projection_without_terminal,
+      );
+      for (const p of perPair) {
+        logger.warn(
+          {
+            tenant_id: p.tenant_id,
+            agent_id: p.agent_id,
+            terminal_without_projection: p.terminal_without_projection,
+            projection_without_terminal: p.projection_without_terminal,
+          },
+          'turn.legacy_projection_mismatch',
+        );
+        // Auditoria ATRIBUÍDA ao par divergente — sem o contexto, a row cairia
+        // no tenant sintético `system` e perderia justamente a informação que
+        // o operador precisa para agir.
+        await runWithTenantContext({ tenant_id: p.tenant_id, agent_id: p.agent_id }, () =>
+          audit({
+            acao: 'turn_state_inconsistency_detected',
+            metadata: {
+              terminal_without_projection: p.terminal_without_projection,
+              projection_without_terminal: p.projection_without_terminal,
+            },
+          }),
+        );
+      }
+      return { ...totals, pairs: perPair.length };
+    },
+    { blocking: false },
+  );
 }

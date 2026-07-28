@@ -24,6 +24,44 @@ const DIVERGENCE_PROBE_EVERY_MS = 15 * 60 * 1000;
 let lastDivergenceProbeAt = 0;
 
 /**
+ * Shadow-read (#503 §6, passo 6): mede a divergência entre a máquina de estados
+ * e a projeção legada, SEM decidir nada com ela. É o sinal que autoriza (ou
+ * barra) ligar `FEATURE_TURN_STATE_AUTHORITATIVE`.
+ *
+ * INDEPENDENTE da fila de recovery, e roda mesmo quando o sweep está idle: a
+ * divergência que mais importa (turno `retryable` com `processada_em`
+ * preenchido) vive exatamente nos pares SEM trabalho pendente — o campo legado
+ * carimbado é o que os esconde da enumeração. Amarrar o probe à fila era
+ * garantir que a métrica central nunca saísse.
+ *
+ * Throttled (15min/processo) porque a query é um JOIN de três tabelas e mede
+ * uma condição que muda em minutos, não a cada tick. Nunca lança.
+ */
+async function runDivergenceProbe(): Promise<void> {
+  if (!turnStateMachineEnabled()) return;
+  if (Date.now() - lastDivergenceProbeAt < DIVERGENCE_PROBE_EVERY_MS) return;
+  lastDivergenceProbeAt = Date.now();
+  try {
+    const report = await reportLegacyProjectionDivergence();
+    if (report && report.pairs > 0) {
+      logger.warn(
+        {
+          pairs: report.pairs,
+          terminal_without_projection: report.terminal_without_projection,
+          projection_without_terminal: report.projection_without_terminal,
+        },
+        'message_recovery.divergence_detected',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'message_recovery.divergence_probe_failed',
+    );
+  }
+}
+
+/**
  * Re-enqueues inbound messages that were persisted but never picked up by the
  * agent worker (process killed between insert and enqueue, or BullMQ outage).
  * Idempotent: agent-core early-returns when processada_em is set.
@@ -69,6 +107,11 @@ export async function runMessageRecovery(): Promise<void> {
     : await mensagensRepo.listTenantAgentPairsWithUnprocessedOlderThan(STUCK_AFTER_MS);
 
   if (tuples.length === 0) {
+    // O probe roda ANTES do retorno idle. Ele NÃO depende da fila: a
+    // divergência central da issue (turno `retryable` com `processada_em`
+    // preenchido) aparece justamente em pares SEM trabalho pendente — o campo
+    // legado carimbado é o que os esconde da enumeração de recovery.
+    await runDivergenceProbe();
     logger.debug('message_recovery.idle');
     return;
   }
@@ -99,21 +142,7 @@ export async function runMessageRecovery(): Promise<void> {
     }
   }
 
-  // Shadow-read (#503 §6, passo 6): mede a divergência entre a máquina de
-  // estados e a projeção legada, por par, SEM decidir nada com ela. É o sinal
-  // que autoriza (ou barra) ligar FEATURE_TURN_STATE_AUTHORITATIVE.
-  if (turnStateMachineEnabled() && Date.now() - lastDivergenceProbeAt >= DIVERGENCE_PROBE_EVERY_MS) {
-    lastDivergenceProbeAt = Date.now();
-    for (const { tenant_id, agent_id } of tuples) {
-      await runWithTenantContext({ tenant_id, agent_id }, reportLegacyProjectionDivergence).catch(
-        (err) =>
-          logger.warn(
-            { tenant_id, agent_id, err: (err as Error).message },
-            'message_recovery.divergence_probe_failed',
-          ),
-      );
-    }
-  }
+  await runDivergenceProbe();
 
   logger.info(
     { tuples: tuples.length, agents_processed, agents_failed, authoritative },
