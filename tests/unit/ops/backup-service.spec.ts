@@ -66,6 +66,8 @@ function harness(over: Partial<BackupPorts> = {}, opts: { frozenClock?: boolean;
   const removed: string[] = [];
   const promoted: { from: string; to: string }[] = [];
   const fs = new Map<string, string>();
+  /** Mirrors the partial unique index: at most one non-terminal run. */
+  let activeRunId: string | null = null;
   let clock = new Date('2026-07-28T03:00:00.000Z').getTime();
 
   const ports: BackupPorts = {
@@ -128,11 +130,30 @@ function harness(over: Partial<BackupPorts> = {}, opts: { frozenClock?: boolean;
       rows_present: true,
     }),
     manifestSecret: () => ({ secret: SECRET, key_version: 1 }),
+    // Round-1 P2: the old store was a bag of pushes, so a run left in `running`
+    // looked harmless. This one models `backup_runs_single_active_uq` — at most
+    // ONE non-terminal row — which is what turns a stranded row into the
+    // permanent outage the finding describes.
     store: {
       createRun: async (row) => {
+        if (activeRunId !== null) {
+          throw new TypedError(
+            'backup_runs_single_active_uq',
+            'a non-terminal backup run already exists',
+            { holder: activeRunId },
+          );
+        }
+        activeRunId = row.id;
         runs.push({ ...row });
       },
       updateRun: async (id, patch) => {
+        const state = patch.state as string | undefined;
+        if (
+          state !== undefined &&
+          ['completed', 'completed_degraded', 'failed', 'expired', 'deleted'].includes(state)
+        ) {
+          activeRunId = null;
+        }
         runs.push({ id, ...patch });
       },
       saveManifest: async (runId, signed) => {
@@ -582,6 +603,79 @@ describe('tombstone ledger probe (round-1 P1)', () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
     expect(lastRun(h).tombstone_watermark).toBeInstanceOf(Date);
+  });
+});
+
+describe('a failing audit sink never strands the run (round-1 P2)', () => {
+  it('completes the backup when the START audit throws', async () => {
+    const h = harness();
+    h.ports.audit = vi.fn(async (action: string) => {
+      if (action === 'backup_run_started') throw new Error('audit_log unreachable');
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(res.outcome).toBe('completed_degraded');
+    expect(h.logs.some((l) => l.event === 'backup.start_audit_failed')).toBe(true);
+  });
+
+  it('terminalizes the row when ANY step after createRun throws', async () => {
+    const h = harness({
+      ensureBackupDir: async () => {
+        throw new Error('EACCES');
+      },
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(res.outcome).toBe('failed');
+    expect(lastRun(h).state).toBe('failed');
+  });
+
+  it('lets the NEXT run start — the strand is gone', async () => {
+    // The fake store enforces `backup_runs_single_active_uq`, so this only
+    // passes if the previous run actually reached a terminal state.
+    const h = harness();
+    let first = true;
+    h.ports.audit = vi.fn(async (action: string) => {
+      if (action === 'backup_run_started' && first) {
+        first = false;
+        throw new Error('audit_log unreachable');
+      }
+    });
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    await expect(
+      runVerifiedBackup(h.ports, resolveBackupProfile(cfg())),
+    ).resolves.toMatchObject({ outcome: 'completed_degraded' });
+  });
+
+  it('a stranded run WOULD block the next one (the fake proves the hazard is real)', async () => {
+    const h = harness();
+    // Bypass terminalization to simulate the pre-fix behaviour.
+    h.ports.store.updateRun = vi.fn(async () => undefined);
+    await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    await expect(runVerifiedBackup(h.ports, resolveBackupProfile(cfg()))).rejects.toThrow(
+      /non-terminal backup run already exists/,
+    );
+  });
+
+  it('does not throw when the TERMINAL audit fails (the run already succeeded)', async () => {
+    const h = harness();
+    h.ports.audit = vi.fn(async (action: string) => {
+      if (action !== 'backup_run_started') throw new Error('audit_log unreachable');
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
+    expect(res.outcome).toBe('completed_degraded');
+    expect(h.logs.some((l) => l.event === 'backup.outcome_audit_failed')).toBe(true);
+  });
+
+  it('escalates loudly when the terminalizing write itself fails', async () => {
+    const h = harness();
+    h.ports.store.updateRun = vi.fn(async () => {
+      throw new Error('deadlock detected');
+    });
+    await expect(runVerifiedBackup(h.ports, resolveBackupProfile(cfg()))).rejects.toThrow(
+      'deadlock detected',
+    );
+    const strand = h.logs.find((l) => l.event === 'backup.run_not_terminalized');
+    expect(strand).toBeDefined();
+    expect(String(strand!.detail.impact)).toMatch(/subsequent runs will be refused/);
   });
 });
 

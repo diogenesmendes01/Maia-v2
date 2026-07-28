@@ -238,6 +238,10 @@ export async function runVerifiedBackup(
   const correlation_id = randomUUID();
   const started = ports.now();
 
+  // From the moment this row exists it MUST reach a terminal state, or the
+  // partial unique index `backup_runs_single_active_uq` blocks every future
+  // run until a human intervenes. Everything after this line therefore lives
+  // inside the try/catch below, whose tail always calls `updateRun`.
   await ports.store.createRun({
     id: backup_id,
     correlation_id,
@@ -245,7 +249,6 @@ export async function runVerifiedBackup(
     trigger,
     state: 'running',
   });
-  await ports.audit('backup_run_started', { backup_id, correlation_id, profile: profile.name });
 
   const finalName = artifactName(started, backup_id);
   const finalPath = ports.resolvePath(finalName);
@@ -280,6 +283,25 @@ export async function runVerifiedBackup(
   const temps = new Set<string>([partialPath, encPath]);
 
   try {
+    // ROUND-1 REVIEW FINDING (P2): this audit used to sit BETWEEN `createRun`
+    // and the try block. A transient failure of the audit sink threw out of the
+    // function with the row still `running`, and the partial unique index then
+    // rejected every subsequent run — a momentary audit blip permanently
+    // stopped backups.
+    //
+    // It is now inside the try (so any throw terminalizes the row) AND
+    // individually non-fatal (so a broken audit sink degrades observability
+    // rather than stopping the backup). The terminal audit at the tail still
+    // records the run, so the trail is never silently empty.
+    await ports
+      .audit('backup_run_started', { backup_id, correlation_id, profile: profile.name })
+      .catch((err: unknown) => {
+        ports.log('backup.start_audit_failed', {
+          backup_id,
+          error: redactSecrets((err as Error).message),
+        });
+      });
+
     await ports.ensureBackupDir();
 
     // ── tombstone ledger probe (BEFORE the dump) ─────────────────────────
@@ -515,23 +537,48 @@ export async function runVerifiedBackup(
     }
   }
 
-  await ports.store.updateRun(backup_id, runPatch);
+  // THE terminalizing write. If it fails the row stays non-terminal and the
+  // next run is blocked, so the failure is escalated loudly (the operator
+  // procedure is in docs/runbooks/backup-restore.md §2) rather than swallowed.
+  try {
+    await ports.store.updateRun(backup_id, runPatch);
+  } catch (err) {
+    ports.log('backup.run_not_terminalized', {
+      backup_id,
+      correlation_id,
+      error: redactSecrets((err as Error).message),
+      // Names the consequence, because the log line is the only warning an
+      // operator gets before the NEXT run is refused.
+      impact: 'backup_runs row left non-terminal; subsequent runs will be refused',
+    });
+    throw err;
+  }
 
   const outcome = runPatch.outcome as BackupOutcome;
   const reason = runPatch.outcome_reason as string;
-  await ports.audit(outcomeAuditAction(outcome), {
-    backup_id,
-    correlation_id,
-    outcome,
-    reason,
-    // Basename only. Never the absolute path, never the object URL.
-    artifact_ref: runPatch.artifact_ref,
-    size_bytes: runPatch.size_bytes,
-    destination_kind: runPatch.destination_kind,
-    encryption_mode: profile.encryption.mode,
-    dump_duration_ms: dumpMs,
-    upload_duration_ms: uploadMs,
-  });
+  // Non-fatal for the same reason as the start audit: the run is already
+  // terminal and its evidence is already persisted in `backup_runs`. A broken
+  // audit sink must not turn a completed backup into a thrown error.
+  await ports
+    .audit(outcomeAuditAction(outcome), {
+      backup_id,
+      correlation_id,
+      outcome,
+      reason,
+      // Basename only. Never the absolute path, never the object URL.
+      artifact_ref: runPatch.artifact_ref,
+      size_bytes: runPatch.size_bytes,
+      destination_kind: runPatch.destination_kind,
+      encryption_mode: profile.encryption.mode,
+      dump_duration_ms: dumpMs,
+      upload_duration_ms: uploadMs,
+    })
+    .catch((err: unknown) => {
+      ports.log('backup.outcome_audit_failed', {
+        backup_id,
+        error: redactSecrets((err as Error).message),
+      });
+    });
 
   return {
     backup_id,
