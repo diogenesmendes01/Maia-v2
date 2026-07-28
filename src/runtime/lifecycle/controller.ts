@@ -98,6 +98,22 @@ export type ShutdownOutcome = {
   undrained: string[];
 };
 
+/**
+ * The startup was cancelled because a stop signal arrived mid-boot — issue
+ * #512 review round 1 (P1 on `src/index.ts:319`).
+ *
+ * Typed so `main().catch` can tell "we were told to stop" apart from "a
+ * mandatory dependency failed": the first is a normal rolling-deploy outcome
+ * and must NOT be audited as `system_start_failed`.
+ */
+export class StartupAbortedError extends Error {
+  readonly code = 'STARTUP_ABORTED';
+  constructor(readonly step: string) {
+    super(`startup aborted at step "${step}": shutdown requested`);
+    this.name = 'StartupAbortedError';
+  }
+}
+
 /** Timeout helper that resolves to a sentinel instead of racing an unhandled rejection. */
 async function withDeadline<T>(
   p: Promise<T>,
@@ -137,6 +153,8 @@ class LifecycleController {
   #signalCount = 0;
   #backgroundTasks = new Map<string, Set<Promise<unknown>>>();
   #gaugesRegistered = false;
+  /** The startup phase currently executing, if any. See `runStartupStep`. */
+  #startupStep: { name: string; done: Promise<unknown> } | null = null;
 
   constructor() {
     this.#resetComponents();
@@ -265,6 +283,54 @@ class LifecycleController {
     };
   }
 
+  // ─── abortable startup ──────────────────────────────────────────────────
+  //
+  // Issue #512 review round 1 (P1 on `src/index.ts:319`): a SIGTERM mid-boot
+  // triggered a CONCURRENT shutdown, but `main()` never revalidated the
+  // lifecycle after its `await`s. When the pending dependency finally
+  // answered, the boot happily went on to start HTTP, BullMQ, the crons and
+  // Baileys — AFTER the sequence had already drained and closed them. In a
+  // rolling deploy that kills a slow pod, this leaves a process that is
+  // `stopped` on paper and fully wired in reality.
+  //
+  // Two guarantees here:
+  //   - CANCELLATION: every startup phase checks the shutdown flag before it
+  //     runs, so the boot stops at the first checkpoint after the signal;
+  //   - SERIALIZATION: the shutdown waits for the phase already in flight
+  //     before running its steps, so nothing is closed while it is still
+  //     being opened.
+
+  /**
+   * Run one startup phase under the abort/serialize contract.
+   * @throws StartupAbortedError when a stop signal already arrived.
+   */
+  async runStartupStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    this.assertStartupNotAborted(name);
+    const run = fn();
+    // Swallow on the BOOKKEEPING copy only — the caller keeps its own
+    // rejection, which propagates out of the `await` below.
+    this.#startupStep = { name, done: run.catch(() => undefined) };
+    try {
+      const value = await run;
+      // A signal that landed WHILE this phase ran must stop the boot here,
+      // before the next phase opens anything else.
+      this.assertStartupNotAborted(name);
+      return value;
+    } finally {
+      this.#startupStep = null;
+    }
+  }
+
+  /** Throw if a stop signal already arrived. Cheap; call between boot phases. */
+  assertStartupNotAborted(step: string): void {
+    if (this.isShuttingDown()) throw new StartupAbortedError(step);
+  }
+
+  /** Name of the startup phase currently running (diagnostics/tests). */
+  get startupStepInFlight(): string | null {
+    return this.#startupStep?.name ?? null;
+  }
+
   // ─── background tasks ───────────────────────────────────────────────────
   //
   // Fire-and-forget promises (post-turn reflection, trace enqueue, outbox
@@ -336,6 +402,7 @@ class LifecycleController {
     this.#shutdownPromise = null;
     this.#signalCount = 0;
     this.#backgroundTasks.clear();
+    this.#startupStep = null;
     this.#role = 'all';
     this.#resetComponents();
   }
@@ -397,6 +464,23 @@ class LifecycleController {
     // Atomic FIRST move: `/readyz` must answer 503 on the very next request,
     // before any resource starts closing.
     this.transitionTo('draining', opts?.reason ?? opts?.signal ?? 'shutdown_requested');
+
+    // SERIALIZE against a boot in flight (review round 1, P1 on
+    // `src/index.ts:319`). Closing a resource while `main()` is still opening
+    // it is how a "stopped" process ends up with live sockets. `runStartupStep`
+    // aborts at its next checkpoint, so this wait is short — but it is bounded
+    // anyway so a wedged dependency cannot hold the whole drain hostage.
+    const startup = this.#startupStep;
+    if (startup) {
+      logger.info({ step: startup.name }, 'lifecycle.shutdown_waiting_for_startup_step');
+      const settled = await withDeadline(startup.done, config.SHUTDOWN_STEP_TIMEOUT_MS);
+      if (!settled.ok) {
+        logger.error(
+          { step: startup.name, timeout_ms: config.SHUTDOWN_STEP_TIMEOUT_MS },
+          'lifecycle.shutdown_startup_step_did_not_yield',
+        );
+      }
+    }
 
     const grace = config.SHUTDOWN_GRACE_MS;
     const drained: string[] = [];

@@ -35,7 +35,7 @@ import { startServer } from '@/server.js';
 import { audit } from '@/governance/audit.js';
 import { probeDb } from '@/db/client.js';
 import { startWorkers } from '@/workers/index.js';
-import { lifecycle } from '@/runtime/lifecycle/controller.js';
+import { lifecycle, StartupAbortedError } from '@/runtime/lifecycle/controller.js';
 import { checkSchemaVersion } from '@/runtime/lifecycle/schema-version.js';
 import { roleOwns } from '@/runtime/lifecycle/roles.js';
 import {
@@ -64,26 +64,41 @@ async function main() {
   installSignalHandlers();
   registerShutdownSequence();
 
+  // Every phase below runs through `lifecycle.runStartupStep`, which aborts
+  // the boot at the first checkpoint after a stop signal and serializes
+  // against the shutdown sequence (review round 1, P1 on `src/index.ts:319`).
+  // Without it, a SIGTERM mid-boot drained and closed everything while
+  // `main()` was still awaiting a slow dependency — and then the boot went on
+  // to start HTTP, BullMQ, the crons and Baileys on a `stopped` process.
+
   // ── 1. config + secrets ────────────────────────────────────────────────
-  // Spec roteamento v4 §1.4 — strict RECUSA ligar sem keyring válido: um miss
-  // em strict é estagiado CIFRADO; sem chave, seria perda de mensagem. O
-  // parse lança (fail-closed) e o boot para aqui com o erro explícito.
-  if (config.MAIA_CHANNEL_ROUTING_MODE === 'strict') {
-    const { parseKeyring } = await import('@/gateway/staging-crypto.js');
-    parseKeyring();
-    logger.info('routing.strict_keyring_validated');
-  }
-  lifecycle.setComponent('config', 'ready');
+  await lifecycle.runStartupStep('config', async () => {
+    // Spec roteamento v4 §1.4 — strict RECUSA ligar sem keyring válido: um miss
+    // em strict é estagiado CIFRADO; sem chave, seria perda de mensagem. O
+    // parse lança (fail-closed) e o boot para aqui com o erro explícito.
+    if (config.MAIA_CHANNEL_ROUTING_MODE === 'strict') {
+      const { parseKeyring } = await import('@/gateway/staging-crypto.js');
+      parseKeyring();
+      logger.info('routing.strict_keyring_validated');
+    }
+    lifecycle.setComponent('config', 'ready');
+  });
 
   // ── 2. PostgreSQL ──────────────────────────────────────────────────────
-  lifecycle.setComponent('db', 'starting');
-  if (!(await probeDb())) {
-    throw new Error('database unreachable at startup (SELECT 1 failed)');
-  }
-  lifecycle.setComponent('db', 'ready');
+  await lifecycle.runStartupStep('db', async () => {
+    lifecycle.setComponent('db', 'starting');
+    if (!(await probeDb())) {
+      throw new Error('database unreachable at startup (SELECT 1 failed)');
+    }
+    lifecycle.setComponent('db', 'ready');
+  });
 
   // ── 3. schema / migration version ──────────────────────────────────────
-  if (config.READINESS_SCHEMA_CHECK) {
+  await lifecycle.runStartupStep('schema', async () => {
+    if (!config.READINESS_SCHEMA_CHECK) {
+      lifecycle.setComponent('schema', 'ready', 'schema check disabled by config');
+      return;
+    }
     const schema = await checkSchemaVersion();
     if (schema.status !== 'ok') {
       lifecycle.setComponent('schema', 'failed', schema.detail);
@@ -92,40 +107,42 @@ async function main() {
       );
     }
     lifecycle.setComponent('schema', 'ready', `applied ${schema.applied}`);
-  } else {
-    lifecycle.setComponent('schema', 'ready', 'schema check disabled by config');
-  }
+  });
 
   // ── 4. Redis (MANDATORY — fail-closed) ─────────────────────────────────
-  lifecycle.setComponent('redis', 'starting');
-  await ensureRedisConnect();
-  lifecycle.setComponent('redis', 'ready');
+  await lifecycle.runStartupStep('redis', async () => {
+    lifecycle.setComponent('redis', 'starting');
+    await ensureRedisConnect();
+    lifecycle.setComponent('redis', 'ready');
+  });
 
   // ── 5. best-effort boot chores (never gate readiness) ──────────────────
-  // B3b: clean up any orphan PDF reports from a prior crash. Best-effort.
-  const { sweepPdfTmp } = await import('@/lib/pdf/_sweeper.js');
-  await sweepPdfTmp().catch((err) => logger.warn({ err }, 'pdf.sweeper.boot_failed'));
+  await lifecycle.runStartupStep('boot_chores', async () => {
+    // B3b: clean up any orphan PDF reports from a prior crash. Best-effort.
+    const { sweepPdfTmp } = await import('@/lib/pdf/_sweeper.js');
+    await sweepPdfTmp().catch((err) => logger.warn({ err }, 'pdf.sweeper.boot_failed'));
 
-  // SETUP: ensure bootstrap token exists (cold-start / first deploy).
-  // Token NOT logged in plaintext — operator must SSH and read the file.
-  const { ensureToken } = await import('@/setup/token.js');
-  const { hasValidBaileysSession } = await import('@/setup/state.js');
-  await ensureToken();
-  if (!(await hasValidBaileysSession(config.BAILEYS_AUTH_DIR))) {
-    logger.warn(
-      { setup_token_path: '<BAILEYS_AUTH_DIR>/setup-token.txt' },
-      'setup.bootstrap_token_ready — run `cat $BAILEYS_AUTH_DIR/setup-token.txt` and visit /setup',
+    // SETUP: ensure bootstrap token exists (cold-start / first deploy).
+    // Token NOT logged in plaintext — operator must SSH and read the file.
+    const { ensureToken } = await import('@/setup/token.js');
+    const { hasValidBaileysSession } = await import('@/setup/state.js');
+    await ensureToken();
+    if (!(await hasValidBaileysSession(config.BAILEYS_AUTH_DIR))) {
+      logger.warn(
+        { setup_token_path: '<BAILEYS_AUTH_DIR>/setup-token.txt' },
+        'setup.bootstrap_token_ready — run `cat $BAILEYS_AUTH_DIR/setup-token.txt` and visit /setup',
+      );
+    }
+
+    // P8e: cross-instance policy cache invalidation. Subscriber is idempotent.
+    // Codex review #93: previously this was defined but never called,
+    // leaving stale positive/negative cache entries until natural TTL.
+    const { startPolicyCacheInvalidationSubscriber } = await import(
+      '@/control-plane/policy/index.js'
     );
-  }
-
-  // P8e: cross-instance policy cache invalidation. Subscriber is idempotent.
-  // Codex review #93: previously this was defined but never called,
-  // leaving stale positive/negative cache entries until natural TTL.
-  const { startPolicyCacheInvalidationSubscriber } = await import(
-    '@/control-plane/policy/index.js'
-  );
-  startPolicyCacheInvalidationSubscriber();
-  logger.info('policy_resolver.cache_invalidation_subscriber_started');
+    startPolicyCacheInvalidationSubscriber();
+    logger.info('policy_resolver.cache_invalidation_subscriber_started');
+  });
 
   // Issue #511: cross-replica invalidation for the turn-context cache
   // (identity / capabilities / gaps). Idempotent, and a no-op while
@@ -140,52 +157,72 @@ async function main() {
   }
 
   // ── 6. HTTP (probes answer 503 while `starting`) ───────────────────────
-  if (roleOwns(role, 'http')) {
-    lifecycle.setComponent('http', 'starting');
-    setHttpApp(await startServer());
-    lifecycle.setComponent('http', 'ready');
-  }
-  // The Redis memory collector is started by `buildServer()`; its readings are
-  // what the `redis_memory` gate reads at probe time.
-  lifecycle.setComponent('redis_memory', 'ready');
+  await lifecycle.runStartupStep('http', async () => {
+    if (roleOwns(role, 'http')) {
+      lifecycle.setComponent('http', 'starting');
+      setHttpApp(await startServer());
+      lifecycle.setComponent('http', 'ready');
+    }
+    // The Redis memory collector is started by `buildServer()`; its readings are
+    // what the `redis_memory` gate reads at probe time.
+    lifecycle.setComponent('redis_memory', 'ready');
 
-  // Sonda sintética (spec §1.3 / review P1-C) — carrega o sink ANTES do worker
-  // de agente: a impossibilidade de envio físico a um canal is_synthetic vale
-  // independente da flag (cobre um job antigo na fila mesmo no kill-switch). Com
-  // a flag on, valida fail-fast o triplete configurado (boot FALHA se não for
-  // exclusivamente sintético). No-op de validação com a flag off.
-  const { initSyntheticProbe } = await import('@/probe/boot-validate.js');
-  await initSyntheticProbe();
+    // Sonda sintética (spec §1.3 / review P1-C) — carrega o sink ANTES do worker
+    // de agente: a impossibilidade de envio físico a um canal is_synthetic vale
+    // independente da flag (cobre um job antigo na fila mesmo no kill-switch). Com
+    // a flag on, valida fail-fast o triplete configurado (boot FALHA se não for
+    // exclusivamente sintético). No-op de validação com a flag off.
+    const { initSyntheticProbe } = await import('@/probe/boot-validate.js');
+    await initSyntheticProbe();
+  });
 
   // ── 7. queues + BullMQ workers ─────────────────────────────────────────
-  if (roleOwns(role, 'queue')) {
+  await lifecycle.runStartupStep('queues', async () => {
+    if (!roleOwns(role, 'queue')) return;
+    lifecycle.setComponent('queue', 'starting');
+    const ownsWorker = roleOwns(role, 'agent_worker');
+    if (ownsWorker) {
+      lifecycle.setComponent('agent_worker', 'starting');
+      startAgentWorker(async (job) => {
+        await runAgentForMensagem(job.data.mensagem_id);
+      });
+      // Spec roteamento v4 §1.4 — worker de replay do staging (job só carrega o
+      // id; o payload cifrado vive no Postgres). Ativo em qualquer modo: rows só
+      // existem se o strict as criou, e o replay precisa sobreviver a um
+      // downgrade de modo (as pendentes ainda merecem entrega).
+      const { startUnroutedReplayWorker } = await import('@/gateway/queue.js');
+      const { processUnroutedReplay } = await import('@/gateway/unrouted-staging.js');
+      startUnroutedReplayWorker(async (job) => {
+        await processUnroutedReplay(job.data.unrouted_id);
+      });
+    }
+    // Constructing a Queue/Worker does NOT mean it can consume — the BullMQ
+    // connection is lazy. Wait for a live connection before claiming ready, or
+    // `/readyz` answers 200 on evidence that is merely "the object exists"
+    // (review round 1, P1 on `src/index.ts:170`). With
+    // `READINESS_BACKLOG_MAX=0` (the default) this flag is the ONLY thing
+    // readiness knows about the queue, so it has to be true.
+    const { awaitQueueReady } = await import('@/gateway/queue.js');
+    await awaitQueueReady({ includeWorkers: ownsWorker });
     lifecycle.setComponent('queue', 'ready');
-  }
-  if (roleOwns(role, 'agent_worker')) {
-    lifecycle.setComponent('agent_worker', 'starting');
-    startAgentWorker(async (job) => {
-      await runAgentForMensagem(job.data.mensagem_id);
-    });
-    // Spec roteamento v4 §1.4 — worker de replay do staging (job só carrega o
-    // id; o payload cifrado vive no Postgres). Ativo em qualquer modo: rows só
-    // existem se o strict as criou, e o replay precisa sobreviver a um
-    // downgrade de modo (as pendentes ainda merecem entrega).
-    const { startUnroutedReplayWorker } = await import('@/gateway/queue.js');
-    const { processUnroutedReplay } = await import('@/gateway/unrouted-staging.js');
-    startUnroutedReplayWorker(async (job) => {
-      await processUnroutedReplay(job.data.unrouted_id);
-    });
-    lifecycle.setComponent('agent_worker', 'ready');
-  }
+    if (ownsWorker) lifecycle.setComponent('agent_worker', 'ready');
+  });
 
   // ── 8. cron scheduler ──────────────────────────────────────────────────
-  if (roleOwns(role, 'cron_scheduler')) {
+  await lifecycle.runStartupStep('cron_scheduler', async () => {
+    if (!roleOwns(role, 'cron_scheduler')) return;
     startWorkers(1);
     lifecycle.setComponent('cron_scheduler', 'ready');
-  }
+  });
 
   // ── 9. WhatsApp sessions ───────────────────────────────────────────────
-  if (roleOwns(role, 'whatsapp_session')) {
+  await lifecycle.runStartupStep('whatsapp_session', async () => {
+    if (!roleOwns(role, 'whatsapp_session')) return;
+    // NOTE: the component reaches `ready` from the Baileys `connection.update
+    // = open` handler, NOT here. `startBaileys()` returns as soon as the
+    // socket is armed — long before it is usable — so marking it ready here
+    // made a never-paired cold start indistinguishable from a mere reconnect
+    // (review round 1, P1 on `src/index.ts:189`).
     lifecycle.setComponent('whatsapp_session', 'starting');
     await startBaileys();
     // Fase 3 do roteamento multi-linha: sobe as sessões das linhas adicionais
@@ -194,12 +231,12 @@ async function main() {
     await startAdditionalLineSessions().catch((err) =>
       logger.error({ err: (err as Error).message }, 'line_sessions.boot_failed'),
     );
-    lifecycle.setComponent('whatsapp_session', 'ready');
-  }
+  });
 
   // ── 10. ready ──────────────────────────────────────────────────────────
   // `system_started` lands HERE — after every mandatory dependency for this
   // role was verified, not before (issue #512).
+  lifecycle.assertStartupNotAborted('ready');
   lifecycle.transitionTo('ready', 'startup_complete');
   await audit({
     acao: 'system_started',
@@ -213,6 +250,15 @@ async function main() {
 }
 
 main().catch(async (err) => {
+  // A stop signal mid-boot is NOT a failure — it is a rolling deploy killing a
+  // slow pod. The shutdown is already running (that is what aborted us); just
+  // wait for it and exit cleanly, without an `system_start_failed` row that
+  // would make every deploy look like an incident.
+  if (err instanceof StartupAbortedError) {
+    logger.warn({ step: err.step }, 'maia.startup_aborted_by_shutdown');
+    await lifecycle.shutdown({ reason: 'startup_aborted' }).catch(() => undefined);
+    return;
+  }
   logger.error({ err }, 'maia.fatal');
   lifecycle.transitionTo('failed', (err as Error)?.message ?? 'startup_failed');
   // Fail-closed with cleanup: whatever was already opened still gets closed,
