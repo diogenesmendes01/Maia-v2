@@ -275,6 +275,37 @@ describe('executeLLM — retry e classificação de erro', () => {
     expect(anthropicCreateMock).toHaveBeenCalledTimes(2);
   });
 
+  /**
+   * O caso do achado: primário esgota com erro retentável, fallback devolve um
+   * terminal. Lançar o erro do primário devolvia ao caller um 5xx retentável
+   * quando a causa real era um 401 — mascarando o incidente e induzindo retry
+   * externo contra uma chave inválida.
+   */
+  it('503 no primário + 401 no fallback: o caller recebe o terminal do fallback', async () => {
+    anthropicCreateMock
+      .mockRejectedValueOnce(apiError(503))
+      .mockRejectedValueOnce(apiError(503))
+      .mockRejectedValueOnce(apiError(401, 'invalid api key'));
+
+    const err = await executeLLM(req()).catch((e) => e);
+
+    expect(err.kind).toBe('authentication');
+    expect(err.retryable).toBe(false);
+    expect(err.status).toBe(401);
+    // Duas tentativas no primário + uma no fallback.
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(3);
+  }, 20000);
+
+  it('resposta 200 sem conteúdo utilizável é response_invalid, não sucesso', async () => {
+    // A Anthropic devolvendo 200 sem `content` — payload do qual não dá para
+    // extrair nada. Antes virava `content: null` com `status='ok'`.
+    anthropicCreateMock.mockResolvedValue({ stop_reason: 'end_turn', usage: {} });
+    const err = await executeLLM(req({ workload: 'role_selector' })).catch((e) => e);
+    expect(err.kind).toBe('response_invalid');
+    expect(err.retryable).toBe(false);
+    expect(counterCalls('maia_llm_requests_total')[0]?.status).toBe('error');
+  });
+
   it('parseRetryAfterMs aceita segundos e HTTP-date, e descarta lixo', () => {
     expect(parseRetryAfterMs('2')).toBe(2000);
     const now = Date.parse('2026-01-01T00:00:00Z');

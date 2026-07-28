@@ -72,9 +72,22 @@ export class AnthropicProvider implements LLMProvider {
       requestOptions,
     );
 
+    // Uma resposta 200 com corpo inesperado não é sucesso. Sem esta guarda o
+    // gateway registrava `status='ok'` para um payload do qual não deu para
+    // extrair nada, e o caller recebia `content: null` como se o modelo
+    // tivesse respondido vazio — falha de provider disfarçada de resposta.
+    if (!Array.isArray(res?.content)) {
+      throw new LLMGatewayError({
+        kind: 'response_invalid',
+        detail: 'anthropic response has no content array',
+        provider: this.name,
+        model: params.model,
+      });
+    }
+
     const tool_uses: LLMResponse['tool_uses'] = [];
     let textOut: string | null = null;
-    for (const block of res.content ?? []) {
+    for (const block of res.content) {
       if (block.type === 'text') textOut = (textOut ?? '') + block.text;
       else if (block.type === 'tool_use')
         tool_uses.push({ id: block.id, tool: block.name, args: block.input });

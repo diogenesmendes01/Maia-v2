@@ -182,7 +182,29 @@ export class OpenRouterProvider implements LLMProvider {
       },
       requestOptions,
     );
+    // Um 200 com `choices: []` (OpenRouter devolve isso quando o modelo
+    // upstream falha) virava `content: null` + `stop_reason: 'error'` e o
+    // gateway registrava `status='ok'`. A taxonomia tinha `response_invalid`
+    // desde o começo e nunca era usada — este é o ponto onde ela vale.
+    const choice = res?.choices?.[0];
+    if (!choice || !choice.message) {
+      throw new LLMGatewayError({
+        kind: 'response_invalid',
+        detail: 'openrouter response has no usable choice',
+        provider: this.name,
+        model: params.model,
+      });
+    }
+
     const out = fromOpenAIResponse(res);
+    if (out.stop_reason === 'error') {
+      throw new LLMGatewayError({
+        kind: 'response_invalid',
+        detail: 'openrouter response has an unmapped finish_reason',
+        provider: this.name,
+        model: params.model,
+      });
+    }
     // O slug efetivo é o que pedimos: a OpenRouter às vezes ecoa uma variante
     // roteada e a métrica precisa bater com o modelo que o backend escolheu.
     return { ...out, model: out.model || params.model };
