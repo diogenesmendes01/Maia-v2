@@ -499,7 +499,17 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       if (err.kind === 'aborted' || ctx.signal?.aborted) {
         throw isAbortError(rawErr) ? rawErr : err;
       }
-      throw lastError ?? err;
+      // O erro do FALLBACK é o que o caller precisa ver.
+      //
+      // Antes, este ramo lançava `lastError ?? err` — ou seja, o 5xx do
+      // primário. Um fallback que devolve 401/403/400 é TERMINAL, mas o caller
+      // recebia um erro retentável e podia insistir numa chave inválida ou num
+      // payload malformado, gerando o retry externo que a camada única de
+      // retry existe para evitar. Além de esconder a causa real do incidente.
+      //
+      // Quando o fallback também falha de forma transitória, o kind coincide e
+      // a escolha é indiferente; quando diverge, o terminal manda.
+      throw err;
     }
   } finally {
     link.dispose();
