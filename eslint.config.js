@@ -286,17 +286,19 @@ export default [
       // the shared loader is tracked as the Admin rollout step of #515.
       'src/admin-ui/**',
       // Pending migration (inventoried in docs/configuration.md).
+      //
+      // Issue #508 encolheu esta lista: os cinco call sites de LLM que liam
+      // `process.env.ANTHROPIC_API_KEY` direto (calendar-pattern-detector,
+      // capability-proposer, drift/**, role-selector/llm-suggester,
+      // shared/risk/llm-gate) foram migrados para o LLM Gateway, que consome a
+      // chave pelo `config` tipado. A leitura direta sumiu junto — não é
+      // isenção retirada "no grito", é código que deixou de existir.
       'src/agent/prompt-builder.ts',
-      'src/cognition/calendar-pattern-detector.ts',
-      'src/cognition/capability-proposer.ts',
-      'src/cognition/drift/**',
-      'src/cognition/role-selector/llm-suggester.ts',
       'src/db/tenant-context.ts',
       'src/lib/mcp-client.ts',
       'src/runtime/context-packet/test-fixtures.ts',
       'src/runtime/feature-flags/context-packet-flag.ts',
       'src/setup/index.ts',
-      'src/shared/risk/llm-gate.ts',
       'src/workers/procedure-execution-reaper.ts',
     ],
     rules: {

@@ -55,6 +55,11 @@ vi.mock('../../../src/agent/turn-context/cache.js', () => ({
     async () => void calls.push('turn_context_subscriber'),
   ),
 }));
+vi.mock('../../../src/lib/llm/cache-invalidation.js', () => ({
+  stopLLMSettingsInvalidationSubscriber: vi.fn(
+    async () => void calls.push('llm_settings_subscriber'),
+  ),
+}));
 vi.mock('../../../src/governance/audit.js', () => ({
   audit: vi.fn(async () => void calls.push('audit_stop')),
 }));
@@ -100,6 +105,7 @@ describe('shutdown sequence order', () => {
       'bullmq_close',
       'drain_cron',
       'turn_context_subscriber',
+      'llm_settings_subscriber',
       'line_sessions',
       'baileys',
       'audit_stop',
@@ -118,6 +124,22 @@ describe('shutdown sequence order', () => {
     await lifecycle.shutdown({ signal: 'SIGTERM' });
 
     const subIdx = calls.indexOf('turn_context_subscriber');
+    expect(subIdx).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf('drain_cron')).toBeLessThan(subIdx);
+    expect(calls.indexOf('bullmq_close')).toBeLessThan(subIdx);
+    expect(subIdx).toBeLessThan(calls.indexOf('pools'));
+  });
+
+  it('closes the LLM settings subscriber AFTER every caller of the gateway (#508)', async () => {
+    // Mesma forma e mesma razão do subscriber da #511: ioredis PRÓPRIA, que o
+    // `pools` não alcança. Um socket desses deixado aberto mantém o event loop
+    // vivo depois de um drain limpo e faz todo deploy reportar shutdown
+    // forçado. Fecha só depois que turnos, crons e tarefas de fundo — que são
+    // quem chama o LLM — já drenaram.
+    registerShutdownSequence();
+    await lifecycle.shutdown({ signal: 'SIGTERM' });
+
+    const subIdx = calls.indexOf('llm_settings_subscriber');
     expect(subIdx).toBeGreaterThanOrEqual(0);
     expect(calls.indexOf('drain_cron')).toBeLessThan(subIdx);
     expect(calls.indexOf('bullmq_close')).toBeLessThan(subIdx);

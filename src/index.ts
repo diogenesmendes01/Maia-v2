@@ -164,6 +164,24 @@ async function main() {
     if (config.FEATURE_TURN_CONTEXT_CACHE) {
       logger.info('turn_context.cache_invalidation_subscriber_started');
     }
+
+    // Issue #508: mesma ideia para o cache de settings de modelo do LLM
+    // Gateway. Sem isto, trocar o modelo pelo Admin só valia na réplica que
+    // atendeu o request; as demais serviam o modelo antigo até o TTL curto
+    // expirar — justamente durante o incidente que motivou a troca.
+    //
+    // Vive em `boot_chores`, ao lado dos seus dois gêmeos (policy cache e
+    // turn-context cache), e NÃO sob `roleOwns`: qualquer role que chame o LLM
+    // precisa enxergar a troca de modelo, e crons/probe/playground chamam sem
+    // ser `agent_worker`. Ele abre conexão ioredis PRÓPRIA (ioredis proíbe
+    // outros comandos num cliente inscrito), então é fechado explicitamente no
+    // passo `llm_settings_subscriber` da sequência de drain — foi exatamente
+    // um socket assim, deixado aberto, que fazia todo deploy limpo reportar
+    // shutdown forçado na #512.
+    const { startLLMSettingsInvalidationSubscriber } = await import(
+      '@/lib/llm/cache-invalidation.js'
+    );
+    startLLMSettingsInvalidationSubscriber();
   });
 
   // ── 6. HTTP (probes answer 503 while `starting`) ───────────────────────

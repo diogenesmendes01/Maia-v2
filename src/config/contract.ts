@@ -388,6 +388,19 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  LLM_DAILY_BUDGET_USD: {
+    name: 'LLM_DAILY_BUDGET_USD',
+    description:
+      'Teto de gasto diário de LLM por tenant+agent, em USD. Imposto no LLM Gateway ANTES de qualquer requisição ao provider (issue #508); estouro rejeita a chamada com erro não retentável. 0 desliga a quota.',
+    group: 'llm',
+    secret: false,
+    services: ['runtime'],
+    schema: z.coerce.number().nonnegative().default(0),
+    example: '0',
+    fixture: '0',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   DECISION_ENGINE_BUDGET_MS: {
     name: 'DECISION_ENGINE_BUDGET_MS',
     description:

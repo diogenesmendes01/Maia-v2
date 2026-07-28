@@ -303,6 +303,7 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 
 > Adicionar `maia_llm_circuit_state` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessa, abre uma PR.
 
+<<<<<<< HEAD
 ### 8.1 Probes — qual endpoint usar onde (issue #512)
 
 Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
@@ -405,6 +406,47 @@ Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
 | `maia_worker_last_success_timestamp{worker}` | gauge | idade > 3× a cadência do cron |
 | `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
 | `maia_worker_tick_skipped_total{worker,reason}` | counter | crescimento (execução anterior não termina no intervalo) |
+=======
+### 8.1 LLM Gateway (issue #508)
+
+Todas as chamadas de chat/classificação/visão passam por `src/lib/llm/`. A
+partir da #508 o gateway emite em **todo** desfecho — sucesso, erro, timeout,
+rate limit e cancelamento (antes só o caminho de sucesso era contado, e chamadas
+diretas ao SDK não eram contadas de forma alguma):
+
+| Métrica | Tipo | Alerta se |
+|---|---|---|
+| `maia_llm_requests_total{tenant_id,agent_id,provider,model,tier,workload,status}` | counter | `status!="ok"` subindo |
+| `maia_llm_request_duration_ms{provider,model,tier,workload,status}` | histogram | p95 fora do baseline do workload |
+| `maia_llm_attempts_total{provider,model,workload,outcome}` | counter | razão attempts/requests > ~1.2 = retry storm |
+| `maia_llm_fallback_total{from_model,to_model,workload,reason}` | counter | qualquer taxa sustentada = degradação de qualidade silenciosa |
+| `maia_llm_timeouts_total{provider,model,workload}` | counter | rate alto |
+| `maia_llm_cancelled_total{provider,model,workload}` | counter | rate alto sem deploy = turnos sendo abortados |
+| `maia_llm_settings_cache_total{result}` | counter | `result="error"` sustentado = servindo modelo de env, não o do Admin |
+| `maia_llm_scope_missing_total{workload}` | counter | > 0 = chamada sem tenant/agent no ALS (custo não atribuível) |
+| `maia_llm_cost_ledger_failures_total` | counter | > 0 = custo sendo perdido |
+| `maia_llm_budget_exhausted_total{tenant_id,agent_id,workload}` | counter | quota diária estourada |
+| `maia_llm_budget_check_failures_total{workload}` | counter | > 0 = quota degradou ABERTO (não está protegendo) |
+
+`trace_id`, `pessoa_id`, conversa e mensagem **não** são labels (cardinalidade);
+aparecem só no log estruturado `llm_gateway.call`.
+
+**Trocar de modelo durante um incidente:** `/dashboard/llm-settings`. A escrita
+publica no canal `maia:llm:settings:invalidate` e todas as réplicas soltam o
+cache na hora; se o Redis estiver fora, cada réplica converge sozinha pelo TTL
+curto do cache (segundos). Confirme pelo log `llm_gateway.settings_cache_invalidated`.
+
+**Fixar provider:** `LLM_PROVIDER` (`anthropic` | `openrouter`) + a chave
+correspondente. A partir da #508 o provider é resolvido por chamada, não no
+carregamento do módulo, e módulos de cognição não exigem mais
+`ANTHROPIC_API_KEY` quando o provider é OpenRouter.
+
+**Cortar gasto:** `LLM_DAILY_BUDGET_USD` (por tenant+agent, USD/dia). `0`
+desliga. Estouro rejeita a chamada ANTES de qualquer requisição ao provider,
+com erro não retentável.
+
+> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+>>>>>>> fc7afccd (refactor(llm): governança do gateway — orçamento, invalidação e runbook (#508))
 
 ---
 

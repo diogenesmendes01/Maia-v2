@@ -22,6 +22,7 @@
  * propõe").
  */
 import { config } from '@/config/env.js';
+import { assertWithinBudget, invalidateSpendCache } from './budget.js';
 import { LLMGatewayError, classifyProviderError, isAbortError } from './errors.js';
 import { resolveModelPair } from './model-resolver.js';
 import { getProvider } from './providers/index.js';
@@ -160,7 +161,34 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (3) Uma leitura de settings resolve primário E fallback.
+  // (3) Orçamento por tenant+agent ANTES de qualquer I/O de provider — o ponto
+  // de uma quota é não gastar. Rejeita com `budget_exhausted` (não retentável).
+  try {
+    await assertWithinBudget({ scope, workload: req.workload });
+  } catch (budgetErr) {
+    const err =
+      budgetErr instanceof LLMGatewayError
+        ? budgetErr
+        : new LLMGatewayError({ kind: 'budget_exhausted', detail: budgetErr });
+    await emitUsage(
+      {
+        workload: req.workload,
+        tier,
+        provider: provider.name,
+        model: 'unresolved',
+        status: 'budget_exhausted',
+        attempts: 0,
+        duration_ms: Date.now() - startedAt,
+        error_kind: 'budget_exhausted',
+        pessoa_id: req.pessoa_id,
+        trace_id: ctx.trace_id,
+      },
+      scope,
+    );
+    throw err;
+  }
+
+  // (4) Uma leitura de settings resolve primário E fallback.
   const { primary, fast } = await resolveModelPair(tier);
 
   const link = linkSignal(ctx.signal, ctx.deadline_at);
@@ -206,6 +234,10 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       },
       scope,
     );
+    // O gasto que acabou de acontecer torna o número cacheado do orçamento
+    // obsoleto; soltar aqui é o que impede a quota de ficar sempre um passo
+    // atrás durante uma rajada.
+    if (scope) invalidateSpendCache(scope);
     return res;
   };
 
