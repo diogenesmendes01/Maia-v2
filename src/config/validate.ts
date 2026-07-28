@@ -29,8 +29,9 @@ import {
   type MaiaService,
   type Tombstone,
   describeRequiredWhen,
+  isMaiaNamespacedKey,
 } from '@/config/metadata.js';
-import { isStrictProfile, resolveProfile } from '@/config/profiles.js';
+import { resolveProfile } from '@/config/profiles.js';
 import { evaluateCrossFieldRules } from '@/config/rules.js';
 import { scrubSecrets } from '@/config/redact.js';
 
@@ -106,7 +107,6 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
 
   const resolved = resolveProfile(env);
   const profile = input.profile ?? resolved.profile;
-  const strict = isStrictProfile(profile);
 
   const problems: ConfigProblem[] = [];
   // Profile-resolution findings only apply when the caller did not force a
@@ -204,32 +204,52 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
   );
 
   // ---- tombstones --------------------------------------------------------
+  // ERROR in EVERY profile, development included (owner decision on PR #522
+  // review round 1). A removed variable sitting in the environment is never
+  // harmless: it tells the operator a code path is gated when the gate was
+  // deleted. The whole point of a tombstone is that the removal is not silent.
   for (const t of tombstones) {
     const raw = env[t.name];
     const set = t.failsOn === 'truthy' ? isTruthyFlag(raw) : nonEmpty(raw);
     if (!set || alreadyFlagged.has(t.name)) continue;
     problems.push({
-      severity: strict ? 'error' : 'warning',
+      severity: 'error',
       variable: t.name,
       rule: 'contract/removed',
       message: `${t.name} foi REMOVIDA (${t.removedIn}) e não tem mais efeito. ${t.reason}`,
       remediation: t.replacement
-        ? `Remova ${t.name} do ambiente; o gate real é ${t.replacement}.`
-        : `Remova ${t.name} do ambiente.`,
+        ? `Remova ${t.name} do ambiente. O gate real hoje é ${t.replacement} — migre o valor para lá se ainda quiser o comportamento.`
+        : `Remova ${t.name} do ambiente. Não há substituta: o caminho que ela controlava foi deletado.`,
     });
   }
 
   // ---- unknown Maia-namespaced keys --------------------------------------
+  // Also ERROR in every profile. An unknown `MAIA_*` / `FEATURE_*` key is
+  // either a typo — so the setting the operator believes is active is not — or
+  // a variable someone added without declaring it. Both are configuration the
+  // system cannot honour.
+  // With a test-supplied contract override, "known" means known TO THAT
+  // override — otherwise every variable the fake contract declares would read
+  // as unknown. Without an override we ask the real contract, because the
+  // service subset (`entries`) is narrower than what the process may legitimately
+  // carry (a runtime boot still sees the Admin UI's variables).
+  const overrideNames = input.entries ? new Set(input.entries.map((s) => s.name)) : null;
+  const tombstoneNames = new Set(tombstones.map((t) => t.name));
+  const isUnknown = overrideNames
+    ? (key: string) =>
+        isMaiaNamespacedKey(key) && !overrideNames.has(key) && !tombstoneNames.has(key)
+    : isUnknownMaiaKey;
+
   for (const key of Object.keys(env).sort()) {
-    if (!nonEmpty(env[key]) || !isUnknownMaiaKey(key)) continue;
+    if (!nonEmpty(env[key]) || !isUnknown(key)) continue;
     problems.push({
-      severity: strict ? 'error' : 'warning',
+      severity: 'error',
       variable: key,
       rule: 'contract/unknown',
       message: `${key} está em um namespace da Maia mas não existe no contrato (versão ${CONTRACT_VERSION}).`,
       remediation:
-        `Se a variável é real, declare-a em src/config/contract.ts e regenere os artefatos ` +
-        `(npm run config:generate). Se não, remova-a do ambiente.`,
+        `Confira se não é erro de digitação. Se a variável é real, declare-a em ` +
+        `src/config/contract.ts e rode \`npm run config:generate\`. Se não, remova-a do ambiente.`,
     });
   }
 

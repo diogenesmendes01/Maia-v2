@@ -125,6 +125,25 @@
         "info"
       ]
     },
+    "MAIA_CONFIG_STRICT_BOOT": {
+      "type": "string",
+      "description": "Validação de contrato no boot (fail-closed em TODOS os profiles). `false` é o ROLLBACK DE EMERGÊNCIA: volta ao loader anterior (schema + regras de boot) e desliga a detecção de variável desconhecida, tombstone e contradição de profile. Use só para destravar um ambiente, e abra issue — ver docs/runbooks/config-contract.md.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
     "MAIA_REJECT_DEFAULT_LITERAL": {
       "type": "string",
       "description": "Fail-closed do literal 'default' em tenant_id/agent_id (issue #323). Default ON; `false` é o rollback de emergência sem redeploy.",

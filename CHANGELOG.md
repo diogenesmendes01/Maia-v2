@@ -4,6 +4,34 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — o boot passa a falhar fechado por configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
+
+> **Um ambiente que sobe hoje pode parar de subir no primeiro release que contiver esta mudança.** Rode `npm run config:check -- --profile production --env-file .env` contra o `.env` de cada ambiente **antes** de deployar. Runbook completo: [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md).
+
+O boot agora valida o contrato inteiro e **aborta em TODOS os profiles — `development` incluído**. Antes, só as regras legadas de boot eram aplicadas e o resto ficava no `maia config check`.
+
+Passam a abortar o boot:
+
+| Situação | Regra | Antes |
+|---|---|---|
+| `FEATURE_MULTI_CHANNEL`, `FEATURE_COGNITIVE_GRAPH` ou `APROVAR_MENSAGENS_PROATIVAS` no ambiente | `contract/removed` | ignorado em silêncio |
+| Qualquer `MAIA_*` / `FEATURE_*` / `BACKUP_*` … fora do contrato | `contract/unknown` | ignorado em silêncio |
+| `MAIA_ENV` ausente em staging/produção | `profile/required` | não existia |
+| `MAIA_ENV` contradizendo `NODE_ENV` | `profile/node-env-contradiction` | não existia |
+| Placeholder (`__SET_ME__`, `sk-ant-...`) em staging/produção | `secret/placeholder` | não existia |
+| Valor de fixture sintética de CI em staging/produção | `secret/synthetic-fixture` | não existia |
+| Dependência condicional não satisfeita (ex.: `FEATURE_OUTBOUND_VOICE=true` sem `OPENAI_API_KEY`) | `contract/required-when` | não existia |
+
+**Ações necessárias antes de deployar:**
+
+1. **Adicione `MAIA_ENV=production`** (ou `staging`) — `NODE_ENV` nem consegue expressar `staging`.
+2. **Remova as variáveis removidas** do `.env` de cada ambiente. O gate real de mensagens proativas é `FEATURE_PROACTIVE_MESSAGES`.
+3. **Substitua qualquer `__SET_ME__` remanescente.**
+
+**Rollback de emergência, env-only e sem redeploy:** `MAIA_CONFIG_STRICT_BOOT=false` volta ao loader anterior (schema Zod + regras de boot legadas, com as mensagens históricas preservadas) e desliga a validação de contrato inteira. O boot degradado loga um aviso alto a cada start; é alavanca para destravar um ambiente, não estado estável. Os loaders programáticos (`loadMigrationConfig`, `loadAdminConfig`, `loadBackupConfig`) têm a equivalente `validate: false`. Procedimento em [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md) §4.
+
+Namespaces de terceiros (`CLAUDE_*`, `ANTHROPIC_*`, `POSTGRES_*`, `REDIS_*`, `SMTP_*`, `NEXTAUTH_*`, `OPENAI_*`) **nunca** são recusados como desconhecidos — são populados por ferramentas e plataformas de hosting. As variáveis que a Maia possui nesses namespaces estão no contrato pelo nome.
+
 ### Added — Contrato único de configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
 
 **Impacto para operadores.** A configuração da Maia passa a ter uma fonte única de verdade tipada e **sem efeitos colaterais no import**: `src/config/contract.ts`. `.env.example`, `docs/configuration.md`, o JSON Schema, o manifest de variáveis por serviço e as fixtures por profile são **gerados** — não edite `.env.example` à mão; rode `npm run config:generate`. O CI falha se os artefatos estiverem desatualizados.

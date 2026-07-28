@@ -61,6 +61,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | What | Where |
 |---|---|
 | Configuração (contrato de env vars, profiles, comandos) | [`docs/configuration.md`](docs/configuration.md) — **gerado** por `npm run config:generate` |
+| Boot falhando por config, e o rollback | [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md) |
 | Operational runbooks (debug + rollback) | [`docs/runbooks/`](docs/runbooks/) |
 | Per-feature design specs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Implementation plans | [`docs/superpowers/plans/`](docs/superpowers/plans/) |

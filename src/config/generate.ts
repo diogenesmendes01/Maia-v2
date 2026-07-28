@@ -322,8 +322,9 @@ function renderEnvFile(options: EnvRenderOptions): string {
     lines.push(
       ...commentBlock(
         'As variáveis abaixo não existem mais. Mantê-las no ambiente é recusado pela validação ' +
-          '(erro em staging/produção, aviso em development) para que nenhum operador acredite ' +
-          'estar controlando um caminho que já foi deletado.',
+          '(ERRO DE BOOT em todos os profiles, development incluído) para que nenhum operador ' +
+          'acredite estar controlando um caminho que já foi deletado. Rollback de emergência: ' +
+          'MAIA_CONFIG_STRICT_BOOT=false — ver docs/runbooks/config-contract.md.',
       ),
     );
     for (const t of TOMBSTONES) {
@@ -402,9 +403,25 @@ export function renderConfigDoc(): string {
   out.push('');
   out.push('| Profile | Postura |');
   out.push('|---|---|');
-  out.push('| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida. Variáveis desconhecidas/removidas geram **aviso**. |');
-  out.push('| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. Desconhecidas/removidas são **erro**. |');
-  out.push('| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. Desconhecidas/removidas são **erro**. |');
+  out.push('| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida, placeholders tolerados. |');
+  out.push('| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. |');
+  out.push('| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. |');
+  out.push('');
+  out.push(
+    '**O boot falha fechado em TODOS os profiles.** Variável desconhecida, variável removida ' +
+      '(tombstone) e contradição `NODE_ENV` × `MAIA_ENV` abortam o boot em `development` ' +
+      'exatamente como em produção: um `.env` que sobe no laptop e morre em staging é o drift ' +
+      'que este contrato existe para eliminar. O que muda por profile é o rigor sobre ' +
+      'placeholders, endpoints locais e auth de desenvolvimento.',
+  );
+  out.push('');
+  out.push(
+    '**Rollback de emergência, sem redeploy:** `MAIA_CONFIG_STRICT_BOOT=false` volta ao loader ' +
+      'anterior (schema Zod + regras de boot legadas) e desliga a validação de contrato inteira. ' +
+      'É uma alavanca para destravar um ambiente, não um estado estável — o boot degradado ' +
+      'loga um aviso a cada start. Procedimento completo em ' +
+      '[`docs/runbooks/config-contract.md`](runbooks/config-contract.md).',
+  );
   out.push('');
 
   out.push('## Comandos');

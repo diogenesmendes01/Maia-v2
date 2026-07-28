@@ -39,6 +39,13 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
           "name": "MAIA_REJECT_DEFAULT_LITERAL",
           "secret": false,
           "required": false,
@@ -965,6 +972,7 @@
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
@@ -1103,6 +1111,7 @@
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
@@ -1239,6 +1248,7 @@
             "TZ",
             "APP_PORT",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
@@ -1389,6 +1399,13 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
           "name": "DATABASE_URL",
           "secret": true,
           "required": true,
@@ -1525,6 +1542,7 @@
             "MAIA_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
@@ -1557,6 +1575,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
@@ -1584,6 +1603,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
@@ -1624,6 +1644,13 @@
         },
         {
           "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
           "secret": false,
           "required": false,
           "group": "core",
@@ -1682,6 +1709,7 @@
             "MAIA_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT"
           ]
         },
@@ -1697,6 +1725,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT"
           ]
         },
@@ -1712,6 +1741,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT"
           ]
         }
@@ -1742,6 +1772,13 @@
         },
         {
           "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
           "secret": false,
           "required": false,
           "group": "core",
@@ -1929,6 +1966,7 @@
             "MAIA_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT",
             "ALERT_CHANNELS",
             "SMTP_HOST",
@@ -1962,6 +2000,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT",
             "ALERT_CHANNELS",
             "SMTP_HOST",
@@ -1994,6 +2033,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "POSTGRES_PORT",
             "ALERT_CHANNELS",
             "SMTP_HOST",
@@ -2040,6 +2080,13 @@
         },
         {
           "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
           "secret": false,
           "required": false,
           "group": "core",
@@ -2372,6 +2419,7 @@
             "MAIA_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
@@ -2424,6 +2472,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",
@@ -2475,6 +2524,7 @@
             "NODE_ENV",
             "TZ",
             "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
             "REDIS_PORT",

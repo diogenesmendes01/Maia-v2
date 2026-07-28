@@ -269,8 +269,6 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   'OUTBOX_',
   'OUTBOUND_',
   'ALERT_',
-  'CLAUDE_',
-  'OPENROUTER_',
   'EMBEDDING_',
   'WHISPER_',
   'BAILEYS_',
@@ -285,6 +283,7 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   'DECISION_ENGINE_',
   'DAILY_LLM_',
   'DLQ_',
+  'OPENROUTER_',
   'POLICY_RESOLVER_',
   'RUNTIME_TRACE_',
   'SYNC_LATENCY_',
@@ -296,16 +295,25 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   'OIDC_',
   'REAPER_',
   'CONTRADICTION_',
-  'ANTHROPIC_',
   'VOYAGE_',
   'COHERE_',
 ] as const;
-// Deliberately NOT listed: POSTGRES_, REDIS_, SMTP_, NEXTAUTH_, OPENAI_. Those
-// namespaces are routinely populated by hosting platforms and managed add-ons
-// (a Coolify/Heroku-style POSTGRES_HOST, a REDIS_TLS_URL). Rejecting them would
-// turn a legitimate platform injection into a boot failure. The variables Maia
-// actually owns inside those namespaces are still covered — they are in the
-// contract by name.
+// Deliberately NOT listed, because these namespaces belong to somebody else and
+// an unknown key in them is NOT a Maia misconfiguration:
+//
+//   POSTGRES_, REDIS_, SMTP_, NEXTAUTH_, OPENAI_
+//     routinely populated by hosting platforms and managed add-ons (a
+//     Coolify/Heroku-style POSTGRES_HOST, a REDIS_TLS_URL).
+//
+//   CLAUDE_, ANTHROPIC_
+//     owned by Anthropic tooling, not by Maia. A developer machine running
+//     Claude Code carries ~18 of them (CLAUDE_CODE_ENTRYPOINT, CLAUDE_PID,
+//     ANTHROPIC_BASE_URL, …). Since the boot now fails closed on an unknown
+//     Maia key in EVERY profile, listing these prefixes would abort `npm run
+//     dev` and the whole test suite on any machine with the CLI installed.
+//
+// The variables Maia actually owns inside those namespaces are still covered —
+// they are in the contract BY NAME.
 
 /** True when `key` sits in a Maia-owned namespace. */
 export function isMaiaNamespacedKey(key: string): boolean {

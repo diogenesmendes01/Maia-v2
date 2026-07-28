@@ -272,21 +272,19 @@ describe('validateConfig — cross-field rules (#515)', () => {
 });
 
 describe('validateConfig — unknown, deprecated and removed (#515)', () => {
-  it('a REMOVED variable is an error in staging/production and a warning in development', () => {
-    const prod = validateConfig({
-      env: envFor('production', { FEATURE_MULTI_CHANNEL: 'false' }),
-      profile: 'production',
+  // Owner decision on PR #522 review round 1: fail-closed in EVERY profile.
+  // A `.env` that boots on a laptop and dies in staging is the drift this
+  // issue exists to remove, so `development` gets the same verdict.
+  it.each(PROFILES)('a REMOVED variable is an error in %s', (profile) => {
+    const result = validateConfig({
+      env: envFor(profile, { FEATURE_MULTI_CHANNEL: 'false' }),
+      profile,
+      allowSyntheticFixtures: true,
     });
-    const removed = prod.errors.find((p) => p.variable === 'FEATURE_MULTI_CHANNEL');
+    const removed = result.errors.find((p) => p.variable === 'FEATURE_MULTI_CHANNEL');
     expect(removed?.rule).toBe('contract/removed');
     expect(removed?.message).toContain('#411');
-
-    const dev = validateConfig({
-      env: envFor('development', { FEATURE_MULTI_CHANNEL: 'false' }),
-      profile: 'development',
-    });
-    expect(dev.warnings.some((p) => p.variable === 'FEATURE_MULTI_CHANNEL')).toBe(true);
-    expect(dev.ok).toBe(true);
+    expect(result.ok).toBe(false);
   });
 
   it('APROVAR_MENSAGENS_PROATIVAS points the operator at the real gate', () => {
@@ -298,18 +296,32 @@ describe('validateConfig — unknown, deprecated and removed (#515)', () => {
     expect(problem?.remediation).toContain('FEATURE_PROACTIVE_MESSAGES');
   });
 
-  it('an UNKNOWN Maia-namespaced variable is an error in production, a warning in development', () => {
-    const prod = validateConfig({
-      env: envFor('production', { MAIA_TOTALLY_MADE_UP: '1' }),
-      profile: 'production',
+  it.each(PROFILES)('an UNKNOWN Maia-namespaced variable is an error in %s', (profile) => {
+    const result = validateConfig({
+      env: envFor(profile, { MAIA_TOTALLY_MADE_UP: '1' }),
+      profile,
+      allowSyntheticFixtures: true,
     });
-    expect(prod.errors.some((p) => p.rule === 'contract/unknown')).toBe(true);
+    const unknown = result.errors.find((p) => p.rule === 'contract/unknown');
+    expect(unknown?.variable).toBe('MAIA_TOTALLY_MADE_UP');
+    expect(unknown?.remediation).toContain('digitação');
+    expect(result.ok).toBe(false);
+  });
 
-    const dev = validateConfig({
-      env: envFor('development', { MAIA_TOTALLY_MADE_UP: '1' }),
-      profile: 'development',
+  it('third-party namespaces (CLAUDE_*, ANTHROPIC_*) are never rejected', () => {
+    // A developer machine running Claude Code carries ~18 CLAUDE_* variables.
+    // With the boot failing closed in every profile, claiming that namespace
+    // would abort `npm run dev` and the whole suite on any such machine.
+    const result = validateConfig({
+      env: envFor('production', {
+        CLAUDE_CODE_ENTRYPOINT: 'cli',
+        CLAUDE_PID: '1234',
+        ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
     });
-    expect(dev.warnings.some((p) => p.rule === 'contract/unknown')).toBe(true);
+    expect(result.errors.filter((p) => p.rule === 'contract/unknown')).toEqual([]);
   });
 
   it('OS / hosting variables outside Maia namespaces are never rejected', () => {

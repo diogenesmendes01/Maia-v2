@@ -12,9 +12,13 @@ Versão do contrato: `1.0.0`
 
 | Profile | Postura |
 |---|---|
-| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida. Variáveis desconhecidas/removidas geram **aviso**. |
-| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. Desconhecidas/removidas são **erro**. |
-| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. Desconhecidas/removidas são **erro**. |
+| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida, placeholders tolerados. |
+| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. |
+| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. |
+
+**O boot falha fechado em TODOS os profiles.** Variável desconhecida, variável removida (tombstone) e contradição `NODE_ENV` × `MAIA_ENV` abortam o boot em `development` exatamente como em produção: um `.env` que sobe no laptop e morre em staging é o drift que este contrato existe para eliminar. O que muda por profile é o rigor sobre placeholders, endpoints locais e auth de desenvolvimento.
+
+**Rollback de emergência, sem redeploy:** `MAIA_CONFIG_STRICT_BOOT=false` volta ao loader anterior (schema Zod + regras de boot legadas) e desliga a validação de contrato inteira. É uma alavanca para destravar um ambiente, não um estado estável — o boot degradado loga um aviso a cada start. Procedimento completo em [`docs/runbooks/config-contract.md`](runbooks/config-contract.md).
 
 ## Comandos
 
@@ -45,11 +49,11 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 130 | 17 |
-| `admin-ui` | 21 | 4 |
-| `migrator` | 9 | 2 |
-| `backup` | 26 | 6 |
-| `maintenance` | 45 | 12 |
+| `runtime` | 131 | 17 |
+| `admin-ui` | 22 | 4 |
+| `migrator` | 10 | 2 |
+| `backup` | 27 | 6 |
+| `maintenance` | 46 | 12 |
 
 O manifest completo (por serviço e por profile) é gerado em [`src/config/generated/service-env-manifest.json`](../src/config/generated/service-env-manifest.json).
 
@@ -64,6 +68,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `TZ` | string | `America/Sao_Paulo` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Timezone IANA usada em toda formatação/agendamento. |
 | `APP_PORT` | number | `3000` | não | `runtime` | sim | Porta HTTP do servidor Fastify. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Nível mínimo de log (pino). |
+| `MAIA_CONFIG_STRICT_BOOT` | string | `true` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Validação de contrato no boot (fail-closed em TODOS os profiles). `false` é o ROLLBACK DE EMERGÊNCIA: volta ao loader anterior (schema + regras de boot) e desliga a detecção de variável desconhecida, tombstone e contradição de profile. Use só para destravar um ambiente, e abra issue — ver docs/runbooks/config-contract.md. |
 | `MAIA_REJECT_DEFAULT_LITERAL` | string | `true` | não | `runtime`, `maintenance` | não | Fail-closed do literal 'default' em tenant_id/agent_id (issue #323). Default ON; `false` é o rollback de emergência sem redeploy. |
 
 ### Banco de dados

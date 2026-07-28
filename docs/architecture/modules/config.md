@@ -26,7 +26,7 @@
 ## Patterns it follows
 
 - **The contract has no import-time side effects.** No `dotenv`, no `process.env`, no filesystem, no network, no singletons. This is what lets `maia doctor` (#517), the migration runner (#516), the CLI and the test suite reason about configuration without booting the world. Enforced by `tests/unit/config/contract-purity.spec.ts`, which walks the real import graph.
-- **Fail-closed:** an invalid or missing required variable aborts before any tenant context is set up. Never a silent default, never the `'default'` literal.
+- **Fail-closed at boot, in EVERY profile.** An invalid or missing required variable, an unknown Maia variable, a tombstoned one, or a `NODE_ENV` × `MAIA_ENV` contradiction aborts before any tenant context is set up — in `development` exactly as in production. Never a silent default, never the `'default'` literal. The escape hatch is `MAIA_CONFIG_STRICT_BOOT=false` (env-only, no redeploy, loud warning on every start) — see [`docs/runbooks/config-contract.md`](../../runbooks/config-contract.md).
 - **Profiles are explicit.** `MAIA_ENV` (`development` | `staging` | `production`) decides which rules are mandatory; `NODE_ENV` keeps controlling Node platform optimisations only, and a contradiction between the two is an error.
 - **Secrets never appear in output.** Messages name the variable and the rule, never the value — canary-tested in `tests/unit/config/validate.spec.ts`.
 - **Generated, not hand-edited.** `.env.example`, `docs/configuration.md`, the JSON Schema, the service manifest and the fixtures come from `npm run config:generate`; CI fails on drift.
@@ -99,14 +99,15 @@ fixture files themselves, accepts them. `--allow-placeholders` (used for
 | `tests/unit/config/env-file.spec.ts` | `parseEnvFile` ↔ `dotenv.parse` parity (inline comments, quoting, escapes, multi-line) |
 | `tests/unit/config/required-when.spec.ts` | Every `requiredWhen` in the contract, both branches; the case list is asserted to equal the contract's |
 | `tests/unit/config/init-template.spec.ts` | `config init` emits a template (never a fixture), it fails until filled and passes once filled; fixture-as-environment is rejected |
+| `tests/unit/config/boot-fail-closed.spec.ts` | The real loader aborts on tombstone / unknown key / profile contradiction in every profile, and the `MAIA_CONFIG_STRICT_BOOT=false` rollback behaves as documented |
 
 ## In-flight changes
 
-Issue #515 landed the contract, the generators and the validation. Still open, by design (rollout steps 4–9 of the issue):
+Issue #515 landed the contract, the generators, the validation and the fail-closed boot (rollout step 8, brought forward by the owner during PR #522 review). Still open, by design:
 
 - migrating the remaining direct `process.env` readers listed in the ESLint allow-list;
-- wiring `contract`-scope rules (unknown keys, tombstones, per-profile requirements) into the **boot** path — today boot enforces only the `boot`-scope rules, byte-for-byte what it enforced before, so this change cannot break a running deployment;
-- `maia doctor` (#517) and the migration runner (#516) consuming the loaders.
+- `maia doctor` (#517) and the migration runner (#516) consuming the loaders;
+- boot observability (emit profile / contract version / config hash / warning count as a metric — `bootSummary()` already produces the payload, nothing publishes it yet).
 
 Verify: `gh pr list --state open --search "config OR env OR feature-flag"`.
 

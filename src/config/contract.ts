@@ -131,6 +131,24 @@ export const ENV_CONTRACT = {
     fixture: 'info',
     restartRequired: true,
   },
+  MAIA_CONFIG_STRICT_BOOT: {
+    name: 'MAIA_CONFIG_STRICT_BOOT',
+    description:
+      'Validação de contrato no boot (fail-closed em TODOS os profiles). `false` é o ROLLBACK DE EMERGÊNCIA: volta ao loader anterior (schema + regras de boot) e desliga a detecção de variável desconhecida, tombstone e contradição de profile. Use só para destravar um ambiente, e abra issue — ver docs/runbooks/config-contract.md.',
+    group: 'core',
+    secret: false,
+    services: ALL,
+    // Mirrors src/config/env.ts exactly (`!== 'false'`): default-ON needs no
+    // variable set, and the rollback is env-only, without a redeploy.
+    schema: z
+      .string()
+      .default('true')
+      .transform((s) => s !== 'false'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   MAIA_REJECT_DEFAULT_LITERAL: {
     name: 'MAIA_REJECT_DEFAULT_LITERAL',
     description:
