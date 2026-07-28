@@ -256,9 +256,21 @@ d('#511 batch repos — isolation and constant cost', () => {
         tk.profiles.push(await mkProfile(c, B, 'i511-foreign-profile'));
         const ent = await mkEntityWithState(c, A, '1.00');
         tk.entidades.push(ent);
+        // NOTE: `pessoas.tipo` and `permissoes.papel` are DIFFERENT closed
+        // vocabularies and only one of them contains 'operador'.
+        //   pessoas.tipo  — who the person IS      (migrations/001_initial.sql:126)
+        //                   dono · co_dono · socio · contador · funcionario ·
+        //                   fornecedor · cliente · outro
+        //   permissoes.papel — what they may DO    (migrations/001_initial.sql:142)
+        //                   dono · admin · operador · leitor · contador · contato
+        // 'funcionario' is the right `tipo` here: the scenario needs a
+        // NON-OWNER whose access comes entirely from a permission profile, and
+        // `isOwnerType()` (src/governance/permissions.ts:112) treats
+        // dono/co_dono specially — an owner type would blur what is being
+        // tested.
         const pes = await c.query<{ id: string }>(
           `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
-           VALUES ($1, $2, 'i511-p', $3, 'operador', 'ativa') RETURNING id`,
+           VALUES ($1, $2, 'i511-p', $3, 'funcionario', 'ativa') RETURNING id`,
           [A.tenant_id, A.agent_id, `+5511${Math.floor(Math.random() * 1e9)}`],
         );
         const pessoa_id = pes.rows[0]!.id;

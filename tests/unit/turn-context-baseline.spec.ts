@@ -340,6 +340,51 @@ describe('#511 baseline — turn-context query cost', () => {
       expect(resolved.entidades).toEqual(['ent-ok']);
       expect(resolved.byEntity.has('ent-orphan')).toBe(false);
     });
+
+    /**
+     * COUNTERFACTUAL for the cross-tenant assertion in
+     * `tests/integration/turn-context-batch-repos.spec.ts`
+     * ("resolveScope no longer resolves a foreign profile into a grant").
+     *
+     * That integration test asserts `scope.entidades` is `[]` when the only
+     * permission points at a profile owned by ANOTHER tenant. An assertion is
+     * only worth having if it can go red, and the pre-#511 code is gone, so
+     * this pins the other half: when the profile lookup DOES return the foreign
+     * row — exactly what the old unscoped `profilesRepo.byId(id)` did, matching
+     * on `WHERE id = $1` with no tenant predicate — the permission resolves
+     * into a real grant carrying that other tenant's action list and spend
+     * limit, and `entidades` is `['ent-foreign']`, not `[]`.
+     *
+     * So: old lookup behaviour ⇒ the integration assertion fails; scoped lookup
+     * ⇒ it passes. The assertion discriminates.
+     *
+     * What this does NOT prove is that the SQL predicate in
+     * `profilesRepo.byIds` really excludes the other tenant's row — that needs
+     * a real Postgres and is the integration test's own job in CI.
+     */
+    it('COUNTERFACTUAL: an unscoped profile lookup WOULD have granted the foreign profile', async () => {
+      permissoesFixture = [
+        {
+          id: 'perm-foreign',
+          entidade_id: 'ent-foreign',
+          profile_id: 'profile-of-other-tenant',
+          status: 'ativa',
+          limites: {},
+        },
+      ] as unknown as Permissao[];
+      // `missingProfiles` deliberately NOT set: the lookup returns the foreign
+      // profile, which is precisely the old unscoped `byId` behaviour.
+
+      const resolved = await resolveScope(mkPessoa());
+
+      expect(resolved.entidades).toEqual(['ent-foreign']);
+      const grant = resolved.byEntity.get('ent-foreign');
+      expect(grant?.profile.id).toBe('profile-of-other-tenant');
+      // The leak was never abstract: the foreign profile carries the action
+      // list and the spend ceiling this person would have been allowed.
+      expect(grant?.profile.acoes).toEqual(['*']);
+      expect(grant?.effective_limits.valor_max).toBe(1000);
+    });
   });
 
   describe('whole turn', () => {
