@@ -134,7 +134,7 @@ export const tracesRouter = router({
 
       // Review round 2 [P1]: every attempt of this turn, so the detail page can
       // show "attempt 2 of 3" and link to the siblings. Falls back to just this
-      // trace for rows written before migration 101 backfilled the root.
+      // trace for rows written before migration 107 backfilled the root.
       const attempts = trace.root_trace_id
         ? await ctx.repos.runtimeTraceRepo.listAttempts({
             tenantId,

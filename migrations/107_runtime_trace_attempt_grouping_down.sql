@@ -1,4 +1,7 @@
--- 101 down — drop the attempt-grouping columns (issue #514, review round 2).
+-- 107 down — drop the attempt-grouping columns (issue #514, review round 2).
+--
+-- (Authored as 101; renumbered to 107 before merge — 101/102 are issue #520's.
+-- See the `_up` header for why.)
 --
 -- Reverting loses only the DENORMALISED grouping. Nothing else depends on it:
 -- the envelope HMAC never covered these columns, and `turno_id` (which is

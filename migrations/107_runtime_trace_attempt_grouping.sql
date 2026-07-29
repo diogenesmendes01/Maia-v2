@@ -1,4 +1,14 @@
--- 101 — group runtime-trace envelopes by turn attempt (issue #514, review round 2).
+-- 107 — group runtime-trace envelopes by turn attempt (issue #514, review round 2).
+--
+-- Numbering note: this was authored as 101 and renumbered to 107 before merge —
+-- 101/102 belong to issue #520 (backup/LGPD, PR #533) and 104–106 are reserved
+-- by other in-flight branches. The prefix ledger only catches collisions
+-- between MERGED migrations, so a cross-branch clash has to be resolved by
+-- hand; see `migrations/RESERVATIONS.md` and issues #308 / #340.
+--
+-- Ordering is unaffected: this migration depends only on
+-- `runtime_trace_envelopes` (created in 052). It does NOT depend on 100 — that
+-- one only adds indexes — so the widened gap between the two changes nothing.
 --
 -- Migration 100 (+ `envelopeTraceIdForAttempt`) fixed the primary-key collision
 -- that made a retry impossible: attempt 1 keeps the root trace id, attempt N>1

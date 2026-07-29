@@ -330,7 +330,7 @@ export const runtimeTraceRepo = {
    * traces and a retry investigation would stay fragmented.
    *
    * Served by `runtime_trace_env_attempt_group_idx (tenant_id, root_trace_id,
-   * attempt)` from migration 101 — tenant-leading like every other read here.
+   * attempt)` from migration 107 — tenant-leading like every other read here.
    *
    * Bounded at 50: an attempt count beyond that is a runaway retry loop, and
    * the operator needs the first few plus the fact that it ran away, not 500

@@ -115,7 +115,7 @@ export class DivergentTraceReplayError extends Error {
  * check for the decision evidence. `tenant_id` is compared explicitly anyway —
  * relying on a hash to prove tenant isolation would be indirect where the
  * invariant deserves to be direct. `root_trace_id`/`attempt` are unsigned
- * (migration 101), so they need their own comparison.
+ * (migration 107), so they need their own comparison.
  *
  * @returns the names of the fields that differ; empty ⇒ identical replay.
  */
