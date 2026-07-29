@@ -52,12 +52,18 @@ FROM backup_manifests WHERE backup_run_id = '<id>';
 
 ### "O job não roda / não sai do lugar"
 
-Existe no máximo **uma** run não-terminal (índice parcial `backup_runs_single_active_uq`). Se um worker morreu no meio, a linha ficará em estado não-terminal e o advisory lock já terá sido liberado pelo fim da sessão. Feche a run órfã manualmente antes de rodar de novo:
+Existe no máximo **uma** run não-terminal (índice parcial `backup_runs_single_active_uq`).
+
+**Isso se resolve sozinho.** Toda execução (cron ou CLI) faz um *reclaim* antes de pegar o lock: runs não-terminais mais velhas que **2× `BACKUP_DUMP_TIMEOUT_MS`** são terminalizadas como `abandoned` e auditadas. O corte é o que torna a operação segura — passado esse ponto nenhuma run viva poderia ainda estar em voo, porque o próprio dump é limitado.
+
+Isso cobre SIGKILL, OOM, crash — e o caso do shutdown. `nightly_backup` e `backup_retention` são jobs de cron comuns, então o drain da #512 já os alcança: `runTick` recusa iniciar trabalho novo durante o drain, e o passo `cron_workers` espera o tick em voo. Mas o orçamento do drain é `SHUTDOWN_GRACE_MS` (25s) e um dump pode legitimamente levar até `BACKUP_DUMP_TIMEOUT_MS` (1h), então um backup pego pelo SIGTERM é reportado como `pending` e o processo sai com a row não-terminal. O reclaim da execução seguinte a fecha.
+
+Só intervenha à mão se precisar destravar ANTES de 2× o timeout do dump — e só depois de confirmar que nenhum processo está de fato rodando:
 
 ```sql
 UPDATE backup_runs
    SET state='failed', outcome='failed', outcome_reason='abandoned',
-       error_code='unexpected', finished_at=now()
+       error_code='abandoned', finished_at=now()
  WHERE state NOT IN ('completed','completed_degraded','failed','expired','deleted');
 ```
 

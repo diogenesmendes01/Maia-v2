@@ -149,6 +149,41 @@ export async function anyActiveLegalHold(
   }
 }
 
+/**
+ * Terminalize runs abandoned by a process that never came back.
+ *
+ * WHY THIS EXISTS (issue #512 interaction). `nightly_backup` and
+ * `backup_retention` are ordinary cron jobs, so #512's shutdown sequence
+ * already covers them: `runTick` refuses to start new work once draining, and
+ * step 2 (`cron_workers`) awaits the in-flight tick. But the drain budget is
+ * `SHUTDOWN_GRACE_MS` (25s default) while a dump may legitimately run for
+ * `BACKUP_DUMP_TIMEOUT_MS` (1h default) — so a backup caught by SIGTERM is
+ * reported as `pending`, the process exits, and its row stays non-terminal.
+ * The single-active partial index then refuses EVERY future run.
+ *
+ * Rather than special-casing shutdown, this reclaims on the way IN, which also
+ * covers SIGKILL, OOM and a hard crash — none of which get to run cleanup code.
+ *
+ * The cutoff is what makes it safe: a run is only abandoned once it is older
+ * than any live run could possibly be (the dump stage is itself bounded), so a
+ * genuinely-running backup is never stolen from under itself.
+ */
+export async function reclaimAbandonedRuns(olderThan: Date): Promise<string[]> {
+  const res = await db.execute<{ id: string }>(sql`
+    UPDATE ${backup_runs}
+       SET state = 'failed',
+           outcome = 'failed',
+           outcome_reason = 'abandoned',
+           error_code = 'abandoned',
+           finished_at = now(),
+           updated_at = now()
+     WHERE state NOT IN ('completed', 'completed_degraded', 'failed', 'expired', 'deleted')
+       AND started_at < ${olderThan}
+    RETURNING id
+  `);
+  return res.rows.map((r) => r.id);
+}
+
 /** Move a run row to `deleted` once its artifact is confirmed gone. */
 export async function markRunDeleted(backupId: string): Promise<void> {
   await db

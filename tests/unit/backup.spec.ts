@@ -30,6 +30,7 @@ const createBackupPortsMock = vi.fn(() => ({}) as never);
 const recordRetentionRunMock = vi.fn().mockResolvedValue(undefined);
 const readdirSyncMock = vi.fn(() => [] as string[]);
 const listArtifactRunsMock = vi.fn().mockResolvedValue([]);
+const reclaimAbandonedRunsMock = vi.fn().mockResolvedValue([]);
 
 vi.mock('node:fs', () => ({
   readdirSync: readdirSyncMock,
@@ -54,6 +55,7 @@ vi.mock('../../src/ops/backup/retention.js', () => ({
 vi.mock('../../src/db/repositories/ops-repos.js', () => ({
   anyActiveLegalHold: vi.fn(),
   listArtifactRuns: listArtifactRunsMock,
+  reclaimAbandonedRuns: reclaimAbandonedRunsMock,
   markRunDeleted: vi.fn(),
   recordRetentionRun: recordRetentionRunMock,
 }));
@@ -137,6 +139,8 @@ beforeEach(() => {
   readdirSyncMock.mockReturnValue([]);
   listArtifactRunsMock.mockReset();
   listArtifactRunsMock.mockResolvedValue([]);
+  reclaimAbandonedRunsMock.mockReset();
+  reclaimAbandonedRunsMock.mockResolvedValue([]);
   runVerifiedBackupMock.mockResolvedValue(backupResult());
   runArtifactRetentionMock.mockResolvedValue(retentionOutcome());
   // The retention lock is fail-closed: `requireOpsLock` runs the body or throws.
@@ -223,6 +227,52 @@ describe('nightly_backup worker', () => {
     expect(isSystemContext(observed!)).toBe(true);
     expect(observed!.tenant_id).not.toBe('default');
     expect(observed!.agent_id).not.toBe('default');
+  });
+});
+
+describe('a backup killed mid-run does not block the next one (#512 drain interaction)', () => {
+  it('reclaims abandoned runs BEFORE taking the lock', async () => {
+    const order: string[] = [];
+    reclaimAbandonedRunsMock.mockImplementation(async () => {
+      order.push('reclaim');
+      return [];
+    });
+    withOpsLockMock.mockImplementation(
+      async (_k: string, _d: unknown, fn: () => Promise<unknown>) => {
+        order.push('lock');
+        return { status: 'ran', result: await fn() };
+      },
+    );
+    const { runNightlyBackup } = await import('../../src/workers/backup.js');
+    await runNightlyBackup();
+    expect(order).toEqual(['reclaim', 'lock']);
+  });
+
+  it('uses a cutoff of twice the dump budget — a live run is never stolen', async () => {
+    const before = Date.now();
+    const { runNightlyBackup } = await import('../../src/workers/backup.js');
+    await runNightlyBackup();
+    const cutoff = reclaimAbandonedRunsMock.mock.calls[0]![0] as Date;
+    // BACKUP_DUMP_TIMEOUT_MS is 3_600_000 in the mocked config.
+    expect(before - cutoff.getTime()).toBeGreaterThanOrEqual(2 * 3_600_000);
+  });
+
+  it('audits every reclaimed run — it is a state change on evidence', async () => {
+    reclaimAbandonedRunsMock.mockResolvedValue(['run-a', 'run-b']);
+    const { runNightlyBackup } = await import('../../src/workers/backup.js');
+    await runNightlyBackup();
+    const reclaimed = auditMock.mock.calls
+      .map((c) => c[0])
+      .filter((a) => a.metadata?.reason === 'abandoned');
+    expect(reclaimed.map((a) => a.metadata.backup_id)).toEqual(['run-a', 'run-b']);
+    expect(reclaimed[0]!.acao).toBe('backup_run_failed');
+  });
+
+  it('proceeds with the backup when the reclaim itself fails', async () => {
+    reclaimAbandonedRunsMock.mockRejectedValue(new Error('db down'));
+    const { executeBackup } = await import('../../src/workers/backup.js');
+    const res = await executeBackup('schedule');
+    expect(res.status).toBe('ran');
   });
 });
 

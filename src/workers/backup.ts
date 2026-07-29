@@ -26,6 +26,7 @@ import {
   anyActiveLegalHold,
   listArtifactRuns,
   markRunDeleted,
+  reclaimAbandonedRuns,
   recordRetentionRun,
 } from '@/db/repositories/ops-repos.js';
 import type { RetentionCandidate } from '@/ops/backup/retention.js';
@@ -55,6 +56,44 @@ import type { RetentionCandidate } from '@/ops/backup/retention.js';
  */
 export async function runNightlyBackup(): Promise<void> {
   await runWithSystemContext(() => executeBackup('schedule'));
+}
+
+/**
+ * Terminalize runs no live process can still own.
+ *
+ * The cutoff is TWICE the dump budget: past that, no legitimate run could
+ * still be in flight, because the dump stage is itself bounded by
+ * `BACKUP_DUMP_TIMEOUT_MS`. Anything older is debris from a process that died,
+ * and every reclaim is audited — it is a state change on evidence.
+ *
+ * Failures here are non-fatal: if the reclaim cannot run, the backup simply
+ * proceeds and either succeeds or is refused by the single-active index, which
+ * is the pre-existing behaviour. Blocking the nightly backup on housekeeping
+ * would be the wrong trade.
+ */
+async function reclaimAbandoned(): Promise<void> {
+  const cutoff = new Date(Date.now() - config.BACKUP_DUMP_TIMEOUT_MS * 2);
+  try {
+    const reclaimed = await reclaimAbandonedRuns(cutoff);
+    if (reclaimed.length === 0) return;
+    logger.warn(
+      { count: reclaimed.length, cutoff: cutoff.toISOString() },
+      'backup.abandoned_runs_reclaimed',
+    );
+    for (const backup_id of reclaimed) {
+      await audit({
+        acao: 'backup_run_failed',
+        metadata: {
+          backup_id,
+          outcome: 'failed',
+          reason: 'abandoned',
+          detail: 'run was left non-terminal by a process that did not come back',
+        },
+      });
+    }
+  } catch (err) {
+    logger.error({ err: (err as Error).name }, 'backup.abandoned_reclaim_failed');
+  }
 }
 
 /**
@@ -114,6 +153,12 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
     logger.warn({ profile: profile.name }, 'backup.disabled');
     return { status: 'disabled' };
   }
+
+  // Reclaim runs abandoned by a process that never came back (SIGTERM whose
+  // drain budget expired mid-dump, SIGKILL, OOM, crash). Without this the
+  // single-active partial index refuses every future run — see
+  // `reclaimAbandonedRuns` for why the cutoff makes it safe.
+  await reclaimAbandoned();
 
   // Single-flight: cron, CLI and any retry contend for one global lock. The
   // loser does NOT wait and does NOT start a second dump.
