@@ -97,12 +97,17 @@ export default function TracesPage() {
                 {items.map((t) => (
                   <Tr key={t.id}>
                     <Td>
-                      <Link
-                        href={`/traces/${t.id}`}
-                        className="font-mono text-xs font-medium text-brand-600 hover:text-brand-700 hover:underline"
-                      >
-                        {t.id.slice(0, 8)}
-                      </Link>
+                      <div className="flex items-center gap-1.5">
+                        <Link
+                          href={`/traces/${t.id}`}
+                          className="font-mono text-xs font-medium text-brand-600 hover:text-brand-700 hover:underline"
+                        >
+                          {t.id.slice(0, 8)}
+                        </Link>
+                        {/* A retry is a different trace id for the SAME turn —
+                            label it so the list does not read as N incidents. */}
+                        {t.is_retry && <Badge tone="warning">retry #{t.attempt}</Badge>}
+                      </div>
                     </Td>
                     <Td>{t.agent_id}</Td>
                     <Td className="font-mono text-xs text-zinc-700">

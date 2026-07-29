@@ -100,6 +100,10 @@ export async function writeEnvelope(
   const decision: Decision = input.decision.decision;
   const policy_id = input.decision.policy_id ?? null;
   const hmac_key_version = currentKeyVersion();
+  // Issue #514 review round 2: attempt grouping. Defaults keep every existing
+  // caller (and attempt 1) writing exactly what it wrote before.
+  const root_trace_id = input.root_trace_id ?? input.trace_id;
+  const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
 
   // Payload to sign — canonical JSON guarantees stable bytes regardless of
   // insertion order. We sign the envelope contents (no DB-assigned fields).
@@ -117,6 +121,26 @@ export async function writeEnvelope(
   });
   const envelope_hmac = signHmac(input.tenant_id, hmac_key_version, signedPayload);
 
+  // ONE row definition for both write paths — they had drifted into
+  // copy-paste twins, and a column added to one but not the other is a silent
+  // evidence gap.
+  const envelopeRow = {
+    trace_id: input.trace_id,
+    tenant_id: input.tenant_id,
+    agent_id: input.agent_id,
+    conversa_id: input.conversa_id ?? null,
+    turno_id: input.turno_id ?? null,
+    root_trace_id,
+    attempt,
+    policy_id,
+    decision,
+    side_effect_level,
+    redaction_class,
+    envelope_hmac,
+    hmac_key_version,
+    body_status: 'pending' as const,
+  };
+
   try {
     if (options.outbox_body) {
       // Durable path: envelope + outbox row in one transaction.
@@ -126,20 +150,7 @@ export async function writeEnvelope(
       await db.transaction(async (tx) => {
         await tx
           .insert(runtime_trace_envelopes)
-          .values({
-            trace_id: input.trace_id,
-            tenant_id: input.tenant_id,
-            agent_id: input.agent_id,
-            conversa_id: input.conversa_id ?? null,
-            turno_id: input.turno_id ?? null,
-            policy_id,
-            decision,
-            side_effect_level,
-            redaction_class,
-            envelope_hmac,
-            hmac_key_version,
-            body_status: 'pending',
-          })
+          .values(envelopeRow)
           // Issue #514 review round 1 [P1]: the writer is at-least-once by
           // construction (BullMQ retries, the recovery sweep, the outbox
           // relayer). Re-writing the SAME envelope must be a no-op, not a
@@ -165,20 +176,7 @@ export async function writeEnvelope(
       // Best-effort path (legacy callers / minimal redaction).
       await db
         .insert(runtime_trace_envelopes)
-        .values({
-          trace_id: input.trace_id,
-          tenant_id: input.tenant_id,
-          agent_id: input.agent_id,
-          conversa_id: input.conversa_id ?? null,
-          turno_id: input.turno_id ?? null,
-          policy_id,
-          decision,
-          side_effect_level,
-          redaction_class,
-          envelope_hmac,
-          hmac_key_version,
-          body_status: 'pending',
-        })
+        .values(envelopeRow)
         // Same at-least-once rationale as the transactional path above.
         .onConflictDoNothing();
     }
@@ -204,6 +202,8 @@ export async function writeEnvelope(
 
   return {
     trace_id: input.trace_id,
+    root_trace_id,
+    attempt,
     envelope_hmac,
     hmac_key_version,
     side_effect_level,

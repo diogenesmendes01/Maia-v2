@@ -84,6 +84,11 @@ export const tracesRouter = router({
           agent_id: t.agent_id,
           conversa_id: t.conversa_id,
           turno_id: t.turno_id,
+          // Review round 2 [P1]: attempt grouping, so a retry is legible as a
+          // retry instead of an unrelated trace.
+          root_trace_id: t.root_trace_id,
+          attempt: t.attempt,
+          is_retry: t.attempt > 1,
           started_at: t.created_at,
           decision: t.decision,
           side_effect_level: t.side_effect_level,
@@ -127,6 +132,16 @@ export const tracesRouter = router({
         traceId: input.traceId,
       });
 
+      // Review round 2 [P1]: every attempt of this turn, so the detail page can
+      // show "attempt 2 of 3" and link to the siblings. Falls back to just this
+      // trace for rows written before migration 101 backfilled the root.
+      const attempts = trace.root_trace_id
+        ? await ctx.repos.runtimeTraceRepo.listAttempts({
+            tenantId,
+            rootTraceId: trace.root_trace_id,
+          })
+        : [];
+
       const packet = (trace.redacted_packet ?? null) as Record<string, unknown> | null;
       const hooks = Array.isArray(packet?.policy_hooks)
         ? (packet.policy_hooks as Array<Record<string, unknown>>)
@@ -138,6 +153,19 @@ export const tracesRouter = router({
         agent_id: trace.agent_id,
         conversa_id: trace.conversa_id,
         turno_id: trace.turno_id,
+        root_trace_id: trace.root_trace_id,
+        attempt: trace.attempt,
+        // The sibling attempts of the same turn, oldest first.
+        attempts: attempts.map((a) => ({
+          trace_id: a.trace_id,
+          attempt: a.attempt,
+          decision: a.decision,
+          side_effect_level: a.side_effect_level,
+          body_status: a.body_status,
+          started_at: a.created_at,
+          is_current: a.trace_id === trace.trace_id,
+        })),
+        attempt_count: attempts.length,
         started_at: trace.created_at,
         decision: trace.decision,
         side_effect_level: trace.side_effect_level,

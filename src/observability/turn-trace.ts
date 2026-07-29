@@ -290,6 +290,11 @@ export async function traceTurnDecision(
       agent_id: input.base.agent_id,
       conversa_id: asUuidOrNull(input.base.conversation_id),
       turno_id: asUuidOrNull(input.base.input.content_ref),
+      // Review round 2 [P1]: persist the root/attempt relation that until now
+      // existed only in the correlation ALS, so the Explorer can group the
+      // attempts of one turn instead of listing N unrelated traces.
+      root_trace_id,
+      attempt,
       packet: toContextStub(input),
       decision,
       redaction_class: 'standard',

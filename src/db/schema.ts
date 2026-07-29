@@ -2324,6 +2324,11 @@ export const runtime_trace_envelopes = pgTable(
     agent_id: text('agent_id').notNull(),
     conversa_id: uuid('conversa_id'),
     turno_id: uuid('turno_id'),
+    // Issue #514 (migration 101): attempt grouping. `root_trace_id` equals
+    // `trace_id` on attempt 1; retries get a derived id and point back here.
+    // NOT covered by `envelope_hmac` — see the migration for why.
+    root_trace_id: uuid('root_trace_id'),
+    attempt: integer('attempt').notNull().default(1),
     policy_id: uuid('policy_id'),
     decision: text('decision').notNull(),
     side_effect_level: text('side_effect_level').notNull(),

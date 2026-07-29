@@ -47,6 +47,10 @@ export interface TraceListItem {
   agent_id: string;
   conversa_id: string | null;
   turno_id: string | null;
+  /** Root trace id of the turn — equal to `trace_id` on attempt 1. */
+  root_trace_id: string | null;
+  /** 1-based attempt ordinal. */
+  attempt: number;
   decision: string;
   side_effect_level: string;
   redaction_class: string;
@@ -203,6 +207,8 @@ export const runtimeTraceRepo = {
         agent_id: t.agent_id,
         conversa_id: t.conversa_id,
         turno_id: t.turno_id,
+        root_trace_id: t.root_trace_id,
+        attempt: t.attempt,
         decision: t.decision,
         side_effect_level: t.side_effect_level,
         redaction_class: t.redaction_class,
@@ -259,6 +265,8 @@ export const runtimeTraceRepo = {
       agent_id: env.agent_id,
       conversa_id: env.conversa_id,
       turno_id: env.turno_id,
+      root_trace_id: env.root_trace_id,
+      attempt: env.attempt,
       policy_id: env.policy_id,
       decision: env.decision,
       side_effect_level: env.side_effect_level,
@@ -291,6 +299,49 @@ export const runtimeTraceRepo = {
       encrypted: body?.encrypted ?? false,
       body_available: body !== null,
     };
+  },
+
+  /**
+   * All attempts of ONE turn, oldest attempt first (issue #514 review round 2).
+   *
+   * Retries deliberately get their own `trace_id` so they cannot collide on the
+   * primary key; without this query the Explorer would show them as N unrelated
+   * traces and a retry investigation would stay fragmented.
+   *
+   * Served by `runtime_trace_env_attempt_group_idx (tenant_id, root_trace_id,
+   * attempt)` from migration 101 — tenant-leading like every other read here.
+   *
+   * Bounded at 50: an attempt count beyond that is a runaway retry loop, and
+   * the operator needs the first few plus the fact that it ran away, not 500
+   * rows.
+   */
+  async listAttempts(input: {
+    tenantId: string;
+    rootTraceId: string;
+  }): Promise<TraceListItem[]> {
+    assertTenant(input.tenantId);
+    const t = runtime_trace_envelopes;
+    const rows = await db
+      .select({
+        trace_id: t.trace_id,
+        tenant_id: t.tenant_id,
+        agent_id: t.agent_id,
+        conversa_id: t.conversa_id,
+        turno_id: t.turno_id,
+        root_trace_id: t.root_trace_id,
+        attempt: t.attempt,
+        decision: t.decision,
+        side_effect_level: t.side_effect_level,
+        redaction_class: t.redaction_class,
+        body_status: t.body_status,
+        body_persisted_at: t.body_persisted_at,
+        created_at: t.created_at,
+      })
+      .from(t)
+      .where(and(eq(t.tenant_id, input.tenantId), eq(t.root_trace_id, input.rootTraceId)))
+      .orderBy(t.attempt, t.created_at)
+      .limit(50);
+    return rows as TraceListItem[];
   },
 
   /**

@@ -171,6 +171,44 @@ export default function TraceDetailPage({
           </CardBody>
         </Card>
 
+        {/* Issue #514 review round 2 — attempt grouping. A retry gets its own
+            trace id (so it cannot collide on the PK); without this card the
+            operator would see N unrelated traces for one turn. */}
+        {trace.attempt_count > 1 && (
+          <Card>
+            <CardHeader
+              title={`Tentativas deste turno (${trace.attempt_count})`}
+              description="Retry e recovery reusam o mesmo turno; cada tentativa tem seu próprio envelope."
+            />
+            <CardBody>
+              <ul className="divide-y divide-zinc-100">
+                {trace.attempts.map((a) => (
+                  <li key={a.trace_id} className="flex items-center gap-3 py-2 text-sm">
+                    <Badge tone={a.is_current ? 'brand' : 'neutral'}>#{a.attempt}</Badge>
+                    {a.is_current ? (
+                      <span className="font-mono text-xs text-zinc-800">
+                        {a.trace_id.slice(0, 8)} (atual)
+                      </span>
+                    ) : (
+                      <Link
+                        href={`/traces/${a.trace_id}`}
+                        className="font-mono text-xs text-brand-600 hover:underline"
+                      >
+                        {a.trace_id.slice(0, 8)}
+                      </Link>
+                    )}
+                    <span className="text-zinc-600">{a.decision}</span>
+                    <span className="text-zinc-500">{a.side_effect_level}</span>
+                    <span className="ml-auto text-xs text-zinc-500">
+                      {new Date(a.started_at).toLocaleString('pt-BR')}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </CardBody>
+          </Card>
+        )}
+
         <Card>
           <CardHeader
             title="Decisões PEP"
