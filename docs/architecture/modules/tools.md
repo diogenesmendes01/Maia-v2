@@ -87,11 +87,29 @@ schema:
 | Where | Field | Identifies |
 |---|---|---|
 | `tool_visibility_resolved` audit row | `tool_schema_canonical_hash` (+ `_hashes`, `_bytes`) | the CANONICAL contract of the visible set |
-| `llm.tool_payload` log line, at the call site | `canonical_hash` + `provider_payload_hash` + `mode` | the exact bytes handed to the SDK |
+| `llm.tool_payload` log line (`info`), at the call site | `canonical_hash` + `provider_schema_hash` + `rewritten` + `mode` | the contract AS SENT |
+| `maia_tool_schema_provider_payload_total{provider,model,mode,rewritten}` | — | the same, alertable without parsing logs |
 
-`canonical_hash` is the join key between the two. Equal hashes mean the envelope
-was a pass-through; different hashes with `mode: 'strict'` are expected, and
-comparing them is how an envelope that changed the contract gets caught.
+`canonical_hash` is the join key between the audit row and the wire payload.
+
+Both hashes at the call site are taken over the **same projection** — a
+`{tool name → hash of that tool's input schema}` map — one reading the schemas
+before adaptation, the other reading the schemas actually inside the payload
+(`input_schema` for Anthropic, `function.parameters` for OpenAI). That is what
+makes the comparison mean something:
+
+- equal (`rewritten: false`) ⇒ the envelope did not touch any contract;
+- different (`rewritten: true`) ⇒ some tool's schema was rewritten, added or dropped.
+
+`mode` and `rewritten` are independent on purpose: `mode` says whether strict was
+*requested*, `rewritten` says whether the contract actually *changed*.
+`rewritten: true` with `mode: 'canonical'` is a bug — an envelope that silently
+altered the contract. `provider_payload_bytes` is a size, not an identity, and is
+not compared against anything.
+
+The digest is emitted at `info` because `LOG_LEVEL` defaults to `info`: a `debug`
+line would not exist when someone needs it, since log levels get raised *after*
+an incident, not before.
 
 ### Provider delivery
 

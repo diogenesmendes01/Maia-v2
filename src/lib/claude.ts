@@ -93,16 +93,17 @@ class AnthropicProvider implements LLMProvider {
   }): Promise<LLMResponse> {
     const model = params.model ?? config.CLAUDE_MODEL_MAIN;
     const start = Date.now();
-    // Issue #509 / PR #530 P2 — identity of the tool payload actually sent.
-    // Anthropic has no strict mode, so the envelope is a pass-through and the
-    // two hashes must match; logging both makes that verifiable instead of
-    // assumed.
+    // Issue #509 / PR #530 P2 — identity of the tool contract actually sent.
+    // Anthropic has no strict mode, so the envelope is a pass-through: the two
+    // hashes MUST match and `rewritten` must be false. Recording it makes that
+    // verifiable instead of assumed.
     if (params.tools && params.tools.length > 0) {
       recordProviderPayload(
         describeProviderPayload({
           provider: 'anthropic',
           model,
           canonical: params.tools,
+          effective: params.tools.map((t) => ({ name: t.name, schema: t.input_schema })),
           payload: params.tools,
           strictCount: 0,
         }),
@@ -315,18 +316,24 @@ class OpenRouterProvider implements LLMProvider {
     const oaiTools = toOpenAITools(params.tools, model);
     // PR #530 P2 — the strict envelope REWRITES the schema (required, dropped
     // keywords, descriptions), so the canonical hash audited by the runtime
-    // filter does not identify this payload. Record both, plus the mode, so the
-    // divergence is observable in production rather than inferred.
+    // filter does not identify this payload. Record both hashes over the SAME
+    // projection ({name → schema hash}), so `rewritten` is a real answer rather
+    // than a comparison of two different domains.
     if (params.tools && params.tools.length > 0 && oaiTools) {
+      const fnOf = (t: OAITool) =>
+        (t as { function?: { name?: string; parameters?: Record<string, unknown>; strict?: boolean } })
+          .function;
       recordProviderPayload(
         describeProviderPayload({
           provider: 'openrouter',
           model,
           canonical: params.tools,
+          effective: oaiTools.map((t) => ({
+            name: fnOf(t)?.name ?? '',
+            schema: fnOf(t)?.parameters ?? {},
+          })),
           payload: oaiTools,
-          strictCount: oaiTools.filter(
-            (t) => (t as { function?: { strict?: boolean } }).function?.strict === true,
-          ).length,
+          strictCount: oaiTools.filter((t) => fnOf(t)?.strict === true).length,
         }),
       );
     }

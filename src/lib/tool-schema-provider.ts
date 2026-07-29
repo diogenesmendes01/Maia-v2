@@ -251,22 +251,38 @@ export function recordStrictDowngrade(
 }
 
 /**
- * Issue #509 / PR #530 review round 1, [P2] — identity of the tool payload that
- * ACTUALLY went on the wire.
+ * Issue #509 / PR #530 — identity of the tool contract that ACTUALLY went on
+ * the wire.
  *
- * `runtime-filter.ts` audits the CANONICAL contract, which is computed before
- * any provider adaptation. In the strict path the envelope rewrites `required`,
- * drops keywords and rewrites descriptions, so the canonical hash alone does not
- * identify what the model saw. This records BOTH:
+ * `runtime-filter.ts` audits the CANONICAL contract, computed before any
+ * provider adaptation. In the strict path the envelope rewrites `required`,
+ * drops keywords and rewrites descriptions, so the canonical hash alone does
+ * not identify what the model saw.
  *
- *   - `canonical_hash` — the same value the audit row carries, so a turn's audit
- *     row and its wire payload can be joined;
- *   - `provider_payload_hash` — the exact bytes handed to the SDK.
+ * ## The two hashes share ONE domain (review round 2)
  *
- * Equal hashes ⇒ the envelope was a pass-through. Different hashes with
- * `mode: 'canonical'` would be a bug. Different hashes with `mode: 'strict'` is
- * expected, and comparing the two is how the P1 divergence class gets caught in
- * production rather than in an incident.
+ * Round 1 hashed the canonical SCHEMAS on one side and the whole provider-shaped
+ * PAYLOAD on the other. Those live in different domains, so they could never be
+ * equal and comparing them said nothing — the documented "equal ⇒ pass-through"
+ * property was not real.
+ *
+ * Both hashes are now taken over the SAME projection: a `{tool name → hash of
+ * that tool's input schema}` map. `canonical` reads the schemas before
+ * adaptation, `effective` reads the schemas the caller actually put inside the
+ * payload (`input_schema` for Anthropic, `function.parameters` for OpenAI). So:
+ *
+ *   - equal  ⇒ the envelope did NOT touch any contract (a real pass-through);
+ *   - differ ⇒ some tool's schema was rewritten, added or dropped.
+ *
+ * `rewritten` exposes that comparison as a boolean so nobody has to eyeball two
+ * hex strings. It is deliberately independent of `mode`: `mode` says whether
+ * strict was REQUESTED, `rewritten` says whether the contract actually CHANGED.
+ * `rewritten: true` with `mode: 'canonical'` is a bug — an envelope that
+ * silently altered the contract, which is exactly the divergence class the
+ * round-1 P1 finding was about.
+ *
+ * `provider_payload_bytes` measures the serialized wire payload. It is a size,
+ * not an identity, and is not compared against anything.
  *
  * Contract identity only: hashes, counts and bytes. No schema bodies, no
  * messages, no arguments.
@@ -277,21 +293,43 @@ export interface ProviderPayloadDigest {
   /** 'strict' = every tool strict; 'mixed' = some; 'canonical' = none. */
   mode: 'strict' | 'mixed' | 'canonical';
   tools: number;
+  /** Hash of {name → schema hash} BEFORE provider adaptation. */
   canonical_hash: string;
-  provider_payload_hash: string;
+  /** Hash of {name → schema hash} AS SENT. Same domain as `canonical_hash`. */
+  provider_schema_hash: string;
+  /** `canonical_hash !== provider_schema_hash` — the envelope changed a contract. */
+  rewritten: boolean;
+  /** Serialized size of the wire payload. A size, not an identity. */
   provider_payload_bytes: number;
+}
+
+/** The `{name → schema hash}` projection both hashes are taken over. */
+function schemaMapHash(
+  entries: ReadonlyArray<{ name: string; schema: Record<string, unknown> }>,
+): string {
+  const map: Record<string, string> = {};
+  for (const e of entries) map[e.name] = schemaHash(e.schema);
+  return schemaHash(map);
 }
 
 export function describeProviderPayload(params: {
   provider: string;
   model: string;
+  /** Tool schemas as the registry produced them. */
   canonical: ReadonlyArray<{ name: string; input_schema: Record<string, unknown> }>;
+  /**
+   * Tool schemas as they appear INSIDE the wire payload. The caller extracts
+   * these because only it knows the provider's envelope shape.
+   */
+  effective: ReadonlyArray<{ name: string; schema: Record<string, unknown> }>;
+  /** The wire payload itself — used for the byte count only. */
   payload: unknown;
   strictCount: number;
 }): ProviderPayloadDigest {
-  const canonicalMap: Record<string, string> = {};
-  for (const t of params.canonical) canonicalMap[t.name] = schemaHash(t.input_schema);
-  const serialized = canonicalStringify(params.payload);
+  const canonical_hash = schemaMapHash(
+    params.canonical.map((t) => ({ name: t.name, schema: t.input_schema })),
+  );
+  const provider_schema_hash = schemaMapHash(params.effective);
   return {
     provider: params.provider,
     model: params.model,
@@ -302,27 +340,25 @@ export function describeProviderPayload(params: {
           ? 'strict'
           : 'mixed',
     tools: params.canonical.length,
-    canonical_hash: schemaHash(canonicalMap),
-    provider_payload_hash: schemaHash(params.payload),
-    provider_payload_bytes: Buffer.byteLength(serialized, 'utf8'),
+    canonical_hash,
+    provider_schema_hash,
+    rewritten: canonical_hash !== provider_schema_hash,
+    provider_payload_bytes: Buffer.byteLength(canonicalStringify(params.payload), 'utf8'),
   };
 }
 
 /**
  * Emit the payload digest so it is available WITHOUT re-deploying at
- * `LOG_LEVEL=debug` (PR #530 review round 2).
- *
- * `debug` is dropped by the default `info` level, and nobody raises the log
- * level BEFORE an incident — they raise it after, when the turn under
- * investigation is already gone. Diagnostic data that only exists in a
- * configuration nobody runs is not diagnostic data.
+ * `LOG_LEVEL=debug` (review round 2). `debug` is dropped by the default `info`
+ * level, and nobody raises the log level BEFORE the incident — they raise it
+ * after, when the turn under investigation is already gone.
  *
  * Two retained surfaces:
  *   - `logger.info('llm.tool_payload')` — carries the hash PAIR, which a metric
  *     cannot without unbounded label cardinality. One small identity-only line
  *     per LLM call that ships tools.
- *   - `maia_tool_schema_provider_payload_total{provider,model,mode}` — bounded
- *     labels, so the strict/canonical split is alertable without parsing logs.
+ *   - `maia_tool_schema_provider_payload_total{provider,model,mode,rewritten}` —
+ *     bounded labels, so a rewrite is alertable without parsing logs.
  *
  * Not an `audit()` row: `callLLM` is reached from cognition workers and the
  * synthetic probe, which have no pessoa/conversa context, and a per-call DB
@@ -333,6 +369,7 @@ export function recordProviderPayload(digest: ProviderPayloadDigest): void {
     provider: digest.provider,
     model: digest.model,
     mode: digest.mode,
+    rewritten: String(digest.rewritten),
   });
   logger.info(digest, 'llm.tool_payload');
 }
