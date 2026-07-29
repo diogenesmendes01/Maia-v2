@@ -45,6 +45,7 @@ const dispatchTool = vi.fn();
 const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 const runDecisionEngineForTurn = vi.fn();
+const failTurnRetryable = vi.fn(async () => undefined);
 
 /**
  * The REAL error class from the module under test. Importing it (instead of
@@ -165,6 +166,15 @@ vi.mock('../../src/gateway/presence.js', () => ({
   quotedReplyContext: vi.fn(),
   sendPoll,
 }));
+// #503 (merged) — the durable turn state machine. Only `failTurnRetryable` is
+// spied; everything else keeps its real implementation so the wiring under test
+// is the real one.
+vi.mock('../../src/runtime/turns/lifecycle.js', async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import('../../src/runtime/turns/lifecycle.js')
+  >();
+  return { ...actual, failTurnRetryable };
+});
 vi.mock('../../src/agent/reflection.js', () => ({
   detectCorrection: vi.fn().mockReturnValue(false),
   reflectOnCorrection: vi.fn(),
@@ -202,6 +212,7 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     markProcessed.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
     runDecisionEngineForTurn.mockReset();
+    failTurnRetryable.mockReset().mockResolvedValue(undefined);
     buildPrompt.mockResolvedValue({ system: 's', messages: [] });
     dbState.conversaResult = [{ conversas: CONVERSA, pessoas: PESSOA }];
   });
@@ -297,6 +308,25 @@ describe('issue #514 [P1] — mandatory trace envelope failure blocks the whole 
     expect((row!.metadata as Record<string, unknown>).side_effect_level).toBe('high');
     // No message content in the audit metadata.
     expect(JSON.stringify(row)).not.toContain('transfere 5000');
+  });
+
+  it('marks the turn through the #503 state machine, not just the BullMQ job', async () => {
+    // #503 merged while this issue was in review. The job failing and the
+    // durable turn row agreeing are two halves of one contract — a job that
+    // fails while the turn row still says `running` is the same silent loss in
+    // a different table. `failTurnRetryable` owns the retry-vs-dead-letter
+    // decision, so this adds no parallel retry mechanism.
+    runDecisionEngineForTurn.mockRejectedValue(
+      new MandatoryTraceEnvelopeError(new Error('db down'), 'primary', 'medium'),
+    );
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    await expect(runAgentForMensagem('in1')).rejects.toThrow();
+
+    expect(failTurnRetryable).toHaveBeenCalledTimes(1);
+    expect(failTurnRetryable.mock.calls[0]?.[1]).toMatchObject({
+      code: 'runtime_trace_envelope_failed',
+      mensagem_id: 'in1',
+    });
   });
 
   it('a failing audit write does not mask the original error', async () => {

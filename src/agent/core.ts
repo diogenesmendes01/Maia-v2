@@ -1229,11 +1229,9 @@ async function runAgentForMensagemInner(
     // slightly slower answer. If every attempt fails the DLQ alert is the
     // signal, and the inbound stays recoverable.
     //
-    // #503 hand-off: once the durable turn state machine lands, this is where
-    // the turn should be marked `retryable` / `dead_letter` through its facade
-    // instead of relying on BullMQ's job state alone. The required BEHAVIOUR
-    // is the same either way — the job fails — so adopting the facade is a
-    // mechanical change at merge time, not a redesign.
+    // #503 is merged, so the turn is ALSO marked through the durable state
+    // machine below (`failTurnRetryable`) — the job failing and the turn row
+    // agreeing are two halves of the same contract.
     if (err instanceof MandatoryTraceEnvelopeError) {
       logger.error(
         {
@@ -1259,6 +1257,17 @@ async function runAgentForMensagemInner(
           'agent.runtime_trace.blocked_turn_audit_failed',
         ),
       );
+      // #503 (now merged) — mark the turn through the durable state machine
+      // instead of relying on BullMQ's job state alone. `failTurnRetryable`
+      // owns the retry-vs-dead-letter decision (`MAX_TURN_ATTEMPTS`), so this
+      // does NOT introduce a parallel retry mechanism: the envelope failure is
+      // just another pre-side-effect failure, which is exactly the case that
+      // facade exists for.
+      await failTurnRetryable(turn, {
+        code: 'runtime_trace_envelope_failed',
+        error: err.cause_error,
+        mensagem_id: inbound.id,
+      });
       // Deliberately NOT marking processed: the row must stay pending so the
       // recovery sweep can re-enqueue it if the job itself is lost.
       throw err;
