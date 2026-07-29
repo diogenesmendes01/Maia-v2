@@ -303,7 +303,6 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 
 > Adicionar `maia_llm_circuit_state` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessa, abre uma PR.
 
-<<<<<<< HEAD
 ### 8.1 Probes — qual endpoint usar onde (issue #512)
 
 Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
@@ -406,8 +405,8 @@ Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
 | `maia_worker_last_success_timestamp{worker}` | gauge | idade > 3× a cadência do cron |
 | `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
 | `maia_worker_tick_skipped_total{worker,reason}` | counter | crescimento (execução anterior não termina no intervalo) |
-=======
-### 8.1 LLM Gateway (issue #508)
+
+### 8.4 LLM Gateway (issue #508)
 
 Todas as chamadas de chat/classificação/visão passam por `src/lib/llm/`. A
 partir da #508 o gateway emite em **todo** desfecho — sucesso, erro, timeout,
@@ -480,7 +479,6 @@ reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
 excede o que resta do deadline.
 
 > Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
->>>>>>> fc7afccd (refactor(llm): governança do gateway — orçamento, invalidação e runbook (#508))
 
 ---
 
@@ -497,6 +495,7 @@ sudo systemctl stop maia          # SIGTERM → inicia o drain
 #   lifecycle.shutdown_step_done    step=bullmq
 #   lifecycle.shutdown_step_done    step=background_tasks
 #   lifecycle.shutdown_step_done    step=turn_context_subscriber
+#   lifecycle.shutdown_step_done    step=llm_settings_subscriber
 #   lifecycle.shutdown_step_done    step=line_sessions
 #   lifecycle.shutdown_step_done    step=baileys
 #   lifecycle.shutdown_step_done    step=http
@@ -527,6 +526,11 @@ sudo systemctl start maia
    tem conexão ioredis PRÓPRIA (o ioredis proíbe outros comandos num cliente
    inscrito), então o `pools` do passo 9 não a cobre; deixá-la aberta segurava
    o event loop e disparava o backstop de saída a cada deploy limpo;
+5b. fecha o subscriber de invalidação das settings de modelo do LLM Gateway
+   (#508) — mesma forma, mesma razão e mesmo risco do passo 5: ioredis própria
+   que o `pools` não alcança. Roda aqui porque todo caller do gateway (turnos
+   BullMQ, prompt builders de cron, sonda sintética, tarefas de fundo) já
+   drenou, então ninguém mais vai reler modelo;
 6. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
    timer de reconexão pendente);
 7. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
