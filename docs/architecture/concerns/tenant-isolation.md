@@ -85,6 +85,9 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 |---|---|
 | `tests/integration/leak.spec.ts` | End-to-end cross-tenant query leak check |
 | `tests/integration/repos-leak.spec.ts` | Repository-level leak check |
+| `tests/integration/agent-tool-grants-leak.spec.ts` | `agent_tool_grants` scoped by (tenant, agent) |
+| `tests/integration/playground-objectives-mcp-leak.spec.ts` | Tabelas 087/088/089 — playground, objetivos e MCP (issue #481) |
+| `tests/integration/skip-locked-claims.spec.ts` | Claims `SKIP LOCKED` entregam cada row a um único worker (issue #481) |
 | `tests/unit/cross-entity.spec.ts` | Cross-entity (within-tenant) boundary |
 | `tests/unit/audit-rate-limit-tenant-labels.spec.ts` | Audit counter labels carry tenant attribution |
 | `tests/unit/audit-tenant-fallback.spec.ts` | `system` fallback for out-of-context audits |
