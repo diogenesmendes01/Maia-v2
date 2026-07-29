@@ -84,6 +84,15 @@ retry externo.
 | 200 sem conteúdo utilizável é `response_invalid`, não sucesso | `providers/**` |
 | `workload` é obrigatório; não existe default | `types.ts` + gate em `tests/unit/lib/llm-workload-declaration.spec.ts` |
 
+**Divergência consciente do critério de aceite da #508:** a issue pede que todo
+caller declare `workload` **e** `tier`. `workload` é obrigatório; `tier` não é.
+O tier continua declarado — uma vez por workload, em `workloads.ts` — porque
+obrigá-lo no call site contraria o objetivo da própria issue ("apenas o backend
+seleciona provider, modelo, tier e política de fallback") e devolve a escolha
+de classe de modelo a quem não tem contexto para fazê-la, que foi como 13
+módulos acabaram com slug fixo no código. O argumento longo está em
+`src/lib/llm/types.ts`, no campo `tier` de `LLMGatewayRequest`.
+
 **Como fixar provider/modelo ou desligar fallback num incidente:** troque o
 modelo pelo Admin (`/dashboard/llm-settings`) — a mudança propaga para todas as
 réplicas; para desligar o fallback de um workload, mude `allow_fast_fallback`

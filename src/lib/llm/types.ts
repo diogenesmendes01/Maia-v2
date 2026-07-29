@@ -132,7 +132,32 @@ export type LLMExecutionContext = {
  */
 export type LLMGatewayRequest = {
   workload: LLMWorkload;
-  /** Omitido → tier default do workload (`src/lib/llm/workloads.ts`). */
+  /**
+   * Omitido → tier default do workload (`src/lib/llm/workloads.ts`).
+   *
+   * ## DIVERGÊNCIA CONSCIENTE do critério de aceite da issue #508
+   *
+   * A issue pede, textualmente, que "todos os callers declarem `workload` e
+   * `tier`". `workload` é obrigatório; `tier` **não é**, e isso é decisão, não
+   * esquecimento. O argumento, para quem revisar isto sem o histórico:
+   *
+   * O objetivo declarado da própria issue é "apenas o backend seleciona
+   * provider, modelo, tier e política de fallback". Um `tier` obrigatório no
+   * call site trabalha CONTRA esse objetivo: transforma a classe de modelo em
+   * parâmetro de quem chama, e o call site é justamente quem não tem contexto
+   * para decidir custo/qualidade — foi assim que 13 módulos acabaram com slugs
+   * fixos no código, que é o defeito que esta issue existe para consertar.
+   *
+   * O tier CONTINUA declarado, e de forma mais forte: uma vez por workload, em
+   * `src/lib/llm/workloads.ts`, versionado, revisável num diff e impossível de
+   * divergir entre dois call sites do mesmo workload. Mudar o tier de um
+   * classificador vira uma linha revisada, não um grep por call sites.
+   *
+   * O parâmetro permanece opcional como escape hatch para o caso legítimo de
+   * um workload precisar de tier diferente numa chamada específica (hoje: só a
+   * visão, que declara `vision`). Se esse caso deixar de existir, o campo pode
+   * sumir — mas obrigá-lo seria mover a decisão para o lugar errado.
+   */
   tier?: LLMTier;
   system: string;
   messages: LLMMessage[];

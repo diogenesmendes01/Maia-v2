@@ -26,7 +26,18 @@
 import type { LLMTier, LLMWorkload } from './types.js';
 
 export type WorkloadPolicy = {
-  /** Tier usado quando o caller não passa `tier` explícito. */
+  /**
+   * Tier usado quando o caller não passa `tier` explícito — que é o caso de
+   * praticamente todos.
+   *
+   * ESTE é o lugar onde o tier é declarado. A issue #508 pede que "todos os
+   * callers declarem workload e tier"; a declaração de tier acontece aqui, uma
+   * vez por workload, em vez de repetida em cada call site. O raciocínio
+   * completo está em `src/lib/llm/types.ts`, no campo `tier` de
+   * `LLMGatewayRequest` — resumo: o call site é exatamente quem não tem
+   * contexto para escolher classe de modelo, e foi assim que 13 módulos
+   * acabaram com slug fixo no código.
+   */
   default_tier: LLMTier;
   /**
    * `undefined` → usa `config.CLAUDE_MAX_RETRIES`. Número → teto fixo.
