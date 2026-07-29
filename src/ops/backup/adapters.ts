@@ -16,6 +16,7 @@ import { sql } from 'drizzle-orm';
 import { config } from '@/config/env.js';
 import { db } from '@/db/client.js';
 import { logger } from '@/lib/logger.js';
+import { sendAlert } from '@/lib/alerts.js';
 import { TypedError } from '@/lib/utils.js';
 import { audit } from '@/governance/audit.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
@@ -283,6 +284,18 @@ export function createBackupPorts(): BackupPorts {
           // artifact and, with the bucket, locates the crown jewels.
           log: (event, detail) =>
             logger.warn({ ...detail, key_hash: opaqueLocator(bucket, key) }, event),
+          // An orphan we can only DECLARE needs a human: it is an object
+          // off-site with no manifest and no run row, outside retention and
+          // outside legal hold until someone reconciles the bucket.
+          alert: async (detail) => {
+            await sendAlert({
+              subject: 'Backup upload cancelled without acknowledgement (possible orphan object)',
+              body:
+                `${String(detail.impact)}\n` +
+                `Action: ${String(detail.action)}\n` +
+                `Object locator (hashed): ${opaqueLocator(bucket, key)}`,
+            }).catch(() => null);
+          },
         },
         timeoutMs,
       );

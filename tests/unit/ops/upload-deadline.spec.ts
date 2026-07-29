@@ -17,6 +17,13 @@ function provider(opts: {
   durationMs: number;
   /** Whether the fake stops when aborted (a well-behaved client). */
   honoursAbort: boolean;
+  /**
+   * The worst case, and the one the round-2 review said the fake was missing:
+   * the operation NEVER settles. Not "ignores abort but eventually resolves" —
+   * a Promise that stays pending forever, which is what a wedged socket or a
+   * provider SDK that drops the request looks like.
+   */
+  neverSettles?: boolean;
   /** Whether a completed upload creates the object. */
   creates?: boolean;
   deleteThrows?: boolean;
@@ -26,11 +33,13 @@ function provider(opts: {
 }) {
   const store = new Set<string>();
   const logs: { event: string; detail: Record<string, unknown> }[] = [];
+  const alerts: Record<string, unknown>[] = [];
   let settled = false;
 
   const deps: DeadlineUploadDeps = {
     put: (signal) =>
       new Promise<void>((resolve, reject) => {
+        if (opts.neverSettles) return; // pending forever, on purpose
         const timer = setTimeout(() => {
           settled = true;
           if (opts.creates !== false) store.add('k');
@@ -44,6 +53,9 @@ function provider(opts: {
           });
         }
       }),
+    alert: async (detail) => {
+      alerts.push(detail);
+    },
     objectExists: vi.fn(async () => {
       if (opts.existsThrows) throw new Error('403');
       return store.has('k');
@@ -55,7 +67,7 @@ function provider(opts: {
     log: (event, detail) => logs.push({ event, detail }),
   };
 
-  return { deps, store, logs, hasSettled: () => settled };
+  return { deps, store, logs, alerts, hasSettled: () => settled };
 }
 
 describe('the happy path is untouched', () => {
@@ -112,6 +124,67 @@ describe('the finding: an upload that completes AFTER the deadline', () => {
     await expect(putWithDeadline(p.deps, 5)).rejects.toMatchObject({ code: 'upload_timeout' });
     expect(p.deps.objectExists).toHaveBeenCalled();
     expect(p.store.size).toBe(0);
+  });
+});
+
+describe('an upload that NEVER settles (round-2 finding)', () => {
+  it('returns instead of hanging forever', async () => {
+    const p = provider({ durationMs: 0, honoursAbort: false, neverSettles: true });
+    // Without the cancellation grace this await never resolves and the run
+    // stays active — which the single-active index turns into a permanent
+    // block on every future backup.
+    await expect(
+      putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }),
+    ).rejects.toMatchObject({ code: 'upload_cancel_timeout' });
+  });
+
+  it('DECLARES the orphan as unknown instead of claiming a cleanup', async () => {
+    const p = provider({ durationMs: 0, honoursAbort: false, neverSettles: true });
+    await expect(
+      putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }),
+    ).rejects.toMatchObject({ details: { orphan: 'unknown' } });
+  });
+
+  it('does NOT touch the key — a delete would race a write still in flight', async () => {
+    const p = provider({ durationMs: 0, honoursAbort: false, neverSettles: true });
+    await putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }).catch(() => undefined);
+    expect(p.deps.objectExists).not.toHaveBeenCalled();
+    expect(p.deps.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it('alerts, naming the impact and the operator action', async () => {
+    const p = provider({ durationMs: 0, honoursAbort: false, neverSettles: true });
+    await putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }).catch(() => undefined);
+    expect(p.alerts).toHaveLength(1);
+    expect(String(p.alerts[0]!.impact)).toMatch(/no manifest and no run row/);
+    expect(String(p.alerts[0]!.action)).toMatch(/inspect the bucket prefix/);
+    expect(p.logs.some((l) => l.event === 'backup.upload_cancel_timeout')).toBe(true);
+  });
+
+  it('still resolves normally when cancellation IS acknowledged within the grace', async () => {
+    // Same deadline, but the client stops when told — this must reap, not
+    // degrade to `unknown`.
+    const p = provider({ durationMs: 10_000, honoursAbort: true });
+    await expect(putWithDeadline(p.deps, 5, { cancelGraceMs: 500 })).rejects.toMatchObject({
+      code: 'upload_timeout',
+    });
+    expect(p.deps.objectExists).toHaveBeenCalled();
+  });
+
+  it('a late failure from the abandoned upload never becomes an unhandled rejection', async () => {
+    let rejectLate: ((e: Error) => void) | null = null;
+    const deps: DeadlineUploadDeps = {
+      put: () =>
+        new Promise<void>((_res, rej) => {
+          rejectLate = rej;
+        }),
+      objectExists: async () => false,
+      deleteObject: async () => undefined,
+    };
+    await putWithDeadline(deps, 5, { cancelGraceMs: 10 }).catch(() => undefined);
+    // The operation fails AFTER we gave up on it. Absorbed, not thrown.
+    rejectLate!(new Error('socket reset, far too late'));
+    await new Promise((r) => setTimeout(r, 10));
   });
 });
 
