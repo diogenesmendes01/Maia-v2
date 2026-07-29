@@ -45,7 +45,9 @@ import {
   type TraceEnvelopeWritten,
 } from '@/control-plane/runtime-trace/index.js';
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
+import { DivergentTraceReplayError } from '@/control-plane/runtime-trace/envelope-writer.js';
 import { config } from '@/config/env.js';
+import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { counter, histogram } from './metrics.js';
 import { METRIC } from './taxonomy.js';
@@ -312,6 +314,49 @@ export async function traceTurnDecision(
     });
     return env;
   } catch (err) {
+    // Review round 2 [P2]: a DIVERGENT replay is not an ordinary write failure.
+    // It means an existing trace_id already holds DIFFERENT evidence — an id
+    // collision or tampering. It fails closed regardless of `side_effect_level`
+    // (a "low" turn whose evidence contradicts the record is still a corrupted
+    // audit trail) and is audited, because the trace itself cannot be trusted
+    // to carry the report.
+    if (err instanceof DivergentTraceReplayError) {
+      counter(METRIC.TRACE_COVERAGE, {
+        ...attribution,
+        result: 'failed',
+        reason: 'divergent_replay',
+        side_effect_level: decision.side_effect_level,
+      });
+      logger.error(
+        {
+          trace_id: err.trace_id,
+          tenant_id: err.tenant_id,
+          diverged_fields: err.diverged_fields,
+          ...correlationLogFields(),
+        },
+        'runtime_trace.divergent_replay_refused',
+      );
+      await audit({
+        acao: 'runtime_trace_envelope_divergent_replay',
+        alvo_id: err.trace_id,
+        metadata: {
+          // Field NAMES only — never the conflicting values.
+          diverged_fields: err.diverged_fields,
+          side_effect_level: decision.side_effect_level,
+        },
+      }).catch((e) =>
+        logger.error(
+          { err: (e as Error).message },
+          'runtime_trace.divergent_replay_audit_failed',
+        ),
+      );
+      throw new MandatoryTraceEnvelopeError(
+        err,
+        input.base.tenant_id,
+        decision.side_effect_level,
+      );
+    }
+
     counter(METRIC.TRACE_COVERAGE, {
       ...attribution,
       result: 'failed',

@@ -46,7 +46,12 @@ const { txRows, persisted, dbTransactionMock, dbInsertValuesMock, dbExecuteMock 
         },
         onConflictDoNothing: () => {
           if (!conflict) commit();
-          return Promise.resolve(undefined);
+          // Empty RETURNING on conflict — how the writer detects a replay.
+          const rows = conflict ? [] : [{ trace_id: row.trace_id }];
+          return {
+            then: (res: (v: unknown) => void) => res(rows),
+            returning: () => Promise.resolve(rows),
+          };
         },
       };
     }
@@ -60,6 +65,9 @@ const { txRows, persisted, dbTransactionMock, dbInsertValuesMock, dbExecuteMock 
         const tx = {
           insert: vi.fn((table: unknown) => ({
             values: vi.fn((row: Record<string, unknown>) => insertInto(tableName(table), row)),
+          })),
+          select: vi.fn(() => ({
+            from: () => ({ where: () => ({ limit: () => Promise.resolve([]) }) }),
           })),
         };
         await fn(tx);

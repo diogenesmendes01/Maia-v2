@@ -27,7 +27,11 @@ vi.mock('../../src/db/client.js', () => ({
         const p = dbInsertMock(row) as Promise<unknown>;
         return {
           then: (res: (v: unknown) => void, rej: (e: unknown) => void) => p.then(res, rej),
-          onConflictDoNothing: () => p,
+          onConflictDoNothing: () => ({
+            then: (r: (v: unknown) => void, j: (e: unknown) => void) =>
+              p.then(() => r([{ trace_id: 1 }]), j),
+            returning: () => p.then(() => [{ trace_id: 1 }]),
+          }),
         };
       },
     }),

@@ -35,7 +35,15 @@ const { dbInsertMock, txInsertOnConflictMock, txInsertValuesMock, dbTransactionM
             //  - has .onConflictDoNothing() that returns a promise (outbox path).
             const chain = {
               then: (resolve: (v: unknown) => void) => resolve(undefined),
-              onConflictDoNothing: txInsertOnConflictMock,
+              onConflictDoNothing: () => {
+                txInsertOnConflictMock();
+                // Non-empty RETURNING ⇒ the row was inserted, no replay.
+                const rows = [{ trace_id: 'inserted' }];
+                return {
+                  then: (res: (v: unknown) => void) => res(rows),
+                  returning: () => Promise.resolve(rows),
+                };
+              },
             } as unknown;
             return chain;
           }),
@@ -62,7 +70,14 @@ vi.mock('../../src/db/client.js', () => ({
         const p = dbInsertMock(row) as Promise<unknown>;
         return {
           then: (res: (v: unknown) => void, rej: (e: unknown) => void) => p.then(res, rej),
-          onConflictDoNothing: () => p,
+          // #514 round 2: the writer asks for RETURNING to detect a replay. A
+          // non-empty result means "inserted", which is the default here — the
+          // divergent-replay path has its own spec with a PK-modelling fake.
+          onConflictDoNothing: () => ({
+            then: (res: (v: unknown) => void, rej: (e: unknown) => void) =>
+              p.then(() => res([{ trace_id: 'inserted' }]), rej),
+            returning: () => p.then(() => [{ trace_id: 'inserted' }]),
+          }),
         };
       },
     }),

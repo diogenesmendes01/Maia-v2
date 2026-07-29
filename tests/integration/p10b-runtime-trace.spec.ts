@@ -29,7 +29,15 @@ const { dbInsertValuesMock, dbExecuteMock, dbTransactionMock, txInsertValuesMock
               txInsertValuesMock(row);
               return {
                 then: (resolve: (v: unknown) => void) => resolve(undefined),
-                onConflictDoNothing: txOnConflictMock,
+                onConflictDoNothing: () => {
+                  txOnConflictMock();
+                  // #514 round 2: RETURNING is how the writer detects a replay.
+                  const rows = [{ trace_id: 'inserted' }];
+                  return {
+                    then: (r: (v: unknown) => void) => r(rows),
+                    returning: () => Promise.resolve(rows),
+                  };
+                },
               };
             }),
           })),

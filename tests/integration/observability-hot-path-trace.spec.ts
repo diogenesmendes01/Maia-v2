@@ -24,6 +24,7 @@ const {
   txRows,
   persisted,
   UniqueViolationError,
+  selectFrom,
 } = vi.hoisted(() => {
   const txRows: Array<{ table: string; row: Record<string, unknown> }> = [];
 
@@ -87,15 +88,50 @@ const {
       },
       onConflictDoNothing: () => {
         if (!conflict) commit();
-        return Promise.resolve(undefined);
+        // Postgres RETURNING yields NO row when the conflict clause suppressed
+        // the insert — that empty array is exactly how the writer detects a
+        // replay (issue #514 round 2 [P2]).
+        const rows = conflict ? [] : [{ trace_id: row.trace_id }];
+        return {
+          then: (resolve: (v: unknown) => void) => resolve(rows),
+          returning: () => Promise.resolve(rows),
+        };
       },
     };
+  }
+
+  /**
+   * Reads the same store so a conflict can be compared against what is there.
+   *
+   * Deliberately NOT a query engine: it cannot interpret drizzle's `eq(...)`,
+   * so it returns every row of the table and relies on the writer's `.limit(1)`
+   * taking the first. That is faithful for the replay scenario under test —
+   * one trace id, one stored row — and the specs keep it that way by clearing
+   * `persisted` between cases. Do not reach for it to model multi-row queries.
+   */
+  function selectFrom() {
+    let table = '';
+    const self = {
+      from: (t: unknown) => {
+        table = tableName(t);
+        return self;
+      },
+      where: () => self,
+      limit: () =>
+        Promise.resolve(
+          [...persisted.entries()]
+            .filter(([k]) => k.startsWith(`${table}:`))
+            .map(([, v]) => v),
+        ),
+    };
+    return self;
   }
 
   return {
     txRows,
     persisted,
     UniqueViolationError,
+    selectFrom,
     dbInsertValuesMock: vi.fn().mockResolvedValue(undefined),
     dbExecuteMock: vi.fn().mockResolvedValue({ rows: [] }),
     dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
@@ -103,6 +139,8 @@ const {
         insert: vi.fn((table: unknown) => ({
           values: vi.fn((row: Record<string, unknown>) => insertInto(tableName(table), row)),
         })),
+        // The writer SELECTs inside the transaction on the conflict path.
+        select: vi.fn(() => selectFrom()),
       };
       await fn(tx);
     }),
@@ -112,6 +150,7 @@ const {
 vi.mock('@/db/client.js', () => ({
   db: {
     insert: () => ({ values: dbInsertValuesMock }),
+    select: () => selectFrom(),
     execute: dbExecuteMock,
     transaction: dbTransactionMock,
   },
