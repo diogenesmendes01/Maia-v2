@@ -16,6 +16,7 @@ import { createBackupPorts } from '@/ops/backup/adapters.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
 import { runArtifactRetention } from '@/ops/backup/retention.js';
 import {
+  isSafeArtifactRef,
   resolveArtifactObjectKey,
   resolveArtifactPath,
 } from '@/ops/backup/artifact-path.js';
@@ -23,10 +24,11 @@ import { OPS_LOCK_KEYS, requireOpsLock, withOpsLock } from '@/ops/backup/single-
 import { UNAPPROVED_POLICY_VERSION } from '@/ops/retention/data-classes.js';
 import {
   anyActiveLegalHold,
-  listRetentionCandidates,
+  listArtifactRuns,
   markRunDeleted,
   recordRetentionRun,
 } from '@/db/repositories/ops-repos.js';
+import type { RetentionCandidate } from '@/ops/backup/retention.js';
 
 /**
  * Nightly backup runner — issue #520.
@@ -184,6 +186,78 @@ export async function runBackupRetention(): Promise<void> {
   });
 }
 
+/**
+ * Candidates for one destination.
+ *
+ * ROUND-2 REVIEW FINDING: a run that uploads to S3 ALSO leaves a local copy,
+ * and the previous lister filtered on `destination_kind`, so that local copy
+ * was invisible to the local pass and accumulated forever.
+ *
+ * The two destinations are now enumerated differently, on purpose:
+ *
+ *  - S3 is driven by the RUN ROWS (`destination_kind='s3'`), whose
+ *    `delete_after` is the remote expiry the policy assigned at run time.
+ *  - LOCAL is driven by WHAT IS ON DISK, cross-referenced with the runs. That
+ *    reaches the local copy of an S3 run, applies the (shorter) local retention
+ *    window, and — the other half of the finding — surfaces a file with NO run
+ *    row at all as `unidentified` instead of leaving it invisible.
+ *
+ * Every filename is validated before it becomes a candidate, so a hostile
+ * entry in the directory cannot ride into the delete path.
+ */
+export async function listRetentionCandidatesFor(
+  destination: 'local' | 's3',
+): Promise<RetentionCandidate[]> {
+  const runs = await listArtifactRuns();
+
+  if (destination === 's3') {
+    return runs
+      .filter((r) => r.destination_kind === 's3' && isSafeArtifactRef(r.artifact_ref))
+      .map((r) => ({
+        backup_id: r.backup_id,
+        artifact_ref: r.artifact_ref,
+        state: r.state,
+        destination_kind: 's3' as const,
+        delete_after: r.delete_after,
+        has_manifest: r.has_manifest,
+      }));
+  }
+
+  const byRef = new Map(runs.map((r) => [r.artifact_ref, r]));
+  let files: string[];
+  try {
+    files = readdirSync(config.BACKUP_DIR);
+  } catch {
+    return [];
+  }
+  const localMs = config.BACKUP_RETENTION_LOCAL_DAYS * 86_400_000;
+  return files.filter(isSafeArtifactRef).map((name) => {
+    const run = byRef.get(name);
+    if (!run) {
+      // On disk, unknown to the evidence tables. Reported, never reaped:
+      // deleting an unidentifiable artifact on a guess is the original defect.
+      return {
+        backup_id: `unknown:${name}`,
+        artifact_ref: name,
+        state: 'completed' as const,
+        destination_kind: 'local' as const,
+        delete_after: null,
+        has_manifest: false,
+      };
+    }
+    return {
+      backup_id: run.backup_id,
+      artifact_ref: name,
+      state: run.state,
+      destination_kind: 'local' as const,
+      // The LOCAL window is its own, and shorter: the off-site copy is the
+      // authoritative one, so the local copy need not live as long.
+      delete_after: run.finished_at ? new Date(run.finished_at.getTime() + localMs) : null,
+      has_manifest: run.has_manifest,
+    };
+  });
+}
+
 async function runOneRetentionPass(
   destination: 'local' | 's3',
   dryRun: boolean,
@@ -197,7 +271,7 @@ async function runOneRetentionPass(
   const outcome = await runArtifactRetention(
     {
       now: () => new Date(),
-      listCandidates: listRetentionCandidates,
+      listCandidates: listRetentionCandidatesFor,
       anyActiveHold: anyActiveLegalHold,
       // ROUND-2 REVIEW FINDING: `artifact_ref` comes from a DB row, and this is
       // a REMOVAL path. A corrupted or tampered row carrying `../…`, an
@@ -225,7 +299,22 @@ async function runOneRetentionPass(
         }
         return !existsSync(resolveArtifactPath(config.BACKUP_DIR, candidate.artifact_ref));
       },
-      markDeleted: markRunDeleted,
+      // A run reaches `deleted` only when NO copy remains. Removing the local
+      // copy of an S3 run must not mark the run gone while the authoritative
+      // off-site object is still there — that would hide it from the next
+      // remote pass and strand it outside retention forever.
+      markDeleted: async (candidate) => {
+        if (candidate.backup_id.startsWith('unknown:')) return;
+        const localGone = !existsSync(
+          resolveArtifactPath(config.BACKUP_DIR, candidate.artifact_ref),
+        );
+        const remoteGone =
+          !isS3Configured() ||
+          (await headBackupObject(
+            resolveArtifactObjectKey(config.BACKUP_S3_PREFIX, candidate.artifact_ref),
+          )) === null;
+        if (localGone && remoteGone) await markRunDeleted(candidate.backup_id);
+      },
       audit: (acao, metadata) => audit({ acao: acao as AuditAction, metadata }),
       log: (event, detail) => logger.warn(detail, event),
     },

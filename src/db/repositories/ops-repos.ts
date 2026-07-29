@@ -63,33 +63,53 @@ export const backupEvidenceStore: BackupEvidenceStore = {
   },
 };
 
+/** A run that produced an artifact, whatever destination it ended up on. */
+export interface ArtifactRunRow {
+  backup_id: string;
+  artifact_ref: string;
+  state: RetentionCandidate['state'];
+  destination_kind: 'local' | 's3';
+  /** Remote expiry, from the policy at run time. */
+  delete_after: Date | null;
+  /** When the run finished — the base for the LOCAL expiry. */
+  finished_at: Date | null;
+  has_manifest: boolean;
+}
+
 /**
- * Artifacts retention may consider, for one destination (issue #520 §10).
+ * Every run that produced an artifact, keyed for retention (issue #520 §10).
  *
  * The join to `backup_manifests` is what makes `has_manifest` real: an artifact
  * with no signed manifest cannot be identified, so the planner refuses to
- * delete it. Selection is by EVIDENCE (`delete_after`, state, manifest), never
- * by file mtime or `LastModified` — that was the round-1 P1 finding.
+ * delete it. Selection is by EVIDENCE (state, expiry, manifest), never by file
+ * mtime or `LastModified` — that was the round-1 P1 finding.
+ *
+ * ROUND-2 REVIEW FINDING: this used to filter by `destination_kind`, so the
+ * LOCAL copy of a run that uploaded to S3 (`destination_kind='s3'`) was
+ * invisible to the local pass and accumulated forever — disk, yes, but more
+ * importantly data under a retention policy living outside the lifecycle this
+ * issue promises to govern. The filter is gone; callers scope by destination.
  */
-export async function listRetentionCandidates(
-  destination: 'local' | 's3',
-): Promise<RetentionCandidate[]> {
+export async function listArtifactRuns(): Promise<ArtifactRunRow[]> {
   const rows = await db.execute<{
     backup_id: string;
     artifact_ref: string | null;
     state: string;
+    destination_kind: string;
     delete_after: string | null;
+    finished_at: string | null;
     has_manifest: boolean;
   }>(sql`
     SELECT r.id AS backup_id,
            r.artifact_ref,
            r.state,
+           r.destination_kind,
            r.delete_after::text AS delete_after,
+           r.finished_at::text AS finished_at,
            (m.id IS NOT NULL) AS has_manifest
       FROM ${backup_runs} r
       LEFT JOIN ${backup_manifests} m ON m.backup_run_id = r.id
-     WHERE r.destination_kind = ${destination}
-       AND r.state <> 'deleted'
+     WHERE r.state <> 'deleted'
        AND r.artifact_ref IS NOT NULL
      ORDER BY r.delete_after ASC NULLS LAST
   `);
@@ -97,8 +117,9 @@ export async function listRetentionCandidates(
     backup_id: r.backup_id,
     artifact_ref: r.artifact_ref ?? '',
     state: r.state as RetentionCandidate['state'],
-    destination_kind: destination,
+    destination_kind: r.destination_kind === 's3' ? 's3' : 'local',
     delete_after: r.delete_after ? new Date(r.delete_after) : null,
+    finished_at: r.finished_at ? new Date(r.finished_at) : null,
     has_manifest: r.has_manifest === true,
   }));
 }

@@ -97,6 +97,16 @@ export function assertSafeArtifactRef(ref: unknown): string {
   return ref;
 }
 
+/** Non-throwing form, for filtering a directory listing. */
+export function isSafeArtifactRef(ref: unknown): ref is string {
+  try {
+    assertSafeArtifactRef(ref);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve an artifact to an absolute path and PROVE it stays directly inside
  * `root`. Throws rather than returning a boolean, so a caller cannot delete by

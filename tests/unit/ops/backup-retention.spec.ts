@@ -48,6 +48,8 @@ function store(opts: {
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
   const logs: { event: string; detail: Record<string, unknown> }[] = [];
   const marked: string[] = [];
+  // Round-2: `markDeleted` takes the CANDIDATE now, because one run can have
+  // two copies and only the last one to go marks the run deleted.
 
   const ports: RetentionPorts = {
     now: () => NOW,
@@ -64,8 +66,8 @@ function store(opts: {
       if (!opts.lyingDelete) present.delete(c.backup_id);
     }),
     confirmDeleted: vi.fn(async (c: RetentionCandidate) => !present.has(c.backup_id)),
-    markDeleted: vi.fn(async (id: string) => {
-      marked.push(id);
+    markDeleted: vi.fn(async (c: RetentionCandidate) => {
+      marked.push(c.backup_id);
     }),
     audit: vi.fn(async (action, metadata) => {
       audits.push({ action, metadata });

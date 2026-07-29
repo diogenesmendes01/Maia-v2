@@ -112,8 +112,14 @@ export interface RetentionPorts {
   deleteArtifact(candidate: RetentionCandidate): Promise<void>;
   /** Prove it is gone. "delete returned success" is not evidence. */
   confirmDeleted(candidate: RetentionCandidate): Promise<boolean>;
-  /** Mark the run row as `deleted`. */
-  markDeleted(backup_id: string): Promise<void>;
+  /**
+   * Record that this copy is gone.
+   *
+   * Takes the CANDIDATE, not just an id, because one run can have two copies
+   * (local + off-site) and the run reaches `deleted` only when the LAST one
+   * goes. The adapter decides; the executor just reports what it removed.
+   */
+  markDeleted(candidate: RetentionCandidate): Promise<void>;
   audit(action: string, metadata: Record<string, unknown>): Promise<void>;
   log(event: string, detail: Record<string, unknown>): void;
 }
@@ -210,7 +216,7 @@ export async function runArtifactRetention(
         });
         continue;
       }
-      await ports.markDeleted(candidate.backup_id);
+      await ports.markDeleted(candidate);
       outcome.deleted += 1;
       await ports.audit('backup_artifact_deleted', {
         backup_id: candidate.backup_id,

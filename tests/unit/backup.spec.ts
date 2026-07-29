@@ -28,11 +28,14 @@ const withOpsLockMock = vi.fn();
 const requireOpsLockMock = vi.fn();
 const createBackupPortsMock = vi.fn(() => ({}) as never);
 const recordRetentionRunMock = vi.fn().mockResolvedValue(undefined);
+const readdirSyncMock = vi.fn(() => [] as string[]);
+const listArtifactRunsMock = vi.fn().mockResolvedValue([]);
 
 vi.mock('node:fs', () => ({
-  readdirSync: vi.fn(() => []),
+  readdirSync: readdirSyncMock,
   statSync: vi.fn(() => ({ size: 123, mtimeMs: Date.now() })),
   rmSync: vi.fn(),
+  existsSync: vi.fn(() => false),
 }));
 vi.mock('../../src/governance/audit.js', () => ({ audit: auditMock }));
 vi.mock('../../src/lib/alerts.js', () => ({ sendAlert: sendAlertMock }));
@@ -50,7 +53,7 @@ vi.mock('../../src/ops/backup/retention.js', () => ({
 }));
 vi.mock('../../src/db/repositories/ops-repos.js', () => ({
   anyActiveLegalHold: vi.fn(),
-  listRetentionCandidates: vi.fn(),
+  listArtifactRuns: listArtifactRunsMock,
   markRunDeleted: vi.fn(),
   recordRetentionRun: recordRetentionRunMock,
 }));
@@ -130,6 +133,10 @@ beforeEach(() => {
   withOpsLockMock.mockReset();
   requireOpsLockMock.mockReset();
   recordRetentionRunMock.mockClear();
+  readdirSyncMock.mockReset();
+  readdirSyncMock.mockReturnValue([]);
+  listArtifactRunsMock.mockReset();
+  listArtifactRunsMock.mockResolvedValue([]);
   runVerifiedBackupMock.mockResolvedValue(backupResult());
   runArtifactRetentionMock.mockResolvedValue(retentionOutcome());
   // The retention lock is fail-closed: `requireOpsLock` runs the body or throws.
@@ -216,6 +223,95 @@ describe('nightly_backup worker', () => {
     expect(isSystemContext(observed!)).toBe(true);
     expect(observed!.tenant_id).not.toBe('default');
     expect(observed!.agent_id).not.toBe('default');
+  });
+});
+
+describe('retention candidates reach the LOCAL copy of an S3 run (round-2 finding)', () => {
+  const S3_REF = 'maia-2026-07-01T03-00-00-aaaaaaaaaaaa.dump';
+  const FINISHED = new Date('2026-07-01T03:05:00.000Z');
+
+  function s3Run() {
+    return {
+      backup_id: 'run-s3',
+      artifact_ref: S3_REF,
+      state: 'completed' as const,
+      destination_kind: 's3' as const,
+      delete_after: new Date('2026-07-31T00:00:00.000Z'),
+      finished_at: FINISHED,
+      has_manifest: true,
+    };
+  }
+
+  it('the local pass SEES the local copy of a run whose destination is s3', async () => {
+    listArtifactRunsMock.mockResolvedValue([s3Run()]);
+    readdirSyncMock.mockReturnValue([S3_REF]);
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    const local = await listRetentionCandidatesFor('local');
+    expect(local).toHaveLength(1);
+    expect(local[0]!.backup_id).toBe('run-s3');
+    expect(local[0]!.destination_kind).toBe('local');
+  });
+
+  it('applies the shorter LOCAL window to that copy, not the remote expiry', async () => {
+    listArtifactRunsMock.mockResolvedValue([s3Run()]);
+    readdirSyncMock.mockReturnValue([S3_REF]);
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    const [c] = await listRetentionCandidatesFor('local');
+    // finished_at + BACKUP_RETENTION_LOCAL_DAYS (7 in the mocked config).
+    expect(c!.delete_after).toEqual(new Date(FINISHED.getTime() + 7 * 86_400_000));
+    expect(c!.delete_after).not.toEqual(s3Run().delete_after);
+  });
+
+  it('the s3 pass still sees only the remote copies, with the remote expiry', async () => {
+    listArtifactRunsMock.mockResolvedValue([
+      s3Run(),
+      {
+        backup_id: 'run-local',
+        artifact_ref: 'maia-2026-07-02T03-00-00-bbbbbbbbbbbb.dump',
+        state: 'completed' as const,
+        destination_kind: 'local' as const,
+        delete_after: null,
+        finished_at: FINISHED,
+        has_manifest: true,
+      },
+    ]);
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    const remote = await listRetentionCandidatesFor('s3');
+    expect(remote.map((c) => c.backup_id)).toEqual(['run-s3']);
+    expect(remote[0]!.delete_after).toEqual(s3Run().delete_after);
+  });
+
+  it('surfaces a file on disk with NO run row as unidentified, never deletable', async () => {
+    listArtifactRunsMock.mockResolvedValue([]);
+    readdirSyncMock.mockReturnValue(['maia-2026-01-01T00-00-00-cccccccccccc.dump']);
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    const [c] = await listRetentionCandidatesFor('local');
+    expect(c!.has_manifest).toBe(false);
+    expect(c!.delete_after).toBeNull();
+    expect(c!.backup_id).toMatch(/^unknown:/);
+  });
+
+  it('ignores directory entries that are not valid artifact names', async () => {
+    listArtifactRunsMock.mockResolvedValue([]);
+    readdirSyncMock.mockReturnValue([
+      '../../etc/passwd',
+      'maia-x.dump.partial',
+      'README',
+      'maia-2026-01-01T00-00-00-cccccccccccc.dump',
+    ]);
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    const local = await listRetentionCandidatesFor('local');
+    expect(local.map((c) => c.artifact_ref)).toEqual([
+      'maia-2026-01-01T00-00-00-cccccccccccc.dump',
+    ]);
+  });
+
+  it('returns nothing when the backup directory cannot be read', async () => {
+    readdirSyncMock.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const { listRetentionCandidatesFor } = await import('../../src/workers/backup.js');
+    expect(await listRetentionCandidatesFor('local')).toEqual([]);
   });
 });
 
