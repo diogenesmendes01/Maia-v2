@@ -144,18 +144,25 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
   const scope = currentScope();
 
   /**
-   * Deadline ABSOLUTO da chamada inteira. Quando o caller não declara um, o
-   * gateway DERIVA um a partir de `LLM_TURN_DEADLINE_MS`.
+   * Deadline ABSOLUTO da chamada inteira: o MENOR entre o que o caller pediu e
+   * o teto do operador.
    *
-   * A mecânica de deadline compartilhado existia desde a primeira versão, mas
-   * o campo era opcional e quase nenhum caller o passava — na prática o
+   * Duas correções distintas moram nesta linha.
+   *
+   * A primeira: a mecânica de deadline compartilhado existia desde o começo,
+   * mas o campo era opcional e quase nenhum caller o passava — na prática o
    * gateway rodava com `Infinity`, e cada tentativa podia consumir o timeout
-   * por requisição inteiro, mais backoff, mais fallback. Ou seja: o mecanismo
-   * certo, nunca acionado. Derivar aqui é o que torna o limite real para o
-   * caller que não declara nada; a issue #507 continua podendo passar um
-   * deadline mais apertado, e o gateway sempre usa o menor tempo restante.
+   * por requisição inteiro, mais backoff, mais fallback. Derivar de
+   * `LLM_TURN_DEADLINE_MS` é o que torna o limite real para quem não declara.
+   *
+   * A segunda: derivar sozinho não bastava, porque um `deadline_at` explícito
+   * no futuro distante passava por cima do orçamento configurado.
+   * `LLM_TURN_DEADLINE_MS` é TETO, não default — declarar um deadline serve
+   * para APERTAR o limite (é o que a issue #507 faz por turno), nunca para
+   * afrouxá-lo. Daí o `Math.min`.
    */
-  const deadlineAt = ctx.deadline_at ?? startedAt + config.LLM_TURN_DEADLINE_MS;
+  const deadlineCeiling = startedAt + config.LLM_TURN_DEADLINE_MS;
+  const deadlineAt = Math.min(ctx.deadline_at ?? deadlineCeiling, deadlineCeiling);
 
   // (1) Cancelamento antecipado: um caller que já abortou não paga nem pela
   // leitura de settings. Precede QUALQUER I/O.

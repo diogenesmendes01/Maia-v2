@@ -114,9 +114,13 @@ export type LLMExecutionContext = {
    * Instante absoluto (ms epoch) em que a chamada inteira deve estar morta.
    *
    * Opcional, mas NUNCA ausente na prática: quando o caller não declara um, o
-   * gateway deriva a partir de `LLM_TURN_DEADLINE_MS`. Declarar serve para
-   * APERTAR o limite (é o que a issue #507 faz por turno), nunca para afrouxá-lo
-   * — o gateway sempre usa o menor tempo restante.
+   * gateway deriva a partir de `LLM_TURN_DEADLINE_MS`.
+   *
+   * Declarar serve para APERTAR o limite (é o que a issue #507 faz por turno),
+   * nunca para afrouxá-lo: `LLM_TURN_DEADLINE_MS` é TETO, e o gateway aplica
+   * `min(deadline_at, now + LLM_TURN_DEADLINE_MS)`. Um valor no futuro
+   * distante é silenciosamente reduzido ao teto do operador — o orçamento de
+   * quem opera o processo não é sobrescrevível por um caller.
    */
   deadline_at?: number;
 };

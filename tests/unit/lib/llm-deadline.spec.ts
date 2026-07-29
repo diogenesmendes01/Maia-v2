@@ -145,4 +145,40 @@ describe('deadline derivado — caller que não declara nada', () => {
     const opts = anthropicCreateMock.mock.calls[0]?.[1];
     expect(opts.timeout).toBeLessThanOrEqual(50);
   });
+
+  /**
+   * `LLM_TURN_DEADLINE_MS` é TETO, não default. Derivar quando o caller omite
+   * fechava só metade do buraco: um `deadline_at` no futuro distante passava
+   * por cima do orçamento do operador. O orçamento de quem opera o processo
+   * não é sobrescrevível por um caller.
+   */
+  it('um deadline declarado MAIOR que o teto é reduzido ao teto', async () => {
+    anthropicCreateMock.mockRejectedValue(apiError(503));
+
+    const t0 = Date.now();
+    const err = await withScope(() =>
+      // Uma hora no futuro — sem o clamp, a chamada retentaria com backoff por
+      // muito mais que os 400ms configurados.
+      executeLLM({ ...REQ, ctx: { deadline_at: Date.now() + 3_600_000 } }),
+    ).catch((e) => e);
+
+    expect(err.kind).toBe('timeout');
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('o teto também limita o timeout por tentativa de um caller folgado', async () => {
+    anthropicCreateMock.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'ok' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+
+    await withScope(() =>
+      executeLLM({ ...REQ, ctx: { deadline_at: Date.now() + 3_600_000 } }),
+    );
+
+    const opts = anthropicCreateMock.mock.calls[0]?.[1];
+    expect(opts.timeout).toBeLessThanOrEqual(400);
+  });
 });
