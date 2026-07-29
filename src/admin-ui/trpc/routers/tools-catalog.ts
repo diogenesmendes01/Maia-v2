@@ -29,11 +29,11 @@
  *   `@/config/env` is side-effect-free (zod validation only; no timers/Redis)
  *   and the admin-ui already imports it transitively via the DB client.
  *
- * Richer than `getToolSchemas()` (`_registry.ts`): that helper returns a
- * stubbed `input_schema: { type:'object', additionalProperties:true }` and is
+ * Different from `getToolSchemas()` (`_registry.ts`): that helper returns the
+ * canonical JSON Schema the MODEL receives (issue #509, `schema-json.ts`) and is
  * filtered by LLM permission logic. A catalog wants the FULL set (including
  * tools disabled by an off feature flag, so operators see what exists and
- * which flag turns it on) plus an expanded input field list.
+ * which flag turns it on) plus a flat, human-readable input field list.
  */
 import { router, protectedProcedure } from '../server.js';
 import { config } from '@/config/env.js';

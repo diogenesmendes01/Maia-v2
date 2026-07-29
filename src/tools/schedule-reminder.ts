@@ -7,18 +7,36 @@ import { reminderTaskBlueprint } from '@/scheduling/engine.js';
 const PAST_GRACE_SECONDS = 60;
 const FAR_FUTURE_THRESHOLD_DAYS = 365;
 
+// Issue #509 §6 — descriptions shipped to the model via the canonical JSON
+// Schema. `quando` carries a `.refine()` (futuro), which has no JSON Schema
+// keyword, so the constraint is stated in prose here AND still enforced by Zod
+// in the dispatcher.
 const inputSchema = z.object({
-  entidade_id: z.string().uuid().optional(),
-  quando: z.string().refine(
-    (s) => {
-      const t = Date.parse(s);
-      if (Number.isNaN(t)) return false;
-      return t >= Date.now() - PAST_GRACE_SECONDS * 1000;
-    },
-    { message: 'quando precisa ser ISO 8601 futuro (ou no máximo 60s no passado)' },
-  ),
-  texto: z.string().min(1).max(500),
-  canal: z.enum(['whatsapp']).default('whatsapp'),
+  entidade_id: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('UUID opaco da entidade. Omita quando o lembrete não for de uma entidade específica.'),
+  quando: z
+    .string()
+    .refine(
+      (s) => {
+        const t = Date.parse(s);
+        if (Number.isNaN(t)) return false;
+        return t >= Date.now() - PAST_GRACE_SECONDS * 1000;
+      },
+      { message: 'quando precisa ser ISO 8601 futuro (ou no máximo 60s no passado)' },
+    )
+    .describe(
+      'Instante do disparo em ISO 8601 com offset, ex.: 2026-03-01T09:00:00-03:00. ' +
+        'Deve ser futuro (tolerância de 60s no passado). Resolva expressões relativas ' +
+        '("amanhã 9h") usando o fuso do interlocutor antes de chamar.',
+    ),
+  texto: z.string().min(1).max(500).describe('Texto do lembrete, 1 a 500 caracteres.'),
+  canal: z
+    .enum(['whatsapp'])
+    .default('whatsapp')
+    .describe('Canal de entrega. Omita para usar o default "whatsapp".'),
 });
 
 const outputSchema = z.object({

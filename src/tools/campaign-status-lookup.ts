@@ -15,7 +15,9 @@ const inputSchema = z
   })
   .refine((v) => Boolean(v.cnpj ?? v.company_id), {
     message: 'cnpj or company_id is required',
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe('Consulta status de campanha. Informe cnpj OU company_id (ao menos um).');
 
 const outputSchema = z.object({
   status: z.enum(['active', 'removed', 'unknown']),

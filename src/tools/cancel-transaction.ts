@@ -9,9 +9,22 @@ const inputSchema = z.object({
   // entity that actually owns the transaction. Without it, the dispatcher
   // would fall back to `scope.entidades[0]` and could authorize against the
   // wrong profile (allowing/blocking based on an unrelated entity).
-  entidade_id: z.string().uuid(),
-  transacao_id: z.string().uuid(),
-  motivo: z.string().max(200).optional(),
+  // Issue #509 §6 — descriptions shipped to the model via the canonical JSON
+  // Schema. They describe format/semantics only; authority is never declarable
+  // from args.
+  entidade_id: z
+    .string()
+    .uuid()
+    .describe('UUID opaco da entidade dona da transação. Obrigatório: define contra qual perfil a permissão é checada.'),
+  transacao_id: z.string().uuid().describe('UUID opaco da transação a cancelar.'),
+  motivo: z
+    .string()
+    .max(200)
+    .optional()
+    .describe(
+      'Motivo do cancelamento, até 200 caracteres. Cancelar NÃO apaga o lançamento: ' +
+        'marca como cancelada e mantém a trilha. Para corrigir um valor, cancele e registre de novo.',
+    ),
 });
 
 const outputSchema = z.union([

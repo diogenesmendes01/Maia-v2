@@ -626,6 +626,13 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_STRICT_TOOL_SCHEMAS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_TURN_STATE_AUTHORITATIVE",
           "secret": false,
           "required": false,
@@ -1165,6 +1172,7 @@
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1320,6 +1328,7 @@
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1474,6 +1483,7 @@
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",

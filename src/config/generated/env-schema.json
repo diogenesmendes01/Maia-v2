@@ -1438,6 +1438,21 @@
         "true"
       ]
     },
+    "FEATURE_STRICT_TOOL_SCHEMAS": {
+      "type": "string",
+      "description": "NÃO é uma flag inócua: muda o JSON Schema das tools ENTREGUE ao modelo e, portanto, como ele chama tools. ON (default, #509): schema estrito derivado do contrato Zod — campos, obrigatórios, enums, limites e descrições reais. OFF: volta o stub genérico {type:object, additionalProperties:true}. Só afeta o que o modelo é INFORMADO — a revalidação Zod no dispatcher e todos os gates de grant/permissão/limite/aprovação seguem ativos nas duas posições, então desligar nunca amplia o que uma tool pode fazer. Lever de rollback temporária; remover junto com o branch legado em src/tools/_registry.ts.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
     "FEATURE_TURN_STATE_AUTHORITATIVE": {
       "type": "string",
       "description": "Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno `retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído (`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. Ver docs/runbooks/turn-state-machine.md §2.",

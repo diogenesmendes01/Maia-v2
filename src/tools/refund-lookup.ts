@@ -16,7 +16,9 @@ const inputSchema = z
   })
   .refine((v) => Boolean(v.protocol ?? v.cnpj ?? v.company_id), {
     message: 'a protocol or company identifier is required',
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe('Consulta de reembolso. Informe AO MENOS UM: protocol, cnpj ou company_id.');
 
 const outputSchema = z.object({
   found: z.boolean(),

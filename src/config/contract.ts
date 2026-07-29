@@ -1182,6 +1182,26 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_STRICT_TOOL_SCHEMAS: {
+    name: 'FEATURE_STRICT_TOOL_SCHEMAS',
+    description:
+      'NÃO é uma flag inócua: muda o JSON Schema das tools ENTREGUE ao modelo e, ' +
+      'portanto, como ele chama tools. ON (default, #509): schema estrito derivado ' +
+      'do contrato Zod — campos, obrigatórios, enums, limites e descrições reais. ' +
+      'OFF: volta o stub genérico {type:object, additionalProperties:true}. Só afeta ' +
+      'o que o modelo é INFORMADO — a revalidação Zod no dispatcher e todos os gates ' +
+      'de grant/permissão/limite/aprovação seguem ativos nas duas posições, então ' +
+      'desligar nunca amplia o que uma tool pode fazer. Lever de rollback temporária; ' +
+      'remover junto com o branch legado em src/tools/_registry.ts.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_TURN_STATE_AUTHORITATIVE: {
     name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
     description:
