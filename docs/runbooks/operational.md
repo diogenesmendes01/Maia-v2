@@ -22,10 +22,24 @@ ssh maia 'tail -50 /var/log/maia.log | grep baileys'
 **Caso 2 — LoggedOut**: o auto-recovery deveria ter rotacionado o token e mandado alerta. Se você não recebeu o alerta:
 
 ```bash
-ssh maia 'cat .baileys-auth/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
-# Browser → https://maia.SEU-DOMINIO.com/setup?token=<TOKEN>
+ssh maia 'cat .baileys-auth/control/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
+# Browser → https://maia.SEU-DOMINIO.com/setup
+# A página pede o token: COLE no formulário (o token vai no corpo do POST).
 # Clique "QR" ou "Código de 8 dígitos"
 ```
+
+> **Issue #518 — o token NÃO vai mais na URL.** `/setup?token=…` não autentica
+> mais: a URL ficava no histórico do navegador, no header `Referer` e no
+> access log do nginx. O token é colado uma vez no formulário e trocado por um
+> cookie de sessão `httpOnly` + `SameSite=Strict` válido por 30 minutos.
+> Rotacionar o token revoga as sessões abertas.
+>
+> Break-glass para automação/curl (sem browser), com o token em HEADER:
+>
+> ```bash
+> TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+> curl -s -H "x-maia-setup-token: $TOKEN" https://maia.SEU-DOMINIO.com/setup/status
+> ```
 
 **Caso 3 — recovery travou**: verifique no `audit_log` se `pairing_recovery_started` apareceu sem `pairing_recovery_completed`:
 
@@ -48,6 +62,106 @@ sudo systemctl start maia
 **Audit log relacionado**: `pairing_recovery_started`, `pairing_recovery_completed`, `pairing_logged_out`, `setup_token_rotated`.
 
 > Quando a PR #24 (audit_watcher) for mergeada, a regra `pairing_recovery_stuck` dispara alerta automático após 1 min sem `_completed`.
+
+---
+
+## 1b. Linhas ADICIONAIS: parear, cancelar, re-parear (Admin, issue #518)
+
+A linha primária continua no `/setup`. Toda linha **adicional** é operada pelo
+console autenticado — sem shell, sem curl, sem token:
+
+**Console → Setup → Canais.** Cada linha mostra:
+
+| Estado | Significado | Próxima ação |
+|---|---|---|
+| `declared` | Número registrado; ninguém provou a posse. Não roteia | **Parear** |
+| `pairing` | Sessão aberta; QR/código na tela | Acompanhar ou **Cancelar** |
+| `aborting` | Cancelamento pedido; aguardando o runtime confirmar | Aguardar (segundos) |
+| `verified_offline` | Posse provada, mas **não roteia**: falta readiness | Criar a política com papel padrão ativo — o backend ativa sozinho |
+| `connected` | Sessão viva: envia e recebe | — |
+| `recovering` | Queda transitória; o runtime reconecta sozinho | Aguardar |
+| `logged_out` | O WhatsApp encerrou a sessão — a posse acabou | **Re-parear** |
+| `failed` | Última tentativa não completou (mismatch, TTL, restart) | **Repetir** |
+| `disabled` | Desligada pelo operador | **Parear** quando quiser religar |
+
+**Pré-requisito de deploy**: `MAIA_STAGING_KEYRING` + `MAIA_STAGING_ACTIVE_KEY_ID`
+configurados no runtime **e** no console. O QR/código só trafegam cifrados; sem
+keyring a tela mostra os estados mas o botão de parear fica desabilitado com a
+explicação.
+
+**Como funciona por baixo** (útil quando algo trava): o console NÃO fala com o
+Baileys. Ele grava um comando em `channel_line_state` com o ator administrativo;
+o worker `channel_pairing` (a cada 5s, no processo do runtime) reivindica,
+executa e devolve o estado.
+
+Com **mais de uma réplica**, dois conceitos de posse convivem na tabela:
+`owner_instance` (+ `owner_lease_expires_at`) é quem está executando a ORDEM;
+`session_owner_instance` (+ `session_owner_lease_expires_at`) é quem segura o
+SOCKET. `disable` e `repair` são endereçados (`target_instance`) à réplica dona
+do socket — só ela consegue derrubá-lo. Lease vencida do alvo libera o comando
+para qualquer réplica (o processo morreu e levou o socket junto).
+
+```sql
+-- Quem segura o socket de cada linha, e a ordem endereçada a quem.
+SELECT channel_id, session_owner_instance, session_owner_lease_expires_at,
+       command, target_instance
+  FROM channel_line_state WHERE session_owner_instance IS NOT NULL OR command IS NOT NULL;
+
+-- Comando pendente que ninguém reivindicou ⇒ o worker do runtime está parado.
+SELECT channel_id, command, command_requested_at, command_claimed_at, owner_instance
+  FROM channel_line_state WHERE command IS NOT NULL;
+
+-- Tentativas presas em pairing (o sweep de 1min deveria zerar isto).
+SELECT channel_id, state, reason_code, pairing_expires_at
+  FROM channel_line_state WHERE state = 'pairing';
+```
+
+**Restart durante o pareamento**: a sessão vivia em memória e morreu junto. O
+worker marca a tentativa como `failed` com `reason_code = interrupted_retryable`
+e audita `pairing_session_expired`. Nunca vira `verified`. O operador clica em
+"Repetir pareamento".
+
+**Mismatch de número**: se o WhatsApp que leu o QR não for a linha declarada, o
+pareamento falha com `line_mismatch` e o canal NÃO é ativado. Digitar um número
+nunca dá posse.
+
+**Pareou mas não responde?** Provavelmente é o gate de readiness (issue #518
+§4): posse provada **não** é permissão de rotear. Uma linha só é ativada quando
+o backend revalida, deterministicamente, a mesma sequência do go-live checklist:
+
+1. o **agente** tem perfil operacional **ativo**;
+2. o canal tem política de canal;
+3. o papel padrão dessa política está **ativo**.
+
+Até lá a linha fica `verified_offline` e o audit registra
+`channel_activation_deferred` com o motivo (`missing_active_profile`,
+`missing_policy` ou `default_role_inactive`).
+
+Não é preciso re-parear: o worker revalida a cada minuto e emite
+`channel_activated` assim que a política ficar pronta.
+
+```sql
+-- Linhas com posse provada esperando readiness.
+SELECT s.channel_id, s.reason_code, c.external_id, c.active
+  FROM channel_line_state s JOIN channels c ON c.id = s.channel_id
+ WHERE s.state = 'verified_offline' AND c.active = false;
+```
+
+**Audit log relacionado**: `channel_pairing_requested`, `pairing_session_started`,
+`pairing_session_verified`, `pairing_session_failed`, `pairing_session_aborted`,
+`pairing_session_expired`, `line_session_transition`, `channel_disabled`,
+`channel_repair_requested`, `channel_activation_deferred`, `channel_activated`.
+Nenhum deles carrega QR, código, token ou auth state.
+
+**Break-glass** (console fora do ar), sem token em query string:
+
+```bash
+TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+curl -s -X POST -H "x-maia-setup-token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"method":"qr"}' https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair
+curl -s -H "x-maia-setup-token: $TOKEN" \
+  https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair/status
+```
 
 ---
 
@@ -397,7 +511,8 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 - [ ] `npm run db:migrate` rodado
 - [ ] `npm run build` clean
 - [ ] App started → log mostra `setup.bootstrap_token_ready` (cold start, sem `creds.json`)
-- [ ] SSH cat `.baileys-auth/setup-token.txt` → `/setup?token=…` no browser → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] SSH cat `.baileys-auth/control/setup-token.txt` → abrir `/setup` no browser → colar o token no formulário (nunca na URL) → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] Linhas ADICIONAIS: parear pelo Admin (`/setup/channels`), não pelo `/setup` — o console é autenticado e a auditoria fica com o ator administrativo (issue #518)
 - [ ] Audit log mostra `system_started`, `pairing_qr_displayed` (ou `pairing_code_requested`), `pairing_completed`
 - [ ] `/health/whatsapp` ok
 - [ ] Mande mensagem teste pro número Maia → log mostra `baileys.message.enqueued` → resposta do agente em ~3-8s

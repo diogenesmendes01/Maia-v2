@@ -54,6 +54,10 @@ vi.mock('../../../src/governance/audit.js', () => ({ audit: vi.fn(async () => un
 vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
   channelsRepo: { listActiveWhatsappLinesCrossTenant: vi.fn(async () => []) },
 }));
+// #518 — ver nota em line-sessions-shutdown.spec.ts.
+vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
+  channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
+}));
 vi.mock('../../../src/gateway/baileys.js', () => ({
   ingressUpsertMessage: ingressMock,
   handleMessagesUpdate: handleMessagesUpdateMock,

@@ -38,6 +38,7 @@ import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
 import { runObjectiveExecuteWorker, runObjectivePerceiveWorker } from './objective-execute-worker.js';
 import { runMcpSyncWorker } from './mcp-sync-worker.js';
+import { runChannelPairingWorker } from './channel-pairing-worker.js';
 import { runSyntheticProbe } from './synthetic-probe.js';
 
 export type Job = {
@@ -91,6 +92,13 @@ export const JOBS: Job[] = [
   // (UI desonesta). A FLAG é o gate real: com FEATURE_MCP_TOOLS off o
   // worker é no-op na primeira linha (nenhuma rede, nenhum secret).
   { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 1 },
+  // Issue #518 — ponte Admin→runtime do pareamento de linhas WhatsApp. O
+  // console só tem Postgres; o socket Baileys vive aqui. Cadência de 5s
+  // porque o operador está OLHANDO a tela esperando o QR — um cron de 1min
+  // tornaria o fluxo inutilizável. PHASE 1 de propósito (startWorkers(1)
+  // ignora phase>1); o custo em repouso é um probe em índice parcial
+  // (`WHERE command IS NOT NULL`), que não retorna nada sem operador agindo.
+  { name: 'channel_pairing', cron: '*/5 * * * * *', fn: runChannelPairingWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
   // Sonda sintética (spec 2026-07-17 §1.1). PHASE 1 de propósito: startWorkers(1)
   // ignora phase>1, então phase 2 NUNCA seria agendado (correção do review). É

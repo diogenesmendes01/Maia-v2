@@ -32,6 +32,10 @@ import { audit } from '../governance/audit.js';
 import { runWithTenantContext } from '../db/tenant-context.js';
 import { channelsRepo } from '../db/repositories/channel-repos.js';
 import {
+  channelLineStateRepo,
+  type LineState,
+} from '../db/repositories/channel-line-state-repos.js';
+import {
   ingressUpsertMessage,
   handleMessagesUpdate,
   getCurrentLineE164,
@@ -51,6 +55,7 @@ import {
   type LineTransport,
 } from './line-session-manager.js';
 import { triggerRecovery } from '../setup/recovery.js';
+import { runtimeInstanceId } from '../runtime/instance-identity.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -64,6 +69,14 @@ type LineChannel = {
 };
 
 type LineSessionState = {
+  /**
+   * Triplete da linha desta sessão. Guardado no estado porque a posse de
+   * sessão precisa ser PUBLICADA com escopo: `channel_line_state` exige
+   * `tenant_id`/`agent_id` e a row pode ainda não existir (canal ativado fora
+   * do fluxo do console). Sem isto só sobrava o `channel_id`, e o registro de
+   * posse virava um UPDATE que silenciosamente não pegava nada.
+   */
+  channel: LineChannel;
   sock: WASocket | null;
   connected: boolean;
   reconnectAttempts: number;
@@ -91,6 +104,43 @@ function auditLineTransition(
     { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
     () => audit({ acao: 'line_session_transition', metadata }),
   );
+}
+
+/**
+ * Issue #518 — a transição de sessão também PERSISTE (migration 103), para
+ * que o console mostre conectado/recovering/deslogado sem depender de estado
+ * em memória de outro processo. Best-effort e fail-isolated: a sessão de
+ * WhatsApp nunca cai porque o Postgres piscou. Nenhum material sensível é
+ * gravado aqui — só o estado e um reason code sanitizado.
+ */
+function persistLineState(
+  channel: LineChannel,
+  session: LineSessionState,
+  state: LineState,
+  extra: { reason_code?: string | null; connected?: boolean } = {},
+): void {
+  // Review PR #528 (P1) — guard de IDENTIDADE, o mesmo padrão do pareamento.
+  // Um `connection.update` atrasado do socket que acabou de ser encerrado
+  // gravava `connected` DEPOIS de o operador desabilitar a linha, e a tela
+  // voltava a dizer que ela estava no ar. Só escreve quem ainda é a sessão
+  // corrente deste canal e não foi parada.
+  if (session.stopped || sessions.get(channel.id) !== session) return;
+  const now = new Date();
+  void channelLineStateRepo
+    .upsertTransition({
+      channel_id: channel.id,
+      tenant_id: channel.tenant_id,
+      agent_id: channel.agent_id,
+      state,
+      reason_code: extra.reason_code ?? null,
+      ...(extra.connected ? { connected_at: now } : { disconnected_at: now }),
+    })
+    .catch((err) =>
+      logger.warn(
+        { channel_id: channel.id, state, err: (err as Error).message },
+        'line_session.state_persist_failed',
+      ),
+    );
 }
 
 /**
@@ -203,6 +253,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
   }
 
   const state: LineSessionState = sessions.get(channel.id) ?? {
+    channel,
     sock: null,
     connected: false,
     reconnectAttempts: 0,
@@ -260,6 +311,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         state: 'connected',
         is_primary: false,
       });
+      persistLineState(channel, state, 'connected', { connected: true });
       return;
     }
     if (u.connection === 'close') {
@@ -278,6 +330,12 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         is_primary: false,
         reason,
       });
+      // `closed` por loggedOut é PERDA DE POSSE (a linha precisa re-parear);
+      // `closed` por desistir da reconexão é `failed` (retryable). Os dois
+      // são estados distintos para o operador — a UI oferece CTAs diferentes.
+      persistLineState(channel, state, loggedOut ? 'logged_out' : 'recovering', {
+        reason_code: loggedOut ? 'whatsapp_logged_out' : 'transport_closed',
+      });
       // Cap. 7 — loggedOut persiste o encerramento da posse (canal inativo +
       // rm do auth SÓ desta linha) em vez de fechar apenas em memória.
       if (loggedOut) void handleLineLoggedOut(channel, reason);
@@ -289,6 +347,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
           'line_session.reconnect_giving_up',
         );
         manager.markState(channel.id, 'closed');
+        persistLineState(channel, state, 'failed', { reason_code: 'reconnect_exhausted' });
         return;
       }
       const delay = Math.min(
@@ -334,12 +393,78 @@ export async function startAdditionalLineSessions(): Promise<void> {
 }
 
 /**
+ * Issue #518 / review PR #528 (P1) — encerra a sessão de UMA linha.
+ *
+ * `disable` e `requestRepair` mexiam só no banco: desativavam o registro e
+ * (no repair) apagavam o auth dir, mas o SOCKET continuava vivo. Uma linha
+ * "desabilitada" seguia registrada no transporte, os timers de reconexão
+ * continuavam disparando, `connection.update` atrasado regravava `connected`,
+ * e o Baileys podia recriar credenciais em cima do dir recém-apagado ou
+ * coexistir com a tentativa de pareamento nova.
+ *
+ * A ordem aqui é o contrato: marcar como parada (para os callbacks pararem de
+ * escrever) → cancelar o timer de reconexão → encerrar o socket → remover o
+ * transporte. Só DEPOIS o chamador desativa ou apaga o auth dir.
+ *
+ * Idempotente: parar uma linha que não tem sessão é um no-op.
+ */
+/**
+ * Linhas cujo socket vive NESTE processo (review PR #528 rodada 2).
+ *
+ * É a fonte do heartbeat de posse de sessão: o worker publica esta lista em
+ * `channel_line_state.session_owner_instance`, e é por ela que `disable` e
+ * `repair` conseguem endereçar o comando à réplica certa em vez de chamar
+ * `stopLineSession` num Map local vazio e declarar sucesso.
+ *
+ * Devolve o TRIPLETE, não só o id: a row de estado pode ainda não existir
+ * (canal ativado fora do fluxo do console, ou heartbeat disparando antes do
+ * primeiro `connection.update`), e registrar a posse exige `tenant_id` e
+ * `agent_id`.
+ */
+export function listLocalLineSessions(): Array<{
+  channel_id: string;
+  tenant_id: string;
+  agent_id: string;
+}> {
+  return [...sessions.values()]
+    .filter((s) => !s.stopped)
+    .map((s) => ({
+      channel_id: s.channel.id,
+      tenant_id: s.channel.tenant_id,
+      agent_id: s.channel.agent_id,
+    }));
+}
+
+export function stopLineSession(channelId: string): boolean {
+  const state = sessions.get(channelId);
+  // `markState('closed')` remove o transporte no manager mesmo sem sessão
+  // local — a linha pode ter sido registrada por outro caminho.
+  getLineSessionManager().markState(channelId, 'closed');
+  if (!state) return false;
+  state.stopped = true;
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  state.connected = false;
+  try {
+    state.sock?.end(undefined);
+  } catch {
+    /* já fechado */
+  }
+  sessions.delete(channelId);
+  logger.info({ channel_id: channelId }, 'line_session.stopped');
+  return true;
+}
+
+/**
  * Encerra todas as sessões de linha (shutdown ordenado). Cancela os timers
  * de reconexão pendentes (review #498 alto 3) — sem isso um callback
  * agendado antes do shutdown recriava o estado (`stopped=false`) e reabria
  * o socket durante o desligamento.
  */
 export async function shutdownLineSessions(): Promise<void> {
+  const owned = [...sessions.keys()];
   for (const [channelId, state] of sessions) {
     state.stopped = true;
     if (state.reconnectTimer) {
@@ -354,6 +479,24 @@ export async function shutdownLineSessions(): Promise<void> {
     getLineSessionManager().markState(channelId, 'closed');
   }
   sessions.clear();
+
+  // Drain ordenado da #512 (passo `line_sessions`): abrir mão da POSSE das
+  // sessões aqui, em vez de deixar a lease vencer, permite que outra réplica
+  // assuma as linhas imediatamente após o shutdown. Best-effort — o banco já
+  // pode estar indo embora no passo `pools`, e a lease cobre esse caso.
+  if (owned.length > 0) {
+    try {
+      const { channelLineStateRepo } = await import(
+        '../db/repositories/channel-line-state-repos.js'
+      );
+      await channelLineStateRepo.releaseSessionOwnership(runtimeInstanceId(), owned);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message },
+        'line_session.session_ownership_release_failed',
+      );
+    }
+  }
 }
 
 /** Test-only. */

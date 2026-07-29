@@ -1,8 +1,24 @@
+/**
+ * Páginas do `/setup` (pareamento da linha PRIMÁRIA).
+ *
+ * Issue #518 — o bootstrap token FOI REMOVIDO destes templates. Antes ele
+ * viajava em `action="/setup/start?token=…"`, em `<img src="/setup/qr.png
+ * ?token=…">` e embutido no JavaScript de polling: bastava uma screenshot, um
+ * "copiar link", um access log de proxy ou o header `Referer` de qualquer
+ * recurso externo para vazá-lo.
+ *
+ * Agora a autenticação é uma SESSÃO DE OPERADOR em cookie httpOnly +
+ * sameSite=strict (`maia_setup_session`), estabelecida uma única vez pelo
+ * formulário de `renderTokenGate` — que envia o token no CORPO de um POST.
+ * Nenhuma URL desta superfície carrega segredo; o navegador anexa o cookie
+ * sozinho em `/setup/status` e `/setup/qr.png`.
+ */
 const BASE_HEAD = `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>Maia — Pareamento</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
@@ -16,7 +32,12 @@ const BASE_HEAD = `<!DOCTYPE html>
 <div class="bg-white rounded-2xl shadow-lg max-w-md w-full p-8">
 <h1 class="text-2xl font-bold mb-6">Maia — Pareamento WhatsApp</h1>`;
 
-const STATUS_AND_FOOT = (statusText: string, token: string, autoRefreshSec?: number): string => `
+/**
+ * O polling não carrega credencial alguma: `credentials: 'same-origin'` faz o
+ * navegador anexar o cookie de sessão, e a URL fica limpa (nada em histórico,
+ * em referer ou em access log).
+ */
+const STATUS_AND_FOOT = (statusText: string, autoRefreshSec?: number): string => `
 <div class="status mt-6 p-3 rounded-lg bg-slate-100 text-sm text-slate-700">
   <span class="font-medium">Status atual:</span>
   <span id="status-text">${escapeHtml(statusText)}</span>
@@ -24,12 +45,11 @@ const STATUS_AND_FOOT = (statusText: string, token: string, autoRefreshSec?: num
 </div>
 <script>
 (function() {
-  const TOKEN = ${JSON.stringify(token)};
   const POLL_INTERVAL_MS = 2000;
   let prevPhase = null;
   async function poll() {
     try {
-      const res = await fetch('/setup/status?token=' + encodeURIComponent(TOKEN), { cache: 'no-store' });
+      const res = await fetch('/setup/status', { cache: 'no-store', credentials: 'same-origin' });
       if (!res.ok) return;
       const data = await res.json();
       // Skip change detection on first poll — current phase is already reflected in the HTML.
@@ -60,10 +80,47 @@ function escapeHtml(s: string): string {
   );
 }
 
-export function renderChooser(token: string, csrf: string): string {
+/**
+ * Portão de entrada: o operador cola o bootstrap token UMA vez e o servidor
+ * troca por uma sessão em cookie. O campo é `type="password"` com
+ * `autocomplete="off"` para não ir parar no gerenciador de senhas nem em
+ * screenshots casuais, e o `<form>` é POST — o token nunca vira query string.
+ *
+ * `error` já vem sanitizado pelo chamador (sem eco do valor digitado).
+ */
+export function renderTokenGate(csrf: string, error?: string): string {
+  const alert = error
+    ? `<div class="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-800">${escapeHtml(error)}</div>`
+    : '';
+  return `${BASE_HEAD}
+${alert}
+<p class="text-slate-700 mb-6">
+  Cole o token de operador (arquivo <code>control/setup-token.txt</code> no
+  volume de auth) para abrir uma sessão de pareamento.
+</p>
+<form method="POST" action="/setup/session" class="space-y-3" autocomplete="off">
+  <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+  <label class="block text-sm font-medium text-slate-700" for="token">Token de operador</label>
+  <input id="token" name="token" type="password" required autocomplete="off"
+    spellcheck="false" autocapitalize="off"
+    class="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm"
+    placeholder="••••••••••••••••••••••••••••••••">
+  <button type="submit"
+    class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">
+    Abrir sessão de pareamento
+  </button>
+</form>
+<p class="mt-6 text-xs text-slate-500">
+  A sessão vale 30 minutos e fica num cookie <code>httpOnly</code>. O token
+  não aparece na URL, no histórico do navegador nem em logs de acesso.
+</p>
+</div></body></html>`;
+}
+
+export function renderChooser(csrf: string): string {
   return `${BASE_HEAD}
 <p class="text-slate-700 mb-6">Escolha como quer parear o WhatsApp da Maia:</p>
-<form method="POST" action="/setup/start?token=${encodeURIComponent(token)}" class="space-y-3">
+<form method="POST" action="/setup/start" class="space-y-3">
   <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
   <button type="submit" name="method" value="qr"
     class="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium">
@@ -74,13 +131,13 @@ export function renderChooser(token: string, csrf: string): string {
     🔢 Parear com Código de 8 dígitos
   </button>
 </form>
-${STATUS_AND_FOOT('Aguardando você escolher o método de pareamento.', token)}`;
+${STATUS_AND_FOOT('Aguardando você escolher o método de pareamento.')}`;
 }
 
-export function renderQr(token: string, qr: string | null): string {
+export function renderQr(qr: string | null): string {
   const body = qr
     ? `<div class="text-center">
-        <img src="/setup/qr.png?token=${encodeURIComponent(token)}" alt="QR Code"
+        <img src="/setup/qr.png" alt="QR Code"
           class="mx-auto rounded-lg border border-slate-200" width="320" height="320">
         <p class="mt-4 text-sm text-slate-600">
           Abra <strong>WhatsApp</strong> → <strong>Aparelhos conectados</strong> → <strong>Conectar aparelho</strong> e aponte a câmera.
@@ -91,10 +148,10 @@ export function renderQr(token: string, qr: string | null): string {
         <p class="mt-4 text-slate-700">Gerando QR Code…</p>
       </div>`;
   const status = qr ? 'Aguardando leitura do QR Code no WhatsApp.' : 'Gerando QR Code…';
-  return `${BASE_HEAD}${body}${STATUS_AND_FOOT(status, token)}`;
+  return `${BASE_HEAD}${body}${STATUS_AND_FOOT(status)}`;
 }
 
-export function renderCode(token: string, code: string, expiresAt: Date): string {
+export function renderCode(code: string, expiresAt: Date): string {
   const formatted = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4, 8)}` : code;
   const expiresIso = expiresAt.toISOString();
   return `${BASE_HEAD}
@@ -145,7 +202,7 @@ export function renderCode(token: string, code: string, expiresAt: Date): string
   setInterval(tick, 1000);
 })();
 </script>
-${STATUS_AND_FOOT('Código gerado. Aguardando confirmação no WhatsApp.', token)}`;
+${STATUS_AND_FOOT('Código gerado. Aguardando confirmação no WhatsApp.')}`;
 }
 
 export function renderConnected(connectedAt: Date, dashboardEnabled: boolean): string {
@@ -170,24 +227,24 @@ export function renderConnected(connectedAt: Date, dashboardEnabled: boolean): s
 </div></body></html>`;
 }
 
-export function renderTransientDisconnect(token: string): string {
+export function renderTransientDisconnect(): string {
   return `${BASE_HEAD}
 <div class="text-center py-4">
   <div class="inline-block animate-pulse text-3xl mb-3">⏳</div>
   <p class="text-slate-700">Conexão perdida temporariamente.</p>
   <p class="text-sm text-slate-500 mt-2">Reconectando… costuma levar 5-10s.</p>
 </div>
-${STATUS_AND_FOOT('Conexão perdida temporariamente. Reconectando…', token, 5)}`;
+${STATUS_AND_FOOT('Conexão perdida temporariamente. Reconectando…', 5)}`;
 }
 
-export function renderRecovering(token: string): string {
+export function renderRecovering(): string {
   return `${BASE_HEAD}
 <div class="text-center py-4">
   <div class="inline-block animate-spin text-3xl mb-3">🔄</div>
   <p class="text-slate-700">Limpando sessão antiga e gerando novo token…</p>
   <p class="text-sm text-slate-500 mt-2">~3s. Verifique seu canal de alertas (email/telegram) para instruções de re-pareamento.</p>
 </div>
-${STATUS_AND_FOOT('Limpando sessão antiga e gerando novo token…', token, 5)}`;
+${STATUS_AND_FOOT('Limpando sessão antiga e gerando novo token…', 5)}`;
 }
 
 export function renderDone(): string {

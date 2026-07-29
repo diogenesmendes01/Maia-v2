@@ -1908,6 +1908,77 @@ export const channels = pgTable(
   }),
 );
 
+// 103 (issue #518) — estado OPERACIONAL da linha whatsapp + fila durável de
+// comandos Admin→runtime. `channels.active` continua sendo ROTEAMENTO; este
+// `state` é o ciclo de vida da posse/conexão (declared → pairing →
+// verified_offline → connected → recovering/logged_out/failed/disabled).
+//
+// `pairing_material` é o envelope AES-256-GCM de staging-crypto.ts — QR/código
+// NUNCA em claro, com TTL curto e apagado ao concluir/abortar/expirar. O
+// console decifra na resposta tRPC autenticada; nada disso entra em URL,
+// audit ou log. As CHECKs de estado/comando vivem na migration 103 (fonte de
+// verdade das constraints); aqui declaramos tipos.
+export const channel_line_state = pgTable(
+  'channel_line_state',
+  {
+    channel_id: uuid('channel_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    state: text('state').notNull().default('declared'),
+    command: text('command'),
+    command_method: text('command_method'),
+    command_id: uuid('command_id'),
+    command_requested_at: timestamp('command_requested_at', { withTimezone: true }),
+    command_claimed_at: timestamp('command_claimed_at', { withTimezone: true }),
+    owner_lease_expires_at: timestamp('owner_lease_expires_at', { withTimezone: true }),
+    target_instance: text('target_instance'),
+    session_owner_instance: text('session_owner_instance'),
+    session_owner_lease_expires_at: timestamp('session_owner_lease_expires_at', {
+      withTimezone: true,
+    }),
+    actor_id: text('actor_id'),
+    actor_role: text('actor_role'),
+    correlation_id: text('correlation_id'),
+    pairing_material: customType<{ data: Buffer }>({
+      dataType() {
+        return 'bytea';
+      },
+    })('pairing_material'),
+    pairing_material_key_id: text('pairing_material_key_id'),
+    pairing_material_kind: text('pairing_material_kind'),
+    pairing_material_expires_at: timestamp('pairing_material_expires_at', {
+      withTimezone: true,
+    }),
+    pairing_method: text('pairing_method'),
+    pairing_started_at: timestamp('pairing_started_at', { withTimezone: true }),
+    pairing_expires_at: timestamp('pairing_expires_at', { withTimezone: true }),
+    pairing_attempts: integer('pairing_attempts').notNull().default(0),
+    owner_instance: text('owner_instance'),
+    reason_code: text('reason_code'),
+    verified_at: timestamp('verified_at', { withTimezone: true }),
+    connected_at: timestamp('connected_at', { withTimezone: true }),
+    disconnected_at: timestamp('disconnected_at', { withTimezone: true }),
+    last_transition_at: timestamp('last_transition_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdx: index('channel_line_state_scope_idx').on(t.tenant_id, t.agent_id),
+    pendingCommandIdx: index('channel_line_state_pending_command_idx')
+      .on(t.command_requested_at)
+      .where(sql`command IS NOT NULL`),
+    pairingExpiryIdx: index('channel_line_state_pairing_expiry_idx')
+      .on(t.pairing_expires_at)
+      .where(sql`state = 'pairing'`),
+    ownerIdx: index('channel_line_state_owner_idx')
+      .on(t.owner_instance)
+      .where(sql`owner_instance IS NOT NULL`),
+  }),
+);
+export type ChannelLineStateRow = typeof channel_line_state.$inferSelect;
+
 // P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
 // Exatamente 1 default por (tenant, agent), garantido por partial unique index.
 // prompt_addendum entra no prompt quando o role estiver ativo.

@@ -6,6 +6,11 @@ import { trpc } from '../../../trpc/client.js';
 import ChannelPolicyModal from './_components/channel-policy-modal.js';
 import ChannelCreateModal from './_components/channel-create-modal.js';
 import RoleCreateModal from './_components/role-create-modal.js';
+import LinePairingModal from './_components/line-pairing-modal.js';
+import LineActionModal, {
+  type LineActionKind,
+} from './_components/line-action-modal.js';
+import { presentState, presentReason, primaryAction } from './_components/line-state.js';
 import { PageHeader } from '../../../components/ui/page-header.js';
 import { Badge } from '../../../components/ui/badge.js';
 import { Button } from '../../../components/ui/button.js';
@@ -53,6 +58,15 @@ export default function ChannelsSetupPage() {
   } | null>(null);
   const [showChannelCreate, setShowChannelCreate] = React.useState(false);
   const [showRoleCreate, setShowRoleCreate] = React.useState(false);
+  const [pairTarget, setPairTarget] = React.useState<{
+    channelId: string;
+    channelLabel: string;
+  } | null>(null);
+  const [actionTarget, setActionTarget] = React.useState<{
+    kind: LineActionKind;
+    channelId: string;
+    channelLabel: string;
+  } | null>(null);
 
   const tenantsQuery = trpc.tenants.list.useQuery(undefined, {
     enabled: role === 'founder',
@@ -63,7 +77,14 @@ export default function ChannelsSetupPage() {
     { enabled: allowed && tenantId !== '' },
   );
 
-  const overviewQuery = trpc.channelPolicies.channelsOverview.useQuery(
+  /**
+   * Issue #518 — a listagem passou a ser `channelLines.list`, que devolve
+   * canais ATIVOS E INATIVOS com o estado operacional da linha. A antiga
+   * `channelsOverview` só trazia ativos, e como um canal WhatsApp nasce
+   * inativo ("declarado"), ele SUMIA da tela logo depois de ser criado — o
+   * operador não tinha por onde pareá-lo.
+   */
+  const linesQuery = trpc.channelLines.list.useQuery(
     { tenantId, agentId },
     { enabled: allowed && tenantId !== '' && agentId !== '' },
   );
@@ -74,6 +95,7 @@ export default function ChannelsSetupPage() {
   );
 
   const invalidateAll = React.useCallback(() => {
+    void utils.channelLines.list.invalidate({ tenantId, agentId });
     void utils.channelPolicies.channelsOverview.invalidate({ tenantId, agentId });
     void utils.channelPolicies.listChannels.invalidate({ tenantId, agentId });
     void utils.channelPolicies.listRoles.invalidate({ tenantId, agentId });
@@ -95,7 +117,8 @@ export default function ChannelsSetupPage() {
     );
   }
 
-  const channels = overviewQuery.data?.channels ?? [];
+  const lines = linesQuery.data?.lines ?? [];
+  const pairingAvailable = linesQuery.data?.pairing_available ?? false;
   const roles = rolesQuery.data?.items ?? [];
 
   return (
@@ -157,8 +180,8 @@ export default function ChannelsSetupPage() {
         <div className="space-y-6">
           <Card>
             <CardHeader
-              title="Canais do agente"
-              description="Um canal representa a linha em que as mensagens chegam. Cada canal precisa de uma política com papel padrão."
+              title="Linhas e canais do agente"
+              description="Um canal representa a linha em que as mensagens chegam. Uma linha WhatsApp nasce DECLARADA (inativa) e só passa a rotear depois de provar a posse pelo pareamento e ter uma política com papel padrão."
               actions={
                 <Button size="sm" onClick={() => setShowChannelCreate(true)}>
                   Novo canal
@@ -166,14 +189,24 @@ export default function ChannelsSetupPage() {
               }
             />
             <CardBody>
-              {overviewQuery.isLoading ? (
-                <LoadingState label="Carregando canais…" />
-              ) : overviewQuery.error ? (
+              {!pairingAvailable && !linesQuery.isLoading && !linesQuery.error && (
+                <div className="mb-4">
+                  <Alert tone="warning" title="Pareamento pelo console indisponível">
+                    O QR e o código de pareamento só trafegam cifrados. Configure{' '}
+                    <code className="font-mono">MAIA_STAGING_KEYRING</code> e{' '}
+                    <code className="font-mono">MAIA_STAGING_ACTIVE_KEY_ID</code> no runtime e
+                    no console para habilitar. Os estados abaixo continuam válidos.
+                  </Alert>
+                </div>
+              )}
+              {linesQuery.isLoading ? (
+                <LoadingState label="Carregando linhas…" />
+              ) : linesQuery.error ? (
                 <ErrorState
-                  message={overviewQuery.error.message}
-                  onRetry={() => void overviewQuery.refetch()}
+                  message={linesQuery.error.message}
+                  onRetry={() => void linesQuery.refetch()}
                 />
-              ) : channels.length === 0 ? (
+              ) : lines.length === 0 ? (
                 <EmptyState
                   icon={<IconMessage size={36} />}
                   title="Nenhum canal ainda para este agente"
@@ -189,44 +222,133 @@ export default function ChannelsSetupPage() {
                   <Table>
                     <THead>
                       <Th>Tipo</Th>
-                      <Th>ID externo</Th>
-                      <Th>Nome de exibição</Th>
+                      <Th>Linha / ID externo</Th>
+                      <Th>Estado</Th>
+                      <Th>Roteamento</Th>
                       <Th>Política</Th>
+                      <Th>Última transição</Th>
                       <Th>Ações</Th>
                     </THead>
                     <tbody>
-                      {channels.map((c) => (
-                        <Tr key={c.id}>
-                          <Td>{c.channel_type}</Td>
-                          <Td className="font-mono text-xs">{c.external_id}</Td>
-                          <Td>{c.display_name ?? '—'}</Td>
-                          <Td>
-                            {c.policy_ready ? (
-                              <Badge tone="success">
-                                papel padrão: {c.default_role_key}
+                      {lines.map((line) => {
+                        const label = `${line.channel_type}/${line.external_id}`;
+                        const st = presentState(line.state);
+                        const reason = presentReason(line.reason_code);
+                        const action =
+                          line.channel_type === 'whatsapp' ? primaryAction(line) : null;
+                        return (
+                          <Tr key={line.channel_id}>
+                            <Td>{line.channel_type}</Td>
+                            <Td className="font-mono text-xs">
+                              {line.external_id}
+                              {line.display_name && (
+                                <span className="block font-sans text-2xs text-zinc-400">
+                                  {line.display_name}
+                                </span>
+                              )}
+                            </Td>
+                            <Td>
+                              <Badge tone={st.tone} title={st.help}>
+                                {st.label}
                               </Badge>
-                            ) : c.has_policy ? (
-                              <Badge tone="danger">papel padrão inativo</Badge>
-                            ) : (
-                              <Badge tone="warning">sem política</Badge>
-                            )}
-                          </Td>
-                          <Td>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() =>
-                                setPolicyTarget({
-                                  channelId: c.id,
-                                  channelLabel: `${c.channel_type}/${c.external_id}`,
-                                })
-                              }
-                            >
-                              {c.has_policy ? 'Editar política' : 'Criar política'}
-                            </Button>
-                          </Td>
-                        </Tr>
-                      ))}
+                              {reason && (
+                                <span className="mt-1 block text-2xs text-zinc-400">
+                                  {reason}
+                                </span>
+                              )}
+                            </Td>
+                            <Td>
+                              {line.active ? (
+                                <Badge tone="success">roteando</Badge>
+                              ) : (
+                                <Badge tone="neutral">não roteia</Badge>
+                              )}
+                            </Td>
+                            <Td>
+                              {line.policy_ready ? (
+                                <Badge tone="success">
+                                  papel padrão: {line.default_role_key}
+                                </Badge>
+                              ) : line.has_policy ? (
+                                <Badge tone="danger">papel padrão inativo</Badge>
+                              ) : (
+                                <Badge tone="warning">sem política</Badge>
+                              )}
+                            </Td>
+                            <Td className="text-2xs text-zinc-500">
+                              {line.last_transition_at
+                                ? new Date(line.last_transition_at).toLocaleString('pt-BR')
+                                : '—'}
+                            </Td>
+                            <Td>
+                              <div className="flex flex-wrap gap-1">
+                                {line.channel_type === 'whatsapp' &&
+                                  (line.state === 'pairing' || action === 'pair') && (
+                                    <Button
+                                      variant={line.state === 'pairing' ? 'primary' : 'secondary'}
+                                      size="sm"
+                                      disabled={!pairingAvailable}
+                                      onClick={() =>
+                                        setPairTarget({
+                                          channelId: line.channel_id,
+                                          channelLabel: label,
+                                        })
+                                      }
+                                    >
+                                      {line.state === 'pairing'
+                                        ? 'Acompanhar pareamento'
+                                        : line.state === 'failed'
+                                          ? 'Repetir pareamento'
+                                          : 'Parear'}
+                                    </Button>
+                                  )}
+                                {action === 'repair' && (
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() =>
+                                      setActionTarget({
+                                        kind: 'repair',
+                                        channelId: line.channel_id,
+                                        channelLabel: label,
+                                      })
+                                    }
+                                  >
+                                    Re-parear
+                                  </Button>
+                                )}
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() =>
+                                    setPolicyTarget({
+                                      channelId: line.channel_id,
+                                      channelLabel: label,
+                                    })
+                                  }
+                                >
+                                  {line.has_policy ? 'Editar política' : 'Criar política'}
+                                </Button>
+                                {line.active && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() =>
+                                      setActionTarget({
+                                        kind: 'disable',
+                                        channelId: line.channel_id,
+                                        channelLabel: label,
+                                      })
+                                    }
+                                  >
+                                    Desabilitar
+                                  </Button>
+                                )}
+                              </div>
+                            </Td>
+                          </Tr>
+                        );
+                      })}
                     </tbody>
                   </Table>
                 </TableShell>
@@ -330,6 +452,32 @@ export default function ChannelsSetupPage() {
           hasRoles={roles.length > 0}
           onClose={() => setShowRoleCreate(false)}
           onCreated={invalidateAll}
+        />
+      )}
+
+      {pairTarget && tenantId && agentId && (
+        <LinePairingModal
+          tenantId={tenantId}
+          agentId={agentId}
+          channelId={pairTarget.channelId}
+          channelLabel={pairTarget.channelLabel}
+          onClose={() => {
+            setPairTarget(null);
+            invalidateAll();
+          }}
+          onChanged={invalidateAll}
+        />
+      )}
+
+      {actionTarget && tenantId && agentId && (
+        <LineActionModal
+          kind={actionTarget.kind}
+          tenantId={tenantId}
+          agentId={agentId}
+          channelId={actionTarget.channelId}
+          channelLabel={actionTarget.channelLabel}
+          onClose={() => setActionTarget(null)}
+          onDone={invalidateAll}
         />
       )}
     </div>
