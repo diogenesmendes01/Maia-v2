@@ -16,7 +16,7 @@ import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
 import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
-import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
+import { runNightlyBackup, runBackupRetention } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -134,11 +134,13 @@ export const JOBS: Job[] = [
   { name: 'idempotency_outbox_relayer', cron: '*/1 * * * *', fn: runIdempotencyOutboxRelayer, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
-  // Cloud backup rotation runs once a week (Sundays 04:00 BRT) so
-  // BACKUP_RETENTION_CLOUD_DAYS is actually applied. Decoupled from the
-  // nightly run so the upload path stays fast and rotation can be paused
-  // independently if a provider has hiccups.
-  { name: 'cloud_backup_rotation', cron: '0 4 * * 0', fn: runCloudBackupRotation, phase: 1 },
+  // Backup artifact retention runs once a week (Sundays 04:00 BRT), decoupled
+  // from the nightly run so the upload path stays fast and retention can be
+  // paused independently. Renamed from `cloud_backup_rotation` in the #520
+  // round-1 fix: it is no longer a cloud-only, mtime-driven prune — it plans
+  // every deletion from the manifest, evaluates legal hold under a lock, and
+  // covers both destinations. Deletes nothing while RETENTION_DRY_RUN=true.
+  { name: 'backup_retention', cron: '0 4 * * 0', fn: runBackupRetention, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },

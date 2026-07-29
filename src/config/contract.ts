@@ -98,6 +98,19 @@ export const ENV_CONTRACT = {
     requiredIn: ['staging', 'production'],
     restartRequired: true,
   },
+  MAIA_BUILD_COMMIT: {
+    name: 'MAIA_BUILD_COMMIT',
+    description:
+      'Commit desta build, injetado pelo pipeline de deploy. Vira provenance do manifesto de backup (issue #520), respondendo "qual código este artefato representa". Ausente = null no manifesto.',
+    group: 'core',
+    secret: false,
+    services: ALL,
+    schema: z.string().optional(),
+    example: 'd93624b',
+    fixture: 'd93624b',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   TZ: {
     name: 'TZ',
     description: 'Timezone IANA usada em toda formatação/agendamento.',
@@ -960,6 +973,212 @@ export const ENV_CONTRACT = {
     schema: z.string().default('maia'),
     example: 'maia',
     fixture: 'maia',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
+  // Issue #520 — backup VERIFICÁVEL. As variáveis acima descrevem o destino;
+  // estas descrevem o que conta como sucesso. Não há `BACKUP_PROFILE`: o
+  // profile da Maia é MAIA_ENV, e um segundo seletor de profile só para backup
+  // seria uma segunda fonte de verdade. As regras fail-closed que consomem
+  // estas variáveis vivem em src/config/rules.ts (grupo `backup/*`).
+  BACKUP_ENABLED: {
+    name: 'BACKUP_ENABLED',
+    description:
+      'Liga o backup. `false` é recusado no profile production — um deploy de produção sem backup não tem caminho de recuperação.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_OFFSITE_REQUIRED: {
+    name: 'BACKUP_OFFSITE_REQUIRED',
+    description:
+      'Exige cópia off-site VERIFICADA para uma run contar como sucesso. Ausente = o profile decide (production exige). `false` é recusado em production.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // Tri-state DE PROPÓSITO: ausente ≠ false. Ausente delega ao profile;
+    // `false` é uma decisão explícita do operador (e ilegal em production).
+    schema: z
+      .enum(['true', 'false', '1', '0'])
+      .optional()
+      .transform((s) => (s === undefined ? undefined : s === 'true' || s === '1')),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_ENCRYPTION_MODE: {
+    name: 'BACKUP_ENCRYPTION_MODE',
+    description:
+      'Cifra do artefato: `none` ou `envelope_aes256_gcm` (client-side, antes de sair do host). `none` é recusado em production — o dump contém dados pessoais de todos os tenants.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: z.enum(['none', 'envelope_aes256_gcm']).default('none'),
+    example: 'envelope_aes256_gcm',
+    fixture: 'none',
+    // A fixture de production TEM de satisfazer a regra backup/encryption-mode.
+    fixtureByProfile: { production: 'envelope_aes256_gcm' },
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_ENCRYPTION_KEYRING: {
+    name: 'BACKUP_ENCRYPTION_KEYRING',
+    description:
+      'Keyring JSON { key_id: base64(32B) } da cifra de backup. A chave vive FORA do artefato; rotação é aditiva (mantenha a chave antiga enquanto houver artefato que a referencie).',
+    group: 'backup',
+    secret: true,
+    services: ['backup', 'maintenance', 'runtime'],
+    schema: z.string().optional(),
+    example: '__SET_ME__{"k1":"<base64 32 bytes>"}',
+    // Sintética e inconfundível (mesma forma de MAIA_STAGING_KEYRING):
+    // base64 de 32 bytes zerados, que não decifra nada de verdade.
+    fixture: '{"k1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}',
+    requiredWhen: { var: 'BACKUP_ENCRYPTION_MODE', equals: 'envelope_aes256_gcm' },
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_ENCRYPTION_ACTIVE_KEY_ID: {
+    name: 'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
+    description:
+      'Id da chave ATIVA dentro de BACKUP_ENCRYPTION_KEYRING. É um identificador, não material de chave — é o único campo de cifra que aparece em manifesto e auditoria.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: z.string().optional(),
+    example: 'k1',
+    fixture: 'k1',
+    requiredWhen: { var: 'BACKUP_ENCRYPTION_MODE', equals: 'envelope_aes256_gcm' },
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_DUMP_TIMEOUT_MS: {
+    name: 'BACKUP_DUMP_TIMEOUT_MS',
+    description: 'Orçamento do pg_dump. Estourado, o processo é morto e a run falha.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(3_600_000),
+    example: '3600000',
+    fixture: '3600000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_UPLOAD_TIMEOUT_MS: {
+    name: 'BACKUP_UPLOAD_TIMEOUT_MS',
+    description: 'Orçamento do upload off-site.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(1_800_000),
+    example: '1800000',
+    fixture: '1800000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_RESTORE_TIMEOUT_MS: {
+    name: 'BACKUP_RESTORE_TIMEOUT_MS',
+    description: 'Orçamento do restore drill.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(3_600_000),
+    example: '3600000',
+    fixture: '3600000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_MIN_ARTIFACT_BYTES: {
+    name: 'BACKUP_MIN_ARTIFACT_BYTES',
+    description:
+      'Piso de tamanho do artefato. Abaixo disso é dump truncado, não backup — tamanho sozinho nunca é evidência, mas um piso pega o caso grosseiro.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(4096),
+    example: '4096',
+    fixture: '4096',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_RPO_TARGET_HOURS: {
+    name: 'BACKUP_RPO_TARGET_HOURS',
+    description:
+      'Objetivo de ponto de recuperação. Abaixo de 24h é recusado: dump lógico noturno não cumpre, e a plataforma não anuncia objetivo que a arquitetura não honra (exigiria PITR/WAL).',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(24),
+    example: '24',
+    fixture: '24',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_RTO_TARGET_MINUTES: {
+    name: 'BACKUP_RTO_TARGET_MINUTES',
+    description: 'Objetivo de tempo de recuperação, comparado à duração medida do último drill.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(120),
+    example: '120',
+    fixture: '120',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  BACKUP_RESTORE_DRILL_INTERVAL_HOURS: {
+    name: 'BACKUP_RESTORE_DRILL_INTERVAL_HOURS',
+    description:
+      'Intervalo máximo entre drills de restore aprovados. Vencido, a readiness degrada — até um drill passar, nenhum artefato é sabidamente restaurável.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(168),
+    example: '168',
+    fixture: '168',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  RETENTION_DRY_RUN: {
+    name: 'RETENTION_DRY_RUN',
+    description:
+      'Executor de retenção só CONTA, não apaga. Default `true` de propósito: exclusão é irreversível, então desligar isso é uma decisão explícita por ambiente. Só `false`/`0` desligam.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // NÃO usa boolFlag: com boolFlag um valor inesperado (`yes`) viraria
+    // `false` e LIGARIA a exclusão. Aqui qualquer coisa que não seja um
+    // desligamento explícito mantém o dry-run.
+    schema: z
+      .string()
+      .default('true')
+      .transform((s) => !(s === 'false' || s === '0')),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  RETENTION_POLICY: {
+    name: 'RETENTION_POLICY',
+    description:
+      'Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // Validada em profundidade por `parseRetentionPolicy`
+    // (src/ops/retention/data-classes.ts), que devolve a política NÃO-APROVADA
+    // em qualquer erro em vez de cair num default embutido.
+    schema: z.string().optional(),
+    example:
+      '{"version":"v1-dpo-2026-07","approved_by":"<responsável jurídico>","approved_at":"2026-07-01T00:00:00.000Z","classes":{}}',
+    fixture:
+      '{"version":"v0-fixture","approved_by":"fixture-dpo","approved_at":"2026-01-01T00:00:00.000Z","classes":{}}',
     restartRequired: true,
     commentedInExample: true,
   },

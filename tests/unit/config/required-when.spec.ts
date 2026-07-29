@@ -78,6 +78,19 @@ const CASES: Record<string, Case> = {
     satisfiedOtherwise: { MAIA_CHANNEL_ROUTING_MODE: 'shadow' },
     rule: 'routing/strict-requires-keyring',
   },
+  // Issue #520: cifra de backup exigida ⇒ o keyring e o id da chave ativa são
+  // obrigatórios. Sem eles a run FALHA FECHADA (nunca grava dump em claro), e
+  // descobrir isso às 3h é tarde — o boot avisa.
+  BACKUP_ENCRYPTION_KEYRING: {
+    trigger: { BACKUP_ENCRYPTION_MODE: 'envelope_aes256_gcm' },
+    satisfiedOtherwise: { BACKUP_ENCRYPTION_MODE: 'none' },
+    rule: 'backup/encryption-key',
+  },
+  BACKUP_ENCRYPTION_ACTIVE_KEY_ID: {
+    trigger: { BACKUP_ENCRYPTION_MODE: 'envelope_aes256_gcm' },
+    satisfiedOtherwise: { BACKUP_ENCRYPTION_MODE: 'none' },
+    rule: 'backup/encryption-key',
+  },
   MAIA_STAGING_ACTIVE_KEY_ID: {
     trigger: { MAIA_CHANNEL_ROUTING_MODE: 'strict' },
     satisfiedOtherwise: { MAIA_CHANNEL_ROUTING_MODE: 'shadow' },

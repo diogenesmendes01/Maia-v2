@@ -268,6 +268,11 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   'MAIA_',
   'FEATURE_',
   'BACKUP_',
+  // Issue #520: RETENTION_DRY_RUN governa exclusão IRREVERSÍVEL. Sob este
+  // prefixo, um typo (`RETENTION_DRYRUN=false`) vira variável desconhecida e
+  // falha o boot, em vez de ser ignorado silenciosamente enquanto o operador
+  // acredita ter desligado o dry-run.
+  'RETENTION_',
   'OUTBOX_',
   'OUTBOUND_',
   'ALERT_',

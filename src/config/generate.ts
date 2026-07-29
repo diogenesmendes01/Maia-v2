@@ -168,8 +168,16 @@ function commentBlock(text: string): string[] {
 /**
  * Variables whose value IS the profile. The operator does not choose them, so
  * the template writes them out rather than asking for a value.
+ *
+ * `BACKUP_ENCRYPTION_MODE` joins them for issue #520: the rule
+ * `backup/production-encryption` refuses `none` in production, so the value is
+ * decided by the profile, not by the operator. Writing it out also makes the
+ * `requiredWhen` closure below pull `BACKUP_ENCRYPTION_KEYRING` into the
+ * production template as a `__SET_ME__` placeholder — which is the point: the
+ * template must ASK for the backup key instead of letting an operator discover
+ * at 03:00 that the run fails closed without it.
  */
-const PROFILE_DETERMINED = new Set(['MAIA_ENV', 'NODE_ENV']);
+const PROFILE_DETERMINED = new Set(['MAIA_ENV', 'NODE_ENV', 'BACKUP_ENCRYPTION_MODE']);
 
 /** True when the schema itself rejects an absent value. */
 function schemaRequires(spec: EnvVarSpec): boolean {
@@ -237,6 +245,9 @@ function templateActiveNames(profile: MaiaProfile): Set<string> {
   const active = new Set(
     allowed
       .filter((spec) => {
+        // Profile-determined values are always written out — the closure below
+        // reads them to decide which conditional variables to activate.
+        if (PROFILE_DETERMINED.has(spec.name)) return true;
         if (spec.requiredIn?.includes(profile) || schemaRequires(spec)) return true;
         // A CONDITIONAL secret (a provider key) starts commented out: demanding
         // COHERE_API_KEY from a deployment that runs Voyage would block a

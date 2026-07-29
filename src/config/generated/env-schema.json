@@ -66,6 +66,24 @@
         "development"
       ]
     },
+    "MAIA_BUILD_COMMIT": {
+      "type": "string",
+      "description": "Commit desta build, injetado pelo pipeline de deploy. Vira provenance do manifesto de backup (issue #520), respondendo \"qual código este artefato representa\". Ausente = null no manifesto.",
+      "x-maia-type": "string",
+      "x-maia-group": "core",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui",
+        "migrator",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "d93624b"
+      ]
+    },
     "TZ": {
       "type": "string",
       "description": "Timezone IANA usada em toda formatação/agendamento.",
@@ -1178,6 +1196,249 @@
       "default": "maia",
       "examples": [
         "maia"
+      ]
+    },
+    "BACKUP_ENABLED": {
+      "type": "string",
+      "description": "Liga o backup. `false` é recusado no profile production — um deploy de produção sem backup não tem caminho de recuperação.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "BACKUP_OFFSITE_REQUIRED": {
+      "type": "string",
+      "description": "Exige cópia off-site VERIFICADA para uma run contar como sucesso. Ausente = o profile decide (production exige). `false` é recusado em production.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "true",
+        "false",
+        "1",
+        "0"
+      ],
+      "examples": [
+        "true"
+      ]
+    },
+    "BACKUP_ENCRYPTION_MODE": {
+      "type": "string",
+      "description": "Cifra do artefato: `none` ou `envelope_aes256_gcm` (client-side, antes de sair do host). `none` é recusado em production — o dump contém dados pessoais de todos os tenants.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "none",
+        "envelope_aes256_gcm"
+      ],
+      "default": "none",
+      "examples": [
+        "envelope_aes256_gcm"
+      ]
+    },
+    "BACKUP_ENCRYPTION_KEYRING": {
+      "type": "string",
+      "description": "Keyring JSON { key_id: base64(32B) } da cifra de backup. A chave vive FORA do artefato; rotação é aditiva (mantenha a chave antiga enquanto houver artefato que a referencie).",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "backup",
+        "maintenance",
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+    },
+    "BACKUP_ENCRYPTION_ACTIVE_KEY_ID": {
+      "type": "string",
+      "description": "Id da chave ATIVA dentro de BACKUP_ENCRYPTION_KEYRING. É um identificador, não material de chave — é o único campo de cifra que aparece em manifesto e auditoria.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm",
+      "examples": [
+        "k1"
+      ]
+    },
+    "BACKUP_DUMP_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Orçamento do pg_dump. Estourado, o processo é morto e a run falha.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3600000",
+      "examples": [
+        "3600000"
+      ]
+    },
+    "BACKUP_UPLOAD_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Orçamento do upload off-site.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "1800000",
+      "examples": [
+        "1800000"
+      ]
+    },
+    "BACKUP_RESTORE_TIMEOUT_MS": {
+      "type": "string",
+      "description": "Orçamento do restore drill.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "3600000",
+      "examples": [
+        "3600000"
+      ]
+    },
+    "BACKUP_MIN_ARTIFACT_BYTES": {
+      "type": "string",
+      "description": "Piso de tamanho do artefato. Abaixo disso é dump truncado, não backup — tamanho sozinho nunca é evidência, mas um piso pega o caso grosseiro.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "4096",
+      "examples": [
+        "4096"
+      ]
+    },
+    "BACKUP_RPO_TARGET_HOURS": {
+      "type": "string",
+      "description": "Objetivo de ponto de recuperação. Abaixo de 24h é recusado: dump lógico noturno não cumpre, e a plataforma não anuncia objetivo que a arquitetura não honra (exigiria PITR/WAL).",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "24",
+      "examples": [
+        "24"
+      ]
+    },
+    "BACKUP_RTO_TARGET_MINUTES": {
+      "type": "string",
+      "description": "Objetivo de tempo de recuperação, comparado à duração medida do último drill.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "120",
+      "examples": [
+        "120"
+      ]
+    },
+    "BACKUP_RESTORE_DRILL_INTERVAL_HOURS": {
+      "type": "string",
+      "description": "Intervalo máximo entre drills de restore aprovados. Vencido, a readiness degrada — até um drill passar, nenhum artefato é sabidamente restaurável.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "168",
+      "examples": [
+        "168"
+      ]
+    },
+    "RETENTION_DRY_RUN": {
+      "type": "string",
+      "description": "Executor de retenção só CONTA, não apaga. Default `true` de propósito: exclusão é irreversível, então desligar isso é uma decisão explícita por ambiente. Só `false`/`0` desligam.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
+    "RETENTION_POLICY": {
+      "type": "string",
+      "description": "Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "{\"version\":\"v1-dpo-2026-07\",\"approved_by\":\"<responsável jurídico>\",\"approved_at\":\"2026-07-01T00:00:00.000Z\",\"classes\":{}}"
       ]
     },
     "DAILY_LLM_USD_THRESHOLD": {

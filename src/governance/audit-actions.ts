@@ -68,10 +68,56 @@ export const AUDIT_ACTIONS = [
   'backup_completed',
   'backup_failed',
   'backup_s3_upload_failed',
+  // Emitted by the pre-#520 `cloud_backup_rotation` worker. The worker was
+  // replaced by `backup_retention` (manifest-driven, hold-aware, conclusive
+  // outcome) in the #520 round-1 fix, so nothing emits these any more — they
+  // stay in the enum because HISTORICAL audit rows carry them and the watcher
+  // must keep resolving the label.
   'backup_cloud_rotation_completed',
   'backup_cloud_rotation_failed',
   'restore_test_passed',
   'restore_test_failed',
+  // Issue #520 — backup/restore/retention verificáveis. As ações `backup_*`
+  // legadas acima continuam existindo (a trilha histórica não é reescrita),
+  // mas o lifecycle novo emite as ações abaixo, que distinguem o que o
+  // baseline não distinguia: uma run que terminou COM cópia off-site
+  // verificada (`backup_run_completed`) de uma que terminou local-only ou com
+  // upload falhado (`backup_run_degraded`). O baseline auditava
+  // `backup_completed` nos dois casos.
+  //  - backup_run_started/completed/degraded/failed: ciclo de uma execução.
+  //  - backup_artifact_verified: checksum conferido (local ou no destino).
+  //  - backup_artifact_deleted: retenção removeu um artefato — ação
+  //    destrutiva, registra política/escopo/contagem, nunca conteúdo.
+  //  - restore_drill_*: drill automatizado; `completed` carrega a duração que
+  //    alimenta o RTO medido.
+  //  - retention_run_*: passe de retenção (inclusive dry-run) por classe de
+  //    dado e tenant.
+  //  - legal_hold_created/released: §11 exige papel e auditoria append-only.
+  //  - privacy_request_*: workflow LGPD. `denied` guarda CÓDIGO de motivo.
+  //  - post_restore_reconciliation_*: gate anti-ressurreição do §13. `failed`
+  //    significa que o runtime NÃO pode voltar a produção.
+  'backup_run_started',
+  'backup_run_completed',
+  'backup_run_degraded',
+  'backup_run_failed',
+  'backup_artifact_verified',
+  'backup_artifact_deleted',
+  'restore_drill_started',
+  'restore_drill_completed',
+  'restore_drill_failed',
+  'retention_run_started',
+  'retention_run_completed',
+  'retention_run_failed',
+  'legal_hold_created',
+  'legal_hold_released',
+  'legal_hold_blocked_purge',
+  'privacy_request_created',
+  'privacy_request_identity_verified',
+  'privacy_request_approved',
+  'privacy_request_completed',
+  'privacy_request_denied',
+  'post_restore_reconciliation_completed',
+  'post_restore_reconciliation_failed',
   'whatsapp_connected',
   'whatsapp_disconnected',
   'llm_circuit_opened',
