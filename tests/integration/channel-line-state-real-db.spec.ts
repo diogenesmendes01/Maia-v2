@@ -39,6 +39,9 @@ async function wipe(): Promise<void> {
   try {
     for (const t of [T, T2]) {
       await c.query(`DELETE FROM admin_audit_log WHERE tenant_id = $1`, [t]);
+      await c.query(`DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`, [t]);
+      await c.query(`DELETE FROM channel_policies WHERE tenant_id = $1`, [t]);
+      await c.query(`DELETE FROM roles WHERE tenant_id = $1`, [t]);
       await c.query(`DELETE FROM channel_line_state WHERE tenant_id = $1`, [t]);
       await c.query(`DELETE FROM channels WHERE tenant_id = $1`, [t]);
     }
@@ -425,6 +428,134 @@ d('channel_line_state — idempotência e concorrência', () => {
     });
     expect(retry.ok).toBe(true);
     expect((retry as { row: { pairing_attempts: number } }).row.pairing_attempts).toBe(2);
+  });
+});
+
+/**
+ * Rodada 2 do review PR #528 — o gate de readiness ignorava o perfil
+ * operacional: um agente com policy e role, mas SEM perfil ativo, continuava
+ * elegível para ativação, e a linha entrava em roteamento para responder sem
+ * identidade operacional aprovada.
+ */
+d('line readiness — perfil operacional ativo é precondição', () => {
+  async function seedPolicyAndRole(): Promise<void> {
+    const c = await pool.connect();
+    try {
+      const role = await c.query<{ id: string }>(
+        `INSERT INTO roles(tenant_id, agent_id, role_key, display_name, is_default, active)
+         VALUES ($1, $2, 'atendente', 'Atendente', true, true) RETURNING id`,
+        [T, A],
+      );
+      await c.query(
+        `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+         VALUES ($1, $2, $3, $4, 'locked')`,
+        [T, A, channelId, role.rows[0]!.id],
+      );
+    } finally {
+      c.release();
+    }
+  }
+
+  async function seedActiveProfile(): Promise<void> {
+    const c = await pool.connect();
+    try {
+      await c.query(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, proposed_by, activated_at)
+         VALUES ($1, $2, 1, 'active', 'i518-test', now())`,
+        [T, A],
+      );
+    } finally {
+      c.release();
+    }
+  }
+
+  async function wipeReadiness(): Promise<void> {
+    const c = await pool.connect();
+    try {
+      await c.query(`DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`, [T]);
+      await c.query(`DELETE FROM channel_policies WHERE tenant_id = $1`, [T]);
+      await c.query(`DELETE FROM roles WHERE tenant_id = $1`, [T]);
+    } finally {
+      c.release();
+    }
+  }
+
+  beforeEach(async () => {
+    await wipeReadiness();
+  });
+
+  afterAll(async () => {
+    await wipeReadiness();
+  });
+
+  it('CASO NEGATIVO: policy + role prontos, mas SEM perfil ativo ⇒ não pronta', async () => {
+    const { evaluateLineReadiness } = await import('../../src/setup/line-readiness.js');
+    await seedPolicyAndRole();
+
+    expect(
+      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
+    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+  });
+
+  it('perfil apenas PROPOSTO não conta', async () => {
+    const { evaluateLineReadiness } = await import('../../src/setup/line-readiness.js');
+    await seedPolicyAndRole();
+    const c = await pool.connect();
+    try {
+      await c.query(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, proposed_by)
+         VALUES ($1, $2, 1, 'proposed', 'i518-test')`,
+        [T, A],
+      );
+    } finally {
+      c.release();
+    }
+
+    expect(
+      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
+    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+  });
+
+  it('perfil ativo + policy + role ativo ⇒ pronta', async () => {
+    const { evaluateLineReadiness } = await import('../../src/setup/line-readiness.js');
+    await seedActiveProfile();
+    await seedPolicyAndRole();
+
+    expect(
+      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
+    ).toEqual({ ready: true });
+  });
+
+  it('o perfil de OUTRO tenant não satisfaz a precondição (escopo)', async () => {
+    const { evaluateLineReadiness } = await import('../../src/setup/line-readiness.js');
+    await seedPolicyAndRole();
+    const c = await pool.connect();
+    try {
+      await c.query(
+        `INSERT INTO agent_operational_profile_versions
+           (tenant_id, agent_id, version, status, proposed_by, activated_at)
+         VALUES ($1, $2, 1, 'active', 'i518-test', now())`,
+        [T2, A2],
+      );
+    } finally {
+      c.release();
+    }
+
+    expect(
+      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
+    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+
+    const cleanup = await pool.connect();
+    try {
+      await cleanup.query(
+        `DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`,
+        [T2],
+      );
+    } finally {
+      cleanup.release();
+    }
   });
 });
 

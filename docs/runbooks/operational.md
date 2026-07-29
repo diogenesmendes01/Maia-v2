@@ -127,10 +127,15 @@ nunca dá posse.
 
 **Pareou mas não responde?** Provavelmente é o gate de readiness (issue #518
 §4): posse provada **não** é permissão de rotear. Uma linha só é ativada quando
-o backend revalida, deterministicamente, que ela tem política de canal com
-papel padrão **ativo**. Até lá fica `verified_offline` e o audit registra
-`channel_activation_deferred` com o motivo (`missing_policy` ou
-`default_role_inactive`).
+o backend revalida, deterministicamente, a mesma sequência do go-live checklist:
+
+1. o **agente** tem perfil operacional **ativo**;
+2. o canal tem política de canal;
+3. o papel padrão dessa política está **ativo**.
+
+Até lá a linha fica `verified_offline` e o audit registra
+`channel_activation_deferred` com o motivo (`missing_active_profile`,
+`missing_policy` ou `default_role_inactive`).
 
 Não é preciso re-parear: o worker revalida a cada minuto e emite
 `channel_activated` assim que a política ficar pronta.

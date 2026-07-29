@@ -99,6 +99,8 @@ const REASONS: Record<string, string> = {
   repair_completed: 'Posse encerrada. Pronta para um novo pareamento.',
   awaiting_readiness:
     'Posse provada. A linha só entra em roteamento quando tiver política com papel padrão ativo — o backend ativa sozinho assim que isso acontecer.',
+  missing_active_profile:
+    'O agente não tem perfil operacional ativo — sem ele a linha não entra em roteamento.',
   missing_policy: 'Falta a política de canal (papel padrão) para esta linha rotear.',
   default_role_inactive: 'O papel padrão da política está desativado — a linha não roteia.',
   already_active: 'A linha já estava ativa.',

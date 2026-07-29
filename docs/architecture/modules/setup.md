@@ -38,7 +38,8 @@
 | HTTP endpoints in `src/server.ts` | `/setup` consumes the setup-token — via the `POST /setup/session` form (token in the BODY, traded for an `httpOnly` session cookie) or the `x-maia-setup-token` header for break-glass. **Never via query string** (issue #518) |
 | `src/admin-ui/trpc/routers/channelLines.ts` | Pareamento de linhas ADICIONAIS na jornada normal: o console autenticado enfileira comandos em `channel_line_state` e o worker `channel_pairing` executa `line-pairing.ts`. Os endpoints `/setup/channels/:id/pair*` ficam como break-glass |
 | `src/setup/pairing-material.ts` | Cifra o QR/código para a travessia console↔runtime (envelope AES-GCM do keyring de staging); TTL curto, nunca em claro, nunca em log/audit/URL |
-| `src/setup/line-readiness.ts` | Gate DETERMINÍSTICO de roteamento (#518 §4): posse provada não ativa o canal — a linha só roteia com política de canal e papel padrão ATIVO. `line-pairing` consulta no fim do pareamento; o worker `channel_pairing` revalida a cada minuto e ativa sozinho quando a política fica pronta |
+| `src/setup/line-readiness.ts` | Gate DETERMINÍSTICO de roteamento (#518 §4): posse provada não ativa o canal — a linha só roteia com PERFIL OPERACIONAL ATIVO do agente, política de canal e papel padrão ativo (a mesma sequência do go-live checklist). `line-pairing` consulta no fim do pareamento; o worker `channel_pairing` revalida a cada minuto e ativa sozinho quando as condições aparecem |
+| `src/runtime/instance-identity.ts` | Fonte única de "quem eu sou" (`<hostname>:<pid>`) — worker e gateway precisam concordar para endereçar comandos à réplica que segura o socket da linha |
 
 ## Tests
 
