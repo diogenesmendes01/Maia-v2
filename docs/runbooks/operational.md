@@ -94,7 +94,19 @@ Baileys. Ele grava um comando em `channel_line_state` com o ator administrativo;
 o worker `channel_pairing` (a cada 5s, no processo do runtime) reivindica,
 executa e devolve o estado.
 
+Com **mais de uma réplica**, dois conceitos de posse convivem na tabela:
+`owner_instance` (+ `owner_lease_expires_at`) é quem está executando a ORDEM;
+`session_owner_instance` (+ `session_owner_lease_expires_at`) é quem segura o
+SOCKET. `disable` e `repair` são endereçados (`target_instance`) à réplica dona
+do socket — só ela consegue derrubá-lo. Lease vencida do alvo libera o comando
+para qualquer réplica (o processo morreu e levou o socket junto).
+
 ```sql
+-- Quem segura o socket de cada linha, e a ordem endereçada a quem.
+SELECT channel_id, session_owner_instance, session_owner_lease_expires_at,
+       command, target_instance
+  FROM channel_line_state WHERE session_owner_instance IS NOT NULL OR command IS NOT NULL;
+
 -- Comando pendente que ninguém reivindicou ⇒ o worker do runtime está parado.
 SELECT channel_id, command, command_requested_at, command_claimed_at, owner_instance
   FROM channel_line_state WHERE command IS NOT NULL;

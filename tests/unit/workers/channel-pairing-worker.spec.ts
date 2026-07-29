@@ -24,6 +24,7 @@ const {
   abortPairingMock,
   triggerRecoveryMock,
   stopLineSessionMock,
+  listLocalSessionsMock,
   readinessMock,
   activateVerifiedMock,
   sealMock,
@@ -33,6 +34,7 @@ const {
     claimNextCommand: vi.fn(),
     completeCommand: vi.fn(async () => true),
     renewOwnerLeases: vi.fn(async () => 0),
+    renewSessionLeases: vi.fn(async () => 0),
     putPairingMaterial: vi.fn(async () => true),
     transition: vi.fn(async () => true),
     failStalePairings: vi.fn(async () => []),
@@ -48,6 +50,7 @@ const {
   abortPairingMock: vi.fn(async () => undefined),
   triggerRecoveryMock: vi.fn(async () => undefined),
   stopLineSessionMock: vi.fn(() => true),
+  listLocalSessionsMock: vi.fn((): string[] => []),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
 }));
@@ -72,6 +75,7 @@ vi.mock('../../../src/setup/line-pairing.js', () => ({
 vi.mock('../../../src/setup/recovery.js', () => ({ triggerRecovery: triggerRecoveryMock }));
 vi.mock('../../../src/gateway/line-sessions.js', () => ({
   stopLineSession: stopLineSessionMock,
+  listLocalLineSessionIds: listLocalSessionsMock,
   _internal: { startLineSession: vi.fn(async () => undefined) },
 }));
 vi.mock('../../../src/setup/line-readiness.js', () => ({
@@ -138,6 +142,8 @@ beforeEach(() => {
   repoMock.releaseStaleAborts.mockResolvedValue([]);
   repoMock.listVerifiedAwaitingActivation.mockResolvedValue([]);
   repoMock.renewOwnerLeases.mockResolvedValue(0);
+  repoMock.renewSessionLeases.mockResolvedValue(0);
+  listLocalSessionsMock.mockReturnValue([]);
   readinessMock.mockResolvedValue({ ready: true });
   activateVerifiedMock.mockResolvedValue({ ok: true });
   repoMock.completeCommand.mockResolvedValue(true);
@@ -403,6 +409,50 @@ describe('abort e repair', () => {
     claimOnce(commandRow({ command: 'stop_line', command_method: null }));
     await runChannelPairingWorker();
     expect(stopLineSessionMock).toHaveBeenCalledWith(CHANNEL_ID);
+  });
+
+  it('stop_line CONFIRMADO apaga o registro de posse da sessão', async () => {
+    claimOnce(
+      commandRow({
+        command: 'stop_line',
+        command_method: null,
+        target_instance: _internal.OWNER_INSTANCE,
+      }),
+    );
+    await runChannelPairingWorker();
+
+    expect(repoMock.completeCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ release_owner: true, clear_session_owner: true }),
+    );
+  });
+
+  it('repair também confirma a derrubada e solta a posse da sessão', async () => {
+    claimOnce(commandRow({ command: 'repair', command_method: null }));
+    await runChannelPairingWorker();
+
+    expect(repoMock.completeCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ clear_session_owner: true, state: 'declared' }),
+    );
+  });
+
+  it('o tick PUBLICA quais linhas têm socket nesta réplica (roteamento do stop)', async () => {
+    listLocalSessionsMock.mockReturnValue(['ch-local-1', 'ch-local-2']);
+    claimOnce(null);
+    await runChannelPairingWorker();
+
+    // Sem esta publicação, `disable` não teria como endereçar o comando à
+    // réplica dona e a linha continuaria respondendo (review PR #528 rodada 2).
+    expect(repoMock.renewSessionLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE, [
+      'ch-local-1',
+      'ch-local-2',
+    ]);
+  });
+
+  it('sem sessão local, o tick não escreve posse alguma', async () => {
+    listLocalSessionsMock.mockReturnValue([]);
+    claimOnce(null);
+    await runChannelPairingWorker();
+    expect(repoMock.renewSessionLeases).not.toHaveBeenCalled();
   });
 
   it('stop_line que falha NÃO marca a linha como failed (ela está disabled)', async () => {

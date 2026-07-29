@@ -55,6 +55,7 @@ import {
   type LineTransport,
 } from './line-session-manager.js';
 import { triggerRecovery } from '../setup/recovery.js';
+import { runtimeInstanceId } from '../runtime/instance-identity.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -398,6 +399,18 @@ export async function startAdditionalLineSessions(): Promise<void> {
  *
  * Idempotente: parar uma linha que não tem sessão é um no-op.
  */
+/**
+ * Canais cujo socket vive NESTE processo (review PR #528 rodada 2).
+ *
+ * É a fonte do heartbeat de posse de sessão: o worker publica esta lista em
+ * `channel_line_state.session_owner_instance`, e é por ela que `disable` e
+ * `repair` conseguem endereçar o comando à réplica certa em vez de chamar
+ * `stopLineSession` num Map local vazio e declarar sucesso.
+ */
+export function listLocalLineSessionIds(): string[] {
+  return [...sessions.keys()].filter((id) => !sessions.get(id)!.stopped);
+}
+
 export function stopLineSession(channelId: string): boolean {
   const state = sessions.get(channelId);
   // `markState('closed')` remove o transporte no manager mesmo sem sessão
@@ -427,6 +440,7 @@ export function stopLineSession(channelId: string): boolean {
  * o socket durante o desligamento.
  */
 export async function shutdownLineSessions(): Promise<void> {
+  const owned = [...sessions.keys()];
   for (const [channelId, state] of sessions) {
     state.stopped = true;
     if (state.reconnectTimer) {
@@ -441,6 +455,24 @@ export async function shutdownLineSessions(): Promise<void> {
     getLineSessionManager().markState(channelId, 'closed');
   }
   sessions.clear();
+
+  // Drain ordenado da #512 (passo `line_sessions`): abrir mão da POSSE das
+  // sessões aqui, em vez de deixar a lease vencer, permite que outra réplica
+  // assuma as linhas imediatamente após o shutdown. Best-effort — o banco já
+  // pode estar indo embora no passo `pools`, e a lease cobre esse caso.
+  if (owned.length > 0) {
+    try {
+      const { channelLineStateRepo } = await import(
+        '../db/repositories/channel-line-state-repos.js'
+      );
+      await channelLineStateRepo.releaseSessionOwnership(runtimeInstanceId(), owned);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message },
+        'line_session.session_ownership_release_failed',
+      );
+    }
+  }
 }
 
 /** Test-only. */

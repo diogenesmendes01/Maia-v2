@@ -20,7 +20,7 @@
  * Material de pareamento (QR/código) só entra aqui CIFRADO — ver
  * `src/setup/pairing-material.ts`. Este repo nunca loga o envelope.
  */
-import { and, eq, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, lt, sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { channels, channel_line_state, admin_audit_log } from '../schema.js';
 import type { ChannelLineStateRow } from '../schema.js';
@@ -38,6 +38,14 @@ export interface RequestCommandArgs {
   correlation_id: string;
   /** TTL da tentativa de pareamento (default 15 min, igual à PairingSession). */
   pairing_ttl_ms?: number;
+  /**
+   * Endereça o comando à réplica que detém o SOCKET desta linha
+   * (review PR #528 rodada 2). Usado por `stop_line` e `repair`, que precisam
+   * derrubar uma sessão que vive na memória de um processo específico. O
+   * destino é lido da própria row DENTRO da transação (ela já está travada
+   * com `FOR UPDATE`), e só vale enquanto a lease do dono estiver viva.
+   */
+  address_to_session_owner?: boolean;
 }
 
 export type RequestCommandResult =
@@ -252,12 +260,25 @@ async function requestCommandInTx(
         }
       }
 
+      // Destino do comando endereçado: só a réplica cuja lease de sessão está
+      // VIVA. Com a lease vencida o socket morreu junto do processo, então o
+      // comando fica livre para qualquer réplica concluir.
+      const sessionOwnerAlive =
+        current?.session_owner_instance != null &&
+        current.session_owner_lease_expires_at !== null &&
+        current.session_owner_lease_expires_at.getTime() > now.getTime();
+      const target =
+        args.address_to_session_owner && sessionOwnerAlive
+          ? current!.session_owner_instance
+          : null;
+
       const base = {
         command: args.command,
         command_method: args.method ?? null,
         command_id: args.command_id,
         command_requested_at: now,
         command_claimed_at: null,
+        target_instance: target,
         actor_id: args.actor_id,
         actor_role: args.actor_role,
         correlation_id: args.correlation_id,
@@ -511,7 +532,11 @@ export const channelLineStateRepo = {
           },
         });
 
-      // O socket vive no runtime — desativar a row não o encerra (P1).
+      // O socket vive no runtime — desativar a row não o encerra (P1). E o
+      // comando é ENDEREÇADO à réplica que o segura: sem isso, qualquer
+      // réplica o consumia chamando `stopLineSession` num Map local vazio e
+      // declarava sucesso, enquanto a linha seguia respondendo pela réplica
+      // dona (review PR #528 rodada 2).
       await requestCommandInTx(tx, {
         scope: args.scope,
         command: 'stop_line',
@@ -519,6 +544,7 @@ export const channelLineStateRepo = {
         actor_id: args.actor_id,
         actor_role: args.actor_role,
         correlation_id: args.correlation_id,
+        address_to_session_owner: true,
       });
 
       await appendLineAudit(tx, args.scope, args.audit);
@@ -597,6 +623,20 @@ export const channelLineStateRepo = {
             sql`(${channel_line_state.command_claimed_at} IS NULL
                   OR ${channel_line_state.owner_lease_expires_at} IS NULL
                   OR ${channel_line_state.owner_lease_expires_at} < ${now})`,
+            // Review PR #528 rodada 2 — ENDEREÇAMENTO. `stop_line` e `repair`
+            // precisam derrubar um socket que vive na memória de uma réplica
+            // específica; sem este filtro, qualquer réplica reivindicava o
+            // comando, chamava `stopLineSession` no seu Map local (no-op) e
+            // concluía — o operador via "desabilitada" e a linha continuava
+            // respondendo pela réplica dona.
+            //
+            // A lease vencida do ALVO é o escape: se a réplica dona morreu, o
+            // socket morreu junto, e qualquer réplica pode concluir em vez de
+            // o comando ficar pendurado para sempre.
+            sql`(${channel_line_state.target_instance} IS NULL
+                  OR ${channel_line_state.target_instance} = ${owner_instance}
+                  OR ${channel_line_state.session_owner_lease_expires_at} IS NULL
+                  OR ${channel_line_state.session_owner_lease_expires_at} < ${now})`,
           ),
         )
         .orderBy(channel_line_state.command_requested_at)
@@ -666,6 +706,61 @@ export const channelLineStateRepo = {
   },
 
   /**
+   * Registra/renova a POSSE DA SESSÃO das linhas cujos sockets vivem NESTE
+   * processo (review PR #528 rodada 2).
+   *
+   * É a tabela de roteamento dos comandos endereçados: `disable` e `repair`
+   * precisam alcançar a réplica que realmente segura o socket. Claim e
+   * heartbeat são a mesma escrita de propósito — assim a posse é
+   * auto-corretiva: se o registro inicial falhar, o próximo tick (≤5s) a
+   * grava. Lista vazia é no-op barato.
+   *
+   * Não usa CAS por dono: exatamente uma réplica pode ter a sessão viva (o
+   * CAS de `activateVerified` elege quem sobe), então o último escritor é o
+   * dono corrente por construção.
+   */
+  async renewSessionLeases(
+    owner_instance: string,
+    channel_ids: readonly string[],
+    lease_ms: number = OWNER_LEASE_MS,
+  ): Promise<number> {
+    if (channel_ids.length === 0) return 0;
+    const now = new Date();
+    const rows = await db
+      .update(channel_line_state)
+      .set({
+        session_owner_instance: owner_instance,
+        session_owner_lease_expires_at: new Date(now.getTime() + lease_ms),
+      })
+      .where(inArray(channel_line_state.channel_id, [...channel_ids]))
+      .returning({ channel_id: channel_line_state.channel_id });
+    return rows.length;
+  },
+
+  /**
+   * Abre mão da posse da sessão (shutdown ordenado da #512, stop explícito).
+   * Liberar aqui, em vez de esperar a lease vencer, deixa outra réplica
+   * assumir a linha imediatamente.
+   */
+  async releaseSessionOwnership(
+    owner_instance: string,
+    channel_ids: readonly string[],
+  ): Promise<number> {
+    if (channel_ids.length === 0) return 0;
+    const rows = await db
+      .update(channel_line_state)
+      .set({ session_owner_instance: null, session_owner_lease_expires_at: null })
+      .where(
+        and(
+          eq(channel_line_state.session_owner_instance, owner_instance),
+          inArray(channel_line_state.channel_id, [...channel_ids]),
+        ),
+      )
+      .returning({ channel_id: channel_line_state.channel_id });
+    return rows.length;
+  },
+
+  /**
    * Conclui o comando reivindicado: limpa a ordem, aplica a transição de
    * estado e (quando o trabalho acabou) libera a posse — TUDO num único
    * UPDATE, sob UM ÚNICO CAS por `(channel_id, command_id, owner_instance)`.
@@ -697,6 +792,8 @@ export const channelLineStateRepo = {
     lease_ms?: number;
     state?: LineState;
     reason_code?: string | null;
+    /** A sessão desta linha foi derrubada: some com o registro de posse. */
+    clear_session_owner?: boolean;
   }): Promise<boolean> {
     const now = new Date();
     const rows = await db
@@ -705,6 +802,10 @@ export const channelLineStateRepo = {
         command: null,
         command_method: null,
         command_claimed_at: null,
+        target_instance: null,
+        ...(args.clear_session_owner
+          ? { session_owner_instance: null, session_owner_lease_expires_at: null }
+          : {}),
         ...(args.release_owner
           ? { owner_instance: null, owner_lease_expires_at: null }
           : {

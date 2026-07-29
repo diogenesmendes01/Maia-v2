@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS channel_line_state (
   -- dono a renova por heartbeat a cada tick; um dono morto para de renovar e a
   -- lease vence. Quem varre olha a LEASE, nunca a identidade do dono.
   owner_lease_expires_at timestamptz,
+  -- Instância que detém o comando ENDEREÇADO (review PR #528 rodada 2).
+  -- `stop_line` e `repair` precisam derrubar um socket que vive na MEMÓRIA de
+  -- uma réplica específica. Sem endereçamento, qualquer réplica reivindicava o
+  -- comando, chamava `stopLineSession` no seu Map local (no-op), e concluía —
+  -- o operador via "desabilitada" e a linha continuava respondendo pela outra
+  -- réplica. NULL = qualquer réplica pode executar.
+  target_instance text,
+
+  -- ── posse da SESSÃO (socket Baileys), distinta da posse do COMANDO ───────
+  -- `owner_instance` diz quem está executando a ordem; estas duas dizem quem
+  -- segura o socket da linha. São a tabela de roteamento dos comandos
+  -- endereçados, e a lease é o que distingue "réplica viva" de "réplica que
+  -- morreu levando o socket junto".
+  session_owner_instance text,
+  session_owner_lease_expires_at timestamptz,
   -- Ator ADMINISTRATIVO preservado ponta a ponta (invariante 4 do AGENTS.md):
   -- o runtime audita a transição citando quem pediu, não "system".
   actor_id text,

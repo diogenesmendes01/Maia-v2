@@ -384,6 +384,9 @@ export const channelLinesRouter = router({
         scope,
         command: 'repair',
         command_id: randomUUID(),
+        // Endereçado à réplica que segura o socket: o repair derruba a sessão
+        // ANTES de apagar o auth dir, e só quem tem o socket consegue.
+        address_to_session_owner: true,
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
         correlation_id: correlationId,

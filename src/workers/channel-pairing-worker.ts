@@ -19,8 +19,8 @@
  * CIFRADO (`setup/pairing-material.ts`); o código de 8 dígitos idem. Nada
  * disso é logado nem auditado.
  */
-import { hostname } from 'node:os';
 import { config } from '@/config/env.js';
+import { runtimeInstanceId } from '@/runtime/instance-identity.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { audit } from '@/governance/audit.js';
@@ -54,7 +54,7 @@ const STALE_SWEEP_EVERY_TICKS = 12;
  * exatamente assim que `failStalePairings` reconhece uma tentativa cuja
  * PairingSession morreu com o processo anterior.
  */
-const OWNER_INSTANCE = `${hostname()}:${process.pid}`;
+const OWNER_INSTANCE = runtimeInstanceId();
 
 let running = false;
 let tickCount = 0;
@@ -119,6 +119,8 @@ interface CommandCompletion {
   release_owner: boolean;
   state?: LineState;
   reason_code?: string | null;
+  /** A sessão desta linha foi confirmadamente derrubada. */
+  clear_session_owner?: boolean;
 }
 
 async function executeStartPairing(row: {
@@ -254,7 +256,12 @@ async function executeRepair(row: {
     },
   });
   incCounter('maia_channel_pairing_total', { outcome: 'repaired' });
-  return { release_owner: true, state: 'declared', reason_code: 'repair_completed' };
+  return {
+    release_owner: true,
+    state: 'declared',
+    reason_code: 'repair_completed',
+    clear_session_owner: true,
+  };
 }
 
 /**
@@ -264,15 +271,46 @@ async function executeRepair(row: {
  * socket encerrado, transporte removido. O estado `disabled` já foi gravado
  * pelo console e é protegido contra ressurreição por callback atrasado.
  */
-async function executeStopLine(row: { channel_id: string }): Promise<CommandCompletion> {
+async function executeStopLine(row: {
+  channel_id: string;
+  target_instance: string | null;
+}): Promise<CommandCompletion> {
   const { stopLineSession } = await import('@/gateway/line-sessions.js');
   const stopped = stopLineSession(row.channel_id);
   incCounter('maia_channel_pairing_total', {
     outcome: stopped ? 'line_stopped' : 'line_already_stopped',
   });
+  logger.info(
+    { channel_id: row.channel_id, stopped, target: row.target_instance },
+    'channel_pairing.stop_line_confirmed',
+  );
+  // Só chegamos aqui se ESTE processo é o destinatário (a lease do dono ainda
+  // valia) ou se o dono registrado já não tem lease — nos dois casos não há
+  // socket vivo para esta linha em lugar nenhum. É a CONFIRMAÇÃO que autoriza
+  // concluir o comando e apagar o registro de posse da sessão.
+  //
   // Sem `state`: a linha já está `disabled` por decisão do operador, e
   // sobrescrever isso apagaria a decisão.
-  return { release_owner: true };
+  return { release_owner: true, clear_session_owner: true };
+}
+
+/**
+ * Publica a posse das sessões que vivem NESTE processo. Best-effort: uma
+ * falha aqui só atrasa o endereçamento até o próximo tick (≤5s), e a lease
+ * vencida do alvo já é o escape que impede um comando de ficar pendurado.
+ */
+async function publishLocalSessionOwnership(): Promise<void> {
+  try {
+    const { listLocalLineSessionIds } = await import('@/gateway/line-sessions.js');
+    const ids = listLocalLineSessionIds();
+    if (ids.length === 0) return;
+    await channelLineStateRepo.renewSessionLeases(OWNER_INSTANCE, ids);
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'channel_pairing.session_ownership_publish_failed',
+    );
+  }
 }
 
 /**
@@ -412,6 +450,14 @@ export async function runChannelPairingWorker(): Promise<void> {
         logger.warn({ err: (err as Error).message }, 'channel_pairing.lease_renew_failed'),
       );
 
+    // Publica quais linhas têm o SOCKET nesta réplica. É a tabela de
+    // roteamento que permite endereçar `disable`/`repair` à réplica dona —
+    // sem ela, qualquer réplica "concluía" o stop chamando `stopLineSession`
+    // num Map local vazio, e a linha seguia respondendo (review PR #528
+    // rodada 2). Claim e heartbeat são a mesma escrita: a posse é
+    // auto-corretiva a cada tick.
+    await publishLocalSessionOwnership();
+
     if (tickCount % STALE_SWEEP_EVERY_TICKS === 0) {
       await sweepStalePairings();
       // Mesma cadência de ~1min: a linha verificada entra em roteamento assim
@@ -444,7 +490,10 @@ export async function runChannelPairingWorker(): Promise<void> {
             external_id: row.external_id,
           });
         } else if (row.command === 'stop_line') {
-          completion = await executeStopLine({ channel_id: row.channel_id });
+          completion = await executeStopLine({
+            channel_id: row.channel_id,
+            target_instance: row.target_instance,
+          });
         }
       } catch (err) {
         // Fail-isolated por comando: um canal problemático não trava a fila.
@@ -470,6 +519,7 @@ export async function runChannelPairingWorker(): Promise<void> {
             ...(completion.reason_code !== undefined
               ? { reason_code: completion.reason_code }
               : {}),
+            ...(completion.clear_session_owner ? { clear_session_owner: true } : {}),
           })
           .catch(() => false);
         if (!done) {

@@ -233,3 +233,29 @@ describe('stopLineSession — derruba a sessão de VERDADE', () => {
     expect(stopLineSession('canal-sem-sessao')).toBe(false);
   });
 });
+
+/**
+ * Rodada 2 do review PR #528 — `stopLineSession` só enxerga o Map LOCAL. Para
+ * `disable`/`repair` alcançarem a réplica que realmente segura o socket, essa
+ * posse precisa ser publicada; esta lista é a fonte do heartbeat.
+ */
+describe('listLocalLineSessionIds — tabela de roteamento do stop', () => {
+  it('lista só as linhas cujo socket vive NESTE processo', async () => {
+    const { listLocalLineSessionIds } = await import('../../../src/gateway/line-sessions.js');
+    expect(listLocalLineSessionIds()).toEqual([]);
+
+    await _internal.startLineSession(CHANNEL);
+    expect(listLocalLineSessionIds()).toEqual([CHANNEL.id]);
+  });
+
+  it('uma linha PARADA sai da lista imediatamente', async () => {
+    const { listLocalLineSessionIds, stopLineSession } = await import(
+      '../../../src/gateway/line-sessions.js'
+    );
+    await _internal.startLineSession(CHANNEL);
+    stopLineSession(CHANNEL.id);
+    // Continuar publicando posse de um socket morto faria o comando de stop
+    // ser endereçado a uma réplica que não tem mais nada para derrubar.
+    expect(listLocalLineSessionIds()).toEqual([]);
+  });
+});

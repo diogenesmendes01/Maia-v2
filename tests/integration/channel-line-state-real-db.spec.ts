@@ -977,6 +977,155 @@ d('channel_line_state — material cifrado e restart', () => {
     ).toEqual({ ok: false, reason: 'not_found' });
   });
 
+  /**
+   * P1 da rodada 2 do review PR #528 — `channelLines.ts:335`.
+   *
+   * `stopLineSession` só enxerga o `Map` local da réplica que consumiu o
+   * comando. Sem endereçamento, a réplica ERRADA consumia o `stop_line`,
+   * chamava um no-op e concluía: o operador via "desabilitada" e a linha
+   * continuava respondendo pela réplica dona. Pior que não ter feito nada.
+   */
+  it('stop_line é endereçado à réplica DONA do socket — a outra não o consome', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+
+    // A réplica A publica que segura o socket desta linha.
+    await channelLineStateRepo.upsertTransition({
+      channel_id: channelId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'connected',
+    });
+    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+
+    await channelLineStateRepo.disableLineWithAudit({
+      scope,
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      ...ACTOR,
+      audit: {
+        actor_id: 'i518-user',
+        actor_role: 'owner',
+        action: 'channel_disabled',
+        change_summary: { agent_id: A },
+      },
+    });
+
+    const state = await channelLineStateRepo.getStateForScope(scope);
+    expect(state?.command).toBe('stop_line');
+    expect(state?.target_instance).toBe('replica-A');
+
+    // A réplica B NÃO pode consumir: ela não tem o socket.
+    expect(await channelLineStateRepo.claimNextCommand('replica-B')).toBeNull();
+    // A dona consome.
+    const claimed = await channelLineStateRepo.claimNextCommand('replica-A');
+    expect(claimed?.command).toBe('stop_line');
+  });
+
+  it('dono MORTO (lease vencida): qualquer réplica conclui o stop', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.upsertTransition({
+      channel_id: channelId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'connected',
+    });
+    // Lease de 1ms: a réplica A morreu e nunca renovou.
+    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId], 1);
+    await new Promise((r) => setTimeout(r, 20));
+
+    await channelLineStateRepo.disableLineWithAudit({
+      scope,
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      ...ACTOR,
+      audit: {
+        actor_id: 'i518-user',
+        actor_role: 'owner',
+        action: 'channel_disabled',
+        change_summary: { agent_id: A },
+      },
+    });
+
+    // Com o dono morto o comando nasce SEM destino — o socket morreu junto.
+    const state = await channelLineStateRepo.getStateForScope(scope);
+    expect(state?.target_instance).toBeNull();
+    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe(
+      'stop_line',
+    );
+  });
+
+  it('comando endereçado a um dono que morreu DEPOIS não fica pendurado', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.upsertTransition({
+      channel_id: channelId,
+      tenant_id: T,
+      agent_id: A,
+      state: 'connected',
+    });
+    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId], 1);
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'stop_line',
+      command_id: randomUUID(),
+      ...ACTOR,
+      address_to_session_owner: true,
+    });
+    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe(
+      'replica-A',
+    );
+
+    await new Promise((r) => setTimeout(r, 20)); // a lease do alvo vence
+    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe(
+      'stop_line',
+    );
+  });
+
+  it('a conclusão do stop apaga o registro de posse da sessão', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+    const key = randomUUID();
+    await channelLineStateRepo.requestCommand({
+      scope,
+      command: 'stop_line',
+      command_id: key,
+      ...ACTOR,
+      address_to_session_owner: true,
+    });
+    await channelLineStateRepo.claimNextCommand('replica-A');
+    await channelLineStateRepo.completeCommand({
+      channel_id: channelId,
+      command_id: key,
+      owner_instance: 'replica-A',
+      release_owner: true,
+      clear_session_owner: true,
+    });
+
+    const after = await channelLineStateRepo.getStateForScope(scope);
+    expect(after?.command).toBeNull();
+    expect(after?.target_instance).toBeNull();
+    expect(after?.session_owner_instance).toBeNull();
+    expect(after?.session_owner_lease_expires_at).toBeNull();
+  });
+
+  it('releaseSessionOwnership só solta o que é do próprio dono', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+
+    expect(await channelLineStateRepo.releaseSessionOwnership('replica-B', [channelId])).toBe(0);
+    expect((await channelLineStateRepo.getStateForScope(scope))?.session_owner_instance).toBe(
+      'replica-A',
+    );
+    expect(await channelLineStateRepo.releaseSessionOwnership('replica-A', [channelId])).toBe(1);
+    expect(
+      (await channelLineStateRepo.getStateForScope(scope))?.session_owner_instance,
+    ).toBeNull();
+  });
+
   it('uma linha DESABILITADA não é ressuscitada por callback atrasado da sessão', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
