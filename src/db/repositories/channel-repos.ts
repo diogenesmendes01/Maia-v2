@@ -490,9 +490,18 @@ export const channelsRepo = {
     channel_id: string;
   }): Promise<
     | { ok: true; channel: Channel }
-    | { ok: false; reason: 'not_found' | 'line_owned_elsewhere' }
+    | { ok: false; reason: 'not_found' | 'line_owned_elsewhere' | 'already_active' }
   > {
     try {
+      // Review PR #528 rodada 2 (P1 novo) — o UPDATE é um CAS sobre
+      // `active = false`, e é ele que decide o VENCEDOR da ativação.
+      //
+      // Sem o predicado, duas réplicas rodando `promoteReadyVerifiedLines` no
+      // mesmo tick liam a mesma linha `verified_offline`, ambas recebiam
+      // `ok: true` e cada uma subia `startLineSession` no seu mapa local:
+      // DOIS sockets Baileys para a MESMA linha WhatsApp — exatamente o
+      // incidente que a posse de linha existe para impedir. Com o CAS, o
+      // Postgres serializa e só um UPDATE encontra `active = false`.
       const rows = await db
         .update(channels)
         .set({ active: true, updated_at: new Date() })
@@ -501,11 +510,29 @@ export const channelsRepo = {
             eq(channels.tenant_id, args.tenant_id),
             eq(channels.agent_id, args.agent_id),
             eq(channels.id, args.channel_id),
+            eq(channels.active, false),
           ),
         )
         .returning();
-      if (rows.length === 0) return { ok: false, reason: 'not_found' };
-      return { ok: true, channel: rows[0]! };
+      if (rows.length > 0) return { ok: true, channel: rows[0]! };
+
+      // Zero linhas: ou o canal não existe NESTE escopo, ou alguém já ativou.
+      // Distinguir importa — `already_active` é um perdedor de corrida
+      // benigno (não deve marcar a linha como `failed` nem subir sessão),
+      // `not_found` é fail-closed de escopo.
+      const existing = await db
+        .select({ active: channels.active })
+        .from(channels)
+        .where(
+          and(
+            eq(channels.tenant_id, args.tenant_id),
+            eq(channels.agent_id, args.agent_id),
+            eq(channels.id, args.channel_id),
+          ),
+        )
+        .limit(1);
+      if (existing.length === 0) return { ok: false, reason: 'not_found' };
+      return { ok: false, reason: 'already_active' };
     } catch (err) {
       if (pgErrorCode(err) === '23505') {
         return { ok: false, reason: 'line_owned_elsewhere' };

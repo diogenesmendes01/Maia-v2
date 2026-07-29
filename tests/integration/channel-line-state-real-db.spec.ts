@@ -933,6 +933,50 @@ d('channel_line_state — material cifrado e restart', () => {
     expect(pending.map((p) => p.channel_id)).not.toContain(activeId);
   });
 
+  /**
+   * P1 NOVO da rodada 2 do review PR #528 — duas réplicas promovendo a mesma
+   * linha. Sem CAS sobre `active = false`, as duas recebiam `ok: true` e cada
+   * uma subia um socket Baileys para a MESMA linha WhatsApp.
+   */
+  it('activateVerified é CAS: duas réplicas concorrentes, UM vencedor', async () => {
+    const { channelsRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+
+    const [a, b] = await Promise.all([
+      channelsRepo.activateVerified(scope),
+      channelsRepo.activateVerified(scope),
+    ]);
+
+    const winners = [a, b].filter((r) => r.ok);
+    const losers = [a, b].filter((r) => !r.ok);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    // Perdedor benigno, distinguível de erro de escopo: quem perde não pode
+    // marcar a linha `failed` nem subir uma segunda sessão.
+    expect((losers[0] as { reason: string }).reason).toBe('already_active');
+  });
+
+  it('ativação sequencial: a segunda chamada informa already_active, não sucesso', async () => {
+    const { channelsRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    expect((await channelsRepo.activateVerified(scope)).ok).toBe(true);
+    expect(await channelsRepo.activateVerified(scope)).toEqual({
+      ok: false,
+      reason: 'already_active',
+    });
+  });
+
+  it('activateVerified fora do escopo continua not_found (fail-closed)', async () => {
+    const { channelsRepo } = await import('../../src/db/repositories.js');
+    expect(
+      await channelsRepo.activateVerified({
+        tenant_id: T,
+        agent_id: A,
+        channel_id: foreignChannelId,
+      }),
+    ).toEqual({ ok: false, reason: 'not_found' });
+  });
+
   it('uma linha DESABILITADA não é ressuscitada por callback atrasado da sessão', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };

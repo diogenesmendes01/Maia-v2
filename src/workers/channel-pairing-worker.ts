@@ -302,6 +302,18 @@ async function promoteReadyVerifiedLines(): Promise<void> {
         channel_id: line.channel_id,
       });
       if (!act.ok) {
+        // `already_active`: OUTRA RÉPLICA venceu o CAS neste mesmo tick. É um
+        // perdedor benigno — a linha está ativa e com sessão subindo lá.
+        // Marcá-la `failed` ou subir uma segunda sessão aqui é justamente o
+        // bug que o CAS fecha (review PR #528 rodada 2).
+        if (act.reason === 'already_active') {
+          incCounter('maia_channel_pairing_total', { outcome: 'activation_lost_race' });
+          logger.info(
+            { channel_id: line.channel_id },
+            'channel_pairing.activation_lost_race',
+          );
+          continue;
+        }
         // `line_owned_elsewhere` (23505 do índice global) é fail-closed: a
         // linha pertence a outro workspace, esta não pode ativar.
         await channelLineStateRepo.transition({

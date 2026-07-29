@@ -683,6 +683,50 @@ describe('readiness — a linha verificada só roteia quando estiver pronta (#51
     expect(activated?.metadata).toMatchObject({ trigger: 'readiness_revalidated' });
   });
 
+  /**
+   * P1 NOVO da rodada 2 (`channel-pairing-worker.ts:281`): duas réplicas
+   * varrendo no mesmo tick listavam a MESMA linha `verified_offline`, as duas
+   * recebiam `ok: true` de `activateVerified` e cada uma subia um socket —
+   * DOIS sockets Baileys para a mesma linha WhatsApp.
+   */
+  it('duas réplicas concorrentes: só o VENCEDOR do CAS inicia sessão', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
+    // O CAS sobre `active = false` só deixa UM UPDATE encontrar a row.
+    let winnerTaken = false;
+    activateVerifiedMock.mockImplementation(async () => {
+      if (winnerTaken) return { ok: false, reason: 'already_active' };
+      winnerTaken = true;
+      return { ok: true };
+    });
+    const sessions = await import('../../../src/gateway/line-sessions.js');
+    const startLineSession = vi.mocked(sessions._internal.startLineSession);
+    startLineSession.mockClear();
+    claimOnce(null);
+
+    // Dois sweepers concorrentes (duas réplicas, mesmo tick).
+    _internal.reset();
+    await runChannelPairingWorker();
+    _internal.reset();
+    await runChannelPairingWorker();
+
+    expect(activateVerifiedMock).toHaveBeenCalledTimes(2);
+    // Exatamente uma ativação vencedora e, portanto, uma única auditoria.
+    expect(auditCalls.filter((c) => c.acao === 'channel_activated')).toHaveLength(1);
+  });
+
+  it('perdedor da corrida NÃO marca a linha como failed', async () => {
+    repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
+    activateVerifiedMock.mockResolvedValue({ ok: false, reason: 'already_active' });
+    claimOnce(null);
+
+    await runChannelPairingWorker();
+
+    // A linha está ativa e com sessão subindo na outra réplica: marcá-la
+    // `failed` aqui seria mentira, e subir sessão seria o segundo socket.
+    expect(repoMock.transition).not.toHaveBeenCalled();
+    expect(auditCalls.some((c) => c.acao === 'channel_activated')).toBe(false);
+  });
+
   it('linha que pertence a outro workspace falha fechado, não ativa', async () => {
     repoMock.listVerifiedAwaitingActivation.mockResolvedValue([AWAITING]);
     activateVerifiedMock.mockResolvedValue({ ok: false, reason: 'line_owned_elsewhere' });
