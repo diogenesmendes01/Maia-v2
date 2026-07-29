@@ -181,6 +181,11 @@ export const tracesRouter = router({
         hmac_key_version: trace.hmac_key_version,
         envelope_integrity: trace.integrity,
         envelope_signed: trace.integrity === 'verified',
+        // Round 2 [P2]: the BODY carries its own `packet_hmac`, which was
+        // persisted and never read back — the same omission the envelope check
+        // just fixed. `absent` means "not persisted yet", not "failed to
+        // verify" and not "invalid".
+        body_integrity: trace.body_integrity,
         // Body lifecycle — makes "pending" and "orphaned" visible instead of
         // looking like an empty trace.
         body_status: trace.body_status,

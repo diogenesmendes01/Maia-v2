@@ -39,6 +39,7 @@ function detailRow(over: Record<string, unknown> = {}) {
     hmac_key_version: 1,
     // The repo recomputes this; the router only projects it.
     integrity: 'verified' as const,
+    body_integrity: 'verified' as const,
     redacted_packet: {
       trace_id: TRACE_ID,
       tenant_id: 'tenant-A',
@@ -248,6 +249,36 @@ describe('traces.getTrace', () => {
     const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
     expect(res.envelope_integrity).toBe('invalid');
     expect(res.envelope_signed).toBe(false);
+  });
+
+  it('surfaces the BODY integrity too [round 2 P2]', async () => {
+    // `packet_hmac` was persisted and never read back — same gap the envelope
+    // check closed one round earlier.
+    const { ctx } = makeCtx();
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.body_integrity).toBe('verified');
+  });
+
+  it('a tampered BODY is reported as invalid', async () => {
+    const { ctx } = makeCtx({ detail: detailRow({ body_integrity: 'invalid' }) });
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.body_integrity).toBe('invalid');
+    // The envelope can be intact while the body is not — they are separate
+    // signatures over separate rows.
+    expect(res.envelope_integrity).toBe('verified');
+  });
+
+  it('a pending body is `absent`, not `invalid`', async () => {
+    const { ctx } = makeCtx({
+      detail: detailRow({
+        body_integrity: 'absent',
+        body_status: 'pending',
+        body_available: false,
+        redacted_packet: null,
+      }),
+    });
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.body_integrity).toBe('absent');
   });
 
   it('an unverifiable envelope is `unknown`, not `invalid`', async () => {

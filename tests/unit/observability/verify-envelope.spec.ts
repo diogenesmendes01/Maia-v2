@@ -8,7 +8,10 @@
  * that only looked at the string length would pass every one of them as signed.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { verifyEnvelopeIntegrity } from '@/control-plane/runtime-trace/verify-envelope.js';
+import {
+  verifyEnvelopeIntegrity,
+  verifyBodyIntegrity,
+} from '@/control-plane/runtime-trace/verify-envelope.js';
 import { envelopeSignedPayload } from '@/control-plane/runtime-trace/envelope-writer.js';
 import {
   signHmac,
@@ -133,6 +136,87 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
       let result: string | undefined;
       expect(() => {
         result = verifyEnvelopeIntegrity(row);
+      }).not.toThrow();
+      expect(result).toBe('unknown');
+    });
+  });
+
+  describe('body packet_hmac [round 2 P2]', () => {
+    // `body-writer.ts` signs the EXACT jsonb it stores in `packet`. The column
+    // was persisted and never read back — same class of gap as the envelope.
+    function signedBody(packet: unknown, over: Record<string, unknown> = {}) {
+      const tenant_id = (over.tenant_id as string) ?? 'acme';
+      const hmac_key_version = (over.hmac_key_version as number) ?? 1;
+      return {
+        tenant_id,
+        hmac_key_version,
+        packet,
+        packet_hmac: signHmac(tenant_id, hmac_key_version, packet),
+        ...over,
+      };
+    }
+
+    it('an untouched body verifies', () => {
+      expect(verifyBodyIntegrity(signedBody({ trace_id: TRACE_ID, decision_meta: { a: 1 } }))).toBe(
+        'verified',
+      );
+    });
+
+    it('a tampered packet ⇒ invalid', () => {
+      const row = signedBody({ trace_id: TRACE_ID, decision_meta: { risk_score: 0.9 } });
+      expect(
+        verifyBodyIntegrity({
+          ...row,
+          packet: { trace_id: TRACE_ID, decision_meta: { risk_score: 0.1 } },
+        }),
+      ).toBe('invalid');
+    });
+
+    it('a tampered signature ⇒ invalid', () => {
+      const row = signedBody({ trace_id: TRACE_ID });
+      expect(verifyBodyIntegrity({ ...row, packet_hmac: 'AAAA' })).toBe('invalid');
+    });
+
+    it('key ordering does not matter (canonical JSON)', () => {
+      const row = signedBody({ a: 1, b: 2 });
+      expect(verifyBodyIntegrity({ ...row, packet: { b: 2, a: 1 } })).toBe('verified');
+    });
+
+    it("another tenant's key ⇒ invalid", () => {
+      const mine = signedBody({ trace_id: TRACE_ID }, { tenant_id: 'tenant-a' });
+      const theirs = signedBody({ trace_id: TRACE_ID }, { tenant_id: 'tenant-b' });
+      expect(
+        verifyBodyIntegrity({ ...mine, packet_hmac: theirs.packet_hmac }),
+      ).toBe('invalid');
+    });
+
+    it('an ENCRYPTED body still verifies — the writer signs what it stores', () => {
+      // For redaction_class=debug the stored packet is the cipher envelope
+      // metadata, not the plaintext; it is signed all the same.
+      const cipherRow = signedBody({
+        __encrypted: true,
+        cipher: { iv: 'aaa', tag: 'bbb', key_version: 1 },
+        storage: 'inline',
+      });
+      expect(verifyBodyIntegrity(cipherRow)).toBe('verified');
+    });
+
+    it('a body that does not exist yet ⇒ absent, NOT invalid', () => {
+      // Pending body. Nothing to verify is not a failure to verify.
+      expect(verifyBodyIntegrity(null)).toBe('absent');
+      expect(verifyBodyIntegrity(undefined)).toBe('absent');
+    });
+
+    it('a stored body with no signature ⇒ invalid', () => {
+      const row = signedBody({ trace_id: TRACE_ID });
+      expect(verifyBodyIntegrity({ ...row, packet_hmac: '' })).toBe('invalid');
+    });
+
+    it('an unavailable key version ⇒ unknown, and never throws', () => {
+      const row = signedBody({ trace_id: TRACE_ID });
+      let result: string | undefined;
+      expect(() => {
+        result = verifyBodyIntegrity({ ...row, hmac_key_version: 99 });
       }).not.toThrow();
       expect(result).toBe('unknown');
     });

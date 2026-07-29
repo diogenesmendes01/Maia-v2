@@ -31,7 +31,9 @@ import {
 import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
 import {
   verifyEnvelopeIntegrity,
+  verifyBodyIntegrity,
   type EnvelopeIntegrity,
+  type BodyIntegrity,
 } from '@/control-plane/runtime-trace/verify-envelope.js';
 import type {
   Decision as VerifiableDecision,
@@ -68,6 +70,12 @@ export interface TraceDetail extends TraceListItem {
    * round 1 [P2]). Not a "is the string non-empty" check.
    */
   integrity: EnvelopeIntegrity;
+  /**
+   * Result of recomputing the BODY's `packet_hmac` (issue #514 review round 2).
+   * `absent` when the body has not been persisted yet — distinct from
+   * `unknown` (could not verify) and from `invalid` (does not match).
+   */
+  body_integrity: BodyIntegrity;
   /** Redacted packet as persisted by the body writer; null while pending. */
   redacted_packet: unknown;
   redaction_applied: string | null;
@@ -297,6 +305,19 @@ export const runtimeTraceRepo = {
       redaction_applied: body?.redaction_applied ?? null,
       bytes_redacted: body?.bytes_redacted ?? null,
       encrypted: body?.encrypted ?? false,
+      // Recomputed over the stored `packet` jsonb — the same value the body
+      // writer signed, encrypted bodies included (it signs the cipher envelope
+      // it stores, not the plaintext).
+      body_integrity: verifyBodyIntegrity(
+        body
+          ? {
+              tenant_id: body.tenant_id,
+              hmac_key_version: body.hmac_key_version,
+              packet_hmac: body.packet_hmac,
+              packet: body.packet,
+            }
+          : null,
+      ),
       body_available: body !== null,
     };
   },

@@ -124,6 +124,18 @@ export default function TraceDetailPage({
                 }
               />
               <Meta
+                label="Integridade do corpo"
+                value={
+                  trace.body_integrity === 'verified'
+                    ? 'HMAC verificado'
+                    : trace.body_integrity === 'invalid'
+                      ? 'ADULTERADO — HMAC não confere'
+                      : trace.body_integrity === 'unknown'
+                        ? 'Não verificável (chave ausente)'
+                        : 'Ainda não persistido'
+                }
+              />
+              <Meta
                 label="Corpo"
                 value={
                   trace.body_status === 'persisted'
@@ -142,6 +154,13 @@ export default function TraceDetailPage({
                 }
               />
             </dl>
+            {trace.body_integrity === 'invalid' && (
+              <Alert tone="danger">
+                O corpo persistido NÃO confere com sua assinatura HMAC. O
+                conteúdo abaixo não é confiável — trate como incidente de
+                integridade.
+              </Alert>
+            )}
             {trace.envelope_integrity === 'invalid' && (
               <Alert tone="danger">
                 A assinatura HMAC deste envelope NÃO confere com o conteúdo da
