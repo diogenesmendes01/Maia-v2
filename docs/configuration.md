@@ -49,11 +49,11 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 149 | 17 |
-| `admin-ui` | 22 | 4 |
-| `migrator` | 10 | 2 |
-| `backup` | 27 | 6 |
-| `maintenance` | 46 | 12 |
+| `runtime` | 164 | 18 |
+| `admin-ui` | 23 | 4 |
+| `migrator` | 11 | 2 |
+| `backup` | 42 | 7 |
+| `maintenance` | 61 | 13 |
 
 O manifest completo (por serviço e por profile) é gerado em [`src/config/generated/service-env-manifest.json`](../src/config/generated/service-env-manifest.json).
 
@@ -65,6 +65,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 |---|---|---|---|---|---|---|
 | `NODE_ENV` | `development` \| `test` \| `production` | `development` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Modo da plataforma Node (otimizações do runtime). NÃO é o profile da Maia — use MAIA_ENV. |
 | `MAIA_ENV` | `development` \| `staging` \| `production` | — | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Profile da Maia: development \| staging \| production. Decide quais regras de validação são obrigatórias. Quando ausente, é derivado de NODE_ENV. Obrigatória em: staging, production. |
+| `MAIA_BUILD_COMMIT` | string | — | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Commit desta build, injetado pelo pipeline de deploy. Vira provenance do manifesto de backup (issue #520), respondendo "qual código este artefato representa". Ausente = null no manifesto. |
 | `TZ` | string | `America/Sao_Paulo` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Timezone IANA usada em toda formatação/agendamento. |
 | `APP_PORT` | number | `3000` | não | `runtime` | sim | Porta HTTP do servidor Fastify. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Nível mínimo de log (pino). |
@@ -188,6 +189,20 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `BACKUP_S3_ACCESS_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Access key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET está definida. |
 | `BACKUP_S3_SECRET_KEY` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Secret key do bucket de backup. Obrigatória quando BACKUP_S3_BUCKET está definida. |
 | `BACKUP_S3_PREFIX` | string | `maia` | não | `runtime`, `backup`, `maintenance` | sim | Prefixo dentro do bucket (sem barra inicial nem final). |
+| `BACKUP_ENABLED` | string | `true` | não | `runtime`, `backup`, `maintenance` | sim | Liga o backup. `false` é recusado no profile production — um deploy de produção sem backup não tem caminho de recuperação. |
+| `BACKUP_OFFSITE_REQUIRED` | `true` \| `false` \| `1` \| `0` | — | não | `runtime`, `backup`, `maintenance` | sim | Exige cópia off-site VERIFICADA para uma run contar como sucesso. Ausente = o profile decide (production exige). `false` é recusado em production. |
+| `BACKUP_ENCRYPTION_MODE` | `none` \| `envelope_aes256_gcm` | `none` | não | `runtime`, `backup`, `maintenance` | sim | Cifra do artefato: `none` ou `envelope_aes256_gcm` (client-side, antes de sair do host). `none` é recusado em production — o dump contém dados pessoais de todos os tenants. |
+| `BACKUP_ENCRYPTION_KEYRING` | string | — | sim | `backup`, `maintenance`, `runtime` | sim | Keyring JSON { key_id: base64(32B) } da cifra de backup. A chave vive FORA do artefato; rotação é aditiva (mantenha a chave antiga enquanto houver artefato que a referencie). Obrigatória quando BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm. |
+| `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Id da chave ATIVA dentro de BACKUP_ENCRYPTION_KEYRING. É um identificador, não material de chave — é o único campo de cifra que aparece em manifesto e auditoria. Obrigatória quando BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm. |
+| `BACKUP_DUMP_TIMEOUT_MS` | number | `3600000` | não | `runtime`, `backup`, `maintenance` | sim | Orçamento do pg_dump. Estourado, o processo é morto e a run falha. |
+| `BACKUP_UPLOAD_TIMEOUT_MS` | number | `1800000` | não | `runtime`, `backup`, `maintenance` | sim | Orçamento do upload off-site. |
+| `BACKUP_RESTORE_TIMEOUT_MS` | number | `3600000` | não | `runtime`, `backup`, `maintenance` | sim | Orçamento do restore drill. |
+| `BACKUP_MIN_ARTIFACT_BYTES` | number | `4096` | não | `runtime`, `backup`, `maintenance` | sim | Piso de tamanho do artefato. Abaixo disso é dump truncado, não backup — tamanho sozinho nunca é evidência, mas um piso pega o caso grosseiro. |
+| `BACKUP_RPO_TARGET_HOURS` | number | `24` | não | `runtime`, `backup`, `maintenance` | sim | Objetivo de ponto de recuperação. Abaixo de 24h é recusado: dump lógico noturno não cumpre, e a plataforma não anuncia objetivo que a arquitetura não honra (exigiria PITR/WAL). |
+| `BACKUP_RTO_TARGET_MINUTES` | number | `120` | não | `runtime`, `backup`, `maintenance` | sim | Objetivo de tempo de recuperação, comparado à duração medida do último drill. |
+| `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` | number | `168` | não | `runtime`, `backup`, `maintenance` | sim | Intervalo máximo entre drills de restore aprovados. Vencido, a readiness degrada — até um drill passar, nenhum artefato é sabidamente restaurável. |
+| `RETENTION_DRY_RUN` | string | `true` | não | `runtime`, `backup`, `maintenance` | sim | Executor de retenção só CONTA, não apaga. Default `true` de propósito: exclusão é irreversível, então desligar isso é uma decisão explícita por ambiente. Só `false`/`0` desligam. |
+| `RETENTION_POLICY` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md. |
 
 ### Custo
 
