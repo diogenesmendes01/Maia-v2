@@ -15,6 +15,7 @@ import { isRedisConnected } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
 import { isDbConnected, probeDb } from '@/db/client.js';
 import { startRedisMemoryCollector } from '@/observability/redis-memory-collector.js';
+import { registerTurnStateGauges } from '@/observability/turn-state-collector.js';
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
@@ -26,6 +27,12 @@ export async function buildServer() {
   setGaugeProvider('maia_redis_connected', () => (isRedisConnected() ? 1 : 0));
   setGaugeProvider('maia_baileys_connected', () => (isBaileysConnected() ? 1 : 0));
   setGaugeProvider('maia_db_connected', () => (isDbConnected() ? 1 : 0));
+
+  // #503 — `maia_turns_current{status}` e `maia_turn_state_age_seconds{status}`:
+  // turno preso e envelhecimento por estado, os riscos centrais da máquina de
+  // estados. Snapshot compartilhado com TTL — um scrape faz uma query, não uma
+  // por série.
+  registerTurnStateGauges();
 
   // Sonda sintética (spec §1.6) — sinal PRIMÁRIO de outage, DURÁVEL (lido de
   // synthetic_probe_state.last_ok_at, não in-memory): segundos desde o último

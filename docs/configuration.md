@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 146 | 17 |
+| `runtime` | 148 | 17 |
 | `admin-ui` | 22 | 4 |
 | `migrator` | 10 | 2 |
 | `backup` | 27 | 6 |
@@ -214,6 +214,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `FEATURE_OUTBOUND_DEDUP` | string | `false` | não | `runtime` | sim | Ledger de idempotência de saída (#227) em outbound_messages. |
 | `FEATURE_MESSAGE_DEBOUNCE` | string | `false` | não | `runtime` | sim | Agrupa textos picotados do mesmo remetente numa única rodada. Mídia sempre passa direto. |
 | `FEATURE_PROCEDURE_RUNTIME` | string | `true` | não | `runtime` | sim | Kill switch do runtime de procedimentos (selector + engine + avaliador). Default ON; a rodada ReAct base não depende dele. |
+| `FEATURE_TURN_STATE_MACHINE` | string | `true` | não | `runtime` | sim | Máquina de estados durável do turno inbound (issue #503): dual-write de agent_turns. EXIGE as migrations 096 e 097 APLICADAS — subir o processo com esta flag ligada antes de `npm run db:migrate` derruba todo o ingresso. Default ON, e só ESCRITA: enquanto FEATURE_TURN_STATE_AUTHORITATIVE estiver false, `mensagens.processada_em` continua sendo a decisão de negócio e o comportamento observável não muda. Kill switch: false volta ao runtime anterior sem perder os turnos já gravados. Ver docs/runbooks/turn-state-machine.md. |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | string | `false` | não | `runtime` | sim | Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno `retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído (`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. Ver docs/runbooks/turn-state-machine.md §2. |
 | `FEATURE_TURN_CONTEXT_CACHE` | string | `false` | não | `runtime` | sim | Cache do contexto estático do turno (#511) — hoje só a seção `identity` (perfil operacional v2 renderizado). Default OFF: é a única parte da #511 que pode servir conteúdo velho, então sobe no escuro e é ligada por ambiente depois de observar a invalidação cross-replica. Desligar degrada para leitura direta pelo MESMO caminho, nunca para a waterfall legada — o kill switch custa latência, não correção. |
 
 ### Sonda sintética

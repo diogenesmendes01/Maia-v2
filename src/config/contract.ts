@@ -1164,6 +1164,42 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_STATE_MACHINE: {
+    name: 'FEATURE_TURN_STATE_MACHINE',
+    description:
+      'Máquina de estados durável do turno inbound (issue #503): dual-write de agent_turns. ' +
+      'EXIGE as migrations 096 e 097 APLICADAS — subir o processo com esta flag ligada antes de ' +
+      '`npm run db:migrate` derruba todo o ingresso. Default ON, e só ESCRITA: enquanto ' +
+      'FEATURE_TURN_STATE_AUTHORITATIVE estiver false, `mensagens.processada_em` continua sendo a ' +
+      'decisão de negócio e o comportamento observável não muda. Kill switch: false volta ao ' +
+      'runtime anterior sem perder os turnos já gravados. Ver docs/runbooks/turn-state-machine.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_TURN_STATE_AUTHORITATIVE: {
+    name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
+    description:
+      'Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos ' +
+      'por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno ' +
+      '`retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, ' +
+      'muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído ' +
+      '(`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. ' +
+      'Ver docs/runbooks/turn-state-machine.md §2.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
 
   // ---- probe ------------------------------------------------------------
   MAIA_SYNTHETIC_PROBE: {

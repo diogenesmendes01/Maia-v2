@@ -199,3 +199,5 @@ NEW shared prefixes — pick `max(existing)+1`.
 093 | 093_proposal_approvals_scope.sql | escopo tenant/agent/source em proposal_approvals + partial uniques (spec perfil-inbox v4)
 094 | 094_synthetic_probe.sql | sonda sintetica: teste real de interacao do agente automatizado — is_synthetic + synthetic_probe_runs/state + seed do recurso de sonda (spec 2026-07-17)
 095 | 095_approval_requests.sql | fase 0 cap.2: evidencia backend imutavel de aprovacao humana (approval_requests + approval_decisions, hash canonico, consumo one-time)
+096 | 096_mensagens_turn_scope_indexes.sql | fase 1: indices CONCURRENTLY em mensagens que sustentam a maquina de estados do turno — unique (tenant, agent, id) alvo da FK composta + parcial de inbound para backfill/divergencia (issue 503)
+097 | 097_agent_turns.sql | fase 1: maquina de estados duravel do turno inbound — agent_turns + agent_turn_inputs, CAS por state_version, outcome fechado por estado terminal, FKs compostas por tenant/agent (issue 503)

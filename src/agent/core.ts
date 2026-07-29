@@ -43,11 +43,24 @@ import type { TypingHandle } from '@/gateway/presence.js';
 // procedure-selector node output below).
 import { type SelectorDecision } from '@/cognition/procedure-selector.js';
 import * as procedureEngine from '@/procedures/engine.js';
-import { sendOutbound, safeDispatchOutput } from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput, OutboundDeliveryError } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
-import { runReActLoop } from './react-loop.js';
+import { runReActLoop, type ReActDelivery } from './react-loop.js';
+import { decideTurnAction } from './turn-outcome.js';
+// Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
+// OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
+import {
+  ensureTurnHandle,
+  beginTurnExecution,
+  absorbDebounceInputs,
+  concludeTurn,
+  failTurnRetryable,
+  deadLetterTurn,
+  isTerminalTurnStatus,
+  turnStateAuthoritative,
+} from '@/runtime/turns/index.js';
 import {
   runWithTenantContext,
   getCurrentTenant,
@@ -469,28 +482,87 @@ async function runAgentForMensagemInner(
     logger.warn({ mensagem_id }, 'agent.message_not_found');
     return;
   }
-  if (inbound.processada_em) {
+  // Issue #503 — handle do turno DURÁVEL, resolvido ANTES do early-return
+  // porque em modo autoritativo é o ESTADO que decide se há trabalho.
+  // `ensureTurnHandle` reencontra o turno criado atomicamente no ingresso ou,
+  // para rows anteriores a esta issue (e durante deploy rolling), cria um em
+  // `received`. `null` quando a flag está OFF.
+  const turn = await ensureTurnHandle(inbound);
+
+  // EARLY-RETURN POR ESTADO (achado P1 rodada 1). Decidir por `processada_em`
+  // aqui matava o retry inteiro: um turno que virou `retryable` tinha o campo
+  // legado carimbado logo abaixo, o recovery reenfileirava a mensagem e a
+  // reentrada morria neste `if` antes de olhar o turno — os cenários A e B da
+  // #503 continuavam sendo perda definitiva, que é exatamente o que a máquina
+  // de estados existe para impedir.
+  //
+  // Autoritativo: só estado TERMINAL encerra. `outbound_pending` também para,
+  // por motivo oposto — a resposta já está comprometida e quem finaliza é o
+  // delivery worker (#506); reexecutar o ReAct duplicaria a resposta.
+  // Sem turno (falha de escrita em shadow) cai no critério legado — fail-closed
+  // contra reprocessamento.
+  if (turnStateAuthoritative() && turn) {
+    if (isTerminalTurnStatus(turn.status)) {
+      logger.debug({ mensagem_id, turn_id: turn.turn_id, status: turn.status }, 'agent.turn_terminal');
+      return;
+    }
+    if (turn.status === 'outbound_pending') {
+      logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_outbound_pending_skip');
+      return;
+    }
+  } else if (inbound.processada_em) {
     logger.debug({ mensagem_id }, 'agent.already_processed');
     return;
   }
+
+  // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
+  // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
+  // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
+  await beginTurnExecution(turn, { channel_id });
+
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
-    if (!tel) return;
+    if (!tel) {
+      // #503 — sem telefone não há identidade a resolver: o inbound é
+      // inaproveitável. Antes esta saída era um `return` mudo e o turno ficava
+      // `running` para sempre (sem lease até #504, o recovery nunca o
+      // reencontraria). Descarte EXPLÍCITO, com outcome.
+      logger.warn({ mensagem_id }, 'agent.inbound_without_telefone');
+      await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
+      await mensagensRepo.markProcessed(inbound.id, 0).catch((err) =>
+        logger.warn(
+          { err: (err as Error).message, mensagem_id },
+          'agent.mark_processed_failed',
+        ),
+      );
+      return;
+    }
     // Fase 0 (spec roteamento v4 §1.6): a identidade da conversa inclui o
     // canal — o resolver casa/cria a conversa DO canal que recebeu o inbound.
     const resolved = await resolveIdentity({ telefone_whatsapp: tel, channel_id });
     if (resolved.kind === 'unknown') {
       // Mark processed so the recovery worker doesn't requeue forever.
+      // #503: descarte INTENCIONAL por regra explícita → `ignored`, com outcome
+      // próprio (antes era indistinguível de "processado com sucesso").
+      await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'blocked') {
       logger.info({ pessoa_id: resolved.pessoa.id, reason: resolved.reason }, 'agent.blocked_drop');
+      await concludeTurn(turn, 'identity_blocked', {
+        pessoa_id: resolved.pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'quarantined') {
       await handleQuarantineFirstContact({ pessoa: resolved.pessoa, inbound });
+      await concludeTurn(turn, 'quarantined', {
+        pessoa_id: resolved.pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await mensagensRepo.markProcessed(inbound.id, 0);
       return;
     }
@@ -506,6 +578,10 @@ async function runAgentForMensagemInner(
       });
       if (consumed) {
         await mensagensRepo.setConversaId(inbound.id, resolved.conversa.id);
+        await concludeTurn(turn, 'pending_action_resolved', {
+          pessoa_id: resolved.pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await mensagensRepo.markProcessed(inbound.id, 0);
         return;
       }
@@ -517,6 +593,11 @@ async function runAgentForMensagemInner(
   const conv = await loadConversaWithPessoa(inbound.conversa_id!);
   if (!conv) {
     logger.warn({ mensagem_id }, 'agent.conversa_missing');
+    // #503 — a conversa acabou de ser resolvida/criada; não a encontrar aqui é
+    // inconsistência TRANSITÓRIA (replica lag, conversa encerrada em corrida),
+    // não uma decisão de negócio. Nenhuma tool rodou, então retry é seguro.
+    // Antes era `return` mudo e o turno ficava `running` órfão.
+    await failTurnRetryable(turn, { code: 'conversa_missing', mensagem_id: inbound.id });
     return;
   }
   const { conversa: c, pessoa } = conv;
@@ -564,6 +645,10 @@ async function runAgentForMensagemInner(
     );
   }
   const allInboundIds = [...aggregated.merged_ids, inbound.id];
+  // #503 — a rajada do debounce produz UM turno executável: as irmãs viram
+  // inputs deste turno (ou têm seu próprio turno marcado `superseded`). A
+  // associação definitiva no ingresso é fechada em #505.
+  await absorbDebounceInputs(turn, aggregated.merged_ids);
   const markAllProcessed = async (tokens: number | null): Promise<void> => {
     // Per-row update keeps the existing repo contract (single-id) and
     // mirrors the audit semantics: each row gets its own processada_em.
@@ -608,6 +693,10 @@ async function runAgentForMensagemInner(
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
     }
+    await concludeTurn(turn, 'rate_limited_silent', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
     await markAllProcessed(0);
     await conversasRepo.touch(c.id);
     await clearDebounceState(pessoa.telefone_whatsapp);
@@ -631,6 +720,10 @@ async function runAgentForMensagemInner(
       }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.approval_reply_send_failed'),
       );
+      await concludeTurn(turn, 'pending_action_resolved', {
+        pessoa_id: pessoa.id,
+        mensagem_id: inbound.id,
+      });
       await markAllProcessed(0);
       await conversasRepo.touch(c.id);
       await clearDebounceState(pessoa.telefone_whatsapp);
@@ -643,6 +736,10 @@ async function runAgentForMensagemInner(
   // action and audited it; we just close the loop and skip the ReAct turn.
   const gate = await checkPendingFirst({ pessoa, conversa: c, inbound });
   if (gate.kind === 'resolved') {
+    await concludeTurn(turn, 'pending_action_resolved', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
     await markAllProcessed(0);
     await conversasRepo.touch(c.id);
     await clearDebounceState(pessoa.telefone_whatsapp);
@@ -947,6 +1044,10 @@ async function runAgentForMensagemInner(
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
+        await concludeTurn(turn, 'blocked_by_policy', {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await markAllProcessed(0);
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
@@ -967,6 +1068,10 @@ async function runAgentForMensagemInner(
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
+        await concludeTurn(turn, 'blocked_by_policy', {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
         await markAllProcessed(0);
         await conversasRepo.touch(c.id);
         await clearDebounceState(pessoa.telefone_whatsapp);
@@ -1076,6 +1181,12 @@ async function runAgentForMensagemInner(
           },
         );
         if (outcome.handled) {
+          // A skill entregou a resposta pelo dispatchOutput — turno concluído
+          // COM resposta.
+          await concludeTurn(turn, 'reply_delivered', {
+            pessoa_id: pessoa.id,
+            mensagem_id: inbound.id,
+          });
           await markAllProcessed(0);
           await conversasRepo.touch(c.id);
           await clearDebounceState(pessoa.telefone_whatsapp);
@@ -1099,12 +1210,52 @@ async function runAgentForMensagemInner(
       // fail-closed: the always-on engine errored → block the turn, reply to
       // user, skip LLM (there is no legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
-      await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
-        channel_id: c.channel_id,
-      }).catch((e) =>
-        logger.warn({ err: (e as Error).message }, 'agent.decision_engine.fail_closed_reply_failed'),
-      );
-      await markAllProcessed(0);
+      // #503 — o resultado do envio DECIDE o outcome. Antes o `.catch` engolia
+      // a falha e o turno era concluído como `fallback_delivered` mesmo quando
+      // nada chegou ao usuário, violando o critério da issue de que falha
+      // pre-send não resulta em `completed`.
+      //
+      // `sendOutbound` lança `OutboundDeliveryError` com o flag `delivered`,
+      // que distingue as duas situações que não podem ser confundidas:
+      //   delivered=false → PRE-SEND (canal desconectado, pessoa/JID não
+      //     resolvidos): nada chegou, retry é seguro;
+      //   delivered=true  → enviado mas ambíguo (transporte lançou depois do
+      //     envio, ou persistência falhou): NUNCA reenviar.
+      let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
+      try {
+        await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
+          channel_id: c.channel_id,
+        });
+      } catch (e) {
+        fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';
+        logger.warn(
+          { err: (e as Error).message, fallback },
+          'agent.decision_engine.fail_closed_reply_failed',
+        );
+      }
+
+      if (fallback === 'not_sent') {
+        // Nada foi entregue e o ReAct nem chegou a rodar — nenhuma tool, logo
+        // nenhum efeito irreversível. Retry é seguro e é o único desfecho
+        // honesto.
+        await failTurnRetryable(turn, {
+          code: 'decision_engine_fallback_not_sent',
+          mensagem_id: inbound.id,
+        });
+      } else {
+        await concludeTurn(
+          turn,
+          fallback === 'ambiguous' ? 'reply_delivery_unknown' : 'fallback_delivered',
+          { pessoa_id: pessoa.id, mensagem_id: inbound.id },
+        );
+      }
+
+      // Mesma regra de projeção da conclusão do ReAct: turno não-terminal em
+      // modo autoritativo NÃO carimba `processada_em`, senão o recovery
+      // reenfileira e a reentrada morre no early-return legado.
+      if (!turnStateAuthoritative() || fallback !== 'not_sent') {
+        await markAllProcessed(0);
+      }
       await conversasRepo.touch(c.id);
       await clearDebounceState(pessoa.telefone_whatsapp);
       return;
@@ -1145,6 +1296,7 @@ async function runAgentForMensagemInner(
   let totalTokens: number;
   let reactOutboundText: string;
   let reactToolsCalled: Array<{ name: string; result: unknown }>;
+  let reactDelivery: ReActDelivery;
   try {
     const result = await runReActLoop({
       pessoa,
@@ -1162,11 +1314,76 @@ async function runAgentForMensagemInner(
     totalTokens = result.totalTokens;
     reactOutboundText = result.outboundText;
     reactToolsCalled = result.toolsCalled;
+    reactDelivery = result.delivery;
   } finally {
     stopTyping();
   }
 
-  await markAllProcessed(totalTokens);
+  // Issue #503 — o outcome do turno vem do RESULTADO DURÁVEL do ReAct, nunca do
+  // simples retorno da função. Dois casos deixam de ser `completed`:
+  //   * `reasoner_failed`  (cenário A) — o LLM expirou/errou, nada foi produzido;
+  //   * `outbound_failure` (cenário B) — resposta pronta, envio falhou pre-send.
+  // Ambos viram `retryable` com backoff (ou dead letter no esgotamento), então o
+  // recovery por estado (FEATURE_TURN_STATE_AUTHORITATIVE) refaz o turno em vez
+  // de perdê-lo.
+  //
+  // `iteration_cap` NÃO é retryable: tools já rodaram, reexecutar duplicaria
+  // efeito colateral — conclui sem resposta e o operador vê pela auditoria
+  // `turn_completed_without_reply`.
+  //
+  // A MESMA proteção vale para `reasoner_failed`/`outbound_failure` (achado P1
+  // rodada 1): o risco não é do motivo da saída, é de JÁ TER RODADO uma tool com
+  // efeito externo. Iteração 1 cria um boleto, iteração 2 expira o reasoner —
+  // reenfileirar reexecutaria o ReAct do zero e poderia criar o boleto de novo.
+  // `reactDelivery.sideEffectsCommitted` é o gate: sem efeito irreversível, o
+  // retry é seguro; com efeito, o turno para em dead letter com
+  // `unsafe_to_retry` e exige decisão humana (replay manual auditado).
+  // A regra vive em `decideTurnAction` (src/agent/turn-outcome.ts): pura,
+  // exaustivamente testada, e fora deste orquestrador onde nenhum teste
+  // alcançava.
+  const action = decideTurnAction(reactDelivery);
+  if (action.kind === 'complete') {
+    await concludeTurn(turn, action.outcome, {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+  } else if (action.kind === 'retry') {
+    await failTurnRetryable(turn, { code: action.code, mensagem_id: inbound.id });
+  } else {
+    logger.error(
+      {
+        mensagem_id: inbound.id,
+        turn_id: turn?.turn_id,
+        error_code: action.code,
+        ops_alert: true,
+      },
+      'agent.turn_unsafe_to_retry',
+    );
+    await deadLetterTurn(turn, { code: action.code, outcome: action.outcome });
+  }
+
+  // PROJEÇÃO LEGADA (#503 §6), agora condicionada ao ESTADO.
+  //
+  // SHADOW: `markAllProcessed` roda sempre — `processada_em` é a decisão de
+  // negócio e o comportamento observável é IDÊNTICO ao anterior; a divergência
+  // (turno `retryable` com o campo carimbado) é justamente o que
+  // `maia_turn_legacy_projection_mismatch_total` mede.
+  //
+  // AUTORITATIVO: carimbar `processada_em` num turno NÃO-terminal era o que
+  // matava o retry — o recovery reenfileirava e a reentrada morria no
+  // early-return legado (achado P1 rodada 1). Aqui só projetamos quando o turno
+  // chegou a terminal; nesse caso o repositório JÁ escreveu a projeção dentro
+  // da transação do CAS, e `markAllProcessed` apenas grava `tokens_usados` e
+  // cobre as irmãs do debounce.
+  const turnIsTerminal = turn ? isTerminalTurnStatus(turn.status) : false;
+  if (!turnStateAuthoritative() || turnIsTerminal) {
+    await markAllProcessed(totalTokens);
+  } else {
+    logger.info(
+      { turn_id: turn?.turn_id, to_status: turn?.status, mensagem_id: inbound.id },
+      'agent.legacy_projection_skipped_non_terminal',
+    );
+  }
   await conversasRepo.touch(c.id);
   // Issue #73 — persist the scope hash for the *next* turn's sentinel check.
   // Merge (jsonb ||) instead of overwrite so concurrent writers don't clobber

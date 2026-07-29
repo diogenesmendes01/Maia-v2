@@ -81,6 +81,19 @@ export const AUDIT_ACTIONS = [
   'dlq_job_added',
   'dlq_job_resolved',
   'dlq_alert_emitted',
+  // Issue #503 — máquina de estados durável do turno inbound. Auditamos apenas
+  // o que a issue exige (§ "Auditoria obrigatória"): descarte por política,
+  // dead letter, replay manual, conclusão SEM resposta e detecção de
+  // inconsistência entre a máquina de estados e a projeção legada
+  // `processada_em`. Transições rotineiras (received→queued→claimed→running)
+  // ficam em métrica/log estruturado — auditá-las inflaria `audit_logs` sem
+  // acrescentar decisão governável. NENHUM desses registros carrega texto,
+  // prompt, telefone ou JID.
+  'turn_ignored_by_policy',
+  'turn_dead_lettered',
+  'turn_replayed',
+  'turn_completed_without_reply',
+  'turn_state_inconsistency_detected',
   'pending_resolved',
   'pending_cancelled',
   'pending_expired',

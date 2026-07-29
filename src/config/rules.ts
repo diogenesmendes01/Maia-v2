@@ -447,6 +447,25 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #503 — a leitura autoritativa da máquina de estados do turno depende
+  // do dual-write. Com MACHINE=false não existe turno para o recovery eleger, e
+  // `turnStateAuthoritative()` (src/runtime/turns/lifecycle.ts) devolve false —
+  // ou seja, a combinação é INERTE. Silêncio aqui é pior que erro: o operador
+  // acredita ter feito o flip do passo 8 do rollout e o recovery continua
+  // decidindo pelo campo legado. Fail-closed no contrato.
+  if (bool(c.FEATURE_TURN_STATE_AUTHORITATIVE) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_STATE_AUTHORITATIVE',
+      rule: 'turn-state/authoritative-requires-dual-write',
+      message:
+        'FEATURE_TURN_STATE_AUTHORITATIVE=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem dual-write não há agent_turns para o recovery eleger, e a decisão continua saindo de mensagens.processada_em.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (e conclua o backfill com `npm run backfill:turns`) antes do flip da leitura, ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. Ver docs/runbooks/turn-state-machine.md §2.',
+    });
+  }
+
   // Janelas/limites que precisam estar em ordem.
   const orderPairs: readonly [string, string, string][] = [
     ['MESSAGE_DEBOUNCE_MS', 'MESSAGE_DEBOUNCE_MAX_MS', 'debounce'],
