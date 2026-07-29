@@ -18,9 +18,22 @@
  *      compara. Se o novo total estourar, a reserva é devolvida e a chamada é
  *      recusada. Duas chamadas concorrentes nunca leem o mesmo valor: o
  *      `INCRBYFLOAT` do Redis serializa.
- *   2. `settleReservation()` ajusta a diferença entre a estimativa e o custo
- *      REAL depois da resposta (delta pode ser negativo). Se a chamada falhou,
- *      a reserva inteira é devolvida.
+ *   2. `settleReservation()` ajusta o contador para o gasto ACUMULADO, e é
+ *      chamada uma vez por TENTATIVA ENVIADA — não só pela resposta final.
+ *
+ * ## Por que por tentativa, e não só pela resposta final
+ *
+ * A versão anterior liquidava com o custo da resposta bem sucedida e devolvia
+ * a reserva inteira quando a chamada falhava. Mas uma tentativa que CHEGOU ao
+ * provider já consumiu tokens de entrada: o prompt foi transmitido e cobrado,
+ * mesmo que a resposta tenha morrido no meio. Tratá-la como custo zero fazia o
+ * gasto real divergir do contabilizado exatamente no retry storm — o cenário
+ * que a quota existe para conter, onde há muitas tentativas e poucas respostas.
+ *
+ * Agora: toda tentativa que entrou em `provider.call()` soma custo (entrada
+ * sempre; saída quando há evidência dela no `usage` da resposta ou do erro), e
+ * retries e fallback ACUMULAM. Devolução integral só quando nenhuma requisição
+ * saiu — recusa por quota, ausência de scope, ou abort antes do primeiro envio.
  *
  * A verdade contábil continua no ledger em Postgres; o contador do Redis é o
  * mecanismo de admissão. Na primeira escrita do dia ele é semeado a partir do
@@ -57,7 +70,15 @@ const CHARS_PER_TOKEN = 4;
 
 export type LLMScope = { tenant_id: string; agent_id: string };
 
-/** Handle opaco devolvido pela reserva e exigido pela liquidação. */
+/**
+ * Handle opaco devolvido pela reserva e exigido pela liquidação.
+ *
+ * `reserved_usd` é MUTÁVEL de propósito: `settleReservation` pode ser chamada
+ * várias vezes durante a mesma chamada de LLM (uma vez por tentativa enviada),
+ * sempre com o total corrido, e atualiza este campo para que a próxima
+ * liquidação aplique só o delta. Sem isso, liquidar por tentativa somaria o
+ * mesmo gasto repetidas vezes.
+ */
 export type BudgetReservation = {
   key: string;
   reserved_usd: number;
@@ -65,7 +86,10 @@ export type BudgetReservation = {
   active: boolean;
 };
 
-const NO_RESERVATION: BudgetReservation = { key: '', reserved_usd: 0, active: false };
+/** Fábrica, não constante compartilhada: o handle é mutado na liquidação. */
+function noReservation(): BudgetReservation {
+  return { key: '', reserved_usd: 0, active: false };
+}
 
 function dailyBudgetUsd(): number {
   return config.LLM_DAILY_BUDGET_USD;
@@ -97,7 +121,7 @@ function budgetKey(scope: LLMScope, day = todayKey()): string {
 }
 
 /** Tokens estimados do payload de entrada (system + mensagens). */
-function estimateInputTokens(system: string, messages: LLMMessage[]): number {
+export function estimateInputTokens(system: string, messages: LLMMessage[]): number {
   let chars = system.length;
   for (const m of messages) {
     if (typeof m.content === 'string') {
@@ -137,7 +161,7 @@ export async function reserveBudget(args: {
 }): Promise<BudgetReservation> {
   const budget = dailyBudgetUsd();
   // Quota desligada: nada a estimar, nada a reservar, nenhum I/O.
-  if (budget <= 0) return NO_RESERVATION;
+  if (budget <= 0) return noReservation();
 
   const key = budgetKey(args.scope);
 
@@ -173,7 +197,7 @@ export async function reserveBudget(args: {
       { err: (err as Error).message, workload: args.workload },
       'llm_gateway.budget_reserve_failed',
     );
-    return NO_RESERVATION;
+    return noReservation();
   }
 
   if (total <= budget) return { key, reserved_usd: delta, active: true };
@@ -207,8 +231,16 @@ export async function reserveBudget(args: {
 }
 
 /**
- * Ajusta a reserva para o custo REAL. `actual_usd = 0` devolve a reserva
- * inteira (chamada que não chegou a gastar).
+ * Ajusta o contador para o gasto ACUMULADO da chamada até agora.
+ *
+ * Idempotente e CUMULATIVA: pode ser invocada uma vez por tentativa enviada,
+ * sempre com o total corrido, porque aplica só o delta contra o que já estava
+ * reservado e então move `reserved_usd` para o novo total. Chamar duas vezes
+ * com o mesmo valor é no-op.
+ *
+ * `actual_total_usd = 0` devolve a reserva inteira — reservado para o caso em
+ * que NENHUMA requisição chegou ao provider (recusa por quota, ausência de
+ * scope, abort antes do primeiro envio).
  *
  * Nunca lança: uma falha aqui não pode derrubar um turno que já teve sucesso.
  * A consequência de perder um ajuste é um contador levemente conservador até
@@ -216,11 +248,15 @@ export async function reserveBudget(args: {
  */
 export async function settleReservation(
   reservation: BudgetReservation,
-  actual_usd: number,
+  actual_total_usd: number,
 ): Promise<void> {
   if (!reservation.active) return;
-  const delta = Math.max(0, actual_usd) - reservation.reserved_usd;
+  const total = Math.max(0, actual_total_usd);
+  const delta = total - reservation.reserved_usd;
   if (Math.abs(delta) < 1e-9) return;
+  // Move o handle ANTES do I/O: se o `incrbyfloat` falhar, a próxima
+  // liquidação não repete este mesmo delta em cima do anterior.
+  reservation.reserved_usd = total;
   try {
     await redis.incrbyfloat(reservation.key, delta);
   } catch (err) {

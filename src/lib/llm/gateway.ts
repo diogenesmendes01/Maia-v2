@@ -23,14 +23,14 @@
  */
 import { config } from '@/config/env.js';
 import { estimateLLMCostUsd } from '@/lib/cost-ledger.js';
-import { reserveBudget, settleReservation } from './budget.js';
+import { estimateInputTokens, reserveBudget, settleReservation } from './budget.js';
 import type { BudgetReservation } from './budget.js';
 import { LLMGatewayError, classifyProviderError, isAbortError } from './errors.js';
 import { resolveModelPair } from './model-resolver.js';
 import { getProvider } from './providers/index.js';
 import { currentScope, emitUsage, recordAttempt, statusForKind } from './telemetry.js';
 import { workloadPolicy } from './workloads.js';
-import type { LLMGatewayRequest, LLMResponse, ResolvedModel } from './types.js';
+import type { LLMGatewayRequest, LLMResponse, LLMUsage, ResolvedModel } from './types.js';
 
 /** Base do backoff exponencial, herdada do comportamento pré-#508. */
 const BACKOFF_BASE_MS = 2000;
@@ -110,6 +110,24 @@ function abortedError(): LLMGatewayError {
   // `signal.reason` NÃO entra: é valor arbitrário do caller e já foi vetor de
   // vazamento em outros sistemas. O kind já diz tudo que o operador precisa.
   return new LLMGatewayError({ kind: 'aborted', detail: 'llm_call_aborted' });
+}
+
+/**
+ * Evidência de consumo anexada a um erro de provider.
+ *
+ * Uma resposta que morre no meio (abort do caller, deadline, queda de conexão)
+ * às vezes chega com `usage` parcial no erro do SDK. Quando chega, é a melhor
+ * medida do que foi realmente gerado; quando não chega, o caller cobra só a
+ * entrada — que o provider certamente contabilizou ao receber o prompt.
+ */
+function usageFromError(err: unknown): Partial<LLMUsage> | undefined {
+  const usage = (err as { usage?: unknown })?.usage;
+  if (!usage || typeof usage !== 'object') return undefined;
+  const { input_tokens, output_tokens } = usage as Partial<LLMUsage>;
+  const out: Partial<LLMUsage> = {};
+  if (typeof input_tokens === 'number' && input_tokens >= 0) out.input_tokens = input_tokens;
+  if (typeof output_tokens === 'number' && output_tokens >= 0) out.output_tokens = output_tokens;
+  return out.input_tokens === undefined && out.output_tokens === undefined ? undefined : out;
 }
 
 /** Backoff exponencial com jitter para baixo (50%–100% da janela nominal). */
@@ -264,11 +282,37 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
   }
 
   /**
-   * Custo REAL da chamada bem sucedida, ou `null` se nenhuma chamada gastou.
-   * Liquidado contra a reserva no `finally` — devolvendo a diferença (que
-   * costuma ser negativa, já que a reserva assume `max_tokens` de saída).
+   * Gasto ACUMULADO da chamada — soma de TODA tentativa que chegou ao
+   * provider, não só da resposta final.
+   *
+   * Uma tentativa que falhou no meio já transmitiu o prompt: os tokens de
+   * entrada foram consumidos e cobrados. Contabilizá-la como custo zero fazia
+   * o gasto real divergir do contabilizado precisamente no retry storm — muitas
+   * tentativas, poucas respostas — que é o cenário que a quota existe para
+   * conter.
    */
-  let actualCostUsd: number | null = null;
+  let spentUsd = 0;
+
+  /** Tokens de entrada estimados uma vez: o payload não muda entre tentativas. */
+  const estimatedInputTokens = estimateInputTokens(req.system, req.messages);
+
+  /**
+   * Cobra UMA tentativa enviada e liquida o acumulado.
+   *
+   * `usage` vem da resposta quando houve uma; num erro, alguns SDKs anexam
+   * `usage` parcial (resposta que morreu no meio) — usamos quando existe. Sem
+   * evidência de saída, cobra-se só a entrada, que é o que o provider
+   * certamente contabilizou ao receber o prompt.
+   */
+  const chargeAttempt = async (model: string, usage?: Partial<LLMUsage>): Promise<void> => {
+    const cost = await estimateLLMCostUsd({
+      model,
+      tokens_input: usage?.input_tokens ?? estimatedInputTokens,
+      tokens_output: usage?.output_tokens ?? 0,
+    }).catch(() => 0);
+    spentUsd += cost;
+    await settleReservation(reservation, spentUsd);
+  };
 
   const link = linkSignal(ctx.signal, deadlineAt);
   const maxAttempts = Math.max(1, policy.max_attempts ?? config.CLAUDE_MAX_RETRIES);
@@ -292,16 +336,8 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     res: LLMResponse,
     fallbackFrom?: string,
   ): Promise<LLMResponse> => {
-    // Custo REAL da resposta, pela mesma tabela de preços do ledger. Só é
-    // calculado quando há reserva ativa — com a quota desligada, nada a
-    // liquidar (e nada a importar).
-    if (reservation.active) {
-      actualCostUsd = await estimateLLMCostUsd({
-        model: resolved.model,
-        tokens_input: res.usage.input_tokens,
-        tokens_output: res.usage.output_tokens,
-      }).catch(() => null);
-    }
+    // Tentativa bem sucedida: cobra com o `usage` REAL da resposta.
+    if (reservation.active) await chargeAttempt(resolved.model, res.usage);
     await emitUsage(
       {
         workload: req.workload,
@@ -319,9 +355,6 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       },
       scope,
     );
-    // O gasto que acabou de acontecer torna o número cacheado do orçamento
-    // obsoleto; soltar aqui é o que impede a quota de ficar sempre um passo
-    // atrás durante uma rajada.
     return res;
   };
 
@@ -400,6 +433,11 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
           },
           scope,
         );
+        // A tentativa CHEGOU ao provider (`provider.call()` foi executada), então
+        // o prompt foi transmitido e a entrada foi cobrada — inclusive quando o
+        // desfecho é abort ou timeout no meio do voo. Cobrar aqui é o que
+        // impede o gasto real de divergir do contabilizado num retry storm.
+        if (reservation.active) await chargeAttempt(primary.model, usageFromError(rawErr));
 
         // Cancelamento NUNCA é retentável e nunca é reportado como erro de
         // provider. Repassamos o erro original quando ele veio do SDK para
@@ -492,6 +530,9 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
         },
         scope,
       );
+      // O fallback também foi ENVIADO: soma sobre o que as tentativas do
+      // primário já custaram, não substitui.
+      if (reservation.active) await chargeAttempt(fast.model, usageFromError(rawErr));
       await fail(fast, err);
       // Um abort no fallback tem que vencer o erro do primário: mascarar o
       // cancelamento atrás do último 5xx rouba do caller o sinal de que ELE
@@ -513,10 +554,13 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     }
   } finally {
     link.dispose();
-    // Liquida SEMPRE — sucesso, erro, timeout ou cancelamento. Sem isto, uma
-    // chamada que falhou deixaria a estimativa presa no contador e a quota
-    // encolheria a cada falha, que é justamente quando o retry storm começa.
-    await settleReservation(reservation, actualCostUsd ?? 0);
+    // Liquidação final. `chargeAttempt` já liquidou por tentativa, então aqui
+    // isto é no-op no caso comum — e é o que devolve a reserva INTEIRA quando
+    // `spentUsd` é 0, ou seja, quando nenhuma requisição chegou a sair (abort
+    // antes do primeiro envio). Sem esta linha, uma chamada que nunca gastou
+    // deixaria a estimativa presa no contador e a quota encolheria a cada
+    // recusa, que é justamente quando o retry storm começa.
+    await settleReservation(reservation, spentUsd);
   }
 }
 

@@ -214,13 +214,95 @@ describe('orçamento diário por tenant+agent', () => {
     expect(spendCounter()).toBeCloseTo(0.02, 6);
   });
 
-  it('chamada que falhou devolve a reserva inteira', async () => {
+  /**
+   * O achado da rodada 2: uma tentativa que CHEGOU ao provider já transmitiu o
+   * prompt e teve a entrada cobrada. Liquidá-la como custo zero fazia o gasto
+   * real divergir do contabilizado exatamente no retry storm — muitas
+   * tentativas, poucas respostas — que é o cenário que a quota existe para
+   * conter.
+   */
+  it('tentativa enviada que FALHA é cobrada, não devolvida', async () => {
     anthropicCreateMock.mockRejectedValue(
       Object.assign(new Error('nope'), { status: 401 }),
     );
+    // Reserva 0,50 (estimativa) e cobra 0,10 pela entrada transmitida.
+    estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.1);
+
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
       executeLLM(REQ),
     ).catch(() => undefined);
+
+    expect(spendCounter()).toBeCloseTo(0.1, 6);
+  });
+
+  it('retries somam: cada tentativa enviada acumula, não substitui', async () => {
+    // `reasoner` com CLAUDE_MAX_RETRIES=2 → 2 tentativas no primário + fallback.
+    anthropicCreateMock.mockRejectedValue(
+      Object.assign(new Error('upstream'), { status: 503 }),
+    );
+    estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.1);
+
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM(REQ),
+    ).catch(() => undefined);
+
+    // 3 requisições enviadas (2 primário + 1 fallback) × 0,10 de entrada cada.
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(3);
+    expect(spendCounter()).toBeCloseTo(0.3, 6);
+  }, 20000);
+
+  it('sucesso após uma falha cobra AS DUAS tentativas', async () => {
+    anthropicCreateMock
+      .mockRejectedValueOnce(Object.assign(new Error('upstream'), { status: 503 }))
+      .mockResolvedValueOnce(okReply());
+    estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.1);
+
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ));
+
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(2);
+    // 0,10 da tentativa perdida + 0,10 da resposta boa.
+    expect(spendCounter()).toBeCloseTo(0.2, 6);
+  }, 20000);
+
+  it('usage parcial anexado ao erro é usado quando existe', async () => {
+    // Resposta que morreu no meio: o SDK anexou o que foi consumido.
+    const partial = Object.assign(new Error('aborted mid-flight'), {
+      status: 500,
+      usage: { input_tokens: 900, output_tokens: 40 },
+    });
+    anthropicCreateMock.mockRejectedValue(partial);
+    estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.2);
+
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM({ ...REQ, workload: 'role_selector' }),
+    ).catch(() => undefined);
+
+    // A cobrança usou o usage do erro, não a estimativa de entrada.
+    const chargeCall = estimateCostMock.mock.calls.at(-1)?.[0] as {
+      tokens_input: number;
+      tokens_output: number;
+    };
+    expect(chargeCall).toMatchObject({ tokens_input: 900, tokens_output: 40 });
+    expect(spendCounter()).toBeCloseTo(0.2, 6);
+  });
+
+  it('reserva inteira só volta quando NENHUMA requisição saiu', async () => {
+    // Recusa por quota: nada foi enviado, nada é cobrado.
+    readDailyUsdMock.mockResolvedValue(5);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM(REQ),
+    ).catch(() => undefined);
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
+    expect(spendCounter()).toBeCloseTo(5, 6);
+  });
+
+  it('abort ANTES do primeiro envio devolve a reserva inteira', async () => {
+    const c = new AbortController();
+    c.abort('caller_cancelled');
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
+      executeLLM({ ...REQ, ctx: { signal: c.signal } }),
+    ).catch(() => undefined);
+    expect(anthropicCreateMock).not.toHaveBeenCalled();
     expect(spendCounter()).toBeCloseTo(0, 6);
   });
 
