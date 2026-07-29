@@ -721,18 +721,45 @@ export const channelLineStateRepo = {
    */
   async renewSessionLeases(
     owner_instance: string,
-    channel_ids: readonly string[],
+    lines: ReadonlyArray<{ channel_id: string; tenant_id: string; agent_id: string }>,
     lease_ms: number = OWNER_LEASE_MS,
   ): Promise<number> {
-    if (channel_ids.length === 0) return 0;
+    if (lines.length === 0) return 0;
     const now = new Date();
+    const expires = new Date(now.getTime() + lease_ms);
+    // `ON CONFLICT DO UPDATE` não pode atingir a mesma row duas vezes no mesmo
+    // comando. A origem (um Map por channel_id) já é única, mas o repo não
+    // depende disso.
+    const unique = [...new Map(lines.map((l) => [l.channel_id, l])).values()];
+    // UPSERT, não UPDATE (falha de CI da rodada 2): a row de estado pode ainda
+    // não existir — um canal ativado fora do fluxo do console nunca passou por
+    // `requestCommand`, e o heartbeat pode disparar antes do primeiro
+    // `connection.update`. Como UPDATE puro, a escrita não pegava nada, a
+    // posse ficava NULL e o `disable` voltava a ser consumido pela réplica
+    // ERRADA — exatamente o P1 que este mecanismo existe para fechar,
+    // reintroduzido como no-op silencioso.
     const rows = await db
-      .update(channel_line_state)
-      .set({
-        session_owner_instance: owner_instance,
-        session_owner_lease_expires_at: new Date(now.getTime() + lease_ms),
+      .insert(channel_line_state)
+      .values(
+        unique.map((l) => ({
+          channel_id: l.channel_id,
+          tenant_id: l.tenant_id,
+          agent_id: l.agent_id,
+          session_owner_instance: owner_instance,
+          session_owner_lease_expires_at: expires,
+        })),
+      )
+      .onConflictDoUpdate({
+        target: channel_line_state.channel_id,
+        set: {
+          session_owner_instance: owner_instance,
+          session_owner_lease_expires_at: expires,
+          updated_at: now,
+        },
+        // SEM `setWhere`: a posse é ortogonal ao estado. Uma linha `disabled`
+        // que ainda tem socket PRECISA continuar endereçável, senão o
+        // `stop_line` nunca alcança quem o segura.
       })
-      .where(inArray(channel_line_state.channel_id, [...channel_ids]))
       .returning({ channel_id: channel_line_state.channel_id });
     return rows.length;
   },

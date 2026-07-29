@@ -50,7 +50,7 @@ const {
   abortPairingMock: vi.fn(async () => undefined),
   triggerRecoveryMock: vi.fn(async () => undefined),
   stopLineSessionMock: vi.fn(() => true),
-  listLocalSessionsMock: vi.fn((): string[] => []),
+  listLocalSessionsMock: vi.fn((): Array<{ channel_id: string; tenant_id: string; agent_id: string }> => []),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
 }));
@@ -75,7 +75,7 @@ vi.mock('../../../src/setup/line-pairing.js', () => ({
 vi.mock('../../../src/setup/recovery.js', () => ({ triggerRecovery: triggerRecoveryMock }));
 vi.mock('../../../src/gateway/line-sessions.js', () => ({
   stopLineSession: stopLineSessionMock,
-  listLocalLineSessionIds: listLocalSessionsMock,
+  listLocalLineSessions: listLocalSessionsMock,
   _internal: { startLineSession: vi.fn(async () => undefined) },
 }));
 vi.mock('../../../src/setup/line-readiness.js', () => ({
@@ -436,16 +436,19 @@ describe('abort e repair', () => {
   });
 
   it('o tick PUBLICA quais linhas têm socket nesta réplica (roteamento do stop)', async () => {
-    listLocalSessionsMock.mockReturnValue(['ch-local-1', 'ch-local-2']);
+    const local = [
+      { channel_id: 'ch-local-1', tenant_id: 'tenant-A', agent_id: 'agent-a' },
+      { channel_id: 'ch-local-2', tenant_id: 'tenant-A', agent_id: 'agent-a' },
+    ];
+    listLocalSessionsMock.mockReturnValue(local);
     claimOnce(null);
     await runChannelPairingWorker();
 
     // Sem esta publicação, `disable` não teria como endereçar o comando à
     // réplica dona e a linha continuaria respondendo (review PR #528 rodada 2).
-    expect(repoMock.renewSessionLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE, [
-      'ch-local-1',
-      'ch-local-2',
-    ]);
+    // O TRIPLETE viaja junto porque a row de estado pode ainda não existir e
+    // precisa ser criada com escopo (falha de CI da rodada 2).
+    expect(repoMock.renewSessionLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE, local);
   });
 
   it('sem sessão local, o tick não escreve posse alguma', async () => {

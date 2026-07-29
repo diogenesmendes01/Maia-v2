@@ -301,10 +301,10 @@ async function executeStopLine(row: {
  */
 async function publishLocalSessionOwnership(): Promise<void> {
   try {
-    const { listLocalLineSessionIds } = await import('@/gateway/line-sessions.js');
-    const ids = listLocalLineSessionIds();
-    if (ids.length === 0) return;
-    await channelLineStateRepo.renewSessionLeases(OWNER_INSTANCE, ids);
+    const { listLocalLineSessions } = await import('@/gateway/line-sessions.js');
+    const lines = listLocalLineSessions();
+    if (lines.length === 0) return;
+    await channelLineStateRepo.renewSessionLeases(OWNER_INSTANCE, lines);
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },

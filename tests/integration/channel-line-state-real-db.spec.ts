@@ -50,6 +50,33 @@ async function wipe(): Promise<void> {
   }
 }
 
+/** Triplete de uma linha, como `listLocalLineSessions()` o entrega. */
+function ownedLine(channel_id: string, tenant_id = T, agent_id = A) {
+  return { channel_id, tenant_id, agent_id };
+}
+
+/**
+ * Mata a lease de posse de SESSÃO deterministicamente.
+ *
+ * Substitui o `lease_ms: 1` + `sleep`: com 1ms a lease vencia ANTES da própria
+ * chamada seguinte (o round-trip ao Postgres já passa de 1ms), então o cenário
+ * "dono vivo agora, morto depois" nunca era montado. Empurrar o vencimento
+ * para o passado no banco expressa a intenção sem depender de relógio.
+ */
+async function expireSessionLease(channel_id: string): Promise<void> {
+  const c = await pool.connect();
+  try {
+    await c.query(
+      `UPDATE channel_line_state
+          SET session_owner_lease_expires_at = now() - interval '1 minute'
+        WHERE channel_id = $1`,
+      [channel_id],
+    );
+  } finally {
+    c.release();
+  }
+}
+
 async function seedChannel(
   tenant: string,
   agent: string,
@@ -1127,7 +1154,7 @@ d('channel_line_state — material cifrado e restart', () => {
       agent_id: A,
       state: 'connected',
     });
-    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
 
     await channelLineStateRepo.disableLineWithAudit({
       scope,
@@ -1162,9 +1189,9 @@ d('channel_line_state — material cifrado e restart', () => {
       agent_id: A,
       state: 'connected',
     });
-    // Lease de 1ms: a réplica A morreu e nunca renovou.
-    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId], 1);
-    await new Promise((r) => setTimeout(r, 20));
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
+    // A réplica A morreu e nunca mais renovou.
+    await expireSessionLease(channelId);
 
     await channelLineStateRepo.disableLineWithAudit({
       scope,
@@ -1196,7 +1223,9 @@ d('channel_line_state — material cifrado e restart', () => {
       agent_id: A,
       state: 'connected',
     });
-    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId], 1);
+    // Dono VIVO no momento em que o comando é enfileirado — é o que faz o
+    // comando nascer endereçado.
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
     await channelLineStateRepo.requestCommand({
       scope,
       command: 'stop_line',
@@ -1208,7 +1237,9 @@ d('channel_line_state — material cifrado e restart', () => {
       'replica-A',
     );
 
-    await new Promise((r) => setTimeout(r, 20)); // a lease do alvo vence
+    // ...e só DEPOIS a réplica dona morre. Sem o escape de lease vencida no
+    // claim, o comando ficaria endereçado a um processo que não existe mais.
+    await expireSessionLease(channelId);
     expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe(
       'stop_line',
     );
@@ -1217,7 +1248,7 @@ d('channel_line_state — material cifrado e restart', () => {
   it('a conclusão do stop apaga o registro de posse da sessão', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
-    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
     const key = randomUUID();
     await channelLineStateRepo.requestCommand({
       scope,
@@ -1242,10 +1273,79 @@ d('channel_line_state — material cifrado e restart', () => {
     expect(after?.session_owner_lease_expires_at).toBeNull();
   });
 
+  /**
+   * Falha de CI da rodada 2. `renewSessionLeases` era um UPDATE puro: quando a
+   * row de `channel_line_state` ainda não existia, a escrita não pegava nada e
+   * a posse ficava NULL — em silêncio. Consequência: `disable` nascia SEM
+   * destino e voltava a ser consumido pela réplica errada, que chamava
+   * `stopLineSession` num Map local vazio e reportava sucesso. O P1 da rodada
+   * 2 reintroduzido como no-op.
+   *
+   * Acontece de verdade: um canal ativado fora do fluxo do console nunca passa
+   * por `requestCommand`, e o heartbeat pode disparar antes do primeiro
+   * `connection.update`.
+   */
+  it('registra a posse mesmo quando a row de estado AINDA NÃO EXISTE', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    // Nenhum pareamento, nenhuma transição: a row não existe.
+    expect(await channelLineStateRepo.getStateForScope(scope)).toBeNull();
+
+    expect(
+      await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]),
+    ).toBe(1);
+
+    const after = await channelLineStateRepo.getStateForScope(scope);
+    expect(after).not.toBeNull();
+    expect(after!.session_owner_instance).toBe('replica-A');
+    expect(after!.session_owner_lease_expires_at).not.toBeNull();
+    // A row nasce com o escopo correto — sem ele o console não a enxergaria.
+    expect(after!.tenant_id).toBe(T);
+    expect(after!.agent_id).toBe(A);
+  });
+
+  it('a posse recém-registrada JÁ endereça o disable à réplica dona', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
+
+    await channelLineStateRepo.disableLineWithAudit({
+      scope,
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      ...ACTOR,
+      audit: {
+        actor_id: 'i518-user',
+        actor_role: 'owner',
+        action: 'channel_disabled',
+        change_summary: { agent_id: A },
+      },
+    });
+
+    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe(
+      'replica-A',
+    );
+    expect(await channelLineStateRepo.claimNextCommand('replica-B')).toBeNull();
+  });
+
+  it('renovar a posse NÃO altera o estado da linha (ortogonalidade)', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+    await channelLineStateRepo.markDisabled(scope, 'operator_disabled');
+
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
+
+    const after = await channelLineStateRepo.getStateForScope(scope);
+    // Uma linha `disabled` que ainda tem socket PRECISA continuar endereçável;
+    // e registrar posse não pode ressuscitar o estado.
+    expect(after?.state).toBe('disabled');
+    expect(after?.session_owner_instance).toBe('replica-A');
+  });
+
   it('releaseSessionOwnership só solta o que é do próprio dono', async () => {
     const { channelLineStateRepo } = await import('../../src/db/repositories.js');
     const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
-    await channelLineStateRepo.renewSessionLeases('replica-A', [channelId]);
+    await channelLineStateRepo.renewSessionLeases('replica-A', [ownedLine(channelId)]);
 
     expect(await channelLineStateRepo.releaseSessionOwnership('replica-B', [channelId])).toBe(0);
     expect((await channelLineStateRepo.getStateForScope(scope))?.session_owner_instance).toBe(

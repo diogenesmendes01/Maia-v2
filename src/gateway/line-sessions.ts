@@ -69,6 +69,14 @@ type LineChannel = {
 };
 
 type LineSessionState = {
+  /**
+   * Triplete da linha desta sessão. Guardado no estado porque a posse de
+   * sessão precisa ser PUBLICADA com escopo: `channel_line_state` exige
+   * `tenant_id`/`agent_id` e a row pode ainda não existir (canal ativado fora
+   * do fluxo do console). Sem isto só sobrava o `channel_id`, e o registro de
+   * posse virava um UPDATE que silenciosamente não pegava nada.
+   */
+  channel: LineChannel;
   sock: WASocket | null;
   connected: boolean;
   reconnectAttempts: number;
@@ -245,6 +253,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
   }
 
   const state: LineSessionState = sessions.get(channel.id) ?? {
+    channel,
     sock: null,
     connected: false,
     reconnectAttempts: 0,
@@ -400,15 +409,30 @@ export async function startAdditionalLineSessions(): Promise<void> {
  * Idempotente: parar uma linha que não tem sessão é um no-op.
  */
 /**
- * Canais cujo socket vive NESTE processo (review PR #528 rodada 2).
+ * Linhas cujo socket vive NESTE processo (review PR #528 rodada 2).
  *
  * É a fonte do heartbeat de posse de sessão: o worker publica esta lista em
  * `channel_line_state.session_owner_instance`, e é por ela que `disable` e
  * `repair` conseguem endereçar o comando à réplica certa em vez de chamar
  * `stopLineSession` num Map local vazio e declarar sucesso.
+ *
+ * Devolve o TRIPLETE, não só o id: a row de estado pode ainda não existir
+ * (canal ativado fora do fluxo do console, ou heartbeat disparando antes do
+ * primeiro `connection.update`), e registrar a posse exige `tenant_id` e
+ * `agent_id`.
  */
-export function listLocalLineSessionIds(): string[] {
-  return [...sessions.keys()].filter((id) => !sessions.get(id)!.stopped);
+export function listLocalLineSessions(): Array<{
+  channel_id: string;
+  tenant_id: string;
+  agent_id: string;
+}> {
+  return [...sessions.values()]
+    .filter((s) => !s.stopped)
+    .map((s) => ({
+      channel_id: s.channel.id,
+      tenant_id: s.channel.tenant_id,
+      agent_id: s.channel.agent_id,
+    }));
 }
 
 export function stopLineSession(channelId: string): boolean {
