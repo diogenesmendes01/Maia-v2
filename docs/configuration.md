@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 166 | 18 |
+| `runtime` | 168 | 18 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |

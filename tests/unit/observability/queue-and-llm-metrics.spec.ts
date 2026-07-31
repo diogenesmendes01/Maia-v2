@@ -1,15 +1,13 @@
 /**
- * Issue #514 §5 — queue depth/age gauges and the missing LLM error counter.
+ * Issue #514 §5 — gauges de profundidade/idade de fila.
+ *
+ * Os contadores de falha de LLM sairam daqui: o gateway governado da #508
+ * (src/lib/llm/telemetry.ts) emite maia_llm_calls_total em TODO desfecho, de um
+ * unico ponto. Um segundo emissor dobraria a contagem em cada falha.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Queue } from 'bullmq';
 import { registerQueueGauges, _TRACKED_STATES } from '../../../src/observability/queue-metrics.js';
-import {
-  classifyLlmError,
-  recordLlmFailure,
-  recordLlmRetry,
-  recordLlmFallback,
-} from '../../../src/observability/llm-metrics.js';
 import { _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 import { renderPrometheus, _resetForTests } from '../../../src/lib/metrics.js';
 
@@ -94,79 +92,5 @@ describe('issue #514 §5 — queue gauges', () => {
     const out = await renderPrometheus();
     expect(out).toContain('maia_queue_depth{queue="agent",state="waiting"} 12');
     expect(out).toContain('maia_queue_depth{queue="unrouted-replay",state="waiting"} 99');
-  });
-});
-
-describe('issue #514 §5 — LLM failure counters', () => {
-  beforeEach(() => {
-    _resetForTests();
-    _resetLabelGuardForTests();
-  });
-
-  describe('classification uses structure, never the message text', () => {
-    it.each([
-      [{ status: 429 }, 'rate_limit'],
-      [{ status: 401 }, 'auth'],
-      [{ status: 403 }, 'auth'],
-      [{ status: 408 }, 'timeout'],
-      [{ status: 504 }, 'timeout'],
-      [{ status: 529 }, 'overloaded'],
-      [{ status: 503 }, 'overloaded'],
-      [{ status: 400 }, 'bad_request'],
-      [{ status: 500 }, 'provider_error'],
-      [{ name: 'AbortError' }, 'aborted'],
-      [{ code: 'ABORT_ERR' }, 'aborted'],
-      [{ code: 'ETIMEDOUT' }, 'timeout'],
-      [{}, 'transport'],
-    ])('%o ⇒ %s', (err, expected) => {
-      expect(classifyLlmError(err)).toBe(expected);
-    });
-
-    it('ignores a message that would otherwise match a keyword', () => {
-      // If classification read the text, this would be mis-binned as
-      // rate_limit — and worse, the text could carry user content.
-      expect(classifyLlmError({ message: 'rate limit exceeded', status: 500 })).toBe(
-        'provider_error',
-      );
-    });
-
-    it('handles null/undefined without throwing', () => {
-      expect(classifyLlmError(null)).toBe('transport');
-      expect(classifyLlmError(undefined)).toBe('transport');
-    });
-  });
-
-  it('emits the maia_llm_calls_total{status="error"} series the runbook references', async () => {
-    recordLlmFailure({ provider: 'anthropic', model: 'sonnet', tier: 'main' }, { status: 429 });
-    const out = await renderPrometheus();
-    expect(out).toContain('status="error"');
-    expect(out).toContain('reason="rate_limit"');
-    expect(out).toContain('model="sonnet"');
-    expect(out).toContain('provider="anthropic"');
-    expect(out).toContain('tier="main"');
-  });
-
-  it('separates retry from error from fallback', async () => {
-    recordLlmFailure({ provider: 'anthropic', model: 'sonnet' }, { status: 500 });
-    recordLlmRetry({ provider: 'anthropic', model: 'sonnet' }, 'provider_error');
-    recordLlmFallback({ provider: 'anthropic', model: 'haiku' });
-    const out = await renderPrometheus();
-    expect(out).toContain('status="error"');
-    expect(out).toContain('status="retry"');
-    expect(out).toContain('status="fallback"');
-  });
-
-  it('never puts the raw provider message in a label', async () => {
-    recordLlmFailure(
-      { provider: 'anthropic', model: 'sonnet' },
-      { status: 400, message: 'invalid request: "meu telefone é +55 11 99999-9999"' },
-    );
-    const out = await renderPrometheus();
-    expect(out).not.toContain('99999');
-    expect(out).not.toContain('telefone');
-  });
-
-  it('returns the classified reason so the caller can reuse it', () => {
-    expect(recordLlmFailure({ provider: 'p', model: 'm' }, { status: 429 })).toBe('rate_limit');
   });
 });
