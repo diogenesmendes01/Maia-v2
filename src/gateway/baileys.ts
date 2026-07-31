@@ -37,12 +37,15 @@ import {
   sendPoll as presenceSendPoll,
 } from './presence.js';
 import type { LineTransport } from './line-session-manager.js';
-import { enqueueAgent, QueueRedisUnavailableError } from './queue.js';
+import { enqueueAgent, enqueueAgentTurn, QueueRedisUnavailableError } from './queue.js';
 import { scheduleDebouncedAgent } from './debouncer.js';
 // Issue #503 — máquina de estados durável do turno (dual-write no ingresso).
+// Issue #504 — o produtor arma o job V2 (identidade durável) quando o claim
+// está ligado.
 import {
   noteTurnQueued,
   noteTurnEnqueueFailed,
+  turnClaimEnabled,
   turnStateMachineEnabled,
   type TurnStatus,
 } from '@/runtime/turns/index.js';
@@ -1234,13 +1237,26 @@ async function handleIncoming(
   // outer `handleIncoming` handler (real bug — surface it), again leaving the
   // row pending (we never reach the "processed" write).
   try {
+    // Issue #504 — o PRODUTOR só muda para V2 quando o claim está ligado E o
+    // turno durável existe. As duas condições são necessárias: sem turno não há
+    // identidade a carregar, e sem claim o consumidor V2 não teria exclusão
+    // mútua alguma. Fora disso, o job V1 continua exatamente como era —
+    // rollback é desligar a flag, sem redeploy.
+    //
     // Issue #514 §5 — carry the PERSISTED inbound timestamp so the E2E latency
     // SLI is measured from when the message actually arrived, not from when a
     // worker happened to pick it up.
-    await enqueueAgent({
-      mensagem_id: stored.id,
-      received_at_ms: stored.created_at?.getTime(),
-    });
+    if (turnClaimEnabled() && turnHandle) {
+      await enqueueAgentTurn({
+        turn_id: turnHandle.turn_id,
+        ...(stored.created_at ? { received_at_ms: stored.created_at.getTime() } : {}),
+      });
+    } else {
+      await enqueueAgent({
+        mensagem_id: stored.id,
+        received_at_ms: stored.created_at?.getTime(),
+      });
+    }
   } catch (err) {
     if (err instanceof QueueRedisUnavailableError) {
       logger.warn(

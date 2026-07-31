@@ -112,6 +112,10 @@ export type RedisOomCaller =
   // message-recovery sweep). Fail-closed — see `enqueueAgent` in
   // `src/gateway/queue.ts`.
   | 'enqueue_agent'
+  // Idem, para o job V2 do turno (#504). Rótulo próprio de propósito: durante o
+  // rollout os dois produtores coexistem, e um OOM atribuído ao rótulo errado
+  // faria a coorte nova parecer saudável.
+  | 'enqueue_agent_turn'
   // Rate-limit (#309 follow-up, PR #324 B2 / W1): the sliding-window zset
   // block and the overage get/set block now classify OOM explicitly while
   // preserving the intentional fail-closed `silence` posture.

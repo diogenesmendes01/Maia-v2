@@ -7,7 +7,9 @@ import {
   channelPoliciesRepo,
   rolesRepo,
   agentAudienceProfilesRepo,
+  agentTurnsRepo,
 } from '@/db/repositories.js';
+import { incCounter } from '@/lib/metrics.js';
 import { resolveScope } from '@/governance/permissions.js';
 import { buildAudienceContext } from '@/identity/audience-context.js';
 import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
@@ -60,6 +62,11 @@ import {
   deadLetterTurn,
   isTerminalTurnStatus,
   turnStateAuthoritative,
+  // Issue #504 — claim atômico, lease e fencing.
+  acquireTurnLease,
+  turnClaimEnabled,
+  runWithTurnExecution,
+  type TurnHandle,
 } from '@/runtime/turns/index.js';
 import {
   runWithTenantContext,
@@ -475,6 +482,49 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   );
 }
 
+/**
+ * Issue #504 — entrada do job V2, cuja identidade é o TURNO.
+ *
+ * O payload carrega só `turn_id`; tudo o mais é RELIDO do PostgreSQL. Este
+ * método faz a única leitura que precisa acontecer fora de contexto — descobrir
+ * a qual (tenant, agent) o turno pertence — e é explicitamente cross-tenant,
+ * pelo padrão sancionado de entry point (`findByExternalCrossTenant`,
+ * `claimNextCommand`): a ROW é a autoridade, nunca o payload.
+ *
+ * Turno inexistente é FAIL-CLOSED silencioso: um job órfão (turno apagado por
+ * retenção, ou payload adulterado) não pode inventar trabalho. Métrica sim,
+ * exceção não — falhar aqui geraria retry e DLQ para algo que jamais vai
+ * existir.
+ */
+export async function runAgentForTurn(turn_id: string): Promise<void> {
+  const scope = await agentTurnsRepo.findScopeByIdCrossTenant(turn_id);
+  if (!scope) {
+    incCounter('maia_turn_job_orphan_total', { reason: 'turn_not_found' });
+    logger.warn({ turn_id }, 'agent.turn_job_orphan');
+    return;
+  }
+  // O caminho a partir daqui é o MESMO do job V1 — resolução de canal, adoção
+  // cross-tenant, claim e execução. Deliberado: uma segunda implementação do
+  // corpo do turno seria a forma mais rápida de as duas versões divergirem
+  // durante o rollout, que é justamente quando as duas precisam ser
+  // indistinguíveis.
+  await runAgentForMensagem(scope.representative_message_id);
+}
+
+/**
+ * Issue #504 — a porta de ENTRADA da execução: resolve o turno, DISPUTA o
+ * claim atômico e só então executa, com o fence instalado.
+ *
+ * Ordem deliberada. O claim acontece DEPOIS da resolução de canal (que é quem
+ * define o par tenant/agent real e adota a row) e DENTRO do contexto resolvido:
+ * o claim é uma escrita escopada, e reivindicar sob o tenant errado seria
+ * violação da invariante 1 — além de não encontrar a row.
+ *
+ * Não vencer o claim NÃO é erro: significa que outra réplica é a dona (ou que o
+ * backoff ainda não venceu). O job termina com sucesso, sem efeito, sem
+ * consumir tentativa canônica — e sem alarme, porque isto é o sistema
+ * funcionando.
+ */
 async function runAgentForMensagemInner(
   mensagem_id: string,
   channel_id: string | null = null,
@@ -517,10 +567,61 @@ async function runAgentForMensagemInner(
     return;
   }
 
-  // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
-  // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
-  // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
-  await beginTurnExecution(turn, { channel_id });
+  // ── CLAIM ATÔMICO (#504) ────────────────────────────────────────────────
+  //
+  // Sem a flag (ou sem turno durável), o caminho é o de #503: `beginTurnExecution`
+  // registra que a execução começou, mas NÃO é exclusão mútua — duas réplicas
+  // ainda podem entrar no mesmo turno. Com a flag, o PostgreSQL decide o dono
+  // antes de qualquer efeito, e todo o corpo roda sob o fence.
+  if (!turnClaimEnabled() || !turn) {
+    await beginTurnExecution(turn, { channel_id });
+    await runAgentTurnBody(inbound, turn, channel_id);
+    return;
+  }
+
+  const lease = await acquireTurnLease({ turn_id: turn.turn_id });
+  if (!lease) {
+    // Outra réplica é a dona, ou o backoff não venceu. Nada a fazer — e nada a
+    // alarmar. O job termina COM SUCESSO de propósito: falhar aqui gastaria
+    // tentativas do BullMQ e acabaria numa DLQ que descreveria o sistema
+    // funcionando corretamente.
+    logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_not_claimed');
+    return;
+  }
+
+  // O claim É uma transição: incrementou `attempt_count` e a `state_version`.
+  // O handle que veio de `ensureTurnHandle` está obsoleto desde aquele
+  // instante, e usá-lo faria o CAS da próxima transição falhar por versão.
+  turn.status = 'claimed';
+  turn.state_version = lease.claimed_state_version;
+  turn.attempt_count = lease.ctx.attempt;
+
+  try {
+    await runWithTurnExecution(lease.ctx, async () => {
+      await beginTurnExecution(turn, { channel_id });
+      await runAgentTurnBody(inbound, turn, channel_id);
+    });
+  } finally {
+    // `release: false` — a transição terminal (ou o `retryable`) JÁ devolveu a
+    // posse no mesmo UPDATE do estado. Liberar de novo aqui seria uma segunda
+    // escrita sem CAS de estado, exatamente a janela que a #518 aprendeu a não
+    // abrir. O que resta é local: parar o timer de heartbeat e sair do
+    // registro de drain.
+    await lease.finish({ release: false });
+  }
+}
+
+/**
+ * O corpo do turno. Extraído de `runAgentForMensagemInner` por #504 para que a
+ * aquisição do claim possa envolvê-lo inteiro com o `TurnExecutionContext` —
+ * toda escrita daqui para baixo herda o fence pelo ALS.
+ */
+async function runAgentTurnBody(
+  inbound: Mensagem,
+  turn: TurnHandle | null,
+  channel_id: string | null,
+): Promise<void> {
+  const mensagem_id = inbound.id;
 
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;

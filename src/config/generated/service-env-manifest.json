@@ -761,6 +761,27 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_TURN_CLAIM",
+          "secret": false,
+          "required": false,
+          "group": "turns",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_LEASE_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "turns",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_LEASE_HEARTBEAT_MS",
+          "secret": false,
+          "required": false,
+          "group": "turns",
+          "restartRequired": true
+        },
+        {
           "name": "MAIA_SYNTHETIC_PROBE",
           "secret": false,
           "required": false,
@@ -1327,6 +1348,9 @@
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "FEATURE_TURN_CLAIM",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
             "MAIA_PROBE_CRON",
@@ -1502,6 +1526,9 @@
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "FEATURE_TURN_CLAIM",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
             "MAIA_PROBE_CRON",
@@ -1676,6 +1703,9 @@
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "FEATURE_TURN_CLAIM",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
             "MAIA_PROBE_CRON",

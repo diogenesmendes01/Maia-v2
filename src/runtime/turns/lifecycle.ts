@@ -35,6 +35,8 @@ import {
   type TurnOutcome,
   type TurnStatus,
 } from './contract.js';
+import { jitteredDelayMs, TurnFenceRejectedError } from './claim.js';
+import { currentClaimTokenFor } from './execution-context.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -63,6 +65,67 @@ function toHandle(turn: AgentTurn): TurnHandle {
     attempt_count: turn.attempt_count,
     conversa_id: turn.conversa_id,
   };
+}
+
+/**
+ * O fence da tentativa corrente, quando ela é dona DESTE turno (#504).
+ *
+ * `undefined` quando não há claim ativo — o caminho de rollout com
+ * `FEATURE_TURN_CLAIM=false`, em que as transições seguem sem fencing e com a
+ * mesma semântica de #503. Nunca "quase o token": ou o ALS prova posse deste
+ * `turn_id`, ou não há fence.
+ */
+function fenceFor(turn_id: string): { expected_claim_token: string } | Record<string, never> {
+  const token = currentClaimTokenFor(turn_id);
+  return token ? { expected_claim_token: token } : {};
+}
+
+/**
+ * Erro de FENCING transformado em decisão: o turno pertence a outro worker
+ * agora. Emite métrica, log e AUDITORIA (a issue exige `turn.fence_rejected`
+ * explicável) e lança — engolir seria deixar a tentativa acreditar que
+ * concluiu o turno enquanto o sucessor o executa.
+ */
+async function rejectByFence(
+  handle: TurnHandle,
+  result: Extract<TurnTransitionResult, { conflict: 'stale_claim' }>,
+  op: string,
+): Promise<never> {
+  logger.error(
+    {
+      turn_id: handle.turn_id,
+      from_status: handle.status,
+      to_status: result.to,
+      operation: op,
+      current_status: result.current_status,
+      current_claimed_by: result.current_claimed_by,
+      ops_alert: true,
+    },
+    'turn.fence_rejected',
+  );
+  await audit({
+    acao: 'turn_fence_rejected',
+    ...(handle.conversa_id ? { conversa_id: handle.conversa_id } : {}),
+    alvo_id: handle.turn_id,
+    metadata: {
+      operation: op,
+      from_status: handle.status,
+      to_status: result.to,
+      current_status: result.current_status,
+      current_claimed_by: result.current_claimed_by,
+      attempt: handle.attempt_count,
+    },
+  }).catch((err) =>
+    logger.warn(
+      { turn_id: handle.turn_id, err: (err as Error).message },
+      'turn.fence_audit_failed',
+    ),
+  );
+  throw new TurnFenceRejectedError({
+    turn_id: handle.turn_id,
+    operation: op,
+    claim_token: currentClaimTokenFor(handle.turn_id) ?? 'unknown',
+  });
 }
 
 /**
@@ -100,6 +163,25 @@ function applyResult(handle: TurnHandle, result: TurnTransitionResult): boolean 
     'turn.transition_conflict',
   );
   return false;
+}
+
+/**
+ * `applyResult` + a política de FENCING (#504).
+ *
+ * `stale_claim` NUNCA é "só mais um conflito": significa que outro worker é o
+ * dono e esta tentativa é um zumbi. Por isso este caminho é assíncrono (audita)
+ * e LANÇA, enquanto `state_mismatch` continua sendo um `false` silencioso que o
+ * caller trata como corrida benigna.
+ */
+async function applyResultChecked(
+  handle: TurnHandle,
+  result: TurnTransitionResult,
+  op: string,
+): Promise<boolean> {
+  if (!result.ok && result.conflict === 'stale_claim') {
+    await rejectByFence(handle, result, op);
+  }
+  return applyResult(handle, result);
 }
 
 /**
@@ -152,6 +234,11 @@ async function guarded<T>(
     return await fn();
   } catch (err) {
     if (err instanceof TurnStateWriteError) throw err; // já contabilizado
+    // FENCING (#504) atravessa a política de modo INTACTO. Em shadow, `guarded`
+    // engoliria o erro e a tentativa seguiria acreditando ter concluído o turno
+    // — que é precisamente a execução dupla que esta issue existe para
+    // impedir. `stale_claim` nunca é fail-soft.
+    if (err instanceof TurnFenceRejectedError) throw err;
     const { code } = sanitizeTurnError({ error: err });
     incCounter('maia_turn_state_errors_total', { op, error_code: code });
     const blocking = opts.blocking ?? turnStateAuthoritative();
@@ -215,17 +302,26 @@ export async function noteTurnEnqueueFailed(
 /**
  * Marca o início da execução (`-> claimed -> running`).
  *
- * NÃO é um claim distribuído: nesta issue a máquina de estados registra que a
- * execução começou, mas NÃO decide quem executa — dois workers ainda podem
- * entrar no mesmo turno. O claim atômico com lease e fencing é #504, que
- * substitui o miolo daqui preservando esta assinatura. Por isso um conflito
- * aqui NUNCA aborta o turno: seria uma falsa sensação de exclusão mútua.
+ * DOIS REGIMES, decididos pela presença de um claim ativo no ALS (#504):
+ *
+ * COM CLAIM (`FEATURE_TURN_CLAIM=true`): o turno JÁ está em `claimed`, com
+ * token e lease gravados pelo statement atômico, e `attempt_count` JÁ foi
+ * incrementado por ele. Aqui só resta `claimed -> running`, com fencing e SEM
+ * bumpar a tentativa de novo — contar duas vezes inflaria o número canônico que
+ * decide retry vs. dead letter. As pernas `retryable -> queued` e
+ * `-> claimed` não rodam: o claim já cobriu essas origens no seu predicado.
+ *
+ * SEM CLAIM (rollout com a flag desligada): comportamento de #503, preservado
+ * byte a byte — registra que a execução começou, mas NÃO decide quem executa.
+ * Por isso um conflito aqui não aborta o turno: seria falsa exclusão mútua.
  */
 export async function beginTurnExecution(
   handle: TurnHandle | null,
   args: { conversa_id?: string | null; channel_id?: string | null } = {},
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
+  const fence = fenceFor(handle.turn_id);
+  const claimed = 'expected_claim_token' in fence;
   await guarded('begin_execution', async () => {
     // Reentrada de um turno em RETRY. O recovery normalmente já fez
     // `retryable -> queued` ao rearmar, mas um retry do próprio BullMQ chega
@@ -234,7 +330,10 @@ export async function beginTurnExecution(
     // (`retryable` não alcança `completed`) — o turno voltaria à fila para
     // sempre. `retryable -> queued` é aresta do contrato, então a cadeia
     // completa é retryable -> queued -> claimed -> running.
-    if (handle.status === 'retryable') {
+    //
+    // Com claim ativo esta perna é inalcançável (o claim leva `retryable`
+    // direto a `claimed`), e mantê-la seria escrever por cima da posse.
+    if (!claimed && handle.status === 'retryable') {
       applyResult(
         handle,
         await agentTurnsRepo.markQueued({
@@ -243,7 +342,7 @@ export async function beginTurnExecution(
         }),
       );
     }
-    if (handle.status === 'received' || handle.status === 'queued') {
+    if (!claimed && (handle.status === 'received' || handle.status === 'queued')) {
       applyResult(
         handle,
         await agentTurnsRepo.markClaimed({
@@ -253,14 +352,17 @@ export async function beginTurnExecution(
       );
     }
     if (handle.status === 'claimed') {
-      applyResult(
+      await applyResultChecked(
         handle,
         await agentTurnsRepo.markRunning({
           turn_id: handle.turn_id,
           expected_version: handle.state_version,
+          ...fence,
+          ...(claimed ? { bump_attempt: false } : {}),
           ...(args.conversa_id !== undefined ? { conversa_id: args.conversa_id } : {}),
           ...(args.channel_id !== undefined ? { channel_id: args.channel_id } : {}),
         }),
+        'begin_execution',
       );
     }
   });
@@ -332,26 +434,33 @@ export async function concludeTurn(
   ctx: { pessoa_id?: string | null; mensagem_id?: string | null } = {},
 ): Promise<void> {
   if (!handle || !turnStateMachineEnabled()) return;
+  const fence = fenceFor(handle.turn_id);
   await guarded('conclude', async () => {
     const from = handle.status;
+    // FENCING (#504): a conclusão é a escrita mais perigosa do turno — é a que
+    // um zumbi usaria para declarar sucesso sobre trabalho que o sucessor está
+    // fazendo. O `expected_claim_token` no WHERE é o que a torna impossível.
     const result =
       outcome === 'merged_into_turn'
         ? await agentTurnsRepo.markSuperseded({
             turn_id: handle.turn_id,
             expected_version: handle.state_version,
+            ...fence,
           })
         : IGNORED_OUTCOMES.has(outcome)
           ? await agentTurnsRepo.markIgnored({
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fence,
             })
           : await agentTurnsRepo.completeTurnTx({
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fence,
             });
-    if (!applyResult(handle, result)) return;
+    if (!(await applyResultChecked(handle, result, 'conclude'))) return;
 
     if (IGNORED_OUTCOMES.has(outcome)) {
       await audit({
@@ -416,8 +525,12 @@ export async function failTurnRetryable(
     await deadLetterTurn(handle, { code, summary, outcome: 'retry_exhausted' });
     return;
   }
+  const fence = fenceFor(handle.turn_id);
   await guarded('fail_retryable', async () => {
-    const next = new Date(Date.now() + retryDelayMs(handle.attempt_count + 1));
+    // Backoff PERSISTIDO com jitter limitado (#504): sem jitter, N turnos que
+    // falharam pelo mesmo motivo (um provedor fora do ar) voltam todos no mesmo
+    // instante e derrubam o que acabou de se recuperar.
+    const next = new Date(Date.now() + jitteredDelayMs(retryDelayMs(handle.attempt_count + 1)));
     const from = handle.status;
     const result = await agentTurnsRepo.markRetryable({
       turn_id: handle.turn_id,
@@ -425,8 +538,9 @@ export async function failTurnRetryable(
       error_code: code,
       error_summary: summary,
       expected_version: handle.state_version,
+      ...fence,
     });
-    if (!applyResult(handle, result)) return;
+    if (!(await applyResultChecked(handle, result, 'fail_retryable'))) return;
     incCounter('maia_turn_retries_total', { error_code: code });
     logger.info(
       {
@@ -456,6 +570,7 @@ export async function deadLetterTurn(
     args.summary !== undefined
       ? { code: args.code, summary: args.summary }
       : sanitizeTurnError({ code: args.code, error: args.error });
+  const fence = fenceFor(handle.turn_id);
   await guarded('dead_letter', async () => {
     const from = handle.status;
     const result = await agentTurnsRepo.markDeadLetter({
@@ -464,8 +579,9 @@ export async function deadLetterTurn(
       error_code: sanitized.code,
       error_summary: sanitized.summary,
       expected_version: handle.state_version,
+      ...fence,
     });
-    if (!applyResult(handle, result)) return;
+    if (!(await applyResultChecked(handle, result, 'dead_letter'))) return;
     logger.error(
       {
         turn_id: handle.turn_id,

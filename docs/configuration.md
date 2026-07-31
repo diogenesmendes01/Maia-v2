@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
+| `runtime` | 171 | 18 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
@@ -325,6 +325,14 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Exige que a migration mais nova em disco esteja aplicada em schema_migrations antes de anunciar readiness. A readiness NUNCA aplica migration — só recusa servir num schema para o qual o código não foi construído. Desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso. |
 | `READINESS_BACKLOG_MAX` | number | `0` | não | `runtime` | sim | Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog. |
 | `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. |
+
+### Turnos (claim atômico, lease e fencing)
+
+| Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
+|---|---|---|---|---|---|---|
+| `FEATURE_TURN_CLAIM` | string | `false` | não | `runtime` | sim | Claim atômico, lease renovável, fencing por claim_token e jobId determinístico do turno (issue #504). EXIGE a migration 108 APLICADA e FEATURE_TURN_STATE_MACHINE ligada — sem a máquina de estados não existe row para reivindicar. Default OFF: ligar muda QUEM executa o turno (o PostgreSQL passa a decidir ownership) e faz o produtor armar jobs V2 com jobId derivado do turn_id. Com a flag ON, um worker só processa depois de vencer o claim, e uma tentativa que perde a lease é impedida de gravar. Kill switch: false volta ao caminho anterior (jobs V1, sem exclusão mútua) sem perder turnos já gravados. Ver docs/runbooks/turn-claim-lease.md. |
+| `TURN_LEASE_TTL_MS` | number | `60000` | não | `runtime` | sim | Validade da lease de posse do turno. Curto demais causa takeover FALSO (o dono vivo perde a posse por um GC longo e o trabalho é refeito); longo demais atrasa a recuperação depois de um crash na mesma medida. 60s é o mesmo TTL já usado pela posse de linha (#518). Precisa ser >= 3x TURN_LEASE_HEARTBEAT_MS — o boot recusa a combinação insegura. |
+| `TURN_LEASE_HEARTBEAT_MS` | number | `15000` | não | `runtime` | sim | Cadência com que o dono prova que está vivo. No MÁXIMO um terço de TURN_LEASE_TTL_MS, para que dois heartbeats consecutivos possam falhar antes de a lease vencer; com metade, um único tick perdido já abriria janela de takeover com o dono ainda trabalhando. A relação é validada no boot (checkLeaseConfig) e o processo NÃO sobe se ela for violada. |
 
 ### Bootstrap / setup
 

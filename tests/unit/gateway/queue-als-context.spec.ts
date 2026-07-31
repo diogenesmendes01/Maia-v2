@@ -86,7 +86,10 @@ const { startAgentWorker } = await import('@/gateway/queue.js');
 const { getCurrentTenant, getCurrentAgent, isSystemContext, MissingTenantContextError } =
   await import('@/db/tenant-context.js');
 
-function fakeJob(mensagem_id = 'm1'): Job<AgentJob> {
+// Issue #504: o consumidor agora INTERPRETA o payload (`parseAgentJob`) e
+// recusa o que não casa com nenhuma das versões, então a identidade precisa ser
+// um UUID de verdade — como sempre foi em produção (`mensagens.id`).
+function fakeJob(mensagem_id = '11112222-3333-4444-5555-666677778888'): Job<AgentJob> {
   return { id: 'job-1', data: { mensagem_id } } as unknown as Job<AgentJob>;
 }
 

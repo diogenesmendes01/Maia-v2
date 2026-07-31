@@ -1466,6 +1466,60 @@ export const ENV_CONTRACT = {
     commentedInExample: true,
   },
 
+  // ---- turnos: claim atômico, lease e fencing (issue #504) ---------------
+  FEATURE_TURN_CLAIM: {
+    name: 'FEATURE_TURN_CLAIM',
+    description:
+      'Claim atômico, lease renovável, fencing por claim_token e jobId determinístico do turno ' +
+      '(issue #504). EXIGE a migration 108 APLICADA e FEATURE_TURN_STATE_MACHINE ligada — sem a ' +
+      'máquina de estados não existe row para reivindicar. Default OFF: ligar muda QUEM executa o ' +
+      'turno (o PostgreSQL passa a decidir ownership) e faz o produtor armar jobs V2 com jobId ' +
+      'derivado do turn_id. Com a flag ON, um worker só processa depois de vencer o claim, e uma ' +
+      'tentativa que perde a lease é impedida de gravar. Kill switch: false volta ao caminho ' +
+      'anterior (jobs V1, sem exclusão mútua) sem perder turnos já gravados. ' +
+      'Ver docs/runbooks/turn-claim-lease.md.',
+    group: 'turns',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_LEASE_TTL_MS: {
+    name: 'TURN_LEASE_TTL_MS',
+    description:
+      'Validade da lease de posse do turno. Curto demais causa takeover FALSO (o dono vivo perde a ' +
+      'posse por um GC longo e o trabalho é refeito); longo demais atrasa a recuperação depois de ' +
+      'um crash na mesma medida. 60s é o mesmo TTL já usado pela posse de linha (#518). ' +
+      'Precisa ser >= 3x TURN_LEASE_HEARTBEAT_MS — o boot recusa a combinação insegura.',
+    group: 'turns',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(60_000),
+    example: '60000',
+    fixture: '60000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_LEASE_HEARTBEAT_MS: {
+    name: 'TURN_LEASE_HEARTBEAT_MS',
+    description:
+      'Cadência com que o dono prova que está vivo. No MÁXIMO um terço de TURN_LEASE_TTL_MS, para ' +
+      'que dois heartbeats consecutivos possam falhar antes de a lease vencer; com metade, um único ' +
+      'tick perdido já abriria janela de takeover com o dono ainda trabalhando. A relação é ' +
+      'validada no boot (checkLeaseConfig) e o processo NÃO sobe se ela for violada.',
+    group: 'turns',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(15_000),
+    example: '15000',
+    fixture: '15000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
   // ---- probe ------------------------------------------------------------
   MAIA_SYNTHETIC_PROBE: {
     name: 'MAIA_SYNTHETIC_PROBE',

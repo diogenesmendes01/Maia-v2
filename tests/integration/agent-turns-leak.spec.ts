@@ -161,6 +161,73 @@ d('agent turns — leak suite cross-tenant', () => {
     expect(Number(after?.state_version)).toBe(v);
   });
 
+  it('posse (#504): claim, heartbeat e liberação não alcançam turno de outro par', async () => {
+    const { agentTurnsRepo } = await loadRepos();
+    const msgB = await mkInbound(T_B, A_B);
+    const turnB = await inB(() =>
+      agentTurnsRepo.ensureTurnForMessage({
+        id: msgB,
+        tenant_id: T_B,
+        agent_id: A_B,
+        conversa_id: null,
+        channel_id: null,
+      }),
+    );
+
+    // O tenant A não consegue REIVINDICAR o turno de B. `not_found`, não
+    // `lease_active`: fora do escopo, a row simplesmente não existe.
+    expect(
+      await inA(() =>
+        agentTurnsRepo.tryClaimTurn({ turn_id: turnB.id, worker_id: 'intruso:1', lease_ms: 60_000 }),
+      ),
+    ).toEqual({ ok: false, reason: 'not_found' });
+
+    // O dono reivindica…
+    const claim = await inB(() =>
+      agentTurnsRepo.tryClaimTurn({ turn_id: turnB.id, worker_id: 'dono:1', lease_ms: 60_000 }),
+    );
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+
+    // …e nem com o TOKEN CORRETO em mãos o outro par consegue renovar ou
+    // liberar. O token é o fence DENTRO do escopo; ele nunca substitui o
+    // escopo.
+    expect(
+      await inA(() =>
+        agentTurnsRepo.renewTurnLease({
+          turn_id: turnB.id,
+          claim_token: claim.claim.claim_token,
+          worker_id: 'dono:1',
+          lease_ms: 60_000,
+        }),
+      ),
+    ).toEqual({ ok: false, reason: 'lost' });
+    expect(
+      await inA(() =>
+        agentTurnsRepo.releaseTurnLease({
+          turn_id: turnB.id,
+          claim_token: claim.claim.claim_token,
+        }),
+      ),
+    ).toEqual({ released: false });
+
+    // E a transição com fence tampouco atravessa o escopo.
+    expect(
+      await inA(() =>
+        agentTurnsRepo.completeTurnTx({
+          turn_id: turnB.id,
+          outcome: 'reply_delivered',
+          expected_claim_token: claim.claim.claim_token,
+        }),
+      ),
+    ).toMatchObject({ ok: false, conflict: 'not_found' });
+
+    // Posse do dono intacta.
+    const after = await inB(() => agentTurnsRepo.findById(turnB.id));
+    expect(after?.claimed_by).toBe('dono:1');
+    expect(after?.status).toBe('claimed');
+  });
+
   it('recovery: findRecoverableTurns só devolve turnos do par corrente', async () => {
     const { agentTurnsRepo } = await loadRepos();
     const stale = 60_000;

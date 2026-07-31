@@ -3103,10 +3103,16 @@ export const agent_turns = pgTable(
     // Sanitizados por `sanitizeTurnError` — nunca payload/prompt/PII.
     last_error_code: text('last_error_code'),
     last_error_summary: text('last_error_summary'),
-    // Reservados para #504 (claim/lease/fencing).
+    // Posse distribuída (#504). O TRIO é all-or-nothing — a CHECK
+    // `agent_turns_claim_trio_chk` (migration 108) impede meia-posse, porque um
+    // `claim_token` sem dono faria o fencing casar numa row sem lease real.
     claimed_by: text('claimed_by'),
     claim_token: uuid('claim_token'),
     lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    // Última PROVA DE VIDA do dono (migration 108). `lease_expires_at` diz até
+    // quando a posse vale; este campo diz quando ela foi provada — perguntas
+    // diferentes quando se investiga um worker travado com TTL longo.
+    heartbeat_at: timestamp('heartbeat_at', { withTimezone: true }),
     // Reservado para #507 (deadline/cancelamento).
     deadline_at: timestamp('deadline_at', { withTimezone: true }),
     // Reservado para #506 (outbox durável).

@@ -7,9 +7,16 @@
  * detalhe interno de organização.
  *
  * Camadas:
- *   contract  — vocabulário puro (estados, outcomes, transições, sanitização);
- *   lifecycle — fachada com flag de rollout, fail-soft, auditoria e métricas;
+ *   contract          — vocabulário puro de estados (#503);
+ *   claim             — vocabulário puro de posse: payload da fila, jobId
+ *                       determinístico, elegibilidade e config de lease (#504);
+ *   execution-context — o ALS que carrega o fence pelo pipeline (#504);
+ *   lease             — o detentor da lease: claim, heartbeat, cancelamento (#504);
+ *   lifecycle         — fachada com flag de rollout, fail-soft, auditoria e métricas;
  *   agentTurnsRepo (src/db/repositories/turn-repos.ts) — única porta de escrita.
  */
 export * from './contract.js';
+export * from './claim.js';
+export * from './execution-context.js';
+export * from './lease.js';
 export * from './lifecycle.js';

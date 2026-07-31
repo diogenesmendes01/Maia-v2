@@ -18,7 +18,13 @@ import {
 import { counter, histogram } from '@/observability/metrics.js';
 import { METRIC } from '@/observability/taxonomy.js';
 import { withCorrelation } from './job-correlation.js';
-import type { AgentJob } from './types.js';
+import {
+  AGENT_TURN_JOB_VERSION,
+  parseAgentJob,
+  turnJobId,
+  type ParsedAgentJob,
+} from '@/runtime/turns/claim.js';
+import type { AgentJob, AgentJobV1, AgentTurnJobV2 } from './types.js';
 
 const connection = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,
@@ -67,7 +73,17 @@ async function deferIfNotAcceptingWork(
 
 let worker: Worker<AgentJob> | null = null;
 
-export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void>): Worker<AgentJob> {
+/**
+ * Registra o consumidor da fila `agent`.
+ *
+ * O processor recebe o payload JÁ INTERPRETADO (`ParsedAgentJob`) além do job
+ * cru: assim a decisão "V1 ou V2" acontece UMA vez, aqui, e o entrypoint não
+ * precisa reimplementar a leitura — o que seria a forma mais provável de as
+ * duas divergirem durante a janela de rollout.
+ */
+export function startAgentWorker(
+  processor: (job: Job<AgentJob>, parsed: ParsedAgentJob) => Promise<void>,
+): Worker<AgentJob> {
   if (worker) return worker;
   worker = new Worker<AgentJob>(
     'agent',
@@ -84,18 +100,35 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       //      overstate retries during every deploy.
       await deferIfNotAcceptingWork(job, token, 'agent');
 
+      // Issue #504 — LEITURA DUAL do payload. Um job V1 armado por um processo
+      // antigo (deploy rolling) tem de processar normalmente; um payload que não
+      // casa com nenhuma das versões é RECUSADO, porque executar "o que der" é
+      // como um turno vira execução sem identidade.
+      const parsed = parseAgentJob(job.data);
+      if (!parsed) {
+        incCounter('maia_turn_job_payload_total', { version: 'invalid' });
+        logger.error({ job_id: job.id }, 'agent.job.unparseable_payload');
+        throw new Error(
+          `payload de job desconhecido (job_id=${job.id}): não casa com AgentTurnJobV2 nem com o formato legado`,
+        );
+      }
+      incCounter('maia_turn_job_payload_total', {
+        version: parsed.version === 2 ? 'v2' : 'v1',
+      });
+      const identity = parsed.version === 2 ? parsed.turn_id : parsed.mensagem_id;
+
       // Issue #514 §1 — restore the turn's root trace on the consumer side.
       // `attemptsMade` is 0 on the first pass, so `+1` yields a 1-based attempt
       // ordinal; a BullMQ retry of the SAME job keeps the trace id and bumps
       // the attempt, which is exactly the "recovery preserves root trace, new
-      // attempt id" contract. Falling back to `deriveTraceId(mensagem_id)`
+      // attempt id" contract. Falling back to `deriveTraceId(identity)`
       // makes jobs armed before this deploy correlate identically.
-      const trace_id = job.data.trace_id ?? deriveTraceId(job.data.mensagem_id);
+      const trace_id = job.data.trace_id ?? deriveTraceId(identity);
       const attempt = (job.attemptsMade ?? 0) + 1;
       await runWithCorrelation(
         {
           trace_id,
-          turn_id: job.data.mensagem_id,
+          turn_id: identity,
           attempt,
           origin: 'queue',
           received_at_ms: job.data.received_at_ms ?? null,
@@ -115,7 +148,12 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             phase: attempt === 1 ? 'first' : 'retry',
           });
           logger.debug(
-            { job_id: job.id, mensagem_id: job.data.mensagem_id, ...correlationLogFields() },
+            {
+              job_id: job.id,
+              job_version: parsed.version,
+              turn_identity: identity,
+              ...correlationLogFields(),
+            },
             'agent.job.start',
           );
           counter(METRIC.TURN_STARTED, { origin: attempt === 1 ? 'queue' : 'recovery' });
@@ -145,7 +183,7 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // the instrumentation off the files #503 is rewriting.
           const t0 = Date.now();
           try {
-            await runWithSystemContext(() => processor(job));
+            await runWithSystemContext(() => processor(job, parsed));
             recordTurnOutcome(job, 'completed', t0);
           } catch (err) {
             // A turn that throws with retries left is RETRYABLE, not failed —
@@ -270,7 +308,7 @@ export class QueueRedisUnavailableError extends Error {
  * @throws QueueRedisUnavailableError on a Redis OOM (oom=true).
  * @throws the underlying error for any non-OOM failure.
  */
-export async function enqueueAgent(data: AgentJob): Promise<void> {
+export async function enqueueAgent(data: AgentJobV1): Promise<void> {
   try {
     // Issue #514 §1 — stamp the correlation fields onto the payload. An
     // explicit `trace_id` from the caller always wins (the recovery sweep and
@@ -293,6 +331,89 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
     throw err;
   }
 }
+
+/**
+ * Arma (ou re-arma) o job V2 de um turno — issue #504.
+ *
+ * ## O que o `jobId` determinístico compra
+ *
+ * `turnJobId(turn_id)` é estável: o mesmo turno sempre mapeia para o mesmo id.
+ * BullMQ recusa `add` de um id que já existe, então dois recoveries
+ * concorrentes, um retry do ingresso e um replay manual convergem para UM job
+ * ativo. A não-duplicação vira estrutural em vez de depender de quem chega
+ * primeiro. E é só metade da garantia: o job é o DESPERTADOR, o claim atômico
+ * é quem decide o executor.
+ *
+ * ## Jobs RETIDOS em estado final
+ *
+ * `removeOnComplete`/`removeOnFail` mantêm jobs concluídos por horas ou dias.
+ * Enquanto a row existe no Redis, um `add` com o MESMO id é ignorado
+ * silenciosamente — e um turno legitimamente rearmado (retry vencido, takeover
+ * de lease, replay de dead letter) simplesmente nunca acordaria. É o cenário 4
+ * da issue.
+ *
+ * A saída é remover a row RETIDA antes de rearmar, e só ela: `getState()`
+ * distingue `completed`/`failed` (trabalho encerrado, a row é histórico) de
+ * `waiting`/`active`/`delayed` (trabalho VIVO, que não pode ser tocado —
+ * removê-lo seria cancelar um turno em andamento para "rearmá-lo"). Uma corrida
+ * em que o job muda de estado entre a leitura e o remove resolve-se sozinha: o
+ * `remove()` falha, e o `add` seguinte é ignorado porque o job vivo existe —
+ * exatamente o resultado desejado.
+ */
+export async function enqueueAgentTurn(data: {
+  turn_id: string;
+  trace_id?: string;
+  received_at_ms?: number;
+  /** Atraso do wake-up, em ms — usado pelo backoff persistido. */
+  delay_ms?: number;
+}): Promise<{ armed: boolean; reason?: 'already_active' }> {
+  const jobId = turnJobId(data.turn_id);
+  const payload: AgentTurnJobV2 = withCorrelation({
+    version: AGENT_TURN_JOB_VERSION,
+    turn_id: data.turn_id,
+    ...(data.trace_id !== undefined ? { trace_id: data.trace_id } : {}),
+    ...(data.received_at_ms !== undefined ? { received_at_ms: data.received_at_ms } : {}),
+  });
+
+  try {
+    const existing = await agentQueue.getJob(jobId).catch(() => null);
+    if (existing) {
+      const state = await existing.getState().catch(() => 'unknown');
+      if (state === 'completed' || state === 'failed') {
+        await existing.remove().catch(() => undefined);
+        incCounter('maia_turn_job_rearm_total', { retained_state: state });
+      } else {
+        // Trabalho VIVO com este id: o wake-up já existe. Rearmar seria
+        // duplicar — ou, pior, cancelar o job ativo.
+        incCounter('maia_turn_job_rearm_total', { retained_state: 'alive' });
+        return { armed: false, reason: 'already_active' };
+      }
+    }
+    await agentQueue.add('process-message', payload, {
+      jobId,
+      ...(data.delay_ms !== undefined && data.delay_ms > 0 ? { delay: data.delay_ms } : {}),
+      // Tentativas de TRANSPORTE. A tentativa CANÔNICA vive no PostgreSQL
+      // (`agent_turns.attempt_count`, incrementado pelo claim): o BullMQ pode
+      // reentregar, mas cada reentrega tem de vencer o claim de novo, então
+      // nunca há duas tentativas ativas.
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 2000 },
+      removeOnComplete: { age: 86_400 },
+      removeOnFail: { count: 1000, age: 7 * 24 * 3600 },
+    });
+    return { armed: true };
+  } catch (err) {
+    if (isRedisOomError(err)) {
+      recordRedisOomDegraded('enqueue_agent_turn', { mensagem_id: data.turn_id });
+      logger.warn({ turn_id: data.turn_id, redis_oom: true }, 'queue.enqueue_failed_oom_fail_closed');
+      throw new QueueRedisUnavailableError({ oom: true });
+    }
+    throw err;
+  }
+}
+
+/** Reexportado para que quem arma e quem inspeciona derivem o MESMO id. */
+export { turnJobId };
 
 // ─── §1.4 (spec roteamento v4) — replay de inbound NÃO-ROTEADO (strict) ────
 //

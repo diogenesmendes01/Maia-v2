@@ -46,6 +46,30 @@ nunca cria turno órfão. Falha de enqueue **não** vira `retryable`: não houve
 tentativa de execução, o turno fica em `received` para o sweep. Ver
 [`runtime.md`](runtime.md) e [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
+### Payload da fila: V1 e V2 (issue #504)
+
+`AgentJob` é uma **união discriminada** (`src/gateway/types.ts`):
+
+| Versão | Payload | Quem arma |
+|---|---|---|
+| V2 | `{ version: 2, turn_id }` | ingresso não-debounced e recovery, com `FEATURE_TURN_CLAIM=true` |
+| V1 (legado) | `{ mensagem_id }` | debouncer sempre; demais caminhos com a flag OFF |
+
+O consumidor lê as **duas** (`parseAgentJob`, fail-closed: payload que não casa
+com nenhuma versão não vira execução) e mede a migração em
+`maia_turn_job_payload_total{version}`. Critério de remoção do V1: zero
+incrementos de `version="v1"` por 7 dias com o produtor V2 em 100%
+(`LEGACY_JOB_REMOVAL_CRITERION`).
+
+O V2 carrega **só** a identidade durável: tenant, agent, conversa e mensagens são
+relidos do PostgreSQL depois do claim. Nenhuma informação de tenant vinda do
+payload é confiada — a row é a autoridade.
+
+`enqueueAgentTurn` usa `jobId` determinístico e **remove um job retido** em
+`completed`/`failed` antes de rearmar (um job vivo em `waiting`/`active`/`delayed`
+é preservado): sem isso, a retenção do BullMQ bloquearia para sempre o
+rearmamento legítimo de um turno com o mesmo id.
+
 ## How to extend
 
 | Need | Where |

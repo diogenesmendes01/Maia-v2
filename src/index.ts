@@ -30,7 +30,7 @@ import { logger } from '@/lib/logger.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
 import { startBaileys } from '@/gateway/baileys.js';
 import { startAgentWorker } from '@/gateway/queue.js';
-import { runAgentForMensagem } from '@/agent/core.js';
+import { runAgentForMensagem, runAgentForTurn } from '@/agent/core.js';
 import { startServer } from '@/server.js';
 import { audit } from '@/governance/audit.js';
 import { probeDb } from '@/db/client.js';
@@ -211,8 +211,17 @@ async function main() {
     const ownsWorker = roleOwns(role, 'agent_worker');
     if (ownsWorker) {
       lifecycle.setComponent('agent_worker', 'starting');
-      startAgentWorker(async (job) => {
-        await runAgentForMensagem(job.data.mensagem_id);
+      // Issue #504 — o consumidor entende as DUAS versões do payload. `parsed`
+      // vem já interpretado de `startAgentWorker`, então a decisão "V1 ou V2"
+      // existe em um lugar só. V2 entra por `runAgentForTurn` (identidade
+      // durável, tenant relido da row); V1 mantém o caminho histórico enquanto
+      // houver produtor antigo no ar.
+      startAgentWorker(async (_job, parsed) => {
+        if (parsed.version === 2) {
+          await runAgentForTurn(parsed.turn_id);
+          return;
+        }
+        await runAgentForMensagem(parsed.mensagem_id);
       });
       // Spec roteamento v4 §1.4 — worker de replay do staging (job só carrega o
       // id; o payload cifrado vive no Postgres). Ativo em qualquer modo: rows só

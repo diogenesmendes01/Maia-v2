@@ -433,6 +433,19 @@ export async function scheduleDebouncedAgent(params: {
       });
     }
 
+    // Issue #504 — o caminho debounced continua armando payload V1, de
+    // propósito. O `jobId` daqui é a CHAVE DE DEBOUNCE (tenant:agent:phone),
+    // não a identidade do turno: ele precisa ser removível e re-armável a cada
+    // tecla do usuário, o que é o oposto do jobId estável por turno. Além
+    // disso, o turno executor de uma rajada só é decidido no fim da janela
+    // (#505), então não há `turn_id` a carregar aqui.
+    //
+    // Isso NÃO deixa o caminho debounced sem exclusão mútua: o claim atômico
+    // acontece em `runAgentForMensagemInner`, depois da resolução de canal e
+    // independentemente da versão do payload. O que o V1 não tem é a segunda
+    // camada (um job por turno) — e aqui ela seria contraditória com o
+    // debounce.
+    //
     // Issue #514 §1 — the debounced path arms the job through the same
     // correlation stamper as `enqueueAgent`, so a debounced turn and a direct
     // turn are indistinguishable to the consumer's trace restoration.

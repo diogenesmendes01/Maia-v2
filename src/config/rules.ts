@@ -230,6 +230,50 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #504 — lease do turno. A relação TTL × heartbeat é de SEGURANÇA, não
+  // de tuning: com heartbeat acima de TTL/3, um único tick perdido (GC longo,
+  // blip de rede) abre janela de takeover enquanto o dono segue trabalhando —
+  // duas réplicas no mesmo turno, com a segunda vencendo. Boot falha fechado.
+  //
+  // A mesma regra vive em `checkLeaseConfig` (src/runtime/turns/claim.ts), que
+  // é o contrato puro consumido pelo runtime. Duplicação deliberada e barata:
+  // aqui ela roda no boot e em `maia config check`; lá, em teste unitário sem
+  // env. Uma divergência entre as duas é impossível de passar despercebida
+  // porque ambas são exercidas pela suíte.
+  const leaseTtl = num(c.TURN_LEASE_TTL_MS);
+  const leaseHb = num(c.TURN_LEASE_HEARTBEAT_MS);
+  if (leaseTtl !== undefined && leaseHb !== undefined && leaseHb > leaseTtl / 3) {
+    push({
+      scope: 'boot',
+      severity: 'error',
+      variable: 'TURN_LEASE_HEARTBEAT_MS',
+      rule: 'turns/lease-heartbeat-ratio',
+      message:
+        `TURN_LEASE_HEARTBEAT_MS=${leaseHb} excede um terço de TURN_LEASE_TTL_MS=${leaseTtl} ` +
+        `(máximo ${Math.floor(leaseTtl / 3)}): um tick de heartbeat perdido abriria janela de ` +
+        `takeover com o dono do turno ainda vivo`,
+      remediation:
+        'Reduza TURN_LEASE_HEARTBEAT_MS para no máximo TURN_LEASE_TTL_MS/3, ou aumente o TTL.',
+    });
+  }
+  // A flag de claim sem a máquina de estados é inerte por construção (não há
+  // row para reivindicar), e uma flag inerte que o operador acredita ligada é
+  // pior que uma desligada: o painel mostra "claim ON" e nenhuma exclusão mútua
+  // existe.
+  if (bool(c.FEATURE_TURN_CLAIM) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'boot',
+      severity: 'error',
+      variable: 'FEATURE_TURN_CLAIM',
+      rule: 'turns/claim-requires-state-machine',
+      message:
+        'FEATURE_TURN_CLAIM=true exige FEATURE_TURN_STATE_MACHINE=true — sem a máquina de estados ' +
+        'não existe turno durável para reivindicar, e o claim seria silenciosamente inerte',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (e aplique as migrations 096/097/108) antes de ligar o claim.',
+    });
+  }
+
   // P10b/P11 — runtime trace é always-on; em produção o segredo mestre é
   // obrigatório (sem ele os HMACs de auditoria seriam forjáveis).
   if (c.NODE_ENV === 'production' && !str(c.RUNTIME_TRACE_HMAC_MASTER_SECRET)) {

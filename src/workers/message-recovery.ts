@@ -1,11 +1,12 @@
 import { mensagensRepo, agentTurnsRepo } from '@/db/repositories.js';
-import { enqueueAgent, QueueRedisUnavailableError } from '@/gateway/queue.js';
+import { enqueueAgent, enqueueAgentTurn, QueueRedisUnavailableError } from '@/gateway/queue.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   noteTurnQueued,
   reportLegacyProjectionDivergence,
+  turnClaimEnabled,
   turnStateAuthoritative,
   turnStateMachineEnabled,
 } from '@/runtime/turns/index.js';
@@ -161,17 +162,46 @@ export async function runMessageRecovery(): Promise<void> {
  *   - terminais (`completed`/`ignored`/`superseded`/`dead_letter`) são
  *     invisíveis por construção.
  *
- * O job continua carregando só `mensagem_id` (a representativa do turno): o
- * worker do agente reencontra o turno por `findTurnByMessage`. jobId
- * determinístico — e portanto a garantia de não duplicar execução — é #504.
+ * ── Rearmamento (#504) ─────────────────────────────────────────────────────
+ *
+ * COM claim (`FEATURE_TURN_CLAIM=true`): o job é V2, com `jobId` DETERMINÍSTICO
+ * derivado do `turn_id`. Duas instâncias do recovery rodando ao mesmo tempo —
+ * cenário normal em multi-réplica — produzem no máximo UM job ativo, porque o
+ * BullMQ recusa o segundo `add` com o mesmo id. E mesmo que dois wake-ups
+ * escapassem, só um worker venceria o claim atômico: a não-duplicação tem duas
+ * camadas independentes, e nenhuma delas depende de ordem de chegada.
+ *
+ * Um job retido em `completed`/`failed` é removido antes do re-add
+ * (`enqueueAgentTurn`), fechando o cenário 4 da issue — um turno legítimo
+ * bloqueado para sempre pela retenção de um job antigo com o mesmo id.
+ *
+ * SEM claim: o job continua V1, carregando `mensagem_id`, sem jobId estável —
+ * comportamento de #503 preservado byte a byte para o rollback.
+ *
+ * O recovery NÃO transiciona `claimed`/`running` com lease vencida: quem faz
+ * isso é o próprio claim, atomicamente, no worker que vencer. Rebaixar o estado
+ * aqui seria mentir sobre o que já executou e, pior, abrir uma janela em que o
+ * turno não é nem possuído nem elegível.
  */
 async function runTurnRecoveryInner(): Promise<void> {
   const candidates = await agentTurnsRepo.findRecoverableTurns(STUCK_AFTER_MS, MAX_PER_RUN);
   if (candidates.length === 0) return;
+  const claimMode = turnClaimEnabled();
   let requeued = 0;
   for (const { turn, reason } of candidates) {
     incCounter('maia_turn_recovery_candidates_total', { reason });
     try {
+      if (claimMode) {
+        const armed = await enqueueAgentTurn({
+          turn_id: turn.id,
+          ...(turn.created_at ? { received_at_ms: turn.created_at.getTime() } : {}),
+        });
+        incCounter('maia_turn_recovery_total', {
+          result: armed.armed ? 'rearmed' : 'already_active',
+        });
+        if (armed.armed) requeued++;
+        continue;
+      }
       await enqueueAgent({ mensagem_id: turn.representative_message_id });
       // Só `received` e `retryable` têm aresta para `queued`. Um turno já em
       // `queued` (job perdido) ou em `claimed`/`running` com lease vencida é

@@ -68,6 +68,8 @@ export type ConfigGroup =
   | 'procedures'
   | 'performance'
   | 'lifecycle'
+  /** Posse distribuída do turno inbound: claim atômico, lease e fencing (#504). */
+  | 'turns'
   | 'setup'
   | 'admin-ui';
 
@@ -93,6 +95,7 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
   { group: 'procedures', title: 'Procedures / reaper' },
   { group: 'performance', title: 'Performance / caches' },
   { group: 'lifecycle', title: 'Lifecycle do processo (readiness e shutdown)' },
+  { group: 'turns', title: 'Turnos (claim atômico, lease e fencing)' },
   { group: 'setup', title: 'Bootstrap / setup' },
   { group: 'admin-ui', title: 'Admin UI (container Next.js separado)' },
 ];

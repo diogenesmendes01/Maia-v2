@@ -73,6 +73,29 @@ export function registerShutdownSequence(): void {
     },
   });
 
+  // 3b. leases de turno (issue #504). Roda LOGO DEPOIS do BullMQ, e a ordem é
+  //     o contrato: `worker.close()` já esperou o job ativo terminar, e uma
+  //     tentativa que termina devolve a posse no MESMO UPDATE do estado
+  //     terminal. No caminho normal, portanto, isto é um no-op.
+  //
+  //     O que ele cobre é o caminho ANORMAL: uma tentativa que estourou o
+  //     deadline do drain e ficou com o timer de heartbeat e a posse
+  //     pendurados. Duas consequências, ambas já pagas nesta rodada por outros
+  //     subscribers: um `setInterval` vivo mantém o event loop acordado e faz
+  //     todo deploy limpo reportar shutdown forçado (por isso o timer também é
+  //     `unref`), e uma lease não devolvida obriga a próxima réplica a esperar
+  //     um TTL inteiro antes de retomar o turno.
+  //
+  //     Antes de `pools`, obviamente: devolver a posse é uma escrita.
+  lifecycle.registerShutdownStep({
+    name: 'turn_leases',
+    critical: false,
+    run: async () => {
+      const { drainTurnLeases } = await import('@/runtime/turns/lease.js');
+      await drainTurnLeases();
+    },
+  });
+
   // 4. tracked fire-and-forget work (post-turn reflection, line registration,
   //    reconnect timers). AFTER the queue and the crons, because those are
   //    what SPAWN these tasks — draining them earlier would just race.

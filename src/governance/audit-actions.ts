@@ -140,6 +140,19 @@ export const AUDIT_ACTIONS = [
   'turn_replayed',
   'turn_completed_without_reply',
   'turn_state_inconsistency_detected',
+  // Issue #504 — posse distribuída do turno. Auditamos AQUISIÇÃO e REJEIÇÃO POR
+  // FENCING; a RENOVAÇÃO fica deliberadamente de fora, porque é o evento mais
+  // frequente do runtime (um por turno em voo a cada 15s) e inundá-la enterraria
+  // os dois eventos que realmente contam numa investigação. O sinal de renovação
+  // vive em `maia_turn_lease_heartbeat_total`, e a PERDA aparece tanto em
+  // `maia_turn_lease_lost_total` quanto na rejeição por fencing que ela produz.
+  //
+  // `turn_claimed` responde "quem estava executando este turno, e em que
+  // tentativa" — a primeira pergunta de qualquer incidente de execução dupla.
+  // `turn_fence_rejected` é a EVIDÊNCIA de que a defesa funcionou: um worker
+  // zumbi tentou gravar e o banco recusou.
+  'turn_claimed',
+  'turn_fence_rejected',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

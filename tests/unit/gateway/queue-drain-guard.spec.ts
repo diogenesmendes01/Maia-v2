@@ -81,7 +81,9 @@ import {
 function fakeJob() {
   return {
     id: 'job-1',
-    data: { mensagem_id: 'm-1', unrouted_id: 'u-1' },
+    // Issue #504: `parseAgentJob` é fail-closed, então a identidade do payload
+    // precisa ser um UUID — como sempre foi em produção (`mensagens.id`).
+    data: { mensagem_id: '11112222-3333-4444-5555-666677778888', unrouted_id: 'u-1' },
     moveToDelayed: vi.fn(async () => undefined),
   };
 }

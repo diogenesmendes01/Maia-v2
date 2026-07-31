@@ -59,7 +59,10 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 
 | File | Role |
 |---|---|
-| `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
+| `contract.ts` | Vocabulário PURO de ESTADO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
+| `claim.ts` | Vocabulário PURO de POSSE (#504): payload da fila V1/V2, `jobId` determinístico, elegibilidade do claim, validação TTL × heartbeat, `TurnExecutionContext`, erros de fencing. |
+| `execution-context.ts` | O ALS que carrega o fence pelo pipeline (#504). |
+| `lease.ts` | Detentor da lease (#504): aquisição, heartbeat, cancelamento por perda, drain do shutdown. |
 | `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
 | `index.ts` | Superfície pública — importe daqui. |
 
@@ -88,15 +91,46 @@ contrato, nunca o `.env.example`):
 |---|---|---|
 | `FEATURE_TURN_STATE_MACHINE` | `true` | Dual-write: cria/transiciona turnos. Só ESCRITA — o comportamento observável não muda. **Exige as migrations 096/097 aplicadas.** |
 | `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | Flip da LEITURA: o recovery elege por `agent_turns.status` em vez de `processada_em`. |
+| `FEATURE_TURN_CLAIM` | `false` | Claim atômico, lease, fencing e job V2 (#504). **Exige a migration 108** e `FEATURE_TURN_STATE_MACHINE=true`. |
 
 A combinação `AUTHORITATIVE=true` + `MACHINE=false` é inerte e por isso o boot a
 **recusa** (regra `turn-state/authoritative-requires-dual-write` em
-[`src/config/rules.ts`](../../../src/config/rules.ts)).
+[`src/config/rules.ts`](../../../src/config/rules.ts)). Pelo mesmo motivo,
+`FEATURE_TURN_CLAIM=true` + `MACHINE=false` também é recusado
+(`turns/claim-requires-state-machine`).
 
 Enquanto a segunda flag estiver OFF, `mensagens.processada_em` continua sendo a
 decisão de negócio e a máquina roda em **shadow**; a divergência é medida por
 `maia_turn_legacy_projection_mismatch_total`. Runbook:
 [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
+
+#### Posse distribuída (`FEATURE_TURN_CLAIM`, issue #504)
+
+Com a flag ligada, **o PostgreSQL decide quem executa**. Três mecanismos
+independentes, cada um fechando um buraco distinto:
+
+| Mecanismo | Fecha | Onde |
+|---|---|---|
+| `jobId = turn-<sha256(turn_id)[0..40]>` | dois wake-ups para o mesmo turno | `turnJobId` / `enqueueAgentTurn` |
+| claim atômico (um `UPDATE ... RETURNING`) | duas réplicas começando o mesmo turno | `agentTurnsRepo.tryClaimTurn` |
+| `claim_token` no `WHERE` de toda escrita | worker lento gravando após perder a posse | `expected_claim_token` nas transições |
+
+O claim incrementa `attempt_count` (a tentativa **canônica** — `job.attemptsMade`
+é só transporte), grava o trio `claimed_by`/`claim_token`/`lease_expires_at` e
+transiciona para `claimed`, tudo num statement. A lease é renovada a cada
+`TURN_LEASE_HEARTBEAT_MS` (no máximo TTL/3, validado no boot); perder a renovação
+aborta a tentativa via `AbortSignal` e qualquer gravação posterior é recusada com
+`conflict: 'stale_claim'`, auditada como `turn_fence_rejected`.
+
+Transições terminais e `retryable` **devolvem a posse no mesmo UPDATE** do
+estado — separar as duas escritas abriria a janela em que o turno já acabou mas
+ainda parece possuído. Runbook:
+[`docs/runbooks/turn-claim-lease.md`](../../runbooks/turn-claim-lease.md).
+
+O claim acontece em `runAgentForMensagemInner`, **depois** da resolução de canal
+e independentemente da versão do payload — de modo que o caminho debounced (que
+continua armando V1, porque seu `jobId` é a chave de debounce) também tem
+exclusão mútua.
 
 ### Feature flags (`src/runtime/feature-flags/`)
 
