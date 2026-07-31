@@ -188,9 +188,20 @@ EOF
 chmod 600 .env.infra
 
 # 3. Suba (sem as vars acima o compose ABORTA — não há fallback maia/maia)
+#    O serviço `migrate` roda PRIMEIRO, uma vez, e app/admin-ui só sobem
+#    depois que ele sai com sucesso (issue #516). Nenhuma réplica inicia
+#    sobre schema desatualizado, e só UM migrator aplica por banco.
 docker compose --env-file .env.infra -f compose.prod.yml up -d
+docker compose --env-file .env.infra -f compose.prod.yml logs migrate
 docker compose --env-file .env.infra -f compose.prod.yml logs -f app
 ```
+
+Se o job `migrate` falhar, o deploy PARA aí — `app` e `admin-ui` não sobem.
+Isso é intencional: o schema não é o que esta build precisa. Diagnostique com
+`docker compose ... run --rm migrate node dist/cli/maia.js migrate status` (é
+read-only) e siga [`docs/runbooks/migrations.md`](docs/runbooks/migrations.md)
+§"Recovery". **Nunca** rode um `_down.sql` para "destravar" — down migrations
+são manuais e destrutivas, e o runner nunca as executa sozinho.
 
 Postgres/Redis **não publicam porta no host** (rede interna `data`); app
 (`:3000`) e admin-ui (`:4000`) só são alcançáveis pelo reverse proxy conectado

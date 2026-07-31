@@ -91,7 +91,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | 3 | **Backend decides, LLM proposes** | LLM emits typed intents (Zod). Backend validates against state + rules. Backend executes (or denies). See [`concerns/action-layer.md`](docs/architecture/concerns/action-layer.md). |
 | 4 | **Audit every decision** | Side-effect or governance decision → `audit()` row in `audit_logs` with action label and tenant context. |
 | 5 | **Confidence is computed (self-model) / gated (routing)** | **Self-model & governance confidence** comes from deterministic formulas over evidence counts — the LLM never declares it. **Decision-engine *routing* confidence** (intent / pending-gate / procedure-selector) MAY be LLM-proposed, but a backend threshold always decides ("LLM proposes, backend decides"). Canonical: [`docs/ai/maia-invariants-checklist.md` § Deterministic Confidence](docs/ai/maia-invariants-checklist.md#deterministic-confidence). See `src/agent/pending-gate.ts:150` (`resolution.confidence >= CONFIDENCE_THRESHOLD`), `src/cognition/procedure-selector.ts:91` (`top.confidence < threshold`), `src/runtime/decision/intent-classifier.ts:126` (`confidence: haiku.confidence`). |
-| 6 | **Migrations are append-only** | New migration file with `_up` + `_down`. Never edit a merged migration. |
+| 6 | **Migrations are append-only** | New migration file with `_up` + `_down`. Never edit a merged migration — since #516 the runner ENFORCES it: an edited merged file fails `migrate up` and `/readyz` with `checksum_mismatch`, and a forward file without its `_down` sibling fails `npm run migrate:check` in CI. |
 | 7 | **Branch before commit** | `git checkout -b claude/<short-purpose>` off `main`. Never commit to `main` directly. |
 | 8 | **No `'default'` literal in dynamic paths** | Schema seeds `tenant_id='default'`/`agent_id='default'` for single-tenant runtime, but production code rejects the literal when it appears in resolver/context-builder paths. |
 
@@ -136,8 +136,13 @@ npm run config:init -- --profile development
 # Build
 npm run build                     # tsc + tsc-alias
 
-# DB
-npm run db:migrate                # apply migrations in order
+# DB / migrations (runner: src/migrations/, CLI: src/cli/maia.ts — issue #516)
+npm run migrate:check             # OFFLINE artifact check (no DB): _down siblings + prefixes
+npm run migrate:plan              # READ-ONLY: what would be applied + drift
+npm run migrate:status            # READ-ONLY: full ledger
+npm run migrate:up                # apply (advisory-locked). Alias: npm run db:migrate
+npm run migrate:repair -- --id … --resolution … --actor … --reason … --yes
+npm run migrate:reserve "purpose" # reserve the next prefix BEFORE writing SQL
 npm run db:seed                   # seed dev data
 
 # Bootstrap

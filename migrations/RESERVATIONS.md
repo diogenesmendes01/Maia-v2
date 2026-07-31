@@ -206,3 +206,5 @@ NEW shared prefixes — pick `max(existing)+1`.
 103 | 103_channel_line_state.sql | estado operacional das linhas whatsapp + fila duravel de comandos admin->runtime, material de pareamento cifrado (issue 518)
 100 | 100_trace_explorer_indexes.sql | trace explorer: indices de keyset pagination e filtros (outcome, side effect) em runtime_trace_envelopes/bodies (issue 514)
 107 | 107_runtime_trace_attempt_grouping.sql | trace explorer: root_trace_id + attempt em runtime_trace_envelopes para agrupar tentativas do mesmo turno (issue 514, review rodada 2) — autorada como 101 e renumerada antes do merge: 101/102 sao da issue 520 (PR 533) e 104-106 estao reservados por outras branches em voo
+110 | 110_schema_migrations_v2.sql | issue 516: ledger v2 do runner de migrations — checksum canonico, status running/applied/dirty/failed, duracao, app/runner version e error_class (compativel com o runner anterior)
+111 | 111_schema_migration_events.sql | issue 516: trilha append-only de fatos excepcionais do runner (lock wait, blocked, dirty, checksum mismatch, backfill, repair) — evidencia primaria porque migrations rodam antes de audit_logs existir

@@ -311,6 +311,11 @@ export const MAIA_KEY_PREFIXES: readonly string[] = [
   // Heroku) injetam REDIS_* próprios, e rejeitá-los quebraria o boot.
   'SHUTDOWN_',
   'READINESS_',
+  // Issue #516 — runner de migrations. Namespace exclusivamente da Maia
+  // (nenhum provedor injeta MIGRATION_*), então um typo em
+  // MIGRATION_LOCK_TIMEOUT_MS é detectado em vez de virar knob silencioso que
+  // deixa o migrator com o timeout default numa janela de deploy apertada.
+  'MIGRATION_',
 ] as const;
 // Deliberately NOT listed, because these namespaces belong to somebody else and
 // an unknown key in them is NOT a Maia misconfiguration:

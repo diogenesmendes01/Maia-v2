@@ -4,6 +4,36 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Runner de migrations serializado, com checksum, dirty state e readiness de schema ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
+
+**Impacto para operadores.** O deploy passa a rodar um **job one-shot `migrate`** antes de `app`/`admin-ui` (ambos os composes). Se ele falhar, o deploy PARA — nenhuma réplica sobe sobre schema desatualizado. Diagnóstico read-only: `npm run migrate:status`. Runbook: [`docs/runbooks/migrations.md`](docs/runbooks/migrations.md).
+
+| Garantia | Antes | Agora |
+|---|---|---|
+| Dois migrators concorrentes | corriam juntos | advisory lock global `(0x4D414941 "MAIA", 1)` em client dedicado; o segundo espera ou sai limpo (exit 3) |
+| Migration mergeada editada | ignorada em silêncio | checksum sha256 canônico no ledger; divergência bloqueia `migrate up` **e** `/readyz` |
+| Falha em migration `no-transaction` | retentada no boot seguinte como se nada tivesse acontecido | estado `dirty`, migrations seguintes não são tentadas, `repair` auditável exigido |
+| Falha em migration transacional | `process.exit(1)` dentro do loop | rollback + linha `failed`, pool fechado em `finally` |
+| Migration faltando no MEIO da cadeia | `/readyz` dizia ok (comparava só a head) | `/readyz` recusa: a avaliação percorre o ledger inteiro |
+| Rollback de código (banco à frente) | ok | ok por padrão; `MIGRATION_MAX_SUPPORTED` permite bloquear a versão antiga quando o schema novo é destrutivo |
+
+Novos comandos (`plan`, `status`, `check` e `manifest` são **read-only**):
+
+```
+npm run migrate:check      # offline, sem banco — usado no CI
+npm run migrate:manifest   # manifesto de schema do release
+npm run migrate:plan       # o que SERIA aplicado + drift
+npm run migrate:status     # ledger completo
+npm run migrate:up         # aplica (= npm run db:migrate)
+npm run migrate:repair     # excepcional: exige --actor, --reason e --yes
+```
+
+Novas variáveis (todas opcionais, todas documentadas em [`docs/configuration.md`](docs/configuration.md)): `MIGRATION_LOCK_TIMEOUT_MS`, `MIGRATION_STATEMENT_TIMEOUT_MS`, `MIGRATION_MIN_SUPPORTED`, `MIGRATION_MAX_SUPPORTED`, `MIGRATION_ON_BOOT`.
+
+Migrations `110_schema_migrations_v2.sql` (ledger v2) e `111_schema_migration_events.sql` (trilha append-only de repairs). O ledger v2 continua **legível e escrevível pelo runner anterior** — só o `NOT NULL` de `applied_at` cai, porque uma linha `running` ainda não foi aplicada.
+
+**O que NÃO mudou:** nenhuma migration histórica foi renomeada ou editada; down migrations continuam manuais e nunca são executadas automaticamente; a readiness continua validando e **nunca** aplicando.
+
 ### ⚠️ BREAKING (operacional) — o boot passa a falhar fechado por configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
 
 > **Um ambiente que sobe hoje pode parar de subir no primeiro release que contiver esta mudança.** Rode `npm run config:check -- --profile production --env-file .env` contra o `.env` de cada ambiente **antes** de deployar. Runbook completo: [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md).

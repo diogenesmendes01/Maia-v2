@@ -18,10 +18,26 @@
 | `src/db/tenant-guard.ts` | `applyTenantGuard()` — query-builder helper that injects scoping predicates |
 | `src/db/capability-risk.ts` | Capability risk scoring helper |
 
+## Migration runner (issue #516)
+
+The runner is **not** in `src/db/`. It lives in [`src/migrations/`](../../../src/migrations/) and is deliberately independent of `@/config/env.ts` and `@/db/client.ts`, so a migration container is configured from the `migrator` service subset (Postgres only) instead of the whole runtime configuration.
+
+| File | Role |
+|---|---|
+| `src/migrations/discover.ts` | forward-file discovery, markers, canonical checksums |
+| `src/migrations/compatibility.ts` | PURE artifact-vs-ledger evaluation — the contract `/readyz`, `maia migrate status` and `maia doctor` (#517) all read |
+| `src/migrations/ledger.ts` | ledger v2 (`schema_migrations`) + `schema_migration_events` |
+| `src/migrations/lock.ts` | global advisory lock, namespace `(0x4D414941 "MAIA", 1)` |
+| `src/migrations/runner.ts` | `planMigrations` / `migrateUp` / `repairMigration` |
+| `src/cli/maia.ts` | `maia migrate check\|manifest\|plan\|status\|up\|repair` |
+
+`src/runtime/lifecycle/schema-version.ts` consumes `evaluateCompatibility` for the `/readyz` schema gate; it validates and NEVER applies. Runbook: [`docs/runbooks/migrations.md`](../../runbooks/migrations.md).
+
 ## Patterns it follows
 
 - [Tenant isolation](../concerns/tenant-isolation.md) — `runWithTenantContext` + `applyTenantGuard` are the canonical scoping mechanism
-- Migrations are append-only: new `<n>_<name>.sql` files in `migrations/`; never edit a merged file
+- Migrations are append-only: new `<n>_<name>.sql` files in `migrations/`; never edit a merged file. Since #516 the runner ENFORCES this — an edited merged migration fails `migrate up` and `/readyz` with `checksum_mismatch`
+- `schema_migrations` and `schema_migration_events` carry no tenant-scoped rows: they are global infrastructure, not tenant state
 
 ## How to extend
 
@@ -50,6 +66,8 @@ The repositories are the only sanctioned interface. Raw `client.query()` is rese
 | `tests/integration/repos-leak.spec.ts` | Repository-level leak |
 | `tests/unit/db/` | Schema + repo unit tests |
 | `tests/integration/db/` | Live Postgres repo tests |
+| `tests/unit/migrations/` | Discovery, checksum determinism, compatibility, CLI (no database) |
+| `tests/integration/migration-runner-real-db.spec.ts` | Advisory lock, dirty state, transactional atomicity, v1→v2 ledger, repair — the only evidence for those, since they are server semantics |
 
 ## In-flight changes
 

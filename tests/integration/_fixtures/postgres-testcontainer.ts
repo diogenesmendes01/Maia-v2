@@ -16,11 +16,13 @@
  * `isDockerLikelyAvailable()` if they want to keep the test lane green on a
  * Docker-less runner.
  *
- * Migration runner: re-uses the SAME chain as `scripts/migrate.ts` (forward
- * `.sql` files in /migrations, applied in lexical order, each in its own
- * transaction unless `-- maia:no-transaction` opts out). This guarantees the
- * test schema is bit-identical to production. We do NOT reimplement schema
- * creation here.
+ * Migration runner: since issue #516 this fixture calls the SHARED runner
+ * (`src/migrations/runner.ts`) — the very code `npm run db:migrate` and the
+ * one-shot deploy job run. It used to carry a hand-copied duplicate of the
+ * apply loop "kept in sync" with the script by convention, which is exactly
+ * the drift this issue removes: every real-DB spec in the suite now exercises
+ * the production runner, so a runner bug fails the tests instead of hiding
+ * behind a divergent test-only implementation.
  *
  * Why we set `DATABASE_URL` before importing `@/db/client.js`: production
  * `db` is constructed at module load from `config.DATABASE_URL` (pg.Pool
@@ -28,11 +30,12 @@
  * `db` at the testcontainer must mutate `process.env.DATABASE_URL` and then
  * dynamic-import the modules they exercise — never the other way around.
  */
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
+import { migrateUp } from '@/migrations/runner.js';
+import { silentMigrationLogger } from '@/migrations/log.js';
 
 /**
  * Same image production uses (docker-compose.yml). pgvector is required by
@@ -40,43 +43,6 @@ import pg from 'pg';
  * image would fail that step.
  */
 const POSTGRES_IMAGE = 'pgvector/pgvector:pg16';
-
-/**
- * Marker copied verbatim from `scripts/migrate.ts`. Migrations that need to
- * run outside a transaction (e.g. `CREATE INDEX CONCURRENTLY`, which Postgres
- * rejects inside BEGIN/COMMIT) opt-in by putting this on its own line at the
- * top of the file. Keeping the marker spelling identical to the prod runner
- * means a future change to the runner stays single-sourced — only the regex
- * here needs to be updated.
- */
-const NO_TX_MARKER = /^[ \t]*--[ \t]*maia:no-transaction\b/m;
-
-/**
- * Split a no-transaction migration into individual statements. Copied
- * verbatim (in behaviour) from `scripts/migrate.ts` so the test schema is
- * built bit-identically to production.
- *
- * Required because node-postgres' simple-query protocol wraps MULTIPLE
- * statements sent in one `client.query()` call in an implicit
- * transaction. A no-tx file with more than one `CREATE INDEX
- * CONCURRENTLY` (e.g. migration 066) therefore still trips
- * "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
- * unless each statement is executed on its own. We strip `--` line
- * comments and split on `;`.
- *
- * Constraint (same as the prod runner): no-tx migrations may ONLY contain
- * simple `;`-terminated statements (CONCURRENTLY index DDL) — no
- * dollar-quoted bodies or `;`-bearing string literals.
- */
-function splitNoTxStatements(sql: string): string[] {
-  return sql
-    .split('\n')
-    .map((line) => line.replace(/--.*$/, ''))
-    .join('\n')
-    .split(';')
-    .map((stmt) => stmt.trim())
-    .filter((stmt) => stmt.length > 0);
-}
 
 export interface StartedPostgres {
   /** Started testcontainer handle; pass to `stopPostgresContainer` to tear down. */
@@ -112,61 +78,35 @@ async function findMigrationsDir(): Promise<string> {
 }
 
 /**
- * Apply forward migrations against the connected pool. Mirrors the loop in
- * scripts/migrate.ts:
- *   - sort .sql files lexically, skip *_down.sql
- *   - wrap in BEGIN/COMMIT unless `-- maia:no-transaction` marker is present
- *   - for no-tx files, send each statement separately (node-postgres wraps
- *     a multi-statement query in an implicit transaction, which
- *     CONCURRENTLY rejects — see splitNoTxStatements)
- *   - record each applied migration in `schema_migrations`
- * Returns the number of migrations applied.
+ * Apply the forward chain with the PRODUCTION runner (issue #516).
+ *
+ * Silent logger: a green suite must not emit ~120 JSON lines per container.
+ * A failure is turned into a thrown Error with the migration id and the error
+ * CLASS — the runner never surfaces a raw driver message (it could carry the
+ * DSN), so neither does this.
  */
 async function applyMigrations(pool: pg.Pool): Promise<number> {
-  const dir = await findMigrationsDir();
-  const files = (await readdir(dir))
-    .filter((f) => f.endsWith('.sql') && !f.endsWith('_down.sql'))
-    .sort();
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      id TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-
-  let applied = 0;
-  for (const file of files) {
-    const sql = await readFile(join(dir, file), 'utf8');
-    const useTx = !NO_TX_MARKER.test(sql);
-    const client = await pool.connect();
-    try {
-      if (useTx) {
-        await client.query('BEGIN');
-        await client.query(sql);
-        await client.query('INSERT INTO schema_migrations (id) VALUES ($1)', [file]);
-        await client.query('COMMIT');
-      } else {
-        // Execute each statement separately — node-postgres wraps a
-        // multi-statement query() in an implicit transaction, which
-        // CONCURRENTLY rejects. See splitNoTxStatements above.
-        for (const stmt of splitNoTxStatements(sql)) {
-          await client.query(stmt);
-        }
-        await client.query(
-          'INSERT INTO schema_migrations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
-          [file],
-        );
-      }
-      applied++;
-    } catch (err) {
-      if (useTx) await client.query('ROLLBACK').catch(() => undefined);
-      throw new Error(`migration ${file} failed: ${(err as Error).message}`, { cause: err });
-    } finally {
-      client.release();
-    }
+  const result = await migrateUp({
+    pool,
+    migrationsDir: await findMigrationsDir(),
+    logger: silentMigrationLogger,
+  });
+  switch (result.outcome) {
+    case 'applied':
+    case 'noop':
+      return result.applied.length;
+    case 'failed':
+      throw new Error(
+        `migration ${result.failed_id} failed (${result.error_class})` +
+          `${result.dirty ? ' and left DIRTY state' : ''}`,
+      );
+    case 'blocked':
+      throw new Error(
+        `migration runner refused to start: ${result.problems.map((p) => `${p.code} (${p.id ?? '-'})`).join(', ')}`,
+      );
+    case 'lock_timeout':
+      throw new Error('migration runner could not take the advisory lock in a fresh container');
   }
-  return applied;
 }
 
 /**

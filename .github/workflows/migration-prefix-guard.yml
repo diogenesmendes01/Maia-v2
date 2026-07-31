@@ -18,6 +18,8 @@ on:
       - 'migrations/**'
       - 'scripts/check-migration-reservations.ts'
       - 'scripts/migrate-reserve.ts'
+      - 'src/migrations/**'
+      - 'src/cli/maia.ts'
       - '.github/workflows/migration-prefix-guard.yml'
 
 # Cancel superseded runs on the same PR branch.
@@ -48,3 +50,10 @@ jobs:
 
       - name: Check migration reservation ledger
         run: npm run migrate:reservations:check
+
+      - name: Check the migration artifact (issue #516)
+        # OFFLINE — no DATABASE_URL. Fails when a forward migration ships
+        # without its `_down.sql` sibling or with a non-conforming prefix, so
+        # the "every forward has a down" invariant (AGENTS.md §4.6) is caught
+        # in review instead of by the deploy job refusing to run.
+        run: npm run migrate:check

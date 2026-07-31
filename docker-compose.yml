@@ -81,6 +81,35 @@ services:
       timeout: 5s
       retries: 10
 
+  # Job one-shot de migrations (issue #516). Roda UMA vez por release, com a
+  # MESMA imagem da aplicação — mesmo artefato de `migrations/`, mesmo runner,
+  # mesmos checksums. `app` e `admin-ui` só sobem depois que ele SAI COM
+  # SUCESSO (`service_completed_successfully`), então nenhuma réplica jamais
+  # inicia sobre banco vazio ou desatualizado, e nenhuma réplica disputa a
+  # aplicação das migrations (o advisory lock global garante um migrator só).
+  #
+  # `restart: "no"` é obrigatório: um job one-shot que reinicia sozinho vira um
+  # loop de retry silencioso sobre um schema que já falhou uma vez.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # DEV-ONLY: injeta o .env inteiro (mesma ressalva dos demais serviços). Em
+    # produção o migrator recebe SÓ o que o manifesto do serviço declara —
+    # ver compose.prod.yml.
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
+      TZ: America/Sao_Paulo
+    command: ["node", "dist/cli/maia.js", "migrate", "up"]
+
   app:
     build:
       context: .
@@ -92,6 +121,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # DEV-ONLY: injeta o .env inteiro. Em produção cada container recebe
     # apenas o SEU env file (.env.app / .env.admin) — ver compose.prod.yml.
     env_file:
@@ -120,6 +151,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # DEV-ONLY: .env inteiro — mesma ressalva do serviço `app` acima.
     env_file:
       - .env

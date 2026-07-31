@@ -95,6 +95,37 @@ async function main() {
 
   // ── 3. schema / migration version ──────────────────────────────────────
   await lifecycle.runStartupStep('schema', async () => {
+    // Issue #516 §7: the SUPPORTED path is the one-shot `migrate` job, which
+    // runs once per release before app/admin-ui start. `MIGRATION_ON_BOOT` is
+    // the explicit single-instance escape hatch for hosts with no job
+    // primitive — still serialised by the global advisory lock, so even with
+    // several replicas it degrades into a queue rather than a corruption.
+    // Default is OFF: an application replica must not race to migrate.
+    if (config.MIGRATION_ON_BOOT) {
+      const { migrateUp } = await import('@/migrations/runner.js');
+      const { pool } = await import('@/db/client.js');
+      const result = await migrateUp({
+        pool,
+        lockTimeoutMs: config.MIGRATION_LOCK_TIMEOUT_MS,
+        statementTimeoutMs: config.MIGRATION_STATEMENT_TIMEOUT_MS,
+        appVersion: config.MAIA_BUILD_COMMIT ?? null,
+        minSupported: config.MIGRATION_MIN_SUPPORTED ?? null,
+        maxSupported: config.MIGRATION_MAX_SUPPORTED ?? null,
+      });
+      logger.info({ outcome: result.outcome }, 'maia.migrate_on_boot');
+      // Fail-closed: `blocked` and `failed` mean the schema is NOT what this
+      // build needs. Booting anyway is how a replica ends up serving on a
+      // half-migrated database. `lock_timeout` is NOT fatal here — another
+      // migrator is doing the work, and the schema gate below decides whether
+      // this process may serve.
+      if (result.outcome === 'blocked' || result.outcome === 'failed') {
+        lifecycle.setComponent('schema', 'failed', `migrate_on_boot=${result.outcome}`);
+        throw new Error(
+          `migrate-on-boot ${result.outcome} — run \`npm run migrate:status\` and see docs/runbooks/migrations.md`,
+        );
+      }
+    }
+
     if (!config.READINESS_SCHEMA_CHECK) {
       lifecycle.setComponent('schema', 'ready', 'schema check disabled by config');
       return;
@@ -103,7 +134,9 @@ async function main() {
     if (schema.status !== 'ok') {
       lifecycle.setComponent('schema', 'failed', schema.detail);
       throw new Error(
-        `schema version incompatible (expected ${schema.expected ?? '?'}, applied ${schema.applied ?? 'none'}) — run npm run db:migrate`,
+        `schema incompatible [${schema.code ?? schema.status}] (expected ${schema.expected ?? '?'}, ` +
+          `applied ${schema.applied ?? 'none'}): ${schema.detail ?? 'no detail'} — ` +
+          'run `npm run migrate:status` for the full picture',
       );
     }
     lifecycle.setComponent('schema', 'ready', `applied ${schema.applied}`);

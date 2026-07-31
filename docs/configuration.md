@@ -49,9 +49,9 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
+| `runtime` | 173 | 18 |
 | `admin-ui` | 23 | 4 |
-| `migrator` | 11 | 2 |
+| `migrator` | 15 | 2 |
 | `backup` | 42 | 7 |
 | `maintenance` | 61 | 13 |
 
@@ -81,6 +81,11 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `POSTGRES_PASSWORD` | string | — | sim | `runtime`, `migrator`, `backup`, `maintenance` | sim | Senha do Postgres (mínimo 8 caracteres). Obrigatória em: development, staging, production. |
 | `POSTGRES_DB` | string | — | não | `runtime`, `migrator`, `backup`, `maintenance` | sim | Nome do banco. Obrigatória em: development, staging, production. |
 | `POSTGRES_PORT` | number | `5432` | não | `runtime`, `migrator`, `backup`, `maintenance` | sim | Porta do Postgres. |
+| `MIGRATION_LOCK_TIMEOUT_MS` | number | `30000` | não | `runtime`, `migrator` | sim | Quanto o migrator espera pelo advisory lock global antes de desistir com resultado tipado (lock_timeout). Só UM migrator aplica mudanças por banco; o segundo espera ou sai limpo — nunca executa em paralelo. Curto demais faz o segundo migrator de um rolling deploy sair antes do primeiro terminar; longo demais segura o job de deploy. |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | number | `300000` | não | `runtime`, `migrator` | sim | statement_timeout default aplicado a cada statement de migration. Uma migration específica pode pedir mais via marcador versionado no próprio arquivo (`-- maia:statement-timeout=30min`), que é revisável no diff — a variável é o teto padrão, não um override invisível. |
+| `MIGRATION_MIN_SUPPORTED` | string | — | não | `runtime`, `migrator` | sim | Migration aplicada mais ANTIGA que esta build tolera (nome de arquivo completo). Ausente = a própria head do artefato, ou seja, o padrão exige schema em dia. Afrouxe apenas em rollout expand/contract, quando o código foi deliberadamente escrito para servir também no schema anterior. |
+| `MIGRATION_MAX_SUPPORTED` | string | — | não | `runtime`, `migrator` | sim | Migration aplicada mais NOVA que esta build tolera (nome de arquivo completo). Ausente = ilimitado, que mantém o rollback de código (banco à frente, código atrás) dentro de readiness. Defina quando uma migration destrutiva torna a versão antiga incapaz de servir — aí o banco acima da faixa bloqueia a versão antiga em vez de deixá-la quebrar em query. |
+| `MIGRATION_ON_BOOT` | string | `false` | não | `runtime` | sim | Deixa o PRÓPRIO processo da aplicação aplicar migrations no boot, ainda protegido pelo advisory lock. Default false de propósito: o caminho suportado é o job one-shot `migrate` do Compose, que roda UMA vez por release. Ligue apenas em ambiente single-instance sem orquestrador capaz de job — com várias réplicas todas competem pelo lock e o boot vira fila. |
 
 ### Redis
 

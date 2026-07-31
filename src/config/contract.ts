@@ -241,6 +241,81 @@ export const ENV_CONTRACT = {
     restartRequired: true,
   },
 
+  // ---- migration runner (issue #516) -------------------------------------
+  MIGRATION_LOCK_TIMEOUT_MS: {
+    name: 'MIGRATION_LOCK_TIMEOUT_MS',
+    description:
+      'Quanto o migrator espera pelo advisory lock global antes de desistir com resultado tipado (lock_timeout). Só UM migrator aplica mudanças por banco; o segundo espera ou sai limpo — nunca executa em paralelo. Curto demais faz o segundo migrator de um rolling deploy sair antes do primeiro terminar; longo demais segura o job de deploy.',
+    group: 'database',
+    secret: false,
+    services: ['runtime', 'migrator'],
+    schema: posInt(30_000),
+    example: '30000',
+    fixture: '30000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_STATEMENT_TIMEOUT_MS: {
+    name: 'MIGRATION_STATEMENT_TIMEOUT_MS',
+    description:
+      'statement_timeout default aplicado a cada statement de migration. Uma migration específica pode pedir mais via marcador versionado no próprio arquivo (`-- maia:statement-timeout=30min`), que é revisável no diff — a variável é o teto padrão, não um override invisível.',
+    group: 'database',
+    secret: false,
+    services: ['runtime', 'migrator'],
+    schema: posInt(300_000),
+    example: '300000',
+    fixture: '300000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_MIN_SUPPORTED: {
+    name: 'MIGRATION_MIN_SUPPORTED',
+    description:
+      'Migration aplicada mais ANTIGA que esta build tolera (nome de arquivo completo). Ausente = a própria head do artefato, ou seja, o padrão exige schema em dia. Afrouxe apenas em rollout expand/contract, quando o código foi deliberadamente escrito para servir também no schema anterior.',
+    group: 'database',
+    secret: false,
+    services: ['runtime', 'migrator'],
+    schema: z.string().optional(),
+    example: '110_schema_migrations_v2.sql',
+    // A fixture aponta para a migration MAIS ANTIGA que existe: qualquer banco
+    // está em dia com ela, então a fixture nunca reprova readiness — e, como
+    // migrations são append-only, esse nome nunca muda. Congelar a head atual
+    // aqui envelheceria a cada migration nova.
+    fixture: '001_initial.sql',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_MAX_SUPPORTED: {
+    name: 'MIGRATION_MAX_SUPPORTED',
+    description:
+      'Migration aplicada mais NOVA que esta build tolera (nome de arquivo completo). Ausente = ilimitado, que mantém o rollback de código (banco à frente, código atrás) dentro de readiness. Defina quando uma migration destrutiva torna a versão antiga incapaz de servir — aí o banco acima da faixa bloqueia a versão antiga em vez de deixá-la quebrar em query.',
+    group: 'database',
+    secret: false,
+    services: ['runtime', 'migrator'],
+    schema: z.string().optional(),
+    example: '111_schema_migration_events.sql',
+    // Sentinela SINTÉTICA acima de qualquer head real (o runner compara por
+    // ordem lexical de nome de arquivo, e '9' > '1'). Mesma lógica da fixture
+    // de MIGRATION_MIN_SUPPORTED, na outra ponta: satisfaz o contrato sem
+    // congelar uma head que envelhece.
+    fixture: '999_synthetic_upper_bound.sql',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_ON_BOOT: {
+    name: 'MIGRATION_ON_BOOT',
+    description:
+      'Deixa o PRÓPRIO processo da aplicação aplicar migrations no boot, ainda protegido pelo advisory lock. Default false de propósito: o caminho suportado é o job one-shot `migrate` do Compose, que roda UMA vez por release. Ligue apenas em ambiente single-instance sem orquestrador capaz de job — com várias réplicas todas competem pelo lock e o boot vira fila.',
+    group: 'database',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
   // ---- redis ------------------------------------------------------------
   REDIS_URL: {
     name: 'REDIS_URL',

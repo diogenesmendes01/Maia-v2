@@ -126,6 +126,50 @@ services:
       timeout: 5s
       retries: 10
 
+  # Job one-shot de migrations (issue #516) — o ÚNICO caminho suportado para
+  # aplicar schema em produção. Roda uma vez por release, com a MESMA imagem da
+  # aplicação (mesmo `migrations/`, mesmo runner, mesmos checksums), e `app` /
+  # `admin-ui` só sobem depois que ele SAI COM SUCESSO.
+  #
+  # Postura de segredo: este é o container com a MENOR superfície do projeto —
+  # SEM `env_file`. Ele recebe exatamente o subconjunto que o manifesto do
+  # serviço `migrator` declara (src/config/generated/service-env-manifest.json):
+  # Postgres + processo. Nada de ANTHROPIC_API_KEY, BAILEYS_AUTH_DIR,
+  # BACKUP_S3_SECRET_KEY ou NEXTAUTH_SECRET — um migrator que vaze não pode
+  # vazar o que nunca recebeu.
+  #
+  # `restart: "no"`: um job one-shot que reinicia sozinho vira retry loop sobre
+  # um schema que já falhou. Falhou ⇒ o deploy PARA e alguém olha.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "1001:1001"
+    environment:
+      NODE_ENV: production
+      MAIA_ENV: ${MAIA_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      TZ: America/Sao_Paulo
+    networks:
+      - data
+    command: ["node", "dist/cli/maia.js", "migrate", "up"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+
   app:
     build:
       context: .
@@ -137,6 +181,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # uid/gid 1001 (`maia`) já é o USER do runtime stage do Dockerfile;
     # repetir aqui garante que um drift na imagem não traga root de volta.
     user: "1001:1001"
@@ -202,6 +248,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     user: "1001:1001"
     # Apenas os segredos DO ADMIN (NextAuth/OIDC + o mínimo transitivo que
     # src/config/env.ts exige) — o .env do app NÃO entra aqui.
