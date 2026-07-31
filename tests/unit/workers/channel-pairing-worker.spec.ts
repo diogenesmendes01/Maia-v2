@@ -25,6 +25,7 @@ const {
   triggerRecoveryMock,
   stopLineSessionMock,
   listLocalSessionsMock,
+  heartbeatOwnershipMock,
   readinessMock,
   activateVerifiedMock,
   sealMock,
@@ -51,6 +52,10 @@ const {
   triggerRecoveryMock: vi.fn(async () => undefined),
   stopLineSessionMock: vi.fn(() => true),
   listLocalSessionsMock: vi.fn((): Array<{ channel_id: string; tenant_id: string; agent_id: string }> => []),
+  // #513 — o heartbeat de posse vive no gateway (é ele que tem o Map de
+  // sessões e é ele que fecha o socket quando o CAS falha). O worker só o
+  // dispara e conta o resultado.
+  heartbeatOwnershipMock: vi.fn(async () => ({ renewed: 0, lost: 0 })),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
 }));
@@ -76,6 +81,7 @@ vi.mock('../../../src/setup/recovery.js', () => ({ triggerRecovery: triggerRecov
 vi.mock('../../../src/gateway/line-sessions.js', () => ({
   stopLineSession: stopLineSessionMock,
   listLocalLineSessions: listLocalSessionsMock,
+  heartbeatLineOwnership: heartbeatOwnershipMock,
   _internal: { startLineSession: vi.fn(async () => undefined) },
 }));
 vi.mock('../../../src/setup/line-readiness.js', () => ({
@@ -144,6 +150,7 @@ beforeEach(() => {
   repoMock.renewOwnerLeases.mockResolvedValue(0);
   repoMock.renewSessionLeases.mockResolvedValue(0);
   listLocalSessionsMock.mockReturnValue([]);
+  heartbeatOwnershipMock.mockResolvedValue({ renewed: 0, lost: 0 });
   readinessMock.mockResolvedValue({ ready: true });
   activateVerifiedMock.mockResolvedValue({ ok: true });
   repoMock.completeCommand.mockResolvedValue(true);
@@ -435,27 +442,31 @@ describe('abort e repair', () => {
     );
   });
 
-  it('o tick PUBLICA quais linhas têm socket nesta réplica (roteamento do stop)', async () => {
-    const local = [
-      { channel_id: 'ch-local-1', tenant_id: 'tenant-A', agent_id: 'agent-a' },
-      { channel_id: 'ch-local-2', tenant_id: 'tenant-A', agent_id: 'agent-a' },
-    ];
-    listLocalSessionsMock.mockReturnValue(local);
+  it('o tick RENOVA a posse das linhas com socket nesta réplica', async () => {
     claimOnce(null);
     await runChannelPairingWorker();
 
-    // Sem esta publicação, `disable` não teria como endereçar o comando à
+    // Sem esta renovação, `disable` não teria como endereçar o comando à
     // réplica dona e a linha continuaria respondendo (review PR #528 rodada 2).
-    // O TRIPLETE viaja junto porque a row de estado pode ainda não existir e
-    // precisa ser criada com escopo (falha de CI da rodada 2).
-    expect(repoMock.renewSessionLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE, local);
+    // Desde a #513 o heartbeat também é o que FECHA um socket cuja posse foi
+    // perdida — o worker delega essa decisão inteira ao gateway, que é quem
+    // tem o Map de sessões.
+    expect(heartbeatOwnershipMock).toHaveBeenCalled();
   });
 
-  it('sem sessão local, o tick não escreve posse alguma', async () => {
-    listLocalSessionsMock.mockReturnValue([]);
+  it('posse perdida no heartbeat é contabilizada (o socket já foi fechado)', async () => {
+    heartbeatOwnershipMock.mockResolvedValueOnce({ renewed: 1, lost: 2 });
     claimOnce(null);
-    await runChannelPairingWorker();
-    expect(repoMock.renewSessionLeases).not.toHaveBeenCalled();
+    await expect(runChannelPairingWorker()).resolves.toBeUndefined();
+    expect(heartbeatOwnershipMock).toHaveBeenCalled();
+  });
+
+  it('uma falha no heartbeat NÃO derruba o tick (o resto do trabalho segue)', async () => {
+    heartbeatOwnershipMock.mockRejectedValueOnce(new Error('db down'));
+    claimOnce(null);
+    await expect(runChannelPairingWorker()).resolves.toBeUndefined();
+    // O sweep do tick continuou rodando apesar do heartbeat ter falhado.
+    expect(repoMock.failStalePairings).toHaveBeenCalled();
   });
 
   it('stop_line que falha NÃO marca a linha como failed (ela está disabled)', async () => {

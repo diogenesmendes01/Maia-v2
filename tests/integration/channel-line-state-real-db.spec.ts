@@ -1396,4 +1396,236 @@ d('channel_line_state — material cifrado e restart', () => {
       channel_type: 'whatsapp',
     });
   });
+
+  /**
+   * ── Issue #513 §6 — POSSE EXCLUSIVA COM LEASE E FENCING TOKEN ──────────
+   *
+   * Este bloco é a ÚNICA evidência possível de exclusividade: ela é uma
+   * propriedade do banco sob concorrência, e nenhum mock a demonstra. Duas
+   * "réplicas" aqui são dois `owner_instance` distintos batendo no mesmo
+   * Postgres — exatamente o que dois containers `session-owner` fazem.
+   *
+   * O que a #518 já garantia: o comando `stop_line` alcança a réplica dona.
+   * O que faltava e é testado aqui: que só UMA réplica consegue a posse, que
+   * o token anda para frente a cada takeover, e que um dono que perdeu a
+   * lease não consegue renovar (é isso que faz o socket dele fechar).
+   */
+  describe('posse exclusiva da sessão (issue #513)', () => {
+    const claim = (owner: string, lease_ms?: number) =>
+      import('../../src/db/repositories.js').then(({ channelLineStateRepo }) =>
+        channelLineStateRepo.acquireSessionLease({
+          channel_id: channelId,
+          tenant_id: T,
+          agent_id: A,
+          owner_instance: owner,
+          ...(lease_ms === undefined ? {} : { lease_ms }),
+        }),
+      );
+
+    it('duas réplicas disputando a MESMA linha: exatamente uma vence', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      // A row de estado NÃO existe: é o caso mais perigoso, porque
+      // `SELECT … FOR UPDATE` numa row inexistente não trava nada. Quem
+      // serializa aqui é o `ON CONFLICT DO NOTHING` da criação.
+      const [a, b] = await Promise.all([claim('replica-A'), claim('replica-B')]);
+
+      const winners = [a, b].filter((r) => r.ok);
+      const losers = [a, b].filter((r) => !r.ok);
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      expect(losers[0]).toMatchObject({ ok: false, reason: 'held_by_other' });
+
+      // O perdedor sabe QUEM ganhou — o runbook de duplicidade parte daí.
+      const owner = (losers[0] as { owner_instance: string }).owner_instance;
+      expect(['replica-A', 'replica-B']).toContain(owner);
+
+      // E o banco concorda com o vencedor: uma linha, um dono.
+      const state = await channelLineStateRepo.getStateForScope({
+        tenant_id: T,
+        agent_id: A,
+        channel_id: channelId,
+      });
+      expect(state?.session_owner_instance).toBe(owner);
+      expect(state?.session_fencing_token).toBe(1);
+    });
+
+    it('a segunda réplica é recusada enquanto a lease da primeira estiver VIVA', async () => {
+      const first = await claim('replica-A');
+      expect(first.ok).toBe(true);
+
+      const second = await claim('replica-B');
+      expect(second).toMatchObject({
+        ok: false,
+        reason: 'held_by_other',
+        owner_instance: 'replica-A',
+      });
+    });
+
+    it('re-adquirir pela MESMA instância é idempotente: o token NÃO anda', async () => {
+      const first = await claim('replica-A');
+      const again = await claim('replica-A');
+      expect(first.ok && again.ok).toBe(true);
+      expect((again as { grant: { fencing_token: number } }).grant.fencing_token).toBe(
+        (first as { grant: { fencing_token: number } }).grant.fencing_token,
+      );
+      expect((again as { takeover: boolean }).takeover).toBe(false);
+    });
+
+    it('takeover só depois da lease VENCER — e o fencing token INCREMENTA', async () => {
+      const first = await claim('replica-A');
+      const token1 = (first as { grant: { fencing_token: number } }).grant.fencing_token;
+
+      // A réplica A morreu: parou de renovar e a lease venceu.
+      await expireSessionLease(channelId);
+
+      const second = await claim('replica-B');
+      expect(second.ok).toBe(true);
+      expect((second as { takeover: boolean }).takeover).toBe(true);
+      const grant = (second as { grant: { fencing_token: number; previous_owner: string } })
+        .grant;
+      expect(grant.fencing_token).toBe(token1 + 1);
+      // Quem foi destronado viaja na concessão — é o que a auditoria cita.
+      expect(grant.previous_owner).toBe('replica-A');
+    });
+
+    it('o token é MONOTÔNICO ao longo de vários takeovers', async () => {
+      const seen: number[] = [];
+      for (const owner of ['r1', 'r2', 'r3', 'r1']) {
+        const r = await claim(owner);
+        expect(r.ok).toBe(true);
+        seen.push((r as { grant: { fencing_token: number } }).grant.fencing_token);
+        await expireSessionLease(channelId);
+      }
+      expect(seen).toEqual([1, 2, 3, 4]);
+      // Inclusive quando a MESMA instância reassume (r1 no fim): é justamente
+      // esse caso que comparar `owner_instance` não detectaria.
+    });
+
+    it('o dono renova por CAS; a instância errada NÃO consegue', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const granted = await claim('replica-A');
+      const token = (granted as { grant: { fencing_token: number } }).grant.fencing_token;
+
+      const ok = await channelLineStateRepo.renewFencedSessionLeases('replica-A', [
+        { channel_id: channelId, tenant_id: T, agent_id: A, fencing_token: token },
+      ]);
+      expect(ok).toEqual({ renewed: [channelId], lost: [] });
+
+      const impostor = await channelLineStateRepo.renewFencedSessionLeases('replica-B', [
+        { channel_id: channelId, tenant_id: T, agent_id: A, fencing_token: token },
+      ]);
+      expect(impostor).toEqual({ renewed: [], lost: [channelId] });
+    });
+
+    it('TOKEN ANTIGO não renova: o dono destronado descobre que perdeu', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const first = await claim('replica-A');
+      const stale = (first as { grant: { fencing_token: number } }).grant.fencing_token;
+
+      await expireSessionLease(channelId);
+      await claim('replica-B'); // token += 1
+
+      // A réplica A volta de uma pausa longa achando que ainda é dona.
+      const result = await channelLineStateRepo.renewFencedSessionLeases('replica-A', [
+        { channel_id: channelId, tenant_id: T, agent_id: A, fencing_token: stale },
+      ]);
+      // `lost` é o sinal que faz o gateway FECHAR o socket. Sem ele, a réplica
+      // A seguiria enviando por uma linha que não é mais dela — e o WhatsApp
+      // não tem como recusar, porque não conhece fencing token.
+      expect(result).toEqual({ renewed: [], lost: [channelId] });
+    });
+
+    it('a lease é avaliada pelo relógio do BANCO, não do processo', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      // Lease de 1ms: só o `now()` do banco pode decidir que já venceu.
+      await claim('replica-A', 1);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const second = await claim('replica-B');
+      expect(second.ok).toBe(true);
+      expect((second as { takeover: boolean }).takeover).toBe(true);
+
+      const state = await channelLineStateRepo.getStateForScope({
+        tenant_id: T,
+        agent_id: A,
+        channel_id: channelId,
+      });
+      expect(state?.session_owner_instance).toBe('replica-B');
+    });
+
+    it('liberar a posse NÃO reinicia o token (monotonicidade sobrevive ao shutdown)', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const first = await claim('replica-A');
+      const token = (first as { grant: { fencing_token: number } }).grant.fencing_token;
+
+      await channelLineStateRepo.releaseSessionOwnership('replica-A', [channelId]);
+
+      const next = await claim('replica-B');
+      expect((next as { grant: { fencing_token: number } }).grant.fencing_token).toBe(
+        token + 1,
+      );
+    });
+
+    it('a posse recém-adquirida já endereça o stop_line à réplica dona', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+      await claim('replica-A');
+
+      await channelLineStateRepo.disableLineWithAudit({
+        scope,
+        reason_code: 'operator_disabled',
+        stop_command_id: randomUUID(),
+        ...ACTOR,
+        audit: {
+          actor_id: 'i518-user',
+          actor_role: 'owner',
+          action: 'channel_disabled',
+          change_summary: { agent_id: A },
+        },
+      });
+
+      expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe(
+        'replica-A',
+      );
+      // A réplica sem socket não consome — contrato da #518, preservado.
+      expect(await channelLineStateRepo.claimNextCommand('replica-B')).toBeNull();
+    });
+
+    it('a aquisição CRIA a row de estado quando ela ainda não existe', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+      expect(await channelLineStateRepo.getStateForScope(scope)).toBeNull();
+
+      const r = await claim('replica-A');
+      expect(r.ok).toBe(true);
+
+      const after = await channelLineStateRepo.getStateForScope(scope);
+      // Nasce com o ESCOPO correto — sem ele o console não a enxergaria.
+      expect(after).toMatchObject({
+        tenant_id: T,
+        agent_id: A,
+        session_owner_instance: 'replica-A',
+        session_fencing_token: 1,
+      });
+      expect(after!.session_owner_acquired_at).not.toBeNull();
+    });
+
+    it('sessões sem token (janela de rollout) usam o registro legado e não são perdidas', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      const result = await channelLineStateRepo.renewFencedSessionLeases('replica-A', [
+        { channel_id: channelId, tenant_id: T, agent_id: A, fencing_token: null },
+      ]);
+      // Uma sessão aberta pelo processo ANTERIOR à 115 não tem token. Tratá-la
+      // como perdida derrubaria sockets saudáveis no meio do deploy.
+      expect(result).toEqual({ renewed: [channelId], lost: [] });
+    });
+
+    it('lista vazia é no-op — o tick em repouso não escreve nada', async () => {
+      const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+      expect(await channelLineStateRepo.renewFencedSessionLeases('replica-A', [])).toEqual({
+        renewed: [],
+        lost: [],
+      });
+    });
+  });
 });

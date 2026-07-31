@@ -1,6 +1,11 @@
 import cron, { type ScheduledTask } from 'node-cron';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
+import {
+  roleRunsJobGroup,
+  type JobGroup,
+  type ProcessRole,
+} from '@/runtime/lifecycle/roles.js';
 import { incCounter, setGaugeProvider, _internal as metricsInternal } from '@/lib/metrics.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
@@ -41,19 +46,56 @@ import { runMcpSyncWorker } from './mcp-sync-worker.js';
 import { runChannelPairingWorker } from './channel-pairing-worker.js';
 import { runSyntheticProbe } from './synthetic-probe.js';
 
+/**
+ * Issue #513 §5/§9 — CLASSIFICAÇÃO do job por grupo de topologia.
+ *
+ * `phase` continua sendo o gate histórico de rollout ("este job já é seguro de
+ * ligar?"). Ele nunca disse NADA sobre topologia, e é por isso que a separação
+ * de papéis quebrava silenciosamente: um cron que mexe no socket do WhatsApp e
+ * um cron que só varre o Postgres têm a mesma `phase: 1`, mas não podem rodar
+ * no mesmo processo depois do split.
+ *
+ * `group` é essa segunda dimensão, ortogonal à fase e declarada dos DOIS
+ * lados: o job nomeia seu grupo, o papel nomeia os grupos que roda
+ * (`ROLE_CONTRACTS[...].jobGroups`). Ver `JobGroup` em
+ * `src/runtime/lifecycle/roles.ts` para a definição de cada grupo.
+ *
+ * Omitir o grupo significa `maintenance` — o caso comum, e o padrão SEGURO: um
+ * job novo que ninguém classificou vai para o scheduler, onde não há socket
+ * para ele estragar.
+ */
 export type Job = {
   name: string;
   cron: string;
   fn: () => Promise<void>;
   phase: number;
+  /** Grupo de topologia. Ausente = `maintenance`. */
+  group?: JobGroup;
 };
+
+/** Manutenção pura — o caso comum, declarado por omissão. */
+const JOB_GROUP_DEFAULT: JobGroup = 'maintenance';
+
+export function jobGroup(job: Job): JobGroup {
+  return job.group ?? JOB_GROUP_DEFAULT;
+}
 
 export const JOBS: Job[] = [
   { name: 'health_monitor', cron: '*/1 * * * *', fn: runHealthMonitor, phase: 1 },
   { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
-  { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
+  // Issue #513: ENVIA pelo transporte da linha (`forCurrentAgentChannel` →
+  // LineSessionManager → socket) e ainda consulta `isBaileysConnected()`.
+  // Precisa do processo que segura o socket. Até a #506 tornar o outbound uma
+  // fronteira durável, colocalizar é a única forma de o lembrete sair.
+  {
+    name: 'pending_reminder',
+    cron: '*/30 * * * *',
+    fn: runPendingReminder,
+    phase: 1,
+    group: 'session',
+  },
   // Spec 18 §10 — three scheduling workers:
   //  - scheduling_tick: every minute, claims due occurrences and advances
   //    state (also reclaims expired occurrence leases in the same pass).
@@ -71,7 +113,17 @@ export const JOBS: Job[] = [
   // removed FEATURE_SCHEDULING_V2), so these run every tick and cleanly no-op
   // when no tenant has work.
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
-  { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
+  // Issue #513: `runOutboxDrain` despacha pelo transporte da linha
+  // (`src/scheduling/outbox-drain.ts` → `line-output`). O claim é durável
+  // (`FOR UPDATE SKIP LOCKED`), mas o ENVIO exige o socket — este é
+  // exatamente o acoplamento que a #506 vai cortar.
+  {
+    name: 'outbox_drain',
+    cron: '* * * * *',
+    fn: runOutboxDrainWorker,
+    phase: 1,
+    group: 'session',
+  },
   // Spec roteamento v4 §1.4 — recovery sweep do staging de inbound
   // não-roteado (modo strict): expira TTL, re-arma jobs órfãos (jobId
   // estável ⇒ idempotente) e vigia o keyring. No-op barato sem rows.
@@ -98,7 +150,23 @@ export const JOBS: Job[] = [
   // tornaria o fluxo inutilizável. PHASE 1 de propósito (startWorkers(1)
   // ignora phase>1); o custo em repouso é um probe em índice parcial
   // (`WHERE command IS NOT NULL`), que não retorna nada sem operador agindo.
-  { name: 'channel_pairing', cron: '*/5 * * * * *', fn: runChannelPairingWorker, phase: 1 },
+  //
+  // Issue #513: `group: 'session'` NÃO é conservadorismo — é correção.
+  // TODO efeito deste worker atravessa o Map de sessões em memória
+  // de `src/gateway/line-sessions.ts`: `publishLocalSessionOwnership()` lê
+  // `listLocalLineSessions()`, `stop_line`/`repair` chamam `stopLineSession()`
+  // e `promoteReadyVerifiedLines()` chama `startLineSession()`. Rodando no
+  // papel `scheduler`, esse Map está VAZIO: a posse nunca era publicada, o
+  // `stop_line` endereçado era reivindicado por uma réplica sem socket e
+  // "confirmado" contra o vazio (o P1 da rodada 2 do PR #528, ressuscitado
+  // pela topologia), e o scheduler tentava ABRIR sockets Baileys.
+  {
+    name: 'channel_pairing',
+    cron: '*/5 * * * * *',
+    fn: runChannelPairingWorker,
+    phase: 1,
+    group: 'session',
+  },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
   // Sonda sintética (spec 2026-07-17 §1.1). PHASE 1 de propósito: startWorkers(1)
   // ignora phase>1, então phase 2 NUNCA seria agendado (correção do review). É
@@ -106,7 +174,16 @@ export const JOBS: Job[] = [
   // (default) — a flag, não a fase, é o gate. Cadência configurável (default
   // */10). Sob shadow o worker falha fechado (no-op + audit); só age em
   // exact_first/strict com o canal de sonda pareado (§1.2).
-  { name: 'synthetic_probe', cron: config.MAIA_PROBE_CRON, fn: runSyntheticProbe, phase: 1 },
+  // Issue #513: a sonda INJETA inbound (`ingressUpsertMessage`) e mede o envio
+  // real — é um exercício de ponta a ponta do transporte, logo pertence ao
+  // processo que o segura.
+  {
+    name: 'synthetic_probe',
+    cron: config.MAIA_PROBE_CRON,
+    fn: runSyntheticProbe,
+    phase: 1,
+    group: 'session',
+  },
   // Issue #345 (Phase 4 of #323), Batch D — the inline body was EXTRACTED into
   // `./workflow-engine-tick.ts` (`runWorkflowEngineTick`) and converted from the
   // hardcoded `default/default` shim into a per-tenant dispatcher. The job SHAPE
@@ -131,7 +208,18 @@ export const JOBS: Job[] = [
   // + per-tenant fan-out — mirrors outbound_messages_sweeper. No featureFlag:
   // it's the only dispatch path for these effects once merged (the tool no
   // longer sends inline), so it must always run.
-  { name: 'idempotency_outbox_relayer', cron: '*/1 * * * *', fn: runIdempotencyOutboxRelayer, phase: 1 },
+  //
+  // Issue #513: o relayer é o ÚNICO caminho de despacho destes efeitos, e ele
+  // despacha por `forCurrentAgentChannel` — socket. O advisory lock global já
+  // o torna single-flight entre réplicas; o que faltava era garantir que a
+  // réplica que o segura tenha um transporte para usar.
+  {
+    name: 'idempotency_outbox_relayer',
+    cron: '*/1 * * * *',
+    fn: runIdempotencyOutboxRelayer,
+    phase: 1,
+    group: 'session',
+  },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
   // Backup artifact retention runs once a week (Sundays 04:00 BRT), decoupled
@@ -151,9 +239,30 @@ export const JOBS: Job[] = [
   { name: 'procedure_candidate_consumer', cron: '0 2 * * *', fn: runProcedureCandidateConsumer, phase: 2 },
   { name: 'procedure_execution_reaper', cron: '0 * * * *', fn: runProcedureExecutionReaper, phase: 3 },
   { name: 'procedure_metrics_refresh', cron: '*/15 * * * *', fn: runProcedureMetricsRefresh, phase: 3 },
-  { name: 'briefing_morning', cron: '0 8 * * *', fn: runMorningBriefing, phase: 4 },
-  { name: 'briefing_evening', cron: '0 21 * * *', fn: runEveningBriefing, phase: 4 },
-  { name: 'briefing_weekly', cron: '0 8 * * 1', fn: runWeeklyBriefing, phase: 4 },
+  // Issue #513: os três briefings ENVIAM (`forCurrentAgentChannel`). Ainda em
+  // phase 4 (nunca agendados por `startWorkers(1)`), mas classificados agora
+  // para que ligá-los mais tarde não reintroduza o acoplamento silencioso.
+  {
+    name: 'briefing_morning',
+    cron: '0 8 * * *',
+    fn: runMorningBriefing,
+    phase: 4,
+    group: 'session',
+  },
+  {
+    name: 'briefing_evening',
+    cron: '0 21 * * *',
+    fn: runEveningBriefing,
+    phase: 4,
+    group: 'session',
+  },
+  {
+    name: 'briefing_weekly',
+    cron: '0 8 * * 1',
+    fn: runWeeklyBriefing,
+    phase: 4,
+    group: 'session',
+  },
   // P4 Task 10 — drift monitor semanal (domingo 03:00 BRT).
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
@@ -252,18 +361,64 @@ function runTick(job: Job): void {
   inflight.set(job.name, p);
 }
 
-export function startWorkers(currentPhase: number = 1): void {
-  acceptingTicks = true;
+/**
+ * Inventário EXPLÍCITO de jobs para um (papel, fase) — issue #513 §5
+ * ("possuir inventário explícito de jobs habilitados") e critério de aceite
+ * "o boot lista role e componentes/jobs ativos".
+ *
+ * Pura e exportada de propósito: é o que os testes verificam sem subir cron
+ * nenhum, e é o que o boot loga.
+ */
+export function jobsForRole(
+  role: ProcessRole,
+  currentPhase: number = 1,
+): { scheduled: Job[]; skipped: Array<{ job: Job; reason: 'phase' | 'role' }> } {
+  const scheduled: Job[] = [];
+  const skipped: Array<{ job: Job; reason: 'phase' | 'role' }> = [];
   for (const job of JOBS) {
-    if (job.phase > currentPhase) continue;
+    if (job.phase > currentPhase) {
+      skipped.push({ job, reason: 'phase' });
+      continue;
+    }
+    // Fail-closed: um job de um grupo que este papel NÃO roda não é agendado.
+    // Agendá-lo "porque provavelmente funciona" é o que fazia o scheduler
+    // chamar `stopLineSession` num Map vazio e declarar sucesso.
+    if (!roleRunsJobGroup(role, jobGroup(job))) {
+      skipped.push({ job, reason: 'role' });
+      continue;
+    }
+    scheduled.push(job);
+  }
+  return { scheduled, skipped };
+}
+
+export function startWorkers(
+  currentPhase: number = 1,
+  role: ProcessRole = 'all',
+): void {
+  acceptingTicks = true;
+  const { scheduled, skipped } = jobsForRole(role, currentPhase);
+  for (const job of scheduled) {
     const t = cron.schedule(job.cron, () => runTick(job), { timezone: 'America/Sao_Paulo' });
     tasks.push(t);
     registerWorkerGauges(job.name);
     logger.info(
-      { job: job.name, cron: job.cron, phase: job.phase },
+      { job: job.name, cron: job.cron, phase: job.phase, group: jobGroup(job), role },
       'worker.scheduled',
     );
   }
+  // UMA linha com o inventário completo: o operador precisa conseguir
+  // responder "este processo está rodando o quê?" sem correlacionar 40 linhas.
+  logger.info(
+    {
+      role,
+      phase: currentPhase,
+      scheduled: scheduled.map((j) => j.name),
+      skipped_by_role: skipped.filter((s) => s.reason === 'role').map((s) => s.job.name),
+      skipped_by_phase: skipped.filter((s) => s.reason === 'phase').map((s) => s.job.name),
+    },
+    'worker.inventory',
+  );
 }
 
 /** Names of cron jobs currently executing. */

@@ -260,6 +260,24 @@ export const AUDIT_ACTIONS = [
   'legacy_catch_all',
   'channel_scope_mismatch',
   'line_session_transition',
+  // Issue #513 §6 — POSSE EXCLUSIVA da linha, com lease e fencing token.
+  // Distintas de `line_session_transition` de propósito: aquela descreve o
+  // ESTADO do socket (conectou, caiu, está reconectando), estas descrevem
+  // QUEM tem o direito de abri-lo. As duas dimensões são independentes — um
+  // socket pode estar `connected` numa réplica que acabou de PERDER a posse,
+  // e é exatamente essa janela que o operador precisa enxergar.
+  //  - _acquired: esta instância passou a ser a dona (linha livre ou primeira
+  //    posse). `metadata.fencing_token` é o token concedido.
+  //  - _taken_over: a lease do dono anterior VENCEU e esta instância assumiu.
+  //    `metadata.previous_owner` diz de quem. É o evento a vigiar num
+  //    failover — um takeover repetido na mesma linha é sintoma de réplica
+  //    doente ou lease curta demais.
+  //  - _lost: o CAS do heartbeat falhou; a posse é de outro. O socket local é
+  //    fechado IMEDIATAMENTE (fail-closed) — esta ação é a prova de que foi.
+  // NUNCA carregam número, JID ou auth state; só ids, instância e token.
+  'line_session_ownership_acquired',
+  'line_session_ownership_taken_over',
+  'line_session_ownership_lost',
   'pairing_session_started',
   'pairing_session_verified',
   'pairing_session_failed',

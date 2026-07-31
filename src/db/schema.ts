@@ -1936,6 +1936,20 @@ export const channel_line_state = pgTable(
     session_owner_lease_expires_at: timestamp('session_owner_lease_expires_at', {
       withTimezone: true,
     }),
+    /**
+     * Issue #513 §6 (migration 115) — fencing token MONOTÔNICO da posse desta
+     * linha. Incrementa a cada AQUISIÇÃO (nunca em renovação/release). É o que
+     * distingue "ainda sou o dono" de "perdi a lease e outro — ou eu mesmo —
+     * reassumi": comparar só `session_owner_instance` não detecta o caso em
+     * que a MESMA instância reassume depois de uma pausa longa.
+     */
+    session_fencing_token: bigint('session_fencing_token', { mode: 'number' })
+      .notNull()
+      .default(0),
+    /** Quando ESTA posse (este token) começou — diagnóstico do runbook. */
+    session_owner_acquired_at: timestamp('session_owner_acquired_at', {
+      withTimezone: true,
+    }),
     actor_id: text('actor_id'),
     actor_role: text('actor_role'),
     correlation_id: text('correlation_id'),
@@ -1975,6 +1989,14 @@ export const channel_line_state = pgTable(
     ownerIdx: index('channel_line_state_owner_idx')
       .on(t.owner_instance)
       .where(sql`owner_instance IS NOT NULL`),
+    // Issue #513 (migration 115) — heartbeat/CAS do dono da SESSÃO e varredura
+    // de takeover por lease VENCIDA (nunca por identidade de dono).
+    sessionOwnerIdx: index('channel_line_state_session_owner_idx')
+      .on(t.session_owner_instance)
+      .where(sql`session_owner_instance IS NOT NULL`),
+    sessionLeaseExpiryIdx: index('channel_line_state_session_lease_expiry_idx')
+      .on(t.session_owner_lease_expires_at)
+      .where(sql`session_owner_instance IS NOT NULL`),
   }),
 );
 export type ChannelLineStateRow = typeof channel_line_state.$inferSelect;

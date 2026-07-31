@@ -11,11 +11,13 @@ import { describe, it, expect } from 'vitest';
 import {
   PROCESS_ROLES,
   LIFECYCLE_COMPONENTS,
+  JOB_GROUPS,
   ROLE_CONTRACTS,
   getRoleContract,
   parseProcessRole,
   roleOwns,
   roleRequires,
+  roleRunsJobGroup,
 } from '../../../src/runtime/lifecycle/roles.js';
 
 describe('process role contract', () => {
@@ -82,6 +84,77 @@ describe('process role contract', () => {
     expect(roleRequires('session-owner', 'whatsapp_session')).toBe(true);
     expect(roleRequires('session-owner', 'queue')).toBe(true);
     expect(roleRequires('session-owner', 'agent_worker')).toBe(false);
+  });
+
+  /**
+   * Issue #513 — o scheduler ENFILEIRA (`message_recovery`,
+   * `unrouted_recovery`). Sem `queue` no contrato, `src/index.ts` fase 7
+   * retorna cedo e esses crons rodavam contra uma fila que nunca foi
+   * construída.
+   */
+  it('scheduler owns the queue it produces onto', () => {
+    expect(roleOwns('scheduler', 'queue')).toBe(true);
+    // Produz, nunca consome — como `api`.
+    expect(roleOwns('scheduler', 'agent_worker')).toBe(false);
+  });
+
+  /**
+   * Issue #513 — a ponte Admin→runtime do pareamento (#518) é um CRON, mas
+   * mexe no Map de sessões Baileys. Sem `cron_scheduler` no session-owner, um
+   * deploy separado deixava o dono do socket incomandável: a posse nunca era
+   * publicada e o `stop_line` endereçado ia parar numa réplica sem socket.
+   */
+  it('session-owner owns the cron machinery its session-bound jobs need', () => {
+    expect(roleOwns('session-owner', 'cron_scheduler')).toBe(true);
+    expect(roleRequires('session-owner', 'cron_scheduler')).toBe(true);
+  });
+});
+
+describe('job groups — issue #513 §5', () => {
+  it('declares a group list for every role', () => {
+    for (const role of PROCESS_ROLES) {
+      const { jobGroups } = getRoleContract(role);
+      for (const g of jobGroups) expect(JOB_GROUPS).toContain(g);
+    }
+  });
+
+  it('a role that runs ANY group owns the cron machinery', () => {
+    for (const role of PROCESS_ROLES) {
+      if (getRoleContract(role).jobGroups.length === 0) continue;
+      expect(roleOwns(role, 'cron_scheduler'), role).toBe(true);
+    }
+  });
+
+  it('a role that runs the SESSION group owns the socket those jobs reach for', () => {
+    for (const role of PROCESS_ROLES) {
+      if (!roleRunsJobGroup(role, 'session')) continue;
+      expect(roleOwns(role, 'whatsapp_session'), role).toBe(true);
+    }
+  });
+
+  it('every group has exactly ONE non-compat runner — no duplicate crons', () => {
+    // `all` runs everything by design; among the split roles each group must
+    // have a single owner, or a split deployment double-fires the job.
+    for (const group of JOB_GROUPS) {
+      const runners = PROCESS_ROLES.filter(
+        (r) => r !== 'all' && roleRunsJobGroup(r, group),
+      );
+      expect(runners, group).toHaveLength(1);
+    }
+  });
+
+  it('the split roles together cover every group `all` covers', () => {
+    const split = new Set(
+      PROCESS_ROLES.filter((r) => r !== 'all').flatMap((r) => [
+        ...getRoleContract(r).jobGroups,
+      ]),
+    );
+    expect([...split].sort()).toEqual([...ROLE_CONTRACTS.all.jobGroups].sort());
+  });
+
+  it('api and worker schedule nothing', () => {
+    expect(ROLE_CONTRACTS.api.jobGroups).toEqual([]);
+    expect(ROLE_CONTRACTS.worker.jobGroups).toEqual([]);
   });
 });
 

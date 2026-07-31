@@ -72,7 +72,20 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 }));
 // #518 — ver nota em line-sessions-shutdown.spec.ts.
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
-  channelLineStateRepo: { upsertTransition: persistMock },
+  // #513 — a sessão só abre depois de ADQUIRIR a posse da linha.
+  channelLineStateRepo: {
+    upsertTransition: persistMock,
+    acquireSessionLease: vi.fn(async () => ({
+      ok: true as const,
+      takeover: false,
+      grant: {
+        channel_id: 'c',
+        fencing_token: 1,
+        acquired_at: new Date(),
+        previous_owner: null,
+      },
+    })),
+  },
 }));
 vi.mock('../../../src/gateway/baileys.js', () => ({
   ingressUpsertMessage: vi.fn(async () => 'handled' as const),
@@ -247,9 +260,16 @@ describe('listLocalLineSessions — tabela de roteamento do stop', () => {
     await _internal.startLineSession(CHANNEL);
     // Só o id não basta: registrar a posse pode ter que CRIAR a row de
     // estado, e `channel_line_state` exige tenant/agent (falha de CI da
-    // rodada 2).
+    // rodada 2). Desde a #513 o FENCING TOKEN viaja junto — é ele que o
+    // heartbeat usa como CAS, e sem ele a renovação não distinguiria "ainda
+    // sou dono" de "perdi e alguém reassumiu".
     expect(listLocalLineSessions()).toEqual([
-      { channel_id: CHANNEL.id, tenant_id: CHANNEL.tenant_id, agent_id: CHANNEL.agent_id },
+      {
+        channel_id: CHANNEL.id,
+        tenant_id: CHANNEL.tenant_id,
+        agent_id: CHANNEL.agent_id,
+        fencing_token: 1,
+      },
     ]);
   });
 

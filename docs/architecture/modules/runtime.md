@@ -126,12 +126,30 @@ through `/livez`, `/startupz` and `/readyz`.
 
 | File | Role |
 |---|---|
-| `roles.ts` | **Process role contract** — `ProcessRole`, `LifecycleComponent`, `ROLE_CONTRACTS`, `roleOwns()`, `roleRequires()`. What a role STARTS vs what gates its readiness. Consumed by issue #513 (topology separation). |
+| `roles.ts` | **Process role contract** — `ProcessRole`, `LifecycleComponent`, `JobGroup`, `ROLE_CONTRACTS`, `roleOwns()`, `roleRequires()`, `roleRunsJobGroup()`. What a role STARTS, what gates its readiness, and which cron groups it runs. Consumed by `src/index.ts` and `src/workers/index.ts`; the deployment side is `compose.roles.yml` (issue #513). |
 | `controller.ts` | Singleton state machine: legal transitions, component registry, idempotent shutdown with an ordered step list + deadline, `isAcceptingWork()` (the "no new work" gate), abortable startup (`runStartupStep`), background-task registry, `maia_lifecycle_state` gauge |
 | `shutdown-sequence.ts` | The ordered steps and the signal handlers. Order is the contract: stop accepting work → drain crons → drain BullMQ → drain background tasks → close the turn-context subscriber (#511, its own ioredis connection) → close sessions → HTTP → audit → pools |
 | `readiness.ts` | Composite, role-aware `/readyz` + `/startupz` evaluation. Read-only, per-component timeout, memoized, sanitized output |
 | `schema-version.ts` | Applied-vs-expected migration comparison. Validates only — never applies |
 | `index.ts` | Public barrel (import the role contract from here) |
+
+#### Topology separation (issue #513)
+
+The role contract has **two axes**, and conflating them is what made a real
+split break silently:
+
+- `owns` / `requires` — which lifecycle COMPONENTS the process starts and
+  which ones gate `/readyz`.
+- `jobGroups` — which cron GROUPS the process is responsible for. Deliberately
+  not derived from `owns`: `session-owner` owns `cron_scheduler` (it needs the
+  machinery for the #518 pairing bridge, whose every effect reaches the
+  in-process Baileys socket map) but is not responsible for maintenance. Derive
+  the group from ownership and every sweeper fires N+1 times in a split deploy.
+
+Deployment: `compose.prod.yml` is the single-process topology
+(`MAIA_PROCESS_ROLE=all`); `compose.roles.yml` is one container per role. They
+are alternatives, never overlays — combining them runs the monolith alongside
+the roles.
 
 Rules this module enforces:
 
@@ -176,7 +194,8 @@ Rules this module enforces:
 | `tests/unit/decision/action-decider/` | Routing decisions |
 | `tests/unit/runtime/context-packet/` | Slice assembly + cache |
 | `tests/unit/runtime/feature-flags/` | Flag defaults |
-| `tests/unit/runtime/lifecycle-roles.spec.ts` | Process role contract (#512/#513) |
+| `tests/unit/runtime/lifecycle-roles.spec.ts` | Process role contract + job-group invariants (#512/#513) |
+| `tests/unit/workers/job-role-inventory.spec.ts` | Cron registry filtered by role; roles cover the registry with no gap and no overlap (#513) |
 | `tests/unit/runtime/lifecycle-controller.spec.ts` | State machine, idempotent shutdown, drain deadline |
 | `tests/unit/runtime/lifecycle-readiness.spec.ts` | Role-aware `/readyz` + `/startupz` fail-closed cases |
 | `tests/unit/runtime/lifecycle-schema-version.spec.ts` | Migration version gate |

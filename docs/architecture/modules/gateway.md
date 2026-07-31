@@ -17,7 +17,40 @@
 | `src/gateway/bot-detection.ts` | Heuristic bot detection (Redis, tenant-keyed) |
 | `src/gateway/presence.ts` | Presence / typing indicator handling |
 | `src/gateway/queue.ts` | BullMQ inbound queue producer |
+| `src/gateway/line-sessions.ts` | Per-line Baileys sessions (multi-line routing phase 3) + **exclusive line ownership**: `acquireSessionLease` before opening a socket, `heartbeatLineOwnership()` fail-closed after |
+| `src/gateway/line-session-manager.ts` | `LineTransport` registry — the seam between "which line" and "which socket" |
 | `src/gateway/types.ts` | Shared gateway types |
+
+### Exclusive line ownership (issue #513 §6, migration 115)
+
+A line's socket lives in ONE process. Before #513 that was an assumption; now
+it is enforced:
+
+1. **Acquire before opening.** `startLineSession()` calls
+   `acquireSessionLease()` and returns early unless it is granted. Granted when
+   the line is unowned, its lease expired, or this instance already owns it.
+2. **Fail-closed three ways.** Lease held by a live owner ⇒ do not open. DB
+   error ⇒ do not open (ambiguous ownership is denied ownership). Heartbeat CAS
+   failure ⇒ close the socket immediately.
+3. **Fencing token.** Monotonic per channel, incremented on every acquisition
+   by a different owner, never on renewal and never reset on release. It is what
+   distinguishes "still the owner" from "lost it and re-took it" — comparing
+   `session_owner_instance` alone misses the case where the SAME instance
+   re-acquires after a long pause.
+4. **DB clock.** Expiry is always evaluated with Postgres `now()`, never the
+   process clock.
+
+Why closing (rather than merely flagging) is the only defence: WhatsApp does
+not know about fencing tokens, so there is no server-side rejection of a stale
+owner's send. Checking the token *after* sending would prove nothing.
+
+Ownership transitions are audited as `line_session_ownership_acquired`,
+`_taken_over` (carries `previous_owner`) and `_lost`, under the ALS context of
+the channel's own tenant/agent. The heartbeat runs inside the `channel_pairing`
+cron, which #513 schedules only in the role that owns `whatsapp_session`.
+
+Outbound still travels through the in-process `LineTransport`; making that a
+durable boundary is issue #506.
 
 ## Patterns it follows
 

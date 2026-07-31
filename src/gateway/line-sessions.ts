@@ -33,6 +33,7 @@ import { runWithTenantContext } from '../db/tenant-context.js';
 import { channelsRepo } from '../db/repositories/channel-repos.js';
 import {
   channelLineStateRepo,
+  type HeldSessionLine,
   type LineState,
 } from '../db/repositories/channel-line-state-repos.js';
 import {
@@ -87,6 +88,16 @@ type LineSessionState = {
    * shutdown e reabria o socket com um estado novo (`stopped=false`).
    */
   reconnectTimer: NodeJS.Timeout | null;
+  /**
+   * Issue #513 §6 — fencing token da POSSE que autorizou este socket. Toda
+   * renovação é um CAS por `(instância, token)`; um token que não bate
+   * significa que a lease venceu e outra réplica assumiu a linha, e o socket
+   * daqui precisa morrer imediatamente (fail-closed).
+   *
+   * `null` só na janela de rollout: uma sessão herdada de um processo anterior
+   * à migration 115.
+   */
+  fencingToken: number | null;
 };
 
 const sessions = new Map<string, LineSessionState>();
@@ -104,6 +115,34 @@ function auditLineTransition(
     { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
     () => audit({ acao: 'line_session_transition', metadata }),
   );
+}
+
+/**
+ * Issue #513 — AQUISIÇÃO, PERDA e TAKEOVER de posse são side effects de
+ * governança, não ruído de log (AGENTS.md §4, "audit every side effect").
+ * Auditados sob o ALS do (tenant, agent) DONO do canal, pelo mesmo motivo de
+ * `auditLineTransition`: metadata não corrige colunas nem labels de métrica.
+ *
+ * Fail-isolated: uma falha de auditoria nunca impede o fechamento fail-closed
+ * de um socket cuja posse foi perdida — o efeito de segurança vem primeiro.
+ */
+function auditLineOwnership(
+  channel: LineChannel,
+  acao:
+    | 'line_session_ownership_acquired'
+    | 'line_session_ownership_lost'
+    | 'line_session_ownership_taken_over',
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  return runWithTenantContext(
+    { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
+    () => audit({ acao, metadata }),
+  ).catch((err) => {
+    logger.error(
+      { channel_id: channel.id, acao, err: (err as Error).message },
+      'line_session.ownership_audit_failed',
+    );
+  });
 }
 
 /**
@@ -239,6 +278,66 @@ function lidResolverFor(state: LineSessionState) {
   };
 }
 
+/**
+ * Issue #513 §6 — POSSE EXCLUSIVA antes de abrir o socket.
+ *
+ * Este é o gate que faltava para escalar `session-owner` além de uma réplica.
+ * A #518 registrava a posse DEPOIS do socket aberto (upsert last-writer-wins),
+ * o que resolve endereçamento de comando mas não exclusividade: duas réplicas
+ * enumeravam as mesmas linhas ativas no boot e abriam as duas.
+ *
+ * Fail-closed em três frentes:
+ *   - lease viva de outra instância ⇒ NÃO abre (a outra réplica é a dona);
+ *   - erro de banco ⇒ NÃO abre (posse ambígua é posse negada, §"Perda/
+ *     ambiguidade de lease falha fechada");
+ *   - takeover ⇒ abre, mas AUDITA citando o dono anterior.
+ *
+ * Devolve o fencing token concedido, ou `null` quando a posse foi negada.
+ */
+async function acquireLineOwnership(channel: LineChannel): Promise<number | null> {
+  try {
+    const result = await channelLineStateRepo.acquireSessionLease({
+      channel_id: channel.id,
+      tenant_id: channel.tenant_id,
+      agent_id: channel.agent_id,
+      owner_instance: runtimeInstanceId(),
+    });
+    if (!result.ok) {
+      logger.info(
+        {
+          channel_id: channel.id,
+          line: channel.external_id,
+          owner: result.owner_instance,
+          lease_expires_at: result.lease_expires_at,
+        },
+        'line_session.ownership_held_elsewhere',
+      );
+      return null;
+    }
+    await auditLineOwnership(
+      channel,
+      result.takeover ? 'line_session_ownership_taken_over' : 'line_session_ownership_acquired',
+      {
+        channel_id: channel.id,
+        fencing_token: result.grant.fencing_token,
+        owner_instance: runtimeInstanceId(),
+        ...(result.grant.previous_owner
+          ? { previous_owner: result.grant.previous_owner }
+          : {}),
+      },
+    );
+    return result.grant.fencing_token;
+  } catch (err) {
+    // Banco indisponível ⇒ posse INDETERMINADA. Abrir "otimisticamente" aqui é
+    // exatamente como se cria um split-brain de sessão WhatsApp.
+    logger.error(
+      { channel_id: channel.id, err: (err as Error).message },
+      'line_session.ownership_acquire_failed',
+    );
+    return null;
+  }
+}
+
 async function startLineSession(channel: LineChannel): Promise<void> {
   const dir = lineAuthDir(channel.id);
   if (!existsSync(dir)) {
@@ -252,14 +351,22 @@ async function startLineSession(channel: LineChannel): Promise<void> {
     return;
   }
 
-  const state: LineSessionState = sessions.get(channel.id) ?? {
+  const existing = sessions.get(channel.id);
+  // Reivindica ANTES de tocar no auth state ou construir o socket. Uma
+  // reconexão da própria instância renova a posse sem incrementar o token.
+  const fencingToken = await acquireLineOwnership(channel);
+  if (fencingToken === null) return;
+
+  const state: LineSessionState = existing ?? {
     channel,
     sock: null,
     connected: false,
     reconnectAttempts: 0,
     stopped: false,
     reconnectTimer: null,
+    fencingToken,
   };
+  state.fencingToken = fencingToken;
   sessions.set(channel.id, state);
 
   const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
@@ -421,18 +528,79 @@ export async function startAdditionalLineSessions(): Promise<void> {
  * primeiro `connection.update`), e registrar a posse exige `tenant_id` e
  * `agent_id`.
  */
-export function listLocalLineSessions(): Array<{
-  channel_id: string;
-  tenant_id: string;
-  agent_id: string;
-}> {
+export function listLocalLineSessions(): HeldSessionLine[] {
   return [...sessions.values()]
     .filter((s) => !s.stopped)
     .map((s) => ({
       channel_id: s.channel.id,
       tenant_id: s.channel.tenant_id,
       agent_id: s.channel.agent_id,
+      fencing_token: s.fencingToken,
     }));
+}
+
+/**
+ * Issue #513 §6 — HEARTBEAT DA POSSE, fail-closed.
+ *
+ * Renova a lease das linhas deste processo por CAS em `(instância, fencing
+ * token)`. Toda linha que NÃO renovou perdeu a posse: outra réplica assumiu
+ * enquanto este processo estava pausado, particionado ou lento. O socket dela
+ * é encerrado IMEDIATAMENTE, antes que possa enviar mais qualquer coisa.
+ *
+ * Por que fechar em vez de só marcar: o WhatsApp não conhece fencing token
+ * (§6 da issue). Não existe "recusar o envio no servidor" — a única defesa é
+ * o dono antigo PARAR, e parar significa não ter mais socket. Conferir o token
+ * DEPOIS de enviar não seria proteção alguma.
+ *
+ * Uma falha de BANCO aqui não fecha nada de propósito: ela é indistinguível
+ * de um blip e a lease ainda tem folga (renovamos a cada 5s, a lease vale
+ * 60s). O que fecha a sessão é a lease VENCER — ou seja, o banco continuar
+ * inalcançável até lá —, e aí o próximo tick que conseguir falar com o banco
+ * vê o CAS falhar. É a mesma escada de segurança do `claimNextCommand`.
+ *
+ * Chamado pelo worker `channel_pairing`, que a #513 passa a agendar apenas no
+ * papel que possui `whatsapp_session`.
+ */
+export async function heartbeatLineOwnership(): Promise<{
+  renewed: number;
+  lost: number;
+}> {
+  const held = listLocalLineSessions();
+  if (held.length === 0) return { renewed: 0, lost: 0 };
+
+  const { renewed, lost } = await channelLineStateRepo.renewFencedSessionLeases(
+    runtimeInstanceId(),
+    held,
+  );
+
+  for (const channelId of lost) {
+    const state = sessions.get(channelId);
+    if (!state) continue;
+    logger.error(
+      {
+        channel_id: channelId,
+        line: state.channel.external_id,
+        fencing_token: state.fencingToken,
+        owner_instance: runtimeInstanceId(),
+      },
+      'line_session.ownership_lost_closing_socket',
+    );
+    // AUDITA antes de fechar, mas sem bloquear o fechamento: o efeito de
+    // segurança não pode depender de o insert de auditoria completar.
+    void auditLineOwnership(state.channel, 'line_session_ownership_lost', {
+      channel_id: channelId,
+      fencing_token: state.fencingToken,
+      owner_instance: runtimeInstanceId(),
+      reason: 'heartbeat_cas_failed',
+    });
+    // Fecha SEM liberar a posse no banco: ela já não é nossa. Chamar
+    // `releaseSessionOwnership` aqui seria um no-op benigno (o CAS por dono
+    // recusaria), mas `stopLineSession` é o caminho que cancela os timers de
+    // reconexão — sem isso o socket voltaria sozinho em segundos.
+    stopLineSession(channelId);
+  }
+
+  return { renewed: renewed.length, lost: lost.length };
 }
 
 export function stopLineSession(channelId: string): boolean {

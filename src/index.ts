@@ -239,7 +239,11 @@ async function main() {
   // ── 8. cron scheduler ──────────────────────────────────────────────────
   await lifecycle.runStartupStep('cron_scheduler', async () => {
     if (!roleOwns(role, 'cron_scheduler')) return;
-    startWorkers(1);
+    // Issue #513: o ROLE entra no registro de jobs. `startWorkers` agenda
+    // apenas os jobs cuja capacidade declarada este processo possui — o
+    // scheduler não recebe os jobs que tocam o socket Baileys, e o
+    // session-owner recebe SÓ esses. Em `all` nada muda.
+    startWorkers(1, role);
     lifecycle.setComponent('cron_scheduler', 'ready');
   });
 

@@ -1,0 +1,312 @@
+# =======================================================================
+# compose.roles.yml — topologia SEPARADA POR PAPEL (issue #513).
+#
+# Uso:
+#   docker compose --env-file .env.infra -f compose.roles.yml up -d
+#
+# É uma ALTERNATIVA a `compose.prod.yml`, nunca um overlay dele: os dois
+# arquivos descrevem a MESMA responsabilidade (rodar o runtime) em
+# topologias diferentes, e combiná-los subiria o monólito `app` ao lado dos
+# papéis — dois processos abrindo os mesmos sockets WhatsApp e rodando os
+# mesmos crons. Escolha um.
+#
+#   compose.prod.yml   → 1 processo (`MAIA_PROCESS_ROLE=all`). O padrão.
+#   compose.roles.yml  → 4 processos, um por papel. Este arquivo.
+#
+# Os nomes de volume e de rede são os MESMOS do compose.prod.yml de
+# propósito: no mesmo diretório (⇒ mesmo project name) a migração de uma
+# topologia para a outra REUSA os dados existentes, sem dump/restore.
+#
+# ── Por que separar (issue #513) ──────────────────────────────────────
+#
+# Num único processo, escalar a API significa abrir sockets WhatsApp
+# duplicados e rodar cada cron duas vezes. Separado:
+#
+#   api            escala livremente     — não abre socket, não consome fila,
+#                                          não roda cron
+#   worker         escala livremente     — só drena a fila BullMQ
+#   scheduler      1 réplica (ver §lock) — só crons de manutenção
+#   session-owner  N réplicas, 1 por     — segura os sockets Baileys e os
+#                  conjunto de linhas      crons que dependem deles
+#
+# Quem decide o que cada processo INICIA e o que o `/readyz` EXIGE é
+# `src/runtime/lifecycle/roles.ts` (`ROLE_CONTRACTS`), não este arquivo.
+# Aqui só se declara o papel; o contrato é código e é testado.
+#
+# ── §lock: réplicas por papel ─────────────────────────────────────────
+#
+#   api            — quantas quiser. Stateless.
+#   worker         — quantas quiser. BullMQ distribui.
+#   session-owner  — >1 é SEGURO desde a migration 115: a posse de cada
+#                    linha é adquirida com lease + fencing token
+#                    (`acquireSessionLease`) e o socket é fechado quando o
+#                    CAS do heartbeat falha. Duas réplicas nunca abrem a
+#                    mesma linha.
+#   scheduler      — MANTENHA EM 1 por enquanto. Vários jobs já são
+#                    single-flight (advisory lock global ou `FOR UPDATE SKIP
+#                    LOCKED`), mas a classificação completa e o claim
+#                    universal são a fatia seguinte da #513. Duas réplicas
+#                    hoje duplicariam os jobs que ainda não têm claim.
+#
+# ── Segredos por papel ────────────────────────────────────────────────
+#
+# Cada serviço recebe o SEU env file. Os arquivos ainda não são mínimos
+# (o contrato de env trata o runtime como uma unidade só — reduzi-lo por
+# papel é follow-up da #513 §10), mas a separação de arquivos é o ponto de
+# corte: quando o contrato suportar, basta editar cada `.env.<papel>`.
+# Intenção declarada, por papel:
+#   api            — sem credencial Baileys (não monta o volume de auth)
+#   worker         — sem auth state do WhatsApp (não monta o volume)
+#   scheduler      — sem auth state do WhatsApp (não monta o volume)
+#   session-owner  — precisa do auth state; é o único que monta o volume RW
+#
+# O volume `maia_baileys_auth` é montado APENAS no session-owner. Isso não
+# é cosmético: montar o mesmo diretório RW em várias réplicas sem exclusão
+# garantida corrompe o auth state (issue #513 §8).
+#
+# Verificação pós-deploy, rollback e ordem de corte:
+# docs/runbooks/deploy-prod.md e docs/runbooks/line-ownership-duplicates.md.
+# =======================================================================
+
+# Base comum a todos os papéis do runtime. Mesma imagem, mesmo hardening —
+# muda o papel, o env file e o que é montado.
+x-runtime-base: &runtime-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  user: "1001:1001"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - data
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 512
+  # Issue #512 — a janela de drain tem que caber ANTES do SIGKILL do Docker.
+  stop_grace_period: 40s
+
+x-runtime-env: &runtime-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+  POSTGRES_USER: ${POSTGRES_USER:?}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+  POSTGRES_DB: ${POSTGRES_DB:?}
+  TZ: America/Sao_Paulo
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: maia-postgres
+    restart: unless-stopped
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required in prod (no fallback)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in prod (no fallback; min 8 chars, URL-safe)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required in prod (no fallback)}
+      TZ: America/Sao_Paulo
+      PGTZ: America/Sao_Paulo
+    networks:
+      - data
+    volumes:
+      - maia_pg_data:/var/lib/postgresql/data
+      - ./migrations:/migrations:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: maia-redis
+    restart: unless-stopped
+    user: redis
+    # IMPORTANT: --maxmemory-policy MUST stay `noeviction` (or `volatile-lru`)
+    # com mais de um tenant — ver o racional completo em docker-compose.yml.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "2gb"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD is required in prod (unauthenticated Redis is not allowed)}"
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is required in prod}
+    networks:
+      - data
+    volumes:
+      - maia_redis_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── API / control plane ────────────────────────────────────────────────
+  # Serve Fastify (ingress HTTP, /setup, probes, métricas) e ENFILEIRA. Não
+  # abre socket Baileys, não consome a fila de agente, não roda cron — o
+  # contrato do papel `api` garante isso, não a boa vontade do código.
+  #
+  # É o único papel exposto ao proxy, e por isso o único na rede `web`.
+  # Escalável: `docker compose -f compose.roles.yml up -d --scale api=3`.
+  api:
+    <<: *runtime-base
+    env_file:
+      - .env.api
+    environment:
+      <<: *runtime-env
+      MAIA_PROCESS_ROLE: api
+    networks:
+      - data
+      - web
+    volumes:
+      # Mídia SIM (uploads/downloads servidos pelo HTTP); auth do Baileys NÃO.
+      - maia_media:/app/media
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/livez').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Agent worker ───────────────────────────────────────────────────────
+  # Drena a fila BullMQ (turnos do agente + replay do staging não-roteado).
+  # Sem HTTP, sem cron, sem Baileys. Escalar aqui aumenta throughput de
+  # cognição SEM abrir um socket a mais — que é o objetivo inteiro da #513.
+  agent-worker:
+    <<: *runtime-base
+    env_file:
+      - .env.worker
+    environment:
+      <<: *runtime-env
+      MAIA_PROCESS_ROLE: worker
+    volumes:
+      # O worker persiste anexos/relatórios gerados no turno.
+      - maia_media:/app/media
+    # Sem healthcheck HTTP: o papel `worker` não sobe Fastify. A saúde dele é
+    # o `/readyz` que ele NÃO expõe — o supervisor observa o processo e as
+    # métricas de fila (`maia_agent_queue_depth`) fazem o resto.
+
+  # ── Scheduler / manutenção ─────────────────────────────────────────────
+  # Só os crons de manutenção: sweepers, relayers de efeito, monitores,
+  # refresh de matview. NÃO recebe os crons que tocam o socket WhatsApp —
+  # `startWorkers()` filtra o registro pela capacidade declarada de cada job
+  # (`src/workers/index.ts`), e este papel não possui `whatsapp_session`.
+  #
+  # MANTENHA 1 RÉPLICA — ver §lock no cabeçalho.
+  scheduler:
+    <<: *runtime-base
+    env_file:
+      - .env.scheduler
+    environment:
+      <<: *runtime-env
+      MAIA_PROCESS_ROLE: scheduler
+    volumes:
+      # Backup/retenção escrevem artefatos; sem auth do WhatsApp.
+      - maia_media:/app/media
+
+  # ── WhatsApp session owner ─────────────────────────────────────────────
+  # Segura os sockets Baileys e os crons que dependem deles (ponte de
+  # pareamento, drains de outbound, sonda sintética). ÚNICO serviço que monta
+  # o volume de auth state, e ele o monta RW.
+  #
+  # Escalável desde a migration 115: cada linha é reivindicada com lease +
+  # fencing token antes de o socket abrir, e o socket é fechado quando o CAS
+  # do heartbeat falha. Duas réplicas nunca abrem a mesma linha — a segunda
+  # simplesmente loga `line_session.ownership_held_elsewhere` e segue.
+  session-owner:
+    <<: *runtime-base
+    env_file:
+      - .env.session-owner
+    environment:
+      <<: *runtime-env
+      MAIA_PROCESS_ROLE: session-owner
+    volumes:
+      - maia_baileys_auth:/app/.baileys-auth
+      - maia_media:/app/media
+
+  # ── admin-ui ───────────────────────────────────────────────────────────
+  # Inalterado em relação ao compose.prod.yml: o console é um processo Next.js
+  # que só fala com o Postgres. Ele NÃO tem papel de runtime — a ponte para o
+  # runtime é a fila durável de comandos em `channel_line_state` (#518).
+  admin-ui:
+    build:
+      context: .
+      dockerfile: src/admin-ui/Dockerfile
+    container_name: maia-admin-ui
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "1001:1001"
+    env_file:
+      - .env.admin
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      AUTH_TRUST_HOST: 'true'
+      TZ: America/Sao_Paulo
+    networks:
+      - data
+      - web
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/src/admin-ui/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/').then(function(r){process.exit(r.status<500?0:1)}).catch(function(){process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  data:
+    internal: true
+  web:
+
+volumes:
+  # MESMOS nomes do compose.prod.yml — a troca de topologia reusa os dados.
+  maia_pg_data:
+  maia_redis_data:
+  maia_baileys_auth:
+  maia_media:

@@ -10,6 +10,37 @@
 |---|---|
 | `src/workers/index.ts` | Worker registry, startup orchestration and the cron **drain** (`stopWorkers`) |
 
+### Job groups — topology (issue #513)
+
+Each job carries two independent gates:
+
+| Field | Question it answers |
+|---|---|
+| `phase` | *Rollout*: is this job safe to enable yet? (`startWorkers(1)` skips `phase > 1`) |
+| `group` | *Topology*: which process may run it? |
+
+`group` is `'maintenance'` (default) or `'session'`. A `session` job reaches
+the in-process Baileys socket map, directly or transitively — the pairing
+bridge (`channel_pairing`), the outbound drains (`outbox_drain`,
+`idempotency_outbox_relayer`, `pending_reminder`), the synthetic probe and the
+briefings. Everything else is maintenance.
+
+`startWorkers(phase, role)` schedules a job only when the role declares its
+group (`ROLE_CONTRACTS[role].jobGroups`). Fail-closed: a new job that nobody
+classified defaults to `maintenance`, where there is no socket to break.
+
+This matters because `phase` never said anything about topology.
+`channel_pairing` is `phase: 1` like any sweeper, but running it on the
+`scheduler` — where the session map is empty — meant ownership was never
+published, an addressed `stop_line` was "confirmed" against an empty map while
+the line kept answering on the session owner, and the scheduler tried to open
+Baileys sockets. `jobsForRole()` is the pure, exported function behind the
+`worker.inventory` boot log and the tests.
+
+The outbound jobs are colocated with the socket only because outbound is still
+in-process; issue #506 (durable outbound boundary) is what lets them move back
+to `maintenance`.
+
 ### Cron drain and overlap (issue #512)
 
 `startWorkers()` wraps every tick in a guard (`runTick`) that:

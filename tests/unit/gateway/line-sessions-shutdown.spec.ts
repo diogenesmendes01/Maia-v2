@@ -64,7 +64,22 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 // #518 — a transição de sessão passa a PERSISTIR o estado da linha (103).
 // É best-effort e fail-isolated; aqui basta stubar para o teste não tocar o DB.
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
-  channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
+  // #513 — a sessão só abre depois de ADQUIRIR a posse da linha; o shutdown
+  // ordenado continua liberando a posse ao final.
+  channelLineStateRepo: {
+    upsertTransition: vi.fn(async () => undefined),
+    releaseSessionOwnership: vi.fn(async () => 0),
+    acquireSessionLease: vi.fn(async () => ({
+      ok: true as const,
+      takeover: false,
+      grant: {
+        channel_id: 'c',
+        fencing_token: 1,
+        acquired_at: new Date(),
+        previous_owner: null,
+      },
+    })),
+  },
 }));
 vi.mock('../../../src/gateway/baileys.js', () => ({
   ingressUpsertMessage: vi.fn(async () => 'handled' as const),

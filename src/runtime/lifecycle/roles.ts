@@ -64,10 +64,44 @@ export const LIFECYCLE_COMPONENTS = [
 ] as const;
 export type LifecycleComponent = (typeof LIFECYCLE_COMPONENTS)[number];
 
+/**
+ * Issue #513 §5 — GRUPOS DE JOB de cron.
+ *
+ * `phase` (in `src/workers/index.ts`) is a ROLLOUT gate: "is this job safe to
+ * enable yet?". It never said anything about topology, and that is precisely
+ * why splitting roles broke things silently — a cron that manipulates the
+ * Baileys socket map and a cron that only sweeps Postgres both carry
+ * `phase: 1`, yet they cannot live in the same process once the topology is
+ * split.
+ *
+ * The group is that second, orthogonal axis. It is declared on BOTH sides:
+ * each job names its group, each role names the groups it runs. Neither side
+ * can drift without the other noticing, and the boot log can answer "what is
+ * this process running?" from data alone.
+ *
+ *   - `maintenance` — Postgres/Redis only: sweepers, relayers, monitors,
+ *     matview refresh, backups. Runs in the `scheduler` role.
+ *   - `session`     — reaches the in-process Baileys socket map, directly or
+ *     transitively: the pairing bridge, the outbound drains, the synthetic
+ *     probe, the briefings. Runs in the `session-owner` role.
+ *
+ * `all` declares BOTH, which is what keeps the single-process compat mode of
+ * issue #512 byte-for-byte identical.
+ */
+export const JOB_GROUPS = ['maintenance', 'session'] as const;
+export type JobGroup = (typeof JOB_GROUPS)[number];
+
 export type RoleContract = {
   readonly role: ProcessRole;
   /** One-line operator description; surfaced in `/livez` and logs. */
   readonly description: string;
+  /**
+   * Cron job groups this role RUNS. Empty for roles that do not schedule at
+   * all. A role listing a group MUST own `cron_scheduler` (the machinery),
+   * and a role listing `session` MUST own `whatsapp_session` (the socket the
+   * group's jobs reach for) — both invariants are locked by test.
+   */
+  readonly jobGroups: readonly JobGroup[];
   /**
    * Components this role is responsible for STARTING. Issue #513 uses this to
    * decide what a given process boots; today `all` owns everything.
@@ -88,6 +122,7 @@ export const ROLE_CONTRACTS: Readonly<Record<ProcessRole, RoleContract>> = {
   all: {
     role: 'all',
     description: 'single-process compat mode — serves HTTP, drains the queue, schedules crons and owns the WhatsApp sessions',
+    jobGroups: [...JOB_GROUPS],
     owns: [...LIFECYCLE_COMPONENTS],
     requires: [
       ...CORE_REQUIRED,
@@ -101,6 +136,7 @@ export const ROLE_CONTRACTS: Readonly<Record<ProcessRole, RoleContract>> = {
   api: {
     role: 'api',
     description: 'HTTP surface only — ingress, setup pairing, probes, metrics',
+    jobGroups: [],
     owns: ['config', 'db', 'schema', 'redis', 'redis_memory', 'queue', 'http'],
     // Enqueues onto the agent queue, so the QUEUE must be reachable; it does
     // NOT consume, so `agent_worker` is another role's readiness concern.
@@ -109,21 +145,61 @@ export const ROLE_CONTRACTS: Readonly<Record<ProcessRole, RoleContract>> = {
   worker: {
     role: 'worker',
     description: 'BullMQ consumer — drains the agent queue and the unrouted-replay queue',
+    jobGroups: [],
     owns: ['config', 'db', 'schema', 'redis', 'redis_memory', 'queue', 'agent_worker'],
     requires: [...CORE_REQUIRED, 'queue', 'agent_worker'],
   },
   scheduler: {
     role: 'scheduler',
-    description: 'cron scheduler — periodic jobs (sweepers, relayers, monitors, briefings)',
-    owns: ['config', 'db', 'schema', 'redis', 'redis_memory', 'cron_scheduler'],
-    requires: [...CORE_REQUIRED, 'cron_scheduler'],
+    description: 'cron scheduler — periodic maintenance jobs (sweepers, relayers, monitors)',
+    jobGroups: ['maintenance'],
+    // Issue #513: `queue` was MISSING here and that made the role unusable.
+    // `message_recovery` and `unrouted_recovery` are scheduler jobs whose whole
+    // purpose is to ENQUEUE (`enqueueAgent` / `enqueueUnroutedReplay`), and
+    // `src/index.ts` phase 7 returns early when the role does not own `queue` —
+    // so a scheduler-only process ran those crons against a queue that had
+    // never been constructed. Same shape as `api`: produces, never consumes.
+    owns: ['config', 'db', 'schema', 'redis', 'redis_memory', 'queue', 'cron_scheduler'],
+    requires: [...CORE_REQUIRED, 'queue', 'cron_scheduler'],
   },
   'session-owner': {
     role: 'session-owner',
-    description: 'WhatsApp transport owner — primary Baileys session + additional line sessions',
-    owns: ['config', 'db', 'schema', 'redis', 'redis_memory', 'queue', 'whatsapp_session'],
+    description:
+      'WhatsApp transport owner — Baileys sessions + the session-bound cron jobs (pairing bridge, outbound drains)',
+    jobGroups: ['session'],
+    // Issue #513: `cron_scheduler` was MISSING here, and that silently broke
+    // the #518 Admin→runtime bridge the moment the topology was actually
+    // split. `channel_pairing` is a CRON job, but every one of its effects
+    // reaches into the in-process Baileys session map:
+    //   - `publishLocalSessionOwnership()` reads `listLocalLineSessions()`;
+    //   - `stop_line`/`repair` call `stopLineSession()`;
+    //   - `promoteReadyVerifiedLines()` calls `startLineSession()`.
+    // In a split deployment that job ran on the SCHEDULER, where the map is
+    // empty — so ownership was never published, addressed `stop_line` commands
+    // were claimed by a replica holding no socket and "confirmed" against an
+    // empty map (exactly the P1 that PR #528 round 2 closed, reintroduced by
+    // topology), and the scheduler tried to OPEN Baileys sockets, violating
+    // "scheduler não abre sockets".
+    //
+    // Owning `cron_scheduler` here does NOT mean this role runs every cron:
+    // `startWorkers()` filters the registry by each job's declared `requires`
+    // (see `src/workers/index.ts`). The session owner runs only the
+    // session-bound jobs; the scheduler runs only the rest; `all` runs both.
+    owns: [
+      'config',
+      'db',
+      'schema',
+      'redis',
+      'redis_memory',
+      'queue',
+      'cron_scheduler',
+      'whatsapp_session',
+    ],
     // Owns the ingress socket, so it must be able to ENQUEUE what it receives.
-    requires: [...CORE_REQUIRED, 'queue', 'whatsapp_session'],
+    // Gates on `cron_scheduler` too: without it the pairing bridge and the
+    // ownership heartbeat are not running, and an owner that cannot be
+    // commanded or whose lease is not renewed must not be in rotation.
+    requires: [...CORE_REQUIRED, 'queue', 'cron_scheduler', 'whatsapp_session'],
   },
 };
 
@@ -143,6 +219,20 @@ export function roleOwns(role: ProcessRole, component: LifecycleComponent): bool
 /** Does `/readyz` gate on `component` for `role`? */
 export function roleRequires(role: ProcessRole, component: LifecycleComponent): boolean {
   return getRoleContract(role).requires.includes(component);
+}
+
+/**
+ * Should a process in `role` schedule the cron jobs of `group`?
+ *
+ * Deliberately NOT derived from `owns`: `session-owner` owns `cron_scheduler`
+ * (it needs the machinery for the pairing bridge) but must NOT pick up the
+ * maintenance sweepers — otherwise every maintenance job would run twice in a
+ * split deployment, once on the scheduler and once on each session owner.
+ * Ownership of the machinery and responsibility for a group are two different
+ * questions, so they are two different fields.
+ */
+export function roleRunsJobGroup(role: ProcessRole, group: JobGroup): boolean {
+  return getRoleContract(role).jobGroups.includes(group);
 }
 
 /**

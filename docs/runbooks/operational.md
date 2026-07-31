@@ -375,19 +375,66 @@ curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | s
 
 ### 8.2 Papel do processo (`MAIA_PROCESS_ROLE`)
 
-Contrato em `src/runtime/lifecycle/roles.ts`. Hoje todo processo roda `all`
-(modo compatível). Os demais papéis existem para a separação de topologia
-(issue #513) e já mudam o que `/readyz` exige:
+Contrato em `src/runtime/lifecycle/roles.ts`. O padrão continua sendo `all`
+(processo único, `compose.prod.yml`). A topologia separada é
+`compose.roles.yml` — um container por papel:
 
-| Papel | Inicia | `/readyz` exige |
-|---|---|---|
-| `all` | tudo | tudo |
-| `api` | HTTP + filas (produtor) | config, db, schema, redis, redis_memory, queue, http |
-| `worker` | filas + worker BullMQ | config, db, schema, redis, redis_memory, queue, agent_worker |
-| `scheduler` | crons | config, db, schema, redis, redis_memory, cron_scheduler |
-| `session-owner` | sessões WhatsApp + filas | config, db, schema, redis, redis_memory, queue, whatsapp_session |
+| Papel | Inicia | Grupos de cron | `/readyz` exige |
+|---|---|---|---|
+| `all` | tudo | `maintenance` + `session` | tudo |
+| `api` | HTTP + filas (produtor) | — | config, db, schema, redis, redis_memory, queue, http |
+| `worker` | filas + worker BullMQ | — | config, db, schema, redis, redis_memory, queue, agent_worker |
+| `scheduler` | crons + filas (produtor) | `maintenance` | config, db, schema, redis, redis_memory, queue, cron_scheduler |
+| `session-owner` | sessões WhatsApp + crons + filas | `session` | config, db, schema, redis, redis_memory, queue, cron_scheduler, whatsapp_session |
 
 Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
+
+**Réplicas seguras por papel:** `api` e `worker`, quantas quiser;
+`session-owner`, quantas quiser (a posse por linha é exclusiva — §8.2.2);
+`scheduler`, **mantenha 1** até a classificação completa de single-flight dos
+crons (follow-up da #513 §9).
+
+#### 8.2.1 Grupos de cron (`maintenance` vs `session`)
+
+`phase` é gate de **rollout** ("este job já é seguro de ligar?"); `group` é
+gate de **topologia** ("em que processo ele pode rodar?"). São ortogonais, e
+confundi-los foi o bug: `channel_pairing` tem `phase: 1` como qualquer
+sweeper, mas todo efeito dele atravessa o Map de sessões Baileys em memória.
+Rodando no `scheduler`, esse Map está vazio — a posse nunca era publicada, o
+`stop_line` endereçado era "confirmado" contra o vazio e a linha seguia
+respondendo pelo `session-owner`.
+
+- `session` — `channel_pairing`, `outbox_drain`, `idempotency_outbox_relayer`,
+  `pending_reminder`, `synthetic_probe`, `briefing_*`. Rodam no `session-owner`.
+- `maintenance` — todo o resto. Roda no `scheduler`. É o **default**: um job
+  novo sem `group` declarado vai para onde não há socket para estragar.
+
+O boot loga o inventário completo (`worker.inventory`): papel, jobs agendados,
+e o que foi pulado por fase e por papel. Para responder "este processo está
+rodando o quê?", leia essa linha — não correlacione 40 linhas de
+`worker.scheduled`.
+
+#### 8.2.2 Posse exclusiva de linha (lease + fencing token)
+
+Migration 115. Cada linha WhatsApp é **reivindicada antes** de o socket abrir
+(`acquireSessionLease`), não registrada depois. Regras:
+
+- concede se a linha está sem dono, com lease vencida, ou já é desta instância;
+- recusa enquanto outra instância tiver lease **viva** — a segunda réplica loga
+  `line_session.ownership_held_elsewhere` e não abre nada;
+- **falha de banco também recusa**: posse ambígua é posse negada;
+- toda posse concedida a um dono diferente incrementa `session_fencing_token`
+  (monotônico, nunca reiniciado — nem no release);
+- expiração é avaliada com `now()` **do banco**, nunca do processo.
+
+O heartbeat (a cada 5s, dentro do `channel_pairing`) renova por CAS em
+`(instância, fencing token)`. Falhou o CAS ⇒ **o socket é fechado na hora** e a
+perda é auditada. Não existe "conferir o token depois de enviar": o WhatsApp
+não conhece fencing token, então a única defesa é o dono antigo parar.
+
+Auditoria: `line_session_ownership_acquired`, `_taken_over` (cita
+`previous_owner`), `_lost`. Diagnóstico e resolução de duplicidade em
+[`line-ownership-duplicates.md`](line-ownership-duplicates.md).
 
 ### 8.3 Métricas de lifecycle
 

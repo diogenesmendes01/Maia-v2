@@ -92,6 +92,44 @@ export interface LineScope {
   channel_id: string;
 }
 
+/**
+ * Issue #513 §6 — concessão de posse EXCLUSIVA de uma linha.
+ *
+ * O `fencing_token` é o que o dono precisa guardar em memória: todo heartbeat
+ * subsequente é um CAS por `(owner_instance, fencing_token)`. Um token que não
+ * bate significa que a lease venceu e alguém — possivelmente esta mesma
+ * instância, depois de uma pausa longa — reassumiu no intervalo.
+ */
+export interface SessionLeaseGrant {
+  channel_id: string;
+  /** Monotônico por canal. Incrementa a cada nova posse, nunca em renovação. */
+  fencing_token: number;
+  acquired_at: Date;
+  /** Instância cuja lease vencida foi tomada. `null` fora de um takeover. */
+  previous_owner: string | null;
+}
+
+export type SessionLeaseResult =
+  | { ok: true; grant: SessionLeaseGrant; takeover: boolean }
+  | {
+      ok: false;
+      reason: 'held_by_other';
+      owner_instance: string;
+      lease_expires_at: Date | null;
+    };
+
+/** Uma linha cujo socket vive NESTE processo, como o heartbeat a enxerga. */
+export interface HeldSessionLine {
+  channel_id: string;
+  tenant_id: string;
+  agent_id: string;
+  /**
+   * `null` = sessão aberta antes da migration 115 (janela de rollout); usa o
+   * registro legado da #518, sem CAS.
+   */
+  fencing_token: number | null;
+}
+
 /** Uma linha como o console a enxerga: canal + estado operacional. */
 export interface LineOverviewRow {
   channel_id: string;
@@ -765,9 +803,235 @@ export const channelLineStateRepo = {
   },
 
   /**
+   * Issue #513 §6 — AQUISIÇÃO EXCLUSIVA da posse desta linha, com fencing.
+   *
+   * ── O buraco que isto fecha ────────────────────────────────────────────
+   * `renewSessionLeases` (acima) REGISTRA a posse, mas não a DISPUTA: é um
+   * upsert last-writer-wins executado DEPOIS de o socket já estar aberto. O
+   * comentário dela assume que "exatamente uma réplica pode ter a sessão viva
+   * (o CAS de `activateVerified` elege quem sobe)" — verdade no caminho de
+   * ATIVAÇÃO, falso no caminho de BOOT: `startAdditionalLineSessions()`
+   * enumera todas as linhas ativas e abre um socket para cada, sem reivindicar
+   * nada. Duas réplicas `session-owner` abriam a MESMA linha.
+   *
+   * Este método é o gate que faltava, e é chamado ANTES de `makeWASocket`.
+   *
+   * ── Semântica ──────────────────────────────────────────────────────────
+   *   - concede quando a linha está SEM dono, com a lease VENCIDA, ou quando
+   *     o dono já é esta instância (re-entrância idempotente do reconnect);
+   *   - recusa (fail-closed) enquanto outra instância tiver lease VIVA;
+   *   - toda concessão a um dono DIFERENTE do anterior incrementa
+   *     `session_fencing_token` — takeover é distinguível de renovação;
+   *   - a expiração é avaliada com `now()` do BANCO, nunca com o relógio do
+   *     processo (§6: "Relógio do banco, não do processo").
+   *
+   * A row é travada com `FOR UPDATE` dentro da transação, então duas réplicas
+   * disputando a mesma linha serializam e a segunda enxerga a lease da
+   * primeira. A row é criada on-demand (canal ativado fora do console).
+   */
+  async acquireSessionLease(args: {
+    channel_id: string;
+    tenant_id: string;
+    agent_id: string;
+    owner_instance: string;
+    lease_ms?: number;
+  }): Promise<SessionLeaseResult> {
+    const leaseMs = args.lease_ms ?? OWNER_LEASE_MS;
+    return withTx(async (tx) => {
+      // `lease_alive` é calculado pelo BANCO: comparar em JS reintroduziria o
+      // clock skew entre containers que a issue manda eliminar.
+      const locked = await tx
+        .select({
+          session_owner_instance: channel_line_state.session_owner_instance,
+          session_fencing_token: channel_line_state.session_fencing_token,
+          session_owner_lease_expires_at: channel_line_state.session_owner_lease_expires_at,
+          lease_alive: sql<boolean>`COALESCE(${channel_line_state.session_owner_lease_expires_at} > now(), false)`,
+        })
+        .from(channel_line_state)
+        .where(eq(channel_line_state.channel_id, args.channel_id))
+        .limit(1)
+        .for('update');
+      const current = locked[0] ?? null;
+
+      if (
+        current &&
+        current.lease_alive &&
+        current.session_owner_instance !== null &&
+        current.session_owner_instance !== args.owner_instance
+      ) {
+        return {
+          ok: false as const,
+          reason: 'held_by_other' as const,
+          owner_instance: current.session_owner_instance,
+          lease_expires_at: current.session_owner_lease_expires_at,
+        };
+      }
+
+      const previousOwner = current?.session_owner_instance ?? null;
+      // Renovação do MESMO dono preserva o token; QUALQUER outra concessão
+      // (linha livre, lease vencida de outro, primeira posse) o incrementa. É
+      // o que torna o token monotônico e o takeover detectável.
+      const isRenewal = previousOwner === args.owner_instance;
+      const takeover = !isRenewal && previousOwner !== null;
+
+      const leaseExpr = sql`now() + ${leaseMs}::int * interval '1 millisecond'`;
+
+      if (current === null) {
+        // `FOR UPDATE` numa row INEXISTENTE não trava nada — duas réplicas
+        // disputando uma linha que nunca passou pelo console veriam ambas
+        // `null` e as duas tentariam inserir. `ON CONFLICT DO NOTHING` desfaz
+        // o empate: quem insere ganha; o perdedor recebe zero rows (a segunda
+        // transação BLOQUEIA até a primeira commitar) e cai no caminho normal
+        // de avaliação, agora com a row existindo e travada.
+        const inserted = await tx
+          .insert(channel_line_state)
+          .values({
+            channel_id: args.channel_id,
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            session_owner_instance: args.owner_instance,
+            session_owner_lease_expires_at: leaseExpr as unknown as Date,
+            session_owner_acquired_at: sql`now()` as unknown as Date,
+            session_fencing_token: 1,
+          })
+          .onConflictDoNothing({ target: channel_line_state.channel_id })
+          .returning({
+            fencing_token: channel_line_state.session_fencing_token,
+            acquired_at: channel_line_state.session_owner_acquired_at,
+          });
+        const row = inserted[0];
+        if (row) {
+          return {
+            ok: true as const,
+            takeover: false,
+            grant: {
+              channel_id: args.channel_id,
+              fencing_token: row.fencing_token,
+              acquired_at: row.acquired_at!,
+              previous_owner: null,
+            },
+          };
+        }
+        // Perdemos a corrida de criação: outra réplica acabou de inserir a row
+        // com a posse dela. Fail-closed — não tentamos tomar uma lease que
+        // nasceu viva há milissegundos.
+        const raced = await tx
+          .select({
+            session_owner_instance: channel_line_state.session_owner_instance,
+            session_owner_lease_expires_at:
+              channel_line_state.session_owner_lease_expires_at,
+          })
+          .from(channel_line_state)
+          .where(eq(channel_line_state.channel_id, args.channel_id))
+          .limit(1);
+        return {
+          ok: false as const,
+          reason: 'held_by_other' as const,
+          owner_instance: raced[0]?.session_owner_instance ?? 'unknown',
+          lease_expires_at: raced[0]?.session_owner_lease_expires_at ?? null,
+        };
+      }
+
+      const updated = await tx
+        .update(channel_line_state)
+        .set({
+          session_owner_instance: args.owner_instance,
+          session_owner_lease_expires_at: leaseExpr as unknown as Date,
+          ...(isRenewal
+            ? {}
+            : {
+                session_fencing_token: sql`${channel_line_state.session_fencing_token} + 1` as unknown as number,
+                session_owner_acquired_at: sql`now()` as unknown as Date,
+              }),
+          updated_at: sql`now()` as unknown as Date,
+        })
+        .where(eq(channel_line_state.channel_id, args.channel_id))
+        .returning({
+          fencing_token: channel_line_state.session_fencing_token,
+          acquired_at: channel_line_state.session_owner_acquired_at,
+        });
+      const row = updated[0]!;
+      return {
+        ok: true as const,
+        takeover,
+        grant: {
+          channel_id: args.channel_id,
+          fencing_token: row.fencing_token,
+          acquired_at: row.acquired_at!,
+          previous_owner: takeover ? previousOwner : null,
+        },
+      };
+    });
+  },
+
+  /**
+   * Issue #513 §6 — HEARTBEAT COM CAS. Renova apenas as linhas que ainda são
+   * desta instância COM o mesmo fencing token, e DEVOLVE as perdidas.
+   *
+   * A diferença para `renewSessionLeases` é a devolução: aqui uma linha que
+   * não renovou é um sinal ACIONÁVEL — o chamador fecha o socket
+   * (fail-closed). Sem isso, um processo pausado por GC longo voltava, via a
+   * lease vencida e reassumida por outro, e continuava enviando por um socket
+   * que já não lhe pertencia.
+   *
+   * `fencing_token: null` = sessão aberta ANTES da migration 115 (janela de
+   * rollout). Essas caem no registro legado da #518, que nunca "perde" — a
+   * exclusividade só passa a valer depois que a linha é readquirida.
+   */
+  async renewFencedSessionLeases(
+    owner_instance: string,
+    held: ReadonlyArray<HeldSessionLine>,
+    lease_ms: number = OWNER_LEASE_MS,
+  ): Promise<{ renewed: string[]; lost: string[] }> {
+    if (held.length === 0) return { renewed: [], lost: [] };
+    const unique = [...new Map(held.map((h) => [h.channel_id, h])).values()];
+    const fenced = unique.filter((h) => h.fencing_token !== null);
+    const legacy = unique.filter((h) => h.fencing_token === null);
+
+    const renewed: string[] = [];
+
+    if (legacy.length > 0) {
+      await this.renewSessionLeases(owner_instance, legacy, lease_ms);
+      renewed.push(...legacy.map((l) => l.channel_id));
+    }
+
+    if (fenced.length > 0) {
+      // UM statement para N linhas: o CAS por (dono, token) vai num JOIN com
+      // um VALUES, em vez de N round-trips. `now()` do banco, sempre.
+      const pairs = sql.join(
+        fenced.map((h) => sql`(${h.channel_id}::uuid, ${h.fencing_token}::bigint)`),
+        sql`, `,
+      );
+      const res = await db.execute(sql`
+        UPDATE channel_line_state AS c
+           SET session_owner_lease_expires_at =
+                 now() + ${lease_ms}::int * interval '1 millisecond',
+               updated_at = now()
+          FROM (VALUES ${pairs}) AS h(channel_id, fencing_token)
+         WHERE c.channel_id = h.channel_id
+           AND c.session_owner_instance = ${owner_instance}
+           AND c.session_fencing_token = h.fencing_token
+        RETURNING c.channel_id
+      `);
+      renewed.push(
+        ...(res.rows as unknown as Array<{ channel_id: string }>).map((r) => r.channel_id),
+      );
+    }
+
+    const renewedSet = new Set(renewed);
+    return {
+      renewed,
+      lost: unique.map((h) => h.channel_id).filter((id) => !renewedSet.has(id)),
+    };
+  },
+
+  /**
    * Abre mão da posse da sessão (shutdown ordenado da #512, stop explícito).
    * Liberar aqui, em vez de esperar a lease vencer, deixa outra réplica
    * assumir a linha imediatamente.
+   *
+   * O fencing token NÃO é zerado: ele é monotônico por canal, e reiniciá-lo
+   * revalidaria um dono antigo que ainda carregasse o valor anterior.
    */
   async releaseSessionOwnership(
     owner_instance: string,

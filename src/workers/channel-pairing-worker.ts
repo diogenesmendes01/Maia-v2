@@ -295,16 +295,27 @@ async function executeStopLine(row: {
 }
 
 /**
- * Publica a posse das sessões que vivem NESTE processo. Best-effort: uma
- * falha aqui só atrasa o endereçamento até o próximo tick (≤5s), e a lease
- * vencida do alvo já é o escape que impede um comando de ficar pendurado.
+ * Renova a posse das sessões que vivem NESTE processo — e FECHA as que a
+ * perderam (issue #513 §6).
+ *
+ * Antes (#518) era só uma publicação: um upsert last-writer-wins que
+ * registrava "quem segura o socket" para endereçar `stop_line`/`repair`.
+ * Agora é o heartbeat de uma LEASE com fencing token: `heartbeatLineOwnership`
+ * faz o CAS por `(instância, token)` e encerra imediatamente o socket de
+ * qualquer linha cujo CAS falhou. É o mecanismo que permite mais de uma
+ * réplica `session-owner` sem split-brain de sessão.
+ *
+ * Best-effort quanto ao BANCO: uma falha aqui só atrasa a renovação até o
+ * próximo tick (≤5s) e a lease tem 60s de folga. O que NÃO é best-effort é a
+ * perda comprovada — essa fecha o socket na hora.
  */
 async function publishLocalSessionOwnership(): Promise<void> {
   try {
-    const { listLocalLineSessions } = await import('@/gateway/line-sessions.js');
-    const lines = listLocalLineSessions();
-    if (lines.length === 0) return;
-    await channelLineStateRepo.renewSessionLeases(OWNER_INSTANCE, lines);
+    const { heartbeatLineOwnership } = await import('@/gateway/line-sessions.js');
+    const { lost } = await heartbeatLineOwnership();
+    if (lost > 0) {
+      incCounter('maia_channel_pairing_total', { outcome: 'session_ownership_lost' });
+    }
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },

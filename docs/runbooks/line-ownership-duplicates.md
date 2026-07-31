@@ -176,3 +176,159 @@ Atenção: canais desativados durante a resolução (§2.2) **não** são
 reativados pelo rollback — reativá-los é decisão operacional explícita
 (e, com o índice removido, deixa de haver guarda contra duplicata; só
 reative um dos lados).
+
+---
+
+# Parte 2 — posse de SESSÃO entre réplicas (migration 115, issue #513)
+
+A parte acima trata de **posse de linha entre workspaces**: duas rows de
+`channels` ativas para o mesmo número. Esta parte trata de outra coisa, que
+antes da 115 não tinha guarda nenhuma: **duas réplicas do runtime abrindo um
+socket para a MESMA linha**.
+
+São camadas independentes e ambas necessárias. A 091 impede que dois tenants
+reivindiquem o mesmo número. A 115 impede que dois processos reivindiquem a
+mesma linha do mesmo tenant.
+
+## 5. O que a 115 acrescenta
+
+A #518 já registrava `session_owner_instance` + `session_owner_lease_expires_at`
+para **endereçar** comandos (`stop_line`, `repair`) à réplica que segura o
+socket. Isso é roteamento, não exclusividade: a escrita era um upsert
+last-writer-wins feito **depois** de o socket abrir, e o caminho de boot
+(`startAdditionalLineSessions`) enumerava todas as linhas ativas e abria uma
+sessão para cada, sem reivindicar nada.
+
+A 115 acrescenta duas colunas e inverte a ordem:
+
+| Coluna | Papel |
+|---|---|
+| `session_fencing_token` | contador **monotônico** por canal; incrementa a cada nova posse, nunca em renovação, nunca no release |
+| `session_owner_acquired_at` | quando esta posse (este token) começou |
+
+O socket agora só abre **depois** de `acquireSessionLease` conceder. A
+expiração é sempre avaliada com `now()` do banco — containers com clock skew
+não roubam nem cedem posse.
+
+## 6. Diagnóstico
+
+### 6.1 Quem segura cada linha, agora
+
+```sql
+SELECT c.external_id,
+       s.state,
+       s.session_owner_instance,
+       s.session_fencing_token,
+       s.session_owner_acquired_at,
+       s.session_owner_lease_expires_at,
+       s.session_owner_lease_expires_at > now() AS lease_viva
+  FROM channel_line_state s
+  JOIN channels c ON c.id = s.channel_id
+ WHERE s.session_owner_instance IS NOT NULL
+ ORDER BY s.session_owner_lease_expires_at;
+```
+
+`lease_viva = false` com dono preenchido = **réplica morta**. Não é incidente:
+a próxima aquisição toma a linha e incrementa o token. Vira incidente se
+persistir por mais de ~2 minutos com o `session-owner` no ar — aí o heartbeat
+(`channel_pairing`, 5s) não está rodando, e a causa quase sempre é o papel:
+confira `MAIA_PROCESS_ROLE` e a linha `worker.inventory` no boot.
+
+### 6.2 Uma linha trocando de dono sem parar (flapping)
+
+```sql
+SELECT c.external_id, s.session_fencing_token, s.session_owner_acquired_at
+  FROM channel_line_state s JOIN channels c ON c.id = s.channel_id
+ WHERE s.session_owner_acquired_at > now() - interval '10 minutes'
+ ORDER BY s.session_fencing_token DESC;
+```
+
+Token subindo depressa = takeover repetido. Causas, em ordem de frequência:
+
+1. **Lease curta demais para a carga.** `OWNER_LEASE_MS` é 60s e o heartbeat
+   roda a cada 5s; se o tick do `channel_pairing` está demorando >60s, o dono
+   não renova a tempo. Veja `maia_worker_active_jobs{worker="channel_pairing"}`
+   preso em 1 e `maia_worker_tick_skipped_total{reason="overlap"}` subindo.
+2. **Réplica reiniciando em loop.** Cada boot toma a linha de volta.
+3. **Postgres intermitente.** O CAS falha, o dono fecha o socket fail-closed, e
+   outra réplica assume. Correto, mas visível — trate o Postgres.
+
+### 6.3 Trilha de auditoria
+
+```sql
+SELECT criado_em, acao, metadata->>'channel_id' AS channel,
+       metadata->>'owner_instance' AS owner,
+       metadata->>'previous_owner' AS previous,
+       metadata->>'fencing_token' AS token
+  FROM audit_log
+ WHERE acao LIKE 'line_session_ownership_%'
+ ORDER BY criado_em DESC LIMIT 50;
+```
+
+- `_acquired` — posse de uma linha livre.
+- `_taken_over` — a lease do dono anterior venceu e esta instância assumiu.
+  `previous_owner` diz de quem.
+- `_lost` — o CAS do heartbeat falhou; **o socket local já foi fechado** quando
+  esta linha foi escrita.
+
+Um `_lost` sem um `_taken_over` correspondente em outra instância significa que
+a linha ficou órfã (nenhuma réplica a reassumiu) — verifique se sobrou algum
+`session-owner` no ar.
+
+## 7. Resolução
+
+### 7.1 Duas réplicas parecem responder pela mesma linha
+
+Não deveria acontecer depois da 115. Se acontecer, é bug — colete antes de
+mexer:
+
+```bash
+# 1. Estado do banco (§6.1) e auditoria (§6.3), salvos em arquivo.
+# 2. Qual papel cada container roda:
+docker compose -f compose.roles.yml exec session-owner printenv MAIA_PROCESS_ROLE
+# 3. A linha de inventário do boot de cada réplica:
+docker compose -f compose.roles.yml logs session-owner | grep worker.inventory
+```
+
+Contenção imediata: **desabilite a linha pelo console**. O `stop_line` é
+endereçado ao dono registrado e derruba o socket de verdade; com a lease do
+alvo vencida, qualquer réplica conclui.
+
+### 7.2 Linha presa sem dono (ninguém abre)
+
+Sintoma: `session_owner_instance IS NULL` e a linha ativa não responde. Causas:
+
+- **auth state ausente** — `line_session.auth_state_missing_pair_first` no log.
+  A linha precisa ser re-pareada pelo console; não há posse a resolver.
+- **aquisição falhando por banco** — `line_session.ownership_acquire_failed`.
+  Fail-closed correto; trate o Postgres e a próxima varredura abre.
+
+Nunca "force" a posse escrevendo `session_owner_instance` na mão: o token
+ficaria dessincronizado do que a réplica tem em memória, e o CAS do heartbeat
+passaria a falhar em loop.
+
+## 8. Rollback da 115
+
+Reverter volta ao contrato da 103: o endereçamento de `stop_line`/`repair`
+continua funcionando, mas a **exclusividade some** — duas réplicas
+`session-owner` voltam a poder abrir a mesma linha.
+
+Por isso a ordem importa:
+
+```bash
+# 1. Reduza a UMA réplica de session-owner ANTES de reverter.
+docker compose -f compose.roles.yml up -d --scale session-owner=1
+
+# 2. Confirme posse única (§6.1): uma row por linha, um único owner_instance.
+
+# 3. Backup lógico.
+npm run backup
+
+# 4. Down.
+psql "$DATABASE_URL" -f migrations/115_channel_session_lease_fencing_down.sql
+psql "$DATABASE_URL" -c "DELETE FROM schema_migrations WHERE id = '115_channel_session_lease_fencing.sql'"
+```
+
+Ou volte a topologia inteira para `MAIA_PROCESS_ROLE=all` (`compose.prod.yml`),
+que é o alvo de rollback documentado da #512 e não exige reverter migration
+alguma — as colunas ficam e são ignoradas.

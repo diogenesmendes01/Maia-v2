@@ -56,7 +56,21 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 }));
 // #518 — ver nota em line-sessions-shutdown.spec.ts.
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
-  channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
+  // #513 — a sessão só abre depois de ADQUIRIR a posse da linha. Aqui a
+  // aquisição sempre concede; a exclusividade tem suíte própria.
+  channelLineStateRepo: {
+    upsertTransition: vi.fn(async () => undefined),
+    acquireSessionLease: vi.fn(async () => ({
+      ok: true as const,
+      takeover: false,
+      grant: {
+        channel_id: 'c',
+        fencing_token: 1,
+        acquired_at: new Date(),
+        previous_owner: null,
+      },
+    })),
+  },
 }));
 vi.mock('../../../src/gateway/baileys.js', () => ({
   ingressUpsertMessage: ingressMock,

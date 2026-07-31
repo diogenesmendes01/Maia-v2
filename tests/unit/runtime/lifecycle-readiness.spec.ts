@@ -252,9 +252,17 @@ describe('checkRoleReadiness — role awareness', () => {
     lifecycle.transitionTo('ready');
     const r = await checkRoleReadiness();
     const required = r.checks.filter((c) => c.required).map((c) => c.component).sort();
+    // `queue` entrou na #513: o scheduler ENFILEIRA (`message_recovery`,
+    // `unrouted_recovery`). Sem a fila no contrato, `src/index.ts` fase 7
+    // retornava cedo e esses crons rodavam contra uma fila nunca construída —
+    // um scheduler pronto por definição, e quebrado na prática.
     expect(required).toEqual(
-      ['config', 'cron_scheduler', 'db', 'redis', 'redis_memory', 'schema'].sort(),
+      ['config', 'cron_scheduler', 'db', 'queue', 'redis', 'redis_memory', 'schema'].sort(),
     );
+    // …e continua NÃO gateando no que ele não faz: a igualdade acima já prova
+    // que agent_worker, whatsapp_session e http ficaram de fora.
+    expect(required).not.toContain('whatsapp_session');
+    expect(required).not.toContain('agent_worker');
   });
 });
 
