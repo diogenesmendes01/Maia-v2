@@ -24,6 +24,10 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/retention.ts` | Manifest-driven, hold-aware artifact deletion with confirmation and a conclusive outcome |
 | `src/ops/backup/rpo.ts` | RPO/RTO readiness: level + evidence + remediation per check |
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
+| `src/ops/retention/proposed-policy.ts` | The owner's proposal (#536) as a loadable `RETENTION_POLICY` — pending homologation, so it counts and arms nothing |
+| `src/ops/retention/derivation.ts` | Derived data never outlives its source: the clamp behind `postgres.memory` and `postgres.conversations` |
+| `src/ops/retention/activation.ts` | Which class may stop counting and start deleting — five conditions, wave order, two observed dry-run cycles |
+| `src/ops/retention/tombstone-floor.ts` | `tombstone > longest backup retention`, the predicate behind the boot rule `retention/tombstone-exceeds-backup` |
 | `src/ops/retention/legal-hold.ts` | Deterministic hold evaluator (backend decides) |
 | `src/ops/retention/tombstones.ts` | Pseudonymised, signed ledger + post-restore reconciliation gate |
 
@@ -41,7 +45,8 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | Add a backup configuration knob | Declare it in `src/config/contract.ts` (group `backup`), add it to `BackupConfigInput`/`backupConfigInput()`, and put its fail-closed rule in `src/config/rules.ts` (`backup/*`). Then `npm run config:generate`. |
 | Add a lifecycle stage | `state-machine.ts` (`BACKUP_STATES` + `TRANSITIONS`), then the CHECK in `migrations/101_*.sql` |
 | Add a manifest field | `manifest.ts` (`backupManifestSchema`); bump `MANIFEST_VERSION` only when an existing field's MEANING changes |
-| Add a data class | `retention/data-classes.ts` + the matrix doc; state its `dpo_open_question` |
+| Add a data class | `retention/data-classes.ts` + the matrix doc + a row in `retention/proposed-policy.ts`; state its `dpo_open_question`, and put it in an `ACTIVATION_WAVES` wave (a class outside the order can never be armed) |
+| Make a class inherit another's period | `retention/derivation.ts` — `RETENTION_SOURCES` is the TRANSITIVE closure; list every ancestor, not just the parent |
 | Add a readiness check | `rpo.ts` — every check must carry evidence and remediation |
 | Support another off-site provider | `src/workers/backup-s3.ts` (protocol-compatible) or a new adapter behind `BackupPorts.upload`/`verifyRemote` |
 

@@ -31,6 +31,31 @@ const recordRetentionRunMock = vi.fn().mockResolvedValue(undefined);
 const readdirSyncMock = vi.fn(() => [] as string[]);
 const listArtifactRunsMock = vi.fn().mockResolvedValue([]);
 const reclaimAbandonedRunsMock = vi.fn().mockResolvedValue([]);
+// #536 — the observed dry-run cycles the activation gate reads.
+const countCyclesMock = vi.fn().mockResolvedValue({});
+/**
+ * Mutable config stand-in: the activation gate (#536) reads `RETENTION_POLICY`
+ * and `RETENTION_DRY_RUN`, and the arming tests have to move both.
+ */
+const configMock: Record<string, unknown> = {
+  NODE_ENV: 'development',
+  BACKUP_DIR: '/tmp/maia-backups',
+  DATABASE_URL: 'postgres://localhost/maia',
+  BACKUP_ENABLED: true,
+  BACKUP_RETENTION_LOCAL_DAYS: 7,
+  BACKUP_RETENTION_CLOUD_DAYS: 30,
+  BACKUP_ENCRYPTION_MODE: 'none',
+  BACKUP_DUMP_TIMEOUT_MS: 3_600_000,
+  BACKUP_UPLOAD_TIMEOUT_MS: 1_800_000,
+  BACKUP_RESTORE_TIMEOUT_MS: 3_600_000,
+  BACKUP_MIN_ARTIFACT_BYTES: 4096,
+  BACKUP_RPO_TARGET_HOURS: 24,
+  BACKUP_RTO_TARGET_MINUTES: 120,
+  BACKUP_RESTORE_DRILL_INTERVAL_HOURS: 168,
+  RETENTION_DRY_RUN: true,
+  RETENTION_POLICY: undefined,
+  RETENTION_TOMBSTONE_MIN_DAYS: 60,
+};
 
 vi.mock('node:fs', () => ({
   readdirSync: readdirSyncMock,
@@ -58,6 +83,7 @@ vi.mock('../../src/db/repositories/ops-repos.js', () => ({
   reclaimAbandonedRuns: reclaimAbandonedRunsMock,
   markRunDeleted: vi.fn(),
   recordRetentionRun: recordRetentionRunMock,
+  countCompletedDryRunCycles: countCyclesMock,
 }));
 vi.mock('../../src/ops/backup/adapters.js', () => ({
   createBackupPorts: createBackupPortsMock,
@@ -70,25 +96,7 @@ vi.mock('../../src/ops/backup/single-flight.js', () => ({
   withOpsLock: withOpsLockMock,
   requireOpsLock: requireOpsLockMock,
 }));
-vi.mock('../../src/config/env.js', () => ({
-  config: {
-    NODE_ENV: 'development',
-    BACKUP_DIR: '/tmp/maia-backups',
-    DATABASE_URL: 'postgres://localhost/maia',
-    BACKUP_ENABLED: true,
-    BACKUP_RETENTION_LOCAL_DAYS: 7,
-    BACKUP_RETENTION_CLOUD_DAYS: 30,
-    BACKUP_ENCRYPTION_MODE: 'none',
-    BACKUP_DUMP_TIMEOUT_MS: 3_600_000,
-    BACKUP_UPLOAD_TIMEOUT_MS: 1_800_000,
-    BACKUP_RESTORE_TIMEOUT_MS: 3_600_000,
-    BACKUP_MIN_ARTIFACT_BYTES: 4096,
-    BACKUP_RPO_TARGET_HOURS: 24,
-    BACKUP_RTO_TARGET_MINUTES: 120,
-    BACKUP_RESTORE_DRILL_INTERVAL_HOURS: 168,
-    RETENTION_DRY_RUN: true,
-  },
-}));
+vi.mock('../../src/config/env.js', () => ({ config: configMock }));
 
 function lockRuns(): void {
   withOpsLockMock.mockImplementation(
@@ -141,6 +149,10 @@ beforeEach(() => {
   listArtifactRunsMock.mockResolvedValue([]);
   reclaimAbandonedRunsMock.mockReset();
   reclaimAbandonedRunsMock.mockResolvedValue([]);
+  countCyclesMock.mockReset();
+  countCyclesMock.mockResolvedValue({});
+  configMock.RETENTION_DRY_RUN = true;
+  configMock.RETENTION_POLICY = undefined;
   runVerifiedBackupMock.mockResolvedValue(backupResult());
   runArtifactRetentionMock.mockResolvedValue(retentionOutcome());
   // The retention lock is fail-closed: `requireOpsLock` runs the body or throws.
@@ -434,6 +446,16 @@ describe('backup_retention worker', () => {
     );
   });
 
+  it('records the policy version IN FORCE, so the cycle count is scoped to it', async () => {
+    isS3ConfiguredMock.mockReturnValue(false);
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(recordRetentionRunMock).toHaveBeenCalledWith(
+      expect.objectContaining({ policy_version: 'v0-pending-dpo' }),
+    );
+    expect(countCyclesMock).toHaveBeenCalledWith('v0-pending-dpo');
+  });
+
   it('runs under the reserved system context (not default/default)', async () => {
     isS3ConfiguredMock.mockReturnValue(false);
     let observed: { tenant_id: string; agent_id: string } | null = null;
@@ -448,5 +470,101 @@ describe('backup_retention worker', () => {
     expect(isSystemContext(observed!)).toBe(true);
     expect(observed!.tenant_id).not.toBe('default');
     expect(observed!.agent_id).not.toBe('default');
+  });
+});
+
+/**
+ * Issue #536 — the activation gate, exercised through the worker.
+ *
+ * The point of these cases is the BREAKING CHANGE: `RETENTION_DRY_RUN=false`
+ * used to be sufficient to arm this pass and is now only necessary. Each case
+ * satisfies every condition but one and asserts the pass still only counts.
+ */
+describe('backup_retention — activation gate (#536)', () => {
+  const dryRunOf = () =>
+    (runArtifactRetentionMock.mock.calls[0]![2] as { dryRun: boolean }).dryRun;
+
+  function policyJson(over: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      version: 'v-test-1',
+      approved_by: 'dpo@example',
+      approved_at: '2026-07-01T00:00:00.000Z',
+      classes: { 'backup.artifact': { retention_days: 30, dry_run: false } },
+      ...over,
+    });
+  }
+
+  /** Every condition satisfied — the only shape that may delete. */
+  function armEverything(): void {
+    isS3ConfiguredMock.mockReturnValue(false);
+    configMock.RETENTION_DRY_RUN = false;
+    configMock.RETENTION_POLICY = policyJson();
+    countCyclesMock.mockResolvedValue({ 'backup.artifact': 2 });
+  }
+
+  it('arms only when every condition holds', async () => {
+    armEverything();
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(false);
+  });
+
+  it('keeps counting when the global lever is still on', async () => {
+    armEverything();
+    configMock.RETENTION_DRY_RUN = true;
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(true);
+  });
+
+  it('keeps counting for a policy that is only PROPOSED (pending homologation)', async () => {
+    armEverything();
+    configMock.RETENTION_POLICY = policyJson({ approved_by: 'pending_dpo_homologation' });
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(true);
+  });
+
+  it('keeps counting when the class is named but not armed in writing', async () => {
+    armEverything();
+    configMock.RETENTION_POLICY = policyJson({
+      classes: { 'backup.artifact': { retention_days: 30 } },
+    });
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(true);
+  });
+
+  it('keeps counting with fewer than two observed dry-run cycles', async () => {
+    armEverything();
+    countCyclesMock.mockResolvedValue({ 'backup.artifact': 1 });
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(true);
+  });
+
+  it('keeps counting when the cycle count cannot be read at all (fail-closed)', async () => {
+    armEverything();
+    // The repository swallows its own errors and returns {} — i.e. zero cycles.
+    countCyclesMock.mockResolvedValue({});
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(dryRunOf()).toBe(true);
+  });
+
+  it('audits WHY the pass is only counting', async () => {
+    armEverything();
+    countCyclesMock.mockResolvedValue({});
+    const { runBackupRetention } = await import('../../src/workers/backup.js');
+    await runBackupRetention();
+    expect(auditMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'retention_run_started',
+        metadata: expect.objectContaining({
+          activation_reason: 'insufficient_dry_run_cycles',
+          activation_wave: 1,
+        }),
+      }),
+    );
   });
 });

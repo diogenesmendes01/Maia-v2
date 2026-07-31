@@ -31,9 +31,13 @@ function approvedPolicy(classes: Record<string, number>): string {
 describe('the inventory covers every class the issue enumerates', () => {
   it.each([
     'postgres.messages',
+    // #536 — a transcript has its own (shorter) period, so it has its own class.
+    'postgres.messages.audio_transcript',
     'postgres.conversations',
     'postgres.people',
     'postgres.memory',
+    // #536 — pinned memory does not inherit, so it is not the same class.
+    'postgres.memory.pinned',
     'postgres.financial',
     'postgres.audit',
     'postgres.traces',
@@ -122,7 +126,8 @@ describe('parseRetentionPolicy', () => {
     const p = parseRetentionPolicy(approvedPolicy({ 'postgres.traces': 30 }));
     expect(p.approved).toBe(true);
     expect(p.approved_by).toBe('dpo@example');
-    expect(p.classes['postgres.traces']).toEqual({ retention_days: 30 });
+    // #536 — `dry_run` defaults to TRUE: naming a class does not arm it.
+    expect(p.classes['postgres.traces']).toEqual({ retention_days: 30, dry_run: true });
   });
 
   it('silently drops entries for unknown classes', () => {
@@ -140,6 +145,55 @@ describe('parseRetentionPolicy', () => {
 
   it('rejects a non-positive retention (a 0-day policy would delete on write)', () => {
     expect(parseRetentionPolicy(approvedPolicy({ 'postgres.traces': 0 })).approved).toBe(false);
+  });
+});
+
+/**
+ * Issue #536 — a policy can now be structurally valid WITHOUT being signed off.
+ * That is what lets the owner's proposal ship as a real, loadable value that
+ * starts counting and arms nothing.
+ */
+describe('homologation is separate from parseability', () => {
+  it('marks a real approver as homologated', () => {
+    expect(parseRetentionPolicy(approvedPolicy({ 'postgres.traces': 30 })).homologated).toBe(true);
+  });
+
+  it.each([
+    'pending_dpo_homologation',
+    'pending_dpo',
+    'pending_homologation',
+    'pending_accountant_homologation',
+    // Case and padding must not be a way around the sentinel.
+    '  Pending_DPO_Homologation  ',
+  ])('treats %s as NOT homologated', (approver) => {
+    const raw = JSON.stringify({
+      version: 'v1',
+      approved_by: approver,
+      approved_at: '2026-07-01T00:00:00.000Z',
+      classes: { 'postgres.traces': { retention_days: 30 } },
+    });
+    const p = parseRetentionPolicy(raw);
+    expect(p.approved).toBe(true);
+    expect(p.homologated).toBe(false);
+  });
+
+  it('reports the unapproved policy as not homologated either', () => {
+    expect(UNAPPROVED_POLICY.homologated).toBe(false);
+  });
+
+  it('carries an explicit per-class arming flag when the policy sets it', () => {
+    const raw = JSON.stringify({
+      version: 'v1',
+      approved_by: 'dpo@example',
+      approved_at: '2026-07-01T00:00:00.000Z',
+      classes: {
+        'postgres.traces': { retention_days: 30, dry_run: false },
+        'media.blobs': { retention_days: 7, dry_run: true },
+      },
+    });
+    const p = parseRetentionPolicy(raw);
+    expect(p.classes['postgres.traces']!.dry_run).toBe(false);
+    expect(p.classes['media.blobs']!.dry_run).toBe(true);
   });
 });
 

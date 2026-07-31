@@ -228,6 +228,48 @@ export async function recordRetentionRun(row: {
   });
 }
 
+/**
+ * Completed dry-run CYCLES per data class, for one policy version (#536).
+ *
+ * This is the evidence `resolveActivation` requires before a class may stop
+ * counting and start deleting. Three things make the count mean what the
+ * activation gate needs:
+ *
+ *  - DISTINCT `correlation_id`, not row count. One weekly pass writes one row
+ *    per destination (local + off-site), and two destinations in one night are
+ *    one cycle of observation, not two.
+ *  - `policy_version` scoped. Editing the policy restarts the observation,
+ *    because the counts the operator compared were counts of a different
+ *    policy.
+ *  - `status = 'completed'` only. A partial or failed pass proves nothing about
+ *    what the plan would have deleted.
+ *
+ * Fails CLOSED: on any error the caller gets an empty map, which reads as zero
+ * observed cycles, which keeps every class in dry-run.
+ */
+export async function countCompletedDryRunCycles(
+  policyVersion: string,
+): Promise<Record<string, number>> {
+  try {
+    const res = await db.execute<{ data_class: string; cycles: string }>(sql`
+      SELECT data_class, count(DISTINCT correlation_id)::text AS cycles
+        FROM ${retention_runs}
+       WHERE dry_run = true
+         AND status = 'completed'
+         AND policy_version = ${policyVersion}
+       GROUP BY data_class
+    `);
+    const out: Record<string, number> = {};
+    for (const row of res.rows) {
+      const n = Number(row.cycles);
+      if (Number.isFinite(n) && n > 0) out[row.data_class] = n;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export interface ReadinessFacts {
   last_local_verified_at: Date | null;
   last_offsite_verified_at: Date | null;

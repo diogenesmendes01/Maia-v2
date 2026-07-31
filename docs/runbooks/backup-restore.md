@@ -103,7 +103,7 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 
 | O quê | Política | Recuperação |
 |---|---|---|
-| `/app/media` | Volume separado; **não** está no dump | **Decisão pendente** (ver [matriz](../architecture/concerns/data-retention-matrix.md)). Hoje um restore volta sem anexos |
+| `/app/media` | Volume separado; **não** está no dump. A proposta da #536 declara a mídia **efêmera** (7 dias após processamento, sem backup próprio) — pendente de homologação (ver [matriz](../architecture/concerns/data-retention-matrix.md)) | Um restore volta sem anexos — consequência declarada da política, não lacuna |
 | Sessão Baileys | Segredo operacional; nunca no dump nem em log | **Re-pair**: pare o app, remova o diretório de auth, reinicie e refaça o pareamento. Rotacione/revogue a sessão antiga |
 | Redis/BullMQ | Reconstruível; a fonte de verdade é o Postgres | **Não restaure Redis antigo**: reexecutaria side effects já ocorridos. Suba vazio e deixe o outbox relayer reidratar |
 
@@ -121,7 +121,31 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 
 ## 7. Retenção, legal hold e LGPD
 
-**A retenção não apaga nada hoje.** `RETENTION_DRY_RUN=true` é o default e, sem uma `RETENTION_POLICY` aprovada pelo DPO, `resolveRetention` devolve `purgeable: false` para todas as classes. Ver a [matriz](../architecture/concerns/data-retention-matrix.md) para as perguntas em aberto e o procedimento de ativação.
+**A retenção não apaga nada hoje.** `RETENTION_DRY_RUN=true` é o default e, sem uma `RETENTION_POLICY` **homologada**, `resolveRetention` devolve `purgeable: false` para todas as classes. Ver a [matriz](../architecture/concerns/data-retention-matrix.md) para a política proposta, o que ainda depende de homologação e o procedimento de ativação.
+
+### Ativação (issue #536) — cinco condições, todas necessárias
+
+`RETENTION_DRY_RUN=false` **deixou de ser suficiente**. `resolveActivation` (`src/ops/retention/activation.ts`) só devolve `enforce` quando **todas** valem:
+
+1. `RETENTION_DRY_RUN=false`;
+2. a política está **homologada** — `approved_by` não é o sentinela `pending_dpo_homologation`;
+3. a classe está armada **por escrito**: `"dry_run": false` na entrada dela;
+4. a **onda** foi alcançada — `postgres.traces` / `privacy.export` / `backup.artifact` primeiro, mídia e transcrição depois, conteúdo de conversa por último;
+5. há **≥ 2 ciclos** de dry-run concluídos **na mesma versão da política** (`retention_runs`, `count(DISTINCT correlation_id)`).
+
+Se o lever global estiver desligado e a classe ainda não armar, o worker registra `retention.activation_withheld` com o código do motivo — para não parecer que a configuração foi ignorada. O motivo também vai para o metadata de `retention_run_started`.
+
+```sql
+-- Ciclos já observados por classe, na política em vigor
+SELECT data_class, count(DISTINCT correlation_id) AS cycles
+FROM retention_runs
+WHERE dry_run AND status = 'completed' AND policy_version = '<versão em vigor>'
+GROUP BY data_class;
+```
+
+### Piso do tombstone — trava o boot
+
+`RETENTION_TOMBSTONE_MIN_DAYS` (default **60**) precisa ser **estritamente maior** que `max(BACKUP_RETENTION_LOCAL_DAYS, BACKUP_RETENTION_CLOUD_DAYS)`. Um tombstone que expira antes do artefato deixa de bloquear a ressurreição. A regra `retention/tombstone-exceeds-backup` tem escopo **boot**: subir a retenção remota além do piso **impede o processo de subir** até o piso acompanhar. Vale mesmo com `BACKUP_ENABLED=false` — desligar o job não apaga os artefatos já retidos.
 
 ### Retenção de artefatos (`backup_retention`, domingos 04:00)
 

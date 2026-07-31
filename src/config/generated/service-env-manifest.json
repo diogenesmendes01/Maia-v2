@@ -628,6 +628,13 @@
           "restartRequired": true
         },
         {
+          "name": "RETENTION_TOMBSTONE_MIN_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -1308,6 +1315,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1483,6 +1491,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1657,6 +1666,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -2443,6 +2453,13 @@
           "required": false,
           "group": "backup",
           "restartRequired": true
+        },
+        {
+          "name": "RETENTION_TOMBSTONE_MIN_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2500,7 +2517,8 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS"
           ]
         },
         "staging": {
@@ -2548,7 +2566,8 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS"
           ]
         },
         "production": {
@@ -2596,7 +2615,8 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS"
           ]
         }
       }
@@ -3030,6 +3050,13 @@
           "restartRequired": true
         },
         {
+          "name": "RETENTION_TOMBSTONE_MIN_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -3123,6 +3150,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3190,6 +3218,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3257,6 +3286,7 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "RETENTION_TOMBSTONE_MIN_DAYS",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]

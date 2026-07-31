@@ -12,6 +12,9 @@
  */
 import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
 import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
+// Zero-import module (issue #536): keeps `rules.ts` inside the purity gate that
+// `tests/unit/config/contract-purity.spec.ts` walks.
+import { evaluateTombstoneFloor } from '@/ops/retention/tombstone-floor.js';
 import {
   type EnvVarSpec,
   type MaiaProfile,
@@ -413,6 +416,48 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
           'Aumente BACKUP_RETENTION_CLOUD_DAYS para >= BACKUP_RETENTION_LOCAL_DAYS.',
       });
     }
+  }
+
+  // -------------------------------------------------------------------
+  // PISO DO TOMBSTONE (issue #536).
+  //
+  // Das 11 perguntas em aberto da matriz de retenção, esta é a ÚNICA técnica
+  // e não jurídica — dá para responder sem esperar o DPO, e vale responder
+  // antes das outras porque ela protege todas.
+  //
+  // O tombstone é o que impede um restore de ressuscitar dado apagado. Essa
+  // proteção tem prazo de validade: expirado o tombstone, restaurar um
+  // artefato que ainda contém a linha revive o dado e NADA percebe — o ledger
+  // não bloqueia o que já esqueceu. Logo o tombstone precisa sobreviver a todo
+  // artefato que ainda possa carregar a linha.
+  //
+  // BOOT scope, como as demais regras destrutivas da #520: aumentar a retenção
+  // remota sem acompanhar o piso é a mudança de uma linha que reabre a
+  // ressurreição em silêncio, e um warning seria lido depois do incidente.
+  //
+  // FORA do `if (backupEnabled)` de propósito: desligar o backup não apaga os
+  // artefatos já retidos, então a janela de ressurreição continua existindo.
+  // As duas variáveis têm default, então a regra é sempre avaliável.
+  const tombstoneFloor = evaluateTombstoneFloor({
+    tombstoneMinDays: num(c.RETENTION_TOMBSTONE_MIN_DAYS),
+    localBackupDays: num(c.BACKUP_RETENTION_LOCAL_DAYS),
+    cloudBackupDays: num(c.BACKUP_RETENTION_CLOUD_DAYS),
+  });
+  if (!tombstoneFloor.ok) {
+    push({
+      scope: 'boot',
+      severity: 'error',
+      variable: 'RETENTION_TOMBSTONE_MIN_DAYS',
+      rule: 'retention/tombstone-exceeds-backup',
+      message:
+        `RETENTION_TOMBSTONE_MIN_DAYS=${tombstoneFloor.tombstone_min_days} does not exceed the longest configured backup retention ` +
+        `(${tombstoneFloor.longest_backup_days} days). Restoring a retained artifact would resurrect data already erased, ` +
+        'and the tombstone ledger would no longer exist to block it.',
+      remediation:
+        `Use RETENTION_TOMBSTONE_MIN_DAYS >= ${tombstoneFloor.required_min_days}, ` +
+        'ou reduza BACKUP_RETENTION_CLOUD_DAYS/BACKUP_RETENTION_LOCAL_DAYS — ' +
+        'ver docs/architecture/concerns/data-retention-matrix.md.',
+    });
   }
 
   // Exclusão é IRREVERSÍVEL: desligar o dry-run é uma decisão consciente por

@@ -49,11 +49,11 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
+| `runtime` | 169 | 18 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
-| `backup` | 42 | 7 |
-| `maintenance` | 61 | 13 |
+| `backup` | 43 | 7 |
+| `maintenance` | 62 | 13 |
 
 O manifest completo (por serviço e por profile) é gerado em [`src/config/generated/service-env-manifest.json`](../src/config/generated/service-env-manifest.json).
 
@@ -204,7 +204,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `BACKUP_RTO_TARGET_MINUTES` | number | `120` | não | `runtime`, `backup`, `maintenance` | sim | Objetivo de tempo de recuperação, comparado à duração medida do último drill. |
 | `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` | number | `168` | não | `runtime`, `backup`, `maintenance` | sim | Intervalo máximo entre drills de restore aprovados. Vencido, a readiness degrada — até um drill passar, nenhum artefato é sabidamente restaurável. |
 | `RETENTION_DRY_RUN` | string | `true` | não | `runtime`, `backup`, `maintenance` | sim | Executor de retenção só CONTA, não apaga. Default `true` de propósito: exclusão é irreversível, então desligar isso é uma decisão explícita por ambiente. Só `false`/`0` desligam. |
-| `RETENTION_POLICY` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md. |
+| `RETENTION_POLICY` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Política de retenção em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days, dry_run? } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). `dry_run` é POR CLASSE e o default é `true`: nomear uma classe não a arma. O exemplo abaixo é a PROPOSTA da issue #536 — `approved_by=pending_dpo_homologation` marca que ela ainda NÃO foi homologada pelo DPO/contador, e nesse estado `resolveActivation` recusa armar qualquer classe. Ver docs/architecture/concerns/data-retention-matrix.md. |
+| `RETENTION_TOMBSTONE_MIN_DAYS` | number | `60` | não | `runtime`, `backup`, `maintenance` | sim | Piso mínimo (dias) de vida de um tombstone. DECISÃO TÉCNICA, não jurídica (issue #536): precisa ser MAIOR que a maior retenção de backup (local ou off-site). Um tombstone que expira antes do artefato deixa de bloquear a ressurreição — restaurar um backup retido revive dado já apagado e nada percebe. `retention/tombstone-exceeds-backup` (escopo boot) recusa o boot se BACKUP_RETENTION_CLOUD_DAYS/LOCAL_DAYS subirem sem o piso acompanhar. Na v1 `privacy.tombstone` continua NÃO purgável: este é um mínimo a honrar, nunca licença para apagar ao atingi-lo. |
 
 ### Custo
 

@@ -1193,7 +1193,7 @@ export const ENV_CONTRACT = {
   RETENTION_POLICY: {
     name: 'RETENTION_POLICY',
     description:
-      'Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md.',
+      'Política de retenção em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days, dry_run? } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). `dry_run` é POR CLASSE e o default é `true`: nomear uma classe não a arma. O exemplo abaixo é a PROPOSTA da issue #536 — `approved_by=pending_dpo_homologation` marca que ela ainda NÃO foi homologada pelo DPO/contador, e nesse estado `resolveActivation` recusa armar qualquer classe. Ver docs/architecture/concerns/data-retention-matrix.md.',
     group: 'backup',
     secret: false,
     services: ['runtime', 'backup', 'maintenance'],
@@ -1201,10 +1201,28 @@ export const ENV_CONTRACT = {
     // (src/ops/retention/data-classes.ts), que devolve a política NÃO-APROVADA
     // em qualquer erro em vez de cair num default embutido.
     schema: z.string().optional(),
+    // ESPELHO de `PROPOSED_RETENTION_POLICY_JSON`
+    // (src/ops/retention/proposed-policy.ts). Não pode ser importado daqui — o
+    // contrato só importa zod (PURITY CONTRACT no topo) — então
+    // `tests/unit/ops/retention-proposed-policy.spec.ts` prende os dois.
     example:
-      '{"version":"v1-dpo-2026-07","approved_by":"<responsável jurídico>","approved_at":"2026-07-01T00:00:00.000Z","classes":{}}',
+      '{"version":"v1-proposta-owner-2026-07","approved_by":"pending_dpo_homologation","approved_at":"2026-07-31T00:00:00.000Z","classes":{"postgres.messages":{"retention_days":180,"dry_run":true},"postgres.messages.audio_transcript":{"retention_days":30,"dry_run":true},"postgres.conversations":{"retention_days":180,"dry_run":true},"postgres.people":{"retention_days":180,"dry_run":true},"postgres.memory":{"retention_days":180,"dry_run":true},"postgres.audit":{"retention_days":180,"dry_run":true},"postgres.traces":{"retention_days":30,"dry_run":true},"media.blobs":{"retention_days":7,"dry_run":true},"backup.artifact":{"retention_days":30,"dry_run":true},"privacy.export":{"retention_days":7,"dry_run":true}}}',
     fixture:
       '{"version":"v0-fixture","approved_by":"fixture-dpo","approved_at":"2026-01-01T00:00:00.000Z","classes":{}}',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  RETENTION_TOMBSTONE_MIN_DAYS: {
+    name: 'RETENTION_TOMBSTONE_MIN_DAYS',
+    description:
+      'Piso mínimo (dias) de vida de um tombstone. DECISÃO TÉCNICA, não jurídica (issue #536): precisa ser MAIOR que a maior retenção de backup (local ou off-site). Um tombstone que expira antes do artefato deixa de bloquear a ressurreição — restaurar um backup retido revive dado já apagado e nada percebe. `retention/tombstone-exceeds-backup` (escopo boot) recusa o boot se BACKUP_RETENTION_CLOUD_DAYS/LOCAL_DAYS subirem sem o piso acompanhar. Na v1 `privacy.tombstone` continua NÃO purgável: este é um mínimo a honrar, nunca licença para apagar ao atingi-lo.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // Default 60 com off-site de 30 — a folga proposta pelo owner na #536.
+    schema: posInt(60),
+    example: '60',
+    fixture: '60',
     restartRequired: true,
     commentedInExample: true,
   },

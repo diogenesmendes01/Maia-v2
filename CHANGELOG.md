@@ -4,6 +4,23 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — piso do tombstone trava o boot, e `RETENTION_DRY_RUN=false` deixa de bastar ([#536](https://github.com/diogenesmendes01/Maia-v2/issues/536))
+
+**1. Nova regra de boot `retention/tombstone-exceeds-backup`.** `RETENTION_TOMBSTONE_MIN_DAYS` (nova variável, default **60**) precisa ser **estritamente maior** que `max(BACKUP_RETENTION_LOCAL_DAYS, BACKUP_RETENTION_CLOUD_DAYS)`. Um tombstone que expira antes do artefato deixa de bloquear a ressurreição: restaurar um backup retido revive dado já apagado e nada percebe. Com os valores atuais (7 local / 30 off-site) a regra está satisfeita com folga e **nenhum ambiente muda de comportamento** — ela só dispara se alguém aumentar a retenção de backup sem acompanhar o piso. Vale mesmo com `BACKUP_ENABLED=false`, porque desligar o job não apaga os artefatos já retidos.
+
+**2. Ativação da retenção passou a ter cinco condições.** `RETENTION_DRY_RUN=false` era **suficiente** para armar o passe de `backup.artifact`; agora é apenas **necessário**. Além dele, é preciso: política **homologada** (`approved_by` diferente de `pending_dpo_homologation`), classe armada por escrito (`"dry_run": false` na entrada dela), a onda de ativação alcançada, e **≥ 2 ciclos** de dry-run concluídos na mesma versão da política. Um ambiente que dependia só do lever passa a **contar em vez de apagar**, e registra `retention.activation_withheld` com o código do motivo. Procedimento em [`docs/runbooks/backup-restore.md`](docs/runbooks/backup-restore.md) §7.
+
+### Added — Política de retenção proposta, materializada ([#536](https://github.com/diogenesmendes01/Maia-v2/issues/536))
+
+> **É uma proposta para homologação do DPO e do contador — não é parecer jurídico nem afirmação de conformidade.** A LGPD não estabelece prazos universais: exige finalidade, necessidade e eliminação ao término do tratamento, salvo as exceções dos arts. 6º e 15–18, com orientação da ANPD. Os arts. 173–174 do CTN têm janelas de cinco anos mas **não constituem tabela universal de retenção**. Cada prazo é um **default operacional configurável, pendente de homologação**.
+
+- [`docs/architecture/concerns/data-retention-matrix.md`](docs/architecture/concerns/data-retention-matrix.md) deixou de ser `DRAFT — NÃO APROVADO` e passou a **"Política proposta — pendente de homologação do DPO/contador"**, com a política, a base declarada e **o que ainda depende de homologação** por classe.
+- `src/ops/retention/proposed-policy.ts` — a proposta como `RETENTION_POLICY` carregável, que é também o exemplo do `.env.example`. Carregá-la **começa a contar e arma nada**: o aprovador é o sentinela `pending_dpo_homologation` e toda classe entra com `dry_run: true`.
+- `src/ops/retention/derivation.ts` — dado derivado nunca sobrevive à fonte. `postgres.memory` herda o **menor** prazo das fontes e `postgres.conversations` não sobrevive às mensagens, por **clamp** no único caminho que responde "por quanto tempo posso guardar", não por comentário. Teste de propriedade cobre toda combinação de prazos.
+- `src/ops/retention/activation.ts` — ordem de ativação executável (`postgres.traces` / `privacy.export` / `backup.artifact` primeiro) com exigência de dois ciclos de dry-run.
+- Duas classes novas no inventário: `postgres.messages.audio_transcript` (prazo mais curto que o corpo da mensagem) e `postgres.memory.pinned` (não herda; exige finalidade e prazo próprios).
+- `RETENTION_POLICY` aceita `dry_run` **por classe**, com default `true`: nomear uma classe não a arma.
+
 ### ⚠️ BREAKING (operacional) — o boot passa a falhar fechado por configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
 
 > **Um ambiente que sobe hoje pode parar de subir no primeiro release que contiver esta mudança.** Rode `npm run config:check -- --profile production --env-file .env` contra o `.env` de cada ambiente **antes** de deployar. Runbook completo: [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md).

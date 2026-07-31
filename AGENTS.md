@@ -51,7 +51,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Channels, roles, policies | [`concerns/channel-policy.md`](docs/architecture/concerns/channel-policy.md) |
 | Governance, audit, observability | [`concerns/governance-observability.md`](docs/architecture/concerns/governance-observability.md) |
 | Capability taxonomy (roles · skills · tools · packs · policies) | [`concerns/capability-taxonomy.md`](docs/architecture/concerns/capability-taxonomy.md) |
-| Data retention, legal hold, tombstones (**DRAFT — pending DPO**) | [`concerns/data-retention-matrix.md`](docs/architecture/concerns/data-retention-matrix.md) |
+| Data retention, legal hold, tombstones (**proposta — pendente de homologação do DPO/contador**) | [`concerns/data-retention-matrix.md`](docs/architecture/concerns/data-retention-matrix.md) |
 
 ### Subsystems (one module doc per `src/` subdir)
 

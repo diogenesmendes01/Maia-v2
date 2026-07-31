@@ -21,9 +21,11 @@ import {
   resolveArtifactPath,
 } from '@/ops/backup/artifact-path.js';
 import { OPS_LOCK_KEYS, requireOpsLock, withOpsLock } from '@/ops/backup/single-flight.js';
-import { UNAPPROVED_POLICY_VERSION } from '@/ops/retention/data-classes.js';
+import { parseRetentionPolicy } from '@/ops/retention/data-classes.js';
+import { resolveActivation, type ActivationVerdict } from '@/ops/retention/activation.js';
 import {
   anyActiveLegalHold,
+  countCompletedDryRunCycles,
   listArtifactRuns,
   markRunDeleted,
   reclaimAbandonedRuns,
@@ -216,6 +218,45 @@ export async function runBackupRetention(): Promise<void> {
     const correlationId = randomUUID();
     const profile = resolveBackupProfile(backupConfigInput());
 
+    // ISSUE #536 — the activation gate, not just the global lever.
+    //
+    // `RETENTION_DRY_RUN=false` used to be SUFFICIENT to arm this pass. It is
+    // now NECESSARY BUT NOT SUFFICIENT: the class also needs a homologated
+    // policy that names AND arms it, its wave reached, and two completed
+    // dry-run cycles of the SAME policy version on record. That is the #520
+    // rollout ("dry-run → comparar contagens → desligar dry-run por classe")
+    // as a mechanism instead of a runbook step someone has to remember.
+    //
+    // Fail-closed by construction: an unreadable `retention_runs` yields zero
+    // observed cycles, and zero cycles means dry-run.
+    const policy = parseRetentionPolicy(config.RETENTION_POLICY);
+    const cyclesByClass = await countCompletedDryRunCycles(policy.version);
+    const activation = resolveActivation({
+      classId: 'backup.artifact',
+      policy,
+      dryRunConfigured: profile.retention.dryRun,
+      cyclesByClass,
+    });
+    const dryRun = activation.mode !== 'enforce';
+
+    if (!profile.retention.dryRun && dryRun) {
+      // The operator turned the global lever off and the class still did not
+      // arm. Say so, with the code — otherwise this looks like the setting was
+      // ignored.
+      logger.warn(
+        {
+          data_class: 'backup.artifact',
+          reason: activation.reason,
+          wave: activation.wave,
+          observed_cycles: activation.observed_cycles,
+          required_cycles: activation.required_cycles,
+          blocking_class: activation.blocking_class,
+          policy_version: policy.version,
+        },
+        'retention.activation_withheld',
+      );
+    }
+
     // Destructive work is single-flight and FAILS CLOSED on contention: losing
     // the race must not be mistaken for "nothing to do".
     await requireOpsLock(
@@ -224,7 +265,7 @@ export async function runBackupRetention(): Promise<void> {
       async () => {
         for (const destination of ['local', 's3'] as const) {
           if (destination === 's3' && !isS3Configured()) continue;
-          await runOneRetentionPass(destination, profile.retention.dryRun, correlationId);
+          await runOneRetentionPass(destination, dryRun, correlationId, activation);
         }
       },
     );
@@ -307,10 +348,20 @@ async function runOneRetentionPass(
   destination: 'local' | 's3',
   dryRun: boolean,
   correlationId: string,
+  activation: ActivationVerdict,
 ): Promise<void> {
   await audit({
     acao: 'retention_run_started',
-    metadata: { correlation_id: correlationId, destination, dry_run: dryRun },
+    metadata: {
+      correlation_id: correlationId,
+      destination,
+      dry_run: dryRun,
+      // #536 — WHY this pass is counting rather than deleting, as a stable code.
+      activation_reason: activation.reason,
+      activation_wave: activation.wave,
+      policy_version: activation.policy_version,
+      observed_cycles: activation.observed_cycles,
+    },
   });
 
   const outcome = await runArtifactRetention(
@@ -367,11 +418,16 @@ async function runOneRetentionPass(
     { dryRun, correlationId },
   );
 
+  // The version recorded is the one actually IN FORCE — an unapproved or
+  // malformed `RETENTION_POLICY` resolves to `v0-pending-dpo`, exactly as
+  // before. Recording it (rather than the constant) is what lets
+  // `countCompletedDryRunCycles` scope the two-cycle observation to a policy
+  // version, so editing the policy restarts the count.
   await recordRetentionRun({
     correlation_id: correlationId,
     data_class: 'backup.artifact',
     dry_run: dryRun,
-    policy_version: UNAPPROVED_POLICY_VERSION,
+    policy_version: activation.policy_version,
     status: outcome.status,
     scanned: outcome.scanned,
     eligible: outcome.eligible,
@@ -392,6 +448,8 @@ async function runOneRetentionPass(
       correlation_id: correlationId,
       destination,
       dry_run: dryRun,
+      activation_reason: activation.reason,
+      policy_version: activation.policy_version,
       status: outcome.status,
       scanned: outcome.scanned,
       eligible: outcome.eligible,

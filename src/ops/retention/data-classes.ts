@@ -28,6 +28,14 @@
  * (a) the retention period, (b) the legal basis, and (c) the exceptions.
  * Record the approval in `docs/architecture/concerns/data-retention-matrix.md`
  * and ship it as `RETENTION_POLICY`.
+ *
+ * Issue #536 materialised the owner's PROPOSAL as a configuration artifact
+ * (`./proposed-policy.ts`). A proposal is not an approval: its `approved_by` is
+ * the `pending_dpo_homologation` sentinel, `RetentionPolicy.homologated` is
+ * `false` for it, and `./activation.ts` refuses to arm any class while that is
+ * the case. Nothing below changed: the inventory still ships
+ * `retention_days: null` for every class, because a number HERE would be the
+ * legal assumption the issue forbids.
  * ─────────────────────────────────────────────────────────────────────────
  */
 import { z } from 'zod';
@@ -108,6 +116,27 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
       'retention period for inbound/outbound message bodies, and whether transcripts of audio require a shorter one',
   }),
   cls({
+    // #536 — the owner's proposal gives audio transcripts a SHORTER period than
+    // the message body that carries them (30d vs 180d). A shorter period that
+    // cannot be addressed separately is prose, not policy, so the transcript is
+    // its own class. It has no dedicated column today: the selector is
+    // `mensagens` rows whose `tipo` is audio, and materialising that selector is
+    // a prerequisite listed in the matrix.
+    id: 'postgres.messages.audio_transcript',
+    data_owner: 'platform_ops',
+    purpose: 'speech-to-text transcript of a received audio message',
+    sensitivity: 'sensitive_personal',
+    scope: 'tenant_agent',
+    source_of_truth: "postgres.mensagens (tipo='audio')",
+    purge_mechanism: 'delete',
+    backup_behavior: 'in_pg_dump',
+    legal_hold_applicable: true,
+    reversible: false,
+    audit_event: 'retention_run_completed',
+    dpo_open_question:
+      'whether a transcript of voice needs a shorter period than the message body that carries it, and how short',
+  }),
+  cls({
     id: 'postgres.conversations',
     data_owner: 'platform_ops',
     purpose: 'grouping of messages into a dialogue with its state',
@@ -152,6 +181,26 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     audit_event: 'retention_run_completed',
     dpo_open_question:
       'whether derived memory inherits the retention of its source message or has its own',
+  }),
+  cls({
+    // #536 — memory the USER pinned on purpose is not derived data, so the
+    // inheritance rule in `./derivation.ts` must not reach it: clamping it to
+    // the source message would delete something the user asked to keep, and
+    // exempting it inside the derived class would silently let derived memory
+    // outlive its source. Separate class, separate purpose, separate period.
+    id: 'postgres.memory.pinned',
+    data_owner: 'platform_ops',
+    purpose: 'memory the user explicitly pinned, kept beyond the conversation that produced it',
+    sensitivity: 'sensitive_personal',
+    scope: 'tenant_agent',
+    source_of_truth: 'postgres.agent_memories (pinned by the user)',
+    purge_mechanism: 'delete',
+    backup_behavior: 'in_pg_dump',
+    legal_hold_applicable: true,
+    reversible: false,
+    audit_event: 'retention_run_completed',
+    dpo_open_question:
+      'the purpose and the period of user-pinned memory, which by definition does not inherit the retention of its source',
   }),
   cls({
     id: 'postgres.financial',
@@ -292,8 +341,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: false,
     reversible: false,
     audit_event: 'retention_run_completed',
+    // #536 — ANSWERED, and the only one of the eleven that could be: the
+    // minimum is a technical consequence of the backup windows, not a legal
+    // judgement. It is enforced at boot by `retention/tombstone-exceeds-backup`
+    // rather than left as a number someone has to remember to check.
     dpo_open_question:
-      'the MINIMUM retention for tombstones (must exceed the longest backup retention, or resurrection becomes possible again)',
+      'ANSWERED (#536, technical not legal): the minimum must EXCEED the longest backup retention, enforced at boot by `retention/tombstone-exceeds-backup` (RETENTION_TOMBSTONE_MIN_DAYS, default 60 against a 30-day off-site window)',
   }),
 ]);
 
@@ -323,8 +376,38 @@ export function classesIncludedInDump(): string[] {
 }
 
 /**
+ * Approver sentinels meaning "this policy is a PROPOSAL awaiting homologation".
+ *
+ * Issue #536 ships the owner's proposal as a real, loadable `RETENTION_POLICY`
+ * so that counting can start before the lawyers finish — but a proposal must
+ * never delete. Rather than inventing a parallel "is it real" flag an operator
+ * could forget, the signal is the approver field itself: a policy signed
+ * `pending_dpo_homologation` reads, in the env file, as exactly what it is.
+ *
+ * `homologated: false` is what `./activation.ts` refuses to arm on.
+ */
+export const PENDING_HOMOLOGATION_APPROVER = 'pending_dpo_homologation';
+
+export const PENDING_HOMOLOGATION_APPROVERS: readonly string[] = Object.freeze([
+  PENDING_HOMOLOGATION_APPROVER,
+  'pending_dpo',
+  'pending_homologation',
+  'pending_accountant_homologation',
+]);
+
+/** Is this approver a real sign-off, or the pending-homologation sentinel? */
+export function isHomologatedApprover(approvedBy: string | null | undefined): boolean {
+  if (!approvedBy) return false;
+  return !PENDING_HOMOLOGATION_APPROVERS.includes(approvedBy.trim().toLowerCase());
+}
+
+/**
  * The DPO-approved policy, supplied as configuration. Absent ⇒ nothing is
  * purgeable.
+ *
+ * `dry_run` is per class and defaults to `true`: the activation path is
+ * "dry-run → compare counts → disarm ONE class", so a policy that merely names
+ * a class must not arm it. Omitting the field keeps the class counting.
  */
 export const retentionPolicySchema = z.object({
   version: z.string().min(1),
@@ -332,17 +415,32 @@ export const retentionPolicySchema = z.object({
   approved_at: z.string().datetime({ offset: true }),
   classes: z.record(
     z.string(),
-    z.object({ retention_days: z.number().int().positive() }),
+    z.object({
+      retention_days: z.number().int().positive(),
+      dry_run: z.boolean().optional(),
+    }),
   ),
 });
 
 export type RetentionPolicyInput = z.infer<typeof retentionPolicySchema>;
 
+export interface RetentionPolicyClass {
+  retention_days: number;
+  /** `true` ⇒ this class only COUNTS, whatever the global lever says. */
+  dry_run: boolean;
+}
+
 export interface RetentionPolicy {
   version: string;
   approved: boolean;
   approved_by: string | null;
-  classes: Record<string, { retention_days: number }>;
+  /**
+   * The policy carries a real sign-off, not the pending-homologation sentinel.
+   * A structurally valid proposal is `approved: true` (it parses, it has a
+   * version and an approver) but `homologated: false` (nobody signed it).
+   */
+  homologated: boolean;
+  classes: Record<string, RetentionPolicyClass>;
 }
 
 /** The policy in force when no DPO-approved configuration is present. */
@@ -350,6 +448,7 @@ export const UNAPPROVED_POLICY: RetentionPolicy = Object.freeze({
   version: UNAPPROVED_POLICY_VERSION,
   approved: false,
   approved_by: null,
+  homologated: false,
   classes: {},
 });
 
@@ -370,16 +469,21 @@ export function parseRetentionPolicy(raw: string | undefined): RetentionPolicy {
   const result = retentionPolicySchema.safeParse(parsed);
   if (!result.success) return UNAPPROVED_POLICY;
   // A policy may only speak about classes that exist AND are purgeable at all.
-  const classes: Record<string, { retention_days: number }> = {};
+  const classes: Record<string, RetentionPolicyClass> = {};
   for (const [id, entry] of Object.entries(result.data.classes)) {
     const known = BY_ID.get(id);
     if (!known || known.purge_mechanism === 'not_purgeable') continue;
-    classes[id] = { retention_days: entry.retention_days };
+    classes[id] = {
+      retention_days: entry.retention_days,
+      // Absent ⇒ dry-run. Arming is opt-in, per class, in writing.
+      dry_run: entry.dry_run !== false,
+    };
   }
   return {
     version: result.data.version,
     approved: true,
     approved_by: result.data.approved_by,
+    homologated: isHomologatedApprover(result.data.approved_by),
     classes,
   };
 }
@@ -393,7 +497,13 @@ export interface RetentionVerdict {
     | 'ok'
     | 'policy_not_approved'
     | 'class_not_in_policy'
-    | 'class_not_purgeable';
+    | 'class_not_purgeable'
+    /**
+     * #536 — the class itself has no approved period, but a class it derives
+     * from does, and derived data may not outlive its source. Only
+     * `resolveEffectiveRetention` (`./derivation.ts`) emits this.
+     */
+    | 'inherited_from_source';
 }
 
 /**
