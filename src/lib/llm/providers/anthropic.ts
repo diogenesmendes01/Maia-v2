@@ -10,6 +10,7 @@
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '@/config/env.js';
+import { describeProviderPayload, recordProviderPayload } from '@/lib/tool-schema-provider.js';
 import { LLMGatewayError } from '../errors.js';
 import type { LLMMessage, LLMProvider, LLMResponse, LLMTier, ToolSchema } from '../types.js';
 
@@ -59,6 +60,23 @@ export class AnthropicProvider implements LLMProvider {
     // cima dele, para que o cancelamento do caller chegue intacto ao HTTP.
     if (params.signal) requestOptions.signal = params.signal;
     if (params.timeout_ms !== undefined) requestOptions.timeout = params.timeout_ms;
+
+    // Issue #509 / PR #530 P2 — identidade do contrato de tools de fato
+    // enviado. A Anthropic não tem strict mode, então o envelope é
+    // pass-through: os dois hashes DEVEM coincidir e `rewritten` deve ser
+    // false. Registrar torna isso verificável em vez de presumido.
+    if (params.tools && params.tools.length > 0) {
+      recordProviderPayload(
+        describeProviderPayload({
+          provider: 'anthropic',
+          model: params.model,
+          canonical: params.tools,
+          effective: params.tools.map((t) => ({ name: t.name, schema: t.input_schema })),
+          payload: params.tools,
+          strictCount: 0,
+        }),
+      );
+    }
 
     const res = await this.getClient().messages.create(
       {

@@ -10,6 +10,13 @@
  */
 import OpenAI from 'openai';
 import { config } from '@/config/env.js';
+import {
+  describeProviderPayload,
+  recordProviderPayload,
+  recordStrictDowngrade,
+  supportsStrictToolSchemas,
+  toStrictJsonSchema,
+} from '@/lib/tool-schema-provider.js';
 import { LLMGatewayError } from '../errors.js';
 import type {
   LLMContentBlock,
@@ -85,12 +92,48 @@ export function toOpenAIMessages(system: string, messages: LLMMessage[]): OAIMes
   return out;
 }
 
-export function toOpenAITools(tools: ToolSchema[] | undefined): OAITool[] | undefined {
+/**
+ * Issue #509 — quando o modelo está na matriz de capacidade strict, o schema
+ * canônico é reescrito para o subconjunto estrito e `function.strict` é
+ * anexado. Recusa e motivo são contabilizados em vez de silenciados: uma tool
+ * cujo contrato não cabe no subconjunto é entregue sem strict, nunca com um
+ * contrato que o Zod do dispatcher rejeitaria.
+ *
+ * `model` é opcional para os call sites que só querem o envelope OpenAI
+ * (os conversores são testados diretamente em `openrouter-converters.spec.ts`).
+ */
+export function toOpenAITools(
+  tools: ToolSchema[] | undefined,
+  model?: string,
+): OAITool[] | undefined {
   if (!tools || tools.length === 0) return undefined;
-  return tools.map((t) => ({
-    type: 'function',
-    function: { name: t.name, description: t.description, parameters: t.input_schema },
-  }));
+  const strictCapable = supportsStrictToolSchemas('openrouter', model);
+  return tools.map((t) => {
+    const fn: {
+      name: string;
+      description: string;
+      parameters: Record<string, unknown>;
+      strict?: boolean;
+    } = {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    };
+    if (model !== undefined) {
+      if (!strictCapable) {
+        recordStrictDowngrade('openrouter', model, 'model_not_strict_capable');
+      } else {
+        const strict = toStrictJsonSchema(t.input_schema);
+        if (strict.ok) {
+          fn.parameters = strict.schema;
+          fn.strict = true;
+        } else {
+          recordStrictDowngrade('openrouter', model, strict.reason);
+        }
+      }
+    }
+    return { type: 'function', function: fn } as OAITool;
+  });
 }
 
 export function fromOpenAIResponse(res: OpenAI.Chat.Completions.ChatCompletion): LLMResponse {
@@ -172,11 +215,40 @@ export class OpenRouterProvider implements LLMProvider {
     if (params.signal) requestOptions.signal = params.signal;
     if (params.timeout_ms !== undefined) requestOptions.timeout = params.timeout_ms;
 
+    // Issue #509 — o modelo decide se `function.strict` é anexado.
+    const oaiTools = toOpenAITools(params.tools, params.model);
+    // PR #530 P2 — o envelope strict REESCREVE o schema (required, keywords
+    // removidas, descrições), então o hash canônico auditado pelo runtime
+    // filter não identifica este payload. Os dois hashes são calculados sobre
+    // a MESMA projeção ({name → hash do schema}), para `rewritten` ser uma
+    // resposta de verdade e não a comparação de dois domínios diferentes.
+    if (params.tools && params.tools.length > 0 && oaiTools) {
+      const fnOf = (t: OAITool) =>
+        (
+          t as {
+            function?: { name?: string; parameters?: Record<string, unknown>; strict?: boolean };
+          }
+        ).function;
+      recordProviderPayload(
+        describeProviderPayload({
+          provider: 'openrouter',
+          model: params.model,
+          canonical: params.tools,
+          effective: oaiTools.map((t) => ({
+            name: fnOf(t)?.name ?? '',
+            schema: fnOf(t)?.parameters ?? {},
+          })),
+          payload: oaiTools,
+          strictCount: oaiTools.filter((t) => fnOf(t)?.strict === true).length,
+        }),
+      );
+    }
+
     const res = await this.getClient().chat.completions.create(
       {
         model: params.model,
         messages: toOpenAIMessages(params.system, params.messages),
-        tools: toOpenAITools(params.tools),
+        tools: oaiTools,
         max_tokens: params.max_tokens ?? 1024,
         temperature: params.temperature ?? 0.2,
       },
