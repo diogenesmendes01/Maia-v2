@@ -1223,6 +1223,37 @@ export const ENV_CONTRACT = {
   },
 
   // ---- feature flags ----------------------------------------------------
+  MAIA_ONBOARDING_WIZARD: {
+    name: 'MAIA_ONBOARDING_WIZARD',
+    description:
+      'Wizard de onboarding persistido (#519): habilita os comandos da saga e a tela do console. Default seguro OFF — desligar impede runs NOVAS; as existentes seguem legíveis e diagnosticáveis.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime', 'admin-ui'],
+    // Sem restrição de profile: o rollout gradual da issue prevê tenants
+    // internos/canário em produção. `activeWhen: truthy` para que um
+    // `=false` explícito em produção continue sendo configuração legítima.
+    activeWhen: 'truthy',
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_ONBOARDING_BOOTSTRAP: {
+    name: 'MAIA_ONBOARDING_BOOTSTRAP',
+    description:
+      'Abre a rota de BOOTSTRAP GLOBAL (primeiro tenant + primeiro admin sem SQL, #519 §9). Default OFF: a rota só deve existir durante a instalação, e mesmo ligada exige credencial de uso único e recusa se já houver qualquer usuário administrativo.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime', 'admin-ui'],
+    activeWhen: 'truthy',
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MCP_TOOLS: {
     name: 'FEATURE_MCP_TOOLS',
     description:

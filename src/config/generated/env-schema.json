@@ -1487,6 +1487,38 @@
         "5"
       ]
     },
+    "MAIA_ONBOARDING_WIZARD": {
+      "type": "string",
+      "description": "Wizard de onboarding persistido (#519): habilita os comandos da saga e a tela do console. Default seguro OFF — desligar impede runs NOVAS; as existentes seguem legíveis e diagnosticáveis.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "MAIA_ONBOARDING_BOOTSTRAP": {
+      "type": "string",
+      "description": "Abre a rota de BOOTSTRAP GLOBAL (primeiro tenant + primeiro admin sem SQL, #519 §9). Default OFF: a rota só deve existir durante a instalação, e mesmo ligada exige credencial de uso único e recusa se já houver qualquer usuário administrativo.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "FEATURE_MCP_TOOLS": {
       "type": "string",
       "description": "MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest).",

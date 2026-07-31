@@ -49,8 +49,8 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
-| `admin-ui` | 23 | 4 |
+| `runtime` | 170 | 18 |
+| `admin-ui` | 25 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
 | `maintenance` | 61 | 13 |
@@ -216,6 +216,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
+| `MAIA_ONBOARDING_WIZARD` | string | `false` | não | `runtime`, `admin-ui` | sim | Wizard de onboarding persistido (#519): habilita os comandos da saga e a tela do console. Default seguro OFF — desligar impede runs NOVAS; as existentes seguem legíveis e diagnosticáveis. |
+| `MAIA_ONBOARDING_BOOTSTRAP` | string | `false` | não | `runtime`, `admin-ui` | sim | Abre a rota de BOOTSTRAP GLOBAL (primeiro tenant + primeiro admin sem SQL, #519 §9). Default OFF: a rota só deve existir durante a instalação, e mesmo ligada exige credencial de uso único e recusa se já houver qualquer usuário administrativo. |
 | `FEATURE_MCP_TOOLS` | string | `false` | não | `runtime`, `admin-ui` | sim | MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest). Ativa apenas em: development, staging. |
 | `FEATURE_PROACTIVE_MESSAGES` | string | `false` | não | `runtime` | sim | Mensagens proativas do agente. |
 | `FEATURE_OFX_IMPORT` | string | `false` | não | `runtime`, `maintenance` | sim | Importação de extratos OFX. |

@@ -151,6 +151,24 @@ export const METRIC = {
   WORKER_RUN: 'maia_worker_run_total',
   WORKER_DURATION_MS: 'maia_worker_duration_ms',
 
+  // --- onboarding (issue #519) ---------------------------------------------
+  // Nomes com o prefixo `maia_` por convenção deste arquivo; a issue os lista
+  // sem prefixo. Rótulos deliberadamente FECHADOS: `kind` e `step` vêm de
+  // enums do `state-machine.ts`, `reason` do enum de códigos sanitizados e
+  // `check_code` do enum de readiness. Run id, tenant nome, e-mail e telefone
+  // NUNCA entram — a issue §"Observabilidade" é explícita.
+  ONBOARDING_RUN_STARTED: 'maia_onboarding_run_started_total',
+  ONBOARDING_RUN_COMPLETED: 'maia_onboarding_run_completed_total',
+  ONBOARDING_RUN_CANCELLED: 'maia_onboarding_run_cancelled_total',
+  ONBOARDING_RUN_DURATION_MS: 'maia_onboarding_run_duration_ms',
+  ONBOARDING_STEP_COMPLETED: 'maia_onboarding_step_completed_total',
+  ONBOARDING_STEP_FAILED: 'maia_onboarding_step_failed_total',
+  ONBOARDING_STEP_DURATION_MS: 'maia_onboarding_step_duration_ms',
+  ONBOARDING_IDEMPOTENCY_REPLAY: 'maia_onboarding_idempotency_replay_total',
+  AGENT_READINESS_EVALUATED: 'maia_agent_readiness_evaluated_total',
+  AGENT_READINESS_FAILED: 'maia_agent_readiness_failed_total',
+  BOOTSTRAP_ATTEMPT: 'maia_bootstrap_attempt_total',
+
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */
   TRACE_COVERAGE: 'maia_runtime_trace_coverage_total',
@@ -215,6 +233,11 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   'phase',
   'state',
   'required',
+  // onboarding (issue #519) — os dois vêm de enums fechados
+  // (`ONBOARDING_STEPS` e `READINESS_CHECK_CODES`), então são enumeráveis e
+  // não-identificantes por construção.
+  'step',
+  'check_code',
 ]);
 
 /**
@@ -359,6 +382,9 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   stage: 60,
   span: 60,
   reason: 60,
+  // Enums fechados do onboarding (#519): 11 passos, 14 códigos de check.
+  step: 20,
+  check_code: 30,
 });
 
 /** Budget applied to any allowed key without an explicit entry above. */

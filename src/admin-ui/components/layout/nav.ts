@@ -67,6 +67,10 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     label: 'Plataforma',
     items: [
+      // Issue #519 — a jornada de provisionamento ponta a ponta. Fica em
+      // Plataforma (e não em Agentes) porque uma run pode criar o TENANT antes
+      // de existir agente algum.
+      { href: '/onboarding', label: 'Onboarding', icon: 'sparkles', activePrefix: '/onboarding' },
       { href: '/setup/channels', label: 'Canais', icon: 'message' },
       { href: '/setup/mcp', label: 'Conexões MCP', icon: 'wrench' },
       { href: '/setup/tenants', label: 'Tenants', icon: 'users', founderOnly: true },

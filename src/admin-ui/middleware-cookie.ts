@@ -209,12 +209,42 @@ export const PUBLIC_PATHS = [
   '/api/auth',
   '/_next',
   '/favicon.ico',
+  // Issue #519 §9 — a tela de BOOTSTRAP GLOBAL. É a única página do console
+  // que existe antes de haver alguém a autenticar: ela cria o primeiro tenant
+  // e o primeiro administrador. Um run id é UUID, então este prefixo não
+  // colide com `/onboarding/<runId>` (e o segmento estático vence o dinâmico
+  // no App Router de qualquer forma).
+  '/onboarding/bootstrap',
+] as const;
+
+/**
+ * Rotas de API públicas verificadas por IGUALDADE EXATA, não por prefixo.
+ *
+ * Issue #519 — as duas procedures de bootstrap são `publicProcedure` e
+ * precisam ser alcançáveis sem sessão. Liberá-las por PREFIXO
+ * (`/api/trpc/onboarding.bootstrap`) abriria um desvio real: o tRPC aceita
+ * chamadas em LOTE, cujo caminho é a lista de procedures separada por vírgula
+ * (`/api/trpc/onboarding.bootstrapStatus,agents.list?batch=1`). Esse caminho
+ * começa com o prefixo liberado e passaria pelo gate — as procedures
+ * protegidas ainda recusariam no tRPC (o gate é grosso, a autorização real
+ * está na procedure), mas criar o desvio de propósito seria abrir mão de uma
+ * camada por conveniência.
+ *
+ * Igualdade exata elimina o problema: um lote NUNCA tem o caminho exato de uma
+ * procedure só. A tela de bootstrap chama estas duas com `fetch` sem lote.
+ */
+export const PUBLIC_EXACT_PATHS = [
+  '/api/trpc/onboarding.bootstrapStatus',
+  '/api/trpc/onboarding.bootstrapGlobal',
 ] as const;
 
 /**
  * True iff `pathname` should bypass the session check.
  */
 export function isPublicPath(pathname: string): boolean {
+  for (const p of PUBLIC_EXACT_PATHS) {
+    if (pathname === p) return true;
+  }
   for (const p of PUBLIC_PATHS) {
     if (pathname.startsWith(p)) return true;
   }

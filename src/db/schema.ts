@@ -3451,3 +3451,130 @@ export type DataTombstone = typeof data_tombstones.$inferSelect;
 export type NewDataTombstone = typeof data_tombstones.$inferInsert;
 export type RetentionRun = typeof retention_runs.$inferSelect;
 export type NewRetentionRun = typeof retention_runs.$inferInsert;
+
+// =====================================================================
+// 113/114 (issue #519) — saga durável de onboarding + credencial de
+// bootstrap global de uso único.
+//
+// As CHECKs de estado/passo/tipo vivem nas migrations 113/114 (fonte de
+// verdade das constraints, mesmo contrato da 103); aqui declaramos tipos e os
+// índices que o Drizzle precisa conhecer.
+// =====================================================================
+
+export const onboarding_runs = pgTable(
+  'onboarding_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    kind: text('kind').notNull(),
+    /** Tenant ALVO — nulo só enquanto a run está em `created`. */
+    tenant_id: text('tenant_id'),
+    /** Agente ALVO — nulo até o passo `agent`. */
+    agent_id: text('agent_id'),
+    /** Tenant da SESSÃO que abriu a run: é por ele que a listagem filtra. */
+    actor_tenant_id: text('actor_tenant_id').notNull(),
+    state: text('state').notNull().default('created'),
+    current_step: text('current_step').notNull().default('tenant'),
+    /** Concorrência otimista: todo comando declara a versão que leu. */
+    version: integer('version').notNull().default(0),
+    created_by: text('created_by').notNull(),
+    created_by_role: text('created_by_role').notNull(),
+    correlation_id: text('correlation_id').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    /** Código SANITIZADO — nunca mensagem crua de erro. */
+    last_error_code: text('last_error_code'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    configuration_contract_version: text('configuration_contract_version').notNull(),
+    schema_version: text('schema_version').notNull(),
+  },
+  (t) => ({
+    actorScopeIdx: index('onboarding_runs_actor_scope_idx').on(
+      t.actor_tenant_id,
+      t.state,
+      t.created_at,
+    ),
+    targetScopeIdx: index('onboarding_runs_target_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+    ),
+  }),
+);
+export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+export type NewOnboardingRunRow = typeof onboarding_runs.$inferInsert;
+
+export const onboarding_events = pgTable(
+  'onboarding_events',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    step: text('step').notNull(),
+    event_type: text('event_type').notNull(),
+    actor_id: text('actor_id').notNull(),
+    actor_role: text('actor_role').notNull(),
+    correlation_id: text('correlation_id').notNull(),
+    /** SHA-256 da chave opaca — a chave em si nunca é persistida. */
+    idempotency_key_hash: text('idempotency_key_hash'),
+    from_state: text('from_state'),
+    to_state: text('to_state'),
+    summary: jsonb('summary').notNull().default(sql`'{}'::jsonb`),
+    error_code: text('error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    runIdx: index('onboarding_events_run_idx').on(t.run_id, t.id),
+    scopeIdx: index('onboarding_events_scope_idx').on(t.tenant_id, t.agent_id, t.created_at),
+  }),
+);
+export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
+export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
+
+export const onboarding_step_results = pgTable(
+  'onboarding_step_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    step: text('step').notNull(),
+    idempotency_key_hash: text('idempotency_key_hash').notNull(),
+    /** SHA-256 do payload canônico: mesma chave + payload diferente = conflito. */
+    request_hash: text('request_hash').notNull(),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    keyUq: uniqueIndex('onboarding_step_results_key_uq').on(
+      t.run_id,
+      t.step,
+      t.idempotency_key_hash,
+    ),
+    stepUq: uniqueIndex('onboarding_step_results_step_uq').on(t.run_id, t.step),
+  }),
+);
+export type OnboardingStepResultRow = typeof onboarding_step_results.$inferSelect;
+export type NewOnboardingStepResultRow = typeof onboarding_step_results.$inferInsert;
+
+export const bootstrap_credentials = pgTable('bootstrap_credentials', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  /** SHA-256 hex — o segredo em claro nunca toca o banco. */
+  secret_hash: text('secret_hash').notNull(),
+  label: text('label'),
+  created_by: text('created_by').notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+  consumed_at: timestamp('consumed_at', { withTimezone: true }),
+  consumed_by_run_id: uuid('consumed_by_run_id'),
+  revoked_at: timestamp('revoked_at', { withTimezone: true }),
+  revoked_reason: text('revoked_reason'),
+  attempts: integer('attempts').notNull().default(0),
+  last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+  locked_until: timestamp('locked_until', { withTimezone: true }),
+});
+export type BootstrapCredentialRow = typeof bootstrap_credentials.$inferSelect;
+export type NewBootstrapCredentialRow = typeof bootstrap_credentials.$inferInsert;

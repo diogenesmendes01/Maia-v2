@@ -28,6 +28,7 @@ import {
   isPublicPath,
   SESSION_COOKIE_PREFIXES,
   PUBLIC_PATHS,
+  PUBLIC_EXACT_PATHS,
 } from '@/admin-ui/middleware-cookie.js';
 
 // Helpers ---------------------------------------------------------------------
@@ -370,6 +371,32 @@ describe('isPublicPath — bypass list', () => {
     expect(isPublicPath('/admin/auth/signin')).toBe(false);
     expect(isPublicPath('/foo/_next/static/x.js')).toBe(false);
   });
+
+  // Issue #519 §9 — a tela e as duas procedures do BOOTSTRAP GLOBAL.
+  it('bypasses a tela de bootstrap global (não há sessão a exigir ainda)', () => {
+    expect(isPublicPath('/onboarding/bootstrap')).toBe(true);
+  });
+
+  it('NÃO bypassa o resto do wizard — só a tela de bootstrap é pública', () => {
+    expect(isPublicPath('/onboarding')).toBe(false);
+    expect(isPublicPath('/onboarding/11111111-1111-4111-8111-111111111111')).toBe(false);
+  });
+
+  it('bypassa as duas procedures de bootstrap por IGUALDADE EXATA', () => {
+    expect(isPublicPath('/api/trpc/onboarding.bootstrapStatus')).toBe(true);
+    expect(isPublicPath('/api/trpc/onboarding.bootstrapGlobal')).toBe(true);
+  });
+
+  it('um LOTE tRPC não vira desvio — o caminho em lote não é exato', () => {
+    // O ataque que a igualdade exata fecha: liberar por prefixo deixaria
+    // `/api/trpc/onboarding.bootstrapStatus,agents.list?batch=1` passar pelo
+    // gate. As procedures protegidas ainda recusariam no tRPC, mas abrir o
+    // desvio de propósito seria abrir mão de uma camada.
+    expect(isPublicPath('/api/trpc/onboarding.bootstrapStatus,agents.list')).toBe(false);
+    expect(isPublicPath('/api/trpc/agents.list,onboarding.bootstrapStatus')).toBe(false);
+    expect(isPublicPath('/api/trpc/onboarding.get')).toBe(false);
+    expect(isPublicPath('/api/trpc/onboarding.bootstrapStatusExtra')).toBe(false);
+  });
 });
 
 describe('PUBLIC_PATHS — drift guard with middleware.ts', () => {
@@ -385,6 +412,14 @@ describe('PUBLIC_PATHS — drift guard with middleware.ts', () => {
       '/api/auth',
       '/_next',
       '/favicon.ico',
+      '/onboarding/bootstrap',
+    ]);
+  });
+
+  it('a lista EXATA carrega só as duas procedures de bootstrap', () => {
+    expect([...PUBLIC_EXACT_PATHS]).toEqual([
+      '/api/trpc/onboarding.bootstrapStatus',
+      '/api/trpc/onboarding.bootstrapGlobal',
     ]);
   });
 });

@@ -1,9 +1,12 @@
 /**
  * P8.5 — Next.js middleware. Route-level protection.
  *
- * Public routes: /auth/*, /api/auth/*, _next/*. Everything else requires
- * a NextAuth session cookie. Tenant assertion happens at the tRPC layer
- * (see ./trpc/context.ts).
+ * Public routes: /auth/*, /api/auth/*, _next/*, plus the BOOTSTRAP GLOBAL
+ * surface of issue #519 (`/onboarding/bootstrap` and, by EXACT match, the two
+ * `onboarding.bootstrap*` tRPC procedures — see `PUBLIC_EXACT_PATHS` in
+ * ./middleware-cookie.ts for why exact and not prefix). Everything else
+ * requires a NextAuth session cookie. Tenant assertion happens at the tRPC
+ * layer (see ./trpc/context.ts).
  *
  * ---------------------------------------------------------------------------
  * Issue #179 — Auth.js v5 cookie name + chunked-cookie awareness

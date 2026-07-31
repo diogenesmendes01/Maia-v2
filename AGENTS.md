@@ -55,7 +55,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 ### Subsystems (one module doc per `src/` subdir)
 
-24 subdirectories in [`src/`](src/), one doc each under [`docs/architecture/modules/`](docs/architecture/modules/). See the **Code map** in [`ARCHITECTURE.md`](ARCHITECTURE.md#5-code-map) for the table.
+27 subdirectories in [`src/`](src/), one doc each under [`docs/architecture/modules/`](docs/architecture/modules/). See the **Code map** in [`ARCHITECTURE.md`](ARCHITECTURE.md#5-code-map) for the table.
 
 ### Other documentation
 

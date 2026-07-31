@@ -62,6 +62,21 @@ export const appUsersRepo = {
     if (!rows[0]) throw new TypedError('app_user_create_failed', 'Could not create app_user');
     return rows[0];
   },
+
+  /**
+   * Issue #519 §9 — a precondição do BOOTSTRAP GLOBAL: "permitido apenas
+   * quando o sistema ainda não possui identidade administrativa global".
+   *
+   * Deliberadamente cross-tenant e sem filtro de papel: QUALQUER usuário
+   * administrativo, em qualquer tenant, fecha a porta. Restringir a
+   * `role='founder'` deixaria uma instalação com um `owner` já criado aceitar
+   * um bootstrap que se autoconcede founder — escalação de privilégio pela
+   * porta que existe justamente para não haver escalação.
+   */
+  async hasAnyUser(): Promise<boolean> {
+    const rows = await db.select({ id: app_users.id }).from(app_users).limit(1);
+    return rows.length > 0;
+  },
 };
 
 /**

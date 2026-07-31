@@ -635,6 +635,20 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_ONBOARDING_WIZARD",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ONBOARDING_BOOTSTRAP",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_MCP_TOOLS",
           "secret": false,
           "required": false,
@@ -1309,6 +1323,8 @@
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
             "FEATURE_OFX_IMPORT",
@@ -1484,6 +1500,8 @@
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
             "FEATURE_OFX_IMPORT",
@@ -1658,6 +1676,8 @@
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
             "DAILY_LLM_USD_THRESHOLD",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
             "FEATURE_OFX_IMPORT",
@@ -1793,6 +1813,20 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_ONBOARDING_WIZARD",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ONBOARDING_BOOTSTRAP",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_MCP_TOOLS",
           "secret": false,
           "required": false,
@@ -1924,6 +1958,8 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
@@ -1958,6 +1994,8 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
@@ -1987,6 +2025,8 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_ONBOARDING_WIZARD",
+            "MAIA_ONBOARDING_BOOTSTRAP",
             "FEATURE_MCP_TOOLS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",

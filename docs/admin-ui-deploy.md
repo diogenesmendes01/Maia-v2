@@ -102,19 +102,33 @@ first prod sign-in attempt.
 
 After the admin-ui container is up, you still need at least one
 `app_users` row that matches an IdP email, or the SSO sign-in will hit
-`AccessDenied`. From `psql` against the shared Postgres:
+`AccessDenied`.
 
-```sql
-INSERT INTO app_users (id, tenant_id, email, name, role, email_verified)
-VALUES (
-  gen_random_uuid()::text,
-  'default',
-  'you@example.com',
-  'Your Name',
-  'founder',
-  now()
-);
+**Do NOT insert it by hand.** Issue #519 replaced the manual `INSERT` with a
+governed bootstrap: a one-time credential, consumed atomically, that creates
+the first tenant AND the first founder in one audited saga. A hand-written
+`INSERT` has no precondition, no expiry, no trail and no revocation — and
+whoever can run it can grant themselves `founder` in any tenant, forever.
+
+```bash
+# 1. Emit the one-time credential (prints the secret ONCE; only its SHA-256
+#    reaches the database)
+npm run bootstrap:credential -- issue --label "initial deploy" --ttl-hours 2
+
+# 2. Start admin-ui with MAIA_ONBOARDING_BOOTSTRAP=true, open the console and
+#    paste the secret into the bootstrap form. The secret travels in the POST
+#    body — never in a query string.
+
+# 3. Confirm the door is closed and turn the flag back off
+npm run bootstrap:credential -- status
 ```
+
+The endpoint refuses once ANY `app_users` row exists, so the door closes by
+construction after the first success. Full procedure, failure modes and
+recovery: [`docs/runbooks/onboarding-wizard.md`](runbooks/onboarding-wizard.md).
+
+Every subsequent tenant/admin/agent goes through the same wizard
+(`/onboarding` in the console), never through SQL.
 
 The IdP email claim must equal `app_users.email` (case-insensitive). The
 tenant_id must appear in `OIDC_TENANT_SLUGS`.

@@ -24,6 +24,8 @@ export * from './repositories/objective-repos.js';
 export * from './repositories/mcp-repos.js';
 export * from './repositories/approval-repos.js';
 export * from './repositories/turn-repos.js';
+// Issue #519 — saga durável de onboarding + credencial de bootstrap global.
+export * from './repositories/onboarding-repos.js';
 // Issue #514 — Trace Explorer reads the P10b evidence tables through this repo.
 export * from './repositories/runtime-trace-repos.js';
 
