@@ -49,11 +49,22 @@ function extractFunctionSource(source: string, marker: string): string {
 describe('Finding 2 — rulesRepo.listActive uses lifecycle_status, not ativa', () => {
   const source = readFileSync(REPOSITORIES_PATH, 'utf8');
 
-  it('rulesRepo.listActive body does NOT include eq(learned_rules.ativa, ...)', () => {
-    const body = extractFunctionSource(
+  /**
+   * Issue #525 moved the predicate out of the method and into
+   * `rulesListActiveQuery`, so the batched turn-context read and the single
+   * read share one definition. The method is now a one-line delegation, so the
+   * source check follows the predicate to where it lives — the assertion is
+   * unchanged, only its address is.
+   */
+  it('rulesListActiveQuery body does NOT include eq(learned_rules.ativa, ...)', () => {
+    const body = extractFunctionSource(source, 'export function rulesListActiveQuery(tipo: string)');
+    // The delegating method must not have grown a predicate of its own.
+    const method = extractFunctionSource(
       source,
       'async listActive(tipo: string): Promise<LearnedRule[]>',
     );
+    expect(method).toContain('rulesListActiveQuery(tipo)');
+    expect(method).not.toMatch(/learned_rules\./);
     expect(body).toContain('lifecycle_status');
     expect(body).toContain("'active'");
     // No predicate references `learned_rules.ativa` anymore.

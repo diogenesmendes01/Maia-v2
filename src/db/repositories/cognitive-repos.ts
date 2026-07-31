@@ -1,4 +1,4 @@
-import { eq, and, inArray, desc, isNull, sql, or, gt, Param } from 'drizzle-orm';
+import { eq, and, inArray, desc, isNull, sql, or, gt, Param, type SQL } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   agent_facts,
@@ -130,17 +130,33 @@ export const factsRepo = {
    */
   async listMentionableForScopes(escopos: string[]): Promise<AgentFact[]> {
     if (escopos.length === 0) return [];
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    // P10a (review #104 critical): lifecycle_status filter is mandatory
-    // on every read that the LLM can see. pending_review / deprecated /
-    // revoked rows MUST NOT reach the prompt — they live behind the
-    // Admin UI Proposal Inbox until a human acts on them.
-    //
-    // escopos is wrapped in new Param(...) so it binds as one $n (a real PG
-    // array). A bare interpolated JS array expands to a parenthesized scalar
-    // list ($1, $2, ...), which PG rejects on the right of ANY (42809).
-    const result = await db.execute<AgentFact>(sql`
+    const result = await db.execute<AgentFact>(factsMentionableForScopesQuery(escopos));
+    return Array.from(result.rows as unknown as AgentFact[]);
+  },
+};
+
+/**
+ * Issue #525 — the statement behind `listMentionableForScopes`, exported so the
+ * turn-context loader can embed it as a subquery in its batched read
+ * (`src/db/repositories/turn-context-repos.ts`). The sensitivity `NOT EXISTS`
+ * and the lifecycle filter are the reason this must not be re-typed anywhere:
+ * a copy that loses either one puts a do-not-mention fact into the prompt.
+ *
+ * Callers keep the empty-`escopos` guard — `= ANY('{}')` matches nothing, but
+ * the early return also avoids the round-trip entirely.
+ */
+export function factsMentionableForScopesQuery(escopos: string[]): SQL {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  // P10a (review #104 critical): lifecycle_status filter is mandatory
+  // on every read that the LLM can see. pending_review / deprecated /
+  // revoked rows MUST NOT reach the prompt — they live behind the
+  // Admin UI Proposal Inbox until a human acts on them.
+  //
+  // escopos is wrapped in new Param(...) so it binds as one $n (a real PG
+  // array). A bare interpolated JS array expands to a parenthesized scalar
+  // list ($1, $2, ...), which PG rejects on the right of ANY (42809).
+  return sql`
       SELECT af.*
       FROM agent_facts af
       WHERE af.tenant_id = ${tenant_id}
@@ -160,43 +176,50 @@ export const factsRepo = {
               OR me.mention_allowed = false
             )
         )
-    `);
-    return Array.from(result.rows as unknown as AgentFact[]);
-  },
-};
+    `;
+}
+
+/**
+ * Issue #525 — SELECT builder behind `rulesRepo.listActive`, shared with the
+ * batched turn-context read so the lifecycle filter, the ordering and the
+ * 50-row cap exist in exactly one place.
+ */
+export function rulesListActiveQuery(tipo: string) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  // Codex round-2 finding 2: lifecycle_status is the source of truth
+  // for "is this rule visible to the LLM". The legacy `ativa=true`
+  // requirement was double-bookkeeping: KSM-proposed rules transitioned
+  // through pending_review → … → active never flipped `ativa`, so
+  // approved proposals stayed invisible forever. We drop the
+  // `ativa=true` predicate here and rely on lifecycle_status alone.
+  // (The `ativa` column is preserved for ops/admin "soft disable"
+  // outside the lifecycle pipeline; if it gets set to false in the
+  // DB, a follow-up migration can join it back.)
+  return db
+    .select()
+    .from(learned_rules)
+    .where(
+      and(
+        eq(learned_rules.tenant_id, tenant_id),
+        eq(learned_rules.agent_id, agent_id),
+        eq(learned_rules.tipo, tipo),
+        inArray(learned_rules.lifecycle_status, [
+          'ephemeral',
+          'observed',
+          'reinforced',
+          'verified',
+          'active',
+        ]),
+      ),
+    )
+    .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
+    .limit(50);
+}
 
 export const rulesRepo = {
   async listActive(tipo: string): Promise<LearnedRule[]> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    // Codex round-2 finding 2: lifecycle_status is the source of truth
-    // for "is this rule visible to the LLM". The legacy `ativa=true`
-    // requirement was double-bookkeeping: KSM-proposed rules transitioned
-    // through pending_review → … → active never flipped `ativa`, so
-    // approved proposals stayed invisible forever. We drop the
-    // `ativa=true` predicate here and rely on lifecycle_status alone.
-    // (The `ativa` column is preserved for ops/admin "soft disable"
-    // outside the lifecycle pipeline; if it gets set to false in the
-    // DB, a follow-up migration can join it back.)
-    return db
-      .select()
-      .from(learned_rules)
-      .where(
-        and(
-          eq(learned_rules.tenant_id, tenant_id),
-          eq(learned_rules.agent_id, agent_id),
-          eq(learned_rules.tipo, tipo),
-          inArray(learned_rules.lifecycle_status, [
-            'ephemeral',
-            'observed',
-            'reinforced',
-            'verified',
-            'active',
-          ]),
-        ),
-      )
-      .orderBy(desc(learned_rules.confianca), desc(learned_rules.updated_at))
-      .limit(50);
+    return rulesListActiveQuery(tipo);
   },
   async create(
     input: Omit<
@@ -483,6 +506,85 @@ export const cognitiveCandidatesRepo = {
   },
 };
 
+/**
+ * Issue #525 — SELECT builder behind `memoryEntryRepo.findRelevant`, shared
+ * with the batched turn-context read.
+ *
+ * The role/channel scoping rule is the reason this must have exactly one
+ * definition: a role- or channel-scoped memory is only reachable when the
+ * caller supplied the matching subject id, and a second copy of this predicate
+ * is a second place for that rule to be got wrong.
+ */
+export function memoryFindRelevantQuery(opts: {
+  interlocutor_id?: string;
+  role_id?: string;
+  channel_id?: string;
+  conversa_id?: string;
+  limit?: number;
+}) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  const now = new Date();
+  const conds = [
+    eq(memory_entry.tenant_id, tenant_id),
+    eq(memory_entry.agent_id, agent_id),
+    eq(memory_entry.needs_review, false),
+    // PR #82 review (Codex medium + Superpowers Critical #2): TTL must
+    // be enforced at query time. Entries past expires_at MUST NOT be
+    // returned to the prompt builder. NULL expires_at = no TTL.
+    or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
+    // P10a (review #104 critical): lifecycle_status filter enforced on
+    // every prompt-exposing read. pending_review / deprecated / revoked
+    // entries stay hidden from the LLM.
+    inArray(memory_entry.lifecycle_status, [
+      'ephemeral',
+      'observed',
+      'reinforced',
+      'verified',
+      'active',
+    ]),
+  ];
+  // Filtrar por scope_type + subject_id apropriado. PR #82 review
+  // (Superpowers Critical #4): role/channel devem só ser incluídos
+  // quando o caller passar o subject id correspondente — senão a
+  // memória escopada por role/channel atravessa todas as fronteiras.
+  const orConds = [];
+  if (opts.interlocutor_id) {
+    orConds.push(
+      and(
+        eq(memory_entry.scope_type, 'interlocutor'),
+        eq(memory_entry.subject_id, opts.interlocutor_id),
+      ),
+    );
+  }
+  if (opts.role_id) {
+    orConds.push(
+      and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, opts.role_id)),
+    );
+  }
+  if (opts.channel_id) {
+    orConds.push(
+      and(eq(memory_entry.scope_type, 'channel'), eq(memory_entry.subject_id, opts.channel_id)),
+    );
+  }
+  if (opts.conversa_id) {
+    orConds.push(
+      and(
+        eq(memory_entry.scope_type, 'conversation'),
+        eq(memory_entry.subject_id, opts.conversa_id),
+      ),
+    );
+  }
+  orConds.push(eq(memory_entry.scope_type, 'agent'));
+
+  return db
+    .select()
+    .from(memory_entry)
+    .where(and(...conds, or(...orConds)))
+    .orderBy(desc(memory_entry.created_at))
+    .limit(opts.limit ?? 50);
+}
+
 export const memoryEntryRepo = {
   async create(
     input: Omit<
@@ -512,70 +614,7 @@ export const memoryEntryRepo = {
     conversa_id?: string;
     limit?: number;
   }): Promise<MemoryEntry[]> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const now = new Date();
-    const conds = [
-      eq(memory_entry.tenant_id, tenant_id),
-      eq(memory_entry.agent_id, agent_id),
-      eq(memory_entry.needs_review, false),
-      // PR #82 review (Codex medium + Superpowers Critical #2): TTL must
-      // be enforced at query time. Entries past expires_at MUST NOT be
-      // returned to the prompt builder. NULL expires_at = no TTL.
-      or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
-      // P10a (review #104 critical): lifecycle_status filter enforced on
-      // every prompt-exposing read. pending_review / deprecated / revoked
-      // entries stay hidden from the LLM.
-      inArray(memory_entry.lifecycle_status, [
-        'ephemeral',
-        'observed',
-        'reinforced',
-        'verified',
-        'active',
-      ]),
-    ];
-    // Filtrar por scope_type + subject_id apropriado. PR #82 review
-    // (Superpowers Critical #4): role/channel devem só ser incluídos
-    // quando o caller passar o subject id correspondente — senão a
-    // memória escopada por role/channel atravessa todas as fronteiras.
-    const orConds = [];
-    if (opts.interlocutor_id) {
-      orConds.push(
-        and(
-          eq(memory_entry.scope_type, 'interlocutor'),
-          eq(memory_entry.subject_id, opts.interlocutor_id),
-        ),
-      );
-    }
-    if (opts.role_id) {
-      orConds.push(
-        and(eq(memory_entry.scope_type, 'role'), eq(memory_entry.subject_id, opts.role_id)),
-      );
-    }
-    if (opts.channel_id) {
-      orConds.push(
-        and(
-          eq(memory_entry.scope_type, 'channel'),
-          eq(memory_entry.subject_id, opts.channel_id),
-        ),
-      );
-    }
-    if (opts.conversa_id) {
-      orConds.push(
-        and(
-          eq(memory_entry.scope_type, 'conversation'),
-          eq(memory_entry.subject_id, opts.conversa_id),
-        ),
-      );
-    }
-    orConds.push(eq(memory_entry.scope_type, 'agent'));
-
-    return db
-      .select()
-      .from(memory_entry)
-      .where(and(...conds, or(...orConds)))
-      .orderBy(desc(memory_entry.created_at))
-      .limit(opts.limit ?? 50);
+    return memoryFindRelevantQuery(opts);
   },
 
   async markReviewed(
@@ -653,6 +692,66 @@ export const memoryEntryRepo = {
       .limit(limit);
   },
 };
+
+/**
+ * Issue #525 — SELECT builder behind `behavioralHintRepo.findActiveForScopes`,
+ * shared with the batched turn-context read so the revoked/lifecycle/expiry
+ * filters and the OR'd scope tuples have exactly one definition.
+ *
+ * Returns `null` — never a query — for the degenerate empty-scope case, so the
+ * "fail closed rather than match every hint" rule cannot be lost by a caller
+ * that forgets the guard: there is simply no statement to run.
+ */
+export function hintsFindActiveForScopesQuery(
+  scopes: Array<{ scope_type: string; subject_id?: string | null }>,
+  limit = 200,
+) {
+  if (scopes.length === 0) return null;
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const now = new Date();
+
+    const seen = new Set<string>();
+    const tupleConds = [];
+    for (const s of scopes) {
+      const dedupKey = `${s.scope_type} ${s.subject_id ?? ''}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      tupleConds.push(
+        s.subject_id
+          ? and(
+              eq(behavioral_hint.scope_type, s.scope_type),
+              eq(behavioral_hint.subject_id, s.subject_id),
+            )
+          : eq(behavioral_hint.scope_type, s.scope_type),
+      );
+    }
+    // Defensive: `scopes` was non-empty, so dedup cannot empty it. Kept so a
+    // future filter added to the loop can never silently widen the predicate.
+    if (tupleConds.length === 0) return null;
+
+    return db
+      .select()
+      .from(behavioral_hint)
+      .where(
+        and(
+          eq(behavioral_hint.tenant_id, tenant_id),
+          eq(behavioral_hint.agent_id, agent_id),
+          isNull(behavioral_hint.revoked_at),
+          inArray(behavioral_hint.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
+          or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
+          or(...tupleConds),
+        ),
+      )
+      .orderBy(behavioral_hint.created_at, behavioral_hint.id)
+    .limit(limit);
+}
 
 export const behavioralHintRepo = {
   async create(
@@ -747,51 +846,8 @@ export const behavioralHintRepo = {
     scopes: Array<{ scope_type: string; subject_id?: string | null }>,
     limit = 200,
   ): Promise<BehavioralHint[]> {
-    if (scopes.length === 0) return [];
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const now = new Date();
-
-    const seen = new Set<string>();
-    const tupleConds = [];
-    for (const s of scopes) {
-      const dedupKey = `${s.scope_type} ${s.subject_id ?? ''}`;
-      if (seen.has(dedupKey)) continue;
-      seen.add(dedupKey);
-      tupleConds.push(
-        s.subject_id
-          ? and(
-              eq(behavioral_hint.scope_type, s.scope_type),
-              eq(behavioral_hint.subject_id, s.subject_id),
-            )
-          : eq(behavioral_hint.scope_type, s.scope_type),
-      );
-    }
-    // Defensive: `scopes` was non-empty, so dedup cannot empty it. Kept so a
-    // future filter added to the loop can never silently widen the predicate.
-    if (tupleConds.length === 0) return [];
-
-    return db
-      .select()
-      .from(behavioral_hint)
-      .where(
-        and(
-          eq(behavioral_hint.tenant_id, tenant_id),
-          eq(behavioral_hint.agent_id, agent_id),
-          isNull(behavioral_hint.revoked_at),
-          inArray(behavioral_hint.lifecycle_status, [
-            'ephemeral',
-            'observed',
-            'reinforced',
-            'verified',
-            'active',
-          ]),
-          or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
-          or(...tupleConds),
-        ),
-      )
-      .orderBy(behavioral_hint.created_at, behavioral_hint.id)
-      .limit(limit);
+    const q = hintsFindActiveForScopesQuery(scopes, limit);
+    return q === null ? [] : q;
   },
 
   async revoke(id: string): Promise<void> {

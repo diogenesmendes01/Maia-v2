@@ -60,17 +60,7 @@ export const procedureDefinitionsRepo = {
    * to a different tenant/agent (P83-H5: prevent cross-tenant access by id).
    */
   async findById(id: string): Promise<ProcedureDefinition | null> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const rows = await db
-      .select()
-      .from(procedure_definitions)
-      .where(and(
-        eq(procedure_definitions.id, id),
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-      ))
-      .limit(1);
+    const rows = await procedureDefinitionByIdQuery(id);
     return rows[0] ?? null;
   },
 
@@ -406,6 +396,55 @@ export const procedureAssignmentsRepo = {
   },
 };
 
+/**
+ * Issue #525 — SELECT builders behind `procedureExecutionsRepo
+ * .findActiveForConversa` and `procedureDefinitionsRepo.findById`, shared with
+ * the batched turn-context read. The turn used to pay TWO sequential
+ * round-trips here (execution, then its definition); the loader folds both into
+ * one statement, and the tenant predicate that makes a foreign definition
+ * invisible (P83-H5) is written once.
+ */
+export function procedureActiveForConversaQuery(conversa_id: string) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(procedure_executions)
+    .where(and(
+      eq(procedure_executions.tenant_id, tenant_id),
+      eq(procedure_executions.agent_id, agent_id),
+      eq(procedure_executions.conversa_id, conversa_id),
+      eq(procedure_executions.status, 'in_progress'),
+    ))
+    .orderBy(desc(procedure_executions.last_activity_at))
+    .limit(1);
+}
+
+export function procedureDefinitionByIdQuery(id: string) {
+  return db
+    .select()
+    .from(procedure_definitions)
+    .where(and(eq(procedure_definitions.id, id), procedureDefinitionScopeCondition()))
+    .limit(1);
+}
+
+/**
+ * Every definition of the running (tenant, agent) — the join side the loader
+ * needs when it resolves the execution and its definition in one statement.
+ * Shares `procedureDefinitionScopeCondition` with the by-id read, so a foreign
+ * definition is invisible on both paths.
+ */
+export function procedureDefinitionsScopedQuery() {
+  return db.select().from(procedure_definitions).where(procedureDefinitionScopeCondition());
+}
+
+function procedureDefinitionScopeCondition() {
+  return and(
+    eq(procedure_definitions.tenant_id, getCurrentTenant()),
+    eq(procedure_definitions.agent_id, getCurrentAgent()),
+  );
+}
+
 export const procedureExecutionsRepo = {
   async create(
     input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
@@ -416,19 +455,7 @@ export const procedureExecutionsRepo = {
   },
 
   async findActiveForConversa(conversa_id: string): Promise<ProcedureExecution | null> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const rows = await db
-      .select()
-      .from(procedure_executions)
-      .where(and(
-        eq(procedure_executions.tenant_id, tenant_id),
-        eq(procedure_executions.agent_id, agent_id),
-        eq(procedure_executions.conversa_id, conversa_id),
-        eq(procedure_executions.status, 'in_progress'),
-      ))
-      .orderBy(desc(procedure_executions.last_activity_at))
-      .limit(1);
+    const rows = await procedureActiveForConversaQuery(conversa_id);
     return rows[0] ?? null;
   },
 

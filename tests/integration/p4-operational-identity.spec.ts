@@ -120,7 +120,13 @@ const {
   loggerDebug: vi.fn(),
 }));
 
-vi.mock('@/db/repositories.js', () => ({
+vi.mock('@/db/repositories.js', async () => {
+  // #525: this spec describes the world section by section, which is how the
+  // prompt builder used to read it. The adapter composes the batched
+  // `turnContextRepo` the loader calls now, so the scenarios below keep their
+  // vocabulary and still exercise the real loader and renderer.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   selfStateRepo: { getActive: selfStateGetActive },
   operationalProfileVersionsRepo: {
     getActive: operationalProfileVersionsGetActive,
@@ -152,7 +158,9 @@ vi.mock('@/db/repositories.js', () => ({
     findActiveForConversa: procedureExecutionsFindActiveForConversa,
   },
   procedureDefinitionsRepo: { findById: procedureDefinitionsFindById },
-}));
+  };
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('@/lib/logger.js', () => ({
   logger: {
@@ -457,8 +465,12 @@ describe('P4 operational identity — end-to-end', () => {
     expect(system).not.toContain('LEGACY_SYSTEM_PROMPT_BODY');
     expect(system).not.toContain('LEGACY_RESUMO');
     expect(system).not.toContain('self_state_v7');
-    // self_state NEVER consultado quando profile ativo válido.
-    expect(selfStateGetActive).not.toHaveBeenCalled();
+    // Issue #525 — as duas leituras de identidade vivem no MESMO statement, então
+    // "self_state não é consultado" deixou de ser observável (e de ser a
+    // propriedade interessante: uma leitura a mais dentro do mesmo round-trip
+    // não custa nada). O que importa é que não é USADO, e as três asserções
+    // acima já provam isso.
+    expect(selfStateGetActive).toHaveBeenCalledTimes(1);
     expect(operationalProfileVersionsGetActive).toHaveBeenCalledTimes(1);
     expect(loggerWarn).not.toHaveBeenCalled();
   });

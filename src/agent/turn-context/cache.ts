@@ -78,19 +78,44 @@ import { recordCacheOutcome } from './metrics.js';
  *                 path with no publisher, so a cached copy could go stale on
  *                 another replica until the TTL.
  *
+ *  - `self_awareness` — the skill catalogue (`agent_capabilities_skill`) and
+ *                 the mentionable/proposed capability gaps
+ *                 (`agent_capability_gaps`), which render the
+ *                 `## Autoconhecimento` and `## Limitações conhecidas` blocks.
+ *
+ *                 #511 removed these from the cache, correctly: only profile
+ *                 activation published, so a revoked skill or a resolved gap
+ *                 stayed visible on other replicas for up to a full TTL. Issue
+ *                 #525 restores them by supplying the missing half — EVERY
+ *                 writer of either table now publishes a `self_awareness`
+ *                 invalidation after commit
+ *                 (`publishSelfAwarenessInvalidation` in
+ *                 `src/db/repositories/capability-repos.ts`).
+ *
+ *                 The coverage claim is checkable rather than aspirational:
+ *                 both tables are written ONLY through `capabilitiesSkillRepo`
+ *                 and `capabilityGapsRepo` (grep for the table names — the
+ *                 sole other reference is a read in
+ *                 `workers/confidence-recompute.ts`), so publishing from
+ *                 inside those repo methods is exhaustive by construction, and
+ *                 `tests/unit/turn-context-self-awareness-invalidation.spec.ts`
+ *                 pins one test per mutating method.
+ *
+ *                 The two are ONE resource because one statement produces both
+ *                 and both invalidate together — a skill mutation dropping the
+ *                 gap half too is over-invalidation, which is always safe.
+ *
  * A resource only belongs here once EVERY mutation that changes it publishes.
- * `capabilities` (skills catalogue) and `gaps` were cached in the first cut of
- * this issue and have been REMOVED: only profile activation published, so a
- * revoked skill or a resolved gap stayed visible on other replicas for up to a
- * full TTL. That is an authorization-shaped failure wearing a performance
- * costume, and the correct trade is to give up the two saved queries until the
- * publisher coverage exists (skill activation/rollback/revocation and the gap
- * lifecycle transitions are a wider surface than this change should carry).
+ * Note what is still NOT here, and why: the legacy `self_state` identity
+ * fallback (`selfStateRepo.appendLearning` rewrites it from a fire-and-forget
+ * reflection path with no publisher), conversation history, entity states,
+ * facts, rules, memories and hints (per-subject, changing within the turn), and
+ * — structurally — anything authorization-bearing.
  *
  * Each resource is loaded ATOMICALLY: a load that throws is not cached at all,
  * so a partially-failed section can never be pinned for a TTL.
  */
-export const CACHEABLE_RESOURCES = ['identity'] as const;
+export const CACHEABLE_RESOURCES = ['identity', 'self_awareness'] as const;
 export type CacheableResource = (typeof CACHEABLE_RESOURCES)[number];
 
 /** Cache shape version. Bump when a cached section's payload changes shape. */
@@ -222,6 +247,21 @@ export class TurnContextCache {
   /** Tenants whose SUBSCRIBE this process has ACKNOWLEDGED — never before. */
   private readonly subscribedTenants = new Set<string>();
   private readonly lastSubscribeAttempt = new Map<string, number>();
+  /**
+   * Issue #525 — in-flight subscribe attempts, per tenant.
+   *
+   * Without this, two cacheable resources filling CONCURRENTLY on a tenant's
+   * first turn raced the cooldown: the first caller stamped
+   * `lastSubscribeAttempt` and awaited the hook, the second saw the fresh
+   * stamp, took the "inside the cooldown" branch and declined to cache — so one
+   * of the two resources silently went uncached for a whole cooldown window,
+   * every time a process saw a new tenant. The race was invisible while
+   * `identity` was the only cacheable resource; `self_awareness` made it live.
+   *
+   * Concurrent callers now await the SAME attempt, which is also the correct
+   * semantics: one SUBSCRIBE covers the tenant, not one per resource.
+   */
+  private readonly inflightSubscribe = new Map<string, Promise<boolean>>();
   private hits = 0;
   private misses = 0;
   private negativeHits = 0;
@@ -243,6 +283,7 @@ export class TurnContextCache {
   async getOrLoad<T>(
     resource: CacheableResource,
     load: () => Promise<T | null>,
+    opts: { cache_absent?: boolean } = {},
   ): Promise<T | null> {
     let scoped: { key: string; tenant_id: string };
     try {
@@ -276,10 +317,21 @@ export class TurnContextCache {
     recordCacheOutcome(resource, 'miss');
     const loaded = await load();
 
+    const absent = loaded === null || loaded === undefined;
+    // Issue #525 — `cache_absent: false` opts a resource out of negative
+    // caching. `identity` uses it: a cached "no active profile v2" would not
+    // save a round-trip, because the caller must then read the UNCACHEABLE
+    // `self_state` fallback anyway. A negative entry that saves nothing and
+    // adds a staleness window is strictly worse than no entry.
+    if (absent && opts.cache_absent === false) {
+      recordCacheOutcome(resource, 'bypass');
+      return null;
+    }
+
     // Store ONLY once we can prove this process will hear about invalidations
     // for this tenant. A value we cannot invalidate is worse than no value.
     if (await this.ensureSubscribed(scoped.tenant_id)) {
-      this.put(scoped.key, loaded === null || loaded === undefined ? ABSENT : loaded);
+      this.put(scoped.key, absent ? ABSENT : loaded);
     } else {
       recordCacheOutcome(resource, 'unsubscribed');
     }
@@ -330,6 +382,7 @@ export class TurnContextCache {
     this.store.clear();
     this.subscribedTenants.clear();
     this.lastSubscribeAttempt.clear();
+    this.inflightSubscribe.clear();
     this.hits = 0;
     this.misses = 0;
     this.negativeHits = 0;
@@ -372,25 +425,36 @@ export class TurnContextCache {
     if (!this.cfg.ensureSubscribed) return true;
     if (this.subscribedTenants.has(tenant_id)) return true;
 
+    // Join an attempt already running for this tenant rather than treating its
+    // cooldown stamp as "someone tried and failed" (issue #525).
+    const inflight = this.inflightSubscribe.get(tenant_id);
+    if (inflight) return inflight;
+
     const cooldown = this.cfg.subscribe_retry_ms ?? 5_000;
     const last = this.lastSubscribeAttempt.get(tenant_id) ?? 0;
     const now = Date.now();
     if (now - last < cooldown) return false;
     this.lastSubscribeAttempt.set(tenant_id, now);
 
-    try {
-      await this.cfg.ensureSubscribed(tenant_id);
-      this.subscribedTenants.add(tenant_id);
-      return true;
-    } catch (err) {
-      // Loud, not silent: the turn still works, but the cache is inert for
-      // this tenant and an operator needs to be able to see that.
-      logger.warn(
-        { err: (err as Error).message, tenant_id },
-        'turn_context_cache.subscribe_unconfirmed_not_caching',
-      );
-      return false;
-    }
+    const attempt = (async (): Promise<boolean> => {
+      try {
+        await this.cfg.ensureSubscribed!(tenant_id);
+        this.subscribedTenants.add(tenant_id);
+        return true;
+      } catch (err) {
+        // Loud, not silent: the turn still works, but the cache is inert for
+        // this tenant and an operator needs to be able to see that.
+        logger.warn(
+          { err: (err as Error).message, tenant_id },
+          'turn_context_cache.subscribe_unconfirmed_not_caching',
+        );
+        return false;
+      } finally {
+        this.inflightSubscribe.delete(tenant_id);
+      }
+    })();
+    this.inflightSubscribe.set(tenant_id, attempt);
+    return attempt;
   }
 
   /** Test helper: tenants with a confirmed subscription. */
@@ -426,12 +490,13 @@ export async function readCached<T>(
   resource: CacheableResource,
   load: () => Promise<T | null>,
   cache: TurnContextCache = turnContextCache,
+  opts: { cache_absent?: boolean } = {},
 ): Promise<T | null> {
   if (!config.FEATURE_TURN_CONTEXT_CACHE) {
     recordCacheOutcome(resource, 'bypass');
     return load();
   }
-  return cache.getOrLoad(resource, load);
+  return cache.getOrLoad(resource, load, opts);
 }
 
 /**

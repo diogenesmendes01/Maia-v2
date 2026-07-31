@@ -84,6 +84,28 @@ async function publishIdentityInvalidation(tenant_id: string, agent_id: string):
   }
 }
 
+/**
+ * Issue #525 — SELECT builder behind `operationalProfileVersionsRepo.getActive`,
+ * shared with the batched turn-context read. `status = 'active'` is the whole
+ * safety property of this read (a `proposed` or `frozen` persona must never
+ * reach the prompt), so it gets one definition, not two.
+ */
+export function operationalProfileGetActiveQuery() {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(agent_operational_profile_versions)
+    .where(
+      and(
+        eq(agent_operational_profile_versions.tenant_id, tenant_id),
+        eq(agent_operational_profile_versions.agent_id, agent_id),
+        eq(agent_operational_profile_versions.status, 'active'),
+      ),
+    )
+    .limit(1);
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
@@ -131,19 +153,7 @@ export const operationalProfileVersionsRepo = {
   },
 
   async getActive(): Promise<AgentOperationalProfileVersion | null> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const rows = await db
-      .select()
-      .from(agent_operational_profile_versions)
-      .where(
-        and(
-          eq(agent_operational_profile_versions.tenant_id, tenant_id),
-          eq(agent_operational_profile_versions.agent_id, agent_id),
-          eq(agent_operational_profile_versions.status, 'active'),
-        ),
-      )
-      .limit(1);
+    const rows = await operationalProfileGetActiveQuery();
     return rows[0] ?? null;
   },
 

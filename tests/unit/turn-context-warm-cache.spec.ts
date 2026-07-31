@@ -2,23 +2,25 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Mensagem, Pessoa, Conversa } from '../../src/db/schema.js';
 
 /**
- * Issue #511 — the warm-cache query budget.
+ * Issues #511 / #525 — the warm-cache query budget.
  *
- * The cold number (13 prompt queries) is asserted in
+ * The cold number (4 prompt statements) is asserted in
  * `turn-context-baseline.spec.ts` with the cache feature OFF. This spec turns it
- * ON and pins what the cache is actually worth on the second turn of an agent:
- * the two identity reads disappear, taking the prompt to 11.
+ * ON and pins what the cache is actually worth on the second turn of an agent.
  *
- * Round-1 review, P1: this used to be 8, because `capabilities` and `gaps` were
- * cached too. They were removed — only profile activation published an
- * invalidation, so a revoked skill or a resolved gap could stay visible on
- * another replica for a full TTL. Three queries back is the price of not
- * showing an agent a capability it no longer has.
+ * History of the number, because it is the part that keeps moving:
+ *   - #511 round 1 cached identity + capabilities + gaps → 8. Withdrawn: only
+ *     profile activation published, so a revoked skill or a resolved gap stayed
+ *     visible on other replicas for up to a full TTL.
+ *   - #511 round 2 cached identity only → 12 (self_state path) / 11 (v2 path).
+ *   - #525 batches the reads (13 statements → 4) and brings skills+gaps back as
+ *     ONE `self_awareness` resource, now that every writer of both tables
+ *     publishes an invalidation after commit. Warm: 3 (self_state) / 2 (v2).
  *
- * It also pins the property that makes the cache safe to enable at all — every
- * surviving read is one nothing may cache: recent messages, entities, entity
- * states (financial), facts, rules, the per-subject memory/hint reads, and the
- * capability/gap reads that now have no publisher coverage.
+ * It also pins the property that makes the cache safe to enable at all: every
+ * surviving read is one nothing may cache — recent messages, entities, entity
+ * states (financial), facts, rules, per-subject memories and hints, and the
+ * `self_state` identity fallback, which has no publisher.
  */
 
 type Counters = Record<string, number>;
@@ -34,11 +36,13 @@ const h = vi.hoisted(() => {
     calls,
     count,
     /**
-     * When set, the agent has an ACTIVE operational profile v2 and the prompt
+     * When set, the agent has an ACTIVE operational profile v2 and identity
      * takes the cached branch. `null` (default) exercises the legacy
      * `self_state` fallback, which is deliberately NOT cached.
      */
     activeProfile: null as { version: number; status: string; profile_body: unknown } | null,
+    /** Skill catalogue the batched self-awareness read returns. */
+    skills: [] as Array<{ skill_name: string; confidence: string }>,
   };
 });
 
@@ -60,32 +64,34 @@ vi.mock('../../src/lib/logger.js', () => ({
 }));
 
 vi.mock('../../src/db/repositories.js', () => ({
-  operationalProfileVersionsRepo: {
-    getActive: h.count('operationalProfileVersionsRepo.getActive', async () => h.activeProfile),
-  },
-  selfStateRepo: {
-    getActive: h.count('selfStateRepo.getActive', async () => ({
-      system_prompt: 'Você é a Maia.',
-      versao: 1,
-      resumo_aprendizados: '(vazio)',
+  turnContextRepo: {
+    loadIdentity: h.count('turnContextRepo.loadIdentity', async () => ({
+      profile: h.activeProfile,
+      self: { system_prompt: 'Você é a Maia.', versao: 1, resumo_aprendizados: '(vazio)' },
+    })),
+    loadCore: h.count('turnContextRepo.loadCore', async () => ({
+      history: [],
+      entities: [],
+      entity_states: [],
+      facts: [],
+      rules: [],
+    })),
+    loadEnrichment: h.count('turnContextRepo.loadEnrichment', async () => ({
+      memories: [],
+      hints: [],
+      procedure: null,
+    })),
+    loadSelfAwareness: h.count('turnContextRepo.loadSelfAwareness', async () => ({
+      skills: h.skills,
+      gaps: [],
     })),
   },
-  mensagensRepo: {
-    recentInConversation: h.count('mensagensRepo.recentInConversation', async () => []),
-  },
-  entidadesRepo: { byIds: h.count('entidadesRepo.byIds', async () => []) },
-  entityStatesRepo: { byIds: h.count('entityStatesRepo.byIds', async () => []) },
-  factsRepo: { listMentionableForScopes: h.count('factsRepo.listMentionableForScopes', async () => []) },
-  rulesRepo: { listActive: h.count('rulesRepo.listActive', async () => []) },
   memoryEntryRepo: { findRelevant: h.count('memoryEntryRepo.findRelevant', async () => []) },
   behavioralHintRepo: {
     findActiveForScopes: h.count('behavioralHintRepo.findActiveForScopes', async () => []),
   },
   capabilitiesSkillRepo: { listAll: h.count('capabilitiesSkillRepo.listAll', async () => []) },
-  capabilityGapsRepo: {
-    listByLevel: h.count('capabilityGapsRepo.listByLevel', async () => []),
-    listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []),
-  },
+  capabilityGapsRepo: { listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []) },
   procedureExecutionsRepo: {
     findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
   },
@@ -96,6 +102,7 @@ import { buildPrompt, type PromptContext } from '../../src/agent/prompt-builder.
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
 import {
   turnContextCache,
+  publishTurnContextInvalidation,
   startTurnContextCacheInvalidationSubscriber,
   _resetTurnContextSubscriberForTests,
   _setTurnContextSubscriberFactoryForTests,
@@ -141,12 +148,17 @@ function totalCalls(): number {
   return Object.values(h.calls).reduce((a, b) => a + b, 0);
 }
 
-describe('#511 warm-cache query budget', () => {
+function resetCalls(): void {
+  for (const k of Object.keys(h.calls)) delete h.calls[k];
+}
+
+describe('#511/#525 warm-cache query budget', () => {
   beforeEach(() => {
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
     h.activeProfile = null;
+    h.skills = [];
     turnContextCache.resetForTests();
-    // Round-1 review (P2): the cache refuses to STORE until it holds a
+    // #511 round-1 review (P2): the cache refuses to STORE until it holds a
     // confirmed subscription to the tenant's invalidation channel. Stand up a
     // fake bus so these tests measure the cache, not the refusal — and so the
     // wiring they exercise matches production's.
@@ -166,66 +178,57 @@ describe('#511 warm-cache query budget', () => {
   it('caches NOTHING while the invalidation bus is unconfirmed', async () => {
     // The safety property behind the numbers below: without a confirmed
     // subscription there is no cache at all, so there is no window in which a
-    // replica serves an identity it can never be told to drop.
+    // replica serves a value it can never be told to drop.
     _resetTurnContextSubscriberForTests();
     turnContextCache.resetForTests();
+    h.activeProfile = { version: 7, status: 'active', profile_body: {} };
 
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
 
-    expect(totalCalls()).toBe(13);
+    expect(totalCalls()).toBe(4);
   });
 
-  it('drops from 13 to 12 queries on the legacy self_state path', async () => {
+  it('drops from 4 to 3 statements on the legacy self_state path', async () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const cold = totalCalls();
 
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const warm = totalCalls();
 
-    expect(cold).toBe(13);
-    expect(warm).toBe(12);
+    expect(cold).toBe(4);
+    expect(warm).toBe(3);
 
-    // Only the operational-profile lookup is served from cache (as a negative
-    // entry: "no active profile v2"). Everything else is re-read every turn —
-    // because it must be (conversation state, financial state, per-subject
-    // knowledge) or because it has no invalidation publisher (capabilities,
-    // gaps, and the self_state fallback).
+    // Only self-awareness is served from cache on this path. Identity is
+    // re-read because the answer it produced was the UNCACHEABLE `self_state`
+    // fallback; everything else must be re-read every turn.
     expect(Object.keys(h.calls).sort()).toEqual([
-      'behavioralHintRepo.findActiveForScopes',
-      'capabilitiesSkillRepo.listAll',
-      'capabilityGapsRepo.listByLevel',
-      'capabilityGapsRepo.listByLevels',
-      'entidadesRepo.byIds',
-      'entityStatesRepo.byIds',
-      'factsRepo.listMentionableForScopes',
-      'memoryEntryRepo.findRelevant',
-      'mensagensRepo.recentInConversation',
-      'procedureExecutionsRepo.findActiveForConversa',
-      'rulesRepo.listActive',
-      'selfStateRepo.getActive',
+      'turnContextRepo.loadCore',
+      'turnContextRepo.loadEnrichment',
+      'turnContextRepo.loadIdentity',
     ]);
   });
 
   /**
-   * Round-2 review, P2. `identity` used to cache the DERIVED value across both
-   * branches, including the `self_state` fallback — but
+   * #511 round-2 review, P2. `identity` used to cache the DERIVED value across
+   * both branches, including the `self_state` fallback — but
    * `selfStateRepo.appendLearning` rewrites `resumo_aprendizados` from the
    * fire-and-forget reflection path with no publisher, so another replica could
    * render a stale summary until the TTL.
+   *
+   * #525 keeps that, and adds the reason the negative answer is not cached
+   * either: a cached "no active profile v2" would not save the round-trip,
+   * because the uncacheable fallback lives in the same statement.
    */
   it('re-reads self_state every turn, so a new learning shows up immediately', async () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
 
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
 
-    expect(h.calls['selfStateRepo.getActive']).toBe(1);
-    // The profile lookup IS still cached — only the uncovered branch was pulled
-    // out, not the whole resource.
-    expect(h.calls['operationalProfileVersionsRepo.getActive']).toBeUndefined();
+    expect(h.calls['turnContextRepo.loadIdentity']).toBe(1);
   });
 
   it('caches the rendered profile when an operational profile v2 IS active', async () => {
@@ -233,53 +236,101 @@ describe('#511 warm-cache query budget', () => {
 
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const cold = totalCalls();
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const warm = totalCalls();
 
-    // The v2 path never reads self_state at all, so cold is one lower and the
-    // cache removes the remaining identity query.
-    expect(cold).toBe(12);
-    expect(warm).toBe(11);
-    expect(h.calls['operationalProfileVersionsRepo.getActive']).toBeUndefined();
-    expect(h.calls['selfStateRepo.getActive']).toBeUndefined();
+    expect(cold).toBe(4);
+    // Identity AND self-awareness are both served from cache: the warm turn is
+    // two statements — core and enrichment, neither of which may ever be cached.
+    expect(warm).toBe(2);
+    expect(h.calls['turnContextRepo.loadIdentity']).toBeUndefined();
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBeUndefined();
   });
 
-  it('a revoked skill is visible on the very next turn (no TTL window)', async () => {
-    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+  /**
+   * Issue #525 — the property that lets `capabilities`/`gaps` be cached at all.
+   *
+   * #511 pulled them out because a revoked skill could survive in cache for a
+   * TTL. The trade is only acceptable if an invalidation makes it disappear on
+   * the NEXT turn, so that is what is asserted — the publisher, not the TTL.
+   */
+  it('a revoked skill is gone on the very next turn after invalidation', async () => {
+    h.skills = [{ skill_name: 'conciliar_extrato', confidence: '0.910' }];
 
-    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    const first = await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    expect(first.system).toContain('conciliar_extrato');
 
-    // The catalogue is re-read every turn, so a revocation that commits
-    // between two turns takes effect on the next one — not after a TTL.
-    expect(h.calls['capabilitiesSkillRepo.listAll']).toBe(1);
-    expect(h.calls['capabilityGapsRepo.listByLevel']).toBe(1);
-    expect(h.calls['capabilityGapsRepo.listByLevels']).toBe(1);
+    // Second turn WITHOUT invalidation: served from cache, no re-read.
+    resetCalls();
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBeUndefined();
+
+    // The revocation commits and publishes (this is what
+    // `capabilitiesSkillRepo.upsertConfidence` does after its write).
+    h.skills = [];
+    await publishTurnContextInvalidation({
+      ...SCOPE,
+      resource: 'self_awareness',
+      publisher: { publish: async () => 1 },
+    });
+
+    resetCalls();
+    const third = await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBe(1);
+    expect(third.system).not.toContain('conciliar_extrato');
   });
 
-  it('does NOT reuse one agent cached identity for another agent', async () => {
+  it('does NOT reuse one agent cached context for another agent', async () => {
+    h.activeProfile = { version: 7, status: 'active', profile_body: {} };
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
 
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-2' }, () =>
       buildPrompt(mkCtx()),
     );
 
     // A second agent in the same tenant is a cold cache, not a free ride.
-    expect(h.calls['operationalProfileVersionsRepo.getActive']).toBe(1);
-    expect(h.calls['selfStateRepo.getActive']).toBe(1);
-    expect(totalCalls()).toBe(13);
+    expect(h.calls['turnContextRepo.loadIdentity']).toBe(1);
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBe(1);
+    expect(totalCalls()).toBe(4);
   });
 
-  it('does NOT reuse one tenant cached identity for another tenant', async () => {
+  it('does NOT reuse one tenant cached context for another tenant', async () => {
+    h.activeProfile = { version: 7, status: 'active', profile_body: {} };
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
-    for (const k of Object.keys(h.calls)) delete h.calls[k];
+    resetCalls();
 
     await runWithTenantContext({ tenant_id: 'globex', agent_id: 'agent-1' }, () =>
       buildPrompt(mkCtx()),
     );
 
-    expect(totalCalls()).toBe(13);
+    expect(totalCalls()).toBe(4);
+  });
+
+  it('invalidating one tenant self-awareness leaves another tenant cache intact', async () => {
+    h.activeProfile = { version: 7, status: 'active', profile_body: {} };
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    await runWithTenantContext({ tenant_id: 'globex', agent_id: 'agent-1' }, () =>
+      buildPrompt(mkCtx()),
+    );
+
+    await publishTurnContextInvalidation({
+      tenant_id: 'acme',
+      agent_id: 'agent-1',
+      resource: 'self_awareness',
+      publisher: { publish: async () => 1 },
+    });
+
+    resetCalls();
+    await runWithTenantContext({ tenant_id: 'globex', agent_id: 'agent-1' }, () =>
+      buildPrompt(mkCtx()),
+    );
+    // globex was untouched: still fully warm.
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBeUndefined();
+
+    resetCalls();
+    await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
+    expect(h.calls['turnContextRepo.loadSelfAwareness']).toBe(1);
   });
 });

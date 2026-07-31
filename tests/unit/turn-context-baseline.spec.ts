@@ -2,41 +2,35 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '../../src/db/schema.js';
 
 /**
- * Issue #511 — TURN-CONTEXT QUERY BUDGET.
+ * Issues #511 / #525 — TURN-CONTEXT QUERY BUDGET.
  *
  * "Reduce queries by at least 50%" is meaningless without a number, so this
  * spec is the number. It counts every repository round-trip the turn-context
- * path makes and asserts the exact figure, for 1 / 10 / 100 entities.
+ * path makes and asserts the EXACT figure, for 1 / 10 / 100 entities.
  *
- * Measured baseline (commit 1 of this issue, before any batching):
+ *   entities        |  1  |  10  |  100  | what changed
+ *   ----------------+-----+------+-------+---------------------------------
+ *   pre-#511        | 17  |  35  |  215  | affine in scope size (the N+1)
+ *   #511 (cold)     | 15  |  15  |   15  | slope zero, constant still 15
+ *   #525 (cold)     |  6  |   6  |    6  | 4 batched statements + 2 scope
+ *   #525 (warm)     |  4  |   4  |    4  | identity + self_awareness cached
  *
- *   entities |  1  |  10  |  100
- *   ---------+-----+------+------
- *   prompt   | 15  |  24  |  114
- *   scope    |  2  |  11  |  101
- *   turn     | 17  |  35  |  215
- *
- * The cost was AFFINE in scope size: one `entityStatesRepo.byId` per entity in
- * the prompt builder, one `profilesRepo.byId` per permission in `resolveScope`,
- * and one behavioural-hint query per scope. That slope was the N+1.
- *
- * Current budget, asserted below:
- *
- *   entities |  1  |  10  |  100  | vs baseline
- *   ---------+-----+------+-------+------------
- *   prompt   | 13  |  13  |   13  |
- *   scope    |  2  |   2  |    2  |
- *   turn     | 15  |  15  |   15  | -12% / -57% / -93%
- *
- * The slope is now ZERO — the property that actually matters, because it is
- * what stops one "elephant" tenant from monopolising the fixed 10-connection
- * pool (`src/db/client.ts`) and stalling every other tenant's turn.
+ * The slope went to zero in #511 — the property that actually matters, because
+ * it is what stops one "elephant" tenant from monopolising the fixed
+ * 10-connection pool (`src/db/client.ts`). #525 attacks the CONSTANT, which is
+ * what the typical 1-entity turn actually pays: 17 → 6 is −65%, and the issue's
+ * ≤8 round-trip ceiling is met with two to spare.
  *
  * Counting is done at the repository boundary rather than against a live
- * Postgres because every repo method here is exactly one statement, so the two
- * numbers coincide — and this spec then runs in the unit suite with no DB.
- * The production counter (`src/db/query-counter.ts`) measures the real
- * round-trips and is asserted separately.
+ * Postgres because every method counted here is exactly ONE statement — a
+ * property asserted independently, without a database, in
+ * `tests/unit/turn-context-statements.spec.ts` (no `;` outside a literal), and
+ * against a real Postgres by the production counter
+ * (`src/db/query-counter.ts`) in `tests/integration/turn-context-batch-repos.spec.ts`.
+ *
+ * The 4 batched statements are grouped by FAILURE SEMANTICS, not by table:
+ * `core` holds the reads whose failure fails the turn, `enrichment` and
+ * `self_awareness` the ones that degrade their own sections.
  */
 
 type Counters = Record<string, number>;
@@ -51,8 +45,10 @@ const h = vi.hoisted(() => {
   return {
     calls,
     count,
-    /** Scope tuples handed to the batched hint query, per call. */
+    /** Scope tuples handed to the batched enrichment read, per call. */
     hintScopeCalls: [] as Array<Array<{ scope_type: string }>>,
+    /** Procedure mode the loader asked for, per call. */
+    procedureModes: [] as string[],
     /**
      * Profile ids the batch read must NOT return — models a profile that
      * exists in `permissoes` but not under the running tenant.
@@ -67,67 +63,59 @@ function entityIds(n: number): string[] {
 }
 
 vi.mock('../../src/db/repositories.js', () => ({
-  // --- identity ---------------------------------------------------------
-  operationalProfileVersionsRepo: {
-    getActive: h.count('operationalProfileVersionsRepo.getActive', async () => null),
-  },
-  selfStateRepo: {
-    getActive: h.count('selfStateRepo.getActive', async () => ({
-      system_prompt: 'Você é a Maia.',
-      versao: 1,
-      resumo_aprendizados: '(vazio)',
+  // --- #525 batched turn-context surface --------------------------------
+  turnContextRepo: {
+    loadIdentity: h.count('turnContextRepo.loadIdentity', async () => ({
+      profile: null,
+      self: { system_prompt: 'Você é a Maia.', versao: 1, resumo_aprendizados: '(vazio)' },
     })),
-  },
-  // --- conversation -----------------------------------------------------
-  mensagensRepo: {
-    recentInConversation: h.count('mensagensRepo.recentInConversation', async () => []),
-  },
-  // --- scope ------------------------------------------------------------
-  entidadesRepo: {
-    byIds: h.count('entidadesRepo.byIds', async (ids: string[]) =>
-      ids.map((id) => ({ id, nome: `Entidade ${id}` })),
+    loadCore: h.count(
+      'turnContextRepo.loadCore',
+      async (args: { entidade_ids: string[] }) => ({
+        history: [],
+        entities: args.entidade_ids.map((id) => ({ id, nome: `Entidade ${id}` })),
+        entity_states: args.entidade_ids.map((id) => ({
+          entidade_id: id,
+          saldo_consolidado: '100',
+          proximo_vencimento: null,
+        })),
+        facts: [],
+        rules: [],
+      }),
     ),
-  },
-  entityStatesRepo: {
-    byId: h.count('entityStatesRepo.byId', async (id: string) => ({
-      entidade_id: id,
-      saldo_consolidado: '100',
-      proximo_vencimento: null,
-    })),
-    byIds: h.count('entityStatesRepo.byIds', async (ids: string[]) =>
-      ids.map((id) => ({ entidade_id: id, saldo_consolidado: '100', proximo_vencimento: null })),
-    ),
-  },
-  // --- knowledge --------------------------------------------------------
-  factsRepo: {
-    listMentionableForScopes: h.count('factsRepo.listMentionableForScopes', async () => []),
-  },
-  rulesRepo: { listActive: h.count('rulesRepo.listActive', async () => []) },
-  // --- memory -----------------------------------------------------------
-  memoryEntryRepo: { findRelevant: h.count('memoryEntryRepo.findRelevant', async () => []) },
-  behavioralHintRepo: {
-    findActiveForScope: h.count('behavioralHintRepo.findActiveForScope', async () => []),
-    findActiveForScopes: h.count(
-      'behavioralHintRepo.findActiveForScopes',
-      async (scopes: Array<{ scope_type: string }>) => {
-        h.hintScopeCalls.push(scopes);
-        return [];
+    loadEnrichment: h.count(
+      'turnContextRepo.loadEnrichment',
+      async (args: {
+        hint_scopes: Array<{ scope_type: string }>;
+        procedure: { mode: string };
+      }) => {
+        h.hintScopeCalls.push(args.hint_scopes);
+        h.procedureModes.push(args.procedure.mode);
+        return { memories: [], hints: [], procedure: null };
       },
     ),
+    loadSelfAwareness: h.count('turnContextRepo.loadSelfAwareness', async () => ({
+      skills: [],
+      gaps: [],
+    })),
   },
-  // --- capabilities -----------------------------------------------------
+
+  // --- per-section fallbacks (used only when a batch fails) -------------
+  memoryEntryRepo: { findRelevant: h.count('memoryEntryRepo.findRelevant', async () => []) },
+  behavioralHintRepo: {
+    findActiveForScopes: h.count('behavioralHintRepo.findActiveForScopes', async () => []),
+  },
   capabilitiesSkillRepo: { listAll: h.count('capabilitiesSkillRepo.listAll', async () => []) },
   capabilityGapsRepo: {
-    listByLevel: h.count('capabilityGapsRepo.listByLevel', async () => []),
     listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []),
   },
-  // --- procedures -------------------------------------------------------
   procedureExecutionsRepo: {
     findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
   },
   procedureDefinitionsRepo: {
     findById: h.count('procedureDefinitionsRepo.findById', async () => null),
   },
+
   // --- permissions (resolveScope) --------------------------------------
   permissoesRepo: {
     forPessoa: h.count('permissoesRepo.forPessoa', async () => permissoesFixture),
@@ -141,7 +129,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { list: h.count('pessoasRepo.list', async () => []) },
 }));
 
-vi.mock('../../src/config/env.js', () => ({ config: { TZ: 'America/Sao_Paulo' } }));
+vi.mock('../../src/config/env.js', () => ({
+  config: { TZ: 'America/Sao_Paulo', FEATURE_TURN_CONTEXT_CACHE: false },
+}));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
@@ -224,10 +214,11 @@ function totalCalls(): number {
 function resetCalls(): void {
   for (const k of Object.keys(h.calls)) delete h.calls[k];
   h.hintScopeCalls.length = 0;
+  h.procedureModes.length = 0;
   h.missingProfiles.clear();
 }
 
-describe('#511 baseline — turn-context query cost', () => {
+describe('#511/#525 baseline — turn-context query cost', () => {
   beforeEach(() => {
     resetCalls();
   });
@@ -237,23 +228,16 @@ describe('#511 baseline — turn-context query cost', () => {
      * Cost of the typical turn (no operational profile v2 → self_state
      * fallback, no active role/channel, no active procedure):
      *
-     *   operationalProfileVersionsRepo.getActive        1
-     *   selfStateRepo.getActive                         1
-     *   mensagensRepo.recentInConversation              1
-     *   entidadesRepo.byIds                             1
-     *   entityStatesRepo.byIds                          1  (was: 1 per entity)
-     *   factsRepo.listMentionableForScopes              1
-     *   rulesRepo.listActive                            1
-     *   memoryEntryRepo.findRelevant                    1
-     *   behavioralHintRepo.findActiveForScopes          1  (was: 1 per scope)
-     *   capabilitiesSkillRepo.listAll                   1
-     *   capabilityGapsRepo.listByLevel                  1
-     *   procedureExecutionsRepo.findActiveForConversa   1
-     *   capabilityGapsRepo.listByLevels                 1
-     *                                                  --
-     *                                                  13, independent of N
+     *   turnContextRepo.loadIdentity        1  (was 2: profile + self_state)
+     *   turnContextRepo.loadCore           1  (was 5: history, entidades,
+     *                                          entity_states, facts, rules)
+     *   turnContextRepo.loadEnrichment     1  (was 3: memories, hints,
+     *                                          procedure execution)
+     *   turnContextRepo.loadSelfAwareness  1  (was 3: skills + gaps ×2)
+     *                                     --
+     *                                      4, independent of N
      */
-    const PROMPT_BUDGET = 13;
+    const PROMPT_BUDGET = 4;
 
     it.each([1, 10, 100])('costs a CONSTANT %i-independent budget for %i entities', async (n) => {
       await buildPrompt({
@@ -263,10 +247,30 @@ describe('#511 baseline — turn-context query cost', () => {
         inbound: mkInbound(),
       });
 
-      // The N+1 is gone: one batched statement, whatever the scope size.
-      expect(h.calls['entityStatesRepo.byIds']).toBe(1);
-      expect(h.calls['entityStatesRepo.byId']).toBeUndefined();
+      expect(h.calls['turnContextRepo.loadCore']).toBe(1);
       expect(totalCalls()).toBe(PROMPT_BUDGET);
+    });
+
+    it('never reaches a repository directly — the renderer is pure', async () => {
+      await buildPrompt({
+        pessoa: mkPessoa(),
+        conversa: mkConversa(),
+        scope: mkScope(1),
+        inbound: mkInbound(),
+      });
+      // The per-section methods exist only as the failure-path retry. On the
+      // happy path NONE of them runs; if one does, a read leaked back into the
+      // renderer or a batch silently fell back.
+      for (const name of [
+        'memoryEntryRepo.findRelevant',
+        'behavioralHintRepo.findActiveForScopes',
+        'capabilitiesSkillRepo.listAll',
+        'capabilityGapsRepo.listByLevels',
+        'procedureExecutionsRepo.findActiveForConversa',
+        'procedureDefinitionsRepo.findById',
+      ]) {
+        expect(h.calls[name], name).toBeUndefined();
+      }
     });
 
     it('requests every hint scope in ONE query, not one per scope', async () => {
@@ -278,17 +282,37 @@ describe('#511 baseline — turn-context query cost', () => {
         current_role_id: 'role-1',
         current_channel_id: 'chan-1',
       });
-      expect(h.calls['behavioralHintRepo.findActiveForScope']).toBeUndefined();
-      expect(h.calls['behavioralHintRepo.findActiveForScopes']).toBe(1);
+      expect(h.calls['turnContextRepo.loadEnrichment']).toBe(1);
       // …and it still asks for all five scopes.
       const scopes = (h.hintScopeCalls.at(-1) ?? []).map((s) => s.scope_type);
-      expect(scopes).toEqual([
-        'interlocutor',
-        'conversation',
-        'role',
-        'channel',
-        'agent',
-      ]);
+      expect(scopes).toEqual(['interlocutor', 'conversation', 'role', 'channel', 'agent']);
+    });
+
+    it('does not ask for a procedure the caller already ruled out', async () => {
+      await buildPrompt({
+        pessoa: mkPessoa(),
+        conversa: mkConversa(),
+        scope: mkScope(1),
+        inbound: mkInbound(),
+        // `null` = the caller looked and found none.
+        activeExecution: null,
+      });
+      expect(h.procedureModes.at(-1)).toBe('skip');
+      expect(totalCalls()).toBe(PROMPT_BUDGET);
+    });
+
+    it('resolves a running procedure and its definition in the SAME statement', async () => {
+      await buildPrompt({
+        pessoa: mkPessoa(),
+        conversa: mkConversa(),
+        scope: mkScope(1),
+        inbound: mkInbound(),
+      });
+      // `undefined` = the caller did not look, so the loader looks — and the
+      // definition comes back in the same round-trip (pre-#525 that was a
+      // second query, issued only after the first returned).
+      expect(h.procedureModes.at(-1)).toBe('lookup');
+      expect(h.calls['procedureDefinitionsRepo.findById']).toBeUndefined();
     });
   });
 
@@ -388,10 +412,16 @@ describe('#511 baseline — turn-context query cost', () => {
   });
 
   describe('whole turn', () => {
+    /**
+     * THE acceptance number of issue #525: ≤8 round-trips for the typical turn
+     * with no procedure. Asserted as an exact figure, not a bound, so a
+     * regression that adds one back fails here instead of eroding the margin
+     * silently.
+     */
     it.each([
-      [1, 15],
-      [10, 15],
-      [100, 15],
+      [1, 6],
+      [10, 6],
+      [100, 6],
     ])('for %i entities the turn costs %i queries', async (n, expected) => {
       permissoesFixture = entityIds(n).map(
         (id) =>
@@ -413,6 +443,7 @@ describe('#511 baseline — turn-context query cost', () => {
       });
 
       expect(totalCalls()).toBe(expected);
+      expect(totalCalls()).toBeLessThanOrEqual(8);
     });
   });
 });

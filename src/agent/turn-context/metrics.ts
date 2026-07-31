@@ -27,8 +27,11 @@ import { incCounter, observeHistogram } from '@/lib/metrics.js';
  *  - `optional`: reasoner context, loaded only for turns the gate allowed.
  *  - `legacy`: the pre-#511 prompt-builder waterfall, kept as the baseline the
  *    optimisation is measured against.
+ *  - `loader`: issue #525 — the batched `TurnContextLoader`. A DISTINCT label
+ *    from `legacy` on purpose: merging them would average the before and after
+ *    into one series and hide the very change the label exists to show.
  */
-export type TurnContextPhase = 'critical' | 'optional' | 'legacy';
+export type TurnContextPhase = 'critical' | 'optional' | 'legacy' | 'loader';
 
 export type TurnContextResult = 'ok' | 'degraded' | 'error';
 
@@ -47,6 +50,14 @@ export type TurnContextSection =
   | 'hints'
   | 'capabilities'
   | 'gaps'
+  /**
+   * Issue #525 — the CACHE resource that holds `capabilities` + `gaps`
+   * together. They are read in one statement and invalidated by the same
+   * publishers, so they are one cache entry; the two section labels above stay
+   * as they are, because a dashboard cares about the two prompt BLOCKS
+   * separately even when one read produced both.
+   */
+  | 'self_awareness'
   | 'role'
   | 'procedure';
 

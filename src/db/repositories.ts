@@ -24,6 +24,8 @@ export * from './repositories/objective-repos.js';
 export * from './repositories/mcp-repos.js';
 export * from './repositories/approval-repos.js';
 export * from './repositories/turn-repos.js';
+// Issue #525 — batched turn-context reads consumed by `src/agent/turn-context/loader.ts`.
+export * from './repositories/turn-context-repos.js';
 // Issue #514 — Trace Explorer reads the P10b evidence tables through this repo.
 export * from './repositories/runtime-trace-repos.js';
 

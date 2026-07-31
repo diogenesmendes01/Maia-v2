@@ -28,7 +28,11 @@ const h = vi.hoisted(() => ({
   entityStatesById: vi.fn(),
 }));
 
-vi.mock('../../src/db/repositories.js', () => ({
+vi.mock('../../src/db/repositories.js', async () => {
+  // #525: the spec keeps describing the world section by section; the
+  // adapter composes the batched `turnContextRepo` the loader now calls.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   selfStateRepo: { getActive: h.selfStateGetActive },
   operationalProfileVersionsRepo: { getActive: vi.fn(async () => null) },
   mensagensRepo: { recentInConversation: h.recentInConversation },
@@ -36,7 +40,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   factsRepo: { listMentionableForScopes: h.factsListMentionableForScopes },
   rulesRepo: { listActive: h.rulesListActive },
   entityStatesRepo: { byId: h.entityStatesById, byIds: vi.fn(async () => []) },
-}));
+};
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('../../src/config/env.js', () => ({
   config: { TZ: 'America/Sao_Paulo' },

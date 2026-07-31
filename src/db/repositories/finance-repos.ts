@@ -14,6 +14,37 @@ import type { Entidade, Conta, Transacao, Contraparte, Categoria, EntityState } 
 import { EmptyScopeError } from './core.js';
 import type { EntityScope } from './core.js';
 
+/**
+ * Issue #525 — SELECT builders behind `entidadesRepo.byIds` and
+ * `entityStatesRepo.byIds`, exported so the turn-context loader
+ * (`src/db/repositories/turn-context-repos.ts`) folds the SAME predicates into
+ * its batched statement rather than restating them. Restating is how a tenant
+ * predicate goes missing in a copy; there is now only one copy.
+ *
+ * Callers must keep the empty-input guard: an `IN ()` over zero ids is a
+ * degenerate predicate and these builders do not defend against it.
+ */
+export function entidadesByIdsQuery(ids: string[]) {
+  return db.select().from(entidades).where(inArray(entidades.id, ids));
+}
+
+export function entityStatesByIdsQuery(entidade_ids: string[], limit = 500) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(entity_states)
+    .where(
+      and(
+        inArray(entity_states.entidade_id, Array.from(new Set(entidade_ids))),
+        eq(entity_states.tenant_id, tenant_id),
+        eq(entity_states.agent_id, agent_id),
+      ),
+    )
+    .orderBy(entity_states.entidade_id)
+    .limit(limit);
+}
+
 export const entidadesRepo = {
   /**
    * Issue #345 (Phase 4 of #323) — tenant-scope the entity list.
@@ -42,7 +73,7 @@ export const entidadesRepo = {
   },
   async byIds(ids: string[]): Promise<Entidade[]> {
     if (ids.length === 0) return [];
-    return db.select().from(entidades).where(inArray(entidades.id, ids));
+    return entidadesByIdsQuery(ids);
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
     const guarded = applyTenantGuard(input);
@@ -614,20 +645,7 @@ export const entityStatesRepo = {
    */
   async byIds(entidade_ids: string[], limit = 500): Promise<EntityState[]> {
     if (entidade_ids.length === 0) return [];
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    return db
-      .select()
-      .from(entity_states)
-      .where(
-        and(
-          inArray(entity_states.entidade_id, Array.from(new Set(entidade_ids))),
-          eq(entity_states.tenant_id, tenant_id),
-          eq(entity_states.agent_id, agent_id),
-        ),
-      )
-      .orderBy(entity_states.entidade_id)
-      .limit(limit);
+    return entityStatesByIdsQuery(entidade_ids, limit);
   },
   // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.
   // The conflict target is the `entidade_id` PK only, and the OLD SET

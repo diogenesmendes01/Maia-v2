@@ -30,7 +30,11 @@ function hugeRows<T>(n: number, make: (i: number) => T): T[] {
   return Array.from({ length: n }, (_, i) => make(i));
 }
 
-vi.mock('../../src/db/repositories.js', () => ({
+vi.mock('../../src/db/repositories.js', async () => {
+  // #525: the spec keeps describing the world section by section; the
+  // adapter composes the batched `turnContextRepo` the loader now calls.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   operationalProfileVersionsRepo: { getActive: vi.fn(async () => null) },
   selfStateRepo: {
     getActive: vi.fn(async () => ({
@@ -101,7 +105,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   },
   procedureExecutionsRepo: { findActiveForConversa: vi.fn(async () => null) },
   procedureDefinitionsRepo: { findById: vi.fn(async () => null) },
-}));
+};
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('../../src/config/env.js', () => ({
   config: { TZ: 'America/Sao_Paulo', LOG_LEVEL: 'silent', NODE_ENV: 'test' },

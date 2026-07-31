@@ -31,7 +31,11 @@ const behavioralHintFindActiveForScopes = vi.fn();
 const capabilitiesSkillListAll = vi.fn();
 const capabilityGapsListByLevel = vi.fn();
 
-vi.mock('../../src/db/repositories.js', () => ({
+vi.mock('../../src/db/repositories.js', async () => {
+  // #525: the spec keeps describing the world section by section; the
+  // adapter composes the batched `turnContextRepo` the loader now calls.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   selfStateRepo: { getActive: selfStateGetActive },
   operationalProfileVersionsRepo: { getActive: vi.fn(async () => null) },
   mensagensRepo: { recentInConversation: mensagensRecent },
@@ -46,7 +50,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   },
   capabilitiesSkillRepo: { listAll: capabilitiesSkillListAll },
   capabilityGapsRepo: { listByLevel: capabilityGapsListByLevel },
-}));
+};
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('../../src/config/env.js', () => ({
   config: { LOG_LEVEL: 'silent', NODE_ENV: 'test', TZ: 'America/Sao_Paulo' },

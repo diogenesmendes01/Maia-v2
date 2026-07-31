@@ -118,6 +118,10 @@ export const capabilitiesSkillRepo = {
         ...updates,
       } as typeof agent_capabilities_skill.$inferInsert);
     }
+    // Issue #525 — AFTER commit. This is the ONLY writer of
+    // `agent_capabilities_skill`, so the `self_awareness` cache resource has
+    // complete publisher coverage on the skill half.
+    await publishSelfAwarenessInvalidation(tenant_id, agent_id);
   },
 
   async listByDomain(domain: string): Promise<AgentCapabilitySkill[]> {
@@ -136,19 +140,49 @@ export const capabilitiesSkillRepo = {
   },
 
   async listAll(): Promise<AgentCapabilitySkill[]> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    return db
-      .select()
-      .from(agent_capabilities_skill)
-      .where(
-        and(
-          eq(agent_capabilities_skill.tenant_id, tenant_id),
-          eq(agent_capabilities_skill.agent_id, agent_id),
-        ),
-      );
+    return skillsListAllQuery();
   },
 };
+
+/**
+ * Issue #525 — SELECT builders behind `capabilitiesSkillRepo.listAll` and
+ * `capabilityGapsRepo.listByLevels`, shared with the batched turn-context read
+ * (`src/db/repositories/turn-context-repos.ts`) so the (tenant, agent) scope is
+ * written once.
+ *
+ * These two ARE the `self_awareness` cache resource. The cache stores what they
+ * return, and every writer of the two tables publishes an invalidation after
+ * commit (see the publishers further down this file) — that is the condition
+ * under which they were allowed back into the cache at all.
+ */
+export function skillsListAllQuery() {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(agent_capabilities_skill)
+    .where(
+      and(
+        eq(agent_capabilities_skill.tenant_id, tenant_id),
+        eq(agent_capabilities_skill.agent_id, agent_id),
+      ),
+    );
+}
+
+export function gapsListByLevelsQuery(levels: GapLevel[]) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(agent_capability_gaps)
+    .where(
+      and(
+        eq(agent_capability_gaps.tenant_id, tenant_id),
+        eq(agent_capability_gaps.agent_id, agent_id),
+        inArray(agent_capability_gaps.current_level, levels),
+      ),
+    );
+}
 
 export const capabilityGapsRepo = {
   async upsert(input: {
@@ -190,6 +224,10 @@ export const capabilityGapsRepo = {
             eq(agent_capability_gaps.agent_id, agent_id),
           ),
         );
+      // Issue #525 — the bump changes `frequency_score`, which the escalation
+      // engine turns into a LEVEL change. Publishing here as well keeps the
+      // rule simple and auditable: every write to this table publishes.
+      await publishSelfAwarenessInvalidation(tenant_id, agent_id);
       return existing[0];
     }
 
@@ -204,6 +242,7 @@ export const capabilityGapsRepo = {
         source_candidate_id: input.source_candidate_id ?? null,
       } as typeof agent_capability_gaps.$inferInsert)
       .returning();
+    await publishSelfAwarenessInvalidation(tenant_id, agent_id);
     return created!;
   },
 
@@ -227,19 +266,8 @@ export const capabilityGapsRepo = {
   // every gap in a set of current levels (e.g. ['silent', 'dashboard']) in one
   // query before running level-transition rules.
   async listByLevels(levels: GapLevel[]): Promise<AgentCapabilityGap[]> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
     if (levels.length === 0) return [];
-    return db
-      .select()
-      .from(agent_capability_gaps)
-      .where(
-        and(
-          eq(agent_capability_gaps.tenant_id, tenant_id),
-          eq(agent_capability_gaps.agent_id, agent_id),
-          inArray(agent_capability_gaps.current_level, levels),
-        ),
-      );
+    return gapsListByLevelsQuery(levels);
   },
 
   // P5: updateLevel — typed-args level setter scoped by the current
@@ -259,6 +287,11 @@ export const capabilityGapsRepo = {
           eq(agent_capability_gaps.agent_id, agent_id),
         ),
       );
+    // Issue #525 — the escalation transition (silent → dashboard → mentionable
+    // → proposed) is exactly what decides whether a gap is VISIBLE in the
+    // prompt. A gap escalated to `mentionable`, or de-escalated out of it, must
+    // change the prompt on the next turn, not after a TTL.
+    await publishSelfAwarenessInvalidation(tenant_id, agent_id);
   },
 
   // P5: daysSinceLastProposed — tenant/agent-wide MAX(last_level_change_at)
@@ -300,9 +333,49 @@ export const capabilityGapsRepo = {
       .insert(agent_capability_gaps)
       .values(guarded as typeof agent_capability_gaps.$inferInsert)
       .returning();
+    // Issue #525 — the learning loop reaches the gap table through here
+    // (`capability-test-runner` → `revertCapability` → `create`). A new gap
+    // starts at the schema default level, which can be prompt-visible, so the
+    // cached snapshot has to go.
+    await publishSelfAwarenessInvalidation(getCurrentTenant(), getCurrentAgent());
     return row!;
   },
 };
+
+/**
+ * Issue #525 — drop the cached `self_awareness` snapshot on every replica.
+ *
+ * Called AFTER the write commits, from inside each mutating method rather than
+ * from the callers: the two tables are written only through this file, so
+ * publishing here makes the coverage a property of the repository instead of a
+ * convention every future call site has to remember. That is the condition
+ * under which `capabilities`/`gaps` were allowed back into the cache at all
+ * (see `src/agent/turn-context/cache.ts`).
+ *
+ * Best-effort by contract, and never fatal: `publishTurnContextInvalidation`
+ * applies the invalidation to THIS replica first and only then tries the
+ * broker, so a Redis outage degrades to TTL-bounded staleness of a non-
+ * authorization-bearing value. A throw is swallowed for the same reason the
+ * identity publisher swallows one — the write already committed, and failing a
+ * capability update because a cache hint could not be published would be the
+ * worse outcome.
+ *
+ * The import is lazy so the repository layer does not pull the agent's cache
+ * module (and, transitively, the Redis client) into every process that merely
+ * imports repositories.
+ */
+async function publishSelfAwarenessInvalidation(
+  tenant_id: string,
+  agent_id: string,
+): Promise<void> {
+  try {
+    const { publishTurnContextInvalidation } = await import('@/agent/turn-context/cache.js');
+    await publishTurnContextInvalidation({ tenant_id, agent_id, resource: 'self_awareness' });
+  } catch {
+    // Already logged inside the publisher for broker failures; this catch only
+    // covers an import/wiring failure, which must not fail a committed write.
+  }
+}
 
 // P5: gap_escalation_rules — thresholds determinísticos por (tenant_id, agent_id)
 // para a escalation chain (silent → dashboard → mentionable → proposed).

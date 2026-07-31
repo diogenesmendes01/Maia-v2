@@ -20,6 +20,28 @@ import type {
 } from '../schema.js';
 import { validateProfileBodyP8d } from './profile-internal.js';
 
+/**
+ * Issue #525 — SELECT builder behind `selfStateRepo.getActive`, shared with the
+ * batched turn-context read so the tenant/agent scope and the `ativa` +
+ * highest-`versao` selection stay in one place.
+ */
+export function selfStateGetActiveQuery() {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(self_state)
+    .where(
+      and(
+        eq(self_state.tenant_id, tenant_id),
+        eq(self_state.agent_id, agent_id),
+        eq(self_state.ativa, true),
+      ),
+    )
+    .orderBy(desc(self_state.versao))
+    .limit(1);
+}
+
 export const selfStateRepo = {
   // Flip-readiness (#323, H4 of #355) — READ half of a read-then-write PAIR, and
   // the more dangerous one. `self_state` carries NOT NULL `tenant_id` +
@@ -40,20 +62,7 @@ export const selfStateRepo = {
   // (NB: the many `operationalProfileVersionsRepo.getActive()` call sites are a
   // DIFFERENT repo and unaffected.)
   async getActive(): Promise<SelfState | null> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    const rows = await db
-      .select()
-      .from(self_state)
-      .where(
-        and(
-          eq(self_state.tenant_id, tenant_id),
-          eq(self_state.agent_id, agent_id),
-          eq(self_state.ativa, true),
-        ),
-      )
-      .orderBy(desc(self_state.versao))
-      .limit(1);
+    const rows = await selfStateGetActiveQuery();
     return rows[0] ?? null;
   },
   // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.

@@ -31,7 +31,11 @@ const capabilityGapsListByLevels = vi.fn();
 const procedureExecutionsFindActiveForConversa = vi.fn();
 const procedureDefinitionsFindById = vi.fn();
 
-vi.mock('../../src/db/repositories.js', () => ({
+vi.mock('../../src/db/repositories.js', async () => {
+  // #525: the spec keeps describing the world section by section; the
+  // adapter composes the batched `turnContextRepo` the loader now calls.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   selfStateRepo: { getActive: selfStateGetActive },
   operationalProfileVersionsRepo: { getActive: operationalProfileVersionsGetActive },
   mensagensRepo: { recentInConversation: mensagensRecent },
@@ -51,7 +55,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   },
   procedureExecutionsRepo: { findActiveForConversa: procedureExecutionsFindActiveForConversa },
   procedureDefinitionsRepo: { findById: procedureDefinitionsFindById },
-}));
+};
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('../../src/config/env.js', () => ({
   config: {},

@@ -29,7 +29,11 @@ const capabilityGapsListByLevel = vi.fn();
 const procedureExecutionsFindActiveForConversa = vi.fn();
 const procedureDefinitionsFindById = vi.fn();
 
-vi.mock('../../src/db/repositories.js', () => ({
+vi.mock('../../src/db/repositories.js', async () => {
+  // #525: the spec keeps describing the world section by section; the
+  // adapter composes the batched `turnContextRepo` the loader now calls.
+  const { turnContextRepoDouble } = await import('../helpers/turn-context-repo-double.js');
+  const repos = {
   selfStateRepo: { getActive: selfStateGetActive },
   operationalProfileVersionsRepo: { getActive: operationalProfileVersionsGetActive },
   mensagensRepo: { recentInConversation: mensagensRecent },
@@ -48,7 +52,9 @@ vi.mock('../../src/db/repositories.js', () => ({
     findActiveForConversa: procedureExecutionsFindActiveForConversa,
   },
   procedureDefinitionsRepo: { findById: procedureDefinitionsFindById },
-}));
+};
+  return { ...repos, turnContextRepo: turnContextRepoDouble(repos) };
+});
 
 vi.mock('../../src/config/env.js', () => ({
   config: {},
@@ -209,9 +215,15 @@ describe('buildPrompt — operational profile v2 (com fallback a self_state)', (
     // nao carrega esse conteudo.
     expect(system).not.toContain('## Capacidades em desenvolvimento');
     expect(system).not.toContain('## Contexto recente');
-    // self_state NUNCA é consultado quando há profile ativo.
-    expect(selfStateGetActive).not.toHaveBeenCalled();
+    // Issue #525 — a asserção mudou de forma, não de conteúdo. As duas leituras
+    // de identidade agora vivem no MESMO statement (`turnContextRepo
+    // .loadIdentity`), então "self_state não é consultado" deixou de ser
+    // observável — e deixou de ser a propriedade interessante, porque uma
+    // leitura extra dentro do mesmo round-trip não custa nada. O que importa é
+    // que o self_state não é USADO: as asserções acima já provam isso
+    // (`op_profile_v3` presente, `self_state_v7` e o corpo legado ausentes).
     expect(operationalProfileVersionsGetActive).toHaveBeenCalledTimes(1);
+    expect(selfStateGetActive).toHaveBeenCalledTimes(1);
     expect(loggerWarn).not.toHaveBeenCalled();
   });
 

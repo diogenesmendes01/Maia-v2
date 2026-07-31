@@ -353,6 +353,30 @@ type MensagemInsertInput = Omit<
   'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'channel_id'
 > & { channel_id?: string | null };
 
+/**
+ * Issue #525 — the SELECT behind `mensagensRepo.recentInConversation`, exposed
+ * as a builder so the turn-context loader can fold it into its batched
+ * statement (`src/db/repositories/turn-context-repos.ts`) instead of restating
+ * the predicate. One definition, two callers: the tenant/agent scope, the
+ * ordering and the limit cannot drift between the single read and the batch.
+ */
+export function recentInConversationQuery(conversa_id: string, n = 20) {
+  const tenant_id = getCurrentTenant();
+  const agent_id = getCurrentAgent();
+  return db
+    .select()
+    .from(mensagens)
+    .where(
+      and(
+        eq(mensagens.tenant_id, tenant_id),
+        eq(mensagens.agent_id, agent_id),
+        eq(mensagens.conversa_id, conversa_id),
+      ),
+    )
+    .orderBy(desc(mensagens.created_at))
+    .limit(n);
+}
+
 export const mensagensRepo = {
   async create(input: MensagemInsertInput): Promise<Mensagem> {
     const guarded = applyTenantGuard({ ...input, channel_id: input.channel_id ?? null });
@@ -504,20 +528,7 @@ export const mensagensRepo = {
     return rows[0] ?? null;
   },
   async recentInConversation(conversa_id: string, n = 20): Promise<Mensagem[]> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    return db
-      .select()
-      .from(mensagens)
-      .where(
-        and(
-          eq(mensagens.tenant_id, tenant_id),
-          eq(mensagens.agent_id, agent_id),
-          eq(mensagens.conversa_id, conversa_id),
-        ),
-      )
-      .orderBy(desc(mensagens.created_at))
-      .limit(n);
+    return recentInConversationQuery(conversa_id, n);
   },
   /**
    * Inbound messages from a given telefone (`metadata->>'telefone'`) that

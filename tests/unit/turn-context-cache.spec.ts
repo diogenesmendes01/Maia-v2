@@ -92,21 +92,30 @@ describe('#511 turn-context cache — keys', () => {
   it('never lists an authorization-bearing resource as cacheable', () => {
     // The union IS the guard: caching permissions/grants/balances must not be
     // expressible. If this list grows, the growth was a security decision.
-    expect([...CACHEABLE_RESOURCES].sort()).toEqual(['identity']);
+    expect([...CACHEABLE_RESOURCES].sort()).toEqual(['identity', 'self_awareness']);
     for (const forbidden of ['permissions', 'scope', 'grants', 'balance', 'pending']) {
       expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain(forbidden);
     }
   });
 
   /**
-   * Round-1 review, P1: `capabilities` and `gaps` were cached while only
+   * #511 round-1 review, P1: `capabilities` and `gaps` were cached while only
    * profile activation published an invalidation, so a REVOKED skill or a
    * resolved gap stayed visible on other replicas for up to a full TTL. They
-   * were removed rather than half-covered. The rule this pins is the general
-   * one: a resource may only be cached once EVERY mutation that changes it
-   * publishes after commit.
+   * were removed rather than half-covered.
+   *
+   * Issue #525 brings them back under the single `self_awareness` resource,
+   * having supplied the missing half: every writer of `agent_capabilities_skill`
+   * and `agent_capability_gaps` publishes after commit
+   * (`tests/unit/turn-context-self-awareness-invalidation.spec.ts` pins one test
+   * per mutating method). The rule they were removed FOR is unchanged and is
+   * what this asserts: they are cached under a name that exists precisely
+   * because the publisher coverage now does.
    */
-  it('does not cache capabilities or gaps (no publisher coverage yet)', () => {
+  it('caches skills+gaps as ONE resource, not as two half-covered ones', () => {
+    expect(CACHEABLE_RESOURCES as readonly string[]).toContain('self_awareness');
+    // The two SECTION labels are not cache resources — one statement produces
+    // both and one invalidation drops both, so there is one entry, not two.
     expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain('capabilities');
     expect(CACHEABLE_RESOURCES as readonly string[]).not.toContain('gaps');
   });
