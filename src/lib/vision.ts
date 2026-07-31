@@ -1,8 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-
-const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+import { executeLLM } from '@/lib/llm/index.js';
+import type { LLMImageMediaType } from '@/lib/llm/index.js';
 
 export type BoletoFields = {
   linha_digitavel?: string;
@@ -46,15 +44,20 @@ export async function parseImage(input: {
   kind: 'boleto' | 'receipt';
 }): Promise<(BoletoFields & ReceiptFields) | null> {
   // media-guard's 'image' kind only yields the sniffed types below.
-  const mime = input.mime as 'image/jpeg' | 'image/png' | 'image/webp';
+  const mime = input.mime as LLMImageMediaType;
   const data = input.buf.toString('base64');
 
   const prompt = input.kind === 'boleto' ? BOLETO_PROMPT : RECEIPT_PROMPT;
   const t0 = Date.now();
-  let text = '';
+  let text: string;
   try {
-    const res = await anthropic.messages.create({
-      model: config.CLAUDE_MODEL_FAST,
+    // Issue #508: visão passa pela MESMA fronteira do chat. O bloco de imagem
+    // é provider-neutral — o adapter OpenRouter converte para `image_url` com
+    // data URI, então trocar de provider não exige mexer aqui. O modelo vem do
+    // tier `vision`, resolvido pelo backend.
+    const res = await executeLLM({
+      workload: 'vision',
+      system: '',
       max_tokens: 1024,
       messages: [
         {
@@ -66,8 +69,9 @@ export async function parseImage(input: {
         },
       ],
     });
-    for (const b of res.content) if (b.type === 'text') text += b.text;
+    text = res.content ?? '';
   } catch (err) {
+    // A mensagem já vem redigida pelo gateway (sem chave, sem prompt).
     logger.warn({ err: (err as Error).message }, 'vision.failed');
     return null;
   }

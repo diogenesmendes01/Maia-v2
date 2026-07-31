@@ -188,6 +188,9 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       },
       () =>
         callLLM({
+          // Issue #508: workload declarado → o backend decide tier, política
+          // de retry e se fallback é permitido (src/lib/llm/workloads.ts).
+          workload: 'reasoner',
           system,
           messages: conversation,
           tools,

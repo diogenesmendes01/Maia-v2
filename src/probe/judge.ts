@@ -33,6 +33,7 @@ export async function judgeReply(input: {
   }
   try {
     const res = await callLLM({
+      workload: 'probe',
       system: JUDGE_SYSTEM,
       messages: [
         {

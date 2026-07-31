@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 164 | 18 |
+| `runtime` | 166 | 18 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
@@ -103,6 +103,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `CLAUDE_MODEL_FAST` | string | `claude-haiku-4-5-20251001` | não | `runtime`, `maintenance` | não | Modelo rápido na API Anthropic direta. |
 | `CLAUDE_MAX_RETRIES` | number | `3` | não | `runtime` | sim | Retries em chamada de LLM. |
 | `CLAUDE_TIMEOUT_MS` | number | `30000` | não | `runtime` | sim | Timeout (ms) de chamada de LLM. |
+| `LLM_TURN_DEADLINE_MS` | number | `120000` | não | `runtime` | sim | Orçamento wall-clock TOTAL (ms) de uma chamada de LLM quando o caller não declara um deadline: cobre todas as tentativas, backoff, fallback e parsing. Instante absoluto, nunca reiniciado a cada retry (issue #508). O caller pode passar um deadline mais curto; nunca um mais longo na prática, já que o gateway usa o menor tempo restante. |
+| `LLM_DAILY_BUDGET_USD` | number | `0` | não | `runtime` | sim | Teto de gasto diário de LLM por tenant+agent, em USD. Imposto no LLM Gateway ANTES de qualquer requisição ao provider (issue #508); estouro rejeita a chamada com erro não retentável. 0 desliga a quota. |
 | `DECISION_ENGINE_BUDGET_MS` | number | `2500` | não | `runtime` | sim | Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification. |
 
 ### Transcrição de áudio (Whisper)

@@ -467,6 +467,36 @@
         "30000"
       ]
     },
+    "LLM_TURN_DEADLINE_MS": {
+      "type": "string",
+      "description": "Orçamento wall-clock TOTAL (ms) de uma chamada de LLM quando o caller não declara um deadline: cobre todas as tentativas, backoff, fallback e parsing. Instante absoluto, nunca reiniciado a cada retry (issue #508). O caller pode passar um deadline mais curto; nunca um mais longo na prática, já que o gateway usa o menor tempo restante.",
+      "x-maia-type": "number",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "120000",
+      "examples": [
+        "120000"
+      ]
+    },
+    "LLM_DAILY_BUDGET_USD": {
+      "type": "string",
+      "description": "Teto de gasto diário de LLM por tenant+agent, em USD. Imposto no LLM Gateway ANTES de qualquer requisição ao provider (issue #508); estouro rejeita a chamada com erro não retentável. 0 desliga a quota.",
+      "x-maia-type": "number",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "0",
+      "examples": [
+        "0"
+      ]
+    },
     "DECISION_ENGINE_BUDGET_MS": {
       "type": "string",
       "description": "Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification.",

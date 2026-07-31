@@ -102,6 +102,24 @@ export function registerShutdownSequence(): void {
     },
   });
 
+  // 5b. LLM settings-invalidation subscriber (issue #508). Same shape and same
+  //     reason as the step above: it owns its OWN ioredis connection (ioredis
+  //     forbids other commands on a subscribed client), so `pools` never closes
+  //     it, and a socket left open keeps the event loop alive after a clean
+  //     drain — the exact failure that made every #512 deploy report a forced
+  //     shutdown. Closed here because every caller of the LLM gateway (BullMQ
+  //     turns, cron prompt builders, the synthetic probe, background tasks) is
+  //     already drained, so nothing will need to re-read model settings.
+  lifecycle.registerShutdownStep({
+    name: 'llm_settings_subscriber',
+    run: async () => {
+      const { stopLLMSettingsInvalidationSubscriber } = await import(
+        '@/lib/llm/cache-invalidation.js'
+      );
+      await stopLLMSettingsInvalidationSubscriber();
+    },
+  });
+
   // 6. additional WhatsApp lines, then the primary socket. Every producer of
   //    outbound traffic (jobs, crons, background tasks) is already quiet.
   //    Lines first so a per-line reconnect timer can never resurrect a socket

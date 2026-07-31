@@ -29,6 +29,7 @@ export async function reflect(
     },
     async () => {
       const res = await callLLM({
+        workload: 'reflection',
         system: systemPrompt,
         messages: [{ role: 'user', content: userPrompt }],
         max_tokens: 500,

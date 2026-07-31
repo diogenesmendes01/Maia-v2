@@ -288,6 +288,7 @@ export async function toolMediatedMode(
       throw new Error('aborted');
     }
     const res = await callLLM({
+      workload: 'skill',
       system,
       messages,
       tools: tools.length > 0 ? tools : undefined,

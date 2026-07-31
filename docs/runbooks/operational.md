@@ -406,6 +406,80 @@ Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
 | `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
 | `maia_worker_tick_skipped_total{worker,reason}` | counter | crescimento (execução anterior não termina no intervalo) |
 
+### 8.4 LLM Gateway (issue #508)
+
+Todas as chamadas de chat/classificação/visão passam por `src/lib/llm/`. A
+partir da #508 o gateway emite em **todo** desfecho — sucesso, erro, timeout,
+rate limit e cancelamento (antes só o caminho de sucesso era contado, e chamadas
+diretas ao SDK não eram contadas de forma alguma):
+
+| Métrica | Tipo | Alerta se |
+|---|---|---|
+| `maia_llm_requests_total{tenant_id,agent_id,provider,model,tier,workload,status}` | counter | `status!="ok"` subindo |
+| `maia_llm_request_duration_ms{provider,model,tier,workload,status}` | histogram | p95 fora do baseline do workload |
+| `maia_llm_attempts_total{provider,model,workload,outcome}` | counter | razão attempts/requests > ~1.2 = retry storm |
+| `maia_llm_fallback_total{from_model,to_model,workload,reason}` | counter | qualquer taxa sustentada = degradação de qualidade silenciosa |
+| `maia_llm_timeouts_total{provider,model,workload}` | counter | rate alto |
+| `maia_llm_cancelled_total{provider,model,workload}` | counter | rate alto sem deploy = turnos sendo abortados |
+| `maia_llm_settings_cache_total{result}` | counter | `result="error"` sustentado = servindo modelo de env, não o do Admin |
+| `maia_llm_scope_missing_total{workload}` | counter | > 0 = chamada sem tenant/agent no ALS (custo não atribuível) |
+| `maia_llm_cost_ledger_failures_total` | counter | > 0 = custo sendo perdido |
+| `maia_llm_budget_exhausted_total{tenant_id,agent_id,workload}` | counter | quota diária estourada |
+| `maia_llm_budget_check_failures_total{workload}` | counter | > 0 = Redis fora, quota degradou ABERTO (não está protegendo) |
+| `maia_llm_budget_settle_failures_total` | counter | > 0 = reserva não liquidada; contador fica conservador até o TTL |
+
+Salvo `maia_llm_scope_missing_total` e os counters de falha, todas as métricas
+acima carregam `tenant_id` + `agent_id` — inclusive duração, timeout,
+cancelamento, fallback, tokens e attempts. Antes só `requests_total` levava o
+escopo, e um tenant sozinho estourando latência ficava diluído na média de
+todos.
+
+**Como a quota funciona.** Não é uma checagem antes da chamada: é uma RESERVA
+atômica (`INCRBYFLOAT` num contador diário por `tenant+agent` no Redis) feita
+antes de qualquer I/O de provider, liquidada com o custo real depois da
+resposta. Checar-e-seguir deixava N chamadas concorrentes lerem o mesmo valor e
+passarem todas — falhava justamente no retry storm. O contador é semeado a
+partir do ledger na primeira escrita do dia (restart não zera a quota) e expira
+em 36h; a verdade contábil continua no Postgres.
+
+**Erros que o gateway recusa de primeira** (terminais, sem retry e sem
+fallback): `authentication`, `permission`, `invalid_request`,
+`budget_exhausted`, `response_invalid` (200 sem conteúdo utilizável — antes
+virava `status="ok"` com resposta vazia) e `missing_tenant_context` (chamada
+sem `tenant_id`/`agent_id` no ALS; trabalho global deve rodar sob
+`runWithSystemContext()`).
+
+**Mensagens de erro não carregam corpo do provider.** Só `kind`, `status` e
+`request_id`. Um `400` costuma ecoar o input, e o input é conversa de cliente —
+leve o `request_id` para o suporte do provider.
+
+`trace_id`, `pessoa_id`, conversa e mensagem **não** são labels (cardinalidade);
+aparecem só no log estruturado `llm_gateway.call`.
+
+**Trocar de modelo durante um incidente:** `/dashboard/llm-settings`. A escrita
+publica no canal `maia:llm:settings:invalidate` e todas as réplicas soltam o
+cache na hora; se o Redis estiver fora, cada réplica converge sozinha pelo TTL
+curto do cache (segundos). Confirme pelo log `llm_gateway.settings_cache_invalidated`.
+
+**Fixar provider:** `LLM_PROVIDER` (`anthropic` | `openrouter`) + a chave
+correspondente. A partir da #508 o provider é resolvido por chamada, não no
+carregamento do módulo, e módulos de cognição não exigem mais
+`ANTHROPIC_API_KEY` quando o provider é OpenRouter.
+
+**Cortar gasto:** `LLM_DAILY_BUDGET_USD` (por tenant+agent, USD/dia). `0`
+desliga. Estouro rejeita a chamada ANTES de qualquer requisição ao provider,
+com erro não retentável. Para zerar a quota de um tenant no meio do dia, apague
+a chave `maia:llm:budget:<AAAA-MM-DD>:["<tenant>","<agent>"]` no Redis — ela é
+recriada a partir do ledger na chamada seguinte.
+
+**Limitar a duração de uma chamada:** `LLM_TURN_DEADLINE_MS` (default 120000) é
+o orçamento wall-clock TOTAL de uma chamada quando o caller não declara um
+deadline — cobre todas as tentativas, backoff, fallback e parsing, e não
+reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
+excede o que resta do deadline.
+
+> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+
 ---
 
 ## 9. Restart limpo (zero data loss)
@@ -421,6 +495,7 @@ sudo systemctl stop maia          # SIGTERM → inicia o drain
 #   lifecycle.shutdown_step_done    step=bullmq
 #   lifecycle.shutdown_step_done    step=background_tasks
 #   lifecycle.shutdown_step_done    step=turn_context_subscriber
+#   lifecycle.shutdown_step_done    step=llm_settings_subscriber
 #   lifecycle.shutdown_step_done    step=line_sessions
 #   lifecycle.shutdown_step_done    step=baileys
 #   lifecycle.shutdown_step_done    step=http
@@ -451,6 +526,11 @@ sudo systemctl start maia
    tem conexão ioredis PRÓPRIA (o ioredis proíbe outros comandos num cliente
    inscrito), então o `pools` do passo 9 não a cobre; deixá-la aberta segurava
    o event loop e disparava o backstop de saída a cada deploy limpo;
+5b. fecha o subscriber de invalidação das settings de modelo do LLM Gateway
+   (#508) — mesma forma, mesma razão e mesmo risco do passo 5: ioredis própria
+   que o `pools` não alcança. Roda aqui porque todo caller do gateway (turnos
+   BullMQ, prompt builders de cron, sonda sintética, tarefas de fundo) já
+   drenou, então ninguém mais vai reler modelo;
 6. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
    timer de reconexão pendente);
 7. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);

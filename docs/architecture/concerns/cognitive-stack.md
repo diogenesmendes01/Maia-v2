@@ -42,6 +42,33 @@ The cognitive graph also bounds latency. A user message must produce a response 
 | `src/cognition/role-selector/oscillation-tracker.ts` | Anti-oscillation guard for role switches |
 | `src/cognition/behavioral-hint-deriver.ts` | Derives behavior hints from soul layer + memories |
 
+### Como os módulos cognitivos falam com o LLM (issue #508)
+
+Nenhum módulo desta camada instancia SDK de provider. Todos entram pela
+fronteira única — `executeLLM()` de `@/lib/llm/index.js`, ou o facade
+`callLLM()` — declarando um **workload**, nunca um modelo:
+
+| Módulo | Workload | Tier |
+|---|---|---|
+| `src/agent/react-loop.ts` | `reasoner` | main |
+| `src/agent/pending-gate.ts` | `pending_gate` | main |
+| `src/runtime/decision/prod-env.ts` (HaikuClientAdapter) | `intent_classifier` | main ¹ |
+| `src/shared/risk/llm-gate.ts` | `risk_classifier` | fast |
+| `src/cognition/role-selector/llm-suggester.ts` | `role_selector` | fast |
+| `src/cognition/step-evaluator-llm-judge.ts` | `step_evaluator` | fast |
+| `src/cognition/calendar-pattern-detector.ts` | `calendar_detector` | fast |
+| `src/cognition/capability-proposer.ts` | `capability_proposer` | main |
+| `src/cognition/drift/*` | `drift_detector` | main |
+| `src/cognition/{classifier,memory-classifier,procedure-*,reflector}.ts` | ver `workloads.ts` | main |
+| `src/lib/vision.ts` | `vision` | vision |
+
+¹ O adapter se chama "Haiku" mas roda no tier **main** desde antes da #508. A
+migração preservou o modelo efetivo de propósito — retierizar um classificador
+muda critério funcional e é follow-up, não parte desta refatoração.
+
+O tier de cada workload, o número de tentativas e a permissão de fallback vivem
+em `src/lib/llm/workloads.ts`. Ver [`modules/lib.md`](../modules/lib.md#llm-gateway-srclibllm--issue-508).
+
 ### Cognitive graph (`src/cognitive-graph/`)
 
 | File | Role |

@@ -17,22 +17,27 @@ import { join, relative, resolve } from 'node:path';
 const REPO_ROOT = resolve(__dirname, '../../..');
 const SRC = join(REPO_ROOT, 'src');
 
-/** Files/globs allowed to read `process.env`. Mirrors `eslint.config.js`. */
+/**
+ * Files/globs allowed to read `process.env`. Mirrors `eslint.config.js`.
+ *
+ * Issue #508 removeu cinco entradas: `calendar-pattern-detector`,
+ * `capability-proposer`, `drift/**`, `role-selector/llm-suggester` e
+ * `shared/risk/llm-gate` liam `process.env.ANTHROPIC_API_KEY` para instanciar
+ * o SDK direto. Com a migração para o LLM Gateway a leitura deixou de existir
+ * — a chave entra pelo `config` tipado, num único ponto
+ * (`src/lib/llm/providers/**`). Foi o teste de exemption obsoleta abaixo que
+ * cobrou a remoção.
+ */
 const ALLOWLIST = [
   'src/config/env.ts',
   'src/config/load.ts',
   'src/admin-ui/**',
   'src/agent/prompt-builder.ts',
-  'src/cognition/calendar-pattern-detector.ts',
-  'src/cognition/capability-proposer.ts',
-  'src/cognition/drift/**',
-  'src/cognition/role-selector/llm-suggester.ts',
   'src/db/tenant-context.ts',
   'src/lib/mcp-client.ts',
   'src/runtime/context-packet/test-fixtures.ts',
   'src/runtime/feature-flags/context-packet-flag.ts',
   'src/setup/index.ts',
-  'src/shared/risk/llm-gate.ts',
   'src/workers/procedure-execution-reaper.ts',
 ] as const;
 

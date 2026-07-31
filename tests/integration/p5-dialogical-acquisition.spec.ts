@@ -293,8 +293,15 @@ function happyJson(): string {
 
 async function flushMicrotasks(): Promise<void> {
   // Allow fire-and-forget proposer promise + .then to run before assertions.
-  await Promise.resolve();
-  await Promise.resolve();
+  //
+  // Issue #508: contar ticks de microtask acoplava este helper à PROFUNDIDADE
+  // da cadeia assíncrona do proposer. Ao migrar para o LLM Gateway, o caminho
+  // até o SDK ganhou hops (resolução de settings + provider) e quatro ticks
+  // deixaram de bastar — o teste falhava por timing, não por comportamento.
+  // Ceder o controle até um macrotask drena a fila de microtasks INTEIRA,
+  // qualquer que seja a profundidade, desde que ninguém espere timer/IO real
+  // (os repos e o SDK estão mockados).
+  await new Promise((resolve) => setTimeout(resolve, 0));
   await Promise.resolve();
   await Promise.resolve();
 }
