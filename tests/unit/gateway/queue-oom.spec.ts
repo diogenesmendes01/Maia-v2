@@ -151,8 +151,13 @@ describe('enqueueAgent — OOM fail-closed (#309 / PR #324 B1)', () => {
     await enqueueAgent({ mensagem_id: 'ok' });
     expect(queueAdd).toHaveBeenCalledWith(
       'process-message',
-      { mensagem_id: 'ok' },
+      // Issue #514 §1: the payload now also carries the turn's correlation
+      // (root trace id + arm timestamp). `mensagem_id` remains the contract.
+      expect.objectContaining({ mensagem_id: 'ok' }),
       expect.objectContaining({ attempts: 3, backoff: { type: 'exponential', delay: 2000 } }),
     );
+    const payload = queueAdd.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(typeof payload.trace_id).toBe('string');
+    expect(typeof payload.enqueued_at_ms).toBe('number');
   });
 });

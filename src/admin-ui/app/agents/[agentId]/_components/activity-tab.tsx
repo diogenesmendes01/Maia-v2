@@ -79,15 +79,17 @@ function HeaderLink({ href, label }: { href: string; label: string }) {
 /* ------------------------------------------------------------------ */
 
 function TracesCard({ tenantId, agentId }: ScopeProps) {
+  // Issue #514 §7: o filtro por agente agora é SERVER-SIDE (índice
+  // `runtime_trace_env_explorer_agent_idx`, migration 100). Antes buscávamos 50
+  // traces do tenant e filtrávamos no cliente — o que, num tenant com vários
+  // agentes, mostrava "nenhum trace" para um agente que TINHA traces, só
+  // porque os 50 mais recentes eram de outro.
   const query = trpc.traces.listTraces.useQuery(
-    { tenantId, limit: 50 },
+    { tenantId, agentId, limit: MAX_ROWS },
     { enabled: tenantId !== '' },
   );
 
-  const all = query.data?.items ?? [];
-  // Os itens carregam agent_id — filtramos para este agente no cliente.
-  const mine = all.filter((t) => t.agent_id === agentId);
-  const rows = mine.slice(0, MAX_ROWS);
+  const rows = query.data?.items ?? [];
 
   return (
     <Card>
@@ -107,16 +109,8 @@ function TracesCard({ tenantId, agentId }: ScopeProps) {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<IconSearch size={32} />}
-            title={
-              all.length > 0
-                ? 'Nenhum trace deste agente'
-                : 'Nenhum trace registrado'
-            }
-            description={
-              all.length > 0
-                ? 'Há traces no tenant, mas nenhum pertence a este agente.'
-                : `Os traces dependem do P10b (${PARTIAL_INSTRUMENTATION}).`
-            }
+            title="Nenhum trace deste agente"
+            description={`Os traces dependem do P10b (${PARTIAL_INSTRUMENTATION}).`}
           />
         ) : (
           <ul className="divide-y divide-zinc-100">

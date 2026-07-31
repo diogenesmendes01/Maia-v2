@@ -1603,6 +1603,32 @@ export const ENV_CONTRACT = {
   },
 
   // ---- runtime trace ----------------------------------------------------
+  FEATURE_RUNTIME_TRACE_V1: {
+    name: 'FEATURE_RUNTIME_TRACE_V1',
+    description:
+      'Liga o runtime trace durável no hot path (#514). Default OFF: com a flag desligada o caminho do turno é idêntico ao anterior e o HMAC master secret não é exigido. Ligar em canário — ver docs/runbooks/observability-slo.md.',
+    group: 'runtime-trace',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_STRICT_METRIC_LABELS: {
+    name: 'MAIA_STRICT_METRIC_LABELS',
+    description:
+      'Promove violação da política de labels de métrica (PII / alta cardinalidade) a exceção em vez de descarte silencioso (#514). Para suíte de testes e diagnóstico; em produção o sanitizer já descarta sem lançar.',
+    group: 'runtime-trace',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   RUNTIME_TRACE_HMAC_KEY_VERSION: {
     name: 'RUNTIME_TRACE_HMAC_KEY_VERSION',
     description: 'Versão da chave HMAC em uso (rotação a cada 90d).',

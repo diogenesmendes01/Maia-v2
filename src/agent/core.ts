@@ -80,6 +80,8 @@ import {
   runDecisionEngineForTurn,
   DecisionEngineFailClosedError,
 } from '@/runtime/decision/integration.js';
+// Issue #514 — a failed MANDATORY trace envelope is a turn-blocking condition.
+import { MandatoryTraceEnvelopeError } from '@/observability/turn-trace.js';
 import {
   buildBaseContextPacketFromTurn,
   applyToolReductions,
@@ -1206,9 +1208,74 @@ async function runAgentForMensagemInner(
       }
     }
   } catch (err) {
+    // Issue #514 review round 2 [P1]: a MANDATORY runtime-trace envelope that
+    // could not be written is NOT the same class of failure as an engine
+    // crash, and must NOT be handled the same way.
+    //
+    // Round 1 stopped the turn reaching ReAct — that closed the side-effect
+    // hole. But it then took the engine's path: reply to the user, mark the
+    // inbound processed, return. The job COMPLETED, so the turn was silently
+    // lost: no retry, no dead-letter, and a `processada_em` stamp that stops
+    // `runMessageRecovery` from ever picking it up again. A failure to write
+    // authoritative evidence has to PROPAGATE.
+    //
+    // So: audit it (the audit log is the only durable record left — the trace
+    // write is precisely what failed), leave the inbound UNPROCESSED, and
+    // rethrow. BullMQ then retries per the job policy and dead-letters on
+    // exhaustion, which is where the operator alert already fires.
+    //
+    // No user-facing reply here on purpose: a retry may well succeed, and
+    // "Sistema indisponível" followed by a real answer is worse than a
+    // slightly slower answer. If every attempt fails the DLQ alert is the
+    // signal, and the inbound stays recoverable.
+    //
+    // #503 is merged, so the turn is ALSO marked through the durable state
+    // machine below (`failTurnRetryable`) — the job failing and the turn row
+    // agreeing are two halves of the same contract.
+    if (err instanceof MandatoryTraceEnvelopeError) {
+      logger.error(
+        {
+          err: err.cause_error,
+          tenant_id: err.tenant_id,
+          side_effect_level: err.side_effect_level,
+          mensagem_id: inbound.id,
+        },
+        'agent.runtime_trace.mandatory_envelope_failed_failing_job',
+      );
+      await audit({
+        acao: 'runtime_trace_envelope_blocked_turn',
+        alvo_id: inbound.id,
+        metadata: {
+          side_effect_level: err.side_effect_level,
+          conversa_id: c.id,
+          // Enumerated/structural only — no message content.
+          reason: 'mandatory_envelope_write_failed',
+        },
+      }).catch((e) =>
+        logger.error(
+          { err: (e as Error).message },
+          'agent.runtime_trace.blocked_turn_audit_failed',
+        ),
+      );
+      // #503 (now merged) — mark the turn through the durable state machine
+      // instead of relying on BullMQ's job state alone. `failTurnRetryable`
+      // owns the retry-vs-dead-letter decision (`MAX_TURN_ATTEMPTS`), so this
+      // does NOT introduce a parallel retry mechanism: the envelope failure is
+      // just another pre-side-effect failure, which is exactly the case that
+      // facade exists for.
+      await failTurnRetryable(turn, {
+        code: 'runtime_trace_envelope_failed',
+        error: err.cause_error,
+        mensagem_id: inbound.id,
+      });
+      // Deliberately NOT marking processed: the row must stay pending so the
+      // recovery sweep can re-enqueue it if the job itself is lost.
+      throw err;
+    }
+
     if (err instanceof DecisionEngineFailClosedError) {
-      // fail-closed: the always-on engine errored → block the turn, reply to
-      // user, skip LLM (there is no legacy fallback path anymore)
+      // fail-closed: block the turn, reply to user, skip LLM (there is no
+      // legacy fallback path anymore)
       const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
       // #503 — o resultado do envio DECIDE o outcome. Antes o `.catch` engolia
       // a falha e o turno era concluído como `fallback_delivered` mesmo quando

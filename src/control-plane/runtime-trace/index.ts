@@ -80,6 +80,10 @@ export interface TraceInput {
   agent_id: string;
   conversa_id?: string | null;
   turno_id?: string | null;
+  /** Issue #514: root trace id of the turn (defaults to trace_id = attempt 1). */
+  root_trace_id?: string | null;
+  /** Issue #514: 1-based attempt ordinal. */
+  attempt?: number;
   packet: ExecutionContextPacketStub;
   decision: DecisionPacketStub;
   redaction_class?: RedactionClass;
@@ -98,6 +102,8 @@ export async function trace(input: TraceInput): Promise<TraceEnvelopeWritten> {
     agent_id: input.agent_id,
     conversa_id: input.conversa_id,
     turno_id: input.turno_id,
+    root_trace_id: input.root_trace_id,
+    attempt: input.attempt,
     decision: input.decision,
     redaction_class: input.redaction_class,
   };

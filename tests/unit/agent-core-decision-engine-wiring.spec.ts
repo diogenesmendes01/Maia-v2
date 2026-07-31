@@ -29,6 +29,7 @@ import {
   applyToolReductions,
   buildBaseContextPacketFromTurn,
 } from '@/runtime/decision/build-base-context.js';
+import { deriveTraceId } from '@/observability/correlation.js';
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '@/runtime/context-packet/types.js';
 import type { DecisionEngineResult } from '@/runtime/decision/decision-engine.js';
@@ -218,7 +219,17 @@ describe('P11 — agent/core.ts × Decision Engine wiring (always-on)', () => {
       active_procedure_execution_id: null,
     });
 
-    expect(packet.trace_id).toBe('msg_001');
+    // Issue #514 §1 — the trace id is DERIVED from the inbound row id rather
+    // than copied. In production `mensagens.id` is a UUID and the derivation
+    // is the identity function, so the hot path is unchanged; here the fixture
+    // uses a synthetic non-UUID id, so we get the deterministic v5-shaped
+    // derivation instead. What matters is that it is stable (recovery lands on
+    // the same root trace) and UUID-shaped (`runtime_trace_envelopes.trace_id`
+    // is a UUID column).
+    expect(packet.trace_id).toBe(deriveTraceId('msg_001'));
+    expect(packet.trace_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
     expect(packet.tenant_id).toBe('tn_test');
     expect(packet.agent_id).toBe('ag_test');
     expect(packet.conversation_id).toBe('conv_001');

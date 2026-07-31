@@ -7,6 +7,7 @@ import { trpc } from '../../../trpc/client.js';
 import { PageHeader } from '../../../components/ui/page-header.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Button } from '../../../components/ui/button.js';
+import { Badge } from '../../../components/ui/badge.js';
 import { Modal } from '../../../components/ui/modal.js';
 import { Field, Input, Select, Textarea } from '../../../components/ui/field.js';
 import {
@@ -90,6 +91,143 @@ export default function TraceDetailPage({
       />
 
       <div className="space-y-4">
+        {/* Issue #514 §7 — envelope summary: integrity + body lifecycle.
+            A "pending" or "orphaned" body must be legible as such, otherwise
+            an incomplete trace reads as a trace where nothing happened. */}
+        <Card>
+          <CardHeader
+            title="Envelope"
+            description="Registro durável e assinado da decisão deste turno."
+          />
+          <CardBody>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+              <Meta label="Agente" value={trace.agent_id} />
+              <Meta label="Decisão" value={trace.decision} />
+              <Meta label="Nível de efeito" value={trace.side_effect_level} />
+              <Meta label="Classe de redação" value={trace.redaction_class} />
+              <Meta
+                label="Início"
+                value={new Date(trace.started_at).toLocaleString('pt-BR')}
+              />
+              <Meta
+                label="Conversa"
+                value={trace.conversa_id ? trace.conversa_id.slice(0, 8) : '—'}
+              />
+              <Meta
+                label="Integridade"
+                value={
+                  trace.envelope_integrity === 'verified'
+                    ? `HMAC v${trace.hmac_key_version} verificado`
+                    : trace.envelope_integrity === 'invalid'
+                      ? 'ADULTERADO — HMAC não confere'
+                      : `Não verificável (chave v${trace.hmac_key_version} ausente)`
+                }
+              />
+              <Meta
+                label="Integridade do corpo"
+                value={
+                  trace.body_integrity === 'verified'
+                    ? 'HMAC verificado'
+                    : trace.body_integrity === 'invalid'
+                      ? 'ADULTERADO — HMAC não confere'
+                      : trace.body_integrity === 'unknown'
+                        ? 'Não verificável (chave ausente)'
+                        : 'Ainda não persistido'
+                }
+              />
+              <Meta
+                label="Corpo"
+                value={
+                  trace.body_status === 'persisted'
+                    ? 'persistido'
+                    : trace.body_status === 'orphaned'
+                      ? 'ÓRFÃO (evidência perdida)'
+                      : 'pendente'
+                }
+              />
+              <Meta
+                label="Persistido em"
+                value={
+                  trace.body_persisted_at
+                    ? new Date(trace.body_persisted_at).toLocaleString('pt-BR')
+                    : '—'
+                }
+              />
+            </dl>
+            {trace.body_integrity === 'invalid' && (
+              <Alert tone="danger">
+                O corpo persistido NÃO confere com sua assinatura HMAC. O
+                conteúdo abaixo não é confiável — trate como incidente de
+                integridade.
+              </Alert>
+            )}
+            {trace.envelope_integrity === 'invalid' && (
+              <Alert tone="danger">
+                A assinatura HMAC deste envelope NÃO confere com o conteúdo da
+                linha. Trate como incidente de integridade — não tome decisão
+                com base neste trace. Ver docs/runbooks/observability-slo.md §4.1.
+              </Alert>
+            )}
+            {trace.envelope_integrity === 'unknown' && (
+              <Alert tone="warning">
+                Não foi possível verificar a assinatura: a chave HMAC v
+                {trace.hmac_key_version} não está configurada neste processo.
+                Ausência de prova não é prova de adulteração.
+              </Alert>
+            )}
+            {trace.body_status === 'orphaned' && (
+              <Alert tone="danger">
+                O corpo deste trace nunca foi persistido e passou da janela de
+                recuperação. Ver docs/runbooks/p10b-runtime-trace.md.
+              </Alert>
+            )}
+            {trace.body_encrypted && (
+              <Alert tone="warning">
+                Corpo cifrado (classe debug). O conteúdo só é acessível pelo
+                fluxo governado de snapshot.
+              </Alert>
+            )}
+          </CardBody>
+        </Card>
+
+        {/* Issue #514 review round 2 — attempt grouping. A retry gets its own
+            trace id (so it cannot collide on the PK); without this card the
+            operator would see N unrelated traces for one turn. */}
+        {trace.attempt_count > 1 && (
+          <Card>
+            <CardHeader
+              title={`Tentativas deste turno (${trace.attempt_count})`}
+              description="Retry e recovery reusam o mesmo turno; cada tentativa tem seu próprio envelope."
+            />
+            <CardBody>
+              <ul className="divide-y divide-zinc-100">
+                {trace.attempts.map((a) => (
+                  <li key={a.trace_id} className="flex items-center gap-3 py-2 text-sm">
+                    <Badge tone={a.is_current ? 'brand' : 'neutral'}>#{a.attempt}</Badge>
+                    {a.is_current ? (
+                      <span className="font-mono text-xs text-zinc-800">
+                        {a.trace_id.slice(0, 8)} (atual)
+                      </span>
+                    ) : (
+                      <Link
+                        href={`/traces/${a.trace_id}`}
+                        className="font-mono text-xs text-brand-600 hover:underline"
+                      >
+                        {a.trace_id.slice(0, 8)}
+                      </Link>
+                    )}
+                    <span className="text-zinc-600">{a.decision}</span>
+                    <span className="text-zinc-500">{a.side_effect_level}</span>
+                    <span className="ml-auto text-xs text-zinc-500">
+                      {new Date(a.started_at).toLocaleString('pt-BR')}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </CardBody>
+          </Card>
+        )}
+
         <Card>
           <CardHeader
             title="Decisões PEP"
@@ -104,10 +242,11 @@ export default function TraceDetailPage({
               <ul className="space-y-2 text-sm">
                 {trace.pep_decisions.map((d) => (
                   <li key={d.id} className="flex items-baseline gap-2">
+                    <Badge tone="neutral">{d.pep}</Badge>
                     <span className="font-mono text-xs text-zinc-700">
                       {d.decision}
                     </span>
-                    <span className="text-zinc-600">— {d.reason}</span>
+                    {d.reason && <span className="text-zinc-600">— {d.reason}</span>}
                   </li>
                 ))}
               </ul>
@@ -123,7 +262,10 @@ export default function TraceDetailPage({
           <CardBody>
             <pre className="scroll-thin overflow-x-auto rounded-lg bg-zinc-950 p-4 text-xs text-zinc-100">
               {JSON.stringify(
-                trace.redacted_packet ?? { note: 'Corpo ainda não populado' },
+                trace.redacted_packet ??
+                  (trace.body_available
+                    ? { note: 'Corpo cifrado — use o fluxo de snapshot' }
+                    : { note: 'Corpo ainda não persistido', body_status: trace.body_status }),
                 null,
                 2,
               )}
@@ -142,6 +284,16 @@ export default function TraceDetailPage({
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** Small definition-list cell used by the envelope summary. */
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="text-xs font-medium uppercase tracking-wide text-zinc-500">{label}</dt>
+      <dd className="mt-0.5 font-mono text-xs text-zinc-800">{value}</dd>
     </div>
   );
 }

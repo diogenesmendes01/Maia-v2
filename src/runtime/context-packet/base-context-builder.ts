@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import type { BaseContextPacket } from './types.js';
 import { memoryResolver } from '@/user-layer/resolvers/memory-resolver.js';
 import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
+import { currentTraceId } from '@/observability/correlation.js';
 
 export interface BaseContextBuilderInput {
   raw_input: Record<string, unknown>;
@@ -128,7 +129,13 @@ export class BaseContextBuilder {
       .catch(() => 0);
 
     return {
-      trace_id: randomUUID(),
+      // Issue #514 §1 — "Não gerar um novo root trace dentro de context
+      // builders." When a correlation context is already open (ingress → queue
+      // → worker), reuse its root id so the packet, the decision, the runtime
+      // trace and the logs all agree. `randomUUID()` remains the fallback for
+      // genuinely standalone callers (tests, tools, one-off builds) that never
+      // opened a correlation scope.
+      trace_id: currentTraceId() ?? randomUUID(),
       tenant_id,
       agent_id,
       session_id: input.session_id ?? input.channel_id,

@@ -1169,7 +1169,14 @@ async function handleIncoming(
       // inside `scheduleDebouncedAgent` from the ALS tenant context that
       // `messages.upsert` installs above — so a shared phone across two
       // tenants gets two INDEPENDENT debouncers (issue #248).
-      const result = await scheduleDebouncedAgent({ phone: tel, mensagem_id: stored.id });
+      // Issue #514 [P2]: pass the PERSISTED arrival timestamp here too, not
+      // just on the direct path — otherwise debounced textual turns (the bulk
+      // of the traffic) never enter the E2E latency histogram.
+      const result = await scheduleDebouncedAgent({
+        phone: tel,
+        mensagem_id: stored.id,
+        received_at_ms: stored.created_at?.getTime(),
+      });
       // #503: só DEPOIS do wake-up confirmado o turno sai de `received`. Um
       // crash antes daqui deixa `received`, que é exatamente o que o recovery
       // procura.
@@ -1227,7 +1234,13 @@ async function handleIncoming(
   // outer `handleIncoming` handler (real bug — surface it), again leaving the
   // row pending (we never reach the "processed" write).
   try {
-    await enqueueAgent({ mensagem_id: stored.id });
+    // Issue #514 §5 — carry the PERSISTED inbound timestamp so the E2E latency
+    // SLI is measured from when the message actually arrived, not from when a
+    // worker happened to pick it up.
+    await enqueueAgent({
+      mensagem_id: stored.id,
+      received_at_ms: stored.created_at?.getTime(),
+    });
   } catch (err) {
     if (err instanceof QueueRedisUnavailableError) {
       logger.warn(

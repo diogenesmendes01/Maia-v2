@@ -211,7 +211,10 @@ async function runMessageRecoveryInner(): Promise<void> {
   let requeued = 0;
   for (const m of stuck) {
     try {
-      await enqueueAgent({ mensagem_id: m.id });
+      // Issue #514 §5 — recovery keeps the ORIGINAL arrival timestamp so a
+      // recovered turn's E2E latency reflects the real user-visible delay
+      // (that is the point of the SLI) instead of restarting the clock.
+      await enqueueAgent({ mensagem_id: m.id, received_at_ms: m.created_at?.getTime() });
       requeued++;
     } catch (err) {
       // FAIL-CLOSED (#309 follow-up, PR #324 B1): the row is left UNPROCESSED

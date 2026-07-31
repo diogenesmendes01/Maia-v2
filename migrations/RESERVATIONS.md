@@ -204,3 +204,5 @@ NEW shared prefixes — pick `max(existing)+1`.
 101 | 101_backup_runs_manifests.sql | issue 520: evidencia duravel de backup/restore (backup_runs lifecycle, backup_manifests assinado, restore_drills para RTO medido)
 102 | 102_data_lifecycle.sql | issue 520: ciclo de vida de dados (legal_holds, privacy_requests, data_tombstones anti-ressurreicao, retention_runs dry-runnable)
 103 | 103_channel_line_state.sql | estado operacional das linhas whatsapp + fila duravel de comandos admin->runtime, material de pareamento cifrado (issue 518)
+100 | 100_trace_explorer_indexes.sql | trace explorer: indices de keyset pagination e filtros (outcome, side effect) em runtime_trace_envelopes/bodies (issue 514)
+107 | 107_runtime_trace_attempt_grouping.sql | trace explorer: root_trace_id + attempt em runtime_trace_envelopes para agrupar tentativas do mesmo turno (issue 514, review rodada 2) — autorada como 101 e renumerada antes do merge: 101/102 sao da issue 520 (PR 533) e 104-106 estao reservados por outras branches em voo

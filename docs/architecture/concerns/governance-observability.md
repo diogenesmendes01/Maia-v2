@@ -60,13 +60,23 @@ Observability with tenant attribution is the operational corollary: a dashboard 
 | `src/cognition/drift/decision-engine.ts` | Decision over drift signals → alert / proposal / silent |
 | `src/cognition/gap-escalation/engine.ts` | 4-level escalation: silent → dashboard → mentionable → proposed |
 
-### Observability (`src/lib/`)
+### Observability (`src/lib/`, `src/observability/`)
 
 | File | Role |
 |---|---|
 | `src/lib/logger.ts` | Pino structured logger |
-| `src/lib/metrics.ts` | `incCounter()`, `observeHistogram()`, `setGauge()` — Prometheus-compatible registry |
+| `src/lib/metrics.ts` | `incCounter()`, `observeHistogram()`, `setGaugeProvider()` — Prometheus-compatible registry (the **transport**) |
 | `src/lib/alerts.ts` | Alert channels (email / Telegram) |
+| `src/observability/taxonomy.ts` | **Issue #514** — canonical span tree, metric names, label allow/deny lists, cardinality budgets |
+| `src/observability/labels.ts` | Label sanitizer — the fail-closed gate between instrumentation and the registry |
+| `src/observability/metrics.ts` | Sanitized emitters (`counter`/`histogram`/`gauge`) — the **policy layer** over `lib/metrics.ts` |
+| `src/observability/correlation.ts` | Correlation ALS — one `trace_id` per turn, propagated ingress → queue → worker → decision → trace → logs |
+| `src/observability/turn-trace.ts` | Adapter connecting the durable P10b `trace()` to the hot path |
+| `src/observability/queue-metrics.ts` | Queue depth + oldest-job-age gauges |
+| `src/observability/llm-metrics.ts` | LLM failure/retry/fallback counters |
+| `src/observability/redis-memory-collector.ts` | Redis memory pressure gauges (#297) |
+| `monitoring/alerts/slo.rules.yml` | Recording rules, 18 alerts, error-budget burn rate |
+| `docs/runbooks/observability-slo.md` | SLIs/SLOs, per-alert operator reaction, clock semantics |
 
 ### Admin UI (governance surface)
 
@@ -105,6 +115,44 @@ After PR #275, every `maia_*` counter has `tenant_id` and `agent_id` labels. Out
 - HMAC chains the envelope to the body so tampering is detectable
 - Redaction and optional encryption apply to the body, not the envelope
 
+### 4.4b Correlation: one `trace_id` per turn (issue #514)
+
+`src/observability/correlation.ts` owns a dedicated AsyncLocalStorage, separate
+from the tenant ALS on purpose: tenant context is **fail-closed** (missing ⇒
+throw, it is a security boundary), correlation is **fail-soft** (missing ⇒
+`null`, observability must never break a turn). Merging them would force one
+semantics onto the other.
+
+The id is **derived, not minted**: `deriveTraceId(mensagem_id)` returns a UUID
+seed verbatim and hashes anything else into a stable v5-shaped UUID. That is
+what makes "recovery preserves the root trace" free — the sweep re-enqueues the
+same row id and lands on the same trace, with no state carried across the
+crash. Each attempt gets its own `attempt` ordinal + `attempt_id`, so a retry
+is distinguishable without splitting the trace.
+
+Context builders must **not** mint a new root (`build-base-context.ts:83`,
+`base-context-builder.ts:132` both read the ambient id first).
+
+### 4.4c Metric labels are a closed allowlist (issue #514 §6)
+
+`src/observability/labels.ts` is a gate, not a convention:
+
+| Rule | Behaviour |
+|---|---|
+| key not on the allowlist | dropped |
+| key on the deny list, or containing `phone`/`jid`/`email`/`message`/`trace_id`/… | dropped — the deny list wins over the allowlist |
+| value shaped like a phone / JID / e-mail / URL / free text | `__sanitized__` |
+| value past the (metric, key) cardinality budget | `__overflow__` |
+
+`tenant_id` + `agent_id` are the sanctioned exception (§4.3 above), still
+cardinality-capped. High-cardinality correlation ids live in **logs and
+traces** (`correlationLogFields()`), never in labels. Nothing throws in
+production; `MAIA_STRICT_METRIC_LABELS=true` promotes a violation to a test
+failure. Both that flag and `FEATURE_RUNTIME_TRACE_V1` are declared in the
+configuration contract (`src/config/contract.ts`, issue #515) and read through
+the typed loader — never `process.env` — so both are validated at boot and
+`restartRequired`.
+
 ### 4.5 Drift detector — 7 types × 4 severities
 
 `src/cognition/drift/index.ts` invokes 7 typed detectors. Each detector returns a severity (1-4) for its category. The drift decision engine (`decision-engine.ts`) maps the matrix of severities to an action: silent, dashboard alert, mentionable, or owner-proposed correction.
@@ -122,6 +170,11 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | Pattern | Why it's wrong |
 |---|---|
 | Direct `INSERT INTO audit_logs` | Bypasses `audit()`'s context capture and counter emission. Use `audit()`. |
+| `incCounter()` directly for a NEW metric | Bypasses the label sanitizer. Use `src/observability/metrics.ts` and declare the name in `taxonomy.ts` first. |
+| `conversa_id` / `trace_id` / phone as a metric label | Unbounded cardinality + PII. Put it in the log line (`correlationLogFields()`) or the trace. |
+| Minting a fresh `trace_id` inside a context builder | Splits one turn into several traces. Read `currentTraceId()` first. |
+| Reading an absent metric as a healthy `0` | A gauge that cannot be read renders `NaN` on purpose. `MaiaQueueMetricsAbsent` exists for this. |
+| Relaxing the label sanitizer to fix a cardinality alert | Fix the call site. The sanitizer is the invariant, not the symptom. |
 | Audit-free side-effect ("just a small change") | Every side-effect audits. There is no small change. |
 | Metric without `tenant_id + agent_id` labels | Aggregates lose attribution. Every new counter goes through `incCounter()` with labels. |
 | Direct write to `soul_biases` | Soul is append-only and gated by `origin-gate.ts`. Cognition proposes; governance writes. |
@@ -143,6 +196,14 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/integration/p10b-runtime-trace.spec.ts` (if present) | Envelope/body trace integrity |
 | `tests/unit/control-plane/knowledge-state-machine/` | KSM lifecycle + transitions |
 | `tests/unit/cognition/drift/` | Drift detector contracts |
+| `tests/unit/observability/labels.spec.ts` | PII/cardinality label gate (issue #514) |
+| `tests/unit/observability/taxonomy.spec.ts` | Span tree shape + metric naming discipline |
+| `tests/unit/observability/correlation.spec.ts` | Deterministic trace derivation, ALS isolation, attempts |
+| `tests/unit/observability/turn-trace.spec.ts` | Envelope fail-loud semantics + body privacy |
+| `tests/unit/observability/slo-rules.spec.ts` | Alert rules ↔ emitted metrics drift guard |
+| `tests/unit/observability/runtime-trace-repo.spec.ts` | Trace Explorer tenant fail-closed + keyset cursor |
+| `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
+| `tests/integration/observability-hot-path-trace.spec.ts` | Hot-path trace through the real HMAC/redaction writers |
 
 ## 7. Known gaps
 
@@ -158,8 +219,19 @@ gh pr list --state open --search "audit OR governance OR trace"
 At last verification:
 
 - P3c (procedure governance ops) — partial: `procedure_metrics` materialized view, full test runner, full step-evaluator (`llm_judge` / `user_signal` / `human_confirmed`) still in iteration. See `README.md` § Estado atual.
-- Runtime-trace P10b — implemented; admin-ui trace exploration still maturing.
 - Capability dialogical-acquisition 4-level escalation — in production; loop closure post-acquisition still being tuned.
+
+Issue #514 (tracing E2E / metrics / SLOs) landed the foundation. Still open —
+do **not** assume coverage that does not exist:
+
+- **No OTLP exporter.** The span taxonomy is declared (`taxonomy.ts`) but no
+  operational spans are emitted or exported; only the durable compliance trace
+  is written.
+- **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
+  pending the canary rollout in `docs/runbooks/observability-slo.md`.
+- **Not yet instrumented**: tool dispatch, context load, DB pool saturation,
+  WhatsApp session/reconnect, scheduler lag, outbound send duration.
+- **No versioned dashboards** and no published overhead/cardinality benchmark.
 
 ## 7.5 Documented exception — staging de inbound não-roteado (`inbound_unrouted`)
 

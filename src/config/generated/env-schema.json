@@ -1928,6 +1928,36 @@
         "log_only"
       ]
     },
+    "FEATURE_RUNTIME_TRACE_V1": {
+      "type": "string",
+      "description": "Liga o runtime trace durável no hot path (#514). Default OFF: com a flag desligada o caminho do turno é idêntico ao anterior e o HMAC master secret não é exigido. Ligar em canário — ver docs/runbooks/observability-slo.md.",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
+    "MAIA_STRICT_METRIC_LABELS": {
+      "type": "string",
+      "description": "Promove violação da política de labels de métrica (PII / alta cardinalidade) a exceção em vez de descarte silencioso (#514). Para suíte de testes e diagnóstico; em produção o sanitizer já descarta sem lançar.",
+      "x-maia-type": "string",
+      "x-maia-group": "runtime-trace",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "RUNTIME_TRACE_HMAC_KEY_VERSION": {
       "type": "string",
       "description": "Versão da chave HMAC em uso (rotação a cada 90d).",

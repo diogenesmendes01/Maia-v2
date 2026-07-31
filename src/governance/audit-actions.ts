@@ -140,6 +140,14 @@ export const AUDIT_ACTIONS = [
   'turn_replayed',
   'turn_completed_without_reply',
   'turn_state_inconsistency_detected',
+  // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
+  // turn was aborted before any side effect and the job was failed for retry /
+  // dead-letter. The audit row is the durable record that the platform refused
+  // to act — the evidence write failed, so the trace itself cannot carry it.
+  'runtime_trace_envelope_blocked_turn',
+  // Issue #514: a replay reused an existing trace_id with DIVERGENT content.
+  // Never expected; means an id collision or tampering.
+  'runtime_trace_envelope_divergent_replay',
   'pending_resolved',
   'pending_cancelled',
   'pending_expired',

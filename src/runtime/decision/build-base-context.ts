@@ -14,6 +14,7 @@
 import type { BaseContextPacket } from '../context-packet/types.js';
 import type { Mensagem, Conversa, Pessoa } from '@/db/schema.js';
 import type { AudienceType, TrustLevel } from '@/shared/audience.js';
+import { currentTraceId, deriveTraceId } from '@/observability/correlation.js';
 
 export interface BuildBaseContextInput {
   inbound: Mensagem;
@@ -73,8 +74,17 @@ export function buildBaseContextPacketFromTurn(
     FEATURE_DECISION_ENGINE_V1: true,
   };
 
+  // Issue #514 §1 — ONE trace id per turn. Prefer the id already established
+  // by the ingress/queue correlation context; fall back to deriving it from
+  // the persisted inbound row id. Because `deriveTraceId` returns a UUID input
+  // verbatim and `mensagens.id` is a UUID, the fallback is byte-identical to
+  // the previous `trace_id: inbound.id` — this is a correlation upgrade, not a
+  // behaviour change, and a retry/recovery of the same row still lands on the
+  // same root trace.
+  const trace_id = currentTraceId() ?? deriveTraceId(inbound.id);
+
   return {
-    trace_id: inbound.id,
+    trace_id,
     tenant_id,
     agent_id,
     session_id: conversa.id,
