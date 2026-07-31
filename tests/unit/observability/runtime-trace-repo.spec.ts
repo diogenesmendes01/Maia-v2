@@ -59,6 +59,10 @@ function row(over: Record<string, unknown> = {}) {
     decision: 'allow',
     side_effect_level: 'low',
     redaction_class: 'standard',
+    root_trace_id: TRACE_ID,
+    attempt: 1,
+    // Issue #535 — which field set the signature covers (migration 119).
+    envelope_payload_version: 2,
     body_status: 'persisted',
     body_persisted_at: null,
     created_at: new Date('2026-07-01T10:00:00Z'),

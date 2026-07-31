@@ -66,6 +66,13 @@ export interface TraceDetail extends TraceListItem {
   envelope_hmac: string;
   hmac_key_version: number;
   /**
+   * Issue #535 — which field set `envelope_hmac` covers (1 = the #514 payload,
+   * 2 = + `root_trace_id`/`attempt`). Surfaced so an operator reading a v1 row
+   * knows the attempt columns on it are unsigned, rather than assuming every
+   * `verified` row means the same thing.
+   */
+  envelope_payload_version: number;
+  /**
    * Result of RECOMPUTING the envelope HMAC over this row (issue #514 review
    * round 1 [P2]). Not a "is the string non-empty" check.
    */
@@ -281,8 +288,11 @@ export const runtimeTraceRepo = {
       redaction_class: env.redaction_class,
       envelope_hmac: env.envelope_hmac,
       hmac_key_version: env.hmac_key_version,
+      envelope_payload_version: env.envelope_payload_version,
       // Recomputed over the row we just read, so a tampered field or a
-      // tampered signature both surface as `invalid`.
+      // tampered signature both surface as `invalid`. Issue #535: the row's
+      // OWN `envelope_payload_version` selects which field set is recomputed,
+      // so a v1 envelope keeps verifying against the v1 payload.
       integrity: verifyEnvelopeIntegrity({
         trace_id: env.trace_id,
         tenant_id: env.tenant_id,
@@ -294,6 +304,9 @@ export const runtimeTraceRepo = {
         side_effect_level: env.side_effect_level as VerifiableSideEffectLevel,
         redaction_class: env.redaction_class,
         hmac_key_version: env.hmac_key_version,
+        root_trace_id: env.root_trace_id,
+        attempt: env.attempt,
+        envelope_payload_version: env.envelope_payload_version,
         envelope_hmac: env.envelope_hmac,
       }),
       body_status: env.body_status,

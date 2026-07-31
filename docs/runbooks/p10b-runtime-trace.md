@@ -6,7 +6,7 @@
 
 A two-table audit pipeline + durable outbox + 3 workers + 1 materialized view:
 
-- `runtime_trace_envelopes` (migration 052): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
+- `runtime_trace_envelopes` (migration 052): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `envelope_payload_version`, `root_trace_id`, `attempt`, `body_status`.
 - `runtime_trace_bodies` + `runtime_trace_body_outbox` (migration 053): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket` (PK = `trace_id`, `ON CONFLICT DO NOTHING` for idempotent at-least-once delivery), plus a **durable outbox** table written transactionally with the envelope so a process crash never strands the packet (Codex review #102 issue 4).
 - `unified_trace_events` matview (migration 054): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
 
@@ -23,6 +23,8 @@ Workers (in `src/workers/`):
 | # | Invariant | Where enforced |
 |---|---|---|
 | 8 | HMAC-SHA256 is tenant-scoped (no cross-tenant dictionary attack) | `src/control-plane/runtime-trace/lib/hmac.ts` — HKDF derives a per-tenant key from the master KMS material. **Fail-closed**: throws if `RUNTIME_TRACE_HMAC_MASTER_SECRET` is absent in prod (Codex #102 issue 2). |
+| — | Signer and verifier share ONE payload definition, at every payload version | `envelopeSignedPayload(fields, version)` in `envelope-writer.ts`, consumed by the writer and by `verify-envelope.ts`. A hand-rolled payload elsewhere is how signer/verifier drift starts (issue #535). |
+| — | Widening the signature never invalidates rows written under a narrower one | `envelope_payload_version` (migration 119) + dual verification. See "Payload version" below. |
 | 12 | Envelope MUST be written BEFORE any side effect with `side_effect_level >= medium` | `src/control-plane/runtime-trace/envelope-writer.ts` throws on failure; caller MUST abort the side effect |
 | — | Redaction policy is a **strict allowlist** — `STRUCTURAL_TOP_LEVEL` + `DECISION_TOP_LEVEL` + special-cased `request`/`soul`/`user_layer`; unknown top-level fields are DROPPED (Codex #102 issue 5) | `src/control-plane/runtime-trace/lib/redaction.ts` |
 | — | Debug mode is AES-256-GCM + S3 with 24h TTL + MFA-gated read. **Durability**: real `PutObject` when bucket configured, or inline ciphertext in DB row when not — never silent-drop (Codex #102 issue 3). | `lib/debug-encrypt.ts` + `body-writer.ts` + DB CHECK constraint `runtime_trace_bodies_encrypted_has_storage` |
@@ -76,6 +78,32 @@ await actuallyDoTheThing();
 
 No re-signing of historical rows. Each row carries its own version; the verifier loads the right key on demand.
 
+## Payload version (issue #535) — a second, independent version axis
+
+`hmac_key_version` says **which key** signed the envelope. `envelope_payload_version` (migration 119) says **which fields** were signed. They rotate independently and must never be conflated.
+
+| version | field set covered by `envelope_hmac` |
+|---|---|
+| 1 | `trace_id`, `tenant_id`, `agent_id`, `conversa_id`, `turno_id`, `policy_id`, `decision`, `side_effect_level`, `redaction_class`, `hmac_key_version` |
+| 2 | all of v1, **plus** `root_trace_id`, `attempt`, and the version tag itself |
+
+Both payloads are built by ONE function — `envelopeSignedPayload(fields, version)` in `src/control-plane/runtime-trace/envelope-writer.ts` — used by the writer and by `verify-envelope.ts`. Never hand-roll a payload anywhere else: a second definition that agrees today is the shape this bug class takes.
+
+**Why v2 exists.** Migration 107 added `root_trace_id`/`attempt` outside the signature, arguing that `turno_id` (which is signed) already identifies the turn, so a tampered `attempt` could only mis-order the attempts of a turn, not merge two turns. The owner's decision on #535 revised that: these two columns are what a retry investigation is READ through ("attempt 2 of 3", the sibling list), and mis-ordering the forensic read is enough harm on its own.
+
+**Behaviour of the reader:**
+
+- v1 row → recomputed with the v1 payload → an envelope written before #535 keeps verifying. Widening the signature must never retroactively convict history.
+- v2 row → recomputed with the v2 payload; editing `attempt` or `root_trace_id` gives `invalid`.
+- A version the build does not implement → **`invalid`, not `unknown`**. `unknown` means "the material to check is missing HERE" (a rotated-out key, a reader without the secret) — a config gap, where the row is fine and accusing it would make every rotation look like an incident. A payload version is not provisioned, it is *written*: only our writer sets it, only to a version that existed then, and versions are added, never removed. A row carrying an unimplemented version was not produced by our writer. Answering `unknown` there would hand an attacker an opt-out from verification — write a number nobody implemented and the row is never checked.
+- Flipping the column 2 → 1 to make the verifier ignore the attempt columns does not work: the version is inside the v2 payload, so the downgrade breaks the recomputation and the row reads `invalid`.
+
+**Rollout order — the one operational rule.** A new payload version must ship **readable** at least one release before anything **writes** it. Otherwise a mid-deploy replica reads a row from the future, cannot reconstruct the payload, and reports `invalid` — the exact false alarm the `invalid`-for-unknown-version choice trades away. Concretely for v2: `DEFAULT 1` on the column means a not-yet-upgraded replica keeps writing v1 rows that the upgraded replica still verifies, and the upgraded replica's v2 rows are only read by builds that understand v2.
+
+**Divergent-replay comparison.** Because the same evidence has two valid encodings, `divergedEnvelopeFields()` compares the evidence fields BY VALUE and compares `envelope_hmac` only when the key version and payload version both match. A cross-version at-least-once re-write during a rolling deploy is therefore an identical replay, not a `DivergentTraceReplayError` that would fail the turn closed for the whole deploy window.
+
+**Reading the Explorer.** `getTrace` returns `envelope_payload_version` and `attempt_grouping_signed`. On a v1 row, `envelope_integrity: 'verified'` means the decision evidence is intact while the attempt columns on that row remain unsigned — `attempt_grouping_signed: false` states that instead of leaving it implied.
+
 ## Recovery from "orphaned" body
 
 When the recoverer marks envelopes as `body_status='orphaned'`, the body was never persisted within `RUNTIME_TRACE_BODY_ORPHAN_SEC`. Two likely causes:
@@ -121,6 +149,14 @@ SELECT count(*) FROM runtime_trace_envelopes WHERE body_status = 'pending';
 
 -- Orphaned envelopes (should be near-zero):
 SELECT count(*) FROM runtime_trace_envelopes WHERE body_status = 'orphaned';
+
+-- Payload-version mix (issue #535). During and after the rollout this should
+-- move monotonically towards 2; a version that is neither 1 nor 2 is a row no
+-- writer of ours produced — investigate before anything else:
+SELECT envelope_payload_version, count(*)
+FROM runtime_trace_envelopes
+GROUP BY envelope_payload_version
+ORDER BY envelope_payload_version;
 
 -- Recent decisions per tenant:
 SELECT tenant_id, decision, count(*)

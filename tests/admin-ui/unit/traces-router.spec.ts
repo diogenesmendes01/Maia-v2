@@ -37,6 +37,9 @@ function detailRow(over: Record<string, unknown> = {}) {
     policy_id: 'pol-1',
     envelope_hmac: 'c2lnbmF0dXJl',
     hmac_key_version: 1,
+    // Issue #535: which field set that signature covers. 2 = `root_trace_id`
+    // and `attempt` are inside it.
+    envelope_payload_version: 2,
     // The repo recomputes this; the router only projects it.
     integrity: 'verified' as const,
     body_integrity: 'verified' as const,
@@ -249,6 +252,26 @@ describe('traces.getTrace', () => {
     const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
     expect(res.envelope_integrity).toBe('invalid');
     expect(res.envelope_signed).toBe(false);
+  });
+
+  it('says whether the attempt grouping is itself signed [#535]', async () => {
+    // `verified` alone does not tell an operator whether the `attempt` he is
+    // reading was covered by the signature — that depends on the payload
+    // version, so the version travels with the verdict.
+    const { ctx } = makeCtx();
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.envelope_payload_version).toBe(2);
+    expect(res.attempt_grouping_signed).toBe(true);
+  });
+
+  it('a v1 envelope is verified BUT its attempt grouping is unsigned [#535]', async () => {
+    // The honest answer for a row written before the widening: the decision
+    // evidence is intact, the grouping columns on it are not signed. Reporting
+    // it as fully signed would overstate what was checked.
+    const { ctx } = makeCtx({ detail: detailRow({ envelope_payload_version: 1 }) });
+    const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
+    expect(res.envelope_integrity).toBe('verified');
+    expect(res.attempt_grouping_signed).toBe(false);
   });
 
   it('surfaces the BODY integrity too [round 2 P2]', async () => {

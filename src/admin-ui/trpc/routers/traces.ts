@@ -179,6 +179,12 @@ export const tracesRouter = router({
         // (`unknown` = the key version's secret is not configured here, which
         // is a config gap, never evidence of tampering).
         hmac_key_version: trace.hmac_key_version,
+        // Issue #535: WHICH fields that signature covers. 1 = the #514 payload
+        // (attempt grouping unsigned); 2 = + `root_trace_id`/`attempt`. An
+        // operator correlating a retry needs to know whether the grouping he
+        // is reading is itself signed evidence or just a column.
+        envelope_payload_version: trace.envelope_payload_version,
+        attempt_grouping_signed: trace.envelope_payload_version >= 2,
         envelope_integrity: trace.integrity,
         envelope_signed: trace.integrity === 'verified',
         // Round 2 [P2]: the BODY carries its own `packet_hmac`, which was

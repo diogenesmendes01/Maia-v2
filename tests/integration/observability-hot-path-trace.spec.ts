@@ -286,6 +286,11 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
     await traceTurnDecision({ base: baseFixture('acme', trace_id), packet: packetFixture() });
     const row = txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row;
 
+    // Payload v2 (issue #535): the hot path signs `root_trace_id`/`attempt`
+    // and stamps the version it used. Written out by hand rather than through
+    // `envelopeSignedPayload` so this remains an independent statement of what
+    // the writer must have signed, not a restatement of the writer.
+    expect(row.envelope_payload_version).toBe(2);
     const signed = {
       trace_id: row.trace_id,
       tenant_id: row.tenant_id,
@@ -297,6 +302,9 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
       side_effect_level: row.side_effect_level,
       redaction_class: row.redaction_class,
       hmac_key_version: row.hmac_key_version,
+      envelope_payload_version: row.envelope_payload_version,
+      root_trace_id: row.root_trace_id,
+      attempt: row.attempt,
     };
     expect(
       verifyHmac('acme', row.hmac_key_version as number, signed, row.envelope_hmac as string),
@@ -307,6 +315,23 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
         'acme',
         row.hmac_key_version as number,
         { ...signed, decision: 'deny' },
+        row.envelope_hmac as string,
+      ),
+    ).toBe(false);
+    // Including the attempt-grouping columns, which #514 left unsigned.
+    expect(
+      verifyHmac(
+        'acme',
+        row.hmac_key_version as number,
+        { ...signed, attempt: (row.attempt as number) + 1 },
+        row.envelope_hmac as string,
+      ),
+    ).toBe(false);
+    expect(
+      verifyHmac(
+        'acme',
+        row.hmac_key_version as number,
+        { ...signed, root_trace_id: '00000000-0000-4000-8000-000000000000' },
         row.envelope_hmac as string,
       ),
     ).toBe(false);

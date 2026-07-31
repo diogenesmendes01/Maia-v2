@@ -118,15 +118,25 @@ vi.mock('@/config/env.js', () => ({
   },
 }));
 
-const { writeEnvelope, DivergentTraceReplayError, divergedEnvelopeFields, bodyPayloadDigest } =
-  await import('@/control-plane/runtime-trace/envelope-writer.js');
+const {
+  writeEnvelope,
+  DivergentTraceReplayError,
+  divergedEnvelopeFields,
+  bodyPayloadDigest,
+  envelopeSignedPayload,
+  ENVELOPE_PAYLOAD_VERSION_V1,
+  ENVELOPE_PAYLOAD_VERSION_V2,
+} = await import('@/control-plane/runtime-trace/envelope-writer.js');
+const { signHmac } = await import('@/control-plane/runtime-trace/lib/hmac.js');
 
 import type {
   TraceEnvelopeInput,
   TraceBodyInput,
 } from '@/control-plane/runtime-trace/types.js';
+import type { ComparableEnvelopeEvidence } from '@/control-plane/runtime-trace/envelope-writer.js';
 
 const TRACE_ID = '3f1a9d2e-4c5b-4a7e-9f0d-1b2c3d4e5f60';
+const ENVELOPE_KEY = `runtime_trace_envelopes:${TRACE_ID}`;
 
 function input(over: Partial<TraceEnvelopeInput> = {}): TraceEnvelopeInput {
   return {
@@ -137,6 +147,43 @@ function input(over: Partial<TraceEnvelopeInput> = {}): TraceEnvelopeInput {
     turno_id: null,
     decision: { decision: 'allow', side_effect_level: 'medium', policy_id: 'pol-1' },
     ...over,
+  };
+}
+
+/**
+ * An envelope row exactly as the PRE-#535 writer left it: the v1 payload, the
+ * v1 version tag, and a signature over the v1 field set.
+ *
+ * Used to seed the store so the CURRENT writer meets a row written by an older
+ * replica — the rolling-deploy shape, which is the one that can turn a deploy
+ * window into a wave of failed turns if the divergence check compares the
+ * signature across versions.
+ */
+function storedV1Envelope(over: Record<string, unknown> = {}) {
+  const fields = {
+    trace_id: TRACE_ID,
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-a',
+    conversa_id: null,
+    turno_id: null,
+    policy_id: 'pol-1',
+    decision: 'allow' as const,
+    side_effect_level: 'medium' as const,
+    redaction_class: 'standard',
+    hmac_key_version: 1,
+    root_trace_id: TRACE_ID,
+    attempt: 1,
+    ...over,
+  };
+  return {
+    ...fields,
+    envelope_payload_version: ENVELOPE_PAYLOAD_VERSION_V1,
+    envelope_hmac: signHmac(
+      fields.tenant_id,
+      fields.hmac_key_version,
+      envelopeSignedPayload(fields, ENVELOPE_PAYLOAD_VERSION_V1),
+    ),
+    body_status: 'pending',
   };
 }
 
@@ -221,7 +268,7 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
       ).rejects.toBeInstanceOf(DivergentTraceReplayError);
     });
 
-    it('a different ATTEMPT ordinal is refused (unsigned column)', async () => {
+    it('a different ATTEMPT ordinal is refused', async () => {
       await writeEnvelope(input({ attempt: 1 }), { outbox_body: body() });
       let thrown: unknown;
       try {
@@ -286,36 +333,156 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
     });
   });
 
+  /**
+   * Issue #535 — the same evidence now has TWO valid encodings, so the
+   * divergence check had to stop treating "different signature" as "different
+   * facts".
+   */
+  describe('#535 — replay across payload versions', () => {
+    it('a v1 row replayed by the v2 writer is IDENTICAL, not divergent', () => {
+      // The rolling-deploy case. Old replica wrote the envelope; the upgraded
+      // one retries the same attempt (BullMQ, outbox relayer, recovery sweep).
+      // Same facts, different signature — and `writeEnvelope` fails CLOSED on
+      // divergence, so getting this wrong aborts turns for the whole deploy
+      // window and pages ops over an encoding difference.
+      persisted.set(ENVELOPE_KEY, storedV1Envelope());
+      return expect(writeEnvelope(input())).resolves.toMatchObject({ trace_id: TRACE_ID });
+    });
+
+    it('… and the reverse direction (v2 stored, v1 replay) too', async () => {
+      await writeEnvelope(input());
+      const storedV2 = persisted.get(ENVELOPE_KEY);
+      expect(storedV2!.envelope_payload_version).toBe(ENVELOPE_PAYLOAD_VERSION_V2);
+      // Simulate the not-yet-upgraded replica re-writing the same evidence.
+      const diverged = divergedEnvelopeFields(
+        storedV2 as unknown as ComparableEnvelopeEvidence,
+        storedV1Envelope() as unknown as ComparableEnvelopeEvidence,
+      );
+      expect(diverged).toEqual([]);
+    });
+
+    it('but DIFFERENT facts across versions are still refused', async () => {
+      // The carve-out is for the encoding, never for the evidence: a v1 row
+      // asserting `deny` must not be silently replaced by a v2 `allow`.
+      persisted.set(ENVELOPE_KEY, storedV1Envelope({ decision: 'deny' }));
+      let thrown: unknown;
+      try {
+        await writeEnvelope(input());
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(DivergentTraceReplayError);
+      expect((thrown as InstanceType<typeof DivergentTraceReplayError>).diverged_fields).toContain(
+        'decision',
+      );
+    });
+
+    it('a v1 row with a different ATTEMPT is still refused', async () => {
+      // `attempt` is compared by value regardless of whether the STORED row
+      // signed it — the column is evidence either way.
+      persisted.set(ENVELOPE_KEY, storedV1Envelope({ attempt: 4 }));
+      let thrown: unknown;
+      try {
+        await writeEnvelope(input({ attempt: 1 }));
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(DivergentTraceReplayError);
+      expect((thrown as InstanceType<typeof DivergentTraceReplayError>).diverged_fields).toContain(
+        'attempt',
+      );
+    });
+
+    it('the writer stamps v2 on every new row', async () => {
+      await writeEnvelope(input(), { outbox_body: body() });
+      expect(persisted.get(ENVELOPE_KEY)!.envelope_payload_version).toBe(
+        ENVELOPE_PAYLOAD_VERSION_V2,
+      );
+    });
+  });
+
   describe('comparison helpers', () => {
-    const base = {
-      tenant_id: 't',
-      envelope_hmac: 'h',
-      root_trace_id: 'r',
-      attempt: 1,
-    };
+    function comparable(over: Record<string, unknown> = {}) {
+      return {
+        tenant_id: 't',
+        agent_id: 'a',
+        conversa_id: null,
+        turno_id: null,
+        policy_id: 'p',
+        decision: 'allow',
+        side_effect_level: 'medium',
+        redaction_class: 'standard',
+        root_trace_id: 'r',
+        attempt: 1,
+        hmac_key_version: 1,
+        envelope_payload_version: ENVELOPE_PAYLOAD_VERSION_V2,
+        envelope_hmac: 'h',
+        ...over,
+      };
+    }
 
     it('identical rows diverge on nothing', () => {
-      expect(divergedEnvelopeFields(base, { ...base })).toEqual([]);
+      expect(divergedEnvelopeFields(comparable(), comparable())).toEqual([]);
     });
 
     it('null and undefined root are the same absence', () => {
       expect(
         divergedEnvelopeFields(
-          { ...base, root_trace_id: null },
-          { ...base, root_trace_id: null },
+          comparable({ root_trace_id: null }),
+          comparable({ root_trace_id: undefined }),
         ),
       ).toEqual([]);
     });
 
-    it('reports every field that differs', () => {
+    it('reports every evidence field that differs, by name', () => {
       expect(
-        divergedEnvelopeFields(base, {
-          tenant_id: 'other',
-          envelope_hmac: 'other',
-          root_trace_id: 'other',
-          attempt: 9,
-        }),
-      ).toEqual(['tenant_id', 'envelope_hmac', 'root_trace_id', 'attempt']);
+        divergedEnvelopeFields(
+          comparable(),
+          comparable({
+            tenant_id: 'other',
+            agent_id: 'other',
+            decision: 'deny',
+            root_trace_id: 'other',
+            attempt: 9,
+            envelope_hmac: 'other',
+          }),
+        ),
+      ).toEqual(['tenant_id', 'agent_id', 'decision', 'root_trace_id', 'attempt', 'envelope_hmac']);
+    });
+
+    it('a tampered signature over identical fields is still divergence', () => {
+      // The one thing the value-by-value comparison would miss on its own.
+      expect(
+        divergedEnvelopeFields(comparable(), comparable({ envelope_hmac: 'forged' })),
+      ).toEqual(['envelope_hmac']);
+    });
+
+    it('a different payload version alone is NOT divergence', () => {
+      expect(
+        divergedEnvelopeFields(
+          comparable({
+            envelope_payload_version: ENVELOPE_PAYLOAD_VERSION_V1,
+            envelope_hmac: 'v1-signature',
+          }),
+          comparable({
+            envelope_payload_version: ENVELOPE_PAYLOAD_VERSION_V2,
+            envelope_hmac: 'v2-signature',
+          }),
+        ),
+      ).toEqual([]);
+    });
+
+    it('a different KEY version alone is NOT divergence either', () => {
+      // Rotating the key mid-retry-window changes the signature without
+      // changing a single fact. Same reasoning as the payload version, and the
+      // same reasoning that makes a rotated-out key `unknown` rather than
+      // `invalid` on the read side.
+      expect(
+        divergedEnvelopeFields(
+          comparable({ hmac_key_version: 1, envelope_hmac: 'signed-with-v1-key' }),
+          comparable({ hmac_key_version: 2, envelope_hmac: 'signed-with-v2-key' }),
+        ),
+      ).toEqual([]);
     });
 
     it('the body digest is stable under key reordering', () => {

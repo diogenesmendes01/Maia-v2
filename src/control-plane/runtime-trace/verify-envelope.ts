@@ -17,8 +17,19 @@
  *     version is not configured in THIS process (a rotated-out key, a reader
  *     deployed without the secret). Absence of proof is not proof of absence,
  *     so this must never be collapsed into `invalid`.
+ *
+ * Issue #535 adds a SECOND version axis, orthogonal to the key version: which
+ * field set the signature covers (`envelope_payload_version`, migration 119).
+ * v1 rows are checked against the v1 payload, v2 rows against the v2 payload
+ * that also covers `root_trace_id`/`attempt`. `unknown` stays reserved for the
+ * key axis — see `verifyEnvelopeIntegrity` for why an unrecognised PAYLOAD
+ * version is `invalid` rather than `unknown`.
  */
-import { envelopeSignedPayload, type EnvelopeSignedFields } from './envelope-writer.js';
+import {
+  envelopeSignedPayload,
+  isKnownEnvelopePayloadVersion,
+  type EnvelopeSignedFields,
+} from './envelope-writer.js';
 import { verifyHmac } from './lib/hmac.js';
 import { logger } from '@/lib/logger.js';
 
@@ -80,10 +91,24 @@ export function verifyBodyIntegrity(row: VerifiableBodyRow | null | undefined): 
 /** Row shape needed to verify — a subset of `runtime_trace_envelopes`. */
 export interface VerifiableEnvelopeRow extends EnvelopeSignedFields {
   envelope_hmac: string;
+  /**
+   * Issue #535 — which payload definition the writer signed, read straight off
+   * the row (`envelope_payload_version`, migration 119). Typed `number`, not
+   * `EnvelopePayloadVersion`: the column is a plain INTEGER and this is the
+   * boundary where a value that is not a version we know has to be caught.
+   */
+  envelope_payload_version: number;
 }
 
 /**
  * Recompute the envelope HMAC and compare.
+ *
+ * Dual-version by construction (issue #535): a v1 row is re-signed with the v1
+ * payload, a v2 row with the v2 payload. Envelopes written before `attempt`
+ * and `root_trace_id` joined the signature therefore keep verifying exactly as
+ * they did — adding a field to the signature must not retroactively convict
+ * every row that predates it, which is the same reasoning that reserves
+ * `unknown` for a missing key version instead of calling a rotation an attack.
  *
  * Never throws: an integrity check that can crash the detail page is an
  * availability bug in the incident tool you reach for during an incident.
@@ -94,11 +119,49 @@ export function verifyEnvelopeIntegrity(row: VerifiableEnvelopeRow): EnvelopeInt
     // time, so its absence is a real integrity failure.
     return 'invalid';
   }
+
+  const payloadVersion = row.envelope_payload_version;
+  if (!isKnownEnvelopePayloadVersion(payloadVersion)) {
+    /**
+     * A payload version this build cannot reconstruct ⇒ `invalid`, NOT
+     * `unknown`. The two states answer different questions and the distinction
+     * is the whole reason `unknown` exists:
+     *
+     *   `unknown` means "the material to check is missing HERE" — a key
+     *   rotated out of this process, a reader deployed without the secret. The
+     *   row is fine; this reader is under-provisioned, and the fix is config.
+     *   Nothing about the row is suspicious, so accusing it would make every
+     *   rotation look like an incident.
+     *
+     *   A payload version is not provisioned, it is WRITTEN. Only the writer
+     *   sets this column, only ever to a version that existed when the row was
+     *   written, and versions are added, never removed — so no legitimate row
+     *   can carry a version this build does not know. A row that does is
+     *   either hand-edited or produced by something that is not our writer,
+     *   and both are exactly what `invalid` is for. Answering `unknown` would
+     *   hand an attacker a way to opt any row out of verification by writing a
+     *   number nobody has implemented yet.
+     *
+     * The one shape that WOULD warrant `unknown` — a NEWER version written by
+     * a newer replica and read by an older one mid-deploy — is prevented
+     * operationally instead: a payload version ships (readable) at least one
+     * release before it is written. See `docs/runbooks/p10b-runtime-trace.md`.
+     */
+    logger.warn(
+      {
+        trace_id: row.trace_id,
+        envelope_payload_version: payloadVersion,
+      },
+      'runtime_trace.envelope_payload_version_unknown',
+    );
+    return 'invalid';
+  }
+
   try {
     const ok = verifyHmac(
       row.tenant_id,
       row.hmac_key_version,
-      envelopeSignedPayload(row),
+      envelopeSignedPayload(row, payloadVersion),
       row.envelope_hmac,
     );
     return ok ? 'verified' : 'invalid';

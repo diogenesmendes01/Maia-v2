@@ -2326,7 +2326,9 @@ export const runtime_trace_envelopes = pgTable(
     turno_id: uuid('turno_id'),
     // Issue #514 (migration 107): attempt grouping. `root_trace_id` equals
     // `trace_id` on attempt 1; retries get a derived id and point back here.
-    // NOT covered by `envelope_hmac` — see the migration for why.
+    // Migration 107 left these OUT of `envelope_hmac`; issue #535 (migration
+    // 119) put them IN, from payload version 2 on — see
+    // `envelope_payload_version` below.
     root_trace_id: uuid('root_trace_id'),
     attempt: integer('attempt').notNull().default(1),
     policy_id: uuid('policy_id'),
@@ -2335,6 +2337,13 @@ export const runtime_trace_envelopes = pgTable(
     redaction_class: text('redaction_class').notNull().default('standard'),
     envelope_hmac: text('envelope_hmac').notNull(),
     hmac_key_version: integer('hmac_key_version').notNull(),
+    // Issue #535 (migration 119): WHICH field set `envelope_hmac` covers.
+    // 1 = the #514 payload; 2 = that payload plus `root_trace_id`/`attempt`.
+    // Orthogonal to `hmac_key_version` (WHICH KEY signed it) — a rotation does
+    // not change the payload and a payload change does not rotate the key.
+    // DEFAULT 1 is what makes existing rows, and rows written by a not-yet-
+    // upgraded replica, still verify: they really were signed with v1.
+    envelope_payload_version: integer('envelope_payload_version').notNull().default(1),
     body_status: text('body_status').notNull().default('pending'),
     body_persisted_at: timestamp('body_persisted_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

@@ -95,7 +95,13 @@ vi.mock('../../src/config/env.js', () => ({
   },
 }));
 
-import { writeEnvelope } from '../../src/control-plane/runtime-trace/envelope-writer.js';
+import {
+  writeEnvelope,
+  envelopeSignedPayload,
+  ENVELOPE_PAYLOAD_VERSION_V1,
+  ENVELOPE_PAYLOAD_VERSION_V2,
+  CURRENT_ENVELOPE_PAYLOAD_VERSION,
+} from '../../src/control-plane/runtime-trace/envelope-writer.js';
 import {
   verifyHmac,
   _resetHmacCacheForTests,
@@ -142,9 +148,17 @@ describe('writeEnvelope', () => {
     expect(out.redaction_class).toBe('standard');
   });
 
-  it('HMAC verifies against the canonical envelope payload', async () => {
-    const out = await writeEnvelope(baseInput);
-    const payload = {
+  /**
+   * The payload the writer is EXPECTED to have signed, spelled out here by
+   * hand rather than through `envelopeSignedPayload`. A spec that re-used the
+   * production builder would agree with the writer by construction — including
+   * on the day the builder is wrong.
+   */
+  function expectedPayload(
+    over: Record<string, unknown> = {},
+    version: number = CURRENT_ENVELOPE_PAYLOAD_VERSION,
+  ) {
+    const v1 = {
       trace_id: baseInput.trace_id,
       tenant_id: baseInput.tenant_id,
       agent_id: baseInput.agent_id,
@@ -154,28 +168,159 @@ describe('writeEnvelope', () => {
       decision: baseInput.decision.decision,
       side_effect_level: baseInput.decision.side_effect_level,
       redaction_class: 'standard',
-      hmac_key_version: out.hmac_key_version,
+      hmac_key_version: 1,
     };
-    expect(verifyHmac(baseInput.tenant_id, out.hmac_key_version, payload, out.envelope_hmac)).toBe(true);
+    if (version === ENVELOPE_PAYLOAD_VERSION_V1) return { ...v1, ...over };
+    return {
+      ...v1,
+      envelope_payload_version: ENVELOPE_PAYLOAD_VERSION_V2,
+      root_trace_id: baseInput.trace_id, // attempt 1 ⇒ own root
+      attempt: 1,
+      ...over,
+    };
+  }
+
+  it('HMAC verifies against the canonical envelope payload', async () => {
+    const out = await writeEnvelope(baseInput);
+    expect(
+      verifyHmac(baseInput.tenant_id, out.hmac_key_version, expectedPayload(), out.envelope_hmac),
+    ).toBe(true);
   });
 
   it('tampered side_effect_level fails HMAC verify', async () => {
     const out = await writeEnvelope(baseInput);
-    const tampered = {
-      trace_id: baseInput.trace_id,
-      tenant_id: baseInput.tenant_id,
-      agent_id: baseInput.agent_id,
-      conversa_id: baseInput.conversa_id,
-      turno_id: baseInput.turno_id,
-      policy_id: baseInput.decision.policy_id,
-      decision: baseInput.decision.decision,
-      side_effect_level: 'low', // ← tampered down from 'medium'
-      redaction_class: 'standard',
-      hmac_key_version: out.hmac_key_version,
-    };
     expect(
-      verifyHmac(baseInput.tenant_id, out.hmac_key_version, tampered, out.envelope_hmac),
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        // ← tampered down from 'medium'
+        expectedPayload({ side_effect_level: 'low' }),
+        out.envelope_hmac,
+      ),
     ).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------
+  // Issue #535 — new writes sign `root_trace_id` + `attempt` (payload v2).
+  // ---------------------------------------------------------------------
+
+  it('stamps the payload version on the row and reports it back', async () => {
+    const out = await writeEnvelope(baseInput);
+    const row = dbInsertMock.mock.calls[0]![0];
+    expect(row.envelope_payload_version).toBe(ENVELOPE_PAYLOAD_VERSION_V2);
+    expect(out.envelope_payload_version).toBe(ENVELOPE_PAYLOAD_VERSION_V2);
+  });
+
+  it('the signature is over the V2 payload, NOT the v1 one', async () => {
+    const out = await writeEnvelope(baseInput);
+    // The discriminating pair: if the writer still signed v1, the first
+    // expectation would fail and the second would pass.
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({}, ENVELOPE_PAYLOAD_VERSION_V2),
+        out.envelope_hmac,
+      ),
+    ).toBe(true);
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({}, ENVELOPE_PAYLOAD_VERSION_V1),
+        out.envelope_hmac,
+      ),
+    ).toBe(false);
+  });
+
+  it('a tampered ATTEMPT fails HMAC verify (the #535 gap)', async () => {
+    const out = await writeEnvelope({ ...baseInput, attempt: 2, root_trace_id: baseInput.trace_id });
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({ attempt: 2 }),
+        out.envelope_hmac,
+      ),
+    ).toBe(true);
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({ attempt: 1 }), // ← retry re-ordered to look like the first try
+        out.envelope_hmac,
+      ),
+    ).toBe(false);
+  });
+
+  it('a tampered ROOT_TRACE_ID fails HMAC verify', async () => {
+    const root = '99999999-9999-4999-8999-999999999999';
+    const out = await writeEnvelope({ ...baseInput, attempt: 3, root_trace_id: root });
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({ root_trace_id: root, attempt: 3 }),
+        out.envelope_hmac,
+      ),
+    ).toBe(true);
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({ root_trace_id: baseInput.trace_id, attempt: 3 }),
+        out.envelope_hmac,
+      ),
+    ).toBe(false);
+  });
+
+  it('two attempts of the same turn get DIFFERENT signatures', async () => {
+    const a = await writeEnvelope({ ...baseInput, attempt: 1 });
+    const b = await writeEnvelope({ ...baseInput, attempt: 2 });
+    // Under v1 these were byte-identical payloads: same trace, same decision,
+    // and the only difference (`attempt`) was outside the signature.
+    expect(a.envelope_hmac).not.toBe(b.envelope_hmac);
+  });
+
+  it('the clamped attempt is what gets SIGNED, not the raw input', async () => {
+    // The row and the signature must agree; a clamp applied to one and not the
+    // other would write a row that cannot verify itself.
+    const out = await writeEnvelope({ ...baseInput, attempt: 0 });
+    const row = dbInsertMock.mock.calls[0]![0];
+    expect(row.attempt).toBe(1);
+    expect(
+      verifyHmac(
+        baseInput.tenant_id,
+        out.hmac_key_version,
+        expectedPayload({ attempt: 1 }),
+        out.envelope_hmac,
+      ),
+    ).toBe(true);
+  });
+
+  it('the shared payload builder produces exactly what the writer signed', async () => {
+    // The other direction of the same claim: `envelopeSignedPayload` is not a
+    // second definition that happens to agree — it IS the one the writer used.
+    const out = await writeEnvelope(baseInput);
+    const row = dbInsertMock.mock.calls[0]![0];
+    const rebuilt = envelopeSignedPayload(
+      {
+        trace_id: row.trace_id,
+        tenant_id: row.tenant_id,
+        agent_id: row.agent_id,
+        conversa_id: row.conversa_id,
+        turno_id: row.turno_id,
+        policy_id: row.policy_id,
+        decision: row.decision,
+        side_effect_level: row.side_effect_level,
+        redaction_class: row.redaction_class,
+        hmac_key_version: row.hmac_key_version,
+        root_trace_id: row.root_trace_id,
+        attempt: row.attempt,
+      },
+      row.envelope_payload_version,
+    );
+    expect(verifyHmac(row.tenant_id, row.hmac_key_version, rebuilt, out.envelope_hmac)).toBe(true);
   });
 
   it('throws when DB insert fails — caller MUST abort the side effect', async () => {

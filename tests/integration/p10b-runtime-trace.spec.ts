@@ -181,6 +181,10 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
     const bEnv = await trace({ ...baseInput(), tenant_id: 'tenant-beta' });
     expect(aEnv.envelope_hmac).not.toBe(bEnv.envelope_hmac);
     // Verify tenant-alpha's HMAC does NOT validate under tenant-beta's key.
+    // Payload v2 (issue #535): `root_trace_id`/`attempt` and the version tag
+    // are inside the signature now. Spelled out by hand rather than through
+    // `envelopeSignedPayload` so this stays an independent statement of what
+    // the writer must have signed.
     const payload = {
       trace_id: aEnv.trace_id,
       tenant_id: 'tenant-alpha',
@@ -192,6 +196,9 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
       side_effect_level: 'medium',
       redaction_class: 'standard',
       hmac_key_version: aEnv.hmac_key_version,
+      envelope_payload_version: 2,
+      root_trace_id: aEnv.trace_id, // attempt 1 ⇒ its own root
+      attempt: 1,
     };
     expect(verifyHmac('tenant-alpha', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(true);
     expect(verifyHmac('tenant-beta', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(false);

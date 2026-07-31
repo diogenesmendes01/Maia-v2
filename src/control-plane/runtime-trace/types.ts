@@ -94,6 +94,12 @@ export interface TraceEnvelopeWritten {
   attempt: number;
   envelope_hmac: string;
   hmac_key_version: number;
+  /**
+   * Issue #535: WHICH field set `envelope_hmac` covers. Always
+   * `CURRENT_ENVELOPE_PAYLOAD_VERSION` on a fresh write; persisted on the row
+   * so the verifier reads it instead of inferring it.
+   */
+  envelope_payload_version: number;
   side_effect_level: SideEffectLevel;
   decision: Decision;
   policy_id: string | null;
