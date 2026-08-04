@@ -63,7 +63,7 @@
     "@fastify/cookie": "^11.0.2",
     "@fastify/rate-limit": "^10.3.0",
     "@hapi/boom": "^10.0.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@whiskeysockets/baileys": "^6.7.23",
     "bullmq": "^5.78.0",
     "date-fns": "^4.4.0",
