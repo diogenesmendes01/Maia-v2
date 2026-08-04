@@ -13,6 +13,8 @@ import { runWithSystemContext } from '@/db/tenant-context.js';
 import { resolveProfile } from '@/config/profiles.js';
 import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profile.js';
 import { createBackupPorts } from '@/ops/backup/adapters.js';
+import { createRestoreDrillPorts } from '@/ops/backup/drill-adapters.js';
+import { runRestoreDrill } from '@/ops/backup/drill.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
 import { runArtifactRetention } from '@/ops/backup/retention.js';
 import {
@@ -192,6 +194,51 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
   }
 
   return { status: 'ran', outcome: run.outcome, reason: run.reason };
+}
+
+/**
+ * Restore drill — issue #536 §1.
+ *
+ * Shared entry point for `npm run restore:test` and for any scheduler that
+ * wants to run it. Single-flight on its OWN lock key, so a drill never blocks a
+ * nightly backup and two drills never race for the same ephemeral database.
+ *
+ * The drill runs under the reserved `system` sentinel for the same reason the
+ * backup does: it exercises a DB-wide artifact that has no owning tenant.
+ *
+ * The result is deliberately returned rather than thrown: the caller decides
+ * the exit code, and the evidence is already durable in `restore_drills`.
+ */
+export async function runRestoreDrillJob(): Promise<
+  | { status: 'already_running' }
+  | { status: 'ran'; result: Awaited<ReturnType<typeof runRestoreDrill>> }
+> {
+  return runWithSystemContext(async () => {
+    const profile = resolveBackupProfile(backupConfigInput());
+    const outcome = await withOpsLock(
+      OPS_LOCK_KEYS.restore_drill,
+      { pool, onWarn: (event, detail) => logger.warn(detail, event) },
+      () => runRestoreDrill(createRestoreDrillPorts(), profile),
+    );
+
+    if (outcome.status === 'already_running') {
+      logger.info({}, 'restore_drill.already_running');
+      return { status: 'already_running' as const };
+    }
+
+    const result = outcome.result;
+    if (result.status === 'failed') {
+      await sendAlert({
+        subject: 'Restore drill FAILED — no artifact is known to be restorable',
+        // Codes only: no path, no object key, no connection string.
+        body:
+          `Drill ${result.drill_id} failed with code=${result.failure_code}.\n` +
+          `Source: ${result.source}. Correlation id: ${result.correlation_id}.\n` +
+          'Inspect restore_drills for the probe detail.',
+      }).catch(() => null);
+    }
+    return { status: 'ran' as const, result };
+  });
 }
 
 /**

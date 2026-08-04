@@ -23,6 +23,9 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/upload-deadline.ts` | Cancellable upload: aborts, awaits settlement, reaps any orphan object |
 | `src/ops/backup/retention.ts` | Manifest-driven, hold-aware artifact deletion with confirmation and a conclusive outcome |
 | `src/ops/backup/rpo.ts` | RPO/RTO readiness: level + evidence + remediation per check |
+| `src/ops/backup/drill.ts` | `runRestoreDrill` — fetch the OFF-SITE artifact, bind it to its signed manifest, decrypt, restore in isolation, probe, reconcile in dry-run, tear down in `finally` (issue #536) |
+| `src/ops/backup/drill-probes.ts` | The probe suite the drill grades a restored snapshot with. Pure graders; counts and booleans only |
+| `src/ops/backup/drill-adapters.ts` | Real IO behind the drill's ports (S3 GET to file, decrypt, `CREATE/DROP DATABASE`, `pg_restore`, probe queries) |
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
 | `src/ops/retention/legal-hold.ts` | Deterministic hold evaluator (backend decides) |
 | `src/ops/retention/tombstones.ts` | Pseudonymised, signed ledger + post-restore reconciliation gate |
@@ -43,14 +46,17 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | Add a manifest field | `manifest.ts` (`backupManifestSchema`); bump `MANIFEST_VERSION` only when an existing field's MEANING changes |
 | Add a data class | `retention/data-classes.ts` + the matrix doc; state its `dpo_open_question` |
 | Add a readiness check | `rpo.ts` — every check must carry evidence and remediation |
+| Add a restore-drill probe | `drill-probes.ts`: a single-row SQL plus a PURE grader. `required: true` only when its failure means the snapshot is genuinely unusable; the query must return counts/booleans, never a row value |
 | Support another off-site provider | `src/workers/backup-s3.ts` (protocol-compatible) or a new adapter behind `BackupPorts.upload`/`verifyRemote` |
 
 ## Public surface
 
 - `runVerifiedBackup(ports, profile, trigger)` — the shared runner (`src/workers/backup.ts` and `scripts/backup.ts` are its only callers)
+- `runRestoreDrill(ports, profile)` — the shared drill (`runRestoreDrillJob` in `src/workers/backup.ts`, reached from `scripts/restore-test.ts`)
 - `evaluateBackupReadiness(input)` — the RPO/RTO verdict for `maia doctor` / readiness
 - `resolveRetention(classId, policy)` / `evaluateHold(holds, query)` — the two purge gates
 - `planReconciliation(input)` / `canReleaseTraffic(plan, applied)` — the post-restore anti-resurrection gate
+- `deriveTombstoneSecret(master)` — the ledger's keying material. Domain-separated from the manifest-signing key and FROZEN: changing the label invalidates every existing tombstone HMAC, and an unverifiable ledger blocks every restore
 
 ## Invariants
 

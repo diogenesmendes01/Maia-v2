@@ -84,6 +84,7 @@ UPDATE backup_runs
    - obtenha `tombstone_watermark` do manifesto;
    - liste os tombstones posteriores e reaplique cada exclusão/anonimização;
    - **se o ledger estiver ilegível, o watermark for nulo, ou qualquer linha falhar na verificação HMAC, PARE** — o runtime não pode voltar a produção (`planReconciliation` devolve `ok:false`).
+   - Antecipe esse número: o último drill já mediu quantos tombstones este artefato deveria reaplicar (`restore_drills.tombstones_pending`, §4). Se o drill mais recente do mesmo artefato falhou com `reconciliation_blocked`, o restore vai parar aqui — resolva o ledger **antes** de derrubar o banco.
 7. **Reconcilie o que não está no dump**: mídia (`/app/media`), Redis/BullMQ e a sessão Baileys **não** vêm no `pg_dump`. Ver §5.
 8. **Só então** inicie: `sudo systemctl start maia` e confira `/health/db`.
 
@@ -95,9 +96,38 @@ UPDATE backup_runs
 ssh maia 'cd /opt/maia && npm run restore:test'
 ```
 
-Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finally`. O resultado alimenta `restore_drills` e o RTO medido. **Um drill falhado torna a readiness FAIL**: até um drill passar, nenhum artefato é sabidamente restaurável.
+Exit codes: `0` passou (ou já rodando, ou backups desabilitados) · `1` falhou.
 
-> Limitação conhecida nesta fatia: o drill ainda consome o artefato **local** e não faz o download do off-site. Ver "Não entregue" abaixo.
+O drill **não** pega "o dump mais novo do diretório". Ele escolhe por evidência e prova cada etapa (issue #536, [`src/ops/backup/drill.ts`](../../src/ops/backup/drill.ts)):
+
+1. **seleciona** a run mais recente que tenha manifesto assinado E cópia verificada no destino (`selectDrillCandidate`, [`src/db/repositories/ops-repos.ts`](../../src/db/repositories/ops-repos.ts));
+2. **verifica a versão e a assinatura do manifesto** — um manifesto v1 é recusado com `manifest_version_unsupported`, porque em v1 `remote_checksum_verified` podia ser verdade só porque o carimbo do próprio uploader voltou no `HEAD`;
+3. **baixa o artefato off-site** e casa os bytes que chegaram com o digest do manifesto;
+4. **decifra** e casa o PLAINTEXT com `manifest.sha256` — conferência que nenhuma outra parte do sistema faz;
+5. **restaura** num banco efêmero isolado (`maia_drill_<stamp>_<id do drill>` — o discriminador existe pelo mesmo motivo que o do artefato na #520: dois drills no mesmo segundo colidiriam, e uma colisão aqui restauraria dentro de um banco velho e reportaria falso positivo);
+6. roda a **suíte de probes** ([`drill-probes.ts`](../../src/ops/backup/drill-probes.ts)): tabelas críticas presentes, seed de tenant/agent, escopo de tenant válido, integridade `mensagens→conversas`, ledger de tombstones restaurado, `transacoes` e `audit_logs` legíveis; mais dois informativos (outbox despachável, divergência de migration head);
+7. roda a **reconciliação de tombstones em dry-run** e avalia o gate `canReleaseTraffic` — é isso que transforma "o `pg_restore` saiu 0" em "este artefato poderia voltar à produção";
+8. grava tudo em `restore_drills` (inclusive a falha) e audita;
+9. derruba o banco e apaga cada arquivo estagiado **em `finally`**.
+
+**Fail-closed em cada passo.** Sem candidato, manifesto irrecuperável, checksum que não casa, probe obrigatório falhando ou plano de reconciliação `ok:false` ⇒ drill `failed`. **Um drill falhado torna a readiness FAIL**: até um drill passar, nenhum artefato é sabidamente restaurável.
+
+Se o perfil **exige** off-site (`BACKUP_OFFSITE_REQUIRED`), drillar a cópia local **não** conta: o drill falha com `no_offsite_candidate`. O artefato que importa depois de perder o host é o remoto, e só buscá-lo prova que ele é legível, decifrável e inteiro.
+
+```sql
+-- O último drill, com o detalhe dos probes
+SELECT started_at, source, status, duration_ms, failure_code,
+       tombstones_pending, probes
+FROM restore_drills ORDER BY started_at DESC LIMIT 5;
+```
+
+`tombstones_pending > 0` num drill que passou é **normal e informativo**: é quanto um restore real ainda deveria reaplicar antes de liberar tráfego (§3.6). `probes->'reconciliation'->>'release_without_replay'` é o veredito do gate com nada reaplicado.
+
+Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, `no_drill_candidate`, `no_offsite_candidate`, `manifest_version_unsupported`, `manifest_unverifiable`, `artifact_fetch_failed`, `artifact_checksum_mismatch`, `decryption_failed`, `plaintext_checksum_mismatch`, `isolation_failed`, `restore_failed`, `probe_failed`, `reconciliation_blocked`, `drill_not_recorded`, `unexpected`.
+
+**Requisitos operacionais.** O drill precisa de (a) `pg_restore` no host, (b) permissão de `CREATE DATABASE`/`DROP DATABASE` no cluster, (c) espaço em `BACKUP_DIR/restore-drill` para o artefato baixado **e** o plaintext decifrado. Esse diretório contém, enquanto o drill roda, uma cópia **em claro** dos dados de todos os tenants — ele fica sob `BACKUP_DIR` de propósito (permissões e disco que o operador já trata como sensíveis), nunca em `/tmp`. Se o log `restore_drill.database_not_dropped` aparecer, **derrube o banco efêmero à mão**: ele é uma cópia completa da produção.
+
+O drill não está no cron por decisão: ele cria e derruba um banco, e o intervalo esperado (`BACKUP_RESTORE_DRILL_INTERVAL_HOURS`) é semanal. Agende-o pelo cron do host, ou chame `runRestoreDrillJob()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)) de um job próprio — ele já disputa o lock `maia_ops_restore_drill`, então dois drills nunca correm juntos.
 
 ## 5. Dados fora do PostgreSQL
 
@@ -160,8 +190,9 @@ O único lugar onde mtime sobrevive é a varredura de `.partial` órfão — que
 
 Registrado aqui para que ninguém opere com expectativa errada:
 
-- O drill (`npm run restore:test`) ainda usa o dump **local** mais recente e não baixa/decifra o artefato off-site nem escreve em `restore_drills`.
 - O executor de retenção existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes de dado — mensagens, mídia, memória, traces — só existem o mecanismo de decisão e o schema; não há job que os varra.
-- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco.
-- A reconciliação de tombstones pós-restore é **manual** (passo 3.6): o planejador e o gate estão implementados e testados, mas não há job que os execute automaticamente.
-- Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado.
+- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco. (Issue #536, eixo 2.)
+- A **reaplicação** de tombstones pós-restore continua manual (passo 3.6). O drill agora executa `planReconciliation` e `canReleaseTraffic` em **dry-run** contra o snapshot restaurado, então a proteção deixou de depender de alguém lembrar de *avaliar* — mas não existe executor que *reaplique* as exclusões, porque reaplicar exige o mesmo mecanismo de exclusão por classe que o eixo 2 vai construir. (Issue #536, eixo 3.)
+- Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
+- O drill não roda por cron dentro da aplicação — ver §4 para como agendá-lo.
+- Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.
