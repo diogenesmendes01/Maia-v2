@@ -429,6 +429,17 @@ export const AUDIT_ACTIONS = [
   //   no learning), but every sandbox interaction stays on the audit trail
   //   (invariant #4) — marked so forensics can separate test traffic.
   'playground_turn',
+  // Onboarding (issue #519) — as decisões de governança AGENTE-ESCOPADAS da
+  // saga. A trilha administrativa completa (todo passo, todo ator, todo
+  // correlation id) vai atomicamente para `admin_audit_log` dentro da mesma
+  // transação do passo; estas três entram TAMBÉM em `audit_log` porque são
+  // decisões sobre o AGENTE e pertencem à trilha do agente (invariante 4).
+  // `agent_readiness_evaluated` registra o veredito canônico do backend (com
+  // os fingerprints de configuração e schema); os dois de ativação registram
+  // a decisão explícita de deixar — ou não deixar — o agente operar.
+  'agent_readiness_evaluated',
+  'agent_activation_approved',
+  'agent_activation_denied',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

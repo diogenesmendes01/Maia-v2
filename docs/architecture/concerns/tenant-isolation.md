@@ -94,6 +94,9 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 | `tests/unit/control-plane/knowledge-state-machine/ksm-rules-cross-tenant.spec.ts` | KSM transitions scoped |
 | `tests/property/knowledge-state-machine.spec.ts` | Property-based KSM invariants |
 | `tests/integration/p10a-knowledge-lifecycle.spec.ts` | KSM lifecycle stays scoped |
+| `tests/integration/onboarding-leak.spec.ts` | Saga de onboarding (#519): leitura, escrita, retomada, cancelamento e ativação escopadas; CHECK contra `'default'`/`'system'`. **Ainda não está no script `test:leak`** |
+| `tests/unit/onboarding/readiness-facts-scope.spec.ts` | DB-free: o loader de readiness compila `tenant_id + agent_id` em cada `WHERE` |
+| `tests/unit/onboarding/readiness.spec.ts` | Readiness nunca compõe profile de um agente com canal de outro (nem entre tenants) |
 
 There is a dedicated npm script `npm run test:leak` that runs the leak suite — invoke it on any change that touches state or context.
 
