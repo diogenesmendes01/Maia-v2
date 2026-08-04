@@ -300,8 +300,16 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
+| `maia_llm_circuit_state{provider,workload}` | gauge | `=1` (open) por > 2min |
+| `maia_llm_circuit_transitions_total{provider,workload,from,to}` | counter | qualquer transição para `open` |
+| `maia_llm_circuit_short_circuited_total{provider,workload,state}` | counter | rate alto = carga sendo recusada |
+| `maia_llm_requests_total{status="circuit_open"}` | counter | separa carga recusada por nós de erro do provider |
 
-> Adicionar `maia_llm_circuit_state` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessa, abre uma PR.
+O gauge vale `0` closed, `1` open, `2` half-open. Ele é registrado pelo próprio
+disjuntor (`src/lib/llm/circuit-breaker.ts`), sob demanda, na primeira vez que
+um par `(provider, workload)` é exercitado — não há nada a ligar em
+`src/server.ts`. Um par que nunca recebeu tráfego não tem série, o que é
+diferente de ter série em `0`.
 
 ### 8.1 Probes — qual endpoint usar onde (issue #512)
 
@@ -478,7 +486,16 @@ deadline — cobre todas as tentativas, backoff, fallback e parsing, e não
 reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
 excede o que resta do deadline.
 
-> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+**Quando o provider cai:** o disjuntor por `(provider, workload)` para de tentar
+depois de uma janela deslizante de 30s com no mínimo 10 tentativas acima do
+limiar, e passa a recusar com erro `circuit_open` — não retentável, carregando
+`retry_after_ms`. Ele só conta falha atribuível ao provider (`provider_5xx`,
+`network`, `timeout` do SDK): payload inválido, orçamento estourado ou turno
+cancelado não abrem o disjuntor de ninguém. O estado é por réplica e em memória,
+e o restart o zera. Ver `docs/architecture/modules/lib.md` para os limiares e o
+porquê de cada um.
+
+> Adicionar `maia_db_connected` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nela, abre uma PR.
 
 ---
 
