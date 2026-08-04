@@ -31,7 +31,13 @@ export type LLMCallStatus =
   | 'timeout'
   | 'rate_limit'
   | 'cancelled'
-  | 'budget_exhausted';
+  | 'budget_exhausted'
+  /**
+   * Recusa do disjuntor (issue #534). Status próprio para que carga
+   * DERRUBADA por nós não se confunda com erro do provider no dashboard: a
+   * primeira é a proteção funcionando, a segunda é o incidente.
+   */
+  | 'circuit_open';
 
 /** Mapeia o kind do erro para o status observável (label Prometheus). */
 export function statusForKind(kind: LLMErrorKind): LLMCallStatus {
@@ -44,6 +50,8 @@ export function statusForKind(kind: LLMErrorKind): LLMCallStatus {
       return 'rate_limit';
     case 'budget_exhausted':
       return 'budget_exhausted';
+    case 'circuit_open':
+      return 'circuit_open';
     default:
       return 'error';
   }

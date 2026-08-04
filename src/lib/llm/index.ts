@@ -16,6 +16,8 @@ export {
   startLLMSettingsInvalidationSubscriber,
 } from './cache-invalidation.js';
 export { workloadPolicy } from './workloads.js';
+export { circuitState } from './circuit-breaker.js';
+export type { CircuitKey, CircuitState } from './circuit-breaker.js';
 export {
   LLMGatewayError,
   classifyProviderError,

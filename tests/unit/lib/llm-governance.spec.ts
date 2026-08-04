@@ -80,6 +80,9 @@ vi.mock('@/lib/cost-ledger.js', () => ({
 vi.mock('@/lib/metrics.js', () => ({
   incCounter: incCounterMock,
   observeHistogram: vi.fn(),
+  // Registrado pelo disjuntor (issue #534) na primeira chamada de cada
+  // `(provider, workload)`.
+  setGaugeProvider: vi.fn(),
 }));
 
 vi.mock('@/lib/redis.js', () => ({
@@ -105,6 +108,7 @@ vi.mock('@/config/env.js', async () => {
 import { executeLLM } from '@/lib/llm/gateway.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { isBudgetEnabled, _internal as budgetInternal } from '@/lib/llm/budget.js';
+import { _internal as circuitInternal } from '@/lib/llm/circuit-breaker.js';
 import {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
   handleLLMSettingsInvalidation,
@@ -156,6 +160,9 @@ beforeEach(() => {
     fast: { value: 'settings-fast', source: 'global' },
   });
   invalidateModelCache();
+  // Disjuntor é estado de processo: sem zerar, as falhas de um caso entram na
+  // janela do seguinte. Comportamento coberto em `llm-circuit-breaker.spec.ts`.
+  circuitInternal.reset();
 });
 
 describe('orçamento diário por tenant+agent', () => {

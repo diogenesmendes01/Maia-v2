@@ -24,6 +24,19 @@ export type LLMErrorKind =
   | 'budget_exhausted'
   | 'configuration'
   /**
+   * Disjuntor aberto para `(provider, workload)`: o gateway RECUSOU a chamada
+   * sem tocar no provider, porque a janela recente de erros indica que ele
+   * está fora (`src/lib/llm/circuit-breaker.ts`, issue #534).
+   *
+   * Kind próprio, e não `provider_5xx`, porque o desfecho é diferente em três
+   * pontos que importam ao operador: nenhuma requisição saiu (não há custo,
+   * não há tentativa), a causa é uma decisão NOSSA, e existe um
+   * `retry_after_ms` derivado do cooldown do disjuntor. Contá-lo como erro de
+   * provider mascararia a diferença entre "o provider errou" e "nós paramos de
+   * perguntar".
+   */
+  | 'circuit_open'
+  /**
    * Fail-closed de isolamento: a chamada chegou ao gateway sem
    * `tenant_id + agent_id` no ALS. Kind próprio (e não `configuration`) para
    * que o operador distinga "faltou chave" de "faltou contexto de tenant" —
@@ -35,6 +48,11 @@ export type LLMErrorKind =
  * Só erros TRANSITÓRIOS são retentáveis. `aborted` e `timeout` ficam de fora
  * de propósito: cancelamento não é falha do provider e retentar depois do
  * deadline é exatamente o retry storm que a issue quer matar.
+ *
+ * `circuit_open` também fica de fora, e é o caso mais contra-intuitivo: a
+ * condição É transitória, mas retentar é precisamente o que o disjuntor
+ * existe para impedir. Quem quiser tentar de novo tem `retry_after_ms` no
+ * erro, que carrega o cooldown restante.
  */
 const RETRYABLE: ReadonlySet<LLMErrorKind> = new Set<LLMErrorKind>([
   'rate_limit',

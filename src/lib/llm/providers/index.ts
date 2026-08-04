@@ -41,6 +41,23 @@ export function _resetProvidersForTests(): void {
   instances.clear();
 }
 
+/**
+ * Test/benchmark seam: injeta uma instância no lugar do adapter real.
+ *
+ * Existe para o harness de carga (`scripts/llm-benchmark.ts`, issue #534)
+ * poder exercitar o gateway INTEIRO — deadline, retry, fallback, disjuntor,
+ * telemetria — contra um provider sintético, sem rede e sem custo. Sem este
+ * seam, medir o gateway exigiria ou gastar dinheiro real ou testar outra coisa
+ * que não o gateway.
+ *
+ * NÃO é caminho de produção: nada em `src/` chama esta função, o nome carrega
+ * o prefixo `_` da convenção de seams do repositório, e ela não é reexportada
+ * por `src/lib/llm/index.js`, que é a superfície pública do gateway.
+ */
+export function _injectProviderForTests(name: LLMProviderName, provider: LLMProvider): void {
+  instances.set(name, provider);
+}
+
 export { AnthropicProvider } from './anthropic.js';
 export {
   OpenRouterProvider,

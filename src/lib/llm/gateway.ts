@@ -25,6 +25,13 @@ import { config } from '@/config/env.js';
 import { estimateLLMCostUsd } from '@/lib/cost-ledger.js';
 import { estimateInputTokens, reserveBudget, settleReservation } from './budget.js';
 import type { BudgetReservation } from './budget.js';
+import {
+  acquireCircuit,
+  circuitOutcomeFor,
+  peekCircuit,
+  releaseCircuit,
+} from './circuit-breaker.js';
+import type { CircuitKey } from './circuit-breaker.js';
 import { LLMGatewayError, classifyProviderError, isAbortError } from './errors.js';
 import { resolveModelPair } from './model-resolver.js';
 import { getProvider } from './providers/index.js';
@@ -246,12 +253,51 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     throw err;
   }
 
-  // (4) Uma leitura de settings resolve primário E fallback. É leitura de
+  // (4) DISJUNTOR (issue #534). Se a janela recente de erros diz que este
+  // `(provider, workload)` está fora, a chamada não acontece — sem tentativa,
+  // sem backoff, sem fallback.
+  //
+  // A checagem precede a resolução de modelo e a reserva de cota de propósito:
+  // uma chamada que não vai sair não deve carimbar orçamento nem gastar I/O de
+  // Redis. É a leitura NÃO destrutiva; a sonda de half-open só é consumida na
+  // tentativa de verdade, mais abaixo.
+  const circuitKey: CircuitKey = { provider: provider.name, workload: req.workload };
+  const circuitError = (state: string, retry_after_ms: number): LLMGatewayError =>
+    new LLMGatewayError({
+      kind: 'circuit_open',
+      detail: `circuit ${state} for provider=${provider.name} workload=${req.workload}`,
+      provider: provider.name,
+      workload: req.workload,
+      retry_after_ms,
+    });
+
+  const peek = peekCircuit(circuitKey);
+  if (!peek.allowed) {
+    const err = circuitError(peek.state, peek.retry_after_ms);
+    await emitUsage(
+      {
+        workload: req.workload,
+        tier,
+        provider: provider.name,
+        model: 'unresolved',
+        status: 'circuit_open',
+        attempts: 0,
+        duration_ms: Date.now() - startedAt,
+        error_kind: 'circuit_open',
+        pessoa_id: req.pessoa_id,
+        trace_id: ctx.trace_id,
+      },
+      scope,
+    );
+    throw err;
+  }
+
+  // (5) Uma leitura de settings resolve primário E fallback. É leitura de
   // configuração, não I/O de provider — pode preceder a reserva de quota, e
   // precisa: a estimativa de custo depende do modelo escolhido.
   const { primary, fast } = await resolveModelPair(tier);
 
-  // (5) RESERVA de orçamento — atômica, antes de qualquer I/O de provider.
+  // (6) RESERVA de orçamento — atômica, antes de qualquer I/O de provider.
   // Não é uma checagem: o contador é incrementado com a estimativa e só então
   // comparado, para que chamadas concorrentes nunca decidam sobre o mesmo
   // número. A diferença para o custo real é liquidada no `finally`.
@@ -396,6 +442,17 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
         throw err;
       }
 
+      // Toda requisição que sai passa pelo disjuntor — tentativa primária,
+      // retry e fallback. Reavaliar A CADA tentativa é o que impede uma chamada
+      // já em voo de continuar gastando o que sobrou das tentativas depois que
+      // o disjuntor abriu por causa do tráfego concorrente.
+      const permit = acquireCircuit(circuitKey);
+      if (!permit.allowed) {
+        const err = circuitError(permit.state, permit.retry_after_ms);
+        await fail(primary, err);
+        throw err;
+      }
+
       attempts++;
       try {
         const res = await provider.call({
@@ -408,6 +465,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
           signal: link.signal,
           timeout_ms: attemptTimeout(),
         });
+        releaseCircuit(permit, 'ok');
         recordAttempt(
           {
             provider: primary.provider,
@@ -431,6 +489,10 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
             });
         lastError = err;
         lastRawError = rawErr;
+        // Deadline do TURNO não é evidência sobre o provider: quem estourou foi
+        // o orçamento do caller. Só o que o SDK classificou como falha de
+        // provider alimenta a janela do disjuntor.
+        releaseCircuit(permit, link.deadlineFired() ? 'ignored' : circuitOutcomeFor(err.kind));
         recordAttempt(
           {
             provider: primary.provider,
@@ -498,6 +560,17 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       throw isAbortError(lastRawError) ? lastRawError : err;
     }
 
+    // O fallback roda no MESMO provider (só troca o slug do modelo), então
+    // compartilha o disjuntor de `(provider, workload)`. É o ponto do
+    // exercício: era exatamente o fallback que continuava martelando um
+    // provider já fora do ar depois das tentativas do primário.
+    const fallbackPermit = acquireCircuit(circuitKey);
+    if (!fallbackPermit.allowed) {
+      const err = circuitError(fallbackPermit.state, fallbackPermit.retry_after_ms);
+      await fail(fast, err);
+      throw err;
+    }
+
     attempts++;
     try {
       const res = await provider.call({
@@ -510,6 +583,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
         signal: link.signal,
         timeout_ms: attemptTimeout(),
       });
+      releaseCircuit(fallbackPermit, 'ok');
       recordAttempt(
         {
           provider: fast.provider,
@@ -528,6 +602,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
             model: fast.model,
             workload: req.workload,
           });
+      releaseCircuit(fallbackPermit, link.deadlineFired() ? 'ignored' : circuitOutcomeFor(err.kind));
       recordAttempt(
         {
           provider: fast.provider,

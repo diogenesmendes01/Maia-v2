@@ -50,6 +50,7 @@ entra por `executeLLM()`. A regra é enforced por `no-restricted-imports`
 | `gateway.ts` | Deadline, cancelamento, retry único, fallback, orquestração |
 | `errors.ts` | Taxonomia de erro por `kind` + `Retry-After` + redaction |
 | `budget.ts` | Quota diária por tenant+agent (`LLM_DAILY_BUDGET_USD`) |
+| `circuit-breaker.ts` | Disjuntor por `(provider, workload)` — issue #534. Ver seção abaixo |
 | `telemetry.ts` | Métrica, custo e evento de uso — em TODO desfecho |
 | `cache-invalidation.ts` | Redis pub/sub: troca de modelo no Admin vale em todas as réplicas |
 
@@ -67,8 +68,8 @@ parâmetro de slug de modelo na API pública — é o que impede um módulo de
 
 Só erro TRANSITÓRIO retenta (`rate_limit`, `provider_5xx`, `network`).
 `authentication`, `permission`, `invalid_request`, `aborted`, `timeout`,
-`response_invalid`, `budget_exhausted` e `missing_tenant_context` são terminais
-de primeira. `Retry-After` do provider vence o backoff local. Cancelamento nunca
+`response_invalid`, `budget_exhausted`, `circuit_open` e
+`missing_tenant_context` são terminais de primeira. `Retry-After` do provider vence o backoff local. Cancelamento nunca
 é tratado como erro retryable. Quando o fallback falha, é o erro DELE que sobe —
 mascarar um 401 do fallback atrás do 5xx do primário esconde a causa e induz
 retry externo.
@@ -83,15 +84,66 @@ retry externo.
 | Erro nunca carrega corpo/mensagem do provider — só `kind`, `status`, `request_id` | `errors.ts` |
 | 200 sem conteúdo utilizável é `response_invalid`, não sucesso | `providers/**` |
 | `workload` é obrigatório; não existe default | `types.ts` + gate em `tests/unit/lib/llm-workload-declaration.spec.ts` |
+| Provider fora do ar deixa de receber carga: disjuntor por `(provider, workload)` recusa antes de resolver modelo e reservar cota | `circuit-breaker.ts` |
 
-**Divergência consciente do critério de aceite da #508:** a issue pede que todo
-caller declare `workload` **e** `tier`. `workload` é obrigatório; `tier` não é.
-O tier continua declarado — uma vez por workload, em `workloads.ts` — porque
-obrigá-lo no call site contraria o objetivo da própria issue ("apenas o backend
-seleciona provider, modelo, tier e política de fallback") e devolve a escolha
-de classe de modelo a quem não tem contexto para fazê-la, que foi como 13
-módulos acabaram com slug fixo no código. O argumento longo está em
-`src/lib/llm/types.ts`, no campo `tier` de `LLMGatewayRequest`.
+### Disjuntor por `(provider, workload)` (issue #534)
+
+Antes dele, uma queda do provider era AMPLIFICADA pelo gateway: cada request
+gastava todas as tentativas do workload mais o fallback contra um provider já
+fora do ar. Medido com `scripts/llm-benchmark.ts` (200 requests, queda total):
+**800 requisições ao provider sem disjuntor, 10 com** — e o erro que o caller vê
+deixa de custar 123ms de p50 para custar ~0.
+
+| Aspecto | Decisão | Por quê |
+|---|---|---|
+| Chave | `(provider, workload)` — **sem tenant** | O estado mede a saúde de uma dependência EXTERNA e compartilhada, não dados de tenant. Escopar por tenant destruiria a amostra (tenant pequeno nunca abriria), faria cada tenant redescobrir a queda queimando as próprias tentativas, e criaria cardinalidade sem teto. A DECISÃO continua atribuível: toda recusa sai em `maia_llm_requests_total{status="circuit_open"}` com `tenant_id + agent_id`. Estado global, evidência escopada |
+| Onde mora | Memória do processo, por réplica | Um disjuntor em Redis colocaria round-trip em toda chamada de LLM e faria o caminho de LLM depender do Redis — a falha correlacionada que o disjuntor existe para sobreviver. Custo: N réplicas sondam N vezes. Reinício zera o disjuntor |
+| O que conta como falha | Só `provider_5xx`, `network`, `timeout` do SDK | Erro de caller (`invalid_request`), de config (`authentication`) ou decisão nossa (`budget_exhausted`) não são evidência sobre o provider — e deixar um caller abrir o disjuntor seria negação de serviço entre tenants. `timeout` por deadline do TURNO é descartado na origem (`link.deadlineFired()`); `rate_limit` fica de fora porque o 429 já traz `Retry-After` |
+| Limiar de abertura | Derivado do orçamento de tentativas: `0.5 ^ (1/tentativas)` | 50% fixo por tentativa está errado quando há retry: com `reasoner` (3 tentativas + fallback), 70% de erro por tentativa ainda entrega ~76% das chamadas. O harness mediu o estrago do limiar fixo — disponibilidade de 161/200 para 9/200. Quem trata brownout é o retry; quem trata queda é o disjuntor |
+| Amostra mínima | 10 tentativas em janela de 30s | Sem piso, duas falhas de madrugada abrem com "100% de erro" sobre amostra 2 |
+| Half-open | Até **3** sondas por janela, fecha na primeira que passar | Uma sonda só deixava preso em aberto um provider parcialmente saudável. Numa queda real o custo é 3 requisições por janela |
+| Cooldown | 5s, dobrando a cada janela de sondas que falha inteira, teto de 60s | O cooldown é o tempo em que ainda recusamos DEPOIS de o provider voltar: medido em 10s, custava ~63 requests a mais numa corrida de 200; com 5s caiu para ~52 e a queda longa continua protegida pelo backoff |
+| Sem env var | Constantes versionadas | Mesma postura de `allow_fast_fallback`: degradação não deve ser toggle de runtime que alguém vira às 3h sem deixar rastro |
+
+Métricas: `maia_llm_circuit_state{provider,workload}` (gauge — `0` closed, `1`
+half_open, `2` open; é a série que o runbook §8 documentava e que **nada
+emitia** até esta issue), `maia_llm_circuit_transitions_total{from,to}` e
+`maia_llm_circuit_short_circuited_total`. Toda transição também sai no log como
+`llm_gateway.circuit_transition` com o motivo.
+
+Recusa é o kind `circuit_open`: não retentável (retentar é o que o disjuntor
+impede), com `retry_after_ms` = cooldown restante, e emitida ANTES de resolver
+modelo ou reservar cota — uma chamada que não vai acontecer não carimba
+orçamento.
+
+### Benchmark (`scripts/llm-benchmark.ts`, issue #534)
+
+`npm run llm:bench` roda carga contra um provider SINTÉTICO injetado por
+`_injectProviderForTests()`, exercitando o gateway inteiro (deadline, retry,
+fallback, disjuntor, telemetria) sem rede e sem custo. Cenários: `healthy`,
+`outage`, `brownout`, `recovery`; `--breaker both` produz a tabela antes/depois.
+
+O que ele mede de verdade: amplificação (requisições ao provider por request de
+entrada), desfechos, latência vista pelo caller, tokens e custo pela mesma
+tabela de preços do ledger. O que ele **não** mede: latência do provider real —
+`--latency-ms` é parâmetro, não observação. Números de p50/p95/p99 contra
+Anthropic/OpenRouter exigem chave, rede e dinheiro, e não saem daqui.
+
+### Decisão fechada: `tier` NÃO é obrigatório no call site (issue #534)
+
+A #508 pedia que todo caller declarasse `workload` **e** `tier`. A #531 tornou
+`workload` obrigatório e deixou a divergência registrada como pendente; a #534
+fechou por decisão do owner: **o call site declara workload; o backend resolve
+tier, provider, modelo e fallback centralmente, e exceções são políticas
+governadas em `workloads.ts`, não overrides livres do caller.**
+
+Obrigar `tier` no call site contraria o objetivo da própria issue ("apenas o
+backend seleciona provider, modelo, tier e política de fallback") e devolve a
+escolha de classe de modelo a quem não tem contexto para fazê-la — foi como 13
+módulos acabaram com slug fixo no código. O tier continua declarado, uma vez por
+workload, versionado e impossível de divergir entre dois call sites. O parâmetro
+segue opcional como escape hatch (hoje só a visão usa). O argumento longo está
+em `src/lib/llm/types.ts`, no campo `tier` de `LLMGatewayRequest`.
 
 **Como fixar provider/modelo ou desligar fallback num incidente:** troque o
 modelo pelo Admin (`/dashboard/llm-settings`) — a mudança propaga para todas as
@@ -113,6 +165,7 @@ propósito — degradação silenciosa de qualidade não deve ser toggle de runt
 | Chamar um LLM de um módulo novo | `executeLLM({ workload, ... })` de `@/lib/llm/index.js`. Declare o **workload**, nunca o modelo. Se o workload é novo, adicione-o em `src/lib/llm/workloads.ts` com tier, tentativas e política de fallback. |
 | Add a new external API | New file in `src/lib/`; document rate limits, retry policy, cost in the file header |
 | Add a new metric | Use `incCounter()` / `observeHistogram()` / `setGauge()` with `tenant_id + agent_id` labels |
+| Medir o efeito de uma mudança no gateway | `npm run llm:bench -- --scenario outage --breaker both`. Rode ANTES e DEPOIS no mesmo processo; a tabela sai em markdown pronta para colar na PR |
 | Add a new currency format | Extend `brazilian.ts` (or new locale file); `decimal.js` for math |
 
 ## Public surface
@@ -132,6 +185,8 @@ propósito — degradação silenciosa de qualidade não deve ser toggle de runt
 | `tests/unit/lib/brazilian.spec.ts` | BR formatting |
 | `tests/unit/lib/business-days.spec.ts` | Business-day arithmetic |
 | `tests/unit/lib/holidays-cache.spec.ts` | Per-tenant cache keys |
+| `tests/unit/lib/llm-gateway.spec.ts` | Contrato do gateway: tier, retry, deadline, fallback, telemetria, redaction |
+| `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor + teste de carga que mede a queda de requisições durante indisponibilidade |
 
 ## In-flight changes
 

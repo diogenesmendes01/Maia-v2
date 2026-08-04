@@ -31,6 +31,7 @@
     "restore:test": "tsx scripts/restore-test.ts",
     "embeddings:rebuild": "tsx scripts/embeddings-rebuild.ts",
     "gen:tool-catalog": "tsx scripts/gen-tool-catalog.ts",
+    "llm:bench": "tsx scripts/llm-benchmark.ts",
     "config:generate": "tsx scripts/config.ts generate",
     "config:check": "tsx scripts/config.ts check",
     "config:check:drift": "tsx scripts/config.ts generate --check",
