@@ -414,6 +414,23 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  LLM_CIRCUIT_MODE: {
+    name: 'LLM_CIRCUIT_MODE',
+    description:
+      'Postura BASE do disjuntor de LLM (issue #534, decisão do owner na revisão): off | shadow | enforce. `shadow` (default) roda a máquina de estados inteira e mede o que faria, sem NUNCA recusar chamada; `enforce` recusa de fato; `off` desliga e não guarda estado. Promover para `enforce` só depois de uma passagem por staging com would_open/would_reject medidos. NÃO é o kill switch: mudar aqui exige restart. A alavanca de incidente, sem restart e sem deploy, é o override por Redis — ver docs/runbooks/operational.md §3.1.',
+    group: 'llm',
+    secret: false,
+    services: ['runtime'],
+    schema: z.enum(['off', 'shadow', 'enforce']).default('shadow'),
+    example: 'shadow',
+    fixture: 'shadow',
+    // Honesto de propósito: `config` é congelado no boot, então trocar esta
+    // variável só vale no próximo start. Marcar `false` aqui venderia como
+    // alavanca quente algo que não é — e é exatamente essa confusão que o
+    // override por Redis existe para não deixar acontecer.
+    restartRequired: true,
+    commentedInExample: true,
+  },
   DECISION_ENGINE_BUDGET_MS: {
     name: 'DECISION_ENGINE_BUDGET_MS',
     description:

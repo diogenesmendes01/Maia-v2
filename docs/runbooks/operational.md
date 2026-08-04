@@ -208,6 +208,146 @@ GROUP BY acao;
 
 ---
 
+## 3.1 Disjuntor de LLM — postura, kill switch e promoção
+
+O disjuntor tem TRÊS posturas. **Em produção o default é `shadow`**: ele observa
+e mede, mas não recusa nada. Promover para `enforce` é uma decisão com número na
+mão, e este é o procedimento.
+
+| Postura | O caller vê | Estado guardado |
+|---|---|---|
+| `off` | nada muda | nenhum |
+| `shadow` (default) | nada muda — **nunca recusa** | sim, e mede |
+| `enforce` | recusa com `circuit_open` | sim |
+
+### Qual é a postura AGORA
+
+```bash
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode
+# maia_llm_circuit_mode{state="off"} 0
+# maia_llm_circuit_mode{state="shadow"} 1     ← esta é a que vale
+# maia_llm_circuit_mode{state="enforce"} 0
+```
+
+Par de séries, exatamente uma valendo `1` — nunca leia por valor numérico. Se
+nenhuma das três aparecer, o processo ainda não fez chamada de LLM alguma (as
+séries são registradas na primeira leitura da postura).
+
+### KILL SWITCH — desligar durante um incidente, sem restart e sem deploy
+
+Use quando **o disjuntor é o incidente**: recusando tráfego que o provider ainda
+serviria, preso em `open` por um falso positivo, ou abrindo em brownout.
+
+```bash
+# 1. Monte o payload. `actor` e `reason` são OBRIGATÓRIOS — um override sem eles
+#    é RECUSADO (e a recusa também é contada). Não há como virar esta chave
+#    anonimamente, de propósito.
+EXP=$(( ($(date +%s) + 1800) * 1000 ))    # 30 min a partir de agora
+PAYLOAD="{\"mode\":\"off\",\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 disjuntor abrindo em brownout\",\"expires_at\":$EXP}"
+
+# 2. Chave durável PRIMEIRO (réplica que subir no meio do incidente adota o
+#    resto do arrendamento), depois o broadcast.
+redis-cli SET  maia:llm:circuit:override "$PAYLOAD" PX 1800000
+redis-cli PUBLISH maia:llm:circuit:override "$PAYLOAD"
+
+# 3. Confirme em TODAS as réplicas.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_mode{state="off"} 1'
+```
+
+**Reverter antes do TTL:**
+
+```bash
+CLEAR="{\"clear\":true,\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 encerrado\"}"
+redis-cli DEL maia:llm:circuit:override
+redis-cli PUBLISH maia:llm:circuit:override "$CLEAR"
+```
+
+**Se o Redis estiver fora**, o override não propaga. Segunda alavanca, com o
+custo honesto de um restart: `LLM_CIRCUIT_MODE=off` no `.env` +
+`docker compose up -d --no-deps app`. É por isso que a variável é declarada
+`restartRequired: true` no contrato — vendê-la como quente seria mentira.
+
+**Restrições que o código impõe** (e por que existem):
+
+- `actor` e `reason` vazios ⇒ recusado. Um kill switch anônimo não é auditável,
+  e a objeção original da #534 a toggles de runtime era exatamente essa.
+- TTL acima de 24h ⇒ recusado, não truncado. Desligar o disjuntor por mais de um
+  dia é decisão de deploy, não de plantão.
+- Sem TTL declarado ⇒ 30 min. Ele **expira sozinho** e volta para a postura do
+  contrato; o retorno também é um evento contado.
+
+### Auditoria — como saber que alguém mexeu
+
+```bash
+# Métrica (é onde o alerta deve morar):
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode_overrides_total
+# maia_llm_circuit_mode_overrides_total{state="off",reason="applied"} 1
+
+# Log estruturado (carrega ator e motivo — texto livre não vai para label):
+journalctl -u maia | grep llm_gateway.circuit_mode_override
+```
+
+`reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted`. Um
+`rejected` no gráfico significa que alguém TENTOU virar a chave e não conseguiu
+— vale investigar tanto quanto um `applied`.
+
+### Promoção `shadow` → `enforce`
+
+Só com os números de sombra em mãos. As duas perguntas, e a PromQL que responde
+cada uma sobre a janela de observação (mínimo sugerido: 7 dias em staging com
+tráfego representativo, incluindo pelo menos um incidente ou um teste de falha
+injetada):
+
+```promql
+# 1. "Quanta carga isso teria cortado?" — recusas simuladas por chamada.
+sum(rate(maia_llm_circuit_would_reject_total[1h])) by (provider, workload)
+#    Compare com o total de chamadas: se der ~0, o disjuntor não teria feito
+#    nada e não há o que promover ainda.
+sum(rate(maia_llm_calls_total[1h])) by (provider, workload)
+
+# 2. "Teria aberto quando não devia?" — aberturas simuladas.
+sum(increase(maia_llm_circuit_would_open_total[24h])) by (provider, workload, reason)
+#    Cruze com a taxa de erro real do MESMO par no MESMO instante. Uma abertura
+#    em cima de uma queda de verdade é o controle funcionando; uma abertura sem
+#    erro correspondente é falso positivo e BLOQUEIA a promoção.
+sum(rate(maia_llm_calls_total{status="error"}[5m])) by (provider, workload)
+```
+
+Critérios de ida (todos, não algum):
+
+1. Pelo menos um incidente real ou injetado dentro da janela, com
+   `would_open` disparando **durante** ele.
+2. Zero `would_open` fora de janela de erro elevado — nenhum falso positivo.
+3. `would_reject` compatível com a duração dos incidentes observados: recusa
+   simulada muito acima disso é sinal de que o cooldown está longo demais.
+4. A atribuição de `would_reject` por `tenant_id` não concentra num tenant só de
+   forma inesperada (o estado é global; a evidência é escopada — se um tenant
+   come 95% das recusas simuladas, entenda por quê antes de ligar).
+
+**Como promover:** `LLM_CIRCUIT_MODE=enforce` no `.env` do ambiente + restart.
+É deploy-time de propósito — promover é decisão versionada, não de plantão.
+
+### Rollback da promoção
+
+| Sintoma | Ação | Custo |
+|---|---|---|
+| `circuit_open` subindo sem queda de provider correspondente | kill switch para `off` (acima) | segundos, sem restart |
+| Quer manter a medição mas parar de recusar | mesmo procedimento, `"mode":"shadow"` | segundos, sem restart |
+| Redis fora, ou o incidente vai durar mais que 24h | `LLM_CIRCUIT_MODE=shadow`/`off` + restart | um restart |
+
+Depois de estabilizar: **deixe o override expirar sozinho e reverta a env var no
+código**. Um kill switch renovado indefinidamente vira configuração escondida —
+que é como um controle morre de vez, sem ninguém perceber.
+
+> **Nota de honestidade.** A #534 defendeu por escrito que política de
+> degradação é código versionado, não toggle de runtime. Esta seção existe
+> porque o owner overruled aquilo, e a razão é boa: o argumento vale para
+> AJUSTAR limiares e não vale para DESLIGAR um controle que virou o incidente.
+> A parte certa da objeção ("sem deixar rastro") foi endereçada — o override é
+> obrigatoriamente identificado, contado, logado e temporário.
+
+---
+
 ## 4. DB connection lost / Postgres down
 
 **Sinal**: `/health/db` em down, log `pg pool error`, queries falhando em massa.
@@ -304,10 +444,31 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 | `maia_llm_circuit_transitions_total{provider,workload,state,reason}` | counter | qualquer transição com `state="open"` |
 | `maia_llm_circuit_short_circuited_total{provider,workload,state}` | counter | rate alto = carga sendo recusada |
 | `maia_llm_requests_total{status="circuit_open"}` | counter | separa carga recusada por nós de erro do provider |
+| `maia_llm_circuit_mode{state}` | gauge | `{state="off"} == 1` por > 1h (kill switch esquecido ligado) |
+| `maia_llm_circuit_mode_overrides_total{state,reason}` | counter | **qualquer** incremento — é o kill switch sendo usado |
+| `maia_llm_circuit_would_open_total{provider,workload,reason}` | counter | em `shadow`: abertura simulada. Cruze com a taxa de erro real antes de promover |
+| `maia_llm_circuit_would_reject_total{provider,workload,state}` | counter | em `shadow`: carga que SERIA recusada. Carrega `tenant_id`/`agent_id` |
 
 O gauge é um **par de séries**, uma por estado, exatamente uma valendo `1` —
 mesmo formato de `maia_lifecycle_state{role,state}`. Alerte em
-`maia_llm_circuit_state{state="open"} == 1`, nunca num valor numérico.
+`maia_llm_circuit_state{state="open"} == 1`, nunca num valor numérico. O mesmo
+vale para `maia_llm_circuit_mode{state}`.
+
+**Leia `maia_llm_circuit_state` junto com `maia_llm_circuit_mode`.** Um disjuntor
+marcando `open` na postura `shadow` **não está recusando nada** — ele está
+medindo. Alertar em `state="open"` sem qualificar a postura produz plantão
+acordado por um incidente que não existe:
+
+```promql
+# "o disjuntor está REALMENTE recusando":
+maia_llm_circuit_state{state="open"} == 1 and on() maia_llm_circuit_mode{state="enforce"} == 1
+```
+
+Em `off` a série de estado vira `NaN` (amostra ausente), nunca `0` — `0` diria
+"fechado e saudável" sobre um disjuntor que não está observando coisa alguma.
+
+`would_open` e `would_reject` só existem em `shadow`; `short_circuited` só em
+`enforce`. Procedimento de promoção e rollback: §3.1.
 
 Ele é registrado pelo próprio disjuntor (`src/lib/llm/circuit-breaker.ts`), sob
 demanda, na primeira vez que um par `(provider, workload)` é exercitado — não há
@@ -498,6 +659,13 @@ limiar, e passa a recusar com erro `circuit_open` — não retentável, carregan
 cancelado não abrem o disjuntor de ninguém. O estado é por réplica e em memória,
 e o restart o zera. Ver `docs/architecture/modules/lib.md` para os limiares e o
 porquê de cada um.
+
+**…mas só se a postura for `enforce`.** `LLM_CIRCUIT_MODE` tem default
+**`shadow`**: por padrão o disjuntor roda a máquina inteira e mede o que faria,
+sem recusar chamada nenhuma. Antes de concluir "o disjuntor recusou", cheque
+`maia_llm_circuit_mode{state}`. Para desligar durante um incidente sem restart e
+sem deploy, ou para promover para `enforce`, o procedimento inteiro está em
+**§3.1**.
 
 > Adicionar `maia_db_connected` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nela, abre uma PR.
 

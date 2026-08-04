@@ -51,8 +51,9 @@ entra por `executeLLM()`. A regra é enforced por `no-restricted-imports`
 | `errors.ts` | Taxonomia de erro por `kind` + `Retry-After` + redaction |
 | `budget.ts` | Quota diária por tenant+agent (`LLM_DAILY_BUDGET_USD`) |
 | `circuit-breaker.ts` | Disjuntor por `(provider, workload)` — issue #534. Ver seção abaixo |
+| `circuit-mode.ts` | Postura do disjuntor (`off`/`shadow`/`enforce`), default `shadow`, + kill switch com TTL e auditoria |
 | `telemetry.ts` | Métrica, custo e evento de uso — em TODO desfecho |
-| `cache-invalidation.ts` | Redis pub/sub: troca de modelo no Admin vale em todas as réplicas |
+| `cache-invalidation.ts` | Redis pub/sub: troca de modelo no Admin **e** postura do disjuntor valem em todas as réplicas |
 
 **O caller declara intenção, não implementação.** Ele passa `workload`; o
 backend decide provider, modelo, tier, deadline, retry e fallback. Não existe
@@ -103,7 +104,7 @@ deixa de custar 123ms de p50 para custar ~0.
 | Amostra mínima | 10 tentativas em janela de 30s | Sem piso, duas falhas de madrugada abrem com "100% de erro" sobre amostra 2 |
 | Half-open | Até **3** sondas por janela, fecha na primeira que passar | Uma sonda só deixava preso em aberto um provider parcialmente saudável. Numa queda real o custo é 3 requisições por janela |
 | Cooldown | 5s, dobrando a cada janela de sondas que falha inteira, teto de 60s | O cooldown é o tempo em que ainda recusamos DEPOIS de o provider voltar: medido em 10s, custava ~63 requests a mais numa corrida de 200; com 5s caiu para ~52 e a queda longa continua protegida pelo backoff |
-| Sem env var | Constantes versionadas | Mesma postura de `allow_fast_fallback`: degradação não deve ser toggle de runtime que alguém vira às 3h sem deixar rastro |
+| Limiares sem env var | Constantes versionadas | Mesma postura de `allow_fast_fallback`: AJUSTAR a política de degradação não deve ser toggle de runtime. DESLIGAR o controle, sim — ver a seção de postura abaixo |
 
 Métricas: `maia_llm_circuit_state{provider,workload,state}` (gauge — **uma série
 por estado**, exatamente uma valendo `1`; é a série que o runbook §8 documentava
@@ -136,18 +137,139 @@ impede), com `retry_after_ms` = cooldown restante, e emitida ANTES de resolver
 modelo ou reservar cota — uma chamada que não vai acontecer não carimba
 orçamento.
 
+### Postura: `off | shadow | enforce` (`circuit-mode.ts`)
+
+Decisão do owner na revisão da #534. **Canário por tenant/agente foi rejeitado
+explicitamente** — o disjuntor protege uma dependência global e compartilhada, e
+fragmentar a decisão por tenant destruiria a amostra que dá sentido ao controle
+(o argumento está na tabela acima, linha "Chave"). Mas rollout global sem
+alavanca também foi rejeitado. A alavanca não é por tenant: é por postura.
+
+| Postura | O que a máquina de estados faz | O que o caller vê |
+|---|---|---|
+| `off` | nada; nenhum estado é guardado e a série `maia_llm_circuit_state` vira `NaN` | nada muda |
+| `shadow` (**default**) | roda INTEIRA e idêntica ao `enforce` | nada muda — nenhuma recusa, nunca |
+| `enforce` | roda | recusa com `circuit_open` |
+
+**O que faz o shadow ser uma simulação e não outro experimento.** Quando a
+sombra deixa passar uma chamada que o `enforce` teria recusado, o DESFECHO dessa
+chamada é descartado: não entra na janela de observação. Um disjuntor que
+estivesse recusando nunca teria tido aquela amostra, e alimentá-la faria a
+trajetória simulada divergir justamente daquilo que ela existe para prever — as
+falhas que continuam chegando durante o `open` manteriam a janela cheia, ou os
+sucessos "curariam" um disjuntor que na vida real estaria cego. A sonda de
+half-open é o caso oposto e por isso NÃO é descartada: ela é concedida nas duas
+posturas, e é o desfecho dela que decide fechar ou reabrir.
+`tests/unit/lib/llm-circuit-mode.spec.ts` compara as duas trajetórias de estado
+sob a mesma sequência de falhas e exige igualdade, inclusive de `cooldown_ms` e
+`failed_windows`.
+
+**Por que a sombra não consegue derrubar uma chamada boa.** Existe UM ponto no
+`circuit-breaker.ts` capaz de devolver `allowed: false` — a função `refuse()` —
+e com `shadow` ela devolve `allowed: true` em todos os caminhos. Não é uma
+promessa espalhada por condicionais: é uma função com uma saída só. As provas
+são três e independentes: exaustiva por estado alcançável, por propriedade
+(20.000 sequências pseudoaleatórias, zero recusas) e ponta a ponta pelo gateway
+real comparando com `off` chamada por chamada.
+
+**Custo no hot path.** Medido por `npm run llm:bench` (200k iterações do par
+`acquireCircuit`/`releaseCircuit`, menor de 5 rodadas): `off` ~100ns, `shadow`
+~770ns, `enforce` ~760ns por tentativa. A comparação que importa é
+`shadow ≈ enforce` — a sombra não custa mais que o controle que ela simula, e
+os ~700ns ficam três ordens de grandeza abaixo dos ~25ms da chamada sintética
+mais barata (e cinco abaixo de uma chamada real de LLM).
+
+Métricas de sombra: `maia_llm_circuit_would_open_total{provider,workload,reason}`
+e `maia_llm_circuit_would_reject_total{provider,workload,state}`. A segunda é
+emitida pelo GATEWAY, uma vez por CHAMADA e dentro do escopo do caller — casa
+1:1 com `maia_llm_requests_total{status="circuit_open"}` e carrega a mesma
+atribuição de `tenant_id + agent_id`. Contá-la dentro do disjuntor inflaria a
+sombra em ~4× num workload com retry e destruiria a comparação, que é a única
+razão de a métrica existir.
+
+### Kill switch (`LLM_CIRCUIT_MODE` + override por Redis)
+
+São **duas alavancas com custos diferentes**, e confundi-las é o erro que faz um
+operador achar que já desligou o controle enquanto ele continua recusando:
+
+| | `LLM_CIRCUIT_MODE` | override por Redis |
+|---|---|---|
+| O que é | postura BASE, versionada | alavanca de INCIDENTE |
+| Como muda | editar env + **restart** | `SET` + `PUBLISH`, sem restart e sem deploy |
+| Quanto dura | até o próximo deploy | TTL explícito, expira sozinha (default 30min, teto 24h) |
+| Se o Redis cair | funciona | não propaga — cai na alavanca da esquerda |
+
+A variável é declarada `restartRequired: true` no contrato porque é a verdade:
+`config` é congelado no boot. O override anda pelo canal
+`maia:llm:circuit:override` **no mesmo subscriber ioredis** do cache de settings
+(`cache-invalidation.ts`) — reusar a conexão evita mexer em `src/index.ts` e na
+sequência de drain, e um socket ioredis esquecido aberto é o bug que travou a
+#512. A postura também mora numa chave durável com TTL, então uma réplica que
+sobe no meio do incidente adota o resto do arrendamento em vez de voltar sozinha
+para a postura do contrato.
+
+O hot path continua **sem tocar em Redis**: o que anda por pub/sub é
+notificação, não consulta. É a mesma razão pela qual o estado do disjuntor não
+mora em Redis.
+
+**A tensão com a #534, registrada e não escondida.** A #534 argumentou por
+escrito que política de degradação é código versionado, não toggle que alguém
+vira às 3h sem deixar rastro. O owner passou por cima disso, e com razão: o
+argumento vale para AJUSTAR a política e não vale para DESLIGAR um controle que
+está causando o incidente em vez de conter. A parte certa da objeção — "sem
+deixar rastro" — foi resolvida, não ignorada:
+
+1. **Override anônimo é RECUSADO.** `actor` e `reason` são obrigatórios e
+   não-vazios. Não existe caminho para virar a chave sem se identificar.
+2. **Todo uso vira contador e log**: `maia_llm_circuit_mode_overrides_total{state,reason}`
+   (`reason` ∈ `applied|expired|cleared|rejected|adopted`) e
+   `llm_gateway.circuit_mode_override` com ator, motivo e validade. Ator e
+   motivo são texto livre: vivem no log, nunca em label.
+3. **A postura efetiva é uma série**: `maia_llm_circuit_mode{state}`, par de
+   séries com exatamente uma valendo 1. Não dá para o controle ficar desligado
+   em silêncio.
+4. **Expira sozinho**, e o retorno para a postura versionada também é contado.
+
+Procedimento de operação, promoção e rollback: `docs/runbooks/operational.md`
+§3.1.
+
 ### Benchmark (`scripts/llm-benchmark.ts`, issue #534)
 
 `npm run llm:bench` roda carga contra um provider SINTÉTICO injetado por
 `_injectProviderForTests()`, exercitando o gateway inteiro (deadline, retry,
 fallback, disjuntor, telemetria) sem rede e sem custo. Cenários: `healthy`,
-`outage`, `brownout`, `recovery`; `--breaker both` produz a tabela antes/depois.
+`outage`, `brownout`, `recovery`. Por default roda os TRÊS braços de postura
+(`--mode all`); `--breaker both` continua valendo como alias legado.
 
 O que ele mede de verdade: amplificação (requisições ao provider por request de
 entrada), desfechos, latência vista pelo caller, tokens e custo pela mesma
 tabela de preços do ledger. O que ele **não** mede: latência do provider real —
 `--latency-ms` é parâmetro, não observação. Números de p50/p95/p99 contra
 Anthropic/OpenRouter exigem chave, rede e dinheiro, e não saem daqui.
+
+**Veredictos, não só tabela.** O harness sai com código 1 quando a sombra deixa
+de ser sombra. Medido em `outage`, 200 requests, concorrência 10, workload
+`reasoner`:
+
+| | `off` | `shadow` | `enforce` |
+|---|---|---|---|
+| requisições ao provider | 800 | **800** | **10** |
+| sucesso / erro | 0 / 200 | 0 / 200 | 0 / 0 |
+| recusado | 0 | **0** | 200 |
+| `would_reject` | 0 | **200** | 0 |
+| `would_open` | 0 | 1 | 0 |
+| estado final | closed | open | open |
+
+Lê-se: a sombra chegou ao MESMO estado final do `enforce` e contou exatamente as
+mesmas 200 recusas que o `enforce` executou, **sem recusar nenhuma** e sem mudar
+uma única requisição ao provider em relação ao `off`. A carga que o `enforce`
+cortaria é 790 requisições (−98,8%).
+
+Só `healthy` e `outage` admitem igualdade byte a byte entre braços: em
+`brownout` a sorte depende de qual requisição pegou qual índice e em `recovery`
+de que lado da fronteira temporal ela caiu — sob concorrência real (e com o
+`Math.random()` do backoff do gateway) isso não se repete. Nesses dois o
+veredicto usa folga de 5% e diz isso na saída. Ver `DETERMINISTIC_SCENARIOS`.
 
 ### Decisão fechada: `tier` NÃO é obrigatório no call site (issue #534)
 
@@ -206,7 +328,9 @@ propósito — degradação silenciosa de qualidade não deve ser toggle de runt
 | `tests/unit/lib/business-days.spec.ts` | Business-day arithmetic |
 | `tests/unit/lib/holidays-cache.spec.ts` | Per-tenant cache keys |
 | `tests/unit/lib/llm-gateway.spec.ts` | Contrato do gateway: tier, retry, deadline, fallback, telemetria, redaction |
-| `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor + teste de carga que mede a queda de requisições durante indisponibilidade |
+| `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor em `enforce` + teste de carga que mede a queda de requisições durante indisponibilidade |
+| `tests/unit/lib/llm-circuit-mode.spec.ts` | Posturas `off`/`shadow`/`enforce`, fidelidade da simulação em sombra, e o kill switch (auditoria, TTL, recusa de override anônimo) |
+| `tests/unit/lib/llm-circuit-override-channel.spec.ts` | Transporte do kill switch: roteamento por canal, ordem `SET` antes de `PUBLISH`, e falha de Redis propagada |
 
 ## In-flight changes
 

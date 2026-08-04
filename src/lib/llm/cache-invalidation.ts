@@ -23,12 +23,40 @@
  * escopo a estreitar. Se as settings virarem per-tenant, este canal vira
  * `maia:llm:settings:invalidate:<tenant>` e o handler passa o escopo para
  * `invalidateModelCache`.
+ *
+ * ## Segundo canal: o kill switch do disjuntor (#534, revisão do owner)
+ *
+ * `maia:llm:circuit:override` carrega a postura do disjuntor
+ * (`circuit-mode.ts`). Ele anda NESTE subscriber, e não num novo, por três
+ * razões práticas:
+ *
+ *  1. A conexão já existe, já é `lazyConnect`, e já é fechada no passo
+ *     `llm_settings_subscriber` da sequência de drain (#512). Um subscriber
+ *     novo exigiria mexer em `src/index.ts` e em `shutdown-sequence.ts` — e um
+ *     socket ioredis esquecido aberto é exatamente o bug que travou a #512.
+ *  2. Os dois canais têm o mesmo público (toda réplica que chama LLM) e a
+ *     mesma janela de vida.
+ *  3. Um pub/sub perde mensagem para quem não estava inscrito na hora, então a
+ *     postura também mora numa CHAVE durável com TTL: quem sobe no meio do
+ *     incidente adota o resto do arrendamento em vez de voltar sozinho para a
+ *     postura do contrato.
+ *
+ * O hot path do disjuntor continua sem tocar em Redis: o que vem por aqui é
+ * notificação, não consulta. Redis fora ⇒ o override não propaga, e o runbook
+ * manda usar a segunda alavanca (`LLM_CIRCUIT_MODE=off` + restart).
  */
 import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
+import {
+  LLM_CIRCUIT_OVERRIDE_CHANNEL,
+  LLM_CIRCUIT_OVERRIDE_KEY,
+  applyCircuitOverride,
+  handleCircuitOverrideMessage,
+} from './circuit-mode.js';
+import type { CircuitOverrideMessage } from './circuit-mode.js';
 import { invalidateModelCache } from './model-resolver.js';
 
 export const LLM_SETTINGS_INVALIDATION_CHANNEL = 'maia:llm:settings:invalidate';
@@ -55,10 +83,59 @@ export async function publishLLMSettingsInvalidation(): Promise<void> {
 }
 
 /**
+ * Publica a postura do disjuntor para TODA a frota — o kill switch da #534.
+ *
+ * Escreve a chave durável ANTES de publicar, e nessa ordem de propósito: uma
+ * réplica que sobe entre o `PUBLISH` e o `SET` perderia a mensagem e não
+ * acharia a chave. Invertendo, a pior janela é uma réplica adotar a postura um
+ * instante antes das outras — que é a direção segura.
+ *
+ * Falha de Redis é propagada (diferente da invalidação de settings, que é
+ * best-effort): quem virou o kill switch precisa saber que ele NÃO virou. Um
+ * "ok" mentiroso durante incidente é pior que um erro.
+ */
+export async function publishCircuitOverride(msg: CircuitOverrideMessage): Promise<void> {
+  const payload = JSON.stringify(msg);
+  const ttl =
+    typeof msg.expires_at === 'number' ? Math.max(1, msg.expires_at - Date.now()) : undefined;
+  if (msg.clear === true) await redis.del(LLM_CIRCUIT_OVERRIDE_KEY);
+  else if (ttl !== undefined) await redis.set(LLM_CIRCUIT_OVERRIDE_KEY, payload, 'PX', ttl);
+  else await redis.set(LLM_CIRCUIT_OVERRIDE_KEY, payload);
+  await redis.publish(LLM_CIRCUIT_OVERRIDE_CHANNEL, payload);
+}
+
+/**
+ * Adota um override que já estava em vigor quando esta réplica subiu.
+ *
+ * Sem isto, um deploy ou um scale-out no meio do incidente traria réplicas
+ * novas com o disjuntor de volta na postura do contrato — metade da frota
+ * recusando e metade não, que é o pior dos dois mundos. Best-effort: sem Redis,
+ * a réplica simplesmente fica na postura versionada.
+ */
+async function adoptPersistedOverride(): Promise<void> {
+  try {
+    const raw = await redis.get(LLM_CIRCUIT_OVERRIDE_KEY);
+    if (!raw) return;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return;
+    applyCircuitOverride(parsed as CircuitOverrideMessage, Date.now(), 'adopted');
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message, key: LLM_CIRCUIT_OVERRIDE_KEY },
+      'llm_gateway.circuit_override_adopt_failed',
+    );
+  }
+}
+
+/**
  * Aplica a invalidação local. Exportado separado do wiring de Redis para que o
  * teste possa exercer o handler sem subir um subscriber.
  */
-export function handleLLMSettingsInvalidation(channel: string): void {
+export function handleLLMSettingsInvalidation(channel: string, payload = ''): void {
+  if (channel === LLM_CIRCUIT_OVERRIDE_CHANNEL) {
+    handleCircuitOverrideMessage(payload);
+    return;
+  }
   if (channel !== LLM_SETTINGS_INVALIDATION_CHANNEL) return;
   invalidateModelCache();
   logger.info(
@@ -87,22 +164,29 @@ export function startLLMSettingsInvalidationSubscriber(): void {
       'llm_gateway.settings_subscribe_connect_failed',
     );
   });
-  sub.on('message', (channel) => handleLLMSettingsInvalidation(channel));
-  void sub.subscribe(LLM_SETTINGS_INVALIDATION_CHANNEL, (err) => {
+  sub.on('message', (channel, payload) => handleLLMSettingsInvalidation(channel, payload));
+  void sub.subscribe(LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL, (err) => {
     if (err) {
       // Degradação documentada: sem subscribe, cada réplica ainda converge
-      // pelo TTL curto do cache.
+      // pelo TTL curto do cache — e o kill switch do disjuntor cai na segunda
+      // alavanca (`LLM_CIRCUIT_MODE=off` + restart), como o runbook manda.
       logger.warn(
-        { err: err.message, channel: LLM_SETTINGS_INVALIDATION_CHANNEL },
+        {
+          err: err.message,
+          channels: [LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL],
+        },
         'llm_gateway.settings_subscribe_failed_natural_ttl_only',
       );
       return;
     }
     logger.info(
-      { channel: LLM_SETTINGS_INVALIDATION_CHANNEL },
+      { channels: [LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL] },
       'llm_gateway.settings_invalidation_subscriber_started',
     );
   });
+  // Depois do subscribe, nunca antes: assim não há janela em que um override
+  // publicado logo após o `GET` passe despercebido.
+  void adoptPersistedOverride();
 }
 
 /**

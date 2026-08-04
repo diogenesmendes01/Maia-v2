@@ -353,6 +353,67 @@ groups:
           description: |
             Runbook: docs/runbooks/observability-slo.md §4.9
 
+      # --- disjuntor de LLM: postura + sombra (#534, revisão do owner) -------
+      #
+      # Três alertas com propósitos DIFERENTES. Não colapse em um só:
+      #
+      #  1. o disjuntor está recusando DE VERDADE (só em `enforce`);
+      #  2. alguém mexeu no kill switch;
+      #  3. o kill switch ficou ligado e ninguém lembrou.
+      #
+      # O `and on() maia_llm_circuit_mode{state="enforce"} == 1` do primeiro é
+      # o detalhe que evita acordar plantão à toa: `maia_llm_circuit_state`
+      # marca `open` também em `shadow`, onde nada está sendo recusado. Alertar
+      # em `state="open"` sem qualificar a postura é confundir medição com
+      # incidente.
+      - alert: MaiaLlmCircuitOpenEnforcing
+        expr: |
+          (maia_llm_circuit_state{state="open"} == 1)
+          and on() (maia_llm_circuit_mode{state="enforce"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM ABERTO e recusando ({{ $labels.provider }}/{{ $labels.workload }})"
+          description: |
+            Chamadas estão sendo recusadas com `circuit_open`. Confirme que é o
+            provider (e não o disjuntor) antes de usar o kill switch.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # `increase(...) > 0` de propósito: QUALQUER uso da alavanca precisa
+      # aparecer. `reason="rejected"` também dispara — alguém tentando virar a
+      # chave sem conseguir é tão digno de investigação quanto alguém virando.
+      - alert: MaiaLlmCircuitModeOverridden
+        expr: increase(maia_llm_circuit_mode_overrides_total{reason=~"applied|cleared|rejected"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Kill switch do disjuntor de LLM acionado ({{ $labels.reason }} → {{ $labels.state }})"
+          description: |
+            Ator e motivo estão no log `llm_gateway.circuit_mode_override` —
+            não em label, porque são texto livre.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # O override expira sozinho (teto de 24h), então `off` por mais de uma
+      # hora é ou um incidente longo ou — o caso perigoso — alguém renovando a
+      # alavanca até ela virar configuração escondida. É assim que um controle
+      # de degradação morre sem ninguém perceber.
+      - alert: MaiaLlmCircuitDisabledTooLong
+        expr: maia_llm_circuit_mode{state="off"} == 1
+        for: 1h
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM desligado há mais de 1h"
+          description: |
+            Volte para `shadow` ou `enforce`, ou registre a decisão de manter
+            desligado. Kill switch não é postura.
+            Runbook: docs/runbooks/operational.md §3.1
+
       - alert: MaiaWhatsAppDisconnected
         expr: maia_baileys_connected == 0
         for: 5m

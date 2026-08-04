@@ -217,6 +217,45 @@ export const METRIC = {
   LLM_CIRCUIT_TRANSITIONS: 'maia_llm_circuit_transitions_total',
   /** Calls refused by an open/half-open breaker, i.e. load actually shed. */
   LLM_CIRCUIT_SHORT_CIRCUITED: 'maia_llm_circuit_short_circuited_total',
+  /**
+   * Effective breaker POSTURE, `state` ∈ off|shadow|enforce (issue #534,
+   * owner review). Same pair-of-series shape as `LLM_CIRCUIT_STATE`: exactly
+   * one is 1. `mode` is not on `ALLOWED_LABEL_KEYS` and a new key there is a
+   * separate governance decision, so the posture rides the `state` key — the
+   * two are told apart by the metric name, never by a label.
+   *
+   * This is the series that answers "is the control actually enforcing right
+   * now?", which is not answerable from `LLM_CIRCUIT_STATE` alone: a breaker
+   * reading `open` in shadow mode is refusing nothing.
+   */
+  LLM_CIRCUIT_MODE: 'maia_llm_circuit_mode',
+  /**
+   * SHADOW-ONLY twin of the `open` transition: the breaker entered `open`
+   * while refusing nothing. `reason` matches `LLM_CIRCUIT_TRANSITIONS`.
+   *
+   * Exists because `LLM_CIRCUIT_TRANSITIONS{state="open"}` fires identically
+   * in shadow and enforce, so across a mixed fleet it cannot answer "would it
+   * have opened when it shouldn't?" — which is the whole question a staging
+   * pass has to answer before promotion.
+   */
+  LLM_CIRCUIT_WOULD_OPEN: 'maia_llm_circuit_would_open_total',
+  /**
+   * SHADOW-ONLY twin of `LLM_CALLS{status="circuit_open"}`: one increment per
+   * CALL that an enforcing breaker would have refused and shadow let through.
+   * `state` is the breaker state that would have produced the refusal.
+   *
+   * Tenant-attributed like the real refusal counter (emitted from inside the
+   * caller's ALS scope) — the breaker's STATE is deliberately global, but
+   * every refusal, real or simulated, stays attributable to who ate it.
+   */
+  LLM_CIRCUIT_WOULD_REJECT: 'maia_llm_circuit_would_reject_total',
+  /**
+   * Kill-switch usage. `state` is the posture that was forced, `reason` ∈
+   * applied|expired|cleared|rejected|adopted. A lever that can be pulled
+   * without a deploy MUST leave a trace that alerting can see; the matching
+   * `llm_gateway.circuit_mode_override` log line carries actor and reason.
+   */
+  LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 
   // --- tools ---------------------------------------------------------------
   TOOL_DISPATCH: 'maia_tool_dispatch_total',

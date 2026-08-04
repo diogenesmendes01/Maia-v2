@@ -497,6 +497,26 @@
         "0"
       ]
     },
+    "LLM_CIRCUIT_MODE": {
+      "type": "string",
+      "description": "Postura BASE do disjuntor de LLM (issue #534, decisão do owner na revisão): off | shadow | enforce. `shadow` (default) roda a máquina de estados inteira e mede o que faria, sem NUNCA recusar chamada; `enforce` recusa de fato; `off` desliga e não guarda estado. Promover para `enforce` só depois de uma passagem por staging com would_open/would_reject medidos. NÃO é o kill switch: mudar aqui exige restart. A alavanca de incidente, sem restart e sem deploy, é o override por Redis — ver docs/runbooks/operational.md §3.1.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "off",
+        "shadow",
+        "enforce"
+      ],
+      "default": "shadow",
+      "examples": [
+        "shadow"
+      ]
+    },
     "DECISION_ENGINE_BUDGET_MS": {
       "type": "string",
       "description": "Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification.",

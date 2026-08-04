@@ -14,6 +14,18 @@
  *     queima todas as tentativas do workload MAIS o fallback contra um
  *     provider que já está fora — a mesma carga que derrubou o provider é
  *     multiplicada pelo nosso próprio retry.
+ *
+ * ## Por que todo `beforeEach` fixa `enforce`
+ *
+ * O default do contrato passou a ser `shadow` (revisão do owner da #534): em
+ * produção o disjuntor OBSERVA e não recusa até alguém promover. Este arquivo
+ * inteiro descreve o comportamento do `enforce`, então fixa a postura de
+ * propósito, uma vez por caso. As posturas `shadow` e `off`, a fidelidade da
+ * simulação e o kill switch vivem em `llm-circuit-mode.spec.ts`.
+ *
+ * Fixar aqui não é contornar o default — é o contrário: se um dia alguém
+ * inverter o default de volta para `enforce` sem querer, este arquivo continua
+ * verde e o outro pega, que é onde a asserção sobre o default mora.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -116,6 +128,7 @@ function feed(key: CircuitKey, outcome: 'ok' | 'fault' | 'ignored', n: number, a
 
 beforeEach(() => {
   _internal.reset();
+  _internal.setMode('enforce');
   incCounterMock.mockClear();
   setGaugeProviderMock.mockClear();
 });
@@ -491,6 +504,7 @@ async function storm(n: number, request: LLMGatewayRequest): Promise<number> {
 describe('teste de carga — o disjuntor reduz a carga durante indisponibilidade', () => {
   beforeEach(() => {
     _internal.reset();
+    _internal.setMode('enforce');
     anthropicCreateMock.mockReset();
     recordCostMock.mockClear();
     incCounterMock.mockClear();
@@ -517,8 +531,8 @@ describe('teste de carga — o disjuntor reduz a carga durante indisponibilidade
     expect(circuitState({ provider: 'anthropic', workload: 'role_selector' })).toBe('open');
   });
 
-  it('controle: com o disjuntor desligado, TODAS as 60 requests batem no provider', async () => {
-    _internal.setEnabled(false);
+  it('controle: com a postura `off`, TODAS as 60 requests batem no provider', async () => {
+    _internal.setMode('off');
     anthropicCreateMock.mockRejectedValue(outage());
 
     const refused = await storm(REQUESTS, req());
@@ -533,7 +547,7 @@ describe('teste de carga — o disjuntor reduz a carga durante indisponibilidade
    * gateway JOGA em cima de um provider já fora é 3× o tráfego de entrada.
    */
   it('workload com retry + fallback: a amplificação de 3× desaparece', async () => {
-    _internal.setEnabled(false);
+    _internal.setMode('off');
     anthropicCreateMock.mockRejectedValue(outage());
     await storm(20, req({ workload: 'reasoner' }));
     const withoutBreaker = anthropicCreateMock.mock.calls.length;
@@ -541,6 +555,7 @@ describe('teste de carga — o disjuntor reduz a carga durante indisponibilidade
     expect(withoutBreaker).toBe(60);
 
     _internal.reset();
+    _internal.setMode('enforce');
     anthropicCreateMock.mockClear();
     await storm(20, req({ workload: 'reasoner' }));
     const withBreaker = anthropicCreateMock.mock.calls.length;

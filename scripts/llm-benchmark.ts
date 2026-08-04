@@ -24,14 +24,36 @@
  *    ou o OpenRouter exigem chave, rede e dinheiro, e não saem daqui.
  *
  * Quem for citar um número deste harness, cite junto o que ele é: comparação
- * A/B do MESMO gateway com o disjuntor ligado e desligado, sob a mesma carga
+ * A/B do MESMO gateway em posturas diferentes do disjuntor, sob a mesma carga
  * sintética, no mesmo processo.
+ *
+ * ## O que a postura `shadow` acrescentou aqui (revisão do owner da #534)
+ *
+ * O harness passou a rodar TRÊS braços em vez de dois, e a comparação que
+ * importa não é mais só "off × enforce". É:
+ *
+ *  - **`off` × `shadow`** — a prova de que a sombra não muda NADA do que o
+ *    caller vê. A sorte de cada requisição é função pura do índice dela (ver
+ *    `hashUnit`), então `sucesso`, `erro do provider` e `requisições ao
+ *    provider` têm que bater EXATAMENTE nos cenários determinísticos. Qualquer
+ *    divergência aí é o bug imperdoável do shadow (transformar chamada boa em
+ *    erro), e o harness sai com código 1 em vez de imprimir a tabela e seguir.
+ *  - **`shadow.would_reject` × `enforce.recusado`** — a prova de que a sombra
+ *    MEDE o que ela promete: o que ela contou como "eu teria recusado" tem que
+ *    ser da mesma ordem do que o enforce recusou de verdade.
+ *  - **carga que seria cortada** — `off.requisições − enforce.requisições`, que
+ *    é a resposta numérica a "quanto isso teria aliviado o provider".
+ *
+ * E a seção `custo por chamada no hot path`, que mede direto o par
+ * `acquireCircuit`/`releaseCircuit` em ns/op nas três posturas — o requisito de
+ * "em shadow o disjuntor custa aproximadamente nada" vira número, não promessa.
  *
  * ## Uso
  *
  *   npm run llm:bench
  *   npm run llm:bench -- --scenario outage --requests 300 --concurrency 20
  *   npm run llm:bench -- --scenario recovery --json
+ *   npm run llm:bench -- --mode shadow            # um braço só
  *
  * | Flag | Default | O que faz |
  * |---|---|---|
@@ -44,7 +66,9 @@
  * | `--outage-ms` | `12000` | Duração da queda no cenário `recovery` |
  * | `--tenants` | `3` | Tenants distintos girando na carga |
  * | `--think-ms` | `0` | Pausa entre requests do mesmo worker. Necessário no cenário `recovery`: sem espaçar a carga, os 200 requests terminam antes de a queda acabar e a sonda nunca chega a rodar |
- * | `--breaker` | `both` | `on` · `off` · `both` (both = a tabela antes/depois) |
+ * | `--mode` | `all` | `off` · `shadow` · `enforce` · `all` |
+ * | `--breaker` | — | Alias legado: `off`→`off`, `on`→`enforce`, `both`→`off,enforce` |
+ * | `--micro-iterations` | `200000` | Iterações do micro-benchmark de hot path |
  * | `--json` | — | Saída em JSON em vez da tabela markdown |
  */
 
@@ -77,13 +101,20 @@ for (const [k, v] of Object.entries(ENV_DEFAULTS)) process.env[k] ??= v;
 
 const { executeLLM } = await import('@/lib/llm/gateway.js');
 const { _injectProviderForTests } = await import('@/lib/llm/providers/index.js');
-const { _internal: circuitInternal, circuitState } = await import('@/lib/llm/circuit-breaker.js');
+const {
+  _internal: circuitInternal,
+  acquireCircuit,
+  circuitState,
+  releaseCircuit,
+} = await import('@/lib/llm/circuit-breaker.js');
 const { runWithTenantContext } = await import('@/db/tenant-context.js');
 const { estimateLLMCostUsd } = await import('@/lib/cost-ledger.js');
+const { renderPrometheus, _resetForTests: resetMetrics } = await import('@/lib/metrics.js');
 type LLMWorkload = import('@/lib/llm/types.js').LLMWorkload;
 type LLMProvider = import('@/lib/llm/types.js').LLMProvider;
 type LLMTier = import('@/lib/llm/types.js').LLMTier;
 type LLMResponse = import('@/lib/llm/types.js').LLMResponse;
+type CircuitMode = import('@/lib/llm/circuit-mode.js').CircuitMode;
 
 type Scenario = 'healthy' | 'outage' | 'brownout' | 'recovery';
 
@@ -97,9 +128,37 @@ type Options = {
   outage_ms: number;
   tenants: number;
   think_ms: number;
-  breaker: 'on' | 'off' | 'both';
+  modes: CircuitMode[];
+  micro_iterations: number;
   json: boolean;
 };
+
+const ALL_MODES: CircuitMode[] = ['off', 'shadow', 'enforce'];
+
+/**
+ * `--mode`, com o `--breaker` da #534 preservado como alias.
+ *
+ * O alias não é cortesia: `--breaker both` está citado em `lib.md` e no runbook,
+ * e um harness que quebra a linha de comando documentada obriga quem for
+ * reproduzir o número antigo a arqueologia de git.
+ */
+function parseModes(mode: string | undefined, breaker: string | undefined): CircuitMode[] {
+  if (mode !== undefined) {
+    if (mode === 'all') return [...ALL_MODES];
+    const parts = mode.split(',').map((m) => m.trim());
+    for (const p of parts) {
+      if (!ALL_MODES.includes(p as CircuitMode)) {
+        throw new Error(`--mode inválido: ${p} (esperado ${ALL_MODES.join(' | ')} | all)`);
+      }
+    }
+    return parts as CircuitMode[];
+  }
+  if (breaker === 'on') return ['enforce'];
+  if (breaker === 'off') return ['off'];
+  if (breaker === 'both') return ['off', 'enforce'];
+  if (breaker !== undefined) throw new Error(`--breaker inválido: ${breaker}`);
+  return [...ALL_MODES];
+}
 
 function parseArgs(argv: string[]): Options {
   const get = (name: string): string | undefined => {
@@ -123,9 +182,31 @@ function parseArgs(argv: string[]): Options {
     outage_ms: num('outage-ms', 12_000),
     tenants: num('tenants', 3),
     think_ms: num('think-ms', 0),
-    breaker: (get('breaker') ?? 'both') as 'on' | 'off' | 'both',
+    modes: parseModes(get('mode'), get('breaker')),
+    micro_iterations: num('micro-iterations', 200_000),
     json: argv.includes('--json'),
   };
+}
+
+/**
+ * Soma TODAS as séries de um contador, lendo a exposição Prometheus de verdade.
+ *
+ * Ler a métrica renderizada em vez de um contador próprio do harness é
+ * deliberado: prova, de quebra, que a métrica está sendo emitida e passou pelo
+ * gate de label da #514. Um número que o harness calculasse sozinho não provaria
+ * nada sobre o que o operador vai ver no Grafana.
+ */
+async function counterTotal(metric: string): Promise<number> {
+  const text = await renderPrometheus();
+  let total = 0;
+  for (const line of text.split('\n')) {
+    if (!line.startsWith(metric)) continue;
+    const rest = line.slice(metric.length);
+    if (rest !== '' && !rest.startsWith('{') && !rest.startsWith(' ')) continue;
+    const value = Number(line.slice(line.lastIndexOf(' ') + 1));
+    if (Number.isFinite(value)) total += value;
+  }
+  return total;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -162,10 +243,7 @@ class SyntheticProvider implements LLMProvider {
   tokens_output = 0;
   private started_at = Date.now();
 
-  constructor(
-    private readonly opts: Options,
-    private readonly rng: () => number,
-  ) {}
+  constructor(private readonly opts: Options) {}
 
   isConfigured(): boolean {
     return true;
@@ -179,24 +257,24 @@ class SyntheticProvider implements LLMProvider {
     return tier === 'main' ? 'claude-sonnet-4-6' : 'claude-haiku-4-5-20251001';
   }
 
-  private failing(): boolean {
+  private failing(index: number): boolean {
     switch (this.opts.scenario) {
       case 'healthy':
         return false;
       case 'outage':
         return true;
       case 'brownout':
-        return this.rng() < this.opts.failure_rate;
+        return hashUnit(index, 0x5eed) < this.opts.failure_rate;
       case 'recovery':
         return Date.now() - this.started_at < this.opts.outage_ms;
     }
   }
 
   async call(params: { model: string }): Promise<LLMResponse> {
-    this.calls++;
+    const index = this.calls++;
     // Jitter de ±20% para que os percentis não sejam um único valor.
-    await sleep(Math.round(this.opts.latency_ms * (0.8 + this.rng() * 0.4)));
-    if (this.failing()) throw providerOutage();
+    await sleep(Math.round(this.opts.latency_ms * (0.8 + hashUnit(index, 0xbeef) * 0.4)));
+    if (this.failing(index)) throw providerOutage();
     const usage = { input_tokens: 900, output_tokens: 180 };
     this.tokens_input += usage.input_tokens;
     this.tokens_output += usage.output_tokens;
@@ -210,13 +288,22 @@ class SyntheticProvider implements LLMProvider {
   }
 }
 
-/** PRNG com semente: duas execuções do harness comparam a mesma carga. */
-function seededRng(seed: number): () => number {
-  let s = seed >>> 0;
-  return () => {
-    s = (s * 1_664_525 + 1_013_904_223) >>> 0;
-    return s / 0x1_0000_0000;
-  };
+/**
+ * Ruído determinístico em `[0,1)`, função pura do ÍNDICE da requisição.
+ *
+ * Um PRNG com estado mutável não serve aqui, e o `recovery` mostrou por quê: a
+ * ordem em que os workers concorrentes consomem os sorteios muda entre braços,
+ * então o mesmo índice de requisição pegava sorteios diferentes e os braços
+ * deixavam de ser comparáveis. Indexando o ruído, a n-ésima requisição do braço
+ * `off` e a n-ésima do braço `shadow` recebem exatamente a mesma sorte — que é
+ * o que faz a igualdade de desfechos ser uma AFIRMAÇÃO sobre a sombra, e não
+ * sobre o escalonador.
+ */
+function hashUnit(index: number, salt: number): number {
+  let h = (index ^ salt) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 0x1_0000_0000;
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -226,7 +313,7 @@ function percentile(sorted: number[], p: number): number {
 }
 
 type ArmResult = {
-  breaker: 'on' | 'off';
+  mode: CircuitMode;
   requests: number;
   ok: number;
   refused: number;
@@ -242,13 +329,21 @@ type ArmResult = {
   cost_usd: number;
   final_state: string;
   refused_by_tenant: Record<string, number>;
+  /** `maia_llm_circuit_would_reject_total` — só existe em `shadow`. */
+  would_reject: number;
+  /** `maia_llm_circuit_would_open_total` — só existe em `shadow`. */
+  would_open: number;
+  /** `maia_llm_circuit_short_circuited_total` — só existe em `enforce`. */
+  short_circuited: number;
 };
 
-async function runArm(opts: Options, breaker: 'on' | 'off'): Promise<ArmResult> {
+async function runArm(opts: Options, mode: CircuitMode): Promise<ArmResult> {
   circuitInternal.reset();
-  circuitInternal.setEnabled(breaker === 'on');
+  circuitInternal.setMode(mode);
+  // Contadores zerados por braço: os totais lidos abaixo são DESTE braço.
+  resetMetrics();
 
-  const provider = new SyntheticProvider(opts, seededRng(42));
+  const provider = new SyntheticProvider(opts);
   _injectProviderForTests('anthropic', provider);
 
   const latencies: number[] = [];
@@ -300,7 +395,7 @@ async function runArm(opts: Options, breaker: 'on' | 'off'): Promise<ArmResult> 
   });
 
   return {
-    breaker,
+    mode,
     requests: opts.requests,
     ok,
     refused,
@@ -316,16 +411,169 @@ async function runArm(opts: Options, breaker: 'on' | 'off'): Promise<ArmResult> 
     cost_usd: cost,
     final_state: circuitState({ provider: 'anthropic', workload: opts.workload }),
     refused_by_tenant: refusedByTenant,
+    would_reject: await counterTotal('maia_llm_circuit_would_reject_total'),
+    would_open: await counterTotal('maia_llm_circuit_would_open_total'),
+    short_circuited: await counterTotal('maia_llm_circuit_short_circuited_total'),
   };
+}
+
+type MicroResult = { mode: CircuitMode; ns_per_call: number };
+
+/**
+ * Custo do disjuntor no hot path, isolado do resto do gateway.
+ *
+ * A tabela de carga NÃO consegue responder isto: com 25ms de latência sintética
+ * por requisição, a diferença entre as posturas some no ruído. Aqui roda-se só
+ * o par `acquireCircuit`/`releaseCircuit` — que é literalmente tudo o que o
+ * disjuntor acrescenta a uma chamada — contra um disjuntor FECHADO, que é o
+ * estado em que ele passa 99,9% do tempo.
+ */
+function runMicro(opts: Options, mode: CircuitMode): MicroResult {
+  const key = { provider: 'anthropic', workload: opts.workload };
+  const round = (): number => {
+    circuitInternal.reset();
+    circuitInternal.setMode(mode);
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < opts.micro_iterations; i++) {
+      releaseCircuit(acquireCircuit(key), 'ok');
+    }
+    return Number(process.hrtime.bigint() - t0) / opts.micro_iterations;
+  };
+
+  // Aquecimento: o JIT precisa ver o caminho antes de a gente cronometrar.
+  round();
+  // MENOR de cinco rodadas, não a média: GC e escalonador só sabem somar tempo,
+  // então o mínimo é a estimativa menos poluída do custo real. Sem isto, a
+  // mesma postura variava ~15% entre execuções e o número não servia para
+  // comparar nada.
+  let best = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < 5; i++) best = Math.min(best, round());
+  circuitInternal.reset();
+  return { mode, ns_per_call: best };
+}
+
+/**
+ * Os veredictos que fazem deste harness uma PROVA e não um relatório.
+ *
+ * `passed: false` derruba o processo com exit code 1 — um harness que imprime
+ * "shadow perdeu 3 chamadas" numa tabela bonita e sai com 0 não serve para
+ * nada, porque é exatamente esse número que ninguém lê.
+ */
+type Verdict = { label: string; passed: boolean; detail: string };
+
+/**
+ * Onde a igualdade byte a byte entre braços é exigível — e por que não é em
+ * todo lugar.
+ *
+ * Em `healthy` e `outage` o veredicto do provider é o mesmo para TODA
+ * requisição, então não importa qual worker pegou qual índice: os braços são
+ * comparáveis exatamente. Nos outros dois a sorte depende de qual requisição
+ * recebeu qual índice (`brownout`) ou de que lado da fronteira da queda ela
+ * caiu (`recovery`), e sob concorrência real isso não se repete — o backoff do
+ * gateway usa `Math.random()` e o event loop não promete ordem. Exigir
+ * igualdade ali seria exigir que a sombra consertasse o escalonador; a folga
+ * abaixo é a medida honesta.
+ *
+ * Consequência prática: quem quiser a prova FORTE de que a sombra não muda
+ * desfecho, rode `--scenario outage` (é o default) — que também é o cenário em
+ * que a sombra tem mais chance de errar, porque é onde ela fica aberta o tempo
+ * todo.
+ */
+const DETERMINISTIC_SCENARIOS: readonly Scenario[] = ['healthy', 'outage'];
+
+function verdicts(opts: Options, arms: ArmResult[]): Verdict[] {
+  const by = (m: CircuitMode): ArmResult | undefined => arms.find((a) => a.mode === m);
+  const off = by('off');
+  const shadow = by('shadow');
+  const enforce = by('enforce');
+  const out: Verdict[] = [];
+
+  if (off && shadow) {
+    const deterministic = DETERMINISTIC_SCENARIOS.includes(opts.scenario);
+    // O requisito imperdoável: mesma carga, mesma sorte, mesmos desfechos.
+    const exact =
+      off.ok === shadow.ok &&
+      off.failed === shadow.failed &&
+      off.provider_calls === shadow.provider_calls;
+    // Fora dos determinísticos, 5% de folga sobre a grandeza medida — a
+    // divergência de requisições ao provider é a de CHAMADAS multiplicada pelo
+    // orçamento de tentativas, então ela precisa da própria escala.
+    const outTol = Math.max(2, Math.ceil(off.requests * 0.05));
+    const callTol = Math.max(2, Math.ceil(off.provider_calls * 0.05));
+    const close =
+      Math.abs(off.ok - shadow.ok) <= outTol &&
+      Math.abs(off.failed - shadow.failed) <= outTol &&
+      Math.abs(off.provider_calls - shadow.provider_calls) <= callTol;
+    out.push({
+      label: deterministic
+        ? 'shadow não altera NENHUM desfecho visível ao caller (vs `off`)'
+        : `shadow não altera desfecho além do ruído do cenário (±${outTol} chamadas, ±${callTol} requisições)`,
+      passed: off.refused === 0 && shadow.refused === 0 && (deterministic ? exact : close),
+      detail:
+        `sucesso ${off.ok}→${shadow.ok} · erro ${off.failed}→${shadow.failed} · ` +
+        `recusado ${off.refused}→${shadow.refused} · ` +
+        `requisições ao provider ${off.provider_calls}→${shadow.provider_calls}` +
+        (deterministic
+          ? ''
+          : ' — cenário não reproduzível chamada a chamada, ver DETERMINISTIC_SCENARIOS'),
+    });
+  }
+
+  if (shadow) {
+    out.push({
+      label: 'shadow nunca recusa',
+      passed: shadow.refused === 0 && shadow.short_circuited === 0,
+      detail: `recusas=${shadow.refused} · short_circuited=${shadow.short_circuited}`,
+    });
+  }
+
+  if (shadow && enforce) {
+    // Fidelidade: a sombra tem que chegar ao MESMO estado final, e o que ela
+    // contou como "eu teria recusado" tem que ser da ordem do que o enforce
+    // recusou. Não exigimos igualdade exata: o enforce recusa em ~0ms e por
+    // isso escoa a fila mais rápido, então a carga que chega no mesmo relógio
+    // não é idêntica. Exigir igualdade aqui seria exigir que a sombra mentisse.
+    const ratio = enforce.refused === 0 ? 1 : shadow.would_reject / enforce.refused;
+    out.push({
+      label: 'shadow MEDE o que o enforce faria (would_reject ≈ recusas reais)',
+      passed: enforce.refused === 0 ? shadow.would_reject === 0 : ratio >= 0.5 && ratio <= 1.5,
+      detail:
+        `would_reject=${shadow.would_reject} · recusas em enforce=${enforce.refused} · ` +
+        `razão=${ratio.toFixed(2)} · estado final ${shadow.final_state}/${enforce.final_state}`,
+    });
+  }
+
+  if (off && enforce) {
+    const shed = off.provider_calls - enforce.provider_calls;
+    // Este veredicto é a MEDIDA que a issue pede ("quanta carga isso teria
+    // shed"), não um limiar de qualidade: num brownout o disjuntor não abre de
+    // propósito e o corte é ~0, com o sinal indo para qualquer lado dentro do
+    // ruído. O que ele reprova é o disjuntor ADICIONANDO carga, que seria bug.
+    const tol = Math.max(2, Math.ceil(off.provider_calls * 0.05));
+    out.push({
+      label: 'carga que o enforce corta do provider',
+      passed: shed >= -tol,
+      detail:
+        `${shed} requisições (${off.provider_calls} → ${enforce.provider_calls}, ` +
+        `${((-shed / Math.max(1, off.provider_calls)) * 100).toFixed(1)}%)`,
+    });
+  }
+
+  return out;
 }
 
 function fmt(n: number, digits = 2): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-function renderTable(opts: Options, arms: ArmResult[]): string {
+function renderTable(
+  opts: Options,
+  arms: ArmResult[],
+  micro: MicroResult[],
+  checks: Verdict[],
+): string {
   const rows = [
-    ['Métrica', ...arms.map((a) => `disjuntor ${a.breaker}`)],
+    ['Métrica', ...arms.map((a) => `\`${a.mode}\``)],
     ['---', ...arms.map(() => '---')],
     ['requests de entrada', ...arms.map((a) => String(a.requests))],
     ['**requisições ao provider**', ...arms.map((a) => `**${a.provider_calls}**`)],
@@ -333,6 +581,9 @@ function renderTable(opts: Options, arms: ArmResult[]): string {
     ['sucesso', ...arms.map((a) => String(a.ok))],
     ['recusado pelo disjuntor', ...arms.map((a) => String(a.refused))],
     ['erro do provider', ...arms.map((a) => String(a.failed))],
+    ['`would_reject` (sombra)', ...arms.map((a) => String(a.would_reject))],
+    ['`would_open` (sombra)', ...arms.map((a) => String(a.would_open))],
+    ['`short_circuited` (real)', ...arms.map((a) => String(a.short_circuited))],
     ['p50 (ms)', ...arms.map((a) => String(a.p50))],
     ['p95 (ms)', ...arms.map((a) => String(a.p95))],
     ['p99 (ms)', ...arms.map((a) => String(a.p99))],
@@ -349,11 +600,24 @@ function renderTable(opts: Options, arms: ArmResult[]): string {
     (opts.scenario === 'brownout' ? ` · falha ${opts.failure_rate}` : '') +
     (opts.scenario === 'recovery' ? ` · queda de ${opts.outage_ms}ms` : '') +
     (opts.think_ms > 0 ? ` · pausa de ${opts.think_ms}ms entre requests` : '');
+
+  const microTable = [
+    `\n#### Custo por chamada no hot path (${opts.micro_iterations.toLocaleString('en-US')} iterações, disjuntor fechado)\n`,
+    '| postura | ns por chamada |',
+    '| --- | --- |',
+    ...micro.map((m) => `| \`${m.mode}\` | ${fmt(m.ns_per_call, 1)} |`),
+  ].join('\n');
+
+  const verdictBlock = checks.length
+    ? '\n\n#### Veredictos\n\n' +
+      checks.map((c) => `- ${c.passed ? 'OK' : 'FALHOU'} — ${c.label}: ${c.detail}`).join('\n')
+    : '';
+
   const tenantLine = arms
     .filter((a) => Object.keys(a.refused_by_tenant).length > 0)
     .map(
       (a) =>
-        `\nRecusas por tenant (disjuntor ${a.breaker}): ` +
+        `\nRecusas por tenant (postura \`${a.mode}\`): ` +
         Object.entries(a.refused_by_tenant)
           .sort(([x], [y]) => x.localeCompare(y))
           .map(([t, n]) => `${t}=${n}`)
@@ -363,21 +627,31 @@ function renderTable(opts: Options, arms: ArmResult[]): string {
         'em `src/lib/llm/circuit-breaker.ts`.',
     )
     .join('');
-  return `${header}\n\n${table}\n${tenantLine}\n`;
+
+  return `${header}\n\n${table}\n${microTable}${verdictBlock}\n${tenantLine}\n`;
 }
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
+
+  // O micro-benchmark roda ANTES dos braços de carga, de propósito: 200 requests
+  // com concorrência 10 deixam o heap sujo e o GC entra no meio da medição de
+  // nanossegundos. Medir primeiro é a diferença entre um número comparável entre
+  // posturas e um número que só descreve o coletor de lixo.
+  const micro = opts.modes.map((mode) => runMicro(opts, mode));
+
   const arms: ArmResult[] = [];
-  const which: Array<'on' | 'off'> =
-    opts.breaker === 'both' ? ['off', 'on'] : [opts.breaker];
-  for (const breaker of which) arms.push(await runArm(opts, breaker));
+  for (const mode of opts.modes) arms.push(await runArm(opts, mode));
+  const checks = verdicts(opts, arms);
 
   if (opts.json) {
-    process.stdout.write(`${JSON.stringify({ options: opts, arms }, null, 2)}\n`);
-    return;
+    process.stdout.write(`${JSON.stringify({ options: opts, arms, micro, checks }, null, 2)}\n`);
+  } else {
+    process.stdout.write(renderTable(opts, arms, micro, checks));
   }
-  process.stdout.write(renderTable(opts, arms));
+  // Exit code é parte do contrato: `npm run llm:bench` numa esteira precisa
+  // falhar quando a sombra deixou de ser sombra.
+  process.exit(checks.every((c) => c.passed) ? 0 : 1);
 }
 
 await main();

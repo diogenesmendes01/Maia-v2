@@ -66,6 +66,24 @@
  * Consequência aceita: reinício de processo zera o disjuntor. A primeira
  * janela reabre e reaprende em poucos requests.
  *
+ * ## Postura: `off | shadow | enforce`
+ *
+ * Tudo acima descreve o `enforce`. A postura em vigor vem de
+ * `circuit-mode.ts` (env `LLM_CIRCUIT_MODE`, default `shadow`, mais o override
+ * de incidente por Redis) e muda DUAS coisas, nunca mais que isso:
+ *
+ *  - `off` — nada acontece e nada é guardado. Sai antes de tocar no mapa.
+ *  - `shadow` — a máquina roda IDÊNTICA ao `enforce`, e o único ponto do
+ *    arquivo que devolve `allowed: false` (`refuse()`) devolve `allowed: true`
+ *    com `would_reject`. Ver `refuse()` para a prova estrutural.
+ *
+ * A fidelidade do shadow depende de uma regra que não é óbvia: quando o shadow
+ * deixa passar uma chamada que o `enforce` teria recusado, o DESFECHO dessa
+ * chamada não entra na janela de observação. Um disjuntor que estivesse
+ * recusando nunca teria tido aquela amostra; alimentá-la faria a trajetória
+ * simulada divergir justamente daquilo que ela existe para prever. Ver
+ * `releaseCircuit`.
+ *
  * ## Métrica
  *
  * `maia_llm_circuit_state{provider,workload,state}` — gauge documentada no
@@ -80,10 +98,20 @@
  * A emissão passa por `@/observability/metrics.js`, não por `@/lib/metrics.js`:
  * é lá que mora o gate de label (allowlist, deny list e orçamento de
  * cardinalidade da #514). Emitir direto na camada de baixo fura o gate.
+ *
+ * Em `shadow` somam-se `maia_llm_circuit_would_open_total{provider,workload,reason}`
+ * e `maia_llm_circuit_would_reject_total{provider,workload,state}` — os gêmeos
+ * de sombra da transição para `open` e da recusa. O segundo é emitido pelo
+ * GATEWAY, uma vez por chamada e dentro do escopo do caller, para casar 1:1 com
+ * `maia_llm_requests_total{status="circuit_open"}` e carregar a mesma atribuição
+ * de `tenant_id + agent_id`: o estado é global, a evidência é escopada — em
+ * sombra também.
  */
 import { config } from '@/config/env.js';
 import { counter, gauge, METRIC } from '@/observability/metrics.js';
 import { logger } from '@/lib/logger.js';
+import { effectiveMode, onModeChange, _internal as modeInternal } from './circuit-mode.js';
+import type { CircuitMode } from './circuit-mode.js';
 import { workloadPolicy } from './workloads.js';
 import type { LLMErrorKind } from './errors.js';
 import type { LLMWorkload } from './types.js';
@@ -253,23 +281,57 @@ type Entry = {
 };
 
 /**
- * Permissão para UMA tentativa. `probe: true` significa que esta chamada é a
- * sonda de half-open e carrega a decisão de fechar ou reabrir o disjuntor.
+ * Permissão para UMA tentativa.
+ *
+ *  - `probe: true` — esta chamada é a sonda de half-open e carrega a decisão de
+ *    fechar ou reabrir o disjuntor.
+ *  - `would_reject: true` — SÓ em `shadow`: o `enforce` teria recusado esta
+ *    chamada. Ela vai acontecer mesmo assim, e o desfecho dela é descartado
+ *    (ver `releaseCircuit`).
+ *  - `entry: null` — postura `off`: não há estado a atualizar.
  */
 export type CircuitPermit =
-  | { allowed: true; entry: Entry; probe: boolean; state: CircuitState }
+  | {
+      allowed: true;
+      entry: Entry | null;
+      probe: boolean;
+      state: CircuitState;
+      would_reject: boolean;
+    }
   | { allowed: false; state: CircuitState; retry_after_ms: number };
+
+/** Leitura não destrutiva do disjuntor. */
+export type CircuitPeek = {
+  allowed: boolean;
+  state: CircuitState;
+  retry_after_ms: number;
+  would_reject: boolean;
+};
 
 const circuits = new Map<string, Entry>();
 
 /**
- * Desligável só por código (`_internal.setEnabled`), usado pelo harness de
- * benchmark para medir o antes/depois no MESMO processo. Não existe env var
- * de propósito: como `allow_fast_fallback`, é postura de degradação —
- * versionada, revisável num diff, e não um toggle de runtime que alguém possa
- * virar às 3h da manhã sem deixar rastro.
+ * Permissão constante da postura `off`. Compartilhada de propósito: em `off` o
+ * disjuntor precisa custar zero, e alocar um objeto por tentativa não é zero.
+ * É só leitura — `releaseCircuit` sai na primeira linha ao ver `entry: null`.
  */
-let enabled = true;
+const OFF_PERMIT: CircuitPermit = Object.freeze({
+  allowed: true,
+  entry: null,
+  probe: false,
+  state: 'closed' as CircuitState,
+  would_reject: false,
+});
+
+/**
+ * `off` significa "nenhum estado guardado". Estado que sobrevive ao
+ * desligamento é estado que volta errado quando religa: um disjuntor que ficou
+ * `open` por uma queda de ontem recusaria (ou, em shadow, contaria) tráfego
+ * saudável no instante em que o operador reverte o kill switch.
+ */
+onModeChange((next) => {
+  if (next === 'off') circuits.clear();
+});
 
 function keyOf(key: CircuitKey): string {
   // JSON array pelo mesmo motivo de `budget.ts` e `model-resolver.ts`: um
@@ -285,11 +347,22 @@ function keyOf(key: CircuitKey): string {
  */
 function registerStateGauges(entry: Entry): void {
   for (const state of CIRCUIT_STATES) {
-    gauge(METRIC.LLM_CIRCUIT_STATE, () => (entry.state === state ? 1 : 0), {
-      provider: entry.provider,
-      workload: entry.workload,
-      state,
-    });
+    gauge(
+      METRIC.LLM_CIRCUIT_STATE,
+      () =>
+        // `off` não tem estado: NaN, não `0`. O `gauge()` da #514 já usa NaN
+        // para "não pôde ser lido" justamente porque o Prometheus o trata como
+        // amostra ausente — e `0` aqui mentiria dizendo "fechado e saudável"
+        // sobre um disjuntor que não está observando nada. O registro do gauge
+        // não pode ser desfeito (não há `unset` em `lib/metrics.ts`), então a
+        // série some pelo valor.
+        effectiveMode() === 'off' ? Number.NaN : entry.state === state ? 1 : 0,
+      {
+        provider: entry.provider,
+        workload: entry.workload,
+        state,
+      },
+    );
   }
 }
 
@@ -320,6 +393,7 @@ function transition(entry: Entry, to: CircuitState, reason: string): void {
   const from = entry.state;
   if (from === to) return;
   entry.state = to;
+  const mode = effectiveMode();
   // `state` é o estado ENTRADO e `reason` o porquê. `from`/`to` não estão em
   // ALLOWED_LABEL_KEYS e seriam descartados em silêncio pelo gate — a transição
   // completa fica no log estruturado logo abaixo, que não tem cardinalidade.
@@ -329,6 +403,19 @@ function transition(entry: Entry, to: CircuitState, reason: string): void {
     state: to,
     reason,
   });
+  // O gêmeo de sombra da abertura. `transitions_total{state="open"}` dispara
+  // igual nas duas posturas — é a mesma máquina rodando —, então numa frota
+  // mista ele não responde "teria aberto quando não devia?", que é exatamente a
+  // pergunta que a passagem por staging precisa responder antes da promoção.
+  // `mode` não está em ALLOWED_LABEL_KEYS e ampliar a allowlist é decisão de
+  // governança à parte: a distinção vira NOME de métrica, não label.
+  if (to === 'open' && mode === 'shadow') {
+    counter(METRIC.LLM_CIRCUIT_WOULD_OPEN, {
+      provider: entry.provider,
+      workload: entry.workload,
+      reason,
+    });
+  }
   // Governança: mudança de estado do disjuntor é decisão do backend que altera
   // o comportamento observável do sistema. Vai para o log estruturado com
   // motivo — sem prompt, sem resposta, sem tenant (o estado não é de tenant).
@@ -339,6 +426,7 @@ function transition(entry: Entry, to: CircuitState, reason: string): void {
       from,
       to,
       reason,
+      mode,
       cooldown_ms: entry.cooldown_ms,
       failed_windows: entry.failed_windows,
     },
@@ -368,23 +456,40 @@ function cooldownRemaining(entry: Entry, now: number): number {
  * uma chamada que não vai acontecer não deve consumir I/O de Redis nem
  * carimbar reserva de orçamento. Não consome a sonda de half-open.
  */
-export function peekCircuit(key: CircuitKey, now = Date.now()): { allowed: boolean; state: CircuitState; retry_after_ms: number } {
-  if (!enabled) return { allowed: true, state: 'closed', retry_after_ms: 0 };
+export function peekCircuit(key: CircuitKey, now = Date.now()): CircuitPeek {
+  const mode = effectiveMode(now);
+  if (mode === 'off') {
+    return { allowed: true, state: 'closed', retry_after_ms: 0, would_reject: false };
+  }
   const entry = circuits.get(keyOf(key));
   if (!entry || entry.state === 'closed') {
-    return { allowed: true, state: entry?.state ?? 'closed', retry_after_ms: 0 };
+    return {
+      allowed: true,
+      state: entry?.state ?? 'closed',
+      retry_after_ms: 0,
+      would_reject: false,
+    };
   }
+
+  let allowed: boolean;
+  let retry_after_ms: number;
   if (entry.state === 'open') {
-    const remaining = cooldownRemaining(entry, now);
-    return { allowed: remaining <= 0, state: 'open', retry_after_ms: remaining };
+    retry_after_ms = cooldownRemaining(entry, now);
+    allowed = retry_after_ms <= 0;
+  } else {
+    // half_open: passa enquanto a janela ainda tiver vaga de sonda.
+    const hasSlot = entry.probes_started < HALF_OPEN_MAX_PROBES;
+    allowed = hasSlot;
+    retry_after_ms = hasSlot ? 0 : entry.cooldown_ms;
   }
-  // half_open: passa enquanto a janela ainda tiver vaga de sonda.
-  const hasSlot = entry.probes_started < HALF_OPEN_MAX_PROBES;
-  return {
-    allowed: hasSlot,
-    state: 'half_open',
-    retry_after_ms: hasSlot ? 0 : entry.cooldown_ms,
-  };
+
+  if (allowed) return { allowed: true, state: entry.state, retry_after_ms, would_reject: false };
+  // Em `shadow` a chamada passa. `would_reject` é o que o gateway conta — uma
+  // vez por CHAMADA, no escopo do caller — para casar com a recusa real.
+  if (mode === 'shadow') {
+    return { allowed: true, state: entry.state, retry_after_ms, would_reject: true };
+  }
+  return { allowed: false, state: entry.state, retry_after_ms, would_reject: false };
 }
 
 /**
@@ -395,33 +500,58 @@ export function peekCircuit(key: CircuitKey, now = Date.now()): { allowed: boole
  * abre não continua gastando as tentativas que sobraram.
  */
 export function acquireCircuit(key: CircuitKey, now = Date.now()): CircuitPermit {
-  if (!enabled) {
-    return { allowed: true, entry: getEntry(key), probe: false, state: 'closed' };
-  }
+  const mode = effectiveMode(now);
+  // `off`: nem entrada no mapa, nem gauge, nem alocação.
+  if (mode === 'off') return OFF_PERMIT;
+
   const entry = getEntry(key);
+  const shadow = mode === 'shadow';
 
   if (entry.state === 'closed') {
-    return { allowed: true, entry, probe: false, state: 'closed' };
+    return { allowed: true, entry, probe: false, state: 'closed', would_reject: false };
   }
 
   if (entry.state === 'open') {
     const remaining = cooldownRemaining(entry, now);
-    if (remaining > 0) {
-      shed(entry);
-      return { allowed: false, state: 'open', retry_after_ms: remaining };
-    }
+    if (remaining > 0) return refuse(entry, 'open', remaining, shadow);
     entry.probes_started = 0;
     entry.probes_failed = 0;
     transition(entry, 'half_open', 'cooldown_elapsed');
   }
 
-  // half_open — no máximo `HALF_OPEN_MAX_PROBES` sondas por janela.
+  // half_open — no máximo `HALF_OPEN_MAX_PROBES` sondas por janela. A sonda é
+  // concedida IGUAL nas duas posturas: é ela que decide fechar ou reabrir, e é
+  // por isso que a trajetória do shadow é a mesma do enforce.
   if (entry.probes_started >= HALF_OPEN_MAX_PROBES) {
-    shed(entry);
-    return { allowed: false, state: 'half_open', retry_after_ms: entry.cooldown_ms };
+    return refuse(entry, 'half_open', entry.cooldown_ms, shadow);
   }
   entry.probes_started++;
-  return { allowed: true, entry, probe: true, state: 'half_open' };
+  return { allowed: true, entry, probe: true, state: 'half_open', would_reject: false };
+}
+
+/**
+ * O ÚNICO ponto do arquivo que pode devolver `allowed: false`.
+ *
+ * Concentrar a recusa aqui é a prova estrutural do requisito mais importante do
+ * shadow: com `shadow === true` esta função devolve `allowed: true` em todos os
+ * caminhos, então nenhuma postura de sombra consegue transformar uma chamada
+ * que teria dado certo num erro. Não é uma promessa espalhada por condicionais
+ * — é uma função com uma saída só, coberta por
+ * `tests/unit/lib/llm-circuit-mode.spec.ts`.
+ */
+function refuse(
+  entry: Entry,
+  state: CircuitState,
+  retry_after_ms: number,
+  shadow: boolean,
+): CircuitPermit {
+  if (shadow) {
+    // `short_circuited_total` conta carga REALMENTE cortada; em sombra nada foi
+    // cortado. O gêmeo é `would_reject`, contado no gateway.
+    return { allowed: true, entry, probe: false, state, would_reject: true };
+  }
+  shed(entry);
+  return { allowed: false, state, retry_after_ms };
 }
 
 function shed(entry: Entry): void {
@@ -441,7 +571,26 @@ function shed(entry: Entry): void {
  */
 export function releaseCircuit(permit: CircuitPermit, outcome: CircuitOutcome, now = Date.now()): void {
   if (!permit.allowed) return;
+  // `off`, ou postura que virou `off` com a permissão em voo: não há estado.
   const entry = permit.entry;
+  if (entry === null || effectiveMode(now) === 'off') return;
+  /**
+   * O ponto que faz o shadow ser uma SIMULAÇÃO e não outro experimento.
+   *
+   * Esta chamada só aconteceu porque a gente estava em sombra; o disjuntor que
+   * estamos medindo teria recusado, e portanto NUNCA teria visto este desfecho.
+   * Colocá-lo na janela contaminaria a trajetória simulada com evidência que o
+   * original não teria — e num incidente longo isso muda o resultado inteiro:
+   * as falhas que continuam chegando durante o `open` manteriam a janela cheia
+   * e o disjuntor nunca ensaiaria a recuperação, ou o contrário, sucessos
+   * durante o `open` "curariam" um disjuntor que na vida real estaria recusando
+   * e não teria como saber disso.
+   *
+   * A sonda de half-open é o caso oposto e por isso NÃO cai aqui
+   * (`would_reject` é sempre `false` num permit de sonda): ela é concedida nas
+   * duas posturas, e é o desfecho dela que decide fechar ou reabrir.
+   */
+  if (permit.would_reject) return;
 
   if (permit.probe) {
     if (outcome === 'ok') {
@@ -506,16 +655,22 @@ export const _internal = {
   CIRCUIT_STATES,
   PROVIDER_FAULT_KINDS,
   circuits,
-  /** Test seam: zera todos os disjuntores entre casos. */
+  /** Test seam: zera disjuntores E postura entre casos. */
   reset(): void {
     circuits.clear();
-    enabled = true;
+    modeInternal.reset();
   },
-  /** Seam do harness de benchmark: mede o antes/depois no mesmo processo. */
-  setEnabled(next: boolean): void {
-    enabled = next;
+  /**
+   * Seam de teste e do harness de benchmark: fixa a postura no MESMO processo,
+   * por cima do contrato e de qualquer override.
+   *
+   * Substitui o antigo `setEnabled(boolean)`. O booleano respondia a mesma
+   * pergunta que a postura ("o disjuntor está valendo?") por um segundo
+   * caminho, e dois caminhos para a mesma pergunta acabam discordando. Passar
+   * `null` devolve o controle ao contrato.
+   */
+  setMode(next: CircuitMode | null): void {
+    modeInternal.setMode(next);
   },
-  isEnabled(): boolean {
-    return enabled;
-  },
+  effectiveMode,
 };

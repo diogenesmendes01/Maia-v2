@@ -12,12 +12,23 @@ export { isBudgetEnabled, reserveBudget, settleReservation } from './budget.js';
 export type { BudgetReservation } from './budget.js';
 export {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
+  publishCircuitOverride,
   publishLLMSettingsInvalidation,
   startLLMSettingsInvalidationSubscriber,
 } from './cache-invalidation.js';
 export { workloadPolicy } from './workloads.js';
 export { circuitState } from './circuit-breaker.js';
-export type { CircuitKey, CircuitState } from './circuit-breaker.js';
+export type { CircuitKey, CircuitPeek, CircuitPermit, CircuitState } from './circuit-breaker.js';
+export {
+  CIRCUIT_MODES,
+  DEFAULT_OVERRIDE_MS,
+  LLM_CIRCUIT_OVERRIDE_CHANNEL,
+  LLM_CIRCUIT_OVERRIDE_KEY,
+  MAX_OVERRIDE_MS,
+  currentOverride,
+  effectiveMode,
+} from './circuit-mode.js';
+export type { CircuitMode, CircuitOverride, CircuitOverrideMessage } from './circuit-mode.js';
 export {
   LLMGatewayError,
   classifyProviderError,

@@ -23,6 +23,7 @@
  */
 import { config } from '@/config/env.js';
 import { estimateLLMCostUsd } from '@/lib/cost-ledger.js';
+import { counter, METRIC } from '@/observability/metrics.js';
 import { estimateInputTokens, reserveBudget, settleReservation } from './budget.js';
 import type { BudgetReservation } from './budget.js';
 import {
@@ -31,7 +32,7 @@ import {
   peekCircuit,
   releaseCircuit,
 } from './circuit-breaker.js';
-import type { CircuitKey } from './circuit-breaker.js';
+import type { CircuitKey, CircuitState } from './circuit-breaker.js';
 import { LLMGatewayError, classifyProviderError, isAbortError } from './errors.js';
 import { resolveModelPair } from './model-resolver.js';
 import { getProvider } from './providers/index.js';
@@ -271,7 +272,33 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       retry_after_ms,
     });
 
+  /**
+   * Gêmeo de sombra da recusa, contado UMA VEZ POR CHAMADA.
+   *
+   * Precisa ser aqui, e não dentro do disjuntor: em `enforce` a chamada morre
+   * no primeiro `peek` e produz exatamente UM
+   * `maia_llm_requests_total{status="circuit_open"}`. Em `shadow` a chamada
+   * segue e passa por `acquireCircuit` mais N vezes (tentativas + fallback) —
+   * contar lá dentro inflaria a sombra em ~4× num workload com retry e
+   * destruiria a comparação, que é a única razão de a métrica existir.
+   *
+   * A emissão fica dentro do escopo do caller, então `counter()` anexa
+   * `tenant_id + agent_id` do ALS: o estado do disjuntor é global, mas quem
+   * teria comido a recusa continua atribuível — em sombra também.
+   */
+  let shadowCounted = false;
+  const countWouldReject = (state: CircuitState): void => {
+    if (shadowCounted) return;
+    shadowCounted = true;
+    counter(METRIC.LLM_CIRCUIT_WOULD_REJECT, {
+      provider: provider.name,
+      workload: req.workload,
+      state,
+    });
+  };
+
   const peek = peekCircuit(circuitKey);
+  if (peek.would_reject) countWouldReject(peek.state);
   if (!peek.allowed) {
     const err = circuitError(peek.state, peek.retry_after_ms);
     await emitUsage(
@@ -447,6 +474,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
       // já em voo de continuar gastando o que sobrou das tentativas depois que
       // o disjuntor abriu por causa do tráfego concorrente.
       const permit = acquireCircuit(circuitKey);
+      if (permit.allowed && permit.would_reject) countWouldReject(permit.state);
       if (!permit.allowed) {
         const err = circuitError(permit.state, permit.retry_after_ms);
         await fail(primary, err);
@@ -565,6 +593,9 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
     // exercício: era exatamente o fallback que continuava martelando um
     // provider já fora do ar depois das tentativas do primário.
     const fallbackPermit = acquireCircuit(circuitKey);
+    if (fallbackPermit.allowed && fallbackPermit.would_reject) {
+      countWouldReject(fallbackPermit.state);
+    }
     if (!fallbackPermit.allowed) {
       const err = circuitError(fallbackPermit.state, fallbackPermit.retry_after_ms);
       await fail(fast, err);

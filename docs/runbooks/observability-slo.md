@@ -195,6 +195,30 @@ Quebre por `reason`:
 | `timeout` | rede ou modelo lento; cheque `maia_llm_latency_ms` |
 | `bad_request` | bug de payload nosso, não do provider |
 
+### 4.9.1 `MaiaLlmCircuitOpenEnforcing` / `MaiaLlmCircuitModeOverridden` / `MaiaLlmCircuitDisabledTooLong`
+
+Disjuntor de LLM. O procedimento completo (kill switch, promoção e rollback)
+vive em [`operational.md` §3.1](operational.md) — aqui fica só a leitura do
+alerta.
+
+| Alerta | O que aconteceu | Primeira coisa a checar |
+|---|---|---|
+| `MaiaLlmCircuitOpenEnforcing` | disjuntor `open` **e** postura `enforce`: chamadas estão sendo recusadas de verdade | é o provider ou é o disjuntor? `maia_llm_calls_total{status="error"}` do mesmo par no mesmo instante |
+| `MaiaLlmCircuitModeOverridden` | alguém acionou o kill switch (inclusive `reason="rejected"`, i.e. tentou e não conseguiu) | ator e motivo no log `llm_gateway.circuit_mode_override` |
+| `MaiaLlmCircuitDisabledTooLong` | postura `off` há mais de 1h | o incidente ainda está aberto, ou a alavanca virou configuração escondida? |
+
+**Por que o primeiro qualifica a postura.** `maia_llm_circuit_state{state="open"}`
+marca `open` também em `shadow`, onde o disjuntor mede e **não recusa nada** —
+`shadow` é o default em produção. Alertar em `state="open"` sem o
+`and on() maia_llm_circuit_mode{state="enforce"} == 1` acordaria plantão por um
+incidente que não existe.
+
+Em `shadow`, os números que interessam são
+`maia_llm_circuit_would_reject_total` (carga que SERIA recusada, com
+`tenant_id`/`agent_id`) e `maia_llm_circuit_would_open_total` (abertura
+simulada). Eles não têm alerta de propósito: em sombra são medição para a
+decisão de promover, não sintoma de incidente.
+
 ### 4.10 `MaiaWhatsAppDisconnected` / `MaiaDbDisconnected`
 
 Ver `docs/runbooks/operational.md` e `docs/runbooks/whatsapp-migration.md`.
