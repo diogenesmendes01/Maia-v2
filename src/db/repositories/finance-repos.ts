@@ -40,9 +40,88 @@ export const entidadesRepo = {
     const rows = await db.select().from(entidades).where(eq(entidades.id, id)).limit(1);
     return rows[0] ?? null;
   },
+  /**
+   * Issue #525 — `byIds` used to match on `entidades.id` ALONE.
+   *
+   * Every live caller (`agent/turn-context/loader.ts`, `tools/identify-entity`,
+   * `tools/compare-entities`, `tools/generate-report`) feeds it ids that came
+   * from `resolveScope`, so the ids were already tenant-checked and no leak was
+   * reachable in practice. But "safe because of what the caller happened to
+   * pass" is not the isolation invariant (AGENTS.md §4.1): an id is not a
+   * boundary, and this read renders `ent.nome` straight into the system prompt.
+   * Bind (tenant_id, agent_id) from ALS so a foreign id is simply absent from
+   * the result — the same shape the callers already handle for a missing row.
+   */
   async byIds(ids: string[]): Promise<Entidade[]> {
     if (ids.length === 0) return [];
-    return db.select().from(entidades).where(inArray(entidades.id, ids));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(entidades)
+      .where(
+        and(
+          inArray(entidades.id, ids),
+          eq(entidades.tenant_id, tenant_id),
+          eq(entidades.agent_id, agent_id),
+        ),
+      );
+  },
+
+  /**
+   * Issue #525 — entity rows AND their state rows in ONE round-trip.
+   *
+   * The turn's "## Escopo desta conversa" and "## Estado atual" blocks are the
+   * same set of entities read twice: `entidadesRepo.byIds` for the names, then
+   * `entityStatesRepo.byIds` for the balances. They are joined on
+   * `entity_states.entidade_id = entidades.id`, which is exactly what a LEFT
+   * JOIN does — so the second statement was never buying anything except a
+   * round-trip on the fixed 10-connection pool (`src/db/client.ts`).
+   *
+   * LEFT, not INNER: an entity with no state row must still render its name in
+   * the scope block. The caller distinguishes the two by `state === null`,
+   * which is the same signal `entityStatesRepo.byId` gave by returning null.
+   *
+   * Tenant scoping is applied on BOTH sides. On `entidades` it is the ordinary
+   * predicate; on `entity_states` it lives in the JOIN condition, because
+   * `entity_states`'s PK is `entidade_id` alone — a row can exist for an id
+   * under another tuple, and putting the predicate in the WHERE clause of a
+   * LEFT JOIN would filter the whole row out instead of just the state half.
+   *
+   * `limit` bounds the result the same way `entityStatesRepo.byIds` did; the
+   * join is 1:1 on a PK, so the row count is at most `ids.length`.
+   */
+  async byIdsWithState(
+    ids: string[],
+    limit = 500,
+  ): Promise<Array<{ entidade: Entidade; state: EntityState | null }>> {
+    if (ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ entidade: entidades, state: entity_states })
+      .from(entidades)
+      .leftJoin(
+        entity_states,
+        and(
+          eq(entity_states.entidade_id, entidades.id),
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
+      )
+      .where(
+        and(
+          inArray(entidades.id, Array.from(new Set(ids))),
+          eq(entidades.tenant_id, tenant_id),
+          eq(entidades.agent_id, agent_id),
+        ),
+      )
+      // Deterministic order so the rendered blocks are byte-stable for the same
+      // scope across turns. The caller re-sorts into scope order; ordering here
+      // just removes DB nondeterminism.
+      .orderBy(entidades.id)
+      .limit(limit);
+    return rows.map((r) => ({ entidade: r.entidade, state: r.state ?? null }));
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
     const guarded = applyTenantGuard(input);

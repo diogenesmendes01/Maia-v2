@@ -90,6 +90,56 @@ export const SECTION_BUDGETS = {
 export type BudgetedSection = keyof typeof SECTION_BUDGETS;
 
 /**
+ * Issue #525 — the TURN's round-trip ceiling, counted at the repository
+ * boundary for a typical turn (one entity in scope, no active procedure).
+ *
+ * This constant is the budget, and `tests/unit/turn-context-round-trips.spec.ts`
+ * is its enforcement: the spec asserts the EXACT count for each path and fails
+ * the build the moment a new read pushes past this number. A budget nothing
+ * fails on is a wish, and the whole point of #511/#525 is that the turn's cost
+ * stops being a wish.
+ *
+ * "Whole turn" means `resolveScope` (2) + `buildPrompt`. It deliberately counts
+ * the procedure-execution lookup even though `core.ts` normally supplies it —
+ * the read happens once per turn either way, and moving a query to a different
+ * caller is not an optimisation.
+ *
+ * Current composition (legacy `self_state` path, the most expensive one):
+ *
+ *   resolveScope: permissoesRepo.forPessoa, profilesRepo.byIds           2
+ *   identity: operationalProfileVersionsRepo.getActive                   1
+ *   identity: selfStateRepo.getActive (fallback branch only)             1
+ *   mensagensRepo.recentInConversation                                   1
+ *   entidadesRepo.byIdsWithState (entities ⋈ states, one statement)      1
+ *   factsRepo.listMentionableForScopes                                   1
+ *   rulesRepo.listActive                                                 1
+ *   memoryEntryRepo.findRelevant                                         1
+ *   behavioralHintRepo.findActiveForScopes                               1
+ *   capabilitiesSkillRepo.listAll                                        1
+ *   capabilityGapsRepo.listByLevels (serves BOTH gap blocks)             1
+ *   procedureExecutionsRepo.findActiveForConversa                        1
+ *                                                                       --
+ *                                                                       13
+ *
+ * Every one of these is independent of scope size: the slope is zero, which is
+ * the property that stops one "elephant" tenant from monopolising the fixed
+ * 10-connection pool in `src/db/client.ts`.
+ */
+export const TURN_ROUND_TRIP_BUDGET = 13;
+
+/**
+ * The goal issue #525 sets. NOT yet met — see `docs/architecture/modules/
+ * agent.md` for the remaining merges, what each is worth, and why they were not
+ * taken in this change (each one needs a cross-table statement that cannot be
+ * verified without a live Postgres).
+ *
+ * Kept in code rather than only in the issue so the gap is greppable from the
+ * budget it belongs to, and so closing it is a one-line edit here plus the
+ * counts in the spec.
+ */
+export const TURN_ROUND_TRIP_TARGET = 8;
+
+/**
  * Item cap for the gap list inside the self-awareness ("## Autoconhecimento")
  * section — the "Ainda não tem: …" clause.
  *
