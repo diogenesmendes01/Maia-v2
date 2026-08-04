@@ -651,10 +651,20 @@ async function emitAgentScopedAudit(
     audit({
       acao,
       entidade_alvo: 'agent',
-      alvo_id: run.agent_id,
+      // `audit_log.alvo_id` é uma coluna `uuid`; `agents.id` é TEXT (um slug
+      // como `acme-bot`). Passar o id do agente ali é 22P02 — e `audit()`
+      // ENGOLE a exceção por design (best-effort, loga `audit.write_failed`),
+      // então a trilha agente-escopada de readiness e de ativação simplesmente
+      // NUNCA era gravada: sem erro para o operador, sem teste vermelho, só uma
+      // linha de log. O agente já está atribuído em `audit_log.agent_id` (TEXT)
+      // pelo `runWithTenantContext` acima; repetimos o id em `metadata` para
+      // quem consulta por lá. Invariante 4 do AGENTS.md.
+      alvo_id: null,
       metadata: {
         run_id: run.id,
         step,
+        agent_id: run.agent_id,
+        tenant_id: run.tenant_id,
         ...(readiness ? readinessSummary(readiness) : {}),
       },
     }),

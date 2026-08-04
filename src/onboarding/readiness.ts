@@ -121,8 +121,14 @@ export type ReadinessFacts = {
   blocking_governance_items: number;
 };
 
-/** Estados de linha (#518) que PROVAM posse da linha. */
-const OWNERSHIP_PROVEN_LINE_STATES = ['connected', 'verified_offline'] as const;
+/**
+ * Estados de linha (#518) que PROVAM posse da linha. Exportado porque é um
+ * literal do vocabulário de `channel_line_state.state`: se ele divergir do
+ * CHECK daquela coluna, o check `channel_ownership_proven` nunca passa e
+ * nenhum agente jamais ativa — falha silenciosa, sem 23514 para denunciar.
+ * `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` confronta.
+ */
+export const OWNERSHIP_PROVEN_LINE_STATES = ['connected', 'verified_offline'] as const;
 
 function owns(scope: { tenant_id: string; agent_id: string }, requested: Scoped): boolean {
   return scope.tenant_id === requested.tenant_id && scope.agent_id === requested.agent_id;

@@ -120,7 +120,22 @@ export async function loadReadinessFactsFromDb(scope: {
           line_state: channel_line_state.state,
         })
         .from(channels)
-        .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
+        // O par (tenant, agente) entra no ON, não só no WHERE. `channel_id` é
+        // PK de `channel_line_state`, então hoje o join já é 1:1 e não poderia
+        // cruzar escopo; mas `channel_line_state` REPLICA (tenant_id, agent_id)
+        // sem FK composta (`migrations/103_channel_line_state.sql:28`), e uma
+        // linha replicada divergente é precisamente o que o avaliador puro
+        // trata como fato de outro dono. Casar o escopo no ON faz a divergência
+        // virar `line_state = NULL` (posse NÃO provada, fail-closed) em vez de
+        // um estado herdado de outro escopo. Invariante 1 do AGENTS.md.
+        .leftJoin(
+          channel_line_state,
+          and(
+            eq(channel_line_state.channel_id, channels.id),
+            eq(channel_line_state.tenant_id, tenant_id),
+            eq(channel_line_state.agent_id, agent_id),
+          ),
+        )
         .where(and(eq(channels.tenant_id, tenant_id), eq(channels.agent_id, agent_id))),
       db
         .select()

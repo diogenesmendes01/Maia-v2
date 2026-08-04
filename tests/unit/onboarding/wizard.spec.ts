@@ -474,8 +474,67 @@ describe('readiness e ativação — fail-closed', () => {
     expect(out.status).toBe('completed');
     expect(runs.get('run-1')!.state).toBe('active');
     expect(auditSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ acao: 'agent_activation_approved', alvo_id: 'acme-bot' }),
+      expect.objectContaining({
+        acao: 'agent_activation_approved',
+        // `alvo_id` é coluna `uuid` em `audit_log` e `agents.id` é TEXT: mandar
+        // o id do agente ali é 22P02, e `audit()` engole a exceção — a linha
+        // sumia em silêncio. Esta asserção ANTES afirmava `alvo_id: 'acme-bot'`,
+        // ou seja, o teste falso PINAVA o defeito. O agente segue atribuível
+        // pela coluna `agent_id` (TEXT, via ALS) e por `metadata`.
+        alvo_id: null,
+        metadata: expect.objectContaining({ agent_id: 'acme-bot', tenant_id: 'acme' }),
+      }),
     );
+  });
+
+  it('nenhum campo uuid da trilha do agente recebe um id textual', async () => {
+    // Asserção tipada pelo SCHEMA, não por literal: lê de `migrations/*.sql`
+    // quais colunas de `audit_log` são `uuid` e exige `null` ou uuid canônico
+    // em cada campo correspondente do payload. É o que faltava — um `vi.fn()`
+    // aceita qualquer string, e por isso a lacuna sobreviveu à suíte inteira.
+    const { UUID_RE, uuidColumnsOf } = await import('./_migration-schema.js');
+    const PAYLOAD_TO_COLUMN: Record<string, string> = {
+      pessoa_id: 'pessoa_id',
+      alvo_id: 'alvo_id',
+      conversa_id: 'conversa_id',
+      mensagem_id: 'mensagem_id',
+      occurrence_id: 'occurrence_id',
+    };
+    const uuidCols = uuidColumnsOf('audit_log');
+    expect(uuidCols.has('alvo_id'), 'guarda do parser: alvo_id deveria ser uuid').toBe(true);
+
+    for (const [step, from, version] of [
+      ['evaluate_readiness', 'channel_ready', 5],
+      ['activate', 'ready_for_activation', 6],
+    ] as const) {
+      auditSpy.mockClear();
+      runs.set('run-1', makeRun({ state: from, version }));
+      await executeOnboardingStep({
+        run_id: 'run-1',
+        step,
+        payload:
+          step === 'activate'
+            ? { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' }
+            : {},
+        idempotency_key: `chave-uuid-${step}`,
+        expected_version: version,
+        actor: OWNER,
+        deps: { evaluateReadiness: async () => readyReport() },
+      });
+
+      expect(auditSpy, `o passo ${step} não emitiu audit()`).toHaveBeenCalledTimes(1);
+      const payload = auditSpy.mock.calls[0]![0] as unknown as Record<string, unknown>;
+      for (const [field, column] of Object.entries(PAYLOAD_TO_COLUMN)) {
+        if (!uuidCols.has(column)) continue;
+        const value = payload[field];
+        if (value === undefined || value === null) continue;
+        expect(
+          String(value),
+          `audit_log.${column} é coluna uuid, mas o passo ${step} mandou ` +
+            `${JSON.stringify(value)} — 22P02, engolido por audit(), trilha perdida.`,
+        ).toMatch(UUID_RE);
+      }
+    }
   });
 
   it('uma segunda ativação concorrente não produz uma segunda transição conclusiva', async () => {

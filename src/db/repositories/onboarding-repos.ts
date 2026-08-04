@@ -30,7 +30,7 @@
  * agente-escopados que ocorrem DEPOIS da criação do agente (readiness,
  * ativação) também emitem `audit()` pós-commit — ver `wizard.ts`.
  */
-import { and, asc, desc, eq, isNull, lt, notInArray, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, lt, notInArray, or } from 'drizzle-orm';
 import { TERMINAL_STATES } from '@/onboarding/state-machine.js';
 import { db, withTx } from '../client.js';
 import {
@@ -38,6 +38,7 @@ import {
   onboarding_events,
   onboarding_runs,
   onboarding_step_results,
+  tenants,
 } from '../schema.js';
 import type { OnboardingEventRow, OnboardingRunRow } from '../schema.js';
 import { planTransition, type OnboardingState } from '@/onboarding/state-machine.js';
@@ -45,6 +46,65 @@ import { OnboardingError } from '@/onboarding/errors.js';
 import { sanitizeForPersistence } from '@/onboarding/sanitize.js';
 
 type Tx = Parameters<Parameters<typeof withTx>[0]>[0];
+
+/**
+ * Bucket de auditoria para trabalho SEM DONO AINDA. É um tenant de verdade,
+ * semeado por `migrations/014_p0_seed_system_tenant.sql`, então satisfaz a FK.
+ */
+export const AUDIT_FALLBACK_TENANT = 'system';
+
+/**
+ * Os `event_type` que ESTE repo escreve em `onboarding_events`. A coluna tem
+ * `CHECK (event_type IN (…))` na migration 109; um literal fora do CHECK é um
+ * 23514 invisível para qualquer teste com store falso, então o conjunto vive
+ * aqui, é usado nas escritas, e
+ * `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` o confronta
+ * com o CHECK lido de `migrations/*.sql`.
+ *
+ * Não é o conjunto COMPLETO do CHECK: `step_failed` e `readiness_evaluated`
+ * estão no schema para uso futuro e nenhuma escrita os emite hoje. A direção
+ * que importa é código ⊆ schema.
+ */
+export const ONBOARDING_EVENT_TYPES = {
+  RUN_CREATED: 'run_created',
+  STEP_COMPLETED: 'step_completed',
+  STEP_REPLAYED: 'step_replayed',
+  STEP_DENIED: 'step_denied',
+  RUN_CANCELLED: 'run_cancelled',
+  RUN_COMPLETED: 'run_completed',
+  RUN_EXPIRED: 'run_expired',
+} as const;
+
+/**
+ * Resolve o `tenant_id` que pode ser gravado em `admin_audit_log`.
+ *
+ * `admin_audit_log.tenant_id` é `TEXT NOT NULL REFERENCES tenants(id)`
+ * (`migrations/047_admin_audit_log.sql:10`) — uma FK, não apenas um NOT NULL.
+ * E a saga audita ANTES de o tenant existir: numa run `tenant_onboarding` o
+ * `tenant_id` da run é o tenant que a saga ainda VAI criar (`provision_tenant`
+ * é um passo), então gravá-lo direto na coluna estourava 23503 na criação da
+ * run e no cancelamento de uma run ainda em `created`.
+ *
+ * A resposta NÃO é enfraquecer a FK nem descartar o alvo: a linha vai para o
+ * bucket `system` e o alvo PRETENDIDO é preservado em
+ * `change_summary.target_tenant_id`. A trilha continua completa e atribuível —
+ * "quem iniciou o onboarding do tenant X" é achável por
+ * `change_summary->>'target_tenant_id'`, e o índice
+ * `admin_audit_log_resource_idx` já resolve a busca pelo `resource_id` da run.
+ *
+ * O SELECT roda no MESMO `tx`, logo enxerga o tenant que `provision_tenant`
+ * acabou de inserir nesta transação: do passo seguinte em diante a auditoria
+ * volta a ser gravada sob o tenant real, sem nenhuma janela intermediária.
+ */
+async function resolveAuditTenant(tx: Tx, intended: string | null): Promise<string> {
+  if (intended === null) return AUDIT_FALLBACK_TENANT;
+  const rows = await tx
+    .select({ id: tenants.id })
+    .from(tenants)
+    .where(eq(tenants.id, intended))
+    .limit(1);
+  return rows[0] ? intended : AUDIT_FALLBACK_TENANT;
+}
 
 export type StepApplication = {
   /** Resultado materializado devolvido ao caller e persistido no ledger. */
@@ -130,7 +190,7 @@ export const onboardingRunsRepo = {
         tenant_id: run.tenant_id,
         agent_id: run.agent_id,
         step: 'create_run',
-        event_type: 'run_created',
+        event_type: ONBOARDING_EVENT_TYPES.RUN_CREATED,
         actor_id: input.created_by,
         correlation_id: input.correlation_id,
         from_state: null,
@@ -138,17 +198,23 @@ export const onboardingRunsRepo = {
         summary: sanitizeForPersistence({ kind: input.kind }),
       });
 
-      // `admin_audit_log.tenant_id` é NOT NULL. Uma run de bootstrap global
-      // ainda não tem tenant; o bucket reservado `system` é o home sancionado
-      // para trabalho sem dono (tenant-context.ts) e é o que usamos aqui.
+      // O tenant-alvo desta run AINDA NÃO EXISTE (`provision_tenant` é o passo
+      // seguinte), e `admin_audit_log.tenant_id` é FK. Ver `resolveAuditTenant`:
+      // a linha vai para o bucket `system` e o alvo fica em `change_summary`.
       await tx.insert(admin_audit_log).values({
-        tenant_id: run.tenant_id ?? 'system',
+        tenant_id: await resolveAuditTenant(tx, run.tenant_id),
         actor_id: input.created_by,
         actor_role: input.actor_role,
         action: 'onboarding_run_started',
         resource_type: 'onboarding_run',
         resource_id: run.id,
-        change_summary: { kind: input.kind, correlation_id: input.correlation_id },
+        change_summary: {
+          kind: input.kind,
+          correlation_id: input.correlation_id,
+          run_id: run.id,
+          target_tenant_id: run.tenant_id,
+          target_agent_id: run.agent_id,
+        },
       });
 
       return run;
@@ -284,7 +350,7 @@ export const onboardingRunsRepo = {
           tenant_id: run.tenant_id,
           agent_id: run.agent_id,
           step: input.step,
-          event_type: 'step_replayed',
+          event_type: ONBOARDING_EVENT_TYPES.STEP_REPLAYED,
           actor_id: input.actor_id,
           correlation_id: input.correlation_id,
           idempotency_key_hash: input.idempotency_key_hash,
@@ -345,7 +411,7 @@ export const onboardingRunsRepo = {
           tenant_id: run.tenant_id,
           agent_id: run.agent_id,
           step: input.step,
-          event_type: 'step_denied',
+          event_type: ONBOARDING_EVENT_TYPES.STEP_DENIED,
           actor_id: input.actor_id,
           correlation_id: input.correlation_id,
           idempotency_key_hash: input.idempotency_key_hash,
@@ -355,7 +421,7 @@ export const onboardingRunsRepo = {
         });
 
         await tx.insert(admin_audit_log).values({
-          tenant_id: nextTenant ?? 'system',
+          tenant_id: await resolveAuditTenant(tx, nextTenant),
           actor_id: input.actor_id,
           actor_role: input.actor_role,
           action: `${applied.audit.action}_denied`,
@@ -367,6 +433,8 @@ export const onboardingRunsRepo = {
             from_state: run.state,
             to_state: plan.onDeny,
             code: applied.deny.code,
+            target_tenant_id: nextTenant,
+            target_agent_id: nextAgent,
             correlation_id: input.correlation_id,
           },
         });
@@ -418,7 +486,9 @@ export const onboardingRunsRepo = {
         tenant_id: nextTenant,
         agent_id: nextAgent,
         step: input.step,
-        event_type: applied.completes ? 'run_completed' : 'step_completed',
+        event_type: applied.completes
+          ? ONBOARDING_EVENT_TYPES.RUN_COMPLETED
+          : ONBOARDING_EVENT_TYPES.STEP_COMPLETED,
         actor_id: input.actor_id,
         correlation_id: input.correlation_id,
         idempotency_key_hash: input.idempotency_key_hash,
@@ -428,7 +498,9 @@ export const onboardingRunsRepo = {
       });
 
       await tx.insert(admin_audit_log).values({
-        tenant_id: nextTenant ?? 'system',
+        // Depois de `provision_tenant` o tenant existe NESTE `tx`, então esta
+        // linha é gravada sob o tenant real. Antes dele, cai no bucket.
+        tenant_id: await resolveAuditTenant(tx, nextTenant),
         actor_id: input.actor_id,
         actor_role: input.actor_role,
         action: applied.audit.action,
@@ -515,7 +587,7 @@ export const onboardingRunsRepo = {
         tenant_id: run.tenant_id,
         agent_id: run.agent_id,
         step: run.current_step ?? 'cancel',
-        event_type: 'run_cancelled',
+        event_type: ONBOARDING_EVENT_TYPES.RUN_CANCELLED,
         actor_id: input.actor_id,
         correlation_id: input.correlation_id,
         from_state: run.state,
@@ -523,8 +595,10 @@ export const onboardingRunsRepo = {
         summary: sanitizeForPersistence({ reason_code: input.reason_code }),
       });
 
+      // Cancelar uma run ainda em `created` acontece ANTES de `provision_tenant`:
+      // o tenant-alvo não existe e a FK recusaria. Mesmo tratamento da criação.
       await tx.insert(admin_audit_log).values({
-        tenant_id: run.tenant_id ?? 'system',
+        tenant_id: await resolveAuditTenant(tx, run.tenant_id),
         actor_id: input.actor_id,
         actor_role: input.actor_role,
         action: 'onboarding_run_cancelled',
@@ -534,6 +608,8 @@ export const onboardingRunsRepo = {
           run_id: run.id,
           from_state: run.state,
           reason_code: input.reason_code,
+          target_tenant_id: run.tenant_id,
+          target_agent_id: run.agent_id,
           correlation_id: input.correlation_id,
         },
       });
@@ -592,7 +668,7 @@ export const onboardingRunsRepo = {
           tenant_id: run.tenant_id,
           agent_id: run.agent_id,
           step: run.current_step ?? 'expire',
-          event_type: 'run_expired',
+          event_type: ONBOARDING_EVENT_TYPES.RUN_EXPIRED,
           actor_id: 'system',
           from_state: run.state,
           to_state: 'cancelled',

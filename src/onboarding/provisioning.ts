@@ -44,6 +44,74 @@ type Tx = Parameters<
   Parameters<typeof import('@/db/client.js').withTx>[0]
 >[0];
 
+// ── Vocabulário de enum/status que a saga ESCREVE ────────────────────────────
+//
+// Cada coluna abaixo tem um `CHECK (col IN (…))` em `migrations/`. Um literal
+// aqui que o CHECK não admita é um 23514 que NENHUM teste com store falso
+// enxerga — foi assim que `agents.status='provisioning'` e
+// `channel_policies.switch_behavior='fixed'` chegaram ao CI.
+//
+// Por isso os literais moram em constantes NOMEADAS, são usados nas escritas, e
+// `SAGA_ENUM_WRITES` os expõe agrupados por `tabela.coluna`. É contra esse mapa
+// que `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` confronta
+// os CHECKs lidos de `migrations/*.sql` — sem banco, em segundos.
+
+/** Status do tenant que `provision_tenant` cria. */
+export const TENANT_STATUS_ACTIVE = 'active';
+
+/**
+ * O agente NASCE aqui: existe, mas não é operável. Ver
+ * `migrations/110_agents_status_provisioning.sql` para por que não é `paused`.
+ */
+export const AGENT_STATUS_PROVISIONING = 'provisioning';
+/** E só chega aqui pelo comando explícito `activate`. */
+export const AGENT_STATUS_ACTIVE = 'active';
+
+/** A versão SEMENTE do profile nasce proposta — nenhum profile nasce ativo. */
+export const PROFILE_STATUS_SEED = 'proposed';
+/** E é ativada pelo passo `configure_profile`, com aprovação do operador. */
+export const PROFILE_STATUS_ACTIVE = 'active';
+
+/** Único tipo de canal desta fatia. */
+export const CHANNEL_TYPE_WHATSAPP = 'whatsapp';
+
+/** Estado operacional inicial da linha (#518): declarada, não pareada. */
+export const CHANNEL_LINE_STATE_INITIAL = 'declared';
+
+/**
+ * Papéis administrativos que `provision_admin` pode conceder. `founder` está
+ * FORA de propósito: é global, e a saga não cria founder novo (§1 da issue).
+ */
+export const ADMIN_ROLES = ['owner', 'compliance_officer', 'analyst', 'viewer'] as const;
+
+/**
+ * Vocabulário de `channel_policies.switch_behavior`. São EXATAMENTE os valores
+ * do CHECK de `migrations/033_p6_channel_policies.sql:10` e do enum
+ * `SwitchBehavior` (`src/types/enums.ts:197`) — a saga não inventa um
+ * vocabulário paralelo para uma coluna que outro módulo interpreta
+ * (`src/cognition/role-selector/policy-decider.ts`).
+ */
+export const SWITCH_BEHAVIORS = [
+  'locked',
+  'prefer_handoff',
+  'free_with_trigger',
+  'by_context',
+] as const;
+
+/** Fail-closed: o canal recém-declarado fica preso ao seu único papel padrão. */
+export const SWITCH_BEHAVIOR_DEFAULT = 'locked';
+
+/** Mapa `tabela.coluna` → literais que a saga pode escrever naquela coluna. */
+export const SAGA_ENUM_WRITES = {
+  'tenants.status': [TENANT_STATUS_ACTIVE],
+  'agents.status': [AGENT_STATUS_PROVISIONING, AGENT_STATUS_ACTIVE],
+  'app_users.role': [...ADMIN_ROLES],
+  'agent_operational_profile_versions.status': [PROFILE_STATUS_SEED, PROFILE_STATUS_ACTIVE],
+  'channels.channel_type': [CHANNEL_TYPE_WHATSAPP],
+  'channel_line_state.state': [CHANNEL_LINE_STATE_INITIAL],
+  'channel_policies.switch_behavior': [...SWITCH_BEHAVIORS],
+} as const satisfies Record<string, readonly string[]>;
+
 // ── Contratos de payload ─────────────────────────────────────────────────────
 
 const scopeId = z.string().min(2).max(64);
@@ -60,7 +128,7 @@ export const STEP_PAYLOAD_SCHEMAS = {
     user_id: z.string().min(3).max(128),
     email: z.string().email(),
     name: z.string().min(1).max(200).optional(),
-    role: z.enum(['owner', 'compliance_officer', 'analyst', 'viewer']).default('owner'),
+    role: z.enum(ADMIN_ROLES).default('owner'),
   }),
   provision_agent: z.object({
     agent_id: scopeId,
@@ -87,11 +155,24 @@ export const STEP_PAYLOAD_SCHEMAS = {
     granted_packs: z.array(z.string().min(1).max(64)).max(50).default([]),
   }),
   declare_channel: z.object({
-    channel_type: z.literal('whatsapp'),
+    channel_type: z.literal(CHANNEL_TYPE_WHATSAPP),
     /** Linha E.164 com `+`. NÃO é persistida em metadata/summary/result. */
     external_id: z.string().min(8).max(24),
     display_name: z.string().max(200).optional(),
-    switch_behavior: z.enum(['fixed', 'by_context', 'by_command']).default('fixed'),
+    /**
+     * VOCABULÁRIO DA PLATAFORMA, não um paralelo. Os valores são exatamente os
+     * do CHECK de `channel_policies.switch_behavior`
+     * (`migrations/033_p6_channel_policies.sql:10`) e do enum `SwitchBehavior`
+     * (`src/types/enums.ts:197`), porque é esta coluna que o payload alimenta e
+     * é `src/cognition/role-selector/policy-decider.ts` que o interpreta.
+     *
+     * O default é `locked` — fail-closed: um agente recém-provisionado tem
+     * exatamente UM papel padrão (invariante do check `default_role_resolved`),
+     * então o canal nasce preso a ele. Trocar de papel por contexto é uma
+     * decisão de governança posterior, tomada no console, não um efeito
+     * colateral do onboarding.
+     */
+    switch_behavior: z.enum(SWITCH_BEHAVIORS).default(SWITCH_BEHAVIOR_DEFAULT),
   }),
   start_pairing: z.object({
     channel_id: z.string().uuid(),
@@ -162,7 +243,7 @@ export async function applyProvisionTenant(
   // convergente.
   await tx
     .insert(tenants)
-    .values({ id: payload.tenant_id, nome: payload.nome, status: 'active' })
+    .values({ id: payload.tenant_id, nome: payload.nome, status: TENANT_STATUS_ACTIVE })
     .onConflictDoNothing();
 
   const rows = await tx.select().from(tenants).where(eq(tenants.id, payload.tenant_id)).limit(1);
@@ -235,7 +316,13 @@ export async function applyProvisionAgent(
       nome: payload.nome,
       // NASCE INATIVO. A ativação é um comando explícito no fim da saga, com
       // readiness reavaliado — nunca um efeito colateral da criação.
-      status: 'provisioning',
+      //
+      // `provisioning` é um valor de primeira classe do CHECK de `agents.status`
+      // desde `migrations/110_agents_status_provisioning.sql`. NÃO trocar por
+      // `paused`: `paused` significa "esteve ativo e foi parado", e a remediação
+      // óbvia para ele (despausar) colocaria em serviço um agente sem profile,
+      // sem papel e sem política — ver o cabeçalho da migration 110.
+      status: AGENT_STATUS_PROVISIONING,
     })
     .onConflictDoNothing();
 
@@ -262,7 +349,7 @@ export async function applyProvisionAgent(
       tenant_id,
       agent_id: agent.id,
       version: 1,
-      status: 'proposed',
+      status: PROFILE_STATUS_SEED,
       profile_body: {},
       proposed_by: 'onboarding_wizard',
       proposed_reason: `run ${run.id}`,
@@ -306,7 +393,7 @@ export async function applyConfigureProfile(
   const activated = await tx
     .update(agent_operational_profile_versions)
     .set({
-      status: 'active',
+      status: PROFILE_STATUS_ACTIVE,
       approved_by: actor_id,
       approved_at: now,
       activated_at: now,
@@ -316,7 +403,7 @@ export async function applyConfigureProfile(
         eq(agent_operational_profile_versions.tenant_id, tenant_id),
         eq(agent_operational_profile_versions.agent_id, agent_id),
         eq(agent_operational_profile_versions.version, 1),
-        eq(agent_operational_profile_versions.status, 'proposed'),
+        eq(agent_operational_profile_versions.status, PROFILE_STATUS_SEED),
       ),
     )
     .returning();
@@ -328,7 +415,7 @@ export async function applyConfigureProfile(
       and(
         eq(agent_operational_profile_versions.tenant_id, tenant_id),
         eq(agent_operational_profile_versions.agent_id, agent_id),
-        eq(agent_operational_profile_versions.status, 'active'),
+        eq(agent_operational_profile_versions.status, PROFILE_STATUS_ACTIVE),
       ),
     )
     .limit(1);
@@ -512,7 +599,7 @@ export async function applyDeclareChannel(
         tenant_id,
         agent_id,
         external_id,
-        channel_type: 'whatsapp',
+        channel_type: CHANNEL_TYPE_WHATSAPP,
         display_name: payload.display_name ?? null,
         active: false,
       })
@@ -531,7 +618,7 @@ export async function applyDeclareChannel(
       and(
         eq(channels.tenant_id, tenant_id),
         eq(channels.agent_id, agent_id),
-        eq(channels.channel_type, 'whatsapp'),
+        eq(channels.channel_type, CHANNEL_TYPE_WHATSAPP),
         eq(channels.external_id, external_id),
       ),
     )
@@ -550,7 +637,7 @@ export async function applyDeclareChannel(
   // Estado operacional inicial de #518.
   await tx
     .insert(channel_line_state)
-    .values({ channel_id: channel.id, tenant_id, agent_id, state: 'declared' })
+    .values({ channel_id: channel.id, tenant_id, agent_id, state: CHANNEL_LINE_STATE_INITIAL })
     .onConflictDoNothing();
 
   // A `channel_policy` é materializada AQUI (e não no passo `configure_role`)
@@ -653,7 +740,7 @@ export async function applyActivate(
 
   await tx
     .update(agents)
-    .set({ status: 'active', updated_at: new Date() })
+    .set({ status: AGENT_STATUS_ACTIVE, updated_at: new Date() })
     .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)));
 
   // Só as linhas GOVERNADAS (com política do mesmo escopo) passam a rotear.

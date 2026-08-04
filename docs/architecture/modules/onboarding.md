@@ -39,6 +39,10 @@ O que `scripts/setup.ts` ganhou foi **uma linha de verdade**: no fim ele imprime
 | `src/onboarding/errors.ts` | Códigos de erro estáveis |
 | `src/db/repositories/onboarding-repos.ts` | `commitStep` — a transação curta que dá atomicidade à saga |
 | `migrations/109_onboarding_runs.sql` | `onboarding_runs`, `onboarding_events`, `onboarding_step_results` |
+| `migrations/110_agents_status_provisioning.sql` | `agents.status` passa a admitir `provisioning` — com a auditoria dos consumidores no cabeçalho |
+| `tests/unit/onboarding/_migration-schema.ts` | Lê `CHECK`s e colunas `uuid` de `migrations/*.sql` para as suítes SEM banco |
+| `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` | Literais do código ⊆ `CHECK` real, sem banco |
+| `tests/unit/onboarding/audit-fk-safety.spec.ts` | `tx` falso **com integridade referencial**: a auditoria nunca referencia tenant inexistente |
 
 ## O contrato de readiness (para #517)
 
@@ -73,7 +77,7 @@ Escopo inválido (vazio, com whitespace, ou os literais `'default'`/`'system'`) 
 | `channel_online` | advisory | linha `connected` agora — socket caído se recupera sozinho |
 | `schema_ready` | blocking | zero migrations pendentes (fail-closed: erro de leitura ⇒ reprova) |
 | `governance_no_blocking_pending` | blocking | nenhum alerta de drift `critical` sem `resolved_at` |
-| `agent_activated` | advisory | `agents.status='active'` — advisório porque readiness é a PRECONDIÇÃO da ativação |
+| `agent_activated` | advisory | `agents.status='active'` — advisório porque readiness é a PRECONDIÇÃO da ativação. O agente criado pela saga nasce em `agents.status='provisioning'` (`migrations/110_agents_status_provisioning.sql`), um estado distinto de `paused` (= esteve ativo e foi parado) |
 
 ### A propriedade central
 
@@ -127,7 +131,9 @@ O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_age
 ## Patterns it follows
 
 - **Escopo fail-closed antes de tudo** — `scope.ts` rejeita `'default'` e `'system'` como ALVO de provisionamento. `'primary'` é um tenant ordinário e passa. As mesmas regras existem como `CHECK` na migration 108: o guard devolve erro tipado, o banco é a última linha.
-- **Auditoria atômica** — a trilha completa vai para `admin_audit_log` **no mesmo `tx`** do passo (mesmo desenho de `tenantsRepo.createWithAuditAtomic`). `audit_log` não serve para todos os passos: sua coluna `agent_id` é FK para `agents`, e metade da saga roda antes do agente existir. As decisões agente-escopadas (`agent_readiness_evaluated`, `agent_activation_approved|denied`) emitem **também** `audit()` pós-commit sob o ALS do par real.
+- **Auditoria atômica** — a trilha completa vai para `admin_audit_log` **no mesmo `tx`** do passo (mesmo desenho de `tenantsRepo.createWithAuditAtomic`). `audit_log` não serve para todos os passos: sua coluna `agent_id` é FK para `agents`, e metade da saga roda antes do agente existir. As decisões agente-escopadas (`agent_readiness_evaluated`, `agent_activation_approved|denied`) emitem **também** `audit()` pós-commit sob o ALS do par real — com `alvo_id: null`, porque `audit_log.alvo_id` é coluna `uuid` e `agents.id` é TEXT; o agente é atribuído pela coluna `agent_id` e por `metadata`.
+- **O bucket `system` quando o alvo ainda não existe** — `admin_audit_log.tenant_id` é `REFERENCES tenants(id)` (`migrations/047_admin_audit_log.sql:10`), e a saga audita **antes** de `provision_tenant` criar o tenant. `resolveAuditTenant` (`src/db/repositories/onboarding-repos.ts`) resolve, no mesmo `tx`, se o tenant-alvo já existe: existindo, a linha vai para ele; não existindo, vai para o bucket `system` (semeado por `migrations/014_p0_seed_system_tenant.sql`) com o alvo preservado em `change_summary.target_tenant_id`. A trilha nunca some e continua atribuível — buscar por `change_summary->>'target_tenant_id'` responde "quem iniciou/cancelou o onboarding do tenant X". Como o SELECT roda dentro do `tx`, do passo `provision_tenant` em diante a auditoria já usa o tenant real.
+- **Vocabulário de enum vem do schema, não do módulo** — os literais que a saga escreve em coluna com `CHECK` moram em constantes nomeadas (`SAGA_ENUM_WRITES` em `provisioning.ts`), e `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` confronta cada um com o `CHECK` efetivo lido de `migrations/*.sql` — **sem banco**. Foi assim que `agents.status='provisioning'` (fora do `CHECK` de 007 até a migration 110) e `channel_policies.switch_behavior='fixed'` (vocabulário paralelo inventado; o real é `locked|prefer_handoff|free_with_trigger|by_context`) deixaram de ser possíveis de reintroduzir sem um teste vermelho.
 - **Backend decide** — todo payload passa por Zod antes de qualquer escrita; a UI propõe.
 - **Nada sensível persistido** — `sanitize.ts` redige por denylist de CHAVE (determinístico e auditável) em `metadata`, `summary` e `result`. Telefone, e-mail, QR, código de pareamento e token nunca entram.
 
@@ -137,7 +143,8 @@ O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_age
 |---|---|
 | Novo check de readiness | Adicione o código a `READINESS_CHECK_CODES`, o fato a `ReadinessFacts`, o check a `evaluateReadinessFacts` e a leitura a `readiness-facts.ts`. O teste de contrato exige um check por código |
 | Novo passo da saga | `ONBOARDING_STEPS` + `STEP_DEFINITIONS` (state-machine), schema em `STEP_PAYLOAD_SCHEMAS`, `apply*` em `provisioning.ts`, `case` no `switch` de `wizard.ts` |
-| Novo estado | `ONBOARDING_STATES` **e** o `CHECK` de uma migration NOVA (108 está mergeada — migrations são append-only) |
+| Novo estado | `ONBOARDING_STATES` **e** o `CHECK` de uma migration NOVA (109 está mergeada — migrations são append-only) |
+| Novo literal de status/enum em coluna com `CHECK` | Declare a constante e registre em `SAGA_ENUM_WRITES` (`provisioning.ts`). Se o `CHECK` não o admitir, `schema-constraint-compatibility.spec.ts` falha **sem banco** e a correção é uma migration nova alargando o `CHECK` (padrão `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT`, como a 110) — nunca editar a migration mergeada |
 | Trocar a fonte dos fatos | Injete `deps.loadFacts` em `evaluateAgentReadiness` |
 
 ## Public surface

@@ -38,6 +38,38 @@ Leitura dos `event_type`:
 | `step_failed` | falha de infraestrutura |
 | `run_expired` | a varredura de TTL encerrou a run |
 
+### A trilha administrativa de uma run — cuidado com o bucket `system`
+
+`admin_audit_log.tenant_id` é FK para `tenants(id)`, e os primeiros eventos de
+uma run acontecem **antes** de `provision_tenant` criar o tenant. Essas linhas
+ficam no bucket `system`, com o alvo pretendido em
+`change_summary.target_tenant_id`. **Filtrar só por `tenant_id` perde o começo
+da história.** A consulta certa cobre os dois:
+
+```sql
+SELECT created_at, action, tenant_id, actor_id,
+       change_summary->>'target_tenant_id' AS alvo,
+       change_summary->>'step'             AS passo
+  FROM admin_audit_log
+ WHERE tenant_id = :tenant
+    OR change_summary->>'target_tenant_id' = :tenant
+ ORDER BY id;
+```
+
+Por run (mais direto, e usa `admin_audit_log_resource_idx`):
+
+```sql
+SELECT created_at, action, tenant_id, change_summary
+  FROM admin_audit_log
+ WHERE resource_type = 'onboarding_run' AND resource_id = :run_id
+ ORDER BY id;
+```
+
+As três decisões agente-escopadas (`agent_readiness_evaluated`,
+`agent_activation_approved|denied`) vão para `audit_log`, não para
+`admin_audit_log`, e com `alvo_id` nulo — o agente está em `audit_log.agent_id`
+e em `metadata->>'agent_id'`.
+
 ## 2. Retomar
 
 Uma run é retomável por construção: o estado está no banco, não em memória.
@@ -144,6 +176,18 @@ A ordem importa.
    Ele derruba as três tabelas e **não** desprovisiona nada: tenants, agentes,
    profiles, papéis, políticas e canais criados por uma run permanecem. O
    sistema volta ao provisionamento manual router-a-router.
+5. **`migrations/110_agents_status_provisioning_down.sql` só depois disso**, e
+   sabendo o que ele faz: agentes parados em `agents.status='provisioning'`
+   viram `paused`, porque o vocabulário antigo não tem como dizer "em
+   onboarding" e `active` colocaria em serviço um agente sem profile, sem papel
+   padrão e sem política de canal. Confira antes quem seria afetado:
+
+   ```sql
+   SELECT id, tenant_id, updated_at FROM agents WHERE status = 'provisioning';
+   ```
+
+   A informação não se perde: `onboarding_runs` e `admin_audit_log`
+   (`onboarding_agent_provisioned`) continuam contando a história.
 
 O readiness canônico **não** precisa de rollback: ele é somente-leitura e não
 substituiu nenhum cálculo anterior — o dashboard e o go-live checklist do
