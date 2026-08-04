@@ -97,6 +97,59 @@ export const SPAN_NAMES: readonly SpanName[] = Object.freeze(
 /** Terminal status of a span. Mirrors the metric `status` enum. */
 export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
 
+/**
+ * Issue #535 §1 — is this span actually EMITTED, or only declared?
+ *
+ * The whole complaint the issue opens with is that "quem ler
+ * `src/observability/taxonomy.ts` pode concluir que a cobertura é maior do que
+ * é". A declaration that nothing emits reads exactly like coverage. Rather
+ * than deleting the roadmap (the tree IS the target shape, and every name in
+ * it is referenced by the SLI narrative), the gap is made MACHINE-CHECKABLE:
+ * each span declares whether an instrumentation site exists today, and
+ * `tests/unit/observability/tracer.spec.ts` pins the `emitted` set exactly.
+ *
+ * So the file can no longer overstate coverage: adding a name here without an
+ * emitter fails a test, and shipping an emitter without flipping the flag
+ * fails the same test.
+ *
+ * Current emitters:
+ *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
+ *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
+ *                            `observability/instrumentation.ts`
+ */
+export type SpanEmission = 'emitted' | 'declared';
+
+export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.freeze({
+  [SPAN.TURN]: 'emitted',
+  [SPAN.INGRESS_NORMALIZE]: 'declared',
+  [SPAN.INGRESS_PERSIST]: 'declared',
+  [SPAN.QUEUE_WAIT]: 'emitted',
+  [SPAN.IDENTITY_RESOLVE]: 'declared',
+  [SPAN.AUDIENCE_RESOLVE]: 'declared',
+  [SPAN.PRETURN_GRAPH]: 'declared',
+  [SPAN.ROLE_SELECT]: 'declared',
+  [SPAN.PROCEDURE_SELECT]: 'declared',
+  [SPAN.RISK_CLASSIFY]: 'declared',
+  [SPAN.DECISION_EVALUATE]: 'declared',
+  [SPAN.CONTEXT_LOAD]: 'declared',
+  [SPAN.PROMPT_RENDER]: 'declared',
+  [SPAN.REACT_ITERATION]: 'declared',
+  [SPAN.LLM_REQUEST]: 'declared',
+  [SPAN.TOOL_DISPATCH]: 'emitted',
+  [SPAN.PERMISSION_CHECK]: 'declared',
+  [SPAN.CONSTITUTIONAL_CHECK]: 'declared',
+  [SPAN.IDEMPOTENCY_CLAIM]: 'declared',
+  [SPAN.HANDLER_EXECUTE]: 'declared',
+  [SPAN.OUTBOUND_COMMIT]: 'declared',
+  [SPAN.WHATSAPP_SEND]: 'declared',
+  [SPAN.TURN_COMPLETE]: 'declared',
+});
+
+/** The spans an instrumentation site exists for today. */
+export const EMITTED_SPANS: readonly SpanName[] = Object.freeze(
+  SPAN_NAMES.filter((s) => SPAN_EMISSION[s] === 'emitted'),
+);
+
 // ============================================================================
 // 2. Metrics — the minimum set (issue #514 §5)
 // ============================================================================
@@ -130,7 +183,19 @@ export const METRIC = {
 
   // --- context / db --------------------------------------------------------
   CONTEXT_LOAD_MS: 'maia_context_load_ms',
+  /** Turn-context slices assembled, by slice + outcome (issue #535 §2). */
+  CONTEXT_SLICES: 'maia_context_slices_total',
+  /**
+   * pg pool saturation, `state` ∈ total|idle|waiting|max (issue #535 §2).
+   * `waiting` climbing while `idle` is 0 IS the saturation incident.
+   */
   DB_POOL: 'maia_db_pool',
+
+  // --- scheduler (issue #535 §2) ------------------------------------------
+  /** How late the oldest DUE-but-unclaimed unit of work is, per `queue`. */
+  SCHEDULER_LAG_MS: 'maia_scheduler_lag_ms',
+  /** How many units of work are due and still unclaimed, per `queue`. */
+  SCHEDULER_BACKLOG: 'maia_scheduler_backlog',
 
   // --- llm -----------------------------------------------------------------
   LLM_CALLS: 'maia_llm_calls_total',
@@ -145,7 +210,14 @@ export const METRIC = {
   OUTBOUND_COMMITTED: 'maia_outbound_committed_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
+  /**
+   * WhatsApp session presence, `state` ∈ connected|disconnected (issue #535
+   * §2). Exactly one series is 1 — the pair makes "no session at all" and
+   * "session down" distinguishable from a missing scrape.
+   */
   WHATSAPP_SESSIONS: 'maia_whatsapp_sessions',
+  /** Seconds since the WhatsApp socket last dropped. Growing = healthy. */
+  WHATSAPP_SESSION_AGE_SECONDS: 'maia_whatsapp_session_age_seconds',
 
   // --- workers / schedulers ------------------------------------------------
   WORKER_RUN: 'maia_worker_run_total',
@@ -158,6 +230,23 @@ export const METRIC = {
   LABEL_REJECTED: 'maia_metric_label_rejected_total',
   /** A label value exceeded its cardinality budget and fell into overflow. */
   LABEL_CARDINALITY_OVERFLOW: 'maia_metric_label_cardinality_overflow_total',
+
+  // --- OTLP exporter self-health (issue #535 §1) ---------------------------
+  /** Spans handed to the OTLP transport and accepted by the collector. */
+  OTLP_SPANS_EXPORTED: 'maia_otlp_spans_exported_total',
+  /**
+   * Spans that never reached the collector, by `reason` (`queue_full`,
+   * `not_sampled`, `transport`, `http_status`, `shutdown`, `attributes`).
+   * An exporter that silently loses spans is worse than no exporter: the gaps
+   * read as "nothing happened".
+   */
+  OTLP_SPANS_DROPPED: 'maia_otlp_spans_dropped_total',
+  /** Wall time of one export request. */
+  OTLP_EXPORT_MS: 'maia_otlp_export_duration_ms',
+  /** Spans currently waiting in the batch queue. */
+  OTLP_QUEUE_DEPTH: 'maia_otlp_queue_depth',
+  /** A span attribute was dropped/sanitized by the span-attribute gate. */
+  SPAN_ATTRIBUTE_REJECTED: 'maia_span_attribute_rejected_total',
 } as const;
 
 export type MetricName = (typeof METRIC)[keyof typeof METRIC];
@@ -372,3 +461,65 @@ export const SANITIZED_VALUE = '__sanitized__';
 
 /** Max characters kept for any label value. */
 export const MAX_LABEL_VALUE_LENGTH = 64;
+
+// ============================================================================
+// 4. Span attributes (issue #535 §1)
+// ============================================================================
+
+/**
+ * Span attributes are NOT metric labels, and the difference is deliberate.
+ *
+ * A metric label mints a time series forever, so `labels.ts` bans every
+ * correlation id. A span attribute lives on ONE exported span: it costs no
+ * series, and carrying `trace_id`/`turn_id` there is exactly what
+ * `governance-observability.md` §4.4c prescribes ("high-cardinality
+ * correlation ids live in logs and traces, never in labels").
+ *
+ * What does NOT change between the two surfaces: message content, phone
+ * numbers, JIDs, e-mails, person names, URLs and raw error strings are
+ * forbidden in BOTH. The OTLP exporter ships to a third-party collector, so if
+ * anything the value guard here matters more than the label one.
+ *
+ * `SPAN_ATTRIBUTE_KEYS` = every metric label key (so instrumentation can pass
+ * one bag to both surfaces) PLUS the enumerated correlation ids below.
+ */
+export const SPAN_CORRELATION_KEYS: ReadonlySet<string> = new Set([
+  'trace_id',
+  'turn_id',
+  'attempt',
+  'attempt_id',
+  'conversa_id',
+  'root_trace_id',
+]);
+
+export const SPAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  ...ALLOWED_LABEL_KEYS,
+  ...SPAN_CORRELATION_KEYS,
+  // span-only numerics — bounded magnitudes, never identifiers
+  'duration_ms',
+  'attempt_count',
+  'item_count',
+  'byte_count',
+  'sampled',
+]);
+
+/**
+ * Deny list for span attributes. Same PII/content vocabulary as the metric
+ * deny list MINUS the correlation ids that spans are allowed to carry — the
+ * whole point of a trace is to join on those.
+ */
+export const FORBIDDEN_SPAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set(
+  [...FORBIDDEN_LABEL_KEYS].filter((k) => !SPAN_CORRELATION_KEYS.has(k)),
+);
+
+export const FORBIDDEN_SPAN_KEY_SUBSTRINGS: readonly string[] = Object.freeze(
+  FORBIDDEN_KEY_SUBSTRINGS.filter(
+    (frag) => frag !== 'trace_id' && frag !== 'conversa' && frag !== 'conversation',
+  ),
+);
+
+/** Max characters kept for any span attribute value. */
+export const MAX_SPAN_ATTRIBUTE_VALUE_LENGTH = 128;
+
+/** Max attributes kept on one span — a bag, not a payload channel. */
+export const MAX_SPAN_ATTRIBUTES = 24;

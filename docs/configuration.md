@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
+| `runtime` | 172 | 19 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
@@ -177,6 +177,10 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `TELEGRAM_BOT_TOKEN` | string | — | sim | `runtime`, `backup`, `maintenance` | sim | Token do bot do Telegram. Obrigatória quando ALERT_CHANNELS contém telegram. |
 | `TELEGRAM_CHAT_ID` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Chat de destino dos alertas no Telegram. Obrigatória quando ALERT_CHANNELS contém telegram. |
 | `DLQ_ALERT_THRESHOLD` | number | `10` | não | `runtime`, `maintenance` | sim | Tamanho da DLQ que dispara alerta. |
+| `MAIA_OTLP_TRACES_ENDPOINT` | string | — | não | `runtime` | sim | Endpoint OTLP/HTTP de traces (ex.: http://collector:4318/v1/traces). Vazio = exporter INERTE: nenhum span é amostrado, montado ou enviado, e o hot path fica idêntico ao anterior (#535). |
+| `MAIA_OTLP_TRACES_HEADERS` | string | — | sim | `runtime` | sim | Headers extras do exporter OTLP no formato k=v,k=v (tipicamente autenticação do collector). Segredo — nunca aparece em log nem em /metrics. |
+| `MAIA_OTLP_SAMPLE_RATIO` | number | `0.05` | não | `runtime` | sim | Fração de turnos amostrados para OTLP (0..1). A decisão é DERIVADA do trace_id, então gateway e worker chegam ao mesmo veredito sem propagar bit de amostragem — um turno amostrado é amostrado inteiro. |
+| `MAIA_OTLP_SERVICE_NAME` | string | `maia-runtime` | não | `runtime` | sim | Valor de `service.name` no resource OTLP. |
 
 ### Backup / restore
 

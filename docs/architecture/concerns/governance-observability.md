@@ -67,16 +67,24 @@ Observability with tenant attribution is the operational corollary: a dashboard 
 | `src/lib/logger.ts` | Pino structured logger |
 | `src/lib/metrics.ts` | `incCounter()`, `observeHistogram()`, `setGaugeProvider()` — Prometheus-compatible registry (the **transport**) |
 | `src/lib/alerts.ts` | Alert channels (email / Telegram) |
-| `src/observability/taxonomy.ts` | **Issue #514** — canonical span tree, metric names, label allow/deny lists, cardinality budgets |
+| `src/observability/taxonomy.ts` | **Issues #514 + #535** — canonical span tree + **emission status per span**, metric names, label/span-attribute allow-deny lists, cardinality budgets |
 | `src/observability/labels.ts` | Label sanitizer — the fail-closed gate between instrumentation and the registry |
+| `src/observability/span-attributes.ts` | **#535** — the same gate for OTLP span attributes (one deliberate divergence: correlation ids are allowed) |
 | `src/observability/metrics.ts` | Sanitized emitters (`counter`/`histogram`/`gauge`) — the **policy layer** over `lib/metrics.ts` |
 | `src/observability/correlation.ts` | Correlation ALS — one `trace_id` per turn, propagated ingress → queue → worker → decision → trace → logs |
+| `src/observability/tracer.ts` | **#535** — span emission: W3C ids derived from the Maia `trace_id`, derived head sampling, ALS parent chain |
+| `src/observability/otlp-exporter.ts` | **#535** — dependency-free OTLP/HTTP JSON exporter: bounded queue, batching, counted loss |
+| `src/observability/instrumentation.ts` | **#535** — `instrumentToolDispatch` / `instrumentContextLoad` wrappers |
+| `src/observability/runtime-collectors.ts` | **#535** — pg pool, WhatsApp session, scheduler-lag gauges |
+| `src/observability/register.ts` | **#535** — single wiring point, called once from `src/server.ts` |
 | `src/observability/turn-trace.ts` | Adapter connecting the durable P10b `trace()` to the hot path |
 | `src/observability/queue-metrics.ts` | Queue depth + oldest-job-age gauges |
-| `src/observability/llm-metrics.ts` | LLM failure/retry/fallback counters |
+| `src/observability/turn-state-collector.ts` | Live turn count + per-state age gauges (#503) |
+| `src/lib/llm/telemetry.ts` | LLM call/latency/token/failure counters (the gateway owns them since #508) |
 | `src/observability/redis-memory-collector.ts` | Redis memory pressure gauges (#297) |
-| `monitoring/alerts/slo.rules.yml` | Recording rules, 18 alerts, error-budget burn rate |
-| `docs/runbooks/observability-slo.md` | SLIs/SLOs, per-alert operator reaction, clock semantics |
+| `monitoring/alerts/slo.rules.yml` | Recording rules, 27 alerts, error-budget burn rate |
+| `monitoring/dashboards/` | **#535** — three versioned Grafana dashboards (correção · capacidade · ação) |
+| `docs/runbooks/observability-slo.md` | SLIs/SLOs, per-alert operator reaction, clock semantics, OTLP rollout |
 
 ### Admin UI (governance surface)
 
@@ -146,12 +154,41 @@ Context builders must **not** mint a new root (`build-base-context.ts:83`,
 
 `tenant_id` + `agent_id` are the sanctioned exception (§4.3 above), still
 cardinality-capped. High-cardinality correlation ids live in **logs and
-traces** (`correlationLogFields()`), never in labels. Nothing throws in
+traces** — `correlationLogFields()` for logs, `span-attributes.ts` for OTLP
+spans (issue #535) — never in labels. Nothing throws in
 production; `MAIA_STRICT_METRIC_LABELS=true` promotes a violation to a test
 failure. Both that flag and `FEATURE_RUNTIME_TRACE_V1` are declared in the
 configuration contract (`src/config/contract.ts`, issue #515) and read through
 the typed loader — never `process.env` — so both are validated at boot and
 `restartRequired`.
+
+### 4.4d Two trace surfaces, one id (issue #535)
+
+There are now **two** traces, and conflating them is the mistake to avoid:
+
+| | Durable trace (P10b) | Operational trace (OTLP) |
+|---|---|---|
+| Purpose | governed evidence | latency waterfall |
+| Storage | `runtime_trace_envelopes/_bodies` | third-party collector |
+| Sampling | never | `MAIA_OTLP_SAMPLE_RATIO`, default 5% |
+| Integrity | HMAC-chained | none — it is not a system of record |
+| Off switch | `FEATURE_RUNTIME_TRACE_V1` | absent `MAIA_OTLP_TRACES_ENDPOINT` |
+
+They **join on one id**: the W3C trace id is `mensagens.id` with the dashes
+removed, so one value addresses the durable envelope, the log line, the Trace
+Explorer and the collector. `tracer.ts` derives it rather than minting a
+parallel id, for the same reason `deriveTraceId` is derived: an id you have to
+carry is an id you can lose.
+
+Sampling is **derived from the trace id, never rolled**. A turn crosses
+processes (ingress → BullMQ → worker); if each rolled its own dice we would
+export half-traces, and a missing half reads as "that stage never ran". Hashing
+the id makes every process reach the same verdict with nothing to propagate.
+
+The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
+`emitted` or `declared`, and `tests/unit/observability/tracer.spec.ts` fails if
+the two drift. Today `turn`, `queue.wait` and `tool.dispatch` are emitted; the
+other 20 are declared.
 
 ### 4.5 Drift detector — 7 types × 4 severities
 
@@ -171,7 +208,11 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 |---|---|
 | Direct `INSERT INTO audit_logs` | Bypasses `audit()`'s context capture and counter emission. Use `audit()`. |
 | `incCounter()` directly for a NEW metric | Bypasses the label sanitizer. Use `src/observability/metrics.ts` and declare the name in `taxonomy.ts` first. |
-| `conversa_id` / `trace_id` / phone as a metric label | Unbounded cardinality + PII. Put it in the log line (`correlationLogFields()`) or the trace. |
+| `conversa_id` / `trace_id` / phone as a metric label | Unbounded cardinality + PII. Put it in the log line (`correlationLogFields()`) or the span attribute (`span-attributes.ts`), never the label. |
+| Free text (a policy reason, an error message) as a span attribute | The collector is a third party. `span-attributes.ts` replaces it with `__sanitized__`; the detail belongs in the log line. |
+| Marking a span `emitted` in `SPAN_EMISSION` without an emitter | This is the exact defect issue #535 opens with — a declaration that reads as coverage. The tracer spec fails on it. |
+| Treating a returned `{ error }` from `dispatchTool` as success | The dispatcher signals denial by RETURNING. Classify with `classifyToolResult`, or the tool SLI reads 0% while the agent cannot act. |
+| Reading a missing pool/session/scheduler gauge as a healthy 0 | Every #535 collector renders `NaN` when it cannot read its source; `Maia*MetricsAbsent` exists for this. |
 | Minting a fresh `trace_id` inside a context builder | Splits one turn into several traces. Read `currentTraceId()` first. |
 | Reading an absent metric as a healthy `0` | A gauge that cannot be read renders `NaN` on purpose. `MaiaQueueMetricsAbsent` exists for this. |
 | Relaxing the label sanitizer to fix a cardinality alert | Fix the call site. The sanitizer is the invariant, not the symptom. |
@@ -202,6 +243,13 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/unit/observability/turn-trace.spec.ts` | Envelope fail-loud semantics + body privacy |
 | `tests/unit/observability/slo-rules.spec.ts` | Alert rules ↔ emitted metrics drift guard |
 | `tests/unit/observability/runtime-trace-repo.spec.ts` | Trace Explorer tenant fail-closed + keyset cursor |
+| `tests/unit/observability/span-attributes.spec.ts` | Span-attribute gate: PII out, correlation ids in (issue #535) |
+| `tests/unit/observability/tracer.spec.ts` | Inert-when-off, id correlation, derived sampling, taxonomy honesty |
+| `tests/unit/observability/otlp-exporter.spec.ts` | OTLP wire contract + bounded/counted loss |
+| `tests/unit/observability/runtime-collectors.spec.ts` | pool/session/scheduler gauges render NaN, never a healthy 0 |
+| `tests/unit/observability/instrumentation.spec.ts` | Returned `{error}` is classified, not counted as success |
+| `tests/unit/observability/dashboards.spec.ts` | Dashboards ↔ emitted metrics / recording rules drift guard |
+| `tests/unit/observability/overhead-benchmark.spec.ts` | Per-emission cost + cardinality budget actually bounds series |
 | `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
 | `tests/integration/observability-hot-path-trace.spec.ts` | Hot-path trace through the real HMAC/redaction writers |
 
@@ -221,17 +269,27 @@ At last verification:
 - P3c (procedure governance ops) — partial: `procedure_metrics` materialized view, full test runner, full step-evaluator (`llm_judge` / `user_signal` / `human_confirmed`) still in iteration. See `README.md` § Estado atual.
 - Capability dialogical-acquisition 4-level escalation — in production; loop closure post-acquisition still being tuned.
 
-Issue #514 (tracing E2E / metrics / SLOs) landed the foundation. Still open —
-do **not** assume coverage that does not exist:
+Issue #514 landed the foundation; issue #535 landed the exporter, four of the
+five missing metric families and the dashboards. Still open — do **not** assume
+coverage that does not exist:
 
-- **No OTLP exporter.** The span taxonomy is declared (`taxonomy.ts`) but no
-  operational spans are emitted or exported; only the durable compliance trace
-  is written.
+- **Span emission is partial.** `turn`, `queue.wait` and `tool.dispatch` have
+  emitters; the other 20 taxonomy entries are marked `declared` in
+  `SPAN_EMISSION` and produce nothing. The marking is test-enforced, so this
+  list cannot silently go stale.
+- **`context.load` is not emitted on the hot path.** `instrumentContextLoad`
+  exists and is tested, but the turn's context assembly lives in
+  `src/agent/prompt-builder.ts`, which #535 did not touch. `maia_context_load_ms`
+  therefore has no production series yet — one wrap away.
 - **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
   pending the canary rollout in `docs/runbooks/observability-slo.md`.
-- **Not yet instrumented**: tool dispatch, context load, DB pool saturation,
-  WhatsApp session/reconnect, scheduler lag, outbound send duration.
-- **No versioned dashboards** and no published overhead/cardinality benchmark.
+- **Not yet instrumented**: outbound send duration (`maia_outbound_send_ms`),
+  ingress normalize/persist, identity/audience resolution.
+- **The overhead benchmark is micro, not under load.** Real cardinality under
+  production traffic is still unmeasured; the budget is proven to BOUND the
+  series count, not sized against observed traffic.
+- **`root_trace_id` / `attempt` are still outside `envelope_hmac`** — the
+  owner decision the issue asks for has not been recorded.
 
 ## 7.5 Documented exception — staging de inbound não-roteado (`inbound_unrouted`)
 
@@ -276,11 +334,16 @@ Verify with `gh pr list --state open --search "audit OR governance OR trace OR i
 - **Dual-pattern trace (envelope + body)** — envelope is durable + observable; body is detailed + redacted + HMAC-chained.
 - **Cognition proposes; governance gates** — every capability/skill/procedure/role change goes through proposal + owner approval. No self-modification.
 - **Policy DSL over imperative checks** — declarative rules in `policy-dsl/` keep governance out of executable code paths.
+- **OTLP without the OpenTelemetry SDK (#535)** — OTLP is a wire format, not a framework. The HTTP/JSON binding is a POST of a plain object; the SDK would add a large dependency tree, own the global tracer and monkey-patch `http`/`pg`/`ioredis` on import. The cost accepted in exchange: no auto-instrumentation, no cross-service context propagation, no protobuf binding.
+- **The OTLP trace id IS the Maia trace id (#535)** — a UUID and a W3C trace id are both 16 bytes, so one value addresses four surfaces instead of forcing an operator to correlate two id spaces.
+- **Sampling derived from the trace id, not rolled per process (#535)** — a turn crosses processes; independent dice produce half-traces, and a missing half reads as "that stage never ran".
+- **Span attributes may carry correlation ids; metric labels may not (#535)** — a label mints a time series forever, a span attribute lives on one span. Content, phones, JIDs and free text are forbidden on both.
+- **Span emission status is declared and test-enforced (#535)** — the taxonomy states which spans have emitters, so it cannot overstate coverage.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
+| Last verified | 2026-08-04 |
+| Against `main` HEAD | `7b34e7e` + issue #535 |
 | Re-verify when | Older than 30 days; OR `audit-actions.ts` adds a variant; OR `metrics.ts` changes counter labels; OR `runtime-trace/` changes envelope/body split; OR `policy-dsl/` adds an operator |

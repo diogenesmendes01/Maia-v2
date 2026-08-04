@@ -16,7 +16,8 @@ import {
   runWithCorrelation,
 } from '@/observability/correlation.js';
 import { counter, histogram } from '@/observability/metrics.js';
-import { METRIC } from '@/observability/taxonomy.js';
+import { METRIC, SPAN } from '@/observability/taxonomy.js';
+import { recordElapsedSpan, withSpan } from '@/observability/tracer.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
 
@@ -106,7 +107,22 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // process-local clock, so it survives a worker restart.
           if (typeof job.data.enqueued_at_ms === 'number') {
             const waited = Date.now() - job.data.enqueued_at_ms;
-            if (waited >= 0) histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
+            if (waited >= 0) {
+              histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
+              // Issue #535 — the same wait as a SPAN, so the backlog shows up
+              // in the waterfall next to the work it delayed. Reconstructed
+              // rather than wrapped: by the time this worker can observe the
+              // wait, the wait is over, so there is no callback to put a span
+              // around. Emitted BEFORE the `turn` span opens, so it is a
+              // SIBLING of the turn's work rather than a child of it — the
+              // waiting happened before the turn started running.
+              recordElapsedSpan(
+                SPAN.QUEUE_WAIT,
+                job.data.enqueued_at_ms,
+                job.data.enqueued_at_ms + waited,
+                { queue: 'agent' },
+              );
+            }
           }
           counter(METRIC.QUEUE_JOB_ATTEMPTS, {
             queue: 'agent',
@@ -145,7 +161,15 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // the instrumentation off the files #503 is rewriting.
           const t0 = Date.now();
           try {
-            await runWithSystemContext(() => processor(job));
+            // Issue #535 — the ROOT operational span. It wraps the same scope
+            // the turn metrics already measure, so span duration and
+            // `maia_turn_duration_ms` can never disagree, and every span opened
+            // deeper in the call stack (tool dispatch today, more later) lands
+            // under it via ALS without threading a context object through the
+            // hot path.
+            await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job)), {
+              attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
+            });
             recordTurnOutcome(job, 'completed', t0);
           } catch (err) {
             // A turn that throws with retries left is RETRYABLE, not failed —

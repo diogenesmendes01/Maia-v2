@@ -1,0 +1,143 @@
+{
+  "uid": "maia-llm-tools-otlp",
+  "title": "Maia — LLM, tools e exporter OTLP",
+  "description": "Camada de ação (gateway LLM + dispatch de tool) e a saúde do próprio pipeline de observabilidade. Runbook: docs/runbooks/observability-slo.md §4.9, §4.14, §4.15.",
+  "tags": ["maia", "llm", "tools", "otlp"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "LLM",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Erro de LLM por motivo",
+      "description": "`rate_limit` = reduza concorrência/negocie quota. `overloaded` = provider instável, o fallback já está atuando. `auth` = chave expirada, NÃO é transitório. `bad_request` = bug de payload nosso.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:llm_error_ratio:rate5m", "legendFormat": "razão de erro" },
+        {
+          "expr": "sum by (reason) (rate(maia_llm_calls_total{status=\"error\"}[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Latência e tokens de LLM",
+      "description": "Tokens agregados por `kind` (input/output/cache_read/cache_write) e SEM quebra por modelo de propósito: a issue predecessora já sinaliza tenant_id+agent_id+model como cardinalidade a revisar antes de crescimento multi-tenant — o painel não piora isso.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(maia_llm_latency_ms_bucket[5m])))",
+          "legendFormat": "latência p95"
+        },
+        {
+          "expr": "sum by (kind) (rate(maia_llm_tokens_total[5m]))",
+          "legendFormat": "tokens/s — {{kind}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Tools",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Dispatch de tool por desfecho",
+      "description": "`blocked` é a GOVERNANÇA negando — a plataforma funcionando, não um erro; por isso tem SLI próprio e fica fora do numerador de erro. `invalid` é o modelo gerando argumentos que o Zod rejeitou, e costuma subir junto com troca de modelo/prompt.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(maia_tool_dispatch_total[5m]))",
+          "legendFormat": "{{result}}"
+        },
+        { "expr": "maia:tool_error_ratio:rate5m", "legendFormat": "razão de erro" },
+        { "expr": "maia:tool_blocked_ratio:rate5m", "legendFormat": "razão bloqueada" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tools mais lentas (p95)",
+      "description": "topk mantém o painel legível e a consulta barata. O nome da tool é um conjunto fechado, orçado em 200 valores distintos — um bug que passe entrada de usuário como nome de tool degrada para `__overflow__`, não explode a série.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "topk(10, maia:tool_duration_ms:p95)", "legendFormat": "{{tool}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Exporter OTLP",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Spans exportados vs descartados",
+      "description": "`not_sampled` NÃO é perda — é MAIA_OTLP_SAMPLE_RATIO fazendo o trabalho dele, e está fora da razão de perda. Perda real é `queue_full` (o collector não drena), `transport` (rede/timeout) ou `http_4xx`/`http_5xx`.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(maia_otlp_spans_exported_total[5m]))",
+          "legendFormat": "exportados/s"
+        },
+        {
+          "expr": "sum by (reason) (rate(maia_otlp_spans_dropped_total[5m]))",
+          "legendFormat": "descartados/s — {{reason}}"
+        },
+        { "expr": "maia:otlp_drop_ratio:rate5m", "legendFormat": "razão de perda real" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Fila e duração do export",
+      "description": "A fila é limitada em 2048 spans de propósito: um outage do collector não pode virar um incidente de heap no processo que ele deveria estar observando. A fila encostando no teto é o precursor de `queue_full`.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "max(maia_otlp_queue_depth)", "legendFormat": "spans na fila (teto 2048)" },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(maia_otlp_export_duration_ms_bucket[5m])))",
+          "legendFormat": "duração do export p95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    }
+  ]
+}

@@ -17,6 +17,7 @@ import { isDbConnected, probeDb } from '@/db/client.js';
 import { startRedisMemoryCollector } from '@/observability/redis-memory-collector.js';
 import { registerTurnStateGauges } from '@/observability/turn-state-collector.js';
 import { registerQueueGauges } from '@/observability/queue-metrics.js';
+import { registerRuntimeObservability } from '@/observability/register.js';
 import { agentQueue, unroutedQueue } from '@/gateway/queue.js';
 
 export async function buildServer() {
@@ -46,6 +47,14 @@ export async function buildServer() {
   // `max by (queue, state)` in the recording rules collapses the duplicates.
   registerQueueGauges(agentQueue, 'agent');
   registerQueueGauges(unroutedQueue, 'unrouted-replay');
+
+  // Issue #535 §1/§2 — the families #514 declared but never emitted: pg pool
+  // saturation, WhatsApp session presence/age and scheduler lag, plus the OTLP
+  // span exporter. All inert by default: the gauges are scrape-time providers
+  // (no work until a scrape) and the exporter does nothing without
+  // `MAIA_OTLP_TRACES_ENDPOINT`. Awaited so a registration failure surfaces at
+  // boot rather than as a silently missing series during an incident.
+  await registerRuntimeObservability();
 
   // Sonda sintética (spec §1.6) — sinal PRIMÁRIO de outage, DURÁVEL (lido de
   // synthetic_probe_state.last_ok_at, não in-memory): segundos desde o último
@@ -79,6 +88,11 @@ export async function buildServer() {
   app.addHook('onClose', async () => {
     clearInterval(dbProbeTimer);
     redisMemoryCollector.stop();
+    // Issue #535 — stop the OTLP batch timer and make one last flush attempt,
+    // so the spans of the turns that ran just before a deploy are not the ones
+    // an operator loses.
+    const { stopOtlpExporter } = await import('@/observability/otlp-exporter.js');
+    await stopOtlpExporter();
   });
 
   // Issue #512 — three DISTINCT probes with three distinct jobs.
