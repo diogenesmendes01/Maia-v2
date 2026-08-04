@@ -30,7 +30,8 @@
  * agente-escopados que ocorrem DEPOIS da criação do agente (readiness,
  * ativação) também emitem `audit()` pós-commit — ver `wizard.ts`.
  */
-import { and, asc, desc, eq, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, lt, notInArray, or, sql } from 'drizzle-orm';
+import { TERMINAL_STATES } from '@/onboarding/state-machine.js';
 import { db, withTx } from '../client.js';
 import {
   admin_audit_log,
@@ -190,7 +191,6 @@ export const onboardingRunsRepo = {
     include_terminal?: boolean;
     limit?: number;
   }): Promise<OnboardingRunRow[]> {
-    const terminal = ['active', 'cancelled', 'failed_terminal'];
     return db
       .select()
       .from(onboarding_runs)
@@ -199,7 +199,7 @@ export const onboardingRunsRepo = {
           ? eq(onboarding_runs.tenant_id, input.tenant_id)
           : and(
               eq(onboarding_runs.tenant_id, input.tenant_id),
-              sql`${onboarding_runs.state} <> ALL(${terminal})`,
+              notInArray(onboarding_runs.state, [...TERMINAL_STATES]),
             ),
       )
       .orderBy(desc(onboarding_runs.created_at))
@@ -485,8 +485,7 @@ export const onboardingRunsRepo = {
       const run = lockedRows[0];
       if (!run) return { outcome: 'not_found' as const };
 
-      const terminal = ['active', 'cancelled', 'failed_terminal'];
-      if (terminal.includes(run.state)) {
+      if ((TERMINAL_STATES as readonly string[]).includes(run.state)) {
         return {
           outcome: 'invalid_transition' as const,
           run,
@@ -549,14 +548,13 @@ export const onboardingRunsRepo = {
    * continuar diagnosticável (critério de aceite da issue).
    */
   async expireStale(now: Date = new Date(), limit = 100): Promise<number> {
-    const terminal = ['active', 'cancelled', 'failed_terminal'];
     const stale = await db
       .select({ id: onboarding_runs.id })
       .from(onboarding_runs)
       .where(
         and(
           lt(onboarding_runs.expires_at, now),
-          sql`${onboarding_runs.state} <> ALL(${terminal})`,
+          notInArray(onboarding_runs.state, [...TERMINAL_STATES]),
         ),
       )
       .limit(limit);
@@ -572,7 +570,11 @@ export const onboardingRunsRepo = {
           .for('update')
           .limit(1);
         const run = rows[0];
-        if (!run || terminal.includes(run.state) || run.expires_at.getTime() > now.getTime()) {
+        if (
+          !run ||
+          (TERMINAL_STATES as readonly string[]).includes(run.state) ||
+          run.expires_at.getTime() > now.getTime()
+        ) {
           return false;
         }
         await tx
