@@ -201,6 +201,22 @@ export const METRIC = {
   LLM_CALLS: 'maia_llm_calls_total',
   LLM_TOKENS: 'maia_llm_tokens_total',
   LLM_LATENCY_MS: 'maia_llm_latency_ms',
+  /**
+   * Circuit-breaker state per `(provider, workload)`, `state` ∈
+   * closed|half_open|open (issue #534). Exactly one series is 1 — same shape as
+   * `LIFECYCLE_STATE` and `WHATSAPP_SESSIONS`, and for the same reason: a
+   * single gauge encoding 0/1/2 cannot be read in PromQL without a legend, and
+   * makes "never exercised" indistinguishable from "closed".
+   *
+   * No `tenant_id`/`agent_id`: the breaker measures the health of a shared
+   * external dependency, not tenant data. Attribution of each *refusal* lives
+   * on `LLM_CALLS{status="circuit_open"}`, which is tenant-scoped.
+   */
+  LLM_CIRCUIT_STATE: 'maia_llm_circuit_state',
+  /** Breaker state changes. `state` is the state entered; `reason` is why. */
+  LLM_CIRCUIT_TRANSITIONS: 'maia_llm_circuit_transitions_total',
+  /** Calls refused by an open/half-open breaker, i.e. load actually shed. */
+  LLM_CIRCUIT_SHORT_CIRCUITED: 'maia_llm_circuit_short_circuited_total',
 
   // --- tools ---------------------------------------------------------------
   TOOL_DISPATCH: 'maia_tool_dispatch_total',

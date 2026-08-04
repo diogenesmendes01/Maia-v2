@@ -105,11 +105,31 @@ deixa de custar 123ms de p50 para custar ~0.
 | Cooldown | 5s, dobrando a cada janela de sondas que falha inteira, teto de 60s | O cooldown é o tempo em que ainda recusamos DEPOIS de o provider voltar: medido em 10s, custava ~63 requests a mais numa corrida de 200; com 5s caiu para ~52 e a queda longa continua protegida pelo backoff |
 | Sem env var | Constantes versionadas | Mesma postura de `allow_fast_fallback`: degradação não deve ser toggle de runtime que alguém vira às 3h sem deixar rastro |
 
-Métricas: `maia_llm_circuit_state{provider,workload}` (gauge — `0` closed, `1`
-half_open, `2` open; é a série que o runbook §8 documentava e que **nada
-emitia** até esta issue), `maia_llm_circuit_transitions_total{from,to}` e
-`maia_llm_circuit_short_circuited_total`. Toda transição também sai no log como
-`llm_gateway.circuit_transition` com o motivo.
+Métricas: `maia_llm_circuit_state{provider,workload,state}` (gauge — **uma série
+por estado**, exatamente uma valendo `1`; é a série que o runbook §8 documentava
+e que **nada emitia** até esta issue), `maia_llm_circuit_transitions_total{provider,workload,state,reason}`
+e `maia_llm_circuit_short_circuited_total{provider,workload,state}`. Toda
+transição também sai no log como `llm_gateway.circuit_transition` com o motivo.
+
+Duas escolhas de formato, ambas herdadas de precedente do repo e não desta
+issue:
+
+- **Par de séries, não codificação numérica.** Mesmo formato de
+  `maia_lifecycle_state{role,state}` (`src/runtime/lifecycle/controller.ts:197`)
+  e `maia_whatsapp_sessions{state}`. Um gauge único valendo `0/1/2` não se lê em
+  PromQL sem legenda e torna "par nunca exercitado" indistinguível de "closed" —
+  e é justamente o par sem série que diz que aquele workload nunca rodou.
+- **Emissão por `@/observability/metrics.js`, nunca por `@/lib/metrics.js`.** É
+  na camada de observabilidade que moram a allowlist de label, a deny list e o
+  orçamento de cardinalidade da #514. Emitir direto na camada de baixo fura o
+  gate. Consequência prática: `from`/`to` não estão na allowlist e seriam
+  descartados em silêncio, então o contador carrega `state` (o estado entrado) e
+  `reason`; a transição completa fica no log, que não tem cardinalidade.
+
+O gauge **não** carrega `tenant_id`/`agent_id` — `gauge()` já força
+`attribute: false`. O estado mede a saúde de uma dependência externa
+compartilhada, não dado de tenant. A atribuição de cada recusa vive em
+`maia_llm_requests_total{status="circuit_open"}`, essa sim com escopo de tenant.
 
 Recusa é o kind `circuit_open`: não retentável (retentar é o que o disjuntor
 impede), com `retry_after_ms` = cooldown restante, e emitida ANTES de resolver

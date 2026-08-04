@@ -300,16 +300,20 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
-| `maia_llm_circuit_state{provider,workload}` | gauge | `=1` (open) por > 2min |
-| `maia_llm_circuit_transitions_total{provider,workload,from,to}` | counter | qualquer transição para `open` |
+| `maia_llm_circuit_state{provider,workload,state}` | gauge | `{state="open"} == 1` por > 2min |
+| `maia_llm_circuit_transitions_total{provider,workload,state,reason}` | counter | qualquer transição com `state="open"` |
 | `maia_llm_circuit_short_circuited_total{provider,workload,state}` | counter | rate alto = carga sendo recusada |
 | `maia_llm_requests_total{status="circuit_open"}` | counter | separa carga recusada por nós de erro do provider |
 
-O gauge vale `0` closed, `1` open, `2` half-open. Ele é registrado pelo próprio
-disjuntor (`src/lib/llm/circuit-breaker.ts`), sob demanda, na primeira vez que
-um par `(provider, workload)` é exercitado — não há nada a ligar em
-`src/server.ts`. Um par que nunca recebeu tráfego não tem série, o que é
-diferente de ter série em `0`.
+O gauge é um **par de séries**, uma por estado, exatamente uma valendo `1` —
+mesmo formato de `maia_lifecycle_state{role,state}`. Alerte em
+`maia_llm_circuit_state{state="open"} == 1`, nunca num valor numérico.
+
+Ele é registrado pelo próprio disjuntor (`src/lib/llm/circuit-breaker.ts`), sob
+demanda, na primeira vez que um par `(provider, workload)` é exercitado — não há
+nada a ligar em `src/server.ts`. **Um par que nunca recebeu tráfego não tem
+série alguma**, o que é diferente de ter série em `0`: a primeira coisa a checar
+quando um alerta não dispara é se aquele workload chegou a rodar.
 
 ### 8.1 Probes — qual endpoint usar onde (issue #512)
 

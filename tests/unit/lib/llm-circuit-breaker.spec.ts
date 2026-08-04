@@ -354,46 +354,80 @@ describe('circuit breaker — aberto e half-open', () => {
 // ---------------------------------------------------------------------------
 
 describe('circuit breaker — métrica maia_llm_circuit_state', () => {
-  /** O gauge é registrado pelo NOME já rotulado (mesmo padrão do lifecycle). */
-  function gaugeFor(provider: string, workload: string): (() => number) | undefined {
-    const series = `maia_llm_circuit_state{provider="${provider}",workload="${workload}"}`;
+  /**
+   * O gauge é registrado pelo NOME já rotulado, uma série POR ESTADO — mesmo
+   * padrão de `maia_lifecycle_state{role,state}` e `maia_whatsapp_sessions`.
+   * As chaves saem ordenadas alfabeticamente por `gaugeName()`, e o provider
+   * registrado é async porque `observability/metrics.ts` embrulha a leitura
+   * para devolver NaN (nunca 0) quando a fonte não pode ser lida.
+   */
+  function gaugeFor(
+    provider: string,
+    workload: string,
+    state: string,
+  ): (() => Promise<number>) | undefined {
+    const series = `maia_llm_circuit_state{provider="${provider}",state="${state}",workload="${workload}"}`;
     const hit = setGaugeProviderMock.mock.calls.filter((c) => c[0] === series).pop();
-    return hit?.[1] as (() => number) | undefined;
+    return hit?.[1] as (() => Promise<number>) | undefined;
   }
 
-  it('registra o gauge na PRIMEIRA chamada, antes de qualquer incidente', () => {
+  /** Lê as três séries do par e devolve o estado que está valendo 1. */
+  async function activeState(provider: string, workload: string): Promise<string[]> {
+    const on: string[] = [];
+    for (const state of _internal.CIRCUIT_STATES) {
+      const g = gaugeFor(provider, workload, state);
+      expect(g, `série ${state} não registrada`).toBeTypeOf('function');
+      if ((await g!()) === 1) on.push(state);
+    }
+    return on;
+  }
+
+  it('registra as TRÊS séries na PRIMEIRA chamada, antes de qualquer incidente', async () => {
     acquireCircuit(KEY, T0);
-    const gauge = gaugeFor('anthropic', 'reasoner');
-    expect(gauge, 'gauge não registrado').toBeTypeOf('function');
-    expect(gauge!()).toBe(0);
+    // Uma série que só aparece durante o incidente é inútil para alertar: não
+    // há linha de base. As três existem desde a primeira chamada.
+    expect(await activeState('anthropic', 'reasoner')).toEqual(['closed']);
   });
 
-  it('gauge acompanha closed=0 → open=2 → half_open=1 → closed=0', () => {
+  it('exatamente UMA série vale 1 em closed → open → half_open → closed', async () => {
     acquireCircuit(KEY, T0);
-    const gauge = gaugeFor('anthropic', 'reasoner')!;
-    expect(gauge()).toBe(0);
+    expect(await activeState('anthropic', 'reasoner')).toEqual(['closed']);
 
     feed(KEY, 'fault', _internal.MIN_SAMPLES);
-    expect(gauge()).toBe(2);
+    expect(await activeState('anthropic', 'reasoner')).toEqual(['open']);
 
     const probe = acquireCircuit(KEY, T0 + _internal.OPEN_MS);
-    expect(gauge()).toBe(1);
+    expect(await activeState('anthropic', 'reasoner')).toEqual(['half_open']);
 
     releaseCircuit(probe, 'ok', T0 + _internal.OPEN_MS);
-    expect(gauge()).toBe(0);
+    expect(await activeState('anthropic', 'reasoner')).toEqual(['closed']);
   });
 
-  it('cada transição incrementa maia_llm_circuit_transitions_total com from/to', () => {
+  it('um par (provider, workload) nunca exercitado não tem série alguma', () => {
+    acquireCircuit(KEY, T0);
+    // Distinguir "nunca exercitado" de "fechado" é justamente o que a
+    // codificação numérica 0/1/2 num gauge único não permitia.
+    expect(gaugeFor('openrouter', 'vision', 'closed')).toBeUndefined();
+    expect(gaugeFor('anthropic', 'reasoner', 'closed')).toBeTypeOf('function');
+  });
+
+  it('cada transição incrementa maia_llm_circuit_transitions_total com state/reason', () => {
     feed(KEY, 'fault', _internal.MIN_SAMPLES);
     const probe = acquireCircuit(KEY, T0 + _internal.OPEN_MS);
     releaseCircuit(probe, 'ok', T0 + _internal.OPEN_MS);
 
+    // `state` é o estado ENTRADO. `from`/`to` não estão em ALLOWED_LABEL_KEYS e
+    // seriam descartados em silêncio pelo gate de label da #514 — a transição
+    // completa vive no log estruturado, que não tem cardinalidade.
     const transitions = counterCalls('maia_llm_circuit_transitions_total');
-    expect(transitions).toEqual([
-      { provider: 'anthropic', workload: 'reasoner', from: 'closed', to: 'open' },
-      { provider: 'anthropic', workload: 'reasoner', from: 'open', to: 'half_open' },
-      { provider: 'anthropic', workload: 'reasoner', from: 'half_open', to: 'closed' },
-    ]);
+    expect(transitions.map((t) => t.state)).toEqual(['open', 'half_open', 'closed']);
+    for (const t of transitions) {
+      expect(t.provider).toBe('anthropic');
+      expect(t.workload).toBe('reasoner');
+      expect(t.reason, 'toda transição carrega um motivo').toBeTruthy();
+      expect(t).not.toHaveProperty('from');
+      expect(t).not.toHaveProperty('to');
+    }
   });
 });
 

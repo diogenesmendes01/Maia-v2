@@ -68,12 +68,21 @@
  *
  * ## Métrica
  *
- * `maia_llm_circuit_state{provider,workload}` — gauge documentada no runbook
- * operacional (§8) desde antes desta issue e que, até aqui, NADA emitia.
- * `0 = closed`, `1 = half_open`, `2 = open`.
+ * `maia_llm_circuit_state{provider,workload,state}` — gauge documentada no
+ * runbook operacional (§8) desde antes desta issue e que, até aqui, NADA
+ * emitia. UMA série por estado, exatamente uma valendo `1`.
+ *
+ * O formato é o de `maia_lifecycle_state{role,state}` e
+ * `maia_whatsapp_sessions{state}`, e pelo mesmo motivo: um gauge único
+ * codificando `0/1/2` não se lê em PromQL sem legenda, e torna "nunca
+ * exercitado" indistinguível de "fechado".
+ *
+ * A emissão passa por `@/observability/metrics.js`, não por `@/lib/metrics.js`:
+ * é lá que mora o gate de label (allowlist, deny list e orçamento de
+ * cardinalidade da #514). Emitir direto na camada de baixo fura o gate.
  */
 import { config } from '@/config/env.js';
-import { incCounter, setGaugeProvider } from '@/lib/metrics.js';
+import { counter, gauge, METRIC } from '@/observability/metrics.js';
 import { logger } from '@/lib/logger.js';
 import { workloadPolicy } from './workloads.js';
 import type { LLMErrorKind } from './errors.js';
@@ -81,8 +90,8 @@ import type { LLMWorkload } from './types.js';
 
 export type CircuitState = 'closed' | 'half_open' | 'open';
 
-/** Valor numérico exposto no gauge. Ordem = gravidade crescente. */
-const STATE_GAUGE: Record<CircuitState, number> = { closed: 0, half_open: 1, open: 2 };
+/** Os três estados, na ordem de gravidade crescente. */
+const CIRCUIT_STATES: readonly CircuitState[] = ['closed', 'half_open', 'open'];
 
 /**
  * Janela deslizante de observação. Curta de propósito: o disjuntor precisa
@@ -269,8 +278,19 @@ function keyOf(key: CircuitKey): string {
   return JSON.stringify([key.provider, key.workload]);
 }
 
-function gaugeSeries(entry: Entry): string {
-  return `maia_llm_circuit_state{provider="${entry.provider}",workload="${entry.workload}"}`;
+/**
+ * Registra as TRÊS séries do par para este `(provider, workload)`. Cada uma
+ * responde `1` quando o disjuntor está naquele estado e `0` caso contrário, de
+ * modo que a soma das três é sempre 1 enquanto a combinação existir.
+ */
+function registerStateGauges(entry: Entry): void {
+  for (const state of CIRCUIT_STATES) {
+    gauge(METRIC.LLM_CIRCUIT_STATE, () => (entry.state === state ? 1 : 0), {
+      provider: entry.provider,
+      workload: entry.workload,
+      state,
+    });
+  }
 }
 
 function getEntry(key: CircuitKey): Entry {
@@ -292,7 +312,7 @@ function getEntry(key: CircuitKey): Entry {
   // O gauge existe a partir da PRIMEIRA chamada daquela combinação, mesmo que
   // o disjuntor nunca abra: uma série que só aparece durante o incidente é
   // inútil para alertar (não há linha de base para comparar).
-  setGaugeProvider(gaugeSeries(created), () => STATE_GAUGE[created.state]);
+  registerStateGauges(created);
   return created;
 }
 
@@ -300,11 +320,14 @@ function transition(entry: Entry, to: CircuitState, reason: string): void {
   const from = entry.state;
   if (from === to) return;
   entry.state = to;
-  incCounter('maia_llm_circuit_transitions_total', {
+  // `state` é o estado ENTRADO e `reason` o porquê. `from`/`to` não estão em
+  // ALLOWED_LABEL_KEYS e seriam descartados em silêncio pelo gate — a transição
+  // completa fica no log estruturado logo abaixo, que não tem cardinalidade.
+  counter(METRIC.LLM_CIRCUIT_TRANSITIONS, {
     provider: entry.provider,
     workload: entry.workload,
-    from,
-    to,
+    state: to,
+    reason,
   });
   // Governança: mudança de estado do disjuntor é decisão do backend que altera
   // o comportamento observável do sistema. Vai para o log estruturado com
@@ -402,7 +425,7 @@ export function acquireCircuit(key: CircuitKey, now = Date.now()): CircuitPermit
 }
 
 function shed(entry: Entry): void {
-  incCounter('maia_llm_circuit_short_circuited_total', {
+  counter(METRIC.LLM_CIRCUIT_SHORT_CIRCUITED, {
     provider: entry.provider,
     workload: entry.workload,
     state: entry.state,
@@ -480,7 +503,7 @@ export const _internal = {
   OPEN_MS,
   MAX_OPEN_MS,
   HALF_OPEN_MAX_PROBES,
-  STATE_GAUGE,
+  CIRCUIT_STATES,
   PROVIDER_FAULT_KINDS,
   circuits,
   /** Test seam: zera todos os disjuntores entre casos. */
