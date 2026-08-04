@@ -25,6 +25,7 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { loadMigrationConfig } from '@/config/migration-config.js';
+import { ConfigValidationError } from '@/config/load.js';
 import {
   getSchemaReadiness,
   repairMigration,
@@ -203,7 +204,21 @@ if (isDirectInvocation(process.argv[1], import.meta.url) && !process.env.MIGRATE
       process.exitCode = code;
     },
     (err: unknown) => {
-      // Error CLASS only — a pg error message embeds the connection string.
+      // `ConfigValidationError` é a ÚNICA exceção à redaction, e é deliberada:
+      // sua mensagem é construída só com nome de variável, regra e remediação —
+      // nunca com o VALOR lido (`src/config/load.ts:59-68`), e é exatamente o
+      // formato que `npm run config:check` já imprime. Engoli-la transformava a
+      // falha mais provável do runner ("faltou POSTGRES_USER") em
+      // `unexpected failure (ConfigValidationError)`, que não diz o que fazer —
+      // desperdiçando o diagnóstico acionável que o contrato da #515 existe
+      // para dar.
+      if (err instanceof ConfigValidationError) {
+        console.error(`migrate: ${err.message}`);
+        process.exitCode = 2;
+        return;
+      }
+      // Para todo o resto, CLASSE apenas — a mensagem de um erro do pg embute a
+      // connection string com senha.
       const cls =
         typeof (err as { code?: unknown } | null)?.code === 'string'
           ? String((err as { code: string }).code)
