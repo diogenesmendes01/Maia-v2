@@ -1,11 +1,21 @@
 # Migrations runbook
 
 This runbook explains how to apply and (manually) revert SQL migrations
-in `migrations/`. The current setup uses a minimal viable layout: each
-migration `NNN_<name>.sql` ships with a sibling `NNN_<name>_down.sql` for
-rollback. Forward migrations are applied automatically; rollbacks are
-manual for now (a `--down` flag in `scripts/migrate.ts` is a future
-evolution).
+in `migrations/`. Each migration `NNN_<name>.sql` ships with a sibling
+`NNN_<name>_down.sql` for rollback. Forward migrations are applied by the
+runner; rollbacks stay manual by design — nothing in the runner can
+execute a `_down.sql`.
+
+> **Issue #516 changed how migrations are applied.** The logic moved out
+> of `scripts/migrate.ts` into `src/migrations/` (see
+> [`docs/architecture/modules/migrations.md`](../architecture/modules/migrations.md)),
+> and the runner now: serialises concurrent migrators with a global
+> advisory lock; records a **checksum** per applied migration and refuses
+> to proceed when a merged file changed; represents a partially-applied
+> no-transaction migration as **dirty** and blocks on it; and exposes a
+> read-only **schema readiness** verdict. `scripts/migrate.ts` is now a
+> CLI with subcommands — `up` (the default, what `npm run db:migrate`
+> runs), `plan`, `status` and `repair`.
 
 ## File layout
 
@@ -23,17 +33,22 @@ migrations/
   005_audit_mensagem_idx_down.sql
 ```
 
-`scripts/migrate.ts` discovers and applies every `NNN_*.sql` that does
-not end in `_down.sql`, in **lexical filename order** (a plain
-`Array.prototype.sort()` over the filename — not a numeric parse). Files
-containing the marker `-- maia:no-transaction` on the first line (e.g.
-005) are applied outside a `BEGIN/COMMIT` envelope so they can use
+The runner (`src/migrations/`, driven by `scripts/migrate.ts`) discovers
+and applies every `NNN_*.sql` that does not end in `_down.sql`, in
+**lexical filename order** (plain code-unit comparison — not a numeric
+parse, and not `localeCompare`, which would be locale-dependent). Files
+containing the marker `-- maia:no-transaction` on its own line (e.g. 005)
+are applied outside a `BEGIN/COMMIT` envelope so they can use
 `CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`.
 
+A file may also declare `-- maia:statement-timeout=<ms>` to raise the
+per-statement ceiling for a long backfill. The override lives in the
+migration, where a reviewer sees it — not in an operator's shell.
+
 Note: this is **not** Drizzle. `drizzle-orm` is used only as a query
-builder; the migration runner is the hand-rolled `scripts/migrate.ts`,
-which records applied migrations by **full filename** in a
-`schema_migrations (id TEXT PRIMARY KEY)` table.
+builder; the migration runner is hand-rolled, and records applied
+migrations by **full filename** in `schema_migrations` — which since #516
+also carries the checksum, lifecycle status, timings and repair trail.
 
 ### Duplicate migration numbers (and why you must NOT rename to "fix" them)
 
@@ -60,15 +75,104 @@ is grandfathered in
 CI if a NEW duplicate number is introduced** (the actual fix: don't add
 new collisions — see "Adding a new migration" below).
 
+## Inspecting before applying (read-only)
+
+```bash
+tsx scripts/migrate.ts status   # full ledger vs packaged artifact
+tsx scripts/migrate.ts plan     # just: what would `up` apply?
+```
+
+Both are **read-only**: no DDL, no ledger writes, no advisory lock. Safe
+against production, and safe to run while a migrator is working. They
+exit non-zero only when something is actually broken (dirty row, checksum
+mismatch, a migration the build does not ship, or no ledger at all) —
+pending work alone is not an error, that is what `up` is for.
+
 ## Applying migrations (up)
 
 ```bash
-npm run db:migrate
+npm run db:migrate              # = tsx scripts/migrate.ts up
 ```
 
-Applies every pending forward migration in order. Idempotent: each
-migration is recorded in the migrations bookkeeping table and is not
-re-run if already applied.
+Applies every pending forward migration in order, under a global advisory
+lock, recording a checksum per migration. Idempotent: an already-applied
+migration is skipped.
+
+Before applying anything it **refuses** (exit 1, nothing executed) when:
+
+- a migration is `dirty` — a no-transaction run failed midway;
+- a `running` row exists while no migrator holds the lock — a crashed
+  run; it is promoted to `dirty` and then blocks;
+- an applied migration's file no longer matches its recorded checksum;
+- an applied migration has no recorded checksum and no packaged file to
+  adopt one from;
+- the database ran a migration this build does not ship;
+- a forward migration on disk has no `_down.sql` sibling.
+
+A second migrator started concurrently **waits** for the first (30s by
+default) and then exits cleanly with `lock_unavailable` — it never
+applies anything unguarded.
+
+### Checksums on migrations that predate them
+
+The first `up` after this change adopts the packaged checksum for every
+already-applied migration that has none, marking it
+`checksum_source = 'backfilled'`. No historical file is renamed, edited
+or re-applied. Adoption trusts the artifact present at that moment, so do
+it in staging first and compare `tsx scripts/migrate.ts status` output
+between staging and production before rolling forward. After adoption,
+any divergence is a hard blocker.
+
+## Recovering a dirty migration
+
+`dirty` means a `-- maia:no-transaction` migration failed partway, so
+some statements may have taken effect and others may not. It is never
+auto-retried and never treated as success.
+
+1. **Read the ledger row** — it names the migration and the error class:
+
+   ```bash
+   tsx scripts/migrate.ts status
+   ```
+
+2. **Inspect the schema by hand** and decide which is true:
+   - the migration's effects ARE fully in place, or
+   - they are not, and you have undone the partial ones.
+
+   For a partially-created `CREATE INDEX CONCURRENTLY`, Postgres leaves
+   an INVALID index behind; drop it before choosing option (b):
+
+   ```sql
+   SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE NOT i.indisvalid;
+   ```
+
+3. **Record the decision, with a reason that is persisted on the row:**
+
+   ```bash
+   # (a) verified fully applied
+   tsx scripts/migrate.ts repair --id 066_x.sql --as applied \
+     --reason "conferido: os 8 indices existem e sao validos"
+
+   # (b) partial effects undone; let it run again from scratch
+   tsx scripts/migrate.ts repair --id 066_x.sql --as pending \
+     --reason "indice invalido dropado; reaplicar"
+   ```
+
+`repair` takes the same global lock, refuses an empty reason, and refuses
+to touch a healthy `applied` row. **Never "clear the flag" without
+verifying the schema** — the reason field exists precisely so the next
+operator can tell what was checked.
+
+## Checksum mismatch
+
+`up`, `status` and readiness all fail when an applied migration's file
+changed. That is the append-only rule being enforced (AGENTS.md §4 rule
+6), not a glitch. The fix is almost always to **revert the edit** and put
+the change in a NEW migration. The only legitimate exception — the file
+was corrupted in transit, not edited — is handled by verifying the schema
+by hand and then `repair --as applied --reason "..."`, which re-adopts
+the packaged checksum and leaves an audit trail.
 
 ## Reverting a migration (down) — manual procedure
 
@@ -101,10 +205,18 @@ in reverse order — never skip an intermediate step.
      a transaction block. `psql -f` honors that automatically — do not
      wrap them with `psql -1` or a manual `BEGIN`.
 
-4. **Manually mark the migration as un-applied** in whatever table
-   `scripts/migrate.ts` uses for bookkeeping (check the script for the
-   exact table name). Otherwise the runner will treat the migration as
-   already applied and the next `npm run db:migrate` will skip it.
+4. **Mark the migration as un-applied** so the runner will re-apply it:
+
+   ```bash
+   tsx scripts/migrate.ts repair --id NNN_name.sql --as pending \
+     --reason "rollback manual via NNN_name_down.sql em <data>"
+   ```
+
+   This deletes the ledger row and records why. (Deleting the row with
+   raw SQL also works, but leaves no trail — prefer `repair`.) The
+   bookkeeping table is `schema_migrations`; since #516 it also carries
+   the checksum, status and repair columns described in
+   [`docs/architecture/modules/migrations.md`](../architecture/modules/migrations.md).
 
 5. **Verify the rollback** with a smoke query (table missing, column
    gone, index dropped) before rerunning the application.
@@ -158,10 +270,40 @@ time. The two are reviewed together.
 5. Open a PR with both files. Reviewer checks that the down truly
    reverses the up.
 
-## Future work
+## Deploy ordering (expand/contract)
 
-- Teach `scripts/migrate.ts` to discover `_down.sql` siblings and add a
-  `--down=NNN` flag that applies the corresponding down file and
-  removes the bookkeeping row.
-- Optional: rename existing `NNN_<name>.sql` to `NNN_<name>_up.sql` for
-  symmetry. Out of scope for the current minimal-viable change.
+The runner decides schema compatibility; the operator does not. A build
+declares the range it supports (`min_supported_migration` /
+`max_supported_migration` — see the module doc) and
+`getSchemaReadiness()` blocks when the database is outside it.
+
+Two rules follow, and they are the operator's responsibility:
+
+- **A destructive migration must not ship in the same release that
+  removes compatibility with the old schema.** Expand in release N (add
+  the new column, keep the old one), contract in release N+1 (drop the
+  old one) — otherwise a rollback of the application has no schema to
+  roll back to.
+- **Reverting a deploy never runs a down migration.** Rollback of code is
+  not rollback of schema. If a domain migration must actually be undone,
+  take a backup first and follow the manual procedure above.
+
+## Future work (issue #516 remainder)
+
+- Wire `/readyz` to `getSchemaReadiness()`. The `schema` component at
+  `src/runtime/lifecycle/readiness.ts:102` still calls the #512
+  `checkSchemaVersion()`, which only compares the newest applied id to
+  the newest file on disk — it cannot see a checksum mismatch, a dirty
+  migration or an orphaned `running` row, and reports a database ahead
+  of the build as `ok`. Until the swap lands, `/readyz` is NOT a
+  trustworthy gate for those conditions; `tsx scripts/migrate.ts status`
+  is.
+- Add a one-shot `migrate` service to `docker-compose.yml` /
+  `compose.prod.yml`, with `app` and `admin-ui` depending on its
+  successful completion, so a fresh database reaches head before any
+  service starts.
+- `maia doctor` (#517) consuming `status` + readiness.
+- Move the lock/statement timeouts into the configuration contract
+  (#515) instead of call-site defaults.
+- A `--down=NNN` flag remains deliberately unbuilt: down migrations stay
+  manual and reviewed.

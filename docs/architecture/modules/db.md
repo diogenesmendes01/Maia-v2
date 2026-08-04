@@ -4,6 +4,8 @@
 
 **Purpose** — Drizzle ORM schema, repositories, query helpers, and the tenant-isolation primitives (`tenant-context.ts`, `tenant-guard.ts`). The schema defines every table; repositories provide the typed query interface; the tenant-context + guard pair enforces `tenant_id + agent_id` scoping on every query. SQL migrations live in `migrations/` at the repo root, not under `src/db/`.
 
+> **The migration runner is a separate module.** Since issue #516 the discovery, checksums, advisory lock, ledger and schema-readiness logic live in [`src/migrations/`](migrations.md) — `scripts/migrate.ts` is only a CLI over it. Anything that needs to know whether the schema is compatible calls `getSchemaReadiness()` from that module; it must never re-derive the answer by querying `schema_migrations` directly.
+
 ## Key files
 
 | File | Role |
@@ -21,7 +23,7 @@
 ## Patterns it follows
 
 - [Tenant isolation](../concerns/tenant-isolation.md) — `runWithTenantContext` + `applyTenantGuard` are the canonical scoping mechanism
-- Migrations are append-only: new `<n>_<name>.sql` files in `migrations/`; never edit a merged file
+- Migrations are append-only: new `<n>_<name>.sql` files in `migrations/`; never edit a merged file. Since #516 this is enforced, not just documented — the runner records a checksum per applied migration and blocks (`up`, `status` and readiness all fail) when a merged file's content changes. See [`migrations`](migrations.md).
 
 ## How to extend
 
