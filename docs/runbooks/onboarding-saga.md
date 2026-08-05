@@ -100,6 +100,8 @@ Gerar uma chave nova nessa situação é o erro clássico — você recebe
 | `run_expired` | passou de `expires_at` | Cancele e abra uma run nova. Os recursos já criados permanecem |
 | `readiness_blocked` | checks bloqueantes vermelhos | Cada check traz `remediation`. Corrija e rode `evaluate_readiness` de novo |
 | `run_terminal` | `active` / `cancelled` / `failed_terminal` | Runs terminais não são retomadas. Abra uma nova |
+| `pairing_in_progress` | já há pareamento vivo (ou um abort pendente) nessa linha | A run foi para `failed_retryable`. Aborte o pareamento anterior no console de linhas e rode `start_pairing` de novo |
+| `activation_precondition_failed` | a configuração mudou entre a avaliação e a escrita: nenhuma linha governada sobrou | A run está em `readiness_failed` e **nada foi escrito** (agente segue `provisioning`, canal segue inativo). Confira `channel_policies` do par e rode `evaluate_readiness` de novo |
 
 ## 3. Readiness reprovado
 
@@ -115,8 +117,60 @@ Os vermelhos mais comuns num onboarding novo:
 | `default_role_resolved` | exatamente UM papel `is_default` + `active`. Dois papéis default é ambiguidade, não redundância |
 | `channel_policy_role_active` | o papel padrão da política foi desativado. Reative-o ou reaponte a política |
 | `channel_ownership_proven` | a linha não concluiu o pareamento. Veja `channel_line_state.state` |
-| `schema_ready` | `npm run db:migrate` |
+| `schema_ready` | **leia a mensagem antes de rodar migrate** — ver §3.1 |
 | `governance_no_blocking_pending` | há alerta de drift `critical` sem `resolved_at` para o agente |
+| `agent_exists` / `agent_belongs_to_tenant` | os dois vermelhos juntos = **não existe agente com esse id neste par**. O readiness NÃO diz se ele existe em outro tenant (seria vazamento de existência) — ver §3.2 |
+
+### 3.1 `schema_ready` vermelho: `npm run db:migrate` nem sempre é a resposta
+
+O check consome o veredito canônico de `src/migrations/`
+([runbook de migrations](migrations.md)), não uma contagem de pendentes. A
+mensagem traz os **códigos de bloqueador** e o id da migration:
+
+| Bloqueador | O que aconteceu | Ação |
+|---|---|---|
+| `schema_below_minimum` | migration realmente pendente | `npm run db:migrate` |
+| `dirty_migration` | uma migration `-- maia:no-transaction` morreu no meio; o schema pode estar parcial | **NÃO** rode migrate. Inspecione e use `migrate repair` — ver o runbook de migrations |
+| `running_migration` | há `running` no ledger: ou um migrator está rodando agora, ou um caiu | Espere; se persistir, é debris de crash |
+| `checksum_mismatch` | uma migration já aplicada foi EDITADA (migrations são append-only) | Descubra qual commit a editou. Nunca "conserte" alterando o ledger |
+| `checksum_unknown` | aplicada por um runner antigo, sem checksum registrado | `migrate up` / `migrate backfill` adota o checksum empacotado |
+| `missing_file` | **o banco aplicou algo que este build não empacota** — um deploy mais novo já migrou este banco | Não sirva tráfego deste build. Promova a versão que empacota a migration |
+
+`state: 'unknown'` (banco fora do ar, ledger ilegível) também reprova, por
+desenho: um erro de leitura nunca vira "schema pronto".
+
+O `schema_fingerprint` gravado na auditoria da ativação cobre o **estado
+verificado** de cada migration (estado + checksum), não a lista de ids — dois
+carimbos iguais significam mesmo schema *e* mesma integridade.
+
+### 3.2 "Esse agente existe em algum lugar?"
+
+O readiness responde **só sobre o par requisitado**: agente de outro tenant é
+indistinguível de agente inexistente, de propósito (invariante 1 do `AGENTS.md`;
+confirmar existência a quem tem o id é vazamento entre tenants).
+
+Quando o diagnóstico global é realmente necessário, ele existe numa fronteira
+separada — restrita ao papel global `founder` e **auditada**:
+
+```ts
+import { diagnoseAgentOwnershipGlobally } from '@/onboarding/index.js';
+await diagnoseAgentOwnershipGlobally({
+  scope: { tenant_id, agent_id },
+  actor: { actor_id, actor_role: 'founder' },
+  reason_code: 'suporte-ticket-1234',
+});
+// => { verdict: 'absent' | 'owned_by_requested_tenant' | 'owned_by_other_tenant', owner_tenant_id? }
+```
+
+Toda chamada grava `admin_audit_log` no bucket `system` com ator, alvo e
+veredito. Para auditar quem varreu ids:
+
+```sql
+SELECT created_at, actor_id, change_summary
+  FROM admin_audit_log
+ WHERE action = 'onboarding_agent_ownership_diagnosed'
+ ORDER BY id DESC;
+```
 
 Depois de corrigir, rode `evaluate_readiness` novamente — é um passo repetível
 e é assim que o ciclo corrigir→reavaliar funciona.
@@ -169,6 +223,13 @@ A ordem importa.
 
    Uma run aí significa ativação commitada parcialmente. Investigue
    `admin_audit_log` e `agents.status` antes de prosseguir.
+
+   > Nota: desde a review do PR #541 a ativação trava o retrato
+   > (`lockReadinessSnapshot`) e **confere o efeito** das suas escritas antes de
+   > concluir. Não existe mais o caso "run `active` com zero canais ativados";
+   > se a configuração mudar na janela, a run vira `readiness_failed` **sem
+   > escrita parcial**. Uma run presa em `activating` continua sendo sinal de
+   > crash, não de decisão.
 3. **Não apague tabelas nem eventos.** Runs existentes continuam legíveis e
    podem ser concluídas ou canceladas normalmente — o módulo não altera nenhum
    caminho de provisionamento anterior.
@@ -192,3 +253,25 @@ A ordem importa.
 O readiness canônico **não** precisa de rollback: ele é somente-leitura e não
 substituiu nenhum cálculo anterior — o dashboard e o go-live checklist do
 console continuam com a lógica que já tinham.
+
+## 7. Pareamento: onde procurar o comando
+
+Desde a review do PR #541 o `start_pairing` enfileira **dentro da transação do
+passo**. Consequências operacionais:
+
+- se o passo devolveu `conflict` (expirada, versão velha, transição ilegal,
+  terminal), **não há comando na fila** — não procure por ele, e não "limpe"
+  nada;
+- se o passo devolveu `completed`, o comando está em `channel_line_state` do
+  canal, com o `command_id` também no `result` do passo (e no ledger):
+
+```sql
+SELECT cls.state, cls.command, cls.command_id, cls.command_requested_at,
+       cls.actor_id, cls.correlation_id
+  FROM channel_line_state cls
+ WHERE cls.channel_id = :channel_id;
+```
+
+- a trilha do enfileiramento (`onboarding_pairing_requested`, resource_type
+  `channel`) e a do passo da saga (`onboarding_pairing_started`) estão no MESMO
+  commit — se você vê uma sem a outra, é bug, não corrida.

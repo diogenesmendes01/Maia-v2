@@ -454,21 +454,42 @@ export const channelLineStateRepo = {
   async requestCommandWithAudit(
     args: RequestCommandArgs & { audit: LineCommandAudit },
   ): Promise<RequestCommandResult> {
-    return withTx(async (tx) => {
-      const result = await requestCommandInTx(tx, args);
-      if (result.ok && !result.idempotent) {
-        await appendLineAudit(tx, args.scope, {
-          ...args.audit,
-          change_summary: {
-            ...args.audit.change_summary,
-            // Número da tentativa: só existe depois da escrita, e vale a pena
-            // na trilha ("3ª tentativa desta linha").
-            attempt: result.row.pairing_attempts,
-          },
-        });
-      }
-      return result;
-    });
+    return withTx((tx) => this.requestCommandWithAuditInTx(tx, args));
+  },
+
+  /**
+   * O MESMO enfileiramento, na transação de QUEM CHAMA (issue #519, review do
+   * PR #541).
+   *
+   * Existe porque a fila de comandos desta tabela é o outbox durável
+   * Admin→runtime (migration 103), e um caller que já está numa transação —
+   * a saga de onboarding é o caso — precisa que o comando entre no MESMO
+   * commit da decisão que o autorizou. Enfileirar por fora, numa transação
+   * própria, é o que fazia o efeito PRECEDER a decisão: o comando sobrevivia
+   * mesmo quando a transação do caller era recusada por expiração, versão ou
+   * transição inválida.
+   *
+   * `requestCommandWithAudit` continua sendo o atalho para quem não tem
+   * transação em mãos; os dois compartilham este corpo, então não há como um
+   * divergir do outro.
+   */
+  async requestCommandWithAuditInTx(
+    tx: Tx,
+    args: RequestCommandArgs & { audit: LineCommandAudit },
+  ): Promise<RequestCommandResult> {
+    const result = await requestCommandInTx(tx, args);
+    if (result.ok && !result.idempotent) {
+      await appendLineAudit(tx, args.scope, {
+        ...args.audit,
+        change_summary: {
+          ...args.audit.change_summary,
+          // Número da tentativa: só existe depois da escrita, e vale a pena
+          // na trilha ("3ª tentativa desta linha").
+          attempt: result.row.pairing_attempts,
+        },
+      });
+    }
+    return result;
   },
 
   /**

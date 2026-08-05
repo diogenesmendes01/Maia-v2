@@ -43,6 +43,8 @@ O que `scripts/setup.ts` ganhou foi **uma linha de verdade**: no fim ele imprime
 | `tests/unit/onboarding/_migration-schema.ts` | Lê `CHECK`s e colunas `uuid` de `migrations/*.sql` para as suítes SEM banco |
 | `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` | Literais do código ⊆ `CHECK` real, sem banco |
 | `tests/unit/onboarding/audit-fk-safety.spec.ts` | `tx` falso **com integridade referencial**: a auditoria nunca referencia tenant inexistente |
+| `tests/unit/onboarding/metrics-taxonomy.spec.ts` | vocabulários fechados ≡ constantes do código; texto livre/PII nunca vira label |
+| `tests/integration/onboarding-review-541.spec.ts` | as cinco correções da review do PR #541, contra Postgres real |
 
 ## O contrato de readiness (para #517)
 
@@ -64,7 +66,7 @@ Escopo inválido (vazio, com whitespace, ou os literais `'default'`/`'system'`) 
 | Código | Severidade | O que prova |
 |---|---|---|
 | `tenant_exists` / `tenant_enabled` | blocking | o tenant existe e está `active` |
-| `agent_exists` / `agent_belongs_to_tenant` | blocking | separados de propósito: "não existe" e "é de outro tenant" são diagnósticos diferentes |
+| `agent_exists` / `agent_belongs_to_tenant` | blocking | há agente com esse id NESTE par. Os dois códigos sobrevivem (são contrato público) mas **não distinguem mais** "não existe" de "é de outro tenant" — ver [Escopo do agente](#escopo-do-agente-e-o-que-o-readiness-recusa-a-responder) |
 | `profile_active` | blocking | há profile operacional `active` DO MESMO par |
 | `capability_grant_present` | blocking | existe `agent_tool_grants` do par |
 | `required_packs_granted` | blocking | `BASE_AGENT_PACKS` ⊆ `granted_packs` |
@@ -75,7 +77,7 @@ Escopo inválido (vazio, com whitespace, ou os literais `'default'`/`'system'`) 
 | `channel_policy_role_active` | blocking | o `default_role_id` resolve para papel ativo do par |
 | `channel_ownership_proven` | blocking | linha em `connected` ou `verified_offline` (#518) |
 | `channel_online` | advisory | linha `connected` agora — socket caído se recupera sozinho |
-| `schema_ready` | blocking | zero migrations pendentes (fail-closed: erro de leitura ⇒ reprova) |
+| `schema_ready` | blocking | o **veredito canônico** de `src/migrations/` (`getSchemaReadiness`) — ver [Schema](#schema_ready-consome-o-veredito-canônico-nunca-schema_migrations) |
 | `governance_no_blocking_pending` | blocking | nenhum alerta de drift `critical` sem `resolved_at` |
 | `agent_activated` | advisory | `agents.status='active'` — advisório porque readiness é a PRECONDIÇÃO da ativação. O agente criado pela saga nasce em `agents.status='provisioning'` (`migrations/110_agents_status_provisioning.sql`), um estado distinto de `paused` (= esteve ativo e foi parado) |
 
@@ -83,10 +85,60 @@ Escopo inválido (vazio, com whitespace, ou os literais `'default'`/`'system'`) 
 
 O avaliador é puro e recebe os fatos com o **escopo dono embutido em cada objeto**. Ele não confia que o loader filtrou — ele **prova**, descartando todo objeto cujo par não seja o requisitado. Um fato de outro escopo é tratado como **ausente**, jamais como satisfeito. É o que mata o falso positivo "profile de A + canal de B ⇒ pronto" (`tests/unit/onboarding/readiness.spec.ts`).
 
+### Escopo do agente, e o que o readiness recusa a responder
+
+O loader lê `agents` pelo **par completo** (`tenant_id + agent_id`), como toda
+outra leitura do módulo. Consequência deliberada: um agente que existe em OUTRO
+tenant é **indistinguível de ausência** — `agent_exists` e
+`agent_belongs_to_tenant` reprovam juntos, com a mesma mensagem, e
+`configuration_fingerprint` é o mesmo dos dois casos.
+
+Isto **reverte** um desenho anterior que lia `agents` por `id` apenas para poder
+dizer "existe, mas é de outro tenant". Aquele diagnóstico era comprado com uma
+leitura cross-tenant no caminho default: violava a invariante 1 do `AGENTS.md`
+e **vazava existência** — quem chutasse o id de um agente alheio recebia a
+confirmação de que ele existe. Nenhum diagnóstico de operador paga esse preço.
+
+O diagnóstico global continua disponível, mas fora do caminho default:
+
+```ts
+import { diagnoseAgentOwnershipGlobally } from '@/onboarding/index.js';
+// só `founder`; qualquer outro papel ⇒ OnboardingError('forbidden')
+// toda consulta grava `admin_audit_log` (bucket `system`) com ator, alvo e veredito
+```
+
+Ela devolve `absent | owned_by_requested_tenant | owned_by_other_tenant` e nada
+mais — nunca status, nome ou configuração do agente alheio. `evaluateAgentReadiness`
+**não** a chama.
+
+`applyProvisionAgent` segue a mesma regra: a releitura pós-`INSERT` carrega o
+par, e um id já em uso recusa com `duplicate_agent` **sem nomear o dono**.
+
+### `schema_ready` consome o veredito canônico, nunca `schema_migrations`
+
+`loadSchemaState()` chama `getSchemaReadiness({ pool, migrationsDir })` de
+[`src/migrations/`](migrations.md) e projeta o resultado. Ele **não** lê
+`schema_migrations` — o doc daquele módulo é explícito: um consumidor nunca
+re-deriva estado de schema por conta própria.
+
+O que isso corrige: a leitura crua tratava **toda linha do ledger como
+aplicada**. Migration `dirty`, `failed`, `running`, com checksum divergente ou
+desconhecido, e arquivo ausente (o banco aplicou algo que este build não
+empacota) **não são pendentes** — logo `pending_migrations.length === 0` deixava
+`schema_ready` verde no exato instante de uma ativação.
+
+Os fatos passam a carregar:
+
+| Campo | O que é |
+|---|---|
+| `ready` / `state` | o veredito (`ready` / `blocked` / `unknown`). `unknown` (banco fora do ar, ledger ilegível) **reprova** — `getSchemaReadiness` nunca lança, sempre falha fechado |
+| `blockers` | `{ kind, id }` — códigos ESTÁVEIS. Nunca SQL, DSN ou mensagem de driver: a mensagem do check é persistida |
+| `verified` | `{ id, state, checksum }` por migration — a evidência, e o insumo do fingerprint |
+
 ### Fingerprints
 
 - `configuration_fingerprint` — SHA-256 da projeção canônica de profile, grants, papéis, políticas e canais. **Não inclui `channels.external_id`** (é o telefone da linha, e o fingerprint aparece em auditoria).
-- `schema_fingerprint` — SHA-256 da lista ordenada de migrations aplicadas.
+- `schema_fingerprint` — SHA-256 de `{ state, expected_head, applied_head, verified[] }`, isto é, do **estado verificado** de cada migration. Deliberadamente **não** é a lista de ids: essa produzia o MESMO valor para um schema íntegro e para um schema com migration `dirty` ou checksum divergente — exatamente o par que o carimbo de auditoria da ativação existe para distinguir.
 
 ## A saga
 
@@ -116,7 +168,24 @@ Por isso **não** existe unique em `(run_id, step)`: passos re-executáveis (`ev
 
 Não há estado intermediário que exija inspeção manual do banco.
 
-**A única exceção é `start_pairing`**, que enfileira um comando para OUTRO processo (o worker de #518) e portanto não cabe na transação. Mitigação: o `command_id` é **derivado** de `(run_id, step, hash da chave)`, e o contrato de #518 é "mesma `command_id` ⇒ devolve a sessão existente". Um crash entre o enfileiramento e o commit é reparado pelo retry com a mesma chave.
+**Não há exceção — nem para `start_pairing`.** A fila de comandos Admin→runtime
+de #518 (`channel_line_state`, `migrations/103`) é o **outbox durável** desse
+efeito, e ela vive no mesmo Postgres. Então o enfileiramento entra no `tx` do
+passo, via `channelLineStateRepo.requestCommandWithAuditInTx` — junto do ledger,
+do evento, da auditoria e do novo estado.
+
+Isto corrige uma violação direta de "backend decide, caller propõe": o comando
+era enfileirado **antes** de `commitStep` travar a run e conferir expiração,
+ledger, `expected_version` e transição. Um pedido velho, terminal ou inválido
+produzia efeito de runtime e **só então** recebia conflito; e o `command_id`
+derivado só protege o retry da MESMA chave — a mesma ação sob chave diferente
+enfileirava um segundo comando. Hoje o commit decide primeiro, sempre.
+
+Efeito colateral desejável: uma recusa da fila (`pairing_in_progress`) passou a
+ser uma **negativa de governança** como qualquer outra — a run vai para
+`failed_retryable` (de onde `start_pairing` é legal de novo) e a decisão deixa
+evento + `admin_audit_log`. Antes ela era devolvida fora da transação e não
+deixava rastro nenhum.
 
 ### Concorrência
 
@@ -125,6 +194,53 @@ Optimistic: todo comando informa `expected_version`; o `UPDATE` casa com `versio
 ### Ativação
 
 A ativação **reavalia** o readiness sob a trava da run — readiness verde há cinco minutos não autoriza ativar agora. Reprovando, a run vai para `readiness_failed` e a auditoria registra `agent_activation_denied`. Aprovando, o agente vira `active`, as linhas **governadas** (com política do mesmo par) passam a rotear, e a auditoria registra `agent_activation_approved` com os dois fingerprints.
+
+#### O retrato precisa ser o MESMO que as escritas enxergam
+
+Reavaliar não basta se a reavaliação lê por fora da transação. O avaliador
+default lia pelo handle global `db`: só a row de `onboarding_runs` estava
+travada, e profile, grant, papel, política ou canal podiam mudar entre o retrato
+e o `applyActivate`. Uma política removida nessa janela produzia **zero canais
+ativados com a run concluindo assim mesmo** — um agente "ativo" que não roteia
+em lugar nenhum.
+
+São duas defesas, e as duas são necessárias:
+
+1. **Lock + leitura pelo `tx`.** `lockReadinessSnapshot(tx, scope)` trava, em
+   ordem FIXA, tudo de que o veredito depende: `FOR SHARE` no que é só lido
+   (tenant, profile, grant, papéis, políticas, estado de linha, drift) e
+   `FOR UPDATE` no que será escrito (`agents`, `channels` — pegar o lock forte
+   já na leitura evita o upgrade tardio, fonte clássica de deadlock). Só então o
+   readiness é carregado, **pelo `tx`**. Um `DELETE` concorrente de política
+   bloqueia até o commit.
+2. **Verificação do efeito.** `FOR SHARE` não é predicate lock: uma linha NOVA
+   inserida concorrentemente não é travada por nada. Por isso `applyActivate`
+   **lê o conjunto governado primeiro** (se vazio ⇒ `deny`, com zero escritas —
+   um `deny` commita a transição, então escrever antes de decidir deixaria o
+   agente `active` numa run que não concluiu) e depois **confere** que ambos os
+   `UPDATE` casaram exatamente com o esperado; divergência lança e o rollback
+   leva tudo.
+
+`evaluate_readiness` lê pelo `tx` mas **não** trava: é observação, não escrita, e
+segurar `FOR SHARE` sobre a configuração do agente a cada refresh de dashboard
+seria contenção gratuita.
+
+### Métricas
+
+As séries deste módulo saem por [`@/observability/metrics`](../../../src/observability/metrics.ts) — allowlist de chave, guarda de PII, budget de cardinalidade e atribuição `tenant_id`/`agent_id` — e **nunca** por `@/lib/metrics` direto. Emitir direto punha `reason_code` (texto arbitrário do console), código de erro e código de check em labels crus: PII possível e cardinalidade ilimitada.
+
+Os valores vêm de **vocabulários fechados** declarados em `src/observability/taxonomy.ts` (`ONBOARDING_STEP_VALUES`, `ONBOARDING_REASONS`, `READINESS_CHECK_CODE_VALUES`); `closedVocabulary()` colapsa qualquer coisa fora do contrato em `other`. O motivo original continua inteiro em `onboarding_runs.last_error_code`, no evento append-only e na auditoria — texto livre pertence à trilha, não a um label.
+
+| Série | Labels |
+|---|---|
+| `maia_onboarding_run_started_total` / `_completed_total` | `kind` |
+| `maia_onboarding_run_cancelled_total` | `reason` |
+| `maia_onboarding_step_completed_total` / `maia_onboarding_idempotency_replay_total` | `step` |
+| `maia_onboarding_step_failed_total` | `step`, `reason` |
+| `maia_onboarding_step_duration_ms` | `step` |
+| `maia_agent_readiness_failed_total` | `check_code` |
+
+Todas carregam `tenant_id` + `agent_id` (bucket `system` enquanto a run ainda não resolveu o escopo). `tests/unit/onboarding/metrics-taxonomy.spec.ts` pina os vocabulários contra `ONBOARDING_STEPS`, `ONBOARDING_ERROR_CODES` e `READINESS_CHECK_CODES`, e `wizard.spec.ts` lê o registro renderizado para provar que um `reason_code` com telefone não vira série.
 
 O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_agent_id`); divergência é recusada. É a defesa contra ativar o agente errado a partir de uma aba antiga do console.
 
@@ -169,6 +285,6 @@ Verifique contra as issues antes de confiar nesta lista.
 
 | | |
 |---|---|
-| Last verified | 2026-08-04 |
-| Against `main` HEAD | `ce1f0f69` |
+| Last verified | 2026-08-05 |
+| Against `main` HEAD | `ce1f0f69` (branch `claude/leva-agentes-2026-08-04` @ `7c1b3da` + review do PR #541) |
 | Re-verify when | Older than 30 days; OR `src/onboarding/**` muda; OR uma migration nova toca `onboarding_*`; OR #517/#518 mudam o contrato consumido aqui |

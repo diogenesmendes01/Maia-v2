@@ -8,10 +8,12 @@
  * fica provada também nas lanes sem banco. Mesmo padrão de
  * `tests/unit/agent-tool-grants-repo-scope.spec.ts` (#408).
  *
- * A única leitura DELIBERADAMENTE não filtrada por tenant é a de `agents`: o
- * avaliador precisa distinguir "o agente não existe" de "o agente existe mas é
- * de outro tenant" (check `agent_belongs_to_tenant`). O teste trava esse
- * contrato explicitamente para que a exceção não vire regressão silenciosa.
+ * CONTRATO ALTERADO (review do PR #541). Este arquivo AFIRMAVA, como desenho
+ * intencional, que a leitura de `agents` era filtrada só por `id` — para
+ * distinguir "não existe" de "é de outro tenant". Era uma leitura cross-tenant
+ * real: violava a invariante 1 do AGENTS.md e vazava EXISTÊNCIA entre tenants.
+ * Agora NÃO HÁ exceção: as 8 leituras carregam o escopo, e as 7 que têm coluna
+ * `agent_id` carregam o PAR completo.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -37,9 +39,14 @@ function makeChain(): Record<string, unknown> {
 vi.mock('../../../src/db/client.js', () => ({
   db: {
     select: () => makeChain(),
-    // `loadSchemaState` lê `schema_migrations` por SQL cru.
     execute: () => Promise.resolve({ rows: [] }),
   },
+  // `loadSchemaState` já não lê `schema_migrations` por SQL cru: ele consome o
+  // veredito canônico de `src/migrations/`, que recebe o POOL. Um pool que não
+  // conecta faz `getSchemaReadiness` devolver `state:'unknown'` (nunca lança,
+  // fail-closed) — exatamente o que queremos aqui, onde só os predicados de
+  // escopo estão sob teste.
+  pool: { connect: () => Promise.reject(new Error('sem banco neste teste')) },
   withTx: vi.fn(),
   pgErrorCode: () => undefined,
 }));
@@ -54,7 +61,7 @@ beforeEach(() => {
 });
 
 describe('loadReadinessFactsFromDb — predicados de escopo', () => {
-  it('toda leitura carrega o par requisitado, exceto a de `agents` (por desenho)', async () => {
+  it('TODA leitura carrega o escopo — inclusive a de `agents`', async () => {
     const { loadReadinessFactsFromDb } = await import(
       '../../../src/onboarding/readiness-facts.js'
     );
@@ -67,20 +74,35 @@ describe('loadReadinessFactsFromDb — predicados de escopo', () => {
     const scoped = compiled.filter(
       (c) => c.params.includes('tA') && c.params.includes('agA'),
     );
-    // 6 das 8 provam o PAR completo: profile, grant, roles, channels, policies, drift.
-    expect(scoped.length).toBe(6);
+    // 7 das 8 ligam os DOIS parâmetros de escopo: agents, profile, grant,
+    // roles, channels, policies, drift. Antes eram 6 — `agents` era a exceção
+    // que vazava.
+    expect(scoped.length).toBe(7);
     for (const c of scoped) {
       expect(c.sql).toMatch(/tenant_id/);
-      expect(c.sql).toMatch(/agent_id/);
+      // `agents` identifica o agente pela PK `id`; as demais por `agent_id`.
+      expect(c.sql).toMatch(/agent_id|"agents"\."id"/);
     }
 
     // A leitura de `tenants` é por id do tenant (é a própria linha do tenant).
     const tenantRead = compiled.find((c) => c.sql.includes('"tenants"."id"'));
     expect(tenantRead?.params).toContain('tA');
+  });
 
-    // A leitura de `agents` é por id do agente APENAS — a exceção documentada.
-    const agentRead = compiled.find((c) => c.sql.includes('"agents"."id"'));
-    expect(agentRead?.params).toEqual(['agA']);
+  it('a leitura de `agents` carrega `tenant_id` — sem ele, existência vaza entre tenants', async () => {
+    const { loadReadinessFactsFromDb } = await import(
+      '../../../src/onboarding/readiness-facts.js'
+    );
+    await loadReadinessFactsFromDb({ tenant_id: 'tA', agent_id: 'agA' });
+
+    const agentRead = captured
+      .map(compile)
+      .find((c) => c.sql.includes('"agents"."id"'));
+    expect(agentRead, 'nenhuma leitura de `agents` foi capturada').toBeDefined();
+    // O predicado precisa citar as DUAS colunas e ligar os DOIS parâmetros.
+    expect(agentRead!.sql).toMatch(/"agents"\."id"/);
+    expect(agentRead!.sql).toMatch(/"agents"\."tenant_id"/);
+    expect(agentRead!.params).toEqual(['agA', 'tA']);
   });
 
   it('nenhum predicado vaza um escopo diferente do requisitado', async () => {

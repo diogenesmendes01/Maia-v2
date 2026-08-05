@@ -278,6 +278,42 @@ export const METRIC = {
   WORKER_RUN: 'maia_worker_run_total',
   WORKER_DURATION_MS: 'maia_worker_duration_ms',
 
+  // --- onboarding saga / agent readiness (issue #519) ----------------------
+  //
+  // Declaradas aqui — e não emitidas direto por `@/lib/metrics` — porque os
+  // rótulos destas séries vêm de entrada do CHAMADOR (`reason_code` do
+  // cancelamento, código de erro do passo, código de check reprovado). Emitir
+  // por fora do sanitizador punha texto livre (e potencialmente PII) num label
+  // e abria cardinalidade ilimitada. Aqui o vocabulário é FECHADO
+  // (`ONBOARDING_REASONS`, `ONBOARDING_STEP_VALUES`,
+  // `READINESS_CHECK_CODE_VALUES`) e o texto livre fica em auditoria/log.
+  /** Runs de onboarding iniciadas, por `kind`. */
+  ONBOARDING_RUN_STARTED: 'maia_onboarding_run_started_total',
+  /** Runs canceladas, por `reason` (vocabulário fechado). */
+  ONBOARDING_RUN_CANCELLED: 'maia_onboarding_run_cancelled_total',
+  /** Runs que chegaram a `active`, por `kind`. */
+  ONBOARDING_RUN_COMPLETED: 'maia_onboarding_run_completed_total',
+  /** Passos commitados, por `step`. */
+  ONBOARDING_STEP_COMPLETED: 'maia_onboarding_step_completed_total',
+  /** Passos recusados/falhos, por `step` + `reason`. */
+  ONBOARDING_STEP_FAILED: 'maia_onboarding_step_failed_total',
+  /** Replays do ledger de idempotência, por `step`. */
+  ONBOARDING_IDEMPOTENCY_REPLAY: 'maia_onboarding_idempotency_replay_total',
+  /** Duração de um passo da saga. */
+  ONBOARDING_STEP_DURATION_MS: 'maia_onboarding_step_duration_ms',
+  /** Checks BLOQUEANTES reprovados, por `check_code`. */
+  AGENT_READINESS_FAILED: 'maia_agent_readiness_failed_total',
+
+  // --- ops / restore drill (issue #536) ------------------------------------
+  /**
+   * Drills de restore que terminaram com `cleanup_status='unsafe'` — o teardown
+   * deixou cópia da produção no host. SEM labels: o drill é uma operação da
+   * plataforma, não de um tenant, e o "quem/qual drill" pertence a
+   * `restore_drills` e ao log, não a uma série. Declarado aqui a pedido da
+   * integração, para o trabalho de drill que roda em paralelo nesta leva.
+   */
+  RESTORE_DRILL_UNSAFE_RESIDUE: 'maia_restore_drill_unsafe_residue_total',
+
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */
   TRACE_COVERAGE: 'maia_runtime_trace_coverage_total',
@@ -359,6 +395,12 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   'phase',
   'state',
   'required',
+  // saga de onboarding (issue #519) — os dois são conjuntos FECHADOS e
+  // pequenos, declarados abaixo em `ONBOARDING_STEP_VALUES` e
+  // `READINESS_CHECK_CODE_VALUES`. Nenhum dos dois aceita texto do chamador:
+  // o emissor colapsa qualquer valor fora do vocabulário.
+  'step',
+  'check_code',
 ]);
 
 /**
@@ -485,6 +527,126 @@ export const ENUM_VALUES = Object.freeze({
   required: ['true', 'false'] as const,
 });
 
+// ---------------------------------------------------------------------------
+// 3.1 Onboarding saga — vocabulários FECHADOS (issue #519, review do PR #541)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sentinela para qualquer valor fora de um vocabulário fechado.
+ *
+ * Difere de `CARDINALITY_OVERFLOW_VALUE` de propósito: overflow é "o budget
+ * estourou", isto é "o chamador mandou algo que não está no contrato". O
+ * emissor colapsa ANTES do sanitizador, então um `reason_code` livre nunca
+ * chega a existir como série — e o motivo original continua inteiro na
+ * auditoria e no log estruturado, que é onde texto livre pertence.
+ */
+export const CLOSED_VOCABULARY_FALLBACK = 'other';
+
+/**
+ * Valores admitidos no label `step`. Espelho EXATO de `ONBOARDING_STEPS`
+ * (`src/onboarding/state-machine.ts`) — a igualdade é pinada por
+ * `tests/unit/onboarding/metrics-taxonomy.spec.ts`, para que um passo novo não
+ * possa ser emitido sem passar por esta declaração.
+ */
+export const ONBOARDING_STEP_VALUES: readonly string[] = Object.freeze([
+  'provision_tenant',
+  'provision_admin',
+  'provision_agent',
+  'configure_profile',
+  'apply_capability_packs',
+  'configure_role',
+  'declare_channel',
+  'start_pairing',
+  'confirm_channel_ready',
+  'evaluate_readiness',
+  'activate',
+]);
+
+/**
+ * Valores admitidos no label `reason` das séries de onboarding.
+ *
+ * União de: os códigos de erro tipados da saga (`ONBOARDING_ERROR_CODES`), o
+ * `internal_error` do sanitizador de exceção, os motivos de recusa vindos da
+ * fila de comandos de #518, e um pequeno vocabulário de cancelamento operado
+ * pelo console. `reason_code` de cancelamento é ENTRADA DO OPERADOR: qualquer
+ * coisa fora desta lista vira `CLOSED_VOCABULARY_FALLBACK`, e o texto original
+ * fica só em `onboarding_runs.last_error_code`, no evento e na auditoria.
+ */
+export const ONBOARDING_REASONS: readonly string[] = Object.freeze([
+  // erros tipados da saga
+  'invalid_scope',
+  'forbidden_scope_literal',
+  'scope_mismatch',
+  'invalid_transition',
+  'run_not_found',
+  'run_terminal',
+  'run_expired',
+  'unknown_step',
+  'version_conflict',
+  'idempotency_payload_mismatch',
+  'missing_idempotency_key',
+  'forbidden',
+  'tenant_not_found',
+  'tenant_disabled',
+  'agent_not_found',
+  'duplicate_tenant',
+  'duplicate_agent',
+  'duplicate_channel',
+  'role_not_found',
+  'channel_not_found',
+  'channel_not_paired',
+  'readiness_blocked',
+  'activation_precondition_failed',
+  'kind_not_implemented',
+  'internal_error',
+  // recusas da fila de comandos de #518
+  'pairing_in_progress',
+  'pairing_rejected',
+  // cancelamento operado pelo console
+  'operator_abort',
+  'expired',
+  CLOSED_VOCABULARY_FALLBACK,
+]);
+
+/**
+ * Valores admitidos no label `check_code`. Espelho EXATO de
+ * `READINESS_CHECK_CODES` (`src/onboarding/readiness.ts`), pinado pelo mesmo
+ * teste que pina os passos.
+ */
+export const READINESS_CHECK_CODE_VALUES: readonly string[] = Object.freeze([
+  'tenant_exists',
+  'tenant_enabled',
+  'agent_exists',
+  'agent_belongs_to_tenant',
+  'profile_active',
+  'capability_grant_present',
+  'required_packs_granted',
+  'tool_permissions_coherent',
+  'default_role_resolved',
+  'channel_declared',
+  'channel_policy_resolved',
+  'channel_policy_role_active',
+  'channel_ownership_proven',
+  'channel_online',
+  'schema_ready',
+  'governance_no_blocking_pending',
+  'agent_activated',
+]);
+
+/**
+ * Colapsa um valor num vocabulário fechado. É a defesa que roda ANTES do
+ * sanitizador de labels: o allowlist de CHAVES não diz nada sobre o VALOR, e
+ * `reason` tem budget 60 — sem isto, 60 `reason_code` livres viravam 60 séries
+ * permanentes antes de o overflow sequer começar a proteger.
+ */
+export function closedVocabulary(
+  value: string | null | undefined,
+  vocabulary: readonly string[],
+): string {
+  if (typeof value !== 'string') return CLOSED_VOCABULARY_FALLBACK;
+  return vocabulary.includes(value) ? value : CLOSED_VOCABULARY_FALLBACK;
+}
+
 /**
  * Per-label cardinality budget. Once a (metric, key) pair has seen this many
  * distinct values, further values collapse into `CARDINALITY_OVERFLOW_VALUE`
@@ -503,6 +665,10 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   stage: 60,
   span: 60,
   reason: 60,
+  // Vocabulários fechados e pequenos: 11 passos e 17 códigos de check. O
+  // budget é o teto do contrato, não uma estimativa.
+  step: 20,
+  check_code: 24,
 });
 
 /** Budget applied to any allowed key without an explicit entry above. */

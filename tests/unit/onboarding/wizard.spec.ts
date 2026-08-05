@@ -35,6 +35,22 @@ const runs = new Map<string, OnboardingRunRow>();
 const ledger = new Map<string, LedgerRow>();
 /** Quantas vezes o `apply` de cada passo REALMENTE rodou. */
 const applyCalls: string[] = [];
+/** SQL que o passo executou pelo `tx` — hoje só os locks do retrato. */
+const txStatements: string[] = [];
+
+/**
+ * `tx` falso mínimo. Só precisa de `execute`, porque as escritas de
+ * provisionamento estão mockadas; o que ele PROVA é que o passo executou (ou
+ * não) as instruções de lock dentro da transação.
+ */
+function fakeTx(): { execute: (q: unknown) => Promise<{ rows: never[] }> } {
+  return {
+    execute: (q: unknown) => {
+      txStatements.push(JSON.stringify((q as { queryChunks?: unknown }).queryChunks ?? q));
+      return Promise.resolve({ rows: [] });
+    },
+  };
+}
 
 function ledgerKey(run_id: string, step: string, hash: string): string {
   return `${run_id}:${step}:${hash}`;
@@ -110,9 +126,11 @@ const fakeRepo = {
       };
     }
 
-    // (4) A escrita do passo.
+    // (4) A escrita do passo. O `tx` falso precisa expor `execute`: a ativação
+    // TRAVA o retrato de readiness (`lockReadinessSnapshot`) antes de decidir,
+    // e um `tx` sem `execute` esconderia a ausência do lock em vez de prová-la.
     applyCalls.push(input.step);
-    const applied: StepApplication = await input.apply({} as never, run);
+    const applied: StepApplication = await input.apply(fakeTx() as never, run);
 
     if (applied.deny) {
       const denied = { ...run, state: plan.onDeny, version: run.version + 1, current_step: input.step, last_error_code: applied.deny.code };
@@ -228,6 +246,7 @@ beforeEach(() => {
   runs.clear();
   ledger.clear();
   applyCalls.length = 0;
+  txStatements.length = 0;
   auditSpy.mockClear();
 });
 
@@ -553,6 +572,88 @@ describe('readiness e ativação — fail-closed', () => {
     expect(second.status).toBe('conflict');
   });
 
+  /**
+   * A review do PR #541: o avaliador default lia pelo `db` GLOBAL, fora do
+   * `tx`. Só a row de `onboarding_runs` estava travada, então profile, grant,
+   * papel, política ou canal podiam mudar entre o retrato e o `applyActivate`.
+   *
+   * Os dois testes abaixo travam as duas metades da correção: a decisão recebe
+   * o `tx` do passo, e o retrato é TRAVADO antes de ser lido.
+   */
+  it('a ativação avalia readiness PELO `tx` do passo, não pelo `db` global', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const seen: Array<{ tx: unknown } | undefined> = [];
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-tx',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async (_scope, ctx) => {
+          seen.push(ctx);
+          return readyReport();
+        },
+      },
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.tx, 'o avaliador recebeu `undefined` — a leitura saiu da transação').toBeDefined();
+  });
+
+  it('a ativação TRAVA o retrato antes de decidir — e o lock cobre cada fato do veredito', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    let statementsAtDecision: string[] = [];
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-lock',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        // Capturado NO MOMENTO da decisão: os locks têm de já estar tomados
+        // quando o avaliador roda, não depois.
+        evaluateReadiness: async () => {
+          statementsAtDecision = [...txStatements];
+          return readyReport();
+        },
+      },
+    });
+
+    const locked = statementsAtDecision.join(' ');
+    for (const table of [
+      'tenants',
+      'agents',
+      'agent_operational_profile_versions',
+      'agent_tool_grants',
+      'roles',
+      'channels',
+      'channel_policies',
+      'channel_line_state',
+      'agent_drift_alerts',
+    ]) {
+      expect(locked, `nenhum lock sobre ${table} antes da decisão`).toContain(table);
+    }
+    // O que a ativação ESCREVE é travado em modo exclusivo (evita o upgrade
+    // tardio de share→exclusive, fonte clássica de deadlock).
+    expect(locked).toMatch(/FROM agents[\s\S]*FOR UPDATE|FOR UPDATE[\s\S]*agents/);
+  });
+
+  it('`evaluate_readiness` NÃO trava a configuração — é só observação', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-readiness-sem-lock',
+      expected_version: 5,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(txStatements.join(' ')).not.toContain('FOR SHARE');
+  });
+
   it('a denegação de ativação também vai para a trilha do agente', async () => {
     runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
     await executeOnboardingStep({
@@ -570,46 +671,130 @@ describe('readiness e ativação — fail-closed', () => {
   });
 });
 
-describe('pareamento (#518)', () => {
-  it('usa um `command_id` DERIVADO — o retry re-enfileira idempotentemente', async () => {
-    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
-    const seen: string[] = [];
-    const deps = {
-      requestPairing: async (i: { command_id: string }) => {
-        seen.push(i.command_id);
-        return { ok: true };
-      },
+/**
+ * O pareamento é o passo que a review do PR #541 chama de violação direta de
+ * "backend decide, caller propõe": o comando era enfileirado ANTES de
+ * `commitStep` travar a run e conferir expiração, ledger, `expected_version` e
+ * transição. Um pedido velho, terminal ou inválido — ou a MESMA ação sob outra
+ * chave — produzia efeito de runtime mesmo quando o commit devolvia conflito.
+ *
+ * O contrato agora: o enfileiramento acontece DENTRO do `apply`, no `tx` do
+ * passo. A fila de #518 (`channel_line_state`, migration 103) é o outbox
+ * durável Admin→runtime e vive no mesmo banco, então ela entra no mesmo commit
+ * do ledger, do evento, da auditoria e do novo estado.
+ */
+describe('pareamento (#518) — nenhum efeito antes da decisão', () => {
+  const CH = '11111111-1111-4111-8111-111111111111';
+
+  const pairingPort = (calls: unknown[], result = { ok: true }) =>
+    async (i: unknown) => {
+      calls.push(i);
+      return result as { ok: boolean; reason?: string };
     };
+
+  it('usa um `command_id` DERIVADO e enfileira DENTRO do `tx` do passo', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const calls: Array<{ command_id: string; tx: unknown }> = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-1',
+      expected_version: 7,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('completed');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.command_id).toMatch(/^[0-9a-f-]{36}$/);
+    // O `tx` do passo chega à porta: o comando NÃO é enfileirado por fora.
+    expect(calls[0]!.tx).toBeDefined();
+    expect(runs.get('run-1')!.state).toBe('pairing_pending');
+  });
+
+  it('a MESMA chave replaya do ledger sem enfileirar de novo', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const calls: unknown[] = [];
+    const deps = { requestPairing: pairingPort(calls) as never };
     const call = () =>
       executeOnboardingStep({
         run_id: 'run-1',
         step: 'start_pairing',
-        payload: { channel_id: '11111111-1111-4111-8111-111111111111', method: 'qr' },
+        payload: { channel_id: CH, method: 'qr' },
         idempotency_key: 'chave-pareamento-1',
         expected_version: runs.get('run-1')!.version,
         actor: OWNER,
         deps,
       });
     await call();
-    await call();
-    expect(seen).toHaveLength(2);
-    expect(seen[0]).toBe(seen[1]);
-    expect(seen[0]).toMatch(/^[0-9a-f-]{36}$/);
+    const retry = await call();
+    expect(retry).toMatchObject({ status: 'completed', replayed: true });
+    // ANTES: a porta era chamada nas DUAS vezes (o efeito precedia o ledger).
+    // Agora o ledger responde e nada é re-enfileirado.
+    expect(calls).toHaveLength(1);
   });
 
-  it('recusa do runtime vira `denied` sem mover a run', async () => {
+  it.each([
+    ['run EXPIRADA', () => makeRun({ state: 'channel_declared', version: 7, expires_at: new Date(Date.now() - 1000) }), 7],
+    ['run TERMINAL', () => makeRun({ state: 'cancelled', version: 7 }), 7],
+    ['estado de origem ILEGAL', () => makeRun({ state: 'created', version: 1 }), 1],
+    ['versão DIVERGENTE', () => makeRun({ state: 'channel_declared', version: 9 }), 7],
+  ])('%s: o comando NÃO é enfileirado — o commit decide primeiro', async (_label, mk, version) => {
+    runs.set('run-1', mk());
+    const calls: unknown[] = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-x',
+      expected_version: version,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('conflict');
+    // ESTE é o defeito que a review descreve: antes a porta já tinha sido
+    // chamada quando o commit devolvia o conflito.
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a MESMA ação sob chave DIFERENTE não enfileira um segundo comando', async () => {
+    // `command_id` só protege o retry da MESMA chave. Quem impede o efeito
+    // duplicado com chave nova é a máquina de estados — e ela só é consultada
+    // dentro da transação, para onde o enfileiramento se mudou.
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const calls: unknown[] = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-nova',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('conflict');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('recusa do runtime vira NEGATIVA de governança, com evento e trilha', async () => {
+    // CONTRATO ALTERADO. Antes a recusa era devolvida do lado de fora da
+    // transação e a run NÃO se movia — logo a decisão não deixava evento nem
+    // linha de auditoria. Agora ela é um `deny` do passo: a run vai para
+    // `failed_retryable` (de onde `start_pairing` é legal de novo) e a negativa
+    // é registrada como qualquer outra decisão do backend.
     runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
     const out = await executeOnboardingStep({
       run_id: 'run-1',
       step: 'start_pairing',
-      payload: { channel_id: '11111111-1111-4111-8111-111111111111', method: 'qr' },
+      payload: { channel_id: CH, method: 'qr' },
       idempotency_key: 'chave-pareamento-2',
       expected_version: 7,
       actor: OWNER,
       deps: { requestPairing: async () => ({ ok: false, reason: 'pairing_in_progress' }) },
     });
     expect(out).toMatchObject({ status: 'denied', code: 'pairing_in_progress' });
-    expect(runs.get('run-1')!.state).toBe('channel_declared');
+    expect(runs.get('run-1')!.state).toBe('failed_retryable');
+    expect(runs.get('run-1')!.last_error_code).toBe('pairing_in_progress');
   });
 
   it('deriveCommandId é estável e sensível a cada componente', () => {
@@ -617,6 +802,111 @@ describe('pareamento (#518)', () => {
     expect(deriveCommandId('run-1', 'start_pairing', 'hash-a')).toBe(a);
     expect(deriveCommandId('run-2', 'start_pairing', 'hash-a')).not.toBe(a);
     expect(deriveCommandId('run-1', 'start_pairing', 'hash-b')).not.toBe(a);
+  });
+});
+
+/**
+ * [Medium] da review: `reason_code` é texto ARBITRÁRIO do console e este módulo
+ * emitia por `@/lib/metrics` DIRETO — sem allowlist de chave, sem guarda de
+ * PII, sem budget de cardinalidade e sem atribuição tenant/agente. Texto
+ * operacional (ou um telefone) virava label, e a série era ilimitada.
+ *
+ * Estes testes olham o REGISTRO renderizado, não o código: é a única forma de
+ * provar o que efetivamente virou série.
+ */
+describe('métricas — o texto do chamador nunca vira label', () => {
+  const cancelWith = async (reason_code: string) => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    const out = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code,
+    });
+    expect(out.status).toBe('completed');
+  };
+
+  it('um `reason_code` com telefone não aparece em nenhuma série', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    await cancelWith('cliente +5511987654321 desistiu do onboarding');
+
+    const scrape = await renderPrometheus();
+    expect(scrape).not.toContain('5511987654321');
+    expect(scrape).not.toContain('desistiu');
+    // O que sobra é o vocabulário fechado…
+    expect(scrape).toMatch(/maia_onboarding_run_cancelled_total\{[^}]*reason="other"/);
+    // …com a atribuição de tenant/agente que a camada sanitizada garante.
+    expect(scrape).toMatch(/maia_onboarding_run_cancelled_total\{[^}]*tenant_id="acme"/);
+    expect(scrape).toMatch(/maia_onboarding_run_cancelled_total\{[^}]*agent_id="acme-bot"/);
+
+    // E o motivo ORIGINAL continua inteiro onde ele pertence: no estado
+    // persistido da run (e daí no evento e na auditoria).
+    expect(runs.get('run-1')!.last_error_code).toBe('cliente +5511987654321 desistiu do onboarding');
+  });
+
+  it('cem `reason_code` distintos produzem UMA série, não cem', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    for (let i = 0; i < 100; i += 1) await cancelWith(`motivo-do-operador-${i}`);
+
+    const lines = (await renderPrometheus())
+      .split('\n')
+      .filter((l) => l.startsWith('maia_onboarding_run_cancelled_total{'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason="other"');
+  });
+
+  it('um `reason_code` do vocabulário sobrevive — o colapso não é indiscriminado', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    await cancelWith('operator_abort');
+    expect(await renderPrometheus()).toMatch(
+      /maia_onboarding_run_cancelled_total\{[^}]*reason="operator_abort"/,
+    );
+  });
+
+  it('o passo e o código de check saem com as chaves declaradas', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-metricas-1',
+      expected_version: 5,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () =>
+          readyReport({
+            ready: false,
+            checks: [
+              {
+                code: 'profile_active',
+                status: 'fail',
+                severity: 'blocking',
+                message: 'sem profile',
+                remediation: 'aprove',
+              },
+            ],
+          }),
+      },
+    });
+
+    const scrape = await renderPrometheus();
+    expect(scrape).toMatch(
+      /maia_onboarding_step_failed_total\{[^}]*reason="readiness_blocked"[^}]*step="evaluate_readiness"/,
+    );
+    expect(scrape).toMatch(
+      /maia_agent_readiness_failed_total\{[^}]*check_code="profile_active"/,
+    );
+    // A chave antiga `error_code` não é emitida — ela nem está no allowlist.
+    expect(scrape).not.toContain('error_code=');
   });
 });
 

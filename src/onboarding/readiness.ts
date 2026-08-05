@@ -83,7 +83,12 @@ export type AgentReadiness = {
    * mudou DEPOIS da avaliação.
    */
   configuration_fingerprint: string;
-  /** SHA-256 da lista ordenada de migrations aplicadas. */
+  /**
+   * SHA-256 do ESTADO VERIFICADO do schema: veredito, heads e o par
+   * (estado, checksum) de cada migration. Deliberadamente NÃO é a lista de
+   * ids — essa seria idêntica para um schema saudável e um sujo, que é
+   * exatamente a confusão que a fingerprint existe para impedir.
+   */
   schema_fingerprint: string;
 };
 
@@ -93,6 +98,30 @@ export type AgentReadiness = {
 // exatamente o modo de falha que estamos defendendo).
 
 type Scoped = { tenant_id: string; agent_id: string };
+
+/**
+ * Estado do schema como o readiness o consome — a PROJEÇÃO do veredito
+ * canônico de `src/migrations/` (`getSchemaReadiness`), nunca uma re-derivação
+ * a partir de `schema_migrations`.
+ *
+ * `ready` é o veredito; `verified` é a evidência por migration, e é ela (e não
+ * a lista de ids) que entra no `schema_fingerprint`.
+ */
+export type SchemaFacts = {
+  /** Veredito canônico. `false` também quando o estado não pôde ser apurado. */
+  ready: boolean;
+  state: 'ready' | 'blocked' | 'unknown';
+  expected_head: string | null;
+  applied_head: string | null;
+  /** Ids verificados como aplicados (checksum confere). */
+  applied_migrations: string[];
+  /** Ids que este build ainda aplicaria (`pending` + `failed`). */
+  pending_migrations: string[];
+  /** Bloqueadores por CÓDIGO estável — nunca SQL, DSN ou texto de driver. */
+  blockers: Array<{ kind: string; id: string | null }>;
+  /** Estado + checksum de cada migration conhecida (artefato ∪ ledger). */
+  verified: Array<{ id: string; state: string; checksum: string | null }>;
+};
 
 export type ReadinessFacts = {
   requested: { tenant_id: string; agent_id: string };
@@ -116,7 +145,7 @@ export type ReadinessFacts = {
   policies: Array<Scoped & { id: string; channel_id: string; default_role_id: string }>;
   /** Packs que a plataforma exige de todo agente (`BASE_AGENT_PACKS`). */
   required_packs: string[];
-  schema: { applied_migrations: string[]; pending_migrations: string[] };
+  schema: SchemaFacts;
   /** Itens de governança abertos que bloqueiam operação (drift crítico não resolvido). */
   blocking_governance_items: number;
 };
@@ -132,6 +161,25 @@ export const OWNERSHIP_PROVEN_LINE_STATES = ['connected', 'verified_offline'] as
 
 function owns(scope: { tenant_id: string; agent_id: string }, requested: Scoped): boolean {
   return scope.tenant_id === requested.tenant_id && scope.agent_id === requested.agent_id;
+}
+
+/**
+ * Mensagem SANITIZADA do `schema_ready` reprovado: só códigos de bloqueador e
+ * ids de migration, nunca `detail` cru (que é operador-facing mas longo) e
+ * jamais SQL/DSN. A mensagem é persistida no resultado do passo.
+ */
+function describeSchemaBlockage(schema: SchemaFacts): string {
+  if (schema.state === 'unknown') {
+    return 'estado do schema não pôde ser apurado — fail-closed';
+  }
+  const head = schema.blockers
+    .slice(0, 5)
+    .map((b) => (b.id ? `${b.kind}(${b.id})` : b.kind))
+    .join(', ');
+  const extra = schema.blockers.length > 5 ? ` e mais ${schema.blockers.length - 5}` : '';
+  return head
+    ? `schema bloqueado: ${head}${extra}`
+    : `schema bloqueado (${schema.pending_migrations.length} migration(s) pendente(s))`;
 }
 
 function check(
@@ -182,27 +230,38 @@ export function evaluateReadinessFacts(
     ),
   );
 
-  // (2) Agente — existência E pertencimento são checks SEPARADOS de propósito:
-  // "o agente existe mas é de outro tenant" é um diagnóstico completamente
-  // diferente de "o agente não existe", e o operador precisa distinguir.
-  const agentExists = facts.agent !== null && facts.agent.id === req.agent_id;
+  // (2) Agente. Os dois códigos continuam existindo (são contrato público:
+  // label de métrica e chave de i18n), mas eles NÃO distinguem mais "não
+  // existe" de "existe em outro tenant" — e isso é a correção, não uma perda.
+  //
+  // O loader lê `agents` pelo PAR completo, então um agente alheio nunca chega
+  // até aqui; e o avaliador puro descarta, por `owns`, qualquer fato de escopo
+  // errado que um caller injete. As duas mensagens são portanto IDÊNTICAS em
+  // conteúdo informativo: tenant errado é indistinguível de ausência. Confirmar
+  // a existência de um agente de outro tenant a quem tem o id é vazamento de
+  // existência — o diagnóstico global vive em
+  // `diagnoseAgentOwnershipGlobally` (só `founder`, auditado).
+  const agentExists =
+    facts.agent !== null &&
+    facts.agent.id === req.agent_id &&
+    facts.agent.tenant_id === req.tenant_id;
   checks.push(
     check(
       'agent_exists',
       agentExists,
       'blocking',
-      'agente não encontrado',
+      'nenhum agente com este id neste (tenant, agente)',
       'Crie o agente pelo passo `provision_agent` do wizard.',
       'agente encontrado',
     ),
   );
-  const agentInTenant = agentExists && facts.agent!.tenant_id === req.tenant_id;
+  const agentInTenant = agentExists;
   checks.push(
     check(
       'agent_belongs_to_tenant',
       agentInTenant,
       'blocking',
-      'o agente informado pertence a outro tenant',
+      'nenhum agente com este id neste (tenant, agente)',
       'Verifique o par (tenant, agente): readiness NUNCA compõe recursos de escopos diferentes.',
       'agente pertence ao tenant',
     ),
@@ -359,15 +418,19 @@ export function evaluateReadinessFacts(
     ),
   );
 
-  // (8) Schema pronto (#516). Fail-closed: migration pendente ⇒ não pronto.
+  // (8) Schema pronto (#516). O VEREDITO CANÔNICO de `src/migrations/`, não uma
+  // contagem de linhas do ledger: `dirty`, `failed`, `running`, checksum
+  // divergente/desconhecido e arquivo ausente reprovam tanto quanto uma
+  // migration pendente. Fail-closed também no `unknown` (o estado não pôde ser
+  // apurado ⇒ não pronto).
   checks.push(
     check(
       'schema_ready',
-      facts.schema.pending_migrations.length === 0,
+      facts.schema.ready,
       'blocking',
-      `schema com ${facts.schema.pending_migrations.length} migration(s) pendente(s)`,
-      'Rode `npm run db:migrate` antes de ativar o agente.',
-      'schema aplicado',
+      describeSchemaBlockage(facts.schema),
+      'Rode `npm run db:migrate` (ou `npm run db:migrate -- status`) e resolva os bloqueadores antes de ativar o agente.',
+      'schema verificado e compatível',
     ),
   );
 
@@ -406,7 +469,7 @@ export function evaluateReadinessFacts(
     checks,
     evaluated_at: now.toISOString(),
     configuration_fingerprint: configurationFingerprint(facts),
-    schema_fingerprint: schemaFingerprint(facts.schema.applied_migrations),
+    schema_fingerprint: schemaFingerprint(facts.schema),
   };
 }
 
@@ -455,8 +518,28 @@ export function configurationFingerprint(facts: ReadinessFacts): string {
   return createHash('sha256').update(canonicalJson(projection), 'utf8').digest('hex');
 }
 
-export function schemaFingerprint(applied: string[]): string {
-  return createHash('sha256').update(canonicalJson([...applied].sort()), 'utf8').digest('hex');
+/**
+ * Fingerprint do SCHEMA VERIFICADO.
+ *
+ * Inclui o veredito, os heads e o par (estado, checksum) de cada migration —
+ * NÃO a lista de ids. A versão anterior hasheava só os ids "aplicados", e por
+ * isso produzia o MESMO valor para um schema íntegro e para um schema com
+ * migration `dirty`, checksum divergente ou arquivo ausente: o carimbo que a
+ * ativação grava na auditoria não distinguia os dois casos que ele existe para
+ * distinguir.
+ */
+export function schemaFingerprint(
+  schema: Pick<SchemaFacts, 'state' | 'expected_head' | 'applied_head' | 'verified'>,
+): string {
+  const projection = {
+    state: schema.state,
+    expected_head: schema.expected_head,
+    applied_head: schema.applied_head,
+    verified: [...schema.verified]
+      .map((e) => ({ id: e.id, state: e.state, checksum: e.checksum }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  };
+  return createHash('sha256').update(canonicalJson(projection), 'utf8').digest('hex');
 }
 
 /** Porta de carregamento dos fatos — injetável para teste sem banco. */

@@ -19,9 +19,18 @@ export {
   type ReadinessSeverity,
   type ReadinessFacts,
   type ReadinessFactsLoader,
+  type SchemaFacts,
 } from './readiness.js';
 
-export { loadReadinessFactsFromDb, loadSchemaState } from './readiness-facts.js';
+export {
+  diagnoseAgentOwnershipGlobally,
+  loadReadinessFactsFromDb,
+  loadReadinessFactsWith,
+  loadSchemaState,
+  lockReadinessSnapshot,
+  type AgentOwnershipDiagnosis,
+  type ReadinessExecutor,
+} from './readiness-facts.js';
 
 export {
   startOnboardingRun,
@@ -38,6 +47,8 @@ export {
   type StepOutcome,
   type WizardDeps,
   type PairingPort,
+  type ReadinessEvaluator,
+  type StepTx,
 } from './wizard.js';
 
 export {

@@ -18,7 +18,7 @@
  * (invariante 3): a UI propõe o payload, o backend recusa o que não couber no
  * contrato.
  */
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { pgErrorCode } from '@/db/client.js';
 import {
@@ -326,17 +326,26 @@ export async function applyProvisionAgent(
     })
     .onConflictDoNothing();
 
-  const agentRows = await tx.select().from(agents).where(eq(agents.id, payload.agent_id)).limit(1);
+  // A releitura carrega o PAR completo (invariante 1 do AGENTS.md). Reler por
+  // `id` apenas — como aqui já se fez — devolvia a row do agente de OUTRO
+  // tenant só para então recusá-la: uma leitura cross-tenant real, e uma
+  // mensagem de erro que CONFIRMAVA a existência do agente alheio a quem
+  // chutasse o id.
+  //
+  // Com o par no WHERE, a ausência tem uma única leitura possível: o
+  // `ON CONFLICT DO NOTHING` acima não inseriu, logo o id JÁ ESTÁ EM USO (a PK
+  // de `agents` é global). Recusamos sem dizer por quem — o que é inerente a
+  // qualquer criação com id escolhido pelo caller, e nada além disso vaza.
+  const agentRows = await tx
+    .select()
+    .from(agents)
+    .where(and(eq(agents.id, payload.agent_id), eq(agents.tenant_id, tenant_id)))
+    .limit(1);
   const agent = agentRows[0];
   if (!agent) {
-    throw new OnboardingError('agent_not_found', 'agente não encontrado após o INSERT');
-  }
-  if (agent.tenant_id !== tenant_id) {
-    // O id do agente é PK GLOBAL: colidir com o agente de outro tenant não pode
-    // virar "reaproveitar o agente alheio".
     throw new OnboardingError(
       'duplicate_agent',
-      'o id de agente informado já pertence a outro tenant',
+      'o id de agente informado já está em uso — escolha outro',
       { agent_id: payload.agent_id },
     );
   }
@@ -728,8 +737,19 @@ export async function applyConfirmChannelReady(
 
 /**
  * Ativação: liga o agente E as linhas governadas, no mesmo `tx` da transição
- * da run. O readiness já foi reavaliado pelo wizard imediatamente antes, sob a
- * trava da run.
+ * da run. O readiness foi reavaliado pelo wizard imediatamente antes, DENTRO
+ * desta mesma transação e sob os locks de `lockReadinessSnapshot`.
+ *
+ * As escritas são CONFERIDAS antes de a run poder concluir. O lock protege as
+ * linhas que existiam no momento do snapshot; ele não é um predicate lock e
+ * portanto não impede toda mutação concebível. A verificação do EFEITO fecha o
+ * que sobra: se o `UPDATE` do agente não casou, ou se NENHUMA linha governada
+ * passou a rotear, isto vira uma NEGATIVA de governança (`deny`) e a run vai
+ * para `readiness_failed` — jamais um `active` que não ativou nada.
+ *
+ * Este era o buraco concreto que a review descreve: uma política removida entre
+ * o snapshot e a escrita produzia zero canais ativados e a run concluía assim
+ * mesmo, com um agente "ativo" que não roteia em lugar nenhum.
  */
 export async function applyActivate(
   tx: Tx,
@@ -738,15 +758,14 @@ export async function applyActivate(
 ): Promise<StepApplication> {
   const { tenant_id, agent_id } = requireScope(run);
 
-  await tx
-    .update(agents)
-    .set({ status: AGENT_STATUS_ACTIVE, updated_at: new Date() })
-    .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)));
-
-  // Só as linhas GOVERNADAS (com política do mesmo escopo) passam a rotear.
-  const activatedChannels = await tx
-    .update(channels)
-    .set({ active: true, updated_at: new Date() })
+  // (1) LEITURA primeiro. A precondição "existe pelo menos uma linha governada"
+  // é conferida ANTES de qualquer escrita, porque uma NEGATIVA (`deny`) NÃO faz
+  // rollback — ela commita a transição para `readiness_failed`. Escrever antes
+  // de decidir deixaria o agente `active` numa run que não concluiu, que é
+  // pior do que o defeito original.
+  const governed = await tx
+    .select({ id: channels.id })
+    .from(channels)
     .where(
       and(
         eq(channels.tenant_id, tenant_id),
@@ -759,8 +778,61 @@ export async function applyActivate(
              AND cp.agent_id = ${agent_id}
         )`,
       ),
+    );
+
+  if (governed.length === 0) {
+    return {
+      result: { activated_channels: 0 },
+      summary: { activated_channels: 0 },
+      deny: {
+        code: 'activation_precondition_failed',
+        message:
+          'nenhuma linha governada para ativar — a configuração mudou entre a avaliação e a escrita',
+      },
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: agent_id },
+    };
+  }
+
+  // (2) Escritas, cada uma conferida. Aqui a falha é uma INVARIANTE quebrada,
+  // não uma decisão de governança: as linhas estão travadas desde
+  // `lockReadinessSnapshot`, então nada deveria ter sumido. Lançar é a resposta
+  // certa — o rollback leva tudo, e a run não avança.
+  const activatedAgent = await tx
+    .update(agents)
+    .set({ status: AGENT_STATUS_ACTIVE, updated_at: new Date() })
+    .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
+    .returning({ id: agents.id });
+  if (activatedAgent.length !== 1) {
+    throw new OnboardingError(
+      'activation_precondition_failed',
+      'o agente do escopo da run desapareceu durante a ativação',
+      { agent_id, matched: activatedAgent.length },
+    );
+  }
+
+  // Só as linhas GOVERNADAS (com política do mesmo escopo) passam a rotear, e
+  // exatamente aquelas que a leitura (1) já provou governadas sob o lock.
+  const activatedChannels = await tx
+    .update(channels)
+    .set({ active: true, updated_at: new Date() })
+    .where(
+      and(
+        eq(channels.tenant_id, tenant_id),
+        eq(channels.agent_id, agent_id),
+        inArray(
+          channels.id,
+          governed.map((g) => g.id),
+        ),
+      ),
     )
     .returning({ id: channels.id });
+  if (activatedChannels.length !== governed.length) {
+    throw new OnboardingError(
+      'activation_precondition_failed',
+      'o conjunto de linhas governadas mudou durante a ativação',
+      { expected: governed.length, matched: activatedChannels.length },
+    );
+  }
 
   return {
     result: {

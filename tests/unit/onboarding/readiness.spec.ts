@@ -20,6 +20,7 @@ import {
   schemaFingerprint,
   type ReadinessCheckCode,
   type ReadinessFacts,
+  type SchemaFacts,
 } from '../../../src/onboarding/readiness.js';
 import { OnboardingError } from '../../../src/onboarding/errors.js';
 
@@ -64,8 +65,30 @@ function readyFacts(overrides: Partial<ReadinessFacts> = {}): ReadinessFacts {
       { id: POLICY_ID, tenant_id: T, agent_id: A, channel_id: CHANNEL_ID, default_role_id: ROLE_ID },
     ],
     required_packs: ['baseline.core', 'domain.calendar'],
-    schema: { applied_migrations: ['001_initial.sql', '109_onboarding_runs.sql'], pending_migrations: [] },
+    schema: readySchema(),
     blocking_governance_items: 0,
+    ...overrides,
+  };
+}
+
+/**
+ * Schema VERIFICADO — a projeção do veredito canônico de `src/migrations/`
+ * (`getSchemaReadiness`). Note que `verified` carrega estado + checksum de cada
+ * migration: é ele, e não a lista de ids, que alimenta `schemaFingerprint`.
+ */
+function readySchema(overrides: Partial<SchemaFacts> = {}): SchemaFacts {
+  return {
+    ready: true,
+    state: 'ready',
+    expected_head: '109_onboarding_runs.sql',
+    applied_head: '109_onboarding_runs.sql',
+    applied_migrations: ['001_initial.sql', '109_onboarding_runs.sql'],
+    pending_migrations: [],
+    blockers: [],
+    verified: [
+      { id: '001_initial.sql', state: 'applied', checksum: 'a'.repeat(64) },
+      { id: '109_onboarding_runs.sql', state: 'applied', checksum: 'b'.repeat(64) },
+    ],
     ...overrides,
   };
 }
@@ -209,14 +232,36 @@ describe('composição cruzada — o falso positivo que a issue descreve', () =>
     expect(codes).toContain('channel_policy_role_active');
   });
 
-  it('agente que existe mas pertence a OUTRO tenant reprova com o diagnóstico certo', () => {
+  it('agente de OUTRO tenant é INDISTINGUÍVEL de ausência (contrato novo, review do PR #541)', () => {
+    // CONTRATO ALTERADO DE PROPÓSITO. Este teste afirmava o oposto: que
+    // `agent_exists` PASSAVA para o agente de outro tenant, e só
+    // `agent_belongs_to_tenant` reprovava. Aquele "diagnóstico melhor" só era
+    // possível porque o loader lia `agents` por `id` SEM o tenant — uma leitura
+    // cross-tenant que viola a invariante 1 do AGENTS.md e VAZA EXISTÊNCIA:
+    // quem chutasse o id de um agente alheio recebia a confirmação de que ele
+    // existe. O teste estava pinando o defeito.
+    //
+    // Agora os dois checks reprovam JUNTOS e com a MESMA mensagem, e não há
+    // resposta do readiness que distinga "não existe" de "é de outro tenant".
+    // O diagnóstico global continua disponível, mas numa fronteira separada,
+    // autorizada (`founder`) e auditada — `diagnoseAgentOwnershipGlobally`.
     const r = evaluateReadinessFacts(
       readyFacts({ agent: { id: A, tenant_id: OTHER_T, status: 'active' } }),
     );
     const codes = blockingFailures(r).map((c) => c.code);
-    // `agent_exists` PASSA (o agente existe); o que reprova é o pertencimento.
-    expect(codes).not.toContain('agent_exists');
+    expect(codes).toContain('agent_exists');
     expect(codes).toContain('agent_belongs_to_tenant');
+
+    // Indistinguibilidade PROVADA: os checks do agente ausente e do agente
+    // alheio são idênticos, código a código, status a status, mensagem a
+    // mensagem. Sem esta asserção, uma mensagem diferente reintroduziria o
+    // vazamento sem quebrar nada.
+    const absent = evaluateReadinessFacts(readyFacts({ agent: null }));
+    const project = (x: typeof r) =>
+      x.checks
+        .filter((c) => c.code === 'agent_exists' || c.code === 'agent_belongs_to_tenant')
+        .map((c) => ({ code: c.code, status: c.status, message: c.message }));
+    expect(project(r)).toEqual(project(absent));
   });
 });
 
@@ -372,10 +417,75 @@ describe('checks individuais', () => {
     expect(
       failedCodes(
         readyFacts({
-          schema: { applied_migrations: ['001_initial.sql'], pending_migrations: ['109_onboarding_runs.sql'] },
+          schema: readySchema({
+            ready: false,
+            state: 'blocked',
+            applied_migrations: ['001_initial.sql'],
+            pending_migrations: ['109_onboarding_runs.sql'],
+            blockers: [{ kind: 'schema_below_minimum', id: null }],
+          }),
         }),
       ),
     ).toContain('schema_ready');
+  });
+
+  /**
+   * O DEFEITO que a review descreve: o loader lia `schema_migrations` cru e
+   * tratava TODA linha do ledger como aplicada. Uma migration `dirty`,
+   * `failed`, `running`, com checksum divergente/desconhecido ou com arquivo
+   * ausente tem ZERO pendentes — logo `pending_migrations.length === 0` deixava
+   * `schema_ready` VERDE no exato momento de uma ativação.
+   *
+   * Cada caso abaixo tem `pending_migrations: []` de propósito: é o veredito
+   * canônico (`ready`), e só ele, que reprova.
+   */
+  it.each([
+    ['dirty_migration', 'dirty'],
+    ['migration_failed', 'failed'],
+    ['running_migration', 'running'],
+    ['checksum_mismatch', 'checksum_mismatch'],
+    ['checksum_unknown', 'checksum_unknown'],
+    ['missing_file', 'missing_file'],
+  ])(
+    'schema com ZERO pendentes mas %s reprova — o veredito canônico, não a contagem',
+    (kind, entryState) => {
+      const facts = readyFacts({
+        schema: readySchema({
+          ready: false,
+          state: 'blocked',
+          pending_migrations: [],
+          blockers: [{ kind, id: '109_onboarding_runs.sql' }],
+          verified: [
+            { id: '001_initial.sql', state: 'applied', checksum: 'a'.repeat(64) },
+            { id: '109_onboarding_runs.sql', state: entryState, checksum: 'b'.repeat(64) },
+          ],
+        }),
+      });
+      const r = evaluateReadinessFacts(facts);
+      expect(r.ready).toBe(false);
+      const check = r.checks.find((c) => c.code === 'schema_ready')!;
+      expect(check.status).toBe('fail');
+      expect(check.message).toContain(kind);
+      // A mensagem carrega CÓDIGO + id de migration, jamais SQL/DSN/driver.
+      expect(check.message).not.toMatch(/postgres:\/\/|SELECT |password/i);
+    },
+  );
+
+  it('estado do schema NÃO apurado (`unknown`) reprova — fail-closed', () => {
+    const r = evaluateReadinessFacts(
+      readyFacts({
+        schema: readySchema({
+          ready: false,
+          state: 'unknown',
+          applied_migrations: [],
+          pending_migrations: [],
+          verified: [],
+          blockers: [{ kind: 'ledger_unavailable', id: null }],
+        }),
+      }),
+    );
+    expect(r.ready).toBe(false);
+    expect(r.checks.find((c) => c.code === 'schema_ready')!.message).toContain('não pôde ser apurado');
   });
 
   it('pendência de governança bloqueante reprova', () => {
@@ -439,9 +549,45 @@ describe('fingerprints', () => {
     expect(Object.keys(facts.channels[0]!)).not.toContain('external_id');
   });
 
-  it('schemaFingerprint é estável sob reordenação e sensível ao conteúdo', () => {
-    expect(schemaFingerprint(['b.sql', 'a.sql'])).toBe(schemaFingerprint(['a.sql', 'b.sql']));
-    expect(schemaFingerprint(['a.sql'])).not.toBe(schemaFingerprint(['a.sql', 'b.sql']));
+  it('schemaFingerprint é estável sob reordenação e sensível ao conjunto de migrations', () => {
+    const a = { id: 'a.sql', state: 'applied', checksum: 'a'.repeat(64) };
+    const b = { id: 'b.sql', state: 'applied', checksum: 'b'.repeat(64) };
+    const fp = (verified: typeof a[]) =>
+      schemaFingerprint(readySchema({ verified, expected_head: null, applied_head: null }));
+    expect(fp([b, a])).toBe(fp([a, b]));
+    expect(fp([a])).not.toBe(fp([a, b]));
+  });
+
+  /**
+   * CONTRATO NOVO (review do PR #541). A fingerprint anterior era o SHA-256 da
+   * lista ordenada de ids aplicados — idêntica para um schema íntegro e para um
+   * schema `dirty` / com checksum divergente, que é exatamente o par que ela
+   * existe para distinguir na auditoria de uma ativação.
+   */
+  it('schemaFingerprint DISTINGUE schema saudável de schema sujo com os mesmos ids', () => {
+    const healthy = readySchema();
+    const dirty = readySchema({
+      ready: false,
+      state: 'blocked',
+      verified: [
+        { id: '001_initial.sql', state: 'applied', checksum: 'a'.repeat(64) },
+        // MESMO id, mesmo checksum — só o estado verificado mudou.
+        { id: '109_onboarding_runs.sql', state: 'dirty', checksum: 'b'.repeat(64) },
+      ],
+    });
+    expect(healthy.applied_migrations).toEqual(dirty.applied_migrations);
+    expect(schemaFingerprint(dirty)).not.toBe(schemaFingerprint(healthy));
+  });
+
+  it('schemaFingerprint muda quando o CHECKSUM de uma migration aplicada muda', () => {
+    const before = readySchema();
+    const edited = readySchema({
+      verified: [
+        { id: '001_initial.sql', state: 'applied', checksum: 'a'.repeat(64) },
+        { id: '109_onboarding_runs.sql', state: 'applied', checksum: 'c'.repeat(64) },
+      ],
+    });
+    expect(schemaFingerprint(edited)).not.toBe(schemaFingerprint(before));
   });
 });
 
