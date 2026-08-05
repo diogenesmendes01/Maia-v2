@@ -212,6 +212,51 @@ O hot path continua **sem tocar em Redis**: o que anda por pub/sub é
 notificação, não consulta. É a mesma razão pela qual o estado do disjuntor não
 mora em Redis.
 
+#### Duas propriedades distribuídas que a chave durável precisa ter (revisão da #541)
+
+Um kill switch com chave durável tem dois modos de falhar que não aparecem em
+teste com Redis mockado — um mock não tem TTL de servidor nem ordem de comandos.
+Os dois estão travados por `tests/integration/llm-circuit-kill-switch-redis.spec.ts`,
+contra Redis real.
+
+**1. A validade é normalizada para ABSOLUTA antes de gravar, e a chave SEMPRE
+leva `PX`.** `publishCircuitOverride` (`src/lib/llm/cache-invalidation.ts:128`)
+resolve `ttl_ms`/`expires_at`/default por
+`resolveOverrideExpiry` (`src/lib/llm/circuit-mode.ts:178`), valida os limites
+**antes** de tocar no Redis, descarta `ttl_ms` do payload persistido e publica o
+mesmo payload normalizado que gravou. Sem isso, uma validade relativa na chave
+durável seria reinterpretada contra o relógio de cada boot: a chave viveria para
+sempre e toda réplica que reiniciasse ressuscitaria o override, atravessando
+deploys sem ninguém ter decidido isso. Defesa em profundidade do lado de quem lê:
+`applyCircuitOverride` com `source: 'adopted'` **recusa** payload sem
+`expires_at` absoluto — pelo canal, onde a validade relativa não sobrevive a
+nada, `ttl_ms` continua aceito.
+
+*Relógio*: `expires_at` é resolvido no relógio de quem publica e comparado no de
+quem recebe. Assume-se skew NTP de ordem de segundos — a mesma premissa de `exp`
+de JWT e de comparações com `now()` do Postgres neste repo — contra um
+arrendamento mínimo de 30min. O dano é limitado nas duas direções: réplica
+adiantada volta cedo para a postura **versionada** (direção segura); réplica
+atrasada estica o arrendamento pelo skew e só nela, porque o `PX` é uma duração
+imposta pelo próprio Redis e nenhuma réplica nova adota depois disso. Skew
+grosseiro não é adivinhado — vira `rejected` por "já vencido na chegada" ou pelo
+teto de 24h, contado e logado.
+
+**2. A adoção da chave só corre depois do `SUBSCRIBE` CONFIRMADO.**
+`subscribe()` é assíncrono; disparar e seguir para o `GET` na mesma volta do
+event loop põe o `GET` **antes** da inscrição existir. A réplica leria a chave
+antes do `SET`, perderia o `PUBLISH`, e ficaria na postura do contrato o
+incidente inteiro. Encadeando o `GET` no ack (`src/lib/llm/cache-invalidation.ts:278`),
+o Redis single-threaded fecha o argumento: ou ele processa o `SET` antes do
+`GET` (a chave é encontrada), ou processa o `GET` primeiro e então o `PUBLISH`
+— que vem depois do `SET`, sempre — é entregue à inscrição já ativa. Não há
+terceiro caso, por isso basta um `GET`. Continua best-effort: se o `SUBSCRIBE`
+falhar a adoção ainda roda, sem ordenação garantida; e pub/sub é at-most-once,
+então uma queda de socket depois do ack perde a notificação — a chave cobre quem
+**sobe** no meio do incidente, não quem **reconecta** nele.
+`llmSettingsSubscriberReady()` é o ponto em que a convergência pode ser afirmada
+em vez de presumida.
+
 **A tensão com a #534, registrada e não escondida.** A #534 argumentou por
 escrito que política de degradação é código versionado, não toggle que alguém
 vira às 3h sem deixar rastro. O owner passou por cima disso, e com razão: o
@@ -330,7 +375,8 @@ propósito — degradação silenciosa de qualidade não deve ser toggle de runt
 | `tests/unit/lib/llm-gateway.spec.ts` | Contrato do gateway: tier, retry, deadline, fallback, telemetria, redaction |
 | `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor em `enforce` + teste de carga que mede a queda de requisições durante indisponibilidade |
 | `tests/unit/lib/llm-circuit-mode.spec.ts` | Posturas `off`/`shadow`/`enforce`, fidelidade da simulação em sombra, e o kill switch (auditoria, TTL, recusa de override anônimo) |
-| `tests/unit/lib/llm-circuit-override-channel.spec.ts` | Transporte do kill switch: roteamento por canal, ordem `SET` antes de `PUBLISH`, e falha de Redis propagada |
+| `tests/unit/lib/llm-circuit-override-channel.spec.ts` | Transporte do kill switch: roteamento por canal, ordem `SET` antes de `PUBLISH`, normalização de `ttl_ms` para `expires_at` absoluto + `PX` obrigatório, recusa de adoção com validade relativa, e falha de Redis propagada |
+| `tests/integration/llm-circuit-kill-switch-redis.spec.ts` | **Redis real** — o que um mock não sabe provar: a chave carrega `PTTL` de verdade e morre sozinha (nenhum restart ressuscita override vencido), e o `GET` da adoção chega ao servidor depois do `SUBSCRIBE` (ordem lida do `MONITOR`), com a corrida réplica-subindo-durante-a-virada convergindo para o override |
 
 ## In-flight changes
 

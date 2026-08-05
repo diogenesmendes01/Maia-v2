@@ -127,11 +127,70 @@ export type CircuitOverrideMessage = {
   reason?: unknown;
   /** Instante absoluto (epoch ms). Vence `ttl_ms` quando os dois vêm. */
   expires_at?: unknown;
-  /** Alternativa a `expires_at`, resolvida contra o relógio local. */
+  /**
+   * Alternativa a `expires_at`, resolvida contra o relógio local. Só vale na
+   * ENTRADA (canal, ou argumento de `publishCircuitOverride`): a chave durável
+   * guarda sempre o absoluto já normalizado. Validade relativa numa chave
+   * durável é a receita da ressurreição — cada réplica que sobe recomeçaria a
+   * contagem e o kill switch não morreria nunca. Ver `adoptPersistedOverride`.
+   */
   ttl_ms?: unknown;
   /** `true` limpa o override e volta para a postura do contrato. */
   clear?: unknown;
 };
+
+/** Resultado da normalização de validade: instante ABSOLUTO ou o porquê da recusa. */
+export type ResolvedExpiry = { expires_at: number } | { error: string };
+
+/**
+ * Converte a validade declarada (absoluta ou relativa) num instante ABSOLUTO e
+ * valida os limites — UMA vez, num lugar só.
+ *
+ * Fonte única de verdade para `applyCircuitOverride` (que aplica localmente) e
+ * para `publishCircuitOverride` (que grava a chave durável e o `PX`). Os dois
+ * caminhos precisam concordar sobre o instante de vencimento: se o `PX` do
+ * Redis e o `expires_at` do payload divergissem, a chave sobreviveria ao
+ * arrendamento (ou morreria antes dele) e as réplicas discordariam sobre até
+ * quando o kill switch vale.
+ *
+ * ## Relógio: o que se assume e por quê é aceitável
+ *
+ * `expires_at` é resolvido no relógio de QUEM PUBLICA e comparado no relógio de
+ * QUEM RECEBE. Assume-se skew NTP de ordem de segundos entre réplicas — a
+ * mesma premissa que já sustenta `exp` de JWT e comparações com `now()` do
+ * Postgres neste repo. Contra o arrendamento mínimo sancionado (30min default)
+ * isso é ruído; contra o teto (24h), ainda mais.
+ *
+ * O dano é limitado nas DUAS direções, o que é o que importa:
+ *
+ *  - relógio da réplica ADIANTADO ⇒ o override vence cedo e ela volta para a
+ *    postura VERSIONADA (`shadow` por default). Direção segura: a réplica cai
+ *    para o contrato, nunca para um estado que ninguém pediu.
+ *  - relógio da réplica ATRASADO ⇒ o override dura o skew a mais, e só nela. O
+ *    `PX` da chave é uma DURAÇÃO medida e imposta pelo próprio Redis, então
+ *    nenhuma réplica nova adota depois do vencimento real.
+ *  - skew grosseiro (minutos, horas) NÃO é adivinhado: `expires_at <= now`
+ *    vira `rejected` ("já vencido na chegada") e `expires_at - now >
+ *    MAX_OVERRIDE_MS` vira `rejected` pelo teto. Ou seja, uma réplica com
+ *    relógio quebrado recusa o override, contado e logado — ela falha para o
+ *    baseline, jamais para um arrendamento sem fim.
+ */
+export function resolveOverrideExpiry(msg: CircuitOverrideMessage, now: number): ResolvedExpiry {
+  const absolute =
+    typeof msg.expires_at === 'number' && Number.isFinite(msg.expires_at) ? msg.expires_at : null;
+  const relative =
+    typeof msg.ttl_ms === 'number' && Number.isFinite(msg.ttl_ms) ? msg.ttl_ms : DEFAULT_OVERRIDE_MS;
+  const expiresAt = absolute ?? now + relative;
+
+  if (expiresAt <= now) return { error: 'override já vencido na chegada' };
+  if (expiresAt - now > MAX_OVERRIDE_MS) {
+    // Teto duro: desligar o disjuntor por mais de um dia é decisão de deploy,
+    // não de plantão. Recusar é melhor que truncar em silêncio — o operador
+    // precisa saber que o arrendamento que ele pediu não é o que ficou.
+    return { error: `validade acima do teto de ${MAX_OVERRIDE_MS}ms` };
+  }
+  return { expires_at: expiresAt };
+}
 
 let override: CircuitOverride | null = null;
 
@@ -307,20 +366,24 @@ export function applyCircuitOverride(
     return reject(`mode inválido: esperado ${CIRCUIT_MODES.join(' | ')}`);
   }
 
-  const expiresAt =
-    typeof msg.expires_at === 'number' && Number.isFinite(msg.expires_at)
-      ? msg.expires_at
-      : now + (typeof msg.ttl_ms === 'number' && Number.isFinite(msg.ttl_ms)
-          ? msg.ttl_ms
-          : DEFAULT_OVERRIDE_MS);
-
-  if (expiresAt <= now) return reject('override já vencido na chegada', msg.mode);
-  if (expiresAt - now > MAX_OVERRIDE_MS) {
-    // Teto duro: desligar o disjuntor por mais de um dia é decisão de deploy,
-    // não de plantão. Recusar é melhor que truncar em silêncio — o operador
-    // precisa saber que o arrendamento que ele pediu não é o que ficou.
-    return reject(`validade acima do teto de ${MAX_OVERRIDE_MS}ms`, msg.mode);
+  // Adoção da chave durável exige validade ABSOLUTA. Um payload persistido com
+  // `ttl_ms` seria reinterpretado contra o relógio de cada boot: a réplica que
+  // reinicia ressuscita o arrendamento inteiro, e o kill switch passa a ser
+  // impossível de esquecer — ele nunca expira. Recusar aqui é fail-safe: a
+  // réplica fica na postura versionada, que é o estado auditável.
+  if (
+    source === 'adopted' &&
+    !(typeof msg.expires_at === 'number' && Number.isFinite(msg.expires_at))
+  ) {
+    return reject(
+      'adoção exige expires_at absoluto: validade relativa numa chave durável ressuscita o override a cada boot',
+      msg.mode,
+    );
   }
+
+  const expiry = resolveOverrideExpiry(msg, now);
+  if ('error' in expiry) return reject(expiry.error, msg.mode);
+  const expiresAt = expiry.expires_at;
 
   override = { mode: msg.mode, expires_at: expiresAt, actor, reason };
   auditOverride(source, { mode: msg.mode, actor, reason, expires_at: expiresAt });

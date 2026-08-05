@@ -242,17 +242,49 @@ serviria, preso em `open` por um falso positivo, ou abrindo em brownout.
 # 1. Monte o payload. `actor` e `reason` são OBRIGATÓRIOS — um override sem eles
 #    é RECUSADO (e a recusa também é contada). Não há como virar esta chave
 #    anonimamente, de propósito.
+#    A validade vai como `expires_at` ABSOLUTO (epoch ms), NUNCA como `ttl_ms`:
+#    ver a caixa "duas regras" logo abaixo.
 EXP=$(( ($(date +%s) + 1800) * 1000 ))    # 30 min a partir de agora
 PAYLOAD="{\"mode\":\"off\",\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 disjuntor abrindo em brownout\",\"expires_at\":$EXP}"
 
 # 2. Chave durável PRIMEIRO (réplica que subir no meio do incidente adota o
-#    resto do arrendamento), depois o broadcast.
+#    resto do arrendamento), depois o broadcast. O `PX` tem que casar com o
+#    `expires_at` do payload.
 redis-cli SET  maia:llm:circuit:override "$PAYLOAD" PX 1800000
 redis-cli PUBLISH maia:llm:circuit:override "$PAYLOAD"
 
-# 3. Confirme em TODAS as réplicas.
+# 3. Confirme que a chave REALMENTE expira. `-1` aqui significa chave eterna:
+#    aborte e regrave com PX antes de seguir.
+redis-cli PTTL maia:llm:circuit:override
+
+# 4. Confirme em TODAS as réplicas.
 curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_mode{state="off"} 1'
 ```
+
+> **Duas regras da chave durável — as duas são o que faz o kill switch poder ser
+> esquecido sem virar configuração permanente (revisão da #541).**
+>
+> 1. **Sempre `PX`.** Uma chave sem TTL vive para sempre. `PTTL` retornando `-1`
+>    é o sinal.
+> 2. **Sempre `expires_at` absoluto no payload, nunca `ttl_ms`.** Validade
+>    relativa numa chave durável é reinterpretada contra o relógio de cada boot:
+>    toda réplica que reiniciasse ressuscitaria o arrendamento inteiro, e o
+>    override atravessaria deploys. Uma chave assim é **recusada na adoção**
+>    (`maia_llm_circuit_mode_overrides_total{reason="rejected"}`), então o
+>    sintoma é a frota não adotar o override — não é falha silenciosa, mas
+>    também não é o que você quer no meio de um incidente.
+>
+> Quem publica pelo código (`publishCircuitOverride`) já recebe as duas de
+> graça: ele normaliza `ttl_ms` para absoluto, valida os limites antes de tocar
+> no Redis e sempre grava com `PX`. As regras acima existem para o caminho do
+> `redis-cli` na mão.
+>
+> **Relógio:** `expires_at` é resolvido no relógio de quem publica e comparado
+> no de quem recebe. Assume-se skew NTP de ordem de segundos, o que é ruído
+> contra um arrendamento de 30min. Réplica adiantada volta cedo para a postura
+> versionada (direção segura); réplica atrasada estica o arrendamento pelo skew
+> e só nela. Skew grosseiro não passa: vira `rejected` por "já vencido na
+> chegada" ou pelo teto de 24h.
 
 **Reverter antes do TTL:**
 
@@ -275,6 +307,16 @@ custo honesto de um restart: `LLM_CIRCUIT_MODE=off` no `.env` +
   dia é decisão de deploy, não de plantão.
 - Sem TTL declarado ⇒ 30 min. Ele **expira sozinho** e volta para a postura do
   contrato; o retorno também é um evento contado.
+- Chave durável sem `expires_at` absoluto ⇒ recusada na adoção. Ver a caixa
+  "duas regras" acima.
+
+**Réplica que sobe durante a virada.** Uma réplica nova só lê a chave durável
+depois que a inscrição no canal está CONFIRMADA pelo Redis. Isso fecha a janela
+em que ela leria a chave antes do seu `SET` e perderia o `PUBLISH` por ainda não
+estar inscrita — o modo de falha em que metade da frota atravessa o incidente na
+postura antiga. Se o passo 4 mostrar uma réplica divergente mesmo assim, o
+suspeito é perda de mensagem por queda de socket (pub/sub é at-most-once):
+republique o `SET` + `PUBLISH`, que é idempotente.
 
 ### Auditoria — como saber que alguém mexeu
 

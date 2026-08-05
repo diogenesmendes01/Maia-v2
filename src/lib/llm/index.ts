@@ -12,6 +12,7 @@ export { isBudgetEnabled, reserveBudget, settleReservation } from './budget.js';
 export type { BudgetReservation } from './budget.js';
 export {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
+  llmSettingsSubscriberReady,
   publishCircuitOverride,
   publishLLMSettingsInvalidation,
   startLLMSettingsInvalidationSubscriber,
@@ -27,8 +28,14 @@ export {
   MAX_OVERRIDE_MS,
   currentOverride,
   effectiveMode,
+  resolveOverrideExpiry,
 } from './circuit-mode.js';
-export type { CircuitMode, CircuitOverride, CircuitOverrideMessage } from './circuit-mode.js';
+export type {
+  CircuitMode,
+  CircuitOverride,
+  CircuitOverrideMessage,
+  ResolvedExpiry,
+} from './circuit-mode.js';
 export {
   LLMGatewayError,
   classifyProviderError,
