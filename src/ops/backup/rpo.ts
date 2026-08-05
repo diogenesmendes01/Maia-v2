@@ -182,7 +182,13 @@ export function evaluateBackupReadiness(input: BackupReadinessInput): BackupRead
     },
     remediation:
       input.last_restore_drill_result === 'failed'
-        ? 'The last restore drill FAILED. Until a drill passes, no artifact is known to be restorable.'
+        ? // Readiness grades on `status` alone, which is deliberately
+          // conservative: a drill that restored perfectly but left a copy of
+          // production on the host is `failed` too (`cleanup_failed`), and it
+          // is not a certification either. `restore_drills.failure_code` +
+          // `cleanup_status` say which of the two happened — and they ask for
+          // opposite actions, so the operator must read the row.
+          'The last restore drill FAILED. Read restore_drills: `failure_code` says whether nothing is known to be restorable, or the artifact IS restorable and the drill left a copy of production data on the host (`cleanup_failed` / `cleanup_status=unsafe`, runbook §4.1).'
         : drillAge === null
           ? 'No restore drill has ever run. Run `npm run restore:test` in an isolated environment.'
           : 'The last successful restore drill is older than the configured interval.',

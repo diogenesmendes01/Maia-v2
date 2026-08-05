@@ -227,7 +227,24 @@ export async function runRestoreDrillJob(): Promise<
     }
 
     const result = outcome.result;
-    if (result.status === 'failed') {
+    // Two different emergencies, two different alerts (issue #536, review of
+    // PR #541). "Nothing is restorable" and "a full copy of production is
+    // sitting on this host" ask for opposite actions, and the residue one can
+    // fire on a drill whose restore proved out perfectly — sending the generic
+    // subject for it would send the operator looking at the wrong thing.
+    if (result.cleanup.status !== 'clean') {
+      await sendAlert({
+        subject: 'Restore drill left a COPY OF PRODUCTION DATA on the host',
+        // Kinds and reasons only: no path, no database name, no connection string.
+        body:
+          `Drill ${result.drill_id} could not prove its teardown removed: ` +
+          `${result.cleanup.residue.map((r) => `${r.kind} (${r.reason})`).join(', ')}.\n` +
+          `Restore verdict: ${result.failure_code === 'cleanup_failed' ? 'the artifact IS restorable' : `failed with code=${result.failure_code}`}.\n` +
+          `Correlation id: ${result.correlation_id}.\n` +
+          'Remove the leftovers by hand — see docs/runbooks/backup-restore.md §4.',
+      }).catch(() => null);
+    }
+    if (result.status === 'failed' && result.failure_code !== 'cleanup_failed') {
       await sendAlert({
         subject: 'Restore drill FAILED — no artifact is known to be restorable',
         // Codes only: no path, no object key, no connection string.

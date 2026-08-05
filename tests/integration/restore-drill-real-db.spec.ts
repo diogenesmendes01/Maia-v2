@@ -18,7 +18,11 @@
  *  6. the drill row round-trips with its probe JSON, duration and
  *     `tombstones_pending`, which is what feeds the measured RTO;
  *  7. an EMPTY tombstone ledger reads back as `available: true` with zero rows
- *     — distinguishable from an unreadable one, which blocks a restore.
+ *     — distinguishable from an unreadable one, which blocks a restore;
+ *  8. the teardown verdict (`cleanup_status`, migration 112) survives the round
+ *     trip on its OWN column, starts as `unknown` rather than `clean`, and is
+ *     constrained by the database — so "which drills left a copy of production
+ *     data on a host?" is one indexed predicate an operator can trust.
  *
  * Skipped without TEST_DB_URL (the unit-only lane passes without Postgres).
  */
@@ -263,6 +267,91 @@ d('restore drill evidence round-trip (issue #536)', () => {
     await expect(
       pool.query(
         `INSERT INTO restore_drills (correlation_id, status) VALUES ($1, 'green')`,
+        [CORR],
+      ),
+    ).rejects.toThrow();
+  });
+
+  /**
+   * Issue #536, review of PR #541. The teardown verdict is a SECOND axis, and
+   * these three properties are what make it trustworthy in an incident.
+   */
+  it('starts at `unknown` — a drill that died mid-flight never reads as clean', async () => {
+    const drillId = randomUUID();
+    await restoreDrillStore.createDrill({
+      id: drillId,
+      correlation_id: CORR,
+      backup_run_id: null,
+      source: 'local',
+    });
+
+    const res = await pool.query<{ status: string; cleanup_status: string }>(
+      'SELECT status, cleanup_status FROM restore_drills WHERE id = $1',
+      [drillId],
+    );
+    // `unknown` is the honest state of a row nobody finished: residue possible,
+    // nobody checked. Defaulting to `clean` would manufacture the very
+    // certification this column exists to withhold.
+    expect(res.rows[0]).toEqual({ status: 'running', cleanup_status: 'unknown' });
+  });
+
+  it('records a residue WITHOUT losing the restore-phase diagnosis', async () => {
+    const drillId = randomUUID();
+    await restoreDrillStore.createDrill({
+      id: drillId,
+      correlation_id: CORR,
+      backup_run_id: null,
+      source: 'offsite',
+    });
+    // A drill that failed its probes AND could not drop its database. One row
+    // has to carry both, because the two ask for different remediations.
+    await restoreDrillStore.finishDrill(drillId, {
+      status: 'failed',
+      finished_at: new Date(),
+      duration_ms: 999,
+      probes: {
+        tenant_seed_present: { ok: false },
+        cleanup: {
+          ok: false,
+          status: 'unsafe',
+          residue: [{ kind: 'drill_database', reason: 'still_present' }],
+        },
+      },
+      tombstones_pending: null,
+      failure_code: 'probe_failed',
+      cleanup_status: 'unsafe',
+    });
+
+    const res = await pool.query<{
+      status: string;
+      failure_code: string;
+      cleanup_status: string;
+      probes: Record<string, unknown>;
+    }>('SELECT status, failure_code, cleanup_status, probes FROM restore_drills WHERE id = $1', [
+      drillId,
+    ]);
+    expect(res.rows[0]).toMatchObject({
+      status: 'failed',
+      failure_code: 'probe_failed',
+      cleanup_status: 'unsafe',
+    });
+    expect(res.rows[0]?.probes).toMatchObject({
+      cleanup: { ok: false, residue: [{ kind: 'drill_database', reason: 'still_present' }] },
+    });
+
+    // The incident query: "which drills left a copy of production behind?" —
+    // answered by the column, regardless of what `failure_code` says.
+    const unsafe = await pool.query<{ id: string }>(
+      `SELECT id FROM restore_drills WHERE cleanup_status = 'unsafe' AND correlation_id = $1`,
+      [CORR],
+    );
+    expect(unsafe.rows.map((r) => r.id)).toContain(drillId);
+  });
+
+  it('the database refuses an invented cleanup_status', async () => {
+    await expect(
+      pool.query(
+        `INSERT INTO restore_drills (correlation_id, cleanup_status) VALUES ($1, 'probably_fine')`,
         [CORR],
       ),
     ).rejects.toThrow();

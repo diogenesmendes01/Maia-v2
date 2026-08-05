@@ -23,7 +23,7 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/upload-deadline.ts` | Cancellable upload: aborts, awaits settlement, reaps any orphan object |
 | `src/ops/backup/retention.ts` | Manifest-driven, hold-aware artifact deletion with confirmation and a conclusive outcome |
 | `src/ops/backup/rpo.ts` | RPO/RTO readiness: level + evidence + remediation per check |
-| `src/ops/backup/drill.ts` | `runRestoreDrill` — fetch the OFF-SITE artifact, bind it to its signed manifest, decrypt, restore in isolation, probe, reconcile in dry-run, tear down in `finally` (issue #536) |
+| `src/ops/backup/drill.ts` | `runRestoreDrill` — fetch the OFF-SITE artifact, bind it to its signed manifest, decrypt, restore in isolation, probe, reconcile in dry-run, tear down in `finally` and PROVE the teardown removed everything (issue #536) |
 | `src/ops/backup/drill-probes.ts` | The probe suite the drill grades a restored snapshot with. Pure graders; counts and booleans only |
 | `src/ops/backup/drill-adapters.ts` | Real IO behind the drill's ports (S3 GET to file, decrypt, `CREATE/DROP DATABASE`, `pg_restore`, probe queries) |
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
@@ -65,8 +65,20 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 - Key material never appears in a return value, error, log, metric or manifest; only `key_id` does.
 - Deletion is irreversible, so every destructive path is dry-run by default (`RETENTION_DRY_RUN=true`) and blocked entirely until a DPO-approved `RETENTION_POLICY` is configured.
 - A restore may not release traffic until every tombstone newer than the artifact's watermark has been re-applied and confirmed.
+- **A drill is `passed` only when the host is PROVEN clean.** The drill is the one job that deliberately materialises a full plaintext copy of production, so a teardown that merely did not throw is not evidence: `drill.ts` re-checks the ephemeral database against `pg_database` and each staged file against the filesystem AFTER removing them, and an absence it cannot prove counts exactly like a proven leak. The teardown verdict is a SECOND axis (`restore_drills.cleanup_status`, migration 112), never folded into `failure_code` — a probe failure and a residue can happen together, ask for opposite remediations, and must both be readable from the row.
+
+### The drill's status vocabulary
+
+| Outcome | `status` | `failure_code` | `cleanup_status` | Means |
+|---|---|---|---|---|
+| Certified | `passed` | `null` | `clean` | The artifact is restorable AND nothing was left on the host. |
+| Successful restore, unsafe residue | `failed` | `cleanup_failed` | `unsafe` | The artifact **is** restorable; a copy of production data is (or may be) still on the host. A human must remove it. Not a certification — see the runbook. |
+| Restore unproven | `failed` | the restore-phase code | `clean` | Nothing is known to be restorable; the host is clean. |
+| Both | `failed` | the restore-phase code | `unsafe` | Two independent problems in one row; neither masks the other. |
+| Nothing to drill | `skipped` | `backups_disabled` | `clean` | The only legitimate non-verdict. `readReadinessFacts` ignores it. |
+| Process died mid-drill | `running` | — | `unknown` | Nobody checked. Treat as possible residue. |
 
 ## Related
 
 - Runbook: [`docs/runbooks/backup-restore.md`](../../runbooks/backup-restore.md)
-- Migrations: `migrations/101_backup_runs_manifests.sql`, `migrations/102_data_lifecycle.sql`
+- Migrations: `migrations/101_backup_runs_manifests.sql`, `migrations/102_data_lifecycle.sql`, `migrations/112_restore_drill_cleanup_status.sql`

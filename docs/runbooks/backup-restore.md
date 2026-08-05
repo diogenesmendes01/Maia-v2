@@ -39,8 +39,9 @@ SELECT started_at, remote_verified_at, artifact_ref
 FROM backup_runs
 WHERE remote_verified ORDER BY remote_verified_at DESC LIMIT 1;
 
--- Último drill e sua duração (a resposta ao RTO)
-SELECT started_at, status, duration_ms, source, probes
+-- Último drill e sua duração (a resposta ao RTO). `cleanup_status` é um eixo
+-- SEPARADO do `status`: 'unsafe' significa cópia da produção deixada no host (§4.1)
+SELECT started_at, status, cleanup_status, duration_ms, source, probes
 FROM restore_drills ORDER BY started_at DESC LIMIT 5;
 
 -- O manifesto assinado de uma run
@@ -96,7 +97,7 @@ UPDATE backup_runs
 ssh maia 'cd /opt/maia && npm run restore:test'
 ```
 
-Exit codes: `0` passou (ou já rodando, ou backups desabilitados) · `1` falhou.
+Exit codes: `0` passou (ou já rodando, ou backups desabilitados) · `1` falhou — inclusive quando o restore provou e o **host ficou sujo** (§4.1).
 
 O drill **não** pega "o dump mais novo do diretório". Ele escolhe por evidência e prova cada etapa (issue #536, [`src/ops/backup/drill.ts`](../../src/ops/backup/drill.ts)):
 
@@ -107,25 +108,72 @@ O drill **não** pega "o dump mais novo do diretório". Ele escolhe por evidênc
 5. **restaura** num banco efêmero isolado (`maia_drill_<stamp>_<id do drill>` — o discriminador existe pelo mesmo motivo que o do artefato na #520: dois drills no mesmo segundo colidiriam, e uma colisão aqui restauraria dentro de um banco velho e reportaria falso positivo);
 6. roda a **suíte de probes** ([`drill-probes.ts`](../../src/ops/backup/drill-probes.ts)): tabelas críticas presentes, seed de tenant/agent, escopo de tenant válido, integridade `mensagens→conversas`, ledger de tombstones restaurado, `transacoes` e `audit_logs` legíveis; mais dois informativos (outbox despachável, divergência de migration head);
 7. roda a **reconciliação de tombstones em dry-run** e avalia o gate `canReleaseTraffic` — é isso que transforma "o `pg_restore` saiu 0" em "este artefato poderia voltar à produção";
-8. grava tudo em `restore_drills` (inclusive a falha) e audita;
-9. derruba o banco e apaga cada arquivo estagiado **em `finally`**.
+8. derruba o banco e apaga cada arquivo estagiado **em `finally`**, e **prova** que sumiram: consulta `pg_database` pelo nome do banco efêmero e o filesystem por cada arquivo, **depois** de remover;
+9. grava tudo em `restore_drills` (inclusive a falha e qualquer resíduo) e audita.
 
-**Fail-closed em cada passo.** Sem candidato, manifesto irrecuperável, checksum que não casa, probe obrigatório falhando ou plano de reconciliação `ok:false` ⇒ drill `failed`. **Um drill falhado torna a readiness FAIL**: até um drill passar, nenhum artefato é sabidamente restaurável.
+**Fail-closed em cada passo.** Sem candidato, manifesto irrecuperável, checksum que não casa, probe obrigatório falhando, plano de reconciliação `ok:false` **ou teardown que não se provou** ⇒ drill `failed`. **Qualquer drill falhado torna a readiness FAIL** — inclusive o `cleanup_failed`, que não é "nada é restaurável" e sim "é restaurável, e sobrou uma cópia da produção no host" (§4.1). A readiness é deliberadamente conservadora aqui: ela lê só o `status`; quem diz qual dos dois aconteceu é a linha em `restore_drills`.
 
 Se o perfil **exige** off-site (`BACKUP_OFFSITE_REQUIRED`), drillar a cópia local **não** conta: o drill falha com `no_offsite_candidate`. O artefato que importa depois de perder o host é o remoto, e só buscá-lo prova que ele é legível, decifrável e inteiro.
 
+### 4.1 O vocabulário de status (leia antes de interpretar um drill)
+
+`passed` significa **duas** coisas provadas, não uma: o artefato é restaurável **e** o host ficou limpo. São dois eixos independentes na mesma linha de `restore_drills`:
+
+| `status` | `failure_code` | `cleanup_status` | O que aconteceu, e o que fazer |
+|---|---|---|---|
+| `passed` | `null` | `clean` | Certificado. Nada a fazer. |
+| `failed` | `cleanup_failed` | `unsafe` | **Restore bem-sucedido com resíduo inseguro.** O artefato *é* restaurável — download, checksum, decifragem, `pg_restore`, probes e reconciliação passaram — mas o drill não conseguiu provar que removeu o que criou. Há (ou pode haver) uma cópia completa da produção neste host. **Vá removê-la** (§4.2). |
+| `failed` | qualquer código de restore | `clean` | Nada é sabidamente restaurável. O host está limpo. Investigue o backup. |
+| `failed` | qualquer código de restore | `unsafe` | Os dois problemas juntos, e nenhum esconde o outro: o `failure_code` é o diagnóstico do **restore**, o `cleanup_status` é o estado do **host**. Duas remediações diferentes. |
+| `skipped` | `backups_disabled` | `clean` | O único não-veredito legítimo. A readiness ignora. |
+| `running` | — | `unknown` | O processo morreu no meio. **Ninguém conferiu** — trate como resíduo possível (§4.2). |
+
+Por que `cleanup_failed` não é "só mais um código de falha": um drill verde que deixa uma cópia da produção para trás é **pior** que um drill vermelho, porque ensina o operador a confiar num sinal nocivo. Até a PR #541 o teardown só logava, e o drill terminava `passed` com o banco efêmero de pé. Por isso, também, o resíduo é **auditado numa ação própria** (`restore_drill_unsafe_residue`) e dispara um **alerta próprio**, com assunto diferente do alerta de "nada é restaurável": as duas emergências pedem ações opostas.
+
+### 4.2 Resíduo: como achar e remover
+
+O drill nunca imprime o caminho nem o nome do banco (esses textos vão para log de operador e transcript de CI). Os `kind` do resíduo mapeiam assim:
+
+| `kind` | Onde está | Como remover |
+|---|---|---|
+| `drill_database` | Um banco no mesmo cluster, nome `maia_drill_<stamp>_<12 hex do drill_id>` | `psql -d postgres -c 'DROP DATABASE "<nome>" WITH (FORCE)'` |
+| `decrypted_plaintext` | `BACKUP_DIR/restore-drill/<backup_id>.plain` — **dados de todos os tenants em claro** | `shred -u` (ou `rm`) o arquivo |
+| `staged_artifact` | `BACKUP_DIR/restore-drill/<backup_id>.artifact` — cópia cifrada baixada do off-site | `rm` o arquivo |
+
+`reason` diz o que se sabe: `removal_failed` (a remoção deu erro), `still_present` (a remoção **reportou sucesso** e o recurso continua lá) ou `unverified` (não foi possível provar a ausência). Os três exigem a mesma ação — alguém precisa ir olhar.
+
+```sql
+-- Drills com resíduo (índice parcial restore_drills_unsafe_idx)
+SELECT id, started_at, status, failure_code, probes->'cleanup' AS cleanup
+FROM restore_drills WHERE cleanup_status = 'unsafe' ORDER BY started_at DESC;
+
+-- Drills que morreram no meio: ninguém conferiu o teardown
+SELECT id, started_at FROM restore_drills
+WHERE status = 'running' AND started_at < now() - interval '6 hours';
+```
+
+```bash
+# Bancos efêmeros de drill que sobraram no cluster, de qualquer época
+psql -d postgres -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) \
+  FROM pg_database WHERE datname LIKE 'maia\_drill\_%'"
+# Arquivos estagiados que sobraram
+ls -la "$BACKUP_DIR/restore-drill/"
+```
+
+Depois de limpar, rode o drill de novo: a linha antiga fica como evidência (é append-only), e o que a readiness lê é o drill mais recente.
+
 ```sql
 -- O último drill, com o detalhe dos probes
-SELECT started_at, source, status, duration_ms, failure_code,
+SELECT started_at, source, status, duration_ms, failure_code, cleanup_status,
        tombstones_pending, probes
 FROM restore_drills ORDER BY started_at DESC LIMIT 5;
 ```
 
 `tombstones_pending > 0` num drill que passou é **normal e informativo**: é quanto um restore real ainda deveria reaplicar antes de liberar tráfego (§3.6). `probes->'reconciliation'->>'release_without_replay'` é o veredito do gate com nada reaplicado.
 
-Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, `no_drill_candidate`, `no_offsite_candidate`, `manifest_version_unsupported`, `manifest_unverifiable`, `artifact_fetch_failed`, `artifact_checksum_mismatch`, `decryption_failed`, `plaintext_checksum_mismatch`, `isolation_failed`, `restore_failed`, `probe_failed`, `reconciliation_blocked`, `drill_not_recorded`, `unexpected`.
+Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, `no_drill_candidate`, `no_offsite_candidate`, `manifest_version_unsupported`, `manifest_unverifiable`, `artifact_fetch_failed`, `artifact_checksum_mismatch`, `decryption_failed`, `plaintext_checksum_mismatch`, `isolation_failed`, `restore_failed`, `probe_failed`, `reconciliation_blocked`, `cleanup_failed` (§4.1 — o único que significa "o artefato é restaurável, mas o host não está limpo"), `drill_not_recorded`, `unexpected`.
 
-**Requisitos operacionais.** O drill precisa de (a) `pg_restore` no host, (b) permissão de `CREATE DATABASE`/`DROP DATABASE` no cluster, (c) espaço em `BACKUP_DIR/restore-drill` para o artefato baixado **e** o plaintext decifrado. Esse diretório contém, enquanto o drill roda, uma cópia **em claro** dos dados de todos os tenants — ele fica sob `BACKUP_DIR` de propósito (permissões e disco que o operador já trata como sensíveis), nunca em `/tmp`. Se o log `restore_drill.database_not_dropped` aparecer, **derrube o banco efêmero à mão**: ele é uma cópia completa da produção.
+**Requisitos operacionais.** O drill precisa de (a) `pg_restore` no host, (b) permissão de `CREATE DATABASE`/`DROP DATABASE` no cluster, (c) espaço em `BACKUP_DIR/restore-drill` para o artefato baixado **e** o plaintext decifrado. Esse diretório contém, enquanto o drill roda, uma cópia **em claro** dos dados de todos os tenants — ele fica sob `BACKUP_DIR` de propósito (permissões e disco que o operador já trata como sensíveis), nunca em `/tmp`. Se faltar qualquer uma das três, o drill termina com `cleanup_status = 'unsafe'` e **não** certifica nada: os logs `restore_drill.database_not_dropped` / `restore_drill.staged_file_not_removed` carregam o `kind` e o `reason`, e §4.2 diz o que remover.
 
 O drill não está no cron por decisão: ele cria e derruba um banco, e o intervalo esperado (`BACKUP_RESTORE_DRILL_INTERVAL_HOURS`) é semanal. Agende-o pelo cron do host, ou chame `runRestoreDrillJob()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)) de um job próprio — ele já disputa o lock `maia_ops_restore_drill`, então dois drills nunca correm juntos.
 
@@ -195,4 +243,5 @@ Registrado aqui para que ninguém opere com expectativa errada:
 - A **reaplicação** de tombstones pós-restore continua manual (passo 3.6). O drill agora executa `planReconciliation` e `canReleaseTraffic` em **dry-run** contra o snapshot restaurado, então a proteção deixou de depender de alguém lembrar de *avaliar* — mas não existe executor que *reaplique* as exclusões, porque reaplicar exige o mesmo mecanismo de exclusão por classe que o eixo 2 vai construir. (Issue #536, eixo 3.)
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
 - O drill não roda por cron dentro da aplicação — ver §4 para como agendá-lo.
+- O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.
 - Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.

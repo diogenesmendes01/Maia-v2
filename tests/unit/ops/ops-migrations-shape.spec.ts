@@ -14,6 +14,7 @@ import * as schema from '@/db/schema.js';
 const MIGRATIONS = join(process.cwd(), 'migrations');
 const sql101 = readFileSync(join(MIGRATIONS, '101_backup_runs_manifests.sql'), 'utf8');
 const sql102 = readFileSync(join(MIGRATIONS, '102_data_lifecycle.sql'), 'utf8');
+const sql112 = readFileSync(join(MIGRATIONS, '112_restore_drill_cleanup_status.sql'), 'utf8');
 
 /** SQL with `--` comments removed, so prose about a literal is not mistaken for it. */
 function statementsOnly(sql: string): string {
@@ -30,6 +31,7 @@ describe('migrations are append-only with a _down sibling (AGENTS.md §4.6)', ()
   it.each([
     '101_backup_runs_manifests',
     '102_data_lifecycle',
+    '112_restore_drill_cleanup_status',
   ])('%s has both _up and _down', (name) => {
     expect(existsSync(join(MIGRATIONS, `${name}.sql`))).toBe(true);
     expect(existsSync(join(MIGRATIONS, `${name}_down.sql`))).toBe(true);
@@ -148,6 +150,35 @@ describe('102 — data lifecycle is genuinely per-tenant', () => {
     // be exactly the "suposição jurídica como fato" the issue forbids.
     expect(sql102).not.toMatch(/retention_days\s+integer\s+NOT NULL DEFAULT/);
     expect(sql102).toMatch(/DPO/);
+  });
+});
+
+describe('112 — the drill teardown verdict is its own axis (issue #536, review of #541)', () => {
+  it('defaults to `unknown`, never to `clean`', () => {
+    // A row whose process died between `createDrill` and `finishDrill` must not
+    // read as a host that was checked. `clean` here would manufacture the very
+    // certification the column exists to withhold.
+    expect(sql112).toMatch(/cleanup_status text NOT NULL DEFAULT 'unknown'/);
+  });
+
+  it('constrains the vocabulary in the database, not only in TypeScript', () => {
+    expect(sql112).toMatch(
+      /CHECK \(cleanup_status IN \('unknown', 'clean', 'unsafe'\)\)/,
+    );
+  });
+
+  it('indexes the residue question, which is the one asked in an incident', () => {
+    // Partial: the healthy answer is zero rows, so a full index over a column
+    // that is 99% `clean` would not serve the query it exists for.
+    expect(sql112).toMatch(/CREATE INDEX IF NOT EXISTS restore_drills_unsafe_idx[\s\S]*?WHERE cleanup_status = 'unsafe'/);
+  });
+
+  it('adds a column instead of overloading failure_code', () => {
+    // The whole point: a probe failure and a teardown failure are different
+    // diagnoses that can happen together, and one column cannot hold both
+    // without the first masking the second.
+    expect(sql112).not.toMatch(/DROP COLUMN/);
+    expect(sql112).toMatch(/ADD COLUMN IF NOT EXISTS cleanup_status/);
   });
 });
 

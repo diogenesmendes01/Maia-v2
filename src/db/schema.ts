@@ -3286,11 +3286,24 @@ export const restore_drills = pgTable(
     probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
     tombstones_pending: integer('tombstones_pending'),
     failure_code: text('failure_code'),
+    /**
+     * Estado do HOST depois do teardown (migration 112): `clean` = banco
+     * efêmero e arquivos estagiados provadamente removidos; `unsafe` = alguma
+     * cópia da produção ficou (ou não se pôde provar que não ficou);
+     * `unknown` = o processo morreu antes de conferir. Eixo INDEPENDENTE de
+     * `failure_code`, para que falha de probe e falha de teardown não se
+     * mascarem.
+     */
+    cleanup_status: text('cleanup_status').notNull().default('unknown'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     recent_idx: index('restore_drills_recent_idx').on(t.status, t.started_at),
     run_idx: index('restore_drills_run_idx').on(t.backup_run_id),
+    /** Parcial: o que se consulta em incidente é "há resíduo?" (migration 112). */
+    unsafe_idx: index('restore_drills_unsafe_idx')
+      .on(t.started_at)
+      .where(sql`cleanup_status = 'unsafe'`),
   }),
 );
 

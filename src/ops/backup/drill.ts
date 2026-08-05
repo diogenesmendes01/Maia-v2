@@ -26,14 +26,39 @@
  *   7. run the tombstone reconciliation as a DRY RUN and evaluate the release
  *      gate, so a drill answers "could this artifact go back to production?"
  *      and not merely "did pg_restore exit 0";
- *   8. record everything in `restore_drills` — including a failure — and audit;
- *   9. tear down the database and every staged file in `finally`.
+ *   8. tear down the database and every staged file in `finally`, and PROVE
+ *      each one is gone;
+ *   9. record everything in `restore_drills` — including a failure and any
+ *      residue — and audit.
  *
  * FAIL-CLOSED. Every doubt is a FAILED drill. There is no path through this
  * function that reports `passed` for a step it could not prove: no candidate,
  * an unverifiable manifest, a checksum that does not bind, a required probe
  * that failed, a reconciliation plan that is not `ok` — all of them fail. An
  * unverifiable backup is not a good backup.
+ *
+ * THE STATUS VOCABULARY, precisely (issue #541 round-2 review):
+ *
+ *   `passed`  — the artifact was proven restorable AND the host was proven
+ *               clean: the ephemeral database and every file this drill staged
+ *               (including the DECRYPTED plaintext copy of every tenant's data)
+ *               are gone, checked after the removal rather than assumed from a
+ *               call that did not throw.
+ *   `failed`  — at least one of those two could not be proven. `failure_code`
+ *               names the RESTORE-phase diagnosis; `cleanup_status` is an
+ *               INDEPENDENT axis that names the host's state. A drill whose
+ *               restore was perfect but whose teardown left a copy behind is a
+ *               successful restore WITH AN UNSAFE RESIDUE — it is reported as
+ *               `failed` / `cleanup_failed` / `cleanup_status='unsafe'`, never
+ *               as a certification, because a green drill that leaks a
+ *               production copy trains the operator to trust a harmful signal.
+ *   `skipped` — the one legitimate non-verdict: backups are disabled by
+ *               configuration, so there is nothing to drill.
+ *
+ * The two axes are deliberately orthogonal so neither diagnosis masks the
+ * other: a probe failure keeps `failure_code='probe_failed'` even when the
+ * teardown ALSO failed, and the residue is still recoverable from the same row
+ * via `cleanup_status` + `probes.cleanup`.
  *
  * PURE ORCHESTRATION over injected ports, exactly like
  * `src/ops/backup/service.ts`: no Postgres, no S3, no `pg_restore` binary is
@@ -80,8 +105,53 @@ export type RestoreDrillFailureCode =
   | 'restore_failed'
   | 'probe_failed'
   | 'reconciliation_blocked'
+  // The restore itself proved out, but the drill could not prove the host is
+  // clean afterwards. It is NOT interchangeable with the codes above: those
+  // mean "nothing is known to be restorable", this one means "this artifact IS
+  // restorable and a full copy of production data is still sitting on the
+  // host". Only ever set when no restore-phase code applies — see
+  // `cleanup_status` for the axis that survives regardless.
+  | 'cleanup_failed'
   | 'drill_not_recorded'
   | 'unexpected';
+
+/** What the drill could not prove it removed. Stable, non-sensitive, no paths. */
+export type RestoreDrillResidueKind =
+  /** The ephemeral database — a full, unencrypted, untracked copy of production. */
+  | 'drill_database'
+  /** The DECRYPTED dump: every tenant's data in plaintext, on disk. */
+  | 'decrypted_plaintext'
+  /** The staged copy of the artifact as stored (still encrypted when the profile encrypts). */
+  | 'staged_artifact';
+
+/**
+ * WHY a resource counts as residue. `unverified` is not a lesser case: an
+ * absence that cannot be proven is treated exactly like a proven presence,
+ * because the operator has to go look either way.
+ */
+export type RestoreDrillResidueReason = 'removal_failed' | 'still_present' | 'unverified';
+
+export interface RestoreDrillResidue {
+  kind: RestoreDrillResidueKind;
+  reason: RestoreDrillResidueReason;
+}
+
+/**
+ * The teardown verdict — an axis of its own, never folded into `failure_code`.
+ *
+ * `clean`  — every resource this drill created was PROVEN gone after teardown.
+ * `unsafe` — at least one is still there, or its absence could not be proven.
+ *
+ * The database column additionally carries `unknown`, which this module never
+ * produces: it is the state of a row whose process died between `createDrill`
+ * and `finishDrill`, and it means "residue possible, nobody checked".
+ */
+export type RestoreDrillCleanupStatus = 'clean' | 'unsafe';
+
+export interface RestoreDrillCleanup {
+  status: RestoreDrillCleanupStatus;
+  residue: readonly RestoreDrillResidue[];
+}
 
 export interface DrillCandidate {
   backup_id: string;
@@ -149,6 +219,23 @@ export interface RestoreDrillPorts {
   removeFile(path: string): Promise<void>;
 
   /**
+   * Does this database still exist? Asked AFTER `dropDatabase`, because a call
+   * that returned without throwing is not proof: `DROP DATABASE IF EXISTS`
+   * succeeds against a name the server never had, and a pooled/misrouted admin
+   * connection can drop nothing at all and still report success.
+   *
+   * Rejecting is meaningful: the drill cannot prove the copy is gone, which is
+   * `unsafe`, not `clean`.
+   */
+  databaseExists(name: string): Promise<boolean>;
+
+  /**
+   * Does this staged file still exist? Same reasoning as `databaseExists`, and
+   * this one guards the worse artifact of the two: the DECRYPTED dump.
+   */
+  fileExists(path: string): Promise<boolean>;
+
+  /**
    * Read the tombstone ledger for the reconciliation dry run. `available:
    * false` means the boundary could not be READ — distinct from an empty
    * ledger, and a blocking condition (§13).
@@ -173,6 +260,12 @@ export interface RestoreDrillResult {
   /** Tombstones this snapshot would have to replay before releasing traffic. */
   tombstones_pending: number | null;
   probes: Record<string, unknown>;
+  /**
+   * The teardown verdict, INDEPENDENT of `failure_code`. `status: 'unsafe'`
+   * means a copy of production data is (or may be) still on the host and a
+   * human has to remove it — see the runbook, §4.
+   */
+  cleanup: RestoreDrillCleanup;
 }
 
 /**
@@ -214,7 +307,14 @@ export function assertSafeDatabaseName(name: string): string {
   return name;
 }
 
-/** Codes this module raises itself and records verbatim. */
+/**
+ * Codes this module raises itself and records verbatim.
+ *
+ * `cleanup_failed` and `drill_not_recorded` are deliberately absent: they are
+ * ASSIGNED from observed state after the try/finally, never thrown, so an error
+ * arriving with one of those codes did not come from this module and must not
+ * be echoed as if it had.
+ */
 const OWN_FAILURE_CODES: ReadonlySet<string> = new Set<RestoreDrillFailureCode>([
   'no_drill_candidate',
   'no_offsite_candidate',
@@ -267,6 +367,45 @@ export function drillFailureCode(err: unknown): RestoreDrillFailureCode {
 }
 
 /**
+ * Remove one resource and PROVE it is gone.
+ *
+ * The asymmetry is the whole point:
+ *
+ *  - a removal that THREW but whose target is provably absent is clean — a
+ *    connection dropped after `DROP DATABASE` committed did not leak anything;
+ *  - a removal that RETURNED but whose target is still there is residue, which
+ *    is exactly the case a `try { … } catch { log }` teardown cannot see;
+ *  - a check that could not run at all is residue too. An absence that cannot
+ *    be proven is worth nothing here: the operator has to go look either way,
+ *    and the alternative is certifying a drill on the strength of a call that
+ *    returned.
+ */
+async function removeAndProveGone(
+  kind: RestoreDrillResidueKind,
+  remove: () => Promise<void>,
+  stillExists: () => Promise<boolean>,
+  onProblem: (stage: 'remove' | 'verify', err: unknown) => void,
+): Promise<RestoreDrillResidue | null> {
+  let removalFailed = false;
+  try {
+    await remove();
+  } catch (err) {
+    removalFailed = true;
+    onProblem('remove', err);
+  }
+
+  try {
+    if (await stillExists()) {
+      return { kind, reason: removalFailed ? 'removal_failed' : 'still_present' };
+    }
+    return null;
+  } catch (err) {
+    onProblem('verify', err);
+    return { kind, reason: 'unverified' };
+  }
+}
+
+/**
  * Execute one restore drill.
  *
  * Callers hold `OPS_LOCK_KEYS.restore_drill`; this function does not take it,
@@ -288,6 +427,10 @@ export async function runRestoreDrill(
     duration_ms: Math.max(0, ports.now().getTime() - started.getTime()),
     tombstones_pending: null,
     probes: {},
+    // Every early return below happens before anything was created, so the
+    // host carries no residue from this drill. `clean` is a statement of fact
+    // here, not an optimistic default.
+    cleanup: { status: 'clean', residue: [] },
   });
 
   // A profile with backups disabled has nothing to drill. This is the ONE
@@ -356,6 +499,15 @@ export async function runRestoreDrill(
   let databaseName: string | null = null;
   let createdDatabase = false;
   const ephemeralFiles = new Set<string>();
+  /** Tracked apart from the rest: this is the file that holds PLAINTEXT. */
+  let plaintextPath: string | null = null;
+  /**
+   * Left DEFINITELY UNASSIGNED on purpose. The teardown in `finally` always
+   * runs and always sets it, so there is no initial value that could survive to
+   * the status computation — and an optimistic `clean` default sitting here is
+   * exactly the shape of the bug this fixes.
+   */
+  let cleanup: RestoreDrillCleanup;
 
   try {
     if (candidate === null) {
@@ -416,8 +568,12 @@ export async function runRestoreDrill(
     let restorePath = fetched.path;
     if (manifest.encryption.mode !== 'none') {
       const stagedPlain = ports.stagingPath(`${manifest.backup_id}.plain`);
-      const plain = await ports.decrypt(fetched.path, stagedPlain);
+      // Registered BEFORE the write, not after: a `decrypt` that throws
+      // half-way still leaves plaintext bytes at that path, and a teardown that
+      // only knows about files whose write SUCCEEDED would walk past them.
       ephemeralFiles.add(stagedPlain);
+      plaintextPath = stagedPlain;
+      const plain = await ports.decrypt(fetched.path, stagedPlain);
       restorePath = stagedPlain;
       if (
         !digestsMatch(plain.sha256, manifest.sha256) ||
@@ -510,30 +666,117 @@ export async function runRestoreDrill(
   } finally {
     // Teardown ALWAYS runs — the baseline's cleanup lived on the happy path, so
     // a failed drill leaked its database AND its decrypted plaintext copy of
-    // every tenant's data. Both are swept here.
+    // every tenant's data (#536). Both are swept here, and — since #541 — each
+    // sweep is VERIFIED: a teardown that merely did not throw used to leave
+    // `failure` null, and the status computed below then CERTIFIED the drill
+    // while a full copy of production sat on the host in a database nobody was
+    // tracking. Certifying a leak is worse than reporting a failure.
+    const residue: RestoreDrillResidue[] = [];
+
+    /**
+     * Remove one resource, prove it is gone, and say so exactly once.
+     *
+     * The log fires on the VERDICT, not on the exception, because the two do
+     * not coincide: a removal can return cleanly and leave the resource there
+     * (nothing thrown, real leak), and it can throw over a resource that is
+     * provably gone (something thrown, nothing leaked). Logging the exception
+     * alone is how the old teardown managed to be both noisy and blind.
+     */
+    const sweep = async (
+      kind: RestoreDrillResidueKind,
+      event: string,
+      impact: string,
+      remove: () => Promise<void>,
+      stillExists: () => Promise<boolean>,
+    ): Promise<void> => {
+      const problems: { stage: string; error: string }[] = [];
+      const left = await removeAndProveGone(kind, remove, stillExists, (stage, err) => {
+        problems.push({ stage, error: redactSecrets((err as Error).message) });
+      });
+
+      if (left !== null) {
+        residue.push(left);
+        // The KIND, never the path or the database name: this reaches operator
+        // logs. The runbook turns a kind into the command that removes it.
+        ports.log(event, { drill_id, kind, reason: left.reason, problems, impact });
+        return;
+      }
+      if (problems.length > 0) {
+        ports.log('restore_drill.teardown_error_recovered', { drill_id, kind, problems });
+      }
+    };
+
     if (createdDatabase && databaseName !== null) {
-      await ports.dropDatabase(databaseName).catch((err: unknown) => {
-        ports.log('restore_drill.database_not_dropped', {
-          drill_id,
-          error: redactSecrets((err as Error).message),
-          impact: 'ephemeral drill database still exists and holds a full copy of production data',
-        });
-      });
+      const name = databaseName;
+      await sweep(
+        'drill_database',
+        'restore_drill.database_not_dropped',
+        'ephemeral drill database still exists and holds a full copy of production data',
+        () => ports.dropDatabase(name),
+        () => ports.databaseExists(name),
+      );
     }
+
     for (const path of ephemeralFiles) {
-      await ports.removeFile(path).catch((err: unknown) => {
-        ports.log('restore_drill.staged_file_not_removed', {
-          drill_id,
-          error: redactSecrets((err as Error).message),
-          impact: 'a staged artifact copy remains on disk',
-        });
-      });
+      const isPlaintext = path === plaintextPath;
+      await sweep(
+        isPlaintext ? 'decrypted_plaintext' : 'staged_artifact',
+        'restore_drill.staged_file_not_removed',
+        isPlaintext
+          ? 'a DECRYPTED copy of every tenant’s data remains on disk'
+          : 'a staged artifact copy remains on disk',
+        () => ports.removeFile(path),
+        () => ports.fileExists(path),
+      );
     }
+
+    cleanup =
+      residue.length === 0 ? { status: 'clean', residue: [] } : { status: 'unsafe', residue };
   }
+
+  // The teardown verdict is its OWN axis. It never overwrites a restore-phase
+  // diagnosis — a drill that failed its probes AND leaked its database keeps
+  // `probe_failed` here and carries the leak in `cleanup_status` — and it never
+  // gets swallowed by one either.
+  if (failure === null && cleanup.status !== 'clean') failure = 'cleanup_failed';
+  probes.cleanup = {
+    ok: cleanup.status === 'clean',
+    status: cleanup.status,
+    residue: cleanup.residue,
+  };
 
   const finished = ports.now();
   const duration_ms = Math.max(0, finished.getTime() - started.getTime());
+  // `passed` requires BOTH: the restore proved out and the host is proven clean.
   const status: RestoreDrillStatus = failure === null ? 'passed' : 'failed';
+
+  // Audited BEFORE the row is finished, on purpose: a leaked plaintext copy
+  // plus a `finishDrill` that fails is the worst pair in this function, and the
+  // operator must still learn about the copy. This is the notice they act on.
+  if (cleanup.status !== 'clean') {
+    ports.log('restore_drill.unsafe_residue', {
+      drill_id,
+      correlation_id,
+      residue: cleanup.residue,
+      restore_verdict: failure === 'cleanup_failed' ? 'restore_proved_out' : failure,
+    });
+    await ports
+      .audit('restore_drill_unsafe_residue', {
+        drill_id,
+        correlation_id,
+        source,
+        backup_id: candidate?.backup_id ?? null,
+        // Kinds and reasons only — no path, no database name, no key.
+        residue: cleanup.residue,
+        failure_code: failure,
+      })
+      .catch((err: unknown) => {
+        ports.log('restore_drill.residue_audit_failed', {
+          drill_id,
+          error: redactSecrets((err as Error).message),
+        });
+      });
+  }
 
   try {
     await ports.store.finishDrill(drill_id, {
@@ -543,6 +786,10 @@ export async function runRestoreDrill(
       probes,
       tombstones_pending: tombstonesPending,
       failure_code: failure,
+      // Persisted as its own column so "which drills left a copy of production
+      // data behind?" is one indexed predicate, not a jsonb hunt — and so it
+      // survives even when `failure_code` is describing the restore phase.
+      cleanup_status: cleanup.status,
     });
   } catch (err) {
     // The drill row is the evidence. A drill whose result was not persisted is
@@ -563,6 +810,9 @@ export async function runRestoreDrill(
       duration_ms,
       tombstones_pending: tombstonesPending,
       probes,
+      // Carried out even though the row is unusable: the caller alerts on it,
+      // and the residue audit above already fired.
+      cleanup,
     };
   }
 
@@ -576,6 +826,7 @@ export async function runRestoreDrill(
       failure_code: failure,
       duration_ms,
       tombstones_pending: tombstonesPending,
+      cleanup_status: cleanup.status,
     })
     .catch((err: unknown) => {
       ports.log('restore_drill.outcome_audit_failed', {
@@ -594,5 +845,6 @@ export async function runRestoreDrill(
     duration_ms,
     tombstones_pending: tombstonesPending,
     probes,
+    cleanup,
   };
 }

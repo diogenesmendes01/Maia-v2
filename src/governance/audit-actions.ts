@@ -89,7 +89,11 @@ export const AUDIT_ACTIONS = [
   //  - backup_artifact_deleted: retenção removeu um artefato — ação
   //    destrutiva, registra política/escopo/contagem, nunca conteúdo.
   //  - restore_drill_*: drill automatizado; `completed` carrega a duração que
-  //    alimenta o RTO medido.
+  //    alimenta o RTO medido. `unsafe_residue` é uma ação SEPARADA de `failed`
+  //    de propósito: ela não diz "o backup não presta", diz "uma cópia completa
+  //    da produção ficou no host e alguém precisa removê-la à mão" — duas
+  //    remediações diferentes, e a segunda pode acontecer junto com um drill
+  //    que provou o restore (issue #536, revisão da PR #541).
   //  - retention_run_*: passe de retenção (inclusive dry-run) por classe de
   //    dado e tenant.
   //  - legal_hold_created/released: §11 exige papel e auditoria append-only.
@@ -105,6 +109,7 @@ export const AUDIT_ACTIONS = [
   'restore_drill_started',
   'restore_drill_completed',
   'restore_drill_failed',
+  'restore_drill_unsafe_residue',
   'retention_run_started',
   'retention_run_completed',
   'retention_run_failed',

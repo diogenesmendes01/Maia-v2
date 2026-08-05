@@ -16,10 +16,14 @@
  *
  * Exit codes are meaningful for an operator script:
  *   0  passed (artifact fetched, bound to its signed manifest, decrypted,
- *      restored, probed, and reconcilable against the tombstone ledger)
+ *      restored, probed, reconcilable against the tombstone ledger, AND the
+ *      host proven clean afterwards)
  *   0  another drill holds the lock — not an error
  *   0  skipped because backups are disabled by configuration
- *   1  failed — nothing is known to be restorable; see restore_drills
+ *   1  failed — either nothing is known to be restorable, or the drill left a
+ *      copy of production data on the host (`cleanup_failed`). Both are exit 1
+ *      because neither is a certification; the printed lines say which, since
+ *      the remediations are opposite (issue #536, review of PR #541).
  */
 import { runRestoreDrillJob } from '@/workers/backup.js';
 
@@ -55,9 +59,25 @@ async function run(): Promise<number> {
     return 0;
   }
 
+  // The residue notice comes FIRST and is separate from the failure line: it is
+  // the one thing here that needs a human at a shell tonight. Kinds and reasons
+  // only — the ephemeral database name is still not printed; the runbook's
+  // `datname LIKE 'maia_drill_%'` query finds it (the name embeds this drill id).
+  if (r.cleanup.status !== 'clean') {
+    console.error(
+      `UNSAFE: this drill could not prove it removed ` +
+        `${r.cleanup.residue.map((x) => `${x.kind} (${x.reason})`).join(', ')}. ` +
+        'A copy of production data may still be on this host — see runbook §4.',
+    );
+  }
+
   console.error(
-    `FAILED: ${r.failure_code}. Inspect restore_drills (drill ${r.drill_id}) for the probe detail. ` +
-      'Until a drill passes, no artifact is known to be restorable.',
+    r.failure_code === 'cleanup_failed'
+      ? `FAILED: cleanup_failed. The artifact IS restorable — the restore, the probes and the ` +
+          `reconciliation all proved out — but drill ${r.drill_id} is NOT a certification while ` +
+          'the residue above is on the host.'
+      : `FAILED: ${r.failure_code}. Inspect restore_drills (drill ${r.drill_id}) for the probe detail. ` +
+          'Until a drill passes, no artifact is known to be restorable.',
   );
   return 1;
 }

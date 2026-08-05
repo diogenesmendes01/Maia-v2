@@ -30,6 +30,10 @@ import { TypedError } from '../../../src/lib/utils.js';
  *   - a drill ALWAYS leaves evidence in `restore_drills`, especially a failure;
  *   - teardown ALWAYS runs — the baseline leaked its database and its
  *     decrypted plaintext on every failing path;
+ *   - teardown is PROVEN, not assumed: `passed` requires the ephemeral database
+ *     and the decrypted plaintext to be checked gone AFTER the removal, and a
+ *     residue is reported on an axis of its own so it can never be masked by,
+ *     nor mask, a restore-phase diagnosis (issue #536, review of PR #541);
  *   - the local artifact is never deleted by the drill that reads it.
  */
 
@@ -168,9 +172,37 @@ interface Harness {
   droppedDatabases: string[];
   createdDatabases: string[];
   restored: { db: string; path: string }[];
+  /** Which resources the drill actually asked about AFTER removing them. */
+  existenceChecks: string[];
 }
 
-function harness(over: Partial<RestoreDrillPorts> = {}, seed: { candidates?: Partial<Record<'local' | 'offsite', DrillCandidate | null>>; tombstones?: TombstoneRecord[]; ledgerAvailable?: boolean; probeRows?: Record<string, ProbeRow | null> } = {}): Harness {
+/**
+ * The fake host keeps REAL state: `createIsolatedDatabase` and the staging
+ * writes add to it, `dropDatabase` and `removeFile` take away from it, and the
+ * existence ports answer from it. So a test that makes `dropDatabase` throw
+ * gets a host where the database is genuinely still there — no separate knob
+ * to remember, and no way to write a test whose host is self-contradictory.
+ *
+ * `HostState` is for the OTHER case, the one no exception announces: the
+ * removal reports success and the resource is still there anyway.
+ */
+interface HostState {
+  /** Force "still present" regardless of what `dropDatabase` reported. */
+  databasesLeft?: (name: string) => boolean;
+  /** Force "still present" regardless of what `removeFile` reported. */
+  filesLeft?: (path: string) => boolean;
+}
+
+function harness(
+  over: Partial<RestoreDrillPorts> = {},
+  seed: {
+    candidates?: Partial<Record<'local' | 'offsite', DrillCandidate | null>>;
+    tombstones?: TombstoneRecord[];
+    ledgerAvailable?: boolean;
+    probeRows?: Record<string, ProbeRow | null>;
+    host?: HostState;
+  } = {},
+): Harness {
   const drills: Record<string, unknown>[] = [];
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
   const logs: { event: string; detail: Record<string, unknown> }[] = [];
@@ -178,6 +210,9 @@ function harness(over: Partial<RestoreDrillPorts> = {}, seed: { candidates?: Par
   const droppedDatabases: string[] = [];
   const createdDatabases: string[] = [];
   const restored: { db: string; path: string }[] = [];
+  const existenceChecks: string[] = [];
+  const liveDatabases = new Set<string>();
+  const liveFiles = new Set<string>();
   let clock = new Date('2026-08-01T05:00:00.000Z').getTime();
 
   const candidates = seed.candidates ?? { offsite: candidate() };
@@ -188,15 +223,23 @@ function harness(over: Partial<RestoreDrillPorts> = {}, seed: { candidates?: Par
     selectCandidate: async (source) => candidates[source] ?? null,
     manifestSecret: () => ({ secret: MANIFEST_SECRET }),
     stagingPath: (name) => `/backups/restore-drill/${name}`,
-    fetchArtifact: async (c, dest) => ({
-      path: c.source === 'offsite' ? dest : `/backups/${c.artifact_ref}`,
-      sha256: CIPHER_DIGEST,
-      bytes: CIPHER_BYTES,
-      ephemeral: c.source === 'offsite',
-    }),
-    decrypt: async () => ({ sha256: PLAIN_DIGEST, bytes: PLAIN_BYTES }),
+    fetchArtifact: async (c, dest) => {
+      const path = c.source === 'offsite' ? dest : `/backups/${c.artifact_ref}`;
+      liveFiles.add(path);
+      return {
+        path,
+        sha256: CIPHER_DIGEST,
+        bytes: CIPHER_BYTES,
+        ephemeral: c.source === 'offsite',
+      };
+    },
+    decrypt: async (_src, dest) => {
+      liveFiles.add(dest);
+      return { sha256: PLAIN_DIGEST, bytes: PLAIN_BYTES };
+    },
     createIsolatedDatabase: async (name) => {
       createdDatabases.push(name);
+      liveDatabases.add(name);
     },
     restore: async (db, path) => {
       restored.push({ db, path });
@@ -204,9 +247,19 @@ function harness(over: Partial<RestoreDrillPorts> = {}, seed: { candidates?: Par
     runProbes: async () => seed.probeRows ?? healthyProbeRows(),
     dropDatabase: async (name) => {
       droppedDatabases.push(name);
+      liveDatabases.delete(name);
     },
     removeFile: async (path) => {
       removed.push(path);
+      liveFiles.delete(path);
+    },
+    databaseExists: async (name) => {
+      existenceChecks.push(`db:${name}`);
+      return seed.host?.databasesLeft?.(name) ?? liveDatabases.has(name);
+    },
+    fileExists: async (path) => {
+      existenceChecks.push(`file:${path}`);
+      return seed.host?.filesLeft?.(path) ?? liveFiles.has(path);
     },
     readLedger: async () => ({
       available: seed.ledgerAvailable ?? true,
@@ -231,7 +284,17 @@ function harness(over: Partial<RestoreDrillPorts> = {}, seed: { candidates?: Par
     ...over,
   };
 
-  return { ports, drills, audits, logs, removed, droppedDatabases, createdDatabases, restored };
+  return {
+    ports,
+    drills,
+    audits,
+    logs,
+    removed,
+    droppedDatabases,
+    createdDatabases,
+    restored,
+    existenceChecks,
+  };
 }
 
 const devProfile = () => resolveBackupProfile(cfg());
@@ -349,16 +412,216 @@ describe('restore drill — teardown always runs (the baseline leaked on failure
     expect(h.droppedDatabases).toEqual([]);
   });
 
-  it('reports, and does not throw, when the ephemeral database cannot be dropped', async () => {
+  /**
+   * CONTRACT CHANGED (issue #536, round-2 review of PR #541).
+   *
+   * This test used to assert `status === 'passed'` — a refused `DROP DATABASE`
+   * was pinned as an acceptable outcome for a drill that still gets certified.
+   * That was the defect, pinned: the teardown caught only to log, `failure`
+   * stayed null, and the status computed afterwards certified the drill while a
+   * full copy of production data remained on the host, in plaintext, in a
+   * database nobody was tracking. A green drill that leaks a production copy is
+   * worse than a red one — it teaches the operator to trust a harmful signal.
+   *
+   * What survives from the old assertion, because it was right: the drill must
+   * still NOT THROW, and it must still log the leak with its impact. What
+   * changed is the verdict.
+   */
+  it('does NOT certify a drill whose ephemeral database could not be dropped', async () => {
     const h = harness({
       dropDatabase: async () => {
         throw new Error('still connected');
       },
     });
     const result = await runRestoreDrill(h.ports, prodProfile());
-    expect(result.status).toBe('passed');
+
+    expect(result.status).toBe('failed');
+    expect(result.failure_code).toBe('cleanup_failed');
+    expect(result.cleanup).toEqual({
+      status: 'unsafe',
+      residue: [{ kind: 'drill_database', reason: 'removal_failed' }],
+    });
+    // Still no throw, and the operator log is still there.
     const leak = h.logs.find((l) => l.event === 'restore_drill.database_not_dropped');
     expect(leak?.detail.impact).toContain('full copy of production data');
+  });
+});
+
+describe('restore drill — `passed` is PROVEN clean, not assumed clean (#541)', () => {
+  it('asks the host whether each resource is really gone, AFTER removing it', async () => {
+    const h = harness();
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('passed');
+    expect(result.cleanup).toEqual({ status: 'clean', residue: [] });
+    // The proof itself: a check per resource the drill created.
+    expect(h.existenceChecks).toEqual([
+      `db:${h.createdDatabases[0]}`,
+      `file:/backups/restore-drill/${BACKUP_ID}.artifact`,
+      `file:/backups/restore-drill/${BACKUP_ID}.plain`,
+    ]);
+    expect(h.drills[0]).toMatchObject({ status: 'passed', cleanup_status: 'clean' });
+    expect(h.drills[0]?.probes).toMatchObject({ cleanup: { ok: true, status: 'clean' } });
+  });
+
+  it('fails when DROP DATABASE reports success and the database is still there', async () => {
+    // The case a `try { drop() } catch { log() }` teardown is blind to, and the
+    // reason the check exists at all: `DROP DATABASE IF EXISTS` also "succeeds"
+    // against a name the server never had.
+    const h = harness({}, { host: { databasesLeft: () => true } });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('failed');
+    expect(result.failure_code).toBe('cleanup_failed');
+    expect(result.cleanup.residue).toEqual([
+      { kind: 'drill_database', reason: 'still_present' },
+    ]);
+    // The removal was attempted and reported fine — only the proof caught it.
+    expect(h.droppedDatabases).toEqual(h.createdDatabases);
+  });
+
+  it('fails when the DECRYPTED plaintext survives the removal', async () => {
+    const h = harness(
+      {},
+      { host: { filesLeft: (p) => p.endsWith('.plain') } },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('failed');
+    expect(result.failure_code).toBe('cleanup_failed');
+    expect(result.cleanup.residue).toEqual([
+      { kind: 'decrypted_plaintext', reason: 'still_present' },
+    ]);
+    const leak = h.logs.find((l) => l.event === 'restore_drill.staged_file_not_removed');
+    expect(leak?.detail.kind).toBe('decrypted_plaintext');
+  });
+
+  it('treats an absence it CANNOT PROVE exactly like a proven leak', async () => {
+    // `fileExists` rejecting means the drill has no idea. Fail-closed: the
+    // operator has to go look either way.
+    const h = harness({
+      fileExists: async () => {
+        throw new Error('EACCES');
+      },
+    });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('failed');
+    expect(result.failure_code).toBe('cleanup_failed');
+    expect(result.cleanup.residue).toEqual([
+      { kind: 'staged_artifact', reason: 'unverified' },
+      { kind: 'decrypted_plaintext', reason: 'unverified' },
+    ]);
+  });
+
+  it('is clean when the removal threw but the resource is provably gone', async () => {
+    // The mirror case, and the reason the check is the authority rather than
+    // the call: a connection dropped after `DROP DATABASE` committed leaked
+    // nothing, and reporting it as a leak would cry wolf.
+    const h = harness(
+      {
+        dropDatabase: async () => {
+          throw new Error('connection reset after commit');
+        },
+      },
+      { host: { databasesLeft: () => false } },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('passed');
+    expect(result.cleanup).toEqual({ status: 'clean', residue: [] });
+  });
+
+  it('registers the plaintext path BEFORE decrypting, so a half-written dump is swept', async () => {
+    const h = harness({
+      decrypt: async () => {
+        throw new TypedError('backup_decrypt_failed', 'GCM tag mismatch at byte 4M', {});
+      },
+    });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.failure_code).toBe('decryption_failed');
+    // A teardown that only knew about files whose write SUCCEEDED would walk
+    // past the partial plaintext this failure left behind.
+    expect(h.removed).toContain(`/backups/restore-drill/${BACKUP_ID}.plain`);
+    expect(h.existenceChecks).toContain(`file:/backups/restore-drill/${BACKUP_ID}.plain`);
+  });
+});
+
+describe('restore drill — a probe failure and a residue never mask each other (#541)', () => {
+  it('keeps the RESTORE diagnosis in failure_code and the residue in cleanup_status', async () => {
+    const rows = healthyProbeRows();
+    rows.tenant_seed_present = { tenants: 0, agents: 0 };
+    const h = harness({}, { probeRows: rows, host: { databasesLeft: () => true } });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    // Two different diagnoses, two different remediations, both recoverable
+    // from the persisted row.
+    expect(result.failure_code).toBe('probe_failed');
+    expect(result.cleanup.status).toBe('unsafe');
+    expect(h.drills[0]).toMatchObject({
+      status: 'failed',
+      failure_code: 'probe_failed',
+      cleanup_status: 'unsafe',
+    });
+    expect(h.drills[0]?.probes).toMatchObject({
+      tenant_seed_present: { ok: false },
+      cleanup: { ok: false, status: 'unsafe' },
+    });
+  });
+
+  it('uses cleanup_failed ONLY when the restore itself proved out', async () => {
+    const h = harness({}, { host: { databasesLeft: () => true } });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.failure_code).toBe('cleanup_failed');
+    // The restore-phase evidence is intact — this artifact IS restorable; what
+    // is not true is that the host is clean.
+    expect(result.probes).toMatchObject({ tenant_seed_present: { ok: true } });
+    expect(result.tombstones_pending).toBe(0);
+  });
+
+  it('audits the residue as its OWN action, with codes only', async () => {
+    const h = harness({}, { host: { databasesLeft: () => true } });
+    await runRestoreDrill(h.ports, prodProfile());
+
+    const residue = h.audits.find((a) => a.action === 'restore_drill_unsafe_residue');
+    expect(residue?.metadata).toMatchObject({
+      residue: [{ kind: 'drill_database', reason: 'still_present' }],
+      failure_code: 'cleanup_failed',
+    });
+    // `restore_drill_failed` still closes the drill — the residue action is an
+    // addition, not a replacement.
+    expect(h.audits.map((a) => a.action)).toEqual([
+      'restore_drill_started',
+      'restore_drill_unsafe_residue',
+      'restore_drill_failed',
+    ]);
+    const serialized = JSON.stringify(h.audits);
+    expect(serialized).not.toContain('/backups');
+    expect(serialized).not.toContain(h.createdDatabases[0]);
+  });
+
+  it('announces the residue even when the drill row cannot be finished', async () => {
+    // The worst pair in this function: a leaked plaintext copy AND no evidence
+    // row. The operator must still learn about the copy, so the residue audit
+    // fires BEFORE `finishDrill`.
+    const h = harness(
+      {
+        store: {
+          createDrill: async () => undefined,
+          finishDrill: async () => {
+            throw new Error('update failed');
+          },
+        },
+      },
+      { host: { filesLeft: (p) => p.endsWith('.plain') } },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.failure_code).toBe('drill_not_recorded');
+    expect(result.cleanup.status).toBe('unsafe');
+    expect(h.audits.map((a) => a.action)).toContain('restore_drill_unsafe_residue');
   });
 });
 
@@ -728,5 +991,14 @@ describe('drillFailureCode', () => {
     expect(drillFailureCode(new TypedError('postgres://user:pw@host/db', '', {}))).toBe('unexpected');
     expect(drillFailureCode(new Error('boom'))).toBe('unexpected');
     expect(drillFailureCode(null)).toBe('unexpected');
+  });
+
+  it('does not accept `cleanup_failed` from a thrown error', () => {
+    // It is ASSIGNED from observed teardown state, never thrown. An error
+    // arriving with that code did not come from this module, and letting it
+    // through would let a restore-phase failure disguise itself as "the
+    // artifact is fine, only the host is dirty".
+    expect(drillFailureCode(new TypedError('cleanup_failed', '', {}))).toBe('unexpected');
+    expect(drillFailureCode(new TypedError('drill_not_recorded', '', {}))).toBe('unexpected');
   });
 });

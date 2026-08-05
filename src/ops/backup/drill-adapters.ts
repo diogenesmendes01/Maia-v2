@@ -19,7 +19,7 @@
  *    echoes the connection URL — with the password — on a connection failure,
  *    which is precisely the leak issue #520 closed on the `pg_dump` side.
  */
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import pg from 'pg';
 import { config } from '@/config/env.js';
@@ -74,6 +74,31 @@ async function adminExec(statement: string): Promise<void> {
   await client.connect();
   try {
     await client.query(statement);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Ask the CATALOG whether the ephemeral database is still there (issue #541).
+ *
+ * `DROP DATABASE IF EXISTS` returning without error is not proof: it also
+ * "succeeds" against a name the server never had, which is exactly what a
+ * misrouted admin connection produces. `pg_database` is the only authority.
+ *
+ * Parameterised — this is a query, not DDL, so the name never becomes SQL. Any
+ * failure PROPAGATES: `drill.ts` treats an unprovable absence as residue, and
+ * swallowing the error here would put the false certification straight back.
+ */
+async function databaseExists(name: string): Promise<boolean> {
+  const client = new pg.Client({ connectionString: adminUrl() });
+  await client.connect();
+  try {
+    const res = await client.query<{ ok: number }>(
+      'SELECT 1 AS ok FROM pg_database WHERE datname = $1',
+      [assertSafeDatabaseName(name)],
+    );
+    return res.rowCount !== null && res.rowCount > 0;
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -208,6 +233,21 @@ export function createRestoreDrillPorts(): RestoreDrillPorts {
 
     removeFile: async (path) => {
       await rm(path, { force: true });
+    },
+
+    databaseExists,
+
+    // ENOENT is the proof of absence. Every OTHER errno (EACCES on the
+    // directory, EIO) is NOT: it means we cannot tell, so it propagates and
+    // `drill.ts` records `unverified` residue rather than certifying the drill.
+    fileExists: async (path) => {
+      try {
+        await stat(path);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw err;
+      }
     },
 
     readLedger: readTombstoneLedger,
