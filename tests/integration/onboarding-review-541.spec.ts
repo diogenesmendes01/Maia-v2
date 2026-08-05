@@ -530,7 +530,7 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
       run_id: s.run_id,
       step: 'evaluate_readiness',
       payload: {},
-      idempotency_key: 'rev541-atomic-ready',
+      idempotency_key: 'saga-key-atomic-ready',
       expected_version: s.version,
       actor,
     });
@@ -549,7 +549,7 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
       run_id: s.run_id,
       step: 'activate',
       payload: { confirm_tenant_id: s.tenant, confirm_agent_id: s.agent },
-      idempotency_key: 'rev541-atomic-activate',
+      idempotency_key: 'saga-key-atomic-act',
       expected_version: version,
       actor,
       deps: {
@@ -629,7 +629,7 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
       run_id: s.run_id,
       step: 'evaluate_readiness',
       payload: {},
-      idempotency_key: 'rev541-verify-ready',
+      idempotency_key: 'saga-key-verify-ready',
       expected_version: s.version,
       actor,
     });
@@ -639,7 +639,7 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
       run_id: s.run_id,
       step: 'activate',
       payload: { confirm_tenant_id: s.tenant, confirm_agent_id: s.agent },
-      idempotency_key: 'rev541-verify-activate',
+      idempotency_key: 'saga-key-verify-act',
       expected_version: version,
       actor,
       deps: {

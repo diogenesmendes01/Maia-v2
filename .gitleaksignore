@@ -12,3 +12,18 @@ d9a4afbefc0a8c911ec6628611e1f5889c913e75:tests/admin-ui/unit/auth-gating.spec.ts
 # idempotency-outbox-dispatcher.spec.ts is now suppressed in a squash-stable
 # way via a path+value allowlist in .gitleaks.toml (the old commit-fingerprint
 # entry here broke when #326 was squash-merged and the SHA changed).
+
+# PR #541: same shape as #162. An `idempotency_key` fixture in the onboarding
+# review spec ('rev541-verify-activate') carried enough entropy to trip
+# generic-api-key in the key-assignment shape the rule looks for. It is a test
+# fixture, never a credential. The value was renamed to the convention its
+# neighbours in the same file already used (saga-key-*), so the CURRENT tree is
+# clean — but gitleaks still scans the original commit under
+# `--log-opts="origin/main..HEAD"`.
+#
+# A fingerprint, NOT a .gitleaks.toml path+value allowlist, is deliberate here:
+# the offending value no longer exists in the code, so a value allowlist would
+# be permanent config guarding something already gone. This entry is scoped to
+# one commit and stops mattering the moment the PR is squash-merged — which is
+# exactly the property #326 needed to NOT have, and this one does.
+da0bc0c7105e4390c3fdb8e9cce03caafe0bca8a:tests/integration/onboarding-review-541.spec.ts:generic-api-key:642
