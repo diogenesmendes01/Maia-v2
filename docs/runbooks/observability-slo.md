@@ -283,13 +283,44 @@ Quebre por `result`:
 | `result` | Significado |
 |---|---|
 | `ok` | sucesso |
-| `blocked` | governança NEGOU (grant, permissão, aprovação pendente, escopo). **Não é erro** — é a plataforma funcionando. Tem SLI próprio (`maia:tool_blocked_ratio:rate5m`). |
-| `invalid` | o modelo produziu argumentos que o Zod rejeitou. Sobe junto com troca de modelo/prompt. |
+| `blocked` | governança NEGOU (grant, permissão, aprovação pendente, escopo, flag desligada, dependência ausente). **Não é erro** — é a plataforma funcionando. Tem SLI próprio (`maia:tool_blocked_ratio:rate5m`). |
+| `invalid` | a CHAMADA veio malformada: argumentos que o Zod rejeitou, ou um nome de tool que não existe. Sobe junto com troca de modelo/prompt. |
 | `error` | a tool quebrou. Este é o numerador do alerta. |
 
 `blocked` subindo sozinho é quase sempre grant mal configurado, não incidente —
 por isso está fora do numerador. Confirme em `maia:tool_duration_ms:p95` por
 `tool` se a lentidão acompanha, e cruze com §4.5.
+
+#### De onde vem cada `result` (vocabulário fechado)
+
+O dispatcher e a ponte MCP sinalizam veredito **retornando** `{ error: <code> }`,
+nunca lançando. Os códigos são um conjunto **fechado**, declarado por quem os
+produz em [`src/tools/_dispatch-error-codes.ts`](../../src/tools/_dispatch-error-codes.ts)
+e re-exportado por `src/tools/_dispatcher.ts` e `src/tools/mcp-bridge.ts` — a
+observabilidade importa a lista em vez de manter cópia (cópia diverge).
+
+| `result` | Códigos |
+|---|---|
+| `blocked` | `forbidden` · `tool_not_granted` · `tool_disabled` · `feature_disabled` · `no_entity_in_scope` · `redis_unavailable_blocked` · `approval_pending` · `requires_confirmation` · `requires_dual_approval` · `mcp_tool_not_executable` |
+| `invalid` | `invalid_args` · `unknown_tool` |
+| `error` | `execution_failed` · `mcp_call_failed` · `idempotency_payload_hash_collision` · `idempotency_prior_failed` · `idempotency_owner_failed` · `idempotency_wait_timeout` · `idempotency_completion_fenced` |
+
+Até a revisão da #541 o classificador conhecia cinco códigos escritos à mão e
+jogava o resto no `error` default. Ou seja: `feature_disabled`,
+`redis_unavailable_blocked`, `approval_pending`, `requires_confirmation`,
+`requires_dual_approval` e `mcp_tool_not_executable` — **recusas fail-closed,
+governança funcionando como projetada** — entravam no numerador deste alerta.
+Um SLI que conta governança como falha é pior que nenhum: ensina o time a
+ignorar o alerta. `tests/unit/observability/tool-error-codes.spec.ts` varre os
+dois arquivos-fonte e falha se um código retornado não estiver classificado —
+exaustividade, não amostragem.
+
+**Resíduo conhecido.** O default continua `error`, de propósito: uma tool
+HANDLER também pode devolver `{ error: … }` com string livre (ex.
+`cancel-transaction` → `not_found`, `generate-report` →
+`pdf_generation_failed`), fora do vocabulário do dispatcher. Contar falha
+desconhecida como falha é a direção fail-safe. Se um desses volumes crescer a
+ponto de distorcer o SLI, classifique-o explicitamente — não mexa no default.
 
 ### 4.15 `MaiaOtlpExportFailing`
 

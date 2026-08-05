@@ -483,12 +483,64 @@ export type RepairResult =
   | { readonly ok: false; readonly reason: string };
 
 /**
+ * Why `--as applied` cannot be honoured for a given id.
+ *
+ * - `artifact_missing`  — this build does not package the file at all, so
+ *   there is nothing to hash and the row would stay `missing_file`.
+ * - `checksum_missing`  — the file is packaged but carries no digest, so the
+ *   row would stay `checksum_unknown`.
+ *
+ * Both leave `status`/`up` blocked on exactly the same id the operator was
+ * just told had been repaired.
+ */
+export type RepairRefusalRule = 'artifact_missing' | 'checksum_missing';
+
+/**
+ * The refusal text for `--as applied` without a verifiable artifact.
+ *
+ * Shaped like `ConfigValidationError` (`src/config/load.ts:59`), which is the
+ * repo's model for actionable diagnosis: one line naming WHAT is missing,
+ * indented `→` lines naming what to do instead. Exported so the CLI, the tests
+ * and the runbook all quote one string rather than three that drift.
+ */
+export function repairAppliedRefusal(id: string, rule: RepairRefusalRule): string {
+  const missing =
+    rule === 'artifact_missing'
+      ? `this build does not package migrations/${id}, so there is no checksum to record and the row would stay missing_file`
+      : `migrations/${id} is packaged but has no checksum, so the row would stay checksum_unknown`;
+  const nextState = rule === 'artifact_missing' ? 'missing_file' : 'checksum_unknown';
+  return (
+    `repair --as applied refused for "${id}": it would report success without repairing readiness.\n` +
+    `  - ${id} [repair/${rule}]: ${missing}.\n` +
+    `      → Marking it applied here writes checksum_source='backfilled' with nothing verified, ` +
+    `and the next \`migrate status\`/\`migrate up\` blocks again on ${nextState} — repaired in name only.\n` +
+    `      → Run the repair from a build that ships ${id}, so the packaged checksum can be adopted.\n` +
+    `      → Or, if ${id} must not stand in this schema: undo its effects by hand, then ` +
+    `\`migrate repair --id ${id} --as pending --reason "<why>"\` — that DELETES the ledger row ` +
+    `so the migration is applied again from scratch, instead of certifying a schema nobody can verify.`
+  );
+}
+
+/**
  * Explicit repair of a dirty/failed/orphaned ledger row.
  *
  * Deliberately NOT part of `up`: "clearing the flag" is exactly what the
  * runbook forbids doing reflexively. It takes the same global lock (so it
  * cannot race a migrator), demands a non-empty reason that is persisted on the
  * row, and refuses to touch a healthy `applied` row.
+ *
+ * ### Why `--as applied` demands the packaged file AND its checksum
+ *
+ * `repairEntry` writes `checksum_sha256 = COALESCE($2, checksum_sha256)`, so a
+ * NULL checksum still flipped the row to `applied` and stamped
+ * `checksum_source = 'backfilled'` — and this function still returned success.
+ * The very next `status`/`up` then blocked again on `missing_file` /
+ * `checksum_unknown` for that same id. The operator was told "repaired" while
+ * readiness had not moved, in the one tool they reach for during an incident.
+ *
+ * So the artifact is checked FIRST — before the lock, before any DDL, so a
+ * refusal costs nothing and contends with no migrator — and `pending` stays the
+ * explicit remediation for the case where there is nothing to verify.
  */
 export async function repairMigration(
   deps: RunnerDeps,
@@ -498,6 +550,20 @@ export async function repairMigration(
   const emit = deps.onEvent ?? (() => undefined);
   if (request.reason.trim().length === 0) {
     return { ok: false, reason: 'a repair requires a non-empty --reason; it is persisted on the ledger row as the audit trail' };
+  }
+  const artifact = await discoverMigrations(deps.migrationsDir);
+  const packaged = artifact.byId.get(request.id) ?? null;
+  const checksum = packaged?.checksum ?? null;
+  if (request.outcome === 'applied') {
+    const rule: RepairRefusalRule | null =
+      packaged === null
+        ? 'artifact_missing'
+        : checksum === null || checksum.length === 0
+          ? 'checksum_missing'
+          : null;
+    if (rule !== null) {
+      return { ok: false, reason: repairAppliedRefusal(request.id, rule) };
+    }
   }
   const acquisition = await acquireMigrationLock(
     { pool: deps.pool, onEvent: emit, ...(deps.now ? { now: deps.now } : {}) },
@@ -509,8 +575,6 @@ export async function repairMigration(
   const client = acquisition.lock.client as RunnerPoolClient;
   try {
     await ensureLedgerSchema(client);
-    const artifact = await discoverMigrations(deps.migrationsDir);
-    const checksum = artifact.byId.get(request.id)?.checksum ?? null;
     const changed = await repairEntry(
       client,
       request.id,

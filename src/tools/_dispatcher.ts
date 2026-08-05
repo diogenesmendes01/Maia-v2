@@ -30,6 +30,21 @@ import { incCounter } from '@/lib/metrics.js';
 import { instrumentToolDispatch } from '@/observability/instrumentation.js';
 import { config } from '@/config/env.js';
 
+/**
+ * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
+ * imports it instead of keeping a partial copy that silently drifts and
+ * miscounts fail-closed refusals as operational failures. The list itself
+ * lives in a leaf module (no imports) because this file already imports
+ * `observability/instrumentation.ts`, and the reverse edge would be a cycle.
+ * `tests/unit/observability/tool-error-codes.spec.ts` fails if a code returned
+ * below is missing from the list, or listed without being returned.
+ */
+export {
+  DISPATCHER_ERROR_CODES,
+  type DispatcherErrorCode,
+  type ToolErrorCode,
+} from './_dispatch-error-codes.js';
+
 export type ToolContext = {
   pessoa: Pessoa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };

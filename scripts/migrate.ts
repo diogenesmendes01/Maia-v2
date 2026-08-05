@@ -16,6 +16,10 @@
  *
  * `plan` and `status` NEVER write (no DDL, no backfill, no lock). `repair` is
  * an exceptional, audited operation — see `docs/runbooks/migrations.md`.
+ * `repair --as applied` is REFUSED when this build does not package the
+ * migration (there would be no checksum to record, so the next `status`/`up`
+ * would block again on the same id); the refusal names `--as pending` as the
+ * remediation and exits 1.
  *
  * Exit codes: 0 success / up-to-date · 1 failure, blocked, or lock unavailable.
  * `process.exit()` is called HERE and never inside the library.

@@ -68,12 +68,14 @@ export {
 } from './ledger.js';
 
 export {
+  repairAppliedRefusal,
   repairMigration,
   runMigrations,
   DEFAULT_STATEMENT_LOCK_TIMEOUT_MS,
   RUNNER_VERSION,
   type MigrationEventSink,
   type MigrationRunResult,
+  type RepairRefusalRule,
   type RepairRequest,
   type RepairResult,
   type RunnerDeps,

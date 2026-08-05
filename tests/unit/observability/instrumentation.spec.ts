@@ -38,10 +38,34 @@ describe('issue #535 — tool dispatch classification', () => {
     },
   );
 
+  it.each([
+    'feature_disabled',
+    'redis_unavailable_blocked',
+    'approval_pending',
+    'requires_confirmation',
+    'requires_dual_approval',
+    'mcp_tool_not_executable',
+  ])('classifies the fail-closed refusal %s as BLOCKED, not error', (error) => {
+    // These six were the actual defect: the dispatcher and the MCP bridge
+    // return them for governance working exactly as designed, and every one of
+    // them landed in the default `error` bucket — i.e. inside the numerator of
+    // `MaiaToolErrorRateHigh`. The exhaustive proof that no seventh one is
+    // hiding lives in `tool-error-codes.spec.ts`.
+    expect(classifyToolResult({ error })).toBe('blocked');
+  });
+
   it('classifies invalid_args separately from a broken tool', () => {
     // `invalid` tracks MODEL quality (it produced args Zod rejected); `error`
     // tracks OUR code. They move for opposite reasons.
     expect(classifyToolResult({ error: 'invalid_args' })).toBe('invalid');
+    // Same axis: a hallucinated tool name is a malformed CALL, not an outage.
+    expect(classifyToolResult({ error: 'unknown_tool' })).toBe('invalid');
+  });
+
+  it('keeps genuine operational failures in error', () => {
+    expect(classifyToolResult({ error: 'execution_failed' })).toBe('error');
+    expect(classifyToolResult({ error: 'mcp_call_failed' })).toBe('error');
+    expect(classifyToolResult({ error: 'idempotency_payload_hash_collision' })).toBe('error');
   });
 
   it('classifies an unknown error string as error', () => {
@@ -73,6 +97,19 @@ describe('issue #535 — instrumentToolDispatch', () => {
       error: 'tool_not_granted',
     }));
     expect(await renderPrometheus()).toMatch(/maia_tool_dispatch_total\{.*result="blocked"/);
+  });
+
+  it('keeps a pending approval OUT of the error SLI series', async () => {
+    // End to end through the metric, not just the classifier: a queue of
+    // approvals waiting on humans must not appear in
+    // `maia:tool_error_ratio:rate5m` (monitoring/alerts/slo.rules.yml).
+    await instrumentToolDispatch('criar_lancamento', async () => ({
+      error: 'approval_pending',
+      details: { ref: 'AP-12345678' },
+    }));
+    const metrics = await renderPrometheus();
+    expect(metrics).toMatch(/maia_tool_dispatch_total\{.*result="blocked"/);
+    expect(metrics).not.toMatch(/maia_tool_dispatch_total\{.*result="error"/);
   });
 
   it('records a THROWN failure as error and rethrows', async () => {

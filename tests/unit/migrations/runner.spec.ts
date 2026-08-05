@@ -18,7 +18,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runMigrations, repairMigration, RUNNER_VERSION } from '@/migrations/runner.js';
+import {
+  runMigrations,
+  repairMigration,
+  repairAppliedRefusal,
+  RUNNER_VERSION,
+} from '@/migrations/runner.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
 import { FakeDb } from './_fake-db.js';
 
@@ -459,5 +464,116 @@ describe('repairMigration', () => {
     expect(db.queries[0]).toContain('pg_try_advisory_lock');
     expect(db.unlocks).toBe(1);
     expect(db.releases).toBe(1);
+  });
+});
+
+/**
+ * The medium finding from the #541 review.
+ *
+ * With no packaged file there is no checksum, so `repairEntry`'s
+ * `COALESCE($2, checksum_sha256)` left the row's checksum NULL while still
+ * flipping it to `applied` and stamping `checksum_source = 'backfilled'` — and
+ * `repairMigration` returned `ok: true`. The next `status`/`up` blocked again
+ * on `missing_file` / `checksum_unknown` for that same id, so the operator was
+ * told "repaired" while readiness had not moved at all.
+ */
+describe('repairMigration — `--as applied` demands something verifiable', () => {
+  it('refuses when this build does not package the migration, and does NOT touch the row', async () => {
+    await write('001_a.sql', TX_A);
+    const events: { event: string; detail: Record<string, unknown> }[] = [];
+    const db = new FakeDb({ rows: [{ id: '099_ghost.sql', status: 'dirty' }] });
+
+    const result = await repairMigration(deps(db, events), {
+      id: '099_ghost.sql',
+      outcome: 'applied',
+      reason: 'schema conferido a mao',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      reason: repairAppliedRefusal('099_ghost.sql', 'artifact_missing'),
+    });
+    // The ledger is exactly as it was: still dirty, still blocking, still NULL.
+    const row = db.ledger.get('099_ghost.sql')!;
+    expect(row.status).toBe('dirty');
+    expect(row.checksum_sha256).toBeNull();
+    expect(row.checksum_source).toBeNull();
+    expect(row.repaired_at).toBeNull();
+    expect(row.repair_reason).toBeNull();
+    // No "repaired" event: nothing was repaired.
+    expect(events.map((e) => e.event)).not.toContain('migration.repaired');
+  });
+
+  it('refuses BEFORE taking the lock or writing any DDL', async () => {
+    // A refusal during an incident must not contend with a running migrator,
+    // and must not bootstrap a ledger it is about to refuse to write to.
+    await write('001_a.sql', TX_A);
+    const db = new FakeDb({ rows: [{ id: '099_ghost.sql', status: 'dirty' }] });
+    await repairMigration(deps(db), {
+      id: '099_ghost.sql',
+      outcome: 'applied',
+      reason: 'schema conferido a mao',
+    });
+    expect(db.queries).toEqual([]);
+    expect(db.unlocks).toBe(0);
+    expect(db.releases).toBe(0);
+  });
+
+  it('names what is missing AND what to do instead — `--as pending`', () => {
+    const reason = repairAppliedRefusal('099_ghost.sql', 'artifact_missing');
+    // Diagnosis: the id, the rule, and the state it would still be stuck in.
+    expect(reason).toContain('repair --as applied refused for "099_ghost.sql"');
+    expect(reason).toContain('[repair/artifact_missing]');
+    expect(reason).toContain('this build does not package migrations/099_ghost.sql');
+    expect(reason).toContain('blocks again on missing_file');
+    // Remediation, both branches, as runnable commands.
+    expect(reason).toContain('Run the repair from a build that ships 099_ghost.sql');
+    expect(reason).toContain('migrate repair --id 099_ghost.sql --as pending --reason');
+
+    const unknown = repairAppliedRefusal('001_a.sql', 'checksum_missing');
+    expect(unknown).toContain('[repair/checksum_missing]');
+    expect(unknown).toContain('blocks again on checksum_unknown');
+  });
+
+  it('still accepts `--as applied` when the file IS packaged', async () => {
+    await write('001_idx.sql', NO_TX);
+    const db = new FakeDb({ rows: [{ id: '001_idx.sql', status: 'dirty' }] });
+    const result = await repairMigration(deps(db), {
+      id: '001_idx.sql',
+      outcome: 'applied',
+      reason: 'os dois indices existem e sao validos',
+    });
+    expect(result.ok).toBe(true);
+    expect(db.ledger.get('001_idx.sql')!.checksum_sha256).toBe(migrationChecksum(NO_TX));
+  });
+
+  it('keeps `--as pending` available for the unpackaged row — the actual remediation', async () => {
+    // `pending` needs nothing to verify: it DELETES the row instead of
+    // certifying it, so it is the right answer precisely when `applied` is not.
+    await write('001_a.sql', TX_A);
+    const db = new FakeDb({ rows: [{ id: '099_ghost.sql', status: 'dirty' }] });
+    const result = await repairMigration(deps(db), {
+      id: '099_ghost.sql',
+      outcome: 'pending',
+      reason: 'efeitos desfeitos a mao; migration nao pertence a este build',
+    });
+    expect(result.ok).toBe(true);
+    expect(db.ledger.has('099_ghost.sql')).toBe(false);
+  });
+
+  it('refuses an empty reason before it ever looks at the artifact', async () => {
+    await write('001_idx.sql', NO_TX);
+    const db = new FakeDb({ rows: [{ id: '001_idx.sql', status: 'dirty' }] });
+    const result = await repairMigration(deps(db), {
+      id: '001_idx.sql',
+      outcome: 'applied',
+      reason: ' ',
+    });
+    expect(result.ok).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      reason: expect.stringContaining('non-empty --reason'),
+    });
   });
 });

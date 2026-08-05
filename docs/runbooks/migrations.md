@@ -164,6 +164,45 @@ to touch a healthy `applied` row. **Never "clear the flag" without
 verifying the schema** — the reason field exists precisely so the next
 operator can tell what was checked.
 
+### When `repair --as applied` refuses
+
+`--as applied` records the **packaged** checksum for the id. If this build
+does not ship that migration there is nothing to record, so the command
+refuses instead of flipping the row and reporting success:
+
+```
+$ tsx scripts/migrate.ts repair --id 099_ghost.sql --as applied --reason "..."
+repair refused: repair --as applied refused for "099_ghost.sql": it would report
+success without repairing readiness.
+  - 099_ghost.sql [repair/artifact_missing]: this build does not package
+    migrations/099_ghost.sql, so there is no checksum to record and the row
+    would stay missing_file.
+      → Marking it applied here writes checksum_source='backfilled' with nothing
+        verified, and the next `migrate status`/`migrate up` blocks again on
+        missing_file — repaired in name only.
+      → Run the repair from a build that ships 099_ghost.sql, so the packaged
+        checksum can be adopted.
+      → Or, if 099_ghost.sql must not stand in this schema: undo its effects by
+        hand, then `migrate repair --id 099_ghost.sql --as pending --reason
+        "<why>"` — that DELETES the ledger row so the migration is applied again
+        from scratch, instead of certifying a schema nobody can verify.
+```
+
+Exit code **1**, nothing written: no lock is taken, no DDL is issued, and
+the ledger row is left exactly as it was (`status`, `checksum_sha256`,
+`checksum_source`, `repaired_at`, `repair_reason` all unchanged). Before
+this refusal existed the command answered `repaired 099_ghost.sql ->
+applied` and exited 0, and then the very next `status` blocked again on
+the same id — the worst possible answer from the tool you reach for
+during an incident.
+
+You will see this in exactly two situations, and they have different fixes:
+
+| Situation | Fix |
+|---|---|
+| You are on an **older image** than the database (rollback, reverted branch, canary running behind) | Repair from the build that ships the migration. The running image genuinely cannot verify a file it does not have. |
+| The migration **should not be in this schema at all** (manual rollback, abandoned branch) | Undo its effects, then `--as pending` — it deletes the row, so nothing is certified. |
+
 ## Checksum mismatch
 
 `up`, `status` and readiness all fail when an applied migration's file

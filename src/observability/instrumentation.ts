@@ -21,6 +21,11 @@ import { counter, histogram } from './metrics.js';
 import { METRIC, SPAN } from './taxonomy.js';
 import { withSpan } from './tracer.js';
 import type { SpanAttributes } from './span-attributes.js';
+import {
+  TOOL_FAILURE_CODES,
+  TOOL_INVALID_CODES,
+  TOOL_REFUSAL_CODES,
+} from '@/tools/_dispatch-error-codes.js';
 
 /**
  * Outcome vocabulary for a tool dispatch. Bounded and enumerated — a tool's
@@ -31,31 +36,56 @@ import type { SpanAttributes } from './span-attributes.js';
 export type ToolDispatchOutcome = 'ok' | 'error' | 'blocked' | 'invalid';
 
 /**
+ * `{ error: <code> }` ⇒ outcome label, built from the CLOSED sets the
+ * dispatcher and the MCP bridge export (`src/tools/_dispatch-error-codes.ts`).
+ *
+ * Built from their lists rather than restated here on purpose: the previous
+ * hand-written `switch` knew five codes, four of which were real. It missed
+ * `feature_disabled`, `tool_disabled` on the MCP path, `redis_unavailable_blocked`,
+ * `approval_pending`, `requires_confirmation`, `requires_dual_approval` and
+ * `mcp_tool_not_executable` — every one of them a fail-closed refusal that then
+ * counted as an operational failure in `maia:tool_error_ratio:rate5m`. It also
+ * mapped `approval_required`, which is a skill EXPOSURE policy
+ * (`src/skills/usage-policy.ts:45`) that no dispatcher path can return: a
+ * phantom entry is exactly the drift a copy produces.
+ */
+const OUTCOME_BY_CODE: ReadonlyMap<string, ToolDispatchOutcome> = new Map<
+  string,
+  ToolDispatchOutcome
+>([
+  ...TOOL_REFUSAL_CODES.map((c) => [c, 'blocked'] as const),
+  ...TOOL_INVALID_CODES.map((c) => [c, 'invalid'] as const),
+  ...TOOL_FAILURE_CODES.map((c) => [c, 'error'] as const),
+]);
+
+/**
  * Classify a dispatcher return value.
  *
  * `dispatchTool` signals failure by RETURNING `{ error: string }` rather than
  * throwing, so a naive wrapper would record every denied tool as a success.
- * The governance verdicts are separated from ordinary failures because they
- * mean opposite things operationally: `blocked` rising is the platform
- * correctly refusing (possibly a mis-scoped grant), `error` rising is the
- * platform breaking.
+ * The three failure classes are separated because they mean opposite things
+ * operationally, and each has its own reader:
+ *
+ *   - `blocked` — governance refused. Rising means a mis-scoped grant, a killed
+ *     flag or a queue of approvals waiting on humans. It is the platform
+ *     WORKING, has its own SLI (`maia:tool_blocked_ratio:rate5m`) and is
+ *     deliberately outside the error numerator.
+ *   - `invalid` — the model produced args or a tool name the boundary rejected.
+ *     Tracks model/prompt quality.
+ *   - `error`   — the platform broke. This is what pages.
+ *
+ * The DEFAULT is `error`, and that stays deliberate: an `{ error }` shape from
+ * a tool HANDLER (e.g. `cancel-transaction` returning `not_found`) is outside
+ * the dispatcher's closed vocabulary, and counting an unrecognised failure as a
+ * failure is the fail-safe direction. What must never happen again is a
+ * DISPATCHER refusal reaching that default — which the closed sets plus
+ * `tests/unit/observability/tool-error-codes.spec.ts` now prevent.
  */
 export function classifyToolResult(result: unknown): ToolDispatchOutcome {
   if (typeof result !== 'object' || result === null) return 'ok';
   const err = (result as { error?: unknown }).error;
   if (typeof err !== 'string') return 'ok';
-  switch (err) {
-    case 'forbidden':
-    case 'tool_not_granted':
-    case 'tool_disabled':
-    case 'no_entity_in_scope':
-    case 'approval_required':
-      return 'blocked';
-    case 'invalid_args':
-      return 'invalid';
-    default:
-      return 'error';
-  }
+  return OUTCOME_BY_CODE.get(err) ?? 'error';
 }
 
 /**

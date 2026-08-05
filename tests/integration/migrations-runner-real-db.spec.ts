@@ -26,12 +26,13 @@
  * suite SKIPS cleanly when it is unset, so a sandbox with no database stays
  * green.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
-import { runMigrations, repairMigration } from '@/migrations/runner.js';
+import { runMigrations, repairMigration, repairAppliedRefusal } from '@/migrations/runner.js';
+import { main as migrateCli } from '../../scripts/migrate.js';
 import { getMigrationStatus, getSchemaReadiness } from '@/migrations/readiness.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
 
@@ -299,6 +300,105 @@ d('migration runner — real Postgres (#516)', () => {
     expect(row.rows[0]!.repair_reason).toContain('#516 drill');
     expect(row.rows[0]!.repaired_at).not.toBeNull();
     expect(row.rows[0]!.checksum_source).toBe('backfilled');
+  }, 30_000);
+
+  /**
+   * The medium finding from the #541 review, against the REAL ledger.
+   *
+   * `repairEntry` writes `checksum_sha256 = COALESCE($2, checksum_sha256)`, so
+   * with no packaged file the UPDATE still flipped `status` to `applied` and
+   * stamped `checksum_source = 'backfilled'` over a NULL checksum, and the CLI
+   * printed `repaired …`. The very next `status`/`up` blocked again on
+   * `missing_file` — "repaired" without readiness having been repaired.
+   */
+  it('refuses `repair --as applied` for a migration this build does not package, leaving the row untouched', async () => {
+    await write('001_plain.sql', PLAIN);
+    await runMigrations(deps());
+    // A row the current artifact knows nothing about — the shape a rollback,
+    // a reverted branch or a downgraded image really produces.
+    await pool.query(
+      "INSERT INTO schema_migrations (id, status, applied_at) VALUES ($1, 'dirty', NULL)",
+      ['099_ghost.sql'],
+    );
+    expect((await runMigrations(deps())).outcome).toBe('blocked');
+
+    const refused = await repairMigration(deps(), {
+      id: '099_ghost.sql',
+      outcome: 'applied',
+      reason: 'schema conferido a mao durante o incidente',
+    });
+    expect(refused).toEqual({
+      ok: false,
+      reason: repairAppliedRefusal('099_ghost.sql', 'artifact_missing'),
+    });
+
+    // The real row is byte-for-byte what it was: nothing was certified.
+    const row = await pool.query<{
+      status: string;
+      checksum_sha256: string | null;
+      checksum_source: string | null;
+      repaired_at: Date | null;
+      repair_reason: string | null;
+    }>(
+      'SELECT status, checksum_sha256, checksum_source, repaired_at, repair_reason FROM schema_migrations WHERE id = $1',
+      ['099_ghost.sql'],
+    );
+    expect(row.rows[0]).toEqual({
+      status: 'dirty',
+      checksum_sha256: null,
+      checksum_source: null,
+      repaired_at: null,
+      repair_reason: null,
+    });
+
+    // And readiness agrees with the refusal instead of contradicting it.
+    const readiness = await getSchemaReadiness({ pool, migrationsDir: dir });
+    expect(readiness.ready).toBe(false);
+    expect(readiness.blockers.map((b) => b.kind)).toContain('missing_file');
+
+    // The remediation the refusal names DOES work, on the same real row.
+    const repaired = await repairMigration(deps(), {
+      id: '099_ghost.sql',
+      outcome: 'pending',
+      reason: 'linha orfa de um build anterior; efeitos ja desfeitos',
+    });
+    expect(repaired.ok).toBe(true);
+    const gone = await pool.query('SELECT 1 FROM schema_migrations WHERE id = $1', [
+      '099_ghost.sql',
+    ]);
+    expect(gone.rows).toHaveLength(0);
+    expect((await getSchemaReadiness({ pool, migrationsDir: dir })).ready).toBe(true);
+  }, 60_000);
+
+  it('the CLI prints the refusal and exits 1, without connecting to the database', async () => {
+    // Exit behaviour is the operator-visible half of the fix: `repair refused:`
+    // on stderr and a non-zero code, so a script or an init container cannot
+    // read the lie as success. The refusal happens before the lock, so the
+    // pool is never even connected.
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(' '));
+    });
+    try {
+      const code = await migrateCli([
+        'repair',
+        '--id',
+        '999_not_in_this_build.sql',
+        '--as',
+        'applied',
+        '--reason',
+        'schema conferido a mao',
+      ]);
+      expect(code).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+    const printed = errors.join('\n');
+    expect(printed).toContain('repair refused:');
+    expect(printed).toContain(
+      repairAppliedRefusal('999_not_in_this_build.sql', 'artifact_missing'),
+    );
+    expect(printed).toContain('--as pending');
   }, 30_000);
 
   it('adopts checksums from a v1 ledger, then blocks on a later edit', async () => {

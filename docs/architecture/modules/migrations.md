@@ -36,6 +36,19 @@ tsx scripts/migrate.ts repair --id <file.sql> --as applied|pending --reason "...
 
 `plan` and `status` issue no DDL, take no lock and write nothing — safe against production. `up` and `repair` take the global lock. Down migrations are still manual (`docs/runbooks/migrations.md`); nothing in this module can execute a `_down.sql`.
 
+### `repair --as applied` refuses to certify what it cannot verify
+
+`--as applied` means "I checked the schema; record this as done". Recording it means adopting the **packaged** checksum, exactly like the backfill — so when this build does not ship the file there is nothing to adopt. `repairEntry` writes `checksum_sha256 = COALESCE($2, checksum_sha256)`, so a NULL checksum used to leave the row's checksum NULL while still flipping `status` to `applied` and stamping `checksum_source = 'backfilled'`, and `repairMigration` still returned success. The next `status`/`up` blocked again on `missing_file` / `checksum_unknown` for that same id: the operator was told **"repaired"** while readiness had not moved.
+
+So `repairMigration` (`src/migrations/runner.ts:545`) now requires a packaged migration **and** a checksum before it will honour `applied`. The check runs **before** the advisory lock and before `ensureLedgerSchema`, so a refusal costs no lock contention and writes no DDL; the ledger row is left byte-for-byte untouched and no `migration.repaired` event is emitted. `RepairResult.reason` carries the diagnosis, shaped like `ConfigValidationError` (`src/config/load.ts:59`) — what is missing, which state it would still be stuck in, and the two remediations:
+
+- repair from a build that **does** ship the migration, so the packaged checksum can be adopted; or
+- `--as pending`, which **deletes** the row instead of certifying it. `pending` stays available for exactly this case, because it needs nothing to verify.
+
+`repairAppliedRefusal(id, rule)` is exported so the CLI, the tests and this doc quote one string. The CLI prints `repair refused: …` on stderr and exits **1**.
+
+Adjacent and deliberately unchanged: a packaged file with a broken `_down` sibling still repairs, then blocks `up` on `artifact_integrity`. That describes the **repository**, not the ledger, and `repair` has no remediation for it in either direction.
+
 ## Ledger v2 (`schema_migrations`)
 
 | Column | Meaning |
@@ -152,10 +165,10 @@ The ledger is the primary operational trail, because migrations can run before `
 | `tests/unit/migrations/discover.spec.ts` | Ordering (matches the pre-#516 runner), markers, down siblings, the real directory |
 | `tests/unit/migrations/status.spec.ts` | Every entry state and every readiness blocker, including min/max range |
 | `tests/unit/migrations/lock.spec.ts` | Acquire, wait, timeout, connect/query failure, idempotent release, namespace |
-| `tests/unit/migrations/runner.spec.ts` | Order of operations, three transaction modes, dirty/failed transitions, repair, log hygiene |
+| `tests/unit/migrations/runner.spec.ts` | Order of operations, three transaction modes, dirty/failed transitions, repair (including the `--as applied` refusal, its exact text, and that it precedes the lock), log hygiene |
 | `tests/unit/migrations/readiness.spec.ts` | Read-only + never-throwing guarantees of the #517 surface |
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
-| `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, v1→v2 backfill, CHECK constraints. Skips without `TEST_DB_URL`. |
+| `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
 ## How to extend
 
@@ -182,5 +195,5 @@ Not yet delivered, tracked on #516:
 
 | | |
 |---|---|
-| Last verified | 2026-08-04 |
-| Against `main` HEAD | `7b34e7e` |
+| Last verified | 2026-08-05 |
+| Against `main` HEAD | `7c1b3da` |
