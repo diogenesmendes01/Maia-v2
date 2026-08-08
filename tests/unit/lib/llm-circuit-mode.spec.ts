@@ -28,6 +28,7 @@ const {
   incCounterMock,
   observeHistogramMock,
   setGaugeProviderMock,
+  recordCircuitAuditMock,
 } = vi.hoisted(() => ({
   anthropicCreateMock: vi.fn(),
   getSettingsMock: vi.fn(),
@@ -35,6 +36,20 @@ const {
   incCounterMock: vi.fn(),
   observeHistogramMock: vi.fn(),
   setGaugeProviderMock: vi.fn(),
+  recordCircuitAuditMock: vi.fn(),
+}));
+
+/**
+ * Trilha durável mockada: `circuit-audit.ts` puxa `@/db/client.js`, que abre um
+ * pool de Postgres. Este é um spec de unidade — que a linha CHEGA no
+ * `audit_log` é provado contra Postgres real em
+ * `tests/integration/llm-circuit-audit-real-db.spec.ts`. Aqui prova-se qual
+ * ação cada desfecho de override emite, e com quais metadados.
+ */
+vi.mock('@/lib/llm/circuit-audit.js', () => ({
+  recordCircuitAudit: recordCircuitAuditMock,
+  drainCircuitAudits: vi.fn(async () => undefined),
+  _internal: { pendingCount: () => 0 },
 }));
 
 vi.mock('@anthropic-ai/sdk', () => {
@@ -148,6 +163,7 @@ beforeEach(() => {
   _internal.reset();
   incCounterMock.mockClear();
   setGaugeProviderMock.mockClear();
+  recordCircuitAuditMock.mockClear();
   warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined as never);
 });
 
@@ -519,6 +535,77 @@ describe('kill switch — override de postura', () => {
     for (const labels of overrideCalls()) {
       expect(Object.keys(labels).sort()).toEqual(['reason', 'state']);
     }
+  });
+
+  /**
+   * ACHADO 2 da revisão adversarial da PR #541 (High).
+   *
+   * Contador e log respondem "alguém virou a chave?" enquanto o Prometheus e o
+   * coletor guardarem — o que é pouco para uma DECISÃO de governança. O
+   * invariante 4 do `AGENTS.md` manda persistir em `audit_log`, e até esta
+   * correção `auditOverride` não chamava `audit()`: `grep -rn "audit(" src/lib/llm/`
+   * devolvia zero.
+   *
+   * Os quatro desfechos são auditados, inclusive a RECUSA — auditar o
+   * fail-closed é o que separa "ninguém tentou" de "alguém tentou e o guarda
+   * segurou", que são incidentes diferentes.
+   */
+  function auditCalls(): Array<[string, Record<string, unknown>]> {
+    return recordCircuitAuditMock.mock.calls as Array<[string, Record<string, unknown>]>;
+  }
+
+  it('aplicado / limpo / expirado / recusado vão TODOS para a trilha durável', () => {
+    applyCircuitOverride({ mode: 'off', actor: ACTOR, reason: REASON, ttl_ms: 60_000 }, T0);
+    applyCircuitOverride({ clear: true, actor: ACTOR, reason: 'incidente encerrado' }, T0);
+    applyCircuitOverride({ mode: 'off', actor: ACTOR, reason: REASON, ttl_ms: 60_000 }, T0);
+    effectiveMode(T0 + 60_001); // vence sozinho
+    applyCircuitOverride({ mode: 'off', reason: REASON }, T0); // anônimo ⇒ recusado
+
+    expect(auditCalls().map(([acao]) => acao)).toEqual([
+      'llm_circuit_mode_override_applied',
+      'llm_circuit_mode_override_cleared',
+      'llm_circuit_mode_override_applied',
+      'llm_circuit_mode_override_expired',
+      'llm_circuit_mode_override_rejected',
+    ]);
+  });
+
+  it('a linha da trilha carrega ator, motivo, postura e validade', () => {
+    applyCircuitOverride({ mode: 'off', actor: ACTOR, reason: REASON, ttl_ms: 60_000 }, T0);
+    const [acao, metadata] = auditCalls()[0]!;
+    expect(acao).toBe('llm_circuit_mode_override_applied');
+    expect(metadata).toMatchObject({
+      action: 'applied',
+      mode: 'off',
+      actor: ACTOR,
+      reason: REASON,
+      source: 'applied',
+      expires_at: new Date(T0 + 60_000).toISOString(),
+    });
+  });
+
+  /**
+   * Adoção da chave durável no boot é o MESMO desfecho de governança (a postura
+   * mudou), com procedência diferente. Procedência é metadado; ação separada
+   * obrigaria toda consulta da trilha a lembrar de somar as duas.
+   */
+  it('adoção da chave durável audita como `applied` com `source: adopted`', () => {
+    applyCircuitOverride(
+      { mode: 'off', actor: ACTOR, reason: REASON, expires_at: T0 + 60_000 },
+      T0,
+      'adopted',
+    );
+    const [acao, metadata] = auditCalls()[0]!;
+    expect(acao).toBe('llm_circuit_mode_override_applied');
+    expect(metadata).toMatchObject({ source: 'adopted', action: 'adopted' });
+  });
+
+  it('a recusa registra o ERRO que a segurou', () => {
+    applyCircuitOverride({ mode: 'off', actor: ACTOR }, T0);
+    const [acao, metadata] = auditCalls()[0]!;
+    expect(acao).toBe('llm_circuit_mode_override_rejected');
+    expect(metadata.actor).toBe(ACTOR);
+    expect(String(metadata.error)).toContain('reason obrigatório');
   });
 
   it('a postura efetiva é um par de séries, exatamente uma valendo 1', async () => {

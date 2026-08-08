@@ -58,8 +58,12 @@
  *
  *  1. **Um override anônimo é RECUSADO.** `actor` e `reason` são obrigatórios e
  *     não-vazios. Não existe caminho para virar a chave sem se identificar.
- *  2. **Todo uso é contado e logado**: `maia_llm_circuit_mode_overrides_total`
- *     + `llm_gateway.circuit_mode_override` com ator, motivo e validade.
+ *  2. **Todo uso é contado, logado e AUDITADO**:
+ *     `maia_llm_circuit_mode_overrides_total` +
+ *     `llm_gateway.circuit_mode_override` com ator, motivo e validade, mais uma
+ *     linha durável em `audit_log` (`llm_circuit_mode_override_*`). Contador e
+ *     log expiram na retenção do coletor; a trilha, não — e mudar a postura de
+ *     um controle de degradação é decisão de governança (invariante 4).
  *  3. **A postura efetiva é uma série**: `maia_llm_circuit_mode{state}`. Não dá
  *     para o controle ficar desligado em silêncio — o dashboard mostra.
  *  4. **Expira sozinho.** TTL obrigatório, teto de 24h. Um kill switch que
@@ -84,6 +88,8 @@
 import { config } from '@/config/env.js';
 import { counter, gauge, METRIC } from '@/observability/metrics.js';
 import { logger } from '@/lib/logger.js';
+import { recordCircuitAudit } from './circuit-audit.js';
+import type { CircuitAuditAction } from './circuit-audit.js';
 
 export type CircuitMode = 'off' | 'shadow' | 'enforce';
 
@@ -245,19 +251,50 @@ function auditOverride(
   // WARN, não INFO: mexer no kill switch de um controle de degradação é evento
   // de plantão. `actor` e `reason` são texto livre do operador e por isso vivem
   // no log (sem cardinalidade), nunca em label.
-  logger.warn(
-    {
-      action,
-      mode: detail.mode,
-      actor: detail.actor,
-      reason: detail.reason,
-      expires_at: detail.expires_at ? new Date(detail.expires_at).toISOString() : undefined,
-      error: detail.error,
-      baseline: baselineMode(),
-    },
-    'llm_gateway.circuit_mode_override',
-  );
+  const record = {
+    action,
+    mode: detail.mode,
+    actor: detail.actor,
+    reason: detail.reason,
+    expires_at: detail.expires_at ? new Date(detail.expires_at).toISOString() : undefined,
+    error: detail.error,
+    baseline: baselineMode(),
+  };
+  logger.warn(record, 'llm_gateway.circuit_mode_override');
+
+  /**
+   * …e a trilha DURÁVEL (achado 2 da revisão da PR #541).
+   *
+   * A objeção original da #534 a um toggle de runtime era "alguém vira a chave
+   * às 3h da manhã sem deixar rastro". Exigir `actor` + `reason` responde
+   * metade; a outra metade é o rastro SOBREVIVER. Contador some na retenção do
+   * Prometheus, log some na do coletor — e mudança de postura de um controle
+   * de degradação é decisão de governança, que o invariante 4 do `AGENTS.md`
+   * manda persistir em `audit_log`.
+   *
+   * `adopted` NÃO tem ação própria: adotar a chave durável no boot da réplica é
+   * o mesmo desfecho de governança de aplicar ao vivo (a postura mudou), com
+   * procedência diferente. A procedência é metadado (`source`); inventar uma
+   * quinta ação faria toda consulta da trilha ter que lembrar de somar as duas.
+   */
+  recordCircuitAudit(OVERRIDE_AUDIT_ACTION[action], { ...record, source: action });
 }
+
+/**
+ * Mapa ação-interna → ação da taxonomia. Explícito (e não string interpolada)
+ * para que o typecheck recuse um desfecho novo sem entrada correspondente em
+ * `AUDIT_ACTIONS` — foi assim que a #541 nasceu com um watcher sem produtor.
+ */
+const OVERRIDE_AUDIT_ACTION: Record<
+  'applied' | 'expired' | 'cleared' | 'rejected' | 'adopted',
+  CircuitAuditAction
+> = {
+  applied: 'llm_circuit_mode_override_applied',
+  adopted: 'llm_circuit_mode_override_applied',
+  cleared: 'llm_circuit_mode_override_cleared',
+  expired: 'llm_circuit_mode_override_expired',
+  rejected: 'llm_circuit_mode_override_rejected',
+};
 
 /**
  * As TRÊS séries da postura, uma por modo, exatamente uma valendo 1 — mesmo

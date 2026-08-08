@@ -125,8 +125,39 @@ export const AUDIT_ACTIONS = [
   'post_restore_reconciliation_failed',
   'whatsapp_connected',
   'whatsapp_disconnected',
+  // Disjuntor de LLM (issue #534). `opened`/`closed` são o PAR que a regra
+  // `llm_circuit_long_open` do `src/workers/audit-watcher.ts` consome para
+  // alertar "circuito aberto há mais de 5 min". Até a revisão da PR #541 as
+  // duas ações existiam SEM produtor — o watcher era um consumidor de eventos
+  // que ninguém emitia, e o alerta nunca podia disparar. O produtor é
+  // `src/lib/llm/circuit-audit.ts`, chamado por `circuit-breaker.ts` em toda
+  // transição para `open`/`closed`. Escritas no contexto sintético `system`
+  // (ADR 0002): o estado mede uma dependência externa compartilhada, não dado
+  // de tenant. `half_open` NÃO audita — é etapa interna da recuperação, não
+  // mudança de postura observável, e auditá-la duplicaria o par sem
+  // acrescentar decisão governável.
   'llm_circuit_opened',
   'llm_circuit_closed',
+  // Kill switch do disjuntor (`src/lib/llm/circuit-mode.ts`). A objeção
+  // original da #534 a um toggle de runtime era "alguém vira a chave às 3h da
+  // manhã sem deixar rastro"; a resposta foi exigir `actor` + `reason` e
+  // contar/logar todo uso. Log estruturado, porém, tem retenção curta e cai
+  // junto com o coletor — mudança de POSTURA de um controle de degradação é
+  // decisão de governança e pertence à trilha durável (invariante 4 do
+  // `AGENTS.md`). Cada linha carrega actor, reason, modo e validade.
+  //  - applied: override em vigor. `metadata.source='adopted'` distingue a
+  //    adoção da chave durável no boot da réplica de uma virada ao vivo — é o
+  //    MESMO desfecho de governança (a postura mudou), com procedência
+  //    diferente, então é metadado e não ação separada.
+  //  - cleared: operador devolveu a postura ao contrato.
+  //  - expired: o arrendamento venceu sozinho e a postura voltou ao baseline.
+  //  - rejected: override RECUSADO (anônimo, sem motivo, modo inválido,
+  //    validade vencida/acima do teto). Auditar a recusa é o que separa
+  //    "ninguém tentou" de "alguém tentou e o fail-closed segurou".
+  'llm_circuit_mode_override_applied',
+  'llm_circuit_mode_override_cleared',
+  'llm_circuit_mode_override_expired',
+  'llm_circuit_mode_override_rejected',
   'dashboard_session_started',
   'dashboard_session_ended',
   'dlq_job_added',

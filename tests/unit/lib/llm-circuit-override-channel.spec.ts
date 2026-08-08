@@ -43,6 +43,17 @@ vi.mock('ioredis', () => ({
 
 vi.mock('@/lib/redis.js', () => ({ redis: redisMock }));
 
+/**
+ * Trilha durável mockada: `circuit-audit.ts` puxa `@/db/client.js`, que abre um
+ * pool de Postgres, e este spec cobre transporte (Redis), não persistência. A
+ * escrita real é provada em `tests/integration/llm-circuit-audit-real-db.spec.ts`.
+ */
+vi.mock('@/lib/llm/circuit-audit.js', () => ({
+  recordCircuitAudit: vi.fn(),
+  drainCircuitAudits: vi.fn(async () => undefined),
+  _internal: { pendingCount: () => 0 },
+}));
+
 vi.mock('@/lib/llm/model-resolver.js', () => ({
   invalidateModelCache: invalidateModelCacheMock,
 }));

@@ -95,6 +95,15 @@
  * codificando `0/1/2` não se lê em PromQL sem legenda, e torna "nunca
  * exercitado" indistinguível de "fechado".
  *
+ * ## Trilha durável
+ *
+ * Além da métrica e do log, toda transição para `open`/`closed` vira linha em
+ * `audit_log` (`llm_circuit_opened` / `llm_circuit_closed`), no contexto
+ * sintético `system`. É o produtor que faltava para a regra
+ * `llm_circuit_long_open` do `src/workers/audit-watcher.ts` — ver
+ * `circuit-audit.ts` para o porquê do `system`, da armadilha do `alvo_id` e do
+ * import dinâmico.
+ *
  * A emissão passa por `@/observability/metrics.js`, não por `@/lib/metrics.js`:
  * é lá que mora o gate de label (allowlist, deny list e orçamento de
  * cardinalidade da #514). Emitir direto na camada de baixo fura o gate.
@@ -110,9 +119,11 @@
 import { config } from '@/config/env.js';
 import { counter, gauge, METRIC } from '@/observability/metrics.js';
 import { logger } from '@/lib/logger.js';
+import { recordCircuitAudit } from './circuit-audit.js';
 import { effectiveMode, onModeChange, _internal as modeInternal } from './circuit-mode.js';
 import type { CircuitMode } from './circuit-mode.js';
 import { workloadPolicy } from './workloads.js';
+import { isRetryableKind } from './errors.js';
 import type { LLMErrorKind } from './errors.js';
 import type { LLMWorkload } from './types.js';
 
@@ -215,29 +226,68 @@ const PROVIDER_FAULT_KINDS: ReadonlySet<LLMErrorKind> = new Set<LLMErrorKind>([
   'timeout',
 ]);
 
-/** Desfecho de UMA tentativa, do ponto de vista do disjuntor. */
-export type CircuitOutcome = 'ok' | 'fault' | 'ignored';
+/**
+ * Desfecho de UMA tentativa, do ponto de vista do disjuntor.
+ *
+ * `fault` e `terminal_fault` são AMBOS falha do provider e alimentam a mesma
+ * janela; a diferença é quanto orçamento de tentativas a falha consome, e isso
+ * muda a matemática do limiar (ver `estimatedCallFailureRate`):
+ *
+ *  - `fault` — a chamada CONTINUA: o gateway retenta e, se a política permitir,
+ *    cai no fallback. Uma tentativa dessas é 1 de N; a chamada só se perde
+ *    quando as N falham.
+ *  - `terminal_fault` — a chamada MORRE nesta tentativa. Uma tentativa dessas
+ *    é a chamada inteira.
+ */
+export type CircuitOutcome = 'ok' | 'fault' | 'terminal_fault' | 'ignored';
 
 /**
  * Traduz o kind do erro para o desfecho do disjuntor.
  *
  * `ignored` não é "sucesso": a amostra simplesmente não entra na janela,
  * porque não diz nada sobre a saúde do provider.
+ *
+ * A separação `fault` × `terminal_fault` é DERIVADA de `isRetryableKind` — a
+ * mesma função que o gateway usa para decidir se retenta (`err.retryable` em
+ * `gateway.ts`) e que governa `canFallback`. Derivar em vez de listar à mão é
+ * o que impede as duas de divergirem: se um kind deixar de ser retentável, ele
+ * vira terminal aqui no mesmo commit, sem ninguém precisar lembrar.
+ *
+ * Hoje isso significa: `provider_5xx` e `network` percorrem o orçamento;
+ * `timeout` (o do SDK — provider pendurado) é terminal, porque
+ * `gateway.ts` faz `if (err.kind === 'timeout') { await fail(...); throw err; }`
+ * na PRIMEIRA tentativa. Ver o achado 1 da revisão da PR #541.
  */
 export function circuitOutcomeFor(kind: LLMErrorKind): CircuitOutcome {
-  return PROVIDER_FAULT_KINDS.has(kind) ? 'fault' : 'ignored';
+  if (!PROVIDER_FAULT_KINDS.has(kind)) return 'ignored';
+  return isRetryableKind(kind) ? 'fault' : 'terminal_fault';
 }
 
 /**
- * Limiar de falha POR TENTATIVA que abre o disjuntor deste workload.
+ * Quantas TENTATIVAS uma chamada deste workload gasta antes de se perder —
+ * quando a falha é do tipo que percorre o orçamento (`fault`, retentável).
  *
- * Os 50% "de livro" estão errados aqui, e o harness mostrou por quê: a janela
- * é alimentada por TENTATIVA, mas o caller só perde a chamada quando TODAS as
- * tentativas E o fallback falham. Com `reasoner` (3 tentativas + fallback), uma
- * taxa de 70% por tentativa ainda entrega ~76% das chamadas — e abrir o
- * disjuntor ali derrubava a disponibilidade de 161/200 para 9/200 em troca de
- * poupar carga de um provider que ainda estava servindo. Trocar um incidente
- * por outro.
+ * `max_attempts` do workload (ou `CLAUDE_MAX_RETRIES`), mais uma pelo fallback
+ * quando a política permite. É o mesmo número que o gateway usa: `maxAttempts`
+ * no laço + o `acquireCircuit` do bloco de fallback.
+ */
+function triesPerCall(workload: LLMWorkload): number {
+  const policy = workloadPolicy(workload);
+  const attempts = Math.max(1, policy.max_attempts ?? config.CLAUDE_MAX_RETRIES);
+  return attempts + (policy.allow_fast_fallback ? 1 : 0);
+}
+
+/**
+ * Limiar de falha POR TENTATIVA, para faults que PERCORREM o orçamento de
+ * tentativas do workload.
+ *
+ * Os 50% "de livro" estão errados para esse tipo de falha, e o harness mostrou
+ * por quê: a janela é alimentada por TENTATIVA, mas o caller só perde a chamada
+ * quando TODAS as tentativas E o fallback falham. Com `reasoner` (3 tentativas
+ * + fallback), uma taxa de 70% por tentativa ainda entrega ~76% das chamadas —
+ * e abrir o disjuntor ali derrubava a disponibilidade de 161/200 para 9/200 em
+ * troca de poupar carga de um provider que ainda estava servindo. Trocar um
+ * incidente por outro.
  *
  * Então o limiar é DERIVADO do orçamento de tentativas do workload: abrimos
  * quando a taxa por tentativa implica que metade das CHAMADAS já está se
@@ -252,17 +302,83 @@ export function circuitOutcomeFor(kind: LLMErrorKind): CircuitOutcome {
  * absorve, o disjuntor NÃO abre e a amplificação continua. Quem trata brownout
  * é o retry; quem trata queda é o disjuntor. Confundir os dois papéis é o que
  * produzia a regressão de disponibilidade medida acima.
+ *
+ * ## O que esta derivação NÃO cobre — achado 1 da revisão da PR #541
+ *
+ * Tudo acima continua valendo, e a medição 161/200 → 9/200 continua sendo o
+ * motivo de o limiar não ser 50% fixo. Mas a inferência "p por tentativa ⇒
+ * p^N por chamada" só é VÁLIDA para falhas que de fato consomem as N
+ * tentativas. Havia um kind na janela que não consome: `timeout`.
+ *
+ * No gateway o timeout do SDK é TERMINAL —
+ * `if (err.kind === 'timeout') { await fail(primary, err); throw err; }` —
+ * sem retry e sem fallback, a chamada morre na primeira tentativa. Medi-lo com
+ * a matemática de 4 tentativas produzia o pior erro possível de um disjuntor:
+ * numa tempestade de timeouts terminais a 70%, ~70% das CHAMADAS se perdiam —
+ * cada uma depois de esperar o timeout inteiro — e o disjuntor não abria,
+ * porque 70% < ~84%. O controle ficava calado exatamente no incidente mais
+ * caro que ele existe para cortar.
+ *
+ * A correção NÃO é mudar a política de retry (isso mudaria comportamento de
+ * produção e é decisão do owner). É calcular o limiar POR DESFECHO DE CHAMADA:
+ * cada classe de falha usa o expoente que corresponde ao orçamento que ela
+ * realmente gasta. Ver `estimatedCallFailureRate` — é lá que a janela mista
+ * vira uma taxa de perda de CHAMADAS, e é ela que a decisão de abrir compara
+ * contra `TARGET_CALL_FAILURE_RATE`. Esta função continua existindo como o
+ * termo dessa conta que corresponde às falhas retentáveis.
  */
 function failureThreshold(workload: LLMWorkload): number {
-  const policy = workloadPolicy(workload);
-  const attempts = Math.max(1, policy.max_attempts ?? config.CLAUDE_MAX_RETRIES);
-  const tries = attempts + (policy.allow_fast_fallback ? 1 : 0);
-  return TARGET_CALL_FAILURE_RATE ** (1 / tries);
+  return TARGET_CALL_FAILURE_RATE ** (1 / triesPerCall(workload));
+}
+
+/**
+ * Fração ESTIMADA de CHAMADAS perdidas, a partir de uma janela de tentativas.
+ *
+ * A janela guarda tentativas de duas classes; cada uma se traduz em perda de
+ * chamada com um expoente diferente, e é essa a correção do achado 1:
+ *
+ *   perda ≈ (terminais / total) + (retentáveis / total) ^ tentativas_por_chamada
+ *
+ *  - **terminais** (`terminal_fault`): a chamada morre na tentativa. Expoente
+ *    1 — uma tentativa perdida é uma chamada perdida.
+ *  - **retentáveis** (`fault`): a chamada só se perde quando todas as
+ *    tentativas E o fallback falham. Expoente `triesPerCall`, que é
+ *    exatamente a derivação original de `failureThreshold`.
+ *
+ * Os dois casos puros reduzem ao que já estava certo, o que é o teste de
+ * sanidade desta fórmula:
+ *
+ *  - só retentáveis ⇒ abre quando `r/total >= failureThreshold(workload)`
+ *    (o brownout de `reasoner` a 70% continua NÃO abrindo: 0.7³ ≈ 0.34);
+ *  - só terminais ⇒ abre quando `t/total >= 0.5`, o clássico de livro
+ *    (a tempestade de timeout a 70% passa a abrir, que é o defeito corrigido);
+ *  - workload single-shot ⇒ `triesPerCall = 1` e as duas classes coincidem
+ *    em 50%, como sempre foram.
+ *
+ * A soma é uma ESTIMATIVA, e deliberadamente CONSERVADORA: `total` conta
+ * tentativas, e numa janela mista as retentáveis inflam o denominador (uma
+ * chamada gera várias), então `terminais/total` SUBESTIMA a fração de chamadas
+ * perdidas por falha terminal. O erro empurra para NÃO abrir — a direção certa
+ * para um controle cujo custo de abrir errado foi medido em 161/200 → 9/200.
+ */
+function estimatedCallFailureRate(
+  workload: LLMWorkload,
+  stats: { total: number; faults: number; terminal: number },
+): number {
+  if (stats.total === 0) return 0;
+  const terminalRate = stats.terminal / stats.total;
+  const retryableRate = (stats.faults - stats.terminal) / stats.total;
+  return terminalRate + retryableRate ** triesPerCall(workload);
 }
 
 export type CircuitKey = { provider: string; workload: LLMWorkload };
 
-type Sample = { at: number; fault: boolean };
+/**
+ * `terminal` só faz sentido quando `fault` é true: marca a falha que MATOU a
+ * chamada em vez de consumir uma tentativa dela. É o que permite a
+ * `estimatedCallFailureRate` usar o expoente certo para cada classe.
+ */
+type Sample = { at: number; fault: boolean; terminal: boolean };
 
 type Entry = {
   provider: string;
@@ -389,7 +505,17 @@ function getEntry(key: CircuitKey): Entry {
   return created;
 }
 
-function transition(entry: Entry, to: CircuitState, reason: string): void {
+function transition(
+  entry: Entry,
+  to: CircuitState,
+  reason: string,
+  /**
+   * Evidência da janela que produziu a transição. Vai para o log e para a
+   * trilha durável — nunca para label: `total`/`faults` são números abertos e
+   * `ALLOWED_LABEL_KEYS` (#514) descartaria em silêncio.
+   */
+  window?: { total: number; faults: number; terminal: number },
+): void {
   const from = entry.state;
   if (from === to) return;
   entry.state = to;
@@ -419,30 +545,59 @@ function transition(entry: Entry, to: CircuitState, reason: string): void {
   // Governança: mudança de estado do disjuntor é decisão do backend que altera
   // o comportamento observável do sistema. Vai para o log estruturado com
   // motivo — sem prompt, sem resposta, sem tenant (o estado não é de tenant).
-  logger.warn(
-    {
-      provider: entry.provider,
-      workload: entry.workload,
-      from,
-      to,
-      reason,
-      mode,
-      cooldown_ms: entry.cooldown_ms,
-      failed_windows: entry.failed_windows,
-    },
-    'llm_gateway.circuit_transition',
-  );
+  const detail = {
+    provider: entry.provider,
+    workload: entry.workload,
+    from,
+    to,
+    reason,
+    mode,
+    cooldown_ms: entry.cooldown_ms,
+    failed_windows: entry.failed_windows,
+    ...(window
+      ? {
+          window_total: window.total,
+          window_faults: window.faults,
+          window_terminal_faults: window.terminal,
+        }
+      : {}),
+  };
+  logger.warn(detail, 'llm_gateway.circuit_transition');
+
+  /**
+   * …e para a trilha DURÁVEL (achado 2 da revisão da PR #541).
+   *
+   * O log acima tem retenção curta e cai junto com o coletor; a regra
+   * `llm_circuit_long_open` do `src/workers/audit-watcher.ts` consome
+   * `audit_log`, e sem estas duas linhas ela era um alerta sem produtor — nunca
+   * disparava. Só o PAR `open`/`closed` audita: `half_open` é etapa interna da
+   * recuperação, não mudança de postura, e emiti-la quebraria o casamento
+   * open→closed que a regra de "stuck" faz.
+   *
+   * Fire-and-forget, sob contexto `system`: ver `circuit-audit.ts`.
+   */
+  if (to === 'open' || to === 'closed') {
+    recordCircuitAudit(to === 'open' ? 'llm_circuit_opened' : 'llm_circuit_closed', detail);
+  }
 }
 
 /** Remove amostras fora da janela e devolve o resumo. */
-function windowStats(entry: Entry, now: number): { total: number; faults: number } {
+function windowStats(
+  entry: Entry,
+  now: number,
+): { total: number; faults: number; terminal: number } {
   const cutoff = now - WINDOW_MS;
   let i = 0;
   while (i < entry.samples.length && entry.samples[i]!.at < cutoff) i++;
   if (i > 0) entry.samples.splice(0, i);
   let faults = 0;
-  for (const s of entry.samples) if (s.fault) faults++;
-  return { total: entry.samples.length, faults };
+  let terminal = 0;
+  for (const s of entry.samples) {
+    if (!s.fault) continue;
+    faults++;
+    if (s.terminal) terminal++;
+  }
+  return { total: entry.samples.length, faults, terminal };
 }
 
 function cooldownRemaining(entry: Entry, now: number): number {
@@ -605,7 +760,11 @@ export function releaseCircuit(permit: CircuitPermit, outcome: CircuitOutcome, n
       transition(entry, 'closed', 'probe_succeeded');
       return;
     }
-    if (outcome === 'fault') {
+    // Na SONDA a distinção terminal × retentável não existe: a sonda é uma
+    // pergunta única ("o provider voltou?") e qualquer falha atribuível ao
+    // provider é um "não". O expoente do orçamento só importa para inferir
+    // perda de CHAMADA a partir de tentativas, e a sonda não tem orçamento.
+    if (outcome === 'fault' || outcome === 'terminal_fault') {
       entry.probes_failed++;
       // A janela só reabre quando TODAS as sondas dela falharam. Ver
       // `HALF_OPEN_MAX_PROBES`: com uma sonda só, um provider parcialmente
@@ -626,17 +785,24 @@ export function releaseCircuit(permit: CircuitPermit, outcome: CircuitOutcome, n
 
   if (outcome === 'ignored') return;
   if (entry.samples.length >= MAX_SAMPLES) entry.samples.shift();
-  entry.samples.push({ at: now, fault: outcome === 'fault' });
+  entry.samples.push({
+    at: now,
+    fault: outcome !== 'ok',
+    terminal: outcome === 'terminal_fault',
+  });
 
   if (entry.state !== 'closed') return;
-  const { total, faults } = windowStats(entry, now);
-  if (total < MIN_SAMPLES) return;
-  if (faults / total < failureThreshold(entry.workload)) return;
+  const stats = windowStats(entry, now);
+  if (stats.total < MIN_SAMPLES) return;
+  // Abre pela taxa de perda de CHAMADAS, não pela taxa de falha por tentativa:
+  // cada classe de falha entra com o expoente do orçamento que ela realmente
+  // gasta. Ver `estimatedCallFailureRate` (achado 1 da revisão da PR #541).
+  if (estimatedCallFailureRate(entry.workload, stats) < TARGET_CALL_FAILURE_RATE) return;
 
   entry.opened_at = now;
   entry.failed_windows = 0;
   entry.cooldown_ms = OPEN_MS;
-  transition(entry, 'open', 'error_rate_exceeded');
+  transition(entry, 'open', 'error_rate_exceeded', stats);
 }
 
 /** Estado atual — só leitura, para teste e para o harness de benchmark. */
@@ -649,6 +815,8 @@ export const _internal = {
   MIN_SAMPLES,
   TARGET_CALL_FAILURE_RATE,
   failureThreshold,
+  triesPerCall,
+  estimatedCallFailureRate,
   OPEN_MS,
   MAX_OPEN_MS,
   HALF_OPEN_MAX_PROBES,

@@ -24,8 +24,21 @@
  * spec FALHA rápido (~2s, `ECONNREFUSED`) em vez de dar skip. Um skip aqui
  * esconderia o critério de aceite inteiro.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import IORedis from 'ioredis';
+
+/**
+ * Este arquivo é sobre o TRANSPORTE (Redis: PTTL real, ordem de comandos), não
+ * sobre persistência. Desde que o override passou a auditar (revisão da PR
+ * #541), cada virada aqui gravaria linha em `audit_log` — ruído num banco
+ * compartilhado, e uma corrida com quem asserta sobre essas mesmas ações. A
+ * escrita real é provada em `llm-circuit-audit-real-db.spec.ts`.
+ */
+vi.mock('@/lib/llm/circuit-audit.js', () => ({
+  recordCircuitAudit: vi.fn(),
+  drainCircuitAudits: vi.fn(async () => undefined),
+  _internal: { pendingCount: () => 0 },
+}));
 import { config } from '@/config/env.js';
 import { redis } from '@/lib/redis.js';
 import {

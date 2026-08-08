@@ -52,6 +52,7 @@ entra por `executeLLM()`. A regra é enforced por `no-restricted-imports`
 | `budget.ts` | Quota diária por tenant+agent (`LLM_DAILY_BUDGET_USD`) |
 | `circuit-breaker.ts` | Disjuntor por `(provider, workload)` — issue #534. Ver seção abaixo |
 | `circuit-mode.ts` | Postura do disjuntor (`off`/`shadow`/`enforce`), default `shadow`, + kill switch com TTL e auditoria |
+| `circuit-audit.ts` | Trilha DURÁVEL do disjuntor: transições `open`/`closed` e desfechos de override viram linha em `audit_log`, no contexto `system`. Ver seção abaixo |
 | `telemetry.ts` | Métrica, custo e evento de uso — em TODO desfecho |
 | `cache-invalidation.ts` | Redis pub/sub: troca de modelo no Admin **e** postura do disjuntor valem em todas as réplicas |
 
@@ -100,7 +101,8 @@ deixa de custar 123ms de p50 para custar ~0.
 | Chave | `(provider, workload)` — **sem tenant** | O estado mede a saúde de uma dependência EXTERNA e compartilhada, não dados de tenant. Escopar por tenant destruiria a amostra (tenant pequeno nunca abriria), faria cada tenant redescobrir a queda queimando as próprias tentativas, e criaria cardinalidade sem teto. A DECISÃO continua atribuível: toda recusa sai em `maia_llm_requests_total{status="circuit_open"}` com `tenant_id + agent_id`. Estado global, evidência escopada |
 | Onde mora | Memória do processo, por réplica | Um disjuntor em Redis colocaria round-trip em toda chamada de LLM e faria o caminho de LLM depender do Redis — a falha correlacionada que o disjuntor existe para sobreviver. Custo: N réplicas sondam N vezes. Reinício zera o disjuntor |
 | O que conta como falha | Só `provider_5xx`, `network`, `timeout` do SDK | Erro de caller (`invalid_request`), de config (`authentication`) ou decisão nossa (`budget_exhausted`) não são evidência sobre o provider — e deixar um caller abrir o disjuntor seria negação de serviço entre tenants. `timeout` por deadline do TURNO é descartado na origem (`link.deadlineFired()`); `rate_limit` fica de fora porque o 429 já traz `Retry-After` |
-| Limiar de abertura | Derivado do orçamento de tentativas: `0.5 ^ (1/tentativas)` | 50% fixo por tentativa está errado quando há retry: com `reasoner` (3 tentativas + fallback), 70% de erro por tentativa ainda entrega ~76% das chamadas. O harness mediu o estrago do limiar fixo — disponibilidade de 161/200 para 9/200. Quem trata brownout é o retry; quem trata queda é o disjuntor |
+| Classe da falha | `fault` (percorre o orçamento) × `terminal_fault` (mata a chamada na tentativa) — derivada de `isRetryableKind` | Hoje: `provider_5xx`/`network` são `fault`; o `timeout` do SDK é `terminal_fault`, porque o gateway faz `throw` na primeira tentativa (sem retry, sem fallback). Derivar da mesma função que o gateway usa em `err.retryable` impede as duas de divergirem |
+| Limiar de abertura | Taxa estimada de perda de **chamadas** ≥ 50%: `terminais/total + (retentáveis/total) ^ tentativas` | 50% fixo por tentativa está errado quando há retry: com `reasoner` (3 tentativas + fallback), 70% de erro por tentativa ainda entrega ~76% das chamadas. O harness mediu o estrago do limiar fixo — disponibilidade de 161/200 para 9/200. **Mas** essa derivação só vale para falha que de fato gasta as tentativas: aplicá-la ao `timeout` terminal fazia uma tempestade a 70% (70% das chamadas perdidas, cada uma pagando o timeout inteiro) NÃO abrir o disjuntor, porque 70% < ~84%. Cada classe entra com o expoente do orçamento que ela realmente gasta; os casos puros reduzem a `0.5^(1/tentativas)` e a 50% respectivamente. Quem trata brownout é o retry; quem trata queda é o disjuntor |
 | Amostra mínima | 10 tentativas em janela de 30s | Sem piso, duas falhas de madrugada abrem com "100% de erro" sobre amostra 2 |
 | Half-open | Até **3** sondas por janela, fecha na primeira que passar | Uma sonda só deixava preso em aberto um provider parcialmente saudável. Numa queda real o custo é 3 requisições por janela |
 | Cooldown | 5s, dobrando a cada janela de sondas que falha inteira, teto de 60s | O cooldown é o tempo em que ainda recusamos DEPOIS de o provider voltar: medido em 10s, custava ~63 requests a mais numa corrida de 200; com 5s caiu para ~52 e a queda longa continua protegida pelo backoff |
@@ -136,6 +138,29 @@ Recusa é o kind `circuit_open`: não retentável (retentar é o que o disjuntor
 impede), com `retry_after_ms` = cooldown restante, e emitida ANTES de resolver
 modelo ou reservar cota — uma chamada que não vai acontecer não carimba
 orçamento.
+
+#### Trilha durável (`circuit-audit.ts`)
+
+Métrica e log respondem enquanto Prometheus e coletor guardarem. Mudança de
+estado do disjuntor e virada do kill switch são **decisões de governança**, e o
+invariante 4 do `AGENTS.md` manda persistir em `audit_log`. Toda transição para
+`open`/`closed` escreve `llm_circuit_opened` / `llm_circuit_closed`; todo
+desfecho de override escreve `llm_circuit_mode_override_{applied,cleared,expired,rejected}`.
+
+| Decisão | Por quê |
+|---|---|
+| Escrita sob `runWithSystemContext` EXPLÍCITO | A transição acontece dentro da chamada de algum tenant. Sem o wrapper, a linha herdaria o `tenant_id` que por acaso estava em voo — atribuição errada é pior que atribuição nenhuma. `ADR 0002`: saúde de dependência externa compartilhada é estado `system`, e as quatro condições cumulativas dela valem aqui (a atribuição de cada RECUSA continua em `maia_llm_requests_total{status="circuit_open"}`) |
+| Alvo em `entidade_alvo` (`'llm_circuit'`) + `metadata`, **nunca** em `alvo_id` | `audit_log.alvo_id` é UUID (`migrations/001_initial.sql`) e o alvo é o par `(provider, workload)` — TEXT. Texto num uuid faz o INSERT estourar, e `audit()` engole a falha: a linha sumiria em silêncio, com um produtor que *parece* existir |
+| Import dinâmico de `@/governance/audit.js` | Ele puxa `@/db/client.js`, que abre um pool de Postgres na importação. O disjuntor é hot path e é importado por specs sem banco; transição é evento raro |
+| Fire-and-forget, drenável por `drainCircuitAudits()` | Bloquear a transição num INSERT põe a latência do Postgres na frente do provider — a falha correlacionada que o disjuntor existe para sobreviver. O dreno é o que permite ao teste provar que a LINHA chegou, e ao shutdown não perder o evento |
+| `half_open` NÃO audita | É etapa interna da recuperação, não mudança de postura. Auditá-la quebraria o casamento `open`→`closed` que a regra de "stuck" do watcher faz |
+| `adopted` audita como `applied` com `metadata.source` | Adotar a chave durável no boot é o mesmo desfecho de governança (a postura mudou), com procedência diferente. Ação separada obrigaria toda consulta da trilha a somar as duas |
+
+O consumidor é a regra `llm_circuit_long_open` de
+[`src/workers/audit-watcher.ts`](../../../src/workers/audit-watcher.ts) —
+"aberto há mais de 5 min sem `closed`". Ela existia desde antes da #534 e
+estava **morta**: até a revisão da PR #541, `grep -rn "audit(" src/lib/llm/`
+devolvia zero resultados.
 
 ### Postura: `off | shadow | enforce` (`circuit-mode.ts`)
 
@@ -373,10 +398,11 @@ propósito — degradação silenciosa de qualidade não deve ser toggle de runt
 | `tests/unit/lib/business-days.spec.ts` | Business-day arithmetic |
 | `tests/unit/lib/holidays-cache.spec.ts` | Per-tenant cache keys |
 | `tests/unit/lib/llm-gateway.spec.ts` | Contrato do gateway: tier, retry, deadline, fallback, telemetria, redaction |
-| `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor em `enforce` + teste de carga que mede a queda de requisições durante indisponibilidade |
+| `tests/unit/lib/llm-circuit-breaker.spec.ts` | Máquina de estados do disjuntor em `enforce` + teste de carga que mede a queda de requisições durante indisponibilidade + **tempestade de timeout do SDK** no `reasoner` através do gateway real (abertura, carga cortada, tempo poupado, ausência de retry) |
 | `tests/unit/lib/llm-circuit-mode.spec.ts` | Posturas `off`/`shadow`/`enforce`, fidelidade da simulação em sombra, e o kill switch (auditoria, TTL, recusa de override anônimo) |
 | `tests/unit/lib/llm-circuit-override-channel.spec.ts` | Transporte do kill switch: roteamento por canal, ordem `SET` antes de `PUBLISH`, normalização de `ttl_ms` para `expires_at` absoluto + `PX` obrigatório, recusa de adoção com validade relativa, e falha de Redis propagada |
 | `tests/integration/llm-circuit-kill-switch-redis.spec.ts` | **Redis real** — o que um mock não sabe provar: a chave carrega `PTTL` de verdade e morre sozinha (nenhum restart ressuscita override vencido), e o `GET` da adoção chega ao servidor depois do `SUBSCRIBE` (ordem lida do `MONITOR`), com a corrida réplica-subindo-durante-a-virada convergindo para o override |
+| `tests/integration/llm-circuit-audit-real-db.spec.ts` | **Postgres real** — o que um `audit()` mockado não sabe provar: a LINHA chega em `audit_log` (o `alvo_id` uuid não engoliu a escrita), está no contexto `system`, e o watcher encontra o par `open`/`closed` e detecta o caso "stuck" |
 
 ## In-flight changes
 

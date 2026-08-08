@@ -204,7 +204,7 @@ alerta.
 | Alerta | O que aconteceu | Primeira coisa a checar |
 |---|---|---|
 | `MaiaLlmCircuitOpenEnforcing` | disjuntor `open` **e** postura `enforce`: chamadas estão sendo recusadas de verdade | é o provider ou é o disjuntor? `maia_llm_calls_total{status="error"}` do mesmo par no mesmo instante |
-| `MaiaLlmCircuitModeOverridden` | alguém acionou o kill switch (inclusive `reason="rejected"`, i.e. tentou e não conseguiu) | ator e motivo no log `llm_gateway.circuit_mode_override` |
+| `MaiaLlmCircuitModeOverridden` | alguém acionou o kill switch (inclusive `reason="rejected"`, i.e. tentou e não conseguiu) | ator e motivo no log `llm_gateway.circuit_mode_override` **e** na trilha durável (`audit_log`, ações `llm_circuit_mode_override_*`) |
 | `MaiaLlmCircuitDisabledTooLong` | postura `off` há mais de 1h | o incidente ainda está aberto, ou a alavanca virou configuração escondida? |
 
 **Por que o primeiro qualifica a postura.** `maia_llm_circuit_state{state="open"}`
@@ -218,6 +218,51 @@ Em `shadow`, os números que interessam são
 `tenant_id`/`agent_id`) e `maia_llm_circuit_would_open_total` (abertura
 simulada). Eles não têm alerta de propósito: em sombra são medição para a
 decisão de promover, não sintoma de incidente.
+
+**O que abriu o disjuntor: leia `window_terminal_faults`.** A partir da revisão
+da PR #541 o disjuntor abre pela taxa estimada de perda de CHAMADAS, e cada
+classe de falha entra com o expoente do orçamento que ela realmente gasta
+(`src/lib/llm/circuit-breaker.ts`, `estimatedCallFailureRate`). O log
+`llm_gateway.circuit_transition` e a linha de `audit_log` carregam a evidência
+da janela — `window_total`, `window_faults`, `window_terminal_faults` — e é o
+terceiro campo que responde a pergunta de triagem:
+
+| Leitura | Diagnóstico |
+|---|---|
+| `window_terminal_faults` ≈ `window_faults` | provider PENDURADO (timeout do SDK). Cada chamada perdida pagou o timeout inteiro; não houve retry nem fallback, porque timeout é terminal no gateway. Abre a partir de ~50% |
+| `window_terminal_faults` ≈ 0 | 5xx/rede retentáveis. O retry ainda absorve parte; só abre quando `(faults/total)^tentativas ≥ 50%` (≈84% por tentativa no `reasoner`) |
+
+Um disjuntor que abriu com `window_terminal_faults` alto e `maia_llm_latency_ms`
+no teto é queda de provider, não brownout — não adianta esperar o retry.
+
+### 4.9.2 `llm_circuit_long_open` (alerta do audit-watcher, não do Prometheus)
+
+Vem do `src/workers/audit-watcher.ts`, não das regras de alerta: dispara quando
+existe um `llm_circuit_opened` em `audit_log` com mais de 5 min e **nenhum**
+`llm_circuit_closed` depois dele. É o sinal DURÁVEL — sobrevive à retenção do
+Prometheus e ao coletor caído, que é justamente o cenário em que o plantão mais
+precisa saber que o disjuntor ficou aberto.
+
+Até a revisão da PR #541 esta regra **nunca disparou**: as duas ações existiam
+na taxonomia e nada as emitia. O produtor agora é
+`src/lib/llm/circuit-audit.ts`. Se a regra voltar a ficar muda durante um
+incidente com `maia_llm_circuit_state{state="open"} == 1`, o suspeito é a
+escrita da trilha: cheque `maia_audit_write_failed_total{action="llm_circuit_opened"}`
+e o log `llm_gateway.circuit_audit_failed`.
+
+As linhas ficam sob `tenant_id='system'` (ADR 0002 — saúde de dependência
+externa compartilhada é estado da frota), com provider, workload, motivo,
+postura e a janela em `metadata`. Uma consulta de triagem:
+
+```sql
+SELECT created_at, metadata->>'provider' AS provider,
+       metadata->>'workload' AS workload, metadata->>'reason' AS reason,
+       metadata->>'mode' AS mode, metadata->>'window_terminal_faults' AS terminal
+  FROM audit_log
+ WHERE acao IN ('llm_circuit_opened','llm_circuit_closed')
+   AND created_at > NOW() - INTERVAL '6 hours'
+ ORDER BY created_at;
+```
 
 ### 4.10 `MaiaWhatsAppDisconnected` / `MaiaDbDisconnected`
 

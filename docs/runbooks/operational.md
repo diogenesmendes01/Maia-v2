@@ -333,6 +333,34 @@ journalctl -u maia | grep llm_gateway.circuit_mode_override
 `rejected` no gráfico significa que alguém TENTOU virar a chave e não conseguiu
 — vale investigar tanto quanto um `applied`.
 
+**A fonte DURÁVEL é `audit_log`** (revisão da PR #541). Métrica expira na
+retenção do Prometheus e log expira na do coletor — é a trilha que responde
+"quem virou a chave em março?". Toda virada, limpeza, expiração e recusa vira
+linha, sob `tenant_id='system'` (a postura é da frota, não de um tenant):
+
+```sql
+SELECT created_at, acao,
+       metadata->>'actor'  AS actor,
+       metadata->>'reason' AS motivo,
+       metadata->>'mode'   AS postura,
+       metadata->>'expires_at' AS validade,
+       metadata->>'source' AS origem,   -- 'adopted' = veio da chave durável no boot
+       metadata->>'error'  AS erro      -- só nas recusas
+  FROM audit_log
+ WHERE acao LIKE 'llm_circuit_mode_override_%'
+   AND created_at > NOW() - INTERVAL '30 days'
+ ORDER BY created_at DESC;
+```
+
+Ações: `llm_circuit_mode_override_applied` · `_cleared` · `_expired` ·
+`_rejected`. A adoção da chave durável no boot entra como `applied` com
+`metadata.source = 'adopted'` — é o mesmo desfecho de governança (a postura
+mudou), com procedência diferente.
+
+Se a métrica registrar um `applied` e a trilha não tiver a linha, o suspeito é
+a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
+`llm_gateway.circuit_audit_failed`.
+
 ### Promoção `shadow` → `enforce`
 
 Só com os números de sombra em mãos. As duas perguntas, e a PromQL que responde
@@ -386,7 +414,10 @@ que é como um controle morre de vez, sem ninguém perceber.
 > porque o owner overruled aquilo, e a razão é boa: o argumento vale para
 > AJUSTAR limiares e não vale para DESLIGAR um controle que virou o incidente.
 > A parte certa da objeção ("sem deixar rastro") foi endereçada — o override é
-> obrigatoriamente identificado, contado, logado e temporário.
+> obrigatoriamente identificado, contado, logado, **auditado em `audit_log`** e
+> temporário. O "auditado" só passou a ser verdade na revisão da PR #541: até
+> ali o rastro vivia só em métrica e log, os dois com retenção curta, e
+> `grep -rn "audit(" src/lib/llm/` devolvia zero.
 
 ---
 
@@ -694,13 +725,26 @@ reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
 excede o que resta do deadline.
 
 **Quando o provider cai:** o disjuntor por `(provider, workload)` para de tentar
-depois de uma janela deslizante de 30s com no mínimo 10 tentativas acima do
-limiar, e passa a recusar com erro `circuit_open` — não retentável, carregando
-`retry_after_ms`. Ele só conta falha atribuível ao provider (`provider_5xx`,
-`network`, `timeout` do SDK): payload inválido, orçamento estourado ou turno
-cancelado não abrem o disjuntor de ninguém. O estado é por réplica e em memória,
-e o restart o zera. Ver `docs/architecture/modules/lib.md` para os limiares e o
-porquê de cada um.
+depois de uma janela deslizante de 30s com no mínimo 10 tentativas em que a
+perda estimada de CHAMADAS passa de 50%, e passa a recusar com erro
+`circuit_open` — não retentável, carregando `retry_after_ms`. Ele só conta falha
+atribuível ao provider (`provider_5xx`, `network`, `timeout` do SDK): payload
+inválido, orçamento estourado ou turno cancelado não abrem o disjuntor de
+ninguém. O estado é por réplica e em memória, e o restart o zera.
+
+A conta é por CHAMADA, não por tentativa, e cada classe de falha entra com o
+expoente do orçamento que ela realmente gasta: um `provider_5xx` retentável só
+perde a chamada quando as 3 tentativas do `reasoner` falham (≈84% por
+tentativa), enquanto um `timeout` do SDK mata a chamada na primeira (50%). Na
+triagem, `window_terminal_faults` no log `llm_gateway.circuit_transition` (e na
+linha de `audit_log`) diz qual dos dois foi. Ver
+`docs/architecture/modules/lib.md` para os limiares e o porquê de cada um, e
+`docs/runbooks/observability-slo.md` §4.9.1 para a leitura do alerta.
+
+Toda transição para `open`/`closed` também vira linha em `audit_log`
+(`llm_circuit_opened` / `llm_circuit_closed`, contexto `system`). É o que
+alimenta a regra `llm_circuit_long_open` do audit-watcher — o alerta DURÁVEL de
+"aberto há mais de 5 min", que sobrevive ao coletor caído.
 
 **…mas só se a postura for `enforce`.** `LLM_CIRCUIT_MODE` tem default
 **`shadow`**: por padrão o disjuntor roda a máquina inteira e mede o que faria,

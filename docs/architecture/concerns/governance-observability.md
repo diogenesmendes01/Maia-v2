@@ -108,6 +108,51 @@ The fail-path counter uses the *caller's* captured context (not `system`), so an
 
 `audit-actions.ts` exports the enum of every audit action. The `acao` field on `audit()` is typed; you can't audit an action that doesn't exist in the enum. This makes the audit row a discriminated union — dashboards filter by action label without parsing free-text.
 
+**A declared action is not a produced action.** The enum being typed stops you
+from auditing a *non-existent* action; it does not stop you from declaring one
+nobody emits. `llm_circuit_opened` / `llm_circuit_closed` shipped in the enum
+with a matching `audit-watcher` rule (`llm_circuit_long_open`) and **no
+producer** — `grep -rn "audit(" src/lib/llm/` returned zero, so the durable
+"breaker open for >5 min" alert could never fire, and its silence was
+indistinguishable from "nothing happened". Closed in the PR #541 review by
+`src/lib/llm/circuit-audit.ts`. When you add an action, add the emitter in the
+same change, and prove the ROW lands (see §4.2b).
+
+### 4.2b Proving an audit row LANDED, not that `audit()` was called
+
+`audit()` swallows failures by design (log + `maia_audit_write_failed_total`,
+no propagation) so a transient DB hiccup can't break business logic. That makes
+a mock-based audit test structurally weak: it stays green for a write that never
+committed.
+
+The concrete trap in this repo: `audit_log.alvo_id` is **UUID**
+(`migrations/001_initial.sql`). Any caller that puts a TEXT identifier there
+gets an INSERT error, `audit()` eats it, and the row silently disappears. It has
+already happened twice. Rules:
+
+1. Check the COLUMN TYPE before choosing a field. Free-text targets go in
+   `entidade_alvo` (TEXT) + `metadata` (JSONB); `alvo_id` is for real uuids.
+2. For any new audit producer, the regression test asserts against **real
+   Postgres** that the row exists — `tests/integration/llm-circuit-audit-real-db.spec.ts`
+   is the reference shape.
+3. If the write is fire-and-forget (hot path), expose a drain
+   (`drainCircuitAudits()`) so the test can await it instead of sleeping.
+
+### 4.2c Fleet-level decisions audit under `system`, explicitly
+
+Some governance decisions are about the FLEET, not a tenant: circuit-breaker
+transitions, and flipping the LLM circuit kill switch. They happen inside some
+tenant's call, so `audit()`'s automatic `system` fallback does NOT apply — the
+ALS context is populated, and the row would inherit whichever tenant happened to
+be in flight. That is a false attribution, which is worse than none.
+
+Such producers wrap the write in `runWithSystemContext()` **explicitly**, and
+justify it against the four cumulative conditions of
+[`ADR 0002`](../decisions/0002-external-dependency-health-is-system-state.md).
+The per-decision attribution does not disappear — it lives where the individual
+consequence is emitted (`maia_llm_requests_total{status="circuit_open"}` carries
+`tenant_id + agent_id`). Global state, scoped evidence.
+
 ### 4.3 Metrics with `tenant_id + agent_id` labels (every counter, every histogram)
 
 After PR #275, every `maia_*` counter has `tenant_id` and `agent_id` labels. Out-of-context paths use `system`. This means:
@@ -264,6 +309,9 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | Direct mutation of `agent_operational_profile` | Operational profile is governed. Use proposal flow (admin-ui approval). |
 | Lockdown bypass for "emergency" | Lockdown is the emergency. Bypassing it negates the gate. |
 | Free-text audit action (`acao: "thing happened"`) | The enum is the taxonomy. Add a new variant to `audit-actions.ts` and use it. |
+| Adding an audit action (or a watcher rule) without an emitter in the same change | A declaration that reads as coverage. `llm_circuit_opened`/`llm_circuit_closed` sat in the enum with a live watcher rule and no producer — a durable alert that could never fire. See §4.2. |
+| Proving an audit with a mocked `audit()` | `audit()` swallows failures. The test stays green for a row that never committed (the `alvo_id` uuid trap). Assert against real Postgres — §4.2b. |
+| Letting a FLEET-level decision inherit the ambient `tenant_id` | The breaker/kill-switch state is not any tenant's. Wrap in `runWithSystemContext()` explicitly and argue it against ADR 0002 — §4.2c. |
 | Trace body without redaction | PII goes through `lib/redaction.ts`. Raw bodies are not durable. |
 
 ## 6. Tests
@@ -296,6 +344,7 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/unit/observability/overhead-benchmark.spec.ts` | Per-emission cost + cardinality budget actually bounds series |
 | `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
 | `tests/integration/observability-hot-path-trace.spec.ts` | Hot-path trace through the real HMAC/redaction writers |
+| `tests/integration/llm-circuit-audit-real-db.spec.ts` | **Real Postgres** — a circuit transition LANDS a row in `audit_log` under `system`, `alvo_id` stays null, and the `llm_circuit_long_open` watcher rule finds the open/closed pair and the stuck case |
 
 ## 7. Known gaps
 

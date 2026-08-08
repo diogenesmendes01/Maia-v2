@@ -36,6 +36,7 @@ const {
   incCounterMock,
   observeHistogramMock,
   setGaugeProviderMock,
+  recordCircuitAuditMock,
 } = vi.hoisted(() => ({
   anthropicCreateMock: vi.fn(),
   getSettingsMock: vi.fn(),
@@ -43,6 +44,24 @@ const {
   incCounterMock: vi.fn(),
   observeHistogramMock: vi.fn(),
   setGaugeProviderMock: vi.fn(),
+  recordCircuitAuditMock: vi.fn(),
+}));
+
+/**
+ * A trilha durável do disjuntor é mockada AQUI de propósito.
+ *
+ * `circuit-audit.ts` importa `@/governance/audit.js` → `@/db/client.js`, que
+ * ABRE um pool de Postgres. Este arquivo é um spec de unidade: deixá-lo escrever
+ * no banco de verdade o tornaria dependente de infraestrutura e deixaria linhas
+ * espalhadas por outras suítes. O que se prova aqui é o CONTRATO — qual ação a
+ * transição emite e com quais metadados. Que a LINHA chega no `audit_log`, e que
+ * o watcher a encontra, é provado contra Postgres real em
+ * `tests/integration/llm-circuit-audit-real-db.spec.ts`.
+ */
+vi.mock('@/lib/llm/circuit-audit.js', () => ({
+  recordCircuitAudit: recordCircuitAuditMock,
+  drainCircuitAudits: vi.fn(async () => undefined),
+  _internal: { pendingCount: () => 0 },
 }));
 
 vi.mock('@anthropic-ai/sdk', () => {
@@ -103,7 +122,7 @@ import {
   releaseCircuit,
   _internal,
 } from '@/lib/llm/circuit-breaker.js';
-import type { CircuitKey } from '@/lib/llm/circuit-breaker.js';
+import type { CircuitKey, CircuitOutcome } from '@/lib/llm/circuit-breaker.js';
 import { executeLLM as executeLLMRaw } from '@/lib/llm/gateway.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
@@ -119,7 +138,7 @@ function counterCalls(name: string): Array<Record<string, string>> {
 }
 
 /** Registra N desfechos idênticos no estado fechado. */
-function feed(key: CircuitKey, outcome: 'ok' | 'fault' | 'ignored', n: number, at = T0): void {
+function feed(key: CircuitKey, outcome: CircuitOutcome, n: number, at = T0): void {
   for (let i = 0; i < n; i++) {
     const permit = acquireCircuit(key, at);
     releaseCircuit(permit, outcome, at);
@@ -131,7 +150,13 @@ beforeEach(() => {
   _internal.setMode('enforce');
   incCounterMock.mockClear();
   setGaugeProviderMock.mockClear();
+  recordCircuitAuditMock.mockClear();
 });
+
+/** Ações de auditoria emitidas pelas transições, na ordem. */
+function auditedActions(): string[] {
+  return recordCircuitAuditMock.mock.calls.map((c) => c[0] as string);
+}
 
 // ---------------------------------------------------------------------------
 // Máquina de estados
@@ -194,6 +219,65 @@ describe('circuit breaker — abertura por taxa de erro', () => {
     expect(circuitState(KEY)).toBe('closed');
   });
 
+  // -------------------------------------------------------------------------
+  // ACHADO 1 da revisão adversarial da PR #541 (High)
+  //
+  // O limiar derivado assumia que TODA falha do provider percorre o orçamento
+  // de tentativas. `timeout` não percorre: no gateway ele é terminal
+  // (`if (err.kind === 'timeout') { await fail(primary, err); throw err; }`),
+  // a chamada morre na primeira tentativa. Medi-lo com a matemática de 4
+  // tentativas fazia uma tempestade de timeouts a 70% — em que ~70% das
+  // CHAMADAS se perdem, cada uma depois de esperar o timeout inteiro — NÃO
+  // abrir o disjuntor, porque 70% < ~84%.
+  // -------------------------------------------------------------------------
+
+  it('a taxa estimada de perda de CHAMADAS usa o expoente de cada classe', () => {
+    // `CLAUDE_MAX_RETRIES: 2` no mock de config + fallback do `reasoner`.
+    expect(_internal.triesPerCall('reasoner')).toBe(3);
+    expect(_internal.triesPerCall('role_selector')).toBe(1);
+
+    // Só retentáveis: a chamada só se perde quando as 3 tentativas falham.
+    expect(
+      _internal.estimatedCallFailureRate('reasoner', { total: 10, faults: 7, terminal: 0 }),
+    ).toBeCloseTo(0.7 ** 3, 6);
+    // Só terminais: expoente 1 — uma tentativa perdida É uma chamada perdida.
+    expect(
+      _internal.estimatedCallFailureRate('reasoner', { total: 10, faults: 7, terminal: 7 }),
+    ).toBeCloseTo(0.7, 6);
+    // Single-shot: as duas classes coincidem, como sempre foram.
+    expect(
+      _internal.estimatedCallFailureRate('role_selector', { total: 10, faults: 5, terminal: 0 }),
+    ).toBeCloseTo(0.5, 6);
+  });
+
+  it('70% de fault TERMINAL abre o `reasoner`; 70% de fault RETENTÁVEL não', () => {
+    // Mesma taxa por tentativa, mesmas 10 amostras, desfechos de CHAMADA
+    // opostos — que é exatamente a distinção que o limiar antigo apagava.
+    const terminalKey: CircuitKey = { provider: 'anthropic', workload: 'reasoner' };
+    feed(terminalKey, 'terminal_fault', 7);
+    feed(terminalKey, 'ok', 3);
+    expect(circuitState(terminalKey)).toBe('open');
+
+    const retryableKey: CircuitKey = { provider: 'openrouter', workload: 'reasoner' };
+    feed(retryableKey, 'fault', 7);
+    feed(retryableKey, 'ok', 3);
+    expect(circuitState(retryableKey)).toBe('closed');
+  });
+
+  it('janela MISTA soma as duas classes com o expoente de cada uma', () => {
+    // 4 terminais (0.4 de perda direta) + 6 retentáveis (0.6³ ≈ 0.216) ⇒ ~0.62.
+    feed(KEY, 'terminal_fault', 4);
+    feed(KEY, 'fault', 6);
+    expect(circuitState(KEY)).toBe('open');
+
+    // 3 terminais (0.3) + 4 retentáveis (0.4³ = 0.064) + 3 ok ⇒ ~0.36 < 0.5.
+    const other: CircuitKey = { provider: 'openrouter', workload: 'reasoner' };
+    feed(other, 'terminal_fault', 3);
+    feed(other, 'fault', 4);
+    feed(other, 'ok', 3);
+    expect(circuitState(other)).toBe('closed');
+  });
+
   it('falhas fora da janela não contam', () => {
     feed(KEY, 'fault', _internal.MIN_SAMPLES - 1, T0);
     // A última falha chega depois da janela inteira: as antigas caducaram.
@@ -217,7 +301,11 @@ describe('circuit breaker — abertura por taxa de erro', () => {
   it('só kinds atribuíveis ao provider contam como falha', () => {
     expect(circuitOutcomeFor('provider_5xx')).toBe('fault');
     expect(circuitOutcomeFor('network')).toBe('fault');
-    expect(circuitOutcomeFor('timeout')).toBe('fault');
+    // `timeout` continua contando como falha do provider — muda a CLASSE, não a
+    // atribuição. Ver `estimatedCallFailureRate` (achado 1 da revisão #541): o
+    // timeout do SDK é TERMINAL no gateway (sem retry, sem fallback), então
+    // medi-lo com a matemática de múltiplas tentativas escondia a tempestade.
+    expect(circuitOutcomeFor('timeout')).toBe('terminal_fault');
     for (const kind of [
       'authentication',
       'permission',
@@ -660,5 +748,173 @@ describe('teste de carga — o disjuntor reduz a carga durante indisponibilidade
     // Só a janela de sondas saiu; o resto foi recusado.
     expect(anthropicCreateMock).toHaveBeenCalledTimes(_internal.HALF_OPEN_MAX_PROBES);
     expect(circuitState({ provider: 'anthropic', workload: 'role_selector' })).toBe('open');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tempestade de TIMEOUT do SDK através do gateway real — achado 1 (High) da
+// revisão adversarial da PR #541
+// ---------------------------------------------------------------------------
+
+/**
+ * Este bloco não alimenta `feed('fault')`: ele passa pelo caminho REAL do
+ * gateway (`executeLLM` → `provider.call` → `classifyProviderError` →
+ * `circuitOutcomeFor` → `releaseCircuit`), que é a única forma de provar as
+ * três coisas que a revisão pediu juntas — abertura do circuito, tempo poupado
+ * e ausência de retry inesperado. Alimentar o disjuntor direto provaria a
+ * aritmética e esconderia justamente o elo defeituoso: a classificação do
+ * desfecho no caminho de erro do gateway.
+ *
+ * O cenário é o da revisão: provider PENDURADO em 70% das chamadas do workload
+ * `reasoner`. Cada pendurada custa o timeout inteiro ao caller e mata a chamada
+ * na primeira tentativa — sem retry, sem fallback.
+ *
+ * Antes da correção: `circuitOutcomeFor('timeout') === 'fault'`, a janela
+ * media 0.70 por tentativa, o limiar do `reasoner` era `0.5^(1/3) ≈ 0.794`, e
+ * o disjuntor ficava FECHADO durante a tempestade inteira. 70% do tráfego se
+ * perdia, cada perda pagando o timeout completo, e o controle que existe
+ * exatamente para isso não fazia nada.
+ */
+describe('tempestade de timeout do SDK — `reasoner` (achado 1, PR #541)', () => {
+  /** Quanto o provider fica pendurado antes de estourar. É o tempo poupado. */
+  const HANG_MS = 20;
+  const REQUESTS = 40;
+  /** 7 pendurados a cada 10 chamadas = 70% — a taxa do achado. */
+  const TIMEOUT_PER_10 = 7;
+
+  let providerCalls = 0;
+
+  /**
+   * Timeout como o SDK o entrega: `APIConnectionTimeoutError`. É o que
+   * `classifyProviderError` mapeia para `kind: 'timeout'`.
+   *
+   * NÃO é o deadline do turno: `link.deadlineFired()` continua falso (o
+   * `LLM_TURN_DEADLINE_MS` está a 120s daqui), então a distinção que a #534
+   * fez na origem — e que a revisão mandou preservar — segue intacta. O que
+   * este teste exercita é o outro lado dela: provider pendurado de verdade.
+   */
+  function sdkTimeout(): Error {
+    const err = new Error('Request timed out.');
+    err.name = 'APIConnectionTimeoutError';
+    return err;
+  }
+
+  /** Pendura por `HANG_MS` e só então estoura — o custo que o caller paga. */
+  function hangThenTimeout(): Promise<never> {
+    return new Promise((_, reject) => setTimeout(() => reject(sdkTimeout()), HANG_MS));
+  }
+
+  function installStorm(): void {
+    providerCalls = 0;
+    anthropicCreateMock.mockImplementation(async () => {
+      const hangs = providerCalls++ % 10 < TIMEOUT_PER_10;
+      if (hangs) return hangThenTimeout();
+      return okReply();
+    });
+  }
+
+  beforeEach(() => {
+    _internal.reset();
+    _internal.setMode('enforce');
+    anthropicCreateMock.mockReset();
+    recordCostMock.mockClear();
+    incCounterMock.mockClear();
+    observeHistogramMock.mockClear();
+    recordCircuitAuditMock.mockClear();
+    getSettingsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      main: { value: 'settings-main', source: 'global' },
+      fast: { value: 'settings-fast', source: 'global' },
+    });
+    invalidateModelCache();
+  });
+
+  /**
+   * A premissa do achado, pinada dos DOIS lados no mesmo teste: o `reasoner`
+   * TEM orçamento de 3 tentativas (2 + fallback) para falha retentável, e o
+   * timeout NÃO usa nenhuma delas. Sem esta asserção, "1 chamada por request"
+   * poderia ser lido como "o workload não tem retry", que é o oposto do ponto.
+   */
+  it('o `reasoner` gasta 3 tentativas num 5xx e apenas 1 num timeout do SDK', async () => {
+    _internal.setMode('off');
+
+    anthropicCreateMock.mockRejectedValue(outage());
+    await executeLLM(req({ workload: 'reasoner' })).catch(() => undefined);
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(3);
+
+    anthropicCreateMock.mockClear();
+    anthropicCreateMock.mockRejectedValue(sdkTimeout());
+    const err = await executeLLM(req({ workload: 'reasoner' })).catch((e) => e);
+    expect(err.kind).toBe('timeout');
+    // TERMINAL: nem retry, nem fallback. É por isso que a matemática de
+    // múltiplas tentativas não pode ser aplicada a esta falha.
+    expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a 70% de timeout terminal o disjuntor ABRE, corta a carga e poupa tempo', async () => {
+    // --- controle: postura `off`, a tempestade inteira bate no provider -----
+    _internal.setMode('off');
+    installStorm();
+    const offStarted = Date.now();
+    const offRefused = await storm(REQUESTS, req({ workload: 'reasoner' }));
+    const offElapsed = Date.now() - offStarted;
+    const offCalls = providerCalls;
+
+    // Uma chamada de provider por request — a prova de que o timeout é
+    // terminal e NÃO percorre o orçamento de 3 tentativas do workload.
+    expect(offCalls).toBe(REQUESTS);
+    expect(offRefused).toBe(0);
+
+    // --- disjuntor em vigor -------------------------------------------------
+    _internal.reset();
+    _internal.setMode('enforce');
+    installStorm();
+    const onStarted = Date.now();
+    const onRefused = await storm(REQUESTS, req({ workload: 'reasoner' }));
+    const onElapsed = Date.now() - onStarted;
+    const onCalls = providerCalls;
+
+    // Abre assim que a amostra mínima fecha (7 timeouts + 3 sucessos = 10).
+    expect(circuitState(KEY)).toBe('open');
+    expect(onCalls).toBe(_internal.MIN_SAMPLES);
+    expect(onRefused).toBe(REQUESTS - _internal.MIN_SAMPLES);
+
+    // Tempo poupado: em `off` o caller espera o pendurado 28 vezes; com o
+    // disjuntor, 7. O corte é estrutural, não estatístico — mas a asserção usa
+    // margem larga para não virar teste de relógio.
+    expect(onElapsed).toBeLessThan(offElapsed * 0.6);
+    expect(offElapsed).toBeGreaterThanOrEqual(HANG_MS * TIMEOUT_PER_10 * (REQUESTS / 10) * 0.8);
+  }, 20000);
+
+  it('a recusa da tempestade é `circuit_open`, não `timeout`, e não toca no provider', async () => {
+    installStorm();
+    await storm(_internal.MIN_SAMPLES, req({ workload: 'reasoner' }));
+    expect(circuitState(KEY)).toBe('open');
+
+    const before = providerCalls;
+    const err = await executeLLM(req({ workload: 'reasoner' })).catch((e) => e);
+    expect(err.kind).toBe('circuit_open');
+    expect(err.retryable).toBe(false);
+    expect(err.workload).toBe('reasoner');
+    // Nenhuma requisição saiu: o caller nem paga o pendurado.
+    expect(providerCalls).toBe(before);
+  });
+
+  it('a abertura vai para a trilha durável com a evidência da janela', async () => {
+    installStorm();
+    await storm(_internal.MIN_SAMPLES, req({ workload: 'reasoner' }));
+
+    expect(auditedActions()).toEqual(['llm_circuit_opened']);
+    const [, metadata] = recordCircuitAuditMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(metadata).toMatchObject({
+      provider: 'anthropic',
+      workload: 'reasoner',
+      from: 'closed',
+      to: 'open',
+      reason: 'error_rate_exceeded',
+      mode: 'enforce',
+      window_total: _internal.MIN_SAMPLES,
+      window_terminal_faults: TIMEOUT_PER_10,
+    });
   });
 });
