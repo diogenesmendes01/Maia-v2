@@ -17,7 +17,11 @@ import {
 } from '@/observability/correlation.js';
 import { counter, histogram } from '@/observability/metrics.js';
 import { METRIC, SPAN } from '@/observability/taxonomy.js';
-import { recordElapsedSpan, withSpan } from '@/observability/tracer.js';
+import {
+  recordElapsedSpan,
+  withSpan,
+  type SpanAttribution,
+} from '@/observability/tracer.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
 
@@ -105,23 +109,28 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
         async () => {
           // queue.wait — measured from the persisted arm timestamp, not from a
           // process-local clock, so it survives a worker restart.
+          //
+          // The HISTOGRAM is recorded here, immediately: it is the queue-wait
+          // SLI and it must survive a turn that never finishes. Its ALS
+          // attribution is `system` by construction (nothing has resolved the
+          // tenant yet) — see `docs/runbooks/observability-slo.md` §9.6.
+          //
+          // The SPAN is not. `enqueued_at_ms` describes a window that closed
+          // before this worker existed, so there is no scope to read a tenant
+          // from, and a span nobody can filter by tenant is the defect the
+          // owner's review of PR #541 opened. It is therefore DEFERRED to the
+          // `finally` below and stamped with the tuple the root `turn` span
+          // actually resolved to. Deferring costs nothing structurally: the
+          // start/end instants are explicit, and the span stays a SIBLING of
+          // the turn (it is emitted with no span open, so `parent_span_id`
+          // is null either way) because the waiting happened BEFORE the turn
+          // started running.
+          let queueWaitMs: number | null = null;
           if (typeof job.data.enqueued_at_ms === 'number') {
             const waited = Date.now() - job.data.enqueued_at_ms;
             if (waited >= 0) {
               histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
-              // Issue #535 — the same wait as a SPAN, so the backlog shows up
-              // in the waterfall next to the work it delayed. Reconstructed
-              // rather than wrapped: by the time this worker can observe the
-              // wait, the wait is over, so there is no callback to put a span
-              // around. Emitted BEFORE the `turn` span opens, so it is a
-              // SIBLING of the turn's work rather than a child of it — the
-              // waiting happened before the turn started running.
-              recordElapsedSpan(
-                SPAN.QUEUE_WAIT,
-                job.data.enqueued_at_ms,
-                job.data.enqueued_at_ms + waited,
-                { queue: 'agent' },
-              );
+              queueWaitMs = waited;
             }
           }
           counter(METRIC.QUEUE_JOB_ATTEMPTS, {
@@ -160,6 +169,13 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // the ones that die before the core's own bookkeeping; (b) it keeps
           // the instrumentation off the files #503 is rewriting.
           const t0 = Date.now();
+          // Filled at the root span's close with the tuple the turn RESOLVED
+          // to — never with the pre-resolution payload, which knows no tenant.
+          // A plain box (not a bare `let`) so the closure write is visible to
+          // the reader as the whole point of the variable. It is per-JOB: two
+          // jobs of different tenants processing concurrently each get their
+          // own, which is what keeps one tenant's tuple off another's span.
+          const rootAttribution: { value: SpanAttribution | null } = { value: null };
           try {
             // Issue #535 — the ROOT operational span. It wraps the same scope
             // the turn metrics already measure, so span duration and
@@ -169,6 +185,9 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             // hot path.
             await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job)), {
               attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
+              onAttribution: (attribution) => {
+                rootAttribution.value = attribution;
+              },
             });
             recordTurnOutcome(job, 'completed', t0);
           } catch (err) {
@@ -178,6 +197,21 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             const exhausted = (job.attemptsMade ?? 0) + 1 >= (job.opts.attempts ?? 3);
             recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0);
             throw err;
+          } finally {
+            // The deferred `queue.wait` span (see above). Emitted on the throw
+            // path too: a turn that failed still waited, and a backlog that
+            // only shows up for successful turns understates itself exactly
+            // when the queue is in trouble. `tenant_id`/`agent_id` are passed
+            // EXPLICITLY because at this point the tenant scope has unwound —
+            // caller-supplied attributes win over the tracer's own read.
+            if (queueWaitMs !== null && typeof job.data.enqueued_at_ms === 'number') {
+              recordElapsedSpan(
+                SPAN.QUEUE_WAIT,
+                job.data.enqueued_at_ms,
+                job.data.enqueued_at_ms + queueWaitMs,
+                { queue: 'agent', ...(rootAttribution.value ?? {}) },
+              );
+            }
           }
         },
       );

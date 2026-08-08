@@ -452,6 +452,45 @@ crua de erro continuam proibidos — e o collector é de terceiro, então aqui o
 portão importa mais, não menos. A sanitização roda no FIM do span, antes de
 entrar na fila do exporter: span não sanitizado não chega a existir em memória.
 
+### 9.6 Atribuição de span (`tenant_id` / `agent_id`)
+
+Todo span exportado carrega `tenant_id` + `agent_id`, e a tupla é a que o turno
+**resolveu** — não a que o ALS por acaso continha no fechamento do span.
+
+Isso importa na investigação: o span-raiz `turn` abre ANTES do tenant ser
+conhecido (`src/gateway/queue.ts` embrulha o processor no contexto `system`
+sancionado) e `src/agent/core.ts` abre o `runWithTenantContext` real ANINHADO lá
+dentro. Até a #541 os atributos eram lidos no fechamento, quando esse escopo já
+tinha desmontado — todo root saía `tenant_id=system` enquanto o `tool.dispatch`
+saía com a tupla certa. Se você abrir um waterfall antigo no collector, é isso
+que vai ver; não conclua que o turno rodou como `system`.
+
+Hoje a tupla é CAPTURADA: entrar num escopo de tenant notifica um observer
+consultivo e fail-soft (`setTenantScopeObserver`, registrado por
+`src/observability/tracer.ts`) que publica a tupla em todo span aberto naquele
+contexto assíncrono. Duas regras, ambas cobertas por teste:
+
+- `system` nunca publica — o contexto externo do worker não rebaixa um span já
+  resolvido, em nenhuma ordem de aninhamento;
+- a tupla de um span é **escrita uma vez** — um SEGUNDO tenant real sob o mesmo
+  span é anomalia, não atualização. Re-carimbar poria a tupla de um tenant no
+  span de outro, então o evento é contado em
+  `maia_span_attribute_rejected_total{reason="attribution_conflict"}` e
+  descartado. **Se essa série subir, investigue: é sinal de um turno tocando
+  dois tenants, não de bug de instrumentação.**
+
+`queue.wait` é o único span que não consegue aprender o próprio tenant — ele
+reconstrói uma janela que fechou antes do worker existir. Por isso é emitido
+DEPOIS do root fechar, carimbado com a tupla que o root resolveu (inclusive
+quando o turno falha). Consequência operacional: se o processo morrer no meio do
+turno, você perde o `queue.wait` do waterfall — mas perderia o `turn` junto, então
+o trace estaria vazio de qualquer forma.
+
+O histograma `maia_queue_wait_ms` NÃO mudou: continua sendo registrado na
+entrada, antes da resolução, e portanto continua rotulado `system`. É
+deliberado — a SLI de espera na fila precisa sobreviver a um turno que nunca
+termina. Para quebrar espera de fila por tenant, use o span, não a métrica.
+
 ## 10. Dashboards
 
 `monitoring/dashboards/` — JSON versionado do Grafana, um arquivo por público.

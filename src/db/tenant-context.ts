@@ -136,11 +136,48 @@ function shouldThrowOnDefaultLiteral(): boolean {
   return process.env.MAIA_REJECT_DEFAULT_LITERAL !== 'false';
 }
 
+/**
+ * Notified whenever a tenant scope is ENTERED, from inside the new scope.
+ *
+ * Exists for ONE reason (issue #535, owner review of PR #541): the observability
+ * layer needs to know the tuple a turn resolved to, and it cannot read it. The
+ * root `turn` span opens before the resolution and closes after the scope has
+ * unwound, so an ALS read at either end returns `system` and the exported root
+ * carries no usable attribution.
+ *
+ * Dependency is INVERTED — this module stays the fail-closed security boundary
+ * with zero observability imports; `src/observability/tracer.ts` registers
+ * itself. The observer is advisory and fail-SOFT: it cannot change the context,
+ * cannot reject a scope, and a throw from it is swallowed, so a bug in
+ * instrumentation can never be the reason a tenant scope fails to open.
+ */
+type TenantScopeObserver = (ctx: TenantContext) => void;
+
+let tenantScopeObserver: TenantScopeObserver | null = null;
+
+export function setTenantScopeObserver(observer: TenantScopeObserver | null): void {
+  tenantScopeObserver = observer;
+}
+
+function notifyTenantScope(ctx: TenantContext): void {
+  const observer = tenantScopeObserver;
+  if (observer === null) return;
+  try {
+    observer(ctx);
+  } catch {
+    // Observability is never a control-flow participant.
+  }
+}
+
 export async function runWithTenantContext<T>(
   ctx: TenantContext,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return storage.run(ctx, fn);
+  return storage.run(ctx, () => {
+    // Inside the new scope, so the observer sees exactly what `fn` will see.
+    notifyTenantScope(ctx);
+    return fn();
+  });
 }
 
 /**

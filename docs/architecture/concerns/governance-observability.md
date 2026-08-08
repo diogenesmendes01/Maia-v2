@@ -190,6 +190,48 @@ The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
 the two drift. Today `turn`, `queue.wait` and `tool.dispatch` are emitted; the
 other 20 are declared.
 
+#### Span attribution is RESOLVED, not read at close
+
+Every exported span carries `tenant_id + agent_id`, and the tuple is the one
+the turn **resolved to** — not whatever ALS happened to hold when the span
+closed. The distinction is not academic: it was the defect. The root `turn`
+span is opened by the worker BEFORE the tenant is known (`src/gateway/queue.ts`
+wraps the processor in the sanctioned `system` context) and `src/agent/core.ts`
+opens the real `runWithTenantContext` NESTED inside it. That nested scope has
+already unwound by the time the root's `emit()` runs after its `await`, so a
+close-time ALS read returned `system` for **every root span ever exported**,
+while `tool.dispatch` — opened inside the resolved scope — reported the truth.
+A waterfall whose root could not be filtered by tenant, and whose children
+disagreed with it.
+
+So the tuple is CAPTURED instead. Entering a tenant scope notifies an advisory,
+fail-soft observer (`setTenantScopeObserver` in `src/db/tenant-context.ts`,
+registered by `src/observability/tracer.ts`) which publishes the tuple onto
+every span open on that async context; `emit()` uses the captured value. Two
+rules keep the isolation invariant intact, and both are test-enforced:
+
+- **`system` never publishes.** The worker's outer `runWithSystemContext` — in
+  either nesting order — cannot downgrade a span that already resolved.
+- **A span's tuple is write-once.** A second, *different* real tenant seen
+  under the same span is an anomaly, not an update; re-stamping would put one
+  tenant's tuple on another tenant's span. It is counted as
+  `maia_span_attribute_rejected_total{reason="attribution_conflict"}` and
+  dropped.
+
+Concurrency safety is structural rather than defensive: the slot lives on the
+per-span object created inside the tracer's own ALS frame, so two jobs of
+different tenants never touch the same object.
+`tests/unit/observability/span-attribution.spec.ts` and
+`tests/unit/gateway/queue-span-attribution.spec.ts` assert the **exported**
+attribution (what reaches the sink), including the concurrent case.
+
+`queue.wait` is the one span that cannot learn its own tenant: it reconstructs
+a window that closed before the worker existed. It is therefore emitted after
+the root closes, stamped with the tuple the root resolved to. The matching
+`maia_queue_wait_ms` **histogram** is still recorded up front, before the
+tenant is known, and is therefore still labelled `system` — deliberately, so
+the queue-wait SLI survives a turn that never finishes.
+
 ### 4.5 Drift detector — 7 types × 4 severities
 
 `src/cognition/drift/index.ts` invokes 7 typed detectors. Each detector returns a severity (1-4) for its category. The drift decision engine (`decision-engine.ts`) maps the matrix of severities to an action: silent, dashboard alert, mentionable, or owner-proposed correction.
@@ -245,6 +287,8 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/unit/observability/runtime-trace-repo.spec.ts` | Trace Explorer tenant fail-closed + keyset cursor |
 | `tests/unit/observability/span-attributes.spec.ts` | Span-attribute gate: PII out, correlation ids in (issue #535) |
 | `tests/unit/observability/tracer.spec.ts` | Inert-when-off, id correlation, derived sampling, taxonomy honesty |
+| `tests/unit/observability/span-attribution.spec.ts` | EXPORTED span attribution: resolved tenant on the root, write-once, concurrent turns never swap tuples |
+| `tests/unit/gateway/queue-span-attribution.spec.ts` | Same, driven through the real BullMQ handler — `turn` + `queue.wait` agree |
 | `tests/unit/observability/otlp-exporter.spec.ts` | OTLP wire contract + bounded/counted loss |
 | `tests/unit/observability/runtime-collectors.spec.ts` | pool/session/scheduler gauges render NaN, never a healthy 0 |
 | `tests/unit/observability/instrumentation.spec.ts` | Returned `{error}` is classified, not counted as success |
