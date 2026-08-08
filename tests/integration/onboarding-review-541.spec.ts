@@ -27,10 +27,14 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
+import { useExclusivePairingQueue } from './helpers/pairing-queue-lock.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
+
+// A fila de `channel_line_state` é global por desenho — ver o helper.
+useExclusivePairingQueue();
 
 const ACTOR_ID = 'rev541-tester';
 /** Tenant vizinho: é dele o agente cuja existência NÃO pode vazar. */
