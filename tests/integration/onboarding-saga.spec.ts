@@ -78,15 +78,47 @@ afterAll(async () => {
   }
 });
 
+let runSeq = 0;
+
+/**
+ * `onboarding_runs_one_live_per_tenant_uq` (migration 113) admite UMA run viva
+ * sem agente por tenant — a correção do achado 2: duas runs `tenant_onboarding`
+ * em `created` para o mesmo tenant provisionavam árvores de governança
+ * diferentes. Estes casos são independentes entre si e compartilham o tenant de
+ * propósito (cada um observa um aspecto do MESMO provisionamento), então cada
+ * um encerra a run do anterior — que é exatamente o que a mensagem de conflito
+ * manda um operador fazer ("retome ou cancele").
+ */
+async function terminateLiveRunsOf(tenant: string): Promise<void> {
+  const c = await pool.connect();
+  try {
+    await c.query(
+      `UPDATE onboarding_runs
+          SET state='cancelled', cancelled_at=now(), last_error_code='operator_abort',
+              failed_step=NULL, resume_state=NULL
+        WHERE tenant_id=$1
+          AND state NOT IN ('active','cancelled','failed_terminal')`,
+      [tenant],
+    );
+  } finally {
+    c.release();
+  }
+}
+
 async function startRun(): Promise<{ id: string; version: number }> {
   const { startOnboardingRun } = await import('../../src/onboarding/wizard.js');
-  const view = await startOnboardingRun({
+  // A criação é idempotente por chave (migration 113): cada caso precisa da
+  // SUA chave, senão o segundo `startRun()` replayaria a run do primeiro.
+  await terminateLiveRunsOf(TENANT);
+  const out = await startOnboardingRun({
     kind: 'tenant_onboarding',
     tenant_id: TENANT,
     actor: ACTOR,
+    idempotency_key: `saga-start-${(runSeq += 1)}-${Date.now()}`,
   });
-  createdRuns.push(view.id);
-  return { id: view.id, version: view.version };
+  if (out.status !== 'started') throw new Error(`startOnboardingRun: ${out.code}`);
+  createdRuns.push(out.run.id);
+  return { id: out.run.id, version: out.run.version };
 }
 
 d('saga de onboarding — ponta a ponta', () => {
@@ -300,7 +332,8 @@ d('saga de onboarding — ponta a ponta', () => {
 
   it('a expiração cancela a run e preserva o motivo', async () => {
     const { onboardingRunsRepo } = await import('../../src/db/repositories/onboarding-repos.js');
-    const run = await onboardingRunsRepo.create({
+    await terminateLiveRunsOf(TENANT);
+    const created = await onboardingRunsRepo.create({
       kind: 'tenant_onboarding',
       tenant_id: TENANT,
       agent_id: null,
@@ -310,7 +343,11 @@ d('saga de onboarding — ponta a ponta', () => {
       expires_at: new Date(Date.now() - 1000),
       configuration_contract_version: '1',
       schema_version: 'sf',
+      idempotency_key_hash: `saga-exp-${Date.now()}`,
+      payload_hash: 'saga-exp-payload',
     });
+    if (created.outcome !== 'created') throw new Error(`run não criada: ${created.outcome}`);
+    const run = created.run;
     createdRuns.push(run.id);
 
     expect(await onboardingRunsRepo.expireStale(new Date())).toBeGreaterThanOrEqual(1);
@@ -330,18 +367,22 @@ d('saga de onboarding — ponta a ponta', () => {
     const ghost = 'saga-fantasma';
     const actor = { actor_id: 'saga-tester', actor_role: 'owner' as const, tenant_id: ghost };
 
-    const view = await startOnboardingRun({
+    const started = await startOnboardingRun({
       kind: 'tenant_onboarding',
       tenant_id: ghost,
       actor,
+      idempotency_key: `saga-ghost-${Date.now()}`,
     });
+    if (started.status !== 'started') throw new Error('run não abriu');
+    const view = started.run;
     createdRuns.push(view.id);
 
     const out = await cancelOnboardingRun({
       run_id: view.id,
       expected_version: view.version,
       actor,
-      reason_code: 'desistiu',
+      reason_code: 'operator_abort',
+      idempotency_key: `saga-ghost-cancel-${Date.now()}`,
     });
     expect(out.status).toBe('completed');
 
@@ -385,11 +426,14 @@ d('saga de onboarding — caminho feliz completo até a ativação', () => {
       '../../src/onboarding/wizard.js'
     );
 
-    const view = await startOnboardingRun({
+    const started = await startOnboardingRun({
       kind: 'tenant_onboarding',
       tenant_id: E2E_TENANT,
       actor: E2E_ACTOR,
+      idempotency_key: `saga-e2e-${Date.now()}`,
     });
+    if (started.status !== 'started') throw new Error('run não abriu');
+    const view = started.run;
     createdRuns.push(view.id);
 
     let version = view.version;

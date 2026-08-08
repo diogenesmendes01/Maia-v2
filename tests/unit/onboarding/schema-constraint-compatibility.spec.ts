@@ -39,8 +39,9 @@ import {
 import {
   AUDIT_FALLBACK_TENANT,
   ONBOARDING_EVENT_TYPES,
+  STEP_RESULT_OUTCOMES,
 } from '../../../src/db/repositories/onboarding-repos.js';
-import { ONBOARDING_STATES } from '../../../src/onboarding/state-machine.js';
+import { ONBOARDING_STATES, ONBOARDING_STEPS } from '../../../src/onboarding/state-machine.js';
 import { OWNERSHIP_PROVEN_LINE_STATES } from '../../../src/onboarding/readiness.js';
 
 function expectSubset(
@@ -104,6 +105,33 @@ describe('onboarding — literais do código vs. CHECK real das migrations', () 
       'onboarding_runs.kind',
       ['global_bootstrap', 'tenant_onboarding'],
       effectiveCheckIn('onboarding_runs', 'kind'),
+    );
+  });
+
+  it('todo passo da máquina é admitido por onboarding_runs.failed_step', () => {
+    // O ponto de retomada (migration 113) é escrito com o nome do passo que
+    // falhou. Um passo novo na máquina sem alargar o CHECK é 23514 na hora em
+    // que ele for negado — isto é, no pior momento possível.
+    expectSubset(
+      'onboarding_runs.failed_step',
+      ONBOARDING_STEPS,
+      effectiveCheckIn('onboarding_runs', 'failed_step'),
+    );
+  });
+
+  it('todo estado da máquina é admitido por onboarding_runs.resume_state', () => {
+    expectSubset(
+      'onboarding_runs.resume_state',
+      ONBOARDING_STATES,
+      effectiveCheckIn('onboarding_runs', 'resume_state'),
+    );
+  });
+
+  it('todo tipo de resultado conclusivo é admitido por onboarding_step_results.outcome_kind', () => {
+    expectSubset(
+      'onboarding_step_results.outcome_kind',
+      Object.values(STEP_RESULT_OUTCOMES),
+      effectiveCheckIn('onboarding_step_results', 'outcome_kind'),
     );
   });
 

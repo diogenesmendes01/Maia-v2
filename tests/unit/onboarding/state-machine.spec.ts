@@ -97,11 +97,67 @@ describe('planTransition — saltos não autorizados', () => {
     );
   });
 
-  it('todo passo pode ser retomado a partir de `failed_retryable`', () => {
+  /**
+   * TESTE INVERTIDO (review adversarial do PR #541, achado 4).
+   *
+   * A versão anterior deste caso afirmava que TODO passo aceita
+   * `failed_retryable` como origem — isto é, ela CRISTALIZAVA o defeito: com o
+   * estado sem memória de qual passo falhou, "todo passo é retomável" significa
+   * que uma negativa em `start_pairing` autoriza `provision_tenant`,
+   * `provision_admin`, `declare_channel` ou `evaluate_readiness`. Passos que
+   * rebobinam o estado materializado da saga ou criam recursos adicionais.
+   *
+   * A asserção foi INVERTIDA, não removida: agora ela prova a propriedade
+   * oposta — nenhuma definição declara `failed_retryable`, porque a retomada
+   * passou a ser decidida contra o ponto de retomada PERSISTIDO. Se alguém
+   * reintroduzir a origem universal numa definição, este caso fica vermelho.
+   */
+  it('NENHUM passo declara `failed_retryable` como origem — a retomada vem do ponto persistido', () => {
     for (const step of ONBOARDING_STEPS) {
-      if (step === 'activate') continue; // ativação nunca parte de uma falha genérica
-      expect(STEP_DEFINITIONS[step].from).toContain('failed_retryable');
+      expect(
+        STEP_DEFINITIONS[step].from,
+        `'${step}' voltou a aceitar 'failed_retryable' como origem universal`,
+      ).not.toContain('failed_retryable');
     }
+  });
+
+  it('a partir de `failed_retryable` só o passo que FALHOU (e as remediações dele) é legal', () => {
+    // O cenário concreto da review: negativa em `start_pairing`.
+    const point = { failed_step: 'start_pairing', resume_state: 'channel_declared' };
+    expect(planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to).toBe(
+      'pairing_pending',
+    );
+    for (const step of ['provision_tenant', 'provision_admin', 'declare_channel', 'evaluate_readiness'] as const) {
+      try {
+        planTransition({ step, from: 'failed_retryable', retry_point: point });
+        throw new Error(`'${step}' deveria ser recusado a partir de failed_retryable`);
+      } catch (err) {
+        expect((err as OnboardingError).code).toBe('invalid_transition');
+      }
+    }
+  });
+
+  it('sem ponto de retomada gravado, `failed_retryable` não autoriza NADA (fail-closed)', () => {
+    for (const step of ONBOARDING_STEPS) {
+      expect(() => planTransition({ step, from: 'failed_retryable' })).toThrow(OnboardingError);
+    }
+    expect(allowedStepsFrom('failed_retryable')).toEqual([]);
+  });
+
+  it('a remediação declarada é aceita — e só ela', () => {
+    // `confirm_channel_ready` falhou (linha não provou posse): refazer o
+    // pareamento da MESMA linha é a remediação legal.
+    const point = { failed_step: 'confirm_channel_ready', resume_state: 'pairing_pending' };
+    expect(planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to).toBe(
+      'pairing_pending',
+    );
+    expect(
+      planTransition({ step: 'confirm_channel_ready', from: 'failed_retryable', retry_point: point }).to,
+    ).toBe('channel_ready');
+    // Declarar OUTRA linha não é remediação — é um segundo canal.
+    expect(() =>
+      planTransition({ step: 'declare_channel', from: 'failed_retryable', retry_point: point }),
+    ).toThrow(OnboardingError);
   });
 
   it('passo desconhecido é erro tipado', () => {
@@ -146,11 +202,34 @@ describe('allowedStepsFrom — o que a UI pode desenhar', () => {
     expect(allowedStepsFrom('ready_for_activation')).toEqual(['evaluate_readiness', 'activate']);
   });
 
-  it('`failed_retryable` oferece todo passo retomável', () => {
-    const steps = allowedStepsFrom('failed_retryable');
-    expect(steps).toContain('provision_tenant');
-    expect(steps).toContain('declare_channel');
+  /**
+   * TESTE INVERTIDO (review adversarial do PR #541, achado 4).
+   *
+   * A versão anterior exigia que `failed_retryable` oferecesse `provision_tenant`
+   * E `declare_channel` — ou seja, ela pinava como CORRETO o menu que permite
+   * ao operador rebobinar a saga e reprovisionar governança depois de qualquer
+   * falha. Como a UI desenha exatamente o que esta função devolve, o teste
+   * garantia que o console mostraria esses botões.
+   *
+   * Invertida: o menu agora é derivado do ponto de retomada, e o que ele NÃO
+   * pode conter é justamente o que o caso antigo exigia.
+   */
+  it('`failed_retryable` oferece SÓ o retry do passo que falhou e as remediações dele', () => {
+    const steps = allowedStepsFrom('failed_retryable', {
+      failed_step: 'start_pairing',
+      resume_state: 'channel_declared',
+    });
+    expect(steps).toEqual(['start_pairing']);
+    expect(steps).not.toContain('provision_tenant');
+    expect(steps).not.toContain('declare_channel');
     expect(steps).not.toContain('activate');
+
+    expect(
+      allowedStepsFrom('failed_retryable', {
+        failed_step: 'confirm_channel_ready',
+        resume_state: 'pairing_pending',
+      }),
+    ).toEqual(['start_pairing', 'confirm_channel_ready']);
   });
 });
 

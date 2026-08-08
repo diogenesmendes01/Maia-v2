@@ -73,6 +73,12 @@ import {
   type AgentReadiness,
 } from './readiness.js';
 import { loadReadinessFactsWith, lockReadinessSnapshot } from './readiness-facts.js';
+import {
+  parseCancelReason,
+  projectRunMetadata,
+  type OnboardingCancelReason,
+  type OnboardingRunMetadata,
+} from './sanitize.js';
 import { assertTenantScope } from './scope.js';
 import {
   allowedStepsFrom,
@@ -99,7 +105,18 @@ function attribution(scope: MetricScope): { tenant_id: string; agent_id: string 
   return { tenant_id: scope.tenant_id ?? 'system', agent_id: scope.agent_id ?? 'system' };
 }
 
-/** Passo → label `step`, colapsado no vocabulário fechado. */
+/**
+ * Passo → label `step`, colapsado no vocabulário fechado.
+ *
+ * Os dois PSEUDO-passos que também têm ledger — `create_run` e `cancel_run` —
+ * não estão em `ONBOARDING_STEP_VALUES` (que espelha `ONBOARDING_STEPS`, os
+ * passos da máquina de estados) e portanto colapsam em `other` na série de
+ * replay. É deliberado: alargar o vocabulário exigiria mexer em
+ * `src/observability/taxonomy.ts`, e o teste que pina `step ≡ ONBOARDING_STEPS`
+ * existe justamente para impedir que os dois conjuntos divirjam. Quem precisa
+ * distinguir "replay de criação" de "replay de cancelamento" tem o evento
+ * `step_replayed` e a auditoria, com o passo por extenso.
+ */
 function stepLabel(step: string): string {
   return closedVocabulary(step, ONBOARDING_STEP_VALUES);
 }
@@ -138,6 +155,10 @@ export type OnboardingRunView = {
   version: number;
   allowed_steps: OnboardingStep[];
   last_error_code: string | null;
+  /** O passo que falhou, quando a run está em `failed_retryable`. */
+  failed_step: string | null;
+  /** O estado de onde aquele passo partiu — diagnóstico para o operador. */
+  resume_state: string | null;
   created_at: string;
   updated_at: string;
   expires_at: string;
@@ -154,8 +175,17 @@ export function toRunView(run: OnboardingRunRow): OnboardingRunView {
     state: run.state as OnboardingState,
     current_step: run.current_step,
     version: run.version,
-    allowed_steps: allowedStepsFrom(run.state as OnboardingState),
+    // O ponto de retomada entra no cálculo: a partir de `failed_retryable` a UI
+    // só pode oferecer o retry do passo que falhou e as remediações declaradas
+    // (review do PR #541, achado 4). Passar só o estado, como antes, oferecia
+    // onze botões dos quais o backend recusaria dez.
+    allowed_steps: allowedStepsFrom(run.state as OnboardingState, {
+      failed_step: run.failed_step,
+      resume_state: run.resume_state,
+    }),
     last_error_code: run.last_error_code,
+    failed_step: run.failed_step,
+    resume_state: run.resume_state,
     created_at: run.created_at.toISOString(),
     updated_at: run.updated_at.toISOString(),
     expires_at: run.expires_at.toISOString(),
@@ -300,14 +330,35 @@ export type WizardDeps = {
 
 // ── Comandos ─────────────────────────────────────────────────────────────────
 
+/**
+ * O resultado da abertura da saga. `replayed` distingue "abri a run agora" de
+ * "esta run já existia e é a sua" — o cliente precisa saber qual dos dois para
+ * não contar duas aberturas, e a métrica idem.
+ */
+export type StartRunOutcome =
+  | { status: 'started'; run: OnboardingRunView; replayed: boolean }
+  | { status: 'conflict'; code: string; message: string; run?: OnboardingRunView };
+
+/**
+ * Abre a saga. IDEMPOTENTE (review do PR #541, achado 2): `idempotency_key` é
+ * obrigatória e opaca, exatamente como no `executeOnboardingStep`, e o retry
+ * com a mesma chave devolve a run JÁ MATERIALIZADA em vez de abrir outra.
+ *
+ * `metadata` deixou de ser `Record<string, unknown>` arbitrário: é um schema
+ * TIPADO com vocabulário fechado (`runMetadataSchema`), e só os campos
+ * aprovados são projetados para persistência (achado 5). Uma chave livre como
+ * `note` — que atravessava a denylist porque o NOME dela é inofensivo — passa
+ * a ser recusada na entrada.
+ */
 export async function startOnboardingRun(input: {
   kind: 'global_bootstrap' | 'tenant_onboarding';
   tenant_id: string | null;
   actor: OnboardingActor;
+  idempotency_key: string;
   correlation_id?: string;
   ttl_ms?: number;
-  metadata?: Record<string, unknown>;
-}): Promise<OnboardingRunView> {
+  metadata?: OnboardingRunMetadata;
+}): Promise<StartRunOutcome> {
   if (input.kind === 'global_bootstrap') {
     // O bootstrap global exige uma credencial de uso único e um endpoint
     // restrito, que NÃO fazem parte desta fatia. Recusar explicitamente é
@@ -319,14 +370,31 @@ export async function startOnboardingRun(input: {
   }
   assertMayMutate(input.actor, input.tenant_id);
   if (input.tenant_id !== null) assertTenantScope(input.tenant_id);
+  if (typeof input.idempotency_key !== 'string' || input.idempotency_key.length < 8) {
+    throw new OnboardingError(
+      'missing_idempotency_key',
+      'idempotency_key é obrigatória na criação da run (mínimo 8 caracteres)',
+    );
+  }
 
   const correlation_id = input.correlation_id ?? randomUUID();
+  // Contrato TIPADO + projeção explícita: o que não está no schema não chega
+  // ao banco. Lança `invalid_scope` antes de qualquer escrita.
+  const metadata = projectRunMetadata(input.metadata);
+  const idempotency_key_hash = hashIdempotencyKey(input.idempotency_key);
+  // O hash cobre a INTENÇÃO inteira da criação: reciclar a chave para outro
+  // tenant, outro kind ou outro metadata é conflito, não replay.
+  const payload_hash = hashPayload({
+    step: 'create_run',
+    payload: { kind: input.kind, tenant_id: input.tenant_id, metadata },
+  });
+
   const { schemaFingerprint } = await import('./readiness.js');
   const { loadSchemaState } = await import('./readiness-facts.js');
   // Veredito canônico do schema (#516) — o mesmo que o readiness consome.
   const schema = await loadSchemaState();
 
-  const run = await onboardingRunsRepo.create({
+  const created = await onboardingRunsRepo.create({
     kind: input.kind,
     tenant_id: input.tenant_id,
     agent_id: null,
@@ -336,14 +404,46 @@ export async function startOnboardingRun(input: {
     expires_at: new Date(Date.now() + (input.ttl_ms ?? DEFAULT_RUN_TTL_MS)),
     configuration_contract_version: ONBOARDING_CONTRACT_VERSION,
     schema_version: schemaFingerprint(schema),
-    metadata: input.metadata,
+    idempotency_key_hash,
+    payload_hash,
+    metadata,
   });
 
-  counter(METRIC.ONBOARDING_RUN_STARTED, {
-    kind: input.kind,
-    ...attribution({ tenant_id: run.tenant_id, agent_id: run.agent_id }),
-  });
-  return toRunView(run);
+  if (created.outcome === 'payload_conflict') {
+    return {
+      status: 'conflict',
+      code: 'idempotency_payload_mismatch',
+      message: 'a mesma idempotency key foi usada para abrir uma run diferente',
+      run: toRunView(created.run),
+    };
+  }
+  if (created.outcome === 'live_run_exists') {
+    // Existe outra run VIVA para o escopo inicial, aberta com OUTRA chave.
+    // `duplicate_tenant` é o código mais próximo do union fechado de
+    // `ONBOARDING_ERROR_CODES` — o vocabulário é espelhado pelas métricas
+    // (`src/observability/taxonomy.ts`), fora desta fatia, e inventar um código
+    // novo faria os dois conjuntos divergirem em silêncio.
+    return {
+      status: 'conflict',
+      code: 'duplicate_tenant',
+      message: 'já existe uma saga de onboarding viva para este tenant — retome ou cancele',
+    };
+  }
+
+  const run = created.run;
+  const replayed = created.outcome === 'replayed';
+  if (replayed) {
+    counter(METRIC.ONBOARDING_IDEMPOTENCY_REPLAY, {
+      step: stepLabel('create_run'),
+      ...attribution({ tenant_id: run.tenant_id, agent_id: run.agent_id }),
+    });
+  } else {
+    counter(METRIC.ONBOARDING_RUN_STARTED, {
+      kind: input.kind,
+      ...attribution({ tenant_id: run.tenant_id, agent_id: run.agent_id }),
+    });
+  }
+  return { status: 'started', run: toRunView(run), replayed };
 }
 
 export async function getOnboardingRun(input: {
@@ -373,13 +473,37 @@ export async function listOnboardingRuns(input: {
   return rows.map(toRunView);
 }
 
+/**
+ * Cancelamento — IDEMPOTENTE e com motivo de VOCABULÁRIO FECHADO (review do
+ * PR #541, achados 3 e 5).
+ *
+ * O que mudou, e por quê:
+ *   * `idempotency_key` passou a ser obrigatória. Sem ela, um retry após um
+ *     commit cujo resultado se perdeu encontrava a run já `cancelled` e
+ *     recebia `run_terminal` — um ERRO para uma operação que tinha dado certo.
+ *   * `reason_code` deixou de ser texto livre. Ele é persistido INTEGRALMENTE
+ *     em `onboarding_runs.last_error_code`, no evento append-only e em
+ *     `admin_audit_log`; enquanto era livre, "telefone/e-mail do cliente que
+ *     desistiu" entrava nas três — a denylist de `sanitize.ts` decide por NOME
+ *     de chave e nunca olhou esse valor. Agora o valor persistido é o mesmo
+ *     que vira label de métrica.
+ */
 export async function cancelOnboardingRun(input: {
   run_id: string;
   expected_version: number;
   actor: OnboardingActor;
-  reason_code: string;
+  reason_code: OnboardingCancelReason;
+  idempotency_key: string;
   correlation_id?: string;
 }): Promise<StepOutcome> {
+  const reason_code = parseCancelReason(input.reason_code);
+  if (typeof input.idempotency_key !== 'string' || input.idempotency_key.length < 8) {
+    throw new OnboardingError(
+      'missing_idempotency_key',
+      'idempotency_key é obrigatória no cancelamento (mínimo 8 caracteres)',
+    );
+  }
+
   const existing = await onboardingRunsRepo.getForScope({
     run_id: input.run_id,
     tenant_id: tenantFilterFor(input.actor),
@@ -394,14 +518,19 @@ export async function cancelOnboardingRun(input: {
     actor_id: input.actor.actor_id,
     actor_role: input.actor.actor_role,
     correlation_id: input.correlation_id ?? randomUUID(),
-    reason_code: input.reason_code.slice(0, 64),
+    reason_code,
+    idempotency_key_hash: hashIdempotencyKey(input.idempotency_key),
+    payload_hash: hashPayload({ step: 'cancel_run', payload: { reason_code } }),
   });
   if (outcome.outcome === 'committed') {
-    // `reason_code` é TEXTO ARBITRÁRIO do console. Ele vai inteiro (truncado em
-    // 64) para `onboarding_runs.last_error_code`, para o evento e para a
-    // auditoria; no label entra apenas o vocabulário fechado.
     counter(METRIC.ONBOARDING_RUN_CANCELLED, {
-      reason: reasonLabel(input.reason_code),
+      reason: reasonLabel(reason_code),
+      ...attribution(existing),
+    });
+  }
+  if (outcome.outcome === 'replayed') {
+    counter(METRIC.ONBOARDING_IDEMPOTENCY_REPLAY, {
+      step: stepLabel('cancel_run'),
       ...attribution(existing),
     });
   }
@@ -597,9 +726,15 @@ export async function executeOnboardingStep(input: {
                 audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: run.agent_id },
               };
             }
+            // O conjunto de canais VALIDADO pelo avaliador viaja junto: a
+            // ativação liga exatamente os canais que satisfizeram, cada um por
+            // si, política + papel ativo + posse provada, e confere esse mesmo
+            // conjunto contra o banco sob os locks antes de escrever (review do
+            // PR #541, achado 1).
             return applyActivate(tx, run, {
               configuration_fingerprint: readiness.configuration_fingerprint,
               schema_fingerprint: readiness.schema_fingerprint,
+              activatable_channel_ids: readiness.activatable_channel_ids,
             });
           }
           default: {
@@ -663,11 +798,20 @@ export async function executeOnboardingStep(input: {
         replayed: true,
       };
     case 'denied':
-      counter(METRIC.ONBOARDING_STEP_FAILED, {
-        step: stepLabel(step),
-        reason: reasonLabel(outcome.code),
-        ...attribution(outcome.run),
-      });
+      // Uma negativa REPLAYADA (retry da mesma chave após um commit cuja
+      // resposta se perdeu) não é uma nova recusa: contá-la inflaria
+      // `onboarding_step_failed_total` com retentativas do cliente. Ela ganha a
+      // série de replay, como qualquer outro resultado vindo do ledger.
+      counter(
+        outcome.replayed ? METRIC.ONBOARDING_IDEMPOTENCY_REPLAY : METRIC.ONBOARDING_STEP_FAILED,
+        outcome.replayed
+          ? { step: stepLabel(step), ...attribution(outcome.run) }
+          : {
+              step: stepLabel(step),
+              reason: reasonLabel(outcome.code),
+              ...attribution(outcome.run),
+            },
+      );
       if (readiness) {
         for (const failed of blockingFailures(readiness)) {
           counter(METRIC.AGENT_READINESS_FAILED, {

@@ -32,7 +32,7 @@
  */
 import { and, asc, desc, eq, isNull, lt, notInArray, or } from 'drizzle-orm';
 import { TERMINAL_STATES } from '@/onboarding/state-machine.js';
-import { db, withTx } from '../client.js';
+import { db, pgErrorCode, withTx } from '../client.js';
 import {
   admin_audit_log,
   onboarding_events,
@@ -131,8 +131,48 @@ export type CommitStepOutcome =
   | { outcome: 'payload_conflict'; run: OnboardingRunRow }
   | { outcome: 'version_conflict'; run: OnboardingRunRow }
   | { outcome: 'invalid_transition'; run: OnboardingRunRow; code: string; message: string }
-  | { outcome: 'denied'; run: OnboardingRunRow; code: string; message: string }
+  | {
+      outcome: 'denied';
+      run: OnboardingRunRow;
+      code: string;
+      message: string;
+      /**
+       * `true` quando a negativa veio do LEDGER (retry da mesma chave após um
+       * commit cujo resultado se perdeu), não de uma nova avaliação. Sem esta
+       * distinção o wizard contaria duas recusas na métrica para uma única
+       * decisão — e "quantas vezes o backend recusou" viraria "quantas vezes o
+       * cliente perdeu a resposta".
+       */
+      replayed?: boolean;
+    }
   | { outcome: 'not_found' };
+
+/**
+ * Os tipos de RESULTADO CONCLUSIVO que o ledger guarda
+ * (`onboarding_step_results.outcome_kind`, migration 113).
+ *
+ * Antes o ledger só recebia `success`, e o efeito disso era a assimetria que a
+ * review descreve: uma negativa avançava versão e estado sem deixar rastro
+ * replayável, então o retry da MESMA chave recebia `version_conflict` (a versão
+ * já era outra) em vez da negativa anterior — e a proteção contra reciclagem de
+ * chave (`idempotency_payload_mismatch`) desaparecia justo no caminho de recusa.
+ */
+export const STEP_RESULT_OUTCOMES = {
+  SUCCESS: 'success',
+  DENIED: 'denied',
+  CANCELLED: 'cancelled',
+} as const;
+
+/**
+ * O pseudo-passo sob o qual o CANCELAMENTO entra no ledger de idempotência.
+ *
+ * `onboarding_step_results.step` não tem CHECK (ver migration 109), e o unique
+ * `(run_id, step, idempotency_key_hash)` já é a chave certa — cancelar é um
+ * comando conclusivo da run como qualquer outro. Não é um passo da máquina de
+ * estados e por isso NÃO está em `ONBOARDING_STEPS`: nenhum `planTransition`
+ * jamais o vê.
+ */
+export const CANCEL_LEDGER_STEP = 'cancel_run';
 
 export type CommitStepInput = {
   run_id: string;
@@ -154,19 +194,114 @@ export type CommitStepInput = {
   apply: (tx: Tx, run: OnboardingRunRow) => Promise<StepApplication>;
 };
 
+export type CreateRunInput = {
+  kind: 'global_bootstrap' | 'tenant_onboarding';
+  tenant_id: string | null;
+  agent_id: string | null;
+  created_by: string;
+  actor_role: string;
+  correlation_id: string;
+  expires_at: Date;
+  configuration_contract_version: string;
+  schema_version: string;
+  /** SHA-256 da idempotency key opaca do cliente. Obrigatória. */
+  idempotency_key_hash: string;
+  /** SHA-256 canônico do payload de criação (kind + escopo + metadata). */
+  payload_hash: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type CreateRunOutcome =
+  | { outcome: 'created'; run: OnboardingRunRow }
+  /** Retry da MESMA chave: a run já materializada, sem segunda trilha. */
+  | { outcome: 'replayed'; run: OnboardingRunRow }
+  /** Mesma chave, payload divergente — a chave foi reciclada para outra intenção. */
+  | { outcome: 'payload_conflict'; run: OnboardingRunRow }
+  /** Já existe uma run VIVA para o escopo inicial, aberta com outra chave. */
+  | { outcome: 'live_run_exists' };
+
 export const onboardingRunsRepo = {
-  async create(input: {
-    kind: 'global_bootstrap' | 'tenant_onboarding';
+  /**
+   * Busca a run pela chave de criação, no ESCOPO INICIAL dela.
+   *
+   * O escopo entra na busca (e no índice único) porque a idempotency key é
+   * opaca e escolhida pelo CLIENTE: duas sessões administrativas de tenants
+   * diferentes podem legitimamente gerar a mesma chave, e deduplicá-las
+   * globalmente devolveria a run de OUTRO tenant para quem fizesse retry — um
+   * vazamento horizontal criado pela própria idempotência.
+   */
+  async findByCreationKey(input: {
+    kind: string;
     tenant_id: string | null;
-    agent_id: string | null;
-    created_by: string;
-    actor_role: string;
-    correlation_id: string;
-    expires_at: Date;
-    configuration_contract_version: string;
-    schema_version: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<OnboardingRunRow> {
+    idempotency_key_hash: string;
+  }): Promise<OnboardingRunRow | null> {
+    const rows = await db
+      .select()
+      .from(onboarding_runs)
+      .where(
+        and(
+          eq(onboarding_runs.kind, input.kind),
+          input.tenant_id === null
+            ? isNull(onboarding_runs.tenant_id)
+            : eq(onboarding_runs.tenant_id, input.tenant_id),
+          eq(onboarding_runs.creation_idempotency_key_hash, input.idempotency_key_hash),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Criação IDEMPOTENTE da run (review do PR #541, achado 2).
+   *
+   * O comando que ABRE a saga é mutável como qualquer outro, e o contrato da
+   * issue vale para ele: "cada comando mutável é idempotente" e "retry após
+   * timeout devolve o resultado anterior". Antes não valia — cada retry, cada
+   * duplo-clique no console, inseria outra run e outra trilha, e o único índice
+   * existente (`onboarding_runs_one_live_per_agent_uq`) tem predicado
+   * `agent_id IS NOT NULL`, isto é, não cobre a metade da saga que ainda não
+   * criou o agente.
+   *
+   * A ordem aqui é a mesma do `commitStep`: LEDGER PRIMEIRO. A busca pela chave
+   * acontece antes de qualquer escrita, e a corrida (dois retries simultâneos,
+   * ambos sem encontrar nada) é resolvida pelo índice único — o perdedor recebe
+   * 23505, relê pela chave e replaya a run do vencedor.
+   */
+  async create(input: CreateRunInput): Promise<CreateRunOutcome> {
+    const previous = await this.findByCreationKey({
+      kind: input.kind,
+      tenant_id: input.tenant_id,
+      idempotency_key_hash: input.idempotency_key_hash,
+    });
+    if (previous) {
+      return previous.creation_payload_hash === input.payload_hash
+        ? { outcome: 'replayed' as const, run: previous }
+        : { outcome: 'payload_conflict' as const, run: previous };
+    }
+
+    try {
+      return await this.insertRun(input);
+    } catch (err) {
+      if (pgErrorCode(err) !== '23505') throw err;
+      // Ou perdemos a corrida da MESMA chave (replay), ou esbarramos no índice
+      // de "uma run viva por escopo inicial" com uma chave DIFERENTE. Os dois
+      // casos são 23505 e precisam de respostas opostas, então desempatamos
+      // relendo pela chave.
+      const raced = await this.findByCreationKey({
+        kind: input.kind,
+        tenant_id: input.tenant_id,
+        idempotency_key_hash: input.idempotency_key_hash,
+      });
+      if (raced) {
+        return raced.creation_payload_hash === input.payload_hash
+          ? { outcome: 'replayed' as const, run: raced }
+          : { outcome: 'payload_conflict' as const, run: raced };
+      }
+      return { outcome: 'live_run_exists' as const };
+    }
+  },
+
+  async insertRun(input: CreateRunInput): Promise<{ outcome: 'created'; run: OnboardingRunRow }> {
     return withTx(async (tx) => {
       const [run] = await tx
         .insert(onboarding_runs)
@@ -181,6 +316,8 @@ export const onboardingRunsRepo = {
           metadata: sanitizeForPersistence(input.metadata ?? {}),
           configuration_contract_version: input.configuration_contract_version,
           schema_version: input.schema_version,
+          creation_idempotency_key_hash: input.idempotency_key_hash,
+          creation_payload_hash: input.payload_hash,
         })
         .returning();
       if (!run) throw new OnboardingError('run_not_found', 'INSERT não devolveu a run');
@@ -217,7 +354,7 @@ export const onboardingRunsRepo = {
         },
       });
 
-      return run;
+      return { outcome: 'created' as const, run };
     });
   },
 
@@ -358,6 +495,20 @@ export const onboardingRunsRepo = {
           to_state: run.state,
           summary: {},
         });
+        // O ledger guarda resultados conclusivos TIPADOS (migration 113): uma
+        // negativa replayada devolve a MESMA negativa, com o mesmo código e a
+        // mesma mensagem. Devolver `replayed`/`committed` aqui — como o código
+        // anterior faria se a linha existisse — transformaria uma recusa em
+        // sucesso na segunda tentativa.
+        if (previous.outcome_kind === STEP_RESULT_OUTCOMES.DENIED) {
+          return {
+            outcome: 'denied' as const,
+            run,
+            code: previous.outcome_code ?? 'readiness_blocked',
+            message: previous.outcome_message ?? 'passo recusado',
+            replayed: true,
+          };
+        }
         return {
           outcome: 'replayed' as const,
           run,
@@ -370,10 +521,17 @@ export const onboardingRunsRepo = {
         return { outcome: 'version_conflict' as const, run };
       }
 
-      // (5) Transição validada contra o estado TRAVADO.
+      // (5) Transição validada contra o estado TRAVADO — e, quando a origem é
+      // `failed_retryable`, contra o PONTO DE RETOMADA gravado na mesma row
+      // travada. É por isso que `failed_step` viaja daqui e não do chamador:
+      // qualquer coisa lida fora do lock seria TOCTOU.
       let plan;
       try {
-        plan = planTransition({ step: input.step, from: run.state as OnboardingState });
+        plan = planTransition({
+          step: input.step,
+          from: run.state as OnboardingState,
+          retry_point: { failed_step: run.failed_step, resume_state: run.resume_state },
+        });
       } catch (err) {
         const code = err instanceof OnboardingError ? err.code : 'invalid_transition';
         return {
@@ -392,6 +550,33 @@ export const onboardingRunsRepo = {
       const nextAgent = applied.scope_patch?.agent_id ?? run.agent_id;
 
       if (applied.deny) {
+        // O LEDGER PRIMEIRO, e ANTES de mexer em versão/estado: uma negativa é
+        // um resultado CONCLUSIVO. Sem esta linha, o retry da mesma chave caía
+        // na checagem de versão (já incrementada) e recebia `version_conflict`
+        // em vez da negativa anterior — e a mesma chave com payload diferente
+        // deixava de produzir `idempotency_payload_mismatch`.
+        await tx.insert(onboarding_step_results).values({
+          run_id: run.id,
+          tenant_id: nextTenant,
+          step: input.step,
+          idempotency_key_hash: input.idempotency_key_hash,
+          payload_hash: input.payload_hash,
+          result: sanitizeForPersistence(applied.result),
+          outcome_kind: STEP_RESULT_OUTCOMES.DENIED,
+          outcome_code: applied.deny.code,
+          outcome_message: applied.deny.message,
+        });
+
+        // Ponto de retomada (migration 113). Só faz sentido quando a negativa
+        // leva a `failed_retryable`: os estados de negativa PRÓPRIOS
+        // (`readiness_failed`) já dizem qual passo reexecutar pelo seu nome, e
+        // gravar um `failed_step` neles autorizaria retomadas que a máquina de
+        // estados não pretende.
+        const retryPoint =
+          plan.onDeny === 'failed_retryable'
+            ? { failed_step: input.step, resume_state: run.state }
+            : { failed_step: null, resume_state: null };
+
         const [denied] = await tx
           .update(onboarding_runs)
           .set({
@@ -400,6 +585,7 @@ export const onboardingRunsRepo = {
             version: run.version + 1,
             last_error_code: applied.deny.code,
             updated_at: now,
+            ...retryPoint,
           })
           .where(
             and(eq(onboarding_runs.id, run.id), eq(onboarding_runs.version, run.version)),
@@ -456,6 +642,7 @@ export const onboardingRunsRepo = {
         idempotency_key_hash: input.idempotency_key_hash,
         payload_hash: input.payload_hash,
         result: sanitizedResult,
+        outcome_kind: STEP_RESULT_OUTCOMES.SUCCESS,
       });
 
       const [updated] = await tx
@@ -467,6 +654,11 @@ export const onboardingRunsRepo = {
           tenant_id: nextTenant,
           agent_id: nextAgent,
           last_error_code: null,
+          // O passo commitou: o ponto de retomada anterior deixou de existir.
+          // Mantê-lo autorizaria, depois de uma falha futura em OUTRO passo, o
+          // retry de um passo já superado.
+          failed_step: null,
+          resume_state: null,
           updated_at: now,
           ...(applied.completes ? { completed_at: now } : {}),
         })
@@ -536,6 +728,10 @@ export const onboardingRunsRepo = {
     actor_role: string;
     correlation_id: string;
     reason_code: string;
+    /** SHA-256 da idempotency key opaca do cliente. Obrigatória — ver abaixo. */
+    idempotency_key_hash: string;
+    /** SHA-256 canônico de `{ reason_code }`. */
+    payload_hash: string;
   }): Promise<CommitStepOutcome> {
     return withTx(async (tx) => {
       const lockedRows = await tx
@@ -557,6 +753,47 @@ export const onboardingRunsRepo = {
       const run = lockedRows[0];
       if (!run) return { outcome: 'not_found' as const };
 
+      // LEDGER ANTES do estado terminal e ANTES da versão — a mesma ordem do
+      // `commitStep`, e pelo mesmo motivo. O cancelamento é um comando mutável:
+      // se a resposta se perde, o cliente repete com a MESMA chave. Sem esta
+      // consulta o retry via o estado já `cancelled` e recebia `run_terminal`,
+      // isto é, um ERRO para uma operação que na verdade tinha dado certo.
+      const ledger = await tx
+        .select()
+        .from(onboarding_step_results)
+        .where(
+          and(
+            eq(onboarding_step_results.run_id, run.id),
+            eq(onboarding_step_results.step, CANCEL_LEDGER_STEP),
+            eq(onboarding_step_results.idempotency_key_hash, input.idempotency_key_hash),
+          ),
+        )
+        .limit(1);
+      const previous = ledger[0];
+      if (previous) {
+        if (previous.payload_hash !== input.payload_hash) {
+          return { outcome: 'payload_conflict' as const, run };
+        }
+        await tx.insert(onboarding_events).values({
+          run_id: run.id,
+          tenant_id: run.tenant_id,
+          agent_id: run.agent_id,
+          step: CANCEL_LEDGER_STEP,
+          event_type: ONBOARDING_EVENT_TYPES.STEP_REPLAYED,
+          actor_id: input.actor_id,
+          correlation_id: input.correlation_id,
+          idempotency_key_hash: input.idempotency_key_hash,
+          from_state: run.state,
+          to_state: run.state,
+          summary: {},
+        });
+        return {
+          outcome: 'replayed' as const,
+          run,
+          result: (previous.result ?? {}) as Record<string, unknown>,
+        };
+      }
+
       if ((TERMINAL_STATES as readonly string[]).includes(run.state)) {
         return {
           outcome: 'invalid_transition' as const,
@@ -570,6 +807,20 @@ export const onboardingRunsRepo = {
       }
 
       const now = new Date();
+      const cancelResult = { cancelled_at: now.toISOString(), reason_code: input.reason_code };
+
+      await tx.insert(onboarding_step_results).values({
+        run_id: run.id,
+        tenant_id: run.tenant_id,
+        step: CANCEL_LEDGER_STEP,
+        idempotency_key_hash: input.idempotency_key_hash,
+        payload_hash: input.payload_hash,
+        result: sanitizeForPersistence(cancelResult),
+        outcome_kind: STEP_RESULT_OUTCOMES.CANCELLED,
+        outcome_code: input.reason_code,
+        outcome_message: 'run cancelada pelo operador',
+      });
+
       const [cancelled] = await tx
         .update(onboarding_runs)
         .set({
@@ -578,6 +829,9 @@ export const onboardingRunsRepo = {
           cancelled_at: now,
           updated_at: now,
           last_error_code: input.reason_code,
+          // Uma run cancelada é terminal: não há o que retomar.
+          failed_step: null,
+          resume_state: null,
         })
         .where(and(eq(onboarding_runs.id, run.id), eq(onboarding_runs.version, run.version)))
         .returning();
@@ -614,7 +868,13 @@ export const onboardingRunsRepo = {
         },
       });
 
-      return { outcome: 'committed' as const, run: cancelled ?? run, result: {} };
+      return {
+        outcome: 'committed' as const,
+        run: cancelled ?? run,
+        // O MESMO objeto que o replay devolverá: o retry pós-commit precisa
+        // enxergar a resposta original, não um `{}` que o cliente não sabe ler.
+        result: sanitizeForPersistence(cancelResult),
+      };
     });
   },
 
@@ -661,6 +921,9 @@ export const onboardingRunsRepo = {
             cancelled_at: now,
             updated_at: now,
             last_error_code: 'expired',
+            // Terminal: não há ponto de retomada a preservar.
+            failed_step: null,
+            resume_state: null,
           })
           .where(and(eq(onboarding_runs.id, run.id), eq(onboarding_runs.version, run.version)));
         await tx.insert(onboarding_events).values({

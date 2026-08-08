@@ -210,7 +210,7 @@ dRepo('onboarding — isolamento pelo repo', () => {
       c.release();
     }
 
-    const run = await onboardingRunsRepo.create({
+    const created_run = await onboardingRunsRepo.create({
       kind: 'tenant_onboarding',
       tenant_id: T_A,
       agent_id: null,
@@ -220,7 +220,11 @@ dRepo('onboarding — isolamento pelo repo', () => {
       expires_at: new Date(Date.now() + 3_600_000),
       configuration_contract_version: '1',
       schema_version: 'sf',
+      idempotency_key_hash: `leak-${Date.now()}`,
+      payload_hash: 'leak-payload',
     });
+    if (created_run.outcome !== 'created') throw new Error(`run não criada: ${created_run.outcome}`);
+    const run = created_run.run;
     created.push(run.id);
 
     expect(await onboardingRunsRepo.getForScope({ run_id: run.id, tenant_id: T_B })).toBeNull();

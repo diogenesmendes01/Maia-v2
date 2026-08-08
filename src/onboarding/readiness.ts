@@ -25,6 +25,32 @@
  * / `'system'`) NÃO devolve `ready:false` — lança `OnboardingError`. Devolver
  * um relatório para um escopo proibido convidaria um caller a renderizar
  * "quase pronto" para um alvo que nunca pode existir.
+ *
+ * ─── DECISÃO DE POLÍTICA: canal inválido é EXCLUÍDO, não bloqueante ──────────
+ * (Review adversarial do PR #541, achado 1 — a pergunta em aberto era se um
+ * canal governado inválido deveria BLOQUEAR o agente inteiro.)
+ *
+ * A regra implementada, e o contrato que os consumidores podem assumir:
+ *
+ *   1. os predicados de canal (política do mesmo escopo + `default_role_id`
+ *      resolvendo para papel ATIVO + posse da linha provada) precisam valer
+ *      PARA O MESMO CANAL. A conjunção é por canal, nunca agregada;
+ *   2. o agente fica `ready` quando existe PELO MENOS UM canal que satisfaz a
+ *      conjunção inteira;
+ *   3. a ativação liga EXATAMENTE esses canais (`activatable_channel_ids`).
+ *      Um canal governado que falhe qualquer predicado NÃO é ativado —
+ *      continua `active=false`, isto é, fora do roteamento;
+ *   4. a exclusão é EXPLÍCITA no veredito: `AgentReadiness.channels` traz o
+ *      veredito por canal com os códigos que ele reprovou, e a mensagem do
+ *      check `channel_ownership_proven` enumera os excluídos.
+ *
+ * Por que não a alternativa "todos os canais governados precisam estar
+ * prontos": porque ela transforma um canal quebrado em um agente inteiro
+ * parado. Um tenant com três linhas, uma delas com o pareamento vencido, não
+ * consegue ativar NENHUMA — e a remediação óbvia vira apagar a linha ruim
+ * (destrutivo) em vez de consertá-la. A regra escolhida é fail-closed no que
+ * importa (nada roteia sem posse E papel válido) e permissiva só no que é
+ * seguro (o agente sobe com as linhas que estão de fato prontas).
  */
 import { createHash } from 'node:crypto';
 import { canonicalJson } from './idempotency.js';
@@ -69,12 +95,51 @@ export type ReadinessCheck = {
   remediation: string;
 };
 
+/**
+ * O veredito POR CANAL. Existe porque os checks de canal são um conjunto de
+ * predicados que precisam valer PARA O MESMO canal, e um veredito agregado não
+ * consegue dizer isso (ver `evaluateReadinessFacts`, seção 6/7).
+ *
+ * `activatable` é a conjunção — e é o ÚNICO critério de ativação: a saga liga
+ * exatamente os canais com `activatable: true`, nunca "os que têm política".
+ */
+export type ChannelVerdict = {
+  channel_id: string;
+  /** Existe `channel_policy` do MESMO (tenant, agente) apontando para o canal. */
+  policy_governed: boolean;
+  /** TODA política do canal resolve para um papel ATIVO do mesmo escopo. */
+  policy_role_active: boolean;
+  /** `channel_line_state.state` prova posse da linha (#518). */
+  ownership_proven: boolean;
+  /** Socket de pé agora. Advisório — não entra em `activatable`. */
+  online: boolean;
+  /** `policy_governed && policy_role_active && ownership_proven`. */
+  activatable: boolean;
+  /**
+   * Os códigos de check que ESTE canal reprovou. Vazio ⟺ `activatable`. É o
+   * que torna a exclusão de um canal governado EXPLÍCITA no veredito, em vez
+   * de invisível dentro de um agregado verde.
+   */
+  failed_checks: ReadinessCheckCode[];
+};
+
 export type AgentReadiness = {
   tenant_id: string;
   agent_id: string;
   /** `true` ⟺ TODO check `blocking` está `pass`. Advisórios não bloqueiam. */
   ready: boolean;
   checks: ReadinessCheck[];
+  /**
+   * O veredito de CADA canal declarado do escopo (exceto a sonda sintética).
+   * Fonte única da decisão de ativação e da explicação ao operador.
+   */
+  channels: ChannelVerdict[];
+  /**
+   * Os canais integralmente válidos — o conjunto EXATO que `applyActivate`
+   * liga. Um canal governado que não esteja aqui NÃO é ativado, por decisão
+   * de política (fail-closed), e o motivo está no seu `ChannelVerdict`.
+   */
+  activatable_channel_ids: string[];
   evaluated_at: string;
   /**
    * SHA-256 da projeção canônica da configuração que governa este agente.
@@ -358,12 +423,74 @@ export function evaluateReadinessFacts(
   );
 
   const scopedPolicies = facts.policies.filter((p) => owns(p, req));
-  // Um canal é "governado" quando existe política DO MESMO escopo apontando
-  // para ele. Cruzar canal de um agente com política de outro é precisamente o
-  // falso positivo que a issue descreve.
-  const governedChannels = scopedChannels.filter((c) =>
-    scopedPolicies.some((p) => p.channel_id === c.id),
-  );
+  const activeRoleIds = new Set(scopedRoles.filter((r) => r.active).map((r) => r.id));
+
+  // ─── A CONJUNÇÃO É POR CANAL (review adversarial do PR #541, achado 1) ─────
+  //
+  // O defeito anterior: `channel_policy_role_active` e `channel_ownership_proven`
+  // eram dois `.some()` INDEPENDENTES sobre o conjunto de canais governados.
+  // Dois canais do MESMO (tenant, agente) bastavam para pintar tudo de verde
+  // sem que nenhum dos dois fosse operável:
+  //
+  //   canal A — política aponta para papel ATIVO, mas a linha nunca provou
+  //             posse  ⇒ satisfaz `channel_policy_role_active`;
+  //   canal B — linha `connected` (posse provada), mas a política aponta para
+  //             papel INATIVO ⇒ satisfaz `channel_ownership_proven`.
+  //
+  // Os dois checks passavam, `ready` ficava `true`, e a ativação (que
+  // selecionava canais só pela EXISTÊNCIA de política) ligava os dois: A
+  // passava a rotear sem posse da linha e B com papel inválido. Era o mesmo
+  // falso positivo por composição cruzada que este módulo existe para matar —
+  // só que INTRA-agente, e por isso invisível para os testes cross-tenant e
+  // cross-agent.
+  //
+  // Agora cada canal recebe um veredito PRÓPRIO e os checks agregados
+  // perguntam "existe UM canal que satisfaz a conjunção inteira?".
+  //
+  // Note o `every` (e não `some`) em `policy_role_active`: hoje
+  // `channel_policies` tem unique em `channel_id`, então há no máximo uma
+  // política por canal e os dois quantificadores coincidem. `every` é a
+  // escolha fail-closed para o dia em que esse unique mudar — um canal com uma
+  // política válida e outra apontando para papel inativo é ambíguo, e ambíguo
+  // não roteia.
+  const channelVerdicts: ChannelVerdict[] = scopedChannels.map((c) => {
+    const policies = scopedPolicies.filter((p) => p.channel_id === c.id);
+    const policy_governed = policies.length > 0;
+    const policy_role_active =
+      policy_governed && policies.every((p) => activeRoleIds.has(p.default_role_id));
+    const ownership_proven =
+      c.line_state !== null &&
+      (OWNERSHIP_PROVEN_LINE_STATES as readonly string[]).includes(c.line_state);
+    const online = c.line_state === 'connected';
+    const failed_checks: ReadinessCheckCode[] = [];
+    if (!policy_governed) failed_checks.push('channel_policy_resolved');
+    if (!policy_role_active) failed_checks.push('channel_policy_role_active');
+    if (!ownership_proven) failed_checks.push('channel_ownership_proven');
+    return {
+      channel_id: c.id,
+      policy_governed,
+      policy_role_active,
+      ownership_proven,
+      online,
+      activatable: policy_governed && policy_role_active && ownership_proven,
+      failed_checks,
+    };
+  });
+
+  const governedChannels = channelVerdicts.filter((v) => v.policy_governed);
+  const roleOkChannels = governedChannels.filter((v) => v.policy_role_active);
+  const activatableChannels = channelVerdicts.filter((v) => v.activatable);
+  // Governados que ficaram de fora: a decisão de política é FAIL-CLOSED — eles
+  // não são ativados, e a exclusão é dita em voz alta na mensagem do check e
+  // em `AgentReadiness.channels`.
+  const excludedGoverned = governedChannels.filter((v) => !v.activatable);
+  const excludedNote =
+    excludedGoverned.length > 0
+      ? ` (${excludedGoverned.length} canal(is) governado(s) EXCLUÍDO(S) da ativação: ${excludedGoverned
+          .map((v) => `${v.channel_id}[${v.failed_checks.join('+')}]`)
+          .join(', ')})`
+      : '';
+
   checks.push(
     check(
       'channel_policy_resolved',
@@ -371,22 +498,18 @@ export function evaluateReadinessFacts(
       'blocking',
       'nenhum canal deste agente tem channel_policy do mesmo escopo',
       'Crie a política do canal (o wizard a materializa junto com `declare_channel`).',
-      'política de canal resolvida',
+      `política de canal resolvida em ${governedChannels.length} canal(is)`,
     ),
   );
 
-  const activeRoleIds = new Set(scopedRoles.filter((r) => r.active).map((r) => r.id));
-  const policyRoleOk = governedChannels.some((c) =>
-    scopedPolicies.some((p) => p.channel_id === c.id && activeRoleIds.has(p.default_role_id)),
-  );
   checks.push(
     check(
       'channel_policy_role_active',
-      policyRoleOk,
+      roleOkChannels.length > 0,
       'blocking',
-      'o `default_role_id` da política não resolve para um papel ATIVO deste agente',
+      'nenhum canal governado deste agente tem política apontando para um papel ATIVO',
       'Reative o papel padrão ou aponte a política para um papel ativo do mesmo (tenant, agente).',
-      'papel padrão da política ativo',
+      `papel padrão da política ativo em ${roleOkChannels.length} canal(is)`,
     ),
   );
 
@@ -394,25 +517,26 @@ export function evaluateReadinessFacts(
   // POSSE provada é bloqueante: sem ela a linha não é do agente.
   // ONLINE é advisório: um socket caído é operacional e se recupera sozinho;
   // bloquear a ativação por causa dele impediria configurar fora do ar.
-  const ownershipProven = governedChannels.some(
-    (c) => c.line_state !== null && (OWNERSHIP_PROVEN_LINE_STATES as readonly string[]).includes(c.line_state),
-  );
+  //
+  // Este é o check que FECHA a conjunção: ele não pergunta "alguma linha
+  // governada provou posse?", mas "algum canal governado com papel ativo
+  // provou posse?" — o mesmo canal, os três predicados.
   checks.push(
     check(
       'channel_ownership_proven',
-      ownershipProven,
+      activatableChannels.length > 0,
       'blocking',
-      'nenhuma linha governada deste agente provou posse (pareamento não concluído)',
-      'Conclua o pareamento da linha (passo `start_pairing` → `confirm_channel_ready`).',
-      'posse da linha provada',
+      `nenhum canal deste agente satisfaz política + papel ativo + posse provada AO MESMO TEMPO${excludedNote}`,
+      'Conclua o pareamento da linha governada (passo `start_pairing` → `confirm_channel_ready`) e garanta que a política DELA aponte para um papel ativo.',
+      `${activatableChannels.length} canal(is) integralmente válido(s)${excludedNote}`,
     ),
   );
   checks.push(
     check(
       'channel_online',
-      governedChannels.some((c) => c.line_state === 'connected'),
+      activatableChannels.some((v) => v.online),
       'advisory',
-      'nenhuma linha governada está conectada no momento',
+      'nenhum canal integralmente válido está conectado no momento',
       'A linha reconecta sozinha; se persistir, use `repair` no console de linhas.',
       'linha conectada',
     ),
@@ -467,6 +591,11 @@ export function evaluateReadinessFacts(
     agent_id: req.agent_id,
     ready,
     checks,
+    channels: channelVerdicts,
+    // O conjunto que a ativação vai ligar — nada mais, nada menos. Ordenado
+    // para que o veredito seja determinístico (ele é comparado, logado e
+    // conferido contra o que a transação relê sob o lock).
+    activatable_channel_ids: activatableChannels.map((v) => v.channel_id).sort(),
     evaluated_at: now.toISOString(),
     configuration_fingerprint: configurationFingerprint(facts),
     schema_fingerprint: schemaFingerprint(facts.schema),

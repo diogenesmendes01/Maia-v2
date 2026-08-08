@@ -101,7 +101,58 @@ Gerar uma chave nova nessa situação é o erro clássico — você recebe
 | `readiness_blocked` | checks bloqueantes vermelhos | Cada check traz `remediation`. Corrija e rode `evaluate_readiness` de novo |
 | `run_terminal` | `active` / `cancelled` / `failed_terminal` | Runs terminais não são retomadas. Abra uma nova |
 | `pairing_in_progress` | já há pareamento vivo (ou um abort pendente) nessa linha | A run foi para `failed_retryable`. Aborte o pareamento anterior no console de linhas e rode `start_pairing` de novo |
-| `activation_precondition_failed` | a configuração mudou entre a avaliação e a escrita: nenhuma linha governada sobrou | A run está em `readiness_failed` e **nada foi escrito** (agente segue `provisioning`, canal segue inativo). Confira `channel_policies` do par e rode `evaluate_readiness` de novo |
+| `duplicate_tenant` (em `startOnboardingRun`) | já existe uma saga VIVA para esse tenant, aberta com outra chave | Retome a run existente (`listOnboardingRuns`) ou cancele-a. Ver §2.1 |
+| `activation_precondition_failed` | a configuração mudou entre a avaliação e a escrita: ou não sobrou nenhuma linha integralmente válida, ou o conjunto válido **divergiu** do que o readiness aprovou | A run está em `readiness_failed` e **nada foi escrito** (agente segue `provisioning`, canais seguem inativos). Confira `channel_policies`, o papel padrão e `channel_line_state` do par e rode `evaluate_readiness` de novo |
+
+### 2.1 `failed_retryable`: só o passo que FALHOU volta a ser legal
+
+Uma run em `failed_retryable` guarda **onde parou**, em duas colunas:
+
+```sql
+SELECT id, state, failed_step, resume_state, last_error_code
+  FROM onboarding_runs WHERE id = '<run_id>';
+```
+
+- `failed_step` — o passo que o backend recusou. É ele (e só ele) que pode ser
+  reexecutado, mais as remediações declaradas para ele;
+- `resume_state` — o estado de onde aquele passo partiu, para diagnóstico.
+
+`getOnboardingRun().allowed_steps` já devolve exatamente esse conjunto: **use a
+lista do backend**, não deduza. Hoje a única remediação declarada é
+`confirm_channel_ready → start_pairing` (refazer o pareamento da MESMA linha).
+
+Se `allowed_steps` vier **vazio** com a run em `failed_retryable`, a run é
+irretomável (não há `failed_step` gravado — só runs anteriores à migration 113
+conseguem estar nesse estado): cancele-a e abra uma nova. Os recursos já
+provisionados permanecem.
+
+Por que não é possível "voltar um passo": `provision_tenant`, `provision_admin`,
+`declare_channel` e afins reexecutados fora de ordem duplicam governança
+(segundo admin, segundo canal) ou rebobinam o estado materializado. O backend
+responde `invalid_transition` e **nada roda** — o passo nem chega à escrita.
+
+### 2.2 Abrir a saga também é idempotente
+
+```
+startOnboardingRun({ kind, tenant_id, actor, idempotency_key, metadata })
+→ { status: 'started', run, replayed }   |   { status: 'conflict', code, message }
+```
+
+- `replayed: true` ⇒ a run já existia e é **a sua** (mesma chave). Nenhuma
+  segunda run, nenhum segundo evento, nenhuma segunda linha de auditoria.
+- `idempotency_payload_mismatch` ⇒ a mesma chave foi usada para abrir uma run
+  **diferente** (outro tenant, outro kind, outro `metadata`). Gere uma chave nova
+  para a nova intenção.
+- `duplicate_tenant` ⇒ existe outra saga viva para o tenant, aberta com outra
+  chave. O banco garante isso com dois índices parciais complementares:
+  `onboarding_runs_one_live_per_tenant_uq` (run viva **sem** agente) e
+  `onboarding_runs_one_live_per_agent_uq` (run viva por par completo).
+
+`metadata` é um contrato **fechado**: `source` (`console|cli|api|automation`),
+`intent` opcional (`new_tenant|reonboarding|migration|evaluation`) e
+`ticket_ref` opcional no formato `ABC-123`. Qualquer outra chave é recusada com
+`invalid_scope` — não existe campo de texto livre aqui, de propósito (o valor
+seria persistido em `onboarding_runs.metadata`).
 
 ## 3. Readiness reprovado
 
@@ -115,8 +166,8 @@ Os vermelhos mais comuns num onboarding novo:
 |---|---|
 | `profile_active` | aprove e ative a versão do profile (o passo `configure_profile` faz isso) |
 | `default_role_resolved` | exatamente UM papel `is_default` + `active`. Dois papéis default é ambiguidade, não redundância |
-| `channel_policy_role_active` | o papel padrão da política foi desativado. Reative-o ou reaponte a política |
-| `channel_ownership_proven` | a linha não concluiu o pareamento. Veja `channel_line_state.state` |
+| `channel_policy_role_active` | **nenhum** canal governado tem política apontando para papel ativo. Reative o papel ou reaponte a política |
+| `channel_ownership_proven` | **nenhum canal satisfaz os três predicados AO MESMO TEMPO** (política + papel ativo + posse). A mensagem NOMEIA os canais governados excluídos e o que faltou em cada um — leia `readiness.channels[]` para o veredito por canal. Dois canais "cobrindo" predicados diferentes NÃO valem: a conjunção é por canal |
 | `schema_ready` | **leia a mensagem antes de rodar migrate** — ver §3.1 |
 | `governance_no_blocking_pending` | há alerta de drift `critical` sem `resolved_at` para o agente |
 | `agent_exists` / `agent_belongs_to_tenant` | os dois vermelhos juntos = **não existe agente com esse id neste par**. O readiness NÃO diz se ele existe em outro tenant (seria vazamento de existência) — ver §3.2 |
@@ -178,11 +229,30 @@ e é assim que o ciclo corrigir→reavaliar funciona.
 ## 4. Cancelar
 
 ```
-cancelOnboardingRun({ run_id, expected_version, actor, reason_code })
+cancelOnboardingRun({ run_id, expected_version, actor, reason_code, idempotency_key })
 ```
 
 O que o cancelamento faz: encerra a run em `cancelled`, grava o motivo em
 `last_error_code` e registra evento + auditoria.
+
+**`idempotency_key` é obrigatória**, como em qualquer comando mutável. Se você
+não sabe se o cancelamento commitou, repita com a MESMA chave: volta
+`replayed: true` com o resultado anterior, e não `run_terminal`. O ledger vive em
+`onboarding_step_results` sob o pseudo-passo `cancel_run`:
+
+```sql
+SELECT outcome_kind, outcome_code, created_at
+  FROM onboarding_step_results
+ WHERE run_id = '<run_id>' AND step = 'cancel_run';
+```
+
+**`reason_code` é vocabulário FECHADO** — hoje `operator_abort` (operador) e
+`expired` (varredura de runs vencidas). Qualquer outra coisa é recusada com
+`invalid_scope`, **antes** de qualquer escrita. Não é burocracia: o motivo é
+persistido integralmente em `onboarding_runs.last_error_code`, no evento
+append-only e em `admin_audit_log`, e enquanto ele era texto livre "cliente
++55… desistiu" entrava nas três. O valor persistido é agora o MESMO que vira
+label de métrica — trilha e série contam a mesma história.
 
 O que ele **não** faz: desprovisionar. Isso é deliberado. Nenhum recurso criado
 pela saga é exclusivo dela — o tenant, o agente ou a linha podem já estar em uso
@@ -233,11 +303,28 @@ A ordem importa.
 3. **Não apague tabelas nem eventos.** Runs existentes continuam legíveis e
    podem ser concluídas ou canceladas normalmente — o módulo não altera nenhum
    caminho de provisionamento anterior.
-4. **Só então**, se realmente necessário, `migrations/109_onboarding_runs_down.sql`.
+4. **Antes de 109, reverta 113 se for o caso.**
+   `migrations/113_onboarding_idempotent_creation_down.sql` derruba o ledger de
+   criação, a unicidade do escopo inicial, o `outcome_kind` do ledger de passos e
+   o ponto de retomada. Ele **apaga** as linhas de `onboarding_step_results` com
+   `outcome_kind <> 'success'` de propósito: sem a coluna, uma negativa e um
+   cancelamento seriam indistinguíveis de sucesso no replay — perder o replay de
+   uma negativa é ruim, devolver "concluído" no lugar dela é pior. Meça o
+   estrago antes:
+
+   ```sql
+   SELECT state, count(*) FROM onboarding_runs WHERE failed_step IS NOT NULL GROUP BY state;
+   SELECT outcome_kind, count(*) FROM onboarding_step_results
+    WHERE outcome_kind <> 'success' GROUP BY outcome_kind;
+   ```
+
+   Runs em `failed_retryable` perdem o ponto de retomada: cancele-as e reabra,
+   não tente "consertá-las".
+5. **Só então**, se realmente necessário, `migrations/109_onboarding_runs_down.sql`.
    Ele derruba as três tabelas e **não** desprovisiona nada: tenants, agentes,
    profiles, papéis, políticas e canais criados por uma run permanecem. O
    sistema volta ao provisionamento manual router-a-router.
-5. **`migrations/110_agents_status_provisioning_down.sql` só depois disso**, e
+6. **`migrations/110_agents_status_provisioning_down.sql` só depois disso**, e
    sabendo o que ele faz: agentes parados em `agents.status='provisioning'`
    viram `paused`, porque o vocabulário antigo não tem como dizer "em
    onboarding" e `active` colocaria em serviço um agente sem profile, sem papel

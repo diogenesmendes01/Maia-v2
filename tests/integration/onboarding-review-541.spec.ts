@@ -234,7 +234,14 @@ d('[High] a leitura de `agents` não vaza existência entre tenants', () => {
     const { applyProvisionAgent } = await import('../../src/onboarding/provisioning.js');
 
     const actor = { actor_id: ACTOR_ID, actor_role: 'owner' as const, tenant_id: T };
-    const view = await startOnboardingRun({ kind: 'tenant_onboarding', tenant_id: T, actor });
+    const started = await startOnboardingRun({
+      kind: 'tenant_onboarding',
+      tenant_id: T,
+      actor,
+      idempotency_key: `rev541-agent-${Date.now()}`,
+    });
+    if (started.status !== 'started') throw new Error('run não abriu');
+    const view = started.run;
     createdRuns.push(view.id);
 
     const c = await pool.connect();
@@ -344,7 +351,14 @@ async function driveToChannelReady(suffix: string, line: string): Promise<SagaSt
   tenants.add(tenant);
   const actor = { actor_id: ACTOR_ID, actor_role: 'owner' as const, tenant_id: tenant };
 
-  const view = await startOnboardingRun({ kind: 'tenant_onboarding', tenant_id: tenant, actor });
+  const started = await startOnboardingRun({
+    kind: 'tenant_onboarding',
+    tenant_id: tenant,
+    actor,
+    idempotency_key: `rev541-drive-${tenant}-${Date.now()}`,
+  });
+  if (started.status !== 'started') throw new Error('run não abriu');
+  const view = started.run;
   createdRuns.push(view.id);
 
   let version = view.version;

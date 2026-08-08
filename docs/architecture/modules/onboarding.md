@@ -40,11 +40,13 @@ O que `scripts/setup.ts` ganhou foi **uma linha de verdade**: no fim ele imprime
 | `src/db/repositories/onboarding-repos.ts` | `commitStep` — a transação curta que dá atomicidade à saga |
 | `migrations/109_onboarding_runs.sql` | `onboarding_runs`, `onboarding_events`, `onboarding_step_results` |
 | `migrations/110_agents_status_provisioning.sql` | `agents.status` passa a admitir `provisioning` — com a auditoria dos consumidores no cabeçalho |
+| `migrations/113_onboarding_idempotent_creation.sql` | ledger de criação na run, unicidade do escopo inicial sem agente, `outcome_kind` no ledger de passos e o ponto de retomada (`failed_step`/`resume_state`) |
 | `tests/unit/onboarding/_migration-schema.ts` | Lê `CHECK`s e colunas `uuid` de `migrations/*.sql` para as suítes SEM banco |
 | `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` | Literais do código ⊆ `CHECK` real, sem banco |
 | `tests/unit/onboarding/audit-fk-safety.spec.ts` | `tx` falso **com integridade referencial**: a auditoria nunca referencia tenant inexistente |
 | `tests/unit/onboarding/metrics-taxonomy.spec.ts` | vocabulários fechados ≡ constantes do código; texto livre/PII nunca vira label |
-| `tests/integration/onboarding-review-541.spec.ts` | as cinco correções da review do PR #541, contra Postgres real |
+| `tests/integration/onboarding-review-541.spec.ts` | as cinco correções da 1ª rodada de review do PR #541, contra Postgres real |
+| `tests/integration/onboarding-review-541-round2.spec.ts` | as cinco correções da 2ª rodada (conjunção por canal, criação idempotente, resultados conclusivos, ponto de retomada, entradas tipadas) |
 
 ## O contrato de readiness (para #517)
 
@@ -54,6 +56,9 @@ import { evaluateAgentReadiness } from '@/onboarding/index.js';
 const r = await evaluateAgentReadiness({ tenant_id, agent_id });
 // r.ready: boolean — true ⟺ todo check `blocking` passou
 // r.checks: { code, status: 'pass'|'fail', severity: 'blocking'|'advisory', message, remediation }[]
+// r.channels: veredito POR CANAL — { channel_id, policy_governed, policy_role_active,
+//                                    ownership_proven, online, activatable, failed_checks[] }
+// r.activatable_channel_ids: os canais que a ativação vai ligar — e SÓ eles
 // r.evaluated_at, r.configuration_fingerprint, r.schema_fingerprint
 ```
 
@@ -74,12 +79,45 @@ Escopo inválido (vazio, com whitespace, ou os literais `'default'`/`'system'`) 
 | `default_role_resolved` | blocking | **exatamente um** papel `is_default` + `active` |
 | `channel_declared` | blocking | ≥1 canal não-sintético do par |
 | `channel_policy_resolved` | blocking | política DO MESMO par apontando para esse canal |
-| `channel_policy_role_active` | blocking | o `default_role_id` resolve para papel ativo do par |
-| `channel_ownership_proven` | blocking | linha em `connected` ou `verified_offline` (#518) |
-| `channel_online` | advisory | linha `connected` agora — socket caído se recupera sozinho |
+| `channel_policy_role_active` | blocking | **existe um canal** cuja política resolve para papel ativo do par |
+| `channel_ownership_proven` | blocking | **existe um canal que satisfaz os TRÊS predicados de canal ao mesmo tempo** — política + papel ativo + posse (`connected`/`verified_offline`, #518). Ver [A conjunção é por canal](#a-conjunção-é-por-canal) |
+| `channel_online` | advisory | algum canal ativável está `connected` agora — socket caído se recupera sozinho |
 | `schema_ready` | blocking | o **veredito canônico** de `src/migrations/` (`getSchemaReadiness`) — ver [Schema](#schema_ready-consome-o-veredito-canônico-nunca-schema_migrations) |
 | `governance_no_blocking_pending` | blocking | nenhum alerta de drift `critical` sem `resolved_at` |
 | `agent_activated` | advisory | `agents.status='active'` — advisório porque readiness é a PRECONDIÇÃO da ativação. O agente criado pela saga nasce em `agents.status='provisioning'` (`migrations/110_agents_status_provisioning.sql`), um estado distinto de `paused` (= esteve ativo e foi parado) |
+
+### A conjunção é por canal
+
+Os predicados de canal (`channel_policy_resolved`, `channel_policy_role_active`,
+`channel_ownership_proven`) precisam valer **para o MESMO canal**. Enquanto eles
+eram três `.some()` independentes sobre o conjunto de canais governados, dois
+canais do mesmo agente podiam **dividir entre si** o papel válido e a posse
+provada — canal A com política → papel ativo mas sem posse, canal B com posse
+mas com política → papel inativo — e o agregado ficava verde sem que **nenhum**
+dos dois fosse operável. Pior: a ativação selecionava os canais só pela
+existência de política e ligava os dois.
+
+O contrato, agora:
+
+1. cada canal recebe um **veredito próprio** (`AgentReadiness.channels`);
+2. `ready` exige **pelo menos um** canal com a conjunção inteira satisfeita;
+3. a ativação liga **exatamente** `activatable_channel_ids` — e `applyActivate`
+   re-deriva o mesmo conjunto contra o banco, sob os locks, recusando (`deny`)
+   se os dois divergirem;
+4. **fail-closed por decisão de política**: um canal governado inválido **não é
+   ativado** (continua `active=false`, fora do roteamento) e a exclusão aparece
+   no veredito — em `channels[].failed_checks` e, nomeada, na mensagem de
+   `channel_ownership_proven`.
+
+A alternativa considerada e **recusada** foi "todos os canais governados
+precisam estar prontos". Ela transforma um canal quebrado num agente inteiro
+parado: um tenant com três linhas, uma delas com pareamento vencido, não ativaria
+nenhuma — e a remediação óbvia viraria apagar a linha ruim (destrutivo) em vez
+de consertá-la. A regra escolhida é fail-closed onde importa (nada roteia sem
+posse E papel válido) e permissiva só onde é seguro.
+
+Prova: `tests/unit/onboarding/readiness.spec.ts` (composição INTRA-agente) e
+`tests/integration/onboarding-review-541-round2.spec.ts`.
 
 ### A propriedade central
 
@@ -159,6 +197,74 @@ Laterais: `readiness_failed`, `failed_retryable`, `failed_terminal`, `cancelled`
 
 Por isso **não** existe unique em `(run_id, step)`: passos re-executáveis (`evaluate_readiness`, retomada de pareamento) precisam poder rodar de novo, e quem impede o provisionamento duplicado é o **estado**, não o ledger.
 
+#### Todo comando mutável é idempotente — inclusive abrir e cancelar a run
+
+`startOnboardingRun` e `cancelOnboardingRun` exigem `idempotency_key` como
+qualquer passo. Não é simetria estética: sem isso, o comando que **abre** a saga
+inseria outra run (e outra trilha) a cada retry, e o retry de um cancelamento
+pós-commit encontrava a run já `cancelled` e devolvia `run_terminal` — um erro
+para uma operação que tinha dado certo.
+
+| Comando | Onde mora o ledger | Chave |
+|---|---|---|
+| `startOnboardingRun` | a própria run (`onboarding_runs.creation_idempotency_key_hash` + `creation_payload_hash`) — não há tabela filha antes de a run existir | `(kind, COALESCE(tenant_id,''), hash)`, índice `onboarding_runs_creation_key_uq` |
+| `executeOnboardingStep` | `onboarding_step_results` | `(run_id, step, hash)` |
+| `cancelOnboardingRun` | `onboarding_step_results`, sob o pseudo-passo `cancel_run` | `(run_id, 'cancel_run', hash)` |
+
+O escopo entra na chave de criação de propósito: a idempotency key é opaca e
+escolhida pelo cliente, então deduplicá-la globalmente devolveria a run de
+**outro tenant** para quem fizesse retry — um vazamento horizontal criado pela
+própria idempotência.
+
+#### Unicidade do escopo inicial
+
+`onboarding_runs_one_live_per_agent_uq` tem predicado `agent_id IS NOT NULL` e
+por isso **não cobria** a fase em que a run ainda não criou o agente — de
+`created` até `provision_agent`, metade da saga. Duas runs `tenant_onboarding`
+em `created` para o mesmo tenant coexistiam e provisionavam árvores de
+governança diferentes (dois admins, dois agentes, dois papéis padrão).
+
+`onboarding_runs_one_live_per_tenant_uq` (migration 113) é o espelho para esse
+intervalo: **uma** run viva sem agente por tenant. Assim que a run adquire
+`agent_id`, ela sai deste índice e entra no de par completo — dois agentes do
+mesmo tenant continuam podendo ser onboardados em paralelo a partir daí. Abrir
+uma segunda saga viva com outra chave devolve `duplicate_tenant` ("retome ou
+cancele"), nunca uma segunda run.
+
+#### Resultados CONCLUSIVOS, não só sucessos
+
+`onboarding_step_results.outcome_kind` (migration 113) é `success | denied |
+cancelled`. Enquanto só sucessos entravam no ledger, uma **negativa** avançava
+versão e estado sem deixar rastro replayável: o retry da mesma chave recebia
+`version_conflict` (a versão já era outra) em vez da negativa anterior, e a
+proteção contra reciclagem de chave (`idempotency_payload_mismatch`) sumia justo
+no caminho de recusa. Hoje a negativa é gravada **antes** de a versão/estado
+mudarem, e o replay devolve o mesmo código e a mesma mensagem — marcado como
+replay, para não contar duas recusas na métrica.
+
+#### `failed_retryable` guarda o PONTO DE RETOMADA
+
+O estado dizia "reexecute o mesmo passo" mas não guardava **qual** passo falhou,
+e toda definição aceitava `failed_retryable` como origem. Depois de uma negativa
+em `start_pairing`, o backend autorizava `provision_tenant`, `provision_admin`,
+`declare_channel` ou `evaluate_readiness` — passos que rebobinam o estado
+materializado ou criam recursos adicionais.
+
+Agora a negativa que leva a `failed_retryable` grava `failed_step` (o passo) e
+`resume_state` (de onde ele partiu). `planTransition` resolve a origem
+`failed_retryable` **contra esse ponto persistido**, lido da row travada:
+
+- o retry do próprio passo é legal;
+- as remediações declaradas em `RETRY_REMEDIATIONS` são legais — hoje só
+  `confirm_channel_ready → start_pairing` (refazer o pareamento da MESMA linha;
+  ambos `repeatable`, nenhum provisiona nada);
+- **tudo o mais é `invalid_transition`**, e sem ponto de retomada gravado nada é
+  legal (fail-closed; a migration 113 impede que essa combinação seja gravada).
+
+`allowedStepsFrom(state, retry_point)` devolve exatamente esse conjunto, então o
+console não desenha botões que o backend recusaria. Um passo que commita limpa
+`failed_step`/`resume_state`.
+
 ### Atomicidade — o que acontece se um passo morre no meio
 
 `onboardingRunsRepo.commitStep` faz, numa transação SQL curta: trava a run (`FOR UPDATE`) → confere `version` → consulta o ledger → valida a transição **contra o estado travado** → executa a escrita do passo **no mesmo `tx`** → grava ledger + evento + `admin_audit_log` + novo estado.
@@ -193,7 +299,7 @@ Optimistic: todo comando informa `expected_version`; o `UPDATE` casa com `versio
 
 ### Ativação
 
-A ativação **reavalia** o readiness sob a trava da run — readiness verde há cinco minutos não autoriza ativar agora. Reprovando, a run vai para `readiness_failed` e a auditoria registra `agent_activation_denied`. Aprovando, o agente vira `active`, as linhas **governadas** (com política do mesmo par) passam a rotear, e a auditoria registra `agent_activation_approved` com os dois fingerprints.
+A ativação **reavalia** o readiness sob a trava da run — readiness verde há cinco minutos não autoriza ativar agora. Reprovando, a run vai para `readiness_failed` e a auditoria registra `agent_activation_denied`. Aprovando, o agente vira `active`, **exatamente os canais que o readiness aprovou** (`activatable_channel_ids` — política + papel ativo + posse, cada um satisfeito pelo MESMO canal) passam a rotear, e a auditoria registra `agent_activation_approved` com os dois fingerprints. `applyActivate` re-deriva esse conjunto contra o banco sob os locks e **recusa** (`deny`) se ele divergir do aprovado: a decisão é do avaliador (foi ela que o operador viu), a re-derivação é a segunda opinião, e nenhuma das duas sozinha basta.
 
 #### O retrato precisa ser o MESMO que as escritas enxergam
 
@@ -251,7 +357,7 @@ O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_age
 - **O bucket `system` quando o alvo ainda não existe** — `admin_audit_log.tenant_id` é `REFERENCES tenants(id)` (`migrations/047_admin_audit_log.sql:10`), e a saga audita **antes** de `provision_tenant` criar o tenant. `resolveAuditTenant` (`src/db/repositories/onboarding-repos.ts`) resolve, no mesmo `tx`, se o tenant-alvo já existe: existindo, a linha vai para ele; não existindo, vai para o bucket `system` (semeado por `migrations/014_p0_seed_system_tenant.sql`) com o alvo preservado em `change_summary.target_tenant_id`. A trilha nunca some e continua atribuível — buscar por `change_summary->>'target_tenant_id'` responde "quem iniciou/cancelou o onboarding do tenant X". Como o SELECT roda dentro do `tx`, do passo `provision_tenant` em diante a auditoria já usa o tenant real.
 - **Vocabulário de enum vem do schema, não do módulo** — os literais que a saga escreve em coluna com `CHECK` moram em constantes nomeadas (`SAGA_ENUM_WRITES` em `provisioning.ts`), e `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` confronta cada um com o `CHECK` efetivo lido de `migrations/*.sql` — **sem banco**. Foi assim que `agents.status='provisioning'` (fora do `CHECK` de 007 até a migration 110) e `channel_policies.switch_behavior='fixed'` (vocabulário paralelo inventado; o real é `locked|prefer_handoff|free_with_trigger|by_context`) deixaram de ser possíveis de reintroduzir sem um teste vermelho.
 - **Backend decide** — todo payload passa por Zod antes de qualquer escrita; a UI propõe.
-- **Nada sensível persistido** — `sanitize.ts` redige por denylist de CHAVE (determinístico e auditável) em `metadata`, `summary` e `result`. Telefone, e-mail, QR, código de pareamento e token nunca entram.
+- **Nada sensível persistido, e a entrada é FECHADA** — `sanitize.ts` redige por denylist de CHAVE (determinístico e auditável) em `metadata`, `summary` e `result`. Mas a denylist decide pelo NOME do campo e nunca olha o valor, então ela **não fecha texto livre**: `{ note: '…telefone…' }` atravessava inteiro, e `reason_code` de cancelamento ia cru para `last_error_code`, para o evento e para `admin_audit_log`. Por isso as duas superfícies livres viraram contratos tipados — `runMetadataSchema` (`.strict()`, vocabulários fechados, `ticket_ref` com formato `ABC-123`) e `ONBOARDING_CANCEL_REASONS` (subconjunto de `ONBOARDING_REASONS`, para que o valor persistido seja o MESMO que vira label). Só campos aprovados são projetados; o que não está no contrato é **recusado**, não redigido.
 
 ## How to extend
 
@@ -285,6 +391,6 @@ Verifique contra as issues antes de confiar nesta lista.
 
 | | |
 |---|---|
-| Last verified | 2026-08-05 |
-| Against `main` HEAD | `ce1f0f69` (branch `claude/leva-agentes-2026-08-04` @ `7c1b3da` + review do PR #541) |
+| Last verified | 2026-08-08 |
+| Against `main` HEAD | `ce1f0f69` (branch `claude/leva-agentes-2026-08-04` @ `6bf0fa27` + 2ª rodada de review do PR #541) |
 | Re-verify when | Older than 30 days; OR `src/onboarding/**` muda; OR uma migration nova toca `onboarding_*`; OR #517/#518 mudam o contrato consumido aqui |

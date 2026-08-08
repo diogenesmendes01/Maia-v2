@@ -215,6 +215,9 @@ function baseCreate() {
     expires_at: new Date(Date.now() + 3_600_000),
     configuration_contract_version: '1',
     schema_version: 'sf',
+    // migration 113: a criação da run é idempotente e a chave é obrigatória.
+    idempotency_key_hash: 'c'.repeat(64),
+    payload_hash: 'd'.repeat(64),
   };
 }
 
@@ -229,14 +232,14 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
 
   it('criar a run do tenant que AINDA NÃO EXISTE não viola a FK', async () => {
     const r = await repo();
-    await expect(r.create(baseCreate())).resolves.toBeTruthy();
+    await expect(r.create(baseCreate())).resolves.toMatchObject({ outcome: 'created' });
     expect(state.audit).toHaveLength(1);
     expect(state.audit[0]!.tenant_id).toBe('system');
   });
 
   it('e a trilha continua ATRIBUÍVEL: o tenant pretendido fica em change_summary', async () => {
     const r = await repo();
-    const run = await r.create(baseCreate());
+    const { run } = (await r.create(baseCreate())) as { run: { id: string } };
     const summary = state.audit[0]!.change_summary as Record<string, unknown>;
     expect(summary.target_tenant_id).toBe(TARGET_TENANT);
     expect(summary.run_id).toBe(run.id);
@@ -252,7 +255,7 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
 
   it('cancelar uma run em `created` (antes de provision_tenant) não viola a FK', async () => {
     const r = await repo();
-    const run = await r.create(baseCreate());
+    const { run } = (await r.create(baseCreate())) as { run: { id: string } };
     state.audit.length = 0;
 
     const out = await r.cancel({
@@ -262,7 +265,9 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
       actor_id: 'op-1',
       actor_role: 'owner',
       correlation_id: 'corr-2',
-      reason_code: 'desistiu',
+      reason_code: 'operator_abort',
+      idempotency_key_hash: 'e'.repeat(64),
+      payload_hash: 'f'.repeat(64),
     });
 
     expect(out.outcome).toBe('committed');
@@ -278,7 +283,7 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
     // `apply` deste passo é visível para a resolução da auditoria do passo.
     const r = await repo();
     const schema = await import('../../../src/db/schema.js');
-    const run = await r.create(baseCreate());
+    const { run } = (await r.create(baseCreate())) as { run: { id: string } };
     state.audit.length = 0;
 
     const out = await r.commitStep({

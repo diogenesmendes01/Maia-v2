@@ -18,7 +18,7 @@
  * (invariante 3): a UI propõe o payload, o backend recusa o que não couber no
  * contrato.
  */
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { pgErrorCode } from '@/db/client.js';
 import {
@@ -37,6 +37,10 @@ import type { StepApplication } from '@/db/repositories/onboarding-repos.js';
 import type { OnboardingRunRow } from '@/db/schema.js';
 import { BASE_AGENT_PACKS } from '@/tools/base-agent-packs.js';
 import { OnboardingError } from './errors.js';
+// O vocabulário de "posse provada" é do readiness — a ativação NÃO tem um
+// paralelo. Importar a constante (em vez de repetir os literais) é o que faz a
+// re-derivação da ativação e o avaliador puro concordarem por construção.
+import { OWNERSHIP_PROVEN_LINE_STATES } from './readiness.js';
 import { assertProvisioningScope, assertTenantScope } from './scope.js';
 import type { OnboardingStep } from './state-machine.js';
 
@@ -736,58 +740,128 @@ export async function applyConfirmChannelReady(
 }
 
 /**
- * Ativação: liga o agente E as linhas governadas, no mesmo `tx` da transição
- * da run. O readiness foi reavaliado pelo wizard imediatamente antes, DENTRO
- * desta mesma transação e sob os locks de `lockReadinessSnapshot`.
+ * Ativação: liga o agente E as linhas INTEGRALMENTE VÁLIDAS, no mesmo `tx` da
+ * transição da run. O readiness foi reavaliado pelo wizard imediatamente antes,
+ * DENTRO desta mesma transação e sob os locks de `lockReadinessSnapshot`.
  *
- * As escritas são CONFERIDAS antes de a run poder concluir. O lock protege as
- * linhas que existiam no momento do snapshot; ele não é um predicate lock e
- * portanto não impede toda mutação concebível. A verificação do EFEITO fecha o
- * que sobra: se o `UPDATE` do agente não casou, ou se NENHUMA linha governada
- * passou a rotear, isto vira uma NEGATIVA de governança (`deny`) e a run vai
- * para `readiness_failed` — jamais um `active` que não ativou nada.
+ * ─── O conjunto ativado é o VALIDADO, não "os que têm política" ──────────────
+ * (Review adversarial do PR #541, achado 1.)
  *
- * Este era o buraco concreto que a review descreve: uma política removida entre
- * o snapshot e a escrita produzia zero canais ativados e a run concluía assim
- * mesmo, com um agente "ativo" que não roteia em lugar nenhum.
+ * A versão anterior seleccionava os canais por um único predicado — EXISTE
+ * `channel_policy` do mesmo escopo — e ligava todos. Isso ativava canais que o
+ * readiness jamais aprovou individualmente: a linha sem posse provada e a linha
+ * cuja política aponta para papel inativo entravam em roteamento porque OUTRO
+ * canal do mesmo agente satisfazia o predicado que faltava a elas.
+ *
+ * Agora a ativação recebe do readiness o conjunto EXATO de canais aprovados
+ * (`AgentReadiness.activatable_channel_ids`) e RE-DERIVA a mesma conjunção
+ * contra o banco, sob os locks, com a query abaixo. Só ativa se os dois
+ * conjuntos coincidirem EXATAMENTE:
+ *
+ *   * a re-derivação sozinha não bastaria — ela é uma segunda opinião, não a
+ *     decisão; a decisão foi tomada pelo avaliador puro e é ela que o operador
+ *     viu e aprovou;
+ *   * o conjunto do readiness sozinho não bastaria — ele foi calculado antes
+ *     das escritas, e o `FOR SHARE` não é predicate lock: uma linha NOVA
+ *     inserida concorrentemente não é travada por nada.
+ *
+ * Divergência entre os dois ⇒ NEGATIVA de governança (`deny`), run para
+ * `readiness_failed`. Nunca um `active` que ligou algo que ninguém validou.
+ *
+ * As escritas continuam CONFERIDAS antes de a run poder concluir: se o `UPDATE`
+ * do agente não casou, ou se o conjunto de canais mudou entre a leitura e a
+ * escrita, a transação inteira volta.
  */
 export async function applyActivate(
   tx: Tx,
   run: OnboardingRunRow,
-  fingerprints: { configuration_fingerprint: string; schema_fingerprint: string },
+  fingerprints: {
+    configuration_fingerprint: string;
+    schema_fingerprint: string;
+    /** O conjunto aprovado pelo readiness — a única lista que pode ser ativada. */
+    activatable_channel_ids: readonly string[];
+  },
 ): Promise<StepApplication> {
   const { tenant_id, agent_id } = requireScope(run);
+  const approved = [...new Set(fingerprints.activatable_channel_ids)].sort();
 
-  // (1) LEITURA primeiro. A precondição "existe pelo menos uma linha governada"
-  // é conferida ANTES de qualquer escrita, porque uma NEGATIVA (`deny`) NÃO faz
-  // rollback — ela commita a transição para `readiness_failed`. Escrever antes
-  // de decidir deixaria o agente `active` numa run que não concluiu, que é
-  // pior do que o defeito original.
+  // (1) LEITURA primeiro. A precondição é conferida ANTES de qualquer escrita,
+  // porque uma NEGATIVA (`deny`) NÃO faz rollback — ela commita a transição
+  // para `readiness_failed`. Escrever antes de decidir deixaria o agente
+  // `active` numa run que não concluiu, que é pior do que o defeito original.
+  //
+  // A conjunção inteira vira JOIN: canal não-sintético do escopo × política do
+  // MESMO escopo × papel ATIVO do MESMO escopo × estado de linha que prova
+  // posse. Os `eq` de `(tenant_id, agent_id)` estão em CADA junção, não só no
+  // `WHERE`: `channel_line_state` replica o par sem FK composta (migration 103)
+  // e `channel_policies` idem, então casar o escopo no `ON` é o que impede uma
+  // linha replicada divergente de emprestar validade a um canal alheio.
   const governed = await tx
     .select({ id: channels.id })
     .from(channels)
+    .innerJoin(
+      channel_policies,
+      and(
+        eq(channel_policies.channel_id, channels.id),
+        eq(channel_policies.tenant_id, tenant_id),
+        eq(channel_policies.agent_id, agent_id),
+      ),
+    )
+    .innerJoin(
+      roles,
+      and(
+        eq(roles.id, channel_policies.default_role_id),
+        eq(roles.tenant_id, tenant_id),
+        eq(roles.agent_id, agent_id),
+        eq(roles.active, true),
+      ),
+    )
+    .innerJoin(
+      channel_line_state,
+      and(
+        eq(channel_line_state.channel_id, channels.id),
+        eq(channel_line_state.tenant_id, tenant_id),
+        eq(channel_line_state.agent_id, agent_id),
+        // O vocabulário vem de `readiness.ts`, não de literais repetidos aqui:
+        // se ele divergir, os dois lados divergem JUNTOS e o teste de
+        // compatibilidade de CHECK denuncia.
+        inArray(channel_line_state.state, [...OWNERSHIP_PROVEN_LINE_STATES]),
+      ),
+    )
     .where(
       and(
         eq(channels.tenant_id, tenant_id),
         eq(channels.agent_id, agent_id),
         eq(channels.is_synthetic, false),
-        sql`EXISTS (
-          SELECT 1 FROM channel_policies cp
-           WHERE cp.channel_id = ${channels.id}
-             AND cp.tenant_id = ${tenant_id}
-             AND cp.agent_id = ${agent_id}
-        )`,
       ),
     );
 
-  if (governed.length === 0) {
+  const rederived = [...new Set(governed.map((g) => g.id))].sort();
+
+  if (rederived.length === 0) {
     return {
       result: { activated_channels: 0 },
       summary: { activated_channels: 0 },
       deny: {
         code: 'activation_precondition_failed',
         message:
-          'nenhuma linha governada para ativar — a configuração mudou entre a avaliação e a escrita',
+          'nenhuma linha integralmente válida para ativar — a configuração mudou entre a avaliação e a escrita',
+      },
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: agent_id },
+    };
+  }
+
+  if (
+    approved.length !== rederived.length ||
+    approved.some((id, i) => id !== rederived[i])
+  ) {
+    return {
+      result: { activated_channels: 0 },
+      summary: { activated_channels: 0 },
+      deny: {
+        code: 'activation_precondition_failed',
+        message:
+          'o conjunto de linhas válidas divergiu do que o readiness aprovou — nada foi ativado',
       },
       audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: agent_id },
     };
@@ -810,8 +884,11 @@ export async function applyActivate(
     );
   }
 
-  // Só as linhas GOVERNADAS (com política do mesmo escopo) passam a rotear, e
-  // exatamente aquelas que a leitura (1) já provou governadas sob o lock.
+  // Só os canais INTEGRALMENTE VÁLIDOS passam a rotear — exatamente os que a
+  // leitura (1) re-derivou sob o lock e que o readiness já havia aprovado.
+  // `rederived` (e não `approved`) alimenta o `IN`: os dois são iguais por
+  // construção neste ponto, e usar o conjunto lido pelo `tx` mantém a escrita
+  // ancorada no que ESTA transação enxerga.
   const activatedChannels = await tx
     .update(channels)
     .set({ active: true, updated_at: new Date() })
@@ -819,18 +896,15 @@ export async function applyActivate(
       and(
         eq(channels.tenant_id, tenant_id),
         eq(channels.agent_id, agent_id),
-        inArray(
-          channels.id,
-          governed.map((g) => g.id),
-        ),
+        inArray(channels.id, rederived),
       ),
     )
     .returning({ id: channels.id });
-  if (activatedChannels.length !== governed.length) {
+  if (activatedChannels.length !== rederived.length) {
     throw new OnboardingError(
       'activation_precondition_failed',
-      'o conjunto de linhas governadas mudou durante a ativação',
-      { expected: governed.length, matched: activatedChannels.length },
+      'o conjunto de linhas válidas mudou durante a ativação',
+      { expected: rederived.length, matched: activatedChannels.length },
     );
   }
 
@@ -838,6 +912,7 @@ export async function applyActivate(
     result: {
       agent_id,
       activated_channels: activatedChannels.length,
+      activated_channel_ids: rederived,
       configuration_fingerprint: fingerprints.configuration_fingerprint,
       schema_fingerprint: fingerprints.schema_fingerprint,
     },

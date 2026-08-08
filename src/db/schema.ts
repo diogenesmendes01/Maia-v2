@@ -3495,6 +3495,17 @@ export const onboarding_runs = pgTable(
     metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
     configuration_contract_version: text('configuration_contract_version').notNull(),
     schema_version: text('schema_version').notNull(),
+    // migration 113 — a criação da run é um COMANDO MUTÁVEL e portanto
+    // idempotente: o ledger de criação vive na própria run (não há tabela
+    // filha onde guardá-lo antes de a run existir). Unicidade em
+    // `onboarding_runs_creation_key_uq` por (kind, tenant, hash).
+    creation_idempotency_key_hash: text('creation_idempotency_key_hash'),
+    creation_payload_hash: text('creation_payload_hash'),
+    // migration 113 — ponto de retomada de `failed_retryable`. Sem eles o
+    // estado autorizava QUALQUER passo anterior; com eles a máquina de estados
+    // só admite o retry do passo que falhou e as remediações declaradas.
+    failed_step: text('failed_step'),
+    resume_state: text('resume_state'),
   },
   (t) => ({
     tenantStateIdx: index('onboarding_runs_tenant_state_idx').on(
@@ -3544,6 +3555,13 @@ export const onboarding_step_results = pgTable(
     idempotency_key_hash: text('idempotency_key_hash').notNull(),
     payload_hash: text('payload_hash').notNull(),
     result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    // migration 113 — o ledger guarda RESULTADOS CONCLUSIVOS TIPADOS, não só
+    // sucessos: uma negativa de governança e um cancelamento também são
+    // conclusões, e sem elas o retry da mesma chave devolvia `version_conflict`
+    // / `run_terminal` em vez da resposta anterior.
+    outcome_kind: text('outcome_kind').notNull().default('success'),
+    outcome_code: text('outcome_code'),
+    outcome_message: text('outcome_message'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({

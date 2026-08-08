@@ -123,6 +123,126 @@ describe('evaluateReadinessFacts — baseline', () => {
   });
 });
 
+/**
+ * COMPOSIÇÃO INTRA-AGENTE (review adversarial do PR #541, achado 1).
+ *
+ * Os testes cross-tenant e cross-agent abaixo não cobrem este caso: aqui TUDO
+ * é do mesmo (tenant, agente) e mesmo assim o veredito era um falso positivo,
+ * porque `channel_policy_role_active` e `channel_ownership_proven` eram dois
+ * `.some()` INDEPENDENTES sobre o conjunto de canais governados.
+ *
+ * O cenário mínimo que reproduz: dois canais do mesmo agente DIVIDINDO entre si
+ * o papel válido e a posse provada. Nenhum dos dois é operável; juntos eles
+ * pintavam os dois checks de verde, e a ativação (que selecionava canais só
+ * pela existência de política) ligava OS DOIS.
+ */
+describe('composição INTRA-agente — dois canais dividindo papel válido e posse', () => {
+  const CHANNEL_B = '44444444-4444-4444-8444-444444444444';
+  const POLICY_B = '55555555-5555-4555-8555-555555555555';
+  const INACTIVE_ROLE = '66666666-6666-4666-8666-666666666666';
+
+  /**
+   * Canal A: política aponta para papel ATIVO, mas a linha NUNCA provou posse.
+   * Canal B: linha `connected` (posse provada), mas a política aponta para um
+   *          papel INATIVO.
+   */
+  function splitFacts(): ReadinessFacts {
+    return readyFacts({
+      roles: [
+        { id: ROLE_ID, tenant_id: T, agent_id: A, role_key: 'suporte', active: true, is_default: true },
+        {
+          id: INACTIVE_ROLE,
+          tenant_id: T,
+          agent_id: A,
+          role_key: 'vendas',
+          active: false,
+          is_default: false,
+        },
+      ],
+      channels: [
+        {
+          id: CHANNEL_ID,
+          tenant_id: T,
+          agent_id: A,
+          channel_type: 'whatsapp',
+          active: false,
+          is_synthetic: false,
+          line_state: 'declared', // posse NÃO provada
+        },
+        {
+          id: CHANNEL_B,
+          tenant_id: T,
+          agent_id: A,
+          channel_type: 'whatsapp',
+          active: false,
+          is_synthetic: false,
+          line_state: 'connected', // posse provada
+        },
+      ],
+      policies: [
+        { id: POLICY_ID, tenant_id: T, agent_id: A, channel_id: CHANNEL_ID, default_role_id: ROLE_ID },
+        {
+          id: POLICY_B,
+          tenant_id: T,
+          agent_id: A,
+          channel_id: CHANNEL_B,
+          default_role_id: INACTIVE_ROLE, // papel INATIVO
+        },
+      ],
+    });
+  }
+
+  it('NÃO fica pronto: nenhum canal satisfaz política + papel ativo + posse ao mesmo tempo', () => {
+    const r = evaluateReadinessFacts(splitFacts());
+    expect(r.ready).toBe(false);
+    expect(blockingFailures(r).map((c) => c.code)).toContain('channel_ownership_proven');
+  });
+
+  it('e nenhum dos dois canais é ativável — a lista que a ativação usa fica VAZIA', () => {
+    const r = evaluateReadinessFacts(splitFacts());
+    expect(r.activatable_channel_ids).toEqual([]);
+    // A exclusão é EXPLÍCITA, por canal e com o código do que reprovou.
+    expect(r.channels.find((c) => c.channel_id === CHANNEL_ID)).toMatchObject({
+      policy_governed: true,
+      policy_role_active: true,
+      ownership_proven: false,
+      activatable: false,
+      failed_checks: ['channel_ownership_proven'],
+    });
+    expect(r.channels.find((c) => c.channel_id === CHANNEL_B)).toMatchObject({
+      policy_governed: true,
+      policy_role_active: false,
+      ownership_proven: true,
+      activatable: false,
+      failed_checks: ['channel_policy_role_active'],
+    });
+  });
+
+  it('a mensagem do veredito NOMEIA os canais governados excluídos', () => {
+    const r = evaluateReadinessFacts(splitFacts());
+    const check = r.checks.find((c) => c.code === 'channel_ownership_proven')!;
+    expect(check.status).toBe('fail');
+    expect(check.message).toContain(CHANNEL_ID);
+    expect(check.message).toContain(CHANNEL_B);
+    expect(check.message).toContain('EXCLUÍDO');
+  });
+
+  it('um ÚNICO canal com os três predicados torna pronto — e só ele é ativável', () => {
+    // Canal B ganha uma política válida; canal A continua sem posse provada.
+    const facts = splitFacts();
+    facts.policies = facts.policies.map((p) =>
+      p.channel_id === CHANNEL_B ? { ...p, default_role_id: ROLE_ID } : p,
+    );
+    const r = evaluateReadinessFacts(facts);
+    expect(r.ready).toBe(true);
+    // FAIL-CLOSED: o canal governado inválido NÃO entra na ativação.
+    expect(r.activatable_channel_ids).toEqual([CHANNEL_B]);
+    expect(r.checks.find((c) => c.code === 'channel_ownership_proven')!.message).toContain(
+      'EXCLUÍDO',
+    );
+  });
+});
+
 describe('composição cruzada — o falso positivo que a issue descreve', () => {
   it('profile do agente A + canal do agente B NÃO torna A pronto', () => {
     const facts = readyFacts({
