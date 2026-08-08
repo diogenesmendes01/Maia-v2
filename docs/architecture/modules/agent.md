@@ -31,6 +31,7 @@
 | `src/agent/turn-context/metrics.ts` | `maia_turn_context_*` metrics (closed label vocabulary) |
 | `src/agent/turn-context/types.ts` | `LoadedSection` contract + per-section budgets |
 | `src/agent/turn-context/budget.ts` | Deterministic, metered truncation |
+| `src/agent/turn-context/concurrency.ts` | `createReadGate` — the FIFO semaphore that caps how much of the pool one turn may hold |
 | `src/agent/turn-context/cache.ts` | Versioned tenant+agent cache for the static context, with cross-replica invalidation |
 
 ## Turn-context loading (issues #511, #525)
@@ -72,6 +73,52 @@ The slope is zero — scope size does not multiply round-trips against the fixed
 is: the cache is worth exactly one query, because only the operational-profile
 branch is cacheable (see below).
 
+### Concurrency ceiling
+
+Total cost and **instantaneous** cost are separate ceilings, and the pool needs
+both. The table above says what a turn costs; it says nothing about how much of
+the shared pool a turn may hold while paying it. The first cut of #525 answered
+that badly: the critical group (5 reads) and the optional group (5) are both
+started before either is awaited, so a cold-cache turn with an unresolved
+procedure issued **ten** statements in one tick against `max: 10`. One turn
+could hold every connection in the process, and every other turn — of every
+other tenant — queued behind it. PR #541's review caught it.
+
+`TURN_CONTEXT_MAX_CONCURRENT_READS = 6` (`turn-context/types.ts`) is the
+replacement ceiling, applied as ONE shared FIFO semaphore
+(`turn-context/concurrency.ts`) over the critical **and** optional groups
+together. Six is not a new number: it is the ceiling the pre-#525 code enforced
+and documented, and the shared version is strictly stronger than the per-group
+one it restores.
+
+| | |
+|---|---|
+| Pool (`src/db/client.ts`) | `max: 10`, process-wide |
+| One turn's ceiling | 6 statements in flight |
+| Left for everyone else | ≥ 4 connections, always |
+
+A semaphore rather than a phase split, because running the groups in sequence
+would cap concurrency at 5 but reintroduce half the waterfall #525 removed —
+the turn would pay `max(critical) + max(optional)` instead of
+`max(everything)`. All ten tasks stay in one pipeline; only how many run at once
+is bounded. FIFO matters: the critical group is enqueued first, so it holds the
+first permits and a late optional read can never push the turn's critical path
+back.
+
+The gate never catches, retries or reorders, so the failure contract is
+untouched — a critical rejection still fails the turn, an optional rejection
+still degrades only its own section. The ceiling is per TURN, not per process:
+bounding one turn's blast radius is the point, and a process-wide gate would
+just move cross-turn queueing out of the pool (which has
+`connectionTimeoutMillis`) and into the application (which would not).
+
+`tests/integration/turn-context-pool-fairness.spec.ts` is the enforcement — two
+simultaneous `loadTurnContext` calls against the real pool, with barriers that
+hold real connections, asserting both that the peak never exceeds 6 **and** that
+it reaches 6 (so "fixed by serialising" fails too). Changing this number without
+changing `max` in `src/db/client.ts` changes how much of the pool one tenant can
+take; the two belong in the same review.
+
 `TURN_ROUND_TRIP_BUDGET` in `turn-context/types.ts` is the enforced ceiling and
 `tests/unit/turn-context-round-trips.spec.ts` is its enforcement — it asserts the
 EXACT count per path, names every read, and fails the build when a new one
@@ -90,6 +137,21 @@ behaviour:
   `entity_states.entidade_id = entidades.id`. `entidadesRepo.byIdsWithState` is
   that LEFT JOIN. The same change bound `(tenant_id, agent_id)` on
   `entidadesRepo.byIds`, which had been matching on id alone.
+
+The two halves of that JOIN have **different cardinality**, and the first cut
+got it wrong (PR #541 review, finding 2): it applied one `LIMIT 500` to the
+joined row set, but the pair it replaced capped only the STATE read —
+`entidadesRepo.byIds` never had a limit. Past row 500 the ENTITY vanished, the
+renderer's `ent?.nome ?? eid` fell through, and the scope/permissions block
+printed a raw UUID instead of a name — in a block that has no `SECTION_BUDGETS`
+entry precisely because it is never truncatable. A scope can exceed 500 entities
+whenever they share permission profiles, since `profilesRepo.byIds`'s own cap is
+on distinct PROFILES. The entity side is now unbounded (bounded only by
+`ids.length`, which the caller controls); `stateLimit` caps the state projection
+alone, and a capped row comes back as `state: null` — the same shape an entity
+with no state row already had. Still one statement.
+`tests/integration/turn-context-scope-cardinality.spec.ts` holds it with 501
+entities on one profile.
 
 **The ≤8 target of issue #525 is NOT met** (`TURN_ROUND_TRIP_TARGET`). Every
 remaining read is a different table, so closing the gap needs cross-table
@@ -153,7 +215,8 @@ same snapshot renders the same prompt on every replica. Policy, permission and
 scope blocks have no budget entry — they are never truncatable.
 
 **Degradation.** Optional sections (memories, hints, capabilities, gaps,
-procedure) load concurrently and independently; a failure degrades that section
+procedure) load concurrently (under the shared read gate above) and
+independently; a failure degrades that section
 only, is logged as `turn_context.degraded` with the section NAME (never its
 content), counted on `maia_turn_context_section_total{status="degraded"}`, and
 reaches the renderer as `degraded(fallback, reason)` — which renders as an
@@ -197,6 +260,9 @@ column, never a dropped tenant predicate.
 | `tests/unit/turn-context-round-trips.spec.ts` | The round-trip budget: exact counts, the named read set, and that the renderer costs zero |
 | `tests/unit/turn-context-renderer-purity.spec.ts` | The renderer runs with every repository rigged to throw |
 | `tests/unit/turn-context-baseline.spec.ts` | Zero slope + `resolveScope` batching and its cross-tenant counterfactual |
+| `tests/unit/turn-context-read-gate.spec.ts` | The semaphore's contract: ceiling, FIFO order, permit released on rejection |
+| `tests/integration/turn-context-pool-fairness.spec.ts` | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness |
+| `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
 | `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
 | `tests/unit/agent/` | Per-step contracts |
 | `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |
@@ -210,6 +276,8 @@ At last verification (2026-05-28):
 - Turn-context loader integrated + pure renderer (#525 — this change). Still
   open in #525: the ≤8 round-trip target, and returning `capabilities`/`gaps`
   to the cache (decision to keep them out is recorded above).
+- PR #541 review follow-up: the shared read gate (finding 1) and the JOIN's
+  entity-side cardinality (finding 2), both described above.
 
 Verify: `gh pr list --state open --search "agent OR react OR turn"`.
 
