@@ -5,6 +5,7 @@ import {
   canonicalize,
   signManifest,
   verifyManifest,
+  singleVersionKeyring,
   assertArtifactMatchesManifest,
   type BackupManifest,
 } from '../../../src/ops/backup/manifest.js';
@@ -78,7 +79,7 @@ describe('canonicalize', () => {
 describe('signManifest / verifyManifest', () => {
   it('round-trips a valid manifest', () => {
     const signed = signManifest(manifest(), SECRET, 1);
-    const verdict = verifyManifest(signed, SECRET);
+    const verdict = verifyManifest(signed, singleVersionKeyring(SECRET, 1));
     expect(verdict.ok).toBe(true);
   });
 
@@ -88,7 +89,7 @@ describe('signManifest / verifyManifest', () => {
       ...signed,
       manifest: { ...signed.manifest, sha256: DIGEST_B },
     };
-    expect(verifyManifest(tampered, SECRET)).toEqual({
+    expect(verifyManifest(tampered, singleVersionKeyring(SECRET, 1))).toEqual({
       ok: false,
       reason: 'signature_mismatch',
     });
@@ -96,7 +97,7 @@ describe('signManifest / verifyManifest', () => {
 
   it('rejects a manifest signed with a different key', () => {
     const signed = signManifest(manifest(), SECRET, 1);
-    expect(verifyManifest(signed, 'other-secret')).toEqual({
+    expect(verifyManifest(signed, singleVersionKeyring('other-secret', 1))).toEqual({
       ok: false,
       reason: 'signature_mismatch',
     });
@@ -105,12 +106,17 @@ describe('signManifest / verifyManifest', () => {
   it('rejects a schema-invalid manifest without throwing (no oracle)', () => {
     const signed = signManifest(manifest(), SECRET, 1);
     const broken = { ...signed, manifest: { ...signed.manifest, sha256: 'not-a-digest' } };
-    expect(verifyManifest(broken, SECRET)).toEqual({ ok: false, reason: 'schema_invalid' });
+    expect(verifyManifest(broken, singleVersionKeyring(SECRET, 1))).toEqual({
+      ok: false,
+      reason: 'schema_invalid',
+    });
   });
 
   it('rejects a downgraded signature algorithm', () => {
     const signed = signManifest(manifest(), SECRET, 1);
-    expect(verifyManifest({ ...signed, signature_alg: 'none' }, SECRET)).toEqual({
+    expect(
+      verifyManifest({ ...signed, signature_alg: 'none' }, singleVersionKeyring(SECRET, 1)),
+    ).toEqual({
       ok: false,
       reason: 'unsupported_signature_alg',
     });
@@ -118,6 +124,17 @@ describe('signManifest / verifyManifest', () => {
 
   it('refuses to sign without a secret (unsigned evidence is not evidence)', () => {
     expect(() => signManifest(manifest(), '', 1)).toThrowError(/not verifiable evidence/);
+  });
+
+  it('refuses to sign under a key version the verifier would refuse', () => {
+    // Symmetry: producing an envelope whose selector `verifyManifest` rejects
+    // would publish an artifact that is unverifiable from the moment it is
+    // written.
+    for (const bad of [0, -1, 1.5, NaN, '1' as unknown as number]) {
+      expect(() => signManifest(manifest(), SECRET, bad)).toThrowError(
+        /key version is not a positive integer/,
+      );
+    }
   });
 
   it('refuses to sign a manifest carrying a secret or PII', () => {
@@ -147,6 +164,110 @@ describe('signManifest / verifyManifest', () => {
       'key_version',
       'ciphertext_sha256',
     ]);
+  });
+});
+
+/**
+ * Round-2 review of PR #541, finding #2 — verification resolves the key BY THE
+ * VERSION the envelope names.
+ *
+ * `verifyManifest` used to take a bare secret and ignore
+ * `signature_key_version` entirely, so the first HMAC rotation turned every
+ * manifest signed with the previous key into `manifest_unverifiable` — inside
+ * its retention window, with no failure until someone needed the restore. A
+ * keyring, not a secret, is the fix, and it is fail-closed in both directions:
+ * an unknown version is refused, and a KNOWN version that did not sign this
+ * envelope is refused too.
+ */
+describe('verifyManifest — the key VERSION selects the key (#541 round 2)', () => {
+  /** A deployment that rotated: v2 is current, v1 is retained for the window. */
+  const rotated = {
+    secretForVersion: (v: number) => (v === 2 ? 'new-master' : v === 1 ? 'old-master' : null),
+  };
+
+  it('verifies with the CURRENT key', () => {
+    const signed = signManifest(manifest(), 'new-master', 2);
+    expect(verifyManifest(signed, rotated)).toMatchObject({
+      ok: true,
+      key_version: 2,
+    });
+  });
+
+  it('verifies with the PREVIOUS key — a rotation does not strand a backup', () => {
+    const signed = signManifest(manifest(), 'old-master', 1);
+    expect(verifyManifest(signed, rotated)).toMatchObject({
+      ok: true,
+      key_version: 1,
+    });
+  });
+
+  it('FAILS CLOSED for a version the keyring does not hold', () => {
+    const signed = signManifest(manifest(), 'ancient-master', 9);
+    expect(verifyManifest(signed, rotated)).toEqual({
+      ok: false,
+      reason: 'key_version_unknown',
+    });
+  });
+
+  it('FAILS CLOSED when the keyring itself throws', () => {
+    const exploding = {
+      secretForVersion: (): string => {
+        throw new Error('keyring unreadable');
+      },
+    };
+    const signed = signManifest(manifest(), 'new-master', 2);
+    expect(verifyManifest(signed, exploding)).toEqual({
+      ok: false,
+      reason: 'key_version_unknown',
+    });
+  });
+
+  it('refuses an envelope that RELABELLED its own key version', () => {
+    // Signed with v1/old-master, relabelled to claim v2. The keyring holds v2,
+    // so a verifier that trusted the selector would compute with `new-master`
+    // and reject; one that ignored the selector entirely would compute with
+    // whichever secret it holds. Either way this must not verify.
+    const signed = signManifest(manifest(), 'old-master', 1);
+    expect(verifyManifest({ ...signed, signature_key_version: 2 }, rotated)).toEqual({
+      ok: false,
+      reason: 'signature_mismatch',
+    });
+  });
+
+  it('refuses a selector that is not a positive integer before consulting the keyring', () => {
+    const signed = signManifest(manifest(), 'new-master', 2);
+    const asked: unknown[] = [];
+    const spy = {
+      secretForVersion: (v: number) => {
+        asked.push(v);
+        return 'new-master';
+      },
+    };
+    for (const bad of [undefined, null, '2', 2.5, NaN, 0, -1, { valueOf: () => 2 }]) {
+      expect(
+        verifyManifest({ ...signed, signature_key_version: bad as unknown as number }, spy),
+      ).toEqual({ ok: false, reason: 'invalid_key_version' });
+    }
+    // The adulterated selector never reached the key material.
+    expect(asked).toEqual([]);
+  });
+
+  it('reports an empty secret as such, not as an unknown version', () => {
+    const signed = signManifest(manifest(), SECRET, 1);
+    expect(verifyManifest(signed, singleVersionKeyring('', 1))).toEqual({
+      ok: false,
+      reason: 'no_verification_secret',
+    });
+  });
+
+  it('singleVersionKeyring answers for exactly one version', () => {
+    const ring = singleVersionKeyring(SECRET, 3);
+    expect(ring.secretForVersion(3)).toBe(SECRET);
+    expect(ring.secretForVersion(2)).toBeNull();
+    expect(verifyManifest(signManifest(manifest(), SECRET, 1), ring)).toEqual({
+      ok: false,
+      reason: 'key_version_unknown',
+    });
   });
 });
 

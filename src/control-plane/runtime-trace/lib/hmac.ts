@@ -173,6 +173,25 @@ function masterSecretForVersion(version: number): Buffer {
 }
 
 /**
+ * The versioned keyring, exposed for OTHER holders of long-lived evidence
+ * signed with this same master material (issue #536, round-2 review of PR
+ * #541: `src/ops/backup/manifest-keyring.ts`).
+ *
+ * Additive only — `masterSecretForVersion` is unchanged and `deriveTenantKey`
+ * still calls it directly, so runtime-trace behaviour (including the fail-
+ * closed throw for an unknown version) is byte-for-byte what it was. Exporting
+ * the resolver rather than copying the env parsing is the point: two parsers
+ * for `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` would drift, and a drifted
+ * keyring is an unrestorable backup.
+ *
+ * Throws for a version this deployment does not hold — callers that need a
+ * verdict rather than an exception wrap it.
+ */
+export function hmacMasterSecretForVersion(version: number): Buffer {
+  return masterSecretForVersion(version);
+}
+
+/**
  * Derive a tenant-scoped HMAC key. Cached. Synchronous because hkdfSync is
  * pure CPU; the trace envelope hot path can't afford an async hop.
  *

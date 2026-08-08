@@ -38,6 +38,7 @@ import { runBounded } from './adapters.js';
 import { resolveArtifactObjectKey, resolveArtifactPath } from './artifact-path.js';
 import { sha256File } from './checksum.js';
 import { decryptFile, parseBackupKeyring } from './encryption.js';
+import { backupManifestKeyring } from './manifest-keyring.js';
 import { assertSafeDatabaseName, type RestoreDrillPorts } from './drill.js';
 import { RESTORE_DRILL_PROBES, type ProbeContext, type ProbeRow } from './drill-probes.js';
 
@@ -137,8 +138,10 @@ export function createRestoreDrillPorts(): RestoreDrillPorts {
 
     // Same material the manifest was SIGNED with (src/ops/backup/adapters.ts).
     // It lives outside the artifact, so an attacker holding the dump cannot
-    // forge a manifest for it.
-    manifestSecret: () => ({ secret: config.RUNTIME_TRACE_HMAC_MASTER_SECRET ?? '' }),
+    // forge a manifest for it — and it is resolved BY THE VERSION the envelope
+    // names, so a key rotation does not strand the recovery points signed
+    // before it (see `manifest-keyring.ts`).
+    manifestKeyring: backupManifestKeyring,
 
     stagingPath: (name) => join(drillWorkspace(), stagedName(name)),
 

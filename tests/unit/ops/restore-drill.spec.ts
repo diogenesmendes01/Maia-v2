@@ -11,6 +11,7 @@ import { CRITICAL_TABLES, type ProbeRow } from '../../../src/ops/backup/drill-pr
 import {
   MANIFEST_VERSION,
   signManifest,
+  singleVersionKeyring,
   type BackupManifest,
 } from '../../../src/ops/backup/manifest.js';
 import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
@@ -221,7 +222,7 @@ function harness(
     now: () => new Date((clock += 1000)),
     newId: () => '99999999-8888-4777-8666-555555555555',
     selectCandidate: async (source) => candidates[source] ?? null,
-    manifestSecret: () => ({ secret: MANIFEST_SECRET }),
+    manifestKeyring: () => singleVersionKeyring(MANIFEST_SECRET, 1),
     stagingPath: (name) => `/backups/restore-drill/${name}`,
     fetchArtifact: async (c, dest) => {
       const path = c.source === 'offsite' ? dest : `/backups/${c.artifact_ref}`;
@@ -548,6 +549,146 @@ describe('restore drill — `passed` is PROVEN clean, not assumed clean (#541)',
   });
 });
 
+/**
+ * Round-2 review of PR #541, finding #1 — the SIBLING of the hole above, on
+ * the fetch instead of the decrypt.
+ *
+ * The plaintext path was registered before `decrypt`; the staging destination
+ * was registered only AFTER `fetchArtifact` returned. But the adapter creates
+ * the slot and streams into it before that (`drill-adapters.ts`), and
+ * `downloadBackupObjectToFile` throws without removing what it already wrote
+ * (`src/workers/backup-s3.ts`). So a download that died mid-transfer left bytes
+ * at a path the teardown had never heard of: the sweep walked an inventory that
+ * did not contain them, found nothing, and the drill finished
+ * `failed` + `cleanup_status='clean'` — CERTIFYING a clean host while a partial
+ * production dump sat in the workspace, with no `unsafe` residue audit for
+ * anyone to alert on. Under `encryption.mode='none'` (legal outside the
+ * production profile) those bytes are readable by anyone on the host.
+ *
+ * The guard at `drill.ts` (`failure === null && cleanup.status !== 'clean'`)
+ * cannot reach this: it only PROMOTES an already-detected residue to a failure
+ * code. Here nothing was ever detected — `cleanup.status` was a truthful
+ * report about an inventory that was itself incomplete.
+ */
+describe('restore drill — the drill owns the staging slot BEFORE it fetches (#541 round 2)', () => {
+  it('sweeps the staging destination of a fetch that died AFTER writing bytes', async () => {
+    const h = harness({
+      fetchArtifact: async (_c, _dest) => {
+        // The stream wrote part of the artifact into `_dest` and then died.
+        // Nothing RETURNED, so nothing announced those bytes.
+        throw new TypedError('artifact_fetch_failed', 'connection reset at 4 MiB', {});
+      },
+    });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.failure_code).toBe('artifact_fetch_failed');
+    // The proof the inventory is claimed up front: the drill removed the
+    // destination it named and then ASKED the host whether it is really gone.
+    expect(h.removed).toContain(`/backups/restore-drill/${BACKUP_ID}.artifact`);
+    expect(h.existenceChecks).toContain(`file:/backups/restore-drill/${BACKUP_ID}.artifact`);
+  });
+
+  it('refuses to certify `clean` when the partial artifact CANNOT be removed', async () => {
+    const h = harness(
+      {
+        fetchArtifact: async () => {
+          throw new TypedError('artifact_fetch_failed', 'connection reset at 4 MiB', {});
+        },
+        removeFile: async () => {
+          throw new Error('EACCES');
+        },
+      },
+      { host: { filesLeft: (p) => p.endsWith('.artifact') } },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('failed');
+    // The two axes stay separate: the RESTORE diagnosis is still the fetch
+    // failure, and the residue is carried on `cleanup_status`.
+    expect(result.failure_code).toBe('artifact_fetch_failed');
+    expect(result.cleanup).toEqual({
+      status: 'unsafe',
+      residue: [{ kind: 'staged_artifact', reason: 'removal_failed' }],
+    });
+    expect(h.drills[0]).toMatchObject({
+      failure_code: 'artifact_fetch_failed',
+      cleanup_status: 'unsafe',
+    });
+
+    // AUDITED and ALERTED — an operator has to go remove it by hand.
+    const alert = h.audits.find((a) => a.action === 'restore_drill_unsafe_residue');
+    expect(alert?.metadata.residue).toEqual([
+      { kind: 'staged_artifact', reason: 'removal_failed' },
+    ]);
+    const leak = h.logs.find((l) => l.event === 'restore_drill.staged_file_not_removed');
+    expect(leak?.detail.kind).toBe('staged_artifact');
+  });
+
+  it('treats an unprovable absence at the staging slot as residue too', async () => {
+    const h = harness({
+      fetchArtifact: async () => {
+        throw new TypedError('artifact_fetch_failed', 'connection reset at 4 MiB', {});
+      },
+      fileExists: async () => {
+        throw new Error('EACCES');
+      },
+    });
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.cleanup).toEqual({
+      status: 'unsafe',
+      residue: [{ kind: 'staged_artifact', reason: 'unverified' }],
+    });
+  });
+
+  it('still never deletes the LOCAL recovery point it read in place', async () => {
+    // Claiming the staging slot up front must not turn into claiming the
+    // artifact: a local candidate is read where it lives, and deleting it would
+    // be the drill destroying the recovery point it exists to prove.
+    const h = harness({}, { candidates: { local: candidate({ source: 'local' }) } });
+    const result = await runRestoreDrill(h.ports, devProfile());
+
+    expect(result.status).toBe('passed');
+    expect(h.removed).not.toContain('/backups/maia-2026-07-28T03-00-00-111122224333.dump');
+    // The slot the drill named was never written, so its absence is PROVEN and
+    // the verdict stays clean — the sweep's authority is the host, not the
+    // bookkeeping.
+    expect(result.cleanup).toEqual({ status: 'clean', residue: [] });
+  });
+
+  it('names a CLEARTEXT staged artifact for what it is, not merely "staged"', async () => {
+    // `encryption.mode='none'` is legal outside the production profile, and
+    // then the artifact AS STORED is already every tenant's data in the clear.
+    // Reporting that residue as a generic `staged_artifact` — documented as the
+    // still-encrypted case — understates what the operator has to go delete.
+    const plain = manifest({
+      encryption: {
+        mode: 'none',
+        key_id: null,
+        key_version: null,
+        ciphertext_sha256: null,
+      },
+      size_bytes: CIPHER_BYTES,
+      sha256: CIPHER_DIGEST,
+    });
+    const h = harness(
+      {},
+      {
+        candidates: { offsite: candidate({}, plain) },
+        host: { filesLeft: (p) => p.endsWith('.artifact') },
+      },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.cleanup).toEqual({
+      status: 'unsafe',
+      residue: [{ kind: 'decrypted_plaintext', reason: 'still_present' }],
+    });
+    const leak = h.logs.find((l) => l.event === 'restore_drill.staged_file_not_removed');
+    expect(leak?.detail.impact).toContain('DECRYPTED copy');
+  });
+});
+
 describe('restore drill — a probe failure and a residue never mask each other (#541)', () => {
   it('keeps the RESTORE diagnosis in failure_code and the residue in cleanup_status', async () => {
     const rows = healthyProbeRows();
@@ -694,9 +835,125 @@ describe('restore drill — the manifest is the contract', () => {
   });
 
   it('refuses a manifest signed with a different secret', async () => {
-    const h = harness({ manifestSecret: () => ({ secret: 'a-different-secret' }) });
+    const h = harness({
+      manifestKeyring: () => singleVersionKeyring('a-different-secret', 1),
+    });
     const result = await runRestoreDrill(h.ports, prodProfile());
     expect(result.failure_code).toBe('manifest_unverifiable');
+  });
+
+  /**
+   * Round-2 review of PR #541, finding #2 — an HMAC rotation must not delete
+   * the backups.
+   *
+   * The envelope has always carried `signature_key_version`; the drill used to
+   * hand `verifyManifest` the CURRENT secret and `verifyManifest` used to
+   * ignore the version. So the first time an operator did what the 90-day
+   * rotation policy tells them to do, every recovery point signed with the
+   * previous key started failing as `manifest_unverifiable` — still on disk,
+   * still inside its retention window, still restorable, and now refused by the
+   * only job that certifies restorability. The rotation was the outage.
+   */
+  const rotatedKeyring = () => ({
+    // Post-rotation deployment: v2 is current, v1 is retained per the audit
+    // window (`RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS`).
+    secretForVersion: (v: number) => (v === 2 ? 'new-master' : v === 1 ? 'old-master' : null),
+  });
+
+  it('verifies a recovery point signed with the PREVIOUS key after a rotation', async () => {
+    const h = harness(
+      { manifestKeyring: rotatedKeyring },
+      {
+        candidates: {
+          offsite: candidate({
+            signed_manifest: signManifest(manifest(), 'old-master', 1),
+          }),
+        },
+      },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+    expect(result.status).toBe('passed');
+  });
+
+  it('verifies a recovery point signed with the CURRENT key', async () => {
+    const h = harness(
+      { manifestKeyring: rotatedKeyring },
+      {
+        candidates: {
+          offsite: candidate({
+            signed_manifest: signManifest(manifest(), 'new-master', 2),
+          }),
+        },
+      },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+    expect(result.status).toBe('passed');
+  });
+
+  it('FAILS CLOSED on a key version this deployment no longer holds', async () => {
+    const h = harness(
+      { manifestKeyring: rotatedKeyring },
+      {
+        candidates: {
+          offsite: candidate({
+            signed_manifest: signManifest(manifest(), 'ancient-master', 9),
+          }),
+        },
+      },
+    );
+    const result = await runRestoreDrill(h.ports, prodProfile());
+
+    expect(result.status).toBe('failed');
+    expect(result.failure_code).toBe('manifest_unverifiable');
+    // The operator log separates "we lost the key" from "this is a forgery" —
+    // opposite remediations, same failure code (no oracle).
+    const why = h.logs.find((l) => l.event === 'restore_drill.manifest_unverifiable');
+    expect(why?.detail).toMatchObject({
+      reason: 'key_version_unknown',
+      signature_key_version: 9,
+    });
+  });
+
+  it('refuses an ADULTERATED key-version selector rather than resolving it', async () => {
+    // Renaming the selector on a genuine envelope must not let it pick a key it
+    // was not signed with — and a selector that is not a positive integer is
+    // refused before it reaches the keyring at all.
+    const genuine = signManifest(manifest(), 'old-master', 1);
+
+    const relabelled = harness(
+      { manifestKeyring: rotatedKeyring },
+      {
+        candidates: {
+          offsite: candidate({
+            signed_manifest: { ...genuine, signature_key_version: 2 },
+          }),
+        },
+      },
+    );
+    const relabelledResult = await runRestoreDrill(relabelled.ports, prodProfile());
+    expect(relabelledResult.failure_code).toBe('manifest_unverifiable');
+    expect(
+      relabelled.logs.find((l) => l.event === 'restore_drill.manifest_unverifiable')?.detail,
+    ).toMatchObject({ reason: 'signature_mismatch' });
+
+    const malformed = harness(
+      { manifestKeyring: rotatedKeyring },
+      {
+        candidates: {
+          offsite: candidate({
+            signed_manifest: {
+              ...genuine,
+              signature_key_version: '1' as unknown as number,
+            },
+          }),
+        },
+      },
+    );
+    const malformedResult = await runRestoreDrill(malformed.ports, prodProfile());
+    expect(malformedResult.failure_code).toBe('manifest_unverifiable');
+    expect(
+      malformed.logs.find((l) => l.event === 'restore_drill.manifest_unverifiable')?.detail,
+    ).toMatchObject({ reason: 'invalid_key_version' });
   });
 
   it('binds the FETCHED bytes to the manifest ciphertext digest', async () => {

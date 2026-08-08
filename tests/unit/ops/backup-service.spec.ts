@@ -6,7 +6,7 @@ import {
   type UploadOutcome,
 } from '../../../src/ops/backup/service.js';
 import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
-import { verifyManifest } from '../../../src/ops/backup/manifest.js';
+import { verifyManifest, singleVersionKeyring } from '../../../src/ops/backup/manifest.js';
 import {
   canReleaseTraffic,
   planReconciliation,
@@ -385,7 +385,7 @@ describe('encryption', () => {
   it('keeps the plaintext digest in the manifest and the ciphertext digest beside it', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(encCfg));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     expect(verdict.ok).toBe(true);
     if (!verdict.ok) return;
     expect(verdict.manifest.sha256).toBe(DIGEST);
@@ -464,7 +464,7 @@ describe('off-site', () => {
   it('records HOW the remote copy was verified in the manifest', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(s3Cfg));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     if (!verdict.ok) throw new Error('manifest invalid');
     expect(verdict.manifest.verification.remote_verification_method).toBe('provider_checksum');
     expect(verdict.manifest.verification.remote_checksum_verified).toBe(true);
@@ -473,7 +473,7 @@ describe('off-site', () => {
   it('records `none` as the method when no upload was attempted', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     if (!verdict.ok) throw new Error('manifest invalid');
     expect(verdict.manifest.verification.remote_verification_method).toBe('none');
     expect(verdict.manifest.verification.remote_checksum_verified).toBe(false);
@@ -498,7 +498,7 @@ describe('manifest', () => {
   it('is signed and verifiable, and binds the run to its provenance', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     expect(verdict.ok).toBe(true);
     if (!verdict.ok) return;
     expect(verdict.manifest.migration_head).toBe('102_data_lifecycle.sql');
@@ -509,7 +509,7 @@ describe('manifest', () => {
   it('declares the data classes the dump does NOT cover', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     if (!verdict.ok) throw new Error('manifest invalid');
     expect(verdict.manifest.data_classes_excluded).toContain('media.blobs');
     expect(verdict.manifest.data_classes_excluded).toContain('gateway.baileys_session');
@@ -570,7 +570,7 @@ describe('tombstone ledger probe (round-1 P1)', () => {
     });
     const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
     expect(res.outcome).not.toBe('failed');
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     if (!verdict.ok) throw new Error('manifest invalid');
     expect(verdict.manifest.tombstone_watermark).not.toBeNull();
   });
@@ -585,7 +585,7 @@ describe('tombstone ledger probe (round-1 P1)', () => {
       }),
     });
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
-    const verdict = verifyManifest(h.manifests[0]!.signed, SECRET);
+    const verdict = verifyManifest(h.manifests[0]!.signed, singleVersionKeyring(SECRET, 1));
     if (!verdict.ok) throw new Error('manifest invalid');
 
     const plan = planReconciliation({

@@ -76,6 +76,7 @@ import {
   assertArtifactMatchesManifest,
   verifyManifest,
   type BackupManifest,
+  type ManifestKeyring,
 } from './manifest.js';
 import { digestsMatch } from './checksum.js';
 import { redactSecrets } from './redaction.js';
@@ -119,9 +120,16 @@ export type RestoreDrillFailureCode =
 export type RestoreDrillResidueKind =
   /** The ephemeral database — a full, unencrypted, untracked copy of production. */
   | 'drill_database'
-  /** The DECRYPTED dump: every tenant's data in plaintext, on disk. */
+  /**
+   * A PLAINTEXT dump on disk: every tenant's data, readable. Normally the
+   * decrypted copy the drill produced — but also the staged artifact itself
+   * under `encryption.mode='none'`, where "as stored" already means cleartext.
+   */
   | 'decrypted_plaintext'
-  /** The staged copy of the artifact as stored (still encrypted when the profile encrypts). */
+  /**
+   * The staged copy of the artifact as stored. Ciphertext by construction — a
+   * cleartext one is reported as `decrypted_plaintext`.
+   */
   | 'staged_artifact';
 
 /**
@@ -200,8 +208,18 @@ export interface RestoreDrillPorts {
    */
   selectCandidate(source: RestoreDrillSource): Promise<DrillCandidate | null>;
 
-  /** Secret the manifest signature is verified against. Lives outside the artifact. */
-  manifestSecret(): { secret: string };
+  /**
+   * The keyring the manifest signature is verified against. Lives outside the
+   * artifact, so an attacker holding the dump cannot forge a manifest for it.
+   *
+   * A KEYRING, not a secret: the envelope records `signature_key_version`, and
+   * a verifier handed only the CURRENT secret stops verifying every recovery
+   * point signed before the last rotation — so rotating the HMAC key would
+   * operationally destroy the ability to restore backups that are still inside
+   * their retention window. Resolution is by the version the envelope names,
+   * and an unknown version fails closed (issue #536, round-2 review of #541).
+   */
+  manifestKeyring(): ManifestKeyring;
 
   /** Path inside the drill workspace for a staged file named `name`. */
   stagingPath(name: string): string;
@@ -543,8 +561,28 @@ export async function runRestoreDrill(
       );
     }
 
-    const verified = verifyManifest(candidate.signed_manifest, ports.manifestSecret().secret);
+    // The envelope names WHICH key signed it. The keyring resolves that
+    // version — never "the current key" — so a recovery point signed before the
+    // last rotation stays verifiable for its whole retention window (issue
+    // #536, round-2 review of PR #541).
+    const declaredKeyVersion = (candidate.signed_manifest as { signature_key_version?: unknown })
+      ?.signature_key_version;
+    const verified = verifyManifest(candidate.signed_manifest, ports.manifestKeyring());
     if (!verified.ok) {
+      // The verdict collapses to one failure code on purpose — no oracle — but
+      // the operator still needs the two cases apart, and they have opposite
+      // remediations: `key_version_unknown` means THIS DEPLOYMENT no longer
+      // holds the key that signed a backup still inside its retention window
+      // (restore it into `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS`), while
+      // `signature_mismatch` means the manifest does not match its signature.
+      // The reason is a stable code and the key version is an integer, so
+      // neither discloses anything.
+      ports.log('restore_drill.manifest_unverifiable', {
+        drill_id,
+        correlation_id,
+        reason: verified.reason,
+        signature_key_version: typeof declaredKeyVersion === 'number' ? declaredKeyVersion : null,
+      });
       throw new TypedError('manifest_unverifiable', 'signed manifest did not verify', {
         reason: verified.reason,
       });
@@ -553,8 +591,36 @@ export async function runRestoreDrill(
 
     // ── fetch + bind the STORED bytes to the manifest ────────────────────
     const stagedCipher = ports.stagingPath(`${manifest.backup_id}.artifact`);
+    // OWNERSHIP IS REGISTERED BEFORE THE FETCH, for the same reason the
+    // plaintext path is registered before `decrypt` below — and this one was the
+    // hole that reason did not close (issue #536, round-2 review of PR #541).
+    // `fetchArtifact` STREAMS into this destination; a stream that dies after
+    // writing bytes leaves them there and throws. Registering on the way OUT —
+    // `if (fetched.ephemeral)`, which only runs when the fetch RETURNED — meant
+    // the teardown below never saw that partial artifact, swept an empty
+    // inventory, and let the drill finish `failed` + `cleanup_status='clean'`: a
+    // certification that the host is clean while a truncated production dump
+    // sits in the workspace, with no `unsafe` residue audit and no alert. Under
+    // `encryption.mode='none'` — legal outside the production profile — those
+    // bytes are a CLEARTEXT dump of every tenant.
+    //
+    // Registering up front is fail-closed and does not depend on any adapter's
+    // `catch` being right (a SIGKILL mid-stream has no `catch` at all): the
+    // drill NAMED this path, inside its own workspace, so it owns the slot
+    // whether or not anything was ever written to it. A slot that was never
+    // created is proven absent by `fileExists` and grades `clean` — the sweep's
+    // authority is the host, not this bookkeeping.
+    ephemeralFiles.add(stagedCipher);
     const fetched = await ports.fetchArtifact(candidate, stagedCipher);
+    // A LOCAL candidate is read IN PLACE and reports `ephemeral: false` over the
+    // recovery point itself, which must never be registered — the drill would
+    // delete the very artifact it exists to validate.
     if (fetched.ephemeral) ephemeralFiles.add(fetched.path);
+    // With `mode: 'none'` the artifact AS STORED is already the plaintext dump,
+    // so the staged copy is classified — and reported to the operator — with the
+    // severity it actually carries, rather than as a merely "staged" (implicitly
+    // still-encrypted) file.
+    if (manifest.encryption.mode === 'none') plaintextPath = stagedCipher;
     // Throws `backup_checksum_mismatch` / `backup_size_mismatch`, translated by
     // `drillFailureCode`. Compares against the CIPHERTEXT digest when encrypted.
     assertArtifactMatchesManifest(manifest, { sha256: fetched.sha256, bytes: fetched.bytes });

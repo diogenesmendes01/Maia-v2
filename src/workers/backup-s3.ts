@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { Transform, type Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -239,6 +239,14 @@ export async function downloadAndDigestBackupObject(
  * The digest returned is computed over what actually LANDED on disk, not over
  * what the provider said it would send, so a truncated transfer fails the
  * caller's manifest binding instead of reaching `pg_restore`.
+ *
+ * OWNERSHIP OF `destPath` IS THE CALLER'S (issue #536, round-2 review of PR
+ * #541). This function makes a best effort to remove a partial file it created
+ * when the stream dies, but that is a courtesy, not the guarantee: a SIGKILL
+ * mid-transfer has no `catch` to run. A caller must register `destPath` in its
+ * cleanup inventory BEFORE calling — `src/ops/backup/drill.ts` does — or a
+ * failed download leaves bytes nobody is tracking, which under
+ * `encryption.mode='none'` is a cleartext dump of every tenant.
  */
 export async function downloadBackupObjectToFile(
   key: string,
@@ -278,8 +286,21 @@ export async function downloadBackupObjectToFile(
     // append onto somebody else's bytes.
     await pipeline(body, meter, createWriteStream(destPath, { flags: 'wx' }));
   } catch (err) {
+    const cause = (err as NodeJS.ErrnoException).code ?? (err as Error).name;
+    // A stream that dies after writing bytes leaves them at `destPath`. Sweep
+    // them here so the residue window is the failure itself rather than
+    // everything up to the caller's teardown — best effort, and never the
+    // guarantee (see the header: the caller owns the destination).
+    //
+    // EEXIST is the ONE cause we must not act on. It means the `wx` flag
+    // refused to open a file that was ALREADY THERE, so those bytes are
+    // somebody else's — a concurrent writer, or a stale artifact an operator is
+    // mid-triage on. Deleting them is exactly what `wx` exists to prevent.
+    if (cause !== 'EEXIST') {
+      await rm(destPath, { force: true }).catch(() => undefined);
+    }
     throw new TypedError('artifact_fetch_failed', 'off-site object could not be staged locally', {
-      cause: (err as NodeJS.ErrnoException).code ?? (err as Error).name,
+      cause,
     });
   }
   return { sha256: hash.digest('hex'), bytes };

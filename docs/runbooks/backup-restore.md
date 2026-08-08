@@ -137,10 +137,12 @@ O drill nunca imprime o caminho nem o nome do banco (esses textos vão para log 
 | `kind` | Onde está | Como remover |
 |---|---|---|
 | `drill_database` | Um banco no mesmo cluster, nome `maia_drill_<stamp>_<12 hex do drill_id>` | `psql -d postgres -c 'DROP DATABASE "<nome>" WITH (FORCE)'` |
-| `decrypted_plaintext` | `BACKUP_DIR/restore-drill/<backup_id>.plain` — **dados de todos os tenants em claro** | `shred -u` (ou `rm`) o arquivo |
+| `decrypted_plaintext` | `BACKUP_DIR/restore-drill/<backup_id>.plain` — **dados de todos os tenants em claro**. Também é este o `kind` do `.artifact` quando o perfil roda com `encryption.mode='none'`: aí a cópia "como armazenada" já é o dump em claro | `shred -u` (ou `rm`) o arquivo |
 | `staged_artifact` | `BACKUP_DIR/restore-drill/<backup_id>.artifact` — cópia cifrada baixada do off-site | `rm` o arquivo |
 
 `reason` diz o que se sabe: `removal_failed` (a remoção deu erro), `still_present` (a remoção **reportou sucesso** e o recurso continua lá) ou `unverified` (não foi possível provar a ausência). Os três exigem a mesma ação — alguém precisa ir olhar.
+
+**Um download interrompido também deixa resíduo, e ele É inventariado.** O drill reivindica o caminho de staging **antes** de chamar o fetch, não depois que ele retorna (`src/ops/backup/drill.ts`, §"OWNERSHIP IS REGISTERED BEFORE THE FETCH"). Isso importa porque `downloadBackupObjectToFile` abre o destino com `wx` — o arquivo passa a existir no momento da abertura — e um stream que morre no meio deixa bytes lá. Até a review round-2 da PR #541 o registro acontecia só no retorno do fetch, então um `artifact_fetch_failed` varria um inventário vazio e o drill terminava `failed` + `cleanup_status='clean'`: uma certificação de host limpo com um dump parcial da produção no workspace, sem auditoria de resíduo e sem alerta. Hoje esse caso aparece como `staged_artifact` (ou `decrypted_plaintext`, se o perfil não cifra) com o `reason` correspondente.
 
 ```sql
 -- Drills com resíduo (índice parcial restore_drills_unsafe_idx)
@@ -196,6 +198,41 @@ O drill não está no cron por decisão: ele cria e derruba um banco, e o interv
 - **Drill de decrypt**: `verifyDecryptable` streama pelo decipher e descarta a saída — prova que a chave existe e a tag confere, sem materializar dado pessoal.
 - **Chave indisponível**: o backup **falha fechado**. Não existe fallback plaintext. Restaure o acesso à chave; não desligue a criptografia para "destravar" o job.
 - A chave nunca aparece em log, manifesto, métrica ou mensagem de erro — só o `key_id`.
+
+### 6.1 Chave de ASSINATURA do manifesto (HMAC) — outra chave, outra rotação
+
+A chave que **cifra** o artefato (`BACKUP_ENCRYPTION_KEYRING`, acima) não é a que **assina o manifesto**. A assinatura usa o mesmo material HMAC da auditoria — `RUNTIME_TRACE_HMAC_MASTER_SECRET` + `RUNTIME_TRACE_HMAC_KEY_VERSION` — porque ele já vive **fora** do artefato, que é o requisito da issue §5. O envelope grava qual versão assinou, em `backup_manifests.signature_key_version`.
+
+**Ao rotacionar (política de 90 dias), retenha o segredo anterior — pelo menos enquanto existir recovery point dentro da retenção.**
+
+```bash
+# Antes: RUNTIME_TRACE_HMAC_KEY_VERSION=1, MASTER_SECRET=<v1>
+RUNTIME_TRACE_HMAC_KEY_VERSION=2
+RUNTIME_TRACE_HMAC_MASTER_SECRET=<v2>
+RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS='1=<v1>'   # formato versao=segredo;versao=segredo
+```
+
+A verificação resolve a chave **pela versão que o envelope declara** (`src/ops/backup/manifest-keyring.ts`, que reutiliza o keyring de `src/control-plane/runtime-trace/lib/hmac.ts` — um parser só, para os dois consumidores). Um backup assinado com a v1 continua verificável depois da rotação para a v2.
+
+**Sintoma de ter retirado o segredo anterior cedo demais:** o drill falha com `manifest_unverifiable` em artefatos que estão intactos no disco e dentro da retenção. O que distingue esse caso de um manifesto adulterado é o log — mesmo `failure_code`, `reason` diferente (o código é deliberadamente único: um verificador não é oráculo para atacante):
+
+```bash
+# "esta instalação não tem mais a chave" → recoloque o segredo em PREV_MASTER_SECRETS
+grep restore_drill.manifest_unverifiable <log> | grep key_version_unknown
+# "a assinatura não bate com o conteúdo" → investigue adulteração, NÃO mexa em chave
+grep restore_drill.manifest_unverifiable <log> | grep signature_mismatch
+```
+
+O log carrega o `signature_key_version` declarado (um inteiro, não-sensível), então dá para casar direto com a linha em `backup_manifests`:
+
+```sql
+SELECT r.id, r.finished_at, m.signature_key_version
+  FROM backup_runs r JOIN backup_manifests m ON m.backup_run_id = r.id
+ WHERE r.state IN ('completed','completed_degraded')
+ ORDER BY r.finished_at DESC LIMIT 20;
+```
+
+Versão desconhecida **falha fechado**: nunca há fallback para "tenta com a chave atual". Um fallback esconderia o diagnóstico real e ainda aceitaria um envelope que renomeou a própria versão de chave.
 
 ## 7. Retenção, legal hold e LGPD
 
