@@ -88,12 +88,43 @@ export const entidadesRepo = {
    * under another tuple, and putting the predicate in the WHERE clause of a
    * LEFT JOIN would filter the whole row out instead of just the state half.
    *
-   * `limit` bounds the result the same way `entityStatesRepo.byIds` did; the
-   * join is 1:1 on a PK, so the row count is at most `ids.length`.
+   * ## The two sides have DIFFERENT cardinality (PR #541 review, finding 2)
+   *
+   * The first cut of this method took `limit = 500` and applied it to the JOINED
+   * row set, on the reasoning that it "bounds the result the same way
+   * `entityStatesRepo.byIds` did". It does not, and the difference is a
+   * correctness bug rather than a tuning choice:
+   *
+   *   - the pair this replaced was `entidadesRepo.byIds` (NO limit, ever) plus
+   *     `entityStatesRepo.byIds(ids, 500)` (limited). Only the STATE read was
+   *     capped;
+   *   - a scope can hold more than 500 entities — a tenant whose entities share
+   *     permission profiles passes `profilesRepo.byIds`'s own 500 cap on
+   *     distinct PROFILES while carrying thousands of entities;
+   *   - past row 500 the entity simply vanished from the result, so
+   *     `prompt-builder.ts`'s `ent?.nome ?? eid` fell through to the id and the
+   *     scope/permission block printed a raw UUID where a name belongs. That
+   *     block is declared NON-truncatable (`SECTION_BUDGETS` in
+   *     `agent/turn-context/types.ts` deliberately has no entry for it), and it
+   *     broke byte-identity for a set chosen by UUID ordering — i.e. which
+   *     names disappeared had nothing to do with the scope's own order.
+   *
+   * So the ENTITY side is unbounded, exactly as `byIds` is: it is already bound
+   * by `ids.length`, which the caller controls and `resolveScope` derives from
+   * granted permissions. `stateLimit` caps only the STATE projection, which is
+   * what the read it replaced actually capped — rows past the cap come back with
+   * `state: null`, the same shape an entity that genuinely has no state row has,
+   * and the same shape `entityStatesRepo.byIds`'s `LIMIT` produced. Because the
+   * cap is applied to state rows in id order it reproduces that `LIMIT` exactly.
+   *
+   * Applying it in the projection rather than as a SQL `LIMIT` keeps this ONE
+   * statement: a SQL limit here would have to bound entities, and bounding
+   * entities is the bug. The join is 1:1 on a PK, so the row count is at most
+   * `ids.length` either way — the statement cannot fan out.
    */
   async byIdsWithState(
     ids: string[],
-    limit = 500,
+    stateLimit = 500,
   ): Promise<Array<{ entidade: Entidade; state: EntityState | null }>> {
     if (ids.length === 0) return [];
     const tenant_id = getCurrentTenant();
@@ -118,10 +149,20 @@ export const entidadesRepo = {
       )
       // Deterministic order so the rendered blocks are byte-stable for the same
       // scope across turns. The caller re-sorts into scope order; ordering here
-      // just removes DB nondeterminism.
-      .orderBy(entidades.id)
-      .limit(limit);
-    return rows.map((r) => ({ entidade: r.entidade, state: r.state ?? null }));
+      // just removes DB nondeterminism — and it is also what makes `stateLimit`
+      // below reproduce the old `ORDER BY entidade_id LIMIT n` exactly.
+      .orderBy(entidades.id);
+
+    // Cap the STATE side only. `taken` counts rows that actually carry a state,
+    // so a scope of 600 entities where 40 have states keeps all 40 — the old
+    // `LIMIT` counted state ROWS too, not entities scanned.
+    let taken = 0;
+    return rows.map((r) => {
+      const state = r.state ?? null;
+      if (state === null || taken >= stateLimit) return { entidade: r.entidade, state: null };
+      taken++;
+      return { entidade: r.entidade, state };
+    });
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
     const guarded = applyTenantGuard(input);
