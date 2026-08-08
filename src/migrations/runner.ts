@@ -22,7 +22,7 @@
  *
  * ### Three transaction modes, because only one of them can be atomic
  *
- * **`runner`** — the file has no transaction control of its own (107 of the 118
+ * **`runner`** — the file has no transaction control of its own (110 of the 122
  * migrations on disk today). `BEGIN` → migration SQL → ledger row → `COMMIT`.
  * The ledger row is written inside the same transaction, so "applied" and
  * "recorded" really are atomic: a crash leaves neither. A clean SQL error rolls
@@ -38,6 +38,14 @@
  * runner stops pretending and uses the `running`-first protocol below, which
  * turns the silent gap into a visible dirty state.
  *
+ * `BEGIN;` alone does not make such a file atomic either, so discovery PROVES
+ * the shape: a `self` migration must be ONE complete `BEGIN; … COMMIT;` around
+ * all of its executable SQL. `BEGIN; … COMMIT; <one more statement>` commits
+ * the first part durably before the last one can fail, and is refused as an
+ * artifact problem before any DDL runs (`analyzeTransactionEnvelope` in
+ * `discover.ts`; `terminalLedgerStatusFor` below is the matching fail-closed
+ * classification).
+ *
  * **`none`** — `-- maia:no-transaction` (e.g. `CREATE INDEX CONCURRENTLY`,
  * which Postgres refuses inside `BEGIN`). Same protocol, statements sent one at
  * a time (node-postgres wraps a multi-statement `query()` in an implicit
@@ -47,7 +55,8 @@
  *   1. commit a `running` row BEFORE the first statement,
  *   2. run the migration,
  *   3. on success flip the row to `applied`; on a clean error flip it to
- *      `failed` (`self`, which rolled back) or `dirty` (`none`, which cannot).
+ *      `failed` (a `self` file whose single envelope really did roll back) or
+ *      `dirty` (`none`, and anything else that cannot prove a rollback).
  * If the process DIES at step 2 the row stays `running`, and the next run —
  * which holds the exclusive lock, so it knows no migrator is alive — promotes
  * it to `dirty`. A dirty migration is NEVER auto-retried and NEVER treated as
@@ -71,7 +80,12 @@ import {
 import { acquireMigrationLock, type LockDeps, type LockOptions } from './lock.js';
 import { computeMigrationStatus } from './status.js';
 import { shortChecksum } from './checksum.js';
-import type { MigrationStatusReport, SchemaBlocker } from './types.js';
+import type {
+  DiscoveredMigration,
+  MigrationArtifact,
+  MigrationStatusReport,
+  SchemaBlocker,
+} from './types.js';
 
 /** Bumped when the runner's ledger semantics change. Stamped on every row. */
 export const RUNNER_VERSION = '2.0.0';
@@ -161,11 +175,75 @@ export interface MigrationRunResult {
   readonly lock_waited_ms: number;
 }
 
+/**
+ * The ledger status a terminal failure gets: `failed` (retryable — nothing was
+ * left behind) or `dirty` (a partial change may be durable — never auto-retried).
+ *
+ * The rule is "record `failed` only where a rollback is PROVEN", not "record
+ * `failed` unless the file is no-transaction". The difference is the #541
+ * finding: the old test `transactionMode === 'none' ? 'dirty' : 'failed'` read
+ * a `self` file's `BEGIN;` as proof of atomicity, but `BEGIN; … COMMIT; <more>`
+ * carries the same `BEGIN;` and none of the guarantee — the earlier DDL is
+ * already durable, the runner's ROLLBACK is a no-op, and `failed` would put
+ * that half-applied schema straight back into the auto-retry queue.
+ *
+ * So the proof is now the ENVELOPE, computed at discovery
+ * (`analyzeTransactionEnvelope`), and anything unproven fails CLOSED to `dirty`
+ * (AGENTS.md §4 rule 2). Such a file is also refused as an artifact problem
+ * before any DDL runs, so in practice this branch is the second line of
+ * defence — it is what keeps the classification honest for any future caller
+ * that reaches the runner with an artifact whose problems it chose to ignore.
+ */
+export function terminalLedgerStatusFor(
+  migration: Pick<DiscoveredMigration, 'transactionMode' | 'transactionEnvelope'>,
+): 'dirty' | 'failed' {
+  switch (migration.transactionMode) {
+    // The runner's own BEGIN/COMMIT wraps the DDL and the ledger row together.
+    case 'runner':
+      return 'failed';
+    // Proven atomic only when the file is ONE complete envelope.
+    case 'self':
+      return migration.transactionEnvelope === 'single_complete' ? 'failed' : 'dirty';
+    // No transaction at all: a partial change is the expected failure mode.
+    case 'none':
+      return 'dirty';
+  }
+}
+
 function errorClass(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === 'string' && code.length > 0) return code;
   if (err instanceof Error) return err.constructor.name;
   return 'UnknownError';
+}
+
+/**
+ * Re-read the ledger and recompute `status` from it.
+ *
+ * `MigrationStatusReport` is contracted as the COMPLETE description of artifact
+ * × database, so it may never be a snapshot taken at some earlier point of the
+ * run. It is recomputed at every return that follows a ledger write — including
+ * the failure return, which is the #541 finding: reusing the pre-loop snapshot
+ * there produced a result whose `failure.ledger_status` said `dirty` while
+ * `status.entries` still classified the very same migration as `pending`, and
+ * which listed migrations this run had just applied as still pending. `maia
+ * doctor` and any automation reading `status` would remediate the wrong thing.
+ *
+ * `lockHeld: true` is correct for every caller here: we hold the exclusive
+ * advisory lock, so a `running` row can only be crash debris. In particular, if
+ * `markTerminalFailure` itself failed, the row stays `running` and the
+ * recomputed report says `orphaned_running` — which is exactly what it is.
+ */
+async function readStatus(
+  client: LedgerClient,
+  artifact: MigrationArtifact,
+): Promise<MigrationStatusReport> {
+  const ledger = await readLedger(client, { present: true, version: 2 });
+  return computeMigrationStatus(artifact, ledger, {
+    ledgerPresent: true,
+    ledgerVersion: 2,
+    lockHeld: true,
+  });
 }
 
 async function applyTimeouts(
@@ -271,12 +349,7 @@ async function applyUnderLock(
     });
   }
 
-  const ledger = await readLedger(client, { present: true, version: 2 });
-  const status = computeMigrationStatus(artifact, ledger, {
-    ledgerPresent: true,
-    ledgerVersion: 2,
-    lockHeld: true,
-  });
+  const status = await readStatus(client, artifact);
 
   const blockers: SchemaBlocker[] = [];
   for (const entry of status.entries) {
@@ -397,11 +470,10 @@ async function applyUnderLock(
       }
     } catch (err) {
       const cls = errorClass(err);
-      // `dirty` only where a partial change is actually possible. A no-tx file
-      // has no rollback at all; a self-transactional file DOES roll back, so it
-      // is retryable — its `running` row only becomes dirty if the process dies
-      // before this handler runs.
-      const ledgerStatus = migration.transactionMode === 'none' ? 'dirty' : 'failed';
+      // `dirty` only where a partial change is actually possible — decided from
+      // the file's PROVEN transaction envelope, not from its `BEGIN;`. See
+      // `terminalLedgerStatusFor`.
+      const ledgerStatus = terminalLedgerStatusFor(migration);
       await markTerminalFailure(
         client,
         id,
@@ -417,6 +489,13 @@ async function applyUnderLock(
         error_class: cls,
         transaction_mode: migration.transactionMode,
       });
+      // The ledger moved twice since `status` was computed — every migration
+      // applied above, plus the row just written for this failure — so the
+      // snapshot is re-read rather than reused. If the re-read itself fails
+      // (a dead connection is a plausible cause of the failure we are already
+      // reporting), `status` is `null`: the documented "could not be
+      // established" value, never a stale report presented as current.
+      const failureStatus = await readStatus(client, artifact).catch(() => null);
       return {
         ok: false,
         outcome: 'failed',
@@ -430,7 +509,7 @@ async function applyUnderLock(
             detail: `migration "${id}" failed (${cls}); recorded as ${ledgerStatus}. Subsequent migrations were NOT attempted.`,
           },
         ],
-        status,
+        status: failureStatus,
         failure: { id, error_class: cls, ledger_status: ledgerStatus },
         lock_waited_ms: lockWaited,
       };
@@ -455,7 +534,6 @@ async function applyUnderLock(
     });
   }
 
-  const finalLedger = await readLedger(client, { present: true, version: 2 });
   return {
     ok: true,
     outcome: 'applied',
@@ -463,11 +541,7 @@ async function applyUnderLock(
     backfilled,
     orphaned,
     blockers: [],
-    status: computeMigrationStatus(artifact, finalLedger, {
-      ledgerPresent: true,
-      ledgerVersion: 2,
-      lockHeld: true,
-    }),
+    status: await readStatus(client, artifact),
     lock_waited_ms: lockWaited,
   };
 }

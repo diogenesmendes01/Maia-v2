@@ -107,7 +107,11 @@ Before applying anything it **refuses** (exit 1, nothing executed) when:
 - an applied migration has no recorded checksum and no packaged file to
   adopt one from;
 - the database ran a migration this build does not ship;
-- a forward migration on disk has no `_down.sql` sibling.
+- a forward migration on disk has no `_down.sql` sibling;
+- a migration that manages its own transaction is **not** one complete
+  `BEGIN; … COMMIT;` envelope — a statement outside it, two envelopes,
+  or an envelope that is never closed. See
+  [Fixing `unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope).
 
 A second migrator started concurrently **waits** for the first (30s by
 default) and then exits cleanly with `lock_unavailable` — it never
@@ -123,11 +127,40 @@ it in staging first and compare `tsx scripts/migrate.ts status` output
 between staging and production before rolling forward. After adoption,
 any divergence is a hard blocker.
 
+### Fixing `unverifiable_transaction_envelope`
+
+This blocker is about the **repository**, not the database: nothing was
+applied and nothing needs repairing. The migration wraps itself in
+`BEGIN; … COMMIT;` but does not keep all of its SQL inside that one
+envelope, so a failure in the part left outside would leave a durably
+committed half — and the runner would have no way to tell that apart
+from a clean rollback.
+
+The blocker names the exact defect (`statement_after_commit`,
+`multiple_envelopes`, `unterminated_envelope`, `statement_before_begin`,
+`unbalanced_control`, `self_rollback`). Two ways to fix the file, both
+in the PR that introduced it — never by editing a migration that has
+already been applied anywhere:
+
+1. Move every statement inside the single `BEGIN; … COMMIT;`; or
+2. **delete** the `BEGIN;`/`COMMIT;` lines and let the runner own the
+   transaction. This is the better default: the runner then commits the
+   ledger row in the *same* transaction as the schema change, which is
+   the only mode in this system where "applied" and "recorded" are
+   genuinely atomic.
+
+A migration that truly cannot run inside a transaction (`CREATE INDEX
+CONCURRENTLY`) takes neither route — it declares
+`-- maia:no-transaction` and omits the transaction block entirely.
+
 ## Recovering a dirty migration
 
-`dirty` means a `-- maia:no-transaction` migration failed partway, so
-some statements may have taken effect and others may not. It is never
-auto-retried and never treated as success.
+`dirty` means a migration failed partway with no rollback to fall back
+on — normally a `-- maia:no-transaction` file, so some statements may
+have taken effect and others may not. It is never auto-retried and never
+treated as success. (A self-transactional migration whose envelope could
+not be proven complete is classified the same way, but in practice it is
+refused as an artifact problem before it can run.)
 
 1. **Read the ledger row** — it names the migration and the error class:
 
@@ -292,6 +325,14 @@ time. The two are reviewed together.
    numbers, append a lowercase letter to sequence it (`038b`, `038c`) —
    that token is distinct and sorts after the bare number.
 2. Create `migrations/NNN_<short_name>.sql` with the forward changes.
+   Prefer **no transaction control at all** in the file: the runner then
+   wraps the whole migration and its ledger row in one transaction,
+   which is the only genuinely atomic mode. If you do write your own
+   `BEGIN; … COMMIT;`, every executable statement must sit inside that
+   single envelope — `migrate up` refuses the file otherwise
+   ([`unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope)).
+   A migration that cannot run in a transaction declares
+   `-- maia:no-transaction` and omits the block.
 3. Create `migrations/NNN_<short_name>_down.sql` that reverses them
    coherently:
    - Header:

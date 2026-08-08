@@ -15,16 +15,21 @@
  * `_down.sql`.
  */
 export {
+  analyzeTransactionEnvelope,
   buildMigrationArtifact,
   compareMigrationIds,
   discoverMigrations,
   downSiblingOf,
+  hasOwnTransactionControl,
   isForwardMigration,
   prefixOf,
   splitNoTxStatements,
+  splitTopLevelStatements,
   statementTimeoutOf,
   NO_TX_MARKER,
   STATEMENT_TIMEOUT_MARKER,
+  type EnvelopeAnalysis,
+  type EnvelopeDefect,
   type MigrationSource,
 } from './discover.js';
 
@@ -71,6 +76,7 @@ export {
   repairAppliedRefusal,
   repairMigration,
   runMigrations,
+  terminalLedgerStatusFor,
   DEFAULT_STATEMENT_LOCK_TIMEOUT_MS,
   RUNNER_VERSION,
   type MigrationEventSink,

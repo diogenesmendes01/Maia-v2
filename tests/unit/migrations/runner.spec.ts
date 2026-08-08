@@ -22,6 +22,7 @@ import {
   runMigrations,
   repairMigration,
   repairAppliedRefusal,
+  terminalLedgerStatusFor,
   RUNNER_VERSION,
 } from '@/migrations/runner.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
@@ -38,6 +39,11 @@ const TX_B = 'CREATE TABLE b (id TEXT);\n';
 const SELF_TX = 'BEGIN;\nCREATE TABLE c (id TEXT);\nCOMMIT;\n';
 /** `none` mode: CONCURRENTLY DDL, which Postgres refuses inside a transaction. */
 const NO_TX = '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY i1 ON a (id);\nCREATE INDEX CONCURRENTLY i2 ON a (id);\n';
+/**
+ * `self` mode WITHOUT the guarantee: the same `BEGIN;` as `SELF_TX`, but a
+ * statement outside the envelope. The DDL is durable before that statement runs.
+ */
+const LEAKY_SELF_TX = 'BEGIN;\nCREATE TABLE c (id TEXT);\nCOMMIT;\nANALYZE c;\n';
 
 let dir: string;
 
@@ -575,5 +581,151 @@ describe('repairMigration — `--as applied` demands something verifiable', () =
       ok: false,
       reason: expect.stringContaining('non-empty --reason'),
     });
+  });
+});
+
+/**
+ * Finding 1 of the #541 review — the failure path returned a status snapshot
+ * taken BEFORE the loop ran.
+ *
+ * `MigrationStatusReport` is contracted as the complete description of artifact
+ * × database. Returning the pre-loop snapshot next to a `failure` field
+ * produced a self-contradictory result: `failure.ledger_status = "dirty"` beside
+ * an entry still classified `pending`, and migrations this very run had applied
+ * listed as pending too. `maia doctor` and any automation reading `status`
+ * would then remediate a database that no longer exists.
+ */
+describe('runMigrations — `status` on the failure path describes the ledger AFTER the run', () => {
+  const TX_C = 'CREATE TABLE c2 (id TEXT);\n';
+
+  it('transactional failure: applied → applied, failed → failed, untouched → pending', async () => {
+    await write('001_a.sql', TX_A);
+    await write('002_bad.sql', TX_B);
+    await write('003_c.sql', TX_C);
+    const db = new FakeDb({
+      failOnSql: (sql) => {
+        if (sql.includes('CREATE TABLE b')) throw Object.assign(new Error('boom'), { code: '42P07' });
+      },
+    });
+
+    const result = await runMigrations(deps(db));
+    expect(result.outcome).toBe('failed');
+    expect(result.applied).toEqual(['001_a.sql']);
+    expect(result.failure).toEqual({
+      id: '002_bad.sql',
+      error_class: '42P07',
+      ledger_status: 'failed',
+    });
+
+    const status = result.status!;
+    const state = (id: string) => status.entries.find((e) => e.id === id)!.state;
+    // The migration this run applied is NOT still pending.
+    expect(state('001_a.sql')).toBe('applied');
+    // The failure is visible in the report, not only in `failure`.
+    expect(state('002_bad.sql')).toBe('failed');
+    expect(state('003_c.sql')).toBe('pending');
+    expect(status.counts).toMatchObject({ total: 3, applied: 1, failed: 1, pending: 1, dirty: 0 });
+    expect(status.applied_head).toBe('001_a.sql');
+    // `status` and `failure` cannot disagree about the same id.
+    expect(state(result.failure!.id)).toBe(result.failure!.ledger_status);
+  });
+
+  it('no-transaction failure: the dirty row is dirty in `status.entries` too', async () => {
+    await write('001_a.sql', TX_A);
+    await write('002_idx.sql', NO_TX);
+    await write('003_b.sql', TX_B);
+    const db = new FakeDb({
+      failOnSql: (sql) => {
+        if (sql.includes('i2')) throw Object.assign(new Error('deadlock'), { code: '40P01' });
+      },
+    });
+
+    const result = await runMigrations(deps(db));
+    expect(result.failure).toEqual({
+      id: '002_idx.sql',
+      error_class: '40P01',
+      ledger_status: 'dirty',
+    });
+
+    const status = result.status!;
+    const entry = (id: string) => status.entries.find((e) => e.id === id)!;
+    expect(entry('001_a.sql').state).toBe('applied');
+    expect(entry('002_idx.sql').state).toBe('dirty');
+    // And it carries the blocking bit, so a consumer does not have to re-derive
+    // that this schema must not take traffic.
+    expect(entry('002_idx.sql').blocking).toBe(true);
+    expect(entry('002_idx.sql').error_class).toBe('40P01');
+    expect(entry('003_b.sql').state).toBe('pending');
+    expect(status.counts).toMatchObject({ total: 3, applied: 1, dirty: 1, pending: 1, failed: 0 });
+    expect(status.applied_head).toBe('001_a.sql');
+    expect(entry(result.failure!.id).state).toBe(result.failure!.ledger_status);
+  });
+
+  it('the success path reports the same way — no migration it applied is left pending', async () => {
+    await write('001_a.sql', TX_A);
+    await write('002_b.sql', TX_B);
+    const db = new FakeDb();
+    const result = await runMigrations(deps(db));
+    expect(result.status!.pending).toEqual([]);
+    expect(result.status!.counts).toMatchObject({ total: 2, applied: 2, pending: 0 });
+  });
+});
+
+/**
+ * Finding 2 of the #541 review — `BEGIN;` is not proof of atomicity.
+ *
+ * `BEGIN; … COMMIT; <statement>` was classified `self`, so a failure in that
+ * trailing statement was recorded as `failed`, i.e. AUTO-RETRIED, even though
+ * the DDL inside the envelope had already committed and the runner's `ROLLBACK`
+ * had nothing to undo. The property is now proven per file at discovery, and
+ * anything unproven fails closed.
+ */
+describe('runMigrations — the self-transactional envelope guardrail', () => {
+  it('refuses a `self` file whose SQL is not one complete envelope, before any DDL', async () => {
+    await write('001_leaky.sql', LEAKY_SELF_TX);
+    const events: { event: string; detail: Record<string, unknown> }[] = [];
+    const db = new FakeDb();
+
+    const result = await runMigrations(deps(db, events));
+
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe('blocked');
+    const blocker = result.blockers.find((b) => b.id === '001_leaky.sql')!;
+    expect(blocker.kind).toBe('artifact_integrity');
+    expect(blocker.detail).toContain('statement_after_commit');
+    // Nothing ran and nothing was recorded: the refusal precedes the schema.
+    expect(db.executedSql).toEqual([]);
+    expect(db.ledger.has('001_leaky.sql')).toBe(false);
+    expect(events.map((e) => e.event)).toContain('migration.blocked');
+    // The lock is still released.
+    expect(db.unlocks).toBe(1);
+  });
+
+  it('still applies the well-formed envelope it is modelled on', async () => {
+    await write('001_self.sql', SELF_TX);
+    const db = new FakeDb();
+    const result = await runMigrations(deps(db));
+    expect(result.outcome).toBe('applied');
+    expect(result.blockers).toEqual([]);
+  });
+
+  it('classifies a terminal failure from the PROVEN envelope, not from `BEGIN;`', () => {
+    // The runner wraps it, so the ledger row rolls back with the DDL.
+    expect(
+      terminalLedgerStatusFor({ transactionMode: 'runner', transactionEnvelope: 'absent' }),
+    ).toBe('failed');
+    // One complete envelope: the error aborts it and the trailing COMMIT
+    // degrades to a rollback, so retrying really is safe.
+    expect(
+      terminalLedgerStatusFor({ transactionMode: 'self', transactionEnvelope: 'single_complete' }),
+    ).toBe('failed');
+    // Own transaction control that proves nothing ⇒ fail closed.
+    expect(
+      terminalLedgerStatusFor({ transactionMode: 'self', transactionEnvelope: 'unverifiable' }),
+    ).toBe('dirty');
+    // No transaction at all: a partial change is the expected failure mode.
+    expect(terminalLedgerStatusFor({ transactionMode: 'none', transactionEnvelope: 'absent' })).toBe(
+      'dirty',
+    );
   });
 });

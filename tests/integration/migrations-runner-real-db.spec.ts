@@ -181,6 +181,7 @@ d('migration runner — real Postgres (#516)', () => {
   it('a transactional failure leaves NO partial change and a retryable row', async () => {
     await write('001_plain.sql', PLAIN);
     await write('002_bad.sql', 'CREATE TABLE t_ok (id TEXT);\nSELECT nonexistent_fn();\n');
+    await write('003_later.sql', 'CREATE TABLE t_later (id TEXT);\n');
     const result = await runMigrations(deps());
     expect(result.outcome).toBe('failed');
     expect(result.failure?.ledger_status).toBe('failed');
@@ -195,6 +196,17 @@ d('migration runner — real Postgres (#516)', () => {
     );
     expect(row.rows[0]!.status).toBe('failed');
     expect(row.rows[0]!.applied_at).toBeNull();
+
+    // #541 finding 1: `status` is the ledger as it stands NOW, not the snapshot
+    // taken before the loop. It must agree with the rows just read back.
+    const status = result.status!;
+    const state = (id: string) => status.entries.find((e) => e.id === id)!.state;
+    expect(state('001_plain.sql')).toBe('applied');
+    expect(state('002_bad.sql')).toBe('failed');
+    expect(state('003_later.sql')).toBe('pending');
+    expect(status.counts).toMatchObject({ total: 3, applied: 1, failed: 1, pending: 1, dirty: 0 });
+    expect(status.applied_head).toBe('001_plain.sql');
+    expect(state(result.failure!.id)).toBe(result.failure!.ledger_status);
   }, 30_000);
 
   it('a no-transaction failure leaves a DIRTY row that blocks every later run', async () => {
@@ -221,6 +233,20 @@ d('migration runner — real Postgres (#516)', () => {
     const partial = await pool.query('SELECT 1 FROM pg_indexes WHERE indexname = $1', ['ok_idx']);
     expect(partial.rows).toHaveLength(1);
 
+    // #541 finding 1: the report returned WITH the failure already says dirty.
+    // Before the fix it still said `pending` for this id — while `failure`
+    // beside it said `dirty` — and listed 001 (applied moments earlier in this
+    // very run) as pending too.
+    const status = failed.status!;
+    const entry = (id: string) => status.entries.find((e) => e.id === id)!;
+    expect(entry('001_plain.sql').state).toBe('applied');
+    expect(entry('002_idx.sql').state).toBe('dirty');
+    expect(entry('002_idx.sql').blocking).toBe(true);
+    expect(entry('003_plain.sql').state).toBe('pending');
+    expect(status.counts).toMatchObject({ total: 3, applied: 1, dirty: 1, pending: 1, failed: 0 });
+    expect(status.applied_head).toBe('001_plain.sql');
+    expect(entry(failed.failure!.id).state).toBe(failed.failure!.ledger_status);
+
     // Dirty blocks: 003 is never attempted, on this run or the next.
     const blocked = await runMigrations(deps());
     expect(blocked.outcome).toBe('blocked');
@@ -234,6 +260,72 @@ d('migration runner — real Postgres (#516)', () => {
     expect(readiness.ready).toBe(false);
     expect(readiness.state).toBe('blocked');
   }, 60_000);
+
+  /**
+   * #541 finding 2 — `BEGIN;` is not proof that a `self` migration is atomic.
+   *
+   * This is the case a fake cannot settle, because the question is what REAL
+   * Postgres does: after the file's own `COMMIT`, the DDL is durable, so the
+   * `ROLLBACK` the runner issues in its catch block undoes nothing and the
+   * migration would be filed as `failed` — the auto-retried status — on top of
+   * a half-applied schema. The first assertion proves the hazard against the
+   * server; the second proves the runner now refuses the file before it runs.
+   */
+  it('proves the hazard: after a file COMMITs, a later failure is NOT rolled back', async () => {
+    const client = await pool.connect();
+    try {
+      await expect(
+        client.query('BEGIN;\nCREATE TABLE t_leaky (id TEXT);\nCOMMIT;\nSELECT nonexistent_fn();\n'),
+      ).rejects.toThrow();
+      // Exactly what the old catch block did before recording `failed`.
+      await client.query('ROLLBACK').catch(() => undefined);
+    } finally {
+      client.release();
+    }
+    const t = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_leaky`,
+    ]);
+    // Durable. `failed` (retryable) would have been a lie about this schema.
+    expect(t.rows[0]).toEqual({ present: true });
+  }, 30_000);
+
+  it('refuses a `self` migration whose SQL is not one complete envelope', async () => {
+    await write('001_plain.sql', PLAIN);
+    await write(
+      '002_leaky.sql',
+      'BEGIN;\nCREATE TABLE t_leaky (id TEXT);\nCOMMIT;\nSELECT nonexistent_fn();\n',
+    );
+
+    const result = await runMigrations(deps());
+    expect(result.outcome).toBe('blocked');
+    const blocker = result.blockers.find((b) => b.id === '002_leaky.sql')!;
+    expect(blocker.kind).toBe('artifact_integrity');
+    expect(blocker.detail).toContain('statement_after_commit');
+
+    // Refused before ANY DDL: not even the well-formed 001 was applied.
+    const created = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_leaky`,
+    ]);
+    expect(created.rows[0]).toEqual({ present: false });
+    const plain = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_plain`,
+    ]);
+    expect(plain.rows[0]).toEqual({ present: false });
+    const rows = await pool.query('SELECT id FROM schema_migrations');
+    expect(rows.rows).toEqual([]);
+  }, 30_000);
+
+  it('applies a well-formed self-transactional file and records it verified', async () => {
+    await write('001_self.sql', SELF_TX);
+    const result = await runMigrations(deps());
+    expect(result.outcome).toBe('applied');
+    expect(result.blockers).toEqual([]);
+    const row = await pool.query<{ status: string; checksum_source: string }>(
+      'SELECT status, checksum_source FROM schema_migrations WHERE id = $1',
+      ['001_self.sql'],
+    );
+    expect(row.rows[0]).toEqual({ status: 'applied', checksum_source: 'computed' });
+  }, 30_000);
 
   it('a crashed run (`running` row) is promoted to dirty on the next pass', async () => {
     await write('001_plain.sql', PLAIN);

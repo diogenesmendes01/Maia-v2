@@ -9,15 +9,19 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  analyzeTransactionEnvelope,
   buildMigrationArtifact,
   compareMigrationIds,
   discoverMigrations,
   downSiblingOf,
+  hasOwnTransactionControl,
   isForwardMigration,
   prefixOf,
   splitNoTxStatements,
+  splitTopLevelStatements,
   statementTimeoutOf,
   NO_TX_MARKER,
+  OWN_TRANSACTION_MARKER,
   type MigrationSource,
 } from '@/migrations/discover.js';
 import { join } from 'node:path';
@@ -136,6 +140,181 @@ describe('no-transaction statement splitter (behaviour preserved from PR #310)',
   });
 });
 
+/**
+ * The second medium finding from the #541 review.
+ *
+ * "The file contains `BEGIN;`" was being read as "the file is atomic". It is
+ * not: `BEGIN; … COMMIT; <one more statement>` has the same `BEGIN;` and none
+ * of the guarantee — by the time the trailing statement fails, everything
+ * inside the envelope is already durable, the runner's `ROLLBACK` is a no-op,
+ * and the run would be filed as `failed` (auto-retried) on top of a
+ * half-applied schema. So the property has to be PROVEN per file, not assumed.
+ */
+describe('top-level statement tokeniser', () => {
+  it('splits on top-level semicolons only', () => {
+    expect(splitTopLevelStatements('BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\n')).toEqual([
+      'BEGIN',
+      'CREATE TABLE a (id TEXT)',
+      'COMMIT',
+    ]);
+  });
+
+  it('keeps a dollar-quoted body whole, semicolons and all', () => {
+    const sql = "CREATE FUNCTION f() RETURNS trigger AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n";
+    const statements = splitTopLevelStatements(sql);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain('LANGUAGE plpgsql');
+  });
+
+  it('ignores semicolons inside comments, literals and quoted identifiers', () => {
+    expect(splitTopLevelStatements('SELECT 1; -- a; comment\n')).toEqual(['SELECT 1']);
+    expect(splitTopLevelStatements('SELECT 1 /* a; b */;')).toEqual(['SELECT 1']);
+    expect(splitTopLevelStatements("INSERT INTO t VALUES ('a;b');")).toEqual([
+      "INSERT INTO t VALUES ('a;b')",
+    ]);
+    expect(splitTopLevelStatements('SELECT "we;ird" FROM t;')).toEqual(['SELECT "we;ird" FROM t']);
+  });
+
+  it('returns a trailing unterminated fragment instead of dropping it', () => {
+    // Dropping it is exactly how "there is code after the COMMIT" hides.
+    expect(splitTopLevelStatements('BEGIN;\nSELECT 1;\nCOMMIT;\nANALYZE t')).toEqual([
+      'BEGIN',
+      'SELECT 1',
+      'COMMIT',
+      'ANALYZE t',
+    ]);
+  });
+
+  it('does not mistake a $1 bind placeholder for a dollar quote', () => {
+    expect(splitTopLevelStatements('SELECT $1; SELECT $2;')).toEqual(['SELECT $1', 'SELECT $2']);
+  });
+});
+
+describe('transaction envelope analysis', () => {
+  it('reports `absent` when the runner owns the transaction', () => {
+    expect(analyzeTransactionEnvelope('CREATE TABLE a (id TEXT);\n')).toEqual({
+      envelope: 'absent',
+      defect: null,
+      detail: null,
+    });
+    expect(hasOwnTransactionControl('CREATE TABLE a (id TEXT);\n')).toBe(false);
+  });
+
+  it('reports `single_complete` for one envelope around the whole file', () => {
+    const analysis = analyzeTransactionEnvelope('BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\n');
+    expect(analysis.envelope).toBe('single_complete');
+    expect(analysis.defect).toBeNull();
+    expect(hasOwnTransactionControl('BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\n')).toBe(true);
+  });
+
+  it('accepts `END;` as the COMMIT synonym Postgres documents', () => {
+    expect(analyzeTransactionEnvelope('BEGIN;\nSELECT 1;\nEND;\n').envelope).toBe(
+      'single_complete',
+    );
+  });
+
+  it('accepts BEGIN/START TRANSACTION spellings a line-anchored regex misses', () => {
+    // The pre-fix classifier only matched `BEGIN;` / `START TRANSACTION;`, so a
+    // file opening with `BEGIN WORK;` was filed as `runner` mode and got a
+    // SECOND, nested BEGIN from the runner — the original #516 defect.
+    expect(OWN_TRANSACTION_MARKER.test('BEGIN WORK;\nSELECT 1;\nCOMMIT;\n')).toBe(false);
+    expect(analyzeTransactionEnvelope('BEGIN WORK;\nSELECT 1;\nCOMMIT;\n').envelope).toBe(
+      'single_complete',
+    );
+    expect(
+      analyzeTransactionEnvelope(
+        'START TRANSACTION ISOLATION LEVEL SERIALIZABLE;\nSELECT 1;\nCOMMIT;\n',
+      ).envelope,
+    ).toBe('single_complete');
+  });
+
+  it('does NOT see the PL/pgSQL block opener inside a dollar-quoted body', () => {
+    const sql =
+      'CREATE FUNCTION f() RETURNS trigger AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n';
+    expect(analyzeTransactionEnvelope(sql).envelope).toBe('absent');
+  });
+
+  it('does NOT see a BEGIN that only appears in a comment', () => {
+    expect(analyzeTransactionEnvelope('-- BEGIN;\nCREATE TABLE a (id TEXT);\n').envelope).toBe(
+      'absent',
+    );
+  });
+
+  it('rejects a statement AFTER the COMMIT — the finding, exactly', () => {
+    const analysis = analyzeTransactionEnvelope(
+      'BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nANALYZE a;\n',
+    );
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('statement_after_commit');
+    expect(analysis.detail).toContain('already durable');
+  });
+
+  it('rejects a statement BEFORE the BEGIN', () => {
+    const analysis = analyzeTransactionEnvelope('SET work_mem = "64MB";\nBEGIN;\nSELECT 1;\nCOMMIT;\n');
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('statement_before_begin');
+  });
+
+  it('rejects two envelopes in one file', () => {
+    const analysis = analyzeTransactionEnvelope(
+      'BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nBEGIN;\nCREATE TABLE b (id TEXT);\nCOMMIT;\n',
+    );
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('multiple_envelopes');
+  });
+
+  it('rejects an envelope that is never closed', () => {
+    const analysis = analyzeTransactionEnvelope('BEGIN;\nCREATE TABLE a (id TEXT);\n');
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('unterminated_envelope');
+  });
+
+  it('rejects a COMMIT with no BEGIN of its own', () => {
+    const analysis = analyzeTransactionEnvelope('CREATE TABLE a (id TEXT);\nCOMMIT;\n');
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('unbalanced_control');
+  });
+
+  it('rejects a file that discards its own work', () => {
+    const analysis = analyzeTransactionEnvelope('BEGIN;\nCREATE TABLE a (id TEXT);\nROLLBACK;\n');
+    expect(analysis.envelope).toBe('unverifiable');
+    expect(analysis.defect).toBe('self_rollback');
+  });
+});
+
+describe('buildMigrationArtifact — the envelope guardrail', () => {
+  it('refuses a self-transactional file whose SQL is not one complete envelope', () => {
+    const artifact = buildMigrationArtifact(
+      [src('001_a.sql', 'BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\nANALYZE a;\n')],
+      ['001_a_down.sql'],
+    );
+    expect(artifact.problems.map((p) => p.kind)).toEqual(['unverifiable_transaction_envelope']);
+    expect(artifact.problems[0]!.id).toBe('001_a.sql');
+    expect(artifact.problems[0]!.detail).toContain('statement_after_commit');
+    // Still discovered: the report names the file rather than hiding it.
+    expect(artifact.byId.get('001_a.sql')?.transactionMode).toBe('self');
+    expect(artifact.byId.get('001_a.sql')?.transactionEnvelope).toBe('unverifiable');
+  });
+
+  it('accepts the well-formed envelope with no problem at all', () => {
+    const artifact = buildMigrationArtifact(
+      [src('001_a.sql', 'BEGIN;\nCREATE TABLE a (id TEXT);\nCOMMIT;\n')],
+      ['001_a_down.sql'],
+    );
+    expect(artifact.problems).toEqual([]);
+    expect(artifact.byId.get('001_a.sql')?.transactionEnvelope).toBe('single_complete');
+  });
+
+  it('leaves no-transaction files alone — they never claimed atomicity', () => {
+    const artifact = buildMigrationArtifact(
+      [src('001_a.sql', '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a);\n')],
+      ['001_a_down.sql'],
+    );
+    expect(artifact.problems).toEqual([]);
+    expect(artifact.byId.get('001_a.sql')?.transactionMode).toBe('none');
+  });
+});
+
 describe('the real migrations/ directory', () => {
   it('discovers every forward migration, each with a down sibling', async () => {
     const artifact = await discoverMigrations(join(process.cwd(), 'migrations'));
@@ -144,6 +323,34 @@ describe('the real migrations/ directory', () => {
     // here BLOCKS `migrate up`, so it must never land on main.
     expect(artifact.problems).toEqual([]);
     expect(artifact.head).toBe(artifact.migrations[artifact.migrations.length - 1]!.id);
+  });
+
+  it('every self-transactional migration on disk IS one complete envelope', async () => {
+    // The five that exist today satisfy it; this is the guardrail that keeps the
+    // sixth from arriving without anyone noticing.
+    const artifact = await discoverMigrations(join(process.cwd(), 'migrations'));
+    const self = artifact.migrations.filter((m) => m.transactionMode === 'self');
+    expect(self.length).toBeGreaterThan(0);
+    for (const m of self) {
+      expect(m.transactionEnvelope, m.id).toBe('single_complete');
+    }
+  });
+
+  it('classifies the packaged files exactly as the pre-tokeniser regex did', async () => {
+    // The tokeniser replaced a line-anchored regex. It is allowed to be
+    // STRICTER on new files; it is not allowed to silently re-mode a merged one,
+    // because the transaction mode decides which apply protocol the file gets.
+    const artifact = await discoverMigrations(join(process.cwd(), 'migrations'));
+    for (const m of artifact.migrations) {
+      const legacy = OWN_TRANSACTION_MARKER.test(
+        m.sql
+          .split('\n')
+          .map((line) => line.replace(/--.*$/, ''))
+          .join('\n'),
+      );
+      const expected = m.noTransaction ? 'none' : legacy ? 'self' : 'runner';
+      expect(m.transactionMode, m.id).toBe(expected);
+    }
   });
 
   it('ships the ledger v2 migration as the head', async () => {

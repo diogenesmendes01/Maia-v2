@@ -12,7 +12,7 @@ Introduced by issue #516. Replaces the loop that used to live inline in `scripts
 |---|---|
 | `src/migrations/types.ts` | Vocabulary: ledger statuses, entry states, blockers, manifest, readiness. Pure data. |
 | `src/migrations/checksum.ts` | Canonicalisation + SHA-256. The determinism contract. |
-| `src/migrations/discover.ts` | Reads `migrations/`, orders it, detects markers, pairs `_down` siblings. Pure core (`buildMigrationArtifact`) + disk wrapper. |
+| `src/migrations/discover.ts` | Reads `migrations/`, orders it, detects markers, pairs `_down` siblings, tokenises SQL into top-level statements and **proves** the transaction envelope. Pure core (`buildMigrationArtifact`) + disk wrapper. |
 | `src/migrations/status.ts` | **The decision core.** `computeMigrationStatus` (artifact + ledger ⇒ status) and `evaluateSchemaReadiness` (status + manifest ⇒ verdict). Pure, no DB. |
 | `src/migrations/lock.ts` | Global advisory lock on a dedicated client, with waiting semantics. |
 | `src/migrations/ledger.ts` | `schema_migrations` v2: bootstrap DDL, reads, state transitions, checksum backfill, repair. |
@@ -68,7 +68,7 @@ The DDL lives in **two** places on purpose: `LEDGER_V2_DDL` in `ledger.ts` (the 
 
 ## Checksums, and how already-merged migrations were adopted
 
-Migrations are append-only (AGENTS.md §4 rule 6): the 118 files merged before checksums existed could not be touched, renamed or re-hashed into history. So adoption is a **backfill, not a rewrite**:
+Migrations are append-only (AGENTS.md §4 rule 6): the files merged before checksums existed could not be touched, renamed or re-hashed into history. So adoption is a **backfill, not a rewrite**:
 
 1. `up` computes the checksum of every packaged file;
 2. for each ledger row that is `applied` with a NULL checksum **and** has a file in the artifact, it writes that checksum with `checksum_source = 'backfilled'`;
@@ -84,13 +84,41 @@ Backfill is a **write**, so only `up` does it. `plan`, `status` and readiness re
 
 Only one of them can make "schema changed" and "schema recorded" atomic, so the runner classifies instead of pretending:
 
-| Mode | Trigger | Protocol | Crash leaves |
-|---|---|---|---|
-| `runner` | file has no transaction control (107 of 118 today) | `BEGIN` → SQL → ledger row → `COMMIT` | nothing — the migration is simply pending |
-| `self` | file contains its own `BEGIN; … COMMIT;` | commit `running` → SQL → flip to `applied` | a `running` row ⇒ dirty on the next pass |
-| `none` | `-- maia:no-transaction` (CONCURRENTLY DDL) | commit `running` → statements one at a time → flip to `applied` | a `running` row ⇒ dirty on the next pass |
+| Mode | Trigger | Protocol | Crash leaves | Clean failure recorded as |
+|---|---|---|---|---|
+| `runner` | file has no transaction control (110 of 122 today) | `BEGIN` → SQL → ledger row → `COMMIT` | nothing — the migration is simply pending | `failed` (retried) |
+| `self` | file has its own transaction control | commit `running` → SQL → flip to `applied` | a `running` row ⇒ dirty on the next pass | `failed` **only if the envelope is proven** (below), else `dirty` |
+| `none` | `-- maia:no-transaction` (CONCURRENTLY DDL) | commit `running` → statements one at a time → flip to `applied` | a `running` row ⇒ dirty on the next pass | `dirty` |
 
 The `self` mode fixes a latent defect in the pre-#516 runner. It wrapped every migration in `BEGIN`/`COMMIT` and wrote the ledger row inside that envelope, believing the pair was atomic. For a file that already contains `BEGIN; … COMMIT;` it was not: Postgres does not nest transactions, so the file's `COMMIT` ended the runner's transaction, the ledger `INSERT` ran in autocommit, and the runner's trailing `COMMIT` warned "no transaction in progress". A crash in that gap left the schema changed and the ledger silent, and the migration re-ran on the next boot.
+
+### A `self` migration must be ONE complete envelope — and that is enforced
+
+Detecting `BEGIN;` proves that the file manages its own transaction. It does **not** prove that the file is atomic, and `self` mode used to record a clean failure as `failed` — the *auto-retried* status — on exactly that unproven assumption.
+
+The counter-example is one line long:
+
+```sql
+BEGIN;
+CREATE TABLE t (id TEXT);
+COMMIT;
+ANALYZE t;          -- fails
+```
+
+By the time the last statement fails, `t` is **durably committed**. The runner's `ROLLBACK` in the catch block undoes nothing, and `failed` puts a half-applied schema straight back into the retry queue. The same hole exists for a file with two envelopes, a statement before the `BEGIN`, or a `BEGIN` that is never closed (which additionally hands a connection with an open transaction back to the pool, silently discarding both the DDL and the ledger row).
+
+So the property is now **proven per file, at discovery**, by `analyzeTransactionEnvelope` (`src/migrations/discover.ts`):
+
+1. `splitTopLevelStatements` tokenises the SQL, honouring line and block comments, string literals, quoted identifiers and dollar-quoted bodies — which is what keeps `CREATE FUNCTION … AS $$ … END; $$;` a single statement and stops PL/pgSQL's block `BEGIN`/`END` from being read as transaction control;
+2. the file is `single_complete` only when the first top-level statement opens a transaction, the last one commits it, and there is nothing else outside;
+3. anything else is `unverifiable` and becomes an **artifact problem** (`unverifiable_transaction_envelope`), which blocks `migrate up` before any DDL runs — the same fail-closed treatment a missing `_down` sibling gets;
+4. as a second line of defence, `terminalLedgerStatusFor` (`src/migrations/runner.ts`) derives the terminal status from the proven envelope, so an unverifiable file that ever reached execution would be recorded `dirty`, never `failed`.
+
+Both spellings of the choice offered by the review are therefore taken: validate the envelope **and** fail closed. Validation is what the operator sees (a named refusal, before the schema moves); the classification is what keeps the ledger honest if the refusal is ever bypassed.
+
+Tokenising also made the mode classifier stricter in a second way: `BEGIN WORK;` and `START TRANSACTION ISOLATION LEVEL …` are now recognised as own transaction control. The previous line-anchored regex missed them, so such a file was filed as `runner` mode and got a *second, nested* `BEGIN` — the original defect, undetected. The classification of every packaged file is unchanged; `tests/unit/migrations/discover.spec.ts` pins that.
+
+The five `self` migrations on disk today (007, 041, 050, 051, 108) all satisfy the envelope rule.
 
 ## States and what blocks
 
@@ -109,7 +137,15 @@ The `self` mode fixes a latent defect in the pre-#516 runner. It wrapped every m
 Two things are **reported but not blocking**, deliberately:
 
 - **out-of-order** — a pending migration that sorts before the applied head (a branch merged late). Reported in `status.out_of_order`; the runner still applies it in artifact order. Blocking it would break ordinary merge traffic, and the reservation ledger (`migrations/RESERVATIONS.md`) is the mechanism that prevents the dangerous version.
-- **artifact integrity** — a forward migration with no `_down` sibling, or a malformed prefix. Blocks `up` (it must never reach a database) but not readiness: it describes the repository, not the compatibility of the schema already deployed.
+- **artifact integrity** — a forward migration with no `_down` sibling, a malformed prefix, a duplicate id, or a `self` migration whose SQL is not one complete transaction envelope. Blocks `up` (it must never reach a database) but not readiness: it describes the repository, not the compatibility of the schema already deployed.
+
+## `status` is always the ledger as it stands NOW
+
+`MigrationRunResult.status` is contracted as the complete description of artifact × database *at the moment the call returns*, and every consumer (`maia doctor` (#517), `/readyz`, the CLI) is allowed to act on it without re-querying. So it is recomputed from a fresh `readLedger` at every return that follows a ledger write — the success return **and** the failure return.
+
+It used to be computed once before the apply loop and reused on the failure path. That made a failed run self-contradictory in two ways at once: `failure.ledger_status` said `dirty` while `status.entries` still classified the same id as `pending`, and every migration the run had just applied was still listed as pending. Automation reading `status` would then remediate a database that no longer existed.
+
+If the re-read itself fails — a dead connection is a plausible cause of the failure being reported — `status` is `null`, the documented "could not be established" value, rather than a stale report presented as current.
 
 ## The readiness API (what #517 consumes)
 
@@ -161,20 +197,21 @@ The ledger is the primary operational trail, because migrations can run before `
 
 | Test path | What it covers |
 |---|---|
-| `tests/unit/migrations/checksum.spec.ts` | Cross-platform determinism + sensitivity; no collisions across the real 118 files |
-| `tests/unit/migrations/discover.spec.ts` | Ordering (matches the pre-#516 runner), markers, down siblings, the real directory |
+| `tests/unit/migrations/checksum.spec.ts` | Cross-platform determinism + sensitivity; no collisions across the real forward files |
+| `tests/unit/migrations/discover.spec.ts` | Ordering (matches the pre-#516 runner), markers, down siblings, the top-level tokeniser, every transaction-envelope verdict, and the real directory (every `self` file is one complete envelope; no packaged file changed mode) |
 | `tests/unit/migrations/status.spec.ts` | Every entry state and every readiness blocker, including min/max range |
 | `tests/unit/migrations/lock.spec.ts` | Acquire, wait, timeout, connect/query failure, idempotent release, namespace |
-| `tests/unit/migrations/runner.spec.ts` | Order of operations, three transaction modes, dirty/failed transitions, repair (including the `--as applied` refusal, its exact text, and that it precedes the lock), log hygiene |
+| `tests/unit/migrations/runner.spec.ts` | Order of operations, three transaction modes, dirty/failed transitions, the envelope guardrail and `terminalLedgerStatusFor`, `status` recomputed on the failure path, repair (including the `--as applied` refusal, its exact text, and that it precedes the lock), log hygiene |
 | `tests/unit/migrations/readiness.spec.ts` | Read-only + never-throwing guarantees of the #517 surface |
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
-| `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
+| `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, `status` recomputed on both failure paths, the durability of a committed envelope (the hazard behind the guardrail) and the refusal of the file that would hit it, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
 ## How to extend
 
 | Need | Where |
 |---|---|
 | Add a migration | Reserve the prefix in `migrations/RESERVATIONS.md`, then `NNN_<name>.sql` + `NNN_<name>_down.sql`. Never edit a merged file — the checksum will block. |
+| A migration that wraps itself in `BEGIN; … COMMIT;` | Put **all** of its SQL inside that one envelope. Anything outside it (or a second envelope) is refused as `unverifiable_transaction_envelope`. Simplest alternative: drop the `BEGIN`/`COMMIT` entirely and let the runner own the transaction — then the ledger row commits atomically with the schema change. |
 | A migration that needs a long statement timeout | `-- maia:statement-timeout=<ms>` in the file (versioned + reviewable), not a shell override |
 | A migration that cannot run in a transaction | `-- maia:no-transaction`; keep it to simple `;`-terminated statements |
 | Declare an expand/contract compatibility range | Pass a `manifest` to `getSchemaReadiness` |
@@ -195,5 +232,5 @@ Not yet delivered, tracked on #516:
 
 | | |
 |---|---|
-| Last verified | 2026-08-05 |
-| Against `main` HEAD | `7c1b3da` |
+| Last verified | 2026-08-08 |
+| Against `main` HEAD | `6bf0fa27` |

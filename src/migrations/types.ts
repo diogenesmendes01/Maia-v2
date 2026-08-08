@@ -31,6 +31,14 @@ export type LedgerStatus = (typeof LEDGER_STATUSES)[number];
 export const CHECKSUM_SOURCES = ['computed', 'backfilled'] as const;
 export type ChecksumSource = (typeof CHECKSUM_SOURCES)[number];
 
+/**
+ * Whether a migration's OWN transaction control (if any) wraps all of its
+ * executable SQL in one complete envelope. Computed by
+ * `analyzeTransactionEnvelope` in `discover.ts`; it is the property the runner's
+ * failure classification depends on, so it lives in the shared vocabulary.
+ */
+export type TransactionEnvelope = 'absent' | 'single_complete' | 'unverifiable';
+
 /** One forward migration as it exists in the packaged artifact (on disk). */
 export interface DiscoveredMigration {
   /** Full forward filename — the ledger key. Never renamed (append-only). */
@@ -56,6 +64,23 @@ export interface DiscoveredMigration {
    *   `running`-first protocol, statements sent one at a time.
    */
   readonly transactionMode: 'runner' | 'self' | 'none';
+  /**
+   * Whether the file's OWN transaction control (when it has any) forms one
+   * complete `BEGIN; … COMMIT;` envelope around all of its executable SQL.
+   *
+   * - `absent`          — no transaction control; the runner owns the envelope.
+   * - `single_complete` — one envelope, nothing outside it. A failure anywhere
+   *   aborts that transaction and the trailing `COMMIT` degrades to a rollback,
+   *   so the migration really is retryable (`failed`).
+   * - `unverifiable`    — own control, but not one complete envelope (a
+   *   statement after the `COMMIT`, two envelopes, an envelope never closed).
+   *   Part of the file can be DURABLY committed while a later statement fails,
+   *   so a failure is `dirty`, not `failed`. `buildMigrationArtifact` also
+   *   reports it as an artifact problem, which blocks `up` before any DDL.
+   *
+   * See `analyzeTransactionEnvelope` in `discover.ts`.
+   */
+  readonly transactionEnvelope: TransactionEnvelope;
   /** A `_down.sql` sibling exists (AGENTS.md §4 rule 6 requires one). */
   readonly hasDownSibling: boolean;
   /**
@@ -71,7 +96,14 @@ export interface DiscoveredMigration {
 export type ArtifactProblemKind =
   | 'missing_down_sibling'
   | 'malformed_prefix'
-  | 'duplicate_id';
+  | 'duplicate_id'
+  /**
+   * A migration that manages its own transaction but does NOT wrap all of its
+   * executable SQL in one complete envelope. Its failure mode is a partially
+   * committed schema that the runner cannot distinguish from a clean rollback,
+   * so the file is refused before it can reach a database.
+   */
+  | 'unverifiable_transaction_envelope';
 
 export interface ArtifactProblem {
   readonly kind: ArtifactProblemKind;
