@@ -50,6 +50,27 @@
  *    `degraded_sections`, and leaves the others intact.
  *
  * The turn now waits for the SLOWEST read rather than the SUM of all of them.
+ *
+ * ## The concurrency ceiling (PR #541 review, finding 1)
+ *
+ * Both groups are started before either is awaited, which is the latency win —
+ * but "start ten statements in one tick" against `max: 10` in
+ * `src/db/client.ts` means ONE turn can hold the entire process-wide pool, and
+ * every other turn of every other tenant queues behind it. The first cut of
+ * #525 shipped exactly that: it deleted the ceiling the pre-#525 code had
+ * documented (six concurrent reads, deliberately less than the pool) without
+ * putting anything in its place.
+ *
+ * Every task below therefore runs through ONE shared `ReadGate` sized at
+ * `TURN_CONTEXT_MAX_CONCURRENT_READS` (6). It is a FIFO semaphore, not a phase
+ * split: all ten tasks stay in a single pipeline, so the turn still pays close
+ * to the MAXIMUM of the read set rather than the sum of two phases — the #525
+ * win survives — while the pool never sees more than six of this turn's
+ * statements at once and four connections stay available to everyone else.
+ *
+ * The gate does not catch, retry or reorder. A critical rejection still rejects
+ * `Promise.all` and fails the turn; an optional rejection is still caught by
+ * `optional()` and degrades only its own section. See `concurrency.ts`.
  */
 import {
   selfStateRepo,
@@ -84,8 +105,17 @@ import { renderOperationalProfile, type RenderedProfile } from '@/identity/profi
 import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { readCached } from './cache.js';
+import { createReadGate, type ReadGate } from './concurrency.js';
 import { recordSectionStatus, type TurnContextSection } from './metrics.js';
-import { SECTION_BUDGETS, degraded, fromArray, loaded, empty, type LoadedSection } from './types.js';
+import {
+  SECTION_BUDGETS,
+  TURN_CONTEXT_MAX_CONCURRENT_READS,
+  degraded,
+  fromArray,
+  loaded,
+  empty,
+  type LoadedSection,
+} from './types.js';
 
 /**
  * Everything the renderer needs to say who the agent is.
@@ -255,16 +285,21 @@ function hintScopes(req: TurnContextRequest): Array<{ scope_type: string; subjec
  * `byIds` pair working against the real loader instead of forcing a mechanical
  * rewrite of every prompt fixture in the suite. Production always takes the
  * single-statement branch; the fallback costs two.
+ *
+ * The two fallback reads are SEQUENTIAL, not `Promise.all`. This function runs
+ * under one permit of the turn's read gate, and a permit is meant to mean "at
+ * most one statement of this turn in flight" — a `Promise.all` inside would
+ * make one permit worth two connections and quietly lift the ceiling from 6 to
+ * 7. It costs nothing where it matters, because production never takes this
+ * branch.
  */
 async function loadEntitiesWithState(
   ids: string[],
 ): Promise<Array<{ entidade: Entidade; state: EntityState | null }>> {
   const joined = await entidadesRepo?.byIdsWithState?.(ids);
   if (joined) return joined;
-  const [entities, states] = await Promise.all([
-    entidadesRepo.byIds(ids),
-    (async () => (await entityStatesRepo?.byIds?.(ids)) ?? [])(),
-  ]);
+  const entities = await entidadesRepo.byIds(ids);
+  const states = (await entityStatesRepo?.byIds?.(ids)) ?? [];
   const stateById = new Map(states.map((s) => [s.entidade_id, s]));
   return entities.map((entidade) => ({ entidade, state: stateById.get(entidade.id) ?? null }));
 }
@@ -293,9 +328,13 @@ async function optional<T>(
   load: () => Promise<T>,
   isEmpty: (value: T) => boolean,
   degradedSections: string[],
+  gate: ReadGate,
 ): Promise<LoadedSection<T>> {
   try {
-    const value = await load();
+    // Gated INSIDE the try: a rejection raised while the task holds a permit is
+    // caught here exactly as an ungated one would be, so an optional section can
+    // never fail the turn. The permit is released by the gate's own `finally`.
+    const value = await gate(load);
     const status = isEmpty(value) ? 'empty' : 'loaded';
     recordSectionStatus(section, status);
     return status === 'empty' ? empty(value) : loaded(value);
@@ -319,12 +358,26 @@ async function optional<T>(
  *   legacy `self_state` fallback, `activeExecution` supplied                10
  *   legacy `self_state` fallback, loader resolves the procedure itself      11
  *
- * Both are independent of scope size — the slope is zero, which is the property
- * that stops one "elephant" tenant from monopolising the fixed 10-connection
- * pool in `src/db/client.ts`.
+ * All of them are independent of scope size — the slope is zero.
+ *
+ * TOTAL cost and INSTANTANEOUS cost are separate ceilings, and the pool needs
+ * both. `src/db/client.ts` opens `max: 10` connections for the whole process,
+ * so the numbers above say what a turn costs but not how much of that pool it
+ * may hold while paying. The shared gate below is the second ceiling: at most
+ * `TURN_CONTEXT_MAX_CONCURRENT_READS` (6) of these statements are in flight for
+ * a given turn, leaving 4 connections for every other turn and tenant. Six is
+ * the ceiling the pre-#525 code documented and enforced; #525 dropped it, and
+ * PR #541's review found the pool it left exposed.
  */
 export async function loadTurnContext(req: TurnContextRequest): Promise<TurnContextSnapshot> {
   const degradedSections: string[] = [];
+
+  // ONE gate for both groups. Per-turn (a fresh gate per call), so a slow turn
+  // queues its OWN reads and never blocks another turn inside the application —
+  // bounding this turn's share of the pool is the whole point, and the pool's
+  // own queue, which has `connectionTimeoutMillis`, is the right place for
+  // cross-turn contention to land.
+  const gate = createReadGate(TURN_CONTEXT_MAX_CONCURRENT_READS);
 
   // --- critical -------------------------------------------------------------
   // These five reads have no dependency on one another. `Promise.all` (not
@@ -336,19 +389,28 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
   // `loadEntitiesWithState` replaces the per-entity `entityStatesRepo.byId`
   // loop that was the dominant N+1 of the turn — and, since #525, also the
   // second statement that read the same entity set for its state rows.
+  //
+  // Each task is handed to the shared gate, which is FIFO — the critical group
+  // is enqueued first and therefore holds the first permits, so the turn's own
+  // critical path is never pushed behind a late optional read. `gate` does not
+  // catch, so `Promise.all` rejection semantics are exactly what they were.
   const criticalPromise = Promise.all([
-    loadIdentity(),
-    mensagensRepo.recentInConversation(req.conversa_id!, SECTION_BUDGETS.history.max_items),
-    loadEntitiesWithState(req.entidade_ids),
+    gate(() => loadIdentity()),
+    gate(() =>
+      mensagensRepo.recentInConversation(req.conversa_id!, SECTION_BUDGETS.history.max_items),
+    ),
+    gate(() => loadEntitiesWithState(req.entidade_ids)),
     // Scope strings are built in the SAME order as before the split — the
     // repository's result order feeds the rendered "## Fatos relevantes" block,
     // so reordering the argument would reorder the prompt.
-    factsRepo.listMentionableForScopes([
-      'global',
-      `pessoa:${req.pessoa_id}`,
-      ...req.entidade_ids.map((e) => `entidade:${e}`),
-    ]),
-    rulesRepo.listActive('classificacao'),
+    gate(() =>
+      factsRepo.listMentionableForScopes([
+        'global',
+        `pessoa:${req.pessoa_id}`,
+        ...req.entidade_ids.map((e) => `entidade:${e}`),
+      ]),
+    ),
+    gate(() => rulesRepo.listActive('classificacao')),
   ]);
 
   // --- optional -------------------------------------------------------------
@@ -356,6 +418,12 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
   // turn pays the maximum latency of the whole read set, not the sum of two
   // phases. A rejection here can never reject the critical group, because each
   // is wrapped by `optional` before it is handed to `Promise.all`.
+  //
+  // These share the SAME gate as the critical group — that is what makes the
+  // ceiling a property of the turn instead of a per-group number that adds up
+  // to the whole pool. They queue behind the critical tasks and start as those
+  // release permits, so the pipeline stays saturated at 6 without a phase
+  // boundary in the middle of it.
   const optionalPromise = Promise.all([
     optional(
       'memories',
@@ -370,6 +438,7 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
         })) ?? [],
       (v) => v.length === 0,
       degradedSections,
+      gate,
     ),
     optional(
       'hints',
@@ -377,6 +446,7 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
       async () => (await behavioralHintRepo?.findActiveForScopes?.(hintScopes(req))) ?? [],
       (v) => v.length === 0,
       degradedSections,
+      gate,
     ),
     optional(
       'capabilities',
@@ -384,6 +454,7 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
       async () => (await capabilitiesSkillRepo?.listAll?.()) ?? [],
       (v) => v.length === 0,
       degradedSections,
+      gate,
     ),
     optional(
       'gaps',
@@ -392,6 +463,7 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
         (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [],
       (v) => v.length === 0,
       degradedSections,
+      gate,
     ),
     optional(
       'procedure',
@@ -399,6 +471,7 @@ export async function loadTurnContext(req: TurnContextRequest): Promise<TurnCont
       () => loadProcedure(req),
       (v) => v === null,
       degradedSections,
+      gate,
     ),
   ]);
 

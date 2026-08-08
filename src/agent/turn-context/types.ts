@@ -121,11 +121,54 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  *                                                                       --
  *                                                                       13
  *
- * Every one of these is independent of scope size: the slope is zero, which is
- * the property that stops one "elephant" tenant from monopolising the fixed
- * 10-connection pool in `src/db/client.ts`.
+ * Every one of these is independent of scope size: the slope is zero, so an
+ * "elephant" tenant's turn costs the same as anyone else's.
+ *
+ * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
+ * `src/db/client.ts` — a bounded read set issued all at once still empties the
+ * pool. That is a separate ceiling, `TURN_CONTEXT_MAX_CONCURRENT_READS` below.
  */
 export const TURN_ROUND_TRIP_BUDGET = 13;
+
+/**
+ * Issue #525 (PR #541 review, finding 1) — how many of those round-trips ONE
+ * turn may have in flight at the same instant.
+ *
+ * The round-trip budget above bounds the turn's TOTAL cost; it says nothing
+ * about how much of the shared pool a single turn may hold while paying it.
+ * Those are different failure modes, and #525 fixed the first while opening the
+ * second: the critical group (5) and the optional group (5) are both started
+ * before either is awaited, so a cold-cache turn with an active procedure issued
+ * up to TEN statements in one tick against `max: 10` in `src/db/client.ts`. One
+ * turn could hold every connection in the process, and every other turn — of
+ * every other tenant — queued behind it. A latency win for one turn paid for by
+ * p95 tail for all of them is not a win.
+ *
+ * Six is not a new number: it is the ceiling the pre-#525 code enforced and
+ * documented ("six concurrent reads against a 10-connection pool is a
+ * deliberate ceiling — enough to collapse the waterfall, not enough for one
+ * turn to starve the pool for everyone else"). #525 removed it without
+ * replacing it; this restores it as a SHARED gate over critical + optional,
+ * which is strictly stronger than the old per-group version.
+ *
+ * Why 6 of 10 specifically:
+ *   - it is a strict majority, so a single turn still collapses the waterfall
+ *     essentially completely — the read set is 10 tasks, so the turn pays about
+ *     two waves rather than ten sequential round-trips;
+ *   - it leaves 4 connections for everything else in the process (a second
+ *     turn's critical group, the readiness probe, a worker), so no turn can
+ *     starve the pool on its own;
+ *   - it is enforced per TURN, not per process: bounding one turn's blast
+ *     radius is the point, and a process-wide gate would just move the queue
+ *     from the pool (which has `connectionTimeoutMillis`) into the app (which
+ *     would not).
+ *
+ * Changing this number without changing `max` in `src/db/client.ts` changes how
+ * much of the pool one tenant can take, so the two belong in the same review.
+ * `tests/integration/turn-context-pool-fairness.spec.ts` measures the real peak
+ * against a real pool and fails if the ceiling stops holding.
+ */
+export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
 
 /**
  * The goal issue #525 sets. NOT yet met — see `docs/architecture/modules/
