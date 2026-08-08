@@ -43,6 +43,7 @@ vi.mock('@/config/env.js', async (importOriginal) => {
 });
 
 import {
+  publishSpanAttribution,
   recordElapsedSpan,
   setSpanSink,
   withSpan,
@@ -95,6 +96,10 @@ async function turnLikeTheWorker(
         runWithSystemContext(async () => {
           // Pre-resolution window: no tenant known yet.
           await tick();
+          // Espelha `src/agent/core.ts`: quem RESOLVE a tupla publica-a
+          // explicitamente, depois de derivá-la e ANTES de abrir o escopo.
+          // Não há hook em `runWithTenantContext` — ver o comentário lá.
+          publishSpanAttribution(tenant);
           await runWithTenantContext(tenant, async () => {
             await tick();
             if (opts.inside) await opts.inside();
@@ -192,6 +197,10 @@ describe('issue #535 review — attribution cannot cross tenants', () => {
     // did acme's work — the exact isolation failure the invariant forbids.
     await turnLikeTheWorker(ACME, {
       inside: async () => {
+        // Uma SEGUNDA resolução tentando publicar. Com o hook removido, é
+        // preciso publicar explicitamente para reproduzir o conflito — que é
+        // justamente o que um call site novo e descuidado faria.
+        publishSpanAttribution(GLOBEX);
         await runWithTenantContext(GLOBEX, async () => tick());
       },
     });
@@ -207,6 +216,10 @@ describe('issue #535 review — attribution cannot cross tenants', () => {
     _resetForTests();
     await turnLikeTheWorker(ACME, {
       inside: async () => {
+        // Uma SEGUNDA resolução tentando publicar. Com o hook removido, é
+        // preciso publicar explicitamente para reproduzir o conflito — que é
+        // justamente o que um call site novo e descuidado faria.
+        publishSpanAttribution(GLOBEX);
         await runWithTenantContext(GLOBEX, async () => tick());
       },
     });

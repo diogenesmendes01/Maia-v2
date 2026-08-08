@@ -44,10 +44,10 @@
  * waterfall whose root could not be filtered by tenant, and whose children
  * (opened inside the real scope) disagreed with it.
  *
- * So attribution is CAPTURED instead of read: entering a tenant scope
- * publishes the tuple onto every span open on that async context
- * (`publishSpanAttribution`, wired through `setTenantScopeObserver`), and
- * `emit()` uses the captured tuple. Two properties make this safe under
+ * So attribution is CAPTURED instead of read: quem RESOLVE a tupla publica-a
+ * explicitamente sobre todo span aberto naquele contexto assíncrono
+ * (`publishSpanAttribution`, chamado por `src/agent/core.ts` logo antes de
+ * abrir o escopo), e `emit()` usa a tupla capturada. Two properties make this safe under
  * concurrency, and both are pinned by tests:
  *
  *   - the slot lives on the per-span object created inside `spanStorage.run`,
@@ -71,7 +71,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { setTenantScopeObserver, tryGetCurrentContext } from '@/db/tenant-context.js';
+import { tryGetCurrentContext } from '@/db/tenant-context.js';
 import { tryGetCorrelation } from './correlation.js';
 import { counter } from './metrics.js';
 import {
@@ -175,7 +175,6 @@ export function setSpanSink(next: SpanSink | null): void {
   // Installing the observer HERE rather than at import time keeps this module
   // from making a load-time demand on `db/tenant-context.js`, which a large
   // number of specs partially mock.
-  if (next !== null) installTenantScopeObserver();
 }
 
 /** The span currently open on this async context, if any. */
@@ -262,9 +261,15 @@ function readAmbientAttribution(): SpanAttribution | null {
  *
  * This is the mechanism that makes the root honest. The root `turn` span is
  * opened outside the tenant scope and closed after it has unwound, so it can
- * only learn its tenant from INSIDE — the moment `runWithTenantContext` opens
- * (see `installTenantScopeObserver` at the bottom of this file), or the moment
- * a nested span is opened under a resolved scope.
+ * only learn its tenant de quem a RESOLVEU — hoje `src/agent/core.ts`, que
+ * chama esta função depois de derivar `resolved` e antes de entrar em
+ * `runWithTenantContext` — ou do momento em que um span aninhado é aberto sob
+ * um escopo já resolvido.
+ *
+ * Deliberadamente NÃO há hook em `runWithTenantContext`: a validação canônica
+ * daquele módulo (`assertNotDefaultLiteral`) roda na LEITURA do contexto, então
+ * um hook na entrada do escopo carimbaria spans com tuplas não validadas —
+ * inclusive o literal `'default'`.
  *
  * The two rules that keep the isolation invariant intact:
  *
@@ -521,34 +526,7 @@ function safely(fn: () => void): void {
   }
 }
 
-let scopeObserverInstalled = false;
 
-/**
- * Wire the tenant-scope notification to attribution capture.
- *
- * Dependency-INVERTED on purpose: `db/tenant-context.ts` is the fail-closed
- * security boundary and must not import the observability stack, so it exposes
- * a registration point and this module fills it.
- *
- * Idempotent, and fail-soft like every other entry point here: a process that
- * cannot install the observer loses span attribution, never a tenant scope.
- *
- * Cost once installed and tracing is off: one boolean check
- * (`tracingEnabled()`) per tenant scope, before any allocation — the hot-path
- * claim in the header stands.
- */
-function installTenantScopeObserver(): void {
-  if (scopeObserverInstalled) return;
-  try {
-    setTenantScopeObserver((ctx) => {
-      if (!tracingEnabled()) return;
-      publishSpanAttribution({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
-    });
-    scopeObserverInstalled = true;
-  } catch (err) {
-    logger.debug({ err }, 'observability.tenant_scope_observer_unavailable');
-  }
-}
 
 /** Test-only: drop any span left open by a failed spec. */
 export function _resetTracerForTests(): void {

@@ -137,47 +137,30 @@ function shouldThrowOnDefaultLiteral(): boolean {
 }
 
 /**
- * Notified whenever a tenant scope is ENTERED, from inside the new scope.
+ * Esta fronteira NÃO tem ponto de extensão, e é deliberado.
  *
- * Exists for ONE reason (issue #535, owner review of PR #541): the observability
- * layer needs to know the tuple a turn resolved to, and it cannot read it. The
- * root `turn` span opens before the resolution and closes after the scope has
- * unwound, so an ALS read at either end returns `system` and the exported root
- * carries no usable attribution.
+ * A rodada 2 da review da PR #541 (#535) chegou a instalar aqui um observer
+ * genérico, para que a camada de observabilidade aprendesse a tupla que o turno
+ * resolveu. O owner recusou, e a razão técnica é mais forte que a preferência
+ * de desenho: a validação canônica deste módulo — `assertTruthyContext` e
+ * `assertNotDefaultLiteral` — roda em tempo de LEITURA, dentro de
+ * `getCurrentTenant()`/`getCurrentAgent()`, e não na entrada do escopo. Um
+ * observer notificado aqui recebia uma tupla que ainda não passou por nada:
+ * podia carimbar um span com `'default'`, com string vazia ou com espaço em
+ * volta, enquanto `getCurrentTenant()` lançaria para o mesmo contexto. Ou seja,
+ * a telemetria passaria a afirmar exatamente o que o `AGENTS.md` §4 proíbe.
  *
- * Dependency is INVERTED — this module stays the fail-closed security boundary
- * with zero observability imports; `src/observability/tracer.ts` registers
- * itself. The observer is advisory and fail-SOFT: it cannot change the context,
- * cannot reject a scope, and a throw from it is swallowed, so a bug in
- * instrumentation can never be the reason a tenant scope fails to open.
+ * Some-se a isso que havia um único consumidor. A atribuição de span é
+ * publicada explicitamente por quem RESOLVE a tupla, depois de resolvê-la e
+ * antes de entrar no escopo — hoje `src/agent/core.ts`, via
+ * `publishSpanAttribution`. O core já depende de observabilidade; esta
+ * fronteira segue sem depender.
  */
-type TenantScopeObserver = (ctx: TenantContext) => void;
-
-let tenantScopeObserver: TenantScopeObserver | null = null;
-
-export function setTenantScopeObserver(observer: TenantScopeObserver | null): void {
-  tenantScopeObserver = observer;
-}
-
-function notifyTenantScope(ctx: TenantContext): void {
-  const observer = tenantScopeObserver;
-  if (observer === null) return;
-  try {
-    observer(ctx);
-  } catch {
-    // Observability is never a control-flow participant.
-  }
-}
-
 export async function runWithTenantContext<T>(
   ctx: TenantContext,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return storage.run(ctx, () => {
-    // Inside the new scope, so the observer sees exactly what `fn` will see.
-    notifyTenantScope(ctx);
-    return fn();
-  });
+  return storage.run(ctx, fn);
 }
 
 /**

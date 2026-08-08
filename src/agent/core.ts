@@ -82,6 +82,7 @@ import {
 } from '@/runtime/decision/integration.js';
 // Issue #514 — a failed MANDATORY trace envelope is a turn-blocking condition.
 import { MandatoryTraceEnvelopeError } from '@/observability/turn-trace.js';
+import { publishSpanAttribution } from '@/observability/tracer.js';
 import {
   buildBaseContextPacketFromTurn,
   applyToolReductions,
@@ -468,6 +469,25 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
       }
     }
   }
+
+  // Atribuição do span-raiz, publicada AQUI e não numa extensão da fronteira
+  // de tenant (#535, rodada 2 da review da PR #541).
+  //
+  // O `maia.turn` é aberto pelo worker (`src/gateway/queue.ts`) ANTES desta
+  // resolução e fechado depois que este escopo já desmontou, então uma leitura
+  // ambiental em qualquer das duas pontas devolve `system` — o root exportado
+  // saía sem atribuição utilizável e divergia dos próprios filhos.
+  //
+  // Este é o ponto exato em que a tupla passa a existir: `resolved` acabou de
+  // ser derivada e o escopo ainda não foi aberto. Publicar aqui — e não por um
+  // hook em `runWithTenantContext` — mantém a fronteira fail-closed sem ponto
+  // de extensão e evita carimbar o span com uma tupla que ainda não passou por
+  // `assertNotDefaultLiteral` (que só roda na LEITURA do contexto).
+  //
+  // `publishSpanAttribution` é write-once com a primeira tupla real e ignora
+  // `system`; sem tracing ligado é um no-op. Nunca participa do fluxo de
+  // controle do turno.
+  publishSpanAttribution({ tenant_id: resolved.tenant_id, agent_id: resolved.agent_id });
 
   await runWithTenantContext(
     { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },

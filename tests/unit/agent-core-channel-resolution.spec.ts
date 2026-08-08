@@ -74,6 +74,8 @@ const {
 });
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────────
+const publishSpanAttributionMock = vi.fn();
+
 vi.mock('@/gateway/channel-resolver.js', () => ({
   resolveChannel: resolveChannelMock,
 }));
@@ -92,6 +94,10 @@ vi.mock('@/config/feature-flags.js', () => ({
 
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
 vi.mock('@/lib/logger.js', () => ({ logger: loggerMock }));
+
+vi.mock('@/observability/tracer.js', () => ({
+  publishSpanAttribution: publishSpanAttributionMock,
+}));
 
 vi.mock('@/db/tenant-context.js', () => ({
   runWithTenantContext: runWithTenantContextMock,
@@ -423,6 +429,68 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
     });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // #535, rodada 2 da review da PR #541 — a atribuição do span-raiz é publicada
+  // AQUI, pelo call site que resolve a tupla.
+  //
+  // A primeira tentativa instalou um observer genérico em
+  // `runWithTenantContext`. O owner recusou: aquele módulo valida a tupla em
+  // tempo de LEITURA (`assertNotDefaultLiteral`), então um hook na entrada do
+  // escopo carimbaria spans com tuplas não validadas — incluindo `'default'`.
+  //
+  // Estes testes existem porque os specs de `observability/` e `gateway/`
+  // ESPELHAM este call site com um harness próprio: sem eles, apagar a linha de
+  // `core.ts` deixaria a telemetria muda e toda a suíte verde.
+  // ──────────────────────────────────────────────────────────────────────────
+  it('#535: publica a atribuição do span com a tupla RESOLVIDA, antes de abrir o escopo', async () => {
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+      channel_id: 'ch-abc',
+    });
+    adoptToResolvedTenantMock.mockImplementationOnce(async () => true);
+
+    const order: string[] = [];
+    publishSpanAttributionMock.mockImplementationOnce(() => order.push('publish'));
+    runWithTenantContextMock.mockImplementationOnce(async (_ctx, fn) => {
+      order.push('runWithTenantContext');
+      return fn();
+    });
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await runAgentForMensagem('msg1');
+
+    expect(publishSpanAttributionMock).toHaveBeenCalledTimes(1);
+    expect(publishSpanAttributionMock).toHaveBeenCalledWith({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+    });
+    // A ordem é o ponto: publicar DEPOIS de abrir o escopo devolveria o
+    // comportamento que a #535 corrigiu apenas por acidente de timing.
+    expect(order).toEqual(['publish', 'runWithTenantContext']);
+  });
+
+  it('#535: NÃO publica atribuição quando a resolução aborta o turno', async () => {
+    // Um turno que aborta por conflito cross-tenant nunca chega a operar sob a
+    // tupla — carimbar o span com ela seria afirmar um trabalho que não houve.
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-acme',
+      agent_id: 'agent-main',
+      channel_id: 'ch-abc',
+    });
+    adoptToResolvedTenantMock.mockResolvedValueOnce(false);
+    findOwnerByIdCrossTenantMock.mockResolvedValueOnce({
+      tenant_id: 'tenant-outro',
+      agent_id: 'agent-outro',
+    });
+
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await expect(runAgentForMensagem('msg1')).rejects.toThrow();
+
+    expect(publishSpanAttributionMock).not.toHaveBeenCalled();
+    expect(runWithTenantContextMock).not.toHaveBeenCalled();
   });
 
   // ──────────────────────────────────────────────────────────────────────────

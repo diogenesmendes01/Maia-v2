@@ -249,11 +249,23 @@ while `tool.dispatch` — opened inside the resolved scope — reported the trut
 A waterfall whose root could not be filtered by tenant, and whose children
 disagreed with it.
 
-So the tuple is CAPTURED instead. Entering a tenant scope notifies an advisory,
-fail-soft observer (`setTenantScopeObserver` in `src/db/tenant-context.ts`,
-registered by `src/observability/tracer.ts`) which publishes the tuple onto
-every span open on that async context; `emit()` uses the captured value. Two
-rules keep the isolation invariant intact, and both are test-enforced:
+So the tuple is CAPTURED instead, and it is published **by whoever resolves
+it** — `src/agent/core.ts`, right after deriving `resolved` and *before*
+entering `runWithTenantContext` — via `publishSpanAttribution`, which stamps
+every span open on that async context; `emit()` uses the captured value.
+
+There is deliberately **no extension point in `src/db/tenant-context.ts`**.
+A first attempt installed a generic observer there; it was rejected on review,
+for a reason worth keeping written down: that module validates the tuple at
+*read* time (`assertTruthyContext`, `assertNotDefaultLiteral` inside
+`getCurrentTenant()`/`getCurrentAgent()`), not at scope entry. A hook on entry
+would therefore stamp spans with tuples that had passed no validation at all —
+including the `'default'` literal that `AGENTS.md` §4 rule 8 bans — while a
+read of the same context would throw. Telemetry would assert precisely what the
+invariant forbids. The fail-closed boundary stays free of extension points; new
+resolution sites publish explicitly.
+
+Two rules keep the isolation invariant intact, and both are test-enforced:
 
 - **`system` never publishes.** The worker's outer `runWithSystemContext` — in
   either nesting order — cannot downgrade a span that already resolved.

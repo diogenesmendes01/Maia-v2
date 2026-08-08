@@ -510,10 +510,21 @@ tinha desmontado — todo root saía `tenant_id=system` enquanto o `tool.dispatc
 saía com a tupla certa. Se você abrir um waterfall antigo no collector, é isso
 que vai ver; não conclua que o turno rodou como `system`.
 
-Hoje a tupla é CAPTURADA: entrar num escopo de tenant notifica um observer
-consultivo e fail-soft (`setTenantScopeObserver`, registrado por
-`src/observability/tracer.ts`) que publica a tupla em todo span aberto naquele
-contexto assíncrono. Duas regras, ambas cobertas por teste:
+Hoje a tupla é CAPTURADA e publicada por **quem a resolve**: `src/agent/core.ts`
+chama `publishSpanAttribution` logo depois de derivar `resolved` e ANTES de
+abrir `runWithTenantContext`, carimbando todo span aberto naquele contexto
+assíncrono.
+
+Não há hook em `runWithTenantContext`, e isso é deliberado: aquele módulo valida
+a tupla em tempo de LEITURA (`assertNotDefaultLiteral`, dentro de
+`getCurrentTenant()`), não na entrada do escopo. Um hook ali carimbaria spans
+com tuplas não validadas — inclusive o literal `'default'`, proibido pelo
+`AGENTS.md` §4. **Consequência operacional:** um call site de resolução novo que
+esqueça de publicar produz um root `system` em vez de um span errado. Se você
+vir `tenant_id=system` num root de turno que claramente rodou sob um tenant,
+procure o `publishSpanAttribution` faltando no call site, não um bug no tracer.
+
+Duas regras, ambas cobertas por teste:
 
 - `system` nunca publica — o contexto externo do worker não rebaixa um span já
   resolvido, em nenhuma ordem de aninhamento;

@@ -148,6 +148,39 @@ startOnboardingRun({ kind, tenant_id, actor, idempotency_key, metadata })
   `onboarding_runs_one_live_per_tenant_uq` (run viva **sem** agente) e
   `onboarding_runs_one_live_per_agent_uq` (run viva por par completo).
 
+#### A fase inicial é serializada por tenant, e isso é intencional
+
+Antes de existir `agent_id`, **só pode haver uma saga viva por tenant**. Não é
+um limite acidental do índice: antes do `provision_agent` não existe identidade
+estável que distinga "um segundo agente legítimo" de "a mesma intenção enviada
+duas vezes". Na dúvida entre duplicar um provisionamento e serializar, o
+desenho serializa.
+
+Depois do `provision_agent`, o índice passa a ser por `(tenant_id, agent_id)` e
+**o paralelismo entre agentes do mesmo tenant volta a existir**. Ou seja: o
+gargalo dura exatamente o trecho em que ele protege alguma coisa.
+
+**Remediação de `live_run_exists`** — o operador recebe este código ao tentar
+abrir a segunda saga. Na ordem:
+
+1. **Ache a run viva.** `SELECT id, kind, state, created_at, agent_id FROM
+   onboarding_runs WHERE tenant_id = $1 AND state <> ALL(<terminais>)`. Se
+   `agent_id IS NOT NULL`, o bloqueio não é este — releia `duplicate_tenant`
+   acima.
+2. **Decida o que ela é.** Se for a *sua* intenção reenviada, não abra nada:
+   retome com a chave original (§2) e o replay devolve a run materializada.
+3. **Se for uma intenção diferente** (outro agente para o mesmo tenant), a run
+   corrente precisa **avançar até `provision_agent`** — aí o índice deixa de
+   colidir e a segunda saga abre normalmente.
+4. **Se a run viva estiver abandonada**, cancele-a (§4) ou deixe o
+   `onboarding_expirer` expirá-la (§5). Só depois abra a nova.
+
+**Não remova o índice para "destravar".** Ele é a única proteção contra
+provisionar duas árvores para o mesmo tenant. Se o paralelismo na fase inicial
+virar requisito real, a solução é reservar um `agent_id`/draft identity **na
+criação** — dando à segunda saga a identidade estável que hoje ela não tem —
+e não afrouxar a garantia contra duplicatas.
+
 `metadata` é um contrato **fechado**: `source` (`console|cli|api|automation`),
 `intent` opcional (`new_tenant|reonboarding|migration|evaluation`) e
 `ticket_ref` opcional no formato `ABC-123`. Qualquer outra chave é recusada com

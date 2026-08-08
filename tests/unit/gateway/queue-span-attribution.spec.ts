@@ -83,6 +83,7 @@ vi.mock('@/lib/logger.js', () => ({
 
 const { startAgentWorker } = await import('@/gateway/queue.js');
 const { runWithTenantContext } = await import('@/db/tenant-context.js');
+const { publishSpanAttribution } = await import('@/observability/tracer.js');
 const { setSpanSink } = await import('@/observability/tracer.js');
 const { SPAN } = await import('@/observability/taxonomy.js');
 type EndedSpan = import('@/observability/tracer.js').EndedSpan;
@@ -116,6 +117,10 @@ beforeAll(() => {
     // tenant: channel resolver + cross-tenant adoption, under `system`.
     await tick();
     if (plan.tenant) {
+      // Espelha `src/agent/core.ts`: a tupla resolvida é publicada
+      // explicitamente, antes de abrir o escopo. `runWithTenantContext` não
+      // tem hook — a fronteira fail-closed ficou sem ponto de extensão.
+      publishSpanAttribution(plan.tenant);
       await runWithTenantContext(plan.tenant, async () => {
         await tick();
         if (plan.park) await plan.park();
