@@ -1001,10 +1001,11 @@ export async function applyActivate(
   if (excluded.length > 0) {
     // Quem ESTAVA roteando é o que a governança precisa registrar. Reafirmar
     // `false` sobre `false` é no-op semântico, não uma decisão.
-    const wasActive = governedRows
-      .filter((r) => excluded.includes(r.id) && r.active)
-      .map((r) => r.id)
-      .sort();
+    const wasActive = [
+      ...new Set(
+        governedRows.filter((r) => excluded.includes(r.id) && r.active).map((r) => r.id),
+      ),
+    ].sort();
 
     const deactivated = await tx
       .update(channels)
