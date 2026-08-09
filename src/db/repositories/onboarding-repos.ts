@@ -137,11 +137,29 @@ export type CommitStepOutcome =
       code: string;
       message: string;
       /**
+       * O CORPO da negativa — o mesmo `result` que o ledger persistiu
+       * (`onboarding_step_results.result`). Um `deny` de `evaluate_readiness`
+       * ou de `activate` NÃO é só um código: o relatório de readiness (cada
+       * check com status, severidade, mensagem e remediação, e o veredito por
+       * canal) é o que diz ao operador O QUE FAZER. Devolver code/message e
+       * descartar o resto transformava a segunda resposta a uma mesma decisão
+       * numa versão pior da primeira.
+       *
+       * Vem do ledger tanto no caminho novo quanto no replay, e por construção
+       * é o MESMO valor nos dois — é o que faz "retry devolve o resultado
+       * anterior" valer também para as recusas.
+       */
+      result: Record<string, unknown>;
+      /**
        * `true` quando a negativa veio do LEDGER (retry da mesma chave após um
        * commit cujo resultado se perdeu), não de uma nova avaliação. Sem esta
        * distinção o wizard contaria duas recusas na métrica para uma única
        * decisão — e "quantas vezes o backend recusou" viraria "quantas vezes o
        * cliente perdeu a resposta".
+       *
+       * É também o que impede a AUDITORIA de duplicar: `audit_log` registra
+       * DECISÕES, e um replay não é uma decisão nova. Ver
+       * `emitAgentScopedAudit` em `src/onboarding/wizard.ts`.
        */
       replayed?: boolean;
     }
@@ -506,6 +524,12 @@ export const onboardingRunsRepo = {
             run,
             code: previous.outcome_code ?? 'readiness_blocked',
             message: previous.outcome_message ?? 'passo recusado',
+            // O CORPO da negativa também sai do ledger. Sem isto o replay de
+            // uma recusa de readiness devolvia só code/message: o relatório e a
+            // remediação — a única parte acionável da resposta — sumiam na
+            // segunda tentativa, e o operador que perdeu a primeira resposta
+            // ficava sabendo que foi recusado sem saber por quê.
+            result: (previous.result ?? {}) as Record<string, unknown>,
             replayed: true,
           };
         }
@@ -555,13 +579,19 @@ export const onboardingRunsRepo = {
         // na checagem de versão (já incrementada) e recebia `version_conflict`
         // em vez da negativa anterior — e a mesma chave com payload diferente
         // deixava de produzir `idempotency_payload_mismatch`.
+        // O MESMO valor vai para o ledger e para a resposta. Se a negativa
+        // devolvesse `applied.result` cru e persistisse o sanitizado, a
+        // primeira resposta e o replay dela divergiriam — e a divergência só
+        // apareceria no retry, que é o caminho menos exercitado.
+        const deniedResult = sanitizeForPersistence(applied.result);
+
         await tx.insert(onboarding_step_results).values({
           run_id: run.id,
           tenant_id: nextTenant,
           step: input.step,
           idempotency_key_hash: input.idempotency_key_hash,
           payload_hash: input.payload_hash,
-          result: sanitizeForPersistence(applied.result),
+          result: deniedResult,
           outcome_kind: STEP_RESULT_OUTCOMES.DENIED,
           outcome_code: applied.deny.code,
           outcome_message: applied.deny.message,
@@ -630,6 +660,7 @@ export const onboardingRunsRepo = {
           run: denied ?? run,
           code: applied.deny.code,
           message: applied.deny.message,
+          result: deniedResult,
         };
       }
 

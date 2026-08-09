@@ -35,6 +35,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { counter, histogram } from '@/observability/metrics.js';
@@ -70,6 +71,7 @@ import {
 import {
   blockingFailures,
   evaluateAgentReadiness,
+  READINESS_CHECK_CODES,
   type AgentReadiness,
 } from './readiness.js';
 import { loadReadinessFactsWith, lockReadinessSnapshot } from './readiness-facts.js';
@@ -760,12 +762,23 @@ export async function executeOnboardingStep(input: {
     ...attribution('run' in outcome ? outcome.run : existing),
   });
 
+  // Num REPLAY o `apply` do passo nunca roda, logo `readiness` acima continua
+  // `undefined`: o relatório precisa vir do LEDGER, que é onde a avaliação
+  // original ficou guardada. Reavaliar aqui produziria um veredito NOVO — e um
+  // veredito novo não é um replay.
+  const replayedReadiness =
+    (step === 'evaluate_readiness' || step === 'activate') &&
+    ((outcome.outcome === 'denied' && outcome.replayed === true) ||
+      outcome.outcome === 'replayed')
+      ? reconstituteReadiness(outcome.result)
+      : undefined;
+
   // Auditoria agente-escopada PÓS-COMMIT. `admin_audit_log` já recebeu o
   // registro atômico dentro da transação; este `audit()` existe porque
   // readiness e ativação são decisões de governança do AGENTE e pertencem
   // também à trilha `audit_log` (invariante 4). É best-effort por construção
   // (`audit()` loga+conta a falha) — a evidência atômica já está gravada.
-  await emitAgentScopedAudit(step, outcome, readiness);
+  await emitAgentScopedAudit(step, outcome, replayedReadiness ?? readiness);
 
   switch (outcome.outcome) {
     case 'committed':
@@ -796,6 +809,7 @@ export async function executeOnboardingStep(input: {
         run: toRunView(outcome.run),
         result: outcome.result,
         replayed: true,
+        ...(replayedReadiness ? { readiness: replayedReadiness } : {}),
       };
     case 'denied':
       // Uma negativa REPLAYADA (retry da mesma chave após um commit cuja
@@ -812,6 +826,9 @@ export async function executeOnboardingStep(input: {
               ...attribution(outcome.run),
             },
       );
+      // Pela mesma razão do contador acima: `agent_readiness_failed` conta
+      // CHECKS REPROVADOS numa avaliação, e o replay não avalia nada. Contar o
+      // relatório reconstituído somaria os mesmos checks de novo a cada retry.
       if (readiness) {
         for (const failed of blockingFailures(readiness)) {
           counter(METRIC.AGENT_READINESS_FAILED, {
@@ -825,7 +842,13 @@ export async function executeOnboardingStep(input: {
         run: toRunView(outcome.run),
         code: outcome.code,
         message: outcome.message,
-        ...(readiness ? { readiness } : {}),
+        // O relatório volta nas duas pontas: da avaliação nova (`readiness`) ou
+        // do ledger (`replayedReadiness`). Antes o replay devolvia code/message
+        // e mais nada — o operador ficava sabendo que foi recusado sem saber
+        // por qual check nem o que corrigir.
+        ...(readiness ?? replayedReadiness
+          ? { readiness: (readiness ?? replayedReadiness) as AgentReadiness }
+          : {}),
       };
     default:
       return mapOutcome(outcome);
@@ -888,14 +911,94 @@ function readinessSummary(readiness: AgentReadiness): Record<string, unknown> {
   };
 }
 
+/**
+ * O `result` que vai para o LEDGER (`onboarding_step_results.result`) — e que
+ * o replay devolve no lugar de reavaliar.
+ *
+ * Guarda o relatório INTEIRO, e não a projeção `{code,status,severity}` que
+ * havia antes, porque o ledger é a única memória que a saga tem de uma decisão
+ * já tomada. Com a projeção, o replay de uma NEGATIVA devolvia um veredito sem
+ * `message` e sem `remediation`: o operador que perdeu a primeira resposta
+ * descobria que foi recusado e não descobria o que fazer a respeito — a única
+ * parte acionável da resposta era exatamente a que não sobrevivia ao retry.
+ *
+ * Não é o mesmo papel de `readinessSummary`, que alimenta
+ * `onboarding_events.summary` e a auditoria e continua deliberadamente
+ * reduzido a códigos: aquilo é uma TRILHA (varrida, agregada, retida por
+ * muito tempo), isto é uma RESPOSTA (lida uma vez pelo cliente que a pediu).
+ *
+ * Continua passando por `sanitizeForPersistence` no repositório, como todo
+ * `result`; as mensagens de check já nascem sanitizadas por contrato
+ * (`ReadinessCheck.message` em `readiness.ts`).
+ */
 function readinessResult(readiness: AgentReadiness): Record<string, unknown> {
   return {
+    tenant_id: readiness.tenant_id,
+    agent_id: readiness.agent_id,
     ready: readiness.ready,
     evaluated_at: readiness.evaluated_at,
     configuration_fingerprint: readiness.configuration_fingerprint,
     schema_fingerprint: readiness.schema_fingerprint,
-    checks: readiness.checks.map((c) => ({ code: c.code, status: c.status, severity: c.severity })),
+    checks: readiness.checks.map((c) => ({
+      code: c.code,
+      status: c.status,
+      severity: c.severity,
+      message: c.message,
+      remediation: c.remediation,
+    })),
+    channels: readiness.channels,
+    activatable_channel_ids: readiness.activatable_channel_ids,
   };
+}
+
+/**
+ * O INVERSO de `readinessResult`: reconstitui o relatório a partir do que o
+ * ledger guardou, para que o replay devolva a MESMA resposta.
+ *
+ * Reavaliar seria a outra saída possível, e está errada por duas razões: uma
+ * avaliação nova pode dar outro veredito (a configuração muda), então não seria
+ * um replay; e seria uma DECISÃO nova, que precisaria de auditoria própria —
+ * exatamente o que o replay não é.
+ *
+ * A validação é Zod e o retorno é `undefined` quando não casa. O JSON vem do
+ * banco, pode ter sido gravado por uma versão anterior do código (o `result`
+ * projetado, sem `message`/`remediation`) e pode ter sido truncado pelos
+ * limites de `sanitize.ts`. Nesses casos o replay devolve code/message sem
+ * relatório — o comportamento antigo — em vez de um relatório inventado.
+ */
+const replayedReadinessSchema = z.object({
+  tenant_id: z.string().min(1),
+  agent_id: z.string().min(1),
+  ready: z.boolean(),
+  evaluated_at: z.string(),
+  configuration_fingerprint: z.string(),
+  schema_fingerprint: z.string(),
+  checks: z.array(
+    z.object({
+      code: z.enum(READINESS_CHECK_CODES),
+      status: z.enum(['pass', 'fail']),
+      severity: z.enum(['blocking', 'advisory']),
+      message: z.string(),
+      remediation: z.string(),
+    }),
+  ),
+  channels: z.array(
+    z.object({
+      channel_id: z.string(),
+      policy_governed: z.boolean(),
+      policy_role_active: z.boolean(),
+      ownership_proven: z.boolean(),
+      online: z.boolean(),
+      activatable: z.boolean(),
+      failed_checks: z.array(z.enum(READINESS_CHECK_CODES)),
+    }),
+  ),
+  activatable_channel_ids: z.array(z.string()),
+});
+
+function reconstituteReadiness(result: unknown): AgentReadiness | undefined {
+  const parsed = replayedReadinessSchema.safeParse(result);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /**
@@ -923,6 +1026,29 @@ async function emitAgentScopedAudit(
 ): Promise<void> {
   if (step !== 'evaluate_readiness' && step !== 'activate') return;
   if (outcome.outcome !== 'committed' && outcome.outcome !== 'denied') return;
+  // Um REPLAY não é uma decisão — e `audit_log` registra decisões (invariante 4
+  // do AGENTS.md). A negativa aconteceu UMA vez; o cliente é que perdeu a
+  // resposta e repetiu a chave. Auditar de novo gravava uma segunda linha para
+  // um evento único, e "quantas vezes este agente foi recusado" deixava de ser
+  // respondível contando linhas — passava a medir retentativas de rede.
+  //
+  // Escolhemos NÃO auditar, em vez de auditar marcando `replayed: true`, por
+  // três razões:
+  //
+  //   1. Simetria das duas trilhas. `commitStep` também NÃO escreve
+  //      `admin_audit_log` no caminho de replay. Gravar em `audit_log` e não em
+  //      `admin_audit_log` faria as duas trilhas discordarem sobre quantas
+  //      vezes a recusa aconteceu — e a discordância só apareceria numa
+  //      auditoria, tarde.
+  //   2. O replay JÁ tem registro append-only, e no lugar certo: `commitStep`
+  //      insere um `step_replayed` em `onboarding_events`, na MESMA transação,
+  //      com ator, `correlation_id` e hash da chave. "O cliente repetiu" é um
+  //      fato da saga, não uma decisão de governança.
+  //   3. Uma linha por retry é ilimitada: um cliente em loop de retry inflaria
+  //      a trilha de governança indefinidamente, e todo consumidor que
+  //      esquecesse de filtrar a flag contaria errado. Fechar na ESCRITA é
+  //      determinístico; depender de todo leitor filtrar, não.
+  if (outcome.outcome === 'denied' && outcome.replayed) return;
   const run = outcome.run;
   if (!run.tenant_id || !run.agent_id) return;
 

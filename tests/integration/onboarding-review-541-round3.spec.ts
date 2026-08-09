@@ -80,7 +80,17 @@ afterAll(async () => {
 // `provision_agent` parte.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Cada chamada de `openRunToAdminReady` abre um escopo NOVO — inclusive quando
+ * o vitest reexecuta o mesmo `it` (`retry`). Sem isto, a segunda tentativa
+ * colidia com o tenant/agente/linha que a primeira deixou no banco e o erro
+ * REAL da tentativa 1 ficava soterrado por um `duplicate key` da tentativa 2.
+ */
+let scopeSeq = 0;
+
 type RunCursor = {
+  /** O sufixo único deste escopo — entra em tenant, agente e linha. */
+  scope: string;
   tenant: string;
   actor: { actor_id: string; actor_role: 'owner'; tenant_id: string };
   run_id: string;
@@ -92,10 +102,11 @@ type RunCursor = {
   ) => Promise<Record<string, unknown>>;
 };
 
-async function openRunToAdminReady(suffix: string): Promise<RunCursor> {
+async function openRunToAdminReady(base: string): Promise<RunCursor> {
   const { startOnboardingRun, executeOnboardingStep } = await import(
     '../../src/onboarding/wizard.js'
   );
+  const suffix = `${base}${++scopeSeq}`;
   const tenant = `${PREFIX}-${suffix}`;
   tenants.add(tenant);
   const actor = { actor_id: ACTOR_ID, actor_role: 'owner' as const, tenant_id: tenant };
@@ -111,6 +122,7 @@ async function openRunToAdminReady(suffix: string): Promise<RunCursor> {
   createdRuns.push(started.run.id);
 
   const cursor: RunCursor = {
+    scope: suffix,
     tenant,
     actor,
     run_id: started.run.id,
@@ -148,7 +160,7 @@ d('[High] `provision_agent` não adota um agente preexistente', () => {
    */
   it('(a) agente NOVO é criado, com semente de profile e piso de capacidades', async () => {
     const cursor = await openRunToAdminReady('novo');
-    const agent = `${PREFIX}-novo-bot`;
+    const agent = `${PREFIX}-${cursor.scope}-bot`;
 
     const out = await cursor.step('provision_agent', { agent_id: agent, nome: 'Bot Novo' });
     expect(out.status).toBe('completed');
@@ -201,7 +213,7 @@ d('[High] `provision_agent` não adota um agente preexistente', () => {
    */
   it('(b) agente JÁ EXISTENTE no MESMO tenant ⇒ `duplicate_agent`, e nada é sobrescrito', async () => {
     const cursor = await openRunToAdminReady('adota');
-    const incumbent = `${PREFIX}-adota-bot`;
+    const incumbent = `${PREFIX}-${cursor.scope}-bot`;
 
     // O agente INCUMBENTE, montado direto no banco: ativo e já governado.
     // Deliberadamente com profile na versão 2 — assim a versão SEMENTE `v1`
@@ -306,8 +318,8 @@ d('[High] `provision_agent` não adota um agente preexistente', () => {
    */
   it('(c) replay da MESMA chave devolve o resultado anterior — nunca `duplicate_agent`', async () => {
     const cursor = await openRunToAdminReady('replay');
-    const agent = `${PREFIX}-replay-bot`;
-    const key = `${PREFIX}-replay-provision-agent`;
+    const agent = `${PREFIX}-${cursor.scope}-bot`;
+    const key = `${PREFIX}-${cursor.scope}-provision-agent`;
     const versionBefore = cursor.version;
 
     const first = await cursor.step(
@@ -348,6 +360,175 @@ d('[High] `provision_agent` não adota um agente preexistente', () => {
         [cursor.run_id],
       );
       expect(events.rows.map((r) => r.event_type)).toEqual(['step_completed', 'step_replayed']);
+    } finally {
+      c.release();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (5) [Medium] O replay de uma NEGAÇÃO devolve o relatório inteiro e NÃO
+//     reaudita.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Leva uma run de ZERO até `channel_ready` — o estado de onde
+ * `evaluate_readiness` parte.
+ */
+async function driveToChannelReady(
+  base: string,
+): Promise<RunCursor & { agent: string; channel_id: string; role_id: string }> {
+  const cursor = await openRunToAdminReady(base);
+  const suffix = cursor.scope;
+  const agent = `${PREFIX}-${suffix}-bot`;
+  // A linha também sai do contador: `channels.external_id` é único entre canais
+  // ativos no banco INTEIRO, não por tenant.
+  const line = `+551198765${String(3000 + scopeSeq).padStart(4, '0')}`;
+
+  await cursor.step('provision_agent', { agent_id: agent, nome: `Bot ${suffix}` });
+  await cursor.step('configure_profile', { approve: true });
+  await cursor.step('apply_capability_packs', { granted_packs: [], denied_tools: [] });
+  await cursor.step('configure_role', {
+    role_key: 'atendente',
+    display_name: 'Atendente',
+    granted_packs: [],
+  });
+  const declared = await cursor.step('declare_channel', {
+    channel_type: 'whatsapp',
+    external_id: line,
+    display_name: `Linha ${suffix}`,
+  });
+  const channel_id = (declared.result as Record<string, unknown>).channel_id as string;
+
+  await cursor.step('start_pairing', { channel_id, method: 'qr' });
+
+  const c = await pool.connect();
+  let role_id: string;
+  try {
+    await c.query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
+      channel_id,
+    ]);
+    const roles = await c.query(
+      'SELECT id FROM roles WHERE tenant_id=$1 AND agent_id=$2 AND is_default=true',
+      [cursor.tenant, agent],
+    );
+    role_id = roles.rows[0].id as string;
+  } finally {
+    c.release();
+  }
+
+  await cursor.step('confirm_channel_ready', { channel_id });
+  return Object.assign(cursor, { agent, channel_id, role_id });
+}
+
+d('[Medium] o replay de uma readiness NEGADA é a MESMA resposta, contada uma vez', () => {
+  it('devolve o relatório completo e deixa UMA linha em `audit_log`', async () => {
+    const s = await driveToChannelReady('replaydeny');
+
+    // Quebra a precondição: o papel padrão que governa o canal fica INATIVO.
+    // `channel_policy_role_active` reprova, `readiness.ready` vira false, e
+    // `evaluate_readiness` NEGA — que é o caminho de que este teste trata.
+    const c0 = await pool.connect();
+    try {
+      await c0.query('UPDATE roles SET active=false WHERE id=$1', [s.role_id]);
+    } finally {
+      c0.release();
+    }
+
+    const key = `${PREFIX}-${s.scope}-evaluate`;
+    const versionBefore = s.version;
+
+    const first = await s.step('evaluate_readiness', {}, { key });
+    expect(first.status).toBe('denied');
+    expect(first.code).toBe('readiness_blocked');
+
+    const firstReport = first.readiness as {
+      ready: boolean;
+      checks: { code: string; status: string; message: string; remediation: string }[];
+      channels: { channel_id: string; activatable: boolean; failed_checks: string[] }[];
+      activatable_channel_ids: string[];
+      configuration_fingerprint: string;
+    };
+    expect(firstReport).toBeDefined();
+    expect(firstReport.ready).toBe(false);
+    const firstFailed = firstReport.checks.filter((k) => k.status === 'fail').map((k) => k.code);
+    expect(firstFailed).toContain('channel_policy_role_active');
+    // O que o replay perdia: mensagem e REMEDIAÇÃO. Sem elas, a resposta diz
+    // que foi recusado e não diz o que fazer.
+    const firstRemediations = firstReport.checks
+      .filter((k) => k.status === 'fail')
+      .map((k) => k.remediation);
+    expect(firstRemediations.every((r) => r.length > 0)).toBe(true);
+
+    // Quantas linhas de auditoria a decisão deixou.
+    const auditRows = async () => {
+      const c = await pool.connect();
+      try {
+        const r = await c.query(
+          `SELECT id FROM audit_log
+           WHERE tenant_id=$1 AND agent_id=$2 AND acao='agent_readiness_evaluated'`,
+          [s.tenant, s.agent],
+        );
+        return r.rows.length;
+      } finally {
+        c.release();
+      }
+    };
+    expect(await auditRows()).toBe(1);
+
+    // ── O REPLAY: mesma chave, mesmo payload, versão ANTIGA (o cliente nunca
+    //    viu a resposta, logo nunca viu a versão nova).
+    const second = await s.step('evaluate_readiness', {}, { key, version: versionBefore });
+
+    expect(second.status).toBe('denied');
+    expect(second.code).toBe('readiness_blocked');
+    expect(second.message).toBe(first.message);
+
+    const secondReport = second.readiness as typeof firstReport;
+    expect(secondReport).toBeDefined();
+    // O relatório INTEIRO volta — não uma aproximação, não só code/message.
+    expect(secondReport).toEqual(firstReport);
+    expect(secondReport.checks.filter((k) => k.status === 'fail').map((k) => k.code)).toEqual(
+      firstFailed,
+    );
+    expect(
+      secondReport.checks.filter((k) => k.status === 'fail').every((k) => k.remediation.length > 0),
+    ).toBe(true);
+    expect(secondReport.configuration_fingerprint).toBe(firstReport.configuration_fingerprint);
+
+    // ── E a decisão continua tendo acontecido UMA vez. `audit()` engole falhas
+    //    por design (best-effort), então contar chamadas não prova nada:
+    //    contamos LINHAS no banco.
+    expect(await auditRows()).toBe(1);
+
+    const c = await pool.connect();
+    try {
+      // A trilha de governança transacional também não duplicou.
+      const admin = await c.query(
+        `SELECT action FROM admin_audit_log
+         WHERE tenant_id=$1 AND action='onboarding_readiness_evaluated_denied'`,
+        [s.tenant],
+      );
+      expect(admin.rows).toHaveLength(1);
+
+      // O ledger guardou UM resultado conclusivo, do tipo certo.
+      const ledger = await c.query(
+        `SELECT outcome_kind, outcome_code FROM onboarding_step_results
+         WHERE run_id=$1 AND step='evaluate_readiness'`,
+        [s.run_id],
+      );
+      expect(ledger.rows).toHaveLength(1);
+      expect(ledger.rows[0].outcome_kind).toBe('denied');
+      expect(ledger.rows[0].outcome_code).toBe('readiness_blocked');
+
+      // E o replay ficou registrado onde pertence: um evento append-only da
+      // saga, não uma segunda decisão de governança.
+      const events = await c.query(
+        `SELECT event_type FROM onboarding_events
+         WHERE run_id=$1 AND step='evaluate_readiness' ORDER BY created_at`,
+        [s.run_id],
+      );
+      expect(events.rows.map((r) => r.event_type)).toEqual(['step_denied', 'step_replayed']);
     } finally {
       c.release();
     }

@@ -277,6 +277,65 @@ no caminho de recusa. Hoje a negativa é gravada **antes** de a versão/estado
 mudarem, e o replay devolve o mesmo código e a mesma mensagem — marcado como
 replay, para não contar duas recusas na métrica.
 
+##### O replay de uma negativa devolve o RELATÓRIO, e não reaudita
+
+Duas assimetrias sobravam no caminho de recusa, e as duas só apareciam no
+retry — o caminho menos exercitado.
+
+**(1) O corpo da resposta sumia.** `CommitStepOutcome.denied` carregava só
+`code` e `message`. Para `evaluate_readiness` e `activate`, porém, a resposta
+ACIONÁVEL é o relatório: cada check com status, severidade, mensagem e
+**remediação**, e o veredito por canal. O operador que perdeu a primeira
+resposta e repetiu a chave descobria que foi recusado sem descobrir o que
+corrigir.
+
+Correção: a negativa passa a carregar `result`, vindo do ledger nas duas pontas
+(negativa nova e replay — o mesmo valor sanitizado, por construção). E o `result`
+que o ledger guarda passa a ser o relatório INTEIRO
+(`readinessResult` em [`wizard.ts`](../../../src/onboarding/wizard.ts)), não a
+projeção `{code,status,severity}` de antes; `reconstituteReadiness` é o inverso,
+validado por Zod, devolvendo `undefined` (e não um relatório inventado) quando o
+JSON não casa — linha gravada por versão anterior, ou truncada pelos limites de
+`sanitize.ts`.
+
+> Reavaliar no replay seria a outra saída, e está errada: uma avaliação nova
+> pode dar outro veredito, então não seria um replay — e seria uma DECISÃO nova,
+> que precisaria de auditoria própria.
+
+`readinessSummary` continua reduzido a códigos: ele alimenta
+`onboarding_events.summary` e a auditoria, que são **trilha** (varrida, agregada,
+retida). O `result` é **resposta** — lida uma vez por quem a pediu.
+
+**(2) A auditoria duplicava.** `emitAgentScopedAudit` gravava em `audit_log`
+sempre que o resultado fosse `committed` ou `denied` — inclusive numa negativa
+REPLAYADA. Uma decisão que aconteceu uma vez virava duas linhas, e "quantas vezes
+este agente foi recusado" deixava de ser respondível contando linhas.
+
+Correção: **o replay não audita** (em vez de auditar marcado como replay). Três
+razões:
+
+1. **Simetria das trilhas.** `commitStep` também não escreve `admin_audit_log`
+   no caminho de replay. Gravar numa trilha e não na outra faria as duas
+   discordarem sobre quantas vezes a recusa aconteceu — e a discordância só
+   apareceria numa auditoria, tarde.
+2. **O replay já tem registro, no lugar certo.** `commitStep` insere um
+   `step_replayed` em `onboarding_events`, na mesma transação, com ator,
+   `correlation_id` e hash da chave. "O cliente repetiu" é fato da saga, não
+   decisão de governança (invariante 4 do `AGENTS.md` audita **decisões**).
+3. **Uma linha por retry é ilimitada.** Um cliente em loop inflaria a trilha
+   indefinidamente, e todo consumidor que esquecesse de filtrar a flag contaria
+   errado. Fechar na ESCRITA é determinístico; depender de todo leitor filtrar,
+   não.
+
+Pela mesma razão, `maia_agent_readiness_failed_total` só conta checks de uma
+avaliação REAL: o replay vai para `maia_onboarding_idempotency_replay_total`.
+
+Provado em
+[`tests/integration/onboarding-review-541-round3.spec.ts`](../../../tests/integration/onboarding-review-541-round3.spec.ts):
+o replay devolve relatório idêntico ao da primeira resposta (com remediações), e
+`audit_log` fica com **uma** linha — contada no banco, porque `audit()` engole
+falhas por design e contar chamadas não provaria nada.
+
 #### `failed_retryable` guarda o PONTO DE RETOMADA
 
 O estado dizia "reexecute o mesmo passo" mas não guardava **qual** passo falhou,
