@@ -119,6 +119,59 @@ posse E papel válido) e permissiva só onde é seguro.
 Prova: `tests/unit/onboarding/readiness.spec.ts` (composição INTRA-agente) e
 `tests/integration/onboarding-review-541-round2.spec.ts`.
 
+#### O conjunto é EXATO: liga os válidos **e desliga** os governados excluídos
+
+Ligar `activatable_channel_ids` sem escrever o complemento deixava metade da
+decisão por fazer. Um canal governado que **já estava roteando** e cujo papel foi
+depois desativado continuava `active=true`: o readiness o excluía, a ativação
+não o mencionava, e outro canal do mesmo agente sustentava a readiness global.
+
+`applyActivate` aplica agora o conjunto **exato**, na mesma transação e sob os
+mesmos locks (`lockReadinessSnapshot` já tomou `FOR UPDATE` em `channels`):
+
+- `active = true` em `activatable_channel_ids` (re-derivado);
+- `active = false` nos **governados** (não-sintéticos do escopo **com**
+  `channel_policy` do mesmo escopo) que ficaram de fora;
+- as **duas** escritas com contagem conferida — descasamento lança e a
+  transação inteira volta;
+- cada canal que **estava** ativo e deixou de rotear gera um
+  `onboarding_channel_deactivated` em `admin_audit_log`, no mesmo `tx`, com o
+  ator do comando e os `failed_checks` tipados vindos do veredito.
+
+A regra em uma frase: **readiness do agente é existencial; cada canal é
+fail-closed individualmente.** A alternativa "negar a ativação se houver canal
+ativo excluído" foi recusada — ela devolve o canal quebrado derrubando o agente
+inteiro, exatamente o que a regra existencial rejeita.
+
+Prova: `tests/integration/onboarding-review-541-round3.spec.ts` (achado 3).
+
+#### O pareamento não ativa dentro da saga
+
+`start_pairing` é o sétimo passo de onze. Enquanto o pareamento de #518 ativava
+o canal assim que a posse era provada, o resultado era `channels.active = true`
+com a run ainda em `pairing_pending`/`channel_ready` e o agente em
+`provisioning` — e como o resolver confia em `channels.active`, entrava tráfego
+real antes de a saga revalidar schema, grants, packs e governance.
+
+Enquanto existir uma run de onboarding **viva** para o (tenant, agente), a
+ativação é dela. `resolveLineActivationOwner` (`src/setup/line-activation-owner.ts`)
+responde isso, e a resposta entra como **precondição zero** do gate
+`evaluateLineReadiness` (`reason_code: onboarding_saga_owns_activation`) — no
+gate, e não dentro do pareamento, porque o worker `channel_pairing` consulta o
+mesmo gate a cada minuto para promover linhas `verified_offline`. O pareamento
+verifica posse, a linha fica `verified_offline`, e `confirm_channel_ready`
+segue normalmente.
+
+Fora do onboarding (`/setup` legado, console Admin, recovery de linha de agente
+já ativo) nada muda: sem run viva o dono é o gate de linha, como sempre foi.
+
+O passo `activate` é também quem **sobe a sessão de linha** dos canais que
+ligou (`WizardDeps.startLineSessions`, pós-commit e fail-isolated) — abrir o
+socket dentro da transação prenderia a trava da run por um handshake de rede.
+
+Prova: `tests/integration/onboarding-review-541-round3.spec.ts` (achado 1, os
+dois lados) e `tests/unit/setup/line-activation-owner.spec.ts`.
+
 ### A propriedade central
 
 O avaliador é puro e recebe os fatos com o **escopo dono embutido em cada objeto**. Ele não confia que o loader filtrou — ele **prova**, descartando todo objeto cujo par não seja o requisitado. Um fato de outro escopo é tratado como **ausente**, jamais como satisfeito. É o que mata o falso positivo "profile de A + canal de B ⇒ pronto" (`tests/unit/onboarding/readiness.spec.ts`).
@@ -393,7 +446,9 @@ Optimistic: todo comando informa `expected_version`; o `UPDATE` casa com `versio
 
 ### Ativação
 
-A ativação **reavalia** o readiness sob a trava da run — readiness verde há cinco minutos não autoriza ativar agora. Reprovando, a run vai para `readiness_failed` e a auditoria registra `agent_activation_denied`. Aprovando, o agente vira `active`, **exatamente os canais que o readiness aprovou** (`activatable_channel_ids` — política + papel ativo + posse, cada um satisfeito pelo MESMO canal) passam a rotear, e a auditoria registra `agent_activation_approved` com os dois fingerprints. `applyActivate` re-deriva esse conjunto contra o banco sob os locks e **recusa** (`deny`) se ele divergir do aprovado: a decisão é do avaliador (foi ela que o operador viu), a re-derivação é a segunda opinião, e nenhuma das duas sozinha basta.
+A ativação **reavalia** o readiness sob a trava da run — readiness verde há cinco minutos não autoriza ativar agora. Reprovando, a run vai para `readiness_failed` e a auditoria registra `agent_activation_denied`. Aprovando, o agente vira `active`, **exatamente os canais que o readiness aprovou** (`activatable_channel_ids` — política + papel ativo + posse, cada um satisfeito pelo MESMO canal) passam a rotear, **os governados excluídos vão para `active=false` na mesma transação** (com auditoria por canal), e a auditoria registra `agent_activation_approved` com os dois fingerprints. `applyActivate` re-deriva esse conjunto contra o banco sob os locks e **recusa** (`deny`) se ele divergir do aprovado: a decisão é do avaliador (foi ela que o operador viu), a re-derivação é a segunda opinião, e nenhuma das duas sozinha basta.
+
+O passo devolve `activated_channel_ids` **e** `deactivated_channel_ids`, e é ele — não o pareamento — quem sobe a sessão de linha dos canais ligados.
 
 #### O retrato precisa ser o MESMO que as escritas enxergam
 

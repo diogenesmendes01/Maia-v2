@@ -395,3 +395,55 @@ SELECT cls.state, cls.command, cls.command_id, cls.command_requested_at,
 - a trilha do enfileiramento (`onboarding_pairing_requested`, resource_type
   `channel`) e a do passo da saga (`onboarding_pairing_started`) estão no MESMO
   commit — se você vê uma sem a outra, é bug, não corrida.
+
+### 7.1 "A linha pareou mas o canal continua inativo" — isso é o esperado
+
+Dentro do onboarding o pareamento **só prova posse**. Enquanto a run está viva,
+a ativação pertence ao passo `activate` da saga (re-review do PR #541, achado 1).
+O sintoma normal é:
+
+- `channel_line_state.state = 'verified_offline'`;
+- `channels.active = false`;
+- em `audit_log`, `pairing_session_verified` com `metadata.routing_activated =
+  false` e `channel_activation_deferred` com
+  `metadata.reason = 'onboarding_saga_owns_activation'`.
+
+```sql
+SELECT acao, metadata->>'reason' AS reason, metadata->>'routing_activated' AS routed
+  FROM audit_log
+ WHERE tenant_id = :tenant AND metadata->>'channel_id' = :channel_id
+ ORDER BY created_at DESC LIMIT 10;
+```
+
+**Não ative o canal à mão.** Siga a saga: `confirm_channel_ready` →
+`evaluate_readiness` → `activate`. O passo final liga o canal e sobe a sessão.
+
+O mesmo vale para o worker `channel_pairing`: a varredura
+`promoteReadyVerifiedLines` consulta o MESMO gate e vai pular a linha enquanto a
+run viver — por isso ela não ativa "sessenta segundos depois".
+
+Se a run terminou (`active`, `cancelled`, `failed_terminal`) e o canal continua
+`verified_offline` + inativo, aí sim o dono voltou a ser o pareamento: o worker
+ativa no próximo tick, sem novo pareamento. Se não ativar, o motivo estará em
+`channel_activation_deferred` (`missing_active_profile`, `missing_policy`,
+`default_role_inactive`).
+
+### 7.2 "Um canal parou de rotear depois da ativação"
+
+A ativação aplica o conjunto **exato**: liga `activatable_channel_ids` e
+**desliga** os governados excluídos, na mesma transação. Isso é decisão de
+governança e está auditado:
+
+```sql
+SELECT resource_id AS channel_id, actor_id, actor_role,
+       change_summary->'failed_checks' AS failed_checks, created_at
+  FROM admin_audit_log
+ WHERE tenant_id = :tenant AND action = 'onboarding_channel_deactivated'
+ ORDER BY created_at DESC;
+```
+
+`failed_checks` diz exatamente o que faltou àquele canal
+(`channel_policy_resolved`, `channel_policy_role_active`,
+`channel_ownership_proven`). Corrija a causa e rode `evaluate_readiness` +
+`activate` de novo — o canal volta ao conjunto ativado. O passo também devolve
+`deactivated_channel_ids` no `result`.
