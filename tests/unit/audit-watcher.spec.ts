@@ -24,11 +24,44 @@ beforeEach(async () => {
   dbExecuteMock.mockReset();
 });
 
+/**
+ * A `acao` de cada regra entra na consulta como PARÂMETRO (`$1`), então
+ * reconhecer "a consulta do disjuntor" por grep no texto do SQL não funciona —
+ * as duas regras `stuck` renderizam o mesmo esqueleto. Estes dois helpers
+ * casam pelo parâmetro, que é o que de fato distingue uma da outra.
+ */
+function isQueryFor(q: unknown, acao: string): boolean {
+  return new PgDialect().sqlToQuery(q as SQL).params.includes(acao);
+}
+
+/**
+ * As duas formas de regra devolvem SHAPES diferentes: `threshold` devolve uma
+ * linha com `c`, `stuck` devolve UMA LINHA POR INSTÂNCIA presa (achado 4). Um
+ * `mockResolvedValue` único para as duas faz a regra `stuck` ler "uma
+ * instância presa" onde o caso queria dizer "nada" — verde ou vermelho por
+ * acidente do stub, não pelo comportamento.
+ */
+function isStuckQuery(q: unknown): boolean {
+  return new PgDialect().sqlToQuery(q as SQL).sql.includes('NOT EXISTS');
+}
+
+function stubDb(count: number, stuckGroups: unknown[] = []) {
+  return async (q: unknown) =>
+    isStuckQuery(q) ? { rows: stuckGroups } : { rows: [{ c: count }] };
+}
+
+function renderedFor(mock: { mock: { calls: unknown[][] } }, acao: string): string | undefined {
+  const dialect = new PgDialect();
+  const call = mock.mock.calls.find((c) => isQueryFor(c[0], acao));
+  return call ? dialect.sqlToQuery(call[0] as SQL).sql : undefined;
+}
+
 describe('audit-watcher', () => {
   it('fires alert when threshold rule meets the count', async () => {
-    // Every query returns 100 (well above all thresholds in the rule list).
-    // The first rule in RULES (setup_unauthorized_farm, threshold 3) will trip.
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 100 }] });
+    // Every threshold query returns 100 (well above all thresholds in the
+    // rule list); the stuck rules see nothing. The first rule in RULES
+    // (setup_unauthorized_farm, threshold 3) will trip.
+    dbExecuteMock.mockImplementation(stubDb(100));
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await runAuditWatcher();
     expect(sendAlertMock).toHaveBeenCalled();
@@ -38,14 +71,14 @@ describe('audit-watcher', () => {
   });
 
   it('does not fire when threshold rule is below count', async () => {
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 0 }] });
+    dbExecuteMock.mockImplementation(stubDb(0));
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await runAuditWatcher();
     expect(sendAlertMock).not.toHaveBeenCalled();
   });
 
   it('throttles repeat alerts within the 30-min window', async () => {
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 100 }] });
+    dbExecuteMock.mockImplementation(stubDb(100));
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await runAuditWatcher();
     const firstCount = sendAlertMock.mock.calls.length;
@@ -53,7 +86,7 @@ describe('audit-watcher', () => {
 
     // Second tick same minute — throttle must suppress every alert.
     sendAlertMock.mockClear();
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 100 }] });
+    dbExecuteMock.mockImplementation(stubDb(100));
     await runAuditWatcher();
     expect(sendAlertMock).not.toHaveBeenCalled();
   });
@@ -62,7 +95,7 @@ describe('audit-watcher', () => {
     // First call (first rule) throws, subsequent calls succeed with 0 — only
     // the throwing rule should be skipped, others still run.
     dbExecuteMock.mockRejectedValueOnce(new Error('connection lost'));
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 0 }] });
+    dbExecuteMock.mockImplementation(stubDb(0));
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await expect(runAuditWatcher()).resolves.toBeUndefined();
     // No alerts because subsequent rules return 0
@@ -107,7 +140,7 @@ describe('audit-watcher', () => {
       const { tryGetCurrentContext } = await import('../../src/db/tenant-context.js');
       const ctx = tryGetCurrentContext();
       if (ctx) observed.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
-      return { rows: [{ c: 0 }] };
+      return { rows: [] };
     });
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await runAuditWatcher();
@@ -120,13 +153,108 @@ describe('audit-watcher', () => {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Achado 4 da re-review do owner na PR #541 — correlação das regras `stuck`.
+  //
+  // A prova de ponta a ponta (circuito A preso × circuito B que fecha) é
+  // integração contra Postgres real, em
+  // `tests/integration/llm-circuit-audit-real-db.spec.ts`. O que se trava aqui
+  // é o que aquela suíte NÃO pode travar sem banco: que a consulta emitida
+  // carrega o predicado de correlação, e que nenhuma regra `stuck` nova pode
+  // nascer sem escolher por quê correlacionar.
+  // ---------------------------------------------------------------------
+  it('toda regra `stuck` declara explicitamente `correlate_by`', async () => {
+    const { _internal } = await import('../../src/workers/audit-watcher.js');
+    const stuck = _internal.RULES.filter((r) => r.kind === 'stuck');
+    expect(stuck.length).toBeGreaterThan(0);
+    for (const rule of stuck) {
+      expect(Array.isArray(rule.correlate_by), `regra "${rule.id}"`).toBe(true);
+    }
+    // E as duas que existem hoje NÃO são singletons globais: o disjuntor é por
+    // (provider, workload) e por réplica; a recuperação de pareamento é por
+    // alvo. `[]` em qualquer uma delas é o defeito de volta.
+    const byId = new Map(stuck.map((r) => [r.id, r.correlate_by]));
+    expect(byId.get('llm_circuit_long_open')).toEqual(['provider', 'workload', 'replica']);
+    expect(byId.get('pairing_recovery_stuck')).toEqual(['target']);
+  });
+
+  it('a consulta `stuck` amarra o par pela identidade, não só pela ordem', async () => {
+    dbExecuteMock.mockImplementation(stubDb(0));
+    const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
+    await runAuditWatcher();
+
+    // A `acao` viaja como PARÂMETRO, não no texto — a consulta se reconhece
+    // pelos params, não por grep no SQL.
+    const circuitQuery = renderedFor(dbExecuteMock, 'llm_circuit_opened');
+    expect(circuitQuery, 'nenhuma consulta `stuck` foi emitida').toBeDefined();
+    expect(circuitQuery).toContain('NOT EXISTS');
+
+    // O defeito era um NOT EXISTS que só olhava `created_at`. Cada chave de
+    // correlação precisa aparecer AMARRANDO b a a.
+    for (const key of ['provider', 'workload', 'replica']) {
+      expect(
+        circuitQuery,
+        `a consulta não correlaciona por "${key}": qualquer fechamento fecharia qualquer abertura`,
+      ).toContain(`b.metadata->>'${key}' IS NOT DISTINCT FROM a.metadata->>'${key}'`);
+    }
+    // `=` deixaria a comparação NULL quando a chave falta dos dois lados, e o
+    // NOT EXISTS passaria a valer sempre: alarme falso permanente.
+    expect(circuitQuery).not.toMatch(/b\.metadata->>'provider' = /);
+  });
+
+  it('o alerta NOMEIA a instância presa, e não só quantas são', async () => {
+    dbExecuteMock.mockImplementation(async (q: unknown) =>
+      isQueryFor(q, 'llm_circuit_opened')
+        ? {
+            rows: [
+              {
+                identity: 'anthropic/reasoner/host-a:1#aaaa1111',
+                n: 3,
+                oldest: new Date('2026-01-01T00:00:00.000Z'),
+              },
+            ],
+          }
+        : stubDb(0)(q),
+    );
+    const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
+    await runAuditWatcher();
+
+    const call = sendAlertMock.mock.calls.find((c) =>
+      (c[0].subject as string).includes('llm_circuit_long_open'),
+    );
+    expect(call, 'a regra do disjuntor não alertou').toBeDefined();
+    const body = call![0].body as string;
+    expect(body).toContain('anthropic/reasoner/host-a:1#aaaa1111');
+    expect(body).toContain('provider/workload/replica');
+    expect(body).toContain('2026-01-01T00:00:00.000Z');
+  });
+
+  it('um carimbo ausente vira `unknown` em vez de matar o alerta', async () => {
+    // `new Date(null).toISOString()` lança; lançar aqui faria o `catch` de
+    // `runAuditWatcher` engolir a regra como `check_failed` e o plantão veria
+    // silêncio no lugar de um circuito preso.
+    dbExecuteMock.mockImplementation(async (q: unknown) =>
+      isQueryFor(q, 'llm_circuit_opened')
+        ? { rows: [{ identity: 'anthropic/reasoner/x', n: 1, oldest: null }] }
+        : stubDb(0)(q),
+    );
+    const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
+    await runAuditWatcher();
+
+    const call = sendAlertMock.mock.calls.find((c) =>
+      (c[0].subject as string).includes('llm_circuit_long_open'),
+    );
+    expect(call).toBeDefined();
+    expect(call![0].body as string).toContain('oldest unknown');
+  });
+
   // Regression: the original PR queried `FROM auditoria`, which doesn't exist
   // in the schema — the real table is `audit_log`. The watcher now interpolates
   // the imported `audit_log` schema reference. Render the SQL the watcher
   // hands to `db.execute` through Drizzle's PgDialect and assert the rendered
   // text references `audit_log` and never the legacy name.
   it('queries reference the audit_log table, not auditoria', async () => {
-    dbExecuteMock.mockResolvedValue({ rows: [{ c: 0 }] });
+    dbExecuteMock.mockImplementation(stubDb(0));
     const { runAuditWatcher } = await import('../../src/workers/audit-watcher.js');
     await runAuditWatcher();
     expect(dbExecuteMock).toHaveBeenCalled();

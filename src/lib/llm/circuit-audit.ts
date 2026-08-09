@@ -77,6 +77,7 @@
  */
 import { logger } from '@/lib/logger.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
+import { runtimeInstanceId } from '@/runtime/instance-identity.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 
 /** Ações desta trilha. Todas existem em `AUDIT_ACTIONS` (typecheck garante). */
@@ -89,6 +90,62 @@ export type CircuitAuditAction = Extract<
   | 'llm_circuit_mode_override_expired'
   | 'llm_circuit_mode_override_rejected'
 >;
+
+/**
+ * Chave de `metadata` que carrega a identidade da RÉPLICA (achado 4 da
+ * re-review do owner na PR #541). Exportada porque o consumidor — a regra
+ * `llm_circuit_long_open` de `src/workers/audit-watcher.ts` — correlaciona por
+ * ela, e produtor e consumidor concordarem "por acaso" sobre o nome de uma
+ * chave JSONB é exatamente como um alerta volta a ficar cego em silêncio.
+ */
+export const REPLICA_METADATA_KEY = 'replica';
+
+let cachedReplica: string | null = null;
+
+/**
+ * Identidade da réplica que observou a transição.
+ *
+ * ## Por que a trilha PRECISA disto
+ *
+ * O estado do disjuntor é por `(provider, workload)` (`circuit-breaker.ts`,
+ * `keyOf`) **e por processo**: a janela deslizante de amostras vive na memória
+ * de cada réplica, e nada a compartilha. Duas réplicas atrás do mesmo balanço
+ * podem estar, ao mesmo tempo, uma com `anthropic/reasoner` aberto e a outra
+ * com ele fechado — e as duas estão certas sobre o que enxergam.
+ *
+ * Sem esta chave, `llm_circuit_opened` e `llm_circuit_closed` são
+ * indistinguíveis entre circuitos e entre réplicas, e a regra de "stuck" casa
+ * QUALQUER fechamento posterior com QUALQUER abertura: um circuito que abriu e
+ * fechou normalmente desarma o alerta de outro que continua preso aberto. O
+ * alerta fica cego exatamente no cenário que existe para pegar.
+ *
+ * ## Por que `<host>:<pid>#<boot>` e não só `<host>:<pid>`
+ *
+ * `runtimeInstanceId()` é `<hostname>:<pid>`, legível e consistente com as
+ * leases do repo — é o que responde "QUAL container?" numa investigação. Mas
+ * ele NÃO é único no tempo: em container, o processo principal é PID 1 e o
+ * hostname é estável, então `host:1` se repete a cada restart. Um processo
+ * novo herdaria a identidade do morto e o `closed` dele fecharia a abertura
+ * que o processo anterior deixou em aberto — a mesma correlação cruzada que
+ * esta chave existe para eliminar, só que mais difícil de ver.
+ *
+ * `lifecycle.instanceId` é sorteado por processo (#512), então o sufixo torna
+ * a identidade única por BOOT sem custar a legibilidade do prefixo.
+ *
+ * ## O que isto assume, e o que não conserta
+ *
+ * Uma réplica que MORRE com o circuito aberto nunca emite o `closed` do par:
+ * aquela abertura fica sem fechamento e a regra alerta por ela enquanto a
+ * linha estiver na janela de 24 h do watcher. Isso é ruído CONHECIDO e
+ * deliberado — o inverso (deixar o boot seguinte fechar o par) é o defeito
+ * original. O runbook operacional diz ao plantão como reconhecer o caso: se a
+ * réplica citada no alerta não existe mais, cruze com
+ * `maia_llm_circuit_state{state="open"}`, que só existe para processo vivo.
+ */
+function replicaIdentity(): string {
+  cachedReplica ??= `${runtimeInstanceId()}#${lifecycle.instanceId}`;
+  return cachedReplica;
+}
 
 /**
  * Escritas em voo. `Set` e não contador: o dreno precisa AGUARDAR cada uma,
@@ -109,7 +166,12 @@ async function writeCircuitAudit(
       acao,
       // TEXT, não `alvo_id` (uuid). Ver o bloco "armadilha" acima.
       entidade_alvo: 'llm_circuit',
-      metadata,
+      // A identidade da réplica entra AQUI, e não no `detail` de
+      // `circuit-breaker.ts`/`circuit-mode.ts`, para que TODA ação desta
+      // trilha a carregue por construção — inclusive as que forem
+      // adicionadas depois. Vai por último de propósito: nenhum caller pode
+      // sobrescrever a própria identidade com um valor de metadado.
+      metadata: { ...metadata, [REPLICA_METADATA_KEY]: replicaIdentity() },
     }),
   );
 }
@@ -159,4 +221,5 @@ export async function drainCircuitAudits(): Promise<void> {
 /** Test seam: quantas escritas ainda estão em voo. */
 export const _internal = {
   pendingCount: (): number => pending.size,
+  replicaIdentity,
 };

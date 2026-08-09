@@ -250,6 +250,172 @@ d('audit-watcher encontra o par (Postgres real)', () => {
   });
 });
 
+d('correlação do watcher por circuito e réplica (Postgres real)', () => {
+  /**
+   * Achado 4 da re-review do owner na PR #541.
+   *
+   * A regra `llm_circuit_long_open` aceitava QUALQUER `llm_circuit_closed`
+   * posterior como par de QUALQUER `llm_circuit_opened`. Mas o estado do
+   * disjuntor é por `(provider, workload)` (`keyOf` em `circuit-breaker.ts`) e,
+   * além disso, por RÉPLICA — a janela de amostras vive na memória de cada
+   * processo. Consequência: um circuito que abriu e fechou normalmente
+   * DESARMAVA o alerta de outro que continuava preso aberto. O alerta de
+   * "aberto há mais de 5 min" ficava cego exatamente no cenário que existe
+   * para pegar.
+   *
+   * Estes casos falham contra a versão sem correlação — é essa a única razão
+   * de existirem.
+   */
+  async function ageOpened(minutes: number, where = 'TRUE'): Promise<number> {
+    const r = await pool.query(
+      `UPDATE audit_log SET created_at = NOW() - ($1 || ' minutes')::interval
+        WHERE acao = 'llm_circuit_opened' AND ${where}`,
+      [String(minutes)],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  async function runWatcher(): Promise<Array<{ subject: string; body: string }>> {
+    const { runAuditWatcher, _internal } = await import('@/workers/audit-watcher.js');
+    _internal.lastAlertedAt.clear();
+    sendAlertMock.mockClear();
+    await runAuditWatcher();
+    return sendAlertMock.mock.calls.map((c) => c[0] as { subject: string; body: string });
+  }
+
+  function circuitAlert(
+    alerts: Array<{ subject: string; body: string }>,
+  ): { subject: string; body: string } | undefined {
+    return alerts.find((a) => a.subject.includes('llm_circuit_long_open'));
+  }
+
+  /** Abre o disjuntor de `workload` pelo caminho real (tempestade terminal). */
+  async function open(workload: 'reasoner' | 'summarizer'): Promise<void> {
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
+      '@/lib/llm/circuit-breaker.js'
+    );
+    const key = { provider: 'anthropic', workload } as const;
+    for (let i = 0; i < _internal.MIN_SAMPLES; i++) {
+      releaseCircuit(acquireCircuit(key), 'terminal_fault');
+    }
+    expect(circuitState(key)).toBe('open');
+  }
+
+  /** Fecha o disjuntor de `workload` com uma sonda bem sucedida. */
+  async function close(workload: 'reasoner' | 'summarizer'): Promise<void> {
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
+      '@/lib/llm/circuit-breaker.js'
+    );
+    const key = { provider: 'anthropic', workload } as const;
+    const entry = _internal.circuits.get(JSON.stringify([key.provider, key.workload]))!;
+    entry.opened_at -= _internal.OPEN_MS + 1;
+    releaseCircuit(acquireCircuit(key), 'ok');
+    expect(circuitState(key)).toBe('closed');
+  }
+
+  it('o produtor grava a identidade da réplica em `metadata.replica`', async () => {
+    const { _internal } = await import('@/lib/llm/circuit-breaker.js');
+    const { drainCircuitAudits, REPLICA_METADATA_KEY, _internal: auditInternal } = await import(
+      '@/lib/llm/circuit-audit.js'
+    );
+    _internal.reset();
+    _internal.setMode('enforce');
+    await open('reasoner');
+    await drainCircuitAudits();
+
+    const found = (await rows()).filter((r) => r.acao === 'llm_circuit_opened');
+    expect(found).toHaveLength(1);
+    // Sem esta chave a correlação abaixo não tem como existir: o watcher
+    // importa a MESMA constante do produtor.
+    expect(REPLICA_METADATA_KEY).toBe('replica');
+    expect(found[0]!.metadata[REPLICA_METADATA_KEY]).toBe(auditInternal.replicaIdentity());
+    // `<hostname>:<pid>#<boot>` — o sufixo de boot é o que impede um processo
+    // novo de herdar a identidade do que morreu com o circuito aberto.
+    expect(String(found[0]!.metadata[REPLICA_METADATA_KEY])).toMatch(/^.+:\d+#[0-9a-f-]{4,}$/);
+  });
+
+  it('CASO DECISIVO: circuito B abrindo e fechando NÃO desarma o circuito A preso', async () => {
+    const { _internal } = await import('@/lib/llm/circuit-breaker.js');
+    const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
+    _internal.reset();
+    _internal.setMode('enforce');
+
+    // A = anthropic/reasoner: abre e FICA aberto.
+    await open('reasoner');
+    // B = anthropic/summarizer: abre e fecha normalmente, DEPOIS de A.
+    await open('summarizer');
+    await close('summarizer');
+    await drainCircuitAudits();
+
+    // As duas aberturas envelhecem para além da janela de 5 min da regra; o
+    // `closed` de B fica no presente, ou seja, POSTERIOR a ambas — que é
+    // exatamente a condição que a versão sem correlação casava com A.
+    expect(await ageOpened(10)).toBe(2);
+
+    const alert = circuitAlert(await runWatcher());
+    expect(alert, 'o watcher parou de acusar o circuito preso').toBeDefined();
+    // E nomeia QUEM está preso: A sim, B não.
+    expect(alert!.body).toContain('anthropic/reasoner/');
+    expect(alert!.body).not.toContain('anthropic/summarizer/');
+    expect(alert!.body).toContain('1 instance(s)');
+  });
+
+  it('réplica: o `closed` de uma réplica não fecha o `opened` de outra', async () => {
+    const { _internal } = await import('@/lib/llm/circuit-breaker.js');
+    const { drainCircuitAudits, REPLICA_METADATA_KEY } = await import(
+      '@/lib/llm/circuit-audit.js'
+    );
+    _internal.reset();
+    _internal.setMode('enforce');
+
+    // Mesmo (provider, workload) — só a réplica difere. Um processo só emite
+    // uma identidade, então a segunda réplica é forjada no banco a partir da
+    // linha real: é a única forma honesta de simular DUAS réplicas aqui, e o
+    // que se afirma é a correlação do watcher, não a emissão (coberta acima).
+    await open('reasoner');
+    await close('reasoner');
+    await drainCircuitAudits();
+
+    const other = 'other-host:4242#deadbeef';
+    // Reetiqueta o par real como vindo da réplica `other`…
+    await pool.query(
+      `UPDATE audit_log SET metadata = jsonb_set(metadata, $1, to_jsonb($2::text))
+        WHERE acao LIKE 'llm_circuit_%' AND metadata->>'provider' = 'anthropic'`,
+      [`{${REPLICA_METADATA_KEY}}`, other],
+    );
+    // …e cria a abertura ÓRFÃ desta réplica, anterior ao `closed` da outra.
+    await pool.query(
+      `INSERT INTO audit_log (tenant_id, agent_id, acao, entidade_alvo, metadata, created_at)
+       SELECT tenant_id, agent_id, acao, entidade_alvo,
+              jsonb_set(metadata, $1, to_jsonb($2::text)), NOW()
+         FROM audit_log WHERE acao = 'llm_circuit_opened' LIMIT 1`,
+      [`{${REPLICA_METADATA_KEY}}`, 'stuck-host:7#cafe1234'],
+    );
+    expect(await ageOpened(10)).toBe(2);
+
+    const alert = circuitAlert(await runWatcher());
+    expect(alert, 'a abertura órfã da outra réplica sumiu do alerta').toBeDefined();
+    expect(alert!.body).toContain('stuck-host:7#cafe1234');
+    expect(alert!.body).not.toContain(other);
+    expect(alert!.body).toContain('1 instance(s)');
+  });
+
+  it('o par COMPLETO da mesma réplica continua desarmando a regra', async () => {
+    // O contrapeso: correlacionar não pode transformar a regra num alarme que
+    // nunca desliga. Mesmo circuito, mesma réplica, par fechado → silêncio.
+    const { _internal } = await import('@/lib/llm/circuit-breaker.js');
+    const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
+    _internal.reset();
+    _internal.setMode('enforce');
+    await open('reasoner');
+    await close('reasoner');
+    await drainCircuitAudits();
+    expect(await ageOpened(10)).toBe(1);
+
+    expect(circuitAlert(await runWatcher())).toBeUndefined();
+  });
+});
+
 d('kill switch → audit_log (Postgres real)', () => {
   /**
    * Ator único por execução. `llm-circuit-kill-switch-redis.spec.ts` vira a
