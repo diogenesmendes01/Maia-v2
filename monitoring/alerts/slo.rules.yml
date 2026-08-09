@@ -342,8 +342,14 @@ groups:
             Quebre por `reason` (rate_limit / overloaded / auth / timeout).
             Runbook: docs/runbooks/observability-slo.md §4.9
 
+      # `maia_llm_requests_total` e NÃO `maia_llm_calls_total`: a série legada
+      # carrega apenas provider/model/status, nunca teve `reason`, e
+      # `status="error"` exclui rate limit — `statusForKind('rate_limit')`
+      # devolve `'rate_limit'`, que é valor de primeira classe. O seletor antigo
+      # (`{status="error",reason="rate_limit"}`) não casava NADA: este alerta
+      # nunca disparou desde que foi escrito. Ver `src/lib/llm/telemetry.ts`.
       - alert: MaiaLlmRateLimited
-        expr: increase(maia_llm_calls_total{status="error",reason="rate_limit"}[5m]) > 10
+        expr: increase(maia_llm_requests_total{status="rate_limit"}[5m]) > 10
         for: 5m
         labels:
           severity: warning

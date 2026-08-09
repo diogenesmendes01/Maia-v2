@@ -39,6 +39,7 @@
  */
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { parse as parseYaml } from 'yaml';
 import { resolve } from 'node:path';
 import { METRIC_NAMES, ALLOWED_LABEL_KEYS } from '../../../src/observability/taxonomy.js';
 
@@ -287,8 +288,64 @@ type Block = { file: string; query: string };
  * Linhas de comentário (`#`) são descartadas: o runbook explica a consulta
  * acima dela em português, e prosa não é PromQL.
  */
-function promqlBlocks(): Block[] {
+/**
+ * As expressões do arquivo de REGRAS (`monitoring/alerts/slo.rules.yml`) entram
+ * na mesma guarda que as dos runbooks, e por um motivo concreto: o achado 6 da
+ * rodada 3 encontrou `MaiaLlmRateLimited` casando
+ * `maia_llm_calls_total{status="error",reason="rate_limit"}` — série que nunca
+ * teve `reason` e cujo `status="error"` exclui rate limit. O alerta não
+ * disparava desde que foi escrito, e `slo-rules.spec.ts` não pegou porque
+ * valida NOMES de métrica, não rótulos.
+ *
+ * Um alerta que não casa nada é pior que alerta ausente: ele ocupa o lugar de
+ * um que funcionaria.
+ */
+const RULE_FILES = ['monitoring/alerts/slo.rules.yml'];
+
+/**
+ * ESCOPO, e por que ele é estreito de propósito.
+ *
+ * Este harness exercita os emissores de LLM/disjuntor — é o que a fatia #534
+ * toca. As outras famílias do arquivo de regras (audit, trace durável, filas,
+ * SLO sintético) não são exercitadas aqui, e as recording rules
+ * (`maia:...:rate5m`) são séries DERIVADAS que não existem em emissor nenhum.
+ *
+ * Validar essas expressões contra `observed` produziria falso positivo, que é a
+ * pior falha possível num drift guard: some no ruído e some junto com ele o
+ * achado verdadeiro. Então só entram as expressões cujas métricas TODAS foram
+ * observadas de fato.
+ *
+ * Estender às demais famílias exige exercitar os emissores delas — follow-up
+ * real, não uma linha de regex. Enquanto isso, `expressoesCobertas` abaixo é o
+ * que impede a cobertura de encolher em silêncio.
+ */
+function ruleExpressions(): Block[] {
   const out: Block[] = [];
+  for (const file of RULE_FILES) {
+    // Parser de YAML de verdade, e não regex. A primeira tentativa usou
+    // `/^\s*expr:\s*.../m` e falhou silenciosamente: `\s` casa `\n` e o `|`
+    // do block scalar entrou na classe de caracteres, então UMA "expressão"
+    // engoliu o arquivo inteiro. Guarda que erra assim não fica vermelha — ela
+    // fica vazia, que é o modo de falha mais caro que um drift guard tem.
+    const doc = parseYaml(readFileSync(resolve(ROOT, file), 'utf8')) as {
+      groups?: Array<{ rules?: Array<{ expr?: unknown }> }>;
+    };
+    for (const group of doc.groups ?? []) {
+      for (const rule of group.rules ?? []) {
+        const query = typeof rule.expr === 'string' ? rule.expr.trim() : '';
+        if (!query) continue;
+        const metrics = [...query.matchAll(/\b(maia_[a-z0-9_]+)/g)].map((x) =>
+          x[1]!.replace(/_(bucket|sum|count)$/, ''),
+        );
+        if (metrics.length > 0 && metrics.every((x) => observed.has(x))) out.push({ file, query });
+      }
+    }
+  }
+  return out;
+}
+
+function promqlBlocks(): Block[] {
+  const out: Block[] = [...ruleExpressions()];
   for (const file of RUNBOOKS) {
     const text = readFileSync(resolve(ROOT, file), 'utf8');
     for (const m of text.matchAll(/```promql\n([\s\S]*?)```/g)) {
@@ -433,6 +490,39 @@ describe('achado 6 — a PromQL dos runbooks executa contra as séries reais', (
       }
     }
     expect(bad, 'runbook cita rótulo fora de ALLOWED_LABEL_KEYS').toEqual([]);
+  });
+});
+
+describe('achado 6b — o alerta de rate limit não pode voltar a ser letra morta', () => {
+  const rules = readFileSync(resolve(ROOT, 'monitoring/alerts/slo.rules.yml'), 'utf8');
+  const expr = /- alert: MaiaLlmRateLimited\n\s*expr:\s*(.+)/.exec(rules)?.[1]?.trim() ?? '';
+
+  it('a expressão do MaiaLlmRateLimited entra na guarda (não só o nome do alerta)', () => {
+    // `slo-rules.spec.ts` já garantia que o NOME da métrica existe. Não bastou:
+    // `maia_llm_calls_total{status="error",reason="rate_limit"}` tem nome
+    // válido e não casa nada. A cobertura só vale se a expressão deste alerta
+    // estiver entre as que a guarda de rótulos examina.
+    expect(expr, 'o alerta sumiu do arquivo de regras').not.toBe('');
+    const coberta = blocks.some(
+      (b) => b.file.endsWith('slo.rules.yml') && b.query.includes('MaiaLlmRateLimited') === false && b.query === expr,
+    );
+    expect(coberta, `expressão fora da guarda: ${expr}`).toBe(true);
+  });
+
+  it('casa a série e o status que o código realmente emite', () => {
+    expect(expr).toContain('maia_llm_requests_total');
+    expect(expr).toContain('status="rate_limit"');
+    // As duas metades do defeito original, cada uma explicitamente proibida.
+    expect(expr, 'voltou para a série legada, que não carrega `reason`').not.toContain(
+      'maia_llm_calls_total',
+    );
+    expect(expr, '`reason` nunca existiu nessa série').not.toContain('reason=');
+  });
+
+  it('`rate_limit` é valor que a série ASSUME — provado pelo emissor, não pela taxonomia', () => {
+    const statuses = observed.get('maia_llm_requests_total')?.values.get('status');
+    expect(statuses, 'o emissor de maia_llm_requests_total não rodou').toBeDefined();
+    expect([...(statuses ?? [])]).toContain('rate_limit');
   });
 });
 
