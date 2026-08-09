@@ -238,6 +238,46 @@ Par de séries, exatamente uma valendo `1` — nunca leia por valor numérico. S
 nenhuma das três aparecer, o processo ainda não fez chamada de LLM alguma (as
 séries são registradas na primeira leitura da postura).
 
+### Alerta `llm_circuit_long_open` — como ler
+
+O watcher de auditoria (`src/workers/audit-watcher.ts`) acusa `llm_circuit_opened`
+sem `llm_circuit_closed` correspondente há mais de 5 min. Desde a revisão da PR
+#541 o par é correlacionado por **`provider` / `workload` / `replica`**, e o
+corpo do alerta NOMEIA cada circuito preso:
+
+```
+2 instance(s) with `llm_circuit_opened` older than 5 min and no matching `llm_circuit_closed`.
+Identity is `provider/workload/replica`:
+  - anthropic/reasoner/maia-app-7d9f:1#a1b2c3d4 (3 event(s), oldest 2026-08-09T00:11:54Z)
+```
+
+Antes disso a regra casava QUALQUER fechamento posterior com QUALQUER abertura:
+um circuito que abriu e fechou normalmente desarmava o alerta de outro que
+continuava preso. O estado do disjuntor é por `(provider, workload)` **e por
+réplica** — a janela de amostras vive na memória de cada processo —, então
+correlacionar por menos que isso cega o alerta exatamente no caso que ele existe
+para pegar.
+
+**`replica` é `<hostname>:<pid>#<boot>`.** O sufixo de boot é sorteado por
+processo: sem ele, um container que reinicia (hostname estável, PID 1) herdaria
+a identidade do processo morto e fecharia o par que ele deixou pendurado.
+
+**Falso positivo conhecido: réplica que morreu com o circuito aberto.** Ela nunca
+emite o `closed`, e a abertura órfã alerta enquanto estiver na janela de 24 h do
+watcher. É o preço deliberado de não deixar o boot seguinte fechar o par.
+Como distinguir em 10 segundos:
+
+```bash
+# A réplica citada ainda existe? `maia_llm_circuit_state` só existe em processo
+# VIVO — se o par não aparece em lugar nenhum da frota, o alerta é o rastro de
+# um processo que já morreu.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_state.*state="open"'
+```
+
+Se nenhuma réplica viva reporta `state="open"` para aquele par, o incidente já
+passou junto com o processo — anote e siga. Se alguma reporta, o circuito está
+preso de verdade: vá para a seção 3 (LLM provider down).
+
 ### KILL SWITCH — desligar durante um incidente, sem restart e sem deploy
 
 Use quando **o disjuntor é o incidente**: recusando tráfego que o provider ainda
