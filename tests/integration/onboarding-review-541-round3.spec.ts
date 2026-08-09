@@ -124,10 +124,26 @@ type SagaState = {
   step: (name: string, payload: unknown) => Promise<{ result: Record<string, unknown> }>;
 };
 
-async function driveToChannelDeclared(suffix: string, line: string): Promise<SagaState> {
+/**
+ * Escopo NOVO a cada chamada — inclusive entre o `retry: 1` do vitest.
+ * `onboarding_runs_one_live_per_agent_uq` admite uma única run viva por agente,
+ * então reaproveitar o par transformaria a segunda tentativa num 23505 que
+ * esconde a falha real.
+ */
+let scopeSeq = 0;
+function nextScope(tag: string): { suffix: string; line: string } {
+  scopeSeq += 1;
+  return {
+    suffix: `${tag}${scopeSeq}`,
+    line: `+55119${String(70000000 + scopeSeq).slice(-8)}`,
+  };
+}
+
+async function driveToChannelDeclared(tag: string): Promise<SagaState> {
   const { startOnboardingRun, executeOnboardingStep } = await import(
     '../../src/onboarding/wizard.js'
   );
+  const { suffix, line } = nextScope(tag);
   const tenant = `${PREFIX}-${suffix}`;
   const agent = `${PREFIX}-${suffix}-bot`;
   tenants.add(tenant);
@@ -243,7 +259,7 @@ async function waitForAudit(
 
 d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e não roteia', () => {
   it('run VIVA: posse provada, canal continua active=false e NENHUMA sessão de linha sobe', async () => {
-    const s = await driveToChannelDeclared('a1live', '+5511970000101');
+    const s = await driveToChannelDeclared('a1live');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
 
     // Pré-condição do teste: tudo o que o gate de LINHA exige está pronto —
@@ -269,11 +285,11 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
       ok: true,
     });
 
-    const deferred = await waitForAudit(s.tenant, 'channel_activation_deferred');
-    expect(deferred).toMatchObject({
-      channel_id: s.channel_id,
-      reason: 'onboarding_saga_owns_activation',
-    });
+    // `pairing_session_verified` é emitido nos DOIS desfechos (adiado e
+    // ativado), e no desfecho ATIVADO ele vem DEPOIS de `activateVerified`.
+    // Esperar por ele é, portanto, um ponto de sincronização neutro: quando
+    // chega, o efeito colateral do caminho defeituoso já teria acontecido.
+    const verified = await waitForAudit(s.tenant, 'pairing_session_verified');
 
     // A PROVA: o canal NÃO roteia.
     const ch = await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [
@@ -283,14 +299,18 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
     // E a sessão de linha não subiu — `MAIA_MULTI_LINE` está ligado, então
     // "não chamou" aqui significa mesmo "não roteia".
     expect(startLineSessionMock).not.toHaveBeenCalled();
-
     // A verificação de POSSE, essa sim, aconteceu e ficou registrada.
-    const verified = await waitForAudit(s.tenant, 'pairing_session_verified');
     expect(verified).toMatchObject({ channel_id: s.channel_id, routing_activated: false });
+
+    const deferred = await waitForAudit(s.tenant, 'channel_activation_deferred');
+    expect(deferred).toMatchObject({
+      channel_id: s.channel_id,
+      reason: 'onboarding_saga_owns_activation',
+    });
   });
 
   it('o gate consultado pelo worker (`promoteReadyVerifiedLines`) também recusa a linha da saga', async () => {
-    const s = await driveToChannelDeclared('a1worker', '+5511970000102');
+    const s = await driveToChannelDeclared('a1worker');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE channel_line_state SET state='verified_offline' WHERE channel_id=$1`, [
       s.channel_id,
@@ -313,7 +333,7 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
   it('FORA do onboarding (#518): sem run viva o pareamento ativa e sobe a sessão — o caminho legado não quebrou', async () => {
     // Mesmo escopo, mesma configuração; a única diferença é que a run chegou ao
     // fim (estado TERMINAL). É o caso de RECOVERY de linha de agente já ativo.
-    const s = await driveToChannelDeclared('a1free', '+5511970000103');
+    const s = await driveToChannelDeclared('a1free');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE onboarding_runs SET state='active' WHERE id=$1`, [s.run_id]);
 
@@ -342,7 +362,7 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
   });
 
   it('o passo `activate` da saga é quem liga o canal E sobe a sessão de linha', async () => {
-    const s = await driveToChannelDeclared('a1act', '+5511970000104');
+    const s = await driveToChannelDeclared('a1act');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
       s.channel_id,
@@ -366,7 +386,7 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
 
 d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e desliga os excluídos', () => {
   it('canal governado que ficou inválido e ESTAVA ativo é DESATIVADO na mesma transação, e a desativação é auditada', async () => {
-    const s = await driveToChannelDeclared('a3set', '+5511970000201');
+    const s = await driveToChannelDeclared('a3set');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
       s.channel_id,
@@ -444,7 +464,7 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
   });
 
   it('o agente sobe com as linhas prontas — um canal quebrado NÃO derruba os válidos', async () => {
-    const s = await driveToChannelDeclared('a3keep', '+5511970000301');
+    const s = await driveToChannelDeclared('a3keep');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
       s.channel_id,
