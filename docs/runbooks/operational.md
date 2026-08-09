@@ -182,7 +182,12 @@ curl -s -H "x-maia-setup-token: $TOKEN" \
 
 ## 3. LLM provider down (Anthropic, OpenAI, Voyage)
 
-**Sinal**: audit `llm_circuit_opened` aparecendo, métrica `maia_llm_calls_total{status="error"}` crescendo, mensagens demorando ou falhando.
+**Sinal**: audit `llm_circuit_opened` aparecendo, mensagens demorando ou
+falhando, e `maia_llm_requests_total{status=~"error|timeout"}` crescendo — o
+`timeout` do SDK é status PRÓPRIO e é uma das três falhas que abrem o disjuntor,
+então olhar só `status="error"` esconde metade do incidente. Para saber QUAL par
+está sofrendo, agrupe por `(provider, workload)`: a série legada
+`maia_llm_calls_total` não carrega `workload`.
 
 **Diagnóstico**:
 
@@ -363,39 +368,204 @@ a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
 
 ### Promoção `shadow` → `enforce`
 
-Só com os números de sombra em mãos. As duas perguntas, e a PromQL que responde
-cada uma sobre a janela de observação (mínimo sugerido: 7 dias em staging com
-tráfego representativo, incluindo pelo menos um incidente ou um teste de falha
-injetada):
+> **A postura é GLOBAL.** `LLM_CIRCUIT_MODE` vale para o processo inteiro —
+> `effectiveMode()` em `src/lib/llm/circuit-mode.ts` não recebe `provider` nem
+> `workload`. **Não existe promoção seletiva por workload.** Ou TODOS os
+> workloads ativos passam nos critérios abaixo, ou não se promove: promover
+> "porque o `reasoner` está limpo" liga o `enforce` para `summarizer`,
+> `vision`, `skill` e todo o resto junto. Se a promoção parcial for mesmo o que
+> se quer, o trabalho é implementar postura POR WORKLOAD primeiro — não
+> promover mesmo assim e torcer.
+
+> **PRÉ-REQUISITO BLOQUEANTE — a lacuna de reconexão do pub/sub.**
+> O kill switch (`maia:llm:circuit:override`) chega por pub/sub do Redis, que é
+> **at-most-once**. A chave durável cobre a réplica que **SOBE** no meio do
+> incidente (`adoptPersistedOverride`, chamada uma única vez depois do
+> `SUBSCRIBE` confirmado — ver `src/lib/llm/cache-invalidation.ts`), mas **NÃO**
+> cobre a que **RECONECTA** nele: uma queda de socket entre a confirmação e a
+> mensagem perde a notificação para sempre, e aquela réplica só reconverge no
+> próximo `SET`/`PUBLISH`.
+>
+> Em `shadow` isso é uma divergência de medição. Em `enforce` é uma réplica que
+> **continua recusando tráfego depois de o plantão ter desligado o disjuntor** —
+> ou seja, o kill switch deixa de ser uma alavanca confiável exatamente na
+> postura em que ele é a única saída rápida.
+>
+> **Correção exigida antes de `enforce`** (não implementada nesta PR, por
+> escopo): reler a chave durável em TODO `reconnect`/`ready` do subscriber, não
+> só no primeiro. Semântica da releitura: chave presente ⇒ adota o **TTL
+> restante** (nunca o TTL original, que ressuscitaria o arrendamento); chave
+> ausente ⇒ **limpa o override local** e volta à postura base do contrato.
+> Enquanto isso não existir, a promoção está bloqueada — e não por prudência
+> genérica: sem essa releitura o procedimento de rollback desta mesma seção não
+> tem garantia de chegar em toda a frota.
+
+#### Janela mínima de observação
+
+Nada abaixo disto conta como evidência:
+
+| Requisito | Valor | Por quê |
+|---|---|---|
+| Ambiente | **staging** | Não se aprende a recusar tráfego em produção. |
+| Duração | **7 dias completos** | Menos que isso não pega o ciclo semanal (segunda de manhã ≠ sábado de madrugada), e o limiar do disjuntor é sensível ao volume da janela. |
+| Volume | **≥ 1.000 chamadas por `(provider, workload)`** | `MIN_SAMPLES` é 10 numa janela de 30 s; abaixo de mil chamadas no período, um par sequer exercitou a máquina e "não abriu" não é informação. |
+| Falhas | **outage, brownout e recovery INJETADOS** | Esperar um incidente natural em staging é esperar para sempre. Os três cenários existem prontos em `scripts/llm-benchmark.ts`. |
 
 ```promql
-# 1. "Quanta carga isso teria cortado?" — recusas simuladas por chamada.
-sum(rate(maia_llm_circuit_would_reject_total[1h])) by (provider, workload)
-#    Compare com o total de chamadas: se der ~0, o disjuntor não teria feito
-#    nada e não há o que promover ainda.
-sum(rate(maia_llm_calls_total[1h])) by (provider, workload)
-
-# 2. "Teria aberto quando não devia?" — aberturas simuladas.
-sum(increase(maia_llm_circuit_would_open_total[24h])) by (provider, workload, reason)
-#    Cruze com a taxa de erro real do MESMO par no MESMO instante. Uma abertura
-#    em cima de uma queda de verdade é o controle funcionando; uma abertura sem
-#    erro correspondente é falso positivo e BLOQUEIA a promoção.
-sum(rate(maia_llm_calls_total{status="error"}[5m])) by (provider, workload)
+# Volume por par — todo par ATIVO precisa cruzar 1.000 no período.
+# `maia_llm_requests_total` é a série que carrega `workload`; a legada
+# `maia_llm_calls_total` só tem provider/model/status e NÃO responde isto.
+sum by (provider, workload) (increase(maia_llm_requests_total[7d]))
 ```
 
-Critérios de ida (todos, não algum):
+Injeção das falhas — é o mesmo harness que produziu as constantes do disjuntor,
+e ele já compara as três posturas lado a lado:
 
-1. Pelo menos um incidente real ou injetado dentro da janela, com
-   `would_open` disparando **durante** ele.
-2. Zero `would_open` fora de janela de erro elevado — nenhum falso positivo.
-3. `would_reject` compatível com a duração dos incidentes observados: recusa
-   simulada muito acima disso é sinal de que o cooldown está longo demais.
-4. A atribuição de `would_reject` por `tenant_id` não concentra num tenant só de
-   forma inesperada (o estado é global; a evidência é escopada — se um tenant
-   come 95% das recusas simuladas, entenda por quê antes de ligar).
+```bash
+npm run llm:bench -- --scenario outage   --workload reasoner --requests 300 --concurrency 20
+npm run llm:bench -- --scenario brownout --workload reasoner --failure-rate 0.6
+npm run llm:bench -- --scenario recovery --workload reasoner --outage-ms 12000 --think-ms 50
+```
+
+#### Critérios de ida (todos, não algum)
+
+**Todas as consultas abaixo agrupam por `(provider, workload)` e usam
+`maia_llm_requests_total`.** A série legada `maia_llm_calls_total` carrega
+apenas `provider`, `model` e `status` (`src/lib/llm/telemetry.ts`): agrupar por
+`workload` nela devolve UM grupo com tudo somado, e `status="error"` **não
+inclui `timeout`** — que é justamente um dos desfechos que abrem o disjuntor
+(`PROVIDER_FAULT_KINDS` = `provider_5xx` · `network` · `timeout`). Por isso todo
+seletor de falha aqui é `status=~"error|timeout"`.
+
+**1. Zero `would_open` fora de erro elevado.** Um falso positivo bloqueia a
+promoção — em `enforce` ele seria carga recusada sem provider quebrado.
+
+```promql
+# Taxa de falha REAL do par (inclui timeout do SDK).
+sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+  /
+clamp_min(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+  1e-9
+)
+
+# Aberturas simuladas SEM falha elevada por trás = falso positivo.
+# `TARGET_CALL_FAILURE_RATE` é 0.5; abaixo disso o disjuntor não deveria abrir.
+(sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[5m])) > 0)
+  unless
+(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+    /
+  clamp_min(
+    sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+    1e-9
+  ) > 0.5
+)
+```
+
+Critério: **vazio** durante os 7 dias. Qualquer série que sobre é um par que
+teria aberto sem motivo.
+
+**2. Abertura em até 30 s / 10 amostras durante a falha.** A janela do disjuntor
+é de 30 s com `MIN_SAMPLES=10`: se a falha injetada tem volume, a abertura tem
+que aparecer dentro dela.
+
+```promql
+# Plote os dois no MESMO gráfico, step 15s, sobre o intervalo da injeção.
+# O critério é a distância horizontal entre a primeira subida de cada um.
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[1m]))
+```
+
+Não há PromQL honesta para "quantos segundos entre A e B" num painel de
+plantão; o número exato sai do harness, que carimba a transição no relatório do
+cenário `outage`.
+
+**3. Recuperação em até 60 s.** Depois de o provider voltar, o par tem que
+fechar. `MAX_OPEN_MS` é 60 s, então mais que isso significa que a sonda não está
+rodando (falta de tráfego) ou que o cooldown geométrico ficou preso.
+
+```promql
+# Exatamente uma das três séries vale 1 — nunca leia por valor numérico.
+maia_llm_circuit_state{state="closed"}
+# Cruze com o instante em que a falha parou:
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+```
+
+No cenário `recovery` do harness isso é medido direto: ele espaça a carga
+justamente para a sonda chegar a rodar.
+
+**4. `would_reject` limitado à falha mais o cooldown.** Recusa simulada
+sobrando DEPOIS de o provider voltar é cooldown longo demais — em `enforce`
+seria tráfego bom recusado.
+
+```promql
+sum by (provider, workload) (increase(maia_llm_circuit_would_reject_total[5m]))
+```
+
+Critério: a série zera dentro de `MAX_OPEN_MS` (60 s) após a última falha do
+par. Sobrar depois disso bloqueia a promoção.
+
+**5. ≥ 90% de redução das TENTATIVAS contra o provider numa indisponibilidade
+total.** É o único critério que mede o BENEFÍCIO; sem ele a promoção paga o
+risco de recusar tráfego e não compra nada.
+
+Tentativa ≠ chamada. `maia_llm_requests_total` conta CHAMADAS; quem conta o que
+o provider realmente comeu é `maia_llm_attempts_total`, incrementada uma vez por
+tentativa e **só depois de `provider.call()` ter rodado**
+(`recordAttempt` em `src/lib/llm/gateway.ts`) — uma chamada recusada pelo
+disjuntor não gera tentativa nenhuma. Num workload com retry + fallback a
+diferença entre as duas é o multiplicador que o disjuntor corta.
+
+```promql
+# A carga REAL contra o provider, por par. É esta série que precisa cair.
+sum by (provider, workload) (increase(maia_llm_attempts_total[5m]))
+
+# Baseline: a mesma série durante a queda injetada AINDA em `shadow` — é o que
+# o provider come quando o disjuntor não recusa nada.
+# Critério: numa queda equivalente sob `enforce`, esta soma tem que ficar
+# em <= 10% do baseline para o mesmo par.
+
+# Cruze com as recusas, que são o outro lado da mesma moeda:
+sum by (provider, workload) (increase(maia_llm_requests_total{status="circuit_open"}[5m]))
+  /
+clamp_min(sum by (provider, workload) (increase(maia_llm_requests_total[5m])), 1e-9)
+```
+
+O veredicto formal continua saindo do harness, que roda os três braços sobre a
+MESMA sequência de falhas — em staging não dá para ter `off` e `enforce` ao
+mesmo tempo:
+
+```bash
+# `provider_calls` do relatório é a mesma grandeza de `maia_llm_attempts_total`.
+npm run llm:bench -- --scenario outage --workload reasoner --requests 300 --concurrency 20
+# Critério: enforce.provider_calls <= 0.10 * off.provider_calls
+```
+
+**6. A recusa simulada não concentra num tenant só.** O estado do disjuntor é
+global de propósito, mas a evidência é escopada: se um tenant come 95% das
+recusas simuladas, entenda por quê antes de ligar.
+
+```promql
+topk(5, sum by (tenant_id) (increase(maia_llm_circuit_would_reject_total[24h])))
+```
+
+#### Checklist final
+
+- [ ] A lacuna de reconexão do pub/sub foi corrigida (pré-requisito bloqueante acima).
+- [ ] 7 dias completos em staging, com outage + brownout + recovery injetados.
+- [ ] Todo par `(provider, workload)` ATIVO com ≥ 1.000 chamadas na janela.
+- [ ] Critério 1 vazio: zero `would_open` fora de erro elevado.
+- [ ] Critério 2: abertura dentro de 30 s / 10 amostras na falha injetada.
+- [ ] Critério 3: recuperação em até 60 s.
+- [ ] Critério 4: `would_reject` limitado à falha + cooldown.
+- [ ] Critério 5: `enforce.provider_calls ≤ 10%` de `off.provider_calls` no `outage`.
+- [ ] Critério 6: distribuição por tenant explicada.
+- [ ] TODOS os workloads ativos passaram — a postura é global.
 
 **Como promover:** `LLM_CIRCUIT_MODE=enforce` no `.env` do ambiente + restart.
 É deploy-time de propósito — promover é decisão versionada, não de plantão.
+
 
 ### Rollback da promoção
 
@@ -509,7 +679,8 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 |---|---|---|
 | `maia_baileys_connected` | gauge | =0 por > 2min |
 | `maia_redis_connected` | gauge | =0 por > 30s |
-| `maia_llm_calls_total{status="error"}` | counter | rate alto |
+| `maia_llm_requests_total{status=~"error\|timeout"}` | counter | rate alto — inclui o timeout do SDK, que `status="error"` sozinho não pega |
+| `maia_llm_calls_total{status="error"}` | counter | legada (só provider/model/status); mantida para dashboards antigos |
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
@@ -561,7 +732,8 @@ endpoint errado transforma queda de dependência em restart loop.
 | `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | readiness probe / pool do LB |
 | `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | diagnóstico humano, dashboards |
 
-Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+Não há `/health/llm` — use `maia_llm_requests_total{status}` no Prometheus (a
+legada `maia_llm_calls_total` não separa por workload).
 
 Regras que o código garante (`src/runtime/lifecycle/`):
 

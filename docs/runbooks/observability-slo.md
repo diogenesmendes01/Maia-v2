@@ -203,7 +203,7 @@ alerta.
 
 | Alerta | O que aconteceu | Primeira coisa a checar |
 |---|---|---|
-| `MaiaLlmCircuitOpenEnforcing` | disjuntor `open` **e** postura `enforce`: chamadas estão sendo recusadas de verdade | é o provider ou é o disjuntor? `maia_llm_calls_total{status="error"}` do mesmo par no mesmo instante |
+| `MaiaLlmCircuitOpenEnforcing` | disjuntor `open` **e** postura `enforce`: chamadas estão sendo recusadas de verdade | é o provider ou é o disjuntor? `maia_llm_requests_total{status=~"error\|timeout"}` do mesmo par (`provider`,`workload`) no mesmo instante — a série legada `maia_llm_calls_total` não tem `workload`, e `status="error"` sozinho não inclui o timeout do SDK |
 | `MaiaLlmCircuitModeOverridden` | alguém acionou o kill switch (inclusive `reason="rejected"`, i.e. tentou e não conseguiu) | ator e motivo no log `llm_gateway.circuit_mode_override` **e** na trilha durável (`audit_log`, ações `llm_circuit_mode_override_*`) |
 | `MaiaLlmCircuitDisabledTooLong` | postura `off` há mais de 1h | o incidente ainda está aberto, ou a alavanca virou configuração escondida? |
 
