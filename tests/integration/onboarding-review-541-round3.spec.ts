@@ -404,12 +404,12 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
     const broken = await query<{ id: string }>(
       `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'Linha quebrada', true, false) RETURNING id`,
-      [s.tenant, s.agent, '+5511970000202'],
+      [s.tenant, s.agent, nextScope('extra').line],
     );
     const brokenId = broken[0]!.id;
     await query(
       `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
-       VALUES ($1,$2,$3,$4,'fixed')`,
+       VALUES ($1,$2,$3,$4,'locked')`,
       [s.tenant, s.agent, brokenId, badRole[0]!.id],
     );
     await query(
@@ -476,11 +476,11 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
     const noOwnership = await query<{ id: string }>(
       `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'Sem posse', false, false) RETURNING id`,
-      [s.tenant, s.agent, '+5511970000302'],
+      [s.tenant, s.agent, nextScope('extra').line],
     );
     await query(
       `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
-       VALUES ($1,$2,$3,$4,'fixed')`,
+       VALUES ($1,$2,$3,$4,'locked')`,
       [s.tenant, s.agent, noOwnership[0]!.id, s.role_id],
     );
 

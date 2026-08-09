@@ -22,6 +22,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { pgErrorCode } from '@/db/client.js';
 import {
+  admin_audit_log,
   agent_operational_profile_versions,
   agent_tool_grants,
   agents,
@@ -789,6 +790,37 @@ export async function applyConfirmChannelReady(
  * As escritas continuam CONFERIDAS antes de a run poder concluir: se o `UPDATE`
  * do agente não casou, ou se o conjunto de canais mudou entre a leitura e a
  * escrita, a transação inteira volta.
+ *
+ * ─── O conjunto é EXATO: liga os válidos E DESLIGA os excluídos ──────────────
+ * (Re-review adversarial do PR #541, achado 3.)
+ *
+ * Ligar o conjunto validado sem o complemento deixava metade da decisão por
+ * escrever. Um canal governado cujo papel foi DESATIVADO depois de ele já estar
+ * roteando continuava roteando: o readiness o excluía, a ativação simplesmente
+ * não o mencionava, e `active` seguia `true` porque OUTRO canal do agente
+ * mantinha a readiness global verdadeira.
+ *
+ * A semântica fixada é: **readiness do agente é EXISTENCIAL — pelo menos um
+ * canal precisa satisfazer integralmente política + papel ativo + posse —, mas
+ * cada canal é FAIL-CLOSED INDIVIDUALMENTE.** Ativa-se somente
+ * `activatable_channel_ids`; os governados restantes ficam `active = false`.
+ * Um canal quebrado não derruba os válidos, e um canal válido não empresta
+ * roteamento para um quebrado.
+ *
+ * A alternativa "negar a ativação se houver canal ativo excluído" foi
+ * DESCARTADA: ela devolve exatamente o comportamento que a regra existencial
+ * rejeita — um canal ruim parando o agente inteiro.
+ *
+ * O universo do complemento é o dos canais GOVERNADOS (não-sintéticos do
+ * escopo COM `channel_policy` do mesmo escopo) — o mesmo conjunto que
+ * `readiness.ts` chama `governedChannels`. Um canal sem política nenhuma não
+ * está sob a governança de canal deste agente, e desligá-lo aqui seria uma
+ * decisão diferente da que esta review pediu.
+ *
+ * A desativação é AUDITADA por canal (`onboarding_channel_deactivated`, no
+ * MESMO `tx`): um canal que roteava e deixou de rotear é decisão de governança,
+ * não detalhe de implementação. Só quem estava `active` gera linha — reafirmar
+ * `false` sobre `false` não é mudança.
  */
 export async function applyActivate(
   tx: Tx,
@@ -798,6 +830,14 @@ export async function applyActivate(
     schema_fingerprint: string;
     /** O conjunto aprovado pelo readiness — a única lista que pode ser ativada. */
     activatable_channel_ids: readonly string[];
+    /**
+     * O veredito POR CANAL do readiness. Alimenta a auditoria da desativação
+     * com os códigos que CADA canal reprovou — sem isto a trilha diria "foi
+     * desligado" sem dizer por quê.
+     */
+    channel_verdicts?: ReadonlyArray<{ channel_id: string; failed_checks: readonly string[] }>;
+    /** O ATOR do comando — a desativação é decisão de governança, tem dono. */
+    actor: { actor_id: string; actor_role: string };
   },
 ): Promise<StepApplication> {
   const { tenant_id, agent_id } = requireScope(run);
@@ -855,6 +895,32 @@ export async function applyActivate(
     );
 
   const rederived = [...new Set(governed.map((g) => g.id))].sort();
+
+  // O UNIVERSO do complemento, lido pelo MESMO `tx` e sob os MESMOS locks: os
+  // canais GOVERNADOS do escopo — não-sintéticos, com `channel_policy` do mesmo
+  // (tenant, agente). `rederived` é um subconjunto deste; a diferença é o que
+  // precisa ficar fora do roteamento. `active` vem junto porque só quem ESTAVA
+  // ativo produz uma linha de auditoria.
+  const governedRows = await tx
+    .selectDistinct({ id: channels.id, active: channels.active })
+    .from(channels)
+    .innerJoin(
+      channel_policies,
+      and(
+        eq(channel_policies.channel_id, channels.id),
+        eq(channel_policies.tenant_id, tenant_id),
+        eq(channel_policies.agent_id, agent_id),
+      ),
+    )
+    .where(
+      and(
+        eq(channels.tenant_id, tenant_id),
+        eq(channels.agent_id, agent_id),
+        eq(channels.is_synthetic, false),
+      ),
+    );
+  const governedIds = [...new Set(governedRows.map((g) => g.id))].sort();
+  let deactivatedChannelIds: string[] = [];
 
   if (rederived.length === 0) {
     return {
@@ -926,16 +992,79 @@ export async function applyActivate(
     );
   }
 
+  // ── O COMPLEMENTO (achado 3): os governados que NÃO entraram ───────────────
+  //
+  // Mesma transação, mesmos locks (`lockReadinessSnapshot` tomou `FOR UPDATE`
+  // em `channels` do escopo). Fazer isto depois, ou noutra conexão, reabriria
+  // exatamente a janela em que um canal excluído segue roteando.
+  const excluded = governedIds.filter((id) => !rederived.includes(id));
+  if (excluded.length > 0) {
+    // Quem ESTAVA roteando é o que a governança precisa registrar. Reafirmar
+    // `false` sobre `false` é no-op semântico, não uma decisão.
+    const wasActive = governedRows
+      .filter((r) => excluded.includes(r.id) && r.active)
+      .map((r) => r.id)
+      .sort();
+
+    const deactivated = await tx
+      .update(channels)
+      .set({ active: false, updated_at: new Date() })
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          inArray(channels.id, excluded),
+        ),
+      )
+      .returning({ id: channels.id });
+    // Contagem conferida, como no ramo da ativação: sob os locks nada deveria
+    // ter sumido, e um descasamento é invariante quebrada — lançar leva a
+    // transação inteira de volta.
+    if (deactivated.length !== excluded.length) {
+      throw new OnboardingError(
+        'activation_precondition_failed',
+        'o conjunto de linhas excluídas mudou durante a ativação',
+        { expected: excluded.length, matched: deactivated.length },
+      );
+    }
+
+    const verdictOf = new Map(
+      (fingerprints.channel_verdicts ?? []).map((v) => [v.channel_id, v.failed_checks]),
+    );
+    for (const id of wasActive) {
+      await tx.insert(admin_audit_log).values({
+        tenant_id,
+        actor_id: fingerprints.actor.actor_id,
+        actor_role: fingerprints.actor.actor_role,
+        action: 'onboarding_channel_deactivated',
+        resource_type: 'channel',
+        resource_id: id,
+        change_summary: {
+          agent_id,
+          run_id: run.id,
+          was_active: true,
+          // Tipado, vindo do veredito do readiness — nunca texto livre.
+          failed_checks: [...(verdictOf.get(id) ?? [])],
+        },
+      });
+    }
+
+    deactivatedChannelIds = wasActive;
+  }
+
   return {
     result: {
       agent_id,
       activated_channels: activatedChannels.length,
       activated_channel_ids: rederived,
+      deactivated_channels: deactivatedChannelIds.length,
+      deactivated_channel_ids: deactivatedChannelIds,
       configuration_fingerprint: fingerprints.configuration_fingerprint,
       schema_fingerprint: fingerprints.schema_fingerprint,
     },
     summary: {
       activated_channels: activatedChannels.length,
+      deactivated_channels: deactivatedChannelIds.length,
       configuration_fingerprint: fingerprints.configuration_fingerprint,
     },
     completes: true,

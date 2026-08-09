@@ -796,10 +796,20 @@ export async function executeOnboardingStep(input: {
             // si, política + papel ativo + posse provada, e confere esse mesmo
             // conjunto contra o banco sob os locks antes de escrever (review do
             // PR #541, achado 1).
+            // `channels` viaja junto porque a ativação agora aplica o conjunto
+            // EXATO: liga os aprovados e DESLIGA os governados excluídos, e a
+            // auditoria da desativação precisa dos `failed_checks` de cada um
+            // (re-review do PR #541, achado 3). O ator vai junto porque tirar
+            // um canal do roteamento é decisão de governança — tem dono.
             return applyActivate(tx, run, {
               configuration_fingerprint: readiness.configuration_fingerprint,
               schema_fingerprint: readiness.schema_fingerprint,
               activatable_channel_ids: readiness.activatable_channel_ids,
+              channel_verdicts: readiness.channels,
+              actor: {
+                actor_id: input.actor.actor_id,
+                actor_role: input.actor.actor_role,
+              },
             });
           }
           default: {
