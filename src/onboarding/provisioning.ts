@@ -896,22 +896,30 @@ export async function applyActivate(
 
   const rederived = [...new Set(governed.map((g) => g.id))].sort();
 
-  // O UNIVERSO do complemento, lido pelo MESMO `tx` e sob os MESMOS locks: os
-  // canais GOVERNADOS do escopo — não-sintéticos, com `channel_policy` do mesmo
-  // (tenant, agente). `rederived` é um subconjunto deste; a diferença é o que
-  // precisa ficar fora do roteamento. `active` vem junto porque só quem ESTAVA
-  // ativo produz uma linha de auditoria.
+  // O UNIVERSO do complemento, lido pelo MESMO `tx` e sob os MESMOS locks:
+  // **todo** canal não-sintético de `tenant_id + agent_id`, tenha política ou
+  // não. `rederived` é um subconjunto deste; a diferença é o que precisa ficar
+  // fora do roteamento. `active` vem junto porque só quem ESTAVA ativo produz
+  // linha de auditoria.
+  //
+  // A primeira versão restringia este universo aos canais GOVERNADOS (os com
+  // `channel_policy` do mesmo par), por ser a leitura literal do achado. O
+  // owner recusou, e a razão é boa: **ausência de política não é ausência de
+  // decisão, é um estado inválido.** Um canal sem policy não tem papel padrão
+  // resolvível, logo não pode rotear — deixá-lo de fora do complemento
+  // transformaria a falha mais grosseira de configuração na única que escapa,
+  // ou seja, um fail-OPEN exatamente onde o desenho é fail-closed. É também o
+  // caso mais fácil de produzir por acidente: basta apagar uma policy.
+  //
+  // Duas fronteiras que o `WHERE` preserva, e que os testes fixam:
+  //   - `is_synthetic = false` — a sonda sintética (#502) tem ciclo de vida
+  //     próprio e não é roteamento de tenant; desligá-la aqui cegaria o
+  //     monitoramento como efeito colateral de um onboarding;
+  //   - o par `(tenant_id, agent_id)` — o complemento nunca alcança outro
+  //     escopo. Um agente ativar-se não pode desligar canal de ninguém.
   const governedRows = await tx
-    .selectDistinct({ id: channels.id, active: channels.active })
+    .select({ id: channels.id, active: channels.active })
     .from(channels)
-    .innerJoin(
-      channel_policies,
-      and(
-        eq(channel_policies.channel_id, channels.id),
-        eq(channel_policies.tenant_id, tenant_id),
-        eq(channel_policies.agent_id, agent_id),
-      ),
-    )
     .where(
       and(
         eq(channels.tenant_id, tenant_id),

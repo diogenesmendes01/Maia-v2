@@ -467,6 +467,84 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
     });
   });
 
+  it('canal SEM policy nenhuma também é desativado — ausência de política é estado inválido, não exceção', async () => {
+    // Decisão do owner na rodada 3: o complemento alcança TODO canal
+    // não-sintético do par, tenha política ou não. Um canal sem policy não tem
+    // papel padrão resolvível, logo não pode rotear; deixá-lo de fora faria da
+    // falha de configuração mais grosseira a única que escapa — fail-OPEN
+    // exatamente onde o desenho é fail-closed.
+    const s = await driveToChannelDeclared('a3nopol');
+    await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
+    await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
+      s.channel_id,
+    ]);
+    await s.step('confirm_channel_ready', { channel_id: s.channel_id });
+
+    // (a) órfão: MESMO par, ativo, SEM `channel_policies`.
+    const orphan = await query<{ id: string }>(
+      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'Sem policy', true, false) RETURNING id`,
+      [s.tenant, s.agent, nextScope('extra').line],
+    );
+    const orphanId = orphan[0]!.id;
+
+    // (b) sintético: a sonda (#502) tem ciclo de vida próprio e NÃO pode ser
+    // desligada como efeito colateral de um onboarding.
+    const synthetic = await query<{ id: string }>(
+      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'Sonda', true, true) RETURNING id`,
+      [s.tenant, s.agent, nextScope('extra').line],
+    );
+    const syntheticId = synthetic[0]!.id;
+
+    // (c) OUTRO escopo: um agente ativar-se não desliga canal de ninguém.
+    const other = nextScope('a3other');
+    const otherTenant = `${PREFIX}-${other.suffix}`;
+    const otherAgent = `${PREFIX}-${other.suffix}-bot`;
+    await query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$2,'active')`, [
+      otherTenant,
+      otherTenant,
+    ]);
+    await query(`INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$3,'active')`, [
+      otherAgent,
+      otherTenant,
+      otherAgent,
+    ]);
+    const foreign = await query<{ id: string }>(
+      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'De outro escopo', true, false) RETURNING id`,
+      [otherTenant, otherAgent, other.line],
+    );
+    const foreignId = foreign[0]!.id;
+
+    await s.step('evaluate_readiness', {});
+    const out = await s.step('activate', {
+      confirm_tenant_id: s.tenant,
+      confirm_agent_id: s.agent,
+    });
+
+    const row = async (id: string): Promise<boolean> =>
+      (await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [id]))[0]!.active;
+
+    expect(await row(orphanId), 'canal sem policy continuou roteando').toBe(false);
+    expect(await row(syntheticId), 'a sonda sintética foi desligada').toBe(true);
+    expect(await row(foreignId), 'canal de OUTRO escopo foi tocado').toBe(true);
+    expect(await row(s.channel_id)).toBe(true);
+
+    expect(out.result.deactivated_channel_ids).toEqual([orphanId]);
+
+    // O órfão estava ativo, então a desativação é decisão de governança e vai
+    // para a trilha. `failed_checks` nomeia a política ausente.
+    const trail = await query<{ resource_id: string; change_summary: Record<string, unknown> }>(
+      `SELECT resource_id, change_summary FROM admin_audit_log
+        WHERE tenant_id=$1 AND action='onboarding_channel_deactivated'`,
+      [s.tenant],
+    );
+    expect(trail).toHaveLength(1);
+    expect(trail[0]!.resource_id).toBe(orphanId);
+    expect(trail[0]!.change_summary).toMatchObject({ was_active: true });
+  });
+
   it('o agente sobe com as linhas prontas — um canal quebrado NÃO derruba os válidos', async () => {
     const s = await driveToChannelDeclared('a3keep');
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
