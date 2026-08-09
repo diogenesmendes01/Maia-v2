@@ -565,8 +565,18 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     // O planner só escolhe índice quando vale a pena; forçamos a comparação
     // desabilitando seqscan, o que prova que existe um caminho por índice
     // compatível com (tenant, agent, status, next_attempt_at).
+    //
+    // O `SET LOCAL` precisa de um bloco de transação. Fora dele o Postgres
+    // responde `WARNING: SET LOCAL can only be used in transaction blocks` e
+    // NÃO aplica nada — o `enable_seqscan` seguia ligado, o planner escolhia
+    // Seq Scan numa tabela de dezenas de linhas (é a escolha certa nesse
+    // tamanho) e o teste falhava sempre. O `WARNING` não vira erro no driver,
+    // então a falha se disfarçava de "o índice não existe": foi diagnosticada
+    // por um bom tempo como dívida de schema, quando o índice sempre esteve lá
+    // e é escolhido normalmente dentro de `BEGIN`.
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
       await client.query('SET LOCAL enable_seqscan = off');
       const plan = await client.query(
         `EXPLAIN (FORMAT TEXT)
@@ -577,6 +587,28 @@ d('agent_turns — DB real (migrations 096/097)', () => {
       );
       const text = plan.rows.map((r) => r['QUERY PLAN']).join('\n');
       expect(text).toMatch(/Index (Scan|Only Scan|Cond)|Bitmap Index Scan/);
+      // `SET LOCAL` morre com a transação — nada vaza para a próxima conexão
+      // que pegar este slot do pool.
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
+  });
+
+  it('(9b) o `SET LOCAL` do teste acima REALMENTE se aplica', async () => {
+    // Guarda do guard: sem transação, o `SET LOCAL` é um no-op silencioso e o
+    // caso (9) volta a falhar por um motivo que não é o que ele mede. Aqui a
+    // ausência de transação é o defeito sendo asserido, não um acidente.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL enable_seqscan = off');
+      const dentro = await client.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+      expect(dentro.rows[0]!.enable_seqscan, 'SET LOCAL não pegou dentro do BEGIN').toBe('off');
+      await client.query('ROLLBACK');
+
+      const fora = await client.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+      expect(fora.rows[0]!.enable_seqscan, 'o SET LOCAL vazou da transação').toBe('on');
     } finally {
       client.release();
     }
