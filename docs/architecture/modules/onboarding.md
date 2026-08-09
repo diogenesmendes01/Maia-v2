@@ -149,8 +149,43 @@ Ela devolve `absent | owned_by_requested_tenant | owned_by_other_tenant` e nada
 mais — nunca status, nome ou configuração do agente alheio. `evaluateAgentReadiness`
 **não** a chama.
 
-`applyProvisionAgent` segue a mesma regra: a releitura pós-`INSERT` carrega o
-par, e um id já em uso recusa com `duplicate_agent` **sem nomear o dono**.
+### `provision_agent` CRIA um agente — não adota nenhum
+
+`applyProvisionAgent` ([`src/onboarding/provisioning.ts`](../../../src/onboarding/provisioning.ts))
+insere com `ON CONFLICT DO NOTHING … RETURNING`. **Uma linha retornada, ou
+`duplicate_agent`** — sem exceção, e sem depender de a quem o id pertence:
+
+| Situação | Resultado |
+|---|---|
+| id livre | agente criado em `status='provisioning'`, semente de profile `v1 proposed`, piso de `agent_tool_grants` |
+| id já em uso **pelo mesmo tenant** | `duplicate_agent` |
+| id já em uso **por outro tenant** | `duplicate_agent` — a MESMA mensagem |
+
+As duas últimas linhas são deliberadamente indistinguíveis. A recusa **não pode
+confirmar** a existência de um agente alheio a quem chute o id, e o `RETURNING`
+consegue isso melhor do que a releitura por par que havia antes: aqui não há
+releitura nenhuma — o veredito vem do próprio `INSERT`, e a row do outro tenant
+nunca é lida. A mensagem nunca nomeia o dono.
+
+> **O que isto corrige.** O código anterior fazia `ON CONFLICT DO NOTHING`
+> seguido de um `SELECT` por `(id, tenant_id)`. Esse `SELECT` não distingue
+> "acabei de inserir" de "já estava lá": um id colidindo com um agente do
+> **mesmo tenant** era encontrado pela releitura e o passo devolvia **sucesso**.
+> A saga então seguia por `configure_profile`, `apply_capability_packs` e
+> `configure_role` **sobrescrevendo profile, grants e papel padrão de um agente
+> que podia estar ATIVO em produção**. O `duplicate_agent` que esta seção
+> prometia só disparava para o id de outro tenant — metade do contrato
+> documentado não existia no código.
+
+**O replay legítimo não passa por aqui.** O ledger de idempotência
+(`onboarding_step_results`, migration 113) resolve a mesma
+`(run, passo, chave)` dentro de `onboardingRunsRepo.commitStep` **antes** de o
+`apply` do passo rodar, devolvendo o resultado anterior. Como a linha do ledger
+e o `INSERT` do agente são gravados na **mesma transação curta**, não existe
+estado em que o agente exista e o ledger não saiba — logo um retry nunca recebe
+`duplicate_agent`. Provado em
+[`tests/integration/onboarding-review-541-round3.spec.ts`](../../../tests/integration/onboarding-review-541-round3.spec.ts)
+(casos a/b/c: id novo, id do mesmo tenant, replay da mesma chave).
 
 ### `schema_ready` consome o veredito canônico, nunca `schema_migrations`
 

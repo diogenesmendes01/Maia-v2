@@ -312,7 +312,39 @@ export async function applyProvisionAgent(
   const tenant_id = requireTenant(run);
   assertProvisioningScope({ tenant_id, agent_id: payload.agent_id });
 
-  await tx
+  // `provision_agent` CRIA um agente. Não adota, não reconfigura, não
+  // "converge" para um que já exista — e é o `RETURNING` que faz disso um fato,
+  // não uma intenção.
+  //
+  // O que havia antes: `ON CONFLICT DO NOTHING` seguido de um `SELECT` pelo par
+  // `(id, tenant_id)`. O `SELECT` não distingue "acabei de inserir" de "já
+  // estava lá": um id colidindo com um agente do MESMO tenant era encontrado
+  // pela releitura e o passo seguia como SUCESSO. Os passos seguintes da saga
+  // então sobrescreviam profile, grants e papel padrão de um agente que podia
+  // estar ATIVO em produção — a saga de onboarding virava um caminho de
+  // reconfiguração silenciosa. O `duplicate_agent` documentado só disparava
+  // quando o id pertencia a OUTRO tenant (aí o par não devolvia nada), ou seja,
+  // metade do contrato prometido em `docs/architecture/modules/onboarding.md`
+  // nunca existiu.
+  //
+  // Com `RETURNING`, a linha só volta quando o `INSERT` REALMENTE inseriu.
+  // Nenhuma linha ⟺ a PK global de `agents` já está tomada — não importa por
+  // qual tenant — e a única resposta é `duplicate_agent`.
+  //
+  // Isto NÃO reintroduz o vazamento de existência cross-tenant que a releitura
+  // por par corrigiu, e a razão é que aqui não há releitura NENHUMA: o resultado
+  // vem do próprio `INSERT`, nunca lemos a row alheia, e a recusa é
+  // indistinguível entre "o id é de outro tenant" e "o id é deste tenant". A
+  // mensagem continua sem nomear o dono — só um id já em uso, que é o mínimo
+  // inerente a qualquer criação com id escolhido pelo caller.
+  //
+  // E o REPLAY legítimo não passa por aqui: o ledger de idempotência da saga
+  // (migration 113) resolve a mesma (run, passo, chave) em
+  // `onboardingRunsRepo.commitStep` ANTES de chamar este `apply`, devolvendo o
+  // resultado anterior. Como a linha do ledger e este `INSERT` são gravados na
+  // MESMA transação curta, não existe estado em que o agente exista e o ledger
+  // não saiba — logo, um retry nunca cai neste `duplicate_agent`.
+  const insertedRows = await tx
     .insert(agents)
     .values({
       id: payload.agent_id,
@@ -328,24 +360,10 @@ export async function applyProvisionAgent(
       // sem papel e sem política — ver o cabeçalho da migration 110.
       status: AGENT_STATUS_PROVISIONING,
     })
-    .onConflictDoNothing();
+    .onConflictDoNothing()
+    .returning();
 
-  // A releitura carrega o PAR completo (invariante 1 do AGENTS.md). Reler por
-  // `id` apenas — como aqui já se fez — devolvia a row do agente de OUTRO
-  // tenant só para então recusá-la: uma leitura cross-tenant real, e uma
-  // mensagem de erro que CONFIRMAVA a existência do agente alheio a quem
-  // chutasse o id.
-  //
-  // Com o par no WHERE, a ausência tem uma única leitura possível: o
-  // `ON CONFLICT DO NOTHING` acima não inseriu, logo o id JÁ ESTÁ EM USO (a PK
-  // de `agents` é global). Recusamos sem dizer por quem — o que é inerente a
-  // qualquer criação com id escolhido pelo caller, e nada além disso vaza.
-  const agentRows = await tx
-    .select()
-    .from(agents)
-    .where(and(eq(agents.id, payload.agent_id), eq(agents.tenant_id, tenant_id)))
-    .limit(1);
-  const agent = agentRows[0];
+  const agent = insertedRows[0];
   if (!agent) {
     throw new OnboardingError(
       'duplicate_agent',
