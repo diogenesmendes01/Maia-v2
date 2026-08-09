@@ -12,6 +12,13 @@
  *   - NÃO/TTL: auth de pareamento destruído; canal segue declarado.
  *
  * Digitar um número NUNCA dá posse — só a sessão provando ser a linha.
+ *
+ * E provar posse NÃO É permissão de rotear: a ativação passa pelo gate
+ * `evaluateLineReadiness`. Quando uma run de ONBOARDING viva governa o
+ * (tenant, agente), esse gate devolve `onboarding_saga_owns_activation` e o
+ * pareamento termina em `verified` sem ativar nada — o passo `activate` da
+ * saga é o único dono da ativação do canal e do início da sessão de linha
+ * (re-review do PR #541, achado 1).
  */
 import { rm } from 'node:fs/promises';
 import { config } from '@/config/env.js';
@@ -249,6 +256,31 @@ export async function startChannelPairing(args: {
       // Não é um beco sem saída: o worker `channel_pairing` revalida as linhas
       // `verified_offline` a cada minuto e ativa assim que a política ficar
       // pronta, sem novo pareamento.
+      //
+      // ─── Re-review do PR #541, achado 1 [High] ──────────────────────────
+      // O gate ganhou uma precondição ZERO: se uma run de ONBOARDING viva
+      // governa este (tenant, agente), a ativação é DELA (reason_code
+      // `onboarding_saga_owns_activation`). O pareamento do onboarding apenas
+      // VERIFICA POSSE — não ativa e não roteia.
+      //
+      // Por quê: `start_pairing` é o sétimo passo de onze. Depois dele a saga
+      // ainda revalida schema, grants, packs, governance e o CONJUNTO EXATO
+      // de canais ativáveis, sob os locks da run, no passo `activate`.
+      // Ativar aqui antecipava esse veredito e deixava `channels.active =
+      // true` com a run em `pairing_pending`/`channel_ready` e o agente em
+      // `provisioning` — e o resolver de canal confia em `channels.active`,
+      // então entrava tráfego real. Fora do onboarding (o caminho de #518)
+      // nada muda: sem run viva o dono é este gate, como sempre foi.
+      //
+      // A decisão mora em `line-readiness.ts` (e não num `if` aqui) de
+      // propósito: `evaluateLineReadiness` é o ÚNICO gate de ativação do
+      // maquinário de #518 — o worker `channel_pairing` o consulta a cada
+      // minuto em `promoteReadyVerifiedLines`. Um `if` local fecharia esta
+      // porta e deixaria aquela aberta.
+      //
+      // Fail-closed: uma exceção aqui NÃO cai no ramo de ativação — ela é
+      // capturada pelo `.catch` desta promise, que encerra o pareamento em
+      // `failed`. Não saber quem é o dono nunca vira permissão de rotear.
       const readiness = await evaluateLineReadiness({
         id: channel.id,
         tenant_id: channel.tenant_id,

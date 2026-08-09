@@ -729,6 +729,68 @@ describe('readiness e ativação — fail-closed', () => {
     expect(seen[0]?.tx, 'o avaliador recebeu `undefined` — a leitura saiu da transação').toBeDefined();
   });
 
+  /**
+   * Re-review do PR #541, achado 1 — o passo final é o dono do INÍCIO DA
+   * SESSÃO, não só do `active = true`. O pareamento do onboarding parou de
+   * subir a sessão; se ninguém a subisse aqui, a run terminaria com a linha
+   * ativa no banco e MUDA.
+   */
+  it('a ativação sobe a sessão de linha EXATAMENTE dos canais que ela ligou — depois do commit', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const { applyActivate } = await import('@/onboarding/provisioning.js');
+    (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      result: { activated_channel_ids: ['ch-ok'], deactivated_channel_ids: ['ch-bad'] },
+      completes: true,
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+    });
+    const started: Array<{ scope: unknown; ids: readonly string[] }> = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-sessao',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () => readyReport(),
+        startLineSessions: async (scope, ids) => {
+          started.push({ scope, ids });
+        },
+      },
+    });
+    expect(out.status).toBe('completed');
+    expect(started).toHaveLength(1);
+    // Nem "os canais do agente", nem os DESATIVADOS: só o conjunto ligado.
+    expect(started[0]!.ids).toEqual(['ch-ok']);
+    expect(started[0]!.scope).toEqual({ tenant_id: 'acme', agent_id: 'acme-bot' });
+  });
+
+  it('falha ao subir a sessão NÃO desfaz a run concluída (fail-isolated)', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const { applyActivate } = await import('@/onboarding/provisioning.js');
+    (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      result: { activated_channel_ids: ['ch-ok'] },
+      completes: true,
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+    });
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-sessao-falha',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () => readyReport(),
+        startLineSessions: async () => {
+          throw new Error('socket recusado');
+        },
+      },
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('active');
+  });
+
   it('a ativação TRAVA o retrato antes de decidir — e o lock cobre cada fato do veredito', async () => {
     runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
     let statementsAtDecision: string[] = [];

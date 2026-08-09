@@ -324,9 +324,71 @@ export type ReadinessEvaluator = (
   ctx?: { tx: StepTx },
 ) => Promise<AgentReadiness>;
 
+/**
+ * Re-review do PR #541, achado 1 — a saga é o dono do INÍCIO DA SESSÃO, não só
+ * do `active = true`.
+ *
+ * O pareamento do onboarding deixou de ativar e deixou de subir a sessão de
+ * roteamento. Alguém tem que subi-la, senão a run termina com a linha ativa no
+ * banco e MUDA — visível para o resolver, sem socket. Esse alguém é o passo
+ * `activate`, e o efeito é PÓS-COMMIT de propósito: abrir um socket Baileys
+ * dentro da transação do passo prenderia a trava da run pela duração de um
+ * handshake de rede, e um rollback deixaria o socket vivo para um `active` que
+ * não existe.
+ *
+ * A porta é fail-isolated por construção: a linha JÁ está ativa e durável, e o
+ * worker `channel_pairing`/o boot (`startAdditionalLineSessions`) reconciliam.
+ * Uma falha de socket não pode desfazer a conclusão da run.
+ */
+export type LineSessionStarter = (
+  scope: { tenant_id: string; agent_id: string },
+  channel_ids: readonly string[],
+) => Promise<void>;
+
+const defaultStartLineSessions: LineSessionStarter = async (scope, channel_ids) => {
+  if (channel_ids.length === 0) return;
+  const { config } = await import('@/config/env.js');
+  if (!config.MAIA_MULTI_LINE) return;
+  const { db } = await import('@/db/client.js');
+  const { channels } = await import('@/db/schema.js');
+  const { and, eq, inArray } = await import('drizzle-orm');
+  // O par COMPLETO no WHERE (invariante 1): o id vem do resultado do passo,
+  // mas quem autoriza subir o socket é o escopo da run.
+  const lines = await db
+    .select({ id: channels.id, external_id: channels.external_id })
+    .from(channels)
+    .where(
+      and(
+        eq(channels.tenant_id, scope.tenant_id),
+        eq(channels.agent_id, scope.agent_id),
+        eq(channels.channel_type, 'whatsapp'),
+        eq(channels.is_synthetic, false),
+        eq(channels.active, true),
+        inArray(channels.id, [...channel_ids]),
+      ),
+    );
+  const { _internal } = await import('@/gateway/line-sessions.js');
+  for (const line of lines) {
+    await _internal
+      .startLineSession({
+        id: line.id,
+        tenant_id: scope.tenant_id,
+        agent_id: scope.agent_id,
+        external_id: line.external_id,
+      })
+      .catch((err) =>
+        logger.error(
+          { channel_id: line.id, err: (err as Error).message },
+          'onboarding.start_line_session_failed',
+        ),
+      );
+  }
+};
+
 export type WizardDeps = {
   requestPairing?: PairingPort;
   evaluateReadiness?: ReadinessEvaluator;
+  startLineSessions?: LineSessionStarter;
   now?: () => Date;
 };
 
@@ -574,6 +636,7 @@ export async function executeOnboardingStep(input: {
   let readiness: AgentReadiness | undefined;
 
   const requestPairing = input.deps?.requestPairing ?? defaultPairingPort;
+  const startLineSessions = input.deps?.startLineSessions ?? defaultStartLineSessions;
 
   /**
    * O avaliador default lê os fatos PELO `tx` DO PASSO. Ler pelo handle global
@@ -791,6 +854,22 @@ export async function executeOnboardingStep(input: {
           kind: outcome.run.kind,
           ...attribution(outcome.run),
         });
+        // Re-review do PR #541, achado 1 — o passo final é o dono do início da
+        // sessão. Só os canais que ESTA transação ligou; `activated_channel_ids`
+        // é o conjunto re-derivado sob os locks, nunca "os canais do agente".
+        // Fail-isolated: a run já concluiu e é durável.
+        const activated = outcome.result.activated_channel_ids;
+        if (Array.isArray(activated) && activated.length > 0 && outcome.run.tenant_id && outcome.run.agent_id) {
+          await startLineSessions(
+            { tenant_id: outcome.run.tenant_id, agent_id: outcome.run.agent_id },
+            activated.filter((id): id is string => typeof id === 'string'),
+          ).catch((err) =>
+            logger.error(
+              { err, run_id: outcome.run.id },
+              'onboarding.start_line_sessions_failed',
+            ),
+          );
+        }
       }
       return {
         status: 'completed',

@@ -9,10 +9,11 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { policiesMock, rolesMock, profileMock } = vi.hoisted(() => ({
+const { policiesMock, rolesMock, profileMock, ownerMock } = vi.hoisted(() => ({
   policiesMock: { getByChannelId: vi.fn() },
   rolesMock: { getById: vi.fn() },
   profileMock: { getActive: vi.fn() },
+  ownerMock: vi.fn(),
 }));
 
 vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
@@ -21,6 +22,10 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 }));
 vi.mock('../../../src/db/repositories/profile-repos.js', () => ({
   operationalProfileVersionsRepo: profileMock,
+}));
+// Re-review do PR #541, achado 1 — a precondição ZERO do gate.
+vi.mock('../../../src/setup/line-activation-owner.js', () => ({
+  resolveLineActivationOwner: ownerMock,
 }));
 
 import { evaluateLineReadiness } from '../../../src/setup/line-readiness.js';
@@ -33,6 +38,41 @@ beforeEach(() => {
   // Default: agente com perfil operacional ativo — os casos legados de
   // política/papel isolam a variável que estão testando.
   profileMock.getActive.mockResolvedValue({ id: 'prof-1', status: 'active' });
+  // Default: nenhuma saga viva — o dono é o pareamento (#518), como sempre foi.
+  ownerMock.mockResolvedValue({ owner: 'line_pairing' });
+});
+
+describe('evaluateLineReadiness — dono da ativação (re-review do PR #541, achado 1)', () => {
+  it('run de onboarding VIVA: não pronta, e nem chega a olhar perfil/política/papel', async () => {
+    ownerMock.mockResolvedValue({
+      owner: 'onboarding_saga',
+      run_id: 'run-1',
+      run_state: 'channel_ready',
+    });
+    policiesMock.getByChannelId.mockResolvedValue({ default_role_id: 'role-1' });
+    rolesMock.getById.mockResolvedValue({ id: 'role-1', active: true });
+
+    expect(await evaluateLineReadiness(CHANNEL)).toEqual({
+      ready: false,
+      reason_code: 'onboarding_saga_owns_activation',
+    });
+    // Precondição ZERO: a configuração pode estar impecável — a DECISÃO não é
+    // desta máquina.
+    expect(profileMock.getActive).not.toHaveBeenCalled();
+    expect(policiesMock.getByChannelId).not.toHaveBeenCalled();
+  });
+
+  it('o dono é resolvido pelo (tenant, agent) DONO do canal', async () => {
+    await evaluateLineReadiness(CHANNEL);
+    expect(ownerMock).toHaveBeenCalledWith({ tenant_id: 'tenant-A', agent_id: 'agent-a' });
+  });
+
+  it('FAIL-CLOSED: se a consulta do dono falhar, a exceção PROPAGA — não vira "pode ativar"', async () => {
+    ownerMock.mockRejectedValue(new Error('connection terminated'));
+    policiesMock.getByChannelId.mockResolvedValue({ default_role_id: 'role-1' });
+    rolesMock.getById.mockResolvedValue({ id: 'role-1', active: true });
+    await expect(evaluateLineReadiness(CHANNEL)).rejects.toThrow('connection terminated');
+  });
 });
 
 describe('evaluateLineReadiness — perfil operacional (rodada 2 do review PR #528)', () => {

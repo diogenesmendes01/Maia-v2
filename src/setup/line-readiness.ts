@@ -8,6 +8,13 @@
  * `channels.active = true` e, com `MAIA_MULTI_LINE`, a sessão de roteamento
  * subia na hora — uma linha respondendo sem governança configurada.
  *
+ * ─── Precondição ZERO: quem é o dono da ativação (re-review do PR #541) ──────
+ * Antes de qualquer predicado de configuração, o gate pergunta se a ativação
+ * desta linha pertence a ESTA máquina. Se houver uma run de onboarding VIVA
+ * para o (tenant, agente), pertence à saga — o passo `activate` dela é o único
+ * autorizado a ligar o canal, e o pareamento só prova posse. Ver
+ * `line-activation-owner.ts` para o argumento completo.
+ *
  * A regra é DETERMINÍSTICA e decidida no backend (invariante 3 do AGENTS.md),
  * e é a MESMA sequência que o go-live checklist do console já apresenta ao
  * operador — perfil ativo → canal registrado → papel + política prontos:
@@ -35,12 +42,17 @@
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { channelPoliciesRepo, rolesRepo } from '@/db/repositories/channel-repos.js';
 import { operationalProfileVersionsRepo } from '@/db/repositories/profile-repos.js';
+import { resolveLineActivationOwner } from './line-activation-owner.js';
 
 export type LineReadiness =
   | { ready: true }
   | {
       ready: false;
-      reason_code: 'missing_active_profile' | 'missing_policy' | 'default_role_inactive';
+      reason_code:
+        | 'onboarding_saga_owns_activation'
+        | 'missing_active_profile'
+        | 'missing_policy'
+        | 'default_role_inactive';
     };
 
 export async function evaluateLineReadiness(channel: {
@@ -51,6 +63,37 @@ export async function evaluateLineReadiness(channel: {
   return runWithTenantContext(
     { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
     async () => {
+      // (0) DONO DA ATIVAÇÃO — antes de qualquer predicado (re-review do
+      // PR #541, achado 1).
+      //
+      // Este gate é a ÚNICA porta pela qual o maquinário de #518 ativa uma
+      // linha: `startChannelPairing` o consulta no fim do pareamento e o
+      // worker `channel_pairing` o consulta a cada minuto em
+      // `promoteReadyVerifiedLines`. Pôr a pergunta aqui — e não só no
+      // pareamento — é o que impede a segunda porta: sem isto, o pareamento
+      // deixava de ativar e a varredura periódica ativava sessenta segundos
+      // depois, com a run ainda em `channel_ready`.
+      //
+      // Não é `ready: false` por deficiência de configuração: a linha pode
+      // estar impecável. É `ready: false` porque a DECISÃO não é desta
+      // máquina. O reason_code diz isso em voz alta, e a UI de #518 já o
+      // exibe como motivo de `channel_activation_deferred`.
+      //
+      // Não é beco sem saída: quando a saga chega em `activate`, ela ativa o
+      // conjunto validado (`provisioning.ts`, `applyActivate`); se a run
+      // terminar por cancelamento ou falha terminal, a posse volta para o
+      // pareamento no tick seguinte, sem novo pareamento.
+      const owner = await resolveLineActivationOwner({
+        tenant_id: channel.tenant_id,
+        agent_id: channel.agent_id,
+      });
+      if (owner.owner === 'onboarding_saga') {
+        return {
+          ready: false as const,
+          reason_code: 'onboarding_saga_owns_activation' as const,
+        };
+      }
+
       // Ordem deliberada: o perfil é a precondição mais barata e a mais alta
       // na hierarquia — sem identidade operacional aprovada, discutir política
       // de canal é discutir o papel de um agente que não tem comportamento
