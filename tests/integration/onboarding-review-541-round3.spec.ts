@@ -21,6 +21,7 @@
  * Pulado sem `TEST_DB_URL`, como as demais suítes de integração.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { useExclusivePairingQueue } from './helpers/pairing-queue-lock.js';
 
@@ -131,11 +132,18 @@ type SagaState = {
  * esconde a falha real.
  */
 let scopeSeq = 0;
+const LINE_BASE = 10_000_000 + Math.floor(Math.random() * 80_000_000);
 function nextScope(tag: string): { suffix: string; line: string } {
   scopeSeq += 1;
+  // Base ALEATÓRIA por processo. `channels_active_line_uq` é global (uma linha
+  // ativa por número, em qualquer tenant) e o vitest roda arquivos em processos
+  // paralelos: uma sequência determinística faz dois specs gerarem o MESMO
+  // telefone e colidirem. A falha só aparece na suíte completa, e como erro de
+  // fixture — mascarando a asserção que o teste existe para fazer.
+  const n = LINE_BASE + scopeSeq;
   return {
-    suffix: `${tag}${scopeSeq}`,
-    line: `+55119${String(70000000 + scopeSeq).slice(-8)}`,
+    suffix: `${tag}${scopeSeq}-${LINE_BASE.toString(36)}`,
+    line: `+55119${String(n).slice(-8)}`,
   };
 }
 
@@ -498,9 +506,12 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
     const syntheticId = synthetic[0]!.id;
 
     // (c) OUTRO escopo: um agente ativar-se não desliga canal de ninguém.
+    // Id ÚNICO por execução, não derivado do contador de escopo: este teste tem
+    // `retry`, e uma segunda tentativa reinserindo o mesmo tenant colide em
+    // `tenants_pkey` — mascarando a asserção real com um erro de fixture.
     const other = nextScope('a3other');
-    const otherTenant = `${PREFIX}-${other.suffix}`;
-    const otherAgent = `${PREFIX}-${other.suffix}-bot`;
+    const otherTenant = `${PREFIX}-${other.suffix}-${randomUUID().slice(0, 8)}`;
+    const otherAgent = `${otherTenant}-bot`;
     await query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$2,'active')`, [
       otherTenant,
       otherTenant,

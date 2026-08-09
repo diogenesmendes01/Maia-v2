@@ -31,7 +31,12 @@ const d = SHOULD_RUN ? describe : describe.skip;
 useExclusivePairingQueue();
 
 const ACTOR_ID = 'rev541r3-tester';
-const PREFIX = 'rev541r3';
+// PREFIX distinto do spec irmão (`onboarding-review-541-round3.spec.ts`): os
+// dois nasceram do mesmo molde, o vitest roda arquivos em PROCESSOS paralelos e
+// cada um reinicia o contador de escopo em zero. Com prefixo igual, os dois
+// geram os MESMOS ids de tenant e colidem em `tenants_pkey` — falha que só
+// aparece na suíte completa, nunca no arquivo isolado.
+const PREFIX = 'rev541r3p';
 
 const tenants = new Set<string>();
 const createdRuns: string[] = [];
