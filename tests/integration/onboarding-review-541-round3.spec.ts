@@ -430,18 +430,22 @@ d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e 
       confirm_agent_id: s.agent,
     });
 
-    // Readiness é EXISTENCIAL — o canal bom sozinho basta para o agente subir.
-    expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
-    expect(out.result.deactivated_channel_ids).toEqual([brokenId]);
-
+    // A PROVA está no BANCO, e é a primeira asserção de propósito: o defeito
+    // reintroduzido tem que falhar em `active`, não num campo de resultado que
+    // a própria correção criou.
     const after = await query<{ id: string; active: boolean }>(
       'SELECT id, active FROM channels WHERE tenant_id=$1 AND agent_id=$2 ORDER BY id',
       [s.tenant, s.agent],
     );
     const byId = new Map(after.map((r) => [r.id, r.active]));
-    // Cada canal é FAIL-CLOSED INDIVIDUALMENTE.
+    // Cada canal é FAIL-CLOSED INDIVIDUALMENTE...
+    expect(byId.get(brokenId), 'o canal excluído continuou roteando').toBe(false);
+    // ...e readiness é EXISTENCIAL: o canal bom sozinho basta para o agente
+    // subir, e ele NÃO foi derrubado junto.
     expect(byId.get(s.channel_id)).toBe(true);
-    expect(byId.get(brokenId)).toBe(false);
+
+    expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
+    expect(out.result.deactivated_channel_ids).toEqual([brokenId]);
 
     // Um canal que roteava e deixou de rotear é decisão de GOVERNANÇA: tem que
     // estar na trilha, com o motivo tipado.
