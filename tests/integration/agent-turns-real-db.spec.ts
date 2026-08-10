@@ -561,57 +561,140 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     expect(byMsg.get(pending).next_attempt_at).not.toBeNull();
   });
 
-  it('(9) a consulta de recovery usa o índice escopado (não Seq Scan)', async () => {
-    // O planner só escolhe índice quando vale a pena; forçamos a comparação
-    // desabilitando seqscan, o que prova que existe um caminho por índice
-    // compatível com (tenant, agent, status, next_attempt_at).
-    //
-    // O `SET LOCAL` precisa de um bloco de transação. Fora dele o Postgres
-    // responde `WARNING: SET LOCAL can only be used in transaction blocks` e
-    // NÃO aplica nada — o `enable_seqscan` seguia ligado, o planner escolhia
-    // Seq Scan numa tabela de dezenas de linhas (é a escolha certa nesse
-    // tamanho) e o teste falhava sempre. O `WARNING` não vira erro no driver,
-    // então a falha se disfarçava de "o índice não existe": foi diagnosticada
-    // por um bom tempo como dívida de schema, quando o índice sempre esteve lá
-    // e é escolhido normalmente dentro de `BEGIN`.
+  /**
+   * Nó de plano do `EXPLAIN (FORMAT JSON)`. Só o que este arquivo usa.
+   */
+  type PlanNode = {
+    'Node Type': string;
+    'Index Name'?: string;
+    Plans?: PlanNode[];
+  };
+
+  /**
+   * Todos os índices citados na ÁRVORE do plano, em qualquer profundidade.
+   *
+   * Um `Bitmap Heap Scan` traz o `Index Name` no filho, não na raiz — checar só
+   * o topo devolveria vazio justamente no plano que este teste espera.
+   */
+  function collectIndexNames(node: PlanNode): string[] {
+    const here = node['Index Name'] ? [node['Index Name']] : [];
+    return [...here, ...(node.Plans ?? []).flatMap(collectIndexNames)];
+  }
+
+  /**
+   * Roda `fn` num bloco de transação com `enable_seqscan` desligado, e SEMPRE
+   * desfaz.
+   *
+   * Dois motivos, os dois vindos de defeito real neste arquivo:
+   *
+   *  - `SET LOCAL` só vale dentro de transação. Fora dela o Postgres responde
+   *    `WARNING: SET LOCAL can only be used in transaction blocks` e não aplica
+   *    nada. O WARNING não vira erro no driver, então o teste seguia com o
+   *    seqscan ligado e falhava por um motivo que não era o que ele mede.
+   *  - O `ROLLBACK` precisa rodar TAMBÉM quando a asserção lança. `pg.Pool` não
+   *    desfaz nada no `release()`: um client devolvido ainda em transação, e com
+   *    `enable_seqscan=off` local, contamina o próximo teste que pegar o slot.
+   */
+  async function explainWithoutSeqScan<T>(
+    fn: (client: pg.PoolClient) => Promise<T>,
+  ): Promise<T> {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('SET LOCAL enable_seqscan = off');
-      const plan = await client.query(
-        `EXPLAIN (FORMAT TEXT)
-         SELECT * FROM agent_turns
-         WHERE tenant_id = 'primary' AND agent_id = 'primary'
-           AND status IN ('received','queued','claimed','running','retryable')
-           AND next_attempt_at <= now()`,
-      );
-      const text = plan.rows.map((r) => r['QUERY PLAN']).join('\n');
-      expect(text).toMatch(/Index (Scan|Only Scan|Cond)|Bitmap Index Scan/);
-      // `SET LOCAL` morre com a transação — nada vaza para a próxima conexão
-      // que pegar este slot do pool.
-      await client.query('ROLLBACK');
+      try {
+        await client.query('SET LOCAL enable_seqscan = off');
+        return await fn(client);
+      } finally {
+        await client.query('ROLLBACK').catch(() => undefined);
+      }
     } finally {
       client.release();
     }
+  }
+
+  it('(9) a consulta de recovery usa o ÍNDICE DE RECOVERY, nomeado', async () => {
+    // Asserir "algum índice" não protege nada: com a tabela pequena e um
+    // `IN (…)` sobre `status`, o planner percorre o índice genérico de escopo
+    // (`agent_turns_scope_id_uq`, sobre `(tenant_id, agent_id, id)`) e filtra
+    // `status`/`next_attempt_at` depois. Ou seja, DERRUBAR
+    // `agent_turns_scope_status_next_attempt_idx` — o índice que este caso
+    // existe para proteger — deixaria o teste verde.
+    //
+    // Então o caso faz duas coisas que a versão anterior não fazia:
+    //   1. cria massa suficiente no PRÓPRIO escopo para o índice de recovery
+    //      ser a escolha (com poucas linhas, qualquer plano serve e a medição
+    //      não significa nada);
+    //   2. assere o NOME do índice, lido de `EXPLAIN (FORMAT JSON)` — texto de
+    //      plano é formato de apresentação, não contrato.
+    // Ids únicos por execução nos DOIS: `agents.id` é PK GLOBAL, então um id
+    // fixo colide com a própria tentativa anterior quando o caso é retentado —
+    // e a colisão mascara a asserção real com erro de fixture.
+    const nonce = randomUUID().slice(0, 8);
+    const scope = { tenant: `idx-${nonce}`, agent: `idx-${nonce}-probe` };
+    await pool.query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$1,'active')`, [
+      scope.tenant,
+    ]);
+    await pool.query(
+      `INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$1,'active')`,
+      [scope.agent, scope.tenant],
+    );
+    // Só estados NÃO-terminais: `agent_turns_outcome_presence_chk` exige
+    // `outcome` nos terminais, e o recovery só olha os não-terminais mesmo.
+    await pool.query(
+      `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, next_attempt_at)
+       SELECT $1, $2, gen_random_uuid(),
+              (ARRAY['received','queued','claimed','running','retryable'])[1 + (g % 5)],
+              now() + ((g % 240) - 5 || ' minutes')::interval
+         FROM generate_series(1, 4000) g`,
+      [scope.tenant, scope.agent],
+    );
+    await pool.query('ANALYZE agent_turns');
+
+    const indexes = await explainWithoutSeqScan(async (client) => {
+      const plan = await client.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(
+        `EXPLAIN (FORMAT JSON)
+         SELECT * FROM agent_turns
+         WHERE tenant_id = $1 AND agent_id = $2
+           AND status IN ('received','queued','claimed','running','retryable')
+           AND next_attempt_at <= now()`,
+        [scope.tenant, scope.agent],
+      );
+      return collectIndexNames(plan.rows[0]!['QUERY PLAN'][0]!.Plan);
+    });
+
+    expect(
+      indexes,
+      `o plano não usou o índice de recovery; usou: ${indexes.join(', ') || '(nenhum índice)'}`,
+    ).toContain('agent_turns_scope_status_next_attempt_idx');
   });
 
-  it('(9b) o `SET LOCAL` do teste acima REALMENTE se aplica', async () => {
+  it('(9b) o `SET LOCAL` REALMENTE se aplica, e não vaza da transação', async () => {
     // Guarda do guard: sem transação, o `SET LOCAL` é um no-op silencioso e o
     // caso (9) volta a falhar por um motivo que não é o que ele mede. Aqui a
     // ausência de transação é o defeito sendo asserido, não um acidente.
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL enable_seqscan = off');
-      const dentro = await client.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
-      expect(dentro.rows[0]!.enable_seqscan, 'SET LOCAL não pegou dentro do BEGIN').toBe('off');
-      await client.query('ROLLBACK');
+    const dentro = await explainWithoutSeqScan((client) =>
+      client.query<{ enable_seqscan: string }>('SHOW enable_seqscan'),
+    );
+    expect(dentro.rows[0]!.enable_seqscan, 'SET LOCAL não pegou dentro do BEGIN').toBe('off');
 
-      const fora = await client.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
-      expect(fora.rows[0]!.enable_seqscan, 'o SET LOCAL vazou da transação').toBe('on');
-    } finally {
-      client.release();
-    }
+    // Depois do ROLLBACK o valor volta ao default — inclusive para o próximo
+    // teste que pegar este slot do pool.
+    const fora = await pool.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+    expect(fora.rows[0]!.enable_seqscan, 'o SET LOCAL vazou da transação').toBe('on');
+  });
+
+  it('(9c) uma asserção que LANÇA ainda desfaz a transação', async () => {
+    // O caminho de falha é o que estava desprotegido: `pg.Pool` não faz
+    // rollback no `release()`, então um throw no meio devolvia ao pool um
+    // client ainda em transação e com `enable_seqscan=off`.
+    await expect(
+      explainWithoutSeqScan(async () => {
+        throw new Error('asserção falhou no meio da transação');
+      }),
+    ).rejects.toThrow('asserção falhou');
+
+    const fora = await pool.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+    expect(fora.rows[0]!.enable_seqscan, 'o slot voltou ao pool contaminado').toBe('on');
   });
 
   it('(10) cross-tenant: turno do outro tenant é invisível', async () => {
