@@ -25,16 +25,22 @@ const { baileysConnectedMock, memoryReadinessMock, schemaMock, probeDbMock } = v
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
-vi.mock('../../../src/db/client.js', () => ({ probeDb: probeDbMock }));
+vi.mock('../../../src/db/client.js', () => ({
+  probeDb: probeDbMock,
+  // `schema-readiness.js` binds the application pool at import time.
+  pool: { connect: vi.fn() },
+}));
 vi.mock('../../../src/lib/redis.js', () => ({
   isRedisConnected: () => true,
   redis: { ping: vi.fn(async () => 'PONG') },
 }));
 vi.mock('../../../src/gateway/baileys.js', () => ({ isBaileysConnected: baileysConnectedMock }));
 vi.mock('../../../src/lib/healthcheck.js', () => ({ checkReadiness: memoryReadinessMock }));
-vi.mock('../../../src/runtime/lifecycle/schema-version.js', () => ({
-  checkSchemaVersion: schemaMock,
-}));
+vi.mock('../../../src/runtime/lifecycle/schema-readiness.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../../../src/runtime/lifecycle/schema-readiness.js')>();
+  return { ...actual, checkSchemaReadiness: schemaMock };
+});
 
 import { lifecycle } from '../../../src/runtime/lifecycle/controller.js';
 import {
@@ -47,7 +53,7 @@ import type { LifecycleComponent } from '../../../src/runtime/lifecycle/roles.js
 function healthyExceptWhatsApp(): void {
   probeDbMock.mockResolvedValue(true);
   memoryReadinessMock.mockResolvedValue({ ready: true, checks: {} });
-  schemaMock.mockResolvedValue({ status: 'ok', expected: 'x', applied: 'x' });
+  schemaMock.mockResolvedValue({ state: 'ready', ready: true, blockers: [], reason: null });
   const others: LifecycleComponent[] = [
     'config',
     'db',
