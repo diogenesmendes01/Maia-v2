@@ -631,7 +631,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     }
   }
 
-  it('(9) o ramo `retryable` do recovery é servido pelo índice de recovery, nomeado', async () => {
+  it('(9) o índice de recovery SERVE o ramo `retryable` — provado removendo o concorrente', async () => {
     // ESCOPO DO QUE ESTE CASO PROVA, porque a versão anterior prometia mais do
     // que entregava: ele cobre UM dos três ramos de `findRecoverableTurns`
     // (`src/db/repositories/turn-repos.ts`), o de `retryable`. Os outros dois
@@ -675,6 +675,24 @@ d('agent_turns — DB real (migrations 096/097)', () => {
            FROM generate_series(1, 200)`,
         [tenant, agent],
       );
+
+      // Remove o CONCORRENTE, dentro da transação que já é desfeita.
+      //
+      // Sem isso o caso é instável por natureza, e eu medi por quê:
+      // `agent_turns_live_status_idx` — parcial sobre `(status, updated_at)`
+      // nos estados vivos — serve este mesmo ramo com custo praticamente
+      // idêntico (481.39 contra 486.57 com massa realista, ~1%). Qual dos dois
+      // o planner escolhe depende da distribuição do banco, então asserir "o
+      // planner escolhe X" é asserir algo que varia legitimamente entre
+      // ambientes: local escolhia um, o CI escolhia o outro, e nenhum dos dois
+      // estava errado.
+      //
+      // O que É estável, e o que este caso passa a provar: com o concorrente
+      // fora, o índice de recovery serve o ramo. Se ele deixar de cobrir o
+      // predicado, nenhum plano indexado sobra e o caso fica vermelho.
+      //
+      // O `DROP` morre no `ROLLBACK` — o índice nunca some de verdade.
+      await client.query('DROP INDEX agent_turns_live_status_idx');
 
       // O predicado do ramo `retryable` COMO ELE É em `findRecoverableTurns`,
       // incluindo `IS NOT NULL`, a ordenação e o limite — os três participam da
