@@ -85,6 +85,9 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     await ensureTenantAgent(OTHER_TENANT, OTHER_AGENT);
   });
 
+  /** Escopos criados pelo caso (9), apagados no `afterAll`. */
+  const probeScopes: Array<{ tenant: string; agent: string }> = [];
+
   afterAll(async () => {
     if (createdMensagens.length > 0) {
       // agent_turn_inputs cai por CASCADE do turno; a FK para mensagens exige
@@ -99,6 +102,33 @@ d('agent_turns — DB real (migrations 096/097)', () => {
       );
       await pool.query(`DELETE FROM mensagens WHERE id = ANY($1::uuid[])`, [createdMensagens]);
     }
+    for (const scope of probeScopes) {
+      await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2`, [
+        scope.tenant,
+        scope.agent,
+      ]);
+      await pool.query(`DELETE FROM agents WHERE id = $1`, [scope.agent]);
+      await pool.query(`DELETE FROM tenants WHERE id = $1`, [scope.tenant]);
+    }
+    // Limpeza por ESCOPO, não só pelos ids que este processo rastreou. Uma
+    // execução interrompida deixa linha para trás, e o `DELETE FROM agents`
+    // seguinte quebra em `mensagens_agent_id_fkey` — derrubando a SUÍTE
+    // INTEIRA no `afterAll`, com todos os casos verdes. Falha de arquivo sem
+    // teste vermelho é especialmente difícil de ler. Os ids são namespaced
+    // (`turns503-*`), então apagar por escopo não alcança dado de outro spec.
+    await pool.query(
+      `DELETE FROM agent_turn_inputs WHERE mensagem_id IN
+         (SELECT id FROM mensagens WHERE tenant_id = $1 AND agent_id = $2)`,
+      [OTHER_TENANT, OTHER_AGENT],
+    );
+    await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2`, [
+      OTHER_TENANT,
+      OTHER_AGENT,
+    ]);
+    await pool.query(`DELETE FROM mensagens WHERE tenant_id = $1 AND agent_id = $2`, [
+      OTHER_TENANT,
+      OTHER_AGENT,
+    ]);
     await pool.query(`DELETE FROM agents WHERE id = $1`, [OTHER_AGENT]);
     await pool.query(`DELETE FROM tenants WHERE id = $1`, [OTHER_TENANT]);
     await pool.end();
@@ -631,6 +661,10 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     // e a colisão mascara a asserção real com erro de fixture.
     const nonce = randomUUID().slice(0, 8);
     const scope = { tenant: `idx-${nonce}`, agent: `idx-${nonce}-probe` };
+    // O `afterAll` apaga. 4.000 linhas por execução num banco compartilhado
+    // deixam de ser fixture e viram distorção de estatística para os outros
+    // specs — foi o que aconteceu nas execuções locais antes deste registro.
+    probeScopes.push(scope);
     await pool.query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$1,'active')`, [
       scope.tenant,
     ]);
