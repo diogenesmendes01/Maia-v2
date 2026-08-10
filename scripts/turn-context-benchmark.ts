@@ -55,6 +55,32 @@
  * (exatamente uma query — só o ramo do perfil operacional v2 é cacheável) e
  * para provar que ligá-lo não introduz erro nem estica a cauda.
  *
+ * ## Ritmo da carga (`--think-ms`) — e por que ele decide um dos critérios
+ *
+ * O gerador é de malha FECHADA: `--concurrency` workers, cada um começando o
+ * próximo turno assim que o anterior termina. Com `--think-ms 0` isso mantém
+ * 20 turnos SEMPRE em voo; como cada turno pode segurar até
+ * `TURN_CONTEXT_MAX_CONCURRENT_READS` (6) conexões de um pool de 10, a fila do
+ * pool nunca esvazia — por aritmética, não por defeito. Medido neste host
+ * (4 vCPU, Postgres local), concorrência 20, braço `cold`:
+ *
+ * | `--think-ms` | turnos/s | p50 | p95 | amostras do pool saturadas | maior sequência |
+ * |---|---|---|---|---|---|
+ * | 0   | 90,7  | 187,7 ms | 386,8 ms | 142/142 (100%) | toda a corrida |
+ * | 50  | 110,8 | 119,3 ms | 163,0 ms | 143/143 (100%) | toda a corrida |
+ * | 150 | 102,1 | 28,8 ms  | 108,7 ms | 99/145 (68%)   | 1,3 s |
+ * | 300 | 60,0  | 14,5 ms  | 87,1 ms  | 27/149 (18%)   | 0,3 s |
+ * | 600 | 30,9  | 12,7 ms  | 169,8 ms | 18/152 (12%)   | 0,3 s |
+ *
+ * Duas leituras saem daí. A primeira: o martelo (`0`) entrega MENOS vazão que o
+ * ritmo de 150 ms (90,7 contra 102,1 turnos/s) e um p50 6,5× pior — passado o
+ * joelho da capacidade, a fila só acrescenta espera. A segunda: o critério
+ * "nenhuma saturação contínua do pool por 60 s" NÃO é falsificável em malha
+ * fechada sem ritmo, e o default de 150 ms existe para que ele meça o pool em
+ * vez de medir a ausência de pausa. Rodar com `--think-ms 0` continua sendo
+ * válido — é o perfil de ESTRESSE, e o relatório o traz — mas ali esse
+ * veredicto sai vermelho por construção.
+ *
  * ## Veredicto legível por máquina
  *
  * Exit code 0 = gate passou; 1 = reprovou; 2 = erro de uso/infra. A tabela de
@@ -84,7 +110,7 @@
  * | `--concurrency` | `20` | Turnos simultâneos |
  * | `--turns` | `600` | Turnos por braço (mínimo; ver `--sustain-s`) |
  * | `--sustain-s` | `0` | Mantém a carga por N segundos além de `--turns`. O critério "sem saturação contínua do pool por 60 s" só é falsificável com `--sustain-s 60` |
- * | `--think-ms` | `5` | Pausa entre turnos do mesmo worker |
+ * | `--think-ms` | `150` | Pausa entre turnos do mesmo worker. **Não é cosmético** — ver "Ritmo da carga" abaixo |
  * | `--arm` | `all` | `cold` · `warm` · `all` |
  * | `--identity` | `profile` | `profile` (perfil v2 ativo) · `legacy` (fallback `self_state`, um round-trip a mais) |
  * | `--timeout-ms` | `5000` | Orçamento por turno. Casa com `connectionTimeoutMillis` do pool |
@@ -238,7 +264,7 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
     concurrency: num('concurrency', 20),
     turns: num('turns', 600),
     sustain_s: num('sustain-s', 0),
-    think_ms: num('think-ms', 5),
+    think_ms: num('think-ms', 150),
     arms,
     identity: identityRaw,
     timeout_ms: num('timeout-ms', 5_000),
@@ -439,22 +465,33 @@ export function evaluateGate(
       detail: `máximo simultâneo=${a.max_concurrent_tenants} · pares exercitados=${a.pairs_exercised}`,
     });
 
-    // "Nenhuma saturação contínua do pool por 60 s" só é falsificável se a
-    // corrida durar 60 s. Numa corrida curta o critério é VACUAMENTE
-    // verdadeiro, e carimbá-lo como aprovado seria mentir sobre o que foi
-    // testado — então ele sai marcado como não avaliado.
-    const longEnough = a.wall_ms >= th.saturation_ms;
+    // "Nenhuma saturação contínua do pool por 60 s".
+    //
+    // Comparar a maior SEQUÊNCIA com 60 s e mais nada é um falso verde à espera
+    // de acontecer, e a primeira corrida deste harness o produziu: numa corrida
+    // de 60,1 s o pool ficou saturado em 572 das 572 amostras — 100% do tempo —
+    // e a sequência bateu 57,2 s, portanto "< 60 s", portanto verde. A sequência
+    // é limitada pela DURAÇÃO da corrida, então esse teste sozinho só pergunta
+    // se a corrida foi curta.
+    //
+    // O critério é, então, o que a frase quer dizer: **o pool tem que DRENAR** —
+    // a fila precisa esvaziar pelo menos uma vez — e nunca ficar saturado por
+    // 60 s seguidos. Um pool que jamais drena reprova em qualquer duração de
+    // corrida; não conseguir observar uma janela inteira de 60 s só é motivo de
+    // "não avaliado" quando NADA de errado apareceu.
+    const observedFullWindow = a.wall_ms >= th.saturation_ms;
+    const drained = a.pool_saturation_max_streak_ms < a.wall_ms * 0.98;
     out.push({
-      label: `[${a.arm}] sem saturação contínua do pool por ${(th.saturation_ms / 1000).toFixed(0)} s`,
-      passed: a.pool_saturation_max_streak_ms < th.saturation_ms,
-      skipped: !longEnough,
-      detail: longEnough
-        ? `maior sequência saturada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s · ` +
-          `${a.pool_saturated_samples}/${a.pool_samples} amostras saturadas`
-        : `NÃO AVALIADO — a corrida durou ${(a.wall_ms / 1000).toFixed(1)} s, ` +
-          `menos que a janela de ${(th.saturation_ms / 1000).toFixed(0)} s. ` +
-          `Use --sustain-s ${(th.saturation_ms / 1000).toFixed(0)}. ` +
-          `Maior sequência observada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s`,
+      label: `[${a.arm}] o pool drena (fila esvazia) e nunca fica saturado por ${(th.saturation_ms / 1000).toFixed(0)} s seguidos`,
+      passed: drained && a.pool_saturation_max_streak_ms < th.saturation_ms,
+      skipped: !observedFullWindow && drained,
+      detail:
+        `maior sequência saturada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s de ` +
+        `${(a.wall_ms / 1000).toFixed(1)} s · ${a.pool_saturated_samples}/${a.pool_samples} amostras saturadas` +
+        (drained ? '' : ' · A FILA NUNCA ESVAZIOU') +
+        (observedFullWindow
+          ? ''
+          : ` · janela de ${(th.saturation_ms / 1000).toFixed(0)} s não observada (use --sustain-s ${(th.saturation_ms / 1000).toFixed(0)})`),
     });
 
     // A métrica que o enunciado nomeia tem que estar SAINDO. Um harness que
