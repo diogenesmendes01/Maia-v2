@@ -2708,7 +2708,7 @@
     },
     "READINESS_SCHEMA_CHECK": {
       "type": "string",
-      "description": "Exige que a migration mais nova em disco esteja aplicada em schema_migrations antes de anunciar readiness. A readiness NUNCA aplica migration — só recusa servir num schema para o qual o código não foi construído. Desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.",
+      "description": "Exige que o veredito canônico de schema (getSchemaReadiness, #516) esteja `ready` antes de anunciar readiness: dirty state, checksum divergente, arquivo de migration ausente e schema incompatível derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). A readiness NUNCA aplica migration — só recusa servir num schema que ela não consegue verificar. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.",
       "x-maia-type": "string",
       "x-maia-group": "lifecycle",
       "x-maia-secret": false,

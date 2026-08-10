@@ -11,6 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildFixture } from '@/config/generate.js';
 import { validateConfig, formatHuman } from '@/config/validate.js';
+import { evaluateCrossFieldRules } from '@/config/rules.js';
 import { ENV_CONTRACT } from '@/config/contract.js';
 import { GROUP_ORDER, MAIA_KEY_PREFIXES } from '@/config/metadata.js';
 import type { MaiaProfile } from '@/config/metadata.js';
@@ -157,19 +158,56 @@ describe('regras cruzadas de readiness', () => {
     expect(r.warnings.some((p) => p.rule === 'lifecycle/probe-timeout-exceeds-cache')).toBe(false);
   });
 
-  it('desligar o gate de schema fora de development é AVISO explícito', () => {
+  // Issue #516 — desde que o /readyz consome `getSchemaReadiness()`, desligar
+  // este gate é desligar a única coisa que impede a instância de servir tráfego
+  // contra um schema dirty, com checksum divergente, com arquivo de migration
+  // ausente ou incompatível. Em production isso deixou de ser aviso.
+  it('READINESS_SCHEMA_CHECK=false em production é ERRO e RECUSA o boot', () => {
     const r = check('production', { READINESS_SCHEMA_CHECK: 'false' });
+    expect(r.ok).toBe(false);
+    const finding = r.errors.find((p) => p.rule === 'lifecycle/schema-check-disabled');
+    expect(finding, 'o erro precisa existir').toBeDefined();
+    expect(finding!.variable).toBe('READINESS_SCHEMA_CHECK');
+    expect(finding!.severity).toBe('error');
+    // Não pode sobrar como aviso — um aviso não derruba o boot.
+    expect(r.warnings.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
+  });
+
+  it('a recusa em production sobrevive à alavanca de rollback MAIA_CONFIG_STRICT_BOOT=false', () => {
+    // O loader legado (`legacyBootProblems` em src/config/env.ts) só aplica
+    // regras de escopo `boot` com severidade `error`. Se esta regra fosse de
+    // escopo `contract`, a alavanca de emergência do contrato viraria, sem
+    // querer, a alavanca para desligar o gate de schema em production.
+    const findings = evaluateCrossFieldRules({
+      values: { READINESS_SCHEMA_CHECK: false },
+      raw: {},
+      profile: 'production',
+      entries: [],
+    });
+    const boot = findings.filter(
+      (f) => f.rule === 'lifecycle/schema-check-disabled' && f.scope === 'boot' && f.severity === 'error',
+    );
+    expect(boot).toHaveLength(1);
+  });
+
+  it('em staging desligar o gate de schema continua permitido, como AVISO', () => {
+    const r = check('staging', { READINESS_SCHEMA_CHECK: 'false' });
     expect(r.warnings.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(true);
+    expect(r.errors.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
     expect(r.ok).toBe(true);
   });
 
   it('em development desligar o gate de schema é silencioso (fluxo normal de dev)', () => {
     const r = check('development', { READINESS_SCHEMA_CHECK: 'false' });
     expect(r.warnings.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
+    expect(r.errors.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
   });
 
-  it('o gate de schema ligado não avisa nada', () => {
-    const r = check('production', { READINESS_SCHEMA_CHECK: 'true' });
-    expect(r.warnings.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
+  it('o gate de schema ligado não avisa nem erra em nenhum profile', () => {
+    for (const profile of ['development', 'staging', 'production'] as const) {
+      const r = check(profile, { READINESS_SCHEMA_CHECK: 'true' });
+      expect(r.warnings.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
+      expect(r.errors.some((p) => p.rule === 'lifecycle/schema-check-disabled')).toBe(false);
+    }
   });
 });

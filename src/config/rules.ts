@@ -776,20 +776,45 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
-  // A checagem de schema é um gate fail-closed: desligá-la é política
-  // explícita e legítima (deploy de código e schema fora de banda), mas fora
-  // de development o operador precisa ver que ela está desligada.
-  if (profile !== 'development' && c.READINESS_SCHEMA_CHECK === false) {
-    push({
-      scope: 'contract',
-      severity: 'warning',
-      variable: 'READINESS_SCHEMA_CHECK',
-      rule: 'lifecycle/schema-check-disabled',
-      message:
-        'READINESS_SCHEMA_CHECK=false: a instância vai anunciar readiness mesmo com migration pendente, e falhará na primeira query que tocar uma coluna nova.',
-      remediation:
-        'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente.',
-    });
+  // A checagem de schema é um gate fail-closed. Desde a #516 o /readyz consome
+  // o veredito canônico (`getSchemaReadiness()`): dirty state, checksum
+  // divergente, arquivo de migration ausente e schema incompatível derrubam a
+  // instância para 503. Desligar isso é desligar a ÚNICA coisa que impede a
+  // plataforma de servir tráfego contra um schema que ela não consegue
+  // verificar.
+  //
+  // Em production isso é INVÁLIDO — o boot é recusado, não avisado (decisão do
+  // owner na #516). Escopo `boot` de propósito: a regra vale também no caminho
+  // de rollback `MAIA_CONFIG_STRICT_BOOT=false`, senão a alavanca de emergência
+  // do contrato viraria, sem querer, a alavanca para desligar o gate de schema.
+  //
+  // Fora de production continua permitido: publicar código e schema fora de
+  // banda é um fluxo legítimo em dev/staging. Em staging avisa; em development
+  // é silencioso (fluxo normal de dev).
+  if (c.READINESS_SCHEMA_CHECK === false) {
+    if (profile === 'production') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'READINESS_SCHEMA_CHECK',
+        rule: 'lifecycle/schema-check-disabled',
+        message:
+          'READINESS_SCHEMA_CHECK=false não é permitido no profile production: o /readyz deixaria de consultar o veredito de schema (#516) e a instância anunciaria readiness com migration pendente, ledger dirty, checksum divergente ou arquivo de migration ausente.',
+        remediation:
+          'Remova READINESS_SCHEMA_CHECK=false (o default é true). Se código e schema são publicados fora de banda, faça isso em staging/development — em production o gate é obrigatório.',
+      });
+    } else if (profile !== 'development') {
+      push({
+        scope: 'contract',
+        severity: 'warning',
+        variable: 'READINESS_SCHEMA_CHECK',
+        rule: 'lifecycle/schema-check-disabled',
+        message:
+          'READINESS_SCHEMA_CHECK=false: a instância vai anunciar readiness mesmo com migration pendente, ledger dirty ou checksum divergente, e falhará na primeira query que tocar uma coluna nova.',
+        remediation:
+          'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente. Em production o valor `false` é recusado no boot.',
+      });
+    }
   }
 
   // A separação de topologia (#513) ainda não foi entregue: o contrato de
