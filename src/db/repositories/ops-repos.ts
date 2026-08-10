@@ -12,14 +12,17 @@ import { db } from '@/db/client.js';
 import {
   backup_manifests,
   backup_runs,
+  data_tombstones,
   legal_holds,
   restore_drills,
   retention_runs,
 } from '@/db/schema.js';
+import type { DrillCandidate, RestoreDrillStore } from '@/ops/backup/drill.js';
 import type { SignedManifest } from '@/ops/backup/manifest.js';
 import type { RetentionCandidate } from '@/ops/backup/retention.js';
 import type { BackupEvidenceStore, BackupTrigger } from '@/ops/backup/service.js';
 import type { BackupState } from '@/ops/backup/state-machine.js';
+import type { TombstoneRecord } from '@/ops/retention/tombstones.js';
 
 export const backupEvidenceStore: BackupEvidenceStore = {
   async createRun(row: {
@@ -226,6 +229,152 @@ export async function recordRetentionRun(row: {
     error_code: row.error_code,
     finished_at: new Date(),
   });
+}
+
+/* ────────────────────────── restore drill (issue #536) ────────────────────── */
+
+/**
+ * The artifact a drill should exercise, selected BY EVIDENCE.
+ *
+ * The rules, and why each one is there:
+ *
+ *  - a candidate MUST carry a signed manifest (`INNER JOIN`). Without one there
+ *    is nothing to bind the bytes to, and a drill that restored an
+ *    unidentifiable file would prove nothing about the backup discipline;
+ *  - an OFF-SITE candidate MUST have `remote_verified`. That flag means, since
+ *    manifest v2, that a provider-computed checksum matched or the object was
+ *    re-downloaded and re-hashed — never the uploader's own metadata stamp;
+ *  - a LOCAL candidate MUST have `local_verified`, i.e. its catalog was read
+ *    and its checksum computed. "The file exists" was the baseline's bar and is
+ *    exactly what this issue exists to raise;
+ *  - `state = 'deleted'` is excluded: retention already reaped those bytes.
+ *
+ * Ordering is by `finished_at DESC` — the NEWEST artifact, because a drill
+ * proves the CURRENT recovery point, not a historical one.
+ */
+export async function selectDrillCandidate(
+  source: 'local' | 'offsite',
+): Promise<DrillCandidate | null> {
+  const verifiedPredicate =
+    source === 'offsite'
+      ? sql`r.remote_verified = true AND r.destination_kind = 's3'`
+      : sql`r.local_verified = true`;
+
+  const res = await db.execute<{
+    backup_id: string;
+    artifact_ref: string | null;
+    manifest: unknown;
+    signature: string;
+    signature_alg: string;
+    signature_key_version: number;
+  }>(sql`
+    SELECT r.id AS backup_id,
+           r.artifact_ref,
+           m.manifest,
+           m.signature,
+           m.signature_alg,
+           m.signature_key_version
+      FROM ${backup_runs} r
+      JOIN ${backup_manifests} m ON m.backup_run_id = r.id
+     WHERE r.state IN ('completed', 'completed_degraded')
+       AND r.artifact_ref IS NOT NULL
+       AND ${verifiedPredicate}
+     ORDER BY r.finished_at DESC
+     LIMIT 1
+  `);
+
+  const row = res.rows[0];
+  if (!row || !row.artifact_ref) return null;
+  return {
+    backup_id: row.backup_id,
+    artifact_ref: row.artifact_ref,
+    source,
+    // Reassembled into the envelope shape `verifyManifest` expects. The drill
+    // re-verifies the signature itself — this repository never asserts that a
+    // manifest is valid, it only hands over what was stored.
+    signed_manifest: {
+      manifest: row.manifest,
+      signature: row.signature,
+      signature_alg: row.signature_alg,
+      signature_key_version: row.signature_key_version,
+    },
+  };
+}
+
+export const restoreDrillStore: RestoreDrillStore = {
+  async createDrill(row): Promise<void> {
+    await db.insert(restore_drills).values({
+      id: row.id,
+      correlation_id: row.correlation_id,
+      backup_run_id: row.backup_run_id,
+      source: row.source,
+      status: 'running',
+      // tenant_id/agent_id default to 'system' (migration 101 CHECK).
+    });
+  },
+
+  async finishDrill(id, patch): Promise<void> {
+    await db
+      .update(restore_drills)
+      .set(patch as never)
+      .where(eq(restore_drills.id, id));
+  },
+};
+
+/**
+ * Read the tombstone ledger for the drill's reconciliation dry run.
+ *
+ * `available: false` on ANY read failure — the caller must be able to tell an
+ * unreadable ledger from an empty one, because the first blocks a restore and
+ * the second does not (issue #520 round-1 P1, preserved here).
+ *
+ * DELIBERATELY UNBOUNDED BY TENANT: a `pg_dump` is a container of every
+ * tenant's data, so the reconciliation that guards its restore has to see every
+ * tenant's tombstones. The rows carry PSEUDONYMS only, so reading them all does
+ * not disclose a single identifier.
+ *
+ * BOUNDED BY COUNT, and fail-closed at the bound. A silently truncated ledger
+ * is the worst possible answer here: the missing rows are exactly the deletions
+ * that would NOT be replayed, so a restore would resurrect them while the plan
+ * reported `ok`. Hitting the cap therefore reports the ledger as UNREADABLE,
+ * which blocks the restore and asks a human to reconcile in batches.
+ */
+export const TOMBSTONE_LEDGER_READ_LIMIT = 100_000;
+
+export async function readTombstoneLedger(): Promise<{
+  available: boolean;
+  tombstones: TombstoneRecord[];
+}> {
+  try {
+    const rows = await db
+      .select()
+      .from(data_tombstones)
+      .orderBy(data_tombstones.effective_at)
+      // +1 so the cap is DETECTED rather than silently reached.
+      .limit(TOMBSTONE_LEDGER_READ_LIMIT + 1);
+    if (rows.length > TOMBSTONE_LEDGER_READ_LIMIT) {
+      return { available: false, tombstones: [] };
+    }
+    return {
+      available: true,
+      tombstones: rows.map((r) => ({
+        id: r.id,
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
+        data_class: r.data_class,
+        subject_ref: r.subject_ref,
+        resource_locator: r.resource_locator,
+        action: r.action as TombstoneRecord['action'],
+        effective_at: r.effective_at,
+        origin: r.origin as TombstoneRecord['origin'],
+        version: r.version,
+        hmac: r.hmac,
+        hmac_key_version: r.hmac_key_version,
+      })),
+    };
+  } catch {
+    return { available: false, tombstones: [] };
+  }
 }
 
 export interface ReadinessFacts {

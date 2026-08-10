@@ -98,10 +98,14 @@ Every deletion writes a signed tombstone. Restoring a snapshot requires replayin
 
 The ledger stores **pseudonyms** (keyed HMAC), never raw identifiers — a tombstone holding the phone number it claims to have erased would be a copy of the very data it deleted. It can recognise a subject it is given; it cannot enumerate subjects.
 
+**The ledger's key is now defined** (issue #536). `deriveTombstoneSecret()` in [`tombstones.ts`](../../../src/ops/retention/tombstones.ts) derives it from the platform HMAC master secret under the fixed label `maia.tombstone.hmac.v1`, so the ledger key is not the manifest-signing key even though both descend from the same master. It could be pinned now precisely because nothing has written a tombstone yet; once rows exist it is frozen, since a different derivation makes every existing HMAC fail and an unverifiable ledger blocks every restore by design. This is a **key-management** decision, not a legal one — no retention period is implied or set by it.
+
+**The gate is now exercised, not merely described.** The restore drill (`npm run restore:test`, [`drill.ts`](../../../src/ops/backup/drill.ts)) runs `planReconciliation` + `canReleaseTraffic` as a DRY RUN against the restored snapshot and records `restore_drills.tombstones_pending`. So an unreadable ledger, a missing watermark or a planted row now fails a scheduled drill instead of being discovered during an incident. Re-APPLYING the tombstones is still manual — it needs the per-class deletion mechanism the privacy workflow will build.
+
 ## Review
 
 | | |
 |---|---|
-| Last updated | 2026-07-28 (issue #520) |
+| Last updated | 2026-08-04 (issue #536 — tombstone key derivation + the drill's reconciliation dry run; **no period was decided**) |
 | Approved by legal/DPO | **No — draft** |
 | Re-review when | A class is added, a period is approved, or the media/Redis decisions land |

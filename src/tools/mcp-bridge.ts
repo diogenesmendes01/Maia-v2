@@ -56,6 +56,17 @@ const MAX_DESCRIPTION_CHARS = 400;
 // re-export mantém a API pública deste módulo (usada por `_dispatcher.ts`).
 export { isMcpToolName, mcpToolName, parseMcpToolName };
 
+/**
+ * Issue #535 §2 — o vocabulário de recusa DESTE bridge, exportado para que a
+ * observabilidade classifique `mcp_tool_not_executable` (governança negando,
+ * como projetado) separado de `mcp_call_failed` (o servidor externo quebrou).
+ * Antes os dois caíam no mesmo balde `error` do SLI operacional.
+ */
+export {
+  MCP_BRIDGE_ERROR_CODES,
+  type McpBridgeErrorCode,
+} from './_dispatch-error-codes.js';
+
 /** Packs `mcp.<server>` presentes no grant do agente corrente (ALS). */
 async function grantedMcpServerNames(): Promise<Set<string>> {
   const grant = await agentToolGrantsRepo.findForCurrentAgent();

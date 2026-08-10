@@ -89,7 +89,11 @@ export const AUDIT_ACTIONS = [
   //  - backup_artifact_deleted: retenção removeu um artefato — ação
   //    destrutiva, registra política/escopo/contagem, nunca conteúdo.
   //  - restore_drill_*: drill automatizado; `completed` carrega a duração que
-  //    alimenta o RTO medido.
+  //    alimenta o RTO medido. `unsafe_residue` é uma ação SEPARADA de `failed`
+  //    de propósito: ela não diz "o backup não presta", diz "uma cópia completa
+  //    da produção ficou no host e alguém precisa removê-la à mão" — duas
+  //    remediações diferentes, e a segunda pode acontecer junto com um drill
+  //    que provou o restore (issue #536, revisão da PR #541).
   //  - retention_run_*: passe de retenção (inclusive dry-run) por classe de
   //    dado e tenant.
   //  - legal_hold_created/released: §11 exige papel e auditoria append-only.
@@ -105,6 +109,7 @@ export const AUDIT_ACTIONS = [
   'restore_drill_started',
   'restore_drill_completed',
   'restore_drill_failed',
+  'restore_drill_unsafe_residue',
   'retention_run_started',
   'retention_run_completed',
   'retention_run_failed',
@@ -120,8 +125,39 @@ export const AUDIT_ACTIONS = [
   'post_restore_reconciliation_failed',
   'whatsapp_connected',
   'whatsapp_disconnected',
+  // Disjuntor de LLM (issue #534). `opened`/`closed` são o PAR que a regra
+  // `llm_circuit_long_open` do `src/workers/audit-watcher.ts` consome para
+  // alertar "circuito aberto há mais de 5 min". Até a revisão da PR #541 as
+  // duas ações existiam SEM produtor — o watcher era um consumidor de eventos
+  // que ninguém emitia, e o alerta nunca podia disparar. O produtor é
+  // `src/lib/llm/circuit-audit.ts`, chamado por `circuit-breaker.ts` em toda
+  // transição para `open`/`closed`. Escritas no contexto sintético `system`
+  // (ADR 0002): o estado mede uma dependência externa compartilhada, não dado
+  // de tenant. `half_open` NÃO audita — é etapa interna da recuperação, não
+  // mudança de postura observável, e auditá-la duplicaria o par sem
+  // acrescentar decisão governável.
   'llm_circuit_opened',
   'llm_circuit_closed',
+  // Kill switch do disjuntor (`src/lib/llm/circuit-mode.ts`). A objeção
+  // original da #534 a um toggle de runtime era "alguém vira a chave às 3h da
+  // manhã sem deixar rastro"; a resposta foi exigir `actor` + `reason` e
+  // contar/logar todo uso. Log estruturado, porém, tem retenção curta e cai
+  // junto com o coletor — mudança de POSTURA de um controle de degradação é
+  // decisão de governança e pertence à trilha durável (invariante 4 do
+  // `AGENTS.md`). Cada linha carrega actor, reason, modo e validade.
+  //  - applied: override em vigor. `metadata.source='adopted'` distingue a
+  //    adoção da chave durável no boot da réplica de uma virada ao vivo — é o
+  //    MESMO desfecho de governança (a postura mudou), com procedência
+  //    diferente, então é metadado e não ação separada.
+  //  - cleared: operador devolveu a postura ao contrato.
+  //  - expired: o arrendamento venceu sozinho e a postura voltou ao baseline.
+  //  - rejected: override RECUSADO (anônimo, sem motivo, modo inválido,
+  //    validade vencida/acima do teto). Auditar a recusa é o que separa
+  //    "ninguém tentou" de "alguém tentou e o fail-closed segurou".
+  'llm_circuit_mode_override_applied',
+  'llm_circuit_mode_override_cleared',
+  'llm_circuit_mode_override_expired',
+  'llm_circuit_mode_override_rejected',
   'dashboard_session_started',
   'dashboard_session_ended',
   'dlq_job_added',
@@ -429,6 +465,17 @@ export const AUDIT_ACTIONS = [
   //   no learning), but every sandbox interaction stays on the audit trail
   //   (invariant #4) — marked so forensics can separate test traffic.
   'playground_turn',
+  // Onboarding (issue #519) — as decisões de governança AGENTE-ESCOPADAS da
+  // saga. A trilha administrativa completa (todo passo, todo ator, todo
+  // correlation id) vai atomicamente para `admin_audit_log` dentro da mesma
+  // transação do passo; estas três entram TAMBÉM em `audit_log` porque são
+  // decisões sobre o AGENTE e pertencem à trilha do agente (invariante 4).
+  // `agent_readiness_evaluated` registra o veredito canônico do backend (com
+  // os fingerprints de configuração e schema); os dois de ativação registram
+  // a decisão explícita de deixar — ou não deixar — o agente operar.
+  'agent_readiness_evaluated',
+  'agent_activation_approved',
+  'agent_activation_denied',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

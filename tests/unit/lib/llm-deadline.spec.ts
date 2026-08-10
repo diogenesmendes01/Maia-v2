@@ -44,7 +44,13 @@ vi.mock('@/lib/cost-ledger.js', () => ({
   estimateLLMCostUsd: vi.fn(async () => 0),
 }));
 
-vi.mock('@/lib/metrics.js', () => ({ incCounter: vi.fn(), observeHistogram: vi.fn() }));
+vi.mock('@/lib/metrics.js', () => ({
+  incCounter: vi.fn(),
+  observeHistogram: vi.fn(),
+  // Registrado pelo disjuntor (issue #534) na primeira chamada de cada
+  // `(provider, workload)`.
+  setGaugeProvider: vi.fn(),
+}));
 
 vi.mock('@/config/env.js', async () => {
   const actual = await vi.importActual<typeof import('@/config/env.js')>('@/config/env.js');
@@ -66,6 +72,7 @@ vi.mock('@/config/env.js', async () => {
 });
 
 import { executeLLM } from '@/lib/llm/gateway.js';
+import { _internal as circuitInternal } from '@/lib/llm/circuit-breaker.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
@@ -91,6 +98,9 @@ beforeEach(() => {
     fast: { value: 'settings-fast', source: 'global' },
   });
   invalidateModelCache();
+  // Disjuntor é estado de processo: sem zerar, as falhas de um caso entram na
+  // janela do seguinte. Comportamento coberto em `llm-circuit-breaker.spec.ts`.
+  circuitInternal.reset();
 });
 
 describe('deadline derivado — caller que não declara nada', () => {

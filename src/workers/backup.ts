@@ -13,6 +13,8 @@ import { runWithSystemContext } from '@/db/tenant-context.js';
 import { resolveProfile } from '@/config/profiles.js';
 import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profile.js';
 import { createBackupPorts } from '@/ops/backup/adapters.js';
+import { createRestoreDrillPorts } from '@/ops/backup/drill-adapters.js';
+import { runRestoreDrill } from '@/ops/backup/drill.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
 import { runArtifactRetention } from '@/ops/backup/retention.js';
 import {
@@ -192,6 +194,68 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
   }
 
   return { status: 'ran', outcome: run.outcome, reason: run.reason };
+}
+
+/**
+ * Restore drill — issue #536 §1.
+ *
+ * Shared entry point for `npm run restore:test` and for any scheduler that
+ * wants to run it. Single-flight on its OWN lock key, so a drill never blocks a
+ * nightly backup and two drills never race for the same ephemeral database.
+ *
+ * The drill runs under the reserved `system` sentinel for the same reason the
+ * backup does: it exercises a DB-wide artifact that has no owning tenant.
+ *
+ * The result is deliberately returned rather than thrown: the caller decides
+ * the exit code, and the evidence is already durable in `restore_drills`.
+ */
+export async function runRestoreDrillJob(): Promise<
+  | { status: 'already_running' }
+  | { status: 'ran'; result: Awaited<ReturnType<typeof runRestoreDrill>> }
+> {
+  return runWithSystemContext(async () => {
+    const profile = resolveBackupProfile(backupConfigInput());
+    const outcome = await withOpsLock(
+      OPS_LOCK_KEYS.restore_drill,
+      { pool, onWarn: (event, detail) => logger.warn(detail, event) },
+      () => runRestoreDrill(createRestoreDrillPorts(), profile),
+    );
+
+    if (outcome.status === 'already_running') {
+      logger.info({}, 'restore_drill.already_running');
+      return { status: 'already_running' as const };
+    }
+
+    const result = outcome.result;
+    // Two different emergencies, two different alerts (issue #536, review of
+    // PR #541). "Nothing is restorable" and "a full copy of production is
+    // sitting on this host" ask for opposite actions, and the residue one can
+    // fire on a drill whose restore proved out perfectly — sending the generic
+    // subject for it would send the operator looking at the wrong thing.
+    if (result.cleanup.status !== 'clean') {
+      await sendAlert({
+        subject: 'Restore drill left a COPY OF PRODUCTION DATA on the host',
+        // Kinds and reasons only: no path, no database name, no connection string.
+        body:
+          `Drill ${result.drill_id} could not prove its teardown removed: ` +
+          `${result.cleanup.residue.map((r) => `${r.kind} (${r.reason})`).join(', ')}.\n` +
+          `Restore verdict: ${result.failure_code === 'cleanup_failed' ? 'the artifact IS restorable' : `failed with code=${result.failure_code}`}.\n` +
+          `Correlation id: ${result.correlation_id}.\n` +
+          'Remove the leftovers by hand — see docs/runbooks/backup-restore.md §4.',
+      }).catch(() => null);
+    }
+    if (result.status === 'failed' && result.failure_code !== 'cleanup_failed') {
+      await sendAlert({
+        subject: 'Restore drill FAILED — no artifact is known to be restorable',
+        // Codes only: no path, no object key, no connection string.
+        body:
+          `Drill ${result.drill_id} failed with code=${result.failure_code}.\n` +
+          `Source: ${result.source}. Correlation id: ${result.correlation_id}.\n` +
+          'Inspect restore_drills for the probe detail.',
+      }).catch(() => null);
+    }
+    return { status: 'ran' as const, result };
+  });
 }
 
 /**

@@ -257,6 +257,46 @@ describe('gate de readiness — posse provada não é permissão de rotear (#518
     expect(auditCalls.map((c) => c.acao)).toContain('channel_activated');
   });
 
+  it('saga de onboarding dona da ativação: verifica posse, NÃO ativa, e o motivo é tipado na trilha (achado 1 do re-review #541)', async () => {
+    readinessMock.mockResolvedValue({
+      ready: false,
+      reason_code: 'onboarding_saga_owns_activation',
+    });
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    expect(auditCalls.map((c) => c.acao)).not.toContain('channel_activated');
+    const deferred = auditMock.mock.calls
+      .map((c) => c[0] as { acao: string; metadata?: Record<string, unknown> })
+      .find((c) => c.acao === 'channel_activation_deferred');
+    expect(deferred?.metadata).toMatchObject({
+      channel_id: CHANNEL.id,
+      reason: 'onboarding_saga_owns_activation',
+    });
+    const verified = auditMock.mock.calls
+      .map((c) => c[0] as { acao: string; metadata?: Record<string, unknown> })
+      .find((c) => c.acao === 'pairing_session_verified');
+    expect(verified?.metadata).toMatchObject({ routing_activated: false });
+  });
+
+  it('FAIL-CLOSED: gate indisponível (exceção) encerra em failed — não ativa', async () => {
+    readinessMock.mockRejectedValue(new Error('connection terminated'));
+    const gate = pendingPairing();
+    managerMock.startPairingSession.mockReturnValue(gate.promise);
+    await startChannelPairing({ channel_id: CHANNEL.id, method: 'qr' });
+
+    gate.resolve({ matched: true, actual_line: CHANNEL.external_id });
+    await flush();
+
+    expect(channelsRepoMock.activateVerified).not.toHaveBeenCalled();
+    expect(channelPairingStatus(CHANNEL.id).phase).toBe('failed');
+  });
+
   it('a readiness é avaliada DEPOIS do guard de posse — tentativa superseded nem consulta', async () => {
     const gate = pendingPairing();
     managerMock.startPairingSession.mockReturnValue(gate.promise);

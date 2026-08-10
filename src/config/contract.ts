@@ -414,6 +414,23 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  LLM_CIRCUIT_MODE: {
+    name: 'LLM_CIRCUIT_MODE',
+    description:
+      'Postura BASE do disjuntor de LLM (issue #534, decisão do owner na revisão): off | shadow | enforce. `shadow` (default) roda a máquina de estados inteira e mede o que faria, sem NUNCA recusar chamada; `enforce` recusa de fato; `off` desliga e não guarda estado. Promover para `enforce` só depois de uma passagem por staging com would_open/would_reject medidos. NÃO é o kill switch: mudar aqui exige restart. A alavanca de incidente, sem restart e sem deploy, é o override por Redis — ver docs/runbooks/operational.md §3.1.',
+    group: 'llm',
+    secret: false,
+    services: ['runtime'],
+    schema: z.enum(['off', 'shadow', 'enforce']).default('shadow'),
+    example: 'shadow',
+    fixture: 'shadow',
+    // Honesto de propósito: `config` é congelado no boot, então trocar esta
+    // variável só vale no próximo start. Marcar `false` aqui venderia como
+    // alavanca quente algo que não é — e é exatamente essa confusão que o
+    // override por Redis existe para não deixar acontecer.
+    restartRequired: true,
+    commentedInExample: true,
+  },
   DECISION_ENGINE_BUDGET_MS: {
     name: 'DECISION_ENGINE_BUDGET_MS',
     description:
@@ -885,6 +902,63 @@ export const ENV_CONTRACT = {
     schema: posInt(10),
     example: '10',
     fixture: '10',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_OTLP_TRACES_ENDPOINT: {
+    name: 'MAIA_OTLP_TRACES_ENDPOINT',
+    description:
+      'Endpoint OTLP/HTTP de traces (ex.: http://collector:4318/v1/traces). Vazio = exporter INERTE: nenhum span é amostrado, montado ou enviado, e o hot path fica idêntico ao anterior (#535).',
+    group: 'alerts',
+    secret: false,
+    services: ['runtime'],
+    schema: z.string().url().optional(),
+    example: 'http://otel-collector:4318/v1/traces',
+    // The fixture only has to SATISFY the schema (it is never booted — see
+    // `scripts/config.ts`); the unit suite runs with the variable unset, which
+    // is the inert state the exporter is designed around.
+    fixture: 'http://localhost:4318/v1/traces',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_OTLP_TRACES_HEADERS: {
+    name: 'MAIA_OTLP_TRACES_HEADERS',
+    description:
+      'Headers extras do exporter OTLP no formato k=v,k=v (tipicamente autenticação do collector). Segredo — nunca aparece em log nem em /metrics.',
+    group: 'alerts',
+    secret: true,
+    services: ['runtime'],
+    schema: z.string().optional(),
+    example: '__SET_ME__authorization=Bearer_xxx',
+    // Carries the literal `fixture` so the `secret/synthetic-fixture` boot
+    // check can flag it EXACTLY without a plausible real value becoming a
+    // false positive (PR #522 review round 2).
+    fixture: 'x-maia-fixture=fixture-not-a-real-credential',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_OTLP_SAMPLE_RATIO: {
+    name: 'MAIA_OTLP_SAMPLE_RATIO',
+    description:
+      'Fração de turnos amostrados para OTLP (0..1). A decisão é DERIVADA do trace_id, então gateway e worker chegam ao mesmo veredito sem propagar bit de amostragem — um turno amostrado é amostrado inteiro.',
+    group: 'alerts',
+    secret: false,
+    services: ['runtime'],
+    schema: z.coerce.number().min(0).max(1).default(0.05),
+    example: '0.05',
+    fixture: '1',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_OTLP_SERVICE_NAME: {
+    name: 'MAIA_OTLP_SERVICE_NAME',
+    description: 'Valor de `service.name` no resource OTLP.',
+    group: 'alerts',
+    secret: false,
+    services: ['runtime'],
+    schema: z.string().default('maia-runtime'),
+    example: 'maia-runtime',
+    fixture: 'maia-runtime-test',
     restartRequired: true,
     commentedInExample: true,
   },

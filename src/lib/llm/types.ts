@@ -135,18 +135,26 @@ export type LLMGatewayRequest = {
   /**
    * Omitido → tier default do workload (`src/lib/llm/workloads.ts`).
    *
-   * ## DIVERGÊNCIA CONSCIENTE do critério de aceite da issue #508
+   * ## ✅ DECISÃO DO OWNER (issue #534): `tier` NÃO é obrigatório no call site
    *
-   * A issue pede, textualmente, que "todos os callers declarem `workload` e
-   * `tier`". `workload` é obrigatório; `tier` **não é**, e isso é decisão, não
-   * esquecimento. O argumento, para quem revisar isto sem o histórico:
+   * A issue #508 pedia, textualmente, que "todos os callers declarem
+   * `workload` e `tier`". A PR #531 tornou `workload` obrigatório e manteve o
+   * `tier` centralizado, registrando a divergência como PENDENTE de revisão. A
+   * #534 fechou a pendência, e a regra passa a ser esta:
    *
-   * O objetivo declarado da própria issue é "apenas o backend seleciona
-   * provider, modelo, tier e política de fallback". Um `tier` obrigatório no
-   * call site trabalha CONTRA esse objetivo: transforma a classe de modelo em
-   * parâmetro de quem chama, e o call site é justamente quem não tem contexto
-   * para decidir custo/qualidade — foi assim que 13 módulos acabaram com slugs
-   * fixos no código, que é o defeito que esta issue existe para consertar.
+   * > O call site declara **workload**. O backend resolve tier, provider,
+   * > modelo e política de fallback centralmente. Exceções são POLÍTICAS
+   * > GOVERNADAS (uma linha revisável em `workloads.ts`), nunca overrides
+   * > livres do caller.
+   *
+   * O argumento que sustenta a decisão, para quem revisar isto sem o
+   * histórico: o objetivo declarado da própria #508 é "apenas o backend
+   * seleciona provider, modelo, tier e política de fallback". Um `tier`
+   * obrigatório no call site trabalha CONTRA esse objetivo — transforma a
+   * classe de modelo em parâmetro de quem chama, e o call site é justamente
+   * quem não tem contexto para decidir custo/qualidade. Foi assim que 13
+   * módulos acabaram com slug fixo no código, que é o defeito que a #508
+   * existe para consertar.
    *
    * O tier CONTINUA declarado, e de forma mais forte: uma vez por workload, em
    * `src/lib/llm/workloads.ts`, versionado, revisável num diff e impossível de
@@ -157,6 +165,11 @@ export type LLMGatewayRequest = {
    * um workload precisar de tier diferente numa chamada específica (hoje: só a
    * visão, que declara `vision`). Se esse caso deixar de existir, o campo pode
    * sumir — mas obrigá-lo seria mover a decisão para o lugar errado.
+   *
+   * ⚠️ Consequência prática para quem for adicionar um caller: passar `tier`
+   * aqui é um DESVIO da política do workload, e desvio precisa de justificativa
+   * no diff. Se a razão for "este workload deveria rodar noutro tier", o lugar
+   * da mudança é `workloads.ts`, não o call site.
    */
   tier?: LLMTier;
   system: string;

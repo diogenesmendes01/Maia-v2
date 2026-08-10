@@ -26,6 +26,12 @@ const rules = readFileSync(RULES_PATH, 'utf8');
  * claim instead of trusting the list.
  */
 const PRE_EXISTING_METRICS: Record<string, string> = {
+  // Emitida direto por `incCounter` em `src/lib/llm/telemetry.ts` — a camada
+  // crua, que não passa pelo gate de rótulos da taxonomia. Entrou nas regras
+  // quando `MaiaLlmRateLimited` deixou de casar a série legada
+  // `maia_llm_calls_total{reason=...}`, que nunca teve `reason` (rodada 3 da
+  // review da PR #541).
+  maia_llm_requests_total: 'src/lib/llm/telemetry.ts:110',
   maia_audit_events_total: 'src/governance/audit.ts:58',
   maia_audit_write_failed_total: 'src/governance/audit.ts:83',
   maia_tenant_id_default_literal_total: 'src/db/tenant-context.ts:260',

@@ -45,6 +45,38 @@ export interface TombstoneRecord {
 }
 
 /**
+ * Domain-separation label for the ledger's keying material (issue #536).
+ *
+ * The ledger has no dedicated secret in the configuration contract, and adding
+ * one would be a config change nobody can roll out before the first tombstone
+ * is written. Instead the ledger key is DERIVED from the platform's existing
+ * HMAC master secret with a fixed label, so:
+ *
+ *  - the ledger key is not the manifest-signing key, even though both descend
+ *    from the same master (using one secret for two protocols is how a
+ *    signature from one becomes a valid signature in the other);
+ *  - the derivation is defined ONCE, here, before anything writes a tombstone.
+ *    A future writer that derives it differently would produce rows that fail
+ *    verification and BLOCK every restore — so this function is the contract,
+ *    not a helper.
+ *
+ * MUST NOT change: rotating the label invalidates every existing tombstone's
+ * HMAC, and an unverifiable ledger blocks the return to production by design.
+ */
+export const TOMBSTONE_KEY_LABEL = 'maia.tombstone.hmac.v1';
+
+export function deriveTombstoneSecret(masterSecret: string | undefined): string {
+  if (!masterSecret) {
+    throw new TypedError(
+      'tombstone_secret_missing',
+      'no master secret is configured — the tombstone ledger cannot be keyed',
+      {},
+    );
+  }
+  return createHmac('sha256', masterSecret).update(TOMBSTONE_KEY_LABEL, 'utf8').digest('hex');
+}
+
+/**
  * One-way, keyed pseudonym. Keyed (not a bare hash) so an attacker holding the
  * ledger cannot brute-force the small space of Brazilian phone numbers.
  *

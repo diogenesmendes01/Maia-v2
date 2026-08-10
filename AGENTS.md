@@ -86,7 +86,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | # | Rule | Where enforced |
 |---|---|---|
-| 1 | **Every stateful boundary scopes by `tenant_id + agent_id`** | DB queries, Redis keys, cache keys, ALS context. See [`concerns/tenant-isolation.md`](docs/architecture/concerns/tenant-isolation.md). |
+| 1 | **Every stateful boundary scopes by `tenant_id + agent_id`** | DB queries, Redis keys, cache keys, ALS context. See [`concerns/tenant-isolation.md`](docs/architecture/concerns/tenant-isolation.md). **One bounded exception:** health of a *shared external dependency* is `system` operational state, not tenant state — see [`concerns/tenant-isolation.md` §1.1](docs/architecture/concerns/tenant-isolation.md#11-the-one-bounded-exception-system-operational-state) and [ADR 0002](docs/architecture/decisions/0002-external-dependency-health-is-system-state.md). It has four required conditions and a closed membership list; joining it needs an ADR, not a code comment. |
 | 2 | **Fail-closed in security** | Missing `tenant_id`/`agent_id` → reject. Unmatched policy → reject. Unresolved channel → reject. Never fall back to `'default'` in production paths. |
 | 3 | **Backend decides, LLM proposes** | LLM emits typed intents (Zod). Backend validates against state + rules. Backend executes (or denies). See [`concerns/action-layer.md`](docs/architecture/concerns/action-layer.md). |
 | 4 | **Audit every decision** | Side-effect or governance decision → `audit()` row in `audit_logs` with action label and tenant context. |

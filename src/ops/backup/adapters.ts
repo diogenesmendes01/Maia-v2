@@ -50,7 +50,7 @@ const MIGRATIONS_DIR = join(process.cwd(), 'migrations');
  * the thrown message: on a connection failure `pg_dump` echoes `DATABASE_URL`
  * with the password. Only the exit code travels.
  */
-function runBounded(
+export function runBounded(
   bin: string,
   args: string[],
   timeoutMs: number,

@@ -195,6 +195,13 @@
           "restartRequired": true
         },
         {
+          "name": "LLM_CIRCUIT_MODE",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
           "name": "DECISION_ENGINE_BUDGET_MS",
           "secret": false,
           "required": false,
@@ -457,6 +464,34 @@
         },
         {
           "name": "DLQ_ALERT_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_HEADERS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SAMPLE_RATIO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SERVICE_NAME",
           "secret": false,
           "required": false,
           "group": "alerts",
@@ -1208,6 +1243,7 @@
         "MAIA_STAGING_KEYRING",
         "SMTP_PASS",
         "TELEGRAM_BOT_TOKEN",
+        "MAIA_OTLP_TRACES_HEADERS",
         "BACKUP_S3_ACCESS_KEY",
         "BACKUP_S3_SECRET_KEY",
         "BACKUP_ENCRYPTION_KEYRING",
@@ -1251,6 +1287,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1285,6 +1322,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",
@@ -1427,6 +1468,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1461,6 +1503,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",
@@ -1601,6 +1647,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1635,6 +1682,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",

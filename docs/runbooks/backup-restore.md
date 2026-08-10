@@ -39,8 +39,9 @@ SELECT started_at, remote_verified_at, artifact_ref
 FROM backup_runs
 WHERE remote_verified ORDER BY remote_verified_at DESC LIMIT 1;
 
--- Último drill e sua duração (a resposta ao RTO)
-SELECT started_at, status, duration_ms, source, probes
+-- Último drill e sua duração (a resposta ao RTO). `cleanup_status` é um eixo
+-- SEPARADO do `status`: 'unsafe' significa cópia da produção deixada no host (§4.1)
+SELECT started_at, status, cleanup_status, duration_ms, source, probes
 FROM restore_drills ORDER BY started_at DESC LIMIT 5;
 
 -- O manifesto assinado de uma run
@@ -84,6 +85,7 @@ UPDATE backup_runs
    - obtenha `tombstone_watermark` do manifesto;
    - liste os tombstones posteriores e reaplique cada exclusão/anonimização;
    - **se o ledger estiver ilegível, o watermark for nulo, ou qualquer linha falhar na verificação HMAC, PARE** — o runtime não pode voltar a produção (`planReconciliation` devolve `ok:false`).
+   - Antecipe esse número: o último drill já mediu quantos tombstones este artefato deveria reaplicar (`restore_drills.tombstones_pending`, §4). Se o drill mais recente do mesmo artefato falhou com `reconciliation_blocked`, o restore vai parar aqui — resolva o ledger **antes** de derrubar o banco.
 7. **Reconcilie o que não está no dump**: mídia (`/app/media`), Redis/BullMQ e a sessão Baileys **não** vêm no `pg_dump`. Ver §5.
 8. **Só então** inicie: `sudo systemctl start maia` e confira `/health/db`.
 
@@ -95,9 +97,87 @@ UPDATE backup_runs
 ssh maia 'cd /opt/maia && npm run restore:test'
 ```
 
-Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finally`. O resultado alimenta `restore_drills` e o RTO medido. **Um drill falhado torna a readiness FAIL**: até um drill passar, nenhum artefato é sabidamente restaurável.
+Exit codes: `0` passou (ou já rodando, ou backups desabilitados) · `1` falhou — inclusive quando o restore provou e o **host ficou sujo** (§4.1).
 
-> Limitação conhecida nesta fatia: o drill ainda consome o artefato **local** e não faz o download do off-site. Ver "Não entregue" abaixo.
+O drill **não** pega "o dump mais novo do diretório". Ele escolhe por evidência e prova cada etapa (issue #536, [`src/ops/backup/drill.ts`](../../src/ops/backup/drill.ts)):
+
+1. **seleciona** a run mais recente que tenha manifesto assinado E cópia verificada no destino (`selectDrillCandidate`, [`src/db/repositories/ops-repos.ts`](../../src/db/repositories/ops-repos.ts));
+2. **verifica a versão e a assinatura do manifesto** — um manifesto v1 é recusado com `manifest_version_unsupported`, porque em v1 `remote_checksum_verified` podia ser verdade só porque o carimbo do próprio uploader voltou no `HEAD`;
+3. **baixa o artefato off-site** e casa os bytes que chegaram com o digest do manifesto;
+4. **decifra** e casa o PLAINTEXT com `manifest.sha256` — conferência que nenhuma outra parte do sistema faz;
+5. **restaura** num banco efêmero isolado (`maia_drill_<stamp>_<id do drill>` — o discriminador existe pelo mesmo motivo que o do artefato na #520: dois drills no mesmo segundo colidiriam, e uma colisão aqui restauraria dentro de um banco velho e reportaria falso positivo);
+6. roda a **suíte de probes** ([`drill-probes.ts`](../../src/ops/backup/drill-probes.ts)): tabelas críticas presentes, seed de tenant/agent, escopo de tenant válido, integridade `mensagens→conversas`, ledger de tombstones restaurado, `transacoes` e `audit_logs` legíveis; mais dois informativos (outbox despachável, divergência de migration head);
+7. roda a **reconciliação de tombstones em dry-run** e avalia o gate `canReleaseTraffic` — é isso que transforma "o `pg_restore` saiu 0" em "este artefato poderia voltar à produção";
+8. derruba o banco e apaga cada arquivo estagiado **em `finally`**, e **prova** que sumiram: consulta `pg_database` pelo nome do banco efêmero e o filesystem por cada arquivo, **depois** de remover;
+9. grava tudo em `restore_drills` (inclusive a falha e qualquer resíduo) e audita.
+
+**Fail-closed em cada passo.** Sem candidato, manifesto irrecuperável, checksum que não casa, probe obrigatório falhando, plano de reconciliação `ok:false` **ou teardown que não se provou** ⇒ drill `failed`. **Qualquer drill falhado torna a readiness FAIL** — inclusive o `cleanup_failed`, que não é "nada é restaurável" e sim "é restaurável, e sobrou uma cópia da produção no host" (§4.1). A readiness é deliberadamente conservadora aqui: ela lê só o `status`; quem diz qual dos dois aconteceu é a linha em `restore_drills`.
+
+Se o perfil **exige** off-site (`BACKUP_OFFSITE_REQUIRED`), drillar a cópia local **não** conta: o drill falha com `no_offsite_candidate`. O artefato que importa depois de perder o host é o remoto, e só buscá-lo prova que ele é legível, decifrável e inteiro.
+
+### 4.1 O vocabulário de status (leia antes de interpretar um drill)
+
+`passed` significa **duas** coisas provadas, não uma: o artefato é restaurável **e** o host ficou limpo. São dois eixos independentes na mesma linha de `restore_drills`:
+
+| `status` | `failure_code` | `cleanup_status` | O que aconteceu, e o que fazer |
+|---|---|---|---|
+| `passed` | `null` | `clean` | Certificado. Nada a fazer. |
+| `failed` | `cleanup_failed` | `unsafe` | **Restore bem-sucedido com resíduo inseguro.** O artefato *é* restaurável — download, checksum, decifragem, `pg_restore`, probes e reconciliação passaram — mas o drill não conseguiu provar que removeu o que criou. Há (ou pode haver) uma cópia completa da produção neste host. **Vá removê-la** (§4.2). |
+| `failed` | qualquer código de restore | `clean` | Nada é sabidamente restaurável. O host está limpo. Investigue o backup. |
+| `failed` | qualquer código de restore | `unsafe` | Os dois problemas juntos, e nenhum esconde o outro: o `failure_code` é o diagnóstico do **restore**, o `cleanup_status` é o estado do **host**. Duas remediações diferentes. |
+| `skipped` | `backups_disabled` | `clean` | O único não-veredito legítimo. A readiness ignora. |
+| `running` | — | `unknown` | O processo morreu no meio. **Ninguém conferiu** — trate como resíduo possível (§4.2). |
+
+Por que `cleanup_failed` não é "só mais um código de falha": um drill verde que deixa uma cópia da produção para trás é **pior** que um drill vermelho, porque ensina o operador a confiar num sinal nocivo. Até a PR #541 o teardown só logava, e o drill terminava `passed` com o banco efêmero de pé. Por isso, também, o resíduo é **auditado numa ação própria** (`restore_drill_unsafe_residue`) e dispara um **alerta próprio**, com assunto diferente do alerta de "nada é restaurável": as duas emergências pedem ações opostas.
+
+### 4.2 Resíduo: como achar e remover
+
+O drill nunca imprime o caminho nem o nome do banco (esses textos vão para log de operador e transcript de CI). Os `kind` do resíduo mapeiam assim:
+
+| `kind` | Onde está | Como remover |
+|---|---|---|
+| `drill_database` | Um banco no mesmo cluster, nome `maia_drill_<stamp>_<12 hex do drill_id>` | `psql -d postgres -c 'DROP DATABASE "<nome>" WITH (FORCE)'` |
+| `decrypted_plaintext` | `BACKUP_DIR/restore-drill/<backup_id>.plain` — **dados de todos os tenants em claro**. Também é este o `kind` do `.artifact` quando o perfil roda com `encryption.mode='none'`: aí a cópia "como armazenada" já é o dump em claro | `shred -u` (ou `rm`) o arquivo |
+| `staged_artifact` | `BACKUP_DIR/restore-drill/<backup_id>.artifact` — cópia cifrada baixada do off-site | `rm` o arquivo |
+
+`reason` diz o que se sabe: `removal_failed` (a remoção deu erro), `still_present` (a remoção **reportou sucesso** e o recurso continua lá) ou `unverified` (não foi possível provar a ausência). Os três exigem a mesma ação — alguém precisa ir olhar.
+
+**Um download interrompido também deixa resíduo, e ele É inventariado.** O drill reivindica o caminho de staging **antes** de chamar o fetch, não depois que ele retorna (`src/ops/backup/drill.ts`, §"OWNERSHIP IS REGISTERED BEFORE THE FETCH"). Isso importa porque `downloadBackupObjectToFile` abre o destino com `wx` — o arquivo passa a existir no momento da abertura — e um stream que morre no meio deixa bytes lá. Até a review round-2 da PR #541 o registro acontecia só no retorno do fetch, então um `artifact_fetch_failed` varria um inventário vazio e o drill terminava `failed` + `cleanup_status='clean'`: uma certificação de host limpo com um dump parcial da produção no workspace, sem auditoria de resíduo e sem alerta. Hoje esse caso aparece como `staged_artifact` (ou `decrypted_plaintext`, se o perfil não cifra) com o `reason` correspondente.
+
+```sql
+-- Drills com resíduo (índice parcial restore_drills_unsafe_idx)
+SELECT id, started_at, status, failure_code, probes->'cleanup' AS cleanup
+FROM restore_drills WHERE cleanup_status = 'unsafe' ORDER BY started_at DESC;
+
+-- Drills que morreram no meio: ninguém conferiu o teardown
+SELECT id, started_at FROM restore_drills
+WHERE status = 'running' AND started_at < now() - interval '6 hours';
+```
+
+```bash
+# Bancos efêmeros de drill que sobraram no cluster, de qualquer época
+psql -d postgres -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) \
+  FROM pg_database WHERE datname LIKE 'maia\_drill\_%'"
+# Arquivos estagiados que sobraram
+ls -la "$BACKUP_DIR/restore-drill/"
+```
+
+Depois de limpar, rode o drill de novo: a linha antiga fica como evidência (é append-only), e o que a readiness lê é o drill mais recente.
+
+```sql
+-- O último drill, com o detalhe dos probes
+SELECT started_at, source, status, duration_ms, failure_code, cleanup_status,
+       tombstones_pending, probes
+FROM restore_drills ORDER BY started_at DESC LIMIT 5;
+```
+
+`tombstones_pending > 0` num drill que passou é **normal e informativo**: é quanto um restore real ainda deveria reaplicar antes de liberar tráfego (§3.6). `probes->'reconciliation'->>'release_without_replay'` é o veredito do gate com nada reaplicado.
+
+Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, `no_drill_candidate`, `no_offsite_candidate`, `manifest_version_unsupported`, `manifest_unverifiable`, `artifact_fetch_failed`, `artifact_checksum_mismatch`, `decryption_failed`, `plaintext_checksum_mismatch`, `isolation_failed`, `restore_failed`, `probe_failed`, `reconciliation_blocked`, `cleanup_failed` (§4.1 — o único que significa "o artefato é restaurável, mas o host não está limpo"), `drill_not_recorded`, `unexpected`.
+
+**Requisitos operacionais.** O drill precisa de (a) `pg_restore` no host, (b) permissão de `CREATE DATABASE`/`DROP DATABASE` no cluster, (c) espaço em `BACKUP_DIR/restore-drill` para o artefato baixado **e** o plaintext decifrado. Esse diretório contém, enquanto o drill roda, uma cópia **em claro** dos dados de todos os tenants — ele fica sob `BACKUP_DIR` de propósito (permissões e disco que o operador já trata como sensíveis), nunca em `/tmp`. Se faltar qualquer uma das três, o drill termina com `cleanup_status = 'unsafe'` e **não** certifica nada: os logs `restore_drill.database_not_dropped` / `restore_drill.staged_file_not_removed` carregam o `kind` e o `reason`, e §4.2 diz o que remover.
+
+O drill não está no cron por decisão: ele cria e derruba um banco, e o intervalo esperado (`BACKUP_RESTORE_DRILL_INTERVAL_HOURS`) é semanal. Agende-o pelo cron do host, ou chame `runRestoreDrillJob()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)) de um job próprio — ele já disputa o lock `maia_ops_restore_drill`, então dois drills nunca correm juntos.
 
 ## 5. Dados fora do PostgreSQL
 
@@ -118,6 +198,41 @@ Restaura o artefato num banco efêmero, roda probes e derruba o banco em `finall
 - **Drill de decrypt**: `verifyDecryptable` streama pelo decipher e descarta a saída — prova que a chave existe e a tag confere, sem materializar dado pessoal.
 - **Chave indisponível**: o backup **falha fechado**. Não existe fallback plaintext. Restaure o acesso à chave; não desligue a criptografia para "destravar" o job.
 - A chave nunca aparece em log, manifesto, métrica ou mensagem de erro — só o `key_id`.
+
+### 6.1 Chave de ASSINATURA do manifesto (HMAC) — outra chave, outra rotação
+
+A chave que **cifra** o artefato (`BACKUP_ENCRYPTION_KEYRING`, acima) não é a que **assina o manifesto**. A assinatura usa o mesmo material HMAC da auditoria — `RUNTIME_TRACE_HMAC_MASTER_SECRET` + `RUNTIME_TRACE_HMAC_KEY_VERSION` — porque ele já vive **fora** do artefato, que é o requisito da issue §5. O envelope grava qual versão assinou, em `backup_manifests.signature_key_version`.
+
+**Ao rotacionar (política de 90 dias), retenha o segredo anterior — pelo menos enquanto existir recovery point dentro da retenção.**
+
+```bash
+# Antes: RUNTIME_TRACE_HMAC_KEY_VERSION=1, MASTER_SECRET=<v1>
+RUNTIME_TRACE_HMAC_KEY_VERSION=2
+RUNTIME_TRACE_HMAC_MASTER_SECRET=<v2>
+RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS='1=<v1>'   # formato versao=segredo;versao=segredo
+```
+
+A verificação resolve a chave **pela versão que o envelope declara** (`src/ops/backup/manifest-keyring.ts`, que reutiliza o keyring de `src/control-plane/runtime-trace/lib/hmac.ts` — um parser só, para os dois consumidores). Um backup assinado com a v1 continua verificável depois da rotação para a v2.
+
+**Sintoma de ter retirado o segredo anterior cedo demais:** o drill falha com `manifest_unverifiable` em artefatos que estão intactos no disco e dentro da retenção. O que distingue esse caso de um manifesto adulterado é o log — mesmo `failure_code`, `reason` diferente (o código é deliberadamente único: um verificador não é oráculo para atacante):
+
+```bash
+# "esta instalação não tem mais a chave" → recoloque o segredo em PREV_MASTER_SECRETS
+grep restore_drill.manifest_unverifiable <log> | grep key_version_unknown
+# "a assinatura não bate com o conteúdo" → investigue adulteração, NÃO mexa em chave
+grep restore_drill.manifest_unverifiable <log> | grep signature_mismatch
+```
+
+O log carrega o `signature_key_version` declarado (um inteiro, não-sensível), então dá para casar direto com a linha em `backup_manifests`:
+
+```sql
+SELECT r.id, r.finished_at, m.signature_key_version
+  FROM backup_runs r JOIN backup_manifests m ON m.backup_run_id = r.id
+ WHERE r.state IN ('completed','completed_degraded')
+ ORDER BY r.finished_at DESC LIMIT 20;
+```
+
+Versão desconhecida **falha fechado**: nunca há fallback para "tenta com a chave atual". Um fallback esconderia o diagnóstico real e ainda aceitaria um envelope que renomeou a própria versão de chave.
 
 ## 7. Retenção, legal hold e LGPD
 
@@ -160,8 +275,10 @@ O único lugar onde mtime sobrevive é a varredura de `.partial` órfão — que
 
 Registrado aqui para que ninguém opere com expectativa errada:
 
-- O drill (`npm run restore:test`) ainda usa o dump **local** mais recente e não baixa/decifra o artefato off-site nem escreve em `restore_drills`.
 - O executor de retenção existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes de dado — mensagens, mídia, memória, traces — só existem o mecanismo de decisão e o schema; não há job que os varra.
-- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco.
-- A reconciliação de tombstones pós-restore é **manual** (passo 3.6): o planejador e o gate estão implementados e testados, mas não há job que os execute automaticamente.
-- Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado.
+- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco. (Issue #536, eixo 2.)
+- A **reaplicação** de tombstones pós-restore continua manual (passo 3.6). O drill agora executa `planReconciliation` e `canReleaseTraffic` em **dry-run** contra o snapshot restaurado, então a proteção deixou de depender de alguém lembrar de *avaliar* — mas não existe executor que *reaplique* as exclusões, porque reaplicar exige o mesmo mecanismo de exclusão por classe que o eixo 2 vai construir. (Issue #536, eixo 3.)
+- Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
+- O drill não roda por cron dentro da aplicação — ver §4 para como agendá-lo.
+- O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.
+- Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.

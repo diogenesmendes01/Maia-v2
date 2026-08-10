@@ -20,8 +20,11 @@
  *
  * Retierizar classificadores (ex.: `intent_classifier` roda hoje no modelo
  * MAIN apesar do adapter se chamar "Haiku") é mudança de critério funcional e
- * está FORA do escopo desta issue — ver "Fora de escopo" em #508. O tier
- * declarado aqui reproduz o modelo efetivo de hoje; a correção é follow-up.
+ * continua FORA de escopo — a #508 a excluiu e a #534 confirmou: baixar o tier
+ * de um classificador muda a qualidade da classificação, e mudar qualidade sem
+ * medir acurácia antes/depois é trocar custo por defeito silencioso. Precisa de
+ * issue própria, com medição. O tier declarado aqui reproduz o modelo efetivo
+ * de hoje.
  */
 import type { LLMTier, LLMWorkload } from './types.js';
 
@@ -30,13 +33,13 @@ export type WorkloadPolicy = {
    * Tier usado quando o caller não passa `tier` explícito — que é o caso de
    * praticamente todos.
    *
-   * ESTE é o lugar onde o tier é declarado. A issue #508 pede que "todos os
-   * callers declarem workload e tier"; a declaração de tier acontece aqui, uma
-   * vez por workload, em vez de repetida em cada call site. O raciocínio
-   * completo está em `src/lib/llm/types.ts`, no campo `tier` de
-   * `LLMGatewayRequest` — resumo: o call site é exatamente quem não tem
-   * contexto para escolher classe de modelo, e foi assim que 13 módulos
-   * acabaram com slug fixo no código.
+   * ESTE é o lugar onde o tier é declarado, por decisão do owner registrada na
+   * issue #534: o call site declara workload, o backend resolve tier, provider,
+   * modelo e fallback, e exceções são políticas governadas — esta tabela —
+   * nunca overrides livres do caller. A #508 pedia "todos os callers declaram
+   * workload e tier"; a declaração acontece aqui, uma vez por workload, em vez
+   * de repetida (e divergente) em cada call site. Raciocínio completo em
+   * `src/lib/llm/types.ts`, no campo `tier` de `LLMGatewayRequest`.
    */
   default_tier: LLMTier;
   /**

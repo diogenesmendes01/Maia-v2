@@ -20,10 +20,14 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
+import { useExclusivePairingQueue } from './helpers/pairing-queue-lock.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
+
+// A fila de `channel_line_state` é global por desenho — ver o helper.
+useExclusivePairingQueue();
 
 const T = 'i518-tenant';
 const T2 = 'i518-tenant-b';

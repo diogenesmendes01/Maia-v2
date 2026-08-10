@@ -3286,11 +3286,24 @@ export const restore_drills = pgTable(
     probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
     tombstones_pending: integer('tombstones_pending'),
     failure_code: text('failure_code'),
+    /**
+     * Estado do HOST depois do teardown (migration 112): `clean` = banco
+     * efêmero e arquivos estagiados provadamente removidos; `unsafe` = alguma
+     * cópia da produção ficou (ou não se pôde provar que não ficou);
+     * `unknown` = o processo morreu antes de conferir. Eixo INDEPENDENTE de
+     * `failure_code`, para que falha de probe e falha de teardown não se
+     * mascarem.
+     */
+    cleanup_status: text('cleanup_status').notNull().default('unknown'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     recent_idx: index('restore_drills_recent_idx').on(t.status, t.started_at),
     run_idx: index('restore_drills_run_idx').on(t.backup_run_id),
+    /** Parcial: o que se consulta em incidente é "há resíduo?" (migration 112). */
+    unsafe_idx: index('restore_drills_unsafe_idx')
+      .on(t.started_at)
+      .where(sql`cleanup_status = 'unsafe'`),
   }),
 );
 
@@ -3451,3 +3464,119 @@ export type DataTombstone = typeof data_tombstones.$inferSelect;
 export type NewDataTombstone = typeof data_tombstones.$inferInsert;
 export type RetentionRun = typeof retention_runs.$inferSelect;
 export type NewRetentionRun = typeof retention_runs.$inferInsert;
+
+// ── 108 (issue #519) — saga durável de onboarding ────────────────────────────
+// A migration 108 é a fonte de verdade das CHECKs (estados válidos, rejeição
+// dos literais 'default'/'system', escopo obrigatório por kind). Aqui
+// declaramos apenas os tipos que o Drizzle precisa.
+//
+// `version` é o token de optimistic concurrency: todo comando informa a versão
+// que leu e o UPDATE só casa com ela — dois operadores no mesmo passo produzem
+// UM avanço e um `version_conflict`.
+export const onboarding_runs = pgTable(
+  'onboarding_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    kind: text('kind').notNull(),
+    // NULL só enquanto o recurso ainda não existe (bootstrap global antes de
+    // resolver o tenant; qualquer run antes de criar o agente).
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    state: text('state').notNull().default('created'),
+    current_step: text('current_step'),
+    version: integer('version').notNull().default(1),
+    created_by: text('created_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    last_error_code: text('last_error_code'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    configuration_contract_version: text('configuration_contract_version').notNull(),
+    schema_version: text('schema_version').notNull(),
+    // migration 113 — a criação da run é um COMANDO MUTÁVEL e portanto
+    // idempotente: o ledger de criação vive na própria run (não há tabela
+    // filha onde guardá-lo antes de a run existir). Unicidade em
+    // `onboarding_runs_creation_key_uq` por (kind, tenant, hash).
+    creation_idempotency_key_hash: text('creation_idempotency_key_hash'),
+    creation_payload_hash: text('creation_payload_hash'),
+    // migration 113 — ponto de retomada de `failed_retryable`. Sem eles o
+    // estado autorizava QUALQUER passo anterior; com eles a máquina de estados
+    // só admite o retry do passo que falhou e as remediações declaradas.
+    failed_step: text('failed_step'),
+    resume_state: text('resume_state'),
+  },
+  (t) => ({
+    tenantStateIdx: index('onboarding_runs_tenant_state_idx').on(
+      t.tenant_id,
+      t.state,
+      t.created_at,
+    ),
+  }),
+);
+
+// Append-only. Sustenta reconstrução e diagnóstico do workflow; NÃO substitui
+// `audit_log` (governança). `summary` é sanitizado no código — nada de segredo,
+// telefone, e-mail ou QR entra aqui.
+export const onboarding_events = pgTable(
+  'onboarding_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    step: text('step').notNull(),
+    event_type: text('event_type').notNull(),
+    actor_id: text('actor_id').notNull(),
+    correlation_id: text('correlation_id'),
+    idempotency_key_hash: text('idempotency_key_hash'),
+    from_state: text('from_state'),
+    to_state: text('to_state'),
+    summary: jsonb('summary').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    runIdx: index('onboarding_events_run_idx').on(t.run_id, t.created_at),
+    tenantIdx: index('onboarding_events_tenant_idx').on(t.tenant_id, t.created_at),
+  }),
+);
+
+// Ledger de idempotência: o resultado persistido de cada comando concluído.
+// UNIQUE (run_id, step, idempotency_key_hash) — mesma chave devolve o mesmo
+// resultado; chave igual com payload divergente é conflito.
+export const onboarding_step_results = pgTable(
+  'onboarding_step_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    step: text('step').notNull(),
+    idempotency_key_hash: text('idempotency_key_hash').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    // migration 113 — o ledger guarda RESULTADOS CONCLUSIVOS TIPADOS, não só
+    // sucessos: uma negativa de governança e um cancelamento também são
+    // conclusões, e sem elas o retry da mesma chave devolvia `version_conflict`
+    // / `run_terminal` em vez da resposta anterior.
+    outcome_kind: text('outcome_kind').notNull().default('success'),
+    outcome_code: text('outcome_code'),
+    outcome_message: text('outcome_message'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    keyUq: uniqueIndex('onboarding_step_results_key_uq').on(
+      t.run_id,
+      t.step,
+      t.idempotency_key_hash,
+    ),
+    runIdx: index('onboarding_step_results_run_idx').on(t.run_id, t.created_at),
+  }),
+);
+
+export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+export type NewOnboardingRunRow = typeof onboarding_runs.$inferInsert;
+export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
+export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
+export type OnboardingStepResultRow = typeof onboarding_step_results.$inferSelect;
+export type NewOnboardingStepResultRow = typeof onboarding_step_results.$inferInsert;

@@ -2,7 +2,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '../../src/db/schema.js';
 
 /**
- * Issue #511 — TURN-CONTEXT QUERY BUDGET.
+ * Issue #511 — TURN-CONTEXT QUERY BUDGET (kept as the SLOPE guard).
+ *
+ * Issue #525 moved the exact-count budget to
+ * `tests/unit/turn-context-round-trips.spec.ts`, which counts the loader-backed
+ * read set and enforces `TURN_ROUND_TRIP_BUDGET`. This file keeps the property
+ * #511 was really about — the cost does not grow with scope size — plus the
+ * `resolveScope` batching and its cross-tenant counterfactual.
+ *
+ * The numbers here are the FALLBACK numbers: these mocks stub only
+ * `entidadesRepo.byIds` + `entityStatesRepo.byIds`, so the loader takes its
+ * two-read compatibility path. Production stubs `byIdsWithState` and pays one.
  *
  * "Reduce queries by at least 50%" is meaningless without a number, so this
  * spec is the number. It counts every repository round-trip the turn-context
@@ -20,13 +30,15 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  * the prompt builder, one `profilesRepo.byId` per permission in `resolveScope`,
  * and one behavioural-hint query per scope. That slope was the N+1.
  *
- * Current budget, asserted below:
+ * Current budget, asserted below (loader compatibility path):
  *
  *   entities |  1  |  10  |  100  | vs baseline
  *   ---------+-----+------+-------+------------
- *   prompt   | 13  |  13  |   13  |
+ *   prompt   | 12  |  12  |   12  |
  *   scope    |  2  |   2  |    2  |
- *   turn     | 15  |  15  |   15  | -12% / -57% / -93%
+ *   turn     | 14  |  14  |   14  | -18% / -60% / -93%
+ *
+ * With the batched entity read wired (production), the same turn is 13.
  *
  * The slope is now ZERO — the property that actually matters, because it is
  * what stops one "elephant" tenant from monopolising the fixed 10-connection
@@ -247,13 +259,16 @@ describe('#511 baseline — turn-context query cost', () => {
      *   memoryEntryRepo.findRelevant                    1
      *   behavioralHintRepo.findActiveForScopes          1  (was: 1 per scope)
      *   capabilitiesSkillRepo.listAll                   1
-     *   capabilityGapsRepo.listByLevel                  1
      *   procedureExecutionsRepo.findActiveForConversa   1
-     *   capabilityGapsRepo.listByLevels                 1
+     *   capabilityGapsRepo.listByLevels                 1  (was TWO gap reads)
      *                                                  --
-     *                                                  13, independent of N
+     *                                                  12, independent of N
+     *
+     * Issue #525 removed `capabilityGapsRepo.listByLevel`: the mentionable-only
+     * list is a filter over the mentionable-OR-proposed rows this already
+     * loads, so the second statement bought nothing.
      */
-    const PROMPT_BUDGET = 13;
+    const PROMPT_BUDGET = 12;
 
     it.each([1, 10, 100])('costs a CONSTANT %i-independent budget for %i entities', async (n) => {
       await buildPrompt({
@@ -389,9 +404,9 @@ describe('#511 baseline — turn-context query cost', () => {
 
   describe('whole turn', () => {
     it.each([
-      [1, 15],
-      [10, 15],
-      [100, 15],
+      [1, 14],
+      [10, 14],
+      [100, 14],
     ])('for %i entities the turn costs %i queries', async (n, expected) => {
       permissoesFixture = entityIds(n).map(
         (id) =>

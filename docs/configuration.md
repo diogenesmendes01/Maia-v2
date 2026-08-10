@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 168 | 18 |
+| `runtime` | 173 | 19 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
@@ -105,6 +105,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `CLAUDE_TIMEOUT_MS` | number | `30000` | não | `runtime` | sim | Timeout (ms) de chamada de LLM. |
 | `LLM_TURN_DEADLINE_MS` | number | `120000` | não | `runtime` | sim | Orçamento wall-clock TOTAL (ms) de uma chamada de LLM quando o caller não declara um deadline: cobre todas as tentativas, backoff, fallback e parsing. Instante absoluto, nunca reiniciado a cada retry (issue #508). O caller pode passar um deadline mais curto; nunca um mais longo na prática, já que o gateway usa o menor tempo restante. |
 | `LLM_DAILY_BUDGET_USD` | number | `0` | não | `runtime` | sim | Teto de gasto diário de LLM por tenant+agent, em USD. Imposto no LLM Gateway ANTES de qualquer requisição ao provider (issue #508); estouro rejeita a chamada com erro não retentável. 0 desliga a quota. |
+| `LLM_CIRCUIT_MODE` | `off` \| `shadow` \| `enforce` | `shadow` | não | `runtime` | sim | Postura BASE do disjuntor de LLM (issue #534, decisão do owner na revisão): off \| shadow \| enforce. `shadow` (default) roda a máquina de estados inteira e mede o que faria, sem NUNCA recusar chamada; `enforce` recusa de fato; `off` desliga e não guarda estado. Promover para `enforce` só depois de uma passagem por staging com would_open/would_reject medidos. NÃO é o kill switch: mudar aqui exige restart. A alavanca de incidente, sem restart e sem deploy, é o override por Redis — ver docs/runbooks/operational.md §3.1. |
 | `DECISION_ENGINE_BUDGET_MS` | number | `2500` | não | `runtime` | sim | Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification. |
 
 ### Transcrição de áudio (Whisper)
@@ -177,6 +178,10 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `TELEGRAM_BOT_TOKEN` | string | — | sim | `runtime`, `backup`, `maintenance` | sim | Token do bot do Telegram. Obrigatória quando ALERT_CHANNELS contém telegram. |
 | `TELEGRAM_CHAT_ID` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Chat de destino dos alertas no Telegram. Obrigatória quando ALERT_CHANNELS contém telegram. |
 | `DLQ_ALERT_THRESHOLD` | number | `10` | não | `runtime`, `maintenance` | sim | Tamanho da DLQ que dispara alerta. |
+| `MAIA_OTLP_TRACES_ENDPOINT` | string | — | não | `runtime` | sim | Endpoint OTLP/HTTP de traces (ex.: http://collector:4318/v1/traces). Vazio = exporter INERTE: nenhum span é amostrado, montado ou enviado, e o hot path fica idêntico ao anterior (#535). |
+| `MAIA_OTLP_TRACES_HEADERS` | string | — | sim | `runtime` | sim | Headers extras do exporter OTLP no formato k=v,k=v (tipicamente autenticação do collector). Segredo — nunca aparece em log nem em /metrics. |
+| `MAIA_OTLP_SAMPLE_RATIO` | number | `0.05` | não | `runtime` | sim | Fração de turnos amostrados para OTLP (0..1). A decisão é DERIVADA do trace_id, então gateway e worker chegam ao mesmo veredito sem propagar bit de amostragem — um turno amostrado é amostrado inteiro. |
+| `MAIA_OTLP_SERVICE_NAME` | string | `maia-runtime` | não | `runtime` | sim | Valor de `service.name` no resource OTLP. |
 
 ### Backup / restore
 

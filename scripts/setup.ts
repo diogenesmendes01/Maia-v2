@@ -19,6 +19,7 @@ import {
   PRIMARY_TENANT_ID,
   PRIMARY_AGENT_ID,
 } from '@/db/tenant-context.js';
+import { evaluateAgentReadiness } from '@/onboarding/readiness.js';
 
 const rl = readline.createInterface({ input, output });
 const ask = (q: string) => rl.question(q + ' ');
@@ -183,8 +184,45 @@ async function main() {
   });
 
   rl.close();
+
+  // Issue #519 — este wizard SEMEIA o domínio (self_state, dona, entidades,
+  // contas, permissões) do home single-tenant `primary`. Ele nunca provisionou
+  // governança de agente — papel, política de canal, linha, packs — e por isso
+  // dizer "done" no fim era, na melhor das hipóteses, ambíguo: o operador
+  // partia para `npm run dev` sem saber se o agente sequer podia responder.
+  //
+  // Passamos a imprimir o READINESS CANÔNICO, calculado pelo backend a partir
+  // do MESMO contrato que a ativação e o `maia doctor` (#517) usam. O setup
+  // não decide prontidão — ele apenas mostra o veredito de quem decide.
+  await reportPrimaryReadiness();
+
   console.log('done — agora rode: npm run dev');
   process.exit(0);
+}
+
+async function reportPrimaryReadiness(): Promise<void> {
+  console.log('');
+  console.log(`readiness de ${PRIMARY_TENANT_ID}/${PRIMARY_AGENT_ID}`);
+  console.log('----------------------------------------');
+  try {
+    const readiness = await evaluateAgentReadiness({
+      tenant_id: PRIMARY_TENANT_ID,
+      agent_id: PRIMARY_AGENT_ID,
+    });
+    for (const check of readiness.checks) {
+      const mark = check.status === 'pass' ? 'ok  ' : check.severity === 'blocking' ? 'FALHA' : 'aviso';
+      console.log(`  ${mark} ${check.code}${check.status === 'pass' ? '' : ` — ${check.message}`}`);
+      if (check.status !== 'pass') console.log(`         → ${check.remediation}`);
+    }
+    console.log('');
+    console.log(readiness.ready ? '  agente PRONTO para operar' : '  agente NÃO está pronto (veja as FALHAs acima)');
+    console.log(`  fingerprint de configuração: ${readiness.configuration_fingerprint.slice(0, 16)}…`);
+  } catch (err) {
+    // O relatório é informativo: uma falha aqui não pode invalidar o seed que
+    // já commitou. Fail-closed na MENSAGEM (nunca dizemos "pronto"), não no
+    // processo.
+    console.log(`  ! não foi possível avaliar readiness: ${(err as Error).message}`);
+  }
 }
 
 main().catch((err) => {

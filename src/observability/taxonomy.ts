@@ -97,6 +97,59 @@ export const SPAN_NAMES: readonly SpanName[] = Object.freeze(
 /** Terminal status of a span. Mirrors the metric `status` enum. */
 export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
 
+/**
+ * Issue #535 §1 — is this span actually EMITTED, or only declared?
+ *
+ * The whole complaint the issue opens with is that "quem ler
+ * `src/observability/taxonomy.ts` pode concluir que a cobertura é maior do que
+ * é". A declaration that nothing emits reads exactly like coverage. Rather
+ * than deleting the roadmap (the tree IS the target shape, and every name in
+ * it is referenced by the SLI narrative), the gap is made MACHINE-CHECKABLE:
+ * each span declares whether an instrumentation site exists today, and
+ * `tests/unit/observability/tracer.spec.ts` pins the `emitted` set exactly.
+ *
+ * So the file can no longer overstate coverage: adding a name here without an
+ * emitter fails a test, and shipping an emitter without flipping the flag
+ * fails the same test.
+ *
+ * Current emitters:
+ *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
+ *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
+ *                            `observability/instrumentation.ts`
+ */
+export type SpanEmission = 'emitted' | 'declared';
+
+export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.freeze({
+  [SPAN.TURN]: 'emitted',
+  [SPAN.INGRESS_NORMALIZE]: 'declared',
+  [SPAN.INGRESS_PERSIST]: 'declared',
+  [SPAN.QUEUE_WAIT]: 'emitted',
+  [SPAN.IDENTITY_RESOLVE]: 'declared',
+  [SPAN.AUDIENCE_RESOLVE]: 'declared',
+  [SPAN.PRETURN_GRAPH]: 'declared',
+  [SPAN.ROLE_SELECT]: 'declared',
+  [SPAN.PROCEDURE_SELECT]: 'declared',
+  [SPAN.RISK_CLASSIFY]: 'declared',
+  [SPAN.DECISION_EVALUATE]: 'declared',
+  [SPAN.CONTEXT_LOAD]: 'declared',
+  [SPAN.PROMPT_RENDER]: 'declared',
+  [SPAN.REACT_ITERATION]: 'declared',
+  [SPAN.LLM_REQUEST]: 'declared',
+  [SPAN.TOOL_DISPATCH]: 'emitted',
+  [SPAN.PERMISSION_CHECK]: 'declared',
+  [SPAN.CONSTITUTIONAL_CHECK]: 'declared',
+  [SPAN.IDEMPOTENCY_CLAIM]: 'declared',
+  [SPAN.HANDLER_EXECUTE]: 'declared',
+  [SPAN.OUTBOUND_COMMIT]: 'declared',
+  [SPAN.WHATSAPP_SEND]: 'declared',
+  [SPAN.TURN_COMPLETE]: 'declared',
+});
+
+/** The spans an instrumentation site exists for today. */
+export const EMITTED_SPANS: readonly SpanName[] = Object.freeze(
+  SPAN_NAMES.filter((s) => SPAN_EMISSION[s] === 'emitted'),
+);
+
 // ============================================================================
 // 2. Metrics — the minimum set (issue #514 §5)
 // ============================================================================
@@ -130,12 +183,79 @@ export const METRIC = {
 
   // --- context / db --------------------------------------------------------
   CONTEXT_LOAD_MS: 'maia_context_load_ms',
+  /** Turn-context slices assembled, by slice + outcome (issue #535 §2). */
+  CONTEXT_SLICES: 'maia_context_slices_total',
+  /**
+   * pg pool saturation, `state` ∈ total|idle|waiting|max (issue #535 §2).
+   * `waiting` climbing while `idle` is 0 IS the saturation incident.
+   */
   DB_POOL: 'maia_db_pool',
+
+  // --- scheduler (issue #535 §2) ------------------------------------------
+  /** How late the oldest DUE-but-unclaimed unit of work is, per `queue`. */
+  SCHEDULER_LAG_MS: 'maia_scheduler_lag_ms',
+  /** How many units of work are due and still unclaimed, per `queue`. */
+  SCHEDULER_BACKLOG: 'maia_scheduler_backlog',
 
   // --- llm -----------------------------------------------------------------
   LLM_CALLS: 'maia_llm_calls_total',
   LLM_TOKENS: 'maia_llm_tokens_total',
   LLM_LATENCY_MS: 'maia_llm_latency_ms',
+  /**
+   * Circuit-breaker state per `(provider, workload)`, `state` ∈
+   * closed|half_open|open (issue #534). Exactly one series is 1 — same shape as
+   * `LIFECYCLE_STATE` and `WHATSAPP_SESSIONS`, and for the same reason: a
+   * single gauge encoding 0/1/2 cannot be read in PromQL without a legend, and
+   * makes "never exercised" indistinguishable from "closed".
+   *
+   * No `tenant_id`/`agent_id`: the breaker measures the health of a shared
+   * external dependency, not tenant data. Attribution of each *refusal* lives
+   * on `LLM_CALLS{status="circuit_open"}`, which is tenant-scoped.
+   */
+  LLM_CIRCUIT_STATE: 'maia_llm_circuit_state',
+  /** Breaker state changes. `state` is the state entered; `reason` is why. */
+  LLM_CIRCUIT_TRANSITIONS: 'maia_llm_circuit_transitions_total',
+  /** Calls refused by an open/half-open breaker, i.e. load actually shed. */
+  LLM_CIRCUIT_SHORT_CIRCUITED: 'maia_llm_circuit_short_circuited_total',
+  /**
+   * Effective breaker POSTURE, `state` ∈ off|shadow|enforce (issue #534,
+   * owner review). Same pair-of-series shape as `LLM_CIRCUIT_STATE`: exactly
+   * one is 1. `mode` is not on `ALLOWED_LABEL_KEYS` and a new key there is a
+   * separate governance decision, so the posture rides the `state` key — the
+   * two are told apart by the metric name, never by a label.
+   *
+   * This is the series that answers "is the control actually enforcing right
+   * now?", which is not answerable from `LLM_CIRCUIT_STATE` alone: a breaker
+   * reading `open` in shadow mode is refusing nothing.
+   */
+  LLM_CIRCUIT_MODE: 'maia_llm_circuit_mode',
+  /**
+   * SHADOW-ONLY twin of the `open` transition: the breaker entered `open`
+   * while refusing nothing. `reason` matches `LLM_CIRCUIT_TRANSITIONS`.
+   *
+   * Exists because `LLM_CIRCUIT_TRANSITIONS{state="open"}` fires identically
+   * in shadow and enforce, so across a mixed fleet it cannot answer "would it
+   * have opened when it shouldn't?" — which is the whole question a staging
+   * pass has to answer before promotion.
+   */
+  LLM_CIRCUIT_WOULD_OPEN: 'maia_llm_circuit_would_open_total',
+  /**
+   * SHADOW-ONLY twin of `LLM_CALLS{status="circuit_open"}`: one increment per
+   * CALL that an enforcing breaker would have refused and shadow let through.
+   * `state` is the breaker state that would have produced the refusal.
+   *
+   * Tenant-attributed like the real refusal counter (emitted from inside the
+   * caller's ALS scope) — the breaker's STATE is deliberately global, but
+   * every refusal, real or simulated, stays attributable to who ate it.
+   */
+  LLM_CIRCUIT_WOULD_REJECT: 'maia_llm_circuit_would_reject_total',
+  /**
+   * Kill-switch usage. `state` is the posture that was forced, `reason` ∈
+   * applied|expired|cleared|rejected|adopted. A lever that can be pulled
+   * without a deploy MUST leave a trace that alerting can see; the matching
+   * `llm_gateway.circuit_mode_override` log line carries actor and reason.
+   */
+  LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 
   // --- tools ---------------------------------------------------------------
   TOOL_DISPATCH: 'maia_tool_dispatch_total',
@@ -145,11 +265,54 @@ export const METRIC = {
   OUTBOUND_COMMITTED: 'maia_outbound_committed_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
+  /**
+   * WhatsApp session presence, `state` ∈ connected|disconnected (issue #535
+   * §2). Exactly one series is 1 — the pair makes "no session at all" and
+   * "session down" distinguishable from a missing scrape.
+   */
   WHATSAPP_SESSIONS: 'maia_whatsapp_sessions',
+  /** Seconds since the WhatsApp socket last dropped. Growing = healthy. */
+  WHATSAPP_SESSION_AGE_SECONDS: 'maia_whatsapp_session_age_seconds',
 
   // --- workers / schedulers ------------------------------------------------
   WORKER_RUN: 'maia_worker_run_total',
   WORKER_DURATION_MS: 'maia_worker_duration_ms',
+
+  // --- onboarding saga / agent readiness (issue #519) ----------------------
+  //
+  // Declaradas aqui — e não emitidas direto por `@/lib/metrics` — porque os
+  // rótulos destas séries vêm de entrada do CHAMADOR (`reason_code` do
+  // cancelamento, código de erro do passo, código de check reprovado). Emitir
+  // por fora do sanitizador punha texto livre (e potencialmente PII) num label
+  // e abria cardinalidade ilimitada. Aqui o vocabulário é FECHADO
+  // (`ONBOARDING_REASONS`, `ONBOARDING_STEP_VALUES`,
+  // `READINESS_CHECK_CODE_VALUES`) e o texto livre fica em auditoria/log.
+  /** Runs de onboarding iniciadas, por `kind`. */
+  ONBOARDING_RUN_STARTED: 'maia_onboarding_run_started_total',
+  /** Runs canceladas, por `reason` (vocabulário fechado). */
+  ONBOARDING_RUN_CANCELLED: 'maia_onboarding_run_cancelled_total',
+  /** Runs que chegaram a `active`, por `kind`. */
+  ONBOARDING_RUN_COMPLETED: 'maia_onboarding_run_completed_total',
+  /** Passos commitados, por `step`. */
+  ONBOARDING_STEP_COMPLETED: 'maia_onboarding_step_completed_total',
+  /** Passos recusados/falhos, por `step` + `reason`. */
+  ONBOARDING_STEP_FAILED: 'maia_onboarding_step_failed_total',
+  /** Replays do ledger de idempotência, por `step`. */
+  ONBOARDING_IDEMPOTENCY_REPLAY: 'maia_onboarding_idempotency_replay_total',
+  /** Duração de um passo da saga. */
+  ONBOARDING_STEP_DURATION_MS: 'maia_onboarding_step_duration_ms',
+  /** Checks BLOQUEANTES reprovados, por `check_code`. */
+  AGENT_READINESS_FAILED: 'maia_agent_readiness_failed_total',
+
+  // --- ops / restore drill (issue #536) ------------------------------------
+  /**
+   * Drills de restore que terminaram com `cleanup_status='unsafe'` — o teardown
+   * deixou cópia da produção no host. SEM labels: o drill é uma operação da
+   * plataforma, não de um tenant, e o "quem/qual drill" pertence a
+   * `restore_drills` e ao log, não a uma série. Declarado aqui a pedido da
+   * integração, para o trabalho de drill que roda em paralelo nesta leva.
+   */
+  RESTORE_DRILL_UNSAFE_RESIDUE: 'maia_restore_drill_unsafe_residue_total',
 
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */
@@ -158,6 +321,23 @@ export const METRIC = {
   LABEL_REJECTED: 'maia_metric_label_rejected_total',
   /** A label value exceeded its cardinality budget and fell into overflow. */
   LABEL_CARDINALITY_OVERFLOW: 'maia_metric_label_cardinality_overflow_total',
+
+  // --- OTLP exporter self-health (issue #535 §1) ---------------------------
+  /** Spans handed to the OTLP transport and accepted by the collector. */
+  OTLP_SPANS_EXPORTED: 'maia_otlp_spans_exported_total',
+  /**
+   * Spans that never reached the collector, by `reason` (`queue_full`,
+   * `not_sampled`, `transport`, `http_status`, `shutdown`, `attributes`).
+   * An exporter that silently loses spans is worse than no exporter: the gaps
+   * read as "nothing happened".
+   */
+  OTLP_SPANS_DROPPED: 'maia_otlp_spans_dropped_total',
+  /** Wall time of one export request. */
+  OTLP_EXPORT_MS: 'maia_otlp_export_duration_ms',
+  /** Spans currently waiting in the batch queue. */
+  OTLP_QUEUE_DEPTH: 'maia_otlp_queue_depth',
+  /** A span attribute was dropped/sanitized by the span-attribute gate. */
+  SPAN_ATTRIBUTE_REJECTED: 'maia_span_attribute_rejected_total',
 } as const;
 
 export type MetricName = (typeof METRIC)[keyof typeof METRIC];
@@ -215,6 +395,12 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   'phase',
   'state',
   'required',
+  // saga de onboarding (issue #519) — os dois são conjuntos FECHADOS e
+  // pequenos, declarados abaixo em `ONBOARDING_STEP_VALUES` e
+  // `READINESS_CHECK_CODE_VALUES`. Nenhum dos dois aceita texto do chamador:
+  // o emissor colapsa qualquer valor fora do vocabulário.
+  'step',
+  'check_code',
 ]);
 
 /**
@@ -341,6 +527,126 @@ export const ENUM_VALUES = Object.freeze({
   required: ['true', 'false'] as const,
 });
 
+// ---------------------------------------------------------------------------
+// 3.1 Onboarding saga — vocabulários FECHADOS (issue #519, review do PR #541)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sentinela para qualquer valor fora de um vocabulário fechado.
+ *
+ * Difere de `CARDINALITY_OVERFLOW_VALUE` de propósito: overflow é "o budget
+ * estourou", isto é "o chamador mandou algo que não está no contrato". O
+ * emissor colapsa ANTES do sanitizador, então um `reason_code` livre nunca
+ * chega a existir como série — e o motivo original continua inteiro na
+ * auditoria e no log estruturado, que é onde texto livre pertence.
+ */
+export const CLOSED_VOCABULARY_FALLBACK = 'other';
+
+/**
+ * Valores admitidos no label `step`. Espelho EXATO de `ONBOARDING_STEPS`
+ * (`src/onboarding/state-machine.ts`) — a igualdade é pinada por
+ * `tests/unit/onboarding/metrics-taxonomy.spec.ts`, para que um passo novo não
+ * possa ser emitido sem passar por esta declaração.
+ */
+export const ONBOARDING_STEP_VALUES: readonly string[] = Object.freeze([
+  'provision_tenant',
+  'provision_admin',
+  'provision_agent',
+  'configure_profile',
+  'apply_capability_packs',
+  'configure_role',
+  'declare_channel',
+  'start_pairing',
+  'confirm_channel_ready',
+  'evaluate_readiness',
+  'activate',
+]);
+
+/**
+ * Valores admitidos no label `reason` das séries de onboarding.
+ *
+ * União de: os códigos de erro tipados da saga (`ONBOARDING_ERROR_CODES`), o
+ * `internal_error` do sanitizador de exceção, os motivos de recusa vindos da
+ * fila de comandos de #518, e um pequeno vocabulário de cancelamento operado
+ * pelo console. `reason_code` de cancelamento é ENTRADA DO OPERADOR: qualquer
+ * coisa fora desta lista vira `CLOSED_VOCABULARY_FALLBACK`, e o texto original
+ * fica só em `onboarding_runs.last_error_code`, no evento e na auditoria.
+ */
+export const ONBOARDING_REASONS: readonly string[] = Object.freeze([
+  // erros tipados da saga
+  'invalid_scope',
+  'forbidden_scope_literal',
+  'scope_mismatch',
+  'invalid_transition',
+  'run_not_found',
+  'run_terminal',
+  'run_expired',
+  'unknown_step',
+  'version_conflict',
+  'idempotency_payload_mismatch',
+  'missing_idempotency_key',
+  'forbidden',
+  'tenant_not_found',
+  'tenant_disabled',
+  'agent_not_found',
+  'duplicate_tenant',
+  'duplicate_agent',
+  'duplicate_channel',
+  'role_not_found',
+  'channel_not_found',
+  'channel_not_paired',
+  'readiness_blocked',
+  'activation_precondition_failed',
+  'kind_not_implemented',
+  'internal_error',
+  // recusas da fila de comandos de #518
+  'pairing_in_progress',
+  'pairing_rejected',
+  // cancelamento operado pelo console
+  'operator_abort',
+  'expired',
+  CLOSED_VOCABULARY_FALLBACK,
+]);
+
+/**
+ * Valores admitidos no label `check_code`. Espelho EXATO de
+ * `READINESS_CHECK_CODES` (`src/onboarding/readiness.ts`), pinado pelo mesmo
+ * teste que pina os passos.
+ */
+export const READINESS_CHECK_CODE_VALUES: readonly string[] = Object.freeze([
+  'tenant_exists',
+  'tenant_enabled',
+  'agent_exists',
+  'agent_belongs_to_tenant',
+  'profile_active',
+  'capability_grant_present',
+  'required_packs_granted',
+  'tool_permissions_coherent',
+  'default_role_resolved',
+  'channel_declared',
+  'channel_policy_resolved',
+  'channel_policy_role_active',
+  'channel_ownership_proven',
+  'channel_online',
+  'schema_ready',
+  'governance_no_blocking_pending',
+  'agent_activated',
+]);
+
+/**
+ * Colapsa um valor num vocabulário fechado. É a defesa que roda ANTES do
+ * sanitizador de labels: o allowlist de CHAVES não diz nada sobre o VALOR, e
+ * `reason` tem budget 60 — sem isto, 60 `reason_code` livres viravam 60 séries
+ * permanentes antes de o overflow sequer começar a proteger.
+ */
+export function closedVocabulary(
+  value: string | null | undefined,
+  vocabulary: readonly string[],
+): string {
+  if (typeof value !== 'string') return CLOSED_VOCABULARY_FALLBACK;
+  return vocabulary.includes(value) ? value : CLOSED_VOCABULARY_FALLBACK;
+}
+
 /**
  * Per-label cardinality budget. Once a (metric, key) pair has seen this many
  * distinct values, further values collapse into `CARDINALITY_OVERFLOW_VALUE`
@@ -359,6 +665,10 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   stage: 60,
   span: 60,
   reason: 60,
+  // Vocabulários fechados e pequenos: 11 passos e 17 códigos de check. O
+  // budget é o teto do contrato, não uma estimativa.
+  step: 20,
+  check_code: 24,
 });
 
 /** Budget applied to any allowed key without an explicit entry above. */
@@ -372,3 +682,65 @@ export const SANITIZED_VALUE = '__sanitized__';
 
 /** Max characters kept for any label value. */
 export const MAX_LABEL_VALUE_LENGTH = 64;
+
+// ============================================================================
+// 4. Span attributes (issue #535 §1)
+// ============================================================================
+
+/**
+ * Span attributes are NOT metric labels, and the difference is deliberate.
+ *
+ * A metric label mints a time series forever, so `labels.ts` bans every
+ * correlation id. A span attribute lives on ONE exported span: it costs no
+ * series, and carrying `trace_id`/`turn_id` there is exactly what
+ * `governance-observability.md` §4.4c prescribes ("high-cardinality
+ * correlation ids live in logs and traces, never in labels").
+ *
+ * What does NOT change between the two surfaces: message content, phone
+ * numbers, JIDs, e-mails, person names, URLs and raw error strings are
+ * forbidden in BOTH. The OTLP exporter ships to a third-party collector, so if
+ * anything the value guard here matters more than the label one.
+ *
+ * `SPAN_ATTRIBUTE_KEYS` = every metric label key (so instrumentation can pass
+ * one bag to both surfaces) PLUS the enumerated correlation ids below.
+ */
+export const SPAN_CORRELATION_KEYS: ReadonlySet<string> = new Set([
+  'trace_id',
+  'turn_id',
+  'attempt',
+  'attempt_id',
+  'conversa_id',
+  'root_trace_id',
+]);
+
+export const SPAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  ...ALLOWED_LABEL_KEYS,
+  ...SPAN_CORRELATION_KEYS,
+  // span-only numerics — bounded magnitudes, never identifiers
+  'duration_ms',
+  'attempt_count',
+  'item_count',
+  'byte_count',
+  'sampled',
+]);
+
+/**
+ * Deny list for span attributes. Same PII/content vocabulary as the metric
+ * deny list MINUS the correlation ids that spans are allowed to carry — the
+ * whole point of a trace is to join on those.
+ */
+export const FORBIDDEN_SPAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set(
+  [...FORBIDDEN_LABEL_KEYS].filter((k) => !SPAN_CORRELATION_KEYS.has(k)),
+);
+
+export const FORBIDDEN_SPAN_KEY_SUBSTRINGS: readonly string[] = Object.freeze(
+  FORBIDDEN_KEY_SUBSTRINGS.filter(
+    (frag) => frag !== 'trace_id' && frag !== 'conversa' && frag !== 'conversation',
+  ),
+);
+
+/** Max characters kept for any span attribute value. */
+export const MAX_SPAN_ATTRIBUTE_VALUE_LENGTH = 128;
+
+/** Max attributes kept on one span — a bag, not a payload channel. */
+export const MAX_SPAN_ATTRIBUTES = 24;

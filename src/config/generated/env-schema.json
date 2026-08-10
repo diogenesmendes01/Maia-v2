@@ -497,6 +497,26 @@
         "0"
       ]
     },
+    "LLM_CIRCUIT_MODE": {
+      "type": "string",
+      "description": "Postura BASE do disjuntor de LLM (issue #534, decisão do owner na revisão): off | shadow | enforce. `shadow` (default) roda a máquina de estados inteira e mede o que faria, sem NUNCA recusar chamada; `enforce` recusa de fato; `off` desliga e não guarda estado. Promover para `enforce` só depois de uma passagem por staging com would_open/would_reject medidos. NÃO é o kill switch: mudar aqui exige restart. A alavanca de incidente, sem restart e sem deploy, é o override por Redis — ver docs/runbooks/operational.md §3.1.",
+      "x-maia-type": "string",
+      "x-maia-group": "llm",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "off",
+        "shadow",
+        "enforce"
+      ],
+      "default": "shadow",
+      "examples": [
+        "shadow"
+      ]
+    },
     "DECISION_ENGINE_BUDGET_MS": {
       "type": "string",
       "description": "Orçamento wall-clock total (ms) do Decision Engine. Abaixo de ~2000ms o hop Haiku estoura e cai no fallback ask_clarification.",
@@ -1077,6 +1097,61 @@
       "default": "10",
       "examples": [
         "10"
+      ]
+    },
+    "MAIA_OTLP_TRACES_ENDPOINT": {
+      "type": "string",
+      "description": "Endpoint OTLP/HTTP de traces (ex.: http://collector:4318/v1/traces). Vazio = exporter INERTE: nenhum span é amostrado, montado ou enviado, e o hot path fica idêntico ao anterior (#535).",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "http://otel-collector:4318/v1/traces"
+      ]
+    },
+    "MAIA_OTLP_TRACES_HEADERS": {
+      "type": "string",
+      "description": "Headers extras do exporter OTLP no formato k=v,k=v (tipicamente autenticação do collector). Segredo — nunca aparece em log nem em /metrics.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true
+    },
+    "MAIA_OTLP_SAMPLE_RATIO": {
+      "type": "string",
+      "description": "Fração de turnos amostrados para OTLP (0..1). A decisão é DERIVADA do trace_id, então gateway e worker chegam ao mesmo veredito sem propagar bit de amostragem — um turno amostrado é amostrado inteiro.",
+      "x-maia-type": "number",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "0.05",
+      "examples": [
+        "0.05"
+      ]
+    },
+    "MAIA_OTLP_SERVICE_NAME": {
+      "type": "string",
+      "description": "Valor de `service.name` no resource OTLP.",
+      "x-maia-type": "string",
+      "x-maia-group": "alerts",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "maia-runtime",
+      "examples": [
+        "maia-runtime"
       ]
     },
     "BACKUP_DIR": {

@@ -14,6 +14,7 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/state-machine.ts` | The 12-state lifecycle and `classifyOutcome` — the terminal verdict is COMPUTED from evidence |
 | `src/ops/backup/checksum.ts` | Streaming SHA-256 + timing-safe digest comparison |
 | `src/ops/backup/manifest.ts` | Versioned, HMAC-signed manifest: provenance, checksum, coverage, tombstone watermark |
+| `src/ops/backup/manifest-keyring.ts` | Resolves the manifest-signing secret BY `signature_key_version`, reusing the runtime-trace keyring, so an HMAC rotation does not strand recovery points still inside their retention window |
 | `src/ops/backup/encryption.ts` | Client-side envelope encryption (AES-256-GCM), key rotation, decrypt drill |
 | `src/ops/backup/redaction.ts` | Secret/PII minimisation for everything that reaches a log, manifest or audit row |
 | `src/ops/backup/single-flight.ts` | Namespaced global advisory locks for backup / drill / retention / reconciliation |
@@ -23,6 +24,9 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/backup/upload-deadline.ts` | Cancellable upload: aborts, awaits settlement, reaps any orphan object |
 | `src/ops/backup/retention.ts` | Manifest-driven, hold-aware artifact deletion with confirmation and a conclusive outcome |
 | `src/ops/backup/rpo.ts` | RPO/RTO readiness: level + evidence + remediation per check |
+| `src/ops/backup/drill.ts` | `runRestoreDrill` — fetch the OFF-SITE artifact, bind it to its signed manifest, decrypt, restore in isolation, probe, reconcile in dry-run, tear down in `finally` and PROVE the teardown removed everything (issue #536) |
+| `src/ops/backup/drill-probes.ts` | The probe suite the drill grades a restored snapshot with. Pure graders; counts and booleans only |
+| `src/ops/backup/drill-adapters.ts` | Real IO behind the drill's ports (S3 GET to file, decrypt, `CREATE/DROP DATABASE`, `pg_restore`, probe queries) |
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
 | `src/ops/retention/legal-hold.ts` | Deterministic hold evaluator (backend decides) |
 | `src/ops/retention/tombstones.ts` | Pseudonymised, signed ledger + post-restore reconciliation gate |
@@ -43,14 +47,17 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | Add a manifest field | `manifest.ts` (`backupManifestSchema`); bump `MANIFEST_VERSION` only when an existing field's MEANING changes |
 | Add a data class | `retention/data-classes.ts` + the matrix doc; state its `dpo_open_question` |
 | Add a readiness check | `rpo.ts` — every check must carry evidence and remediation |
+| Add a restore-drill probe | `drill-probes.ts`: a single-row SQL plus a PURE grader. `required: true` only when its failure means the snapshot is genuinely unusable; the query must return counts/booleans, never a row value |
 | Support another off-site provider | `src/workers/backup-s3.ts` (protocol-compatible) or a new adapter behind `BackupPorts.upload`/`verifyRemote` |
 
 ## Public surface
 
 - `runVerifiedBackup(ports, profile, trigger)` — the shared runner (`src/workers/backup.ts` and `scripts/backup.ts` are its only callers)
+- `runRestoreDrill(ports, profile)` — the shared drill (`runRestoreDrillJob` in `src/workers/backup.ts`, reached from `scripts/restore-test.ts`)
 - `evaluateBackupReadiness(input)` — the RPO/RTO verdict for `maia doctor` / readiness
 - `resolveRetention(classId, policy)` / `evaluateHold(holds, query)` — the two purge gates
 - `planReconciliation(input)` / `canReleaseTraffic(plan, applied)` — the post-restore anti-resurrection gate
+- `deriveTombstoneSecret(master)` — the ledger's keying material. Domain-separated from the manifest-signing key and FROZEN: changing the label invalidates every existing tombstone HMAC, and an unverifiable ledger blocks every restore
 
 ## Invariants
 
@@ -59,8 +66,22 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 - Key material never appears in a return value, error, log, metric or manifest; only `key_id` does.
 - Deletion is irreversible, so every destructive path is dry-run by default (`RETENTION_DRY_RUN=true`) and blocked entirely until a DPO-approved `RETENTION_POLICY` is configured.
 - A restore may not release traffic until every tombstone newer than the artifact's watermark has been re-applied and confirmed.
+- **A drill is `passed` only when the host is PROVEN clean.** The drill is the one job that deliberately materialises a full plaintext copy of production, so a teardown that merely did not throw is not evidence: `drill.ts` re-checks the ephemeral database against `pg_database` and each staged file against the filesystem AFTER removing them, and an absence it cannot prove counts exactly like a proven leak. The teardown verdict is a SECOND axis (`restore_drills.cleanup_status`, migration 112), never folded into `failure_code` — a probe failure and a residue can happen together, ask for opposite remediations, and must both be readable from the row.
+- **The drill claims a staged path BEFORE it writes to it, never after.** Registering the destination on the way out of a call — after `fetchArtifact` returned, after `decrypt` returned — only ever records writes that SUCCEEDED, and every one of those calls streams: a transfer that dies mid-way leaves bytes at a path the teardown then walks past. The sweep would report `clean` truthfully about an inventory that was itself incomplete, so the `failure === null && cleanup.status !== 'clean'` promotion never fires and the drill certifies a clean host over a partial production dump (under `encryption.mode='none'`, a cleartext one). Claiming the slot up front is fail-closed and independent of any adapter's `catch`: a slot that was never written is proven absent by `fileExists` and grades `clean` anyway, because the sweep's authority is the host, not the bookkeeping. The local recovery point is the one path the drill must NOT claim — it is read in place (`ephemeral: false`).
+- **Manifest verification resolves the key by the version the ENVELOPE names.** `backup_manifests.signature_key_version` is a selector, not a label: `verifyManifest` takes a `ManifestKeyring` and never a bare secret, because a verifier holding one secret only verifies manifests signed with the key it happens to hold now — so the first HMAC rotation would turn every recovery point still inside its retention window into `manifest_unverifiable`, making the rotation itself the event that destroys restorability. `manifest-keyring.ts` reuses the runtime-trace keyring (`hmacMasterSecretForVersion`) rather than re-parsing `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS`: two parsers for the same env var drift, and a drifted keyring is an unrestorable backup. An unknown version fails closed as `key_version_unknown` — never a fallback to the current key, which would both hide the diagnosis and accept an envelope that renamed its own version. A selector that is not a positive integer is refused before it reaches key material at all.
+
+### The drill's status vocabulary
+
+| Outcome | `status` | `failure_code` | `cleanup_status` | Means |
+|---|---|---|---|---|
+| Certified | `passed` | `null` | `clean` | The artifact is restorable AND nothing was left on the host. |
+| Successful restore, unsafe residue | `failed` | `cleanup_failed` | `unsafe` | The artifact **is** restorable; a copy of production data is (or may be) still on the host. A human must remove it. Not a certification — see the runbook. |
+| Restore unproven | `failed` | the restore-phase code | `clean` | Nothing is known to be restorable; the host is clean. |
+| Both | `failed` | the restore-phase code | `unsafe` | Two independent problems in one row; neither masks the other. |
+| Nothing to drill | `skipped` | `backups_disabled` | `clean` | The only legitimate non-verdict. `readReadinessFacts` ignores it. |
+| Process died mid-drill | `running` | — | `unknown` | Nobody checked. Treat as possible residue. |
 
 ## Related
 
 - Runbook: [`docs/runbooks/backup-restore.md`](../../runbooks/backup-restore.md)
-- Migrations: `migrations/101_backup_runs_manifests.sql`, `migrations/102_data_lifecycle.sql`
+- Migrations: `migrations/101_backup_runs_manifests.sql`, `migrations/102_data_lifecycle.sql`, `migrations/112_restore_drill_cleanup_status.sql`

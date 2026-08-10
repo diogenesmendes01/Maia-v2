@@ -226,6 +226,164 @@ d('#511 batch repos — isolation and constant cost', () => {
     }, 60_000);
   });
 
+  /**
+   * Issue #525 — `entidadesRepo.byIdsWithState`, the LEFT JOIN that replaced the
+   * `byIds` + `entityStatesRepo.byIds` pair in the turn-context loader.
+   *
+   * Two isolation surfaces, not one, because the join has two tables. The
+   * `entidades` half is filtered in the WHERE clause; the `entity_states` half
+   * is filtered in the JOIN condition, because `entity_states`'s PK is
+   * `entidade_id` alone — putting that predicate in the WHERE would drop the
+   * whole row instead of just the state, turning a foreign state into a missing
+   * ENTITY. Both must hold, so both are asserted.
+   */
+  describe('entidadesRepo.byIdsWithState (#525)', () => {
+    it('never returns another tenant/agent entity, even when handed its ids', async () => {
+      const c = await pool.connect();
+      const tk = newTracker();
+      try {
+        const mine = await mkEntityWithState(c, A, '111.00');
+        tk.entidades.push(mine);
+        const theirs = await mkEntityWithState(c, B, '999.00');
+        tk.entidades.push(theirs);
+
+        const { entidadesRepo } = await loadRepos();
+        const rows = await runWithTenantContext(A, () =>
+          entidadesRepo.byIdsWithState([mine, theirs]),
+        );
+
+        expect(rows.map((r) => r.entidade.id)).toEqual([mine]);
+        expect(rows[0]!.state?.saldo_consolidado).toBe('111.00');
+      } finally {
+        await cleanup(c, tk);
+        c.release();
+      }
+    });
+
+    it('never returns another tenant/agent STATE for an entity it does own', async () => {
+      const c = await pool.connect();
+      const tk = newTracker();
+      try {
+        // Entity owned by A, state row deliberately stamped with B's tuple —
+        // the shape a mis-scoped JOIN condition would surface as A's balance.
+        const ent = await c.query<{ id: string }>(
+          `INSERT INTO entidades(tenant_id, agent_id, nome, tipo)
+           VALUES ($1, $2, 'i525-mixed', 'pj') RETURNING id`,
+          [A.tenant_id, A.agent_id],
+        );
+        const id = ent.rows[0]!.id;
+        tk.entidades.push(id);
+        await c.query(
+          `INSERT INTO entity_states(entidade_id, tenant_id, agent_id, saldo_consolidado)
+           VALUES ($1, $2, $3, '999.00')`,
+          [id, B.tenant_id, B.agent_id],
+        );
+
+        const { entidadesRepo } = await loadRepos();
+        const rows = await runWithTenantContext(A, () => entidadesRepo.byIdsWithState([id]));
+
+        // The ENTITY still comes back (A owns it), so the scope block keeps its
+        // name; the foreign STATE does not, so no balance is rendered.
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.entidade.id).toBe(id);
+        expect(rows[0]!.state).toBeNull();
+      } finally {
+        await cleanup(c, tk);
+        c.release();
+      }
+    });
+
+    it('returns exactly what the two separate reads returned', async () => {
+      const c = await pool.connect();
+      const tk = newTracker();
+      try {
+        const withState = await mkEntityWithState(c, A, '10.00');
+        tk.entidades.push(withState);
+        const noState = await c.query<{ id: string }>(
+          `INSERT INTO entidades(tenant_id, agent_id, nome, tipo)
+           VALUES ($1, $2, 'i525-nostate', 'pj') RETURNING id`,
+          [A.tenant_id, A.agent_id],
+        );
+        tk.entidades.push(noState.rows[0]!.id);
+        const ids = [withState, noState.rows[0]!.id];
+
+        const { entidadesRepo, entityStatesRepo } = await loadRepos();
+        const [joined, ents, states] = await runWithTenantContext(A, async () => [
+          await entidadesRepo.byIdsWithState(ids),
+          await entidadesRepo.byIds(ids),
+          await entityStatesRepo.byIds(ids),
+        ]);
+
+        expect(joined.map((r) => r.entidade.id).sort()).toEqual(ents.map((e) => e.id).sort());
+        expect(
+          joined.filter((r) => r.state !== null).map((r) => r.state!.entidade_id),
+        ).toEqual(states.map((s) => s.entidade_id));
+        // An entity with no state row is present with `state: null`, which is
+        // what lets the scope block render its name while the state block skips
+        // it — the exact behaviour the two-read version had.
+        expect(joined.find((r) => r.entidade.id === noState.rows[0]!.id)!.state).toBeNull();
+      } finally {
+        await cleanup(c, tk);
+        c.release();
+      }
+    });
+
+    it('costs ONE query for 1, 10 and 100 entities', async () => {
+      const c = await pool.connect();
+      const tk = newTracker();
+      try {
+        for (let i = 0; i < 100; i++) {
+          tk.entidades.push(await mkEntityWithState(c, A, `${i}.00`));
+        }
+        const { entidadesRepo } = await loadRepos();
+
+        const counts: number[] = [];
+        for (const n of [1, 10, 100]) {
+          const ids = tk.entidades.slice(0, n);
+          await runWithTenantContext(A, () =>
+            runWithQueryCounter(async (counter) => {
+              const rows = await entidadesRepo.byIdsWithState(ids);
+              expect(rows).toHaveLength(n);
+              counts.push(counter.count);
+            }),
+          );
+        }
+        // One statement for BOTH tables — the pair it replaces cost two.
+        expect(counts).toEqual([1, 1, 1]);
+      } finally {
+        await cleanup(c, tk);
+        c.release();
+      }
+    }, 60_000);
+  });
+
+  /**
+   * Issue #525 — `entidadesRepo.byIds` used to match on `entidades.id` alone.
+   * Every live caller fed it ids that came from `resolveScope`, so no leak was
+   * reachable in practice — but an id is not an isolation boundary, and this
+   * read renders entity NAMES straight into the system prompt.
+   */
+  describe('entidadesRepo.byIds (#525 scoping)', () => {
+    it('never returns another tenant/agent entity, even when handed its ids', async () => {
+      const c = await pool.connect();
+      const tk = newTracker();
+      try {
+        const mine = await mkEntityWithState(c, A, '1.00');
+        tk.entidades.push(mine);
+        const theirs = await mkEntityWithState(c, B, '2.00');
+        tk.entidades.push(theirs);
+
+        const { entidadesRepo } = await loadRepos();
+        const rows = await runWithTenantContext(A, () => entidadesRepo.byIds([mine, theirs]));
+
+        expect(rows.map((e) => e.id)).toEqual([mine]);
+      } finally {
+        await cleanup(c, tk);
+        c.release();
+      }
+    });
+  });
+
   describe('profilesRepo.byIds', () => {
     it('never returns another tenant/agent profile', async () => {
       const c = await pool.connect();

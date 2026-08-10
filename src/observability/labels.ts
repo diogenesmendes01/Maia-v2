@@ -74,7 +74,12 @@ const PII_VALUE_PATTERNS: readonly RegExp[] = Object.freeze([
   /\bhttps?:\/\//i, // URL
 ]);
 
-function looksLikePii(value: string): boolean {
+/**
+ * Exported (issue #535) so the span-attribute gate reuses the SAME value
+ * patterns as the metric-label gate. Two copies of a PII regex list is how one
+ * of them silently falls behind the other.
+ */
+export function looksLikePii(value: string): boolean {
   return PII_VALUE_PATTERNS.some((re) => re.test(value));
 }
 

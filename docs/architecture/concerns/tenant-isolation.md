@@ -8,6 +8,29 @@
 
 Single-tenant runtime today (`tenant_id='default'`, `agent_id='default'` seeded by migration P0) does not relax the invariant — it makes it *latent*. Provisioning a second tenant must be a configuration change, never a code change.
 
+### 1.1 The one bounded exception: `system` operational state
+
+The invariant governs **data**. It does not govern the health of a shared external dependency, which belongs to nobody. That category — `system` operational state — is the single sanctioned exception, defined in [ADR 0002](../decisions/0002-external-dependency-health-is-system-state.md).
+
+It is narrow on purpose. State qualifies only when **all four** hold:
+
+1. it is not derived from tenant data;
+2. the thing it measures is genuinely shared — every tenant reaches the same instance, with the same credentials, endpoint and quota;
+3. only failures attributable to the dependency feed it, so no caller can move it with input it controls;
+4. every individual decision made from it is still attributed with `tenant_id + agent_id`.
+
+Conditions 3 and 4 are what make a global aggregate legitimate instead of merely convenient: no tenant can *cause* another's outcome, and every outcome remains traceable to who received it.
+
+**Current members of this category — the complete list:**
+
+| State | Where | Why it qualifies |
+|---|---|---|
+| LLM circuit-breaker state per `(provider, workload)` | `src/lib/llm/circuit-breaker.ts` | Health of a third-party API shared by all tenants. Only `provider_5xx`/`network`/`timeout` feed it; every refusal emits `maia_llm_requests_total{status="circuit_open"}` with tenant and agent. |
+
+Adding to this table requires an ADR entry arguing the candidate against all four conditions. A code comment is **not** sufficient to except this invariant — if the only justification lives next to the code, a reviewer reading this document is right to treat the divergence as a bug.
+
+**This exception is not a fairness mechanism.** If one tenant's traffic degrades another's while the dependency is healthy, that is noisy-neighbour, and the answer is a per-tenant bulkhead or rate limit — never fragmenting a shared-health control, which would break condition 2 and destroy its sample.
+
 ## 2. Why it matters
 
 The platform's value proposition is *"agents learn from experience, but only evolve inside governance, scope, and evidence"* — and scope is enforced here. A single cross-tenant leak invalidates the entire learning system: a fact learned about tenant A could be recalled while answering tenant B, and the agent has no way to detect the contamination. Governance audits can't catch what isolation didn't separate in the first place.
@@ -94,6 +117,9 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 | `tests/unit/control-plane/knowledge-state-machine/ksm-rules-cross-tenant.spec.ts` | KSM transitions scoped |
 | `tests/property/knowledge-state-machine.spec.ts` | Property-based KSM invariants |
 | `tests/integration/p10a-knowledge-lifecycle.spec.ts` | KSM lifecycle stays scoped |
+| `tests/integration/onboarding-leak.spec.ts` | Saga de onboarding (#519): leitura, escrita, retomada, cancelamento e ativação escopadas; CHECK contra `'default'`/`'system'`. **Ainda não está no script `test:leak`** |
+| `tests/unit/onboarding/readiness-facts-scope.spec.ts` | DB-free: o loader de readiness compila `tenant_id + agent_id` em cada `WHERE` |
+| `tests/unit/onboarding/readiness.spec.ts` | Readiness nunca compõe profile de um agente com canal de outro (nem entre tenants) |
 
 There is a dedicated npm script `npm run test:leak` that runs the leak suite — invoke it on any change that touches state or context.
 

@@ -9,8 +9,13 @@
 #
 # Metric sources:
 #   - turn / queue / trace : src/observability/taxonomy.ts (METRIC.*)
-#   - LLM                  : src/lib/claude.ts + src/observability/llm-metrics.ts
+#   - LLM                  : src/lib/llm/telemetry.ts (the gateway owns them
+#                            since #508 — the old src/observability/llm-metrics.ts
+#                            named here no longer exists)
 #   - runtime trace        : src/control-plane/runtime-trace/
+#   - pool / sessão / scheduler / OTLP (#535)
+#                          : src/observability/runtime-collectors.ts,
+#                            src/observability/otlp-exporter.ts
 #
 # Multi-replica note: `maia_queue_depth` and `maia_queue_oldest_job_age_ms` are
 # scrape-time gauges over the SHARED Redis queue, so every replica reports the
@@ -337,8 +342,14 @@ groups:
             Quebre por `reason` (rate_limit / overloaded / auth / timeout).
             Runbook: docs/runbooks/observability-slo.md §4.9
 
+      # `maia_llm_requests_total` e NÃO `maia_llm_calls_total`: a série legada
+      # carrega apenas provider/model/status, nunca teve `reason`, e
+      # `status="error"` exclui rate limit — `statusForKind('rate_limit')`
+      # devolve `'rate_limit'`, que é valor de primeira classe. O seletor antigo
+      # (`{status="error",reason="rate_limit"}`) não casava NADA: este alerta
+      # nunca disparou desde que foi escrito. Ver `src/lib/llm/telemetry.ts`.
       - alert: MaiaLlmRateLimited
-        expr: increase(maia_llm_calls_total{status="error",reason="rate_limit"}[5m]) > 10
+        expr: increase(maia_llm_requests_total{status="rate_limit"}[5m]) > 10
         for: 5m
         labels:
           severity: warning
@@ -347,6 +358,67 @@ groups:
           summary: "Provider LLM aplicando rate limit"
           description: |
             Runbook: docs/runbooks/observability-slo.md §4.9
+
+      # --- disjuntor de LLM: postura + sombra (#534, revisão do owner) -------
+      #
+      # Três alertas com propósitos DIFERENTES. Não colapse em um só:
+      #
+      #  1. o disjuntor está recusando DE VERDADE (só em `enforce`);
+      #  2. alguém mexeu no kill switch;
+      #  3. o kill switch ficou ligado e ninguém lembrou.
+      #
+      # O `and on() maia_llm_circuit_mode{state="enforce"} == 1` do primeiro é
+      # o detalhe que evita acordar plantão à toa: `maia_llm_circuit_state`
+      # marca `open` também em `shadow`, onde nada está sendo recusado. Alertar
+      # em `state="open"` sem qualificar a postura é confundir medição com
+      # incidente.
+      - alert: MaiaLlmCircuitOpenEnforcing
+        expr: |
+          (maia_llm_circuit_state{state="open"} == 1)
+          and on() (maia_llm_circuit_mode{state="enforce"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM ABERTO e recusando ({{ $labels.provider }}/{{ $labels.workload }})"
+          description: |
+            Chamadas estão sendo recusadas com `circuit_open`. Confirme que é o
+            provider (e não o disjuntor) antes de usar o kill switch.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # `increase(...) > 0` de propósito: QUALQUER uso da alavanca precisa
+      # aparecer. `reason="rejected"` também dispara — alguém tentando virar a
+      # chave sem conseguir é tão digno de investigação quanto alguém virando.
+      - alert: MaiaLlmCircuitModeOverridden
+        expr: increase(maia_llm_circuit_mode_overrides_total{reason=~"applied|cleared|rejected"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Kill switch do disjuntor de LLM acionado ({{ $labels.reason }} → {{ $labels.state }})"
+          description: |
+            Ator e motivo estão no log `llm_gateway.circuit_mode_override` —
+            não em label, porque são texto livre.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # O override expira sozinho (teto de 24h), então `off` por mais de uma
+      # hora é ou um incidente longo ou — o caso perigoso — alguém renovando a
+      # alavanca até ela virar configuração escondida. É assim que um controle
+      # de degradação morre sem ninguém perceber.
+      - alert: MaiaLlmCircuitDisabledTooLong
+        expr: maia_llm_circuit_mode{state="off"} == 1
+        for: 1h
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM desligado há mais de 1h"
+          description: |
+            Volte para `shadow` ou `enforce`, ou registre a decisão de manter
+            desligado. Kill switch não é postura.
+            Runbook: docs/runbooks/operational.md §3.1
 
       - alert: MaiaWhatsAppDisconnected
         expr: maia_baileys_connected == 0
@@ -369,6 +441,184 @@ groups:
           summary: "Postgres inalcançável"
           description: |
             Runbook: docs/runbooks/observability-slo.md §4.10
+
+  # ==========================================================================
+  # Issue #535 — as cinco famílias que faltavam (tool dispatch, carga de
+  # contexto, pool de banco, sessão WhatsApp, lag do scheduler) mais a saúde do
+  # próprio exporter OTLP.
+  #
+  # Regra de agregação: `maia_db_pool` e `maia_whatsapp_session_age_seconds`
+  # são estado POR PROCESSO (cada réplica tem o seu pool e o seu socket) —
+  # agregue por `instance`, nunca colapse réplicas num número só, ou uma
+  # réplica saturada some na média. O lag do scheduler lê o MESMO Postgres
+  # compartilhado, então toda réplica reporta o mesmo valor: agregue com `max`,
+  # como as gauges de fila.
+  # ==========================================================================
+  - name: maia_slo_resources
+    interval: 30s
+    rules:
+      # --- pool de banco ----------------------------------------------------
+      # Saturação = conexões em uso / teto. `waiting` subindo com esta razão
+      # perto de 1 é exaustão de pool; `waiting` subindo com a razão baixa é
+      # custo de ABERTURA de conexão, não falta de conexão — dois diagnósticos
+      # opostos que uma métrica só não separa.
+      - record: maia:db_pool_saturation:ratio
+        expr: |
+          max by (instance) (maia_db_pool{state="total"} - maia_db_pool{state="idle"})
+          /
+          clamp_min(max by (instance) (maia_db_pool{state="max"}), 1e-9)
+
+      - record: maia:db_pool_waiting:max
+        expr: max by (instance) (maia_db_pool{state="waiting"})
+
+      # --- tool dispatch ----------------------------------------------------
+      # `blocked` fica FORA do numerador de propósito: uma tool negada por
+      # governança é a plataforma funcionando, e contá-la como erro faria um
+      # grant mal configurado parecer indisponibilidade. Ela tem SLI próprio.
+      - record: maia:tool_error_ratio:rate5m
+        expr: |
+          sum(rate(maia_tool_dispatch_total{result="error"}[5m]))
+          /
+          clamp_min(sum(rate(maia_tool_dispatch_total[5m])), 1e-9)
+
+      - record: maia:tool_blocked_ratio:rate5m
+        expr: |
+          sum(rate(maia_tool_dispatch_total{result="blocked"}[5m]))
+          /
+          clamp_min(sum(rate(maia_tool_dispatch_total[5m])), 1e-9)
+
+      - record: maia:tool_duration_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, tool) (rate(maia_tool_duration_ms_bucket[5m]))
+          )
+
+      # --- carga de contexto do turno ---------------------------------------
+      - record: maia:context_load_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, stage) (rate(maia_context_load_ms_bucket[5m]))
+          )
+
+      # --- scheduler --------------------------------------------------------
+      - record: maia:scheduler_lag_ms:max
+        expr: max by (queue) (maia_scheduler_lag_ms)
+
+      - record: maia:scheduler_backlog:max
+        expr: max by (queue) (maia_scheduler_backlog)
+
+      # --- exporter OTLP ----------------------------------------------------
+      # `not_sampled` está fora do numerador: não amostrar é a POLÍTICA
+      # configurada, não perda. Perda é fila cheia, transporte ou rejeição.
+      - record: maia:otlp_drop_ratio:rate5m
+        expr: |
+          sum(rate(maia_otlp_spans_dropped_total{reason!="not_sampled"}[5m]))
+          /
+          clamp_min(
+            sum(rate(maia_otlp_spans_exported_total[5m]))
+            + sum(rate(maia_otlp_spans_dropped_total{reason!="not_sampled"}[5m])),
+            1e-9
+          )
+
+      - alert: MaiaDbPoolSaturated
+        # Os dois juntos, de propósito: saturação alta SEM ninguém esperando é
+        # uma pool ocupada e suficiente, e alertar nisso treina o operador a
+        # ignorar o alerta.
+        expr: maia:db_pool_saturation:ratio > 0.9 and maia:db_pool_waiting:max > 0
+        for: 5m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Pool do Postgres saturado com conexões em espera"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.11
+
+      - alert: MaiaDbPoolMetricsAbsent
+        expr: absent(maia_db_pool) or (maia_db_pool != maia_db_pool)
+        for: 10m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Métricas do pool ausentes/NaN — cegueira, não saúde"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.11
+
+      - alert: MaiaSchedulerLagWarning
+        expr: maia:scheduler_lag_ms:max > 60000
+        for: 5m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Trabalho agendado > 60s atrasado na fila {{ $labels.queue }}"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaSchedulerLagCritical
+        expr: maia:scheduler_lag_ms:max > 300000
+        for: 5m
+        labels:
+          severity: critical
+          slo: resource
+        annotations:
+          summary: "Trabalho agendado > 5min atrasado na fila {{ $labels.queue }}"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaSchedulerMetricsAbsent
+        # O coletor devolve NaN quando NÃO conseguiu ler o Postgres — nunca 0.
+        # Sem este alerta um scheduler cego pareceria um scheduler ocioso.
+        expr: absent(maia_scheduler_lag_ms) or (maia_scheduler_lag_ms != maia_scheduler_lag_ms)
+        for: 10m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Métricas do scheduler ausentes/NaN — cegueira, não saúde"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaWhatsAppSessionFlapping
+        # Idade que RESETA repetidamente = socket caindo e reconectando. A
+        # gauge binária não pega isso: pode estar `connected` em todo scrape.
+        expr: resets(maia_whatsapp_session_age_seconds[30m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Sessão WhatsApp reconectando repetidamente (>3 quedas em 30min)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.13
+
+      - alert: MaiaToolErrorRateHigh
+        expr: maia:tool_error_ratio:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "5% dos dispatches de tool em erro"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.14
+
+      - alert: MaiaOtlpExportFailing
+        # Alerta sobre a OBSERVABILIDADE, não sobre o produto: span perdido não
+        # afeta nenhum turno, por isso warning. Mas silenciar deixaria o
+        # waterfall com buracos que se leem como "não aconteceu".
+        expr: maia:otlp_drop_ratio:rate5m > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          slo: observability
+        annotations:
+          summary: "Exporter OTLP perdendo >10% dos spans"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.15
 
   # ==========================================================================
   # Error budget burn rate — multi-window, multi-burn (Google SRE workbook).
