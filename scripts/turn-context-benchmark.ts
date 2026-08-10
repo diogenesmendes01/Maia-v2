@@ -250,8 +250,12 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
       min_concurrent_tenants: num('min-tenants', 10),
       saturation_ms: num('saturation-ms', 60_000),
       baseline_tolerance: num('baseline-tolerance', 0.2),
-      pairs: num('pairs', 50),
-      concurrency: num('concurrency', 20),
+      // A FORMA da carga exigida vem do enunciado do dono, NÃO de `--pairs` /
+      // `--concurrency`. Derivá-la das flags tornaria o critério circular:
+      // `--pairs 4` aprovaria uma corrida de quatro tenants como se fosse o
+      // gate. Quem quiser rodar menor roda — e o gate reprova, dizendo por quê.
+      pairs: num('required-pairs', 50),
+      concurrency: num('required-concurrency', 20),
     },
     write_baseline: argv.includes('--write-baseline'),
     self_test,
@@ -303,19 +307,21 @@ export function mergeTwoPairs(reads: Array<{ section: string; ms: number }>): nu
     ['capabilities', 'gaps'],
     ['facts', 'rules'],
   ];
-  const remaining = [...reads];
-  const merged: number[] = [];
+  const remaining = reads.map((r) => ({ ...r }));
   for (const [a, b] of MERGES) {
     const ia = remaining.findIndex((r) => r.section === a);
     const ib = remaining.findIndex((r) => r.section === b);
     if (ia === -1 || ib === -1) continue;
-    const ra = remaining[ia]!;
-    const rb = remaining[ib]!;
-    merged.push(Math.max(ra.ms, rb.ms));
-    remaining.splice(Math.max(ia, ib), 1);
-    remaining.splice(Math.min(ia, ib), 1);
+    // A leitura fundida FICA NA POSIÇÃO DA PRIMEIRA das duas. Jogá-la para o
+    // fim da lista mudaria a ordem FIFO do semáforo e o modelo passaria a medir
+    // a reordenação em vez da fusão — foi o que produziu "ganho negativo" na
+    // primeira versão deste harness.
+    const keep = Math.min(ia, ib);
+    const drop = Math.max(ia, ib);
+    remaining[keep]!.ms = Math.max(remaining[ia]!.ms, remaining[ib]!.ms);
+    remaining.splice(drop, 1);
   }
-  return [...remaining.map((r) => r.ms), ...merged];
+  return remaining.map((r) => r.ms);
 }
 
 // ============================================================================
@@ -621,12 +627,18 @@ function instrument<T extends object>(obj: T, key: keyof T & string, section: st
     if (!frame) return fn.apply(obj, args);
     frame.inflight++;
     if (frame.inflight > frame.peak) frame.peak = frame.inflight;
+    // A entrada é registrada no INÍCIO, não no fim: `reads` precisa estar na
+    // ordem de ENFILEIRAMENTO para o modelo de makespan reagendar as mesmas
+    // tarefas na mesma ordem FIFO que o `ReadGate` usou. Registrar no
+    // `finally` daria a ordem de CONCLUSÃO, que é outra coisa.
+    const entry = { section, ms: 0 };
+    frame.reads.push(entry);
     const t0 = performance.now();
     try {
       return await fn.apply(obj, args);
     } finally {
       frame.inflight--;
-      frame.reads.push({ section, ms: performance.now() - t0 });
+      entry.ms = performance.now() - t0;
     }
   };
   (obj as unknown as Record<string, unknown>)[key] = wrapped;
@@ -791,21 +803,21 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
   await c.query(
     `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
                               sensitivity, proactive_use, mention_allowed)
-     SELECT $1, $2, '${PREFIX} memória de agente ' || g, 'preferencia', 'agent', NULL, 'low', true, true
+     SELECT $1, $2, '${PREFIX} memória de agente ' || g, 'preference', 'agent', NULL, 'low', true, true
      FROM generate_series(1, 25) g`,
     [tenant_id, agent_id],
   );
   await c.query(
     `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
                               sensitivity, proactive_use, mention_allowed)
-     SELECT $1, $2, '${PREFIX} memória de interlocutor ' || g, 'preferencia', 'interlocutor', $3, 'low', true, true
+     SELECT $1, $2, '${PREFIX} memória de interlocutor ' || g, 'preference', 'interlocutor', $3, 'low', true, true
      FROM generate_series(1, 15) g`,
     [tenant_id, agent_id, pessoa_id],
   );
   await c.query(
     `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
                               sensitivity, proactive_use, mention_allowed)
-     SELECT $1, $2, '${PREFIX} memória de conversa ' || g, 'preferencia', 'conversation', $3, 'low', true, true
+     SELECT $1, $2, '${PREFIX} memória de conversa ' || g, 'preference', 'conversation', $3, 'low', true, true
      FROM generate_series(1, 15) g`,
     [tenant_id, agent_id, conversa_id],
   );
@@ -838,7 +850,7 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
   await c.query(
     `INSERT INTO agent_capability_gaps(tenant_id, agent_id, capability_description, tipo, current_level,
                                        frequency_score, severity_score)
-     SELECT $1, $2, '${PREFIX} lacuna de capacidade ' || g, 'conhecimento',
+     SELECT $1, $2, '${PREFIX} lacuna de capacidade ' || g, 'knowledge',
             CASE WHEN g % 2 = 0 THEN 'mentionable' ELSE 'proposed' END, 3, 3
      FROM generate_series(1, 10) g`,
     [tenant_id, agent_id],
