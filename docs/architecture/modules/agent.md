@@ -169,6 +169,89 @@ None of these is expressible as a plain drizzle join, and none can be verified
 without a live Postgres, so they belong in a change that can run the integration
 suite while making them.
 
+**And they would buy almost nothing.** That is now measured rather than argued —
+see "The performance gate" below. The `warm` arm already runs the turn with
+**nine** reads instead of ten (the identity read is served from the process
+cache), and its p95 does not improve: 60.1 ms cold against 66.5 ms warm on the
+same run, i.e. one fewer round-trip is inside the run-to-run noise. Replaying
+each measured turn's read latencies through the same 6-permit gate with the two
+`UNION ALL` merges applied models a saving of **1.9 ms (3.2 % of p95) cold** and
+**4.4 ms (6.7 %) warm**. Ten tasks against six permits is two waves; eight tasks
+against six permits is still two waves, so the merges shorten the second wave
+instead of removing it. Whether 13 stays the budget is the owner's call, but the
+number that call would be made on is no longer a guess.
+
+### The performance gate (`npm run turn:bench`)
+
+`scripts/turn-context-benchmark.ts` is the executable form of the acceptance
+criteria for #525. It drives `buildPrompt` — the production call site, which is
+what publishes `maia_turn_context_load_duration_ms{phase="loader"}` — against a
+**real Postgres** through the real `max: 10` pool, with 50 tenant/agent pairs,
+concurrency 20, scopes of 1/10/100 entities, and two arms:
+
+| arm | `FEATURE_TURN_CONTEXT_CACHE` | identity | reads per turn |
+|---|---|---|---|
+| `cold` | off (the production default in every generated fixture) | read from Postgres every turn | 10 |
+| `warm` | on, pre-warmed per pair | served from process memory | 9 |
+
+Repositories are **wrapped, not mocked**: the real query runs, and the wrapper
+only stamps start/end so every read can be attributed to its turn. That is what
+makes "peak concurrent reads for one turn" a measurement rather than a re-reading
+of the gate's own bookkeeping.
+
+What the gate decides (exit code 0/1), and why each one is there:
+
+| criterion | limit | why |
+|---|---|---|
+| p95 of context load | ≤ 600 ms | the owner's ceiling |
+| p99 of context load | ≤ 1 s | ditto |
+| errors, timeouts | 0 | a fast turn that fails is not a fast turn |
+| peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
+| peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
+| distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
+| pool drains, and is never saturated for 60 s | — | see the trap below |
+| `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
+| p95 vs baseline | ≤ baseline + 20 % | absolute ceilings do not catch a slow drift |
+| load shape | 50 pairs, concurrency 20, 1/10/100 | a gate run on 4 tenants is not this gate |
+
+**The saturation trap.** Comparing "longest saturated streak < 60 s" and nothing
+else is a false green, and the first cut of this harness produced one: a 60.1 s
+run reported 572 of 572 samples saturated — 100 % of the time — with a longest
+streak of 57.2 s, therefore "< 60 s", therefore green. The streak is bounded by
+the run's own length, so on its own that test only asks whether the run was
+short. The criterion is now what the sentence means: the pool must **drain** —
+`saturated_samples < samples`, an exact count — *and* never stay saturated for
+60 s straight.
+
+**Pacing is a parameter, not decoration.** The generator is closed-loop, so with
+`--think-ms 0` twenty turns are always in flight; at up to 6 permits each against
+10 connections the pool queue cannot empty, by arithmetic. Measured on a 4-vCPU
+host with a local Postgres, `cold` arm, concurrency 20: the un-paced profile
+yields 90.7 turns/s at p50 187.7 ms with 100 % of samples saturated, while
+`--think-ms 150` yields **more** throughput (102.1 turns/s) at p50 28.8 ms with
+68 % saturated and a 1.3 s longest streak. Past the knee, the queue only adds
+waiting. The default pacing is therefore 150 ms; `--think-ms 0` remains valid as
+the stress profile, where the drain criterion is red by construction.
+
+**Baseline.** `scripts/turn-context-baseline.json` holds the p95/p99 per arm,
+the host it was measured on, and a note saying whether it is a first measurement
+or a re-record. There was no registered baseline before this change, so the run
+recorded there **is the initial one** — the +20 % criterion only starts meaning
+"did not regress" from the next run onwards, and it is scoped to that host: a CI
+lane needs its own `--write-baseline`. A gate run never writes a baseline as a
+side effect.
+
+Proving a gate is proving that it **rejects**.
+`tests/unit/scripts/turn-context-gate.spec.ts` feeds synthetic arm results into
+the pure `evaluateGate` and asserts a non-zero exit for each criterion —
+including the two that are easy to get backwards (a peak that is too *low*, and
+a pool that never drains inside a sub-60 s run). `--inject` is refused unless
+`--self-test` is also passed, so it cannot become a back door that turns the
+gate into a rubber stamp.
+
+Procedure, thresholds and what to do with a red run:
+[`docs/runbooks/operational.md` §11](../../runbooks/operational.md).
+
 **What is cached, and what is not.** `CACHEABLE_RESOURCES` in
 `turn-context/cache.ts` is a closed union — currently just `identity`. Caching
 anything authorization-bearing is not expressible, which is what makes a Redis
@@ -263,6 +346,8 @@ column, never a dropped tenant predicate.
 | `tests/unit/turn-context-read-gate.spec.ts` | The semaphore's contract: ceiling, FIFO order, permit released on rejection |
 | `tests/integration/turn-context-pool-fairness.spec.ts` | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness |
 | `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
+| `tests/unit/scripts/turn-context-gate.spec.ts` | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1 |
+| `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm. See the gate section above |
 | `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
 | `tests/unit/agent/` | Per-step contracts |
 | `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |
@@ -276,6 +361,10 @@ At last verification (2026-05-28):
 - Turn-context loader integrated + pure renderer (#525 — this change). Still
   open in #525: the ≤8 round-trip target, and returning `capabilities`/`gaps`
   to the cache (decision to keep them out is recorded above).
+- Performance gate for #525 (`npm run turn:bench`, `scripts/turn-context-benchmark.ts`).
+  The measured run is green on every criterion; whether 13 becomes the definitive
+  budget or the ≤8 target stays open is an **owner decision** and this change does
+  not take it — it supplies the numbers the decision needs.
 - PR #541 review follow-up: the shared read gate (finding 1) and the JOIN's
   entity-side cardinality (finding 2), both described above.
 

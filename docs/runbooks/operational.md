@@ -1207,6 +1207,122 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 
 ---
 
+## 11. Gate de desempenho da carga de contexto do turno (issue #525)
+
+`npm run turn:bench` roda o gate que o dono fixou para a #525: Postgres real,
+pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades,
+braços `cold` e `warm`. Ele **exercita `buildPrompt`** — o call site de produção,
+que é quem publica `maia_turn_context_load_duration_ms{phase="loader"}`.
+
+Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
+escreve ~13 mil linhas de massa e devolve o veredicto por **exit code**.
+
+### Pré-requisitos
+
+```bash
+# Postgres migrado e alcançável. O harness usa o mesmo default de tests/setup.ts
+# e qualquer variável já presente no ambiente VENCE sobre esse default.
+export DATABASE_URL=postgres://maia_test:test1234@localhost:5432/maia_test
+export REDIS_URL=redis://localhost:6379     # o braço `warm` usa o subscriber de invalidação
+npm run db:migrate
+```
+
+### O comando do gate
+
+```bash
+# Perfil canônico: 60 s de carga sustentada por braço (~2 min no total).
+# A janela de 60 s é o que torna o critério de saturação do pool FALSIFICÁVEL;
+# sem --sustain-s ele sai como "não avaliado", nunca como aprovado.
+npm run turn:bench -- --sustain-s 60
+
+echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
+```
+
+Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
+
+### Os limites, e o que fazer quando um deles fica vermelho
+
+| veredicto vermelho | leitura | primeiro passo |
+|---|---|---|
+| `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
+| `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
+| `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
+| `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
+| `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
+| `o pool drena` | a fila do pool nunca esvaziou | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
+| `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
+| `p95 ≤ baseline + 20%` | regressão relativa | ver "baseline" abaixo antes de culpar o código |
+| `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
+
+### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
+
+O gerador é de **malha fechada**: `--concurrency` workers, cada um começando o
+turno seguinte assim que o anterior acaba. Com `--think-ms 0` isso mantém 20
+turnos sempre em voo; como cada turno pode segurar até 6 conexões de um pool de
+10, a fila **não tem como esvaziar** — é aritmética, não defeito. Medido em host
+de 4 vCPU com Postgres local, braço `cold`, concorrência 20:
+
+| `--think-ms` | turnos/s | p50 | p95 | amostras saturadas | maior sequência |
+|---|---|---|---|---|---|
+| 0 | 90,7 | 187,7 ms | 386,8 ms | 142/142 (100%) | a corrida inteira |
+| 150 (default) | 102,1 | 28,8 ms | 108,7 ms | 99/145 (68%) | 1,3 s |
+| 300 | 60,0 | 14,5 ms | 87,1 ms | 27/149 (18%) | 0,3 s |
+
+Note que o martelo entrega **menos** vazão que o ritmo de 150 ms: passado o
+joelho da capacidade, a fila só acrescenta espera. `--think-ms 0` continua sendo
+um perfil legítimo — é o de ESTRESSE — mas ali o veredicto do pool sai vermelho
+por construção, e não é sinal de regressão.
+
+### Baseline
+
+```bash
+# Grava o p95/p99 medidos como referência. NUNCA acontece como efeito colateral
+# de uma corrida de gate: baseline é decisão.
+npm run turn:bench -- --sustain-s 60 --write-baseline
+```
+
+`scripts/turn-context-baseline.json` carrega `recorded_at`, `host` e um `note`
+dizendo se é a PRIMEIRA medição ou uma re-gravação. Duas regras:
+
+1. **O baseline é por host.** O número foi medido numa máquina; uma esteira de CI
+   precisa gravar o dela na primeira execução, com `--write-baseline`, e o PR que
+   faz isso deve dizer em que máquina foi.
+2. **Re-gravar é uma decisão de revisão.** A folga de +20 % existe para absorver
+   ruído (a variação medida entre corridas iguais neste host foi de ~10 %), não
+   para absorver regressão. Se o p95 subiu por um motivo aceito, re-grave no
+   MESMO PR que aceitou o motivo — não numa corrida solta.
+
+### Provar que o gate reprova
+
+O veredicto é código, e código sem prova de falha é decoração. Sem tocar no
+banco:
+
+```bash
+npm run turn:bench -- --self-test --inject p95_ms=900          # exit 1
+npm run turn:bench -- --self-test --inject peak_reads_per_turn=7   # exit 1
+npm run turn:bench -- --self-test --inject cold.errors=1       # exit 1
+```
+
+`--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
+fundos que faz qualquer regressão passar. A bateria completa (todos os critérios,
+incluindo pico baixo demais e pool que nunca drena) vive em
+`tests/unit/scripts/turn-context-gate.spec.ts` e roda na suíte normal.
+
+### Massa e limpeza
+
+Tudo que o harness cria usa `tenant_id` com prefixo `bench525-` e é removido no
+`finally` e também em `SIGINT`/`SIGTERM`. Se uma corrida morreu de um jeito que
+não deixou nada rodar:
+
+```bash
+npm run turn:bench -- --cleanup-only
+```
+
+O harness **nunca roda `ANALYZE`** — num banco compartilhado com a suíte,
+`ANALYZE` não é desfeito por `ROLLBACK` e envenenaria o plano dos outros specs.
+
+---
+
 ## Apêndice — referências cruzadas
 
 - **`docs/runbooks/redis.md`** — política de memória multi-tenant, sizing, sinais de pressão. Leia ANTES de mexer em `maxmemory*` no compose ou no Redis gerenciado.
