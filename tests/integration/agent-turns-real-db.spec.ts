@@ -85,9 +85,6 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     await ensureTenantAgent(OTHER_TENANT, OTHER_AGENT);
   });
 
-  /** Escopos criados pelo caso (9), apagados no `afterAll`. */
-  const probeScopes: Array<{ tenant: string; agent: string }> = [];
-
   afterAll(async () => {
     if (createdMensagens.length > 0) {
       // agent_turn_inputs cai por CASCADE do turno; a FK para mensagens exige
@@ -101,14 +98,6 @@ d('agent_turns — DB real (migrations 096/097)', () => {
         [createdMensagens],
       );
       await pool.query(`DELETE FROM mensagens WHERE id = ANY($1::uuid[])`, [createdMensagens]);
-    }
-    for (const scope of probeScopes) {
-      await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2`, [
-        scope.tenant,
-        scope.agent,
-      ]);
-      await pool.query(`DELETE FROM agents WHERE id = $1`, [scope.agent]);
-      await pool.query(`DELETE FROM tenants WHERE id = $1`, [scope.tenant]);
     }
     // Limpeza por ESCOPO, não só pelos ids que este processo rastreou. Uma
     // execução interrompida deixa linha para trás, e o `DELETE FROM agents`
@@ -642,56 +631,63 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     }
   }
 
-  it('(9) a consulta de recovery usa o ÍNDICE DE RECOVERY, nomeado', async () => {
-    // Asserir "algum índice" não protege nada: com a tabela pequena e um
-    // `IN (…)` sobre `status`, o planner percorre o índice genérico de escopo
-    // (`agent_turns_scope_id_uq`, sobre `(tenant_id, agent_id, id)`) e filtra
-    // `status`/`next_attempt_at` depois. Ou seja, DERRUBAR
-    // `agent_turns_scope_status_next_attempt_idx` — o índice que este caso
-    // existe para proteger — deixaria o teste verde.
+  it('(9) o ramo `retryable` do recovery é servido pelo índice de recovery, nomeado', async () => {
+    // ESCOPO DO QUE ESTE CASO PROVA, porque a versão anterior prometia mais do
+    // que entregava: ele cobre UM dos três ramos de `findRecoverableTurns`
+    // (`src/db/repositories/turn-repos.ts`), o de `retryable`. Os outros dois
+    // — `received`/`queued` por `created_at` e `claimed`/`running` por
+    // `lease_expires_at` — NÃO são cobertos aqui e não são reivindicados.
     //
-    // Então o caso faz duas coisas que a versão anterior não fazia:
-    //   1. cria massa suficiente no PRÓPRIO escopo para o índice de recovery
-    //      ser a escolha (com poucas linhas, qualquer plano serve e a medição
-    //      não significa nada);
-    //   2. assere o NOME do índice, lido de `EXPLAIN (FORMAT JSON)` — texto de
-    //      plano é formato de apresentação, não contrato.
-    // Ids únicos por execução nos DOIS: `agents.id` é PK GLOBAL, então um id
-    // fixo colide com a própria tentativa anterior quando o caso é retentado —
-    // e a colisão mascara a asserção real com erro de fixture.
+    // A versão anterior achatava os três ramos num único `next_attempt_at <=
+    // now()` aplicado a todos os estados. Aquele predicado não é o de produção:
+    // ele podia escolher o índice de recovery enquanto a consulta real fazia
+    // Seq Scan. Era a mesma vacuidade que este arquivo veio corrigir, uma
+    // camada abaixo.
+    //
+    // Tudo roda numa transação DESFEITA, e isso não é economia de limpeza:
+    //   - as 200 linhas somem no `ROLLBACK`, então uma execução interrompida
+    //     não deixa massa para trás (a versão com `afterAll` deixava, porque o
+    //     registro dos escopos só existia na memória do processo);
+    //   - e NÃO há `ANALYZE`. Medi: `ANALYZE` dentro de transação NÃO é
+    //     desfeito pelo `ROLLBACK` — `pg_class.reltuples` foi de 39 para 4039 e
+    //     ficou, com a tabela vazia. Publicar estatística sintética num banco
+    //     que outros specs compartilham distorce o plano deles, que é
+    //     exatamente o dano que o teardown existia para evitar.
+    //
+    // Sem `ANALYZE`, com `enable_seqscan = off` e o predicado do ramo, o
+    // planner compara caminhos de índice: o de recovery cobre os quatro
+    // atributos, o genérico de escopo cobre dois. 200 linhas bastam.
     const nonce = randomUUID().slice(0, 8);
-    const scope = { tenant: `idx-${nonce}`, agent: `idx-${nonce}-probe` };
-    // O `afterAll` apaga. 4.000 linhas por execução num banco compartilhado
-    // deixam de ser fixture e viram distorção de estatística para os outros
-    // specs — foi o que aconteceu nas execuções locais antes deste registro.
-    probeScopes.push(scope);
-    await pool.query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$1,'active')`, [
-      scope.tenant,
-    ]);
-    await pool.query(
-      `INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$1,'active')`,
-      [scope.agent, scope.tenant],
-    );
-    // Só estados NÃO-terminais: `agent_turns_outcome_presence_chk` exige
-    // `outcome` nos terminais, e o recovery só olha os não-terminais mesmo.
-    await pool.query(
-      `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, next_attempt_at)
-       SELECT $1, $2, gen_random_uuid(),
-              (ARRAY['received','queued','claimed','running','retryable'])[1 + (g % 5)],
-              now() + ((g % 240) - 5 || ' minutes')::interval
-         FROM generate_series(1, 4000) g`,
-      [scope.tenant, scope.agent],
-    );
-    await pool.query('ANALYZE agent_turns');
+    const tenant = `idx-${nonce}`;
+    const agent = `idx-${nonce}-probe`;
 
     const indexes = await explainWithoutSeqScan(async (client) => {
+      await client.query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$1,'active')`, [
+        tenant,
+      ]);
+      await client.query(
+        `INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$1,'active')`,
+        [agent, tenant],
+      );
+      await client.query(
+        `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, next_attempt_at)
+         SELECT $1, $2, gen_random_uuid(), 'retryable', now() - interval '1 minute'
+           FROM generate_series(1, 200)`,
+        [tenant, agent],
+      );
+
+      // O predicado do ramo `retryable` COMO ELE É em `findRecoverableTurns`,
+      // incluindo `IS NOT NULL`, a ordenação e o limite — os três participam da
+      // escolha do plano.
       const plan = await client.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(
         `EXPLAIN (FORMAT JSON)
          SELECT * FROM agent_turns
          WHERE tenant_id = $1 AND agent_id = $2
-           AND status IN ('received','queued','claimed','running','retryable')
-           AND next_attempt_at <= now()`,
-        [scope.tenant, scope.agent],
+           AND status = 'retryable'
+           AND next_attempt_at IS NOT NULL AND next_attempt_at <= now()
+         ORDER BY created_at
+         LIMIT 200`,
+        [tenant, agent],
       );
       return collectIndexNames(plan.rows[0]!['QUERY PLAN'][0]!.Plan);
     });
