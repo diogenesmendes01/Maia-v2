@@ -480,7 +480,12 @@ export function evaluateGate(
     // corrida; não conseguir observar uma janela inteira de 60 s só é motivo de
     // "não avaliado" quando NADA de errado apareceu.
     const observedFullWindow = a.wall_ms >= th.saturation_ms;
-    const drained = a.pool_saturation_max_streak_ms < a.wall_ms * 0.98;
+    // "Drenou" é uma contagem EXATA, não uma heurística sobre a duração: se
+    // toda amostra viu a fila cheia, a fila nunca esvaziou. Comparar a
+    // sequência com uma fração do relógio de parede erra justamente o caso que
+    // motivou este critério (57,2 s de sequência em 60,1 s de corrida com
+    // 572/572 amostras saturadas passaria por uma folga de 2%).
+    const drained = a.pool_samples === 0 || a.pool_saturated_samples < a.pool_samples;
     out.push({
       label: `[${a.arm}] o pool drena (fila esvazia) e nunca fica saturado por ${(th.saturation_ms / 1000).toFixed(0)} s seguidos`,
       passed: drained && a.pool_saturation_max_streak_ms < th.saturation_ms,
@@ -565,6 +570,8 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'peak_reads_per_turn',
     'max_concurrent_tenants',
     'pool_saturation_max_streak_ms',
+    'pool_samples',
+    'pool_saturated_samples',
     'wall_ms',
     'metric_count',
     'pairs_exercised',
