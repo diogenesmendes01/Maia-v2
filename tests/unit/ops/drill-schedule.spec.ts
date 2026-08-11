@@ -275,6 +275,10 @@ describe('runRestoreDrillTick — absence of evidence is not evidence of success
     expect(res.drill_check_level).toBe('FAIL');
     expect(res.readiness_level).toBe('FAIL');
     expect(h.drills()).toBe(0);
+    // "Unknown", not "never ran" — the two are different diagnoses and the
+    // verdict must not claim the stronger one.
+    expect(res.decision.reason).toBe('evidence_unreadable');
+    expect(res.decision.evidence_expired).toBe(true);
   });
 });
 

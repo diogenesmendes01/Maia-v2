@@ -125,7 +125,13 @@ export type RestoreDrillDueReason =
   /** The last drill FAILED and its (shorter) retry window has elapsed. */
   | 'retry_after_failure'
   /** Recent enough — this tick does nothing. */
-  | 'evidence_fresh';
+  | 'evidence_fresh'
+  /**
+   * The evidence could not be READ. Never produced by `restoreDrillDue`, which
+   * is pure and always has facts; only by `runRestoreDrillTick` when the read
+   * itself failed, so the verdict is "unknown", not "never ran".
+   */
+  | 'evidence_unreadable';
 
 export interface RestoreDrillScheduleInput {
   now: Date;
@@ -264,7 +270,7 @@ export async function runRestoreDrillTick(
     });
     const unknown: RestoreDrillScheduleDecision = {
       due: false,
-      reason: 'never_ran',
+      reason: 'evidence_unreadable',
       evidence_age_seconds: null,
       due_after_seconds: 0,
       max_age_seconds: Math.round(profile.objectives.restoreDrillIntervalHours * 3600),
