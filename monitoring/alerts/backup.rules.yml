@@ -1,0 +1,68 @@
+# Prometheus alerting rules — o GATE do drill de restore (issue #536).
+#
+# Fonte da verdade dos alertas narrados em docs/runbooks/backup-restore.md §4.3.
+# O runbook diz o que o operador FAZ; este arquivo é a config carregável.
+# Mantenha os dois em sincronia.
+#
+# As séries vêm de src/observability/backup-readiness-collector.ts, lidas em
+# tempo de SCRAPE a partir de `restore_drills` / `backup_runs` — não de um valor
+# que um worker publica. Essa escolha é deliberada: se o worker `restore_drill`
+# parar de rodar, um gauge publicado por ele congelaria no último valor (verde),
+# que é exatamente a falha que este gate existe para pegar. Lendo a evidência no
+# scrape, o nível envelhece sozinho.
+#
+# Escala de `maia_restore_drill_check_level` (mesma de
+# `maia_backup_readiness_level`): 0 = OK, 1 = degradado, 2 = reprovado.
+# 2 significa uma destas: a evidência é mais velha que
+# BACKUP_RESTORE_DRILL_INTERVAL_HOURS, o último drill FALHOU, nunca houve drill
+# (em production), ou a evidência não pôde ser LIDA. As quatro pedem um humano;
+# `restore_drills` diz qual foi (runbook §4.1).
+#
+# Por que isto NÃO está no /readyz: um drill vencido não torna esta réplica
+# incapaz de atender uma requisição, e /readyz decide roteamento de tráfego.
+# Reprovar lá derrubaria a plataforma por um problema de evidência de backup —
+# um outage causado pelo monitor.
+#
+# Wiring: carregue via `rule_files` do Prometheus, e.g.
+#
+#   rule_files:
+#     - /etc/prometheus/rules/backup.rules.yml   # este arquivo
+groups:
+  - name: maia_backup_restore_drill
+    interval: 60s
+    rules:
+      # O gate. `for: 30m` porque a série é derivada de evidência durável: ela
+      # não oscila com o scrape, e meia hora só evita alertar durante o próprio
+      # deploy/restart.
+      - alert: RestoreDrillEvidenceNotProvable
+        expr: maia_restore_drill_check_level >= 2
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nenhum backup é sabidamente restaurável"
+          description: |
+            O gate do drill de restore está REPROVADO. Uma destas é verdade:
+            a evidência venceu (BACKUP_RESTORE_DRILL_INTERVAL_HOURS), o último
+            drill falhou, nunca rodou um drill, ou a evidência não pôde ser lida.
+            Descubra qual em `restore_drills` (ORDER BY started_at DESC LIMIT 5)
+            e leia docs/runbooks/backup-restore.md §4.1 — `cleanup_failed` e os
+            demais códigos pedem ações OPOSTAS.
+
+      # Envelhecendo: o worker `restore_drill` deveria ter disparado um drill em
+      # 75% do intervalo. Se chegou a WARN e ficou, o tick não está rodando (ou
+      # está sendo bloqueado por resíduo — ver `restore_drill.blocked_by_residue`
+      # no log e `cleanup_status='unsafe'` na tabela).
+      - alert: RestoreDrillEvidenceAging
+        expr: maia_restore_drill_check_level == 1
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Evidência de restore envelhecendo e nada a renovou"
+          description: |
+            O agendador deveria ter disparado um drill a 75% do intervalo e a
+            evidência continua envelhecendo. Confira se o job `restore_drill`
+            está agendado (log `worker.scheduled`) e se o último drill deixou
+            resíduo — um drill com `cleanup_status='unsafe'` BLOQUEIA o próximo
+            de propósito (runbook §4.2).
