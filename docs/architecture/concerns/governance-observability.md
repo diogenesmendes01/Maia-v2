@@ -232,8 +232,10 @@ the id makes every process reach the same verdict with nothing to propagate.
 
 The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
 `emitted` or `declared`, and `tests/unit/observability/tracer.spec.ts` fails if
-the two drift. Today `turn`, `queue.wait` and `tool.dispatch` are emitted; the
-other 20 are declared.
+the two drift. Today `turn`, `queue.wait`, `tool.dispatch` and `context.load`
+are emitted; the other 19 are declared. `emitted` claims an instrumentation
+site EXISTS — not that it runs on every turn; `context.load` is emitted by
+`buildContextPacket`, which the hot path does not call yet (§7).
 
 #### Span attribution is RESOLVED, not read at close
 
@@ -382,10 +384,23 @@ coverage that does not exist:
   emitters; the other 20 taxonomy entries are marked `declared` in
   `SPAN_EMISSION` and produce nothing. The marking is test-enforced, so this
   list cannot silently go stale.
-- **`context.load` is not emitted on the hot path.** `instrumentContextLoad`
-  exists and is tested, but the turn's context assembly lives in
-  `src/agent/prompt-builder.ts`, which #535 did not touch. `maia_context_load_ms`
-  therefore has no production series yet — one wrap away.
+- **`context.load` has a call site, but not on the hot path.** Issue #535 gate
+  6 wired `instrumentContextLoad` into the packet assembly
+  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), so
+  `maia_context_load_ms` / `maia_context_slices_total` / the `context.load` span
+  are produced by the real assembly instead of only by a unit test. What is
+  still open: `buildContextPacket` is the P8a orchestrator and PR #406 removed
+  the `FEATURE_CONTEXT_PACKET_V1` hot path that called it, so a WhatsApp turn
+  does not reach that assembly today — the turn's own context load lives in
+  `src/agent/turn-context/loader.ts` (`loadTurnContext`, issue #525) and is NOT
+  instrumented. Until either the assembly path is rewired or the loader gets its
+  own stage, the family has series in tests and in any caller of the assembly,
+  and none from a live turn.
+- **Only `stage="packet"` exists.** The per-slice stages named in
+  `instrumentContextLoad`'s doc comment (`working_memory`, `episodic`,
+  `profile`, …) have no emitter. `CONTEXT_LOAD_STAGE_VALUES` in `taxonomy.ts` is
+  the closed vocabulary and lists exactly what is emitted, for the same reason
+  `SPAN_EMISSION` exists.
 - **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
   pending the canary rollout in `docs/runbooks/observability-slo.md`.
 - **Not yet instrumented**: outbound send duration (`maia_outbound_send_ms`),
@@ -449,6 +464,6 @@ Verify with `gh pr list --state open --search "audit OR governance OR trace OR i
 
 | | |
 |---|---|
-| Last verified | 2026-08-04 |
-| Against `main` HEAD | `7b34e7e` + issue #535 |
+| Last verified | 2026-08-11 |
+| Against `main` HEAD | `00fe08a4` + issue #535 gate 6 |
 | Re-verify when | Older than 30 days; OR `audit-actions.ts` adds a variant; OR `metrics.ts` changes counter labels; OR `runtime-trace/` changes envelope/body split; OR `policy-dsl/` adds an operator |

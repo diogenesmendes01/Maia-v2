@@ -160,6 +160,9 @@ O diagnóstico é uma subtração:
   worker insuficiente ou concorrência 1. Ver `src/gateway/queue.ts`.
 - fila baixa e `maia_llm_latency_ms` p95 alto ⇒ **provider**.
 - fila baixa, LLM normal ⇒ contexto/DB. Ver `maia_context_load_ms` e o pool.
+  Atenção: hoje `maia_context_load_ms` só tem `stage="packet"`, emitido pela
+  montagem P8a, que o turno ainda não chama (§11). Sem série ali, o sinal do
+  contexto no turno é o pool (`maia_db_pool`), não esta família.
 - Debounce ligado? Subtraia a janela antes de concluir qualquer coisa.
 
 ### 4.6 `MaiaQueueOldestJobAgeWarning` / `MaiaQueueOldestJobAgeCritical`
@@ -497,8 +500,13 @@ o mesmo `mensagem_id` amostra de novo.
 
 `SPAN_EMISSION` em `src/observability/taxonomy.ts` é a fonte de verdade e é
 verificada por teste — a taxonomia não consegue mais superestimar a cobertura.
-Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch`. Todo o resto está
-**declarado, não emitido**; o span não vai aparecer no waterfall.
+Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch` e `context.load`. Todo o
+resto está **declarado, não emitido**; o span não vai aparecer no waterfall.
+
+`emitted` afirma que EXISTE site de instrumentação, não que ele roda em todo
+turno: `context.load` é emitido por `buildContextPacket`
+(`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), e o
+hot path do turno ainda não chama essa montagem — ver §11.
 
 ### 9.5 Privacidade
 
@@ -573,11 +581,20 @@ Não presuma cobertura que não existe:
 
 - **spans operacionais parciais** — só `turn`, `queue.wait` e `tool.dispatch`
   têm emissor. As outras 20 entradas da taxonomia estão marcadas `declared`;
-- **`context.load` não é emitido no hot path.** O wrapper existe
-  (`instrumentContextLoad`) e é testado, mas a montagem de contexto do turno
-  vive em `src/agent/prompt-builder.ts`, fora do escopo desta entrega. A
-  família `maia_context_load_ms` só produz série quando aquele call site for
-  instrumentado;
+- **`context.load` tem call site, mas não no hot path.** O gate 6 da #535
+  instrumentou a montagem do packet
+  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), então
+  `maia_context_load_ms`, `maia_context_slices_total` e o span `context.load`
+  saem da montagem real. O que continua aberto: `buildContextPacket` é o
+  orquestrador P8a e a PR #406 removeu o hot path (`FEATURE_CONTEXT_PACKET_V1`)
+  que o chamava; a carga de contexto do turno hoje é `loadTurnContext`
+  (`src/agent/turn-context/loader.ts`, #525) e NÃO está instrumentada. Enquanto
+  isso, o painel `maia:context_load_ms:p95` fica sem série vinda de turno real —
+  ausência esperada, não falha de scrape;
+- **só existe `stage="packet"`.** As fatias citadas no comentário de
+  `instrumentContextLoad` (`working_memory`, `episodic`, `profile`, …) não têm
+  emissor. O vocabulário fechado é `CONTEXT_LOAD_STAGE_VALUES`
+  (`src/observability/taxonomy.ts`);
 - **benchmark de overhead é micro, não sob carga** —
   `tests/unit/observability/overhead-benchmark.spec.ts` mede o custo por
   emissão e o teto TEÓRICO de séries a partir dos orçamentos de cardinalidade.
@@ -588,6 +605,6 @@ Não presuma cobertura que não existe:
 
 | | |
 |---|---|
-| Last verified | 2026-08-04 |
+| Last verified | 2026-08-11 |
 | Issue | #514 → #535 |
 | Re-verify when | `src/observability/taxonomy.ts` mudar; ou um limiar de `monitoring/alerts/slo.rules.yml` mudar; ou um span sair de `declared` para `emitted`. |
