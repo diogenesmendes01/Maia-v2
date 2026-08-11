@@ -65,4 +65,4 @@ groups:
             evidência continua envelhecendo. Confira se o job `restore_drill`
             está agendado (log `worker.scheduled`) e se o último drill deixou
             resíduo — um drill com `cleanup_status='unsafe'` BLOQUEIA o próximo
-            de propósito (runbook §4.2).
+            de propósito. Runbook: docs/runbooks/backup-restore.md §4.2/§4.3.

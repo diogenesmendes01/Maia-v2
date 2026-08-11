@@ -206,7 +206,13 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 
 O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observability/backup-readiness-collector.ts)) lê a evidência **no scrape**, não de um valor que o worker publica: se o `restore_drill` parar de rodar, um gauge publicado por ele congelaria no último valor (verde) — que é exatamente a falha que o gate existe para pegar. Pelo mesmo motivo, uma leitura que **falha** derruba o snapshot em vez de reservir o último verde.
 
-Alertas prontos: [`monitoring/alerts/backup.rules.yml`](../../monitoring/alerts/backup.rules.yml).
+**Alertas** ([`monitoring/alerts/backup.rules.yml`](../../monitoring/alerts/backup.rules.yml)):
+
+| Alerta | Dispara | O que o operador faz |
+|---|---|---|
+| `RestoreDrillEvidenceNotProvable` | `maia_restore_drill_check_level >= 2` por 30min | **Nada é sabidamente restaurável.** Descubra qual dos quatro casos é em `restore_drills` (`ORDER BY started_at DESC LIMIT 5`) — vencido, falhou, nunca rodou, ou evidência ilegível — e siga §4.1: `cleanup_failed` e os demais códigos pedem ações OPOSTAS |
+| `RestoreDrillEvidenceAging` | `maia_restore_drill_check_level == 1` por 6h | O agendador deveria ter renovado a evidência aos 75% e não renovou. Confira se o job `restore_drill` está agendado (log `worker.scheduled`) e se o último drill deixou resíduo — resíduo BLOQUEIA o próximo drill de propósito (§4.2) |
+
 
 **Por que isto não está no `/readyz`.** Um drill vencido não torna a réplica incapaz de atender uma requisição, e `/readyz` decide roteamento de tráfego. Reprovar lá derrubaria a plataforma por um problema de evidência de backup — um outage causado pelo monitor. A superfície certa para "nossa postura de recuperação não é demonstrável" é a readiness operacional: o gauge, o alerta e a linha de log por tick.
 

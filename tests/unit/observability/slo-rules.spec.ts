@@ -1,6 +1,6 @@
 /**
- * Issue #514 §9 — drift guard between `monitoring/alerts/slo.rules.yml` and
- * the code that actually emits the metrics.
+ * Issue #514 §9 — drift guard between the committed alert rules and the code
+ * that actually emits the metrics.
  *
  * An alert that references a metric nobody emits is worse than no alert: it
  * looks like coverage and fires never. This spec fails the build when the two
@@ -8,17 +8,53 @@
  *
  * Parsed with a regex rather than a YAML library on purpose — `yaml` is only a
  * transitive dependency here, and this issue is not allowed to add one.
+ *
+ * ISSUE #536 — WHY THIS SCANS A DIRECTORY NOW. The guard was pinned to
+ * `monitoring/alerts/slo.rules.yml`. `monitoring/alerts/` then grew three more
+ * rule files, and every one of them was outside the guard's reach: a new file
+ * could point an alert at a series nobody emits and the suite stayed green —
+ * exactly the `maia_llm_calls_total{reason="rate_limit"}` failure this guard
+ * was written for, just in a file it was not looking at. The metric check now
+ * walks EVERY `*.yml` under `monitoring/alerts/`; a rule file that does not
+ * exist yet is covered the day it is added, with no edit here.
+ *
+ * The checks that encode SLO-specific semantics (turn-counter denominators,
+ * queue aggregation, burn rates) stay scoped to `slo.rules.yml`, because they
+ * are statements about those rules, not about alert files in general.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { METRIC_NAMES } from '../../../src/observability/taxonomy.js';
 
 const ROOT = resolve(__dirname, '../../..');
-const RULES_PATH = resolve(ROOT, 'monitoring/alerts/slo.rules.yml');
+const ALERTS_DIR = resolve(ROOT, 'monitoring/alerts');
 const RUNBOOK_PATH = resolve(ROOT, 'docs/runbooks/observability-slo.md');
 
-const rules = readFileSync(RULES_PATH, 'utf8');
+/** Every committed rule file, by basename. */
+const RULE_FILES: readonly string[] = readdirSync(ALERTS_DIR)
+  .filter((f) => f.endsWith('.yml'))
+  .sort();
+
+const RULE_TEXT: Record<string, string> = Object.fromEntries(
+  RULE_FILES.map((f) => [f, readFileSync(resolve(ALERTS_DIR, f), 'utf8')]),
+);
+
+/**
+ * Rule files whose alerts must be narrated in a runbook, and where.
+ *
+ * A MAP rather than a derivation from each alert's own link: six alerts in
+ * `redis.rules.yml` / `working-memory.rules.yml` predate this rule and would
+ * fail it today. Widening the map is the cleanup that fixes them — and it is a
+ * one-line change per file, which is the point of writing it as data.
+ */
+const RULES_TO_RUNBOOK: Record<string, string> = {
+  'slo.rules.yml': 'docs/runbooks/observability-slo.md',
+  'backup.rules.yml': 'docs/runbooks/backup-restore.md',
+};
+
+/** The SLO rules specifically — the subject of every `slo.rules.yml` check below. */
+const rules = RULE_TEXT['slo.rules.yml']!;
 
 /**
  * `maia_*` metrics emitted OUTSIDE the #514 taxonomy but genuinely present in
@@ -216,5 +252,99 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
     for (const forbidden of ['$labels.trace_id', '$labels.conversa_id', '$labels.telefone']) {
       expect(rules).not.toContain(forbidden);
     }
+  });
+});
+
+/**
+ * Issue #536 — the same guard, over EVERY committed rule file.
+ *
+ * The block above is about `slo.rules.yml` and its SLO semantics. This one is
+ * about the property that must hold for any alert file the repository ships,
+ * including files that do not exist yet: what an alert queries has to be
+ * something the code emits.
+ */
+describe('issue #536 — every committed alert file is under the drift guard', () => {
+  /** Names of every alert in `file`, in declaration order. */
+  function alertsIn(file: string): string[] {
+    return [...RULE_TEXT[file]!.matchAll(/- alert: (\w+)/g)].map((m) => m[1]!);
+  }
+
+  it('the scan actually finds the rule files (a broken glob must not pass silently)', () => {
+    // Without this, a renamed directory would make every check below iterate an
+    // empty list and report success — the exact shape of failure this guard
+    // exists to prevent, one level up.
+    expect(RULE_FILES.length).toBeGreaterThanOrEqual(4);
+    expect(RULE_FILES).toContain('slo.rules.yml');
+    for (const file of RULE_FILES) {
+      expect(RULE_TEXT[file], `${file} is empty`).toContain('groups:');
+    }
+  });
+
+  it('every metric referenced by ANY alert file is actually emitted', () => {
+    const known = new Set<string>([...METRIC_NAMES, ...Object.keys(PRE_EXISTING_METRICS)]);
+    const unknown: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const metric of referencedMetrics(RULE_TEXT[file]!)) {
+        if (!known.has(metric)) unknown.push(`${file}: ${metric}`);
+      }
+    }
+    expect(
+      unknown,
+      'alert files reference metrics that nothing emits — add the series to ' +
+        'METRIC (src/observability/taxonomy.ts) or, if it is emitted outside the ' +
+        'taxonomy, to PRE_EXISTING_METRICS WITH its emitter at file:line: ' +
+        unknown.join(', '),
+    ).toEqual([]);
+  });
+
+  it('every alert name is unique across ALL files, not just within one', () => {
+    // Prometheus loads every rule file into one namespace; two alerts sharing a
+    // name make a firing alert unattributable to the rule that produced it.
+    const all = RULE_FILES.flatMap(alertsIn);
+    const seen = new Set<string>();
+    const duplicated = all.filter((a) => {
+      if (seen.has(a)) return true;
+      seen.add(a);
+      return false;
+    });
+    expect(duplicated, `alert names defined twice: ${duplicated.join(', ')}`).toEqual([]);
+    expect(all.length).toBeGreaterThan(30);
+  });
+
+  it('no alert file leaks a high-cardinality id through an annotation template', () => {
+    for (const file of RULE_FILES) {
+      for (const forbidden of ['$labels.trace_id', '$labels.conversa_id', '$labels.telefone']) {
+        expect(RULE_TEXT[file], `${file} leaks ${forbidden}`).not.toContain(forbidden);
+      }
+    }
+  });
+
+  it('every alert in a mapped file is narrated in its runbook', () => {
+    for (const [file, runbookPath] of Object.entries(RULES_TO_RUNBOOK)) {
+      // Deleting a mapped rule file deletes coverage; the map is the assertion
+      // that it still exists.
+      expect(RULE_FILES, `${file} is missing from monitoring/alerts/`).toContain(file);
+      const runbook = readFileSync(resolve(ROOT, runbookPath), 'utf8');
+      const undocumented = alertsIn(file).filter((a) => !runbook.includes(a));
+      expect(
+        undocumented,
+        `${file}: alerts with no operator guidance in ${runbookPath}: ${undocumented.join(', ')}`,
+      ).toEqual([]);
+    }
+  });
+
+  it('the restore-drill gate is alerted on, and on the series the code emits', () => {
+    // The #536 gate specifically: `backup.rules.yml` must query the same series
+    // `readinessGauges` produces. Pointing it at a plausible-looking name that
+    // nothing emits is what the generic check above catches; this one pins
+    // WHICH series, so a silent rename of the gate cannot slip through as
+    // "well, the new name is in the taxonomy too".
+    const backup = RULE_TEXT['backup.rules.yml'];
+    expect(backup, 'monitoring/alerts/backup.rules.yml is gone').toBeDefined();
+    expect(backup).toContain('maia_restore_drill_check_level >= 2');
+    expect(alertsIn('backup.rules.yml')).toEqual([
+      'RestoreDrillEvidenceNotProvable',
+      'RestoreDrillEvidenceAging',
+    ]);
   });
 });
