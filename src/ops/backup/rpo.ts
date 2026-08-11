@@ -257,15 +257,40 @@ export function rtoWithinTarget(
 }
 
 /**
+ * Level of the `restore_drill_age` check — the restore-drill gate verdict on
+ * its own, separated from the aggregate so a scheduler and a metric can both
+ * read it without re-deriving the check id.
+ *
+ * The check is absent from exactly one verdict: the short-circuit for disabled
+ * backups, which stops after `backup_enabled`. There the overall level (WARN)
+ * IS the answer — nothing is drilled because nothing is backed up, and that
+ * degradation is already reported.
+ */
+export function drillCheckLevel(readiness: BackupReadiness): ReadinessLevel {
+  return readiness.checks.find((c) => c.id === 'restore_drill_age')?.level ?? readiness.level;
+}
+
+const LEVEL_VALUE: Record<ReadinessLevel, number> = { OK: 0, WARN: 1, FAIL: 2 };
+
+/**
  * Gauge values for `/metrics`.
  *
  * Deliberately label-free apart from `destination` (issue §"Observabilidade":
  * "evitar labels de alta cardinalidade como tenant, agent, backup ID, request
  * ID, telefone ou object key").
+ *
+ * `maia_restore_drill_check_level` is the RESTORE-DRILL GATE (issue #536): 0
+ * while a recent drill proves an artifact restorable, 2 once the evidence is
+ * past `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`, past a failed drill, or — in
+ * production — while no drill has ever run. It is ALWAYS emitted, including
+ * when nothing has ever been measured, precisely because "never drilled" is the
+ * state that must not read as green: a missing series would be indistinguishable
+ * from a collector that is not wired.
  */
 export function readinessGauges(readiness: BackupReadiness): Record<string, number> {
   const out: Record<string, number> = {
-    maia_backup_readiness_level: readiness.level === 'OK' ? 0 : readiness.level === 'WARN' ? 1 : 2,
+    maia_backup_readiness_level: LEVEL_VALUE[readiness.level],
+    maia_restore_drill_check_level: LEVEL_VALUE[drillCheckLevel(readiness)],
   };
   if (readiness.measured_rpo_seconds !== null) {
     out.maia_backup_age_seconds = readiness.measured_rpo_seconds;
@@ -273,6 +298,12 @@ export function readinessGauges(readiness: BackupReadiness): Record<string, numb
   if (readiness.measured_rto_seconds !== null) {
     out.maia_restore_drill_duration_seconds = readiness.measured_rto_seconds;
   }
+  // Age of the newest terminal drill. Omitted when none ever ran — the gate
+  // level above carries that case; a sentinel age would be a lie either way
+  // (0 reads as "just drilled", a huge number as "drilled long ago").
+  const drillAge = readiness.checks.find((c) => c.id === 'restore_drill_age')?.evidence
+    .age_seconds;
+  if (typeof drillAge === 'number') out.maia_restore_drill_age_seconds = drillAge;
   return out;
 }
 

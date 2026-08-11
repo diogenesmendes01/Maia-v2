@@ -383,6 +383,14 @@ export interface ReadinessFacts {
   last_restore_drill_at: Date | null;
   last_restore_drill_result: 'passed' | 'failed' | null;
   last_restore_drill_duration_ms: number | null;
+  /**
+   * Teardown verdict of that same drill (issue #536). The SCHEDULER needs it:
+   * a drill that could not prove it removed its decrypted copy of production
+   * blocks the next one, because starting another would materialise a second
+   * copy instead of proving anything. `null` when no drill has ever reached a
+   * terminal state.
+   */
+  last_restore_drill_cleanup_status: 'clean' | 'unsafe' | 'unknown' | null;
   consecutive_failures: number;
 }
 
@@ -413,6 +421,7 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
       at: restore_drills.finished_at,
       status: restore_drills.status,
       duration: restore_drills.duration_ms,
+      cleanup: restore_drills.cleanup_status,
     })
     .from(restore_drills)
     .where(sql`${restore_drills.status} IN ('passed', 'failed')`)
@@ -448,6 +457,15 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
         ? (drillRow.status as 'passed' | 'failed')
         : null,
     last_restore_drill_duration_ms: drillRow?.duration ?? null,
+    // Anything the column can hold that is not `clean` is treated as `unknown`
+    // rather than being coerced to `clean`: an unrecognised teardown verdict is
+    // a doubt, and a doubt about a decrypted copy of production is not a pass.
+    last_restore_drill_cleanup_status:
+      drillRow === undefined
+        ? null
+        : drillRow.cleanup === 'clean' || drillRow.cleanup === 'unsafe'
+          ? drillRow.cleanup
+          : 'unknown',
     consecutive_failures: Number(failures.rows[0]?.n ?? 0),
   };
 }
