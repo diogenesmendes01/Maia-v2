@@ -178,6 +178,23 @@ describe('the gauge is actually registered on /metrics', () => {
     expect(body).toMatch(/^maia_backup_readiness_level \d$/m);
   });
 
+  it('renders a NEGATIVE sentinel for an age that was never measured, never 0', async () => {
+    registerBackupReadinessGauges(
+      deps({
+        last_restore_drill_at: null,
+        last_restore_drill_result: null,
+        last_restore_drill_duration_ms: null,
+        last_restore_drill_cleanup_status: null,
+      }),
+    );
+    const body = await renderPrometheus();
+    // 0 would read as "a drill just finished" — the most dangerous lie an age
+    // series can tell. A negative age is impossible, so it is unambiguous and
+    // inert to every `> threshold` alert.
+    expect(body).toMatch(/^maia_restore_drill_age_seconds -1$/m);
+    expect(body).not.toMatch(/^maia_restore_drill_age_seconds 0$/m);
+  });
+
   /**
    * ANTI-MIRROR-TRAP. The test above registers the collector itself, so it
    * would keep passing if the production wiring were deleted. This one goes

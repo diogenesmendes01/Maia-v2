@@ -47,6 +47,9 @@ const SNAPSHOT_TTL_MS = 30_000;
  */
 const UNKNOWN_IS_FAIL = 2;
 
+/** Sentinel for an age/duration that was never measured. See `OPTIONAL_SERIES`. */
+const NEVER_MEASURED = -1;
+
 export interface BackupReadinessCollectorDeps {
   now: () => Date;
   readFacts: () => Promise<DrillEvidenceFacts>;
@@ -108,10 +111,16 @@ async function refresh(deps: BackupReadinessCollectorDeps): Promise<void> {
 const ALWAYS_EMITTED = ['maia_backup_readiness_level', 'maia_restore_drill_check_level'] as const;
 
 /**
- * Series that are omitted when never measured. An age or a duration has no
- * honest sentinel: 0 reads as "just now" and a large number as "long ago", and
- * both are claims the platform cannot make. `ALWAYS_EMITTED` above carries the
- * "we do not know" case instead.
+ * Age/duration series. `backupReadinessGaugeSnapshot` OMITS them when nothing
+ * was ever measured; a registered Prometheus gauge cannot be omitted, so on
+ * `/metrics` they carry `NEVER_MEASURED` instead.
+ *
+ * The sentinel is negative on purpose. `0` would read as "measured, and it just
+ * happened" — the most dangerous possible lie for an age — and a large positive
+ * value would trip every `> threshold` alert with a fabricated number. A
+ * negative age is impossible, so it is unambiguous to a human and inert to
+ * every alert written the natural way. The gate lives in `ALWAYS_EMITTED`
+ * above, never in these.
  */
 const OPTIONAL_SERIES = [
   'maia_backup_age_seconds',
@@ -150,10 +159,7 @@ export function registerBackupReadinessGauges(deps: BackupReadinessCollectorDeps
   for (const name of OPTIONAL_SERIES) {
     setGaugeProvider(name, async () => {
       await refresh(deps);
-      // 0 is the only safe value for a series whose meaning is "how long" and
-      // which has never been measured; the two `ALWAYS_EMITTED` gates above are
-      // what an alert reads, never these.
-      return snapshot?.[name] ?? 0;
+      return snapshot?.[name] ?? NEVER_MEASURED;
     });
   }
   registered = true;

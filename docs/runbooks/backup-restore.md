@@ -201,7 +201,7 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 | Série | Significado |
 |---|---|
 | `maia_restore_drill_check_level` | **O gate.** 0 = um drill recente provou um artefato restaurável; 1 = envelhecendo; 2 = **reprovado** (evidência vencida, último drill falhou, nunca rodou em production, ou a evidência não pôde ser lida) |
-| `maia_restore_drill_age_seconds` | Idade do drill terminal mais recente. **Ausente** quando nunca houve um — não existe sentinela honesta |
+| `maia_restore_drill_age_seconds` | Idade do drill terminal mais recente. **`-1`** quando nunca houve um: `0` leria como "acabou de rodar", a mentira mais perigosa que uma série de idade pode contar, e idade negativa é impossível (logo, inerte a qualquer alerta `> limiar`) |
 | `maia_backup_readiness_level` | O veredito agregado de backup (RPO local/off-site, falhas consecutivas, cifra, viabilidade do RPO) |
 
 O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observability/backup-readiness-collector.ts)) lê a evidência **no scrape**, não de um valor que o worker publica: se o `restore_drill` parar de rodar, um gauge publicado por ele congelaria no último valor (verde) — que é exatamente a falha que o gate existe para pegar. Pelo mesmo motivo, uma leitura que **falha** derruba o snapshot em vez de reservir o último verde.
