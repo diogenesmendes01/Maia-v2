@@ -16,6 +16,7 @@ export async function validateBehavioralHint(
     { name: 'behavioral-hint-validator', triggered_by: 'sync_required', timeoutMs: 4000 },
     async () => {
       const res = await callLLM({
+        workload: 'behavioral_hint',
         system: validatorPrompt(),
         messages: [
           {

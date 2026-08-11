@@ -39,7 +39,12 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
-import { llmSuggester } from '@/cognition/role-selector/llm-suggester.js';
+import { llmSuggester as rawLlmSuggester } from '@/cognition/role-selector/llm-suggester.js';
+import { scopedFn } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant. Em produção o role selector
+// roda dentro do turno, que já abre o contexto — ver tests/helpers/llm-scope.ts.
+const llmSuggester = { suggest: scopedFn(rawLlmSuggester.suggest.bind(rawLlmSuggester)) };
 import { SuggestedBy, RoleSelectorStrength } from '@/types/enums.js';
 import type { Role, ChannelPolicy } from '@/db/schema.js';
 import type { RoleSelectorInput } from '@/cognition/role-selector/types.js';

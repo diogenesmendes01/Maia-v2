@@ -1,4 +1,4 @@
-import { checkAll } from '@/lib/healthcheck.js';
+import { checkAll, recordHealthSnapshot } from '@/lib/healthcheck.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { logger } from '@/lib/logger.js';
 import { healthRepo } from '@/db/repositories.js';
@@ -20,6 +20,10 @@ export async function runHealthMonitor(): Promise<void> {
 
 async function runHealthMonitorInner(): Promise<void> {
   const report = await checkAll();
+  // Issue #512: historical persistence moved OUT of `checkAll()` (which the
+  // `/health` probe calls) and into this once-a-minute cron tick. Probes are
+  // read-only; the timeline lives here.
+  await recordHealthSnapshot(report.components);
   for (const c of report.components) {
     if (c.status === 'ok') {
       const wasDown = downSinceByComponent.has(c.component);

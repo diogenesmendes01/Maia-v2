@@ -1,6 +1,7 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import { config } from '@/config/env.js';
+import { recordDbQuery } from './query-counter.js';
 
 export const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
@@ -52,7 +53,42 @@ export async function probeDb(): Promise<boolean> {
   return dbConnected;
 }
 
-export const db = drizzle(pool);
+/**
+ * Issue #511 — transparent query-counting wrapper around the pg client handed
+ * to drizzle.
+ *
+ * Every drizzle statement bottoms out in `client.query(...)` (see
+ * `drizzle-orm/node-postgres/session.js`), so intercepting that single method
+ * yields an exact DB round-trip count for whatever `runWithQueryCounter` frame
+ * is open — the number the turn-context budget in issue #511 is measured
+ * against.
+ *
+ * Deliberately a `Proxy` rather than a monkey-patch of `pool.query`:
+ *   - the exported `pool` keeps its exact pg semantics (`pool.end()` in
+ *     `shutdownDb`, `pool.connect()` in `probeDb`/`withTx`, the `error` event
+ *     handler above) — nothing outside drizzle changes behaviour;
+ *   - the proxy is transparent to drizzle's own type probes: `isConfig()`
+ *     reads `constructor.name` (forwarded → `BoundPool`, not `Object`) and the
+ *     transaction path does `client instanceof Pool` (forwarded through the
+ *     prototype chain), so both still classify it as a pool.
+ *
+ * Zero behavioural change when no counter frame is open: `recordDbQuery()` is
+ * an ALS read plus a null check.
+ */
+function instrumentQueries<T extends object>(client: T): T {
+  return new Proxy(client, {
+    get(target, prop, receiver): unknown {
+      const value: unknown = Reflect.get(target, prop, receiver);
+      if (prop !== 'query' || typeof value !== 'function') return value;
+      return function instrumentedQuery(this: unknown, ...args: unknown[]): unknown {
+        recordDbQuery();
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+}
+
+export const db = drizzle(instrumentQueries(pool));
 
 export async function withTx<T>(fn: (tx: typeof db) => Promise<T>): Promise<T> {
   const client = await pool.connect();
@@ -61,7 +97,9 @@ export async function withTx<T>(fn: (tx: typeof db) => Promise<T>): Promise<T> {
     // drizzle(client) returns NodePgDatabase & { $client: PoolClient } —
     // structurally identical to `db` for query purposes; the unknown-bridge
     // cast tells TS the $client divergence is intentional.
-    const tx = drizzle(client) as unknown as typeof db;
+    // #511: the transaction's client is instrumented too, so statements issued
+    // through `tx` are counted the same as statements issued through `db`.
+    const tx = drizzle(instrumentQueries(client)) as unknown as typeof db;
     const result = await fn(tx);
     await client.query('COMMIT');
     return result;

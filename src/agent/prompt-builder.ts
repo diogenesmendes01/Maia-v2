@@ -1,28 +1,52 @@
+/**
+ * Issue #525 — the PROMPT RENDERER.
+ *
+ * This module used to be the turn's I/O layer as well as its renderer: it
+ * imported thirteen repositories and interleaved reads with string building, so
+ * "does rendering touch the database?" could only be answered by reading every
+ * branch. It no longer imports a single repository — all reads moved to
+ * `turn-context/loader.ts`, and `renderTurnPrompt` below is SYNCHRONOUS.
+ *
+ * Synchronous is the proof, not a style choice. A function that cannot `await`
+ * cannot consume a repository promise, so "no lazy I/O hidden inside rendering"
+ * stops being a convention a future edit can quietly break and becomes
+ * something `tsc` rejects. `buildPrompt` keeps its old signature and is now
+ * exactly two steps: load, then render.
+ *
+ * What is still allowed inside the renderer: in-process metric counters
+ * (`applyBudget` → `recordTruncation`/`recordSectionSize`). Those are memory
+ * writes on a Prometheus registry, not round-trips, and keeping them next to
+ * the code that decides what to cut is what makes the truncation numbers
+ * trustworthy.
+ */
 import { config } from '@/config/env.js';
-import {
-  selfStateRepo,
-  factsRepo,
-  rulesRepo,
-  mensagensRepo,
-  entityStatesRepo,
-  entidadesRepo,
-  memoryEntryRepo,
-  behavioralHintRepo,
-  capabilitiesSkillRepo,
-  capabilityGapsRepo,
-  procedureExecutionsRepo,
-  procedureDefinitionsRepo,
-  operationalProfileVersionsRepo,
-} from '@/db/repositories.js';
-import type { Pessoa, Conversa, Mensagem, BehavioralHint, Role, ProcedureExecution } from '@/db/schema.js';
+import { runWithQueryCounter } from '@/db/query-counter.js';
+import type {
+  AgentCapabilityGap,
+  AgentCapabilitySkill,
+  BehavioralHint,
+  Conversa,
+  MemoryEntry,
+  Mensagem,
+  Pessoa,
+  ProcedureExecution,
+  Role,
+} from '@/db/schema.js';
 import type { ResolvedPermission } from '@/governance/permissions.js';
-import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { fmtBR } from '@/lib/brazilian.js';
+import { resolveInterlocutorTz } from '@/lib/timezone.js';
 import type { LLMMessage } from '@/lib/claude.js';
-import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
 import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
+import { applyBudget, truncateUtf8, utf8Bytes } from './turn-context/budget.js';
+import { loadTurnContext, type TurnContextSnapshot } from './turn-context/loader.js';
+import {
+  recordSectionStatus,
+  recordTurnContextLoad,
+  type TurnContextResult,
+} from './turn-context/metrics.js';
+import { SECTION_BUDGETS, SELF_AWARENESS_GAP_MAX_ITEMS } from './turn-context/types.js';
 import {
   DOMAIN_KEYWORDS,
   type ToolExecutionSummary,
@@ -550,7 +574,7 @@ function renderContradictionOverlay({ fresh, stale }: ContradictionBuckets): str
  *   - Sempre inclui `display_name` (mínimo identificador do modo).
  *   - description e prompt_addendum entram apenas se presentes (não vazios).
  */
-async function buildRoleSection(role: Role | null | undefined): Promise<string | null> {
+function buildRoleSection(role: Role | null | undefined): string | null {
   if (!role) return null;
   if (role.is_default) return null;
   if (!role.prompt_addendum && !role.description) return null;
@@ -573,11 +597,25 @@ async function buildRoleSection(role: Role | null | undefined): Promise<string |
  *   indicando que já há proposta de melhoria registrada.
  * - Retorna null quando não há nada a injetar (chamador omite a seção).
  */
-async function buildGapMentionSection(): Promise<string | null> {
-  const gaps =
-    (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [];
+function buildGapMentionSection(gaps: readonly AgentCapabilityGap[]): string | null {
+  // Issue #511 round 1 review — deliberately NOT cached. A gap that was
+  // resolved must stop being announced immediately, not after a TTL.
+  //
+  // Issue #525: the rows arrive from the loader's SINGLE
+  // `listByLevels([mentionable, proposed])` read, shared with the
+  // self-awareness clause below — one statement now serves both blocks.
   if (gaps.length === 0) return null;
-  const lines = gaps.slice(0, 5).map((g) => {
+  // #511: the 5-gap cap is now metered instead of silent (token bloat guard).
+  const lines = applyBudget(
+    'gaps',
+    gaps,
+    SECTION_BUDGETS.gaps,
+    (g) => utf8Bytes(g.capability_description),
+    (g, maxBytes) => ({
+      ...g,
+      capability_description: truncateUtf8(g.capability_description, maxBytes),
+    }),
+  ).items.map((g) => {
     const proposedSuffix =
       g.current_level === GapLevel.PROPOSED ? ' (proposta de melhoria já enviada)' : '';
     return `- Se o usuário perguntar sobre ${g.capability_description}, você pode explicar honestamente que isso é uma limitação atual${proposedSuffix}.`;
@@ -585,274 +623,335 @@ async function buildGapMentionSection(): Promise<string | null> {
   return `## Limitações conhecidas (mencionar com transparência se vier à tona)\n${lines.join('\n')}`;
 }
 
+/**
+ * Issue #511 / #525 — instrumented entry point.
+ *
+ * Two steps, in this order and no others: LOAD the turn context (the only place
+ * a turn touches the database — `turn-context/loader.ts`), then RENDER it. The
+ * wrapper opens a query-counter frame (`src/db/query-counter.ts`, fed by the
+ * instrumented drizzle client) and publishes the round-trip count and duration,
+ * so the budget asserted in `tests/unit/turn-context-round-trips.spec.ts` has a
+ * production counterpart rather than being a unit-test-only fiction.
+ *
+ * Phase label moved from `legacy` to `loader` (#525): `legacy` named the
+ * pre-#511 waterfall, and that waterfall no longer exists. A dashboard that
+ * still shows `phase="legacy"` after this deploy is looking at an old replica.
+ *
+ * `result` is now three-valued. A turn whose optional sections degraded still
+ * returns a prompt, but it is NOT the same event as a clean one, and reporting
+ * both as `ok` is exactly the ambiguity issue #511 exists to remove.
+ *
+ * The counter frame is per-call and ALS-scoped: concurrent turns never share a
+ * frame, and the count is reported from `finally` so a throwing build still
+ * publishes what it spent before failing.
+ */
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
-  // P4: operational profile v2. An active profile renders via
-  // renderOperationalProfile; a missing or non-'active' profile falls back to
-  // self_state (runtime defense — never expose a `proposed`/`frozen` profile
-  // even if the DB invariant slips).
-  let renderedV2: RenderedProfile | null;
-  let selfVersionLabel: string;
-  let systemPromptBody: string;
-  let resumoAprendizadosBody: string;
-
-  const profile = await operationalProfileVersionsRepo.getActive();
-  if (profile && profile.status === 'active') {
-    renderedV2 = renderOperationalProfile({ version: profile });
-    systemPromptBody = renderedV2.system_prompt_block;
-    selfVersionLabel = `op_profile_v${profile.version}`;
-    resumoAprendizadosBody = '(perfil v2 ativo)';
-  } else {
-    if (profile) {
-      // Profile loaded but status !== 'active' — runtime defense, should never
-      // happen if the DB invariant holds. Log + fall back to self_state.
-      logger.warn(
-        { has_profile: true, status: profile.status },
-        'identity.profile_v2_invalid_fallback_to_self_state',
-      );
+  const started_at = Date.now();
+  return runWithQueryCounter(async (counter) => {
+    let result: TurnContextResult = 'ok';
+    try {
+      const snapshot = await loadTurnContext({
+        pessoa_id: ctx.pessoa?.id,
+        conversa_id: ctx.conversa?.id,
+        entidade_ids: ctx.scope.entidades,
+        current_role_id: ctx.current_role_id,
+        current_channel_id: ctx.current_channel_id,
+        activeRole: ctx.activeRole,
+        activeExecution: ctx.activeExecution,
+      });
+      if (snapshot.degraded_sections.length > 0) result = 'degraded';
+      return renderTurnPrompt(ctx, snapshot);
+    } catch (err) {
+      result = 'error';
+      throw err;
+    } finally {
+      recordTurnContextLoad({
+        phase: 'loader',
+        result,
+        duration_ms: Date.now() - started_at,
+        query_count: counter.count,
+      });
     }
-    const self = await selfStateRepo.getActive();
-    systemPromptBody = self?.system_prompt ?? 'Você é a Maia.';
-    selfVersionLabel = `self_state_v${self?.versao ?? 0}`;
-    resumoAprendizadosBody = self?.resumo_aprendizados ?? '(vazio)';
-  }
+  });
+}
 
-  const recent = await mensagensRepo.recentInConversation(ctx.conversa.id, 10);
-  const ents = await entidadesRepo.byIds(ctx.scope.entidades);
-  // PR #82 review (Superpowers Critical #1): route legacy factsBlock
-  // through the memory_entry sensitivity filter. listMentionableForScopes
-  // drops any fact whose corresponding memory_entry row has
-  // mention_allowed=false or needs_review=true. Sensitive content captured
-  // before P2 stays out of the prompt while the classifier reviews it.
-  const facts = await factsRepo.listMentionableForScopes([
-    'global',
-    `pessoa:${ctx.pessoa.id}`,
-    ...ctx.scope.entidades.map((e) => `entidade:${e}`),
-  ]);
-  const rules = await rulesRepo.listActive('classificacao');
+/**
+ * "## Memória relevante" — pure. `proactive_use=false` memories only surface
+ * when the CURRENT message already touches their topic, so the filter needs the
+ * inbound text and nothing else.
+ */
+function renderMemorySection(ctx: PromptContext, memoryEntries: readonly MemoryEntry[]): string {
+  const currentText = (ctx.inbound?.conteudo ?? '').toLowerCase();
+  const usableMemories = memoryEntries.filter((m) => {
+    if (m.proactive_use) return true;
+    const memWords = m.content
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 4);
+    return memWords.some((w) => currentText.includes(w));
+  });
 
-  const profileBlock = Array.from(ctx.scope.byEntity.entries())
-    .map(([eid, rp]) => {
-      const ent = ents.find((e) => e.id === eid);
-      return `  - ${ent?.nome ?? eid}: profile=${rp.profile.id}, limite=R$ ${rp.effective_limits.valor_max}`;
-    })
-    .join('\n');
+  // Split: only mention_allowed enters the prompt literally. The hidden-
+  // influence subset is represented via behavioral hints derived from it.
+  const mentionableMemories = usableMemories.filter((m) => m.mention_allowed);
+  if (mentionableMemories.length === 0) return '';
 
-  const factsBlock = facts
-    .slice(0, 20)
-    .map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`)
-    .join('\n');
+  // P83-C6: wrap memory content in <memory> tags so the LLM treats it as DATA,
+  // not as instruction. Without this, a stored memory containing "ignore
+  // previous rules…" would be interpolated raw into the system prompt.
+  const lines = mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`);
+  const budgeted = applyBudget('memories', lines, SECTION_BUDGETS.memories, utf8Bytes, truncateUtf8);
+  return '\n## Memória relevante\n' + budgeted.items.join('\n');
+}
 
-  const rulesBlock = rules
-    .slice(0, 20)
-    .map(
-      (r) =>
-        `  - [#${r.id.slice(0, 8)}] (${r.tipo}, conf ${r.confianca}) ${wrapRule(`${r.contexto} → ${r.acao}`)}`,
-    )
-    .join('\n');
+/** "## Instruções comportamentais ativas" — pure. */
+function renderHintsSection(allHints: readonly BehavioralHint[]): string {
+  if (allHints.length === 0) return '';
+  // P83-C6: hints are derived from observed conversations and so may carry
+  // untrusted text. Wrap them as <hint> data.
+  const lines = allHints.map((h) => `- ${wrapHint(h.hint_text)}`);
+  const budgeted = applyBudget('hints', lines, SECTION_BUDGETS.hints, utf8Bytes, truncateUtf8);
+  return '\n## Instruções comportamentais ativas\n' + budgeted.items.join('\n');
+}
 
-  const entityStateBlocks: string[] = [];
-  for (const eid of ctx.scope.entidades) {
-    const st = await entityStatesRepo.byId(eid);
-    if (!st) continue;
-    const ent = ents.find((e) => e.id === eid);
-    entityStateBlocks.push(
-      `  - ${ent?.nome ?? eid}: saldo=${st.saldo_consolidado ?? '?'}, próximo_venc=${st.proximo_vencimento ?? '?'}`,
-    );
-  }
+/**
+ * "## Autoconhecimento" — pure.
+ *
+ * Issue #511 round 1 review: skills and gaps are read fresh every turn, never
+ * cached. A REVOKED skill or a resolved gap must stop being announced
+ * immediately, not after a TTL.
+ *
+ * Issue #525: `gaps` arrives as the mentionable-OR-proposed set loaded once for
+ * the whole turn; this clause takes the `mentionable` subset. Filtering
+ * preserves relative order, so the rendered bytes are unchanged from when this
+ * was its own `listByLevel('mentionable')` round-trip.
+ */
+function renderSelfAwarenessSection(
+  skills: readonly AgentCapabilitySkill[],
+  gaps: readonly AgentCapabilityGap[],
+): string {
+  const mentionableGapRows = gaps.filter((g) => g.current_level === GapLevel.MENTIONABLE);
 
-  // P2: Load memory_entry respecting visibility flags, behavioral hints, and
-  // self-awareness (capabilities + gaps). Wrapped in try/catch so any DB
-  // failure or missing repo (e.g. older test mocks) degrades gracefully —
-  // the existing prompt is still produced.
-  let memorySection = '';
-  let hintsSection = '';
-  let selfAwarenessSection = '';
-  let roleSection = '';
-  let procedureSection = '';
-  let gapMentionSection = '';
+  // Deterministic order before the cut: sort by confidence, then by name so two
+  // skills with equal confidence never swap places between turns (which would
+  // change the prompt bytes for no reason and defeat prompt caching).
+  const sortedSkills = [...skills].sort(
+    (a, b) =>
+      Number(b.confidence) - Number(a.confidence) || a.skill_name.localeCompare(b.skill_name),
+  );
+  // Issue #511 round 2 review: both lists share the section's single
+  // `max_bytes`, applied in render order — skills first, then gaps against
+  // whatever is left. Sharing one allowance (rather than giving each its own)
+  // is what makes the SECTION bounded instead of just each clause. Each list
+  // keeps its own item cap, and both report under the `capabilities` label.
+  const skillsBudgeted = applyBudget(
+    'capabilities',
+    sortedSkills,
+    SECTION_BUDGETS.capabilities,
+    (s) => utf8Bytes(s.skill_name),
+    (s, maxBytes) => ({ ...s, skill_name: truncateUtf8(s.skill_name, maxBytes) }),
+  );
+  const topSkills = skillsBudgeted.items;
+  const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
+  const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
 
-  try {
-    const memoryEntries = (await memoryEntryRepo?.findRelevant?.({
-      interlocutor_id: ctx.pessoa?.id,
-      conversa_id: ctx.conversa?.id,
-      // PR #82 review (Superpowers Critical #4): pass current role/channel
-      // so scope_type='role'/'channel' memories are actually filtered.
-      // When the caller omits these, role/channel-scoped memories are
-      // simply not returned — which is the safe default before P6 plumbs
-      // these through the agent core.
-      role_id: ctx.current_role_id ?? undefined,
-      channel_id: ctx.current_channel_id ?? undefined,
-      limit: 30,
-    })) ?? [];
+  const gapsBudgeted = applyBudget(
+    'capabilities',
+    mentionableGapRows,
+    {
+      max_items: SELF_AWARENESS_GAP_MAX_ITEMS,
+      max_bytes: Math.max(0, SECTION_BUDGETS.capabilities.max_bytes - skillsBudgeted.bytes),
+    },
+    (g) => utf8Bytes(g.capability_description),
+    (g, maxBytes) => ({
+      ...g,
+      capability_description: truncateUtf8(g.capability_description, maxBytes),
+    }),
+  );
+  // A pathological skill list can consume the whole allowance, clipping a gap
+  // description to nothing. Rendering "Ainda não tem: ." would be noise, so drop
+  // the emptied entries — the loss is already on
+  // `maia_turn_context_truncated_total`, so this is not a silent drop.
+  const mentionableGaps = gapsBudgeted.items.filter((g) => g.capability_description.length > 0);
 
-    // Respect proactive_use: if false, only include when current message
-    // touches the topic (simple keyword overlap heuristic).
-    const currentText = (ctx.inbound?.conteudo ?? '').toLowerCase();
-    const usableMemories = memoryEntries.filter((m) => {
-      if (m.proactive_use) return true;
-      const memWords = m.content
-        .toLowerCase()
-        .split(/\s+/)
-        .filter((w) => w.length > 4);
-      return memWords.some((w) => currentText.includes(w));
-    });
+  const lines = [
+    masteredSkills.length
+      ? `Você domina: ${masteredSkills.map((s) => s.skill_name).join(', ')}.`
+      : '',
+    learningSkills.length
+      ? `Está aprendendo: ${learningSkills.map((s) => s.skill_name).join(', ')}.`
+      : '',
+    mentionableGaps.length
+      ? `Ainda não tem: ${mentionableGaps
+          .map((g) => wrapGap(g.capability_description))
+          .join(', ')}.`
+      : '',
+  ].filter(Boolean);
 
-    // Split: only mention_allowed enters the prompt literally. The hidden-
-    // influence subset is represented via behavioral hints derived from it.
-    const mentionableMemories = usableMemories.filter((m) => m.mention_allowed);
+  return lines.length > 0 ? '\n## Autoconhecimento\n' + lines.join('\n') : '';
+}
 
-    if (mentionableMemories.length > 0) {
-      // P83-C6: wrap memory content in <memory> tags so the LLM treats
-      // it as DATA, not as instruction. Without this, a stored memory
-      // that contains "ignore previous rules…" would be interpolated raw
-      // into the system prompt and could override governance.
-      memorySection =
-        '\n## Memória relevante\n' +
-        mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully — DB unavailable or repo unmocked in tests.
-  }
-
-  try {
-    const scopeQueries: Array<{ scope_type: string; subject_id?: string | null }> = [
-      { scope_type: 'interlocutor', subject_id: ctx.pessoa?.id },
-      { scope_type: 'conversation', subject_id: ctx.conversa?.id },
-      // PR #82 review (Superpowers Critical #4): include role/channel
-      // scope hints when the caller plumbed them.
-      ...(ctx.current_role_id
-        ? [{ scope_type: 'role', subject_id: ctx.current_role_id }]
-        : []),
-      ...(ctx.current_channel_id
-        ? [{ scope_type: 'channel', subject_id: ctx.current_channel_id }]
-        : []),
-      { scope_type: 'agent', subject_id: null },
-    ];
-    const allHints: BehavioralHint[] = [];
-    for (const sq of scopeQueries) {
-      // Skip interlocutor/conversation queries when subject id is missing.
-      if (sq.scope_type !== 'agent' && !sq.subject_id) continue;
-      const hints =
-        (await behavioralHintRepo?.findActiveForScope?.({
-          scope_type: sq.scope_type,
-          subject_id: sq.subject_id ?? null,
-        })) ?? [];
-      allHints.push(...hints);
-    }
-    if (allHints.length > 0) {
-      // P83-C6: hints are derived from observed conversations and so
-      // may carry untrusted text. Wrap them as <hint> data.
-      hintsSection =
-        '\n## Instruções comportamentais ativas\n' +
-        allHints.map((h) => `- ${wrapHint(h.hint_text)}`).join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
-
-  try {
-    const allSkills = (await capabilitiesSkillRepo?.listAll?.()) ?? [];
-    const topSkills = [...allSkills]
-      .sort((a, b) => Number(b.confidence) - Number(a.confidence))
-      .slice(0, 5);
-    const masteredSkills = topSkills.filter((s) => Number(s.confidence) >= 0.7);
-    const learningSkills = topSkills.filter((s) => Number(s.confidence) < 0.5);
-    const mentionableGaps = (await capabilityGapsRepo?.listByLevel?.('mentionable')) ?? [];
-
-    const lines = [
-      masteredSkills.length
-        ? `Você domina: ${masteredSkills.map((s) => s.skill_name).join(', ')}.`
-        : '',
-      learningSkills.length
-        ? `Está aprendendo: ${learningSkills.map((s) => s.skill_name).join(', ')}.`
-        : '',
-      mentionableGaps.length
-        ? `Ainda não tem: ${mentionableGaps
-            .slice(0, 3)
-            .map((g) => wrapGap(g.capability_description))
-            .join(', ')}.`
-        : '',
-    ].filter(Boolean);
-
-    if (lines.length > 0) {
-      selfAwarenessSection = '\n## Autoconhecimento\n' + lines.join('\n');
-    }
-  } catch {
-    // Degrade gracefully.
-  }
-
-  // P6 Task 9: injeta "## Modo operacional" entre selfAwareness e procedure
-  // para respeitar a precedência da spec §10.7 (CHANNEL POLICY > PROCEDURE).
-  // Tolerante a ausência de role e omitido para o role default (ver
-  // buildRoleSection — MULTI_CHANNEL removido / sempre on após #411).
-  try {
-    const section = await buildRoleSection(ctx.activeRole);
-    if (section) roleSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — role section é não-essencial ao turno base.
-  }
-
-  // P3b Task 8: if there's an active procedure_execution for this conversa,
-  // surface it in the system prompt so the model can follow the step's
-  // intencao/como/sucesso/armadilhas instead of improvising. Wrapped in
-  // try/catch so missing repos in tests or any DB failure leave the prompt
-  // intact — procedure runtime is non-essential to the baseline turn.
-  //
-  // PR #84 Minor #7: prefer the execution that core.ts already loaded
-  // (`ctx.activeExecution`) over a fresh DB roundtrip. `undefined` means the
-  // caller didn't provide one (legacy / test) → fall back to lookup. `null`
-  // means the caller looked and found nothing → skip the section entirely.
-  try {
-    if (ctx.conversa?.id) {
-      const activeExec =
-        ctx.activeExecution !== undefined
-          ? ctx.activeExecution
-          : await procedureExecutionsRepo?.findActiveForConversa?.(ctx.conversa.id);
-      if (activeExec) {
-        const def = await procedureDefinitionsRepo?.findById?.(activeExec.definition_id);
-        if (def && activeExec.current_step_id) {
-          const steps = def.steps as unknown as Array<{
-            id: string;
-            intencao?: string;
-            como?: string;
-            sucesso_criteria_ref?: string;
-            armadilhas?: string[];
-          }>;
-          const criteria = def.success_criteria as unknown as Array<{
-            id: string;
-            type?: string;
-          }>;
-          const currentStep = steps.find((s) => s.id === activeExec.current_step_id);
-          if (currentStep) {
-            const matchingCriterion = currentStep.sucesso_criteria_ref
-              ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
-              : null;
-            const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
-            procedureSection = `\n## Procedimento em execução
+/**
+ * "## Procedimento em execução" — pure.
+ *
+ * P3b Task 8: when a procedure_execution is active for this conversa, surface
+ * the current step's intencao/como/sucesso/armadilhas so the model follows it
+ * instead of improvising. The execution + definition pair is resolved by the
+ * loader (and, in production, the execution is already in hand from `core.ts`,
+ * so the typical turn pays no round-trip for it at all).
+ */
+function renderProcedureSection(procedure: TurnContextSnapshot['procedure']['value']): string {
+  if (!procedure) return '';
+  const { execution: activeExec, definition: def } = procedure;
+  if (!activeExec.current_step_id) return '';
+  const steps = def.steps as unknown as Array<{
+    id: string;
+    intencao?: string;
+    como?: string;
+    sucesso_criteria_ref?: string;
+    armadilhas?: string[];
+  }>;
+  const criteria = def.success_criteria as unknown as Array<{
+    id: string;
+    type?: string;
+  }>;
+  const currentStep = steps.find((s) => s.id === activeExec.current_step_id);
+  if (!currentStep) return '';
+  const matchingCriterion = currentStep.sucesso_criteria_ref
+    ? criteria.find((c) => c.id === currentStep.sucesso_criteria_ref)
+    : null;
+  const stateJson = JSON.stringify(activeExec.execution_state, null, 2);
+  return `\n## Procedimento em execução
 Você está executando "${def.nome}" v${def.version_number}, passo atual: "${currentStep.id}".
 Intenção do passo: ${currentStep.intencao ?? 'não especificada'}.
 Como executar: ${currentStep.como ?? 'não especificado'}.${matchingCriterion ? `\nCritério de sucesso (${matchingCriterion.type}).` : ''}${currentStep.armadilhas?.length ? `\nArmadilhas comuns: ${currentStep.armadilhas.join('; ')}.` : ''}
 
 Estado coletado:
 ${stateJson}`;
-          }
-        }
-      }
-    }
-  } catch {
-    // Degrade gracefully — procedure runtime must not break baseline prompt.
-  }
+}
 
-  // P5 Task 10: surface gaps em nível mentionable/proposed para que o agente
-  // possa ser transparente sobre limitações conhecidas se vierem à tona.
-  // Flag-gated (DIALOGICAL_ACQUISITION). Tolerante a falhas: qualquer erro
-  // de repo degrada para "sem seção" sem quebrar o prompt.
-  try {
-    const section = await buildGapMentionSection();
-    if (section) gapMentionSection = '\n' + section;
-  } catch {
-    // Degrade gracefully — gap mention é não-essencial ao turno.
+/**
+ * Issue #525 — the PURE renderer.
+ *
+ * Synchronous by design: a function that cannot `await` cannot issue a query,
+ * so "the renderer performs no I/O" is enforced by the compiler rather than by
+ * review. Everything it needs is already in `snapshot`; everything it emits is
+ * a deterministic function of `(ctx, snapshot)` plus the wall clock (the
+ * "## Estado atual" timestamp, which was already time-dependent).
+ *
+ * Section ORDER is fixed here and mirrors the order the budgets are applied, so
+ * a reordering mistake shows up as a diff in the byte-identity fixtures rather
+ * than as a silently reshuffled prompt.
+ */
+export function renderTurnPrompt(
+  ctx: PromptContext,
+  snapshot: TurnContextSnapshot,
+): { system: string; messages: LLMMessage[] } {
+  const { systemPromptBody, selfVersionLabel, resumoAprendizadosBody } = snapshot.identity.value;
+
+  // #511 round 1 review: `history` declared a budget but never went through
+  // `applyBudget`, so the item cap was enforced (by the repo's LIMIT) while the
+  // byte ceiling was not — one long message could still blow the prompt.
+  //
+  // `recentInConversation` returns NEWEST-FIRST (the render below reverses it),
+  // so a prefix keeps the most recent turns and drops the oldest. That is the
+  // right end to cut: recency is what the model needs. The oversized-single-
+  // message case is clipped rather than dropped, so a turn whose latest message
+  // is huge still shows the model what was just said.
+  const recent = applyBudget(
+    'history',
+    snapshot.history.value,
+    SECTION_BUDGETS.history,
+    (m) => utf8Bytes(m.conteudo ?? ''),
+    (m, maxBytes) => ({ ...m, conteudo: truncateUtf8(m.conteudo ?? '', maxBytes) }),
+  ).items;
+
+  // #511: index once instead of a linear scan per entity — the scope block and
+  // the state block below both look entities up by id.
+  const entById = new Map(snapshot.entities.value.map((e) => [e.id, e]));
+
+  const profileBlock = Array.from(ctx.scope.byEntity.entries())
+    .map(([eid, rp]) => {
+      const ent = entById.get(eid);
+      const limite =
+        rp.effective_limits.valor_max === null
+          ? 'sem limite individual (teto global aplica)'
+          : `R$ ${rp.effective_limits.valor_max}`;
+      return `  - ${ent?.nome ?? eid}: profile=${rp.profile.id}, limite=${limite}`;
+    })
+    .join('\n');
+
+  // Issue #511 — the `.slice(0, 20)` caps that used to live here were
+  // deterministic but INVISIBLE: a tenant whose 200 facts were being cut to 20
+  // looked exactly like a tenant that had 20. `applyBudget` keeps the same cut,
+  // adds a byte ceiling, and counts every dropped item onto
+  // `maia_turn_context_truncated_total`.
+  const factsBlock = applyBudget(
+    'facts',
+    snapshot.facts.value.map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`),
+    SECTION_BUDGETS.facts,
+    utf8Bytes,
+    truncateUtf8,
+  ).items.join('\n');
+
+  const rulesBlock = applyBudget(
+    'rules',
+    snapshot.rules.value.map(
+      (r) =>
+        `  - [#${r.id.slice(0, 8)}] (${r.tipo}, conf ${r.confianca}) ${wrapRule(`${r.contexto} → ${r.acao}`)}`,
+    ),
+    SECTION_BUDGETS.rules,
+    utf8Bytes,
+    truncateUtf8,
+  ).items.join('\n');
+
+  // Rendering walks `ctx.scope.entidades`, so the state block's ORDER is scope
+  // order (not DB order) and entities without a state row are still skipped —
+  // the block is byte-identical to the pre-batch output.
+  const stateByEntityId = new Map(snapshot.entity_states.value.map((s) => [s.entidade_id, s]));
+
+  const entityStateLines: string[] = [];
+  for (const eid of ctx.scope.entidades) {
+    const st = stateByEntityId.get(eid);
+    if (!st) continue;
+    const ent = entById.get(eid);
+    entityStateLines.push(
+      `  - ${ent?.nome ?? eid}: saldo=${st.saldo_consolidado ?? '?'}, próximo_venc=${st.proximo_vencimento ?? '?'}`,
+    );
   }
+  // #511 round 1 review: `entity_states` declared a budget but never went
+  // through `applyBudget`, so an elephant tenant's scope rendered unbounded.
+  // Entity NAMES are tenant-controlled free text, so the byte ceiling matters
+  // here as much as the item cap.
+  const entityStateBlocks = applyBudget(
+    'entity_states',
+    entityStateLines,
+    SECTION_BUDGETS.entity_states,
+    utf8Bytes,
+    truncateUtf8,
+  ).items;
+
+  // Order of these six is the order they are concatenated onto the system
+  // prompt at the bottom of this function.
+  const memorySection = renderMemorySection(ctx, snapshot.memories.value);
+  const hintsSection = renderHintsSection(snapshot.hints.value);
+  const selfAwarenessSection = renderSelfAwarenessSection(
+    snapshot.capabilities.value,
+    snapshot.gaps.value,
+  );
+  // P6 Task 9: "## Modo operacional" sits between selfAwareness and procedure
+  // to respect spec §10.7 precedence (CHANNEL POLICY > PROCEDURE). The role is
+  // already in hand (zero round-trips), but whether it renders depends on the
+  // gates in `buildRoleSection`, which is why the section metric is emitted
+  // here rather than in the loader.
+  const roleBlock = buildRoleSection(snapshot.role.value);
+  const roleSection = roleBlock ? '\n' + roleBlock : '';
+  recordSectionStatus('role', roleSection ? 'loaded' : 'empty');
+  const procedureSection = renderProcedureSection(snapshot.procedure.value);
+  // P5 Task 10: surface gaps at mentionable/proposed level so the agent can be
+  // transparent about known limitations if they come up.
+  const gapMentionBlock = buildGapMentionSection(snapshot.gaps.value);
+  const gapMentionSection = gapMentionBlock ? '\n' + gapMentionBlock : '';
 
   // Issue #73 — scope-change sentinel + backend events + contradiction overlay.
   // These three blocks are computed once and injected at fixed positions in
@@ -898,12 +997,18 @@ ${stateJson}`;
     systemSections.push(scopeSentinelBlock, '');
   }
 
+  const interlocutorTz = resolveInterlocutorTz(ctx.pessoa);
+
   systemSections.push(
     '## Escopo desta conversa',
     profileBlock || '  (sem entidades acessíveis)',
     '',
     '## Estado atual',
-    `- Hoje: ${fmtBR(new Date())}`,
+    // Inclui data, hora local E offset de fuso (ex.: "18/06/2026 22:10:00 -03:00").
+    // Sem a hora-do-dia o agente não consegue confirmar se um horário pedido ainda
+    // está no futuro nem montar o ISO 8601 correto para `schedule_reminder`. O fuso
+    // é o do interlocutor (preferencias.timezone) com fallback para config.TZ.
+    `- Agora: ${fmtBR(new Date(), 'dd/MM/yyyy HH:mm:ss xxx', interlocutorTz)} (fuso ${interlocutorTz})`,
     entityStateBlocks.join('\n') || '  (sem estados ativos)',
     '',
   );

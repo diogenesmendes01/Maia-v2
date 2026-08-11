@@ -566,6 +566,21 @@ export async function setGlobalLLMSettingsAtomic(input: {
     return null;
   }
 
+  // Issue #508: a escrita é a única fonte de verdade que muda o modelo em
+  // runtime, então é aqui que a invalidação distribuída nasce — não no router
+  // do Admin. Import dinâmico para não criar ciclo
+  // (cache-invalidation → model-resolver → llm-settings).
+  //
+  // Fire-and-forget de propósito: a escrita JÁ foi commitada no Postgres. Se o
+  // save do Admin esperasse o Redis, uma indisponibilidade de cache viraria
+  // latência (ou erro) numa operação que já teve sucesso. Sem a mensagem, cada
+  // réplica ainda converge pelo TTL curto do cache de settings.
+  if (res.ok) {
+    void import('@/lib/llm/cache-invalidation.js')
+      .then((m) => m.publishLLMSettingsInvalidation())
+      .catch(() => undefined);
+  }
+
   if (!res.ok) {
     if (res.reason === 'optimistic_conflict') {
       // Translate the repo's key namespace back to the LLM-domain

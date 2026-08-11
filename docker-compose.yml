@@ -1,16 +1,34 @@
+# =======================================================================
+# docker-compose.yml — DEV compose. NÃO use em produção.
+#
+# Produção: `compose.prod.yml` (sem portas de datastore no host, Redis com
+# auth, containers non-root, env por serviço). Ver README §"Setup produção"
+# e docs/runbooks/deploy-prod.md.
+#
+# Este arquivo existe para o fluxo local (`docker compose up -d postgres
+# redis`, usado também por `npm run test:integration:setup`). Postgres e
+# Redis ficam publicados APENAS em 127.0.0.1 — nunca em 0.0.0.0 — para que
+# uma máquina de dev em rede aberta não exponha datastore com credencial
+# fraca (auditoria P0 cap. 6).
+# =======================================================================
 services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: maia-postgres
     restart: unless-stopped
     environment:
+      # ⚠️  DEV-ONLY FALLBACK CREDENTIALS (maia/maia). Aceitável somente
+      # porque a porta abaixo está amarrada a 127.0.0.1. NUNCA leve este
+      # arquivo para um host de produção — compose.prod.yml exige
+      # POSTGRES_PASSWORD real (sintaxe `:?`) e não tem fallback.
       POSTGRES_USER: ${POSTGRES_USER:-maia}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-maia}
       POSTGRES_DB: ${POSTGRES_DB:-maia}
       TZ: America/Sao_Paulo
       PGTZ: America/Sao_Paulo
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Loopback only: alcançável da própria máquina de dev, invisível na LAN.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - maia_pg_data:/var/lib/postgresql/data
       - ./migrations:/migrations:ro
@@ -24,6 +42,10 @@ services:
     image: redis:7-alpine
     container_name: maia-redis
     restart: unless-stopped
+    # ⚠️  DEV-ONLY: este Redis roda SEM autenticação. Aceitável somente
+    # porque a porta está amarrada a 127.0.0.1 (abaixo). Em produção use
+    # compose.prod.yml, que exige REDIS_PASSWORD via --requirepass.
+    #
     # IMPORTANT: --maxmemory-policy MUST stay `noeviction` (or `volatile-lru`)
     # in any environment with more than one tenant. Redis key isolation in
     # this codebase relies on tenant-prefixed keys (working memory, BullMQ
@@ -49,7 +71,8 @@ services:
       - "--maxmemory-policy"
       - "noeviction"
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Loopback only — ver comentário do postgres.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - maia_redis_data:/data
     healthcheck:
@@ -69,6 +92,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # DEV-ONLY: injeta o .env inteiro. Em produção cada container recebe
+    # apenas o SEU env file (.env.app / .env.admin) — ver compose.prod.yml.
     env_file:
       - .env
     environment:
@@ -95,6 +120,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # DEV-ONLY: .env inteiro — mesma ressalva do serviço `app` acima.
     env_file:
       - .env
     environment:

@@ -19,8 +19,8 @@
  *  - O contrato NÃO força no-downgrade no LLM — defesa em profundidade
  *    deixa essa validação para o scorer (cf. `scorer.ts`).
  */
-import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
+import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { logger } from '@/lib/logger.js';
 import { RiskLevel } from '@/types/enums.js';
@@ -75,7 +75,6 @@ export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) =>
       fallback: null,
     },
     async () => {
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
       const system = [
         'Você é um classificador de risco operacional. Recebe o nível atual',
         '(heurístico determinístico) e um texto de contexto, e retorna o nível',
@@ -92,19 +91,18 @@ export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) =>
         'Devolva JSON.',
       ].join('\n');
 
-      const completion = await anthropic.messages.create({
-        model: 'claude-haiku-4-5-20251001',
+      // Issue #508: o modelo não é mais fixado aqui. O tier `fast` do
+      // workload `risk_classifier` é resolvido pelo backend a partir das
+      // settings dinâmicas — antes este gate ignorava o modelo configurado
+      // pelo operador e exigia ANTHROPIC_API_KEY mesmo com
+      // LLM_PROVIDER=openrouter.
+      const completion = await callLLM({
+        workload: 'risk_classifier',
         max_tokens: 150,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = (completion.content as Array<{ type: string; text?: string }>)
-        .filter(
-          (c): c is { type: 'text'; text: string } =>
-            c.type === 'text' && typeof c.text === 'string',
-        )
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
 
       // Stage 1: JSON detection. Sem chaves no texto → throw para audit.
       const match = text.match(/\{[\s\S]*\}/);

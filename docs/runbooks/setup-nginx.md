@@ -72,9 +72,12 @@ Sem isso o navegador aceita o cookie via HTTP (cleartext) e a defesa cai.
 Confira no primeiro GET pos-deploy:
 
 ```bash
-curl -is "https://maia.seu-dominio.com/setup?token=$TOKEN" | grep -i set-cookie
+curl -is "https://maia.seu-dominio.com/setup" | grep -i set-cookie
 # Esperado: Set-Cookie: maia_setup_csrf=...; HttpOnly; Secure; SameSite=Strict
 ```
+
+O mesmo vale para o cookie de SESSAO de operador (`maia_setup_session`),
+emitido pelo `POST /setup/session`.
 
 ## 4. fail2ban (opcional)
 
@@ -95,11 +98,16 @@ bantime  = 3600
 # /etc/fail2ban/filter.d/maia-setup.conf
 [Definition]
 failregex = ^<HOST> .* "POST /setup/start.*" 403
-            ^<HOST> .* "GET /setup\?token=.*" 403
+            ^<HOST> .* "POST /setup/session.*" 403
+            ^<HOST> .* "GET /setup.*" 403
 ignoreregex =
 ```
 
-`403` cobre tanto token invalido quanto CSRF mismatch.
+`403` cobre tanto token invalido quanto CSRF mismatch. A tentativa de adivinhar
+o token agora chega como `POST /setup/session` — issue #518 tirou o token da
+query string, entao o padrao antigo (`GET /setup?token=...`) nunca mais casa.
+Como bonus, o access log deixou de REGISTRAR o token: antes, cada acerto do
+operador gravava o segredo em texto puro em `/var/log/nginx/access.log`.
 
 ## Verificacao rapida
 
@@ -113,7 +121,11 @@ curl -i https://maia.seu-dominio.com/setup
 Do IP do operador:
 
 ```bash
-TOKEN=$(ssh maia 'cat .baileys-auth/setup-token.txt')
-curl -i "https://maia.seu-dominio.com/setup?token=$TOKEN"
-# Esperado: 200 OK + Set-Cookie: maia_setup_csrf=...
+curl -i https://maia.seu-dominio.com/setup
+# Esperado: 401 + o FORMULARIO de token (o token nao vai na URL — #518)
+
+# Break-glass programatico: token em HEADER, nunca em query string.
+TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+curl -i -H "x-maia-setup-token: $TOKEN" "https://maia.seu-dominio.com/setup/status"
+# Esperado: 200 OK + JSON { "phase": ... }
 ```

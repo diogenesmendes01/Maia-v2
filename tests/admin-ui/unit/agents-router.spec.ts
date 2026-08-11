@@ -43,6 +43,8 @@ type Profile = {
   profile_body: unknown;
   proposed_by: string;
   proposed_reason: string | null;
+  /** Optional in fixtures; listByStatus fills a fallback when absent. */
+  created_at?: Date;
 };
 type AuditRow = {
   tenant_id: string;
@@ -52,6 +54,16 @@ type AuditRow = {
   resource_type: string;
   resource_id: string | null;
   change_summary: Record<string, unknown> | null;
+};
+type GrantRow = {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  granted_packs: string[];
+  granted_tools: string[];
+  denied_tools: string[];
+  granted_by: string | null;
+  reason: string | null;
 };
 
 /**
@@ -70,11 +82,25 @@ type AuditRow = {
  *     the raw pg error leak as a 500 — closes the TOCTOU window flagged
  *     by Codex Adversarial Review on PR #187 round 1 (issue #184).
  */
+type McpServerRow = { name: string; tenant_id: string; status: string };
+type McpToolRow = {
+  tenant_id: string;
+  server_name: string;
+  tool_name: string;
+  risk_class: string;
+};
+
 function makeRepos(
   opts: {
     tenants?: string[];
     agents?: Agent[];
     profiles?: Profile[];
+    grants?: GrantRow[];
+    /** Issue #481 — SoTs de MCP consultadas por getCapabilities. */
+    mcpServers?: McpServerRow[];
+    mcpTools?: McpToolRow[];
+    /** Simula indisponibilidade das SoTs de MCP (fail-soft do card). */
+    mcpThrows?: boolean;
     failAuditOnAction?: 'agent_create' | 'agent_profile_propose';
     simulateAgentPkConflict?: boolean;
   } = {},
@@ -83,6 +109,7 @@ function makeRepos(
   const agentsMap: Record<string, Agent> = {};
   for (const a of opts.agents ?? []) agentsMap[a.id] = { ...a };
   const profiles: Profile[] = [...(opts.profiles ?? [])];
+  const grants: GrantRow[] = [...(opts.grants ?? [])];
   const audit: AuditRow[] = [];
 
   return {
@@ -251,6 +278,25 @@ function makeRepos(
         // from the profiles list. This is sufficient for the assertions made.
         const active = profiles.find((p) => p.status === 'active');
         return active ?? null;
+      },
+      // Unlike getActive above, this one DOES read the real AsyncLocalStorage:
+      // the router wraps the call in runWithTenantContext, so the store is
+      // populated by the time the mock runs. getById lista active+proposed
+      // por agente e contaria dobrado sem o escopo (tenant, agent).
+      async listByStatus(status: string) {
+        const { getCurrentTenant, getCurrentAgent } = await import(
+          '@/db/tenant-context.js'
+        );
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        return profiles
+          .filter(
+            (p) =>
+              p.status === status &&
+              p.tenant_id === tenant_id &&
+              p.agent_id === agent_id,
+          )
+          .map((p) => ({ ...p, created_at: p.created_at ?? new Date() }));
       },
       // Atomic propose+audit. Mock emulates `withTx` rollback: if the audit
       // insert throws, the profile_version row inserted earlier is removed.
@@ -440,6 +486,99 @@ function makeRepos(
         };
       },
     },
+    agentToolGrantsRepo: {
+      // ALS-aware like listByStatus above — the router wraps this call in
+      // runWithTenantContext, so the store is populated.
+      async findForCurrentAgent() {
+        const { getCurrentTenant, getCurrentAgent } = await import(
+          '@/db/tenant-context.js'
+        );
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        return (
+          grants.find((g) => g.tenant_id === tenant_id && g.agent_id === agent_id) ??
+          null
+        );
+      },
+      // Mirrors the real atomic helper (PR #494 review): the CURRENT row is
+      // read inside the "tx" and handed to the caller's pure compute; a
+      // reject aborts with nothing written.
+      async updateWithAudit(args: {
+        tenant_id: string;
+        agent_id: string;
+        compute: (current: GrantRow | null) =>
+          | {
+              ok: true;
+              granted_packs: string[];
+              granted_tools: string[];
+              denied_tools: string[];
+            }
+          | { ok: false; reject: unknown };
+        granted_by: string;
+        reason: string;
+        audit: { actor_id: string; actor_role: string; action: string };
+      }) {
+        const idx = grants.findIndex(
+          (g) => g.tenant_id === args.tenant_id && g.agent_id === args.agent_id,
+        );
+        const current = idx >= 0 ? grants[idx]! : null;
+        const next = args.compute(current);
+        if (!next.ok) return next;
+        const row: GrantRow = {
+          id: current ? current.id : `grant-${grants.length + 1}`,
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          granted_packs: next.granted_packs,
+          granted_tools: next.granted_tools,
+          denied_tools: next.denied_tools,
+          granted_by: args.granted_by,
+          reason: args.reason,
+        };
+        if (idx >= 0) grants[idx] = row;
+        else grants.push(row);
+        audit.push({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: args.audit.action,
+          resource_type: 'agent_tool_grant',
+          resource_id: args.agent_id,
+          change_summary: {
+            previous: current
+              ? {
+                  granted_packs: current.granted_packs,
+                  granted_tools: current.granted_tools,
+                  denied_tools: current.denied_tools,
+                }
+              : null,
+            next: {
+              granted_packs: next.granted_packs,
+              granted_tools: next.granted_tools,
+              denied_tools: next.denied_tools,
+            },
+            reason: args.reason,
+          },
+        });
+        return { ok: true as const, grant: row };
+      },
+    },
+    // Issue #481 item 3 — getCapabilities resolve packs `mcp.<server>` contra
+    // estas SoTs. `listExecutable` já devolve SÓ o que o bridge executaria
+    // (aprovada + read-only + server ativo), então o mock recebe a lista
+    // pronta — o filtro é responsabilidade do repo real (coberto no leak
+    // suite / integração).
+    mcpServersRepo: {
+      async listByTenant(tenant_id: string) {
+        if (opts.mcpThrows) throw new Error('mcp SoT unavailable');
+        return (opts.mcpServers ?? []).filter((s) => s.tenant_id === tenant_id);
+      },
+    },
+    mcpServerToolsRepo: {
+      async listExecutable(args: { tenant_id: string }) {
+        if (opts.mcpThrows) throw new Error('mcp SoT unavailable');
+        return (opts.mcpTools ?? []).filter((t) => t.tenant_id === args.tenant_id);
+      },
+    },
     adminAuditLogRepo: {
       async append(entry: AuditRow) {
         audit.push(entry);
@@ -449,7 +588,7 @@ function makeRepos(
         };
       },
     },
-    _inspect: { agentsMap, profiles, audit },
+    _inspect: { agentsMap, profiles, grants, audit },
   };
 }
 
@@ -692,559 +831,6 @@ describe('agentsRouter.updateProfile — invariants', () => {
       ).rejects.toThrow(TRPCError);
     },
   );
-});
-
-describe('agentsRouter.approveProfile — atomic + freezes incumbent', () => {
-  const existingAgent: Agent = {
-    id: 'agent-x',
-    tenant_id: 'tenant-A',
-    nome: 'X',
-    status: 'active',
-    metadata: {},
-    created_at: new Date(),
-    updated_at: new Date(),
-  };
-
-  // Codex round 2: proposals authored under the new flow carry
-  // `metadata.previous_version_id` so `approveAndActivateAtomic` can detect
-  // write-skew. Helpers to build well-formed profile_body for these tests.
-  const bodyWithPrev = (prev: string | null) => ({
-    metadata: { previous_version_id: prev },
-  });
-
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s cannot approve',
-    async (role) => {
-      const proposed: Profile = {
-        id: '00000000-0000-4000-8000-0000000000a1',
-        tenant_id: 'tenant-A',
-        agent_id: 'agent-x',
-        version: 1,
-        status: 'proposed',
-        profile_body: bodyWithPrev(null),
-        proposed_by: 'system',
-        proposed_reason: null,
-      };
-      const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).approveProfile({
-          agentId: 'agent-x',
-          versionId: '00000000-0000-4000-8000-0000000000a1',
-          comment: 'no-permission attempt',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
-
-  it('owner approves seed v1 (no incumbent → no freeze)', async () => {
-    const proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'proposed',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
-    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-      agentId: 'agent-x',
-      versionId: '00000000-0000-4000-8000-0000000000a1',
-      comment: 'first activation for this agent',
-    });
-    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a1');
-    expect(res.frozen_previous).toBeNull();
-    expect(repos._inspect.profiles[0]!.status).toBe('active');
-    // Audit row records the transition.
-    expect(repos._inspect.audit[0]!.action).toBe('agent_profile_approve');
-    expect(repos._inspect.audit[0]!.change_summary?.previous_active_id).toBeNull();
-    expect(repos._inspect.audit[0]!.change_summary?.expected_predecessor_id).toBeNull();
-  });
-
-  it('owner approves v2 while v1 active → v1 frozen, v2 active, audited atomically', async () => {
-    const v1Active: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'active',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const v2Proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a2',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 2,
-      status: 'proposed',
-      // v2 was proposed against v1 — predecessor matches incumbent.
-      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
-      proposed_by: 'owner-1',
-      proposed_reason: 'change tone',
-    };
-    const repos = makeRepos({
-      agents: [existingAgent],
-      profiles: [v1Active, v2Proposed],
-    });
-    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-      agentId: 'agent-x',
-      versionId: '00000000-0000-4000-8000-0000000000a2',
-      comment: 'promote v2 after review',
-    });
-    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
-    expect(res.frozen_previous?.id).toBe('00000000-0000-4000-8000-0000000000a1');
-    // Old active → frozen, new proposed → active.
-    expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status).toBe('frozen');
-    expect(repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status).toBe('active');
-    // Audit records both sides of the swap + the predecessor expectation.
-    const audit = repos._inspect.audit[0]!;
-    expect(audit.change_summary?.previous_active_id).toBe('00000000-0000-4000-8000-0000000000a1');
-    expect(audit.change_summary?.new_version_id).toBe('00000000-0000-4000-8000-0000000000a2');
-    expect(audit.change_summary?.expected_predecessor_id).toBe('00000000-0000-4000-8000-0000000000a1');
-  });
-
-  it('CONFLICT when version is not in proposed state', async () => {
-    const alreadyActive: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'active',
-      profile_body: {},
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({
-      agents: [existingAgent],
-      profiles: [alreadyActive],
-    });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'approving an already-active row',
-      }),
-    ).rejects.toMatchObject({ code: 'CONFLICT' });
-  });
-
-  it('NOT_FOUND when agent missing', async () => {
-    const proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-ghost',
-      version: 1,
-      status: 'proposed',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [], profiles: [proposed] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-ghost',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'agent does not exist',
-      }),
-    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
-  });
-
-  /**
-   * Codex Adversarial Review of PR #171 round 2 — predecessor enforcement.
-   *
-   * Sequencial scenario: v1 active, owner Bob proposes v2 (predecessor=v1)
-   * and Alice proposes v3 (predecessor=v1). Bob's v2 gets approved first
-   * → v1 frozen, v2 active. If Alice's v3 is approved next without
-   * predecessor enforcement, v2 would be silently frozen and v3 would
-   * become active even though its content was written against v1 — Alice
-   * had no chance to incorporate Bob's changes.
-   *
-   * The fix: approving v3 must detect the mismatch (expected: v1, current:
-   * v2) and reject with CONFLICT so Alice refreshes and re-proposes
-   * against v2.
-   */
-  it('predecessor_conflict: v3 (proposed against v1) is rejected after v2 was approved', async () => {
-    const v1Active: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'active',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const v2Proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a2',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 2,
-      status: 'proposed',
-      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
-      proposed_by: 'bob',
-      proposed_reason: 'bob update',
-    };
-    const v3Proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a3',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 3,
-      status: 'proposed',
-      // Alice's v3 was authored against v1 too — she didn't see Bob's v2.
-      profile_body: bodyWithPrev('00000000-0000-4000-8000-0000000000a1'),
-      proposed_by: 'alice',
-      proposed_reason: 'alice update',
-    };
-    const repos = makeRepos({
-      agents: [existingAgent],
-      profiles: [v1Active, v2Proposed, v3Proposed],
-    });
-
-    // Step 1: Bob's v2 is approved successfully — v1 → frozen, v2 → active.
-    const approveV2 = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-      agentId: 'agent-x',
-      versionId: '00000000-0000-4000-8000-0000000000a2',
-      comment: 'approve bob v2',
-    });
-    expect(approveV2.activated.id).toBe('00000000-0000-4000-8000-0000000000a2');
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
-        .status,
-    ).toBe('active');
-
-    // Step 2: Alice's v3 was proposed against v1, but v2 is now active.
-    // Approving v3 must be rejected with CONFLICT — otherwise Bob's v2
-    // would be silently overwritten.
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a3',
-        comment: 'approve alice v3',
-      }),
-    ).rejects.toMatchObject({
-      code: 'CONFLICT',
-      message: expect.stringMatching(/active profile changed/i),
-    });
-
-    // v2 must STILL be active, v3 must STILL be proposed — the rejected
-    // approval did not corrupt the lineage.
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!
-        .status,
-    ).toBe('active');
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a3')!
-        .status,
-    ).toBe('proposed');
-  });
-
-  it('predecessor_conflict (legacy): proposal without metadata.previous_version_id is rejected', async () => {
-    const proposed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'proposed',
-      // No metadata — pretends to be a legacy proposal authored before
-      // this codepath existed. Policy: reject conservatively.
-      profile_body: {},
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [proposed] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'legacy proposal approval attempt',
-      }),
-    ).rejects.toMatchObject({
-      code: 'CONFLICT',
-      message: expect.stringMatching(/expected predecessor unknown/i),
-    });
-    // Profile MUST still be proposed — nothing was activated.
-    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
-  });
-
-  /**
-   * Codex Adversarial Review of PR #171 round 3 ([high] #173) — migration 061
-   * backfilled `metadata.previous_version_id = null` + `migrated_from_legacy:
-   * true` for every legacy row. Without the discriminator, the predecessor
-   * check accepted explicit `null` as "no predecessor expected" (valid for
-   * intentional seed v1), so a stale migrated proposal whose true lineage
-   * is unknowable could silently activate against an empty active slot.
-   * The new policy rejects migrated proposals with a distinct sentinel.
-   */
-  it('migrated_legacy_proposal: explicit null + migrated_from_legacy marker is rejected', async () => {
-    const migrated: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      // Could be any version — migration 061 backfilled all of them.
-      version: 1,
-      status: 'proposed',
-      profile_body: {
-        metadata: {
-          previous_version_id: null,
-          migrated_from_legacy: true,
-        },
-      },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [migrated] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'attempt to approve a migrated legacy proposal',
-      }),
-    ).rejects.toMatchObject({
-      code: 'CONFLICT',
-      message: expect.stringMatching(/v3\.1\.1 legacy backfill/i),
-    });
-    // Profile MUST still be proposed — nothing was activated.
-    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
-    // No audit row appended — the rejection happened before the audit step.
-    expect(repos._inspect.audit).toHaveLength(0);
-  });
-
-  /**
-   * Codex Adversarial Review of PR #171 round 3 — the intentional-seed
-   * exception accepts explicit `null` predecessor ONLY when (a) there's no
-   * incumbent active row AND (b) this is version 1. Any non-seed null case
-   * (v2+ with null, or v1 with an incumbent) falls through to
-   * predecessor_conflict. Matches the `create → approve` seed flow shipped
-   * with `createWithSeedAndAudit`.
-   */
-  it('intentional seed: v1 + no incumbent + null predecessor (no marker) is approved', async () => {
-    const seed: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'proposed',
-      profile_body: { metadata: { previous_version_id: null } },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [seed] });
-    const res = await caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-      agentId: 'agent-x',
-      versionId: '00000000-0000-4000-8000-0000000000a1',
-      comment: 'first activation for this agent',
-    });
-    expect(res.activated.id).toBe('00000000-0000-4000-8000-0000000000a1');
-    expect(res.frozen_previous).toBeNull();
-    expect(repos._inspect.profiles[0]!.status).toBe('active');
-  });
-
-  /**
-   * Codex Adversarial Review of PR #182 round 3 (#186) — the dangerous
-   * shape that was missed in round 3 of PR #171: explicit `null`
-   * predecessor on v2+ with NO incumbent active row. The round-3
-   * intentional-seed gate only fired for v === 1, so v2+ + null + null
-   * structurally satisfied the equality check (`null === null`) and got
-   * activated with no lineage anchor. That bypasses the stale-predecessor
-   * guard and can reactivate profile state after rollback without binding
-   * to the last known version.
-   *
-   * The new policy: any non-seed proposal with `previous_version_id: null`
-   * is REJECTED as missing_predecessor (PRECONDITION_FAILED).
-   */
-  it('missing_predecessor: v2 + no incumbent + null predecessor is REJECTED (was bypass in PR #181)', async () => {
-    const v2NoIncumbent: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a2',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 2,
-      status: 'proposed',
-      profile_body: { metadata: { previous_version_id: null } },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [v2NoIncumbent] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a2',
-        comment: 'approve v2 against empty active slot — should be rejected',
-      }),
-    ).rejects.toMatchObject({
-      code: 'PRECONDITION_FAILED',
-      message: expect.stringMatching(/has no predecessor lineage/i),
-    });
-    // Profile MUST still be proposed — nothing was activated.
-    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
-  });
-
-  it('missing_predecessor: v1 + incumbent + null predecessor is REJECTED', async () => {
-    // v1 cannot coexist with an active incumbent. Reject as
-    // missing_predecessor rather than predecessor_conflict so the
-    // operator sees the right diagnosis.
-    const v1Active: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'active',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const v1Extra: Profile = {
-      id: '00000000-0000-4000-8000-0000000000b1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'proposed',
-      profile_body: { metadata: { previous_version_id: null } },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active, v1Extra] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000b1',
-        comment: 'v1 + incumbent + null pred — should be rejected',
-      }),
-    ).rejects.toMatchObject({
-      code: 'PRECONDITION_FAILED',
-      message: expect.stringMatching(/has no predecessor lineage/i),
-    });
-    // Both rows untouched.
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status,
-    ).toBe('active');
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000b1')!.status,
-    ).toBe('proposed');
-  });
-
-  it('missing_predecessor: v2 + incumbent + null predecessor is REJECTED (was predecessor_conflict in round 2)', async () => {
-    // Round 2's check (`expected !== current`) caught this too. We now
-    // surface a clearer reason: the proposal is missing its predecessor,
-    // not that someone changed the incumbent under it.
-    const v1Active: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 1,
-      status: 'active',
-      profile_body: bodyWithPrev(null),
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const v2NullPred: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a2',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 2,
-      status: 'proposed',
-      profile_body: { metadata: { previous_version_id: null } },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [v1Active, v2NullPred] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a2',
-        comment: 'v2 null pred with v1 active — should be rejected',
-      }),
-    ).rejects.toMatchObject({
-      code: 'PRECONDITION_FAILED',
-      message: expect.stringMatching(/has no predecessor lineage/i),
-    });
-    // v1 still active, v2 still proposed.
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a1')!.status,
-    ).toBe('active');
-    expect(
-      repos._inspect.profiles.find((p) => p.id === '00000000-0000-4000-8000-0000000000a2')!.status,
-    ).toBe('proposed');
-  });
-
-  it('migrated_legacy_proposal precedence: null + marker still rejected as migrated (not missing_predecessor)', async () => {
-    // The migrated-legacy check fires BEFORE the null-predecessor check
-    // (so the operator sees the most specific diagnosis). v2+ with
-    // migrated_from_legacy marker + null predecessor → migrated_legacy_proposal,
-    // not missing_predecessor.
-    const migrated: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-x',
-      version: 5, // any non-v1 version
-      status: 'proposed',
-      profile_body: {
-        metadata: {
-          previous_version_id: null,
-          migrated_from_legacy: true,
-        },
-      },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    const repos = makeRepos({ agents: [existingAgent], profiles: [migrated] });
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-x',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'migrated v5 with null pred — should be rejected as migrated',
-      }),
-    ).rejects.toMatchObject({
-      code: 'CONFLICT',
-      message: expect.stringMatching(/v3\.1\.1 legacy backfill/i),
-    });
-    // Not a PRECONDITION_FAILED with missing_predecessor message.
-    expect(repos._inspect.profiles[0]!.status).toBe('proposed');
-  });
-
-  /**
-   * Codex Adversarial Review of PR #171 round 3 — `agent_missing` typed-miss
-   * surfaces as NOT_FOUND. Simulates the agent being deleted between the
-   * router's findById check and the parent-agent FOR UPDATE lock inside
-   * the tx (mock checks agentsMap[args.agent_id] presence to mirror).
-   */
-  it('NOT_FOUND when parent agent vanished between findById and lock', async () => {
-    // No agent in the map — but a proposal exists pointing at it. In real
-    // life this is the (rare) race where the agent was deleted after the
-    // router's findById succeeded but before the FOR UPDATE lock fired.
-    const orphanProposal: Profile = {
-      id: '00000000-0000-4000-8000-0000000000a1',
-      tenant_id: 'tenant-A',
-      agent_id: 'agent-deleted',
-      version: 1,
-      status: 'proposed',
-      profile_body: { metadata: { previous_version_id: null } },
-      proposed_by: 'system',
-      proposed_reason: null,
-    };
-    // Pre-populate with the agent so router.findById succeeds, then we
-    // delete it right before calling. The mock's approveAndActivateAtomic
-    // re-checks agentsMap so the typed-miss fires correctly.
-    const agent: Agent = {
-      id: 'agent-deleted',
-      tenant_id: 'tenant-A',
-      nome: 'about to vanish',
-      status: 'active',
-      metadata: {},
-      created_at: new Date(),
-      updated_at: new Date(),
-    };
-    const repos = makeRepos({ agents: [agent], profiles: [orphanProposal] });
-    // Vanish the agent before approve (simulates the race).
-    delete repos._inspect.agentsMap['agent-deleted'];
-    await expect(
-      caller('owner', 'tenant-A', 'u1', repos).approveProfile({
-        agentId: 'agent-deleted',
-        versionId: '00000000-0000-4000-8000-0000000000a1',
-        comment: 'race against agent deletion',
-      }),
-    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
-  });
 });
 
 /**
@@ -2121,5 +1707,296 @@ describe('agentsRouter.updateProfile — principles omission preserves active (#
       identity?: { principles?: unknown[] };
     };
     expect(persisted.identity?.principles ?? []).toEqual([]);
+  });
+});
+
+
+// grant-math is registry-free (importing has no side effects) — safe to load
+// at module top level for the updateCapabilities fixtures below.
+const { TOOL_PACKS } = await import('@/tools/grant-math.js');
+const financeTool = TOOL_PACKS['domain.finance']!.tools[0]!;
+
+describe('agentsRouter.updateCapabilities', () => {
+  const agent: Agent = {
+    id: 'agent-cap',
+    tenant_id: 'tenant-A',
+    nome: 'Agente Capacidades',
+    status: 'active',
+    metadata: {},
+    created_at: new Date('2024-01-01T00:00:00Z'),
+    updated_at: new Date('2024-01-01T00:00:00Z'),
+  };
+  const baseGrant: GrantRow = {
+    id: 'grant-1',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-cap',
+    granted_packs: ['baseline.core', 'domain.calendar', 'mcp.acme'],
+    granted_tools: [],
+    denied_tools: [],
+    granted_by: 'seed',
+    reason: 'seed',
+  };
+
+  it.each(['analyst', 'viewer', 'compliance_officer'])(
+    '%s gets FORBIDDEN',
+    async (role) => {
+      const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+      await expect(
+        caller(role, 'tenant-A', 'u1', repos).updateCapabilities({
+          agentId: 'agent-cap',
+          granted_packs: ['domain.finance'],
+          denied_tools: [],
+          comment: 'attempt without permission',
+        }),
+      ).rejects.toThrow(TRPCError);
+    },
+  );
+
+  it('NOT_FOUND when the agent does not exist in this tenant', async () => {
+    const repos = makeRepos({ agents: [] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: [],
+        denied_tools: [],
+        comment: 'agent is missing here',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('BAD_REQUEST on unknown pack (fail-closed, not ignored)', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: ['domain.nao-existe'],
+        denied_tools: [],
+        comment: 'unknown pack must be rejected',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(repos._inspect.audit.length).toBe(0);
+  });
+
+  it('grants/revokes catalog packs, preserves mcp.* and re-inserts the baseline floor', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    // Operator checked only domain.finance — calendar is revoked, mcp.acme
+    // (managed on the MCP screen) must survive, baseline.core is forced.
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.finance'],
+      denied_tools: [],
+      comment: 'agente comercial vira financeiro',
+    });
+    expect(res.granted_packs).toContain('baseline.core');
+    expect(res.granted_packs).toContain('domain.finance');
+    expect(res.granted_packs).toContain('mcp.acme');
+    expect(res.granted_packs).not.toContain('domain.calendar');
+    expect(repos._inspect.audit[0]!.action).toBe('agent_capabilities_update');
+    expect(repos._inspect.audit[0]!.resource_type).toBe('agent_tool_grant');
+    const summary = repos._inspect.audit[0]!.change_summary as {
+      previous: { granted_packs: string[] } | null;
+    };
+    expect(summary.previous?.granted_packs).toEqual(baseGrant.granted_packs);
+  });
+
+  it('accepts a hard deny for an effective tool of the NEW pack set', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.finance'],
+      denied_tools: [financeTool],
+      comment: 'nega ferramenta financeira específica',
+    });
+    expect(res.denied_tools).toEqual([financeTool]);
+  });
+
+  it('BAD_REQUEST when denying a tool that is not visible nor already denied', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    await expect(
+      caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: ['domain.calendar'],
+        denied_tools: ['tool_que_nao_existe'],
+        comment: 'deny inválido deve falhar',
+      }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(repos._inspect.audit.length).toBe(0);
+  });
+
+  it('keeps a pre-existing deny even if the tool left visibility', async () => {
+    const grantWithDeny: GrantRow = {
+      ...baseGrant,
+      granted_packs: ['baseline.core', 'domain.finance'],
+      denied_tools: [financeTool],
+    };
+    const repos = makeRepos({ agents: [agent], grants: [grantWithDeny] });
+    // Revoke finance but keep the historical deny — defense in depth.
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: [],
+      denied_tools: [financeTool],
+      comment: 'mantém deny histórico após revogar o pack',
+    });
+    expect(res.granted_packs).toEqual(['baseline.core']);
+    expect(res.denied_tools).toEqual([financeTool]);
+  });
+
+  it('works for an agent with no grant row yet (previous=null in audit)', async () => {
+    const repos = makeRepos({ agents: [agent] });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).updateCapabilities({
+      agentId: 'agent-cap',
+      granted_packs: ['domain.support'],
+      denied_tools: [],
+      comment: 'primeiro grant explícito do agente',
+    });
+    expect(res.granted_packs).toContain('baseline.core');
+    expect(res.granted_packs).toContain('domain.support');
+    const summary = repos._inspect.audit[0]!.change_summary as {
+      previous: unknown;
+    };
+    expect(summary.previous).toBeNull();
+  });
+});
+
+/**
+ * Issue #481 item 3 — packs `mcp.<server>` no card "Capacidades da função".
+ *
+ * Antes: como não existem no catálogo estático (`TOOL_PACKS`), caíam no ramo
+ * "desconhecido" e o card mostrava o id cru com 0 ferramentas. Agora são
+ * resolvidos contra as SoTs de MCP (nome do server + tools EXECUTÁVEIS — a
+ * mesma lista que o bridge usa em runtime).
+ */
+describe('agentsRouter.getCapabilities — packs MCP (#481)', () => {
+  const agent: Agent = {
+    id: 'agent-mcp',
+    tenant_id: 'tenant-A',
+    nome: 'Agente MCP',
+    status: 'active',
+    metadata: {},
+    created_at: new Date('2024-01-01T00:00:00Z'),
+    updated_at: new Date('2024-01-01T00:00:00Z'),
+  };
+  const grantWithMcp: GrantRow = {
+    id: 'grant-mcp',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-mcp',
+    granted_packs: ['baseline.core', 'mcp.acme'],
+    granted_tools: [],
+    denied_tools: [],
+    granted_by: 'seed',
+    reason: 'seed',
+  };
+  const acmeServer: McpServerRow = { name: 'acme', tenant_id: 'tenant-A', status: 'active' };
+  const acmeTools: McpToolRow[] = [
+    { tenant_id: 'tenant-A', server_name: 'acme', tool_name: 'list_orders', risk_class: 'low' },
+    { tenant_id: 'tenant-A', server_name: 'acme', tool_name: 'get_invoice', risk_class: 'high' },
+  ];
+
+  it('resolves name + real tool count from the MCP SoTs', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [acmeServer],
+      mcpTools: acmeTools,
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({
+      id: 'agent-mcp',
+    });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack).toBeDefined();
+    expect(pack.name).toBe('MCP · acme');
+    expect(pack.known).toBe(true);
+    expect(pack.external).toBe(true);
+    // Nome canônico do bridge — `mcp:<server>:<tool>`.
+    expect(pack.tools).toEqual(['mcp:acme:list_orders', 'mcp:acme:get_invoice']);
+    // risk_level = maior risk_class entre as tools executáveis.
+    expect(pack.risk_level).toBe('high');
+  });
+
+  it('never counts MCP tools in effective_tool_count (visibilidade é flag do runtime)', async () => {
+    const withMcp = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [acmeServer],
+      mcpTools: acmeTools,
+    });
+    const withoutMcp = makeRepos({
+      agents: [agent],
+      grants: [{ ...grantWithMcp, granted_packs: ['baseline.core'] }],
+    });
+    const a = await caller('owner', 'tenant-A', 'u1', withMcp).getCapabilities({ id: 'agent-mcp' });
+    const b = await caller('owner', 'tenant-A', 'u1', withoutMcp).getCapabilities({
+      id: 'agent-mcp',
+    });
+    expect(a.effective_tool_count).toBe(b.effective_tool_count);
+    expect(a.effective_tools.some((t) => t.startsWith('mcp:'))).toBe(false);
+  });
+
+  it('does not consult the MCP SoTs when no mcp.* pack is granted', async () => {
+    // mcpThrows garante que qualquer consulta seria detectada — sem pack MCP
+    // o resolver curto-circuita antes das queries.
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [{ ...grantWithMcp, granted_packs: ['baseline.core', 'domain.finance'] }],
+      mcpThrows: true,
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    expect(res.packs.map((p) => p.id)).toEqual(['baseline.core', 'domain.finance']);
+    expect(res.packs.every((p) => p.external === false)).toBe(true);
+  });
+
+  it('grant órfão (server removido) mantém o id cru e known=false', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [],
+      mcpTools: [],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.name).toBe('mcp.acme');
+    expect(pack.known).toBe(false);
+    expect(pack.external).toBe(true);
+    expect(pack.tools).toEqual([]);
+  });
+
+  it('server desativado é rotulado e rende 0 ferramentas', async () => {
+    const repos = makeRepos({
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [{ ...acmeServer, status: 'disabled' }],
+      // listExecutable já exclui server inativo — o mock reflete isso.
+      mcpTools: [],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.name).toBe('MCP · acme (desativado)');
+    expect(pack.tools).toEqual([]);
+  });
+
+  it('SoT de MCP indisponível degrada o card, não derruba a tela', async () => {
+    const repos = makeRepos({ agents: [agent], grants: [grantWithMcp], mcpThrows: true });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.tools).toEqual([]);
+    expect(pack.known).toBe(false);
+    // O resto do card continua correto.
+    expect(res.packs.some((p) => p.id === 'baseline.core' && p.tools.length > 0)).toBe(true);
+  });
+
+  it('cross-tenant: server homônimo de outro tenant não resolve o pack', async () => {
+    const repos = makeRepos({
+      tenants: ['tenant-A', 'tenant-B'],
+      agents: [agent],
+      grants: [grantWithMcp],
+      mcpServers: [{ name: 'acme', tenant_id: 'tenant-B', status: 'active' }],
+      mcpTools: [
+        { tenant_id: 'tenant-B', server_name: 'acme', tool_name: 'leak_me', risk_class: 'low' },
+      ],
+    });
+    const res = await caller('owner', 'tenant-A', 'u1', repos).getCapabilities({ id: 'agent-mcp' });
+    const pack = res.packs.find((p) => p.id === 'mcp.acme')!;
+    expect(pack.known).toBe(false);
+    expect(pack.tools).toEqual([]);
   });
 });

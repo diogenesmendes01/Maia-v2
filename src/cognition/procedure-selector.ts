@@ -59,6 +59,7 @@ export async function selectProcedure(input: {
       { name: `procedure-selector.${def.nome}`, triggered_by: 'sync_conditional', timeoutMs: 5000 },
       async () => {
         const res = await callLLM({
+          workload: 'procedure_selector',
           system: matchPrompt(def),
           messages: [{ role: 'user', content: input.current_message }],
           max_tokens: 150,

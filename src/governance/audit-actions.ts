@@ -29,6 +29,21 @@ export const AUDIT_ACTIONS = [
   'dual_approval_denied',
   'dual_approval_timeout',
   'dual_approval_executed',
+  // Fase 0 cap. 2/3 — store backend de evidência de aprovação (migration 095).
+  // Cobre tanto confirmação simples quanto 4-eyes; o ciclo completo é
+  // requested → decision_recorded* → granted|denied|expired → claimed →
+  // consumed | execution_failed. replay_blocked/payload_mismatch são os
+  // bloqueios de reuso/adulteração.
+  'approval_requested',
+  'approval_decision_recorded',
+  'approval_granted',
+  'approval_denied',
+  'approval_expired',
+  'approval_claimed',
+  'approval_consumed',
+  'approval_execution_failed',
+  'approval_payload_mismatch',
+  'approval_replay_blocked',
   'audit_mode_activated',
   'audit_mode_deactivated',
   'audit_mode_deactivated_auto',
@@ -42,23 +57,133 @@ export const AUDIT_ACTIONS = [
   'auto_blocked_anomalous_volume',
   'system_started',
   'system_stopped',
+  // Issue #512 — explicit lifecycle outcomes. `system_started` now lands only
+  // AFTER every mandatory dependency for the process role was verified; these
+  // two cover the paths that used to be invisible: a boot aborted fail-closed
+  // on an unavailable dependency, and an operator-forced exit (second stop
+  // signal, or a drain deadline that expired with work still in flight).
+  'system_start_failed',
+  'system_shutdown_forced',
   'config_loaded',
   'backup_completed',
   'backup_failed',
   'backup_s3_upload_failed',
+  // Emitted by the pre-#520 `cloud_backup_rotation` worker. The worker was
+  // replaced by `backup_retention` (manifest-driven, hold-aware, conclusive
+  // outcome) in the #520 round-1 fix, so nothing emits these any more — they
+  // stay in the enum because HISTORICAL audit rows carry them and the watcher
+  // must keep resolving the label.
   'backup_cloud_rotation_completed',
   'backup_cloud_rotation_failed',
   'restore_test_passed',
   'restore_test_failed',
+  // Issue #520 — backup/restore/retention verificáveis. As ações `backup_*`
+  // legadas acima continuam existindo (a trilha histórica não é reescrita),
+  // mas o lifecycle novo emite as ações abaixo, que distinguem o que o
+  // baseline não distinguia: uma run que terminou COM cópia off-site
+  // verificada (`backup_run_completed`) de uma que terminou local-only ou com
+  // upload falhado (`backup_run_degraded`). O baseline auditava
+  // `backup_completed` nos dois casos.
+  //  - backup_run_started/completed/degraded/failed: ciclo de uma execução.
+  //  - backup_artifact_verified: checksum conferido (local ou no destino).
+  //  - backup_artifact_deleted: retenção removeu um artefato — ação
+  //    destrutiva, registra política/escopo/contagem, nunca conteúdo.
+  //  - restore_drill_*: drill automatizado; `completed` carrega a duração que
+  //    alimenta o RTO medido. `unsafe_residue` é uma ação SEPARADA de `failed`
+  //    de propósito: ela não diz "o backup não presta", diz "uma cópia completa
+  //    da produção ficou no host e alguém precisa removê-la à mão" — duas
+  //    remediações diferentes, e a segunda pode acontecer junto com um drill
+  //    que provou o restore (issue #536, revisão da PR #541).
+  //  - retention_run_*: passe de retenção (inclusive dry-run) por classe de
+  //    dado e tenant.
+  //  - legal_hold_created/released: §11 exige papel e auditoria append-only.
+  //  - privacy_request_*: workflow LGPD. `denied` guarda CÓDIGO de motivo.
+  //  - post_restore_reconciliation_*: gate anti-ressurreição do §13. `failed`
+  //    significa que o runtime NÃO pode voltar a produção.
+  'backup_run_started',
+  'backup_run_completed',
+  'backup_run_degraded',
+  'backup_run_failed',
+  'backup_artifact_verified',
+  'backup_artifact_deleted',
+  'restore_drill_started',
+  'restore_drill_completed',
+  'restore_drill_failed',
+  'restore_drill_unsafe_residue',
+  'retention_run_started',
+  'retention_run_completed',
+  'retention_run_failed',
+  'legal_hold_created',
+  'legal_hold_released',
+  'legal_hold_blocked_purge',
+  'privacy_request_created',
+  'privacy_request_identity_verified',
+  'privacy_request_approved',
+  'privacy_request_completed',
+  'privacy_request_denied',
+  'post_restore_reconciliation_completed',
+  'post_restore_reconciliation_failed',
   'whatsapp_connected',
   'whatsapp_disconnected',
+  // Disjuntor de LLM (issue #534). `opened`/`closed` são o PAR que a regra
+  // `llm_circuit_long_open` do `src/workers/audit-watcher.ts` consome para
+  // alertar "circuito aberto há mais de 5 min". Até a revisão da PR #541 as
+  // duas ações existiam SEM produtor — o watcher era um consumidor de eventos
+  // que ninguém emitia, e o alerta nunca podia disparar. O produtor é
+  // `src/lib/llm/circuit-audit.ts`, chamado por `circuit-breaker.ts` em toda
+  // transição para `open`/`closed`. Escritas no contexto sintético `system`
+  // (ADR 0002): o estado mede uma dependência externa compartilhada, não dado
+  // de tenant. `half_open` NÃO audita — é etapa interna da recuperação, não
+  // mudança de postura observável, e auditá-la duplicaria o par sem
+  // acrescentar decisão governável.
   'llm_circuit_opened',
   'llm_circuit_closed',
+  // Kill switch do disjuntor (`src/lib/llm/circuit-mode.ts`). A objeção
+  // original da #534 a um toggle de runtime era "alguém vira a chave às 3h da
+  // manhã sem deixar rastro"; a resposta foi exigir `actor` + `reason` e
+  // contar/logar todo uso. Log estruturado, porém, tem retenção curta e cai
+  // junto com o coletor — mudança de POSTURA de um controle de degradação é
+  // decisão de governança e pertence à trilha durável (invariante 4 do
+  // `AGENTS.md`). Cada linha carrega actor, reason, modo e validade.
+  //  - applied: override em vigor. `metadata.source='adopted'` distingue a
+  //    adoção da chave durável no boot da réplica de uma virada ao vivo — é o
+  //    MESMO desfecho de governança (a postura mudou), com procedência
+  //    diferente, então é metadado e não ação separada.
+  //  - cleared: operador devolveu a postura ao contrato.
+  //  - expired: o arrendamento venceu sozinho e a postura voltou ao baseline.
+  //  - rejected: override RECUSADO (anônimo, sem motivo, modo inválido,
+  //    validade vencida/acima do teto). Auditar a recusa é o que separa
+  //    "ninguém tentou" de "alguém tentou e o fail-closed segurou".
+  'llm_circuit_mode_override_applied',
+  'llm_circuit_mode_override_cleared',
+  'llm_circuit_mode_override_expired',
+  'llm_circuit_mode_override_rejected',
   'dashboard_session_started',
   'dashboard_session_ended',
   'dlq_job_added',
   'dlq_job_resolved',
   'dlq_alert_emitted',
+  // Issue #503 — máquina de estados durável do turno inbound. Auditamos apenas
+  // o que a issue exige (§ "Auditoria obrigatória"): descarte por política,
+  // dead letter, replay manual, conclusão SEM resposta e detecção de
+  // inconsistência entre a máquina de estados e a projeção legada
+  // `processada_em`. Transições rotineiras (received→queued→claimed→running)
+  // ficam em métrica/log estruturado — auditá-las inflaria `audit_logs` sem
+  // acrescentar decisão governável. NENHUM desses registros carrega texto,
+  // prompt, telefone ou JID.
+  'turn_ignored_by_policy',
+  'turn_dead_lettered',
+  'turn_replayed',
+  'turn_completed_without_reply',
+  'turn_state_inconsistency_detected',
+  // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
+  // turn was aborted before any side effect and the job was failed for retry /
+  // dead-letter. The audit row is the durable record that the platform refused
+  // to act — the evidence write failed, so the trace itself cannot carry it.
+  'runtime_trace_envelope_blocked_turn',
+  // Issue #514: a replay reused an existing trace_id with DIVERGENT content.
+  // Never expected; means an id collision or tampering.
+  'runtime_trace_envelope_divergent_replay',
   'pending_resolved',
   'pending_cancelled',
   'pending_expired',
@@ -103,6 +228,10 @@ export const AUDIT_ACTIONS = [
   'setup_unauthorized_access',
   'setup_csrf_mismatch',
   'llm_model_changed',
+  // `interlocutor_timezone_set`: set_interlocutor_timezone persisted the
+  // person's IANA zone into `pessoas.preferencias.timezone` (used by the prompt
+  // temporal block + schedule_reminder). Self-scoped per-pessoa write.
+  'interlocutor_timezone_set',
   // Spec 18 — Scheduling V2 (series → occurrence → task → outbox)
   'series_created',
   'series_cancelled',
@@ -138,6 +267,77 @@ export const AUDIT_ACTIONS = [
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.
   'channel_resolution_failed',
+  // `@lid` ingress fix — emitted by the Baileys ingress when a WhatsApp `@lid`
+  // (Linked ID) event cannot be mapped to a real phone: `senderPn`/
+  // `participantPn` were absent AND the signal LID mapping store missed. Split
+  // from `channel_resolution_failed` so operators can alert on real cross-tenant
+  // ownership misses / garbage JIDs WITHOUT the benign WhatsApp sync/peer noise
+  // that arrives as unmapped `@lid`. The message is still DROPPED fail-closed —
+  // this action is the canary for real `@lid` message loss as WhatsApp migrates
+  // its addressing to LID. Triage detail lives in `metadata.resolver_details`.
+  'channel_resolution_skipped_lid_unmapped',
+  // Roteamento multi-linha (spec 2026-07-09 Draft v4 §1.2/§1.6/§2.5/§3.6):
+  //  - shadow_divergence: modo shadow — o exact-match pela LINHA do bot
+  //    divergiu do resultado legado (gate da fase 2→3 do rollout).
+  //  - legacy_catch_all: modo exact_first — miss no exact e a resolução caiu
+  //    no caminho legado (gate da fase 3→4: 7 dias sem esta ação).
+  //  - channel_scope_mismatch: `forChannel` recusou um triplete inconsistente
+  //    (canal não pertence ao tenant/agent ou inativo) — invariante 2.
+  //  - line_session_transition: sessão de linha mudou de estado (connected/
+  //    recovering/closed) — invariante 6.
+  //  - pairing_session_*: ciclo §2.5 (declarado→verificado); `verified` ativa
+  //    o canal; `failed` cobre mismatch de número, TTL e 23505 do índice
+  //    global (linha já pertence a outro workspace).
+  //  - message_update_channel_unresolved: em MAIA_MULTI_LINE, um
+  //    messages.update chegou por uma sessão SEM canal resolvido (registro
+  //    da primária pendente/falho) — o lote é DESCARTADO fail-closed em vez
+  //    de cair no lookup global cross-tenant (review #498 crítico 1).
+  'shadow_divergence',
+  'legacy_catch_all',
+  'channel_scope_mismatch',
+  'line_session_transition',
+  'pairing_session_started',
+  'pairing_session_verified',
+  'pairing_session_failed',
+  // Issue #518 — o pareamento passa a ser pedido pelo Admin AUTENTICADO. O
+  // ator administrativo (`actor_id`/`actor_role`) e o `correlation_id` viajam
+  // do console até estas ações, então uma linha pareada tem trilha ponta a
+  // ponta. NUNCA carregam QR, código, token ou auth state em metadata.
+  //  - channel_pairing_requested: o console enfileirou o comando.
+  //  - pairing_session_aborted: o operador cancelou (idempotente).
+  //  - pairing_session_expired: TTL estourou; ou o restart matou a tentativa
+  //    em memória e ela foi para `failed/retryable` (nunca `verified`).
+  //  - channel_disabled / channel_repair_requested: desativação e pedido de
+  //    re-pareamento (recovery de linha) partindo do console.
+  'channel_pairing_requested',
+  'pairing_session_aborted',
+  'pairing_session_expired',
+  'channel_disabled',
+  'channel_repair_requested',
+  // Issue #518 §4 / review PR #528 — posse provada NÃO é permissão de rotear.
+  //  - channel_activation_deferred: a linha foi VERIFICADA mas o canal segue
+  //    inativo por readiness (sem política, ou papel padrão desativado).
+  //  - channel_activated: o backend revalidou a readiness e ativou o
+  //    roteamento — no fim do pareamento ou depois, quando a política ficou
+  //    pronta.
+  'channel_activation_deferred',
+  'channel_activated',
+  'message_update_channel_unresolved',
+  // Staging de inbound não-roteado (§1.4, modo strict): staged na chegada sem
+  // rota; handed_off quando o replay entrega na pipeline normal (dedup por
+  // canal); expired no TTL de 72h (sweeper).
+  'inbound_staged',
+  'inbound_unrouted_handed_off',
+  'inbound_unrouted_expired',
+  // Sonda sintética (spec 2026-07-17 §1.2): emitido quando o worker roda com a
+  // flag on mas o modo de roteamento é `shadow` — o exact-match por linha não
+  // resolve o canal da sonda, então o worker FALHA FECHADO (no-op) e NUNCA
+  // ativa o canal (um canal ativo derrubaria o ingresso real).
+  'synthetic_probe_prereq_unmet',
+  // Ativação/desativação do canal de sonda (review P1-B): TODA mudança de
+  // estado de roteamento/governança audita (metadata.active). Escrita sob o
+  // contexto do tenant/agente da sonda.
+  'synthetic_probe_channel_activation',
   // Issue #289 — emitted by scripts/embeddings-rebuild.ts when the embedding
   // provider returns a vector with the wrong dimension (or no vector at all)
   // for a row. We skip the UPDATE so the previous run's re-detection
@@ -265,6 +465,17 @@ export const AUDIT_ACTIONS = [
   //   no learning), but every sandbox interaction stays on the audit trail
   //   (invariant #4) — marked so forensics can separate test traffic.
   'playground_turn',
+  // Onboarding (issue #519) — as decisões de governança AGENTE-ESCOPADAS da
+  // saga. A trilha administrativa completa (todo passo, todo ator, todo
+  // correlation id) vai atomicamente para `admin_audit_log` dentro da mesma
+  // transação do passo; estas três entram TAMBÉM em `audit_log` porque são
+  // decisões sobre o AGENTE e pertencem à trilha do agente (invariante 4).
+  // `agent_readiness_evaluated` registra o veredito canônico do backend (com
+  // os fingerprints de configuração e schema); os dois de ativação registram
+  // a decisão explícita de deixar — ou não deixar — o agente operar.
+  'agent_readiness_evaluated',
+  'agent_activation_approved',
+  'agent_activation_denied',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

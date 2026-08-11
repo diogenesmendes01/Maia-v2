@@ -40,9 +40,129 @@ export const entidadesRepo = {
     const rows = await db.select().from(entidades).where(eq(entidades.id, id)).limit(1);
     return rows[0] ?? null;
   },
+  /**
+   * Issue #525 — `byIds` used to match on `entidades.id` ALONE.
+   *
+   * Every live caller (`agent/turn-context/loader.ts`, `tools/identify-entity`,
+   * `tools/compare-entities`, `tools/generate-report`) feeds it ids that came
+   * from `resolveScope`, so the ids were already tenant-checked and no leak was
+   * reachable in practice. But "safe because of what the caller happened to
+   * pass" is not the isolation invariant (AGENTS.md §4.1): an id is not a
+   * boundary, and this read renders `ent.nome` straight into the system prompt.
+   * Bind (tenant_id, agent_id) from ALS so a foreign id is simply absent from
+   * the result — the same shape the callers already handle for a missing row.
+   */
   async byIds(ids: string[]): Promise<Entidade[]> {
     if (ids.length === 0) return [];
-    return db.select().from(entidades).where(inArray(entidades.id, ids));
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(entidades)
+      .where(
+        and(
+          inArray(entidades.id, ids),
+          eq(entidades.tenant_id, tenant_id),
+          eq(entidades.agent_id, agent_id),
+        ),
+      );
+  },
+
+  /**
+   * Issue #525 — entity rows AND their state rows in ONE round-trip.
+   *
+   * The turn's "## Escopo desta conversa" and "## Estado atual" blocks are the
+   * same set of entities read twice: `entidadesRepo.byIds` for the names, then
+   * `entityStatesRepo.byIds` for the balances. They are joined on
+   * `entity_states.entidade_id = entidades.id`, which is exactly what a LEFT
+   * JOIN does — so the second statement was never buying anything except a
+   * round-trip on the fixed 10-connection pool (`src/db/client.ts`).
+   *
+   * LEFT, not INNER: an entity with no state row must still render its name in
+   * the scope block. The caller distinguishes the two by `state === null`,
+   * which is the same signal `entityStatesRepo.byId` gave by returning null.
+   *
+   * Tenant scoping is applied on BOTH sides. On `entidades` it is the ordinary
+   * predicate; on `entity_states` it lives in the JOIN condition, because
+   * `entity_states`'s PK is `entidade_id` alone — a row can exist for an id
+   * under another tuple, and putting the predicate in the WHERE clause of a
+   * LEFT JOIN would filter the whole row out instead of just the state half.
+   *
+   * ## The two sides have DIFFERENT cardinality (PR #541 review, finding 2)
+   *
+   * The first cut of this method took `limit = 500` and applied it to the JOINED
+   * row set, on the reasoning that it "bounds the result the same way
+   * `entityStatesRepo.byIds` did". It does not, and the difference is a
+   * correctness bug rather than a tuning choice:
+   *
+   *   - the pair this replaced was `entidadesRepo.byIds` (NO limit, ever) plus
+   *     `entityStatesRepo.byIds(ids, 500)` (limited). Only the STATE read was
+   *     capped;
+   *   - a scope can hold more than 500 entities — a tenant whose entities share
+   *     permission profiles passes `profilesRepo.byIds`'s own 500 cap on
+   *     distinct PROFILES while carrying thousands of entities;
+   *   - past row 500 the entity simply vanished from the result, so
+   *     `prompt-builder.ts`'s `ent?.nome ?? eid` fell through to the id and the
+   *     scope/permission block printed a raw UUID where a name belongs. That
+   *     block is declared NON-truncatable (`SECTION_BUDGETS` in
+   *     `agent/turn-context/types.ts` deliberately has no entry for it), and it
+   *     broke byte-identity for a set chosen by UUID ordering — i.e. which
+   *     names disappeared had nothing to do with the scope's own order.
+   *
+   * So the ENTITY side is unbounded, exactly as `byIds` is: it is already bound
+   * by `ids.length`, which the caller controls and `resolveScope` derives from
+   * granted permissions. `stateLimit` caps only the STATE projection, which is
+   * what the read it replaced actually capped — rows past the cap come back with
+   * `state: null`, the same shape an entity that genuinely has no state row has,
+   * and the same shape `entityStatesRepo.byIds`'s `LIMIT` produced. Because the
+   * cap is applied to state rows in id order it reproduces that `LIMIT` exactly.
+   *
+   * Applying it in the projection rather than as a SQL `LIMIT` keeps this ONE
+   * statement: a SQL limit here would have to bound entities, and bounding
+   * entities is the bug. The join is 1:1 on a PK, so the row count is at most
+   * `ids.length` either way — the statement cannot fan out.
+   */
+  async byIdsWithState(
+    ids: string[],
+    stateLimit = 500,
+  ): Promise<Array<{ entidade: Entidade; state: EntityState | null }>> {
+    if (ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ entidade: entidades, state: entity_states })
+      .from(entidades)
+      .leftJoin(
+        entity_states,
+        and(
+          eq(entity_states.entidade_id, entidades.id),
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
+      )
+      .where(
+        and(
+          inArray(entidades.id, Array.from(new Set(ids))),
+          eq(entidades.tenant_id, tenant_id),
+          eq(entidades.agent_id, agent_id),
+        ),
+      )
+      // Deterministic order so the rendered blocks are byte-stable for the same
+      // scope across turns. The caller re-sorts into scope order; ordering here
+      // just removes DB nondeterminism — and it is also what makes `stateLimit`
+      // below reproduce the old `ORDER BY entidade_id LIMIT n` exactly.
+      .orderBy(entidades.id);
+
+    // Cap the STATE side only. `taken` counts rows that actually carry a state,
+    // so a scope of 600 entities where 40 have states keeps all 40 — the old
+    // `LIMIT` counted state ROWS too, not entities scanned.
+    let taken = 0;
+    return rows.map((r) => {
+      const state = r.state ?? null;
+      if (state === null || taken >= stateLimit) return { entidade: r.entidade, state: null };
+      taken++;
+      return { entidade: r.entidade, state };
+    });
   },
   async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
     const guarded = applyTenantGuard(input);
@@ -594,6 +714,40 @@ export const entityStatesRepo = {
       )
       .limit(1);
     return rows[0] ?? null;
+  },
+  /**
+   * Issue #511 — batch sibling of `byId`, replacing the per-entity loop that
+   * built `entityStateBlocks` in `src/agent/prompt-builder.ts`. That loop was
+   * the dominant N+1 of the turn: a tenant with 100 entities in scope paid 100
+   * round-trips on the fixed 10-connection pool (`src/db/client.ts`) before the
+   * first LLM token, and every other tenant waited behind it.
+   *
+   * Carries the SAME (tenant_id, agent_id) predicate as `byId` — see the long
+   * note above on why the `entidade_id`-only PK makes that predicate load
+   * bearing rather than decorative. Entities not owned by the running tuple are
+   * simply absent from the result, exactly as `byId` returns null for them.
+   *
+   * Deterministic ordering by `entidade_id` so the rendered "## Estado atual"
+   * block is byte-stable for the same scope across turns (a reordered prompt is
+   * a different prompt to the model, and to the prompt cache). The caller
+   * re-sorts into scope order; ordering here just removes DB nondeterminism.
+   */
+  async byIds(entidade_ids: string[], limit = 500): Promise<EntityState[]> {
+    if (entidade_ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(entity_states)
+      .where(
+        and(
+          inArray(entity_states.entidade_id, Array.from(new Set(entidade_ids))),
+          eq(entity_states.tenant_id, tenant_id),
+          eq(entity_states.agent_id, agent_id),
+        ),
+      )
+      .orderBy(entity_states.entidade_id)
+      .limit(limit);
   },
   // Flip-readiness (#323, H4 of #355) — WRITE half of the read-then-write PAIR.
   // The conflict target is the `entidade_id` PK only, and the OLD SET

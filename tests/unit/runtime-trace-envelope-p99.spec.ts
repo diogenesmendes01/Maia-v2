@@ -19,7 +19,23 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { dbInsertMock } = vi.hoisted(() => ({ dbInsertMock: vi.fn() }));
 
 vi.mock('../../src/db/client.js', () => ({
-  db: { insert: () => ({ values: dbInsertMock }) },
+  // Issue #514 review round 1 [P1]: the writer's non-transactional path now
+  // ends in `.onConflictDoNothing()`, so the chain has to offer it.
+  db: {
+    insert: () => ({
+      values: (row: unknown) => {
+        const p = dbInsertMock(row) as Promise<unknown>;
+        return {
+          then: (res: (v: unknown) => void, rej: (e: unknown) => void) => p.then(res, rej),
+          onConflictDoNothing: () => ({
+            then: (r: (v: unknown) => void, j: (e: unknown) => void) =>
+              p.then(() => r([{ trace_id: 1 }]), j),
+            returning: () => p.then(() => [{ trace_id: 1 }]),
+          }),
+        };
+      },
+    }),
+  },
 }));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },

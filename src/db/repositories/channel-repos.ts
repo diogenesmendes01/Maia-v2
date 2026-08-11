@@ -1,6 +1,12 @@
 import { eq, and, ne, desc, sql } from 'drizzle-orm';
-import { db, withTx } from '../client.js';
-import { channels, roles, channel_policies, role_selector_decisions } from '../schema.js';
+import { db, withTx, pgErrorCode } from '../client.js';
+import {
+  channels,
+  roles,
+  channel_policies,
+  role_selector_decisions,
+  admin_audit_log,
+} from '../schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import {
@@ -25,6 +31,18 @@ import type {
   RoleSelectorDecisionRow,
 } from '../schema.js';
 
+/**
+ * §1.5/§2 (spec roteamento v4) — E.164 canônico COM `+` para linhas whatsapp.
+ * Aceita variantes (`+55…`, `55…`) e devolve `+<dígitos>`; null para valores
+ * que não são uma linha (o legado `default-channel` semeado pré-data a regra
+ * e nunca passa por CREATE de novo).
+ */
+export const WHATSAPP_LINE_RE = /^\+[1-9][0-9]{6,14}$/;
+export function normalizeWhatsappLine(raw: string): string | null {
+  const candidate = raw.startsWith('+') ? raw : `+${raw}`;
+  return WHATSAPP_LINE_RE.test(candidate) ? candidate : null;
+}
+
 // P6: channels — instâncias de entrada de mensagem (1+ por agent). Tenant-
 // scoped via applyTenantGuard; findByExternalCrossTenant é o único método que
 // bypassa o guard (usado pelo resolver de entrada, antes do contexto existir).
@@ -35,8 +53,23 @@ export const channelsRepo = {
     display_name?: string;
     metadata?: unknown;
   }): Promise<Channel> {
+    // §1.5 — canais whatsapp NOVOS são linhas: E.164 com `+`, validado no
+    // repo (além do Zod da superfície). Fail-loud: um external_id que não é
+    // linha quebraria o exact-match do roteamento silenciosamente.
+    let external_id = input.external_id;
+    if (input.channel_type === 'whatsapp') {
+      const normalized = normalizeWhatsappLine(input.external_id);
+      if (!normalized) {
+        throw new TypedError(
+          'invalid_whatsapp_line',
+          `whatsapp channel external_id must be E.164 with '+' (got '${input.external_id}')`,
+          { external_id: input.external_id },
+        );
+      }
+      external_id = normalized;
+    }
     const guarded = applyTenantGuard({
-      external_id: input.external_id,
+      external_id,
       channel_type: input.channel_type,
       display_name: input.display_name ?? null,
       metadata: (input.metadata as object) ?? {},
@@ -208,10 +241,22 @@ export const channelsRepo = {
       //    than the single-tenant home (`primary`), across ALL channel_types.
       //    Its mere existence proves a real multi-tenant deployment. Fail-closed:
       //    do NOT hand back the catch-all. `LIMIT 1` — existence only.
+      // Canais SINTÉTICOS (sonda) NÃO contam como "tenant real" (review P1):
+      // um canal is_synthetic é neutralizado no sink e não representa um tenant
+      // de verdade. Excluí-lo aqui torna a ATIVAÇÃO do canal de sonda segura em
+      // QUALQUER modo — um canal de sonda ativo nunca derruba o catch-all real
+      // (findPrimaryCatchAllChannel), fechando o risco de quebrar o ingresso de
+      // remetentes desconhecidos.
       const realTenantProbe = await tx
         .select({ one: sql<number>`1` })
         .from(channels)
-        .where(and(eq(channels.active, true), ne(channels.tenant_id, PRIMARY_TENANT_ID)))
+        .where(
+          and(
+            eq(channels.active, true),
+            ne(channels.tenant_id, PRIMARY_TENANT_ID),
+            eq(channels.is_synthetic, false),
+          ),
+        )
         .limit(1);
       if (realTenantProbe.length > 0) {
         return { multi_tenant: true, channel: null };
@@ -249,6 +294,251 @@ export const channelsRepo = {
           eq(channels.active, true),
         ),
       );
+  },
+
+  /**
+   * Fase 0 (spec roteamento v4 §1.6) — prova do TRIPLETE para a fronteira de
+   * saída: o canal pertence ao (tenant, agent) informado E está ativo? Args
+   * EXPLÍCITOS (sem ALS) porque o contrato de `forChannel` é validar o escopo
+   * COMO RECEBIDO — um channel_id estrangeiro plantado por bug não pode ser
+   * legitimado pelo contexto corrente. Não bypassa guard: o WHERE carrega o
+   * escopo completo por construção.
+   */
+  async channelBelongsToScopeActive(scope: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .select({ id: channels.id })
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, scope.tenant_id),
+          eq(channels.agent_id, scope.agent_id),
+          eq(channels.id, scope.channel_id),
+          eq(channels.active, true),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  },
+
+  /**
+   * 090/fase 0 (spec roteamento v4 §1.6) — resolução do canal ÚNICO ativo do
+   * agente corrente (ALS). Serve os chamadores que não carregam `channel_id`
+   * (conversas legadas, envio proativo, enqueue do outbox): com exatamente UM
+   * canal ativo a escolha é unívoca; zero ou 2+ é fail-closed no CHAMADOR —
+   * aqui só reportamos, sem lançar, para cada boundary aplicar seu próprio
+   * erro tipado/retry. NUNCA escolhe "o primário" entre vários (invariante do
+   * backfill fail-closed).
+   */
+  async findSoleActiveForCurrentAgent(): Promise<
+    { kind: 'one'; id: string } | { kind: 'none' } | { kind: 'many' }
+  > {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ id: channels.id })
+      .from(channels)
+      .where(
+        and(
+          eq(channels.tenant_id, tenant_id),
+          eq(channels.agent_id, agent_id),
+          eq(channels.active, true),
+        ),
+      )
+      .limit(2);
+    if (rows.length === 1) return { kind: 'one', id: rows[0]!.id };
+    return rows.length === 0 ? { kind: 'none' } : { kind: 'many' };
+  },
+
+  /**
+   * Create a channel AND append its admin_audit_log row in ONE transaction.
+   * "Audit every decision" — a failed audit insert rolls the channel back,
+   * so a governance change can never land without its trail. Mirrors
+   * `agentsRepo.createWithSeedAndAudit`: explicit tenant/agent args (no ALS),
+   * and the UNIQUE (tenant_id, channel_type, external_id) 23505 is caught
+   * inside and surfaced as a typed reason instead of a raw pg error.
+   */
+  async createWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    channel: {
+      external_id: string;
+      channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
+      display_name?: string;
+      metadata?: unknown;
+    };
+    audit: { actor_id: string; actor_role: string; reason: string };
+  }): Promise<
+    | { ok: true; channel: Channel }
+    | { ok: false; reason: 'duplicate' | 'invalid_line' }
+  > {
+    // §2 (spec roteamento v4) — declarado→verificado: um canal whatsapp NOVO
+    // nasce INATIVO ('declarado'); só a PairingSession (§2.5), ao provar a
+    // posse da linha, ativa (activateVerified). Digitar um número nunca dá
+    // posse. Outros channel_types mantêm o default do schema (ativo).
+    const isWhatsapp = args.channel.channel_type === 'whatsapp';
+    let external_id = args.channel.external_id;
+    if (isWhatsapp) {
+      const normalized = normalizeWhatsappLine(args.channel.external_id);
+      if (!normalized) return { ok: false, reason: 'invalid_line' };
+      external_id = normalized;
+    }
+    try {
+      return await withTx(async (tx) => {
+        const [row] = await tx
+          .insert(channels)
+          .values({
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            external_id,
+            channel_type: args.channel.channel_type,
+            display_name: args.channel.display_name ?? null,
+            metadata: (args.channel.metadata as object) ?? {},
+            ...(isWhatsapp ? { active: false } : {}),
+          })
+          .returning();
+        if (!row) {
+          throw new Error('channel_create_with_audit_insert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'channel_create',
+          resource_type: 'channel',
+          resource_id: row.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            channel_type: row.channel_type,
+            external_id: row.external_id,
+            display_name: row.display_name,
+            declared_inactive: isWhatsapp,
+            reason: args.audit.reason,
+          },
+        });
+        return { ok: true as const, channel: row };
+      });
+    } catch (err) {
+      if (pgErrorCode(err) === '23505') {
+        return { ok: false, reason: 'duplicate' };
+      }
+      throw err;
+    }
+  },
+
+  /**
+   * §2.5 (spec roteamento v4) — leitura do canal por id SEM tenant guard,
+   * pelo padrão sancionado de entry-point (`findByExternalCrossTenant`): a
+   * superfície /setup (token de operador, processo backend) orquestra o
+   * pareamento ANTES de qualquer contexto de tenant — o canal declarado é
+   * justamente o que diz a qual (tenant, agent) a linha pertencerá.
+   */
+  async getByIdCrossTenant(id: string): Promise<Channel | null> {
+    const rows = await db.select().from(channels).where(eq(channels.id, id)).limit(1);
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Fase 3 (spec roteamento v4 §1.5) — enumeração das LINHAS a subir no boot
+   * multi-linha. EXPLICITAMENTE cross-tenant (bypassa o guard) pelo mesmo
+   * padrão sancionado de `findByExternalCrossTenant`: o runtime v1 hospeda as
+   * sessões de TODOS os tenants em um processo, e o boot precisa descobrir
+   * quais linhas existem antes de qualquer contexto. Só linhas E.164 contam —
+   * o catch-all legado (`default-channel`) não é uma linha.
+   */
+  async listActiveWhatsappLinesCrossTenant(): Promise<
+    Array<{ id: string; tenant_id: string; agent_id: string; external_id: string }>
+  > {
+    const rows = await db
+      .select({
+        id: channels.id,
+        tenant_id: channels.tenant_id,
+        agent_id: channels.agent_id,
+        external_id: channels.external_id,
+      })
+      .from(channels)
+      .where(
+        and(
+          eq(channels.channel_type, 'whatsapp'),
+          eq(channels.active, true),
+          // Canais SINTÉTICOS (sonda) nunca sobem uma sessão real: o inbound é
+          // injetado sinteticamente e o outbound é interceptado pelo sink. A
+          // linha placeholder (+999...) não tem auth pareado e não deve gerar
+          // QR nem warn de "pair first" no boot (correção do review — alta).
+          eq(channels.is_synthetic, false),
+          sql`${channels.external_id} ~ '^\\+[1-9][0-9]{6,14}$'`,
+        ),
+      );
+    return rows;
+  },
+
+  /**
+   * §2.4/§2.5 (spec roteamento v4) — ativação por posse VERIFICADA: chamado
+   * exclusivamente após a PairingSession confirmar que o número real da
+   * sessão casa a linha declarada. O índice global
+   * `channels_active_line_uq (channel_type, external_id) WHERE active AND
+   * channel_type='whatsapp'` (091) é o juiz: 23505 aqui significa que a
+   * linha JÁ pertence a outro workspace ⇒ `line_owned_elsewhere` (a defesa
+   * de ambiguidade do resolver permanece como segunda linha).
+   */
+  async activateVerified(args: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string;
+  }): Promise<
+    | { ok: true; channel: Channel }
+    | { ok: false; reason: 'not_found' | 'line_owned_elsewhere' | 'already_active' }
+  > {
+    try {
+      // Review PR #528 rodada 2 (P1 novo) — o UPDATE é um CAS sobre
+      // `active = false`, e é ele que decide o VENCEDOR da ativação.
+      //
+      // Sem o predicado, duas réplicas rodando `promoteReadyVerifiedLines` no
+      // mesmo tick liam a mesma linha `verified_offline`, ambas recebiam
+      // `ok: true` e cada uma subia `startLineSession` no seu mapa local:
+      // DOIS sockets Baileys para a MESMA linha WhatsApp — exatamente o
+      // incidente que a posse de linha existe para impedir. Com o CAS, o
+      // Postgres serializa e só um UPDATE encontra `active = false`.
+      const rows = await db
+        .update(channels)
+        .set({ active: true, updated_at: new Date() })
+        .where(
+          and(
+            eq(channels.tenant_id, args.tenant_id),
+            eq(channels.agent_id, args.agent_id),
+            eq(channels.id, args.channel_id),
+            eq(channels.active, false),
+          ),
+        )
+        .returning();
+      if (rows.length > 0) return { ok: true, channel: rows[0]! };
+
+      // Zero linhas: ou o canal não existe NESTE escopo, ou alguém já ativou.
+      // Distinguir importa — `already_active` é um perdedor de corrida
+      // benigno (não deve marcar a linha como `failed` nem subir sessão),
+      // `not_found` é fail-closed de escopo.
+      const existing = await db
+        .select({ active: channels.active })
+        .from(channels)
+        .where(
+          and(
+            eq(channels.tenant_id, args.tenant_id),
+            eq(channels.agent_id, args.agent_id),
+            eq(channels.id, args.channel_id),
+          ),
+        )
+        .limit(1);
+      if (existing.length === 0) return { ok: false, reason: 'not_found' };
+      return { ok: false, reason: 'already_active' };
+    } catch (err) {
+      if (pgErrorCode(err) === '23505') {
+        return { ok: false, reason: 'line_owned_elsewhere' };
+      }
+      throw err;
+    }
   },
 
   // [P88-C3] Tenant-scoped: write paths MUST enforce isolation. Without
@@ -361,6 +651,85 @@ export const rolesRepo = {
           eq(roles.active, true),
         ),
       );
+  },
+
+  /**
+   * Create a role AND append its admin_audit_log row in ONE transaction —
+   * same contract as `channelsRepo.createWithAudit` (audit failure rolls the
+   * role back; 23505 → typed 'duplicate').
+   *
+   * `is_default` omitted ⇒ resolved INSIDE the tx: the agent's first active
+   * role becomes the default. Two concurrent "first role" creates can both
+   * see zero rows, but the partial unique index (one default per
+   * tenant/agent) breaks the tie — the loser lands on 23505 → 'duplicate'.
+   */
+  async createWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    role: {
+      role_key: string;
+      display_name: string;
+      description?: string;
+      prompt_addendum?: string;
+      is_default?: boolean;
+    };
+    audit: { actor_id: string; actor_role: string; reason: string };
+  }): Promise<{ ok: true; role: Role } | { ok: false; reason: 'duplicate' }> {
+    try {
+      return await withTx(async (tx) => {
+        let isDefault = args.role.is_default;
+        if (isDefault === undefined) {
+          const existing = await tx
+            .select({ one: sql<number>`1` })
+            .from(roles)
+            .where(
+              and(
+                eq(roles.tenant_id, args.tenant_id),
+                eq(roles.agent_id, args.agent_id),
+                eq(roles.active, true),
+              ),
+            )
+            .limit(1);
+          isDefault = existing.length === 0;
+        }
+        const [row] = await tx
+          .insert(roles)
+          .values({
+            tenant_id: args.tenant_id,
+            agent_id: args.agent_id,
+            role_key: args.role.role_key,
+            display_name: args.role.display_name,
+            description: args.role.description ?? null,
+            prompt_addendum: args.role.prompt_addendum ?? null,
+            is_default: isDefault,
+          })
+          .returning();
+        if (!row) {
+          throw new Error('role_create_with_audit_insert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: 'role_create',
+          resource_type: 'role',
+          resource_id: row.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            role_key: row.role_key,
+            display_name: row.display_name,
+            is_default: row.is_default,
+            reason: args.audit.reason,
+          },
+        });
+        return { ok: true as const, role: row };
+      });
+    } catch (err) {
+      if (pgErrorCode(err) === '23505') {
+        return { ok: false, reason: 'duplicate' };
+      }
+      throw err;
+    }
   },
 
   // [P88-C3] Tenant-scoped: same justification as channelsRepo.deactivate.

@@ -2,6 +2,7 @@ import { eq, and, desc, isNull, sql, gt } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import {
   capability_proposals,
+  agent_operational_profile_versions,
   app_users,
   proposal_approvals,
   admin_audit_log,
@@ -23,6 +24,16 @@ import type {
 } from '../schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from '../capability-risk.js';
+import {
+  classifyProfileChangeRisk,
+  type ProfileChangeEntry,
+} from '../profile-risk.js';
+import {
+  operationalProfileVersionsRepo,
+  ProfileTransitionError,
+  type ProfileTransitionFailure,
+} from './profile-repos.js';
+import { readExpectedPredecessor, lockParentAgent } from './profile-internal.js';
 
 // =====================================================================
 // P8.5 Admin UI v1 — auth, approvals, audit log, debug snapshot grants
@@ -52,6 +63,36 @@ export const appUsersRepo = {
     return rows[0];
   },
 };
+
+/**
+ * Cursor opaco da fila unificada (review PR #496 médio 8): base64url de
+ * {ts, id} do último item devolvido. Composto porque `created_at` empata
+ * (batches) — o id desempata na MESMA ordem do keyset por source.
+ * Cursor ilegível/estranho ⇒ null (primeira página) — nunca lança.
+ */
+export function encodeListCursor(item: { proposed_at: Date; id: string }): string {
+  return Buffer.from(
+    JSON.stringify({ ts: item.proposed_at.toISOString(), id: item.id }),
+  ).toString('base64url');
+}
+
+export function decodeListCursor(
+  cursor: string | null | undefined,
+): { ts: Date; id: string } | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+      ts?: unknown;
+      id?: unknown;
+    };
+    if (typeof parsed.ts !== 'string' || typeof parsed.id !== 'string') return null;
+    const ts = new Date(parsed.ts);
+    if (Number.isNaN(ts.getTime())) return null;
+    return { ts, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * proposalsUnified — virtual UNION view aggregating all proposal sources.
@@ -87,6 +128,15 @@ export const proposalsUnifiedRepo = {
     return result.rows.map((r) => r.table_name);
   },
 
+  /**
+   * Review PR #496 (médio 8) — a fila unificada é paginada com KEYSET GLOBAL:
+   * cada source recebe o predicado composto `(created_at, id) < cursor` e o
+   * merge final ordena por `proposed_at DESC, id DESC` antes do slice — sem
+   * isso, capabilities entravam primeiro no array e `limit` capabilities
+   * pendentes escondiam TODOS os perfis indefinidamente (e o cursor aceito
+   * nunca era aplicado). O cursor é opaco: base64url de {ts, id} do último
+   * item devolvido.
+   */
   async list(input: {
     tenantId: string;
     types?: ProposalTypeId[];
@@ -112,6 +162,7 @@ export const proposalsUnifiedRepo = {
   }> {
     const available = await this._availableTables();
     const status = input.status ?? 'proposed';
+    const cursor = decodeListCursor(input.cursor);
 
     // capability_proposals is the only table guaranteed to exist on main.
     if (!available.includes('capability_proposals')) {
@@ -151,9 +202,15 @@ export const proposalsUnifiedRepo = {
           and(
             eq(capability_proposals.tenant_id, input.tenantId),
             eq(capability_proposals.status, dbStatus),
+            ...(cursor
+              ? [
+                  sql`(${capability_proposals.created_at}, ${capability_proposals.id})
+                      < (${cursor.ts}, ${cursor.id}::uuid)`,
+                ]
+              : []),
           ),
         )
-        .orderBy(desc(capability_proposals.created_at))
+        .orderBy(desc(capability_proposals.created_at), desc(capability_proposals.id))
         .limit(input.limit + 1);
       for (const r of rows) {
         // Post-Codex-review #101: risk is DERIVED from capability_type +
@@ -172,11 +229,60 @@ export const proposalsUnifiedRepo = {
       }
     }
 
+    // Spec perfil-inbox v4 §3 (fase C: incondicional) — perfis operacionais
+    // PROPOSTOS entram na fila unificada. Risco é COMPUTADO (nunca LLM)
+    // contra o predecessor DECLARADO da proposta (classifyProfileChangeRisk,
+    // fail-UP).
+    {
+      const profStatusMap: Record<ProposalUnifiedStatus, string> = {
+        proposed: 'proposed',
+        pending_review: 'proposed',
+        rejected: 'rolled_back',
+        activated: 'active',
+      };
+      const rows = await db
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, input.tenantId),
+            eq(agent_operational_profile_versions.status, profStatusMap[status]),
+            ...(cursor
+              ? [
+                  sql`(${agent_operational_profile_versions.created_at}, ${agent_operational_profile_versions.id})
+                      < (${cursor.ts}, ${cursor.id}::uuid)`,
+                ]
+              : []),
+          ),
+        )
+        .orderBy(
+          desc(agent_operational_profile_versions.created_at),
+          desc(agent_operational_profile_versions.id),
+        )
+        .limit(input.limit + 1);
+      for (const r of rows) {
+        const { risk } = await this._classifyProfileRow(r);
+        items.push({
+          id: r.id,
+          type: 'operational_profile',
+          descriptor: `Perfil operacional v${r.version} — ${r.agent_id}`,
+          risk,
+          source: 'operational_profile',
+          status,
+          proposed_at: r.created_at,
+          proposed_by: r.proposed_by,
+        });
+      }
+    }
+
     // Future tables (policy_rules, soul_biases, skills, knowledge_pending_review)
     // are wired up here once their schemas land in main; the available[] check
     // gates each block independently to avoid runtime errors before merge.
 
-    // Simple in-memory filter on optional facets (UI-side filters)
+    // Simple in-memory filter on optional facets (UI-side filters). Nota:
+    // facetas podem sub-preencher uma página (limitação pré-existente); a
+    // paginação por cursor continua correta porque o nextCursor é sempre o
+    // ÚLTIMO item devolvido, na mesma ordem do keyset.
     const filtered = items.filter((it) => {
       if (input.types && !input.types.includes(it.type)) return false;
       if (input.risks && !input.risks.includes(it.risk)) return false;
@@ -184,11 +290,19 @@ export const proposalsUnifiedRepo = {
       return true;
     });
 
+    // Merge global: mesma ordem do keyset de cada source (created_at DESC,
+    // id DESC — uuid canônico compara igual em texto e no pg), para que
+    // sources se INTERCALEM por recência em vez de concatenar por tipo.
+    filtered.sort((a, b) => {
+      const d = b.proposed_at.getTime() - a.proposed_at.getTime();
+      if (d !== 0) return d;
+      return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+    });
+
     const hasMore = filtered.length > input.limit;
     const trimmed = filtered.slice(0, input.limit);
-    const nextCursor = hasMore && trimmed[trimmed.length - 1]
-      ? trimmed[trimmed.length - 1]!.id
-      : null;
+    const last = trimmed[trimmed.length - 1];
+    const nextCursor = hasMore && last ? encodeListCursor(last) : null;
     return { items: trimmed, hasMore, nextCursor };
   },
 
@@ -199,6 +313,7 @@ export const proposalsUnifiedRepo = {
       skill: 0,
       capability_proposal: 0,
       knowledge_proposal: 0,
+      operational_profile: 0,
     };
     const available = await this._availableTables();
     if (available.includes('capability_proposals')) {
@@ -211,7 +326,54 @@ export const proposalsUnifiedRepo = {
       const raw = result.rows[0]?.count ?? 0;
       counts.capability_proposal = typeof raw === 'string' ? Number(raw) : raw;
     }
+    // Spec perfil-inbox v4 (fase C) — contadores nativos; o card bespoke
+    // `pendingProfileApprovals` (#492) foi removido junto com a flag.
+    {
+      const result = await db.execute<{ count: number | string }>(sql`
+        SELECT COUNT(*)::int AS count
+          FROM agent_operational_profile_versions
+         WHERE tenant_id = ${tenantId}
+           AND status = 'proposed'
+      `);
+      const raw = result.rows[0]?.count ?? 0;
+      counts.operational_profile = typeof raw === 'string' ? Number(raw) : raw;
+    }
     return counts;
+  },
+
+  /**
+   * Spec perfil-inbox v4 §1.2 — risco computado contra o predecessor
+   * DECLARADO (`metadata.previous_version_id`), não contra o active do
+   * momento da leitura — coerente com o guard de predecessor que decidirá a
+   * ativação. Predecessor ausente/ilegível ⇒ o classificador falha PARA CIMA
+   * (`high`), exceto o seed intencional v1 (sem predecessor por construção),
+   * cujo risco também é `high` — a primeira ativação define o contrato do
+   * agente inteiro.
+   */
+  async _classifyProfileRow(row: {
+    version: number;
+    profile_body: unknown;
+    tenant_id: string;
+    agent_id: string;
+  }): Promise<{ risk: RiskLevelId; changes: ProfileChangeEntry[]; reasons: string[] }> {
+    const declared = readExpectedPredecessor(row.profile_body);
+    let predecessorBody: unknown = null;
+    if (typeof declared === 'string' && declared !== 'unknown') {
+      const rows = await db
+        .select({ profile_body: agent_operational_profile_versions.profile_body })
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.id, declared),
+            eq(agent_operational_profile_versions.tenant_id, row.tenant_id),
+            eq(agent_operational_profile_versions.agent_id, row.agent_id),
+          ),
+        )
+        .limit(1);
+      predecessorBody = rows[0]?.profile_body ?? null;
+    }
+    const out = classifyProfileChangeRisk(predecessorBody, row.profile_body);
+    return { risk: out.risk, changes: out.changes, reasons: out.reasons };
   },
 
   async getOne(
@@ -220,6 +382,13 @@ export const proposalsUnifiedRepo = {
   ): Promise<{
     id: string;
     type: ProposalTypeId;
+    /**
+     * Agente DONO da proposta (review PR #496 alto 5): chamadores que
+     * recebem um agent_id do cliente DEVEM conferir este campo antes de
+     * decidir — sem isso uma versão do agente B seria aprovável por um
+     * endpoint invocado para o agente A dentro do mesmo tenant.
+     */
+    agent_id: string;
     descriptor: string;
     risk: RiskLevelId;
     source: string;
@@ -250,6 +419,7 @@ export const proposalsUnifiedRepo = {
         return {
           id: r.id,
           type: 'capability_proposal',
+          agent_id: r.agent_id,
           descriptor: r.title,
           risk: deriveCapabilityRisk(r.capability_type, r.proposed_spec),
           source: r.capability_type,
@@ -258,6 +428,68 @@ export const proposalsUnifiedRepo = {
           proposed_by: r.decided_by ?? 'system',
           body: r.proposed_spec,
           locks: deriveCapabilityLocks(r.capability_type, r.proposed_spec),
+        };
+      }
+    }
+
+    // Spec perfil-inbox v4 — detalhe do perfil proposto: o body carrega o
+    // corpo proposto + o do predecessor DECLARADO + as entradas do walker
+    // (mesma fonte do classificador) para o DiffOperationalProfile.
+    {
+      const rows = await db
+        .select()
+        .from(agent_operational_profile_versions)
+        .where(
+          and(
+            eq(agent_operational_profile_versions.tenant_id, tenantId),
+            eq(agent_operational_profile_versions.id, id),
+          ),
+        )
+        .limit(1);
+      const r = rows[0];
+      if (r) {
+        const reverseProfileStatus: Record<string, ProposalUnifiedStatus> = {
+          proposed: 'proposed',
+          active: 'activated',
+          frozen: 'activated',
+          rolled_back: 'rejected',
+        };
+        const classified = await this._classifyProfileRow(r);
+        const declared = readExpectedPredecessor(r.profile_body);
+        let predecessorBody: unknown = null;
+        if (typeof declared === 'string' && declared !== 'unknown') {
+          const predRows = await db
+            .select({ profile_body: agent_operational_profile_versions.profile_body })
+            .from(agent_operational_profile_versions)
+            .where(
+              and(
+                eq(agent_operational_profile_versions.id, declared),
+                eq(agent_operational_profile_versions.tenant_id, tenantId),
+                eq(agent_operational_profile_versions.agent_id, r.agent_id),
+              ),
+            )
+            .limit(1);
+          predecessorBody = predRows[0]?.profile_body ?? null;
+        }
+        return {
+          id: r.id,
+          type: 'operational_profile',
+          agent_id: r.agent_id,
+          descriptor: `Perfil operacional v${r.version} — ${r.agent_id}`,
+          risk: classified.risk,
+          source: 'operational_profile',
+          status: reverseProfileStatus[r.status] ?? 'proposed',
+          proposed_at: r.created_at,
+          proposed_by: r.proposed_by,
+          body: {
+            agent_id: r.agent_id,
+            version: r.version,
+            proposed_profile_body: r.profile_body,
+            predecessor_profile_body: predecessorBody,
+            changes: classified.changes,
+            risk_reasons: classified.reasons,
+          },
+          locks: [],
         };
       }
     }
@@ -328,6 +560,11 @@ export const proposalsUnifiedRepo = {
     finalStatus: ProposalUnifiedStatus;
     /** Recomputed inside transaction. */
     dualComplete: boolean;
+    /** Presente só no source operational_profile (shim legado da aba Versões). */
+    profile?: {
+      activated: { id: string; version: number } | null;
+      frozen_previous: { id: string; version: number } | null;
+    };
   } | {
     ok: false;
     reason:
@@ -337,7 +574,25 @@ export const proposalsUnifiedRepo = {
       | 'transition_failed'
       | 'already_approved_by_user'
       | 'already_approved_by_role';
+  } | {
+    /**
+     * Spec perfil-inbox v4 §1.4 — falha tipada dos guards de perfil
+     * (predecessor_conflict, migrated_legacy_proposal, missing_predecessor,
+     * …), capturada FORA do withTx: o rollback já desfez approval + audit.
+     * O router traduz com as mesmas mensagens do caminho legado.
+     */
+    ok: false;
+    reason: 'profile_transition_failed';
+    detail: ProfileTransitionFailure;
   }> {
+    // Spec perfil-inbox v4 — source operational_profile tem caminho próprio:
+    // a transição delega aos primitivos InTx do repo de perfis (guards de
+    // predecessor intactos) e o contrato de falha é THROW→rollback→catch.
+    // Fase C: caminho ÚNICO — a flag e o shim legado foram removidos.
+    if (input.type === 'operational_profile') {
+      return this._decideProfileAtomically(input);
+    }
+
     const available = await this._availableTables();
 
     return await withTx(async (tx) => {
@@ -370,10 +625,18 @@ export const proposalsUnifiedRepo = {
         // checks so concurrent approvers cannot race past the idempotency guard.
         let resolvedDualComplete = input.dualComplete;
         if (input.decision === 'approved' && input.gateParams) {
+          // 093 (spec perfil-inbox v4 §1.6): predicates de leitura carregam
+          // tenant_id SEMPRE; rows legadas (source NULL) continuam contando —
+          // eram deste proposal antes do escopo existir.
           const existingInTx = await tx
             .select()
             .from(proposal_approvals)
-            .where(eq(proposal_approvals.proposal_id, input.proposalId));
+            .where(
+              and(
+                eq(proposal_approvals.proposal_id, input.proposalId),
+                eq(proposal_approvals.tenant_id, input.tenantId),
+              ),
+            );
 
           // Idempotency by user: same user cannot record two approvals.
           if (existingInTx.some(
@@ -413,11 +676,15 @@ export const proposalsUnifiedRepo = {
           }
         }
 
-        // (2) Insert approval row.
+        // (2) Insert approval row — 093 (spec perfil-inbox v4 §1.6): escritas
+        // novas preenchem agent_id + proposal_source OBRIGATORIAMENTE (o CHECK
+        // de pareamento NULL e a partial unique escopada são os juízes no DB).
         const insertedApprovals = await tx
           .insert(proposal_approvals)
           .values({
             tenant_id: input.tenantId,
+            agent_id: sourceRow.agent_id,
+            proposal_source: 'capability_proposal',
             proposal_id: input.proposalId,
             approval_class: input.approvalClass,
             approver_user_id: input.actorId,
@@ -518,8 +785,278 @@ export const proposalsUnifiedRepo = {
       // each source repo to expose a tx-aware `activate(tx, ...)` overload.
       // Until that lands, source_not_supported is the fail-safe — the tRPC
       // layer maps it to NOT_IMPLEMENTED rather than pretending success.
+      // (operational_profile já é despachado ANTES do withTx — ver acima.)
       return { ok: false, reason: 'source_not_supported' as const };
     });
+  },
+
+  /**
+   * Spec perfil-inbox v4 §1.4 — decisão de PERFIL pelo motor unificado.
+   *
+   * A ordem interna espelha o caminho capability (dup-check → approval →
+   * audit → transição do source), e é exatamente por isso que a transição
+   * usa os primitivos InTx com contrato de THROW: `ProfileTransitionError`
+   * dentro do withTx faz rollback TOTAL — a approval e o audit inseridos
+   * antes da transição desaparecem junto (invariante 1b: nenhum estado
+   * parcial, nenhum dup-check falso-positivo no retry). O catch fica FORA
+   * do withTx e converte para o resultado tipado do motor.
+   */
+  async _decideProfileAtomically(input: {
+    tenantId: string;
+    proposalId: string;
+    approvalClass: string;
+    actorId: string;
+    actorRole: string;
+    decision: 'approved' | 'rejected';
+    comment: string;
+    gateParams?: {
+      dualRequired: boolean;
+      requiredRoles: string[];
+      allLocks: string[];
+    };
+    dualComplete: boolean;
+  }): Promise<
+    | {
+        ok: true;
+        sourceTransitioned: boolean;
+        approval: ProposalApproval;
+        finalStatus: ProposalUnifiedStatus;
+        dualComplete: boolean;
+        /** Detalhe da ativação de perfil (só para type=operational_profile). */
+        profile?: {
+          activated: { id: string; version: number } | null;
+          frozen_previous: { id: string; version: number } | null;
+        };
+      }
+    | {
+        ok: false;
+        reason:
+          | 'not_found'
+          | 'invalid_source_status'
+          | 'already_approved_by_user'
+          | 'already_approved_by_role';
+      }
+    | { ok: false; reason: 'profile_transition_failed'; detail: ProfileTransitionFailure }
+  > {
+    // Issue #511 — set as the LAST statement inside the transaction callback,
+    // so any throw before that point leaves it null and publishes nothing. The
+    // only window left is a COMMIT that fails after the callback returned, which
+    // would publish a spurious invalidation — harmless (one extra cache miss),
+    // and strictly preferable to the opposite failure mode.
+    let activatedIdentity: { tenant_id: string; agent_id: string } | null = null;
+    try {
+      return await withTx(async (tx) => {
+        // (0) Leitura SEM lock só para descobrir o agent_id — o lock do
+        // agente pai precisa vir ANTES de qualquer row lock desta tabela
+        // (MESMA ordem de todos os writers: lockParentAgent → row FOR
+        // UPDATE). Inverter a ordem criaria um deadlock AB-BA com o caminho
+        // legado/seeds.
+        const probe = await tx
+          .select({
+            id: agent_operational_profile_versions.id,
+            agent_id: agent_operational_profile_versions.agent_id,
+          })
+          .from(agent_operational_profile_versions)
+          .where(
+            and(
+              eq(agent_operational_profile_versions.tenant_id, input.tenantId),
+              eq(agent_operational_profile_versions.id, input.proposalId),
+            ),
+          )
+          .limit(1);
+        if (!probe[0]) return { ok: false, reason: 'not_found' as const };
+
+        const agentLocked = await lockParentAgent(tx, input.tenantId, probe[0].agent_id);
+        if (!agentLocked) return { ok: false, reason: 'not_found' as const };
+
+        // (1) Lock do source row (pós-lock do pai) — serializa decisões
+        // concorrentes: a 2ª assinatura do dual VÊ a approval da 1ª no
+        // re-read transacional abaixo. O InTx re-trava (idempotente na
+        // mesma tx).
+        const rows = await tx
+          .select()
+          .from(agent_operational_profile_versions)
+          .where(
+            and(
+              eq(agent_operational_profile_versions.tenant_id, input.tenantId),
+              eq(agent_operational_profile_versions.id, input.proposalId),
+            ),
+          )
+          .for('update')
+          .limit(1);
+        const sourceRow = rows[0];
+        if (!sourceRow) return { ok: false, reason: 'not_found' as const };
+        if (sourceRow.status !== 'proposed') {
+          return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
+        // (1b) Dup-check + recomputação do gate DENTRO da tx, leitura
+        // ESCOPADA (tenant + source + proposal — §1.6).
+        let resolvedDualComplete = input.dualComplete;
+        if (input.decision === 'approved' && input.gateParams) {
+          const existingInTx = await tx
+            .select()
+            .from(proposal_approvals)
+            .where(
+              and(
+                eq(proposal_approvals.proposal_id, input.proposalId),
+                eq(proposal_approvals.tenant_id, input.tenantId),
+                eq(proposal_approvals.proposal_source, 'operational_profile'),
+              ),
+            );
+
+          if (
+            existingInTx.some(
+              (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
+            )
+          ) {
+            return { ok: false, reason: 'already_approved_by_user' as const };
+          }
+
+          const { dualRequired, requiredRoles, allLocks } = input.gateParams;
+          if (dualRequired && allLocks.length === 0) {
+            if (
+              existingInTx.some(
+                (a) => a.approver_role === input.actorRole && a.decision === 'approved',
+              )
+            ) {
+              return { ok: false, reason: 'already_approved_by_role' as const };
+            }
+          }
+
+          if (allLocks.length > 0) {
+            const priorFounderIds = new Set(
+              existingInTx
+                .filter((a) => a.decision === 'approved' && a.approver_role === 'founder')
+                .map((a) => a.approver_user_id),
+            );
+            priorFounderIds.add(input.actorId);
+            resolvedDualComplete = priorFounderIds.size >= 2;
+          } else if (dualRequired) {
+            const approvedRoles = new Set(
+              existingInTx
+                .filter((a) => a.decision === 'approved')
+                .map((a) => a.approver_role),
+            );
+            approvedRoles.add(input.actorRole);
+            resolvedDualComplete = requiredRoles.every((r) => approvedRoles.has(r));
+          } else {
+            resolvedDualComplete = true;
+          }
+        }
+
+        // (2) Approval com ESCOPO COMPLETO (invariante 5; CHECK 093 no DB).
+        const insertedApprovals = await tx
+          .insert(proposal_approvals)
+          .values({
+            tenant_id: input.tenantId,
+            agent_id: sourceRow.agent_id,
+            proposal_source: 'operational_profile',
+            proposal_id: input.proposalId,
+            approval_class: input.approvalClass,
+            approver_user_id: input.actorId,
+            approver_role: input.actorRole,
+            decision: input.decision,
+            comment: input.comment,
+          })
+          .returning();
+        const approval = insertedApprovals[0];
+        if (!approval) {
+          throw new TypedError('approval_insert_failed', 'Could not record approval');
+        }
+
+        // (3) Audit do MOTOR (uma trilha por decisão — invariante 3; o
+        // wrapper legado mantém a dele até ser aposentado, e cada decisão
+        // passa por exatamente UM caminho).
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.tenantId,
+          actor_id: input.actorId,
+          actor_role: input.actorRole,
+          action: input.decision === 'approved' ? 'proposal_approve' : 'proposal_reject',
+          resource_type: 'agent_operational_profile_version',
+          resource_id: input.proposalId,
+          change_summary: {
+            agent_id: sourceRow.agent_id,
+            approval_class: input.approvalClass,
+            comment: input.comment,
+            dual_complete: resolvedDualComplete,
+            source_transition_attempted:
+              input.decision === 'rejected' || resolvedDualComplete,
+          },
+        });
+
+        // (4) Transição do source pelos primitivos endurecidos (guards de
+        // predecessor intactos — invariante 1). Falha ⇒ THROW ⇒ rollback.
+        let finalStatus: ProposalUnifiedStatus = 'pending_review';
+        let sourceTransitioned = false;
+        let profile:
+          | {
+              activated: { id: string; version: number } | null;
+              frozen_previous: { id: string; version: number } | null;
+            }
+          | undefined;
+        if (input.decision === 'rejected') {
+          await operationalProfileVersionsRepo.rejectProposedInTx(tx, {
+            tenant_id: input.tenantId,
+            agent_id: sourceRow.agent_id,
+            id: input.proposalId,
+            rollback_reason: input.comment,
+          });
+          finalStatus = 'rejected';
+          sourceTransitioned = true;
+        } else if (resolvedDualComplete) {
+          const r = await operationalProfileVersionsRepo.approveAndActivateInTx(tx, {
+            tenant_id: input.tenantId,
+            agent_id: sourceRow.agent_id,
+            id: input.proposalId,
+            actor_id: input.actorId,
+          });
+          profile = { activated: r.activated, frozen_previous: r.frozen_previous };
+          finalStatus = 'activated';
+          sourceTransitioned = true;
+        }
+        // high sem segunda assinatura: NENHUMA transição (invariante 2) — a
+        // approval fica gravada aguardando o segundo aprovador.
+
+        if (profile?.activated) {
+          activatedIdentity = { tenant_id: input.tenantId, agent_id: sourceRow.agent_id };
+        }
+        return {
+          ok: true as const,
+          sourceTransitioned,
+          approval,
+          finalStatus,
+          dualComplete: resolvedDualComplete,
+          ...(profile ? { profile } : {}),
+        };
+      });
+    } catch (err) {
+      if (err instanceof ProfileTransitionError) {
+        return { ok: false, reason: 'profile_transition_failed', detail: err.detail };
+      }
+      throw err;
+    } finally {
+      // Issue #511 — publish the identity-cache invalidation AFTER the
+      // transaction commits, never inside it. Publishing from inside would race
+      // the readers: a replica receiving the event before COMMIT would re-read
+      // the PRE-commit snapshot and pin the OLD identity for a full TTL —
+      // strictly worse than not publishing at all.
+      //
+      // Activation is the only transition that changes what `getActive()`
+      // returns, so it is the only one that needs to fan out. Best-effort by
+      // contract: `publishTurnContextInvalidation` swallows broker failures
+      // (staleness then falls back to the TTL bound) and never fails the
+      // operator's approval, which is already committed and audited.
+      if (activatedIdentity) {
+        const { publishTurnContextInvalidation } = await import(
+          '@/agent/turn-context/cache.js'
+        );
+        await publishTurnContextInvalidation({
+          ...(activatedIdentity as { tenant_id: string; agent_id: string }),
+          resource: 'identity',
+        });
+      }
+    }
   },
 
   /**
@@ -549,6 +1086,13 @@ export const proposalsUnifiedRepo = {
       // not_found and we skip.
       const proposal = await this.getOne(tenantId, id);
       if (!proposal) {
+        skipped.push(id);
+        continue;
+      }
+      // Spec perfil-inbox v4 §1.5 — perfis FORA do bulkReject na v1 da
+      // integração: rejeitar perfil é transição terminal (rolled_back) e
+      // merece decisão individual com o diff na frente do operador.
+      if (proposal.type === 'operational_profile') {
         skipped.push(id);
         continue;
       }
@@ -589,14 +1133,41 @@ export const proposalsUnifiedRepo = {
  * proposalApprovalsRepo — track + check dual-approval state.
  */
 export const proposalApprovalsRepo = {
-  async listByProposal(proposalId: string): Promise<ProposalApproval[]> {
+  /**
+   * 093 (spec perfil-inbox v4 §1.6): predicates de leitura incluem
+   * `tenant_id` SEMPRE que o chamador o conhece (todos os routers conhecem);
+   * o parâmetro é opcional só para compatibilidade com chamadores legados.
+   */
+  async listByProposal(proposalId: string, tenantId?: string): Promise<ProposalApproval[]> {
     return await db
       .select()
       .from(proposal_approvals)
-      .where(eq(proposal_approvals.proposal_id, proposalId));
+      .where(
+        and(
+          eq(proposal_approvals.proposal_id, proposalId),
+          ...(tenantId ? [eq(proposal_approvals.tenant_id, tenantId)] : []),
+        ),
+      );
   },
 
+  /**
+   * 093 (spec perfil-inbox v4 §1.6) — guard de escrita: decisão NOVA sem
+   * escopo completo (agent_id + proposal_source, aos pares) é rejeitada AQUI
+   * além do CHECK no DB. Rows legadas (ambos nulos) só existem via histórico.
+   */
   async record(input: NewProposalApproval): Promise<ProposalApproval> {
+    if ((input.agent_id == null) !== (input.proposal_source == null)) {
+      throw new TypedError(
+        'approval_scope_incomplete',
+        'proposal_approvals: agent_id and proposal_source must be provided together',
+      );
+    }
+    if (input.agent_id == null) {
+      throw new TypedError(
+        'approval_scope_incomplete',
+        'proposal_approvals: new decisions must carry full scope (tenant, agent, source)',
+      );
+    }
     const rows = await db.insert(proposal_approvals).values(input).returning();
     if (!rows[0]) throw new TypedError('approval_insert_failed', 'Could not record approval');
     return rows[0];

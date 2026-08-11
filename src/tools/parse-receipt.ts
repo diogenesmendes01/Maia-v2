@@ -3,10 +3,12 @@ import type { Tool } from './_registry.js';
 import { parseImage } from '@/lib/vision.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
 import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
+import { resolveAttachmentById } from '@/lib/attachment-resolver.js';
+import { readStoredMedia, MAX_IMAGE_BYTES } from '@/lib/media-guard.js';
+import { TypedError } from '@/lib/utils.js';
 
 const inputSchema = z.object({
-  media_local_path: z.string().min(1),
-  file_sha256: z.string().min(1),
+  attachment_id: z.string().uuid(),
 });
 
 const outputSchema = z.object({
@@ -27,9 +29,16 @@ type Output = z.infer<typeof outputSchema>;
 /**
  * Spec 10 §5.3 — extracts structured fields from a PIX/TED/DOC receipt via
  * Claude Vision. Idempotency: the dispatcher keys on
- * (pessoa_id, entity_id, file_sha256); on top of that, this handler caches
- * the Vision parse keyed on file_sha256 alone so the same image uploaded
- * by different pessoas doesn't pay the Vision API cost twice.
+ * (pessoa_id, entity_id, attachment_id); on top of that, this handler caches
+ * the Vision parse keyed on the RECOMPUTED sha256 of the media bytes so the
+ * same image uploaded by different pessoas doesn't pay the Vision API cost
+ * twice.
+ *
+ * P0 audit chapter 4: input is an OPAQUE `attachment_id` (a mensagens row id
+ * from `conversation_attachment_lookup`). The backend resolves it
+ * (tenant/agent/conversation-scoped, fail-closed) and reads the file through
+ * media-guard (containment, symlink rejection, 10MB cap pre-read, magic-byte
+ * mime). Cache keys use the recomputed sha — never a declared one.
  *
  * Sanitization strategy (PR #38 review #3189933385):
  *   - beneficiario_nome: wrap with <ocr> tags + sanitize (strategy B)
@@ -43,7 +52,7 @@ type Output = z.infer<typeof outputSchema>;
 export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_receipt',
   description:
-    'Extrai dados estruturados de uma imagem de comprovante (PIX, TED, DOC, etc.): tipo, valor, beneficiário, chave PIX, endToEndId.',
+    'Extrai dados estruturados de uma imagem de comprovante (PIX, TED, DOC, etc.): tipo, valor, beneficiário, chave PIX, endToEndId. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_balance'],
@@ -51,14 +60,28 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
   redis_required: false,
   operation_type: 'parse_only',
   audit_action: 'receipt_parsed',
-  handler: async (args) => {
-    const cached = await getCachedVision<Output>('parse_receipt', args.file_sha256);
+  handler: async (args, ctx) => {
+    const attachment = await resolveAttachmentById(ctx.conversa.id, args.attachment_id);
+    if (!attachment) {
+      throw new TypedError(
+        'attachment_not_found',
+        'anexo não encontrado nesta conversa — use conversation_attachment_lookup para obter um attachment_id válido',
+      );
+    }
+    const media = await readStoredMedia(attachment.path, {
+      maxBytes: MAX_IMAGE_BYTES,
+      kind: 'image',
+    });
+    // Cache key = sha256 RECOMPUTED from the bytes read (never declared).
+    const sha = media.sha256;
+
+    const cached = await getCachedVision<Output>('parse_receipt', sha);
     if (cached) return cached;
 
-    const result = await parseImage({ path: args.media_local_path, kind: 'receipt' });
+    const result = await parseImage({ buf: media.buf, mime: media.mime, kind: 'receipt' });
     if (!result) {
       const empty: Output = { confianca: 0 };
-      await setCachedVision('parse_receipt', args.file_sha256, empty);
+      await setCachedVision('parse_receipt', sha, empty);
       return empty;
     }
     const out: Output = {
@@ -81,7 +104,7 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
       endToEndId: validateOrDrop(result.endToEndId, OCR_REGEXES.end_to_end_id),
       confianca: result.valor && result.beneficiario_nome ? 0.85 : 0.6,
     };
-    await setCachedVision('parse_receipt', args.file_sha256, out);
+    await setCachedVision('parse_receipt', sha, out);
     return out;
   },
 };

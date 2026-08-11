@@ -49,20 +49,71 @@ export async function checkWhatsApp(): Promise<HealthReport> {
   };
 }
 
+/**
+ * Aggregate component health. READ-ONLY as of issue #512.
+ *
+ * It used to fire three `healthRepo.record()` INSERTs on every call — and
+ * `/health` is polled by the container healthcheck (compose.prod.yml) and by
+ * every load balancer, so a probe endpoint grew `system_health_events`
+ * forever and put write pressure on the DB during exactly the incidents it
+ * was meant to observe. Historical persistence now lives in the
+ * `health_monitor` cron worker (`src/workers/health-monitor.ts`), which calls
+ * `recordHealthSnapshot()` once a minute.
+ *
+ * Result is cached for `HEALTH_CACHE_MS` so a thundering herd of probes
+ * collapses into one round-trip per window.
+ */
+const HEALTH_CACHE_MS = 2_000;
+let healthCache: { at: number; value: { status: HealthStatus; components: HealthReport[] } } | null =
+  null;
+
 export async function checkAll(): Promise<{ status: HealthStatus; components: HealthReport[] }> {
+  const now = Date.now();
+  if (healthCache && now - healthCache.at < HEALTH_CACHE_MS) return healthCache.value;
   const reports = await Promise.all([checkDb(), checkRedis(), checkWhatsApp()]);
   const anyDown = reports.some((r) => r.status === 'down');
   const anyDeg = reports.some((r) => r.status === 'degraded');
   const overall: HealthStatus = anyDown ? 'down' : anyDeg ? 'degraded' : 'ok';
-  for (const r of reports) {
-    void healthRepo.record({
-      component: r.component,
-      status: r.status,
-      duration_ms: r.latency_ms,
-      error: r.details ? JSON.stringify(r.details) : undefined,
-    });
-  }
-  return { status: overall, components: reports };
+  const value = { status: overall, components: reports };
+  healthCache = { at: now, value };
+  return value;
+}
+
+/**
+ * Persist one health snapshot row per component. Called by the
+ * `health_monitor` worker — NEVER by a probe endpoint (issue #512: "Probes de
+ * load balancer não deveriam produzir writes ou crescimento de dados").
+ */
+export async function recordHealthSnapshot(components: HealthReport[]): Promise<void> {
+  await Promise.all(
+    components.map((r) =>
+      healthRepo
+        .record({
+          component: r.component,
+          status: r.status,
+          duration_ms: r.latency_ms,
+          error: r.details ? JSON.stringify(r.details) : undefined,
+        })
+        .catch(() => undefined),
+    ),
+  );
+}
+
+/**
+ * Public projection of a health report. Strips `details`, which carries raw
+ * driver text (`err.message` from pg/ioredis) and can leak connection strings,
+ * hostnames and internal paths on an endpoint reachable by a load balancer
+ * (issue #512: "Raw errors, secrets e paths internos não aparecem em health
+ * público"). The full detail stays available to the worker and the logs.
+ */
+export function toPublicHealthReport(r: HealthReport): Omit<HealthReport, 'details'> {
+  const { details: _details, ...safe } = r;
+  return safe;
+}
+
+/** Test seam — drops the `/health` memoization. */
+export function _resetHealthCacheForTests(): void {
+  healthCache = null;
 }
 
 export type ReadinessReport = {

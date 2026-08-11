@@ -10,7 +10,7 @@ import {
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 
 const SIDE_EFFECT_ACTIONS = new Set([
   'transaction_created',
@@ -27,8 +27,16 @@ const REVIEW_TTL_HOURS = 24;
  *   - editedMessage         → handleMessageEdit
  *   - protocolMessage type=0 → handleMessageRevoke (REVOKE)
  *   - anything else (read receipts, status updates) → ignored
+ *
+ * `channel_id` (review PR #496 crítico 1): canal da SESSÃO que entregou o
+ * evento — escopa os lookups de whatsapp_id (dedup por canal, §1.7: o mesmo
+ * wid pode existir em duas linhas do MESMO tenant/agente). Omitido/null ⇒
+ * comportamento anterior (janela mono-linha).
  */
-export async function routeMessageUpdate(update: proto.IWebMessageInfo): Promise<void> {
+export async function routeMessageUpdate(
+  update: proto.IWebMessageInfo,
+  channel_id?: string | null,
+): Promise<void> {
   if (!update.key?.id) return;
   const m = update.message;
   if (!m) return;
@@ -37,7 +45,7 @@ export async function routeMessageUpdate(update: proto.IWebMessageInfo): Promise
   if (edited) {
     const new_conteudo = edited.conversation ?? edited.extendedTextMessage?.text ?? null;
     if (typeof new_conteudo === 'string') {
-      await handleMessageEdit({ whatsapp_id: update.key.id, new_conteudo });
+      await handleMessageEdit({ whatsapp_id: update.key.id, new_conteudo, channel_id });
     }
     return;
   }
@@ -47,6 +55,7 @@ export async function routeMessageUpdate(update: proto.IWebMessageInfo): Promise
     await handleMessageRevoke({
       whatsapp_id: proto_msg.key.id,
       revoked_by_jid: update.key.remoteJid ?? '',
+      channel_id,
     });
     return;
   }
@@ -55,8 +64,12 @@ export async function routeMessageUpdate(update: proto.IWebMessageInfo): Promise
 async function handleMessageEdit(input: {
   whatsapp_id: string;
   new_conteudo: string;
+  channel_id?: string | null;
 }): Promise<void> {
-  const original = await mensagensRepo.findByWhatsappId(input.whatsapp_id);
+  const original = await mensagensRepo.findByWhatsappId(
+    input.whatsapp_id,
+    input.channel_id ?? undefined,
+  );
   if (!original) {
     logger.debug({ whatsapp_id: input.whatsapp_id }, 'message_update.edit_unknown_original');
     return;
@@ -89,8 +102,12 @@ async function handleMessageEdit(input: {
 async function handleMessageRevoke(input: {
   whatsapp_id: string;
   revoked_by_jid: string;
+  channel_id?: string | null;
 }): Promise<void> {
-  const original = await mensagensRepo.findByWhatsappId(input.whatsapp_id);
+  const original = await mensagensRepo.findByWhatsappId(
+    input.whatsapp_id,
+    input.channel_id ?? undefined,
+  );
   if (!original) {
     logger.debug({ whatsapp_id: input.whatsapp_id }, 'message_update.revoke_unknown_original');
     return;
@@ -204,6 +221,7 @@ async function createEditReviewPending(input: {
   await notifyOwnerOfEditReview({
     owner: { telefone_whatsapp: owner.telefone_whatsapp },
     ownerConversaId: ownerConversa.id,
+    ownerChannelId: ownerConversa.channel_id,
     pendingId: created.id,
     pergunta,
   });
@@ -212,14 +230,18 @@ async function createEditReviewPending(input: {
 async function notifyOwnerOfEditReview(input: {
   owner: { telefone_whatsapp: string };
   ownerConversaId: string;
+  /** Fase 0 (spec roteamento v4 §1.6): canal da conversa do dono (NULL legado). */
+  ownerChannelId: string | null;
   pendingId: string;
   pergunta: string;
 }): Promise<void> {
   const jid = input.owner.telefone_whatsapp.replace(/^\+/, '') + '@s.whatsapp.net';
   try {
-    const wid = await sendOutboundText(jid, input.pergunta);
+    const line = await forCurrentAgentChannel(input.ownerChannelId);
+    const wid = await line.sendText(jid, input.pergunta);
     await mensagensRepo.create({
       conversa_id: input.ownerConversaId,
+      channel_id: line.scope.channel_id,
       direcao: 'out',
       tipo: 'texto',
       conteudo: input.pergunta,

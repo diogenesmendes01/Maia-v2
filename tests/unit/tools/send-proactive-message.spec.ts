@@ -13,11 +13,16 @@ const conversasFindActive = vi.fn();
 const conversasCreate = vi.fn();
 const mensagensCreate = vi.fn();
 const sendOutboundTextMock = vi.fn();
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): conversa NOVA nasce
+// COM canal quando o agente tem canal único ativo (`{ kind: 'one', id }`);
+// ambíguo/zero fica NULL (legado).
+const channelsFindSoleActive = vi.fn();
 
 vi.mock('../../../src/db/repositories.js', () => ({
   pessoasRepo: { findById: pessoasFindById },
   conversasRepo: { findActive: conversasFindActive, create: conversasCreate },
   mensagensRepo: { create: mensagensCreate },
+  channelsRepo: { findSoleActiveForCurrentAgent: channelsFindSoleActive },
 }));
 
 // The gateway is mocked so we can ASSERT it is never called from the handler
@@ -40,6 +45,8 @@ beforeEach(() => {
   conversasCreate.mockReset();
   mensagensCreate.mockReset();
   sendOutboundTextMock.mockReset();
+  channelsFindSoleActive.mockReset();
+  channelsFindSoleActive.mockResolvedValue({ kind: 'one', id: 'ch-1' });
 });
 
 const TARGET_ID = '44444444-4444-4444-4444-444444444444';
@@ -59,7 +66,7 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
       id: TARGET_ID,
       telefone_whatsapp: '+5511999990000',
     });
-    conversasFindActive.mockResolvedValueOnce({ id: 'conv-existing' });
+    conversasFindActive.mockResolvedValueOnce({ id: 'conv-existing', channel_id: 'ch-existing' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-1' });
 
     const { sendProactiveMessageTool } = await import(
@@ -83,8 +90,12 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
     // CRITICAL (#316): the handler does NOT fire the gateway send.
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
     expect(conversasCreate).not.toHaveBeenCalled(); // active conversa already existed
+    // Fase 0 (§1.6): conversa já existente ⇒ nenhuma resolução de canal único.
+    expect(channelsFindSoleActive).not.toHaveBeenCalled();
     const m = mensagensCreate.mock.calls[0]![0] as Record<string, unknown>;
     expect(m.conversa_id).toBe('conv-existing');
+    // O canal da conversa existente propaga para a mensagem persistida.
+    expect(m.channel_id).toBe('ch-existing');
     expect(m.direcao).toBe('out');
     expect(m.tipo).toBe('texto');
     expect(m.conteudo).toBe('Lembrete: revisar fechamento.');
@@ -122,7 +133,7 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
       telefone_whatsapp: '+5511888887777',
     });
     conversasFindActive.mockResolvedValueOnce(null);
-    conversasCreate.mockResolvedValueOnce({ id: 'conv-new' });
+    conversasCreate.mockResolvedValueOnce({ id: 'conv-new', channel_id: 'ch-1' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-2' });
 
     const { sendProactiveMessageTool } = await import(
@@ -136,13 +147,50 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
       } as never,
       ctx,
     );
+    // Fase 0 (§1.6): a conversa nova nasce COM o canal único ativo do agente.
+    expect(channelsFindSoleActive).toHaveBeenCalledTimes(1);
     expect(conversasCreate).toHaveBeenCalledWith({
       pessoa_id: TARGET_ID,
       escopo_entidades: [],
+      channel_id: 'ch-1',
     });
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
     const m = mensagensCreate.mock.calls[0]![0] as Record<string, unknown>;
     expect(m.conversa_id).toBe('conv-new');
+    // O canal da conversa propaga para a mensagem persistida.
+    expect(m.channel_id).toBe('ch-1');
+  });
+
+  it('creates a new conversa with channel_id NULL when the agent has no sole active channel (legacy)', async () => {
+    pessoasFindById.mockResolvedValueOnce({
+      id: TARGET_ID,
+      telefone_whatsapp: '+5511888887777',
+    });
+    conversasFindActive.mockResolvedValueOnce(null);
+    channelsFindSoleActive.mockResolvedValueOnce({ kind: 'none' });
+    conversasCreate.mockResolvedValueOnce({ id: 'conv-new-legacy', channel_id: null });
+    mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-3' });
+
+    const { sendProactiveMessageTool } = await import(
+      '../../../src/tools/send-proactive-message.js'
+    );
+    await sendProactiveMessageTool.handler(
+      {
+        pessoa_id_destino: TARGET_ID,
+        texto: 'Olá',
+        reason: 'first_contact',
+      } as never,
+      ctx,
+    );
+    // Sem canal único resolvível ⇒ comportamento legado: conversa sem canal
+    // (o envio físico no relayer falha fechado por conta própria nesse caso).
+    expect(conversasCreate).toHaveBeenCalledWith({
+      pessoa_id: TARGET_ID,
+      escopo_entidades: [],
+      channel_id: null,
+    });
+    const m = mensagensCreate.mock.calls[0]![0] as Record<string, unknown>;
+    expect(m.channel_id).toBeNull();
   });
 
   it('schema invalid: rejects empty texto', async () => {

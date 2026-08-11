@@ -41,7 +41,12 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
-import { proposeCapabilityForGap } from '@/cognition/capability-proposer.js';
+import { proposeCapabilityForGap as rawProposeCapabilityForGap } from '@/cognition/capability-proposer.js';
+import { scopedFn } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant. Em produção o proposer roda
+// sob o worker de gaps, que já abre o contexto — ver tests/helpers/llm-scope.ts.
+const proposeCapabilityForGap = scopedFn(rawProposeCapabilityForGap);
 
 beforeEach(() => {
   anthropicCreateMock.mockReset();

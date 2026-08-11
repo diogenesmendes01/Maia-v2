@@ -15,7 +15,7 @@
  * Returns `null` quando não há matches regex (sem chamar Anthropic), ou
  * quando o LLM classifica como falso positivo (`drift_detected: false`).
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
@@ -50,7 +50,6 @@ export const viesDetector: DriftDetector = {
     if (matches.length === 0) return null;
 
     const sample = matches.map((m) => `- (pattern: ${m.matched_pattern}) "${m.text}"`).join('\n');
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você audita mensagens de um agente em busca de generalizações enviesadas.',
       'Para cada mensagem suspeita, classifique como: bias_real | falso_positivo | inconclusivo.',
@@ -62,16 +61,13 @@ export const viesDetector: DriftDetector = {
     ].join('\n');
 
     try {
-      const completion = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+      const completion = await callLLM({
+        workload: 'drift_detector',
         max_tokens: 600,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = completion.content
-        .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) {
         // LLM unable to judge — surface regex matches anyway as soft signal (severity baixo)

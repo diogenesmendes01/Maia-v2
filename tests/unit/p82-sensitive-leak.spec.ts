@@ -25,6 +25,9 @@ const rulesListActive = vi.fn();
 const entityStatesById = vi.fn();
 const memoryEntryFindRelevant = vi.fn();
 const behavioralHintFindActiveForScope = vi.fn();
+// Issue #511 — the prompt builder asks for every hint scope in ONE batched
+// call now; C4's role/channel plumbing assertion reads that call's tuple list.
+const behavioralHintFindActiveForScopes = vi.fn();
 const capabilitiesSkillListAll = vi.fn();
 const capabilityGapsListByLevel = vi.fn();
 
@@ -35,9 +38,12 @@ vi.mock('../../src/db/repositories.js', () => ({
   entidadesRepo: { byIds: entidadesByIds },
   factsRepo: { listMentionableForScopes: factsListMentionableForScopes },
   rulesRepo: { listActive: rulesListActive },
-  entityStatesRepo: { byId: entityStatesById },
+  entityStatesRepo: { byId: entityStatesById, byIds: vi.fn(async () => []) },
   memoryEntryRepo: { findRelevant: memoryEntryFindRelevant },
-  behavioralHintRepo: { findActiveForScope: behavioralHintFindActiveForScope },
+  behavioralHintRepo: {
+    findActiveForScope: behavioralHintFindActiveForScope,
+    findActiveForScopes: behavioralHintFindActiveForScopes,
+  },
   capabilitiesSkillRepo: { listAll: capabilitiesSkillListAll },
   capabilityGapsRepo: { listByLevel: capabilityGapsListByLevel },
 }));
@@ -61,6 +67,7 @@ beforeEach(() => {
   entityStatesById.mockReset();
   memoryEntryFindRelevant.mockReset();
   behavioralHintFindActiveForScope.mockReset();
+  behavioralHintFindActiveForScopes.mockReset();
   capabilitiesSkillListAll.mockReset();
   capabilityGapsListByLevel.mockReset();
 
@@ -76,6 +83,7 @@ beforeEach(() => {
   entityStatesById.mockResolvedValue(null);
   memoryEntryFindRelevant.mockResolvedValue([]);
   behavioralHintFindActiveForScope.mockResolvedValue([]);
+  behavioralHintFindActiveForScopes.mockResolvedValue([]);
   capabilitiesSkillListAll.mockResolvedValue([]);
   capabilityGapsListByLevel.mockResolvedValue([]);
 });
@@ -157,24 +165,36 @@ describe('[P82-C4] role/channel scope plumbing', () => {
 
   it('only emits role/channel scope hint queries when ids are supplied', async () => {
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
+    // Issue #511: the scopes are now requested in ONE batched call instead of
+    // one query per scope, so the C4 invariant is read off that call's tuple
+    // list. The invariant itself is unchanged — a role/channel scope must not
+    // be requested when its id is absent, or the query would match every hint
+    // of that scope type regardless of subject.
+    const requestedScopes = (): string[] =>
+      behavioralHintFindActiveForScopes.mock.calls.flatMap((c) =>
+        (c[0] as Array<{ scope_type: string }>).map((s) => s.scope_type),
+      );
+
     // Without role/channel — only interlocutor + conversation + agent.
     await buildPrompt(baseCtx);
-    const baseCalls = behavioralHintFindActiveForScope.mock.calls.map((c) => c[0].scope_type);
+    expect(behavioralHintFindActiveForScopes).toHaveBeenCalledTimes(1);
+    const baseCalls = requestedScopes();
     expect(baseCalls).toContain('interlocutor');
     expect(baseCalls).toContain('conversation');
     expect(baseCalls).toContain('agent');
     expect(baseCalls).not.toContain('role');
     expect(baseCalls).not.toContain('channel');
 
-    behavioralHintFindActiveForScope.mockClear();
+    behavioralHintFindActiveForScopes.mockClear();
 
-    // With role/channel — both extra scopes are queried.
+    // With role/channel — both extra scopes are queried, still in one call.
     await buildPrompt({
       ...baseCtx,
       current_role_id: 'role-x',
       current_channel_id: 'chan-y',
     } as never);
-    const fullCalls = behavioralHintFindActiveForScope.mock.calls.map((c) => c[0].scope_type);
+    expect(behavioralHintFindActiveForScopes).toHaveBeenCalledTimes(1);
+    const fullCalls = requestedScopes();
     expect(fullCalls).toContain('role');
     expect(fullCalls).toContain('channel');
   });

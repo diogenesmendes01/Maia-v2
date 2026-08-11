@@ -3,10 +3,12 @@ import type { Tool } from './_registry.js';
 import { parseLinhaDigitavel, isValidLinhaDigitavel, BANCOS_CODIGO } from '@/lib/brazilian.js';
 import { parseImage } from '@/lib/vision.js';
 import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
+import { resolveAttachmentById } from '@/lib/attachment-resolver.js';
+import { readStoredMedia, MAX_IMAGE_BYTES } from '@/lib/media-guard.js';
+import { TypedError } from '@/lib/utils.js';
 
 const inputSchema = z.object({
-  media_local_path: z.string().min(1),
-  file_sha256: z.string().min(1),
+  attachment_id: z.string().uuid(),
 });
 
 const outputSchema = z.object({
@@ -34,7 +36,7 @@ const outputSchema = z.object({
 export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_boleto',
   description:
-    'Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor.',
+    'Extrai dados estruturados de uma imagem de boleto: linha digitável, valor, vencimento, beneficiário, banco emissor. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_balance'],
@@ -42,9 +44,23 @@ export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
   redis_required: false,
   operation_type: 'parse_only',
   audit_action: 'boleto_parsed',
-  handler: async (args) => {
+  handler: async (args, ctx) => {
+    // P0 audit chapter 4: opaque attachment_id → scoped resolution + guarded
+    // read (containment, symlink rejection, 10MB cap, magic-sniffed mime).
+    const attachment = await resolveAttachmentById(ctx.conversa.id, args.attachment_id);
+    if (!attachment) {
+      throw new TypedError(
+        'attachment_not_found',
+        'anexo não encontrado nesta conversa — use conversation_attachment_lookup para obter um attachment_id válido',
+      );
+    }
+    const media = await readStoredMedia(attachment.path, {
+      maxBytes: MAX_IMAGE_BYTES,
+      kind: 'image',
+    });
     const result = await parseImage({
-      path: args.media_local_path,
+      buf: media.buf,
+      mime: media.mime,
       kind: 'boleto',
     });
     if (!result) return { confianca: 0 };

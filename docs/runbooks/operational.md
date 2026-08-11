@@ -22,10 +22,24 @@ ssh maia 'tail -50 /var/log/maia.log | grep baileys'
 **Caso 2 — LoggedOut**: o auto-recovery deveria ter rotacionado o token e mandado alerta. Se você não recebeu o alerta:
 
 ```bash
-ssh maia 'cat .baileys-auth/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
-# Browser → https://maia.SEU-DOMINIO.com/setup?token=<TOKEN>
+ssh maia 'cat .baileys-auth/control/setup-token.txt'   # NOVO token (já rotacionado pelo recovery)
+# Browser → https://maia.SEU-DOMINIO.com/setup
+# A página pede o token: COLE no formulário (o token vai no corpo do POST).
 # Clique "QR" ou "Código de 8 dígitos"
 ```
+
+> **Issue #518 — o token NÃO vai mais na URL.** `/setup?token=…` não autentica
+> mais: a URL ficava no histórico do navegador, no header `Referer` e no
+> access log do nginx. O token é colado uma vez no formulário e trocado por um
+> cookie de sessão `httpOnly` + `SameSite=Strict` válido por 30 minutos.
+> Rotacionar o token revoga as sessões abertas.
+>
+> Break-glass para automação/curl (sem browser), com o token em HEADER:
+>
+> ```bash
+> TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+> curl -s -H "x-maia-setup-token: $TOKEN" https://maia.SEU-DOMINIO.com/setup/status
+> ```
 
 **Caso 3 — recovery travou**: verifique no `audit_log` se `pairing_recovery_started` apareceu sem `pairing_recovery_completed`:
 
@@ -51,6 +65,106 @@ sudo systemctl start maia
 
 ---
 
+## 1b. Linhas ADICIONAIS: parear, cancelar, re-parear (Admin, issue #518)
+
+A linha primária continua no `/setup`. Toda linha **adicional** é operada pelo
+console autenticado — sem shell, sem curl, sem token:
+
+**Console → Setup → Canais.** Cada linha mostra:
+
+| Estado | Significado | Próxima ação |
+|---|---|---|
+| `declared` | Número registrado; ninguém provou a posse. Não roteia | **Parear** |
+| `pairing` | Sessão aberta; QR/código na tela | Acompanhar ou **Cancelar** |
+| `aborting` | Cancelamento pedido; aguardando o runtime confirmar | Aguardar (segundos) |
+| `verified_offline` | Posse provada, mas **não roteia**: falta readiness | Criar a política com papel padrão ativo — o backend ativa sozinho |
+| `connected` | Sessão viva: envia e recebe | — |
+| `recovering` | Queda transitória; o runtime reconecta sozinho | Aguardar |
+| `logged_out` | O WhatsApp encerrou a sessão — a posse acabou | **Re-parear** |
+| `failed` | Última tentativa não completou (mismatch, TTL, restart) | **Repetir** |
+| `disabled` | Desligada pelo operador | **Parear** quando quiser religar |
+
+**Pré-requisito de deploy**: `MAIA_STAGING_KEYRING` + `MAIA_STAGING_ACTIVE_KEY_ID`
+configurados no runtime **e** no console. O QR/código só trafegam cifrados; sem
+keyring a tela mostra os estados mas o botão de parear fica desabilitado com a
+explicação.
+
+**Como funciona por baixo** (útil quando algo trava): o console NÃO fala com o
+Baileys. Ele grava um comando em `channel_line_state` com o ator administrativo;
+o worker `channel_pairing` (a cada 5s, no processo do runtime) reivindica,
+executa e devolve o estado.
+
+Com **mais de uma réplica**, dois conceitos de posse convivem na tabela:
+`owner_instance` (+ `owner_lease_expires_at`) é quem está executando a ORDEM;
+`session_owner_instance` (+ `session_owner_lease_expires_at`) é quem segura o
+SOCKET. `disable` e `repair` são endereçados (`target_instance`) à réplica dona
+do socket — só ela consegue derrubá-lo. Lease vencida do alvo libera o comando
+para qualquer réplica (o processo morreu e levou o socket junto).
+
+```sql
+-- Quem segura o socket de cada linha, e a ordem endereçada a quem.
+SELECT channel_id, session_owner_instance, session_owner_lease_expires_at,
+       command, target_instance
+  FROM channel_line_state WHERE session_owner_instance IS NOT NULL OR command IS NOT NULL;
+
+-- Comando pendente que ninguém reivindicou ⇒ o worker do runtime está parado.
+SELECT channel_id, command, command_requested_at, command_claimed_at, owner_instance
+  FROM channel_line_state WHERE command IS NOT NULL;
+
+-- Tentativas presas em pairing (o sweep de 1min deveria zerar isto).
+SELECT channel_id, state, reason_code, pairing_expires_at
+  FROM channel_line_state WHERE state = 'pairing';
+```
+
+**Restart durante o pareamento**: a sessão vivia em memória e morreu junto. O
+worker marca a tentativa como `failed` com `reason_code = interrupted_retryable`
+e audita `pairing_session_expired`. Nunca vira `verified`. O operador clica em
+"Repetir pareamento".
+
+**Mismatch de número**: se o WhatsApp que leu o QR não for a linha declarada, o
+pareamento falha com `line_mismatch` e o canal NÃO é ativado. Digitar um número
+nunca dá posse.
+
+**Pareou mas não responde?** Provavelmente é o gate de readiness (issue #518
+§4): posse provada **não** é permissão de rotear. Uma linha só é ativada quando
+o backend revalida, deterministicamente, a mesma sequência do go-live checklist:
+
+1. o **agente** tem perfil operacional **ativo**;
+2. o canal tem política de canal;
+3. o papel padrão dessa política está **ativo**.
+
+Até lá a linha fica `verified_offline` e o audit registra
+`channel_activation_deferred` com o motivo (`missing_active_profile`,
+`missing_policy` ou `default_role_inactive`).
+
+Não é preciso re-parear: o worker revalida a cada minuto e emite
+`channel_activated` assim que a política ficar pronta.
+
+```sql
+-- Linhas com posse provada esperando readiness.
+SELECT s.channel_id, s.reason_code, c.external_id, c.active
+  FROM channel_line_state s JOIN channels c ON c.id = s.channel_id
+ WHERE s.state = 'verified_offline' AND c.active = false;
+```
+
+**Audit log relacionado**: `channel_pairing_requested`, `pairing_session_started`,
+`pairing_session_verified`, `pairing_session_failed`, `pairing_session_aborted`,
+`pairing_session_expired`, `line_session_transition`, `channel_disabled`,
+`channel_repair_requested`, `channel_activation_deferred`, `channel_activated`.
+Nenhum deles carrega QR, código, token ou auth state.
+
+**Break-glass** (console fora do ar), sem token em query string:
+
+```bash
+TOKEN=$(ssh maia 'cat .baileys-auth/control/setup-token.txt')
+curl -s -X POST -H "x-maia-setup-token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"method":"qr"}' https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair
+curl -s -H "x-maia-setup-token: $TOKEN" \
+  https://maia.SEU-DOMINIO.com/setup/channels/<CHANNEL_ID>/pair/status
+```
+
+---
+
 ## 2. WhatsApp rate-limit (banimento temporário do número Maia)
 
 **Sinal**: erros `too many requests` ou `connection refused` repetidos do socket Baileys, mensagens não saem.
@@ -68,7 +182,12 @@ sudo systemctl start maia
 
 ## 3. LLM provider down (Anthropic, OpenAI, Voyage)
 
-**Sinal**: audit `llm_circuit_opened` aparecendo, métrica `maia_llm_calls_total{status="error"}` crescendo, mensagens demorando ou falhando.
+**Sinal**: audit `llm_circuit_opened` aparecendo, mensagens demorando ou
+falhando, e `maia_llm_requests_total{status=~"error|timeout"}` crescendo — o
+`timeout` do SDK é status PRÓPRIO e é uma das três falhas que abrem o disjuntor,
+então olhar só `status="error"` esconde metade do incidente. Para saber QUAL par
+está sofrendo, agrupe por `(provider, workload)`: a série legada
+`maia_llm_calls_total` não carrega `workload`.
 
 **Diagnóstico**:
 
@@ -91,6 +210,424 @@ GROUP BY acao;
 **Audit log relacionado**: `llm_circuit_opened`, `llm_circuit_closed`.
 
 > Quando a PR #24 (audit_watcher) for mergeada, a regra `llm_circuit_long_open` dispara alerta após 5 min sem `_closed`.
+
+---
+
+## 3.1 Disjuntor de LLM — postura, kill switch e promoção
+
+O disjuntor tem TRÊS posturas. **Em produção o default é `shadow`**: ele observa
+e mede, mas não recusa nada. Promover para `enforce` é uma decisão com número na
+mão, e este é o procedimento.
+
+| Postura | O caller vê | Estado guardado |
+|---|---|---|
+| `off` | nada muda | nenhum |
+| `shadow` (default) | nada muda — **nunca recusa** | sim, e mede |
+| `enforce` | recusa com `circuit_open` | sim |
+
+### Qual é a postura AGORA
+
+```bash
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode
+# maia_llm_circuit_mode{state="off"} 0
+# maia_llm_circuit_mode{state="shadow"} 1     ← esta é a que vale
+# maia_llm_circuit_mode{state="enforce"} 0
+```
+
+Par de séries, exatamente uma valendo `1` — nunca leia por valor numérico. Se
+nenhuma das três aparecer, o processo ainda não fez chamada de LLM alguma (as
+séries são registradas na primeira leitura da postura).
+
+### Alerta `llm_circuit_long_open` — como ler
+
+O watcher de auditoria (`src/workers/audit-watcher.ts`) acusa `llm_circuit_opened`
+sem `llm_circuit_closed` correspondente há mais de 5 min. Desde a revisão da PR
+#541 o par é correlacionado por **`provider` / `workload` / `replica`**, e o
+corpo do alerta NOMEIA cada circuito preso:
+
+```
+2 instance(s) with `llm_circuit_opened` older than 5 min and no matching `llm_circuit_closed`.
+Identity is `provider/workload/replica`:
+  - anthropic/reasoner/maia-app-7d9f:1#a1b2c3d4 (3 event(s), oldest 2026-08-09T00:11:54Z)
+```
+
+Antes disso a regra casava QUALQUER fechamento posterior com QUALQUER abertura:
+um circuito que abriu e fechou normalmente desarmava o alerta de outro que
+continuava preso. O estado do disjuntor é por `(provider, workload)` **e por
+réplica** — a janela de amostras vive na memória de cada processo —, então
+correlacionar por menos que isso cega o alerta exatamente no caso que ele existe
+para pegar.
+
+**`replica` é `<hostname>:<pid>#<boot>`.** O sufixo de boot é sorteado por
+processo: sem ele, um container que reinicia (hostname estável, PID 1) herdaria
+a identidade do processo morto e fecharia o par que ele deixou pendurado.
+
+**Falso positivo conhecido: réplica que morreu com o circuito aberto.** Ela nunca
+emite o `closed`, e a abertura órfã alerta enquanto estiver na janela de 24 h do
+watcher. É o preço deliberado de não deixar o boot seguinte fechar o par.
+Como distinguir em 10 segundos:
+
+```bash
+# A réplica citada ainda existe? `maia_llm_circuit_state` só existe em processo
+# VIVO — se o par não aparece em lugar nenhum da frota, o alerta é o rastro de
+# um processo que já morreu.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_state.*state="open"'
+```
+
+Se nenhuma réplica viva reporta `state="open"` para aquele par, o incidente já
+passou junto com o processo — anote e siga. Se alguma reporta, o circuito está
+preso de verdade: vá para a seção 3 (LLM provider down).
+
+### KILL SWITCH — desligar durante um incidente, sem restart e sem deploy
+
+Use quando **o disjuntor é o incidente**: recusando tráfego que o provider ainda
+serviria, preso em `open` por um falso positivo, ou abrindo em brownout.
+
+```bash
+# 1. Monte o payload. `actor` e `reason` são OBRIGATÓRIOS — um override sem eles
+#    é RECUSADO (e a recusa também é contada). Não há como virar esta chave
+#    anonimamente, de propósito.
+#    A validade vai como `expires_at` ABSOLUTO (epoch ms), NUNCA como `ttl_ms`:
+#    ver a caixa "duas regras" logo abaixo.
+EXP=$(( ($(date +%s) + 1800) * 1000 ))    # 30 min a partir de agora
+PAYLOAD="{\"mode\":\"off\",\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 disjuntor abrindo em brownout\",\"expires_at\":$EXP}"
+
+# 2. Chave durável PRIMEIRO (réplica que subir no meio do incidente adota o
+#    resto do arrendamento), depois o broadcast. O `PX` tem que casar com o
+#    `expires_at` do payload.
+redis-cli SET  maia:llm:circuit:override "$PAYLOAD" PX 1800000
+redis-cli PUBLISH maia:llm:circuit:override "$PAYLOAD"
+
+# 3. Confirme que a chave REALMENTE expira. `-1` aqui significa chave eterna:
+#    aborte e regrave com PX antes de seguir.
+redis-cli PTTL maia:llm:circuit:override
+
+# 4. Confirme em TODAS as réplicas.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_mode{state="off"} 1'
+```
+
+> **Duas regras da chave durável — as duas são o que faz o kill switch poder ser
+> esquecido sem virar configuração permanente (revisão da #541).**
+>
+> 1. **Sempre `PX`.** Uma chave sem TTL vive para sempre. `PTTL` retornando `-1`
+>    é o sinal.
+> 2. **Sempre `expires_at` absoluto no payload, nunca `ttl_ms`.** Validade
+>    relativa numa chave durável é reinterpretada contra o relógio de cada boot:
+>    toda réplica que reiniciasse ressuscitaria o arrendamento inteiro, e o
+>    override atravessaria deploys. Uma chave assim é **recusada na adoção**
+>    (`maia_llm_circuit_mode_overrides_total{reason="rejected"}`), então o
+>    sintoma é a frota não adotar o override — não é falha silenciosa, mas
+>    também não é o que você quer no meio de um incidente.
+>
+> Quem publica pelo código (`publishCircuitOverride`) já recebe as duas de
+> graça: ele normaliza `ttl_ms` para absoluto, valida os limites antes de tocar
+> no Redis e sempre grava com `PX`. As regras acima existem para o caminho do
+> `redis-cli` na mão.
+>
+> **Relógio:** `expires_at` é resolvido no relógio de quem publica e comparado
+> no de quem recebe. Assume-se skew NTP de ordem de segundos, o que é ruído
+> contra um arrendamento de 30min. Réplica adiantada volta cedo para a postura
+> versionada (direção segura); réplica atrasada estica o arrendamento pelo skew
+> e só nela. Skew grosseiro não passa: vira `rejected` por "já vencido na
+> chegada" ou pelo teto de 24h.
+
+**Reverter antes do TTL:**
+
+```bash
+CLEAR="{\"clear\":true,\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 encerrado\"}"
+redis-cli DEL maia:llm:circuit:override
+redis-cli PUBLISH maia:llm:circuit:override "$CLEAR"
+```
+
+**Se o Redis estiver fora**, o override não propaga. Segunda alavanca, com o
+custo honesto de um restart: `LLM_CIRCUIT_MODE=off` no `.env` +
+`docker compose up -d --no-deps app`. É por isso que a variável é declarada
+`restartRequired: true` no contrato — vendê-la como quente seria mentira.
+
+**Restrições que o código impõe** (e por que existem):
+
+- `actor` e `reason` vazios ⇒ recusado. Um kill switch anônimo não é auditável,
+  e a objeção original da #534 a toggles de runtime era exatamente essa.
+- TTL acima de 24h ⇒ recusado, não truncado. Desligar o disjuntor por mais de um
+  dia é decisão de deploy, não de plantão.
+- Sem TTL declarado ⇒ 30 min. Ele **expira sozinho** e volta para a postura do
+  contrato; o retorno também é um evento contado.
+- Chave durável sem `expires_at` absoluto ⇒ recusada na adoção. Ver a caixa
+  "duas regras" acima.
+
+**Réplica que sobe durante a virada.** Uma réplica nova só lê a chave durável
+depois que a inscrição no canal está CONFIRMADA pelo Redis. Isso fecha a janela
+em que ela leria a chave antes do seu `SET` e perderia o `PUBLISH` por ainda não
+estar inscrita — o modo de falha em que metade da frota atravessa o incidente na
+postura antiga. Se o passo 4 mostrar uma réplica divergente mesmo assim, o
+suspeito é perda de mensagem por queda de socket (pub/sub é at-most-once):
+republique o `SET` + `PUBLISH`, que é idempotente.
+
+### Auditoria — como saber que alguém mexeu
+
+```bash
+# Métrica (é onde o alerta deve morar):
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode_overrides_total
+# maia_llm_circuit_mode_overrides_total{state="off",reason="applied"} 1
+
+# Log estruturado (carrega ator e motivo — texto livre não vai para label):
+journalctl -u maia | grep llm_gateway.circuit_mode_override
+```
+
+`reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted`. Um
+`rejected` no gráfico significa que alguém TENTOU virar a chave e não conseguiu
+— vale investigar tanto quanto um `applied`.
+
+**A fonte DURÁVEL é `audit_log`** (revisão da PR #541). Métrica expira na
+retenção do Prometheus e log expira na do coletor — é a trilha que responde
+"quem virou a chave em março?". Toda virada, limpeza, expiração e recusa vira
+linha, sob `tenant_id='system'` (a postura é da frota, não de um tenant):
+
+```sql
+SELECT created_at, acao,
+       metadata->>'actor'  AS actor,
+       metadata->>'reason' AS motivo,
+       metadata->>'mode'   AS postura,
+       metadata->>'expires_at' AS validade,
+       metadata->>'source' AS origem,   -- 'adopted' = veio da chave durável no boot
+       metadata->>'error'  AS erro      -- só nas recusas
+  FROM audit_log
+ WHERE acao LIKE 'llm_circuit_mode_override_%'
+   AND created_at > NOW() - INTERVAL '30 days'
+ ORDER BY created_at DESC;
+```
+
+Ações: `llm_circuit_mode_override_applied` · `_cleared` · `_expired` ·
+`_rejected`. A adoção da chave durável no boot entra como `applied` com
+`metadata.source = 'adopted'` — é o mesmo desfecho de governança (a postura
+mudou), com procedência diferente.
+
+Se a métrica registrar um `applied` e a trilha não tiver a linha, o suspeito é
+a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
+`llm_gateway.circuit_audit_failed`.
+
+### Promoção `shadow` → `enforce`
+
+> **A postura é GLOBAL.** `LLM_CIRCUIT_MODE` vale para o processo inteiro —
+> `effectiveMode()` em `src/lib/llm/circuit-mode.ts` não recebe `provider` nem
+> `workload`. **Não existe promoção seletiva por workload.** Ou TODOS os
+> workloads ativos passam nos critérios abaixo, ou não se promove: promover
+> "porque o `reasoner` está limpo" liga o `enforce` para `summarizer`,
+> `vision`, `skill` e todo o resto junto. Se a promoção parcial for mesmo o que
+> se quer, o trabalho é implementar postura POR WORKLOAD primeiro — não
+> promover mesmo assim e torcer.
+
+> **PRÉ-REQUISITO BLOQUEANTE — a lacuna de reconexão do pub/sub.**
+> O kill switch (`maia:llm:circuit:override`) chega por pub/sub do Redis, que é
+> **at-most-once**. A chave durável cobre a réplica que **SOBE** no meio do
+> incidente (`adoptPersistedOverride`, chamada uma única vez depois do
+> `SUBSCRIBE` confirmado — ver `src/lib/llm/cache-invalidation.ts`), mas **NÃO**
+> cobre a que **RECONECTA** nele: uma queda de socket entre a confirmação e a
+> mensagem perde a notificação para sempre, e aquela réplica só reconverge no
+> próximo `SET`/`PUBLISH`.
+>
+> Em `shadow` isso é uma divergência de medição. Em `enforce` é uma réplica que
+> **continua recusando tráfego depois de o plantão ter desligado o disjuntor** —
+> ou seja, o kill switch deixa de ser uma alavanca confiável exatamente na
+> postura em que ele é a única saída rápida.
+>
+> **Correção exigida antes de `enforce`** (não implementada nesta PR, por
+> escopo): reler a chave durável em TODO `reconnect`/`ready` do subscriber, não
+> só no primeiro. Semântica da releitura: chave presente ⇒ adota o **TTL
+> restante** (nunca o TTL original, que ressuscitaria o arrendamento); chave
+> ausente ⇒ **limpa o override local** e volta à postura base do contrato.
+> Enquanto isso não existir, a promoção está bloqueada — e não por prudência
+> genérica: sem essa releitura o procedimento de rollback desta mesma seção não
+> tem garantia de chegar em toda a frota.
+
+#### Janela mínima de observação
+
+Nada abaixo disto conta como evidência:
+
+| Requisito | Valor | Por quê |
+|---|---|---|
+| Ambiente | **staging** | Não se aprende a recusar tráfego em produção. |
+| Duração | **7 dias completos** | Menos que isso não pega o ciclo semanal (segunda de manhã ≠ sábado de madrugada), e o limiar do disjuntor é sensível ao volume da janela. |
+| Volume | **≥ 1.000 chamadas por `(provider, workload)`** | `MIN_SAMPLES` é 10 numa janela de 30 s; abaixo de mil chamadas no período, um par sequer exercitou a máquina e "não abriu" não é informação. |
+| Falhas | **outage, brownout e recovery INJETADOS** | Esperar um incidente natural em staging é esperar para sempre. Os três cenários existem prontos em `scripts/llm-benchmark.ts`. |
+
+```promql
+# Volume por par — todo par ATIVO precisa cruzar 1.000 no período.
+# `maia_llm_requests_total` é a série que carrega `workload`; a legada
+# `maia_llm_calls_total` só tem provider/model/status e NÃO responde isto.
+sum by (provider, workload) (increase(maia_llm_requests_total[7d]))
+```
+
+Injeção das falhas — é o mesmo harness que produziu as constantes do disjuntor,
+e ele já compara as três posturas lado a lado:
+
+```bash
+npm run llm:bench -- --scenario outage   --workload reasoner --requests 300 --concurrency 20
+npm run llm:bench -- --scenario brownout --workload reasoner --failure-rate 0.6
+npm run llm:bench -- --scenario recovery --workload reasoner --outage-ms 12000 --think-ms 50
+```
+
+#### Critérios de ida (todos, não algum)
+
+**Todas as consultas abaixo agrupam por `(provider, workload)` e usam
+`maia_llm_requests_total`.** A série legada `maia_llm_calls_total` carrega
+apenas `provider`, `model` e `status` (`src/lib/llm/telemetry.ts`): agrupar por
+`workload` nela devolve UM grupo com tudo somado, e `status="error"` **não
+inclui `timeout`** — que é justamente um dos desfechos que abrem o disjuntor
+(`PROVIDER_FAULT_KINDS` = `provider_5xx` · `network` · `timeout`). Por isso todo
+seletor de falha aqui é `status=~"error|timeout"`.
+
+**1. Zero `would_open` fora de erro elevado.** Um falso positivo bloqueia a
+promoção — em `enforce` ele seria carga recusada sem provider quebrado.
+
+```promql
+# Taxa de falha REAL do par (inclui timeout do SDK).
+sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+  /
+clamp_min(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+  1e-9
+)
+
+# Aberturas simuladas SEM falha elevada por trás = falso positivo.
+# `TARGET_CALL_FAILURE_RATE` é 0.5; abaixo disso o disjuntor não deveria abrir.
+(sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[5m])) > 0)
+  unless
+(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+    /
+  clamp_min(
+    sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+    1e-9
+  ) > 0.5
+)
+```
+
+Critério: **vazio** durante os 7 dias. Qualquer série que sobre é um par que
+teria aberto sem motivo.
+
+**2. Abertura em até 30 s / 10 amostras durante a falha.** A janela do disjuntor
+é de 30 s com `MIN_SAMPLES=10`: se a falha injetada tem volume, a abertura tem
+que aparecer dentro dela.
+
+```promql
+# Plote os dois no MESMO gráfico, step 15s, sobre o intervalo da injeção.
+# O critério é a distância horizontal entre a primeira subida de cada um.
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[1m]))
+```
+
+Não há PromQL honesta para "quantos segundos entre A e B" num painel de
+plantão; o número exato sai do harness, que carimba a transição no relatório do
+cenário `outage`.
+
+**3. Recuperação em até 60 s.** Depois de o provider voltar, o par tem que
+fechar. `MAX_OPEN_MS` é 60 s, então mais que isso significa que a sonda não está
+rodando (falta de tráfego) ou que o cooldown geométrico ficou preso.
+
+```promql
+# Exatamente uma das três séries vale 1 — nunca leia por valor numérico.
+maia_llm_circuit_state{state="closed"}
+# Cruze com o instante em que a falha parou:
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+```
+
+No cenário `recovery` do harness isso é medido direto: ele espaça a carga
+justamente para a sonda chegar a rodar.
+
+**4. `would_reject` limitado à falha mais o cooldown.** Recusa simulada
+sobrando DEPOIS de o provider voltar é cooldown longo demais — em `enforce`
+seria tráfego bom recusado.
+
+```promql
+sum by (provider, workload) (increase(maia_llm_circuit_would_reject_total[5m]))
+```
+
+Critério: a série zera dentro de `MAX_OPEN_MS` (60 s) após a última falha do
+par. Sobrar depois disso bloqueia a promoção.
+
+**5. ≥ 90% de redução das TENTATIVAS contra o provider numa indisponibilidade
+total.** É o único critério que mede o BENEFÍCIO; sem ele a promoção paga o
+risco de recusar tráfego e não compra nada.
+
+Tentativa ≠ chamada. `maia_llm_requests_total` conta CHAMADAS; quem conta o que
+o provider realmente comeu é `maia_llm_attempts_total`, incrementada uma vez por
+tentativa e **só depois de `provider.call()` ter rodado**
+(`recordAttempt` em `src/lib/llm/gateway.ts`) — uma chamada recusada pelo
+disjuntor não gera tentativa nenhuma. Num workload com retry + fallback a
+diferença entre as duas é o multiplicador que o disjuntor corta.
+
+```promql
+# A carga REAL contra o provider, por par. É esta série que precisa cair.
+sum by (provider, workload) (increase(maia_llm_attempts_total[5m]))
+
+# Baseline: a mesma série durante a queda injetada AINDA em `shadow` — é o que
+# o provider come quando o disjuntor não recusa nada.
+# Critério: numa queda equivalente sob `enforce`, esta soma tem que ficar
+# em <= 10% do baseline para o mesmo par.
+
+# Cruze com as recusas, que são o outro lado da mesma moeda:
+sum by (provider, workload) (increase(maia_llm_requests_total{status="circuit_open"}[5m]))
+  /
+clamp_min(sum by (provider, workload) (increase(maia_llm_requests_total[5m])), 1e-9)
+```
+
+O veredicto formal continua saindo do harness, que roda os três braços sobre a
+MESMA sequência de falhas — em staging não dá para ter `off` e `enforce` ao
+mesmo tempo:
+
+```bash
+# `provider_calls` do relatório é a mesma grandeza de `maia_llm_attempts_total`.
+npm run llm:bench -- --scenario outage --workload reasoner --requests 300 --concurrency 20
+# Critério: enforce.provider_calls <= 0.10 * off.provider_calls
+```
+
+**6. A recusa simulada não concentra num tenant só.** O estado do disjuntor é
+global de propósito, mas a evidência é escopada: se um tenant come 95% das
+recusas simuladas, entenda por quê antes de ligar.
+
+```promql
+topk(5, sum by (tenant_id) (increase(maia_llm_circuit_would_reject_total[24h])))
+```
+
+#### Checklist final
+
+- [ ] A lacuna de reconexão do pub/sub foi corrigida (pré-requisito bloqueante acima).
+- [ ] 7 dias completos em staging, com outage + brownout + recovery injetados.
+- [ ] Todo par `(provider, workload)` ATIVO com ≥ 1.000 chamadas na janela.
+- [ ] Critério 1 vazio: zero `would_open` fora de erro elevado.
+- [ ] Critério 2: abertura dentro de 30 s / 10 amostras na falha injetada.
+- [ ] Critério 3: recuperação em até 60 s.
+- [ ] Critério 4: `would_reject` limitado à falha + cooldown.
+- [ ] Critério 5: `enforce.provider_calls ≤ 10%` de `off.provider_calls` no `outage`.
+- [ ] Critério 6: distribuição por tenant explicada.
+- [ ] TODOS os workloads ativos passaram — a postura é global.
+
+**Como promover:** `LLM_CIRCUIT_MODE=enforce` no `.env` do ambiente + restart.
+É deploy-time de propósito — promover é decisão versionada, não de plantão.
+
+
+### Rollback da promoção
+
+| Sintoma | Ação | Custo |
+|---|---|---|
+| `circuit_open` subindo sem queda de provider correspondente | kill switch para `off` (acima) | segundos, sem restart |
+| Quer manter a medição mas parar de recusar | mesmo procedimento, `"mode":"shadow"` | segundos, sem restart |
+| Redis fora, ou o incidente vai durar mais que 24h | `LLM_CIRCUIT_MODE=shadow`/`off` + restart | um restart |
+
+Depois de estabilizar: **deixe o override expirar sozinho e reverta a env var no
+código**. Um kill switch renovado indefinidamente vira configuração escondida —
+que é como um controle morre de vez, sem ninguém perceber.
+
+> **Nota de honestidade.** A #534 defendeu por escrito que política de
+> degradação é código versionado, não toggle de runtime. Esta seção existe
+> porque o owner overruled aquilo, e a razão é boa: o argumento vale para
+> AJUSTAR limiares e não vale para DESLIGAR um controle que virou o incidente.
+> A parte certa da objeção ("sem deixar rastro") foi endereçada — o override é
+> obrigatoriamente identificado, contado, logado, **auditado em `audit_log`** e
+> temporário. O "auditado" só passou a ser verdade na revisão da PR #541: até
+> ali o rastro vivia só em métrica e log, os dois com retenção curta, e
+> `grep -rn "audit(" src/lib/llm/` devolvia zero.
 
 ---
 
@@ -138,24 +675,21 @@ ssh maia 'cd /opt/maia && npm run dlq -- list'
 
 ## 6. Restore de backup (drill ou recuperação real)
 
-**Drill** (sem afetar produção):
+> **Movido para [`backup-restore.md`](backup-restore.md)** (issue #520). O procedimento abaixo ficou incorreto em dois pontos que importam:
+>
+> - escolher o dump por `ls | tail` ignora se o artefato foi verificado, se está cifrado e se existe cópia off-site — `backup_runs` responde isso;
+> - restaurar e subir o app direto **ressuscita** dados excluídos depois do snapshot. A reconciliação de tombstones é obrigatória antes de liberar tráfego.
+
+Resumo rápido (detalhes e SQL de diagnóstico no runbook dedicado):
 
 ```bash
-ssh maia 'cd /opt/maia && npm run restore:test'
-# Pega o backup mais recente, restaura num DB efêmero, valida count(pessoas), drop.
-# Audit: 'restore_test_passed' ou 'restore_test_failed'.
+ssh maia 'cd /opt/maia && npm run backup'        # exit 0 ok · 2 DEGRADED · 1 failed
+ssh maia 'cd /opt/maia && npm run restore:test'  # drill em DB efêmero
 ```
 
-**Recuperação real** (DB original perdido/corrompido):
+Recuperação real: pare o app → escolha o artefato **por evidência** em `backup_runs` → verifique checksum e assinatura do manifesto → decifre → `pg_restore` → `npm run db:migrate` → **reconcilie tombstones** → reconcilie mídia/Redis/sessão Baileys → só então inicie.
 
-1. **Pare o app**: `sudo systemctl stop maia`.
-2. **Identifique o dump**: `ls -la /opt/maia/backups/maia-*.dump | tail`.
-3. **Recrie o DB**: `sudo -u postgres dropdb maia && sudo -u postgres createdb maia`.
-4. **Restore**: `sudo -u postgres pg_restore --no-owner -d maia /opt/maia/backups/maia-2026-XX-XX-XX-XX-XX.dump`.
-5. **Migrações em cima** (se mudou schema entre backup e agora): `npm run db:migrate`.
-6. **Inicie**: `sudo systemctl start maia`. Confira `/health/db`.
-
-**Janela de perda**: até 24h (backup é nightly). Pra perda menor: snapshots EBS / volume cloud = follow-up.
+**Janela de perda**: até 24h (backup é nightly). RPO menor exige PITR/WAL archiving — sub-escopo planejado, não prometido.
 
 ---
 
@@ -185,39 +719,364 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 |---|---|---|
 | `maia_baileys_connected` | gauge | =0 por > 2min |
 | `maia_redis_connected` | gauge | =0 por > 30s |
-| `maia_llm_calls_total{status="error"}` | counter | rate alto |
+| `maia_llm_requests_total{status=~"error\|timeout"}` | counter | rate alto — inclui o timeout do SDK, que `status="error"` sozinho não pega |
+| `maia_llm_calls_total{status="error"}` | counter | legada (só provider/model/status); mantida para dashboards antigos |
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
+| `maia_llm_circuit_state{provider,workload,state}` | gauge | `{state="open"} == 1` por > 2min |
+| `maia_llm_circuit_transitions_total{provider,workload,state,reason}` | counter | qualquer transição com `state="open"` |
+| `maia_llm_circuit_short_circuited_total{provider,workload,state}` | counter | rate alto = carga sendo recusada |
+| `maia_llm_requests_total{status="circuit_open"}` | counter | separa carga recusada por nós de erro do provider |
+| `maia_llm_circuit_mode{state}` | gauge | `{state="off"} == 1` por > 1h (kill switch esquecido ligado) |
+| `maia_llm_circuit_mode_overrides_total{state,reason}` | counter | **qualquer** incremento — é o kill switch sendo usado |
+| `maia_llm_circuit_would_open_total{provider,workload,reason}` | counter | em `shadow`: abertura simulada. Cruze com a taxa de erro real antes de promover |
+| `maia_llm_circuit_would_reject_total{provider,workload,state}` | counter | em `shadow`: carga que SERIA recusada. Carrega `tenant_id`/`agent_id` |
 
-**Health endpoints** (em `src/server.ts`): `/health`, `/health/db`, `/health/redis`, `/health/whatsapp`. Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+O gauge é um **par de séries**, uma por estado, exatamente uma valendo `1` —
+mesmo formato de `maia_lifecycle_state{role,state}`. Alerte em
+`maia_llm_circuit_state{state="open"} == 1`, nunca num valor numérico. O mesmo
+vale para `maia_llm_circuit_mode{state}`.
 
-> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+**Leia `maia_llm_circuit_state` junto com `maia_llm_circuit_mode`.** Um disjuntor
+marcando `open` na postura `shadow` **não está recusando nada** — ele está
+medindo. Alertar em `state="open"` sem qualificar a postura produz plantão
+acordado por um incidente que não existe:
+
+```promql
+# "o disjuntor está REALMENTE recusando":
+maia_llm_circuit_state{state="open"} == 1 and on() maia_llm_circuit_mode{state="enforce"} == 1
+```
+
+Em `off` a série de estado vira `NaN` (amostra ausente), nunca `0` — `0` diria
+"fechado e saudável" sobre um disjuntor que não está observando coisa alguma.
+
+`would_open` e `would_reject` só existem em `shadow`; `short_circuited` só em
+`enforce`. Procedimento de promoção e rollback: §3.1.
+
+Ele é registrado pelo próprio disjuntor (`src/lib/llm/circuit-breaker.ts`), sob
+demanda, na primeira vez que um par `(provider, workload)` é exercitado — não há
+nada a ligar em `src/server.ts`. **Um par que nunca recebeu tráfego não tem
+série alguma**, o que é diferente de ter série em `0`: a primeira coisa a checar
+quando um alerta não dispara é se aquele workload chegou a rodar.
+
+### 8.1 Probes — qual endpoint usar onde (issue #512)
+
+Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
+endpoint errado transforma queda de dependência em restart loop.
+
+| Endpoint | Pergunta que responde | Faz I/O? | Usar em |
+|---|---|---|---|
+| `/livez` | o processo está vivo? | **não** (nenhum) | liveness do orquestrador / `healthcheck` do compose |
+| `/startupz` | a inicialização terminou? | não | startup probe |
+| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | readiness probe / pool do LB |
+| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | diagnóstico humano, dashboards |
+
+Não há `/health/llm` — use `maia_llm_requests_total{status}` no Prometheus (a
+legada `maia_llm_calls_total` não separa por workload).
+
+Regras que o código garante (`src/runtime/lifecycle/`):
+
+- **`/livez` nunca toca DB, Redis, WhatsApp ou disco.** Um `/health` como
+  liveness fazia o container ser reiniciado quando o Postgres caía — o
+  processo estava perfeitamente vivo.
+- **`/readyz` é role-aware** (`MAIA_PROCESS_ROLE`, ver §8.2) e **fail-closed**:
+  503 enquanto `starting`, `draining`, `failed` ou `stopped`, e 503 se um
+  componente obrigatório do papel estiver `down`/`unknown` (DB, Redis,
+  pressão de memória do Redis, versão de schema, fila/worker, sessão).
+- **`/readyz` vira 503 no primeiro request depois do SIGTERM** — o estado é
+  checado antes (e fora) do cache.
+- **Nenhum probe escreve.** Antes do #512 cada chamada de `/health` inseria 3
+  linhas em `system_health_events`; a série histórica agora é escrita pelo cron
+  `health_monitor` (1×/min).
+- **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
+  HTTP; a mensagem completa vai só para o log).
+
+> **Cold start / pareamento.** Nos papéis que exigem a sessão (`all`,
+> `session-owner`), o primeiro `connection.update = open` real — e não o
+> retorno de `startBaileys()` — é o marco de "subiu". Até ele acontecer:
+>
+> - `whatsapp_session` fica `starting`;
+> - o lifecycle fica em `starting` (não vai para `ready`);
+> - **`system_started` NÃO é auditado** — a trilha não pode dizer que o sistema
+>   subiu num instante em que ele não atendia;
+> - `/startupz` e `/readyz` respondem **503**;
+> - `/livez` responde 200 (o processo está vivo) e o log emite
+>   `lifecycle.still_waiting_for_component` a cada 30s.
+>
+> O `/setup` continua acessível (é rota HTTP, fora dos gates), então o fluxo de
+> QR/código funciona normalmente — acesse o host diretamente, não pelo pool do
+> load balancer. **Não** aponte um startup probe com `failureThreshold` curto
+> para `/startupz` num host que ainda vai ser pareado: o probe mataria o pod
+> antes de alguém conseguir escanear o QR. Use `/livez` para liveness (é o que
+> o `compose.prod.yml` faz).
+>
+> A espera é interrompível: um SIGTERM durante o pareamento aborta o boot e
+> drena limpo (`maia.startup_aborted_by_shutdown`).
+>
+> Depois do primeiro `open`, uma queda de socket vira `degraded` e a instância
+> **permanece** em rotação (anti-flapping); um `loggedOut` vira `failed` e tira
+> de rotação, porque aí a sessão realmente acabou e exige novo pareamento.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 sempre que o processo responde
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 → boot ainda em andamento
+curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | select(.required))'
+```
+
+> As variáveis desta seção vivem no contrato de configuração (#515): grupo
+> **Lifecycle do processo** em `src/config/contract.ts`, documentadas em
+> [`docs/configuration.md`](../configuration.md). As relações entre elas são
+> regras executáveis em `src/config/rules.ts` — `npm run config:check` avisa,
+> por exemplo, se `SHUTDOWN_STEP_TIMEOUT_MS` ficar maior que
+> `SHUTDOWN_GRACE_MS`.
+
+### 8.2 Papel do processo (`MAIA_PROCESS_ROLE`)
+
+Contrato em `src/runtime/lifecycle/roles.ts`. Hoje todo processo roda `all`
+(modo compatível). Os demais papéis existem para a separação de topologia
+(issue #513) e já mudam o que `/readyz` exige:
+
+| Papel | Inicia | `/readyz` exige |
+|---|---|---|
+| `all` | tudo | tudo |
+| `api` | HTTP + filas (produtor) | config, db, schema, redis, redis_memory, queue, http |
+| `worker` | filas + worker BullMQ | config, db, schema, redis, redis_memory, queue, agent_worker |
+| `scheduler` | crons | config, db, schema, redis, redis_memory, cron_scheduler |
+| `session-owner` | sessões WhatsApp + filas | config, db, schema, redis, redis_memory, queue, whatsapp_session |
+
+Valor desconhecido = erro de boot (fail-closed), nunca fallback permissivo.
+
+### 8.3 Métricas de lifecycle
+
+| Métrica | Tipo | Alerta se |
+|---|---|---|
+| `maia_lifecycle_state{role,state}` | gauge | `state="failed"`=1, ou `state="draining"`=1 por > grace |
+| `maia_lifecycle_transition_total{role,from,to}` | counter | transições para `failed` |
+| `maia_readiness_check_total{component,result}` | counter | `result!="ok"` sustentado |
+| `maia_readiness_check_duration_ms{component}` | histogram | p99 perto do `READINESS_PROBE_TIMEOUT_MS` |
+| `maia_shutdown_total{result,role}` | counter | `result="incomplete"` |
+| `maia_shutdown_duration_ms{component}` | histogram | passo perto do `SHUTDOWN_STEP_TIMEOUT_MS` |
+| `maia_shutdown_forced_total{reason,role}` | counter | **qualquer** incremento |
+| `maia_shutdown_undrained_startup_total{step}` | counter | **qualquer** incremento (fase de boot travada; recurso pode ter ficado aberto) |
+| `maia_worker_active_jobs{worker}` | gauge | =1 continuamente (job travado) |
+| `maia_worker_last_success_timestamp{worker}` | gauge | idade > 3× a cadência do cron |
+| `maia_worker_last_failure_timestamp{worker}` | gauge | recente + sem sucesso depois |
+| `maia_worker_tick_skipped_total{worker,reason}` | counter | crescimento (execução anterior não termina no intervalo) |
+
+### 8.4 LLM Gateway (issue #508)
+
+Todas as chamadas de chat/classificação/visão passam por `src/lib/llm/`. A
+partir da #508 o gateway emite em **todo** desfecho — sucesso, erro, timeout,
+rate limit e cancelamento (antes só o caminho de sucesso era contado, e chamadas
+diretas ao SDK não eram contadas de forma alguma):
+
+| Métrica | Tipo | Alerta se |
+|---|---|---|
+| `maia_llm_requests_total{tenant_id,agent_id,provider,model,tier,workload,status}` | counter | `status!="ok"` subindo |
+| `maia_llm_request_duration_ms{provider,model,tier,workload,status}` | histogram | p95 fora do baseline do workload |
+| `maia_llm_attempts_total{provider,model,workload,outcome}` | counter | razão attempts/requests > ~1.2 = retry storm |
+| `maia_llm_fallback_total{from_model,to_model,workload,reason}` | counter | qualquer taxa sustentada = degradação de qualidade silenciosa |
+| `maia_llm_timeouts_total{provider,model,workload}` | counter | rate alto |
+| `maia_llm_cancelled_total{provider,model,workload}` | counter | rate alto sem deploy = turnos sendo abortados |
+| `maia_llm_settings_cache_total{result}` | counter | `result="error"` sustentado = servindo modelo de env, não o do Admin |
+| `maia_llm_scope_missing_total{workload}` | counter | > 0 = chamada sem tenant/agent no ALS (custo não atribuível) |
+| `maia_llm_cost_ledger_failures_total` | counter | > 0 = custo sendo perdido |
+| `maia_llm_budget_exhausted_total{tenant_id,agent_id,workload}` | counter | quota diária estourada |
+| `maia_llm_budget_check_failures_total{workload}` | counter | > 0 = Redis fora, quota degradou ABERTO (não está protegendo) |
+| `maia_llm_budget_settle_failures_total` | counter | > 0 = reserva não liquidada; contador fica conservador até o TTL |
+
+Salvo `maia_llm_scope_missing_total` e os counters de falha, todas as métricas
+acima carregam `tenant_id` + `agent_id` — inclusive duração, timeout,
+cancelamento, fallback, tokens e attempts. Antes só `requests_total` levava o
+escopo, e um tenant sozinho estourando latência ficava diluído na média de
+todos.
+
+**Como a quota funciona.** Não é uma checagem antes da chamada: é uma RESERVA
+atômica (`INCRBYFLOAT` num contador diário por `tenant+agent` no Redis) feita
+antes de qualquer I/O de provider, liquidada com o custo real depois da
+resposta. Checar-e-seguir deixava N chamadas concorrentes lerem o mesmo valor e
+passarem todas — falhava justamente no retry storm. O contador é semeado a
+partir do ledger na primeira escrita do dia (restart não zera a quota) e expira
+em 36h; a verdade contábil continua no Postgres.
+
+**Erros que o gateway recusa de primeira** (terminais, sem retry e sem
+fallback): `authentication`, `permission`, `invalid_request`,
+`budget_exhausted`, `response_invalid` (200 sem conteúdo utilizável — antes
+virava `status="ok"` com resposta vazia) e `missing_tenant_context` (chamada
+sem `tenant_id`/`agent_id` no ALS; trabalho global deve rodar sob
+`runWithSystemContext()`).
+
+**Mensagens de erro não carregam corpo do provider.** Só `kind`, `status` e
+`request_id`. Um `400` costuma ecoar o input, e o input é conversa de cliente —
+leve o `request_id` para o suporte do provider.
+
+`trace_id`, `pessoa_id`, conversa e mensagem **não** são labels (cardinalidade);
+aparecem só no log estruturado `llm_gateway.call`.
+
+**Trocar de modelo durante um incidente:** `/dashboard/llm-settings`. A escrita
+publica no canal `maia:llm:settings:invalidate` e todas as réplicas soltam o
+cache na hora; se o Redis estiver fora, cada réplica converge sozinha pelo TTL
+curto do cache (segundos). Confirme pelo log `llm_gateway.settings_cache_invalidated`.
+
+**Fixar provider:** `LLM_PROVIDER` (`anthropic` | `openrouter`) + a chave
+correspondente. A partir da #508 o provider é resolvido por chamada, não no
+carregamento do módulo, e módulos de cognição não exigem mais
+`ANTHROPIC_API_KEY` quando o provider é OpenRouter.
+
+**Cortar gasto:** `LLM_DAILY_BUDGET_USD` (por tenant+agent, USD/dia). `0`
+desliga. Estouro rejeita a chamada ANTES de qualquer requisição ao provider,
+com erro não retentável. Para zerar a quota de um tenant no meio do dia, apague
+a chave `maia:llm:budget:<AAAA-MM-DD>:["<tenant>","<agent>"]` no Redis — ela é
+recriada a partir do ledger na chamada seguinte.
+
+**Limitar a duração de uma chamada:** `LLM_TURN_DEADLINE_MS` (default 120000) é
+o orçamento wall-clock TOTAL de uma chamada quando o caller não declara um
+deadline — cobre todas as tentativas, backoff, fallback e parsing, e não
+reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
+excede o que resta do deadline.
+
+**Quando o provider cai:** o disjuntor por `(provider, workload)` para de tentar
+depois de uma janela deslizante de 30s com no mínimo 10 tentativas em que a
+perda estimada de CHAMADAS passa de 50%, e passa a recusar com erro
+`circuit_open` — não retentável, carregando `retry_after_ms`. Ele só conta falha
+atribuível ao provider (`provider_5xx`, `network`, `timeout` do SDK): payload
+inválido, orçamento estourado ou turno cancelado não abrem o disjuntor de
+ninguém. O estado é por réplica e em memória, e o restart o zera.
+
+A conta é por CHAMADA, não por tentativa, e cada classe de falha entra com o
+expoente do orçamento que ela realmente gasta: um `provider_5xx` retentável só
+perde a chamada quando as 3 tentativas do `reasoner` falham (≈84% por
+tentativa), enquanto um `timeout` do SDK mata a chamada na primeira (50%). Na
+triagem, `window_terminal_faults` no log `llm_gateway.circuit_transition` (e na
+linha de `audit_log`) diz qual dos dois foi. Ver
+`docs/architecture/modules/lib.md` para os limiares e o porquê de cada um, e
+`docs/runbooks/observability-slo.md` §4.9.1 para a leitura do alerta.
+
+Toda transição para `open`/`closed` também vira linha em `audit_log`
+(`llm_circuit_opened` / `llm_circuit_closed`, contexto `system`). É o que
+alimenta a regra `llm_circuit_long_open` do audit-watcher — o alerta DURÁVEL de
+"aberto há mais de 5 min", que sobrevive ao coletor caído.
+
+**…mas só se a postura for `enforce`.** `LLM_CIRCUIT_MODE` tem default
+**`shadow`**: por padrão o disjuntor roda a máquina inteira e mede o que faria,
+sem recusar chamada nenhuma. Antes de concluir "o disjuntor recusou", cheque
+`maia_llm_circuit_mode{state}`. Para desligar durante um incidente sem restart e
+sem deploy, ou para promover para `enforce`, o procedimento inteiro está em
+**§3.1**.
+
+> Adicionar `maia_db_connected` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nela, abre uma PR.
 
 ---
 
 ## 9. Restart limpo (zero data loss)
 
 ```bash
-sudo systemctl stop maia          # SIGTERM → finaliza jobs em flight
-# Aguarde 'maia.shutting_down' no log
-sleep 5
+sudo systemctl stop maia          # SIGTERM → inicia o drain
+# Log esperado, nesta ordem:
+#   maia.shutting_down
+#   lifecycle.transition            from=ready to=draining
+#   queue.workers_paused
+#   lifecycle.shutdown_step_done    step=stop_accepting_work
+#   lifecycle.shutdown_step_done    step=cron_workers
+#   lifecycle.shutdown_step_done    step=bullmq
+#   lifecycle.shutdown_step_done    step=background_tasks
+#   lifecycle.shutdown_step_done    step=turn_context_subscriber
+#   lifecycle.shutdown_step_done    step=llm_settings_subscriber
+#   lifecycle.shutdown_step_done    step=line_sessions
+#   lifecycle.shutdown_step_done    step=baileys
+#   lifecycle.shutdown_step_done    step=http
+#   lifecycle.shutdown_step_done    step=pools
+#   lifecycle.shutdown_complete     result=clean
 sudo systemctl start maia
-# Aguarde 'http.listening' + 'baileys.connected'
+# Aguarde 'http.listening' → 'maia.ready' e /readyz respondendo 200
 ```
 
-O shutdown handler em `src/index.ts` chama `stopWorkers()` + `shutdownPools()` + audit `system_stopped`. Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs (BullMQ persiste em Redis).
+**O que o shutdown faz de verdade**
+(`src/runtime/lifecycle/shutdown-sequence.ts`, `registerShutdownSequence`):
+
+0. transição atômica para `draining` → `/readyz` responde 503 no request
+   seguinte, e o guard de trabalho novo (`lifecycle.isAcceptingWork()`) fecha
+   no mesmo tick do sinal;
+1. **para de aceitar trabalho** (`stop_accepting_work`, primeiro passo, sem
+   esperar nada): pausa os dois Workers BullMQ (`pause(true)` — para de
+   *buscar*) e para de agendar crons. Um job que já estava sendo entregue ao
+   processor é reestacionado como `delayed`, não executado;
+2. **espera** o tick de cron em execução (antes ele só chamava `task.stop()` e
+   seguia em frente, fechando os pools por baixo do job);
+3. fecha BullMQ — `Worker.close()` **espera o job ativo terminar**. Vem
+   ANTES do WhatsApp para que um turno em voo ainda consiga responder;
+4. espera as tarefas fire-and-forget rastreadas (reflection pós-turno, escrita
+   de DLQ, registro de linha) — depois da fila e dos crons, que são quem as
+   gera;
+5. fecha o subscriber de invalidação do cache de contexto do turno (#511). Ele
+   tem conexão ioredis PRÓPRIA (o ioredis proíbe outros comandos num cliente
+   inscrito), então o `pools` do passo 9 não a cobre; deixá-la aberta segurava
+   o event loop e disparava o backstop de saída a cada deploy limpo;
+5b. fecha o subscriber de invalidação das settings de modelo do LLM Gateway
+   (#508) — mesma forma, mesma razão e mesmo risco do passo 5: ioredis própria
+   que o `pools` não alcança. Roda aqui porque todo caller do gateway (turnos
+   BullMQ, prompt builders de cron, sonda sintética, tarefas de fundo) já
+   drenou, então ninguém mais vai reler modelo;
+6. fecha as linhas adicionais e depois a sessão Baileys primária (cancelando o
+   timer de reconexão pendente);
+7. fecha o Fastify (dispara os `onClose`: timers do coletor de memória e do probe de DB);
+8. audita `system_stopped`;
+9. fecha Redis e Postgres **por último** (nenhum consumidor fica com handle fechado);
+10. sai naturalmente. Não há `process.exit(0)` prematuro.
+
+**SIGTERM durante o boot** é tratado: cada fase do startup roda sob
+`lifecycle.runStartupStep`, que aborta o boot no primeiro checkpoint após o
+sinal e serializa contra o shutdown (nada é fechado enquanto ainda está sendo
+aberto). O log mostra `maia.startup_aborted_by_shutdown` e **não** há
+`system_start_failed` — sinal durante deploy não é incidente.
+
+Se a fase de boot **não ceder** dentro de `SHUTDOWN_STEP_TIMEOUT_MS`, o drain
+não espera para sempre — mas também **não** se declara limpo: a fase entra em
+`undrained` como `startup:<fase>` (log
+`lifecycle.shutdown_startup_step_did_not_yield`, counter
+`maia_shutdown_undrained_startup_total{step}`), o outcome vira `incomplete` e
+o processo sai com `SHUTDOWN_FORCED_EXIT_CODE`. O motivo é concreto: um
+`startServer()`/`startBaileys()` que retorna DEPOIS do passo que o fecharia
+deixaria listener ou socket vivo num processo que já se disse parado — a saída
+forçada entrega ao SO o que não foi possível fechar.
+
+**Orçamento de tempo** — `SHUTDOWN_GRACE_MS` (default 25s) é o teto do drain
+inteiro e `SHUTDOWN_STEP_TIMEOUT_MS` (default 10s) o de cada passo. Ele
+**precisa ser menor** que o `TimeoutStopSec` do systemd / `stop_grace_period`
+do compose (40s no `compose.prod.yml`), senão o SIGKILL corta o drain.
+
+**Quando o deadline estoura:** os componentes não drenados aparecem em
+`lifecycle.shutdown_incomplete` (campo `undrained`), o counter
+`maia_shutdown_forced_total{reason="drain_deadline"}` incrementa e o processo
+sai com `SHUTDOWN_FORCED_EXIT_CODE` (default 1). Trabalho não concluído
+continua recuperável: o job BullMQ volta como stalled e a row de inbound
+pendente é re-enfileirada pelo `message_recovery`.
+
+**Segundo SIGTERM/SIGINT** força a saída imediata — é auditado
+(`system_shutdown_forced`) e metrificado
+(`maia_shutdown_forced_total{reason="second_signal_SIGTERM"}`). Use só se o
+drain travou.
+
+**Se o boot falhar** (dependência obrigatória fora): não há readiness, o
+lifecycle vai para `failed`, `system_start_failed` é auditado, o que já abriu é
+fechado e o processo sai com 1. Redis indisponível **não** é mais um warning
+silencioso.
+
+Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
+(BullMQ persiste em Redis).
 
 ---
 
 ## 10. Checklist de deploy novo (cold start)
 
-- [ ] `.env` preenchido (todas as obrigatórias do `envSchema` em `src/config/env.ts`)
+- [ ] `.env` preenchido e validado — `npm run config:check` (fonte da verdade: `ENV_CONTRACT` em `src/config/contract.ts`; referência gerada em [`docs/configuration.md`](../configuration.md))
 - [ ] Postgres + Redis up (`/health/db` + `/health/redis`)
 - [ ] `npm run db:migrate` rodado
 - [ ] `npm run build` clean
 - [ ] App started → log mostra `setup.bootstrap_token_ready` (cold start, sem `creds.json`)
-- [ ] SSH cat `.baileys-auth/setup-token.txt` → `/setup?token=…` no browser → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] SSH cat `.baileys-auth/control/setup-token.txt` → abrir `/setup` no browser → colar o token no formulário (nunca na URL) → escolher QR ou código → parear com WhatsApp do número da Maia
+- [ ] Linhas ADICIONAIS: parear pelo Admin (`/setup/channels`), não pelo `/setup` — o console é autenticado e a auditoria fica com o ator administrativo (issue #518)
 - [ ] Audit log mostra `system_started`, `pairing_qr_displayed` (ou `pairing_code_requested`), `pairing_completed`
 - [ ] `/health/whatsapp` ok
 - [ ] Mande mensagem teste pro número Maia → log mostra `baileys.message.enqueued` → resposta do agente em ~3-8s

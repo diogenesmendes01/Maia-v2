@@ -196,6 +196,7 @@ export async function summarizeTranscript(
     },
     () =>
       llmCall({
+        workload: 'summarizer',
         system,
         messages: [{ role: 'user', content: transcript }],
         max_tokens: 700,

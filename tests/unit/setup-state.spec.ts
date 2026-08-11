@@ -145,9 +145,9 @@ describe('setup-recovery — concurrency lock', () => {
     const { triggerRecovery, _internal } = await import('../../src/setup/recovery.js');
     const { setupState } = await import('../../src/setup/state.js');
 
-    const p1 = triggerRecovery({ shutdownBaileys, startBaileys });
-    const p2 = triggerRecovery({ shutdownBaileys, startBaileys });
-    expect(p1).toBe(p2); // singleton lock: same promise reference
+    const p1 = triggerRecovery({ target: 'primary', shutdownBaileys, startBaileys });
+    const p2 = triggerRecovery({ target: 'primary', shutdownBaileys, startBaileys });
+    expect(p1).toBe(p2); // singleton lock (por alvo): same promise reference
     await p1;
 
     // Each side-effect runs exactly once.
@@ -156,9 +156,15 @@ describe('setup-recovery — concurrency lock', () => {
     expect(rotateTokenMock).toHaveBeenCalledTimes(1);
     expect(sendAlertMock).toHaveBeenCalledTimes(1);
 
-    // Audit trail is complete (start + completed).
-    expect(auditMock).toHaveBeenCalledWith({ acao: 'pairing_recovery_started' });
-    expect(auditMock).toHaveBeenCalledWith({ acao: 'pairing_recovery_completed' });
+    // Audit trail is complete (start + completed) com o alvo em metadata.
+    expect(auditMock).toHaveBeenCalledWith({
+      acao: 'pairing_recovery_started',
+      metadata: { target: 'primary' },
+    });
+    expect(auditMock).toHaveBeenCalledWith({
+      acao: 'pairing_recovery_completed',
+      metadata: { target: 'primary' },
+    });
 
     // Final state is unpaired (recovery completed; setUnpaired ran before sendAlert).
     expect(setupState.current().phase).toBe('unpaired');

@@ -32,6 +32,7 @@ export async function promptOnlyMode(ctx: ModeContext): Promise<Record<string, u
   }
 
   const res = await callLLM({
+    workload: 'skill',
     system,
     messages: [{ role: 'user', content: JSON.stringify(ctx.input) }],
     max_tokens,

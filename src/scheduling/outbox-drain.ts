@@ -23,7 +23,7 @@
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
-import { sendOutboundText, isBaileysConnected } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { outboxRepo, occurrencesRepo, tasksRepo } from './repos.js';
 import { tryAcquireSendSlot, releasePaceKey } from './backpressure.js';
@@ -109,8 +109,20 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
   }
 
   // Backpressure gate (only for whatsapp channels — emails go via spec 17).
+  // Review PR #496 (alto 4): a linha é resolvida ANTES do gate e a
+  // conectividade checada NA LINHA-ALVO (`line.isConnected()`), não na sessão
+  // global — com N linhas, a global conectada não prova nada sobre a linha da
+  // row (markSent fantasma) e a global caída não pode bloquear uma linha
+  // adicional saudável. Falha de RESOLUÇÃO (channel_ambiguous / scope
+  // mismatch) cai na mesma máquina de retry/DLQ do send.
+  let line: LineOutput | null = null;
   if (channel.requiresBaileys) {
-    if (!isBaileysConnected()) {
+    try {
+      line = await forCurrentAgentChannel(msg.channel_id ?? null);
+    } catch (err) {
+      return handleSendFailure(msg, err as Error);
+    }
+    if (!line.isConnected()) {
       await outboxRepo.returnToPending(msg.id);
       return 'rate_limited';
     }
@@ -128,42 +140,17 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
   }
 
   try {
-    await channel.send();
+    const providerRef = await channel.send(line);
+    // Review PR #496 (alto 4): o transporte devolve null quando a linha caiu
+    // entre o gate e o send (LineTransport devolve null sem sessão viva) —
+    // tratar como FALHA RETRYABLE; seguir adiante marcaria como `sent` algo
+    // que nunca saiu (perda silenciosa violando o ledger).
+    if (channel.requiresBaileys && providerRef == null) {
+      throw new Error('whatsapp_send_returned_null (line disconnected mid-send?)');
+    }
   } catch (err) {
     if (channel.jid) await releasePaceKey(channel.jid).catch(() => null);
-    const newAttempts = msg.attempts + 1;
-    if (newAttempts >= msg.max_attempts) {
-      await outboxRepo.markDead(msg.id, (err as Error).message);
-      await audit({
-        acao: 'outbox_dead',
-        alvo_id: msg.id,
-        occurrence_id: msg.occurrence_id,
-        metadata: { kind: msg.kind, attempts: newAttempts, error: (err as Error).message },
-      });
-      // Blocker 3 (review 2): if the dead message was an outreach
-      // FORWARD or a one_shot_reminder FIRE, the underlying task must
-      // be marked failed and the occurrence must NOT remain a phantom
-      // success. `onMessageDead` looks up the task kind and updates
-      // accordingly.
-      await onMessageDead({
-        ...msg,
-        last_error: (err as Error).message,
-      } as OutboxMessage).catch(() => null);
-      await sendAlert({
-        subject: `Outbox DLQ: ${msg.kind}`,
-        body: `Outbox row ${msg.id} reached max_attempts (${newAttempts}). Error: ${(err as Error).message}`,
-      }).catch(() => null);
-      return 'failed';
-    }
-    const backoff = backoffSeconds(newAttempts);
-    await outboxRepo.markFailedRetryable(msg.id, (err as Error).message, backoff);
-    await audit({
-      acao: 'outbox_failed',
-      alvo_id: msg.id,
-      occurrence_id: msg.occurrence_id,
-      metadata: { kind: msg.kind, attempts: newAttempts, backoff_seconds: backoff },
-    });
-    return 'failed';
+    return handleSendFailure(msg, err as Error);
   }
 
   await outboxRepo.markSent(msg.id);
@@ -210,6 +197,48 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
 }
 
 /**
+ * Máquina de retry/DLQ compartilhada entre falha de RESOLUÇÃO de linha e
+ * falha de SEND (review PR #496 alto 4 — a resolução passou a acontecer
+ * antes do gate e precisa do mesmo destino: attempts++, retryable até
+ * max_attempts, depois dead + consequências de scheduling + alerta).
+ */
+async function handleSendFailure(msg: OutboxMessage, err: Error): Promise<'failed'> {
+  const newAttempts = msg.attempts + 1;
+  if (newAttempts >= msg.max_attempts) {
+    await outboxRepo.markDead(msg.id, err.message);
+    await audit({
+      acao: 'outbox_dead',
+      alvo_id: msg.id,
+      occurrence_id: msg.occurrence_id,
+      metadata: { kind: msg.kind, attempts: newAttempts, error: err.message },
+    });
+    // Blocker 3 (review 2): if the dead message was an outreach
+    // FORWARD or a one_shot_reminder FIRE, the underlying task must
+    // be marked failed and the occurrence must NOT remain a phantom
+    // success. `onMessageDead` looks up the task kind and updates
+    // accordingly.
+    await onMessageDead({
+      ...msg,
+      last_error: err.message,
+    } as OutboxMessage).catch(() => null);
+    await sendAlert({
+      subject: `Outbox DLQ: ${msg.kind}`,
+      body: `Outbox row ${msg.id} reached max_attempts (${newAttempts}). Error: ${err.message}`,
+    }).catch(() => null);
+    return 'failed';
+  }
+  const backoff = backoffSeconds(newAttempts);
+  await outboxRepo.markFailedRetryable(msg.id, err.message, backoff);
+  await audit({
+    acao: 'outbox_failed',
+    alvo_id: msg.id,
+    occurrence_id: msg.occurrence_id,
+    metadata: { kind: msg.kind, attempts: newAttempts, backoff_seconds: backoff },
+  });
+  return 'failed';
+}
+
+/**
  * Called from `markDead` path to handle scheduling-specific consequences
  * of a dead outbox message (forward never sent → mark forward task
  * failed and the occurrence failed; the series stays alive but this
@@ -249,8 +278,14 @@ async function onMessageDead(msg: OutboxMessage): Promise<void> {
 }
 
 type Channel =
-  | { kind: 'whatsapp'; requiresBaileys: true; jid: string; send: () => Promise<unknown> }
-  | { kind: 'email'; requiresBaileys: false; jid: null; send: () => Promise<unknown> };
+  | {
+      kind: 'whatsapp';
+      requiresBaileys: true;
+      jid: string;
+      /** Recebe a linha JÁ resolvida/gated pelo processOne (nunca null aqui). */
+      send: (line: LineOutput | null) => Promise<unknown>;
+    }
+  | { kind: 'email'; requiresBaileys: false; jid: null; send: (line: LineOutput | null) => Promise<unknown> };
 
 function pickChannel(msg: OutboxMessage): Channel | null {
   const payload = msg.payload as unknown;
@@ -262,7 +297,13 @@ function pickChannel(msg: OutboxMessage): Channel | null {
         kind: 'whatsapp',
         requiresBaileys: true,
         jid: p.jid,
-        send: () => sendOutboundText(p.jid, p.text),
+        // Fase 0 (spec roteamento v4 §1.6): o drain roda sob o ALS do tuple e
+        // envia pela fronteira única, no canal da PRÓPRIA row (o CHECK de 090
+        // garante channel_id em rows pending/claimed novas; NULL legado
+        // resolve o canal único do agente). A linha chega JÁ resolvida e
+        // gated pelo processOne (review #496 alto 4); o retorno é o provider
+        // id — null vira falha retryable no chamador.
+        send: (line) => line!.sendText(p.jid, p.text),
       };
     }
     case 'whatsapp_pending_question': {

@@ -27,7 +27,8 @@ const inputSchema = z.object({
   staleness_threshold_hours: z.number().int().min(1).max(720).default(24),
   exclusive_per_destinatario: z.boolean().default(false),
   entidade_id: z.string().uuid(),
-  dual_approval_granted: z.boolean(),
+  // Fase 0 cap. 3: `dual_approval_granted` REMOVIDO — o gate C-007 é
+  // resolvido pelo dispatcher contra a evidência backend (approval_requests).
 });
 
 const outputSchema = z.object({
@@ -41,12 +42,13 @@ const outputSchema = z.object({
  * scheduled occurrence in one transaction. Each subsequent cycle is
  * scheduled at the end of the previous occurrence's execution.
  *
- * Constitutional gate C-007 (rules.ts) requires `dual_approval_granted`.
+ * Constitutional gate C-007 (rules.ts) exige 4-eyes; o dispatcher resolve a
+ * exigência contra a evidência backend persistida (Fase 0 cap. 3).
  */
 export const startRecurringOutreachTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'start_recurring_outreach',
   description:
-    'Agenda uma série recorrente de mensagens para um terceiro (ex: pedir relatório mensal). Cada ciclo envia o template para o destinatário, espera resposta (ou expira em wait_response_hours), e se forward_template estiver setado, encaminha para uma segunda pessoa. Requer aprovação dupla (dual_approval_granted=true).',
+    'Agenda uma série recorrente de mensagens para um terceiro (ex: pedir relatório mensal). Cada ciclo envia o template para o destinatário, espera resposta (ou expira em wait_response_hours), e se forward_template estiver setado, encaminha para uma segunda pessoa. Requer aprovação dupla registrada pelo backend (4-eyes fora do chat do modelo).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['send_proactive_message'],

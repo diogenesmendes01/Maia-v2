@@ -55,6 +55,22 @@ vi.mock('@/tools/_vision-cache.js', () => ({
   setCachedVision: setCachedVisionMock,
 }));
 
+// ---- P0 audit ch. 4: attachment_id resolution + guarded media read --------
+// receipt_validate resolves an attachment ID and delegates to parse_receipt,
+// which resolves it again (scoped) and reads through media-guard. The vision
+// cache is keyed on the sha RECOMPUTED by media-guard.
+const resolveAttachmentByIdMock = vi.fn();
+vi.mock('@/lib/attachment-resolver.js', () => ({
+  resolveAttachmentById: resolveAttachmentByIdMock,
+}));
+const readStoredMediaMock = vi.fn();
+vi.mock('@/lib/media-guard.js', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/media-guard.js')>(
+    '@/lib/media-guard.js',
+  );
+  return { ...actual, readStoredMedia: readStoredMediaMock };
+});
+
 // ---- shared summarizer collateral (runner + LLM) --------------------------
 // The runner mock runs the wrapped fn for the SUMMARIZER, but short-circuits the
 // risk gate (`risk_assessor_llm`) to its declared fallback so `case_risk_classify`
@@ -81,6 +97,8 @@ beforeEach(() => {
   getCachedVisionMock.mockReset();
   setCachedVisionMock.mockReset();
   callLLMMock.mockReset();
+  resolveAttachmentByIdMock.mockReset();
+  readStoredMediaMock.mockReset();
 });
 
 const ctx = {
@@ -247,7 +265,27 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
     expect(receiptValidateTool.audit_action).toBe('receipt_validated');
   });
 
-  it('serves a parse_receipt CACHE HIT without any vision call (valid when authentic + complete)', async () => {
+  const ATT_ID = '99999999-8888-4777-8666-555555555555';
+
+  /** Wire the delegated parse_receipt path: attachment_id → resolved row →
+   * guarded read whose RECOMPUTED sha keys the vision cache. */
+  function wireAttachment(sha: string): void {
+    resolveAttachmentByIdMock.mockResolvedValue({
+      message_id: ATT_ID,
+      path: '/media/t/2026-07/r.jpg',
+      mime: 'image/jpeg',
+      tipo: 'imagem',
+      caption: 'comprovante',
+    });
+    readStoredMediaMock.mockResolvedValue({
+      buf: Buffer.from('receipt-bytes'),
+      sha256: sha,
+      mime: 'image/jpeg',
+    });
+  }
+
+  it('serves a parse_receipt CACHE HIT keyed on the RECOMPUTED sha, without any vision call', async () => {
+    wireAttachment('abc123');
     // The cache is keyed by the parse_receipt tool name; a hit means NO parseImage.
     getCachedVisionMock.mockResolvedValueOnce({
       tipo: 'pix',
@@ -257,11 +295,11 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
       confianca: 0.85,
     });
     const { receiptValidateTool } = await import('@/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/r.jpg', file_sha256: 'abc123' } as never,
-      ctx,
-    );
-    // Delegated cache lookup used the parse_receipt name.
+    const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
+    // The direct ref was validated against the CURRENT conversation.
+    expect(resolveAttachmentByIdMock).toHaveBeenCalledWith('c1', ATT_ID);
+    // Delegated cache lookup used the parse_receipt name + the sha media-guard
+    // RECOMPUTED from the bytes (never a declared value).
     expect(getCachedVisionMock).toHaveBeenCalledWith('parse_receipt', 'abc123');
     // No SECOND vision call site.
     expect(parseImageMock).not.toHaveBeenCalled();
@@ -274,6 +312,7 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
   });
 
   it('is FAIL-CLOSED: a parsed receipt missing the recipient is invalid with reasons', async () => {
+    wireAttachment('norecipient-sha');
     getCachedVisionMock.mockResolvedValueOnce({
       tipo: 'pix',
       valor: 10,
@@ -282,10 +321,7 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
       confianca: 0.85,
     });
     const { receiptValidateTool } = await import('@/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/r.jpg', file_sha256: 'norecipient' } as never,
-      ctx,
-    );
+    const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
     expect(out.valid).toBe(false);
     expect(out.reasons).toContain('missing_recipient_identification');
     // authenticity could not reach 'plausible' (a missing field is a warning).
@@ -301,32 +337,35 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
     expect(getCachedVisionMock).not.toHaveBeenCalled();
   });
 
-  it('on a cache MISS, calls parseImage ONCE and caches under parse_receipt', async () => {
+  it('on a cache MISS, calls parseImage ONCE and caches under parse_receipt + recomputed sha', async () => {
+    wireAttachment('sha9');
     getCachedVisionMock.mockResolvedValueOnce(null);
     parseImageMock.mockResolvedValueOnce({ tipo: 'pix', valor: 99, beneficiario_nome: 'Foo' });
     const { receiptValidateTool } = await import('@/tools/receipt-validate.js');
-    const out = await receiptValidateTool.handler(
-      { media_local_path: '/tmp/r.jpg', file_sha256: 'sha9' } as never,
-      ctx,
-    );
+    const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
     expect(parseImageMock).toHaveBeenCalledTimes(1);
+    // Vision gets validated bytes + sniffed mime — never a filesystem path.
+    expect(parseImageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ mime: 'image/jpeg', kind: 'receipt' }),
+    );
     // Cache written back under the parse_receipt name (so a later parse_receipt
-    // reuses it — single shared cache entry).
+    // reuses it — single shared cache entry) keyed by the RECOMPUTED sha.
     expect(setCachedVisionMock).toHaveBeenCalledWith('parse_receipt', 'sha9', expect.anything());
     expect(out.source_parser).toBe('parse_receipt');
   });
 
-  it('resolves the attachment from the conversation metadata when no path is given', async () => {
+  it('resolves the attachment ID from the conversation when only a hint is given', async () => {
     recentInConversationMock.mockResolvedValueOnce([
       {
-        id: 'm9',
-        midia_url: '/tmp/from-meta.jpg',
+        id: ATT_ID,
+        midia_url: '/media/t/2026-07/r.jpg',
         tipo: 'imagem',
         conteudo: 'comprovante',
-        metadata: { media_sha256: 'metasha', media_mime: 'image/jpeg' },
+        metadata: { media_sha256: 'DECLARED-not-used', media_mime: 'image/jpeg' },
         created_at: new Date(),
       },
     ]);
+    wireAttachment('metasha');
     getCachedVisionMock.mockResolvedValueOnce({
       tipo: 'pix',
       valor: 10,
@@ -337,15 +376,18 @@ describe('receipt_validate — delegates through parse_receipt, FAIL-CLOSED', ()
     const { receiptValidateTool } = await import('@/tools/receipt-validate.js');
     const out = await receiptValidateTool.handler({ attachment_hint: 'comprovante' } as never, ctx);
     expect(recentInConversationMock).toHaveBeenCalledWith('c1', 50);
-    // It read media_sha256 from metadata and delegated under parse_receipt.
+    // The hint resolved to the message ID; the delegated parse_receipt re-read
+    // the media and keyed the cache on the RECOMPUTED sha — the stored
+    // metadata sha ('DECLARED-not-used') is never trusted.
+    expect(resolveAttachmentByIdMock).toHaveBeenCalledWith('c1', ATT_ID);
     expect(getCachedVisionMock).toHaveBeenCalledWith('parse_receipt', 'metasha');
     expect(out.source_parser).toBe('parse_receipt');
   });
 });
 
 // ===========================================================================
-describe('conversation_attachment_lookup — scope + metadata reads', () => {
-  it('returns only current-scope attachments and reads sha/mime from metadata', async () => {
+describe('conversation_attachment_lookup — scope + opaque attachment ids', () => {
+  it('returns only current-scope attachments with OPAQUE attachment_ids (no path, no sha)', async () => {
     recentInConversationMock.mockResolvedValueOnce([
       {
         id: 'm1',
@@ -375,10 +417,55 @@ describe('conversation_attachment_lookup — scope + metadata reads', () => {
     expect(out.count).toBe(2);
     const img = out.attachments.find((a) => a.message_id === 'm1')!;
     expect(img.type).toBe('image');
-    expect(img.file_sha256).toBe('s1'); // mapped from metadata.media_sha256
+    expect(img.attachment_id).toBe('m1'); // the opaque handle = mensagens row id
     expect(img.media_mime).toBe('image/jpeg'); // mapped from metadata.media_mime
+    // P0 audit ch. 4: the LLM never sees a filesystem path or a sha.
+    expect(img).not.toHaveProperty('media_local_path');
+    expect(img).not.toHaveProperty('file_sha256');
+    expect(JSON.stringify(out)).not.toContain('/tmp/a.jpg');
+    expect(JSON.stringify(out)).not.toContain('s1');
     const pdf = out.attachments.find((a) => a.message_id === 'm3')!;
     expect(pdf.type).toBe('pdf'); // documento + pdf mime → pdf
+    expect(pdf.attachment_id).toBe('m3');
+  });
+
+  it('hints match caption or attachment_id prefix — NOT paths or shas', async () => {
+    recentInConversationMock.mockResolvedValue([
+      {
+        id: 'aaaa1111-0000-4000-8000-000000000001',
+        midia_url: '/tmp/secret-path-token.jpg',
+        tipo: 'imagem',
+        conteudo: 'comprovante do aluguel',
+        metadata: { media_sha256: 'shatoken', media_mime: 'image/jpeg' },
+        created_at: new Date(),
+      },
+    ]);
+    const { conversationAttachmentLookupTool } = await import(
+      '@/tools/conversation-attachment-lookup.js'
+    );
+    // Caption hint matches.
+    const byCaption = await conversationAttachmentLookupTool.handler(
+      { limit: 100, attachment_hints: ['aluguel'] } as never,
+      ctx,
+    );
+    expect(byCaption.count).toBe(1);
+    // attachment_id prefix matches.
+    const byIdPrefix = await conversationAttachmentLookupTool.handler(
+      { limit: 100, attachment_hints: ['aaaa1111'] } as never,
+      ctx,
+    );
+    expect(byIdPrefix.count).toBe(1);
+    // A path fragment or the stored sha NO LONGER matches anything.
+    const byPath = await conversationAttachmentLookupTool.handler(
+      { limit: 100, attachment_hints: ['secret-path-token'] } as never,
+      ctx,
+    );
+    expect(byPath.count).toBe(0);
+    const bySha = await conversationAttachmentLookupTool.handler(
+      { limit: 100, attachment_hints: ['shatoken'] } as never,
+      ctx,
+    );
+    expect(bySha.count).toBe(0);
   });
 
   it('warns and ignores a divergent conversation_id (no scope escape)', async () => {

@@ -5,6 +5,7 @@ import {
   recordRedisOomDegraded,
 } from '@/lib/redis.js';
 import { agentQueue } from './queue.js';
+import { withCorrelation } from './job-correlation.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -261,6 +262,25 @@ export const debounceJobId = (phone: string): string =>
 type DebounceState = {
   /** ms since epoch when the FIRST message of this window was enqueued */
   first_enqueued_at: number;
+  /**
+   * `mensagens.created_at` (epoch ms) of the FIRST inbound in this window.
+   *
+   * Issue #514 review round 1 [P2]: the debounced path built its correlation
+   * without `received_at_ms`, and `recordTurnOutcome` only emits the E2E
+   * latency histogram when that field exists — so debounced textual turns were
+   * absent from the latency SLI entirely, and the SLO measured only the
+   * non-debounced traffic (mostly media, i.e. probably not the slow half).
+   *
+   * Why the FIRST message and not the last: the SLI answers "how long did the
+   * user wait", and the user started waiting when they sent the first message
+   * of the burst. Carrying it across resets (exactly like `first_enqueued_at`)
+   * means the debounce window is INCLUDED in the measurement, which is what
+   * the "com debounce" targets in `docs/runbooks/observability-slo.md` §3 are
+   * written against.
+   *
+   * Optional so a state row written by a previous deploy still parses.
+   */
+  first_received_at_ms?: number;
 };
 
 // Note: the `scoped` parameter is the OUTPUT of `scopedKey(phone)` —
@@ -352,6 +372,13 @@ export async function scheduleDebouncedAgent(params: {
    */
   phone: string;
   mensagem_id: string;
+  /**
+   * `mensagens.created_at` in epoch ms for THIS inbound (issue #514 [P2]).
+   * Only the first one of a debounce window is kept — see `DebounceState`.
+   * Optional: a caller that does not know it simply leaves the turn out of the
+   * E2E latency histogram, exactly as before.
+   */
+  received_at_ms?: number;
   delay_ms?: number;
   max_hold_ms?: number;
 }): Promise<DebounceResult> {
@@ -406,7 +433,17 @@ export async function scheduleDebouncedAgent(params: {
       });
     }
 
-    const data: AgentJob = { mensagem_id };
+    // Issue #514 §1 — the debounced path arms the job through the same
+    // correlation stamper as `enqueueAgent`, so a debounced turn and a direct
+    // turn are indistinguishable to the consumer's trace restoration.
+    //
+    // [P2] `received_at_ms` is the FIRST inbound of the window, preserved
+    // across resets, so the E2E latency SLI covers debounced traffic too.
+    const first_received_at_ms = prior?.first_received_at_ms ?? params.received_at_ms;
+    const data: AgentJob = withCorrelation({
+      mensagem_id,
+      ...(first_received_at_ms != null ? { received_at_ms: first_received_at_ms } : {}),
+    });
     await agentQueue.add(JOB_NAME, data, {
       jobId,
       delay,
@@ -423,8 +460,12 @@ export async function scheduleDebouncedAgent(params: {
 
     // Preserve first_enqueued_at across resets so heldMs grows toward the
     // ceiling. On a true first message (no prior), stamp now.
+    // `first_received_at_ms` rides along under the same "first wins" rule.
     const first_enqueued_at = prior?.first_enqueued_at ?? now;
-    await writeState(scoped, { first_enqueued_at });
+    await writeState(scoped, {
+      first_enqueued_at,
+      ...(first_received_at_ms != null ? { first_received_at_ms } : {}),
+    });
 
     return { kind: 'scheduled', reset: !!prior, held_ms: heldMs };
   } catch (err) {

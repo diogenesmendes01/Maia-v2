@@ -738,16 +738,22 @@ const haikuClientAdapter: HaikuClient = {
       `Text: ${params.text}`,
     ].join('\n');
 
-    const controller = new AbortController();
-    if (options?.signal) {
-      options.signal.addEventListener('abort', () => controller.abort(), { once: true });
-    }
-
     try {
       const response = await callLLM({
+        // Issue #508: o adapter se chama "Haiku" mas roda no tier MAIN desde
+        // sempre. O workload preserva esse comportamento (a política em
+        // src/lib/llm/workloads.ts o declara como main) — retierizar um
+        // classificador é mudança de critério funcional e está fora do
+        // escopo desta issue.
+        workload: 'intent_classifier',
         system: 'You are a text classifier. Respond with ONLY the label, nothing else.',
         messages: [{ role: 'user', content: prompt }],
         max_tokens: params.max_tokens,
+        // O AbortController local que existia aqui era criado, encadeado ao
+        // sinal do caller e nunca passado adiante: cancelar a classificação
+        // não cancelava a requisição HTTP. Agora o sinal do caller vai
+        // direto ao gateway, que o propaga até o SDK.
+        signal: options?.signal,
       });
       const label = (response.content ?? '').trim().toLowerCase();
       const matched = params.allowed_labels.find(

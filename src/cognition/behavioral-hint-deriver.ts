@@ -15,6 +15,7 @@ export async function deriveBehavioralHint(
     { name: 'behavioral-hint-deriver', triggered_by: 'async_event', timeoutMs: 5000 },
     async () => {
       const res = await callLLM({
+        workload: 'behavioral_hint',
         system: deriverPrompt(),
         messages: [{ role: 'user', content: sensitiveContent }],
         max_tokens: 150,

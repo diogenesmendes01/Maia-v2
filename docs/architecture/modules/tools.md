@@ -10,6 +10,8 @@
 |---|---|
 | `src/tools/_registry.ts` | Aggregated tool registry — every callable surface |
 | `src/tools/_dispatcher.ts` | Routes typed intent → tool handler |
+| `src/tools/schema-json.ts` | Canonical Zod → JSON Schema converter for LLM exposure (#509) |
+| `src/lib/tool-schema-provider.ts` | Per-provider envelope + strict-mode capability matrix (#509) |
 | `src/tools/_vision-cache.ts` | Per-tenant vision-result cache |
 
 ### Tool categories (representative files)
@@ -42,6 +44,107 @@
 | Add a tool category | Group under a subdir (see `calendar/`); register in `_registry.ts` |
 | Add a result cache | Per-tool or per-service; key by `tenant_id + agent_id + ...` (never key by business id alone) |
 | Generate the tool catalog | `npm run gen:tool-catalog` produces a serialized catalog for the admin-ui |
+
+## The tool contract is written ONCE, in Zod (issue #509)
+
+There is exactly one place a tool's input contract lives: its Zod
+`input_schema`. Never hand-write a JSON Schema, never mirror the contract in
+seed SQL, never restate it in the tool `description`.
+
+- The **model** receives a strict JSON Schema DERIVED from that Zod schema
+  (`src/tools/schema-json.ts` → `toolInputToJsonSchema`), delivered by the three
+  exposure surfaces in `_registry.ts` (`getToolSchemas`, `getAgentToolSchemas`,
+  `getToolSchemasByName`).
+- The **backend** validates every call with the same Zod schema
+  (`_dispatcher.ts`, `tool.input_schema.safeParse`). The schema shown to the
+  model DESCRIBES arguments; it grants nothing and relaxes no gate.
+
+### Rules when authoring a schema
+
+| Do | Why |
+|---|---|
+| Keep objects closed (plain `z.object`) | Emits `additionalProperties:false`; `.passthrough()` is REFUSED by the converter |
+| Model a dynamic map as `z.record(<value schema>)` | `additionalProperties` carries the value schema; the literal `true` is never emitted |
+| Add `.describe()` to money, dates, timezones, opaque ids, size limits | It becomes the JSON Schema `description` — the only way the model learns units and formats |
+| Put a top-level `.refine()` rule in a root `.describe()` too | Cross-field rules ("at least one of…") have no JSON Schema keyword; Zod still enforces it |
+| Never add a field named `approved`, `tenant_id`, `agent_id`, `api_key`, … | Authority comes from backend state; the converter REFUSES these names at any depth |
+| Never write a description that tells the model it may declare approval | Same reason |
+
+Unsupported Zod constructs (tuple, lazy, bigint, intersection, …) make the
+conversion throw. That is deliberate: `buildToolSchema` then DROPS the tool from
+the exposed set rather than advertising a permissive stub, and the catalog lint
+(`tests/unit/tools/tool-schema-catalog.spec.ts`) fails CI first.
+
+### Contract versioning
+
+Each schema has a deterministic `schema_hash`. Eight tools have their hash
+PINNED in the catalog lint — changing a contract changes the hash and fails the
+test, so the change is reviewed instead of silently shipped to the model.
+
+Two hashes are recorded per turn, because the provider envelope can rewrite the
+schema:
+
+| Where | Field | Identifies |
+|---|---|---|
+| `tool_visibility_resolved` audit row | `tool_schema_canonical_hash` (+ `_hashes`, `_bytes`) | the CANONICAL contract of the visible set |
+| `llm.tool_payload` log line (`info`), at the call site | `canonical_hash` + `provider_schema_hash` + `rewritten` + `mode` | the contract AS SENT |
+| `maia_tool_schema_provider_payload_total{provider,model,mode,rewritten}` | — | the same, alertable without parsing logs |
+
+`canonical_hash` is the join key between the audit row and the wire payload.
+
+Both hashes at the call site are taken over the **same projection** — a
+`{tool name → hash of that tool's input schema}` map — one reading the schemas
+before adaptation, the other reading the schemas actually inside the payload
+(`input_schema` for Anthropic, `function.parameters` for OpenAI). That is what
+makes the comparison mean something:
+
+- equal (`rewritten: false`) ⇒ the envelope did not touch any contract;
+- different (`rewritten: true`) ⇒ some tool's schema was rewritten, added or dropped.
+
+`mode` and `rewritten` are independent on purpose: `mode` says whether strict was
+*requested*, `rewritten` says whether the contract actually *changed*.
+`rewritten: true` with `mode: 'canonical'` is a bug — an envelope that silently
+altered the contract. `provider_payload_bytes` is a size, not an identity, and is
+not compared against anything.
+
+The digest is emitted at `info` because `LOG_LEVEL` defaults to `info`: a `debug`
+line would not exist when someone needs it, since log levels get raised *after*
+an incident, not before.
+
+### Provider delivery
+
+One canonical schema, two envelopes (`src/lib/tool-schema-provider.ts`):
+
+- Anthropic — `input_schema`, verbatim.
+- OpenAI/OpenRouter — `function.parameters`, plus `strict: true` only for models
+  in the backend capability matrix `STRICT_CAPABLE_MODEL_PREFIXES`, and only
+  when the strict rewrite is FAITHFUL to the Zod contract. Otherwise the
+  canonical schema is sent WITHOUT `strict` and the reason is counted in
+  `maia_tool_schema_provider_downgrade_total{reason}`. A downgrade weakens
+  generation, never enforcement.
+
+Strict mode cannot express "optional": it demands every property in `required`.
+A tool is therefore strict-eligible only when every `.optional()` field is also
+`.nullable()` — otherwise constrained decoding would force the model to emit the
+key, it would emit `null` to mean "absent", and Zod would reject the call as
+`invalid_args`. The adapter refuses rather than ship a schema that contradicts
+the backend; making the Zod contract nullable to please a provider would invert
+the direction of authority. Rejection reasons (all metric labels):
+
+| `reason` | What to change to become strict-eligible |
+|---|---|
+| `optional_not_null_safe` | make the optional field `.nullable()` too, when `null` is semantically correct |
+| `dynamic_map` | replace `z.record(...)` with a closed object |
+| `untyped_value` | give `z.unknown()` / `z.any()` a real type |
+| `union_root` | flatten the root `z.discriminatedUnion` into one object |
+| `model_not_strict_capable` | nothing in the contract — the model is not in the matrix |
+
+### Rollback
+
+`FEATURE_STRICT_TOOL_SCHEMAS=false` restores the pre-#509 generic stub for the
+model-facing payload only. Zod validation, every gate, the schema generation and
+the CI lint stay active in both positions. The flag is temporary — remove it
+with the `LEGACY_GENERIC_INPUT_SCHEMA` branch in `_registry.ts`.
 
 ## The capability chain (issues #410 + #408)
 
@@ -127,6 +230,12 @@ pack `risk_level` and the resolved `AudienceContext` (#407). `DataScope` in
 | Test path | What it covers |
 |---|---|
 | `tests/unit/tools/` | Per-tool input schema + execute contract |
+| `tests/unit/tools/tool-json-schema.spec.ts` | Zod → JSON Schema conversion, per Zod category (#509) |
+| `tests/unit/tools/tool-schema-catalog.spec.ts` | CATALOG LINT: every registered tool converts strictly; golden hashes pinned (#509) |
+| `tests/unit/tools/tool-schema-equivalence.spec.ts` | JSON Schema × Zod equivalence + property-based (#509) |
+| `tests/unit/tools/tool-schema-exposure.spec.ts` | Payload of the three exposure surfaces + rollback flag (#509) |
+| `tests/unit/tools/tool-schema-provider.spec.ts` | Anthropic/OpenAI envelopes + strict-mode matrix (#509) |
+| `tests/unit/tools/tool-schema-dispatch-contract.spec.ts` | Provider-shaped args at the dispatch boundary (#509) |
 | `tests/integration/tools/` | Tools that touch real Postgres / Redis |
 
 ## In-flight changes
@@ -142,5 +251,5 @@ Verify: `gh pr list --state open --search "tools OR tool-mediated OR _registry"`
 
 | | |
 |---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
+| Last verified | 2026-07-28 |
+| Against `main` HEAD | `d93624b` |

@@ -79,7 +79,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 
 vi.mock('@/config/env.js', () => ({
   config: {
-    BAILEYS_AUTH_DIR: '/tmp/maia-enqueue-oom-test',
+    BAILEYS_AUTH_DIR: '/tmp/maia-baileys-enqueue-oom-test',
     FEATURE_MESSAGE_UPDATE: false,
     FEATURE_ONE_TAP: false,
     FEATURE_MESSAGE_DEBOUNCE: false, // force the non-debounced enqueueAgent path

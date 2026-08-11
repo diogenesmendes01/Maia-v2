@@ -36,10 +36,14 @@ import {
   validateBehavior,
   type ProfileFormValue,
 } from '../_components/profile-form.js';
-import { ProfileDiff } from '../_components/profile-diff.js';
+// Diff exaustivo compartilhado com o Inbox (spec perfil-inbox v4 §1.2 — um
+// único diff nas duas superfícies; deriva do walker de profile-risk.ts).
+import { DiffOperationalProfile } from '../../proposals/[id]/_components/diff-operational-profile.js';
 import ActivityTab from './_components/activity-tab.js';
 import PlaygroundTab from './_components/playground-tab.js';
 import ObjectivesTab from './_components/objectives-tab.js';
+import GoLiveChecklist from './_components/go-live-checklist.js';
+import CapabilitiesModal from './_components/capabilities-modal.js';
 
 type TabId =
   | 'overview'
@@ -48,6 +52,19 @@ type TabId =
   | 'activity'
   | 'playground'
   | 'objectives';
+
+const TAB_IDS: readonly TabId[] = [
+  'overview',
+  'profile',
+  'versions',
+  'activity',
+  'playground',
+  'objectives',
+];
+
+function isTabId(v: string | null): v is TabId {
+  return v !== null && (TAB_IDS as readonly string[]).includes(v);
+}
 
 export default function AgentDetailPage() {
   const params = useParams<{ agentId: string }>();
@@ -59,7 +76,12 @@ export default function AgentDetailPage() {
   const canManage = role === 'founder' || role === 'owner';
   const justCreated = search.get('created') === '1';
 
-  const [tab, setTab] = React.useState<TabId>('overview');
+  // ?tab=versions etc. — permite que Identidades e a fila Aprovações
+  // aterrissem direto na aba certa (a aprovação de perfil vive aqui).
+  const requestedTab = search.get('tab');
+  const [tab, setTab] = React.useState<TabId>(
+    isTabId(requestedTab) ? requestedTab : 'overview',
+  );
 
   const agentQuery = trpc.agents.getById.useQuery(
     { tenantId, id: agentId },
@@ -166,13 +188,24 @@ export default function AgentDetailPage() {
       />
 
       {tab === 'overview' && (
-        <OverviewTab
-          activeBody={active?.profile_body ?? null}
-          activeVersion={active?.version ?? null}
-          onEdit={() => setTab('profile')}
-          canManage={canManage}
-          capabilities={capabilitiesQuery.data ?? null}
-        />
+        <div className="space-y-4">
+          <GoLiveChecklist
+            tenantId={tenantId}
+            agentId={agent.id}
+            hasActiveProfile={active !== null}
+            onGoToVersions={() => setTab('versions')}
+          />
+          <OverviewTab
+            tenantId={tenantId}
+            agentId={agent.id}
+            activeBody={active?.profile_body ?? null}
+            activeVersion={active?.version ?? null}
+            onEdit={() => setTab('profile')}
+            canManage={canManage}
+            capabilities={capabilitiesQuery.data ?? null}
+            onCapabilitiesChanged={() => void capabilitiesQuery.refetch()}
+          />
+        </div>
       )}
       {tab === 'profile' && (
         <ProfileTab
@@ -236,6 +269,8 @@ type Capabilities = {
     risk_level: string | null;
     tools: string[];
     known: boolean;
+    /** Issue #481 — pack de servidor MCP externo (gerido em /setup/mcp). */
+    external: boolean;
   }>;
   granted_tools: string[];
   denied_tools: string[];
@@ -243,25 +278,50 @@ type Capabilities = {
 };
 
 function OverviewTab({
+  tenantId,
+  agentId,
   activeBody,
   activeVersion,
   onEdit,
   canManage,
   capabilities,
+  onCapabilitiesChanged,
 }: {
+  tenantId: string;
+  agentId: string;
   activeBody: unknown;
   activeVersion: number | null;
   onEdit: () => void;
   canManage: boolean;
   capabilities: Capabilities | null;
+  onCapabilitiesChanged: () => void;
 }) {
+  const [showCapabilitiesModal, setShowCapabilitiesModal] = React.useState(false);
+
   // Issue #470 — packs/tools efetivos da função, mesmo contrato fail-closed
-  // do runtime (sem grant row ⇒ floor da plataforma).
+  // do runtime (sem grant row ⇒ floor da plataforma). Edição (packs de
+  // domínio + hard denies): fase 4 — owner/founder, auditada.
   const capabilitiesCard = capabilities && (
     <Card>
       <CardHeader
         title="Capacidades da função"
-        description={`${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.`}
+        description={
+          `${capabilities.effective_tool_count} ferramentas visíveis ao agente — princípio do menor privilégio: ele nasce com o mínimo da função e aprende o resto sob aprovação.` +
+          (capabilities.packs.some((p) => p.external)
+            ? ' Ferramentas de servidores MCP externos são contadas por pack (dependem da flag MCP do runtime).'
+            : '')
+        }
+        actions={
+          canManage && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setShowCapabilitiesModal(true)}
+            >
+              Gerenciar
+            </Button>
+          )
+        }
       />
       <CardBody className="space-y-3">
         {capabilities.packs.map((pack) => (
@@ -274,6 +334,10 @@ function OverviewTab({
               <code className="font-mono text-2xs text-zinc-400">{pack.id}</code>
             </span>
             <span className="flex items-center gap-1.5">
+              {/* Issue #481 — packs MCP não entram no total do cabeçalho:
+                  a visibilidade deles é gated por FEATURE_MCP_TOOLS no
+                  runtime e hard-deny não se aplica a nomes `mcp:*`. */}
+              {pack.external && <Badge tone="info">externo (MCP)</Badge>}
               {pack.risk_level && <StatusBadge status={pack.risk_level} />}
               <Badge tone="neutral">
                 {pack.tools.length} ferramenta{pack.tools.length === 1 ? '' : 's'}
@@ -299,6 +363,17 @@ function OverviewTab({
     </Card>
   );
 
+  const capabilitiesModal = showCapabilitiesModal && capabilities && (
+    <CapabilitiesModal
+      tenantId={tenantId}
+      agentId={agentId}
+      currentPackIds={capabilities.packs.map((p) => p.id)}
+      currentDeniedTools={capabilities.denied_tools}
+      onClose={() => setShowCapabilitiesModal(false)}
+      onSaved={onCapabilitiesChanged}
+    />
+  );
+
   if (!activeBody) {
     return (
       <div className="space-y-4">
@@ -307,6 +382,7 @@ function OverviewTab({
           description="Este agente ainda não tem uma versão de perfil ativa. Aprove a proposta pendente na aba Versões — sem perfil ativo o agente não opera."
         />
         {capabilitiesCard}
+        {capabilitiesModal}
       </div>
     );
   }
@@ -387,6 +463,7 @@ function OverviewTab({
       </Card>
 
       <div className="lg:col-span-2">{capabilitiesCard}</div>
+      {capabilitiesModal}
     </div>
   );
 }
@@ -511,12 +588,18 @@ function VersionsTab({
     },
     { enabled: tenantId !== '' },
   );
-  const approveMutation = trpc.agents.approveProfile.useMutation();
+  // Spec perfil-inbox v4 fase C — a aba Versões decide pelo MESMO endpoint
+  // unificado do /inbox (`proposals.approve`; o id da versão É o id da
+  // proposta). O shim `agents.approveProfile` foi removido: uma superfície de
+  // decisão, uma trilha de auditoria, mesmas classes por risco computado
+  // (dual para high — a segunda assinatura pode vir daqui ou do /inbox).
+  const approveMutation = trpc.proposals.approve.useMutation();
   const [target, setTarget] = React.useState<{ id: string; version: number } | null>(
     null,
   );
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
+  const [notice, setNotice] = React.useState<string | null>(null);
 
   const approve = async () => {
     if (!target) return;
@@ -525,12 +608,16 @@ function VersionsTab({
       return;
     }
     try {
-      await approveMutation.mutateAsync({
+      const decided = await approveMutation.mutateAsync({
         tenantId,
-        agentId,
-        versionId: target.id,
+        id: target.id,
         comment: comment.trim(),
       });
+      setNotice(
+        decided.status === 'pending_dual_approval'
+          ? `Primeira assinatura registrada para v${target.version}. Mudanças de risco alto exigem uma segunda aprovação (papel distinto) — conclua no Inbox ou peça a outro aprovador.`
+          : null,
+      );
       setTarget(null);
       setComment('');
       setError(null);
@@ -554,6 +641,13 @@ function VersionsTab({
 
   return (
     <>
+      {notice ? (
+        <div className="mb-3">
+          <Alert tone="info" title="Aprovação parcial registrada">
+            {notice}
+          </Alert>
+        </div>
+      ) : null}
       {items.length === 0 ? (
         <EmptyState
           title="Nenhuma versão de perfil"
@@ -624,8 +718,8 @@ function VersionsTab({
       >
         <div className="space-y-4">
           {target && proposedBodies[target.id] !== undefined ? (
-            <ProfileDiff
-              activeBody={activeBody}
+            <DiffOperationalProfile
+              predecessorBody={activeBody}
               proposedBody={proposedBodies[target.id]}
             />
           ) : (

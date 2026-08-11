@@ -23,7 +23,11 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
-import { viesDetector } from '@/cognition/drift/vies.js';
+import { viesDetector as rawViesDetector } from '@/cognition/drift/vies.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant — ver tests/helpers/llm-scope.ts.
+const viesDetector = scopedDetector(rawViesDetector);
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   content: Array<{ type: 'text'; text: string }>;

@@ -1,6 +1,6 @@
 import { listOwners } from '@/governance/permissions.js';
 import { entidadesRepo, contasRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
@@ -94,10 +94,15 @@ async function sendToOwners(text: string): Promise<void> {
   // (tenant_id, agent_id), so under a per-tuple briefing run this resolves ONLY
   // the running tuple's active owners — the briefing can never be addressed to
   // another tenant's owner.
+  //
+  // Fase 0 (spec roteamento v4 §1.6): proativo sem conversa — resolve o canal
+  // único ativo do agente (fail-closed em ambiguidade; o throw sobe para o
+  // dispatcher per-tuple, que registra `briefing.*.agent_failed`).
+  const line = await forCurrentAgentChannel(null);
   const owners = await listOwners();
   for (const o of owners) {
     const jid = o.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-    await sendOutboundText(jid, text).catch((err) =>
+    await line.sendText(jid, text).catch((err) =>
       logger.warn({ err, pessoa_id: o.id }, 'briefing.send_failed'),
     );
   }

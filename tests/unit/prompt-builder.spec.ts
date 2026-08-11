@@ -35,7 +35,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   entidadesRepo: { byIds: h.entidadesByIds },
   factsRepo: { listMentionableForScopes: h.factsListMentionableForScopes },
   rulesRepo: { listActive: h.rulesListActive },
-  entityStatesRepo: { byId: h.entityStatesById },
+  entityStatesRepo: { byId: h.entityStatesById, byIds: vi.fn(async () => []) },
 }));
 
 vi.mock('../../src/config/env.js', () => ({
@@ -1109,5 +1109,43 @@ describe('prompt-builder — raw conversation history preserved', () => {
     const { messages } = await build();
     const asst = messages.find((m) => m.role === 'assistant');
     expect(asst!.content).toBe(original);
+  });
+});
+
+describe('prompt-builder — temporal context (current time)', () => {
+  // Regression: the agent used to receive only the date ("Hoje: 17/06/2026")
+  // and replied that it had "no access to the current time", refusing to
+  // confirm whether a requested reminder time was still in the future. The
+  // "Estado atual" block must carry the wall-clock time and timezone offset so
+  // the LLM can build the ISO 8601 `quando` for `schedule_reminder`.
+  it('injects the current local time-of-day, not just the date', async () => {
+    const { system } = await build();
+    const block = system.slice(system.indexOf('## Estado atual'));
+    expect(block).toMatch(/Agora:/);
+    // HH:mm:ss present (time-of-day), e.g. "22:10:05"
+    expect(block).toMatch(/\b\d{2}:\d{2}:\d{2}\b/);
+  });
+
+  it('includes an explicit timezone offset so the absolute instant is unambiguous', async () => {
+    const { system } = await build();
+    const block = system.slice(system.indexOf('## Estado atual'));
+    // offset like "-03:00" / "+00:00"
+    expect(block).toMatch(/[+-]\d{2}:\d{2}/);
+    expect(block).toContain('America/Sao_Paulo');
+  });
+
+  it('renders "now" in the interlocutor\'s own timezone when preferencias.timezone is set', async () => {
+    const pessoa = mkPessoa({ preferencias: { timezone: 'Europe/Lisbon' } });
+    const { system } = await build({ pessoa });
+    const block = system.slice(system.indexOf('## Estado atual'));
+    expect(block).toContain('Europe/Lisbon');
+    expect(block).not.toContain('America/Sao_Paulo');
+  });
+
+  it('falls back to the default timezone when preferencias.timezone is invalid', async () => {
+    const pessoa = mkPessoa({ preferencias: { timezone: 'Not/AZone' } });
+    const { system } = await build({ pessoa });
+    const block = system.slice(system.indexOf('## Estado atual'));
+    expect(block).toContain('America/Sao_Paulo');
   });
 });

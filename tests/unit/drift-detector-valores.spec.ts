@@ -26,9 +26,13 @@ vi.mock('@anthropic-ai/sdk', () => {
 });
 
 import {
-  valoresDetector,
+  valoresDetector as rawValoresDetector,
   __test_only_resetNoPrinciplesLogCache,
 } from '@/cognition/drift/valores.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant — ver tests/helpers/llm-scope.ts.
+const valoresDetector = scopedDetector(rawValoresDetector);
 import { logger } from '@/lib/logger.js';
 import type { AgentOperationalProfileVersion, ProfileBody } from '@/db/schema.js';
 

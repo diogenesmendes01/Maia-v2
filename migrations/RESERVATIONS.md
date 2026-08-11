@@ -193,3 +193,21 @@ NEW shared prefixes — pick `max(existing)+1`.
 087 | 087_playground_sessions.sql | playground sandbox sessions and turns (issue 464)
 088 | 088_agent_objectives.sql | work loop: agent objectives and tasks (issue 469)
 089 | 089_mcp_servers.sql | mcp external tools: servers and per-tool governance state (issue 478)
+090 | 090_channel_scoped_egress.sql | fase 0 roteamento multi-linha: channel_id em conversas/outbox/mensagens, FKs compostas, dedup por canal (spec 2026-07-09)
+091 | 091_line_ownership.sql | unicidade global de linha whatsapp ativa + normalizacao E.164 com + (spec roteamento v4)
+092 | 092_inbound_unrouted.sql | staging cifrado de inbound nao-roteado para modo strict (spec roteamento v4)
+093 | 093_proposal_approvals_scope.sql | escopo tenant/agent/source em proposal_approvals + partial uniques (spec perfil-inbox v4)
+094 | 094_synthetic_probe.sql | sonda sintetica: teste real de interacao do agente automatizado — is_synthetic + synthetic_probe_runs/state + seed do recurso de sonda (spec 2026-07-17)
+095 | 095_approval_requests.sql | fase 0 cap.2: evidencia backend imutavel de aprovacao humana (approval_requests + approval_decisions, hash canonico, consumo one-time)
+096 | 096_mensagens_turn_scope_indexes.sql | fase 1: indices CONCURRENTLY em mensagens que sustentam a maquina de estados do turno — unique (tenant, agent, id) alvo da FK composta + parcial de inbound para backfill/divergencia (issue 503)
+097 | 097_agent_turns.sql | fase 1: maquina de estados duravel do turno inbound — agent_turns + agent_turn_inputs, CAS por state_version, outcome fechado por estado terminal, FKs compostas por tenant/agent (issue 503)
+101 | 101_backup_runs_manifests.sql | issue 520: evidencia duravel de backup/restore (backup_runs lifecycle, backup_manifests assinado, restore_drills para RTO medido)
+102 | 102_data_lifecycle.sql | issue 520: ciclo de vida de dados (legal_holds, privacy_requests, data_tombstones anti-ressurreicao, retention_runs dry-runnable)
+103 | 103_channel_line_state.sql | estado operacional das linhas whatsapp + fila duravel de comandos admin->runtime, material de pareamento cifrado (issue 518)
+100 | 100_trace_explorer_indexes.sql | trace explorer: indices de keyset pagination e filtros (outcome, side effect) em runtime_trace_envelopes/bodies (issue 514)
+107 | 107_runtime_trace_attempt_grouping.sql | trace explorer: root_trace_id + attempt em runtime_trace_envelopes para agrupar tentativas do mesmo turno (issue 514, review rodada 2) — autorada como 101 e renumerada antes do merge: 101/102 sao da issue 520 (PR 533) e 104-106 estao reservados por outras branches em voo
+108 | 108_schema_migrations_v2.sql | issue 516: ledger v2 do schema_migrations — checksum, dirty state, timings e trilha de repair (DDL idempotente, espelha src/migrations/ledger.ts LEDGER_V2_DDL)
+109 | 109_onboarding_runs.sql | issue 519: saga duravel de onboarding (onboarding_runs com optimistic concurrency, onboarding_events append-only, onboarding_step_results como ledger de idempotencia) — CHECK fail-closed contra os literais 'default' e 'system' — autorada como 108 e renumerada antes do merge: a 108 e da issue 516, desenvolvida em paralelo na mesma leva de agentes
+110 | 110_agents_status_provisioning.sql | issue 519 follow-up: agents.status admite 'provisioning' — o agente criado pela saga nasce inoperavel ate o comando explicito de ativacao, e 'paused' (esteve ativo e foi parado) mentiria sobre a remediacao e apagaria a distincao forense
+112 | 112_restore_drill_cleanup_status.sql | issue 536 follow-up (revisao da PR 541): restore_drills.cleanup_status — o teardown do drill vira um eixo proprio ('unknown'/'clean'/'unsafe'), para que uma falha de probe e uma falha de teardown nao se mascarem e para que "quais drills deixaram copia da producao no host?" seja um predicado indexado (111 esta reservada por outra branch em voo nesta mesma leva)
+113 | 113_onboarding_idempotent_creation.sql | issue 519 (revisao adversarial da PR 541, achados 2/3/4): criacao idempotente da saga (creation_idempotency_key_hash + unicidade por escopo inicial, incluindo run viva sem agente), resultados conclusivos TIPADOS no ledger (outcome_kind success/denied/cancelled) e ponto de retomada persistido (failed_step + resume_state) — 111 esta reservada por outra branch em voo nesta mesma leva

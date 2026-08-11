@@ -138,7 +138,26 @@ vi.mock('@/db/repositories.js', async (importOriginal) => {
 
 // Capture outbound sends to assert the recipient (and prove cross-tenant
 // non-delivery). Resolves so `sendToOwners` never logs a failure.
+//
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): `sendToOwners` agora
+// sai pela FRONTEIRA ÚNICA — `forCurrentAgentChannel(null)` (proativo sem
+// conversa → canal único ativo do agente) e `line.sendText(jid, text)` por
+// owner. O mock resolve SEMPRE (estes specs provam isolamento por tupla, não a
+// resolução de canal) e captura no MESMO `sentMessages`, preservando todas as
+// asserções de destinatário/corpo.
 const sentMessages: Array<{ jid: string; text: string }> = [];
+const forCurrentAgentChannelMock = vi.fn(async () => ({
+  sendText: async (jid: string, text: string) => {
+    sentMessages.push({ jid, text });
+    return null;
+  },
+}));
+vi.mock('@/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: forCurrentAgentChannelMock,
+}));
+// Tripwire: nada neste worker deve mais tocar a primitiva crua do gateway; se
+// algum caminho voltar a enviar por `sendOutboundText` direto, a captura abaixo
+// faz as asserções de destinatário/contagem flagrarem o desvio.
 vi.mock('@/gateway/baileys.js', () => ({
   sendOutboundText: vi.fn(async (jid: string, text: string) => {
     sentMessages.push({ jid, text });
@@ -166,6 +185,7 @@ beforeEach(() => {
   sentMessages.length = 0;
   throwForTuple = new Set();
   listActiveOwnerPairsMock.mockClear();
+  forCurrentAgentChannelMock.mockClear();
   store.select.mockClear();
   // DISPATCH tests run with an EMPTY store (inner reads → []); the ISOLATION
   // block seeds it in its own beforeEach.
@@ -346,6 +366,12 @@ describe('Issue #345 — morning briefing reads + sends for ONLY the current ten
     // Every financial SELECT in the run fired under tenant-A's context only.
     expect(contextsSeen.length).toBeGreaterThan(0);
     for (const c of contextsSeen) expect(c).toEqual(A);
+
+    // Fase 0: a linha foi resolvida pela fronteira única EXATAMENTE uma vez
+    // (uma por tupla), com channel_id NULL (proativo sem conversa → canal
+    // único ativo do agente).
+    expect(forCurrentAgentChannelMock).toHaveBeenCalledTimes(1);
+    expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
   });
 
   it('a tuple with active owners but no entities still sends an (empty-body) briefing — no under-delivery', async () => {

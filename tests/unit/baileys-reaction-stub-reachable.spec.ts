@@ -76,7 +76,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 // inside a tenant context.
 vi.mock('../../src/config/env.js', () => ({
   config: {
-    BAILEYS_AUTH_DIR: '/tmp/maia-reaction-stub-test',
+    BAILEYS_AUTH_DIR: '/tmp/maia-baileys-reaction-stub-test',
     FEATURE_MESSAGE_UPDATE: false,
     FEATURE_ONE_TAP: true,
     FEATURE_MESSAGE_DEBOUNCE: false,

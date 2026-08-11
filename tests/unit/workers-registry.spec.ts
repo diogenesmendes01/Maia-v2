@@ -60,7 +60,8 @@ vi.mock('../../src/workers/message-recovery.js', () => noopWorkers);
 vi.mock('../../src/workers/pending-reminder.js', () => noopWorkers);
 vi.mock('../../src/workers/backup.js', () => ({
   runNightlyBackup: noopAsync,
-  runCloudBackupRotation: noopAsync,
+  // Renamed from `runCloudBackupRotation` in the #520 round-1 fix.
+  runBackupRetention: noopAsync,
 }));
 vi.mock('../../src/workers/cost-monitor.js', () => noopWorkers);
 vi.mock('../../src/workers/audit-watcher.js', () => noopWorkers);
@@ -83,9 +84,11 @@ vi.mock('node-cron', () => ({
 }));
 
 describe('workers registry', () => {
-  it('registers cloud_backup_rotation as a weekly Sunday 04:00 phase-1 job', async () => {
+  // Renamed from `cloud_backup_rotation` in the #520 round-1 fix: it is no
+  // longer a cloud-only, mtime-driven prune. Same slot, same phase.
+  it('registers backup_retention as a weekly Sunday 04:00 phase-1 job', async () => {
     const { JOBS } = await import('../../src/workers/index.js');
-    const job = JOBS.find((j) => j.name === 'cloud_backup_rotation');
+    const job = JOBS.find((j) => j.name === 'backup_retention');
     expect(job).toBeDefined();
     // Sundays at 04:00 in America/Sao_Paulo
     expect(job!.cron).toBe('0 4 * * 0');

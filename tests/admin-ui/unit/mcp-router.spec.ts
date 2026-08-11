@@ -5,7 +5,7 @@
  * validação de secret ref/slug, decisão auditada e a edição de grant
  * (setAgentPack) preservando tools/denies existentes.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TRPCError } from '@trpc/server';
 import { mcpRouter } from '@/admin-ui/trpc/routers/mcp.js';
 
@@ -88,9 +88,53 @@ function makeCtx(
               }
             : opts.grant;
         },
-        async upsertForCurrentAgent(input: Record<string, unknown>) {
-          upserts.push(input);
-          return { granted_packs: input.granted_packs };
+        // Mirrors the real atomic helper (PR #493 follow-up + PR #494 review):
+        // the CURRENT row is read inside the "tx" and handed to the caller's
+        // pure compute; upsert + audit land together.
+        async updateWithAudit(args: {
+          tenant_id: string;
+          agent_id: string;
+          compute: (current: Record<string, unknown> | null) =>
+            | {
+                ok: true;
+                granted_packs: string[];
+                granted_tools: string[];
+                denied_tools: string[];
+              }
+            | { ok: false; reject: unknown };
+          granted_by: string;
+          reason: string;
+          audit: { actor_id: string; actor_role: string; action: string };
+        }) {
+          const current =
+            opts?.grant === undefined
+              ? {
+                  granted_packs: ['baseline.core', 'domain.calendar'],
+                  granted_tools: ['extra_tool'],
+                  denied_tools: ['blocked_tool'],
+                }
+              : opts.grant;
+          const next = args.compute(current as Record<string, unknown> | null);
+          if (!next.ok) return next;
+          upserts.push(next as unknown as Record<string, unknown>);
+          audit.push({
+            tenant_id: args.tenant_id,
+            actor_id: args.audit.actor_id,
+            actor_role: args.audit.actor_role,
+            action: args.audit.action,
+            resource_type: 'agent_tool_grant',
+            resource_id: args.agent_id,
+            change_summary: {
+              previous: current,
+              next: {
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
+              },
+              reason: args.reason,
+            },
+          });
+          return { ok: true as const, grant: { granted_packs: next.granted_packs } };
         },
       },
     } as unknown as typeof import('@/db/repositories.js'),
@@ -105,13 +149,23 @@ function makeCtx(
 }
 
 describe('mcp.registerServer', () => {
+  // Fase 0 cap. 5 — as mutations de cadastro/test/sync exigem a feature
+  // ligada (UI honesta: com flag off o worker de sync é no-op). Os testes de
+  // comportamento ligam a flag; os de contenção provam o bloqueio com ela off.
+  beforeEach(() => {
+    process.env.FEATURE_MCP_TOOLS = 'true';
+  });
+  afterEach(() => {
+    delete process.env.FEATURE_MCP_TOOLS;
+  });
+
   it('registers and audits (owner)', async () => {
     const { ctx, audit } = makeCtx('owner');
     const caller = mcpRouter.createCaller(ctx);
     const res = await caller.registerServer({
       name: 'erp',
       url: 'https://erp.example.com/mcp',
-      authSecretRef: 'MCP_SERVER_ERP_TOKEN',
+      authSecretRef: 'MCP_SECRET_ERP_TOKEN',
     });
     expect(res.id).toBe(SERVER_UUID);
     expect(audit[0]).toMatchObject({ action: 'mcp_server_registered' });
@@ -131,6 +185,40 @@ describe('mcp.registerServer', () => {
     await expect(
       caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: null }),
     ).rejects.toThrowError(/FORBIDDEN|not allowed/);
+  });
+
+  it('Fase 0 cap.5 — flag OFF bloqueia o cadastro (PRECONDITION_FAILED)', async () => {
+    delete process.env.FEATURE_MCP_TOOLS;
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    await expect(
+      caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: null }),
+    ).rejects.toThrowError(/desativado/);
+  });
+
+  it('Fase 0 cap.5 — env var fora do namespace MCP_SECRET_* é rejeitado', async () => {
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    for (const ref of ['ANTHROPIC_API_KEY', 'DATABASE_URL', 'NEXTAUTH_SECRET']) {
+      await expect(
+        caller.registerServer({ name: 'erp', url: 'https://x.com/mcp', authSecretRef: ref }),
+      ).rejects.toThrowError(/MCP_SECRET_/);
+    }
+  });
+
+  it('Fase 0 cap.5 — URL privada/metadata/http é rejeitada no cadastro', async () => {
+    const { ctx } = makeCtx('owner');
+    const caller = mcpRouter.createCaller(ctx);
+    for (const url of [
+      'https://169.254.169.254/latest/meta-data/',
+      'https://10.0.0.5/mcp',
+      'https://user:pass@example.com/mcp',
+      'https://example.com:6379/mcp',
+    ]) {
+      await expect(
+        caller.registerServer({ name: 'erp', url, authSecretRef: null }),
+      ).rejects.toThrowError();
+    }
   });
 
   it('rejects secret ref that is not an env-var name (Zod)', async () => {
@@ -191,10 +279,15 @@ describe('mcp.setAgentPack', () => {
       granted_tools: ['extra_tool'],
       denied_tools: ['blocked_tool'],
     });
-    expect(audit[0]).toMatchObject({
-      action: 'mcp_pack_grant_changed',
-      change_summary: { pack: 'mcp.erp', granted: true },
-    });
+    expect(audit[0]).toMatchObject({ action: 'mcp_pack_grant_changed' });
+    const summary = audit[0]!.change_summary as {
+      previous: { granted_packs: string[] };
+      next: { granted_packs: string[] };
+      reason: string;
+    };
+    expect(summary.next.granted_packs).toContain('mcp.erp');
+    expect(summary.previous.granted_packs).not.toContain('mcp.erp');
+    expect(summary.reason).toContain('mcp.erp');
   });
 
   it('revokes the pack', async () => {

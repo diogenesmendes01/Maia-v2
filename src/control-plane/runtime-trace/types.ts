@@ -75,12 +75,23 @@ export interface TraceEnvelopeInput {
   agent_id: string;
   conversa_id?: string | null;
   turno_id?: string | null;
+  /**
+   * Issue #514 (review round 2): the turn's ROOT trace id. Defaults to
+   * `trace_id`, which is correct for attempt 1. Retries pass the root here
+   * while `trace_id` carries their own derived id, so the Explorer can group
+   * the attempts of one turn instead of showing N unrelated traces.
+   */
+  root_trace_id?: string | null;
+  /** 1-based attempt ordinal. Defaults to 1. */
+  attempt?: number;
   decision: DecisionPacketStub;
   redaction_class?: RedactionClass; // default 'standard'
 }
 
 export interface TraceEnvelopeWritten {
   trace_id: string;
+  root_trace_id: string;
+  attempt: number;
   envelope_hmac: string;
   hmac_key_version: number;
   side_effect_level: SideEffectLevel;
