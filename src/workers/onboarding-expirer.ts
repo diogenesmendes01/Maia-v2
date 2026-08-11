@@ -65,41 +65,49 @@ export const ONBOARDING_EXPIRER_BATCH_LIMIT = 100;
 export async function runOnboardingExpirer(opts: { limit?: number } = {}): Promise<void> {
   const limit = opts.limit ?? ONBOARDING_EXPIRER_BATCH_LIMIT;
 
-  try {
-    const expired = await runWithSystemContext(() =>
-      onboardingRunsRepo.expireStale(new Date(), limit),
-    );
+  // O escopo `system` envolve a corrida INTEIRA — varredura, emissões do
+  // caminho feliz E as do `catch` —, não só a chamada ao repositório.
+  // `counter()` resolve `tenant_id`/`agent_id` LENDO O ALS no instante da
+  // emissão (`src/observability/metrics.ts:38`) e só cai em `system` quando o
+  // ALS está VAZIO. Numa cadeia de cron ele está — mas isso é propriedade do
+  // AMBIENTE, não do código: bastaria alguém invocar este worker de dentro de
+  // um contexto de tenant para a série de housekeeping sair rotulada com
+  // aquele tenant, e ninguém veria. Aqui o `system` é DECLARADO.
+  await runWithSystemContext(async () => {
+    try {
+      const expired = await onboardingRunsRepo.expireStale(new Date(), limit);
 
-    counter(METRIC.WORKER_RUN, { worker: WORKER, status: 'ok' });
+      counter(METRIC.WORKER_RUN, { worker: WORKER, status: 'ok' });
 
-    if (expired === 0) {
-      logger.debug('onboarding_expirer.idle');
-      return;
+      if (expired === 0) {
+        logger.debug('onboarding_expirer.idle');
+        return;
+      }
+
+      // Mesma série que o cancelamento operado pelo console emite
+      // (`src/onboarding/wizard.ts:590`), com `reason='expired'` — já no
+      // vocabulário fechado `ONBOARDING_REASONS`. A atribuição sai `system`
+      // porque `expireStale` devolve só a CONTAGEM: quem precisa saber de qual
+      // tenant era cada run tem o evento `run_expired` e a run em si.
+      counter(METRIC.ONBOARDING_RUN_CANCELLED, { reason: 'expired' }, expired);
+      logger.info({ expired, limit }, 'onboarding_expirer.done');
+
+      if (expired >= limit) {
+        // Lote cheio ⇒ provavelmente sobrou fila para o próximo tick.
+        logger.warn({ expired, limit }, 'onboarding_expirer.batch_capped');
+      }
+    } catch (err) {
+      // Uma corrida que falha NÃO derruba o scheduler nem contamina os outros
+      // jobs: o erro fica no log e na série
+      // `maia_worker_run_total{status="error"}` (o registry só vê uma execução
+      // que terminou). O `try` fica DENTRO do escopo `system` de propósito:
+      // esta emissão também é rotulada, e um erro é justamente quando ninguém
+      // está olhando o rótulo.
+      counter(METRIC.WORKER_RUN, { worker: WORKER, status: 'error' });
+      logger.error(
+        { err: (err as Error).message, stack: (err as Error).stack },
+        'onboarding_expirer.failed',
+      );
     }
-
-    // Mesma série que o cancelamento operado pelo console emite
-    // (`src/onboarding/wizard.ts:590`), com `reason='expired'` — já no
-    // vocabulário fechado `ONBOARDING_REASONS`. A atribuição sai `system`
-    // porque `expireStale` devolve só a CONTAGEM: quem precisa saber de qual
-    // tenant era cada run tem o evento `run_expired` e a run em si.
-    counter(METRIC.ONBOARDING_RUN_CANCELLED, { reason: 'expired' }, expired);
-    logger.info({ expired, limit }, 'onboarding_expirer.done');
-
-    if (expired >= limit) {
-      // Lote cheio ⇒ provavelmente sobrou fila para o próximo tick.
-      logger.warn({ expired, limit }, 'onboarding_expirer.batch_capped');
-    }
-  } catch (err) {
-    // Uma corrida que falha NÃO derruba o scheduler nem contamina os outros
-    // jobs: o erro fica no log e na série `maia_worker_run_total{status="error"}`
-    // (o registry só vê uma execução que terminou). Sem isto, um erro
-    // transitório de banco viraria `worker.failed` e a próxima janela ainda
-    // rodaria — mas a falha ficaria só no log genérico do registry, sem série
-    // própria para alertar.
-    counter(METRIC.WORKER_RUN, { worker: WORKER, status: 'error' });
-    logger.error(
-      { err: (err as Error).message, stack: (err as Error).stack },
-      'onboarding_expirer.failed',
-    );
-  }
+  });
 }

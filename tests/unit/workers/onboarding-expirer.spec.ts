@@ -33,6 +33,7 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
+import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { renderPrometheus, _resetForTests } from '@/lib/metrics.js';
 import { _resetLabelGuardForTests } from '@/observability/labels.js';
@@ -146,6 +147,50 @@ describe('worker onboarding_expirer (issue #519)', () => {
         expect.objectContaining({ expired: 3 }),
         'onboarding_expirer.done',
       );
+    });
+
+    /**
+     * `counter()` resolve `tenant_id`/`agent_id` LENDO O ALS no instante da
+     * emissão (`src/observability/metrics.ts:38`) e só cai em `system` quando
+     * o ALS está VAZIO. Numa cadeia de cron ele está — mas isso é propriedade
+     * do ambiente, não do código: bastaria alguém invocar o worker de dentro
+     * de um contexto de tenant (ou um escopo vazar de um tick anterior) para a
+     * série de housekeeping sair rotulada com aquele tenant, e ninguém veria.
+     *
+     * Estes dois casos simulam exatamente esse vazamento: rodam a `fn` do
+     * registry DENTRO de um `runWithTenantContext` e exigem `system`. Com as
+     * emissões fora do `runWithSystemContext`, ambos ficam vermelhos com o
+     * tenant vazado no rótulo.
+     */
+    it('rotula com system DECLARADO, mesmo invocada dentro do ALS de outro tenant', async () => {
+      expireStale.mockImplementation(async () => 3);
+      await runWithTenantContext({ tenant_id: 'tenant-vazado', agent_id: 'bot-vazado' }, () =>
+        registryJob()!.fn(),
+      );
+      const out = await renderPrometheus();
+      expect(out).toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 3',
+      );
+      expect(out).toContain(
+        'maia_worker_run_total{agent_id="system",status="ok",tenant_id="system",worker="onboarding_expirer"} 1',
+      );
+      // Nenhuma série de housekeeping pode carregar o escopo vazado.
+      expect(out).not.toContain('tenant-vazado');
+      expect(out).not.toContain('bot-vazado');
+    });
+
+    it('rotula com system também no caminho de erro, sob ALS de outro tenant', async () => {
+      expireStale.mockImplementation(async () => {
+        throw new Error('deadlock detected');
+      });
+      await runWithTenantContext({ tenant_id: 'tenant-vazado', agent_id: 'bot-vazado' }, () =>
+        registryJob()!.fn(),
+      );
+      const out = await renderPrometheus();
+      expect(out).toContain(
+        'maia_worker_run_total{agent_id="system",status="error",tenant_id="system",worker="onboarding_expirer"} 1',
+      );
+      expect(out).not.toContain('tenant-vazado');
     });
 
     it('registra a corrida bem-sucedida mesmo quando não havia nada a expirar', async () => {
