@@ -224,10 +224,13 @@ export async function runRestoreDrillJob(): Promise<
  * EVIDENCE, not a schedule (owner's ruling). Turning it into a cron expression
  * would be a second, drifting source of truth and would re-drill on a clock
  * even when a drill had just passed. Instead this job wakes on a fixed hourly
- * tick — frequent enough that no reachable interval can expire between two
- * wake-ups — and `runRestoreDrillTick` decides, from the evidence in
+ * tick and `runRestoreDrillTick` decides, from the evidence in
  * `restore_drills`, whether a drill is actually needed. A tick that finds fresh
  * evidence does no work: one indexed read and it returns.
+ *
+ * An hourly tick honours every interval down to
+ * `MIN_HONOURABLE_INTERVAL_HOURS` (6h); below that the tick says so on every
+ * pass rather than pretending — see `drill-schedule.ts`.
  *
  * THE GATE PART. Every tick grades the evidence through
  * `evaluateBackupReadiness` and logs the verdict at a matching level, whether
