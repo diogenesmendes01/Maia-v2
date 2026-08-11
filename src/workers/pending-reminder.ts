@@ -5,7 +5,8 @@ import { pending_questions } from '@/db/schema.js';
 import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { sendOutboundText, isBaileysConnected } from '@/gateway/baileys.js';
+import { isBaileysConnected } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { audit } from '@/governance/audit.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import {
@@ -24,6 +25,8 @@ type Row = {
   telefone_whatsapp: string;
   outbound_metadata: Record<string, unknown> | null;
   metadata: Record<string, unknown>;
+  /** Fase 0 (spec roteamento v4 §1.6): canal da conversa do pending (NULL legado). */
+  channel_id: string | null;
 };
 
 /**
@@ -131,12 +134,17 @@ async function runPendingReminderInner(): Promise<void> {
       pq.pergunta,
       p.telefone_whatsapp,
       m.metadata AS outbound_metadata,
-      pq.metadata AS metadata
+      pq.metadata AS metadata,
+      c.channel_id AS channel_id
     FROM pending_questions pq
     JOIN pessoas p
       ON p.id = pq.pessoa_id
      AND p.tenant_id = pq.tenant_id
      AND p.agent_id = pq.agent_id
+    LEFT JOIN conversas c
+      ON c.id = pq.conversa_id
+     AND c.tenant_id = pq.tenant_id
+     AND c.agent_id = pq.agent_id
     LEFT JOIN mensagens m
       ON m.direcao = 'out'
      AND m.tenant_id = pq.tenant_id
@@ -239,7 +247,10 @@ async function processOne(row: Row): Promise<void> {
 
   const jid = quoted.key.remoteJid;
   try {
-    await sendOutboundText(jid, 'Lembra dessa? Tô aguardando.', { quoted });
+    // Fase 0 (spec roteamento v4 §1.6): lembrete sai pela fronteira única, no
+    // canal da conversa do pending (NULL legado ⇒ canal único do agente).
+    const line = await forCurrentAgentChannel(row.channel_id ?? null);
+    await line.sendText(jid, 'Lembra dessa? Tô aguardando.', { quoted });
     await audit({
       acao: 'pending_reminder_sent',
       alvo_id: row.id,

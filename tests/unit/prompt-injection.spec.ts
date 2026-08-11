@@ -26,7 +26,7 @@ vi.mock('../../src/db/repositories.js', () => ({
     listMentionableForScopes: factsListMentionableForScopes,
   },
   rulesRepo: { listActive: rulesListActive },
-  entityStatesRepo: { byId: entityStatesById },
+  entityStatesRepo: { byId: entityStatesById, byIds: vi.fn(async () => []) },
   operationalProfileVersionsRepo: { getActive: vi.fn().mockResolvedValue(null) },
 }));
 

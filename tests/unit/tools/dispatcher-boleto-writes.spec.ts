@@ -34,6 +34,7 @@ const { canActMock } = vi.hoisted(() => ({ canActMock: vi.fn(() => ({ allowed: t
 
 vi.mock('@/db/repositories.js', () => ({
   idempotencyRepo: {
+    lookup: vi.fn(async () => null),
     tryReserve: vi.fn(async () => ({
       was_inserted: true,
       state: 'in_progress',
@@ -46,6 +47,14 @@ vi.mock('@/db/repositories.js', () => ({
   },
   idempotencyOutboxRepo: { markCompletedWithEffect: vi.fn(async () => true) },
   agentToolGrantsRepo: { findForCurrentAgent: vi.fn(async () => grantState.grant) },
+  // Fase 0 cap. 2/3 — repos do store de aprovação (não exercitados aqui: o
+  // constitutionalCheck está mockado para null e os valores ficam abaixo dos
+  // thresholds, então o dispatcher não entra no fluxo de approval).
+  approvalRequestsRepo: {
+    findOpenByFingerprint: vi.fn(async () => null),
+    create: vi.fn(async () => null),
+  },
+  approvalDecisionsRepo: { record: vi.fn(async () => null), byRequest: vi.fn(async () => []) },
 }));
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
 vi.mock('@/lib/redis.js', () => ({ isRedisConnected: vi.fn(() => true) }));
@@ -87,9 +96,20 @@ import { dispatchTool } from '@/tools/_dispatcher.js';
 import type { Pessoa, Conversa } from '@/db/schema.js';
 
 const UUID = '00000000-0000-4000-8000-000000000001';
+// Fase 0 cap. 3 (revisão adversarial): o dispatcher agora roda o avaliador
+// financeiro REAL (não mockado) para tools com `valor` — refund_create tem
+// `valor`. O escopo precisa carregar uma permissão resolvida ativa (sem
+// limite individual) para o entity, senão o gate fail-closed nega
+// `no_permission_for_entity` antes do handler. `canAct` continua mockado
+// (isola a composição pack↔guard); o teto global default (50k) admite 100.
+const resolvedForEntity = {
+  permissao: { status: 'ativa' },
+  profile: { acoes: ['*'] },
+  effective_limits: { valor_max: null },
+} as unknown as import('@/governance/permissions.js').ResolvedPermission;
 const fakeCtx = {
-  pessoa: { id: 'p1' } as unknown as Pessoa,
-  scope: { entidades: ['e-1'], byEntity: new Map() },
+  pessoa: { id: 'p1', status: 'ativa' } as unknown as Pessoa,
+  scope: { entidades: [UUID], byEntity: new Map([[UUID, resolvedForEntity]]) },
   conversa: { id: 'c1' } as unknown as Conversa,
   mensagem_id: 'm1',
   request_id: 'r1',

@@ -1,5 +1,7 @@
 import cron, { type ScheduledTask } from 'node-cron';
+import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter, setGaugeProvider, _internal as metricsInternal } from '@/lib/metrics.js';
 import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
 import { runIdempotencyCleanup } from './idempotency-cleanup.js';
@@ -12,8 +14,9 @@ import { runMessageRecovery } from './message-recovery.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
+import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
-import { runNightlyBackup, runCloudBackupRotation } from './backup.js';
+import { runNightlyBackup, runBackupRetention } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -35,6 +38,8 @@ import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
 import { runObjectiveExecuteWorker, runObjectivePerceiveWorker } from './objective-execute-worker.js';
 import { runMcpSyncWorker } from './mcp-sync-worker.js';
+import { runChannelPairingWorker } from './channel-pairing-worker.js';
+import { runSyntheticProbe } from './synthetic-probe.js';
 
 export type Job = {
   name: string;
@@ -67,6 +72,10 @@ export const JOBS: Job[] = [
   // when no tenant has work.
   { name: 'scheduling_tick', cron: '* * * * *', fn: runScheduling, phase: 1 },
   { name: 'outbox_drain', cron: '* * * * *', fn: runOutboxDrainWorker, phase: 1 },
+  // Spec roteamento v4 §1.4 — recovery sweep do staging de inbound
+  // não-roteado (modo strict): expira TTL, re-arma jobs órfãos (jobId
+  // estável ⇒ idempotente) e vigia o keyring. No-op barato sem rows.
+  { name: 'unrouted_recovery', cron: '* * * * *', fn: runUnroutedRecovery, phase: 1 },
   // Issue #464 — admin-console sandbox chat: drains playground_turns
   // (Postgres-as-queue) inside the tick for ~50s, so effective chat latency
   // is seconds despite the 1-min cron. Non-critical surface → phase 2.
@@ -77,8 +86,27 @@ export const JOBS: Job[] = [
   { name: 'objective_execute', cron: '* * * * *', fn: runObjectiveExecuteWorker, phase: 2 },
   // Issue #478 — MCP: executa test/sync pedidos pelo console (ponte
   // Postgres-as-queue por flags; só o runtime tem rede para os servers).
-  { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 2 },
+  // Fase 0 cap. 5: PHASE 1 de propósito (mesmo padrão do synthetic_probe
+  // abaixo) — startWorkers(1) ignora phase>1, então em phase 2 o worker
+  // NUNCA rodava e o console mostrava test/sync "pendentes" para sempre
+  // (UI desonesta). A FLAG é o gate real: com FEATURE_MCP_TOOLS off o
+  // worker é no-op na primeira linha (nenhuma rede, nenhum secret).
+  { name: 'mcp_sync', cron: '* * * * *', fn: runMcpSyncWorker, phase: 1 },
+  // Issue #518 — ponte Admin→runtime do pareamento de linhas WhatsApp. O
+  // console só tem Postgres; o socket Baileys vive aqui. Cadência de 5s
+  // porque o operador está OLHANDO a tela esperando o QR — um cron de 1min
+  // tornaria o fluxo inutilizável. PHASE 1 de propósito (startWorkers(1)
+  // ignora phase>1); o custo em repouso é um probe em índice parcial
+  // (`WHERE command IS NOT NULL`), que não retorna nada sem operador agindo.
+  { name: 'channel_pairing', cron: '*/5 * * * * *', fn: runChannelPairingWorker, phase: 1 },
   { name: 'series_next_scheduler', cron: '*/10 * * * *', fn: runSeriesNextSchedulerWorker, phase: 1 },
+  // Sonda sintética (spec 2026-07-17 §1.1). PHASE 1 de propósito: startWorkers(1)
+  // ignora phase>1, então phase 2 NUNCA seria agendado (correção do review). É
+  // seguro em phase 1 porque o worker é NO-OP com MAIA_SYNTHETIC_PROBE=false
+  // (default) — a flag, não a fase, é o gate. Cadência configurável (default
+  // */10). Sob shadow o worker falha fechado (no-op + audit); só age em
+  // exact_first/strict com o canal de sonda pareado (§1.2).
+  { name: 'synthetic_probe', cron: config.MAIA_PROBE_CRON, fn: runSyntheticProbe, phase: 1 },
   // Issue #345 (Phase 4 of #323), Batch D — the inline body was EXTRACTED into
   // `./workflow-engine-tick.ts` (`runWorkflowEngineTick`) and converted from the
   // hardcoded `default/default` shim into a per-tenant dispatcher. The job SHAPE
@@ -106,11 +134,13 @@ export const JOBS: Job[] = [
   { name: 'idempotency_outbox_relayer', cron: '*/1 * * * *', fn: runIdempotencyOutboxRelayer, phase: 1 },
   { name: 'inactivity_sweep', cron: '0 3 * * *', fn: runInactivitySweep, phase: 1 },
   { name: 'nightly_backup', cron: '0 3 * * *', fn: runNightlyBackup, phase: 1 },
-  // Cloud backup rotation runs once a week (Sundays 04:00 BRT) so
-  // BACKUP_RETENTION_CLOUD_DAYS is actually applied. Decoupled from the
-  // nightly run so the upload path stays fast and rotation can be paused
-  // independently if a provider has hiccups.
-  { name: 'cloud_backup_rotation', cron: '0 4 * * 0', fn: runCloudBackupRotation, phase: 1 },
+  // Backup artifact retention runs once a week (Sundays 04:00 BRT), decoupled
+  // from the nightly run so the upload path stays fast and retention can be
+  // paused independently. Renamed from `cloud_backup_rotation` in the #520
+  // round-1 fix: it is no longer a cloud-only, mtime-driven prune — it plans
+  // every deletion from the manifest, evaluates legal hold under a lock, and
+  // covers both destinations. Deletes nothing while RETENTION_DRY_RUN=true.
+  { name: 'backup_retention', cron: '0 4 * * 0', fn: runBackupRetention, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },
@@ -160,17 +190,75 @@ export const JOBS: Job[] = [
 
 const tasks: ScheduledTask[] = [];
 
+/**
+ * Cron drain state — issue #512 §6.
+ *
+ * `stopWorkers()` used to be a synchronous `task.stop()` loop: it prevented
+ * FUTURE ticks but returned immediately, so `gracefulShutdown()` went on to
+ * close the Redis and Postgres pools underneath a cron run that was still
+ * executing. A nightly backup, an outbox drain or a scheduling tick would then
+ * die mid-write against a closed pool.
+ *
+ * We now track every in-flight run so the drain can await it within a deadline
+ * and REPORT what did not finish, and we refuse to overlap a job with itself.
+ */
+const inflight = new Map<string, Promise<void>>();
+let acceptingTicks = true;
+/** Jobs whose gauges are already registered (bounded by JOBS.length). */
+const gaugesRegistered = new Set<string>();
+const lastSuccessAt = new Map<string, number>();
+const lastFailureAt = new Map<string, number>();
+
+function registerWorkerGauges(name: string): void {
+  if (gaugesRegistered.has(name)) return;
+  gaugesRegistered.add(name);
+  setGaugeProvider(metricsInternal.key('maia_worker_active_jobs', { worker: name }), () =>
+    inflight.has(name) ? 1 : 0,
+  );
+  setGaugeProvider(metricsInternal.key('maia_worker_last_success_timestamp', { worker: name }), () =>
+    Math.floor((lastSuccessAt.get(name) ?? 0) / 1000),
+  );
+  setGaugeProvider(metricsInternal.key('maia_worker_last_failure_timestamp', { worker: name }), () =>
+    Math.floor((lastFailureAt.get(name) ?? 0) / 1000),
+  );
+}
+
+function runTick(job: Job): void {
+  // No new work once the drain started (issue #512: "Nenhum novo side effect
+  // começa após draining").
+  if (!acceptingTicks) return;
+  // Self-overlap guard: a job whose previous run is still active is SKIPPED,
+  // not queued. Every long-running job here (outbox drain, playground drain,
+  // objective execute) is already single-flight via a DB lease, so a skipped
+  // tick is strictly better than two racing runs.
+  if (inflight.has(job.name)) {
+    incCounter('maia_worker_tick_skipped_total', { worker: job.name, reason: 'overlap' });
+    logger.warn({ job: job.name }, 'worker.tick_skipped_overlap');
+    return;
+  }
+  registerWorkerGauges(job.name);
+  const p = job
+    .fn()
+    .then(() => {
+      lastSuccessAt.set(job.name, Date.now());
+    })
+    .catch((err) => {
+      lastFailureAt.set(job.name, Date.now());
+      logger.error({ err, job: job.name }, 'worker.failed');
+    })
+    .finally(() => {
+      inflight.delete(job.name);
+    });
+  inflight.set(job.name, p);
+}
+
 export function startWorkers(currentPhase: number = 1): void {
+  acceptingTicks = true;
   for (const job of JOBS) {
     if (job.phase > currentPhase) continue;
-    const t = cron.schedule(
-      job.cron,
-      () => {
-        job.fn().catch((err) => logger.error({ err, job: job.name }, 'worker.failed'));
-      },
-      { timezone: 'America/Sao_Paulo' },
-    );
+    const t = cron.schedule(job.cron, () => runTick(job), { timezone: 'America/Sao_Paulo' });
     tasks.push(t);
+    registerWorkerGauges(job.name);
     logger.info(
       { job: job.name, cron: job.cron, phase: job.phase },
       'worker.scheduled',
@@ -178,6 +266,83 @@ export function startWorkers(currentPhase: number = 1): void {
   }
 }
 
-export function stopWorkers(): void {
-  for (const t of tasks) t.stop();
+/** Names of cron jobs currently executing. */
+export function activeWorkerJobs(): string[] {
+  return [...inflight.keys()];
 }
+
+export type StopWorkersResult = {
+  /** Jobs that were running when the drain started and finished in time. */
+  drained: string[];
+  /** Jobs still executing when the deadline expired — reported, never hidden. */
+  pending: string[];
+};
+
+/**
+ * Stop scheduling new ticks and await the runs already in flight.
+ *
+ * @param deadlineMs how long to wait for in-flight runs. On expiry the still
+ *        active job names are RETURNED so the caller can log/audit them
+ *        (issue #512: "Componentes não drenados aparecem no log/métrica
+ *        final"; "informar job ativo no momento do shutdown").
+ */
+export async function stopWorkers(deadlineMs = 15_000): Promise<StopWorkersResult> {
+  await haltWorkerScheduling();
+  return drainWorkers(deadlineMs);
+}
+
+/**
+ * Stop scheduling, WITHOUT waiting — issue #512 review round 1 (P1 on
+ * `src/index.ts:260`). This belongs to the first atomic shutdown step,
+ * alongside `pauseQueueWorkers()`: everything that could START new work is
+ * silenced before anything begins to close.
+ *
+ * Idempotent.
+ */
+export async function haltWorkerScheduling(): Promise<void> {
+  acceptingTicks = false;
+  // node-cron v4 `stop()` returns `void | Promise<void>`; await both shapes so
+  // the scheduler is really quiesced before we start counting the drain.
+  await Promise.all(tasks.map(async (t) => t.stop()));
+  tasks.length = 0;
+}
+
+/** Await the cron runs already in flight. See `stopWorkers` for the contract. */
+export async function drainWorkers(deadlineMs = 15_000): Promise<StopWorkersResult> {
+  const running = [...inflight.keys()];
+  if (running.length === 0) return { drained: [], pending: [] };
+  logger.info({ jobs: running, deadline_ms: deadlineMs }, 'worker.drain_started');
+
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), deadlineMs);
+    timer.unref?.();
+  });
+  try {
+    const outcome = await Promise.race([
+      Promise.all([...inflight.values()]).then(() => 'drained' as const),
+      deadline,
+    ]);
+    const pending = outcome === 'timeout' ? [...inflight.keys()] : [];
+    const drained = running.filter((j) => !pending.includes(j));
+    if (pending.length > 0) {
+      logger.error({ jobs: pending, deadline_ms: deadlineMs }, 'worker.drain_deadline_exceeded');
+    }
+    return { drained, pending };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Test seam — resets the drain bookkeeping between specs. */
+export function _resetWorkerStateForTests(): void {
+  acceptingTicks = true;
+  inflight.clear();
+  tasks.length = 0;
+  gaugesRegistered.clear();
+  lastSuccessAt.clear();
+  lastFailureAt.clear();
+}
+
+/** Test seam — drives one tick through the guard without a cron schedule. */
+export const _internal = { runTick };

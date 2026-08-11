@@ -40,7 +40,8 @@ const inputSchema = z
     // Normalised PIX or bank data (see `bank_account_validate.normalized`).
     payment_data: z.record(z.string(), z.unknown()).optional(),
     reason: z.string().trim().min(1).max(500),
-    dual_approval_granted: z.boolean().optional(),
+    // Fase 0 cap. 3: sem `dual_approval_granted` — evidência humana só via
+    // store backend (approval_requests), nunca por args do LLM.
   })
   // A refund must carry evidence: at least one of a related payment/boleto or a
   // validated receipt reference. Prevents opening a refund with no traceability.
@@ -51,6 +52,12 @@ const inputSchema = z
         'refund_create requires evidence: related_payment_id, related_boleto_id, or receipt_reference',
       path: ['receipt_reference'],
     },
+  )
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Abertura de reembolso. Além dos campos obrigatórios, informe AO MENOS UMA ' +
+      'evidência: related_payment_id, related_boleto_id ou receipt_reference. ' +
+      'Valor em BRL. A aprovação humana, quando exigida, é resolvida pelo backend.',
   );
 
 const outputSchema = z.object({

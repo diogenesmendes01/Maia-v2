@@ -100,66 +100,67 @@ describe('uploadBackup', () => {
   });
 });
 
-describe('pruneCloud', () => {
-  it('deletes objects older than retention window', async () => {
-    const old = new Date(Date.now() - 60 * 86_400_000); // 60d old
-    const fresh = new Date(Date.now() - 1 * 86_400_000); // 1d old
-    sendMock
-      // ListObjectsV2 page 1 (final)
-      .mockResolvedValueOnce({
-        Contents: [
-          { Key: 'maia/old-1.dump', LastModified: old },
-          { Key: 'maia/fresh-1.dump', LastModified: fresh },
-          { Key: 'maia/old-2.dump', LastModified: old },
-        ],
-        IsTruncated: false,
-      })
-      // DeleteObjects
-      .mockResolvedValueOnce({
-        Deleted: [{ Key: 'maia/old-1.dump' }, { Key: 'maia/old-2.dump' }],
-      });
+/**
+ * `pruneCloud` was REMOVED in the #520 round-1 P1 fix, and its tests with it.
+ *
+ * It selected objects to DELETE by `LastModified`, so an artifact under legal
+ * hold was destroyed if it was simply old enough; it swallowed a per-chunk
+ * delete failure; and it returned a partial count the caller audited as
+ * `completed`. Tests that asserted "deletes objects older than the retention
+ * window" were therefore pinning the defect in place.
+ *
+ * Deletion now lives in `src/ops/backup/retention.ts`, driven by
+ * `backup_runs` + `backup_manifests` with a legal-hold gate and a confirmation
+ * per object (`tests/unit/ops/backup-retention.spec.ts`). What remains here is
+ * the LISTING, which only feeds reconciliation and never deletes.
+ */
+describe('listBackupObjectKeys', () => {
+  it('returns the keys under the backup prefix', async () => {
+    sendMock.mockResolvedValueOnce({
+      Contents: [{ Key: 'maia/a.dump' }, { Key: 'maia/b.dump' }],
+      IsTruncated: false,
+    });
     vi.resetModules();
-    const { pruneCloud, _resetS3ClientForTests } = await import(
+    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
       '../../src/workers/backup-s3.js'
     );
     _resetS3ClientForTests();
-    const out = await pruneCloud();
-    expect(out.scanned).toBe(3);
-    expect(out.deleted).toBe(2);
-    // 2 calls: list + delete
-    expect(sendMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('returns zero counts when bucket is unset', async () => {
-    configState.BACKUP_S3_BUCKET = undefined;
-    vi.resetModules();
-    const { pruneCloud } = await import('../../src/workers/backup-s3.js');
-    expect(await pruneCloud()).toEqual({ scanned: 0, deleted: 0 });
-    expect(sendMock).not.toHaveBeenCalled();
+    expect(await listBackupObjectKeys()).toEqual(['maia/a.dump', 'maia/b.dump']);
   });
 
   it('iterates pagination via ContinuationToken', async () => {
-    const old = new Date(Date.now() - 60 * 86_400_000);
     sendMock
       .mockResolvedValueOnce({
-        Contents: [{ Key: 'maia/a.dump', LastModified: old }],
+        Contents: [{ Key: 'maia/a.dump' }],
         IsTruncated: true,
         NextContinuationToken: 'tok2',
       })
-      .mockResolvedValueOnce({
-        Contents: [{ Key: 'maia/b.dump', LastModified: old }],
-        IsTruncated: false,
-      })
-      .mockResolvedValueOnce({
-        Deleted: [{ Key: 'maia/a.dump' }, { Key: 'maia/b.dump' }],
-      });
+      .mockResolvedValueOnce({ Contents: [{ Key: 'maia/b.dump' }], IsTruncated: false });
     vi.resetModules();
-    const { pruneCloud, _resetS3ClientForTests } = await import(
+    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
       '../../src/workers/backup-s3.js'
     );
     _resetS3ClientForTests();
-    const out = await pruneCloud();
-    expect(out.scanned).toBe(2);
-    expect(out.deleted).toBe(2);
+    expect(await listBackupObjectKeys()).toEqual(['maia/a.dump', 'maia/b.dump']);
+  });
+
+  it('returns nothing — and calls nothing — when the bucket is unset', async () => {
+    configState.BACKUP_S3_BUCKET = undefined;
+    vi.resetModules();
+    const { listBackupObjectKeys } = await import('../../src/workers/backup-s3.js');
+    expect(await listBackupObjectKeys()).toEqual([]);
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('never deletes — listing is for reconciliation only', async () => {
+    sendMock.mockResolvedValueOnce({ Contents: [{ Key: 'maia/a.dump' }], IsTruncated: false });
+    vi.resetModules();
+    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
+      '../../src/workers/backup-s3.js'
+    );
+    _resetS3ClientForTests();
+    await listBackupObjectKeys();
+    // Exactly one call: the list. No DeleteObjects.
+    expect(sendMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -17,7 +17,7 @@
  *  - >= 0.5 MEDIUM
  *  - <  0.5 WEAK
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { SuggestedBy, RoleSelectorStrength } from '@/types/enums.js';
 import type { RoleSuggester, RoleCandidate, RoleSelectorInput } from './types.js';
@@ -38,7 +38,6 @@ export const llmSuggester: RoleSuggester = {
         fallback: null,
       },
       async () => {
-        const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
         const rolesBlock = input.available_roles
           .map(
             (r) =>
@@ -55,19 +54,15 @@ export const llmSuggester: RoleSuggester = {
           `MENSAGEM:\n${input.inbound_text}`,
           'Devolva JSON estrito.',
         ].join('\n\n');
-        const completion = await anthropic.messages.create({
-          model: 'claude-haiku-4-5-20251001',
+        // Issue #508: modelo resolvido pelo backend (tier `fast` do workload
+        // `role_selector`), não mais fixado no call site.
+        const completion = await callLLM({
+          workload: 'role_selector',
           max_tokens: 200,
           system,
           messages: [{ role: 'user', content: user }],
         });
-        const text = (completion.content as Array<{ type: string; text?: string }>)
-          .filter(
-            (c): c is { type: 'text'; text: string } =>
-              c.type === 'text' && typeof c.text === 'string',
-          )
-          .map((c) => c.text)
-          .join('');
+        const text = completion.content ?? '';
         const match = text.match(/\{[\s\S]*\}/);
         if (!match) return null;
         let parsed: { role_key?: string; confidence?: number; reason?: string };

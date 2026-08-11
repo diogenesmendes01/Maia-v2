@@ -28,7 +28,7 @@
  *   labels (papelDriftDetector audits THEM); principles are core value
  *   contracts. Conflating the two is exactly the bug class #189 fixes.
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
 import { logger } from '@/lib/logger.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
@@ -90,7 +90,6 @@ export const valoresDetector: DriftDetector = {
     const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
     const principlesTxt = principles.map((p, i) => `${i + 1}. ${p}`).join('\n');
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você é um auditor de princípios do agente.',
       'Dado os princípios do núcleo e as últimas mensagens do agente,',
@@ -103,16 +102,13 @@ export const valoresDetector: DriftDetector = {
     ].join('\n');
 
     try {
-      const completion = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+      const completion = await callLLM({
+        workload: 'drift_detector',
         max_tokens: 600,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = completion.content
-        .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;
       const parsed = JSON.parse(match[0]) as {

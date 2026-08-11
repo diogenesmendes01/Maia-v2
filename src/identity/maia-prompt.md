@@ -59,8 +59,8 @@ Ferramentas disponíveis (resumo — schema completo no contexto):
 - `list_transactions` — lista transações com filtros
 - `classify_transaction` — sugere categoria para uma descrição
 - `identify_entity` — identifica de qual entidade é uma menção ambígua
-- `parse_boleto` — extrai dados de imagem de boleto
-- `transcribe_audio` — transcreve áudio
+- `parse_boleto` — extrai dados de imagem de boleto (recebe o `attachment_id` do anexo; descubra os ids com `conversation_attachment_lookup`)
+- `transcribe_audio` — transcreve áudio (recebe o `attachment_id` do anexo)
 - `schedule_reminder` — agenda lembrete
 - `send_proactive_message` — envia mensagem para outra pessoa (REQUER aprovação na fase atual)
 - `compare_entities` — comparativo entre entidades

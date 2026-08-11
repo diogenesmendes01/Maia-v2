@@ -1,4 +1,4 @@
-import { eq, and, desc, sql, lt, ne } from 'drizzle-orm';
+import { eq, and, desc, sql, lt, ne, inArray, asc } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { procedure_status_events } from '../schema.js';
 import {
@@ -72,6 +72,37 @@ export const procedureDefinitionsRepo = {
       ))
       .limit(1);
     return rows[0] ?? null;
+  },
+
+  /**
+   * Issue #511 — batch sibling of `findById`.
+   *
+   * Carries the same tenant/agent predicate as `findById` (P83-H5: a definition
+   * that exists under another tenant must be invisible, not merely unused), so
+   * a foreign id in the input yields no row rather than another tenant's steps.
+   *
+   * Today's turn resolves at most one definition, so this does not remove a
+   * live N+1 by itself — it exists so the multi-procedure paths (selector
+   * candidates, assignment fan-out) have a batch primitive to reach for instead
+   * of reintroducing the loop, and so the turn-context loader can hydrate
+   * definitions alongside the other batched sections.
+   */
+  async byIds(ids: string[], limit = 100): Promise<ProcedureDefinition[]> {
+    if (ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(procedure_definitions)
+      .where(
+        and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          inArray(procedure_definitions.id, Array.from(new Set(ids))),
+        ),
+      )
+      .orderBy(asc(procedure_definitions.id))
+      .limit(limit);
   },
 
   async listByStatus(status: string, limit = 100): Promise<ProcedureDefinition[]> {

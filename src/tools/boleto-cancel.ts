@@ -39,9 +39,9 @@ const inputSchema = z.object({
   cnpj: z.string().trim().min(1).max(20).optional(),
   company_id: z.string().trim().min(1).max(64).optional(),
   reason: z.string().trim().min(1).max(500),
-  // The dispatcher reads this when a governing policy / constitutional rule
-  // requires a second approver; the tool itself does not branch on it.
-  dual_approval_granted: z.boolean().optional(),
+  // Fase 0 cap. 3: `dual_approval_granted` foi REMOVIDO do schema — o LLM não
+  // atesta aprovação. A evidência humana vem do store backend
+  // (approval_requests), resolvida pelo dispatcher antes de executar.
 });
 
 const outputSchema = z.object({

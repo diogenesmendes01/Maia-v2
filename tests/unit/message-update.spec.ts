@@ -28,9 +28,16 @@ vi.mock('../../src/db/client.js', () => ({ withTx: withTxMock, db: {} as never }
 const auditMock = vi.fn();
 vi.mock('../../src/governance/audit.js', () => ({ audit: auditMock }));
 
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): a notificação do
+// dono sai pela fronteira única `LineOutput` (forCurrentAgentChannel) em vez
+// do sendOutboundText direto do baileys. O mesmo spy segue verificando o
+// envio físico (jid + pergunta) — só o transporte mudou de módulo.
 const sendOutboundTextMock = vi.fn().mockResolvedValue('WAID-OWNER-NOTIFY');
-vi.mock('../../src/gateway/baileys.js', () => ({
-  sendOutboundText: sendOutboundTextMock,
+vi.mock('../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: vi.fn(async () => ({
+    scope: { tenant_id: 'primary', agent_id: 'primary', channel_id: 'ch-owner' },
+    sendText: sendOutboundTextMock,
+  })),
 }));
 
 vi.mock('../../src/config/env.js', () => ({

@@ -13,6 +13,21 @@ export type WhatsAppInbound = {
 
 export type AgentJob = {
   mensagem_id: string;
+  /**
+   * Issue #514 §1 — root trace id of the turn, carried across the queue
+   * boundary so ingress, worker, LLM, tool and outbound all correlate.
+   *
+   * OPTIONAL on purpose: jobs armed by an older process (rolling deploy) or by
+   * a path that has not adopted the contract yet still process normally — the
+   * consumer re-derives the id deterministically from `mensagem_id` via
+   * `deriveTraceId()`, which yields the SAME value. The field is therefore an
+   * optimisation + explicit contract, never a correctness dependency.
+   */
+  trace_id?: string;
+  /** Epoch ms when the job was armed. Feeds the queue-wait SLI. */
+  enqueued_at_ms?: number;
+  /** Epoch ms of `mensagens.created_at`. Feeds the inbound→delivered SLI. */
+  received_at_ms?: number;
 };
 
 export type WAQuotedContext = {

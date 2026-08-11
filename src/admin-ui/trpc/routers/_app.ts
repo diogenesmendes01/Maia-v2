@@ -11,6 +11,7 @@ import { auditRouter } from './audit.js';
 import { tenantsRouter } from './tenants.js';
 import { agentsRouter } from './agents.js';
 import { channelPoliciesRouter } from './channelPolicies.js';
+import { channelLinesRouter } from './channelLines.js';
 import { dashboardRouter } from './dashboard.js';
 import { capabilitiesRouter } from './capabilities.js';
 import { proceduresRouter } from './procedures.js';
@@ -32,6 +33,7 @@ export const appRouter = router({
   tenants: tenantsRouter,
   agents: agentsRouter,
   channelPolicies: channelPoliciesRouter,
+  channelLines: channelLinesRouter,
   dashboard: dashboardRouter,
   capabilities: capabilitiesRouter,
   procedures: proceduresRouter,

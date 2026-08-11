@@ -29,7 +29,8 @@ const inputSchema = z
     cnpj: z.string().trim().min(1).max(20).optional(),
     company_id: z.string().trim().min(1).max(64).optional(),
     reason: z.string().trim().min(1).max(500),
-    dual_approval_granted: z.boolean().optional(),
+    // Fase 0 cap. 3: sem `dual_approval_granted` — evidência humana só via
+    // store backend (approval_requests), nunca por args do LLM.
   })
   // Target must be unambiguous: require at least one company identifier. The
   // policy declares `company_identified`, but the schema itself must reject a
@@ -37,7 +38,12 @@ const inputSchema = z
   .refine((v) => Boolean(v.cnpj ?? v.company_id), {
     message: 'company_campaign_remove requires cnpj or company_id',
     path: ['company_id'],
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Remoção de campanha. Além dos campos obrigatórios, informe cnpj OU company_id ' +
+      'para identificar a empresa alvo sem ambiguidade.',
+  );
 
 const outputSchema = z.object({
   executed: z.boolean(),

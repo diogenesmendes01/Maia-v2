@@ -31,6 +31,7 @@ type OutboxRow = {
   id: string;
   task_id: string | null;
   occurrence_id: string | null;
+  channel_id: string | null;
   kind: 'whatsapp_text';
   payload: { jid: string; text: string };
   status: 'pending' | 'claimed' | 'sent' | 'failed' | 'dead';
@@ -60,6 +61,7 @@ const outboxEnqueueMock = vi.fn(async (input: {
     id: `ob-${outbox.length + 1}`,
     task_id: input.task_id ?? null,
     occurrence_id: input.occurrence_id ?? null,
+    channel_id: null,
     kind: input.kind,
     payload: input.payload,
     status: 'pending',
@@ -178,6 +180,23 @@ const sendOutboundTextMock = vi.fn();
 vi.mock('../../../src/gateway/baileys.js', () => ({
   sendOutboundText: sendOutboundTextMock,
   isBaileysConnected: () => true,
+}));
+
+// Fase 0 (spec roteamento v4 §1.6): the drain sends via the single egress
+// boundary (`forCurrentAgentChannel(msg.channel_id ?? null)` → LineOutput).
+// Delegate sendText to the same spy so the crash/recovery assertions keep
+// observing the physical send (mockRejectedValueOnce simulates the crash).
+const forCurrentAgentChannelMock = vi.fn(async (channel_id: string | null) => ({
+  scope: {
+    tenant_id: 'tenant-test',
+    agent_id: 'agent-test',
+    channel_id: channel_id ?? 'chan-sole-1',
+  },
+  sendText: (jid: string, text: string) => sendOutboundTextMock(jid, text),
+  isConnected: () => true,
+}));
+vi.mock('../../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: forCurrentAgentChannelMock,
 }));
 
 const tryAcquireMock = vi.fn().mockResolvedValue({ kind: 'allow' });

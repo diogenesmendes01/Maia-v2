@@ -1,0 +1,1464 @@
+/**
+ * Issue #519 — o ORQUESTRADOR, contra um store de saga em memória.
+ *
+ * O store falso reproduz FIELMENTE a ordem de decisão do `commitStep` real
+ * (ledger → versão → transição → apply → commit/deny), que é o que dá sentido
+ * a testar o wizard sem Postgres: o que muda entre os dois é só o mecanismo de
+ * durabilidade (transação + `FOR UPDATE`), coberto pela suíte de integração.
+ *
+ * O que provamos aqui:
+ *   - RBAC por comando e isolamento horizontal (run de outro tenant não é
+ *     descoberta nem mutável);
+ *   - retomada: um comando novo parte do estado PERSISTIDO, não de memória;
+ *   - replay da mesma chave devolve o resultado persistido sem re-executar;
+ *   - mesma chave com payload divergente é conflito;
+ *   - double-click com DUAS chaves não duplica provisionamento;
+ *   - concorrência otimista (dois operadores, um avanço);
+ *   - ativação reavalia readiness e falha FECHADA;
+ *   - o par confirmado precisa bater com o escopo da run;
+ *   - o `command_id` de pareamento é derivado (retry idempotente).
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { OnboardingRunRow } from '../../../src/db/schema.js';
+import type {
+  CommitStepInput,
+  CommitStepOutcome,
+  StepApplication,
+} from '../../../src/db/repositories/onboarding-repos.js';
+import { planTransition, type OnboardingState } from '../../../src/onboarding/state-machine.js';
+
+// ── Store de saga em memória ─────────────────────────────────────────────────
+
+/**
+ * O ledger guarda RESULTADOS CONCLUSIVOS TIPADOS (migration 113): sucesso,
+ * negação e cancelamento. O store falso espelha isso porque é justamente a
+ * assimetria "só sucessos entram no ledger" que a review do PR #541 apontou.
+ */
+type LedgerRow = {
+  payload_hash: string;
+  result: Record<string, unknown>;
+  outcome_kind: 'success' | 'denied' | 'cancelled';
+  outcome_code?: string;
+  outcome_message?: string;
+};
+
+const runs = new Map<string, OnboardingRunRow>();
+const ledger = new Map<string, LedgerRow>();
+/** Ledger de CRIAÇÃO: (kind, tenant, hash da chave) → id da run. */
+const createdByKey = new Map<string, string>();
+/** Quantas vezes o `apply` de cada passo REALMENTE rodou. */
+const applyCalls: string[] = [];
+/** SQL que o passo executou pelo `tx` — hoje só os locks do retrato. */
+const txStatements: string[] = [];
+
+/**
+ * `tx` falso mínimo. Só precisa de `execute`, porque as escritas de
+ * provisionamento estão mockadas; o que ele PROVA é que o passo executou (ou
+ * não) as instruções de lock dentro da transação.
+ */
+function fakeTx(): { execute: (q: unknown) => Promise<{ rows: never[] }> } {
+  return {
+    execute: (q: unknown) => {
+      txStatements.push(JSON.stringify((q as { queryChunks?: unknown }).queryChunks ?? q));
+      return Promise.resolve({ rows: [] });
+    },
+  };
+}
+
+function ledgerKey(run_id: string, step: string, hash: string): string {
+  return `${run_id}:${step}:${hash}`;
+}
+
+function makeRun(over: Partial<OnboardingRunRow> = {}): OnboardingRunRow {
+  const now = new Date();
+  return {
+    id: 'run-1',
+    kind: 'tenant_onboarding',
+    tenant_id: 'acme',
+    agent_id: 'acme-bot',
+    state: 'created',
+    current_step: null,
+    version: 1,
+    created_by: 'u1',
+    created_at: now,
+    updated_at: now,
+    completed_at: null,
+    cancelled_at: null,
+    expires_at: new Date(Date.now() + 3_600_000),
+    last_error_code: null,
+    metadata: {},
+    configuration_contract_version: '1',
+    schema_version: 'sf',
+    ...over,
+  } as OnboardingRunRow;
+}
+
+const fakeRepo = {
+  async getForScope(input: { run_id: string; tenant_id: string | null }) {
+    const run = runs.get(input.run_id);
+    if (!run) return null;
+    // MESMO predicado do repo real: o tenant do chamador entra no WHERE.
+    // `null` = SEM FILTRO (privilégio exclusivo do founder).
+    if (input.tenant_id !== null && run.tenant_id !== input.tenant_id) return null;
+    return run;
+  },
+
+  async commitStep(input: CommitStepInput): Promise<CommitStepOutcome> {
+    const run = runs.get(input.run_id);
+    if (!run) return { outcome: 'not_found' };
+    if (input.tenant_id !== null && run.tenant_id !== null && run.tenant_id !== input.tenant_id) {
+      return { outcome: 'not_found' };
+    }
+    if (run.expires_at.getTime() <= Date.now()) {
+      return { outcome: 'invalid_transition', run, code: 'run_expired', message: 'expirada' };
+    }
+
+    // (1) LEDGER antes da versão — um retry após commit perdido traz a versão antiga.
+    const key = ledgerKey(run.id, input.step, input.idempotency_key_hash);
+    const previous = ledger.get(key);
+    if (previous) {
+      if (previous.payload_hash !== input.payload_hash) {
+        return { outcome: 'payload_conflict', run };
+      }
+      // Uma negativa replayada volta como NEGATIVA — não como sucesso.
+      if (previous.outcome_kind === 'denied') {
+        return {
+          outcome: 'denied',
+          run,
+          code: previous.outcome_code ?? 'readiness_blocked',
+          message: previous.outcome_message ?? 'passo recusado',
+          replayed: true,
+        };
+      }
+      return { outcome: 'replayed', run, result: previous.result };
+    }
+
+    // (2) Concorrência otimista.
+    if (run.version !== input.expected_version) return { outcome: 'version_conflict', run };
+
+    // (3) Transição contra o estado persistido — e, em `failed_retryable`,
+    // contra o PONTO DE RETOMADA persistido na mesma row.
+    let plan;
+    try {
+      plan = planTransition({
+        step: input.step,
+        from: run.state as OnboardingState,
+        retry_point: { failed_step: run.failed_step, resume_state: run.resume_state },
+      });
+    } catch (err) {
+      return {
+        outcome: 'invalid_transition',
+        run,
+        code: (err as { code?: string }).code ?? 'invalid_transition',
+        message: (err as Error).message,
+      };
+    }
+
+    // (4) A escrita do passo. O `tx` falso precisa expor `execute`: a ativação
+    // TRAVA o retrato de readiness (`lockReadinessSnapshot`) antes de decidir,
+    // e um `tx` sem `execute` esconderia a ausência do lock em vez de prová-la.
+    applyCalls.push(input.step);
+    const applied: StepApplication = await input.apply(fakeTx() as never, run);
+
+    if (applied.deny) {
+      // A negativa é CONCLUSIVA: entra no ledger tipada, ANTES de a versão e o
+      // estado mudarem, e leva junto o ponto de retomada quando o destino é
+      // `failed_retryable`.
+      ledger.set(key, {
+        payload_hash: input.payload_hash,
+        result: applied.result,
+        outcome_kind: 'denied',
+        outcome_code: applied.deny.code,
+        outcome_message: applied.deny.message,
+      });
+      const retryPoint =
+        plan.onDeny === 'failed_retryable'
+          ? { failed_step: input.step, resume_state: run.state }
+          : { failed_step: null, resume_state: null };
+      const denied = {
+        ...run,
+        state: plan.onDeny,
+        version: run.version + 1,
+        current_step: input.step,
+        last_error_code: applied.deny.code,
+        ...retryPoint,
+      };
+      runs.set(run.id, denied as OnboardingRunRow);
+      return { outcome: 'denied', run: denied as OnboardingRunRow, code: applied.deny.code, message: applied.deny.message };
+    }
+
+    ledger.set(key, {
+      payload_hash: input.payload_hash,
+      result: applied.result,
+      outcome_kind: 'success',
+    });
+    const updated = {
+      ...run,
+      state: plan.to,
+      version: run.version + 1,
+      current_step: input.step,
+      tenant_id: applied.scope_patch?.tenant_id ?? run.tenant_id,
+      agent_id: applied.scope_patch?.agent_id ?? run.agent_id,
+      last_error_code: null,
+      failed_step: null,
+      resume_state: null,
+      ...(applied.completes ? { completed_at: new Date() } : {}),
+    };
+    runs.set(run.id, updated as OnboardingRunRow);
+    return { outcome: 'committed', run: updated as OnboardingRunRow, result: applied.result };
+  },
+
+  /**
+   * Espelha a ordem do repo real DEPOIS da correção do achado 3: LEDGER antes
+   * do estado terminal e antes da versão. Um retry pós-commit precisa achar a
+   * resposta anterior em vez de esbarrar no `cancelled` que ele mesmo produziu.
+   */
+  async cancel(input: {
+    run_id: string;
+    expected_version: number;
+    reason_code: string;
+    idempotency_key_hash: string;
+    payload_hash: string;
+  }) {
+    const run = runs.get(input.run_id);
+    if (!run) return { outcome: 'not_found' as const };
+
+    const key = ledgerKey(run.id, 'cancel_run', input.idempotency_key_hash);
+    const previous = ledger.get(key);
+    if (previous) {
+      if (previous.payload_hash !== input.payload_hash) {
+        return { outcome: 'payload_conflict' as const, run };
+      }
+      return { outcome: 'replayed' as const, run, result: previous.result };
+    }
+
+    if (['active', 'cancelled', 'failed_terminal'].includes(run.state)) {
+      return { outcome: 'invalid_transition' as const, run, code: 'run_terminal', message: 'terminal' };
+    }
+    if (run.version !== input.expected_version) return { outcome: 'version_conflict' as const, run };
+    const result = { cancelled_at: new Date().toISOString(), reason_code: input.reason_code };
+    ledger.set(key, {
+      payload_hash: input.payload_hash,
+      result,
+      outcome_kind: 'cancelled',
+      outcome_code: input.reason_code,
+    });
+    const cancelled = { ...run, state: 'cancelled', version: run.version + 1, cancelled_at: new Date(), last_error_code: input.reason_code };
+    runs.set(run.id, cancelled as OnboardingRunRow);
+    return { outcome: 'committed' as const, run: cancelled as OnboardingRunRow, result };
+  },
+
+  /**
+   * Espelha a criação idempotente do repo real (achado 2): o ledger de criação
+   * mora na PRÓPRIA run, chaveado por (kind, tenant, hash da chave).
+   */
+  async create(input: {
+    kind: string;
+    tenant_id: string | null;
+    idempotency_key_hash: string;
+    payload_hash: string;
+    created_by: string;
+    expires_at: Date;
+  }) {
+    const key = `${input.kind}:${input.tenant_id ?? ''}:${input.idempotency_key_hash}`;
+    const previous = createdByKey.get(key);
+    if (previous) {
+      const run = runs.get(previous)!;
+      return run.creation_payload_hash === input.payload_hash
+        ? { outcome: 'replayed' as const, run }
+        : { outcome: 'payload_conflict' as const, run };
+    }
+    // O índice parcial de "uma run viva sem agente por tenant" (migration 113).
+    const live = [...runs.values()].find(
+      (r) =>
+        r.tenant_id === input.tenant_id &&
+        r.agent_id === null &&
+        !['active', 'cancelled', 'failed_terminal'].includes(r.state),
+    );
+    if (live) return { outcome: 'live_run_exists' as const };
+
+    const id = `run-created-${createdByKey.size + 1}`;
+    const run = makeRun({
+      id,
+      tenant_id: input.tenant_id,
+      agent_id: null,
+      metadata: (input as { metadata?: Record<string, unknown> }).metadata ?? {},
+      state: 'created',
+      version: 1,
+      created_by: input.created_by,
+      expires_at: input.expires_at,
+      creation_idempotency_key_hash: input.idempotency_key_hash,
+      creation_payload_hash: input.payload_hash,
+    });
+    runs.set(id, run);
+    createdByKey.set(key, id);
+    return { outcome: 'created' as const, run };
+  },
+  async listForTenant() {
+    return [...runs.values()];
+  },
+  async listEvents() {
+    return [];
+  },
+  async expireStale() {
+    return 0;
+  },
+};
+
+vi.mock('@/db/repositories/onboarding-repos.js', () => ({ onboardingRunsRepo: fakeRepo }));
+
+// As escritas de provisionamento reais precisam de Postgres; aqui só nos
+// interessa a ORQUESTRAÇÃO. Cada `apply*` vira um stub que devolve a mesma
+// forma de `StepApplication`.
+vi.mock('@/onboarding/provisioning.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../../src/onboarding/provisioning.js')>();
+  const stub = (action: string, result: Record<string, unknown> = {}) =>
+    vi.fn(async () => ({ result, audit: { action, resource_type: 'x', resource_id: null } }));
+  return {
+    ...original,
+    applyProvisionTenant: vi.fn(async (_tx: unknown, _run: unknown, payload: { tenant_id: string }) => ({
+      result: { tenant_id: payload.tenant_id },
+      scope_patch: { tenant_id: payload.tenant_id },
+      audit: { action: 'onboarding_tenant_provisioned', resource_type: 'tenant', resource_id: payload.tenant_id },
+    })),
+    applyProvisionAdmin: stub('onboarding_admin_provisioned'),
+    applyProvisionAgent: vi.fn(async (_tx: unknown, _run: unknown, payload: { agent_id: string }) => ({
+      result: { agent_id: payload.agent_id },
+      scope_patch: { agent_id: payload.agent_id },
+      audit: { action: 'onboarding_agent_provisioned', resource_type: 'agent', resource_id: payload.agent_id },
+    })),
+    applyConfigureProfile: stub('onboarding_profile_activated'),
+    applyCapabilityPacks: stub('onboarding_packs_applied'),
+    applyConfigureRole: stub('onboarding_role_configured', { role_id: 'r1' }),
+    applyDeclareChannel: stub('onboarding_channel_declared', { channel_id: 'c1' }),
+    applyConfirmChannelReady: stub('onboarding_channel_confirmed'),
+    applyActivate: vi.fn(async () => ({
+      result: { activated: true },
+      completes: true,
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+    })),
+  };
+});
+
+// `audit()` grava em Postgres; aqui só precisamos saber que foi chamado.
+const auditSpy = vi.fn(async () => undefined);
+vi.mock('@/governance/audit.js', () => ({ audit: auditSpy, auditTx: vi.fn() }));
+
+const {
+  executeOnboardingStep,
+  cancelOnboardingRun,
+  getOnboardingRun,
+  startOnboardingRun,
+  deriveCommandId,
+} = await import('../../../src/onboarding/wizard.js');
+const { OnboardingError } = await import('../../../src/onboarding/errors.js');
+
+const OWNER = { actor_id: 'u1', actor_role: 'owner' as const, tenant_id: 'acme' };
+const FOUNDER = { actor_id: 'root', actor_role: 'founder' as const, tenant_id: null };
+
+/** Readiness sempre verde, injetado. */
+const readyReport = (over: Record<string, unknown> = {}) =>
+  ({
+    tenant_id: 'acme',
+    agent_id: 'acme-bot',
+    ready: true,
+    checks: [],
+    evaluated_at: new Date().toISOString(),
+    configuration_fingerprint: 'cfg',
+    schema_fingerprint: 'sch',
+    ...over,
+  }) as never;
+
+beforeEach(() => {
+  runs.clear();
+  ledger.clear();
+  createdByKey.clear();
+  applyCalls.length = 0;
+  txStatements.length = 0;
+  auditSpy.mockClear();
+});
+
+describe('RBAC e isolamento horizontal', () => {
+  beforeEach(() => runs.set('run-1', makeRun()));
+
+  it('operador de OUTRO tenant não descobre a run (not_found, não forbidden)', async () => {
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'provision_tenant',
+      payload: { tenant_id: 'acme', nome: 'Acme' },
+      idempotency_key: 'chave-suficiente-1',
+      expected_version: 1,
+      actor: { actor_id: 'u9', actor_role: 'owner', tenant_id: 'globex' },
+    });
+    expect(out).toEqual({ status: 'not_found' });
+    expect(applyCalls).toEqual([]);
+  });
+
+  it('papel sem permissão de mutação é recusado', async () => {
+    await expect(
+      executeOnboardingStep({
+        run_id: 'run-1',
+        step: 'provision_tenant',
+        payload: { tenant_id: 'acme', nome: 'Acme' },
+        idempotency_key: 'chave-suficiente-1',
+        expected_version: 1,
+        actor: { actor_id: 'u2', actor_role: 'viewer', tenant_id: 'acme' },
+      }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('leitura de outro tenant devolve null', async () => {
+    expect(
+      await getOnboardingRun({
+        run_id: 'run-1',
+        actor: { actor_id: 'u9', actor_role: 'owner', tenant_id: 'globex' },
+      }),
+    ).toBeNull();
+    expect(await getOnboardingRun({ run_id: 'run-1', actor: OWNER })).not.toBeNull();
+  });
+
+  it('founder global alcança a run', async () => {
+    expect(await getOnboardingRun({ run_id: 'run-1', actor: FOUNDER })).not.toBeNull();
+  });
+
+  it('sessão SEM tenant de um papel não-global é recusada — nunca vira "vê tudo"', async () => {
+    // O `null` de filtro é privilégio exclusivo do founder. Um owner com
+    // sessão sem tenant cairia em "sem filtro" se a derivação fosse ingênua.
+    await expect(
+      getOnboardingRun({
+        run_id: 'run-1',
+        actor: { actor_id: 'u3', actor_role: 'owner', tenant_id: null },
+      }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+  });
+});
+
+describe('retomada, idempotência e concorrência', () => {
+  beforeEach(() => runs.set('run-1', makeRun()));
+
+  const provision = (key: string, version: number, nome = 'Acme') =>
+    executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'provision_tenant',
+      payload: { tenant_id: 'acme', nome },
+      idempotency_key: key,
+      expected_version: version,
+      actor: OWNER,
+    });
+
+  it('o comando parte do estado PERSISTIDO — retomada após reinício', async () => {
+    // Simula o processo tendo morrido: a run está em `tenant_ready` no banco e
+    // o wizard nunca viu o passo anterior nesta "instância".
+    runs.set('run-1', makeRun({ state: 'tenant_ready', version: 2 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'provision_admin',
+      payload: { user_id: 'admin-1', email: 'a@acme.com' },
+      idempotency_key: 'chave-suficiente-2',
+      expected_version: 2,
+      actor: OWNER,
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('admin_ready');
+  });
+
+  it('retry com a MESMA chave devolve o resultado persistido SEM re-executar', async () => {
+    const first = await provision('chave-suficiente-1', 1);
+    expect(first).toMatchObject({ status: 'completed', replayed: false });
+    // O cliente não viu a resposta e repete com a versão ANTIGA.
+    const retry = await provision('chave-suficiente-1', 1);
+    expect(retry).toMatchObject({ status: 'completed', replayed: true });
+    expect(applyCalls).toEqual(['provision_tenant']); // rodou UMA vez
+  });
+
+  it('mesma chave com payload DIVERGENTE é conflito', async () => {
+    await provision('chave-suficiente-1', 1);
+    const out = await provision('chave-suficiente-1', 1, 'Outro Nome');
+    expect(out).toMatchObject({ status: 'conflict', code: 'idempotency_payload_mismatch' });
+  });
+
+  it('double-click com DUAS chaves não duplica o provisionamento', async () => {
+    await provision('chave-suficiente-1', 1);
+    const second = await provision('chave-suficiente-9', 1);
+    // O ledger não cobre a chave nova; quem barra é a máquina de estados.
+    expect(second.status).toBe('conflict');
+    expect(applyCalls).toEqual(['provision_tenant']);
+  });
+
+  it('dois operadores na mesma versão: um avança, o outro vê version_conflict', async () => {
+    runs.set('run-1', makeRun({ state: 'tenant_ready', version: 2 }));
+    const a = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'provision_admin',
+      payload: { user_id: 'admin-1', email: 'a@acme.com' },
+      idempotency_key: 'chave-operador-a',
+      expected_version: 2,
+      actor: OWNER,
+    });
+    const b = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'provision_admin',
+      payload: { user_id: 'admin-2', email: 'b@acme.com' },
+      idempotency_key: 'chave-operador-b',
+      expected_version: 2,
+      actor: { ...OWNER, actor_id: 'u2' },
+    });
+    expect(a.status).toBe('completed');
+    expect(b).toMatchObject({ status: 'conflict', code: 'version_conflict' });
+  });
+
+  it('run expirada não avança', async () => {
+    runs.set('run-1', makeRun({ expires_at: new Date(Date.now() - 1000) }));
+    const out = await provision('chave-suficiente-1', 1);
+    expect(out).toMatchObject({ status: 'conflict', code: 'run_expired' });
+  });
+
+  it('chave de idempotência ausente/curta é recusada antes de qualquer escrita', async () => {
+    await expect(provision('curta', 1)).rejects.toBeInstanceOf(OnboardingError);
+    expect(applyCalls).toEqual([]);
+  });
+
+  it('payload fora do contrato é recusado antes de qualquer escrita', async () => {
+    await expect(
+      executeOnboardingStep({
+        run_id: 'run-1',
+        step: 'provision_tenant',
+        payload: { tenant_id: 'acme' }, // falta `nome`
+        idempotency_key: 'chave-suficiente-1',
+        expected_version: 1,
+        actor: OWNER,
+      }),
+    ).rejects.toBeInstanceOf(OnboardingError);
+    expect(applyCalls).toEqual([]);
+  });
+});
+
+describe('readiness e ativação — fail-closed', () => {
+  it('readiness reprovado leva a `readiness_failed` e NÃO ativa', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-readiness-1',
+      expected_version: 5,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () =>
+          readyReport({
+            ready: false,
+            checks: [
+              {
+                code: 'profile_active',
+                status: 'fail',
+                severity: 'blocking',
+                message: 'sem profile',
+                remediation: 'aprove',
+              },
+            ],
+          }),
+      },
+    });
+    expect(out).toMatchObject({ status: 'denied', code: 'readiness_blocked' });
+    expect(runs.get('run-1')!.state).toBe('readiness_failed');
+  });
+
+  it('readiness aprovado leva a `ready_for_activation`', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-readiness-2',
+      expected_version: 5,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('ready_for_activation');
+  });
+
+  it('a ativação REAVALIA readiness: verde há cinco minutos não ativa agora', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-1',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport({ ready: false }) },
+    });
+    expect(out).toMatchObject({ status: 'denied', code: 'readiness_blocked' });
+    expect(runs.get('run-1')!.state).toBe('readiness_failed');
+  });
+
+  it('o par CONFIRMADO precisa bater com o escopo da run', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'agente-errado' },
+      idempotency_key: 'chave-ativacao-2',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(out).toMatchObject({ status: 'denied', code: 'scope_mismatch' });
+  });
+
+  it('ativação bem-sucedida conclui a run e audita a decisão no escopo do agente', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-3',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('active');
+    expect(auditSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'agent_activation_approved',
+        // `alvo_id` é coluna `uuid` em `audit_log` e `agents.id` é TEXT: mandar
+        // o id do agente ali é 22P02, e `audit()` engole a exceção — a linha
+        // sumia em silêncio. Esta asserção ANTES afirmava `alvo_id: 'acme-bot'`,
+        // ou seja, o teste falso PINAVA o defeito. O agente segue atribuível
+        // pela coluna `agent_id` (TEXT, via ALS) e por `metadata`.
+        alvo_id: null,
+        metadata: expect.objectContaining({ agent_id: 'acme-bot', tenant_id: 'acme' }),
+      }),
+    );
+  });
+
+  it('nenhum campo uuid da trilha do agente recebe um id textual', async () => {
+    // Asserção tipada pelo SCHEMA, não por literal: lê de `migrations/*.sql`
+    // quais colunas de `audit_log` são `uuid` e exige `null` ou uuid canônico
+    // em cada campo correspondente do payload. É o que faltava — um `vi.fn()`
+    // aceita qualquer string, e por isso a lacuna sobreviveu à suíte inteira.
+    const { UUID_RE, uuidColumnsOf } = await import('./_migration-schema.js');
+    const PAYLOAD_TO_COLUMN: Record<string, string> = {
+      pessoa_id: 'pessoa_id',
+      alvo_id: 'alvo_id',
+      conversa_id: 'conversa_id',
+      mensagem_id: 'mensagem_id',
+      occurrence_id: 'occurrence_id',
+    };
+    const uuidCols = uuidColumnsOf('audit_log');
+    expect(uuidCols.has('alvo_id'), 'guarda do parser: alvo_id deveria ser uuid').toBe(true);
+
+    for (const [step, from, version] of [
+      ['evaluate_readiness', 'channel_ready', 5],
+      ['activate', 'ready_for_activation', 6],
+    ] as const) {
+      auditSpy.mockClear();
+      runs.set('run-1', makeRun({ state: from, version }));
+      await executeOnboardingStep({
+        run_id: 'run-1',
+        step,
+        payload:
+          step === 'activate'
+            ? { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' }
+            : {},
+        idempotency_key: `chave-uuid-${step}`,
+        expected_version: version,
+        actor: OWNER,
+        deps: { evaluateReadiness: async () => readyReport() },
+      });
+
+      expect(auditSpy, `o passo ${step} não emitiu audit()`).toHaveBeenCalledTimes(1);
+      const payload = auditSpy.mock.calls[0]![0] as unknown as Record<string, unknown>;
+      for (const [field, column] of Object.entries(PAYLOAD_TO_COLUMN)) {
+        if (!uuidCols.has(column)) continue;
+        const value = payload[field];
+        if (value === undefined || value === null) continue;
+        expect(
+          String(value),
+          `audit_log.${column} é coluna uuid, mas o passo ${step} mandou ` +
+            `${JSON.stringify(value)} — 22P02, engolido por audit(), trilha perdida.`,
+        ).toMatch(UUID_RE);
+      }
+    }
+  });
+
+  it('uma segunda ativação concorrente não produz uma segunda transição conclusiva', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const payload = { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' };
+    const deps = { evaluateReadiness: async () => readyReport() };
+    const first = await executeOnboardingStep({
+      run_id: 'run-1', step: 'activate', payload, idempotency_key: 'chave-ativacao-a',
+      expected_version: 6, actor: OWNER, deps,
+    });
+    const second = await executeOnboardingStep({
+      run_id: 'run-1', step: 'activate', payload, idempotency_key: 'chave-ativacao-b',
+      expected_version: 6, actor: OWNER, deps,
+    });
+    expect(first.status).toBe('completed');
+    expect(second.status).toBe('conflict');
+  });
+
+  /**
+   * A review do PR #541: o avaliador default lia pelo `db` GLOBAL, fora do
+   * `tx`. Só a row de `onboarding_runs` estava travada, então profile, grant,
+   * papel, política ou canal podiam mudar entre o retrato e o `applyActivate`.
+   *
+   * Os dois testes abaixo travam as duas metades da correção: a decisão recebe
+   * o `tx` do passo, e o retrato é TRAVADO antes de ser lido.
+   */
+  it('a ativação avalia readiness PELO `tx` do passo, não pelo `db` global', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const seen: Array<{ tx: unknown } | undefined> = [];
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-tx',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async (_scope, ctx) => {
+          seen.push(ctx);
+          return readyReport();
+        },
+      },
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.tx, 'o avaliador recebeu `undefined` — a leitura saiu da transação').toBeDefined();
+  });
+
+  /**
+   * Re-review do PR #541, achado 1 — o passo final é o dono do INÍCIO DA
+   * SESSÃO, não só do `active = true`. O pareamento do onboarding parou de
+   * subir a sessão; se ninguém a subisse aqui, a run terminaria com a linha
+   * ativa no banco e MUDA.
+   */
+  it('a ativação sobe a sessão de linha EXATAMENTE dos canais que ela ligou — depois do commit', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const { applyActivate } = await import('@/onboarding/provisioning.js');
+    (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      result: { activated_channel_ids: ['ch-ok'], deactivated_channel_ids: ['ch-bad'] },
+      completes: true,
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+    });
+    const started: Array<{ scope: unknown; ids: readonly string[] }> = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-sessao',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () => readyReport(),
+        startLineSessions: async (scope, ids) => {
+          started.push({ scope, ids });
+        },
+      },
+    });
+    expect(out.status).toBe('completed');
+    expect(started).toHaveLength(1);
+    // Nem "os canais do agente", nem os DESATIVADOS: só o conjunto ligado.
+    expect(started[0]!.ids).toEqual(['ch-ok']);
+    expect(started[0]!.scope).toEqual({ tenant_id: 'acme', agent_id: 'acme-bot' });
+  });
+
+  it('falha ao subir a sessão NÃO desfaz a run concluída (fail-isolated)', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const { applyActivate } = await import('@/onboarding/provisioning.js');
+    (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      result: { activated_channel_ids: ['ch-ok'] },
+      completes: true,
+      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+    });
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-sessao-falha',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () => readyReport(),
+        startLineSessions: async () => {
+          throw new Error('socket recusado');
+        },
+      },
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('active');
+  });
+
+  it('a ativação TRAVA o retrato antes de decidir — e o lock cobre cada fato do veredito', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    let statementsAtDecision: string[] = [];
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-lock',
+      expected_version: 6,
+      actor: OWNER,
+      deps: {
+        // Capturado NO MOMENTO da decisão: os locks têm de já estar tomados
+        // quando o avaliador roda, não depois.
+        evaluateReadiness: async () => {
+          statementsAtDecision = [...txStatements];
+          return readyReport();
+        },
+      },
+    });
+
+    const locked = statementsAtDecision.join(' ');
+    for (const table of [
+      'tenants',
+      'agents',
+      'agent_operational_profile_versions',
+      'agent_tool_grants',
+      'roles',
+      'channels',
+      'channel_policies',
+      'channel_line_state',
+      'agent_drift_alerts',
+    ]) {
+      expect(locked, `nenhum lock sobre ${table} antes da decisão`).toContain(table);
+    }
+    // O que a ativação ESCREVE é travado em modo exclusivo (evita o upgrade
+    // tardio de share→exclusive, fonte clássica de deadlock).
+    expect(locked).toMatch(/FROM agents[\s\S]*FOR UPDATE|FOR UPDATE[\s\S]*agents/);
+  });
+
+  it('`evaluate_readiness` NÃO trava a configuração — é só observação', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-readiness-sem-lock',
+      expected_version: 5,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(txStatements.join(' ')).not.toContain('FOR SHARE');
+  });
+
+  it('a denegação de ativação também vai para a trilha do agente', async () => {
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'activate',
+      payload: { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' },
+      idempotency_key: 'chave-ativacao-4',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport({ ready: false }) },
+    });
+    expect(auditSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ acao: 'agent_activation_denied' }),
+    );
+  });
+});
+
+/**
+ * O pareamento é o passo que a review do PR #541 chama de violação direta de
+ * "backend decide, caller propõe": o comando era enfileirado ANTES de
+ * `commitStep` travar a run e conferir expiração, ledger, `expected_version` e
+ * transição. Um pedido velho, terminal ou inválido — ou a MESMA ação sob outra
+ * chave — produzia efeito de runtime mesmo quando o commit devolvia conflito.
+ *
+ * O contrato agora: o enfileiramento acontece DENTRO do `apply`, no `tx` do
+ * passo. A fila de #518 (`channel_line_state`, migration 103) é o outbox
+ * durável Admin→runtime e vive no mesmo banco, então ela entra no mesmo commit
+ * do ledger, do evento, da auditoria e do novo estado.
+ */
+describe('pareamento (#518) — nenhum efeito antes da decisão', () => {
+  const CH = '11111111-1111-4111-8111-111111111111';
+
+  const pairingPort = (calls: unknown[], result = { ok: true }) =>
+    async (i: unknown) => {
+      calls.push(i);
+      return result as { ok: boolean; reason?: string };
+    };
+
+  it('usa um `command_id` DERIVADO e enfileira DENTRO do `tx` do passo', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const calls: Array<{ command_id: string; tx: unknown }> = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-1',
+      expected_version: 7,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('completed');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.command_id).toMatch(/^[0-9a-f-]{36}$/);
+    // O `tx` do passo chega à porta: o comando NÃO é enfileirado por fora.
+    expect(calls[0]!.tx).toBeDefined();
+    expect(runs.get('run-1')!.state).toBe('pairing_pending');
+  });
+
+  it('a MESMA chave replaya do ledger sem enfileirar de novo', async () => {
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const calls: unknown[] = [];
+    const deps = { requestPairing: pairingPort(calls) as never };
+    const call = () =>
+      executeOnboardingStep({
+        run_id: 'run-1',
+        step: 'start_pairing',
+        payload: { channel_id: CH, method: 'qr' },
+        idempotency_key: 'chave-pareamento-1',
+        expected_version: runs.get('run-1')!.version,
+        actor: OWNER,
+        deps,
+      });
+    await call();
+    const retry = await call();
+    expect(retry).toMatchObject({ status: 'completed', replayed: true });
+    // ANTES: a porta era chamada nas DUAS vezes (o efeito precedia o ledger).
+    // Agora o ledger responde e nada é re-enfileirado.
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['run EXPIRADA', () => makeRun({ state: 'channel_declared', version: 7, expires_at: new Date(Date.now() - 1000) }), 7],
+    ['run TERMINAL', () => makeRun({ state: 'cancelled', version: 7 }), 7],
+    ['estado de origem ILEGAL', () => makeRun({ state: 'created', version: 1 }), 1],
+    ['versão DIVERGENTE', () => makeRun({ state: 'channel_declared', version: 9 }), 7],
+  ])('%s: o comando NÃO é enfileirado — o commit decide primeiro', async (_label, mk, version) => {
+    runs.set('run-1', mk());
+    const calls: unknown[] = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-x',
+      expected_version: version,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('conflict');
+    // ESTE é o defeito que a review descreve: antes a porta já tinha sido
+    // chamada quando o commit devolvia o conflito.
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a MESMA ação sob chave DIFERENTE não enfileira um segundo comando', async () => {
+    // `command_id` só protege o retry da MESMA chave. Quem impede o efeito
+    // duplicado com chave nova é a máquina de estados — e ela só é consultada
+    // dentro da transação, para onde o enfileiramento se mudou.
+    runs.set('run-1', makeRun({ state: 'ready_for_activation', version: 6 }));
+    const calls: unknown[] = [];
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-nova',
+      expected_version: 6,
+      actor: OWNER,
+      deps: { requestPairing: pairingPort(calls) as never },
+    });
+    expect(out.status).toBe('conflict');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('recusa do runtime vira NEGATIVA de governança, com evento e trilha', async () => {
+    // CONTRATO ALTERADO. Antes a recusa era devolvida do lado de fora da
+    // transação e a run NÃO se movia — logo a decisão não deixava evento nem
+    // linha de auditoria. Agora ela é um `deny` do passo: a run vai para
+    // `failed_retryable` (de onde `start_pairing` é legal de novo) e a negativa
+    // é registrada como qualquer outra decisão do backend.
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: CH, method: 'qr' },
+      idempotency_key: 'chave-pareamento-2',
+      expected_version: 7,
+      actor: OWNER,
+      deps: { requestPairing: async () => ({ ok: false, reason: 'pairing_in_progress' }) },
+    });
+    expect(out).toMatchObject({ status: 'denied', code: 'pairing_in_progress' });
+    expect(runs.get('run-1')!.state).toBe('failed_retryable');
+    expect(runs.get('run-1')!.last_error_code).toBe('pairing_in_progress');
+  });
+
+  it('deriveCommandId é estável e sensível a cada componente', () => {
+    const a = deriveCommandId('run-1', 'start_pairing', 'hash-a');
+    expect(deriveCommandId('run-1', 'start_pairing', 'hash-a')).toBe(a);
+    expect(deriveCommandId('run-2', 'start_pairing', 'hash-a')).not.toBe(a);
+    expect(deriveCommandId('run-1', 'start_pairing', 'hash-b')).not.toBe(a);
+  });
+});
+
+/**
+ * [Medium] da review: `reason_code` é texto ARBITRÁRIO do console e este módulo
+ * emitia por `@/lib/metrics` DIRETO — sem allowlist de chave, sem guarda de
+ * PII, sem budget de cardinalidade e sem atribuição tenant/agente. Texto
+ * operacional (ou um telefone) virava label, e a série era ilimitada.
+ *
+ * Estes testes olham o REGISTRO renderizado, não o código: é a única forma de
+ * provar o que efetivamente virou série.
+ */
+describe('métricas — o texto do chamador nunca vira label', () => {
+  const cancelWith = async (reason_code: string, key = 'chave-de-cancelamento-1') => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    const out = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: reason_code as never,
+      idempotency_key: key,
+    });
+    expect(out.status).toBe('completed');
+  };
+
+  /**
+   * TESTE INVERTIDO (review adversarial do PR #541, achado 5).
+   *
+   * A versão anterior deste caso aceitava
+   * `'cliente +5511987654321 desistiu do onboarding'` como motivo válido e
+   * provava apenas que ele NÃO virava label — e depois AFIRMAVA, como
+   * comportamento correto, que o telefone ficava inteiro em
+   * `onboarding_runs.last_error_code` ("o motivo ORIGINAL continua inteiro onde
+   * ele pertence"). Isto é, o teste cristalizava a persistência de PII em três
+   * lugares (estado da run, evento append-only e `admin_audit_log`), num
+   * módulo cujas tabelas prometem por escrito "sem telefone, sem e-mail, sem
+   * segredo".
+   *
+   * Invertido: o motivo livre passa a ser RECUSADO na entrada, antes de existir
+   * qualquer escrita. O que não é persistido não precisa ser redigido depois.
+   */
+  it('um `reason_code` livre com PII é RECUSADO na entrada — não persistido e não redigido', async () => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    await expect(
+      cancelOnboardingRun({
+        run_id: 'run-1',
+        expected_version: 4,
+        actor: OWNER,
+        reason_code: 'cliente +5511987654321 desistiu do onboarding' as never,
+        idempotency_key: 'chave-de-cancelamento-pii',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_scope' });
+
+    // Nada aconteceu: a run continua viva e o motivo não chegou ao estado.
+    expect(runs.get('run-1')!.state).toBe('policy_ready');
+    expect(runs.get('run-1')!.last_error_code).toBeNull();
+  });
+
+  it('cem motivos livres distintos produzem ZERO séries — todos recusados', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    for (let i = 0; i < 100; i += 1) {
+      runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+      await expect(
+        cancelOnboardingRun({
+          run_id: 'run-1',
+          expected_version: 4,
+          actor: OWNER,
+          reason_code: `motivo-do-operador-${i}` as never,
+          idempotency_key: `chave-livre-${i}`,
+        }),
+      ).rejects.toBeInstanceOf(OnboardingError);
+    }
+
+    const lines = (await renderPrometheus())
+      .split('\n')
+      .filter((l) => l.startsWith('maia_onboarding_run_cancelled_total{'));
+    expect(lines).toHaveLength(0);
+  });
+
+  it('o motivo do vocabulário passa — e o valor PERSISTIDO é o mesmo do label', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    await cancelWith('operator_abort');
+    expect(await renderPrometheus()).toMatch(
+      /maia_onboarding_run_cancelled_total\{[^}]*reason="operator_abort"/,
+    );
+    // A propriedade que faltava: trilha e série dizem a MESMA coisa.
+    expect(runs.get('run-1')!.last_error_code).toBe('operator_abort');
+  });
+
+  it('o passo e o código de check saem com as chaves declaradas', async () => {
+    const { renderPrometheus, _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+
+    runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 }));
+    await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-metricas-1',
+      expected_version: 5,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () =>
+          readyReport({
+            ready: false,
+            checks: [
+              {
+                code: 'profile_active',
+                status: 'fail',
+                severity: 'blocking',
+                message: 'sem profile',
+                remediation: 'aprove',
+              },
+            ],
+          }),
+      },
+    });
+
+    const scrape = await renderPrometheus();
+    expect(scrape).toMatch(
+      /maia_onboarding_step_failed_total\{[^}]*reason="readiness_blocked"[^}]*step="evaluate_readiness"/,
+    );
+    expect(scrape).toMatch(
+      /maia_agent_readiness_failed_total\{[^}]*check_code="profile_active"/,
+    );
+    // A chave antiga `error_code` não é emitida — ela nem está no allowlist.
+    expect(scrape).not.toContain('error_code=');
+  });
+});
+
+describe('cancelamento', () => {
+  it('cancela uma run viva e preserva o motivo', async () => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    const out = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: 'operator_abort',
+      idempotency_key: 'chave-cancelamento-ok',
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('cancelled');
+    expect(runs.get('run-1')!.last_error_code).toBe('operator_abort');
+  });
+
+  /**
+   * [Medium] da review, achado 3: `cancelOnboardingRun` sequer aceitava chave,
+   * então o retry pós-commit (a resposta se perdeu na rede) encontrava a run já
+   * `cancelled` e virava `run_terminal` — um ERRO para uma operação que tinha
+   * dado certo.
+   */
+  it('o retry da MESMA chave replaya o cancelamento em vez de virar `run_terminal`', async () => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    const first = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: 'operator_abort',
+      idempotency_key: 'chave-cancelamento-retry',
+    });
+    expect(first).toMatchObject({ status: 'completed', replayed: false });
+
+    // O cliente nunca viu a resposta: repete com a MESMA chave e a MESMA versão.
+    const retry = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: 'operator_abort',
+      idempotency_key: 'chave-cancelamento-retry',
+    });
+    expect(retry).toMatchObject({ status: 'completed', replayed: true });
+    expect(runs.get('run-1')!.version).toBe(5); // uma única transição
+  });
+
+  it('a MESMA chave com motivo diferente é conflito de payload, não um segundo cancelamento', async () => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: 'operator_abort',
+      idempotency_key: 'chave-cancelamento-reciclada',
+    });
+    const out = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: OWNER,
+      reason_code: 'expired',
+      idempotency_key: 'chave-cancelamento-reciclada',
+    });
+    expect(out).toMatchObject({ status: 'conflict', code: 'idempotency_payload_mismatch' });
+    expect(runs.get('run-1')!.last_error_code).toBe('operator_abort');
+  });
+
+  it('run cancelada não é retomada implicitamente', async () => {
+    runs.set('run-1', makeRun({ state: 'cancelled', version: 5 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: 'chave-suficiente-3',
+      expected_version: 5,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(out).toMatchObject({ status: 'conflict', code: 'run_terminal' });
+  });
+
+  it('operador de outro tenant não cancela a run alheia', async () => {
+    runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+    const out = await cancelOnboardingRun({
+      run_id: 'run-1',
+      expected_version: 4,
+      actor: { actor_id: 'u9', actor_role: 'owner', tenant_id: 'globex' },
+      reason_code: 'operator_abort',
+      idempotency_key: 'chave-cancelamento-alheia',
+    });
+    expect(out).toEqual({ status: 'not_found' });
+    expect(runs.get('run-1')!.state).toBe('policy_ready');
+  });
+});
+
+/**
+ * [High] da review, achado 2: `startOnboardingRun` não aceitava idempotency key
+ * nem procurava resultado anterior — cada retry (ou duplo-clique) inseria OUTRA
+ * run e OUTRA trilha, violando "cada comando mutável é idempotente" e "retry
+ * após timeout devolve o resultado anterior" no comando que ABRE a saga.
+ */
+describe('criação da run — idempotente por chave', () => {
+  const START = {
+    kind: 'tenant_onboarding' as const,
+    tenant_id: 'acme',
+    actor: OWNER,
+    metadata: { source: 'console' as const },
+  };
+
+  it('o retry da MESMA chave devolve a MESMA run, sem abrir uma segunda', async () => {
+    const first = await startOnboardingRun({ ...START, idempotency_key: 'chave-criacao-1' });
+    expect(first).toMatchObject({ status: 'started', replayed: false });
+
+    const retry = await startOnboardingRun({ ...START, idempotency_key: 'chave-criacao-1' });
+    expect(retry).toMatchObject({ status: 'started', replayed: true });
+
+    const firstRun = (first as { run: { id: string } }).run;
+    const retryRun = (retry as { run: { id: string } }).run;
+    expect(retryRun.id).toBe(firstRun.id);
+    expect(runs.size).toBe(1);
+  });
+
+  it('a MESMA chave com outra intenção é conflito de payload', async () => {
+    await startOnboardingRun({ ...START, idempotency_key: 'chave-criacao-2' });
+    const out = await startOnboardingRun({
+      ...START,
+      idempotency_key: 'chave-criacao-2',
+      metadata: { source: 'cli' as const },
+    });
+    expect(out).toMatchObject({ status: 'conflict', code: 'idempotency_payload_mismatch' });
+    expect(runs.size).toBe(1);
+  });
+
+  it('uma chave DIFERENTE não abre uma segunda run viva para o mesmo tenant', async () => {
+    // Este é o buraco do índice: `onboarding_runs_one_live_per_agent_uq` tem
+    // predicado `agent_id IS NOT NULL` e a run recém-criada ainda não tem
+    // agente, então duas runs `tenant_onboarding` em `created` coexistiam para
+    // o mesmo tenant — e provisionavam árvores de governança diferentes.
+    await startOnboardingRun({ ...START, idempotency_key: 'chave-criacao-3' });
+    const out = await startOnboardingRun({ ...START, idempotency_key: 'chave-criacao-OUTRA' });
+    expect(out).toMatchObject({ status: 'conflict', code: 'duplicate_tenant' });
+    expect(runs.size).toBe(1);
+  });
+
+  it('sem idempotency key o comando é RECUSADO', async () => {
+    await expect(
+      startOnboardingRun({ ...START, idempotency_key: '' }),
+    ).rejects.toMatchObject({ code: 'missing_idempotency_key' });
+    expect(runs.size).toBe(0);
+  });
+
+  /**
+   * [Medium] da review, achado 5: `metadata` aceitava `Record<string, unknown>`
+   * ARBITRÁRIO, então `{ note: '…telefone…' }` atravessava a denylist inteira —
+   * ela decide pelo NOME da chave, e `note` é um nome inofensivo.
+   */
+  it('metadata fora do contrato tipado é RECUSADO — nenhuma run é aberta', async () => {
+    await expect(
+      startOnboardingRun({
+        ...START,
+        idempotency_key: 'chave-criacao-4',
+        metadata: { source: 'console', note: 'token/telefone +5511987654321/e-mail j@a.com' } as never,
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_scope' });
+    expect(runs.size).toBe(0);
+  });
+
+  it('só os campos APROVADOS são projetados para persistência', async () => {
+    const out = await startOnboardingRun({
+      ...START,
+      idempotency_key: 'chave-criacao-5',
+      metadata: { source: 'cli', intent: 'reonboarding', ticket_ref: 'OPS-4211' },
+    });
+    expect(out.status).toBe('started');
+    const stored = [...runs.values()][0]!;
+    expect(stored.metadata).toEqual({
+      source: 'cli',
+      intent: 'reonboarding',
+      ticket_ref: 'OPS-4211',
+    });
+  });
+});
+
+/**
+ * [Medium] da review, achado 3: a branch `applied.deny` avançava versão/estado e
+ * auditava, mas SÓ SUCESSOS entravam em `onboarding_step_results`. Se a resposta
+ * se perdesse, repetir a mesma chave e a mesma versão devolvia `version_conflict`
+ * (a versão já era outra) em vez da negativa anterior — e a mesma chave com
+ * payload diferente deixava de produzir `idempotency_payload_mismatch`.
+ */
+describe('negativa de governança — replay tipado', () => {
+  const denyStep = async (key: string, expected_version = 5) =>
+    executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'evaluate_readiness',
+      payload: {},
+      idempotency_key: key,
+      expected_version,
+      actor: OWNER,
+      deps: {
+        evaluateReadiness: async () =>
+          readyReport({
+            ready: false,
+            checks: [
+              {
+                code: 'profile_active',
+                status: 'fail',
+                severity: 'blocking',
+                message: 'sem profile',
+                remediation: 'aprove',
+              },
+            ],
+          }),
+      },
+    });
+
+  beforeEach(() => runs.set('run-1', makeRun({ state: 'channel_ready', version: 5 })));
+
+  it('o retry da MESMA chave devolve a MESMA negativa, não `version_conflict`', async () => {
+    const first = await denyStep('chave-negativa-1');
+    expect(first).toMatchObject({ status: 'denied', code: 'readiness_blocked' });
+    expect(runs.get('run-1')!.state).toBe('readiness_failed');
+    expect(runs.get('run-1')!.version).toBe(6);
+
+    // O cliente nunca viu a resposta: repete com a MESMA chave e a versão ANTIGA.
+    const retry = await denyStep('chave-negativa-1');
+    expect(retry).toMatchObject({ status: 'denied', code: 'readiness_blocked' });
+    // E a negativa replayada NÃO reavaliou nada nem avançou a run de novo.
+    expect(runs.get('run-1')!.version).toBe(6);
+    expect(applyCalls.filter((s) => s === 'evaluate_readiness')).toHaveLength(1);
+  });
+
+  it('a MESMA chave com payload diferente continua sendo conflito de payload', async () => {
+    // Um passo cujo payload TEM campos: o de readiness é `{}` por contrato, e
+    // um payload vazio nunca diverge de si mesmo.
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 9 }));
+    const reject = { requestPairing: async () => ({ ok: false, reason: 'pairing_rejected' }) };
+
+    const first = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: '11111111-1111-4111-8111-111111111111', method: 'qr' },
+      idempotency_key: 'chave-negativa-2',
+      expected_version: 9,
+      actor: OWNER,
+      deps: reject,
+    });
+    expect(first).toMatchObject({ status: 'denied', code: 'pairing_rejected' });
+
+    // MESMA chave, OUTRA linha: a chave foi reciclada para outra intenção.
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: '99999999-9999-4999-8999-999999999999', method: 'qr' },
+      idempotency_key: 'chave-negativa-2',
+      expected_version: 9,
+      actor: OWNER,
+      deps: reject,
+    });
+    expect(out).toMatchObject({ status: 'conflict', code: 'idempotency_payload_mismatch' });
+  });
+});
+
+/**
+ * [Medium] da review, achado 4, provado ATRAVÉS do orquestrador (a máquina de
+ * estados sozinha está coberta em `state-machine.spec.ts`): depois de uma
+ * negativa em `start_pairing`, a run guarda o ponto de retomada e o backend
+ * passa a recusar os passos que rebobinariam a saga.
+ */
+describe('`failed_retryable` — a retomada é o passo que falhou', () => {
+  beforeEach(async () => {
+    runs.set('run-1', makeRun({ state: 'channel_declared', version: 7 }));
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: '11111111-1111-4111-8111-111111111111', method: 'qr' },
+      idempotency_key: 'chave-pareamento-recusado',
+      expected_version: 7,
+      actor: OWNER,
+      deps: { requestPairing: async () => ({ ok: false, reason: 'pairing_in_progress' }) },
+    });
+    expect(out).toMatchObject({ status: 'denied', code: 'pairing_in_progress' });
+  });
+
+  it('a run grava QUAL passo falhou e de onde ele partiu', () => {
+    const run = runs.get('run-1')!;
+    expect(run.state).toBe('failed_retryable');
+    expect(run.failed_step).toBe('start_pairing');
+    expect(run.resume_state).toBe('channel_declared');
+  });
+
+  it('a projeção da run oferece SÓ o retry — não `provision_tenant` nem `declare_channel`', async () => {
+    const view = await getOnboardingRun({ run_id: 'run-1', actor: OWNER });
+    expect(view!.allowed_steps).toEqual(['start_pairing']);
+  });
+
+  it.each(['provision_tenant', 'provision_admin', 'declare_channel', 'evaluate_readiness'] as const)(
+    "o backend RECUSA '%s' depois da negativa em `start_pairing`",
+    async (step) => {
+      const before = { ...runs.get('run-1')! };
+      const out = await executeOnboardingStep({
+        run_id: 'run-1',
+        step,
+        payload:
+          step === 'provision_tenant'
+            ? { tenant_id: 'acme', nome: 'Acme' }
+            : step === 'provision_admin'
+              ? { user_id: 'admin-1', email: 'a@acme.com' }
+              : step === 'declare_channel'
+                ? { channel_type: 'whatsapp', external_id: '+5511999990000' }
+                : {},
+        idempotency_key: `chave-rebobina-${step}`,
+        expected_version: before.version,
+        actor: OWNER,
+        deps: { evaluateReadiness: async () => readyReport() },
+      });
+      expect(out).toMatchObject({ status: 'conflict', code: 'invalid_transition' });
+      // Nada rodou: o passo recusado não chegou ao `apply`.
+      expect(applyCalls).not.toContain(step);
+      expect(runs.get('run-1')!.state).toBe('failed_retryable');
+    },
+  );
+
+  it('o retry do PRÓPRIO passo é aceito e limpa o ponto de retomada', async () => {
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step: 'start_pairing',
+      payload: { channel_id: '11111111-1111-4111-8111-111111111111', method: 'qr' },
+      idempotency_key: 'chave-pareamento-retry',
+      expected_version: runs.get('run-1')!.version,
+      actor: OWNER,
+      deps: { requestPairing: async () => ({ ok: true }) },
+    });
+    expect(out.status).toBe('completed');
+    expect(runs.get('run-1')!.state).toBe('pairing_pending');
+    expect(runs.get('run-1')!.failed_step).toBeNull();
+    expect(runs.get('run-1')!.resume_state).toBeNull();
+  });
+});

@@ -89,6 +89,54 @@ jobs:
       - name: AI docs governance
         run: npm run docs:ai:check
 
+      - name: Config contract drift (#515)
+        # `.env.example`, docs/configuration.md, the JSON Schema, the
+        # per-service manifest and the per-profile fixtures are GENERATED from
+        # src/config/contract.ts. This fails the build when the contract moved
+        # and the artifacts were not regenerated — the drift that made
+        # `.env.example` stop matching the schema in the first place.
+        run: npm run config:check:drift
+
+      - name: Config contract — .env.example is structurally valid
+        # Structural mode: placeholders are accepted (the example ships
+        # `sk-ant-...`), but every schema and cross-field rule still applies.
+        run: npm run config:check -- --profile development --env-file .env.example --allow-placeholders
+
+      - name: Config contract — per-profile fixtures satisfy every rule
+        # Proof the contract is SATISFIABLE. `--allow-fixtures` waives exactly
+        # one thing: that these values are the synthetic CI set. Every other
+        # rule (including the placeholder rejection) still applies.
+        run: |
+          for p in development staging production; do
+            npm run config:check -- --profile "$p" \
+              --env-file "src/config/generated/fixtures/$p.env" --allow-fixtures
+          done
+
+      - name: Config contract — a fixture is NOT a valid environment
+        # PR #522 review round 1 [P1]: `config init` used to write these files
+        # as `.env`, and the recommended check said they were fine. They must
+        # fail without the explicit opt-in above.
+        run: |
+          for p in staging production; do
+            if npm run --silent config:check -- --profile "$p" \
+                 --env-file "src/config/generated/fixtures/$p.env"; then
+              echo "::error::a fixture de $p passou na validação de um ambiente real"
+              exit 1
+            fi
+          done
+
+      - name: Config contract — `config init` fails until it is filled in
+        # The operational template must never be mistakable for a ready `.env`.
+        run: |
+          for p in staging production; do
+            npm run --silent config:init -- --profile "$p" --out ".ci-$p.env" --force
+            if npm run --silent config:check -- --profile "$p" --env-file ".ci-$p.env"; then
+              echo "::error::o template de $p passou sem ser preenchido"
+              exit 1
+            fi
+            rm -f ".ci-$p.env"
+          done
+
       - name: PR body governance
         if: github.event_name == 'pull_request'
         run: npm run pr:body:check
@@ -125,6 +173,34 @@ jobs:
       - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-audit:
+    # Fase 0 cap. 8 (auditoria P0) — SCA BLOQUEANTE nos DOIS lockfiles. O
+    # audit do root não enxerga o projeto do admin-ui (lockfile próprio), e um
+    # critical no Next ficou invisível exatamente por isso. `npm audit` lê o
+    # lockfile direto (sem npm ci), então o job é rápido e sem serviços.
+    # Gate em --audit-level=high: moderate/low exigem relatório + exceção com
+    # owner/expiry (processo do cap. 8), não passam silenciosamente a high.
+    name: npm audit (prod deps, both lockfiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'npm'
+      - name: Pin npm to 11.5.2
+        # Mesmo pin do job validate (ci.yml acima): o audit resolve advisories
+        # contra o lockfile gerado com npm 11.5.2.
+        run: npm install -g npm@11.5.2
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+      - name: Audit root lockfile (prod deps)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit admin-ui lockfile (prod deps)
+        working-directory: src/admin-ui
+        run: npm audit --omit=dev --audit-level=high
 
   integration:
     name: integration + e2e (node ${{ matrix.node }})

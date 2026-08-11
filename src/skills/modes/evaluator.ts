@@ -48,6 +48,7 @@ export async function evaluatorMode(ctx: ModeContext): Promise<Record<string, un
   }
 
   const res = await callLLM({
+    workload: 'skill',
     system,
     messages: [{ role: 'user', content: JSON.stringify(ctx.input) }],
     max_tokens,

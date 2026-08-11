@@ -8,6 +8,11 @@ dist/
 .env
 .env.local
 .env.*.local
+# Fase 0 cap. 6 — env files reais do compose de produção (nunca commitar).
+# Os exemplos versionados são .env.app.prod.example / .env.admin.prod.example.
+.env.app
+.env.admin
+.env.infra
 
 # WhatsApp / Baileys
 .baileys-auth/
@@ -62,3 +67,7 @@ p8.5-plan.md
 p8.5-spec.md
 
 src/admin-ui/next-env.d.ts
+
+# Artefato do redis-server quando ele é iniciado a partir da raiz do repo
+# (sandbox de teste). Nunca é código.
+dump.rdb

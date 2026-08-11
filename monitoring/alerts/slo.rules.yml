@@ -1,0 +1,670 @@
+# Prometheus recording + alerting rules — Maia SLOs (issue #514 §8/§9).
+#
+# Source of truth for the SLOs narrated in docs/runbooks/observability-slo.md.
+# The runbook explains what an operator DOES; this file is the committed,
+# loadable config. Keep the two in sync: if a threshold moves here, move it in
+# the runbook table too, and record the reason in an ADR — issue #514 is
+# explicit that "os valores podem ser ajustados somente após baseline e ADR
+# explícita, não silenciosamente para 'passar'".
+#
+# Metric sources:
+#   - turn / queue / trace : src/observability/taxonomy.ts (METRIC.*)
+#   - LLM                  : src/lib/llm/telemetry.ts (the gateway owns them
+#                            since #508 — the old src/observability/llm-metrics.ts
+#                            named here no longer exists)
+#   - runtime trace        : src/control-plane/runtime-trace/
+#   - pool / sessão / scheduler / OTLP (#535)
+#                          : src/observability/runtime-collectors.ts,
+#                            src/observability/otlp-exporter.ts
+#
+# Multi-replica note: `maia_queue_depth` and `maia_queue_oldest_job_age_ms` are
+# scrape-time gauges over the SHARED Redis queue, so every replica reports the
+# same value. Aggregate with `max`, never `sum` — summing multiplies the
+# backlog by the replica count. Counters (`*_total`) aggregate with `sum` as
+# usual and are restart-safe because every rule below uses `rate()`/`increase()`
+# rather than the raw counter value.
+#
+# Wiring: load via Prometheus `rule_files`, e.g.
+#
+#   rule_files:
+#     - /etc/prometheus/rules/slo.rules.yml   # this file
+#
+groups:
+  # ==========================================================================
+  # Recording rules — the SLIs. Defined once here so dashboards, alerts and
+  # error-budget math all read the SAME expression.
+  # ==========================================================================
+  - name: maia_sli
+    interval: 30s
+    rules:
+      # --- availability: turns reaching a durable terminal state -------------
+      #
+      # TERMINAL OUTCOMES ONLY (issue #514 review round 1 [P2]).
+      #
+      # `maia_turn_completed_total` is emitted once per ATTEMPT, with three
+      # outcomes: `completed`, `failed` and `retryable`. `retryable` is by
+      # definition NOT terminal — that same turn will be retried and will later
+      # emit `completed` or `failed`. Counting it in the denominator made one
+      # turn look like several: two retries followed by success showed up as
+      # 3 observations and a 33% success rate, so a healthy service with normal
+      # transient retries appeared to be burning error budget.
+      #
+      # Filtering to `completed|failed` yields EXACTLY ONE observation per
+      # turn, because the worker emits `failed` when the attempts are exhausted
+      # (`recordTurnOutcome` in `src/gateway/queue.ts`) — no turn can end
+      # without a terminal outcome.
+      #
+      # Retries are not lost information; they get their own SLI below.
+      - record: maia:turn_success_ratio:rate5m
+        expr: |
+          sum(rate(maia_turn_completed_total{outcome="completed"}[5m]))
+          /
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
+
+      - record: maia:turn_failure_ratio:rate5m
+        expr: |
+          sum(rate(maia_turn_completed_total{outcome="failed"}[5m]))
+          /
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
+
+      # Per-tenant view — the whole point of the tenant labels (AGENTS.md §4.1):
+      # one noisy tenant must be distinguishable from a platform-wide outage.
+      - record: maia:turn_failure_ratio:rate5m:by_tenant
+        expr: |
+          sum by (tenant_id, agent_id) (rate(maia_turn_completed_total{outcome="failed"}[5m]))
+          /
+          clamp_min(
+            sum by (tenant_id, agent_id) (
+              rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])
+            ),
+            1e-9
+          )
+
+      # Retries per terminal turn. A SEPARATE signal, deliberately: retries
+      # rising while the failure ratio stays flat means the platform is
+      # absorbing transient faults (worth investigating, not worth paging).
+      - record: maia:turn_retry_ratio:rate5m
+        expr: |
+          sum(rate(maia_turn_completed_total{outcome="retryable"}[5m]))
+          /
+          clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[5m])), 1e-9)
+
+      # --- latency: measured from the PERSISTED inbound timestamp -----------
+      #
+      # `outcome="completed"` only. A failed turn never sent a response, so
+      # including it would measure time-to-failure, and a `retryable` attempt
+      # is a PARTIAL attempt whose duration is not a user-visible latency at
+      # all — averaging those in makes the percentile meaningless in both
+      # directions.
+      - record: maia:turn_e2e_latency_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket{outcome="completed"}[5m]))
+          )
+
+      - record: maia:turn_e2e_latency_ms:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(maia_turn_e2e_latency_ms_bucket{outcome="completed"}[5m]))
+          )
+
+      # --- queue ------------------------------------------------------------
+      # `max`, not `sum` — see the multi-replica note in the header.
+      - record: maia:queue_oldest_job_age_ms:max
+        expr: max by (queue) (maia_queue_oldest_job_age_ms)
+
+      - record: maia:queue_depth:max
+        expr: max by (queue, state) (maia_queue_depth)
+
+      - record: maia:queue_wait_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, queue) (rate(maia_queue_wait_ms_bucket[5m]))
+          )
+
+      # --- LLM --------------------------------------------------------------
+      - record: maia:llm_error_ratio:rate5m
+        expr: |
+          sum(rate(maia_llm_calls_total{status="error"}[5m]))
+          /
+          clamp_min(sum(rate(maia_llm_calls_total{status=~"ok|error"}[5m])), 1e-9)
+
+      # --- runtime trace coverage (issue §4 "medir coverage de envelopes") ---
+      - record: maia:trace_envelope_coverage:rate5m
+        expr: |
+          sum(rate(maia_runtime_trace_coverage_total{result="written"}[5m]))
+          /
+          clamp_min(sum(rate(maia_runtime_trace_coverage_total{result=~"written|failed"}[5m])), 1e-9)
+
+  # ==========================================================================
+  # Correctness SLOs — target is ZERO. Any occurrence is an incident.
+  # ==========================================================================
+  - name: maia_slo_correctness
+    interval: 30s
+    rules:
+      - alert: MaiaMandatoryTraceEnvelopeFailed
+        # A REQUIRED envelope that could not be written means a side effect was
+        # aborted (fail-loud, by design) — or, worse, that the evidence trail
+        # has a hole. SLO: 100% of side effects carry an envelope.
+        expr: increase(maia_runtime_trace_coverage_total{result="failed",required="true"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          slo: correctness
+        annotations:
+          summary: "Envelope OBRIGATÓRIO de runtime trace falhou"
+          description: |
+            Um side effect de nível >= medium não conseguiu gravar envelope e
+            o turno foi abortado (fail-loud, invariante 12 do P10b).
+            Runbook: docs/runbooks/observability-slo.md §4.1
+            Ver também: docs/runbooks/p10b-runtime-trace.md
+
+      - alert: MaiaTraceEnvelopeWriteFailing
+        expr: increase(maia_runtime_trace_envelope_write_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          slo: correctness
+        annotations:
+          summary: "Escrita de envelope de trace falhando"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.1
+
+      - alert: MaiaAuditWriteFailing
+        expr: increase(maia_audit_write_failed_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          slo: correctness
+        annotations:
+          summary: "Falha de escrita no audit log — decisão sem trilha"
+          description: |
+            AGENTS.md §4.4: toda decisão com efeito colateral audita. Uma falha
+            aqui é perda de evidência de governança.
+            Runbook: docs/runbooks/observability-slo.md §4.2
+
+      - alert: MaiaTenantDefaultLiteralObserved
+        # AGENTS.md §4.8 — the `'default'` literal must never appear in a
+        # dynamic path. The counter existing at all means a path is misrouted.
+        expr: increase(maia_tenant_id_default_literal_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          slo: correctness
+        annotations:
+          summary: "Literal 'default' alcançado em path dinâmico (isolamento de tenant)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.3
+            Ver docs/architecture/concerns/tenant-isolation.md
+
+      - alert: MaiaMetricLabelPolicyViolated
+        # Privacy guard: the sanitizer dropped a forbidden/PII label. It did its
+        # job (nothing leaked), but a caller is trying to emit one.
+        expr: increase(maia_metric_label_rejected_total{reason="key_forbidden"}[30m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: correctness
+        annotations:
+          summary: "Instrumentação tentou emitir label proibida (PII/alta cardinalidade)"
+          description: |
+            O sanitizer bloqueou — nada vazou. Corrija o call site.
+            Runbook: docs/runbooks/observability-slo.md §5
+
+  # ==========================================================================
+  # Availability + latency SLOs
+  # ==========================================================================
+  - name: maia_slo_availability
+    interval: 30s
+    rules:
+      - alert: MaiaTurnFailureRateHigh
+        # SLO: 99.9% of eligible inbounds reach a durable terminal state.
+        expr: maia:turn_failure_ratio:rate5m > 0.001
+        for: 10m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Taxa de falha de turno acima do SLO (0,1%)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.4
+
+      - alert: MaiaTurnFailureRateCritical
+        expr: maia:turn_failure_ratio:rate5m > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "1% dos turnos falhando — orçamento de erro queimando rápido"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.4
+
+      - alert: MaiaTurnLatencyP95High
+        # SLO (sem debounce): p95 inbound → resposta <= 5s.
+        expr: maia:turn_e2e_latency_ms:p95 > 5000
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "p95 inbound→terminal acima de 5s"
+          description: |
+            Cruze com maia:queue_oldest_job_age_ms:max: fila alta ⇒ capacidade;
+            fila baixa ⇒ DB/LLM/tool. Se há debounce configurado, subtraia a
+            janela antes de concluir.
+            Runbook: docs/runbooks/observability-slo.md §4.5
+
+      - alert: MaiaTurnLatencyP99High
+        expr: maia:turn_e2e_latency_ms:p99 > 15000
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "p99 inbound→terminal acima de 15s"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.5
+
+  # ==========================================================================
+  # Queue SLOs — issue §8 "Filas"
+  # ==========================================================================
+  - name: maia_slo_queue
+    interval: 30s
+    rules:
+      - alert: MaiaQueueOldestJobAgeWarning
+        expr: maia:queue_oldest_job_age_ms:max > 10000
+        for: 5m
+        labels:
+          severity: warning
+          slo: queue
+        annotations:
+          summary: "Job mais antigo na fila {{ $labels.queue }} > 10s"
+          description: |
+            Operação normal é < 2s.
+            Runbook: docs/runbooks/observability-slo.md §4.6
+
+      - alert: MaiaQueueOldestJobAgeCritical
+        expr: maia:queue_oldest_job_age_ms:max > 30000
+        for: 5m
+        labels:
+          severity: critical
+          slo: queue
+        annotations:
+          summary: "Job mais antigo na fila {{ $labels.queue }} > 30s"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.6
+
+      - alert: MaiaQueueMetricsAbsent
+        # Issue #514 invariant: "métrica ausente não é interpretada como zero
+        # saudável". The gauge renders NaN when Redis is unreachable, and a
+        # scrape that stops entirely is caught by `absent()`.
+        expr: absent(maia_queue_depth) or (maia_queue_depth != maia_queue_depth)
+        for: 5m
+        labels:
+          severity: warning
+          slo: queue
+        annotations:
+          summary: "Métricas de fila ausentes/NaN — cegueira, não saúde"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.7
+
+      - alert: MaiaDlqGrowing
+        expr: increase(maia_audit_events_total{action="dlq_job_added"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: queue
+        annotations:
+          summary: "Jobs entrando na DLQ"
+          description: |
+            `npm run dlq` para inspecionar.
+            Runbook: docs/runbooks/observability-slo.md §4.8
+
+  # ==========================================================================
+  # Provider / dependency SLOs
+  # ==========================================================================
+  - name: maia_slo_dependencies
+    interval: 30s
+    rules:
+      - alert: MaiaLlmErrorRateHigh
+        expr: maia:llm_error_ratio:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "5% das chamadas LLM em erro"
+          description: |
+            Quebre por `reason` (rate_limit / overloaded / auth / timeout).
+            Runbook: docs/runbooks/observability-slo.md §4.9
+
+      # `maia_llm_requests_total` e NÃO `maia_llm_calls_total`: a série legada
+      # carrega apenas provider/model/status, nunca teve `reason`, e
+      # `status="error"` exclui rate limit — `statusForKind('rate_limit')`
+      # devolve `'rate_limit'`, que é valor de primeira classe. O seletor antigo
+      # (`{status="error",reason="rate_limit"}`) não casava NADA: este alerta
+      # nunca disparou desde que foi escrito. Ver `src/lib/llm/telemetry.ts`.
+      - alert: MaiaLlmRateLimited
+        expr: increase(maia_llm_requests_total{status="rate_limit"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Provider LLM aplicando rate limit"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.9
+
+      # --- disjuntor de LLM: postura + sombra (#534, revisão do owner) -------
+      #
+      # Três alertas com propósitos DIFERENTES. Não colapse em um só:
+      #
+      #  1. o disjuntor está recusando DE VERDADE (só em `enforce`);
+      #  2. alguém mexeu no kill switch;
+      #  3. o kill switch ficou ligado e ninguém lembrou.
+      #
+      # O `and on() maia_llm_circuit_mode{state="enforce"} == 1` do primeiro é
+      # o detalhe que evita acordar plantão à toa: `maia_llm_circuit_state`
+      # marca `open` também em `shadow`, onde nada está sendo recusado. Alertar
+      # em `state="open"` sem qualificar a postura é confundir medição com
+      # incidente.
+      - alert: MaiaLlmCircuitOpenEnforcing
+        expr: |
+          (maia_llm_circuit_state{state="open"} == 1)
+          and on() (maia_llm_circuit_mode{state="enforce"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM ABERTO e recusando ({{ $labels.provider }}/{{ $labels.workload }})"
+          description: |
+            Chamadas estão sendo recusadas com `circuit_open`. Confirme que é o
+            provider (e não o disjuntor) antes de usar o kill switch.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # `increase(...) > 0` de propósito: QUALQUER uso da alavanca precisa
+      # aparecer. `reason="rejected"` também dispara — alguém tentando virar a
+      # chave sem conseguir é tão digno de investigação quanto alguém virando.
+      - alert: MaiaLlmCircuitModeOverridden
+        expr: increase(maia_llm_circuit_mode_overrides_total{reason=~"applied|cleared|rejected"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Kill switch do disjuntor de LLM acionado ({{ $labels.reason }} → {{ $labels.state }})"
+          description: |
+            Ator e motivo estão no log `llm_gateway.circuit_mode_override` —
+            não em label, porque são texto livre.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      # O override expira sozinho (teto de 24h), então `off` por mais de uma
+      # hora é ou um incidente longo ou — o caso perigoso — alguém renovando a
+      # alavanca até ela virar configuração escondida. É assim que um controle
+      # de degradação morre sem ninguém perceber.
+      - alert: MaiaLlmCircuitDisabledTooLong
+        expr: maia_llm_circuit_mode{state="off"} == 1
+        for: 1h
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Disjuntor de LLM desligado há mais de 1h"
+          description: |
+            Volte para `shadow` ou `enforce`, ou registre a decisão de manter
+            desligado. Kill switch não é postura.
+            Runbook: docs/runbooks/operational.md §3.1
+
+      - alert: MaiaWhatsAppDisconnected
+        expr: maia_baileys_connected == 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "WhatsApp desconectado há 5 min"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.10
+
+      - alert: MaiaDbDisconnected
+        expr: maia_db_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "Postgres inalcançável"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.10
+
+  # ==========================================================================
+  # Issue #535 — as cinco famílias que faltavam (tool dispatch, carga de
+  # contexto, pool de banco, sessão WhatsApp, lag do scheduler) mais a saúde do
+  # próprio exporter OTLP.
+  #
+  # Regra de agregação: `maia_db_pool` e `maia_whatsapp_session_age_seconds`
+  # são estado POR PROCESSO (cada réplica tem o seu pool e o seu socket) —
+  # agregue por `instance`, nunca colapse réplicas num número só, ou uma
+  # réplica saturada some na média. O lag do scheduler lê o MESMO Postgres
+  # compartilhado, então toda réplica reporta o mesmo valor: agregue com `max`,
+  # como as gauges de fila.
+  # ==========================================================================
+  - name: maia_slo_resources
+    interval: 30s
+    rules:
+      # --- pool de banco ----------------------------------------------------
+      # Saturação = conexões em uso / teto. `waiting` subindo com esta razão
+      # perto de 1 é exaustão de pool; `waiting` subindo com a razão baixa é
+      # custo de ABERTURA de conexão, não falta de conexão — dois diagnósticos
+      # opostos que uma métrica só não separa.
+      - record: maia:db_pool_saturation:ratio
+        expr: |
+          max by (instance) (maia_db_pool{state="total"} - maia_db_pool{state="idle"})
+          /
+          clamp_min(max by (instance) (maia_db_pool{state="max"}), 1e-9)
+
+      - record: maia:db_pool_waiting:max
+        expr: max by (instance) (maia_db_pool{state="waiting"})
+
+      # --- tool dispatch ----------------------------------------------------
+      # `blocked` fica FORA do numerador de propósito: uma tool negada por
+      # governança é a plataforma funcionando, e contá-la como erro faria um
+      # grant mal configurado parecer indisponibilidade. Ela tem SLI próprio.
+      - record: maia:tool_error_ratio:rate5m
+        expr: |
+          sum(rate(maia_tool_dispatch_total{result="error"}[5m]))
+          /
+          clamp_min(sum(rate(maia_tool_dispatch_total[5m])), 1e-9)
+
+      - record: maia:tool_blocked_ratio:rate5m
+        expr: |
+          sum(rate(maia_tool_dispatch_total{result="blocked"}[5m]))
+          /
+          clamp_min(sum(rate(maia_tool_dispatch_total[5m])), 1e-9)
+
+      - record: maia:tool_duration_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, tool) (rate(maia_tool_duration_ms_bucket[5m]))
+          )
+
+      # --- carga de contexto do turno ---------------------------------------
+      - record: maia:context_load_ms:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, stage) (rate(maia_context_load_ms_bucket[5m]))
+          )
+
+      # --- scheduler --------------------------------------------------------
+      - record: maia:scheduler_lag_ms:max
+        expr: max by (queue) (maia_scheduler_lag_ms)
+
+      - record: maia:scheduler_backlog:max
+        expr: max by (queue) (maia_scheduler_backlog)
+
+      # --- exporter OTLP ----------------------------------------------------
+      # `not_sampled` está fora do numerador: não amostrar é a POLÍTICA
+      # configurada, não perda. Perda é fila cheia, transporte ou rejeição.
+      - record: maia:otlp_drop_ratio:rate5m
+        expr: |
+          sum(rate(maia_otlp_spans_dropped_total{reason!="not_sampled"}[5m]))
+          /
+          clamp_min(
+            sum(rate(maia_otlp_spans_exported_total[5m]))
+            + sum(rate(maia_otlp_spans_dropped_total{reason!="not_sampled"}[5m])),
+            1e-9
+          )
+
+      - alert: MaiaDbPoolSaturated
+        # Os dois juntos, de propósito: saturação alta SEM ninguém esperando é
+        # uma pool ocupada e suficiente, e alertar nisso treina o operador a
+        # ignorar o alerta.
+        expr: maia:db_pool_saturation:ratio > 0.9 and maia:db_pool_waiting:max > 0
+        for: 5m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Pool do Postgres saturado com conexões em espera"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.11
+
+      - alert: MaiaDbPoolMetricsAbsent
+        expr: absent(maia_db_pool) or (maia_db_pool != maia_db_pool)
+        for: 10m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Métricas do pool ausentes/NaN — cegueira, não saúde"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.11
+
+      - alert: MaiaSchedulerLagWarning
+        expr: maia:scheduler_lag_ms:max > 60000
+        for: 5m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Trabalho agendado > 60s atrasado na fila {{ $labels.queue }}"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaSchedulerLagCritical
+        expr: maia:scheduler_lag_ms:max > 300000
+        for: 5m
+        labels:
+          severity: critical
+          slo: resource
+        annotations:
+          summary: "Trabalho agendado > 5min atrasado na fila {{ $labels.queue }}"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaSchedulerMetricsAbsent
+        # O coletor devolve NaN quando NÃO conseguiu ler o Postgres — nunca 0.
+        # Sem este alerta um scheduler cego pareceria um scheduler ocioso.
+        expr: absent(maia_scheduler_lag_ms) or (maia_scheduler_lag_ms != maia_scheduler_lag_ms)
+        for: 10m
+        labels:
+          severity: warning
+          slo: resource
+        annotations:
+          summary: "Métricas do scheduler ausentes/NaN — cegueira, não saúde"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.12
+
+      - alert: MaiaWhatsAppSessionFlapping
+        # Idade que RESETA repetidamente = socket caindo e reconectando. A
+        # gauge binária não pega isso: pode estar `connected` em todo scrape.
+        expr: resets(maia_whatsapp_session_age_seconds[30m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Sessão WhatsApp reconectando repetidamente (>3 quedas em 30min)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.13
+
+      - alert: MaiaToolErrorRateHigh
+        expr: maia:tool_error_ratio:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "5% dos dispatches de tool em erro"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.14
+
+      - alert: MaiaOtlpExportFailing
+        # Alerta sobre a OBSERVABILIDADE, não sobre o produto: span perdido não
+        # afeta nenhum turno, por isso warning. Mas silenciar deixaria o
+        # waterfall com buracos que se leem como "não aconteceu".
+        expr: maia:otlp_drop_ratio:rate5m > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          slo: observability
+        annotations:
+          summary: "Exporter OTLP perdendo >10% dos spans"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §4.15
+
+  # ==========================================================================
+  # Error budget burn rate — multi-window, multi-burn (Google SRE workbook).
+  # Availability SLO 99.9% ⇒ error budget 0.1%.
+  # ==========================================================================
+  - name: maia_slo_burn_rate
+    interval: 1m
+    rules:
+      # Same terminal-outcome filter as the SLIs above — otherwise a burst of
+      # transient retries burns budget that was never actually spent.
+      - record: maia:turn_error_budget_burn:1h
+        expr: |
+          (
+            sum(rate(maia_turn_completed_total{outcome="failed"}[1h]))
+            /
+            clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[1h])), 1e-9)
+          ) / 0.001
+
+      - record: maia:turn_error_budget_burn:6h
+        expr: |
+          (
+            sum(rate(maia_turn_completed_total{outcome="failed"}[6h]))
+            /
+            clamp_min(sum(rate(maia_turn_completed_total{outcome=~"completed|failed"}[6h])), 1e-9)
+          ) / 0.001
+
+      - alert: MaiaErrorBudgetFastBurn
+        # 14.4x burn over 1h ⇒ the whole 30d budget gone in ~2 days.
+        expr: maia:turn_error_budget_burn:1h > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          slo: burn_rate
+        annotations:
+          summary: "Queima RÁPIDA do orçamento de erro (14,4x em 1h)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §6
+
+      - alert: MaiaErrorBudgetSlowBurn
+        # 6x burn over 6h ⇒ budget gone in ~5 days.
+        expr: maia:turn_error_budget_burn:6h > 6
+        for: 15m
+        labels:
+          severity: warning
+          slo: burn_rate
+        annotations:
+          summary: "Queima LENTA do orçamento de erro (6x em 6h)"
+          description: |
+            Runbook: docs/runbooks/observability-slo.md §6

@@ -19,7 +19,7 @@
  * IMPORTANTE: o proposer NÃO julga prioridade; só gera spec. Aprovação e
  * delivery vivem no fluxo de capability_proposals (state machine no repo).
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from './runner.js';
 import { capabilityProposalsRepo } from '@/db/repositories.js';
 import type { CapabilityProposalType } from '@/db/repositories.js';
@@ -82,7 +82,8 @@ export type ProposeResult =
   | { ok: true; proposal_id: string; draft: ProposalDraft }
   | { ok: false; reason: 'llm_unavailable' | 'parse_failed' | 'repo_failed'; message?: string };
 
-const PROPOSER_MODEL = 'claude-sonnet-4-6';
+// Issue #508: slug removido — o tier (`main`) vem da política do workload
+// `capability_proposer` e o modelo efetivo das settings dinâmicas.
 const PROPOSER_TIMEOUT_MS = 15000;
 
 export async function proposeCapabilityForGap(args: {
@@ -97,7 +98,6 @@ export async function proposeCapabilityForGap(args: {
       fallback: null,
     },
     async () => {
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
       const system = [
         'Você é o agente analisando uma lacuna recorrente na sua capacidade.',
         'Proponha uma especificação técnica para resolver. Você propõe; o owner decide.',
@@ -122,20 +122,16 @@ export async function proposeCapabilityForGap(args: {
       ].filter((s) => s.length > 0);
       const user = userParts.join('\n\n');
 
-      const completion = await anthropic.messages.create({
-        model: PROPOSER_MODEL,
+      const completion = await callLLM({
+        workload: 'capability_proposer',
         max_tokens: 1500,
         system,
         messages: [{ role: 'user', content: user }],
       });
 
-      const text = (completion.content as Array<{ type: string; text?: string }>)
-        .filter(
-          (c): c is { type: 'text'; text: string } =>
-            c.type === 'text' && typeof c.text === 'string',
-        )
-        .map((c) => c.text)
-        .join('');
+      // O gateway já entrega o texto concatenado dos blocos `text`; a
+      // extração manual de content blocks era detalhe do SDK.
+      const text = completion.content ?? '';
 
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;

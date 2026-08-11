@@ -22,7 +22,11 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
-import { linguagemDetector } from '@/cognition/drift/linguagem.js';
+import { linguagemDetector as rawLinguagemDetector } from '@/cognition/drift/linguagem.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant — ver tests/helpers/llm-scope.ts.
+const linguagemDetector = scopedDetector(rawLinguagemDetector);
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   content: Array<{ type: 'text'; text: string }>;

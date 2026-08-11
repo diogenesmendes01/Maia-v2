@@ -199,19 +199,41 @@ describe('versionsRouter.rollback — fail loud, not silent', () => {
     ).rejects.toThrowError(/Agent not found/);
   });
 
-  it('throws NOT_IMPLEMENTED for policy_rules', async () => {
-    const { ctx } = makeCtx('founder');
-    const caller = versionsRouter.createCaller(ctx);
-    await expect(
-      caller.rollback({
-        sotKind: 'policy_rules',
-        sotId: 'pr-1',
-        fromVersion: 2,
-        toVersion: 1,
-        reason: 'policy-drift-correction',
-      }),
-    ).rejects.toThrowError(/not implemented/i);
-  });
+  /**
+   * Issue #481 item 5 — as três SoTs restantes (`policy_rules`,
+   * `soul_biases`, `skills`) continuam DELIBERADAMENTE sem rollback: ver a
+   * nota em `src/admin-ui/trpc/routers/versions.ts` (ROLLBACK_IMPLEMENTED).
+   * O contrato que precisa se manter enquanto isso é duplo — falhar alto E
+   * deixar rastro forense da TENTATIVA. Trocar o `false` por um `true`
+   * prematuro (sem branch de transição) cai no INTERNAL_SERVER_ERROR de
+   * exaustividade e quebra estes testes.
+   */
+  it.each(['policy_rules', 'soul_biases', 'skills'] as const)(
+    '%s: throws NOT_IMPLEMENTED and still audits the attempt',
+    async (sotKind) => {
+      const { ctx, audit } = makeCtx('founder');
+      const caller = versionsRouter.createCaller(ctx);
+      await expect(
+        caller.rollback({
+          sotKind,
+          sotId: `${sotKind}-1`,
+          fromVersion: 2,
+          toVersion: 1,
+          reason: `rollback attempt on ${sotKind}`,
+        }),
+      ).rejects.toThrowError(/not implemented/i);
+
+      // Forense: a tentativa fica registrada mesmo com a recuperação falhando.
+      expect(audit).toHaveLength(1);
+      expect(audit[0]!.action).toBe('version_rollback_attempt');
+      expect(audit[0]!.resource_type).toBe(sotKind);
+      expect(audit[0]!.change_summary).toMatchObject({
+        from_version: 2,
+        to_version: 1,
+        implemented: false,
+      });
+    },
+  );
 
   it('rejects invalid rollback target (target >= current)', async () => {
     const { ctx } = makeCtx('owner');

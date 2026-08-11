@@ -97,7 +97,11 @@ describe('debouncer.scheduleDebouncedAgent', () => {
     expect(h.queueAdd).toHaveBeenCalledTimes(1);
     const [name, data, opts] = h.queueAdd.mock.calls[0]!;
     expect(name).toBe('process-message-debounced');
-    expect(data).toEqual({ mensagem_id: 'm1' });
+    // Issue #514 §1: the debounced payload now carries the turn correlation
+    // too, so it is indistinguishable from the direct path on the consumer.
+    expect(data).toMatchObject({ mensagem_id: 'm1' });
+    expect(typeof (data as { trace_id?: unknown }).trace_id).toBe('string');
+    expect(typeof (data as { enqueued_at_ms?: unknown }).enqueued_at_ms).toBe('number');
     expect(opts).toMatchObject({
       jobId: `debounce:${SCOPED}`,
       delay: 5000,
@@ -134,7 +138,7 @@ describe('debouncer.scheduleDebouncedAgent', () => {
     }
     expect(remove).toHaveBeenCalledTimes(1);
     expect(h.queueAdd).toHaveBeenCalledTimes(1);
-    expect(h.queueAdd.mock.calls[0]![1]).toEqual({ mensagem_id: 'm2' });
+    expect(h.queueAdd.mock.calls[0]![1]).toMatchObject({ mensagem_id: 'm2' });
 
     // first_enqueued_at must NOT advance — that's how max-hold ticks.
     const state = JSON.parse(h.store.get(_internal.STATE_KEY(SCOPED))!);
@@ -240,5 +244,70 @@ describe('debouncer.scheduleDebouncedAgent', () => {
 
     expect(result.kind).toBe('scheduled');
     expect(h.queueAdd).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Issue #514 review round 1 [P2] ──────────────────────────────────────
+  // Debounced turns were absent from the E2E latency histogram because the
+  // debounced path built its correlation without `received_at_ms`, and
+  // `recordTurnOutcome` only emits that histogram when the field exists. The
+  // SLO therefore measured only non-debounced traffic.
+  describe('received_at_ms propagation (E2E latency SLI)', () => {
+    const FIRST_AT = 1_780_000_000_000;
+    const SECOND_AT = FIRST_AT + 2_000;
+
+    it('stamps the inbound timestamp on the job payload', async () => {
+      await withCtx(() =>
+        scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1', received_at_ms: FIRST_AT }),
+      );
+      const data = h.queueAdd.mock.calls[0]![1] as { received_at_ms?: number };
+      expect(data.received_at_ms).toBe(FIRST_AT);
+    });
+
+    it('an aggregated window keeps the FIRST inbound timestamp across resets', async () => {
+      // The user started waiting at the first message of the burst; that is
+      // what the latency SLI is about.
+      await withCtx(() =>
+        scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1', received_at_ms: FIRST_AT }),
+      );
+      h.queueGetJob.mockResolvedValue({ remove: vi.fn(async () => undefined) });
+      await withCtx(() =>
+        scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm2', received_at_ms: SECOND_AT }),
+      );
+
+      expect(h.queueAdd).toHaveBeenCalledTimes(2);
+      const second = h.queueAdd.mock.calls[1]![1] as {
+        mensagem_id: string;
+        received_at_ms?: number;
+      };
+      // The job now targets the LATEST message id...
+      expect(second.mensagem_id).toBe('m2');
+      // ...but still measures from the FIRST arrival.
+      expect(second.received_at_ms).toBe(FIRST_AT);
+    });
+
+    it('persists first_received_at_ms in the debounce state', async () => {
+      await withCtx(() =>
+        scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1', received_at_ms: FIRST_AT }),
+      );
+      const state = JSON.parse(h.store.get(_internal.STATE_KEY(SCOPED))!);
+      expect(state.first_received_at_ms).toBe(FIRST_AT);
+    });
+
+    it('a caller without the timestamp simply omits the field (no crash)', async () => {
+      await withCtx(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' }));
+      const data = h.queueAdd.mock.calls[0]![1] as { received_at_ms?: number };
+      expect(data.received_at_ms).toBeUndefined();
+    });
+
+    it('a state row from a previous deploy (no field) still parses', async () => {
+      h.store.set(_internal.STATE_KEY(SCOPED), JSON.stringify({ first_enqueued_at: Date.now() }));
+      h.queueGetJob.mockResolvedValue({ remove: vi.fn(async () => undefined) });
+      await withCtx(() =>
+        scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm2', received_at_ms: SECOND_AT }),
+      );
+      const data = h.queueAdd.mock.calls[0]![1] as { received_at_ms?: number };
+      // No prior value ⇒ falls back to this message.
+      expect(data.received_at_ms).toBe(SECOND_AT);
+    });
   });
 });

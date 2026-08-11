@@ -69,7 +69,7 @@ import {
   type PlannedEffect,
   type OutboxRowIdentity,
 } from '@/governance/idempotency-effects.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { incCounter } from '@/lib/metrics.js';
@@ -181,7 +181,12 @@ async function dispatchEffect(
     case 'whatsapp_text': {
       // Pass the deterministic message id so a re-dispatch is the SAME WhatsApp
       // message key → provider/recipient dedups instead of showing a duplicate.
-      const providerRef = await sendOutboundText(effect.jid, effect.text, {
+      //
+      // Fase 0 (spec roteamento v4 §1.6): sai pela fronteira única, sob o ALS
+      // do tuple da row. O effect não carrega canal (legado) ⇒ canal único
+      // ativo do agente; ambiguidade lança → retry/DLQ da própria row.
+      const line = await forCurrentAgentChannel(null);
+      const providerRef = await line.sendText(effect.jid, effect.text, {
         ...(dedupKey ? { messageId: dedupKey } : {}),
       });
       if (providerRef === null) {

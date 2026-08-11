@@ -104,6 +104,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
         tenant_id: 'tenant-acme',
         agent_id: 'agent-main',
         channel_id: 'ch-abc-123',
+        resolved_via: 'legacy',
       });
       expect(findByExternalCrossTenantMock).toHaveBeenCalledTimes(1);
       expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
@@ -133,6 +134,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
         tenant_id: 'primary',
         agent_id: 'primary',
         channel_id: 'primary-channel-uuid',
+        resolved_via: 'legacy',
       });
       expect(findPrimaryCatchAllChannelMock).toHaveBeenCalledWith({
         channel_type: 'whatsapp',
@@ -159,6 +161,7 @@ describe('resolveChannel — fail-loud (issue #268) + single-tenant catch-all (#
         tenant_id: 'primary',
         agent_id: 'primary',
         channel_id: 'primary-channel-uuid',
+        resolved_via: 'legacy',
       });
     });
   });

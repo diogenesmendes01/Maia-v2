@@ -9,6 +9,7 @@
 | File | Role |
 |---|---|
 | `src/gateway/baileys.ts` | WhatsApp connection lifecycle + in/out via Baileys |
+| `src/gateway/jid-tenant-resolver.ts` | Parses the inbound WhatsApp JID (`@s.whatsapp.net`/`@c.us`/`@lid`) → E.164 phone, then delegates to `channel-resolver`. `@lid` recovery order: `senderPn`/`participantPn` key hints → injected LID→PN mapping-store lookup → fail-closed `lid_unmapped` (dropped, audited as `channel_resolution_skipped_lid_unmapped`, distinct from a real `channel_resolution_failed`) |
 | `src/gateway/channel-resolver.ts` | Resolves `(channel_id, agent_id, role)` from inbound metadata; fails loud |
 | `src/gateway/rate-limit.ts` | Per-channel rate-limit (Redis, tenant-prefixed keys) |
 | `src/gateway/dedup.ts` | Inbound message dedup (Redis, tenant-keyed) |
@@ -22,6 +23,28 @@
 
 - [Channel/role/policy](../concerns/channel-policy.md) — channel-resolver is the single entry; failure-loud
 - [Tenant isolation](../concerns/tenant-isolation.md) — every Redis key (rate-limit, dedup, debounce, bot-detect) carries `tenant_id + agent_id`
+
+### Ingresso e o turno durável (issue #503)
+
+O ingresso persiste a mensagem **antes** de enfileirar — sempre foi a ordem
+correta, e agora ela também é diagnosticável. Com
+`FEATURE_TURN_STATE_MACHINE` ligada, `mensagensRepo.createInbound(..., { withTurn: true })`
+grava a mensagem e o turno `received` na **mesma transação PostgreSQL**; só
+depois de o wake-up (BullMQ direto ou debouncer) ser confirmado o turno vai para
+`queued`.
+
+Commit atômico entre PostgreSQL e Redis é impossível, então o contrato é:
+
+1. Postgres grava `received`.
+2. O código tenta armar o job.
+3. Enqueue confirmado ⇒ `received → queued`.
+4. Processo morre em qualquer janela ⇒ o recovery reencontra `received`.
+5. jobId determinístico (#504) garante que rearmar não duplica execução.
+
+Uma duplicata (dedup por `whatsapp_id`) nunca chega a abrir a transação, logo
+nunca cria turno órfão. Falha de enqueue **não** vira `retryable`: não houve
+tentativa de execução, o turno fica em `received` para o sweep. Ver
+[`runtime.md`](runtime.md) e [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
 ## How to extend
 

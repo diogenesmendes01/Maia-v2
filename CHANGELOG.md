@@ -4,6 +4,85 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — o boot passa a falhar fechado por configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
+
+> **Um ambiente que sobe hoje pode parar de subir no primeiro release que contiver esta mudança.** Rode `npm run config:check -- --profile production --env-file .env` contra o `.env` de cada ambiente **antes** de deployar. Runbook completo: [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md).
+
+O boot agora valida o contrato inteiro e **aborta em TODOS os profiles — `development` incluído**. Antes, só as regras legadas de boot eram aplicadas e o resto ficava no `maia config check`.
+
+> **Abortar em `development` é decisão deliberada do owner, não descuido.** O rollout descrito na issue #515 (passo 6) previa *aviso* em `development` e erro só em staging/produção. Durante a review da [PR #522](https://github.com/diogenesmendes01/Maia-v2/pull/522) o owner decidiu explicitamente ligar o fail-closed em todos os profiles, ciente da divergência em relação ao texto da issue: um `.env` que sobe no laptop e morre em staging é justamente o drift que o contrato existe para eliminar. Quem for revisitar isso depois: o ponto de revert é único e está documentado no runbook §4.3.
+
+Passam a abortar o boot:
+
+| Situação | Regra | Antes |
+|---|---|---|
+| `FEATURE_MULTI_CHANNEL`, `FEATURE_COGNITIVE_GRAPH` ou `APROVAR_MENSAGENS_PROATIVAS` no ambiente | `contract/removed` | ignorado em silêncio |
+| Qualquer `MAIA_*` / `FEATURE_*` / `BACKUP_*` … fora do contrato | `contract/unknown` | ignorado em silêncio |
+| `MAIA_ENV` ausente em staging/produção | `profile/required` | não existia |
+| `MAIA_ENV` contradizendo `NODE_ENV` | `profile/node-env-contradiction` | não existia |
+| Placeholder (`__SET_ME__`, `sk-ant-...`) em staging/produção | `secret/placeholder` | não existia |
+| Valor de fixture sintética de CI em staging/produção | `secret/synthetic-fixture` | não existia |
+| Dependência condicional não satisfeita (ex.: `FEATURE_OUTBOUND_VOICE=true` sem `OPENAI_API_KEY`) | `contract/required-when` | não existia |
+
+**Ações necessárias antes de deployar:**
+
+1. **Adicione `MAIA_ENV=production`** (ou `staging`) — `NODE_ENV` nem consegue expressar `staging`.
+2. **Remova as variáveis removidas** do `.env` de cada ambiente. O gate real de mensagens proativas é `FEATURE_PROACTIVE_MESSAGES`.
+3. **Substitua qualquer `__SET_ME__` remanescente.**
+
+**Rollback de emergência, env-only e sem redeploy:** `MAIA_CONFIG_STRICT_BOOT=false` volta ao loader anterior (schema Zod + regras de boot legadas, com as mensagens históricas preservadas) e desliga a validação de contrato inteira. O boot degradado loga um aviso alto a cada start; é alavanca para destravar um ambiente, não estado estável. Os loaders programáticos (`loadMigrationConfig`, `loadAdminConfig`, `loadBackupConfig`) têm a equivalente `validate: false`. Procedimento em [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md) §4.
+
+Namespaces de terceiros (`CLAUDE_*`, `ANTHROPIC_*`, `POSTGRES_*`, `REDIS_*`, `SMTP_*`, `NEXTAUTH_*`, `OPENAI_*`) **nunca** são recusados como desconhecidos — são populados por ferramentas e plataformas de hosting. As variáveis que a Maia possui nesses namespaces estão no contrato pelo nome.
+
+### Added — Contrato único de configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
+
+**Impacto para operadores.** A configuração da Maia passa a ter uma fonte única de verdade tipada e **sem efeitos colaterais no import**: `src/config/contract.ts`. `.env.example`, `docs/configuration.md`, o JSON Schema, o manifest de variáveis por serviço e as fixtures por profile são **gerados** — não edite `.env.example` à mão; rode `npm run config:generate`. O CI falha se os artefatos estiverem desatualizados.
+
+- **Profiles explícitos**: `MAIA_ENV=development|staging|production` decide quais regras são obrigatórias. `NODE_ENV` segue controlando apenas as otimizações da plataforma Node (e nem consegue expressar `staging`); a contradição entre os dois é erro. Em staging/produção `MAIA_ENV` é **obrigatória**.
+- **Novos comandos**: `npm run config:generate`, `npm run config:check -- --profile production --env-file .env [--json] [--allow-placeholders] [--allow-fixtures]`, `npm run config:check:drift`, `npm run config:init -- --profile production`. O `check` reporta **todos** os problemas numa execução, com variável + regra + remediação, e **nunca** o valor de um segredo.
+- **`config:init` gera um ponto de partida operacional, não uma fixture**: todo valor que pertence ao operador vem como `__SET_ME__` e a validação estrita **falha de propósito** até ser preenchido. As fixtures em `src/config/generated/fixtures/` provam que o contrato é satisfazível e têm valores previsíveis que não autenticam em nada — usá-las como `.env` é recusado fora de development (regra `secret/synthetic-fixture`); só o opt-in `--allow-fixtures` as aceita.
+- **Configuração mínima por serviço**: `runtime`, `admin-ui`, `migrator`, `backup` e `maintenance` recebem apenas o subconjunto declarado. O migrator não recebe chave de LLM, sessão do WhatsApp nem credencial de S3.
+- **Variáveis removidas viram erro explícito**: `FEATURE_MULTI_CHANNEL` (#411), `FEATURE_COGNITIVE_GRAPH` (#412), `FEATURE_CONTEXT_PACKET_V1(_KILL_SWITCH)` (#406) e `APROVAR_MENSAGENS_PROATIVAS` (sem consumidor) têm *tombstone*. Configurá-las é erro em staging/produção e aviso em development — nunca mais um no-op silencioso. **Ação necessária:** remova-as do `.env` dos ambientes reais.
+- **Variáveis Maia desconhecidas** (prefixos `MAIA_`, `FEATURE_`, `BACKUP_`, `OUTBOX_`, …) são erro em staging/produção e aviso em development. Namespaces de plataforma (`POSTGRES_`, `REDIS_`, `SMTP_`, `NEXTAUTH_`, `OPENAI_`) ficam de fora da rejeição por injeção legítima de hosting.
+- **Dependências condicionais são executáveis** (`requiredWhen`): o contrato declara a condição como dado (`equals`/`includes`/`truthy`/`present`/`anyOf`/`allOf`) e o validador a **executa** (regra `contract/required-when`); a frase da documentação é derivada da condição, então as duas não podem divergir. Fecha três lacunas reais: `FEATURE_OUTBOUND_VOICE=true` sem `OPENAI_API_KEY`, `RUNTIME_TRACE_DEBUG_S3_BUCKET` sem `RUNTIME_TRACE_DEBUG_AES_KEY` e `ALLOW_DEV_AUTH=true` sem `ADMIN_UI_DEV_LOGIN_TOKEN`.
+- **Novas regras cross-field** (validador, ainda não no boot): provider de embeddings × modelo × dimensões, bucket S3 × credenciais, canal de alerta × transporte, `MAIA_MULTI_LINE` × modo de roteamento, `strict` × keyring de staging, dev auth proibido fora de development, https obrigatório fora de development, `OIDC_TENANT_SLUGS` sem o literal `default`, ordenação de janelas (debounce, SLO da sonda, backoff do outbox) e recusa de placeholders em staging/produção.
+- **Variáveis que já eram lidas direto de `process.env` agora estão documentadas** no contrato: `MAIA_REJECT_DEFAULT_LITERAL`, `PROCEDURE_TTL_DAYS`, `REAPER_BATCH_SIZE`, `REAPER_GLOBAL_BUDGET`, `CONTRADICTION_OVERLAY_TTL_HOURS`, além das variáveis do Admin UI (`ADMIN_UI_PORT`, `NEXTAUTH_*`, `AUTH_TRUST_HOST`, `NEXT_PUBLIC_API_URL`, `OIDC_*`, `ALLOW_DEV_AUTH`, `ADMIN_UI_DEV_LOGIN_TOKEN`, `FEATURE_ADMIN_UI_*`).
+
+### Changed — Configuração
+
+- `src/config/env.ts` virou um **loader fino**: schema, defaults e regras cross-field vêm do contrato. O comportamento de boot é **idêntico** ao anterior (as mensagens das regras de escopo `boot` foram preservadas literalmente) — as regras novas ficam no `maia config check` até o passo de rollout dedicado.
+- `src/admin-ui/lib/env.ts` deixou de manter um **segundo schema Zod** e passou a derivar do contrato (`objectSchemaForService('admin-ui')`). Admin e runtime não podem mais divergir na interpretação da mesma variável.
+- `assertSafeAuthDir`/`isReservedRootEntry` migraram para `src/setup/auth-dir-path.ts` (puro, sem import de `config`); `src/setup/auth-dir.ts` os re-exporta — nenhum import site mudou.
+- **Node 22 documentado onde já estava pinado**: README e `AGENTS.md` diziam Node 20+ enquanto `.nvmrc`, `package.json` engines e as imagens Docker usam 22. Teste de paridade em `tests/unit/config/parity.spec.ts`.
+- **Lint gate**: `no-restricted-properties` recusa novas leituras de `process.env` fora de uma allow-list explícita em `eslint.config.js` (orçamento de migração, não isenção permanente).
+
+### Changed — LLM Gateway governado ([#508](https://github.com/diogenesmendes01/Maia-v2/issues/508))
+- **Fronteira única para chamadas de modelo.** Novo módulo `src/lib/llm/` centraliza seleção de provider/modelo, deadline, cancelamento, retry, fallback, orçamento, custo, métricas e correlação de trace. `src/lib/claude.ts` vira facade fino: `callLLM()` delega ao gateway e aceita `workload`/`tier`.
+- **Nenhum módulo importa SDK de provider.** Os 13 call sites que instanciavam `@anthropic-ai/sdk` direto (risk gate, role selector, step evaluator, capability proposer, calendar detector, os 7 detectores de drift e a visão) foram migrados; regra ESLint `no-restricted-imports` bloqueia novos bypasses fora de `src/lib/llm/providers/**`, e o grep gate de auditoria passou a cobrir `executeLLM` além de `callLLM`.
+- **Visão pelo mesmo caminho.** `src/lib/vision.ts` usa blocos de imagem provider-neutrais; o adapter OpenRouter converte para `image_url`/data URI. Antes, visão só funcionava com Anthropic.
+- **OpenRouter deixa de exigir `ANTHROPIC_API_KEY`.** As checagens de chave nos módulos de cognição passaram a consultar o provider ativo (`isLLMConfigured()`).
+- **Uma leitura de settings por chamada, cacheada.** `getCurrentMainModel` + `getCurrentFastModel` (duas operações sequenciais por chamada, a cada iteração do ReAct) viraram uma leitura conjunta com cache por `tenant_id + agent_id`, TTL curto e TTL de falha menor.
+- **Uma única camada de retry.** Os adapters passam `maxRetries: 0` ao SDK; erro é classificado por *kind* e só transitório retenta; `Retry-After` é respeitado; cancelamento nunca é retentado. O deadline total é absoluto e não reinicia a cada tentativa — `CLAUDE_TIMEOUT_MS` ganhou consumidor no hot path como teto **por tentativa**.
+- **Fallback deixa de ser silencioso.** É controlado por política de workload (`src/lib/llm/workloads.ts`) e registrado com origem, destino e razão.
+
+### Added — Governança de custo e propagação de configuração ([#508](https://github.com/diogenesmendes01/Maia-v2/issues/508))
+- **Quota diária por tenant+agent** (`LLM_DAILY_BUDGET_USD`, default `0` = desligada): imposta antes de qualquer requisição ao provider, com erro não retentável.
+- **Invalidação distribuída do cache de modelos** via Redis pub/sub (`maia:llm:settings:invalidate`): trocar o modelo no Admin passa a valer em todas as réplicas imediatamente, com o TTL curto como rede de segurança.
+- **Métricas novas**: `maia_llm_requests_total`, `maia_llm_request_duration_ms`, `maia_llm_attempts_total`, `maia_llm_fallback_total`, `maia_llm_timeouts_total`, `maia_llm_cancelled_total`, `maia_llm_settings_cache_total`, `maia_llm_scope_missing_total`, `maia_llm_cost_ledger_failures_total`, `maia_llm_budget_*`. `maia_llm_calls_total{status}` passou a incrementar também em erro/timeout/rate limit/cancelamento, como o runbook já documentava.
+
+### Fixed — LLM ([#508](https://github.com/diogenesmendes01/Maia-v2/issues/508))
+- `src/runtime/decision/prod-env.ts`: o HaikuClientAdapter criava um `AbortController`, encadeava o sinal do caller nele e nunca o passava adiante — cancelar a classificação não cancelava a requisição HTTP.
+- Falha ao persistir o ledger de custo deixou de ser engolida (`.catch(() => undefined)`) e passou a emitir counter alertável.
+- A seleção de provider deixou de ser congelada no carregamento do módulo.
+- **Quota de LLM deixou de ser check-then-act** (review da PR #531): virou reserva atômica por `tenant_id + agent_id` antes de qualquer requisição ao provider, liquidada com o custo real depois. Antes, N chamadas simultâneas liam o mesmo gasto acumulado e passavam todas — a quota falhava exatamente no retry storm.
+- **Erro de provider não propaga mais o corpo da resposta.** Um `400` costuma ecoar o input (que é conversa de cliente); truncar em 200 caracteres preservava justamente o começo do eco. A mensagem passa a ser montada só com `kind`, `status` e `request_id`, e `cause` foi removido do erro para não vazar por serializador de log.
+- **Chamada sem contexto de tenant no ALS é rejeitada** (`missing_tenant_context`) em vez de executada sem quota. Trabalho genuinamente global declara `runWithSystemContext()`.
+- **Deadline absoluto passou a ser derivado** de `LLM_TURN_DEADLINE_MS` quando o caller não declara um: a mecânica existia mas o campo era opcional e ninguém o passava, então na prática o gateway rodava sem teto agregado.
+- **`response_invalid` deixou de ser letra morta**: um 200 sem conteúdo utilizável (ex.: `choices: []`) era registrado como `status="ok"` com resposta vazia.
+- **Escopo de tenant em todas as métricas tenant-aware** — antes só `maia_llm_requests_total` o carregava.
+- **`workload` é obrigatório** e o escape hatch `legacy` foi removido, com gate de CI provando que todo call site declara política.
+- **Allow-list de `process.env` encolhida** (#515): a migração dos call sites de LLM removeu as leituras diretas de `ANTHROPIC_API_KEY` em `src/cognition/{calendar-pattern-detector,capability-proposer}.ts`, `src/cognition/drift/**`, `src/cognition/role-selector/llm-suggester.ts` e `src/shared/risk/llm-gate.ts` — as cinco entradas saíram do orçamento de migração em `eslint.config.js` e do espelho em `tests/unit/config/no-direct-env-reads.spec.ts`. A chave passa a entrar pelo `config` tipado num único ponto (`src/lib/llm/providers/**`).
+
 ### Added — Plataforma de funcionários digitais (rodada 2026-06-10)
 - **Fase 1 do blueprint** ([#467](https://github.com/diogenesmendes01/Maia-v2/pull/467)): diff de perfil antes de aprovar (#461), aba Atividade (#462), página `/audit` (#463), checklist de ativação (#465), console responsivo (#466), arquétipos no wizard e **rollback real** de `agent_operational_profile_versions` (#468).
 - **Playground sandbox** ([#473](https://github.com/diogenesmendes01/Maia-v2/pull/473), #464): aba "Testar" — chat com o perfil ativo ou uma versão proposta, sem outbox/memória/aprendizado; migração 087; Postgres-as-queue + worker `playground_turn_drain`.
@@ -12,8 +91,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - **Pedidos de ferramenta** ([#476](https://github.com/diogenesmendes01/Maia-v2/pull/476), #471 v1): lacunas `tipo='tool'` viram backlog com geração de issue pré-preenchida.
 - **MCP externo v1** ([#480](https://github.com/diogenesmendes01/Maia-v2/pull/480), #478): servers MCP first-party (ERP) com governança completa — migração 089, cliente SDK, bridge no dispatcher, worker `mcp_sync`, tela `/setup/mcp`, flag `FEATURE_MCP_TOOLS` (default OFF).
 
+### Fixed
+- **Roteamento de canal para JID `@lid`**: eventos do WhatsApp que chegam como `XXX@lid` sem `senderPn`/`participantPn` deixavam de resolver e eram descartados como `channel_resolution_failed` (risco de perda de mensagem conforme o WhatsApp migra o endereçamento para LID). Agora `resolveScopeForJid` aceita um resolvedor LID→telefone injetado (a *signal LID mapping store* do Baileys, via `socket.signalRepository.lidMapping.getPNForLID`, com *feature-detection*) como terceiro fallback; o telefone recuperado também passa a alimentar a identidade (`tel`) em `handleIncoming`, mantendo roteamento e identidade consistentes. Quando nada resolve, o drop continua *fail-closed* mas é auditado como a ação dedicada `channel_resolution_skipped_lid_unmapped` (separando ruído de sync do WhatsApp de falhas reais de posse cross-tenant). Ver `src/gateway/jid-tenant-resolver.ts` e `src/gateway/baileys.ts`.
+
 ### Docs
 - Specs versionadas: visão "funcionários digitais", playground, work loop e MCP (`docs/superpowers/specs/2026-06-10-*`); novo doc de módulo `objectives.md`.
+- `docs/architecture/modules/gateway.md`: lista `jid-tenant-resolver.ts` e documenta a ordem de recuperação de `@lid`.
 
 ### Changed — Admin UI
 - **Redesign visual completo da console** ([#460](https://github.com/diogenesmendes01/Maia-v2/pull/460)): camada visual reconstruída do zero sobre design system próprio (`src/admin-ui/components/ui/`) com navegação agent-first em pt-BR (sidebar + badge de aprovações pendentes). Nova experiência de agentes: hub `/agents` em cards, wizard de criação em 4 passos (`/agents/new`) e detalhe por agente com edição de perfil pré-preenchida e aprovação de versões (`/agents/[agentId]`); `/setup/agents` virou redirect. Tela de versões passou a expor o fluxo de rollback (auditado; `NOT_IMPLEMENTED` sinalizado na UI). Routers tRPC preservados como camada de dados.

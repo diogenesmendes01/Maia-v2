@@ -5,7 +5,7 @@
 > aprovados para assumir uma função operacional humana — com governança,
 > escopo e evidência.
 
-[![Node](https://img.shields.io/badge/node-20%2B-green)]()
+[![Node](https://img.shields.io/badge/node-22%2B-green)]()
 [![TypeScript](https://img.shields.io/badge/typescript-5%2B-blue)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -51,7 +51,7 @@
 
 ## Stack
 
-- **Runtime:** Node.js 20+ + TypeScript 5+
+- **Runtime:** Node.js 22+ + TypeScript 5+
 - **Banco:** PostgreSQL 16 + pgvector
 - **Cache / Fila:** Redis + BullMQ
 - **WhatsApp:** Baileys
@@ -127,7 +127,7 @@ maia/
 ```bash
 # Pré-requisitos
 # - Docker + Docker Compose
-# - Node 20+
+# - Node 22+ (linha única do repo: .nvmrc, package.json engines, imagens Docker)
 # - Conta Anthropic com API key
 # - Conta OpenAI com API key
 # - Um chip WhatsApp dedicado por agente que você for operar
@@ -167,11 +167,37 @@ npm run pessoa:add -- --nome="Joana" --telefone="+55..." \
 
 ## Setup produção (VPS)
 
+Produção usa **`compose.prod.yml`** — NÃO o `docker-compose.yml`, que é o
+compose de **dev** (publica Postgres/Redis no host com credencial fallback e
+injeta o `.env` inteiro em todos os containers).
+
 ```bash
-# Configure `.env` com chaves antes (compose lê `.env` automaticamente)
-docker compose up -d
-docker compose logs -f app
+# 1. Env files POR SERVIÇO (nunca comite os reais)
+cp .env.app.prod.example .env.app       # segredos do app (LLM, WhatsApp, HMAC)
+cp .env.admin.prod.example .env.admin   # segredos do admin-ui (NextAuth/OIDC)
+chmod 600 .env.app .env.admin
+# edite ambos — os placeholders __SET_ME__ são REJEITADOS no boot de propósito
+
+# 2. Credenciais da infra (interpolação do compose; não é injetado em container)
+cat > .env.infra <<'EOF'
+POSTGRES_USER=maia_prod
+POSTGRES_PASSWORD=troque__openssl_rand_hex_24__url_safe
+POSTGRES_DB=maia
+REDIS_PASSWORD=troque__openssl_rand_hex_24
+EOF
+chmod 600 .env.infra
+
+# 3. Suba (sem as vars acima o compose ABORTA — não há fallback maia/maia)
+docker compose --env-file .env.infra -f compose.prod.yml up -d
+docker compose --env-file .env.infra -f compose.prod.yml logs -f app
 ```
+
+Postgres/Redis **não publicam porta no host** (rede interna `data`); app
+(`:3000`) e admin-ui (`:4000`) só são alcançáveis pelo reverse proxy conectado
+à rede `web` do projeto. Todos os containers rodam **non-root** com rootfs
+read-only. Verificação pós-deploy (portas, non-root), migração de volumes de
+deployments antigos e rollback:
+[`docs/runbooks/deploy-prod.md`](docs/runbooks/deploy-prod.md).
 
 ---
 

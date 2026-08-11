@@ -288,9 +288,20 @@ Já expostas por `src/server.ts`:
   `CRITICAL_MEMORY_USED_RATIO` (mesma constante do alerta
   `RedisMemoryPressureCritical`).
 
+  > **Issue #512** — desde o lifecycle controller, `/readyz` é **composto e
+  > role-aware**: a pressão de memória do Redis é UM dos componentes
+  > (`redis_memory`), ao lado de `db`, `redis`, `schema`, `queue`,
+  > `agent_worker`, `cron_scheduler`, `whatsapp_session` e `http`. O gate de
+  > memória descrito aqui continua idêntico — `checkReadiness()` segue sendo a
+  > implementação e o threshold não mudou —, mas um 503 em `/readyz` agora pode
+  > ter outra causa. Leia `.reason` / `.checks[]` da resposta antes de concluir
+  > que é pressão de memória. Ver `docs/runbooks/operational.md` §8.1.
+
   ```bash
-  # 200 quando saudável, 503 quando ratio > 0.95
+  # 200 quando saudável, 503 quando ratio > 0.95 (ou outro componente ruim)
   curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/readyz
+  # qual componente derrubou a readiness:
+  curl -s http://localhost:3000/readyz | jq '.reason, .checks'
   ```
 
 ### 4.4 Sondagem manual

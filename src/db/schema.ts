@@ -18,6 +18,7 @@ import {
   bigint,
   smallint,
   primaryKey,
+  customType,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { AudienceType, TrustLevel } from '@/shared/audience.js';
@@ -372,6 +373,11 @@ export const conversas = pgTable('conversas', {
   tenant_id: text('tenant_id').notNull(),
   agent_id: text('agent_id').notNull(),
   pessoa_id: uuid('pessoa_id').notNull(),
+  // 090 (fase 0 roteamento multi-linha) — identidade da conversa inclui o
+  // canal: mesma pessoa em duas linhas = duas conversas; a resposta sai pela
+  // linha da conversa. NULL = legado (casa qualquer canal do agente até
+  // encerrar). FK composta (tenant, agent, channel) na migração.
+  channel_id: uuid('channel_id'),
   escopo_entidades: uuid('escopo_entidades').array().notNull().default(sql`'{}'::uuid[]`),
   status: text('status').notNull().default('ativa'),
   contexto_resumido: text('contexto_resumido'),
@@ -385,6 +391,10 @@ export const mensagens = pgTable('mensagens', {
   tenant_id: text('tenant_id').notNull(),
   agent_id: text('agent_id').notNull(),
   conversa_id: uuid('conversa_id'),
+  // 090 — canal (linha) que entregou/enviará a mensagem. O dedup de
+  // whatsapp_id é POR CANAL para rows novas (a unique global de 003 colidiria
+  // IDs entre linhas/tenants — spec roteamento v4 §1.7). NULL = legado.
+  channel_id: uuid('channel_id'),
   direcao: text('direcao').notNull(),
   tipo: text('tipo').notNull(),
   conteudo: text('conteudo'),
@@ -554,6 +564,77 @@ export const workflows = pgTable('workflows', {
   metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
 });
 
+// Fase 0 cap. 2 (migration 095) — evidência backend imutável de aprovação.
+// Fonte de verdade das aprovações humanas (4-eyes/confirmação): intent
+// imutável + hash canônico versionado, classe/contagem exigida, expiração e
+// máquina de estados com consumo one-time. O LLM nunca cria/assina/consome.
+export const approval_requests = pgTable(
+  'approval_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    requester_pessoa_id: uuid('requester_pessoa_id').notNull(),
+    entidade_id: uuid('entidade_id'),
+    conversa_id: uuid('conversa_id'),
+    mensagem_id: uuid('mensagem_id'),
+    request_id: text('request_id'),
+    tool: text('tool').notNull(),
+    operation_type: text('operation_type').notNull(),
+    intent_payload: jsonb('intent_payload').notNull(),
+    intent_hash: text('intent_hash').notNull(),
+    intent_hash_version: integer('intent_hash_version').notNull().default(1),
+    approval_class: text('approval_class').notNull(),
+    required_approvals: integer('required_approvals').notNull(),
+    status: text('status').notNull().default('pending'),
+    fingerprint: text('fingerprint').notNull(),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    denied_at: timestamp('denied_at', { withTimezone: true }),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    consumed_at: timestamp('consumed_at', { withTimezone: true }),
+    claim_token: text('claim_token'),
+    result_ref: text('result_ref'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_status_idx: index('approval_requests_scope_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.expires_at,
+    ),
+    // Partial unique (WHERE status aberto) vive na migration 095 — Drizzle não
+    // expressa o WHERE aqui; a DB enforce.
+  }),
+);
+
+export const approval_decisions = pgTable(
+  'approval_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    request_id: uuid('request_id')
+      .notNull()
+      .references(() => approval_requests.id),
+    principal_pessoa_id: uuid('principal_pessoa_id').notNull(),
+    principal_tipo: text('principal_tipo').notNull(),
+    decision: text('decision').notNull(),
+    channel: text('channel').notNull().default('whatsapp'),
+    reason: text('reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    request_principal_uq: unique('approval_decisions_request_principal_uq').on(
+      t.request_id,
+      t.principal_pessoa_id,
+    ),
+    scope_idx: index('approval_decisions_scope_idx').on(t.tenant_id, t.agent_id, t.request_id),
+  }),
+);
+
 // Spec 18 — Scheduling: Series, Occurrences, Tasks, Outbox.
 // Lives in its own domain alongside `workflows` (which keeps dual_approval
 // and any other ad-hoc workflow types). Recurring scheduling never touches
@@ -655,6 +736,11 @@ export const outbox_messages = pgTable(
     agent_id: text('agent_id').notNull(),
     occurrence_id: uuid('occurrence_id'),
     task_id: uuid('task_id'),
+    // 090 — linha pela qual a mensagem DEVE sair. Rows enviáveis
+    // (pending/claimed) exigem canal (CHECK outbox_sendable_requires_channel);
+    // não-deriváveis no backfill ficam status='blocked_channel_unresolved'
+    // e o drain as ignora (fail-closed — nunca escolher linha sozinho).
+    channel_id: uuid('channel_id'),
     kind: text('kind').notNull(),
     payload: jsonb('payload').notNull(),
     status: text('status').notNull().default('pending'),
@@ -1806,6 +1892,11 @@ export const channels = pgTable(
     channel_type: text('channel_type').notNull(),
     display_name: text('display_name'),
     active: boolean('active').notNull().default(true),
+    // 094 — marcador sintético IMUTÁVEL (spec sonda §1.3): setado só no seed da
+    // migração, nunca por config de runtime. Base do sink de outbound e da
+    // validação fail-fast de boot; garante que a sonda não silencie um recurso
+    // não-sintético (o sink exige is_synthetic=true + triplete completo).
+    is_synthetic: boolean('is_synthetic').notNull().default(false),
     metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1816,6 +1907,77 @@ export const channels = pgTable(
     externalUq: uniqueIndex('channels_tenant_type_external_uq').on(t.tenant_id, t.channel_type, t.external_id),
   }),
 );
+
+// 103 (issue #518) — estado OPERACIONAL da linha whatsapp + fila durável de
+// comandos Admin→runtime. `channels.active` continua sendo ROTEAMENTO; este
+// `state` é o ciclo de vida da posse/conexão (declared → pairing →
+// verified_offline → connected → recovering/logged_out/failed/disabled).
+//
+// `pairing_material` é o envelope AES-256-GCM de staging-crypto.ts — QR/código
+// NUNCA em claro, com TTL curto e apagado ao concluir/abortar/expirar. O
+// console decifra na resposta tRPC autenticada; nada disso entra em URL,
+// audit ou log. As CHECKs de estado/comando vivem na migration 103 (fonte de
+// verdade das constraints); aqui declaramos tipos.
+export const channel_line_state = pgTable(
+  'channel_line_state',
+  {
+    channel_id: uuid('channel_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    state: text('state').notNull().default('declared'),
+    command: text('command'),
+    command_method: text('command_method'),
+    command_id: uuid('command_id'),
+    command_requested_at: timestamp('command_requested_at', { withTimezone: true }),
+    command_claimed_at: timestamp('command_claimed_at', { withTimezone: true }),
+    owner_lease_expires_at: timestamp('owner_lease_expires_at', { withTimezone: true }),
+    target_instance: text('target_instance'),
+    session_owner_instance: text('session_owner_instance'),
+    session_owner_lease_expires_at: timestamp('session_owner_lease_expires_at', {
+      withTimezone: true,
+    }),
+    actor_id: text('actor_id'),
+    actor_role: text('actor_role'),
+    correlation_id: text('correlation_id'),
+    pairing_material: customType<{ data: Buffer }>({
+      dataType() {
+        return 'bytea';
+      },
+    })('pairing_material'),
+    pairing_material_key_id: text('pairing_material_key_id'),
+    pairing_material_kind: text('pairing_material_kind'),
+    pairing_material_expires_at: timestamp('pairing_material_expires_at', {
+      withTimezone: true,
+    }),
+    pairing_method: text('pairing_method'),
+    pairing_started_at: timestamp('pairing_started_at', { withTimezone: true }),
+    pairing_expires_at: timestamp('pairing_expires_at', { withTimezone: true }),
+    pairing_attempts: integer('pairing_attempts').notNull().default(0),
+    owner_instance: text('owner_instance'),
+    reason_code: text('reason_code'),
+    verified_at: timestamp('verified_at', { withTimezone: true }),
+    connected_at: timestamp('connected_at', { withTimezone: true }),
+    disconnected_at: timestamp('disconnected_at', { withTimezone: true }),
+    last_transition_at: timestamp('last_transition_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdx: index('channel_line_state_scope_idx').on(t.tenant_id, t.agent_id),
+    pendingCommandIdx: index('channel_line_state_pending_command_idx')
+      .on(t.command_requested_at)
+      .where(sql`command IS NOT NULL`),
+    pairingExpiryIdx: index('channel_line_state_pairing_expiry_idx')
+      .on(t.pairing_expires_at)
+      .where(sql`state = 'pairing'`),
+    ownerIdx: index('channel_line_state_owner_idx')
+      .on(t.owner_instance)
+      .where(sql`owner_instance IS NOT NULL`),
+  }),
+);
+export type ChannelLineStateRow = typeof channel_line_state.$inferSelect;
 
 // P6: roles — modos operacionais por agent (comercial, suporte, default, etc).
 // Exatamente 1 default por (tenant, agent), garantido por partial unique index.
@@ -1911,6 +2073,43 @@ export const role_selector_decisions = pgTable(
   }),
 );
 
+// 092 — staging de inbound não-roteado (spec roteamento v4 §1.4, modo
+// strict). Envelope AES-256-GCM (staging-crypto.ts); TTL 72h; UNIQUE
+// (line, whatsapp_id) = idempotência pré-resolução. O job BullMQ carrega só
+// o id (jobId estável — digest de (line, whatsapp_id), ver unroutedReplayJobId).
+export const inbound_unrouted = pgTable(
+  'inbound_unrouted',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    line_external_id: text('line_external_id').notNull(),
+    whatsapp_message_id: text('whatsapp_message_id').notNull(),
+    envelope: customType<{ data: Buffer }>({
+      dataType() {
+        return 'bytea';
+      },
+    })('envelope').notNull(),
+    enc_key_id: text('enc_key_id').notNull(),
+    status: text('status').notNull().default('pending'),
+    attempts: integer('attempts').notNull().default(0),
+    received_at: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    handed_off_at: timestamp('handed_off_at', { withTimezone: true }),
+  },
+  (t) => ({
+    lineMsgUq: uniqueIndex('inbound_unrouted_line_msg_uq').on(
+      t.line_external_id,
+      t.whatsapp_message_id,
+    ),
+    pendingIdx: index('idx_inbound_unrouted_pending')
+      .on(t.received_at)
+      .where(sql`status = 'pending'`),
+    expiryIdx: index('idx_inbound_unrouted_expiry')
+      .on(t.expires_at)
+      .where(sql`status = 'pending'`),
+  }),
+);
+export type InboundUnroutedRow = typeof inbound_unrouted.$inferSelect;
+
 export type SoulBias = typeof soul_biases.$inferSelect;
 export type NewSoulBias = typeof soul_biases.$inferInsert;
 
@@ -2001,12 +2200,23 @@ export const app_sessions = pgTable(
   }),
 );
 
-// 046: proposal_approvals — tracks dual-approval state
+// 046 + 093: proposal_approvals — tracks dual-approval state.
+// 093 (spec perfil-inbox v4 §1.6): escopo tenant/agent/source. A unicidade
+// GLOBAL (proposal, approver, decision) foi substituída por partial uniques:
+//   - rows novas: (tenant, agent, source, proposal, approver, decision)
+//     WHERE agent_id IS NOT NULL AND proposal_source IS NOT NULL;
+//   - rows legadas: a semântica antiga, WHERE proposal_source IS NULL.
+// CHECK (agent_id IS NULL) = (proposal_source IS NULL) — NULLs são distintos
+// em Postgres; sem o pareamento, source preenchido + agent ausente duplicaria.
+// Vocabulário de proposal_source fechado por CHECK (espelha a registry TS).
 export const proposal_approvals = pgTable(
   'proposal_approvals',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     tenant_id: text('tenant_id').notNull(),
+    // 093 — nulos APENAS em rows legadas (pré-escopo), aos pares.
+    agent_id: text('agent_id'),
+    proposal_source: text('proposal_source'),
     proposal_id: uuid('proposal_id').notNull(),
     approval_class: text('approval_class').notNull(),
     approver_user_id: text('approver_user_id').notNull(),
@@ -2017,14 +2227,16 @@ export const proposal_approvals = pgTable(
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    // Post-Codex-review #101: dropped (proposal_id, approver_role, decision)
-    // — see migration 049 — because it blocked dual-founder approval flows.
-    // Distinct-user invariant is still enforced; distinct-role invariant
-    // (for owner+compliance dual classes) is enforced at the app layer.
-    proposalUserDecisionUq: unique('proposal_approvals_proposal_user_decision_uq').on(
+    scopedUq: uniqueIndex('proposal_approvals_scoped_uq')
+      .on(t.tenant_id, t.agent_id, t.proposal_source, t.proposal_id, t.approver_user_id, t.decision)
+      .where(sql`agent_id IS NOT NULL AND proposal_source IS NOT NULL`),
+    legacyUq: uniqueIndex('proposal_approvals_legacy_uq')
+      .on(t.proposal_id, t.approver_user_id, t.decision)
+      .where(sql`proposal_source IS NULL`),
+    scopeReadIdx: index('proposal_approvals_scope_read_idx').on(
+      t.tenant_id,
+      t.proposal_source,
       t.proposal_id,
-      t.approver_user_id,
-      t.decision,
     ),
     proposalIdx: index('proposal_approvals_proposal_id_idx').on(t.proposal_id),
     classIdx: index('proposal_approvals_approval_class_idx').on(t.approval_class),
@@ -2112,6 +2324,11 @@ export const runtime_trace_envelopes = pgTable(
     agent_id: text('agent_id').notNull(),
     conversa_id: uuid('conversa_id'),
     turno_id: uuid('turno_id'),
+    // Issue #514 (migration 107): attempt grouping. `root_trace_id` equals
+    // `trace_id` on attempt 1; retries get a derived id and point back here.
+    // NOT covered by `envelope_hmac` — see the migration for why.
+    root_trace_id: uuid('root_trace_id'),
+    attempt: integer('attempt').notNull().default(1),
     policy_id: uuid('policy_id'),
     decision: text('decision').notNull(),
     side_effect_level: text('side_effect_level').notNull(),
@@ -2228,6 +2445,8 @@ export type SelfState = typeof self_state.$inferSelect;
 export type EntityState = typeof entity_states.$inferSelect;
 export type Workflow = typeof workflows.$inferSelect;
 export type WorkflowStep = typeof workflow_steps.$inferSelect;
+export type ApprovalRequest = typeof approval_requests.$inferSelect;
+export type ApprovalDecision = typeof approval_decisions.$inferSelect;
 export type PendingQuestion = typeof pending_questions.$inferSelect;
 export type IdempotencyKey = typeof idempotency_keys.$inferSelect;
 export type IdempotencyEffectOutboxRow = typeof idempotency_effect_outbox.$inferSelect;
@@ -2281,13 +2500,46 @@ export type AgentOperationalProfileVersion = typeof agent_operational_profile_ve
 export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
 
 // Single source of truth for the ProfileBody schema version literal.
-// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.2).
-export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.1-2026-05-15' as const;
+// Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.3).
+// v3.1.2: formaliza `identity.principles` no tipo canônico (spec perfil-inbox
+// v4 §1.2 — antes persistido por cast em agents.ts, um campo high-risk fora
+// do tipo). Mudança aditiva: nenhuma migração de dados.
+export const PROFILE_BODY_SCHEMA_VERSION = 'v3.1.2-2026-07-13' as const;
 export type ProfileBodySchemaVersion = typeof PROFILE_BODY_SCHEMA_VERSION;
 
-// Tipo estrutural do JSONB `profile_body` (v3.1.1)
+// Versões conhecidas do ProfileBody (spec perfil-inbox v4 §1.2). A validação
+// de corpo aceita QUALQUER versão conhecida — não apenas o literal corrente,
+// que faria o predecessor legado falhar na validação ANTES de chegar ao mapa
+// de compatibilidade. Versão desconhecida ⇒ `null` (o chamador trata como
+// risco alto, fail-up — nunca erro de parse).
+export type KnownProfileSchemaVersion = 'v3.1.1-2026-05-15' | 'v3.1.2-2026-07-13';
+
+export const KNOWN_PROFILE_SCHEMA_VERSIONS: readonly KnownProfileSchemaVersion[] = [
+  'v3.1.1-2026-05-15',
+  'v3.1.2-2026-07-13',
+];
+
+export function parseKnownProfileSchemaVersion(v: unknown): KnownProfileSchemaVersion | null {
+  if (typeof v !== 'string') return null;
+  return (KNOWN_PROFILE_SCHEMA_VERSIONS as readonly string[]).includes(v)
+    ? (v as KnownProfileSchemaVersion)
+    : null;
+}
+
+// Mapa de compatibilidade ADITIVA entre versões persistidas (spec §1.2):
+// `{ versão_proposta: [predecessores aceitos] }`, usando os literais REAIS
+// gravados nas rows. Par presente ⇒ a diferença de versão em si não pesa no
+// risco (só os campos alterados); par ausente e não-idêntico ⇒ risco alto.
+// Atualizar a cada bump de PROFILE_BODY_SCHEMA_VERSION.
+export const PROFILE_SCHEMA_COMPAT: Record<string, string[]> = {
+  'v3.1.2-2026-07-13': ['v3.1.1-2026-05-15'],
+};
+
+// Tipo estrutural do JSONB `profile_body` (v3.1.2). `schema_version` admite
+// qualquer versão conhecida — rows legadas (v3.1.1) continuam satisfazendo o
+// tipo sem migração.
 export interface ProfileBody {
-  schema_version: ProfileBodySchemaVersion;
+  schema_version: KnownProfileSchemaVersion;
   identity: {
     role_descriptor: string;
     voice: {
@@ -2301,6 +2553,9 @@ export interface ProfileBody {
       confidence_floor_for_action: number;
     };
     priorities: string[];
+    // Contratos de valor invioláveis (valoresDetector — high-risk). Opcional:
+    // ausência ⇒ guardrail desativado por decisão do operador (#189/#193).
+    principles?: string[];
     learned_voice_modifiers: unknown[];
   };
   style: {
@@ -2321,6 +2576,70 @@ export type CapabilityProposal = typeof capability_proposals.$inferSelect;
 export type NewCapabilityProposal = typeof capability_proposals.$inferInsert;
 export type CapabilityTestResult = typeof capability_test_results.$inferSelect;
 export type NewCapabilityTestResult = typeof capability_test_results.$inferInsert;
+// 094 — Sonda sintética (spec §1.5): estado DURÁVEL em Postgres. Os contadores/
+// gauges de metrics.ts são in-memory e as rows do run são limpas; sem estas
+// tabelas um restart esqueceria o outage (last_ok) ou duplicaria runs
+// (single-flight). Namespaced pelo tenant '__probe__', filtrado de dashboards.
+export const synthetic_probe_runs = pgTable(
+  'synthetic_probe_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    channel_id: uuid('channel_id'),
+    scenario: text('scenario').notNull(),
+    // id estável do inbound sintético injetado (metadata.whatsapp_id) — o HANDLE
+    // do run; dele a sonda resolve a `mensagens` de entrada e daí os efeitos.
+    whatsapp_id: text('whatsapp_id').notNull(),
+    // `mensagens.id` da entrada resolvida — chave de correlação dos efeitos
+    // (transacoes.mensagem_id / out.metadata->>'in_reply_to'). NULL até resolver.
+    mensagem_id: uuid('mensagem_id'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    // ok | slow | wrong | silent | error — NULL enquanto em voo.
+    outcome: text('outcome'),
+    latency_ms: integer('latency_ms'),
+    detail: jsonb('detail').notNull().default(sql`'{}'::jsonb`),
+    // set no estado TERMINAL do run — só então o cleanup pode recolher (§1.5).
+    terminal_at: timestamp('terminal_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdx: index('synthetic_probe_runs_scope_idx').on(t.tenant_id, t.agent_id, t.started_at),
+    widIdx: index('synthetic_probe_runs_wid_idx').on(t.whatsapp_id),
+  }),
+);
+
+export const synthetic_probe_state = pgTable(
+  'synthetic_probe_state',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // sinal PRIMÁRIO de outage (§1.6): o gauge seconds_since_last_ok lê daqui.
+    last_ok_at: timestamp('last_ok_at', { withTimezone: true }),
+    // primeira tentativa — o gauge cresce a partir daqui mesmo se NUNCA ficou
+    // verde (last_ok_at nulo), senão gauge=0 e '>15m' nunca dispara (review).
+    first_attempt_at: timestamp('first_attempt_at', { withTimezone: true }),
+    consecutive_failures: integer('consecutive_failures').notNull().default(0),
+    health: text('health').notNull().default('healthy'),
+    // alerta durável com retry (§1.6): a transição saudável→degradado grava
+    // alert_pending=true; o retry reentrega até confirmar e só então zera.
+    alert_pending: boolean('alert_pending').notNull().default(false),
+    alert_pending_since: timestamp('alert_pending_since', { withTimezone: true }),
+    last_alert_attempt_at: timestamp('last_alert_attempt_at', { withTimezone: true }),
+    // single-flight (§1.5): impede runs concorrentes; lease vencido é reciclado.
+    lease_until: timestamp('lease_until', { withTimezone: true }),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id] }),
+  }),
+);
+
+export type SyntheticProbeRun = typeof synthetic_probe_runs.$inferSelect;
+export type NewSyntheticProbeRun = typeof synthetic_probe_runs.$inferInsert;
+export type SyntheticProbeState = typeof synthetic_probe_state.$inferSelect;
+export type NewSyntheticProbeState = typeof synthetic_probe_state.$inferInsert;
+
 export type Channel = typeof channels.$inferSelect;
 export type NewChannel = typeof channels.$inferInsert;
 export type Role = typeof roles.$inferSelect;
@@ -2512,7 +2831,8 @@ export type ProposalTypeId =
   | 'soul_bias'
   | 'skill'
   | 'capability_proposal'
-  | 'knowledge_proposal';
+  | 'knowledge_proposal'
+  | 'operational_profile';
 
 export type RiskLevelId = 'low' | 'medium' | 'high' | 'critical';
 
@@ -2530,7 +2850,9 @@ export type ApprovalClassId =
   | 'knowledge_guidance'
   | 'knowledge_deprecated'
   | 'identity_drift_correction'
-  | 'procedure_update';
+  | 'procedure_update'
+  | 'operational_profile_change'
+  | 'operational_profile_change_high';
 
 export type ProposalUnifiedStatus = 'proposed' | 'pending_review' | 'rejected' | 'activated';
 
@@ -2748,3 +3070,513 @@ export type McpServer = typeof mcp_servers.$inferSelect;
 export type NewMcpServer = typeof mcp_servers.$inferInsert;
 export type McpServerTool = typeof mcp_server_tools.$inferSelect;
 export type NewMcpServerTool = typeof mcp_server_tools.$inferInsert;
+
+// ─── Issue #503 — máquina de estados durável do turno inbound (migration 097) ─
+//
+// O turno é LÓGICO: agrega N mensagens inbound (debounce) numa única execução.
+// PostgreSQL é a fonte de verdade do ciclo de vida; Redis/BullMQ são só
+// wake-up e distribuição. O vocabulário de `status`/`outcome` e a tabela de
+// transições vivem em `src/runtime/turns/contract.ts` — aqui só a forma da row.
+// Toda escrita passa por `agentTurnsRepo` (src/db/repositories/turn-repos.ts);
+// nenhum caller atualiza `status` direto.
+export const agent_turns = pgTable(
+  'agent_turns',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    // NULL até a identidade/conversa ser resolvida (o inbound é persistido
+    // ANTES da resolução — ver src/gateway/baileys.ts).
+    conversa_id: uuid('conversa_id'),
+    channel_id: uuid('channel_id'),
+    representative_message_id: uuid('representative_message_id').notNull(),
+    status: text('status').notNull().default('received'), // TurnStatus
+    outcome: text('outcome'), // TurnOutcome | null
+    /** Turno que absorveu este pelo debounce (só em `superseded`). */
+    superseded_by_turn_id: uuid('superseded_by_turn_id'),
+    // Compare-and-swap: toda transição incrementa e o UPDATE exige a versão
+    // esperada. `bigint` com mode 'number' — o contador nunca chega perto de
+    // 2^53 (é por turno, não global).
+    state_version: bigint('state_version', { mode: 'number' }).notNull().default(0),
+    attempt_count: integer('attempt_count').notNull().default(0),
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }),
+    // Sanitizados por `sanitizeTurnError` — nunca payload/prompt/PII.
+    last_error_code: text('last_error_code'),
+    last_error_summary: text('last_error_summary'),
+    // Reservados para #504 (claim/lease/fencing).
+    claimed_by: text('claimed_by'),
+    claim_token: uuid('claim_token'),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    // Reservado para #507 (deadline/cancelamento).
+    deadline_at: timestamp('deadline_at', { withTimezone: true }),
+    // Reservado para #506 (outbox durável).
+    outbound_message_id: uuid('outbound_message_id'),
+    queued_at: timestamp('queued_at', { withTimezone: true }),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    outbound_committed_at: timestamp('outbound_committed_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    dead_lettered_at: timestamp('dead_lettered_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('agent_turns_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    representativeUq: uniqueIndex('agent_turns_representative_uq').on(
+      t.representative_message_id,
+    ),
+    scopeStatusIdx: index('agent_turns_scope_status_next_attempt_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.next_attempt_at,
+    ),
+    pendingDispatchIdx: index('agent_turns_pending_dispatch_idx')
+      .on(t.status, t.next_attempt_at, t.created_at)
+      .where(sql`status IN ('received', 'queued', 'claimed', 'running', 'retryable')`),
+    conversaIdx: index('agent_turns_conversa_idx')
+      .on(t.tenant_id, t.agent_id, t.conversa_id, t.created_at)
+      .where(sql`conversa_id IS NOT NULL`),
+    leaseIdx: index('agent_turns_lease_idx')
+      .on(t.tenant_id, t.agent_id, t.lease_expires_at)
+      .where(sql`status IN ('claimed', 'running')`),
+    supersededByIdx: index('agent_turns_superseded_by_idx')
+      .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
+      .where(sql`superseded_by_turn_id IS NOT NULL`),
+    liveStatusIdx: index('agent_turns_live_status_idx')
+      .on(t.status, t.updated_at)
+      .where(
+        sql`status IN ('received', 'queued', 'claimed', 'running', 'outbound_pending', 'retryable')`,
+      ),
+  }),
+);
+
+// Associação inbound -> turno. As DUAS FKs são COMPOSTAS por (tenant, agent):
+// é o que impede fisicamente ligar uma mensagem do tenant B a um turno do
+// tenant A. A unique em `mensagem_id` implementa "uma mensagem inbound
+// pertence a no máximo um turno".
+export const agent_turn_inputs = pgTable(
+  'agent_turn_inputs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    turn_id: uuid('turn_id').notNull(),
+    mensagem_id: uuid('mensagem_id').notNull(),
+    /** Ordem de chegada dentro do turno. 0 = mensagem representativa. */
+    ingress_seq: integer('ingress_seq').notNull().default(0),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    mensagemUq: uniqueIndex('agent_turn_inputs_mensagem_uq').on(t.mensagem_id),
+    turnIdx: index('agent_turn_inputs_turn_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.turn_id,
+      t.ingress_seq,
+    ),
+  }),
+);
+
+export type AgentTurn = typeof agent_turns.$inferSelect;
+export type NewAgentTurn = typeof agent_turns.$inferInsert;
+export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
+export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de
+// dados (migration 102).
+//
+// ESCOPO: as três tabelas de backup são DB-wide por natureza (`pg_dump` não
+// tem tenant a que se atribuir) e vivem sob o sentinela RESERVADO `system`
+// (src/db/tenant-context.ts:77) — a migration 101 grava esse contrato num
+// CHECK. As quatro tabelas de ciclo de vida são per-tenant DE VERDADE:
+// tenant_id/agent_id NOT NULL, primeiro em todo índice, e a migration 102
+// recusa o literal legado 'default'.
+// ---------------------------------------------------------------------------
+
+export const backup_runs = pgTable(
+  'backup_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    correlation_id: text('correlation_id').notNull(),
+    /** BackupState — src/ops/backup/state-machine.ts. */
+    state: text('state').notNull().default('scheduled'),
+    profile: text('profile').notNull(),
+    trigger: text('trigger').notNull().default('schedule'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    dump_duration_ms: integer('dump_duration_ms'),
+    upload_duration_ms: integer('upload_duration_ms'),
+    outcome: text('outcome'),
+    outcome_reason: text('outcome_reason'),
+    /** Basename apenas — nunca caminho absoluto. */
+    artifact_ref: text('artifact_ref'),
+    size_bytes: bigint('size_bytes', { mode: 'number' }),
+    sha256: text('sha256'),
+    encryption_mode: text('encryption_mode').notNull().default('none'),
+    /** IDENTIFICADOR de chave. Material de chave nunca é persistido. */
+    encryption_key_id: text('encryption_key_id'),
+    destination_kind: text('destination_kind').notNull().default('local'),
+    /** Locator opaco — src/ops/backup/redaction.ts:opaqueLocator. */
+    destination_locator: text('destination_locator'),
+    local_verified: boolean('local_verified').notNull().default(false),
+    remote_verified: boolean('remote_verified').notNull().default(false),
+    remote_verified_at: timestamp('remote_verified_at', { withTimezone: true }),
+    tombstone_watermark: timestamp('tombstone_watermark', { withTimezone: true }),
+    retention_class: text('retention_class').notNull().default('backup_artifact'),
+    delete_after: timestamp('delete_after', { withTimezone: true }),
+    legal_hold_state: text('legal_hold_state').notNull().default('none'),
+    /** Código estável de falha — NUNCA a stderr crua do pg_dump. */
+    error_code: text('error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    recent_idx: index('backup_runs_recent_idx').on(
+      t.destination_kind,
+      t.remote_verified,
+      t.started_at,
+    ),
+    state_idx: index('backup_runs_state_idx').on(t.state, t.started_at),
+    // O unique parcial de single-flight (WHERE state IN (não-terminais)) e os
+    // CHECKs de forma vivem na migration 101 — Drizzle não os expressa aqui.
+  }),
+);
+
+export const backup_manifests = pgTable(
+  'backup_manifests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    backup_run_id: uuid('backup_run_id')
+      .notNull()
+      .references(() => backup_runs.id),
+    manifest_version: integer('manifest_version').notNull(),
+    manifest: jsonb('manifest').notNull(),
+    manifest_sha256: text('manifest_sha256').notNull(),
+    signature: text('signature').notNull(),
+    signature_alg: text('signature_alg').notNull().default('HMAC-SHA256'),
+    signature_key_version: integer('signature_key_version').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    run_uq: unique('backup_manifests_backup_run_id_key').on(t.backup_run_id),
+    created_idx: index('backup_manifests_created_idx').on(t.created_at),
+  }),
+);
+
+export const restore_drills = pgTable(
+  'restore_drills',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull().default('system'),
+    agent_id: text('agent_id').notNull().default('system'),
+    correlation_id: text('correlation_id').notNull(),
+    backup_run_id: uuid('backup_run_id').references(() => backup_runs.id),
+    source: text('source').notNull().default('local'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    duration_ms: integer('duration_ms'),
+    status: text('status').notNull().default('running'),
+    /** Booleanos e contagens por probe — nunca valores de linha. */
+    probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
+    tombstones_pending: integer('tombstones_pending'),
+    failure_code: text('failure_code'),
+    /**
+     * Estado do HOST depois do teardown (migration 112): `clean` = banco
+     * efêmero e arquivos estagiados provadamente removidos; `unsafe` = alguma
+     * cópia da produção ficou (ou não se pôde provar que não ficou);
+     * `unknown` = o processo morreu antes de conferir. Eixo INDEPENDENTE de
+     * `failure_code`, para que falha de probe e falha de teardown não se
+     * mascarem.
+     */
+    cleanup_status: text('cleanup_status').notNull().default('unknown'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    recent_idx: index('restore_drills_recent_idx').on(t.status, t.started_at),
+    run_idx: index('restore_drills_run_idx').on(t.backup_run_id),
+    /** Parcial: o que se consulta em incidente é "há resíduo?" (migration 112). */
+    unsafe_idx: index('restore_drills_unsafe_idx')
+      .on(t.started_at)
+      .where(sql`cleanup_status = 'unsafe'`),
+  }),
+);
+
+export const legal_holds = pgTable(
+  'legal_holds',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    case_reference: text('case_reference').notNull(),
+    /** Classe de dado congelada; '*' cobre todas as classes do escopo. */
+    data_class: text('data_class').notNull(),
+    /** Sujeito PSEUDONIMIZADO; NULL = hold de escopo amplo. */
+    subject_ref: text('subject_ref'),
+    /** CÓDIGO de motivo — §11 "logs não expõem motivo sensível". */
+    reason_code: text('reason_code').notNull(),
+    status: text('status').notNull().default('active'),
+    effective_from: timestamp('effective_from', { withTimezone: true }).notNull().defaultNow(),
+    effective_until: timestamp('effective_until', { withTimezone: true }),
+    created_by: text('created_by').notNull(),
+    approved_by: text('approved_by'),
+    released_by: text('released_by'),
+    released_at: timestamp('released_at', { withTimezone: true }),
+    release_reevaluated_at: timestamp('release_reevaluated_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    active_idx: index('legal_holds_active_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.status,
+      t.effective_from,
+      t.effective_until,
+    ),
+  }),
+);
+
+export const privacy_requests = pgTable(
+  'privacy_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    type: text('type').notNull(),
+    /** Sujeito PSEUDONIMIZADO — §12 "evitar enumeração por identificador". */
+    subject_ref: text('subject_ref').notNull(),
+    status: text('status').notNull().default('received'),
+    identity_method: text('identity_method'),
+    identity_verified_by: text('identity_verified_by'),
+    identity_verified_at: timestamp('identity_verified_at', { withTimezone: true }),
+    approved_by: text('approved_by'),
+    approved_at: timestamp('approved_at', { withTimezone: true }),
+    due_at: timestamp('due_at', { withTimezone: true }),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    denied_reason_code: text('denied_reason_code'),
+    systems_covered: jsonb('systems_covered').notNull().default(sql`'[]'::jsonb`),
+    exceptions: jsonb('exceptions').notNull().default(sql`'[]'::jsonb`),
+    /** Contagens e códigos, nunca o conteúdo excluído. */
+    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    /** Locator OPACO — jamais uma URL assinada. */
+    export_locator: text('export_locator'),
+    export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
+    export_downloaded_at: timestamp('export_downloaded_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_status_idx: index('privacy_requests_scope_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.created_at,
+    ),
+  }),
+);
+
+export const data_tombstones = pgTable(
+  'data_tombstones',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    data_class: text('data_class').notNull(),
+    /** PSEUDONIMIZADO — o ledger reconhece um sujeito, nunca o enumera. */
+    subject_ref: text('subject_ref'),
+    resource_locator: text('resource_locator'),
+    action: text('action').notNull(),
+    effective_at: timestamp('effective_at', { withTimezone: true }).notNull().defaultNow(),
+    privacy_request_id: uuid('privacy_request_id').references(() => privacy_requests.id),
+    origin: text('origin').notNull().default('privacy_request'),
+    version: integer('version').notNull().default(1),
+    hmac: text('hmac').notNull(),
+    hmac_key_version: integer('hmac_key_version').notNull().default(1),
+    last_reconciled_at: timestamp('last_reconciled_at', { withTimezone: true }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    watermark_idx: index('data_tombstones_watermark_idx').on(
+      t.effective_at,
+      t.tenant_id,
+      t.agent_id,
+    ),
+    scope_class_idx: index('data_tombstones_scope_class_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.effective_at,
+    ),
+  }),
+);
+
+export const retention_runs = pgTable(
+  'retention_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    correlation_id: text('correlation_id').notNull(),
+    data_class: text('data_class').notNull(),
+    dry_run: boolean('dry_run').notNull().default(true),
+    policy_version: text('policy_version').notNull(),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    status: text('status').notNull().default('running'),
+    scanned: integer('scanned').notNull().default(0),
+    eligible: integer('eligible').notNull().default(0),
+    deleted: integer('deleted').notNull().default(0),
+    skipped_held: integer('skipped_held').notNull().default(0),
+    failed: integer('failed').notNull().default(0),
+    cursor_watermark: timestamp('cursor_watermark', { withTimezone: true }),
+    error_code: text('error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scope_idx: index('retention_runs_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.data_class,
+      t.started_at,
+    ),
+    status_idx: index('retention_runs_status_idx').on(t.status, t.started_at),
+  }),
+);
+
+export type BackupRun = typeof backup_runs.$inferSelect;
+export type NewBackupRun = typeof backup_runs.$inferInsert;
+export type BackupManifestRow = typeof backup_manifests.$inferSelect;
+export type NewBackupManifestRow = typeof backup_manifests.$inferInsert;
+export type RestoreDrill = typeof restore_drills.$inferSelect;
+export type NewRestoreDrill = typeof restore_drills.$inferInsert;
+export type LegalHold = typeof legal_holds.$inferSelect;
+export type NewLegalHold = typeof legal_holds.$inferInsert;
+export type PrivacyRequest = typeof privacy_requests.$inferSelect;
+export type NewPrivacyRequest = typeof privacy_requests.$inferInsert;
+export type DataTombstone = typeof data_tombstones.$inferSelect;
+export type NewDataTombstone = typeof data_tombstones.$inferInsert;
+export type RetentionRun = typeof retention_runs.$inferSelect;
+export type NewRetentionRun = typeof retention_runs.$inferInsert;
+
+// ── 108 (issue #519) — saga durável de onboarding ────────────────────────────
+// A migration 108 é a fonte de verdade das CHECKs (estados válidos, rejeição
+// dos literais 'default'/'system', escopo obrigatório por kind). Aqui
+// declaramos apenas os tipos que o Drizzle precisa.
+//
+// `version` é o token de optimistic concurrency: todo comando informa a versão
+// que leu e o UPDATE só casa com ela — dois operadores no mesmo passo produzem
+// UM avanço e um `version_conflict`.
+export const onboarding_runs = pgTable(
+  'onboarding_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    kind: text('kind').notNull(),
+    // NULL só enquanto o recurso ainda não existe (bootstrap global antes de
+    // resolver o tenant; qualquer run antes de criar o agente).
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    state: text('state').notNull().default('created'),
+    current_step: text('current_step'),
+    version: integer('version').notNull().default(1),
+    created_by: text('created_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    last_error_code: text('last_error_code'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    configuration_contract_version: text('configuration_contract_version').notNull(),
+    schema_version: text('schema_version').notNull(),
+    // migration 113 — a criação da run é um COMANDO MUTÁVEL e portanto
+    // idempotente: o ledger de criação vive na própria run (não há tabela
+    // filha onde guardá-lo antes de a run existir). Unicidade em
+    // `onboarding_runs_creation_key_uq` por (kind, tenant, hash).
+    creation_idempotency_key_hash: text('creation_idempotency_key_hash'),
+    creation_payload_hash: text('creation_payload_hash'),
+    // migration 113 — ponto de retomada de `failed_retryable`. Sem eles o
+    // estado autorizava QUALQUER passo anterior; com eles a máquina de estados
+    // só admite o retry do passo que falhou e as remediações declaradas.
+    failed_step: text('failed_step'),
+    resume_state: text('resume_state'),
+  },
+  (t) => ({
+    tenantStateIdx: index('onboarding_runs_tenant_state_idx').on(
+      t.tenant_id,
+      t.state,
+      t.created_at,
+    ),
+  }),
+);
+
+// Append-only. Sustenta reconstrução e diagnóstico do workflow; NÃO substitui
+// `audit_log` (governança). `summary` é sanitizado no código — nada de segredo,
+// telefone, e-mail ou QR entra aqui.
+export const onboarding_events = pgTable(
+  'onboarding_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    step: text('step').notNull(),
+    event_type: text('event_type').notNull(),
+    actor_id: text('actor_id').notNull(),
+    correlation_id: text('correlation_id'),
+    idempotency_key_hash: text('idempotency_key_hash'),
+    from_state: text('from_state'),
+    to_state: text('to_state'),
+    summary: jsonb('summary').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    runIdx: index('onboarding_events_run_idx').on(t.run_id, t.created_at),
+    tenantIdx: index('onboarding_events_tenant_idx').on(t.tenant_id, t.created_at),
+  }),
+);
+
+// Ledger de idempotência: o resultado persistido de cada comando concluído.
+// UNIQUE (run_id, step, idempotency_key_hash) — mesma chave devolve o mesmo
+// resultado; chave igual com payload divergente é conflito.
+export const onboarding_step_results = pgTable(
+  'onboarding_step_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    step: text('step').notNull(),
+    idempotency_key_hash: text('idempotency_key_hash').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    // migration 113 — o ledger guarda RESULTADOS CONCLUSIVOS TIPADOS, não só
+    // sucessos: uma negativa de governança e um cancelamento também são
+    // conclusões, e sem elas o retry da mesma chave devolvia `version_conflict`
+    // / `run_terminal` em vez da resposta anterior.
+    outcome_kind: text('outcome_kind').notNull().default('success'),
+    outcome_code: text('outcome_code'),
+    outcome_message: text('outcome_message'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    keyUq: uniqueIndex('onboarding_step_results_key_uq').on(
+      t.run_id,
+      t.step,
+      t.idempotency_key_hash,
+    ),
+    runIdx: index('onboarding_step_results_run_idx').on(t.run_id, t.created_at),
+  }),
+);
+
+export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+export type NewOnboardingRunRow = typeof onboarding_runs.$inferInsert;
+export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
+export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
+export type OnboardingStepResultRow = typeof onboarding_step_results.$inferSelect;
+export type NewOnboardingStepResultRow = typeof onboarding_step_results.$inferInsert;

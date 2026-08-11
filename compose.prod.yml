@@ -1,0 +1,267 @@
+# =======================================================================
+# compose.prod.yml — compose de PRODUÇÃO (auditoria P0 cap. 6).
+#
+# Uso:
+#   docker compose --env-file .env.infra -f compose.prod.yml up -d
+#
+# As variáveis de interpolação (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD)
+# são OBRIGATÓRIAS (sintaxe `:?` — o compose aborta se faltarem, nada de
+# fallback maia/maia). Elas vêm do shell do deploy ou de um env-file
+# passado via `--env-file` (ex.: .env.infra). Esse arquivo serve SÓ para
+# interpolação — ele NÃO é injetado em nenhum container. Cada serviço
+# recebe apenas o seu próprio env_file:
+#   app      → .env.app    (ver .env.app.prod.example)
+#   admin-ui → .env.admin  (ver .env.admin.prod.example)
+#
+# Postura de segurança vs docker-compose.yml (dev):
+#   - postgres/redis NÃO publicam porta no host: vivem na rede `data`
+#     (internal: true), alcançáveis apenas por app/admin-ui.
+#   - app/admin-ui também NÃO publicam porta: o reverse proxy
+#     (nginx/Traefik/Coolify) conecta-se à rede `web` deste projeto e
+#     roteia para app:3000 / admin-ui:4000.
+#   - Redis exige autenticação (--requirepass) e o healthcheck autentica
+#     via REDISCLI_AUTH (senha fora do argv do healthcheck).
+#   - Todos os serviços rodam non-root, rootfs read-only (tmpfs onde
+#     preciso), cap_drop ALL, no-new-privileges e pids_limit.
+#
+# Wiring do reverse proxy (fora deste arquivo): no compose do proxy,
+# declare a rede como externa e conecte o serviço a ela, ex.:
+#   networks:
+#     maia_web:
+#       external: true
+#       name: maia-v2_web   # <project>_web — confira com `docker network ls`
+#
+# Verificação pós-deploy, migração de volumes root-era e rollback:
+# docs/runbooks/deploy-prod.md.
+# =======================================================================
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: maia-postgres
+    restart: unless-stopped
+    # Non-root desde o boot: o entrypoint nunca roda como root. Volumes
+    # criados por deployments antigos já pertencem ao uid 999 (o entrypoint
+    # root-era fazia chown para `postgres` antes de dropar privilégio).
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required in prod (no fallback)}
+      # Sem fallback: faltou senha ⇒ o compose aborta em vez de subir maia/maia.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in prod (no fallback; min 8 chars, URL-safe)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required in prod (no fallback)}
+      TZ: America/Sao_Paulo
+      PGTZ: America/Sao_Paulo
+    # SEM `ports:` — 5432 nunca chega ao host em produção.
+    networks:
+      - data
+    volumes:
+      - maia_pg_data:/var/lib/postgresql/data
+      - ./migrations:/migrations:ro
+    read_only: true
+    tmpfs:
+      # Socket unix + scratch. tmpfs monta com mode 1777 (gravável pelo
+      # uid 999 mesmo com rootfs read-only).
+      - /tmp
+      - /var/run/postgresql
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    healthcheck:
+      # `$$` escapa a interpolação do compose: o shell DO CONTAINER expande
+      # POSTGRES_USER/DB em runtime. pg_isready usa o socket local e não
+      # recebe/loga senha alguma.
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: maia-redis
+    restart: unless-stopped
+    # uid 999 na imagem alpine; volumes root-era já pertencem a `redis`
+    # (o entrypoint antigo fazia chown antes do su-exec).
+    user: redis
+    # IMPORTANT: --maxmemory-policy MUST stay `noeviction` (or `volatile-lru`)
+    # in any environment with more than one tenant: key-prefixing alone does
+    # NOT protect a tenant from being evicted to make room for another tenant
+    # under `allkeys-*` policies. Full rationale in docker-compose.yml (dev)
+    # and `docs/runbooks/redis.md` §4 — pressure surfaces as WRITE FAILURE,
+    # monitoring via `redis-cli INFO memory` until #297/#309 land.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "2gb"
+      - "--maxmemory-policy"
+      - "noeviction"
+      # AUTH obrigatória — Redis sem senha não sobe em produção.
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD is required in prod (unauthenticated Redis is not allowed)}"
+    environment:
+      # redis-cli lê REDISCLI_AUTH do ambiente — o healthcheck autentica sem
+      # colocar a senha no argv (que vazaria em `docker inspect`/ps).
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is required in prod}
+    # SEM `ports:` — 6379 nunca chega ao host em produção.
+    networks:
+      - data
+    volumes:
+      - maia_redis_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    healthcheck:
+      # PING AUTENTICADO (via REDISCLI_AUTH acima). Um PING sem auth
+      # responderia NOAUTH e o grep falharia — ou seja, o healthcheck também
+      # falha se alguém remover o --requirepass por engano.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # uid/gid 1001 (`maia`) já é o USER do runtime stage do Dockerfile;
+    # repetir aqui garante que um drift na imagem não traga root de volta.
+    user: "1001:1001"
+    # Apenas os segredos DO APP — nada de .env global (o admin-ui tem o seu).
+    env_file:
+      - .env.app
+    environment:
+      NODE_ENV: production
+      # DATABASE_URL/REDIS_URL compostas das MESMAS vars obrigatórias com que
+      # os datastores sobem — sem fallback e sem drift entre serviço e URL.
+      # NOTA: a senha entra numa URL — use senha URL-safe (ex.:
+      # `openssl rand -hex 24`) ou percent-encode caracteres reservados.
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      # src/config/env.ts também exige as vars discretas (backup/scripts):
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      TZ: America/Sao_Paulo
+    # SEM `ports:` — o proxy alcança app:3000 pela rede `web`.
+    networks:
+      - data
+      - web
+    volumes:
+      # Estado persistente: sessão Baileys + mídia. Devem ser graváveis pelo
+      # uid 1001 — volumes novos herdam o chown feito no Dockerfile; volumes
+      # de um deployment root-era precisam de chown único (ver runbook).
+      - maia_baileys_auth:/app/.baileys-auth
+      - maia_media:/app/media
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    # Issue #512 — a janela de drain tem que caber ANTES do SIGKILL do Docker
+    # (default 10s). SHUTDOWN_GRACE_MS (default 25s) + fechamento de recursos
+    # cabe em 40s; se aumentar o grace no .env, aumente isto junto.
+    stop_grace_period: 40s
+    healthcheck:
+      # Issue #512 — LIVENESS usa `/livez`: sem I/O, sem DB/Redis/WhatsApp. O
+      # healthcheck antigo batia em `/health`, que agrega dependências: uma
+      # queda de Postgres marcava o CONTAINER unhealthy e o restart matava o
+      # processo em vez de deixar o `/readyz` tirar a instância de rotação.
+      # Node 22 tem fetch global — sem curl/wget, sem segredo no comando.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/livez').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Startup: `/startupz` só vira 200 quando o lifecycle chega em `ready`.
+      start_period: 30s
+
+  # admin-ui (Next.js) — container separado; o proxy roteia
+  # `admin.${DOMAIN}` → admin-ui:4000 pela rede `web`.
+  admin-ui:
+    build:
+      context: .
+      dockerfile: src/admin-ui/Dockerfile
+    container_name: maia-admin-ui
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "1001:1001"
+    # Apenas os segredos DO ADMIN (NextAuth/OIDC + o mínimo transitivo que
+    # src/config/env.ts exige) — o .env do app NÃO entra aqui.
+    env_file:
+      - .env.admin
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      # env.ts (importado transitivamente via @/db/client.ts) valida
+      # REDIS_URL como URL mesmo que o admin-ui nunca abra conexão Redis.
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      # NEXTAUTH_URL/NEXTAUTH_SECRET vêm de .env.admin — `resolveSecret()`
+      # (src/admin-ui/lib/auth-gating.ts) recusa boot com secret <32 chars
+      # ou placeholder conhecido.
+      #
+      # AUTH_TRUST_HOST=true: atrás de reverse proxy que termina TLS, o
+      # proxy é a borda confiável para validação de Host (NextAuth v5).
+      AUTH_TRUST_HOST: 'true'
+      TZ: America/Sao_Paulo
+    # SEM `ports:` — o proxy alcança admin-ui:4000 pela rede `web`.
+    networks:
+      - data
+      - web
+    read_only: true
+    tmpfs:
+      - /tmp
+      # Next.js escreve cache de runtime (ISR/imagens/fetch-cache) aqui.
+      - /app/src/admin-ui/.next/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    healthcheck:
+      # Qualquer resposta <500 = servidor de pé (a raiz pode redirecionar
+      # para o sign-in). Sem credencial no comando.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/').then(function(r){process.exit(r.status<500?0:1)}).catch(function(){process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  # Rede interna dos datastores: SEM rota para fora do host (internal) —
+  # postgres/redis só falam com app/admin-ui.
+  data:
+    internal: true
+  # Rede de entrada: o reverse proxy conecta-se a ela para alcançar
+  # app:3000 / admin-ui:4000. Nenhum serviço publica porta no host.
+  web:
+
+volumes:
+  # Mesmos nomes do compose de dev de propósito: um host que migra do
+  # docker-compose.yml antigo para este arquivo (mesmo diretório ⇒ mesmo
+  # project name) REUSA os dados existentes. `up -d` nunca apaga volumes;
+  # evite `down -v` em produção.
+  maia_pg_data:
+  maia_redis_data:
+  maia_baileys_auth:
+  maia_media:

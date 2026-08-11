@@ -1,11 +1,12 @@
-import { eq, and, sql } from 'drizzle-orm';
-import { db } from '../client.js';
+import { eq, and, sql, inArray, asc } from 'drizzle-orm';
+import { db, withTx, pgErrorCode } from '../client.js';
 import {
   pessoas,
   agent_audience_profiles,
   agent_tool_grants,
   permissoes,
   permission_profiles,
+  admin_audit_log,
 } from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
@@ -331,6 +332,147 @@ export const agentToolGrantsRepo = {
       .returning();
     return rows[0]!;
   },
+
+  /**
+   * Read-modify-write the grant AND append its admin_audit_log row in ONE
+   * transaction — "audit every decision": a failed audit insert rolls the
+   * grant back. Same contract family as channelsRepo.createWithAudit
+   * (PR #491 review): explicit tenant/agent args (no ALS).
+   *
+   * PR #494 review [medium] — the CURRENT row is read INSIDE the tx under
+   * `SELECT ... FOR UPDATE`, and the caller supplies a PURE `compute`
+   * function instead of a precomputed grant. Without the lock, two writers
+   * (e.g. /setup/mcp toggling a pack while the capabilities modal saves)
+   * could read the same snapshot and the last full-array upsert would clobber
+   * the other's change — and the audit `previous` would record the stale
+   * snapshot rather than the value actually replaced.
+   *
+   * `compute` MUST be synchronous and side-effect free. Returning
+   * `{ ok: false, reject }` aborts with rollback (nothing written) and the
+   * opaque `reject` payload is surfaced to the caller for error mapping.
+   *
+   * First-write race (no row to lock yet): two concurrent inserts collide on
+   * the (tenant, agent) UNIQUE — the loser retries the whole tx once, now
+   * serialized by the winner's row.
+   */
+  async updateWithAudit(args: {
+    tenant_id: string;
+    agent_id: string;
+    compute: (current: AgentToolGrantRow | null) =>
+      | {
+          ok: true;
+          granted_packs: string[];
+          granted_tools: string[];
+          denied_tools: string[];
+        }
+      | { ok: false; reject: unknown };
+    granted_by: string;
+    reason: string;
+    audit: {
+      actor_id: string;
+      actor_role: string;
+      action: string;
+    };
+  }): Promise<
+    | { ok: true; grant: AgentToolGrantRow }
+    | { ok: false; reject: unknown }
+  > {
+    const attempt = () =>
+      withTx(async (tx) => {
+        const currentRows = await tx
+          .select()
+          .from(agent_tool_grants)
+          .where(
+            and(
+              eq(agent_tool_grants.tenant_id, args.tenant_id),
+              eq(agent_tool_grants.agent_id, args.agent_id),
+            ),
+          )
+          .limit(1)
+          .for('update');
+        const current = currentRows[0] ?? null;
+
+        const next = args.compute(current);
+        if (!next.ok) return next;
+
+        // Deliberately NOT an upsert: with the row locked, an existing grant
+        // takes the UPDATE path; a missing grant takes a PLAIN insert so a
+        // concurrent first-writer collides on the (tenant, agent) UNIQUE and
+        // hits the 23505 retry below. An ON CONFLICT DO UPDATE here would
+        // let the loser silently overwrite the winner with a compute(null)
+        // result — the exact lost-update this helper exists to prevent.
+        const [row] = current
+          ? await tx
+              .update(agent_tool_grants)
+              .set({
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
+                granted_by: args.granted_by,
+                reason: args.reason,
+                updated_at: new Date(),
+              })
+              .where(
+                and(
+                  eq(agent_tool_grants.tenant_id, args.tenant_id),
+                  eq(agent_tool_grants.agent_id, args.agent_id),
+                ),
+              )
+              .returning()
+          : await tx
+              .insert(agent_tool_grants)
+              .values({
+                tenant_id: args.tenant_id,
+                agent_id: args.agent_id,
+                granted_packs: next.granted_packs,
+                granted_tools: next.granted_tools,
+                denied_tools: next.denied_tools,
+                granted_by: args.granted_by,
+                reason: args.reason,
+              })
+              .returning();
+        if (!row) {
+          throw new Error('grant_update_with_audit_upsert_failed: returning() empty');
+        }
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.audit.actor_id,
+          actor_role: args.audit.actor_role,
+          action: args.audit.action,
+          resource_type: 'agent_tool_grant',
+          resource_id: args.agent_id,
+          change_summary: {
+            agent_id: args.agent_id,
+            previous: current
+              ? {
+                  granted_packs: current.granted_packs,
+                  granted_tools: current.granted_tools,
+                  denied_tools: current.denied_tools,
+                }
+              : null,
+            next: {
+              granted_packs: next.granted_packs,
+              granted_tools: next.granted_tools,
+              denied_tools: next.denied_tools,
+            },
+            reason: args.reason,
+          },
+        });
+        return { ok: true as const, grant: row };
+      });
+
+    try {
+      return await attempt();
+    } catch (err) {
+      // Concurrent FIRST write: both saw no row (nothing to lock), the loser
+      // hits the (tenant, agent) UNIQUE. One retry is now serialized by the
+      // winner's committed row.
+      if (pgErrorCode(err) === '23505') {
+        return attempt();
+      }
+      throw err;
+    }
+  },
 };
 
 export const permissoesRepo = {
@@ -430,6 +572,44 @@ export const profilesRepo = {
       .where(eq(permission_profiles.id, id))
       .limit(1);
     return rows[0] ?? null;
+  },
+  /**
+   * Issue #511 — batch sibling of `byId`, replacing the per-permission lookup
+   * loop in `resolveScope` (`src/governance/permissions.ts`).
+   *
+   * TENANT-SCOPED, unlike `byId`. `permission_profiles` carries NOT NULL
+   * `tenant_id` + `agent_id` (schema `src/db/schema.ts` `permission_profiles`),
+   * and a profile is what decides which ACTIONS and which SPEND LIMIT a person
+   * gets — reading one by id alone would let a `permissoes` row pointing at a
+   * foreign profile id resolve to that other tenant's action list. `byId` is
+   * left unscoped for now (its only remaining caller is the interactive
+   * `scripts/pessoa-add.ts`, which runs outside a tenant frame); the hot path
+   * moves here, so the turn now resolves scope under an exact tenant predicate.
+   *
+   * Missing ids are simply absent from the result — the caller decides what an
+   * unresolvable profile means. `resolveScope` skips the permission entirely,
+   * which is the fail-closed reading: no profile, no grant.
+   *
+   * Deterministic ordering by id (the same permission set must render the same
+   * prompt every turn) and an explicit row cap so one tenant cannot make a
+   * single statement unbounded.
+   */
+  async byIds(ids: string[], limit = 500): Promise<PermissionProfile[]> {
+    if (ids.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(permission_profiles)
+      .where(
+        and(
+          eq(permission_profiles.tenant_id, tenant_id),
+          eq(permission_profiles.agent_id, agent_id),
+          inArray(permission_profiles.id, Array.from(new Set(ids))),
+        ),
+      )
+      .orderBy(asc(permission_profiles.id))
+      .limit(limit);
   },
   async list(): Promise<PermissionProfile[]> {
     return db.select().from(permission_profiles);

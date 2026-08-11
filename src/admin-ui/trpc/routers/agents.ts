@@ -14,16 +14,19 @@
  *                      approved through the standard proposal-inbox flow.
  *
  * Notes:
- *   - All three mutations (create / updateProfile / approveProfile) now go
- *     through repo-level "atomic" methods that take explicit tenant_id/agent_id
- *     and wrap their writes in `withTx`. Codex review of PR #162 round 3
- *     (issue #166) closed the multi-write atomicity gap.
+ *   - Both mutations (create / updateProfile) go through repo-level "atomic"
+ *     methods that take explicit tenant_id/agent_id and wrap their writes in
+ *     `withTx`. Codex review of PR #162 round 3 (issue #166) closed the
+ *     multi-write atomicity gap.
  *   - The tenant_id ALWAYS comes from the resolved ctx tenant (no body
  *     override for owner — only founder can supply a body tenantId).
  *   - We deliberately do NOT auto-activate the seeded profile. P8.5 invariant
  *     is "no profile activates without an approval"; admin-ui setup respects
- *     this — a freshly-created agent has no active profile until owner/founder
- *     approves the seed via the Proposal Inbox.
+ *     this — a freshly-created agent has no active profile until the seed is
+ *     approved. Spec perfil-inbox v4 fase C: a DECISÃO de perfis vive só no
+ *     motor unificado (`proposals.approve`/`reject` — /inbox e aba Versões
+ *     chamam o mesmo endpoint); o shim `approveProfile` e o card bespoke
+ *     `pendingProfileApprovals` foram removidos junto com a flag.
  *   - role gate: founder or owner. analyst/viewer cannot create agents.
  */
 import { z } from 'zod';
@@ -35,6 +38,9 @@ import { PROFILE_BODY_SCHEMA_VERSION, type ProfileBody } from '../../../db/schem
 import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP } from '../../../tools/archetype-packs.js';
 import { BASE_AGENT_PACKS } from '../../../tools/base-agent-packs.js';
 import { TOOL_PACKS, resolvePackTools } from '../../../tools/grant-math.js';
+// Módulo puro (sem registry/db) — mesma gramática de nome que o bridge usa em
+// runtime, para o console não inventar um nome de tool MCP diferente (#481).
+import { mcpToolName } from '../../../tools/mcp-tool-names.js';
 
 const AgentIdSchema = z
   .string()
@@ -128,28 +134,18 @@ const ProfileBodyInputSchema = z
       }
     });
   })
-  // Codex `/codex:review` of PR #201 round 2 [P2] — cross-PR fallback hazard.
+  // Originally a safety gate (PR #201 round 2 [P2]) for a runtime hazard:
+  // the IdentitySliceBuilder used to fall back to `identity.principles` for
+  // `slice.priorities` when priorities was empty, so `priorities: []` +
+  // non-empty `principles` would surface core value contracts as operational
+  // priorities. PR #200 (#192) removed that fallback — the hazard is gone.
   //
-  // The runtime IdentitySliceBuilder (`src/runtime/context-assembly/slice-
-  // builders/identity-slice-builder.ts`, both P8a class and P8d function)
-  // still falls back to `identity.principles` for `slice.priorities` when
-  // `identity.priorities` is empty. PR #200 (#192) is the symmetric fix to
-  // remove that fallback but is still OPEN at the time of this PR.
-  //
-  // If we let a client write `priorities: []` + non-empty `principles` now,
-  // the persisted body's core value contracts would be rendered/audited as
-  // operational priorities — exactly the cross-domain contamination this
-  // PR is trying to fix at the API ingress. We refuse the combination
-  // server-side until #200 removes the slice-builder fallback. Once that
-  // ships, this gate becomes redundant and can be relaxed (but it does no
-  // harm to keep — there is no legitimate "principles without priorities"
-  // workflow; principles are an addition on top of, not a replacement for,
-  // operational priorities).
-  //
-  // Trade-off: the gate forces operators to declare at least one priority
-  // when they configure principles. We accept this — the wizard already
-  // surfaces both fields and an agent with declared core value contracts
-  // but no operational priorities is an incoherent identity descriptor.
+  // The gate is KEPT deliberately as a product rule: there is no legitimate
+  // "principles without priorities" workflow (principles are an addition on
+  // top of, not a replacement for, operational priorities), and an agent
+  // with declared core value contracts but no operational priorities is an
+  // incoherent identity descriptor. The wizard mirrors this client-side
+  // (validateIdentity in profile-form.tsx).
   .superRefine((data, ctx) => {
     const principles = data.identity.principles;
     if (!principles || principles.length === 0) return;
@@ -158,11 +154,9 @@ const ProfileBodyInputSchema = z
         code: z.ZodIssueCode.custom,
         path: ['identity', 'priorities'],
         message:
-          `priorities cannot be empty when principles are declared. The runtime ` +
-          `slice builder (IdentitySliceBuilder, #192/PR #200 pending) falls back ` +
-          `to identity.principles when priorities is empty, which would surface ` +
-          `core value contracts as operational priorities — the same cross-domain ` +
-          `contamination this PR forbids. Declare at least one priority alongside ` +
+          `priorities cannot be empty when principles are declared — principles ` +
+          `are core value contracts layered ON TOP of operational priorities, ` +
+          `not a replacement for them. Declare at least one priority alongside ` +
           `principles.`,
       });
     }
@@ -188,18 +182,26 @@ const CreateInputSchema = z.object({
   archetype: z.enum(ARCHETYPE_IDS).optional(),
 });
 
+const UpdateCapabilitiesInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: AgentIdSchema,
+  // Packs de PRODUTO desejados (catálogo TOOL_PACKS). Packs fora do catálogo
+  // presentes no grant atual (ex.: mcp.<server>, geridos em /setup/mcp) são
+  // PRESERVADOS — esta superfície não os gerencia. Pack desconhecido no input
+  // é rejeitado (fail-closed), não ignorado.
+  granted_packs: z.array(z.string().min(1).max(100)).max(50),
+  // HARD deny — substitui a lista atual. Cada entrada deve ser uma tool
+  // efetiva do novo conjunto (ou já estar negada hoje, para permitir manter
+  // denies históricos de tools que saíram de visibilidade).
+  denied_tools: z.array(z.string().min(1).max(200)).max(100),
+  comment: z.string().min(10).max(1000),
+});
+
 const UpdateProfileInputSchema = z.object({
   tenantId: z.string().optional(),
   agentId: AgentIdSchema,
   profile_body: ProfileBodyInputSchema,
   proposed_reason: z.string().min(10).max(2000),
-});
-
-const ApproveProfileInputSchema = z.object({
-  tenantId: z.string().optional(),
-  agentId: AgentIdSchema,
-  versionId: z.string().uuid(),
-  comment: z.string().min(10).max(2000),
 });
 
 /**
@@ -252,9 +254,11 @@ function buildProfileBody(
       voice: input.identity.voice,
       cognitive_limits: input.identity.cognitive_limits,
       priorities: input.identity.priorities,
+      // `principles` é campo canônico desde v3.1.2 (spec perfil-inbox §1.2) —
+      // sem cast: o tipo ProfileBody admite o campo diretamente.
       principles,
       learned_voice_modifiers: [],
-    } as ProfileBody['identity'] & { principles: string[] },
+    },
     style: {
       language: input.style.language,
       rhythm: input.style.rhythm,
@@ -288,6 +292,119 @@ function extractActivePrinciples(activeProfileBody: unknown): string[] | null {
   if (!Array.isArray(principles)) return null;
   if (!principles.every((p): p is string => typeof p === 'string')) return null;
   return principles;
+}
+
+/** Entrada de pack no contrato de `getCapabilities`. */
+type CapabilityPack = {
+  id: string;
+  name: string;
+  risk_level: string | null;
+  tools: string[];
+  known: boolean;
+  /** true = pack de servidor externo (MCP), gerido em /setup/mcp. */
+  external: boolean;
+};
+
+/**
+ * Dependências mínimas (estruturais) de `resolveMcpPacks` — evita amarrar o
+ * helper ao tipo completo do contexto tRPC e mantém o mock dos testes enxuto.
+ */
+type McpCapabilityCtx = {
+  repos: {
+    mcpServersRepo: {
+      listByTenant(tenant_id: string): Promise<Array<{ name: string; status: string }>>;
+    };
+    mcpServerToolsRepo: {
+      listExecutable(args: {
+        tenant_id: string;
+      }): Promise<Array<{ tool_name: string; risk_class: string; server_name: string }>>;
+    };
+  };
+};
+
+const MCP_PACK_PREFIX = 'mcp.';
+const RISK_ORDER = ['low', 'medium', 'high', 'critical'] as const;
+
+/**
+ * Issue #481 item 3 — resolve os packs `mcp.<server>` do grant contra as SoTs
+ * de MCP. Retorna um mapa pack_id → entrada pronta para o card.
+ *
+ * Fail-soft por design: se as SoTs de MCP não responderem, cada pack MCP cai
+ * na entrada "crua" (id, 0 tools) — o card degrada como hoje em vez de a tela
+ * inteira de capacidades quebrar. NÃO é fail-open de segurança: nada aqui
+ * concede acesso; a execução é revalidada no bridge a cada chamada.
+ */
+async function resolveMcpPacks(
+  ctx: McpCapabilityCtx,
+  tenantId: string,
+  grantedPacks: readonly string[],
+): Promise<Map<string, CapabilityPack>> {
+  const out = new Map<string, CapabilityPack>();
+  const mcpPackIds = grantedPacks.filter(
+    (id) => TOOL_PACKS[id] === undefined && id.startsWith(MCP_PACK_PREFIX),
+  );
+  if (mcpPackIds.length === 0) return out;
+
+  let sots:
+    | [
+        Array<{ name: string; status: string }>,
+        Array<{ tool_name: string; risk_class: string; server_name: string }>,
+      ]
+    | null;
+  try {
+    sots = await Promise.all([
+      ctx.repos.mcpServersRepo.listByTenant(tenantId),
+      ctx.repos.mcpServerToolsRepo.listExecutable({ tenant_id: tenantId }),
+    ]);
+  } catch {
+    sots = null;
+  }
+  if (sots === null) return out;
+  const [servers, executable] = sots;
+
+  const serverByName = new Map(servers.map((s) => [s.name, s]));
+  const toolsByServer = new Map<string, Array<{ tool_name: string; risk_class: string }>>();
+  for (const t of executable) {
+    const list = toolsByServer.get(t.server_name);
+    if (list) list.push(t);
+    else toolsByServer.set(t.server_name, [t]);
+  }
+
+  for (const packId of mcpPackIds) {
+    const serverName = packId.slice(MCP_PACK_PREFIX.length);
+    const server = serverByName.get(serverName);
+    const tools = toolsByServer.get(serverName) ?? [];
+    // Pack apontando para server inexistente/removido: mantém o id cru, que
+    // é o sinal honesto de "grant órfão" para o operador.
+    if (!server) {
+      out.set(packId, {
+        id: packId,
+        name: packId,
+        risk_level: null,
+        tools: [],
+        known: false,
+        external: true,
+      });
+      continue;
+    }
+    const risk = tools.reduce<string | null>((acc, t) => {
+      const a = acc === null ? -1 : RISK_ORDER.indexOf(acc as (typeof RISK_ORDER)[number]);
+      const b = RISK_ORDER.indexOf(t.risk_class as (typeof RISK_ORDER)[number]);
+      return b > a ? t.risk_class : acc;
+    }, null);
+    out.set(packId, {
+      id: packId,
+      // Server desativado ainda aparece — mas o operador precisa ver POR QUE
+      // o pack não rende ferramentas (listExecutable já exclui server
+      // inativo, então `tools` vem vazia).
+      name: server.status === 'active' ? `MCP · ${serverName}` : `MCP · ${serverName} (desativado)`,
+      risk_level: risk,
+      tools: tools.map((t) => mcpToolName(serverName, t.tool_name)),
+      known: true,
+      external: true,
+    });
+  }
+  return out;
 }
 
 export const agentsRouter = router({
@@ -347,8 +464,24 @@ export const agentsRouter = router({
   /**
    * Issue #470 — capacidades efetivas do agente para exibição no console:
    * grant row (packs/tools/denied) + resolução pack→tools via o registry
-   * (grant-math, fail-closed). Read-only; edição de grants continua fora do
-   * escopo desta superfície (mudança de capacidade passa por proposta).
+   * (grant-math, fail-closed). Edição de packs/denies: updateCapabilities
+   * (fase 4); aquisição de tools NOVAS continua via propostas.
+   *
+   * Issue #481 item 3 — packs `mcp.<server>` NÃO vivem no catálogo estático
+   * (são dados por tenant, criados em /setup/mcp). Antes caíam no ramo
+   * "desconhecido" e apareciam no card com o id cru e 0 ferramentas. Agora
+   * são resolvidos contra as SoTs de MCP: nome do server (mcp_servers) e
+   * ferramentas realmente EXECUTÁVEIS (aprovadas + read-only + server ativo,
+   * `mcpServerToolsRepo.listExecutable`) — a mesma lista que o bridge usa em
+   * runtime, então o console não promete o que o dispatcher recusaria.
+   *
+   * `effective_tools`/`effective_tool_count` continuam sendo SÓ tools do
+   * REGISTRY, de propósito: (a) a visibilidade MCP é gated por
+   * FEATURE_MCP_TOOLS no processo do runtime (default OFF) e capada por
+   * turno, e (b) `denied_tools` não se aplica a nomes `mcp:*` (o bridge não
+   * consulta hard-denies) — contá-las aqui prometeria um controle que não
+   * existe. Os packs externos são marcados com `external: true` para o card
+   * poder explicar a diferença.
    */
   getCapabilities: protectedProcedure
     .input(GetByIdInputSchema)
@@ -362,21 +495,39 @@ export const agentsRouter = router({
         { tenant_id: tenantId, agent_id: agent.id },
         async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
       );
-      // Mesmo contrato fail-closed do runtime: sem row ⇒ floor da plataforma.
+      // Mesmo contrato do runtime (resolveGrantedToolNames): com row, o único
+      // piso inamovível é baseline.core — domain.calendar é padrão de CRIAÇÃO
+      // (BASE_AGENT_PACKS/coluna default), mas revogável via updateCapabilities;
+      // unir BASE_AGENT_PACKS aqui exibiria calendar como concedido após uma
+      // revogação. Sem row ⇒ floor da plataforma (o que uma row nova teria).
       const grantedPacks = grant
-        ? [...new Set([...BASE_AGENT_PACKS, ...grant.granted_packs])]
+        ? [...new Set(['baseline.core', ...grant.granted_packs])]
         : [...BASE_AGENT_PACKS];
       const deniedTools = grant?.denied_tools ?? [];
       const deniedSet = new Set(deniedTools);
+      const mcpPacks = await resolveMcpPacks(ctx, tenantId, grantedPacks);
       const packs = grantedPacks.map((id) => {
         const def = TOOL_PACKS[id];
-        return {
-          id,
-          name: def?.name ?? id,
-          risk_level: def?.risk_level ?? null,
-          tools: def ? [...def.tools] : [],
-          known: def !== undefined,
-        };
+        if (def) {
+          return {
+            id,
+            name: def.name ?? id,
+            risk_level: def.risk_level ?? null,
+            tools: [...def.tools],
+            known: true,
+            external: false,
+          };
+        }
+        return (
+          mcpPacks.get(id) ?? {
+            id,
+            name: id,
+            risk_level: null,
+            tools: [] as string[],
+            known: false,
+            external: false,
+          }
+        );
       });
       const effectiveTools = [
         ...new Set([
@@ -391,6 +542,105 @@ export const agentsRouter = router({
         effective_tool_count: effectiveTools.length,
         effective_tools: effectiveTools,
         reason: grant?.reason ?? null,
+      };
+    }),
+
+  /**
+   * Edição de grants de packs de domínio + hard denies do agente — fase 4 do
+   * relatório de complexidade. Segue a decisão da spec §2.8 inaugurada por
+   * mcp.setAgentPack ("primeira superfície de EDIÇÃO de grants"): owner/founder,
+   * audit direto — aqui com upsert+audit ATÔMICOS (updateWithAudit, mesma
+   * classe de invariante do review do PR #491). Aquisição de tools NOVAS
+   * continua no fluxo de propostas (capability_proposals); esta superfície só
+   * compõe packs já existentes no catálogo e denies.
+   *
+   * Regras fail-closed:
+   *   - pack desconhecido no input ⇒ BAD_REQUEST (não é ignorado);
+   *   - `baseline.core` é sempre reinserido (piso de runtime — ver
+   *     resolveGrantedToolNames); packs fora do catálogo (mcp.*) do grant
+   *     atual são preservados;
+   *   - denied_tools: cada entrada precisa ser tool efetiva do NOVO conjunto,
+   *     tool avulsa concedida, ou já estar negada hoje.
+   */
+  updateCapabilities: protectedProcedure
+    .input(UpdateCapabilitiesInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      const unknownPacks = input.granted_packs.filter((p) => TOOL_PACKS[p] === undefined);
+      if (unknownPacks.length > 0) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Unknown pack(s): ${unknownPacks.join(', ')} — only catalog packs can be granted here`,
+        });
+      }
+
+      // Review do PR #494 [medium]: todo o read-modify-write roda dentro da
+      // transação do helper, com o grant atual lido sob FOR UPDATE — a
+      // preservação de packs não-gerenciados e a validação de denies são
+      // computadas contra o estado SERIALIZADO, não contra um snapshot que
+      // outro writer (ex.: toggle MCP em /setup/mcp) pode ter invalidado.
+      const result = await ctx.repos.agentToolGrantsRepo.updateWithAudit({
+        tenant_id: tenantId,
+        agent_id: agent.id,
+        compute: (current) => {
+          // Preserva packs não-gerenciados por esta superfície (fora do
+          // catálogo, ex.: mcp.<server> — geridos em /setup/mcp). Sem isso,
+          // um save aqui revogaria silenciosamente o acesso MCP concedido
+          // em outra tela.
+          const unmanagedPacks = (current?.granted_packs ?? []).filter(
+            (p) => TOOL_PACKS[p] === undefined,
+          );
+          const nextPacks = [
+            ...new Set(['baseline.core', ...input.granted_packs, ...unmanagedPacks]),
+          ];
+          const grantedTools = current?.granted_tools ?? [];
+          const nextEffective = new Set([
+            ...resolvePackTools(nextPacks),
+            ...grantedTools,
+          ]);
+          const currentDenied = new Set(current?.denied_tools ?? []);
+          const invalidDenies = input.denied_tools.filter(
+            (t) => !nextEffective.has(t) && !currentDenied.has(t),
+          );
+          if (invalidDenies.length > 0) {
+            return { ok: false, reject: { invalid_denies: invalidDenies } };
+          }
+          return {
+            ok: true,
+            granted_packs: nextPacks,
+            granted_tools: grantedTools,
+            denied_tools: [...new Set(input.denied_tools)],
+          };
+        },
+        granted_by: ctx.userId,
+        reason: input.comment,
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'agent_capabilities_update',
+        },
+      });
+
+      if (!result.ok) {
+        const reject = result.reject as { invalid_denies?: string[] };
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message:
+            `denied_tools contains name(s) not visible to this agent: ` +
+            `${(reject.invalid_denies ?? []).join(', ')} — a hard deny targets an effective tool`,
+        });
+      }
+
+      return {
+        granted_packs: result.grant.granted_packs,
+        denied_tools: result.grant.denied_tools,
       };
     }),
 
@@ -482,8 +732,8 @@ export const agentsRouter = router({
 
       // Read current active version OUTSIDE the tx — it's only used to chain
       // previous_version_id into the profile_body metadata. Concurrent
-      // approveProfile races are guarded inside `approveAndActivateAtomic`
-      // via FOR UPDATE on the active row, so a stale read here is bounded
+      // approval races are guarded inside `approveAndActivateInTx` (motor
+      // unificado) via FOR UPDATE on the active row, so a stale read here is bounded
       // (worst case: previous_version_id chains to a now-frozen row, which
       // is still a valid lineage marker).
       const activeVersion = await runWithTenantContext(
@@ -543,126 +793,4 @@ export const agentsRouter = router({
       };
     }),
 
-  /**
-   * Approve a `proposed` agent_operational_profile_versions row, transitioning
-   * it to `active` and atomically freezing the previous active version (if any).
-   *
-   * Codex review #162 round 2 ([high] x2) — uses
-   * `operationalProfileVersionsRepo.approveAndActivateAtomic`, which wraps:
-   *   - lock proposed row
-   *   - lock incumbent active (if any) and freeze it
-   *   - activate proposed
-   *   - append admin_audit_log
-   * in a single transaction so partial commits cannot leave runtime state
-   * mutated without an audit row, AND so subsequent updateProfile approvals
-   * don't get stuck on `already_has_active`.
-   *
-   * Architecture-lock semantics are NOT applied here — operational profile is
-   * per-agent state, not part of the immutable identity_immutable_core. If we
-   * later decide it warrants dual approval, switch this to a Proposal Inbox
-   * source.
-   */
-  approveProfile: protectedProcedure
-    .input(ApproveProfileInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-
-      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
-      if (!agent || agent.tenant_id !== tenantId) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-      }
-
-      const result = await ctx.repos.operationalProfileVersionsRepo.approveAndActivateAtomic({
-        tenant_id: tenantId,
-        agent_id: agent.id,
-        id: input.versionId,
-        actor_id: ctx.userId,
-        actor_role: ctx.userRole,
-        comment: input.comment,
-      });
-
-      if (!result.ok) {
-        if (result.reason === 'not_found') {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Version not found' });
-        }
-        if (result.reason === 'agent_missing') {
-          // Codex Adversarial Review of PR #171 round 3 — the agent was
-          // deleted between findById above and the parent-agent FOR UPDATE
-          // lock inside the tx. Same outcome as the upfront NOT_FOUND.
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-        }
-        if (result.reason === 'invalid_source_status') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message: 'Version is not in proposed state; refresh and retry',
-          });
-        }
-        // Codex Adversarial Review of PR #171 round 2 — predecessor mismatch.
-        // The active profile changed between the time this proposal was
-        // authored and now. Approving would silently overwrite the newer
-        // approved version with stale content. Surface a CONFLICT with the
-        // diff so the client can refresh + re-propose against the current
-        // incumbent.
-        if (result.reason === 'predecessor_conflict') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message:
-              `Active profile changed since this proposal was authored ` +
-              `(expected predecessor ${String(result.expected)}, current ${String(result.current)}). ` +
-              `Refresh and re-propose against the current active version.`,
-          });
-        }
-        // Codex Adversarial Review of PR #171 round 3 (#173) — migration 061
-        // backfilled `metadata.previous_version_id = null` + `migrated_from_legacy: true`
-        // for every legacy row. Without distinguishing migrated proposals
-        // from intentional seeds, an explicit-null predecessor on a
-        // migrated row would silently activate against an empty active
-        // slot. Surface a distinct CONFLICT so the operator re-proposes
-        // under the post-migration flow with a real predecessor link.
-        if (result.reason === 'migrated_legacy_proposal') {
-          throw new TRPCError({
-            code: 'CONFLICT',
-            message:
-              `This proposal was created by the v3.1.1 legacy backfill and has ` +
-              `no known predecessor lineage. Re-propose the change against the ` +
-              `current active version before approving.`,
-          });
-        }
-        // Codex Adversarial Review of PR #182 round 3 (#186) — explicit
-        // `null` predecessor on a non-seed proposal. Rejected because
-        // approving would create a v2+ active row with no lineage anchor
-        // (bypassing the stale-predecessor guard). The most common case is
-        // a recovery window — agent has frozen/rolled_back versions but no
-        // active row — and the operator tried to use the normal approve
-        // path instead of re-proposing against the last known version.
-        // PRECONDITION_FAILED communicates "the request is structurally
-        // wrong for the current state" better than CONFLICT (which implies
-        // someone else changed the state under you).
-        if (result.reason === 'missing_predecessor') {
-          throw new TRPCError({
-            code: 'PRECONDITION_FAILED',
-            message:
-              `Proposal v${result.proposed_version} has no predecessor lineage ` +
-              `(metadata.previous_version_id is null), but it is not a ` +
-              `v1 intentional seed. ` +
-              (result.current_predecessor === null
-                ? `There is no active version to chain from — if this agent has ` +
-                  `frozen or rolled_back versions, re-propose the change against ` +
-                  `the last known version explicitly.`
-                : `Current active version is ${String(result.current_predecessor)} — ` +
-                  `re-propose the change against it.`),
-          });
-        }
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: `Approval transition failed: ${result.reason}`,
-        });
-      }
-
-      return {
-        activated: result.activated,
-        frozen_previous: result.frozen_previous,
-      };
-    }),
 });

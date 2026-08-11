@@ -21,9 +21,13 @@ vi.mock('@anthropic-ai/sdk', () => {
 });
 
 import {
-  papelDriftDetector,
+  papelDriftDetector as rawPapelDriftDetector,
   __test_only_resetFallbackLogCache,
 } from '@/cognition/drift/papel.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant — ver tests/helpers/llm-scope.ts.
+const papelDriftDetector = scopedDetector(rawPapelDriftDetector);
 import { logger } from '@/lib/logger.js';
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
