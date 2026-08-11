@@ -218,6 +218,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
     });
     expect(jid_context.resolved_phone_e164).toBe('+5511999999999');
     expect(jid_context.via_lid_fallback).toBe(false);
+    expect(jid_context.lid_recovery_source).toBeNull();
     expect(jid_context.raw_jid).toBe('5511999999999@s.whatsapp.net');
     expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
       channel_type: 'whatsapp',
@@ -311,7 +312,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
     expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
   });
 
-  it('@lid without senderPn → throws jid_unparseable (no synthetic tenant routing)', async () => {
+  it('@lid without senderPn AND no LID resolver → throws lid_unmapped (split from jid_unparseable)', async () => {
     const { resolveScopeForJid } = await import(
       '@/gateway/jid-tenant-resolver.js'
     );
@@ -319,8 +320,97 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
       resolveScopeForJid('12345@lid'),
     ).rejects.toMatchObject({
       code: 'channel_resolution_failed',
+      details: { resolver_path: 'lid_unmapped', raw_jid: '12345@lid' },
+    });
+    // Distinct from a foreign/garbage JID, which stays jid_unparseable.
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+  });
+
+  it('@lid without senderPn → recovers phone via injected lidPhoneResolver (source: lid_store)', async () => {
+    findByExternalCrossTenantMock.mockResolvedValueOnce(
+      makeChannel({
+        tenant_id: 'tenant-store',
+        agent_id: 'agent-store',
+        external_id: '+5511777777777',
+      }),
+    );
+    const lidPhoneResolver = vi.fn().mockResolvedValue('5511777777777@s.whatsapp.net');
+    const { resolveScopeForJid } = await import(
+      '@/gateway/jid-tenant-resolver.js'
+    );
+    const { scope, jid_context } = await resolveScopeForJid(
+      '168813890908183@lid',
+      undefined,
+      { lidPhoneResolver },
+    );
+    expect(scope.tenant_id).toBe('tenant-store');
+    expect(jid_context.via_lid_fallback).toBe(true);
+    expect(jid_context.lid_recovery_source).toBe('lid_store');
+    expect(jid_context.resolved_phone_e164).toBe('+5511777777777');
+    expect(lidPhoneResolver).toHaveBeenCalledWith('168813890908183@lid');
+    // The store-recovered phone (NOT the synthetic LID) feeds the resolver.
+    expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
+      channel_type: 'whatsapp',
+      external_id: '+5511777777777',
+    });
+  });
+
+  it('@lid: lidPhoneResolver consulted ONLY when key hints are absent (senderPn wins, source: key_hint)', async () => {
+    findByExternalCrossTenantMock.mockResolvedValueOnce(
+      makeChannel({ external_id: '+5511777777777' }),
+    );
+    const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
+    const { resolveScopeForJid } = await import(
+      '@/gateway/jid-tenant-resolver.js'
+    );
+    const { jid_context } = await resolveScopeForJid(
+      '999@lid',
+      { senderPn: '5511777777777' },
+      { lidPhoneResolver },
+    );
+    expect(jid_context.lid_recovery_source).toBe('key_hint');
+    expect(lidPhoneResolver).not.toHaveBeenCalled();
+  });
+
+  it('@lid: lidPhoneResolver returns null → still throws lid_unmapped (fail-closed)', async () => {
+    const lidPhoneResolver = vi.fn().mockResolvedValue(null);
+    const { resolveScopeForJid } = await import(
+      '@/gateway/jid-tenant-resolver.js'
+    );
+    await expect(
+      resolveScopeForJid('12345@lid', undefined, { lidPhoneResolver }),
+    ).rejects.toMatchObject({
+      code: 'channel_resolution_failed',
+      details: { resolver_path: 'lid_unmapped' },
+    });
+    expect(lidPhoneResolver).toHaveBeenCalledTimes(1);
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+  });
+
+  it('lidPhoneResolver is NEVER consulted for a non-@lid JID', async () => {
+    findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({}));
+    const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
+    const { resolveScopeForJid } = await import(
+      '@/gateway/jid-tenant-resolver.js'
+    );
+    await resolveScopeForJid('5511999999999@s.whatsapp.net', undefined, {
+      lidPhoneResolver,
+    });
+    expect(lidPhoneResolver).not.toHaveBeenCalled();
+  });
+
+  it('malformed (non-@lid) JID still throws jid_unparseable, never lid_unmapped', async () => {
+    const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
+    const { resolveScopeForJid } = await import(
+      '@/gateway/jid-tenant-resolver.js'
+    );
+    await expect(
+      resolveScopeForJid('120363025111111111@g.us', undefined, { lidPhoneResolver }),
+    ).rejects.toMatchObject({
+      code: 'channel_resolution_failed',
       details: { resolver_path: 'jid_unparseable' },
     });
+    expect(lidPhoneResolver).not.toHaveBeenCalled();
   });
 
   it('@lid + senderPn → calls resolver with the REAL phone (not the synthetic LID)', async () => {
@@ -339,6 +429,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
     });
     expect(scope.tenant_id).toBe('tenant-lid');
     expect(jid_context.via_lid_fallback).toBe(true);
+    expect(jid_context.lid_recovery_source).toBe('key_hint');
     expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
       channel_type: 'whatsapp',
       external_id: '+5511777777777',

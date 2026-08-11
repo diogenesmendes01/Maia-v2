@@ -6,7 +6,7 @@ import { callLLM, type LLMMessage, type ToolSchema } from '@/lib/claude.js';
 import { logger } from '@/lib/logger.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { REGISTRY } from '@/tools/_registry.js';
-import { sendReaction } from '@/gateway/presence.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { uuid } from '@/lib/utils.js';
 import { safeDispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
 import { detectGap } from './gap-detector.js';
@@ -29,7 +29,7 @@ async function flushUnconfirmedToolSummaries(
   conversa_id: string,
   inbound_id: string,
   toolSummaries: ToolExecutionSummary[],
-  reason: 'iteration_cap' | 'empty_final_text' | 'outbound_failure',
+  reason: ReActExitReason,
 ): Promise<void> {
   if (toolSummaries.length === 0) return;
   try {
@@ -90,7 +90,50 @@ export type ReActLoopResult = {
    * Each entry has the tool name and the raw dispatcher output.
    */
   toolsCalled: Array<{ name: string; result: unknown }>;
+  /**
+   * Issue #503 — resultado DURÁVEL do turno, para que `core.ts` decida o
+   * outcome da máquina de estados em vez de assumir "a função retornou, logo o
+   * turno terminou". Antes desta issue o loop encerrava com texto vazio tanto
+   * numa falha do reasoner quanto numa falha pre-send do outbound, e o caller
+   * marcava tudo como processado — os cenários A e B da issue.
+   */
+  delivery: ReActDelivery;
 };
+
+export type ReActDelivery = {
+  /** true quando o outbound foi efetivamente despachado ao usuário. */
+  dispatched: boolean;
+  /**
+   * Por que o loop terminou sem despachar (ou, quando despachou, o motivo é
+   * irrelevante e vale `empty_final_text`).
+   *   reasoner_failed  — timeout/erro do LLM: NADA foi produzido, retry é seguro;
+   *   outbound_failure — resposta produzida, envio falhou PRE-SEND: nada chegou
+   *                      ao usuário, retry é seguro;
+   *   empty_final_text — o modelo terminou sem texto: turno concluído sem resposta;
+   *   iteration_cap    — teto de iterações com tools executadas: NÃO reexecutar
+   *                      (efeitos colaterais já ocorreram).
+   */
+  exitReason: ReActExitReason;
+  /**
+   * Enviado ao usuário, mas a persistência do outbound falhou/ficou ambígua.
+   * NUNCA reenviar: o outcome correto é `reply_delivery_unknown`.
+   */
+  persistUnknown: boolean;
+  /**
+   * Alguma tool com `side_effect` `write`/`communication` foi INVOCADA neste
+   * turno. Quando true, um retry pode DUPLICAR o efeito (transação criada duas
+   * vezes, mensagem enviada duas vezes), então o turno não pode voltar para a
+   * fila — vai para dead letter com outcome `unsafe_to_retry` e exige decisão
+   * humana. Conservador por construção: marca na invocação, não no sucesso.
+   */
+  sideEffectsCommitted: boolean;
+};
+
+export type ReActExitReason =
+  | 'reasoner_failed'
+  | 'outbound_failure'
+  | 'empty_final_text'
+  | 'iteration_cap';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle
@@ -125,8 +168,13 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // Reason recorded when we exit the loop without dispatching outbound.
   // Defaults to empty_final_text (the model returned no end_turn text);
   // overridden to 'iteration_cap' when we hit MAX_REACT_ITERATIONS.
-  let exitReason: 'iteration_cap' | 'empty_final_text' | 'outbound_failure' =
-    'empty_final_text';
+  let exitReason: ReActExitReason = 'empty_final_text';
+  // Issue #503 — dispatch entregue mas persistência ambígua: o usuário TEM a
+  // resposta, então nunca reenviar; o outcome é `reply_delivery_unknown`.
+  let persistUnknown = false;
+  // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
+  // Enquanto false, um retry é seguro; a partir de true, não é.
+  let sideEffectsCommitted = false;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const reasonerResult = await runCognitiveModule(
@@ -140,6 +188,9 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       },
       () =>
         callLLM({
+          // Issue #508: workload declarado → o backend decide tier, política
+          // de retry e se fallback é permitido (src/lib/llm/workloads.ts).
+          workload: 'reasoner',
           system,
           messages: conversation,
           tools,
@@ -155,6 +206,9 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         { conversa_id: c.id, mensagem_id: inbound.id, status: reasonerResult.status },
         'react_loop.reasoner_failed',
       );
+      // #503 cenário A: o turno NÃO está concluído — nada foi produzido nem
+      // entregue. O caller agenda retry em vez de marcar `completed`.
+      exitReason = 'reasoner_failed';
       break;
     }
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
@@ -201,6 +255,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
             { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error, ops_alert: true },
             'react_loop.dispatch_inconsistency',
           );
+          persistUnknown = true;
         }
         outboundDispatched = true;
 
@@ -271,6 +326,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         },
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+      // Issue #503 — RASTREIO DE EFEITO IRREVERSÍVEL. Uma tool `write` ou
+      // `communication` pode ter alterado estado externo (transação criada,
+      // mensagem enviada). Se o turno falhar DEPOIS disso, reexecutar o ReAct
+      // duplicaria o efeito, então o turno não pode ser `retryable`.
+      //
+      // Deliberadamente conservador: marcamos na INVOCAÇÃO, não no sucesso. Um
+      // `isError` do dispatcher não prova que nada foi aplicado (pode ter
+      // falhado depois do commit externo), e o custo de errar para o lado
+      // seguro é uma intervenção manual; para o outro lado é cobrar o cliente
+      // duas vezes.
+      const spec = REGISTRY[tu.tool];
+      if (spec?.side_effect === 'write' || spec?.side_effect === 'communication') {
+        sideEffectsCommitted = true;
+      }
 
       // P3b Task 9: capture every tool invocation for the post-turn
       // step-evaluator (tool_result success criteria).
@@ -348,13 +418,25 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       if (isSideEffect) {
         const wid = (inbound.metadata as Record<string, unknown> | null)?.['whatsapp_id'];
         if (typeof wid === 'string') {
-          if (!isError) {
-            sendReaction(jid, wid, '✅');
-          } else {
-            const errKind = (out as { error: string }).error;
-            if (errKind === 'forbidden' || errKind === 'requires_dual_approval') {
-              sendReaction(jid, wid, '❌');
-            }
+          // Fase 0 (spec roteamento v4 §1.6): reação (efêmera) sai pela
+          // fronteira LineOutput do canal da conversa. Best-effort — falha de
+          // resolução só suprime a reação, nunca o turno.
+          const emoji: '✅' | '❌' | null = !isError
+            ? '✅'
+            : ['forbidden', 'requires_dual_approval'].includes(
+                  (out as { error: string }).error,
+                )
+              ? '❌'
+              : null;
+          if (emoji) {
+            await forCurrentAgentChannel(c.channel_id)
+              .then((line) => line.sendReaction(jid, wid, emoji))
+              .catch((err) =>
+                logger.debug(
+                  { err: (err as Error).message },
+                  'react_loop.reaction_line_unresolved',
+                ),
+              );
           }
         }
       }
@@ -411,5 +493,10 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     );
   }
 
-  return { totalTokens, outboundText, toolsCalled };
+  return {
+    totalTokens,
+    outboundText,
+    toolsCalled,
+    delivery: { dispatched: outboundDispatched, exitReason, persistUnknown, sideEffectsCommitted },
+  };
 }

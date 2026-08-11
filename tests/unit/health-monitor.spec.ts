@@ -11,8 +11,15 @@ import { tryGetCurrentContext, isSystemContext } from '../../src/db/tenant-conte
 const checkAllMock = vi.fn();
 const sendAlertMock = vi.fn().mockResolvedValue(undefined);
 const recordMock = vi.fn().mockResolvedValue(undefined);
+// Issue #512: `checkAll()` is now READ-ONLY (a `/health` poll must not grow
+// `system_health_events`). Persisting the snapshot moved here, into the
+// once-a-minute cron tick.
+const recordSnapshotMock = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('../../src/lib/healthcheck.js', () => ({ checkAll: checkAllMock }));
+vi.mock('../../src/lib/healthcheck.js', () => ({
+  checkAll: checkAllMock,
+  recordHealthSnapshot: recordSnapshotMock,
+}));
 vi.mock('../../src/lib/alerts.js', () => ({ sendAlert: sendAlertMock }));
 vi.mock('../../src/db/repositories.js', () => ({ healthRepo: { record: recordMock } }));
 vi.mock('../../src/lib/logger.js', () => ({
@@ -23,6 +30,7 @@ beforeEach(() => {
   checkAllMock.mockReset();
   sendAlertMock.mockClear();
   recordMock.mockClear();
+  recordSnapshotMock.mockClear();
 });
 
 describe('health-monitor worker', () => {
@@ -33,7 +41,22 @@ describe('health-monitor worker', () => {
 
     expect(checkAllMock).toHaveBeenCalledTimes(1);
     expect(sendAlertMock).not.toHaveBeenCalled();
+    // No ALERT row — the alert-specific `healthRepo.record` still only fires
+    // once a component has been down past its threshold.
     expect(recordMock).not.toHaveBeenCalled();
+  });
+
+  it('persists the health snapshot itself (issue #512: writes moved off the probe)', async () => {
+    const components = [
+      { component: 'db', status: 'ok' },
+      { component: 'redis', status: 'ok' },
+    ];
+    checkAllMock.mockResolvedValue({ components });
+    const { runHealthMonitor } = await import('../../src/workers/health-monitor.js');
+    await runHealthMonitor();
+
+    expect(recordSnapshotMock).toHaveBeenCalledTimes(1);
+    expect(recordSnapshotMock).toHaveBeenCalledWith(components);
   });
 
   it('runs under the reserved system context (not default/default)', async () => {

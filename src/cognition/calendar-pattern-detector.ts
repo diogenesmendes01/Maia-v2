@@ -8,7 +8,7 @@
  * Output: descriptor estruturado se positivo (parseável por holiday-descriptor),
  * null se LLM diz que não é padrão de feriado.
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from './runner.js';
 import {
   buildHolidayDescriptor,
@@ -33,7 +33,7 @@ export interface CalendarDetectorOutput {
   descriptor?: string;
 }
 
-const DETECTOR_MODEL = 'claude-haiku-4-5-20251001';
+// Issue #508: slug removido — tier `fast` via workload `calendar_detector`.
 const DETECTOR_TIMEOUT_MS = 15000;
 
 export async function detectHolidayPattern(
@@ -49,7 +49,6 @@ export async function detectHolidayPattern(
       fallback: null,
     },
     async () => {
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
       const system = [
         'Você é um classificador rápido de padrões de feriado/recesso em conversas em português brasileiro.',
         'Dado um trecho, decida se ele indica um feriado/recesso reconhecível.',
@@ -58,20 +57,14 @@ export async function detectHolidayPattern(
         'NÃO inclua julgamento de valor. NÃO invente dados que não estão no trecho.',
       ].join('\n');
 
-      const completion = await anthropic.messages.create({
-        model: DETECTOR_MODEL,
+      const completion = await callLLM({
+        workload: 'calendar_detector',
         max_tokens: 500,
         system,
         messages: [{ role: 'user', content: input.text }],
       });
 
-      const text = (completion.content as Array<{ type: string; text?: string }>)
-        .filter(
-          (c): c is { type: 'text'; text: string } =>
-            c.type === 'text' && typeof c.text === 'string',
-        )
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;
 

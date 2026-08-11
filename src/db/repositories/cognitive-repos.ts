@@ -713,6 +713,87 @@ export const behavioralHintRepo = {
       );
   },
 
+  /**
+   * Issue #511 — single-query sibling of `findActiveForScope`.
+   *
+   * The prompt builder asked for hints one scope at a time (interlocutor,
+   * conversation, role, channel, agent), so a turn with a resolved role and
+   * channel paid FIVE sequential round-trips for what is one predicate over one
+   * table. This collapses them into a single statement whose scope tuples are
+   * OR'd together.
+   *
+   * Semantics are preserved EXACTLY, tuple by tuple:
+   *   - a tuple with a `subject_id` matches `scope_type = t AND subject_id = s`;
+   *   - a tuple WITHOUT one (the `agent` scope) matches `scope_type = t` with no
+   *     subject predicate at all — same as the single-scope method, which only
+   *     pushes the `subject_id` condition when the value is truthy.
+   * The tenant/agent, `revoked_at IS NULL`, lifecycle-visibility and expiry
+   * filters are shared across all tuples, so a hint that the per-scope method
+   * would have hidden (pending_review, revoked, expired) stays hidden here.
+   *
+   * Duplicate tuples are collapsed, and a hint matching two tuples is returned
+   * ONCE (the per-scope loop could return it twice, appending it to the prompt
+   * twice); dedup is by row, which is what the caller wanted all along.
+   *
+   * Empty input returns `[]` WITHOUT touching the DB — an `or()` over zero
+   * conditions is a degenerate predicate, and drizzle would drop it, turning
+   * the query into "every hint for this tenant". Fail-closed on the empty case
+   * rather than fail-open.
+   *
+   * Deterministic ordering (created_at, then id as tiebreak) so the rendered
+   * hint block is stable across turns for an unchanged hint set.
+   */
+  async findActiveForScopes(
+    scopes: Array<{ scope_type: string; subject_id?: string | null }>,
+    limit = 200,
+  ): Promise<BehavioralHint[]> {
+    if (scopes.length === 0) return [];
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const now = new Date();
+
+    const seen = new Set<string>();
+    const tupleConds = [];
+    for (const s of scopes) {
+      const dedupKey = `${s.scope_type} ${s.subject_id ?? ''}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      tupleConds.push(
+        s.subject_id
+          ? and(
+              eq(behavioral_hint.scope_type, s.scope_type),
+              eq(behavioral_hint.subject_id, s.subject_id),
+            )
+          : eq(behavioral_hint.scope_type, s.scope_type),
+      );
+    }
+    // Defensive: `scopes` was non-empty, so dedup cannot empty it. Kept so a
+    // future filter added to the loop can never silently widen the predicate.
+    if (tupleConds.length === 0) return [];
+
+    return db
+      .select()
+      .from(behavioral_hint)
+      .where(
+        and(
+          eq(behavioral_hint.tenant_id, tenant_id),
+          eq(behavioral_hint.agent_id, agent_id),
+          isNull(behavioral_hint.revoked_at),
+          inArray(behavioral_hint.lifecycle_status, [
+            'ephemeral',
+            'observed',
+            'reinforced',
+            'verified',
+            'active',
+          ]),
+          or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
+          or(...tupleConds),
+        ),
+      )
+      .orderBy(behavioral_hint.created_at, behavioral_hint.id)
+      .limit(limit);
+  },
+
   async revoke(id: string): Promise<void> {
     // Flip-readiness (#323, H4 of #355) — tenant+agent scope the WHERE (bound
     // from ALS), mirroring the already-scoped `findActiveForScope`. Both columns

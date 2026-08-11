@@ -27,7 +27,7 @@
  */
 import type { ResolvedPermission } from '@/governance/permissions.js';
 import { BASE_AGENT_PACKS } from './base-agent-packs.js';
-import { getAgentToolSchemas } from './_registry.js';
+import { getAgentToolSchemas, describeExposedSchemas } from './_registry.js';
 import {
   computeAgentVisibleTools,
   type AgentToolGrant,
@@ -188,6 +188,18 @@ export async function computeRuntimeVisibleTools(
     finalNames.has(n),
   );
 
+  // Issue #509 — CANONICAL schema identity + budget for THIS visible set.
+  //
+  // Explicitly canonical, not "what the model saw" (PR #530 review round 1, P2):
+  // the provider envelope is applied later, inside `callLLM`, and in the strict
+  // path it rewrites `required`, drops keywords and rewrites descriptions. The
+  // hash of the payload actually put on the wire is recorded there, alongside
+  // this one, so the two can be compared — a mismatch between
+  // `tool_schema_canonical_hash` here and `canonical_hash` in the
+  // `llm.tool_payload` log line means the envelope changed the contract.
+  // Never throws — diagnostics must not break a turn.
+  const schemaDigest = describeExposedSchemas([...finalNames], 'agent_runtime_filter');
+
   // Provenance audit (invariant #4 + criterion #408). Best-effort: a failed
   // audit never blocks the turn, but it is logged. try/catch (not `.catch`) so
   // it is robust to both a rejection and a synchronous throw.
@@ -202,6 +214,13 @@ export async function computeRuntimeVisibleTools(
         visible_tools: [...finalNames],
         ...composed.provenance,
         requires_confirmation,
+        // Issue #509 — the exposed CONTRACT, not its content: a set-level hash,
+        // the per-tool hashes and the byte budget. No argument values, no
+        // payloads, no schema bodies. Named `canonical` because the provider
+        // envelope has not been applied yet (see the comment above).
+        tool_schema_canonical_hash: schemaDigest.set_hash,
+        tool_schema_canonical_hashes: schemaDigest.hashes,
+        tool_schema_canonical_bytes: schemaDigest.bytes,
         // Issue #409 — record when a skill scope was DROPPED because the skill's
         // usage_policy did not admit the audience (defense-in-depth at the
         // visibility boundary). null when no skill scope was dropped.

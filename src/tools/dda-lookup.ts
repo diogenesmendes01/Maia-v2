@@ -17,7 +17,11 @@ const inputSchema = z
   })
   .refine((v) => Boolean(v.boleto_id ?? v.boleto_metadata ?? v.cnpj ?? v.company_id), {
     message: 'a boleto reference or company identifier is required',
-  });
+  })
+  // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
+  .describe(
+    'Consulta DDA. Informe AO MENOS UM: boleto_id, boleto_metadata, cnpj ou company_id.',
+  );
 
 const outputSchema = z.object({
   dda_situation: z.string(),

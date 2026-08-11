@@ -43,10 +43,21 @@ vi.mock('@/tools/_registry.js', () => ({
       return [...set].map((name) => ({
         name,
         description: name,
+        // Deliberately the LEGACY stub: this spec pins the FILTER, not the
+        // schema payload (issue #509 pins that in tool-schema-exposure.spec.ts).
         input_schema: { type: 'object' as const, additionalProperties: true },
       }));
     },
   ),
+  // Issue #509 — the filter now also records the exposed-contract digest in the
+  // provenance audit. Stubbed deterministically so this spec stays independent
+  // of the live tool set.
+  describeExposedSchemas: vi.fn((names: readonly string[]) => ({
+    tools: names.length,
+    bytes: names.length * 10,
+    set_hash: 'stubhash00000000',
+    hashes: Object.fromEntries(names.map((n) => [n, 'stub000000000000'])),
+  })),
 }));
 
 import { computeRuntimeVisibleTools } from '@/tools/runtime-filter.js';

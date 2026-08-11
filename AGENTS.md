@@ -28,7 +28,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | Layer | Tech |
 |---|---|
-| Runtime | Node 20+, TypeScript 5+, ESM |
+| Runtime | Node 22+ (`.nvmrc`, `package.json` engines e imagens Docker na mesma linha), TypeScript 5+, ESM |
 | Server | Fastify (`src/server.ts`) |
 | DB | PostgreSQL 16 + pgvector via Drizzle ORM |
 | Cache / Queue | Redis + BullMQ (`ioredis`) |
@@ -51,6 +51,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Channels, roles, policies | [`concerns/channel-policy.md`](docs/architecture/concerns/channel-policy.md) |
 | Governance, audit, observability | [`concerns/governance-observability.md`](docs/architecture/concerns/governance-observability.md) |
 | Capability taxonomy (roles · skills · tools · packs · policies) | [`concerns/capability-taxonomy.md`](docs/architecture/concerns/capability-taxonomy.md) |
+| Data retention, legal hold, tombstones (**DRAFT — pending DPO**) | [`concerns/data-retention-matrix.md`](docs/architecture/concerns/data-retention-matrix.md) |
 
 ### Subsystems (one module doc per `src/` subdir)
 
@@ -60,6 +61,8 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | What | Where |
 |---|---|
+| Configuração (contrato de env vars, profiles, comandos) | [`docs/configuration.md`](docs/configuration.md) — **gerado** por `npm run config:generate` |
+| Boot falhando por config, e o rollback | [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md) |
 | Operational runbooks (debug + rollback) | [`docs/runbooks/`](docs/runbooks/) |
 | Per-feature design specs | [`docs/superpowers/specs/`](docs/superpowers/specs/) |
 | Implementation plans | [`docs/superpowers/plans/`](docs/superpowers/plans/) |
@@ -83,7 +86,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 
 | # | Rule | Where enforced |
 |---|---|---|
-| 1 | **Every stateful boundary scopes by `tenant_id + agent_id`** | DB queries, Redis keys, cache keys, ALS context. See [`concerns/tenant-isolation.md`](docs/architecture/concerns/tenant-isolation.md). |
+| 1 | **Every stateful boundary scopes by `tenant_id + agent_id`** | DB queries, Redis keys, cache keys, ALS context. See [`concerns/tenant-isolation.md`](docs/architecture/concerns/tenant-isolation.md). **One bounded exception:** health of a *shared external dependency* is `system` operational state, not tenant state — see [`concerns/tenant-isolation.md` §1.1](docs/architecture/concerns/tenant-isolation.md#11-the-one-bounded-exception-system-operational-state) and [ADR 0002](docs/architecture/decisions/0002-external-dependency-health-is-system-state.md). It has four required conditions and a closed membership list; joining it needs an ADR, not a code comment. |
 | 2 | **Fail-closed in security** | Missing `tenant_id`/`agent_id` → reject. Unmatched policy → reject. Unresolved channel → reject. Never fall back to `'default'` in production paths. |
 | 3 | **Backend decides, LLM proposes** | LLM emits typed intents (Zod). Backend validates against state + rules. Backend executes (or denies). See [`concerns/action-layer.md`](docs/architecture/concerns/action-layer.md). |
 | 4 | **Audit every decision** | Side-effect or governance decision → `audit()` row in `audit_logs` with action label and tenant context. |
@@ -120,9 +123,15 @@ npm run test:leak                 # cross-tenant leak suite (critical, run befor
 
 # Static checks (run before every commit)
 npm run docs:ai:check             # AI engineering docs governance
+npm run config:check:drift        # config contract: generated artifacts up to date? (#515)
 npm run typecheck                 # tsc --noEmit
 npm run lint                      # eslint src tests scripts
 npm run format                    # prettier --write src
+
+# Configuração (contrato único — src/config/contract.ts)
+npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
+npm run config:check -- --profile production --env-file .env
+npm run config:init -- --profile development
 
 # Build
 npm run build                     # tsc + tsc-alias

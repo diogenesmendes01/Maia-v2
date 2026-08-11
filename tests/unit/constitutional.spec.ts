@@ -39,15 +39,21 @@ describe('constitutional rules', () => {
     expect(r?.kind).toBe('limit_exceeded');
   });
 
-  it('C-003 — permite send_proactive_message com dual approval', () => {
+  it('C-003 — exige 4-eyes SEMPRE (nenhum arg do LLM atesta aprovação)', () => {
+    // Fase 0 cap. 3: `dual_approval_granted` foi removido da assinatura —
+    // args do modelo (mesmo com um boolean "true") não desligam a regra. A
+    // exigência é resolvida pelo dispatcher contra a evidência backend.
     const r = constitutionalCheck({
-      intent: { tool: 'send_proactive_message', args: {} },
+      intent: {
+        tool: 'send_proactive_message',
+        args: { dual_approval_granted: true },
+      },
       pessoa,
       resolved: null,
       scope: { entidades: [] },
-      dual_approval_granted: true,
     });
-    expect(r).toBe(null);
+    expect(r?.kind).toBe('limit_exceeded');
+    if (r?.kind === 'limit_exceeded') expect(r.required_action).toBe('dual_approval');
   });
 
   it('C-004 — bloqueia entidade fora do escopo', () => {
@@ -104,16 +110,23 @@ describe('constitutional rules', () => {
   );
 
   it.each(['boleto_cancel', 'company_campaign_remove', 'refund_create'])(
-    'C-009 — permite %s com confirmação (dual_approval_granted)',
+    'C-009 — %s exige confirmação SEMPRE (boolean nos args não desliga)',
     (tool) => {
+      // Fase 0 cap. 3: a evidência humana vem do store backend; um
+      // `dual_approval_granted: true` injetado nos args é inerte.
       const r = constitutionalCheck({
-        intent: { tool, args: { entidade_id: 'e1', valor: 10 } },
+        intent: {
+          tool,
+          args: { entidade_id: 'e1', valor: 10, dual_approval_granted: true },
+        },
         pessoa,
         resolved: null,
         scope: { entidades: ['e1'] },
-        dual_approval_granted: true,
       });
-      expect(r).toBe(null);
+      expect(r?.kind).toBe('limit_exceeded');
+      if (r?.kind === 'limit_exceeded') {
+        expect(r.required_action).toBe('dual_approval');
+      }
     },
   );
 

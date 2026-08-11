@@ -1,0 +1,186 @@
+{
+  "uid": "maia-capacity",
+  "title": "Maia — Capacidade: fila, pool, scheduler, sessão",
+  "description": "As famílias de recurso da issue #535: backlog de fila, pool do Postgres, lag do scheduler e presença da sessão WhatsApp. É o painel de \"a plataforma dá conta?\" — o de correção é maia-turn-slo. Runbook: docs/runbooks/observability-slo.md §4.6, §4.11–§4.13.",
+  "tags": ["maia", "capacity", "queue"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Fila BullMQ",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Idade do job mais antigo",
+      "description": "Agregado com `max`, NUNCA `sum`: toda réplica reporta a MESMA fila Redis compartilhada, e somar multiplicaria o backlog pelo número de réplicas. Normal < 2s; warning > 10s; critical > 30s.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "expr": "maia:queue_oldest_job_age_ms:max", "legendFormat": "{{queue}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 10000 },
+              { "color": "red", "value": 30000 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Profundidade por estado",
+      "description": "`waiting` crescendo com `active` preso em 1 = um job travado (a concorrência do agent worker é 1 por design). `failed` crescendo = veja a DLQ. Série AUSENTE ou NaN não é fila vazia — é cegueira (MaiaQueueMetricsAbsent).",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "expr": "maia:queue_depth:max", "legendFormat": "{{queue}}/{{state}}" }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Turnos vivos por estado (máquina de estados)",
+      "description": "Complementa a fila: a fila mede o backlog do BullMQ, isto mede onde os turnos ficam PRESOS na máquina de estados. Um `running` que não desce é o incidente.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "max by (status) (maia_turns_current)", "legendFormat": "{{status}}" },
+        {
+          "expr": "max by (status) (maia_turn_state_age_seconds)",
+          "legendFormat": "idade — {{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "Pool do Postgres",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Pool por estado (por réplica)",
+      "description": "Quatro séries do MESMO pool. `waiting>0` + `idle==0` + `total==max` = exaustão. `waiting>0` com `total<max` = o pool ainda cresce, e a espera é custo de ABRIR conexão, não falta de conexão. Sem agregar entre réplicas: cada processo tem o seu pool.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "max by (instance, state) (maia_db_pool)",
+          "legendFormat": "{{instance}} — {{state}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Saturação do pool e espera",
+      "description": "Saturação = (total - idle) / max. O alerta MaiaDbPoolSaturated exige as DUAS condições: saturação alta SEM ninguém esperando é uma pool ocupada e suficiente.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:db_pool_saturation:ratio", "legendFormat": "saturação — {{instance}}" },
+        { "expr": "maia:db_pool_waiting:max", "legendFormat": "esperando — {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Scheduler e sessão",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Atraso do scheduler",
+      "description": "ATRASO, não profundidade: quanto tempo a linha mais antiga JÁ VENCIDA está esperando. 10 000 itens vencendo daqui a uma hora é saudável; um item três minutos atrasado não é. `occurrences` = motor; `outbox` = entrega.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "expr": "maia:scheduler_lag_ms:max", "legendFormat": "{{queue}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 60000 },
+              { "color": "red", "value": 300000 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Backlog vencido do scheduler",
+      "description": "Ao lado do atraso: backlog ~1 com lag alto = UMA linha travada (lease expirado). Backlog crescendo junto = o tick parou ou não vaza.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "expr": "maia:scheduler_backlog:max", "legendFormat": "{{queue}}" }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Sessão WhatsApp: presença e idade",
+      "description": "A presença é um PAR de séries (connected/disconnected) porque com uma gauge 0/1 \"caiu\" e \"o scrape falhou\" renderizam igual. A idade é o sinal de FLAPPING: ela cresce enquanto a sessão vive e reseta a cada queda — a presença pode estar `connected` em todo scrape mesmo com dez quedas entre eles.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "max by (state) (maia_whatsapp_sessions)", "legendFormat": "{{state}}" },
+        {
+          "expr": "max(maia_whatsapp_session_age_seconds)",
+          "legendFormat": "segundos desde a última queda"
+        },
+        {
+          "expr": "resets(maia_whatsapp_session_age_seconds[30m])",
+          "legendFormat": "quedas em 30min"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] }
+    }
+  ]
+}

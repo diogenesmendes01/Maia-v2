@@ -33,6 +33,7 @@ export async function classifyMemory(content: string): Promise<ClassifierOutput 
     { name: 'memory-classifier', triggered_by: 'sync_conditional', timeoutMs: 5000 },
     async () => {
       const res = await callLLM({
+        workload: 'memory_classifier',
         system: classifierSystemPrompt(),
         messages: [{ role: 'user', content }],
         max_tokens: 200,

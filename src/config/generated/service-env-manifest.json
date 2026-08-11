@@ -1,0 +1,3318 @@
+{
+  "contract_version": "1.0.0",
+  "services": {
+    "runtime": {
+      "variables": [
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ENV",
+          "secret": false,
+          "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "TZ",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "APP_PORT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_REJECT_DEFAULT_LITERAL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": false
+        },
+        {
+          "name": "DATABASE_URL",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_USER",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_DB",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PORT",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "REDIS_URL",
+          "secret": true,
+          "required": true,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
+          "name": "REDIS_PORT",
+          "secret": false,
+          "required": false,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
+          "name": "REDIS_CONNECT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
+          "name": "LLM_PROVIDER",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true,
+          "requiredWhen": "LLM_PROVIDER=anthropic"
+        },
+        {
+          "name": "OPENROUTER_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true,
+          "requiredWhen": "LLM_PROVIDER=openrouter"
+        },
+        {
+          "name": "OPENROUTER_MODEL_MAIN",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "OPENROUTER_MODEL_FAST",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "CLAUDE_MODEL_MAIN",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "CLAUDE_MODEL_FAST",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "CLAUDE_MAX_RETRIES",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "CLAUDE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "LLM_TURN_DEADLINE_MS",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "LLM_DAILY_BUDGET_USD",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "LLM_CIRCUIT_MODE",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "DECISION_ENGINE_BUDGET_MS",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "speech",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=openai ou FEATURE_OUTBOUND_VOICE=true"
+        },
+        {
+          "name": "WHISPER_PROVIDER",
+          "secret": false,
+          "required": false,
+          "group": "speech",
+          "restartRequired": true
+        },
+        {
+          "name": "WHISPER_MODEL",
+          "secret": false,
+          "required": false,
+          "group": "speech",
+          "restartRequired": true
+        },
+        {
+          "name": "EMBEDDING_PROVIDER",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "EMBEDDING_MODEL",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "EMBEDDING_DIMENSIONS",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "VOYAGE_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=voyage"
+        },
+        {
+          "name": "COHERE_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=cohere"
+        },
+        {
+          "name": "BAILEYS_AUTH_DIR",
+          "secret": false,
+          "required": false,
+          "group": "whatsapp",
+          "restartRequired": true
+        },
+        {
+          "name": "WHATSAPP_NUMBER_MAIA",
+          "secret": false,
+          "required": true,
+          "group": "whatsapp",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_DISPLAY_NAME",
+          "secret": false,
+          "required": false,
+          "group": "whatsapp",
+          "restartRequired": true
+        },
+        {
+          "name": "OWNER_TELEFONE_WHATSAPP",
+          "secret": false,
+          "required": true,
+          "group": "owner",
+          "restartRequired": true
+        },
+        {
+          "name": "OWNER_NOME",
+          "secret": false,
+          "required": true,
+          "group": "owner",
+          "restartRequired": true
+        },
+        {
+          "name": "VALOR_LIMITE_SEM_CONFIRMACAO",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "VALOR_DUAL_APPROVAL",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "VALOR_LIMITE_DURO",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "DUAL_APPROVAL_TIMEOUT_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "AUDIT_MODE_TTL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "IDEMPOTENCY_BUCKET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "PENDING_QUESTION_TTL_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "PENDING_ACTION_TTL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "RATE_LIMIT_MSGS_PER_HOUR",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "WHATSAPP_RECONNECT_ALERT_MIN",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_MULTI_LINE",
+          "secret": false,
+          "required": false,
+          "group": "routing",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CHANNEL_ROUTING_MODE",
+          "secret": false,
+          "required": false,
+          "group": "routing",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_STAGING_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "routing",
+          "restartRequired": true,
+          "requiredWhen": "MAIA_CHANNEL_ROUTING_MODE=strict"
+        },
+        {
+          "name": "MAIA_STAGING_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "routing",
+          "restartRequired": true,
+          "requiredWhen": "MAIA_CHANNEL_ROUTING_MODE=strict"
+        },
+        {
+          "name": "ALERT_CHANNELS",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_HOST",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "SMTP_PORT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_USER",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_PASS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "ALERT_EMAIL_TO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "TELEGRAM_BOT_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "TELEGRAM_CHAT_ID",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "DLQ_ALERT_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_HEADERS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SAMPLE_RATIO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SERVICE_NAME",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_DIR",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_LOCAL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_CLOUD_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_BUCKET",
+          "secret": false,
+          "required": true,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_REGION",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ACCESS_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_SECRET_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_PREFIX",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "DAILY_LLM_USD_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "cost",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_MCP_TOOLS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PROACTIVE_MESSAGES",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OFX_IMPORT",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_DASHBOARD",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PENDING_GATE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PRESENCE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_ONE_TAP",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_MESSAGE_UPDATE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PENDING_REMINDER",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_VIEW_ONCE_SENSITIVE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PDF_REPORTS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OUTBOUND_VOICE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OUTBOUND_DEDUP",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_MESSAGE_DEBOUNCE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PROCEDURE_RUNTIME",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STATE_MACHINE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_STRICT_TOOL_SCHEMAS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STATE_AUTHORITATIVE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_SYNTHETIC_PROBE",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_LLM_JUDGE",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_CRON",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_SLO_MS",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_SLO_WARN_MS",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_ALERT_AFTER_K",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_AUTOSILENCE_AFTER_N",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_SILENCED_BACKOFF_MS",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_RUN_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_LEASE_MS",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROBE_ALERT_MODE",
+          "secret": false,
+          "required": false,
+          "group": "probe",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_RUNTIME_TRACE_V1",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_STRICT_METRIC_LABELS",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_KEY_VERSION",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+          "secret": true,
+          "required": true,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+          "secret": true,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_DEBUG_S3_BUCKET",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_DEBUG_AES_KEY",
+          "secret": true,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true,
+          "requiredWhen": "RUNTIME_TRACE_DEBUG_S3_BUCKET está definida"
+        },
+        {
+          "name": "RUNTIME_TRACE_BODY_ORPHAN_SEC",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_MATVIEW_REFRESH_SEC",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOUND_SWEEPER_STALE_PENDING_SEC",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOUND_SWEEPER_RETENTION_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_RELAYER_BATCH_PER_TENANT",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_RELAYER_BASE_BACKOFF_SEC",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_RELAYER_MAX_BACKOFF_SEC",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_RELAYER_RETENTION_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_RELAYER_RETENTION_BATCH_SIZE",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_MAX_PER_SECOND",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_MAX_PER_HOUR",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OCCURRENCE_LEASE_TTL_SECONDS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_LEASE_TTL_SECONDS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_WORKER_CONCURRENCY",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_DRAIN_LOOP_PASSES",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "OUTBOX_DRAIN_LOOP_SLEEP_MS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "MESSAGE_DEBOUNCE_MS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "MESSAGE_DEBOUNCE_MAX_MS",
+          "secret": false,
+          "required": false,
+          "group": "outbox",
+          "restartRequired": true
+        },
+        {
+          "name": "PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "procedures",
+          "restartRequired": true
+        },
+        {
+          "name": "PROCEDURE_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "procedures",
+          "restartRequired": true
+        },
+        {
+          "name": "REAPER_BATCH_SIZE",
+          "secret": false,
+          "required": false,
+          "group": "procedures",
+          "restartRequired": true
+        },
+        {
+          "name": "REAPER_GLOBAL_BUDGET",
+          "secret": false,
+          "required": false,
+          "group": "procedures",
+          "restartRequired": true
+        },
+        {
+          "name": "CONTRADICTION_OVERLAY_TTL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "procedures",
+          "restartRequired": true
+        },
+        {
+          "name": "POLICY_RESOLVER_CACHE_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_CONTEXT_CACHE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_CONTEXT_CACHE_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_CONTEXT_CACHE_MAX_ENTRIES",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "SYNC_LATENCY_P95_BASELINE_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "SYNC_LATENCY_P95_BUDGET_PERCENT",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_PROCESS_ROLE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_GRACE_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_STEP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_EXIT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SHUTDOWN_FORCED_EXIT_CODE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_CACHE_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_PROBE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_SCHEMA_CHECK",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_BACKLOG_MAX",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "READINESS_REQUIRE_WHATSAPP_LIVE",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
+          "name": "SETUP_TOKEN_OVERRIDE",
+          "secret": true,
+          "required": false,
+          "group": "setup",
+          "restartRequired": true
+        }
+      ],
+      "secrets": [
+        "DATABASE_URL",
+        "POSTGRES_PASSWORD",
+        "REDIS_URL",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "VOYAGE_API_KEY",
+        "COHERE_API_KEY",
+        "MAIA_STAGING_KEYRING",
+        "SMTP_PASS",
+        "TELEGRAM_BOT_TOKEN",
+        "MAIA_OTLP_TRACES_HEADERS",
+        "BACKUP_S3_ACCESS_KEY",
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING",
+        "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+        "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+        "RUNTIME_TRACE_DEBUG_AES_KEY",
+        "SETUP_TOKEN_OVERRIDE"
+      ],
+      "by_profile": {
+        "development": {
+          "required": [
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL",
+            "WHATSAPP_NUMBER_MAIA",
+            "OWNER_TELEFONE_WHATSAPP",
+            "OWNER_NOME"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "APP_PORT",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "CLAUDE_MAX_RETRIES",
+            "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
+            "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
+            "DECISION_ENGINE_BUDGET_MS",
+            "OPENAI_API_KEY",
+            "WHISPER_PROVIDER",
+            "WHISPER_MODEL",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "BAILEYS_AUTH_DIR",
+            "MAIA_DISPLAY_NAME",
+            "VALOR_LIMITE_SEM_CONFIRMACAO",
+            "VALOR_DUAL_APPROVAL",
+            "VALOR_LIMITE_DURO",
+            "DUAL_APPROVAL_TIMEOUT_HOURS",
+            "AUDIT_MODE_TTL_HOURS",
+            "IDEMPOTENCY_BUCKET_MINUTES",
+            "PENDING_QUESTION_TTL_MINUTES",
+            "PENDING_ACTION_TTL_HOURS",
+            "RATE_LIMIT_MSGS_PER_HOUR",
+            "WHATSAPP_RECONNECT_ALERT_MIN",
+            "MAIA_MULTI_LINE",
+            "MAIA_CHANNEL_ROUTING_MODE",
+            "MAIA_STAGING_KEYRING",
+            "MAIA_STAGING_ACTIVE_KEY_ID",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_BUCKET",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_MCP_TOOLS",
+            "FEATURE_PROACTIVE_MESSAGES",
+            "FEATURE_OFX_IMPORT",
+            "FEATURE_DASHBOARD",
+            "FEATURE_PENDING_GATE",
+            "FEATURE_PRESENCE",
+            "FEATURE_ONE_TAP",
+            "FEATURE_MESSAGE_UPDATE",
+            "FEATURE_PENDING_REMINDER",
+            "FEATURE_VIEW_ONCE_SENSITIVE",
+            "FEATURE_PDF_REPORTS",
+            "FEATURE_OUTBOUND_VOICE",
+            "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_MESSAGE_DEBOUNCE",
+            "FEATURE_PROCEDURE_RUNTIME",
+            "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_SYNTHETIC_PROBE",
+            "MAIA_PROBE_LLM_JUDGE",
+            "MAIA_PROBE_CRON",
+            "MAIA_PROBE_SLO_MS",
+            "MAIA_PROBE_SLO_WARN_MS",
+            "MAIA_PROBE_ALERT_AFTER_K",
+            "MAIA_PROBE_AUTOSILENCE_AFTER_N",
+            "MAIA_PROBE_SILENCED_BACKOFF_MS",
+            "MAIA_PROBE_RUN_TTL_MS",
+            "MAIA_PROBE_LEASE_MS",
+            "MAIA_PROBE_ALERT_MODE",
+            "FEATURE_RUNTIME_TRACE_V1",
+            "MAIA_STRICT_METRIC_LABELS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_DEBUG_S3_BUCKET",
+            "RUNTIME_TRACE_DEBUG_AES_KEY",
+            "RUNTIME_TRACE_BODY_ORPHAN_SEC",
+            "RUNTIME_TRACE_MATVIEW_REFRESH_SEC",
+            "OUTBOUND_SWEEPER_STALE_PENDING_SEC",
+            "OUTBOUND_SWEEPER_RETENTION_DAYS",
+            "OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE",
+            "OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT",
+            "OUTBOX_RELAYER_BATCH_PER_TENANT",
+            "OUTBOX_RELAYER_BASE_BACKOFF_SEC",
+            "OUTBOX_RELAYER_MAX_BACKOFF_SEC",
+            "OUTBOX_RELAYER_RETENTION_DAYS",
+            "OUTBOX_RELAYER_RETENTION_BATCH_SIZE",
+            "OUTBOX_MAX_PER_SECOND",
+            "OUTBOX_MAX_PER_HOUR",
+            "OCCURRENCE_LEASE_TTL_SECONDS",
+            "OUTBOX_LEASE_TTL_SECONDS",
+            "OUTBOX_WORKER_CONCURRENCY",
+            "OUTBOX_DRAIN_LOOP_PASSES",
+            "OUTBOX_DRAIN_LOOP_SLEEP_MS",
+            "MESSAGE_DEBOUNCE_MS",
+            "MESSAGE_DEBOUNCE_MAX_MS",
+            "PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD",
+            "PROCEDURE_TTL_DAYS",
+            "REAPER_BATCH_SIZE",
+            "REAPER_GLOBAL_BUDGET",
+            "CONTRADICTION_OVERLAY_TTL_HOURS",
+            "POLICY_RESOLVER_CACHE_TTL_MS",
+            "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
+            "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_CONTEXT_CACHE_TTL_MS",
+            "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
+            "TURN_CONTEXT_CACHE_MAX_ENTRIES",
+            "SYNC_LATENCY_P95_BASELINE_MS",
+            "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
+            "SETUP_TOKEN_OVERRIDE"
+          ]
+        },
+        "staging": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL",
+            "WHATSAPP_NUMBER_MAIA",
+            "OWNER_TELEFONE_WHATSAPP",
+            "OWNER_NOME",
+            "BACKUP_S3_BUCKET",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "APP_PORT",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "CLAUDE_MAX_RETRIES",
+            "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
+            "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
+            "DECISION_ENGINE_BUDGET_MS",
+            "OPENAI_API_KEY",
+            "WHISPER_PROVIDER",
+            "WHISPER_MODEL",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "BAILEYS_AUTH_DIR",
+            "MAIA_DISPLAY_NAME",
+            "VALOR_LIMITE_SEM_CONFIRMACAO",
+            "VALOR_DUAL_APPROVAL",
+            "VALOR_LIMITE_DURO",
+            "DUAL_APPROVAL_TIMEOUT_HOURS",
+            "AUDIT_MODE_TTL_HOURS",
+            "IDEMPOTENCY_BUCKET_MINUTES",
+            "PENDING_QUESTION_TTL_MINUTES",
+            "PENDING_ACTION_TTL_HOURS",
+            "RATE_LIMIT_MSGS_PER_HOUR",
+            "WHATSAPP_RECONNECT_ALERT_MIN",
+            "MAIA_MULTI_LINE",
+            "MAIA_CHANNEL_ROUTING_MODE",
+            "MAIA_STAGING_KEYRING",
+            "MAIA_STAGING_ACTIVE_KEY_ID",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_MCP_TOOLS",
+            "FEATURE_PROACTIVE_MESSAGES",
+            "FEATURE_OFX_IMPORT",
+            "FEATURE_DASHBOARD",
+            "FEATURE_PENDING_GATE",
+            "FEATURE_PRESENCE",
+            "FEATURE_ONE_TAP",
+            "FEATURE_MESSAGE_UPDATE",
+            "FEATURE_PENDING_REMINDER",
+            "FEATURE_VIEW_ONCE_SENSITIVE",
+            "FEATURE_PDF_REPORTS",
+            "FEATURE_OUTBOUND_VOICE",
+            "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_MESSAGE_DEBOUNCE",
+            "FEATURE_PROCEDURE_RUNTIME",
+            "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_SYNTHETIC_PROBE",
+            "MAIA_PROBE_LLM_JUDGE",
+            "MAIA_PROBE_CRON",
+            "MAIA_PROBE_SLO_MS",
+            "MAIA_PROBE_SLO_WARN_MS",
+            "MAIA_PROBE_ALERT_AFTER_K",
+            "MAIA_PROBE_AUTOSILENCE_AFTER_N",
+            "MAIA_PROBE_SILENCED_BACKOFF_MS",
+            "MAIA_PROBE_RUN_TTL_MS",
+            "MAIA_PROBE_LEASE_MS",
+            "MAIA_PROBE_ALERT_MODE",
+            "FEATURE_RUNTIME_TRACE_V1",
+            "MAIA_STRICT_METRIC_LABELS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_DEBUG_S3_BUCKET",
+            "RUNTIME_TRACE_DEBUG_AES_KEY",
+            "RUNTIME_TRACE_BODY_ORPHAN_SEC",
+            "RUNTIME_TRACE_MATVIEW_REFRESH_SEC",
+            "OUTBOUND_SWEEPER_STALE_PENDING_SEC",
+            "OUTBOUND_SWEEPER_RETENTION_DAYS",
+            "OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE",
+            "OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT",
+            "OUTBOX_RELAYER_BATCH_PER_TENANT",
+            "OUTBOX_RELAYER_BASE_BACKOFF_SEC",
+            "OUTBOX_RELAYER_MAX_BACKOFF_SEC",
+            "OUTBOX_RELAYER_RETENTION_DAYS",
+            "OUTBOX_RELAYER_RETENTION_BATCH_SIZE",
+            "OUTBOX_MAX_PER_SECOND",
+            "OUTBOX_MAX_PER_HOUR",
+            "OCCURRENCE_LEASE_TTL_SECONDS",
+            "OUTBOX_LEASE_TTL_SECONDS",
+            "OUTBOX_WORKER_CONCURRENCY",
+            "OUTBOX_DRAIN_LOOP_PASSES",
+            "OUTBOX_DRAIN_LOOP_SLEEP_MS",
+            "MESSAGE_DEBOUNCE_MS",
+            "MESSAGE_DEBOUNCE_MAX_MS",
+            "PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD",
+            "PROCEDURE_TTL_DAYS",
+            "REAPER_BATCH_SIZE",
+            "REAPER_GLOBAL_BUDGET",
+            "CONTRADICTION_OVERLAY_TTL_HOURS",
+            "POLICY_RESOLVER_CACHE_TTL_MS",
+            "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
+            "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_CONTEXT_CACHE_TTL_MS",
+            "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
+            "TURN_CONTEXT_CACHE_MAX_ENTRIES",
+            "SYNC_LATENCY_P95_BASELINE_MS",
+            "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
+            "SETUP_TOKEN_OVERRIDE"
+          ]
+        },
+        "production": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL",
+            "WHATSAPP_NUMBER_MAIA",
+            "OWNER_TELEFONE_WHATSAPP",
+            "OWNER_NOME",
+            "BACKUP_S3_BUCKET",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "APP_PORT",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "REDIS_CONNECT_TIMEOUT_MS",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "CLAUDE_MAX_RETRIES",
+            "CLAUDE_TIMEOUT_MS",
+            "LLM_TURN_DEADLINE_MS",
+            "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
+            "DECISION_ENGINE_BUDGET_MS",
+            "OPENAI_API_KEY",
+            "WHISPER_PROVIDER",
+            "WHISPER_MODEL",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "BAILEYS_AUTH_DIR",
+            "MAIA_DISPLAY_NAME",
+            "VALOR_LIMITE_SEM_CONFIRMACAO",
+            "VALOR_DUAL_APPROVAL",
+            "VALOR_LIMITE_DURO",
+            "DUAL_APPROVAL_TIMEOUT_HOURS",
+            "AUDIT_MODE_TTL_HOURS",
+            "IDEMPOTENCY_BUCKET_MINUTES",
+            "PENDING_QUESTION_TTL_MINUTES",
+            "PENDING_ACTION_TTL_HOURS",
+            "RATE_LIMIT_MSGS_PER_HOUR",
+            "WHATSAPP_RECONNECT_ALERT_MIN",
+            "MAIA_MULTI_LINE",
+            "MAIA_CHANNEL_ROUTING_MODE",
+            "MAIA_STAGING_KEYRING",
+            "MAIA_STAGING_ACTIVE_KEY_ID",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_MCP_TOOLS",
+            "FEATURE_PROACTIVE_MESSAGES",
+            "FEATURE_OFX_IMPORT",
+            "FEATURE_DASHBOARD",
+            "FEATURE_PENDING_GATE",
+            "FEATURE_PRESENCE",
+            "FEATURE_ONE_TAP",
+            "FEATURE_MESSAGE_UPDATE",
+            "FEATURE_PENDING_REMINDER",
+            "FEATURE_VIEW_ONCE_SENSITIVE",
+            "FEATURE_PDF_REPORTS",
+            "FEATURE_OUTBOUND_VOICE",
+            "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_MESSAGE_DEBOUNCE",
+            "FEATURE_PROCEDURE_RUNTIME",
+            "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_SYNTHETIC_PROBE",
+            "MAIA_PROBE_LLM_JUDGE",
+            "MAIA_PROBE_CRON",
+            "MAIA_PROBE_SLO_MS",
+            "MAIA_PROBE_SLO_WARN_MS",
+            "MAIA_PROBE_ALERT_AFTER_K",
+            "MAIA_PROBE_AUTOSILENCE_AFTER_N",
+            "MAIA_PROBE_SILENCED_BACKOFF_MS",
+            "MAIA_PROBE_RUN_TTL_MS",
+            "MAIA_PROBE_LEASE_MS",
+            "MAIA_PROBE_ALERT_MODE",
+            "FEATURE_RUNTIME_TRACE_V1",
+            "MAIA_STRICT_METRIC_LABELS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_DEBUG_S3_BUCKET",
+            "RUNTIME_TRACE_DEBUG_AES_KEY",
+            "RUNTIME_TRACE_BODY_ORPHAN_SEC",
+            "RUNTIME_TRACE_MATVIEW_REFRESH_SEC",
+            "OUTBOUND_SWEEPER_STALE_PENDING_SEC",
+            "OUTBOUND_SWEEPER_RETENTION_DAYS",
+            "OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE",
+            "OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT",
+            "OUTBOX_RELAYER_BATCH_PER_TENANT",
+            "OUTBOX_RELAYER_BASE_BACKOFF_SEC",
+            "OUTBOX_RELAYER_MAX_BACKOFF_SEC",
+            "OUTBOX_RELAYER_RETENTION_DAYS",
+            "OUTBOX_RELAYER_RETENTION_BATCH_SIZE",
+            "OUTBOX_MAX_PER_SECOND",
+            "OUTBOX_MAX_PER_HOUR",
+            "OCCURRENCE_LEASE_TTL_SECONDS",
+            "OUTBOX_LEASE_TTL_SECONDS",
+            "OUTBOX_WORKER_CONCURRENCY",
+            "OUTBOX_DRAIN_LOOP_PASSES",
+            "OUTBOX_DRAIN_LOOP_SLEEP_MS",
+            "MESSAGE_DEBOUNCE_MS",
+            "MESSAGE_DEBOUNCE_MAX_MS",
+            "PROCEDURE_SELECTOR_CONFIDENCE_THRESHOLD",
+            "PROCEDURE_TTL_DAYS",
+            "REAPER_BATCH_SIZE",
+            "REAPER_GLOBAL_BUDGET",
+            "CONTRADICTION_OVERLAY_TTL_HOURS",
+            "POLICY_RESOLVER_CACHE_TTL_MS",
+            "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
+            "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_CONTEXT_CACHE_TTL_MS",
+            "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
+            "TURN_CONTEXT_CACHE_MAX_ENTRIES",
+            "SYNC_LATENCY_P95_BASELINE_MS",
+            "SYNC_LATENCY_P95_BUDGET_PERCENT",
+            "MAIA_PROCESS_ROLE",
+            "SHUTDOWN_GRACE_MS",
+            "SHUTDOWN_STEP_TIMEOUT_MS",
+            "SHUTDOWN_EXIT_TIMEOUT_MS",
+            "SHUTDOWN_FORCED_EXIT_CODE",
+            "READINESS_CACHE_MS",
+            "READINESS_PROBE_TIMEOUT_MS",
+            "READINESS_SCHEMA_CHECK",
+            "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP_LIVE",
+            "SETUP_TOKEN_OVERRIDE"
+          ]
+        }
+      }
+    },
+    "admin-ui": {
+      "variables": [
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ENV",
+          "secret": false,
+          "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "TZ",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "DATABASE_URL",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_MCP_TOOLS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "ADMIN_UI_PORT",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "NEXTAUTH_URL",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "NEXTAUTH_SECRET",
+          "secret": true,
+          "required": true,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "AUTH_TRUST_HOST",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "NEXT_PUBLIC_API_URL",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_ADMIN_UI_V1",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_ADMIN_UI_BULK_REJECT",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_ADMIN_UI_REDECIDE",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "ALLOW_DEV_AUTH",
+          "secret": false,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "ADMIN_UI_DEV_LOGIN_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "admin-ui",
+          "restartRequired": true,
+          "requiredWhen": "ALLOW_DEV_AUTH=true"
+        },
+        {
+          "name": "OIDC_ISSUER",
+          "secret": false,
+          "required": true,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "OIDC_CLIENT_ID",
+          "secret": false,
+          "required": true,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "OIDC_CLIENT_SECRET",
+          "secret": true,
+          "required": true,
+          "group": "admin-ui",
+          "restartRequired": true
+        },
+        {
+          "name": "OIDC_TENANT_SLUGS",
+          "secret": false,
+          "required": true,
+          "group": "admin-ui",
+          "restartRequired": true
+        }
+      ],
+      "secrets": [
+        "DATABASE_URL",
+        "NEXTAUTH_SECRET",
+        "ADMIN_UI_DEV_LOGIN_TOKEN",
+        "OIDC_CLIENT_SECRET"
+      ],
+      "by_profile": {
+        "development": {
+          "required": [
+            "DATABASE_URL"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "FEATURE_MCP_TOOLS",
+            "ADMIN_UI_PORT",
+            "NEXTAUTH_URL",
+            "NEXTAUTH_SECRET",
+            "AUTH_TRUST_HOST",
+            "NEXT_PUBLIC_API_URL",
+            "FEATURE_ADMIN_UI_V1",
+            "FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS",
+            "FEATURE_ADMIN_UI_BULK_REJECT",
+            "FEATURE_ADMIN_UI_REDECIDE",
+            "ALLOW_DEV_AUTH",
+            "ADMIN_UI_DEV_LOGIN_TOKEN",
+            "OIDC_ISSUER",
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_TENANT_SLUGS"
+          ]
+        },
+        "staging": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "NEXTAUTH_SECRET",
+            "OIDC_ISSUER",
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_TENANT_SLUGS"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "FEATURE_MCP_TOOLS",
+            "ADMIN_UI_PORT",
+            "NEXTAUTH_URL",
+            "AUTH_TRUST_HOST",
+            "NEXT_PUBLIC_API_URL",
+            "FEATURE_ADMIN_UI_V1",
+            "FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS",
+            "FEATURE_ADMIN_UI_BULK_REJECT",
+            "FEATURE_ADMIN_UI_REDECIDE",
+            "ALLOW_DEV_AUTH",
+            "ADMIN_UI_DEV_LOGIN_TOKEN"
+          ]
+        },
+        "production": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "NEXTAUTH_SECRET",
+            "OIDC_ISSUER",
+            "OIDC_CLIENT_ID",
+            "OIDC_CLIENT_SECRET",
+            "OIDC_TENANT_SLUGS"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "FEATURE_MCP_TOOLS",
+            "ADMIN_UI_PORT",
+            "NEXTAUTH_URL",
+            "AUTH_TRUST_HOST",
+            "NEXT_PUBLIC_API_URL",
+            "FEATURE_ADMIN_UI_V1",
+            "FEATURE_ADMIN_UI_DEBUG_SNAPSHOTS",
+            "FEATURE_ADMIN_UI_BULK_REJECT",
+            "FEATURE_ADMIN_UI_REDECIDE",
+            "ALLOW_DEV_AUTH",
+            "ADMIN_UI_DEV_LOGIN_TOKEN"
+          ]
+        }
+      }
+    },
+    "migrator": {
+      "variables": [
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ENV",
+          "secret": false,
+          "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "TZ",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "DATABASE_URL",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_USER",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_DB",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PORT",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        }
+      ],
+      "secrets": [
+        "DATABASE_URL",
+        "POSTGRES_PASSWORD"
+      ],
+      "by_profile": {
+        "development": {
+          "required": [
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT"
+          ]
+        },
+        "staging": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT"
+          ]
+        },
+        "production": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT"
+          ]
+        }
+      }
+    },
+    "backup": {
+      "variables": [
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ENV",
+          "secret": false,
+          "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "TZ",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "DATABASE_URL",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_USER",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_DB",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PORT",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "ALERT_CHANNELS",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_HOST",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "SMTP_PORT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_USER",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_PASS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "ALERT_EMAIL_TO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "TELEGRAM_BOT_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "TELEGRAM_CHAT_ID",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "BACKUP_DIR",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_LOCAL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_CLOUD_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_BUCKET",
+          "secret": false,
+          "required": true,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_REGION",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ACCESS_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_SECRET_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_PREFIX",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        }
+      ],
+      "secrets": [
+        "DATABASE_URL",
+        "POSTGRES_PASSWORD",
+        "SMTP_PASS",
+        "TELEGRAM_BOT_TOKEN",
+        "BACKUP_S3_ACCESS_KEY",
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING"
+      ],
+      "by_profile": {
+        "development": {
+          "required": [
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_BUCKET",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
+          ]
+        },
+        "staging": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "BACKUP_S3_BUCKET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
+          ]
+        },
+        "production": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "BACKUP_S3_BUCKET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "POSTGRES_PORT",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY"
+          ]
+        }
+      }
+    },
+    "maintenance": {
+      "variables": [
+        {
+          "name": "NODE_ENV",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_ENV",
+          "secret": false,
+          "required": true,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_BUILD_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "TZ",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "LOG_LEVEL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_CONFIG_STRICT_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_REJECT_DEFAULT_LITERAL",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": false
+        },
+        {
+          "name": "DATABASE_URL",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_USER",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "secret": true,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_DB",
+          "secret": false,
+          "required": true,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "POSTGRES_PORT",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "REDIS_URL",
+          "secret": true,
+          "required": true,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
+          "name": "REDIS_PORT",
+          "secret": false,
+          "required": false,
+          "group": "redis",
+          "restartRequired": true
+        },
+        {
+          "name": "LLM_PROVIDER",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true,
+          "requiredWhen": "LLM_PROVIDER=anthropic"
+        },
+        {
+          "name": "OPENROUTER_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true,
+          "requiredWhen": "LLM_PROVIDER=openrouter"
+        },
+        {
+          "name": "OPENROUTER_MODEL_MAIN",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "OPENROUTER_MODEL_FAST",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "CLAUDE_MODEL_MAIN",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "CLAUDE_MODEL_FAST",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": false
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "speech",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=openai ou FEATURE_OUTBOUND_VOICE=true"
+        },
+        {
+          "name": "EMBEDDING_PROVIDER",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "EMBEDDING_MODEL",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "EMBEDDING_DIMENSIONS",
+          "secret": false,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true
+        },
+        {
+          "name": "VOYAGE_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=voyage"
+        },
+        {
+          "name": "COHERE_API_KEY",
+          "secret": true,
+          "required": false,
+          "group": "embeddings",
+          "restartRequired": true,
+          "requiredWhen": "EMBEDDING_PROVIDER=cohere"
+        },
+        {
+          "name": "ALERT_CHANNELS",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_HOST",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "SMTP_PORT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_USER",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "SMTP_PASS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "ALERT_EMAIL_TO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém email"
+        },
+        {
+          "name": "TELEGRAM_BOT_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "TELEGRAM_CHAT_ID",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true,
+          "requiredWhen": "ALERT_CHANNELS contém telegram"
+        },
+        {
+          "name": "DLQ_ALERT_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_DIR",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_LOCAL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RETENTION_CLOUD_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_BUCKET",
+          "secret": false,
+          "required": true,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_REGION",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_S3_ACCESS_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_SECRET_KEY",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_S3_BUCKET está definida"
+        },
+        {
+          "name": "BACKUP_S3_PREFIX",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_OFFSITE_REQUIRED",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_MODE",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_KEYRING",
+          "secret": true,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true,
+          "requiredWhen": "BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm"
+        },
+        {
+          "name": "BACKUP_DUMP_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_UPLOAD_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_MIN_ARTIFACT_BYTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RPO_TARGET_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RTO_TARGET_MINUTES",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "RETENTION_POLICY",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "DAILY_LLM_USD_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "cost",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OFX_IMPORT",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        }
+      ],
+      "secrets": [
+        "DATABASE_URL",
+        "POSTGRES_PASSWORD",
+        "REDIS_URL",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "VOYAGE_API_KEY",
+        "COHERE_API_KEY",
+        "SMTP_PASS",
+        "TELEGRAM_BOT_TOKEN",
+        "BACKUP_S3_ACCESS_KEY",
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_ENCRYPTION_KEYRING"
+      ],
+      "by_profile": {
+        "development": {
+          "required": [
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "OPENAI_API_KEY",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_BUCKET",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_OFX_IMPORT"
+          ]
+        },
+        "staging": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL",
+            "BACKUP_S3_BUCKET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "OPENAI_API_KEY",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_OFX_IMPORT"
+          ]
+        },
+        "production": {
+          "required": [
+            "MAIA_ENV",
+            "DATABASE_URL",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_DB",
+            "REDIS_URL",
+            "BACKUP_S3_BUCKET"
+          ],
+          "optional": [
+            "NODE_ENV",
+            "MAIA_BUILD_COMMIT",
+            "TZ",
+            "LOG_LEVEL",
+            "MAIA_CONFIG_STRICT_BOOT",
+            "MAIA_REJECT_DEFAULT_LITERAL",
+            "POSTGRES_PORT",
+            "REDIS_PORT",
+            "LLM_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL_MAIN",
+            "OPENROUTER_MODEL_FAST",
+            "CLAUDE_MODEL_MAIN",
+            "CLAUDE_MODEL_FAST",
+            "OPENAI_API_KEY",
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSIONS",
+            "VOYAGE_API_KEY",
+            "COHERE_API_KEY",
+            "ALERT_CHANNELS",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASS",
+            "ALERT_EMAIL_TO",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "DLQ_ALERT_THRESHOLD",
+            "BACKUP_DIR",
+            "BACKUP_RETENTION_LOCAL_DAYS",
+            "BACKUP_RETENTION_CLOUD_DAYS",
+            "BACKUP_S3_ENDPOINT",
+            "BACKUP_S3_REGION",
+            "BACKUP_S3_ACCESS_KEY",
+            "BACKUP_S3_SECRET_KEY",
+            "BACKUP_S3_PREFIX",
+            "BACKUP_ENABLED",
+            "BACKUP_OFFSITE_REQUIRED",
+            "BACKUP_ENCRYPTION_MODE",
+            "BACKUP_ENCRYPTION_KEYRING",
+            "BACKUP_ENCRYPTION_ACTIVE_KEY_ID",
+            "BACKUP_DUMP_TIMEOUT_MS",
+            "BACKUP_UPLOAD_TIMEOUT_MS",
+            "BACKUP_RESTORE_TIMEOUT_MS",
+            "BACKUP_MIN_ARTIFACT_BYTES",
+            "BACKUP_RPO_TARGET_HOURS",
+            "BACKUP_RTO_TARGET_MINUTES",
+            "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
+            "RETENTION_DRY_RUN",
+            "RETENTION_POLICY",
+            "DAILY_LLM_USD_THRESHOLD",
+            "FEATURE_OFX_IMPORT"
+          ]
+        }
+      }
+    }
+  }
+}

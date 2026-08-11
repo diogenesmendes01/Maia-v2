@@ -60,13 +60,31 @@ Observability with tenant attribution is the operational corollary: a dashboard 
 | `src/cognition/drift/decision-engine.ts` | Decision over drift signals → alert / proposal / silent |
 | `src/cognition/gap-escalation/engine.ts` | 4-level escalation: silent → dashboard → mentionable → proposed |
 
-### Observability (`src/lib/`)
+### Observability (`src/lib/`, `src/observability/`)
 
 | File | Role |
 |---|---|
 | `src/lib/logger.ts` | Pino structured logger |
-| `src/lib/metrics.ts` | `incCounter()`, `observeHistogram()`, `setGauge()` — Prometheus-compatible registry |
+| `src/lib/metrics.ts` | `incCounter()`, `observeHistogram()`, `setGaugeProvider()` — Prometheus-compatible registry (the **transport**) |
 | `src/lib/alerts.ts` | Alert channels (email / Telegram) |
+| `src/observability/taxonomy.ts` | **Issues #514 + #535** — canonical span tree + **emission status per span**, metric names, label/span-attribute allow-deny lists, cardinality budgets |
+| `src/observability/labels.ts` | Label sanitizer — the fail-closed gate between instrumentation and the registry |
+| `src/observability/span-attributes.ts` | **#535** — the same gate for OTLP span attributes (one deliberate divergence: correlation ids are allowed) |
+| `src/observability/metrics.ts` | Sanitized emitters (`counter`/`histogram`/`gauge`) — the **policy layer** over `lib/metrics.ts` |
+| `src/observability/correlation.ts` | Correlation ALS — one `trace_id` per turn, propagated ingress → queue → worker → decision → trace → logs |
+| `src/observability/tracer.ts` | **#535** — span emission: W3C ids derived from the Maia `trace_id`, derived head sampling, ALS parent chain |
+| `src/observability/otlp-exporter.ts` | **#535** — dependency-free OTLP/HTTP JSON exporter: bounded queue, batching, counted loss |
+| `src/observability/instrumentation.ts` | **#535** — `instrumentToolDispatch` / `instrumentContextLoad` wrappers |
+| `src/observability/runtime-collectors.ts` | **#535** — pg pool, WhatsApp session, scheduler-lag gauges |
+| `src/observability/register.ts` | **#535** — single wiring point, called once from `src/server.ts` |
+| `src/observability/turn-trace.ts` | Adapter connecting the durable P10b `trace()` to the hot path |
+| `src/observability/queue-metrics.ts` | Queue depth + oldest-job-age gauges |
+| `src/observability/turn-state-collector.ts` | Live turn count + per-state age gauges (#503) |
+| `src/lib/llm/telemetry.ts` | LLM call/latency/token/failure counters (the gateway owns them since #508) |
+| `src/observability/redis-memory-collector.ts` | Redis memory pressure gauges (#297) |
+| `monitoring/alerts/slo.rules.yml` | Recording rules, 27 alerts, error-budget burn rate |
+| `monitoring/dashboards/` | **#535** — three versioned Grafana dashboards (correção · capacidade · ação) |
+| `docs/runbooks/observability-slo.md` | SLIs/SLOs, per-alert operator reaction, clock semantics, OTLP rollout |
 
 ### Admin UI (governance surface)
 
@@ -90,6 +108,51 @@ The fail-path counter uses the *caller's* captured context (not `system`), so an
 
 `audit-actions.ts` exports the enum of every audit action. The `acao` field on `audit()` is typed; you can't audit an action that doesn't exist in the enum. This makes the audit row a discriminated union — dashboards filter by action label without parsing free-text.
 
+**A declared action is not a produced action.** The enum being typed stops you
+from auditing a *non-existent* action; it does not stop you from declaring one
+nobody emits. `llm_circuit_opened` / `llm_circuit_closed` shipped in the enum
+with a matching `audit-watcher` rule (`llm_circuit_long_open`) and **no
+producer** — `grep -rn "audit(" src/lib/llm/` returned zero, so the durable
+"breaker open for >5 min" alert could never fire, and its silence was
+indistinguishable from "nothing happened". Closed in the PR #541 review by
+`src/lib/llm/circuit-audit.ts`. When you add an action, add the emitter in the
+same change, and prove the ROW lands (see §4.2b).
+
+### 4.2b Proving an audit row LANDED, not that `audit()` was called
+
+`audit()` swallows failures by design (log + `maia_audit_write_failed_total`,
+no propagation) so a transient DB hiccup can't break business logic. That makes
+a mock-based audit test structurally weak: it stays green for a write that never
+committed.
+
+The concrete trap in this repo: `audit_log.alvo_id` is **UUID**
+(`migrations/001_initial.sql`). Any caller that puts a TEXT identifier there
+gets an INSERT error, `audit()` eats it, and the row silently disappears. It has
+already happened twice. Rules:
+
+1. Check the COLUMN TYPE before choosing a field. Free-text targets go in
+   `entidade_alvo` (TEXT) + `metadata` (JSONB); `alvo_id` is for real uuids.
+2. For any new audit producer, the regression test asserts against **real
+   Postgres** that the row exists — `tests/integration/llm-circuit-audit-real-db.spec.ts`
+   is the reference shape.
+3. If the write is fire-and-forget (hot path), expose a drain
+   (`drainCircuitAudits()`) so the test can await it instead of sleeping.
+
+### 4.2c Fleet-level decisions audit under `system`, explicitly
+
+Some governance decisions are about the FLEET, not a tenant: circuit-breaker
+transitions, and flipping the LLM circuit kill switch. They happen inside some
+tenant's call, so `audit()`'s automatic `system` fallback does NOT apply — the
+ALS context is populated, and the row would inherit whichever tenant happened to
+be in flight. That is a false attribution, which is worse than none.
+
+Such producers wrap the write in `runWithSystemContext()` **explicitly**, and
+justify it against the four cumulative conditions of
+[`ADR 0002`](../decisions/0002-external-dependency-health-is-system-state.md).
+The per-decision attribution does not disappear — it lives where the individual
+consequence is emitted (`maia_llm_requests_total{status="circuit_open"}` carries
+`tenant_id + agent_id`). Global state, scoped evidence.
+
 ### 4.3 Metrics with `tenant_id + agent_id` labels (every counter, every histogram)
 
 After PR #275, every `maia_*` counter has `tenant_id` and `agent_id` labels. Out-of-context paths use `system`. This means:
@@ -104,6 +167,127 @@ After PR #275, every `maia_*` counter has `tenant_id` and `agent_id` labels. Out
 - A turn outcome is observable even if the body write fails or is delayed
 - HMAC chains the envelope to the body so tampering is detectable
 - Redaction and optional encryption apply to the body, not the envelope
+
+### 4.4b Correlation: one `trace_id` per turn (issue #514)
+
+`src/observability/correlation.ts` owns a dedicated AsyncLocalStorage, separate
+from the tenant ALS on purpose: tenant context is **fail-closed** (missing ⇒
+throw, it is a security boundary), correlation is **fail-soft** (missing ⇒
+`null`, observability must never break a turn). Merging them would force one
+semantics onto the other.
+
+The id is **derived, not minted**: `deriveTraceId(mensagem_id)` returns a UUID
+seed verbatim and hashes anything else into a stable v5-shaped UUID. That is
+what makes "recovery preserves the root trace" free — the sweep re-enqueues the
+same row id and lands on the same trace, with no state carried across the
+crash. Each attempt gets its own `attempt` ordinal + `attempt_id`, so a retry
+is distinguishable without splitting the trace.
+
+Context builders must **not** mint a new root (`build-base-context.ts:83`,
+`base-context-builder.ts:132` both read the ambient id first).
+
+### 4.4c Metric labels are a closed allowlist (issue #514 §6)
+
+`src/observability/labels.ts` is a gate, not a convention:
+
+| Rule | Behaviour |
+|---|---|
+| key not on the allowlist | dropped |
+| key on the deny list, or containing `phone`/`jid`/`email`/`message`/`trace_id`/… | dropped — the deny list wins over the allowlist |
+| value shaped like a phone / JID / e-mail / URL / free text | `__sanitized__` |
+| value past the (metric, key) cardinality budget | `__overflow__` |
+
+`tenant_id` + `agent_id` are the sanctioned exception (§4.3 above), still
+cardinality-capped. High-cardinality correlation ids live in **logs and
+traces** — `correlationLogFields()` for logs, `span-attributes.ts` for OTLP
+spans (issue #535) — never in labels. Nothing throws in
+production; `MAIA_STRICT_METRIC_LABELS=true` promotes a violation to a test
+failure. Both that flag and `FEATURE_RUNTIME_TRACE_V1` are declared in the
+configuration contract (`src/config/contract.ts`, issue #515) and read through
+the typed loader — never `process.env` — so both are validated at boot and
+`restartRequired`.
+
+### 4.4d Two trace surfaces, one id (issue #535)
+
+There are now **two** traces, and conflating them is the mistake to avoid:
+
+| | Durable trace (P10b) | Operational trace (OTLP) |
+|---|---|---|
+| Purpose | governed evidence | latency waterfall |
+| Storage | `runtime_trace_envelopes/_bodies` | third-party collector |
+| Sampling | never | `MAIA_OTLP_SAMPLE_RATIO`, default 5% |
+| Integrity | HMAC-chained | none — it is not a system of record |
+| Off switch | `FEATURE_RUNTIME_TRACE_V1` | absent `MAIA_OTLP_TRACES_ENDPOINT` |
+
+They **join on one id**: the W3C trace id is `mensagens.id` with the dashes
+removed, so one value addresses the durable envelope, the log line, the Trace
+Explorer and the collector. `tracer.ts` derives it rather than minting a
+parallel id, for the same reason `deriveTraceId` is derived: an id you have to
+carry is an id you can lose.
+
+Sampling is **derived from the trace id, never rolled**. A turn crosses
+processes (ingress → BullMQ → worker); if each rolled its own dice we would
+export half-traces, and a missing half reads as "that stage never ran". Hashing
+the id makes every process reach the same verdict with nothing to propagate.
+
+The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
+`emitted` or `declared`, and `tests/unit/observability/tracer.spec.ts` fails if
+the two drift. Today `turn`, `queue.wait` and `tool.dispatch` are emitted; the
+other 20 are declared.
+
+#### Span attribution is RESOLVED, not read at close
+
+Every exported span carries `tenant_id + agent_id`, and the tuple is the one
+the turn **resolved to** — not whatever ALS happened to hold when the span
+closed. The distinction is not academic: it was the defect. The root `turn`
+span is opened by the worker BEFORE the tenant is known (`src/gateway/queue.ts`
+wraps the processor in the sanctioned `system` context) and `src/agent/core.ts`
+opens the real `runWithTenantContext` NESTED inside it. That nested scope has
+already unwound by the time the root's `emit()` runs after its `await`, so a
+close-time ALS read returned `system` for **every root span ever exported**,
+while `tool.dispatch` — opened inside the resolved scope — reported the truth.
+A waterfall whose root could not be filtered by tenant, and whose children
+disagreed with it.
+
+So the tuple is CAPTURED instead, and it is published **by whoever resolves
+it** — `src/agent/core.ts`, right after deriving `resolved` and *before*
+entering `runWithTenantContext` — via `publishSpanAttribution`, which stamps
+every span open on that async context; `emit()` uses the captured value.
+
+There is deliberately **no extension point in `src/db/tenant-context.ts`**.
+A first attempt installed a generic observer there; it was rejected on review,
+for a reason worth keeping written down: that module validates the tuple at
+*read* time (`assertTruthyContext`, `assertNotDefaultLiteral` inside
+`getCurrentTenant()`/`getCurrentAgent()`), not at scope entry. A hook on entry
+would therefore stamp spans with tuples that had passed no validation at all —
+including the `'default'` literal that `AGENTS.md` §4 rule 8 bans — while a
+read of the same context would throw. Telemetry would assert precisely what the
+invariant forbids. The fail-closed boundary stays free of extension points; new
+resolution sites publish explicitly.
+
+Two rules keep the isolation invariant intact, and both are test-enforced:
+
+- **`system` never publishes.** The worker's outer `runWithSystemContext` — in
+  either nesting order — cannot downgrade a span that already resolved.
+- **A span's tuple is write-once.** A second, *different* real tenant seen
+  under the same span is an anomaly, not an update; re-stamping would put one
+  tenant's tuple on another tenant's span. It is counted as
+  `maia_span_attribute_rejected_total{reason="attribution_conflict"}` and
+  dropped.
+
+Concurrency safety is structural rather than defensive: the slot lives on the
+per-span object created inside the tracer's own ALS frame, so two jobs of
+different tenants never touch the same object.
+`tests/unit/observability/span-attribution.spec.ts` and
+`tests/unit/gateway/queue-span-attribution.spec.ts` assert the **exported**
+attribution (what reaches the sink), including the concurrent case.
+
+`queue.wait` is the one span that cannot learn its own tenant: it reconstructs
+a window that closed before the worker existed. It is therefore emitted after
+the root closes, stamped with the tuple the root resolved to. The matching
+`maia_queue_wait_ms` **histogram** is still recorded up front, before the
+tenant is known, and is therefore still labelled `system` — deliberately, so
+the queue-wait SLI survives a turn that never finishes.
 
 ### 4.5 Drift detector — 7 types × 4 severities
 
@@ -122,12 +306,24 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | Pattern | Why it's wrong |
 |---|---|
 | Direct `INSERT INTO audit_logs` | Bypasses `audit()`'s context capture and counter emission. Use `audit()`. |
+| `incCounter()` directly for a NEW metric | Bypasses the label sanitizer. Use `src/observability/metrics.ts` and declare the name in `taxonomy.ts` first. |
+| `conversa_id` / `trace_id` / phone as a metric label | Unbounded cardinality + PII. Put it in the log line (`correlationLogFields()`) or the span attribute (`span-attributes.ts`), never the label. |
+| Free text (a policy reason, an error message) as a span attribute | The collector is a third party. `span-attributes.ts` replaces it with `__sanitized__`; the detail belongs in the log line. |
+| Marking a span `emitted` in `SPAN_EMISSION` without an emitter | This is the exact defect issue #535 opens with — a declaration that reads as coverage. The tracer spec fails on it. |
+| Treating a returned `{ error }` from `dispatchTool` as success | The dispatcher signals denial by RETURNING. Classify with `classifyToolResult`, or the tool SLI reads 0% while the agent cannot act. |
+| Reading a missing pool/session/scheduler gauge as a healthy 0 | Every #535 collector renders `NaN` when it cannot read its source; `Maia*MetricsAbsent` exists for this. |
+| Minting a fresh `trace_id` inside a context builder | Splits one turn into several traces. Read `currentTraceId()` first. |
+| Reading an absent metric as a healthy `0` | A gauge that cannot be read renders `NaN` on purpose. `MaiaQueueMetricsAbsent` exists for this. |
+| Relaxing the label sanitizer to fix a cardinality alert | Fix the call site. The sanitizer is the invariant, not the symptom. |
 | Audit-free side-effect ("just a small change") | Every side-effect audits. There is no small change. |
 | Metric without `tenant_id + agent_id` labels | Aggregates lose attribution. Every new counter goes through `incCounter()` with labels. |
 | Direct write to `soul_biases` | Soul is append-only and gated by `origin-gate.ts`. Cognition proposes; governance writes. |
 | Direct mutation of `agent_operational_profile` | Operational profile is governed. Use proposal flow (admin-ui approval). |
 | Lockdown bypass for "emergency" | Lockdown is the emergency. Bypassing it negates the gate. |
 | Free-text audit action (`acao: "thing happened"`) | The enum is the taxonomy. Add a new variant to `audit-actions.ts` and use it. |
+| Adding an audit action (or a watcher rule) without an emitter in the same change | A declaration that reads as coverage. `llm_circuit_opened`/`llm_circuit_closed` sat in the enum with a live watcher rule and no producer — a durable alert that could never fire. See §4.2. |
+| Proving an audit with a mocked `audit()` | `audit()` swallows failures. The test stays green for a row that never committed (the `alvo_id` uuid trap). Assert against real Postgres — §4.2b. |
+| Letting a FLEET-level decision inherit the ambient `tenant_id` | The breaker/kill-switch state is not any tenant's. Wrap in `runWithSystemContext()` explicitly and argue it against ADR 0002 — §4.2c. |
 | Trace body without redaction | PII goes through `lib/redaction.ts`. Raw bodies are not durable. |
 
 ## 6. Tests
@@ -143,6 +339,24 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/integration/p10b-runtime-trace.spec.ts` (if present) | Envelope/body trace integrity |
 | `tests/unit/control-plane/knowledge-state-machine/` | KSM lifecycle + transitions |
 | `tests/unit/cognition/drift/` | Drift detector contracts |
+| `tests/unit/observability/labels.spec.ts` | PII/cardinality label gate (issue #514) |
+| `tests/unit/observability/taxonomy.spec.ts` | Span tree shape + metric naming discipline |
+| `tests/unit/observability/correlation.spec.ts` | Deterministic trace derivation, ALS isolation, attempts |
+| `tests/unit/observability/turn-trace.spec.ts` | Envelope fail-loud semantics + body privacy |
+| `tests/unit/observability/slo-rules.spec.ts` | Alert rules ↔ emitted metrics drift guard |
+| `tests/unit/observability/runtime-trace-repo.spec.ts` | Trace Explorer tenant fail-closed + keyset cursor |
+| `tests/unit/observability/span-attributes.spec.ts` | Span-attribute gate: PII out, correlation ids in (issue #535) |
+| `tests/unit/observability/tracer.spec.ts` | Inert-when-off, id correlation, derived sampling, taxonomy honesty |
+| `tests/unit/observability/span-attribution.spec.ts` | EXPORTED span attribution: resolved tenant on the root, write-once, concurrent turns never swap tuples |
+| `tests/unit/gateway/queue-span-attribution.spec.ts` | Same, driven through the real BullMQ handler — `turn` + `queue.wait` agree |
+| `tests/unit/observability/otlp-exporter.spec.ts` | OTLP wire contract + bounded/counted loss |
+| `tests/unit/observability/runtime-collectors.spec.ts` | pool/session/scheduler gauges render NaN, never a healthy 0 |
+| `tests/unit/observability/instrumentation.spec.ts` | Returned `{error}` is classified, not counted as success |
+| `tests/unit/observability/dashboards.spec.ts` | Dashboards ↔ emitted metrics / recording rules drift guard |
+| `tests/unit/observability/overhead-benchmark.spec.ts` | Per-emission cost + cardinality budget actually bounds series |
+| `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
+| `tests/integration/observability-hot-path-trace.spec.ts` | Hot-path trace through the real HMAC/redaction writers |
+| `tests/integration/llm-circuit-audit-real-db.spec.ts` | **Real Postgres** — a circuit transition LANDS a row in `audit_log` under `system`, `alvo_id` stays null, and the `llm_circuit_long_open` watcher rule finds the open/closed pair and the stuck case |
 
 ## 7. Known gaps
 
@@ -158,8 +372,50 @@ gh pr list --state open --search "audit OR governance OR trace"
 At last verification:
 
 - P3c (procedure governance ops) — partial: `procedure_metrics` materialized view, full test runner, full step-evaluator (`llm_judge` / `user_signal` / `human_confirmed`) still in iteration. See `README.md` § Estado atual.
-- Runtime-trace P10b — implemented; admin-ui trace exploration still maturing.
 - Capability dialogical-acquisition 4-level escalation — in production; loop closure post-acquisition still being tuned.
+
+Issue #514 landed the foundation; issue #535 landed the exporter, four of the
+five missing metric families and the dashboards. Still open — do **not** assume
+coverage that does not exist:
+
+- **Span emission is partial.** `turn`, `queue.wait` and `tool.dispatch` have
+  emitters; the other 20 taxonomy entries are marked `declared` in
+  `SPAN_EMISSION` and produce nothing. The marking is test-enforced, so this
+  list cannot silently go stale.
+- **`context.load` is not emitted on the hot path.** `instrumentContextLoad`
+  exists and is tested, but the turn's context assembly lives in
+  `src/agent/prompt-builder.ts`, which #535 did not touch. `maia_context_load_ms`
+  therefore has no production series yet — one wrap away.
+- **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
+  pending the canary rollout in `docs/runbooks/observability-slo.md`.
+- **Not yet instrumented**: outbound send duration (`maia_outbound_send_ms`),
+  ingress normalize/persist, identity/audience resolution.
+- **The overhead benchmark is micro, not under load.** Real cardinality under
+  production traffic is still unmeasured; the budget is proven to BOUND the
+  series count, not sized against observed traffic.
+- **`root_trace_id` / `attempt` are still outside `envelope_hmac`** — the
+  owner decision the issue asks for has not been recorded.
+
+## 7.5 Documented exception — staging de inbound não-roteado (`inbound_unrouted`)
+
+Spec `2026-07-09-multi-agent-channel-routing-design` §1.4 (modo `strict`): um
+inbound cuja LINHA não resolve para nenhum canal ativo não é descartado — é
+**estagiado fora de qualquer tenant** (não há tenant a atribuir; descobrir o
+dono é exatamente o que falhou). Esta é uma exceção CONSCIENTE ao invariante
+de escopo por tenant, mitigada por:
+
+- **Cifragem**: payload selado em envelope AES-256-GCM versionado
+  (`src/gateway/staging-crypto.ts`), keyring via `MAIA_STAGING_KEYRING` +
+  `MAIA_STAGING_ACTIVE_KEY_ID`; uma chave só sai do keyring quando nenhuma
+  row `pending` a referencia (canário no worker `unrouted_recovery`).
+- **TTL**: 72h — rows `pending` vencidas viram `expired` (auditadas como
+  `inbound_unrouted_expired`), nunca acumulam indefinidamente.
+- **Acesso restrito**: só `inboundUnroutedRepo` + o worker de replay tocam a
+  tabela; nenhum caminho de leitura de produto a expõe.
+- **Trilha completa**: `inbound_staged` → `inbound_unrouted_handed_off` /
+  `inbound_unrouted_expired` no audit; o handoff entrega pela pipeline normal
+  sob o tenant RESOLVIDO (o dedup por canal de `mensagens` impede entrega
+  dupla na corrida com o caminho vivo).
 
 ## 8. In-flight changes
 
@@ -183,11 +439,16 @@ Verify with `gh pr list --state open --search "audit OR governance OR trace OR i
 - **Dual-pattern trace (envelope + body)** — envelope is durable + observable; body is detailed + redacted + HMAC-chained.
 - **Cognition proposes; governance gates** — every capability/skill/procedure/role change goes through proposal + owner approval. No self-modification.
 - **Policy DSL over imperative checks** — declarative rules in `policy-dsl/` keep governance out of executable code paths.
+- **OTLP without the OpenTelemetry SDK (#535)** — OTLP is a wire format, not a framework. The HTTP/JSON binding is a POST of a plain object; the SDK would add a large dependency tree, own the global tracer and monkey-patch `http`/`pg`/`ioredis` on import. The cost accepted in exchange: no auto-instrumentation, no cross-service context propagation, no protobuf binding.
+- **The OTLP trace id IS the Maia trace id (#535)** — a UUID and a W3C trace id are both 16 bytes, so one value addresses four surfaces instead of forcing an operator to correlate two id spaces.
+- **Sampling derived from the trace id, not rolled per process (#535)** — a turn crosses processes; independent dice produce half-traces, and a missing half reads as "that stage never ran".
+- **Span attributes may carry correlation ids; metric labels may not (#535)** — a label mints a time series forever, a span attribute lives on one span. Content, phones, JIDs and free text are forbidden on both.
+- **Span emission status is declared and test-enforced (#535)** — the taxonomy states which spans have emitters, so it cannot overstate coverage.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
+| Last verified | 2026-08-04 |
+| Against `main` HEAD | `7b34e7e` + issue #535 |
 | Re-verify when | Older than 30 days; OR `audit-actions.ts` adds a variant; OR `metrics.ts` changes counter labels; OR `runtime-trace/` changes envelope/body split; OR `policy-dsl/` adds an operator |

@@ -35,7 +35,15 @@ const { dbInsertMock, txInsertOnConflictMock, txInsertValuesMock, dbTransactionM
             //  - has .onConflictDoNothing() that returns a promise (outbox path).
             const chain = {
               then: (resolve: (v: unknown) => void) => resolve(undefined),
-              onConflictDoNothing: txInsertOnConflictMock,
+              onConflictDoNothing: () => {
+                txInsertOnConflictMock();
+                // Non-empty RETURNING ⇒ the row was inserted, no replay.
+                const rows = [{ trace_id: 'inserted' }];
+                return {
+                  then: (res: (v: unknown) => void) => res(rows),
+                  returning: () => Promise.resolve(rows),
+                };
+              },
             } as unknown;
             return chain;
           }),
@@ -51,7 +59,28 @@ const { dbInsertMock, txInsertOnConflictMock, txInsertValuesMock, dbTransactionM
 // Mock drizzle db.insert(...).values(...) chain + db.transaction.
 vi.mock('../../src/db/client.js', () => ({
   db: {
-    insert: () => ({ values: dbInsertMock }),
+    // Issue #514 review round 1 [P1]: the non-transactional path is now
+    // `insert(...).values(...).onConflictDoNothing()` (at-least-once callers
+    // must not die on a duplicate PK). `dbInsertMock` stays the row recorder
+    // and outcome control — `mockRejectedValue` still simulates a DB failure —
+    // and the chain simply forwards its promise to whichever terminal the
+    // writer uses.
+    insert: () => ({
+      values: (row: unknown) => {
+        const p = dbInsertMock(row) as Promise<unknown>;
+        return {
+          then: (res: (v: unknown) => void, rej: (e: unknown) => void) => p.then(res, rej),
+          // #514 round 2: the writer asks for RETURNING to detect a replay. A
+          // non-empty result means "inserted", which is the default here — the
+          // divergent-replay path has its own spec with a PK-modelling fake.
+          onConflictDoNothing: () => ({
+            then: (res: (v: unknown) => void, rej: (e: unknown) => void) =>
+              p.then(() => res([{ trace_id: 'inserted' }]), rej),
+            returning: () => p.then(() => [{ trace_id: 'inserted' }]),
+          }),
+        };
+      },
+    }),
     transaction: dbTransactionMock,
   },
 }));
@@ -186,8 +215,11 @@ describe('writeEnvelope', () => {
     expect(dbTransactionMock).toHaveBeenCalledTimes(1);
     // 2 .values() calls inside the tx: envelopes + outbox.
     expect(txInsertValuesMock).toHaveBeenCalledTimes(2);
-    // Outbox uses onConflictDoNothing.
-    expect(txInsertOnConflictMock).toHaveBeenCalledTimes(1);
+    // Issue #514 review round 1 [P1]: BOTH inserts are conflict-tolerant now
+    // — the envelope as well as the outbox. An at-least-once re-write of the
+    // same attempt must be a no-op, not a unique violation that fails the
+    // turn closed.
+    expect(txInsertOnConflictMock).toHaveBeenCalledTimes(2);
     // Non-tx insert path NOT used when outbox_body is set.
     expect(dbInsertMock).not.toHaveBeenCalled();
     // Inspect what got inserted — envelope first (has body_status), outbox second (has payload).

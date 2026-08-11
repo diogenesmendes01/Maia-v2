@@ -29,6 +29,7 @@ import type { BaseContextPacket } from '../context-packet/types.js';
 import type { MetricsClient } from './types.js';
 import { createProductionDecisionEngineEnv } from './prod-env.js';
 import { logger } from '@/lib/logger.js';
+import { traceTurnDecision } from '@/observability/turn-trace.js';
 
 // ============================================================================
 // Shared types
@@ -164,10 +165,11 @@ export function _overrideDecisionEngineSingleton(
 export async function runDecisionEngineForTurn(
   base: BaseContextPacket,
 ): Promise<RunDecisionEngineResult> {
+  const t0 = Date.now();
+  let result: DecisionEngineResult;
   try {
     const engine = getDecisionEngine();
-    const result = await engine.run({ base });
-    return { engine_ran: true, result };
+    result = await engine.run({ base });
   } catch (err) {
     logger.error(
       { err, tenant_id: base.tenant_id, trace_id: base.trace_id },
@@ -177,4 +179,25 @@ export async function runDecisionEngineForTurn(
     // fail-closed: caller MUST handle as block
     throw new DecisionEngineFailClosedError(err, base.tenant_id, base.trace_id);
   }
+
+  // Issue #514 §4 — durable runtime trace, written AFTER the decision exists
+  // and BEFORE the caller acts on it. This is the ordering P10b invariant 12
+  // requires ("envelope precedes the side effect") and it is the single hook
+  // that gives every turn an envelope without instrumenting each effect site.
+  //
+  // Gated OFF by default (`FEATURE_RUNTIME_TRACE_V1`) per the issue's canary
+  // rollout, so this call is inert until an operator flips it.
+  //
+  // Deliberately OUTSIDE the try/catch above: a `traceTurnDecision` throw means
+  // a MANDATORY envelope could not be written, which must fail the turn closed
+  // — but it must not be misreported as "the engine crashed", so it surfaces as
+  // itself rather than being wrapped in DecisionEngineFailClosedError.
+  await traceTurnDecision({
+    base,
+    packet: result.packet,
+    block: result.block ?? null,
+    evaluation_ms: Date.now() - t0,
+  });
+
+  return { engine_ran: true, result };
 }

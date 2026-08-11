@@ -24,12 +24,14 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { anthropicCreateMock, openaiCreateMock, getMainMock, getFastMock } = vi.hoisted(() => ({
-  anthropicCreateMock: vi.fn(),
-  openaiCreateMock: vi.fn(),
-  getMainMock: vi.fn(),
-  getFastMock: vi.fn(),
-}));
+const { anthropicCreateMock, openaiCreateMock, getMainMock, getFastMock, getSettingsMock } =
+  vi.hoisted(() => ({
+    anthropicCreateMock: vi.fn(),
+    openaiCreateMock: vi.fn(),
+    getMainMock: vi.fn(),
+    getFastMock: vi.fn(),
+    getSettingsMock: vi.fn(),
+  }));
 
 vi.mock('@anthropic-ai/sdk', () => {
   const Anthropic = vi.fn(function (this: unknown) {
@@ -45,9 +47,14 @@ vi.mock('openai', () => {
   return { default: OpenAI };
 });
 
+// Issue #508: o gateway resolve main + fast numa ÚNICA leitura
+// (`getCurrentLLMSettings`) em vez das duas operações sequenciais que
+// `callLLM` fazia por chamada. Os mocks legados continuam aqui porque as
+// asserções de "nada foi lido antes do abort" seguem valendo para eles.
 vi.mock('@/lib/llm-settings.js', () => ({
   getCurrentMainModel: getMainMock,
   getCurrentFastModel: getFastMock,
+  getCurrentLLMSettings: getSettingsMock,
 }));
 
 vi.mock('@/lib/cost-ledger.js', () => ({
@@ -57,6 +64,9 @@ vi.mock('@/lib/cost-ledger.js', () => ({
 vi.mock('@/lib/metrics.js', () => ({
   incCounter: vi.fn(),
   observeHistogram: vi.fn(),
+  // Registrado pelo disjuntor (issue #534) na primeira chamada de cada
+  // `(provider, workload)`.
+  setGaugeProvider: vi.fn(),
 }));
 
 // Force a deterministic provider + retry count regardless of dev env. The
@@ -105,6 +115,16 @@ function makeAbortError() {
   return err;
 }
 
+/**
+ * Issue #508 (review rodada 1): o gateway exige `tenant_id + agent_id` no ALS
+ * — uma chamada de LLM sempre gasta dinheiro de algum tenant. Estes testes
+ * cobrem cancelamento, não isolamento, então rodam sob um escopo fixo.
+ */
+async function withScope<T>(fn: () => Promise<T>): Promise<T> {
+  const { runWithTenantContext } = await import('@/db/tenant-context.js');
+  return runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, fn);
+}
+
 describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
   beforeEach(() => {
     anthropicCreateMock.mockReset();
@@ -113,6 +133,11 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     getFastMock.mockReset();
     getMainMock.mockResolvedValue('claude-test-main');
     getFastMock.mockResolvedValue('claude-test-fast');
+    getSettingsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      main: { value: 'claude-test-main', source: 'global' },
+      fast: { value: 'claude-test-fast', source: 'global' },
+    });
     // Drop the cached module so the `selectProvider()` snapshot uses the
     // current `LLM_PROVIDER` mock value rather than whatever a prior test
     // (in a different describe block) installed.
@@ -123,22 +148,49 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     vi.useRealTimers();
   });
 
-  it('forwards { signal } to anthropic.messages.create as RequestOptions', async () => {
+  /**
+   * Issue #508: the gateway now always derives an absolute deadline
+   * (`LLM_TURN_DEADLINE_MS`) when the caller doesn't declare one, so the signal
+   * handed to the SDK is composed from the caller's signal + the deadline
+   * timer — no longer the caller's object by identity. The property that
+   * matters is unchanged, and this asserts it directly and more strongly than
+   * the old identity check did: while the request is IN FLIGHT, aborting the
+   * caller aborts the signal the SDK is holding.
+   */
+  it('propagates caller cancellation to the signal anthropic.messages.create holds', async () => {
     const { callLLM } = await import('@/lib/claude.js');
-    anthropicCreateMock.mockResolvedValueOnce(happyAnthropicResponse());
+
+    let sdkSignal: AbortSignal | undefined;
+    anthropicCreateMock.mockImplementationOnce(
+      (_params: unknown, options: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          sdkSignal = options.signal;
+          options.signal?.addEventListener('abort', () => reject(makeAbortError()), {
+            once: true,
+          });
+        }),
+    );
 
     const controller = new AbortController();
-    await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    const promise = withScope(() =>
+      callLLM({
+        workload: 'reasoner',
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
+    // Give the call time to reach the SDK.
+    await new Promise((r) => setTimeout(r, 20));
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
-    // RequestOptions is the second positional arg.
-    const requestOptions = anthropicCreateMock.mock.calls[0]?.[1];
-    expect(requestOptions).toBeDefined();
-    expect(requestOptions.signal).toBe(controller.signal);
+    expect(sdkSignal).toBeInstanceOf(AbortSignal);
+    expect(sdkSignal?.aborted).toBe(false);
+
+    controller.abort('caller_cancelled');
+
+    expect(sdkSignal?.aborted).toBe(true);
+    await expect(promise).rejects.toBeDefined();
   });
 
   it('pre-aborted signal short-circuits before the SDK and model lookup (item 4)', async () => {
@@ -148,17 +200,19 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
 
     await expect(
       callLLM({
+        workload: 'reasoner',
         system: 'sys',
         messages: [{ role: 'user', content: 'hi' }],
         signal: controller.signal,
       }),
     ).rejects.toThrow('llm_call_aborted');
 
-    // Item 4: the early-cancellation check runs before getCurrentMainModel,
-    // so even the settings reads must not have happened.
+    // Item 4: the early-cancellation check runs before ANY settings read, so
+    // neither the legacy per-tier reads nor the issue-#508 joint read fire.
     expect(anthropicCreateMock).not.toHaveBeenCalled();
     expect(getMainMock).not.toHaveBeenCalled();
     expect(getFastMock).not.toHaveBeenCalled();
+    expect(getSettingsMock).not.toHaveBeenCalled();
   });
 
   it('does not retry when SDK rejects with AbortError mid-flight', async () => {
@@ -167,11 +221,14 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
 
     const controller = new AbortController();
     await expect(
-      callLLM({
-        system: 'sys',
-        messages: [{ role: 'user', content: 'hi' }],
-        signal: controller.signal,
-      }),
+      withScope(() =>
+        callLLM({
+          workload: 'reasoner',
+          system: 'sys',
+          messages: [{ role: 'user', content: 'hi' }],
+          signal: controller.signal,
+        }),
+      ),
     ).rejects.toMatchObject({ name: 'AbortError' });
 
     // Critical assertion: AbortError must NOT trigger the retry loop.
@@ -187,11 +244,14 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
     anthropicCreateMock.mockRejectedValueOnce(new Error('500: upstream'));
 
     const controller = new AbortController();
-    const promise = callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    const promise = withScope(() =>
+      callLLM({
+        workload: 'reasoner',
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
     // Let the first attempt run + reject, then enter the back-off sleep.
     // The first back-off is 2000ms; the test would hang for the full delay
@@ -230,11 +290,14 @@ describe('callLLM — Anthropic SDK abort wiring (PR #221, item 3)', () => {
         throw makeAbortError();
       });
 
-    const err = await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    }).catch((e) => e);
+    const err = await withScope(() =>
+      callLLM({
+        workload: 'reasoner',
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    ).catch((e) => e);
 
     // The abort error has name 'AbortError'. lastErr would have message
     // starting with '500:'. Item 2 ensures abort wins.
@@ -254,6 +317,11 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     getFastMock.mockReset();
     getMainMock.mockResolvedValue('anthropic/claude-test-main');
     getFastMock.mockResolvedValue('anthropic/claude-test-fast');
+    getSettingsMock.mockReset();
+    getSettingsMock.mockResolvedValue({
+      main: { value: 'anthropic/claude-test-main', source: 'global' },
+      fast: { value: 'anthropic/claude-test-fast', source: 'global' },
+    });
     vi.resetModules();
     // Swap the config provider to openrouter before importing claude.ts.
     vi.doMock('@/config/env.js', async () => {
@@ -277,21 +345,39 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
     vi.doUnmock('@/config/env.js');
   });
 
-  it('forwards { signal } to openai.chat.completions.create as RequestOptions', async () => {
+  /** See the Anthropic-side note above: composed signal, same guarantee. */
+  it('propagates caller cancellation to the signal openai.chat.completions.create holds', async () => {
     const { callLLM } = await import('@/lib/claude.js');
-    openaiCreateMock.mockResolvedValueOnce(happyOpenAIResponse());
+
+    let sdkSignal: AbortSignal | undefined;
+    openaiCreateMock.mockImplementationOnce(
+      (_params: unknown, options: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          sdkSignal = options.signal;
+          options.signal?.addEventListener('abort', () => reject(makeAbortError()), {
+            once: true,
+          });
+        }),
+    );
 
     const controller = new AbortController();
-    await callLLM({
-      system: 'sys',
-      messages: [{ role: 'user', content: 'hi' }],
-      signal: controller.signal,
-    });
+    const promise = withScope(() =>
+      callLLM({
+        workload: 'reasoner',
+        system: 'sys',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      }),
+    );
 
+    await new Promise((r) => setTimeout(r, 20));
     expect(openaiCreateMock).toHaveBeenCalledTimes(1);
-    const requestOptions = openaiCreateMock.mock.calls[0]?.[1];
-    expect(requestOptions).toBeDefined();
-    expect(requestOptions.signal).toBe(controller.signal);
+    expect(sdkSignal?.aborted).toBe(false);
+
+    controller.abort('caller_cancelled');
+
+    expect(sdkSignal?.aborted).toBe(true);
+    await expect(promise).rejects.toBeDefined();
   });
 
   it('does not retry when OpenAI SDK rejects with AbortError', async () => {
@@ -300,11 +386,14 @@ describe('callLLM — OpenRouter (OpenAI SDK) abort wiring (PR #221, item 3)', (
 
     const controller = new AbortController();
     await expect(
-      callLLM({
-        system: 'sys',
-        messages: [{ role: 'user', content: 'hi' }],
-        signal: controller.signal,
-      }),
+      withScope(() =>
+        callLLM({
+          workload: 'reasoner',
+          system: 'sys',
+          messages: [{ role: 'user', content: 'hi' }],
+          signal: controller.signal,
+        }),
+      ),
     ).rejects.toMatchObject({ name: 'AbortError' });
 
     expect(openaiCreateMock).toHaveBeenCalledTimes(1);

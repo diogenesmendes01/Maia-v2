@@ -439,6 +439,7 @@ async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
     { name: 'reflection-batch', triggered_by: 'async_event', timeoutMs: 30000 },
     () =>
       callLLM({
+        workload: 'reflection',
         system,
         messages: [{ role: 'user', content: user }],
         max_tokens: 400,

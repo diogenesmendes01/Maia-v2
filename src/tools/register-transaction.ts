@@ -7,20 +7,54 @@ import { trigramSim } from '@/lib/utils.js';
 import { TypedError } from '@/lib/utils.js';
 import { toDecimal } from '@/lib/decimal.js';
 
+// Issue #509 §6 — the `.describe()` texts below are shipped to the model as the
+// JSON Schema `description` of each field (see src/tools/schema-json.ts). They
+// state units, formats and opacity of identifiers so the model stops guessing.
+// They must NEVER teach the model to assert authority (approval, ownership,
+// tenancy): those come from backend state alone.
 const inputSchema = z.object({
-  entidade_id: z.string().uuid(),
-  conta_id: z.string().uuid(),
-  natureza: z.enum(['receita', 'despesa', 'movimentacao']),
-  valor: z.number().positive(),
-  data_competencia: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  data_pagamento: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  status: z.enum(['pendente', 'agendada', 'paga', 'recebida']),
-  descricao: z.string().min(1).max(280),
-  categoria_id: z.string().uuid().optional(),
-  contraparte_id: z.string().uuid().optional(),
-  contraparte_nome: z.string().optional(),
-  metadata: z.record(z.unknown()).optional(),
-  origem: z.enum(['whatsapp', 'manual']).default('whatsapp'),
+  entidade_id: z
+    .string()
+    .uuid()
+    .describe('UUID opaco da entidade dona da conta. Nunca invente: use um id já visto no contexto.'),
+  conta_id: z
+    .string()
+    .uuid()
+    .describe('UUID opaco da conta que recebe o lançamento. Deve pertencer a entidade_id.'),
+  natureza: z
+    .enum(['receita', 'despesa', 'movimentacao'])
+    .describe('Sinal do lançamento. O valor é sempre positivo; o sinal vem daqui.'),
+  valor: z
+    .number()
+    .positive()
+    .describe('Valor absoluto em BRL (reais), maior que zero. Use ponto decimal, ex.: 1234.56.'),
+  data_competencia: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .describe('Data de competência no formato YYYY-MM-DD (fuso do interlocutor).'),
+  data_pagamento: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .describe('Data de pagamento no formato YYYY-MM-DD. Omita quando ainda não houve pagamento.'),
+  status: z
+    .enum(['pendente', 'agendada', 'paga', 'recebida'])
+    .describe('Situação do lançamento no momento do registro.'),
+  descricao: z.string().min(1).max(280).describe('Descrição livre, 1 a 280 caracteres.'),
+  categoria_id: z.string().uuid().optional().describe('UUID opaco de categoria já existente.'),
+  contraparte_id: z.string().uuid().optional().describe('UUID opaco de contraparte já existente.'),
+  contraparte_nome: z
+    .string()
+    .optional()
+    .describe('Nome da contraparte quando não houver contraparte_id.'),
+  metadata: z
+    .record(z.unknown())
+    .optional()
+    .describe('Mapa livre de metadados auxiliares. Não use para dados sensíveis.'),
+  origem: z
+    .enum(['whatsapp', 'manual'])
+    .default('whatsapp')
+    .describe('Canal de origem do registro. Omita para usar o default "whatsapp".'),
 });
 
 const outputSchema = z.union([

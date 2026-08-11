@@ -82,12 +82,14 @@ else
   FAILED=$((FAILED + 1))
 fi
 
-echo "=== Gate 7/7: prompt-builder enforces status === 'active' ==="
-if grep -q "status === 'active'" src/agent/prompt-builder.ts; then
-  echo "[GATE 7/7] prompt-builder enforces status === 'active' ... PASS"
+# Issue #525 moved the identity READ (and this guard) out of prompt-builder.ts
+# into the turn-context loader; prompt-builder.ts is now a pure renderer.
+echo "=== Gate 7/7: turn-context loader enforces status === 'active' ==="
+if grep -q "status === 'active'" src/agent/turn-context/loader.ts; then
+  echo "[GATE 7/7] turn-context loader enforces status === 'active' ... PASS"
   PASSED=$((PASSED + 1))
 else
-  echo "[GATE 7/7] prompt-builder enforces status === 'active' ... FAIL"
+  echo "[GATE 7/7] turn-context loader enforces status === 'active' ... FAIL"
   FAILED=$((FAILED + 1))
 fi
 

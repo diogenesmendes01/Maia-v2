@@ -2,12 +2,17 @@
  * Admin UI Setup — channel policies router.
  *
  * Procedures:
- *   - listChannels  — list channels for the resolved tenant (so the UI can
- *                     pick one before upserting a policy)
- *   - listRoles     — list roles in the resolved tenant (so the UI can pick
- *                     the default_role_id for the policy)
- *   - getByChannel  — fetch the current policy (if any) for a channel
- *   - upsert        — create-or-update the policy for a channel. Audits.
+ *   - listChannels     — list channels for the resolved tenant (so the UI can
+ *                        pick one before upserting a policy)
+ *   - listRoles        — list roles in the resolved tenant (so the UI can pick
+ *                        the default_role_id for the policy)
+ *   - channelsOverview — channels joined with their policy status + role
+ *                        count, for the go-live checklist and the channels
+ *                        table (avoids an N+1 of getByChannel from the client)
+ *   - getByChannel     — fetch the current policy (if any) for a channel
+ *   - upsert           — create-or-update the policy for a channel. Audits.
+ *   - createChannel    — register a channel for an agent. Audits.
+ *   - createRole       — register a role for an agent. Audits.
  *
  * Notes:
  *   - channelsRepo / rolesRepo / channelPoliciesRepo all use applyTenantGuard,
@@ -16,6 +21,9 @@
  *   - Single source of truth for "1 policy per channel" is the UNIQUE
  *     constraint on (channel_id) — we still try update→create here as a clean
  *     UX shortcut, but the DB is authoritative.
+ *   - channels e roles eram seed/SQL-only; createChannel/createRole fecham o
+ *     elo que faltava na jornada "agente novo → responde no canal". A UNIQUE
+ *     do DB continua autoritativa — 23505 vira CONFLICT tipado, nunca 500.
  */
 import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
@@ -70,6 +78,48 @@ const UpsertInputSchema = z.object({
   comment: z.string().min(10).max(1000),
 });
 
+// Mirrors channelsRepo.create's channel_type union (schema has no CHECK; the
+// repo signature is the contract).
+const ChannelTypeSchema = z.enum([
+  'whatsapp',
+  'telegram',
+  'email',
+  'sms',
+  'web',
+  'api',
+  'other',
+]);
+
+const CreateChannelInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: z.string(),
+  channel_type: ChannelTypeSchema,
+  external_id: z.string().min(1).max(200),
+  display_name: z.string().min(1).max(200).optional(),
+  comment: z.string().min(10).max(1000),
+});
+
+// Same shape rule as agent ids / role_key seeds (e.g. migration 035).
+const RoleKeySchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, 'must be lowercase letters/digits/_/- and start with alnum');
+
+const CreateRoleInputSchema = z.object({
+  tenantId: z.string().optional(),
+  agentId: z.string(),
+  role_key: RoleKeySchema,
+  display_name: z.string().min(1).max(200),
+  description: z.string().max(1000).optional(),
+  prompt_addendum: z.string().max(4000).optional(),
+  // Omitted ⇒ the first role of the agent becomes the default automatically
+  // (a channel policy cannot exist without a default role). Explicit false is
+  // honored even for the first role.
+  is_default: z.boolean().optional(),
+  comment: z.string().min(10).max(1000),
+});
+
 export const channelPoliciesRouter = router({
   listChannels: protectedProcedure
     .input(ListChannelsInputSchema)
@@ -90,6 +140,50 @@ export const channelPoliciesRouter = router({
     );
     return { items };
   }),
+
+  /**
+   * Channels joined with their policy status, plus the agent's role count.
+   * Feeds the go-live checklist on the agent detail page and the policy
+   * column on /setup/channels without an N+1 of getByChannel calls.
+   */
+  channelsOverview: protectedProcedure
+    .input(ListChannelsInputSchema)
+    .query(async ({ input, ctx }) => {
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+      return runWithTenantContext(
+        { tenant_id: tenantId, agent_id: input.agentId },
+        async () => {
+          const [channels, roles] = await Promise.all([
+            ctx.repos.channelsRepo.listActive(),
+            ctx.repos.rolesRepo.listActive(),
+          ]);
+          const roleKeyById = new Map(roles.map((r) => [r.id, r.role_key]));
+          const withPolicy = await Promise.all(
+            channels.map(async (c) => {
+              const policy = await ctx.repos.channelPoliciesRepo.getByChannelId(c.id);
+              // roleKeyById only holds ACTIVE roles, so a policy whose
+              // default role was deactivated resolves to null — the channel
+              // has a policy but is NOT ready to operate. Consumers (go-live
+              // checklist, policy badge) must gate on policy_ready, not
+              // has_policy (PR #491 review, medium).
+              const defaultRoleKey = policy
+                ? (roleKeyById.get(policy.default_role_id) ?? null)
+                : null;
+              return {
+                id: c.id,
+                channel_type: c.channel_type,
+                external_id: c.external_id,
+                display_name: c.display_name,
+                has_policy: policy !== null,
+                default_role_key: defaultRoleKey,
+                policy_ready: policy !== null && defaultRoleKey !== null,
+              };
+            }),
+          );
+          return { channels: withPolicy, roles_count: roles.length };
+        },
+      );
+    }),
 
   getByChannel: protectedProcedure
     .input(GetByChannelInputSchema)
@@ -184,4 +278,117 @@ export const channelPoliciesRouter = router({
 
     return { policy, created: !isUpdate };
   }),
+
+  /**
+   * Register a channel for an agent. Channels were previously seed/SQL-only
+   * (migration 035); this closes the missing link in the "new agent → answers
+   * on a channel" journey. The DB UNIQUE (tenant_id, channel_type,
+   * external_id) stays authoritative — a violation surfaces as CONFLICT.
+   *
+   * NOTE: in the current single-tenant runtime the gateway resolves inbound
+   * messages via the seeded `primary/primary` catch-all (issue #411 —
+   * `src/gateway/channel-resolver.ts`); an exact-match channel row created
+   * here only routes traffic on deployments where the gateway passes the bot
+   * line as external_id. Registering the row is still the correct
+   * configuration step — routing is the runtime's concern, not this surface's.
+   */
+  createChannel: protectedProcedure
+    .input(CreateChannelInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      // PR #491 review (high) — create + audit run in ONE tx inside the repo
+      // ("audit every decision": a failed audit insert rolls the channel
+      // back). The helper takes explicit tenant/agent and maps 23505 to a
+      // typed reason, same contract as agentsRepo.createWithSeedAndAudit.
+      const result = await ctx.repos.channelsRepo.createWithAudit({
+        tenant_id: tenantId,
+        agent_id: input.agentId,
+        channel: {
+          channel_type: input.channel_type,
+          external_id: input.external_id,
+          display_name: input.display_name,
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          reason: input.comment,
+        },
+      });
+      if (!result.ok) {
+        // §1.5/§2 (spec roteamento): linha whatsapp deve ser E.164 com `+`;
+        // duplicata continua CONFLICT. Um canal whatsapp criado aqui volta
+        // INATIVO ('declarado') — a posse só vem do pareamento (§2.5).
+        if (result.reason === 'invalid_line') {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message:
+              'WhatsApp channel external_id must be an E.164 line with "+" (e.g. +5511999999999)',
+          });
+        }
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message: `Channel '${input.channel_type}/${input.external_id}' already exists in this tenant`,
+        });
+      }
+
+      return { channel: result.channel };
+    }),
+
+  /**
+   * Register a role for an agent. Roles were previously seed/SQL-only; a
+   * channel policy requires a default_role_id, so without this mutation the
+   * policy modal dead-ends on agents created through the wizard.
+   *
+   * `is_default` omitted ⇒ the agent's first role becomes the default
+   * automatically. Both UNIQUEs (role_key per agent; single default per
+   * agent — partial index) stay authoritative and surface as CONFLICT.
+   */
+  createRole: protectedProcedure
+    .input(CreateRoleInputSchema)
+    .mutation(async ({ input, ctx }) => {
+      ctx.assertRole('owner', 'founder');
+      const tenantId = resolveTenantId(ctx, input.tenantId);
+
+      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+      if (!agent || agent.tenant_id !== tenantId) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      }
+
+      // PR #491 review (high) — create + audit in ONE tx; `is_default`
+      // omitted is resolved INSIDE the tx (first active role becomes the
+      // default; the partial unique index breaks concurrent-create ties).
+      const result = await ctx.repos.rolesRepo.createWithAudit({
+        tenant_id: tenantId,
+        agent_id: input.agentId,
+        role: {
+          role_key: input.role_key,
+          display_name: input.display_name,
+          description: input.description,
+          prompt_addendum: input.prompt_addendum,
+          is_default: input.is_default,
+        },
+        audit: {
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          reason: input.comment,
+        },
+      });
+      if (!result.ok) {
+        throw new TRPCError({
+          code: 'CONFLICT',
+          message:
+            `Role '${input.role_key}' already exists for this agent, ` +
+            `or another role is already the default`,
+        });
+      }
+
+      return { role: result.role };
+    }),
 });

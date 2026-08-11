@@ -46,6 +46,7 @@ type Row = {
   external_id: string;
   channel_type: string;
   active: boolean;
+  is_synthetic: boolean;
 };
 const dataset: { rows: Row[] } = { rows: [] };
 // Captured so the TOCTOU test can assert a single transaction wraps both reads.
@@ -86,6 +87,7 @@ vi.mock('@/db/schema.js', async () => {
       external_id: 'external_id',
       channel_type: 'channel_type',
       active: 'active',
+      is_synthetic: 'is_synthetic',
     },
   };
 });
@@ -128,6 +130,7 @@ function row(overrides: Partial<Row> = {}): Row {
     external_id: 'default-channel',
     channel_type: 'whatsapp',
     active: true,
+    is_synthetic: false,
     ...overrides,
   };
 }
@@ -215,6 +218,20 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
     expect(oldOut.channel).not.toBeNull();
     // NEW fails closed.
     expect(newOut.multi_tenant).toBe(true);
+  });
+
+  it('[P1-A] active non-primary SYNTHETIC channel is EXCLUDED → single-tenant, returns catch-all', async () => {
+    // Um canal is_synthetic ativo de tenant ≠ primary NÃO conta como tenant
+    // real: ativar o canal de sonda nunca derruba o catch-all (review P1-A).
+    dataset.rows = [
+      row({ id: 'ch-probe', tenant_id: '__probe__', agent_id: '__probe__', channel_type: 'whatsapp', active: true, is_synthetic: true }),
+      row({ id: 'ch-primary', channel_type: 'whatsapp' }),
+    ];
+    const { channelsRepo } = await import('@/db/repositories.js');
+    const out = await channelsRepo.findPrimaryCatchAllChannel({ channel_type: 'whatsapp' });
+    expect(out.multi_tenant).toBe(false);
+    expect(out.channel).not.toBeNull();
+    expect((out.channel as Channel).tenant_id).toBe('primary');
   });
 
   it('inactive-only non-primary rows (no ACTIVE real tenant) → single-tenant, returns catch-all', async () => {

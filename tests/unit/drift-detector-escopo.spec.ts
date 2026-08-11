@@ -22,7 +22,11 @@ vi.mock('@anthropic-ai/sdk', () => {
   return { default: Anthropic };
 });
 
-import { escopoDetector } from '@/cognition/drift/escopo.js';
+import { escopoDetector as rawEscopoDetector } from '@/cognition/drift/escopo.js';
+import { scopedDetector } from '../helpers/llm-scope.js';
+
+// Issue #508: o gateway exige contexto de tenant — ver tests/helpers/llm-scope.ts.
+const escopoDetector = scopedDetector(rawEscopoDetector);
 
 function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   content: Array<{ type: 'text'; text: string }>;

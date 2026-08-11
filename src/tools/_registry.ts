@@ -13,6 +13,7 @@ import { parseImageTool } from './parse-image.js';
 import { transcribeAudioTool } from './transcribe-audio.js';
 import { scheduleReminderTool } from './schedule-reminder.js';
 import { cancelReminderTool } from './cancel-reminder.js';
+import { setInterlocutorTimezoneTool } from './set-interlocutor-timezone.js';
 import { startRecurringOutreachTool } from './start-recurring-outreach.js';
 import { startRecurringPaymentTool } from './start-recurring-payment.js';
 import { sendProactiveMessageTool } from './send-proactive-message.js';
@@ -31,6 +32,11 @@ import { generateReportTool } from './generate-report.js';
 import { config } from '@/config/env.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
+// Issue #509 — canonical Zod → JSON Schema conversion for the model-facing
+// exposure surfaces. Zod stays the AUTHORITY in `_dispatcher.ts`; this only
+// changes what the model is TOLD.
+import { buildToolSchema, schemaHash } from './schema-json.js';
+import { observeHistogram } from '@/lib/metrics.js';
 // Calendar v2 — read-only tools
 import { calendarIsBusinessDayTool } from './calendar/calendar-is-business-day.js';
 import { calendarNextHolidayTool } from './calendar/calendar-next-holiday.js';
@@ -183,6 +189,7 @@ export const REGISTRY: Record<string, AnyTool> = {
   // unconditionally).
   schedule_reminder: scheduleReminderTool as unknown as AnyTool,
   cancel_reminder: cancelReminderTool as unknown as AnyTool,
+  set_interlocutor_timezone: setInterlocutorTimezoneTool as unknown as AnyTool,
   start_recurring_outreach: startRecurringOutreachTool as unknown as AnyTool,
   start_recurring_payment: startRecurringPaymentTool as unknown as AnyTool,
   send_proactive_message: sendProactiveMessageTool as unknown as AnyTool,
@@ -319,10 +326,10 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
   // cujo `feature_flag` declarado esteja desligado em runtime. Mantém o schema
   // exposto ao LLM sincronizado com o gate do dispatcher.
   const tools = Object.values(REGISTRY).filter((t) => isToolEnabled(t.name));
-  if (isOwner) return tools.map(toolToSchema);
+  if (isOwner) return tools.flatMap(toolToSchema);
   return tools
     .filter((t) => t.required_actions.every((a) => allowed.has(a)))
-    .map(toolToSchema);
+    .flatMap(toolToSchema);
 }
 
 /**
@@ -370,18 +377,50 @@ export function getAgentToolSchemas(
   const tools = Object.values(REGISTRY).filter(
     (t) => visible.has(t.name) && isToolEnabled(t.name),
   );
-  if (isOwner) return tools.map(toolToSchema);
+  if (isOwner) return tools.flatMap(toolToSchema);
   return tools
     .filter((t) => t.required_actions.every((a) => allowed.has(a)))
-    .map(toolToSchema);
+    .flatMap(toolToSchema);
 }
 
-function toolToSchema(t: AnyTool) {
-  return {
-    name: t.name,
-    description: t.description,
-    input_schema: { type: 'object' as const, additionalProperties: true },
-  };
+/**
+ * The EXACT payload shape a provider accepts for a tool definition. Anthropic
+ * and OpenAI/OpenRouter both reject unknown keys here, so schema metadata
+ * (hash, bytes) travels via `describeExposedSchemas`, never on the wire.
+ */
+export type ExposedToolSchema = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+};
+
+/**
+ * Issue #509 — the ROLLBACK payload. Before #509 every tool was described to
+ * the model with this stub, which told it nothing: no field names, no required
+ * set, no enums, no bounds. Kept ONLY so `FEATURE_STRICT_TOOL_SCHEMAS=false`
+ * can restore the previous behaviour without a redeploy; delete it together
+ * with the flag (see `src/config/env.ts` FEATURE_STRICT_TOOL_SCHEMAS).
+ */
+const LEGACY_GENERIC_INPUT_SCHEMA = { type: 'object' as const, additionalProperties: true };
+
+/**
+ * Issue #509 — map a registry tool to the payload the model receives.
+ *
+ * Returns an ARRAY so callers can `flatMap`: a tool whose Zod contract cannot
+ * be converted exactly yields `[]` and is DROPPED from the exposed set. That is
+ * the fail-closed direction — an undescribable tool becomes invisible to the
+ * model instead of being advertised with a permissive stub. The dispatcher's
+ * grant / permission / limit / approval gates are unaffected either way, and
+ * the catalog lint test converts every registered tool so a conversion failure
+ * fails CI long before it could shrink the runtime catalog.
+ */
+function toolToSchema(t: AnyTool): ExposedToolSchema[] {
+  if (!config.FEATURE_STRICT_TOOL_SCHEMAS) {
+    return [{ name: t.name, description: t.description, input_schema: LEGACY_GENERIC_INPUT_SCHEMA }];
+  }
+  const built = buildToolSchema(t);
+  if (!built) return [];
+  return [{ name: built.name, description: built.description, input_schema: built.input_schema }];
 }
 
 /**
@@ -389,11 +428,46 @@ function toolToSchema(t: AnyTool) {
  * feature-flag-disabled tools. Used by the `tool_mediated` executor to build
  * the tools list from `skill.allowed_tools` without duplicating schemas in SQL.
  */
-export function getToolSchemasByName(names: readonly string[]) {
+export function getToolSchemasByName(names: readonly string[]): ExposedToolSchema[] {
   return names
     .map((name) => REGISTRY[name])
     .filter((t): t is AnyTool => t !== undefined && isToolEnabled(t.name))
-    .map(toolToSchema);
+    .flatMap(toolToSchema);
+}
+
+/**
+ * Issue #509 §7 — schema budget + trace identity for a VISIBLE SET.
+ *
+ * Returns the per-tool contract hashes, their total byte size and a
+ * set-level hash that is INDEPENDENT of the order the names arrive in, so the
+ * same visible set always traces the same value. Unknown / unconvertible names
+ * are skipped (fail-closed, never throws — diagnostics must not break a turn).
+ *
+ * Emits `maia_tool_schema_bytes{surface}` with a bounded `surface` label
+ * (never `agent_id`/`tenant_id`, which would be unbounded cardinality; the
+ * per-turn attribution lives in the `tool_visibility_resolved` audit row).
+ *
+ * The budget is a DIAGNOSTIC: nothing here truncates the tool set. Reducing a
+ * set must happen through grants / role scope / skill scope / Decision Engine,
+ * where it stays auditable.
+ */
+export function describeExposedSchemas(
+  names: readonly string[],
+  surface: string,
+): { tools: number; bytes: number; set_hash: string; hashes: Record<string, string> } {
+  const hashes: Record<string, string> = {};
+  let bytes = 0;
+  for (const name of names) {
+    const tool = REGISTRY[name];
+    if (!tool) continue;
+    const built = buildToolSchema(tool);
+    if (!built) continue;
+    hashes[name] = built.schema_hash;
+    bytes += built.bytes;
+  }
+  const tools = Object.keys(hashes).length;
+  observeHistogram('maia_tool_schema_bytes', bytes, { surface });
+  return { tools, bytes, set_hash: schemaHash(hashes), hashes };
 }
 
 /**

@@ -11,12 +11,19 @@ export type IntentLike = {
   args: Record<string, unknown>;
 };
 
+/**
+ * Fase 0 cap. 3 (auditoria P0): o parâmetro `dual_approval_granted` foi
+ * REMOVIDO. Ele vinha dos args Zod do LLM — ou seja, o modelo (ou prompt
+ * injection) podia atestar a própria aprovação com um boolean. Agora as
+ * regras que exigem 4-eyes retornam `limit_exceeded` INCONDICIONALMENTE e o
+ * dispatcher resolve a exigência contra a evidência backend persistida
+ * (src/governance/approval-requests.ts) — nunca contra args do modelo.
+ */
 export function constitutionalCheck(input: {
   intent: IntentLike;
   pessoa: Pessoa;
   resolved: ResolvedPermission | null;
   scope: { entidades: string[] };
-  dual_approval_granted?: boolean;
 }): RuleViolation | null {
   const { intent } = input;
 
@@ -31,8 +38,9 @@ export function constitutionalCheck(input: {
 
   // C-002: deletion is impossible by design (no delete tool registered)
 
-  // C-003: proactive messages require dual approval (Phase 1-2)
-  if (intent.tool === 'send_proactive_message' && !input.dual_approval_granted) {
+  // C-003: proactive messages require dual approval (Phase 1-2). Evidência
+  // resolvida pelo dispatcher contra o store backend — nunca por args.
+  if (intent.tool === 'send_proactive_message') {
     return {
       kind: 'limit_exceeded',
       required_action: 'dual_approval',
@@ -64,8 +72,8 @@ export function constitutionalCheck(input: {
 
   // C-007 (spec 18 §9): start_recurring_outreach requires dual_approval at
   // creation. Owner approves the recurring contract once; each occurrence
-  // inherits via the series row.
-  if (intent.tool === 'start_recurring_outreach' && !input.dual_approval_granted) {
+  // inherits via the series row. Evidência via store backend (dispatcher).
+  if (intent.tool === 'start_recurring_outreach') {
     return {
       kind: 'limit_exceeded',
       required_action: 'dual_approval',
@@ -90,12 +98,11 @@ export function constitutionalCheck(input: {
   // never decides confirmation — policy + the dispatcher decide"). It COMPOSES
   // with `confirm_before_write_policy` (migration 078), which DECIDES the same
   // outcome via the P9d DSL at the Mid PEP, and with the dispatcher grant guard.
-  // Fail-closed: without a granted approval the write is refused here even if
-  // every other gate (skill scope, canAct) would allow it. The `confirm before
-  // write` intent maps to the existing dual_approval signal the three tools
-  // already accept (`dual_approval_granted` in their input schema), so no DSL
-  // vocabulary change is needed.
-  if (SENSITIVE_BOLETO_WRITE_TOOLS.has(intent.tool) && !input.dual_approval_granted) {
+  // Fail-closed: without persisted backend evidence the write is refused even
+  // if every other gate (skill scope, canAct) would allow it. (Fase 0 cap. 3:
+  // o boolean `dual_approval_granted` dos schemas foi removido — a evidência
+  // vem exclusivamente do store de approval_requests, resolvido no dispatcher.)
+  if (SENSITIVE_BOLETO_WRITE_TOOLS.has(intent.tool)) {
     return {
       kind: 'limit_exceeded',
       required_action: 'dual_approval',

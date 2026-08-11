@@ -67,7 +67,13 @@ export default function InboxPage() {
   }
 
   const counters = countersQuery.data;
-  const total = counters ? Object.values(counters).reduce((a, b) => a + b, 0) : null;
+  // Spec perfil-inbox v4 fase C: perfis operacionais são um source NATIVO da
+  // fila (contador/tabela/diff/decisão) — o card bespoke e o agregado
+  // `pendingProfileApprovals` (#492) foram removidos; o total do header já os
+  // inclui via counters.operational_profile.
+  const total = counters
+    ? Object.values(counters).reduce((a, b) => a + b, 0)
+    : null;
 
   return (
     <div>

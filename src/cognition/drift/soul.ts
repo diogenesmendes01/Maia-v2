@@ -18,7 +18,8 @@
  * — este detector é testável em isolamento. Erros LLM devolvem null (sem
  * drift; orchestrator tem fallback own).
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
+import { isLLMConfigured } from '@/lib/llm/index.js';
 import { DriftType, DriftSeverity } from '@/types/enums.js';
 import { soulBiasesRepo } from '@/control-plane/soul/soul-biases-repo.js';
 import type { SoulBias } from '@/db/schema.js';
@@ -160,11 +161,12 @@ async function llmJudgeBiasAdherence(
   bias: SoulBias,
   messages: DriftRecentMessage[],
 ): Promise<{ adheres: boolean; confidence: number; examples: string[] } | null> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
+  // Issue #508: a checagem passa a ser sobre o provider ATIVO. Com
+  // LLM_PROVIDER=openrouter, exigir ANTHROPIC_API_KEY desligava o juiz
+  // silenciosamente mesmo com LLM configurado.
+  if (!isLLMConfigured()) return null;
 
   const sample = messages.slice(-10).map((m) => `- ${m.text}`).join('\n');
-  const anthropic = new Anthropic({ apiKey });
   const system = [
     'Você é um auditor de aderência comportamental.',
     'Dado um princípio comportamental ("soul bias") e mensagens recentes do agente, analise se as mensagens demonstram aderência ao princípio.',
@@ -180,16 +182,13 @@ async function llmJudgeBiasAdherence(
   ].join('\n');
 
   try {
-    const completion = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+    const completion = await callLLM({
+      workload: 'drift_detector',
       max_tokens: 500,
       system,
       messages: [{ role: 'user', content: user }],
     });
-    const text = completion.content
-      .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-      .map((c) => c.text)
-      .join('');
+    const text = completion.content ?? '';
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const parsed = JSON.parse(match[0]) as {

@@ -29,6 +29,23 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText,
   isBaileysConnected: () => true,
 }));
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): sendOutbound envia
+// pela fronteira única LineOutput. A linha mockada roteia sendText para o
+// MESMO spy acima, então as asserções de view_once no envio continuam
+// exercendo exatamente o mesmo contrato.
+vi.mock('../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: vi.fn(async () => ({
+    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'ch-1' },
+    sendText: sendOutboundText,
+    sendDocument: vi.fn(),
+    sendVoice: vi.fn(),
+    sendPoll: vi.fn(),
+    sendReaction: vi.fn(),
+    startTyping: vi.fn(() => ({ stop: vi.fn() })),
+    markRead: vi.fn(),
+    isConnected: () => true,
+  })),
+}));
 // P11: the Decision Engine is always-on and would otherwise hit real prod
 // adapters (DB/Redis) here. Mock it to a no-op pass-through (engine_ran:false →
 // agent/core.ts proceeds straight to the LLM path).
@@ -51,7 +68,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
   factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
-  entityStatesRepo: { byId: vi.fn().mockResolvedValue(null) },
+  entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 // Drizzle query-chain mock — see vi.hoisted block above for rationale.

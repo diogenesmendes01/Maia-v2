@@ -1,5 +1,5 @@
 /**
- * P8.5 — Approval matrix (14 classes).
+ * P8.5 — Approval matrix (16 classes).
  *
  * Each entry defines: name, requiredRoles, requiresDistinctApprovers,
  * architectureLocks. The matrix is the single source of truth for
@@ -136,6 +136,25 @@ export const approvalMatrix: Record<ApprovalClassId, ApprovalClassDef> = {
     architectureLocks: [],
     description: 'Updates an executable procedure definition.',
   },
+  // Spec perfil-inbox v4 §1.3 — duas classes selecionadas por risco, porque
+  // ApprovalClassDef tem papéis FIXOS por classe (uma classe única não
+  // representa "owner para low/medium, dual para high").
+  operational_profile_change: {
+    id: 'operational_profile_change',
+    name: 'Operational Profile (Change)',
+    requiredRoles: ['owner', 'founder'],
+    requiresDistinctApprovers: false,
+    architectureLocks: [],
+    description: 'Low/medium-risk profile change; owner OR founder approves.',
+  },
+  operational_profile_change_high: {
+    id: 'operational_profile_change_high',
+    name: 'Operational Profile (High-Risk Change)',
+    requiredRoles: ['owner', 'founder'],
+    requiresDistinctApprovers: true,
+    architectureLocks: [],
+    description: 'High-risk profile change. Dual approval (owner + founder).',
+  },
 };
 
 /**
@@ -166,6 +185,13 @@ export function getApprovalClassFor(type: ProposalTypeId, risk: RiskLevelId): Ap
       if (risk === 'critical' || risk === 'high') return 'knowledge_rule';
       if (risk === 'low') return 'knowledge_guidance';
       return 'knowledge_guidance';
+    case 'operational_profile':
+      // Spec perfil-inbox v4 §1.3: low/medium ⇒ owner OU founder (paridade
+      // com o caminho bespoke atual); high ⇒ dual owner + founder. `critical`
+      // não está nos riskLevels do tipo — se chegar, escala para dual.
+      return risk === 'critical' || risk === 'high'
+        ? 'operational_profile_change_high'
+        : 'operational_profile_change';
     default: {
       // Exhaustiveness check — TypeScript ensures all branches covered.
       const _exhaustive: never = type;

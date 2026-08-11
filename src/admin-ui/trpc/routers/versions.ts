@@ -55,6 +55,28 @@ const RollbackInputSchema = z.object({
  * Wired source-of-truth kinds that have a rollback implementation. Until one
  * lands the per-SoT entry must throw NOT_IMPLEMENTED to avoid false-positive
  * incident recovery signals.
+ *
+ * Issue #481 item 5 — avaliado e mantido FORA DE ESCOPO daquela rodada de
+ * dívidas: as três SoTs restantes não compartilham o desenho de
+ * `agent_operational_profile_versions` (uma linha ATIVA por agente, alvos
+ * `frozen`, lock no agente pai), então cada uma exige seu próprio desenho de
+ * "ponteiro ativo" antes de qualquer código:
+ *
+ *   - `policy_rules`  (migração 036) — versionadas por `idx_policy_rules_version_uq`,
+ *     mas o resolver casa regra por escopo/prioridade: reverter uma versão
+ *     sem reavaliar o conjunto pode deixar duas regras conflitantes ativas;
+ *   - `soul_biases`   (migração 038) — append-only encadeada por
+ *     `previous_version_id`; "rollback" aqui é ANEXAR a reversão, não
+ *     reativar uma linha antiga (o histórico é imutável por contrato);
+ *   - `skills`        (migração 043) — o ciclo de vida (propose→approve→
+ *     deprecate) já tem transições próprias; rollback precisa combinar com
+ *     elas em vez de mexer no status por fora.
+ *
+ * Enquanto isso o contrato é: falhar ALTO (nunca devolver 'rolled_back' sem
+ * mutar a fonte) e auditar a TENTATIVA. Coberto por
+ * `tests/admin-ui/unit/versions-router.spec.ts`. Flipar um `false` aqui sem
+ * escrever o branch correspondente cai no INTERNAL_SERVER_ERROR de
+ * exaustividade no fim de `rollback` — de propósito.
  */
 const ROLLBACK_IMPLEMENTED: Record<string, boolean> = {
   // Issue #468 — wired via operationalProfileVersionsRepo.adminRollbackAtomic

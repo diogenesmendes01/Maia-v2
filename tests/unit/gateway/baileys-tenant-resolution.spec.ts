@@ -92,7 +92,7 @@ vi.mock('qrcode-terminal', () => ({ default: { generate: vi.fn() } }));
 
 vi.mock('@/config/env.js', () => ({
   config: {
-    BAILEYS_AUTH_DIR: '/tmp/maia-issue-290-test',
+    BAILEYS_AUTH_DIR: '/tmp/maia-baileys-issue-290-test',
     FEATURE_MESSAGE_UPDATE: false,
     FEATURE_ONE_TAP: false,
     FEATURE_MESSAGE_DEBOUNCE: false,
@@ -511,6 +511,106 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
       channel_type: 'whatsapp',
       external_id: '+5511555555555',
     });
+  });
+
+  it('@lid without senderPn and no LID store mapping → audit channel_resolution_skipped_lid_unmapped (NOT channel_resolution_failed), dropped', async () => {
+    // No LID mapping store on the socket → resolvePhoneFromLidStore returns null.
+    delete (fakeSocket as Record<string, unknown>).signalRepository;
+    createInboundMock.mockImplementation(async () => {
+      throw new Error('createInbound MUST NOT run for an unmapped @lid');
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('168813890908183@lid', 'WAID-LID-SYNC')],
+    });
+
+    // Never reached the channel repo or persisted anything (fail-closed drop).
+    expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
+    expect(createInboundMock).not.toHaveBeenCalled();
+    expect(enqueueAgentMock).not.toHaveBeenCalled();
+
+    // The de-noised, dedicated action — NOT the generic failure.
+    const skipped = auditMock.mock.calls.filter(
+      (c) =>
+        (c[0] as { acao?: string })?.acao ===
+        'channel_resolution_skipped_lid_unmapped',
+    );
+    expect(skipped).toHaveLength(1);
+    const md = (skipped[0]![0] as { metadata: Record<string, unknown> }).metadata;
+    expect(md.raw_jid).toBe('168813890908183@lid');
+    expect(md.whatsapp_id).toBe('WAID-LID-SYNC');
+    expect(md.emitter).toBe('baileys_ingress');
+    expect(
+      (md.resolver_details as { resolver_path?: string })?.resolver_path,
+    ).toBe('lid_unmapped');
+
+    // The generic ownership-miss action stays clean of this benign sync noise.
+    const failed = auditMock.mock.calls.filter(
+      (c) => (c[0] as { acao?: string })?.acao === 'channel_resolution_failed',
+    );
+    expect(failed).toHaveLength(0);
+  });
+
+  it('@lid without senderPn but LID store maps it → recovers the real phone, resolves and processes', async () => {
+    const getPNForLID = vi
+      .fn()
+      .mockResolvedValue('5511555555555@s.whatsapp.net');
+    (fakeSocket as Record<string, unknown>).signalRepository = {
+      lidMapping: { getPNForLID },
+    };
+    findByExternalCrossTenantMock.mockResolvedValueOnce(
+      makeChannel({
+        tenant_id: 'tenant-lid-store',
+        agent_id: 'agent-lid-store',
+        external_id: '+5511555555555',
+      }),
+    );
+
+    let observedTenant: string | null = null;
+    let observedTel: unknown = null;
+    createInboundMock.mockImplementation(async (arg: unknown) => {
+      const { getCurrentTenant } = await import('@/db/tenant-context.js');
+      observedTenant = getCurrentTenant();
+      observedTel = (arg as { metadata?: { telefone?: unknown } })?.metadata
+        ?.telefone;
+      return {
+        row: { id: 'msg-lid-store', tenant_id: observedTenant, agent_id: 'agent-lid-store' },
+        duplicate: false,
+      };
+    });
+
+    const { startBaileys } = await import('@/gateway/baileys.js');
+    await startBaileys();
+
+    await handlerState.upsertHandler!({
+      messages: [inbound('168813890908183@lid', 'WAID-LID-STORE')],
+    });
+
+    expect(getPNForLID).toHaveBeenCalledWith('168813890908183@lid');
+    // Routing used the store-recovered phone, not the synthetic LID.
+    expect(observedTenant).toBe('tenant-lid-store');
+    expect(findByExternalCrossTenantMock).toHaveBeenCalledWith({
+      channel_type: 'whatsapp',
+      external_id: '+5511555555555',
+    });
+    expect(createInboundMock).toHaveBeenCalled();
+    // Identity (tel) is the REAL phone too — consistent with routing.
+    expect(observedTel).toBe('+5511555555555');
+
+    // No drop audits of either kind.
+    const drops = auditMock.mock.calls.filter((c) =>
+      [
+        'channel_resolution_failed',
+        'channel_resolution_skipped_lid_unmapped',
+      ].includes((c[0] as { acao?: string })?.acao ?? ''),
+    );
+    expect(drops).toHaveLength(0);
+
+    // Cleanup so the shared fakeSocket doesn't leak the store into other tests.
+    delete (fakeSocket as Record<string, unknown>).signalRepository;
   });
 
   it('one failure does not poison the rest: unknown JID followed by known JID in the same batch', async () => {

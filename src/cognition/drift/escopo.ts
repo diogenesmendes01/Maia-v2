@@ -15,7 +15,7 @@
  * (defensivo — o orchestrator cuida do fallback via runCognitiveModule), ou
  * quando todas as promessas têm capability ativa.
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
 import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.js';
 
@@ -41,7 +41,6 @@ export const escopoDetector: DriftDetector = {
       .map((m) => `- (id=${m.id}) ${m.text}`)
       .join('\n');
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você audita o agente em busca de promessas que ele não pode cumprir.',
       'Extraia das mensagens dele promessas/compromissos para o usuário.',
@@ -54,16 +53,15 @@ export const escopoDetector: DriftDetector = {
     ].join('\n');
 
     try {
-      const completion = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+      // Issue #508: modelo resolvido pelo backend (tier `main` do workload
+      // `drift_detector`), não mais fixado aqui.
+      const completion = await callLLM({
+        workload: 'drift_detector',
         max_tokens: 800,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = completion.content
-        .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;
       const parsed = JSON.parse(match[0]) as {

@@ -29,6 +29,7 @@ export async function classify(insight: string): Promise<ClassifiedCandidate | n
     { name: 'classifier', triggered_by: 'async_event', timeoutMs: 8000 },
     async () => {
       const res = await callLLM({
+        workload: 'conversation_classifier',
         system: classifierSystemPrompt(),
         messages: [{ role: 'user', content: insight }],
         max_tokens: 400,

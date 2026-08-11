@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
-import { pessoasRepo, mensagensRepo, conversasRepo } from '@/db/repositories.js';
+import { pessoasRepo, mensagensRepo, conversasRepo, channelsRepo } from '@/db/repositories.js';
 import { isOwnerType } from '@/governance/permissions.js';
 import type { PlannedEffect } from '@/governance/idempotency-effects.js';
 
@@ -50,10 +50,19 @@ export const sendProactiveMessageTool: Tool<typeof inputSchema, typeof outputSch
     // null until the relayer fills provider_ref on the outbox row.
     let conversa = await conversasRepo.findActive(target.id);
     if (!conversa) {
-      conversa = await conversasRepo.create({ pessoa_id: target.id, escopo_entidades: [] });
+      // Fase 0 (spec roteamento v4 §1.6): conversa nova nasce COM canal quando
+      // o agente tem canal único ativo; ambíguo fica NULL (legado) — o envio
+      // físico no relayer falha fechado por conta própria nesse caso.
+      const sole = await channelsRepo.findSoleActiveForCurrentAgent();
+      conversa = await conversasRepo.create({
+        pessoa_id: target.id,
+        escopo_entidades: [],
+        channel_id: sole.kind === 'one' ? sole.id : null,
+      });
     }
     const m = await mensagensRepo.create({
       conversa_id: conversa.id,
+      channel_id: conversa.channel_id,
       direcao: 'out',
       tipo: 'texto',
       conteudo: args.texto,

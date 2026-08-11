@@ -21,6 +21,69 @@ import {
   acquireNextVersionForAgent,
 } from './profile-internal.js';
 
+type Tx = typeof db;
+
+/**
+ * Spec perfil-inbox v4 §1.4 — contrato de falha do primitivo InTx.
+ *
+ * `decideAtomically` (motor unificado) insere approval e audit ANTES da
+ * transição do source; um InTx que sinalizasse falha por retorno commitaria
+ * a aprovação SEM ativação, e o retry do operador seria bloqueado pelo
+ * dup-check como "já aprovou". Falha do InTx portanto SEMPRE **lança** — o
+ * rollback da MESMA tx desfaz approval + audit; nenhum estado parcial,
+ * nenhum falso-positivo no retry (invariante 1b).
+ */
+export type ProfileTransitionFailure =
+  | { reason: 'not_found' | 'invalid_source_status' | 'transition_failed' | 'agent_missing' }
+  | {
+      reason: 'predecessor_conflict';
+      expected: string | null | 'unknown';
+      current: string | null;
+    }
+  | { reason: 'migrated_legacy_proposal'; expected: null; current: string | null }
+  | {
+      reason: 'missing_predecessor';
+      proposed_version: number;
+      current_predecessor: string | null;
+    };
+
+export class ProfileTransitionError extends Error {
+  readonly code = 'profile_transition_failed';
+  constructor(readonly detail: ProfileTransitionFailure) {
+    super(`profile transition failed: ${detail.reason}`);
+    this.name = 'ProfileTransitionError';
+  }
+}
+
+/**
+ * Issue #511 — publish the `identity` turn-context cache invalidation for a
+ * (tenant, agent) whose ACTIVE operational profile just changed.
+ *
+ * Call sites are every mutation that changes what `getActive()` returns:
+ * activation, freeze, rollback and the seed path. Transitions that only touch
+ * `proposed`/`rejected` rows are deliberately NOT here — they cannot change the
+ * active profile, and a spurious publish is pointless cache churn.
+ *
+ * ALWAYS called AFTER the transaction commits, never inside it. From inside, a
+ * replica receiving the event before COMMIT would re-read the pre-commit
+ * snapshot and pin the OLD identity for a full TTL — strictly worse than not
+ * publishing at all.
+ *
+ * Best-effort: `publishTurnContextInvalidation` already swallows broker
+ * failures (staleness then falls back to the TTL bound). The extra guard here
+ * covers the dynamic import itself, so a governance mutation that already
+ * committed and audited can never fail because a cache hint could not be sent.
+ */
+async function publishIdentityInvalidation(tenant_id: string, agent_id: string): Promise<void> {
+  try {
+    const { publishTurnContextInvalidation } = await import('@/agent/turn-context/cache.js');
+    await publishTurnContextInvalidation({ tenant_id, agent_id, resource: 'identity' });
+  } catch {
+    // Deliberately silent: the mutation succeeded, and the cache degrades to
+    // its TTL bound. `publishTurnContextInvalidation` logs its own failures.
+  }
+}
+
 export const operationalProfileVersionsRepo = {
   async create(input: {
     profile_body: ProfileBody;
@@ -208,7 +271,13 @@ export const operationalProfileVersionsRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
 
-    return await withTx(async (tx) => {
+    // #511: `transition` is the broad status mutator — it covers freeze,
+    // rollback and frozen→active re-activation, i.e. most of the ways the
+    // active profile changes outside the approval flow. Publish after commit
+    // when the transition touched the ACTIVE row in either direction; the
+    // source status is captured here because it is only known inside the tx.
+    let fromStatus: ProfileStatus | null = null;
+    const result = await withTx(async (tx) => {
       // (0) Lock the parent `agents` row FIRST so we serialize against every
       //     OTHER writer that touches `(tenant, agent)` profile state
       //     (`approveAndActivateAtomic`, `proposeAndAuditAtomic`,
@@ -242,6 +311,7 @@ export const operationalProfileVersionsRepo = {
       if (!row) return { ok: false as const, reason: 'not_found' as const };
 
       const from = row.status as ProfileStatus;
+      fromStatus = from;
 
       // (1.5) Codex Adversarial Review of PR #182 round 1 fail-open guard:
       //       if the caller passed an `expected_from`, enforce that the
@@ -343,6 +413,18 @@ export const operationalProfileVersionsRepo = {
       }
       return { ok: true as const, updated: updated[0]! };
     });
+
+    // #511: publish only when the active profile actually moved — a row
+    // entering OR leaving `active` both change what `getActive()` returns. A
+    // proposed→rejected transition changes nothing the prompt reads.
+    if (
+      result.ok &&
+      (result.updated.status === 'active' ||
+        (fromStatus as ProfileStatus | null) === 'active')
+    ) {
+      await publishIdentityInvalidation(tenant_id, agent_id);
+    }
+    return result;
   },
 
   /**
@@ -590,8 +672,8 @@ export const operationalProfileVersionsRepo = {
    * router can call it without `runWithTenantContext`. The previous active
    * id is captured by the caller (router) BEFORE this call because the
    * read is part of the same logical operation but doesn't need tx
-   * isolation — concurrent updateProfile + approveProfile races are guarded
-   * by `approveAndActivateAtomic`'s FOR UPDATE on the active row.
+   * isolation — concurrent updateProfile + approval races are guarded by
+   * the FOR UPDATE on the active row inside `approveAndActivateInTx`.
    *
    * Returns `null` if the agent was deleted between the caller's
    * `findById` check and this call — the router translates that into
@@ -763,6 +845,20 @@ export const operationalProfileVersionsRepo = {
    *
    * Required input is explicit (no AsyncLocalStorage dependency) so the
    * router can call it without `runWithTenantContext`.
+   *
+   * Spec perfil-inbox v4 §1.4 — o CORPO vive em `approveAndActivateInTx`
+   * (extração mecânica; locks/guards/transições idênticos) para compor com a
+   * tx do motor unificado (`decideAtomically`). Este wrapper abre a própria
+   * tx, chama o InTx, escreve o audit DENTRO da mesma tx e traduz o throw
+   * tipado de volta para o resultado tipado histórico — comportamento
+   * byte-a-byte, verificado por teste de caracterização.
+   *
+   * FASE C (spec §3): o shim `agents.approveProfile` foi removido — este
+   * wrapper NÃO tem mais caller de produção. É mantido como o primitivo
+   * atômico caracterizado do repo: as suites de concorrência issue-166/
+   * issue-177 e o contrato InTx (`profile-approve-intx-contract`) exercitam
+   * os guards de predecessor contra DB real ATRAVÉS dele. Remover só quando
+   * essas suites forem migradas para dirigir `decideAtomically` diretamente.
    */
   async approveAndActivateAtomic(args: {
     tenant_id: string;
@@ -811,208 +907,329 @@ export const operationalProfileVersionsRepo = {
         current_predecessor: string | null;
       }
   > {
-    return await withTx(async (tx) => {
-      // (0) Lock the parent agent row FIRST. This serializes against EVERY
-      // other writer that touches `(tenant, agent)` operational profile
-      // state — `proposeAndAuditAtomic`, `seedNewActiveAtomic`, and
-      // `operationalProfileVersionsRepo.create` all go through
-      // `lockParentAgent` (directly or via `acquireNextVersionForAgent`).
-      // Without this lock, a concurrent `seedNewActiveAtomic` could freeze
-      // and insert a new active row between our read and freeze, causing
-      // the partial unique index on (tenant, agent) WHERE status='active'
-      // to reject one tx as a 500 instead of a serialized update
-      // (Codex round 3 [medium]).
-      const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
-      if (!agentLocked) {
-        // The agent was deleted between the router's findById check and
-        // this lock acquisition. Surface a typed-miss so the caller can
-        // translate to NOT_FOUND (same outcome as the upfront check) and
-        // we don't leak a half-applied transaction.
-        return { ok: false as const, reason: 'agent_missing' as const };
-      }
-
-      // (1) Lock the proposed row inside the tx so concurrent approvers
-      // serialize on it.
-      const proposedRows = await tx
-        .select()
-        .from(agent_operational_profile_versions)
-        .where(
-          and(
-            eq(agent_operational_profile_versions.id, args.id),
-            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
-            eq(agent_operational_profile_versions.agent_id, args.agent_id),
-          ),
-        )
-        .for('update')
-        .limit(1);
-      const proposed = proposedRows[0];
-      if (!proposed) return { ok: false as const, reason: 'not_found' as const };
-      if (proposed.status !== 'proposed') {
-        return { ok: false as const, reason: 'invalid_source_status' as const };
-      }
-
-      // (2) Lock the current active (if any). Note: the parent-agent lock
-      // already serializes every writer, so this row lock is defense-in-
-      // depth (catches any future codepath that bypasses the parent lock
-      // and only touches the active row directly).
-      const activeRows = await tx
-        .select()
-        .from(agent_operational_profile_versions)
-        .where(
-          and(
-            eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
-            eq(agent_operational_profile_versions.agent_id, args.agent_id),
-            eq(agent_operational_profile_versions.status, 'active'),
-          ),
-        )
-        .for('update')
-        .limit(1);
-      const incumbent = activeRows[0] ?? null;
-
-      // (2b) Predecessor enforcement — Codex round 2 [high] #1 + round 3
-      // [high] #173.
-      // The proposal was built against a specific incumbent id (recorded in
-      // profile_body.metadata.previous_version_id). If the current incumbent
-      // (re-read post-lock) doesn't match, a different proposal won the
-      // race — approving this one would silently drop that newer version's
-      // changes while the audit lineage still pointed at the old
-      // predecessor. Reject so the caller can refresh + re-propose.
-      const expectedPredecessor = readExpectedPredecessor(proposed.profile_body);
-      const currentPredecessor = incumbent?.id ?? null;
-      if (expectedPredecessor === 'unknown') {
-        // Legacy proposal authored before this codepath — see policy in
-        // the doccomment above. Refuse rather than risk silent overwrite.
+    // #511: set as the LAST thing inside the tx callback, so a throw before
+    // that point publishes nothing. See `publishIdentityInvalidation`.
+    let activated = false;
+    try {
+      return await withTx(async (tx) => {
+        const r = await this.approveAndActivateInTx(tx, {
+          tenant_id: args.tenant_id,
+          agent_id: args.agent_id,
+          id: args.id,
+          actor_id: args.actor_id,
+        });
+        // Audit do wrapper legado DENTRO da MESMA tx (review v3 do spec
+        // perfil-inbox): se este insert falhar, TUDO reverte e o incumbente
+        // segue ativo — nenhuma mudança de governança sem trilha.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: args.tenant_id,
+          actor_id: args.actor_id,
+          actor_role: args.actor_role,
+          action: 'agent_profile_approve',
+          resource_type: 'agent_operational_profile_version',
+          resource_id: args.id,
+          change_summary: {
+            agent_id: args.agent_id,
+            new_version_id: args.id,
+            new_version: r.activated.version,
+            previous_active_id: r.frozen_previous?.id ?? null,
+            previous_active_version: r.frozen_previous?.version ?? null,
+            // Codex round 2: record the predecessor expectation declared by
+            // the proposal so forensics can prove this approval did NOT win
+            // a write-skew race (expected == current at lock time).
+            expected_predecessor_id: r.expected_predecessor,
+            comment: args.comment,
+          },
+        });
+        activated = true;
         return {
-          ok: false as const,
-          reason: 'predecessor_conflict' as const,
-          expected: 'unknown' as const,
-          current: currentPredecessor,
+          ok: true as const,
+          activated: r.activated,
+          frozen_previous: r.frozen_previous,
         };
-      }
-
-      // Round 3 [high] #173: explicit `null` predecessor needs context.
-      // Migration 061 backfills `null` + `migrated_from_legacy: true` for
-      // every legacy row whose original lineage is unknowable. Without this
-      // discriminator, a stale migrated proposal could silently activate
-      // against an empty active slot (the (no incumbent + null predecessor)
-      // pair is indistinguishable from intentional seed v1). Reject migrated
-      // proposals with a distinct sentinel so the operator must re-propose
-      // under the new flow.
-      if (expectedPredecessor === null && isMigratedLegacy(proposed.profile_body)) {
-        return {
-          ok: false as const,
-          reason: 'migrated_legacy_proposal' as const,
-          expected: null,
-          current: currentPredecessor,
-        };
-      }
-
-      // Round 3 [high] #173: intentional-seed exception. Explicit `null`
-      // predecessor is legitimate when (a) there's no incumbent active row
-      // AND (b) this is version 1 — the first activation of a freshly-
-      // created agent (`createWithSeedAndAudit` → owner approves the seed).
-      const isIntentionalSeed =
-        expectedPredecessor === null && currentPredecessor === null && proposed.version === 1;
-
-      // Codex Adversarial Review of PR #182 round 3 ([high] #186): explicit
-      // `null` predecessor on any non-seed proposal must be rejected.
-      // Without this gate, an agent with `frozen`/`rolled_back` versions but
-      // no active row (e.g. post-rollback recovery window) could approve a
-      // v2+ proposal whose `previous_version_id` is `null` — the structural
-      // `null === null` equality would pass and the new active row would
-      // appear with no lineage anchor at all, silently bypassing the
-      // stale-predecessor guard that round 2/3 introduced.
-      //
-      // The four explicit cases we now distinguish:
-      //   - v1 + no incumbent + null pred       → ACCEPT (intentional seed, handled above)
-      //   - v1 + incumbent present + null pred  → REJECT as missing_predecessor
-      //       (a v1 cannot coexist with an active row — the version allocator
-      //       would never produce v1 in that state)
-      //   - v2+ + no incumbent + null pred      → REJECT as missing_predecessor
-      //       (recovery requires explicit lineage to the last frozen/rolled_back row)
-      //   - v2+ + incumbent + null pred         → REJECT as missing_predecessor
-      //       (round 2 already caught this as predecessor_conflict; the new
-      //       reason name better describes the cause)
-      if (!isIntentionalSeed && expectedPredecessor === null) {
-        return {
-          ok: false as const,
-          reason: 'missing_predecessor' as const,
-          proposed_version: proposed.version,
-          current_predecessor: currentPredecessor,
-        };
-      }
-
-      if (!isIntentionalSeed && expectedPredecessor !== currentPredecessor) {
-        return {
-          ok: false as const,
-          reason: 'predecessor_conflict' as const,
-          expected: expectedPredecessor,
-          current: currentPredecessor,
-        };
-      }
-
-      const now = new Date();
-
-      // (3) Freeze incumbent if it exists. proposed-version row itself can't
-      // be its own incumbent (we already asserted proposed.status==='proposed'
-      // != 'active'), so the WHERE id != proposed.id is defensive.
-      if (incumbent) {
-        const frozen = await tx
-          .update(agent_operational_profile_versions)
-          .set({ status: 'frozen', frozen_at: now })
-          .where(eq(agent_operational_profile_versions.id, incumbent.id))
-          .returning({ id: agent_operational_profile_versions.id });
-        if (frozen.length === 0) {
-          return { ok: false as const, reason: 'transition_failed' as const };
+      });
+    } catch (err) {
+      // Tradução do contrato de THROW do InTx de volta ao resultado tipado
+      // histórico deste wrapper (caracterização byte-a-byte).
+      if (err instanceof ProfileTransitionError) {
+        const d = err.detail;
+        switch (d.reason) {
+          case 'predecessor_conflict':
+            return { ok: false, reason: d.reason, expected: d.expected, current: d.current };
+          case 'migrated_legacy_proposal':
+            return { ok: false, reason: d.reason, expected: d.expected, current: d.current };
+          case 'missing_predecessor':
+            return {
+              ok: false,
+              reason: d.reason,
+              proposed_version: d.proposed_version,
+              current_predecessor: d.current_predecessor,
+            };
+          default:
+            return { ok: false, reason: d.reason };
         }
       }
+      throw err;
+    } finally {
+      if (activated) await publishIdentityInvalidation(args.tenant_id, args.agent_id);
+    }
+  },
 
-      // (4) Activate the proposed.
-      const activated = await tx
-        .update(agent_operational_profile_versions)
-        .set({
-          status: 'active',
-          approved_at: proposed.approved_at ?? now,
-          approved_by: proposed.approved_by ?? args.actor_id,
-          activated_at: now,
-        })
-        .where(eq(agent_operational_profile_versions.id, args.id))
-        .returning({ id: agent_operational_profile_versions.id });
-      if (activated.length === 0) {
-        return { ok: false as const, reason: 'transition_failed' as const };
-      }
+  /**
+   * Spec perfil-inbox v4 §1.4 — PRIMITIVO transacional da aprovação de
+   * perfil: locks (agente pai FOR UPDATE, proposta, incumbente), guards de
+   * predecessor (#171/#173/#182/#186) e transições — extração MECÂNICA do
+   * corpo de `approveAndActivateAtomic`, sem abrir tx e sem audit próprio.
+   *
+   * FALHA SEMPRE LANÇA `ProfileTransitionError`: dentro da tx do
+   * `decideAtomically` (que insere approval + audit ANTES da transição), o
+   * throw faz rollback TOTAL — nenhum estado parcial, nenhum dup-check
+   * falso-positivo no retry (invariante 1b). O chamador captura FORA do
+   * `withTx` e traduz para o seu resultado tipado.
+   */
+  async approveAndActivateInTx(
+    tx: Tx,
+    args: {
+      tenant_id: string;
+      agent_id: string;
+      /** ID of the `proposed` version being approved. */
+      id: string;
+      actor_id: string;
+    },
+  ): Promise<{
+    activated: { id: string; version: number };
+    frozen_previous: { id: string; version: number } | null;
+    /** Expectativa de predecessor declarada pela proposta (para o audit do chamador). */
+    expected_predecessor: string | null;
+  }> {
+    // (0) Lock the parent agent row FIRST. This serializes against EVERY
+    // other writer that touches `(tenant, agent)` operational profile
+    // state — `proposeAndAuditAtomic`, `seedNewActiveAtomic`, and
+    // `operationalProfileVersionsRepo.create` all go through
+    // `lockParentAgent` (directly or via `acquireNextVersionForAgent`).
+    // Without this lock, a concurrent `seedNewActiveAtomic` could freeze
+    // and insert a new active row between our read and freeze, causing
+    // the partial unique index on (tenant, agent) WHERE status='active'
+    // to reject one tx as a 500 instead of a serialized update
+    // (Codex round 3 [medium]).
+    const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
+    if (!agentLocked) {
+      // The agent was deleted between the router's findById check and
+      // this lock acquisition. Surface a typed-miss so the caller can
+      // translate to NOT_FOUND (same outcome as the upfront check) and
+      // we don't leak a half-applied transaction.
+      throw new ProfileTransitionError({ reason: 'agent_missing' });
+    }
 
-      // (5) Audit in the SAME tx. If this insert fails, EVERYTHING rolls back
-      // and the incumbent stays active — no unaudited governance change.
-      await tx.insert(admin_audit_log).values({
-        tenant_id: args.tenant_id,
-        actor_id: args.actor_id,
-        actor_role: args.actor_role,
-        action: 'agent_profile_approve',
-        resource_type: 'agent_operational_profile_version',
-        resource_id: args.id,
-        change_summary: {
-          agent_id: args.agent_id,
-          new_version_id: args.id,
-          new_version: proposed.version,
-          previous_active_id: incumbent?.id ?? null,
-          previous_active_version: incumbent?.version ?? null,
-          // Codex round 2: record the predecessor expectation declared by
-          // the proposal so forensics can prove this approval did NOT win
-          // a write-skew race (expected == current at lock time).
-          expected_predecessor_id: expectedPredecessor,
-          comment: args.comment,
-        },
+    // (1) Lock the proposed row inside the tx so concurrent approvers
+    // serialize on it.
+    const proposedRows = await tx
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+          eq(agent_operational_profile_versions.agent_id, args.agent_id),
+        ),
+      )
+      .for('update')
+      .limit(1);
+    const proposed = proposedRows[0];
+    if (!proposed) throw new ProfileTransitionError({ reason: 'not_found' });
+    if (proposed.status !== 'proposed') {
+      throw new ProfileTransitionError({ reason: 'invalid_source_status' });
+    }
+
+    // (2) Lock the current active (if any). Note: the parent-agent lock
+    // already serializes every writer, so this row lock is defense-in-
+    // depth (catches any future codepath that bypasses the parent lock
+    // and only touches the active row directly).
+    const activeRows = await tx
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+          eq(agent_operational_profile_versions.agent_id, args.agent_id),
+          eq(agent_operational_profile_versions.status, 'active'),
+        ),
+      )
+      .for('update')
+      .limit(1);
+    const incumbent = activeRows[0] ?? null;
+
+    // (2b) Predecessor enforcement — Codex round 2 [high] #1 + round 3
+    // [high] #173.
+    // The proposal was built against a specific incumbent id (recorded in
+    // profile_body.metadata.previous_version_id). If the current incumbent
+    // (re-read post-lock) doesn't match, a different proposal won the
+    // race — approving this one would silently drop that newer version's
+    // changes while the audit lineage still pointed at the old
+    // predecessor. Reject so the caller can refresh + re-propose.
+    const expectedPredecessor = readExpectedPredecessor(proposed.profile_body);
+    const currentPredecessor = incumbent?.id ?? null;
+    if (expectedPredecessor === 'unknown') {
+      // Legacy proposal authored before this codepath — see policy in
+      // the doccomment above. Refuse rather than risk silent overwrite.
+      throw new ProfileTransitionError({
+        reason: 'predecessor_conflict',
+        expected: 'unknown',
+        current: currentPredecessor,
       });
+    }
 
-      return {
-        ok: true as const,
-        activated: { id: proposed.id, version: proposed.version },
-        frozen_previous: incumbent
-          ? { id: incumbent.id, version: incumbent.version }
-          : null,
-      };
-    });
+    // Round 3 [high] #173: explicit `null` predecessor needs context.
+    // Migration 061 backfills `null` + `migrated_from_legacy: true` for
+    // every legacy row whose original lineage is unknowable. Without this
+    // discriminator, a stale migrated proposal could silently activate
+    // against an empty active slot (the (no incumbent + null predecessor)
+    // pair is indistinguishable from intentional seed v1). Reject migrated
+    // proposals with a distinct sentinel so the operator must re-propose
+    // under the new flow.
+    if (expectedPredecessor === null && isMigratedLegacy(proposed.profile_body)) {
+      throw new ProfileTransitionError({
+        reason: 'migrated_legacy_proposal',
+        expected: null,
+        current: currentPredecessor,
+      });
+    }
+
+    // Round 3 [high] #173: intentional-seed exception. Explicit `null`
+    // predecessor is legitimate when (a) there's no incumbent active row
+    // AND (b) this is version 1 — the first activation of a freshly-
+    // created agent (`createWithSeedAndAudit` → owner approves the seed).
+    const isIntentionalSeed =
+      expectedPredecessor === null && currentPredecessor === null && proposed.version === 1;
+
+    // Codex Adversarial Review of PR #182 round 3 ([high] #186): explicit
+    // `null` predecessor on any non-seed proposal must be rejected.
+    // Without this gate, an agent with `frozen`/`rolled_back` versions but
+    // no active row (e.g. post-rollback recovery window) could approve a
+    // v2+ proposal whose `previous_version_id` is `null` — the structural
+    // `null === null` equality would pass and the new active row would
+    // appear with no lineage anchor at all, silently bypassing the
+    // stale-predecessor guard that round 2/3 introduced.
+    //
+    // The four explicit cases we now distinguish:
+    //   - v1 + no incumbent + null pred       → ACCEPT (intentional seed, handled above)
+    //   - v1 + incumbent present + null pred  → REJECT as missing_predecessor
+    //       (a v1 cannot coexist with an active row — the version allocator
+    //       would never produce v1 in that state)
+    //   - v2+ + no incumbent + null pred      → REJECT as missing_predecessor
+    //       (recovery requires explicit lineage to the last frozen/rolled_back row)
+    //   - v2+ + incumbent + null pred         → REJECT as missing_predecessor
+    //       (round 2 already caught this as predecessor_conflict; the new
+    //       reason name better describes the cause)
+    if (!isIntentionalSeed && expectedPredecessor === null) {
+      throw new ProfileTransitionError({
+        reason: 'missing_predecessor',
+        proposed_version: proposed.version,
+        current_predecessor: currentPredecessor,
+      });
+    }
+
+    if (!isIntentionalSeed && expectedPredecessor !== currentPredecessor) {
+      throw new ProfileTransitionError({
+        reason: 'predecessor_conflict',
+        expected: expectedPredecessor,
+        current: currentPredecessor,
+      });
+    }
+
+    const now = new Date();
+
+    // (3) Freeze incumbent if it exists. proposed-version row itself can't
+    // be its own incumbent (we already asserted proposed.status==='proposed'
+    // != 'active'), so the WHERE id != proposed.id is defensive.
+    if (incumbent) {
+      const frozen = await tx
+        .update(agent_operational_profile_versions)
+        .set({ status: 'frozen', frozen_at: now })
+        .where(eq(agent_operational_profile_versions.id, incumbent.id))
+        .returning({ id: agent_operational_profile_versions.id });
+      if (frozen.length === 0) {
+        throw new ProfileTransitionError({ reason: 'transition_failed' });
+      }
+    }
+
+    // (4) Activate the proposed.
+    const activated = await tx
+      .update(agent_operational_profile_versions)
+      .set({
+        status: 'active',
+        approved_at: proposed.approved_at ?? now,
+        approved_by: proposed.approved_by ?? args.actor_id,
+        activated_at: now,
+      })
+      .where(eq(agent_operational_profile_versions.id, args.id))
+      .returning({ id: agent_operational_profile_versions.id });
+    if (activated.length === 0) {
+      throw new ProfileTransitionError({ reason: 'transition_failed' });
+    }
+
+    return {
+      activated: { id: proposed.id, version: proposed.version },
+      frozen_previous: incumbent
+        ? { id: incumbent.id, version: incumbent.version }
+        : null,
+      expected_predecessor: expectedPredecessor,
+    };
+  },
+
+  /**
+   * Spec perfil-inbox v4 §1.4 — reject dentro da tx do motor unificado:
+   * `proposed → rolled_back` (terminal) pelo MESMO padrão (falha ⇒ throw ⇒
+   * rollback). Serializa no lock do agente pai como todo writer desta tabela.
+   */
+  async rejectProposedInTx(
+    tx: Tx,
+    args: {
+      tenant_id: string;
+      agent_id: string;
+      id: string;
+      rollback_reason: string;
+    },
+  ): Promise<{ rejected: { id: string; version: number } }> {
+    const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
+    if (!agentLocked) throw new ProfileTransitionError({ reason: 'agent_missing' });
+
+    const rows = await tx
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.tenant_id, args.tenant_id),
+          eq(agent_operational_profile_versions.agent_id, args.agent_id),
+        ),
+      )
+      .for('update')
+      .limit(1);
+    const row = rows[0];
+    if (!row) throw new ProfileTransitionError({ reason: 'not_found' });
+    if (row.status !== 'proposed') {
+      throw new ProfileTransitionError({ reason: 'invalid_source_status' });
+    }
+
+    const updated = await tx
+      .update(agent_operational_profile_versions)
+      .set({
+        status: 'rolled_back',
+        rolled_back_at: new Date(),
+        rollback_reason: args.rollback_reason,
+      })
+      .where(
+        and(
+          eq(agent_operational_profile_versions.id, args.id),
+          eq(agent_operational_profile_versions.status, 'proposed'),
+        ),
+      )
+      .returning({ id: agent_operational_profile_versions.id });
+    if (updated.length === 0) {
+      throw new ProfileTransitionError({ reason: 'transition_failed' });
+    }
+    return { rejected: { id: row.id, version: row.version } };
   },
 
   /**
@@ -1054,7 +1271,7 @@ export const operationalProfileVersionsRepo = {
     | { ok: false; reason: 'target_invalid_status'; actual_status: ProfileStatus }
     | { ok: false; reason: 'transition_failed' }
   > {
-    return await withTx(async (tx) => {
+    const result = await withTx(async (tx) => {
       // (0) Parent-agent lock — serializes against every other writer of
       // this (tenant, agent)'s profile state.
       const agentLocked = await lockParentAgent(tx, args.tenant_id, args.agent_id);
@@ -1175,6 +1392,11 @@ export const operationalProfileVersionsRepo = {
         rolled_back: { id: active.id, version: active.version },
       };
     });
+
+    // #511: a rollback swaps which version occupies the active slot, so every
+    // replica's cached identity is stale the moment this commits.
+    if (result.ok) await publishIdentityInvalidation(args.tenant_id, args.agent_id);
+    return result;
   },
 
   // Próxima version sequencial para (tenant_id, agent_id) corrente.
@@ -1273,7 +1495,9 @@ export const operationalProfileVersionsRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
 
-    return withTx(async (tx) => {
+    // #511: seeding promotes a brand-new version straight into the active
+    // slot, so it changes `getActive()` exactly like an approval does.
+    const seeded = await withTx(async (tx) => {
       // 1) Allocate next version via the shared helper. This (a) takes the
       //    parent agent FOR UPDATE lock and (b) reads MAX(version) behind
       //    it. Throws on missing agent — historically this method was
@@ -1437,6 +1661,9 @@ export const operationalProfileVersionsRepo = {
 
       return { new_active: inserted, frozen_previous: frozenPrevious };
     });
+
+    await publishIdentityInvalidation(tenant_id, agent_id);
+    return seeded;
   },
 };
 

@@ -55,6 +55,7 @@ required must be set or the container fails fast at boot.**
 | `NEXTAUTH_SECRET`         | yes      | `openssl rand -base64 48`                     | ≥ 32 chars; rotation invalidates sessions |
 | `AUTH_TRUST_HOST`         | yes      | `true`                                        | Required behind Coolify's reverse proxy  |
 | `RUNTIME_TRACE_HMAC_MASTER_SECRET` | yes | Same value as the `app` container | Required in prod — `@/config/env.ts` fail-closes without it (audit HMACs would be forgeable). Set **runtime-only, NOT a build variable**: the Dockerfile build uses a throwaway stub, so the real secret never enters the build env or logs. |
+| `MAIA_STAGING_KEYRING` / `MAIA_STAGING_ACTIVE_KEY_ID` | for pairing | Same values as the `app` container | Required to pair WhatsApp lines from the console (issue #518). O QR/código só atravessam o Postgres CIFRADOS com este keyring — sem ele a tela de linhas continua mostrando os estados, mas o botão de parear fica desabilitado com a explicação. Runtime-only, nunca variável de build. |
 | `OIDC_ISSUER`             | for SSO  | `https://login.example.com/realms/maia`       | `https://` REQUIRED in prod              |
 | `OIDC_CLIENT_ID`          | for SSO  | (from IdP)                                    |                                          |
 | `OIDC_CLIENT_SECRET`      | for SSO  | (from IdP, ≥ 16 chars)                        | Never logged                             |

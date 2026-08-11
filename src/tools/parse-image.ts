@@ -5,10 +5,12 @@ import { isValidLinhaDigitavel, parseLinhaDigitavel, BANCOS_CODIGO } from '@/lib
 import { logger } from '@/lib/logger.js';
 import { getCachedVision, setCachedVision } from './_vision-cache.js';
 import { wrapWithTag, validateOrDrop, OCR_REGEXES } from '@/agent/sanitize.js';
+import { resolveAttachmentById } from '@/lib/attachment-resolver.js';
+import { readStoredMedia, MAX_IMAGE_BYTES } from '@/lib/media-guard.js';
+import { TypedError } from '@/lib/utils.js';
 
 const inputSchema = z.object({
-  media_local_path: z.string().min(1),
-  file_sha256: z.string().min(1),
+  attachment_id: z.string().uuid(),
 });
 
 const outputSchema = z.object({
@@ -49,8 +51,13 @@ type Output = z.infer<typeof outputSchema>;
  * back to receipt parsing if confidence is below the boleto threshold. The
  * LLM does NOT pick the parser — that's a backend concern per spec 10 §7.
  *
- * Idempotency: caches the final routed result keyed on file_sha256. Two
- * pessoas uploading the same image avoid the 1–2 Vision calls per attempt.
+ * P0 audit chapter 4: input is an OPAQUE `attachment_id` (a mensagens row id
+ * from `conversation_attachment_lookup`). The backend resolves it to the
+ * gateway-stored path (tenant/agent/conversation-scoped, fail-closed) and
+ * reads it through media-guard: containment under MEDIA_ROOT, symlink
+ * rejection, 10MB cap enforced pre-read, magic-byte mime sniffing. The vision
+ * cache is keyed on the RECOMPUTED sha256 of the bytes actually read — a
+ * declared sha can no longer poison the cache.
  *
  * Sanitization strategy (PR #38 review #3189933385):
  * Both boleto and receipt branches apply the same strategy:
@@ -60,7 +67,7 @@ type Output = z.infer<typeof outputSchema>;
 export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'parse_image',
   description:
-    'Identifica o tipo da imagem (boleto vs comprovante PIX/TED) e extrai os campos. Use quando o usuário envia uma foto e você não tem certeza do tipo.',
+    'Identifica o tipo da imagem (boleto vs comprovante PIX/TED) e extrai os campos. Use quando o usuário envia uma foto e você não tem certeza do tipo. Recebe o attachment_id de um anexo desta conversa (obtenha via conversation_attachment_lookup).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_balance'],
@@ -68,11 +75,25 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
   redis_required: false,
   operation_type: 'parse_only',
   audit_action: 'image_parsed',
-  handler: async (args) => {
-    const cached = await getCachedVision<Output>('parse_image', args.file_sha256);
+  handler: async (args, ctx) => {
+    const attachment = await resolveAttachmentById(ctx.conversa.id, args.attachment_id);
+    if (!attachment) {
+      throw new TypedError(
+        'attachment_not_found',
+        'anexo não encontrado nesta conversa — use conversation_attachment_lookup para obter um attachment_id válido',
+      );
+    }
+    const media = await readStoredMedia(attachment.path, {
+      maxBytes: MAX_IMAGE_BYTES,
+      kind: 'image',
+    });
+    // Cache key = sha256 RECOMPUTED from the bytes read (never declared).
+    const sha = media.sha256;
+
+    const cached = await getCachedVision<Output>('parse_image', sha);
     if (cached) return cached;
 
-    const boletoRaw = await visionParse({ path: args.media_local_path, kind: 'boleto' }).catch(
+    const boletoRaw = await visionParse({ buf: media.buf, mime: media.mime, kind: 'boleto' }).catch(
       () => null,
     );
     if (boletoRaw) {
@@ -103,13 +124,14 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
           },
           confianca: 0.9,
         };
-        await setCachedVision('parse_image', args.file_sha256, out);
+        await setCachedVision('parse_image', sha, out);
         return out;
       }
     }
 
     const receiptRaw = await visionParse({
-      path: args.media_local_path,
+      buf: media.buf,
+      mime: media.mime,
       kind: 'receipt',
     }).catch((err) => {
       logger.warn({ err: (err as Error).message }, 'parse_image.receipt_failed');
@@ -142,12 +164,12 @@ export const parseImageTool: Tool<typeof inputSchema, typeof outputSchema> = {
         },
         confianca: receiptRaw.valor && receiptRaw.beneficiario_nome ? 0.85 : 0.6,
       };
-      await setCachedVision('parse_image', args.file_sha256, out);
+      await setCachedVision('parse_image', sha, out);
       return out;
     }
 
     const unknown: Output = { kind: 'unknown', confianca: 0 };
-    await setCachedVision('parse_image', args.file_sha256, unknown);
+    await setCachedVision('parse_image', sha, unknown);
     return unknown;
   },
 };

@@ -16,10 +16,16 @@ export * from './repositories/capability-repos.js';
 export * from './repositories/procedure-repos.js';
 export * from './repositories/profile-repos.js';
 export * from './repositories/channel-repos.js';
+export * from './repositories/channel-line-state-repos.js';
+export * from './repositories/inbound-unrouted-repos.js';
 export * from './repositories/admin-repos.js';
 export * from './repositories/playground-repos.js';
 export * from './repositories/objective-repos.js';
 export * from './repositories/mcp-repos.js';
+export * from './repositories/approval-repos.js';
+export * from './repositories/turn-repos.js';
+// Issue #514 — Trace Explorer reads the P10b evidence tables through this repo.
+export * from './repositories/runtime-trace-repos.js';
 
 // Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
 export { holidaysRepo } from './repositories/holidays-repo.js';

@@ -54,6 +54,7 @@ async function haikuClassifier(
     { name: 'pending-gate', triggered_by: 'sync_conditional', timeoutMs: 5000 },
     () =>
       callLLM({
+        workload: 'pending_gate',
         system,
         messages: [{ role: 'user', content: user }],
         max_tokens: 200,

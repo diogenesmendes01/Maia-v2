@@ -230,17 +230,20 @@ export const DOMAIN_CALENDAR_PACK: ToolPack = {
   id: 'domain.calendar',
   name: 'Agenda',
   domain: 'calendar',
-  version: 1,
+  // v2: added `set_interlocutor_timezone` so scheduling agents can record the
+  // person's IANA zone and build the correct absolute instant for reminders.
+  version: 2,
   risk_level: 'medium',
   default_for_agent_type: ['operacoes', 'agenda'],
   description:
-    'Capacidades de agenda: consultas de dias úteis/feriados (read-only) e gestão de lembretes (write, com efeito real).',
+    'Capacidades de agenda: consultas de dias úteis/feriados (read-only), registro do fuso do interlocutor e gestão de lembretes (write, com efeito real).',
   tools: [
     'calendar_is_business_day',
     'calendar_next_holiday',
     'calendar_list_holidays',
     'calendar_business_days_between',
     'calendar_add_business_days',
+    'set_interlocutor_timezone',
     'schedule_reminder',
     'cancel_reminder',
   ],

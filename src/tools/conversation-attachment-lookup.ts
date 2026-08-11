@@ -12,19 +12,16 @@
  *     API parity but the read is ALWAYS the ALS conversation — a divergent id is
  *     ignored, never honored (no scope-escape vector).
  *   - `mensagens` has exactly ONE media column, `midia_url` (the local path the
- *     gateway saved). There is NO `media_local_path` / `media_mime` /
- *     `file_sha256` / `caption` column. The REAL keys the gateway writes:
- *       · midia_url  (column)            → media_local_path
- *       · conteudo   (column)            → caption (text/caption of the message)
- *       · tipo       (column)            → 'imagem' | 'audio' | 'documento' | …
- *       · metadata.media_mime            → media_mime
- *       · metadata.media_sha256          → file_sha256  (NB: NOT `file_sha256`)
- *       · metadata.whatsapp_id           → provider message id (for hints)
- *     so the output is assembled from the column + the `metadata` jsonb, not
- *     from non-existent columns.
+ *     gateway saved). P0 audit chapter 4: that path (and the stored sha) is NO
+ *     LONGER exposed to the LLM. Each item carries an OPAQUE `attachment_id`
+ *     (= the mensagens row id) that the parse/transcribe tools resolve
+ *     server-side (scoped + fail-closed) and read through media-guard.
+ *     Exposed per item: attachment_id, type (from `tipo` + metadata.media_mime),
+ *     media_mime, created_at, caption (`conteudo`).
  *
  * Behavior: returns only attachments visible in the active
- * tenant/agent/conversation scope; bounded; optional filtering by type / hints.
+ * tenant/agent/conversation scope; bounded; optional filtering by type / hints
+ * (hints match caption + attachment_id prefix only — never paths or shas).
  */
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
@@ -43,11 +40,12 @@ const inputSchema = z.object({
 });
 
 const attachmentSchema = z.object({
+  // Opaque handle for parse_image / parse_receipt / parse_boleto /
+  // transcribe_audio / receipt_validate. Equals the mensagens row id.
+  attachment_id: z.string(),
   message_id: z.string(),
   type: z.string(),
-  media_local_path: z.string().optional(),
   media_mime: z.string().optional(),
-  file_sha256: z.string().optional(),
   created_at: z.string().optional(),
   caption: z.string().optional(),
 });
@@ -76,7 +74,7 @@ function mapType(tipo: string, mime: string | null): string {
 export const conversationAttachmentLookupTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'conversation_attachment_lookup',
   description:
-    'Lista os arquivos (imagens, PDFs, áudios, documentos) já enviados nesta conversa, lendo os metadados de mídia das mensagens. Não baixa nem rebaixa mídia do WhatsApp. Apenas leitura, escopo tenant/agente/conversa.',
+    'Lista os arquivos (imagens, PDFs, áudios, documentos) já enviados nesta conversa, com o attachment_id de cada um — use esse id nas ferramentas parse_image/parse_receipt/parse_boleto/transcribe_audio. Não baixa nem rebaixa mídia do WhatsApp. Apenas leitura, escopo tenant/agente/conversa.',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: [],
@@ -99,13 +97,11 @@ export const conversationAttachmentLookupTool: Tool<typeof inputSchema, typeof o
       .map((m) => {
         const meta = (m.metadata ?? {}) as Record<string, unknown>;
         const mime = typeof meta.media_mime === 'string' ? meta.media_mime : null;
-        const sha = typeof meta.media_sha256 === 'string' ? meta.media_sha256 : undefined;
         return {
+          attachment_id: m.id,
           message_id: m.id,
           type: mapType(m.tipo, mime),
-          media_local_path: m.midia_url ?? undefined,
           media_mime: mime ?? undefined,
-          file_sha256: sha,
           created_at: m.created_at.toISOString(),
           caption: m.conteudo ?? undefined,
         };
@@ -113,10 +109,11 @@ export const conversationAttachmentLookupTool: Tool<typeof inputSchema, typeof o
       .filter((a) => (args.attachment_type ? a.type === args.attachment_type : true))
       .filter((a) => {
         if (hints.length === 0) return true;
-        const hay = [a.caption ?? '', a.media_local_path ?? '', a.file_sha256 ?? '']
-          .join(' ')
-          .toLowerCase();
-        return hints.some((h) => hay.includes(h));
+        // Hints match the caption or an attachment_id prefix — NEVER a
+        // filesystem path or sha (no longer exposed).
+        const caption = (a.caption ?? '').toLowerCase();
+        const id = a.attachment_id.toLowerCase();
+        return hints.some((h) => caption.includes(h) || id.startsWith(h));
       });
 
     if (attachments.length === 0) warnings.push('no_attachments_in_scope');

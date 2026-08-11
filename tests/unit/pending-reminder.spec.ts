@@ -50,6 +50,19 @@ vi.mock('../../src/gateway/baileys.js', () => ({
   isBaileysConnected: () => true,
 }));
 
+// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): o lembrete agora sai
+// pela FRONTEIRA ÚNICA de saída — `forCurrentAgentChannel(row.channel_id ?? null)`
+// → `line.sendText(jid, texto, { quoted })`. O mock devolve uma linha cujo
+// `sendText` delega para o MESMO spy de antes, então as asserções existentes
+// sobre (jid, texto, quoted) continuam provando o contrato de envio.
+const forCurrentAgentChannelMock = vi.fn(async () => ({
+  sendText: (jid: string, text: string, opts?: unknown) =>
+    sendOutboundTextMock(jid, text, opts),
+}));
+vi.mock('../../src/gateway/line-output.js', () => ({
+  forCurrentAgentChannel: forCurrentAgentChannelMock,
+}));
+
 const auditMock = vi.fn();
 vi.mock('../../src/governance/audit.js', () => ({ audit: auditMock }));
 
@@ -72,6 +85,7 @@ beforeEach(() => {
   dbUpdateReturningMock.mockResolvedValue([{ id: 'pq-1' }]); // CAS won by default
   sendOutboundTextMock.mockReset();
   sendOutboundTextMock.mockResolvedValue('WAID-REMINDER');
+  forCurrentAgentChannelMock.mockClear();
   auditMock.mockReset();
   listRemindablePairsMock.mockClear();
   listRemindablePairsMock.mockResolvedValue([{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
@@ -91,6 +105,9 @@ describe('pending-reminder worker', () => {
             remote_jid: '5511988888888@s.whatsapp.net',
           },
           metadata: {},
+          // Fase 0: o SELECT agora projeta `c.channel_id` (LEFT JOIN conversas);
+          // NULL = conversa legada sem canal → resolução do canal único do agente.
+          channel_id: null,
         },
       ],
     });
@@ -107,6 +124,9 @@ describe('pending-reminder worker', () => {
     );
     const sent = auditMock.mock.calls.filter((c) => c[0].acao === 'pending_reminder_sent');
     expect(sent).toHaveLength(1);
+    // Fase 0: o envio resolve a linha pela fronteira única, no canal do pending
+    // (NULL legado ⇒ canal único ativo do agente).
+    expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
   });
 
   it('FEATURE_PENDING_REMINDER=false → no-op (no DB scan)', async () => {
@@ -135,6 +155,9 @@ describe('pending-reminder worker', () => {
           telefone_whatsapp: '+5511988888888',
           outbound_metadata: null,
           metadata: {},
+          // Fase 0: o SELECT agora projeta `c.channel_id` (LEFT JOIN conversas);
+          // NULL = conversa legada sem canal → resolução do canal único do agente.
+          channel_id: null,
         },
       ],
     });
@@ -160,6 +183,9 @@ describe('pending-reminder worker', () => {
             remote_jid: '5511988888888@s.whatsapp.net',
           },
           metadata: {},
+          // Fase 0: o SELECT agora projeta `c.channel_id` (LEFT JOIN conversas);
+          // NULL = conversa legada sem canal → resolução do canal único do agente.
+          channel_id: null,
         },
       ],
     });
@@ -188,6 +214,9 @@ describe('pending-reminder worker', () => {
             remote_jid: '5511988888888@s.whatsapp.net',
           },
           metadata: {},
+          // Fase 0: o SELECT agora projeta `c.channel_id` (LEFT JOIN conversas);
+          // NULL = conversa legada sem canal → resolução do canal único do agente.
+          channel_id: null,
         },
       ],
     });
@@ -223,6 +252,7 @@ describe('pending-reminder worker', () => {
             remote_jid: '5511988888888@s.whatsapp.net',
           },
           metadata: { reminder_count: 0 },
+          channel_id: null,
         },
       ],
     });

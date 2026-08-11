@@ -53,6 +53,16 @@ export const proposalTypeRegistry: Record<ProposalTypeId, ProposalTypeDef> = {
     displayName: 'Knowledge',
     defaultApprovalClass: 'knowledge_guidance',
   },
+  // Spec perfil-inbox v4 §1.1 — perfil operacional como source do motor
+  // unificado. O diff NÃO reusa o ProfileDiff antigo: DiffOperationalProfile
+  // deriva do walker exaustivo de profile-risk.ts (§1.2).
+  operational_profile: {
+    id: 'operational_profile',
+    diffComponent: 'DiffOperationalProfile',
+    riskLevels: ['low', 'medium', 'high'],
+    displayName: 'Perfil operacional',
+    defaultApprovalClass: 'operational_profile_change',
+  },
 };
 
 export function getDiffComponent(type: ProposalTypeId): string {

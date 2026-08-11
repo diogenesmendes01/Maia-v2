@@ -18,10 +18,16 @@ import {
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { mcpListTools } from '@/lib/mcp-client.js';
 import { audit } from '@/governance/audit.js';
+import { featureFlags } from '@/config/feature-flags.js';
 
 let running = false;
 
 export async function runMcpSyncWorker(): Promise<void> {
+  // Fase 0 cap. 5 (auditoria P0) — a FLAG é o gate, não a fase do worker:
+  // com FEATURE_MCP_TOOLS off este worker é NO-OP total. Sem isso, o simples
+  // cadastro de um server (que auto-enfileira sync) faria o runtime buscar a
+  // URL do admin com o bearer resolvido — mesmo com a feature "desligada".
+  if (!featureFlags.isEnabled('MCP_TOOLS')) return;
   if (running) return;
   running = true;
   try {

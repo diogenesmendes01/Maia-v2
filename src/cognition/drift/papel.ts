@@ -32,7 +32,7 @@
  *   sentenças descritivas (não slugs) e isso é OK pro auditor LLM, que
  *   trata "PRIORIDADES" como lista textual livre.
  */
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM } from '@/lib/claude.js';
 import { DriftType } from '@/types/enums.js';
 import { logger } from '@/lib/logger.js';
 import { resolveLegacyPayload } from '@/identity/profile-legacy-resolver.js';
@@ -172,7 +172,6 @@ export const papelDriftDetector: DriftDetector = {
       .map((m) => `- ${m.text}`)
       .join('\n');
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY ?? '' });
     const system = [
       'Você é um auditor de papel operacional do agente.',
       'Dado o papel declarado e as prioridades, avalie se as mensagens recentes',
@@ -186,16 +185,13 @@ export const papelDriftDetector: DriftDetector = {
     ].join('\n');
 
     try {
-      const completion = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+      const completion = await callLLM({
+        workload: 'drift_detector',
         max_tokens: 700,
         system,
         messages: [{ role: 'user', content: user }],
       });
-      const text = completion.content
-        .filter((c): c is Anthropic.TextBlock => c.type === 'text')
-        .map((c) => c.text)
-        .join('');
+      const text = completion.content ?? '';
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return null;
       const parsed = JSON.parse(match[0]) as {

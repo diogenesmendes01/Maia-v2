@@ -160,6 +160,20 @@ vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
+// Fase 0 (spec roteamento v4 §1.6): `outboxRepo.enqueue` for whatsapp% kinds
+// without an explicit channel_id resolves the caller agent's SOLE active
+// channel (ALS-scoped) and stamps it on the row. The store-mock has no
+// `channels` table, so stub the resolver to a deterministic single channel —
+// the isolation-under-test (tenant/agent stamping) is unchanged.
+// vi.hoisted: the factory runs during the static import of scheduling/repos.js
+// below, before plain top-level consts would be initialised.
+const { soleChannelMock } = vi.hoisted(() => ({
+  soleChannelMock: vi.fn(async () => ({ kind: 'one' as const, id: 'chan-sole-1' })),
+}));
+vi.mock('../../src/db/repositories/channel-repos.js', () => ({
+  channelsRepo: { findSoleActiveForCurrentAgent: soleChannelMock },
+}));
+
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
@@ -207,6 +221,7 @@ beforeEach(() => {
   store.tasks!.length = 0;
   store.outbox_messages!.length = 0;
   executeMock.mockClear().mockResolvedValue({ rows: [] });
+  soleChannelMock.mockClear();
 });
 
 // ---------------------------------------------------------------------------
@@ -304,7 +319,12 @@ describe('scheduling tenant isolation — inserts stamp the caller tenant', () =
         dedup_key: 'k1',
       }),
     );
-    expect(store.outbox_messages[0]).toMatchObject({ tenant_id: 'tenant-B', agent_id: 'agent-B' });
+    expect(store.outbox_messages[0]).toMatchObject({
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      // Fase 0: whatsapp rows are born WITH the resolved channel (090 CHECK).
+      channel_id: 'chan-sole-1',
+    });
   });
 });
 

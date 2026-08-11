@@ -2,9 +2,24 @@ import { config } from '@/config/env.js';
 import { pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import type { Pessoa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
-import { sendOutboundText } from '@/gateway/baileys.js';
+import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { logger } from '@/lib/logger.js';
 import { parseDecision, maskPhone } from './quarantine-utils.js';
+
+/**
+ * Fase 0 (spec roteamento v4 §1.6) — envio pela fronteira única. O canal vem
+ * do inbound (a linha que a pessoa contactou) quando conhecido; NULL resolve o
+ * canal único ativo do agente (fail-closed em ambiguidade — o catch dos call
+ * sites preserva o contrato best-effort atual).
+ */
+async function sendViaLine(
+  jid: string,
+  text: string,
+  channel_id: string | null,
+): Promise<string | null> {
+  const line = await forCurrentAgentChannel(channel_id);
+  return line.sendText(jid, text);
+}
 
 const HOLDING_MESSAGE =
   'Oi! Antes de eu poder te atender, preciso confirmar com {OWNER_NAME} que é você mesmo. Aguenta 1 minutinho?';
@@ -43,7 +58,9 @@ export async function handleQuarantineFirstContact(input: {
     // which person they're confirming. Keep one open at a time and tell the new
     // contact to wait.
     const tel = (pessoa.telefone_whatsapp ?? '').trim();
-    if (tel) await sendOutboundText(jidFromPhone(tel), TIMEOUT_MESSAGE).catch(() => null);
+    if (tel) {
+      await sendViaLine(jidFromPhone(tel), TIMEOUT_MESSAGE, inbound.channel_id).catch(() => null);
+    }
     return;
   }
 
@@ -57,9 +74,10 @@ export async function handleQuarantineFirstContact(input: {
   // Reply to the quarantined contact.
   const tel = (pessoa.telefone_whatsapp ?? '').trim();
   if (tel) {
-    await sendOutboundText(
+    await sendViaLine(
       jidFromPhone(tel),
       HOLDING_MESSAGE.replace('{OWNER_NAME}', config.OWNER_NOME),
+      inbound.channel_id,
     ).catch((err) => logger.warn({ err: (err as Error).message }, 'quarantine.holding_send_failed'));
   }
 
@@ -86,11 +104,12 @@ export async function handleQuarantineFirstContact(input: {
     metadata: {},
   });
 
-  // Send the prompt to the owner.
+  // Send the prompt to the owner (pela conversa/canal do dono quando houver).
   if (owner.telefone_whatsapp) {
-    await sendOutboundText(
+    await sendViaLine(
       jidFromPhone(owner.telefone_whatsapp),
       `${pessoa.nome} (${maskPhone(pessoa.telefone_whatsapp)}) mandou primeira mensagem. Responde "sim" para liberar ou "bloqueia" para bloquear.`,
+      ownerConv?.channel_id ?? null,
     ).catch((err) => logger.warn({ err: (err as Error).message }, 'quarantine.owner_prompt_failed'));
   }
 }
@@ -131,15 +150,16 @@ export async function handleOwnerIdentityReply(input: {
       metadata: { decision },
     });
     if (target.telefone_whatsapp) {
-      await sendOutboundText(
+      await sendViaLine(
         jidFromPhone(target.telefone_whatsapp),
         ACCEPTED_MESSAGE.replace('{OWNER_NAME}', config.OWNER_NOME),
+        null,
       ).catch(() => null);
     }
   } else {
     await pessoasRepo.updateStatus(target.id, 'bloqueada');
     if (target.telefone_whatsapp) {
-      await sendOutboundText(jidFromPhone(target.telefone_whatsapp), BLOCKED_MESSAGE).catch(
+      await sendViaLine(jidFromPhone(target.telefone_whatsapp), BLOCKED_MESSAGE, null).catch(
         () => null,
       );
     }
