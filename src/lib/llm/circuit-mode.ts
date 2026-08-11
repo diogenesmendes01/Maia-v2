@@ -201,6 +201,44 @@ export function resolveOverrideExpiry(msg: CircuitOverrideMessage, now: number):
 let override: CircuitOverride | null = null;
 
 /**
+ * Contador MONOTÔNICO de mudanças do override vindas de FORA (canal, chave
+ * durável, reset de teste). Existe por causa de uma corrida específica, e é a
+ * resposta explícita ao item 3 do gate 4 da #534 — o desenho não tinha
+ * mecanismo de versão/geração, então este é ele.
+ *
+ * ## A corrida
+ *
+ * A releitura de reconexão (`resyncAuthoritativeState`, em
+ * `cache-invalidation.ts`) faz um `GET` na conexão COMPARTILHADA, enquanto as
+ * mensagens do canal chegam pela conexão do SUBSCRIBER. São dois sockets: o
+ * Redis serializa os comandos numa ordem total, mas as RESPOSTAS chegam ao
+ * processo em ordens independentes. Logo é possível o processo tratar uma
+ * mensagem do canal (estado B) e só depois receber a resposta do `GET` que o
+ * Redis atendeu ANTES do `SET` de B (estado A) — a releitura sobrescreveria B,
+ * mais novo, por A, mais velho. O estado final seria o da corrida, não o do
+ * Redis.
+ *
+ * ## A resolução
+ *
+ * A releitura captura a geração antes de emitir o `GET` e desiste se ela mudou
+ * quando a resposta chega: quem passou pelo canal no meio do voo é sempre pelo
+ * menos tão novo quanto o que o `GET` leu, então CEDER é a escolha correta — e
+ * é convergente mesmo no caso em que a mensagem tratada era a mais velha,
+ * porque o `PUBLISH` do valor mais novo também é entregue à inscrição (ativa,
+ * confirmada) logo em seguida.
+ *
+ * A expiração natural (`resolve`) NÃO conta como mudança externa: ela é local,
+ * determinística e re-derivável do próprio `expires_at`. Bumpá-la faria uma
+ * releitura legítima ser descartada por um relógio que virou no meio do voo.
+ */
+let generation = 0;
+
+/** Geração atual do override local. Ver o bloco em `generation`. */
+export function overrideGeneration(): number {
+  return generation;
+}
+
+/**
  * Seam de teste e do harness de benchmark. Vence tudo, e NUNCA é setado em
  * produção — não há caminho de env, de Redis ou de HTTP que chegue aqui.
  *
@@ -239,6 +277,15 @@ function auditOverride(
     reason?: string;
     expires_at?: number;
     error?: string;
+    /**
+     * PROCEDÊNCIA, quando ela não coincide com o desfecho. Uma releitura de
+     * reconexão (`resynced`) tem o mesmo desfecho de governança que a adoção de
+     * boot (a postura mudou porque a chave durável disse isso), então ela NÃO
+     * ganha ação nova na taxonomia — ganha uma procedência distinta no log e no
+     * `metadata.source` da trilha. É o que permite responder "esta réplica
+     * mudou de postura porque reconectou?" sem somar duas ações em toda query.
+     */
+    via?: string;
   },
 ): void {
   // `attribute: false`: mudar a postura é evento de FROTA. O `tenant_id` do ALS
@@ -253,6 +300,7 @@ function auditOverride(
   // no log (sem cardinalidade), nunca em label.
   const record = {
     action,
+    source: detail.via ?? action,
     mode: detail.mode,
     actor: detail.actor,
     reason: detail.reason,
@@ -277,7 +325,7 @@ function auditOverride(
    * procedência diferente. A procedência é metadado (`source`); inventar uma
    * quinta ação faria toda consulta da trilha ter que lembrar de somar as duas.
    */
-  recordCircuitAudit(OVERRIDE_AUDIT_ACTION[action], { ...record, source: action });
+  recordCircuitAudit(OVERRIDE_AUDIT_ACTION[action], record);
 }
 
 /**
@@ -369,8 +417,26 @@ export function onModeChange(listener: ModeListener): void {
 export type OverrideResult = { applied: boolean; error?: string; mode: CircuitMode };
 
 /**
+ * Procedência de uma aplicação local:
+ *
+ *  - `applied`  — mensagem do canal, agora.
+ *  - `adopted`  — `GET` da chave durável no BOOT do subscriber.
+ *  - `resynced` — `GET` da chave durável depois de uma RECONEXÃO do subscriber
+ *    (gate 4 da #534). Tem as mesmas exigências de `adopted` (a chave é a
+ *    fonte, então a validade precisa ser absoluta) e o mesmo desfecho de
+ *    governança; só a procedência muda.
+ */
+export type OverrideSource = 'applied' | 'adopted' | 'resynced';
+
+/** Leitura da chave durável — as duas procedências que exigem validade absoluta. */
+function fromDurableKey(source: OverrideSource): boolean {
+  return source === 'adopted' || source === 'resynced';
+}
+
+/**
  * Aplica um override LOCALMENTE (nesta réplica). Chamado pelo handler de
- * pub/sub, pela adoção da chave durável no boot do subscriber e pelos testes.
+ * pub/sub, pela adoção da chave durável no boot do subscriber, pela releitura
+ * de reconexão e pelos testes.
  *
  * Fail-closed na governança: sem `actor` ou sem `reason` o override é
  * RECUSADO, contado e logado. Não é rigor decorativo — é a diferença entre um
@@ -380,7 +446,7 @@ export type OverrideResult = { applied: boolean; error?: string; mode: CircuitMo
 export function applyCircuitOverride(
   msg: CircuitOverrideMessage,
   now = Date.now(),
-  source: 'applied' | 'adopted' = 'applied',
+  source: OverrideSource = 'applied',
 ): OverrideResult {
   const actor = typeof msg.actor === 'string' ? msg.actor.trim() : '';
   const reason = typeof msg.reason === 'string' ? msg.reason.trim() : '';
@@ -395,7 +461,8 @@ export function applyCircuitOverride(
 
   if (msg.clear === true) {
     override = null;
-    auditOverride('cleared', { mode: baselineMode(), actor, reason });
+    generation++;
+    auditOverride('cleared', { mode: baselineMode(), actor, reason, via: source });
     return { applied: true, mode: effectiveMode(now) };
   }
 
@@ -403,13 +470,13 @@ export function applyCircuitOverride(
     return reject(`mode inválido: esperado ${CIRCUIT_MODES.join(' | ')}`);
   }
 
-  // Adoção da chave durável exige validade ABSOLUTA. Um payload persistido com
-  // `ttl_ms` seria reinterpretado contra o relógio de cada boot: a réplica que
-  // reinicia ressuscita o arrendamento inteiro, e o kill switch passa a ser
-  // impossível de esquecer — ele nunca expira. Recusar aqui é fail-safe: a
-  // réplica fica na postura versionada, que é o estado auditável.
+  // Leitura da chave durável exige validade ABSOLUTA. Um payload persistido com
+  // `ttl_ms` seria reinterpretado contra o relógio de cada boot (ou de cada
+  // reconexão): a réplica ressuscita o arrendamento inteiro, e o kill switch
+  // passa a ser impossível de esquecer — ele nunca expira. Recusar aqui é
+  // fail-safe: a réplica fica na postura versionada, que é o estado auditável.
   if (
-    source === 'adopted' &&
+    fromDurableKey(source) &&
     !(typeof msg.expires_at === 'number' && Number.isFinite(msg.expires_at))
   ) {
     return reject(
@@ -423,7 +490,17 @@ export function applyCircuitOverride(
   const expiresAt = expiry.expires_at;
 
   override = { mode: msg.mode, expires_at: expiresAt, actor, reason };
-  auditOverride(source, { mode: msg.mode, actor, reason, expires_at: expiresAt });
+  generation++;
+  // `resynced` não vira ação nova na taxonomia: o desfecho de governança é o
+  // mesmo de `adopted` (a chave durável mudou a postura desta réplica), e a
+  // procedência vai em `source`. Ver o bloco de `via` em `auditOverride`.
+  auditOverride(source === 'resynced' ? 'adopted' : source, {
+    mode: msg.mode,
+    actor,
+    reason,
+    expires_at: expiresAt,
+    via: source,
+  });
   return { applied: true, mode: effectiveMode(now) };
 }
 
@@ -450,6 +527,10 @@ export const _internal = {
     forced = null;
     baseline = null;
     lastSeen = null;
+    // A geração NÃO volta a zero: ela é monotônica de propósito. Um `reset()`
+    // entre a captura e a comparação tem que INVALIDAR a releitura em voo, e
+    // zerar o contador poderia fazê-la casar de novo por acaso.
+    generation++;
   },
   /** Seam de teste/benchmark. Vence override e contrato. */
   setMode(next: CircuitMode | null): void {
