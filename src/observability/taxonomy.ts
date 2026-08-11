@@ -116,6 +116,17 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
  *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
  *                            `observability/instrumentation.ts`
+ *   - `context.load`       → `src/runtime/context-packet/build-context-packet.ts`
+ *                            (`stage="packet"`, issue #535 gate 6) via
+ *                            `observability/instrumentation.ts`
+ *
+ * `emitted` means "an instrumentation site exists", which is the only claim
+ * this table can make honestly. It is NOT a claim about how often the site
+ * runs: `buildContextPacket` is the P8a assembly orchestrator, and PR #406
+ * removed the hot path that called it, so `context.load` produces series for
+ * every caller of the assembly but not (yet) on the WhatsApp turn. That gap is
+ * written down in `docs/architecture/concerns/governance-observability.md` §7
+ * rather than hidden behind a flag value that reads as coverage.
  */
 export type SpanEmission = 'emitted' | 'declared';
 
@@ -131,7 +142,7 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.PROCEDURE_SELECT]: 'declared',
   [SPAN.RISK_CLASSIFY]: 'declared',
   [SPAN.DECISION_EVALUATE]: 'declared',
-  [SPAN.CONTEXT_LOAD]: 'declared',
+  [SPAN.CONTEXT_LOAD]: 'emitted',
   [SPAN.PROMPT_RENDER]: 'declared',
   [SPAN.REACT_ITERATION]: 'declared',
   [SPAN.LLM_REQUEST]: 'declared',
@@ -573,6 +584,36 @@ export const ENUM_VALUES = Object.freeze({
   origin: ['ingress', 'queue', 'recovery', 'replay', 'probe', 'internal'] as const,
   required: ['true', 'false'] as const,
 });
+
+/**
+ * Issue #535 gate 6 — the CLOSED set of `stage` values on the context-load
+ * family (`maia_context_load_ms`, `maia_context_slices_total`, span
+ * `context.load`).
+ *
+ * `stage` is a shared label key (`maia_turn_stage_duration_ms` uses it too),
+ * so it cannot live in `ENUM_VALUES`, which is global per key. This is the
+ * per-family vocabulary, and it exists so the closure is assertable instead of
+ * argued: the budget for `stage` is 60 distinct values, and the moment a call
+ * site derives one from input (a config name, a tenant, a slice name coming
+ * from the wire) that budget stops bounding anything real.
+ *
+ * `packet` — the whole `ExecutionContextPacket` assembly, emitted by
+ * `src/runtime/context-packet/build-context-packet.ts`. It is the only member
+ * today: the per-slice stages the wrapper's doc comment mentions have no
+ * emitter, and listing them here without one is exactly the "declared reads as
+ * covered" defect this issue opens with.
+ * `tests/unit/observability/context-load-call-site.spec.ts` pins the set
+ * against what the production assembly actually emits.
+ */
+export const CONTEXT_LOAD_STAGE = Object.freeze({
+  PACKET: 'packet',
+} as const);
+
+export type ContextLoadStage =
+  (typeof CONTEXT_LOAD_STAGE)[keyof typeof CONTEXT_LOAD_STAGE];
+
+export const CONTEXT_LOAD_STAGE_VALUES: readonly ContextLoadStage[] =
+  Object.freeze(Object.values(CONTEXT_LOAD_STAGE));
 
 // ---------------------------------------------------------------------------
 // 3.1 Onboarding saga — vocabulários FECHADOS (issue #519, review do PR #541)
