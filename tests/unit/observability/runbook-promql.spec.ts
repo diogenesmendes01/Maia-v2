@@ -570,9 +570,16 @@ describe('achado 6 — os fatos que motivaram a reescrita continuam valendo', ()
     // A postura não é por workload — promover é decisão de frota.
     expect(section).toContain('A postura é GLOBAL');
     expect(section).toContain('Não existe promoção seletiva por workload');
-    // …e a lacuna de reconexão bloqueia a promoção enquanto não for corrigida.
-    expect(section).toContain('PRÉ-REQUISITO BLOQUEANTE');
+    // A lacuna de reconexão do pub/sub era o pré-requisito BLOQUEANTE da
+    // promoção; ela foi fechada no gate 4 da #534. A seção não pode voltar a
+    // ser silenciosa sobre isso: quem promove precisa achar aqui o mecanismo
+    // (releitura na reconexão), a semântica das duas pontas e COMO verificar
+    // que a réplica ressincronizou — que é o que substitui o bloqueio.
     expect(section).toMatch(/reconect/i);
+    expect(section).toContain('resyncAuthoritativeState');
+    expect(section).toContain('arrendamento restante');
+    expect(section).toContain('limpa o override local');
+    expect(section).toContain('reason="resynced"');
     // Os números que o owner fixou.
     expect(section).toContain('7 dias completos');
     expect(section).toContain('1.000 chamadas');

@@ -359,9 +359,28 @@ custo honesto de um restart: `LLM_CIRCUIT_MODE=off` no `.env` +
 depois que a inscrição no canal está CONFIRMADA pelo Redis. Isso fecha a janela
 em que ela leria a chave antes do seu `SET` e perderia o `PUBLISH` por ainda não
 estar inscrita — o modo de falha em que metade da frota atravessa o incidente na
-postura antiga. Se o passo 4 mostrar uma réplica divergente mesmo assim, o
-suspeito é perda de mensagem por queda de socket (pub/sub é at-most-once):
-republique o `SET` + `PUBLISH`, que é idempotente.
+postura antiga.
+
+**Réplica que RECONECTA durante a virada.** Pub/sub é at-most-once e não tem
+replay: a mensagem publicada enquanto o socket estava caído está perdida. Desde
+o gate 4 da #534, toda volta da conexão do subscriber (o segundo `ready` do
+ioredis em diante) dispara uma RELEITURA do estado autoritativo — chave presente
+⇒ adota o que sobrou do arrendamento; chave ausente ⇒ limpa o override local e
+volta à postura do contrato. Não é preciso republicar nem esperar TTL. Para
+confirmar que uma réplica específica passou por isso:
+
+```bash
+curl -s http://localhost:3000/metrics | grep 'reason="resync'
+# maia_llm_circuit_mode_overrides_total{state="off",reason="resynced"} 1
+journalctl -u maia | grep llm_gateway.circuit_override_resync
+```
+
+`resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`) é a
+única saída ruim: a releitura NÃO conseguiu falar com o Redis e a réplica
+manteve o estado que tinha — fail-closed, porque concluir "não há override" a
+partir de um Redis mudo desligaria o kill switch sozinho. Uma réplica nesse
+estado pode estar divergente da frota: republique o `SET` + `PUBLISH` (é
+idempotente) e, se persistir, trate como Redis fora do ar — segunda alavanca.
 
 ### Auditoria — como saber que alguém mexeu
 
@@ -374,9 +393,11 @@ curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode_overrides_tot
 journalctl -u maia | grep llm_gateway.circuit_mode_override
 ```
 
-`reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted`. Um
-`rejected` no gráfico significa que alguém TENTOU virar a chave e não conseguiu
-— vale investigar tanto quanto um `applied`.
+`reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted` ·
+`resynced` · `resync_failed`. Um `rejected` no gráfico significa que alguém
+TENTOU virar a chave e não conseguiu — vale investigar tanto quanto um
+`applied`. Os dois últimos são a releitura de reconexão (uma linha por
+releitura, inclusive quando ela não muda nada).
 
 **A fonte DURÁVEL é `audit_log`** (revisão da PR #541). Métrica expira na
 retenção do Prometheus e log expira na do coletor — é a trilha que responde
@@ -389,7 +410,7 @@ SELECT created_at, acao,
        metadata->>'reason' AS motivo,
        metadata->>'mode'   AS postura,
        metadata->>'expires_at' AS validade,
-       metadata->>'source' AS origem,   -- 'adopted' = veio da chave durável no boot
+       metadata->>'source' AS origem,   -- 'adopted' = chave durável no boot; 'resynced' = releitura de reconexão
        metadata->>'error'  AS erro      -- só nas recusas
   FROM audit_log
  WHERE acao LIKE 'llm_circuit_mode_override_%'
@@ -399,8 +420,11 @@ SELECT created_at, acao,
 
 Ações: `llm_circuit_mode_override_applied` · `_cleared` · `_expired` ·
 `_rejected`. A adoção da chave durável no boot entra como `applied` com
-`metadata.source = 'adopted'` — é o mesmo desfecho de governança (a postura
-mudou), com procedência diferente.
+`metadata.source = 'adopted'`, e a releitura de reconexão com
+`metadata.source = 'resynced'` — é o mesmo desfecho de governança (a postura
+mudou), com procedência diferente. Uma limpeza vinda da releitura aparece como
+`_cleared` com `actor = 'system:llm_circuit_resync'`: não houve humano, o que
+mudou a postura foi a convergência com o Redis.
 
 Se a métrica registrar um `applied` e a trilha não tiver a linha, o suspeito é
 a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
@@ -417,28 +441,32 @@ a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
 > se quer, o trabalho é implementar postura POR WORKLOAD primeiro — não
 > promover mesmo assim e torcer.
 
-> **PRÉ-REQUISITO BLOQUEANTE — a lacuna de reconexão do pub/sub.**
+> **PRÉ-REQUISITO — a lacuna de reconexão do pub/sub: FECHADA (gate 4 da #534).**
 > O kill switch (`maia:llm:circuit:override`) chega por pub/sub do Redis, que é
-> **at-most-once**. A chave durável cobre a réplica que **SOBE** no meio do
-> incidente (`adoptPersistedOverride`, chamada uma única vez depois do
-> `SUBSCRIBE` confirmado — ver `src/lib/llm/cache-invalidation.ts`), mas **NÃO**
-> cobre a que **RECONECTA** nele: uma queda de socket entre a confirmação e a
-> mensagem perde a notificação para sempre, e aquela réplica só reconverge no
-> próximo `SET`/`PUBLISH`.
+> **at-most-once**. A chave durável cobria a réplica que **SOBE** no meio do
+> incidente (`adoptPersistedOverride`, depois do `SUBSCRIBE` confirmado), mas
+> **não** cobria a que **RECONECTA** nele: uma queda de socket entre a
+> confirmação e a mensagem perdia a notificação para sempre, e aquela réplica
+> continuava na postura antiga até o TTL do arrendamento. Em `shadow` isso era
+> divergência de medição; em `enforce` seria uma réplica **recusando tráfego
+> depois de o plantão ter desligado o disjuntor**.
 >
-> Em `shadow` isso é uma divergência de medição. Em `enforce` é uma réplica que
-> **continua recusando tráfego depois de o plantão ter desligado o disjuntor** —
-> ou seja, o kill switch deixa de ser uma alavanca confiável exatamente na
-> postura em que ele é a única saída rápida.
+> Hoje `resyncAuthoritativeState` (`src/lib/llm/cache-invalidation.ts`) é
+> encadeada no `ready` do ioredis a partir da SEGUNDA vez: re-inscreve nos dois
+> canais, espera o ack, solta o cache de settings e **relê** a chave durável.
+> Chave presente ⇒ adota o **arrendamento restante** (o payload carrega
+> `expires_at` absoluto, então não há como reiniciar a contagem); chave ausente
+> ⇒ **limpa o override local** e volta à postura do contrato. Falha de leitura
+> não vira "não há override": o estado é preservado e sai `resync_failed`.
 >
-> **Correção exigida antes de `enforce`** (não implementada nesta PR, por
-> escopo): reler a chave durável em TODO `reconnect`/`ready` do subscriber, não
-> só no primeiro. Semântica da releitura: chave presente ⇒ adota o **TTL
-> restante** (nunca o TTL original, que ressuscitaria o arrendamento); chave
-> ausente ⇒ **limpa o override local** e volta à postura base do contrato.
-> Enquanto isso não existir, a promoção está bloqueada — e não por prudência
-> genérica: sem essa releitura o procedimento de rollback desta mesma seção não
-> tem garantia de chegar em toda a frota.
+> Provas: `tests/integration/llm-circuit-reconnect-resync.spec.ts` (socket
+> morto de verdade, mensagem comprovadamente perdida) e
+> `tests/unit/lib/llm-circuit-resync.spec.ts` (fail-closed e a corrida entre a
+> releitura em voo e uma mensagem do canal). **Verificação antes de promover:**
+> derrube o socket de uma réplica, vire a chave nesse intervalo e confirme
+> `maia_llm_circuit_mode_overrides_total{reason="resynced"}` subindo naquela
+> réplica com a postura convergida — o passo 4 desta seção, com a queda no
+> meio.
 
 #### Janela mínima de observação
 
