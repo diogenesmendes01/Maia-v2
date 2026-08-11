@@ -14,7 +14,7 @@
  * `pg_try_advisory_lock` semantics), the evidence read, and `runRestoreDrill`
  * itself — no Postgres, no S3, no `pg_restore`.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 const { drillSpy, facts, heldLocks, lockCalls, sendAlertSpy } = vi.hoisted(() => ({
   drillSpy: vi.fn(),
@@ -107,8 +107,20 @@ function drillResult(over: Record<string, unknown> = {}) {
   };
 }
 
-async function registryJob() {
-  const { JOBS } = await import('../../../src/workers/index.js');
+/**
+ * The REAL registry, imported once. `src/workers/index.ts` pulls in the whole
+ * worker tree, which takes seconds to transform on a cold cache — well past the
+ * 5s default per-test timeout on a loaded machine. Paying it in `beforeAll`
+ * with an explicit budget keeps the assertions from flaking on import cost
+ * (they are about the registry, not about how fast esbuild is today).
+ */
+let JOBS: Array<{ name: string; cron: string; phase: number; fn: () => Promise<void> }>;
+
+beforeAll(async () => {
+  ({ JOBS } = await import('../../../src/workers/index.js'));
+}, 120_000);
+
+function registryJob() {
   const job = JOBS.find((j) => j.name === 'restore_drill');
   if (!job) throw new Error('the restore_drill job is not in the worker registry');
   return job;
@@ -133,7 +145,7 @@ beforeEach(() => {
 
 describe('restore_drill is a real entry in the worker registry', () => {
   it('is registered at phase 1 on an hourly tick', async () => {
-    const job = await registryJob();
+    const job = registryJob();
     // PHASE 1: production calls startWorkers(1); a phase>1 job would never be
     // scheduled at all — the trap already documented for the trace workers.
     expect(job.phase).toBe(1);
@@ -148,7 +160,7 @@ describe('restore_drill is a real entry in the worker registry', () => {
 
 describe('the registered job actually drills', () => {
   it('runs a drill when no drill has ever run', async () => {
-    const job = await registryJob();
+    const job = registryJob();
     await job.fn();
     expect(drillSpy).toHaveBeenCalledTimes(1);
   });
@@ -157,7 +169,7 @@ describe('the registered job actually drills', () => {
     facts.current.last_restore_drill_at = new Date(Date.now() - 400 * 3_600_000);
     facts.current.last_restore_drill_result = 'passed';
     facts.current.last_restore_drill_cleanup_status = 'clean';
-    const job = await registryJob();
+    const job = registryJob();
     await job.fn();
     expect(drillSpy).toHaveBeenCalledTimes(1);
   });
@@ -166,21 +178,21 @@ describe('the registered job actually drills', () => {
     facts.current.last_restore_drill_at = new Date(Date.now() - 2 * 3_600_000);
     facts.current.last_restore_drill_result = 'passed';
     facts.current.last_restore_drill_cleanup_status = 'clean';
-    const job = await registryJob();
+    const job = registryJob();
     await job.fn();
     expect(drillSpy).not.toHaveBeenCalled();
   });
 
   it('does not reject when the drill fails — the verdict is the evidence', async () => {
     drillSpy.mockResolvedValue(drillResult({ status: 'failed', failure_code: 'restore_failed' }));
-    const job = await registryJob();
+    const job = registryJob();
     await expect(job.fn()).resolves.toBeUndefined();
   });
 });
 
 describe('single-flight: two concurrent ticks, one drill', () => {
   it('the second tick loses the advisory lock and starts nothing', async () => {
-    const job = await registryJob();
+    const job = registryJob();
 
     // Hold the first drill open so the two ticks genuinely overlap.
     let release!: () => void;
