@@ -151,6 +151,38 @@ async function reconnect(sub: FakeSub): Promise<void> {
   }
 }
 
+/** Espera uma condição com deadline curto — nunca dorme às cegas. */
+async function waitUntil(pred: () => boolean, ms = 1000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!pred() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 2));
+}
+
+/**
+ * Responde à leitura mais RECENTE que estiver em voo.
+ *
+ * O mesmo código descreve os dois mundos, e é isso que faz dele um teste em vez
+ * de um espelho da implementação:
+ *
+ *  - **em série** (com a `resyncChain`) só existe UMA leitura em voo por vez, e
+ *    "a mais recente" é a única — a segunda releitura nem chegou a emitir a
+ *    dela, porque a primeira ainda não terminou;
+ *  - **concorrente** (sem a cadeia) as duas estão em voo juntas, e "a mais
+ *    recente" é a leitura #2 — que passa a responder ANTES da #1, que é a
+ *    inversão de ordem que se quer provocar.
+ */
+async function answerInFlight(
+  inFlight: Array<(v: string | null) => void>,
+  value: string,
+): Promise<void> {
+  await waitUntil(() => inFlight.length > 0);
+  // Folga deliberada para uma segunda leitura CONCORRENTE aparecer, se o
+  // desenho permitir que ela apareça. Em série ela não pode.
+  await new Promise((r) => setTimeout(r, 20));
+  expect(inFlight.length, 'nenhuma leitura em voo para responder').toBeGreaterThan(0);
+  inFlight.pop()!(value);
+  await new Promise((r) => setTimeout(r, 5));
+}
+
 beforeEach(() => {
   subs.length = 0;
   modeInternal.reset();
@@ -375,5 +407,53 @@ describe('kill switch — releitura na reconexão', () => {
       await new Promise((r) => setTimeout(r, 2));
     }
     expect(llmSettingsSubscriberResyncCount()).toBe(before + 3);
+  });
+
+  /**
+   * SERIALIZAÇÃO — a propriedade que a `resyncChain` existe para dar, e que
+   * antes só existia como afirmação num comentário.
+   *
+   * A guarda de geração sozinha NÃO cobre isto. Ela protege a releitura contra
+   * uma mensagem do canal que chegue no meio do voo (essa é sempre pelo menos
+   * tão nova quanto o que o `GET` leu). Entre DUAS releituras concorrentes a
+   * premissa cai: as duas capturam a mesma geração antes de qualquer aplicação,
+   * a primeira a responder aplica e bumpa a geração, e a outra — que pode ser a
+   * que leu o estado MAIS NOVO — sai como `superseded`. O que fica valendo é a
+   * leitura mais velha: inversão de ordem no kill switch, a classe exata de bug
+   * que o resto do desenho combate.
+   *
+   * O cenário aqui é o pior caso operacional: a leitura velha diz `enforce`, a
+   * nova diz `off` (o plantão desligou o disjuntor entre as duas). Se a velha
+   * vencer, a réplica segue recusando tráfego que já mandaram parar de recusar.
+   */
+  it('duas reconexões seguidas correm EM SÉRIE: a leitura mais nova é a que fica', async () => {
+    const sub = await bootSubscriber();
+    const before = llmSettingsSubscriberResyncCount();
+
+    /** Leituras em voo, na ordem em que a PRODUÇÃO as emitiu. */
+    const inFlight: Array<(v: string | null) => void> = [];
+    redisMock.get.mockImplementation(
+      () => new Promise<string | null>((resolve) => inFlight.push(resolve)),
+    );
+
+    // Dois `ready` em sequência rápida, sem esperar o primeiro terminar — o
+    // socket instável do comentário, agora exercido de verdade.
+    sub.emit('ready');
+    sub.emit('ready');
+
+    // A leitura mais recente em voo responde PRIMEIRO, com o valor mais VELHO…
+    await answerInFlight(inFlight, overridePayload('enforce'));
+    // …e a que sobrar (ou a que a série emitir em seguida) com o mais NOVO.
+    await answerInFlight(inFlight, overridePayload('off'));
+
+    await waitUntil(() => llmSettingsSubscriberResyncCount() === before + 2);
+    expect(
+      llmSettingsSubscriberResyncCount(),
+      'as duas releituras precisam TERMINAR — serializar não pode virar engolir uma',
+    ).toBe(before + 2);
+    expect(
+      effectiveMode(),
+      'a leitura mais VELHA foi a última a escrever: releituras concorrentes inverteram a ordem do kill switch',
+    ).toBe('off');
   });
 });
