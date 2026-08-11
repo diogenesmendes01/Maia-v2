@@ -278,6 +278,22 @@ describe('runRestoreDrillTick — absence of evidence is not evidence of success
   });
 });
 
+describe('runRestoreDrillTick — an interval the tick cannot honour is said out loud', () => {
+  it('warns when the configured interval is below the tick floor', async () => {
+    const h = harness();
+    await runRestoreDrillTick(h.ports, prodProfile({ BACKUP_RESTORE_DRILL_INTERVAL_HOURS: 2 }));
+    const line = h.logs.find((l) => l.event === 'restore_drill.interval_below_tick_floor');
+    expect(line?.level).toBe('warn');
+    expect(line?.detail.interval_hours).toBe(2);
+  });
+
+  it('stays quiet for an interval the tick can honour', async () => {
+    const h = harness();
+    await runRestoreDrillTick(h.ports, prodProfile());
+    expect(h.logs.some((l) => l.event === 'restore_drill.interval_below_tick_floor')).toBe(false);
+  });
+});
+
 describe('runRestoreDrillTick — single-flight and residue', () => {
   it('reports already_running without starting a second drill', async () => {
     const h = harness({

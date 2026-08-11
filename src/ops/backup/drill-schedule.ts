@@ -16,7 +16,8 @@
  * schedule an execution. That distinction is the whole design of this module:
  *
  *   - the WORKER wakes on a fixed, frequent tick (hourly — see
- *     `src/workers/index.ts`), which has nothing to do with the interval;
+ *     `src/workers/index.ts` and `DRILL_TICK_HOURS`), which has nothing to do
+ *     with the interval;
  *   - each tick asks THIS module whether the evidence in `restore_drills` is
  *     close enough to expiring that a new drill should start now;
  *   - a tick that finds fresh evidence does NOTHING. The drill is expensive —
@@ -67,6 +68,30 @@ export const DRILL_DUE_FRACTION = 0.75;
  * (a weekly interval retries in ~21h, a daily one in ~3h) and never faster.
  */
 export const DRILL_RETRY_FRACTION = 0.125;
+
+/**
+ * The tick cadence the worker registry uses, in hours (`40 * * * *`). Declared
+ * here so the honourability floor below is derived from it rather than from a
+ * number someone has to remember to keep in sync.
+ */
+export const DRILL_TICK_HOURS = 1;
+
+/**
+ * Shortest interval this schedule can actually HONOUR.
+ *
+ * The margin between "due" and "expired" is 25% of the interval, and the tick
+ * only wakes every `DRILL_TICK_HOURS`. So the worst case from becoming due to a
+ * drill finishing is one tick plus one drill duration, and the interval can be
+ * honoured only while that fits in the margin. At 6h the margin is 90 minutes —
+ * a tick plus a drill of half an hour.
+ *
+ * `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` accepts any positive integer, so an
+ * operator CAN configure 2h. The scheduler does not silently pretend to honour
+ * it: the tick says so, every tick, and the gate still goes red when the
+ * evidence expires. Refusing the value outright would be a change to the config
+ * contract, which is not this module's call.
+ */
+export const MIN_HONOURABLE_INTERVAL_HOURS = DRILL_TICK_HOURS * 6;
 
 /**
  * Terminal cleanup verdicts as persisted in `restore_drills.cleanup_status`.
@@ -262,6 +287,21 @@ export async function runRestoreDrillTick(
     last_restore_drill_result: facts.last_restore_drill_result,
     last_restore_drill_cleanup_status: facts.last_restore_drill_cleanup_status,
   });
+
+  if (profile.objectives.restoreDrillIntervalHours < MIN_HONOURABLE_INTERVAL_HOURS) {
+    // Said out loud rather than assumed away: the operator asked for an
+    // evidence age this schedule cannot guarantee, and the gate will flap red
+    // between drills as a result. That is a configuration problem, not a drill
+    // problem, and the log is where the two get told apart.
+    ports.log('warn', 'restore_drill.interval_below_tick_floor', {
+      interval_hours: profile.objectives.restoreDrillIntervalHours,
+      tick_hours: DRILL_TICK_HOURS,
+      min_honourable_interval_hours: MIN_HONOURABLE_INTERVAL_HOURS,
+      impact:
+        'the scheduler cannot guarantee evidence stays inside this interval; ' +
+        'raise BACKUP_RESTORE_DRILL_INTERVAL_HOURS or drill from the host cron',
+    });
+  }
 
   const verdict = {
     gate: checkLevel,
