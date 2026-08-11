@@ -14,7 +14,7 @@ import {
   registerBackupReadinessGauges,
   type BackupReadinessCollectorDeps,
 } from '../../../src/observability/backup-readiness-collector.js';
-import { renderPrometheus } from '../../../src/lib/metrics.js';
+import { renderPrometheus, _resetForTests as resetMetrics } from '../../../src/lib/metrics.js';
 import {
   resolveBackupProfile,
   type BackupConfigInput,
@@ -115,12 +115,30 @@ describe('maia_restore_drill_check_level — the gate', () => {
     expect(g.maia_restore_drill_check_level).toBe(2);
   });
 
+  /**
+   * Fail-closed, and this is the case that distinguishes this collector from
+   * `turn-state-collector.ts`: the SAME collector instance, already holding a
+   * green snapshot, must not keep serving it once the read stops working. The
+   * clock is advanced past the snapshot window rather than resetting module
+   * state, so the previous verdict really is there to be (wrongly) re-served.
+   */
   it('is 2 — never the last known-good value — when the evidence cannot be read', async () => {
-    const ok = await backupReadinessGaugeSnapshot(deps());
-    expect(ok.maia_restore_drill_check_level).toBe(0);
+    let clock = NOW;
+    let broken = false;
+    const flaky: BackupReadinessCollectorDeps = {
+      now: () => clock,
+      resolveProfile: () => prodProfile(),
+      readFacts: async () => {
+        if (broken) throw new Error('connection terminated');
+        return facts();
+      },
+    };
 
-    _resetBackupReadinessCollectorForTests();
-    const g = await backupReadinessGaugeSnapshot(deps(new Error('connection terminated')));
+    expect((await backupReadinessGaugeSnapshot(flaky)).maia_restore_drill_check_level).toBe(0);
+
+    broken = true;
+    clock = new Date(NOW.getTime() + 10 * 60_000);
+    const g = await backupReadinessGaugeSnapshot(flaky);
     expect(g.maia_restore_drill_check_level).toBe(2);
     expect(g.maia_backup_readiness_level).toBe(2);
   });
@@ -171,6 +189,11 @@ describe('the gauge is actually registered on /metrics', () => {
    * evidence read produces the pessimistic value rather than no series.
    */
   it('is wired from registerRuntimeObservability, the boot-time registration point', async () => {
+    // Start from an EMPTY registry and an unregistered collector, so the series
+    // below can only come from the production wiring — never from the test
+    // above, which registers the collector itself.
+    resetMetrics();
+    _resetBackupReadinessCollectorForTests();
     const { registerRuntimeObservability } = await import(
       '../../../src/observability/register.js'
     );

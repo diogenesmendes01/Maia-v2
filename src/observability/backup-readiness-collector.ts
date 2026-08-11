@@ -71,9 +71,13 @@ let registered = false;
  * back to FAIL.
  */
 async function refresh(deps: BackupReadinessCollectorDeps): Promise<void> {
-  if (snapshot !== null && Date.now() - lastRefreshAt < SNAPSHOT_TTL_MS) return;
+  // The window is measured on the INJECTED clock, the same one the verdict is
+  // computed against — a test can then advance time and prove that a refresh
+  // which fails drops the previous verdict instead of re-serving it.
+  const nowMs = deps.now().getTime();
+  if (snapshot !== null && nowMs - lastRefreshAt < SNAPSHOT_TTL_MS) return;
   if (inFlight) return inFlight;
-  lastRefreshAt = Date.now();
+  lastRefreshAt = nowMs;
   inFlight = (async () => {
     try {
       const profile = await deps.resolveProfile();
