@@ -235,11 +235,21 @@ the stress profile, where the drain criterion is red by construction.
 
 **Baseline.** `scripts/turn-context-baseline.json` holds the p95/p99 per arm,
 the host it was measured on, and a note saying whether it is a first measurement
-or a re-record. There was no registered baseline before this change, so the run
-recorded there **is the initial one** — the +20 % criterion only starts meaning
-"did not regress" from the next run onwards, and it is scoped to that host: a CI
-lane needs its own `--write-baseline`. A gate run never writes a baseline as a
-side effect.
+or a re-record. **It is not checked in**, and `.gitignore` keeps it that way. A
+baseline is a measurement of one machine at one moment, and shipping one file as
+if it were a shared reference makes the +20 % criterion red on arrival for
+everybody else: a baseline recorded here at p95 67.0 ms (`cold`) / 75.9 ms
+(`warm`) was replayed on the same 4-vCPU host in a later container and measured
+135.5 / 118.5 ms and then 154.1 / 114.9 ms — the same code, +56 % to +130 % over
+the recorded number, with the gate's own ceilings (600 ms / 1 s) never
+threatened. So each host and each CI lane records its own on first run with
+`--write-baseline`, and without one the harness reports the relative criterion as
+`n/a` and says so loudly. A gate run never writes a baseline as a side effect.
+
+What survives across hosts is the absolute part of the gate — 600 ms p95, 1 s
+p99, zero errors, peak ≤ 6, the pool draining, the metric covering every turn and
+the load having the shape the issue specifies. Those are the criteria to read
+first when a run is red.
 
 Proving a gate is proving that it **rejects**.
 `tests/unit/scripts/turn-context-gate.spec.ts` feeds synthetic arm results into

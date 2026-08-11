@@ -95,6 +95,11 @@
  * chamado com `--write-baseline`. Uma corrida de gate NUNCA grava baseline
  * sozinha: baseline é decisão, não efeito colateral.
  *
+ * O arquivo NÃO é versionado (`.gitignore`). Ele mede uma máquina num momento:
+ * o mesmo código, no mesmo host de 4 vCPU, mediu p95 67,0 ms num contêiner e
+ * 135,5 ms no seguinte. Versioná-lo entregaria o critério relativo vermelho na
+ * chegada para qualquer host que não fosse o que gravou.
+ *
  * ## Uso
  *
  *   npm run turn:bench                       # medição completa (cold + warm)

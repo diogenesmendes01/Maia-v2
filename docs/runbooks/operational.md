@@ -1282,15 +1282,27 @@ npm run turn:bench -- --sustain-s 60 --write-baseline
 ```
 
 `scripts/turn-context-baseline.json` carrega `recorded_at`, `host` e um `note`
-dizendo se é a PRIMEIRA medição ou uma re-gravação. Duas regras:
+dizendo se é a PRIMEIRA medição ou uma re-gravação. O arquivo **não é versionado**
+(está no `.gitignore`): é a medição da SUA máquina, e cada host grava o seu na
+primeira corrida. Três regras:
 
-1. **O baseline é por host.** O número foi medido numa máquina; uma esteira de CI
-   precisa gravar o dela na primeira execução, com `--write-baseline`, e o PR que
-   faz isso deve dizer em que máquina foi.
-2. **Re-gravar é uma decisão de revisão.** A folga de +20 % existe para absorver
-   ruído (a variação medida entre corridas iguais neste host foi de ~10 %), não
-   para absorver regressão. Se o p95 subiu por um motivo aceito, re-grave no
-   MESMO PR que aceitou o motivo — não numa corrida solta.
+1. **O baseline é por host — e por momento do host.** Não é figura de retórica.
+   Um baseline gravado neste repositório a p95 67,0 ms (`cold`) / 75,9 ms (`warm`)
+   foi reproduzido no MESMO host de 4 vCPU, com o mesmo código e o banco vazio,
+   num contêiner posterior: 135,5 / 118,5 ms, e depois 154,1 / 114,9 ms. De 56 %
+   a 130 % acima do número gravado, sem que nenhum limite absoluto do gate
+   (600 ms / 1 s) chegasse perto de cair. Versionar esse arquivo entregaria um
+   gate vermelho na chegada para todo mundo que não fosse a máquina que o gravou.
+2. **A variação entre corridas iguais na mesma sessão é de ~10–15 %**; a folga de
+   +20 % é dimensionada para isso. Ela NÃO absorve troca de máquina, de contêiner
+   nem host ocupado — nesses casos re-grave, não discuta o delta.
+3. **Re-gravar é uma decisão de revisão.** A folga existe para absorver ruído, não
+   regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
+   aceitou o motivo — não numa corrida solta.
+
+Quando um número tem que valer para todo mundo, ele está nos critérios absolutos:
+p95 ≤ 600 ms, p99 ≤ 1 s, zero erros, pico ≤ 6, o pool drenando, a métrica cobrindo
+todos os turnos e a carga com a forma do enunciado. Leia esses primeiro.
 
 ### Provar que o gate reprova
 
