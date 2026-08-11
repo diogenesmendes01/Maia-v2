@@ -203,6 +203,32 @@ d('worker onboarding_expirer contra Postgres real (issue #519)', () => {
     expect(await eventTypes(terminal)).toHaveLength(0);
   });
 
+  it('duas corridas simultâneas não expiram a mesma run duas vezes (por que não há lock)', async () => {
+    // A justificativa para NÃO acrescentar single-flight, verificada em vez de
+    // afirmada: `expireStale` trava cada run com `SELECT … FOR UPDATE` e
+    // re-valida estado/`expires_at` DEPOIS da trava, então a corrida perdedora
+    // encontra a run já terminal e não escreve nada.
+    const ids = [
+      await seedRun({ tenant_id: 'expirer-race-1', expires_in_ms: -60_000 }),
+      await seedRun({ tenant_id: 'expirer-race-2', expires_in_ms: -60_000 }),
+      await seedRun({ tenant_id: 'expirer-race-3', expires_in_ms: -60_000 }),
+    ];
+
+    const before = await expiredCounter();
+    await Promise.all([tick(), tick()]);
+
+    // 3 runs, 2 corridas: a contagem total continua 3 — sem dobra.
+    expect(await expiredCounter()).toBe(before + 3);
+    for (const id of ids) {
+      const after = await readRun(id);
+      expect(after.state).toBe('cancelled');
+      expect(after.last_error_code).toBe('expired');
+      // Um único UPDATE por run: `version` 1 → 2, e UM evento append-only.
+      expect(after.version).toBe(2);
+      expect(await eventTypes(id)).toEqual(['run_expired']);
+    }
+  });
+
   it('respeita o limite de lote: 3 vencidas, limite 2 ⇒ 2 expiradas neste tick', async () => {
     // Tenants distintos: `onboarding_runs_one_live_per_tenant_uq` só admite uma
     // run viva por tenant.
