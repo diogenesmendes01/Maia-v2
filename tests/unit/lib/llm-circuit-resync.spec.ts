@@ -93,6 +93,8 @@ vi.mock('@/lib/llm/model-resolver.js', () => ({
   invalidateModelCache: invalidateModelCacheMock,
 }));
 
+import { recordCircuitAudit } from '@/lib/llm/circuit-audit.js';
+
 import {
   LLM_SETTINGS_INVALIDATION_CHANNEL,
   _resetLLMSettingsSubscriberForTests,
@@ -336,6 +338,28 @@ describe('kill switch — releitura na reconexão', () => {
 
     expect(effectiveMode()).toBe('off');
     expect(currentOverride()).toEqual(applied);
+  });
+
+  /**
+   * GOVERNANÇA. A releitura não inventa ação nova na taxonomia (o desfecho é o
+   * mesmo de adotar a chave no boot: a postura mudou), mas a PROCEDÊNCIA tem
+   * que sobreviver na trilha durável — é ela que responde "por que a postura
+   * desta réplica mudou às 3h se ninguém digitou nada?".
+   */
+  it('a trilha durável distingue a procedência: `source = resynced`', async () => {
+    const sub = await bootSubscriber();
+    const audit = vi.mocked(recordCircuitAudit);
+    audit.mockClear();
+
+    redisMock.get.mockResolvedValue(overridePayload('off'));
+    await reconnect(sub);
+
+    const call = audit.mock.calls.find(
+      (c) => (c[1] as { source?: string }).source === 'resynced',
+    );
+    expect(call, 'a mudança de postura da releitura não deixou procedência na trilha').toBeTruthy();
+    expect(call![0]).toBe('llm_circuit_mode_override_applied');
+    expect(call![1]).toMatchObject({ mode: 'off', actor: ACTOR });
   });
 
   it('flapping: cada volta do socket produz UMA releitura, em série', async () => {
