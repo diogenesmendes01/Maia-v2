@@ -18,7 +18,7 @@
  * participant.
  */
 import { counter, histogram } from './metrics.js';
-import { METRIC, SPAN } from './taxonomy.js';
+import { METRIC, SPAN, type ContextLoadStage } from './taxonomy.js';
 import { withSpan } from './tracer.js';
 import type { SpanAttributes } from './span-attributes.js';
 import {
@@ -128,12 +128,20 @@ export async function instrumentToolDispatch<T>(
 /**
  * Measure one turn-context load.
  *
- * `stage` names the slice being assembled (`working_memory`, `episodic`,
- * `profile`, …) or `packet` for the whole assembly. Bounded by the slice
- * registry, budgeted at 60 distinct values.
+ * `stage` is typed as `ContextLoadStage`, not `string`, and that is the whole
+ * point: the review of PR #554 caught that calling the set "closed" while the
+ * emitting surface accepted any string made the closure a review convention
+ * instead of a contract. Cardinality control that depends on nobody making a
+ * mistake is not control.
+ *
+ * Today the set is `['packet']` — the P8a assembly. The per-slice stages this
+ * comment used to promise (`working_memory`, `episodic`, `profile`, …) had no
+ * emitter, so they are not in the vocabulary; adding one is a deliberate edit
+ * to `CONTEXT_LOAD_STAGE` in the taxonomy, which is exactly the friction that
+ * keeps a metric label bounded.
  */
 export async function instrumentContextLoad<T>(
-  stage: string,
+  stage: ContextLoadStage,
   fn: () => Promise<T>,
 ): Promise<T> {
   const t0 = Date.now();

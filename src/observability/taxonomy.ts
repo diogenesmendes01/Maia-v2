@@ -116,17 +116,25 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
  *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
  *                            `observability/instrumentation.ts`
- *   - `context.load`       → `src/runtime/context-packet/build-context-packet.ts`
- *                            (`stage="packet"`, issue #535 gate 6) via
- *                            `observability/instrumentation.ts`
  *
- * `emitted` means "an instrumentation site exists", which is the only claim
- * this table can make honestly. It is NOT a claim about how often the site
- * runs: `buildContextPacket` is the P8a assembly orchestrator, and PR #406
- * removed the hot path that called it, so `context.load` produces series for
- * every caller of the assembly but not (yet) on the WhatsApp turn. That gap is
- * written down in `docs/architecture/concerns/governance-observability.md` §7
- * rather than hidden behind a flag value that reads as coverage.
+ * `emitted` means "production reaches this span", NOT "an instrumentation site
+ * exists in the tree". The two came apart on `context.load` and the review of
+ * PR #554 settled it in favour of the stricter reading, for the reason that
+ * decides it: this table is read as a coverage answer. A span no production
+ * path reaches produces nothing, and a value that says otherwise turns the
+ * table into the thing it exists to prevent.
+ *
+ * `context.load` is the live example and is deliberately `declared`. Issue #535
+ * gate 6 wired `instrumentContextLoad` into `buildContextPacket`
+ * (`stage="packet"`), so the site is real and test-covered — but
+ * `buildContextPacket` is the P8a assembly orchestrator and PR #406 removed the
+ * `FEATURE_CONTEXT_PACKET_V1` hot path that called it. No turn reaches it. The
+ * turn's own context load is `loadTurnContext`
+ * (`src/agent/turn-context/loader.ts`, issue #525), which emits the SEPARATE
+ * family `maia_turn_context_load_duration_ms`.
+ *
+ * Promoting `context.load` to `emitted` needs a contract decision first — see
+ * `docs/architecture/concerns/governance-observability.md` §7.
  */
 export type SpanEmission = 'emitted' | 'declared';
 
@@ -142,7 +150,7 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.PROCEDURE_SELECT]: 'declared',
   [SPAN.RISK_CLASSIFY]: 'declared',
   [SPAN.DECISION_EVALUATE]: 'declared',
-  [SPAN.CONTEXT_LOAD]: 'emitted',
+  [SPAN.CONTEXT_LOAD]: 'declared',
   [SPAN.PROMPT_RENDER]: 'declared',
   [SPAN.REACT_ITERATION]: 'declared',
   [SPAN.LLM_REQUEST]: 'declared',

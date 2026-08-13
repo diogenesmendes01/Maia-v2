@@ -13,6 +13,7 @@ import {
   instrumentContextLoad,
   instrumentToolDispatch,
 } from '../../../src/observability/instrumentation.js';
+import { CONTEXT_LOAD_STAGE } from '../../../src/observability/taxonomy.js';
 import { _resetForTests, renderPrometheus } from '../../../src/lib/metrics.js';
 import { _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 
@@ -143,16 +144,23 @@ describe('issue #535 — instrumentToolDispatch', () => {
 });
 
 describe('issue #535 — instrumentContextLoad', () => {
+  // Estes casos usavam `working_memory` e `episodic`, que nunca tiveram
+  // emissor e não estão no vocabulário fechado. Um spec que exercita valores
+  // inexistentes documenta uma superfície que não existe — e foi o que deixou
+  // a promessa de fatias viva no comentário por tanto tempo. Agora usam o
+  // único `stage` real, e o compilador recusa os outros.
   it('emits duration and a slice counter on success', async () => {
-    await instrumentContextLoad('working_memory', async () => 'slice');
+    await instrumentContextLoad(CONTEXT_LOAD_STAGE.PACKET, async () => 'slice');
     const metrics = await renderPrometheus();
-    expect(metrics).toMatch(/maia_context_load_ms_count\{.*stage="working_memory".*status="ok"/);
-    expect(metrics).toMatch(/maia_context_slices_total\{.*stage="working_memory".*status="ok"/);
+    expect(metrics).toMatch(/maia_context_load_ms_count\{.*stage="packet".*status="ok"/);
+    expect(metrics).toMatch(/maia_context_slices_total\{.*stage="packet".*status="ok"/);
   });
 
   it('marks a failed slice and rethrows', async () => {
     await expect(
-      instrumentContextLoad('episodic', async () => Promise.reject(new Error('x'))),
+      instrumentContextLoad(CONTEXT_LOAD_STAGE.PACKET, async () =>
+        Promise.reject(new Error('x')),
+      ),
     ).rejects.toThrow('x');
     expect(await renderPrometheus()).toMatch(/maia_context_slices_total\{.*status="error"/);
   });

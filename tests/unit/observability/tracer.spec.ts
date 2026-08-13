@@ -278,7 +278,7 @@ describe('issue #535 — tracer', () => {
       // opens with; shipping an emitter without flipping the flag understates
       // coverage in the runbook.
       expect([...EMITTED_SPANS].sort()).toEqual(
-        [SPAN.CONTEXT_LOAD, SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
+        [SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
       );
     });
 

@@ -581,16 +581,18 @@ Não presuma cobertura que não existe:
 
 - **spans operacionais parciais** — só `turn`, `queue.wait` e `tool.dispatch`
   têm emissor. As outras 20 entradas da taxonomia estão marcadas `declared`;
-- **`context.load` tem call site, mas não no hot path.** O gate 6 da #535
-  instrumentou a montagem do packet
-  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), então
-  `maia_context_load_ms`, `maia_context_slices_total` e o span `context.load`
-  saem da montagem real. O que continua aberto: `buildContextPacket` é o
+- **`context.load` tem call site, mas não no hot path — e por isso continua
+  `declared`.** O gate 6 da #535 instrumentou a montagem do packet
+  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), com
+  teste que cai se alguém apagar a chamada. Mas `buildContextPacket` é o
   orquestrador P8a e a PR #406 removeu o hot path (`FEATURE_CONTEXT_PACKET_V1`)
-  que o chamava; a carga de contexto do turno hoje é `loadTurnContext`
-  (`src/agent/turn-context/loader.ts`, #525) e NÃO está instrumentada. Enquanto
-  isso, o painel `maia:context_load_ms:p95` fica sem série vinda de turno real —
-  ausência esperada, não falha de scrape;
+  que o chamava: **nenhum turno chega lá**. A carga de contexto do turno é
+  `loadTurnContext` (`src/agent/turn-context/loader.ts`, #525), que emite a
+  família SEPARADA `maia_turn_context_load_duration_ms`.
+  A revisão da PR #554 fixou a leitura de `emitted` como "produção alcança",
+  não "existe site no repositório" — então o span fica `declared` até haver
+  decisão de contrato. O painel `maia:context_load_ms:p95` segue sem série
+  vinda de turno real: ausência esperada, não falha de scrape;
 - **só existe `stage="packet"`.** As fatias citadas no comentário de
   `instrumentContextLoad` (`working_memory`, `episodic`, `profile`, …) não têm
   emissor. O vocabulário fechado é `CONTEXT_LOAD_STAGE_VALUES`

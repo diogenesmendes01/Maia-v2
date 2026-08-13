@@ -384,18 +384,24 @@ coverage that does not exist:
   emitters; the other 20 taxonomy entries are marked `declared` in
   `SPAN_EMISSION` and produce nothing. The marking is test-enforced, so this
   list cannot silently go stale.
-- **`context.load` has a call site, but not on the hot path.** Issue #535 gate
-  6 wired `instrumentContextLoad` into the packet assembly
-  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), so
-  `maia_context_load_ms` / `maia_context_slices_total` / the `context.load` span
-  are produced by the real assembly instead of only by a unit test. What is
-  still open: `buildContextPacket` is the P8a orchestrator and PR #406 removed
-  the `FEATURE_CONTEXT_PACKET_V1` hot path that called it, so a WhatsApp turn
-  does not reach that assembly today — the turn's own context load lives in
-  `src/agent/turn-context/loader.ts` (`loadTurnContext`, issue #525) and is NOT
-  instrumented. Until either the assembly path is rewired or the loader gets its
-  own stage, the family has series in tests and in any caller of the assembly,
-  and none from a live turn.
+- **`context.load` has a call site, but not on the hot path — so it stays
+  `declared`.** Issue #535 gate 6 wired `instrumentContextLoad` into the packet
+  assembly (`src/runtime/context-packet/build-context-packet.ts`,
+  `stage="packet"`), with a test that goes red if the call is deleted. But
+  `buildContextPacket` is the P8a orchestrator and PR #406 removed the
+  `FEATURE_CONTEXT_PACKET_V1` hot path that called it, so **no turn reaches it**.
+  The turn's own context load is `loadTurnContext`
+  (`src/agent/turn-context/loader.ts`, issue #525), which emits the SEPARATE
+  family `maia_turn_context_load_duration_ms`.
+
+  The review of PR #554 settled what `emitted` means: "production reaches this
+  span", not "an instrumentation site exists in the tree". Under the looser
+  reading this table would have answered "covered" about a span that produces
+  nothing — which is the failure the table exists to prevent. Promoting it needs
+  a contract decision first: either instrument the active path without
+  duplicating the family #525 already ships (integrate only the span, or
+  consolidate the families), or retire the orphan family together with the P8a
+  path that justified it.
 - **Only `stage="packet"` exists.** The per-slice stages named in
   `instrumentContextLoad`'s doc comment (`working_memory`, `episodic`,
   `profile`, …) have no emitter. `CONTEXT_LOAD_STAGE_VALUES` in `taxonomy.ts` is
