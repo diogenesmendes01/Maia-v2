@@ -62,6 +62,8 @@ function tickWithLimit(limit: number): Promise<void> {
 let pool: pg.Pool;
 let lockClient: pg.PoolClient | null = null;
 const createdRuns: string[] = [];
+/** Tenants criados só para provar a atribuição da auditoria. */
+const seededTenants: string[] = [];
 
 type SeedRun = {
   tenant_id?: string | null;
@@ -103,6 +105,31 @@ async function readRun(id: string): Promise<{
   return rows[0];
 }
 
+/**
+ * Trilha administrativa da run. `admin_audit_log` é onde a saga inteira audita
+ * (o evento append-only NÃO substitui auditoria — ver o cabeçalho de
+ * `src/db/repositories/onboarding-repos.ts`).
+ */
+async function auditRows(run_id: string): Promise<
+  Array<{
+    tenant_id: string;
+    actor_id: string;
+    actor_role: string;
+    action: string;
+    resource_type: string;
+    change_summary: Record<string, unknown>;
+  }>
+> {
+  const { rows } = await pool.query(
+    `SELECT tenant_id, actor_id, actor_role, action, resource_type, change_summary
+       FROM admin_audit_log
+      WHERE resource_type='onboarding_run' AND resource_id=$1
+      ORDER BY id`,
+    [run_id],
+  );
+  return rows;
+}
+
 async function eventTypes(run_id: string): Promise<string[]> {
   const { rows } = await pool.query(
     'SELECT event_type FROM onboarding_events WHERE run_id=$1 ORDER BY created_at',
@@ -139,7 +166,14 @@ afterAll(async () => {
   if (!SHOULD_RUN) return;
   for (const id of createdRuns) {
     await pool.query('DELETE FROM onboarding_events WHERE run_id=$1', [id]);
+    await pool.query(
+      "DELETE FROM admin_audit_log WHERE resource_type='onboarding_run' AND resource_id=$1",
+      [id],
+    );
     await pool.query('DELETE FROM onboarding_runs WHERE id=$1', [id]);
+  }
+  for (const t of seededTenants) {
+    await pool.query('DELETE FROM tenants WHERE id=$1', [t]).catch(() => undefined);
   }
   if (lockClient) {
     await lockClient.query(`SELECT pg_advisory_unlock(${LOCK_KEY})`).catch(() => undefined);
@@ -154,6 +188,10 @@ d('worker onboarding_expirer contra Postgres real (issue #519)', () => {
     // Cada caso parte de um banco sem candidatas de casos anteriores.
     for (const id of createdRuns) {
       await pool.query('DELETE FROM onboarding_events WHERE run_id=$1', [id]);
+      await pool.query(
+        "DELETE FROM admin_audit_log WHERE resource_type='onboarding_run' AND resource_id=$1",
+        [id],
+      );
       await pool.query('DELETE FROM onboarding_runs WHERE id=$1', [id]);
     }
     createdRuns.length = 0;
@@ -172,6 +210,100 @@ d('worker onboarding_expirer contra Postgres real (issue #519)', () => {
     expect(after.version).toBe(2);
     // Nunca apagada — a trilha append-only continua diagnosticável.
     expect(await eventTypes(stale)).toContain('run_expired');
+  });
+
+  it('grava EVENTO e AUDITORIA na expiração (invariante MUST nº 4)', async () => {
+    // A run tem tenant real: a auditoria vai para o tenant dela.
+    await pool.query(
+      `INSERT INTO tenants (id, nome, status) VALUES ('expirer-audit', 'Expirer Audit', 'active')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    seededTenants.push('expirer-audit');
+    const stale = await seedRun({ tenant_id: 'expirer-audit', expires_in_ms: -60_000 });
+
+    await tick();
+
+    // O evento append-only continua lá…
+    expect(await eventTypes(stale)).toEqual(['run_expired']);
+    // …e NÃO substitui a trilha de governança.
+    const audit = await auditRows(stale);
+    expect(audit).toHaveLength(1);
+    expect(audit[0].actor_id).toBe('system');
+    expect(audit[0].actor_role).toBe('system');
+    // MESMA ação do cancelamento operado pelo console: quem consulta "runs
+    // canceladas" faz UMA consulta; o `reason_code` separa os dois casos.
+    expect(audit[0].action).toBe('onboarding_run_cancelled');
+    expect(audit[0].tenant_id).toBe('expirer-audit');
+    expect(audit[0].change_summary).toMatchObject({
+      run_id: stale,
+      from_state: 'created',
+      reason_code: 'expired',
+      target_tenant_id: 'expirer-audit',
+      swept_by: 'onboarding_expirer',
+    });
+    // A regra aplicada precisa estar registrada com o dado a que foi aplicada.
+    expect(audit[0].change_summary.expires_at).toEqual(expect.any(String));
+  });
+
+  it('audita também a run de bootstrap, que ainda não tem tenant', async () => {
+    // `tenant_id IS NULL`: `admin_audit_log.tenant_id` é FK NOT NULL para
+    // `tenants`, então a linha vai para o bucket sancionado `system` com o
+    // alvo preservado em `change_summary` — nunca um literal 'default'.
+    const stale = await seedRun({ expires_in_ms: -60_000 });
+
+    await tick();
+
+    const audit = await auditRows(stale);
+    expect(audit).toHaveLength(1);
+    expect(audit[0].tenant_id).toBe('system');
+    expect(audit[0].actor_id).toBe('system');
+    expect(audit[0].change_summary).toMatchObject({
+      reason_code: 'expired',
+      target_tenant_id: null,
+      target_agent_id: null,
+    });
+    expect(JSON.stringify(audit[0].change_summary)).not.toContain('default');
+  });
+
+  it('auditoria, evento e UPDATE são a MESMA transação (mesmo xmin)', async () => {
+    // Prova direta, sem injetar falha em código de produção: no Postgres, o
+    // `xmin` de uma linha É o id da transação que a escreveu. Se as três
+    // escritas saem do mesmo `withTx`, os três `xmin` são idênticos; se a
+    // auditoria escapar para fora da transação (um `db.insert` no lugar do
+    // `tx.insert`), o dela passa a ser outro — e a trilha sobrevive a um
+    // rollback do UPDATE, que é exatamente o defeito.
+    const stale = await seedRun({ tenant_id: 'expirer-xmin', expires_in_ms: -60_000 });
+
+    await tick();
+
+    const { rows } = await pool.query(
+      `SELECT (SELECT xmin::text FROM onboarding_runs WHERE id=$1::uuid) AS run_xmin,
+              (SELECT xmin::text FROM onboarding_events WHERE run_id=$1::uuid) AS event_xmin,
+              (SELECT xmin::text FROM admin_audit_log
+                WHERE resource_type='onboarding_run' AND resource_id=$1::text) AS audit_xmin`,
+      [stale],
+    );
+    const { run_xmin, event_xmin, audit_xmin } = rows[0];
+    expect(run_xmin).toBeTruthy();
+    expect(event_xmin).toBe(run_xmin);
+    expect(audit_xmin).toBe(run_xmin);
+  });
+
+  it('run viva não gera nem evento nem auditoria', async () => {
+    const ids = [
+      await seedRun({ tenant_id: 'expirer-atomic-1', expires_in_ms: -60_000 }),
+      await seedRun({ tenant_id: 'expirer-atomic-2', expires_in_ms: -60_000 }),
+      await seedRun({ tenant_id: 'expirer-atomic-3', expires_in_ms: 60 * 60_000 }),
+    ];
+
+    await tick();
+
+    const states = await Promise.all(ids.map(readRun));
+    const audits = await Promise.all(ids.map(auditRows));
+    expect(states.map((s) => s.state)).toEqual(['cancelled', 'cancelled', 'created']);
+    // Uma linha de auditoria por run EXPIRADA, nenhuma para a que sobreviveu.
+    expect(audits.map((a) => a.length)).toEqual([1, 1, 0]);
+    expect(await eventTypes(ids[2])).toHaveLength(0);
   });
 
   it('preserva a run que ainda NÃO venceu', async () => {
