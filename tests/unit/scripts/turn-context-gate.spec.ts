@@ -25,8 +25,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  BASELINE_SCHEMA_VERSION,
   CARDINALITIES,
   applyInjection,
+  checkBaselineCompatibility,
+  createPoolSaturationTracker,
   evaluateGate,
   gateExitCode,
   gateMakespan,
@@ -34,9 +37,14 @@ import {
   mergeTwoPairs,
   parseArgs,
   percentile,
+  poolMetricsFromSummary,
+  runFingerprint,
+  startPoolSampler,
   syntheticPassingArm,
   type ArmResult,
   type BaselineFile,
+  type RunFingerprint,
+  type RunMode,
   type Thresholds,
 } from '../../../scripts/turn-context-benchmark.js';
 
@@ -50,7 +58,51 @@ const TH: Thresholds = {
   baseline_tolerance: 0.2,
   pairs: 50,
   concurrency: 20,
+  sample_gap_factor: 10,
 };
+
+/** A forma da corrida canônica — a mesma que o `--sustain-s 60` do runbook produz. */
+const FP: RunFingerprint = {
+  pairs: 50,
+  concurrency: 20,
+  think_ms: 150,
+  identity: 'profile',
+  cardinalities: [1, 10, 100],
+  pool_max: 10,
+  max_concurrent_reads: 6,
+};
+
+/**
+ * Um baseline COMPARÁVEL com folga, para que os testes de outros critérios não
+ * fiquem falhando pelo critério relativo. Cada teste que fala DE baseline monta
+ * o seu.
+ */
+function baselineWith(p95: number, fingerprint: RunFingerprint = FP): BaselineFile {
+  return {
+    schema_version: BASELINE_SCHEMA_VERSION,
+    recorded_at: '2026-08-10T00:00:00.000Z',
+    recorded_by: 'spec',
+    host: 'spec',
+    note: 'fixture',
+    fingerprint,
+    context: {
+      turns: 600,
+      sustain_s: 60,
+      timeout_ms: 5_000,
+      sample_ms: 100,
+      node: '22.0.0',
+      platform: 'linux',
+      mode: 'measure',
+    },
+    arms: {
+      cold: { p95_ms: p95, p99_ms: p95 * 2, turns: 600, wall_ms: 61_000 },
+      warm: { p95_ms: p95, p99_ms: p95 * 2, turns: 600, wall_ms: 61_000 },
+    },
+  };
+}
+
+/** Baseline folgado: 40 ms medidos contra 1000 ms de referência nunca reprovam. */
+const BASELINE_FOLGADO = baselineWith(1_000);
 
 function armsWith(inject: Record<string, number>): ArmResult[] {
   const arms = [syntheticPassingArm('cold', TH), syntheticPassingArm('warm', TH)];
@@ -58,10 +110,18 @@ function armsWith(inject: Record<string, number>): ArmResult[] {
   return arms;
 }
 
-function run(inject: Record<string, number>, baseline: BaselineFile | null = null) {
+function run(
+  inject: Record<string, number>,
+  baseline: BaselineFile | null = BASELINE_FOLGADO,
+  mode: RunMode = 'gate',
+) {
   const arms = armsWith(inject);
-  const verdicts = evaluateGate(arms, TH, baseline);
-  return { verdicts, code: gateExitCode(verdicts), failed: verdicts.filter((v) => !v.passed) };
+  const verdicts = evaluateGate(arms, TH, baseline, { mode, fingerprint: FP });
+  return {
+    verdicts,
+    code: gateExitCode(verdicts, mode),
+    failed: verdicts.filter((v) => !v.passed),
+  };
 }
 
 describe('#525 — o gate do benchmark de carga de contexto', () => {
@@ -168,15 +228,48 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     expect(failed.some((v) => v.label.includes('o pool drena'))).toBe(true);
   });
 
-  it('marca a saturação como NÃO AVALIADA numa corrida curta e saudável, sem reprovar', () => {
-    const { code, verdicts } = run({ wall_ms: 5_000, pool_saturation_max_streak_ms: 300 });
-    const v = verdicts.find((x) => x.label.includes('o pool drena'))!;
+  it('numa corrida curta e saudável a saturação sai NÃO AVALIADA — e em modo gate isso REPROVA', () => {
+    // Não avaliado ≠ aprovado. A janela de 60 s é o que torna o critério
+    // falsificável; uma corrida de 5 s não a observou, então o gate não tem a
+    // evidência que promete e não pode sair verde.
+    const gate = run({ wall_ms: 5_000, pool_saturation_max_streak_ms: 300 });
+    const v = gate.verdicts.find((x) => x.label.includes('o pool drena'))!;
     expect(v.skipped).toBe(true);
-    expect(v.passed).toBe(true);
+    expect(v.passed).toBe(false);
     expect(v.detail).toContain('não observada');
-    // Não avaliado ≠ reprovado: o gate segue verde, mas o relatório diz que
-    // aquele critério não foi testado, em vez de carimbá-lo.
-    expect(code).toBe(0);
+    expect(gate.code).toBe(1);
+
+    // Em modo `measure` o mesmo critério é informativo: ali não há veredicto de
+    // gate para ficar verde.
+    const medicao = run(
+      { wall_ms: 5_000, pool_saturation_max_streak_ms: 300 },
+      BASELINE_FOLGADO,
+      'measure',
+    );
+    expect(medicao.verdicts.find((x) => x.label.includes('o pool drena'))!.skipped).toBe(true);
+    expect(medicao.code).toBe(0);
+  });
+
+  it('INVARIANTE: nenhum veredicto sai "não avaliado" e "aprovado" ao mesmo tempo', () => {
+    // Era esta igualdade — `skipped: true, passed: true` — que deixava o
+    // veredicto final verde sem a evidência prometida, nos DOIS critérios que a
+    // review apontou (baseline ausente e janela de saturação não observada).
+    const casos: Array<Record<string, number>> = [
+      {},
+      { wall_ms: 5_000 },
+      { pool_samples: 0, pool_saturated_samples: 0 },
+      { pool_saturation_max_streak_ms: 61_000 },
+    ];
+    for (const caso of casos) {
+      for (const baseline of [null, BASELINE_FOLGADO]) {
+        for (const v of run(caso, baseline).verdicts) {
+          if (v.skipped) expect({ label: v.label, passed: v.passed }).toEqual({
+            label: v.label,
+            passed: false,
+          });
+        }
+      }
+    }
   });
 
   it('REPROVA quando a métrica do aceite não observou todos os turnos', () => {
@@ -200,21 +293,45 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
   // -------------------------------------------------------------------------
 
   describe('comparação contra baseline', () => {
-    const baseline = (p95: number): BaselineFile => ({
-      recorded_at: '2026-08-10T00:00:00.000Z',
-      recorded_by: 'spec',
-      host: 'spec',
-      note: 'fixture',
-      options: { pairs: 50, concurrency: 20, turns: 600, identity: 'profile' },
-      arms: { cold: { p95_ms: p95, p99_ms: p95 * 2 }, warm: { p95_ms: p95, p99_ms: p95 * 2 } },
-    });
+    const baseline = baselineWith;
 
-    it('sem baseline registrado o critério sai como NÃO AVALIADO — e diz isso com todas as letras', () => {
-      const { verdicts, code } = run({}, null);
+    it('SEM baseline, o modo gate REPROVA — um checkout limpo não sai verde', () => {
+      // O achado: sem baseline o critério obrigatório saía `passed: true`, e
+      // como o exit code só olhava `passed`, todo checkout limpo saía 0 sem ter
+      // avaliado o critério. O estado "não tenho a referência" era o estado
+      // GARANTIDO de qualquer máquina nova, porque o arquivo não é versionado.
+      const { verdicts, code, failed } = run({}, null);
       const v = verdicts.find((x) => x.label.includes('baseline'))!;
       expect(v.skipped).toBe(true);
-      expect(v.passed).toBe(true);
+      expect(v.passed).toBe(false);
       expect(v.detail).toContain('NÃO HÁ BASELINE REGISTRADO');
+      // …e diz COMO sair desse estado, sem sugerir que uma corrida de gate grave.
+      expect(v.detail).toContain('--mode measure');
+      expect(v.detail).toContain('--write-baseline');
+      expect(code).toBe(1);
+      expect(failed.map((x) => x.label)).toEqual([
+        expect.stringContaining('[cold] p95 ≤ baseline + 20%'),
+        expect.stringContaining('[warm] p95 ≤ baseline + 20%'),
+      ]);
+    });
+
+    it('SEM baseline, o modo measure não reprova — mas também não se apresenta como gate', () => {
+      // O opt-out explícito que o dono admitiu: medir sem baseline é legítimo,
+      // desde que a corrida NÃO se apresente como gate. O critério continua
+      // marcado como não avaliado; o que muda é que ali não há veredicto.
+      const { verdicts, code } = run({}, null, 'measure');
+      const v = verdicts.find((x) => x.label.includes('baseline'))!;
+      expect(v.skipped).toBe(true);
+      expect(v.passed).toBe(false);
+      expect(code).toBe(0);
+    });
+
+    it('o baseline não é o único critério: um p95 estourado em modo measure segue sem veredicto', () => {
+      // O preço do opt-out, explícito: `measure` sai 0 mesmo com critério
+      // vermelho. É por isso que o relatório dele carrega a tarja "NÃO É O
+      // GATE" e o modo default é `gate`.
+      const { code, failed } = run({ p95_ms: 900 }, BASELINE_FOLGADO, 'measure');
+      expect(failed.length).toBeGreaterThan(0);
       expect(code).toBe(0);
     });
 
@@ -234,6 +351,253 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       const { code, failed } = run({ p95_ms: 60 }, baseline(40));
       expect(code).toBe(1);
       expect(failed.every((v) => v.label.includes('baseline'))).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // O fingerprint da carga: comparar dois p95 medidos com cargas diferentes é
+  // comparar duas coisas diferentes
+  // -------------------------------------------------------------------------
+
+  describe('fingerprint da carga (o baseline precisa medir a MESMA corrida)', () => {
+    it('RECUSA a comparação quando o baseline foi medido com outro --think-ms', () => {
+      // Não é hipotético: nesta PR o `--think-ms` sozinho move o p95 de 28,8 ms
+      // (150) para 187,7 ms (0). Comparar através dessa diferença produz falso
+      // verde ou falso vermelho por mudança de CARGA, não de código.
+      const outraCarga = baselineWith(40, { ...FP, think_ms: 0 });
+      const { code, verdicts } = run({}, outraCarga);
+      const v = verdicts.find((x) => x.label.includes('baseline'))!;
+      expect(v.skipped).toBe(true);
+      expect(v.passed).toBe(false);
+      expect(v.detail).toContain('BASELINE MEDIDO COM OUTRA CARGA');
+      expect(v.detail).toContain('think_ms: baseline=0 · agora=150');
+      expect(code).toBe(1);
+    });
+
+    it('RECUSA — não apenas avisa — cada campo que muda o número medido', () => {
+      const divergencias: Array<[Partial<RunFingerprint>, string]> = [
+        [{ pairs: 10 }, 'pairs'],
+        [{ concurrency: 4 }, 'concurrency'],
+        [{ think_ms: 0 }, 'think_ms'],
+        [{ identity: 'legacy' }, 'identity'],
+        [{ cardinalities: [1, 10] }, 'cardinalities'],
+        [{ pool_max: 20 }, 'pool_max'],
+        [{ max_concurrent_reads: 8 }, 'max_concurrent_reads'],
+      ];
+      for (const [patch, campo] of divergencias) {
+        const compat = checkBaselineCompatibility(baselineWith(40, { ...FP, ...patch }), FP);
+        expect({ campo, status: compat.status }).toEqual({ campo, status: 'incompatible' });
+        expect(compat.diffs.join(' ')).toContain(campo);
+        // E o efeito é REPROVAR o critério, não decorar o relatório.
+        expect(run({}, baselineWith(40, { ...FP, ...patch })).code).toBe(1);
+      }
+    });
+
+    it('NÃO invalida o baseline por coisa que não muda o número medido', () => {
+      // O outro extremo do erro: um fingerprint barulhento invalida o baseline
+      // a cada corrida e o operador aprende a ignorá-lo. Host, versão de Node,
+      // duração da corrida, timeout e período de amostragem NÃO entram no p95
+      // do turno — ficam registrados, não comparados.
+      const mesmoNumeroOutroContexto = baselineWith(1_000);
+      mesmoNumeroOutroContexto.host = 'outra-maquina-completamente-diferente';
+      mesmoNumeroOutroContexto.context = {
+        turns: 5_000,
+        sustain_s: 300,
+        timeout_ms: 60_000,
+        sample_ms: 250,
+        node: '24.9.9',
+        platform: 'darwin',
+        mode: 'gate',
+      };
+      expect(checkBaselineCompatibility(mesmoNumeroOutroContexto, FP).status).toBe('ok');
+      expect(run({}, mesmoNumeroOutroContexto).code).toBe(0);
+    });
+
+    it('RECUSA um baseline no formato antigo, que não prova com que carga foi medido', () => {
+      // Aceitar o formato sem fingerprint em silêncio reabriria o buraco: o
+      // arquivo antigo gravava `pairs/concurrency/turns/identity` e ninguém
+      // olhava — e nem gravava `think_ms`, que é o campo que mais move o p95.
+      const antigo = {
+        recorded_at: '2026-08-10T00:00:00.000Z',
+        recorded_by: 'spec',
+        host: 'spec',
+        note: 'formato v1',
+        options: { pairs: 50, concurrency: 20, turns: 600, identity: 'profile' },
+        arms: { cold: { p95_ms: 40, p99_ms: 80 }, warm: { p95_ms: 40, p99_ms: 80 } },
+      } as unknown as BaselineFile;
+      const compat = checkBaselineCompatibility(antigo, FP);
+      expect(compat.status).toBe('legacy_schema');
+      const { code, verdicts } = run({}, antigo);
+      expect(verdicts.find((x) => x.label.includes('baseline'))!.detail).toContain(
+        'BASELINE EM FORMATO ANTIGO',
+      );
+      expect(code).toBe(1);
+    });
+
+    it('RECUSA quando o baseline não tem o braço que está sendo medido', () => {
+      const soCold = baselineWith(1_000);
+      delete soCold.arms.warm;
+      const { code, verdicts } = run({}, soCold);
+      const warm = verdicts.find((x) => x.label.includes('[warm] p95 ≤ baseline'))!;
+      expect(warm.skipped).toBe(true);
+      expect(warm.passed).toBe(false);
+      expect(verdicts.find((x) => x.label.includes('[cold] p95 ≤ baseline'))!.passed).toBe(true);
+      expect(code).toBe(1);
+    });
+
+    it('o fingerprint lê o pool e o teto de leituras do AMBIENTE, não de literais', () => {
+      // Mesmo motivo do teto de 6 vir do código: um fingerprint que digitasse
+      // `pool_max: 10` concordaria consigo mesmo no dia em que alguém subisse o
+      // pool para 20 — que é o dia em que o baseline deixa de valer.
+      const fp = runFingerprint(
+        { pairs: 50, concurrency: 20, think_ms: 150, identity: 'profile' },
+        8,
+        20,
+      );
+      expect(fp.max_concurrent_reads).toBe(8);
+      expect(fp.pool_max).toBe(20);
+      expect(fp.cardinalities).toEqual([...CARDINALITIES]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Amostragem do pool: zero amostras NÃO é "drenou"
+  // -------------------------------------------------------------------------
+
+  describe('amostragem do pool', () => {
+    it('REPROVA com zero amostras — nenhuma observação não é uma observação boa', () => {
+      // O achado: `pool_samples === 0` era tratado como "drenou". Uma corrida
+      // com `--sample-ms` maior que a duração, ou com o event loop impedindo o
+      // amostrador de rodar, passava num dos critérios centrais do gate sem
+      // observação alguma.
+      // A ÚNICA coisa fora do lugar é a contagem de amostras: a lacuna cega
+      // segue no valor de uma corrida sadia. Injetar também uma lacuna enorme
+      // faria o teste passar por outro motivo e deixaria o defeito coberto por
+      // acidente — foi o que aconteceu na primeira versão deste caso.
+      const { code, verdicts, failed } = run({
+        pool_samples: 0,
+        pool_saturated_samples: 0,
+        pool_sampled_span_ms: 0,
+      });
+      expect(code).toBe(1);
+      const cobertura = failed.find((v) => v.label.includes('a amostragem do pool observou'))!;
+      expect(cobertura).toBeDefined();
+      expect(cobertura.detail).toContain('NENHUMA AMOSTRA DO POOL');
+      // E o critério que dependia dessa observação NÃO pode sair aprovado.
+      const drena = verdicts.find((v) => v.label.includes('o pool drena'))!;
+      expect(drena.passed).toBe(false);
+      expect(drena.detail).toContain('SEM AMOSTRAGEM VÁLIDA DO POOL');
+    });
+
+    it('REPROVA quando o amostrador ficou cego por uma lacuna grande', () => {
+      // 610 amostras num período de 100 ms, mas 6 s sem nenhuma no meio: houve
+      // 6 s de corrida sobre os quais o critério de saturação nada sabe.
+      const { code, failed } = run({ pool_max_sample_gap_ms: 6_000 });
+      expect(code).toBe(1);
+      expect(failed.some((v) => v.label.includes('a amostragem do pool observou'))).toBe(true);
+    });
+
+    it('a maior sequência saturada é medida por TIMESTAMPS, não somando períodos', () => {
+      // O acumulador antigo (`streak += periodMs`) contava períodos PEDIDOS.
+      // Quando o event loop atrasa — que é exatamente quando a máquina está sob
+      // a carga que interessa medir — ele conta muito menos tempo do que
+      // passou, e uma saturação de 60 s aparece como 1 s.
+      const t = createPoolSaturationTracker(0);
+      // Amostrador pedido a cada 100 ms, mas STARVED: 10 amostras em 61 s.
+      for (let i = 1; i <= 10; i++) t.observe(i * 6_100, true);
+      const s = t.summary(61_000);
+      expect(s.samples).toBe(10);
+      expect(s.saturated_samples).toBe(10);
+      // Somando períodos daria 1 000 ms; o relógio diz 61 000 ms.
+      expect(s.max_streak_ms).toBe(61_000);
+      expect(s.max_gap_ms).toBe(6_100);
+    });
+
+    it('a sequência começa no último instante em que se SABE que o pool drenou', () => {
+      const t = createPoolSaturationTracker(0);
+      t.observe(100, false); // drenado
+      t.observe(200, true);
+      t.observe(300, true);
+      t.observe(400, false); // drenou de novo
+      t.observe(500, true);
+      const s = t.summary(500);
+      // A maior sequência vai de 100 (última drenada) a 300: 200 ms. Erra para
+      // MAIS em até um período, que é a direção segura para este critério.
+      expect(s.max_streak_ms).toBe(200);
+      expect(s.saturated_samples).toBe(3);
+      expect(s.samples).toBe(5);
+    });
+
+    it('sem observação alguma, a lacuna cega é a corrida INTEIRA', () => {
+      const s = createPoolSaturationTracker(0).summary(61_000);
+      expect(s).toEqual({
+        samples: 0,
+        saturated_samples: 0,
+        max_streak_ms: 0,
+        sampled_span_ms: 0,
+        max_gap_ms: 61_000,
+      });
+    });
+
+    it('a lacuna cega inclui as PONTAS — um amostrador que morreu no meio se denuncia', () => {
+      const t = createPoolSaturationTracker(0);
+      t.observe(100, false);
+      t.observe(200, false);
+      const s = t.summary(30_000); // morreu aos 200 ms de uma corrida de 30 s
+      expect(s.sampled_span_ms).toBe(100);
+      expect(s.max_gap_ms).toBe(29_800);
+    });
+
+    // -----------------------------------------------------------------------
+    // A FRONTEIRA: não basta o avaliador saber. Se `runArm` continuar
+    // publicando `pool_samples: 0` como se fosse observação, o spec passa e a
+    // corrida real segue mentindo.
+    // -----------------------------------------------------------------------
+
+    it('o que o amostrador REAL produz atravessa até o veredicto', async () => {
+      // Um pool de mentira, mas o amostrador de verdade — o mesmo
+      // `startPoolSampler` que `runArm` usa — com período MAIOR que a duração
+      // da corrida: o caso que produzia 0/0 amostras e "drenou".
+      const poolStub = {
+        options: { max: 10 },
+        waitingCount: 0,
+        totalCount: 10,
+        idleCount: 0,
+      } as unknown as Parameters<typeof startPoolSampler>[0];
+
+      const t0 = performance.now();
+      const sampler = startPoolSampler(poolStub, 5_000, t0);
+      await new Promise((r) => setTimeout(r, 30));
+      const metrics = poolMetricsFromSummary(sampler.stop(performance.now()), 5_000);
+
+      expect(metrics.pool_samples).toBe(0);
+      expect(metrics.pool_sample_ms).toBe(5_000);
+      expect(metrics.pool_max_sample_gap_ms).toBeGreaterThan(0);
+
+      // E o veredicto, alimentado com o que o amostrador REALMENTE produziu:
+      const arms = armsWith({});
+      for (const a of arms) Object.assign(a, metrics);
+      const verdicts = evaluateGate(arms, TH, BASELINE_FOLGADO, { mode: 'gate', fingerprint: FP });
+      expect(gateExitCode(verdicts, 'gate')).toBe(1);
+      expect(
+        verdicts.filter((v) => !v.passed).some((v) => v.label.includes('a amostragem do pool')),
+      ).toBe(true);
+    });
+
+    it('o amostrador real conta amostras e saturação quando o período cabe na corrida', async () => {
+      const poolStub = {
+        options: { max: 10 },
+        waitingCount: 3,
+        totalCount: 10,
+        idleCount: 0,
+      } as unknown as Parameters<typeof startPoolSampler>[0];
+      const t0 = performance.now();
+      const sampler = startPoolSampler(poolStub, 5, t0);
+      await new Promise((r) => setTimeout(r, 120));
+      const m = poolMetricsFromSummary(sampler.stop(performance.now()), 5);
+      expect(m.pool_samples).toBeGreaterThan(5);
+      expect(m.pool_saturated_samples).toBe(m.pool_samples);
+      expect(m.pool_sampled_span_ms).toBeGreaterThan(0);
     });
   });
 
@@ -271,6 +635,50 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
   // -------------------------------------------------------------------------
   // A forma da carga exigida NÃO pode vir das flags
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Modo: medir e barrar são coisas diferentes, e o comando tem que dizer qual
+  // -------------------------------------------------------------------------
+
+  describe('--mode', () => {
+    it('o default é `gate` — esquecer a flag produz o julgamento ESTRITO', () => {
+      expect(parseArgs([], 6).mode).toBe('gate');
+      expect(parseArgs(['--mode', 'measure'], 6).mode).toBe('measure');
+      expect(parseArgs(['--self-test'], 6).mode).toBe('self-test');
+      expect(() => parseArgs(['--mode', 'quase-gate'], 6)).toThrow(/--mode inválido/);
+      expect(() => parseArgs(['--self-test', '--mode', 'gate'], 6)).toThrow(/conflita/);
+    });
+
+    it('--write-baseline EXIGE --mode measure: gravar baseline não é rodar o gate', () => {
+      // Sem isto, a mesma corrida que julga produz a referência contra a qual
+      // ela seria julgada — e "medição absoluta" e "gate" voltam a ser a mesma
+      // saída, que é a origem do achado.
+      expect(() => parseArgs(['--write-baseline'], 6)).toThrow(/--mode measure/);
+      expect(() => parseArgs(['--write-baseline', '--sustain-s', '60'], 6)).toThrow(/--mode measure/);
+      expect(parseArgs(['--mode', 'measure', '--write-baseline'], 6).write_baseline).toBe(true);
+    });
+
+    it('--sample-ms é validado contra a JANELA que ele precisa resolver', () => {
+      // Um período maior que a janela devolve zero amostras — e zero amostras
+      // era lido como "o pool drenou".
+      expect(() => parseArgs(['--sample-ms', '10000'], 6)).toThrow(/janela de saturação/);
+      expect(() => parseArgs(['--sample-ms', '0'], 6)).toThrow(/inteiro ≥ 1/);
+      expect(() => parseArgs(['--sample-ms', '2000', '--sustain-s', '10'], 6)).toThrow(
+        /não resolve uma corrida de 10s/,
+      );
+      expect(parseArgs(['--sample-ms', '100', '--sustain-s', '60'], 6).sample_ms).toBe(100);
+    });
+
+    it('--self-test-baseline só existe dentro do autoteste', () => {
+      expect(() => parseArgs(['--self-test-baseline', 'missing'], 6)).toThrow(/--self-test/);
+      expect(() => parseArgs(['--self-test', '--self-test-baseline', 'nada'], 6)).toThrow(
+        /--self-test-baseline inválido/,
+      );
+      expect(parseArgs(['--self-test', '--self-test-baseline', 'missing'], 6).self_test_baseline).toBe(
+        'missing',
+      );
+    });
+  });
 
   it('os requisitos de forma vêm do enunciado, não de --pairs/--concurrency', () => {
     // Derivar o critério da flag o tornaria circular: `--pairs 4` aprovaria uma

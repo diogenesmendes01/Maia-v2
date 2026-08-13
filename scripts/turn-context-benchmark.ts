@@ -81,19 +81,48 @@
  * válido — é o perfil de ESTRESSE, e o relatório o traz — mas ali esse
  * veredicto sai vermelho por construção.
  *
+ * ## Medir e barrar são coisas diferentes (`--mode`)
+ *
+ * Este harness faz as duas, e misturá-las produziu o defeito que a review do
+ * dono apontou: sem baseline registrado — o estado GARANTIDO de todo checkout
+ * limpo, já que o arquivo não é versionado — o critério obrigatório saía
+ * `passed: true` e a corrida saía com exit 0. O operador lia "gate passou" onde
+ * o gate não tinha avaliado um dos seus critérios.
+ *
+ * O modo é declarado, não deduzido de uma flag no meio do comando:
+ *
+ * | `--mode` | o que é | exit code |
+ * |---|---|---|
+ * | `gate` (default) | o veredicto. Um critério NÃO AVALIADO reprova | 0 · 1 · 2 |
+ * | `measure` | medição absoluta. NÃO emite veredicto de gate, e o relatório diz isso em caixa alta | 0 · 2 |
+ * | `self-test` | prova que o gate reprova, sobre valores sintéticos | como `gate` |
+ *
+ * Um critério que não pôde ser avaliado sai como `n/a` e, em modo `gate`,
+ * REPROVA: `Verdict.skipped === true` implica `Verdict.passed === false`. Um
+ * gate sem a evidência que promete não é um gate.
+ *
  * ## Veredicto legível por máquina
  *
- * Exit code 0 = gate passou; 1 = reprovou; 2 = erro de uso/infra. A tabela de
- * veredictos sai em markdown (ou `--json`) com o número medido ao lado do
- * limite, para que a reprovação diga QUAL critério caiu e por quanto.
+ * Exit code 0 = gate passou; 1 = reprovou (inclui "não avaliado"); 2 = erro de
+ * uso/infra. A tabela de veredictos sai em markdown (ou `--json`) com o número
+ * medido ao lado do limite, para que a reprovação diga QUAL critério caiu e por
+ * quanto.
  *
  * ## Baseline
  *
- * `scripts/turn-context-baseline.json` guarda o p95 por braço. Não havendo
- * arquivo, o harness DIZ que não há baseline registrado, reporta o critério
- * relativo como `n/a` e grava a corrida atual como baseline inicial quando
- * chamado com `--write-baseline`. Uma corrida de gate NUNCA grava baseline
- * sozinha: baseline é decisão, não efeito colateral.
+ * `scripts/turn-context-baseline.json` guarda o p95 por braço E o FINGERPRINT
+ * da carga que o produziu. Não havendo arquivo — ou tendo ele sido medido com
+ * outra forma de carga — a comparação é RECUSADA, o critério relativo sai como
+ * `n/a` e o modo `gate` reprova. Gravar é uma decisão explícita e um modo
+ * explícito: `--write-baseline` exige `--mode measure`. Uma corrida de gate
+ * NUNCA grava baseline sozinha, e uma corrida que grava não se apresenta como
+ * gate.
+ *
+ * O fingerprint existe porque o próprio corpo desta PR mostra `--think-ms`
+ * movendo o p95 de 28,8 ms para 187,7 ms: comparar através dessa diferença
+ * produz falso verde ou falso vermelho por mudança de CARGA, não de código. Os
+ * campos comparados, e os deliberadamente deixados de fora, estão documentados
+ * um a um em `RunFingerprint`.
  *
  * O arquivo NÃO é versionado (`.gitignore`). Ele mede uma máquina num momento:
  * o mesmo código, no mesmo host de 4 vCPU, mediu p95 67,0 ms num contêiner e
@@ -102,11 +131,12 @@
  *
  * ## Uso
  *
- *   npm run turn:bench                       # medição completa (cold + warm)
- *   npm run turn:bench -- --json
- *   npm run turn:bench -- --sustain-s 60     # perfil de gate (ver runbook)
- *   npm run turn:bench -- --write-baseline
+ *   npm run turn:bench -- --sustain-s 60     # O GATE (modo `gate`, o default)
+ *   npm run turn:bench -- --mode measure     # medição completa, SEM veredicto de gate
+ *   npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline
+ *   npm run turn:bench -- --sustain-s 60 --json
  *   npm run turn:bench -- --self-test --inject p95_ms=900   # prova que o gate reprova
+ *   npm run turn:bench -- --self-test --self-test-baseline missing   # idem, sem baseline
  *   npm run turn:bench -- --cleanup-only     # remove massa órfã de uma corrida abortada
  *
  * | Flag | Default | O que faz |
@@ -119,12 +149,15 @@
  * | `--arm` | `all` | `cold` · `warm` · `all` |
  * | `--identity` | `profile` | `profile` (perfil v2 ativo) · `legacy` (fallback `self_state`, um round-trip a mais) |
  * | `--timeout-ms` | `5000` | Orçamento por turno. Casa com `connectionTimeoutMillis` do pool |
- * | `--sample-ms` | `100` | Período de amostragem do pool |
+ * | `--sample-ms` | `100` | Período de amostragem do pool. Validado contra a janela que precisa resolver |
+ * | `--sample-gap-factor` | `10` | Maior lacuna cega tolerada na amostragem, em múltiplos de `--sample-ms` |
  * | `--p95-ms` / `--p99-ms` | `600` / `1000` | Limites do gate |
  * | `--baseline-tolerance` | `0.20` | Folga sobre o p95 do baseline |
- * | `--write-baseline` | — | Grava o p95 medido como novo baseline |
- * | `--self-test` | — | Não toca no banco: avalia o gate sobre valores injetados |
+ * | `--mode` | `gate` | `gate` · `measure` · `self-test` — ver acima |
+ * | `--write-baseline` | — | Grava o p95 medido como novo baseline. **Exige `--mode measure`** |
+ * | `--self-test` | — | Apelido de `--mode self-test`. Não toca no banco |
  * | `--inject` | — | `p95_ms=900`, `warm.peak_reads=8`, `cold.errors=1`, … (exige `--self-test`) |
+ * | `--self-test-baseline` | `ok` | `ok` · `missing` · `incompatible` (exige `--self-test`) |
  * | `--json` | — | Saída JSON |
  * | `--cleanup-only` | — | Só remove a massa `bench525-*` e sai |
  */
@@ -183,9 +216,38 @@ export type Thresholds = {
   baseline_tolerance: number;
   pairs: number;
   concurrency: number;
+  /**
+   * Maior lacuna tolerada entre duas amostras do pool, em múltiplos de
+   * `--sample-ms`. NÃO é um limite de desempenho: é o limite de QUALIDADE DA
+   * EVIDÊNCIA. Um amostrador que ficou 6 s sem rodar não observou 6 s de
+   * corrida, e o critério de saturação que ele alimenta não pode ser lido como
+   * "o pool drenou" — foi só ninguém ter olhado.
+   */
+  sample_gap_factor: number;
 };
 
+/**
+ * O MODO da corrida. Existe porque medir e barrar são coisas diferentes, e
+ * misturá-las foi o defeito que a review do dono apontou: uma corrida sem
+ * baseline saía com exit 0 e o operador lia isso como "o gate passou".
+ *
+ * | modo | o que é | exit code |
+ * |---|---|---|
+ * | `gate` | o veredicto. Todo critério obrigatório TEM que ter sido avaliado | 0 aprovado · 1 reprovado (inclui "não avaliado") · 2 erro de uso/infra |
+ * | `measure` | medição absoluta. NÃO emite veredicto de gate e diz isso no relatório | 0 (a medição aconteceu) · 2 erro |
+ * | `self-test` | prova que o gate reprova, sobre valores sintéticos | como `gate` |
+ *
+ * O default é `gate`: o modo mais estrito precisa ser o que sai de graça, para
+ * que esquecer a flag produza um NÃO em vez de um sim sem evidência.
+ */
+export type RunMode = 'gate' | 'measure' | 'self-test';
+const ALL_MODES: RunMode[] = ['gate', 'measure', 'self-test'];
+
+/** Estado do baseline que o `--self-test` simula, para provar cada reprovação pela CLI. */
+export type SelfTestBaseline = 'ok' | 'missing' | 'incompatible';
+
 type Options = {
+  mode: RunMode;
   pairs: number;
   concurrency: number;
   turns: number;
@@ -197,8 +259,8 @@ type Options = {
   sample_ms: number;
   thresholds: Thresholds;
   write_baseline: boolean;
-  self_test: boolean;
   inject: Record<string, number>;
+  self_test_baseline: SelfTestBaseline;
   json: boolean;
   cleanup_only: boolean;
 };
@@ -206,15 +268,138 @@ type Options = {
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
 
+/**
+ * A FORMA da corrida que produziu um número — o que precisa bater para que
+ * comparar dois p95 signifique alguma coisa.
+ *
+ * Cada campo aqui muda o NÚMERO MEDIDO, e é por isso que ele está aqui:
+ *
+ * | campo | por que muda o número |
+ * |---|---|
+ * | `pairs` | quantos pares tenant/agente distintos a carga toca — muda a localidade do cache do Postgres e o volume de linhas por escopo |
+ * | `concurrency` | é o regime de fila. Fixa quantos turnos disputam um pool de 10 e domina a cauda |
+ * | `think_ms` | medido nesta PR: p95 de 28,8 ms com 150 ms contra 187,7 ms com 0. É o parâmetro que mais move o número |
+ * | `identity` | `legacy` cai no `self_state` e paga UM round-trip a mais por turno |
+ * | `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê e renderiza |
+ * | `pool_max` | o denominador da saturação. Comparar p95 de um pool 10 com um pool 20 é comparar dois sistemas |
+ * | `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`: quantas leituras de um turno andam juntas |
+ *
+ * E o que ficou DE FORA da comparação, de propósito, porque invalidaria o
+ * baseline sem mudar o número — o fingerprint frouxo não protege, mas o
+ * fingerprint barulhento é pior: o operador aprende a ignorá-lo:
+ *
+ * | campo | por que só é REGISTRADO |
+ * |---|---|
+ * | `host` / `node` / `platform` | o baseline já é por máquina (não é versionado). Comparar aqui reprovaria toda atualização de runtime sem dizer nada sobre o código |
+ * | `turns` / `sustain_s` | p95 é estatística de distribuição, não total: rodar mais tempo muda a confiança, não o valor central. A FORMA exigida já é cobrada pelo veredicto "carga conforme o enunciado" |
+ * | `timeout_ms` | classifica o que conta como timeout; não move a latência medida |
+ * | `sample_ms` | é o período de observação do POOL; não entra no p95 do turno |
+ */
+export type RunFingerprint = {
+  pairs: number;
+  concurrency: number;
+  think_ms: number;
+  identity: 'profile' | 'legacy';
+  cardinalities: number[];
+  pool_max: number;
+  max_concurrent_reads: number;
+};
+
+/**
+ * Versão do formato do baseline. Um arquivo sem `schema_version` é de antes do
+ * fingerprint: ele NÃO prova ter sido medido com a mesma carga, então a
+ * comparação é recusada em vez de assumida. Aceitar o formato antigo em
+ * silêncio reabriria exatamente o buraco que o fingerprint fecha.
+ */
+export const BASELINE_SCHEMA_VERSION = 2;
+
 export type BaselineFile = {
+  schema_version: number;
   /** Como o baseline foi obtido — texto livre, escrito por quem gravou. */
   recorded_at: string;
   recorded_by: string;
   host: string;
   note: string;
-  options: { pairs: number; concurrency: number; turns: number; identity: string };
-  arms: Record<string, { p95_ms: number; p99_ms: number }>;
+  /** Comparado: divergiu, a comparação é recusada. */
+  fingerprint: RunFingerprint;
+  /** Registrado, NÃO comparado — documenta a corrida sem invalidar o arquivo. */
+  context: {
+    turns: number;
+    sustain_s: number;
+    timeout_ms: number;
+    sample_ms: number;
+    node: string;
+    platform: string;
+    mode: RunMode;
+  };
+  arms: Record<string, { p95_ms: number; p99_ms: number; turns: number; wall_ms: number }>;
 };
+
+/** O fingerprint da corrida ATUAL. `pool_max` vem do pool de verdade, não de um literal. */
+export function runFingerprint(
+  o: { pairs: number; concurrency: number; think_ms: number; identity: 'profile' | 'legacy' },
+  maxConcurrentReads: number,
+  poolMax: number,
+): RunFingerprint {
+  return {
+    pairs: o.pairs,
+    concurrency: o.concurrency,
+    think_ms: o.think_ms,
+    identity: o.identity,
+    cardinalities: [...CARDINALITIES],
+    pool_max: poolMax,
+    max_concurrent_reads: maxConcurrentReads,
+  };
+}
+
+export type BaselineCompatibility = {
+  status: 'ok' | 'missing' | 'legacy_schema' | 'incompatible';
+  /** Uma linha por campo divergente, no formato `campo: baseline=X · agora=Y`. */
+  diffs: string[];
+};
+
+/**
+ * Decide se DÁ para comparar — e recusa quando não dá.
+ *
+ * O aviso não basta: um baseline medido com `--think-ms 0` comparado contra a
+ * corrida canônica produz falso verde ou falso vermelho por mudança de CARGA,
+ * não de código, e um aviso no meio de trinta linhas de tabela é lido como
+ * ruído. Divergiu, o critério relativo não foi avaliado.
+ */
+export function checkBaselineCompatibility(
+  baseline: BaselineFile | null,
+  current: RunFingerprint,
+): BaselineCompatibility {
+  if (!baseline) return { status: 'missing', diffs: [] };
+  if (baseline.schema_version !== BASELINE_SCHEMA_VERSION || !baseline.fingerprint) {
+    return {
+      status: 'legacy_schema',
+      diffs: [
+        `schema_version: baseline=${baseline.schema_version ?? 'ausente'} · ` +
+          `esperado=${BASELINE_SCHEMA_VERSION} (arquivo sem fingerprint da carga)`,
+      ],
+    };
+  }
+  const fp = baseline.fingerprint;
+  const diffs: string[] = [];
+  const cmp = (field: keyof RunFingerprint): void => {
+    const a = fp[field];
+    const b = current[field];
+    const same = Array.isArray(a) && Array.isArray(b) ? a.join('/') === b.join('/') : a === b;
+    if (!same) {
+      const show = (v: unknown): string => (Array.isArray(v) ? v.join('/') : String(v));
+      diffs.push(`${field}: baseline=${show(a)} · agora=${show(b)}`);
+    }
+  };
+  cmp('pairs');
+  cmp('concurrency');
+  cmp('think_ms');
+  cmp('identity');
+  cmp('cardinalities');
+  cmp('pool_max');
+  cmp('max_concurrent_reads');
+  return diffs.length ? { status: 'incompatible', diffs } : { status: 'ok', diffs: [] };
+}
 
 function parseInject(raw: string | undefined): Record<string, number> {
   if (!raw) return {};
@@ -256,31 +441,93 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
   if (identityRaw !== 'profile' && identityRaw !== 'legacy') {
     throw new Error(`--identity inválido: ${identityRaw} (esperado profile | legacy)`);
   }
-  const self_test = argv.includes('--self-test');
+
+  // --- modo -----------------------------------------------------------------
+  // `--self-test` continua valendo como apelido de `--mode self-test`: é o que
+  // o runbook e as esteiras já digitam.
+  const modeRaw = get('mode');
+  if (modeRaw !== undefined && !ALL_MODES.includes(modeRaw as RunMode)) {
+    throw new Error(`--mode inválido: ${modeRaw} (esperado ${ALL_MODES.join(' | ')})`);
+  }
+  const selfTestFlag = argv.includes('--self-test');
+  if (selfTestFlag && modeRaw !== undefined && modeRaw !== 'self-test') {
+    throw new Error(`--self-test conflita com --mode ${modeRaw}`);
+  }
+  const mode: RunMode = selfTestFlag ? 'self-test' : ((modeRaw as RunMode | undefined) ?? 'gate');
+
   const inject = parseInject(get('inject'));
-  if (Object.keys(inject).length > 0 && !self_test) {
+  if (Object.keys(inject).length > 0 && mode !== 'self-test') {
     // Injeção existe para PROVAR que o gate reprova. Deixá-la disponível numa
     // corrida de medição transformaria o gate num carimbo: `--inject p95_ms=1`
     // faria qualquer regressão passar.
     throw new Error('--inject só é aceito junto de --self-test (é a prova do gate, não uma medição)');
   }
+
+  const selfTestBaselineRaw = get('self-test-baseline') ?? 'ok';
+  if (!['ok', 'missing', 'incompatible'].includes(selfTestBaselineRaw)) {
+    throw new Error(
+      `--self-test-baseline inválido: ${selfTestBaselineRaw} (esperado ok | missing | incompatible)`,
+    );
+  }
+  if (selfTestBaselineRaw !== 'ok' && mode !== 'self-test') {
+    throw new Error('--self-test-baseline só é aceito junto de --self-test');
+  }
+
+  const write_baseline = argv.includes('--write-baseline');
+  if (write_baseline && mode !== 'measure') {
+    // Gravar baseline É uma medição absoluta, não um gate. Deixar as duas
+    // coisas no mesmo comando é o que fazia uma corrida "de gate" produzir a
+    // própria referência contra a qual ela seria julgada depois.
+    throw new Error(
+      '--write-baseline exige --mode measure (gravar baseline é medição, não veredicto): ' +
+        'npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline',
+    );
+  }
+
+  const sample_ms = num('sample-ms', 100);
+  const saturation_ms = num('saturation-ms', 60_000);
+  const sustain_s = num('sustain-s', 0);
+  // O período de amostragem é validado contra a JANELA que ele precisa
+  // resolver. Um `--sample-ms` maior que a corrida devolve zero amostras, e
+  // zero amostras já foi lido como "o pool drenou" — o defeito que esta
+  // validação e o veredicto de cobertura fecham pelos dois lados.
+  const MIN_SAMPLES_PER_WINDOW = 10;
+  if (!Number.isInteger(sample_ms) || sample_ms < 1) {
+    throw new Error(`--sample-ms precisa ser um inteiro ≥ 1 (recebido ${sample_ms})`);
+  }
+  if (sample_ms * MIN_SAMPLES_PER_WINDOW > saturation_ms) {
+    throw new Error(
+      `--sample-ms ${sample_ms} não resolve a janela de saturação de ${saturation_ms} ms ` +
+        `(são necessárias ao menos ${MIN_SAMPLES_PER_WINDOW} amostras por janela; ` +
+        `máximo aceito: ${Math.floor(saturation_ms / MIN_SAMPLES_PER_WINDOW)} ms)`,
+    );
+  }
+  if (sustain_s > 0 && sample_ms * MIN_SAMPLES_PER_WINDOW > sustain_s * 1000) {
+    throw new Error(
+      `--sample-ms ${sample_ms} não resolve uma corrida de ${sustain_s}s ` +
+        `(são necessárias ao menos ${MIN_SAMPLES_PER_WINDOW} amostras)`,
+    );
+  }
+
   return {
+    mode,
     pairs: num('pairs', 50),
     concurrency: num('concurrency', 20),
     turns: num('turns', 600),
-    sustain_s: num('sustain-s', 0),
+    sustain_s,
     think_ms: num('think-ms', 150),
     arms,
     identity: identityRaw,
     timeout_ms: num('timeout-ms', 5_000),
-    sample_ms: num('sample-ms', 100),
+    sample_ms,
     thresholds: {
       p95_ms: num('p95-ms', 600),
       p99_ms: num('p99-ms', 1_000),
       max_peak_reads: maxPeakReads,
       min_concurrent_tenants: num('min-tenants', 10),
-      saturation_ms: num('saturation-ms', 60_000),
+      saturation_ms,
       baseline_tolerance: num('baseline-tolerance', 0.2),
+      sample_gap_factor: num('sample-gap-factor', 10),
       // A FORMA da carga exigida vem do enunciado do dono, NÃO de `--pairs` /
       // `--concurrency`. Derivá-la das flags tornaria o critério circular:
       // `--pairs 4` aprovaria uma corrida de quatro tenants como se fosse o
@@ -288,9 +535,9 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
       pairs: num('required-pairs', 50),
       concurrency: num('required-concurrency', 20),
     },
-    write_baseline: argv.includes('--write-baseline'),
-    self_test,
+    write_baseline,
     inject,
+    self_test_baseline: selfTestBaselineRaw as SelfTestBaseline,
     json: argv.includes('--json'),
     cleanup_only: argv.includes('--cleanup-only'),
   };
@@ -356,6 +603,116 @@ export function mergeTwoPairs(reads: Array<{ section: string; ms: number }>): nu
 }
 
 // ============================================================================
+// Amostragem do pool — contabilidade PURA, por relógio real
+// ============================================================================
+
+export type PoolSamplingSummary = {
+  samples: number;
+  saturated_samples: number;
+  /**
+   * Maior sequência saturada, medida por TIMESTAMPS. O acumulador antigo
+   * (`streak += periodMs`) contava PERÍODOS PEDIDOS, não tempo decorrido: com o
+   * event loop atrasado — que é exatamente quando a máquina está sob a carga
+   * que interessa medir — dez amostras espalhadas por 6 s viravam "1 s
+   * saturado", e o critério de 60 s passava sem nunca ter olhado 60 s.
+   */
+  max_streak_ms: number;
+  /** Da primeira à última amostra. Zero quando não houve amostra alguma. */
+  sampled_span_ms: number;
+  /**
+   * Maior intervalo CEGO: inclui o trecho antes da primeira amostra e o trecho
+   * depois da última. Com zero amostras é a corrida inteira, que é como um
+   * amostrador que nunca rodou se denuncia.
+   */
+  max_gap_ms: number;
+};
+
+/**
+ * A contabilidade da amostragem do pool, separada do `setInterval` para poder
+ * ser provada com timestamps sintéticos.
+ *
+ * Duas decisões conservadoras, ambas na direção segura (superestimar a
+ * saturação, nunca subestimá-la):
+ *
+ *  1. A sequência saturada começa no último instante em que se SABE que o pool
+ *     não estava saturado — a amostra drenada anterior, ou o início da corrida.
+ *     Erra para mais em até um período; o acumulador antigo errava para menos,
+ *     sem limite.
+ *  2. `max_gap_ms` inclui as pontas. Um amostrador que morreu no meio da
+ *     corrida deixa um buraco visível em vez de um silêncio.
+ */
+export function createPoolSaturationTracker(startedAtMs: number): {
+  observe: (atMs: number, saturated: boolean) => void;
+  summary: (endedAtMs: number) => PoolSamplingSummary;
+} {
+  let samples = 0;
+  let saturatedSamples = 0;
+  let maxStreak = 0;
+  let maxGap = 0;
+  let firstAt: number | null = null;
+  let lastAt = startedAtMs;
+  // Último instante conhecidamente NÃO saturado.
+  let lastDrainedAt = startedAtMs;
+
+  return {
+    observe: (atMs: number, saturated: boolean): void => {
+      samples++;
+      if (firstAt === null) firstAt = atMs;
+      const gap = atMs - lastAt;
+      if (gap > maxGap) maxGap = gap;
+      lastAt = atMs;
+      if (saturated) {
+        saturatedSamples++;
+        const streak = atMs - lastDrainedAt;
+        if (streak > maxStreak) maxStreak = streak;
+      } else {
+        lastDrainedAt = atMs;
+      }
+    },
+    summary: (endedAtMs: number): PoolSamplingSummary => {
+      const tail = endedAtMs - lastAt;
+      return {
+        samples,
+        saturated_samples: saturatedSamples,
+        max_streak_ms: maxStreak,
+        sampled_span_ms: firstAt === null ? 0 : lastAt - firstAt,
+        max_gap_ms: Math.max(maxGap, tail > 0 ? tail : 0),
+      };
+    },
+  };
+}
+
+/** A fatia de `ArmResult` que descreve a amostragem do pool. */
+export type PoolMetrics = Pick<
+  ArmResult,
+  | 'pool_saturation_max_streak_ms'
+  | 'pool_saturated_samples'
+  | 'pool_samples'
+  | 'pool_sample_ms'
+  | 'pool_sampled_span_ms'
+  | 'pool_max_sample_gap_ms'
+>;
+
+/**
+ * A FRONTEIRA entre o amostrador e o avaliador.
+ *
+ * Existe como função própria porque corrigir só o avaliador não conserta nada:
+ * se `runArm` continuar publicando `pool_samples: 0` como se fosse uma
+ * observação, o spec passa e a corrida real segue mentindo. Toda a tradução
+ * summary → `ArmResult` mora aqui, e é isto que o teste alimenta.
+ */
+export function poolMetricsFromSummary(summary: PoolSamplingSummary, sampleMs: number): PoolMetrics {
+  return {
+    pool_saturation_max_streak_ms: summary.max_streak_ms,
+    pool_saturated_samples: summary.saturated_samples,
+    pool_samples: summary.samples,
+    pool_sample_ms: sampleMs,
+    pool_sampled_span_ms: summary.sampled_span_ms,
+    pool_max_sample_gap_ms: summary.max_gap_ms,
+  };
+}
+
+// ============================================================================
 // Resultado de um braço + veredictos (PUROS — testáveis sem Postgres)
 // ============================================================================
 
@@ -400,6 +757,12 @@ export type ArmResult = {
   pool_saturation_max_streak_ms: number;
   pool_saturated_samples: number;
   pool_samples: number;
+  /** Período PEDIDO ao amostrador (`--sample-ms`). */
+  pool_sample_ms: number;
+  /** Da primeira à última amostra do pool. */
+  pool_sampled_span_ms: number;
+  /** Maior intervalo cego da amostragem, pontas incluídas. */
+  pool_max_sample_gap_ms: number;
   identity_cache: Record<string, number>;
   /** `maia_turn_context_load_duration_ms{phase="loader"}` — count e sum reais. */
   metric_count: number;
@@ -413,10 +776,25 @@ export type ArmResult = {
 
 export type Verdict = {
   label: string;
+  /**
+   * INVARIANTE: `skipped === true` implica `passed === false`.
+   *
+   * "Não avaliado" deixou de ser sinônimo de "aprovado" — era essa igualdade
+   * que deixava o veredicto final verde sem a evidência prometida. Quem decide
+   * o que fazer com um critério não avaliado é o MODO: `gate` reprova, `measure`
+   * apenas informa (ver `gateExitCode`).
+   */
   passed: boolean;
-  /** `true` quando o critério não pôde ser avaliado (não reprova, mas avisa). */
+  /** `true` quando o critério não pôde ser avaliado por falta de evidência. */
   skipped?: boolean;
   detail: string;
+};
+
+/** O que o gate precisa saber além dos números dos braços. */
+export type GateContext = {
+  mode: RunMode;
+  /** A forma da corrida atual — comparada com a do baseline. */
+  fingerprint: RunFingerprint;
 };
 
 /**
@@ -428,8 +806,10 @@ export function evaluateGate(
   arms: ArmResult[],
   th: Thresholds,
   baseline: BaselineFile | null,
+  ctx: GateContext,
 ): Verdict[] {
   const out: Verdict[] = [];
+  const compat = checkBaselineCompatibility(baseline, ctx.fingerprint);
 
   for (const a of arms) {
     out.push({
@@ -484,21 +864,48 @@ export function evaluateGate(
     // 60 s seguidos. Um pool que jamais drena reprova em qualquer duração de
     // corrida; não conseguir observar uma janela inteira de 60 s só é motivo de
     // "não avaliado" quando NADA de errado apareceu.
+    // ANTES de perguntar se o pool drenou, perguntar se ALGUÉM OLHOU.
+    //
+    // Zero amostras era lido como "drenou": uma corrida com `--sample-ms` maior
+    // que a duração, ou com o event loop impedindo o amostrador de rodar,
+    // passava num dos critérios centrais do gate sem observação alguma. Uma
+    // amostragem esburacada tem o mesmo efeito num pedaço da corrida — por isso
+    // o que se cobra é a maior LACUNA, pontas incluídas.
+    const maxGapAllowed = a.pool_sample_ms * th.sample_gap_factor;
+    const sampled = a.pool_samples > 0 && a.pool_max_sample_gap_ms <= maxGapAllowed;
+    out.push({
+      label: `[${a.arm}] a amostragem do pool observou a corrida (lacuna ≤ ${th.sample_gap_factor}× --sample-ms)`,
+      passed: sampled,
+      detail:
+        a.pool_samples === 0
+          ? `NENHUMA AMOSTRA DO POOL em ${(a.wall_ms / 1000).toFixed(1)} s de corrida com ` +
+            `--sample-ms ${a.pool_sample_ms} — o critério de saturação não foi observado`
+          : `${a.pool_samples} amostras · período pedido=${a.pool_sample_ms} ms · ` +
+            `maior lacuna=${a.pool_max_sample_gap_ms.toFixed(0)} ms (teto ${maxGapAllowed.toFixed(0)} ms) · ` +
+            `cobertura=${(a.pool_sampled_span_ms / 1000).toFixed(1)} s de ${(a.wall_ms / 1000).toFixed(1)} s`,
+    });
+
     const observedFullWindow = a.wall_ms >= th.saturation_ms;
     // "Drenou" é uma contagem EXATA, não uma heurística sobre a duração: se
     // toda amostra viu a fila cheia, a fila nunca esvaziou. Comparar a
     // sequência com uma fração do relógio de parede erra justamente o caso que
     // motivou este critério (57,2 s de sequência em 60,1 s de corrida com
     // 572/572 amostras saturadas passaria por uma folga de 2%).
-    const drained = a.pool_samples === 0 || a.pool_saturated_samples < a.pool_samples;
+    const drained = a.pool_saturated_samples < a.pool_samples;
+    const streakOk = a.pool_saturation_max_streak_ms < th.saturation_ms;
+    // Só é "não avaliado" quando NADA de errado apareceu e a janela inteira não
+    // coube na corrida. Sem amostragem válida não há o que avaliar — e não
+    // avaliado NÃO é aprovado (ver `Verdict.passed`).
+    const healthy = sampled && drained && streakOk;
     out.push({
       label: `[${a.arm}] o pool drena (fila esvazia) e nunca fica saturado por ${(th.saturation_ms / 1000).toFixed(0)} s seguidos`,
-      passed: drained && a.pool_saturation_max_streak_ms < th.saturation_ms,
-      skipped: !observedFullWindow && drained,
+      passed: healthy && observedFullWindow,
+      skipped: !sampled || (healthy && !observedFullWindow),
       detail:
         `maior sequência saturada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s de ` +
         `${(a.wall_ms / 1000).toFixed(1)} s · ${a.pool_saturated_samples}/${a.pool_samples} amostras saturadas` +
-        (drained ? '' : ' · A FILA NUNCA ESVAZIOU') +
+        (sampled ? '' : ' · SEM AMOSTRAGEM VÁLIDA DO POOL — critério não observado') +
+        (sampled && !drained ? ' · A FILA NUNCA ESVAZIOU' : '') +
         (observedFullWindow
           ? ''
           : ` · janela de ${(th.saturation_ms / 1000).toFixed(0)} s não observada (use --sustain-s ${(th.saturation_ms / 1000).toFixed(0)})`),
@@ -514,15 +921,29 @@ export function evaluateGate(
       detail: `count=${a.metric_count} · turnos=${a.turns} · p95 pelos buckets≈${a.p95_from_histogram_ms.toFixed(0)} ms`,
     });
 
-    const base = baseline?.arms[a.arm];
+    // O critério relativo só é avaliado contra um baseline COMPARÁVEL. Faltando
+    // baseline, ou tendo sido ele medido com outra carga, o critério fica
+    // `skipped` — e `skipped` não é aprovado: em modo `gate` isso derruba o
+    // exit code. Um checkout limpo passou a dizer "não tenho a evidência" em
+    // vez de sair 0.
+    const base = compat.status === 'ok' ? baseline?.arms[a.arm] : undefined;
     if (!base) {
+      const why =
+        compat.status === 'missing'
+          ? 'NÃO HÁ BASELINE REGISTRADO para este braço'
+          : compat.status === 'legacy_schema'
+            ? `BASELINE EM FORMATO ANTIGO — sem fingerprint da carga, a comparação seria uma suposição (${compat.diffs.join(' · ')})`
+            : compat.status === 'incompatible'
+              ? `BASELINE MEDIDO COM OUTRA CARGA — comparação RECUSADA (${compat.diffs.join(' · ')})`
+              : `o baseline não tem o braço \`${a.arm}\``;
       out.push({
         label: `[${a.arm}] p95 ≤ baseline + ${(th.baseline_tolerance * 100).toFixed(0)}%`,
-        passed: true,
+        passed: false,
         skipped: true,
         detail:
-          'NÃO AVALIADO — NÃO HÁ BASELINE REGISTRADO para este braço. ' +
-          'Esta corrida pode ser gravada como baseline inicial com --write-baseline.',
+          `NÃO AVALIADO — ${why}. ` +
+          'Grave um baseline com esta MESMA forma de carga: ' +
+          'npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline',
       });
     } else {
       const ceiling = base.p95_ms * (1 + th.baseline_tolerance);
@@ -556,7 +977,23 @@ export function evaluateGate(
   return out;
 }
 
-export function gateExitCode(verdicts: Verdict[]): number {
+/**
+ * O exit code, POR MODO.
+ *
+ *  - `gate` / `self-test`: 0 só quando TODO critério foi avaliado e passou.
+ *    Como `skipped` implica `passed === false`, um critério não avaliado
+ *    reprova — que é a correção do achado "o veredicto final fica verde sem
+ *    evidência equivalente à prometida".
+ *  - `measure`: 0 porque a medição aconteceu. Este modo NÃO emite veredicto de
+ *    gate, e o relatório diz isso em caixa alta; ler o exit code dele como
+ *    aprovação é ler outra coisa. É o opt-out explícito, e ele não se apresenta
+ *    como gate.
+ *
+ * O default é `gate` de propósito: esquecer o parâmetro tem que produzir o
+ * julgamento estrito, nunca o permissivo.
+ */
+export function gateExitCode(verdicts: Verdict[], mode: RunMode = 'gate'): number {
+  if (mode === 'measure') return 0;
   return verdicts.every((v) => v.passed) ? 0 : 1;
 }
 
@@ -577,6 +1014,9 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'pool_saturation_max_streak_ms',
     'pool_samples',
     'pool_saturated_samples',
+    'pool_sample_ms',
+    'pool_sampled_span_ms',
+    'pool_max_sample_gap_ms',
     'wall_ms',
     'metric_count',
     'pairs_exercised',
@@ -625,6 +1065,9 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
     pool_saturation_max_streak_ms: 0,
     pool_saturated_samples: 0,
     pool_samples: 610,
+    pool_sample_ms: 100,
+    pool_sampled_span_ms: 60_900,
+    pool_max_sample_gap_ms: 100,
     identity_cache: {},
     metric_count: 600,
     metric_sum_ms: 7_200,
@@ -639,6 +1082,47 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
     by_section: [],
     modelled_makespan_p95_now_ms: 30,
     modelled_makespan_p95_at_8_ms: 29,
+  };
+}
+
+/**
+ * O baseline sintético do `--self-test`.
+ *
+ * O autoteste NÃO pode depender do arquivo de baseline da máquina: ele prova o
+ * GATE, e um gate cujo autoteste muda de resultado conforme o host não prova
+ * nada. `estado` permite exercitar pela CLI as três reprovações do critério
+ * relativo — presente e comparável, ausente, e medido com outra carga.
+ */
+export function syntheticBaseline(
+  arms: ArmResult[],
+  fingerprint: RunFingerprint,
+  estado: SelfTestBaseline,
+): BaselineFile | null {
+  if (estado === 'missing') return null;
+  return {
+    schema_version: BASELINE_SCHEMA_VERSION,
+    recorded_at: '1970-01-01T00:00:00.000Z',
+    recorded_by: 'self-test',
+    host: 'self-test',
+    note: 'BASELINE SINTÉTICO do --self-test. Não é medição de máquina nenhuma.',
+    fingerprint:
+      estado === 'incompatible'
+        ? // A carga que a PR mediu como 28,8 ms contra 187,7 ms de p95: é a
+          // divergência que mais move o número, e por isso a que serve de prova.
+          { ...fingerprint, think_ms: fingerprint.think_ms === 0 ? 150 : 0 }
+        : fingerprint,
+    context: {
+      turns: 600,
+      sustain_s: 60,
+      timeout_ms: 5_000,
+      sample_ms: 100,
+      node: process.versions.node,
+      platform: process.platform,
+      mode: 'self-test',
+    },
+    arms: Object.fromEntries(
+      arms.map((a) => [a.arm, { p95_ms: a.p95_ms, p99_ms: a.p99_ms, turns: a.turns, wall_ms: a.wall_ms }]),
+    ),
   };
 }
 
@@ -1063,30 +1547,22 @@ function instrumentAll(repos: Deps['repos']): void {
  * contínua por 60 s" — que é sobre DURAÇÃO, não sobre um pico instantâneo, e
  * por isso o que se guarda é a maior SEQUÊNCIA.
  */
-function startPoolSampler(pool: PgPool, periodMs: number): {
-  stop: () => { max_streak_ms: number; saturated: number; samples: number };
-} {
-  let samples = 0;
-  let saturated = 0;
-  let streak = 0;
-  let maxStreak = 0;
+export function startPoolSampler(
+  pool: PgPool,
+  periodMs: number,
+  startedAtMs = performance.now(),
+): { stop: (endedAtMs?: number) => PoolSamplingSummary } {
+  const tracker = createPoolSaturationTracker(startedAtMs);
   const max = pool.options.max ?? 10;
   const timer = setInterval(() => {
-    samples++;
-    const isSaturated = pool.waitingCount > 0 || (pool.totalCount >= max && pool.idleCount === 0);
-    if (isSaturated) {
-      saturated++;
-      streak += periodMs;
-      if (streak > maxStreak) maxStreak = streak;
-    } else {
-      streak = 0;
-    }
+    const saturated = pool.waitingCount > 0 || (pool.totalCount >= max && pool.idleCount === 0);
+    tracker.observe(performance.now(), saturated);
   }, periodMs);
   timer.unref?.();
   return {
-    stop: () => {
+    stop: (endedAtMs = performance.now()) => {
       clearInterval(timer);
-      return { max_streak_ms: maxStreak, saturated, samples };
+      return tracker.summary(endedAtMs);
     },
   };
 }
@@ -1204,8 +1680,8 @@ async function runArm(
   const inFlightTenants = new Map<string, number>();
   const exercisedPairs = new Set<string>();
 
-  const sampler = startPoolSampler(deps.pool, opts.sample_ms);
   const startedAt = performance.now();
+  const sampler = startPoolSampler(deps.pool, opts.sample_ms, startedAt);
   const sustainMs = opts.sustain_s * 1000;
 
   const worker = async (): Promise<void> => {
@@ -1250,8 +1726,9 @@ async function runArm(
   };
 
   await Promise.all(Array.from({ length: opts.concurrency }, worker));
-  const wall_ms = performance.now() - startedAt;
-  const pool = sampler.stop();
+  const endedAt = performance.now();
+  const wall_ms = endedAt - startedAt;
+  const pool = poolMetricsFromSummary(sampler.stop(endedAt), opts.sample_ms);
 
   const all = samples.map((s) => s.ms).sort((a, b) => a - b);
   const hist = await readLoaderHistogram(deps.renderPrometheus);
@@ -1312,9 +1789,7 @@ async function runArm(
     reads_per_turn_min: readsPerTurn.length ? Math.min(...readsPerTurn) : 0,
     reads_per_turn_max: readsPerTurn.length ? Math.max(...readsPerTurn) : 0,
     pool_max: deps.pool.options.max ?? 10,
-    pool_saturation_max_streak_ms: pool.max_streak_ms,
-    pool_saturated_samples: pool.saturated,
-    pool_samples: pool.samples,
+    ...pool,
     identity_cache,
     metric_count: hist.count,
     metric_sum_ms: hist.sum,
@@ -1348,19 +1823,40 @@ function fmt(n: number, digits = 1): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
+/**
+ * A tarja do modo. É o que impede o operador de ler uma medição como um gate:
+ * os dois modos imprimem a mesma tabela, e sem a tarja a única diferença
+ * visível seria o exit code — que é justamente o que ele NÃO leu.
+ */
+function modeBanner(mode: RunMode, injected: string[]): string {
+  if (mode === 'self-test') {
+    return (
+      `> **AUTOTESTE DO GATE — NÃO É MEDIÇÃO.**` +
+      (injected.length ? ` Valores injetados: \`${injected.join('`, `')}\`.` : '') +
+      `\n> Os números abaixo são sintéticos; servem apenas para provar que o gate reprova.\n\n`
+    );
+  }
+  if (mode === 'measure') {
+    return (
+      `> **MEDIÇÃO ABSOLUTA — NÃO É O GATE.** Esta corrida NÃO emite veredicto de gate e\n` +
+      `> sai com exit code 0 por ter medido, não por ter aprovado. Os critérios abaixo são\n` +
+      `> informativos. O gate é \`npm run turn:bench -- --sustain-s 60\` (modo \`gate\`, o default).\n\n`
+    );
+  }
+  return `> **MODO GATE.** Todo critério obrigatório precisa ter sido AVALIADO: um critério\n> \`n/a\` reprova a corrida, porque um gate sem a evidência não é um gate.\n\n`;
+}
+
 function renderReport(
   opts: Options,
   arms: ArmResult[],
   verdicts: Verdict[],
   baseline: BaselineFile | null,
   injected: string[],
+  fingerprint: RunFingerprint,
 ): string {
   const head =
     `### Gate de carga de contexto do turno — issue #525\n\n` +
-    (injected.length
-      ? `> **AUTOTESTE DO GATE — NÃO É MEDIÇÃO.** Valores injetados: \`${injected.join('`, `')}\`.\n` +
-        `> Os números abaixo são sintéticos; servem apenas para provar que o gate reprova.\n\n`
-      : '') +
+    modeBanner(opts.mode, injected) +
     `${opts.pairs} pares tenant/agente · concorrência ${opts.concurrency} · ` +
     `${opts.turns} turnos por braço (mín.)` +
     (opts.sustain_s ? ` · carga sustentada por ${opts.sustain_s}s` : '') +
@@ -1392,6 +1888,14 @@ function renderReport(
     [
       'amostras do pool saturadas',
       ...arms.map((a) => `${a.pool_saturated_samples}/${a.pool_samples}`),
+    ],
+    [
+      'amostragem do pool (cobertura · maior lacuna)',
+      ...arms.map(
+        (a) =>
+          `${fmt(a.pool_sampled_span_ms / 1000)}s · ${fmt(a.pool_max_sample_gap_ms, 0)}ms ` +
+          `(período ${a.pool_sample_ms}ms)`,
+      ),
     ],
     [
       'cache de identidade',
@@ -1447,24 +1951,66 @@ function renderReport(
     '`docs/architecture/modules/agent.md`) ao custo do MAIOR dos dois — otimista de propósito.',
   ].join('\n');
 
-  const baselineBlock = baseline
-    ? `\n#### Baseline\n\nRegistrado em ${baseline.recorded_at} por \`${baseline.recorded_by}\` (${baseline.host}).\n` +
-      `${baseline.note}\n\n` +
-      `| braço | p95 do baseline (ms) | p99 do baseline (ms) |\n| --- | --- | --- |\n` +
-      Object.entries(baseline.arms)
-        .map(([k, v]) => `| \`${k}\` | ${fmt(v.p95_ms)} | ${fmt(v.p99_ms)} |`)
-        .join('\n')
-    : `\n#### Baseline\n\n**NÃO HÁ BASELINE REGISTRADO.** Nenhum \`${BASELINE_PATH}\` foi encontrado, ` +
-      `então o critério "p95 ≤ baseline + ${(opts.thresholds.baseline_tolerance * 100).toFixed(0)}%" ` +
-      `NÃO FOI AVALIADO nesta corrida — ele aparece como \`n/a\` na lista de veredictos. ` +
-      `Para adotar ESTA corrida como baseline inicial, rode de novo com \`--write-baseline\`; ` +
-      `o arquivo gravado diz explicitamente que é a primeira medição e não uma referência histórica.`;
+  const compat = checkBaselineCompatibility(baseline, fingerprint);
+  const fingerprintRows = [
+    '',
+    '',
+    'Forma da corrida (o que precisa bater para comparar dois p95):',
+    '',
+    `| campo | esta corrida | baseline |`,
+    `| --- | --- | --- |`,
+    ...(Object.keys(fingerprint) as Array<keyof RunFingerprint>).map((k) => {
+      const mine = fingerprint[k];
+      const theirs = baseline?.fingerprint?.[k];
+      const show = (v: unknown): string => (v === undefined ? '—' : Array.isArray(v) ? v.join('/') : String(v));
+      const flag = show(mine) === show(theirs) ? '' : ' ⚠';
+      return `| \`${k}\` | ${show(mine)} | ${show(theirs)}${flag} |`;
+    }),
+  ].join('\n');
 
+  const baselineBlock =
+    baseline && compat.status === 'ok'
+      ? `\n#### Baseline\n\nRegistrado em ${baseline.recorded_at} por \`${baseline.recorded_by}\` (${baseline.host}).\n` +
+        `${baseline.note}\n\n` +
+        `| braço | p95 do baseline (ms) | p99 do baseline (ms) |\n| --- | --- | --- |\n` +
+        Object.entries(baseline.arms)
+          .map(([k, v]) => `| \`${k}\` | ${fmt(v.p95_ms)} | ${fmt(v.p99_ms)} |`)
+          .join('\n') +
+        fingerprintRows
+      : baseline
+        ? `\n#### Baseline\n\n**BASELINE RECUSADO — ele não mede a mesma carga que esta corrida.** ` +
+          `A comparação foi RECUSADA, não apenas avisada: um baseline medido com outra forma de ` +
+          `carga produz falso verde ou falso vermelho por mudança de CARGA, não de código ` +
+          `(nesta PR, \`--think-ms\` sozinho move o p95 de 28,8 ms para 187,7 ms).\n\n` +
+          compat.diffs.map((d) => `- ${d}`).join('\n') +
+          `\n\nRe-grave com a forma desta corrida: ` +
+          `\`npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline\`.` +
+          fingerprintRows
+        : `\n#### Baseline\n\n**NÃO HÁ BASELINE REGISTRADO.** Nenhum \`${BASELINE_PATH}\` foi encontrado, ` +
+          `então o critério "p95 ≤ baseline + ${(opts.thresholds.baseline_tolerance * 100).toFixed(0)}%" ` +
+          `NÃO FOI AVALIADO nesta corrida — ele aparece como \`n/a\` na lista de veredictos, e ` +
+          `${opts.mode === 'gate' ? '**em modo `gate` isso REPROVA a corrida**' : 'em modo `measure` isso é apenas informativo'}. ` +
+          `Para gravar um baseline inicial: ` +
+          `\`npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline\`. ` +
+          `O arquivo gravado diz explicitamente que é a primeira medição e não uma referência histórica.` +
+          fingerprintRows;
+
+  const naCount = verdicts.filter((v) => v.skipped).length;
+  const failCount = verdicts.filter((v) => !v.passed && !v.skipped).length;
   const verdictBlock =
     '\n\n#### Veredictos\n\n' +
     verdicts
-      .map((v) => `- ${v.skipped ? 'n/a  ' : v.passed ? 'OK  ' : 'FALHOU'} — ${v.label}: ${v.detail}`)
-      .join('\n');
+      .map(
+        (v) =>
+          `- ${v.skipped ? (opts.mode === 'measure' ? 'n/a   ' : 'n/a→REPROVA') : v.passed ? 'OK  ' : 'FALHOU'}` +
+          ` — ${v.label}: ${v.detail}`,
+      )
+      .join('\n') +
+    (opts.mode === 'measure'
+      ? `\n\n**Nenhum veredicto de gate foi emitido** (modo \`measure\`): ${failCount} critério(s) ` +
+        `fora do limite e ${naCount} não avaliado(s), todos informativos.`
+      : `\n\n${failCount} critério(s) reprovado(s) e ${naCount} não avaliado(s). ` +
+        `Em modo \`${opts.mode}\`, não avaliado conta como reprovação.`);
 
   return `${head}\n${table}\n${cardinality}\n${sections}\n${target8}\n${baselineBlock}${verdictBlock}\n`;
 }
@@ -1478,8 +2024,14 @@ function readBaseline(): BaselineFile | null {
   return JSON.parse(readFileSync(BASELINE_PATH, 'utf8')) as BaselineFile;
 }
 
-function writeBaseline(arms: ArmResult[], opts: Options, existing: BaselineFile | null): void {
+function writeBaseline(
+  arms: ArmResult[],
+  opts: Options,
+  fingerprint: RunFingerprint,
+  existing: BaselineFile | null,
+): void {
   const file: BaselineFile = {
+    schema_version: BASELINE_SCHEMA_VERSION,
     recorded_at: new Date().toISOString(),
     recorded_by: process.env.USER ?? 'unknown',
     host: `${process.platform} node ${process.versions.node}`,
@@ -1488,13 +2040,22 @@ function writeBaseline(arms: ArmResult[], opts: Options, existing: BaselineFile 
       : 'PRIMEIRA MEDIÇÃO — não havia baseline registrado antes desta corrida. ' +
         'Este arquivo não é uma referência histórica: é o ponto zero, e a folga de +20% ' +
         'sobre ele só passa a significar "não regrediu" a partir da PRÓXIMA corrida.',
-    options: {
-      pairs: opts.pairs,
-      concurrency: opts.concurrency,
+    fingerprint,
+    context: {
       turns: opts.turns,
-      identity: opts.identity,
+      sustain_s: opts.sustain_s,
+      timeout_ms: opts.timeout_ms,
+      sample_ms: opts.sample_ms,
+      node: process.versions.node,
+      platform: process.platform,
+      mode: opts.mode,
     },
-    arms: Object.fromEntries(arms.map((a) => [a.arm, { p95_ms: a.p95_ms, p99_ms: a.p99_ms }])),
+    arms: Object.fromEntries(
+      arms.map((a) => [
+        a.arm,
+        { p95_ms: a.p95_ms, p99_ms: a.p99_ms, turns: a.turns, wall_ms: a.wall_ms },
+      ]),
+    ),
   };
   writeFileSync(BASELINE_PATH, `${JSON.stringify(file, null, 2)}\n`);
 }
@@ -1506,18 +2067,30 @@ export async function main(argv: string[]): Promise<number> {
   const opts = parseArgs(argv, TURN_CONTEXT_MAX_CONCURRENT_READS);
 
   // --- autoteste: prova o GATE, não mede nada ------------------------------
-  if (opts.self_test) {
+  if (opts.mode === 'self-test') {
     const arms = opts.arms.map((a) => syntheticPassingArm(a, opts.thresholds));
+    // `pool_max` do braço sintético é 10, o mesmo de `src/db/client.ts`.
+    const fingerprint = runFingerprint(opts, opts.thresholds.max_peak_reads, arms[0]?.pool_max ?? 10);
+    // O baseline sai dos braços ANTES da injeção: com `--inject p95_ms=900` o
+    // critério relativo reprova junto do absoluto, em vez de a injeção mover os
+    // dois lados da comparação e se cancelar.
+    const baseline = syntheticBaseline(
+      opts.arms.map((a) => syntheticPassingArm(a, opts.thresholds)),
+      fingerprint,
+      opts.self_test_baseline,
+    );
     const injected = applyInjection(arms, opts.inject);
-    const baseline = readBaseline();
-    const verdicts = evaluateGate(arms, opts.thresholds, baseline);
-    const code = gateExitCode(verdicts);
+    const verdicts = evaluateGate(arms, opts.thresholds, baseline, {
+      mode: opts.mode,
+      fingerprint,
+    });
+    const code = gateExitCode(verdicts, opts.mode);
     if (opts.json) {
       process.stdout.write(
-        `${JSON.stringify({ self_test: true, injected, options: opts, arms, verdicts, exit_code: code }, null, 2)}\n`,
+        `${JSON.stringify({ mode: opts.mode, self_test: true, injected, options: opts, fingerprint, arms, verdicts, exit_code: code }, null, 2)}\n`,
       );
     } else {
-      process.stdout.write(renderReport(opts, arms, verdicts, baseline, injected));
+      process.stdout.write(renderReport(opts, arms, verdicts, baseline, injected, fingerprint));
     }
     return code;
   }
@@ -1577,18 +2150,26 @@ export async function main(argv: string[]): Promise<number> {
     const arms: ArmResult[] = [];
     for (const arm of opts.arms) arms.push(await runArm(arm, opts, pairs, deps));
 
+    const fingerprint = runFingerprint(
+      opts,
+      opts.thresholds.max_peak_reads,
+      deps.pool.options.max ?? 10,
+    );
     const baselineBefore = readBaseline();
-    const verdicts = evaluateGate(arms, opts.thresholds, baselineBefore);
-    const code = gateExitCode(verdicts);
+    const verdicts = evaluateGate(arms, opts.thresholds, baselineBefore, {
+      mode: opts.mode,
+      fingerprint,
+    });
+    const code = gateExitCode(verdicts, opts.mode);
 
-    if (opts.write_baseline) writeBaseline(arms, opts, baselineBefore);
+    if (opts.write_baseline) writeBaseline(arms, opts, fingerprint, baselineBefore);
 
     if (opts.json) {
       process.stdout.write(
-        `${JSON.stringify({ self_test: false, options: opts, arms, verdicts, exit_code: code }, null, 2)}\n`,
+        `${JSON.stringify({ mode: opts.mode, self_test: false, options: opts, fingerprint, arms, verdicts, exit_code: code, gate_evaluated: opts.mode !== 'measure' }, null, 2)}\n`,
       );
     } else {
-      process.stdout.write(renderReport(opts, arms, verdicts, baselineBefore, []));
+      process.stdout.write(renderReport(opts, arms, verdicts, baselineBefore, [], fingerprint));
     }
     return code;
   } finally {
