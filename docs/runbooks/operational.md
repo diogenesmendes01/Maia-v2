@@ -862,11 +862,30 @@ migrations empacotadas e lê o ledger inteiro (~50-100 ms medidos neste repo).
 O veredito é cacheado por **10 s** (`SCHEMA_READINESS_TTL_MS` em
 `src/runtime/lifecycle/schema-readiness.ts`) e chamadas concorrentes são
 coalescidas, então o custo é ~uma avaliação por 10 s por réplica,
-independentemente da frequência do LB. Consequência operacional: depois que o
-schema fica incompatível a instância ainda pode responder 200 por até 10 s —
-dentro da janela em que o próprio load balancer ainda não declarou o alvo
-unhealthy — e depois que o `migrate up` conserta, ela leva até 10 s a mais
-para voltar à rotação.
+independentemente da frequência do LB.
+
+**Não confunda "uma avaliação por 10 s" com "obsoleto por até 10 s".** São
+números diferentes, e o segundo é o que importa durante um incidente. O
+`/readyz` passa por DOIS caches: este TTL de 10 s e o cache composto de
+`evaluateComponents()`, que memoiza o conjunto inteiro de componentes por
+`READINESS_CACHE_MS` (2 s no default). Uma entrada composta preenchida um
+milissegundo antes do TTL interno expirar continua servindo aquele veredito até
+ELA expirar. Então:
+
+| pergunta | número |
+|---|---|
+| com que frequência o schema é REAVALIADO | uma vez por 10 s por réplica |
+| por quanto tempo um 200 obsoleto pode sobreviver | **`SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS`** — 12 s nos defaults |
+| e se eu subir o `READINESS_CACHE_MS` | a janela cresce junto, **sem teto no contrato de config hoje** |
+
+Consequência operacional: depois que o schema fica incompatível a instância
+ainda pode responder 200 por até 12 s — dentro da janela em que o próprio load
+balancer ainda não declarou o alvo unhealthy — e depois que o `migrate up`
+conserta, ela leva até 12 s a mais para voltar à rotação.
+
+A soma está fixada em `tests/unit/runtime/lifecycle-schema-readiness.spec.ts`:
+mexer em qualquer um dos dois valores reprova o teste com o número novo, para
+esta tabela não apodrecer.
 
 **Ordem de deploy.** O migrator precisa rodar **antes** da aplicação. Um banco
 com ledger v1 (linhas sem checksum) deixa o `/readyz` em 503 com
