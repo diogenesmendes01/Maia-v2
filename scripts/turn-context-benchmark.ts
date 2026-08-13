@@ -850,20 +850,6 @@ export function evaluateGate(
       detail: `máximo simultâneo=${a.max_concurrent_tenants} · pares exercitados=${a.pairs_exercised}`,
     });
 
-    // "Nenhuma saturação contínua do pool por 60 s".
-    //
-    // Comparar a maior SEQUÊNCIA com 60 s e mais nada é um falso verde à espera
-    // de acontecer, e a primeira corrida deste harness o produziu: numa corrida
-    // de 60,1 s o pool ficou saturado em 572 das 572 amostras — 100% do tempo —
-    // e a sequência bateu 57,2 s, portanto "< 60 s", portanto verde. A sequência
-    // é limitada pela DURAÇÃO da corrida, então esse teste sozinho só pergunta
-    // se a corrida foi curta.
-    //
-    // O critério é, então, o que a frase quer dizer: **o pool tem que DRENAR** —
-    // a fila precisa esvaziar pelo menos uma vez — e nunca ficar saturado por
-    // 60 s seguidos. Um pool que jamais drena reprova em qualquer duração de
-    // corrida; não conseguir observar uma janela inteira de 60 s só é motivo de
-    // "não avaliado" quando NADA de errado apareceu.
     // ANTES de perguntar se o pool drenou, perguntar se ALGUÉM OLHOU.
     //
     // Zero amostras era lido como "drenou": uma corrida com `--sample-ms` maior
@@ -885,12 +871,26 @@ export function evaluateGate(
             `cobertura=${(a.pool_sampled_span_ms / 1000).toFixed(1)} s de ${(a.wall_ms / 1000).toFixed(1)} s`,
     });
 
-    const observedFullWindow = a.wall_ms >= th.saturation_ms;
+    // "Nenhuma saturação contínua do pool por 60 s".
+    //
+    // Comparar a maior SEQUÊNCIA com 60 s e mais nada é um falso verde à espera
+    // de acontecer, e a primeira corrida deste harness o produziu: numa corrida
+    // de 60,1 s o pool ficou saturado em 572 das 572 amostras — 100% do tempo —
+    // e a sequência bateu 57,2 s, portanto "< 60 s", portanto verde. A sequência
+    // é limitada pela DURAÇÃO da corrida, então esse teste sozinho só pergunta
+    // se a corrida foi curta.
+    //
+    // O critério é, então, o que a frase quer dizer: **o pool tem que DRENAR** —
+    // a fila precisa esvaziar pelo menos uma vez — e nunca ficar saturado por
+    // 60 s seguidos. Um pool que jamais drena reprova em qualquer duração de
+    // corrida.
+    //
     // "Drenou" é uma contagem EXATA, não uma heurística sobre a duração: se
     // toda amostra viu a fila cheia, a fila nunca esvaziou. Comparar a
     // sequência com uma fração do relógio de parede erra justamente o caso que
     // motivou este critério (57,2 s de sequência em 60,1 s de corrida com
     // 572/572 amostras saturadas passaria por uma folga de 2%).
+    const observedFullWindow = a.wall_ms >= th.saturation_ms;
     const drained = a.pool_saturated_samples < a.pool_samples;
     const streakOk = a.pool_saturation_max_streak_ms < th.saturation_ms;
     // Só é "não avaliado" quando NADA de errado apareceu e a janela inteira não

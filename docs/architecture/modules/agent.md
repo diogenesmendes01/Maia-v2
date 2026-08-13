@@ -199,6 +199,18 @@ only stamps start/end so every read can be attributed to its turn. That is what
 makes "peak concurrent reads for one turn" a measurement rather than a re-reading
 of the gate's own bookkeeping.
 
+**Measuring and gating are different runs.** `--mode` is declared, never inferred
+from a flag buried in the command line: `gate` (the default) emits the verdict,
+`measure` emits an absolute measurement and says in capitals that it is **not**
+the gate, `self-test` proves the gate reproves over synthetic values. The rule
+that ties it together: **a criterion that could not be evaluated (`n/a`) fails in
+`gate` mode** — `Verdict.skipped === true` implies `Verdict.passed === false`.
+Not-evaluated used to mean approved, and that equality is what let a clean
+checkout — which by construction has no baseline, since the file is not checked
+in — exit 0 as if it had cleared the relative criterion. Recording a baseline
+requires `--mode measure`, so the run that judges can never mint the reference it
+will later be judged against.
+
 What the gate decides (exit code 0/1), and why each one is there:
 
 | criterion | limit | why |
@@ -209,9 +221,10 @@ What the gate decides (exit code 0/1), and why each one is there:
 | peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
 | peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
 | distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
+| pool sampling actually observed the run | samples > 0, blind gap ≤ 10× `--sample-ms` | the criterion below is worthless without it — see the trap |
 | pool drains, and is never saturated for 60 s | — | see the trap below |
 | `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
-| p95 vs baseline | ≤ baseline + 20 % | absolute ceilings do not catch a slow drift |
+| p95 vs baseline | ≤ baseline + 20 %, **same fingerprint** | absolute ceilings do not catch a slow drift; a baseline from another load is not a baseline |
 | load shape | 50 pairs, concurrency 20, 1/10/100 | a gate run on 4 tenants is not this gate |
 
 **The saturation trap.** Comparing "longest saturated streak < 60 s" and nothing
@@ -222,6 +235,32 @@ the run's own length, so on its own that test only asks whether the run was
 short. The criterion is now what the sentence means: the pool must **drain** —
 `saturated_samples < samples`, an exact count — *and* never stay saturated for
 60 s straight.
+
+That exact count had its own hole: `samples === 0` was read as "drained". A run
+with `--sample-ms` larger than its own duration, or one where the event loop
+starved the sampler, produced 0/0 and cleared one of the gate's central criteria
+with no observation at all. Observation is now a criterion of its own — zero
+samples fails, and so does a blind gap wider than 10× the requested period, ends
+included — and `--sample-ms` is validated against the window it has to resolve.
+The saturated streak is measured from **timestamps**, not by accumulating the
+requested period: `streak += periodMs` counts periods *asked for*, so a starved
+sampler under-reports without bound, and it starves exactly when the machine is
+under the load worth measuring. Ten samples spread over 61 s used to read as
+"1 s saturated". The accounting lives in `createPoolSaturationTracker` +
+`poolMetricsFromSummary`, separate from the `setInterval`, so the boundary from
+sampler to verdict is testable — fixing only the evaluator would leave `runArm`
+emitting `pool_samples: 0` with the spec green and the real run still lying.
+
+**The baseline fingerprint.** The file records the *shape* of the run that
+produced the number, and an incompatible shape makes the comparison **refused**,
+not merely flagged: `pairs`, `concurrency`, `think_ms`, `identity`,
+`cardinalities`, `pool_max`, `max_concurrent_reads`. `think_ms` alone moves p95
+from 28.8 ms to 187.7 ms on this host, so comparing across it manufactures a
+false green or a false red out of a change in *load*, not code. Host, Node
+version, `turns`, `sustain_s`, `timeout_ms` and `sample_ms` are recorded but not
+compared — a fingerprint that invalidates the baseline every run is noise the
+operator learns to ignore. A pre-fingerprint file is refused too: it cannot prove
+what load it measured.
 
 **Pacing is a parameter, not decoration.** The generator is closed-loop, so with
 `--think-ms 0` twenty turns are always in flight; at up to 6 permits each against
@@ -243,8 +282,14 @@ everybody else: a baseline recorded here at p95 67.0 ms (`cold`) / 75.9 ms
 135.5 / 118.5 ms and then 154.1 / 114.9 ms — the same code, +56 % to +130 % over
 the recorded number, with the gate's own ceilings (600 ms / 1 s) never
 threatened. So each host and each CI lane records its own on first run with
-`--write-baseline`, and without one the harness reports the relative criterion as
-`n/a` and says so loudly. A gate run never writes a baseline as a side effect.
+`--mode measure --write-baseline`, and without one the harness reports the
+relative criterion as `n/a` — **which fails the gate**, because the gate promises
+`p95 ≤ baseline + 20 %` and cannot stamp what it never measured. A gate run never
+writes a baseline as a side effect, and `--write-baseline` outside `--mode
+measure` is refused with exit 2. Not versioning the file was right; letting the
+resulting no-baseline state exit 0 turned "exceptional state that warns" into the
+guaranteed state of every clean checkout, which is the defect that got fixed
+here.
 
 What survives across hosts is the absolute part of the gate — 600 ms p95, 1 s
 p99, zero errors, peak ≤ 6, the pool draining, the metric covering every turn and

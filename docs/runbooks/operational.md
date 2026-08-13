@@ -1227,18 +1227,41 @@ export REDIS_URL=redis://localhost:6379     # o braço `warm` usa o subscriber d
 npm run db:migrate
 ```
 
+### Medir e barrar são coisas diferentes (`--mode`)
+
+O harness faz as duas, e o modo é DECLARADO — não deduzido de uma flag no meio
+do comando:
+
+| `--mode` | o que é | exit code |
+|---|---|---|
+| `gate` (**default**) | o veredicto. Todo critério obrigatório precisa ter sido AVALIADO | `0` aprovado · `1` reprovado (inclui "não avaliado") · `2` erro de uso/infra |
+| `measure` | medição absoluta. **NÃO emite veredicto de gate** e diz isso em caixa alta no relatório | `0` (a medição aconteceu) · `2` erro |
+| `self-test` | prova que o gate reprova, sobre valores sintéticos | como `gate` |
+
+A regra que amarra tudo: **um critério `n/a` reprova em modo `gate`**. Não
+avaliado deixou de ser sinônimo de aprovado — era essa igualdade que deixava um
+checkout limpo, sem baseline registrado, sair com exit 0 como se tivesse passado
+pelo critério relativo. Se você quer medir sem ter a evidência completa, o modo
+é `measure`, e ali o relatório não se apresenta como gate.
+
 ### O comando do gate
 
 ```bash
-# Perfil canônico: 60 s de carga sustentada por braço (~2 min no total).
+# Perfil canônico: 60 s de carga sustentada por braço (~3 min no total).
 # A janela de 60 s é o que torna o critério de saturação do pool FALSIFICÁVEL;
-# sem --sustain-s ele sai como "não avaliado", nunca como aprovado.
+# sem --sustain-s ele sai como "não avaliado" — e "não avaliado" REPROVA.
 npm run turn:bench -- --sustain-s 60
 
 echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
 ```
 
+Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
+Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
+comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+o que não mediu. Para medir sem baseline, use `--mode measure`.
+
 Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
+O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 
 ### Os limites, e o que fazer quando um deles fica vermelho
 
@@ -1249,9 +1272,11 @@ Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
+| `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
 | `o pool drena` | a fila do pool nunca esvaziou | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
 | `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
-| `p95 ≤ baseline + 20%` | regressão relativa | ver "baseline" abaixo antes de culpar o código |
+| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
+| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
 | `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
 
 ### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
@@ -1277,12 +1302,17 @@ por construção, e não é sinal de regressão.
 
 ```bash
 # Grava o p95/p99 medidos como referência. NUNCA acontece como efeito colateral
-# de uma corrida de gate: baseline é decisão.
-npm run turn:bench -- --sustain-s 60 --write-baseline
+# de uma corrida de gate: baseline é decisão, e por isso exige --mode measure.
+npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline
 ```
 
-`scripts/turn-context-baseline.json` carrega `recorded_at`, `host` e um `note`
-dizendo se é a PRIMEIRA medição ou uma re-gravação. O arquivo **não é versionado**
+`--write-baseline` em modo `gate` é **recusado com exit 2**. Sem essa trava, a
+mesma corrida que julga produziria a referência contra a qual ela seria julgada
+depois, e "medição absoluta" e "gate" voltariam a ser a mesma saída.
+
+`scripts/turn-context-baseline.json` carrega `recorded_at`, `host`, um `note`
+dizendo se é a PRIMEIRA medição ou uma re-gravação, e — desde a correção dos
+achados Medium — o **fingerprint da carga**. O arquivo **não é versionado**
 (está no `.gitignore`): é a medição da SUA máquina, e cada host grava o seu na
 primeira corrida. Três regras:
 
@@ -1300,6 +1330,32 @@ primeira corrida. Três regras:
    regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
    aceitou o motivo — não numa corrida solta.
 
+#### O fingerprint: comparar dois p95 medidos com cargas diferentes não é comparar
+
+O baseline grava a FORMA da corrida que o produziu, e a comparação é **recusada**
+— não apenas avisada — quando ela diverge. Comparados:
+
+| campo | por que muda o número medido |
+|---|---|
+| `pairs` | quantos pares distintos a carga toca: localidade de cache e volume por escopo |
+| `concurrency` | é o regime de fila; domina a cauda |
+| `think_ms` | **o que mais move o número**: p95 de 28,8 ms com 150 ms contra 187,7 ms com 0 |
+| `identity` | `legacy` paga um round-trip a mais por turno |
+| `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê |
+| `pool_max` | o denominador da saturação. Pool 10 e pool 20 são dois sistemas |
+| `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`, lido do código |
+
+Registrados mas **não** comparados, de propósito — um fingerprint que invalida o
+baseline a cada corrida vira ruído que o operador aprende a ignorar: `host`,
+`node`/`platform` (o baseline já é por máquina), `turns` e `sustain_s` (p95 é
+estatística de distribuição: rodar mais muda a confiança, não o valor central),
+`timeout_ms` (classifica timeouts, não move latência) e `sample_ms` (observa o
+POOL, não entra no p95 do turno).
+
+Um baseline em formato antigo — sem fingerprint — também é recusado: ele não
+prova com que carga foi medido, e assumir que foi com a certa é o buraco que
+esta trava fecha. Apague o arquivo e re-grave.
+
 Quando um número tem que valer para todo mundo, ele está nos critérios absolutos:
 p95 ≤ 600 ms, p99 ≤ 1 s, zero erros, pico ≤ 6, o pool drenando, a métrica cobrindo
 todos os turnos e a carga com a forma do enunciado. Leia esses primeiro.
@@ -1310,14 +1366,19 @@ O veredicto é código, e código sem prova de falha é decoração. Sem tocar n
 banco:
 
 ```bash
-npm run turn:bench -- --self-test --inject p95_ms=900          # exit 1
+npm run turn:bench -- --self-test --inject p95_ms=900              # exit 1
 npm run turn:bench -- --self-test --inject peak_reads_per_turn=7   # exit 1
-npm run turn:bench -- --self-test --inject cold.errors=1       # exit 1
+npm run turn:bench -- --self-test --inject cold.errors=1           # exit 1
+npm run turn:bench -- --self-test --inject pool_samples=0          # exit 1 — zero amostras não é "drenou"
+npm run turn:bench -- --self-test --self-test-baseline missing     # exit 1 — sem baseline não há gate
+npm run turn:bench -- --self-test --self-test-baseline incompatible # exit 1 — baseline de outra carga
 ```
 
 `--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
-fundos que faz qualquer regressão passar. A bateria completa (todos os critérios,
-incluindo pico baixo demais e pool que nunca drena) vive em
+fundos que faz qualquer regressão passar. O autoteste usa um baseline SINTÉTICO,
+nunca o arquivo da máquina: um gate cujo autoteste muda de resultado conforme o
+host não prova nada. A bateria completa (todos os critérios, incluindo pico baixo
+demais, pool que nunca drena, amostragem cega e baseline incompatível) vive em
 `tests/unit/scripts/turn-context-gate.spec.ts` e roda na suíte normal.
 
 ### Massa e limpeza
