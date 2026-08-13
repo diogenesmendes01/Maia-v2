@@ -16,6 +16,16 @@
  * pior dia possível. `evaluateGate` é puro justamente para que isto seja
  * possível sem Postgres, sem carga e sem relógio.
  *
+ * ## A fronteira, e por que ela também é coberta aqui
+ *
+ * `evaluateGate` ser puro é cômodo, e é onde mora um risco: uma correção que só
+ * exista no AVALIADOR deixa o spec verde enquanto a corrida real segue mentindo
+ * — bastaria `runArm` continuar publicando `pool_samples: 0` como se fosse uma
+ * observação. Por isso a contabilidade da amostragem do pool vive em
+ * `createPoolSaturationTracker` + `poolMetricsFromSummary`, fora do
+ * `setInterval`, e há casos que atravessam o caminho inteiro: amostrador REAL
+ * (`startPoolSampler`, o mesmo que `runArm` usa) → métricas → veredicto.
+ *
  * ## O que este arquivo NÃO prova
  *
  * Que os números medidos estão certos — isso é papel do próprio harness rodando
