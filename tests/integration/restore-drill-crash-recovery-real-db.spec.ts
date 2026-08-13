@@ -28,6 +28,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
+import { pool as appPool } from '@/db/client.js';
 import { readReadinessFacts, restoreDrillStore } from '@/db/repositories/ops-repos.js';
 import { OPS_LOCK_KEYS, tryAcquireOpsLock, type LockPool } from '@/ops/backup/single-flight.js';
 import {
@@ -87,7 +88,7 @@ async function crashAfterCreateDrill(): Promise<string> {
 }
 
 /** A drill that DID finish, old enough that the gate is due for a refresh. */
-async function insertTerminalDrill(agoMs: number): Promise<void> {
+async function insertTerminalDrill(agoMs: number): Promise<Date> {
   const at = new Date(Date.now() - agoMs);
   await pool.query(
     `INSERT INTO restore_drills
@@ -95,6 +96,21 @@ async function insertTerminalDrill(agoMs: number): Promise<void> {
      VALUES ($1, 'local', $2, $2, 90000, 'passed', 'clean')`,
     [CORR, at],
   );
+  return at;
+}
+
+/**
+ * `readReadinessFacts` reads the WHOLE table — it has no tenant or correlation
+ * scope, by design. A restore-drill suite running in parallel would therefore
+ * change what "the last drill" is underneath these cases. That must surface as
+ * a loud, explained failure and never as a wrong verdict, so every case that
+ * depends on owning the newest terminal row asserts it first.
+ */
+function expectOursIsTheNewestTerminal(actual: Date | null, expected: Date): void {
+  expect(
+    actual?.getTime(),
+    'a parallel restore-drill suite inserted a newer terminal drill; this case needs to own it',
+  ).toBe(expected.getTime());
 }
 
 interface Harness {
@@ -143,10 +159,12 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
     // query only looked at terminal rows, so the state that means "residue
     // possible, nobody checked" was invisible to every consumer.
     expect(facts.open_restore_drill_started_at).toBeInstanceOf(Date);
-    // …and it did NOT contaminate the terminal fields, which still describe the
-    // newest FINISHED drill (here: none).
-    expect(facts.last_restore_drill_at).toBeNull();
-    expect(facts.last_restore_drill_result).toBeNull();
+    // …and it did NOT contaminate the terminal fields: whatever the newest
+    // FINISHED drill is, it is not this one. (Asserted as "not the same row"
+    // rather than "no terminal drill at all", because the table is shared.)
+    expect(facts.last_restore_drill_at?.getTime()).not.toBe(
+      facts.open_restore_drill_started_at!.getTime(),
+    );
   });
 
   it('the restart really does free the advisory lock — nothing else would stop a second drill', async () => {
@@ -164,7 +182,7 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
 
   it('blocks the next drill while the crashed execution is unaccounted for', async () => {
     // The full sequence: previous evidence is old enough to be due…
-    await insertTerminalDrill(200 * HOURS);
+    const terminalAt = await insertTerminalDrill(200 * HOURS);
     // …a drill crashed after writing its row…
     await crashAfterCreateDrill();
 
@@ -173,11 +191,11 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
     // the case would still pass with the old `IN ('passed','failed')` filter,
     // which returns an ancient timestamp that happens to look abandoned too.
     const facts = await readReadinessFacts();
+    expectOursIsTheNewestTerminal(facts.last_restore_drill_at, terminalAt);
     expect(facts.open_restore_drill_started_at).toBeInstanceOf(Date);
     expect(facts.open_restore_drill_started_at!.getTime()).toBeGreaterThan(
       Date.now() - 5 * 60_000,
     );
-    expect(facts.last_restore_drill_at!.getTime()).toBeLessThan(Date.now() - 100 * HOURS);
 
     // …and the worker wakes up well past the abandonment cutoff.
     const now = new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS);
@@ -207,8 +225,9 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
     // OK and `/metrics` would paint `maia_restore_drill_check_level = 0` for
     // days — while a decrypted copy of every tenant's data may be sitting on
     // this host from an execution nobody accounted for.
-    await insertTerminalDrill(24 * HOURS);
+    const terminalAt = await insertTerminalDrill(24 * HOURS);
     await crashAfterCreateDrill();
+    expectOursIsTheNewestTerminal((await readReadinessFacts()).last_restore_drill_at, terminalAt);
 
     const now = new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS);
     const h = harness(now);
@@ -225,8 +244,9 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
   });
 
   it('a drill still inside its budget reads as IN FLIGHT, not as a corpse', async () => {
-    await insertTerminalDrill(200 * HOURS);
+    const terminalAt = await insertTerminalDrill(200 * HOURS);
     await crashAfterCreateDrill();
+    expectOursIsTheNewestTerminal((await readReadinessFacts()).last_restore_drill_at, terminalAt);
 
     // Same row, clock a minute later: this is what a healthy drill looks like
     // from the outside, and it must not page anyone.
@@ -239,8 +259,9 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
   });
 
   it('drills again once the crashed row is terminalized', async () => {
-    await insertTerminalDrill(200 * HOURS);
+    const terminalAt = await insertTerminalDrill(200 * HOURS);
     const crashed = await crashAfterCreateDrill();
+    expectOursIsTheNewestTerminal((await readReadinessFacts()).last_restore_drill_at, terminalAt);
 
     // The operator cleans the host and closes the row — the documented unlock
     // (runbook §4.2). `unsafe` would keep blocking on the OTHER rule, so the
@@ -278,14 +299,16 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
   it('the block survives a tick that would otherwise RETRY a failed drill', async () => {
     // The retry window is much shorter than the refresh window, so it is the
     // path most likely to fire soon after a crash.
+    const failedAt = new Date(Date.now() - 100 * HOURS);
     await pool.query(
       `INSERT INTO restore_drills
          (correlation_id, source, started_at, finished_at, duration_ms, status,
           failure_code, cleanup_status)
        VALUES ($1, 'local', $2, $2, 5000, 'failed', 'restore_failed', 'clean')`,
-      [CORR, new Date(Date.now() - 100 * HOURS)],
+      [CORR, failedAt],
     );
     await crashAfterCreateDrill();
+    expectOursIsTheNewestTerminal((await readReadinessFacts()).last_restore_drill_at, failedAt);
 
     const facts = await readReadinessFacts();
     // Same guard as above: the block must come from the crashed row, not from
@@ -300,6 +323,113 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
 
     expect(res.decision.reason).toBe('abandoned_drill_blocks');
     expect(h.drills()).toBe(0);
+  });
+
+  /**
+   * ROUND 2 OF THE REVIEW — the same High, in its transition form.
+   *
+   * The two drill facts used to come from two independent statements, each in
+   * its own autocommit and therefore its own snapshot. A drill terminalizing
+   * BETWEEN them produced a state that never existed: the terminal query still
+   * returned the OLD row, and the open query no longer found the execution,
+   * because it had just become terminal. With the new terminal row being
+   * `unsafe`, the tick graded the previous `clean` one, found it due, took the
+   * lock the finished drill had just released, and started a second drill.
+   *
+   * The pause point is taken at the DRIVER, not in production code: every
+   * drizzle statement bottoms out in `pool.query` (see `instrumentQueries` in
+   * `src/db/client.ts`), so the test can let the read's statements run and
+   * commit the transition in the gap between them, from another connection.
+   * Nothing is injected into `readReadinessFacts` itself.
+   *
+   * With ONE statement for both facts there is no gap to slip through: the
+   * transition lands after the snapshot and the drill stays visible as open.
+   * With two, the interleave is exactly the window above — and this case goes
+   * red, which is the point.
+   */
+  it('sees no impossible snapshot when a drill terminalizes MID-READ', async () => {
+    const terminalAt = await insertTerminalDrill(200 * HOURS);
+    const crashed = await crashAfterCreateDrill();
+    expectOursIsTheNewestTerminal((await readReadinessFacts()).last_restore_drill_at, terminalAt);
+
+    // A second connection, so the transition commits independently of whatever
+    // connection the read is holding.
+    const writer = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
+    let transitions = 0;
+    let drillStatements = 0;
+
+    // `appPool` is the pool drizzle wraps (`src/db/client.ts`), NOT the test's
+    // own connection — patching the test pool would intercept nothing.
+    const originalQuery = appPool.query.bind(appPool);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (appPool as any).query = async (...args: any[]) => {
+      const text = typeof args[0] === 'string' ? args[0] : String(args[0]?.text ?? '');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await (originalQuery as (...a: any[]) => Promise<unknown>)(...args);
+      if (/restore_drills/i.test(text)) {
+        drillStatements += 1;
+        // AFTER the first statement that touched restore_drills, and before any
+        // next one: the drill finishes, UNSAFE. This is the window.
+        if (transitions === 0) {
+          transitions += 1;
+          await writer.query(
+            `UPDATE restore_drills
+                SET status = 'failed', finished_at = now(), duration_ms = 1000,
+                    failure_code = 'cleanup_failed', cleanup_status = 'unsafe'
+              WHERE id = $1`,
+            [crashed],
+          );
+        }
+      }
+      return result;
+    };
+
+    let facts;
+    try {
+      facts = await readReadinessFacts();
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appPool as any).query = originalQuery;
+      await writer.end();
+    }
+
+    // The interleave really happened…
+    expect(transitions).toBe(1);
+
+    // …and the snapshot is internally consistent: the execution is still OPEN,
+    // and the terminal fields still describe the drill that had finished BEFORE
+    // the read started. Never "neither" — which is the impossible state.
+    expect(
+      facts!.open_restore_drill_started_at,
+      'the drill vanished from BOTH facts: the open row terminalized between two reads',
+    ).toBeInstanceOf(Date);
+    expect(facts!.last_restore_drill_at?.getTime()).toBe(terminalAt.getTime());
+
+    // And the decisor, fed that snapshot, starts nothing.
+    const h = harness(new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS));
+    const res = await runRestoreDrillTick(
+      { ...h.ports, readFacts: async () => facts! },
+      profile(),
+    );
+    expect(h.drills()).toBe(0);
+    expect(res.decision.reason).toBe('abandoned_drill_blocks');
+
+    // The NEXT tick reads the committed transition and blocks on the other
+    // rule — `unsafe` — so there is no tick at which a second drill may start.
+    const after = harness(new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS));
+    const resAfter = await runRestoreDrillTick(after.ports, profile());
+    expect(after.drills()).toBe(0);
+    expect(resAfter.decision.reason).toBe('residue_blocks_drill');
+
+    // The MECHANISM behind all of the above: both facts came from ONE
+    // statement, so there was no gap for the transition to land in. Asserted
+    // last, so that splitting the read shows up first as the wrong VERDICT and
+    // only then as the wrong number of round trips.
+    expect(
+      drillStatements,
+      'readReadinessFacts issued more than one statement against restore_drills — ' +
+        'the two facts no longer share a snapshot',
+    ).toBe(1);
   });
 
   it('the abandonment cutoff is derived from the profile budgets, with a floor', async () => {
