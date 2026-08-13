@@ -74,6 +74,7 @@ function schedule(over: Partial<RestoreDrillScheduleInput> = {}) {
     last_restore_drill_at: new Date(NOW.getTime() - 24 * HOURS),
     last_restore_drill_result: 'passed',
     last_restore_drill_cleanup_status: 'clean',
+    open_restore_drill_started_at: null,
     ...over,
   });
 }
@@ -153,6 +154,63 @@ describe('restoreDrillDue — the interval is a MAX AGE, not a schedule', () => 
     expect(d.evidence_expired).toBe(true);
   });
 
+  it('BLOCKS while an execution has no proven teardown, with its own reason', () => {
+    // A drill that died after `createDrill` leaves `running` /
+    // `cleanup_status='unknown'` — "residue possible, nobody checked". Starting
+    // another would make a SECOND decrypted copy of production.
+    const d = schedule({
+      last_restore_drill_at: new Date(NOW.getTime() - 500 * HOURS),
+      open_restore_drill_started_at: new Date(NOW.getTime() - 48 * HOURS),
+    });
+    expect(d.due).toBe(false);
+    expect(d.reason).toBe('abandoned_drill_blocks');
+    // NOT the same diagnosis as a teardown that ran and failed: that one says
+    // "we know a copy is there", this one says "nobody looked".
+    expect(d.reason).not.toBe('residue_blocks_drill');
+  });
+
+  it('reads a young non-terminal row as a drill IN FLIGHT, not as a corpse', () => {
+    const d = schedule({
+      last_restore_drill_at: new Date(NOW.getTime() - 500 * HOURS),
+      open_restore_drill_started_at: new Date(NOW.getTime() - 60_000),
+    });
+    expect(d.due).toBe(false);
+    expect(d.reason).toBe('drill_in_flight');
+  });
+
+  it('uses the profile budgets for the abandonment cutoff, not a bare constant', () => {
+    // 2 × (upload + restore), floored at 1h — the same "twice the budget" rule
+    // `reclaimAbandonedRuns` applies to backup_runs.
+    const slow = devProfile({
+      BACKUP_UPLOAD_TIMEOUT_MS: 4 * 3_600_000,
+      BACKUP_RESTORE_TIMEOUT_MS: 4 * 3_600_000,
+    });
+    // 12h old, cutoff 16h ⇒ still in flight under the slow profile…
+    const inFlight = schedule({
+      profile: slow,
+      open_restore_drill_started_at: new Date(NOW.getTime() - 12 * HOURS),
+    });
+    expect(inFlight.reason).toBe('drill_in_flight');
+    // …and a corpse under the default one.
+    const corpse = schedule({
+      open_restore_drill_started_at: new Date(NOW.getTime() - 12 * HOURS),
+    });
+    expect(corpse.reason).toBe('abandoned_drill_blocks');
+  });
+
+  it('an unaccounted-for execution outranks even a never-run gate', () => {
+    // "Never drilled" is normally the strongest reason to drill NOW. It still
+    // loses to "a copy of production may be on the host".
+    const d = schedule({
+      last_restore_drill_at: null,
+      last_restore_drill_result: null,
+      last_restore_drill_cleanup_status: null,
+      open_restore_drill_started_at: new Date(NOW.getTime() - 48 * HOURS),
+    });
+    expect(d.due).toBe(false);
+    expect(d.reason).toBe('abandoned_drill_blocks');
+  });
+
   it('runs nothing when backups are disabled by configuration', () => {
     const d = schedule({
       profile: devProfile({ BACKUP_ENABLED: false }),
@@ -182,6 +240,7 @@ function facts(over: Partial<DrillEvidenceFacts> = {}): DrillEvidenceFacts {
     last_restore_drill_result: 'passed',
     last_restore_drill_duration_ms: 90_000,
     last_restore_drill_cleanup_status: 'clean',
+    open_restore_drill_started_at: null,
     consecutive_failures: 0,
     ...over,
   };
@@ -279,6 +338,28 @@ describe('runRestoreDrillTick — absence of evidence is not evidence of success
     // verdict must not claim the stronger one.
     expect(res.decision.reason).toBe('evidence_unreadable');
     expect(res.decision.evidence_expired).toBe(true);
+  });
+});
+
+describe('runRestoreDrillTick — an unaccounted-for execution is reported loudly', () => {
+  it('logs its own event, distinct from the residue one, and reddens the gate', async () => {
+    const h = harness({
+      facts: facts({
+        // Terminal evidence FRESH: age alone would grade OK.
+        last_restore_drill_at: new Date(NOW.getTime() - 24 * HOURS),
+        open_restore_drill_started_at: new Date(NOW.getTime() - 48 * HOURS),
+      }),
+    });
+    const res = await runRestoreDrillTick(h.ports, prodProfile());
+
+    expect(h.drills()).toBe(0);
+    expect(res.decision.reason).toBe('abandoned_drill_blocks');
+    expect(res.drill_check_level).toBe('FAIL');
+    const line = h.logs.find((l) => l.event === 'restore_drill.blocked_by_abandoned_drill');
+    expect(line?.level).toBe('error');
+    expect(line?.detail.open_drill_age_seconds).toBe(48 * 3600);
+    // The two emergencies never share an event name.
+    expect(h.logs.some((l) => l.event === 'restore_drill.blocked_by_residue')).toBe(false);
   });
 });
 

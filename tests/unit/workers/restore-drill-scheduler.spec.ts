@@ -26,6 +26,7 @@ const { drillSpy, facts, heldLocks, lockCalls, sendAlertSpy } = vi.hoisted(() =>
       last_restore_drill_result: null as 'passed' | 'failed' | null,
       last_restore_drill_duration_ms: null as number | null,
       last_restore_drill_cleanup_status: null as 'clean' | 'unsafe' | 'unknown' | null,
+      open_restore_drill_started_at: null as Date | null,
       consecutive_failures: 0,
     },
   },
@@ -139,6 +140,7 @@ beforeEach(() => {
     last_restore_drill_result: null,
     last_restore_drill_duration_ms: null,
     last_restore_drill_cleanup_status: null,
+    open_restore_drill_started_at: null,
     consecutive_failures: 0,
   };
 });

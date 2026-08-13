@@ -41,6 +41,18 @@ export interface BackupReadinessInput {
   last_offsite_verified_at: Date | null;
   last_restore_drill_at: Date | null;
   last_restore_drill_result: 'passed' | 'failed' | null;
+  /**
+   * Start time of the OLDEST restore drill that never reached a terminal state
+   * — `null` when there is none (issue #536, owner review of #553).
+   *
+   * A drill whose process died between `createDrill` and `finishDrill` leaves
+   * `status='running'` / `cleanup_status='unknown'`, which `drill.ts` defines
+   * as "residue possible, nobody checked". Grading only TERMINAL rows made that
+   * state invisible: readiness reported OK while a decrypted copy of every
+   * tenant's data might be sitting on the host. It is a fact of the readiness
+   * verdict for the same reason `last_restore_drill_result` is.
+   */
+  open_restore_drill_started_at: Date | null;
   /** Duration of the last passing drill — the measured RTO contribution. */
   last_restore_drill_duration_ms: number | null;
   /** Consecutive failed runs since the last success. */
@@ -60,6 +72,39 @@ const HOUR_MS = 3_600_000;
 
 /** Early-warning threshold: warn at 75% of the budget, before the violation. */
 const WARN_FRACTION = 0.75;
+
+/**
+ * Floor under the abandonment cutoff. A development/test profile can set the
+ * stage budgets to milliseconds; without a floor, a drill that is legitimately
+ * running would be declared a corpse seconds after it started, and the gate
+ * would block the very execution that is about to refresh it.
+ */
+const ABANDONED_DRILL_FLOOR_MS = 3_600_000;
+
+/**
+ * How old a NON-TERMINAL `restore_drills` row has to be before it is a corpse
+ * rather than a drill in flight (issue #536, owner review of #553).
+ *
+ * The rule mirrors `reclaimAbandonedRuns` (`src/workers/backup.ts`), which uses
+ * TWICE the dump budget for the same judgement on `backup_runs`: past twice the
+ * budget, no legitimate execution could still be running, so what is left is
+ * debris from a process that died. Here the drill's budget is the sum of the
+ * two stages the profile actually bounds — the transfer (`uploadMs`, the only
+ * knob for the S3 leg; the download itself is NOT separately time-boxed) and
+ * `pg_restore` (`restoreMs`). With the shipped defaults that is 2 × (30min +
+ * 1h) = 3h.
+ *
+ * WHY THE DISTINCTION EXISTS AT ALL, given that both states block: an operator
+ * paged at 03:00 has to know whether to wait (a drill IS running) or to go look
+ * at the host (a drill died holding a plaintext copy). Collapsing them would
+ * make the second one indistinguishable from normal operation.
+ */
+export function abandonedDrillAfterMs(profile: ResolvedBackupProfile): number {
+  return Math.max(
+    ABANDONED_DRILL_FLOOR_MS,
+    2 * (profile.timeouts.uploadMs + profile.timeouts.restoreMs),
+  );
+}
 
 function ageSeconds(now: Date, then: Date | null): number | null {
   if (then === null) return null;
@@ -169,8 +214,19 @@ export function evaluateBackupReadiness(input: BackupReadinessInput): BackupRead
 
   // ── 4. Restore drill (the only proof a backup is restorable) ───────────
   const drillBudget = profile.objectives.restoreDrillIntervalHours * 3600;
-  const drillLevel: ReadinessLevel =
-    input.last_restore_drill_result === 'failed'
+  // An execution that never reached a terminal state and is too old to still
+  // be in flight (issue #536, owner review of #553). It is graded on the SAME
+  // check as drill age, not a new one, because it answers the same question —
+  // "is any backup known to be restorable right now?" — and because
+  // `drillCheckLevel` (hence `maia_restore_drill_check_level` and the alert in
+  // `monitoring/alerts/backup.rules.yml`) reads exactly this id. A separate
+  // check would have been a second gate nobody alerts on.
+  const openDrillAge = ageSeconds(now, input.open_restore_drill_started_at);
+  const abandonedDrill =
+    openDrillAge !== null && openDrillAge * 1000 >= abandonedDrillAfterMs(profile);
+  const drillLevel: ReadinessLevel = abandonedDrill
+    ? 'FAIL'
+    : input.last_restore_drill_result === 'failed'
       ? 'FAIL'
       : gradeAge(drillAge, drillBudget, profile.name === 'production' ? 'FAIL' : 'WARN');
   checks.push({
@@ -180,8 +236,19 @@ export function evaluateBackupReadiness(input: BackupReadinessInput): BackupRead
       age_seconds: drillAge,
       interval_target_seconds: drillBudget,
       last_result: input.last_restore_drill_result,
+      open_drill_age_seconds: openDrillAge,
+      abandoned_drill: abandonedDrill,
     },
-    remediation:
+    remediation: abandonedDrill
+      ? // Deliberately ahead of the "last drill FAILED" wording below: this
+        // state is not a verdict about an artifact, it is a possible copy of
+        // production data on the host that NOBODY has checked. The remediation
+        // is a host inspection, not a re-drill.
+        'A restore drill never reached a terminal state and is too old to still be running: ' +
+        'its process died with a decrypted copy of production possibly still on the host, and ' +
+        'nothing has proven the teardown. Inspect the host and terminalize the row before ' +
+        'another drill may start (runbook §4.2).'
+      :
       input.last_restore_drill_result === 'failed'
         ? // Readiness grades on `status` alone, which is deliberately
           // conservative: a drill that restored perfectly but left a copy of

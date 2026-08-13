@@ -40,6 +40,7 @@
 import type { ResolvedBackupProfile } from './profile.js';
 import { redactSecrets } from './redaction.js';
 import {
+  abandonedDrillAfterMs,
   drillCheckLevel,
   evaluateBackupReadiness,
   type BackupReadinessInput,
@@ -118,6 +119,13 @@ export type RestoreDrillDueReason =
   | 'backups_disabled'
   /** The previous drill left (or may have left) a copy of production behind. */
   | 'residue_blocks_drill'
+  /** A drill is running right now. Normal operation — nothing to do this tick. */
+  | 'drill_in_flight'
+  /**
+   * A drill never reached a terminal state and is too old to still be running:
+   * its process died and NOBODY checked whether the teardown happened.
+   */
+  | 'abandoned_drill_blocks'
   /** No drill has ever reached a terminal state. */
   | 'never_ran'
   /** The last drill is old enough that the evidence is about to expire. */
@@ -139,6 +147,8 @@ export interface RestoreDrillScheduleInput {
   last_restore_drill_at: Date | null;
   last_restore_drill_result: 'passed' | 'failed' | null;
   last_restore_drill_cleanup_status: DrillCleanupStatusFact | null;
+  /** Oldest drill that never reached a terminal state; `null` when none. */
+  open_restore_drill_started_at: Date | null;
 }
 
 export interface RestoreDrillScheduleDecision {
@@ -198,6 +208,21 @@ export function restoreDrillDue(
     // there; the scheduler agrees and runs nothing. `runRestoreDrill` would
     // return `skipped` anyway, and a `skipped` row is not evidence.
     return { ...base, due: false, reason: 'backups_disabled' };
+  }
+
+  // An execution with no PROVEN teardown outranks every other consideration,
+  // including a stale gate. Checked BEFORE `residue_blocks_drill` because it is
+  // the less-known state of the two: `unsafe` means a teardown ran and failed,
+  // this means nobody knows whether one ran at all.
+  const openAge = ageSeconds(input.now, input.open_restore_drill_started_at);
+  if (openAge !== null) {
+    return openAge * 1000 < abandonedDrillAfterMs(input.profile)
+      ? // A drill IS running (or crashed moments ago, still inside its own
+        // budget). Not an alarm and not a block in any meaningful sense — the
+        // advisory lock would refuse a second drill anyway. Reported as its own
+        // reason so the operator can tell "busy" from "broken".
+        { ...base, due: false, reason: 'drill_in_flight' }
+      : { ...base, due: false, reason: 'abandoned_drill_blocks' };
   }
 
   if (input.last_restore_drill_cleanup_status === 'unsafe') {
@@ -292,6 +317,7 @@ export async function runRestoreDrillTick(
     last_restore_drill_at: facts.last_restore_drill_at,
     last_restore_drill_result: facts.last_restore_drill_result,
     last_restore_drill_cleanup_status: facts.last_restore_drill_cleanup_status,
+    open_restore_drill_started_at: facts.open_restore_drill_started_at,
   });
 
   if (profile.objectives.restoreDrillIntervalHours < MIN_HONOURABLE_INTERVAL_HOURS) {
@@ -318,6 +344,15 @@ export async function runRestoreDrillTick(
     due_after_seconds: decision.due_after_seconds,
     last_result: facts.last_restore_drill_result,
     cleanup_status: facts.last_restore_drill_cleanup_status,
+    open_drill_age_seconds:
+      facts.open_restore_drill_started_at === null
+        ? null
+        : Math.max(
+            0,
+            Math.round(
+              (now.getTime() - facts.open_restore_drill_started_at.getTime()) / 1000,
+            ),
+          ),
   };
 
   // The verdict is logged on EVERY tick, at a level that matches it. An expired
@@ -345,6 +380,18 @@ export async function runRestoreDrillTick(
         impact:
           'the previous drill could not prove it removed the decrypted copy it made; ' +
           'refusing to start another until the host is cleaned (runbook §4.2)',
+      });
+    }
+    if (decision.reason === 'abandoned_drill_blocks') {
+      // A DIFFERENT emergency from the one above, and the log says so: there,
+      // a teardown ran and failed; here nobody knows whether one ran at all.
+      ports.log('error', 'restore_drill.blocked_by_abandoned_drill', {
+        ...verdict,
+        impact:
+          'a drill never reached a terminal state and is too old to still be running: its ' +
+          'process died with a decrypted copy of production possibly still on the host. ' +
+          'Refusing to start another — a second drill would make a SECOND copy without ' +
+          'the first ever being proven gone (runbook §4.2)',
       });
     }
     return result('not_due');

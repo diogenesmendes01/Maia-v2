@@ -151,9 +151,13 @@ O drill nunca imprime o caminho nem o nome do banco (esses textos vão para log 
 SELECT id, started_at, status, failure_code, probes->'cleanup' AS cleanup
 FROM restore_drills WHERE cleanup_status = 'unsafe' ORDER BY started_at DESC;
 
--- Drills que morreram no meio: ninguém conferiu o teardown
-SELECT id, started_at FROM restore_drills
-WHERE status = 'running' AND started_at < now() - interval '6 hours';
+-- Drills que morreram no meio: ninguém conferiu o teardown.
+-- Este é o estado que BLOQUEIA o próximo drill (§4.3): `unknown` significa
+-- "resíduo possível, ninguém conferiu", e o corte abaixo tem que casar com o
+-- do código (2× (upload + restore), piso de 1h — 3h nos defaults).
+SELECT id, started_at, status, cleanup_status FROM restore_drills
+WHERE status NOT IN ('passed', 'failed', 'skipped')
+ORDER BY started_at;
 ```
 
 ```bash
@@ -191,6 +195,8 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 | Passou de 75% do intervalo | Dispara o drill. 75% é a **mesma fração** em que `rpo.ts` levanta o WARN: o drill começa quando a readiness fica âmbar e termina antes de ficar vermelha |
 | Último drill **falhou**, e passou de **12,5%** do intervalo | Dispara de novo. Janela própria e mais curta: boa parte das falhas é transitória, e esperar 75% manteria a plataforma em FAIL por dias por causa de um soluço |
 | **Nunca rodou** | Dispara — e a evidência já conta como **vencida**. Ausência de evidência não é evidência de backup restaurável |
+| Existe drill **não-terminal** mais novo que o corte de abandono | **Nada** — há drill em curso (`drill_in_flight`). Não é alarme: o lock recusaria um segundo de qualquer jeito |
+| Existe drill **não-terminal** mais velho que o corte de abandono | **Recusa** e loga `restore_drill.blocked_by_abandoned_drill` em nível error; a gate vai a **FAIL mesmo com evidência terminal fresca**. O processo morreu com uma cópia em claro da produção possivelmente no host, e ninguém conferiu (§4.4) |
 | Último drill deixou **resíduo** (`cleanup_status='unsafe'`) | **Recusa** e loga `restore_drill.blocked_by_residue` em nível error. Outro drill faria uma **segunda** cópia em claro da produção em vez de provar coisa alguma. Limpe o host (§4.2) e o próximo tick volta a drillar |
 | `BACKUP_ENABLED=false` | Nada. Não há o que drillar |
 
@@ -213,6 +219,31 @@ O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observa
 | `RestoreDrillEvidenceNotProvable` | `maia_restore_drill_check_level >= 2` por 30min | **Nada é sabidamente restaurável.** Descubra qual dos quatro casos é em `restore_drills` (`ORDER BY started_at DESC LIMIT 5`) — vencido, falhou, nunca rodou, ou evidência ilegível — e siga §4.1: `cleanup_failed` e os demais códigos pedem ações OPOSTAS |
 | `RestoreDrillEvidenceAging` | `maia_restore_drill_check_level == 1` por 6h | O agendador deveria ter renovado a evidência aos 75% e não renovou. Confira se o job `restore_drill` está agendado (log `worker.scheduled`) e se o último drill deixou resíduo — resíduo BLOQUEIA o próximo drill de propósito (§4.2) |
 
+
+### 4.4 O drill que morreu no meio (issue #536, review da #553)
+
+Um drill que caiu entre `createDrill` e `finishDrill` deixa a linha em `status='running'`, `cleanup_status='unknown'` — que pelo contrato do §4.1 significa **"resíduo possível, ninguém conferiu"**. Três coisas o tornavam perigoso e as três estão fechadas:
+
+1. **O restart NÃO protege.** O `maia_ops_restore_drill` é advisory lock de **sessão**: o processo morto levou o lock junto, e o worker reiniciado o pega sem contenção. Nada mais sobrevive ao crash para recusar o segundo drill.
+2. **Os fatos enxergam a linha.** `readReadinessFacts` devolve `open_restore_drill_started_at` — o **mais antigo** drill não-terminal (com um vivo e um cadáver, o cadáver é o que importa). É campo **novo**: os quatro `last_restore_drill_*` continuam descrevendo o último drill TERMINAL, porque é deles que sai o RPO/RTO.
+3. **O gate fica vermelho mesmo com evidência fresca.** `maia_restore_drill_check_level` vai a 2, então `RestoreDrillEvidenceNotProvable` dispara. Sem isso, um drill aprovado ontem pintava OK por dias com uma cópia da produção parada no host.
+
+**O corte de abandono.** `2 × (BACKUP_UPLOAD_TIMEOUT_MS + BACKUP_RESTORE_TIMEOUT_MS)`, com piso de 1h — **3h nos defaults**. É a mesma regra de "duas vezes o orçamento" que o `reclaimAbandonedRuns` já aplica a `backup_runs`: passado esse ponto nenhuma execução legítima poderia ainda estar rodando. Os dois estágios somados são os que o profile realmente limita (o download do off-site não tem knob próprio). Abaixo do corte é `drill_in_flight`; acima é cadáver.
+
+**Como destravar** (o bloqueio é intencionalmente indefinido até um humano agir — é uma cópia em claro dos dados de todos os tenants):
+
+1. ache a linha com a consulta de §4.2 (`status NOT IN ('passed','failed','skipped')`);
+2. procure o resíduo daquele drill — banco `maia_drill_%` e arquivos em `BACKUP_DIR/restore-drill/` — e remova o que achar (§4.2);
+3. **feche a linha**, que é o que o scheduler lê:
+
+```sql
+UPDATE restore_drills
+   SET status = 'failed', finished_at = now(), failure_code = 'unexpected',
+       cleanup_status = 'clean'   -- só depois de VERIFICAR o host
+ WHERE id = '<id>';
+```
+
+Fechar como `failed` é honesto: aquele drill não provou nada. A partir daí vale a janela de **retry** (12,5% do intervalo, ~21h no semanal), não a de refresh. Se você não conseguiu provar que o host está limpo, feche com `cleanup_status='unsafe'` — aí o bloqueio continua, pela outra regra, que é o que se quer.
 
 **Por que isto não está no `/readyz`.** Um drill vencido não torna a réplica incapaz de atender uma requisição, e `/readyz` decide roteamento de tráfego. Reprovar lá derrubaria a plataforma por um problema de evidência de backup — um outage causado pelo monitor. A superfície certa para "nossa postura de recuperação não é demonstrável" é a readiness operacional: o gauge, o alerta e a linha de log por tick.
 

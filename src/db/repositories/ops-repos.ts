@@ -7,7 +7,7 @@
  * migration 101 enforces with a CHECK — so a caller that somehow arrived under
  * a real tenant context is rejected by the database, not silently accepted.
  */
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { db } from '@/db/client.js';
 import {
   backup_manifests,
@@ -391,6 +391,23 @@ export interface ReadinessFacts {
    * terminal state.
    */
   last_restore_drill_cleanup_status: 'clean' | 'unsafe' | 'unknown' | null;
+  /**
+   * Start time of the OLDEST drill that never reached a terminal state — the
+   * `running` / `cleanup_status='unknown'` rows (issue #536, owner review of
+   * #553). `null` when there is none.
+   *
+   * ADDITIVE on purpose: the four `last_restore_drill_*` fields above keep
+   * meaning exactly what they meant (the newest TERMINAL drill), because
+   * `rpo.ts` grades RPO/RTO from them and widening that query would have
+   * changed what "the last drill" means for every consumer. This is a separate
+   * question — "is there an execution whose teardown nobody ever proved?" — and
+   * it gets a separate field.
+   *
+   * The OLDEST rather than the newest: with one live drill and one corpse, the
+   * corpse is the row that matters, and it is the one whose age decides whether
+   * this is normal operation or debris.
+   */
+  open_restore_drill_started_at: Date | null;
   consecutive_failures: number;
 }
 
@@ -426,6 +443,17 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
     .from(restore_drills)
     .where(sql`${restore_drills.status} IN ('passed', 'failed')`)
     .orderBy(desc(restore_drills.finished_at))
+    .limit(1);
+
+  // The oldest execution that never reached a terminal state. `skipped` is
+  // excluded with the terminal states: `runRestoreDrill` returns it BEFORE
+  // creating a row (backups disabled), so a skipped drill never staged a file
+  // nor created a database — there is nothing of it left on the host.
+  const [openRow] = await db
+    .select({ started_at: restore_drills.started_at })
+    .from(restore_drills)
+    .where(sql`${restore_drills.status} NOT IN ('passed', 'failed', 'skipped')`)
+    .orderBy(asc(restore_drills.started_at))
     .limit(1);
 
   // Consecutive failures since the last non-failed terminal run.
@@ -466,6 +494,7 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
         : drillRow.cleanup === 'clean' || drillRow.cleanup === 'unsafe'
           ? drillRow.cleanup
           : 'unknown',
+    open_restore_drill_started_at: openRow?.started_at ?? null,
     consecutive_failures: Number(failures.rows[0]?.n ?? 0),
   };
 }

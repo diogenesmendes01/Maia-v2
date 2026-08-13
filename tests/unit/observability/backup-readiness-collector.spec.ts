@@ -56,6 +56,7 @@ function facts(over: Partial<DrillEvidenceFacts> = {}): DrillEvidenceFacts {
     last_restore_drill_result: 'passed',
     last_restore_drill_duration_ms: 90_000,
     last_restore_drill_cleanup_status: 'clean',
+    open_restore_drill_started_at: null,
     consecutive_failures: 0,
     ...over,
   };
@@ -103,6 +104,24 @@ describe('maia_restore_drill_check_level — the gate', () => {
     // Never measured: no age series rather than a sentinel that would read as
     // either "just drilled" or "drilled long ago".
     expect(g.maia_restore_drill_age_seconds).toBeUndefined();
+  });
+
+  it('is 2 while an execution has no proven teardown, even with fresh evidence', async () => {
+    // The scraped surface of the #553 finding: a drill passed 24h ago, so drill
+    // AGE grades OK — but an execution that died without proving its teardown
+    // means a decrypted copy of production may be on the host. Green here would
+    // be the alert telling the operator that everything is fine.
+    const g = await backupReadinessGaugeSnapshot(
+      deps({ open_restore_drill_started_at: new Date(NOW.getTime() - 48 * HOURS) }),
+    );
+    expect(g.maia_restore_drill_check_level).toBe(2);
+  });
+
+  it('is not moved by a drill that is still inside its budget', async () => {
+    const g = await backupReadinessGaugeSnapshot(
+      deps({ open_restore_drill_started_at: new Date(NOW.getTime() - 60_000) }),
+    );
+    expect(g.maia_restore_drill_check_level).toBe(0);
   });
 
   it('is 2 when the last drill FAILED, however recent', async () => {
