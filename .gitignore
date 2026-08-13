@@ -75,3 +75,6 @@ dump.rdb
 # Baseline do gate da #525 (`npm run turn:bench`): é uma medição DAQUELA máquina,
 # não um artefato compartilhado. Cada host/esteira grava o seu com --write-baseline.
 scripts/turn-context-baseline.json
+
+# Saídas de corrida do gate da #525 (`npm run turn:bench`) — artefatos locais.
+bench-*.out
