@@ -1963,7 +1963,9 @@ function renderReport(
       const mine = fingerprint[k];
       const theirs = baseline?.fingerprint?.[k];
       const show = (v: unknown): string => (v === undefined ? '—' : Array.isArray(v) ? v.join('/') : String(v));
-      const flag = show(mine) === show(theirs) ? '' : ' ⚠';
+      // Sem baseline não há divergência a apontar: marcar as sete linhas com ⚠
+      // seria ruído sobre uma informação que o bloco acima já deu em caixa alta.
+      const flag = theirs === undefined || show(mine) === show(theirs) ? '' : ' ⚠';
       return `| \`${k}\` | ${show(mine)} | ${show(theirs)}${flag} |`;
     }),
   ].join('\n');
