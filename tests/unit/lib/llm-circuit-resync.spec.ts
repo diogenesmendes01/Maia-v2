@@ -265,6 +265,18 @@ describe('kill switch — releitura na reconexão', () => {
       'override stale sobreviveu ao `clear` que esta réplica não ouviu',
     ).toBe(modeInternal.baselineMode());
     expect(currentOverride()).toBeNull();
+
+    // …e isto é CONVERGÊNCIA, não divergência. O par com o teste do
+    // `superseded`: a review do dono foi sobre desfecho divergente publicado
+    // como verde, e a correção óbvia demais é alargar `DIVERGENT_OUTCOMES` até
+    // ele engolir os desfechos legítimos. `cleared` é o mais comum de todos —
+    // é o plantonista desligando o disjuntor — e transformá-lo em
+    // `resync_failed` faria a série gritar em toda operação normal. Alarme que
+    // toca sempre e alarme que nunca toca acabam no mesmo lugar: ninguém olha.
+    expect(
+      resyncReasons(),
+      'a limpeza convergente foi publicada como falha de resync',
+    ).toEqual(['resynced']);
   });
 
   it('chave ausente E sem override local é no-op — mas ainda é um evento contado', async () => {
