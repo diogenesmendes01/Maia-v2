@@ -442,9 +442,17 @@ rule_files:
   - /etc/prometheus/rules/slo.rules.yml
   - /etc/prometheus/rules/redis.rules.yml
   - /etc/prometheus/rules/working-memory.rules.yml
+  - /etc/prometheus/rules/backup.rules.yml
 ```
 
 Monte `monitoring/alerts/` read-only no container do Prometheus nesse caminho.
+
+**Esta lista é a única declaração de wiring que existe no repositório** — não há
+`prometheus.yml` versionado nem serviço de Prometheus no compose; a config do
+deploy vive fora daqui. Por isso ela é **verificada**: `tests/unit/observability/slo-rules.spec.ts`
+reprova quando um arquivo em `monitoring/alerts/` não aparece acima. Um arquivo
+de regras que ninguém carrega é a mesma mentira que um alerta apontando para uma
+série que ninguém emite — parece cobertura e nunca dispara.
 
 ## 9. Trace operacional (OTLP) — issue #535
 

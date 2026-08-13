@@ -333,6 +333,21 @@ describe('issue #536 — every committed alert file is under the drift guard', (
     }
   });
 
+  it('every rule file is declared in the deployment wiring list', () => {
+    // There is no committed `prometheus.yml` — the deploy's config lives
+    // outside this repository, and `docs/runbooks/observability-slo.md` §8 is
+    // the only place that says which files to load. A rules file that exists
+    // but is never loaded is the same lie as an alert on a series nobody
+    // emits: it looks like coverage and fires never.
+    const wiring = readFileSync(RUNBOOK_PATH, 'utf8');
+    const unwired = RULE_FILES.filter((f) => !wiring.includes(`/etc/prometheus/rules/${f}`));
+    expect(
+      unwired,
+      'rule files missing from the rule_files list in docs/runbooks/observability-slo.md §8: ' +
+        unwired.join(', '),
+    ).toEqual([]);
+  });
+
   it('the restore-drill gate is alerted on, and on the series the code emits', () => {
     // The #536 gate specifically: `backup.rules.yml` must query the same series
     // `readinessGauges` produces. Pointing it at a plausible-looking name that
