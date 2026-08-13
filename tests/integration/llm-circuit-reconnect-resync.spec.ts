@@ -95,15 +95,31 @@ async function bootSubscriber(): Promise<string> {
   startLLMSettingsInvalidationSubscriber();
   await llmSettingsSubscriberReady();
 
-  let mine: string | undefined;
+  let fresh: string[] = [];
   const deadline = Date.now() + 3000;
-  while (mine === undefined && Date.now() < deadline) {
+  while (fresh.length === 0 && Date.now() < deadline) {
     const after = await pubsubClientIds();
-    mine = [...after].find((id) => !before.has(id));
-    if (mine === undefined) await new Promise((r) => setTimeout(r, 20));
+    fresh = [...after].filter((id) => !before.has(id));
+    if (fresh.length === 0) await new Promise((r) => setTimeout(r, 20));
   }
-  expect(mine, 'o subscriber não apareceu como cliente pub/sub no Redis').toBeTruthy();
-  return mine!;
+  expect(fresh.length, 'o subscriber não apareceu como cliente pub/sub no Redis').toBeGreaterThan(
+    0,
+  );
+  // UNICIDADE, não só presença — endurecimento pedido na rodada 2 da review da
+  // #552. Este helper identifica o socket a matar por DIFERENÇA na lista de
+  // clientes pub/sub do Redis, e o `CLIENT KILL` seguinte é destrutivo. Se
+  // outro spec abrir um subscriber exatamente nesta janela, a diferença traz
+  // dois ids e a versão anterior (`.find`) escolhia um qualquer — podendo matar
+  // a conexão do vizinho e transformar este teste em sabotagem silenciosa de
+  // outro. Duas conexões novas aqui não é ambiguidade tolerável: é sinal de que
+  // a premissa do helper não vale nesta corrida, e falhar dizendo isso é mais
+  // barato que um vermelho inexplicável em outro arquivo.
+  expect(
+    fresh.length,
+    `apareceu mais de um subscriber pub/sub novo (${fresh.join(', ')}): ` +
+      'não dá para saber qual é o desta corrida, e o CLIENT KILL seguinte é destrutivo',
+  ).toBe(1);
+  return fresh[0]!;
 }
 
 /**
