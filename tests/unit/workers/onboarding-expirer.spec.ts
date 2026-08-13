@@ -37,7 +37,12 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { renderPrometheus, _resetForTests } from '@/lib/metrics.js';
 import { _resetLabelGuardForTests } from '@/observability/labels.js';
-import { JOBS } from '@/workers/index.js';
+import {
+  JOBS,
+  _internal as workersInternal,
+  _resetWorkerStateForTests,
+  activeWorkerJobs,
+} from '@/workers/index.js';
 import {
   ONBOARDING_EXPIRER_BATCH_LIMIT,
   runOnboardingExpirer,
@@ -98,34 +103,110 @@ describe('worker onboarding_expirer (issue #519)', () => {
   });
 
   describe('falha de uma corrida', () => {
-    it('não propaga para o scheduler', async () => {
+    /** Roda o tick pelo caminho REAL do registry e espera a corrida terminar. */
+    async function runRegistryTick(): Promise<void> {
+      workersInternal.runTick(registryJob()!);
+      while (activeWorkerJobs().includes('onboarding_expirer')) {
+        await new Promise((r) => setTimeout(r, 2));
+      }
+    }
+
+    /**
+     * O contrato do registry (`src/workers/index.ts:247-255`): resolver é
+     * SUCESSO. Uma corrida que engolisse o erro carimbaria
+     * `maia_worker_last_success_timestamp` a cada 5 minutos durante uma
+     * indisponibilidade de banco — falso sucesso novo por tick, exatamente na
+     * telemetria que `docs/runbooks/operational.md` manda usar para achar
+     * worker quebrado. Por isso a corrida REJEITA depois de logar e medir.
+     */
+    it('rejeita para o registry marcar failure (e não falso sucesso)', async () => {
       expireStale.mockImplementation(async () => {
         throw new Error('deadlock detected');
       });
-      await expect(registryJob()!.fn()).resolves.toBeUndefined();
+      await expect(registryJob()!.fn()).rejects.toThrow(/onboarding_expirer/);
     });
 
-    it('a corrida seguinte roda normalmente depois de uma falha', async () => {
+    it('move o gauge de FALHA do registry — e não o de sucesso', async () => {
+      _resetWorkerStateForTests();
+      expireStale.mockImplementation(async () => {
+        throw new Error('deadlock detected');
+      });
+
+      await runRegistryTick();
+
+      const out = await renderPrometheus();
+      const failure = Number(
+        /maia_worker_last_failure_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(
+          out,
+        )?.[1] ?? '0',
+      );
+      const success = Number(
+        /maia_worker_last_success_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(
+          out,
+        )?.[1] ?? '0',
+      );
+      expect(failure).toBeGreaterThan(0);
+      expect(success).toBe(0);
+      // O registry viu a falha e a registrou como tal.
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ job: 'onboarding_expirer' }),
+        'worker.failed',
+      );
+    });
+
+    it('o scheduler segue vivo: a corrida seguinte roda e marca sucesso', async () => {
+      _resetWorkerStateForTests();
       expireStale.mockImplementationOnce(async () => {
         throw new Error('connection terminated');
       });
-      await registryJob()!.fn();
+      await runRegistryTick();
       expireStale.mockImplementationOnce(async () => 2);
-      await registryJob()!.fn();
+      await runRegistryTick();
+
       expect(expireStale).toHaveBeenCalledTimes(2);
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({ expired: 2 }),
         'onboarding_expirer.done',
       );
+      const out = await renderPrometheus();
+      expect(
+        /maia_worker_last_success_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(out)?.[1],
+      ).not.toBe('0');
+    });
+
+    it('o erro que sobe é estável e NÃO carrega credencial', async () => {
+      // #533: este repositório já vazou `DATABASE_URL` por stderr cru. O erro
+      // que atravessa a fronteira do worker é construído por nós, nunca o do
+      // driver.
+      expireStale.mockImplementation(async () => {
+        throw new Error(
+          'connect ECONNREFUSED postgres://maia_test:test1234@localhost:5432/maia_test',
+        );
+      });
+
+      await expect(registryJob()!.fn()).rejects.toThrow(/onboarding_expirer/);
+      const thrown = await registryJob()!
+        .fn()
+        .then(() => null)
+        .catch((e: Error) => e);
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).not.toContain('test1234');
+      expect((thrown as Error).message).not.toContain('postgres://');
+      // Nem a mensagem, nem `cause`, nem o stack.
+      expect(JSON.stringify(thrown, Object.getOwnPropertyNames(thrown))).not.toContain('test1234');
+      // E o log da corrida também não.
+      const logged = JSON.stringify(vi.mocked(logger.error).mock.calls);
+      expect(logged).not.toContain('test1234');
+      expect(logged).toContain('[REDACTED_URL]');
     });
 
     it('deixa a falha visível no log e na métrica (não morre calado)', async () => {
       expireStale.mockImplementation(async () => {
         throw new Error('deadlock detected');
       });
-      await registryJob()!.fn();
+      await expect(registryJob()!.fn()).rejects.toThrow();
       expect(logger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ err: 'deadlock detected' }),
+        expect.objectContaining({ reason: 'deadlock detected', name: 'Error' }),
         'onboarding_expirer.failed',
       );
       const out = await renderPrometheus();
@@ -183,9 +264,11 @@ describe('worker onboarding_expirer (issue #519)', () => {
       expireStale.mockImplementation(async () => {
         throw new Error('deadlock detected');
       });
-      await runWithTenantContext({ tenant_id: 'tenant-vazado', agent_id: 'bot-vazado' }, () =>
-        registryJob()!.fn(),
-      );
+      await expect(
+        runWithTenantContext({ tenant_id: 'tenant-vazado', agent_id: 'bot-vazado' }, () =>
+          registryJob()!.fn(),
+        ),
+      ).rejects.toThrow();
       const out = await renderPrometheus();
       expect(out).toContain(
         'maia_worker_run_total{agent_id="system",status="error",tenant_id="system",worker="onboarding_expirer"} 1',

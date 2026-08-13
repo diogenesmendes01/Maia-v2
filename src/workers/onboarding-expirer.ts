@@ -52,6 +52,31 @@ import { counter, METRIC } from '@/observability/metrics.js';
 const WORKER = 'onboarding_expirer';
 
 /**
+ * Qualquer URI com credencial embutida (`postgres://user:senha@host/db`) some
+ * do que este worker escreve. #533: já houve vazamento de `DATABASE_URL` por
+ * stderr cru, e uma falha de conexão é exatamente o erro cuja mensagem carrega
+ * a DSN.
+ */
+const URI_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s'"]*/gi;
+
+/**
+ * Recorte SANITIZADO e BOUNDED de um erro: nome, código (o `code` do driver
+ * quando ele existe — `40P01` deadlock, `57P01` admin shutdown — que é o que
+ * um plantonista quer no log) e a mensagem com URIs censuradas e truncada.
+ */
+function safeFailure(err: unknown): { name: string; code: string; reason: string } {
+  const e = err as { name?: unknown; code?: unknown; message?: unknown };
+  const name = typeof e?.name === 'string' ? e.name.slice(0, 64) : 'Error';
+  const code =
+    typeof e?.code === 'string' && /^[A-Za-z0-9_]{1,16}$/.test(e.code) ? e.code : 'unknown';
+  const reason =
+    typeof e?.message === 'string'
+      ? e.message.replace(URI_RE, '[REDACTED_URL]').slice(0, 200)
+      : '';
+  return { name, code, reason };
+}
+
+/**
  * Teto de runs expiradas por tick. Igual ao default do repositório; explícito
  * aqui porque o limite é decisão do CHAMADOR (quem conhece a cadência), não do
  * repositório.
@@ -97,17 +122,34 @@ export async function runOnboardingExpirer(opts: { limit?: number } = {}): Promi
         logger.warn({ expired, limit }, 'onboarding_expirer.batch_capped');
       }
     } catch (err) {
-      // Uma corrida que falha NÃO derruba o scheduler nem contamina os outros
-      // jobs: o erro fica no log e na série
-      // `maia_worker_run_total{status="error"}` (o registry só vê uma execução
-      // que terminou). O `try` fica DENTRO do escopo `system` de propósito:
-      // esta emissão também é rotulada, e um erro é justamente quando ninguém
-      // está olhando o rótulo.
+      // O `try` fica DENTRO do escopo `system` de propósito: esta emissão
+      // também é rotulada, e um erro é justamente quando ninguém está olhando
+      // o rótulo.
       counter(METRIC.WORKER_RUN, { worker: WORKER, status: 'error' });
-      logger.error(
-        { err: (err as Error).message, stack: (err as Error).stack },
-        'onboarding_expirer.failed',
-      );
+      const safe = safeFailure(err);
+      logger.error({ ...safe }, 'onboarding_expirer.failed');
+
+      // E REJEITA. O registry lê qualquer resolução como sucesso
+      // (`src/workers/index.ts` `runTick`: `.then()` carimba
+      // `maia_worker_last_success_timestamp`, `.catch()` carimba
+      // `maia_worker_last_failure_timestamp` e loga `worker.failed`). Engolir
+      // o erro produziria um falso sucesso NOVO a cada 5 minutos durante uma
+      // indisponibilidade de banco — justamente na telemetria que
+      // `docs/runbooks/operational.md` manda usar para achar worker quebrado,
+      // e o `WORKER_RUN{status="error"}` local não conserta esses gauges. O
+      // `runTick` isola a rejeição e o próximo tick é agendado do mesmo jeito:
+      // o scheduler não cai.
+      //
+      // O erro que sobe é CONSTRUÍDO aqui: estável, curto e SEM `cause`. O
+      // pino do registry serializa o erro (mensagem E stack, e `cause` junto)
+      // no `worker.failed`, e a mensagem de uma falha de conexão carrega a
+      // `DATABASE_URL` inteira — o vazamento de #533. É por isso que a regra
+      // `preserve-caught-error` é desligada AQUI e só aqui: ela pede
+      // exatamente o que não pode atravessar a fronteira. A cadeia não se
+      // perde — o recorte sanitizado (`name`, `code`, `reason` com URIs
+      // censuradas) foi logado na linha acima.
+      // eslint-disable-next-line preserve-caught-error
+      throw new Error(`onboarding_expirer falhou (${safe.name}/${safe.code})`);
     }
   });
 }
