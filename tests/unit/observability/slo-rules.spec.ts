@@ -362,4 +362,24 @@ describe('issue #536 — every committed alert file is under the drift guard', (
       'RestoreDrillEvidenceAging',
     ]);
   });
+
+  it('the gate alert names the non-terminal case, which is the one that asks for a different action', () => {
+    // The gate reproves for five different reasons and four of them are
+    // answered by reading `restore_drills` and re-drilling. The fifth — an
+    // execution that never reached a terminal state — asks the operator to go
+    // look at the HOST, because a decrypted copy of production may be sitting
+    // on it. An annotation that lists only the other four is actively
+    // misleading during exactly that incident.
+    const backup = RULE_TEXT['backup.rules.yml']!;
+    const critical = backup.slice(
+      backup.indexOf('- alert: RestoreDrillEvidenceNotProvable'),
+      backup.indexOf('- alert: RestoreDrillEvidenceAging'),
+    );
+    expect(critical, 'the gate alert does not mention the non-terminal execution').toMatch(
+      /NOT IN \('passed','failed','skipped'\)/,
+    );
+    expect(critical, 'the gate alert does not point at the runbook section for it').toContain(
+      '§4.4',
+    );
+  });
 });

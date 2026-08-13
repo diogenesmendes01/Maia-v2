@@ -216,8 +216,8 @@ O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observa
 
 | Alerta | Dispara | O que o operador faz |
 |---|---|---|
-| `RestoreDrillEvidenceNotProvable` | `maia_restore_drill_check_level >= 2` por 30min | **Nada é sabidamente restaurável.** Descubra qual dos quatro casos é em `restore_drills` (`ORDER BY started_at DESC LIMIT 5`) — vencido, falhou, nunca rodou, ou evidência ilegível — e siga §4.1: `cleanup_failed` e os demais códigos pedem ações OPOSTAS |
-| `RestoreDrillEvidenceAging` | `maia_restore_drill_check_level == 1` por 6h | O agendador deveria ter renovado a evidência aos 75% e não renovou. Confira se o job `restore_drill` está agendado (log `worker.scheduled`) e se o último drill deixou resíduo — resíduo BLOQUEIA o próximo drill de propósito (§4.2) |
+| `RestoreDrillEvidenceNotProvable` | `maia_restore_drill_check_level >= 2` por 30min | **Nada é sabidamente restaurável.** São **cinco** casos: vencido, último drill falhou, nunca rodou, evidência ilegível, ou **execução não-terminal sem teardown provado**. Comece pelo quinto — é o único que pede inspeção de HOST e não re-drill, e é o que bloqueia o agendador (§4.4). Se não houver linha aberta, é um dos outros quatro: §4.1 |
+| `RestoreDrillEvidenceAging` | `maia_restore_drill_check_level == 1` por 6h | O agendador deveria ter renovado a evidência aos 75% e não renovou. Confira se o job `restore_drill` está agendado (log `worker.scheduled`) e se algo o bloqueia de propósito: resíduo no último drill (§4.2) ou execução não-terminal sem teardown provado (§4.4) |
 
 
 ### 4.4 O drill que morreu no meio (issue #536, review da #553)

@@ -42,12 +42,23 @@ groups:
         annotations:
           summary: "Nenhum backup é sabidamente restaurável"
           description: |
-            O gate do drill de restore está REPROVADO. Uma destas é verdade:
-            a evidência venceu (BACKUP_RESTORE_DRILL_INTERVAL_HOURS), o último
-            drill falhou, nunca rodou um drill, ou a evidência não pôde ser lida.
-            Descubra qual em `restore_drills` (ORDER BY started_at DESC LIMIT 5)
-            e leia docs/runbooks/backup-restore.md §4.1 — `cleanup_failed` e os
-            demais códigos pedem ações OPOSTAS.
+            O gate do drill de restore está REPROVADO. Uma destas CINCO é verdade:
+            (1) a evidência venceu (BACKUP_RESTORE_DRILL_INTERVAL_HOURS);
+            (2) o último drill falhou;
+            (3) nunca rodou um drill;
+            (4) a evidência não pôde ser lida;
+            (5) existe uma execução NÃO-TERMINAL velha demais para ainda estar
+                rodando — o processo morreu e ninguém provou o teardown, então
+                pode haver uma cópia em claro da produção neste host.
+            Comece por (5), que é a única que pede inspeção de HOST e não
+            re-drill, e é a que bloqueia o agendador:
+              SELECT id, started_at, status, cleanup_status FROM restore_drills
+               WHERE status NOT IN ('passed','failed','skipped') ORDER BY started_at;
+            Se voltar linha, siga docs/runbooks/backup-restore.md §4.4 (limpar o
+            host e TERMINALIZAR a linha). Vazio, é (1)-(4): veja
+              SELECT id, started_at, status, failure_code, cleanup_status
+                FROM restore_drills ORDER BY started_at DESC LIMIT 5;
+            e leia §4.1 — `cleanup_failed` e os demais códigos pedem ações OPOSTAS.
 
       # Envelhecendo: o worker `restore_drill` deveria ter disparado um drill em
       # 75% do intervalo. Se chegou a WARN e ficou, o tick não está rodando (ou
@@ -63,6 +74,7 @@ groups:
           description: |
             O agendador deveria ter disparado um drill a 75% do intervalo e a
             evidência continua envelhecendo. Confira se o job `restore_drill`
-            está agendado (log `worker.scheduled`) e se o último drill deixou
-            resíduo — um drill com `cleanup_status='unsafe'` BLOQUEIA o próximo
-            de propósito. Runbook: docs/runbooks/backup-restore.md §4.2/§4.3.
+            está agendado (log `worker.scheduled`) e se algo está bloqueando o
+            agendador de propósito: `cleanup_status='unsafe'` no último drill
+            (§4.2) ou uma execução não-terminal sem teardown provado (§4.4).
+            Runbook: docs/runbooks/backup-restore.md §4.2/§4.3/§4.4.
