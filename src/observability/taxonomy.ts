@@ -260,9 +260,13 @@ export const METRIC = {
    * attempt including the no-op: Redis pub/sub is at-most-once with no replay,
    * so a replica whose socket dropped during the incident must re-read the
    * durable key to converge. `resynced` = the re-read completed and this
-   * replica is consistent with Redis; `resync_failed` = it did NOT, and
-   * `state` is the posture that was PRESERVED (fail-closed — a failed read is
-   * never read as "no override"), which may now diverge from the fleet.
+   * replica's state IS the Redis state; `resync_failed` = it could not be
+   * asserted, and `state` is the posture that was PRESERVED, which may now
+   * diverge from the fleet. Fail-closed covers every way of not knowing: read
+   * error, unreadable key, a key that was read and REJECTED by governance, and
+   * a re-subscribe with no ack (no ack ⇒ the read is not even attempted, since
+   * treating an absent key as authoritative there would clear a live
+   * override). The cause stays distinguishable in the log's `outcome` field.
    * Sustained `resync_failed` is the alert that says the kill switch cannot be
    * trusted to reach everyone.
    */

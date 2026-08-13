@@ -376,11 +376,25 @@ journalctl -u maia | grep llm_gateway.circuit_override_resync
 ```
 
 `resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`) é a
-única saída ruim: a releitura NÃO conseguiu falar com o Redis e a réplica
-manteve o estado que tinha — fail-closed, porque concluir "não há override" a
-partir de um Redis mudo desligaria o kill switch sozinho. Uma réplica nesse
-estado pode estar divergente da frota: republique o `SET` + `PUBLISH` (é
-idempotente) e, se persistir, trate como Redis fora do ar — segunda alavanca.
+saída ruim, e cobre TODA releitura que não pôde afirmar consistência com o
+Redis. O campo `outcome` do log diz qual:
+
+| `outcome` | O que aconteceu |
+|---|---|
+| `failed` | `GET` falhou, chave ilegível, ou re-inscrição sem ack — não houve leitura defensável |
+| `rejected` | a chave FOI lida e foi recusada (sem `expires_at` absoluto, sem ator, vencida, acima do teto) |
+
+Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há
+override" a partir de um Redis mudo (ou de um payload que não passa na
+governança) desligaria o kill switch sozinho. Uma réplica nesse estado pode
+estar divergente da frota: republique o `SET` + `PUBLISH` (é idempotente); se
+o `outcome` for `rejected`, olhe o payload da chave antes (`redis-cli GET
+maia:llm:circuit:override`), porque republicar não conserta payload inválido; se
+persistir, trate como Redis fora do ar — segunda alavanca.
+
+`superseded` **não** é falha: ali a releitura perdeu para uma mensagem do canal,
+que é sempre pelo menos tão nova quanto o que o `GET` leu — o estado final é o
+do Redis, e sai como `resynced`.
 
 ### Auditoria — como saber que alguém mexeu
 

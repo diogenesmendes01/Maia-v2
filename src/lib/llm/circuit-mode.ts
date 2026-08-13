@@ -452,7 +452,12 @@ export function applyCircuitOverride(
   const reason = typeof msg.reason === 'string' ? msg.reason.trim() : '';
 
   const reject = (error: string, mode: CircuitMode | 'invalid' = 'invalid'): OverrideResult => {
-    auditOverride('rejected', { mode, actor, reason, error });
+    // `via: source` também na RECUSA: sem ela, uma releitura de reconexão que
+    // recusa a chave deixa na trilha um `rejected` indistinguível de uma
+    // tentativa manual de virar o kill switch. A procedência é justamente o que
+    // responde "esta réplica recusou o estado autoritativo depois de
+    // reconectar?" (revisão do dono da #552).
+    auditOverride('rejected', { mode, actor, reason, error, via: source });
     return { applied: false, error, mode: effectiveMode(now) };
   };
 

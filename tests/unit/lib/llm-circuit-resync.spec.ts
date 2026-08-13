@@ -352,7 +352,16 @@ describe('kill switch — releitura na reconexão', () => {
       effectiveMode(),
       'a releitura em voo sobrescreveu uma mensagem mais nova: o estado final virou o da corrida',
     ).toBe('enforce');
+    // `superseded` é CONVERGÊNCIA legítima, não falha: quem venceu foi uma
+    // mensagem do canal, que é sempre pelo menos tão nova quanto o que o `GET`
+    // leu — o estado final É o do Redis. Jogá-lo no mesmo balde de
+    // `resync_failed` encheria o alerta de divergência com ruído de corrida
+    // normal e cegaria o sinal que a #534 criou.
     expect(resyncReasons()).toEqual(['resynced']);
+    expect(
+      resyncReasons(),
+      'corrida perdida para o canal virou alerta de divergência: o balde errado',
+    ).not.toContain('resync_failed');
   });
 
   /**
@@ -407,6 +416,86 @@ describe('kill switch — releitura na reconexão', () => {
       await new Promise((r) => setTimeout(r, 2));
     }
     expect(llmSettingsSubscriberResyncCount()).toBe(before + 3);
+  });
+
+  /**
+   * HIGH da revisão do dono da #552 — a fronteira entre "chave ilegível" e
+   * "chave legível porém inaceitável".
+   *
+   * Um payload que É JSON e É objeto, mas que a governança recusa (sem
+   * `expires_at` absoluto, sem ator, vencido, acima do teto), fazia
+   * `applyCircuitOverride` devolver `applied: false` — e a releitura terminava
+   * publicando `reason="resynced"` em `logger.warn`. Ou seja: a réplica RECUSOU
+   * o estado autoritativo, seguiu com o dela, e a série afirmava consistência
+   * com o Redis. Isso neutraliza justamente o sinal criado para detectar "o
+   * kill switch não alcançou uma réplica" — e libera a promoção para `enforce`
+   * com evidência verde falsa.
+   *
+   * O payload aqui é o caso real: chave durável com validade RELATIVA, que a
+   * adoção recusa porque reiniciaria o arrendamento a cada leitura.
+   */
+  it('payload PRESENTE mas recusado é DIVERGÊNCIA, não convergência', async () => {
+    const sub = await bootSubscriber();
+    handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('enforce'));
+    expect(effectiveMode()).toBe('enforce');
+    const audit = vi.mocked(recordCircuitAudit);
+    audit.mockClear();
+
+    redisMock.get.mockResolvedValue(
+      JSON.stringify({ mode: 'off', actor: ACTOR, reason: REASON, ttl_ms: 60_000 }),
+    );
+    await reconnect(sub);
+
+    // Estado preservado: recusar não é adotar, e muito menos limpar.
+    expect(effectiveMode()).toBe('enforce');
+    expect(
+      resyncReasons(),
+      'recusa do estado autoritativo saiu como convergência: a série mente sobre a réplica',
+    ).toEqual(['resync_failed']);
+
+    // A CAUSA continua distinguível na trilha durável — `resync_failed` é o
+    // balde do alerta, `rejected` + `source: resynced` é o porquê.
+    const call = audit.mock.calls.find(
+      (c) => (c[1] as { source?: string }).source === 'resynced',
+    );
+    expect(call, 'a recusa da releitura não deixou rastro na trilha').toBeTruthy();
+    expect(call![0]).toBe('llm_circuit_mode_override_rejected');
+  });
+
+  /**
+   * MEDIUM da revisão do dono da #552 — sem ack de re-inscrição não existe o
+   * argumento de ordenação que sustenta esta releitura.
+   *
+   * Com a inscrição confirmada, ou o Redis processa o `SET` antes do nosso
+   * `GET` (a chave é encontrada), ou processa o `GET` antes e então o `PUBLISH`
+   * — que vem sempre depois do `SET` — cai numa inscrição ativa. Sem ack o
+   * segundo braço some: um `SET` + `PUBLISH` logo depois do `GET` não chega por
+   * canal NEM aparece na leitura. Tratar ausência de chave como autoritativa
+   * nesse estado limparia um override VIVO com base numa leitura indefensável.
+   */
+  it('re-inscrição sem ack: não lê, preserva o estado e conta como falha', async () => {
+    const sub = await bootSubscriber();
+    handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('off'));
+    expect(effectiveMode()).toBe('off');
+
+    redisMock.get.mockClear();
+    invalidateModelCacheMock.mockClear();
+    sub.subscribe.mockRejectedValueOnce(new Error('NOSCRIPT connection lost'));
+
+    await reconnect(sub);
+
+    expect(
+      redisMock.get,
+      'leu a chave sem inscrição ativa: a leitura não pode ser tratada como autoritativa',
+    ).not.toHaveBeenCalled();
+    expect(
+      effectiveMode(),
+      'estado local foi mexido a partir de uma leitura que não tem argumento de ordenação',
+    ).toBe('off');
+    expect(resyncReasons()).toEqual(['resync_failed']);
+    // O cache de settings continua fail-SOFT: soltá-lo não depende de ordenação
+    // e erra sempre para o lado de reler do Postgres.
+    expect(invalidateModelCacheMock).toHaveBeenCalled();
   });
 
   /**

@@ -301,12 +301,25 @@ mensagem mais nova. `overrideGeneration()` (`src/lib/llm/circuit-mode.ts`) é
 capturada antes do `GET` e a releitura CEDE se ela mudou — o estado final é o do
 Redis, não o da corrida.
 
-*Fail-closed*: leitura que falha (ou chave ilegível) **não** vira "não há
-override". O estado local é preservado e sai
+*Fail-closed*: leitura que falha, chave ilegível, chave **recusada** pela
+governança (sem `expires_at` absoluto, sem ator, vencida, acima do teto) e
+re-inscrição **sem ack** — nenhuma delas vira "não há override". Em todas o
+estado local é preservado e sai
 `maia_llm_circuit_mode_overrides_total{reason="resync_failed"}` + log de ERRO
-`llm_gateway.circuit_override_resync_failed`. O caso bom sai como
-`{reason="resynced"}`, um evento por releitura inclusive no no-op — sem isso,
-"esta réplica ressincronizou?" só teria o silêncio como resposta.
+`llm_gateway.circuit_override_resync_failed`, com a causa no campo `outcome` e,
+quando houve recusa, a ação `_rejected` com `source='resynced'` na trilha
+durável (revisão do dono da #552). O ponto é que a série de CONVERGÊNCIA não
+pode dizer "consistente com o Redis" quando a réplica recusou o estado
+autoritativo ou leu sem inscrição ativa — seria evidência verde falsa
+justamente no gate que libera o `enforce`. Sem ack, aliás, nem se lê: tratar
+ausência de chave como autoritativa nesse estado limparia um override vivo com
+base numa leitura indefensável.
+
+O caso bom sai como `{reason="resynced"}`, um evento por releitura inclusive no
+no-op — sem isso, "esta réplica ressincronizou?" só teria o silêncio como
+resposta. `superseded` fica nesse balde de propósito: a releitura perdeu para
+uma mensagem do canal, que é sempre pelo menos tão nova, e o estado final é o do
+Redis.
 `llmSettingsSubscriberResyncCount()` é o mesmo dado para diagnóstico e teste.
 Provas em `tests/integration/llm-circuit-reconnect-resync.spec.ts` (socket morto
 de verdade) e `tests/unit/lib/llm-circuit-resync.spec.ts`.

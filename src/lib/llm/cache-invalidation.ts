@@ -248,6 +248,7 @@ let resyncChain: Promise<void> = Promise.resolve();
  * (JSON corrompido) segue a mesma regra: não dá para concluir nada dela.
  */
 async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
+  let subscribed = true;
   try {
     // Re-inscrever de propósito, mesmo com `autoResubscribe` do ioredis ligado:
     // o `await` no ack é o que dá o MESMO argumento de ordenação do boot (Redis
@@ -256,8 +257,7 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
     // idempotente no Redis.
     await sub.subscribe(...SUBSCRIBED_CHANNELS);
   } catch (err) {
-    // Sem ack não há garantia de ordem, mas a releitura ainda vale mais que
-    // nada — mesmo raciocínio do boot.
+    subscribed = false;
     logger.warn(
       { err: (err as Error).message, channels: SUBSCRIBED_CHANNELS },
       'llm_gateway.settings_resubscribe_failed',
@@ -265,8 +265,32 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
   }
 
   // Settings: o autoritativo é o Postgres, então soltar o cache local É a
-  // releitura. Feito antes do `GET` porque não depende dele nem pode falhar.
+  // releitura. Continua fail-SOFT mesmo sem ack — soltar cache não depende de
+  // ordenação nenhuma e erra sempre para o lado de reler do banco.
   invalidateModelCache();
+
+  if (!subscribed) {
+    /**
+     * Sem o ack, o argumento de ordenação que sustenta esta releitura NÃO
+     * existe (revisão do dono da #552).
+     *
+     * Ele é o do boot: com a inscrição confirmada, ou o Redis processa o `SET`
+     * antes do nosso `GET` (a chave é encontrada), ou processa o `GET` antes e
+     * então o `PUBLISH` — que vem sempre depois do `SET` — é entregue à
+     * inscrição já ativa. Sem inscrição ativa some o segundo braço: um
+     * `SET` + `PUBLISH` logo depois do `GET` não chega por canal NEM aparece na
+     * leitura, e a réplica ficaria com o estado errado achando que convergiu.
+     *
+     * O caso mais perigoso é tratar AUSÊNCIA de chave como autoritativa nesse
+     * estado: limparíamos um override vivo com base numa leitura que não pode
+     * ser defendida. Então nem se lê: o estado local é PRESERVADO e o desfecho
+     * é falha de resync, que é o que acorda alguém.
+     */
+    finishResync('failed', {
+      error: 'sem ack de re-inscrição: ordenação GET × PUBLISH não garantida, leitura não realizada',
+    });
+    return;
+  }
 
   // A geração é capturada ANTES do `GET`: se uma mensagem do canal for aplicada
   // enquanto a resposta está em voo, ela é pelo menos tão nova quanto o que o
@@ -319,13 +343,42 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
   }
 
   const result = applyCircuitOverride(parsed as CircuitOverrideMessage, Date.now(), 'resynced');
-  // Recusa (validade vencida, payload sem `expires_at`, sem ator) já foi
-  // contada e auditada como `rejected` por `applyCircuitOverride`. O estado
-  // local é PRESERVADO — mesma regra do erro de leitura.
+  // Recusa (validade vencida, payload sem `expires_at` absoluto, sem ator) já é
+  // contada e auditada como `rejected` por `applyCircuitOverride`, com
+  // `source: 'resynced'` — mas aquela é a série da CONTABILIDADE de override.
+  // Nesta, que é a de CONVERGÊNCIA, recusa não é convergir: a réplica não
+  // aplicou o estado autoritativo, preservou o dela e pode estar divergente da
+  // frota. Ver `DIVERGENT_OUTCOMES`.
   finishResync(result.applied ? 'applied' : 'rejected', { error: result.error });
 }
 
 type ResyncOutcome = 'applied' | 'cleared' | 'noop' | 'superseded' | 'rejected' | 'failed';
+
+/**
+ * Desfechos em que a réplica NÃO pode afirmar que está consistente com o Redis
+ * (revisão do dono da #552).
+ *
+ *  - `failed`   — não houve leitura defensável: `GET` falhou, chave ilegível,
+ *    ou re-inscrição sem ack.
+ *  - `rejected` — houve leitura, e o payload PRESENTE foi recusado (sem
+ *    `expires_at` absoluto, sem ator, vencido, acima do teto). A réplica
+ *    preservou o estado dela e seguiu com uma postura que o Redis não confirma.
+ *
+ * Os dois pintam a mesma pergunta operacional — "esta réplica pode estar
+ * divergente da frota?" — e por isso compartilham `reason="resync_failed"`. A
+ * CAUSA continua distinguível: `outcome` no log e a ação `_rejected` com
+ * `source='resynced'` na trilha durável.
+ *
+ * `superseded` está deliberadamente FORA: ali a releitura perdeu para uma
+ * mensagem do canal, que é sempre pelo menos tão nova quanto o que o `GET` leu
+ * — o estado final É o do Redis. Somar os dois no mesmo balde apagaria a única
+ * diferença que importa aqui (convergiu × pode estar divergente) e cegaria o
+ * alerta com ruído de corrida normal.
+ */
+const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
+  'failed',
+  'rejected',
+]);
 
 /**
  * Convergência OBSERVÁVEL: um evento por releitura, sempre, mesmo quando ela
@@ -333,10 +386,11 @@ type ResyncOutcome = 'applied' | 'cleared' | 'noop' | 'superseded' | 'rejected' 
  * da queda?" em vez de inferir do silêncio.
  *
  * Fica na família que já existe (`maia_llm_circuit_mode_overrides_total`), com
- * dois valores novos de `reason`: `resynced` (a releitura terminou; `state` é a
- * postura que ficou valendo) e `resync_failed` (não terminou; `state` é a
- * postura PRESERVADA, que pode estar divergente da frota). Métrica nova seria
- * uma família a mais respondendo sobre o mesmo controle.
+ * dois valores novos de `reason`: `resynced` (a releitura terminou e o estado
+ * local é o do Redis; `state` é a postura que ficou valendo) e `resync_failed`
+ * (não deu para afirmar isso; `state` é a postura PRESERVADA, que pode estar
+ * divergente da frota). Métrica nova seria uma família a mais respondendo sobre
+ * o mesmo controle.
  *
  * `attribute: false` pelo mesmo motivo do resto do módulo: a postura é da
  * frota, e o `tenant_id` que por acaso estava no ALS não diz nada sobre ela.
@@ -344,16 +398,18 @@ type ResyncOutcome = 'applied' | 'cleared' | 'noop' | 'superseded' | 'rejected' 
 function finishResync(outcome: ResyncOutcome, detail: { error?: string } = {}): void {
   resyncCount++;
   const state = effectiveMode();
+  const divergent = DIVERGENT_OUTCOMES.has(outcome);
   counter(
     METRIC.LLM_CIRCUIT_MODE_OVERRIDES,
-    { state, reason: outcome === 'failed' ? 'resync_failed' : 'resynced' },
+    { state, reason: divergent ? 'resync_failed' : 'resynced' },
     1,
     { attribute: false },
   );
   const record = { outcome, state, key: LLM_CIRCUIT_OVERRIDE_KEY, err: detail.error };
-  if (outcome === 'failed') {
-    // ERROR, não WARN: uma réplica que não conseguiu reler pode estar recusando
-    // tráfego que o plantão já mandou parar de recusar, e ninguém a acordou.
+  if (divergent) {
+    // ERROR, não WARN: uma réplica que não conseguiu reler — ou que recusou o
+    // que leu — pode estar recusando tráfego que o plantão já mandou parar de
+    // recusar, e ninguém a acordou.
     logger.error(record, 'llm_gateway.circuit_override_resync_failed');
     return;
   }
