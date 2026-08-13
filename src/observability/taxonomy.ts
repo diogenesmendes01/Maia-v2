@@ -105,12 +105,12 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  * é". A declaration that nothing emits reads exactly like coverage. Rather
  * than deleting the roadmap (the tree IS the target shape, and every name in
  * it is referenced by the SLI narrative), the gap is made MACHINE-CHECKABLE:
- * each span declares whether an instrumentation site exists today, and
+ * each span declares whether PRODUCTION REACHES IT, and
  * `tests/unit/observability/tracer.spec.ts` pins the `emitted` set exactly.
  *
- * So the file can no longer overstate coverage: adding a name here without an
- * emitter fails a test, and shipping an emitter without flipping the flag
- * fails the same test.
+ * So the file can no longer overstate coverage: adding a name here without a
+ * production-reachable emitter fails a test, and shipping a reachable emitter
+ * without flipping the flag fails the same test.
  *
  * Current emitters:
  *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
@@ -164,7 +164,12 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.TURN_COMPLETE]: 'declared',
 });
 
-/** The spans an instrumentation site exists for today. */
+/**
+ * The spans PRODUCTION REACHES today — not the spans an instrumentation site
+ * exists for. `context.load` is the difference between the two readings and the
+ * reason this comment is explicit: it has a real, test-covered site in
+ * `buildContextPacket`, and no turn reaches it. See `SPAN_EMISSION`.
+ */
 export const EMITTED_SPANS: readonly SpanName[] = Object.freeze(
   SPAN_NAMES.filter((s) => SPAN_EMISSION[s] === 'emitted'),
 );

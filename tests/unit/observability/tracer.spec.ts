@@ -272,11 +272,16 @@ describe('issue #535 — tracer', () => {
       }
     });
 
-    it('the emitted set is exactly what the codebase instruments', () => {
-      // Update BOTH sides together. Adding a name to SPAN_EMISSION without an
-      // emitter is precisely the "declared reads as covered" failure #535
-      // opens with; shipping an emitter without flipping the flag understates
-      // coverage in the runbook.
+    it('the emitted set is exactly what production reaches', () => {
+      // Update BOTH sides together. Adding a name to SPAN_EMISSION that no
+      // production path reaches is precisely the "declared reads as covered"
+      // failure #535 opens with; shipping a reachable emitter without flipping
+      // the flag understates coverage in the runbook.
+      //
+      // "Reaches", not "instruments": `context.load` has a real site in
+      // `buildContextPacket` and is deliberately absent here, because PR #406
+      // removed the hot path that called it. The two readings came apart on
+      // that span, and the review of PR #554 settled it in favour of this one.
       expect([...EMITTED_SPANS].sort()).toEqual(
         [SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
       );
