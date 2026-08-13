@@ -254,13 +254,17 @@ emitting `pool_samples: 0` with the spec green and the real run still lying.
 **The baseline fingerprint.** The file records the *shape* of the run that
 produced the number, and an incompatible shape makes the comparison **refused**,
 not merely flagged: `pairs`, `concurrency`, `think_ms`, `identity`,
-`cardinalities`, `pool_max`, `max_concurrent_reads`. `think_ms` alone moves p95
-from 28.8 ms to 187.7 ms on this host, so comparing across it manufactures a
-false green or a false red out of a change in *load*, not code. Host, Node
-version, `turns`, `sustain_s`, `timeout_ms` and `sample_ms` are recorded but not
+`cardinalities`, `pool_max`, `max_concurrent_reads`, `turns`, `sustain_s`.
+`think_ms` alone moves p95 from 28.8 ms to 187.7 ms on this host, and run length
+moves it just as hard — 600 turns (5.7 s) measured p95 118.6 ms where 60 s
+sustained (7 389 turns) measured 22.4 ms, same host and code minutes apart,
+because the warm-up transient is amortised over 12× more turns. Comparing across
+either manufactures a false green or a false red out of a change in *load*, not
+code. Host, Node version, `timeout_ms` and `sample_ms` are recorded but not
 compared — a fingerprint that invalidates the baseline every run is noise the
 operator learns to ignore. A pre-fingerprint file is refused too: it cannot prove
-what load it measured.
+what load it measured. The practical consequence: **record the baseline with the
+same command the gate runs**.
 
 **Pacing is a parameter, not decoration.** The generator is closed-loop, so with
 `--think-ms 0` twenty turns are always in flight; at up to 6 permits each against

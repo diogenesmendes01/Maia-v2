@@ -283,6 +283,7 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  * | `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê e renderiza |
  * | `pool_max` | o denominador da saturação. Comparar p95 de um pool 10 com um pool 20 é comparar dois sistemas |
  * | `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`: quantas leituras de um turno andam juntas |
+ * | `turns` / `sustain_s` | a DURAÇÃO amortiza o transiente de aquecimento (JIT, conexões, cache do Postgres). Medido neste host, mesmo código, minutos de intervalo: 600 turnos (5,7 s) deram p95 118,6 ms; 60 s sustentados (7 389 turnos) deram 22,4 ms — 5×. Um baseline de corrida curta contra o gate canônico é falso vermelho garantido |
  *
  * E o que ficou DE FORA da comparação, de propósito, porque invalidaria o
  * baseline sem mudar o número — o fingerprint frouxo não protege, mas o
@@ -291,7 +292,6 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  * | campo | por que só é REGISTRADO |
  * |---|---|
  * | `host` / `node` / `platform` | o baseline já é por máquina (não é versionado). Comparar aqui reprovaria toda atualização de runtime sem dizer nada sobre o código |
- * | `turns` / `sustain_s` | p95 é estatística de distribuição, não total: rodar mais tempo muda a confiança, não o valor central. A FORMA exigida já é cobrada pelo veredicto "carga conforme o enunciado" |
  * | `timeout_ms` | classifica o que conta como timeout; não move a latência medida |
  * | `sample_ms` | é o período de observação do POOL; não entra no p95 do turno |
  */
@@ -303,6 +303,8 @@ export type RunFingerprint = {
   cardinalities: number[];
   pool_max: number;
   max_concurrent_reads: number;
+  turns: number;
+  sustain_s: number;
 };
 
 /**
@@ -324,8 +326,6 @@ export type BaselineFile = {
   fingerprint: RunFingerprint;
   /** Registrado, NÃO comparado — documenta a corrida sem invalidar o arquivo. */
   context: {
-    turns: number;
-    sustain_s: number;
     timeout_ms: number;
     sample_ms: number;
     node: string;
@@ -337,7 +337,14 @@ export type BaselineFile = {
 
 /** O fingerprint da corrida ATUAL. `pool_max` vem do pool de verdade, não de um literal. */
 export function runFingerprint(
-  o: { pairs: number; concurrency: number; think_ms: number; identity: 'profile' | 'legacy' },
+  o: {
+    pairs: number;
+    concurrency: number;
+    think_ms: number;
+    identity: 'profile' | 'legacy';
+    turns: number;
+    sustain_s: number;
+  },
   maxConcurrentReads: number,
   poolMax: number,
 ): RunFingerprint {
@@ -349,6 +356,8 @@ export function runFingerprint(
     cardinalities: [...CARDINALITIES],
     pool_max: poolMax,
     max_concurrent_reads: maxConcurrentReads,
+    turns: o.turns,
+    sustain_s: o.sustain_s,
   };
 }
 
@@ -387,7 +396,8 @@ export function checkBaselineCompatibility(
     const b = current[field];
     const same = Array.isArray(a) && Array.isArray(b) ? a.join('/') === b.join('/') : a === b;
     if (!same) {
-      const show = (v: unknown): string => (Array.isArray(v) ? v.join('/') : String(v));
+      const show = (v: unknown): string =>
+        v === undefined ? 'ausente' : Array.isArray(v) ? v.join('/') : String(v);
       diffs.push(`${field}: baseline=${show(a)} · agora=${show(b)}`);
     }
   };
@@ -398,6 +408,8 @@ export function checkBaselineCompatibility(
   cmp('cardinalities');
   cmp('pool_max');
   cmp('max_concurrent_reads');
+  cmp('turns');
+  cmp('sustain_s');
   return diffs.length ? { status: 'incompatible', diffs } : { status: 'ok', diffs: [] };
 }
 
@@ -1112,8 +1124,6 @@ export function syntheticBaseline(
           { ...fingerprint, think_ms: fingerprint.think_ms === 0 ? 150 : 0 }
         : fingerprint,
     context: {
-      turns: 600,
-      sustain_s: 60,
       timeout_ms: 5_000,
       sample_ms: 100,
       node: process.versions.node,
@@ -2044,8 +2054,6 @@ function writeBaseline(
         'sobre ele só passa a significar "não regrediu" a partir da PRÓXIMA corrida.',
     fingerprint,
     context: {
-      turns: opts.turns,
-      sustain_s: opts.sustain_s,
       timeout_ms: opts.timeout_ms,
       sample_ms: opts.sample_ms,
       node: process.versions.node,

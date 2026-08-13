@@ -80,6 +80,8 @@ const FP: RunFingerprint = {
   cardinalities: [1, 10, 100],
   pool_max: 10,
   max_concurrent_reads: 6,
+  turns: 600,
+  sustain_s: 60,
 };
 
 /**
@@ -96,8 +98,6 @@ function baselineWith(p95: number, fingerprint: RunFingerprint = FP): BaselineFi
     note: 'fixture',
     fingerprint,
     context: {
-      turns: 600,
-      sustain_s: 60,
       timeout_ms: 5_000,
       sample_ms: 100,
       node: '22.0.0',
@@ -393,6 +393,14 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         [{ cardinalities: [1, 10] }, 'cardinalities'],
         [{ pool_max: 20 }, 'pool_max'],
         [{ max_concurrent_reads: 8 }, 'max_concurrent_reads'],
+        // A duração amortiza o transiente de aquecimento (JIT, conexões, cache
+        // do Postgres). Medido neste host, mesmo código, minutos de intervalo:
+        // 600 turnos (5,7 s) deram p95 118,6 ms; 60 s sustentados (7 389
+        // turnos) deram 22,4 ms. Comparar através disso é falso vermelho
+        // garantido — e foi a corrida real que corrigiu este julgamento, que
+        // na primeira versão deixava os dois campos só REGISTRADOS.
+        [{ turns: 100 }, 'turns'],
+        [{ sustain_s: 0 }, 'sustain_s'],
       ];
       for (const [patch, campo] of divergencias) {
         const compat = checkBaselineCompatibility(baselineWith(40, { ...FP, ...patch }), FP);
@@ -406,13 +414,12 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     it('NÃO invalida o baseline por coisa que não muda o número medido', () => {
       // O outro extremo do erro: um fingerprint barulhento invalida o baseline
       // a cada corrida e o operador aprende a ignorá-lo. Host, versão de Node,
-      // duração da corrida, timeout e período de amostragem NÃO entram no p95
-      // do turno — ficam registrados, não comparados.
+      // timeout e período de amostragem NÃO entram no p95 do turno — ficam
+      // registrados, não comparados. (A DURAÇÃO entra, e por isso subiu para o
+      // fingerprint: ver o caso de `turns`/`sustain_s` acima.)
       const mesmoNumeroOutroContexto = baselineWith(1_000);
       mesmoNumeroOutroContexto.host = 'outra-maquina-completamente-diferente';
       mesmoNumeroOutroContexto.context = {
-        turns: 5_000,
-        sustain_s: 300,
         timeout_ms: 60_000,
         sample_ms: 250,
         node: '24.9.9',
@@ -460,7 +467,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // `pool_max: 10` concordaria consigo mesmo no dia em que alguém subisse o
       // pool para 20 — que é o dia em que o baseline deixa de valer.
       const fp = runFingerprint(
-        { pairs: 50, concurrency: 20, think_ms: 150, identity: 'profile' },
+        { pairs: 50, concurrency: 20, think_ms: 150, identity: 'profile', turns: 600, sustain_s: 60 },
         8,
         20,
       );

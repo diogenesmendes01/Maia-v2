@@ -1344,13 +1344,18 @@ O baseline grava a FORMA da corrida que o produziu, e a comparação é **recusa
 | `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê |
 | `pool_max` | o denominador da saturação. Pool 10 e pool 20 são dois sistemas |
 | `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`, lido do código |
+| `turns` · `sustain_s` | a duração amortiza o transiente de aquecimento. Mesmo host, mesmo código, minutos de intervalo: 600 turnos (5,7 s) → p95 **118,6 ms**; 60 s sustentados (7 389 turnos) → p95 **22,4 ms**. 5× de diferença por duração de corrida |
 
 Registrados mas **não** comparados, de propósito — um fingerprint que invalida o
-baseline a cada corrida vira ruído que o operador aprende a ignorar: `host`,
-`node`/`platform` (o baseline já é por máquina), `turns` e `sustain_s` (p95 é
-estatística de distribuição: rodar mais muda a confiança, não o valor central),
-`timeout_ms` (classifica timeouts, não move latência) e `sample_ms` (observa o
-POOL, não entra no p95 do turno).
+baseline a cada corrida vira ruído que o operador aprende a ignorar: `host` e
+`node`/`platform` (o baseline já é por máquina), `timeout_ms` (classifica
+timeouts, não move latência) e `sample_ms` (observa o POOL, não entra no p95 do
+turno).
+
+Consequência prática: **o baseline precisa ser gravado com o mesmo comando com
+que o gate roda.** Um baseline de `--turns 600` sem `--sustain-s` comparado
+contra o gate canônico não é regressão, é outra corrida — e o harness diz isso
+em vez de pintar 342 % de delta.
 
 Um baseline em formato antigo — sem fingerprint — também é recusado: ele não
 prova com que carga foi medido, e assumir que foi com a certa é o buraco que
