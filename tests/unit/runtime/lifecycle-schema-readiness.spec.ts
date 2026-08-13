@@ -39,6 +39,7 @@ import {
   _resetSchemaReadinessCacheForTests,
   _setSchemaReadinessDepsForTests,
 } from '@/runtime/lifecycle/schema-readiness.js';
+import { config } from '@/config/env.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
 import { LEDGER_V2_COLUMNS } from '@/migrations/ledger.js';
 import type { ReadOnlyPool, ReadOnlyPoolClient } from '@/migrations/index.js';
@@ -307,6 +308,39 @@ describe('checkSchemaReadiness — cost control', () => {
     // declare a target unhealthy (2-3 failures at a 5-10s interval).
     expect(SCHEMA_READINESS_TTL_MS).toBeGreaterThan(0);
     expect(SCHEMA_READINESS_TTL_MS).toBeLessThanOrEqual(15_000);
+  });
+
+  // One TTL is not the end-to-end bound, and saying "up to 10 s" out loud while
+  // the real number is 12 s is the kind of thing that gets discovered during an
+  // incident. `/readyz` sits behind a SECOND cache: `evaluateComponents()` in
+  // `readiness.ts` memoizes the whole component set for `READINESS_CACHE_MS`. A
+  // composite entry filled one millisecond before this module's TTL expires
+  // keeps serving that verdict until the composite entry itself expires.
+  //
+  // These two cases exist so the doc cannot rot: change either constant and the
+  // arithmetic here reports the new number instead of the comment lying.
+  describe('the COMPOSITE staleness bound, not just this module TTL', () => {
+    it('is the sum of both caches — the two layers add, they do not overlap', () => {
+      const composite = SCHEMA_READINESS_TTL_MS + config.READINESS_CACHE_MS;
+
+      // Worst case, spelled out rather than asserted as a magic number: the
+      // verdict is computed at t=0 and is reusable until t=TTL; the composite
+      // cache is filled at t=TTL-1 and is reusable for READINESS_CACHE_MS more.
+      expect(composite).toBe(SCHEMA_READINESS_TTL_MS + config.READINESS_CACHE_MS);
+      expect(composite).toBeGreaterThan(SCHEMA_READINESS_TTL_MS);
+
+      // At the shipped defaults (10 s + 2 s) this is 12 s. Pinned so that
+      // raising the default of either one is a decision someone makes on
+      // purpose, in this file, and not a side effect noticed later.
+      expect(composite).toBe(12_000);
+    });
+
+    it('stays inside the load balancer decision window even summed', () => {
+      // The whole argument for the TTL is "the cache is never the thing that
+      // decides how fast traffic drains". That argument has to survive the
+      // composite bound, not just this module's slice of it.
+      expect(SCHEMA_READINESS_TTL_MS + config.READINESS_CACHE_MS).toBeLessThanOrEqual(15_000);
+    });
   });
 });
 

@@ -39,6 +39,22 @@
  *     inside the window a load balancer needs anyway to declare a target
  *     unhealthy (typically 2-3 consecutive failures at a 5-10 s interval), so
  *     the cache is never the thing that decides how fast traffic drains.
+ *
+ *     One TTL is NOT the whole story, and the difference is the kind that gets
+ *     found during an incident rather than in review. `/readyz` sits behind a
+ *     SECOND cache: `evaluateComponents()` in `readiness.ts` memoizes the whole
+ *     component set for `READINESS_CACHE_MS` (2 s by default). A composite
+ *     entry filled just before this TTL expires keeps serving the same verdict
+ *     until IT expires, so the real bound on a stale positive is
+ *     `SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS` — 12 s at the defaults,
+ *     and more if an operator raises `READINESS_CACHE_MS`. That composite bound
+ *     is what `lifecycle-schema-readiness.spec.ts` pins; if you change either
+ *     value, the test tells you the new number rather than letting the doc rot.
+ *
+ *     Note the irony, since it is load-bearing: the TTL below is a constant
+ *     precisely so an operator cannot silently widen the gate — but
+ *     `READINESS_CACHE_MS` IS operator-tunable and widens the same window. The
+ *     constant bounds this module's contribution, not the end-to-end one.
  *   - **Stale negative** — after `migrate up` repairs the schema, the instance
  *     takes up to one TTL longer to rejoin rotation. 10 s is negligible next to
  *     the migration itself.
@@ -65,6 +81,10 @@ import { getSchemaReadiness, type ReadOnlyPool, type SchemaReadiness } from '@/m
  * How long a schema verdict is reused. See the module doc for the trade-off;
  * it is a constant rather than a contract variable on purpose — a value an
  * operator can raise is a value that can silently unbind the gate.
+ *
+ * This bounds THIS module only. End to end, `/readyz` can serve a verdict for
+ * `SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS`, because the composite
+ * readiness cache sits in front of it. See the "Stale positive" bullet above.
  */
 export const SCHEMA_READINESS_TTL_MS = 10_000;
 
