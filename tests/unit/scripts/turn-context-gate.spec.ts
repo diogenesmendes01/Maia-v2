@@ -36,6 +36,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   BASELINE_SCHEMA_VERSION,
+  NEVER_DRAINED,
   CARDINALITIES,
   applyInjection,
   checkBaselineCompatibility,
@@ -230,6 +231,103 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     const v = failed.find((x) => x.label.includes('o pool drena'));
     expect(v).toBeDefined();
     expect(v!.detail).toContain('A FILA NUNCA ESVAZIOU');
+  });
+
+  // -------------------------------------------------------------------------
+  // Os dois perfis: o dono separou o que se mede em cada um
+  //
+  // > "Concorrência 20 continua como máximo de requisições em voo, mas o perfil
+  // > normal deve definir ritmo/think_ms. O perfil sem ritmo passa a ser teste
+  // > de saturação; nele, exige-se zero erros/timeouts e drenagem depois que o
+  // > produtor para — não drenagem enquanto 20 turnos são repostos
+  // > continuamente."
+  // -------------------------------------------------------------------------
+
+  describe('perfil de saturação (--think-ms 0)', () => {
+    /** Carga saturada de ponta a ponta — o que a aritmética garante com ritmo 0. */
+    const SATURADO_NA_CARGA = {
+      think_ms: 0,
+      pool_saturated_samples: 590,
+      pool_load_samples: 590,
+      pool_load_saturated_samples: 590,
+      pool_saturation_max_streak_ms: 59_000,
+    };
+
+    it('APROVA carga 100% saturada quando a fila escoa depois que o produtor para', () => {
+      // Este é o caso que saía vermelho sem significar regressão: com 20 turnos
+      // repostos continuamente contra um pool de 10, a fila não PODE esvaziar
+      // durante a carga. O critério do perfil é outro.
+      const { code, verdicts } = run({
+        ...SATURADO_NA_CARGA,
+        pool_drain_samples: 20,
+        pool_drain_saturated_samples: 0,
+        pool_drained_after_ms: 120,
+      });
+      const v = verdicts.find((x) => x.label.includes('perfil de SATURAÇÃO'))!;
+      expect(v.passed).toBe(true);
+      expect(v.detail).toContain('drenou 120 ms depois de o produtor parar');
+      // E o critério do perfil normal NÃO é emitido: é um veredicto por braço,
+      // escolhido pelo perfil, não os dois somados.
+      expect(verdicts.some((x) => x.label.includes('nunca fica saturado por 60 s'))).toBe(false);
+      expect(code).toBe(0);
+    });
+
+    it('REPROVA quando a fila NÃO escoa depois que o produtor para', () => {
+      // Fila cheia sem ninguém pedindo nada é conexão vazando, não carga.
+      const { code, failed } = run({
+        ...SATURADO_NA_CARGA,
+        pool_drain_samples: 20,
+        pool_drain_saturated_samples: 20,
+        pool_drained_after_ms: -1,
+      });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes('perfil de SATURAÇÃO'))!;
+      expect(v).toBeDefined();
+      expect(v.skipped).toBeFalsy();
+      expect(v.detail).toContain('A FILA NÃO ESVAZIOU DEPOIS QUE O PRODUTOR PAROU');
+    });
+
+    it('amostras SÓ da fase de carga não são evidência de drenagem', () => {
+      // O segundo caso do achado, um passo além do `pool_samples === 0`: houve
+      // 590 amostras, todas ANTES da fronteira. A corrida terminou no instante
+      // em que o produtor parou e não observou nada do que interessa.
+      const { code, verdicts } = run({
+        ...SATURADO_NA_CARGA,
+        pool_drain_samples: 0,
+        pool_drain_saturated_samples: 0,
+        pool_drained_after_ms: -1,
+      });
+      const v = verdicts.find((x) => x.label.includes('perfil de SATURAÇÃO'))!;
+      expect(v.skipped).toBe(true);
+      expect(v.passed).toBe(false);
+      expect(v.detail).toContain('FASE DE ESCOAMENTO NÃO OBSERVADA');
+      expect(code).toBe(1);
+    });
+
+    it('o perfil normal TAMBÉM exige que a fila escoe depois do produtor parar', () => {
+      // A evidência de escoamento é barata e detecta vazamento de conexão nos
+      // dois perfis; o que muda entre eles é o critério da fase de CARGA.
+      const { code, failed } = run({
+        pool_drain_samples: 20,
+        pool_drain_saturated_samples: 20,
+        pool_drained_after_ms: -1,
+      });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes('nunca fica saturado por 60 s'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('A FILA NÃO ESVAZIOU DEPOIS QUE O PRODUTOR PAROU');
+    });
+
+    it('o perfil vem do RITMO medido no braço, não de uma flag lida à parte', () => {
+      // `think_ms` viaja no `ArmResult` porque é o braço que sabe com que ritmo
+      // rodou. Ler a flag noutro lugar deixaria o veredicto e a corrida
+      // discordarem no dia em que alguém rodasse os braços com ritmos
+      // diferentes.
+      const normal = run({});
+      expect(normal.verdicts.some((v) => v.label.includes('perfil de SATURAÇÃO'))).toBe(false);
+      const saturacao = run({ think_ms: 0, pool_drain_samples: 20 });
+      expect(saturacao.verdicts.some((v) => v.label.includes('perfil de SATURAÇÃO'))).toBe(true);
+    });
   });
 
   it('REPROVA quando a sequência saturada passa de 60 s', () => {
@@ -553,6 +651,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         max_streak_ms: 0,
         sampled_span_ms: 0,
         max_gap_ms: 61_000,
+        load: { samples: 0, saturated_samples: 0 },
+        drain: { samples: 0, saturated_samples: 0 },
+        drained_after_ms: NEVER_DRAINED,
       });
     });
 
@@ -599,6 +700,45 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(
         verdicts.filter((v) => !v.passed).some((v) => v.label.includes('a amostragem do pool')),
       ).toBe(true);
+    });
+
+    it('o amostrador REAL separa carga de escoamento na fronteira do produtor', async () => {
+      // A fronteira só existe se `runArm` a MARCAR e continuar amostrando
+      // depois dela. Sem isso não há fase de escoamento: o gerador é de malha
+      // fechada, então quando os workers retornam todo turno já terminou e o
+      // amostrador era parado nesse mesmo instante — zero amostras depois da
+      // fronteira, que é o segundo caso do achado.
+      const poolStub = {
+        options: { max: 10 },
+        waitingCount: 3,
+        totalCount: 10,
+        idleCount: 0,
+      } as unknown as Parameters<typeof startPoolSampler>[0];
+
+      const t0 = performance.now();
+      const sampler = startPoolSampler(poolStub, 5, t0);
+      await new Promise((r) => setTimeout(r, 60));
+
+      // O produtor para: ninguém mais pede conexão e a fila escoa.
+      sampler.markProducerStopped(performance.now());
+      poolStub.waitingCount = 0;
+      poolStub.idleCount = 10;
+      await new Promise((r) => setTimeout(r, 60));
+
+      const m = poolMetricsFromSummary(sampler.stop(performance.now()), 5);
+      expect(m.pool_load_samples).toBeGreaterThan(0);
+      expect(m.pool_load_saturated_samples).toBe(m.pool_load_samples);
+      expect(m.pool_drain_samples).toBeGreaterThan(0);
+      expect(m.pool_drain_saturated_samples).toBe(0);
+      expect(m.pool_drained_after_ms).toBeGreaterThanOrEqual(0);
+      expect(m.pool_load_samples + m.pool_drain_samples).toBe(m.pool_samples);
+
+      // E o veredicto do perfil de saturação aceita essa corrida.
+      const arms = armsWith({ think_ms: 0 });
+      for (const a of arms) Object.assign(a, m);
+      const verdicts = evaluateGate(arms, TH, BASELINE_FOLGADO, { mode: 'gate', fingerprint: FP });
+      const v = verdicts.find((x) => x.label.includes('perfil de SATURAÇÃO'))!;
+      expect(v.passed).toBe(true);
     });
 
     it('o amostrador real conta amostras e saturação quando o período cabe na corrida', async () => {

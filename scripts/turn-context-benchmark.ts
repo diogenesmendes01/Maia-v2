@@ -77,9 +77,28 @@
  * joelho da capacidade, a fila só acrescenta espera. A segunda: o critério
  * "nenhuma saturação contínua do pool por 60 s" NÃO é falsificável em malha
  * fechada sem ritmo, e o default de 150 ms existe para que ele meça o pool em
- * vez de medir a ausência de pausa. Rodar com `--think-ms 0` continua sendo
- * válido — é o perfil de ESTRESSE, e o relatório o traz — mas ali esse
- * veredicto sai vermelho por construção.
+ * vez de medir a ausência de pausa.
+ *
+ * ## Os dois perfis, e o que se mede em cada um
+ *
+ * O dono resolveu a aritmética acima separando os perfis:
+ *
+ * > "Concorrência 20 continua como máximo de requisições em voo, mas o perfil
+ * > normal deve definir ritmo/`think_ms`. O perfil sem ritmo passa a ser teste
+ * > de saturação; nele, exige-se zero erros/timeouts e drenagem depois que o
+ * > produtor para — não drenagem enquanto 20 turnos são repostos
+ * > continuamente."
+ *
+ * | perfil | como se roda | critério de drenagem |
+ * |---|---|---|
+ * | normal | `--think-ms 150` (default) | a fila esvazia DURANTE a carga e nunca fica saturada por 60 s seguidos |
+ * | saturação | `--think-ms 0` | a fila esvazia DEPOIS que o produtor para. Zero erros/timeouts continua valendo |
+ *
+ * Por isso toda corrida passou a ter duas FASES: carga (produtor emitindo) e
+ * escoamento (produtor parado, `--drain-window-ms`). O amostrador marca a
+ * fronteira por timestamp e contabiliza as amostras de cada lado — sem essa
+ * janela não existe fase de escoamento para observar, porque o gerador é de
+ * malha fechada e todo turno já terminou quando os workers retornam.
  *
  * ## Medir e barrar são coisas diferentes (`--mode`)
  *
@@ -151,6 +170,7 @@
  * | `--timeout-ms` | `5000` | Orçamento por turno. Casa com `connectionTimeoutMillis` do pool |
  * | `--sample-ms` | `100` | Período de amostragem do pool. Validado contra a janela que precisa resolver |
  * | `--sample-gap-factor` | `10` | Maior lacuna cega tolerada na amostragem, em múltiplos de `--sample-ms` |
+ * | `--drain-window-ms` | `2000` | Quanto observar o pool DEPOIS que o produtor para. É a única evidência do critério do perfil de saturação |
  * | `--p95-ms` / `--p99-ms` | `600` / `1000` | Limites do gate |
  * | `--baseline-tolerance` | `0.20` | Folga sobre o p95 do baseline |
  * | `--mode` | `gate` | `gate` · `measure` · `self-test` — ver acima |
@@ -257,6 +277,8 @@ type Options = {
   identity: 'profile' | 'legacy';
   timeout_ms: number;
   sample_ms: number;
+  /** Quanto tempo observar o pool DEPOIS que o produtor para. */
+  drain_window_ms: number;
   thresholds: Thresholds;
   write_baseline: boolean;
   inject: Record<string, number>;
@@ -520,6 +542,17 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
         `(são necessárias ao menos ${MIN_SAMPLES_PER_WINDOW} amostras)`,
     );
   }
+  // A janela de escoamento é a ÚNICA evidência do critério do perfil de
+  // saturação. Uma janela que não comporta amostras não observa escoamento
+  // nenhum — é o mesmo defeito de "zero amostras conta como drenou", um passo
+  // adiante.
+  const drain_window_ms = num('drain-window-ms', 2_000);
+  if (drain_window_ms < sample_ms * MIN_SAMPLES_PER_WINDOW) {
+    throw new Error(
+      `--drain-window-ms ${drain_window_ms} não observa escoamento com --sample-ms ${sample_ms} ` +
+        `(são necessárias ao menos ${MIN_SAMPLES_PER_WINDOW} amostras: mínimo ${sample_ms * MIN_SAMPLES_PER_WINDOW} ms)`,
+    );
+  }
 
   return {
     mode,
@@ -532,6 +565,7 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
     identity: identityRaw,
     timeout_ms: num('timeout-ms', 5_000),
     sample_ms,
+    drain_window_ms,
     thresholds: {
       p95_ms: num('p95-ms', 600),
       p99_ms: num('p99-ms', 1_000),
@@ -637,7 +671,30 @@ export type PoolSamplingSummary = {
    * amostrador que nunca rodou se denuncia.
    */
   max_gap_ms: number;
+  /**
+   * Amostras da fase de CARGA (produtor emitindo) e da fase de ESCOAMENTO
+   * (produtor parado). A fronteira existe porque o dono separou os dois perfis:
+   * no perfil de saturação (`--think-ms 0`) a fila não pode esvaziar enquanto
+   * 20 turnos são repostos continuamente — é aritmética — então ali o que se
+   * exige é que ela esvazie DEPOIS que o produtor para.
+   */
+  load: PoolPhaseSummary;
+  drain: PoolPhaseSummary;
+  /**
+   * Quanto tempo depois do produtor parar veio a primeira amostra drenada.
+   * `NEVER_DRAINED` quando nenhuma veio — inclusive quando a fase sequer foi
+   * observada, caso em que `drain.samples === 0` diz qual dos dois é.
+   */
+  drained_after_ms: number;
 };
+
+export type PoolPhaseSummary = {
+  samples: number;
+  saturated_samples: number;
+};
+
+/** "Não drenou" (ou não foi observado) — `drained_after_ms` é um número para poder ser injetado. */
+export const NEVER_DRAINED = -1;
 
 /**
  * A contabilidade da amostragem do pool, separada do `setInterval` para poder
@@ -655,6 +712,8 @@ export type PoolSamplingSummary = {
  */
 export function createPoolSaturationTracker(startedAtMs: number): {
   observe: (atMs: number, saturated: boolean) => void;
+  /** A fronteira temporal entre carga e escoamento: o instante em que o produtor parou. */
+  markProducerStopped: (atMs: number) => void;
   summary: (endedAtMs: number) => PoolSamplingSummary;
 } {
   let samples = 0;
@@ -665,6 +724,10 @@ export function createPoolSaturationTracker(startedAtMs: number): {
   let lastAt = startedAtMs;
   // Último instante conhecidamente NÃO saturado.
   let lastDrainedAt = startedAtMs;
+  let producerStoppedAt: number | null = null;
+  const load: PoolPhaseSummary = { samples: 0, saturated_samples: 0 };
+  const drain: PoolPhaseSummary = { samples: 0, saturated_samples: 0 };
+  let drainedAfterMs = NEVER_DRAINED;
 
   return {
     observe: (atMs: number, saturated: boolean): void => {
@@ -673,13 +736,25 @@ export function createPoolSaturationTracker(startedAtMs: number): {
       const gap = atMs - lastAt;
       if (gap > maxGap) maxGap = gap;
       lastAt = atMs;
+      // A atribuição de fase é por TIMESTAMP, e é por isso que a sequência
+      // também precisa ser: a fronteira "o produtor parou" só é localizável
+      // com precisão nas amostras se as amostras carregarem o relógio real.
+      const phase = producerStoppedAt !== null && atMs > producerStoppedAt ? drain : load;
+      phase.samples++;
       if (saturated) {
         saturatedSamples++;
+        phase.saturated_samples++;
         const streak = atMs - lastDrainedAt;
         if (streak > maxStreak) maxStreak = streak;
       } else {
         lastDrainedAt = atMs;
+        if (phase === drain && drainedAfterMs === NEVER_DRAINED) {
+          drainedAfterMs = atMs - producerStoppedAt!;
+        }
       }
+    },
+    markProducerStopped: (atMs: number): void => {
+      if (producerStoppedAt === null) producerStoppedAt = atMs;
     },
     summary: (endedAtMs: number): PoolSamplingSummary => {
       const tail = endedAtMs - lastAt;
@@ -689,6 +764,9 @@ export function createPoolSaturationTracker(startedAtMs: number): {
         max_streak_ms: maxStreak,
         sampled_span_ms: firstAt === null ? 0 : lastAt - firstAt,
         max_gap_ms: Math.max(maxGap, tail > 0 ? tail : 0),
+        load: { ...load },
+        drain: { ...drain },
+        drained_after_ms: drainedAfterMs,
       };
     },
   };
@@ -703,6 +781,11 @@ export type PoolMetrics = Pick<
   | 'pool_sample_ms'
   | 'pool_sampled_span_ms'
   | 'pool_max_sample_gap_ms'
+  | 'pool_load_samples'
+  | 'pool_load_saturated_samples'
+  | 'pool_drain_samples'
+  | 'pool_drain_saturated_samples'
+  | 'pool_drained_after_ms'
 >;
 
 /**
@@ -721,6 +804,11 @@ export function poolMetricsFromSummary(summary: PoolSamplingSummary, sampleMs: n
     pool_sample_ms: sampleMs,
     pool_sampled_span_ms: summary.sampled_span_ms,
     pool_max_sample_gap_ms: summary.max_gap_ms,
+    pool_load_samples: summary.load.samples,
+    pool_load_saturated_samples: summary.load.saturated_samples,
+    pool_drain_samples: summary.drain.samples,
+    pool_drain_saturated_samples: summary.drain.saturated_samples,
+    pool_drained_after_ms: summary.drained_after_ms,
   };
 }
 
@@ -775,6 +863,21 @@ export type ArmResult = {
   pool_sampled_span_ms: number;
   /** Maior intervalo cego da amostragem, pontas incluídas. */
   pool_max_sample_gap_ms: number;
+  /** Amostras da fase de CARGA (produtor emitindo). */
+  pool_load_samples: number;
+  pool_load_saturated_samples: number;
+  /** Amostras da fase de ESCOAMENTO (produtor parado) — a evidência do perfil de saturação. */
+  pool_drain_samples: number;
+  pool_drain_saturated_samples: number;
+  /** ms entre o produtor parar e a primeira amostra drenada · `NEVER_DRAINED` se não houve. */
+  pool_drained_after_ms: number;
+  /** Janela de observação do escoamento, pedida em `--drain-window-ms`. */
+  pool_drain_window_ms: number;
+  /**
+   * O RITMO com que este braço rodou. Define o PERFIL, e portanto qual critério
+   * de drenagem se aplica: `0` é o perfil de saturação.
+   */
+  think_ms: number;
   identity_cache: Record<string, number>;
   /** `maia_turn_context_load_duration_ms{phase="loader"}` — count e sum reais. */
   metric_count: number;
@@ -902,26 +1005,65 @@ export function evaluateGate(
     // sequência com uma fração do relógio de parede erra justamente o caso que
     // motivou este critério (57,2 s de sequência em 60,1 s de corrida com
     // 572/572 amostras saturadas passaria por uma folga de 2%).
-    const observedFullWindow = a.wall_ms >= th.saturation_ms;
-    const drained = a.pool_saturated_samples < a.pool_samples;
-    const streakOk = a.pool_saturation_max_streak_ms < th.saturation_ms;
-    // Só é "não avaliado" quando NADA de errado apareceu e a janela inteira não
-    // coube na corrida. Sem amostragem válida não há o que avaliar — e não
-    // avaliado NÃO é aprovado (ver `Verdict.passed`).
-    const healthy = sampled && drained && streakOk;
-    out.push({
-      label: `[${a.arm}] o pool drena (fila esvazia) e nunca fica saturado por ${(th.saturation_ms / 1000).toFixed(0)} s seguidos`,
-      passed: healthy && observedFullWindow,
-      skipped: !sampled || (healthy && !observedFullWindow),
-      detail:
-        `maior sequência saturada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s de ` +
-        `${(a.wall_ms / 1000).toFixed(1)} s · ${a.pool_saturated_samples}/${a.pool_samples} amostras saturadas` +
-        (sampled ? '' : ' · SEM AMOSTRAGEM VÁLIDA DO POOL — critério não observado') +
-        (sampled && !drained ? ' · A FILA NUNCA ESVAZIOU' : '') +
-        (observedFullWindow
-          ? ''
-          : ` · janela de ${(th.saturation_ms / 1000).toFixed(0)} s não observada (use --sustain-s ${(th.saturation_ms / 1000).toFixed(0)})`),
-    });
+    // A fase de ESCOAMENTO — a evidência que o perfil de saturação exige, e que
+    // nenhum perfil tinha antes: o amostrador era parado no mesmo instante em
+    // que o produtor parava, então não havia UMA amostra depois da fronteira.
+    const drainObserved = a.pool_drain_samples > 0;
+    const drainedAfterStop = drainObserved && a.pool_drain_saturated_samples < a.pool_drain_samples;
+    const drainDetail =
+      `${a.pool_drain_saturated_samples}/${a.pool_drain_samples} amostras saturadas na janela de ` +
+      `escoamento de ${(a.pool_drain_window_ms / 1000).toFixed(1)} s` +
+      (drainedAfterStop
+        ? ` · drenou ${a.pool_drained_after_ms.toFixed(0)} ms depois de o produtor parar`
+        : drainObserved
+          ? ' · A FILA NÃO ESVAZIOU DEPOIS QUE O PRODUTOR PAROU'
+          : ' · FASE DE ESCOAMENTO NÃO OBSERVADA — nenhuma amostra depois de o produtor parar');
+
+    if (a.think_ms === 0) {
+      // PERFIL DE SATURAÇÃO (`--think-ms 0`), conforme a decisão do dono.
+      //
+      // Aqui NÃO se exige que a fila esvazie durante a carga: com 20 turnos
+      // repostos continuamente contra um pool de 10, e até 6 conexões por
+      // turno, ela não pode — é aritmética, não defeito, e cobrar isso produzia
+      // um vermelho que não significava regressão. O que se exige é zero
+      // erros/timeouts (critério próprio, acima) e que a fila esvazie DEPOIS
+      // que o produtor para. Uma fila que não escoa quando ninguém mais pede é
+      // conexão vazando, não carga.
+      out.push({
+        label: `[${a.arm}] perfil de SATURAÇÃO (--think-ms 0): o pool drena depois que o produtor para`,
+        passed: sampled && drainedAfterStop,
+        skipped: !sampled || !drainObserved,
+        detail:
+          drainDetail +
+          ` · na carga: ${a.pool_load_saturated_samples}/${a.pool_load_samples} saturadas (esperado: quase todas)` +
+          (sampled ? '' : ' · SEM AMOSTRAGEM VÁLIDA DO POOL'),
+      });
+    } else {
+      // PERFIL NORMAL (com ritmo): o critério de drenagem continua como estava —
+      // a fila tem que esvaziar DURANTE a carga e nunca ficar saturada por 60 s
+      // seguidos.
+      const observedFullWindow = a.wall_ms >= th.saturation_ms;
+      const drained = a.pool_saturated_samples < a.pool_samples;
+      const streakOk = a.pool_saturation_max_streak_ms < th.saturation_ms;
+      // Só é "não avaliado" quando NADA de errado apareceu e a janela inteira
+      // não coube na corrida. Sem amostragem válida não há o que avaliar — e
+      // não avaliado NÃO é aprovado (ver `Verdict.passed`).
+      const healthy = sampled && drained && streakOk && drainedAfterStop;
+      out.push({
+        label: `[${a.arm}] o pool drena (fila esvazia) e nunca fica saturado por ${(th.saturation_ms / 1000).toFixed(0)} s seguidos`,
+        passed: healthy && observedFullWindow,
+        skipped: !sampled || !drainObserved || (healthy && !observedFullWindow),
+        detail:
+          `maior sequência saturada=${(a.pool_saturation_max_streak_ms / 1000).toFixed(1)} s de ` +
+          `${(a.wall_ms / 1000).toFixed(1)} s · ${a.pool_saturated_samples}/${a.pool_samples} amostras saturadas` +
+          (sampled ? '' : ' · SEM AMOSTRAGEM VÁLIDA DO POOL — critério não observado') +
+          (sampled && !drained ? ' · A FILA NUNCA ESVAZIOU' : '') +
+          ` · ${drainDetail}` +
+          (observedFullWindow
+            ? ''
+            : ` · janela de ${(th.saturation_ms / 1000).toFixed(0)} s não observada (use --sustain-s ${(th.saturation_ms / 1000).toFixed(0)})`),
+      });
+    }
 
     // A métrica que o enunciado nomeia tem que estar SAINDO. Um harness que
     // medisse com relógio próprio e não olhasse a métrica provaria o
@@ -1029,6 +1171,13 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'pool_sample_ms',
     'pool_sampled_span_ms',
     'pool_max_sample_gap_ms',
+    'pool_load_samples',
+    'pool_load_saturated_samples',
+    'pool_drain_samples',
+    'pool_drain_saturated_samples',
+    'pool_drained_after_ms',
+    'pool_drain_window_ms',
+    'think_ms',
     'wall_ms',
     'metric_count',
     'pairs_exercised',
@@ -1080,6 +1229,15 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
     pool_sample_ms: 100,
     pool_sampled_span_ms: 60_900,
     pool_max_sample_gap_ms: 100,
+    pool_load_samples: 590,
+    pool_load_saturated_samples: 0,
+    pool_drain_samples: 20,
+    pool_drain_saturated_samples: 0,
+    pool_drained_after_ms: 100,
+    pool_drain_window_ms: 2_000,
+    // O braço sintético representa o PERFIL NORMAL: é o do comando canônico.
+    // O perfil de saturação é exercitado com `--inject think_ms=0`.
+    think_ms: 150,
     identity_cache: {},
     metric_count: 600,
     metric_sum_ms: 7_200,
@@ -1561,7 +1719,10 @@ export function startPoolSampler(
   pool: PgPool,
   periodMs: number,
   startedAtMs = performance.now(),
-): { stop: (endedAtMs?: number) => PoolSamplingSummary } {
+): {
+  markProducerStopped: (atMs?: number) => void;
+  stop: (endedAtMs?: number) => PoolSamplingSummary;
+} {
   const tracker = createPoolSaturationTracker(startedAtMs);
   const max = pool.options.max ?? 10;
   const timer = setInterval(() => {
@@ -1570,6 +1731,7 @@ export function startPoolSampler(
   }, periodMs);
   timer.unref?.();
   return {
+    markProducerStopped: (atMs = performance.now()) => tracker.markProducerStopped(atMs),
     stop: (endedAtMs = performance.now()) => {
       clearInterval(timer);
       return tracker.summary(endedAtMs);
@@ -1736,8 +1898,22 @@ async function runArm(
   };
 
   await Promise.all(Array.from({ length: opts.concurrency }, worker));
+
+  // O PRODUTOR PAROU. Daqui em diante o harness não emite mais nenhum turno, e
+  // o que se observa é o ESCOAMENTO.
+  //
+  // Sem esta janela não existe fase de escoamento para observar: o gerador é de
+  // malha fechada, então quando `Promise.all` resolve todos os turnos já
+  // terminaram e o amostrador era parado nesse mesmo instante. O critério
+  // "drena depois que o produtor para" — que é o que o dono fixou para o perfil
+  // de saturação — não teria UMA amostra em que se apoiar.
+  const producerStoppedAt = performance.now();
+  sampler.markProducerStopped(producerStoppedAt);
+  // `wall_ms` continua sendo a duração da CARGA: é ela que responde "a janela
+  // de 60 s foi observada?". A janela de escoamento é reportada à parte.
+  const wall_ms = producerStoppedAt - startedAt;
+  await sleep(opts.drain_window_ms);
   const endedAt = performance.now();
-  const wall_ms = endedAt - startedAt;
   const pool = poolMetricsFromSummary(sampler.stop(endedAt), opts.sample_ms);
 
   const all = samples.map((s) => s.ms).sort((a, b) => a - b);
@@ -1800,6 +1976,8 @@ async function runArm(
     reads_per_turn_max: readsPerTurn.length ? Math.max(...readsPerTurn) : 0,
     pool_max: deps.pool.options.max ?? 10,
     ...pool,
+    pool_drain_window_ms: opts.drain_window_ms,
+    think_ms: opts.think_ms,
     identity_cache,
     metric_count: hist.count,
     metric_sum_ms: hist.sum,
@@ -1898,6 +2076,21 @@ function renderReport(
     [
       'amostras do pool saturadas',
       ...arms.map((a) => `${a.pool_saturated_samples}/${a.pool_samples}`),
+    ],
+    [
+      'escoamento (produtor parado)',
+      ...arms.map(
+        (a) =>
+          `${a.pool_drain_saturated_samples}/${a.pool_drain_samples} saturadas em ` +
+          `${fmt(a.pool_drain_window_ms / 1000)}s · ` +
+          (a.pool_drained_after_ms === NEVER_DRAINED
+            ? '**não drenou**'
+            : `drenou em ${fmt(a.pool_drained_after_ms, 0)}ms`),
+      ),
+    ],
+    [
+      'perfil',
+      ...arms.map((a) => (a.think_ms === 0 ? '**saturação** (`--think-ms 0`)' : `normal (ritmo ${a.think_ms}ms)`)),
     ],
     [
       'amostragem do pool (cobertura · maior lacuna)',

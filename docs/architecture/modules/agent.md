@@ -222,7 +222,8 @@ What the gate decides (exit code 0/1), and why each one is there:
 | peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
 | distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
 | pool sampling actually observed the run | samples > 0, blind gap ≤ 10× `--sample-ms` | the criterion below is worthless without it — see the trap |
-| pool drains, and is never saturated for 60 s | — | see the trap below |
+| pool drains (**normal profile**, paced) | during load, never saturated 60 s straight | see the trap below |
+| pool drains (**saturation profile**, `--think-ms 0`) | after the producer stops | demanding it *during* load is arithmetically impossible — the owner's ruling |
 | `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
 | p95 vs baseline | ≤ baseline + 20 %, **same fingerprint** | absolute ceilings do not catch a slow drift; a baseline from another load is not a baseline |
 | load shape | 50 pairs, concurrency 20, 1/10/100 | a gate run on 4 tenants is not this gate |
@@ -265,6 +266,21 @@ compared — a fingerprint that invalidates the baseline every run is noise the
 operator learns to ignore. A pre-fingerprint file is refused too: it cannot prove
 what load it measured. The practical consequence: **record the baseline with the
 same command the gate runs**.
+
+**Two profiles, two drain criteria.** The owner settled the closed-loop
+arithmetic by splitting what each profile measures: the normal profile paces the
+load (`--think-ms 150`) and keeps the drain criterion as it was; the un-paced
+profile (`--think-ms 0`) becomes a *saturation test*, where zero errors/timeouts
+still holds but drainage is required **after the producer stops**, not while
+twenty turns are continuously replaced. So every run now has two phases — load
+and drain (`--drain-window-ms`, default 2 s) — with the boundary marked by
+timestamp. Without that window there is no drain phase to observe at all: the
+generator is closed-loop, so by the time the workers return every turn has
+finished and the sampler used to be stopped at that same instant. Samples from
+the load phase alone are not evidence of drainage, and that case is `n/a` — which
+fails in gate mode, for the same reason zero samples does. Measured here on the
+saturation profile: 40/40 samples saturated during load, 0/20 during the drain
+window, queue empty 39 ms after the producer stopped.
 
 **Pacing is a parameter, not decoration.** The generator is closed-loop, so with
 `--think-ms 0` twenty turns are always in flight; at up to 6 permits each against

@@ -1273,7 +1273,8 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
 | `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
-| `o pool drena` | a fila do pool nunca esvaziou | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
+| `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
+| `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
 | `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
 | `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
 | `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
@@ -1294,9 +1295,38 @@ de 4 vCPU com Postgres local, braço `cold`, concorrência 20:
 | 300 | 60,0 | 14,5 ms | 87,1 ms | 27/149 (18%) | 0,3 s |
 
 Note que o martelo entrega **menos** vazão que o ritmo de 150 ms: passado o
-joelho da capacidade, a fila só acrescenta espera. `--think-ms 0` continua sendo
-um perfil legítimo — é o de ESTRESSE — mas ali o veredicto do pool sai vermelho
-por construção, e não é sinal de regressão.
+joelho da capacidade, a fila só acrescenta espera.
+
+### Os dois perfis (decisão do dono sobre a #525)
+
+> "Concorrência 20 continua como máximo de requisições em voo, mas o perfil
+> normal deve definir ritmo/`think_ms`. O perfil sem ritmo passa a ser **teste de
+> saturação**; nele, exige-se zero erros/timeouts e **drenagem depois que o
+> produtor para** — não drenagem enquanto 20 turnos são repostos continuamente."
+
+| perfil | como se roda | critério de drenagem |
+|---|---|---|
+| **normal** | `--think-ms 150` (default), o do gate canônico | a fila esvazia **durante** a carga e nunca fica saturada por 60 s seguidos |
+| **saturação** | `--think-ms 0` | a fila esvazia **depois que o produtor para**. Zero erros/timeouts continua valendo |
+
+Cobrar drenagem durante a carga no perfil sem ritmo era pedir o impossível — 20
+turnos repostos continuamente, até 6 conexões cada, contra um pool de 10 — e
+produzia vermelho que não significava regressão.
+
+Por isso toda corrida tem duas **fases**: carga (produtor emitindo) e escoamento
+(produtor parado, `--drain-window-ms`, default 2 s). O amostrador marca a
+fronteira por timestamp e conta as amostras de cada lado. Sem essa janela não
+existe fase de escoamento para observar: o gerador é de malha fechada, então
+quando os workers retornam todo turno já terminou, e o amostrador era parado
+nesse mesmo instante — zero amostras do lado que interessa.
+
+**Amostras só da fase de carga não são evidência de drenagem.** Esse caso sai
+`n/a` e, em modo `gate`, reprova — pelo mesmo motivo que zero amostras reprova.
+
+Medido neste host, perfil de saturação (`--think-ms 0 --turns 400`, braço
+`cold`): 40/40 amostras saturadas na carga — 100 %, como a aritmética manda — e
+0/20 na janela de escoamento, com a fila esvaziando **39 ms** depois de o
+produtor parar. Exit 0.
 
 ### Baseline
 
