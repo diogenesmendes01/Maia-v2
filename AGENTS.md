@@ -34,7 +34,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Cache / Queue | Redis + BullMQ (`ioredis`) |
 | Channel | WhatsApp via Baileys; multi-channel schema present |
 | LLM | Anthropic Claude (Sonnet 4.6 + Haiku 4.5); OpenAI Whisper (audio); Claude Vision (images) |
-| Admin UI | Next.js 14 + tRPC + NextAuth (`src/admin-ui/`) |
+| Admin UI | Next.js 15.5 + React 19 + tRPC + NextAuth (`src/admin-ui/`) |
 | Validation | Zod everywhere |
 | Tests | Vitest (unit/integration/e2e) + Playwright (admin-ui) |
 | Migrations | Versioned SQL in `migrations/` |
@@ -180,8 +180,34 @@ CI runs these automatically in `.github/workflows/ci.yml` with service container
 | **Schema changes need `_up` + `_down`** | Migrations are reversible by default |
 | **Tests stay green** | typecheck + lint + unit + integration must pass before requesting review |
 | **PR body sections** | Non-bot PR bodies MUST carry the 8 `##` sections + the `Residual risk:` field — see [PR body](#pr-body) below. Enforced in CI by [`scripts/check-pr-body.ts`](scripts/check-pr-body.ts) (blocking). |
-| **Co-author trailer** | End commits with `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` |
+| **Não inventar coautoria** | Só acrescente `Co-Authored-By:` quando a identidade e o e-mail do coautor estiverem **verificados**. Assistência de IA vai em `Task Context` ou `Reviewer Notes` da PR, não num trailer com identidade fabricada — ver [Coautoria](#coautoria) |
 | **PR body trailer** | End PR descriptions with `🤖 Generated with [Claude Code](https://claude.com/claude-code)` |
+
+### Coautoria
+
+A regra anterior mandava encerrar todo commit com
+`Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`. Ela foi removida por
+duas razões independentes, e a segunda é a que importa.
+
+**Envelhece.** Um nome de modelo fixo no manual fica obsoleto na versão
+seguinte, e ninguém volta para atualizá-lo. O trailer passa a atribuir trabalho
+a um modelo que não o fez.
+
+**Um trailer `Co-Authored-By:` é uma afirmação verificável.** Ele entra no
+histórico do git e é lido por ferramentas como atribuição de autoria real, com
+e-mail. Preenchê-lo com uma identidade que ninguém pode verificar não é
+formalidade: é registrar no histórico uma coautoria que não existe. Trocar o
+nome do modelo por outro — ou por um endereço inventado de qualquer assistente —
+não conserta isso, só muda a fabricação.
+
+Então:
+
+- **Coautor humano, identidade e e-mail conhecidos** → `Co-Authored-By:` normal.
+- **Assistência de IA** → registre em `Task Context` ou `Reviewer Notes` da PR,
+  onde o contexto cabe e ninguém confunde com autoria verificada. O rodapé
+  automático da PR já sinaliza a ferramenta.
+- **Na dúvida** → não escreva o trailer. Ausência é honesta; identidade
+  fabricada não.
 
 ### PR body
 
