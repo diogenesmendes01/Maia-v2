@@ -476,4 +476,36 @@ d('worker onboarding_expirer contra Postgres real (issue #519)', () => {
       true,
     );
   });
+
+  /**
+   * Achado do review da PR #560. A varredura aplicava `LIMIT` sem `ORDER BY`, e
+   * o SQL é livre para devolver QUAISQUER `limit` linhas que satisfaçam o
+   * filtro. O índice por `expires_at` costumava dar a ordem certa — por
+   * acidente, não por semântica.
+   *
+   * O custo do acidente é operacional: sob backlog contínuo, a run mais antiga
+   * pode ser preterida tick após tick. Isso corrói exatamente a gauge de idade
+   * que esta issue introduz (ela subiria para sempre sem que nada estivesse
+   * quebrado) e derruba a afirmação de que o prazo máximo de limpeza sai de
+   * `backlog ÷ vazão`.
+   *
+   * O caso é o que o review pediu: limite MENOR que o backlog, e a mais antiga
+   * obrigada a sair primeiro.
+   */
+  it('com limite menor que a fila, as MAIS ANTIGAS saem primeiro', async () => {
+    const oldest = await seedRun({ tenant_id: 'expirer-fifo-1', expires_in_ms: -900_000 });
+    const middle = await seedRun({ tenant_id: 'expirer-fifo-2', expires_in_ms: -600_000 });
+    const newest = await seedRun({ tenant_id: 'expirer-fifo-3', expires_in_ms: -60_000 });
+
+    await tickWithLimit(2);
+
+    expect((await readRun(oldest)).state).toBe('cancelled');
+    expect((await readRun(middle)).state).toBe('cancelled');
+    // A mais nova é a que espera — e é a única que espera.
+    expect((await readRun(newest)).state).toBe('created');
+
+    // O tick seguinte a leva, então nada fica preso.
+    await tickWithLimit(2);
+    expect((await readRun(newest)).state).toBe('cancelled');
+  });
 });

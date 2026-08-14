@@ -337,7 +337,19 @@ Corolário para o plantão: `maia_onboarding_expiry_backlog` subindo **com**
 `maia_worker_last_success_timestamp{worker="onboarding_expirer"}` parado é
 worker morto; subindo **com** o worker carimbando sucesso é teto pequeno demais.
 `NaN` nas duas séries não é fila vazia — é leitura que falhou (banco fora, por
-exemplo).
+exemplo). Esse `NaN` **persiste por até 15s** (a janela do snapshot), e é
+deliberado: a janela conta a última TENTATIVA, não a última leitura bem
+sucedida. Sem isso, um Postgres fora do ar faria cada scrape disparar uma query
+por série, todas condenadas — amplificando pressão exatamente durante o
+incidente. Ou seja: `NaN` que some sozinho depois de um scrape é falha
+transitória; `NaN` sustentado é indisponibilidade da leitura, e a investigação
+é do banco, não do worker.
+
+A varredura escolhe as vencidas por `expires_at ASC` (desempate por `id`), então
+com backlog maior que o teto a run mais antiga sai primeiro. É isso que torna
+`maia_onboarding_expiry_oldest_age_seconds` interpretável e o prazo de limpeza
+acima derivável: sem ordem determinística, a mais antiga poderia ser preterida
+tick após tick e a idade subiria para sempre sem nada estar quebrado.
 
 ## 6. Rollback
 

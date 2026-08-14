@@ -1004,6 +1004,16 @@ export const onboardingRunsRepo = {
           notInArray(onboarding_runs.state, [...TERMINAL_STATES]),
         ),
       )
+      // `LIMIT` sem `ORDER BY` não escolhe: o SQL é livre para devolver
+      // QUAISQUER `limit` linhas que satisfaçam o filtro. Hoje o índice por
+      // `expires_at` costuma dar a ordem certa por acidente, mas acidente não
+      // é semântica — e sob backlog contínuo a run mais antiga pode ser
+      // preterida tick após tick, indefinidamente. Isso corroeria justamente a
+      // gauge de idade que esta issue introduz, e derrubaria a afirmação
+      // operacional de que o prazo máximo de limpeza sai de `backlog ÷ vazão`.
+      // `id` é o desempate estável para `expires_at` empatado (achado do
+      // review da PR #560).
+      .orderBy(asc(onboarding_runs.expires_at), asc(onboarding_runs.id))
       .limit(limit);
     if (stale.length === 0) return { total: 0, by_scope: [] };
 
