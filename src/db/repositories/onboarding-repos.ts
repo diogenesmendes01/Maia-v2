@@ -76,6 +76,24 @@ export const ONBOARDING_EVENT_TYPES = {
 } as const;
 
 /**
+ * Ações que ESTE repo grava em `admin_audit_log`. A coluna não tem CHECK, e é
+ * justamente por isso que o literal não pode ficar solto no call site: um typo
+ * quebra a consulta da trilha em silêncio.
+ *
+ * A expiração reusa `RUN_CANCELLED`, a MESMA ação do cancelamento operado pelo
+ * console (`cancel`, abaixo), porque a semântica é a mesma decisão terminal —
+ * a run vai para `state='cancelled'`. O que muda é QUEM e POR QUÊ, e isso já
+ * está nas colunas certas: `actor_id='system'` e
+ * `change_summary.reason_code='expired'` (vocabulário fechado
+ * `ONBOARDING_REASONS`, o mesmo que rotula a métrica). Uma ação nova obrigaria
+ * quem audita "runs canceladas" a somar duas séries para responder uma
+ * pergunta só.
+ */
+export const ONBOARDING_ADMIN_AUDIT_ACTIONS = {
+  RUN_CANCELLED: 'onboarding_run_cancelled',
+} as const;
+
+/**
  * Resolve o `tenant_id` que pode ser gravado em `admin_audit_log`.
  *
  * `admin_audit_log.tenant_id` é `TEXT NOT NULL REFERENCES tenants(id)`
@@ -967,6 +985,39 @@ export const onboardingRunsRepo = {
           from_state: run.state,
           to_state: 'cancelled',
           summary: {},
+        });
+        // O evento acima reconstrói o WORKFLOW; ele NÃO é a trilha de
+        // governança (o cabeçalho deste arquivo é explícito). A expiração é
+        // uma decisão TERMINAL do backend, com mutação durável e sem operador
+        // por perto — exatamente o caso da invariante MUST nº 4 do AGENTS.md.
+        // Vai no MESMO `tx`: auditoria que sobrevive ao rollback do UPDATE
+        // seria trilha de uma expiração que não aconteceu.
+        //
+        // A tabela é `admin_audit_log`, e não `audit_log`, pelo motivo que
+        // vale para a saga inteira: `audit_log.agent_id` é FK para `agents` e
+        // metade das runs vence ANTES de o agente existir (a de
+        // `global_bootstrap` nem tenant tem). O alvo pretendido fica em
+        // `change_summary`, como no cancelamento e na criação.
+        await tx.insert(admin_audit_log).values({
+          tenant_id: await resolveAuditTenant(tx, run.tenant_id),
+          actor_id: 'system',
+          actor_role: 'system',
+          action: ONBOARDING_ADMIN_AUDIT_ACTIONS.RUN_CANCELLED,
+          resource_type: 'onboarding_run',
+          resource_id: run.id,
+          change_summary: {
+            run_id: run.id,
+            kind: run.kind,
+            from_state: run.state,
+            reason_code: 'expired',
+            target_tenant_id: run.tenant_id,
+            target_agent_id: run.agent_id,
+            // A REGRA e o DADO a que ela foi aplicada: venceu em X, varrido
+            // em Y. Sem isso a linha diz "expirou" sem dizer por quê.
+            expires_at: run.expires_at.toISOString(),
+            expired_at: now.toISOString(),
+            swept_by: 'onboarding_expirer',
+          },
         });
         return true;
       });

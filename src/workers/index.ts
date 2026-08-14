@@ -6,6 +6,7 @@ import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
 import { runIdempotencyCleanup } from './idempotency-cleanup.js';
 import { runAuditModeExpirer } from './audit-mode-expirer.js';
+import { runOnboardingExpirer } from './onboarding-expirer.js';
 import { runInactivitySweep } from './inactivity-sweep.js';
 import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
@@ -116,6 +117,12 @@ export const JOBS: Job[] = [
   // tuple under `runWithTenantContext`, fail-isolated.
   { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: runWorkflowEngineTick, phase: 1 },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
+  // Issue #519 — housekeeping da saga de onboarding: marca `cancelled`
+  // (`last_error_code='expired'`) as runs cujo `expires_at` passou e que ainda
+  // não são terminais. Varredura GLOBAL sob contexto `system` (a run pode nem
+  // ter tenant ainda), em lotes de 100 por tick — ver o cabeçalho de
+  // `./onboarding-expirer.ts` para o porquê de não haver single-flight.
+  { name: 'onboarding_expirer', cron: '*/5 * * * *', fn: runOnboardingExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   // Issue #292 — outbound_messages sweeper (#227/#233 follow-up).
   // Cadence ~5min: stale-pending cutoff é 5min default, então rodar a cada
