@@ -29,6 +29,7 @@
  */
 import { gauge, METRIC } from './metrics.js';
 import { logger } from '@/lib/logger.js';
+import { safeFailure } from '@/lib/safe-failure.js';
 
 /** Uma leitura do backlog. Só números — nenhum id de run, nenhum tenant. */
 export interface OnboardingExpiryBacklog {
@@ -48,23 +49,42 @@ export type OnboardingExpiryBacklogSource = () => Promise<OnboardingExpiryBacklo
 const SNAPSHOT_TTL_MS = 15_000;
 
 let snapshot: OnboardingExpiryBacklog | null = null;
-let lastRefreshAt = 0;
+/**
+ * Instante da última TENTATIVA — não da última leitura bem-sucedida.
+ *
+ * Review da PR #560: enquanto a janela era `snapshot !== null && ...`, ela só
+ * valia no caminho feliz. Com o Postgres fora, o primeiro provider deixava
+ * `snapshot = null`, e como `renderPrometheus()` avalia as gauges em
+ * sequência, o segundo provider caía direto em `refresh()` e consultava o
+ * banco DE NOVO no mesmo scrape — duas queries que já se sabiam condenadas,
+ * amplificando pressão exatamente durante o incidente. A tentativa é o que
+ * conta para a janela; o desfecho dela é outra coisa.
+ *
+ * A janela vale para os DOIS desfechos, e é isso que dá o comportamento
+ * correto: uma falha segura `NaN` por 15s (fail-closed continua valendo — ver
+ * "Postura de falha") em vez de virar tempestade de retry por scrape.
+ */
+let lastAttemptAt = 0;
 let inFlight: Promise<void> | null = null;
 let registered = false;
 let source: OnboardingExpiryBacklogSource | null = null;
 
 async function refresh(): Promise<void> {
-  if (snapshot !== null && Date.now() - lastRefreshAt < SNAPSHOT_TTL_MS) return;
+  if (Date.now() - lastAttemptAt < SNAPSHOT_TTL_MS) return;
   if (inFlight) return inFlight;
-  lastRefreshAt = Date.now();
+  lastAttemptAt = Date.now();
   inFlight = (async () => {
     try {
       snapshot = (await source?.()) ?? null;
     } catch (err) {
       // DERRUBA o snapshot — ver "Postura de falha" no cabeçalho.
       snapshot = null;
+      // #533 / review da PR #560: a mensagem crua de uma falha de conexão
+      // carrega a DSN inteira, e habilitar debug para investigar Postgres é
+      // exatamente quando ela seria escrita. Mesmo recorte sanitizado e
+      // bounded do worker desta área, agora compartilhado — sem `cause`.
       logger.debug(
-        { err: (err as Error).message },
+        { err: safeFailure(err) },
         'onboarding_expiry_collector.refresh_failed',
       );
     } finally {
@@ -105,7 +125,7 @@ export function registerOnboardingExpiryGauges(
 /** Test-only: o estado de módulo sobrevive entre specs. */
 export function _resetOnboardingExpiryCollectorForTests(): void {
   snapshot = null;
-  lastRefreshAt = 0;
+  lastAttemptAt = 0;
   inFlight = null;
   registered = false;
   source = null;

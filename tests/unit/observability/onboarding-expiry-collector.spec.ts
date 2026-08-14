@@ -24,8 +24,14 @@ import {
 import { METRIC } from '@/observability/taxonomy.js';
 import { _resetForTests, renderPrometheus } from '@/lib/metrics.js';
 import { _resetLabelGuardForTests } from '@/observability/labels.js';
+import { logger } from '@/lib/logger.js';
+
+vi.mock('@/lib/logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
 
 beforeEach(() => {
+  vi.mocked(logger.debug).mockClear();
   _resetForTests();
   _resetLabelGuardForTests();
   _resetOnboardingExpiryCollectorForTests();
@@ -121,5 +127,52 @@ describe('issue #519 — coletor de backlog do onboarding_expirer', () => {
     // Duas gauges, uma query. Sem a janela compartilhada, cada provider
     // consultaria o banco por scrape.
     expect(source).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Achado do review da PR #560. A janela do snapshot era
+   * `snapshot !== null && ...`, ou seja, só valia no caminho FELIZ. Com a fonte
+   * fora do ar o primeiro provider deixava `snapshot = null`, e como
+   * `renderPrometheus()` avalia as gauges em sequência, o segundo entrava em
+   * `refresh()` e consultava o banco DE NOVO — no mesmo scrape, duas queries
+   * que já se sabiam condenadas. O caso "um scrape faz UMA leitura" acima não
+   * pegava isso porque só exercitava sucesso.
+   *
+   * O ponto operacional: é durante a indisponibilidade do Postgres que a
+   * amplificação dói mais.
+   */
+  it('um scrape que FALHA também faz UMA leitura só — a janela vale nos dois desfechos', async () => {
+    const source = vi.fn(async (): Promise<OnboardingExpiryBacklog> => {
+      throw new Error('connection terminated');
+    });
+    registerOnboardingExpiryGauges(source);
+
+    const body = await renderPrometheus();
+
+    expect(source).toHaveBeenCalledTimes(1);
+    // E o fail-closed continua: a janela segura `NaN`, não um zero saudável.
+    expect(body).toMatch(/^maia_onboarding_expiry_backlog NaN$/m);
+    expect(body).toMatch(/^maia_onboarding_expiry_oldest_age_seconds NaN$/m);
+  });
+
+  /**
+   * Achado do review da PR #560, e a razão é #533: este repositório já vazou
+   * `DATABASE_URL` por stderr cru. A mensagem de uma falha de conexão carrega a
+   * DSN inteira, e habilitar `debug` para investigar Postgres é EXATAMENTE
+   * quando ela seria escrita.
+   */
+  it('a falha logada não carrega credencial — DSN sai censurada', async () => {
+    registerOnboardingExpiryGauges(async () => {
+      throw new Error(
+        'connect ECONNREFUSED postgres://maia_test:test1234@localhost:5432/maia_test',
+      );
+    });
+
+    await renderPrometheus();
+
+    const logged = JSON.stringify(vi.mocked(logger.debug).mock.calls);
+    expect(logged).not.toContain('test1234');
+    expect(logged).not.toContain('postgres://');
+    expect(logged).toContain('[REDACTED_URL]');
   });
 });
