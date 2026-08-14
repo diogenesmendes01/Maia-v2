@@ -450,6 +450,15 @@ groups:
       # `resync_failed` tem que alertar. Listando só `shadow`, uma réplica
       # divergente em `off` ficaria sem alerta nenhum — o buraco que esta leva
       # vem fechando.
+      #
+      # O QUE DELIBERADAMENTE NÃO ENTRA AQUI (achado 2 da review da PR #561):
+      # `reason="resync_aborted"`. É a releitura CANCELADA pelo fechamento do
+      # subscriber — deploy, scale-in, restart. A réplica não divergiu: ela
+      # está saindo, e ninguém mais depende do estado dela. Somá-la nestes
+      # seletores faria TODO deploy paginar em `enforce`. Os dois seletores
+      # abaixo são de IGUALDADE exata em `reason`, e é isso que mantém o
+      # terceiro balde fora; trocar por `reason=~"resync_.*"` reintroduz o
+      # defeito. `tests/unit/observability/slo-rules.spec.ts` reprova isso.
       - alert: MaiaLlmCircuitResyncFailedEnforcing
         expr: increase(maia_llm_circuit_mode_overrides_total{reason="resync_failed",state="enforce"}[5m]) > 0
         for: 0m

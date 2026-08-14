@@ -367,6 +367,50 @@ describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
     ).toEqual([]);
   });
 
+  /**
+   * Achado 2 da review do dono na PR #561. O desfecho de shutdown
+   * (`reason="resync_aborted"`, `src/lib/llm/cache-invalidation.ts`) é a
+   * releitura CANCELADA por um drain — a réplica está saindo, não divergindo.
+   * Se ele cair nestes seletores, TODO deploy passa a paginar em `enforce`, que
+   * é exatamente o defeito apontado.
+   *
+   * A propriedade que sustenta isso é o seletor de IGUALDADE em `reason`.
+   * `reason=~"resync_.*"` ou `reason!="resynced"` teriam nome de métrica válido
+   * e casariam o balde novo em silêncio.
+   */
+  it('o desfecho de drain (`resync_aborted`) não é selecionado por alerta nenhum', () => {
+    for (const name of Object.keys(RESYNC_ALERTS)) {
+      const expr = exprOf(alertBlock(name));
+      expect(
+        expr,
+        `${name} seleciona o desfecho de drain: um deploy deliberado passa a alertar`,
+      ).not.toContain('resync_aborted');
+      // Igualdade exata, nunca regex nem negação: as duas formas casariam
+      // `resync_aborted` sem citá-lo.
+      expect(expr, `${name} usa regex em \`reason\` — o balde de drain entra junto`).not.toMatch(
+        /reason\s*=~/,
+      );
+      expect(expr, `${name} usa negação em \`reason\` — o balde de drain entra junto`).not.toMatch(
+        /reason\s*!=/,
+      );
+      expect(expr).toMatch(/reason="resync_failed"/);
+    }
+
+    // E a mesma propriedade sobre a SÉRIE, em todo arquivo de regra: uma
+    // recording rule futura reintroduziria o defeito por outra porta.
+    const offenders: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const [n, line] of RULE_TEXT[file]!.split('\n').entries()) {
+        if (/^\s*#/.test(line)) continue;
+        if (line.includes('resync_aborted')) offenders.push(`${file}:${n + 1}: ${line.trim()}`);
+      }
+    }
+    expect(
+      offenders,
+      'regra executável seleciona `resync_aborted` — drain vira alerta: ' + offenders.join(' | '),
+    ).toEqual([]);
+  });
+
   it('nenhum `resync_failed` fica sem alerta: os dois seletores cobrem todo `state`', () => {
     // "Qualquer `resync_failed` deve alertar" (decisão do owner). Listar só
     // `shadow` no segundo deixaria uma réplica divergente em `off` sem alerta
