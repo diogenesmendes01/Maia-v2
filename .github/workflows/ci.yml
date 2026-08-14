@@ -229,6 +229,24 @@ jobs:
         working-directory: src/admin-ui
         run: npm audit --omit=dev --audit-level=high
 
+      - name: Audit exceptions ledger (dev tree + moderates)
+        # Issue #526. Os dois passos acima deixam DOIS silêncios: `--omit=dev`
+        # apaga a árvore de desenvolvimento inteira (um `critical` de RCE no
+        # vitest do admin-ui viveu meses sem ninguém no CI mencioná-lo), e
+        # `--audit-level=high` deixa `moderate` de produção passar sem registro.
+        #
+        # Este passo fecha os dois: TODO advisory que o `npm audit` reporta em
+        # qualquer um dos dois lockfiles precisa estar corrigido OU ter linha em
+        # `security/audit-exceptions.json` com motivo, dono e `expires`. Uma
+        # exceção vencida reprova; uma exceção que não casa mais com nenhum
+        # advisory também reprova, o que força a limpeza do ledger.
+        #
+        # Chamado com `node` direto, e não pelo script npm: este job NÃO roda
+        # `npm ci` (é o que o mantém rápido e sem serviços), então não há `tsx`.
+        # O guard é escrito só com sintaxe TS apagável e o Node 22 do runner
+        # remove os tipos nativamente. Localmente use `npm run audit:exceptions:check`.
+        run: node scripts/check-audit-exceptions.ts
+
   integration:
     name: integration + e2e (node ${{ matrix.node }})
     runs-on: ubuntu-latest

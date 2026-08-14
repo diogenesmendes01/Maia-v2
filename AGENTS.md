@@ -127,6 +127,7 @@ npm run config:check:drift        # config contract: generated artifacts up to d
 npm run typecheck                 # tsc --noEmit
 npm run lint                      # eslint src tests scripts
 npm run format                    # prettier --write src
+npm run audit:exceptions:check    # todo advisory do npm audit está corrigido ou tem exceção com dono e prazo? (#526)
 
 # Configuração (contrato único — src/config/contract.ts)
 npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
