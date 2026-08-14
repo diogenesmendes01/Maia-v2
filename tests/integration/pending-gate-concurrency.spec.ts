@@ -12,7 +12,7 @@
  * A versão anterior era um único `it` que fazia TUDO dentro do `testTimeout`
  * padrão de 5s: seed do fixture, `await import()` do grafo de módulos de
  * produção (pending-gate → pending-resolver → tools/_dispatcher → governance
- * → scheduling → LLM gateway), a race e as asserções. Três defeitos de
+ * → scheduling → LLM gateway), a race e as asserções. Quatro defeitos de
  * diagnóstico saíam daí, e juntos tornavam o vermelho ILEGÍVEL:
  *
  *  1. **Custo de infraestrutura contado como prazo do teste.** O `import()`
@@ -51,15 +51,63 @@
  *     `pending_action_dispatched` e `pending_race_lost` — que são as linhas
  *     que `pending-resolver.ts` escreve no caminho de produção.
  *
+ *  4. **Separar os grupos não bastava: os `[semântica]` rodavam mesmo com a
+ *     infraestrutura quebrada.** Uma perna que lançasse erro de conexão
+ *     produzia `kinds: ['THREW','resolved']`, audits incompletos e trilha
+ *     mutilada — e casos `[semântica]` ficavam vermelhos, ou seja, o
+ *     relatório continuava chamando Postgres instável de race semântica. Um
+ *     `beforeAll` que lançasse (seed, migração faltando) era pior ainda:
+ *     reprovava os QUATRO de uma vez. Hoje nenhuma falha derruba o hook — ela
+ *     vira evidência — e cada caso `[semântica]` declara as pré-condições de
+ *     infraestrutura de que a SUA evidência depende. Se alguma falhar, o caso
+ *     se marca INCONCLUSIVO via `ctx.skip(nota)` — nunca verde, nunca
+ *     vermelho — e o `[infra]` correspondente fica vermelho nomeando a causa.
+ *
  * A regra de leitura do vermelho, então:
- *   • `[infra]` vermelho  = ambiente (prazo, conexão, flag, trilha muda).
+ *   • `[infra]` vermelho  = ambiente (prazo, conexão, flag, fixture, trilha).
  *   • `[escopo]` vermelho = esta spec está apagando dado de outro tenant.
  *   • `[semântica]` vermelho = a race real; bug de idempotência em produção.
+ *   • `[semântica]` PULADO = nenhum veredito foi emitido; leia o `[infra]`
+ *     vermelho que a nota do skip aponta pelo nome.
  *
- * Os grupos são independentes — um `[infra]` vermelho não afrouxa nenhuma
- * asserção semântica, e vice-versa.
+ * ─────────────────────────────────────────────────────────────────────────
+ * Pré-condições: por que ESTA lista, e não uma maior
+ * ─────────────────────────────────────────────────────────────────────────
+ * Um mecanismo de "pular quando a infra falha" é perigoso pelo lado oposto:
+ * frouxo demais, ele vira um jeito de nunca reprovar — a race real some como
+ * "ambiente ruim". Então cada pré-condição aqui é um fato de ambiente
+ * OBSERVÁVEL DE FORMA INDEPENDENTE do que produção fez, e tem um `[infra]`
+ * dedicado que fica vermelho junto (o par pré-condição↔caso está codificado
+ * em `testeInfra`, não em comentário: um skip nunca é silencioso). Três
+ * exclusões deliberadas, e são elas que mantêm a lista estreita:
+ *
+ *  • **`audit_total === 0` (trilha muda) NÃO é pré-condição.** Ausência de
+ *    evidência é exatamente a assinatura da regressão de produção que a sonda
+ *    anti-espelho injeta (apagar o call site de `resolveAndDispatch`); usá-la
+ *    como pré-condição converteria esse bug em "inconclusivo". No lugar dela,
+ *    sondamos a CAPACIDADE de escrever em `audit_log` com os ids deste
+ *    fixture (INSERT + DELETE, depois de colher a evidência). Com a sonda
+ *    verde, uma trilha muda não é do ambiente — é de produção, e os
+ *    `[semântica]` derivados do audit ficam vermelhos como devem.
+ *
+ *  • **Um throw qualquer NÃO é pré-condição; só um throw classificado como
+ *    infra.** `resolveTx` é fail-loud por desenho (`conversation-repos.ts`),
+ *    então um bug de idempotência PODE se manifestar como exceção; tratar
+ *    todo throw como ambiente engoliria exatamente a race que este arquivo
+ *    guarda. A classificação é uma allowlist estreita de SQLSTATE de conexão,
+ *    recursos, shutdown, autenticação e objeto inexistente (migração
+ *    faltando). Ficam de fora, de propósito, `40001` (serialization_failure),
+ *    `40P01` (deadlock) e `23505` (unique_violation): os três são desfechos
+ *    de concorrência, que é o assunto do teste. E o `[infra]` de throw
+ *    continua asserindo `threw` INTEIRO, então um throw ambíguo fica vermelho
+ *    nos dois grupos em vez de sumir num skip.
+ *
+ *  • **O orçamento da race NÃO é pré-condição.** Estourá-lo não invalida a
+ *    evidência: ela já foi colhida, e "demorou" não diz nada sobre "despachou
+ *    duas vezes". Só o `[infra]` de prazo fica vermelho.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import type { TestContext } from 'vitest';
 import pg from 'pg';
 
 const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -72,7 +120,7 @@ process.env.FEATURE_PENDING_GATE = 'true';
 
 const NOME = 'pgc545-b0';
 
-/** Sufixo aleatório por processo, para o par tenant/agente do canário. */
+/** Sufixo aleatório por processo, compartilhado pelo fixture e pelo canário. */
 const SUFIXO = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 // Base ALEATÓRIA por processo. `pessoas_tenant_agent_telefone_key` é único por
@@ -81,6 +129,9 @@ const SUFIXO = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,
 // colidirem e o vermelho vira erro de fixture, mascarando a asserção que o
 // teste existe para fazer. Mesma convenção de onboarding-review-541-round3.
 const TELEFONE = `+55119${String(10_000_000 + Math.floor(Math.random() * 80_000_000)).slice(-8)}`;
+
+/** Ação da sonda de gravabilidade — some do banco antes de qualquer contagem. */
+const AUDIT_PROBE_ACAO = 'pgc545_sonda_gravabilidade';
 
 /**
  * Tenant/agente do CANÁRIO de escopo: um par que esta spec cria só para provar
@@ -112,19 +163,82 @@ const RACE_BUDGET_MS = 15_000;
 /** Orçamento do `beforeAll`: transformação ESM do grafo + seed. */
 const SETUP_BUDGET_MS = 120_000;
 
+/**
+ * SQLSTATE que só o ambiente produz. Allowlist ESTREITA de propósito — ver o
+ * cabeçalho. Classe 08 = conexão; 53 = recursos; 57P0x = shutdown/admin;
+ * 3D000/3F000 = catálogo/schema inexistente; 42P01/42703 = tabela/coluna
+ * inexistente (migração faltando); 28xxx = autenticação. Desfechos de
+ * concorrência (40001, 40P01, 23505) NÃO entram aqui.
+ */
+const INFRA_PG_CODES = new Set([
+  '08000',
+  '08001',
+  '08003',
+  '08004',
+  '08006',
+  '08007',
+  '08P01',
+  '53000',
+  '53100',
+  '53200',
+  '53300',
+  '53400',
+  '57P01',
+  '57P02',
+  '57P03',
+  '3D000',
+  '3F000',
+  '42P01',
+  '42703',
+  '28000',
+  '28P01',
+]);
+
+/** Falhas de conexão do driver/pool, que chegam sem SQLSTATE. */
+const INFRA_MSG_MARKERS = [
+  'timeout exceeded when trying to connect',
+  'connection terminated',
+  'client has encountered a connection error',
+  'server closed the connection unexpectedly',
+  'the database system is starting up',
+  'sorry, too many clients already',
+  'econnrefused',
+  'econnreset',
+  'ehostunreach',
+  'etimedout',
+  'enotfound',
+];
+
+function classificarThrow(err: unknown): { texto: string; infra: boolean } {
+  const e = err as { message?: string; code?: unknown } | null;
+  const code = typeof e?.code === 'string' ? e.code : null;
+  const message = e?.message ?? String(err);
+  const infra =
+    (code !== null && INFRA_PG_CODES.has(code)) ||
+    INFRA_MSG_MARKERS.some((m) => message.toLowerCase().includes(m));
+  return { texto: code ? `[${code}] ${message}` : message, infra };
+}
+
 type Evidence = {
   feature_flag: boolean;
   import_ms: number;
   seed_ms: number;
   race_ms: number;
+  /** Fase + mensagem da falha que abortou o `beforeAll` (null = completou). */
+  setup_error: { fase: string; message: string } | null;
   /** `kind` devolvido por cada uma das duas chamadas paralelas, em ordem. */
   kinds: string[];
-  /** Erros lançados por cada chamada (vazio = nenhum). Infra, não semântica. */
+  /** Erros lançados por cada chamada (vazio = nenhum). */
   threw: string[];
+  /** Subconjunto de `threw` classificado como infraestrutura (allowlist). */
+  threw_infra: string[];
   /** Estado final da pending question, lido no banco. */
   pending_status: string[];
   /** O `inbound.id` usado na race existe em `mensagens`? (FK do audit_log). */
   inbound_is_real_mensagem: boolean;
+  /** Sonda direta: `audit_log` aceita uma linha com os ids deste fixture? */
+  audit_writable: boolean;
+  audit_write_error: string | null;
   /** Erro da varredura de restos (best-effort; nunca é veredito). */
   stale_purge_error: string | null;
   /** Linhas do canário de OUTRO tenant que sobreviveram à varredura. */
@@ -150,10 +264,14 @@ const PRIMARY_CTX = { tenant_id: 'primary', agent_id: 'primary' };
 function fmt(e: Evidence): string {
   return JSON.stringify(
     {
+      setup_error: e.setup_error,
       kinds: e.kinds,
       threw: e.threw,
+      threw_infra: e.threw_infra,
       pending_status: e.pending_status,
       inbound_is_real_mensagem: e.inbound_is_real_mensagem,
+      audit_writable: e.audit_writable,
+      audit_write_error: e.audit_write_error,
       stale_purge_error: e.stale_purge_error,
       canary_sobreviveu: e.canary_sobreviveu,
       canary_error: e.canary_error,
@@ -168,19 +286,130 @@ function fmt(e: Evidence): string {
   );
 }
 
+// ── Nomes dos casos [infra] ────────────────────────────────────────────────
+// Constantes porque cada pré-condição aponta para o caso que fica vermelho
+// quando ela falha (`testeInfra`). Amarrar os dois no MESMO literal impede que
+// a nota do skip envelheça apontando para um teste que foi renomeado.
+const T_SETUP = '[infra] o setup completou (import, seed, race, leitura de evidência)';
+const T_FLAG = '[infra] o gate roda com FEATURE_PENDING_GATE ligado';
+const T_THREW = '[infra] nenhuma das duas pernas paralelas lançou erro';
+const T_BUDGET = '[infra] a race paralela terminou dentro do orçamento';
+const T_INBOUND = '[infra] o inbound do fixture é uma mensagem real, gravável em audit_log';
+const T_AUDIT_WRITABLE = '[infra] o audit_log aceita escrita para este fixture (sonda direta)';
+const T_AUDIT_MUTE = '[infra] a trilha de auditoria desta conversa não está muda';
+
+type Precondicao = {
+  /** Rótulo curto, aparece na nota do skip. */
+  nome: string;
+  /** Caso `[infra]` que fica VERMELHO quando esta pré-condição falha. */
+  testeInfra: string;
+  satisfeita: (e: Evidence) => boolean;
+  /** O que a violação significa, e por que ela não é veredito semântico. */
+  porque: string;
+};
+
+const P_SETUP: Precondicao = {
+  nome: 'setup completou',
+  testeInfra: T_SETUP,
+  satisfeita: (e) => e.setup_error === null,
+  porque:
+    'o beforeAll abortou antes de colher a evidência (import do grafo, conexão, ' +
+    'seed do fixture ou leitura no banco). Não há evidência sobre a race.',
+};
+
+const P_FLAG: Precondicao = {
+  nome: 'FEATURE_PENDING_GATE ligada',
+  testeInfra: T_FLAG,
+  satisfeita: (e) => e.feature_flag,
+  porque:
+    'com a flag desligada checkPendingFirst faz short-circuit e devolve no_pending ' +
+    'nas DUAS pernas — indistinguível de "as duas perderam a race". É configuração, ' +
+    'não idempotência.',
+};
+
+const P_SEM_THROW_DE_INFRA: Precondicao = {
+  nome: 'nenhuma perna lançou erro de infraestrutura',
+  testeInfra: T_THREW,
+  satisfeita: (e) => e.threw_infra.length === 0,
+  porque:
+    'uma das pernas morreu com erro de conexão/pool/schema (allowlist estreita de ' +
+    'SQLSTATE). Ela nem chegou ao caminho que este teste afere. Throw AMBÍGUO ' +
+    '(unique_violation, deadlock, serialization_failure) NÃO cai aqui de propósito ' +
+    '— esse continua sendo julgado como semântica.',
+};
+
+const P_INBOUND_REAL: Precondicao = {
+  nome: 'inbound é uma mensagem real',
+  testeInfra: T_INBOUND,
+  satisfeita: (e) => e.inbound_is_real_mensagem,
+  porque:
+    '`audit_log.mensagem_id` tem FK para `mensagens`; sem o inbound no banco NENHUMA ' +
+    'linha desta trilha grava e `audit()` engole a falha — as contagens ficariam em ' +
+    'zero sem que nada estivesse errado com a race.',
+};
+
+const P_AUDIT_GRAVAVEL: Precondicao = {
+  nome: 'audit_log gravável',
+  testeInfra: T_AUDIT_WRITABLE,
+  satisfeita: (e) => e.audit_writable,
+  porque:
+    'a sonda direta (INSERT + DELETE com os ids deste fixture) falhou, então o ' +
+    'ambiente não consegue registrar auditoria nenhuma e as contagens lidas do ' +
+    'audit_log não têm valor probatório.',
+};
+
+/** Veredito derivado do RETORNO das pernas e de `pending_questions`. */
+const PRE_RETORNO: readonly Precondicao[] = [P_SETUP, P_FLAG, P_SEM_THROW_DE_INFRA];
+
+/** Veredito derivado do `audit_log` — precisa também que o audit seja gravável. */
+const PRE_AUDIT: readonly Precondicao[] = [...PRE_RETORNO, P_INBOUND_REAL, P_AUDIT_GRAVAVEL];
+
+/**
+ * Marca o caso como INCONCLUSIVO quando a evidência de que ele depende não é
+ * confiável. Nem verde nem vermelho: `ctx.skip(nota)` sai como `skipped` no
+ * relatório, com uma nota curta dizendo QUAL pré-condição falhou e em qual
+ * caso `[infra]` VERMELHO está a causa; o detalhe e o dump de evidência vão
+ * para stderr (colar o dump na linha do reporter afogaria a lista de testes).
+ * O skip nunca é silencioso: toda pré-condição tem um `[infra]` dedicado que
+ * fica vermelho na mesma rodada.
+ */
+function exigirInfra(ctx: TestContext, exigidas: readonly Precondicao[]): void {
+  const faltando = exigidas.filter((p) => !p.satisfeita(ev));
+  if (faltando.length === 0) return;
+
+  const nota =
+    'INCONCLUSIVO, nenhum veredito semântico emitido — pré-condição de ' +
+    `infraestrutura não satisfeita: ${faltando.map((p) => p.nome).join(' + ')}. ` +
+    `Causa no(s) caso(s) VERMELHO(S) ${faltando.map((p) => `"${p.testeInfra}"`).join(', ')}. ` +
+    'Detalhe e evidência em stderr.';
+
+  console.error(
+    `\n${ctx.task.name}\n` +
+      'INCONCLUSIVO — nenhum veredito semântico foi emitido para este caso.\n' +
+      'Pré-condição de infraestrutura não satisfeita:\n' +
+      faltando.map((p) => `  • ${p.nome} — ${p.porque}`).join('\n') +
+      '\nO(s) caso(s) [infra] com a causa estão VERMELHOS nesta mesma rodada: ' +
+      faltando.map((p) => `"${p.testeInfra}"`).join(', ') +
+      `\nEvidência: ${fmt(ev)}\n`,
+  );
+  ctx.skip(nota);
+}
+
 d('pending-gate concurrency', () => {
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
-
     ev = {
       feature_flag: false,
       import_ms: -1,
       seed_ms: -1,
       race_ms: -1,
+      setup_error: null,
       kinds: [],
       threw: [],
+      threw_infra: [],
       pending_status: [],
       inbound_is_real_mensagem: false,
+      audit_writable: false,
+      audit_write_error: null,
       stale_purge_error: null,
       canary_sobreviveu: { pessoas: -1, conversas: -1, audit_log: -1 },
       canary_error: null,
@@ -188,25 +417,38 @@ d('pending-gate concurrency', () => {
       audit_total: 0,
     };
 
-    // ── 1. Import do grafo de produção, medido FORA do prazo do caso ────────
-    // Isto é custo de transformação ESM, não é o que o teste afere.
-    const t0 = Date.now();
-    const { checkPendingFirst, setClassifierForTesting } = await import(
-      '../../src/agent/pending-gate.js'
-    );
-    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
-    const { config } = await import('../../src/config/env.js');
-    ev.import_ms = Date.now() - t0;
-    ev.feature_flag = config.FEATURE_PENDING_GATE;
-
-    const c = await pool.connect();
+    // Toda falha aqui vira `ev.setup_error` em vez de derrubar o hook: um
+    // `beforeAll` que lança reprova TODOS os casos da suíte, inclusive os
+    // quatro `[semântica]` — que é justamente o falso vermelho que este
+    // arquivo existe para eliminar. Com a falha virando evidência, o `[infra]`
+    // de setup fica vermelho e os semânticos saem inconclusivos.
+    let fase = 'pool';
+    let c: pg.PoolClient | null = null;
     try {
+      pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
+
+      // ── 1. Import do grafo de produção, medido FORA do prazo do caso ──────
+      // Isto é custo de transformação ESM, não é o que o teste afere.
+      fase = 'import';
+      const t0 = Date.now();
+      const { checkPendingFirst, setClassifierForTesting } = await import(
+        '../../src/agent/pending-gate.js'
+      );
+      const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+      const { config } = await import('../../src/config/env.js');
+      ev.import_ms = Date.now() - t0;
+      ev.feature_flag = config.FEATURE_PENDING_GATE;
+
+      fase = 'conexão';
+      c = await pool.connect();
+
       // ── 2. Canário de escopo, semeado ANTES da varredura ─────────────────
       // Uma `pessoa` com o MESMO `NOME` sintético, idade dentro da janela da
       // varredura, sob OUTRO tenant/agente — mais a `conversa` e a linha de
       // `audit_log` dela, para cobrir também as etapas que passam por join. É
       // a linha que a varredura por nome+idade apagaria calada. Falha aqui
       // invalida só o caso `[escopo]`, nunca o veredito da race.
+      fase = 'canário';
       try {
         await c.query(
           `INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
@@ -254,6 +496,7 @@ d('pending-gate concurrency', () => {
       // audit_log → conversas (que cascateia mensagens e pending_questions) →
       // pessoas. Best-effort: isto é higiene, não pré-condição — um erro aqui
       // não pode virar veredito sobre a race, então vira nota na evidência.
+      fase = 'purge';
       const escopo = [NOME, PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id];
       try {
         await c.query(
@@ -292,6 +535,7 @@ d('pending-gate concurrency', () => {
       }
 
       // Quanto do canário sobreviveu à varredura. Esperado: tudo (1/1/1).
+      fase = 'canário (contagem)';
       if (ev.canary_error === null) {
         const cnt = await c.query<{ pessoas: string; conversas: string; audit_log: string }>(
           `SELECT
@@ -308,19 +552,20 @@ d('pending-gate concurrency', () => {
       }
 
       // ── 4. Seed do fixture ───────────────────────────────────────────────
+      fase = 'seed';
       const t1 = Date.now();
       try {
         const pessoa = await c.query<{ id: string }>(
           `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo)
-           VALUES ('primary', 'primary', $1, $2, 'funcionario') RETURNING id`,
-          [NOME, TELEFONE],
+           VALUES ($1, $2, $3, $4, 'funcionario') RETURNING id`,
+          [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, NOME, TELEFONE],
         );
         ids.pessoa = pessoa.rows[0]!.id;
 
         const conv = await c.query<{ id: string }>(
           `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades)
-           VALUES ('primary', 'primary', $1, '{}') RETURNING id`,
-          [ids.pessoa],
+           VALUES ($1, $2, $3, '{}') RETURNING id`,
+          [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, ids.pessoa],
         );
         ids.conversa = conv.rows[0]!.id;
 
@@ -330,15 +575,17 @@ d('pending-gate concurrency', () => {
         // a falha — a evidência de despacho simplesmente não existia.
         const msg = await c.query<{ id: string }>(
           `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo)
-           VALUES ('primary', 'primary', $1, 'in', 'texto', 'sim') RETURNING id`,
-          [ids.conversa],
+           VALUES ($1, $2, $3, 'in', 'texto', 'sim') RETURNING id`,
+          [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, ids.conversa],
         );
         ids.mensagem = msg.rows[0]!.id;
 
         await c.query(
           `INSERT INTO pending_questions(tenant_id, agent_id, conversa_id, pessoa_id, tipo, pergunta, opcoes_validas, acao_proposta, expira_em, status, metadata)
-           VALUES ('primary', 'primary', $1, $2, 'gate', 'Confirma?', $3::jsonb, $4::jsonb, now() + interval '10 min', 'aberta', '{}'::jsonb)`,
+           VALUES ($1, $2, $3, $4, 'gate', 'Confirma?', $5::jsonb, $6::jsonb, now() + interval '10 min', 'aberta', '{}'::jsonb)`,
           [
+            PRIMARY_CTX.tenant_id,
+            PRIMARY_CTX.agent_id,
             ids.conversa,
             ids.pessoa,
             JSON.stringify([
@@ -350,14 +597,14 @@ d('pending-gate concurrency', () => {
         );
       } catch (err) {
         throw new Error(
-          `[fixture] seed do cenário B0 falhou (telefone=${TELEFONE}) — isto é ` +
-            `falha de fixture/ambiente, NÃO veredito sobre a race: ${(err as Error).message}`,
+          `seed do cenário B0 falhou (telefone=${TELEFONE}): ${(err as Error).message}`,
           { cause: err },
         );
       }
       ev.seed_ms = Date.now() - t1;
 
       // ── 5. A race ────────────────────────────────────────────────────────
+      fase = 'race';
       setClassifierForTesting(async () => ({
         resolves_pending: true,
         option_chosen: 'sim',
@@ -372,7 +619,7 @@ d('pending-gate concurrency', () => {
       // checkPendingFirst são tenant-scoped (leem tenant_id/agent_id do ALS),
       // então este caminho — como os callers de produção (baileys →
       // runWithTenantContext) — precisa rodar dentro de um contexto de tenant.
-      const oneGate = async (): Promise<{ kind: string } | { threw: string }> => {
+      const oneGate = async (): Promise<{ kind: string } | { threw: string; infra: boolean }> => {
         try {
           const r = await runWithTenantContext(PRIMARY_CTX, () =>
             checkPendingFirst({
@@ -383,46 +630,87 @@ d('pending-gate concurrency', () => {
           );
           return { kind: r.kind };
         } catch (err) {
-          // Capturado em vez de propagado: um throw de uma das pernas é sinal
-          // de INFRA (conexão, pool, migração faltando) e tem teste próprio.
-          // Deixá-lo escapar aqui reprovaria o `beforeAll` inteiro e apagaria
-          // a evidência semântica que a outra perna já produziu.
-          return { threw: (err as Error).message };
+          // Capturado em vez de propagado: deixá-lo escapar apagaria a
+          // evidência que a outra perna já produziu. A CLASSIFICAÇÃO
+          // (infra × ambíguo) é o que decide se os casos [semântica] saem
+          // inconclusivos ou julgam o throw — ver o cabeçalho: `resolveTx` é
+          // fail-loud, então nem todo throw é ambiente, e tratar todos como
+          // ambiente engoliria a race real.
+          const { texto, infra } = classificarThrow(err);
+          return { threw: texto, infra };
         }
       };
 
-      const t2 = Date.now();
-      const settled = await Promise.all([oneGate(), oneGate()]);
-      ev.race_ms = Date.now() - t2;
+      try {
+        const t2 = Date.now();
+        const settled = await Promise.all([oneGate(), oneGate()]);
+        ev.race_ms = Date.now() - t2;
 
-      ev.kinds = settled.map((s) => ('kind' in s ? s.kind : 'THREW'));
-      ev.threw = settled.flatMap((s) => ('threw' in s ? [s.threw] : []));
-
-      setClassifierForTesting(null);
+        ev.kinds = settled.map((s) => ('kind' in s ? s.kind : 'THREW'));
+        ev.threw = settled.flatMap((s) => ('threw' in s ? [s.threw] : []));
+        ev.threw_infra = settled.flatMap((s) => ('threw' in s && s.infra ? [s.threw] : []));
+      } finally {
+        setClassifierForTesting(null);
+      }
 
       // ── 6. Evidência lida NO BANCO ───────────────────────────────────────
+      fase = 'evidência';
       // `::text` no lado esquerdo para que um `inbound.id` não-UUID (o defeito
       // #3 da issue) devolva `false` em vez de estourar o cast do Postgres.
       const inb = await c.query<{ n: string }>(
-        `SELECT count(*)::text AS n FROM mensagens WHERE id::text = $1`,
-        [String(inbound.id)],
+        `SELECT count(*)::text AS n FROM mensagens
+          WHERE id::text = $1 AND tenant_id = $2 AND agent_id = $3`,
+        [String(inbound.id), PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id],
       );
       ev.inbound_is_real_mensagem = Number(inb.rows[0]!.n) === 1;
 
       const pend = await c.query<{ status: string }>(
-        `SELECT status FROM pending_questions WHERE conversa_id = $1 ORDER BY created_at`,
-        [ids.conversa],
+        `SELECT status FROM pending_questions
+          WHERE conversa_id = $1 AND tenant_id = $2 AND agent_id = $3
+          ORDER BY created_at`,
+        [ids.conversa, PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id],
       );
       ev.pending_status = pend.rows.map((r) => r.status);
 
       const aud = await c.query<{ acao: string; n: string }>(
-        `SELECT acao, count(*)::text AS n FROM audit_log WHERE conversa_id = $1 GROUP BY acao`,
-        [ids.conversa],
+        `SELECT acao, count(*)::text AS n FROM audit_log
+          WHERE conversa_id = $1 AND tenant_id = $2 AND agent_id = $3
+          GROUP BY acao`,
+        [ids.conversa, PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id],
       );
       for (const row of aud.rows) ev.audit_by_acao[row.acao] = Number(row.n);
       ev.audit_total = aud.rows.reduce((s, r) => s + Number(r.n), 0);
+
+      // ── 7. Sonda de gravabilidade do audit_log ───────────────────────────
+      // DEPOIS de contar, para não contaminar a evidência. Converte "trilha
+      // muda" de ausência-de-evidência em fato positivo: se esta linha grava,
+      // o ambiente sabe auditar, e uma trilha vazia passa a ser problema de
+      // PRODUÇÃO (é o que a sonda anti-espelho injeta) em vez de desculpa
+      // ambiental. Sem ela, `audit_total === 0` viraria pré-condição e a
+      // regressão de produção sumiria num skip.
+      fase = 'sonda de gravabilidade do audit_log';
+      try {
+        const sonda = await c.query<{ id: string }>(
+          `INSERT INTO audit_log(tenant_id, agent_id, acao, pessoa_id, conversa_id, mensagem_id)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [
+            PRIMARY_CTX.tenant_id,
+            PRIMARY_CTX.agent_id,
+            AUDIT_PROBE_ACAO,
+            ids.pessoa,
+            ids.conversa,
+            ids.mensagem,
+          ],
+        );
+        await c.query(`DELETE FROM audit_log WHERE id = $1`, [sonda.rows[0]!.id]);
+        ev.audit_writable = true;
+      } catch (err) {
+        ev.audit_write_error = (err as Error).message;
+      }
+    } catch (err) {
+      ev.setup_error = { fase, message: (err as Error).message };
     } finally {
-      c.release();
+      c?.release();
     }
   }, SETUP_BUDGET_MS);
 
@@ -458,10 +746,20 @@ d('pending-gate concurrency', () => {
   });
 
   // ── Grupo [infra]: condições de ambiente. Vermelho aqui NÃO é veredito
-  // sobre a race — é ambiente, e as asserções semânticas abaixo continuam
-  // valendo por conta própria.
+  // sobre a race. Cada um destes casos é o destino de uma nota de skip: quando
+  // um `[semântica]` sai inconclusivo, é porque um destes está vermelho.
 
-  it('[infra] o gate roda com FEATURE_PENDING_GATE ligado', () => {
+  it(T_SETUP, () => {
+    expect(
+      ev.setup_error,
+      '[infra] o beforeAll abortou antes de colher a evidência (import do grafo de ' +
+        'módulos, conexão, seed do fixture ou leitura no banco). Isto é ambiente: ' +
+        'nenhum veredito semântico é possível, e os casos [semântica] saíram ' +
+        `inconclusivos em vez de vermelhos. Evidência: ${fmt(ev)}`,
+    ).toBeNull();
+  });
+
+  it(T_FLAG, () => {
     expect(
       ev.feature_flag,
       '[infra] FEATURE_PENDING_GATE veio desligada, então checkPendingFirst faz ' +
@@ -471,26 +769,32 @@ d('pending-gate concurrency', () => {
     ).toBe(true);
   });
 
-  it('[infra] nenhuma das duas pernas paralelas lançou erro', () => {
+  it(T_THREW, () => {
+    // Assere `threw` INTEIRO, não só o subconjunto classificado como infra: um
+    // throw ambíguo (unique_violation, deadlock) precisa ficar visível aqui E
+    // continuar sendo julgado pelos [semântica], em vez de sumir num skip.
     expect(
       ev.threw,
-      '[infra] uma das chamadas paralelas de checkPendingFirst LANÇOU — conexão, ' +
-        'pool exaurido, schema desatualizado. Isto é ambiente, não race semântica. ' +
-        `Evidência: ${fmt(ev)}`,
+      '[infra] uma das chamadas paralelas de checkPendingFirst LANÇOU. Se o erro ' +
+        'estiver em `threw_infra` (conexão, pool exaurido, schema desatualizado), é ' +
+        'ambiente e os casos [semântica] saíram inconclusivos. Se NÃO estiver, o ' +
+        'throw é ambíguo — pode ser desfecho de concorrência — e os [semântica] ' +
+        `continuam julgando. Evidência: ${fmt(ev)}`,
     ).toEqual([]);
   });
 
-  it('[infra] a race paralela terminou dentro do orçamento', () => {
+  it(T_BUDGET, () => {
     expect(
       ev.race_ms,
       `[infra] as duas chamadas paralelas levaram ${ev.race_ms}ms (orçamento ` +
         `${RACE_BUDGET_MS}ms). Isto é prazo/carga, NÃO "despachou duas vezes" — o ` +
         'veredito de exatamente-uma-vez está nos testes [semântica], que rodam ' +
-        `sobre evidência já coletada e não dependem deste prazo. Evidência: ${fmt(ev)}`,
+        'sobre evidência já coletada e não dependem deste prazo (por isso este ' +
+        `orçamento NÃO é pré-condição deles). Evidência: ${fmt(ev)}`,
     ).toBeLessThan(RACE_BUDGET_MS);
   });
 
-  it('[infra] o inbound do fixture é uma mensagem real, gravável em audit_log', () => {
+  it(T_INBOUND, () => {
     // Guarda de regressão da causa #3 da issue #545: com `inbound.id = 'm-test'`
     // (nem UUID) a FK `audit_log_mensagem_id_fkey` rejeitava TODA linha desta
     // trilha e `audit()` engolia a falha — as contagens abaixo dariam 0 sem que
@@ -501,24 +805,37 @@ d('pending-gate concurrency', () => {
       '[infra] o inbound do fixture não corresponde a uma linha de `mensagens`. ' +
         '`audit_log.mensagem_id` tem FK para `mensagens`, então NENHUMA linha de ' +
         'auditoria desta trilha consegue ser gravada e as contagens [semântica] ' +
-        `abaixo perdem valor probatório. Evidência: ${fmt(ev)}`,
+        `perdem valor probatório — elas saíram inconclusivas. Evidência: ${fmt(ev)}`,
     ).toBe(true);
   });
 
-  it('[infra] a trilha de auditoria desta conversa não está muda', () => {
-    // Duas leituras possíveis para zero linhas, e a evidência separa as duas:
-    // se `kinds` mostra pernas que resolveram, o caminho de produção rodou e
-    // não auditou (semântico/instrumentação de produção); se `kinds` é só
-    // `no_pending`, nada chegou ao resolve. Este teste não escolhe entre elas —
-    // ele só impede que "0 despachos" seja lido como veredito da race.
+  it(T_AUDIT_WRITABLE, () => {
+    expect(
+      ev.audit_writable,
+      '[infra] a sonda direta de escrita em `audit_log` (INSERT + DELETE com os ids ' +
+        'deste fixture, rodada DEPOIS de contar a evidência) falhou: ' +
+        `${ev.audit_write_error}. O ambiente não consegue auditar, então "0 despachos" ` +
+        'não é veredito e os casos [semântica] derivados do audit saíram ' +
+        `inconclusivos. Evidência: ${fmt(ev)}`,
+    ).toBe(true);
+  });
+
+  it(T_AUDIT_MUTE, () => {
+    // Este caso NÃO é pré-condição dos [semântica], e a distinção é o coração
+    // do desenho: "0 linhas" é ausência de evidência, e é exatamente o que uma
+    // regressão de produção (o call site de resolveAndDispatch sumindo) produz.
+    // Quem separa ambiente de produção aqui é a sonda de gravabilidade acima:
+    // com ela VERDE, uma trilha muda é problema de produção, e os [semântica]
+    // derivados do audit ficam vermelhos como devem.
     expect(
       ev.audit_total,
       'nenhuma linha de audit_log para esta conversa. `audit()` engole falhas de ' +
-        'escrita por desenho, então "0 despachos" abaixo NÃO é veredito sobre a ' +
-        `race. Separe pelas \`kinds\` na evidência: ${JSON.stringify(ev.kinds)} — ` +
-        'pernas `resolved` com trilha muda = o caminho de produção rodou sem ' +
-        'auditar; só `no_pending` = nada chegou ao resolve (confira os outros ' +
-        `[infra]). Evidência: ${fmt(ev)}`,
+        'escrita por desenho — mas a sonda de gravabilidade acima diz se isso é ' +
+        `possível aqui (audit_writable=${ev.audit_writable}). Com ela verde, esta ` +
+        'trilha muda NÃO é ambiente. Separe pelas `kinds` na evidência: ' +
+        `${JSON.stringify(ev.kinds)} — pernas \`resolved\` com trilha muda = o ` +
+        'caminho de produção rodou sem auditar; só `no_pending` = nada chegou ao ' +
+        `resolve. Evidência: ${fmt(ev)}`,
     ).toBeGreaterThan(0);
   });
 
@@ -545,21 +862,28 @@ d('pending-gate concurrency', () => {
 
   // ── Grupo [semântica]: o invariante que este arquivo existe para guardar.
   // Vermelho aqui é bug de idempotência em produção (src/agent/pending-gate.ts,
-  // src/agent/pending-resolver.ts), não flake.
+  // src/agent/pending-resolver.ts), não flake. PULADO aqui = inconclusivo: a
+  // infraestrutura não entregou evidência confiável, e o [infra] apontado pela
+  // nota do skip está vermelho com a causa. Nenhuma asserção abaixo foi
+  // afrouxada — exatamente-uma-vez continua asserido em três lugares
+  // independentes, dois lidos do banco.
 
-  it('[semântica] exatamente uma das pernas resolveu a pendência', () => {
+  it('[semântica] exatamente uma das pernas resolveu a pendência', (ctx) => {
+    exigirInfra(ctx, PRE_RETORNO);
     const resolved = ev.kinds.filter((k) => k === 'resolved').length;
     expect(
       resolved,
       `[semântica] ${resolved} das 2 chamadas paralelas devolveram kind='resolved' ` +
         '(esperado exatamente 1). >1 = a pendência foi resolvida em duplicidade; ' +
-        '0 = nenhuma resolveu (confira antes os testes [infra] — com eles verdes, ' +
-        'isto é o guard de FOR UPDATE em pending-resolver.ts rejeitando as duas). ' +
+        '0 = nenhuma resolveu — e as pré-condições de infraestrutura deste caso já ' +
+        'foram verificadas (setup, flag, throw de infra), então isto é o guard de ' +
+        'FOR UPDATE em pending-resolver.ts rejeitando as duas. ' +
         `Evidência: ${fmt(ev)}`,
     ).toBe(1);
   });
 
-  it('[semântica] a ação foi despachada exatamente uma vez (audit_log no banco)', () => {
+  it('[semântica] a ação foi despachada exatamente uma vez (audit_log no banco)', (ctx) => {
+    exigirInfra(ctx, PRE_AUDIT);
     const n = ev.audit_by_acao['pending_action_dispatched'] ?? 0;
     expect(
       n,
@@ -567,12 +891,14 @@ d('pending-gate concurrency', () => {
         'conversa (esperado exatamente 1). Esta é a asserção que dá nome ao arquivo: ' +
         '2 significa que a ação (register_transaction) foi despachada em duplicidade ' +
         'sob resolves paralelos — RACE SEMÂNTICA em src/agent/pending-resolver.ts, ' +
-        'bug de idempotência em produção, não flake. 0 com [infra] verde significa ' +
-        `que nenhuma perna chegou ao despacho. Evidência: ${fmt(ev)}`,
+        'bug de idempotência em produção, não flake. 0 aqui significa que nenhuma ' +
+        'perna chegou ao despacho, com o audit_log comprovadamente gravável. ' +
+        `Evidência: ${fmt(ev)}`,
     ).toBe(1);
   });
 
-  it('[semântica] a perna perdedora foi registrada como race_lost exatamente uma vez', () => {
+  it('[semântica] a perna perdedora foi registrada como race_lost exatamente uma vez', (ctx) => {
+    exigirInfra(ctx, PRE_AUDIT);
     const n = ev.audit_by_acao['pending_race_lost'] ?? 0;
     expect(
       n,
@@ -583,10 +909,11 @@ d('pending-gate concurrency', () => {
     ).toBe(1);
   });
 
-  it('[semântica] a pending question terminou respondida, em linha única', () => {
+  it('[semântica] a pending question terminou respondida, em linha única', (ctx) => {
+    exigirInfra(ctx, PRE_RETORNO);
     expect(
       ev.pending_status,
-      "[semântica] estado final da pending question diferente de exatamente uma linha " +
+      '[semântica] estado final da pending question diferente de exatamente uma linha ' +
         "'respondida'. 'aberta' = o despacho comitou sem fechar a pergunta (o próximo " +
         'inbound re-resolveria e despacharia de novo). Mais de uma linha = fixture ' +
         `contaminado. Evidência: ${fmt(ev)}`,
