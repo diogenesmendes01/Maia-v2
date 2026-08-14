@@ -28,6 +28,7 @@
  * a queda real produz o `ready` que dispara tudo isto.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { logger } from '@/lib/logger.js';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -1001,6 +1002,65 @@ describe('kill switch — releitura na reconexão', () => {
         elapsed,
         `o drain esperou ${elapsed}ms — passou a herdar o orçamento do retry (teto ${resyncWorstCaseMs()}ms)`,
       ).toBeLessThan(RESYNC_RETRY.attemptTimeoutMs / 2);
+    });
+
+    /**
+     * O desenho do achado 2 dizia que `aborted` fica FORA de
+     * `DIVERGENT_OUTCOMES` — mas nada pinava isso. Verifiquei acrescentando
+     * `'aborted'` ao conjunto: os 26 casos continuavam VERDES.
+     *
+     * A consequência de deixar solto não é abstrata. `DIVERGENT_OUTCOMES`
+     * decide duas coisas em `finishResync`: o NÍVEL do log (ERROR, não WARN) e
+     * o NOME dele (`circuit_override_resync_failed`). Ou seja, um drain
+     * deliberado passaria a escrever uma linha de ERRO com o nome da falha —
+     * e um `grep circuit_override_resync_failed` num pós-mortem colheria
+     * deploys normais como incidente, que é exatamente o ruído que o desfecho
+     * novo existe para evitar.
+     *
+     * Este caso fixa a decisão pelo efeito observável, não pela pertinência ao
+     * `Set`: um teste que afirmasse `DIVERGENT_OUTCOMES.has('aborted') ===
+     * false` estaria olhando para a implementação, e sobreviveria a alguém
+     * mudar o `if` do log.
+     */
+    it('o drain loga em WARN com nome próprio — nunca ERROR de divergência', async () => {
+      const warn = vi.spyOn(logger, 'warn');
+      const error = vi.spyOn(logger, 'error');
+      try {
+        const sub = await bootSubscriber();
+        redisMock.get.mockRejectedValue(new Error('ECONNRESET'));
+        redisMock.get.mockClear();
+        warn.mockClear();
+        error.mockClear();
+
+        vi.useFakeTimers();
+        try {
+          sub.emit('ready');
+          await vi.advanceTimersByTimeAsync(0);
+          await stopLLMSettingsInvalidationSubscriber();
+          await vi.advanceTimersByTimeAsync(resyncWorstCaseMs());
+        } finally {
+          vi.useRealTimers();
+        }
+
+        const errorMsgs = error.mock.calls.map((c) => c[1]);
+        expect(
+          errorMsgs,
+          'o drain escreveu linha de ERRO: um deploy deliberado vira incidente no pós-mortem',
+        ).not.toContain('llm_gateway.circuit_override_resync_failed');
+
+        const warnMsgs = warn.mock.calls.map((c) => c[1]);
+        expect(
+          warnMsgs,
+          'o drain não deixou rastro com nome próprio',
+        ).toContain('llm_gateway.circuit_override_resync_aborted');
+        expect(
+          warnMsgs,
+          'o cancelamento foi contado como convergência — evidência verde falsa no gate que libera `enforce`',
+        ).not.toContain('llm_gateway.circuit_override_resynced');
+      } finally {
+        warn.mockRestore();
+        error.mockRestore();
+      }
     });
   });
 });
