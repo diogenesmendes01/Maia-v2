@@ -301,15 +301,22 @@ sobre essa série.
 
    ```bash
    journalctl -u maia | grep llm_gateway.circuit_override_resync_failed | tail
-   # {"outcome":"failed","state":"enforce","err":"…"}
+   # {"outcome":"failed","state":"enforce","attempts":4,"err":"…"}
    ```
 
    | `outcome` | O que aconteceu | Ação |
    |---|---|---|
-   | `failed` | não houve leitura defensável (`GET` falhou, chave ilegível, re-inscrição sem ack) | trate como Redis inalcançável por aquela réplica: cheque `redis.rules.yml`, rede e o `maxmemory` do Redis |
+   | `failed` | não houve leitura defensável em NENHUMA das 4 tentativas (`GET` falhando ou estourando o timeout, chave ilegível, re-inscrição sem ack) | trate como Redis inalcançável por aquela réplica: cheque `redis.rules.yml`, rede e o `maxmemory` do Redis |
    | `rejected` | a chave FOI lida e o payload foi recusado pela governança (sem `expires_at` absoluto, sem ator, vencido, acima do teto) | `redis-cli GET maia:llm:circuit:override` — republicar não conserta payload inválido |
 
-2. Converja a réplica: republicar o override é idempotente
+2. `attempts` diz quantas tentativas foram gastas (1 imediata + até 3 retries,
+   com backoff, jitter e timeout por tentativa). Um `resync_failed` significa
+   **esgotamento** — falha intermediária que depois convergiu não chega nesta
+   série: ela sai como `llm_gateway.circuit_override_resync_retry` (WARN) e a
+   releitura termina em `resynced`. Se o alerta disparar com `attempts` menor
+   que 4, o retry regrediu.
+
+3. Converja a réplica: republicar o override é idempotente
    (`SET` + `PUBLISH`, [`operational.md` §3.1](operational.md)). Se o alerta
    voltar na mesma réplica, ela está sem Redis — use a segunda alavanca
    (`LLM_CIRCUIT_MODE=off` + restart) naquela réplica em vez de insistir.

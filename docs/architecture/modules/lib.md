@@ -301,12 +301,24 @@ mensagem mais nova. `overrideGeneration()` (`src/lib/llm/circuit-mode.ts`) é
 capturada antes do `GET` e a releitura CEDE se ela mudou — o estado final é o do
 Redis, não o da corrida.
 
+*Retry limitado* (decisão do owner na #534): tentativa imediata + 3 retries,
+com backoff exponencial, jitter e timeout POR TENTATIVA (`RESYNC_RETRY`). A
+falha típica é transitória (`LOADING` de failover, socket voltando), e desistir
+na primeira marcava a réplica como divergente por um soluço de 200ms. O timeout
+por tentativa é o que impede a degeneração para uma tentativa eterna contra um
+socket meio-aberto. Recusa de payload é **terminal** — determinística sobre o
+conteúdo da chave, retentar só duplicaria linhas `_rejected` na trilha. A
+serialização da `resyncChain` é mantida de propósito: as duas releituras leem o
+mesmo estado, e serializar é o que garante que a leitura mais nova é a que fica.
+
 *Fail-closed*: leitura que falha, chave ilegível, chave **recusada** pela
 governança (sem `expires_at` absoluto, sem ator, vencida, acima do teto) e
-re-inscrição **sem ack** — nenhuma delas vira "não há override". Em todas o
-estado local é preservado e sai
+re-inscrição **sem ack** — nenhuma delas vira "não há override". Em todas, e em
+TODA tentativa, o estado local é preservado e sai
 `maia_llm_circuit_mode_overrides_total{reason="resync_failed"}` + log de ERRO
-`llm_gateway.circuit_override_resync_failed`, com a causa no campo `outcome` e,
+`llm_gateway.circuit_override_resync_failed` — só depois do ESGOTAMENTO do
+retry; tentativa intermediária vira `..._resync_retry` (WARN) e nada mais —,
+com a causa no campo `outcome` e,
 quando houve recusa, a ação `_rejected` com `source='resynced'` na trilha
 durável (revisão do dono da #552). O ponto é que a série de CONVERGÊNCIA não
 pode dizer "consistente com o Redis" quando a réplica recusou o estado
@@ -314,6 +326,13 @@ autoritativo ou leu sem inscrição ativa — seria evidência verde falsa
 justamente no gate que libera o `enforce`. Sem ack, aliás, nem se lê: tratar
 ausência de chave como autoritativa nesse estado limparia um override vivo com
 base numa leitura indefensável.
+
+Os dois alertas dessa série vivem em `monitoring/alerts/slo.rules.yml`
+(`MaiaLlmCircuitResyncFailedEnforcing`, crítico em `enforce`;
+`MaiaLlmCircuitResyncFailed`, warning nas demais posturas) e são avaliados SEM
+agregação: uma réplica divergente entre vinte é o caso que eles existem para
+pegar, e um `sum` a dissolveria. Leitura em
+`docs/runbooks/observability-slo.md` §4.9.3.
 
 O caso bom sai como `{reason="resynced"}`, um evento por releitura inclusive no
 no-op — sem isso, "esta réplica ressincronizou?" só teria o silêncio como

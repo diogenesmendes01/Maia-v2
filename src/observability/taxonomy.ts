@@ -294,7 +294,8 @@ export const METRIC = {
    * actor and reason.
    *
    * The last two are the RECONNECT resync (issue #534 gate 4), one event per
-   * attempt including the no-op: Redis pub/sub is at-most-once with no replay,
+   * RE-READ including the no-op — never one per retry attempt, see below:
+   * Redis pub/sub is at-most-once with no replay,
    * so a replica whose socket dropped during the incident must re-read the
    * durable key to converge. `resynced` = the re-read completed and this
    * replica's state IS the Redis state; `resync_failed` = it could not be
@@ -304,8 +305,16 @@ export const METRIC = {
    * a re-subscribe with no ack (no ack ⇒ the read is not even attempted, since
    * treating an absent key as authoritative there would clear a live
    * override). The cause stays distinguishable in the log's `outcome` field.
-   * Sustained `resync_failed` is the alert that says the kill switch cannot be
-   * trusted to reach everyone.
+   *
+   * `resync_failed` is TERMINAL: the re-read is retried (immediate attempt + 3
+   * backed-off retries, `RESYNC_RETRY` in `src/lib/llm/cache-invalidation.ts`)
+   * and only exhaustion reaches this series — an intermediate failure is a
+   * `llm_gateway.circuit_override_resync_retry` log line and nothing else. That
+   * is what lets ANY point here page: `MaiaLlmCircuitResyncFailedEnforcing`
+   * (critical, `state="enforce"`) and `MaiaLlmCircuitResyncFailed` (warning,
+   * every other posture) in `monitoring/alerts/slo.rules.yml`. They are
+   * evaluated WITHOUT aggregation on purpose — one diverging replica out of
+   * twenty is the case they exist to catch, and a `sum` would dissolve it.
    */
   LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 

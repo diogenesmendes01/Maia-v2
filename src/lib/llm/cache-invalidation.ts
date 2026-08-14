@@ -203,8 +203,129 @@ const RESYNC_ACTOR = 'system:llm_circuit_resync';
 
 /** Quantas releituras de reconexão já TERMINARAM neste processo (sucesso ou não). */
 let resyncCount = 0;
-/** Serializa releituras: um socket instável pode emitir vários `ready` seguidos. */
+/**
+ * Serializa releituras: um socket instável pode emitir vários `ready` seguidos.
+ *
+ * ## E o retry segura a próxima releitura pelo backoff — de propósito
+ *
+ * Com o retry (abaixo), uma releitura que esgota pode ocupar a cadeia por até
+ * ~10s (4 tentativas × timeout + os três backoffs). A próxima espera. Isso é
+ * ACEITÁVEL, e não é um efeito colateral que se tolera:
+ *
+ *  - as duas releituras leem o MESMO estado — a chave durável do override. A
+ *    segunda não tem informação nova a entregar, só uma leitura mais recente;
+ *  - serializar é o que garante que a leitura mais NOVA é a que fica. Duas
+ *    releituras concorrentes capturam a mesma geração antes de qualquer
+ *    aplicação, e a primeira a responder pode ser a que leu o estado mais
+ *    velho — inversão de ordem no kill switch. É o caso provado em
+ *    `tests/unit/lib/llm-circuit-resync.spec.ts` ("duas reconexões seguidas
+ *    correm EM SÉRIE");
+ *  - um socket que flapa durante uma queda de Redis produziria N releituras
+ *    concorrentes, cada uma com 4 tentativas, martelando o Redis já doente.
+ *    A cadeia é também o freio disso.
+ *
+ * O preço é a latência de convergência num flapping: a releitura que importa
+ * (a última) começa depois que a anterior desiste. Contra o TTL do
+ * arrendamento (30min default, teto de 24h) os ~10s são ruído.
+ */
 let resyncChain: Promise<void> = Promise.resolve();
+
+/**
+ * Retry LIMITADO da releitura — decisão do owner na #534.
+ *
+ * > "Sim, mas limitado. Sugestão: tentativa imediata mais três retries com
+ * > backoff, jitter e timeout por tentativa. Preservar o estado local em todas
+ * > as falhas e emitir `resync_failed` definitivo somente depois do
+ * > esgotamento."
+ *
+ * O porquê: a falha típica aqui é TRANSITÓRIA — `LOADING` durante um failover,
+ * um `GET` que pegou o socket no meio da volta, um ack de `SUBSCRIBE` que se
+ * perdeu na reconexão. Desistir na primeira produzia duas coisas ruins ao mesmo
+ * tempo: uma réplica que ficava divergente até o TTL do arrendamento por causa
+ * de um soluço de 200ms, e um `resync_failed` que não distinguia soluço de
+ * Redis inalcançável — alerta que toca por ruído é alerta que ninguém olha.
+ *
+ * Números, e o que cada um compra:
+ *
+ *  - **4 tentativas** (1 imediata + 3 retries). A imediata é o caso comum (o
+ *    socket acabou de voltar e o Redis está lá). Três retries cobrem um
+ *    failover curto sem transformar a releitura numa operação de minutos.
+ *  - **timeout POR TENTATIVA**. É o que impede a degeneração para "uma
+ *    tentativa eterna": um socket meio-aberto contra um nó em failover pode
+ *    nunca responder o `GET`, e sem deadline a cadeia inteira trava e o
+ *    desfecho terminal nunca sai.
+ *  - **backoff exponencial com jitter**. Quando o Redis cai, TODA a frota
+ *    reconecta junto; sem jitter as N réplicas voltam a bater nele no mesmo
+ *    milissegundo, três vezes seguidas.
+ *
+ * Teto do pior caso: 4 × `attemptTimeoutMs` + os três backoffs ≈ 10s.
+ * Deliberadamente muito abaixo do arrendamento mínimo sancionado (30min): se o
+ * Redis não respondeu em 10s, ele não é um soluço, e a resposta certa é acordar
+ * o plantão — não continuar tentando.
+ *
+ * NÃO é configurável por env: mexer nisto muda o contrato de config, que a
+ * issue manda escalar em vez de decidir.
+ */
+export const RESYNC_RETRY = {
+  /** Tentativa imediata + 3 retries. */
+  attempts: 4,
+  /** Deadline de CADA tentativa (`SUBSCRIBE` e `GET` separadamente). */
+  attemptTimeoutMs: 2_000,
+  /** Backoff: 200 · 400 · 800 ms, cada um com jitter de ±50%. */
+  backoffBaseMs: 200,
+} as const;
+
+/**
+ * Deadline de uma tentativa.
+ *
+ * O timer é `unref`ado: um retry pendurado NÃO pode ser motivo de o processo
+ * ficar vivo depois de um drain limpo — ver o aviso sobre drain em
+ * `resyncAuthoritativeState`. `Promise.race` já registra handler nas duas
+ * pontas, então uma rejeição tardia de `op` não vira `unhandledRejection`.
+ */
+async function withAttemptTimeout<T>(op: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      op,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${what} sem resposta em ${RESYNC_RETRY.attemptTimeoutMs}ms`)),
+          RESYNC_RETRY.attemptTimeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Backoff exponencial com jitter de ±50% sobre o passo daquela tentativa. */
+function resyncBackoffMs(attempt: number): number {
+  const step = RESYNC_RETRY.backoffBaseMs * 2 ** (attempt - 1);
+  return Math.round(step * (0.5 + Math.random()));
+}
+
+/** Espera `ms`. Timer `unref`ado pelo mesmo motivo de `withAttemptTimeout`. */
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
+}
+
+/**
+ * Desfecho de UMA tentativa.
+ *
+ *  - `retry: false` — acabou, com o desfecho terminal da releitura.
+ *  - `retry: true`  — falha TRANSITÓRIA candidata a nova tentativa. O estado
+ *    local não foi tocado (é a invariante do módulo) e nada foi contado ainda:
+ *    a série de convergência só recebe o desfecho DEFINITIVO.
+ */
+type ResyncAttempt =
+  | { retry: false; outcome: ResyncOutcome; error?: string }
+  | { retry: true; error: string };
 
 /**
  * Relê o estado AUTORITATIVO do Redis depois de uma reconexão do subscriber —
@@ -236,40 +357,123 @@ let resyncChain: Promise<void> = Promise.resolve();
  *  - **Cache de settings de modelo** — não tem chave no Redis; o estado
  *    autoritativo é o Postgres e o canal só carrega "solte o cache". A
  *    releitura equivalente é soltar o cache local, que força a próxima
- *    resolução a ir ao banco. Barato e na direção segura.
+ *    resolução a ir ao banco. Barato, na direção segura e SEM retry: não
+ *    depende de ordenação nem de resposta do Redis, então acontece uma vez, no
+ *    começo, e nunca falha.
  *
- * ## Fail-closed
+ * ## Fail-closed, em TODAS as tentativas
  *
- * Se o `GET` FALHAR, esta réplica NÃO conclui "não há override": o estado local
- * é preservado (um override em vigor continua em vigor) e o evento sai contado
- * em `reason="resync_failed"` + log de ERRO. Concluir "não há override" a partir
- * de um Redis que não respondeu seria inventar um desligamento do kill switch
- * durante uma falha de Redis — a direção exatamente errada. Chave ilegível
- * (JSON corrompido) segue a mesma regra: não dá para concluir nada dela.
+ * Se a leitura FALHAR, esta réplica NÃO conclui "não há override": o estado
+ * local é preservado (um override em vigor continua em vigor) em toda tentativa
+ * e também no esgotamento. Concluir "não há override" a partir de um Redis que
+ * não respondeu seria inventar um desligamento do kill switch durante uma falha
+ * de Redis — a direção exatamente errada. Chave ilegível (JSON corrompido)
+ * segue a mesma regra: não dá para concluir nada dela.
+ *
+ * ## Retry, e o que é TERMINAL
+ *
+ * `resync_failed` só sai no ESGOTAMENTO (ver `RESYNC_RETRY`). Tentativa
+ * intermediária que falha é distinguível e não polui a série de convergência:
+ * ela vira o log `llm_gateway.circuit_override_resync_retry` (WARN, com
+ * `attempt` e o erro) e nada mais. Um ponto em
+ * `{reason="resync_failed"}` passa a significar "esta réplica tentou 4 vezes e
+ * não conseguiu", que é o que o alerta da #534 promete.
+ *
+ * Nem toda falha é retentável, e a distinção importa:
+ *
+ *  - **retenta**: `GET` que falhou ou estourou o timeout, `SUBSCRIBE` sem ack,
+ *    chave ilegível. São transitórias por natureza (failover, socket voltando).
+ *  - **NÃO retenta**: payload PRESENTE e recusado pela governança (sem
+ *    `expires_at` absoluto, sem ator, vencido, acima do teto). A recusa é
+ *    determinística sobre o conteúdo da chave — retentar daria o mesmo
+ *    resultado quatro vezes e escreveria quatro linhas `_rejected` idênticas na
+ *    trilha durável, transformando auditoria em ruído. Continua sendo
+ *    divergência, e sai como `resync_failed` na hora.
+ *  - **não é falha**: `superseded`. Uma mensagem do canal venceu a releitura, e
+ *    ela é pelo menos tão nova quanto o que o `GET` leu — inclusive quando
+ *    chega ENTRE duas tentativas, que é por isso que a geração é conferida
+ *    antes de cada retry.
+ *
+ * ## Aviso para quem for mexer no drain
+ *
+ * Esta cadeia deliberadamente NÃO participa da sequência de shutdown. Esperar
+ * um `GET` contra um Redis morto travaria o drain — foi o bug que segurou a
+ * #512. Com o retry isso PIORA: o pior caso passou de um `GET` pendurado para
+ * ~10s de tentativas e backoffs. Se alguém um dia encadear a releitura no
+ * drain, o drain herda esse tempo.
+ *
+ * A mitigação que está aqui: TODO timer deste caminho (timeout de tentativa e
+ * backoff) é `unref`ado. Um retry em voo não segura o event loop sozinho — se o
+ * resto do processo já terminou, o processo sai e a releitura é abandonada sem
+ * cerimônia, que é o comportamento correto para uma réplica que está indo
+ * embora. Não confie nisso se for mudar o desenho: releia a #512 antes.
  */
 async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
-  let subscribed = true;
+  // Settings PRIMEIRO e uma vez só: o autoritativo é o Postgres, então soltar o
+  // cache local É a releitura desse canal. Não depende de ack nem de resposta
+  // do Redis — fica fora do laço de retry de propósito.
+  invalidateModelCache();
+
+  /**
+   * Geração no início da releitura INTEIRA — a guarda que atravessa as
+   * tentativas. A de dentro de `attemptResync` cobre a mensagem que chega com o
+   * `GET` em voo; esta cobre a que chega durante um BACKOFF, quando não há
+   * leitura nenhuma em voo para ceder.
+   */
+  const generationAtStart = overrideGeneration();
+
+  let lastError = 'sem detalhe';
+  for (let attempt = 1; attempt <= RESYNC_RETRY.attempts; attempt++) {
+    const result = await attemptResync(sub);
+    if (!result.retry) {
+      finishResync(result.outcome, { error: result.error, attempts: attempt });
+      return;
+    }
+    lastError = result.error;
+
+    if (attempt === RESYNC_RETRY.attempts) break;
+
+    const delay = resyncBackoffMs(attempt);
+    logger.warn(
+      { attempt, of: RESYNC_RETRY.attempts, next_in_ms: delay, err: lastError },
+      'llm_gateway.circuit_override_resync_retry',
+    );
+    await sleep(delay);
+
+    // Uma mensagem do canal que chegou durante o backoff é pelo menos tão nova
+    // quanto qualquer coisa que a próxima tentativa fosse ler: convergiu, e
+    // insistir só produziria uma leitura mais velha competindo com ela.
+    if (overrideGeneration() !== generationAtStart) {
+      finishResync('superseded', { attempts: attempt });
+      return;
+    }
+  }
+
+  finishResync('failed', { error: lastError, attempts: RESYNC_RETRY.attempts });
+}
+
+/**
+ * UMA tentativa de releitura: re-inscreve (esperando o ack), lê a chave
+ * durável e aplica o que ela disser.
+ *
+ * Não toca no estado local em nenhum caminho de falha, e não conta nada: quem
+ * publica na série de convergência é `finishResync`, uma vez por releitura,
+ * com o desfecho DEFINITIVO.
+ */
+async function attemptResync(sub: IORedis): Promise<ResyncAttempt> {
   try {
     // Re-inscrever de propósito, mesmo com `autoResubscribe` do ioredis ligado:
     // o `await` no ack é o que dá o MESMO argumento de ordenação do boot (Redis
     // é single-threaded, então um `GET` posterior ao ack não pode perder um
     // `PUBLISH` que venha depois do `SET`). Re-inscrição num canal já inscrito é
-    // idempotente no Redis.
-    await sub.subscribe(...SUBSCRIBED_CHANNELS);
+    // idempotente no Redis — inclusive quando a tentativa anterior expirou pelo
+    // timeout e o ack chegou depois.
+    await withAttemptTimeout(sub.subscribe(...SUBSCRIBED_CHANNELS), 'ack de re-inscrição');
   } catch (err) {
-    subscribed = false;
     logger.warn(
       { err: (err as Error).message, channels: SUBSCRIBED_CHANNELS },
       'llm_gateway.settings_resubscribe_failed',
     );
-  }
-
-  // Settings: o autoritativo é o Postgres, então soltar o cache local É a
-  // releitura. Continua fail-SOFT mesmo sem ack — soltar cache não depende de
-  // ordenação nenhuma e erra sempre para o lado de reler do banco.
-  invalidateModelCache();
-
-  if (!subscribed) {
     /**
      * Sem o ack, o argumento de ordenação que sustenta esta releitura NÃO
      * existe (revisão do dono da #552).
@@ -283,13 +487,14 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
      *
      * O caso mais perigoso é tratar AUSÊNCIA de chave como autoritativa nesse
      * estado: limparíamos um override vivo com base numa leitura que não pode
-     * ser defendida. Então nem se lê: o estado local é PRESERVADO e o desfecho
-     * é falha de resync, que é o que acorda alguém.
+     * ser defendida. Então nem se lê — em NENHUMA tentativa. O que muda com o
+     * retry é só que um ack perdido na volta do socket ganha mais três chances
+     * antes de virar alerta.
      */
-    finishResync('failed', {
-      error: 'sem ack de re-inscrição: ordenação GET × PUBLISH não garantida, leitura não realizada',
-    });
-    return;
+    return {
+      retry: true,
+      error: `sem ack de re-inscrição (${(err as Error).message}): ordenação GET × PUBLISH não garantida, leitura não realizada`,
+    };
   }
 
   // A geração é capturada ANTES do `GET`: se uma mensagem do canal for aplicada
@@ -299,23 +504,23 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
   const generation = overrideGeneration();
   let raw: string | null;
   try {
-    raw = await redis.get(LLM_CIRCUIT_OVERRIDE_KEY);
+    raw = await withAttemptTimeout(
+      redis.get(LLM_CIRCUIT_OVERRIDE_KEY),
+      'GET da chave do override',
+    );
   } catch (err) {
-    finishResync('failed', { error: (err as Error).message });
-    return;
+    return { retry: true, error: (err as Error).message };
   }
 
   if (overrideGeneration() !== generation) {
-    finishResync('superseded');
-    return;
+    return { retry: false, outcome: 'superseded' };
   }
 
   if (raw === null) {
     // Ausência é resposta AUTORITATIVA (diferente de erro, acima): a chave
     // expirou ou foi apagada por um `clear` que esta réplica não ouviu.
     if (currentOverride() === null) {
-      finishResync('noop');
-      return;
+      return { retry: false, outcome: 'noop' };
     }
     applyCircuitOverride(
       {
@@ -326,20 +531,17 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
       Date.now(),
       'resynced',
     );
-    finishResync('cleared');
-    return;
+    return { retry: false, outcome: 'cleared' };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    finishResync('failed', { error: `chave ilegível: ${(err as Error).message}` });
-    return;
+    return { retry: true, error: `chave ilegível: ${(err as Error).message}` };
   }
   if (typeof parsed !== 'object' || parsed === null) {
-    finishResync('failed', { error: 'chave ilegível: payload não é objeto' });
-    return;
+    return { retry: true, error: 'chave ilegível: payload não é objeto' };
   }
 
   const result = applyCircuitOverride(parsed as CircuitOverrideMessage, Date.now(), 'resynced');
@@ -349,8 +551,17 @@ async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
   // Nesta, que é a de CONVERGÊNCIA, recusa não é convergir: a réplica não
   // aplicou o estado autoritativo, preservou o dela e pode estar divergente da
   // frota. Ver `DIVERGENT_OUTCOMES`.
-  finishResync(result.applied ? 'applied' : 'rejected', { error: result.error });
+  //
+  // E é TERMINAL: a recusa é determinística sobre o conteúdo da chave, então
+  // retentar escreveria quatro `_rejected` idênticos na trilha durável sem
+  // mudar o desfecho. Ver o bloco de retry em `resyncAuthoritativeState`.
+  return {
+    retry: false,
+    outcome: result.applied ? 'applied' : 'rejected',
+    error: result.error,
+  };
 }
+
 
 type ResyncOutcome = 'applied' | 'cleared' | 'noop' | 'superseded' | 'rejected' | 'failed';
 
@@ -395,7 +606,10 @@ const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
  * `attribute: false` pelo mesmo motivo do resto do módulo: a postura é da
  * frota, e o `tenant_id` que por acaso estava no ALS não diz nada sobre ela.
  */
-function finishResync(outcome: ResyncOutcome, detail: { error?: string } = {}): void {
+function finishResync(
+  outcome: ResyncOutcome,
+  detail: { error?: string; attempts?: number } = {},
+): void {
   resyncCount++;
   const state = effectiveMode();
   const divergent = DIVERGENT_OUTCOMES.has(outcome);
@@ -405,7 +619,16 @@ function finishResync(outcome: ResyncOutcome, detail: { error?: string } = {}): 
     1,
     { attribute: false },
   );
-  const record = { outcome, state, key: LLM_CIRCUIT_OVERRIDE_KEY, err: detail.error };
+  // `attempts` vai no LOG, nunca em rótulo: a pergunta "gastou quantas
+  // tentativas?" é de triagem, não de série temporal, e um rótulo a mais
+  // multiplicaria a cardinalidade de uma família que já tem `state` × `reason`.
+  const record = {
+    outcome,
+    state,
+    attempts: detail.attempts,
+    key: LLM_CIRCUIT_OVERRIDE_KEY,
+    err: detail.error,
+  };
   if (divergent) {
     // ERROR, não WARN: uma réplica que não conseguiu reler — ou que recusou o
     // que leu — pode estar recusando tráfego que o plantão já mandou parar de

@@ -375,13 +375,25 @@ curl -s http://localhost:3000/metrics | grep 'reason="resync'
 journalctl -u maia | grep llm_gateway.circuit_override_resync
 ```
 
-`resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`) é a
-saída ruim, e cobre TODA releitura que não pôde afirmar consistência com o
-Redis. O campo `outcome` do log diz qual:
+A releitura tem **retry limitado** (decisão do owner na #534): tentativa
+imediata + 3 retries, com backoff exponencial, jitter e timeout por tentativa
+(`RESYNC_RETRY`, `src/lib/llm/cache-invalidation.ts`). Uma tentativa
+intermediária que falha sai só como `llm_gateway.circuit_override_resync_retry`
+(WARN, com `attempt` e o erro) e **não** entra na série de convergência — a
+falha típica aqui é um `LOADING` de failover, e desistir dela marcaria a réplica
+como divergente por causa de um soluço.
+
+`resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`, campo
+`attempts`) é a saída ruim, é **terminal** — só sai depois do esgotamento — e
+cobre TODA releitura que não pôde afirmar consistência com o Redis. É a série
+que os alertas `MaiaLlmCircuitResyncFailedEnforcing` (crítico) e
+`MaiaLlmCircuitResyncFailed` (warning) observam, por réplica; leitura do alerta
+em [`observability-slo.md` §4.9.3](observability-slo.md). O campo `outcome` do
+log diz qual:
 
 | `outcome` | O que aconteceu |
 |---|---|
-| `failed` | `GET` falhou, chave ilegível, ou re-inscrição sem ack — não houve leitura defensável |
+| `failed` | `GET` falhou (ou estourou o timeout), chave ilegível, ou re-inscrição sem ack — não houve leitura defensável em nenhuma das 4 tentativas |
 | `rejected` | a chave FOI lida e foi recusada (sem `expires_at` absoluto, sem ator, vencida, acima do teto) |
 
 Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há
@@ -389,8 +401,11 @@ override" a partir de um Redis mudo (ou de um payload que não passa na
 governança) desligaria o kill switch sozinho. Uma réplica nesse estado pode
 estar divergente da frota: republique o `SET` + `PUBLISH` (é idempotente); se
 o `outcome` for `rejected`, olhe o payload da chave antes (`redis-cli GET
-maia:llm:circuit:override`), porque republicar não conserta payload inválido; se
-persistir, trate como Redis fora do ar — segunda alavanca.
+maia:llm:circuit:override`), porque republicar não conserta payload inválido —
+e é por isso que a recusa NÃO é retentada: o veredito é determinístico sobre o
+conteúdo da chave, e retentar só encheria a trilha durável de linhas
+`_rejected` idênticas. Se persistir, trate como Redis fora do ar — segunda
+alavanca.
 
 `superseded` **não** é falha: ali a releitura perdeu para uma mensagem do canal,
 que é sempre pelo menos tão nova quanto o que o `GET` leu — o estado final é o
