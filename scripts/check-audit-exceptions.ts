@@ -134,6 +134,26 @@ export function parseAudit(project: string, raw: unknown): Finding[] {
   return out.sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
 }
 
+/**
+ * `true` só para uma data de calendário que EXISTE.
+ *
+ * `Date.parse('2026-02-31T00:00:00Z')` não devolve NaN: o V8 normaliza para
+ * 2026-03-03. Uma exceção com `expires: "2026-02-31"` ganharia três dias de
+ * vida silenciosos e, pior, deixaria no ledger uma data que ninguém escreveu de
+ * propósito — num arquivo cujo valor inteiro é ser lido por humanos. Aqui os
+ * componentes são reconstruídos em UTC e comparados com o que foi escrito.
+ */
+export function isCalendarDate(value: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return false;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
 /** Valida a forma do ledger. Retorna a lista de problemas (vazia = íntegro). */
 export function validateLedger(parsed: unknown): { exceptions: Exception[]; errors: string[] } {
   const errors: string[] = [];
@@ -175,7 +195,7 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
       errors.push(`${where}: advisory "${e.advisory}" não tem a forma GHSA-xxxx-xxxx-xxxx`);
       continue;
     }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(e.expires) || Number.isNaN(Date.parse(`${e.expires}T00:00:00Z`))) {
+    if (!isCalendarDate(e.expires)) {
       errors.push(`${where}: expires "${e.expires}" não é uma data YYYY-MM-DD válida`);
       continue;
     }

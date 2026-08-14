@@ -13,6 +13,7 @@ import {
   LEDGER_PATH,
   PROJECTS,
   ghsaFromUrl,
+  isCalendarDate,
   keyOf,
   npmExecutable,
   parseAudit,
@@ -120,6 +121,31 @@ describe('npmExecutable — o comando documentado precisa rodar no Windows', () 
   });
 });
 
+describe('isCalendarDate', () => {
+  it('recusa data calendárica impossível que o Date.parse normalizaria', () => {
+    // `new Date('2026-02-31T00:00:00Z')` vira 2026-03-03 no V8 — 3 dias de
+    // exceção que ninguém escreveu.
+    expect(isCalendarDate('2026-02-31')).toBe(false);
+    expect(isCalendarDate('2026-02-30')).toBe(false);
+    expect(isCalendarDate('2026-04-31')).toBe(false);
+    expect(isCalendarDate('2026-13-01')).toBe(false);
+    expect(isCalendarDate('2026-00-10')).toBe(false);
+    expect(isCalendarDate('2026-01-00')).toBe(false);
+    expect(isCalendarDate('2026-01-32')).toBe(false);
+  });
+
+  it('aceita datas reais, inclusive 29/02 em ano bissexto', () => {
+    expect(isCalendarDate('2026-11-12')).toBe(true);
+    expect(isCalendarDate('2028-02-29')).toBe(true);
+    expect(isCalendarDate('2026-02-28')).toBe(true);
+  });
+
+  it('recusa o que não tem a forma YYYY-MM-DD', () => {
+    expect(isCalendarDate('12/11/2026')).toBe(false);
+    expect(isCalendarDate('2026-1-1')).toBe(false);
+  });
+});
+
 describe('validateLedger', () => {
   it('aceita uma entrada bem formada', () => {
     const { exceptions, errors } = validateLedger([OK]);
@@ -145,6 +171,12 @@ describe('validateLedger', () => {
   it('reprova data de expiração malformada', () => {
     const { errors } = validateLedger([{ ...OK, expires: '12/11/2026' }]);
     expect(errors.join('\n')).toContain('não é uma data YYYY-MM-DD válida');
+  });
+
+  it('reprova data calendárica impossível (2026-02-31)', () => {
+    const { exceptions, errors } = validateLedger([{ ...OK, expires: '2026-02-31' }]);
+    expect(errors.join('\n')).toContain('expires "2026-02-31" não é uma data YYYY-MM-DD válida');
+    expect(exceptions).toEqual([]);
   });
 
   it('reprova entradas duplicadas para a mesma chave', () => {
