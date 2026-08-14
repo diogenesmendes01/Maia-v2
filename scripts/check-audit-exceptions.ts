@@ -26,6 +26,8 @@
  *   4. entrada malformada (campo faltando, data inválida, severidade inválida)
  *   5. severidade do advisory diferente da severidade registrada na exceção
  *      → a decisão foi tomada para outro risco, precisa ser tomada de novo
+ *   6. `npm audit` que não devolveu um relatório de auditoria reconhecível
+ *      → não sabemos nada sobre aquele lockfile; ver "Fail-closed" abaixo
  *
  * A regra 3 é o que impede o ledger de crescer para sempre: assim que o
  * advisory some (upgrade, remoção do pacote), o CI EXIGE a limpeza da linha.
@@ -39,6 +41,25 @@
  * linha inteira. O ledger já reprova quando a realidade MELHORA (regra 3, que
  * fica vermelha justamente quando alguém corrigiu a vulnerabilidade); a regra 5
  * apenas mantém essa postura coerente em vez de tolerar meia-verdade no ledger.
+ *
+ * Fail-closed
+ * -----------
+ * O `npm audit` sai com código != 0 QUANDO ENCONTRA vulnerabilidade, então o
+ * exit status não distingue "achei coisa" de "não consegui auditar" e por isso
+ * é ignorado. A distinção que vale é a FORMA do relatório: um relatório de
+ * sucesso do npm >= 7 traz `auditReportVersion`, `vulnerabilities` (objeto,
+ * possivelmente VAZIO) e `metadata`. Uma falha de registry/auth/serviço traz um
+ * objeto sem nenhum desses campos e com `error` — verificado com npm 10.9.7
+ * apontado para um registry morto, exit 1, stdout:
+ *
+ *   {"message":"request to http://127.0.0.1:9/-/npm/v1/security/audits/quick
+ *    failed, reason: connect ECONNREFUSED 127.0.0.1:9",
+ *    "error":{"summary":"","detail":""}}
+ *
+ * Sem checagem de forma esse payload atravessa o parser como "zero advisories"
+ * e o guard fica VERDE — fail-OPEN num guard cuja razão de existir é ser
+ * fail-closed. `validateAuditReport()` separa "relatório válido dizendo que não
+ * há nada" (passa) de "não consegui obter relatório" (reprova).
  *
  * Invocação
  * ---------
@@ -95,6 +116,17 @@ export interface Exception {
   readonly expires: string;
 }
 
+/**
+ * Leitura de um relatório do `npm audit --json`: ou os findings, ou o motivo
+ * pelo qual aquele relatório não pode ser usado. Nunca as duas coisas — quando
+ * `errors` não está vazio, `findings` vem VAZIO de propósito, e quem chama tem
+ * de tratar isso como reprovação, não como ausência de vulnerabilidade.
+ */
+export interface AuditRead {
+  readonly findings: Finding[];
+  readonly errors: string[];
+}
+
 /** Chave de casamento entre finding e exceção. */
 export function keyOf(x: { project: string; pkg: string; advisory: string }): string {
   return `${x.project}|${x.pkg}|${x.advisory}`;
@@ -107,8 +139,83 @@ export function ghsaFromUrl(url: unknown): string | null {
   return m ? m[1]! : null;
 }
 
+/** Descrição curta do que veio, para a mensagem de erro não virar enigma. */
+function describeValue(raw: unknown): string {
+  if (raw === null) return 'null';
+  if (Array.isArray(raw)) return 'array';
+  return typeof raw;
+}
+
+/** Resumo do payload de erro do npm, truncado para não poluir o log do CI. */
+function summarizeNpmError(r: Record<string, unknown>): string {
+  const msg = typeof r.message === 'string' && r.message.trim() !== '' ? r.message : null;
+  const detail = msg ?? JSON.stringify(r.error);
+  return detail.length > 300 ? `${detail.slice(0, 300)}…` : detail;
+}
+
 /**
- * Converte a saída de `npm audit --json` em findings.
+ * Valida que `raw` é um relatório de auditoria BEM-SUCEDIDO do `npm audit
+ * --json`, e não uma falha operacional disfarçada.
+ *
+ * A validação é sobre a FORMA, nunca sobre o exit code (ver "Fail-closed" no
+ * topo). Três campos precisam existir, e os três existem num relatório de
+ * sucesso com ZERO vulnerabilidades — que é justamente o caso que precisa
+ * continuar passando:
+ *
+ *   {"auditReportVersion":2,"vulnerabilities":{},"metadata":{...}}
+ *
+ * Um payload de erro do npm não tem nenhum dos três, e ainda traz `error`.
+ * Exigir os três (em vez de só recusar `error`) protege também contra saídas
+ * futuras ou desconhecidas: o que não for reconhecivelmente um relatório
+ * reprova, em vez de ser lido como "nada encontrado".
+ *
+ * Devolve a lista de problemas (vazia = relatório utilizável).
+ */
+export function validateAuditReport(project: string, raw: unknown): string[] {
+  const where = `npm audit --json em "${project}"`;
+  const comoAgir =
+    'Isto NÃO é "zero advisories", é ausência de auditoria: o guard reprova até ' +
+    'conseguir um relatório válido daquele lockfile.';
+
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return [`${where}: a saída não é um objeto JSON (veio ${describeValue(raw)}). ${comoAgir}`];
+  }
+
+  const r = raw as Record<string, unknown>;
+  const errors: string[] = [];
+
+  if (r.error !== undefined) {
+    errors.push(
+      `${where}: o npm devolveu um relatório de ERRO — ${summarizeNpmError(r)}. ${comoAgir}`,
+    );
+  }
+  if (typeof r.auditReportVersion !== 'number') {
+    errors.push(
+      `${where}: relatório sem "auditReportVersion" numérico, então não é um relatório de ` +
+        `auditoria do npm >= 7. ${comoAgir}`,
+    );
+  }
+  const vulns = r.vulnerabilities;
+  if (typeof vulns !== 'object' || vulns === null || Array.isArray(vulns)) {
+    errors.push(
+      `${where}: campo "vulnerabilities" ausente ou não é um objeto (veio ` +
+        `${describeValue(vulns)}). ${comoAgir}`,
+    );
+  }
+  const metadata = r.metadata;
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+    errors.push(
+      `${where}: campo "metadata" ausente ou não é um objeto (veio ` +
+        `${describeValue(metadata)}). ${comoAgir}`,
+    );
+  }
+
+  return errors;
+}
+
+/**
+ * Converte a saída de `npm audit --json` em findings, DEPOIS de validar que a
+ * saída é mesmo um relatório de auditoria (`validateAuditReport`).
  *
  * Só entram os `via` que são OBJETO — esses carregam o advisory de verdade
  * (`url`, `title`, `severity`). Os `via` string ("este pacote é vulnerável
@@ -117,12 +224,14 @@ export function ghsaFromUrl(url: unknown): string | null {
  * cada nó derivado inflaria o ledger sem acrescentar decisão nenhuma — o que se
  * aceita é o advisory, não cada aresta do grafo.
  */
-export function parseAudit(project: string, raw: unknown): Finding[] {
+export function parseAudit(project: string, raw: unknown): AuditRead {
+  const errors = validateAuditReport(project, raw);
+  if (errors.length > 0) return { findings: [], errors };
+
   const out: Finding[] = [];
   const seen = new Set<string>();
-  const report = raw as { vulnerabilities?: Record<string, unknown> };
-  const vulns = report.vulnerabilities ?? {};
-  for (const entry of Object.values(vulns)) {
+  const report = raw as { vulnerabilities: Record<string, unknown> };
+  for (const entry of Object.values(report.vulnerabilities)) {
     const v = entry as { via?: unknown[] };
     for (const via of v.via ?? []) {
       if (typeof via !== 'object' || via === null) continue;
@@ -143,7 +252,7 @@ export function parseAudit(project: string, raw: unknown): Finding[] {
       out.push(finding);
     }
   }
-  return out.sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
+  return { findings: out.sort((a, b) => keyOf(a).localeCompare(keyOf(b))), errors: [] };
 }
 
 /**
@@ -302,9 +411,14 @@ export function npmExecutable(platform: string = process.platform): string {
 }
 
 /**
- * Roda `npm audit --json` num projeto. O `npm audit` sai com código != 0
- * QUANDO ENCONTRA vulnerabilidade, então o status é ignorado de propósito e o
- * que vale é o JSON no stdout.
+ * Roda `npm audit --json` num projeto e devolve o JSON cru — sem julgar a
+ * forma, que é trabalho de `parseAudit`.
+ *
+ * O `npm audit` sai com código != 0 QUANDO ENCONTRA vulnerabilidade, então o
+ * status é ignorado de propósito e o que vale é o JSON no stdout. Só que
+ * "ignorar o status" não pode virar "aceitar qualquer stdout": se o stdout não
+ * for JSON, isto LEVANTA erro em vez de devolver algo vazio, e quem chama
+ * transforma o erro em reprovação.
  */
 export function runAudit(projectDir: string): unknown {
   let stdout: string;
@@ -320,7 +434,80 @@ export function runAudit(projectDir: string): unknown {
     if (typeof e.stdout !== 'string' || e.stdout.trim() === '') throw err;
     stdout = e.stdout;
   }
-  return JSON.parse(stdout);
+  try {
+    return JSON.parse(stdout);
+  } catch (err) {
+    throw new Error(
+      `saída de \`npm audit --json\` não é JSON (${(err as Error).message}): ${stdout.slice(0, 300)}`,
+      { cause: err },
+    );
+  }
+}
+
+/** Como o guard obtém o relatório de um projeto. Injetável para o spec. */
+export type AuditReader = (projectDir: string) => unknown;
+
+/** O veredito do guard, sem efeito colateral de processo. */
+export interface GuardResult {
+  /** Vazio = verde. */
+  readonly problems: string[];
+  readonly findings: Finding[];
+  readonly exceptions: Exception[];
+}
+
+/**
+ * Todo o trabalho do guard, sem tocar em `process`. `audit` entra por parâmetro
+ * para o spec simular relatório de erro ou lockfile limpo sem rede.
+ */
+export function evaluateGuard(
+  repoRoot: string,
+  now: Date,
+  audit: AuditReader = runAudit,
+): GuardResult {
+  const ledgerRaw = readFileSync(join(repoRoot, LEDGER_PATH), 'utf8');
+  let parsedLedger: unknown;
+  try {
+    parsedLedger = JSON.parse(ledgerRaw);
+  } catch (err) {
+    return {
+      problems: [`${LEDGER_PATH}: JSON inválido (${(err as Error).message})`],
+      findings: [],
+      exceptions: [],
+    };
+  }
+
+  const { exceptions, errors } = validateLedger(parsedLedger);
+
+  const findings: Finding[] = [];
+  const auditErrors: string[] = [];
+  for (const project of PROJECTS) {
+    let raw: unknown;
+    try {
+      raw = audit(join(repoRoot, project));
+    } catch (err) {
+      auditErrors.push(
+        `npm audit --json em "${project}" não pôde ser executado: ${(err as Error).message}`,
+      );
+      continue;
+    }
+    const read = parseAudit(project, raw);
+    auditErrors.push(...read.errors);
+    findings.push(...read.findings);
+  }
+
+  // Se UM dos lockfiles não pôde ser auditado, o cruzamento com o ledger não
+  // vale: as entradas daquele projeto apareceriam como "exceção OBSOLETA", o
+  // que é mentira — o advisory pode continuar lá, só não conseguimos olhar.
+  // Reprova com o motivo real e não inventa diagnóstico em cima do escuro.
+  if (auditErrors.length > 0) {
+    return { problems: [...errors, ...auditErrors], findings, exceptions };
+  }
+
+  return {
+    problems: [...errors, ...findProblems(findings, exceptions, todayUtc(now))],
+    findings,
+    exceptions,
+  };
 }
 
 function fail(message: string): never {
@@ -328,31 +515,17 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-export function runGuard(repoRoot: string, now: Date): void {
-  const ledgerRaw = readFileSync(join(repoRoot, LEDGER_PATH), 'utf8');
-  let parsedLedger: unknown;
-  try {
-    parsedLedger = JSON.parse(ledgerRaw);
-  } catch (err) {
-    fail(`  - ${LEDGER_PATH}: JSON inválido (${(err as Error).message})`);
-  }
-
-  const { exceptions, errors } = validateLedger(parsedLedger);
-
-  const findings: Finding[] = [];
-  for (const project of PROJECTS) {
-    findings.push(...parseAudit(project, runAudit(join(repoRoot, project))));
-  }
-
-  const problems = [...errors, ...findProblems(findings, exceptions, todayUtc(now))];
+export function runGuard(repoRoot: string, now: Date, audit: AuditReader = runAudit): void {
+  const { problems, findings, exceptions } = evaluateGuard(repoRoot, now, audit);
 
   if (problems.length > 0) {
     fail(problems.map((p) => `  - ${p}`).join('\n'));
   }
 
   console.log(
-    `check-audit-exceptions passou: ${findings.length} advisory(s) nos ${PROJECTS.length} ` +
-      `lockfiles, ${exceptions.length} exceção(ões) registrada(s) e todas dentro do prazo.`,
+    `check-audit-exceptions passou: ${PROJECTS.length} lockfiles auditados com relatório ` +
+      `válido, ${findings.length} advisory(s), ${exceptions.length} exceção(ões) registrada(s) — ` +
+      `todas casando na severidade registrada e dentro do prazo.`,
   );
 }
 

@@ -243,6 +243,12 @@ jobs:
         # exceção cuja severidade não bate mais com a que o npm reporta reprova
         # também, porque a decisão registrada valia para outro risco.
         #
+        # O guard NÃO confia no exit code do `npm audit` (ele sai != 0 quando
+        # ACHA vulnerabilidade), e por isso valida a FORMA do relatório: falha
+        # de registry/auth devolve `{"error":...}` em stdout, e sem essa
+        # checagem o passo leria isso como "zero advisories" e ficaria verde —
+        # fail-open no guard que existe para ser fail-closed.
+        #
         # Chamado com `node` direto, e não pelo script npm: este job NÃO roda
         # `npm ci` (é o que o mantém rápido e sem serviços), então não há `tsx`.
         # O guard é escrito só com sintaxe TS apagável e o Node 22 do runner

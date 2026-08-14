@@ -5,10 +5,14 @@
  * entradas sintéticas (sem rede, sem `npm audit`), MAIS uma checagem contra o
  * ledger real commitado: um ledger malformado ou vencido reprova aqui antes de
  * reprovar no CI.
+ *
+ * As funções importadas são as de PRODUÇÃO — nada de reimplementar a validação
+ * no harness. Se `check-audit-exceptions.ts` perder uma regra, estes testes
+ * ficam vermelhos.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import {
   LEDGER_PATH,
   PROJECTS,
@@ -17,9 +21,12 @@ import {
   keyOf,
   npmExecutable,
   parseAudit,
+  validateAuditReport,
   validateLedger,
   findProblems,
+  evaluateGuard,
   todayUtc,
+  type AuditReader,
   type Exception,
   type Finding,
 } from '../../../scripts/check-audit-exceptions.js';
@@ -43,6 +50,75 @@ const FINDING: Finding = {
   title: 'esbuild dev server aceita requisição de qualquer origem',
 };
 
+/** Metadata mínima, na forma que o npm >= 7 emite. */
+const METADATA = {
+  vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },
+  dependencies: { prod: 1, dev: 0, optional: 0, peer: 0, peerOptional: 0, total: 1 },
+};
+
+/**
+ * Relatório de SUCESSO com zero vulnerabilidades — a forma literal que
+ * `npm audit --json` imprime num lockfile limpo (verificado com npm 10.9.7).
+ * Este é o caso que precisa continuar PASSANDO: a distinção do guard é entre
+ * "relatório válido dizendo que não há nada" e "não consegui obter relatório".
+ */
+const RELATORIO_LIMPO = {
+  auditReportVersion: 2,
+  vulnerabilities: {},
+  metadata: METADATA,
+};
+
+/** Relatório de sucesso da raiz, com o advisory do esbuild que está no ledger. */
+function relatorioComEsbuild(severity = 'moderate'): unknown {
+  return {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      esbuild: {
+        name: 'esbuild',
+        severity,
+        via: [
+          {
+            source: 1102341,
+            name: 'esbuild',
+            dependency: 'esbuild',
+            title: 'esbuild enables any website to send any request to the development server',
+            url: 'https://github.com/advisories/GHSA-67mh-4wv8-2f99',
+            severity,
+            range: '<=0.24.2',
+          },
+        ],
+      },
+      '@esbuild-kit/core-utils': { via: ['esbuild'] },
+    },
+    metadata: METADATA,
+  };
+}
+
+/**
+ * O payload que `npm audit --json` realmente escreve no stdout quando não
+ * consegue falar com o registry — capturado de `npm audit --json
+ * --registry=http://127.0.0.1:9/` (npm 10.9.7, exit 1).
+ */
+const RELATORIO_DE_ERRO = {
+  message:
+    'request to http://127.0.0.1:9/-/npm/v1/security/audits/quick failed, ' +
+    'reason: connect ECONNREFUSED 127.0.0.1:9',
+  error: { summary: '', detail: '' },
+};
+
+const REPO_ROOT = process.cwd();
+
+/** Leitor de audit falso, indexado pelo caminho do projeto relativo à raiz. */
+function leitorFake(porProjeto: Record<string, unknown>): AuditReader {
+  return (dir: string) => {
+    const rel = relative(REPO_ROOT, dir) || '.';
+    if (!(rel in porProjeto)) throw new Error(`projeto inesperado no teste: ${rel}`);
+    return porProjeto[rel];
+  };
+}
+
+const CONGELADO = new Date('2026-08-14T12:00:00Z');
+
 describe('ghsaFromUrl', () => {
   it('extrai o id de uma URL de advisory', () => {
     expect(ghsaFromUrl('https://github.com/advisories/GHSA-67mh-4wv8-2f99')).toBe(
@@ -59,6 +135,8 @@ describe('ghsaFromUrl', () => {
 describe('parseAudit', () => {
   it('extrai um finding por advisory OBJETO, ignorando os `via` string', () => {
     const raw = {
+      auditReportVersion: 2,
+      metadata: METADATA,
       vulnerabilities: {
         esbuild: {
           via: [
@@ -76,10 +154,11 @@ describe('parseAudit', () => {
         'drizzle-kit': { via: ['@esbuild-kit/esm-loader', 'esbuild'] },
       },
     } as unknown;
-    const found = parseAudit('.', raw);
-    expect(found).toHaveLength(1);
-    expect(found[0]!.pkg).toBe('esbuild');
-    expect(found[0]!.advisory).toBe('GHSA-67mh-4wv8-2f99');
+    const { findings, errors } = parseAudit('.', raw);
+    expect(errors).toEqual([]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.pkg).toBe('esbuild');
+    expect(findings[0]!.advisory).toBe('GHSA-67mh-4wv8-2f99');
   });
 
   it('deduplica o mesmo advisory reportado em vários nós', () => {
@@ -90,16 +169,75 @@ describe('parseAudit', () => {
       severity: 'high',
     };
     const raw = {
-      vulnerabilities: {
-        'brace-expansion': { via: [via, via, via] },
-      },
+      auditReportVersion: 2,
+      metadata: METADATA,
+      vulnerabilities: { 'brace-expansion': { via: [via, via, via] } },
     } as unknown;
-    expect(parseAudit('.', raw)).toHaveLength(1);
+    expect(parseAudit('.', raw).findings).toHaveLength(1);
   });
 
-  it('aceita um relatório sem vulnerabilidade nenhuma', () => {
-    expect(parseAudit('src/admin-ui', { vulnerabilities: {} })).toEqual([]);
-    expect(parseAudit('src/admin-ui', {})).toEqual([]);
+  it('aceita um relatório de SUCESSO com zero vulnerabilidades', () => {
+    const { findings, errors } = parseAudit('src/admin-ui', RELATORIO_LIMPO);
+    expect(errors).toEqual([]);
+    expect(findings).toEqual([]);
+  });
+});
+
+/**
+ * O achado [High] da review: erro operacional do `npm audit` virava "zero
+ * advisories" e o guard ficava VERDE. A validação é sobre a FORMA do relatório,
+ * nunca sobre o exit code — o `npm audit` sai != 0 também quando ACHA
+ * vulnerabilidade.
+ */
+describe('validateAuditReport — fail-closed sobre a forma do relatório', () => {
+  it('aprova o relatório de sucesso com zero vulnerabilidades', () => {
+    expect(validateAuditReport('src/admin-ui', RELATORIO_LIMPO)).toEqual([]);
+  });
+
+  it('aprova o relatório de sucesso COM vulnerabilidade', () => {
+    expect(validateAuditReport('.', relatorioComEsbuild())).toEqual([]);
+  });
+
+  it('reprova o relatório de ERRO do npm', () => {
+    const errors = validateAuditReport('src/admin-ui', RELATORIO_DE_ERRO);
+    expect(errors.join('\n')).toContain('relatório de ERRO');
+    expect(errors.join('\n')).toContain('ECONNREFUSED');
+  });
+
+  it('reprova relatório sem "vulnerabilities"', () => {
+    const errors = validateAuditReport('.', { auditReportVersion: 2, metadata: METADATA });
+    expect(errors.join('\n')).toContain('"vulnerabilities" ausente ou não é um objeto');
+  });
+
+  it('reprova "vulnerabilities" que não é objeto', () => {
+    for (const v of [[], 'nenhuma', 0, null]) {
+      const errors = validateAuditReport('.', {
+        auditReportVersion: 2,
+        metadata: METADATA,
+        vulnerabilities: v,
+      });
+      expect(errors.join('\n')).toContain('"vulnerabilities" ausente ou não é um objeto');
+    }
+  });
+
+  it('reprova relatório sem "auditReportVersion" e sem "metadata"', () => {
+    const errors = validateAuditReport('.', { vulnerabilities: {} }).join('\n');
+    expect(errors).toContain('"auditReportVersion" numérico');
+    expect(errors).toContain('"metadata" ausente ou não é um objeto');
+  });
+
+  it('reprova o que nem objeto é', () => {
+    expect(validateAuditReport('.', null).join('\n')).toContain('não é um objeto JSON');
+    expect(validateAuditReport('.', []).join('\n')).toContain('veio array');
+    expect(validateAuditReport('.', 'texto').join('\n')).toContain('veio string');
+  });
+
+  it('parseAudit NÃO devolve findings vazios em silêncio para relatório inválido', () => {
+    // Sonda literal do dono: `parseAudit` chamada direto com o payload de erro
+    // do npm devolvia `[]` — fail-open. Agora devolve o motivo.
+    const { findings, errors } = parseAudit('src/admin-ui', RELATORIO_DE_ERRO);
+    expect(findings).toEqual([]);
+    expect(errors.length).toBeGreaterThan(0);
   });
 });
 
@@ -269,6 +407,65 @@ describe('findProblems — drift de severidade', () => {
     expect(findProblems([semSeveridade], [OK], '2026-08-14').join('\n')).toContain(
       'severidade DIVERGENTE',
     );
+  });
+});
+
+/**
+ * O guard inteiro, com o ledger REAL commitado e o `npm audit` injetado.
+ * Reproduz o cenário concreto descrito na review: o audit da raiz encontra o
+ * `esbuild` conhecido (que casa com a exceção), o audit do admin-ui devolve
+ * JSON de erro, não há exceção obsoleta — e antes da correção `runGuard`
+ * PASSAVA.
+ */
+describe('evaluateGuard — o cenário concreto da review', () => {
+  it('passa quando os dois lockfiles devolvem relatório válido', () => {
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': relatorioComEsbuild(), 'src/admin-ui': RELATORIO_LIMPO }),
+    );
+    expect(problems).toEqual([]);
+  });
+
+  it('REPROVA quando o admin-ui devolve relatório de ERRO e a raiz está casada', () => {
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': relatorioComEsbuild(), 'src/admin-ui': RELATORIO_DE_ERRO }),
+    );
+    expect(problems.length).toBeGreaterThan(0);
+    const texto = problems.join('\n');
+    expect(texto).toContain('npm audit --json em "src/admin-ui"');
+    expect(texto).toContain('relatório de ERRO');
+    // E não inventa "exceção obsoleta" sobre um lockfile que ninguém conseguiu ler.
+    expect(texto).not.toContain('exceção OBSOLETA');
+  });
+
+  it('REPROVA quando é a RAIZ que falha, mesmo com o admin-ui limpo', () => {
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': RELATORIO_DE_ERRO, 'src/admin-ui': RELATORIO_LIMPO }),
+    );
+    expect(problems.join('\n')).toContain('npm audit --json em "."');
+  });
+
+  it('REPROVA quando o leitor levanta erro (npm ausente, stdout não-JSON)', () => {
+    const explode: AuditReader = (dir) => {
+      if (dir.endsWith('admin-ui')) throw new Error('spawnSync npm ENOENT');
+      return relatorioComEsbuild();
+    };
+    const { problems } = evaluateGuard(REPO_ROOT, CONGELADO, explode);
+    expect(problems.join('\n')).toContain('não pôde ser executado: spawnSync npm ENOENT');
+  });
+
+  it('REPROVA quando o advisory do ledger real escala para critical', () => {
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': relatorioComEsbuild('critical'), 'src/admin-ui': RELATORIO_LIMPO }),
+    );
+    expect(problems.join('\n')).toContain('severidade DIVERGENTE (ESCALOU)');
   });
 });
 
