@@ -495,11 +495,23 @@ groups:
           )
 
       # --- carga de contexto do turno ---------------------------------------
-      - record: maia:context_load_ms:p95
+      # Fonte: `maia_turn_context_load_duration_ms` (#525), emitida por
+      # `src/agent/prompt-builder.ts` via `recordTurnContextLoad`. Substituiu a
+      # família da montagem P8a (`buildContextPacket`) na review da PR #554: a
+      # PR #406 removeu o hot path daquela montagem, então a regra derivava p95
+      # de uma série que nenhum turno produzia — e painel vazio lê como "sem
+      # problema", não como "sem sinal". A família antiga foi APOSENTADA; o nome
+      # dela não aparece aqui de propósito, porque este arquivo passa por um
+      # drift guard que reprova referência a série sem emissor.
+      #
+      # `phase` no lugar de `stage`: é o rótulo desta família, e hoje o turno
+      # saudável emite `phase="loader"` (`legacy` só aparece em réplica não
+      # rolada). O nome da recording rule acompanha a métrica.
+      - record: maia:turn_context_load_ms:p95
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le, stage) (rate(maia_context_load_ms_bucket[5m]))
+            sum by (le, phase) (rate(maia_turn_context_load_duration_ms_bucket[5m]))
           )
 
       # --- scheduler --------------------------------------------------------

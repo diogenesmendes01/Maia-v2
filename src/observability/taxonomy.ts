@@ -105,17 +105,43 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  * é". A declaration that nothing emits reads exactly like coverage. Rather
  * than deleting the roadmap (the tree IS the target shape, and every name in
  * it is referenced by the SLI narrative), the gap is made MACHINE-CHECKABLE:
- * each span declares whether an instrumentation site exists today, and
+ * each span declares whether PRODUCTION REACHES IT, and
  * `tests/unit/observability/tracer.spec.ts` pins the `emitted` set exactly.
  *
- * So the file can no longer overstate coverage: adding a name here without an
- * emitter fails a test, and shipping an emitter without flipping the flag
- * fails the same test.
+ * So the file can no longer overstate coverage: adding a name here without a
+ * production-reachable emitter fails a test, and shipping a reachable emitter
+ * without flipping the flag fails the same test.
  *
  * Current emitters:
  *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
  *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
  *                            `observability/instrumentation.ts`
+ *   - `context.load`       → `src/agent/turn-context/loader.ts`
+ *                            (`loadTurnContext`) via the same wrapper
+ *
+ * `emitted` means "production reaches this span", NOT "an instrumentation site
+ * exists in the tree". The two came apart on `context.load` and the review of
+ * PR #554 settled it in favour of the stricter reading, for the reason that
+ * decides it: this table is read as a coverage answer. A span no production
+ * path reaches produces nothing, and a value that says otherwise turns the
+ * table into the thing it exists to prevent. Do not weaken this back to
+ * "a site exists" — that reading is what let the table claim coverage for a
+ * span no turn could open.
+ *
+ * `context.load` is the case that forced the definition, and it is now
+ * `emitted` under it. The #535 gate-6 site sat on `buildContextPacket`, the
+ * P8a assembly orchestrator, whose hot path PR #406 deleted
+ * (`FEATURE_CONTEXT_PACKET_V1`): no turn reached it. The wrapper moved to the
+ * carga de contexto the turn actually runs — `loadTurnContext`
+ * (`src/agent/turn-context/loader.ts`, issue #525), reached from
+ * `buildPrompt` → `src/agent/core.ts` → the BullMQ agent worker — and
+ * `tests/integration/context-load-span-hot-path.spec.ts` drives the REAL turn
+ * entry point (`runAgentForMensagem`) to prove the span appears. The span is
+ * the only thing that wrapper emits: duration and round-trips for this same
+ * operation are already published by `recordTurnContextLoad`
+ * (`maia_turn_context_load_duration_ms` / `maia_turn_context_db_queries`), and
+ * two metric families measuring one operation is the drift this taxonomy
+ * exists to prevent.
  */
 export type SpanEmission = 'emitted' | 'declared';
 
@@ -131,7 +157,7 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.PROCEDURE_SELECT]: 'declared',
   [SPAN.RISK_CLASSIFY]: 'declared',
   [SPAN.DECISION_EVALUATE]: 'declared',
-  [SPAN.CONTEXT_LOAD]: 'declared',
+  [SPAN.CONTEXT_LOAD]: 'emitted',
   [SPAN.PROMPT_RENDER]: 'declared',
   [SPAN.REACT_ITERATION]: 'declared',
   [SPAN.LLM_REQUEST]: 'declared',
@@ -145,7 +171,12 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.TURN_COMPLETE]: 'declared',
 });
 
-/** The spans an instrumentation site exists for today. */
+/**
+ * The spans PRODUCTION REACHES today — not the spans an instrumentation site
+ * exists for. `context.load` is why the distinction is spelled out: under the
+ * looser reading it counted as covered for months while sitting on a code path
+ * PR #406 had deleted. See `SPAN_EMISSION`.
+ */
 export const EMITTED_SPANS: readonly SpanName[] = Object.freeze(
   SPAN_NAMES.filter((s) => SPAN_EMISSION[s] === 'emitted'),
 );
@@ -182,9 +213,15 @@ export const METRIC = {
   QUEUE_JOB_ATTEMPTS: 'maia_queue_job_attempts_total',
 
   // --- context / db --------------------------------------------------------
-  CONTEXT_LOAD_MS: 'maia_context_load_ms',
-  /** Turn-context slices assembled, by slice + outcome (issue #535 §2). */
-  CONTEXT_SLICES: 'maia_context_slices_total',
+  //
+  // `maia_context_load_ms` and `maia_context_slices_total` lived here until the
+  // review of PR #554. They were declared for the P8a packet assembly, whose
+  // hot path PR #406 deleted, and the turn's real carga de contexto has
+  // measured itself since #525 through `maia_turn_context_load_duration_ms` +
+  // `maia_turn_context_db_queries` (`src/agent/turn-context/metrics.ts`).
+  // Keeping both would have been two families for ONE operation, so the orphan
+  // pair was retired rather than repointed. The span `context.load` survives —
+  // a span is a position in the waterfall, not a duplicate series.
   /**
    * pg pool saturation, `state` ∈ total|idle|waiting|max (issue #535 §2).
    * `waiting` climbing while `idle` is 0 IS the saturation incident.
@@ -573,6 +610,41 @@ export const ENUM_VALUES = Object.freeze({
   origin: ['ingress', 'queue', 'recovery', 'replay', 'probe', 'internal'] as const,
   required: ['true', 'false'] as const,
 });
+
+/**
+ * The CLOSED set of `stage` values carried by the span `context.load`
+ * (issue #535 gate 6; reshaped by the review of PR #554).
+ *
+ * `stage` is a shared attribute key (`maia_turn_stage_duration_ms` uses it as a
+ * metric LABEL too), so it cannot live in `ENUM_VALUES`, which is global per
+ * key. This is the per-span vocabulary, and it exists so the closure is
+ * assertable instead of argued: `LABEL_CARDINALITY_BUDGET.stage` is 60, and the
+ * moment a call site derives one from input (a config name, a tenant, a slice
+ * name coming from the wire) that budget stops bounding anything real. The
+ * wrapper takes `ContextLoadStage`, not `string`, so the closure is a compiler
+ * rule and not a review convention — that typing was a Medium finding in the
+ * review of PR #554 and must not regress.
+ *
+ * `turn_context` — the turn's carga de contexto, `loadTurnContext` in
+ * `src/agent/turn-context/loader.ts`. It is the only member, and the name is
+ * deliberately the one the reused metric family already uses
+ * (`maia_turn_context_*`), so an operator moving from the histogram to the
+ * waterfall does not need a translation table.
+ *
+ * `packet` was the previous single member and is gone with the P8a
+ * instrumentation: `buildContextPacket` has no caller in production, and a
+ * vocabulary entry no path can emit is the "declared reads as covered" defect
+ * issue #535 opens with.
+ */
+export const CONTEXT_LOAD_STAGE = Object.freeze({
+  TURN_CONTEXT: 'turn_context',
+} as const);
+
+export type ContextLoadStage =
+  (typeof CONTEXT_LOAD_STAGE)[keyof typeof CONTEXT_LOAD_STAGE];
+
+export const CONTEXT_LOAD_STAGE_VALUES: readonly ContextLoadStage[] =
+  Object.freeze(Object.values(CONTEXT_LOAD_STAGE));
 
 // ---------------------------------------------------------------------------
 // 3.1 Onboarding saga — vocabulários FECHADOS (issue #519, review do PR #541)

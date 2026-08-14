@@ -126,6 +126,19 @@ appears. In production the same number is published on
 `maia_turn_context_db_queries{phase="loader"}` by the counter frame in
 `buildPrompt` (`src/db/query-counter.ts`).
 
+**The `context.load` span.** `loadTurnContext` is wrapped by
+`instrumentContextLoad` (`src/observability/instrumentation.ts`,
+`stage="turn_context"`) at the EXPORTED entry point, delegating to
+`loadTurnContextInner` — so "one span per turn-context load" is structural and
+no second call site can be forgotten. The wrapper emits the span and NOTHING
+else: duration and round-trips for the same load are already
+`maia_turn_context_load_duration_ms` / `maia_turn_context_db_queries` above, and
+the review of PR #554 retired the parallel `maia_context_load_*` family rather
+than measure one operation twice. The span sits one level below `buildPrompt`
+on purpose: a span around `buildPrompt` would also cover the render and would
+contain `prompt.render`, which `SPAN_PARENT` declares a SIBLING of
+`context.load` under `turn`.
+
 **What #525 removed, and why it was removable.** Both cuts are duplication, not
 behaviour:
 

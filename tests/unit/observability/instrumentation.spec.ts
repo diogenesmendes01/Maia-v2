@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /**
  * Issue #535 §2 — tool dispatch and context load.
@@ -13,6 +15,10 @@ import {
   instrumentContextLoad,
   instrumentToolDispatch,
 } from '../../../src/observability/instrumentation.js';
+import {
+  CONTEXT_LOAD_STAGE,
+  CONTEXT_LOAD_STAGE_VALUES,
+} from '../../../src/observability/taxonomy.js';
 import { _resetForTests, renderPrometheus } from '../../../src/lib/metrics.js';
 import { _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 
@@ -142,18 +148,71 @@ describe('issue #535 — instrumentToolDispatch', () => {
   });
 });
 
-describe('issue #535 — instrumentContextLoad', () => {
-  it('emits duration and a slice counter on success', async () => {
-    await instrumentContextLoad('working_memory', async () => 'slice');
+/**
+ * Review da PR #554 — `instrumentContextLoad` emite SPAN e mais nada.
+ *
+ * Os dois casos que viviam aqui asseriam `maia_context_load_ms` e
+ * `maia_context_slices_total`. As duas famílias foram aposentadas: a operação
+ * embrulhada é `loadTurnContext`, que já publica duração e round-trips por
+ * `recordTurnContextLoad` (`maia_turn_context_*`, #525). Duas famílias para uma
+ * operação é a divergência que a taxonomia existe para impedir.
+ *
+ * O que sobrou tem que ser assertado pelo NEGATIVO — "nenhuma métrica nova" é
+ * uma decisão de contrato, e contrato sem teste volta na primeira refatoração
+ * que "aproveita que já estamos medindo aqui".
+ *
+ * A prova de que o span sai no caminho de produção NÃO está aqui: está em
+ * `tests/integration/context-load-span-hot-path.spec.ts`, que entra pelo
+ * `runAgentForMensagem`. Um spec que chama o wrapper direto passa com o call
+ * site de produção apagado — foi exatamente esse buraco que a review pegou.
+ */
+describe('review da PR #554 — instrumentContextLoad é span-only', () => {
+  it('não emite NENHUMA métrica — nem a família aposentada, nem outra', async () => {
+    await instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => 'snapshot');
     const metrics = await renderPrometheus();
-    expect(metrics).toMatch(/maia_context_load_ms_count\{.*stage="working_memory".*status="ok"/);
-    expect(metrics).toMatch(/maia_context_slices_total\{.*stage="working_memory".*status="ok"/);
+    expect(metrics).not.toContain('maia_context_load_ms');
+    expect(metrics).not.toContain('maia_context_slices_total');
+    // E nada foi só renomeado: o registry inteiro fica sem qualquer série
+    // carregando o `stage` desta carga.
+    expect(metrics).not.toContain('stage="turn_context"');
   });
 
-  it('marks a failed slice and rethrows', async () => {
+  it('propaga o valor e relança o erro sem tocar em nenhuma série', async () => {
+    expect(await instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => 42)).toBe(42);
+    const boom = new Error('x');
     await expect(
-      instrumentContextLoad('episodic', async () => Promise.reject(new Error('x'))),
-    ).rejects.toThrow('x');
-    expect(await renderPrometheus()).toMatch(/maia_context_slices_total\{.*status="error"/);
+      instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => Promise.reject(boom)),
+      // Mesma INSTÂNCIA: o caminho fail-closed do turno ramifica no erro.
+    ).rejects.toBe(boom);
+    expect(await renderPrometheus()).not.toContain('maia_context');
+  });
+
+  /**
+   * O `stage` TIPADO foi achado Medium da review da PR #554 e não pode
+   * regredir para `stage: string`. Não dá para pinar isso com `@ts-expect-error`
+   * num spec: `tsconfig.json` exclui `tests/`, então `npm run typecheck` nunca
+   * olharia para o arquivo e a guarda seria decorativa.
+   *
+   * Então a guarda lê a ASSINATURA no fonte — mesmo padrão de
+   * `tests/unit/config/no-direct-env-reads.spec.ts`, que confere no texto uma
+   * regra que o compilador sozinho não cobra. Afrouxar o parâmetro devolveria a
+   * fechadura do vocabulário ao regime de "ninguém erra", que não é controle.
+   */
+  it('mantém o parâmetro `stage` TIPADO — `string` reabriria o vocabulário', () => {
+    const src = readFileSync(
+      resolve(__dirname, '../../../src/observability/instrumentation.ts'),
+      'utf8',
+    );
+    const signature = /export async function instrumentContextLoad<T>\(\s*stage:\s*([A-Za-z]+)/.exec(
+      src,
+    );
+    expect(signature, 'assinatura de instrumentContextLoad não encontrada').not.toBeNull();
+    expect(signature![1]).toBe('ContextLoadStage');
+  });
+
+  it('o vocabulário fechado tem exatamente o stage da carga do turno', () => {
+    // Um membro sem emissor é a falha "declarado lê como coberto" que a #535
+    // abre. `packet` saiu junto com a instrumentação da montagem P8a.
+    expect([...CONTEXT_LOAD_STAGE_VALUES]).toEqual([CONTEXT_LOAD_STAGE.TURN_CONTEXT]);
   });
 });

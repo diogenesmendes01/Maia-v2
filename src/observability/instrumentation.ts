@@ -1,24 +1,32 @@
 /**
  * Issue #535 §2 — reusable instrumentation wrappers.
  *
- * Two of the five missing metric families are per-call, not scrape-time, so
- * they need a wrapper at the call site rather than a gauge: tool dispatch and
- * turn-context load. Both live here rather than at the call site itself so the
- * privacy decisions (which labels, which attributes) are reviewed in ONE file
- * next to the taxonomy, and so the foreign edit each needs is a single line.
+ * Two hot-path operations need a wrapper at the call site rather than a
+ * scrape-time gauge: tool dispatch and turn-context load. Both live here rather
+ * than at the call site itself so the privacy decisions (which labels, which
+ * attributes) are reviewed in ONE file next to the taxonomy, and so the foreign
+ * edit each needs is a single line.
  *
- * Each wrapper emits three things from one measurement:
- *   - a counter with a bounded outcome label — the rate/error SLI;
- *   - a duration histogram — the latency SLI;
- *   - an OTLP span — the waterfall position, so "the turn was slow" resolves to
- *     "the turn was slow HERE" without a second deploy.
+ * They emit DIFFERENT things, and the asymmetry is the contract, not an
+ * oversight:
+ *   - `instrumentToolDispatch` owns its measurement end to end — a counter with
+ *     a bounded outcome label (the rate/error SLI), a duration histogram (the
+ *     latency SLI) and an OTLP span (the waterfall position);
+ *   - `instrumentContextLoad` emits ONLY the span. The operation it wraps
+ *     already publishes duration and round-trips through
+ *     `src/agent/turn-context/metrics.ts` (`maia_turn_context_*`, issue #525),
+ *     and a second family over the same window is drift with extra steps. See
+ *     the wrapper's own comment.
+ *
+ * The span is what neither surface can replace: "the turn was slow" resolves to
+ * "the turn was slow HERE" without a second deploy.
  *
  * The wrappers are transparent: the wrapped function's value is returned and
  * its error rethrown unchanged. Observability is never a control-flow
  * participant.
  */
 import { counter, histogram } from './metrics.js';
-import { METRIC, SPAN } from './taxonomy.js';
+import { METRIC, SPAN, type ContextLoadStage } from './taxonomy.js';
 import { withSpan } from './tracer.js';
 import type { SpanAttributes } from './span-attributes.js';
 import {
@@ -126,25 +134,41 @@ export async function instrumentToolDispatch<T>(
 }
 
 /**
- * Measure one turn-context load.
+ * Open the span `context.load` around one turn-context load.
  *
- * `stage` names the slice being assembled (`working_memory`, `episodic`,
- * `profile`, …) or `packet` for the whole assembly. Bounded by the slice
- * registry, budgeted at 60 distinct values.
+ * ## Span ONLY — deliberately no metric family
+ *
+ * This wrapper used to emit `maia_context_load_ms` + `maia_context_slices_total`
+ * alongside the span, and the review of PR #554 retired both. The operation it
+ * wraps is `loadTurnContext`, which issue #525 already measures:
+ * `recordTurnContextLoad` (`src/agent/turn-context/metrics.ts`) publishes
+ * `maia_turn_context_load_duration_ms{phase,result}` and
+ * `maia_turn_context_db_queries{phase}` for the same work. Emitting a second
+ * duration family over the same window would give an operator two numbers for
+ * one question, which is worse than having one — they drift, and the alert and
+ * the dashboard end up disagreeing about whether context load is slow.
+ *
+ * The span is not a duplicate of either: a histogram says HOW LONG, a span says
+ * WHERE in the turn, and only the span puts the load next to the queue wait and
+ * the LLM call in the same waterfall. That is the whole reason #535 asks for
+ * spans on top of the metrics it already has.
+ *
+ * Failure is therefore recorded as the span's `status`, not as a `status`
+ * LABEL — `withSpan` marks the span `error` and rethrows unchanged. The
+ * failure RATE of the same operation is `maia_turn_context_load_duration_ms`'s
+ * `result` label, published by the caller.
+ *
+ * ## `stage` is typed, not a string
+ *
+ * `ContextLoadStage`, not `string`: the review of PR #554 caught that calling
+ * the set "closed" while the emitting surface accepted any string made the
+ * closure a review convention instead of a contract. Cardinality control that
+ * depends on nobody making a mistake is not control. Adding a member is a
+ * deliberate edit to `CONTEXT_LOAD_STAGE` in the taxonomy.
  */
 export async function instrumentContextLoad<T>(
-  stage: string,
+  stage: ContextLoadStage,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const t0 = Date.now();
-  let status: 'ok' | 'error' = 'ok';
-  try {
-    return await withSpan(SPAN.CONTEXT_LOAD, fn, { attributes: { stage } });
-  } catch (err) {
-    status = 'error';
-    throw err;
-  } finally {
-    histogram(METRIC.CONTEXT_LOAD_MS, Date.now() - t0, { stage, status });
-    counter(METRIC.CONTEXT_SLICES, { stage, status });
-  }
+  return withSpan(SPAN.CONTEXT_LOAD, fn, { attributes: { stage } });
 }

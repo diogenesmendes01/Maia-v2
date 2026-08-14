@@ -303,11 +303,17 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
     // The regression this guards: instrumentation that accidentally carries a
     // per-turn dimension (an attempt ordinal, a job id) mints one series per
     // turn and the registry grows without limit.
+    //
+    // `maia_context_load_ms` / `maia_context_slices_total` estavam neste laço
+    // e foram aposentadas na review da PR #554 (a carga de contexto do turno já
+    // se mede por `maia_turn_context_*`). Trocadas por outras duas famílias da
+    // mesma entrega para preservar a aritmética abaixo — o que este caso mede é
+    // cardinalidade por turno, não estas famílias em particular.
     for (let i = 0; i < 500; i++) {
       counter(METRIC.TOOL_DISPATCH, { tool: 'listar_lancamentos', result: 'ok' });
       histogram(METRIC.TOOL_DURATION_MS, i, { tool: 'listar_lancamentos', result: 'ok' });
-      histogram(METRIC.CONTEXT_LOAD_MS, i, { stage: 'working_memory', status: 'ok' });
-      counter(METRIC.CONTEXT_SLICES, { stage: 'working_memory', status: 'ok' });
+      histogram(METRIC.STAGE_DURATION_MS, i, { stage: 'runtime_trace_envelope' });
+      counter(METRIC.TURN_COMPLETED, { outcome: 'completed' });
     }
     const lines = (await renderPrometheus()).split('\n').filter(Boolean).length;
     // 2 counters + 2 histograms (9 bucket lines + sum + count each) = 24.

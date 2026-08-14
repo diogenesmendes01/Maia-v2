@@ -125,7 +125,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         { "expr": "maia:queue_wait_ms:p95", "legendFormat": "fila p95 — {{queue}}" },
-        { "expr": "maia:context_load_ms:p95", "legendFormat": "contexto p95 — {{stage}}" },
+        { "expr": "maia:turn_context_load_ms:p95", "legendFormat": "contexto p95 — {{phase}}" },
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(maia_llm_latency_ms_bucket[5m])))",
           "legendFormat": "LLM p95"

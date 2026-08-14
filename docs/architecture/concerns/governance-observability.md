@@ -232,8 +232,18 @@ the id makes every process reach the same verdict with nothing to propagate.
 
 The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
 `emitted` or `declared`, and `tests/unit/observability/tracer.spec.ts` fails if
-the two drift. Today `turn`, `queue.wait` and `tool.dispatch` are emitted; the
-other 20 are declared.
+the two drift. Today `turn`, `queue.wait`, `tool.dispatch` and `context.load`
+are emitted; the other 19 are declared.
+
+`emitted` means **production reaches this span** — not "an instrumentation site
+exists in the tree". The review of PR #554 settled that reading and it is the
+strict one on purpose: this table is read as a coverage answer, and a span no
+turn can open produces nothing. `context.load` is the case that forced the
+distinction; it is emitted by `loadTurnContext`
+(`src/agent/turn-context/loader.ts`) on the turn's own path, and
+`tests/integration/context-load-span-hot-path.spec.ts` drives the real entry
+point (`runAgentForMensagem`) to prove it rather than asserting the table
+against itself.
 
 #### Span attribution is RESOLVED, not read at close
 
@@ -378,14 +388,30 @@ Issue #514 landed the foundation; issue #535 landed the exporter, four of the
 five missing metric families and the dashboards. Still open — do **not** assume
 coverage that does not exist:
 
-- **Span emission is partial.** `turn`, `queue.wait` and `tool.dispatch` have
-  emitters; the other 20 taxonomy entries are marked `declared` in
-  `SPAN_EMISSION` and produce nothing. The marking is test-enforced, so this
-  list cannot silently go stale.
-- **`context.load` is not emitted on the hot path.** `instrumentContextLoad`
-  exists and is tested, but the turn's context assembly lives in
-  `src/agent/prompt-builder.ts`, which #535 did not touch. `maia_context_load_ms`
-  therefore has no production series yet — one wrap away.
+- **Span emission is partial.** `turn`, `queue.wait`, `tool.dispatch` and
+  `context.load` have emitters production reaches; the other 19 taxonomy
+  entries are marked `declared` in `SPAN_EMISSION` and produce nothing. The
+  marking is test-enforced, so this list cannot silently go stale.
+- **`context.load` carries no metric family of its own — by decision.** The
+  span is emitted by `loadTurnContext` (`src/agent/turn-context/loader.ts`),
+  wrapped at the exported entry point so "once per turn-context load" is
+  structural. Duration and round-trips for that same load are published by
+  `recordTurnContextLoad` — `maia_turn_context_load_duration_ms{phase,result}`
+  and `maia_turn_context_db_queries{phase}` (issue #525). The review of PR #554
+  retired `maia_context_load_ms` and `maia_context_slices_total` rather than
+  keeping two families for one operation: they had been declared for the P8a
+  assembly (`buildContextPacket`), whose hot path PR #406 deleted, so they were
+  dashboarded and alerted on while producing zero series.
+
+  The recording rule followed the emitter: `maia:context_load_ms:p95` became
+  `maia:turn_context_load_ms:p95` over
+  `maia_turn_context_load_duration_ms_bucket`, and panel 7 of
+  `monitoring/dashboards/maia-turn-slo.json` reads it by `phase`.
+- **`CONTEXT_LOAD_STAGE` is a closed set of one: `turn_context`.** The wrapper's
+  parameter is typed `ContextLoadStage`, not `string`, so the closure is a
+  compiler rule and not a review convention. Adding a member is a deliberate
+  edit in `taxonomy.ts` — which is the friction that keeps a shared label key
+  bounded.
 - **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
   pending the canary rollout in `docs/runbooks/observability-slo.md`.
 - **Not yet instrumented**: outbound send duration (`maia_outbound_send_ms`),
@@ -449,6 +475,6 @@ Verify with `gh pr list --state open --search "audit OR governance OR trace OR i
 
 | | |
 |---|---|
-| Last verified | 2026-08-04 |
-| Against `main` HEAD | `7b34e7e` + issue #535 |
+| Last verified | 2026-08-14 |
+| Against `main` HEAD | `356dc2e4` + issue #535 gate 6 (review da PR #554) |
 | Re-verify when | Older than 30 days; OR `audit-actions.ts` adds a variant; OR `metrics.ts` changes counter labels; OR `runtime-trace/` changes envelope/body split; OR `policy-dsl/` adds an operator |

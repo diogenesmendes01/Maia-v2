@@ -272,13 +272,22 @@ describe('issue #535 — tracer', () => {
       }
     });
 
-    it('the emitted set is exactly what the codebase instruments', () => {
-      // Update BOTH sides together. Adding a name to SPAN_EMISSION without an
-      // emitter is precisely the "declared reads as covered" failure #535
-      // opens with; shipping an emitter without flipping the flag understates
-      // coverage in the runbook.
+    it('the emitted set is exactly what production reaches', () => {
+      // Update BOTH sides together. Adding a name to SPAN_EMISSION that no
+      // production path reaches is precisely the "declared reads as covered"
+      // failure #535 opens with; shipping a reachable emitter without flipping
+      // the flag understates coverage in the runbook.
+      //
+      // "Reaches", not "instruments" — do not weaken this back. `context.load`
+      // is here because the wrapper moved to `loadTurnContext`
+      // (`src/agent/turn-context/loader.ts`), which `buildPrompt` calls on
+      // every turn; it was ABSENT under the same definition while the site sat
+      // on `buildContextPacket`, whose hot path PR #406 deleted. The proof that
+      // a real turn opens it is `tests/integration/context-load-span-hot-path.spec.ts`,
+      // which enters through `runAgentForMensagem` — this list is the
+      // bookkeeping, that spec is the evidence.
       expect([...EMITTED_SPANS].sort()).toEqual(
-        [SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
+        [SPAN.CONTEXT_LOAD, SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
       );
     });
 
