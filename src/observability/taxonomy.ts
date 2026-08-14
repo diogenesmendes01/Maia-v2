@@ -251,9 +251,24 @@ export const METRIC = {
   LLM_CIRCUIT_WOULD_REJECT: 'maia_llm_circuit_would_reject_total',
   /**
    * Kill-switch usage. `state` is the posture that was forced, `reason` ∈
-   * applied|expired|cleared|rejected|adopted. A lever that can be pulled
-   * without a deploy MUST leave a trace that alerting can see; the matching
-   * `llm_gateway.circuit_mode_override` log line carries actor and reason.
+   * applied|expired|cleared|rejected|adopted|resynced|resync_failed. A lever
+   * that can be pulled without a deploy MUST leave a trace that alerting can
+   * see; the matching `llm_gateway.circuit_mode_override` log line carries
+   * actor and reason.
+   *
+   * The last two are the RECONNECT resync (issue #534 gate 4), one event per
+   * attempt including the no-op: Redis pub/sub is at-most-once with no replay,
+   * so a replica whose socket dropped during the incident must re-read the
+   * durable key to converge. `resynced` = the re-read completed and this
+   * replica's state IS the Redis state; `resync_failed` = it could not be
+   * asserted, and `state` is the posture that was PRESERVED, which may now
+   * diverge from the fleet. Fail-closed covers every way of not knowing: read
+   * error, unreadable key, a key that was read and REJECTED by governance, and
+   * a re-subscribe with no ack (no ack ⇒ the read is not even attempted, since
+   * treating an absent key as authoritative there would clear a live
+   * override). The cause stays distinguishable in the log's `outcome` field.
+   * Sustained `resync_failed` is the alert that says the kill switch cannot be
+   * trusted to reach everyone.
    */
   LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 

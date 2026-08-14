@@ -237,12 +237,13 @@ O hot path continua **sem tocar em Redis**: o que anda por pub/sub é
 notificação, não consulta. É a mesma razão pela qual o estado do disjuntor não
 mora em Redis.
 
-#### Duas propriedades distribuídas que a chave durável precisa ter (revisão da #541)
+#### Propriedades distribuídas que a chave durável precisa ter (revisão da #541, gate 4 da #534)
 
-Um kill switch com chave durável tem dois modos de falhar que não aparecem em
-teste com Redis mockado — um mock não tem TTL de servidor nem ordem de comandos.
-Os dois estão travados por `tests/integration/llm-circuit-kill-switch-redis.spec.ts`,
-contra Redis real.
+Um kill switch com chave durável tem modos de falhar que não aparecem em teste
+com Redis mockado — um mock não tem TTL de servidor, nem ordem de comandos, nem
+socket que morre. Estão travados por
+`tests/integration/llm-circuit-kill-switch-redis.spec.ts` e
+`tests/integration/llm-circuit-reconnect-resync.spec.ts`, contra Redis real.
 
 **1. A validade é normalizada para ABSOLUTA antes de gravar, e a chave SEMPRE
 leva `PX`.** `publishCircuitOverride` (`src/lib/llm/cache-invalidation.ts:128`)
@@ -276,11 +277,52 @@ o Redis single-threaded fecha o argumento: ou ele processa o `SET` antes do
 `GET` (a chave é encontrada), ou processa o `GET` primeiro e então o `PUBLISH`
 — que vem depois do `SET`, sempre — é entregue à inscrição já ativa. Não há
 terceiro caso, por isso basta um `GET`. Continua best-effort: se o `SUBSCRIBE`
-falhar a adoção ainda roda, sem ordenação garantida; e pub/sub é at-most-once,
-então uma queda de socket depois do ack perde a notificação — a chave cobre quem
-**sobe** no meio do incidente, não quem **reconecta** nele.
+falhar a adoção ainda roda, sem ordenação garantida.
 `llmSettingsSubscriberReady()` é o ponto em que a convergência pode ser afirmada
 em vez de presumida.
+
+**3. Quem RECONECTA relê o estado autoritativo (gate 4 da #534).** Pub/sub é
+at-most-once e não tem replay: o ioredis restaura as inscrições sozinho, mas a
+mensagem publicada durante a queda do socket está perdida — um operador virava o
+kill switch às 3h e a réplica desconectada naquele instante seguia na postura
+antiga até o TTL do arrendamento. `resyncAuthoritativeState`
+(`src/lib/llm/cache-invalidation.ts`) é encadeada no `ready` do ioredis a partir
+da SEGUNDA vez (a primeira é o boot, que já tem a adoção): re-inscreve e espera o
+ack — recuperando o mesmo argumento de ordenação acima —, solta o cache de
+settings (esse canal não tem chave; o autoritativo é o Postgres, então soltar o
+cache local É a releitura dele) e relê a chave do override. Chave presente ⇒
+adota o arrendamento **restante**; chave ausente ⇒ **limpa** o override local, que
+é o caso do `clear` perdido durante a queda. É a releitura que fecha a lacuna: o
+`subscribe` sozinho só garante o futuro.
+
+*Ordem e idempotência*: o `GET` viaja na conexão compartilhada e as mensagens na
+do subscriber, então a resposta do `GET` pode chegar ao processo depois de uma
+mensagem mais nova. `overrideGeneration()` (`src/lib/llm/circuit-mode.ts`) é
+capturada antes do `GET` e a releitura CEDE se ela mudou — o estado final é o do
+Redis, não o da corrida.
+
+*Fail-closed*: leitura que falha, chave ilegível, chave **recusada** pela
+governança (sem `expires_at` absoluto, sem ator, vencida, acima do teto) e
+re-inscrição **sem ack** — nenhuma delas vira "não há override". Em todas o
+estado local é preservado e sai
+`maia_llm_circuit_mode_overrides_total{reason="resync_failed"}` + log de ERRO
+`llm_gateway.circuit_override_resync_failed`, com a causa no campo `outcome` e,
+quando houve recusa, a ação `_rejected` com `source='resynced'` na trilha
+durável (revisão do dono da #552). O ponto é que a série de CONVERGÊNCIA não
+pode dizer "consistente com o Redis" quando a réplica recusou o estado
+autoritativo ou leu sem inscrição ativa — seria evidência verde falsa
+justamente no gate que libera o `enforce`. Sem ack, aliás, nem se lê: tratar
+ausência de chave como autoritativa nesse estado limparia um override vivo com
+base numa leitura indefensável.
+
+O caso bom sai como `{reason="resynced"}`, um evento por releitura inclusive no
+no-op — sem isso, "esta réplica ressincronizou?" só teria o silêncio como
+resposta. `superseded` fica nesse balde de propósito: a releitura perdeu para
+uma mensagem do canal, que é sempre pelo menos tão nova, e o estado final é o do
+Redis.
+`llmSettingsSubscriberResyncCount()` é o mesmo dado para diagnóstico e teste.
+Provas em `tests/integration/llm-circuit-reconnect-resync.spec.ts` (socket morto
+de verdade) e `tests/unit/lib/llm-circuit-resync.spec.ts`.
 
 **A tensão com a #534, registrada e não escondida.** A #534 argumentou por
 escrito que política de degradação é código versionado, não toggle que alguém
@@ -292,7 +334,7 @@ deixar rastro" — foi resolvida, não ignorada:
 1. **Override anônimo é RECUSADO.** `actor` e `reason` são obrigatórios e
    não-vazios. Não existe caminho para virar a chave sem se identificar.
 2. **Todo uso vira contador e log**: `maia_llm_circuit_mode_overrides_total{state,reason}`
-   (`reason` ∈ `applied|expired|cleared|rejected|adopted`) e
+   (`reason` ∈ `applied|expired|cleared|rejected|adopted|resynced|resync_failed`) e
    `llm_gateway.circuit_mode_override` com ator, motivo e validade. Ator e
    motivo são texto livre: vivem no log, nunca em label.
 3. **A postura efetiva é uma série**: `maia_llm_circuit_mode{state}`, par de

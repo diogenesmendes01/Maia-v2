@@ -56,17 +56,27 @@ import { config } from '@/config/env.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
+import { counter, METRIC } from '@/observability/metrics.js';
 import {
   LLM_CIRCUIT_OVERRIDE_CHANNEL,
   LLM_CIRCUIT_OVERRIDE_KEY,
   applyCircuitOverride,
+  currentOverride,
+  effectiveMode,
   handleCircuitOverrideMessage,
+  overrideGeneration,
   resolveOverrideExpiry,
 } from './circuit-mode.js';
 import type { CircuitOverrideMessage } from './circuit-mode.js';
 import { invalidateModelCache } from './model-resolver.js';
 
 export const LLM_SETTINGS_INVALIDATION_CHANNEL = 'maia:llm:settings:invalidate';
+
+/** Os dois canais deste subscriber, numa lista só: quem inscreve e quem RE-inscreve. */
+const SUBSCRIBED_CHANNELS = [
+  LLM_SETTINGS_INVALIDATION_CHANNEL,
+  LLM_CIRCUIT_OVERRIDE_CHANNEL,
+] as const;
 
 let subscriberStarted = false;
 let subscriber: IORedis | null = null;
@@ -181,6 +191,232 @@ async function adoptPersistedOverride(): Promise<void> {
 }
 
 /**
+ * Ator sintético das mudanças de postura que a RELEITURA causa.
+ *
+ * `actor` e `reason` são obrigatórios (`applyCircuitOverride`) porque um kill
+ * switch anônimo não é auditável. Numa releitura não existe humano: o que
+ * mudou a postura foi a convergência com o Redis. Mentir um nome de pessoa
+ * seria pior que isto — o par abaixo é honesto, greppável e diz na trilha
+ * exatamente por que a postura mudou sem ninguém ter digitado nada.
+ */
+const RESYNC_ACTOR = 'system:llm_circuit_resync';
+
+/** Quantas releituras de reconexão já TERMINARAM neste processo (sucesso ou não). */
+let resyncCount = 0;
+/** Serializa releituras: um socket instável pode emitir vários `ready` seguidos. */
+let resyncChain: Promise<void> = Promise.resolve();
+
+/**
+ * Relê o estado AUTORITATIVO do Redis depois de uma reconexão do subscriber —
+ * o gate 4 da #534.
+ *
+ * ## A lacuna que isto fecha
+ *
+ * Pub/sub do Redis é at-most-once e não tem replay. O ioredis reconecta o
+ * socket sozinho e restaura as inscrições, mas tudo que foi publicado enquanto
+ * ele estava fora se perdeu PARA SEMPRE. O cenário concreto: o plantão vira o
+ * kill switch às 3h; uma réplica com o socket caído naquele instante não recebe
+ * o `PUBLISH` e continua recusando tráfego até o TTL natural do arrendamento —
+ * a alavanca de incidente falha exatamente no cenário para o qual ela existe.
+ * `adoptPersistedOverride` cobria quem SOBE no meio do incidente; isto cobre
+ * quem RECONECTA nele.
+ *
+ * É a RELEITURA que fecha a lacuna, não a re-inscrição: o `subscribe` sozinho
+ * só garante as mensagens FUTURAS, e a mensagem perdida é passada.
+ *
+ * ## O que é relido, canal por canal
+ *
+ *  - **Override do disjuntor** — tem chave durável (`LLM_CIRCUIT_OVERRIDE_KEY`),
+ *    então a releitura é literal: `GET` + reaplicação. Chave presente ⇒ adota o
+ *    que sobrou do arrendamento (o payload carrega `expires_at` ABSOLUTO, então
+ *    não há como reiniciar a contagem). Chave ausente ⇒ o override local é
+ *    stale e cai: pode ter havido um `clear` durante a queda, e é justamente
+ *    esse o caso em que a réplica ficaria recusando tráfego depois de o plantão
+ *    ter desligado o disjuntor.
+ *  - **Cache de settings de modelo** — não tem chave no Redis; o estado
+ *    autoritativo é o Postgres e o canal só carrega "solte o cache". A
+ *    releitura equivalente é soltar o cache local, que força a próxima
+ *    resolução a ir ao banco. Barato e na direção segura.
+ *
+ * ## Fail-closed
+ *
+ * Se o `GET` FALHAR, esta réplica NÃO conclui "não há override": o estado local
+ * é preservado (um override em vigor continua em vigor) e o evento sai contado
+ * em `reason="resync_failed"` + log de ERRO. Concluir "não há override" a partir
+ * de um Redis que não respondeu seria inventar um desligamento do kill switch
+ * durante uma falha de Redis — a direção exatamente errada. Chave ilegível
+ * (JSON corrompido) segue a mesma regra: não dá para concluir nada dela.
+ */
+async function resyncAuthoritativeState(sub: IORedis): Promise<void> {
+  let subscribed = true;
+  try {
+    // Re-inscrever de propósito, mesmo com `autoResubscribe` do ioredis ligado:
+    // o `await` no ack é o que dá o MESMO argumento de ordenação do boot (Redis
+    // é single-threaded, então um `GET` posterior ao ack não pode perder um
+    // `PUBLISH` que venha depois do `SET`). Re-inscrição num canal já inscrito é
+    // idempotente no Redis.
+    await sub.subscribe(...SUBSCRIBED_CHANNELS);
+  } catch (err) {
+    subscribed = false;
+    logger.warn(
+      { err: (err as Error).message, channels: SUBSCRIBED_CHANNELS },
+      'llm_gateway.settings_resubscribe_failed',
+    );
+  }
+
+  // Settings: o autoritativo é o Postgres, então soltar o cache local É a
+  // releitura. Continua fail-SOFT mesmo sem ack — soltar cache não depende de
+  // ordenação nenhuma e erra sempre para o lado de reler do banco.
+  invalidateModelCache();
+
+  if (!subscribed) {
+    /**
+     * Sem o ack, o argumento de ordenação que sustenta esta releitura NÃO
+     * existe (revisão do dono da #552).
+     *
+     * Ele é o do boot: com a inscrição confirmada, ou o Redis processa o `SET`
+     * antes do nosso `GET` (a chave é encontrada), ou processa o `GET` antes e
+     * então o `PUBLISH` — que vem sempre depois do `SET` — é entregue à
+     * inscrição já ativa. Sem inscrição ativa some o segundo braço: um
+     * `SET` + `PUBLISH` logo depois do `GET` não chega por canal NEM aparece na
+     * leitura, e a réplica ficaria com o estado errado achando que convergiu.
+     *
+     * O caso mais perigoso é tratar AUSÊNCIA de chave como autoritativa nesse
+     * estado: limparíamos um override vivo com base numa leitura que não pode
+     * ser defendida. Então nem se lê: o estado local é PRESERVADO e o desfecho
+     * é falha de resync, que é o que acorda alguém.
+     */
+    finishResync('failed', {
+      error: 'sem ack de re-inscrição: ordenação GET × PUBLISH não garantida, leitura não realizada',
+    });
+    return;
+  }
+
+  // A geração é capturada ANTES do `GET`: se uma mensagem do canal for aplicada
+  // enquanto a resposta está em voo, ela é pelo menos tão nova quanto o que o
+  // `GET` leu e a releitura CEDE. Argumento completo em `circuit-mode.ts`,
+  // bloco de `generation`.
+  const generation = overrideGeneration();
+  let raw: string | null;
+  try {
+    raw = await redis.get(LLM_CIRCUIT_OVERRIDE_KEY);
+  } catch (err) {
+    finishResync('failed', { error: (err as Error).message });
+    return;
+  }
+
+  if (overrideGeneration() !== generation) {
+    finishResync('superseded');
+    return;
+  }
+
+  if (raw === null) {
+    // Ausência é resposta AUTORITATIVA (diferente de erro, acima): a chave
+    // expirou ou foi apagada por um `clear` que esta réplica não ouviu.
+    if (currentOverride() === null) {
+      finishResync('noop');
+      return;
+    }
+    applyCircuitOverride(
+      {
+        clear: true,
+        actor: RESYNC_ACTOR,
+        reason: 'chave do override ausente no Redis após reconexão',
+      },
+      Date.now(),
+      'resynced',
+    );
+    finishResync('cleared');
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    finishResync('failed', { error: `chave ilegível: ${(err as Error).message}` });
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    finishResync('failed', { error: 'chave ilegível: payload não é objeto' });
+    return;
+  }
+
+  const result = applyCircuitOverride(parsed as CircuitOverrideMessage, Date.now(), 'resynced');
+  // Recusa (validade vencida, payload sem `expires_at` absoluto, sem ator) já é
+  // contada e auditada como `rejected` por `applyCircuitOverride`, com
+  // `source: 'resynced'` — mas aquela é a série da CONTABILIDADE de override.
+  // Nesta, que é a de CONVERGÊNCIA, recusa não é convergir: a réplica não
+  // aplicou o estado autoritativo, preservou o dela e pode estar divergente da
+  // frota. Ver `DIVERGENT_OUTCOMES`.
+  finishResync(result.applied ? 'applied' : 'rejected', { error: result.error });
+}
+
+type ResyncOutcome = 'applied' | 'cleared' | 'noop' | 'superseded' | 'rejected' | 'failed';
+
+/**
+ * Desfechos em que a réplica NÃO pode afirmar que está consistente com o Redis
+ * (revisão do dono da #552).
+ *
+ *  - `failed`   — não houve leitura defensável: `GET` falhou, chave ilegível,
+ *    ou re-inscrição sem ack.
+ *  - `rejected` — houve leitura, e o payload PRESENTE foi recusado (sem
+ *    `expires_at` absoluto, sem ator, vencido, acima do teto). A réplica
+ *    preservou o estado dela e seguiu com uma postura que o Redis não confirma.
+ *
+ * Os dois pintam a mesma pergunta operacional — "esta réplica pode estar
+ * divergente da frota?" — e por isso compartilham `reason="resync_failed"`. A
+ * CAUSA continua distinguível: `outcome` no log e a ação `_rejected` com
+ * `source='resynced'` na trilha durável.
+ *
+ * `superseded` está deliberadamente FORA: ali a releitura perdeu para uma
+ * mensagem do canal, que é sempre pelo menos tão nova quanto o que o `GET` leu
+ * — o estado final É o do Redis. Somar os dois no mesmo balde apagaria a única
+ * diferença que importa aqui (convergiu × pode estar divergente) e cegaria o
+ * alerta com ruído de corrida normal.
+ */
+const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
+  'failed',
+  'rejected',
+]);
+
+/**
+ * Convergência OBSERVÁVEL: um evento por releitura, sempre, mesmo quando ela
+ * não muda nada — é o que permite responder "esta réplica ressincronizou depois
+ * da queda?" em vez de inferir do silêncio.
+ *
+ * Fica na família que já existe (`maia_llm_circuit_mode_overrides_total`), com
+ * dois valores novos de `reason`: `resynced` (a releitura terminou e o estado
+ * local é o do Redis; `state` é a postura que ficou valendo) e `resync_failed`
+ * (não deu para afirmar isso; `state` é a postura PRESERVADA, que pode estar
+ * divergente da frota). Métrica nova seria uma família a mais respondendo sobre
+ * o mesmo controle.
+ *
+ * `attribute: false` pelo mesmo motivo do resto do módulo: a postura é da
+ * frota, e o `tenant_id` que por acaso estava no ALS não diz nada sobre ela.
+ */
+function finishResync(outcome: ResyncOutcome, detail: { error?: string } = {}): void {
+  resyncCount++;
+  const state = effectiveMode();
+  const divergent = DIVERGENT_OUTCOMES.has(outcome);
+  counter(
+    METRIC.LLM_CIRCUIT_MODE_OVERRIDES,
+    { state, reason: divergent ? 'resync_failed' : 'resynced' },
+    1,
+    { attribute: false },
+  );
+  const record = { outcome, state, key: LLM_CIRCUIT_OVERRIDE_KEY, err: detail.error };
+  if (divergent) {
+    // ERROR, não WARN: uma réplica que não conseguiu reler — ou que recusou o
+    // que leu — pode estar recusando tráfego que o plantão já mandou parar de
+    // recusar, e ninguém a acordou.
+    logger.error(record, 'llm_gateway.circuit_override_resync_failed');
+    return;
+  }
+  logger.warn(record, 'llm_gateway.circuit_override_resynced');
+}
+
+/**
  * Aplica a invalidação local. Exportado separado do wiring de Redis para que o
  * teste possa exercer o handler sem subir um subscriber.
  */
@@ -226,13 +462,16 @@ export function handleLLMSettingsInvalidation(channel: string, payload = ''): vo
  * `PUBLISH`, e o `SUBSCRIBE` confirmado garante entrega de todo `PUBLISH`
  * posterior. Por isso a adoção é um `GET` só, sem double-read.
  *
- * **O que continua best-effort, dito com todas as letras:** (1) se o
- * `SUBSCRIBE` FALHAR, a adoção ainda roda — é melhor que nada — mas sem
- * ordenação garantida, e é o cenário do log
- * `settings_subscribe_failed_natural_ttl_only`; (2) pub/sub do Redis é
- * at-most-once: uma queda de socket entre a confirmação e a mensagem perde a
- * notificação, e a réplica só reconverge no próximo `SET`/`PUBLISH` — a chave
- * durável cobre quem SOBE no meio do incidente, não quem RECONECTA nele.
+ * **O que continua best-effort, dito com todas as letras:** se o `SUBSCRIBE`
+ * FALHAR, a adoção ainda roda — é melhor que nada — mas sem ordenação
+ * garantida, e é o cenário do log
+ * `settings_subscribe_failed_natural_ttl_only`.
+ *
+ * **Quem RECONECTA** é coberto por `resyncAuthoritativeState`, encadeada no
+ * `ready` do ioredis a partir da SEGUNDA vez (gate 4 da #534). Pub/sub é
+ * at-most-once e não tem replay: a mensagem publicada durante a queda do socket
+ * está perdida, e é a RELEITURA da chave durável — não a re-inscrição — que faz
+ * a réplica convergir sem esperar o TTL do arrendamento.
  */
 export function startLLMSettingsInvalidationSubscriber(): void {
   if (subscriberStarted) return;
@@ -255,7 +494,26 @@ export function startLLMSettingsInvalidationSubscriber(): void {
   });
   sub.on('message', (channel, payload) => handleLLMSettingsInvalidation(channel, payload));
 
-  const channels = [LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL];
+  /**
+   * A RECONEXÃO. O ioredis emite `ready` no primeiro connect e de novo a cada
+   * reconexão bem-sucedida; só a segunda em diante é queda-e-volta. O primeiro
+   * `ready` é ignorado porque o boot já tem o seu caminho de convergência (o
+   * `GET` encadeado no ack do `subscribe`, abaixo) — releitura em dobro no boot
+   * só duplicaria eventos de auditoria.
+   *
+   * A flag é do SUBSCRIBER, não do módulo: cada `start` cria uma conexão nova, e
+   * o primeiro `ready` DELA é sempre um boot.
+   */
+  let readySeen = false;
+  sub.on('ready', () => {
+    if (!readySeen) {
+      readySeen = true;
+      return;
+    }
+    resyncChain = resyncChain.then(() => resyncAuthoritativeState(sub));
+  });
+
+  const channels = [...SUBSCRIBED_CHANNELS];
   // A promise do `subscribe` só resolve quando o Redis CONFIRMA a inscrição —
   // é esse ack, e não a chamada, que torna verdadeira a frase "depois do
   // subscribe". O `GET` da adoção é encadeado nele.
@@ -290,6 +548,17 @@ export function startLLMSettingsInvalidationSubscriber(): void {
  */
 export function llmSettingsSubscriberReady(): Promise<void> {
   return subscriberReady;
+}
+
+/**
+ * Quantas releituras de reconexão já TERMINARAM neste processo. Monotônico e
+ * de diagnóstico: é o ponto em que um teste (ou um `/debug`) pode AFIRMAR que a
+ * réplica passou pela convergência, em vez de dormir e torcer. A série
+ * equivalente para alerta é
+ * `maia_llm_circuit_mode_overrides_total{reason="resynced"}`.
+ */
+export function llmSettingsSubscriberResyncCount(): number {
+  return resyncCount;
 }
 
 /**
