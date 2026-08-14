@@ -159,10 +159,15 @@ O diagnóstico é uma subtração:
 - `maia:queue_oldest_job_age_ms:max` alto ⇒ **capacidade**. Não é o LLM; é
   worker insuficiente ou concorrência 1. Ver `src/gateway/queue.ts`.
 - fila baixa e `maia_llm_latency_ms` p95 alto ⇒ **provider**.
-- fila baixa, LLM normal ⇒ contexto/DB. Ver `maia_context_load_ms` e o pool.
-  Atenção: hoje `maia_context_load_ms` só tem `stage="packet"`, emitido pela
-  montagem P8a, que o turno ainda não chama (§11). Sem série ali, o sinal do
-  contexto no turno é o pool (`maia_db_pool`), não esta família.
+- fila baixa, LLM normal ⇒ contexto/DB. Ver `maia:turn_context_load_ms:p95`
+  (sobre `maia_turn_context_load_duration_ms`, emitida por
+  `recordTurnContextLoad` a cada turno) e o pool (`maia_db_pool`). Round-trips
+  por turno saem em `maia_turn_context_db_queries{phase="loader"}` — p95 alto
+  com contagem estável é banco lento; contagem subindo é regressão de N+1.
+  O span `context.load` mostra a mesma carga POSICIONADA na waterfall.
+  A recording rule antiga (`maia:context_load_ms:p95`) foi substituída na
+  review da PR #554: ela lia uma família da montagem P8a, sem emissor desde a
+  PR #406, e painel vazio lê como "sem problema".
 - Debounce ligado? Subtraia a janela antes de concluir qualquer coisa.
 
 ### 4.6 `MaiaQueueOldestJobAgeWarning` / `MaiaQueueOldestJobAgeCritical`
@@ -503,10 +508,13 @@ verificada por teste — a taxonomia não consegue mais superestimar a cobertura
 Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch` e `context.load`. Todo o
 resto está **declarado, não emitido**; o span não vai aparecer no waterfall.
 
-`emitted` afirma que EXISTE site de instrumentação, não que ele roda em todo
-turno: `context.load` é emitido por `buildContextPacket`
-(`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), e o
-hot path do turno ainda não chama essa montagem — ver §11.
+`emitted` significa **produção alcança este span** — não "existe site de
+instrumentação no repositório". A review da PR #554 fixou essa leitura, que é a
+estrita de propósito: esta tabela é lida como resposta de cobertura, e span que
+nenhum turno abre não produz nada. `context.load` é emitido por `loadTurnContext`
+(`src/agent/turn-context/loader.ts`, `stage="turn_context"`), no caminho que o
+turno de fato executa; `tests/integration/context-load-span-hot-path.spec.ts`
+entra por `runAgentForMensagem` para provar isso.
 
 ### 9.5 Privacidade
 
@@ -579,23 +587,21 @@ usa as recording rules deste arquivo, então painel e alerta nunca discordam.
 
 Não presuma cobertura que não existe:
 
-- **spans operacionais parciais** — só `turn`, `queue.wait` e `tool.dispatch`
-  têm emissor. As outras 20 entradas da taxonomia estão marcadas `declared`;
-- **`context.load` tem call site, mas não no hot path — e por isso continua
-  `declared`.** O gate 6 da #535 instrumentou a montagem do packet
-  (`src/runtime/context-packet/build-context-packet.ts`, `stage="packet"`), com
-  teste que cai se alguém apagar a chamada. Mas `buildContextPacket` é o
-  orquestrador P8a e a PR #406 removeu o hot path (`FEATURE_CONTEXT_PACKET_V1`)
-  que o chamava: **nenhum turno chega lá**. A carga de contexto do turno é
-  `loadTurnContext` (`src/agent/turn-context/loader.ts`, #525), que emite a
-  família SEPARADA `maia_turn_context_load_duration_ms`.
-  A revisão da PR #554 fixou a leitura de `emitted` como "produção alcança",
-  não "existe site no repositório" — então o span fica `declared` até haver
-  decisão de contrato. O painel `maia:context_load_ms:p95` segue sem série
-  vinda de turno real: ausência esperada, não falha de scrape;
-- **só existe `stage="packet"`.** As fatias citadas no comentário de
-  `instrumentContextLoad` (`working_memory`, `episodic`, `profile`, …) não têm
-  emissor. O vocabulário fechado é `CONTEXT_LOAD_STAGE_VALUES`
+- **spans operacionais parciais** — só `turn`, `queue.wait`, `tool.dispatch` e
+  `context.load` têm emissor que produção alcança. As outras 19 entradas da
+  taxonomia estão marcadas `declared`;
+- **`context.load` não tem família de métrica própria — por decisão.** O span
+  sai de `loadTurnContext`; duração e round-trips da MESMA carga saem de
+  `recordTurnContextLoad` (`maia_turn_context_load_duration_ms{phase,result}`,
+  `maia_turn_context_db_queries{phase}`, #525). A review da PR #554 aposentou
+  `maia_context_load_ms` e `maia_context_slices_total` em vez de manter duas
+  famílias para uma operação: elas serviam a montagem P8a, cujo hot path a
+  PR #406 removeu, e produziam zero série apesar de dashboardadas. Se você
+  procurar essas séries num Prometheus antigo, o que sobrou ali é retenção, não
+  emissão;
+- **`stage` do `context.load` é um conjunto fechado de um: `turn_context`.** O
+  parâmetro é tipado (`ContextLoadStage`), então o compilador recusa qualquer
+  outro; ampliar é edição deliberada em `CONTEXT_LOAD_STAGE`
   (`src/observability/taxonomy.ts`);
 - **benchmark de overhead é micro, não sob carga** —
   `tests/unit/observability/overhead-benchmark.spec.ts` mede o custo por
@@ -607,6 +613,6 @@ Não presuma cobertura que não existe:
 
 | | |
 |---|---|
-| Last verified | 2026-08-11 |
-| Issue | #514 → #535 |
+| Last verified | 2026-08-14 |
+| Issue | #514 → #535 (review da PR #554) |
 | Re-verify when | `src/observability/taxonomy.ts` mudar; ou um limiar de `monitoring/alerts/slo.rules.yml` mudar; ou um span sair de `declared` para `emitted`. |
