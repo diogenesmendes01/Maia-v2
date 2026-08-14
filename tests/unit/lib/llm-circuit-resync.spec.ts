@@ -102,7 +102,9 @@ import {
   handleLLMSettingsInvalidation,
   llmSettingsSubscriberReady,
   llmSettingsSubscriberResyncCount,
+  resyncWorstCaseMs,
   startLLMSettingsInvalidationSubscriber,
+  stopLLMSettingsInvalidationSubscriber,
 } from '@/lib/llm/cache-invalidation.js';
 import {
   LLM_CIRCUIT_OVERRIDE_CHANNEL,
@@ -600,10 +602,13 @@ describe('kill switch — releitura na reconexão', () => {
       expect(RESYNC_RETRY.backoffBaseMs).toBeGreaterThan(0);
       // Teto do pior caso muito abaixo do arrendamento mínimo sancionado
       // (30min): se o Redis não respondeu nisso, não é soluço.
-      const worstCase =
-        RESYNC_RETRY.attempts * RESYNC_RETRY.attemptTimeoutMs +
-        RESYNC_RETRY.backoffBaseMs * 2 ** RESYNC_RETRY.attempts;
-      expect(worstCase).toBeLessThan(30 * 60_000);
+      expect(resyncWorstCaseMs()).toBeLessThan(30 * 60_000);
+      // E é a conta que a documentação declara: 4 × 2 000 ms de deadlines +
+      // 300 + 600 + 1 200 ms de backoffs no pior jitter (achado 1 da #561).
+      // Um literal aqui e uma fórmula lá divergiriam no primeiro ajuste — o
+      // ponto é que `lib.md`, os runbooks e o teto de tempo abaixo citem ESTE
+      // número.
+      expect(resyncWorstCaseMs()).toBe(10_100);
     });
 
     it('o retry ESGOTA e só então emite `resync_failed` — uma vez, não uma por tentativa', async () => {
@@ -801,6 +806,201 @@ describe('kill switch — releitura na reconexão', () => {
         'corrida vencida pelo canal virou alerta de divergência: o balde errado',
       ).toEqual(['resynced']);
     });
+
+    /**
+     * ACHADO 1 DA REVIEW DO DONO NA #561 — o deadline é da TENTATIVA, não de
+     * cada operação dela.
+     *
+     * O defeito: `attemptTimeoutMs` era armado duas vezes por tentativa, uma
+     * para o ack de `SUBSCRIBE` e outra para o `GET`. Um subscribe resolvendo
+     * perto dos 2s somado a um `GET` pendurado dava uma tentativa de quase 4s,
+     * e a cadeia inteira ia a ~17,7s — quase o dobro do orçamento declarado.
+     * O custo não é acadêmico: a `resyncChain` é serializada, então TODA
+     * releitura enfileirada num flapping herda o atraso.
+     *
+     * Este caso é o que o dono pediu: subscribe e `GET` consomem tempo NA MESMA
+     * tentativa, e a asserção é sobre o TETO TOTAL da cadeia.
+     *
+     * Timers falsos e `Math.random` fixado no jitter MÁXIMO: sem os dois, o
+     * teto medido seria uma amostra de um sorteio, e um teto que às vezes passa
+     * não é teto. Nada aqui depende de duas leituras de relógio real caírem no
+     * mesmo milissegundo — o tempo é o do relógio falso, avançado em passo
+     * conhecido.
+     */
+    it('subscribe e `GET` consomem tempo na MESMA tentativa: o teto é o da tentativa, não a soma', async () => {
+      const sub = await bootSubscriber();
+      handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('off'));
+      const before = llmSettingsSubscriberResyncCount();
+
+      // Quase todo o orçamento da tentativa vai no ack; sobram 100ms para o
+      // `GET`, que nunca responde. Com o deadline por OPERAÇÃO, o `GET` ganhava
+      // 2 000ms novos aqui.
+      const ackMs = RESYNC_RETRY.attemptTimeoutMs - 100;
+
+      vi.useFakeTimers();
+      // Jitter máximo (×1,5) — o pior caso que `resyncWorstCaseMs()` declara.
+      const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+      try {
+        sub.subscribe.mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve(2), ackMs)),
+        );
+        redisMock.get.mockImplementation(() => new Promise<string | null>(() => undefined));
+        sub.subscribe.mockClear();
+        // O `GET` da adoção de boot não é tentativa: sai da contagem.
+        redisMock.get.mockClear();
+
+        sub.emit('ready');
+        await vi.advanceTimersByTimeAsync(resyncWorstCaseMs());
+      } finally {
+        random.mockRestore();
+        vi.useRealTimers();
+      }
+
+      expect(
+        llmSettingsSubscriberResyncCount(),
+        `a releitura não terminou dentro de ${resyncWorstCaseMs()}ms: o deadline está sendo aplicado por OPERAÇÃO, então a tentativa custa quase o dobro e a cadeia estoura o orçamento declarado`,
+      ).toBe(before + 1);
+      // As quatro tentativas ACONTECERAM dentro do teto — o teto não veio de o
+      // retry ter desistido cedo.
+      expect(sub.subscribe.mock.calls.length, 'alguma tentativa não re-inscreveu').toBe(
+        RESYNC_RETRY.attempts,
+      );
+      expect(redisMock.get.mock.calls.length, 'o ack comeu a tentativa e o `GET` nem rodou').toBe(
+        RESYNC_RETRY.attempts,
+      );
+      // Fail-closed intacto: uma releitura que falhou de verdade continua
+      // alertando, e o override em vigor continua em vigor.
+      expect(resyncReasons()).toEqual(['resync_failed']);
+      expect(effectiveMode()).toBe('off');
+    });
   });
 
+  /**
+   * ACHADO 2 DA REVIEW DO DONO NA #561 — a réplica que está DRENANDO.
+   *
+   * `stopLLMSettingsInvalidationSubscriber()` fechava o socket e ia embora. Uma
+   * releitura em backoff, ou com um `GET` em voo, acordava depois do `quit()`,
+   * gastava as tentativas restantes contra um cliente encerrado e terminava em
+   * `resync_failed`. Como esta leva transformou `resync_failed` em alerta, um
+   * drain deliberado passava a produzir warning — ou PÁGINA, em
+   * `state="enforce"` — para uma réplica que estava simplesmente saindo.
+   *
+   * O desfecho de shutdown é `aborted` (`reason="resync_aborted"`): fora de
+   * `DIVERGENT_OUTCOMES` e fora dos dois alertas. Ele NÃO é `resynced`: a
+   * releitura foi interrompida, não concluída, e afirmar convergência aqui
+   * seria evidência verde falsa no gate que libera o `enforce`.
+   *
+   * O que estes casos NÃO afrouxam: uma releitura que falha de verdade, sem
+   * drain, continua terminando em `resync_failed` — é o caso "o retry ESGOTA"
+   * acima, e ele continua verde.
+   */
+  describe('drain no meio da releitura', () => {
+    it('`stop` durante o BACKOFF cancela a releitura: drain não vira `resync_failed`', async () => {
+      const sub = await bootSubscriber();
+      handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('enforce'));
+      const before = llmSettingsSubscriberResyncCount();
+
+      // Toda tentativa falha: sem o cancelamento, a releitura esgota e alerta.
+      redisMock.get.mockRejectedValue(new Error('ECONNRESET'));
+      // O `GET` da adoção de boot não é tentativa: sai da contagem.
+      redisMock.get.mockClear();
+
+      vi.useFakeTimers();
+      try {
+        sub.emit('ready');
+        // Avançar zero só drena as microtasks: a tentativa 1 falha na hora
+        // (rejeição imediata) e a releitura fica DORMINDO no backoff.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(
+          redisMock.get.mock.calls.length,
+          'a primeira tentativa não chegou a rodar — o teste não está no backoff',
+        ).toBe(1);
+
+        // O drain acontece exatamente aqui, com a releitura no backoff.
+        await stopLLMSettingsInvalidationSubscriber();
+
+        // Tempo de sobra para a releitura inteira, se ela tivesse continuado.
+        await vi.advanceTimersByTimeAsync(resyncWorstCaseMs());
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(
+        resyncReasons(),
+        'o drain acordou o plantão: uma releitura cancelada pelo shutdown saiu como divergência',
+      ).toEqual(['resync_aborted']);
+      expect(
+        redisMock.get.mock.calls.length,
+        'a releitura acordou do backoff e gastou tentativas contra um cliente já encerrado',
+      ).toBe(1);
+      expect(llmSettingsSubscriberResyncCount()).toBe(before + 1);
+      // O drain não é motivo para mexer na postura local.
+      expect(effectiveMode()).toBe('enforce');
+    });
+
+    it('`stop` com um `GET` PENDURADO cancela na hora: sem `resync_failed` e sem esperar o deadline', async () => {
+      const sub = await bootSubscriber();
+      handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('enforce'));
+      const before = llmSettingsSubscriberResyncCount();
+
+      // Nunca resolve, nunca rejeita — o socket meio-aberto do failover.
+      redisMock.get.mockImplementation(() => new Promise<string | null>(() => undefined));
+      // O `GET` da adoção de boot não é tentativa: sai da contagem.
+      redisMock.get.mockClear();
+
+      sub.emit('close');
+      sub.emit('reconnecting');
+      sub.emit('ready');
+      await waitUntil(() => redisMock.get.mock.calls.length >= 1);
+      expect(redisMock.get.mock.calls.length, 'nenhum `GET` em voo para pendurar').toBe(1);
+
+      await stopLLMSettingsInvalidationSubscriber();
+
+      /**
+       * Relógio REAL, e de propósito: o orçamento abaixo (500ms) é uma fração
+       * do deadline da tentativa (2 000ms). Se o cancelamento não interromper o
+       * `GET` pendurado, a releitura só terminaria depois do deadline — e este
+       * caso fica vermelho sem depender de nenhuma precisão de milissegundo.
+       */
+      await waitUntil(() => llmSettingsSubscriberResyncCount() > before, 500);
+
+      expect(
+        llmSettingsSubscriberResyncCount(),
+        'a releitura ficou pendurada no `GET` depois do drain: o fechamento não interrompe a operação em voo',
+      ).toBe(before + 1);
+      expect(
+        resyncReasons(),
+        'o drain com `GET` pendurado saiu como divergência — página em `enforce` para uma réplica que está saindo',
+      ).toEqual(['resync_aborted']);
+      expect(redisMock.get.mock.calls.length, 'gastou tentativa depois do `quit()`').toBe(1);
+      expect(effectiveMode()).toBe('enforce');
+    });
+
+    /**
+     * A outra ponta do achado 2, e a que não pode regredir junto: o
+     * cancelamento NÃO pode virar "esperar a releitura terminar". Esperar um
+     * `GET` contra um Redis morto travaria o drain — o bug que segurou a #512.
+     */
+    it('o `stop` não ESPERA a releitura: o drain não herda o orçamento do retry', async () => {
+      const sub = await bootSubscriber();
+      redisMock.get.mockImplementation(() => new Promise<string | null>(() => undefined));
+      redisMock.get.mockClear();
+
+      sub.emit('close');
+      sub.emit('reconnecting');
+      sub.emit('ready');
+      await waitUntil(() => redisMock.get.mock.calls.length >= 1);
+
+      const t0 = Date.now();
+      await stopLLMSettingsInvalidationSubscriber();
+      const elapsed = Date.now() - t0;
+
+      // Margem folgada contra o deadline de UMA tentativa (2 000ms): o ponto é
+      // que o drain não paga o orçamento do retry, não medir latência.
+      expect(
+        elapsed,
+        `o drain esperou ${elapsed}ms — passou a herdar o orçamento do retry (teto ${resyncWorstCaseMs()}ms)`,
+      ).toBeLessThan(RESYNC_RETRY.attemptTimeoutMs / 2);
+    });
+  });
 });
