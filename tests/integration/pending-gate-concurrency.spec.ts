@@ -103,6 +103,8 @@ type Evidence = {
   pending_status: string[];
   /** O `inbound.id` usado na race existe em `mensagens`? (FK do audit_log). */
   inbound_is_real_mensagem: boolean;
+  /** Erro da varredura de restos (best-effort; nunca é veredito). */
+  stale_purge_error: string | null;
   /** `audit_log` desta conversa, agrupado por ação, lido NO BANCO. */
   audit_by_acao: Record<string, number>;
   audit_total: number;
@@ -126,6 +128,7 @@ function fmt(e: Evidence): string {
       threw: e.threw,
       pending_status: e.pending_status,
       inbound_is_real_mensagem: e.inbound_is_real_mensagem,
+      stale_purge_error: e.stale_purge_error,
       audit_by_acao: e.audit_by_acao,
       timings_ms: { import: e.import_ms, seed: e.seed_ms, race: e.race_ms },
       feature_flag: e.feature_flag,
@@ -149,6 +152,7 @@ d('pending-gate concurrency', () => {
       threw: [],
       pending_status: [],
       inbound_is_real_mensagem: false,
+      stale_purge_error: null,
       audit_by_acao: {},
       audit_total: 0,
     };
@@ -170,16 +174,38 @@ d('pending-gate concurrency', () => {
       // O corte de 1h evita brigar com uma execução concorrente deste mesmo
       // spec em outro worker; o telefone aleatório já garante que ela não
       // colidiria, isto é só higiene para o banco não acumular lixo.
-      await c.query(
-        `DELETE FROM audit_log a USING conversas cv, pessoas p
-          WHERE a.conversa_id = cv.id AND cv.pessoa_id = p.id
-            AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
-        [NOME],
-      );
-      await c.query(
-        `DELETE FROM pessoas WHERE nome = $1 AND created_at < now() - interval '1 hour'`,
-        [NOME],
-      );
+      //
+      // Ordem obrigatória: `conversas_pessoa_id_fkey` é ON DELETE RESTRICT e
+      // `audit_log` não cascateia nem de `conversas` nem de `pessoas`. Então
+      // audit_log → conversas (que cascateia mensagens e pending_questions) →
+      // pessoas. Best-effort: isto é higiene, não pré-condição — um erro aqui
+      // não pode virar veredito sobre a race, então vira nota na evidência.
+      try {
+        await c.query(
+          `DELETE FROM audit_log a USING conversas cv, pessoas p
+            WHERE a.conversa_id = cv.id AND cv.pessoa_id = p.id
+              AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
+          [NOME],
+        );
+        await c.query(
+          `DELETE FROM audit_log a USING pessoas p
+            WHERE a.pessoa_id = p.id
+              AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
+          [NOME],
+        );
+        await c.query(
+          `DELETE FROM conversas cv USING pessoas p
+            WHERE cv.pessoa_id = p.id
+              AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
+          [NOME],
+        );
+        await c.query(
+          `DELETE FROM pessoas WHERE nome = $1 AND created_at < now() - interval '1 hour'`,
+          [NOME],
+        );
+      } catch (err) {
+        ev.stale_purge_error = (err as Error).message;
+      }
 
       // ── 3. Seed do fixture ───────────────────────────────────────────────
       const t1 = Date.now();
