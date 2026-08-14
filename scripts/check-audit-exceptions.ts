@@ -24,9 +24,21 @@
  *   3. entrada do ledger que não casa com nenhum advisory → exceção obsoleta,
  *      deve ser removida (senão o ledger vira folclore)
  *   4. entrada malformada (campo faltando, data inválida, severidade inválida)
+ *   5. severidade do advisory diferente da severidade registrada na exceção
+ *      → a decisão foi tomada para outro risco, precisa ser tomada de novo
  *
  * A regra 3 é o que impede o ledger de crescer para sempre: assim que o
  * advisory some (upgrade, remoção do pacote), o CI EXIGE a limpeza da linha.
+ *
+ * As regras 3 e 5 são a mesma regra vista de dois ângulos: o ledger descreve a
+ * realidade, e quando a realidade muda — o advisory sumiu, ou mudou de
+ * severidade — a linha para de descrevê-la e precisa ser reescrita por gente.
+ * É por isso que a 5 compara por IGUALDADE e não trata a severidade registrada
+ * como teto: um `critical` reclassificado para `moderate` também invalida a
+ * justificativa escrita, do mesmo jeito que um advisory que sumiu invalida a
+ * linha inteira. O ledger já reprova quando a realidade MELHORA (regra 3, que
+ * fica vermelha justamente quando alguém corrigiu a vulnerabilidade); a regra 5
+ * apenas mantém essa postura coerente em vez de tolerar meia-verdade no ledger.
  *
  * Invocação
  * ---------
@@ -235,6 +247,20 @@ export function findProblems(
           `exceção em ${LEDGER_PATH} com motivo, dono e expires.`,
       );
       continue;
+    }
+    // A severidade NÃO entra na chave de propósito: se entrasse, um drift
+    // viraria dois problemas contraditórios para a mesma linha ("advisory sem
+    // exceção registrada" + "exceção OBSOLETA"), e quem lesse o CI procuraria
+    // uma linha que existe e está quase certa. Como comparação, o diagnóstico é
+    // único e diz exatamente qual campo editar.
+    if (e.severity !== f.severity) {
+      const escalou = SEVERITIES.indexOf(f.severity) > SEVERITIES.indexOf(e.severity);
+      problems.push(
+        `severidade DIVERGENTE${escalou ? ' (ESCALOU)' : ''}: ${f.project} → ${f.pkg} ` +
+          `${f.advisory} foi aceito como "${e.severity}" e o npm audit hoje reporta ` +
+          `"${f.severity}". A decisão de ${e.owner} vale para o risco antigo. Reavalie e ` +
+          `atualize "severity" e "reason" em ${LEDGER_PATH}, ou corrija o advisory.`,
+      );
     }
     if (e.expires < today) {
       problems.push(

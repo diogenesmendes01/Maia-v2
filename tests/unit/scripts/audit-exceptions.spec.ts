@@ -225,6 +225,53 @@ describe('findProblems', () => {
   });
 });
 
+/**
+ * Achado [Medium] da review: `severity` era validada no ledger mas nunca
+ * comparada com o advisory real. Uma exceção aceita como `moderate` seguia
+ * liberando o CI depois do GHSA ser reclassificado para `critical`.
+ */
+describe('findProblems — drift de severidade', () => {
+  it('reprova advisory que ESCALOU de moderate para critical', () => {
+    const escalado: Finding = { ...FINDING, severity: 'critical' };
+    const problems = findProblems([escalado], [OK], '2026-08-14').join('\n');
+    expect(problems).toContain('severidade DIVERGENTE (ESCALOU)');
+    expect(problems).toContain('foi aceito como "moderate"');
+    expect(problems).toContain('reporta "critical"');
+  });
+
+  it('reprova também quando a severidade CAI — o ledger passou a mentir', () => {
+    const rebaixado: Finding = { ...FINDING, severity: 'low' };
+    const problems = findProblems([rebaixado], [OK], '2026-08-14').join('\n');
+    expect(problems).toContain('severidade DIVERGENTE');
+    expect(problems).not.toContain('ESCALOU');
+  });
+
+  it('o drift é UM diagnóstico, não "advisory sem exceção" + "exceção obsoleta"', () => {
+    // A severidade fica fora da CHAVE de propósito: se entrasse, quem lesse o
+    // CI procuraria uma linha que existe e está quase certa.
+    const escalado: Finding = { ...FINDING, severity: 'critical' };
+    const problems = findProblems([escalado], [OK], '2026-08-14');
+    expect(problems).toHaveLength(1);
+    expect(problems.join('\n')).not.toContain('advisory sem exceção registrada');
+    expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
+  });
+
+  it('drift e vencimento são fatos independentes e aparecem os dois', () => {
+    const escalado: Finding = { ...FINDING, severity: 'high' };
+    const vencida = { ...OK, expires: '2026-08-13' };
+    const problems = findProblems([escalado], [vencida], '2026-08-14').join('\n');
+    expect(problems).toContain('severidade DIVERGENTE');
+    expect(problems).toContain('exceção VENCIDA');
+  });
+
+  it('severidade ilegível no relatório não casa com nenhuma exceção', () => {
+    const semSeveridade: Finding = { ...FINDING, severity: 'unknown' };
+    expect(findProblems([semSeveridade], [OK], '2026-08-14').join('\n')).toContain(
+      'severidade DIVERGENTE',
+    );
+  });
+});
+
 describe('keyOf / todayUtc', () => {
   it('a chave junta projeto, pacote e advisory', () => {
     expect(keyOf(OK)).toBe('.|esbuild|GHSA-67mh-4wv8-2f99');
