@@ -10,12 +10,12 @@ import { logger } from '@/lib/logger.js';
 import { pool } from '@/db/client.js';
 import { deleteBackupObject, headBackupObject, isS3Configured } from './backup-s3.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
-import { resolveProfile } from '@/config/profiles.js';
-import { resolveBackupProfile, type BackupConfigInput } from '@/ops/backup/profile.js';
+import { backupProfile } from '@/ops/backup/config-input.js';
 import { createBackupPorts } from '@/ops/backup/adapters.js';
 import { createRestoreDrillPorts } from '@/ops/backup/drill-adapters.js';
 import { runRestoreDrill } from '@/ops/backup/drill.js';
 import { runVerifiedBackup, type BackupTrigger } from '@/ops/backup/service.js';
+import { runRestoreDrillTick } from '@/ops/backup/drill-schedule.js';
 import { runArtifactRetention } from '@/ops/backup/retention.js';
 import {
   isSafeArtifactRef,
@@ -28,6 +28,7 @@ import {
   anyActiveLegalHold,
   listArtifactRuns,
   markRunDeleted,
+  readReadinessFacts,
   reclaimAbandonedRuns,
   recordRetentionRun,
 } from '@/db/repositories/ops-repos.js';
@@ -99,49 +100,6 @@ async function reclaimAbandoned(): Promise<void> {
 }
 
 /**
- * Project the loaded configuration onto the slice `resolveBackupProfile` reads.
- *
- * Explicit rather than passing `config` wholesale: the field list is the
- * compile-time contract between this worker and `src/ops/backup/profile.ts`, so
- * renaming a variable in `src/config/contract.ts` breaks the build here instead
- * of silently resolving to `undefined`.
- *
- * The Maia PROFILE comes from `resolveProfile` (issue #515), not from a
- * backup-specific selector — `MAIA_ENV` is the single source of truth, and
- * `resolveProfile` is pure (it reads the snapshot it is handed, not
- * `process.env`).
- */
-function backupConfigInput(): BackupConfigInput {
-  const { profile } = resolveProfile({
-    MAIA_ENV: config.MAIA_ENV,
-    NODE_ENV: config.NODE_ENV,
-  });
-  return {
-    profile,
-    BACKUP_ENABLED: config.BACKUP_ENABLED,
-    BACKUP_DIR: config.BACKUP_DIR,
-    BACKUP_RETENTION_LOCAL_DAYS: config.BACKUP_RETENTION_LOCAL_DAYS,
-    BACKUP_RETENTION_CLOUD_DAYS: config.BACKUP_RETENTION_CLOUD_DAYS,
-    BACKUP_S3_BUCKET: config.BACKUP_S3_BUCKET,
-    BACKUP_S3_ACCESS_KEY: config.BACKUP_S3_ACCESS_KEY,
-    BACKUP_S3_SECRET_KEY: config.BACKUP_S3_SECRET_KEY,
-    BACKUP_S3_ENDPOINT: config.BACKUP_S3_ENDPOINT,
-    BACKUP_OFFSITE_REQUIRED: config.BACKUP_OFFSITE_REQUIRED,
-    BACKUP_ENCRYPTION_MODE: config.BACKUP_ENCRYPTION_MODE,
-    BACKUP_ENCRYPTION_KEYRING: config.BACKUP_ENCRYPTION_KEYRING,
-    BACKUP_ENCRYPTION_ACTIVE_KEY_ID: config.BACKUP_ENCRYPTION_ACTIVE_KEY_ID,
-    BACKUP_DUMP_TIMEOUT_MS: config.BACKUP_DUMP_TIMEOUT_MS,
-    BACKUP_UPLOAD_TIMEOUT_MS: config.BACKUP_UPLOAD_TIMEOUT_MS,
-    BACKUP_RESTORE_TIMEOUT_MS: config.BACKUP_RESTORE_TIMEOUT_MS,
-    BACKUP_MIN_ARTIFACT_BYTES: config.BACKUP_MIN_ARTIFACT_BYTES,
-    BACKUP_RPO_TARGET_HOURS: config.BACKUP_RPO_TARGET_HOURS,
-    BACKUP_RTO_TARGET_MINUTES: config.BACKUP_RTO_TARGET_MINUTES,
-    BACKUP_RESTORE_DRILL_INTERVAL_HOURS: config.BACKUP_RESTORE_DRILL_INTERVAL_HOURS,
-    RETENTION_DRY_RUN: config.RETENTION_DRY_RUN,
-  };
-}
-
-/**
  * Shared entry point for cron and CLI. Returns the outcome so the CLI can pick
  * a process exit code.
  */
@@ -150,7 +108,7 @@ export async function executeBackup(trigger: BackupTrigger): Promise<{
   outcome?: 'completed' | 'completed_degraded' | 'failed';
   reason?: string;
 }> {
-  const profile = resolveBackupProfile(backupConfigInput());
+  const profile = backupProfile();
   if (!profile.enabled) {
     logger.warn({ profile: profile.name }, 'backup.disabled');
     return { status: 'disabled' };
@@ -214,7 +172,7 @@ export async function runRestoreDrillJob(): Promise<
   | { status: 'ran'; result: Awaited<ReturnType<typeof runRestoreDrill>> }
 > {
   return runWithSystemContext(async () => {
-    const profile = resolveBackupProfile(backupConfigInput());
+    const profile = backupProfile();
     const outcome = await withOpsLock(
       OPS_LOCK_KEYS.restore_drill,
       { pool, onWarn: (event, detail) => logger.warn(detail, event) },
@@ -259,6 +217,66 @@ export async function runRestoreDrillJob(): Promise<
 }
 
 /**
+ * Hourly cron — the restore-drill GATE (issue #536).
+ *
+ * WHY A TICK AND NOT A CRON DERIVED FROM THE INTERVAL.
+ * `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` is the maximum acceptable AGE OF THE
+ * EVIDENCE, not a schedule (owner's ruling). Turning it into a cron expression
+ * would be a second, drifting source of truth and would re-drill on a clock
+ * even when a drill had just passed. Instead this job wakes on a fixed hourly
+ * tick and `runRestoreDrillTick` decides, from the evidence in
+ * `restore_drills`, whether a drill is actually needed. A tick that finds fresh
+ * evidence does no work: one indexed read and it returns.
+ *
+ * An hourly tick cannot honour an arbitrarily small interval, so the floor is
+ * DERIVED from this cadence plus the drill's bounded stages
+ * (`minHonourableDrillIntervalHours`) and enforced at BOOT by
+ * `backup/drill-interval-feasible` — 10h with the shipped timeouts. A config
+ * below it does not start the process, so this function never has to cope with
+ * an interval it cannot meet.
+ *
+ * THE GATE PART. Every tick grades the evidence through
+ * `evaluateBackupReadiness` and logs the verdict at a matching level, whether
+ * or not it decides to drill. `/metrics` exposes the same verdict continuously
+ * as `maia_restore_drill_check_level`
+ * (`src/observability/backup-readiness-collector.ts`), so aged-out evidence is
+ * visible to a probe even if this worker itself stops running.
+ *
+ * Single-flight comes from `runRestoreDrillJob`, which takes
+ * `OPS_LOCK_KEYS.restore_drill` — a tick that overlaps a CLI drill, another
+ * replica's tick, or a long-running drill from the previous hour starts
+ * nothing.
+ *
+ * WHY THE TICK SWALLOWS ITS OWN PORT FAILURES. `runTick`
+ * (`src/workers/index.ts`) catches a rejecting handler and logs `{ err }` —
+ * the RAW error object. A driver or `pg_restore` error carries the connection
+ * URL with the password, which is exactly issue #520's leak. So the tick
+ * catches its port failures itself, redacts the message, and returns a verdict
+ * instead of rejecting.
+ */
+export async function runScheduledRestoreDrill(): Promise<void> {
+  await runWithSystemContext(() =>
+    runRestoreDrillTick(
+      {
+        now: () => new Date(),
+        readFacts: readReadinessFacts,
+        runDrill: async () => {
+          const outcome = await runRestoreDrillJob();
+          return outcome.status === 'already_running'
+            ? { status: 'already_running' as const }
+            : { status: 'ran' as const, drill_status: outcome.result.status };
+        },
+        // The tick redacts every message it puts in `detail` before calling
+        // this sink (`pg_restore`/`pg_dump` echo DATABASE_URL with the password
+        // on a connection failure — issue #520's real leak).
+        log: (level, event, detail) => logger[level](detail, event),
+      },
+      backupProfile(),
+    ),
+  );
+}
+
+/**
  * Weekly cron — manifest-driven, hold-aware artifact retention.
  *
  * ROUND-1 REVIEW FINDING (P1). This used to call `pruneCloud`, which selected
@@ -278,7 +296,7 @@ export async function runBackupRetention(): Promise<void> {
   // under the reserved `system` sentinel (issue #323 phase 2).
   await runWithSystemContext(async () => {
     const correlationId = randomUUID();
-    const profile = resolveBackupProfile(backupConfigInput());
+    const profile = backupProfile();
 
     // Destructive work is single-flight and FAILS CLOSED on contention: losing
     // the race must not be mistaken for "nothing to do".

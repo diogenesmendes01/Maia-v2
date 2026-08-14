@@ -17,7 +17,7 @@ import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
 import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
-import { runNightlyBackup, runBackupRetention } from './backup.js';
+import { runNightlyBackup, runBackupRetention, runScheduledRestoreDrill } from './backup.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -148,6 +148,20 @@ export const JOBS: Job[] = [
   // every deletion from the manifest, evaluates legal hold under a lock, and
   // covers both destinations. Deletes nothing while RETENTION_DRY_RUN=true.
   { name: 'backup_retention', cron: '0 4 * * 0', fn: runBackupRetention, phase: 1 },
+  // Issue #536 — o GATE do drill de restore. `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`
+  // é a IDADE MÁXIMA ACEITÁVEL DA EVIDÊNCIA, não um agendamento: por isso a
+  // cadência aqui é um TICK fixo de hora em hora e não um cron derivado do
+  // intervalo. O tick lê `restore_drills`, e só dispara um drill quando a
+  // evidência está perto de vencer (75% do intervalo) ou nunca existiu —
+  // evidência fresca faz o tick não fazer nada. Esta cadência de 1h é um dos
+  // três parâmetros do piso que o boot exige (`backup/drill-interval-feasible`,
+  // `src/config/rules.ts`): com os timeouts default o intervalo mínimo
+  // honrável é 10h, e abaixo disso o processo NÃO SOBE — mudar este cron muda
+  // aquele piso.
+  // Single-flight pelo lock `maia_ops_restore_drill` (o próprio
+  // `runRestoreDrillJob`), então CLI, réplica e tick anterior nunca correm
+  // juntos. PHASE 1 de propósito: startWorkers(1) ignora phase>1.
+  { name: 'restore_drill', cron: '40 * * * *', fn: runScheduledRestoreDrill, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },

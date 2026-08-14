@@ -14,6 +14,8 @@
 
 Em produção, `local-only` e `upload falhado` são **`failed`**, não degradado.
 
+E o drill de restore **roda sozinho e reprova quando envelhece** (issue #536): o job `restore_drill` acorda de hora em hora, dispara um drill quando a evidência em `restore_drills` está perto de vencer, e `/metrics` expõe o veredito continuamente em `maia_restore_drill_check_level`. `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` é a **idade máxima aceitável da evidência**, não um agendamento — §4.3.
+
 ## 1. Rodar um backup manual
 
 ```bash
@@ -149,9 +151,13 @@ O drill nunca imprime o caminho nem o nome do banco (esses textos vão para log 
 SELECT id, started_at, status, failure_code, probes->'cleanup' AS cleanup
 FROM restore_drills WHERE cleanup_status = 'unsafe' ORDER BY started_at DESC;
 
--- Drills que morreram no meio: ninguém conferiu o teardown
-SELECT id, started_at FROM restore_drills
-WHERE status = 'running' AND started_at < now() - interval '6 hours';
+-- Drills que morreram no meio: ninguém conferiu o teardown.
+-- Este é o estado que BLOQUEIA o próximo drill (§4.3): `unknown` significa
+-- "resíduo possível, ninguém conferiu", e o corte abaixo tem que casar com o
+-- do código (2× (upload + restore), piso de 1h — 3h nos defaults).
+SELECT id, started_at, status, cleanup_status FROM restore_drills
+WHERE status NOT IN ('passed', 'failed', 'skipped')
+ORDER BY started_at;
 ```
 
 ```bash
@@ -177,7 +183,77 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 
 **Requisitos operacionais.** O drill precisa de (a) `pg_restore` no host, (b) permissão de `CREATE DATABASE`/`DROP DATABASE` no cluster, (c) espaço em `BACKUP_DIR/restore-drill` para o artefato baixado **e** o plaintext decifrado. Esse diretório contém, enquanto o drill roda, uma cópia **em claro** dos dados de todos os tenants — ele fica sob `BACKUP_DIR` de propósito (permissões e disco que o operador já trata como sensíveis), nunca em `/tmp`. Se faltar qualquer uma das três, o drill termina com `cleanup_status = 'unsafe'` e **não** certifica nada: os logs `restore_drill.database_not_dropped` / `restore_drill.staged_file_not_removed` carregam o `kind` e o `reason`, e §4.2 diz o que remover.
 
-O drill não está no cron por decisão: ele cria e derruba um banco, e o intervalo esperado (`BACKUP_RESTORE_DRILL_INTERVAL_HOURS`) é semanal. Agende-o pelo cron do host, ou chame `runRestoreDrillJob()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)) de um job próprio — ele já disputa o lock `maia_ops_restore_drill`, então dois drills nunca correm juntos.
+### 4.3 O agendamento e o gate (issue #536)
+
+**O drill roda sozinho.** O job `restore_drill` ([`src/workers/index.ts`](../../src/workers/index.ts)) acorda **de hora em hora** (`40 * * * *`, phase 1) e chama `runScheduledRestoreDrill()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)).
+
+**O intervalo tem um piso, e ele é recusado no boot.** O agendador só consegue honrar uma idade máxima que caiba na sua própria margem: ele acorda a cada 1h e dispara o drill a 75% do intervalo, sobrando 25% para o drill acontecer. Nesses 25% tem que caber **um tick de latência + a duração do drill** (os estágios com orçamento: `BACKUP_UPLOAD_TIMEOUT_MS` + `BACKUP_RESTORE_TIMEOUT_MS`):
+
+```
+intervalo >= (tick + upload + restore) / (1 - 0,75)   ⇒   >= 4 × (tick + upload + restore)
+```
+
+Com os defaults (1h + 30min + 60min = 2,5h) o piso é **10 horas**. Abaixo disso o processo **não sobe**: `backup/drill-interval-feasible` ([`src/config/rules.ts`](../../src/config/rules.ts)) é erro de boot enquanto `BACKUP_ENABLED=true`, mesma postura do `backup/rpo-feasible` — não se anuncia um objetivo que a arquitetura não cumpre. O piso é **derivado**, então baixar os timeouts baixa o piso, e mudar o cron do worker muda os dois. É um piso, não uma garantia: o download off-site e as probes não têm orçamento próprio.
+
+**A cadência do cron não é o intervalo, e isso é de propósito.** `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` é a **idade máxima aceitável da evidência**, não um agendamento. Derivar um cron dele seria uma segunda fonte da verdade e re-executaria um drill por relógio, mesmo com um drill recém-aprovado. Em vez disso o tick lê `restore_drills` e decide ([`src/ops/backup/drill-schedule.ts`](../../src/ops/backup/drill-schedule.ts)):
+
+| Estado da evidência | O que o tick faz |
+|---|---|
+| Mais nova que **75%** do intervalo | **Nada.** Um drill custa um download de gigabytes, um banco efêmero e uma cópia em claro da produção no disco enquanto roda |
+| Passou de 75% do intervalo | Dispara o drill. 75% é a **mesma fração** em que `rpo.ts` levanta o WARN: o drill começa quando a readiness fica âmbar e termina antes de ficar vermelha |
+| Último drill **falhou**, e passou de **12,5%** do intervalo | Dispara de novo. Janela própria e mais curta: boa parte das falhas é transitória, e esperar 75% manteria a plataforma em FAIL por dias por causa de um soluço |
+| **Nunca rodou** | Dispara — e a evidência já conta como **vencida**. Ausência de evidência não é evidência de backup restaurável |
+| Existe drill **não-terminal** mais novo que o corte de abandono | **Nada** — há drill em curso (`drill_in_flight`). Não é alarme: o lock recusaria um segundo de qualquer jeito |
+| Existe drill **não-terminal** mais velho que o corte de abandono | **Recusa** e loga `restore_drill.blocked_by_abandoned_drill` em nível error; a gate vai a **FAIL mesmo com evidência terminal fresca**. O processo morreu com uma cópia em claro da produção possivelmente no host, e ninguém conferiu (§4.4) |
+| Último drill deixou **resíduo** (`cleanup_status='unsafe'`) | **Recusa** e loga `restore_drill.blocked_by_residue` em nível error. Outro drill faria uma **segunda** cópia em claro da produção em vez de provar coisa alguma. Limpe o host (§4.2) e o próximo tick volta a drillar |
+| `BACKUP_ENABLED=false` | Nada. Não há o que drillar |
+
+**Single-flight.** O tick chama `runRestoreDrillJob()`, que disputa o lock `maia_ops_restore_drill`. CLI (`npm run restore:test`), outra réplica e o tick da hora anterior nunca correm juntos — quem perde loga `restore_drill.tick_already_running` e não inicia nada.
+
+**Envelhecer REPROVA — este é o gate.** Toda vez que o tick roda ele grada a evidência por `evaluateBackupReadiness` e loga o veredito no nível correspondente (`restore_drill.evidence_ok` / `.evidence_aging` / `.evidence_expired`). E, independente do worker, `/metrics` expõe o veredito continuamente:
+
+| Série | Significado |
+|---|---|
+| `maia_restore_drill_check_level` | **O gate.** 0 = um drill recente provou um artefato restaurável; 1 = envelhecendo; 2 = **reprovado** (evidência vencida, último drill falhou, nunca rodou em production, ou a evidência não pôde ser lida) |
+| `maia_restore_drill_age_seconds` | Idade do drill terminal mais recente. **`-1`** quando nunca houve um: `0` leria como "acabou de rodar", a mentira mais perigosa que uma série de idade pode contar, e idade negativa é impossível (logo, inerte a qualquer alerta `> limiar`) |
+| `maia_backup_readiness_level` | O veredito agregado de backup (RPO local/off-site, falhas consecutivas, cifra, viabilidade do RPO) |
+
+O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observability/backup-readiness-collector.ts)) lê a evidência **no scrape**, não de um valor que o worker publica: se o `restore_drill` parar de rodar, um gauge publicado por ele congelaria no último valor (verde) — que é exatamente a falha que o gate existe para pegar. Pelo mesmo motivo, uma leitura que **falha** derruba o snapshot em vez de reservir o último verde.
+
+**Alertas** ([`monitoring/alerts/backup.rules.yml`](../../monitoring/alerts/backup.rules.yml)). O arquivo **existe no repositório e está declarado** no `rule_files` de [`observability-slo.md` §8](observability-slo.md) — o que **não** prova que o Prometheus do ambiente o carregou. Isso é verificação operacional: `GET /api/v1/rules` no Prometheus e procure o grupo `maia_backup_restore_drill`. Se ele não estiver lá, os dois alertas abaixo não existem para ninguém:
+
+| Alerta | Dispara | O que o operador faz |
+|---|---|---|
+| `RestoreDrillEvidenceNotProvable` | `maia_restore_drill_check_level >= 2` por 30min | **Nada é sabidamente restaurável.** São **cinco** casos: vencido, último drill falhou, nunca rodou, evidência ilegível, ou **execução não-terminal sem teardown provado**. Comece pelo quinto — é o único que pede inspeção de HOST e não re-drill, e é o que bloqueia o agendador (§4.4). Se não houver linha aberta, é um dos outros quatro: §4.1 |
+| `RestoreDrillEvidenceAging` | `maia_restore_drill_check_level == 1` por 6h | O agendador deveria ter renovado a evidência aos 75% e não renovou. Confira se o job `restore_drill` está agendado (log `worker.scheduled`) e se algo o bloqueia de propósito: resíduo no último drill (§4.2) ou execução não-terminal sem teardown provado (§4.4) |
+
+
+### 4.4 O drill que morreu no meio (issue #536, review da #553)
+
+Um drill que caiu entre `createDrill` e `finishDrill` deixa a linha em `status='running'`, `cleanup_status='unknown'` — que pelo contrato do §4.1 significa **"resíduo possível, ninguém conferiu"**. Três coisas o tornavam perigoso e as três estão fechadas:
+
+1. **O restart NÃO protege.** O `maia_ops_restore_drill` é advisory lock de **sessão**: o processo morto levou o lock junto, e o worker reiniciado o pega sem contenção. Nada mais sobrevive ao crash para recusar o segundo drill.
+2. **Os fatos enxergam a linha.** `readReadinessFacts` devolve `open_restore_drill_started_at` — o **mais antigo** drill não-terminal (com um vivo e um cadáver, o cadáver é o que importa). É campo **novo**: os quatro `last_restore_drill_*` continuam descrevendo o último drill TERMINAL, porque é deles que sai o RPO/RTO.
+3. **O gate fica vermelho mesmo com evidência fresca.** `maia_restore_drill_check_level` vai a 2, então `RestoreDrillEvidenceNotProvable` dispara. Sem isso, um drill aprovado ontem pintava OK por dias com uma cópia da produção parada no host.
+
+**O corte de abandono.** `2 × (BACKUP_UPLOAD_TIMEOUT_MS + BACKUP_RESTORE_TIMEOUT_MS)`, com piso de 1h — **3h nos defaults**. É a mesma regra de "duas vezes o orçamento" que o `reclaimAbandonedRuns` já aplica a `backup_runs`: passado esse ponto nenhuma execução legítima poderia ainda estar rodando. Os dois estágios somados são os que o profile realmente limita (o download do off-site não tem knob próprio). Abaixo do corte é `drill_in_flight`; acima é cadáver.
+
+**Como destravar** (o bloqueio é intencionalmente indefinido até um humano agir — é uma cópia em claro dos dados de todos os tenants):
+
+1. ache a linha com a consulta de §4.2 (`status NOT IN ('passed','failed','skipped')`);
+2. procure o resíduo daquele drill — banco `maia_drill_%` e arquivos em `BACKUP_DIR/restore-drill/` — e remova o que achar (§4.2);
+3. **feche a linha**, que é o que o scheduler lê:
+
+```sql
+UPDATE restore_drills
+   SET status = 'failed', finished_at = now(), failure_code = 'unexpected',
+       cleanup_status = 'clean'   -- só depois de VERIFICAR o host
+ WHERE id = '<id>';
+```
+
+Fechar como `failed` é honesto: aquele drill não provou nada. A partir daí vale a janela de **retry** (12,5% do intervalo, ~21h no semanal), não a de refresh. Se você não conseguiu provar que o host está limpo, feche com `cleanup_status='unsafe'` — aí o bloqueio continua, pela outra regra, que é o que se quer.
+
+**Por que isto não está no `/readyz`.** Um drill vencido não torna a réplica incapaz de atender uma requisição, e `/readyz` decide roteamento de tráfego. Reprovar lá derrubaria a plataforma por um problema de evidência de backup — um outage causado pelo monitor. A superfície certa para "nossa postura de recuperação não é demonstrável" é a readiness operacional: o gauge, o alerta e a linha de log por tick.
 
 ## 5. Dados fora do PostgreSQL
 
@@ -279,6 +355,5 @@ Registrado aqui para que ninguém opere com expectativa errada:
 - O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco. (Issue #536, eixo 2.)
 - A **reaplicação** de tombstones pós-restore continua manual (passo 3.6). O drill agora executa `planReconciliation` e `canReleaseTraffic` em **dry-run** contra o snapshot restaurado, então a proteção deixou de depender de alguém lembrar de *avaliar* — mas não existe executor que *reaplique* as exclusões, porque reaplicar exige o mesmo mecanismo de exclusão por classe que o eixo 2 vai construir. (Issue #536, eixo 3.)
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
-- O drill não roda por cron dentro da aplicação — ver §4 para como agendá-lo.
 - O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.
 - Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.

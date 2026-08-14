@@ -59,6 +59,8 @@ function input(
     last_restore_drill_at: new Date(NOW.getTime() - 24 * HOURS),
     last_restore_drill_result: 'passed',
     last_restore_drill_duration_ms: 90_000,
+    // Issue #536 (review da #553): nenhuma execução sem teardown provado.
+    open_restore_drill_started_at: null,
     consecutive_failures: 0,
     ...over,
   };

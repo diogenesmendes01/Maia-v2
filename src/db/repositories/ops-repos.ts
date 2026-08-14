@@ -383,6 +383,31 @@ export interface ReadinessFacts {
   last_restore_drill_at: Date | null;
   last_restore_drill_result: 'passed' | 'failed' | null;
   last_restore_drill_duration_ms: number | null;
+  /**
+   * Teardown verdict of that same drill (issue #536). The SCHEDULER needs it:
+   * a drill that could not prove it removed its decrypted copy of production
+   * blocks the next one, because starting another would materialise a second
+   * copy instead of proving anything. `null` when no drill has ever reached a
+   * terminal state.
+   */
+  last_restore_drill_cleanup_status: 'clean' | 'unsafe' | 'unknown' | null;
+  /**
+   * Start time of the OLDEST drill that never reached a terminal state — the
+   * `running` / `cleanup_status='unknown'` rows (issue #536, owner review of
+   * #553). `null` when there is none.
+   *
+   * ADDITIVE on purpose: the four `last_restore_drill_*` fields above keep
+   * meaning exactly what they meant (the newest TERMINAL drill), because
+   * `rpo.ts` grades RPO/RTO from them and widening that query would have
+   * changed what "the last drill" means for every consumer. This is a separate
+   * question — "is there an execution whose teardown nobody ever proved?" — and
+   * it gets a separate field.
+   *
+   * The OLDEST rather than the newest: with one live drill and one corpse, the
+   * corpse is the row that matters, and it is the one whose age decides whether
+   * this is normal operation or debris.
+   */
+  open_restore_drill_started_at: Date | null;
   consecutive_failures: number;
 }
 
@@ -408,16 +433,71 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
     .orderBy(desc(backup_runs.remote_verified_at))
     .limit(1);
 
-  const [drillRow] = await db
-    .select({
-      at: restore_drills.finished_at,
-      status: restore_drills.status,
-      duration: restore_drills.duration_ms,
-    })
-    .from(restore_drills)
-    .where(sql`${restore_drills.status} IN ('passed', 'failed')`)
-    .orderBy(desc(restore_drills.finished_at))
-    .limit(1);
+  // ONE STATEMENT for both drill facts — issue #536, round 2 of the owner's
+  // review of #553.
+  //
+  // These used to be two independent `SELECT`s, each in its own autocommit and
+  // therefore each with its own snapshot. A drill terminalizing BETWEEN them
+  // produced a state that never existed: the first query still returned the
+  // OLD terminal row, the second no longer found the open row (it had just
+  // become terminal), so the decisor saw neither the new verdict nor the
+  // execution in flight. In the worst case the drill terminalized as
+  // `cleanup_status='unsafe'` inside that window: the tick graded the previous
+  // `clean` row, found it due, took the advisory lock the finished drill had
+  // just released, and started another drill — materialising the second copy
+  // of production this whole review exists to prevent.
+  //
+  // A single statement takes a SINGLE snapshot under READ COMMITTED, so the
+  // two branches below cannot disagree about what has finished. A transaction
+  // with REPEATABLE READ would also have worked and was rejected on cost: this
+  // function is a cheap read on the `/metrics` scrape path and has consumers
+  // beyond the scheduler, so paying for a transaction (and holding a snapshot
+  // open across four statements) to fix an interleaving between two of them is
+  // the wrong trade.
+  //
+  // `skipped` is excluded with the terminal states in the open branch:
+  // `runRestoreDrill` returns it BEFORE creating a row (backups disabled), so a
+  // skipped drill never staged a file nor created a database — there is nothing
+  // of it left on the host.
+  //
+  // The `anchor` join guarantees exactly one result row even when both branches
+  // are empty, so "no drills at all" reads as nulls rather than as no row.
+  // `::text` on both timestamps, then `new Date(...)` below — the same shape
+  // `listArtifactRuns` above uses. A raw `db.execute` does not get drizzle's
+  // per-column parsers, so a `timestamptz` would arrive as a string and silently
+  // fail an `instanceof Date` contract; casting makes that explicit at the
+  // boundary instead of depending on the driver's default parser.
+  const drills = await db.execute<{
+    terminal_at: string | null;
+    terminal_status: string | null;
+    terminal_duration: number | null;
+    terminal_cleanup: string | null;
+    open_started_at: string | null;
+  }>(sql`
+    WITH terminal AS (
+      SELECT finished_at, status, duration_ms, cleanup_status
+        FROM ${restore_drills}
+       WHERE status IN ('passed', 'failed')
+       ORDER BY finished_at DESC
+       LIMIT 1
+    ),
+    open_drill AS (
+      SELECT started_at
+        FROM ${restore_drills}
+       WHERE status NOT IN ('passed', 'failed', 'skipped')
+       ORDER BY started_at ASC
+       LIMIT 1
+    )
+    SELECT t.finished_at::text    AS terminal_at,
+           t.status              AS terminal_status,
+           t.duration_ms         AS terminal_duration,
+           t.cleanup_status      AS terminal_cleanup,
+           o.started_at::text    AS open_started_at
+      FROM (SELECT 1) AS anchor
+      LEFT JOIN terminal   AS t ON true
+      LEFT JOIN open_drill AS o ON true
+  `);
+  const drillRow = drills.rows[0];
 
   // Consecutive failures since the last non-failed terminal run.
   const failures = await db.execute<{ n: string }>(sql`
@@ -442,12 +522,24 @@ export async function readReadinessFacts(): Promise<ReadinessFacts> {
   return {
     last_local_verified_at: localRow?.at ?? null,
     last_offsite_verified_at: offsiteRow?.at ?? null,
-    last_restore_drill_at: drillRow?.at ?? null,
+    last_restore_drill_at: drillRow?.terminal_at ? new Date(drillRow.terminal_at) : null,
     last_restore_drill_result:
-      drillRow?.status === 'passed' || drillRow?.status === 'failed'
-        ? (drillRow.status as 'passed' | 'failed')
+      drillRow?.terminal_status === 'passed' || drillRow?.terminal_status === 'failed'
+        ? (drillRow.terminal_status as 'passed' | 'failed')
         : null,
-    last_restore_drill_duration_ms: drillRow?.duration ?? null,
+    last_restore_drill_duration_ms: drillRow?.terminal_duration ?? null,
+    // Anything the column can hold that is not `clean` is treated as `unknown`
+    // rather than being coerced to `clean`: an unrecognised teardown verdict is
+    // a doubt, and a doubt about a decrypted copy of production is not a pass.
+    last_restore_drill_cleanup_status:
+      drillRow?.terminal_status == null
+        ? null
+        : drillRow.terminal_cleanup === 'clean' || drillRow.terminal_cleanup === 'unsafe'
+          ? drillRow.terminal_cleanup
+          : 'unknown',
+    open_restore_drill_started_at: drillRow?.open_started_at
+      ? new Date(drillRow.open_started_at)
+      : null,
     consecutive_failures: Number(failures.rows[0]?.n ?? 0),
   };
 }

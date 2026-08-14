@@ -328,6 +328,38 @@ export const METRIC = {
    * integração, para o trabalho de drill que roda em paralelo nesta leva.
    */
   RESTORE_DRILL_UNSAFE_RESIDUE: 'maia_restore_drill_unsafe_residue_total',
+  /**
+   * O GATE do drill de restore: 0 = um drill recente provou um artefato
+   * restaurável; 1 = a evidência está envelhecendo; 2 = REPROVADO (evidência
+   * mais velha que `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`, último drill falhou,
+   * nunca rodou um drill em production, ou a evidência não pôde ser lida).
+   *
+   * Um nível 0/1/2 em vez do par-de-séries de `LLM_CIRCUIT_STATE`/
+   * `WHATSAPP_SESSIONS`, e a diferença é deliberada: ali "nunca exercitado" e
+   * "fechado" precisam ser distinguíveis, aqui NÃO — nunca ter drillado JÁ é o
+   * degrau 2. O caso ambíguo que justifica o par-de-séries não existe nesta
+   * série porque ela é fail-closed por construção.
+   *
+   * SEM labels: a postura de recuperação é da plataforma, não de um tenant, e
+   * o "qual drill / por quê" pertence a `restore_drills` e ao log. Emitida por
+   * `src/observability/backup-readiness-collector.ts`, que a lê no SCRAPE a
+   * partir das tabelas de evidência — não de um valor que o worker publica,
+   * senão um worker morto congelaria a série no último verde.
+   */
+  RESTORE_DRILL_CHECK_LEVEL: 'maia_restore_drill_check_level',
+  /**
+   * Idade do drill terminal mais recente. `-1` quando nunca houve um: `0`
+   * leria como "acabou de rodar", e idade negativa é impossível (logo, inerte
+   * a qualquer alerta `> limiar`). O veredito mora em
+   * `RESTORE_DRILL_CHECK_LEVEL`, nunca aqui.
+   */
+  RESTORE_DRILL_AGE_SECONDS: 'maia_restore_drill_age_seconds',
+  /** Duração do último drill APROVADO — a contribuição medida ao RTO. */
+  RESTORE_DRILL_DURATION_SECONDS: 'maia_restore_drill_duration_seconds',
+  /** Veredito agregado de backup (RPO local/off-site, falhas, cifra). 0/1/2. */
+  BACKUP_READINESS_LEVEL: 'maia_backup_readiness_level',
+  /** Idade do artefato restaurável mais novo — o RPO medido, em segundos. */
+  BACKUP_AGE_SECONDS: 'maia_backup_age_seconds',
 
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */

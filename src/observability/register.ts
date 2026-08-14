@@ -10,6 +10,7 @@
  * driver, the WhatsApp stack or the DB client into a unit test.
  */
 import { logger } from '@/lib/logger.js';
+import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
 import {
   registerDbPoolGauges,
@@ -92,6 +93,25 @@ export async function registerRuntimeObservability(): Promise<void> {
   }
 
   registerSchedulerLagGauges(schedulerLagSnapshot);
+
+  // Issue #536 — the restore-drill gate. `maia_restore_drill_check_level` goes
+  // to 2 when the newest drill in `restore_drills` is older than
+  // `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`, when it failed, or (in production)
+  // when no drill has ever run. Read at SCRAPE time, from the evidence tables,
+  // so the level ages out even if the `restore_drill` worker itself stops —
+  // which is the failure the gate exists to catch. Everything it needs is
+  // imported lazily, for the same reason the collectors above are.
+  registerBackupReadinessGauges({
+    now: () => new Date(),
+    readFacts: async () => {
+      const { readReadinessFacts } = await import('@/db/repositories/ops-repos.js');
+      return readReadinessFacts();
+    },
+    resolveProfile: async () => {
+      const { backupProfile } = await import('@/ops/backup/config-input.js');
+      return backupProfile();
+    },
+  });
 
   startOtlpExporter();
 }

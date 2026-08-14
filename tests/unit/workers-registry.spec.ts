@@ -62,6 +62,10 @@ vi.mock('../../src/workers/backup.js', () => ({
   runNightlyBackup: noopAsync,
   // Renamed from `runCloudBackupRotation` in the #520 round-1 fix.
   runBackupRetention: noopAsync,
+  // Issue #536 — o tick do gate do drill de restore. O comportamento dele é
+  // provado em tests/unit/workers/restore-drill-scheduler.spec.ts, contra o
+  // JOBS real e o adapter real; aqui basta o stub para o registry carregar.
+  runScheduledRestoreDrill: noopAsync,
 }));
 vi.mock('../../src/workers/cost-monitor.js', () => noopWorkers);
 vi.mock('../../src/workers/audit-watcher.js', () => noopWorkers);
