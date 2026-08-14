@@ -75,6 +75,13 @@ const PRE_EXISTING_METRICS: Record<string, string> = {
     'src/control-plane/runtime-trace/envelope-writer.ts:131',
   maia_baileys_connected: 'src/server.ts:21',
   maia_db_connected: 'src/server.ts:22',
+  // Família da carga de contexto do turno (#525). Emitida por
+  // `recordTurnContextLoad`, que usa `incCounter/observeHistogram` de
+  // `src/lib/metrics.ts` direto — fora do gate de rótulos da taxonomia, como as
+  // demais entradas desta tabela. Entrou nas regras na review da PR #554, quando
+  // `maia:context_load_ms:p95` deixou de ter emissor: `maia_context_load_ms` era
+  // da montagem P8a, cujo hot path a PR #406 removeu.
+  maia_turn_context_load_duration_ms: 'src/agent/turn-context/metrics.ts:91',
 };
 
 /**

@@ -114,7 +114,6 @@ describe('issue #514 — observability taxonomy', () => {
         METRIC.TURN_DELIVERY_LATENCY_MS,
         METRIC.STAGE_DURATION_MS,
         METRIC.QUEUE_WAIT_MS,
-        METRIC.CONTEXT_LOAD_MS,
         METRIC.LLM_LATENCY_MS,
         METRIC.TOOL_DURATION_MS,
         METRIC.OUTBOUND_SEND_MS,

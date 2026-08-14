@@ -143,25 +143,42 @@ describe('issue #535 — instrumentToolDispatch', () => {
   });
 });
 
-describe('issue #535 — instrumentContextLoad', () => {
-  // Estes casos usavam `working_memory` e `episodic`, que nunca tiveram
-  // emissor e não estão no vocabulário fechado. Um spec que exercita valores
-  // inexistentes documenta uma superfície que não existe — e foi o que deixou
-  // a promessa de fatias viva no comentário por tanto tempo. Agora usam o
-  // único `stage` real, e o compilador recusa os outros.
-  it('emits duration and a slice counter on success', async () => {
-    await instrumentContextLoad(CONTEXT_LOAD_STAGE.PACKET, async () => 'slice');
+/**
+ * Review da PR #554 — `instrumentContextLoad` emite SPAN e mais nada.
+ *
+ * Os dois casos que viviam aqui asseriam `maia_context_load_ms` e
+ * `maia_context_slices_total`. As duas famílias foram aposentadas: a operação
+ * embrulhada é `loadTurnContext`, que já publica duração e round-trips por
+ * `recordTurnContextLoad` (`maia_turn_context_*`, #525). Duas famílias para uma
+ * operação é a divergência que a taxonomia existe para impedir.
+ *
+ * O que sobrou tem que ser assertado pelo NEGATIVO — "nenhuma métrica nova" é
+ * uma decisão de contrato, e contrato sem teste volta na primeira refatoração
+ * que "aproveita que já estamos medindo aqui".
+ *
+ * A prova de que o span sai no caminho de produção NÃO está aqui: está em
+ * `tests/integration/context-load-span-hot-path.spec.ts`, que entra pelo
+ * `runAgentForMensagem`. Um spec que chama o wrapper direto passa com o call
+ * site de produção apagado — foi exatamente esse buraco que a review pegou.
+ */
+describe('review da PR #554 — instrumentContextLoad é span-only', () => {
+  it('não emite NENHUMA métrica — nem a família aposentada, nem outra', async () => {
+    await instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => 'snapshot');
     const metrics = await renderPrometheus();
-    expect(metrics).toMatch(/maia_context_load_ms_count\{.*stage="packet".*status="ok"/);
-    expect(metrics).toMatch(/maia_context_slices_total\{.*stage="packet".*status="ok"/);
+    expect(metrics).not.toContain('maia_context_load_ms');
+    expect(metrics).not.toContain('maia_context_slices_total');
+    // E nada foi só renomeado: o registry inteiro fica sem qualquer série
+    // carregando o `stage` desta carga.
+    expect(metrics).not.toContain('stage="turn_context"');
   });
 
-  it('marks a failed slice and rethrows', async () => {
+  it('propaga o valor e relança o erro sem tocar em nenhuma série', async () => {
+    expect(await instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => 42)).toBe(42);
+    const boom = new Error('x');
     await expect(
-      instrumentContextLoad(CONTEXT_LOAD_STAGE.PACKET, async () =>
-        Promise.reject(new Error('x')),
-      ),
-    ).rejects.toThrow('x');
-    expect(await renderPrometheus()).toMatch(/maia_context_slices_total\{.*status="error"/);
+      instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, async () => Promise.reject(boom)),
+      // Mesma INSTÂNCIA: o caminho fail-closed do turno ramifica no erro.
+    ).rejects.toBe(boom);
+    expect(await renderPrometheus()).not.toContain('maia_context');
   });
 });

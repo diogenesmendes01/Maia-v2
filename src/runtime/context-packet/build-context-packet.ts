@@ -45,8 +45,6 @@ import type {
   SliceBuilderResult,
 } from '../context-assembly/slice-builders/_types.js';
 import type { SliceCache } from './cache/slice-cache.js';
-import { instrumentContextLoad } from '@/observability/instrumentation.js';
-import { CONTEXT_LOAD_STAGE } from '@/observability/taxonomy.js';
 
 export interface HistoryRequirements {
   depth: 'none' | 'last_turns' | 'relevant';
@@ -211,46 +209,7 @@ function raceBuilderAgainstDeadline<T>(
   return Promise.race([builderPromise, timeoutPromise]);
 }
 
-/**
- * Issue #535 gate 6 — the `stage="packet"` call site.
- *
- * `instrumentContextLoad` shipped with a spec and no caller: the histogram
- * `maia_context_load_ms`, the counter `maia_context_slices_total` and the span
- * `context.load` were declared, dashboarded (`maia:context_load_ms:p95`) and
- * never produced a single series. This wrapper is the production emitter for
- * the `packet` stage.
- *
- * Why HERE and not inside the body:
- *   - the span must cover the COMPLETE assembly — including the budget timer
- *     setup and the `finally` that clears it — and exactly once per assembly.
- *     Wrapping the exported entry point is the only position where "once per
- *     montagem" is structural instead of a review note (same shape as
- *     `dispatchTool` → `dispatchToolInner` in `src/tools/_dispatcher.ts`);
- *   - it cannot nest: `buildContextPacketInner` never calls back into the
- *     exported name, so there is no path that opens two `context.load` spans
- *     for one packet.
- *
- * Cardinality: the stage is the module-level constant
- * `CONTEXT_LOAD_STAGE.PACKET`. Nothing here reads a name out of `input`,
- * `deps`, config or the tenant, so no caller can mint a new `stage` series —
- * the property `tests/unit/observability/context-load-call-site.spec.ts`
- * proves with hostile input.
- *
- * Transparency: `instrumentContextLoad` returns the value and rethrows the
- * error unchanged, so the fail-closed policy path (throw on policy
- * rejection/timeout) reaches the caller exactly as before — it just also
- * records `status="error"`.
- */
 export async function buildContextPacket(
-  input: BuildContextPacketInput,
-  deps: BuildContextPacketDeps,
-): Promise<ExecutionContextPacket> {
-  return instrumentContextLoad(CONTEXT_LOAD_STAGE.PACKET, () =>
-    buildContextPacketInner(input, deps),
-  );
-}
-
-async function buildContextPacketInner(
   input: BuildContextPacketInput,
   deps: BuildContextPacketDeps,
 ): Promise<ExecutionContextPacket> {

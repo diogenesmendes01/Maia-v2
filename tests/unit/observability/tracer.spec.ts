@@ -278,12 +278,16 @@ describe('issue #535 — tracer', () => {
       // failure #535 opens with; shipping a reachable emitter without flipping
       // the flag understates coverage in the runbook.
       //
-      // "Reaches", not "instruments": `context.load` has a real site in
-      // `buildContextPacket` and is deliberately absent here, because PR #406
-      // removed the hot path that called it. The two readings came apart on
-      // that span, and the review of PR #554 settled it in favour of this one.
+      // "Reaches", not "instruments" — do not weaken this back. `context.load`
+      // is here because the wrapper moved to `loadTurnContext`
+      // (`src/agent/turn-context/loader.ts`), which `buildPrompt` calls on
+      // every turn; it was ABSENT under the same definition while the site sat
+      // on `buildContextPacket`, whose hot path PR #406 deleted. The proof that
+      // a real turn opens it is `tests/integration/context-load-span-hot-path.spec.ts`,
+      // which enters through `runAgentForMensagem` — this list is the
+      // bookkeeping, that spec is the evidence.
       expect([...EMITTED_SPANS].sort()).toEqual(
-        [SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
+        [SPAN.CONTEXT_LOAD, SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
       );
     });
 

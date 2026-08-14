@@ -104,6 +104,8 @@ import type {
 import { renderOperationalProfile, type RenderedProfile } from '@/identity/profile-renderer.js';
 import { logger } from '@/lib/logger.js';
 import { GapLevel } from '@/types/enums.js';
+import { instrumentContextLoad } from '@/observability/instrumentation.js';
+import { CONTEXT_LOAD_STAGE } from '@/observability/taxonomy.js';
 import { readCached } from './cache.js';
 import { createReadGate, type ReadGate } from './concurrency.js';
 import { recordSectionStatus, type TurnContextSection } from './metrics.js';
@@ -368,8 +370,42 @@ async function optional<T>(
  * a given turn, leaving 4 connections for every other turn and tenant. Six is
  * the ceiling the pre-#525 code documented and enforced; #525 dropped it, and
  * PR #541's review found the pool it left exposed.
+ *
+ * ## The `context.load` span lives HERE (review da PR #554)
+ *
+ * The exported entry point delegates to `loadTurnContextInner` for one reason:
+ * this is the position where "uma vez por carga de turno" is STRUCTURAL rather
+ * than a review note. `loadTurnContextInner` never calls back into the exported
+ * name, so no path can open two `context.load` spans for one load, and every
+ * caller — production's `buildPrompt` included — is covered by construction
+ * instead of by remembering to wrap the call.
+ *
+ * Why not one level up, in `buildPrompt`:
+ *
+ *  1. `buildPrompt` is LOAD + RENDER, and the render half has its own declared
+ *     span, `prompt.render`, which `SPAN_PARENT` makes a SIBLING of
+ *     `context.load` under `turn`. A span opened around `buildPrompt` would
+ *     eventually contain `prompt.render`, and the exported tree would contradict
+ *     the declared one. Here the two stay siblings, which is what the taxonomy
+ *     says and what `isDeclaredAncestor` checks.
+ *  2. Wrapping a STATEMENT inside a function is a convention; wrapping an
+ *     exported entry point is a shape. The first survives only until someone
+ *     adds a second call site — which is exactly how the previous instrumentation
+ *     ended up on a function no turn calls.
+ *
+ * Nesting is safe: nothing between the worker's root `turn` span and this call
+ * opens a span, so the runtime parent IS `turn` — the declared parent. The span
+ * is the ONLY thing emitted here; duration and round-trips for this same load
+ * are published by `recordTurnContextLoad` in `buildPrompt`, and duplicating
+ * them was the defect the review of PR #554 removed.
  */
 export async function loadTurnContext(req: TurnContextRequest): Promise<TurnContextSnapshot> {
+  return instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, () =>
+    loadTurnContextInner(req),
+  );
+}
+
+async function loadTurnContextInner(req: TurnContextRequest): Promise<TurnContextSnapshot> {
   const degradedSections: string[] = [];
 
   // ONE gate for both groups. Per-turn (a fresh gate per call), so a slow turn
