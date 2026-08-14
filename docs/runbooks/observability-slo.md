@@ -272,6 +272,54 @@ SELECT created_at, metadata->>'provider' AS provider,
  ORDER BY created_at;
 ```
 
+### 4.9.3 `MaiaLlmCircuitResyncFailedEnforcing` / `MaiaLlmCircuitResyncFailed`
+
+Uma réplica reconectou o subscriber do kill switch e **não conseguiu afirmar**
+que está consistente com o Redis. O estado local dela foi **preservado**
+(fail-closed — ver [`operational.md` §3.1](operational.md)), então ela seguiu com
+a postura que já tinha e **pode não ter recebido a virada do disjuntor**.
+
+| Alerta | Postura da réplica | Por que essa severidade |
+|---|---|---|
+| `MaiaLlmCircuitResyncFailedEnforcing` | `enforce` | **Página.** A réplica pode estar recusando tráfego que o plantão já mandou parar de recusar — ou deixando de recusar o que a frota recusa. É o modo de falha que a alavanca de incidente existe para evitar. |
+| `MaiaLlmCircuitResyncFailed` | `shadow` ou `off` | **Warning.** Nada está sendo recusado, o dano é de MEDIÇÃO — mas é a mesma falha que em `enforce` seria página, e sombra divergente não sustenta a decisão de promover. |
+
+**Os dois seletores são complementares de propósito** (`state="enforce"` e
+`state!="enforce"`): qualquer `resync_failed` alerta. Listar só `shadow` no
+segundo deixaria uma réplica divergente em `off` sem alerta nenhum.
+
+**Por que o alerta é por réplica e nunca agregado.** O evento é sobre UMA
+réplica; somado sobre a frota (ou virado razão sobre o total de releituras) ele
+some — uma entre vinte não cruza limiar nenhum, e sem `instance` o plantão não
+sabe onde olhar. `increase()` sem agregação preserva `instance` e `job`, e
+`tests/unit/observability/slo-rules.spec.ts` reprova qualquer `sum`/`avg`/razão
+sobre essa série.
+
+**Triagem, em ordem:**
+
+1. Qual réplica e qual causa — `outcome` no log separa os dois casos:
+
+   ```bash
+   journalctl -u maia | grep llm_gateway.circuit_override_resync_failed | tail
+   # {"outcome":"failed","state":"enforce","err":"…"}
+   ```
+
+   | `outcome` | O que aconteceu | Ação |
+   |---|---|---|
+   | `failed` | não houve leitura defensável (`GET` falhou, chave ilegível, re-inscrição sem ack) | trate como Redis inalcançável por aquela réplica: cheque `redis.rules.yml`, rede e o `maxmemory` do Redis |
+   | `rejected` | a chave FOI lida e o payload foi recusado pela governança (sem `expires_at` absoluto, sem ator, vencido, acima do teto) | `redis-cli GET maia:llm:circuit:override` — republicar não conserta payload inválido |
+
+2. Converja a réplica: republicar o override é idempotente
+   (`SET` + `PUBLISH`, [`operational.md` §3.1](operational.md)). Se o alerta
+   voltar na mesma réplica, ela está sem Redis — use a segunda alavanca
+   (`LLM_CIRCUIT_MODE=off` + restart) naquela réplica em vez de insistir.
+
+**O que este alerta NÃO é:** `superseded` (a releitura perdeu para uma mensagem
+do canal) e `cleared` (o `clear` perdido convergiu) são **convergência** e saem
+como `reason="resynced"`. Se algum deles começar a aparecer como
+`resync_failed`, o defeito é no balde `DIVERGENT_OUTCOMES`
+(`src/lib/llm/cache-invalidation.ts`), não no Redis.
+
 ### 4.10 `MaiaWhatsAppDisconnected` / `MaiaDbDisconnected`
 
 Ver `docs/runbooks/operational.md` e `docs/runbooks/whatsapp-migration.md`.

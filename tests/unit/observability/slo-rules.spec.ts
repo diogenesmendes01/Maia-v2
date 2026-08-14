@@ -263,6 +263,126 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
 });
 
 /**
+ * Issue #534 — o alerta de `resync_failed`, e a propriedade que ele não pode
+ * perder: uma réplica divergente basta.
+ *
+ * A série existia desde a #552 e nada a observava. O que ela responde é "esta
+ * réplica pode estar divergente da frota, e o kill switch pode não tê-la
+ * alcançado" — uma pergunta POR RÉPLICA. Escrita com `sum`, `avg` ou como razão
+ * sobre o total de releituras, ela deixa de responder isso: uma réplica entre
+ * vinte vira 5% de alguma coisa e não cruza limiar nenhum, ou vira um alerta sem
+ * `instance` que já está firing quando a segunda réplica diverge. Este bloco é o
+ * guard dessa propriedade — o texto do YAML é a única superfície onde ela pode
+ * ser verificada sem um servidor Prometheus.
+ */
+describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
+  const RESYNC_ALERTS = {
+    MaiaLlmCircuitResyncFailedEnforcing: 'critical',
+    MaiaLlmCircuitResyncFailed: 'warning',
+  } as const;
+
+  /** Bloco de um alerta: do nome dele até o próximo `- alert:` (ou o fim). */
+  function alertBlock(name: string): string {
+    const start = rules.indexOf(`- alert: ${name}\n`);
+    expect(start, `alerta ${name} não existe em slo.rules.yml`).toBeGreaterThan(-1);
+    const rest = rules.slice(start + 1);
+    const end = rest.indexOf('- alert: ');
+    return end === -1 ? rest : rest.slice(0, end);
+  }
+
+  /** A `expr` do bloco, escalar ou em bloco YAML, já sem indentação. */
+  function exprOf(block: string): string {
+    const lines = block.split('\n');
+    const i = lines.findIndex((l) => /^\s*expr:/.test(l));
+    expect(i, 'bloco de alerta sem `expr`').toBeGreaterThanOrEqual(0);
+    const indent = lines[i]!.match(/^\s*/)![0].length;
+    const out = [lines[i]!.replace(/^\s*expr:\s*\|?\s*/, '')];
+    for (const line of lines.slice(i + 1)) {
+      if (line.trim() === '') continue;
+      if (line.match(/^\s*/)![0].length <= indent) break;
+      out.push(line.trim());
+    }
+    return out.join(' ').trim();
+  }
+
+  it('os dois alertas existem, com a severidade que o modo pede', () => {
+    // `enforce` = a réplica pode estar recusando tráfego que o plantão já
+    // mandou parar de recusar ⇒ página. Fora dele, warning.
+    for (const [name, severity] of Object.entries(RESYNC_ALERTS)) {
+      expect(alertBlock(name), `${name} não declara severity: ${severity}`).toMatch(
+        new RegExp(`severity: ${severity}\\b`),
+      );
+    }
+  });
+
+  it('a severidade é decidida pelo rótulo `state`, que é a postura PRESERVADA', () => {
+    // `state` na série de resync é `effectiveMode()` no fim da releitura
+    // (`src/lib/llm/cache-invalidation.ts`, `finishResync`). É o caminho que já
+    // existe para correlacionar postura e falha — não há rótulo novo.
+    expect(exprOf(alertBlock('MaiaLlmCircuitResyncFailedEnforcing'))).toContain('state="enforce"');
+    expect(exprOf(alertBlock('MaiaLlmCircuitResyncFailed'))).toContain('state!="enforce"');
+  });
+
+  it('nenhuma das duas expressões agrega por cima das réplicas', () => {
+    // O defeito que este teste existe para pegar: `sum by (state) (...)`,
+    // `avg(...)`, ou uma razão sobre o total de releituras. Qualquer um deles
+    // apaga o `instance` — e uma réplica divergente entre vinte, que é o caso
+    // do alerta, some.
+    const AGGREGATORS = /\b(sum|avg|min|max|count|count_values|topk|bottomk|quantile|group|stddev|stdvar)\s*(by|without)?\s*(\([^)]*\))?\s*\(/;
+    for (const name of Object.keys(RESYNC_ALERTS)) {
+      const expr = exprOf(alertBlock(name));
+      expect(expr, `${name} agrega a série e perde o \`instance\`: ${expr}`).not.toMatch(
+        AGGREGATORS,
+      );
+      expect(expr, `${name} tem \`by(...)\`/\`without(...)\`: o \`instance\` some`).not.toMatch(
+        /\b(by|without)\s*\(/,
+      );
+      // Razão é a outra forma de diluir uma réplica na frota.
+      expect(expr, `${name} virou razão: uma réplica entre vinte não cruza limiar`).not.toContain(
+        '/',
+      );
+      expect(expr).toContain('maia_llm_circuit_mode_overrides_total');
+      expect(expr).toContain('reason="resync_failed"');
+    }
+  });
+
+  it('a série de resync não é agregada em NENHUMA linha executável, em nenhum arquivo', () => {
+    // O guard acima é sobre os dois alertas de hoje. Este é sobre a série: um
+    // `sum(...)` sobre `resync_failed` em qualquer regra futura (recording rule
+    // inclusive) reintroduz o mesmo defeito por outra porta.
+    const offenders: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const [n, line] of RULE_TEXT[file]!.split('\n').entries()) {
+        if (/^\s*#/.test(line)) continue;
+        if (!line.includes('resync_failed')) continue;
+        if (/\b(sum|avg|count|topk|group)\s*(by|without)?\s*(\([^)]*\))?\s*\(/.test(line)) {
+          offenders.push(`${file}:${n + 1}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      'agregação sobre `resync_failed` — a réplica divergente some no total: ' +
+        offenders.join(' | '),
+    ).toEqual([]);
+  });
+
+  it('nenhum `resync_failed` fica sem alerta: os dois seletores cobrem todo `state`', () => {
+    // "Qualquer `resync_failed` deve alertar" (decisão do owner). Listar só
+    // `shadow` no segundo deixaria uma réplica divergente em `off` sem alerta
+    // nenhum — o buraco que esta leva vem fechando.
+    const selectors = Object.keys(RESYNC_ALERTS).map((n) => exprOf(alertBlock(n)));
+    const enforce = selectors.filter((s) => /state="enforce"/.test(s));
+    const rest = selectors.filter((s) => /state!="enforce"/.test(s));
+    expect(enforce, 'ninguém alerta `state="enforce"`').toHaveLength(1);
+    expect(
+      rest,
+      'o complemento de `enforce` não é coberto: um `resync_failed` em `off` ou `shadow` não alertaria',
+    ).toHaveLength(1);
+  });
+});
+
+/**
  * Issue #536 — the same guard, over EVERY committed rule file.
  *
  * The block above is about `slo.rules.yml` and its SLO semantics. This one is
