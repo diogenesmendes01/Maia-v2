@@ -1207,6 +1207,230 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 
 ---
 
+## 11. Gate de desempenho da carga de contexto do turno (issue #525)
+
+`npm run turn:bench` roda o gate que o dono fixou para a #525: Postgres real,
+pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades,
+braços `cold` e `warm`. Ele **exercita `buildPrompt`** — o call site de produção,
+que é quem publica `maia_turn_context_load_duration_ms{phase="loader"}`.
+
+Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
+escreve ~13 mil linhas de massa e devolve o veredicto por **exit code**.
+
+### Pré-requisitos
+
+```bash
+# Postgres migrado e alcançável. O harness usa o mesmo default de tests/setup.ts
+# e qualquer variável já presente no ambiente VENCE sobre esse default.
+export DATABASE_URL=postgres://maia_test:test1234@localhost:5432/maia_test
+export REDIS_URL=redis://localhost:6379     # o braço `warm` usa o subscriber de invalidação
+npm run db:migrate
+```
+
+### Medir e barrar são coisas diferentes (`--mode`)
+
+O harness faz as duas, e o modo é DECLARADO — não deduzido de uma flag no meio
+do comando:
+
+| `--mode` | o que é | exit code |
+|---|---|---|
+| `gate` (**default**) | o veredicto. Todo critério obrigatório precisa ter sido AVALIADO | `0` aprovado · `1` reprovado (inclui "não avaliado") · `2` erro de uso/infra |
+| `measure` | medição absoluta. **NÃO emite veredicto de gate** e diz isso em caixa alta no relatório | `0` (a medição aconteceu) · `2` erro |
+| `self-test` | prova que o gate reprova, sobre valores sintéticos | como `gate` |
+
+A regra que amarra tudo: **um critério `n/a` reprova em modo `gate`**. Não
+avaliado deixou de ser sinônimo de aprovado — era essa igualdade que deixava um
+checkout limpo, sem baseline registrado, sair com exit 0 como se tivesse passado
+pelo critério relativo. Se você quer medir sem ter a evidência completa, o modo
+é `measure`, e ali o relatório não se apresenta como gate.
+
+### O comando do gate
+
+```bash
+# Perfil canônico: 60 s de carga sustentada por braço (~3 min no total).
+# A janela de 60 s é o que torna o critério de saturação do pool FALSIFICÁVEL;
+# sem --sustain-s ele sai como "não avaliado" — e "não avaliado" REPROVA.
+npm run turn:bench -- --sustain-s 60
+
+echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
+```
+
+Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
+Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
+comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+o que não mediu. Para medir sem baseline, use `--mode measure`.
+
+Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
+O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
+
+### Os limites, e o que fazer quando um deles fica vermelho
+
+| veredicto vermelho | leitura | primeiro passo |
+|---|---|---|
+| `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
+| `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
+| `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
+| `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
+| `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
+| `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
+| `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
+| `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
+| `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
+| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
+| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
+| `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
+
+### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
+
+O gerador é de **malha fechada**: `--concurrency` workers, cada um começando o
+turno seguinte assim que o anterior acaba. Com `--think-ms 0` isso mantém 20
+turnos sempre em voo; como cada turno pode segurar até 6 conexões de um pool de
+10, a fila **não tem como esvaziar** — é aritmética, não defeito. Medido em host
+de 4 vCPU com Postgres local, braço `cold`, concorrência 20:
+
+| `--think-ms` | turnos/s | p50 | p95 | amostras saturadas | maior sequência |
+|---|---|---|---|---|---|
+| 0 | 90,7 | 187,7 ms | 386,8 ms | 142/142 (100%) | a corrida inteira |
+| 150 (default) | 102,1 | 28,8 ms | 108,7 ms | 99/145 (68%) | 1,3 s |
+| 300 | 60,0 | 14,5 ms | 87,1 ms | 27/149 (18%) | 0,3 s |
+
+Note que o martelo entrega **menos** vazão que o ritmo de 150 ms: passado o
+joelho da capacidade, a fila só acrescenta espera.
+
+### Os dois perfis (decisão do dono sobre a #525)
+
+> "Concorrência 20 continua como máximo de requisições em voo, mas o perfil
+> normal deve definir ritmo/`think_ms`. O perfil sem ritmo passa a ser **teste de
+> saturação**; nele, exige-se zero erros/timeouts e **drenagem depois que o
+> produtor para** — não drenagem enquanto 20 turnos são repostos continuamente."
+
+| perfil | como se roda | critério de drenagem |
+|---|---|---|
+| **normal** | `--think-ms 150` (default), o do gate canônico | a fila esvazia **durante** a carga e nunca fica saturada por 60 s seguidos |
+| **saturação** | `--think-ms 0` | a fila esvazia **depois que o produtor para**. Zero erros/timeouts continua valendo |
+
+Cobrar drenagem durante a carga no perfil sem ritmo era pedir o impossível — 20
+turnos repostos continuamente, até 6 conexões cada, contra um pool de 10 — e
+produzia vermelho que não significava regressão.
+
+Por isso toda corrida tem duas **fases**: carga (produtor emitindo) e escoamento
+(produtor parado, `--drain-window-ms`, default 2 s). O amostrador marca a
+fronteira por timestamp e conta as amostras de cada lado. Sem essa janela não
+existe fase de escoamento para observar: o gerador é de malha fechada, então
+quando os workers retornam todo turno já terminou, e o amostrador era parado
+nesse mesmo instante — zero amostras do lado que interessa.
+
+**Amostras só da fase de carga não são evidência de drenagem.** Esse caso sai
+`n/a` e, em modo `gate`, reprova — pelo mesmo motivo que zero amostras reprova.
+
+Medido neste host, perfil de saturação (`--think-ms 0 --turns 400`, braço
+`cold`): 40/40 amostras saturadas na carga — 100 %, como a aritmética manda — e
+0/20 na janela de escoamento, com a fila esvaziando **39 ms** depois de o
+produtor parar. Exit 0.
+
+### Baseline
+
+```bash
+# Grava o p95/p99 medidos como referência. NUNCA acontece como efeito colateral
+# de uma corrida de gate: baseline é decisão, e por isso exige --mode measure.
+npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline
+```
+
+`--write-baseline` em modo `gate` é **recusado com exit 2**. Sem essa trava, a
+mesma corrida que julga produziria a referência contra a qual ela seria julgada
+depois, e "medição absoluta" e "gate" voltariam a ser a mesma saída.
+
+`scripts/turn-context-baseline.json` carrega `recorded_at`, `host`, um `note`
+dizendo se é a PRIMEIRA medição ou uma re-gravação, e — desde a correção dos
+achados Medium — o **fingerprint da carga**. O arquivo **não é versionado**
+(está no `.gitignore`): é a medição da SUA máquina, e cada host grava o seu na
+primeira corrida. Três regras:
+
+1. **O baseline é por host — e por momento do host.** Não é figura de retórica.
+   Um baseline gravado neste repositório a p95 67,0 ms (`cold`) / 75,9 ms (`warm`)
+   foi reproduzido no MESMO host de 4 vCPU, com o mesmo código e o banco vazio,
+   num contêiner posterior: 135,5 / 118,5 ms, e depois 154,1 / 114,9 ms. De 56 %
+   a 130 % acima do número gravado, sem que nenhum limite absoluto do gate
+   (600 ms / 1 s) chegasse perto de cair. Versionar esse arquivo entregaria um
+   gate vermelho na chegada para todo mundo que não fosse a máquina que o gravou.
+2. **A variação entre corridas iguais na mesma sessão é de ~10–15 %**; a folga de
+   +20 % é dimensionada para isso. Ela NÃO absorve troca de máquina, de contêiner
+   nem host ocupado — nesses casos re-grave, não discuta o delta.
+3. **Re-gravar é uma decisão de revisão.** A folga existe para absorver ruído, não
+   regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
+   aceitou o motivo — não numa corrida solta.
+
+#### O fingerprint: comparar dois p95 medidos com cargas diferentes não é comparar
+
+O baseline grava a FORMA da corrida que o produziu, e a comparação é **recusada**
+— não apenas avisada — quando ela diverge. Comparados:
+
+| campo | por que muda o número medido |
+|---|---|
+| `pairs` | quantos pares distintos a carga toca: localidade de cache e volume por escopo |
+| `concurrency` | é o regime de fila; domina a cauda |
+| `think_ms` | **o que mais move o número**: p95 de 28,8 ms com 150 ms contra 187,7 ms com 0 |
+| `identity` | `legacy` paga um round-trip a mais por turno |
+| `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê |
+| `pool_max` | o denominador da saturação. Pool 10 e pool 20 são dois sistemas |
+| `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`, lido do código |
+| `turns` · `sustain_s` | a duração amortiza o transiente de aquecimento. Mesmo host, mesmo código, minutos de intervalo: 600 turnos (5,7 s) → p95 **118,6 ms**; 60 s sustentados (7 389 turnos) → p95 **22,4 ms**. 5× de diferença por duração de corrida |
+
+Registrados mas **não** comparados, de propósito — um fingerprint que invalida o
+baseline a cada corrida vira ruído que o operador aprende a ignorar: `host` e
+`node`/`platform` (o baseline já é por máquina), `timeout_ms` (classifica
+timeouts, não move latência) e `sample_ms` (observa o POOL, não entra no p95 do
+turno).
+
+Consequência prática: **o baseline precisa ser gravado com o mesmo comando com
+que o gate roda.** Um baseline de `--turns 600` sem `--sustain-s` comparado
+contra o gate canônico não é regressão, é outra corrida — e o harness diz isso
+em vez de pintar 342 % de delta.
+
+Um baseline em formato antigo — sem fingerprint — também é recusado: ele não
+prova com que carga foi medido, e assumir que foi com a certa é o buraco que
+esta trava fecha. Apague o arquivo e re-grave.
+
+Quando um número tem que valer para todo mundo, ele está nos critérios absolutos:
+p95 ≤ 600 ms, p99 ≤ 1 s, zero erros, pico ≤ 6, o pool drenando, a métrica cobrindo
+todos os turnos e a carga com a forma do enunciado. Leia esses primeiro.
+
+### Provar que o gate reprova
+
+O veredicto é código, e código sem prova de falha é decoração. Sem tocar no
+banco:
+
+```bash
+npm run turn:bench -- --self-test --inject p95_ms=900              # exit 1
+npm run turn:bench -- --self-test --inject peak_reads_per_turn=7   # exit 1
+npm run turn:bench -- --self-test --inject cold.errors=1           # exit 1
+npm run turn:bench -- --self-test --inject pool_samples=0          # exit 1 — zero amostras não é "drenou"
+npm run turn:bench -- --self-test --self-test-baseline missing     # exit 1 — sem baseline não há gate
+npm run turn:bench -- --self-test --self-test-baseline incompatible # exit 1 — baseline de outra carga
+```
+
+`--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
+fundos que faz qualquer regressão passar. O autoteste usa um baseline SINTÉTICO,
+nunca o arquivo da máquina: um gate cujo autoteste muda de resultado conforme o
+host não prova nada. A bateria completa (todos os critérios, incluindo pico baixo
+demais, pool que nunca drena, amostragem cega e baseline incompatível) vive em
+`tests/unit/scripts/turn-context-gate.spec.ts` e roda na suíte normal.
+
+### Massa e limpeza
+
+Tudo que o harness cria usa `tenant_id` com prefixo `bench525-` e é removido no
+`finally` e também em `SIGINT`/`SIGTERM`. Se uma corrida morreu de um jeito que
+não deixou nada rodar:
+
+```bash
+npm run turn:bench -- --cleanup-only
+```
+
+O harness **nunca roda `ANALYZE`** — num banco compartilhado com a suíte,
+`ANALYZE` não é desfeito por `ROLLBACK` e envenenaria o plano dos outros specs.
+
+---
+
 ## Apêndice — referências cruzadas
 
 - **`docs/runbooks/redis.md`** — política de memória multi-tenant, sizing, sinais de pressão. Leia ANTES de mexer em `maxmemory*` no compose ou no Redis gerenciado.

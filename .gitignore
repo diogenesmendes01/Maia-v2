@@ -71,3 +71,10 @@ src/admin-ui/next-env.d.ts
 # Artefato do redis-server quando ele é iniciado a partir da raiz do repo
 # (sandbox de teste). Nunca é código.
 dump.rdb
+
+# Baseline do gate da #525 (`npm run turn:bench`): é uma medição DAQUELA máquina,
+# não um artefato compartilhado. Cada host/esteira grava o seu com --write-baseline.
+scripts/turn-context-baseline.json
+
+# Saídas de corrida do gate da #525 (`npm run turn:bench`) — artefatos locais.
+bench-*.out

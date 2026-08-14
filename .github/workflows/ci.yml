@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited` está aqui de propósito. O job roda `pr:body:check`, que valida o
+    # CORPO do PR — e os tipos default (`opened`, `synchronize`, `reopened`) não
+    # incluem edição de descrição. Sem isto o check é insatisfazível: ele reprova
+    # por causa do corpo, corrigir o corpo não dispara nada, e a única saída é
+    # empurrar um commit que não tem relação com o problema. Um gate que não pode
+    # ficar verde consertando aquilo de que ele reclama não é um gate.
+    types: [opened, synchronize, reopened, edited]
 
 # Cancel in-progress runs on the same branch when a new push lands.
 concurrency:
