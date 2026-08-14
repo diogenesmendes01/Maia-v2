@@ -279,26 +279,23 @@ export type ExpiredRunScope = {
  * exatamente o defeito que este agregado existe para corrigir.
  */
 class ScopeTally {
-  private readonly counts = new Map<string, { scope: ExpiredRunScope; total: number }>();
+  private readonly counts = new Map<
+    string,
+    { tenant_id: string | null; agent_id: string | null; total: number }
+  >();
   private total = 0;
 
   add(tenant_id: string | null, agent_id: string | null): void {
     const key = JSON.stringify([tenant_id, agent_id]);
     const entry = this.counts.get(key);
     if (entry) entry.total += 1;
-    else this.counts.set(key, { scope: { tenant_id, agent_id, total: 0 }, total: 1 });
+    else this.counts.set(key, { tenant_id, agent_id, total: 1 });
     this.total += 1;
   }
 
+  /** `total` é somado à parte: a soma dos escopos e o total NÃO podem divergir. */
   result(): { total: number; by_scope: ExpiredRunScope[] } {
-    return {
-      total: this.total,
-      by_scope: Array.from(this.counts.values()).map((e) => ({
-        tenant_id: e.scope.tenant_id,
-        agent_id: e.scope.agent_id,
-        total: e.total,
-      })),
-    };
+    return { total: this.total, by_scope: Array.from(this.counts.values()) };
   }
 }
 
@@ -981,7 +978,7 @@ export const onboardingRunsRepo = {
    * DEVOLVE UM AGREGADO LIMITADO POR ESCOPO, não uma contagem (decisão do dono
    * na revisão de #555). O motivo é de observabilidade e não de conveniência:
    * `maia_onboarding_run_cancelled_total{reason="expired"}` é a MESMA série que
-   * o cancelamento pelo console emite (`src/onboarding/wizard.ts:590`), e
+   * o cancelamento pelo console emite (`src/onboarding/wizard.ts:595`), e
    * aquele caminho a atribui ao `tenant_id + agent_id` da run. Com só a
    * contagem, o varredor não tinha como fazer o mesmo e a metade dele saía sob
    * `system`: duas fontes da mesma série com atribuição diferente, e um
