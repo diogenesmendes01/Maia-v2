@@ -1,5 +1,8 @@
 import { config } from '@/config/env.js';
-import { onboardingRunsRepo } from '@/db/repositories/onboarding-repos.js';
+import {
+  onboardingRunsRepo,
+  type ExpiredRunScope,
+} from '@/db/repositories/onboarding-repos.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { counter, scopeAttribution, METRIC } from '@/observability/metrics.js';
@@ -154,7 +157,7 @@ export function onboardingExpirerBatchLimit(): number {
  * e incrementa `maia_metric_label_cardinality_overflow_total` — degrada, não
  * detona.
  */
-function emitCancelled(by_scope: readonly { tenant_id: string | null; agent_id: string | null; total: number }[]): void {
+function emitCancelled(by_scope: readonly ExpiredRunScope[]): void {
   for (const scope of by_scope) {
     counter(
       METRIC.ONBOARDING_RUN_CANCELLED,
