@@ -90,7 +90,7 @@ Observability with tenant attribution is the operational corollary: a dashboard 
 
 | Path | Role |
 |---|---|
-| `src/admin-ui/` | Next.js 14 + tRPC + NextAuth; 16 routers including: agents, audit, capabilities, channelPolicies, drift, inbox, knowledge, llmSettings, procedures, proposals, skills, tenants, tools-catalog, traces, versions, dashboard |
+| `src/admin-ui/` | Next.js 15.5 + React 19 + tRPC + NextAuth; 16 routers including: agents, audit, capabilities, channelPolicies, drift, inbox, knowledge, llmSettings, procedures, proposals, skills, tenants, tools-catalog, traces, versions, dashboard |
 
 ## 4. Patterns
 
