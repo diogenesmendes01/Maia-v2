@@ -153,6 +153,26 @@ jobs:
         # `npx` instead of an npm script keeps CI independent of script renames.
         run: npx tsc --noEmit
 
+      - name: Install admin-ui deps
+        # O `npm ci` da raiz não instala o `src/admin-ui`, que tem lockfile
+        # próprio. Sem isto o passo abaixo reprovaria com "Cannot find module
+        # 'next'" — falha de ambiente disfarçada de erro de tipo.
+        working-directory: src/admin-ui
+        run: npm ci
+
+      - name: Typecheck admin-ui (tsc --noEmit)
+        # Issue #550: o `AGENTS.md` manda rodar `npm run admin:typecheck`, e ele
+        # estava QUEBRADO no `main` sem que nada reprovasse — porque nenhuma
+        # esteira o executava. Um comando que o manual exige e que ninguém
+        # verifica é pior que não ter o comando: quem segue o manual vê vermelho
+        # e não sabe se foi ele que quebrou.
+        #
+        # Passo próprio, e não `&&` no anterior, para a falha apontar o projeto
+        # certo. O admin fixa `@types/node` em 22.9.0 enquanto a raiz está em
+        # 25.x, então este passo cobre um conjunto de typings que o `tsc` da raiz
+        # não exercita — a divergência em si segue aberta na #550.
+        run: npm run admin:typecheck
+
       - name: Build + verify artifact
         # Atomic: dist/ check is chained with `&&` so the step fails if build
         # fails OR if no dist/index.js was produced.
