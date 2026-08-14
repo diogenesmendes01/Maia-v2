@@ -119,15 +119,19 @@ export function onboardingExpirerBatchLimit(): number {
  * pode saber.
  *
  * POR QUE ISSO NÃO É "SÓ PASSAR UM PARÂMETRO": `counter()` resolve
- * `tenant_id`/`agent_id` LENDO O ALS no instante da emissão e o valor do
+ * `tenant_id`/`agent_id` LENDO O ALS no instante da emissão, e o valor do
  * chamador só vence quando NÃO É `null`/`undefined`
  * (`src/observability/metrics.ts`, `merged.tenant_id ?? attr.tenant_id`).
- * Repassar `run.tenant_id` cru funcionaria para a run com tenant e falharia
- * exatamente na run SEM tenant — que herdaria silenciosamente o escopo do ALS.
- * Sob `runWithSystemContext` isso ainda pareceria certo (`system`), e viraria
- * o rótulo errado no dia em que alguém invocasse o worker de dentro de um
- * contexto de tenant. `scopeAttribution` colapsa `null → 'system'` ANTES da
- * emissão, então o rótulo é DECLARADO, não herdado.
+ * Repassar `run.tenant_id` CRU acerta a run com tenant e, na run SEM tenant,
+ * devolve a decisão do rótulo ao contexto ambiente: o rótulo passa a depender
+ * de o `runWithSystemContext` abaixo continuar existindo, em vez de ser um fato
+ * deste emissor. Hoje os dois concordam em `system` — e é justamente por isso
+ * que a diferença é invisível até o dia em que alguém mexe no envelope. Com o
+ * colapso explícito, uma coisa precisa ser verdadeira onde antes precisavam
+ * duas: `scopeAttribution` resolve `null → 'system'` ANTES da emissão, então o
+ * rótulo é DECLARADO, não herdado. A semântica do `??` que torna isso
+ * necessário está pinada em `tests/unit/observability/metrics-emitters.spec.ts`
+ * ("um tenant_id null NÃO atribui system").
  *
  * A RUN SEM TENANT (`global_bootstrap`, que vence antes de existir tenant)
  * continua expirada e contada, no bucket `system`. Três razões:
