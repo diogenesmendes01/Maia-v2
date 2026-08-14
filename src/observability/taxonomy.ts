@@ -355,6 +355,42 @@ export const METRIC = {
   ONBOARDING_STEP_DURATION_MS: 'maia_onboarding_step_duration_ms',
   /** Checks BLOQUEANTES reprovados, por `check_code`. */
   AGENT_READINESS_FAILED: 'maia_agent_readiness_failed_total',
+  /**
+   * FILA do `onboarding_expirer`: runs cujo `expires_at` já passou e que ainda
+   * não são terminais — exatamente as linhas que o próximo tick pegaria.
+   *
+   * Existe porque a contagem de expiradas sozinha não responde "estou perdendo
+   * a corrida?": o worker drena o teto do lote a cada tick, a série de
+   * cancelamento sobe, `maia_worker_run_total{status="ok"}` sobe, e a fila pode
+   * estar crescendo o tempo todo. Um lote cheio é indistinguível de "havia
+   * exatamente um lote" sem esta série.
+   *
+   * SEM `tenant_id`/`agent_id`, ao contrário da série de cancelamento: isto é a
+   * profundidade de uma fila GLOBAL de housekeeping, e não um fato sobre um
+   * tenant. Mesma justificativa (e mesma forma) de `SCHEDULER_BACKLOG`. Ainda
+   * pesa que um gauge com rótulo vira um provider REGISTRADO por valor em
+   * `src/lib/metrics.ts` (o rótulo mora no NOME registrado), e providers não
+   * são removidos: rotular por tenant aqui deixaria séries de tenants extintos
+   * penduradas para sempre.
+   *
+   * Emitida por `src/observability/onboarding-expiry-collector.ts`, que a lê no
+   * SCRAPE. Um valor publicado pelo worker congelaria no último número quando o
+   * worker parasse — a falha que esta série existe para pegar (#536).
+   */
+  ONBOARDING_EXPIRY_BACKLOG: 'maia_onboarding_expiry_backlog',
+  /**
+   * Há quanto tempo a run vencida MAIS ANTIGA está esperando pela varredura.
+   *
+   * Companheira da contagem, e nenhuma das duas basta sozinha: a contagem
+   * parada no teto do lote não distingue "empatando" de "perdendo", e a idade
+   * alta sozinha não distingue UMA run presa de MIL runs atrasadas. É a idade
+   * que dá o "prazo máximo de limpeza" um SLO verificável.
+   *
+   * `0` quando não há fila — o mesmo contrato de `SCHEDULER_LAG_MS`, onde "não
+   * há linha vencida" É zero. Não confundir com o `NaN` que o coletor devolve
+   * quando NÃO CONSEGUIU LER: ausência de leitura nunca é zero saudável.
+   */
+  ONBOARDING_EXPIRY_OLDEST_AGE_SECONDS: 'maia_onboarding_expiry_oldest_age_seconds',
 
   // --- ops / restore drill (issue #536) ------------------------------------
   /**
