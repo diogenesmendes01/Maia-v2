@@ -33,7 +33,11 @@
  *     diferentes para uma causa só. Hoje: telefone com base aleatória por
  *     processo (mesma convenção de `onboarding-review-541-round3.spec.ts`,
  *     onde `channels_active_line_uq` global já mordeu), cleanup em `afterAll`
- *     que sempre roda, e varredura de restos de execuções mortas.
+ *     que sempre roda, e varredura de restos de execuções mortas — varredura
+ *     essa ESCOPADA por `tenant_id + agent_id` em todas as etapas (AGENTS.md
+ *     §4.1), porque `p.nome` é um literal sintético que outra spec pode
+ *     repetir sob outro tenant e o banco de teste é compartilhado. O grupo
+ *     `[escopo]` abaixo guarda isso com um canário.
  *
  *  3. **O teste nunca observou um despacho.** O nome diz "dispatches action
  *     exactly once", mas as asserções eram sobre o valor de retorno de
@@ -47,11 +51,13 @@
  *     `pending_action_dispatched` e `pending_race_lost` — que são as linhas
  *     que `pending-resolver.ts` escreve no caminho de produção.
  *
- * A regra de leitura do vermelho, então: teste `[infra]` vermelho = ambiente
- * (prazo, erro de conexão, flag, trilha de auditoria muda). Teste
- * `[semântica]` vermelho = a race real, e aí é bug de idempotência em
- * produção. Os dois grupos são independentes — um `[infra]` vermelho não
- * afrouxa nenhuma asserção semântica, e vice-versa.
+ * A regra de leitura do vermelho, então:
+ *   • `[infra]` vermelho  = ambiente (prazo, conexão, flag, trilha muda).
+ *   • `[escopo]` vermelho = esta spec está apagando dado de outro tenant.
+ *   • `[semântica]` vermelho = a race real; bug de idempotência em produção.
+ *
+ * Os grupos são independentes — um `[infra]` vermelho não afrouxa nenhuma
+ * asserção semântica, e vice-versa.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
@@ -66,12 +72,28 @@ process.env.FEATURE_PENDING_GATE = 'true';
 
 const NOME = 'pgc545-b0';
 
+/** Sufixo aleatório por processo, para o par tenant/agente do canário. */
+const SUFIXO = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
 // Base ALEATÓRIA por processo. `pessoas_tenant_agent_telefone_key` é único por
 // (tenant, agent, telefone) e este spec sempre roda sob 'primary'/'primary';
 // um literal fixo faz duas execuções (ou uma execução e o seu próprio retry)
 // colidirem e o vermelho vira erro de fixture, mascarando a asserção que o
 // teste existe para fazer. Mesma convenção de onboarding-review-541-round3.
 const TELEFONE = `+55119${String(10_000_000 + Math.floor(Math.random() * 80_000_000)).slice(-8)}`;
+
+/**
+ * Tenant/agente do CANÁRIO de escopo: um par que esta spec cria só para provar
+ * que a sua varredura de restos não atravessa a fronteira de tenant. Ele
+ * carrega uma `pessoa` com o MESMO `NOME` sintético do fixture e idade dentro
+ * da janela da varredura — exatamente a linha que um `DELETE` por nome+idade
+ * apagaria em silêncio.
+ */
+const CANARY_CTX = {
+  tenant_id: `pgc545-canary-${SUFIXO}`,
+  agent_id: `pgc545-canary-${SUFIXO}-bot`,
+};
+const CANARY_TELEFONE = `+55118${String(10_000_000 + Math.floor(Math.random() * 80_000_000)).slice(-8)}`;
 
 /**
  * Orçamento da race PROPRIAMENTE DITA — só as duas chamadas paralelas de
@@ -105,6 +127,10 @@ type Evidence = {
   inbound_is_real_mensagem: boolean;
   /** Erro da varredura de restos (best-effort; nunca é veredito). */
   stale_purge_error: string | null;
+  /** Linhas do canário de OUTRO tenant que sobreviveram à varredura. */
+  canary_sobreviveu: { pessoas: number; conversas: number; audit_log: number };
+  /** Falha ao montar o canário — invalida só o caso `[escopo]`. */
+  canary_error: string | null;
   /** `audit_log` desta conversa, agrupado por ação, lido NO BANCO. */
   audit_by_acao: Record<string, number>;
   audit_total: number;
@@ -129,10 +155,13 @@ function fmt(e: Evidence): string {
       pending_status: e.pending_status,
       inbound_is_real_mensagem: e.inbound_is_real_mensagem,
       stale_purge_error: e.stale_purge_error,
+      canary_sobreviveu: e.canary_sobreviveu,
+      canary_error: e.canary_error,
       audit_by_acao: e.audit_by_acao,
       timings_ms: { import: e.import_ms, seed: e.seed_ms, race: e.race_ms },
       feature_flag: e.feature_flag,
-      fixture: ids,
+      fixture: { ...ids, telefone: TELEFONE, ...PRIMARY_CTX },
+      canary: CANARY_CTX,
     },
     null,
     2,
@@ -153,6 +182,8 @@ d('pending-gate concurrency', () => {
       pending_status: [],
       inbound_is_real_mensagem: false,
       stale_purge_error: null,
+      canary_sobreviveu: { pessoas: -1, conversas: -1, audit_log: -1 },
+      canary_error: null,
       audit_by_acao: {},
       audit_total: 0,
     };
@@ -170,44 +201,113 @@ d('pending-gate concurrency', () => {
 
     const c = await pool.connect();
     try {
-      // ── 2. Varre restos de execuções que morreram no meio ────────────────
+      // ── 2. Canário de escopo, semeado ANTES da varredura ─────────────────
+      // Uma `pessoa` com o MESMO `NOME` sintético, idade dentro da janela da
+      // varredura, sob OUTRO tenant/agente — mais a `conversa` e a linha de
+      // `audit_log` dela, para cobrir também as etapas que passam por join. É
+      // a linha que a varredura por nome+idade apagaria calada. Falha aqui
+      // invalida só o caso `[escopo]`, nunca o veredito da race.
+      try {
+        await c.query(
+          `INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
+          [CANARY_CTX.tenant_id],
+        );
+        await c.query(
+          `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, $1)
+             ON CONFLICT (id) DO NOTHING`,
+          [CANARY_CTX.agent_id, CANARY_CTX.tenant_id],
+        );
+        const cp = await c.query<{ id: string }>(
+          `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, created_at)
+           VALUES ($1, $2, $3, $4, 'funcionario', now() - interval '2 hours') RETURNING id`,
+          [CANARY_CTX.tenant_id, CANARY_CTX.agent_id, NOME, CANARY_TELEFONE],
+        );
+        const cc = await c.query<{ id: string }>(
+          `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades, created_at)
+           VALUES ($1, $2, $3, '{}', now() - interval '2 hours') RETURNING id`,
+          [CANARY_CTX.tenant_id, CANARY_CTX.agent_id, cp.rows[0]!.id],
+        );
+        await c.query(
+          `INSERT INTO audit_log(tenant_id, agent_id, acao, pessoa_id, conversa_id)
+           VALUES ($1, $2, 'pgc545_canario_escopo', $3, $4)`,
+          [CANARY_CTX.tenant_id, CANARY_CTX.agent_id, cp.rows[0]!.id, cc.rows[0]!.id],
+        );
+      } catch (err) {
+        ev.canary_error = (err as Error).message;
+      }
+
+      // ── 3. Varre restos de execuções que morreram no meio ─────────────────
       // O corte de 1h evita brigar com uma execução concorrente deste mesmo
       // spec em outro worker; o telefone aleatório já garante que ela não
       // colidiria, isto é só higiene para o banco não acumular lixo.
+      //
+      // ESCOPO: `p.nome` é um literal sintético, não um identificador único —
+      // outra spec (ou outro fixture herdado do mesmo molde) pode ter uma linha
+      // com o mesmo nome sob OUTRO tenant/agente, e este banco é compartilhado.
+      // Um DELETE por nome+idade apagaria a linha dela em silêncio. Por isso o
+      // par `PRIMARY_CTX` entra em TODAS as etapas e nos dois lados de cada
+      // join — `audit_log` e `conversas` também carregam o par, NOT NULL desde
+      // a migração 012. AGENTS.md §4.1; guardado pelo caso `[escopo]`.
       //
       // Ordem obrigatória: `conversas_pessoa_id_fkey` é ON DELETE RESTRICT e
       // `audit_log` não cascateia nem de `conversas` nem de `pessoas`. Então
       // audit_log → conversas (que cascateia mensagens e pending_questions) →
       // pessoas. Best-effort: isto é higiene, não pré-condição — um erro aqui
       // não pode virar veredito sobre a race, então vira nota na evidência.
+      const escopo = [NOME, PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id];
       try {
         await c.query(
           `DELETE FROM audit_log a USING conversas cv, pessoas p
             WHERE a.conversa_id = cv.id AND cv.pessoa_id = p.id
+              AND a.tenant_id = $2 AND a.agent_id = $3
+              AND cv.tenant_id = $2 AND cv.agent_id = $3
+              AND p.tenant_id = $2 AND p.agent_id = $3
               AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
-          [NOME],
+          escopo,
         );
         await c.query(
           `DELETE FROM audit_log a USING pessoas p
             WHERE a.pessoa_id = p.id
+              AND a.tenant_id = $2 AND a.agent_id = $3
+              AND p.tenant_id = $2 AND p.agent_id = $3
               AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
-          [NOME],
+          escopo,
         );
         await c.query(
           `DELETE FROM conversas cv USING pessoas p
             WHERE cv.pessoa_id = p.id
+              AND cv.tenant_id = $2 AND cv.agent_id = $3
+              AND p.tenant_id = $2 AND p.agent_id = $3
               AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
-          [NOME],
+          escopo,
         );
         await c.query(
-          `DELETE FROM pessoas WHERE nome = $1 AND created_at < now() - interval '1 hour'`,
-          [NOME],
+          `DELETE FROM pessoas p
+            WHERE p.tenant_id = $2 AND p.agent_id = $3
+              AND p.nome = $1 AND p.created_at < now() - interval '1 hour'`,
+          escopo,
         );
       } catch (err) {
         ev.stale_purge_error = (err as Error).message;
       }
 
-      // ── 3. Seed do fixture ───────────────────────────────────────────────
+      // Quanto do canário sobreviveu à varredura. Esperado: tudo (1/1/1).
+      if (ev.canary_error === null) {
+        const cnt = await c.query<{ pessoas: string; conversas: string; audit_log: string }>(
+          `SELECT
+             (SELECT count(*) FROM pessoas   WHERE tenant_id = $1 AND agent_id = $2 AND nome = $3)::text AS pessoas,
+             (SELECT count(*) FROM conversas WHERE tenant_id = $1 AND agent_id = $2)::text               AS conversas,
+             (SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND agent_id = $2)::text               AS audit_log`,
+          [CANARY_CTX.tenant_id, CANARY_CTX.agent_id, NOME],
+        );
+        ev.canary_sobreviveu = {
+          pessoas: Number(cnt.rows[0]!.pessoas),
+          conversas: Number(cnt.rows[0]!.conversas),
+          audit_log: Number(cnt.rows[0]!.audit_log),
+        };
+      }
+
+      // ── 4. Seed do fixture ───────────────────────────────────────────────
       const t1 = Date.now();
       try {
         const pessoa = await c.query<{ id: string }>(
@@ -257,7 +357,7 @@ d('pending-gate concurrency', () => {
       }
       ev.seed_ms = Date.now() - t1;
 
-      // ── 4. A race ────────────────────────────────────────────────────────
+      // ── 5. A race ────────────────────────────────────────────────────────
       setClassifierForTesting(async () => ({
         resolves_pending: true,
         option_chosen: 'sim',
@@ -300,7 +400,7 @@ d('pending-gate concurrency', () => {
 
       setClassifierForTesting(null);
 
-      // ── 5. Evidência lida NO BANCO ───────────────────────────────────────
+      // ── 6. Evidência lida NO BANCO ───────────────────────────────────────
       // `::text` no lado esquerdo para que um `inbound.id` não-UUID (o defeito
       // #3 da issue) devolva `false` em vez de estourar o cast do Postgres.
       const inb = await c.query<{ n: string }>(
@@ -342,6 +442,14 @@ d('pending-gate concurrency', () => {
           await c.query('DELETE FROM audit_log WHERE pessoa_id = $1', [ids.pessoa]);
           await c.query('DELETE FROM pessoas WHERE id = $1', [ids.pessoa]);
         }
+        // Canário: mesma ordem de FK. O par tenant/agente é criado por esta
+        // spec, então some inteiro — `agents` → `tenants` é ON DELETE RESTRICT.
+        const cctx = [CANARY_CTX.tenant_id, CANARY_CTX.agent_id];
+        await c.query('DELETE FROM audit_log WHERE tenant_id = $1 AND agent_id = $2', cctx);
+        await c.query('DELETE FROM conversas WHERE tenant_id = $1 AND agent_id = $2', cctx);
+        await c.query('DELETE FROM pessoas WHERE tenant_id = $1 AND agent_id = $2', cctx);
+        await c.query('DELETE FROM agents WHERE id = $1', [CANARY_CTX.agent_id]);
+        await c.query('DELETE FROM tenants WHERE id = $1', [CANARY_CTX.tenant_id]);
       } finally {
         c.release();
       }
@@ -412,6 +520,27 @@ d('pending-gate concurrency', () => {
         'auditar; só `no_pending` = nada chegou ao resolve (confira os outros ' +
         `[infra]). Evidência: ${fmt(ev)}`,
     ).toBeGreaterThan(0);
+  });
+
+  // ── Grupo [escopo]: a fronteira de tenant do fixture desta spec. Vermelho
+  // aqui não é ambiente nem race — é esta spec apagando dado de outro tenant.
+
+  it('[escopo] a varredura de restos não atravessa a fronteira de tenant/agente', () => {
+    expect(
+      ev.canary_error,
+      `[escopo] o canário de outro tenant não pôde ser montado (${ev.canary_error}), ` +
+        'então esta rodada não prova nada sobre o escopo da varredura. É falha de ' +
+        `fixture, não veredito. Evidência: ${fmt(ev)}`,
+    ).toBeNull();
+    expect(
+      ev.canary_sobreviveu,
+      '[escopo] a varredura de restos apagou linhas de OUTRO tenant/agente. O ' +
+        'canário tem o mesmo `nome` sintético do fixture e idade dentro da janela ' +
+        'da varredura, mas vive sob outro par — um DELETE por nome+idade o leva ' +
+        'junto. Isto viola o invariante de escopo (AGENTS.md §4.1) e, num banco de ' +
+        'teste compartilhado, contamina a spec vizinha em silêncio: repare o par ' +
+        `tenant_id/agent_id em TODAS as etapas do purge. Evidência: ${fmt(ev)}`,
+    ).toEqual({ pessoas: 1, conversas: 1, audit_log: 1 });
   });
 
   // ── Grupo [semântica]: o invariante que este arquivo existe para guardar.
