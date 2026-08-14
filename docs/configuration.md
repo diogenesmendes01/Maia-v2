@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 173 | 19 |
+| `runtime` | 174 | 19 |
 | `admin-ui` | 23 | 4 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
@@ -150,6 +150,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `VALOR_LIMITE_DURO` | number | `50000` | não | `runtime` | sim | Teto absoluto (BRL). Acima disso a operação é negada. |
 | `DUAL_APPROVAL_TIMEOUT_HOURS` | number | `6` | não | `runtime` | sim | Janela (h) para a segunda aprovação antes de expirar. |
 | `AUDIT_MODE_TTL_HOURS` | number | `24` | não | `runtime` | sim | TTL (h) do modo auditoria. |
+| `ONBOARDING_EXPIRER_BATCH_LIMIT` | number | `100` | não | `runtime` | sim | Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes. |
 | `IDEMPOTENCY_BUCKET_MINUTES` | number | `5` | não | `runtime` | sim | Janela (min) do bucket de idempotência. |
 | `PENDING_QUESTION_TTL_MINUTES` | number | `120` | não | `runtime` | sim | TTL (min) de pergunta pendente. |
 | `PENDING_ACTION_TTL_HOURS` | number | `6` | não | `runtime` | sim | TTL (h) de ação pendente. |

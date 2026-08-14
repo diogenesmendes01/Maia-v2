@@ -1,5 +1,5 @@
 /**
- * Issue #519 (GATE 5) — o worker `onboarding_expirer`.
+ * Issue #519 (GATE 5 + atribuição por escopo) — o worker `onboarding_expirer`.
  *
  * O que estes testes provam, e por que são feitos ASSIM:
  *
@@ -9,25 +9,70 @@
  *     array deixa TODO este arquivo vermelho, que é exatamente o defeito que
  *     um teste-espelho não pegaria;
  *   - a `fn` registrada chama `onboardingRunsRepo.expireStale` PASSANDO O
- *     LIMITE DE LOTE (o repo tem default próprio; o worker não pode depender
- *     dele nem varrer sem teto);
- *   - uma corrida que falha não propaga para o scheduler;
- *   - a observabilidade não fica muda: contagem de expiradas na série de
- *     cancelamento (`reason='expired'`) e resultado da corrida em
- *     `maia_worker_run_total`.
+ *     LIMITE DE LOTE, e esse limite vem do CONTRATO DE CONFIGURAÇÃO
+ *     (`ONBOARDING_EXPIRER_BATCH_LIMIT`): "100 a cada 5 minutos" não é
+ *     contrato, é default operacional ajustável;
+ *   - a série de cancelamento sai ATRIBUÍDA A CADA RUN (`tenant_id + agent_id`),
+ *     não uma vez sob `system` — inclusive quando o ALS de outro tenant está
+ *     vazado por cima da corrida;
+ *   - a run SEM tenant (o `global_bootstrap`, que vence antes de existir
+ *     tenant) continua expirada e contada, no bucket sancionado `system`;
+ *   - uma corrida que falha não propaga para o scheduler.
  *
  * O comportamento de BANCO (run vencida expira, run viva sobrevive, o lote
- * corta em `limit`) é provado contra Postgres real em
+ * corta em `limit`, o backlog encolhe) é provado contra Postgres real em
  * `tests/integration/onboarding-expirer-worker.spec.ts` — aqui o repo é falso
  * de propósito, para isolar o call site.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { expireStale } = vi.hoisted(() => ({ expireStale: vi.fn(async () => 0) }));
+type ExpireResult = {
+  total: number;
+  by_scope: { tenant_id: string | null; agent_id: string | null; total: number }[];
+};
+
+const { expireStale, batchLimit } = vi.hoisted(() => ({
+  expireStale: vi.fn(async (): Promise<ExpireResult> => ({ total: 0, by_scope: [] })),
+  /** Teto de lote servido pelo contrato de configuração — mutável por caso. */
+  batchLimit: { value: 100 },
+}));
 
 vi.mock('@/db/repositories/onboarding-repos.js', () => ({
   onboardingRunsRepo: { expireStale },
 }));
+
+/**
+ * Só `ONBOARDING_EXPIRER_BATCH_LIMIT` é interceptado; todo o resto do contrato
+ * continua sendo o objeto REAL. Um mock de config inteiro quebraria
+ * `@/workers/index.js` (que lê outras variáveis) e o teste passaria a provar o
+ * mock, não o worker.
+ */
+vi.mock('@/config/env.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/env.js')>();
+  return {
+    ...actual,
+    config: new Proxy(actual.config, {
+      get: (target, key, receiver) =>
+        key === 'ONBOARDING_EXPIRER_BATCH_LIMIT'
+          ? batchLimit.value
+          : Reflect.get(target, key, receiver),
+    }),
+  };
+});
+
+/** Açúcar: um único escopo com `total` runs. */
+function scope(
+  tenant_id: string | null,
+  agent_id: string | null,
+  total: number,
+): ExpireResult['by_scope'][number] {
+  return { tenant_id, agent_id, total };
+}
+
+/** Resultado de `expireStale` a partir dos escopos, com o total coerente. */
+function result(...by_scope: ExpireResult['by_scope']): ExpireResult {
+  return { total: by_scope.reduce((acc, s) => acc + s.total, 0), by_scope };
+}
 
 vi.mock('@/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
@@ -43,10 +88,7 @@ import {
   _resetWorkerStateForTests,
   activeWorkerJobs,
 } from '@/workers/index.js';
-import {
-  ONBOARDING_EXPIRER_BATCH_LIMIT,
-  runOnboardingExpirer,
-} from '@/workers/onboarding-expirer.js';
+import { runOnboardingExpirer } from '@/workers/onboarding-expirer.js';
 
 function registryJob() {
   return JOBS.find((j) => j.name === 'onboarding_expirer');
@@ -55,7 +97,8 @@ function registryJob() {
 describe('worker onboarding_expirer (issue #519)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    expireStale.mockImplementation(async () => 0);
+    batchLimit.value = 100;
+    expireStale.mockImplementation(async () => ({ total: 0, by_scope: [] }));
     _resetForTests();
     _resetLabelGuardForTests();
   });
@@ -82,21 +125,42 @@ describe('worker onboarding_expirer (issue #519)', () => {
   describe('lote', () => {
     it('passa o limite de lote explicitamente para expireStale', async () => {
       await registryJob()!.fn();
-      expect(expireStale).toHaveBeenCalledWith(expect.any(Date), ONBOARDING_EXPIRER_BATCH_LIMIT);
+      expect(expireStale).toHaveBeenCalledWith(expect.any(Date), 100);
       const [, limit] = expireStale.mock.calls[0] as unknown as [Date, number];
       expect(Number.isFinite(limit)).toBe(true);
       expect(limit).toBeGreaterThan(0);
-      expect(limit).toBeLessThanOrEqual(100);
+    });
+
+    /**
+     * O achado do dono na revisão de #555: "100 a cada 5 minutos" não pode
+     * virar CONTRATO. O teto é um default operacional, e o operador precisa
+     * poder mexer nele sem redeploy de código — por isso ele é uma variável do
+     * contrato de configuração e é LIDA A CADA CORRIDA, não uma constante
+     * compilada. Com a constante de volta, este caso fica vermelho.
+     */
+    it('o teto do lote vem do contrato de configuração, e é ajustável', async () => {
+      batchLimit.value = 7;
+      await registryJob()!.fn();
+      expect(expireStale).toHaveBeenCalledWith(expect.any(Date), 7);
+
+      // Ajustável DE VERDADE: sem reimportar o módulo, o tick seguinte já usa o
+      // valor novo (uma captura no import congelaria o primeiro).
+      batchLimit.value = 250;
+      await registryJob()!.fn();
+      expect(expireStale).toHaveBeenLastCalledWith(expect.any(Date), 250);
     });
 
     it('faz UMA passada por tick — não varre em laço até esvaziar', async () => {
       // Lote cheio = ainda há fila. O tick seguinte pega o resto; este NÃO
       // pode ficar girando (seguraria conexões por minutos num backlog).
-      expireStale.mockImplementation(async () => ONBOARDING_EXPIRER_BATCH_LIMIT);
+      batchLimit.value = 3;
+      expireStale.mockImplementation(async () =>
+        result(scope('t1', 'a1', 2), scope('t2', 'a2', 1)),
+      );
       await registryJob()!.fn();
       expect(expireStale).toHaveBeenCalledTimes(1);
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ expired: ONBOARDING_EXPIRER_BATCH_LIMIT }),
+        expect.objectContaining({ expired: 3, limit: 3 }),
         'onboarding_expirer.batch_capped',
       );
     });
@@ -160,7 +224,7 @@ describe('worker onboarding_expirer (issue #519)', () => {
         throw new Error('connection terminated');
       });
       await runRegistryTick();
-      expireStale.mockImplementationOnce(async () => 2);
+      expireStale.mockImplementationOnce(async () => result(scope('acme', 'ana', 2)));
       await runRegistryTick();
 
       expect(expireStale).toHaveBeenCalledTimes(2);
@@ -216,46 +280,104 @@ describe('worker onboarding_expirer (issue #519)', () => {
     });
   });
 
-  describe('observabilidade', () => {
-    it('conta as runs expiradas na série de cancelamento, com reason=expired', async () => {
-      expireStale.mockImplementation(async () => 3);
+  describe('observabilidade — atribuição por escopo', () => {
+    /**
+     * A decisão do dono na revisão de #555: a varredura roda global sob
+     * `system`, mas a SÉRIE de cancelamento é atribuída ao `tenant_id +
+     * agent_id` de cada run. O motivo é que o cancelamento pelo console
+     * (`src/onboarding/wizard.ts`) emite ESTA MESMA série já atribuída ao
+     * tenant real — com o varredor emitindo tudo sob `system`, a mesma série
+     * tinha duas atribuições conforme quem cancelou.
+     */
+    it('emite UMA série por escopo, com o tenant e o agente de cada run', async () => {
+      expireStale.mockImplementation(async () =>
+        result(scope('acme', 'ana', 2), scope('globex', 'bob', 1)),
+      );
+
       await registryJob()!.fn();
+
       const out = await renderPrometheus();
       expect(out).toContain(
-        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 3',
+        'maia_onboarding_run_cancelled_total{agent_id="ana",reason="expired",tenant_id="acme"} 2',
+      );
+      expect(out).toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="bob",reason="expired",tenant_id="globex"} 1',
+      );
+      // E NENHUMA linha da série sob `system`: um agregado de 3 rotulado
+      // `system` é exatamente o defeito que esta issue corrige.
+      expect(out).not.toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"}',
       );
       expect(logger.info).toHaveBeenCalledWith(
-        expect.objectContaining({ expired: 3 }),
+        expect.objectContaining({ expired: 3, scopes: 2 }),
         'onboarding_expirer.done',
       );
     });
 
     /**
-     * `counter()` resolve `tenant_id`/`agent_id` LENDO O ALS no instante da
-     * emissão (`src/observability/metrics.ts:38`) e só cai em `system` quando
-     * o ALS está VAZIO. Numa cadeia de cron ele está — mas isso é propriedade
-     * do ambiente, não do código: bastaria alguém invocar o worker de dentro
-     * de um contexto de tenant (ou um escopo vazar de um tick anterior) para a
-     * série de housekeeping sair rotulada com aquele tenant, e ninguém veria.
-     *
-     * Estes dois casos simulam exatamente esse vazamento: rodam a `fn` do
-     * registry DENTRO de um `runWithTenantContext` e exigem `system`. Com as
-     * emissões fora do `runWithSystemContext`, ambos ficam vermelhos com o
-     * tenant vazado no rótulo.
+     * A run de `global_bootstrap` vence ANTES de existir tenant (`tenant_id` é
+     * nullable de propósito). Ela precisa continuar sendo expirada E contada —
+     * é a run mais órfã, a que ninguém mais vai limpar. Vai para o bucket
+     * sancionado `system`, o mesmo que `admin_audit_log` já usa para ela, e
+     * NUNCA para o literal `'default'` (invariante MUST nº 8).
      */
-    it('rotula com system DECLARADO, mesmo invocada dentro do ALS de outro tenant', async () => {
-      expireStale.mockImplementation(async () => 3);
+    it('a run SEM tenant continua contada, no bucket system — nunca em default', async () => {
+      expireStale.mockImplementation(async () =>
+        result(scope(null, null, 1), scope('acme', 'ana', 1)),
+      );
+
+      await registryJob()!.fn();
+
+      const out = await renderPrometheus();
+      expect(out).toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 1',
+      );
+      expect(out).toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="ana",reason="expired",tenant_id="acme"} 1',
+      );
+      expect(out).not.toContain('tenant_id="default"');
+      // Contada, não descartada: o total do log inclui a run órfã.
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ expired: 2 }),
+        'onboarding_expirer.done',
+      );
+    });
+
+    /**
+     * O caso que separa "passar um parâmetro" de "atribuir": `counter()`
+     * resolve o par LENDO O ALS no instante da emissão, e o valor do chamador
+     * só vence quando NÃO é `null` (`merged.tenant_id ?? attr.tenant_id`).
+     * Repassar `run.tenant_id` cru funciona para a run COM tenant e falha na
+     * run SEM tenant, que herda o escopo do ALS — e sob `runWithSystemContext`
+     * o resultado ainda parece certo. Este caso vaza um ALS de outro tenant por
+     * cima da corrida: só um colapso EXPLÍCITO `null → 'system'` (`scopeAttribution`)
+     * sobrevive.
+     *
+     * É o mesmo defeito de #555 pelo outro lado, e por isso os dois sentidos
+     * são exigidos aqui: a série de cancelamento carrega o escopo DA RUN, e as
+     * séries de housekeeping (`maia_worker_run_total`) continuam `system`.
+     */
+    it('sob ALS vazado: a série carrega o escopo DA RUN, e a órfã cai em system', async () => {
+      expireStale.mockImplementation(async () =>
+        result(scope(null, null, 1), scope('acme', 'ana', 2)),
+      );
+
       await runWithTenantContext({ tenant_id: 'tenant-vazado', agent_id: 'bot-vazado' }, () =>
         registryJob()!.fn(),
       );
+
       const out = await renderPrometheus();
       expect(out).toContain(
-        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 3',
+        'maia_onboarding_run_cancelled_total{agent_id="ana",reason="expired",tenant_id="acme"} 2',
       );
+      expect(out).toContain(
+        'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 1',
+      );
+      // A EXECUÇÃO continua declaradamente `system`.
       expect(out).toContain(
         'maia_worker_run_total{agent_id="system",status="ok",tenant_id="system",worker="onboarding_expirer"} 1',
       );
-      // Nenhuma série de housekeeping pode carregar o escopo vazado.
+      // Nada, em nenhuma série, herdou o escopo vazado.
       expect(out).not.toContain('tenant-vazado');
       expect(out).not.toContain('bot-vazado');
     });
@@ -285,6 +407,20 @@ describe('worker onboarding_expirer (issue #519)', () => {
       // Tick vazio não polui o log de INFO.
       expect(logger.debug).toHaveBeenCalledWith('onboarding_expirer.idle');
       expect(out).not.toContain('maia_onboarding_run_cancelled_total');
+    });
+
+    /**
+     * O worker NÃO publica o backlog: uma fila publicada por ele congela no
+     * último valor quando ele para, que é a falha que a série existe para
+     * pegar. Quem a emite é `src/observability/onboarding-expiry-collector.ts`,
+     * no scrape. Se alguém mover a emissão para cá, este caso fica vermelho.
+     */
+    it('não publica o backlog daqui — ele é lido no scrape', async () => {
+      expireStale.mockImplementation(async () => result(scope('acme', 'ana', 3)));
+      await registryJob()!.fn();
+      const out = await renderPrometheus();
+      expect(out).not.toContain('maia_onboarding_expiry_backlog');
+      expect(out).not.toContain('maia_onboarding_expiry_oldest_age_seconds');
     });
   });
 });

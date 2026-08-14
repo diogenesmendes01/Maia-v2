@@ -38,7 +38,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import { counter, histogram } from '@/observability/metrics.js';
+import { counter, histogram, scopeAttribution } from '@/observability/metrics.js';
 import {
   METRIC,
   ONBOARDING_REASONS,
@@ -103,8 +103,13 @@ export const DEFAULT_RUN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 type MetricScope = { tenant_id: string | null; agent_id: string | null };
 
+/**
+ * O colapso `null → system` mora em `@/observability/metrics.js` desde #519:
+ * o varredor de runs vencidas emite a MESMA série que o cancelamento pelo
+ * console, e duas cópias desta regra são como as duas atribuições divergem.
+ */
 function attribution(scope: MetricScope): { tenant_id: string; agent_id: string } {
-  return { tenant_id: scope.tenant_id ?? 'system', agent_id: scope.agent_id ?? 'system' };
+  return scopeAttribution(scope);
 }
 
 /**

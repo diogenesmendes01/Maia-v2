@@ -354,7 +354,11 @@ d('saga de onboarding — ponta a ponta', () => {
     const run = created.run;
     createdRuns.push(run.id);
 
-    expect(await onboardingRunsRepo.expireStale(new Date())).toBeGreaterThanOrEqual(1);
+    const swept = await onboardingRunsRepo.expireStale(new Date());
+    expect(swept.total).toBeGreaterThanOrEqual(1);
+    // O agregado por escopo é o contrato desde #519: a run varrida aparece
+    // atribuída ao tenant dela, não num balde só.
+    expect(swept.by_scope.some((s) => s.tenant_id === TENANT)).toBe(true);
     const after = await onboardingRunsRepo.getForScope({ run_id: run.id, tenant_id: TENANT });
     expect(after?.state).toBe('cancelled');
     expect(after?.last_error_code).toBe('expired');

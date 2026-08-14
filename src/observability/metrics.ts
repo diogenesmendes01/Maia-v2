@@ -31,6 +31,31 @@ const SYSTEM_ATTRIBUTION = { tenant_id: 'system', agent_id: 'system' } as const;
 export type MetricLabels = Record<string, string | number | boolean | null | undefined>;
 
 /**
+ * Atribuição EXPLÍCITA a partir de um escopo que pode não existir ainda.
+ *
+ * Existe porque passar `{ tenant_id: null }` para `counter()` NÃO é atribuir a
+ * `system`: `prepare()` resolve com `??`, então `null` cai no ALS do momento da
+ * emissão. Numa varredura global isso é a diferença entre uma série rotulada
+ * `system` e uma série rotulada com o tenant do contexto que por acaso estava
+ * vazando — e o rótulo errado é indistinguível do certo no dashboard.
+ *
+ * O colapso `null → system` é uma decisão de ROTULAGEM, não de dado: o bucket
+ * sancionado para trabalho sem dono (ARCHITECTURE.md §7 e `governance/audit.ts`),
+ * nunca o literal `'default'` que a invariante MUST nº 8 recusa. Quem precisa
+ * saber que o escopo era ausente (e não igual ao da plataforma) tem a auditoria
+ * e o evento, onde `target_tenant_id` continua `null`.
+ */
+export function scopeAttribution(scope: {
+  tenant_id: string | null | undefined;
+  agent_id: string | null | undefined;
+}): { tenant_id: string; agent_id: string } {
+  return {
+    tenant_id: scope.tenant_id ?? SYSTEM_ATTRIBUTION.tenant_id,
+    agent_id: scope.agent_id ?? SYSTEM_ATTRIBUTION.agent_id,
+  };
+}
+
+/**
  * Read `tenant_id`/`agent_id` from ALS. Fail-SOFT by design: observability must
  * not be the thing that throws on a tenant-less path. Security decisions still
  * use the strict getters (`getCurrentTenant`), which fail closed.

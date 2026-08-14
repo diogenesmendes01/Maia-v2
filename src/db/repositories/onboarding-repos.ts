@@ -30,7 +30,7 @@
  * agente-escopados que ocorrem DEPOIS da criação do agente (readiness,
  * ativação) também emitem `audit()` pós-commit — ver `wizard.ts`.
  */
-import { and, asc, desc, eq, isNull, lt, notInArray, or } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, lt, notInArray, or, sql } from 'drizzle-orm';
 import { TERMINAL_STATES } from '@/onboarding/state-machine.js';
 import { db, pgErrorCode, withTx } from '../client.js';
 import {
@@ -255,6 +255,52 @@ export type CreateRunOutcome =
   | { outcome: 'payload_conflict'; run: OnboardingRunRow }
   /** Já existe uma run VIVA para o escopo inicial, aberta com outra chave. */
   | { outcome: 'live_run_exists' };
+
+/**
+ * Uma linha do agregado de `expireStale`: quantas runs foram expiradas para um
+ * `tenant_id + agent_id`. O par é NULLABLE porque a coluna é — a run de
+ * `global_bootstrap` vence antes de existir tenant, e essa run PRECISA
+ * continuar sendo expirada e contada.
+ */
+export type ExpiredRunScope = {
+  readonly tenant_id: string | null;
+  readonly agent_id: string | null;
+  readonly total: number;
+};
+
+/**
+ * Agregador de `expireStale`, isolado para que a chave composta (um par
+ * nullable) não vire uma concatenação improvisada dentro do laço.
+ *
+ * A chave é `JSON.stringify([tenant, agent])`: `null` e a string `'null'` viram
+ * chaves DIFERENTES (`[null,…]` vs `["null",…]`), e nenhum separador precisa ser
+ * escapado. Um `${t}:${a}` colidiria `('a:b', 'c')` com `('a', 'b:c')` — improvável
+ * com slugs, mas a colisão somaria escopos distintos numa série só, que é
+ * exatamente o defeito que este agregado existe para corrigir.
+ */
+class ScopeTally {
+  private readonly counts = new Map<string, { scope: ExpiredRunScope; total: number }>();
+  private total = 0;
+
+  add(tenant_id: string | null, agent_id: string | null): void {
+    const key = JSON.stringify([tenant_id, agent_id]);
+    const entry = this.counts.get(key);
+    if (entry) entry.total += 1;
+    else this.counts.set(key, { scope: { tenant_id, agent_id, total: 0 }, total: 1 });
+    this.total += 1;
+  }
+
+  result(): { total: number; by_scope: ExpiredRunScope[] } {
+    return {
+      total: this.total,
+      by_scope: Array.from(this.counts.values()).map((e) => ({
+        tenant_id: e.scope.tenant_id,
+        agent_id: e.scope.agent_id,
+        total: e.total,
+      })),
+    };
+  }
+}
 
 export const onboardingRunsRepo = {
   /**
@@ -931,8 +977,27 @@ export const onboardingRunsRepo = {
    * Varredura de runs vencidas. Marca `cancelled` com
    * `last_error_code='expired'` — nunca apaga: uma run abandonada precisa
    * continuar diagnosticável (critério de aceite da issue).
+   *
+   * DEVOLVE UM AGREGADO LIMITADO POR ESCOPO, não uma contagem (decisão do dono
+   * na revisão de #555). O motivo é de observabilidade e não de conveniência:
+   * `maia_onboarding_run_cancelled_total{reason="expired"}` é a MESMA série que
+   * o cancelamento pelo console emite (`src/onboarding/wizard.ts:590`), e
+   * aquele caminho a atribui ao `tenant_id + agent_id` da run. Com só a
+   * contagem, o varredor não tinha como fazer o mesmo e a metade dele saía sob
+   * `system`: duas fontes da mesma série com atribuição diferente, e um
+   * dashboard por tenant que mente sobre quem foi cancelado.
+   *
+   * `by_scope` traz o par TRAVADO (lido de dentro da transação, depois do
+   * `FOR UPDATE`), então é o escopo que realmente foi cancelado — não o que a
+   * varredura enxergou antes da trava. O par continua `null | null` para a run
+   * de `global_bootstrap`, que vence antes de existir tenant: quem traduz
+   * ausência de escopo em bucket de métrica é o EMISSOR, não este repositório
+   * (aqui `null` é o dado; `'system'` seria uma decisão de rotulagem).
    */
-  async expireStale(now: Date = new Date(), limit = 100): Promise<number> {
+  async expireStale(
+    now: Date = new Date(),
+    limit = 100,
+  ): Promise<{ total: number; by_scope: ExpiredRunScope[] }> {
     const stale = await db
       .select({ id: onboarding_runs.id })
       .from(onboarding_runs)
@@ -943,9 +1008,9 @@ export const onboardingRunsRepo = {
         ),
       )
       .limit(limit);
-    if (stale.length === 0) return 0;
+    if (stale.length === 0) return { total: 0, by_scope: [] };
 
-    let expired = 0;
+    const tally = new ScopeTally();
     for (const { id } of stale) {
       const done = await withTx(async (tx) => {
         const rows = await tx
@@ -960,7 +1025,7 @@ export const onboardingRunsRepo = {
           (TERMINAL_STATES as readonly string[]).includes(run.state) ||
           run.expires_at.getTime() > now.getTime()
         ) {
-          return false;
+          return null;
         }
         await tx
           .update(onboarding_runs)
@@ -1019,10 +1084,73 @@ export const onboardingRunsRepo = {
             swept_by: 'onboarding_expirer',
           },
         });
-        return true;
+        // O par TRAVADO. Devolver `run.tenant_id`/`run.agent_id` (e não o que
+        // o SELECT da varredura viu) é o que faz a atribuição corresponder ao
+        // que foi de fato cancelado: entre o SELECT e a trava, um passo da
+        // saga pode ter resolvido o tenant.
+        return { tenant_id: run.tenant_id, agent_id: run.agent_id };
       });
-      if (done) expired += 1;
+      // `null` = a corrida perdeu a disputa (run já terminal sob a trava).
+      // Nada foi escrito, então nada é contado — nem no total, nem no escopo.
+      if (done) tally.add(done.tenant_id, done.agent_id);
     }
-    return expired;
+    return tally.result();
+  },
+
+  /**
+   * BACKLOG da varredura: quantas runs já venceram e ainda não foram expiradas,
+   * e há quanto tempo a mais atrasada esperava.
+   *
+   * O predicado é EXATAMENTE o de `expireStale` — as mesmas linhas que o
+   * próximo tick pegaria. Um backlog medido com outro predicado responderia
+   * outra pergunta.
+   *
+   * Por que este agregado existe (issue #519, decisão do dono): sem ele, um
+   * backlog maior que a vazão é INVISÍVEL. O worker drena 1.200 runs/hora, a
+   * série de cancelamento sobe, `maia_worker_run_total{status="ok"}` sobe — e a
+   * fila cresce o tempo todo. Contagem e idade juntas porque separadas mentem:
+   * uma contagem parada no teto do lote não distingue "empatando" de
+   * "perdendo", e uma idade alta sozinha não distingue uma run presa (que o
+   * `FOR UPDATE` nunca solta) de mil runs atrasadas.
+   *
+   * SEM recorte por tenant, e isto é deliberado: é a profundidade de uma FILA
+   * GLOBAL de housekeeping — o mesmo desenho de
+   * `maia_scheduler_backlog{queue}` (`src/observability/runtime-collectors.ts`)
+   * e de `turnRepos.snapshotLiveTurnStates()`. O escopo mora no agregado, e só
+   * números saem da query: nenhum id, nenhum payload, nenhum identificador de
+   * tenant atravessa a fronteira, então o agregado cross-tenant não vira
+   * leitura de dado de ninguém. Quem precisa saber DE QUEM é a run atrasada
+   * tem a run, o evento e a auditoria.
+   */
+  async snapshotExpiryBacklog(
+    now: Date = new Date(),
+  ): Promise<{ backlog: number; oldest_age_seconds: number }> {
+    const rows = await db
+      .select({
+        backlog: sql<string>`count(*)::text`,
+        // EPOCH em vez do timestamp cru: o driver devolveria `min(...)` em um
+        // formato dependente de tipo/parser, e uma idade errada é pior que
+        // ausente. Segundos desde a época são um número e só.
+        oldest_expires_epoch: sql<
+          string | null
+        >`EXTRACT(EPOCH FROM min(${onboarding_runs.expires_at}))::text`,
+      })
+      .from(onboarding_runs)
+      .where(
+        and(
+          lt(onboarding_runs.expires_at, now),
+          notInArray(onboarding_runs.state, [...TERMINAL_STATES]),
+        ),
+      );
+    const row = rows[0];
+    const backlog = Number(row?.backlog ?? 0);
+    const epoch = row?.oldest_expires_epoch;
+    if (!Number.isFinite(backlog) || backlog === 0 || epoch === null || epoch === undefined) {
+      return { backlog: Number.isFinite(backlog) ? backlog : 0, oldest_age_seconds: 0 };
+    }
+    // Relógio INJETADO, o mesmo contra o qual o predicado foi avaliado — sem
+    // isso a idade poderia sair negativa num teste com clock fixo.
+    const age = now.getTime() / 1000 - Number(epoch);
+    return { backlog, oldest_age_seconds: Math.max(0, Math.round(age)) };
   },
 };
