@@ -92,6 +92,11 @@ export {
 export {
   getMigrationStatus,
   getSchemaReadiness,
+  // Exported for `/readyz` (issue #516): the readiness gate binds the
+  // application's own `pg` pool to `getSchemaReadiness()` and needs the pool
+  // shape to type that adapter. See src/runtime/lifecycle/schema-readiness.ts.
+  type ReadOnlyPool,
+  type ReadOnlyPoolClient,
   type SchemaInspectionDeps,
 } from './readiness.js';
 

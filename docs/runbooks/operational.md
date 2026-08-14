@@ -783,7 +783,7 @@ Regras que o código garante (`src/runtime/lifecycle/`):
 - **`/readyz` é role-aware** (`MAIA_PROCESS_ROLE`, ver §8.2) e **fail-closed**:
   503 enquanto `starting`, `draining`, `failed` ou `stopped`, e 503 se um
   componente obrigatório do papel estiver `down`/`unknown` (DB, Redis,
-  pressão de memória do Redis, versão de schema, fila/worker, sessão).
+  pressão de memória do Redis, schema, fila/worker, sessão).
 - **`/readyz` vira 503 no primeiro request depois do SIGTERM** — o estado é
   checado antes (e fora) do cache.
 - **Nenhum probe escreve.** Antes do #512 cada chamada de `/health` inseria 3
@@ -823,6 +823,87 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 s
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 → boot ainda em andamento
 curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | select(.required))'
 ```
+
+#### O componente `schema` do `/readyz` (issue #516)
+
+Desde a #516 o componente `schema` **é o veredito canônico de migrations**
+(`getSchemaReadiness()`, `src/migrations/readiness.ts`), e não mais a
+comparação "id mais novo do ledger × arquivo mais novo em disco". O check
+antigo (`checkSchemaVersion()`) não enxergava checksum divergente, linha
+`dirty`/`running` órfã nem migration aplicada que o build não empacota — e
+reportava "banco à frente do artefato" como saudável.
+
+Cada uma destas condições responde **HTTP 503** e mantém a instância fora de
+rotação:
+
+| Condição | `state` | `checks[].detail` contém | Como sair |
+|---|---|---|---|
+| Linha `dirty` no ledger | `blocked` | `dirty_migration` | Inspeção + `migrate repair` — ver [`migrations.md`](migrations.md) |
+| Checksum do artefato ≠ checksum do ledger | `blocked` | `checksum_mismatch` | Um arquivo já aplicado foi editado, ou o build errado subiu. Reverta o deploy ou corrija o artefato |
+| Ledger cita migration que este build não empacota | `blocked` | `missing_file` | O banco está num schema que este release não verifica: suba o release novo, não este |
+| Migration aplicada sem checksum registrado | `blocked` | `checksum_unknown` | Rode `npm run db:migrate` uma vez (o runner faz o backfill) |
+| Head esperado não aplicado | `blocked` | `schema_below_minimum` | `npm run db:migrate` |
+| Migration `running` (migrator em voo ou que morreu) | `blocked` | `running_migration` | Espere o migrator; se ninguém está rodando, é debris — `migrate up` promove para `dirty` |
+| Banco fora, ledger ausente ou `migrations/` ilegível | `unknown` | `ledger_unavailable` / `ledger_missing` | **`unknown` também é 503** — nunca "não consegui ler ⇒ pronto" |
+
+Diagnóstico:
+
+```bash
+curl -s http://localhost:3000/readyz | jq '.checks[] | select(.component=="schema")'
+npm run db:migrate -- status      # mesmo veredito, com o relatório completo
+```
+
+O corpo do `/readyz` carrega apenas literais nossos (`kind` do blocker + o
+texto do blocker). Mensagem de driver, SQL e `DATABASE_URL` **nunca** saem —
+uma mensagem de erro do pg embute a DSN com senha.
+
+**Custo e cache.** `getSchemaReadiness()` relê e faz SHA-256 de todas as
+migrations empacotadas e lê o ledger inteiro (~50-100 ms medidos neste repo).
+O veredito é cacheado por **10 s** (`SCHEMA_READINESS_TTL_MS` em
+`src/runtime/lifecycle/schema-readiness.ts`) e chamadas concorrentes são
+coalescidas, então o custo é ~uma avaliação por 10 s por réplica,
+independentemente da frequência do LB.
+
+**Não confunda "uma avaliação por 10 s" com "obsoleto por até 10 s".** São
+números diferentes, e o segundo é o que importa durante um incidente. O
+`/readyz` passa por DOIS caches: este TTL de 10 s e o cache composto de
+`evaluateComponents()`, que memoiza o conjunto inteiro de componentes por
+`READINESS_CACHE_MS` (2 s no default). Uma entrada composta preenchida um
+milissegundo antes do TTL interno expirar continua servindo aquele veredito até
+ELA expirar. Então:
+
+| pergunta | número |
+|---|---|
+| com que frequência o schema é REAVALIADO | uma vez por 10 s por réplica |
+| por quanto tempo um 200 obsoleto pode sobreviver | **`SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS`** — 12 s nos defaults |
+| e se eu subir o `READINESS_CACHE_MS` | a janela cresce junto, **sem teto no contrato de config hoje** |
+
+Consequência operacional: depois que o schema fica incompatível a instância
+ainda pode responder 200 por até 12 s — dentro da janela em que o próprio load
+balancer ainda não declarou o alvo unhealthy — e depois que o `migrate up`
+conserta, ela leva até 12 s a mais para voltar à rotação.
+
+A soma está fixada em `tests/unit/runtime/lifecycle-schema-readiness.spec.ts`:
+mexer em qualquer um dos dois valores reprova o teste com o número novo, para
+esta tabela não apodrecer.
+
+**Ordem de deploy.** O migrator precisa rodar **antes** da aplicação. Um banco
+com ledger v1 (linhas sem checksum) deixa o `/readyz` em 503 com
+`checksum_unknown` até o `migrate up` adotar os checksums empacotados.
+
+**`READINESS_SCHEMA_CHECK=false` é inválido em production.** A validação de
+configuração **recusa o boot** (`lifecycle/schema-check-disabled`, severidade
+`error`, escopo `boot` — vale inclusive sob
+`MAIA_CONFIG_STRICT_BOOT=false`). Em `staging` continua permitido, com aviso;
+em `development` é silencioso. Desligar o flag faz o componente `schema`
+reportar `ok` sem consultar nada — é exatamente a porta que a #516 fechou para
+produção.
+
+> **Nota:** o passo de **boot** (`src/index.ts`, etapa `schema`) continua usando
+> `checkSchemaVersion()`, o check mais fraco. Isso é deliberado: readiness
+> responde "posso servir tráfego?" e um "não" custa uma instância fora de
+> rotação com um 503 auto-explicativo; boot responde "posso existir?" e um "não"
+> custa crash loop. Unificar os dois é decisão de política em aberto na #516.
 
 > As variáveis desta seção vivem no contrato de configuração (#515): grupo
 > **Lifecycle do processo** em `src/config/contract.ts`, documentadas em

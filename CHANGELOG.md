@@ -4,6 +4,33 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — `/readyz` passa a gatear no veredito canônico de schema ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
+
+> **Duas mudanças que podem tirar instâncias de rotação (ou recusar o boot) num ambiente que sobe hoje.** Rode `tsx scripts/migrate.ts status` contra cada banco **antes** de deployar: se ele não imprimir `readiness: ready`, o `/readyz` do release novo responderá 503. Runbook: [`docs/runbooks/operational.md`](docs/runbooks/operational.md) §8.1.
+
+1. **O componente `schema` do `/readyz` agora é `getSchemaReadiness()`** (`src/migrations/readiness.ts`), não mais a comparação "id mais novo do ledger × arquivo mais novo em disco" (`checkSchemaVersion()`). Passam a responder **503** condições que antes davam 200:
+
+   | Condição | Antes | Agora |
+   |---|---|---|
+   | Linha `dirty` no ledger | 200 | **503** (`dirty_migration`) |
+   | Checksum do artefato ≠ do ledger | 200 | **503** (`checksum_mismatch`) |
+   | Migration aplicada sem checksum registrado (ledger v1) | 200 | **503** (`checksum_unknown`) |
+   | Ledger cita migration que o build não empacota | 200 | **503** (`missing_file`) |
+   | Migration `running` (migrator em voo ou morto) | 200 | **503** (`running_migration`) |
+   | Banco à frente do artefato | 200 (explicitamente `ok`) | 503 só se o build declarar `max_supported_migration` |
+   | Head esperado não aplicado | 503 | **503** (`schema_below_minimum`) |
+   | Banco fora / ledger ausente / `migrations/` ilegível | 503 | **503** (`unknown`, fail-closed) |
+
+   **Ordem de deploy:** o migrator precisa rodar **antes** da aplicação. Um banco com ledger v1 mantém o `/readyz` em 503 com `checksum_unknown` até `npm run db:migrate` adotar os checksums empacotados.
+
+   O veredito é cacheado por **10 s** e chamadas concorrentes são coalescidas, então o custo é ~uma avaliação por 10 s por réplica, independente da frequência do load balancer. Atenção ao número que importa em incidente: o `/readyz` também passa pelo cache composto de `READINESS_CACHE_MS` (2 s no default), então um 200 obsoleto pode sobreviver por `SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS` — **12 s nos defaults**, e mais se o `READINESS_CACHE_MS` subir.
+
+2. **`READINESS_SCHEMA_CHECK=false` passa a ser inválido no profile `production` e recusa o boot** (regra `lifecycle/schema-check-disabled`, severidade `error`, escopo `boot` — vale inclusive sob `MAIA_CONFIG_STRICT_BOOT=false`). Em `staging` continua permitido, com aviso; em `development`, silencioso. Antes era aviso em todos os profiles fora de `development`.
+
+   **Ação:** remova `READINESS_SCHEMA_CHECK=false` do `.env` de produção (o default é `true`).
+
+O passo de **boot** (`src/index.ts`, etapa `schema`) continua usando `checkSchemaVersion()` de propósito — unificá-lo com o veredito estrito transformaria toda condição que hoje produz uma instância diagnosticável fora de rotação num crash loop, e isso é decisão de política ainda aberta na #516.
+
 ### ⚠️ BREAKING (operacional) — o boot passa a falhar fechado por configuração ([#515](https://github.com/diogenesmendes01/Maia-v2/issues/515))
 
 > **Um ambiente que sobe hoje pode parar de subir no primeiro release que contiver esta mudança.** Rode `npm run config:check -- --profile production --env-file .env` contra o `.env` de cada ambiente **antes** de deployar. Runbook completo: [`docs/runbooks/config-contract.md`](docs/runbooks/config-contract.md).

@@ -1,6 +1,29 @@
 /**
- * Schema/migration version compatibility — issue #512 §2 (`/readyz`:
- * "schema/migration version é compatível") and §4 step 4.
+ * Schema/migration version compatibility — issue #512 §2 and §4 step 4.
+ *
+ * ### NOT the readiness verdict any more (issue #516)
+ *
+ * `/readyz` no longer consumes this module. Its `schema` component now asks
+ * `getSchemaReadiness()` through `./schema-readiness.ts`, because the check
+ * below is strictly weaker: comparing the newest ledger id with the newest file
+ * on disk cannot see a checksum mismatch, cannot see a `dirty` or orphaned
+ * `running` row, cannot see a migration the database applied but this build
+ * does not ship, and deliberately reports "database ahead of the artifact" as
+ * `ok`. Every one of those is a schema that must not receive traffic.
+ *
+ * WHY IT SURVIVES: it is still the BOOT step (`src/index.ts`, lifecycle step
+ * `schema`), where the two checks answer different questions. Readiness asks
+ * "may I serve traffic?" and answering "no" costs one instance out of rotation
+ * with a self-describing 503 body. Boot asks "may I exist?" and answering "no"
+ * costs a crash loop. Swapping the boot step for the stricter verdict would
+ * turn every schema condition that currently produces a diagnosable
+ * never-ready instance into a restart loop — a policy change, not a wiring
+ * change, and one the owner has not made. So: readiness gets the strong
+ * verdict now, and unifying the boot gate stays an explicit open decision
+ * (see `docs/architecture/modules/migrations.md`).
+ *
+ * Nothing else may consume this module. New surfaces call
+ * `getSchemaReadiness()`.
  *
  * OUT OF SCOPE by design: applying migrations. Readiness NEVER runs DDL — it
  * only refuses to serve traffic on a schema the running code was not built

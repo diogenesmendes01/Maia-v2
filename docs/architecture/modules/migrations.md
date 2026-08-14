@@ -203,6 +203,8 @@ The ledger is the primary operational trail, because migrations can run before `
 | `tests/unit/migrations/lock.spec.ts` | Acquire, wait, timeout, connect/query failure, idempotent release, namespace |
 | `tests/unit/migrations/runner.spec.ts` | Order of operations, three transaction modes, dirty/failed transitions, the envelope guardrail and `terminalLedgerStatusFor`, `status` recomputed on the failure path, repair (including the `--as applied` refusal, its exact text, and that it precedes the lock), log hygiene |
 | `tests/unit/migrations/readiness.spec.ts` | Read-only + never-throwing guarantees of the #517 surface |
+| `tests/unit/runtime/lifecycle-schema-readiness.spec.ts` | The `/readyz` adapter: every blocking condition through the REAL decision core (injected pool + temp artifact), plus the cost contract (TTL cache, single-flight, negative caching) |
+| `tests/integration/lifecycle-probes.spec.ts` | Each schema condition asserted as an HTTP 503 from the REAL `GET /readyz` route on `buildServer()` — a mirrored harness would pass even with the call site deleted |
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
 | `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, `status` recomputed on both failure paths, the durability of a committed envelope (the hazard behind the guardrail) and the refusal of the file that would hit it, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
@@ -217,14 +219,55 @@ The ledger is the primary operational trail, because migrations can run before `
 | Declare an expand/contract compatibility range | Pass a `manifest` to `getSchemaReadiness` |
 | Consume schema health from a new surface | `getSchemaReadiness()` — never re-derive it by querying `schema_migrations` yourself |
 
+## The `/readyz` gate
+
+`src/runtime/lifecycle/readiness.ts` probes the `schema` component through
+`src/runtime/lifecycle/schema-readiness.ts`, a thin cached adapter over
+`getSchemaReadiness()`. It is the ONLY schema question `/readyz` asks.
+
+| Situation | verdict | `/readyz` |
+|---|---|---|
+| every packaged migration applied, checksums match | `ready` | 200 |
+| `dirty` row | `blocked` (`dirty_migration`) | **503** |
+| ledger checksum ≠ packaged checksum | `blocked` (`checksum_mismatch`) | **503** |
+| applied with no recorded checksum | `blocked` (`checksum_unknown`) | **503** |
+| ledger cites a migration this build does not ship | `blocked` (`missing_file`) | **503** |
+| expected head not applied | `blocked` (`schema_below_minimum`) | **503** |
+| `running` row seen from a read-only caller | `blocked` (`running_migration`) | **503** |
+| database unreachable, ledger absent, `migrations/` unreadable | `unknown` | **503** |
+
+Fail-closed in both directions: `unknown` is a NOT-ready answer, never a
+missing one. Artifact integrity problems (a missing `_down` sibling, a
+malformed prefix) still block `migrate up` but deliberately do NOT block
+readiness — they describe the repository, not the schema in the database.
+
+**Cost.** `getSchemaReadiness()` re-reads and hashes the whole packaged
+artifact and reads the whole ledger (~50-100 ms here). The verdict is cached
+for `SCHEMA_READINESS_TTL_MS` (10 s) and concurrent polls are coalesced, so a
+load-balancer poll costs ~one evaluation per 10 s per replica regardless of
+rate. The TTL is the deliberate trade-off between a stale positive (serving up
+to 10 s against a schema that just became incompatible — inside the window the
+load balancer itself needs to declare a target unhealthy) and the cost of the
+evaluation. The rationale lives in the module doc.
+
+**`READINESS_SCHEMA_CHECK=false`** short-circuits the component to `ok`. It is
+an ERROR in the `production` profile and refuses the boot (`src/config/rules.ts`,
+rule `lifecycle/schema-check-disabled`, scope `boot`, so it holds even under
+the `MAIA_CONFIG_STRICT_BOOT=false` rollback lever). Staging warns;
+development is silent.
+
+**Deploy order.** The migrator must run before the application: a v1 ledger
+(rows without checksums) classifies as `checksum_unknown` and keeps `/readyz`
+at 503 until `migrate up` adopts the packaged checksums.
+
 ## In-flight / not yet done (issue #516 DoD)
 
-Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API.
+Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API, and the `/readyz` gate that consumes it (see the section above).
 
 Not yet delivered, tracked on #516:
 
-- **`/readyz` still uses the weaker #512 check.** `src/runtime/lifecycle/readiness.ts:102` probes the `schema` component via `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), gated by `config.READINESS_SCHEMA_CHECK`. That check compares the newest ledger id against the newest file on disk and nothing else: it cannot see a checksum mismatch, cannot see a dirty or orphaned `running` row, and deliberately reports `applied > expected` as `ok`. Swapping it for `getSchemaReadiness()` is the intended follow-up — the call site is one line, but `src/runtime/**` was outside this change's footprint;
 - no one-shot `migrate` service in `docker-compose.yml` / `compose.prod.yml`, and the Dockerfile still starts the app directly;
+- **the BOOT step still uses the weaker check.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. Readiness no longer does. Unifying them is a POLICY decision, not a wiring one: readiness answering "no" costs one instance out of rotation with a self-describing 503 body, while boot answering "no" costs a crash loop, and every condition that currently produces a diagnosable never-ready instance would become a restart loop. Deferred pending an owner decision;
 - `maia doctor` (#517) is a separate issue and consumes this module;
 - timeouts are call-site options with defaults, not configuration-contract variables (#515).
 
@@ -232,5 +275,5 @@ Not yet delivered, tracked on #516:
 
 | | |
 |---|---|
-| Last verified | 2026-08-08 |
-| Against `main` HEAD | `6bf0fa27` |
+| Last verified | 2026-08-10 |
+| Against `main` HEAD | `0b20907e` |

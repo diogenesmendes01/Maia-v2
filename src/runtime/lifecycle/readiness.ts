@@ -17,6 +17,10 @@
  *     of rotation (fail-closed — AGENTS.md §4.2). Only components with an
  *     explicit, documented degradation policy may report `degraded` and stay
  *     in rotation;
+ *   - the `schema` component is the CANONICAL migration verdict
+ *     (`getSchemaReadiness()`, issue #516) via `schema-readiness.ts`: dirty
+ *     state, a divergent checksum, a migration file this build does not ship
+ *     and an incompatible head all answer 503, and so does `unknown`;
  *   - every probe is READ-ONLY (no writes, no rows) and bounded by
  *     `READINESS_PROBE_TIMEOUT_MS`; a timeout reports `unknown`, i.e. it fails
  *     closed for a required component;
@@ -33,7 +37,7 @@ import { isRedisConnected, redis } from '@/lib/redis.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
 import { checkReadiness as checkRedisMemoryReadiness } from '@/lib/healthcheck.js';
 import { lifecycle, type LifecycleState } from './controller.js';
-import { checkSchemaVersion } from './schema-version.js';
+import { checkSchemaReadiness, describeSchemaReadiness } from './schema-readiness.js';
 import { getRoleContract, type LifecycleComponent, type ProcessRole } from './roles.js';
 
 export type ReadinessStatus = 'ok' | 'degraded' | 'down' | 'unknown';
@@ -96,15 +100,29 @@ async function probeComponent(component: LifecycleComponent): Promise<ReadinessC
       return { component, status: ok ? 'ok' : 'down', required: false };
     }
     case 'schema': {
+      // Issue #516: the gate is `getSchemaReadiness()` — the CANONICAL schema
+      // verdict — and not the weaker #512 id comparison it replaced. It names
+      // dirty state, checksum divergence, a migration the database applied but
+      // this build does not ship, and an out-of-range schema; the old check saw
+      // none of those. See `schema-readiness.ts` for the caching policy.
+      //
+      // `READINESS_SCHEMA_CHECK=false` is a documented, explicit policy for
+      // environments that publish code and schema out of band. It is REFUSED at
+      // boot in the production profile (`lifecycle/schema-check-disabled`,
+      // src/config/rules.ts), so this branch cannot be reached in production.
       if (!config.READINESS_SCHEMA_CHECK) {
         return { component, status: 'ok', required: false, detail: 'schema check disabled' };
       }
-      const r = await checkSchemaVersion();
+      const r = await checkSchemaReadiness();
+      // FAIL-CLOSED, both ways: `blocked` is a named incompatibility (`down`),
+      // and `unknown` — the state could not be established at all — is
+      // `unknown`, which keeps a required component out of rotation just as
+      // hard. "I could not read the schema" is never "the schema is fine".
       return {
         component,
-        status: r.status === 'ok' ? 'ok' : r.status === 'pending' ? 'down' : 'unknown',
+        status: r.state === 'ready' ? 'ok' : r.state === 'blocked' ? 'down' : 'unknown',
         required: false,
-        detail: r.status === 'ok' ? undefined : r.detail,
+        detail: r.state === 'ready' ? undefined : describeSchemaReadiness(r),
       };
     }
     case 'redis': {

@@ -370,14 +370,19 @@ Two rules follow, and they are the operator's responsibility:
 
 ## Future work (issue #516 remainder)
 
-- Wire `/readyz` to `getSchemaReadiness()`. The `schema` component at
-  `src/runtime/lifecycle/readiness.ts:102` still calls the #512
-  `checkSchemaVersion()`, which only compares the newest applied id to
-  the newest file on disk — it cannot see a checksum mismatch, a dirty
-  migration or an orphaned `running` row, and reports a database ahead
-  of the build as `ok`. Until the swap lands, `/readyz` is NOT a
-  trustworthy gate for those conditions; `tsx scripts/migrate.ts status`
-  is.
+- **DONE** — `/readyz` consumes `getSchemaReadiness()`. The `schema`
+  component now goes through
+  `src/runtime/lifecycle/schema-readiness.ts`, so a checksum mismatch, a
+  dirty or orphaned `running` row, a migration file this build does not
+  ship, an incompatible head and an unreadable database each answer
+  **503**. `READINESS_SCHEMA_CHECK=false` is refused at boot in the
+  `production` profile. Operator detail (including the 10s verdict
+  cache) in [`operational.md`](operational.md) §8.1.
+- The **boot** step (`src/index.ts`, lifecycle step `schema`) still uses
+  `checkSchemaVersion()`. Unifying it with the readiness verdict would
+  turn every schema condition that currently yields a diagnosable
+  never-ready instance into a crash loop — a policy decision still open
+  on #516.
 - Add a one-shot `migrate` service to `docker-compose.yml` /
   `compose.prod.yml`, with `app` and `admin-ui` depending on its
   successful completion, so a fresh database reaches head before any
