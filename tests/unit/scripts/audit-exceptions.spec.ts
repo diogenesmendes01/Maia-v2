@@ -14,6 +14,7 @@ import {
   PROJECTS,
   ghsaFromUrl,
   keyOf,
+  npmExecutable,
   parseAudit,
   validateLedger,
   findProblems,
@@ -98,6 +99,24 @@ describe('parseAudit', () => {
   it('aceita um relatório sem vulnerabilidade nenhuma', () => {
     expect(parseAudit('src/admin-ui', { vulnerabilities: {} })).toEqual([]);
     expect(parseAudit('src/admin-ui', {})).toEqual([]);
+  });
+});
+
+describe('npmExecutable — o comando documentado precisa rodar no Windows', () => {
+  it('usa npm.cmd no win32', () => {
+    // `execFileSync` não passa por shell nem resolve PATHEXT: com 'npm' o
+    // Windows dá `spawnSync npm ENOENT` e o guard morre antes de auditar.
+    expect(npmExecutable('win32')).toBe('npm.cmd');
+  });
+
+  it('usa npm nos demais', () => {
+    expect(npmExecutable('linux')).toBe('npm');
+    expect(npmExecutable('darwin')).toBe('npm');
+    expect(npmExecutable('freebsd')).toBe('npm');
+  });
+
+  it('sem argumento, decide pela plataforma corrente', () => {
+    expect(npmExecutable()).toBe(npmExecutable(process.platform));
   });
 });
 

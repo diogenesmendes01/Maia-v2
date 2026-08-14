@@ -242,6 +242,20 @@ export function todayUtc(now: Date): string {
 }
 
 /**
+ * Nome do executável do npm para a plataforma.
+ *
+ * No Windows o que existe no PATH é `npm.cmd` (um shim de shell), e
+ * `execFileSync` não resolve por PATHEXT nem passa por shell — chamar `'npm'`
+ * lá dá `spawnSync npm ENOENT`, ou seja, o comando documentado no AGENTS.md
+ * (`npm run audit:exceptions:check`) morre antes de auditar coisa alguma. A
+ * plataforma entra por parâmetro para o spec cobrir os dois casos sem precisar
+ * rodar em Windows.
+ */
+export function npmExecutable(platform: string = process.platform): string {
+  return platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+/**
  * Roda `npm audit --json` num projeto. O `npm audit` sai com código != 0
  * QUANDO ENCONTRA vulnerabilidade, então o status é ignorado de propósito e o
  * que vale é o JSON no stdout.
@@ -249,7 +263,7 @@ export function todayUtc(now: Date): string {
 export function runAudit(projectDir: string): unknown {
   let stdout: string;
   try {
-    stdout = execFileSync('npm', ['audit', '--json'], {
+    stdout = execFileSync(npmExecutable(), ['audit', '--json'], {
       cwd: projectDir,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
