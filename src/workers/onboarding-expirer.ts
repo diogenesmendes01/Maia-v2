@@ -5,6 +5,7 @@ import {
 } from '@/db/repositories/onboarding-repos.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
+import { safeFailure } from '@/lib/safe-failure.js';
 import { counter, scopeAttribution, METRIC } from '@/observability/metrics.js';
 
 /**
@@ -69,31 +70,6 @@ import { counter, scopeAttribution, METRIC } from '@/observability/metrics.js';
 
 /** Nome da entrada no registry — usado como label `worker` das métricas. */
 const WORKER = 'onboarding_expirer';
-
-/**
- * Qualquer URI com credencial embutida (`postgres://user:senha@host/db`) some
- * do que este worker escreve. #533: já houve vazamento de `DATABASE_URL` por
- * stderr cru, e uma falha de conexão é exatamente o erro cuja mensagem carrega
- * a DSN.
- */
-const URI_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s'"]*/gi;
-
-/**
- * Recorte SANITIZADO e BOUNDED de um erro: nome, código (o `code` do driver
- * quando ele existe — `40P01` deadlock, `57P01` admin shutdown — que é o que
- * um plantonista quer no log) e a mensagem com URIs censuradas e truncada.
- */
-function safeFailure(err: unknown): { name: string; code: string; reason: string } {
-  const e = err as { name?: unknown; code?: unknown; message?: unknown };
-  const name = typeof e?.name === 'string' ? e.name.slice(0, 64) : 'Error';
-  const code =
-    typeof e?.code === 'string' && /^[A-Za-z0-9_]{1,16}$/.test(e.code) ? e.code : 'unknown';
-  const reason =
-    typeof e?.message === 'string'
-      ? e.message.replace(URI_RE, '[REDACTED_URL]').slice(0, 200)
-      : '';
-  return { name, code, reason };
-}
 
 /**
  * Teto de runs expiradas por tick, LIDO A CADA CORRIDA do contrato de
