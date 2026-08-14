@@ -288,12 +288,12 @@ export const METRIC = {
   LLM_CIRCUIT_WOULD_REJECT: 'maia_llm_circuit_would_reject_total',
   /**
    * Kill-switch usage. `state` is the posture that was forced, `reason` ∈
-   * applied|expired|cleared|rejected|adopted|resynced|resync_failed. A lever
-   * that can be pulled without a deploy MUST leave a trace that alerting can
-   * see; the matching `llm_gateway.circuit_mode_override` log line carries
-   * actor and reason.
+   * applied|expired|cleared|rejected|adopted|resynced|resync_failed|resync_aborted.
+   * A lever that can be pulled without a deploy MUST leave a trace that
+   * alerting can see; the matching `llm_gateway.circuit_mode_override` log line
+   * carries actor and reason.
    *
-   * The last two are the RECONNECT resync (issue #534 gate 4), one event per
+   * The last THREE are the RECONNECT resync (issue #534 gate 4), one event per
    * RE-READ including the no-op — never one per retry attempt, see below:
    * Redis pub/sub is at-most-once with no replay,
    * so a replica whose socket dropped during the incident must re-read the
@@ -306,15 +306,37 @@ export const METRIC = {
    * treating an absent key as authoritative there would clear a live
    * override). The cause stays distinguishable in the log's `outcome` field.
    *
-   * `resync_failed` is TERMINAL: the re-read is retried (immediate attempt + 3
-   * backed-off retries, `RESYNC_RETRY` in `src/lib/llm/cache-invalidation.ts`)
-   * and only exhaustion reaches this series — an intermediate failure is a
-   * `llm_gateway.circuit_override_resync_retry` log line and nothing else. That
-   * is what lets ANY point here page: `MaiaLlmCircuitResyncFailedEnforcing`
+   * `resync_failed` is TERMINAL, and terminal has TWO distinct routes (owner
+   * review on PR #561, finding 3) — the re-read is retried (immediate attempt +
+   * 3 backed-off retries, `RESYNC_RETRY` in
+   * `src/lib/llm/cache-invalidation.ts`), so a point here means either:
+   *
+   *  - **exhaustion of the RETRYABLE failures** — `GET` error or attempt
+   *    deadline, unreadable key, missing re-subscribe ack. Four attempts, all
+   *    failed. An intermediate failure of this kind is a
+   *    `llm_gateway.circuit_override_resync_retry` log line and nothing else,
+   *    which is what keeps a 200 ms Redis hiccup out of this series; or
+   *  - **a deterministic TERMINAL refusal on the first read** — the key was
+   *    read and governance REJECTED the payload (no absolute `expires_at`, no
+   *    actor, expired, above the cap). Retrying is pointless: the verdict is a
+   *    function of the key's content, and four identical `_rejected` rows would
+   *    turn the durable trail into noise. So `outcome="rejected"` reaches this
+   *    series with `attempts=1`, by design — not as a retry regression.
+   *
+   * Either way ANY point here pages: `MaiaLlmCircuitResyncFailedEnforcing`
    * (critical, `state="enforce"`) and `MaiaLlmCircuitResyncFailed` (warning,
    * every other posture) in `monitoring/alerts/slo.rules.yml`. They are
    * evaluated WITHOUT aggregation on purpose — one diverging replica out of
    * twenty is the case they exist to catch, and a `sum` would dissolve it.
+   * Triage per `outcome` is in `docs/runbooks/observability-slo.md` §4.9.3.
+   *
+   * `resync_aborted` is the THIRD bucket, and neither of the other two (owner
+   * review on PR #561, finding 2): the subscriber was CLOSED — drain, deploy —
+   * while the re-read was in flight, so it was cancelled rather than finished.
+   * Folding it into `resync_failed` would make every deliberate drain page;
+   * folding it into `resynced` would claim a convergence that never happened,
+   * which is exactly the false green evidence the `enforce` promotion gate must
+   * not read. No alert selects it: a replica on its way out is not an incident.
    */
   LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 

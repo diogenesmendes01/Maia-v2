@@ -376,25 +376,38 @@ journalctl -u maia | grep llm_gateway.circuit_override_resync
 ```
 
 A releitura tem **retry limitado** (decisão do owner na #534): tentativa
-imediata + 3 retries, com backoff exponencial, jitter e timeout por tentativa
+imediata + 3 retries, com backoff exponencial, jitter e deadline por tentativa
 (`RESYNC_RETRY`, `src/lib/llm/cache-invalidation.ts`). Uma tentativa
 intermediária que falha sai só como `llm_gateway.circuit_override_resync_retry`
 (WARN, com `attempt` e o erro) e **não** entra na série de convergência — a
 falha típica aqui é um `LOADING` de failover, e desistir dela marcaria a réplica
 como divergente por causa de um soluço.
 
+O deadline vale para a tentativa INTEIRA — ack de re-inscrição e `GET` dividem
+o mesmo orçamento —, então o pior caso de uma releitura que esgota é **~10,1s**:
+4 × 2 000 ms + 300 + 600 + 1 200 ms de backoff no pior jitter
+(`resyncWorstCaseMs()`).
+
 `resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`, campo
-`attempts`) é a saída ruim, é **terminal** — só sai depois do esgotamento — e
-cobre TODA releitura que não pôde afirmar consistência com o Redis. É a série
-que os alertas `MaiaLlmCircuitResyncFailedEnforcing` (crítico) e
-`MaiaLlmCircuitResyncFailed` (warning) observam, por réplica; leitura do alerta
-em [`observability-slo.md` §4.9.3](observability-slo.md). O campo `outcome` do
-log diz qual:
+`attempts`) é a saída ruim, é **terminal** e cobre TODA releitura que não pôde
+afirmar consistência com o Redis. Terminal por dois caminhos: **esgotamento das
+falhas retentáveis** (`attempts=4`) **ou recusa determinística** do payload lido
+(`attempts=1` — retentar daria o mesmo veredito). É a série que os alertas
+`MaiaLlmCircuitResyncFailedEnforcing` (crítico) e `MaiaLlmCircuitResyncFailed`
+(warning) observam, por réplica; leitura do alerta em
+[`observability-slo.md` §4.9.3](observability-slo.md). O campo `outcome` do log
+diz qual:
 
 | `outcome` | O que aconteceu |
 |---|---|
-| `failed` | `GET` falhou (ou estourou o timeout), chave ilegível, ou re-inscrição sem ack — não houve leitura defensável em nenhuma das 4 tentativas |
-| `rejected` | a chave FOI lida e foi recusada (sem `expires_at` absoluto, sem ator, vencida, acima do teto) |
+| `failed` | `GET` falhou (ou estourou o deadline), chave ilegível, ou re-inscrição sem ack — não houve leitura defensável em nenhuma das 4 tentativas |
+| `rejected` | a chave FOI lida e foi recusada (sem `expires_at` absoluto, sem ator, vencida, acima do teto) — terminal na primeira leitura |
+
+**Réplica drenando não é divergência.** Se o subscriber for fechado (deploy,
+scale-in, restart) com a releitura em voo, ela é **cancelada** e sai como
+`reason="resync_aborted"` + log WARN
+`llm_gateway.circuit_override_resync_aborted` — fora dos dois alertas. Um drain
+deliberado não acorda o plantão (achado 2 da review da PR #561).
 
 Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há
 override" a partir de um Redis mudo (ou de um payload que não passa na
