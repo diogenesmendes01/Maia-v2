@@ -228,9 +228,12 @@ export async function runRestoreDrillJob(): Promise<
  * `restore_drills`, whether a drill is actually needed. A tick that finds fresh
  * evidence does no work: one indexed read and it returns.
  *
- * An hourly tick honours every interval down to
- * `MIN_HONOURABLE_INTERVAL_HOURS` (6h); below that the tick says so on every
- * pass rather than pretending — see `drill-schedule.ts`.
+ * An hourly tick cannot honour an arbitrarily small interval, so the floor is
+ * DERIVED from this cadence plus the drill's bounded stages
+ * (`minHonourableDrillIntervalHours`) and enforced at BOOT by
+ * `backup/drill-interval-feasible` — 10h with the shipped timeouts. A config
+ * below it does not start the process, so this function never has to cope with
+ * an interval it cannot meet.
  *
  * THE GATE PART. Every tick grades the evidence through
  * `evaluateBackupReadiness` and logs the verdict at a matching level, whether

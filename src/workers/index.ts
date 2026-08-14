@@ -153,9 +153,11 @@ export const JOBS: Job[] = [
   // cadência aqui é um TICK fixo de hora em hora e não um cron derivado do
   // intervalo. O tick lê `restore_drills`, e só dispara um drill quando a
   // evidência está perto de vencer (75% do intervalo) ou nunca existiu —
-  // evidência fresca faz o tick não fazer nada. Hora em hora honra todo
-  // intervalo >= 6h (`MIN_HONOURABLE_INTERVAL_HOURS`); abaixo disso o tick
-  // AVISA em vez de fingir que honra.
+  // evidência fresca faz o tick não fazer nada. Esta cadência de 1h é um dos
+  // três parâmetros do piso que o boot exige (`backup/drill-interval-feasible`,
+  // `src/config/rules.ts`): com os timeouts default o intervalo mínimo
+  // honrável é 10h, e abaixo disso o processo NÃO SOBE — mudar este cron muda
+  // aquele piso.
   // Single-flight pelo lock `maia_ops_restore_drill` (o próprio
   // `runRestoreDrillJob`), então CLI, réplica e tick anterior nunca correm
   // juntos. PHASE 1 de propósito: startWorkers(1) ignora phase>1.

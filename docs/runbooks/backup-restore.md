@@ -187,6 +187,14 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 
 **O drill roda sozinho.** O job `restore_drill` ([`src/workers/index.ts`](../../src/workers/index.ts)) acorda **de hora em hora** (`40 * * * *`, phase 1) e chama `runScheduledRestoreDrill()` ([`src/workers/backup.ts`](../../src/workers/backup.ts)).
 
+**O intervalo tem um piso, e ele é recusado no boot.** O agendador só consegue honrar uma idade máxima que caiba na sua própria margem: ele acorda a cada 1h e dispara o drill a 75% do intervalo, sobrando 25% para o drill acontecer. Nesses 25% tem que caber **um tick de latência + a duração do drill** (os estágios com orçamento: `BACKUP_UPLOAD_TIMEOUT_MS` + `BACKUP_RESTORE_TIMEOUT_MS`):
+
+```
+intervalo >= (tick + upload + restore) / (1 - 0,75)   ⇒   >= 4 × (tick + upload + restore)
+```
+
+Com os defaults (1h + 30min + 60min = 2,5h) o piso é **10 horas**. Abaixo disso o processo **não sobe**: `backup/drill-interval-feasible` ([`src/config/rules.ts`](../../src/config/rules.ts)) é erro de boot enquanto `BACKUP_ENABLED=true`, mesma postura do `backup/rpo-feasible` — não se anuncia um objetivo que a arquitetura não cumpre. O piso é **derivado**, então baixar os timeouts baixa o piso, e mudar o cron do worker muda os dois. É um piso, não uma garantia: o download off-site e as probes não têm orçamento próprio.
+
 **A cadência do cron não é o intervalo, e isso é de propósito.** `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` é a **idade máxima aceitável da evidência**, não um agendamento. Derivar um cron dele seria uma segunda fonte da verdade e re-executaria um drill por relógio, mesmo com um drill recém-aprovado. Em vez disso o tick lê `restore_drills` e decide ([`src/ops/backup/drill-schedule.ts`](../../src/ops/backup/drill-schedule.ts)):
 
 | Estado da evidência | O que o tick faz |
@@ -212,7 +220,7 @@ Códigos de falha (estáveis, seguros para log e métrica): `backups_disabled`, 
 
 O coletor ([`src/observability/backup-readiness-collector.ts`](../../src/observability/backup-readiness-collector.ts)) lê a evidência **no scrape**, não de um valor que o worker publica: se o `restore_drill` parar de rodar, um gauge publicado por ele congelaria no último valor (verde) — que é exatamente a falha que o gate existe para pegar. Pelo mesmo motivo, uma leitura que **falha** derruba o snapshot em vez de reservir o último verde.
 
-**Alertas** ([`monitoring/alerts/backup.rules.yml`](../../monitoring/alerts/backup.rules.yml)):
+**Alertas** ([`monitoring/alerts/backup.rules.yml`](../../monitoring/alerts/backup.rules.yml)). O arquivo **existe no repositório e está declarado** no `rule_files` de [`observability-slo.md` §8](observability-slo.md) — o que **não** prova que o Prometheus do ambiente o carregou. Isso é verificação operacional: `GET /api/v1/rules` no Prometheus e procure o grupo `maia_backup_restore_drill`. Se ele não estiver lá, os dois alertas abaixo não existem para ninguém:
 
 | Alerta | Dispara | O que o operador faz |
 |---|---|---|

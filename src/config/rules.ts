@@ -11,6 +11,14 @@
  * touches no filesystem, and never interpolates a secret VALUE into a message.
  */
 import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
+// Pure, leaf-level helpers: the drill SCHEDULE owns the arithmetic of what it
+// can honour, so the boot gate asks it instead of restating the formula (which
+// is how the two would drift). Same direction as the `@/setup` import above —
+// this module stays pure, it just does not re-implement other modules' rules.
+import {
+  DRILL_TICK_HOURS,
+  minHonourableDrillIntervalHours,
+} from '@/ops/backup/drill-schedule.js';
 import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
 import {
   type EnvVarSpec,
@@ -391,6 +399,48 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
           'BACKUP_RPO_TARGET_HOURS below 24 cannot be met by nightly logical dumps alone. Either raise the target or land PITR/WAL archiving first — the platform must not advertise an RPO it cannot honour.',
         remediation: 'Use BACKUP_RPO_TARGET_HOURS >= 24 enquanto não houver PITR/WAL archiving.',
       });
+    }
+
+    // O intervalo do drill precisa ser HONRÁVEL pelo agendador (issue #536).
+    //
+    // `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` é a idade máxima aceitável da
+    // evidência, e quem a renova é o worker `restore_drill`: ele acorda a cada
+    // hora e dispara o drill a 75% do intervalo, deixando os 25% restantes para
+    // o drill acontecer. Se esses 25% não cobrirem "um tick de latência + a
+    // duração do drill", a evidência vence antes de ser renovada e o gate fica
+    // piscando vermelho para sempre — a plataforma prometeria uma idade máxima
+    // que a própria arquitetura não cumpre.
+    //
+    // Mesma família de raciocínio do `backup/rpo-feasible` acima, e por isso
+    // também `error` no boot: não se anuncia um objetivo inalcançável. O piso é
+    // DERIVADO dos outros parâmetros (tick, upload, restore) por
+    // `minHonourableDrillIntervalHours` — nos defaults, 10h — em vez de ser um
+    // número solto que envelhece quando alguém mexe num timeout.
+    const drillIntervalHours = num(c.BACKUP_RESTORE_DRILL_INTERVAL_HOURS);
+    const drillUploadMs = num(c.BACKUP_UPLOAD_TIMEOUT_MS);
+    const drillRestoreMs = num(c.BACKUP_RESTORE_TIMEOUT_MS);
+    if (
+      drillIntervalHours !== undefined &&
+      drillUploadMs !== undefined &&
+      drillRestoreMs !== undefined
+    ) {
+      const floorHours = minHonourableDrillIntervalHours({
+        tickHours: DRILL_TICK_HOURS,
+        uploadMs: drillUploadMs,
+        restoreMs: drillRestoreMs,
+      });
+      if (drillIntervalHours < floorHours) {
+        push({
+          scope: 'boot',
+          severity: 'error',
+          variable: 'BACKUP_RESTORE_DRILL_INTERVAL_HOURS',
+          rule: 'backup/drill-interval-feasible',
+          message:
+            `BACKUP_RESTORE_DRILL_INTERVAL_HOURS=${drillIntervalHours} cannot be honoured by the restore-drill scheduler, which needs at least ${floorHours}h here: it wakes every ${DRILL_TICK_HOURS}h and starts the drill at 75% of the interval, leaving 25% for a drill bounded by BACKUP_UPLOAD_TIMEOUT_MS (${Math.round(drillUploadMs / 60_000)}min) + BACKUP_RESTORE_TIMEOUT_MS (${Math.round(drillRestoreMs / 60_000)}min). The evidence would expire before it could be refreshed — do not advertise a maximum evidence age the architecture cannot meet.`,
+          remediation:
+            `Use BACKUP_RESTORE_DRILL_INTERVAL_HOURS >= ${floorHours}, ou reduza BACKUP_UPLOAD_TIMEOUT_MS/BACKUP_RESTORE_TIMEOUT_MS (o piso é derivado deles e da cadência do tick).`,
+        });
+      }
     }
 
     // A cópia autoritativa não pode expirar antes da secundária.

@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   DRILL_DUE_FRACTION,
   DRILL_RETRY_FRACTION,
+  DRILL_TICK_HOURS,
+  minHonourableDrillIntervalHours,
   restoreDrillDue,
   runRestoreDrillTick,
   type DrillEvidenceFacts,
@@ -341,6 +343,63 @@ describe('runRestoreDrillTick — absence of evidence is not evidence of success
   });
 });
 
+describe('minHonourableDrillIntervalHours — the floor the boot gate enforces', () => {
+  const TICK = 1;
+  const UPLOAD = 30 * 60_000;
+  const RESTORE = 60 * 60_000;
+
+  it('is 10h with the shipped defaults', () => {
+    // (1h tick + 30min upload + 60min restore) = 2.5h of worst case, which has
+    // to fit in the 25% of the interval left after the drill becomes due:
+    // 2.5 / 0.25 = 10.
+    expect(
+      minHonourableDrillIntervalHours({ tickHours: TICK, uploadMs: UPLOAD, restoreMs: RESTORE }),
+    ).toBe(10);
+  });
+
+  it('is the worst case divided by the margin left after the due point', () => {
+    // The `4×` is not a magic number: it IS 1 / (1 - DRILL_DUE_FRACTION), so
+    // the identity below has to hold for any inputs.
+    for (const [tickHours, uploadMs, restoreMs] of [
+      [1, 30 * 60_000, 60 * 60_000],
+      [1, 15 * 60_000, 30 * 60_000],
+      [2, 60 * 60_000, 60 * 60_000],
+      [1, 0, 0],
+    ] as const) {
+      const worstCaseHours = tickHours + (uploadMs + restoreMs) / 3_600_000;
+      expect(minHonourableDrillIntervalHours({ tickHours, uploadMs, restoreMs })).toBe(
+        Math.ceil(worstCaseHours / (1 - DRILL_DUE_FRACTION)),
+      );
+    }
+  });
+
+  it('follows the due fraction, so moving the margin cannot silently invalidate it', () => {
+    // Guards the derivation itself: if someone changes when the drill fires,
+    // the floor must move with it. 1/(1-0.75) = 4.
+    expect(1 / (1 - DRILL_DUE_FRACTION)).toBe(4);
+    expect(
+      minHonourableDrillIntervalHours({ tickHours: TICK, uploadMs: UPLOAD, restoreMs: RESTORE }),
+    ).toBe(Math.ceil(2.5 * (1 / (1 - DRILL_DUE_FRACTION))));
+  });
+
+  it('rounds UP — a fractional floor is still a floor', () => {
+    // 1h + 10min + 10min = 1.333h ⇒ 5.33h ⇒ 6h. Rounding down would license an
+    // interval the scheduler provably cannot honour.
+    expect(
+      minHonourableDrillIntervalHours({
+        tickHours: 1,
+        uploadMs: 10 * 60_000,
+        restoreMs: 10 * 60_000,
+      }),
+    ).toBe(6);
+  });
+
+  it('is the value the tick cadence in the registry actually uses', () => {
+    // The floor is only true for the cadence the worker really runs at.
+    expect(DRILL_TICK_HOURS).toBe(1);
+  });
+});
+
 describe('runRestoreDrillTick — an unaccounted-for execution is reported loudly', () => {
   it('logs its own event, distinct from the residue one, and reddens the gate', async () => {
     const h = harness({
@@ -360,22 +419,6 @@ describe('runRestoreDrillTick — an unaccounted-for execution is reported loudl
     expect(line?.detail.open_drill_age_seconds).toBe(48 * 3600);
     // The two emergencies never share an event name.
     expect(h.logs.some((l) => l.event === 'restore_drill.blocked_by_residue')).toBe(false);
-  });
-});
-
-describe('runRestoreDrillTick — an interval the tick cannot honour is said out loud', () => {
-  it('warns when the configured interval is below the tick floor', async () => {
-    const h = harness();
-    await runRestoreDrillTick(h.ports, prodProfile({ BACKUP_RESTORE_DRILL_INTERVAL_HOURS: 2 }));
-    const line = h.logs.find((l) => l.event === 'restore_drill.interval_below_tick_floor');
-    expect(line?.level).toBe('warn');
-    expect(line?.detail.interval_hours).toBe(2);
-  });
-
-  it('stays quiet for an interval the tick can honour', async () => {
-    const h = harness();
-    await runRestoreDrillTick(h.ports, prodProfile());
-    expect(h.logs.some((l) => l.event === 'restore_drill.interval_below_tick_floor')).toBe(false);
   });
 });
 

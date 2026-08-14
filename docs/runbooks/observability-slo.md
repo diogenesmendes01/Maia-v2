@@ -449,10 +449,16 @@ Monte `monitoring/alerts/` read-only no container do Prometheus nesse caminho.
 
 **Esta lista é a única declaração de wiring que existe no repositório** — não há
 `prometheus.yml` versionado nem serviço de Prometheus no compose; a config do
-deploy vive fora daqui. Por isso ela é **verificada**: `tests/unit/observability/slo-rules.spec.ts`
-reprova quando um arquivo em `monitoring/alerts/` não aparece acima. Um arquivo
-de regras que ninguém carrega é a mesma mentira que um alerta apontando para uma
-série que ninguém emite — parece cobertura e nunca dispara.
+deploy vive fora daqui. Por isso ela é **verificada por teste**:
+`tests/unit/observability/slo-rules.spec.ts` reprova quando um arquivo em
+`monitoring/alerts/` não aparece acima. Um arquivo de regras que ninguém carrega
+é a mesma mentira que um alerta apontando para uma série que ninguém emite —
+parece cobertura e nunca dispara.
+
+**O que esse teste NÃO prova:** que o Prometheus do ambiente carregou os
+arquivos. O repositório não tem como afirmar isso. A verificação é operacional —
+`GET /api/v1/rules` e confira se cada grupo aparece (por exemplo
+`maia_backup_restore_drill`, do `backup.rules.yml`).
 
 ## 9. Trace operacional (OTLP) — issue #535
 

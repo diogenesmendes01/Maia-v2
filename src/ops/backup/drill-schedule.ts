@@ -78,21 +78,45 @@ export const DRILL_RETRY_FRACTION = 0.125;
 export const DRILL_TICK_HOURS = 1;
 
 /**
- * Shortest interval this schedule can actually HONOUR.
+ * Shortest `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` this schedule can actually
+ * HONOUR — the boot gate in `src/config/rules.ts` (`backup/drill-interval-feasible`)
+ * refuses anything below it.
  *
- * The margin between "due" and "expired" is 25% of the interval, and the tick
- * only wakes every `DRILL_TICK_HOURS`. So the worst case from becoming due to a
- * drill finishing is one tick plus one drill duration, and the interval can be
- * honoured only while that fits in the margin. At 6h the margin is 90 minutes —
- * a tick plus a drill of half an hour.
+ * THE DERIVATION, which is the whole reason this is a function and not a
+ * constant. The drill becomes due at `DRILL_DUE_FRACTION` of the interval, so
+ * what is left before the evidence EXPIRES is `1 - DRILL_DUE_FRACTION` of it —
+ * 25% today. Into that margin has to fit the worst case between "the drill
+ * became due" and "fresh evidence exists":
  *
- * `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` accepts any positive integer, so an
- * operator CAN configure 2h. The scheduler does not silently pretend to honour
- * it: the tick says so, every tick, and the gate still goes red when the
- * evidence expires. Refusing the value outright would be a change to the config
- * contract, which is not this module's call.
+ *   - up to one full tick of latency, because the worker only wakes every
+ *     `DRILL_TICK_HOURS` and the due moment can land just after a wake-up;
+ *   - plus the drill itself, whose bounded stages are the off-site transfer
+ *     (`BACKUP_UPLOAD_TIMEOUT_MS` — the only budget for that leg) and
+ *     `pg_restore` (`BACKUP_RESTORE_TIMEOUT_MS`).
+ *
+ *   (1 - DRILL_DUE_FRACTION) × interval  >=  tick + upload + restore
+ *   interval >= (tick + upload + restore) / (1 - DRILL_DUE_FRACTION)
+ *
+ * With the shipped defaults — 1h tick, 30min upload, 60min restore — that is
+ * 2.5h / 0.25 = **10 hours**. The `4×` in the owner's phrasing IS the
+ * `1 / (1 - 0.75)`, and it is written that way here so that moving
+ * `DRILL_DUE_FRACTION` moves the floor with it instead of silently invalidating
+ * a hardcoded multiplier.
+ *
+ * A LOWER BOUND, not a guarantee: the drill has stages nobody time-boxes (the
+ * S3 download has no budget of its own, the probe queries none either), so an
+ * interval at exactly the floor is the least-bad configuration, not a promise.
+ * Being honest about that is the point — the alternative was a number that
+ * looked authoritative and was not.
  */
-export const MIN_HONOURABLE_INTERVAL_HOURS = DRILL_TICK_HOURS * 6;
+export function minHonourableDrillIntervalHours(input: {
+  tickHours: number;
+  uploadMs: number;
+  restoreMs: number;
+}): number {
+  const worstCaseMs = input.tickHours * 3_600_000 + input.uploadMs + input.restoreMs;
+  return Math.ceil(worstCaseMs / 3_600_000 / (1 - DRILL_DUE_FRACTION));
+}
 
 /**
  * Terminal cleanup verdicts as persisted in `restore_drills.cleanup_status`.
@@ -320,20 +344,14 @@ export async function runRestoreDrillTick(
     open_restore_drill_started_at: facts.open_restore_drill_started_at,
   });
 
-  if (profile.objectives.restoreDrillIntervalHours < MIN_HONOURABLE_INTERVAL_HOURS) {
-    // Said out loud rather than assumed away: the operator asked for an
-    // evidence age this schedule cannot guarantee, and the gate will flap red
-    // between drills as a result. That is a configuration problem, not a drill
-    // problem, and the log is where the two get told apart.
-    ports.log('warn', 'restore_drill.interval_below_tick_floor', {
-      interval_hours: profile.objectives.restoreDrillIntervalHours,
-      tick_hours: DRILL_TICK_HOURS,
-      min_honourable_interval_hours: MIN_HONOURABLE_INTERVAL_HOURS,
-      impact:
-        'the scheduler cannot guarantee evidence stays inside this interval; ' +
-        'raise BACKUP_RESTORE_DRILL_INTERVAL_HOURS or drill from the host cron',
-    });
-  }
+  // NOTE: there is deliberately no per-tick warning for an interval below
+  // `minHonourableDrillIntervalHours`. It used to be one, and the boot gate
+  // (`backup/drill-interval-feasible`) made it unreachable: the variable is
+  // `restartRequired`, so a running process cannot acquire a value the boot
+  // refused, and when backups are disabled this tick does nothing anyway. A
+  // warning that cannot fire reads as defence in depth while being dead code —
+  // the exact shape of "documented gap standing in for a control" this issue
+  // exists to remove. The floor is enforced where it can actually refuse.
 
   const verdict = {
     gate: checkLevel,

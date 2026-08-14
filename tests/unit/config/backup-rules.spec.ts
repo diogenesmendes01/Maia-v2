@@ -170,6 +170,92 @@ describe('backup/rpo-feasible', () => {
   });
 });
 
+describe('backup/drill-interval-feasible (issue #536)', () => {
+  // `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` is the maximum acceptable AGE of the
+  // drill evidence, and the `restore_drill` worker is what renews it: hourly
+  // tick, drill started at 75% of the interval, leaving 25% for the drill to
+  // finish. If that margin cannot hold "one tick + the drill", the evidence
+  // expires before it can be refreshed and the platform is advertising a
+  // maximum age its own architecture cannot meet — same posture as
+  // `backup/rpo-feasible`, so the boot refuses it.
+  //
+  // Floor with the shipped defaults (1h tick, 30min upload, 60min restore):
+  //   (1h + 30min + 60min) / 0.25 = 2.5h / 0.25 = 10h
+  const FLOOR_HOURS = 10;
+
+  it('refuses an interval the scheduler cannot honour', () => {
+    const r = check('production', {
+      BACKUP_RESTORE_DRILL_INTERVAL_HOURS: String(FLOOR_HOURS - 1),
+    });
+    expect(errorRules(r)).toContain('backup/drill-interval-feasible');
+  });
+
+  it('refuses the value that motivated the rule — a 1h interval', () => {
+    // An hourly evidence budget with an hourly tick cannot work at all, and
+    // used to boot happily and merely flap the gate red.
+    expect(
+      errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '1' })),
+    ).toContain('backup/drill-interval-feasible');
+  });
+
+  it('accepts exactly the floor', () => {
+    expect(
+      errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: String(FLOOR_HOURS) })),
+    ).not.toContain('backup/drill-interval-feasible');
+  });
+
+  it('names the floor and the parameters it was derived from', () => {
+    // The operator has two levers — raise the interval or lower the timeouts —
+    // and the message has to show which numbers produced the floor, or it is
+    // just a refusal.
+    const r = check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '2' });
+    const finding = r.errors.find((p) => p.rule === 'backup/drill-interval-feasible');
+    expect(finding).toBeDefined();
+    expect(finding!.message).toContain(`${FLOOR_HOURS}h`);
+    expect(finding!.message).toContain('BACKUP_UPLOAD_TIMEOUT_MS');
+    expect(finding!.message).toContain('BACKUP_RESTORE_TIMEOUT_MS');
+    expect(finding!.remediation).toContain(`>= ${FLOOR_HOURS}`);
+  });
+
+  it('DERIVES the floor from the timeouts instead of hardcoding it', () => {
+    // Halving both budgets halves the drill's share of the worst case, so the
+    // floor drops — and a value the default profile would reject becomes legal.
+    const faster = {
+      BACKUP_UPLOAD_TIMEOUT_MS: String(15 * 60_000),
+      BACKUP_RESTORE_TIMEOUT_MS: String(30 * 60_000),
+    };
+    // (1h + 15min + 30min) / 0.25 = 1.75h / 0.25 = 7h
+    expect(
+      errorRules(
+        check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' }),
+      ),
+    ).not.toContain('backup/drill-interval-feasible');
+    expect(
+      errorRules(
+        check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '6' }),
+      ),
+    ).toContain('backup/drill-interval-feasible');
+    // …and the same 7h is refused under the SHIPPED budgets.
+    expect(
+      errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' })),
+    ).toContain('backup/drill-interval-feasible');
+  });
+
+  it('does not fire when backups are disabled', () => {
+    const r = check('development', {
+      BACKUP_ENABLED: 'false',
+      BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '1',
+    });
+    expect(errorRules(r)).not.toContain('backup/drill-interval-feasible');
+  });
+
+  it('the shipped default (168h) is far above the floor', () => {
+    for (const profile of ['development', 'staging', 'production'] as const) {
+      expect(errorRules(check(profile))).not.toContain('backup/drill-interval-feasible');
+    }
+  });
+});
+
 describe('backup/retention-ordering', () => {
   it('refuses the authoritative copy expiring before the local one', () => {
     expect(
