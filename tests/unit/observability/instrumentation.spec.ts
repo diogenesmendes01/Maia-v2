@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /**
  * Issue #535 §2 — tool dispatch and context load.
@@ -13,7 +15,10 @@ import {
   instrumentContextLoad,
   instrumentToolDispatch,
 } from '../../../src/observability/instrumentation.js';
-import { CONTEXT_LOAD_STAGE } from '../../../src/observability/taxonomy.js';
+import {
+  CONTEXT_LOAD_STAGE,
+  CONTEXT_LOAD_STAGE_VALUES,
+} from '../../../src/observability/taxonomy.js';
 import { _resetForTests, renderPrometheus } from '../../../src/lib/metrics.js';
 import { _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 
@@ -180,5 +185,34 @@ describe('review da PR #554 — instrumentContextLoad é span-only', () => {
       // Mesma INSTÂNCIA: o caminho fail-closed do turno ramifica no erro.
     ).rejects.toBe(boom);
     expect(await renderPrometheus()).not.toContain('maia_context');
+  });
+
+  /**
+   * O `stage` TIPADO foi achado Medium da review da PR #554 e não pode
+   * regredir para `stage: string`. Não dá para pinar isso com `@ts-expect-error`
+   * num spec: `tsconfig.json` exclui `tests/`, então `npm run typecheck` nunca
+   * olharia para o arquivo e a guarda seria decorativa.
+   *
+   * Então a guarda lê a ASSINATURA no fonte — mesmo padrão de
+   * `tests/unit/config/no-direct-env-reads.spec.ts`, que confere no texto uma
+   * regra que o compilador sozinho não cobra. Afrouxar o parâmetro devolveria a
+   * fechadura do vocabulário ao regime de "ninguém erra", que não é controle.
+   */
+  it('mantém o parâmetro `stage` TIPADO — `string` reabriria o vocabulário', () => {
+    const src = readFileSync(
+      resolve(__dirname, '../../../src/observability/instrumentation.ts'),
+      'utf8',
+    );
+    const signature = /export async function instrumentContextLoad<T>\(\s*stage:\s*([A-Za-z]+)/.exec(
+      src,
+    );
+    expect(signature, 'assinatura de instrumentContextLoad não encontrada').not.toBeNull();
+    expect(signature![1]).toBe('ContextLoadStage');
+  });
+
+  it('o vocabulário fechado tem exatamente o stage da carga do turno', () => {
+    // Um membro sem emissor é a falha "declarado lê como coberto" que a #535
+    // abre. `packet` saiu junto com a instrumentação da montagem P8a.
+    expect([...CONTEXT_LOAD_STAGE_VALUES]).toEqual([CONTEXT_LOAD_STAGE.TURN_CONTEXT]);
   });
 });
