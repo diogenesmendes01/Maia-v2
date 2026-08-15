@@ -258,7 +258,8 @@ Rules this module enforces:
 | `tests/integration/agent-turns-leak.spec.ts` | Leak cross-tenant do `agentTurnsRepo`, incluindo claim/heartbeat/liberação (parte de `npm run test:leak`) |
 | `tests/unit/turn-claim-contract.spec.ts` | Estabilidade do `jobId`, payload V1/V2, aritmética do lease, identidade do worker |
 | `tests/integration/turn-claim-real-db.spec.ts` | Corrida de 2/10/50 callers, takeover por lease vencida, fencing do zumbi, elegibilidade por estado, isolamento |
-| `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`) — prova que o cadeado está na porta |
+| `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`) |
+| `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 
 ## In-flight changes
