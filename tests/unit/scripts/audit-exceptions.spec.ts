@@ -243,6 +243,54 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
   });
 });
 
+/**
+ * Decisão 19 do dono: `metadata` CONTINUA obrigatório — nada de relaxar.
+ *
+ * O caso combinado ("sem auditReportVersion e sem metadata") não prova esta
+ * exigência sozinho: ele ficaria verde só pelo primeiro campo. Estes casos
+ * isolam `metadata`, com todo o resto do relatório VÁLIDO, para que remover a
+ * exigência fique vermelho aqui e não em outro lugar.
+ */
+describe('validateAuditReport — `metadata` continua obrigatório (decisão 19)', () => {
+  it('REPROVA relatório sem "metadata", com todo o resto válido', () => {
+    const semMetadata = { auditReportVersion: 2, vulnerabilities: {} };
+    const errors = validateAuditReport('src/admin-ui', semMetadata);
+    expect(errors.length, 'um relatório sem metadata não pode ser aceito').toBeGreaterThan(0);
+    expect(errors.join('\n')).toContain('"metadata" ausente ou não é um objeto');
+    // A mensagem tem de continuar dizendo o que fazer, não só o que faltou.
+    expect(errors.join('\n')).toContain('NÃO é "zero advisories"');
+    expect(errors.join('\n')).toContain('src/admin-ui');
+  });
+
+  it('REPROVA "metadata" que não é objeto', () => {
+    for (const m of [[], null, 'nenhuma', 0, true]) {
+      const errors = validateAuditReport('.', {
+        auditReportVersion: 2,
+        vulnerabilities: {},
+        metadata: m,
+      });
+      expect(errors.join('\n'), `metadata=${JSON.stringify(m)}`).toContain(
+        '"metadata" ausente ou não é um objeto',
+      );
+    }
+  });
+
+  it('o guard INTEIRO reprova quando um lockfile devolve relatório sem metadata', () => {
+    // Fecha o caminho: não basta `validateAuditReport` reclamar, o veredito do
+    // guard tem de carregar a reclamação até o fim.
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({
+        '.': relatorioComEsbuild(),
+        'src/admin-ui': { auditReportVersion: 2, vulnerabilities: {} },
+      }),
+    );
+    expect(problems.join('\n')).toContain('"metadata" ausente ou não é um objeto');
+    expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
+  });
+});
+
 describe('a invocação do npm audit precisa ATRAVESSAR a fronteira no Windows', () => {
   /**
    * Round 2 do review da #564. A correção anterior devolvia `'npm.cmd'` e o
