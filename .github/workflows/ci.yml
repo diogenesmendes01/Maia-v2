@@ -188,13 +188,19 @@ jobs:
           VITEST_SUMMARY_FILE: .ci-test-summary/unit.txt
         run: npx vitest run
 
+      - name: Lint
+        # `--max-warnings=0` would flip warnings to failures; we keep them as
+        # warnings for now so existing code can be cleaned incrementally.
+        run: npm run lint
+
       - name: Resumo dos testes
         # Issue #545. Numa falha, o log deste job termina com o dump dos service
         # containers, e o sumário do vitest fica soterrado — inalcançável para
         # quem lê o log pelo fim (inclusive as ferramentas de leitura de log,
         # que truncam pela cauda). Este passo reimprime o bloco de diagnóstico
-        # num passo PRÓPRIO e endereçável, o mais tarde que conseguimos
-        # controlar. Nunca reprova: é legibilidade, não gate.
+        # num passo PRÓPRIO e endereçável, e é o ÚLTIMO passo do job — o mais
+        # tarde que conseguimos controlar. Nunca reprova: é legibilidade, não
+        # gate.
         if: always()
         continue-on-error: true
         run: |
@@ -203,11 +209,6 @@ jobs:
             echo "══════════ $f ══════════"
             cat "$f"
           done
-
-      - name: Lint
-        # `--max-warnings=0` would flip warnings to failures; we keep them as
-        # warnings for now so existing code can be cleaned incrementally.
-        run: npm run lint
 
   secret-scan:
     name: gitleaks (secret scan)
