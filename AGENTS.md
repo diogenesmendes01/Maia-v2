@@ -171,6 +171,20 @@ npm run test:integration:teardown # docker compose down -v
 
 CI runs these automatically in `.github/workflows/ci.yml` with service containers. The integration job is blocking: integration + e2e failures fail the run.
 
+**Sem `TEST_DB_URL`, as specs de integração fazem `describe.skip` em silêncio.** Nunca reporte "0 falhas" a partir de uma rodada sem banco — reporte quantos testes **executaram** e quantos ficaram `skipped`. O bloco de diagnóstico impresso no fim de toda rodada (§7.1) traz os três números.
+
+### 7.1 Lendo o vermelho — orçamento de tempo e corpo órfão (#545)
+
+O `await import()` do grafo de módulos de produção custa de 1.9s a 6.8s (medido: `@/gateway/baileys.js` 5.77–6.83s, `@/agent/core.js` 6.38–6.60s, `@/db/repositories.js` 1.92–2.47s). Isso é **infraestrutura**, não o teste — o trabalho real desses casos fica entre 1ms e 43ms. Três consequências que todo agente precisa saber:
+
+| Fato | O que fazer com ele |
+|---|---|
+| `testTimeout` é **20000ms** e `hookTimeout` é **20000ms** (`vitest.config.ts`, com a medição no comentário). | Não abaixe sem medir. Não suba "por precaução": o prazo largo já cega regressão de desempenho abaixo de 20s, e o que devolve essa visibilidade é a lista de mais lentos, não o prazo. |
+| **O timeout do vitest NÃO aborta o corpo async.** A tentativa estourada continua rodando e disputa mocks, linhas no banco e estado de módulo com o que vier depois. | Num arquivo com prazo estourado, a segunda mensagem de erro é quase sempre consequência (`expected "vi.fn()" to be called 1 times, but got 2 times`, `duplicate key ...`). **Leia o prazo primeiro.** O bloco `PRAZOS ESTOURADOS` do reporter existe para isso. |
+| Spec nova que carrega grafo de produção deve carregá-lo em `beforeAll`, não no `it()`. | Use `moduloDeProducao()` de [`tests/helpers/modulo-de-producao.ts`](tests/helpers/modulo-de-producao.ts). Um `beforeAll` que estoura reprova o arquivo **sem executar os casos** — não existe corpo órfão competindo com nada. Exceção: quando a spec recarrega o módulo por caso (`vi.resetModules()` / `vi.doMock()` variando), o import é parte do teste e fica no corpo. |
+
+Toda rodada termina com um bloco `RESUMO DE DIAGNÓSTICO DOS TESTES` ([`tests/reporters/diagnostico-reporter.ts`](tests/reporters/diagnostico-reporter.ts)): executados/falharam/pulados, prazos estourados (inclusive os que a rodada absorveu e ficou verde), os mais lentos e as falhas com a mensagem de **cada tentativa**. Com `MAIA_TEST_SUMMARY_FILE` setado ele grava o mesmo bloco em arquivo — é assim que o CI o reimprime num passo próprio, fora do dump dos service containers.
+
 ## 8. PR rules
 
 | Rule | Detail |
