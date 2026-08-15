@@ -40,7 +40,7 @@ const OK: Exception = {
   max_severity: 'moderate',
   reason: 'só na árvore de dev; correção exige major deferido',
   owner: 'diogenesmendes01',
-  issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/526',
+  issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/574',
   expires: '2099-01-01',
 };
 
@@ -526,6 +526,65 @@ describe('validateLedger', () => {
     expect(exceptions).toEqual([]);
   });
 
+  /**
+   * Decisão 22 do dono: a exceção tem de APONTAR PARA UMA ISSUE ABERTA
+   * específica. O checker aceitava qualquer string aqui — `"n/a"`, `"ver
+   * slack"`, um número solto — e uma exceção sem alvo rastreável não tem para
+   * onde vencer.
+   *
+   * A validação é de FORMA (URL de issue DESTE repositório, com número). O
+   * estado aberto/fechado não é checado: ver o comentário de
+   * `ISSUE_URL_PATTERN` em scripts/check-audit-exceptions.ts.
+   */
+  it('aceita a URL canônica de issue deste repositório', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/574' },
+    ]);
+    expect(errors).toEqual([]);
+  });
+
+  it('reprova string que não é URL de issue', () => {
+    for (const bad of ['n/a', '574', '#574', 'ver o slack', 'https://example.com/issues/574']) {
+      const { errors } = validateLedger([{ ...OK, issue: bad }]);
+      expect(errors.join('\n'), `issue=${bad}`).toContain('não é uma URL de issue');
+    }
+  });
+
+  it('reprova URL de issue de OUTRO repositório', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/outra/pessoa/issues/574' },
+    ]);
+    expect(errors.join('\n')).toContain('não é uma URL de issue');
+  });
+
+  it('reprova URL de PULL REQUEST — PR não é o alvo de uma exceção', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/diogenesmendes01/Maia-v2/pull/574' },
+    ]);
+    expect(errors.join('\n')).toContain('não é uma URL de issue');
+  });
+
+  it('reprova URL de issue SEM número utilizável', () => {
+    for (const bad of [
+      'https://github.com/diogenesmendes01/Maia-v2/issues',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/0',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/abc',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/574/',
+    ]) {
+      const { errors } = validateLedger([{ ...OK, issue: bad }]);
+      expect(errors.join('\n'), `issue=${bad}`).toContain('não é uma URL de issue');
+    }
+  });
+
+  it('a mensagem diz que o alvo precisa estar ABERTO — a forma não prova isso', () => {
+    // O checker não tem rede nem token no job `dependency-audit`, então não dá
+    // para confirmar o estado da issue aqui. O que a mensagem PODE fazer é
+    // dizer a quem lê o vermelho qual é a exigência de verdade.
+    const { errors } = validateLedger([{ ...OK, issue: 'n/a' }]);
+    expect(errors.join('\n').toLowerCase()).toContain('aberta');
+  });
+
   it('reprova conteúdo que não é array', () => {
     const { errors } = validateLedger({ exceptions: [] });
     expect(errors.join('\n')).toContain('precisa ser um array JSON');
@@ -736,6 +795,29 @@ describe('ledger real commitado', () => {
     const hoje = todayUtc(new Date());
     const vencidas = exceptions.filter((e) => e.expires < hoje);
     expect(vencidas.map((e) => `${e.pkg} ${e.advisory} venceu em ${e.expires}`)).toEqual([]);
+  });
+
+  /**
+   * Decisão 22: a entrada do esbuild apontava para a #526, FECHADA em
+   * 2026-08-15 (state_reason: completed). Uma exceção que vence em 2026-11-12
+   * apontando para trabalho concluído não tem para onde vencer. O alvo agora é
+   * a #574, aberta para isto ("Subir drizzle-kit ao major 0.31.x para zerar
+   * GHSA-67mh-4wv8-2f99, com o caminho de migrations exercitado").
+   */
+  it('toda exceção aponta para uma issue deste repositório, com número', () => {
+    const { exceptions, errors } = validateLedger(JSON.parse(raw));
+    expect(errors).toEqual([]);
+    for (const e of exceptions) {
+      expect(e.issue, `${e.pkg} ${e.advisory}`).toMatch(
+        /^https:\/\/github\.com\/diogenesmendes01\/Maia-v2\/issues\/[1-9]\d*$/,
+      );
+    }
+  });
+
+  it('nenhuma exceção aponta mais para a #526, que está FECHADA', () => {
+    const { exceptions } = validateLedger(JSON.parse(raw));
+    const fechadas = exceptions.filter((e) => e.issue.endsWith('/issues/526'));
+    expect(fechadas.map((e) => `${e.pkg} ${e.advisory} → ${e.issue}`)).toEqual([]);
   });
 
   it('só referencia os projetos que o CI audita', () => {

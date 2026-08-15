@@ -23,7 +23,8 @@
  *      ou o problema corrigido; ninguém deferiu "para sempre"
  *   3. entrada do ledger que não casa com nenhum advisory → exceção obsoleta,
  *      deve ser removida (senão o ledger vira folclore)
- *   4. entrada malformada (campo faltando, data inválida, severidade inválida)
+ *   4. entrada malformada (campo faltando, data inválida, severidade inválida,
+ *      `issue` que não é URL de issue deste repositório com número)
  *   5. severidade do advisory ACIMA do teto registrado na exceção
  *      (`max_severity`) → a decisão foi tomada para um risco menor, precisa ser
  *      tomada de novo
@@ -115,6 +116,37 @@ export const SEVERITIES: readonly string[] = ['info', 'low', 'moderate', 'high',
  * mudar este arquivo, não afrouxar a comparação.
  */
 export const AUDIT_REPORT_VERSION = 2;
+
+/**
+ * Forma exigida do campo `issue`: URL de uma issue DESTE repositório, com
+ * número.
+ *
+ * Decisão 22 do dono: "a exceção deve apontar para uma issue aberta
+ * específica". O campo aceitava qualquer string — `"n/a"`, `"ver o slack"`, um
+ * número solto — e uma exceção sem alvo rastreável não tem para onde vencer:
+ * quando `expires` chega, ninguém sabe onde está o trabalho que a encerraria.
+ *
+ * O que esta checagem NÃO faz, e por quê
+ * --------------------------------------
+ * Ela valida a FORMA, não o ESTADO. Não distingue issue aberta de fechada — a
+ * URL da #526 (fechada) tem exatamente a mesma forma que a da #574 (aberta).
+ *
+ * Isso é deliberado, não esquecimento. Saber se a issue está aberta exige uma
+ * chamada à API do GitHub, e este guard roda no job `dependency-audit`, que de
+ * propósito não faz `npm ci` nem recebe credencial de API — e roda também na
+ * máquina de quem desenvolve, offline. Uma checagem de estado aqui seria:
+ *
+ *   - flaky por rede (o guard reprovaria por indisponibilidade do GitHub, não
+ *     por risco de segurança — e um guard que grita sem motivo é ignorado); e
+ *   - fail-open na prática, porque a única saída sã para "não consegui
+ *     consultar" seria deixar passar.
+ *
+ * Então a exigência de "aberta" vive onde ela pode ser cumprida: na MENSAGEM de
+ * erro, lida por gente, e na revisão de quem aprova a PR que mexe no ledger. O
+ * que a máquina consegue garantir sozinha — que existe um alvo específico e
+ * clicável neste repositório — ela garante.
+ */
+export const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/diogenesmendes01\/Maia-v2\/issues\/[1-9]\d*$/;
 
 /** Um advisory concreto encontrado pelo `npm audit` em um dos lockfiles. */
 export interface Finding {
@@ -369,6 +401,16 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
     }
     if (!/^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/.test(e.advisory)) {
       errors.push(`${where}: advisory "${e.advisory}" não tem a forma GHSA-xxxx-xxxx-xxxx`);
+      continue;
+    }
+    if (!ISSUE_URL_PATTERN.test(e.issue)) {
+      errors.push(
+        `${where}: issue "${e.issue}" não é uma URL de issue deste repositório com número ` +
+          `(esperado https://github.com/diogenesmendes01/Maia-v2/issues/<n>). A exceção precisa ` +
+          `apontar para uma issue ABERTA e específica — é ela que recebe o trabalho quando ` +
+          `"expires" chegar. O guard só consegue verificar a FORMA da URL: que a issue está ` +
+          `mesmo aberta é responsabilidade de quem escreve e de quem revisa o ledger.`,
+      );
       continue;
     }
     if (!isCalendarDate(e.expires)) {

@@ -6,7 +6,7 @@
     "max_severity": "moderate",
     "reason": "Só existe na árvore de DEV, e o único caminho até ela é drizzle-kit@0.28.1 > @esbuild-kit/esm-loader > @esbuild-kit/core-utils > esbuild@0.18.20 (mais drizzle-kit > esbuild@0.19.12). O advisory é o dev-server do esbuild aceitar requisição de qualquer origem: exige que alguém esteja com o dev-server do esbuild ESCUTANDO e visite um site hostil na mesma máquina. Não há caminho de produção — nenhum artefato de dist/ ou da imagem Docker contém esbuild 0.x vulnerável (o esbuild que o tsx traz em produção é 0.28.1, fora da faixa). A correção exige drizzle-kit@0.31.10, um MAJOR que o dono deferiu na #526: drizzle-kit é a ferramenta de migrations, e subir major dela sem exercitar a geração/aplicação de migrations trocaria um moderate de superfície de dev por risco de esquema. Deferido para PR própria, com teste do caminho de migrations.",
     "owner": "diogenesmendes01",
-    "issue": "https://github.com/diogenesmendes01/Maia-v2/issues/526",
+    "issue": "https://github.com/diogenesmendes01/Maia-v2/issues/574",
     "expires": "2026-11-12"
   }
 ]
