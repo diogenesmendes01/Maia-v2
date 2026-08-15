@@ -272,6 +272,83 @@ SELECT created_at, metadata->>'provider' AS provider,
  ORDER BY created_at;
 ```
 
+### 4.9.3 `MaiaLlmCircuitResyncFailedEnforcing` / `MaiaLlmCircuitResyncFailed`
+
+Uma réplica reconectou o subscriber do kill switch e **não conseguiu afirmar**
+que está consistente com o Redis. O estado local dela foi **preservado**
+(fail-closed — ver [`operational.md` §3.1](operational.md)), então ela seguiu com
+a postura que já tinha e **pode não ter recebido a virada do disjuntor**.
+
+| Alerta | Postura da réplica | Por que essa severidade |
+|---|---|---|
+| `MaiaLlmCircuitResyncFailedEnforcing` | `enforce` | **Página.** A réplica pode estar recusando tráfego que o plantão já mandou parar de recusar — ou deixando de recusar o que a frota recusa. É o modo de falha que a alavanca de incidente existe para evitar. |
+| `MaiaLlmCircuitResyncFailed` | `shadow` ou `off` | **Warning.** Nada está sendo recusado, o dano é de MEDIÇÃO — mas é a mesma falha que em `enforce` seria página, e sombra divergente não sustenta a decisão de promover. |
+
+**Os dois seletores são complementares de propósito** (`state="enforce"` e
+`state!="enforce"`): qualquer `resync_failed` alerta. Listar só `shadow` no
+segundo deixaria uma réplica divergente em `off` sem alerta nenhum.
+
+**Por que o alerta é por réplica e nunca agregado.** O evento é sobre UMA
+réplica; somado sobre a frota (ou virado razão sobre o total de releituras) ele
+some — uma entre vinte não cruza limiar nenhum, e sem `instance` o plantão não
+sabe onde olhar. `increase()` sem agregação preserva `instance` e `job`, e
+`tests/unit/observability/slo-rules.spec.ts` reprova qualquer `sum`/`avg`/razão
+sobre essa série.
+
+**Triagem, em ordem:**
+
+1. Qual réplica e qual causa — `outcome` no log separa os dois casos:
+
+   ```bash
+   journalctl -u maia | grep llm_gateway.circuit_override_resync_failed | tail
+   # {"outcome":"failed","state":"enforce","attempts":4,"err":"…"}
+   ```
+
+   | `outcome` | O que aconteceu | Ação |
+   |---|---|---|
+   | `failed` | não houve leitura defensável em NENHUMA das 4 tentativas (`GET` falhando ou estourando o deadline, chave ilegível, re-inscrição sem ack) | trate como Redis inalcançável por aquela réplica: cheque `redis.rules.yml`, rede e o `maxmemory` do Redis |
+   | `rejected` | a chave FOI lida e o payload foi recusado pela governança (sem `expires_at` absoluto, sem ator, vencido, acima do teto) | `redis-cli GET maia:llm:circuit:override` — republicar não conserta payload inválido |
+
+2. `attempts` diz quantas tentativas foram gastas (1 imediata + até 3 retries,
+   com backoff, jitter e deadline por tentativa). **Terminal aqui tem dois
+   caminhos, e só um deles é esgotamento** — ler `attempts` como se fosse
+   sempre 4 leva à conclusão errada:
+
+   | `outcome` | `attempts` esperado | Por quê |
+   |---|---|---|
+   | `failed` | **4** | esgotamento das falhas RETENTÁVEIS. Uma falha intermediária que depois convergiu não chega nesta série: sai como `llm_gateway.circuit_override_resync_retry` (WARN) e a releitura termina em `resynced`. `failed` com `attempts` menor que 4 ⇒ o retry regrediu. |
+   | `rejected` | **1** | recusa determinística e TERMINAL sobre o conteúdo da chave. Retentar daria o mesmo veredito quatro vezes e escreveria quatro `_rejected` idênticos na trilha durável. `attempts=1` aqui é o desenho, não regressão. |
+
+   O teto de tempo de uma releitura que esgota é **~10,1s**
+   (`resyncWorstCaseMs()` em `src/lib/llm/cache-invalidation.ts`): 4 × 2 000 ms
+   de deadline por tentativa — o deadline cobre o ack de re-inscrição e o `GET`
+   JUNTOS — mais 300 + 600 + 1 200 ms de backoff no pior jitter. Um alerta que
+   demore muito mais que isso depois da reconexão não é esta cadeia.
+
+3. Converja a réplica: republicar o override é idempotente
+   (`SET` + `PUBLISH`, [`operational.md` §3.1](operational.md)). Se o alerta
+   voltar na mesma réplica, ela está sem Redis — use a segunda alavanca
+   (`LLM_CIRCUIT_MODE=off` + restart) naquela réplica em vez de insistir.
+
+**O que este alerta NÃO é:**
+
+- `superseded` (a releitura perdeu para uma mensagem do canal) e `cleared` (o
+  `clear` perdido convergiu) são **convergência** e saem como
+  `reason="resynced"`.
+- `aborted` — a réplica estava **drenando**. O subscriber foi fechado (deploy,
+  scale-in, restart) com a releitura em backoff ou com um `GET` em voo, e ela
+  foi **cancelada**, não concluída. Sai como `reason="resync_aborted"` e log
+  WARN `llm_gateway.circuit_override_resync_aborted`. Nenhum dos dois alertas o
+  seleciona: um drain deliberado não pode acordar o plantão — era o defeito
+  apontado na review da PR #561. Um pico deste desfecho durante um deploy é
+  esperado; **fora** de janela de deploy, ele diz que alguma coisa está
+  fechando o subscriber, e a pergunta passa a ser por que a réplica está
+  reiniciando.
+
+Se `superseded`, `cleared` ou `aborted` começarem a aparecer como
+`resync_failed`, o defeito é no balde `DIVERGENT_OUTCOMES`
+(`src/lib/llm/cache-invalidation.ts`), não no Redis.
+
 ### 4.10 `MaiaWhatsAppDisconnected` / `MaiaDbDisconnected`
 
 Ver `docs/runbooks/operational.md` e `docs/runbooks/whatsapp-migration.md`.

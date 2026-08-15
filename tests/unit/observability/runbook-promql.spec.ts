@@ -128,7 +128,11 @@ import { executeLLM as executeLLMRaw } from '@/lib/llm/gateway.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { _internal as breakerInternal } from '@/lib/llm/circuit-breaker.js';
-import { applyCircuitOverride, _internal as modeInternal } from '@/lib/llm/circuit-mode.js';
+import {
+  CIRCUIT_MODES,
+  applyCircuitOverride,
+  _internal as modeInternal,
+} from '@/lib/llm/circuit-mode.js';
 import { emitUsage, statusForKind } from '@/lib/llm/telemetry.js';
 import type { LLMCallStatus } from '@/lib/llm/telemetry.js';
 
@@ -268,8 +272,18 @@ async function exerciseEmitters(): Promise<void> {
   await call();
 
   // 5. Kill switch — `maia_llm_circuit_mode`, `..._mode_overrides_total`.
-  modeInternal.reset();
-  applyCircuitOverride({ mode: 'off', actor: 'sre:spec', reason: 'runbook', ttl_ms: 60_000 });
+  //
+  // As TRÊS posturas, e não só `off`: o rótulo `state` desta série é a postura
+  // que ficou valendo, e os desfechos de releitura (`resynced`/`resync_failed`,
+  // #552) publicam nele a postura PRESERVADA — que pode ser qualquer uma das
+  // três. Exercitar só `off` fazia esta guarda reprovar, com falso vermelho,
+  // qualquer alerta que selecione uma postura específica: foi o que aconteceu
+  // com `MaiaLlmCircuitResyncFailedEnforcing` (#534), cujo `state="enforce"` é
+  // exatamente o caso que o alerta existe para paginar.
+  for (const mode of CIRCUIT_MODES) {
+    modeInternal.reset();
+    applyCircuitOverride({ mode, actor: 'sre:spec', reason: 'runbook', ttl_ms: 60_000 });
+  }
   modeInternal.reset();
   breakerInternal.setMode(null);
 }

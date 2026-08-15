@@ -420,6 +420,74 @@ groups:
             desligado. Kill switch não é postura.
             Runbook: docs/runbooks/operational.md §3.1
 
+      # --- releitura de reconexão: a réplica que o kill switch pode não ter
+      # alcançado (#534, decisão do owner) -----------------------------------
+      #
+      # `reason="resync_failed"` é o desfecho em que a réplica NÃO pôde afirmar
+      # consistência com o Redis depois de reconectar: leitura indefensável
+      # (`GET` que falhou, chave ilegível, re-inscrição sem ack) ou payload lido
+      # e RECUSADO pela governança. Nos dois o estado local
+      # é preservado — fail-closed —, e é justamente por isso que o evento
+      # precisa acordar alguém: a réplica seguiu com a postura DELA, e a virada
+      # do kill switch pode não ter chegado nela.
+      #
+      # POR QUE NÃO HÁ `sum`, `avg` NEM RAZÃO AQUI. Uma réplica divergente entre
+      # vinte é o caso que este alerta existe para pegar. Como razão sobre o
+      # total de releituras ela vira 5% de alguma coisa e não cruza limiar
+      # nenhum; somada por `state`, some o `instance` e o plantão não sabe QUAL
+      # réplica olhar — e uma segunda réplica divergindo depois não gera
+      # notificação nova, porque o alerta já está firing com aquele conjunto de
+      # rótulos. `increase()` sem agregação preserva `instance` e `job`: um
+      # alerta por réplica, que é o pedido. `tests/unit/observability/slo-rules.spec.ts`
+      # reprova qualquer agregação sobre esta série.
+      #
+      # A SEVERIDADE VEM DO RÓTULO `state`, e ele já existe: nesta série `state`
+      # é a postura PRESERVADA da réplica — `finishResync` grava
+      # `effectiveMode()` (`src/lib/llm/cache-invalidation.ts`). Não é preciso
+      # rótulo novo para correlacionar postura e falha.
+      #
+      # `state!="enforce"` no segundo, e não `state="shadow"`: QUALQUER
+      # `resync_failed` tem que alertar. Listando só `shadow`, uma réplica
+      # divergente em `off` ficaria sem alerta nenhum — o buraco que esta leva
+      # vem fechando.
+      #
+      # O QUE DELIBERADAMENTE NÃO ENTRA AQUI (achado 2 da review da PR #561):
+      # `reason="resync_aborted"`. É a releitura CANCELADA pelo fechamento do
+      # subscriber — deploy, scale-in, restart. A réplica não divergiu: ela
+      # está saindo, e ninguém mais depende do estado dela. Somá-la nestes
+      # seletores faria TODO deploy paginar em `enforce`. Os dois seletores
+      # abaixo são de IGUALDADE exata em `reason`, e é isso que mantém o
+      # terceiro balde fora; trocar por `reason=~"resync_.*"` reintroduz o
+      # defeito. `tests/unit/observability/slo-rules.spec.ts` reprova isso.
+      - alert: MaiaLlmCircuitResyncFailedEnforcing
+        expr: increase(maia_llm_circuit_mode_overrides_total{reason="resync_failed",state="enforce"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          slo: dependency
+        annotations:
+          summary: "Réplica {{ $labels.instance }} não ressincronizou o kill switch (postura enforce)"
+          description: |
+            Esta réplica pode estar recusando tráfego que o plantão já mandou
+            parar de recusar — ou continuar aceitando o que a frota já recusa.
+            O `outcome` no log `llm_gateway.circuit_override_resync_failed`
+            separa leitura indefensável de payload recusado.
+            Runbook: docs/runbooks/observability-slo.md §4.9.3
+
+      - alert: MaiaLlmCircuitResyncFailed
+        expr: increase(maia_llm_circuit_mode_overrides_total{reason="resync_failed",state!="enforce"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: dependency
+        annotations:
+          summary: "Réplica {{ $labels.instance }} não ressincronizou o kill switch (postura {{ $labels.state }})"
+          description: |
+            Fora de `enforce` a divergência é de MEDIÇÃO — a réplica não recusa
+            nada —, mas ela é a mesma falha que em `enforce` seria página, e
+            evidência de sombra divergente não sustenta promoção.
+            Runbook: docs/runbooks/observability-slo.md §4.9.3
+
       - alert: MaiaWhatsAppDisconnected
         expr: maia_baileys_connected == 0
         for: 5m
