@@ -537,10 +537,25 @@ async function runAgentForMensagemInner(
     return;
   }
 
-  // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
-  // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
-  // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
-  await beginTurnExecution(turn, { channel_id });
+  // #504 — CLAIM ATÔMICO. Com `FEATURE_TURN_CLAIM` ligada, este é o portão de
+  // exclusão mútua do turno: `started: false` significa que outro worker tem a
+  // posse (ou que o turno não está elegível), e a única reação correta é PARAR.
+  //
+  // Parar aqui é deliberadamente SILENCIOSO quanto ao estado: não concluímos,
+  // não marcamos `processada_em`, não auditamos descarte. O turno pertence a
+  // outra tentativa e é ela quem decide o desfecho — qualquer escrita nossa
+  // seria escrita sem posse, que é exatamente o que a issue fecha.
+  //
+  // Com a flag desligada o retorno é sempre `started: true` e o comportamento é
+  // o de #503 (registra que começou, nunca barra ninguém).
+  const start = await beginTurnExecution(turn, { channel_id });
+  if (!start.started) {
+    logger.info(
+      { mensagem_id, turn_id: turn?.turn_id ?? null, reason: start.reason },
+      'agent.turn_not_owned',
+    );
+    return;
+  }
 
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;

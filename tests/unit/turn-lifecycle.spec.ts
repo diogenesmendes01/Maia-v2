@@ -233,7 +233,11 @@ describe('turn lifecycle — SHADOW: fail-soft não derruba o hot path', () => {
 
   it('erro no begin não impede o turno de seguir', async () => {
     repo.markClaimed.mockRejectedValue(new Error('DB down'));
-    await expect(beginTurnExecution(handle({ status: 'queued' }))).resolves.toBeUndefined();
+    // #504 mudou a assinatura para um resultado TIPADO. A propriedade sob teste
+    // é a mesma e continua sendo a que importa em modo shadow: o turno segue.
+    await expect(beginTurnExecution(handle({ status: 'queued' }))).resolves.toEqual({
+      started: true,
+    });
   });
 });
 
@@ -363,7 +367,7 @@ describe('turn lifecycle — begin execution', () => {
     expect(repo.markRunning).not.toHaveBeenCalled();
   });
 
-  it('conflito no claim NÃO aborta o turno (exclusão mútua é #504)', async () => {
+  it('com FEATURE_TURN_CLAIM OFF, conflito no claim NÃO aborta o turno', async () => {
     repo.markClaimed.mockResolvedValue({
       ok: false,
       conflict: 'state_mismatch',
@@ -372,7 +376,11 @@ describe('turn lifecycle — begin execution', () => {
       current_state_version: 7,
     });
     const h = handle({ status: 'queued', state_version: 1 });
-    await expect(beginTurnExecution(h)).resolves.toBeUndefined();
+    // Com a flag de claim DESLIGADA o regime é o de #503:  não é
+    // exclusão mútua, então um conflito aqui não pode barrar a execução — seria
+    // falsa sensação de segurança. Quem barra é o claim atômico de #504, e a
+    // prova disso está em tests/integration/turn-claim-lifecycle-real-db.spec.ts.
+    await expect(beginTurnExecution(h)).resolves.toEqual({ started: true });
     expect(repo.markRunning).not.toHaveBeenCalled();
     expect(h.status).toBe('queued');
   });
