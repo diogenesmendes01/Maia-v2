@@ -75,6 +75,37 @@ vi.mock('../../src/gateway/queue.js', () => ({
   enqueueAgent: vi.fn(),
   shutdownQueue: vi.fn(),
 }));
+// O RESOLVEDOR DE IDENTIDADE é o único mock de comportamento desta suíte, e
+// deliberadamente não é nada que ela teste: ele serve de PONTO DE PAUSA
+// determinístico dentro de `runAgentForMensagem`, entre a barreira do claim e a
+// conclusão do turno. `takeoverDuranteOTurno` é preenchido por caso; quando
+// está nulo o mock só devolve `unknown` e o turno segue o caminho normal.
+//
+// Mockar `beginTurnExecution` ou o dispatcher aqui seria testar o mock. Este é
+// o oposto: o mock apenas abre a janela em que a POSSE REAL é tomada por outro
+// worker, e tudo que se mede depois — fence, `markLost`, `AbortSignal`, guards
+// — é código de produção.
+const takeoverHook = vi.hoisted(() => ({ fn: null as null | (() => Promise<void>) }));
+// O ROTEADOR DE CANAL, pela mesma lógica: uma mensagem COM telefone precisa de
+// um canal casado, e semear um canal `whatsapp` num Postgres compartilhado por
+// 46 worktrees mudaria o desfecho do catch-all single-tenant para todas as
+// outras suítes. Mock PARCIAL — só `resolveChannel` — devolvendo o mesmo par
+// baseline que o caminho sem telefone já usa. Roteamento não é o que esta
+// suíte mede.
+vi.mock('../../src/gateway/channel-resolver.js', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  resolveChannel: async () => ({
+    tenant_id: 'primary',
+    agent_id: 'primary',
+    channel_id: null,
+  }),
+}));
+vi.mock('../../src/identity/resolver.js', () => ({
+  resolveIdentity: async () => {
+    if (takeoverHook.fn) await takeoverHook.fn();
+    return { kind: 'unknown' as const };
+  },
+}));
 vi.mock('../../src/gateway/baileys.js', () => ({
   isBaileysConnected: () => false,
   getSocket: () => null,
@@ -111,6 +142,24 @@ async function mkInboundSemTelefone(): Promise<string> {
     `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, processada_em)
      VALUES ($1, $2, $3, NULL, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
     [id, T, A, `WAID-504-${randomInt(0, 1e9).toString(36)}`],
+  );
+  created.push(id);
+  return id;
+}
+
+/** Inbound COM `telefone` — passa pelo resolvedor (nosso ponto de pausa). */
+async function mkInboundComTelefone(): Promise<string> {
+  const id = randomUUID();
+  await pool.query(
+    `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, processada_em)
+     VALUES ($1, $2, $3, NULL, 'in', 'texto', 'oi', jsonb_build_object('telefone', $4::text, 'whatsapp_id', $5::text), NULL)`,
+    [
+      id,
+      T,
+      A,
+      `+5511${randomInt(100000000, 999999999)}`,
+      `WAID-504-hb-${randomInt(0, 1e9).toString(36)}`,
+    ],
   );
   created.push(id);
   return id;
@@ -188,6 +237,95 @@ d('#504 — o core OBEDECE a barreira do claim (DB real)', () => {
     expect(Number(turn.attempt_count)).toBe(1);
     expect(turn.status).toBe('ignored');
     expect(turn.outcome).toBe('identity_unknown');
+  }, 60_000);
+
+  /**
+   * ─── Achado P1 nº 2 da review, visto do CONSUMIDOR ────────────────────────
+   *
+   * As duas suítes acima provam a barreira de ENTRADA. Este caso prova a outra
+   * metade: que o core abre o CONTEXTO DE EXECUÇÃO da tentativa e que os
+   * limites de efeito a jusante o obedecem quando a posse acaba NO MEIO.
+   *
+   * Por que aqui e não em `turn-lease-lost-effects-real-db.spec.ts`: lá o
+   * escopo (`runWithTurnExecution`) é aberto pelo próprio teste, então aquela
+   * suíte prova que os guards funcionam — não que o core os liga. É a mesma
+   * distinção entre "o cadeado funciona" e "o cadeado está na porta" que segurou
+   * esta PR na primeira integração. Apagar o `runWithTurnExecution` de
+   * `src/agent/core.ts` deixa aquela suíte inteira verde e esta vermelha.
+   *
+   * O efeito observado é `mensagens.processada_em`, pelo mesmo motivo do caso
+   * anterior: é o campo que o early-return legado consulta, e carimbá-lo depois
+   * de perder a posse faz o turno do dono legítimo parecer processado por fora.
+   */
+  it('POSSE PERDIDA NO MEIO: o core não carimba a projeção legada', async () => {
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { agentTurnsRepo } = await import('../../src/db/repositories.js');
+    const mensagem_id = await mkInboundComTelefone();
+    const turn_id = await mkTurn(mensagem_id);
+
+    // A janela: o core já reivindicou e está DENTRO do turno. Aqui a lease vence
+    // e outro worker assume — pela porta de produção, sem mock nenhum.
+    takeoverHook.fn = async () => {
+      await pool.query(
+        `UPDATE agent_turns SET lease_expires_at = now() - interval '1 second' WHERE id=$1`,
+        [turn_id],
+      );
+      const sucessor = await inPrimary(() =>
+        agentTurnsRepo.tryClaimTurn({
+          turn_id,
+          worker_id: 'sucessor-no-meio-do-turno',
+          lease_ms: 60_000,
+        }),
+      );
+      expect(sucessor.ok, 'o sucessor deveria assumir a lease vencida').toBe(true);
+    };
+    try {
+      await runAgentForMensagem(mensagem_id);
+    } finally {
+      takeoverHook.fn = null;
+    }
+
+    // O SINAL: a projeção legada NÃO foi carimbada por quem perdeu a posse.
+    expect(
+      await readProcessadaEm(mensagem_id),
+      'o core carimbou processada_em depois de perder a posse do turno',
+    ).toBeNull();
+
+    // A REDE, e o que prova que o core REALMENTE entrou (sem isto, um turno
+    // barrado na entrada também deixaria `processada_em` nulo): a conclusão foi
+    // tentada e RECUSADA pelo fence, e a posse na linha é a do sucessor.
+    const fence = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_log
+        WHERE acao = 'turn_fence_rejected' AND alvo_id = $1`,
+      [turn_id],
+    );
+    expect(
+      fence.rows[0].n,
+      'o core precisa ter ENTRADO e sido recusado no fence — senão o teste passa por não ter rodado',
+    ).toBeGreaterThan(0);
+    const turn = await readTurn(turn_id);
+    expect(turn.claimed_by).toBe('sucessor-no-meio-do-turno');
+    expect(turn.status, 'o zumbi não pode ter concluído o turno').not.toBe('ignored');
+  }, 60_000);
+
+  it('CONTROLE do caso acima: sem takeover, o mesmo caminho carimba e conclui', async () => {
+    // O par honesto do caso anterior: mesma mensagem com telefone, mesmo
+    // resolvedor devolvendo `unknown`, mesma rota — só que a posse permanece.
+    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const mensagem_id = await mkInboundComTelefone();
+    const turn_id = await mkTurn(mensagem_id);
+
+    takeoverHook.fn = null;
+    await runAgentForMensagem(mensagem_id);
+
+    expect(
+      await readProcessadaEm(mensagem_id),
+      'com a posse intacta o core tem de concluir e carimbar',
+    ).not.toBeNull();
+    const turn = await readTurn(turn_id);
+    expect(turn.status).toBe('ignored');
+    expect(turn.outcome).toBe('identity_unknown');
+    expect(Number(turn.attempt_count)).toBe(1);
   }, 60_000);
 
   it('BARREIRA: turno com dono vivo — o core NÃO executa nem carimba nada', async () => {
