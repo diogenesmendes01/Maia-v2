@@ -36,6 +36,8 @@ import { dirname } from 'node:path';
 import type { Reporter, SerializedError, TestCase, TestModule } from 'vitest/node';
 
 /** Assinatura textual do estouro de prazo do vitest, em test e em hook. */
+import { relative, sep } from 'node:path';
+
 const RE_TIMEOUT = /timed out in \d+\s*ms/i;
 
 // As variáveis abaixo NÃO usam o prefixo `MAIA_` de propósito. O contrato de
@@ -77,8 +79,12 @@ function primeiraLinha(texto: string | undefined): string {
 }
 
 function relativo(caminho: string): string {
-  const marca = `${process.cwd()}/`;
-  return caminho.startsWith(marca) ? caminho.slice(marca.length) : caminho;
+  // `process.cwd()` usa `\\` no Windows enquanto `moduleId` chega normalizado
+  // com `/`, então a concatenação ingênua nunca casava lá e o relatório
+  // imprimia o caminho absoluto — pior referência copiável, e expõe o caminho
+  // local de quem rodou. Achado do review da PR #566.
+  const rel = relative(process.cwd(), caminho);
+  return (rel === '' ? caminho : rel).split(sep).join('/');
 }
 
 export default class DiagnosticoReporter implements Reporter {
@@ -191,11 +197,28 @@ export default class DiagnosticoReporter implements Reporter {
 
     // ── prazos estourados ────────────────────────────────────────────────
     const estouros = registros.filter((r) => r.erros.some((e) => RE_TIMEOUT.test(e)));
+    // Prazo estourado FORA de um caso — `beforeAll`, `afterAll`, `beforeEach`,
+    // erro solto. Estes não estão em `registros` (que vem de
+    // `TestCase.result().errors`), e sem esta coleta o relatório dizia
+    // "prazos estourados: nenhum" para uma rodada cujo único problema era um
+    // hook estourado. É o achado do review da PR #566, e a ironia é exata:
+    // esta PR MOVE os imports frios para `beforeAll`, ou seja, cria justamente
+    // o modo de falha que o reporter era cego para ver.
+    const estourosForaDeCaso: { arquivo: string; erro: string }[] = [];
+    for (const m of naoCarregaram) {
+      for (const e of m.erros) {
+        if (RE_TIMEOUT.test(e)) estourosForaDeCaso.push({ arquivo: m.arquivo, erro: e });
+      }
+    }
+    for (const e of errosSoltos) {
+      if (RE_TIMEOUT.test(e)) estourosForaDeCaso.push({ arquivo: '(sem arquivo)', erro: e });
+    }
+    const totalEstouros = estouros.length + estourosForaDeCaso.length;
     out.push('');
-    if (estouros.length === 0) {
+    if (totalEstouros === 0) {
       out.push('prazos estourados: nenhum.');
     } else {
-      out.push(`PRAZOS ESTOURADOS: ${estouros.length}`);
+      out.push(`PRAZOS ESTOURADOS: ${totalEstouros}`);
       out.push(
         '  O timeout do vitest NÃO aborta o corpo async. A tentativa que estourou',
       );
@@ -256,8 +279,18 @@ export default class DiagnosticoReporter implements Reporter {
     // numa seção acima que ela pode não relacionar.
     const arquivosComEstouro = new Set(estouros.map((r) => r.arquivo));
     out.push('');
-    if (falhos.length === 0) {
+    if (falhos.length === 0 && naoCarregaram.length === 0 && errosSoltos.length === 0) {
       out.push('falhas: nenhuma.');
+    } else if (falhos.length === 0) {
+      // Não há caso vermelho, mas a rodada TEM problema: arquivo que não
+      // carregou ou erro fora de teste. Dizer "falhas: nenhuma" aqui
+      // contradiria o `Test Files N failed` do vitest logo acima, e produziria
+      // exatamente a leitura falsa que este bloco existe para eliminar.
+      // Achado do review da PR #566.
+      out.push(
+        `falhas: nenhum CASO vermelho, mas ${naoCarregaram.length} arquivo(s) não ` +
+          `carregaram e ${errosSoltos.length} erro(s) solto(s) — a rodada NÃO passou.`,
+      );
     } else {
       out.push(`FALHAS: ${falhos.length}`);
       for (const r of falhos.slice(0, TOPO_FALHAS)) {
