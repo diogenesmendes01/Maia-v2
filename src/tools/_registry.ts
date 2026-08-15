@@ -86,6 +86,28 @@ import { riskSignalClassifyTool } from './risk-signal-classify.js';
 import { conversationSummaryComposeTool } from './conversation-summary-compose.js';
 import { conversationStateUpdateTool } from './conversation-state-update.js';
 
+/**
+ * Issue #504 §Fencing — a TENTATIVA do turno, entregue ao handler.
+ *
+ * Um handler que faz várias gravações (ou uma chamada externa longa) precisa de
+ * duas coisas que o `ToolContext` não carregava: `signal`, para COOPERAR com o
+ * cancelamento em vez de terminar um trabalho que ninguém mais aceita, e
+ * `claim_token`, para VALIDAR a tentativa — é o mesmo fence que `agent_turns`
+ * exige em toda gravação da tentativa, e sem ele uma mutação interna não tem
+ * como se recusar a gravar por conta própria.
+ *
+ * `null` no `ToolHandlerCtx.turn` quando não há turno reivindicado
+ * (`FEATURE_TURN_CLAIM` OFF, worker de agenda, playground, testes) — o mesmo
+ * regime no-op dos guards de `runtime/turns/execution-context.ts`.
+ */
+export type ToolTurnContext = {
+  turn_id: string;
+  attempt: number;
+  claim_token: string;
+  deadline: Date;
+  signal: AbortSignal;
+};
+
 export type ToolHandlerCtx = {
   pessoa: import('@/db/schema.js').Pessoa;
   scope: { entidades: string[]; byEntity: Map<string, ResolvedPermission> };
@@ -93,6 +115,8 @@ export type ToolHandlerCtx = {
   mensagem_id: string;
   request_id: string;
   idempotency_key: string;
+  /** Issue #504 §Fencing — ver `ToolTurnContext`. */
+  turn: ToolTurnContext | null;
 };
 
 export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
