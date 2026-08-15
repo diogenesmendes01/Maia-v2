@@ -397,38 +397,52 @@ export function todayUtc(now: Date): string {
 }
 
 /**
- * Nome do executável do npm para a plataforma.
+ * Como INVOCAR o `npm audit` na plataforma atual — arquivo, argumentos e se
+ * precisa de shell.
  *
- * No Windows o que existe no PATH é `npm.cmd` (um shim de shell), e
- * `execFileSync` não resolve por PATHEXT nem passa por shell — chamar `'npm'`
- * lá dá `spawnSync npm ENOENT`, ou seja, o comando documentado no AGENTS.md
- * (`npm run audit:exceptions:check`) morre antes de auditar coisa alguma. A
- * plataforma entra por parâmetro para o spec cobrir os dois casos sem precisar
- * rodar em Windows.
+ * Round 2 do review da PR #564. A primeira correção trocou `'npm'` por
+ * `'npm.cmd'` no Windows e isso resolvia o `ENOENT` — mas produzia `EINVAL`,
+ * porque `.cmd` é script do `cmd.exe` e `execFileSync` não o executa sem
+ * shell. O teste anterior só afirmava que a função devolvia a string
+ * `'npm.cmd'`, então ficava verde sem nunca atravessar a fronteira de
+ * processo. Duas lições, e a segunda é a que importa: uma correção
+ * cross-platform testada só por igualdade de string não é testada.
+ *
+ * `shell: true` aqui NÃO é superfície de injeção: o comando e os argumentos são
+ * constantes literais, e o diretório do projeto entra por `cwd` — nunca
+ * concatenado na linha de comando, então caminho com espaço também não é
+ * problema.
  */
-export function npmExecutable(platform: string = process.platform): string {
-  return platform === 'win32' ? 'npm.cmd' : 'npm';
+export interface AuditSpawn {
+  readonly file: string;
+  readonly args: readonly string[];
+  readonly shell: boolean;
 }
 
-/**
- * Roda `npm audit --json` num projeto e devolve o JSON cru — sem julgar a
- * forma, que é trabalho de `parseAudit`.
- *
- * O `npm audit` sai com código != 0 QUANDO ENCONTRA vulnerabilidade, então o
- * status é ignorado de propósito e o que vale é o JSON no stdout. Só que
- * "ignorar o status" não pode virar "aceitar qualquer stdout": se o stdout não
- * for JSON, isto LEVANTA erro em vez de devolver algo vazio, e quem chama
- * transforma o erro em reprovação.
- */
-export function runAudit(projectDir: string): unknown {
+export function auditSpawn(platform: string = process.platform): AuditSpawn {
+  return { file: 'npm', args: ['audit', '--json'], shell: platform === 'win32' };
+}
+
+/** Assinatura do executor, para o teste observar a chamada REAL sem Windows. */
+export type Exec = (spawn: AuditSpawn, cwd: string) => string;
+
+const defaultExec: Exec = (spawn, cwd) =>
+  execFileSync(spawn.file, [...spawn.args], {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: spawn.shell,
+  });
+
+export function runAudit(
+  projectDir: string,
+  exec: Exec = defaultExec,
+  platform: string = process.platform,
+): unknown {
   let stdout: string;
   try {
-    stdout = execFileSync(npmExecutable(), ['audit', '--json'], {
-      cwd: projectDir,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    stdout = exec(auditSpawn(platform), projectDir);
   } catch (err) {
     const e = err as { stdout?: string };
     if (typeof e.stdout !== 'string' || e.stdout.trim() === '') throw err;

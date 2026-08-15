@@ -19,7 +19,9 @@ import {
   ghsaFromUrl,
   isCalendarDate,
   keyOf,
-  npmExecutable,
+  runAudit,
+  type AuditSpawn,
+  type Exec,
   parseAudit,
   validateAuditReport,
   validateLedger,
@@ -241,22 +243,75 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
   });
 });
 
-describe('npmExecutable — o comando documentado precisa rodar no Windows', () => {
-  it('usa npm.cmd no win32', () => {
-    // `execFileSync` não passa por shell nem resolve PATHEXT: com 'npm' o
-    // Windows dá `spawnSync npm ENOENT` e o guard morre antes de auditar.
-    expect(npmExecutable('win32')).toBe('npm.cmd');
+describe('a invocação do npm audit precisa ATRAVESSAR a fronteira no Windows', () => {
+  /**
+   * Round 2 do review da #564. A correção anterior devolvia `'npm.cmd'` e o
+   * teste afirmava exatamente isso — igualdade de string. Ficava verde
+   * enquanto o comando continuava quebrado no Windows, porque `.cmd` é script
+   * do `cmd.exe` e `execFileSync` não o executa sem shell: o `ENOENT` virava
+   * `EINVAL`.
+   *
+   * A lição está no formato destes casos: eles observam o DESCRITOR DE SPAWN
+   * inteiro que chega ao executor, não o nome do arquivo. Um teste de
+   * cross-platform que só compara string não testa cross-platform.
+   */
+  it('no win32 a invocação pede shell — sem ele, .cmd dá EINVAL', () => {
+    const visto: Array<{ spawn: AuditSpawn; cwd: string }> = [];
+    const exec: Exec = (spawn, cwd) => {
+      visto.push({ spawn, cwd });
+      return JSON.stringify({ auditReportVersion: 2, vulnerabilities: {}, metadata: {} });
+    };
+
+    runAudit('/projeto/qualquer', exec, 'win32');
+
+    expect(visto).toHaveLength(1);
+    expect(
+      visto[0]!.spawn.shell,
+      'sem shell no win32, `npm`/`npm.cmd` não é executável por execFileSync',
+    ).toBe(true);
+    expect(visto[0]!.spawn.file).toBe('npm');
+    expect(visto[0]!.spawn.args).toEqual(['audit', '--json']);
   });
 
-  it('usa npm nos demais', () => {
-    expect(npmExecutable('linux')).toBe('npm');
-    expect(npmExecutable('darwin')).toBe('npm');
-    expect(npmExecutable('freebsd')).toBe('npm');
+  it('fora do win32 NÃO usa shell — é processo direto', () => {
+    for (const plataforma of ['linux', 'darwin', 'freebsd']) {
+      const visto: AuditSpawn[] = [];
+      const exec: Exec = (spawn) => {
+        visto.push(spawn);
+        return JSON.stringify({ auditReportVersion: 2, vulnerabilities: {}, metadata: {} });
+      };
+      runAudit('/projeto', exec, plataforma);
+      expect(visto[0]!.shell, `${plataforma} não deveria precisar de shell`).toBe(false);
+      expect(visto[0]!.args).toEqual(['audit', '--json']);
+    }
   });
 
-  it('sem argumento, decide pela plataforma corrente', () => {
-    expect(npmExecutable()).toBe(npmExecutable(process.platform));
+  it('o diretório vai por cwd, NUNCA concatenado na linha de comando', () => {
+    // É o que mantém `shell: true` sem superfície de injeção, e o que faz
+    // caminho com espaço funcionar.
+    const visto: Array<{ spawn: AuditSpawn; cwd: string }> = [];
+    const exec: Exec = (spawn, cwd) => {
+      visto.push({ spawn, cwd });
+      return JSON.stringify({ auditReportVersion: 2, vulnerabilities: {}, metadata: {} });
+    };
+
+    runAudit('C:\\Program Files\\meu projeto', exec, 'win32');
+
+    expect(visto[0]!.cwd).toBe('C:\\Program Files\\meu projeto');
+    expect(visto[0]!.spawn.args.join(' ')).not.toContain('meu projeto');
+    expect(visto[0]!.spawn.file).not.toContain('meu projeto');
   });
+
+  it('EXECUÇÃO REAL na plataforma corrente: o npm responde de verdade', () => {
+    // O único caso que atravessa a fronteira de processo. No Linux do CI ele
+    // exercita o ramo sem shell; num runner Windows exercitaria o outro. É a
+    // rede que os três casos acima, por serem observação de descritor, não dão.
+    const relatorio = runAudit(process.cwd()) as { auditReportVersion?: unknown };
+    expect(
+      typeof relatorio.auditReportVersion,
+      'o npm audit não devolveu um relatório utilizável na plataforma corrente',
+    ).toBe('number');
+  }, 120_000);
 });
 
 describe('isCalendarDate', () => {
