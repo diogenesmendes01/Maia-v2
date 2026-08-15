@@ -50,7 +50,11 @@ cd /opt/maia   # checkout do repo no host
 # Env por serviço (uma vez; rotacione depois conforme política)
 cp .env.app.prod.example .env.app       && chmod 600 .env.app
 cp .env.admin.prod.example .env.admin   && chmod 600 .env.admin
-# preencha ambos — placeholders __SET_ME__ são rejeitados no boot
+# preencha ambos — placeholders __SET_ME__ são rejeitados no boot.
+#
+# ATENÇÃO: `cp` + preencher os placeholders NÃO basta para app/admin-ui
+# subirem. Os dois exemplos não cobrem tudo que o profile `production`
+# exige — leia "O que os exemplos NÃO cobrem" logo abaixo ANTES do `up`.
 
 # Credenciais de infra — usadas SÓ para interpolação do compose
 cat > .env.infra <<'EOF'
@@ -65,6 +69,57 @@ chmod 600 .env.infra
 docker compose --env-file .env.infra -f compose.prod.yml up -d --build
 docker compose --env-file .env.infra -f compose.prod.yml ps
 ```
+
+### O que os exemplos NÃO cobrem (gap conhecido — issue #572)
+
+`cp` + "preencha os placeholders" **não** produz um ambiente que sobe. Os dois
+`.prod.example` são o conjunto mínimo do schema Zod de `src/config/env.ts`; o
+**contrato** (`src/config/contract.ts`) exige mais no profile `production`, e
+essas chaves não estão nos exemplos.
+
+O gate que a issue #516 entrega cobre o **migrator, e só ele**: `migrate` não
+tem `env_file`, recebe apenas o subset `migrator` do contrato pelo
+`environment:` do compose, e satisfaz o loader. `app` e `admin-ui` **reprovam
+no boot** — depois de o migrator ter saído com sucesso e o gate
+`service_completed_successfully` ter liberado a subida.
+
+Acrescente à mão, depois do `cp`:
+
+**`.env.app` — nenhuma destas aparece em `.env.app.prod.example`, nem
+comentada.** Não há linha para descomentar; são seis chaves novas:
+
+| Chave | Por que o contrato exige em `production` |
+|---|---|
+| `BACKUP_S3_BUCKET` | `requiredIn: ['staging','production']` |
+| `BACKUP_S3_ACCESS_KEY` | `requiredWhen`: `BACKUP_S3_BUCKET` presente |
+| `BACKUP_S3_SECRET_KEY` | `requiredWhen`: `BACKUP_S3_BUCKET` presente |
+| `BACKUP_ENCRYPTION_MODE` | o default `none` é **recusado** em production (`backup/production-encryption`) — o valor de produção é `envelope_aes256_gcm` |
+| `BACKUP_ENCRYPTION_KEYRING` | `requiredWhen`: `BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm` |
+| `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` | `requiredWhen`: `BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm` |
+
+São **duas rodadas de erro**, não uma: o primeiro boot acusa apenas
+`BACKUP_ENCRYPTION_MODE` e `BACKUP_S3_BUCKET`; preenchê-las é o que destrava a
+exigência das outras quatro. Preencher só o que a primeira mensagem lista
+devolve uma segunda falha de boot.
+
+**`.env.admin` — as quatro `OIDC_*` existem no exemplo, porém COMENTADAS**
+(`.env.admin.prod.example`, seção "Sign-in de produção"). O exemplo dizia
+"configure as quatro (ou nenhuma)"; esse "ou nenhuma" **não vale em
+production** — o contrato marca as quatro com
+`requiredIn: ['staging','production']` — e o texto do arquivo já foi corrigido.
+Descomente e preencha `OIDC_ISSUER` (tem de ser `https://`), `OIDC_CLIENT_ID`,
+`OIDC_CLIENT_SECRET` e `OIDC_TENANT_SLUGS`.
+
+> **TODO (issue #572)** — alinhar contrato, `.prod.example` e este runbook, e
+> acrescentar um preflight `config:check` real dos **dois** consumidores, para
+> que esta seção vire um comando em vez de uma lista conferida à mão. Decidir
+> se produção realmente obriga backup off-site cifrado e SSO é decisão de
+> produto, não de wiring — por isso ela não foi tomada aqui.
+>
+> Enquanto isso, o gap está preso em
+> `tests/unit/migrations/compose-prod-effective-env.spec.ts` (`describe` "gap
+> conhecido…"), que afirma as chaves acima pelos dois lados: fica vermelho se o
+> gap crescer **e** se ele fechar sem esta seção ser atualizada junto.
 
 ### `MAIA_ENV` é obrigatória, e de propósito não tem default
 
@@ -94,7 +149,9 @@ os consumidores em outro, sem nada apontando a contradição. Fonte única,
 `.env.infra`, propagada pelo compose.
 `tests/unit/migrations/compose-prod-effective-env.spec.ts` monta o ambiente
 efetivo dos três (env file + `environment:`, ambos lidos do repositório) e
-roda o loader de cada um.
+roda o loader de cada um — verificando que `MAIA_ENV` deixou de ser um dos
+problemas. Ele **não** afirma que esse ambiente sobe: o que falta para isso
+está na seção anterior, e o próprio spec o prende por nome.
 
 Faltou a linha no `.env.infra`, o compose **aborta antes de criar container
 algum**:
