@@ -40,10 +40,16 @@
  *
  * O ganho contra (2) é o que importa: se o carregamento estourar o prazo, quem
  * estoura é o `beforeAll` — e um `beforeAll` que falha REPROVA os casos do
- * arquivo SEM EXECUTÁ-LOS. Não existe segunda tentativa competindo com um
- * corpo órfão pelo mesmo estado, porque não existe corpo nenhum rodando. O
- * modo de falha ilegível deixa de ser possível para o custo de import, que é
- * de onde ele vinha.
+ * arquivo SEM EXECUTÁ-LOS. Não há segunda tentativa do corpo do caso, e é a
+ * segunda tentativa que produzia a mensagem secundária ilegível. O custo de
+ * import deixa de ser capaz de gerar esse modo de falha.
+ *
+ * O que o hook NÃO faz — e não adianta prometer que faz — é cancelar o
+ * `import()`. O timeout rejeita a espera, não a promessa: o módulo termina de
+ * carregar depois, e se ele tiver efeito de topo (registrar um singleton,
+ * abrir conexão com Redis/banco, agendar timer) esse efeito aterrissa fora de
+ * qualquer caso. O helper elimina a disputa entre tentativas do MESMO caso;
+ * ele não transforma um import com efeito colateral em algo inerte.
  *
  * O corpo do caso passa a medir o caso. É isso que faz a lista de "mais
  * lentos" do `tests/reporters/diagnostico-reporter.ts` significar alguma coisa.

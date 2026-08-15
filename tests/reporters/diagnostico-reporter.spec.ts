@@ -18,8 +18,6 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 
-const FIXTURE = 'tests/reporters/fixtures/hook-timeout.fixture.ts';
-
 function rodarVitestFilho(): string {
   try {
     return execFileSync(
@@ -67,4 +65,34 @@ describe('diagnostico-reporter — prazo estourado FORA de um caso', () => {
     expect(saida).toMatch(/ARQUIVOS QUE NÃO CARREGARAM/);
     expect(saida).toMatch(/Hook timed out in \d+ms/);
   });
+
+  it('o detalhe do estouro está DENTRO do bloco PRAZOS ESTOURADOS', () => {
+    // O contador do bloco somava os estouros fora de caso mas a lista não os
+    // renderizava: `PRAZOS ESTOURADOS: 1` seguido de zero itens. Quem lê
+    // procurava o arquivo culpado em outro bloco. Afirmar sobre `saida` inteira
+    // não pega isso — o arquivo e o erro aparecem em ARQUIVOS QUE NÃO
+    // CARREGARAM de qualquer jeito. A asserção tem que ser sobre a FATIA.
+    const bloco = fatiarBlocoDePrazos(saida);
+    expect(bloco, 'bloco PRAZOS ESTOURADOS não encontrado na saída').not.toBeNull();
+    expect(
+      bloco,
+      'o contador de PRAZOS ESTOURADOS voltou a contar sem listar: o estouro ' +
+        'de hook não aparece dentro do próprio bloco',
+    ).toMatch(/Hook timed out in \d+ms/);
+    expect(bloco).toMatch(/hook-timeout\.fixture\.ts/);
+    expect(bloco).toMatch(/HOOK \(nenhum caso executou\)/);
+  });
 }, 180_000);
+
+/**
+ * Recorta do cabeçalho `PRAZOS ESTOURADOS: N` até o começo do bloco seguinte
+ * (`recuperados pela segunda tentativa`), que o reporter sempre emite — em
+ * caixa alta quando há itens, em minúscula com "nenhum" quando não há.
+ */
+function fatiarBlocoDePrazos(saida: string): string | null {
+  const inicio = saida.search(/^PRAZOS ESTOURADOS: \d+$/m);
+  if (inicio < 0) return null;
+  const resto = saida.slice(inicio);
+  const fim = resto.search(/^recuperados pela segunda tentativa|^RECUPERADOS PELA SEGUNDA TENTATIVA/m);
+  return fim < 0 ? resto : resto.slice(0, fim);
+}

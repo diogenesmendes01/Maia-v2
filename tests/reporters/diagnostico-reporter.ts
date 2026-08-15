@@ -32,13 +32,26 @@
  * resultados — ele não reprova, não pula e não silencia nada.
  */
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, relative, sep } from 'node:path';
 import type { Reporter, SerializedError, TestCase, TestModule } from 'vitest/node';
 
 /** Assinatura textual do estouro de prazo do vitest, em test e em hook. */
-import { relative, sep } from 'node:path';
-
 const RE_TIMEOUT = /timed out in \d+\s*ms/i;
+
+/** `Hook timed out in 20000ms` — o vitest marca o hook no texto do erro. */
+const RE_HOOK = /\bhook timed out in\b/i;
+
+/**
+ * Onde o prazo estourou, para um estouro que não pertence a nenhum caso.
+ *
+ * A distinção importa porque a ação é diferente. Hook estourado reprova todos
+ * os casos do arquivo sem executá-los — a lista de "mais lentos" some junto e
+ * não adianta procurar caso lento. Estouro na carga do arquivo (import de topo,
+ * `vi.mock` factory) nem chega a coletar caso nenhum.
+ */
+function marcaDeEstouroForaDeCaso(erro: string): string {
+  return RE_HOOK.test(erro) ? 'HOOK (nenhum caso executou)' : 'CARGA DO ARQUIVO';
+}
 
 // As variáveis abaixo NÃO usam o prefixo `MAIA_` de propósito. O contrato de
 // config (#515, `src/config/contract.ts`) falha FECHADO em qualquer `MAIA_*`
@@ -235,6 +248,15 @@ export default class DiagnosticoReporter implements Reporter {
           `  · ${r.arquivo} > ${r.nome}` +
             `\n      ${r.duracao.toFixed(0)}ms · tentativas=${r.tentativas} · ${marca}`,
         );
+      }
+      // Os que estouraram fora de um caso entram no contador acima; sem
+      // renderizá-los aqui o número não bate com a lista, e quem lê procura o
+      // arquivo culpado em outro bloco. O `marca` diz ONDE estourou, porque a
+      // ação é diferente: hook estourado reprova o arquivo inteiro sem rodar
+      // caso nenhum (mas não cancela o `import()` em curso).
+      for (const e of estourosForaDeCaso) {
+        out.push(`  · ${e.arquivo} > ${marcaDeEstouroForaDeCaso(e.erro)}`);
+        out.push(`      ${e.erro}`);
       }
     }
 
