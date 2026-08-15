@@ -4,6 +4,44 @@
 > dev: portas de datastore no host, fallback `maia/maia`, Redis sem auth,
 > `.env` inteiro em todos os containers, processos root).
 
+## 0. Pré-voo OBRIGATÓRIO: smoke do job `migrate` na imagem real
+
+```bash
+npm run smoke:migrate:image
+```
+
+**Gate bloqueante antes do primeiro rollout, e gate permanente de release**
+(job `smoke-migrate-image` em `.github/workflows/ci.yml`). Precisa de Docker
+e de rede para o build; leva alguns minutos.
+
+O que ele faz, e por que nada mais cobre isso:
+
+- constrói a imagem de **produção real** (`Dockerfile`, sem substituição);
+- sobe um Postgres **efêmero** e confirma que ele está vazio;
+- roda o comando **real** do job (`npm run db:migrate`) dentro dela, como
+  **uid 1001**, com **rootfs read-only** e `/tmp` em tmpfs — as mesmas
+  condições que `compose.prod.yml` impõe ao serviço `migrate`;
+- exige saída 0, eventos `migration.applied` no stdout e um ledger com
+  exatamente tantas migrations `applied` quantas a imagem empacota;
+- repete o run contra o banco já no head e exige saída 0 de novo.
+
+`tests/unit/migrations/compose-migrate-job.spec.ts` prova que os arquivos de
+Compose **dizem** a coisa certa. Nada ali executa o comando, e o que só a
+execução responde é: `npm run db:migrate` é `tsx scripts/migrate.ts`, o
+`tsx` resolve `@/*` em runtime lendo `tsconfig.json`, e ele cria
+`/tmp/tsx-<uid>` **antes de carregar o primeiro módulo**. Dois exemplos
+medidos, ambos com o job saindo != 0 e portanto segurando `app`/`admin-ui`
+fora do ar via `service_completed_successfully`:
+
+| Se sumir da imagem | O job morre com |
+|---|---|
+| `COPY tsconfig.json` (Dockerfile) | `Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@/config' imported from /app/scripts/migrate.ts` |
+| `tmpfs: - /tmp` (compose) | `Error: ENOENT: no such file or directory, mkdir '/tmp/tsx-1001'` |
+
+O smoke não tem flag de bypass nem fallback de imagem: ele constrói
+`Dockerfile` e nada mais. Um gate com escape hatch é um gate que um dia
+passa pelo escape hatch.
+
 ## 1. Bring-up
 
 ```bash
@@ -20,12 +58,35 @@ POSTGRES_USER=maia_prod
 POSTGRES_PASSWORD=<openssl rand -hex 24>   # URL-safe, min 8 chars
 POSTGRES_DB=maia
 REDIS_PASSWORD=<openssl rand -hex 24>
+MAIA_ENV=production                        # OBRIGATÓRIA — ver abaixo
 EOF
 chmod 600 .env.infra
 
 docker compose --env-file .env.infra -f compose.prod.yml up -d --build
 docker compose --env-file .env.infra -f compose.prod.yml ps
 ```
+
+### `MAIA_ENV` é obrigatória, e de propósito não tem default
+
+`compose.prod.yml` interpola `MAIA_ENV` com `${MAIA_ENV:?...}`. Faltou a
+linha no `.env.infra`, o compose **aborta antes de criar container algum**:
+
+```
+$ docker compose --env-file .env.infra -f compose.prod.yml up -d
+error while interpolating services.migrate.environment.MAIA_ENV: required
+variable MAIA_ENV is missing a value: MAIA_ENV is required (production|staging)
+— declare-a no .env.infra; ...
+```
+
+Antes havia `${MAIA_ENV:-production}`. O default não falhava — ele acertava
+o alvo errado em silêncio: um **staging** cujo `.env.infra` esquecesse a
+linha assumia o perfil de **produção** sem uma linha de log dizendo isso, e
+a descoberta vinha por uma regra de produção sendo aplicada (ou relaxada)
+num ambiente que ninguém achava que era produção.
+
+Um ensaio de staging com o mesmo arquivo continua sendo um `MAIA_ENV=staging`
+no `.env.infra` — só que agora **escrito**. (`staging` é compatível com
+`NODE_ENV=production`; `src/config/profiles.ts` só recusa contradição.)
 
 ### Migrations: aplicadas pelo próprio `up` (issue #516)
 
@@ -71,7 +132,7 @@ Rodar migrations fora da subida (raro; o job já cobre o caso normal):
 
 | Arquivo      | Vai para                  | Conteúdo                                              |
 | ------------ | ------------------------- | ----------------------------------------------------- |
-| `.env.infra` | interpolação do compose   | `POSTGRES_USER/PASSWORD/DB`, `REDIS_PASSWORD`         |
+| `.env.infra` | interpolação do compose   | `POSTGRES_USER/PASSWORD/DB`, `REDIS_PASSWORD`, `MAIA_ENV` |
 | `.env.app`   | container `app`           | LLM keys, WhatsApp/owner, HMAC, thresholds            |
 | `.env.admin` | container `admin-ui`      | NextAuth/OIDC + mínimo transitivo de `env.ts`         |
 
