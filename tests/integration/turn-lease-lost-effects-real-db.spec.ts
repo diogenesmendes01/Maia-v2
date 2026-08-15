@@ -332,6 +332,8 @@ d('#504 — lease perdida DURANTE a execução: nenhuma tool, nenhum outbound', 
     const chave = `ll504-barreira-${randomUUID().slice(0, 8)}`;
     createdFacts.push(chave);
 
+    let toolOut: unknown;
+    let sendErr: (Error & { delivered?: boolean }) | null = null;
     await inT(async () => {
       const { turn_id, lease } = await claimWithLease(mensagem_id);
       await runWithTurnExecution(lease.context(), async () => {
@@ -339,35 +341,39 @@ d('#504 — lease perdida DURANTE a execução: nenhuma tool, nenhum outbound', 
         // perdida, pelo caminho real (takeover + heartbeat).
         await loseOwnershipForReal(turn_id, lease);
 
-        const out = await dispatchTool({
+        toolOut = await dispatchTool({
           tool: 'remember_safe_fact',
           args: { chave, valor: 'zumbi' },
           ctx: toolCtx(mensagem_id),
         });
-        expect(out).toEqual({
-          error: 'turn_ownership_lost',
-          details: { tool: 'remember_safe_fact' },
-        });
-
-        // O outbound recusa como PRE-SEND: nada chegou ao usuário, e o caller
-        // que inspeciona `delivered` sabe que não deve tratar como entregue.
-        const err = await sendOutbound(pessoa.id, conversa.id, 'resposta', mensagem_id, {
+        sendErr = await sendOutbound(pessoa.id, conversa.id, 'resposta', mensagem_id, {
           channel_id: null,
         }).then(
           () => null,
           (e: unknown) => e as Error & { delivered?: boolean },
         );
-        expect(err, 'o outbound deveria ter sido recusado').not.toBeNull();
-        expect(err?.delivered, 'recusa é PRE-SEND: nada foi entregue').toBe(false);
-        expect(err?.message).toContain('turn_ownership_lost');
       });
     });
 
-    // O SINAL: nenhum dos dois efeitos existe no banco.
+    // O SINAL vem PRIMEIRO e é o EFEITO NO BANCO, não o valor de retorno. A
+    // ordem importa: um `expect` sobre o retorno colocado antes abortaria o
+    // teste e a saída vermelha mostraria um código de erro em vez do efeito
+    // que a issue existe para impedir.
     expect(await countFacts(chave), 'nenhuma tool pode ter rodado sem posse').toBe(0);
     expect(
       await countOutboundLedger(mensagem_id),
       'nenhum outbound pode ter sido sequer reivindicado sem posse',
     ).toBe(0);
+
+    // O vocabulário da recusa, em cada fronteira.
+    expect(toolOut).toEqual({
+      error: 'turn_ownership_lost',
+      details: { tool: 'remember_safe_fact' },
+    });
+    expect(sendErr, 'o outbound deveria ter sido recusado').not.toBeNull();
+    // PRE-SEND: nada chegou ao usuário, e o caller que inspeciona `delivered`
+    // sabe que não deve tratar como entregue.
+    expect(sendErr!.delivered).toBe(false);
+    expect(sendErr!.message).toContain('turn_ownership_lost');
   }, 60_000);
 });
