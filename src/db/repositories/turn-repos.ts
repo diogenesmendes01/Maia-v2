@@ -39,6 +39,28 @@ import {
   type TurnRecoveryReason,
   type TurnStatus,
 } from '@/runtime/turns/contract.js';
+import {
+  CLAIMABLE_STATUSES,
+  FENCED_WRITE_STATUSES,
+  LEASE_TAKEOVER_STATUSES,
+  type ClaimRejection,
+  type ClaimResult,
+  type LeaseRenewalResult,
+} from '@/runtime/turns/claim.js';
+
+/** Colunas devolvidas pelo `RETURNING` do claim atômico. */
+type ClaimRow = {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  status: string;
+  attempt_count: number | string;
+  claim_token: string;
+  claimed_by: string;
+  claimed_at: string;
+  lease_expires_at: string;
+  state_version: number | string;
+};
 
 /** Resultado tipado de uma transição CAS. Conflito NUNCA é sucesso silencioso. */
 export type TurnTransitionResult =
@@ -47,6 +69,24 @@ export type TurnTransitionResult =
   | {
       ok: false;
       conflict: 'state_mismatch';
+      to: TurnStatus;
+      current_status: TurnStatus;
+      current_state_version: number;
+    }
+  /**
+   * #504 — a transição foi REJEITADA PELO FENCE: o `claim_token` exigido não é
+   * mais o vigente, ou a lease desta tentativa já venceu.
+   *
+   * É deliberadamente distinto de `state_mismatch`. `state_mismatch` diz "o
+   * turno andou"; `stale_claim` diz "você não é mais o dono" — e a reação certa
+   * é oposta: no primeiro caso relemos e podemos tentar de novo, no segundo
+   * temos de PARAR, porque outro worker (ou o recovery) assumiu a tentativa e
+   * insistir duplicaria o trabalho. Confundir os dois transformaria o fence
+   * numa sugestão.
+   */
+  | {
+      ok: false;
+      conflict: 'stale_claim';
       to: TurnStatus;
       current_status: TurnStatus;
       current_state_version: number;
@@ -68,6 +108,16 @@ export type TurnTransitionPatch = {
   superseded_by_turn_id?: string | null;
   /** Incrementa `attempt_count` no mesmo UPDATE (retry). */
   bumpAttempt?: boolean;
+  /**
+   * #504 — libera a posse na MESMA transação da transição terminal.
+   *
+   * Sem isto, um turno concluído continuaria carregando `claim_token` e
+   * `lease_expires_at` no futuro: a leitura de diagnóstico mostraria um dono
+   * para trabalho que já acabou, e a varredura de lease vencida acabaria
+   * "recuperando" turnos terminais quando a lease finalmente passasse. Limpar
+   * junto do CAS é o que mantém as duas leituras honestas.
+   */
+  clearClaim?: boolean;
 };
 
 type Executor = typeof db;
@@ -90,6 +140,23 @@ const STATE_TIMESTAMP: Partial<Record<TurnStatus, keyof AgentTurn>> = {
 
 function transitionLabel(from: TurnStatus | 'any', to: TurnStatus): string {
   return `${from}->${to}`;
+}
+
+/**
+ * Lista de estados como argumentos de um `IN (...)`, cada um parametrizado.
+ *
+ * Interpolar um array JS direto num template `sql` do Drizzle NÃO produz um
+ * array do Postgres: ele vira uma lista de placeholders `($1, $2, $3)`, e
+ * `($1,$2,$3)::text[]` é um RECORD, que o Postgres recusa converter
+ * (`cannot cast type record to text[]`). O erro só aparece em tempo de
+ * execução, contra banco real — este helper existe para que a forma correta
+ * seja a única disponível.
+ */
+function statusList(statuses: readonly string[]) {
+  return sql.join(
+    statuses.map((s) => sql`${s}`),
+    sql`, `,
+  );
 }
 
 export const agentTurnsRepo = {
@@ -186,6 +253,13 @@ export const agentTurnsRepo = {
    * @param input.expected_version quando fornecida, o UPDATE também exige
    *   `state_version = expected_version` (CAS estrito, para leitura-modificação
    *   -escrita otimista).
+   * @param input.expected_claim_token #504 — quando fornecido, o UPDATE também
+   *   exige `claim_token = <token>` **e** `lease_expires_at > now()`: é o
+   *   FENCE. As duas condições são necessárias. Só o token não basta, porque um
+   *   worker cuja lease venceu e que ninguém sucedeu ainda continuaria portando
+   *   um token que casa — e escreveria como dono de uma posse que já não tem.
+   *   Só a lease não basta, porque o sucessor renova a lease e o zumbi passaria.
+   *   Falha aqui é `stale_claim`, nunca `state_mismatch`.
    */
   async transitionTurn(input: {
     turn_id: string;
@@ -193,6 +267,7 @@ export const agentTurnsRepo = {
     outcome?: TurnOutcome | null;
     expected_statuses?: readonly TurnStatus[];
     expected_version?: number;
+    expected_claim_token?: string;
     patch?: TurnTransitionPatch;
     manual?: boolean;
   }): Promise<TurnTransitionResult> {
@@ -226,8 +301,212 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
       patch: input.patch ?? {},
     });
+  },
+
+  // ─── #504 — claim atômico, lease e fencing ───────────────────────────────
+
+  /**
+   * CLAIM ATÔMICO: uma ÚNICA declaração SQL decide o dono da tentativa.
+   *
+   * A garantia inteira desta issue mora na forma desta query. Duas propriedades
+   * a sustentam, e nenhuma das duas sobrevive a "SELECT elegível" seguido de
+   * "UPDATE":
+   *
+   *  1. **Um único UPDATE ... WHERE ... RETURNING.** Sob READ COMMITTED, dois
+   *     workers que disputam a mesma row serializam no lock de row: o segundo
+   *     bloqueia e, quando o primeiro faz commit, RE-AVALIA o WHERE contra a
+   *     versão nova da row (EvalPlanQual). Como o vencedor deixou
+   *     `lease_expires_at` no futuro, o predicado de takeover do perdedor passa
+   *     a ser falso e ele volta ZERO linhas. Com SELECT-depois-UPDATE os dois
+   *     leriam o mesmo estado elegível e os dois escreveriam.
+   *
+   *  2. **Todo relógio é o do PostgreSQL** (`now()`), nunca `Date.now()` do
+   *     processo. Elegibilidade por lease é comparação de instantes entre
+   *     máquinas diferentes; com relógios locais, um nó adiantado em 30s toma
+   *     leases ainda vivas — takeover falso, ou seja, execução dupla.
+   *
+   * Elegibilidade (issue §Claim atômico):
+   *   - `received`/`queued`: ninguém possui;
+   *   - `retryable` com `next_attempt_at` vencido (ou nulo): o backoff é do
+   *     PostgreSQL, não da BullMQ;
+   *   - `claimed`/`running` com `lease_expires_at <= now()`: takeover de dono
+   *     morto. `outbound_pending` NÃO entra — a resposta já foi comprometida.
+   *
+   * Efeito atômico do claim: incrementa `attempt` (a tentativa CANÔNICA nasce
+   * aqui, não em `markRunning`), gera `claim_token` novo, grava `claimed_by`,
+   * `claimed_at`, `heartbeat_at` e `lease_expires_at`, e transiciona para
+   * `claimed`.
+   *
+   * Resultado vazio significa "não adquirido" — não é erro, e NÃO autoriza
+   * processar. `not_found` distingue "não existe neste escopo" de "existe e não
+   * está elegível", que é a diferença entre um bug de roteamento e uma corrida
+   * normal.
+   */
+  async tryClaimTurn(input: {
+    turn_id: string;
+    worker_id: string;
+    lease_ms: number;
+  }): Promise<ClaimResult> {
+    const { tenant_id, agent_id } = scope();
+    const leaseSeconds = input.lease_ms / 1000;
+    const result = await db.execute<ClaimRow>(sql`
+      UPDATE ${agent_turns}
+         SET status            = 'claimed',
+             claimed_by        = ${input.worker_id},
+             claim_token       = gen_random_uuid(),
+             claimed_at        = now(),
+             heartbeat_at      = now(),
+             lease_expires_at  = now() + make_interval(secs => ${leaseSeconds}),
+             attempt_count     = attempt_count + 1,
+             state_version     = state_version + 1,
+             next_attempt_at   = NULL,
+             updated_at        = now()
+       WHERE tenant_id = ${tenant_id}
+         AND agent_id  = ${agent_id}
+         AND id        = ${input.turn_id}
+         AND (
+               (status IN (${statusList(CLAIMABLE_STATUSES)})
+                 AND (status <> 'retryable' OR next_attempt_at IS NULL OR next_attempt_at <= now()))
+            OR (status IN (${statusList(LEASE_TAKEOVER_STATUSES)})
+                 AND lease_expires_at IS NOT NULL
+                 AND lease_expires_at <= now())
+         )
+      RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
+                claimed_by, claimed_at, lease_expires_at, state_version
+    `);
+    const row = (result.rows as unknown as ClaimRow[])[0];
+    if (!row) {
+      // Distinguir "não existe aqui" de "não elegível" custa uma leitura
+      // ESCOPADA, feita só no caminho de fracasso. Sem ela, um turno de outro
+      // tenant e uma corrida perdida seriam o mesmo evento na métrica — e o
+      // primeiro é bug de roteamento, o segundo é operação normal.
+      const exists = await db
+        .select({ id: agent_turns.id })
+        .from(agent_turns)
+        .where(
+          and(
+            eq(agent_turns.tenant_id, tenant_id),
+            eq(agent_turns.agent_id, agent_id),
+            eq(agent_turns.id, input.turn_id),
+          ),
+        )
+        .limit(1);
+      const reason: ClaimRejection = exists.length === 0 ? 'not_found' : 'not_eligible';
+      incCounter('maia_turn_claim_total', { result: reason });
+      return { ok: false, reason };
+    }
+    incCounter('maia_turn_claim_total', { result: 'acquired' });
+    return {
+      ok: true,
+      claim: {
+        turn_id: row.id,
+        tenant_id: row.tenant_id,
+        agent_id: row.agent_id,
+        attempt: Number(row.attempt_count),
+        claim_token: row.claim_token,
+        worker_id: row.claimed_by,
+        claimed_at: new Date(row.claimed_at),
+        lease_expires_at: new Date(row.lease_expires_at),
+        status: row.status as TurnStatus,
+        state_version: Number(row.state_version),
+      },
+    };
+  },
+
+  /**
+   * Renova a lease do claim VIGENTE. É o heartbeat.
+   *
+   * Três condições, todas necessárias:
+   *   - `claim_token = <o meu>` — só o dono renova (fencing);
+   *   - `status` ainda gravável — turno terminal não tem lease a renovar;
+   *   - `lease_expires_at > now()` — **uma lease VENCIDA não se renova.**
+   *
+   * A terceira é a que implementa "um worker que recuperar conectividade após
+   * perder o lease não pode retomá-lo implicitamente" (issue §Lease). Sem ela,
+   * um processo que ficou cinco minutos em GC voltaria, renovaria como se nada
+   * tivesse acontecido e continuaria escrevendo — mesmo que ninguém tenha
+   * tomado o turno ainda. O sucessor não ter chegado não devolve a posse a quem
+   * a perdeu.
+   *
+   * NÃO incrementa `state_version`: heartbeat não é transição de estado. Se
+   * incrementasse, cada batida invalidaria o CAS otimista que o caller carrega
+   * e toda conclusão de turno longo falharia por versão obsoleta.
+   */
+  async renewTurnLease(input: {
+    turn_id: string;
+    claim_token: string;
+    lease_ms: number;
+  }): Promise<LeaseRenewalResult> {
+    const { tenant_id, agent_id } = scope();
+    const leaseSeconds = input.lease_ms / 1000;
+    const result = await db.execute<{ lease_expires_at: string; heartbeat_at: string }>(sql`
+      UPDATE ${agent_turns}
+         SET lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
+             heartbeat_at     = now(),
+             updated_at       = now()
+       WHERE tenant_id   = ${tenant_id}
+         AND agent_id    = ${agent_id}
+         AND id          = ${input.turn_id}
+         AND claim_token = ${input.claim_token}::uuid
+         AND status      IN (${statusList(FENCED_WRITE_STATUSES)})
+         AND lease_expires_at > now()
+      RETURNING lease_expires_at, heartbeat_at
+    `);
+    const row = (
+      result.rows as unknown as Array<{ lease_expires_at: string; heartbeat_at: string }>
+    )[0];
+    if (!row) {
+      incCounter('maia_turn_lease_heartbeat_total', { result: 'token_mismatch' });
+      return { ok: false, reason: 'token_mismatch' };
+    }
+    incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
+    return {
+      ok: true,
+      lease_expires_at: new Date(row.lease_expires_at),
+      heartbeat_at: new Date(row.heartbeat_at),
+    };
+  },
+
+  /**
+   * Libera a posse EXPLICITAMENTE (shutdown gracioso, ou tentativa abortada).
+   *
+   * Vence a lease AGORA (`lease_expires_at = now()`) em vez de apagar o
+   * `claim_token`. Duas razões:
+   *
+   *  - o sucessor pode reivindicar no próximo tick, sem esperar o TTL — é o que
+   *    faz um deploy não custar um TTL de latência por turno em voo;
+   *  - `claimed_by`/`claim_token` sobrevivem para a forense ("quem tinha este
+   *    turno quando o pod morreu?"). Apagá-los devolveria a row a um estado que
+   *    finge que nunca houve dono.
+   *
+   * Isto NÃO reabre a porta para o worker antigo escrever: toda gravação fenced
+   * também exige `lease_expires_at > now()`, então quem libera perde o direito
+   * de escrever no mesmo instante em que libera.
+   *
+   * Idempotente e fenced: só o dono corrente libera.
+   */
+  async releaseTurnClaim(input: {
+    turn_id: string;
+    claim_token: string;
+  }): Promise<{ released: boolean }> {
+    const { tenant_id, agent_id } = scope();
+    const result = await db.execute<{ id: string }>(sql`
+      UPDATE ${agent_turns}
+         SET lease_expires_at = now(),
+             updated_at       = now()
+       WHERE tenant_id   = ${tenant_id}
+         AND agent_id    = ${agent_id}
+         AND id          = ${input.turn_id}
+         AND claim_token = ${input.claim_token}::uuid
+         AND status      IN (${statusList(FENCED_WRITE_STATUSES)})
+      RETURNING id
+    `);
+    return { released: result.rows.length === 1 };
   },
 
   /** `received | retryable -> queued` (wake-up do BullMQ confirmado). */
@@ -246,9 +525,17 @@ export const agentTurnsRepo = {
   },
 
   /**
-   * `received | queued -> claimed`. Nesta issue o claim é apenas de ESTADO — o
-   * claim atômico com lease/fencing/`claim_token` chega em #504, que substitui
-   * esta implementação preservando a assinatura.
+   * `received | queued -> claimed` SEM lease — o claim LEGADO de #503.
+   *
+   * Continua existindo porque `FEATURE_TURN_CLAIM` é um kill switch de verdade:
+   * desligada, o runtime volta a este caminho. Ele NÃO é exclusão mútua e nunca
+   * foi — duas réplicas ainda entram no mesmo turno. Quem dá exclusão mútua é
+   * `tryClaimTurn`.
+   *
+   * Deliberadamente NÃO admite `claimed`/`running` como origem: o takeover é
+   * privilégio do claim com lease, que sabe verificar se o dono morreu. Se esta
+   * porta aceitasse essas origens, o caminho legado poderia rebaixar um turno
+   * com dono VIVO.
    */
   async markClaimed(input: {
     turn_id: string;
@@ -263,12 +550,23 @@ export const agentTurnsRepo = {
     });
   },
 
-  /** `claimed -> running` (execução efetivamente iniciada, conta a tentativa). */
+  /**
+   * `claimed -> running` (execução efetivamente iniciada).
+   *
+   * @param input.bump_attempt conta a tentativa neste UPDATE. `true` (default)
+   *   preserva o comportamento de #503. O caminho de #504 passa `false`, porque
+   *   ali a tentativa canônica JÁ foi incrementada pelo `tryClaimTurn` — contar
+   *   nos dois lugares dobraria `attempt_count` e esgotaria `MAX_TURN_ATTEMPTS`
+   *   na metade das tentativas reais.
+   * @param input.expected_claim_token fence da tentativa (#504).
+   */
   async markRunning(input: {
     turn_id: string;
     conversa_id?: string | null;
     channel_id?: string | null;
     expected_version?: number;
+    expected_claim_token?: string;
+    bump_attempt?: boolean;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -276,8 +574,11 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
       patch: {
-        bumpAttempt: true,
+        bumpAttempt: input.bump_attempt ?? true,
         ...(input.conversa_id !== undefined ? { conversa_id: input.conversa_id } : {}),
         ...(input.channel_id !== undefined ? { channel_id: input.channel_id } : {}),
       },
@@ -294,6 +595,7 @@ export const agentTurnsRepo = {
     turn_id: string;
     outbound_message_id: string;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -302,6 +604,13 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
+      // A posse NÃO é liberada aqui: `outbound_pending` continua sendo uma
+      // gravação da MESMA tentativa (o outbox de #506 ainda vai finalizar), e
+      // soltar o fence agora deixaria a janela mais perigosa da máquina —
+      // resposta comprometida, dono indefinido — sem dono.
       patch: { outbound_message_id: input.outbound_message_id },
     });
   },
@@ -311,6 +620,7 @@ export const agentTurnsRepo = {
     turn_id: string;
     outcome: TurnOutcome;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -319,7 +629,10 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
-      patch: { next_attempt_at: null },
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
+      patch: { next_attempt_at: null, clearClaim: true },
     });
   },
 
@@ -328,6 +641,7 @@ export const agentTurnsRepo = {
     turn_id: string;
     outcome: TurnOutcome;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -336,7 +650,10 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
-      patch: { next_attempt_at: null },
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
+      patch: { next_attempt_at: null, clearClaim: true },
     });
   },
 
@@ -356,6 +673,7 @@ export const agentTurnsRepo = {
         : {}),
       patch: {
         next_attempt_at: null,
+        clearClaim: true,
         ...(input.absorbed_by_turn_id !== undefined
           ? { superseded_by_turn_id: input.absorbed_by_turn_id }
           : {}),
@@ -390,6 +708,7 @@ export const agentTurnsRepo = {
     error_code: string;
     error_summary: string | null;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -397,10 +716,17 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
       patch: {
         next_attempt_at: input.next_attempt_at,
         last_error_code: input.error_code,
         last_error_summary: input.error_summary,
+        // A tentativa acabou: a posse volta ao pool JÁ, sem esperar o TTL. Um
+        // turno `retryable` com lease viva ficaria invisível para o claim até o
+        // vencimento, atrasando o retry por nada.
+        clearClaim: true,
       },
     });
   },
@@ -412,6 +738,7 @@ export const agentTurnsRepo = {
     error_code: string;
     error_summary: string | null;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -420,10 +747,14 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
       patch: {
         next_attempt_at: null,
         last_error_code: input.error_code,
         last_error_summary: input.error_summary,
+        clearClaim: true,
       },
     });
   },
@@ -897,6 +1228,7 @@ async function runTransition(args: {
   outcome: TurnOutcome | null;
   sources: readonly TurnStatus[];
   expected_version?: number;
+  expected_claim_token?: string;
   patch: TurnTransitionPatch;
 }): Promise<TurnTransitionResult> {
   const { tenant_id, agent_id } = scope();
@@ -930,6 +1262,11 @@ async function runTransition(args: {
     if (args.patch.superseded_by_turn_id !== undefined) {
       set['superseded_by_turn_id'] = args.patch.superseded_by_turn_id;
     }
+    if (args.patch.clearClaim) {
+      // #504 — a posse morre com a tentativa. `claimed_by` fica para a forense.
+      set['claim_token'] = null;
+      set['lease_expires_at'] = null;
+    }
 
     const updated = await tx
       .update(agent_turns)
@@ -943,6 +1280,15 @@ async function runTransition(args: {
           ...(args.expected_version !== undefined
             ? [eq(agent_turns.state_version, args.expected_version)]
             : []),
+          // #504 — o FENCE. Token vigente E lease viva: ver o comentário de
+          // `transitionTurn`. `now()` é o relógio do PostgreSQL, o único
+          // comparável entre réplicas.
+          ...(args.expected_claim_token !== undefined
+            ? [
+                eq(agent_turns.claim_token, args.expected_claim_token),
+                sql`${agent_turns.lease_expires_at} > now()`,
+              ]
+            : []),
         ),
       )
       .returning();
@@ -953,7 +1299,15 @@ async function runTransition(args: {
         transition: transitionLabel('any', args.to),
       });
       const current = await tx
-        .select({ status: agent_turns.status, state_version: agent_turns.state_version })
+        .select({
+          status: agent_turns.status,
+          state_version: agent_turns.state_version,
+          claim_token: agent_turns.claim_token,
+          // Avaliado NO BANCO: comparar `lease_expires_at` com o relógio do
+          // processo aqui reintroduziria justamente o clock skew que o fence
+          // existe para eliminar.
+          lease_live: sql<boolean>`(${agent_turns.lease_expires_at} > now())`,
+        })
         .from(agent_turns)
         .where(
           and(
@@ -965,6 +1319,23 @@ async function runTransition(args: {
         .limit(1);
       const row = current[0];
       if (!row) return { ok: false as const, conflict: 'not_found' as const, to: args.to };
+      // Classificação do conflito. A ordem importa: quando havia fence e ele
+      // não bate, a causa é a PERDA DE POSSE — mesmo que o status também tenha
+      // andado. Reportar `state_mismatch` aqui faria o caller reler e tentar de
+      // novo, que é a reação exatamente errada para um zumbi.
+      const fenceBroken =
+        args.expected_claim_token !== undefined &&
+        (row.claim_token !== args.expected_claim_token || row.lease_live !== true);
+      if (fenceBroken) {
+        incCounter('maia_turn_fence_rejected_total', { operation: `to_${args.to}` });
+        return {
+          ok: false as const,
+          conflict: 'stale_claim' as const,
+          to: args.to,
+          current_status: row.status as TurnStatus,
+          current_state_version: Number(row.state_version),
+        };
+      }
       return {
         ok: false as const,
         conflict: 'state_mismatch' as const,
