@@ -79,6 +79,13 @@ terminal **sempre** carrega outcome.
 deriva o estado terminal. É assim que "nenhum turno é concluído simplesmente
 porque uma função retornou" fica garantido.
 
+**`pending_race_lost`** (migration 115, follow-up da #545) é o outcome de
+`ignored` mais recente e o único que nasce de uma corrida: a mensagem foi
+classificada como resposta a uma pergunta pendente e perdeu para outra resposta
+que resolveu a mesma pendência. `completed` seria mentira — quem despachou a
+ação foi o OUTRO turno; este não executou nada e é descartado por regra
+explícita. Ver [`agent.md`](agent.md) § Pending gate.
+
 **Rollout** — duas flags, registradas em `ENV_CONTRACT`
 ([`src/config/contract.ts`](../../../src/config/contract.ts)) e documentadas em
 [`docs/configuration.md`](../../configuration.md) (arquivo **gerado**; edite o
