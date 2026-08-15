@@ -1,6 +1,6 @@
 /**
- * `compose.prod.yml` — o ambiente EFETIVO dos três serviços, executado contra
- * o loader de cada um (issue #516, achado da review da PR #569).
+ * `compose.prod.yml` — a propriedade que a PR #569 corrige: **`MAIA_ENV` chega
+ * aos TRÊS serviços, de uma fonte só** (issue #516).
  *
  * ─────────────────────────────────────────────────────────────────────────
  * O defeito que isto fecha
@@ -21,14 +21,35 @@
  * valor, ou nenhum.
  *
  * ─────────────────────────────────────────────────────────────────────────
- * Por que "ambiente efetivo" e não "o que está no `environment:`"
+ * O que este arquivo NÃO afirma — e por que isso está escrito aqui
  * ─────────────────────────────────────────────────────────────────────────
- * O que um container recebe é `env_file` + `environment:`, e o defeito vivia
- * exatamente na diferença entre os dois: o `environment:` do `migrate` estava
- * certo, e o do `app` estava incompleto porque alguém supôs que o `.env.app`
- * cobria. Então aqui os dois lados são LIDOS DO REPOSITÓRIO — o bloco
- * `environment:` do compose real e o `.prod.example` que o runbook manda
- * copiar — e o resultado é entregue ao loader de produção do serviço.
+ * A revisão da PR #569 (rodada 2) pegou uma versão anterior deste spec que
+ * tinha um caso chamado "o ambiente efetivo … satisfaz o loader". Ele passava
+ * porque `effectiveEnv()` fazia, por default, um `Object.assign` com dez
+ * variáveis (`BACKUP_*`, `OIDC_*`) que **não existem** no Compose, nem nos
+ * `.prod.example`, nem no procedimento de bring-up. Ou seja: o verde afirmava
+ * uma coisa ("o ambiente do runbook sobe") e provava outra ("o ambiente do
+ * runbook MAIS dez variáveis inventadas aqui sobe"). Um operador que seguisse
+ * o runbook à risca continuaria batendo em falha de boot — só que agora com um
+ * teste verde dizendo que não bateria.
+ *
+ * A injeção silenciosa foi REMOVIDA. Este arquivo agora afirma exatamente
+ * duas coisas, e nada além delas:
+ *
+ *  1. **A propriedade da PR** — `MAIA_ENV` é a mesma nos três serviços, vem de
+ *     fonte única (`.env.infra`), aborta o `up` inteiro quando ausente, e
+ *     propaga `staging`. Executável contra o loader real: tirá-la do ambiente
+ *     efetivo acrescenta `MAIA_ENV` — e só ela — às reprovas.
+ *
+ *  2. **O gap que a PR NÃO fecha**, com nome e sobrenome: o ambiente que o
+ *     runbook produz **NÃO** satisfaz o loader de `app` nem o de `admin-ui`.
+ *     `FALTA_NOS_EXEMPLOS` lista as chaves, e os casos abaixo a prendem pelos
+ *     DOIS lados (suficiência e minimalidade) — de modo que fechar o gap sem
+ *     atualizar esta lista deixa o arquivo VERMELHO e obriga a revisitar.
+ *
+ * Alinhar contrato + exemplos + preflight (`config:check` dos dois
+ * consumidores) é a issue #572; é decisão de produto (produção realmente
+ * obriga backup off-site cifrado e SSO?), não de wiring, e não cabe nesta PR.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * A armadilha do espelho, e como ela é evitada
@@ -36,7 +57,9 @@
  * Nada aqui monta YAML nem escreve um `.env`. O compose vem do parser subset
  * estrito (`_compose-yaml.ts`), que recusa qualquer linha que não entenda; os
  * env files vêm do disco; o nome do arquivo de exemplo é DERIVADO do `env_file`
- * declarado no próprio compose. A única coisa escrita aqui é `OPERATOR_FILLS`
+ * declarado no próprio compose; e os valores usados para MEDIR o gap são as
+ * fixtures que o **contrato** publica (`findSpec().fixture`), não valores
+ * escritos à mão neste arquivo. A única coisa escrita aqui é `OPERATOR_FILLS`
  * — os valores que o exemplo deixa em branco de propósito para o operador
  * preencher — e até esse conjunto é conferido contra o arquivo: preencher uma
  * chave que o exemplo já traz preenchida, ou deixar de preencher uma que ele
@@ -47,6 +70,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { asMap, asString, interpolate, parseComposeFile, type ComposeNode } from './_compose-yaml.js';
 import { loadServiceConfig, ConfigValidationError } from '@/config/load.js';
+import { findSpec } from '@/config/contract.js';
 import type { MaiaService } from '@/config/metadata.js';
 
 const REPO_ROOT = resolve(__dirname, '../../..');
@@ -101,36 +125,57 @@ const OPERATOR_FILLS: Readonly<Record<string, string>> = {
 };
 
 /**
- * GAP CONHECIDO, e deliberadamente NÃO corrigido aqui.
+ * GAP CONHECIDO — o que o operador precisa acrescentar À MÃO depois de seguir
+ * `docs/runbooks/deploy-prod.md` §1 ao pé da letra. Deliberadamente NÃO
+ * corrigido nesta PR (issue #572).
  *
- * O profile `production` exige estas variáveis, e os `.prod.example` não as
- * trazem — as de backup não aparecem em `.env.app.prod.example` de forma
- * alguma, e as de OIDC estão em `.env.admin.prod.example` apenas COMENTADAS,
- * sob o texto "Configure as quatro (ou nenhuma)", que contradiz o
- * `requiredIn: ['production']` do contrato.
+ * Os dois lados do gap não têm a mesma forma, e o runbook diz isso:
  *
- * Ou seja: o achado da review ("seguindo o runbook à risca, app/admin-ui
- * reprovam no boot") é MAIOR do que o `MAIA_ENV` que ele nomeia. Fechar o
- * resto significa decidir se produção realmente obriga backup off-site
- * cifrado e SSO — decisão de produto, não de wiring, e ela é do dono. O que
- * esta correção faz é parar de esconder o gap: o caso
- * "gap conhecido…" abaixo o prende com nome e sobrenome, lido do loader REAL,
- * e fica vermelho no dia em que os exemplos melhorarem — obrigando quem
- * melhorar a encolher esta lista de propósito, em vez de deixá-la mentindo.
+ *  - `app`: as `BACKUP_*` **não aparecem de forma nenhuma** em
+ *    `.env.app.prod.example` — não há linha comentada para descomentar.
+ *  - `admin-ui`: as quatro `OIDC_*` **existem** em `.env.admin.prod.example`,
+ *    porém COMENTADAS, sob o texto "Configure as quatro (ou nenhuma)", que
+ *    contradiz o `requiredIn: ['staging','production']` do contrato.
+ *
+ * A lista é MAIOR que as chaves com `requiredIn`, porque o contrato encadeia:
+ * `BACKUP_S3_BUCKET` presente passa a exigir `BACKUP_S3_ACCESS_KEY` e
+ * `BACKUP_S3_SECRET_KEY` (`requiredWhen: { var: 'BACKUP_S3_BUCKET', present:
+ * true }`), e `BACKUP_ENCRYPTION_MODE` não pode ficar em `none` no profile
+ * production (`backup/production-encryption`), o que exige
+ * `BACKUP_ENCRYPTION_KEYRING` e `BACKUP_ENCRYPTION_ACTIVE_KEY_ID`
+ * (`backup/encryption-key`). Uma lista com só as duas `requiredIn` contaria
+ * MENOS do que o operador encontra.
+ *
+ * Prendida pelos dois lados abaixo: "suficiência" reprova se o gap CRESCER,
+ * "minimalidade" reprova se ele ENCOLHER. Fechar o gap sem editar esta lista
+ * deixa o arquivo vermelho de propósito.
  */
-const FORA_DOS_EXEMPLOS: Readonly<Record<string, string>> = {
-  BACKUP_S3_BUCKET: 'maia-backups-prod',
-  BACKUP_S3_ACCESS_KEY: 'f4keaccesskey0000000',
-  BACKUP_S3_SECRET_KEY: 'f4kesecretkey00000000000000000000000000',
-  BACKUP_ENCRYPTION_MODE: 'envelope_aes256_gcm',
-  // Sem base64: o contrato aqui é `z.string()` sem restrição, então a forma de
-  // material criptográfico era gratuita — e é ela que o `generic-api-key` vê.
-  BACKUP_ENCRYPTION_KEYRING: '{"k1":"nao-e-chave-de-verdade-fixture"}',
-  BACKUP_ENCRYPTION_ACTIVE_KEY_ID: 'k1',
-  OIDC_ISSUER: 'https://login.example.com/realms/maia',
-  OIDC_CLIENT_ID: 'maia-admin',
-  OIDC_CLIENT_SECRET: 'f4ke-oidc-client-secret-0000000000000000',
-  OIDC_TENANT_SLUGS: 'primary',
+const FALTA_NOS_EXEMPLOS: Readonly<Record<string, readonly string[]>> = {
+  // O migrator não tem env_file: tudo que ele recebe está no compose, e o
+  // subset `migrator` do contrato é satisfeito por ele. Este `[]` é o gate
+  // que ESTA PR entrega — e é só ele.
+  migrate: [],
+  app: [
+    'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
+    'BACKUP_ENCRYPTION_KEYRING',
+    'BACKUP_ENCRYPTION_MODE',
+    'BACKUP_S3_ACCESS_KEY',
+    'BACKUP_S3_BUCKET',
+    'BACKUP_S3_SECRET_KEY',
+  ],
+  'admin-ui': ['OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_ISSUER', 'OIDC_TENANT_SLUGS'],
+};
+
+/**
+ * O que o loader ACUSA hoje, no primeiro boot, para cada serviço — o subconjunto
+ * de `FALTA_NOS_EXEMPLOS` que aparece na PRIMEIRA rodada. É menor que o gap
+ * inteiro justamente por causa do encadeamento descrito acima: o operador
+ * conserta estas, roda de novo, e o contrato pede as próximas.
+ */
+const PRIMEIRA_RODADA: Readonly<Record<string, readonly string[]>> = {
+  migrate: [],
+  app: ['BACKUP_ENCRYPTION_MODE', 'BACKUP_S3_BUCKET'],
+  'admin-ui': ['OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_ISSUER', 'OIDC_TENANT_SLUGS'],
 };
 
 /** `true` quando o exemplo deixa a chave para o operador preencher. */
@@ -185,17 +230,18 @@ function environmentOf(
 }
 
 /**
- * O que o container REALMENTE recebe: `env_file` primeiro, `environment:`
- * por cima (é essa a precedência do Compose), mais os valores que o operador
- * preenche.
+ * O que o container REALMENTE recebe seguindo o runbook: `env_file` primeiro,
+ * `environment:` por cima (é essa a precedência do Compose), mais os valores
+ * que o exemplo manda o operador preencher. **E nada além disso** — não há
+ * completamento silencioso aqui; `add` é sempre explícito no ponto da chamada.
  */
 function effectiveEnv(
   composeName: string,
   opts: {
     readonly infra?: Readonly<Record<string, string>>;
     readonly drop?: readonly string[];
-    /** `false` = exatamente o que os exemplos trazem, sem tapar o gap conhecido. */
-    readonly fillGap?: boolean;
+    /** Chaves acrescentadas À MÃO pelo operador, com a fixture do contrato. */
+    readonly add?: readonly string[];
   } = {},
 ): Record<string, string> {
   const env: Record<string, string> = { TZ: 'America/Sao_Paulo' };
@@ -204,18 +250,44 @@ function effectiveEnv(
       env[key] = needsOperator(value) ? (OPERATOR_FILLS[key] ?? value) : value;
     }
   }
-  if (opts.fillGap !== false && exampleFilesOf(composeName).length > 0) {
-    Object.assign(env, FORA_DOS_EXEMPLOS);
-  }
   Object.assign(env, environmentOf(composeName, opts.infra ?? INFRA));
+  for (const key of opts.add ?? []) env[key] = fixtureDoContrato(key);
   for (const key of opts.drop ?? []) delete env[key];
   return env;
 }
 
-/** Variáveis que o loader do serviço reprova, para um dado ambiente efetivo. */
-function reprovadas(contract: MaiaService, env: Record<string, string>): string[] {
+/**
+ * O valor de production que o PRÓPRIO contrato publica para uma chave
+ * (`src/config/generated/fixtures/production.env` sai daqui). Usar isto em vez
+ * de escrever valores neste arquivo tem duas consequências que importam:
+ * nenhum material sintético novo entra no repositório (o guard
+ * `secret/synthetic-fixture` e o gitleaks continuam valendo sobre valores que
+ * já existiam), e a medição do gap não pode divergir do contrato.
+ */
+function fixtureDoContrato(name: string): string {
+  const spec = findSpec(name);
+  if (spec === undefined) throw new Error(`${name}: não existe no contrato`);
+  const value = spec.fixtureByProfile?.production ?? spec.fixture;
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(`${name}: o contrato não publica fixture utilizável em production`);
+  }
+  return value;
+}
+
+/**
+ * Variáveis que o loader do serviço reprova, para um dado ambiente efetivo.
+ *
+ * `allowSyntheticFixtures` só é ligado quando o ambiente foi montado com
+ * `add:` — aí os valores SÃO as fixtures do contrato, e o que se está medindo
+ * é "que chaves faltam", não "que credencial é real".
+ */
+function reprovadas(
+  contract: MaiaService,
+  env: Record<string, string>,
+  allowSyntheticFixtures = false,
+): string[] {
   try {
-    loadServiceConfig(contract, { env });
+    loadServiceConfig(contract, { env, allowSyntheticFixtures });
     return [];
   } catch (err) {
     if (!(err instanceof ConfigValidationError)) throw err;
@@ -260,52 +332,32 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
   });
 
   it.each(SERVICES)(
-    'o ambiente efetivo de $compose satisfaz loadServiceConfig("$contract")',
+    'MAIA_ENV chega ao ambiente efetivo de $compose e o loader de $contract NÃO reclama dela',
     ({ compose, contract }) => {
-      // A metade EXECUTÁVEL da afirmação, e a que faltava: o spec anterior
-      // rodava o loader só para o `migrate`.
-      expect(() => loadServiceConfig(contract, { env: effectiveEnv(compose) })).not.toThrow();
+      // Este caso NÃO afirma que o ambiente sobe — ele afirma que, seja qual
+      // for o resto, MAIA_ENV não é mais um dos problemas. O que o ambiente
+      // ainda NÃO satisfaz está no bloco "gap conhecido" abaixo, nomeado.
+      expect(effectiveEnv(compose).MAIA_ENV).toBe(INFRA.MAIA_ENV);
+      expect(reprovadas(contract, effectiveEnv(compose))).not.toContain('MAIA_ENV');
     },
   );
 
   it.each(SERVICES)(
-    'sem MAIA_ENV no ambiente efetivo, o loader de $compose REPROVA',
+    'tirar MAIA_ENV do ambiente efetivo de $compose acrescenta MAIA_ENV — e SÓ ela — às reprovas',
     ({ compose, contract }) => {
       // Prova que a linha injetada é LOAD-BEARING, e não decoração: retirada do
-      // ambiente efetivo (mantendo NODE_ENV=production), o profile resolve para
-      // `production` e `requiredIn` reprova. Sem este caso, acrescentar a
-      // variável ao compose seria indistinguível de não acrescentar.
-      expect(
-        reprovadas(contract, effectiveEnv(compose, { drop: ['MAIA_ENV'] })),
-        `${compose}: o loader aceitou um ambiente efetivo sem MAIA_ENV`,
-      ).toEqual(['MAIA_ENV']);
+      // ambiente efetivo (mantendo NODE_ENV=production), o profile continua
+      // resolvendo para `production` e `requiredIn` reprova. Sem este caso,
+      // acrescentar a variável ao compose seria indistinguível de não
+      // acrescentar. A comparação é com o ambiente REAL (gap incluído), então
+      // ela continua exata quando o gap mudar.
+      const com = reprovadas(contract, effectiveEnv(compose));
+      const sem = reprovadas(contract, effectiveEnv(compose, { drop: ['MAIA_ENV'] }));
+      expect(sem, `${compose}: o loader aceitou um ambiente efetivo sem MAIA_ENV`).toEqual(
+        [...com, 'MAIA_ENV'].sort(),
+      );
     },
   );
-
-  it('gap conhecido: o que o profile production exige e os .prod.example não trazem', () => {
-    // Lido do loader REAL, não de uma lista escrita à mão. Ver o comentário de
-    // FORA_DOS_EXEMPLOS: este caso existe para o gap ter nome, e para encolher
-    // de propósito quando alguém corrigir os exemplos.
-    const gap = Object.fromEntries(
-      SERVICES.map(({ compose, contract }) => [
-        compose,
-        reprovadas(contract, effectiveEnv(compose, { fillGap: false })),
-      ]),
-    );
-    expect(gap).toEqual({
-      // O migrator não tem env_file: tudo que ele recebe está no compose.
-      migrate: [],
-      // Backup off-site cifrado é exigido em production e `.env.app.prod.example`
-      // não menciona nenhuma dessas variáveis. A lista é o PRIMEIRO nível de
-      // problemas: definir o bucket destrava a exigência das credenciais S3, e
-      // sair de `BACKUP_ENCRYPTION_MODE=none` destrava a do keyring — por isso
-      // `FORA_DOS_EXEMPLOS` tem mais chaves do que aparecem aqui.
-      app: ['BACKUP_ENCRYPTION_MODE', 'BACKUP_S3_BUCKET'],
-      // As quatro do OIDC estão no exemplo apenas COMENTADAS, sob "configure as
-      // quatro (ou nenhuma)" — o contrato diz que production exige as quatro.
-      'admin-ui': ['OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_ISSUER', 'OIDC_TENANT_SLUGS'],
-    });
-  });
 
   it.each(SERVICES)(
     'um .env.infra sem MAIA_ENV aborta a interpolação de $compose antes de qualquer container',
@@ -342,5 +394,70 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
       faltando: [...blanks].filter((k) => !(k in OPERATOR_FILLS)).sort(),
       sobrando: Object.keys(OPERATOR_FILLS).filter((k) => !blanks.has(k)).sort(),
     }).toEqual({ faltando: [], sobrando: [] });
+  });
+});
+
+describe('gap conhecido: o ambiente do runbook NÃO satisfaz o loader (issue #572)', () => {
+  it('o `up` do runbook reprova app e admin-ui já na PRIMEIRA rodada, e nestas chaves', () => {
+    // Lido do loader REAL sobre os artefatos REAIS, sem nenhum completamento.
+    // É o que o operador vê no primeiro `docker compose up -d` depois de
+    // seguir `docs/runbooks/deploy-prod.md` §1 ao pé da letra.
+    const primeira = Object.fromEntries(
+      SERVICES.map(({ compose, contract }) => [
+        compose,
+        reprovadas(contract, effectiveEnv(compose)),
+      ]),
+    );
+    expect(
+      primeira,
+      'Se isto mudou, o gap mudou: atualize PRIMEIRA_RODADA, FALTA_NOS_EXEMPLOS e a ' +
+        'seção §1 de docs/runbooks/deploy-prod.md JUNTOS — a issue #572 existe para isso.',
+    ).toEqual(PRIMEIRA_RODADA);
+  });
+
+  it.each(SERVICES)(
+    'suficiência: com FALTA_NOS_EXEMPLOS acrescentada à mão, o loader de $compose aceita',
+    ({ compose, contract }) => {
+      // Vermelho quando o gap CRESCER (contrato passa a exigir mais uma chave
+      // que os exemplos não trazem) — aí a lista está contando menos do que o
+      // operador encontra, que é exatamente o defeito da rodada 2.
+      const add = FALTA_NOS_EXEMPLOS[compose]!;
+      expect(reprovadas(contract, effectiveEnv(compose, { add }), true)).toEqual([]);
+    },
+  );
+
+  it.each(SERVICES)(
+    'minimalidade: tirar QUALQUER uma das chaves de $compose volta a reprovar',
+    ({ compose, contract }) => {
+      // Vermelho quando o gap ENCOLHER (alguém acrescenta a chave ao
+      // `.prod.example` e ela deixa de ser necessária à mão) — obrigando a
+      // encolher esta lista DE PROPÓSITO, em vez de deixá-la mentindo.
+      const todas = FALTA_NOS_EXEMPLOS[compose]!;
+      const aindaNecessaria = todas.filter(
+        (k) =>
+          reprovadas(contract, effectiveEnv(compose, { add: todas.filter((o) => o !== k) }), true)
+            .length > 0,
+      );
+      expect(
+        aindaNecessaria,
+        `${compose}: alguma chave de FALTA_NOS_EXEMPLOS já não é necessária — os exemplos ` +
+          'melhoraram (ou o contrato afrouxou) e a lista ficou para trás.',
+      ).toEqual([...todas]);
+    },
+  );
+
+  it('nenhuma chave do gap está DECLARADA nos .prod.example — nem preenchida, nem em branco', () => {
+    // O outro lado da mesma verdade, dito sobre o ARQUIVO e não sobre o
+    // loader: `parseEnvFile` ignora comentários, então as quatro `OIDC_*` que
+    // existem comentadas em `.env.admin.prod.example` contam como ausentes —
+    // que é o que elas são para um container.
+    const declaradas = SERVICES.flatMap(({ compose }) =>
+      exampleFilesOf(compose).flatMap((file) =>
+        Object.keys(parseEnvFile(file))
+          .filter((k) => FALTA_NOS_EXEMPLOS[compose]!.includes(k))
+          .map((k) => `${compose}: ${k}`),
+      ),
+    ).sort();
+    expect(declaradas).toEqual([]);
   });
 });
