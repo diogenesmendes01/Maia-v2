@@ -48,6 +48,7 @@ interface Registro {
   readonly duracao: number;
   readonly tentativas: number;
   readonly estado: string;
+  readonly flaky: boolean;
   readonly erros: readonly string[];
 }
 
@@ -109,6 +110,7 @@ export default class DiagnosticoReporter implements Reporter {
       // `retryCount` é o número de RE-tentativas; tentativas = 1 + retries.
       tentativas: (diag?.retryCount ?? 0) + 1,
       estado: resultado.state,
+      flaky: diag?.flaky ?? false,
       erros,
     };
   }
@@ -154,6 +156,25 @@ export default class DiagnosticoReporter implements Reporter {
       }
     }
 
+    // ── recuperados pelo retry ───────────────────────────────────────────
+    // O comentário que justificava `retry: 1` afirmava que "uma falha de
+    // verdade aparece na segunda tentativa também". Essa afirmação só é
+    // verificável se a lista de testes que passaram SÓ na segunda tentativa
+    // estiver visível. Sem ela, o retry é um silenciador: a rodada fica verde
+    // e ninguém sabe que houve vermelho. Esta seção é essa lista.
+    const recuperados = registros.filter((r) => r.flaky);
+    out.push('');
+    if (recuperados.length === 0) {
+      out.push('recuperados pela segunda tentativa (retry): nenhum.');
+    } else {
+      out.push(`RECUPERADOS PELA SEGUNDA TENTATIVA (retry): ${recuperados.length}`);
+      out.push('  Estes NÃO são verdes. São vermelhos que o `retry` absorveu.');
+      for (const r of recuperados) {
+        out.push(`  · ${r.arquivo} > ${r.nome}`);
+        r.erros.forEach((e, i) => out.push(`      [tentativa ${i + 1}] ${e}`));
+      }
+    }
+
     // ── mais lentos ──────────────────────────────────────────────────────
     const lentos = [...registros]
       .filter((r) => r.duracao >= LIMIAR_LENTO_MS)
@@ -170,13 +191,22 @@ export default class DiagnosticoReporter implements Reporter {
     }
 
     // ── falhas ───────────────────────────────────────────────────────────
+    // Um arquivo que teve prazo estourado tem corpo órfão rodando. Qualquer
+    // OUTRA falha do mesmo arquivo é suspeita de ser consequência disso, e o
+    // relatório precisa dizer isso no lugar onde a pessoa lê a falha — não só
+    // numa seção acima que ela pode não relacionar.
+    const arquivosComEstouro = new Set(estouros.map((r) => r.arquivo));
     out.push('');
     if (falhos.length === 0) {
       out.push('falhas: nenhuma.');
     } else {
       out.push(`FALHAS: ${falhos.length}`);
       for (const r of falhos.slice(0, TOPO_FALHAS)) {
-        out.push(`  · ${r.arquivo} > ${r.nome}`);
+        const suspeita =
+          arquivosComEstouro.has(r.arquivo) && !r.erros.some((e) => RE_TIMEOUT.test(e))
+            ? '   ⚠ suspeita de CONSEQUÊNCIA: houve prazo estourado neste arquivo'
+            : '';
+        out.push(`  · ${r.arquivo} > ${r.nome}${suspeita}`);
         r.erros.forEach((e, i) => out.push(`      [tentativa ${i + 1}] ${e}`));
       }
       if (falhos.length > TOPO_FALHAS) {

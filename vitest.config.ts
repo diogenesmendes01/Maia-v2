@@ -83,11 +83,38 @@ export default defineConfig({
     // mesmo quando o `retry` absorveu o estouro e a rodada ficou verde, e
     // lista os mais lentos (o controle compensatório do prazo de 20s).
     reporters: ['default', resolve(__dirname, 'tests/reporters/diagnostico-reporter.ts')],
-    // A handful of integration specs share process-wide singletons (Decision
-    // Engine module-level caches, the Baileys presence handle, etc.) and
-    // flake when they run after a polluting test file in the same worker.
-    // Retrying once absorbs the flake without hiding a real regression — a
-    // true failure surfaces on the second attempt too.
+    // ───────────────────────────────────────────────────────────────────────
+    // `retry: 1` — FICA, e agora é auditável. Ver #545.
+    // ───────────────────────────────────────────────────────────────────────
+    // A justificativa original: "algumas specs de integração compartilham
+    // singletons de processo e flocam quando rodam depois de um arquivo
+    // poluidor no mesmo worker; retentar uma vez absorve o flake sem esconder
+    // regressão de verdade — uma falha real aparece na segunda tentativa
+    // também."
+    //
+    // Metade disso era circular: com `testTimeout` de 5000ms, TODO estouro de
+    // prazo virava uma segunda falha com mensagem diferente, porque o timeout
+    // do vitest NÃO aborta o corpo async — a tentativa estourada continua
+    // rodando e disputa mocks, linhas no banco e estado de módulo com o retry.
+    // Medido: em 4 arquivos numa mesma rodada, a tentativa 1 dizia
+    // `Test timed out in 5000ms` e a tentativa 2 dizia
+    // `expected "vi.fn()" to be called 1 times, but got 2 times`. Essa metade
+    // morreu com o orçamento acima.
+    //
+    // A outra metade é REAL, e por isso o retry fica: medido em 5 rodadas
+    // completas com `--retry=0` e o orçamento novo,
+    // `tests/integration/lifecycle-drain-queue.spec.ts` reprova em TODAS
+    // (`expected 12 to be +0` — jobs `failed` residuais na fila BullMQ
+    // compartilhada) e `llm-circuit-audit-real-db.spec.ts` em 2 de 5. Tirar o
+    // retry hoje trocaria flake por vermelho constante, que é o oposto do
+    // objetivo.
+    //
+    // O que MUDA é que ele deixa de ser um silenciador: o reporter de
+    // diagnóstico imprime a seção RECUPERADOS PELA SEGUNDA TENTATIVA com os
+    // erros de cada tentativa. A afirmação "uma falha real aparece na segunda
+    // tentativa também" passa a ser verificável a cada rodada em vez de ser um
+    // comentário. Enquanto essa lista não estiver vazia, o retry é dívida
+    // registrada, não solução.
     retry: 1,
     coverage: {
       provider: 'v8',
