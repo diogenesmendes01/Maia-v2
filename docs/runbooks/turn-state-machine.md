@@ -168,10 +168,18 @@ SELECT tenant_id, agent_id, count(*)
 | `maia_turn_claim_total{result="not_eligible"}` alto | Muitos workers acordando para o mesmo turno. **Normal** se acompanha rearme; suspeito se cresce sozinho. | Confira se o `jobId` determinístico está sendo aplicado (log `queue.turn_job_retained_cleared`, job ids `turn-*`). |
 | `maia_turn_lease_lost_total{reason="heartbeat_failed"}` | O banco não respondeu duas batidas seguidas. | É saúde do PostgreSQL, não do turno. O turno volta ao pool sozinho. |
 | `maia_turn_lease_lost_total{reason="token_mismatch"}` | Alguém tomou o turno. | Se recorrente, o TTL está **curto demais** para a duração real do turno — takeover falso. Aumente `TURN_LEASE_TTL_MS`. |
-| `maia_turn_fence_rejected_total` | Um worker tentou gravar sem posse e foi recusado. | O fence trabalhou. Investigue POR QUE ele perdeu a posse (audit `turn_lease_lost` do mesmo `turn_id`). |
+| `maia_turn_fence_rejected_total` | Um worker tentou gravar sem posse e foi recusado. **Uma escrita recusada = um incremento**, qualquer que seja o `operation`; o counter é emitido só pela camada de runtime (`reportFenceRejection`). Se o número parecer o dobro do esperado, alguém devolveu o incremento ao repositório. | O fence trabalhou. Investigue POR QUE ele perdeu a posse (audit `turn_lease_lost` do mesmo `turn_id`). |
+| `maia_turn_effect_blocked_total{boundary}` | A posse acabou NO MEIO da execução e um limite de efeito foi cancelado antes de agir: `tool_dispatch`, `outbound_send` ou `react_iteration`. | Sozinho não é incidente — é o cancelamento local funcionando, e sempre vem depois de um `turn_lease_lost` do mesmo turno. Crescimento sustentado significa takeover falso: veja o TTL. |
 
 Auditoria: `turn_lease_lost` e `turn_fence_rejected` carregam `turn_id`,
 `worker_id`, `attempt` e o motivo — nunca conteúdo de conversa.
+
+Um `turn_fence_rejected` pode nascer **sem ida ao banco**: quando a tentativa já
+sabe que a lease morreu (heartbeat perdido, `release()`), a gravação é recusada
+em memória — `turn.write_refused_lease_not_alive` no log, com o mesmo counter e
+a mesma auditoria. É deliberado: para quem investiga "por que este turno não
+concluiu", o fato é o mesmo, e a diferença entre o predicado SQL e o guard local
+não muda a ação.
 
 ### 6.3 Turno preso com dono vivo
 

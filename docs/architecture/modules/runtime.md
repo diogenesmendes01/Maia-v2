@@ -62,7 +62,8 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
 | `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. |
 | `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
-| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. |
+| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
+| `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
 | `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
 | `index.ts` | Superfície pública — importe daqui. |
 
@@ -112,6 +113,28 @@ passar o zumbi enquanto o sucessor renova. Zero linhas com fence declarado é
 é oposta (parar, não reler e reinsistir). Ele cancela o `AbortSignal` da lease,
 emite `maia_turn_fence_rejected_total` e audita `turn_fence_rejected`.
 
+**As TRÊS posses.** `resolveFence()` (`lifecycle.ts`) classifica o handle em
+`unfenced` (não há lease: `FEATURE_TURN_CLAIM` OFF, regime de #503),
+`fenced` (lease viva → token no `WHERE`) e `lost` (a lease EXISTIU e morreu:
+`markLost()` por heartbeat, ou `release()` no shutdown). Colapsar `lost` em
+`unfenced` — que é o que acontece quando se lê `lease.token` e se traduz `null`
+para "sem fence" — transforma o fail-closed em fail-open: sem
+`expected_claim_token` sobra apenas o CAS por `state_version`, e ele CASA
+sempre que ninguém tomou o turno ainda. Quem recebe `lost` não grava: recusa
+localmente, com a mesma métrica, log e auditoria de uma rejeição vinda do banco.
+
+**Cancelamento local e limites de efeito.** O fence protege `agent_turns`; ele
+não desfaz um boleto emitido nem despacha de volta uma mensagem entregue. Por
+isso o `AbortSignal` da lease é propagado como contexto AMBIENTE
+(`execution-context.ts`): `src/agent/core.ts` abre
+`runWithTurnExecution(lease.context(), …)` logo depois da barreira do claim, e
+cada limite de efeito pergunta pela posse antes de agir —
+`src/tools/_dispatcher.ts` (recusa com `turn_ownership_lost`),
+`src/agent/output-dispatch.ts` (`OutboundDeliveryError(delivered:false)`),
+`src/agent/react-loop.ts` (no topo de cada iteração, para não pagar mais um
+round-trip de LLM) e a projeção legada `mensagens.processada_em` no próprio
+core. Fora de um turno reivindicado todo guard é no-op.
+
 **`jobId` determinístico.** `agentTurnJobId(turn_id)` = `turn-<uuid>`. "Mesmo
 trabalho lógico" é o TURNO, não a mensagem nem o evento de enfileiramento: o
 debounce agrega N mensagens numa execução, e ingresso e recovery (que podem
@@ -126,7 +149,8 @@ intocado (é ele quem faz a deduplicação).
 | `maia_turn_claim_latency_ms` | `result` |
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
-| `maia_turn_fence_rejected_total` | `operation` |
+| `maia_turn_fence_rejected_total` | `operation` — incrementado **só** em `reportFenceRejection` (`lease.ts`). O repositório classifica `stale_claim` e NÃO conta: com as duas camadas contando, um CAS recusado valia 2 num `sum()`, e a recusa local (que nunca chega ao SQL) ficava invisível. |
+| `maia_turn_effect_blocked_total` | `boundary` = `tool_dispatch` / `outbound_send` / `react_iteration` |
 | `maia_turn_job_retained_cleared_total` | `state` = `completed` / `failed` |
 
 Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
@@ -258,8 +282,9 @@ Rules this module enforces:
 | `tests/integration/agent-turns-leak.spec.ts` | Leak cross-tenant do `agentTurnsRepo`, incluindo claim/heartbeat/liberação (parte de `npm run test:leak`) |
 | `tests/unit/turn-claim-contract.spec.ts` | Estabilidade do `jobId`, payload V1/V2, aritmética do lease, identidade do worker |
 | `tests/integration/turn-claim-real-db.spec.ts` | Corrida de 2/10/50 callers, takeover por lease vencida, fencing do zumbi, elegibilidade por estado, isolamento |
-| `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`) |
-| `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona |
+| `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`); lease marcada como perdida e lease liberada **sem takeover** não alteram a linha; uma escrita recusada = UM incremento da métrica de fence |
+| `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona. Cobre também a posse perdida NO MEIO do turno (o core não carimba `processada_em`), que é o que pinga o `runWithTurnExecution` do core |
+| `tests/integration/turn-lease-lost-effects-real-db.spec.ts` | Perda de lease DURANTE a execução, pelo caminho real (takeover + heartbeat): nenhuma linha em `agent_facts` (tool) nem em `outbound_messages` (outbound), com caso de controle exigindo as duas presentes |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 
 ## In-flight changes
