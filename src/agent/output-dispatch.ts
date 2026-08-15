@@ -17,6 +17,7 @@ import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
+import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -665,6 +666,29 @@ export async function sendOutbound(
     channel_id?: string | null;
   },
 ): Promise<string | null> {
+  // Issue #504 §Fencing — LIMITE DE EFEITO. O outbound é o efeito MENOS
+  // reversível do turno: uma mensagem entregue no WhatsApp não volta.
+  //
+  // Se a posse acabou no meio da execução (heartbeat morto, takeover depois do
+  // vencimento da lease), quem responde ao usuário é o sucessor. Sem este
+  // guard, o worker antigo terminava o ReAct e mandava a resposta assim mesmo:
+  // o usuário recebia DUAS respostas para uma mensagem, e a segunda vinha de
+  // uma tentativa que o banco já tinha desautorizado.
+  //
+  // `OutboundDeliveryError(delivered: false)` é o vocabulário desta fronteira e
+  // é a classificação HONESTA: nada foi enviado, então é pre-send. Os callers
+  // já distinguem `delivered` para decidir entre retry e conclusão ambígua, e
+  // com posse perdida nenhum dos dois nos pertence — a transição final é
+  // recusada pelo fence logo em seguida.
+  //
+  // ANTES do ledger de #227 de propósito: reservar a chave do turno aqui
+  // marcaria como 'pending' um envio que não vamos fazer, e isso bloquearia o
+  // envio de quem TEM a posse.
+  if (turnOwnershipLost()) {
+    reportBlockedEffect('outbound_send');
+    throw new OutboundDeliveryError(false, 'turn_ownership_lost');
+  }
+
   // #227: claim the turn in the ledger BEFORE any work. If a prior attempt
   // already marked this turn 'sent' / 'unknown' / 'pending' (in-flight),
   // short-circuit (the user got — or might have got — that reply; do NOT

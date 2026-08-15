@@ -57,6 +57,7 @@ export const DISPATCHER_ERROR_CODES = [
   'idempotency_owner_failed',
   'idempotency_wait_timeout',
   'idempotency_completion_fenced',
+  'turn_ownership_lost',
   'execution_failed',
 ] as const;
 
@@ -99,6 +100,15 @@ export const TOOL_REFUSAL_CODES: readonly ToolErrorCode[] = Object.freeze([
   'requires_confirmation',
   'requires_dual_approval',
   'mcp_tool_not_executable',
+  // #504 — a tentativa perdeu a posse do turno (lease morta ou takeover) e o
+  // dispatcher recusou ANTES de executar. É REFUSAL, não FAILURE: nada rodou,
+  // nenhum estado ficou pela metade, e a recusa é a feature — é o cancelamento
+  // local que a issue exige. A anomalia em si já paga o seu alerta em
+  // `maia_turn_lease_lost_total{reason}` (com `ops_alert`) e em
+  // `maia_turn_effect_blocked_total{boundary}`; contá-la TAMBÉM no numerador de
+  // `MaiaToolErrorRateHigh` faria um evento paginar duas vezes e tornaria o
+  // error rate de tools ilegível durante um takeover legítimo.
+  'turn_ownership_lost',
 ]);
 
 /**

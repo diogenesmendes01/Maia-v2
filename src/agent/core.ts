@@ -60,6 +60,10 @@ import {
   deadLetterTurn,
   isTerminalTurnStatus,
   turnStateAuthoritative,
+  runWithTurnExecution,
+  turnOwnershipLost,
+  TurnOwnershipLostError,
+  type TurnHandle,
 } from '@/runtime/turns/index.js';
 import {
   runWithTenantContext,
@@ -556,6 +560,64 @@ async function runAgentForMensagemInner(
     );
     return;
   }
+  // #504 §Fencing — a partir daqui existe uma TENTATIVA AUTORIZADA, e todo o
+  // resto do turno roda DENTRO do contexto de execução dela.
+  //
+  // Sem isto o claim era um portão que se consultava uma vez: depois da
+  // barreira, nada no pipeline sabia que a posse podia acabar no meio. O
+  // `AbortSignal` da `TurnLease` disparava e não havia ouvinte — o worker
+  // seguia chamando LLM e executando tools em nome de uma posse encerrada, e a
+  // recusa só aparecia na transição final, tarde demais para o efeito.
+  //
+  // O escopo abre AQUI e não antes: antes da barreira não há posse a propagar.
+  // Com `FEATURE_TURN_CLAIM` OFF (ou sem turno) não há lease, `execCtx` é null,
+  // nenhum escopo é aberto e cada guard a jusante é no-op — o comportamento de
+  // #503 fica idêntico.
+  const execCtx = turn?.lease?.context() ?? null;
+  if (!execCtx) return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+  return runWithTurnExecution(execCtx, () =>
+    runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+  );
+}
+
+/**
+ * O TURNO propriamente dito — tudo que acontece depois de a posse estar
+ * garantida (identidade, debounce, gates, ReAct, conclusão, projeção).
+ *
+ * Separado de `runAgentForMensagemInner` por uma razão só: o corpo precisa
+ * rodar DENTRO de `runWithTurnExecution`, e um escopo de ALS exige uma função
+ * para embrulhar. Nenhuma linha abaixo mudou de lugar dentro do corpo.
+ */
+async function runAgentTurnPipeline(params: {
+  mensagem_id: string;
+  channel_id: string | null;
+  inbound: Mensagem;
+  turn: TurnHandle | null;
+}): Promise<void> {
+  const { mensagem_id, channel_id, inbound, turn } = params;
+
+  /**
+   * Issue #504 §Fencing — a PROJEÇÃO LEGADA também é um limite de efeito.
+   *
+   * `mensagens.processada_em` é o campo que o early-return legado de
+   * `runAgentForMensagemInner` consulta, e é o discriminador de
+   * `turn-claim-core-barrier-real-db.spec.ts`: um worker que o carimba faz o
+   * turno do dono legítimo parecer processado por fora, e o recovery deixa de
+   * rearmá-lo. O fence do banco não alcança esta tabela — ele protege
+   * `agent_turns` —, então o guard tem de ser aqui.
+   *
+   * Fora de um turno reivindicado é no-op e o comportamento é o de #503.
+   */
+  const stampProcessed = async (id: string, tokens: number | null): Promise<void> => {
+    if (turnOwnershipLost()) {
+      logger.warn(
+        { mensagem_id: id, turn_id: turn?.turn_id ?? null },
+        'agent.legacy_projection_skipped_ownership_lost',
+      );
+      return;
+    }
+    await mensagensRepo.markProcessed(id, tokens);
+  };
 
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
@@ -566,7 +628,7 @@ async function runAgentForMensagemInner(
       // reencontraria). Descarte EXPLÍCITO, com outcome.
       logger.warn({ mensagem_id }, 'agent.inbound_without_telefone');
       await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
-      await mensagensRepo.markProcessed(inbound.id, 0).catch((err) =>
+      await stampProcessed(inbound.id, 0).catch((err) =>
         logger.warn(
           { err: (err as Error).message, mensagem_id },
           'agent.mark_processed_failed',
@@ -582,7 +644,7 @@ async function runAgentForMensagemInner(
       // #503: descarte INTENCIONAL por regra explícita → `ignored`, com outcome
       // próprio (antes era indistinguível de "processado com sucesso").
       await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'blocked') {
@@ -591,7 +653,7 @@ async function runAgentForMensagemInner(
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
       });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'quarantined') {
@@ -600,7 +662,7 @@ async function runAgentForMensagemInner(
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
       });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     // Owner reply on a pending identity_confirmation? handled before the LLM
@@ -619,7 +681,7 @@ async function runAgentForMensagemInner(
           pessoa_id: resolved.pessoa.id,
           mensagem_id: inbound.id,
         });
-        await mensagensRepo.markProcessed(inbound.id, 0);
+        await stampProcessed(inbound.id, 0);
         return;
       }
     }
@@ -693,7 +755,7 @@ async function runAgentForMensagemInner(
     // the others — recovery worker will catch any stragglers.
     for (const id of allInboundIds) {
       try {
-        await mensagensRepo.markProcessed(id, id === inbound.id ? tokens : 0);
+        await stampProcessed(id, id === inbound.id ? tokens : 0);
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, mensagem_id: id },
@@ -1417,6 +1479,31 @@ async function runAgentForMensagemInner(
     reactOutboundText = result.outboundText;
     reactToolsCalled = result.toolsCalled;
     reactDelivery = result.delivery;
+  } catch (err) {
+    // Issue #504 §Fencing — a posse acabou NO MEIO da execução. O ReAct parou
+    // no topo de uma iteração, então nenhum LLM, nenhuma tool e nenhum outbound
+    // rodaram a partir dali.
+    //
+    // Saímos SEM concluir e SEM agendar retry, e isso é a escolha certa: o
+    // turno pertence a quem tem a lease vigente, e é essa tentativa que vai
+    // decidir o desfecho. Qualquer transição nossa aqui seria recusada pelo
+    // fence de qualquer forma (`resolveFence` devolveria `lost`); pular a
+    // tentativa evita o barulho de uma rejeição que já sabemos que virá.
+    //
+    // Também NÃO carimbamos `processada_em`: era exatamente assim que um
+    // zumbi fazia o turno do dono legítimo parecer processado por fora.
+    if (err instanceof TurnOwnershipLostError) {
+      logger.warn(
+        {
+          mensagem_id: inbound.id,
+          turn_id: turn?.turn_id ?? null,
+          boundary: err.boundary,
+        },
+        'agent.turn_ownership_lost_mid_execution',
+      );
+      return;
+    }
+    throw err;
   } finally {
     stopTyping();
   }
