@@ -61,7 +61,7 @@ export default defineConfig({
     // 10/15 min e um travamento sistemático estoura o job, que é uma falha
     // legível. (b) é coberto pelo relatório de lentos do reporter em
     // `tests/reporters/diagnostico-reporter.ts`, que imprime no fim de TODA
-    // rodada os testes acima de `MAIA_TEST_SLOW_MS` — a distribuição saudável
+    // rodada os testes acima de `VITEST_SLOW_MS` — a distribuição saudável
     // é nítida (8420 de 8691 testes abaixo de 100ms), então uma regressão de
     // desempenho aparece como linha nova na lista.
     //
@@ -101,19 +101,27 @@ export default defineConfig({
     // `expected "vi.fn()" to be called 1 times, but got 2 times`. Essa metade
     // morreu com o orçamento acima.
     //
-    // A outra metade é REAL, e por isso o retry fica: medido em 5 rodadas
-    // completas com `--retry=0` e o orçamento novo,
-    // `tests/integration/lifecycle-drain-queue.spec.ts` reprova em TODAS
-    // (`expected 12 to be +0` — jobs `failed` residuais na fila BullMQ
-    // compartilhada) e `llm-circuit-audit-real-db.spec.ts` em 2 de 5. Tirar o
-    // retry hoje trocaria flake por vermelho constante, que é o oposto do
-    // objetivo.
+    // A outra metade NÃO foi possível medir com honestidade fora do CI, e é por
+    // isso que o retry fica em vez de sair. Nas 4 rodadas completas com
+    // `--retry=0`, o único candidato a "flake de singleton compartilhado" foi
+    // `tests/integration/lifecycle-drain-queue.spec.ts` (`expected 20 to be
+    // +0`). Investigado até o fim: os 20 jobs `failed` na fila BullMQ eram
+    // resíduo de `turn-job-id-real-redis.spec.ts` rodando em OUTRA worktree de
+    // agente contra o MESMO Redis — arquivo que nem existe nesta branch.
+    // Limpando `bull:agent:*`, a mesma spec dá 3/3 verde COM `--retry=0`. Ou
+    // seja: a evidência que eu tinha contra tirar o retry se dissolveu, e a
+    // evidência a favor de tirá-lo também não existe, porque uma máquina de
+    // desenvolvimento com banco e Redis compartilhados não produz rodada
+    // hermética. Decidir isso a partir daqui seria chute.
     //
     // O que MUDA é que ele deixa de ser um silenciador: o reporter de
     // diagnóstico imprime a seção RECUPERADOS PELA SEGUNDA TENTATIVA com os
     // erros de cada tentativa. A afirmação "uma falha real aparece na segunda
     // tentativa também" passa a ser verificável a cada rodada em vez de ser um
-    // comentário. Enquanto essa lista não estiver vazia, o retry é dívida
+    // comentário. O critério para remover o retry fica objetivo: se essa seção
+    // vier vazia em N rodadas do CI — onde Postgres e Redis são containers
+    // novos por job, e portanto herméticos —, o retry não está absorvendo
+    // nada e pode sair. Enquanto ela não estiver vazia, ele é dívida
     // registrada, não solução.
     retry: 1,
     coverage: {

@@ -8,7 +8,7 @@
  *    centenas de linhas de `checkpoint complete` e de violações de constraint
  *    que são fixtures propositais. Quem lê o log pelo fim não chega ao
  *    sumário. Este reporter imprime, DEPOIS do reporter default, um bloco
- *    curto e auto-contido com o veredito; e, quando `MAIA_TEST_SUMMARY_FILE`
+ *    curto e auto-contido com o veredito; e, quando `VITEST_SUMMARY_FILE`
  *    está setado, grava o mesmo bloco em arquivo para o CI reimprimir num
  *    passo próprio, endereçável, no fim do job.
  *
@@ -38,9 +38,17 @@ import type { Reporter, SerializedError, TestCase, TestModule } from 'vitest/nod
 /** Assinatura textual do estouro de prazo do vitest, em test e em hook. */
 const RE_TIMEOUT = /timed out in \d+\s*ms/i;
 
-const LIMIAR_LENTO_MS = Number(process.env.MAIA_TEST_SLOW_MS ?? 1_000);
-const TOPO_LENTOS = Number(process.env.MAIA_TEST_SLOW_TOP ?? 15);
-const TOPO_FALHAS = Number(process.env.MAIA_TEST_FAIL_TOP ?? 40);
+// As variáveis abaixo NÃO usam o prefixo `MAIA_` de propósito. O contrato de
+// config (#515, `src/config/contract.ts`) falha FECHADO em qualquer `MAIA_*`
+// desconhecida, e `loadConfig()` roda no import de vários módulos de produção —
+// então um `MAIA_TEST_SUMMARY_FILE` no ambiente derruba a COLETA de ~200
+// arquivos com `Invalid configuration: MAIA_TEST_SUMMARY_FILE [contract/unknown]`.
+// Foi exatamente o que aconteceu na primeira versão deste arquivo, e foi a
+// seção "ARQUIVOS QUE NÃO CARREGARAM" abaixo que denunciou.
+
+const LIMIAR_LENTO_MS = Number(process.env.VITEST_SLOW_MS ?? 1_000);
+const TOPO_LENTOS = Number(process.env.VITEST_SLOW_TOP ?? 15);
+const TOPO_FALHAS = Number(process.env.VITEST_FAIL_TOP ?? 40);
 
 interface Registro {
   readonly arquivo: string;
@@ -99,7 +107,7 @@ export default class DiagnosticoReporter implements Reporter {
     // ausência de uma seção significa ausência do problema.
     process.stdout.write(`\n${linhas.join('\n')}\n`);
 
-    const destino = process.env.MAIA_TEST_SUMMARY_FILE;
+    const destino = process.env.VITEST_SUMMARY_FILE;
     if (destino) {
       try {
         mkdirSync(dirname(destino), { recursive: true });

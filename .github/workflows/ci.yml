@@ -185,7 +185,7 @@ jobs:
         env:
           # Ver o passo "Resumo dos testes" abaixo e
           # `tests/reporters/diagnostico-reporter.ts` (#545).
-          MAIA_TEST_SUMMARY_FILE: .ci-test-summary/unit.txt
+          VITEST_SUMMARY_FILE: .ci-test-summary/unit.txt
         run: npx vitest run
 
       - name: Resumo dos testes
@@ -394,12 +394,12 @@ jobs:
 
       - name: Run integration tests
         env:
-          MAIA_TEST_SUMMARY_FILE: .ci-test-summary/integration.txt
+          VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 
       - name: Run e2e tests
         env:
-          MAIA_TEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
+          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
         run: npm run test:e2e
 
       - name: Resumo dos testes
