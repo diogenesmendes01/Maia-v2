@@ -70,8 +70,20 @@ let registered = false;
 let source: OnboardingExpiryBacklogSource | null = null;
 
 async function refresh(): Promise<void> {
-  if (Date.now() - lastAttemptAt < SNAPSHOT_TTL_MS) return;
+  // A ORDEM destas duas guardas é o single-flight, e ela estava invertida
+  // (round 2 do review da PR #560). Com o TTL primeiro: o scrape A entra,
+  // carimba `lastAttemptAt` e deixa a consulta pendente; o scrape B que chega
+  // durante essa janela vê o TTL FRESCO e volta na hora, sem esperar — e
+  // publica o snapshot anterior, ou `NaN` se for a primeira leitura, enquanto
+  // a leitura corrente ainda está em curso. Dois `/metrics` simultâneos
+  // discordavam, e um deles podia afirmar "desconhecido" ou "saudável" sem
+  // base.
+  //
+  // Com `inFlight` primeiro, todo consumidor concorrente recebe A MESMA
+  // promise e enxerga o mesmo resultado novo. O TTL volta a valer depois que
+  // ela assenta (`inFlight` volta a `null` no `finally`).
   if (inFlight) return inFlight;
+  if (Date.now() - lastAttemptAt < SNAPSHOT_TTL_MS) return;
   lastAttemptAt = Date.now();
   inFlight = (async () => {
     try {

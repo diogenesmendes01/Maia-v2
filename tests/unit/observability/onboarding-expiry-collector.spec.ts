@@ -161,6 +161,45 @@ describe('issue #519 — coletor de backlog do onboarding_expirer', () => {
    * DSN inteira, e habilitar `debug` para investigar Postgres é EXATAMENTE
    * quando ela seria escrita.
    */
+  /**
+   * Round 2 do review da PR #560. A ordem das guardas em `refresh()` estava
+   * invertida — TTL antes de `inFlight` —, então um scrape que chegasse com a
+   * consulta do anterior ainda pendente via o TTL fresco e voltava na hora,
+   * publicando o snapshot ANTERIOR (ou `NaN`, na primeira leitura) enquanto a
+   * leitura corrente ainda corria.
+   *
+   * O caso exige as duas coisas que o desenho promete: UMA consulta, e o mesmo
+   * resultado NOVO nas duas respostas. Sem a segunda asserção, uma
+   * implementação que simplesmente devolvesse cedo também passaria.
+   */
+  it('dois scrapes CONCORRENTES fazem uma leitura só, e concordam no valor novo', async () => {
+    let libera!: (v: OnboardingExpiryBacklog) => void;
+    const pendente = new Promise<OnboardingExpiryBacklog>((resolve) => {
+      libera = resolve;
+    });
+    const source = vi.fn(() => pendente);
+    registerOnboardingExpiryGauges(source);
+
+    // Os dois entram ANTES de a fonte responder — é essa janela que o defeito
+    // atravessava.
+    const a = renderPrometheus();
+    const b = renderPrometheus();
+    await Promise.resolve();
+    libera({ backlog: 42, oldest_age_seconds: 900 });
+
+    const [corpoA, corpoB] = await Promise.all([a, b]);
+
+    expect(source, 'o segundo scrape furou o single-flight e consultou de novo').toHaveBeenCalledTimes(1);
+    expect(
+      corpoA,
+      'o scrape A não enxergou a leitura que ele mesmo esperou',
+    ).toMatch(/^maia_onboarding_expiry_backlog 42$/m);
+    expect(
+      corpoB,
+      'o scrape B publicou valor velho (ou NaN) enquanto a leitura corrente ainda corria',
+    ).toMatch(/^maia_onboarding_expiry_backlog 42$/m);
+  });
+
   it('a falha logada não carrega credencial — DSN sai censurada', async () => {
     registerOnboardingExpiryGauges(async () => {
       throw new Error(
