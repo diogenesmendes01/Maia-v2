@@ -385,6 +385,7 @@ const IGNORED_OUTCOMES: ReadonlySet<TurnOutcome> = new Set<TurnOutcome>([
   'quarantined',
   'rate_limited_silent',
   'operator_cancelled',
+  'pending_race_lost',
 ]);
 
 /** Backoff exponencial com teto, em ms — 30s, 60s, 120s, … até 15min. */
