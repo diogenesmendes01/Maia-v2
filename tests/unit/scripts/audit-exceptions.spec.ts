@@ -224,7 +224,7 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
 
   it('reprova relatório sem "auditReportVersion" e sem "metadata"', () => {
     const errors = validateAuditReport('.', { vulnerabilities: {} }).join('\n');
-    expect(errors).toContain('"auditReportVersion" numérico');
+    expect(errors).toContain('"auditReportVersion"');
     expect(errors).toContain('"metadata" ausente ou não é um objeto');
   });
 
@@ -251,6 +251,71 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
  * isolam `metadata`, com todo o resto do relatório VÁLIDO, para que remover a
  * exigência fique vermelho aqui e não em outro lugar.
  */
+/**
+ * Decisão 20 do dono: exigir `auditReportVersion === 2`, não "algum número".
+ *
+ * A v2 é a única forma que este parser sabe ler: `vulnerabilities` como objeto
+ * indexado por pacote, com `via[]` carregando `url`/`title`/`severity`. A v1 do
+ * npm 6 trazia `advisories`/`actions` — forma inteiramente diferente, que
+ * atravessaria `parseAudit` produzindo ZERO findings e deixando o guard verde
+ * por não entender o relatório. Uma v3 futura tem o mesmo problema, com o
+ * agravante de ninguém ter lido a forma dela ainda.
+ *
+ * "Não entendi o relatório" tem de reprovar, como qualquer outra ausência de
+ * auditoria neste arquivo.
+ */
+describe('validateAuditReport — auditReportVersion tem de ser 2 (decisão 20)', () => {
+  it('aceita a v2', () => {
+    const v2 = { auditReportVersion: 2, vulnerabilities: {}, metadata: METADATA };
+    expect(validateAuditReport('.', v2)).toEqual([]);
+  });
+
+  it('REPROVA a v1 do npm 6, cuja forma é outra', () => {
+    const v1 = { auditReportVersion: 1, vulnerabilities: {}, metadata: METADATA };
+    const errors = validateAuditReport('.', v1).join('\n');
+    expect(errors).toContain('auditReportVersion');
+    // A mensagem tem de dizer QUAL versão veio...
+    expect(errors).toContain('1');
+    // ...e o que fazer.
+    expect(errors).toContain('2');
+  });
+
+  it('REPROVA qualquer versão futura — inclusive 3', () => {
+    for (const v of [0, 3, 4, 2.5, -2]) {
+      const errors = validateAuditReport('.', {
+        auditReportVersion: v,
+        vulnerabilities: {},
+        metadata: METADATA,
+      }).join('\n');
+      expect(errors, `auditReportVersion=${v}`).toContain('auditReportVersion');
+    }
+  });
+
+  it('REPROVA a versão como STRING "2" — não é o número 2', () => {
+    const errors = validateAuditReport('.', {
+      auditReportVersion: '2',
+      vulnerabilities: {},
+      metadata: METADATA,
+    }).join('\n');
+    expect(errors).toContain('auditReportVersion');
+  });
+
+  it('o guard INTEIRO reprova um lockfile que devolve versão diferente de 2', () => {
+    // Sem isto, `parseAudit` leria um relatório de outra forma como "zero
+    // advisories" e o ledger inteiro apareceria como exceção OBSOLETA.
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({
+        '.': { ...(relatorioComEsbuild() as object), auditReportVersion: 3 },
+        'src/admin-ui': RELATORIO_LIMPO,
+      }),
+    );
+    expect(problems.join('\n')).toContain('auditReportVersion');
+    expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
+  });
+});
+
 describe('validateAuditReport — `metadata` continua obrigatório (decisão 19)', () => {
   it('REPROVA relatório sem "metadata", com todo o resto válido', () => {
     const semMetadata = { auditReportVersion: 2, vulnerabilities: {} };

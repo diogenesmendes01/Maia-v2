@@ -58,8 +58,9 @@
  * O `npm audit` sai com código != 0 QUANDO ENCONTRA vulnerabilidade, então o
  * exit status não distingue "achei coisa" de "não consegui auditar" e por isso
  * é ignorado. A distinção que vale é a FORMA do relatório: um relatório de
- * sucesso do npm >= 7 traz `auditReportVersion`, `vulnerabilities` (objeto,
- * possivelmente VAZIO) e `metadata`. Uma falha de registry/auth/serviço traz um
+ * sucesso do npm >= 7 traz `auditReportVersion` (que precisa ser exatamente
+ * `2`, a única forma que este parser sabe ler — ver `AUDIT_REPORT_VERSION`),
+ * `vulnerabilities` (objeto, possivelmente VAZIO) e `metadata`. Uma falha de registry/auth/serviço traz um
  * objeto sem nenhum desses campos e com `error` — verificado com npm 10.9.7
  * apontado para um registry morto, exit 1, stdout:
  *
@@ -101,6 +102,19 @@ export const LEDGER_PATH = 'security/audit-exceptions.json';
 export const PROJECTS: readonly string[] = ['.', 'src/admin-ui'];
 
 export const SEVERITIES: readonly string[] = ['info', 'low', 'moderate', 'high', 'critical'];
+
+/**
+ * A ÚNICA versão de relatório que `parseAudit` sabe ler.
+ *
+ * Decisão 20 do dono: exigir o valor 2, não "algum número". A v1 (npm 6) trazia
+ * `advisories` + `actions` em vez de `vulnerabilities` indexado por pacote com
+ * `via[]`; uma v3 futura pode trazer outra coisa qualquer. Aceitar qualquer
+ * número deixaria `parseAudit` varrer uma forma que não conhece, achar zero
+ * findings e devolver VERDE — o mesmo fail-open que a checagem de forma existe
+ * para não ter. Quando o npm publicar uma v3, o caminho é ler a forma nova e
+ * mudar este arquivo, não afrouxar a comparação.
+ */
+export const AUDIT_REPORT_VERSION = 2;
 
 /** Um advisory concreto encontrado pelo `npm audit` em um dos lockfiles. */
 export interface Finding {
@@ -205,10 +219,14 @@ export function validateAuditReport(project: string, raw: unknown): string[] {
       `${where}: o npm devolveu um relatório de ERRO — ${summarizeNpmError(r)}. ${comoAgir}`,
     );
   }
-  if (typeof r.auditReportVersion !== 'number') {
+  if (r.auditReportVersion !== AUDIT_REPORT_VERSION) {
     errors.push(
-      `${where}: relatório sem "auditReportVersion" numérico, então não é um relatório de ` +
-        `auditoria do npm >= 7. ${comoAgir}`,
+      `${where}: "auditReportVersion" é ${JSON.stringify(r.auditReportVersion) ?? 'undefined'} e ` +
+        `este parser só sabe ler a versão ${AUDIT_REPORT_VERSION}. Um relatório de outra ` +
+        `versão tem FORMA diferente, e lê-lo com o parser da v${AUDIT_REPORT_VERSION} produziria ` +
+        `zero findings em vez de um erro. Atualize este script para a nova forma (a v2 indexa ` +
+        `"vulnerabilities" por pacote, com "via[]" trazendo url/title/severity) antes de ` +
+        `aceitá-la. ${comoAgir}`,
     );
   }
   const vulns = r.vulnerabilities;
