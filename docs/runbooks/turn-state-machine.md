@@ -1,9 +1,10 @@
-# Runbook — máquina de estados durável do turno (issue #503)
+# Runbook — máquina de estados durável do turno (issues #503 e #504)
 
 Cobre: rollout, backfill, turno preso, divergência com o campo legado, replay de
-dead letter e rollback.
+dead letter, posse do turno (claim/lease/fencing) e rollback.
 
-Fonte de verdade do vocabulário: [`src/runtime/turns/contract.ts`](../../src/runtime/turns/contract.ts).
+Fonte de verdade do vocabulário: [`src/runtime/turns/contract.ts`](../../src/runtime/turns/contract.ts)
+e, para a posse, [`src/runtime/turns/claim.ts`](../../src/runtime/turns/claim.ts).
 Única porta de escrita: [`src/db/repositories/turn-repos.ts`](../../src/db/repositories/turn-repos.ts).
 
 ## 1. Modelo em 30 segundos
@@ -123,7 +124,114 @@ Antes de replayar, confirme que o efeito colateral do turno **não** ocorreu
 (cheque `outbound_message_id` e a trilha de tools). Replayar um turno que já
 enviou resposta duplica a mensagem para o usuário.
 
-## 6. Rollback
+## 6. Posse do turno: claim, lease e fencing (#504)
+
+`FEATURE_TURN_CLAIM=true` liga a exclusão mútua. Antes dela, duas réplicas
+podiam processar o mesmo turno; a máquina de estados registrava a execução mas
+não decidia quem executa.
+
+### 6.1 Diagnóstico de lease
+
+```sql
+-- Quem tem o quê, e há quanto tempo deu sinal de vida.
+SELECT id, status, claimed_by, attempt_count,
+       lease_expires_at - now()  AS lease_restante,
+       now() - heartbeat_at      AS desde_ultimo_heartbeat
+  FROM agent_turns
+ WHERE status IN ('claimed','running')
+ ORDER BY lease_expires_at;
+```
+
+Como ler as duas últimas colunas juntas — é para isso que `heartbeat_at` existe:
+
+| `lease_restante` | `desde_ultimo_heartbeat` | Leitura |
+|---|---|---|
+| positivo | menor que o intervalo de heartbeat | Worker **saudável** processando algo longo. Não faça nada. |
+| positivo | perto do TTL | Worker **agonizante**: renovou uma vez e parou. Vai virar takeover. Investigue o processo dono AGORA. |
+| negativo | qualquer | Lease **vencida**: o turno já é elegível para takeover e o recovery o rearma no próximo tick. |
+
+Sem `heartbeat_at` as duas primeiras linhas seriam indistinguíveis até o lease
+vencer — exatamente quando já é tarde para agir.
+
+```sql
+-- Leases vencidas por par (tenant, agent) — o que o recovery vai rearmar.
+SELECT tenant_id, agent_id, count(*)
+  FROM agent_turns
+ WHERE status IN ('claimed','running') AND lease_expires_at <= now()
+ GROUP BY 1,2 ORDER BY 3 DESC;
+```
+
+### 6.2 Sinais e o que fazem
+
+| Sinal | Significado | Ação |
+|---|---|---|
+| `maia_turn_claim_total{result="not_eligible"}` alto | Muitos workers acordando para o mesmo turno. **Normal** se acompanha rearme; suspeito se cresce sozinho. | Confira se o `jobId` determinístico está sendo aplicado (log `queue.turn_job_retained_cleared`, job ids `turn-*`). |
+| `maia_turn_lease_lost_total{reason="heartbeat_failed"}` | O banco não respondeu duas batidas seguidas. | É saúde do PostgreSQL, não do turno. O turno volta ao pool sozinho. |
+| `maia_turn_lease_lost_total{reason="token_mismatch"}` | Alguém tomou o turno. | Se recorrente, o TTL está **curto demais** para a duração real do turno — takeover falso. Aumente `TURN_LEASE_TTL_MS`. |
+| `maia_turn_fence_rejected_total` | Um worker tentou gravar sem posse e foi recusado. | O fence trabalhou. Investigue POR QUE ele perdeu a posse (audit `turn_lease_lost` do mesmo `turn_id`). |
+
+Auditoria: `turn_lease_lost` e `turn_fence_rejected` carregam `turn_id`,
+`worker_id`, `attempt` e o motivo — nunca conteúdo de conversa.
+
+### 6.3 Turno preso com dono vivo
+
+Não force. A lease vence sozinha em, no máximo, `TURN_LEASE_TTL_MS`, e forçar
+(zerar `claim_token` na mão) libera o turno para um sucessor **enquanto o dono
+ainda executa** — que é a execução dupla que esta issue fecha. Se for
+inevitável (dono comprovadamente morto e TTL longo demais), o movimento seguro
+é vencer a lease, nunca apagar o token:
+
+```sql
+UPDATE agent_turns SET lease_expires_at = now()
+ WHERE id = '<turn_id>' AND status IN ('claimed','running');
+```
+
+Isso é o mesmo que o shutdown gracioso faz: o sucessor reivindica no próximo
+tick e o dono antigo perde o direito de escrever no mesmo instante (toda
+gravação fenced exige `lease_expires_at > now()`).
+
+### 6.4 Rearme bloqueado por job retido
+
+Sintoma: o turno está elegível no PostgreSQL mas nenhum worker o pega.
+
+```bash
+# O job existe e está em estado terminal?
+npm run dlq   # e procure o id `turn-<turn_id>`
+```
+
+`enqueueAgent` remove sozinho jobs `completed`/`failed` antes de rearmar (log
+`queue.turn_job_retained_cleared`). Se o log não aparece e o job continua lá, o
+produtor não está passando `turn_id` — o job foi armado por um processo anterior
+a #504, e nesse caso o rearme cria um job novo com id gerado pela BullMQ, que
+também funciona.
+
+### 6.5 Rollout e rollback do claim
+
+Ordem obrigatória:
+
+1. `npm run db:migrate` (migration **114**);
+2. deploy do código com `FEATURE_TURN_CLAIM=false` — nada muda;
+3. confirme `TURN_LEASE_TTL_MS` acima da duração p99 do turno (`maia_turn_duration_ms`);
+4. ligue `FEATURE_TURN_CLAIM=true`;
+5. observe por uma janela: `maia_turn_lease_lost_total{reason="token_mismatch"}`
+   próximo de zero é o sinal de que o TTL está bem dimensionado.
+
+**Abortar** se: `lease_lost{token_mismatch}` cresce (TTL curto — takeover falso),
+`fence_rejected` cresce sem `lease_lost` correspondente (algo está gravando com
+token velho por outro caminho), ou a idade dos turnos em `claimed` sobe.
+
+**Rollback de feature**: `FEATURE_TURN_CLAIM=false` volta ao regime de #503
+imediatamente. Nenhum claim gravado é apagado; as leases vivas simplesmente
+vencem e param de ser renovadas, e as gravações voltam a não carregar fence.
+Note que isso REABRE a janela de execução dupla — é rollback de segurança
+reduzida, não neutro.
+
+**Rollback de migration**: `114_agent_turns_lease_heartbeat_down.sql` derruba
+`heartbeat_at` e o índice. Pare o consumo antes e confirme que nenhum turno está
+em `claimed`/`running` com lease viva. O claim não quebra sem a coluna, mas o
+diagnóstico de §6.1 fica cego.
+
+## 7. Rollback
 
 **De aplicação** — volte o código; mantenha as tabelas; mantenha o dual-write
 enquanto houver versão mista rodando. `processada_em` nunca deixou de ser
