@@ -586,7 +586,8 @@ async function runAgentForMensagemInner(
  *
  * Separado de `runAgentForMensagemInner` por uma razão só: o corpo precisa
  * rodar DENTRO de `runWithTurnExecution`, e um escopo de ALS exige uma função
- * para embrulhar. Nenhuma linha abaixo mudou de lugar dentro do corpo.
+ * para embrulhar. O corpo é o mesmo de antes, com a mesma indentação — a única
+ * adição é o helper `stampProcessed` logo abaixo.
  */
 async function runAgentTurnPipeline(params: {
   mensagem_id: string;
