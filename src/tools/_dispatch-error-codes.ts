@@ -71,6 +71,10 @@ export const MCP_BRIDGE_ERROR_CODES = [
   'requires_dual_approval',
   'invalid_args',
   'mcp_call_failed',
+  // #504 — o bridge revalida a posse no PRÓPRIO limite de efeito (a chamada
+  // HTTP ao servidor externo), então ele também produz esta recusa. Mesmo
+  // código, mesma classificação REFUSAL do dispatcher: nada rodou.
+  'turn_ownership_lost',
 ] as const;
 
 export type DispatcherErrorCode = (typeof DISPATCHER_ERROR_CODES)[number];
