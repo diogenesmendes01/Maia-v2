@@ -40,11 +40,34 @@ novo entregaria ao LLM uma entrada com outro significado. O usuário fica sem
 resposta para a segunda mensagem — a primeira já foi respondida pelo turno
 vencedor.
 
-Correlação: `audit_log` tem `pending_race_lost` (a corrida perdida, com
-`metadata.stage` = `resolution` · `cancellation` · `topic_change`) e
-`turn_ignored_by_policy` (o descarte do turno) para a mesma conversa. **Não** é
-incidente. Vira incidente se o volume subir sem tráfego correspondente — aí o
-suspeito é reentrega duplicada no gateway, não o gate.
+Correlação: `audit_log` tem `pending_race_lost` (a corrida perdida) para a mesma
+conversa, e `metadata.stage` diz em qual das travessias do lock ela foi perdida.
+**Os três valores NÃO levam ao mesmo desfecho** — só dois deles emparelham com
+`pending_race_lost` no turno:
+
+| `metadata.stage` | Onde é gravado | Desfecho do turno |
+|---|---|---|
+| `resolution` | `src/agent/pending-resolver.ts` — `resolveAndDispatch` recusou porque a pendência esperada já não é a ativa | **terminal**: `ignored` / `pending_race_lost` + `turn_ignored_by_policy` |
+| `cancellation` | `src/agent/pending-gate.ts` — a mensagem cancelava a pendência e ela já tinha sumido | **terminal**: `ignored` / `pending_race_lost` + `turn_ignored_by_policy` |
+| `topic_change` | `src/agent/pending-gate.ts` — o classificador disse que a mensagem **não** é resposta à pendência, é assunto novo | **segue para o ReAct**: o gate devolve `unresolved/topic_change` e o turno termina com o outcome normal (`completed`/`reply_delivered`, …) |
+
+`topic_change` é deliberado, não omissão: a mensagem nunca foi resposta à
+pendência, então não há reinterpretação a evitar, e o caminho **sem** race já
+segue para o ReAct. Tornar a race terminal faria a mesma pergunta do usuário ser
+respondida ou descartada conforme sorteio de timing. Consequência prática para
+quem investiga: uma linha `pending_race_lost` com `stage = 'topic_change'` e
+**nenhum** `turn_ignored_by_policy` na mesma conversa é o esperado — não procure
+o turno descartado, ele não existe.
+
+```sql
+SELECT metadata->>'stage' AS stage, count(*)
+  FROM audit_log
+ WHERE acao = 'pending_race_lost' AND tenant_id = $1 AND agent_id = $2
+ GROUP BY 1;
+```
+
+**Não** é incidente. Vira incidente se o volume subir sem tráfego correspondente
+— aí o suspeito é reentrega duplicada no gateway, não o gate.
 
 ## 2. Rollout (ordem obrigatória)
 

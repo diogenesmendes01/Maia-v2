@@ -74,6 +74,18 @@ describe('resolveAndDispatch', () => {
     expect(resolveTx).not.toHaveBeenCalled();
     expect(dispatchTool).not.toHaveBeenCalled();
     expect(audit.mock.calls.some((c) => c[0].acao === 'pending_race_lost')).toBe(true);
+    // `stage` é o campo que o runbook manda ler para separar as travessias do
+    // lock, e ele NÃO varia com a `source`: reação, voto e gate perdem a corrida
+    // no mesmo ponto — a releitura sob `FOR UPDATE` — logo, sempre `resolution`.
+    // O caso de banco (`tests/integration/pending-race-lost-terminal.spec.ts`)
+    // cobre `source: 'gate'`; este cobre as outras.
+    const raceLost = audit.mock.calls.find((c) => c[0].acao === 'pending_race_lost')![0];
+    expect(raceLost.metadata).toEqual({
+      pending_question_id: 'pq-1',
+      source: 'reaction',
+      stage: 'resolution',
+      observed_id: 'pq-different',
+    });
   });
 
   it('source=gate audits pending_resolved_by_gate', async () => {

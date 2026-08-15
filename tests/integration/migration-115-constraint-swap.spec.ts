@@ -56,6 +56,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import pg from 'pg';
 import {
+  analyzeTransactionEnvelope,
   discoverMigrations,
   downSiblingOf,
   splitNoTxStatements,
@@ -340,6 +341,20 @@ d('migration 115 — troca de CHECK em agent_turns (#570)', () => {
   });
 
   // ── Achado nº 1 — o `_down` é tudo-ou-nada ────────────────────────────────
+
+  it('o _down é UM envelope de transação completo — a garantia, separada do diagnóstico', () => {
+    // As duas defesas do `_down` são independentes: a preflight NOMEIA a recusa,
+    // o `BEGIN`/`COMMIT` GARANTE que a recusa não deixe rastro. Como qualquer
+    // uma sozinha já preserva a constraint no cenário `pending_race_lost`, o
+    // caso acima não consegue distinguir as duas — remover só o `BEGIN;` passa
+    // por ele. Este caso existe para prender a segunda defesa sozinha, com o
+    // mesmo predicado que o repositório usa para migrations `self`
+    // (`analyzeTransactionEnvelope`, `src/migrations/discover.ts`): o arquivo
+    // abre transação no primeiro statement de topo, fecha no último, e não tem
+    // nada fora dela. É o que faz a recusa ser tudo-ou-nada para QUALQUER
+    // statement que venha a falhar aqui, não só para o que a preflight prevê.
+    expect(analyzeTransactionEnvelope(downSql).envelope).toBe('single_complete');
+  });
 
   it('com uma row pending_race_lost o _down FALHA e a constraint continua presente', async () => {
     const c = await pool.connect();

@@ -86,6 +86,13 @@ type Evidence = {
   turn: { status: string | null; outcome: string | null };
   /** `audit_log` desta conversa, agrupado por ação, lido NO BANCO. */
   audit_by_acao: Record<string, number>;
+  /**
+   * `metadata` da(s) linha(s) `pending_race_lost` desta conversa, lido NO
+   * BANCO. Contar a ação não basta: o runbook manda o operador ler
+   * `metadata.stage` para separar os desfechos, e uma linha sem `stage` deixa a
+   * trilha documentada sem existir de fato.
+   */
+  race_lost_metadata: Record<string, unknown>[];
   /** Mensagens de saída gravadas nesta conversa (resposta do ReAct). */
   outbound_count: number;
   /** O inbound foi carimbado como processado? */
@@ -107,6 +114,7 @@ function fmt(e: Evidence): string {
       core_threw: e.core_threw,
       turn: e.turn,
       audit_by_acao: e.audit_by_acao,
+      race_lost_metadata: e.race_lost_metadata,
       outbound_count: e.outbound_count,
       inbound_processado: e.inbound_processado,
       pending_status: e.pending_status,
@@ -203,6 +211,7 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
       core_threw: [],
       turn: { status: null, outcome: null },
       audit_by_acao: {},
+      race_lost_metadata: [],
       outbound_count: -1,
       inbound_processado: false,
       pending_status: [],
@@ -333,6 +342,15 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
       );
       for (const row of aud.rows) ev.audit_by_acao[row.acao] = Number(row.n);
 
+      const meta = await c.query<{ metadata: Record<string, unknown> | null }>(
+        `SELECT metadata FROM audit_log
+          WHERE conversa_id = $1 AND tenant_id = $2 AND agent_id = $3
+            AND acao = 'pending_race_lost'
+          ORDER BY created_at`,
+        [ids.conversa, PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id],
+      );
+      ev.race_lost_metadata = meta.rows.map((r) => r.metadata ?? {});
+
       const out = await c.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM mensagens
           WHERE conversa_id = $1 AND tenant_id = $2 AND agent_id = $3 AND direcao = 'out'`,
@@ -447,6 +465,28 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
       },
       `[semântica] trilha incompleta do desfecho terminal. Evidência: ${fmt(ev)}`,
     ).toEqual({ pending_race_lost: 1, turn_ignored_by_policy: 1 });
+  });
+
+  it('[semântica] o audit da race de RESOLUÇÃO carrega metadata.stage', (ctx) => {
+    exigirInfra(ctx, PRE);
+    // Contar a linha não prova a trilha. `docs/runbooks/turn-state-machine.md`
+    // manda o operador ler `metadata.stage` para separar os três desfechos —
+    // `resolution` e `cancellation` emparelham com `ignored/pending_race_lost`,
+    // `topic_change` segue para o ReAct. Este caminho é justamente o
+    // `resolution`, e é o único produtor que ficava sem o campo: o ramo de
+    // cancelamento/topic change (`src/agent/pending-gate.ts`) já o gravava, e
+    // `src/agent/pending-resolver.ts` não. Sem o campo, a consulta que o
+    // runbook publica devolve `stage = NULL` justamente para a metade que
+    // termina em turno descartado.
+    expect(
+      ev.race_lost_metadata.map((m) => ({
+        stage: m['stage'] ?? null,
+        source: m['source'] ?? null,
+        pending_question_id: m['pending_question_id'] === ids.pending,
+      })),
+      '[semântica] metadata da race perdida sem `stage`, ou com o stage errado. ' +
+        `Evidência: ${fmt(ev)}`,
+    ).toEqual([{ stage: 'resolution', source: 'gate', pending_question_id: true }]);
   });
 
   it('[semântica] a perna perdedora não despachou ação nem produziu resposta', (ctx) => {
