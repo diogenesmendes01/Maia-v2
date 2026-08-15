@@ -1327,7 +1327,30 @@ async function runTransition(args: {
         args.expected_claim_token !== undefined &&
         (row.claim_token !== args.expected_claim_token || row.lease_live !== true);
       if (fenceBroken) {
-        incCounter('maia_turn_fence_rejected_total', { operation: `to_${args.to}` });
+        // NÃO incrementa `maia_turn_fence_rejected_total` aqui, e isso é uma
+        // escolha de DONO, não um esquecimento.
+        //
+        // Uma escrita recusada tem de valer UM incremento. Enquanto esta linha
+        // existia junto com `reportFenceRejection()` (src/runtime/turns/lease.ts),
+        // uma única recusa somava dois — com labels diferentes (`to_completed` vs
+        // `conclude_reply_delivered`), então qualquer agregação por `sum()` (que
+        // é como um SLO e um alerta leem um counter) via o dobro das rejeições
+        // reais.
+        //
+        // O dono do contador é a camada de runtime, por três razões:
+        //   1. é a única que emite os TRÊS fatos juntos (métrica + log
+        //      estruturado + auditoria `turn_fence_rejected`), então "uma
+        //      recusa = uma linha em cada trilha" fica verificável num lugar só;
+        //   2. o label dela é o `operation` do vocabulário da issue
+        //      (`conclude_reply_delivered`, `fail_retryable`, `dead_letter`), e
+        //      não o estado-alvo — que é o que um operador procura;
+        //   3. existem recusas que NUNCA chegam aqui: quando a tentativa já sabe
+        //      que a lease morreu, o guard em memória recusa sem ir ao banco
+        //      (`refuseLostOwnership`). Se o dono do contador fosse este SELECT,
+        //      essas ficariam invisíveis — justamente as mais graves.
+        //
+        // O repositório continua sendo a autoridade sobre a CLASSIFICAÇÃO
+        // (`stale_claim` vs `state_mismatch`); ele só não conta.
         return {
           ok: false as const,
           conflict: 'stale_claim' as const,
