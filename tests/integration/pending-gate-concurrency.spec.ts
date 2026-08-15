@@ -64,8 +64,10 @@
  *     vermelho — e o `[infra]` correspondente fica vermelho nomeando a causa.
  *
  * A regra de leitura do vermelho, então:
- *   • `[infra]` vermelho  = ambiente (prazo, conexão, flag, fixture, trilha).
+ *   • `[infra]` vermelho  = ambiente (prazo, conexão, flag, fixture).
  *   • `[escopo]` vermelho = esta spec está apagando dado de outro tenant.
+ *   • `[instrumentação]` vermelho = produção rodou e NÃO auditou. Defeito de
+ *     produção, mas de observabilidade — não afirma nada sobre idempotência.
  *   • `[semântica]` vermelho = a race real; bug de idempotência em produção.
  *   • `[semântica]` PULADO = nenhum veredito foi emitido; leia o `[infra]`
  *     vermelho que a nota do skip aponta pelo nome.
@@ -296,7 +298,18 @@ const T_THREW = '[infra] nenhuma das duas pernas paralelas lançou erro';
 const T_BUDGET = '[infra] a race paralela terminou dentro do orçamento';
 const T_INBOUND = '[infra] o inbound do fixture é uma mensagem real, gravável em audit_log';
 const T_AUDIT_WRITABLE = '[infra] o audit_log aceita escrita para este fixture (sonda direta)';
-const T_AUDIT_MUTE = '[infra] a trilha de auditoria desta conversa não está muda';
+// Round 2 do review da PR #562: este caso ESTAVA em `[infra]` e o rótulo ficou
+// errado no momento em que a sonda de gravabilidade entrou. Com ela verde,
+// trilha muda deixa de ser hipótese ambiental e vira defeito do caminho de
+// produção — o relatório classificava no grupo oposto ao que a evidência diz.
+//
+// Grupo próprio, e não `[semântica]`, porque a distinção paga: `[semântica]`
+// vermelho significa "exatamente-uma-vez quebrou". Aqui produção pode ter
+// despachado UMA vez e simplesmente não auditado. É defeito de produção, mas de
+// OBSERVABILIDADE, não de idempotência — e num arquivo cuja tese é que um
+// vermelho tem de nomear a causa, colapsar os dois seria repetir em menor
+// escala o erro que a #545 existe para corrigir.
+const T_AUDIT_MUTE = '[instrumentação] a trilha de auditoria desta conversa não está muda';
 
 type Precondicao = {
   /** Rótulo curto, aparece na nota do skip. */
