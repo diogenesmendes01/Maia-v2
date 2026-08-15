@@ -395,7 +395,7 @@ export function resyncWorstCaseMs(): number {
  * pontas, então uma rejeição tardia de `op` não vira `unhandledRejection`.
  */
 async function withAttemptDeadline<T>(
-  op: Promise<T>,
+  startOp: () => Promise<T>,
   what: string,
   deadline: number,
   life: SubscriberLifecycle,
@@ -403,11 +403,23 @@ async function withAttemptDeadline<T>(
   const expired = new Error(
     `${what} não coube no deadline de ${RESYNC_RETRY.attemptTimeoutMs}ms da tentativa`,
   );
-  // Orçamento já gasto pela operação anterior da MESMA tentativa: não se abre
-  // um timer de duração negativa, e não se dá à segunda operação um prazo que a
-  // tentativa não tem mais.
+  // FACTORY, não promise pronta (round 2 do review da PR #561). Recebendo a
+  // operação já iniciada, o `remaining <= 0` abaixo lançava DEPOIS de ela ter
+  // começado: a operação rodava fora do orçamento, nunca entrava no
+  // `Promise.race` — e portanto nunca ganhava o handler que a nota acima
+  // pressupõe. Uma rejeição tardia dela virava `unhandledRejection` no
+  // processo. O caso concreto é o ack do SUBSCRIBE resolvendo exatamente no
+  // limite: o `GET` já tinha sido disparado.
+  //
+  // As duas guardas ficam ANTES de criar a operação. Orçamento já gasto pela
+  // operação anterior da MESMA tentativa: não se abre timer de duração
+  // negativa, e não se dá à segunda operação um prazo que a tentativa não tem
+  // mais. Subscriber já fechado: não se toca no cliente depois do `stop()`.
+  if (!life.alive) throw expired;
   const remaining = deadline - Date.now();
   if (remaining <= 0) throw expired;
+
+  const op = startOp();
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -633,7 +645,7 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
     // idempotente no Redis — inclusive quando a tentativa anterior expirou pelo
     // timeout e o ack chegou depois.
     await withAttemptDeadline(
-      sub.subscribe(...SUBSCRIBED_CHANNELS),
+      () => sub.subscribe(...SUBSCRIBED_CHANNELS),
       'ack de re-inscrição',
       deadline,
       life,
@@ -677,7 +689,7 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
   let raw: string | null;
   try {
     raw = await withAttemptDeadline(
-      redis.get(LLM_CIRCUIT_OVERRIDE_KEY),
+      () => redis.get(LLM_CIRCUIT_OVERRIDE_KEY),
       'GET da chave do override',
       deadline,
       life,

@@ -828,6 +828,65 @@ describe('kill switch — releitura na reconexão', () => {
      * mesmo milissegundo — o tempo é o do relógio falso, avançado em passo
      * conhecido.
      */
+    /**
+     * Round 2 do review da PR #561. `withAttemptDeadline` recebia a operação
+     * JÁ INICIADA, então a checagem de orçamento lançava depois de ela ter
+     * começado. Com o ack resolvendo exatamente no limite, o `GET` já tinha
+     * sido disparado: rodava fora do orçamento, nunca entrava no
+     * `Promise.race` e portanto nunca ganhava handler — uma rejeição tardia
+     * dele viraria `unhandledRejection` no processo.
+     *
+     * O caso exige as duas metades: o `GET` não pode ser DISPARADO, e não pode
+     * sobrar rejeição sem handler.
+     */
+    it('ack que consome o orçamento INTEIRO: o `GET` nem chega a ser disparado', async () => {
+      const sub = await bootSubscriber();
+      handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('off'));
+
+      const naoTratadas: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        naoTratadas.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+
+      vi.useFakeTimers();
+      const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+      try {
+        // O ack consome EXATAMENTE o deadline da tentativa: no instante em que
+        // ele resolve, não sobrou orçamento nenhum.
+        sub.subscribe.mockImplementation(
+          () =>
+            new Promise((resolve) =>
+              setTimeout(() => resolve(2), RESYNC_RETRY.attemptTimeoutMs),
+            ),
+        );
+        // Se o `GET` for disparado, ele rejeita — e é a rejeição que não teria
+        // handler no caminho defeituoso.
+        redisMock.get.mockImplementation(() =>
+          Promise.reject(new Error('GET disparado fora do orçamento')),
+        );
+        redisMock.get.mockClear();
+
+        sub.emit('ready');
+        await vi.advanceTimersByTimeAsync(resyncWorstCaseMs());
+      } finally {
+        random.mockRestore();
+        vi.useRealTimers();
+      }
+
+      expect(
+        redisMock.get.mock.calls.length,
+        'o `GET` foi disparado com o orçamento da tentativa já zerado: a operação é criada antes de o helper checar o que sobrou',
+      ).toBe(0);
+
+      await new Promise((r) => setImmediate(r));
+      process.off('unhandledRejection', onUnhandled);
+      expect(
+        naoTratadas,
+        'sobrou rejeição sem handler: a operação foi criada e nunca entrou no `Promise.race`',
+      ).toEqual([]);
+    });
+
     it('subscribe e `GET` consomem tempo na MESMA tentativa: o teto é o da tentativa, não a soma', async () => {
       const sub = await bootSubscriber();
       handleLLMSettingsInvalidation(LLM_CIRCUIT_OVERRIDE_CHANNEL, overridePayload('off'));
