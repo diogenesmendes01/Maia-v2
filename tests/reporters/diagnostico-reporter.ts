@@ -60,10 +60,20 @@ interface Registro {
   readonly erros: readonly string[];
 }
 
+/**
+ * Primeira linha COM CONTEÚDO da mensagem.
+ *
+ * O `?? texto` ingênuo devolvia `┌────────────┐` para os erros que vêm em caixa
+ * desenhada (os helpers de testcontainers formatam assim), o que é o mesmo que
+ * não dizer nada. Linhas feitas só de moldura, traço ou espaço são puladas.
+ */
 function primeiraLinha(texto: string | undefined): string {
   if (!texto) return '(sem mensagem)';
-  const linha = texto.split('\n').find((l) => l.trim().length > 0) ?? texto;
-  return linha.trim().slice(0, 240);
+  const util = texto
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 0 && /[\p{L}\p{N}]/u.test(l));
+  return (util ?? texto.trim() ?? '(sem mensagem)').slice(0, 240);
 }
 
 function relativo(caminho: string): string {
