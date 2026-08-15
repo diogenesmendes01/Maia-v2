@@ -78,3 +78,7 @@ scripts/turn-context-baseline.json
 
 # Saídas de corrida do gate da #525 (`npm run turn:bench`) — artefatos locais.
 bench-*.out
+
+# Resumo de diagnóstico dos testes (#545) — gerado por VITEST_SUMMARY_FILE,
+# usado pelo passo "Resumo dos testes" do CI. Efêmero, nunca versionado.
+.ci-test-summary/
