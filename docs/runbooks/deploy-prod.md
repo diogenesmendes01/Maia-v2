@@ -68,8 +68,36 @@ docker compose --env-file .env.infra -f compose.prod.yml ps
 
 ### `MAIA_ENV` é obrigatória, e de propósito não tem default
 
-`compose.prod.yml` interpola `MAIA_ENV` com `${MAIA_ENV:?...}`. Faltou a
-linha no `.env.infra`, o compose **aborta antes de criar container algum**:
+`compose.prod.yml` interpola `MAIA_ENV` com `${MAIA_ENV:?...}` — e injeta o
+resultado no `environment:` dos **três** serviços: `migrate`, `app` e
+`admin-ui`. Isso não é redundância: `.env.infra` serve **só para
+interpolação**, ele não é injetado em container nenhum, e o contrato marca
+`MAIA_ENV` como `services: ALL` com `requiredIn: ['staging','production']`.
+
+A primeira versão desta mudança pôs a linha só no `migrate`. O resultado
+seria pior que não ter feito nada: o job terminaria com **sucesso**, o gate
+`service_completed_successfully` liberaria a subida, e `app`/`admin-ui`
+reprovariam no **boot**, com
+
+```
+Invalid configuration for service "runtime" (profile production):
+  - MAIA_ENV [profile/required]: MAIA_ENV é obrigatória no profile production.
+      → Defina MAIA_ENV.
+```
+
+`NODE_ENV=production` (que os dois recebem) **não** supre: ele é o modo do
+Node, não o profile da Maia, e não sabe dizer `staging`.
+
+Os `.env.app` / `.env.admin` **não** declaram `MAIA_ENV`, de propósito: duas
+fontes são duas fontes que podem divergir — o migrator rodaria num profile e
+os consumidores em outro, sem nada apontando a contradição. Fonte única,
+`.env.infra`, propagada pelo compose.
+`tests/unit/migrations/compose-prod-effective-env.spec.ts` monta o ambiente
+efetivo dos três (env file + `environment:`, ambos lidos do repositório) e
+roda o loader de cada um.
+
+Faltou a linha no `.env.infra`, o compose **aborta antes de criar container
+algum**:
 
 ```
 $ docker compose --env-file .env.infra -f compose.prod.yml up -d

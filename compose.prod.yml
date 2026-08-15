@@ -196,6 +196,16 @@ services:
       #
       # `.env.infra` passa a declarar `MAIA_ENV=production` (ou `staging`)
       # explicitamente — ver docs/runbooks/deploy-prod.md §1.
+      #
+      # A MESMA linha, byte por byte, está em `app` e em `admin-ui`. O
+      # contrato marca MAIA_ENV como `services: ALL` e
+      # `requiredIn: ['staging','production']`, e `.env.infra` serve SÓ para
+      # interpolação — declarar a variável lá NÃO a injeta em container
+      # nenhum. Sem estas três linhas o migrator terminava com sucesso e
+      # `app`/`admin-ui` reprovavam no boot por configuração ausente, seguindo
+      # o runbook à risca. Repetida em vez de ancorada (`&`/`*`) de propósito:
+      # o guard que lê este arquivo exige as três idênticas, e uma âncora
+      # esconderia a divergência dentro do YAML em vez de expô-la.
       MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
       POSTGRES_USER: ${POSTGRES_USER:?}
@@ -243,6 +253,12 @@ services:
       - .env.app
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` (ver o comentário lá em cima).
+      # `NODE_ENV=production` sozinho NÃO basta: o contrato exige MAIA_ENV nos
+      # profiles staging/production (`requiredIn`), e `.env.app` não a declara —
+      # o `.env.app.prod.example` manda explicitamente NÃO defini-la ali, para
+      # que não existam duas fontes que possam divergir do migrator.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       # DATABASE_URL/REDIS_URL compostas das MESMAS vars obrigatórias com que
       # os datastores sobem — sem fallback e sem drift entre serviço e URL.
       # NOTA: a senha entra numa URL — use senha URL-safe (ex.:
@@ -311,6 +327,10 @@ services:
       - .env.admin
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` e do `app` (ver os comentários
+      # acima). `.env.admin` não declara MAIA_ENV pelo mesmo motivo: uma
+      # segunda fonte é uma fonte que pode divergir.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
       # env.ts (importado transitivamente via @/db/client.ts) valida
       # REDIS_URL como URL mesmo que o admin-ui nunca abra conexão Redis.
