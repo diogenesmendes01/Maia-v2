@@ -24,23 +24,34 @@
  *   3. entrada do ledger que não casa com nenhum advisory → exceção obsoleta,
  *      deve ser removida (senão o ledger vira folclore)
  *   4. entrada malformada (campo faltando, data inválida, severidade inválida)
- *   5. severidade do advisory diferente da severidade registrada na exceção
- *      → a decisão foi tomada para outro risco, precisa ser tomada de novo
+ *   5. severidade do advisory ACIMA do teto registrado na exceção
+ *      (`max_severity`) → a decisão foi tomada para um risco menor, precisa ser
+ *      tomada de novo
  *   6. `npm audit` que não devolveu um relatório de auditoria reconhecível
  *      → não sabemos nada sobre aquele lockfile; ver "Fail-closed" abaixo
  *
  * A regra 3 é o que impede o ledger de crescer para sempre: assim que o
  * advisory some (upgrade, remoção do pacote), o CI EXIGE a limpeza da linha.
  *
- * As regras 3 e 5 são a mesma regra vista de dois ângulos: o ledger descreve a
- * realidade, e quando a realidade muda — o advisory sumiu, ou mudou de
- * severidade — a linha para de descrevê-la e precisa ser reescrita por gente.
- * É por isso que a 5 compara por IGUALDADE e não trata a severidade registrada
- * como teto: um `critical` reclassificado para `moderate` também invalida a
- * justificativa escrita, do mesmo jeito que um advisory que sumiu invalida a
- * linha inteira. O ledger já reprova quando a realidade MELHORA (regra 3, que
- * fica vermelha justamente quando alguém corrigiu a vulnerabilidade); a regra 5
- * apenas mantém essa postura coerente em vez de tolerar meia-verdade no ledger.
+ * A regra 3 e a regra 5 miram coisas diferentes. A 3 cuida do ledger que não
+ * encolhe. A 5 cuida do RISCO: `max_severity` é um TETO, não uma igualdade — a
+ * linha registra "esta exceção foi decidida para risco de até X". Enquanto o
+ * npm reporta X ou menos, a decisão escrita ainda cobre o que está lá e o CI
+ * não tem o que perguntar. Quando o npm reporta ACIMA de X, a justificativa
+ * passa a cobrir um risco menor do que o real e alguém precisa decidir de novo.
+ *
+ * A versão anterior comparava por IGUALDADE e reprovava também na QUEDA de
+ * severidade. Isso produzia ruído sem risco: um `moderate` reclassificado para
+ * `low` continua dentro do que o dono aceitou, e reprovar ali só ensinava a
+ * tratar o vermelho do guard como burocracia — o pior que pode acontecer com um
+ * guard de segurança. Se a queda merecer atualizar o texto do `reason`, isso é
+ * higiene de ledger, não motivo para travar o CI.
+ *
+ * O campo antigo `severity` NÃO é aceito como sinônimo: um ledger com o nome
+ * velho reprova na validação, com instrução de renomear. Aceitar os dois nomes
+ * deixaria a mesma linha sendo lida como igualdade por quem escreveu antes e
+ * como teto pelo guard — que é exatamente a meia-verdade que este arquivo
+ * existe para não ter. Fail-closed também vale para o formato.
  *
  * Fail-closed
  * -----------
@@ -108,7 +119,12 @@ export interface Exception {
   readonly project: string;
   readonly pkg: string;
   readonly advisory: string;
-  readonly severity: string;
+  /**
+   * TETO de severidade aceito, não igualdade: o guard só reprova quando o `npm
+   * audit` reporta ALGO ACIMA disto. Renomeado de `severity` justamente para o
+   * nome não sugerir a comparação errada — ver regra 5 no topo.
+   */
+  readonly max_severity: string;
   readonly reason: string;
   readonly owner: string;
   readonly issue: string;
@@ -284,7 +300,16 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
     return { exceptions, errors: [`${LEDGER_PATH}: o conteúdo precisa ser um array JSON`] };
   }
 
-  const required = ['project', 'pkg', 'advisory', 'severity', 'reason', 'owner', 'issue', 'expires'];
+  const required = [
+    'project',
+    'pkg',
+    'advisory',
+    'max_severity',
+    'reason',
+    'owner',
+    'issue',
+    'expires',
+  ];
   const seen = new Set<string>();
 
   for (let i = 0; i < parsed.length; i += 1) {
@@ -292,6 +317,18 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
     const where = `${LEDGER_PATH}[${i}]`;
     if (typeof row !== 'object' || row === null) {
       errors.push(`${where}: entrada precisa ser um objeto`);
+      continue;
+    }
+    // Campo antigo: reprova ANTES de reclamar de `max_severity` ausente, senão
+    // o diagnóstico seria "faltou um campo" quando o fato é "este campo mudou
+    // de nome E de semântica". A mensagem tem de dizer as duas coisas.
+    if ('severity' in row) {
+      errors.push(
+        `${where}: o campo "severity" foi renomeado para "max_severity" e passou a ser um ` +
+          `TETO, não uma igualdade — o guard só reprova quando o npm audit reporta severidade ` +
+          `ACIMA dele. Renomeie "severity" para "max_severity" nesta entrada e confirme que o ` +
+          `valor ainda é o maior risco que você aceita para este advisory.`,
+      );
       continue;
     }
     let ok = true;
@@ -308,8 +345,8 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
       errors.push(`${where}: project "${e.project}" não é um dos projetos (${PROJECTS.join(', ')})`);
       continue;
     }
-    if (!SEVERITIES.includes(e.severity)) {
-      errors.push(`${where}: severity "${e.severity}" inválida (${SEVERITIES.join(', ')})`);
+    if (!SEVERITIES.includes(e.max_severity)) {
+      errors.push(`${where}: max_severity "${e.max_severity}" inválida (${SEVERITIES.join(', ')})`);
       continue;
     }
     if (!/^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/.test(e.advisory)) {
@@ -362,13 +399,24 @@ export function findProblems(
     // exceção registrada" + "exceção OBSOLETA"), e quem lesse o CI procuraria
     // uma linha que existe e está quase certa. Como comparação, o diagnóstico é
     // único e diz exatamente qual campo editar.
-    if (e.severity !== f.severity) {
-      const escalou = SEVERITIES.indexOf(f.severity) > SEVERITIES.indexOf(e.severity);
+    const nivel = SEVERITIES.indexOf(f.severity);
+    if (nivel < 0) {
+      // Fail-closed obrigatório aqui. `indexOf` devolve -1 para uma severidade
+      // que não sabemos ler, e -1 nunca é MAIOR que o teto: sem este ramo, um
+      // relatório com severidade ilegível (campo ausente, valor novo do npm)
+      // passaria batido justamente por ser incompreensível.
       problems.push(
-        `severidade DIVERGENTE${escalou ? ' (ESCALOU)' : ''}: ${f.project} → ${f.pkg} ` +
-          `${f.advisory} foi aceito como "${e.severity}" e o npm audit hoje reporta ` +
-          `"${f.severity}". A decisão de ${e.owner} vale para o risco antigo. Reavalie e ` +
-          `atualize "severity" e "reason" em ${LEDGER_PATH}, ou corrija o advisory.`,
+        `severidade "${f.severity}" não está na escala conhecida (${SEVERITIES.join(', ')}): ` +
+          `${f.project} → ${f.pkg} ${f.advisory}. Sem conseguir situá-la na escala, o guard ` +
+          `não consegue compará-la com o teto "${e.max_severity}" e reprova.`,
+      );
+    } else if (nivel > SEVERITIES.indexOf(e.max_severity)) {
+      problems.push(
+        `severidade ACIMA do teto aceito: ${f.project} → ${f.pkg} ${f.advisory} foi aceito ` +
+          `com teto "${e.max_severity}" e o npm audit hoje reporta "${f.severity}". A decisão ` +
+          `de ${e.owner} vale para um risco menor. Reavalie e atualize "max_severity" e ` +
+          `"reason" em ${LEDGER_PATH}, ou corrija o advisory. (Uma QUEDA de severidade não ` +
+          `reprova: o teto continua cobrindo o risco.)`,
       );
     }
     if (e.expires < today) {
@@ -539,7 +587,7 @@ export function runGuard(repoRoot: string, now: Date, audit: AuditReader = runAu
   console.log(
     `check-audit-exceptions passou: ${PROJECTS.length} lockfiles auditados com relatório ` +
       `válido, ${findings.length} advisory(s), ${exceptions.length} exceção(ões) registrada(s) — ` +
-      `todas casando na severidade registrada e dentro do prazo.`,
+      `todas dentro do teto de severidade aceito e dentro do prazo.`,
   );
 }
 
