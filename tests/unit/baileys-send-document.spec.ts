@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 import { writeFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -68,11 +69,17 @@ afterAll(async () => {
   await rm(SANDBOX, { recursive: true, force: true });
 });
 
+// #545: o grafo de `src/gateway/baileys.js` custa 5.77–6.83s para carregar a
+// frio, contra 2–11ms de trabalho real por caso. Quando o prazo estourava, o
+// corpo órfão chamava `sendMessage` de novo e o retry morria com
+// `expected "vi.fn()" to be called 1 times, but got 2 times"`.
+const baileys = moduloDeProducao(() => import('../../src/gateway/baileys.js'));
+
 describe('sendOutboundDocument', () => {
   it('passes { document: Buffer, mimetype, fileName, caption } to socket.sendMessage', async () => {
     const path = join(SANDBOX, 'media', 'tmp', 'sample.pdf');
     await writeFile(path, '%PDF-1.4 sample bytes\n%%EOF');
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const wid = await mod.sendOutboundDocument('5511999999999@s.whatsapp.net', path, {
       mimetype: 'application/pdf',
@@ -95,7 +102,7 @@ describe('sendOutboundDocument', () => {
   it('forwards quoted as third arg when provided', async () => {
     const path = join(SANDBOX, 'media', 'tmp', 'q.pdf');
     await writeFile(path, '%PDF-1.4');
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;
     await mod.sendOutboundDocument('jid', path, {
@@ -108,7 +115,7 @@ describe('sendOutboundDocument', () => {
   it('returns null when not connected; sendMessage NOT called', async () => {
     const path = join(SANDBOX, 'media', 'tmp', 'nc.pdf');
     await writeFile(path, '%PDF-1.4');
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(null, false);
     const wid = await mod.sendOutboundDocument('jid', path, {
       mimetype: 'application/pdf', fileName: 'nc.pdf',
@@ -121,7 +128,7 @@ describe('sendOutboundDocument', () => {
     // Read failure is BEFORE the send → nothing left the channel. Throwing (not
     // returning null) lets the PDF dispatch tag it delivered:false instead of
     // mistaking a connected read-failure for a sent-without-id (Codex #216 round-4).
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await expect(
       mod.sendOutboundDocument('jid', '/no/such/file.pdf', {

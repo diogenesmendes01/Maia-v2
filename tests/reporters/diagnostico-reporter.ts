@@ -33,7 +33,7 @@
  */
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Reporter, TestCase, TestModule } from 'vitest/node';
+import type { Reporter, SerializedError, TestCase, TestModule } from 'vitest/node';
 
 /** Assinatura textual do estouro de prazo do vitest, em test e em hook. */
 const RE_TIMEOUT = /timed out in \d+\s*ms/i;
@@ -64,16 +64,36 @@ function relativo(caminho: string): string {
 }
 
 export default class DiagnosticoReporter implements Reporter {
-  onTestRunEnd(modules: ReadonlyArray<TestModule>): void {
+  onTestRunEnd(
+    modules: ReadonlyArray<TestModule>,
+    unhandledErrors: ReadonlyArray<SerializedError>,
+  ): void {
     const registros: Registro[] = [];
+    // Erros de COLETA — o arquivo nem chegou a ter testes. Sem esta coleta o
+    // relatório diria "falhas: nenhuma" para um arquivo que não compilou, que é
+    // pior do que não ter relatório. (Encontrado ao converter as specs de #545:
+    // um import mal posicionado deixou o arquivo inteiro fora da rodada e o
+    // bloco de diagnóstico dizia `executados=0 falharam=0`.)
+    const naoCarregaram: { arquivo: string; erros: string[] }[] = [];
 
     for (const modulo of modules) {
       for (const teste of modulo.children.allTests()) {
         registros.push(this.registro(modulo, teste));
       }
+      const erros = modulo.errors().map((e) => primeiraLinha(e.message));
+      for (const suite of modulo.children.allSuites()) {
+        erros.push(...suite.errors().map((e) => primeiraLinha(e.message)));
+      }
+      if (erros.length > 0) {
+        naoCarregaram.push({ arquivo: relativo(modulo.moduleId), erros });
+      }
     }
 
-    const linhas = this.montar(registros);
+    const linhas = this.montar(
+      registros,
+      naoCarregaram,
+      unhandledErrors.map((e) => primeiraLinha(e.message)),
+    );
     // Sempre imprime — mesmo verde. O bloco é curto quando não há nada a
     // dizer, e a sua presença constante é o que faz o leitor confiar que a
     // ausência de uma seção significa ausência do problema.
@@ -115,7 +135,11 @@ export default class DiagnosticoReporter implements Reporter {
     };
   }
 
-  private montar(registros: readonly Registro[]): string[] {
+  private montar(
+    registros: readonly Registro[],
+    naoCarregaram: readonly { arquivo: string; erros: string[] }[],
+    errosSoltos: readonly string[],
+  ): string[] {
     const out: string[] = [];
     const linha = '─'.repeat(72);
     out.push(linha);
@@ -129,6 +153,23 @@ export default class DiagnosticoReporter implements Reporter {
       `executados=${executados}  falharam=${falhos.length}  pulados=${pulados}` +
         `  (pulado NÃO é passou — specs de integração fazem describe.skip sem TEST_DB_URL)`,
     );
+
+    // ── arquivos que nem carregaram ──────────────────────────────────────
+    // Vem PRIMEIRO: um arquivo que não coletou não tem teste nenhum contado
+    // acima, e "executados=N falharam=0" sobre o resto é uma leitura falsa.
+    if (naoCarregaram.length > 0 || errosSoltos.length > 0) {
+      out.push('');
+      out.push(
+        `ARQUIVOS QUE NÃO CARREGARAM / ERROS FORA DE TESTE: ` +
+          `${naoCarregaram.length} arquivo(s), ${errosSoltos.length} erro(s) solto(s)`,
+      );
+      out.push('  Os contadores acima NÃO cobrem estes — nenhum caso deles chegou a rodar.');
+      for (const m of naoCarregaram) {
+        out.push(`  · ${m.arquivo}`);
+        for (const e of m.erros) out.push(`      ${e}`);
+      }
+      for (const e of errosSoltos) out.push(`  · (sem arquivo) ${e}`);
+    }
 
     // ── prazos estourados ────────────────────────────────────────────────
     const estouros = registros.filter((r) => r.erros.some((e) => RE_TIMEOUT.test(e)));
