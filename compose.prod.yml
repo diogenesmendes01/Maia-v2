@@ -12,6 +12,13 @@
 # recebe apenas o seu próprio env_file:
 #   app      → .env.app    (ver .env.app.prod.example)
 #   admin-ui → .env.admin  (ver .env.admin.prod.example)
+#   migrate  → NENHUM env_file: só o subset `migrator` do contrato (#515),
+#              injetado direto no `environment:` do serviço.
+#
+# Ordem de subida (issue #516): postgres healthy → `migrate` (job one-shot)
+# sair com 0 → app + admin-ui. Nenhum serviço de aplicação sobe contra um
+# schema atrasado, e um blocker de migration (dirty/checksum/missing_file)
+# segura o deploy inteiro em vez de deixar o app subir e responder 503.
 #
 # Postura de segurança vs docker-compose.yml (dev):
 #   - postgres/redis NÃO publicam porta no host: vivem na rede `data`
@@ -126,6 +133,73 @@ services:
       timeout: 5s
       retries: 10
 
+  # migrate — JOB ONE-SHOT (issue #516). Aplica as migrations e SAI.
+  #
+  #   postgres healthy → migrate completed successfully → app + admin-ui
+  #
+  # Antes disto o deploy documentado subia os serviços e o operador rodava
+  # `exec app npm run db:migrate` DEPOIS, à mão: entre um passo e outro a
+  # aplicação já estava de pé contra um schema atrasado. Com o job, a
+  # ordem é uma propriedade do arquivo, não da memória de quem deployou.
+  #
+  # Contrato do job (é dele que `service_completed_successfully` depende):
+  # `tsx scripts/migrate.ts up` roda UMA vez e sai 0 em sucesso/já-atualizado,
+  # != 0 em falha, blocker (dirty, checksum mismatch, missing_file) ou lock
+  # indisponível. Um blocker portanto SEGURA app/admin-ui fora do ar — que é
+  # o comportamento fail-closed pedido pela issue.
+  #
+  # `restart: "no"` é OBRIGATÓRIO e explícito: com `unless-stopped` (o que
+  # todos os outros serviços usam aqui) o container reiniciaria ao sair e
+  # NUNCA chegaria a "completed" — app/admin-ui esperariam para sempre.
+  #
+  # Réplicas: o job continua seguro se dois deploys rodarem ao mesmo tempo —
+  # o advisory lock global do runner (src/migrations/lock.ts) serializa, e o
+  # segundo migrator sai de forma limpa e observável.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "1001:1001"
+    # SEM env_file: o migrator recebe SÓ o subset `migrator` do contrato
+    # (#515 — src/config/migration-config.ts, src/config/generated/
+    # service-env-manifest.json): Postgres + knobs de processo. Nada de
+    # .env.app (LLM keys, sessão WhatsApp, credenciais S3): um container de
+    # migration que vaze não pode vazar o que nunca recebeu.
+    environment:
+      NODE_ENV: production
+      # Obrigatória no profile production (contract.ts: `requiredIn`). Fica
+      # interpolável para permitir um ensaio `staging` com o mesmo arquivo —
+      # `staging` é compatível com NODE_ENV=production (src/config/profiles.ts).
+      MAIA_ENV: ${MAIA_ENV:-production}
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      # rootfs read-only: sem isto o npm tentaria escrever o cache em
+      # $HOME (/home/maia), que não é gravável aqui.
+      npm_config_cache: /tmp/.npm
+      TZ: America/Sao_Paulo
+    command: ["npm", "run", "db:migrate"]
+    # SEM `ports:`, SEM rede `web` — o job só fala com o Postgres.
+    networks:
+      - data
+    # As migrations vêm empacotadas na imagem (Dockerfile: COPY migrations),
+    # que é o que torna checksum/`missing_file` uma afirmação sobre ESTA
+    # build. Nenhum volume de estado.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+
   app:
     build:
       context: .
@@ -137,6 +211,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # O schema tem que estar no head ANTES do primeiro request (#516).
+      migrate:
+        condition: service_completed_successfully
     # uid/gid 1001 (`maia`) já é o USER do runtime stage do Dockerfile;
     # repetir aqui garante que um drift na imagem não traga root de volta.
     user: "1001:1001"
@@ -202,6 +279,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Mesma razão do `app`: o console lê tabelas que só existem depois
+      # das migrations (#516).
+      migrate:
+        condition: service_completed_successfully
     user: "1001:1001"
     # Apenas os segredos DO ADMIN (NextAuth/OIDC + o mínimo transitivo que
     # src/config/env.ts exige) — o .env do app NÃO entra aqui.

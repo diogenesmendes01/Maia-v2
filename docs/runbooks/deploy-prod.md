@@ -27,7 +27,45 @@ docker compose --env-file .env.infra -f compose.prod.yml up -d --build
 docker compose --env-file .env.infra -f compose.prod.yml ps
 ```
 
-Migrations: `docker compose --env-file .env.infra -f compose.prod.yml exec app npm run db:migrate`.
+### Migrations: aplicadas pelo próprio `up` (issue #516)
+
+O `up` acima já aplica as migrations. `compose.prod.yml` tem um job
+one-shot `migrate` no meio da subida:
+
+```
+postgres healthy → migrate (roda `npm run db:migrate`, sai 0) → app + admin-ui
+```
+
+`app` e `admin-ui` declaram `depends_on: { migrate: { condition:
+service_completed_successfully } }`, então:
+
+- **o job falhou** (erro de SQL, `dirty`, checksum divergente,
+  `missing_file`, lock indisponível) ⇒ `docker compose up` sai **!= 0** e
+  NENHUM serviço de aplicação sobe. É o comportamento desejado: melhor um
+  deploy que não sobe do que uma instância de pé contra schema incompatível
+  respondendo 503 pelo `/readyz`;
+- **o job saiu 0** ⇒ o schema está no head desta build antes do primeiro
+  request.
+
+Diagnóstico quando o `up` para aqui:
+
+```bash
+C="docker compose --env-file .env.infra -f compose.prod.yml"
+$C ps -a                       # migrate deve aparecer como `exited (0)`
+$C logs migrate                # eventos JSON: migration.applied/failed/dirty/blocked
+$C run --rm migrate npm run db:migrate -- status   # read-only, não pega lock
+```
+
+Recuperação de `dirty`, checksum mismatch e `repair`:
+[`docs/runbooks/migrations.md`](migrations.md).
+
+O job **não** roda `_down` de nada e **não** dispensa o backup antes de uma
+migration destrutiva — ele só automatiza o passo forward que antes era
+manual (`exec app npm run db:migrate`), removendo a janela em que o app já
+estava de pé e o schema ainda não.
+
+Rodar migrations fora da subida (raro; o job já cobre o caso normal):
+`docker compose --env-file .env.infra -f compose.prod.yml run --rm migrate`.
 
 ## 2. Arquivos de segredo (o que mora onde)
 
@@ -64,6 +102,8 @@ docker exec -e REDISCLI_AUTH= maia-redis redis-cli ping   # → NOAUTH (esperado
 
 ```bash
 docker exec maia-app id        # uid=1001(maia)
+# `maia-migrate` é um job: já saiu. Confira no registro do container:
+docker inspect -f '{{.Config.User}} {{.State.ExitCode}}' maia-migrate  # 1001:1001 0
 docker exec maia-admin-ui id   # uid=1001(maia)
 docker exec maia-postgres id   # uid=999(postgres)
 docker exec maia-redis id      # uid=999(redis)

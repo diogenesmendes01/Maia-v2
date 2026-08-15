@@ -206,6 +206,7 @@ The ledger is the primary operational trail, because migrations can run before `
 | `tests/unit/runtime/lifecycle-schema-readiness.spec.ts` | The `/readyz` adapter: every blocking condition through the REAL decision core (injected pool + temp artifact), plus the cost contract (TTL cache, single-flight, negative caching) |
 | `tests/integration/lifecycle-probes.spec.ts` | Each schema condition asserted as an HTTP 503 from the REAL `GET /readyz` route on `buildServer()` — a mirrored harness would pass even with the call site deleted |
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
+| `tests/unit/migrations/compose-migrate-job.spec.ts` | The REAL `docker-compose.yml` / `compose.prod.yml`: the job exists, is gated on by `app`/`admin-ui` with `service_completed_successfully`, cannot restart itself out of "completed", shares the app's build, and (executably) its production environment satisfies `loadServiceConfig('migrator')` |
 | `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, `status` recomputed on both failure paths, the durability of a committed envelope (the hazard behind the guardrail) and the refusal of the file that would hit it, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
 ## How to extend
@@ -258,22 +259,66 @@ development is silent.
 
 **Deploy order.** The migrator must run before the application: a v1 ledger
 (rows without checksums) classifies as `checksum_unknown` and keeps `/readyz`
-at 503 until `migrate up` adopts the packaged checksums.
+at 503 until `migrate up` adopts the packaged checksums. That order is now a
+property of the deployment — see the next section.
+
+## The Compose job (what actually advances the schema)
+
+Everything above makes the schema *knowable*: it refuses traffic while the
+database is behind. Nothing above *advances* it. Without a migrator in the
+start-up path, `app` and `admin-ui` came up as soon as Postgres was healthy —
+against an empty database — and stayed at 503 until an operator remembered to
+run `exec app npm run db:migrate`. The readiness gate was doing its job and the
+deployment was still broken.
+
+Both `docker-compose.yml` and `compose.prod.yml` now carry a one-shot job:
+
+```
+postgres healthy → migrate (runs `npm run db:migrate`, exits 0) → app + admin-ui
+```
+
+| Property | Why it is what it is |
+|---|---|
+| same `build:` as `app` | the migrator applies exactly the migrations **this** build packages — the premise behind `checksum_mismatch` and `missing_file` |
+| `restart: "no"`, explicit | every other service uses `unless-stopped`; inheriting it restarts the container after exit 0, so it never reaches "completed" and every dependant waits forever |
+| `command: npm run db:migrate` | that is `up`, whose exit code is the contract: **0** success / already at head, **non-zero** failure, blocker or lock unavailable (`scripts/migrate.ts`) |
+| `app` / `admin-ui` gate on `service_completed_successfully` | a blocker (dirty, checksum, missing file) fails the whole `up` instead of producing a permanently-503 instance |
+| prod: **no** `env_file` | the migrator gets only the `migrator` subset of the config contract (#515) — Postgres + process knobs, never the LLM keys, WhatsApp session or S3 credentials |
+| prod: `user 1001:1001`, `read_only`, `cap_drop: ALL`, `data` network only | the same hardened posture as every other production container; a job that only talks to Postgres has no business on the `web` network |
+| dev: does **not** pin `NODE_ENV`/`MAIA_ENV` | `loadMigrationConfig()` rejects a contradiction between them (`profile/node-env-conflict`); pinning only `NODE_ENV=production` — what the `app` service does — would break every `.env` derived from `.env.example` |
+
+The local flow is untouched: `docker compose up -d postgres redis`
+(`npm run test:integration:setup`) names its services explicitly, so it starts
+only those two and their dependencies — never the job.
+
+`tests/unit/migrations/compose-migrate-job.spec.ts` reads BOTH real files and
+pins these properties, including an executable one: the environment
+`compose.prod.yml` injects into the job is fed to `loadServiceConfig('migrator')`
+and must validate. A missing `MAIA_ENV` there is not a subtle degradation — the
+job exits non-zero on its first line and, through the dependency edge, holds the
+whole stack down.
+
+**What the job does NOT do.** It never runs a `_down.sql` (nothing in this
+module can), it does not replace the backup that must precede a destructive
+migration, and it is not a boot-time migrator inside the app: `app` still starts
+`node dist/index.js` and only *validates* compatibility. Replicas never race —
+and if two deploys overlap, the global advisory lock serialises them and the
+second migrator exits cleanly.
 
 ## In-flight / not yet done (issue #516 DoD)
 
-Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API, and the `/readyz` gate that consumes it (see the section above).
+Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API, the `/readyz` gate that consumes it, and the one-shot Compose job that puts the schema at the head before `app`/`admin-ui` start (see the two sections above).
 
 Not yet delivered, tracked on #516:
 
-- no one-shot `migrate` service in `docker-compose.yml` / `compose.prod.yml`, and the Dockerfile still starts the app directly;
 - **the BOOT step still uses the weaker check.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. Readiness no longer does. Unifying them is a POLICY decision, not a wiring one: readiness answering "no" costs one instance out of rotation with a self-describing 503 body, while boot answering "no" costs a crash loop, and every condition that currently produces a diagnosable never-ready instance would become a restart loop. Deferred pending an owner decision;
-- `maia doctor` (#517) is a separate issue and consumes this module;
-- timeouts are call-site options with defaults, not configuration-contract variables (#515).
+- `maia doctor` (#517) is a separate issue and consumes this module. **Open question for the owner:** the DoD of #516 lists "Doctor integrado", and the "integrated doctor" (a read-only preflight) is not built here — does that item belong to #516 or does it move to #517? Treated as out of scope until the owner decides;
+- timeouts are call-site options with defaults, not configuration-contract variables (#515);
+- the equivalent of the job outside Compose (Kubernetes init job / Coolify release command) is documented nowhere yet — the issue asks for it and this repo deploys via Compose today.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-08-10 |
-| Against `main` HEAD | `0b20907e` |
+| Last verified | 2026-08-14 |
+| Against `main` HEAD | `8de8da4f` |

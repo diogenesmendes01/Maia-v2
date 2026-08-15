@@ -188,7 +188,14 @@ EOF
 chmod 600 .env.infra
 
 # 3. Suba (sem as vars acima o compose ABORTA — não há fallback maia/maia)
+#    O `up` aplica as migrations ANTES de app/admin-ui: o job one-shot
+#    `migrate` roda entre "postgres healthy" e a subida dos serviços, e
+#    app/admin-ui dependem dele com `service_completed_successfully`
+#    (issue #516). Se o job falhar — inclusive por blocker de migration
+#    (dirty, checksum, missing_file) — o `up` sai != 0 e NENHUM serviço de
+#    aplicação sobe. Não existe mais passo manual de migration no deploy.
 docker compose --env-file .env.infra -f compose.prod.yml up -d
+docker compose --env-file .env.infra -f compose.prod.yml logs migrate
 docker compose --env-file .env.infra -f compose.prod.yml logs -f app
 ```
 

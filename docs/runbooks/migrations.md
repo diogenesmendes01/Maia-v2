@@ -117,6 +117,38 @@ A second migrator started concurrently **waits** for the first (30s by
 default) and then exits cleanly with `lock_unavailable` — it never
 applies anything unguarded.
 
+### No deploy, quem roda isto é o Compose (issue #516)
+
+`docker-compose.yml` e `compose.prod.yml` têm um job one-shot `migrate`
+entre "postgres healthy" e a subida de `app`/`admin-ui`, que dependem
+dele com `service_completed_successfully`. Ou seja: **não há mais passo
+manual de migration no deploy** — o `docker compose up` aplica e só então
+sobe a aplicação.
+
+```
+postgres healthy → migrate (`npm run db:migrate`, exit 0) → app + admin-ui
+```
+
+Consequência operacional que importa: **um blocker segura o deploy
+inteiro**. Se o `up` falhar com `service "migrate" didn't complete
+successfully`, `app` e `admin-ui` ficam em `created` e nunca sobem. Isso
+é intencional (fail-closed): uma instância de pé contra schema
+incompatível responderia 503 no `/readyz` indefinidamente, o que é pior
+de diagnosticar do que um deploy que não subiu.
+
+```bash
+C="docker compose --env-file .env.infra -f compose.prod.yml"   # prod
+$C logs migrate            # eventos JSON: migration.applied / failed / dirty / blocked
+$C run --rm migrate npm run db:migrate -- status   # read-only, sem lock
+```
+
+Depois de diagnosticar (e, se for o caso, `repair` — abaixo), repita o
+`up`: o job roda de novo, e `migrate up` é idempotente.
+
+O job roda **apenas** forward. Ele não executa nenhum `_down.sql`, não
+substitui o backup exigido antes de uma migration destrutiva, e não muda
+nada do procedimento manual descrito no resto deste runbook.
+
 ### Checksums on migrations that predate them
 
 The first `up` after this change adopts the packaged checksum for every
