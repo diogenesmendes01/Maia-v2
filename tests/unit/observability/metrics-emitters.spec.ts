@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { counter, histogram, gauge, gaugeName } from '../../../src/observability/metrics.js';
+import {
+  counter,
+  histogram,
+  gauge,
+  gaugeName,
+  scopeAttribution,
+} from '../../../src/observability/metrics.js';
 import { _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 import { METRIC } from '../../../src/observability/taxonomy.js';
 import { renderPrometheus, _resetForTests } from '../../../src/lib/metrics.js';
@@ -37,6 +43,58 @@ describe('issue #514 — sanitized metric emitters', () => {
     const out = await renderPrometheus();
     expect(out).toContain('tenant_id="other"');
     expect(out).not.toContain('tenant_id="acme"');
+  });
+
+  /**
+   * Issue #519 — a ARMADILHA que `scopeAttribution` existe para desarmar.
+   *
+   * "Atribuir por escopo" NÃO é "passar o par do banco": o par vem de colunas
+   * NULLABLE, e `prepare()` resolve o rótulo com `??`, então um `null` explícito
+   * não atribui nada — ele DEVOLVE A DECISÃO AO ALS do instante da emissão. Um
+   * emissor que repassa `run.tenant_id` cru acerta a run com tenant e fica
+   * dependendo do contexto ambiente exatamente na run SEM tenant, que é a que
+   * ninguém olha.
+   */
+  it('um tenant_id null NÃO atribui system: o rótulo volta a ser o do ALS', async () => {
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'a1' }, async () => {
+      counter(METRIC.ONBOARDING_RUN_CANCELLED, {
+        reason: 'expired',
+        tenant_id: null,
+        agent_id: null,
+      });
+    });
+    const out = await renderPrometheus();
+    // O par nulo NÃO virou `system` — virou o escopo que estava no ar.
+    expect(out).toContain(
+      'maia_onboarding_run_cancelled_total{agent_id="a1",reason="expired",tenant_id="acme"} 1',
+    );
+  });
+
+  it('scopeAttribution colapsa o par ausente em system ANTES da emissão', async () => {
+    expect(scopeAttribution({ tenant_id: null, agent_id: null })).toEqual({
+      tenant_id: 'system',
+      agent_id: 'system',
+    });
+    // O escopo resolvido é preservado intacto — o colapso vale só para a ausência.
+    expect(scopeAttribution({ tenant_id: 'acme', agent_id: null })).toEqual({
+      tenant_id: 'acme',
+      agent_id: 'system',
+    });
+
+    // E, aplicado na emissão, o rótulo deixa de depender do ALS.
+    await runWithTenantContext({ tenant_id: 'vazado', agent_id: 'bot' }, async () => {
+      counter(METRIC.ONBOARDING_RUN_CANCELLED, {
+        reason: 'expired',
+        ...scopeAttribution({ tenant_id: null, agent_id: null }),
+      });
+    });
+    const out = await renderPrometheus();
+    expect(out).toContain(
+      'maia_onboarding_run_cancelled_total{agent_id="system",reason="expired",tenant_id="system"} 1',
+    );
+    expect(out).not.toContain('vazado');
+    // Nunca o literal recusado pela invariante MUST nº 8.
+    expect(out).not.toContain('tenant_id="default"');
   });
 
   it('strips PII labels before they reach the registry', async () => {

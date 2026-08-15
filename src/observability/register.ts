@@ -11,6 +11,7 @@
  */
 import { logger } from '@/lib/logger.js';
 import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
+import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
 import {
   registerDbPoolGauges,
@@ -111,6 +112,17 @@ export async function registerRuntimeObservability(): Promise<void> {
       const { backupProfile } = await import('@/ops/backup/config-input.js');
       return backupProfile();
     },
+  });
+
+  // Issue #519 — o backlog do `onboarding_expirer`. Lido no SCRAPE, do banco,
+  // pelo mesmo motivo do gate acima: uma fila publicada pelo worker congela no
+  // último valor quando o worker para, que é a falha que a série existe para
+  // pegar. O agregado vem do repositório (`snapshotExpiryBacklog`), com o mesmo
+  // predicado que a varredura usa e devolvendo só números — a forma sancionada
+  // de agregado cross-tenant, igual a `turnRepos.snapshotLiveTurnStates()`.
+  registerOnboardingExpiryGauges(async () => {
+    const { onboardingRunsRepo } = await import('@/db/repositories/onboarding-repos.js');
+    return onboardingRunsRepo.snapshotExpiryBacklog();
   });
 
   startOtlpExporter();

@@ -668,6 +668,19 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  ONBOARDING_EXPIRER_BATCH_LIMIT: {
+    name: 'ONBOARDING_EXPIRER_BATCH_LIMIT',
+    description:
+      'Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes.',
+    group: 'governance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(100),
+    example: '100',
+    fixture: '100',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   IDEMPOTENCY_BUCKET_MINUTES: {
     name: 'IDEMPOTENCY_BUCKET_MINUTES',
     description: 'Janela (min) do bucket de idempotência.',

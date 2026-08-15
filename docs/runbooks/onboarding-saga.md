@@ -308,8 +308,48 @@ permitido.
 legível e diagnosticável — nunca é apagada. O TTL default é 7 dias
 (`DEFAULT_RUN_TTL_MS`).
 
-Não há worker agendado chamando isso ainda; hoje é invocação manual ou por
-tarefa operacional.
+Desde a #555 quem chama é o worker `onboarding_expirer`
+(`src/workers/onboarding-expirer.ts`), registrado a cada 5 minutos na fase 1. A
+varredura é GLOBAL (roda sob contexto `system`: uma run pode vencer antes de
+existir tenant), expira um LOTE por tick e não faz laço até esvaziar.
+
+**O contrato de operação não é "100 a cada 5 minutos".** É *trabalho limitado
+por tick, backlog observável, prazo máximo de limpeza*:
+
+| Alavanca / sinal | Onde |
+|---|---|
+| Teto por tick | `ONBOARDING_EXPIRER_BATCH_LIMIT` (default 100, exige restart) |
+| Cadência | entrada `onboarding_expirer` em `src/workers/index.ts` |
+| O que foi expirado | `maia_onboarding_run_cancelled_total{reason="expired"}`, **por `tenant_id + agent_id` da run** (a run sem tenant cai no bucket `system`) |
+| O que ficou na fila | `maia_onboarding_expiry_backlog` |
+| Quanto a mais atrasada esperou | `maia_onboarding_expiry_oldest_age_seconds` |
+
+Prazo máximo de limpeza ≈ `backlog ÷ (teto × ticks por hora)`. Com o default,
+1.200 runs/hora: um backlog estável acima disso significa que o teto (ou a
+cadência) está abaixo da chegada — suba `ONBOARDING_EXPIRER_BATCH_LIMIT`
+primeiro, que é a alavanca sem redeploy de código.
+
+As duas séries de backlog são lidas **no scrape**, direto do banco
+(`src/observability/onboarding-expiry-collector.ts`), e não publicadas pelo
+worker: um valor publicado por quem drena a fila congela no último número se o
+worker parar, que é exatamente a falha que essas séries existem para pegar.
+Corolário para o plantão: `maia_onboarding_expiry_backlog` subindo **com**
+`maia_worker_last_success_timestamp{worker="onboarding_expirer"}` parado é
+worker morto; subindo **com** o worker carimbando sucesso é teto pequeno demais.
+`NaN` nas duas séries não é fila vazia — é leitura que falhou (banco fora, por
+exemplo). Esse `NaN` **persiste por até 15s** (a janela do snapshot), e é
+deliberado: a janela conta a última TENTATIVA, não a última leitura bem
+sucedida. Sem isso, um Postgres fora do ar faria cada scrape disparar uma query
+por série, todas condenadas — amplificando pressão exatamente durante o
+incidente. Ou seja: `NaN` que some sozinho depois de um scrape é falha
+transitória; `NaN` sustentado é indisponibilidade da leitura, e a investigação
+é do banco, não do worker.
+
+A varredura escolhe as vencidas por `expires_at ASC` (desempate por `id`), então
+com backlog maior que o teto a run mais antiga sai primeiro. É isso que torna
+`maia_onboarding_expiry_oldest_age_seconds` interpretável e o prazo de limpeza
+acima derivável: sem ordem determinística, a mais antiga poderia ser preterida
+tick após tick e a idade subiria para sempre sem nada estar quebrado.
 
 ## 6. Rollback
 

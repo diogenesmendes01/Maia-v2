@@ -338,6 +338,13 @@
           "restartRequired": true
         },
         {
+          "name": "ONBOARDING_EXPIRER_BATCH_LIMIT",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
           "name": "IDEMPOTENCY_BUCKET_MINUTES",
           "secret": false,
           "required": false,
@@ -1304,6 +1311,7 @@
             "VALOR_LIMITE_DURO",
             "DUAL_APPROVAL_TIMEOUT_HOURS",
             "AUDIT_MODE_TTL_HOURS",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "IDEMPOTENCY_BUCKET_MINUTES",
             "PENDING_QUESTION_TTL_MINUTES",
             "PENDING_ACTION_TTL_HOURS",
@@ -1485,6 +1493,7 @@
             "VALOR_LIMITE_DURO",
             "DUAL_APPROVAL_TIMEOUT_HOURS",
             "AUDIT_MODE_TTL_HOURS",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "IDEMPOTENCY_BUCKET_MINUTES",
             "PENDING_QUESTION_TTL_MINUTES",
             "PENDING_ACTION_TTL_HOURS",
@@ -1664,6 +1673,7 @@
             "VALOR_LIMITE_DURO",
             "DUAL_APPROVAL_TIMEOUT_HOURS",
             "AUDIT_MODE_TTL_HOURS",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "IDEMPOTENCY_BUCKET_MINUTES",
             "PENDING_QUESTION_TTL_MINUTES",
             "PENDING_ACTION_TTL_HOURS",

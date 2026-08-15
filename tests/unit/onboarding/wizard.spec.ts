@@ -301,7 +301,7 @@ const fakeRepo = {
     return [];
   },
   async expireStale() {
-    return 0;
+    return { total: 0, by_scope: [] };
   },
 };
 

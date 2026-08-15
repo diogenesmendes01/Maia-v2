@@ -88,6 +88,28 @@ describe('onboarding-repos — SQL executável nos predicados de conjunto', () =
     expect(sql.toLowerCase()).toContain('not in');
   });
 
+  /**
+   * O backlog só responde "estou perdendo a corrida?" se medir AS MESMAS linhas
+   * que o próximo tick pegaria. Um predicado que divergisse (esquecer o filtro
+   * de estado terminal, por exemplo) daria um número plausível e errado — pior
+   * que nenhum. Aqui os dois `WHERE` são compilados e comparados byte a byte.
+   */
+  it('snapshotExpiryBacklog mede EXATAMENTE as linhas que a varredura pegaria', async () => {
+    const now = new Date('2026-01-01T00:00:00Z');
+    const { onboardingRunsRepo } = await import(
+      '../../../src/db/repositories/onboarding-repos.js'
+    );
+    await onboardingRunsRepo.expireStale(now);
+    await onboardingRunsRepo.snapshotExpiryBacklog(now);
+
+    expect(captured, 'os dois WHERE deveriam ter sido capturados').toHaveLength(2);
+    const sweep = new PgDialect().sqlToQuery(captured[0]!);
+    const backlog = new PgDialect().sqlToQuery(captured[1]!);
+    expect(backlog.sql).toBe(sweep.sql);
+    expect(backlog.params).toEqual(sweep.params);
+    expect(backlog.sql).not.toMatch(ROW_CONSTRUCTOR_ON_SET_OP);
+  });
+
   it('o conjunto terminal vem de TERMINAL_STATES, não de literal duplicado', async () => {
     const { TERMINAL_STATES } = await import('../../../src/onboarding/state-machine.js');
     const { onboardingRunsRepo } = await import(
