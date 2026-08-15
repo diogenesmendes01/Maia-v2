@@ -29,6 +29,7 @@ import { featureFlags } from '@/config/feature-flags.js';
 import { incCounter } from '@/lib/metrics.js';
 import { instrumentToolDispatch } from '@/observability/instrumentation.js';
 import { config } from '@/config/env.js';
+import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 
 /**
  * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
@@ -104,6 +105,28 @@ async function dispatchToolInner(input: {
   args: unknown;
   ctx: ToolContext;
 }): Promise<DispatchResult> {
+  // Issue #504 §Fencing — LIMITE DE EFEITO. Antes de qualquer coisa: esta
+  // tentativa ainda é dona do turno?
+  //
+  // O fence do banco protege `agent_turns` e nada mais. Um worker que perdeu a
+  // lease (heartbeat morto, takeover depois do vencimento) só descobria isso na
+  // transição final — depois de a tool ter criado a transação, emitido o
+  // boleto, chamado a API externa. Aqui a pergunta é feita ANTES, e a resposta
+  // "não" cancela sem executar.
+  //
+  // PRIMEIRA linha do dispatcher, acima até do desvio MCP, porque a posse não é
+  // um detalhe de uma família de tools: nenhuma delas pode rodar em nome de uma
+  // tentativa encerrada. E antes da reserva de idempotência de propósito — uma
+  // reserva criada aqui prenderia a chave contra o worker que TEM a posse.
+  //
+  // Fora de um turno reivindicado (`FEATURE_TURN_CLAIM` OFF, worker de agenda,
+  // playground) o guard é no-op — ver `runtime/turns/execution-context.ts`.
+  if (turnOwnershipLost()) {
+    reportBlockedEffect('tool_dispatch');
+    logger.warn({ tool: input.tool }, 'tool.turn_ownership_lost');
+    return { error: 'turn_ownership_lost', details: { tool: input.tool } };
+  }
+
   // Issue #478 — tools MCP (`mcp:<server>:<tool>`) são dinâmicas (DB), não
   // vivem no REGISTRY. O bridge revalida TODAS as guardas server-side (flag,
   // pack no grant, tool aprovada+read-only, server ativo) e audita cada
