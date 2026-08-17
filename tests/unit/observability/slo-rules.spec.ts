@@ -82,6 +82,13 @@ const PRE_EXISTING_METRICS: Record<string, string> = {
   // `maia:context_load_ms:p95` deixou de ter emissor: `maia_context_load_ms` era
   // da montagem P8a, cujo hot path a PR #406 removeu.
   maia_turn_context_load_duration_ms: 'src/agent/turn-context/metrics.ts:91',
+  // Gauges por worker, registradas em `registerWorkerGauges` com
+  // `metricsInternal.key(...)` — fora do gate de rótulos da taxonomia, como as
+  // demais entradas desta tabela. Entrou aqui com `onboarding.rules.yml`
+  // (#519): a descrição do alerta de backlog manda o plantão comparar o atraso
+  // da fila com o último sucesso do `onboarding_expirer`, e essa comparação é
+  // o que separa "worker morto" de "teto pequeno demais".
+  maia_worker_last_success_timestamp: 'src/workers/index.ts:239',
 };
 
 /**

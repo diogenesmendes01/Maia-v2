@@ -540,6 +540,7 @@ rule_files:
   - /etc/prometheus/rules/redis.rules.yml
   - /etc/prometheus/rules/working-memory.rules.yml
   - /etc/prometheus/rules/backup.rules.yml
+  - /etc/prometheus/rules/onboarding.rules.yml
 ```
 
 Monte `monitoring/alerts/` read-only no container do Prometheus nesse caminho.

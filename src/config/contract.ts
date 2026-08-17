@@ -668,19 +668,6 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
-  ONBOARDING_EXPIRER_BATCH_LIMIT: {
-    name: 'ONBOARDING_EXPIRER_BATCH_LIMIT',
-    description:
-      'Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes.',
-    group: 'governance',
-    secret: false,
-    services: ['runtime'],
-    schema: posInt(100),
-    example: '100',
-    fixture: '100',
-    restartRequired: true,
-    commentedInExample: true,
-  },
   IDEMPOTENCY_BUCKET_MINUTES: {
     name: 'IDEMPOTENCY_BUCKET_MINUTES',
     description: 'Janela (min) do bucket de idempotência.',
@@ -738,6 +725,26 @@ export const ENV_CONTRACT = {
     schema: posInt(5),
     example: '5',
     fixture: '5',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
+  // ---- onboarding (decisão 13, #519) -------------------------------------
+  // O domínio da saga (`src/onboarding/`) e do worker `onboarding_expirer`.
+  // Estas chaves moravam em `governance`; o grupo é só o índice do operador
+  // nos artefatos gerados, então mover NÃO altera schema, default,
+  // `requiredIn` nem `services` de nenhuma delas — ver
+  // `tests/unit/config/onboarding-group.spec.ts`.
+  ONBOARDING_EXPIRER_BATCH_LIMIT: {
+    name: 'ONBOARDING_EXPIRER_BATCH_LIMIT',
+    description:
+      'Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes.',
+    group: 'onboarding',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(100),
+    example: '100',
+    fixture: '100',
     restartRequired: true,
     commentedInExample: true,
   },
