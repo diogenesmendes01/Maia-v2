@@ -112,7 +112,13 @@ describe('Node/npm version parity (#515)', () => {
       engines: { node: string; npm: string };
       packageManager: string;
     };
-    expect(pkg.engines.node).toBe(`>=${NODE_MAJOR}.0.0`);
+    // A paridade que ESTE arquivo cobre é a LINHA (major), que é o que o
+    // `.nvmrc` fixa. O minor/patch do piso não é escolha livre: ele é o maior
+    // mínimo exigido pela árvore do lockfile sob `engine-strict=true` (hoje
+    // 22.13.0, por causa do eslint) e pelo npm pinado. Quem deriva e cobra
+    // esse número é tests/unit/scripts/check-node.spec.ts — repeti-lo aqui
+    // criaria um segundo número para envelhecer sozinho.
+    expect(pkg.engines.node).toMatch(new RegExp(`^>=${NODE_MAJOR}\\.\\d+\\.\\d+$`));
     expect(pkg.packageManager).toMatch(/^npm@11\./);
     expect(pkg.engines.npm).toContain('11.5.2');
   });

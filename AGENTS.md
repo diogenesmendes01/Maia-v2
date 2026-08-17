@@ -122,6 +122,7 @@ npm run test:e2e                  # e2e
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
+npm run check:node                # guard de versão do Node (.mjs puro, roda com `node` direto — o mesmo que o `preinstall` dispara)
 npm run docs:ai:check             # AI engineering docs governance
 npm run config:check:drift        # config contract: generated artifacts up to date? (#515)
 npm run typecheck                 # tsc --noEmit
