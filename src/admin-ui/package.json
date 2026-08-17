@@ -22,7 +22,7 @@
     "@tanstack/react-table": "8.20.5",
     "react-hook-form": "7.53.2",
     "react-diff-viewer-continued": "4.4.0",
-    "recharts": "2.15.4",
+    "recharts": "3.10.1",
     "zod": "3.23.8",
     "drizzle-orm": "0.45.2",
     "pg": "8.13.0"
