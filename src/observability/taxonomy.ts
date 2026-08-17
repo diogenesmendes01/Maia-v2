@@ -288,7 +288,7 @@ export const METRIC = {
   LLM_CIRCUIT_WOULD_REJECT: 'maia_llm_circuit_would_reject_total',
   /**
    * Kill-switch usage. `state` is the posture that was forced, `reason` ∈
-   * applied|expired|cleared|rejected|adopted|resynced|resync_failed|resync_aborted.
+   * applied|expired|cleared|rejected|adopted|resynced|resync_failed|resync_cancelled.
    * A lever that can be pulled without a deploy MUST leave a trace that
    * alerting can see; the matching `llm_gateway.circuit_mode_override` log line
    * carries actor and reason.
@@ -330,13 +330,15 @@ export const METRIC = {
    * twenty is the case they exist to catch, and a `sum` would dissolve it.
    * Triage per `outcome` is in `docs/runbooks/observability-slo.md` §4.9.3.
    *
-   * `resync_aborted` is the THIRD bucket, and neither of the other two (owner
+   * `resync_cancelled` is the THIRD bucket, and neither of the other two (owner
    * review on PR #561, finding 2): the subscriber was CLOSED — drain, deploy —
    * while the re-read was in flight, so it was cancelled rather than finished.
    * Folding it into `resync_failed` would make every deliberate drain page;
    * folding it into `resynced` would claim a convergence that never happened,
    * which is exactly the false green evidence the `enforce` promotion gate must
    * not read. No alert selects it: a replica on its way out is not an incident.
+   * The matching log line is `llm_gateway.circuit_override_resync_cancelled` at
+   * INFO — normal operation, never silence (owner decision 16).
    */
   LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 

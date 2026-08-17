@@ -37,6 +37,19 @@ WORKDIR /app
 RUN apk add --no-cache libc6-compat \
   && npm install -g npm@11.5.2
 COPY package.json package-lock.json ./
+# O guard precisa existir no filesystem antes do `npm ci`: o `preinstall` do
+# package.json ainda o encadeia (rede de segurança do caminho `npm install`),
+# e a linha `RUN node scripts/check-node.mjs` abaixo o invoca de propósito.
+# Copiar só o guard (e não o `scripts/` inteiro) preserva o cache deste layer.
+COPY scripts/check-node.mjs ./scripts/check-node.mjs
+# O guard é INVOCADO explicitamente, e não deixado a cargo do `preinstall`:
+# com `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+# `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que passa o
+# `preinstall` só roda DEPOIS de a árvore estar escrita. Quem barra de fato é
+# `devEngines.runtime` (package.json, onFail: error); esta linha garante a
+# MENSAGEM legível por construção. Coberto por
+# tests/unit/scripts/check-node.spec.ts.
+RUN node scripts/check-node.mjs
 # `npm ci`: instala exatamente o lockfile, falha em drift.
 RUN npm ci --omit=dev --no-audit --no-fund
 

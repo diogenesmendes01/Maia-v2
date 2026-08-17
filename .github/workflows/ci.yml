@@ -34,7 +34,21 @@ jobs:
         #    incompatibilities were never caught in CI (#396).
         # Keep these in sync: bump the second entry whenever the Dockerfile
         # base image major changes.
-        node: [22, 26]
+        #
+        # A perna do piso é pinada em 22.18 (e não no `22` flutuante): o piso
+        # que o repo SUPORTA é `engines.node: ">=22.13.0"` (o maior mínimo
+        # entre o npm@11.5.2 pinado e o eslint do lockfile, que o
+        # `engine-strict=true` do .npmrc torna obrigatório), mas o que a lane
+        # EXERCITA passa a ser um número explícito e reproduzível, em vez de
+        # "o 22.x mais novo que o runner tiver hoje".
+        # DIVERGÊNCIA ABERTA (não resolvida aqui, de propósito): o comentário
+        # acima afirma que a segunda perna espelha a imagem de produção com
+        # `FROM node:26-alpine`. O Dockerfile hoje diz `FROM node:22-alpine`
+        # (topo do arquivo, com o comentário explicando a descida de 26 -> 22).
+        # Ou seja: a perna 26 não espelha mais nada — ela cobre um major que
+        # produção não usa. Manter as duas pernas ou derrubar a 26 é decisão do
+        # dono; esta mudança só pinou o piso da perna 22.
+        node: ['22.18', 26]
     services:
       redis:
         image: redis:7-alpine
@@ -89,6 +103,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -236,7 +261,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          # Mesmo piso pinado dos jobs matriciais (22.18), para o audit rodar
+          # no Node que as outras lanes rodam.
+          node-version: '22.18'
           cache: 'npm'
       - name: Pin npm to 11.5.2
         # Mesmo pin do job validate (ci.yml acima): o audit resolve advisories
@@ -287,7 +314,9 @@ jobs:
         # Same rationale as the `validate` job: cover the engines floor (22,
         # the .nvmrc dev pin) and the production image major (26, Dockerfile
         # `FROM node:26-alpine`). See #396. Keep in sync with the Dockerfile.
-        node: [22, 26]
+        # Piso pinado em 22.18, pelo mesmo motivo do job `validate` — e com a
+        # mesma divergência aberta sobre a perna 26 vs `node:22-alpine`.
+        node: ['22.18', 26]
     services:
       postgres:
         # pgvector/pgvector:pg16 ships pgvector preinstalled. The image is
@@ -355,6 +384,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -445,3 +485,59 @@ jobs:
       # causa do runner em vez de por causa da imagem.
       - name: Smoke do job migrate na imagem de produção
         run: bash scripts/smoke-migrate-image.sh
+
+  # ---------------------------------------------------------------------
+  # Regras de alerta, avaliadas pelo motor REAL (#519, decisão 14). Job novo,
+  # isolado e apendado no mesmo padrão do `smoke-migrate-image`: sem
+  # `setup-node`, sem `npm ci`, sem service containers, sem matriz.
+  #
+  # Por que ele existe: `tests/unit/observability/*-alert-rules.spec.ts`
+  # executa as `expr` reais e cobre limiar, operador e escopo, mas com um
+  # avaliador INSTANTÂNEO — ele afirma o `for:` como CAMPO e não consegue
+  # simular tempo. Quem prova `pending → firing` é `promtool test rules`, e
+  # um arquivo de teste que ninguém executa apodrece.
+  #
+  # Usa o `/bin/promtool` da imagem oficial do Prometheus em vez de baixar o
+  # binário Go solto: a imagem é assinada, versionada e já está no cache do
+  # runner. A tag é pinada — não existe Prometheus versionado neste repo
+  # hoje (só um exemplo sem tag em `docs/runbooks/redis.md`); quando existir,
+  # ESTA tag e a do deploy têm de andar juntas.
+  # ---------------------------------------------------------------------
+  alert-rules:
+    name: regras de alerta (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
+      # sintaticamente inválido ou uma `expr` que não compila derruba o
+      # carregamento do grupo inteiro no Prometheus, em silêncio.
+      #
+      # Os globs sao expandidos AQUI, no runner, dentro de `monitoring/alerts`,
+      # e so os nomes resolvidos entram no `docker run`. A primeira versao
+      # passava `*.rules.yml` cru: o shell do runner tem `cwd` na RAIZ do repo,
+      # o glob nao casava nada, bash o repassava literal e o promtool respondia
+      # `path '*.rules.yml' does not exist`. Expandir dentro do container
+      # resolveria tambem, mas exigiria `--entrypoint sh` e um shell na imagem;
+      # assim o job nao depende de nada alem do proprio binario.
+      - name: promtool check rules (todos os arquivos)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./*.rules.yml)
+          echo "arquivos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            check rules $files
+
+      # E a prova temporal, que é a razão de o job existir.
+      - name: promtool test rules (semântica de for:)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./tests/*.test.yml)
+          echo "casos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            test rules $files

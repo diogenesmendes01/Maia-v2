@@ -351,6 +351,109 @@ com backlog maior que o teto a run mais antiga sai primeiro. É isso que torna
 acima derivável: sem ordem determinística, a mais antiga poderia ser preterida
 tick após tick e a idade subiria para sempre sem nada estar quebrado.
 
+### 5.1 Alertas do backlog — por IDADE, não por contagem
+
+Regras carregáveis: [`monitoring/alerts/onboarding.rules.yml`](../../monitoring/alerts/onboarding.rules.yml).
+Este runbook diz o que o operador FAZ; aquele arquivo é a config. Se um limiar
+mudar num, mude no outro — `tests/unit/observability/onboarding-expiry-alert-rules.spec.ts`
+reprova se um alerta de lá não for narrado aqui.
+
+**Por que não `backlog > N`.** O mesmo N erra nos dois sentidos. 5.000 runs que
+venceram há 30 segundos disparam qualquer limiar de contagem e não são problema:
+o expirer drena ~1.200/hora e a fila some sozinha — alerta falso, e alerta falso
+treina o plantão a ignorar. Já UMA run parada há 12 minutos nunca chega perto de
+`> 100`, e é a falha que importa: a varredura pega as vencidas por
+`expires_at ASC`, então a mais antiga sai PRIMEIRO. Se ela não saiu, ela não está
+esperando a vez — está presa.
+
+| Alerta | Condição | Sustentação | Severidade |
+|---|---|---|---|
+| `MaiaOnboardingExpiryBacklogStaleWarning` | backlog > 0 **e** idade da mais antiga > 600s | `for: 5m` | warning |
+| `MaiaOnboardingExpiryBacklogStaleCritical` | backlog > 0 **e** idade da mais antiga > 1800s | **sem `for`** | critical |
+| `MaiaOnboardingExpiryMetricsAbsent` | **nenhuma** réplica publica a série **ou** alguma publica `NaN` | `for: 10m` | warning |
+
+A sustentação de 5 minutos **do warning** é a CADÊNCIA do worker:
+`onboarding_expirer` roda a cada 5 minutos (`src/workers/index.ts`), então uma
+janela menor alertaria no intervalo normal entre dois ticks, quando ainda não se
+sabe se algo falhou.
+
+**O critical não tem `for`, e isso é decisão registrada** (issue #519, revisão da
+PR #590 — o primeiro corte trazia `for: 5m`). Os 1800s JÁ são a sustentação: a
+idade é monotônica enquanto a run não sai da fila, então "passou de 30 minutos"
+só é alcançável por uma condição que durou 30 minutos. Um `for: 5m` aqui não
+filtraria ruído — empurraria o page para ~35m30s (limiar + sustentação, com o
+grupo avaliando a cada 30s) e faria a regra mentir sobre o próprio nome. E o
+ruído que um `for` pegaria não existe nesta série: uma falha de leitura publica
+`NaN`, não uma idade finita falsa, e `NaN > 1800` é falso — esse caso é do
+`MetricsAbsent`. O tempo em que o warning já estava firing **não** conta para o
+critical: são dois alertas independentes.
+
+O terceiro alerta não é decoração. O collector publica `NaN` — não `0` — quando
+a leitura falha (§5, "postura de falha"), e `NaN > 600` é FALSO: sem ele, um
+Postgres fora do ar silenciaria os dois primeiros exatamente durante o incidente.
+Os dois primeiros agregam com `max` (nunca `sum`, que multiplicaria o backlog
+pelo número de réplicas — mesma nota multi-réplica de
+`monitoring/alerts/slo.rules.yml`).
+
+**O que o `MetricsAbsent` detecta, e o que ele NÃO detecta.** Os dois ramos dele
+têm alcances diferentes, e confundi-los já custou uma revisão:
+
+| Ramo | Alcance | Detecta |
+|---|---|---|
+| `absent(<série>)` | **FROTA INTEIRA** | ninguém, em nenhuma réplica, publica a série. Se uma única réplica saudável ainda a publica, `absent()` devolve vazio e este ramo fica calado. |
+| `<série> != <série>` (idioma de `NaN`) | **POR RÉPLICA** — preserva `instance` | uma réplica que publica `NaN`, que é o que o collector faz quando a leitura falha (`src/observability/onboarding-expiry-collector.ts`, "postura de falha"). Uma cega entre vinte acorda o alerta com o `instance` dela. |
+
+Consequência escrita, não implícita: **uma réplica que pare de expor a série por
+completo não é detectada por este alerta.** Ela não publica `NaN` — ela não
+publica nada, e uma série ausente não é `NaN`; enquanto qualquer outra réplica
+publicar, `absent()` continua vazio. Na prática esse estado é do processo, não da
+leitura: as gauges são registradas no boot
+(`registerOnboardingExpiryGauges`) e uma réplica viva sempre as expõe, ainda que
+como `NaN`. Uma réplica que sumiu do `/metrics` é uma réplica morta ou fora do
+scrape, e quem cobre isso é o `up`/target health do Prometheus — não esta regra.
+Detecção por réplica a partir de um inventário de targets seria trabalho
+separado; `unless on(instance, job) up` foi considerado e recusado porque o
+`prometheus.yml` não é versionado neste repositório e um `job` errado faria o
+alerta de cegueira nunca disparar — fail-open no alerta que existe justamente
+contra cegueira silenciosa. O caso está travado por teste
+(`monitoring/alerts/tests/onboarding.rules.test.yml`, "gauge ausente em UMA
+replica nao dispara", e o par em
+`tests/unit/observability/onboarding-expiry-alert-rules.spec.ts`), que fixa a
+limitação para que ninguém "conserte" a documentação em vez do alerta.
+
+**Reagindo ao warning.** Comece separando worker morto de teto pequeno:
+
+- `maia_worker_last_success_timestamp{worker="onboarding_expirer"}` parado →
+  worker morto ou desagendado. Vá para o log `worker.scheduled`.
+- carimbando sucesso → teto abaixo da chegada (suba
+  `ONBOARDING_EXPIRER_BATCH_LIMIT`, ver §5) **ou** uma run presa.
+
+**Reagindo ao critical.** Não suba o teto primeiro: subir o teto não solta uma
+linha travada. Identifique a run mais antiga e o que a segura —
+
+```sql
+SELECT id, tenant_id, agent_id, state, expires_at, updated_at
+  FROM onboarding_runs
+ WHERE expires_at < now() AND state <> ALL(ARRAY['completed','cancelled','failed_terminal'])
+ ORDER BY expires_at ASC
+ LIMIT 10;
+```
+
+(os estados terminais são `TERMINAL_STATES` em `src/onboarding/state-machine.ts` —
+a lista acima é ilustrativa; use a de lá se ela tiver mudado). As séries de
+backlog são agregados globais e **não** carregam `tenant_id`/`agent_id` por
+desenho (§5): é esta query, o evento e a auditoria que dizem DE QUEM é a run.
+Se houver uma transação segurando a linha, `pg_locks`/`pg_stat_activity` dizem
+quem.
+
+**Prova das regras.** [`monitoring/alerts/tests/onboarding.rules.test.yml`](../../monitoring/alerts/tests/onboarding.rules.test.yml)
+é um caso de `promtool test rules` com linha do tempo — é o que prova o `for:`.
+Ele **roda no CI**, no job `alert-rules` (`.github/workflows/ci.yml`), que usa o
+`/bin/promtool` da imagem oficial do Prometheus (tag pinada) e executa também um
+`check rules` sobre TODOS os arquivos de `monitoring/alerts/`. `promtool` não é
+dependência instalada deste repositório: para reproduzir localmente, o cabeçalho
+daquele arquivo traz o comando `docker run` com a mesma versão do CI.
+
 ## 6. Rollback
 
 A ordem importa.
