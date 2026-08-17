@@ -452,7 +452,7 @@ groups:
       # vem fechando.
       #
       # O QUE DELIBERADAMENTE NÃO ENTRA AQUI (achado 2 da review da PR #561):
-      # `reason="resync_aborted"`. É a releitura CANCELADA pelo fechamento do
+      # `reason="resync_cancelled"`. É a releitura CANCELADA pelo fechamento do
       # subscriber — deploy, scale-in, restart. A réplica não divergiu: ela
       # está saindo, e ninguém mais depende do estado dela. Somá-la nestes
       # seletores faria TODO deploy paginar em `enforce`. Os dois seletores

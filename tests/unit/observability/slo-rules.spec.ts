@@ -369,7 +369,7 @@ describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
 
   /**
    * Achado 2 da review do dono na PR #561. O desfecho de shutdown
-   * (`reason="resync_aborted"`, `src/lib/llm/cache-invalidation.ts`) é a
+   * (`reason="resync_cancelled"`, `src/lib/llm/cache-invalidation.ts`) é a
    * releitura CANCELADA por um drain — a réplica está saindo, não divergindo.
    * Se ele cair nestes seletores, TODO deploy passa a paginar em `enforce`, que
    * é exatamente o defeito apontado.
@@ -378,15 +378,15 @@ describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
    * `reason=~"resync_.*"` ou `reason!="resynced"` teriam nome de métrica válido
    * e casariam o balde novo em silêncio.
    */
-  it('o desfecho de drain (`resync_aborted`) não é selecionado por alerta nenhum', () => {
+  it('o desfecho de drain (`resync_cancelled`) não é selecionado por alerta nenhum', () => {
     for (const name of Object.keys(RESYNC_ALERTS)) {
       const expr = exprOf(alertBlock(name));
       expect(
         expr,
         `${name} seleciona o desfecho de drain: um deploy deliberado passa a alertar`,
-      ).not.toContain('resync_aborted');
+      ).not.toContain('resync_cancelled');
       // Igualdade exata, nunca regex nem negação: as duas formas casariam
-      // `resync_aborted` sem citá-lo.
+      // `resync_cancelled` sem citá-lo.
       expect(expr, `${name} usa regex em \`reason\` — o balde de drain entra junto`).not.toMatch(
         /reason\s*=~/,
       );
@@ -402,12 +402,12 @@ describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
     for (const file of RULE_FILES) {
       for (const [n, line] of RULE_TEXT[file]!.split('\n').entries()) {
         if (/^\s*#/.test(line)) continue;
-        if (line.includes('resync_aborted')) offenders.push(`${file}:${n + 1}: ${line.trim()}`);
+        if (line.includes('resync_cancelled')) offenders.push(`${file}:${n + 1}: ${line.trim()}`);
       }
     }
     expect(
       offenders,
-      'regra executável seleciona `resync_aborted` — drain vira alerta: ' + offenders.join(' | '),
+      'regra executável seleciona `resync_cancelled` — drain vira alerta: ' + offenders.join(' | '),
     ).toEqual([]);
   });
 
