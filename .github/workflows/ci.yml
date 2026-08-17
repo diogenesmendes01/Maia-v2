@@ -240,8 +240,9 @@ jobs:
         # `security/audit-exceptions.json` com motivo, dono e `expires`. Uma
         # exceção vencida reprova; uma exceção que não casa mais com nenhum
         # advisory também reprova, o que força a limpeza do ledger; e uma
-        # exceção cuja severidade não bate mais com a que o npm reporta reprova
-        # também, porque a decisão registrada valia para outro risco.
+        # exceção cujo `max_severity` (TETO, não igualdade) ficou ABAIXO da
+        # severidade que o npm reporta hoje reprova também, porque a decisão
+        # registrada valia para um risco menor. Queda de severidade não reprova.
         #
         # O guard NÃO confia no exit code do `npm audit` (ele sai != 0 quando
         # ACHA vulnerabilidade), e por isso valida a FORMA do relatório: falha
