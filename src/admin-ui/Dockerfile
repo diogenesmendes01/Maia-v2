@@ -37,6 +37,11 @@ WORKDIR /app
 RUN apk add --no-cache libc6-compat \
   && npm install -g npm@11.5.2
 COPY package.json package-lock.json ./
+# O `preinstall` do package.json roda `node scripts/check-node.mjs` — e
+# `preinstall` dispara em TODO `npm ci`, inclusive aqui. Sem esta cópia o
+# build morre com MODULE_NOT_FOUND antes de instalar qualquer coisa. Copiar
+# só o guard (e não o `scripts/` inteiro) preserva o cache deste layer.
+COPY scripts/check-node.mjs ./scripts/check-node.mjs
 # `npm ci`: instala exatamente o lockfile, falha em drift.
 RUN npm ci --omit=dev --no-audit --no-fund
 

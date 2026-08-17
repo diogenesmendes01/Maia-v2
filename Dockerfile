@@ -11,12 +11,22 @@ RUN apk add --no-cache postgresql-client tini \
 
 FROM base AS deps
 COPY package.json package-lock.json ./
+# O `preinstall` do package.json roda `node scripts/check-node.mjs` — e
+# `preinstall` dispara em TODO `npm ci`, inclusive aqui. Sem esta cópia o
+# build morre com MODULE_NOT_FOUND antes de instalar qualquer coisa. Copiar
+# só o guard (e não o `scripts/` inteiro) preserva o cache deste layer.
+COPY scripts/check-node.mjs ./scripts/check-node.mjs
 # `npm ci` (não `npm install`): instala EXATAMENTE o lockfile e falha em
 # drift, em vez de regenerar silenciosamente um lockfile incompatível.
 RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM base AS build
 COPY package.json package-lock.json ./
+# O `preinstall` do package.json roda `node scripts/check-node.mjs` — e
+# `preinstall` dispara em TODO `npm ci`, inclusive aqui. Sem esta cópia o
+# build morre com MODULE_NOT_FOUND antes de instalar qualquer coisa. Copiar
+# só o guard (e não o `scripts/` inteiro) preserva o cache deste layer.
+COPY scripts/check-node.mjs ./scripts/check-node.mjs
 RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build

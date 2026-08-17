@@ -150,3 +150,61 @@ describe('scripts/check-node.mjs — guard de versão do Node', () => {
     expect(pkg.scripts['check:node']).toBe('node scripts/check-node.mjs');
   });
 });
+
+/**
+ * O guard roda no `preinstall`, e `preinstall` dispara em TODO `npm ci` — o do
+ * runner, o do `docker build` e o do build do admin-ui. Um guard referenciado
+ * por um `preinstall` que aponta para um arquivo ausente não protege ninguém:
+ * ele derruba o build com `MODULE_NOT_FOUND` no lugar de deixá-lo passar.
+ *
+ * Os stages de dependência dos Dockerfiles copiam SÓ `package.json` +
+ * `package-lock.json` antes do `npm ci` — de propósito, para o layer de cache
+ * não invalidar a cada mudança de código. É exatamente a janela em que o guard
+ * não existe no filesystem. Este bloco existe para que essa janela reprove
+ * aqui, e não no `docker build`.
+ */
+describe('o guard existe onde o preinstall vai procurá-lo', () => {
+  const GUARD_PATH = 'scripts/check-node.mjs';
+
+  /** Stages de um Dockerfile: nome + linhas, na ordem. */
+  function stagesOf(dockerfile: string) {
+    const stages: Array<{ name: string; lines: string[] }> = [];
+    for (const line of readFileSync(resolve(REPO_ROOT, dockerfile), 'utf8').split('\n')) {
+      if (/^\s*FROM\s+/i.test(line)) {
+        const as = /\bAS\s+(\S+)/i.exec(line);
+        stages.push({ name: as ? as[1] : line.trim(), lines: [] });
+      } else if (stages.length > 0) {
+        stages[stages.length - 1]?.lines.push(line);
+      }
+    }
+    return stages;
+  }
+
+  it.each(['Dockerfile', 'src/admin-ui/Dockerfile'])(
+    '%s: todo stage que roda `npm ci` sobre o package.json da raiz copia o guard antes',
+    (dockerfile) => {
+      const offenders: string[] = [];
+      for (const stage of stagesOf(dockerfile)) {
+        let rootPkgCopied = false;
+        let guardAvailable = false;
+        for (const line of stage.lines) {
+          if (/^\s*COPY\s/i.test(line) && !/--from=/i.test(line)) {
+            // `COPY package.json ...` (raiz) — não `COPY src/admin-ui/package.json`.
+            if (/(^|\s)(\.\/)?package\.json(\s|$)/.test(line)) rootPkgCopied = true;
+            if (line.includes(GUARD_PATH) || /^\s*COPY\s+\.\s+\.\/?\s*$/.test(line)) {
+              guardAvailable = true;
+            }
+          }
+          if (/^\s*RUN\b/i.test(line) && /\bnpm\s+ci\b/.test(line) && rootPkgCopied) {
+            if (!guardAvailable) offenders.push(`${dockerfile} [stage ${stage.name}]: ${line.trim()}`);
+          }
+        }
+      }
+      expect(
+        offenders,
+        `preinstall roda \`node ${GUARD_PATH}\` e o arquivo não foi copiado neste stage:\n` +
+          offenders.join('\n'),
+      ).toEqual([]);
+    },
+  );
+});
