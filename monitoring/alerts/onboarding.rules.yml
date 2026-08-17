@@ -1,0 +1,122 @@
+# Prometheus alerting rules — backlog do `onboarding_expirer` (issue #519).
+#
+# Fonte da verdade dos alertas narrados em docs/runbooks/onboarding-saga.md
+# §5.1. O runbook diz o que o operador FAZ; este arquivo é a config carregável.
+# Mantenha os dois em sincronia — `tests/unit/observability/
+# onboarding-expiry-alert-rules.spec.ts` reprova se um alerta daqui não for
+# narrado lá.
+#
+# As séries vêm de src/observability/onboarding-expiry-collector.ts, lidas em
+# tempo de SCRAPE a partir de `onboarding_runs` (`snapshotExpiryBacklog`), com o
+# MESMO predicado da varredura — não de um valor que o worker publica. Um gauge
+# publicado por quem drena a fila congela no último número saudável quando o
+# worker para, que é exatamente a falha que estas séries existem para pegar.
+#
+#   maia_onboarding_expiry_backlog               runs vencidas e não terminais
+#   maia_onboarding_expiry_oldest_age_seconds    atraso da mais antiga, em s
+#
+# ## Por que IDADE e não contagem (decisão do dono, #519)
+#
+# "Não alertar apenas por backlog > N. Usar idade e cadência."
+#
+# `backlog > N` erra nos dois sentidos, e é o mesmo N que produz os dois erros:
+#
+#   - 5.000 runs que venceram há 30 segundos disparam `> 100` e não são
+#     problema nenhum — o expirer drena 1.200/hora e a fila some sozinha. Um
+#     alerta que grita nisso treina o plantão a ignorá-lo.
+#   - UMA run parada há 12 minutos nunca chega perto de `> 100`, e é a falha que
+#     importa: a varredura escolhe por `expires_at ASC`, então a mais antiga sai
+#     PRIMEIRO. Se ela não saiu, ela não está esperando a vez — está presa.
+#
+# A contagem sozinha não distingue "empatando" de "perdendo"; a idade sozinha
+# não distingue mil runs atrasadas de uma run travada. Os dois termos juntos, e
+# nessa ordem, são a condição.
+#
+# ## Multi-réplica: `max`, nunca `sum`
+#
+# As duas gauges são lidas no scrape do MESMO Postgres, então toda réplica
+# reporta o mesmo número. `sum` multiplicaria o backlog pelo número de réplicas
+# — a mesma nota que governa `maia_queue_depth` em slo.rules.yml. `max` também
+# é o que faz uma réplica cega (que publica `NaN`) não silenciar a que enxerga:
+# a agregação ignora `NaN` enquanto houver amostra finita.
+#
+# ## Escopo
+#
+# NÃO há recorte por `tenant_id`/`agent_id`, e isso é deliberado no emissor: é a
+# profundidade de uma FILA GLOBAL de housekeeping, e a query devolve só números
+# — nenhum id atravessa a fronteira (ver o comentário de `snapshotExpiryBacklog`
+# em src/db/repositories/onboarding-repos.ts, mesmo desenho de
+# `maia_scheduler_backlog{queue}`). Quem precisa saber DE QUEM é a run atrasada
+# tem a run, o evento e a auditoria — o runbook §5.1 traz a query.
+#
+# Wiring: carregue via `rule_files` do Prometheus, e.g.
+#
+#   rule_files:
+#     - /etc/prometheus/rules/onboarding.rules.yml   # este arquivo
+groups:
+  - name: maia_onboarding_expiry
+    interval: 30s
+    rules:
+      # WARNING — backlog > 0 E a mais antiga atrasada há mais de 10 minutos,
+      # sustentado por 5 minutos. O `for` é a CADÊNCIA da decisão: o expirer
+      # roda a cada 5 minutos, então uma janela menor alertaria no intervalo
+      # normal entre dois ticks, quando ainda não se sabe se algo falhou.
+      - alert: MaiaOnboardingExpiryBacklogStaleWarning
+        expr: max(maia_onboarding_expiry_backlog) > 0 and max(maia_onboarding_expiry_oldest_age_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Onboarding: run vencida há mais de 10min sem ser expirada"
+          description: |
+            A run vencida mais ANTIGA não sai da fila há mais de 10 minutos, e a
+            varredura pega as vencidas por `expires_at ASC` — ela deveria ter
+            saído primeiro. Duas causas, e a série do worker separa as duas:
+            `maia_worker_last_success_timestamp{worker="onboarding_expirer"}`
+            parado é worker morto/desagendado; carimbando sucesso é teto pequeno
+            (ONBOARDING_EXPIRER_BATCH_LIMIT) ou uma run presa.
+            O TAMANHO do backlog não é o sinal — leia a idade.
+            Runbook: docs/runbooks/onboarding-saga.md §5.1
+
+      # CRITICAL — meia hora. Nesse ponto não há leitura benigna: nenhuma
+      # combinação de teto e cadência saudáveis deixa a mais antiga esperando
+      # 30 minutos.
+      - alert: MaiaOnboardingExpiryBacklogStaleCritical
+        expr: max(maia_onboarding_expiry_backlog) > 0 and max(maia_onboarding_expiry_oldest_age_seconds) > 1800
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Onboarding: run vencida há mais de 30min sem ser expirada"
+          description: |
+            A varredura não está drenando. Uma run vencida que sobrevive 30
+            minutos ao worker está presa (transação segurando a linha) ou o
+            worker não está rodando. Vá direto ao §5.1 do runbook: identifique a
+            run mais antiga e o que a está segurando ANTES de subir
+            ONBOARDING_EXPIRER_BATCH_LIMIT — subir o teto não solta uma linha
+            travada.
+            Runbook: docs/runbooks/onboarding-saga.md §5.1
+
+      # Cegueira não é saúde (#514). O collector derruba o snapshot e publica
+      # `NaN` quando a leitura falha — deliberadamente, porque `0` seria "a fila
+      # está vazia", a leitura mais perigosa possível de uma leitura que não
+      # aconteceu. `NaN > 600` é falso, então SEM este alerta um Postgres fora
+      # do ar silenciaria os dois acima.
+      #
+      # Sem agregação: `instance` fica preservado de propósito — uma réplica
+      # cega entre vinte é o caso, e `max()` a esconderia atrás das saudáveis.
+      # `for: 10m` porque o `NaN` transitório de um scrape é normal (a janela do
+      # snapshot é de 15s); o que pede humano é o `NaN` sustentado.
+      - alert: MaiaOnboardingExpiryMetricsAbsent
+        expr: absent(maia_onboarding_expiry_backlog) or (maia_onboarding_expiry_backlog != maia_onboarding_expiry_backlog)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backlog do onboarding ilegível — cegueira, não fila vazia"
+          description: |
+            As gauges de backlog do onboarding estão ausentes ou em `NaN` há mais
+            de 10 minutos. Enquanto isso durar, os dois alertas de atraso acima
+            NÃO podem disparar: não se sabe se há fila. `NaN` sustentado é
+            indisponibilidade da LEITURA (Postgres, pool), não do worker.
+            Runbook: docs/runbooks/onboarding-saga.md §5.1
