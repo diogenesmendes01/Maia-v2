@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "15.5.22",
+    "next": "16.3.1",
     "next-auth": "5.0.0-beta.32",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
