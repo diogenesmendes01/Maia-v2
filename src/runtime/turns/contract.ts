@@ -86,6 +86,7 @@ export const TURN_OUTCOMES = [
   'quarantined',
   'rate_limited_silent',
   'operator_cancelled',
+  'pending_race_lost',
   'merged_into_turn',
   'retry_exhausted',
   'unsafe_to_retry',
@@ -167,6 +168,14 @@ export const TERMINAL_OUTCOMES: Readonly<Record<TerminalTurnStatus, readonly Tur
     'quarantined',
     'rate_limited_silent',
     'operator_cancelled',
+    // A mensagem foi classificada como RESPOSTA a uma pergunta pendente e
+    // perdeu a corrida para outra resposta que já resolveu a mesma pendência
+    // (`GateResult.kind === 'race_lost'`). É descarte por regra explícita, não
+    // execução: quem despachou a ação foi o OUTRO turno. `completed` mentiria —
+    // ele é reservado a turnos que executaram até o fim, e reinterpretar a
+    // mensagem perdedora como comando novo é justamente o que esta regra
+    // proíbe.
+    'pending_race_lost',
   ],
   superseded: ['merged_into_turn'],
   // `unsafe_to_retry`: a tentativa falhou DEPOIS de uma tool com efeito externo
