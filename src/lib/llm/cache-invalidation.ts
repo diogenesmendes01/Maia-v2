@@ -55,6 +55,7 @@ import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
+import { safeFailure } from '@/lib/safe-failure.js';
 import { incCounter } from '@/lib/metrics.js';
 import { counter, METRIC } from '@/observability/metrics.js';
 import {
@@ -652,8 +653,11 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
     );
   } catch (err) {
     // Fechamento vem ANTES do log e do retry: uma réplica que está saindo não
-    // produz `settings_resubscribe_failed` nem gasta tentativa.
-    if (!life.alive) return { retry: false, outcome: 'cancelled' };
+    // produz `settings_resubscribe_failed` nem gasta tentativa. O motivo do
+    // DRIVER vai junto — censurado por `safeFailure`, ver `finishResync`.
+    if (!life.alive) {
+      return { retry: false, outcome: 'cancelled', error: safeFailure(err).reason };
+    }
     logger.warn(
       { err: (err as Error).message, channels: SUBSCRIBED_CHANNELS },
       'llm_gateway.settings_resubscribe_failed',
@@ -695,7 +699,9 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
       life,
     );
   } catch (err) {
-    if (!life.alive) return { retry: false, outcome: 'cancelled' };
+    if (!life.alive) {
+      return { retry: false, outcome: 'cancelled', error: safeFailure(err).reason };
+    }
     return { retry: true, error: (err as Error).message };
   }
 
@@ -854,9 +860,45 @@ function finishResync(
     return;
   }
   if (outcome === 'cancelled') {
-    // Nome de log PRÓPRIO: um `grep circuit_override_resynced` num pós-mortem
-    // não pode devolver linhas de releituras que foram canceladas pelo drain.
-    logger.warn(record, 'llm_gateway.circuit_override_resync_cancelled');
+    /**
+     * INFO, e não WARN — decisão 16 do dono: "emitir evento, não silêncio.
+     * (…) Um log INFO."
+     *
+     * O cancelamento é operação NORMAL: o subscriber parou (drain, deploy,
+     * scale-in) e ninguém mais depende do estado desta réplica. A #561 já
+     * tinha tirado este desfecho do ERROR de divergência — pintá-lo de WARN
+     * devolve o mesmo ruído um degrau abaixo, e um nível que aparece em todo
+     * deploy é um nível que o plantão aprende a ignorar. O que responde pelo
+     * silêncio é a linha EXISTIR e ser contável, não ela ser alarmante.
+     *
+     * Nome de log PRÓPRIO pelo mesmo motivo de antes: um
+     * `grep circuit_override_resynced` num pós-mortem não pode devolver
+     * linhas de releituras que foram canceladas pelo drain.
+     *
+     * O que a linha carrega além do `record` comum, e por quê:
+     *
+     *  - `cancel_reason` — a RAZÃO. `outcome="cancelled"` diz o quê; sozinho
+     *    ele não separa "o subscriber fechou" de um deadline ou de uma
+     *    divergência. Hoje só existe uma razão para este desfecho (o
+     *    `life.alive` caiu, em qualquer um dos cinco pontos de decisão da
+     *    releitura), e escrevê-la explicitamente é o que permite acrescentar
+     *    uma segunda sem quebrar quem já lê esta linha.
+     *  - `channels` — QUAL subscriber foi fechado, no mesmo vocabulário de
+     *    `settings_invalidation_subscriber_started` e de
+     *    `settings_resubscribe_failed`. A réplica em si (`pid`, `hostname`) o
+     *    pino já carimba em toda linha (`base`, `src/lib/logger.ts`), então
+     *    repeti-la aqui só engordaria o registro.
+     *
+     * `record.err`, quando existe, é a mensagem do DRIVER e já vem por
+     * `safeFailure()` (`src/lib/safe-failure.ts`) lá de `attemptResync`: uma
+     * falha de conexão é exatamente o erro que carrega a DSN inteira, e é
+     * exatamente o que alguém vai ler no meio de um incidente (#533). Redação
+     * é do helper, nunca escrita de novo aqui.
+     */
+    logger.info(
+      { ...record, cancel_reason: 'subscriber_stopped', channels: SUBSCRIBED_CHANNELS },
+      'llm_gateway.circuit_override_resync_cancelled',
+    );
     return;
   }
   logger.warn(record, 'llm_gateway.circuit_override_resynced');

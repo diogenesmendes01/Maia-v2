@@ -338,7 +338,10 @@ sobre essa série.
 - `cancelled` — a réplica estava **drenando**. O subscriber foi fechado (deploy,
   scale-in, restart) com a releitura em backoff ou com um `GET` em voo, e ela
   foi **cancelada**, não concluída. Sai como `reason="resync_cancelled"` e log
-  WARN `llm_gateway.circuit_override_resync_cancelled`. Nenhum dos dois alertas o
+  **INFO** `llm_gateway.circuit_override_resync_cancelled` — com `cancel_reason`
+  (a razão) e `channels` (qual subscriber). INFO porque um subscriber que para
+  é operação normal, não anomalia (decisão 16 do dono); o que responde pelo
+  silêncio é a linha existir, não ela ser alarmante. Nenhum dos dois alertas o
   seleciona: um drain deliberado não pode acordar o plantão — era o defeito
   apontado na review da PR #561. Um pico deste desfecho durante um deploy é
   esperado; **fora** de janela de deploy, ele diz que alguma coisa está

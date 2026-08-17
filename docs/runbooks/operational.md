@@ -405,9 +405,11 @@ diz qual:
 
 **Réplica drenando não é divergência.** Se o subscriber for fechado (deploy,
 scale-in, restart) com a releitura em voo, ela é **cancelada** e sai como
-`reason="resync_cancelled"` + log WARN
+`reason="resync_cancelled"` + log **INFO**
 `llm_gateway.circuit_override_resync_cancelled` — fora dos dois alertas. Um drain
-deliberado não acorda o plantão (achado 2 da review da PR #561).
+deliberado não acorda o plantão (achado 2 da review da PR #561). A linha traz
+`cancel_reason` (por que foi cancelado) e `channels` (qual subscriber fechou);
+INFO, e não WARN, porque um subscriber que para é operação normal (decisão 16).
 
 Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há
 override" a partir de um Redis mudo (ou de um payload que não passa na

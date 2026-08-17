@@ -1066,6 +1066,93 @@ describe('kill switch — releitura na reconexão', () => {
     });
 
     /**
+     * DECISÃO 16 DO DONO — "emitir evento, não silêncio. (…) Um log INFO."
+     *
+     * Presença de log não basta: uma linha que só diz `outcome="cancelled"`
+     * não é acionável às 3h. O plantão que vê o balde subir FORA de janela de
+     * deploy precisa de duas coisas na mesma linha — POR QUE foi cancelado (o
+     * subscriber parou; não foi deadline, não foi divergência) e QUAL
+     * subscriber, no vocabulário que o resto do arquivo já usa para
+     * identificá-lo (`channels`, os dois canais deste subscriber). O `pid` e o
+     * `hostname` da réplica o pino já carimba em toda linha (`base` em
+     * `src/lib/logger.ts:82`).
+     *
+     * E a linha não pode carregar segredo. A mensagem que chega ao desfecho de
+     * cancelamento vem do driver, e a falha de conexão é justamente a que traz
+     * a DSN inteira — o par da #533 ("a mensagem mais perigosa é a mais
+     * consultada"). O contrato aqui é `safeFailure()`
+     * (`src/lib/safe-failure.ts`), que já censura URI: nada de redação nova. O
+     * caso abaixo prova as três coisas de uma vez, e prova a redação pelo
+     * MARCADOR do helper — um implementador que simplesmente jogasse a
+     * mensagem fora passaria no "não vaza" e reprovaria aqui, que é o ponto:
+     * o motivo do driver é diagnóstico, ele deve chegar, censurado.
+     */
+    it('o cancelamento diz POR QUE e QUAL subscriber, e sem segredo na linha', async () => {
+      const info = vi.spyOn(logger, 'info');
+      try {
+        const sub = await bootSubscriber();
+        const before = llmSettingsSubscriberResyncCount();
+
+        // A DSN com credencial, exatamente como o ioredis a devolve.
+        const SEGREDO = 'redis://maia:s3nh4-sup3r@redis.interno:6379/0';
+        let rejectGet: ((e: Error) => void) | undefined;
+        redisMock.get.mockImplementation(
+          () =>
+            new Promise<string | null>((_resolve, reject) => {
+              rejectGet = reject;
+            }),
+        );
+        redisMock.get.mockClear();
+        info.mockClear();
+
+        sub.emit('close');
+        sub.emit('reconnecting');
+        sub.emit('ready');
+        await waitUntil(() => redisMock.get.mock.calls.length >= 1);
+        expect(redisMock.get.mock.calls.length, 'nenhum `GET` em voo para falhar').toBe(1);
+
+        // O `GET` falha e o drain acontece na MESMA volta do event loop: é o
+        // caminho em que a mensagem do driver alcança o desfecho de
+        // cancelamento em vez de virar retry.
+        rejectGet!(new Error(`connect ECONNREFUSED ${SEGREDO}`));
+        await stopLLMSettingsInvalidationSubscriber();
+        await waitUntil(() => llmSettingsSubscriberResyncCount() > before, 500);
+        expect(
+          llmSettingsSubscriberResyncCount(),
+          'a releitura não terminou: o teste não chegou ao desfecho de cancelamento',
+        ).toBe(before + 1);
+
+        const linha = info.mock.calls.find(
+          (c) => c[1] === 'llm_gateway.circuit_override_resync_cancelled',
+        );
+        expect(linha, 'o cancelamento não emitiu evento nenhum em INFO — voltou o silêncio').toBeDefined();
+
+        const record = linha![0] as Record<string, unknown>;
+        expect(
+          record.cancel_reason,
+          'a linha não diz POR QUE foi cancelado: `outcome` sozinho não distingue drain de deadline',
+        ).toBe('subscriber_stopped');
+        expect(
+          record.channels,
+          'a linha não identifica o subscriber que foi fechado',
+        ).toEqual([LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL]);
+        expect(record.outcome).toBe('cancelled');
+
+        const serializada = JSON.stringify(record);
+        expect(serializada, 'a credencial do Redis vazou na linha de log').not.toContain(
+          's3nh4-sup3r',
+        );
+        expect(serializada, 'a URI de conexão vazou na linha de log').not.toContain('redis://');
+        expect(
+          serializada,
+          'o motivo do driver não chegou censurado — ou sumiu, ou passou por redação caseira em vez de `safeFailure()`',
+        ).toContain('[REDACTED_URL]');
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    /**
      * O desenho do achado 2 dizia que `cancelled` fica FORA de
      * `DIVERGENT_OUTCOMES` — mas nada pinava isso. Verifiquei acrescentando
      * `'cancelled'` ao conjunto: os 26 casos continuavam VERDES.
@@ -1083,13 +1170,15 @@ describe('kill switch — releitura na reconexão', () => {
      * false` estaria olhando para a implementação, e sobreviveria a alguém
      * mudar o `if` do log.
      */
-    it('o drain loga em WARN com nome próprio — nunca ERROR de divergência', async () => {
+    it('o drain loga em INFO com nome próprio — nunca ERROR de divergência', async () => {
+      const info = vi.spyOn(logger, 'info');
       const warn = vi.spyOn(logger, 'warn');
       const error = vi.spyOn(logger, 'error');
       try {
         const sub = await bootSubscriber();
         redisMock.get.mockRejectedValue(new Error('ECONNRESET'));
         redisMock.get.mockClear();
+        info.mockClear();
         warn.mockClear();
         error.mockClear();
 
@@ -1109,16 +1198,26 @@ describe('kill switch — releitura na reconexão', () => {
           'o drain escreveu linha de ERRO: um deploy deliberado vira incidente no pós-mortem',
         ).not.toContain('llm_gateway.circuit_override_resync_failed');
 
+        const infoMsgs = info.mock.calls.map((c) => c[1]);
+        expect(
+          infoMsgs,
+          'o drain não deixou rastro com nome próprio',
+        ).toContain('llm_gateway.circuit_override_resync_cancelled');
+
+        // NÍVEL, e não só presença (decisão 16): o cancelamento é operação
+        // NORMAL — o subscriber parou. WARN aqui devolve o ruído de deploy que
+        // a #561 tirou do ERROR, só um degrau abaixo.
         const warnMsgs = warn.mock.calls.map((c) => c[1]);
         expect(
           warnMsgs,
-          'o drain não deixou rastro com nome próprio',
-        ).toContain('llm_gateway.circuit_override_resync_cancelled');
+          'o cancelamento saiu em WARN: um drain deliberado continua pintado como anomalia',
+        ).not.toContain('llm_gateway.circuit_override_resync_cancelled');
         expect(
           warnMsgs,
           'o cancelamento foi contado como convergência — evidência verde falsa no gate que libera `enforce`',
         ).not.toContain('llm_gateway.circuit_override_resynced');
       } finally {
+        info.mockRestore();
         warn.mockRestore();
         error.mockRestore();
       }

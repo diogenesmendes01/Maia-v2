@@ -329,6 +329,11 @@ atraso. A conta do teto vive em `resyncWorstCaseMs()`, num lugar só:
 como morto antes de qualquer `await`, e a releitura em voo — em backoff ou com
 um `GET` pendurado — termina na hora como `cancelled`, com
 `reason="resync_cancelled"`, fora de `DIVERGENT_OUTCOMES` e fora dos dois alertas.
+O desfecho **emite evento, nunca silêncio**: log INFO
+`llm_gateway.circuit_override_resync_cancelled` com `cancel_reason` e `channels`,
+e o `err` do driver — quando existe — já censurado por `safeFailure()`
+(`src/lib/safe-failure.ts`), porque a falha de conexão é justamente a que carrega
+a DSN inteira (#533).
 Antes, ela acordava depois do `quit()`, gastava as tentativas restantes contra
 um cliente encerrado e saía como `resync_failed`: um deploy deliberado podia
 PAGINAR (`state="enforce"`) uma réplica que estava apenas saindo. O `unref` dos

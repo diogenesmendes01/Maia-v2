@@ -337,6 +337,8 @@ export const METRIC = {
    * folding it into `resynced` would claim a convergence that never happened,
    * which is exactly the false green evidence the `enforce` promotion gate must
    * not read. No alert selects it: a replica on its way out is not an incident.
+   * The matching log line is `llm_gateway.circuit_override_resync_cancelled` at
+   * INFO — normal operation, never silence (owner decision 16).
    */
   LLM_CIRCUIT_MODE_OVERRIDES: 'maia_llm_circuit_mode_overrides_total',
 
