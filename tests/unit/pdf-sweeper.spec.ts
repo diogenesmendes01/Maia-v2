@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 import { mkdir, writeFile, readdir, rm, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -30,6 +31,11 @@ beforeEach(async () => {
   await mkdir(dir, { recursive: true });
 });
 
+// #545: `_sweeper.js` reexporta `MEDIA_ROOT` de `@/gateway/baileys.js`, então
+// carregá-lo puxa o grafo do Baileys inteiro — 5.83–6.38s medidos a frio,
+// contra 1–16ms de trabalho real por caso.
+const sweeper = moduloDeProducao(() => import('../../src/lib/pdf/_sweeper.js'));
+
 describe('sweepPdfTmp', () => {
   it('removes *.pdf files older than 1 hour, keeps fresh ones', async () => {
     const dir = join(SANDBOX, 'media', 'tmp');
@@ -44,7 +50,7 @@ describe('sweepPdfTmp', () => {
     await utimes(oldPath, twoHoursAgo, twoHoursAgo);
     await utimes(nonPdfPath, twoHoursAgo, twoHoursAgo);
 
-    const { sweepPdfTmp } = await import('../../src/lib/pdf/_sweeper.js');
+    const { sweepPdfTmp } = sweeper();
     const swept = await sweepPdfTmp();
     expect(swept).toBe(1); // only old.pdf removed (non-pdf ignored, fresh kept)
 
@@ -53,14 +59,14 @@ describe('sweepPdfTmp', () => {
   });
 
   it('returns 0 when tmp dir is empty', async () => {
-    const { sweepPdfTmp } = await import('../../src/lib/pdf/_sweeper.js');
+    const { sweepPdfTmp } = sweeper();
     expect(await sweepPdfTmp()).toBe(0);
   });
 
   it('does not throw when tmp dir does not exist (idempotent)', async () => {
     // Force missing-dir scenario: remove tmp to simulate first-boot.
     await rm(join(SANDBOX, 'media', 'tmp'), { recursive: true, force: true });
-    const { sweepPdfTmp } = await import('../../src/lib/pdf/_sweeper.js');
+    const { sweepPdfTmp } = sweeper();
     expect(await sweepPdfTmp()).toBe(0);
     // Restore for any later tests in this file (none here, but defensive):
     await mkdir(join(SANDBOX, 'media', 'tmp'), { recursive: true });

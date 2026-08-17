@@ -172,7 +172,16 @@ async function runTurnRecoveryInner(): Promise<void> {
   for (const { turn, reason } of candidates) {
     incCounter('maia_turn_recovery_candidates_total', { reason });
     try {
-      await enqueueAgent({ mensagem_id: turn.representative_message_id });
+      // #504 — o `turn_id` faz o `jobId` ser determinístico. Duas instâncias
+      // do recovery varrendo o mesmo par (tenant, agent) ao mesmo tempo — ou o
+      // recovery e o ingresso — armam o MESMO job em vez de dois, e a BullMQ
+      // ignora o segundo `add`. É esta linha que fecha "várias instâncias do
+      // recovery não geram execução duplicada" no transporte; o claim atômico
+      // fecha o mesmo no banco, e as duas camadas são independentes.
+      await enqueueAgent({
+        mensagem_id: turn.representative_message_id,
+        turn_id: turn.id,
+      });
       // Só `received` e `retryable` têm aresta para `queued`. Um turno já em
       // `queued` (job perdido) ou em `claimed`/`running` com lease vencida é
       // rearmado na FILA sem mexer no estado — tentar transicionar aqui só

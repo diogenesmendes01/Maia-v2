@@ -1834,6 +1834,21 @@
         "true"
       ]
     },
+    "FEATURE_TURN_CLAIM": {
+      "type": "string",
+      "description": "Claim ATÔMICO do turno com lease e fencing (issue #504). OFF (default): o runtime usa o claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas podem processar o mesmo turno. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, renova lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token vigente; perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a reivindicar). Kill switch: false volta ao caminho de #503 sem perder claims já gravados. Ver docs/runbooks/turn-state-machine.md §6.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "FEATURE_TURN_STATE_AUTHORITATIVE": {
       "type": "string",
       "description": "Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno `retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído (`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. Ver docs/runbooks/turn-state-machine.md §2.",
@@ -2533,6 +2548,36 @@
       "default": "false",
       "examples": [
         "false"
+      ]
+    },
+    "TURN_LEASE_TTL_MS": {
+      "type": "string",
+      "description": "Validade (ms) da lease do claim do turno (#504). É o tempo MÁXIMO que um turno fica preso depois de o worker dono morrer sem aviso — mais curto recupera antes, e mais longo tolera melhor uma pausa de GC ou um provedor lento. Curto demais produz takeover FALSO, que é execução dupla; por isso deve ficar confortavelmente acima da duração p99 de um turno quando somado ao heartbeat. Relação com TURN_LEASE_HEARTBEAT_MS validada no boot.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "60000",
+      "examples": [
+        "60000"
+      ]
+    },
+    "TURN_LEASE_HEARTBEAT_MS": {
+      "type": "string",
+      "description": "Intervalo (ms) entre renovações da lease do turno (#504). DEVE caber ao menos três vezes em TURN_LEASE_TTL_MS — com duas, uma única renovação perdida já deixa a lease vencer e o turno é tomado por outro worker enquanto o dono ainda está processando. A regra cross-field turn-lease/heartbeat-ratio recusa o boot quando a relação é insegura.",
+      "x-maia-type": "number",
+      "x-maia-group": "performance",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "15000",
+      "examples": [
+        "15000"
       ]
     },
     "TURN_CONTEXT_CACHE_TTL_MS": {

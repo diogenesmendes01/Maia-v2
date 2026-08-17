@@ -161,6 +161,61 @@ d('agent turns — leak suite cross-tenant', () => {
     expect(Number(after?.state_version)).toBe(v);
   });
 
+  // Issue #504 — as três primitivas de POSSE. Estão aqui, e não só na suíte de
+  // claim, porque é esta suíte que roda em `npm run test:leak` e é ela que pega
+  // "alguém acrescentou um método e esqueceu o escopo". Um claim sem
+  // `tenant_id + agent_id` no WHERE seria a pior variante do vazamento: não só
+  // leitura, mas TOMADA DE POSSE de trabalho de outro tenant.
+  it('posse: claim, heartbeat e liberação não alcançam turno de outro par', async () => {
+    const { agentTurnsRepo } = await loadRepos();
+    const msgB = await mkInbound(T_B, A_B);
+    const turnB = await inB(() =>
+      agentTurnsRepo.ensureTurnForMessage({
+        id: msgB,
+        tenant_id: T_B,
+        agent_id: A_B,
+        conversa_id: null,
+        channel_id: null,
+      }),
+    );
+
+    // A não consegue reivindicar o turno de B.
+    const alienClaim = await inA(() =>
+      agentTurnsRepo.tryClaimTurn({ turn_id: turnB.id, worker_id: 'wA', lease_ms: 60_000 }),
+    );
+    expect(alienClaim).toMatchObject({ ok: false, reason: 'not_found' });
+
+    // O dono reivindica...
+    const owned = await inB(() =>
+      agentTurnsRepo.tryClaimTurn({ turn_id: turnB.id, worker_id: 'wB', lease_ms: 60_000 }),
+    );
+    expect(owned.ok).toBe(true);
+    if (!owned.ok) return;
+
+    // ...e A, mesmo DE POSSE DO TOKEN (o pior caso: token vazado por log ou
+    // por um payload malformado), não renova nem libera fora do escopo dele.
+    const alienRenew = await inA(() =>
+      agentTurnsRepo.renewTurnLease({
+        turn_id: turnB.id,
+        claim_token: owned.claim.claim_token,
+        lease_ms: 60_000,
+      }),
+    );
+    expect(alienRenew).toMatchObject({ ok: false });
+    const alienRelease = await inA(() =>
+      agentTurnsRepo.releaseTurnClaim({
+        turn_id: turnB.id,
+        claim_token: owned.claim.claim_token,
+      }),
+    );
+    expect(alienRelease).toEqual({ released: false });
+
+    // A posse do dono seguiu intacta.
+    const after = await inB(() => agentTurnsRepo.findById(turnB.id));
+    expect(after?.claimed_by).toBe('wB');
+    expect(after?.claim_token).toBe(owned.claim.claim_token);
+  });
+
   it('recovery: findRecoverableTurns só devolve turnos do par corrente', async () => {
     const { agentTurnsRepo } = await loadRepos();
     const stale = 60_000;

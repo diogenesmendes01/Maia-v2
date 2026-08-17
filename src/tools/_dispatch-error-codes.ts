@@ -57,6 +57,7 @@ export const DISPATCHER_ERROR_CODES = [
   'idempotency_owner_failed',
   'idempotency_wait_timeout',
   'idempotency_completion_fenced',
+  'turn_ownership_lost',
   'execution_failed',
 ] as const;
 
@@ -70,6 +71,10 @@ export const MCP_BRIDGE_ERROR_CODES = [
   'requires_dual_approval',
   'invalid_args',
   'mcp_call_failed',
+  // #504 — o bridge revalida a posse no PRÓPRIO limite de efeito (a chamada
+  // HTTP ao servidor externo), então ele também produz esta recusa. Mesmo
+  // código, mesma classificação REFUSAL do dispatcher: nada rodou.
+  'turn_ownership_lost',
 ] as const;
 
 export type DispatcherErrorCode = (typeof DISPATCHER_ERROR_CODES)[number];
@@ -99,6 +104,15 @@ export const TOOL_REFUSAL_CODES: readonly ToolErrorCode[] = Object.freeze([
   'requires_confirmation',
   'requires_dual_approval',
   'mcp_tool_not_executable',
+  // #504 — a tentativa perdeu a posse do turno (lease morta ou takeover) e o
+  // dispatcher recusou ANTES de executar. É REFUSAL, não FAILURE: nada rodou,
+  // nenhum estado ficou pela metade, e a recusa é a feature — é o cancelamento
+  // local que a issue exige. A anomalia em si já paga o seu alerta em
+  // `maia_turn_lease_lost_total{reason}` (com `ops_alert`) e em
+  // `maia_turn_effect_blocked_total{boundary}`; contá-la TAMBÉM no numerador de
+  // `MaiaToolErrorRateHigh` faria um evento paginar duas vezes e tornaria o
+  // error rate de tools ilegível durante um takeover legítimo.
+  'turn_ownership_lost',
 ]);
 
 /**

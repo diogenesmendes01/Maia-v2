@@ -19,6 +19,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import pg from 'pg';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 import { randomInt } from 'node:crypto';
 
 // `aggregateUnprocessedTexts` short-circuits when FEATURE_MESSAGE_DEBOUNCE
@@ -106,6 +107,14 @@ async function insertInbound(
   return r.rows[0]!.id;
 }
 
+// #545: `repositories.js` custa 1.92–2.47s a frio e `agent/core.js` 6.38–6.60s,
+// contra 13–25ms de trabalho real por caso. Pago no `it()`, um estouro deixava o
+// corpo órfão rodando: o `finally { cleanup() }` da tentativa morta apagava as
+// linhas DO RETRY, e o vermelho virava
+// `markProcessed matched 0 rows` — nada a ver com a causa.
+const repos = moduloDeProducao(() => import('../../src/db/repositories.js'));
+const core = moduloDeProducao(() => import('../../src/agent/core.js'));
+
 d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
@@ -165,7 +174,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'como vai', created_at: t1 });
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
-      const { mensagensRepo } = await import('../../src/db/repositories.js');
+      const { mensagensRepo } = repos();
       const rows = await withPrimaryTenant(() =>
         mensagensRepo.listUnprocessedByTelefone(telefone, { excludeId: id3 }),
       );
@@ -196,7 +205,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a', created_at: t0 });
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b', created_at: t1 });
 
-      const { mensagensRepo } = await import('../../src/db/repositories.js');
+      const { mensagensRepo } = repos();
       await withPrimaryTenant(() => mensagensRepo.setConversaIdMany([id1, id2], conversa_id));
 
       const r = await c.query<{ id: string; conversa_id: string | null }>(
@@ -218,7 +227,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a' });
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b' });
 
-      const { mensagensRepo } = await import('../../src/db/repositories.js');
+      const { mensagensRepo } = repos();
       await withPrimaryTenant(() => mensagensRepo.markProcessed(id1, 42));
 
       const target = await c.query<{ processada_em: Date | null; tokens_usados: number | null }>(
@@ -252,7 +261,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'como vai', created_at: t1 });
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
 
-      const { mensagensRepo } = await import('../../src/db/repositories.js');
+      const { mensagensRepo } = repos();
       const target = await withPrimaryTenant(() => mensagensRepo.findById(id3));
       expect(target).not.toBeNull();
 
@@ -261,7 +270,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // exact function the agent worker calls in production — the spec
       // catches regressions in feature flag, conversa guard, separator,
       // and merged_ids that a re-implementation would not.
-      const { _internal } = await import('../../src/agent/core.js');
+      const { _internal } = core();
       const out = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!));
       expect(out.text).toBe('Oi,\ncomo vai\na finança?');
       expect(out.merged_ids).toEqual(expect.arrayContaining([id1, id2]));
@@ -286,7 +295,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b' });
       const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'c' });
 
-      const { mensagensRepo } = await import('../../src/db/repositories.js');
+      const { mensagensRepo } = repos();
       await withPrimaryTenant(async () => {
         await mensagensRepo.setConversaIdMany([id1, id2], conversa_id);
         await mensagensRepo.markProcessed(id1, 10);

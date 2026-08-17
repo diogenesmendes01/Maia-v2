@@ -15,7 +15,7 @@ import {
 } from '@/governance/approval-requests.js';
 import type { ApprovalClass } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import { REGISTRY, isToolEnabled, type AnyTool } from './_registry.js';
+import { REGISTRY, isToolEnabled, type AnyTool, type ToolTurnContext } from './_registry.js';
 import { isMcpToolName, dispatchMcpTool } from './mcp-bridge.js';
 import { resolveGrantedToolNames, type AgentToolGrant } from './grant-math.js';
 import { BASE_AGENT_PACKS } from './base-agent-packs.js';
@@ -29,6 +29,11 @@ import { featureFlags } from '@/config/feature-flags.js';
 import { incCounter } from '@/lib/metrics.js';
 import { instrumentToolDispatch } from '@/observability/instrumentation.js';
 import { config } from '@/config/env.js';
+import {
+  turnOwnershipLost,
+  reportBlockedEffect,
+  getTurnExecutionContext,
+} from '@/runtime/turns/execution-context.js';
 
 /**
  * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
@@ -91,6 +96,32 @@ function pickToolField<K extends FieldType>(
  *
  * Non-MCP and MCP paths are both covered: the wrapper sits above the branch.
  */
+/**
+ * Issue #504 §Fencing — a RECUSA do dispatcher, em um lugar só.
+ *
+ * O contrato desta fronteira é devolver `{ error }`, não lançar: o caller
+ * (react-loop) trata um throw como quebra de plataforma. `boundary` nomeia
+ * ONDE a posse foi checada — `tool_dispatch` na entrada, `tool_handler` no
+ * limite do efeito — e é label de métrica de cardinalidade fechada.
+ */
+function turnHandlerContext(): ToolTurnContext | null {
+  const ctx = getTurnExecutionContext();
+  if (!ctx) return null;
+  return {
+    turn_id: ctx.turn_id,
+    attempt: ctx.attempt,
+    claim_token: ctx.claim_token,
+    deadline: ctx.deadline,
+    signal: ctx.signal,
+  };
+}
+
+function turnOwnershipLostResult(tool: string, boundary: string): DispatchResult {
+  reportBlockedEffect(boundary);
+  logger.warn({ tool, boundary }, 'tool.turn_ownership_lost');
+  return { error: 'turn_ownership_lost', details: { tool } };
+}
+
 export async function dispatchTool(input: {
   tool: string;
   args: unknown;
@@ -104,6 +135,24 @@ async function dispatchToolInner(input: {
   args: unknown;
   ctx: ToolContext;
 }): Promise<DispatchResult> {
+  // Issue #504 §Fencing — LIMITE DE EFEITO. Antes de qualquer coisa: esta
+  // tentativa ainda é dona do turno?
+  //
+  // O fence do banco protege `agent_turns` e nada mais. Um worker que perdeu a
+  // lease (heartbeat morto, takeover depois do vencimento) só descobria isso na
+  // transição final — depois de a tool ter criado a transação, emitido o
+  // boleto, chamado a API externa. Aqui a pergunta é feita ANTES, e a resposta
+  // "não" cancela sem executar.
+  //
+  // PRIMEIRA linha do dispatcher, acima até do desvio MCP, porque a posse não é
+  // um detalhe de uma família de tools: nenhuma delas pode rodar em nome de uma
+  // tentativa encerrada. E antes da reserva de idempotência de propósito — uma
+  // reserva criada aqui prenderia a chave contra o worker que TEM a posse.
+  //
+  // Fora de um turno reivindicado (`FEATURE_TURN_CLAIM` OFF, worker de agenda,
+  // playground) o guard é no-op — ver `runtime/turns/execution-context.ts`.
+  if (turnOwnershipLost()) return turnOwnershipLostResult(input.tool, 'tool_dispatch');
+
   // Issue #478 — tools MCP (`mcp:<server>:<tool>`) são dinâmicas (DB), não
   // vivem no REGISTRY. O bridge revalida TODAS as guardas server-side (flag,
   // pack no grant, tool aprovada+read-only, server ativo) e audita cada
@@ -111,6 +160,12 @@ async function dispatchToolInner(input: {
   if (isMcpToolName(input.tool)) {
     // Fase 0 cap. 5 — o bridge recebe o ToolContext completo: audits com
     // pessoa/conversa/mensagem + regras constitucionais aplicadas lá dentro.
+    //
+    // Issue #504 §Fencing — o bridge tem awaits PRÓPRIOS antes do efeito
+    // (grant, catálogo executável, regras constitucionais) e termina numa
+    // chamada HTTP a um servidor externo. Por isso ele recebe o `signal` da
+    // tentativa e revalida a posse no seu próprio limite: uma checagem só
+    // aqui seria de novo a fotografia que a review recusou.
     return dispatchMcpTool({
       tool: input.tool,
       args: input.args,
@@ -639,6 +694,37 @@ async function dispatchToolInner(input: {
   // reservation is preserved and this owner's side effect doesn't get
   // double-counted as the winning result.
   const reservation_token = reservation.reservation_token;
+
+  // Issue #504 §Fencing — FENCE NO LIMITE DO EFEITO, não fotografia da entrada.
+  //
+  // Entre o guard da primeira linha e este ponto o dispatcher esperou por:
+  // grant do agente, cache de idempotência, claim de aprovação (que pode
+  // notificar humanos) e a reserva atômica. A lease pode morrer em QUALQUER
+  // uma dessas janelas — e era exatamente aí que o handler continuava rodando
+  // em nome de uma tentativa já desautorizada. A pergunta é refeita aqui,
+  // imediatamente antes da única linha que produz efeito.
+  //
+  // As duas devoluções ANTES do return não são higiene, são a diferença entre
+  // fencear a nós mesmos e fencear o dono legítimo:
+  //   * a reserva é ABANDONADA (row apagada), não marcada 'failed'. O handler
+  //     nunca rodou, então não há efeito parcial a proteger; 'failed' é
+  //     terminal e faria o worker que TEM a lease receber
+  //     `idempotency_prior_failed` por uma execução que não existiu.
+  //   * a evidência de aprovação volta de 'claimed' para 'approved', senão o
+  //     humano teria de aprovar de novo por causa da nossa desistência.
+  if (turnOwnershipLost()) {
+    await idempotencyRepo
+      .abandonReservation({ key: idempotency_key, reservation_token })
+      .catch((abandon_err) => {
+        logger.error(
+          { abandon_err, tool: tool.name, idempotency_key },
+          'tool.reservation_abandon_failed',
+        );
+      });
+    await releaseClaimIfHeld();
+    return turnOwnershipLostResult(tool.name, 'tool_handler');
+  }
+
   let result: unknown;
   try {
     result = await tool.handler(args, {
@@ -648,6 +734,14 @@ async function dispatchToolInner(input: {
       mensagem_id: input.ctx.mensagem_id,
       request_id: input.ctx.request_id,
       idempotency_key,
+      // Issue #504 §Fencing — o handler recebe a TENTATIVA, não só o pedido.
+      // Sem isto, uma mutação interna longa (várias queries, uma chamada
+      // externa) não tem como cooperar com o cancelamento nem como validar a
+      // tentativa contra o banco: o `claim_token` é o mesmo fence que
+      // `agent_turns` exige em toda gravação da tentativa. `null` fora de um
+      // turno reivindicado (flag OFF, worker de agenda, playground), que é o
+      // mesmo regime no-op dos guards.
+      turn: turnHandlerContext(),
     });
   } catch (err) {
     // Mark the reservation 'failed' (B3) so a higher-level retry doesn't

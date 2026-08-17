@@ -3103,10 +3103,14 @@ export const agent_turns = pgTable(
     // Sanitizados por `sanitizeTurnError` — nunca payload/prompt/PII.
     last_error_code: text('last_error_code'),
     last_error_summary: text('last_error_summary'),
-    // Reservados para #504 (claim/lease/fencing).
+    // #504 (claim atômico / lease / fencing). `claim_token` é o FENCE: toda
+    // gravação da tentativa exige o token vigente no WHERE, então um worker que
+    // perdeu o lease não consegue escrever mesmo estando vivo.
     claimed_by: text('claimed_by'),
     claim_token: uuid('claim_token'),
     lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    /** #504 — último heartbeat do dono. NULL = nunca houve dono com lease. */
+    heartbeat_at: timestamp('heartbeat_at', { withTimezone: true }),
     // Reservado para #507 (deadline/cancelamento).
     deadline_at: timestamp('deadline_at', { withTimezone: true }),
     // Reservado para #506 (outbox durável).
@@ -3140,6 +3144,11 @@ export const agent_turns = pgTable(
     leaseIdx: index('agent_turns_lease_idx')
       .on(t.tenant_id, t.agent_id, t.lease_expires_at)
       .where(sql`status IN ('claimed', 'running')`),
+    // #504 (migration 114): mesma pergunta, SEM tenant no prefixo — é o
+    // dispatcher cross-tenant do recovery que a faz.
+    leaseExpiryIdx: index('agent_turns_lease_expiry_idx')
+      .on(t.lease_expires_at)
+      .where(sql`status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL`),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),

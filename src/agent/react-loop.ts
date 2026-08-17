@@ -16,6 +16,11 @@ import { persistCandidate } from '@/cognition/persister.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { buildToolSummary, type ToolExecutionSummary } from './tool-execution-summary.js';
+import {
+  assertTurnOwnership,
+  getTurnExecutionContext,
+  TurnOwnershipLostError,
+} from '@/runtime/turns/execution-context.js';
 
 /**
  * Codex C1 (PR #74): when the ReAct loop exits without dispatching outbound
@@ -177,6 +182,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   let sideEffectsCommitted = false;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+    // Issue #504 §Fencing — LIMITE DE EFEITO, no topo de cada iteração.
+    //
+    // O dispatcher e o outbound já recusam individualmente; este guard existe
+    // porque a review apontou o custo ANTES deles: "o worker antigo pode
+    // continuar chamando LLM". Uma iteração de ReAct é um round-trip pago ao
+    // provedor e mais uma volta de raciocínio em nome de um turno que não é
+    // mais nosso. Perguntar aqui é a diferença entre parar e apenas ser
+    // barrado.
+    //
+    // Lança em vez de sair do laço com um `exitReason`: sair devolveria um
+    // resultado que `decideTurnAction` traduziria em conclusão ou retry — duas
+    // escritas de estado que esta tentativa não tem mais autoridade para fazer.
+    // Quem tem a lease decide o desfecho. `core.ts` captura este erro e retorna
+    // sem concluir.
+    assertTurnOwnership('react_iteration');
     const reasonerResult = await runCognitiveModule(
       {
         name: 'reasoner',
@@ -326,6 +346,30 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         },
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
+
+      // Issue #504 §Fencing — a RECUSA POR POSSE ENCERRA A TENTATIVA.
+      //
+      // O dispatcher recusa devolvendo `{ error }` (o contrato dele; um throw
+      // seria lido pelo caller como quebra de plataforma). O efeito colateral
+      // disso era o ReAct tratar a perda da lease como erro comum de tool:
+      // seguia montando resumo, auditava a chamada e, sem outbound, o
+      // `flushUnconfirmedToolSummaries()` do fim do laço criava uma row nova em
+      // `mensagens`. Três gravações depois de o turno já não ser nosso — o
+      // oposto de "perda de lease impede gravações posteriores".
+      //
+      // Traduzimos a recusa para o vocabulário que o CORE já entende: o catch
+      // dedicado de `src/agent/core.ts:1496` sai sem concluir, sem retry e sem
+      // carimbar `processada_em`. Quem tem a lease decide o desfecho.
+      //
+      // ANTES de `sideEffectsCommitted`, de `toolsCalled`, do `audit()` e do
+      // `results.push` de propósito: cada um deles é estado ou gravação desta
+      // tentativa, e nenhum lhe pertence mais.
+      if (isError && (out as { error: unknown }).error === 'turn_ownership_lost') {
+        throw new TurnOwnershipLostError(
+          'react_tool_refused',
+          getTurnExecutionContext()?.turn_id ?? null,
+        );
+      }
 
       // Issue #503 — RASTREIO DE EFEITO IRREVERSÍVEL. Uma tool `write` ou
       // `communication` pode ter alterado estado externo (transação criada,

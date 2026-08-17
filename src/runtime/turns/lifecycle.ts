@@ -29,12 +29,19 @@ import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
+import type { LeaseLossReason } from './claim.js';
 import {
   COMPLETED_WITHOUT_REPLY_OUTCOMES,
   sanitizeTurnError,
   type TurnOutcome,
   type TurnStatus,
 } from './contract.js';
+import {
+  acquireTurnLease,
+  reportFenceRejection,
+  turnClaimEnabled,
+  type TurnLease,
+} from './lease.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -43,7 +50,135 @@ export type TurnHandle = {
   state_version: number;
   attempt_count: number;
   conversa_id: string | null;
+  /**
+   * #504 — a POSSE desta tentativa, quando `FEATURE_TURN_CLAIM` está ligada.
+   *
+   * Vive no handle, e não numa variável de `core.ts`, porque o handle já é o
+   * objeto que atravessa todo o turno: pendurar a lease nele é o que permite
+   * que CADA transição terminal encontre o token sem que ninguém precise
+   * lembrar de passá-lo adiante. `null` no caminho legado, e `null` quando o
+   * claim não foi concedido (aí o turno não deve nem começar).
+   */
+  lease?: TurnLease | null;
 };
+
+/**
+ * A POSSE de um turno tem TRÊS estados, não dois — e confundir dois deles é o
+ * que transforma o fail-closed em fail-open.
+ *
+ *   `unfenced` — não há lease nenhuma. É o regime de #503
+ *     (`FEATURE_TURN_CLAIM` OFF) ou um handle que nunca passou pelo claim. Não
+ *     há token a exigir, e as gravações seguem sem `expected_claim_token`
+ *     exatamente como antes desta issue. É o que faz a flag ser um kill switch
+ *     de verdade.
+ *
+ *   `fenced` — a lease existe e está VIVA até onde este processo sabe. Toda
+ *     gravação leva o `claim_token` no WHERE.
+ *
+ *   `lost` — a lease EXISTIU e não está mais viva: `markLost()` (heartbeat
+ *     morto, fence recusado) ou `release()` (shutdown gracioso). Este é o
+ *     estado que a versão anterior colapsava com `unfenced`, porque
+ *     `lease.token` devolve `null` depois da perda e o `fenceToken()` anterior
+ *     traduzia `null` para `{}`.
+ *
+ * O colapso não era cosmético. Sem `expected_claim_token`, `transitionTurn`
+ * não aplica predicado nenhum de posse: sobra o CAS por `state_version`. Basta
+ * o `state_version` não ter andado — o banco voltou depois de um blip de
+ * heartbeat, ou alguém concluiu depois de `release()` — para o worker que JÁ
+ * SABE que perdeu a posse gravar assim mesmo, e gravar como se fosse dono.
+ * Ou seja: o caminho que detecta a perda era o mesmo que a tornava inofensiva.
+ *
+ * Aqui `lost` é um estado próprio, e quem o recebe NÃO escreve.
+ */
+type TurnFence =
+  | { kind: 'unfenced' }
+  | { kind: 'fenced'; expected_claim_token: string }
+  | { kind: 'lost'; reason: LeaseLossReason };
+
+function resolveFence(handle: TurnHandle): TurnFence {
+  const lease = handle.lease;
+  // Sem lease: feature desligada, ou handle que nunca reivindicou. Regime #503.
+  if (!lease) return { kind: 'unfenced' };
+  const token = lease.token;
+  // `token === null` <=> `!lease.alive` (ver `TurnLease.token`). Lemos os dois
+  // porque é o par que dá a RAZÃO, e a razão vai para a métrica e a auditoria.
+  if (token === null) return { kind: 'lost', reason: lease.lostReason ?? 'expired' };
+  return { kind: 'fenced', expected_claim_token: token };
+}
+
+/** Argumento de fence para o repositório. Só o estado `fenced` produz token. */
+function fenceArgs(fence: TurnFence): { expected_claim_token?: string } {
+  return fence.kind === 'fenced' ? { expected_claim_token: fence.expected_claim_token } : {};
+}
+
+/**
+ * A tentativa local perdeu a posse ANTES de tentar gravar — cancelamento local,
+ * sem ida ao banco.
+ *
+ * É deliberadamente o MESMO desfecho de uma rejeição vinda do banco
+ * (`handleStaleClaim`): mesma métrica, mesmo log, mesma auditoria. Um operador
+ * que investiga "por que este turno não concluiu" não deveria precisar saber se
+ * quem recusou foi o predicado SQL ou o guard em memória — o fato é o mesmo, e
+ * o fato é "uma escrita desta tentativa foi recusada pelo fence".
+ *
+ * A alternativa — deixar passar sem fence — é o defeito. A outra alternativa —
+ * gravar COM o token morto e deixar o banco recusar — funcionaria hoje, mas
+ * depende de a lease do sucessor já estar registrada; entre a perda e o
+ * takeover existe uma janela em que o token antigo ainda é o vigente no banco,
+ * e nela a escrita passaria.
+ */
+async function refuseLostOwnership(
+  handle: TurnHandle,
+  operation: string,
+  reason: LeaseLossReason,
+): Promise<void> {
+  logger.warn(
+    {
+      turn_id: handle.turn_id,
+      operation,
+      attempt: handle.attempt_count,
+      from_status: handle.status,
+      reason,
+    },
+    'turn.write_refused_lease_not_alive',
+  );
+  await reportFenceRejection({
+    turn_id: handle.turn_id,
+    operation,
+    attempt: handle.attempt_count,
+    current_status: handle.status,
+  });
+}
+
+/**
+ * Reage a uma transição recusada pelo FENCE.
+ *
+ * Uma única porta para os cinco pontos de conclusão do turno. A reação é sempre
+ * a mesma e é sempre TERMINAR a tentativa local: cancelamos a lease (para que o
+ * heartbeat pare de renovar algo que não é mais nosso) e registramos a
+ * rejeição. Deliberadamente NÃO tentamos "consertar" reescrevendo sem o fence —
+ * a issue proíbe, e com razão: sobrescrever o ownership atual é reintroduzir a
+ * execução dupla no exato caminho que a detectou.
+ */
+async function handleStaleClaim(
+  handle: TurnHandle,
+  result: TurnTransitionResult,
+  operation: string,
+): Promise<boolean> {
+  if (result.ok || result.conflict !== 'stale_claim') return false;
+  // CANCELA a tentativa local, não apenas o timer: o banco acabou de responder
+  // que não somos mais donos, então o `AbortSignal` tem de disparar AGORA. Só
+  // parar o heartbeat deixaria o pipeline seguir trabalhando — chamando LLM,
+  // executando tool — em nome de uma posse que já acabou.
+  handle.lease?.markLost('token_mismatch');
+  await reportFenceRejection({
+    turn_id: handle.turn_id,
+    operation,
+    attempt: handle.attempt_count,
+    current_status: result.current_status,
+  });
+  return true;
+}
 
 /** Dual-write ligado? (escrita da máquina de estados) */
 export function turnStateMachineEnabled(): boolean {
@@ -212,20 +347,40 @@ export async function noteTurnEnqueueFailed(
   logger.warn({ turn_id: handle.turn_id, error_code: code }, 'turn.enqueue_failed');
 }
 
+/** Por que a execução não pôde começar. `started: true` é a única autorização. */
+export type TurnExecutionStart =
+  | { started: true }
+  /** Outro worker tem a posse (ou o turno não está elegível). NÃO é erro. */
+  | { started: false; reason: 'not_claimed' }
+  /** Perdemos a posse entre o claim e o `running`. */
+  | { started: false; reason: 'stale_claim' }
+  /** O estado andou por baixo de nós — alguém concluiu, absorveu ou matou o turno. */
+  | { started: false; reason: 'state_conflict' };
+
 /**
- * Marca o início da execução (`-> claimed -> running`).
+ * Toma a POSSE do turno e marca o início da execução.
  *
- * NÃO é um claim distribuído: nesta issue a máquina de estados registra que a
- * execução começou, mas NÃO decide quem executa — dois workers ainda podem
- * entrar no mesmo turno. O claim atômico com lease e fencing é #504, que
- * substitui o miolo daqui preservando esta assinatura. Por isso um conflito
- * aqui NUNCA aborta o turno: seria uma falsa sensação de exclusão mútua.
+ * Dois regimes, escolhidos por `FEATURE_TURN_CLAIM`:
+ *
+ * **ON (#504).** `tryClaimTurn` é a autoridade: uma declaração SQL atômica
+ * decide o dono, incrementa a tentativa canônica, gera o `claim_token` e abre a
+ * lease. `started: false` significa **não processe** — e é a primeira vez nesta
+ * máquina de estados em que um "não" aqui de fato barra a execução. Note que o
+ * claim aceita `retryable` diretamente: o passo `retryable -> queued` do regime
+ * legado existia só para satisfazer a tabela de transições, e o claim tem
+ * predicado próprio (ver `src/runtime/turns/claim.ts`).
+ *
+ * **OFF (#503).** Comportamento preservado byte a byte: registra que a execução
+ * começou e nunca barra ninguém. Não é exclusão mútua e nunca foi — por isso um
+ * conflito aqui continua não abortando o turno, o que seria falsa sensação de
+ * segurança.
  */
 export async function beginTurnExecution(
   handle: TurnHandle | null,
   args: { conversa_id?: string | null; channel_id?: string | null } = {},
-): Promise<void> {
-  if (!handle || !turnStateMachineEnabled()) return;
+): Promise<TurnExecutionStart> {
+  if (!handle || !turnStateMachineEnabled()) return { started: true };
+  if (turnClaimEnabled()) return beginClaimedExecution(handle, args);
   await guarded('begin_execution', async () => {
     // Reentrada de um turno em RETRY. O recovery normalmente já fez
     // `retryable -> queued` ao rearmar, mas um retry do próprio BullMQ chega
@@ -264,6 +419,78 @@ export async function beginTurnExecution(
       );
     }
   });
+  return { started: true };
+}
+
+/**
+ * O caminho de #504: claim atômico + lease + `running` já fenced.
+ *
+ * A ordem é a que importa e não é intercambiável:
+ *   1. **claim** — só depois de vencer a corrida no PostgreSQL existe uma
+ *      tentativa autorizada. Todo o resto pende disto;
+ *   2. **lease** — o heartbeat começa imediatamente, ANTES de `running`, para
+ *      que nem essa janela fique sem renovação;
+ *   3. **running fenced** — a primeira gravação da tentativa já exige o token.
+ *      Se ela for recusada aqui, perdemos a posse em milissegundos (takeover
+ *      por lease de uma encarnação anterior, tipicamente) e paramos antes de
+ *      qualquer efeito.
+ *
+ * `guarded` NÃO envolve o claim: a política de falha de #503 (fail-soft em
+ * shadow) diria "siga em frente" a um claim que não pôde ser lido, e seguir em
+ * frente sem posse é precisamente o defeito. Uma falha de infraestrutura aqui
+ * vira `not_claimed`, e o turno continua elegível para o próximo tick.
+ */
+async function beginClaimedExecution(
+  handle: TurnHandle,
+  args: { conversa_id?: string | null; channel_id?: string | null },
+): Promise<TurnExecutionStart> {
+  let acquired: Awaited<ReturnType<typeof acquireTurnLease>>;
+  try {
+    acquired = await acquireTurnLease(handle.turn_id);
+  } catch (err) {
+    const { code } = sanitizeTurnError({ error: err });
+    incCounter('maia_turn_state_errors_total', { op: 'claim', error_code: code });
+    logger.error({ turn_id: handle.turn_id, error_code: code }, 'turn.claim_failed');
+    return { started: false, reason: 'not_claimed' };
+  }
+  if (!acquired.lease) return { started: false, reason: 'not_claimed' };
+
+  const lease = acquired.lease;
+  handle.lease = lease;
+  handle.status = lease.claim.status;
+  handle.state_version = lease.claim.state_version;
+  handle.attempt_count = lease.claim.attempt;
+
+  // A lease acabou de nascer, então o normal aqui é `fenced`. `lost` é possível
+  // e não é teórico: o primeiro heartbeat pode bater entre o claim e esta linha
+  // e descobrir que uma encarnação anterior nossa já foi substituída. Nesse caso
+  // NÃO gravamos — nem com fence, nem sem.
+  const fence = resolveFence(handle);
+  if (fence.kind === 'lost') {
+    await refuseLostOwnership(handle, 'mark_running', fence.reason);
+    return { started: false, reason: 'stale_claim' };
+  }
+  const result = await agentTurnsRepo.markRunning({
+    turn_id: handle.turn_id,
+    expected_version: handle.state_version,
+    // A tentativa canônica JÁ foi contada pelo claim. Contar de novo aqui
+    // esgotaria `MAX_TURN_ATTEMPTS` na metade das tentativas reais.
+    bump_attempt: false,
+    ...fenceArgs(fence),
+    ...(args.conversa_id !== undefined ? { conversa_id: args.conversa_id } : {}),
+    ...(args.channel_id !== undefined ? { channel_id: args.channel_id } : {}),
+  });
+  if (await handleStaleClaim(handle, result, 'mark_running')) {
+    return { started: false, reason: 'stale_claim' };
+  }
+  if (!applyResult(handle, result)) {
+    // Não é perda de posse: o estado andou por baixo de nós (absorvido pelo
+    // debounce, cancelado por operador). Devolvemos a posse já, para não
+    // segurar por um TTL um turno que não vamos executar.
+    await lease.release();
+    return { started: false, reason: 'state_conflict' };
+  }
+  return { started: true };
 }
 
 /**
@@ -334,6 +561,18 @@ export async function concludeTurn(
   if (!handle || !turnStateMachineEnabled()) return;
   await guarded('conclude', async () => {
     const from = handle.status;
+    // A lease morreu antes da conclusão (heartbeat perdido, `release()` do
+    // shutdown, ou um fence anterior desta mesma tentativa). Concluir agora é
+    // gravar sem posse — e é exatamente o cenário do worker lento que a issue
+    // fecha. Vale inclusive para `merged_into_turn`: `markSuperseded` é
+    // deliberadamente SEM fence (quem absorve nunca teve a posse do absorvido),
+    // mas isso é uma afirmação sobre o turno ABSORVIDO, não licença para o
+    // absorvedor gravar depois de perder a própria posse.
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      await refuseLostOwnership(handle, `conclude_${outcome}`, fence.reason);
+      return;
+    }
     const result =
       outcome === 'merged_into_turn'
         ? await agentTurnsRepo.markSuperseded({
@@ -345,13 +584,22 @@ export async function concludeTurn(
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fenceArgs(fence),
             })
           : await agentTurnsRepo.completeTurnTx({
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fenceArgs(fence),
             });
+    // O FENCE na conclusão é o ponto central da issue: um worker lento que
+    // perdeu a lease chega aqui com trabalho pronto e é RECUSADO. Sem isto ele
+    // marcaria `completed` por cima da tentativa do sucessor, e o usuário
+    // receberia duas respostas com o turno registrado como concluído uma vez.
+    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) return;
     if (!applyResult(handle, result)) return;
+    // Concluído: a posse morreu com o CAS (`clearClaim`), só resta o timer.
+    handle.lease?.stop();
 
     if (IGNORED_OUTCOMES.has(outcome)) {
       await audit({
@@ -418,6 +666,14 @@ export async function failTurnRetryable(
     return;
   }
   await guarded('fail_retryable', async () => {
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      // Nem sequer agendar retry: `next_attempt_at`/`last_error_code` são
+      // campos DO TURNO, e o turno é de outra tentativa. Quem tem a posse
+      // decide o desfecho — inclusive se houve falha.
+      await refuseLostOwnership(handle, 'fail_retryable', fence.reason);
+      return;
+    }
     const next = new Date(Date.now() + retryDelayMs(handle.attempt_count + 1));
     const from = handle.status;
     const result = await agentTurnsRepo.markRetryable({
@@ -426,8 +682,11 @@ export async function failTurnRetryable(
       error_code: code,
       error_summary: summary,
       expected_version: handle.state_version,
+      ...fenceArgs(fence),
     });
+    if (await handleStaleClaim(handle, result, 'fail_retryable')) return;
     if (!applyResult(handle, result)) return;
+    handle.lease?.stop();
     incCounter('maia_turn_retries_total', { error_code: code });
     logger.info(
       {
@@ -458,6 +717,11 @@ export async function deadLetterTurn(
       ? { code: args.code, summary: args.summary }
       : sanitizeTurnError({ code: args.code, error: args.error });
   await guarded('dead_letter', async () => {
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      await refuseLostOwnership(handle, 'dead_letter', fence.reason);
+      return;
+    }
     const from = handle.status;
     const result = await agentTurnsRepo.markDeadLetter({
       turn_id: handle.turn_id,
@@ -465,8 +729,11 @@ export async function deadLetterTurn(
       error_code: sanitized.code,
       error_summary: sanitized.summary,
       expected_version: handle.state_version,
+      ...fenceArgs(fence),
     });
+    if (await handleStaleClaim(handle, result, 'dead_letter')) return;
     if (!applyResult(handle, result)) return;
+    handle.lease?.stop();
     logger.error(
       {
         turn_id: handle.turn_id,
