@@ -60,6 +60,10 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | File | Role |
 |---|---|
 | `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
+| `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. |
+| `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
+| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
+| `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
 | `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
 | `index.ts` | Superfície pública — importe daqui. |
 
@@ -86,6 +90,79 @@ que resolveu a mesma pendência. `completed` seria mentira — quem despachou a
 ação foi o OUTRO turno; este não executou nada e é descartado por regra
 explícita. Ver [`agent.md`](agent.md) § Pending gate.
 
+#### Claim atômico, lease e fencing (#504)
+
+Enquanto `FEATURE_TURN_CLAIM` está OFF, a máquina de estados **registra** que a
+execução começou mas **não decide quem executa** — duas réplicas podem entrar no
+mesmo turno. Ligada, três mecanismos independentes fecham essa janela:
+
+**1. Claim atômico.** `agentTurnsRepo.tryClaimTurn` é UM `UPDATE ... WHERE ...
+RETURNING`. Sob READ COMMITTED, dois workers disputando a mesma row serializam
+no lock de row e o perdedor RE-AVALIA o `WHERE` contra a versão nova
+(EvalPlanQual) — como o vencedor deixou `lease_expires_at` no futuro, o
+predicado de takeover do perdedor fica falso e ele volta zero linhas.
+"SELECT elegível" seguido de "UPDATE" **não** tem essa propriedade. Elegível:
+`received`/`queued`; `retryable` com `next_attempt_at` vencido; `claimed`/
+`running` com `lease_expires_at <= now()`. `outbound_pending` nunca.
+Todo relógio é o do PostgreSQL (`now()`), nunca o do processo — elegibilidade
+por lease compara instantes entre máquinas, e clock skew vira takeover falso.
+
+**2. Lease com heartbeat.** `TurnLease` (`lease.ts`) renova enquanto o token e a
+posse coincidem. Uma lease **vencida não se renova**: um worker que volta de uma
+pausa longa não retoma a posse mesmo que ninguém a tenha tomado. Duas falhas
+consecutivas de heartbeat abortam a tentativa ANTES do vencimento.
+
+**3. Fencing.** `claim_token` entra no `WHERE` de toda gravação da tentativa,
+junto com `lease_expires_at > now()`. As duas condições são necessárias: só o
+token deixaria escrever quem perdeu a lease sem sucessor; só a lease deixaria
+passar o zumbi enquanto o sucessor renova. Zero linhas com fence declarado é
+`stale_claim` — resultado tipado distinto de `state_mismatch`, porque a reação
+é oposta (parar, não reler e reinsistir). Ele cancela o `AbortSignal` da lease,
+emite `maia_turn_fence_rejected_total` e audita `turn_fence_rejected`.
+
+**As TRÊS posses.** `resolveFence()` (`lifecycle.ts`) classifica o handle em
+`unfenced` (não há lease: `FEATURE_TURN_CLAIM` OFF, regime de #503),
+`fenced` (lease viva → token no `WHERE`) e `lost` (a lease EXISTIU e morreu:
+`markLost()` por heartbeat, ou `release()` no shutdown). Colapsar `lost` em
+`unfenced` — que é o que acontece quando se lê `lease.token` e se traduz `null`
+para "sem fence" — transforma o fail-closed em fail-open: sem
+`expected_claim_token` sobra apenas o CAS por `state_version`, e ele CASA
+sempre que ninguém tomou o turno ainda. Quem recebe `lost` não grava: recusa
+localmente, com a mesma métrica, log e auditoria de uma rejeição vinda do banco.
+
+**Cancelamento local e limites de efeito.** O fence protege `agent_turns`; ele
+não desfaz um boleto emitido nem despacha de volta uma mensagem entregue. Por
+isso o `AbortSignal` da lease é propagado como contexto AMBIENTE
+(`execution-context.ts`): `src/agent/core.ts` abre
+`runWithTurnExecution(lease.context(), …)` logo depois da barreira do claim, e
+cada limite de efeito pergunta pela posse antes de agir —
+`src/tools/_dispatcher.ts` (recusa com `turn_ownership_lost`),
+`src/agent/output-dispatch.ts` (`OutboundDeliveryError(delivered:false)`),
+`src/agent/react-loop.ts` (no topo de cada iteração, para não pagar mais um
+round-trip de LLM) e a projeção legada `mensagens.processada_em` no próprio
+core. Fora de um turno reivindicado todo guard é no-op.
+
+**`jobId` determinístico.** `agentTurnJobId(turn_id)` = `turn-<uuid>`. "Mesmo
+trabalho lógico" é o TURNO, não a mensagem nem o evento de enfileiramento: o
+debounce agrega N mensagens numa execução, e ingresso e recovery (que podem
+rodar em réplicas distintas) armam o mesmo turno sem se conhecer. O preço é a
+RETENÇÃO da BullMQ — um job `completed`/`failed` retido bloquearia o rearme
+legítimo, então `enqueueAgent` remove o cadáver antes do `add` e deixa job VIVO
+intocado (é ele quem faz a deduplicação).
+
+| Métrica | Labels |
+|---|---|
+| `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` |
+| `maia_turn_claim_latency_ms` | `result` |
+| `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
+| `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
+| `maia_turn_fence_rejected_total` | `operation` — incrementado **só** em `reportFenceRejection` (`lease.ts`). O repositório classifica `stale_claim` e NÃO conta: com as duas camadas contando, um CAS recusado valia 2 num `sum()`, e a recusa local (que nunca chega ao SQL) ficava invisível. |
+| `maia_turn_effect_blocked_total` | `boundary` = `tool_dispatch` / `outbound_send` / `react_iteration` |
+| `maia_turn_job_retained_cleared_total` | `state` = `completed` / `failed` |
+
+Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
+heartbeat rotineiros ficam em métrica — auditá-los seria uma row por batida.
+
 **Rollout** — duas flags, registradas em `ENV_CONTRACT`
 ([`src/config/contract.ts`](../../../src/config/contract.ts)) e documentadas em
 [`docs/configuration.md`](../../configuration.md) (arquivo **gerado**; edite o
@@ -95,9 +172,17 @@ contrato, nunca o `.env.example`):
 |---|---|---|
 | `FEATURE_TURN_STATE_MACHINE` | `true` | Dual-write: cria/transiciona turnos. Só ESCRITA — o comportamento observável não muda. **Exige as migrations 096/097 aplicadas.** |
 | `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | Flip da LEITURA: o recovery elege por `agent_turns.status` em vez de `processada_em`. |
+| `FEATURE_TURN_CLAIM` | `false` | Claim atômico + lease + fencing (#504). É o único regime em que `beginTurnExecution` pode devolver `started: false` e BARRAR a execução. **Exige a migration 114.** |
 
-A combinação `AUTHORITATIVE=true` + `MACHINE=false` é inerte e por isso o boot a
-**recusa** (regra `turn-state/authoritative-requires-dual-write` em
+`TURN_LEASE_TTL_MS` (60s) e `TURN_LEASE_HEARTBEAT_MS` (15s) dimensionam a lease.
+O heartbeat DEVE caber ao menos 3× no TTL — com 2×, uma renovação perdida já
+deixa a lease vencer com o dono processando, e isso é execução dupla. A regra
+`turn-lease/heartbeat-ratio` recusa o boot fora dessa relação.
+
+As combinações `AUTHORITATIVE=true` + `MACHINE=false` e `CLAIM=true` +
+`MACHINE=false` são inertes e por isso o boot as **recusa** (regras
+`turn-state/authoritative-requires-dual-write` e
+`turn-claim/requires-state-machine` em
 [`src/config/rules.ts`](../../../src/config/rules.ts)).
 
 Enquanto a segunda flag estiver OFF, `mensagens.processada_em` continua sendo a
@@ -201,7 +286,13 @@ Rules this module enforces:
 | `tests/unit/turn-state-machine.spec.ts` | Tabela completa de transições válidas/inválidas, outcome obrigatório em terminal, sanitização do erro |
 | `tests/unit/turn-lifecycle.spec.ts` | Kill switch, derivação outcome→estado, retry/dead letter, fail-soft |
 | `tests/integration/agent-turns-real-db.spec.ts` | CAS concorrente, FK composta, projeção legada, backfill idempotente, plano do índice |
-| `tests/integration/agent-turns-leak.spec.ts` | Leak cross-tenant do `agentTurnsRepo` (parte de `npm run test:leak`) |
+| `tests/integration/agent-turns-leak.spec.ts` | Leak cross-tenant do `agentTurnsRepo`, incluindo claim/heartbeat/liberação (parte de `npm run test:leak`) |
+| `tests/unit/turn-claim-contract.spec.ts` | Estabilidade do `jobId`, payload V1/V2, aritmética do lease, identidade do worker |
+| `tests/integration/turn-claim-real-db.spec.ts` | Corrida de 2/10/50 callers, takeover por lease vencida, fencing do zumbi, elegibilidade por estado, isolamento |
+| `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`); lease marcada como perdida e lease liberada **sem takeover** não alteram a linha; uma escrita recusada = UM incremento da métrica de fence |
+| `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona. Cobre também a posse perdida NO MEIO do turno (o core não carimba `processada_em`), que é o que pinga o `runWithTurnExecution` do core |
+| `tests/integration/turn-lease-lost-effects-real-db.spec.ts` | Perda de lease DURANTE a execução, pelo caminho real (takeover + heartbeat): nenhuma linha em `agent_facts` (tool) nem em `outbound_messages` (outbound), com caso de controle exigindo as duas presentes |
+| `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 
 ## In-flight changes
 

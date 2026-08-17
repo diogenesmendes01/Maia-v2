@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
 const { flagState, dbState } = vi.hoisted(() => ({
   flagState: {
@@ -148,6 +149,14 @@ const TEXT_INBOUND = {
   processada_em: null,
 };
 
+// #545: carregar a frio o grafo de `src/agent/core.js` custa 6.38–6.60s
+// medidos. Dentro do `it()` isso era ~99% do orçamento do primeiro caso (o
+// trabalho real dele são ~5ms), e um estouro deixava o corpo órfão competindo
+// com o retry pelos MESMOS spies deste arquivo — a falha reportada virava
+// `expected "vi.fn()" to be called 1 times, but got 2 times`. No `beforeAll` o
+// custo tem orçamento próprio e um estouro reprova sem executar caso nenhum.
+const core = moduloDeProducao(() => import('../../src/agent/core.js'));
+
 describe('agent loop — B4 voice flow', () => {
   beforeEach(() => {
     callLLM.mockReset();
@@ -177,7 +186,7 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67, 0x67, 0x53, 0x00]));
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
     expect(synthesizeSpeech).toHaveBeenCalledWith('✅ R$ 5 registrado em transporte.');
@@ -206,7 +215,7 @@ describe('agent loop — B4 voice flow', () => {
       content: longText, tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 100 },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).not.toHaveBeenCalled();
     expect(sendOutboundVoice).not.toHaveBeenCalled();
@@ -221,7 +230,7 @@ describe('agent loop — B4 voice flow', () => {
       content: 'reply curto', tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).not.toHaveBeenCalled();
     expect(sendOutboundVoice).not.toHaveBeenCalled();
@@ -235,7 +244,7 @@ describe('agent loop — B4 voice flow', () => {
       content: 'reply', tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 5 },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).not.toHaveBeenCalled();
     expect(sendOutboundVoice).not.toHaveBeenCalled();
@@ -249,7 +258,7 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     synthesizeSpeech.mockRejectedValueOnce(new Error('tts_failed: 500 boom'));
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
     expect(sendOutboundVoice).not.toHaveBeenCalled();
@@ -266,7 +275,7 @@ describe('agent loop — B4 voice flow', () => {
     });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0]));
     sendOutboundVoice.mockResolvedValueOnce(null);
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
     const auditAcoes = audit.mock.calls.map((c) => c[0].acao);
@@ -291,7 +300,7 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 50, output_tokens: 20 },
     });
     dispatchTool.mockResolvedValue({ ok: true });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
     expect(synthesizeSpeech).not.toHaveBeenCalled();
@@ -318,7 +327,7 @@ describe('agent loop — B4 voice flow', () => {
     });
     dispatchTool.mockResolvedValue({ ok: true });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
     expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
@@ -334,7 +343,7 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 50, output_tokens: 80 },
     });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
     expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
@@ -353,7 +362,7 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(sendOutboundVoice).toHaveBeenCalledTimes(1);
     const [, , opts] = sendOutboundVoice.mock.calls[0]!;

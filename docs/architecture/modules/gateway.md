@@ -46,6 +46,21 @@ nunca cria turno órfão. Falha de enqueue **não** vira `retryable`: não houve
 tentativa de execução, o turno fica em `received` para o sweep. Ver
 [`runtime.md`](runtime.md) e [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
+**`jobId` determinístico (#504).** Quando o produtor conhece o turno, ele passa
+`turn_id` a `enqueueAgent`, que deriva `jobId = turn-<uuid>`
+([`src/runtime/turns/job.ts`](runtime.md)). Ingresso e sweep de recovery — que
+não se conhecem e podem rodar em réplicas distintas — passam a COLIDIR num único
+job em vez de armarem dois. O preço é a retenção da BullMQ: um job
+`completed`/`failed` retido vetaria o rearme legítimo de um turno que voltou a
+ser elegível, então `enqueueAgent` remove o cadáver antes do `add` e deixa job
+VIVO intocado (é ele quem faz a deduplicação). Quem decide se o trabalho ainda
+vale continua sendo o PostgreSQL — aqui só se impede que o transporte vete uma
+decisão já tomada no banco.
+
+O caminho do **debounce** mantém o `jobId` próprio (`debounce:<escopo>`): ele
+depende de remover e re-adicionar o job a cada mensagem para reiniciar a janela,
+o que é incompatível com um id que representa o trabalho e não a janela.
+
 ## How to extend
 
 | Need | Where |

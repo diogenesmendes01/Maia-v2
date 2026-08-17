@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { moduloDeProducao } from '../../helpers/modulo-de-producao.js';
 
 const createWithFirstOccurrenceMock = vi.fn();
 vi.mock('../../../src/scheduling/repos.js', () => ({
@@ -28,6 +29,10 @@ const ctx = {
   idempotency_key: 'ik1',
 } as never;
 
+// #545: o import a frio do grafo de produção domina o orçamento do primeiro
+// caso. No `beforeAll` ele tem orçamento próprio e não vira corpo órfão.
+const ferramenta = moduloDeProducao(() => import('../../../src/tools/schedule-reminder.js'));
+
 describe('schedule_reminder tool (spec 18)', () => {
   it('happy path: creates a one_shot_reminder series with an occurrence + reminder task', async () => {
     const scheduled = '2027-01-15T09:00:00Z';
@@ -36,7 +41,7 @@ describe('schedule_reminder tool (spec 18)', () => {
       occurrence: { id: 'occ-1', scheduled_for: new Date(scheduled) },
       tasks: [{ id: 'task-1', ordem: 1, kind: 'fire_reminder' }],
     });
-    const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
+    const { scheduleReminderTool } = ferramenta();
     const result = await scheduleReminderTool.handler(
       {
         entidade_id: E1,
@@ -72,7 +77,7 @@ describe('schedule_reminder tool (spec 18)', () => {
   });
 
   it('schema invalid: empty texto rejected by zod', async () => {
-    const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
+    const { scheduleReminderTool } = ferramenta();
     const parsed = scheduleReminderTool.input_schema.safeParse({
       quando: '2027-01-15T09:00:00Z',
       texto: '',
@@ -87,7 +92,7 @@ describe('schedule_reminder tool (spec 18)', () => {
       occurrence: { id: 'o', scheduled_for: new Date('2030-01-01T00:00:00Z') },
       tasks: [],
     });
-    const { scheduleReminderTool } = await import('../../../src/tools/schedule-reminder.js');
+    const { scheduleReminderTool } = ferramenta();
     const result = await scheduleReminderTool.handler(
       { quando: '2030-01-01T00:00:00Z', texto: 'X', canal: 'whatsapp' } as never,
       ctx,

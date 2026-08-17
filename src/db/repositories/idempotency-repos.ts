@@ -601,6 +601,43 @@ export const idempotencyRepo = {
   },
 
   /**
+   * ABANDONA a reserva (issue #504 §Fencing): o handler NUNCA rodou.
+   *
+   * Diferente de `releaseReservation`, isto APAGA a row em vez de deixá-la
+   * 'failed', e a diferença é a única que importa aqui: 'failed' é terminal
+   * justamente porque um handler que rodou e falhou pode ter aplicado efeito
+   * parcial. Quando a tentativa perde a posse do turno ANTES do handler não há
+   * efeito nenhum a fencear — e deixar 'failed' fecharia a chave contra o
+   * worker que TEM a lease vigente, que receberia `idempotency_prior_failed`
+   * por uma execução que nunca existiu. Ou seja: o fence do turno viraria uma
+   * negação de serviço sobre o dono legítimo.
+   *
+   * Fencing (B2): gated no `reservation_token` e em `state='in_progress'`,
+   * como as demais transições. Um dono preemptado carrega token velho e o
+   * DELETE não toca a reserva viva do novo dono. Devolve se apagou de fato.
+   */
+  async abandonReservation(input: {
+    key: string;
+    reservation_token: string;
+  }): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const deleted = await db
+      .delete(idempotency_keys)
+      .where(
+        and(
+          eq(idempotency_keys.tenant_id, tenant_id),
+          eq(idempotency_keys.agent_id, agent_id),
+          eq(idempotency_keys.key, input.key),
+          eq(idempotency_keys.state, 'in_progress'),
+          eq(idempotency_keys.reservation_token, input.reservation_token),
+        ),
+      )
+      .returning({ key: idempotency_keys.key });
+    return deleted.length > 0;
+  },
+
+  /**
    * Mark a reservation as terminally FAILED (issue #298 B3).
    *
    * Previously this DELETEd the in_progress row so the next caller could

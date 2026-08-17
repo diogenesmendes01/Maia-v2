@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -45,10 +46,14 @@ afterAll(async () => {
   await rm(SANDBOX, { recursive: true, force: true });
 });
 
+// #545: o grafo de `src/gateway/baileys.js` custa 5.77–6.83s para carregar a
+// frio, contra 1–13ms de trabalho real por caso.
+const baileys = moduloDeProducao(() => import('../../src/gateway/baileys.js'));
+
 describe('sendOutboundVoice', () => {
   it('passes { audio: Buffer, mimetype, ptt: true } to socket.sendMessage', async () => {
     const buf = Buffer.from([0x4F, 0x67, 0x67, 0x53, 0x00]); // 'OggS\0' fake
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const wid = await mod.sendOutboundVoice('5511999999999@s.whatsapp.net', buf);
     expect(wid).toBe('WAID-VOICE-1');
@@ -66,7 +71,7 @@ describe('sendOutboundVoice', () => {
 
   it('forwards quoted as third arg when provided', async () => {
     const buf = Buffer.from([0x4F, 0x67]);
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;
     await mod.sendOutboundVoice('jid', buf, { quoted });
@@ -75,7 +80,7 @@ describe('sendOutboundVoice', () => {
   });
 
   it('returns null when not connected; sendMessage NOT called', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(null, false);
     const wid = await mod.sendOutboundVoice('jid', Buffer.from([0]));
     expect(wid).toBeNull();

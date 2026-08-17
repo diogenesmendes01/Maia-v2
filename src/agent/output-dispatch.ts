@@ -17,6 +17,7 @@ import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
+import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -234,9 +235,48 @@ async function recordLedgerFailed(
   );
 }
 
+/**
+ * Issue #504 §Fencing — GUARD ÚNICO dos limites de efeito do outbound.
+ *
+ * `OutboundDeliveryError(delivered: false)` é o vocabulário desta fronteira e é
+ * a classificação HONESTA: nada foi enviado, então é pre-send. Os callers já
+ * distinguem `delivered` para decidir entre retry e conclusão ambígua, e com a
+ * posse perdida nenhum dos dois nos pertence — quem tem a lease vigente é quem
+ * responde ao usuário, e a transição final desta tentativa vai ser recusada
+ * pelo fence logo em seguida.
+ *
+ * Chamado SEMPRE antes de reservar a chave do turno no ledger de #227:
+ * reservar aqui marcaria como 'pending' um envio que não vamos fazer, e isso
+ * bloquearia o envio de quem TEM a posse.
+ */
+function assertOutboundOwnership(boundary: string): void {
+  if (!turnOwnershipLost()) return;
+  reportBlockedEffect(boundary);
+  throw new OutboundDeliveryError(false, 'turn_ownership_lost');
+}
+
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
   const toolSummaries = ctx.toolSummaries ?? [];
+
+  // Issue #504 §Fencing — FRONTEIRA COMUM. O guard vivia só dentro de
+  // `sendOutbound()`, mas `safeDispatchOutput()` entra AQUI, e daqui saem três
+  // ramos que nunca passam por `sendOutbound`: documento (`line.sendDocument`),
+  // voz (`line.sendVoice`) e enquete (`sendOutboundPoll`). Sem este guard os
+  // três reivindicavam o ledger e produziam o efeito externo com o
+  // `AbortSignal` da tentativa já abortado — o usuário recebia DUAS respostas,
+  // a segunda vinda de uma tentativa que o banco já tinha desautorizado.
+  //
+  // Antes de qualquer await: a pergunta é barata e a resposta 'não' cancela sem
+  // nenhum trabalho. Cada ramo REVALIDA no seu próprio limite de efeito (a
+  // posse pode acabar durante os awaits que vêm depois desta linha) — esta
+  // checagem é o corte rápido, não o fence final.
+  if (turnOwnershipLost()) {
+    // O PDF temporário é lixo DESTA tentativa: o sucessor gera o dele. Sem esta
+    // limpeza o arquivo só sairia pelo varredor de boot.
+    if (latestReportPdf) await cleanupPDF(latestReportPdf.path);
+    assertOutboundOwnership('outbound_dispatch');
+  }
 
   // Quoting decision is shared across PDF / voice / text branches —
   // computed once so the rule (correction-detected OR pending active)
@@ -279,6 +319,11 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   if (latestReportPdf) {
     const pdf = latestReportPdf;
     try {
+      // Issue #504 §Fencing — REVALIDAÇÃO no limite do efeito. Entre a entrada
+      // de `dispatchOutput` e esta linha houve awaits (resolução da linha,
+      // consulta de pendência) — a posse pode ter acabado nessa janela. O
+      // `finally` abaixo ainda remove o PDF temporário.
+      assertOutboundOwnership('outbound_document');
       // #227: claim the turn before the send (no-op when flag off, fail-open on
       // DB throws — see claimOutboundLedgerOrFailOpen). cleanupPDF still runs
       // in the `finally` even when we short-circuit on skip.
@@ -398,6 +443,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       );
     }
     if (voiceBuf) {
+      // Issue #504 §Fencing — REVALIDAÇÃO no limite do efeito. `synthesizeSpeech`
+      // é uma chamada de rede: a posse pode ter acabado exatamente durante ela.
+      assertOutboundOwnership('outbound_voice');
       // #227: claim the turn before the voice send (no-op when flag off,
       // fail-open on DB throws — see claimOutboundLedgerOrFailOpen).
       const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'voice');
@@ -665,6 +713,21 @@ export async function sendOutbound(
     channel_id?: string | null;
   },
 ): Promise<string | null> {
+  // Issue #504 §Fencing — LIMITE DE EFEITO. O outbound é o efeito MENOS
+  // reversível do turno: uma mensagem entregue no WhatsApp não volta.
+  //
+  // Se a posse acabou no meio da execução (heartbeat morto, takeover depois do
+  // vencimento da lease), quem responde ao usuário é o sucessor. Sem este
+  // guard, o worker antigo terminava o ReAct e mandava a resposta assim mesmo:
+  // o usuário recebia DUAS respostas para uma mensagem, e a segunda vinha de
+  // uma tentativa que o banco já tinha desautorizado.
+  //
+  // Exportada e chamada direto (fallback de TTS, fallback de poll, skills), por
+  // isso o guard fica aqui TAMBÉM e não só na fronteira comum de
+  // `dispatchOutput`. Vocabulário e ordenação em relação ao ledger: ver
+  // `assertOutboundOwnership`.
+  assertOutboundOwnership('outbound_send');
+
   // #227: claim the turn in the ledger BEFORE any work. If a prior attempt
   // already marked this turn 'sent' / 'unknown' / 'pending' (in-flight),
   // short-circuit (the user got — or might have got — that reply; do NOT
@@ -769,6 +832,12 @@ export async function sendOutboundPoll(
   pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
   opts?: { tool_summaries?: ToolExecutionSummary[]; channel_id?: string | null },
 ): Promise<{ fell_back: boolean }> {
+  // Issue #504 §Fencing — LIMITE DE EFEITO. Exportada, e chamada tanto pelo ramo
+  // de poll de `dispatchOutput` quanto direto por callers externos: o guard tem
+  // de estar AQUI e não só na fronteira comum, senão uma chamada direta escapa.
+  // Antes do ledger, pela mesma razão de `sendOutbound`.
+  assertOutboundOwnership('outbound_poll');
+
   // #227: claim the turn before any work (no-op when flag off, fail-open on
   // DB throws). The same-row reclaim during a poll→text fallback (below) is
   // handled by markFailed-then-claim — see the fallback comment.
