@@ -182,12 +182,33 @@ jobs:
         # Integration tests skip when TEST_DB_URL is unset. Redis is still
         # present because several unit-regression paths load runtime modules
         # that initialize Redis-backed queues/caches from REDIS_URL.
+        env:
+          # Ver o passo "Resumo dos testes" abaixo e
+          # `tests/reporters/diagnostico-reporter.ts` (#545).
+          VITEST_SUMMARY_FILE: .ci-test-summary/unit.txt
         run: npx vitest run
 
       - name: Lint
         # `--max-warnings=0` would flip warnings to failures; we keep them as
         # warnings for now so existing code can be cleaned incrementally.
         run: npm run lint
+
+      - name: Resumo dos testes
+        # Issue #545. Numa falha, o log deste job termina com o dump dos service
+        # containers, e o sumário do vitest fica soterrado — inalcançável para
+        # quem lê o log pelo fim (inclusive as ferramentas de leitura de log,
+        # que truncam pela cauda). Este passo reimprime o bloco de diagnóstico
+        # num passo PRÓPRIO e endereçável, e é o ÚLTIMO passo do job — o mais
+        # tarde que conseguimos controlar. Nunca reprova: é legibilidade, não
+        # gate.
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
 
   secret-scan:
     name: gitleaks (secret scan)
@@ -338,16 +359,62 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Silenciar o log do Postgres de teste (#545)
+        # O log deste job terminava com centenas de linhas do service container
+        # de Postgres: `checkpoint complete` a cada poucos segundos e as
+        # violações de constraint que as próprias specs PROVOCAM de propósito
+        # (leak suite, testes de FK, race de unique). Nenhuma delas é lida ali —
+        # o teste que as provoca já as asserta — e juntas empurravam o sumário
+        # do vitest para fora do alcance de quem lê o log.
+        #
+        # `log_min_messages = fatal` mantém FATAL e PANIC (o Postgres morrendo
+        # continua visível) e corta LOG/ERROR/WARNING;
+        # `log_min_error_statement = panic` corta o dump do SQL que falhou.
+        # Ambos são sighup, então `pg_reload_conf()` basta — sem restart.
+        #
+        # Nunca reprova o job: isto é cosmética de log. Se `psql` não existir na
+        # imagem do runner, o passo avisa e segue.
+        continue-on-error: true
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "psql ausente no runner — log do Postgres segue verboso"
+            exit 0
+          fi
+          PGPASSWORD=test1234 psql -h localhost -U maia_test -d maia_test -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET log_checkpoints = 'off';
+          ALTER SYSTEM SET log_connections = 'off';
+          ALTER SYSTEM SET log_disconnections = 'off';
+          ALTER SYSTEM SET log_min_messages = 'fatal';
+          ALTER SYSTEM SET log_min_error_statement = 'panic';
+          SELECT pg_reload_conf();
+          SQL
+
       - name: Apply migrations
         # Service container health-checks gate startup, so by the time this
         # step runs Postgres is accepting connections.
         run: npm run db:migrate
 
       - name: Run integration tests
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 
       - name: Run e2e tests
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
         run: npm run test:e2e
+
+      - name: Resumo dos testes
+        # Mesma razão do job `validate` — e aqui o problema é pior, porque este
+        # job tem DOIS service containers dumpando no fim. Ver #545.
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
 
   # ---------------------------------------------------------------------
   # Gate permanente de release do job `migrate` (#516). Job NOVO, isolado e
