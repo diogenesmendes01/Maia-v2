@@ -6,7 +6,7 @@
 # desse piso.
 # (Antes: node:26-alpine — dois majors à frente de CI/dev, superfície de
 # drift desnecessária.)
-FROM node:22-alpine AS base
+FROM node:26-alpine AS base
 WORKDIR /app
 # node:22-alpine embarca npm 10.x, mas o preinstall guard do package.json
 # exige npm >=11.5.2 <12 (pin do formato do package-lock.json — ver
