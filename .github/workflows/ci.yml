@@ -378,3 +378,43 @@ jobs:
       # causa do runner em vez de por causa da imagem.
       - name: Smoke do job migrate na imagem de produção
         run: bash scripts/smoke-migrate-image.sh
+
+  # ---------------------------------------------------------------------
+  # Regras de alerta, avaliadas pelo motor REAL (#519, decisão 14). Job novo,
+  # isolado e apendado no mesmo padrão do `smoke-migrate-image`: sem
+  # `setup-node`, sem `npm ci`, sem service containers, sem matriz.
+  #
+  # Por que ele existe: `tests/unit/observability/*-alert-rules.spec.ts`
+  # executa as `expr` reais e cobre limiar, operador e escopo, mas com um
+  # avaliador INSTANTÂNEO — ele afirma o `for:` como CAMPO e não consegue
+  # simular tempo. Quem prova `pending → firing` é `promtool test rules`, e
+  # um arquivo de teste que ninguém executa apodrece.
+  #
+  # Usa o `/bin/promtool` da imagem oficial do Prometheus em vez de baixar o
+  # binário Go solto: a imagem é assinada, versionada e já está no cache do
+  # runner. A tag é pinada — não existe Prometheus versionado neste repo
+  # hoje (só um exemplo sem tag em `docs/runbooks/redis.md`); quando existir,
+  # ESTA tag e a do deploy têm de andar juntas.
+  # ---------------------------------------------------------------------
+  alert-rules:
+    name: regras de alerta (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
+      # sintaticamente inválido ou uma `expr` que não compila derruba o
+      # carregamento do grupo inteiro no Prometheus, em silêncio.
+      - name: promtool check rules (todos os arquivos)
+        run: |
+          docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            check rules *.rules.yml
+
+      # E a prova temporal, que é a razão de o job existir.
+      - name: promtool test rules (semântica de for:)
+        run: |
+          docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            test rules tests/*.test.yml

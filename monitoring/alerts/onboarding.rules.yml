@@ -81,9 +81,20 @@ groups:
       # CRITICAL — meia hora. Nesse ponto não há leitura benigna: nenhuma
       # combinação de teto e cadência saudáveis deixa a mais antiga esperando
       # 30 minutos.
+      #
+      # SEM `for`, e isto é deliberado. Os 1800s JÁ são a sustentação: a idade
+      # é monotônica enquanto a run não sai da fila, então "passou de 30min" só
+      # é alcançável por uma condição que durou 30 minutos. Um `for: 5m` aqui
+      # não filtraria ruído — empurraria o page para ~35m30s (limiar + 5min de
+      # sustentação, avaliando a cada 30s) e faria a regra mentir sobre o
+      # próprio nome. O tempo em que o WARNING já estava firing NÃO conta para
+      # o critical: são dois alertas independentes.
+      #
+      # E o ruído que um `for` pegaria aqui não existe: uma falha de leitura
+      # publica `NaN`, não uma idade finita falsa — `NaN > 1800` é falso, e
+      # quem cobre esse caso é o MetricsAbsent abaixo.
       - alert: MaiaOnboardingExpiryBacklogStaleCritical
         expr: max(maia_onboarding_expiry_backlog) > 0 and max(maia_onboarding_expiry_oldest_age_seconds) > 1800
-        for: 5m
         labels:
           severity: critical
         annotations:
@@ -103,12 +114,22 @@ groups:
       # aconteceu. `NaN > 600` é falso, então SEM este alerta um Postgres fora
       # do ar silenciaria os dois acima.
       #
+      # As DUAS gauges, não só o backlog. Backlog finito com a idade ausente ou
+      # `NaN` cega os dois alertas acima exatamente igual — a condição deles é
+      # uma conjunção, e `max(NaN) > 600` é falso — e um guarda que olhasse só
+      # o backlog ficaria calado nesse caso. Cobrir metade da entrada de um
+      # alerta de cegueira é o mesmo defeito que ele existe para corrigir, um
+      # andar acima.
+      #
       # Sem agregação: `instance` fica preservado de propósito — uma réplica
       # cega entre vinte é o caso, e `max()` a esconderia atrás das saudáveis.
       # `for: 10m` porque o `NaN` transitório de um scrape é normal (a janela do
       # snapshot é de 15s); o que pede humano é o `NaN` sustentado.
       - alert: MaiaOnboardingExpiryMetricsAbsent
-        expr: absent(maia_onboarding_expiry_backlog) or (maia_onboarding_expiry_backlog != maia_onboarding_expiry_backlog)
+        expr: absent(maia_onboarding_expiry_backlog)
+          or (maia_onboarding_expiry_backlog != maia_onboarding_expiry_backlog)
+          or absent(maia_onboarding_expiry_oldest_age_seconds)
+          or (maia_onboarding_expiry_oldest_age_seconds != maia_onboarding_expiry_oldest_age_seconds)
         for: 10m
         labels:
           severity: warning

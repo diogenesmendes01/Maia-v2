@@ -6,6 +6,9 @@
  * warning quando backlog > 0 e o item mais antigo estiver atrasado há mais de
  * 10 minutos, sustentado por 5 minutos; critical acima de 30 minutos."
  *
+ * O critical NÃO leva `for`: a decisão diz "acima de 30 minutos", e os
+ * 1800s já são a sustentação. Ver o caso que trava isso abaixo.
+ *
  * ## Os dois casos que separam a regra nova da antiga
  *
  * Uma regra `backlog > N` erra nos dois sentidos, e são exatamente os dois
@@ -190,6 +193,31 @@ describe('decisão 14 — o alerta de backlog do onboarding', () => {
     expect(fires(expr(ABSENT), replica(0, 0))).toBe(false);
   });
 
+  // A metade que o primeiro corte deixou de fora: o guarda olhava SÓ o
+  // backlog. Backlog finito com a idade ilegível cega os dois alertas de
+  // atraso exatamente igual — a condição deles é conjunção, e `max(NaN) > 600`
+  // é falso — e o guarda ficava calado. Cobrir metade da entrada de um alerta
+  // de cegueira é o mesmo defeito que ele existe para corrigir.
+
+  it('SÓ a idade em `NaN`: os de atraso ficam cegos, e o guarda fala', () => {
+    const meia = replica(7, Number.NaN);
+    expect(fires(expr(WARNING), meia), 'backlog finito e idade ilegível não pode alertar atraso').toBe(false);
+    expect(fires(expr(CRITICAL), meia)).toBe(false);
+    expect(fires(expr(ABSENT), meia), 'idade ilegível com backlog são é cegueira, e ninguém a reportava').toBe(true);
+  });
+
+  it('SÓ a idade AUSENTE do scrape: mesmo veredito', () => {
+    const soBacklog: SeriesDb = { [BACKLOG]: [{ labels: { instance: 'maia-0:3000', job: 'maia' }, value: 7 }] };
+    expect(fires(expr(WARNING), soBacklog)).toBe(false);
+    expect(fires(expr(ABSENT), soBacklog)).toBe(true);
+  });
+
+  it('SÓ o backlog em `NaN`, idade legível: o guarda continua falando', () => {
+    // O caso simétrico, que o corte original já cobria — mantido para que a
+    // ampliação da expressão não regrida o lado que funcionava.
+    expect(fires(expr(ABSENT), replica(Number.NaN, 900))).toBe(true);
+  });
+
   it('uma réplica cega não silencia a que enxerga', () => {
     // As duas gauges são lidas no SCRAPE do MESMO Postgres: toda réplica
     // reporta o mesmo número, e uma que falhou publica `NaN`. Se o `NaN` de uma
@@ -218,8 +246,14 @@ describe('decisão 14 — o alerta de backlog do onboarding', () => {
     expect(alerts().get(WARNING)?.for).toBe('5m');
   });
 
-  it('critical carrega a mesma janela de sustentação', () => {
-    expect(alerts().get(CRITICAL)?.for).toBe('5m');
+  it('critical NÃO tem `for` — os 1800s já são a sustentação', () => {
+    // Decisão do dono, contra a interpretação que o primeiro corte trouxe. A
+    // idade é monotônica enquanto a run não sai da fila, então "passou de
+    // 1800s" só é alcançável por uma condição que durou 30 minutos: um `for`
+    // aqui não filtra ruído, empurra o page para ~35m30s e faz a regra mentir
+    // sobre o próprio nome. O tempo em que o WARNING já estava firing não
+    // conta — são dois alertas independentes.
+    expect(alerts().get(CRITICAL)?.for).toBeUndefined();
   });
 
   it('as severidades são as decididas', () => {

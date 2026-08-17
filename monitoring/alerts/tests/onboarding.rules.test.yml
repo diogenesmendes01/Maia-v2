@@ -11,14 +11,17 @@
 #
 # ## Como rodar
 #
-# `promtool` NÃO é dependência deste repositório e NÃO roda no CI (adicioná-lo
-# significaria um binário Go no pipeline por três alertas). Este arquivo é
-# reproduzível sob demanda:
+# Este arquivo RODA NO CI, no job `alert-rules` (`.github/workflows/ci.yml`),
+# que usa o `/bin/promtool` da imagem oficial do Prometheus. Sem isso ele seria
+# um teste que ninguém executa — e um teste que ninguém executa apodrece.
 #
-#   cd monitoring/alerts
-#   promtool test rules tests/onboarding.rules.test.yml
+# Reproduzível localmente, com a MESMA versão que o CI usa:
 #
-# Verificado com promtool 2.53.0. `rule_files` é relativo a ESTE arquivo.
+#   docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+#     --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+#     test rules tests/onboarding.rules.test.yml
+#
+# `rule_files` é relativo a ESTE arquivo.
 rule_files:
   - ../onboarding.rules.yml
 
@@ -104,10 +107,11 @@ tests:
       - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
         values: '1801+0x80'
     alert_rule_test:
-      - eval_time: 4m30s
-        alertname: MaiaOnboardingExpiryBacklogStaleCritical
-        exp_alerts: []
-      - eval_time: 5m
+      # O critical NAO tem `for` (decisao do dono): 1800s ja E a sustentacao.
+      # Entao ele dispara na PRIMEIRA avaliacao acima do limiar, t=30s, e nao
+      # 5 minutos depois. Este par de assercoes e o que separa as duas leituras
+      # — com `for: 5m` de volta, a de 30s falha.
+      - eval_time: 30s
         alertname: MaiaOnboardingExpiryBacklogStaleCritical
         exp_alerts:
           - &crit_alert
@@ -123,6 +127,12 @@ tests:
                 ONBOARDING_EXPIRER_BATCH_LIMIT — subir o teto não solta uma linha
                 travada.
                 Runbook: docs/runbooks/onboarding-saga.md §5.1
+      # ...e o warning, esse sim sustentado, so aparece 5 minutos depois. A
+      # escalada nao tem buraco, mas as duas cadencias sao diferentes de
+      # proposito.
+      - eval_time: 30s
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
       - eval_time: 5m
         alertname: MaiaOnboardingExpiryBacklogStaleWarning
         exp_alerts:
@@ -177,6 +187,38 @@ tests:
                 NÃO podem disparar: não se sabe se há fila. `NaN` sustentado é
                 indisponibilidade da LEITURA (Postgres, pool), não do worker.
                 Runbook: docs/runbooks/onboarding-saga.md §5.1
+
+  # -------------------------------------------------------------------------
+  # SÓ a idade ilegível, backlog são. É a metade que o primeiro corte deixou
+  # de fora: os dois alertas de atraso são conjunções, então `max(NaN) > 600`
+  # os cala exatamente igual — e um guarda que olhasse só o backlog ficaria
+  # calado junto. Este bloco prova a expressão AMPLIADA e o `for: 10m` dela.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: so a idade ilegivel tambem e cegueira
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '7+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+    alert_rule_test:
+      # Backlog finito e idade ilegível: nenhum alerta de atraso pode falar.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+      # O guarda respeita o próprio `for: 10m` — calado antes...
+      - eval_time: 9m30s
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts: []
+      # ...e falando depois. Com a expressão estreita (só backlog), este caso
+      # devolve [] e a asserção cai.
+      - eval_time: 10m30s
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts:
+          - *absent_alert
 
   # -------------------------------------------------------------------------
   # Uma réplica cega não silencia a que enxerga — é o que `max()` garante.
