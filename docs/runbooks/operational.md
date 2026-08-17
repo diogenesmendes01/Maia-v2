@@ -438,10 +438,28 @@ journalctl -u maia | grep llm_gateway.circuit_mode_override
 ```
 
 `reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted` ·
-`resynced` · `resync_failed`. Um `rejected` no gráfico significa que alguém
-TENTOU virar a chave e não conseguiu — vale investigar tanto quanto um
-`applied`. Os dois últimos são a releitura de reconexão (uma linha por
-releitura, inclusive quando ela não muda nada).
+`resynced` · `resync_failed` · `resync_cancelled`. Um `rejected` no gráfico
+significa que alguém TENTOU virar a chave e não conseguiu — vale investigar
+tanto quanto um `applied`.
+
+Os **três últimos** são a releitura de reconexão, uma linha por releitura, e
+eles não querem dizer a mesma coisa:
+
+| `reason` | O que aconteceu | O que fazer |
+|---|---|---|
+| `resynced` | a releitura CONVERGIU — leu o estado autoritativo e o aplicou (inclusive quando não mudou nada) | nada; é o caminho feliz |
+| `resync_failed` | a releitura DIVERGIU — esgotou as tentativas sem conseguir ler | investigar Redis/rede; é o único dos três que alerta |
+| `resync_cancelled` | a releitura foi ABANDONADA porque o subscriber parou (shutdown) | nada, se houve deploy/restart. Se aparecer sem restart, a pergunta é por que a réplica está reiniciando |
+
+`resync_cancelled` não é falha: o estado local é preservado e nenhuma postura
+é aplicada, limpa ou recusada. Por isso ele fica fora de `DIVERGENT_OUTCOMES`
+e nenhum alerta o seleciona.
+
+> **Série histórica.** Até 2026-08-17 este balde saía como
+> `reason="resync_aborted"`. O rename **quebra a continuidade da série** — uma
+> query que cubra a virada precisa somar os dois rótulos
+> (`reason=~"resync_aborted|resync_cancelled"`) até o dado velho sair da
+> retenção. Detalhe em [`observability-slo.md`](observability-slo.md).
 
 **A fonte DURÁVEL é `audit_log`** (revisão da PR #541). Métrica expira na
 retenção do Prometheus e log expira na do coletor — é a trilha que responde
