@@ -473,15 +473,31 @@ jobs:
       # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
       # sintaticamente inválido ou uma `expr` que não compila derruba o
       # carregamento do grupo inteiro no Prometheus, em silêncio.
+      #
+      # Os globs sao expandidos AQUI, no runner, dentro de `monitoring/alerts`,
+      # e so os nomes resolvidos entram no `docker run`. A primeira versao
+      # passava `*.rules.yml` cru: o shell do runner tem `cwd` na RAIZ do repo,
+      # o glob nao casava nada, bash o repassava literal e o promtool respondia
+      # `path '*.rules.yml' does not exist`. Expandir dentro do container
+      # resolveria tambem, mas exigiria `--entrypoint sh` e um shell na imagem;
+      # assim o job nao depende de nada alem do proprio binario.
       - name: promtool check rules (todos os arquivos)
         run: |
-          docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./*.rules.yml)
+          echo "arquivos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
             --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
-            check rules *.rules.yml
+            check rules $files
 
       # E a prova temporal, que é a razão de o job existir.
       - name: promtool test rules (semântica de for:)
         run: |
-          docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./tests/*.test.yml)
+          echo "casos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
             --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
-            test rules tests/*.test.yml
+            test rules $files
