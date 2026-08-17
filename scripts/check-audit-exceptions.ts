@@ -23,32 +23,45 @@
  *      ou o problema corrigido; ninguém deferiu "para sempre"
  *   3. entrada do ledger que não casa com nenhum advisory → exceção obsoleta,
  *      deve ser removida (senão o ledger vira folclore)
- *   4. entrada malformada (campo faltando, data inválida, severidade inválida)
- *   5. severidade do advisory diferente da severidade registrada na exceção
- *      → a decisão foi tomada para outro risco, precisa ser tomada de novo
+ *   4. entrada malformada (campo faltando, data inválida, severidade inválida,
+ *      `issue` que não é URL de issue deste repositório com número)
+ *   5. severidade do advisory ACIMA do teto registrado na exceção
+ *      (`max_severity`) → a decisão foi tomada para um risco menor, precisa ser
+ *      tomada de novo
  *   6. `npm audit` que não devolveu um relatório de auditoria reconhecível
  *      → não sabemos nada sobre aquele lockfile; ver "Fail-closed" abaixo
  *
  * A regra 3 é o que impede o ledger de crescer para sempre: assim que o
  * advisory some (upgrade, remoção do pacote), o CI EXIGE a limpeza da linha.
  *
- * As regras 3 e 5 são a mesma regra vista de dois ângulos: o ledger descreve a
- * realidade, e quando a realidade muda — o advisory sumiu, ou mudou de
- * severidade — a linha para de descrevê-la e precisa ser reescrita por gente.
- * É por isso que a 5 compara por IGUALDADE e não trata a severidade registrada
- * como teto: um `critical` reclassificado para `moderate` também invalida a
- * justificativa escrita, do mesmo jeito que um advisory que sumiu invalida a
- * linha inteira. O ledger já reprova quando a realidade MELHORA (regra 3, que
- * fica vermelha justamente quando alguém corrigiu a vulnerabilidade); a regra 5
- * apenas mantém essa postura coerente em vez de tolerar meia-verdade no ledger.
+ * A regra 3 e a regra 5 miram coisas diferentes. A 3 cuida do ledger que não
+ * encolhe. A 5 cuida do RISCO: `max_severity` é um TETO, não uma igualdade — a
+ * linha registra "esta exceção foi decidida para risco de até X". Enquanto o
+ * npm reporta X ou menos, a decisão escrita ainda cobre o que está lá e o CI
+ * não tem o que perguntar. Quando o npm reporta ACIMA de X, a justificativa
+ * passa a cobrir um risco menor do que o real e alguém precisa decidir de novo.
+ *
+ * A versão anterior comparava por IGUALDADE e reprovava também na QUEDA de
+ * severidade. Isso produzia ruído sem risco: um `moderate` reclassificado para
+ * `low` continua dentro do que o dono aceitou, e reprovar ali só ensinava a
+ * tratar o vermelho do guard como burocracia — o pior que pode acontecer com um
+ * guard de segurança. Se a queda merecer atualizar o texto do `reason`, isso é
+ * higiene de ledger, não motivo para travar o CI.
+ *
+ * O campo antigo `severity` NÃO é aceito como sinônimo: um ledger com o nome
+ * velho reprova na validação, com instrução de renomear. Aceitar os dois nomes
+ * deixaria a mesma linha sendo lida como igualdade por quem escreveu antes e
+ * como teto pelo guard — que é exatamente a meia-verdade que este arquivo
+ * existe para não ter. Fail-closed também vale para o formato.
  *
  * Fail-closed
  * -----------
  * O `npm audit` sai com código != 0 QUANDO ENCONTRA vulnerabilidade, então o
  * exit status não distingue "achei coisa" de "não consegui auditar" e por isso
  * é ignorado. A distinção que vale é a FORMA do relatório: um relatório de
- * sucesso do npm >= 7 traz `auditReportVersion`, `vulnerabilities` (objeto,
- * possivelmente VAZIO) e `metadata`. Uma falha de registry/auth/serviço traz um
+ * sucesso do npm >= 7 traz `auditReportVersion` (que precisa ser exatamente
+ * `2`, a única forma que este parser sabe ler — ver `AUDIT_REPORT_VERSION`),
+ * `vulnerabilities` (objeto, possivelmente VAZIO) e `metadata`. Uma falha de registry/auth/serviço traz um
  * objeto sem nenhum desses campos e com `error` — verificado com npm 10.9.7
  * apontado para um registry morto, exit 1, stdout:
  *
@@ -91,6 +104,50 @@ export const PROJECTS: readonly string[] = ['.', 'src/admin-ui'];
 
 export const SEVERITIES: readonly string[] = ['info', 'low', 'moderate', 'high', 'critical'];
 
+/**
+ * A ÚNICA versão de relatório que `parseAudit` sabe ler.
+ *
+ * Decisão 20 do dono: exigir o valor 2, não "algum número". A v1 (npm 6) trazia
+ * `advisories` + `actions` em vez de `vulnerabilities` indexado por pacote com
+ * `via[]`; uma v3 futura pode trazer outra coisa qualquer. Aceitar qualquer
+ * número deixaria `parseAudit` varrer uma forma que não conhece, achar zero
+ * findings e devolver VERDE — o mesmo fail-open que a checagem de forma existe
+ * para não ter. Quando o npm publicar uma v3, o caminho é ler a forma nova e
+ * mudar este arquivo, não afrouxar a comparação.
+ */
+export const AUDIT_REPORT_VERSION = 2;
+
+/**
+ * Forma exigida do campo `issue`: URL de uma issue DESTE repositório, com
+ * número.
+ *
+ * Decisão 22 do dono: "a exceção deve apontar para uma issue aberta
+ * específica". O campo aceitava qualquer string — `"n/a"`, `"ver o slack"`, um
+ * número solto — e uma exceção sem alvo rastreável não tem para onde vencer:
+ * quando `expires` chega, ninguém sabe onde está o trabalho que a encerraria.
+ *
+ * O que esta checagem NÃO faz, e por quê
+ * --------------------------------------
+ * Ela valida a FORMA, não o ESTADO. Não distingue issue aberta de fechada — a
+ * URL da #526 (fechada) tem exatamente a mesma forma que a da #574 (aberta).
+ *
+ * Isso é deliberado, não esquecimento. Saber se a issue está aberta exige uma
+ * chamada à API do GitHub, e este guard roda no job `dependency-audit`, que de
+ * propósito não faz `npm ci` nem recebe credencial de API — e roda também na
+ * máquina de quem desenvolve, offline. Uma checagem de estado aqui seria:
+ *
+ *   - flaky por rede (o guard reprovaria por indisponibilidade do GitHub, não
+ *     por risco de segurança — e um guard que grita sem motivo é ignorado); e
+ *   - fail-open na prática, porque a única saída sã para "não consegui
+ *     consultar" seria deixar passar.
+ *
+ * Então a exigência de "aberta" vive onde ela pode ser cumprida: na MENSAGEM de
+ * erro, lida por gente, e na revisão de quem aprova a PR que mexe no ledger. O
+ * que a máquina consegue garantir sozinha — que existe um alvo específico e
+ * clicável neste repositório — ela garante.
+ */
+export const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/diogenesmendes01\/Maia-v2\/issues\/[1-9]\d*$/;
+
 /** Um advisory concreto encontrado pelo `npm audit` em um dos lockfiles. */
 export interface Finding {
   /** Diretório do projeto (`.` ou `src/admin-ui`). */
@@ -108,7 +165,12 @@ export interface Exception {
   readonly project: string;
   readonly pkg: string;
   readonly advisory: string;
-  readonly severity: string;
+  /**
+   * TETO de severidade aceito, não igualdade: o guard só reprova quando o `npm
+   * audit` reporta ALGO ACIMA disto. Renomeado de `severity` justamente para o
+   * nome não sugerir a comparação errada — ver regra 5 no topo.
+   */
+  readonly max_severity: string;
   readonly reason: string;
   readonly owner: string;
   readonly issue: string;
@@ -189,10 +251,14 @@ export function validateAuditReport(project: string, raw: unknown): string[] {
       `${where}: o npm devolveu um relatório de ERRO — ${summarizeNpmError(r)}. ${comoAgir}`,
     );
   }
-  if (typeof r.auditReportVersion !== 'number') {
+  if (r.auditReportVersion !== AUDIT_REPORT_VERSION) {
     errors.push(
-      `${where}: relatório sem "auditReportVersion" numérico, então não é um relatório de ` +
-        `auditoria do npm >= 7. ${comoAgir}`,
+      `${where}: "auditReportVersion" é ${JSON.stringify(r.auditReportVersion) ?? 'undefined'} e ` +
+        `este parser só sabe ler a versão ${AUDIT_REPORT_VERSION}. Um relatório de outra ` +
+        `versão tem FORMA diferente, e lê-lo com o parser da v${AUDIT_REPORT_VERSION} produziria ` +
+        `zero findings em vez de um erro. Atualize este script para a nova forma (a v2 indexa ` +
+        `"vulnerabilities" por pacote, com "via[]" trazendo url/title/severity) antes de ` +
+        `aceitá-la. ${comoAgir}`,
     );
   }
   const vulns = r.vulnerabilities;
@@ -284,7 +350,16 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
     return { exceptions, errors: [`${LEDGER_PATH}: o conteúdo precisa ser um array JSON`] };
   }
 
-  const required = ['project', 'pkg', 'advisory', 'severity', 'reason', 'owner', 'issue', 'expires'];
+  const required = [
+    'project',
+    'pkg',
+    'advisory',
+    'max_severity',
+    'reason',
+    'owner',
+    'issue',
+    'expires',
+  ];
   const seen = new Set<string>();
 
   for (let i = 0; i < parsed.length; i += 1) {
@@ -292,6 +367,18 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
     const where = `${LEDGER_PATH}[${i}]`;
     if (typeof row !== 'object' || row === null) {
       errors.push(`${where}: entrada precisa ser um objeto`);
+      continue;
+    }
+    // Campo antigo: reprova ANTES de reclamar de `max_severity` ausente, senão
+    // o diagnóstico seria "faltou um campo" quando o fato é "este campo mudou
+    // de nome E de semântica". A mensagem tem de dizer as duas coisas.
+    if ('severity' in row) {
+      errors.push(
+        `${where}: o campo "severity" foi renomeado para "max_severity" e passou a ser um ` +
+          `TETO, não uma igualdade — o guard só reprova quando o npm audit reporta severidade ` +
+          `ACIMA dele. Renomeie "severity" para "max_severity" nesta entrada e confirme que o ` +
+          `valor ainda é o maior risco que você aceita para este advisory.`,
+      );
       continue;
     }
     let ok = true;
@@ -308,12 +395,22 @@ export function validateLedger(parsed: unknown): { exceptions: Exception[]; erro
       errors.push(`${where}: project "${e.project}" não é um dos projetos (${PROJECTS.join(', ')})`);
       continue;
     }
-    if (!SEVERITIES.includes(e.severity)) {
-      errors.push(`${where}: severity "${e.severity}" inválida (${SEVERITIES.join(', ')})`);
+    if (!SEVERITIES.includes(e.max_severity)) {
+      errors.push(`${where}: max_severity "${e.max_severity}" inválida (${SEVERITIES.join(', ')})`);
       continue;
     }
     if (!/^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/.test(e.advisory)) {
       errors.push(`${where}: advisory "${e.advisory}" não tem a forma GHSA-xxxx-xxxx-xxxx`);
+      continue;
+    }
+    if (!ISSUE_URL_PATTERN.test(e.issue)) {
+      errors.push(
+        `${where}: issue "${e.issue}" não é uma URL de issue deste repositório com número ` +
+          `(esperado https://github.com/diogenesmendes01/Maia-v2/issues/<n>). A exceção precisa ` +
+          `apontar para uma issue ABERTA e específica — é ela que recebe o trabalho quando ` +
+          `"expires" chegar. O guard só consegue verificar a FORMA da URL: que a issue está ` +
+          `mesmo aberta é responsabilidade de quem escreve e de quem revisa o ledger.`,
+      );
       continue;
     }
     if (!isCalendarDate(e.expires)) {
@@ -362,13 +459,24 @@ export function findProblems(
     // exceção registrada" + "exceção OBSOLETA"), e quem lesse o CI procuraria
     // uma linha que existe e está quase certa. Como comparação, o diagnóstico é
     // único e diz exatamente qual campo editar.
-    if (e.severity !== f.severity) {
-      const escalou = SEVERITIES.indexOf(f.severity) > SEVERITIES.indexOf(e.severity);
+    const nivel = SEVERITIES.indexOf(f.severity);
+    if (nivel < 0) {
+      // Fail-closed obrigatório aqui. `indexOf` devolve -1 para uma severidade
+      // que não sabemos ler, e -1 nunca é MAIOR que o teto: sem este ramo, um
+      // relatório com severidade ilegível (campo ausente, valor novo do npm)
+      // passaria batido justamente por ser incompreensível.
       problems.push(
-        `severidade DIVERGENTE${escalou ? ' (ESCALOU)' : ''}: ${f.project} → ${f.pkg} ` +
-          `${f.advisory} foi aceito como "${e.severity}" e o npm audit hoje reporta ` +
-          `"${f.severity}". A decisão de ${e.owner} vale para o risco antigo. Reavalie e ` +
-          `atualize "severity" e "reason" em ${LEDGER_PATH}, ou corrija o advisory.`,
+        `severidade "${f.severity}" não está na escala conhecida (${SEVERITIES.join(', ')}): ` +
+          `${f.project} → ${f.pkg} ${f.advisory}. Sem conseguir situá-la na escala, o guard ` +
+          `não consegue compará-la com o teto "${e.max_severity}" e reprova.`,
+      );
+    } else if (nivel > SEVERITIES.indexOf(e.max_severity)) {
+      problems.push(
+        `severidade ACIMA do teto aceito: ${f.project} → ${f.pkg} ${f.advisory} foi aceito ` +
+          `com teto "${e.max_severity}" e o npm audit hoje reporta "${f.severity}". A decisão ` +
+          `de ${e.owner} vale para um risco menor. Reavalie e atualize "max_severity" e ` +
+          `"reason" em ${LEDGER_PATH}, ou corrija o advisory. (Uma QUEDA de severidade não ` +
+          `reprova: o teto continua cobrindo o risco.)`,
       );
     }
     if (e.expires < today) {
@@ -539,7 +647,7 @@ export function runGuard(repoRoot: string, now: Date, audit: AuditReader = runAu
   console.log(
     `check-audit-exceptions passou: ${PROJECTS.length} lockfiles auditados com relatório ` +
       `válido, ${findings.length} advisory(s), ${exceptions.length} exceção(ões) registrada(s) — ` +
-      `todas casando na severidade registrada e dentro do prazo.`,
+      `todas dentro do teto de severidade aceito e dentro do prazo.`,
   );
 }
 

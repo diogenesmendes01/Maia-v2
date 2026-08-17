@@ -229,6 +229,49 @@ to touch a healthy `applied` row. **Never "clear the flag" without
 verifying the schema** — the reason field exists precisely so the next
 operator can tell what was checked.
 
+### Dirty on `115_agent_turns_pending_race_lost.sql` (troca de CHECK em fases)
+
+A 115 é `-- maia:no-transaction` por um motivo diferente do usual: ela
+não roda `CONCURRENTLY`, ela precisa que a varredura do
+`VALIDATE CONSTRAINT` aconteça numa transação **separada** do
+`DROP`/`ADD`, senão a validação inteira corre sob o ACCESS EXCLUSIVE
+desses e bloqueia escrita em `agent_turns` (tabela quente). Por isso ela
+tem cinco statements e quatro estados intermediários possíveis. Descubra
+em qual você está:
+
+```sql
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'agent_turns'::regclass AND conname LIKE '%status_outcome%';
+```
+
+| O que você vê | Onde a 115 parou | O que fazer |
+|---|---|---|
+| só `agent_turns_status_outcome_chk`, `convalidated = t`, sem `pending_race_lost` na definição | antes da fase 1 | `repair --as pending` e reaplicar |
+| `…_chk` + `…_chk_v115` com `convalidated = f` | depois da fase 1 | `repair --as pending` e reaplicar |
+| `…_chk` + `…_chk_v115`, ambas `convalidated = t` | depois da fase 2 | `repair --as pending` e reaplicar |
+| **só** `…_chk_v115`, `convalidated = t` | entre os dois statements da fase 3 | **não reaplique o arquivo** — ver abaixo |
+
+Nos três primeiros a tabela ainda tem a constraint canônica de pé, então
+reaplicar o arquivo inteiro é seguro: o `DROP … IF EXISTS` da fase 1 só
+derruba o nome temporário. No quarto a canônica já caiu, e reaplicar
+deixaria a tabela sem NENHUMA constraint entre dois statements. Ali a
+remediação é um statement só, e então marcar como aplicada:
+
+```sql
+ALTER TABLE agent_turns
+  RENAME CONSTRAINT agent_turns_status_outcome_chk_v115
+                 TO agent_turns_status_outcome_chk;
+```
+
+```bash
+tsx scripts/migrate.ts repair --id 115_agent_turns_pending_race_lost.sql --as applied \
+  --reason "crash entre os dois statements da fase 3; rename manual conferido"
+```
+
+Rodar o `_down` da 115 também sai desse estado (ele derruba o nome
+temporário junto), mas isso é reverter, não reparar — e ele **recusa** se
+já houver turno com `outcome = 'pending_race_lost'`.
+
 ### When `repair --as applied` refuses
 
 `--as applied` records the **packaged** checksum for the id. If this build
@@ -364,7 +407,15 @@ time. The two are reviewed together.
    single envelope — `migrate up` refuses the file otherwise
    ([`unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope)).
    A migration that cannot run in a transaction declares
-   `-- maia:no-transaction` and omits the block.
+   `-- maia:no-transaction` and omits the block. So does one that **must
+   not** run in a single transaction: swapping a CHECK/FK on a hot table
+   with `ADD … NOT VALID` + `VALIDATE CONSTRAINT` only avoids a long
+   ACCESS EXCLUSIVE if the validation commits separately from the
+   `DROP`/`ADD` — inside one transaction the strong lock is held across
+   the whole scan and the pair buys nothing. Such a file owes the reader
+   its crash matrix in the header (see
+   `115_agent_turns_pending_race_lost.sql` and
+   [the recovery section](#dirty-on-115_agent_turns_pending_race_lostsql-troca-de-check-em-fases)).
 3. Create `migrations/NNN_<short_name>_down.sql` that reverses them
    coherently:
    - Header:

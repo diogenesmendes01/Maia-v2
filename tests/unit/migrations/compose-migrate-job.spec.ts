@@ -19,6 +19,7 @@
  * YAML. Every assertion is about the bytes committed in the repo root.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { asMap, asString, interpolate, parseComposeFile, type ComposeNode } from './_compose-yaml.js';
 import { loadServiceConfig } from '@/config/load.js';
@@ -151,12 +152,17 @@ describe('docker-compose.yml (dev) — the local flow keeps working', () => {
 });
 
 describe('compose.prod.yml — the job gets the migrator subset and nothing else (#515)', () => {
-  /** What `docker compose --env-file .env.infra` supplies for interpolation. */
+  /**
+   * What `docker compose --env-file .env.infra` supplies for interpolation.
+   * `MAIA_ENV` is in here because the compose file now REQUIRES it (`:?`) —
+   * see the `MAIA_ENV` block below and `docs/runbooks/deploy-prod.md` §1.
+   */
   const INFRA = {
     POSTGRES_USER: 'maia_prod',
     POSTGRES_PASSWORD: 'f4kepassw0rdf4ke',
     POSTGRES_DB: 'maia',
     REDIS_PASSWORD: 'f4keredispass',
+    MAIA_ENV: 'production',
   } as const;
 
   function resolvedJobEnv(): Record<string, string> {
@@ -192,6 +198,38 @@ describe('compose.prod.yml — the job gets the migrator subset and nothing else
     expect(() => loadServiceConfig('migrator', { env: resolvedJobEnv() })).not.toThrow();
   });
 
+  it('MAIA_ENV is required, not defaulted — a staging that forgets it must abort', () => {
+    // The whole point of the owner decision behind this assertion: `${MAIA_ENV:-production}`
+    // does not fail when the variable is missing, it SUCCEEDS with the wrong
+    // answer. A staging deploy whose `.env.infra` lacks the line silently gets
+    // the production profile, and nothing in the logs says so. `${MAIA_ENV:?…}`
+    // turns that into an abort before any container is created.
+    const raw = asMap(service(PROD, JOB).environment, 'prod: services.migrate.environment');
+    const declared = asString(raw.MAIA_ENV, 'MAIA_ENV');
+    expect(
+      declared,
+      'services.migrate.environment.MAIA_ENV must use the required form `${MAIA_ENV:?…}` — ' +
+        'a `:-` default makes a missing variable indistinguishable from an explicit choice',
+    ).toMatch(/^\$\{MAIA_ENV:\?/);
+    expect(() => interpolate(declared, {})).toThrow(/MAIA_ENV is required/);
+    // And it still resolves to the operator's value when the value IS supplied —
+    // a required variable that ignored `.env.infra` would be no better.
+    expect(interpolate(declared, { MAIA_ENV: 'staging' })).toBe('staging');
+  });
+
+  it('an .env.infra without MAIA_ENV aborts the whole job env, not just that line', () => {
+    // Reads the REAL file and drops exactly one key from the infra fixture.
+    // The assertion is on the whole `environment:` block because that is what
+    // `docker compose` interpolates as a unit: the run never starts.
+    const { MAIA_ENV: _dropped, ...withoutMaiaEnv } = INFRA;
+    const raw = asMap(service(PROD, JOB).environment, 'prod: services.migrate.environment');
+    expect(() => {
+      for (const [key, value] of Object.entries(raw)) {
+        interpolate(asString(value, `environment.${key}`), withoutMaiaEnv);
+      }
+    }).toThrow(/MAIA_ENV is required/);
+  });
+
   it('the required production credentials have no fallback', () => {
     const raw = asMap(service(PROD, JOB).environment, 'prod: services.migrate.environment');
     const url = asString(raw.DATABASE_URL, 'DATABASE_URL');
@@ -209,5 +247,60 @@ describe('compose.prod.yml — the job gets the migrator subset and nothing else
     // Only the internal datastore network: the job has no reason to be
     // reachable from the reverse proxy.
     expect(job.networks, 'the migrate job must not join the `web` network').toEqual(['data']);
+  });
+});
+
+/**
+ * The smoke gate (`scripts/smoke-migrate-image.sh`) is the executable half of
+ * everything above: it builds the REAL image and runs the REAL command in it,
+ * as uid 1001, with a read-only rootfs, against an ephemeral database. A gate
+ * that drifts from the file it claims to exercise gates nothing — so the
+ * parameters it pins are asserted here against `compose.prod.yml` itself.
+ * Both sides are read from disk; neither is reconstructed here.
+ */
+describe('scripts/smoke-migrate-image.sh — the gate exercises what compose.prod.yml declares', () => {
+  const script = readFileSync(resolve(REPO_ROOT, 'scripts/smoke-migrate-image.sh'), 'utf8');
+  const job = service(PROD, JOB);
+
+  it('runs the same command the job runs', () => {
+    const declared = (job.command as string[]).join(' ');
+    const pinned = /^MIGRATE_COMMAND=\((.+)\)$/m.exec(script)?.[1];
+    expect(pinned, 'the smoke script must declare MIGRATE_COMMAND=(...)').toBeDefined();
+    expect(pinned, `the smoke runs "${pinned}" but compose.prod.yml runs "${declared}"`).toBe(declared);
+  });
+
+  it('runs under the same uid and the same read-only rootfs', () => {
+    expect(script).toContain(`--user ${asString(job.user, 'user')}`);
+    // `read_only: true` in the file ⇒ `--read-only` in the run. Dropping that
+    // flag is exactly the edit that turns the smoke into decoration.
+    expect(asString(job.read_only, 'read_only')).toBe('true');
+    expect(script).toMatch(/^\s*--read-only$/m);
+    // The job's only writable scratch is a tmpfs on /tmp — and `tsx` genuinely
+    // needs it: it creates `/tmp/tsx-<uid>` before loading the first module.
+    expect(job.tmpfs).toEqual(['/tmp']);
+    expect(script).toMatch(/^\s*--tmpfs \/tmp$/m);
+  });
+
+  it('injects exactly the variables the job receives — no more, no fewer', () => {
+    const declared = Object.keys(asMap(job.environment, 'prod: services.migrate.environment')).sort();
+    // Scoped to the `migrator_env_flags()` body on purpose: the script also
+    // passes `-e POSTGRES_*` to the EPHEMERAL Postgres container, and a regex
+    // over the whole file happily counts those too — which is how the first
+    // version of this assertion reported duplicates instead of drift.
+    const body = /^migrator_env_flags\(\) \{$([\s\S]*?)^\}$/m.exec(script)?.[1];
+    expect(body, 'the smoke script must declare a migrator_env_flags() function').toBeDefined();
+    const injected = [...(body as string).matchAll(/^\s*-e "([A-Za-z_][A-Za-z0-9_]*)=/gm)]
+      .map((m) => m[1] as string)
+      .sort();
+    expect(
+      injected,
+      'a variable added to the compose job but not to the smoke would never be exercised in the ' +
+        'real image; one added only to the smoke would be exercising a fiction',
+    ).toEqual(declared);
+  });
+
+  it('migrates against the same Postgres image production runs', () => {
+    const image = asString(service(PROD, 'postgres').image, 'prod: services.postgres.image');
+    expect(script).toContain(`POSTGRES_IMAGE="${image}"`);
   });
 });

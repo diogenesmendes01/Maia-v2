@@ -37,10 +37,10 @@ const OK: Exception = {
   project: '.',
   pkg: 'esbuild',
   advisory: 'GHSA-67mh-4wv8-2f99',
-  severity: 'moderate',
+  max_severity: 'moderate',
   reason: 'só na árvore de dev; correção exige major deferido',
   owner: 'diogenesmendes01',
-  issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/526',
+  issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/574',
   expires: '2099-01-01',
 };
 
@@ -224,7 +224,7 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
 
   it('reprova relatório sem "auditReportVersion" e sem "metadata"', () => {
     const errors = validateAuditReport('.', { vulnerabilities: {} }).join('\n');
-    expect(errors).toContain('"auditReportVersion" numérico');
+    expect(errors).toContain('"auditReportVersion"');
     expect(errors).toContain('"metadata" ausente ou não é um objeto');
   });
 
@@ -240,6 +240,119 @@ describe('validateAuditReport — fail-closed sobre a forma do relatório', () =
     const { findings, errors } = parseAudit('src/admin-ui', RELATORIO_DE_ERRO);
     expect(findings).toEqual([]);
     expect(errors.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Decisão 19 do dono: `metadata` CONTINUA obrigatório — nada de relaxar.
+ *
+ * O caso combinado ("sem auditReportVersion e sem metadata") não prova esta
+ * exigência sozinho: ele ficaria verde só pelo primeiro campo. Estes casos
+ * isolam `metadata`, com todo o resto do relatório VÁLIDO, para que remover a
+ * exigência fique vermelho aqui e não em outro lugar.
+ */
+/**
+ * Decisão 20 do dono: exigir `auditReportVersion === 2`, não "algum número".
+ *
+ * A v2 é a única forma que este parser sabe ler: `vulnerabilities` como objeto
+ * indexado por pacote, com `via[]` carregando `url`/`title`/`severity`. A v1 do
+ * npm 6 trazia `advisories`/`actions` — forma inteiramente diferente, que
+ * atravessaria `parseAudit` produzindo ZERO findings e deixando o guard verde
+ * por não entender o relatório. Uma v3 futura tem o mesmo problema, com o
+ * agravante de ninguém ter lido a forma dela ainda.
+ *
+ * "Não entendi o relatório" tem de reprovar, como qualquer outra ausência de
+ * auditoria neste arquivo.
+ */
+describe('validateAuditReport — auditReportVersion tem de ser 2 (decisão 20)', () => {
+  it('aceita a v2', () => {
+    const v2 = { auditReportVersion: 2, vulnerabilities: {}, metadata: METADATA };
+    expect(validateAuditReport('.', v2)).toEqual([]);
+  });
+
+  it('REPROVA a v1 do npm 6, cuja forma é outra', () => {
+    const v1 = { auditReportVersion: 1, vulnerabilities: {}, metadata: METADATA };
+    const errors = validateAuditReport('.', v1).join('\n');
+    expect(errors).toContain('auditReportVersion');
+    // A mensagem tem de dizer QUAL versão veio...
+    expect(errors).toContain('1');
+    // ...e o que fazer.
+    expect(errors).toContain('2');
+  });
+
+  it('REPROVA qualquer versão futura — inclusive 3', () => {
+    for (const v of [0, 3, 4, 2.5, -2]) {
+      const errors = validateAuditReport('.', {
+        auditReportVersion: v,
+        vulnerabilities: {},
+        metadata: METADATA,
+      }).join('\n');
+      expect(errors, `auditReportVersion=${v}`).toContain('auditReportVersion');
+    }
+  });
+
+  it('REPROVA a versão como STRING "2" — não é o número 2', () => {
+    const errors = validateAuditReport('.', {
+      auditReportVersion: '2',
+      vulnerabilities: {},
+      metadata: METADATA,
+    }).join('\n');
+    expect(errors).toContain('auditReportVersion');
+  });
+
+  it('o guard INTEIRO reprova um lockfile que devolve versão diferente de 2', () => {
+    // Sem isto, `parseAudit` leria um relatório de outra forma como "zero
+    // advisories" e o ledger inteiro apareceria como exceção OBSOLETA.
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({
+        '.': { ...(relatorioComEsbuild() as object), auditReportVersion: 3 },
+        'src/admin-ui': RELATORIO_LIMPO,
+      }),
+    );
+    expect(problems.join('\n')).toContain('auditReportVersion');
+    expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
+  });
+});
+
+describe('validateAuditReport — `metadata` continua obrigatório (decisão 19)', () => {
+  it('REPROVA relatório sem "metadata", com todo o resto válido', () => {
+    const semMetadata = { auditReportVersion: 2, vulnerabilities: {} };
+    const errors = validateAuditReport('src/admin-ui', semMetadata);
+    expect(errors.length, 'um relatório sem metadata não pode ser aceito').toBeGreaterThan(0);
+    expect(errors.join('\n')).toContain('"metadata" ausente ou não é um objeto');
+    // A mensagem tem de continuar dizendo o que fazer, não só o que faltou.
+    expect(errors.join('\n')).toContain('NÃO é "zero advisories"');
+    expect(errors.join('\n')).toContain('src/admin-ui');
+  });
+
+  it('REPROVA "metadata" que não é objeto', () => {
+    for (const m of [[], null, 'nenhuma', 0, true]) {
+      const errors = validateAuditReport('.', {
+        auditReportVersion: 2,
+        vulnerabilities: {},
+        metadata: m,
+      });
+      expect(errors.join('\n'), `metadata=${JSON.stringify(m)}`).toContain(
+        '"metadata" ausente ou não é um objeto',
+      );
+    }
+  });
+
+  it('o guard INTEIRO reprova quando um lockfile devolve relatório sem metadata', () => {
+    // Fecha o caminho: não basta `validateAuditReport` reclamar, o veredito do
+    // guard tem de carregar a reclamação até o fim.
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({
+        '.': relatorioComEsbuild(),
+        'src/admin-ui': { auditReportVersion: 2, vulnerabilities: {} },
+      }),
+    );
+    expect(problems.join('\n')).toContain('"metadata" ausente ou não é um objeto');
+    expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
   });
 });
 
@@ -377,6 +490,101 @@ describe('validateLedger', () => {
     expect(errors.join('\n')).toContain('entrada duplicada');
   });
 
+  it('reprova max_severity fora da escala', () => {
+    const { errors } = validateLedger([{ ...OK, max_severity: 'catastrophic' }]);
+    expect(errors.join('\n')).toContain('max_severity "catastrophic" inválida');
+  });
+
+  it('reprova max_severity ausente', () => {
+    const semTeto: Record<string, unknown> = { ...OK };
+    delete semTeto.max_severity;
+    const { errors } = validateLedger([semTeto]);
+    expect(errors.join('\n')).toContain('campo "max_severity" ausente ou vazio');
+  });
+
+  /**
+   * Decisão 1: o campo antigo NÃO é tolerado em silêncio. Um ledger escrito
+   * antes da renomeação tem de reprovar dizendo o que renomear — aceitar os
+   * dois nomes deixaria um ledger com `severity` sendo lido como igualdade por
+   * um humano e como teto pelo guard.
+   */
+  it('reprova o campo ANTIGO "severity" com mensagem que diz o que renomear', () => {
+    const antigo: Record<string, unknown> = { ...OK, severity: 'moderate' };
+    delete antigo.max_severity;
+    const { exceptions, errors } = validateLedger([antigo]);
+    const texto = errors.join('\n');
+    expect(texto).toContain('"severity"');
+    expect(texto).toContain('max_severity');
+    expect(texto.toLowerCase()).toContain('teto');
+    expect(exceptions).toEqual([]);
+  });
+
+  it('reprova quando os DOIS nomes estão presentes', () => {
+    const ambos = { ...OK, severity: 'moderate' };
+    const { exceptions, errors } = validateLedger([ambos]);
+    expect(errors.join('\n')).toContain('max_severity');
+    expect(exceptions).toEqual([]);
+  });
+
+  /**
+   * Decisão 22 do dono: a exceção tem de APONTAR PARA UMA ISSUE ABERTA
+   * específica. O checker aceitava qualquer string aqui — `"n/a"`, `"ver
+   * slack"`, um número solto — e uma exceção sem alvo rastreável não tem para
+   * onde vencer.
+   *
+   * A validação é de FORMA (URL de issue DESTE repositório, com número). O
+   * estado aberto/fechado não é checado: ver o comentário de
+   * `ISSUE_URL_PATTERN` em scripts/check-audit-exceptions.ts.
+   */
+  it('aceita a URL canônica de issue deste repositório', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/diogenesmendes01/Maia-v2/issues/574' },
+    ]);
+    expect(errors).toEqual([]);
+  });
+
+  it('reprova string que não é URL de issue', () => {
+    for (const bad of ['n/a', '574', '#574', 'ver o slack', 'https://example.com/issues/574']) {
+      const { errors } = validateLedger([{ ...OK, issue: bad }]);
+      expect(errors.join('\n'), `issue=${bad}`).toContain('não é uma URL de issue');
+    }
+  });
+
+  it('reprova URL de issue de OUTRO repositório', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/outra/pessoa/issues/574' },
+    ]);
+    expect(errors.join('\n')).toContain('não é uma URL de issue');
+  });
+
+  it('reprova URL de PULL REQUEST — PR não é o alvo de uma exceção', () => {
+    const { errors } = validateLedger([
+      { ...OK, issue: 'https://github.com/diogenesmendes01/Maia-v2/pull/574' },
+    ]);
+    expect(errors.join('\n')).toContain('não é uma URL de issue');
+  });
+
+  it('reprova URL de issue SEM número utilizável', () => {
+    for (const bad of [
+      'https://github.com/diogenesmendes01/Maia-v2/issues',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/0',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/abc',
+      'https://github.com/diogenesmendes01/Maia-v2/issues/574/',
+    ]) {
+      const { errors } = validateLedger([{ ...OK, issue: bad }]);
+      expect(errors.join('\n'), `issue=${bad}`).toContain('não é uma URL de issue');
+    }
+  });
+
+  it('a mensagem diz que o alvo precisa estar ABERTO — a forma não prova isso', () => {
+    // O checker não tem rede nem token no job `dependency-audit`, então não dá
+    // para confirmar o estado da issue aqui. O que a mensagem PODE fazer é
+    // dizer a quem lê o vermelho qual é a exigência de verdade.
+    const { errors } = validateLedger([{ ...OK, issue: 'n/a' }]);
+    expect(errors.join('\n').toLowerCase()).toContain('aberta');
+  });
+
   it('reprova conteúdo que não é array', () => {
     const { errors } = validateLedger({ exceptions: [] });
     expect(errors.join('\n')).toContain('precisa ser um array JSON');
@@ -419,27 +627,53 @@ describe('findProblems', () => {
 });
 
 /**
- * Achado [Medium] da review: `severity` era validada no ledger mas nunca
- * comparada com o advisory real. Uma exceção aceita como `moderate` seguia
- * liberando o CI depois do GHSA ser reclassificado para `critical`.
+ * Decisão 1 do dono: `severity` deixou de ser IGUALDADE e virou TETO, com o
+ * campo renomeado para `max_severity`.
+ *
+ * O que motivou: o guard reprovava em QUALQUER divergência, inclusive quando o
+ * advisory BAIXAVA de severidade. Isso é ruído — a decisão registrada foi
+ * "aceito até moderate"; um advisory que passou a ser `low` continua dentro do
+ * que se aceitou. O risco que precisa de decisão nova é a ESCALADA.
  */
-describe('findProblems — drift de severidade', () => {
-  it('reprova advisory que ESCALOU de moderate para critical', () => {
+describe('findProblems — teto de severidade (max_severity)', () => {
+  it('reprova severidade ACIMA do teto — escalada continua exigindo decisão nova', () => {
     const escalado: Finding = { ...FINDING, severity: 'critical' };
     const problems = findProblems([escalado], [OK], '2026-08-14').join('\n');
-    expect(problems).toContain('severidade DIVERGENTE (ESCALOU)');
-    expect(problems).toContain('foi aceito como "moderate"');
+    expect(problems).toContain('severidade ACIMA do teto aceito');
+    expect(problems).toContain('teto "moderate"');
     expect(problems).toContain('reporta "critical"');
   });
 
-  it('reprova também quando a severidade CAI — o ledger passou a mentir', () => {
-    const rebaixado: Finding = { ...FINDING, severity: 'low' };
-    const problems = findProblems([rebaixado], [OK], '2026-08-14').join('\n');
-    expect(problems).toContain('severidade DIVERGENTE');
-    expect(problems).not.toContain('ESCALOU');
+  it('passa com severidade IGUAL ao teto', () => {
+    expect(findProblems([FINDING], [OK], '2026-08-14')).toEqual([]);
   });
 
-  it('o drift é UM diagnóstico, não "advisory sem exceção" + "exceção obsoleta"', () => {
+  it('passa com severidade ABAIXO do teto — queda não é risco novo', () => {
+    // Este é o caso que a igualdade antiga reprovava. `low` < `moderate`: a
+    // decisão escrita ainda cobre o risco de hoje.
+    const rebaixado: Finding = { ...FINDING, severity: 'low' };
+    expect(findProblems([rebaixado], [OK], '2026-08-14')).toEqual([]);
+  });
+
+  it('passa com a menor severidade possível abaixo do teto', () => {
+    const minimo: Finding = { ...FINDING, severity: 'info' };
+    expect(findProblems([minimo], [OK], '2026-08-14')).toEqual([]);
+  });
+
+  it('reprova cada degrau ACIMA do teto e aceita cada degrau até ele', () => {
+    // Varre a escala inteira contra um teto de `moderate`, para o teto não
+    // depender de um par de valores escolhido a dedo.
+    for (const s of ['info', 'low', 'moderate']) {
+      expect(findProblems([{ ...FINDING, severity: s }], [OK], '2026-08-14'), s).toEqual([]);
+    }
+    for (const s of ['high', 'critical']) {
+      expect(findProblems([{ ...FINDING, severity: s }], [OK], '2026-08-14').join('\n'), s).toContain(
+        'severidade ACIMA do teto aceito',
+      );
+    }
+  });
+
+  it('a escalada é UM diagnóstico, não "advisory sem exceção" + "exceção obsoleta"', () => {
     // A severidade fica fora da CHAVE de propósito: se entrasse, quem lesse o
     // CI procuraria uma linha que existe e está quase certa.
     const escalado: Finding = { ...FINDING, severity: 'critical' };
@@ -449,18 +683,21 @@ describe('findProblems — drift de severidade', () => {
     expect(problems.join('\n')).not.toContain('exceção OBSOLETA');
   });
 
-  it('drift e vencimento são fatos independentes e aparecem os dois', () => {
+  it('escalada e vencimento são fatos independentes e aparecem os dois', () => {
     const escalado: Finding = { ...FINDING, severity: 'high' };
     const vencida = { ...OK, expires: '2026-08-13' };
     const problems = findProblems([escalado], [vencida], '2026-08-14').join('\n');
-    expect(problems).toContain('severidade DIVERGENTE');
+    expect(problems).toContain('severidade ACIMA do teto aceito');
     expect(problems).toContain('exceção VENCIDA');
   });
 
-  it('severidade ilegível no relatório não casa com nenhuma exceção', () => {
+  it('severidade ILEGÍVEL no relatório reprova — teto não pode ser fail-open', () => {
+    // `indexOf('unknown')` é -1, que NÃO é maior que o índice do teto. Sem um
+    // ramo próprio, um relatório com severidade que não sabemos ler passaria
+    // batido — exatamente o fail-open que este guard existe para não ter.
     const semSeveridade: Finding = { ...FINDING, severity: 'unknown' };
     expect(findProblems([semSeveridade], [OK], '2026-08-14').join('\n')).toContain(
-      'severidade DIVERGENTE',
+      'severidade "unknown" não está na escala',
     );
   });
 });
@@ -514,13 +751,24 @@ describe('evaluateGuard — o cenário concreto da review', () => {
     expect(problems.join('\n')).toContain('não pôde ser executado: spawnSync npm ENOENT');
   });
 
-  it('REPROVA quando o advisory do ledger real escala para critical', () => {
+  it('REPROVA quando o advisory do ledger real escala ACIMA do teto', () => {
     const { problems } = evaluateGuard(
       REPO_ROOT,
       CONGELADO,
       leitorFake({ '.': relatorioComEsbuild('critical'), 'src/admin-ui': RELATORIO_LIMPO }),
     );
-    expect(problems.join('\n')).toContain('severidade DIVERGENTE (ESCALOU)');
+    expect(problems.join('\n')).toContain('severidade ACIMA do teto aceito');
+  });
+
+  it('PASSA quando o advisory do ledger real CAI de severidade', () => {
+    // Com a igualdade antiga isto reprovava. O ledger real aceita até
+    // `moderate`; um `low` reportado hoje está dentro do que foi decidido.
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': relatorioComEsbuild('low'), 'src/admin-ui': RELATORIO_LIMPO }),
+    );
+    expect(problems).toEqual([]);
   });
 });
 
@@ -547,6 +795,29 @@ describe('ledger real commitado', () => {
     const hoje = todayUtc(new Date());
     const vencidas = exceptions.filter((e) => e.expires < hoje);
     expect(vencidas.map((e) => `${e.pkg} ${e.advisory} venceu em ${e.expires}`)).toEqual([]);
+  });
+
+  /**
+   * Decisão 22: a entrada do esbuild apontava para a #526, FECHADA em
+   * 2026-08-15 (state_reason: completed). Uma exceção que vence em 2026-11-12
+   * apontando para trabalho concluído não tem para onde vencer. O alvo agora é
+   * a #574, aberta para isto ("Subir drizzle-kit ao major 0.31.x para zerar
+   * GHSA-67mh-4wv8-2f99, com o caminho de migrations exercitado").
+   */
+  it('toda exceção aponta para uma issue deste repositório, com número', () => {
+    const { exceptions, errors } = validateLedger(JSON.parse(raw));
+    expect(errors).toEqual([]);
+    for (const e of exceptions) {
+      expect(e.issue, `${e.pkg} ${e.advisory}`).toMatch(
+        /^https:\/\/github\.com\/diogenesmendes01\/Maia-v2\/issues\/[1-9]\d*$/,
+      );
+    }
+  });
+
+  it('nenhuma exceção aponta mais para a #526, que está FECHADA', () => {
+    const { exceptions } = validateLedger(JSON.parse(raw));
+    const fechadas = exceptions.filter((e) => e.issue.endsWith('/issues/526'));
+    expect(fechadas.map((e) => `${e.pkg} ${e.advisory} → ${e.issue}`)).toEqual([]);
   });
 
   it('só referencia os projetos que o CI audita', () => {

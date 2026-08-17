@@ -198,154 +198,216 @@ function normalizeOverview(raw: {
 
 
 /**
+ * Veredito do enfileiramento sobre um `current` JÁ LIDO — função PURA.
+ *
+ * Extraída (issue #573) porque a decisão precisa rodar DUAS vezes na mesma
+ * transação: uma sobre a leitura inicial e, quando o `INSERT` perde a corrida
+ * para outra transação, de novo sobre a RELEITURA travada. Duplicar o corpo
+ * seria abrir espaço para as duas cópias divergirem; centralizar mantém um
+ * único juiz de regra de negócio, seja qual for a passagem.
+ *
+ *  - `settled`: o resultado já está decidido (idempotência ou recusa) e nada
+ *    é escrito;
+ *  - `write`: o `patch` a aplicar sobre a linha (INSERT ou UPDATE, conforme
+ *    ela exista ou não).
+ */
+type CommandPatch = Partial<typeof channel_line_state.$inferInsert>;
+
+type CommandDecision =
+  | { kind: 'settled'; result: RequestCommandResult }
+  | { kind: 'write'; patch: CommandPatch };
+
+function decideCommand(
+  current: ChannelLineStateRow | null,
+  args: RequestCommandArgs,
+  now: Date,
+): CommandDecision {
+  const ttl = args.pairing_ttl_ms ?? 15 * 60_000;
+
+  if (current && current.command_id === args.command_id) {
+    return { kind: 'settled', result: { ok: true as const, row: current, idempotent: true } };
+  }
+
+  // Abort é IDEMPOTENTE de verdade: um segundo pedido enquanto o primeiro
+  // ainda não foi consumido devolve a mesma operação em vez de trocar o
+  // `command_id` — trocar quebraria o CAS que o worker usa para confirmar
+  // o abort (review PR #528, P1).
+  if (args.command === 'abort_pairing' && current?.command === 'abort_pairing') {
+    return { kind: 'settled', result: { ok: true as const, row: current, idempotent: true } };
+  }
+
+  if (args.command === 'start_pairing') {
+    const alive =
+      current?.state === 'pairing' &&
+      current.pairing_expires_at !== null &&
+      current.pairing_expires_at.getTime() > now.getTime();
+    // Review PR #528 (P1): `aborting` também BLOQUEIA um novo start. A
+    // sequência start → cancelar → tentar de novo (antes do tick) fazia o
+    // novo comando sobrescrever o abort pendente: a sessão antiga nunca
+    // era abortada, seguia viva e podia concluir e ATIVAR a linha. O
+    // estado só reabre depois que o runtime CONFIRMA o abort.
+    if (alive || current?.state === 'aborting') {
+      return {
+        kind: 'settled',
+        result: { ok: false as const, reason: 'pairing_in_progress' as const },
+      };
+    }
+  }
+
+  // Destino do comando endereçado: só a réplica cuja lease de sessão está
+  // VIVA. Com a lease vencida o socket morreu junto do processo, então o
+  // comando fica livre para qualquer réplica concluir.
+  const sessionOwnerAlive =
+    current?.session_owner_instance != null &&
+    current.session_owner_lease_expires_at !== null &&
+    current.session_owner_lease_expires_at.getTime() > now.getTime();
+  const target =
+    args.address_to_session_owner && sessionOwnerAlive ? current!.session_owner_instance : null;
+
+  const base = {
+    command: args.command,
+    command_method: args.method ?? null,
+    command_id: args.command_id,
+    command_requested_at: now,
+    command_claimed_at: null,
+    target_instance: target,
+    actor_id: args.actor_id,
+    actor_role: args.actor_role,
+    correlation_id: args.correlation_id,
+    last_transition_at: now,
+    updated_at: now,
+    // Toda troca de comando invalida o material da tentativa anterior:
+    // "abort/retry não reutilizam estado de tentativa anterior".
+    pairing_material: null,
+    pairing_material_key_id: null,
+    pairing_material_kind: null,
+    pairing_material_expires_at: null,
+  };
+
+  const patch =
+    args.command === 'start_pairing'
+      ? {
+          ...base,
+          state: 'pairing' as const,
+          pairing_method: args.method ?? null,
+          pairing_started_at: now,
+          pairing_expires_at: new Date(now.getTime() + ttl),
+          // Conta em cima do `current` DESTA passagem: quando o INSERT perde
+          // a corrida, é a releitura que diz quantas tentativas já houve.
+          pairing_attempts: (current?.pairing_attempts ?? 0) + 1,
+          reason_code: null,
+          owner_instance: null,
+        }
+      : args.command === 'abort_pairing'
+        ? {
+            ...base,
+            // Havia pareamento em curso ⇒ vai para `aborting`, NÃO para
+            // `declared`: a linha só reabre para um novo start quando o
+            // runtime confirmar que a sessão morreu. Um abort sobre uma
+            // linha conectada não muda estado (não é um "desconectar").
+            ...(current === null || current.state === 'pairing'
+              ? {
+                  state: 'aborting' as const,
+                  reason_code: 'operator_abort',
+                }
+              : {}),
+          }
+        : args.command === 'repair'
+          ? { ...base, reason_code: 'operator_repair_requested' }
+          : // `stop_line`: só a ORDEM de derrubar o socket. O estado
+            // (`disabled`) já foi decidido por quem pediu — este comando
+            // não redefine estado nem reason code.
+            base;
+
+  return { kind: 'write', patch };
+}
+
+/** Lê a linha do canal com o lock de escrita da transação corrente. */
+async function lockLineState(tx: Tx, channel_id: string): Promise<ChannelLineStateRow | null> {
+  const locked = await tx
+    .select()
+    .from(channel_line_state)
+    .where(eq(channel_line_state.channel_id, channel_id))
+    .limit(1)
+    .for('update');
+  return locked[0] ?? null;
+}
+
+/**
  * Corpo do enfileiramento, parametrizado pela TRANSACAO. Extraido para que
  * comando, estado e admin_audit_log caiam no MESMO commit (review PR #528, P2)
  * e para que disableLineWithAudit reaproveite exatamente a mesma logica de
  * concorrencia em vez de duplica-la.
+ *
+ * Issue #573 — `SELECT … FOR UPDATE` NÃO tranca linha que não existe. Enquanto
+ * a linha do canal não foi criada, duas transações concorrentes leem
+ * `current === null`, as duas tentam o `INSERT` e a segunda estourava
+ * `23505` (`channel_line_state_pkey`) em vez de devolver a recusa de domínio.
+ * Por isso o INSERT é `ON CONFLICT DO NOTHING`: perder a corrida devolve zero
+ * linhas em vez de exceção, e a segunda passagem relê com `FOR UPDATE` — agora
+ * a linha EXISTE e o lock finalmente tem o que trancar — para reentrar no
+ * MESMO `decideCommand`, que então enxerga o pairing vivo do vencedor e
+ * devolve `pairing_in_progress`.
  */
 async function requestCommandInTx(
   tx: Tx,
   args: RequestCommandArgs,
 ): Promise<RequestCommandResult> {
-    const ttl = args.pairing_ttl_ms ?? 15 * 60_000;
-    {
-      // O canal precisa existir NESTE escopo — a checagem vive dentro da tx
-      // para não abrir janela TOCTOU com um DELETE concorrente.
-      const chan = await tx
-        .select({ id: channels.id })
-        .from(channels)
-        .where(
-          and(
-            eq(channels.tenant_id, args.scope.tenant_id),
-            eq(channels.agent_id, args.scope.agent_id),
-            eq(channels.id, args.scope.channel_id),
-          ),
-        )
-        .limit(1);
-      if (chan.length === 0) return { ok: false as const, reason: 'channel_not_found' as const };
+  // O canal precisa existir NESTE escopo — a checagem vive dentro da tx
+  // para não abrir janela TOCTOU com um DELETE concorrente.
+  const chan = await tx
+    .select({ id: channels.id })
+    .from(channels)
+    .where(
+      and(
+        eq(channels.tenant_id, args.scope.tenant_id),
+        eq(channels.agent_id, args.scope.agent_id),
+        eq(channels.id, args.scope.channel_id),
+      ),
+    )
+    .limit(1);
+  if (chan.length === 0) return { ok: false as const, reason: 'channel_not_found' as const };
 
-      const locked = await tx
-        .select()
-        .from(channel_line_state)
-        .where(eq(channel_line_state.channel_id, args.scope.channel_id))
-        .limit(1)
-        .for('update');
-      const current = locked[0] ?? null;
-      const now = new Date();
+  // Duas passagens no máximo: a segunda só existe quando o INSERT perdeu a
+  // corrida. Depois dela a linha está criada E travada, então não há terceira.
+  for (let pass = 1; pass <= 2; pass++) {
+    const current = await lockLineState(tx, args.scope.channel_id);
+    const decision = decideCommand(current, args, new Date());
+    if (decision.kind === 'settled') return decision.result;
 
-      if (current && current.command_id === args.command_id) {
-        return { ok: true as const, row: current, idempotent: true };
-      }
-
-      // Abort é IDEMPOTENTE de verdade: um segundo pedido enquanto o primeiro
-      // ainda não foi consumido devolve a mesma operação em vez de trocar o
-      // `command_id` — trocar quebraria o CAS que o worker usa para confirmar
-      // o abort (review PR #528, P1).
-      if (args.command === 'abort_pairing' && current?.command === 'abort_pairing') {
-        return { ok: true as const, row: current, idempotent: true };
-      }
-
-      if (args.command === 'start_pairing') {
-        const alive =
-          current?.state === 'pairing' &&
-          current.pairing_expires_at !== null &&
-          current.pairing_expires_at.getTime() > now.getTime();
-        // Review PR #528 (P1): `aborting` também BLOQUEIA um novo start. A
-        // sequência start → cancelar → tentar de novo (antes do tick) fazia o
-        // novo comando sobrescrever o abort pendente: a sessão antiga nunca
-        // era abortada, seguia viva e podia concluir e ATIVAR a linha. O
-        // estado só reabre depois que o runtime CONFIRMA o abort.
-        if (alive || current?.state === 'aborting') {
-          return { ok: false as const, reason: 'pairing_in_progress' as const };
-        }
-      }
-
-      // Destino do comando endereçado: só a réplica cuja lease de sessão está
-      // VIVA. Com a lease vencida o socket morreu junto do processo, então o
-      // comando fica livre para qualquer réplica concluir.
-      const sessionOwnerAlive =
-        current?.session_owner_instance != null &&
-        current.session_owner_lease_expires_at !== null &&
-        current.session_owner_lease_expires_at.getTime() > now.getTime();
-      const target =
-        args.address_to_session_owner && sessionOwnerAlive
-          ? current!.session_owner_instance
-          : null;
-
-      const base = {
-        command: args.command,
-        command_method: args.method ?? null,
-        command_id: args.command_id,
-        command_requested_at: now,
-        command_claimed_at: null,
-        target_instance: target,
-        actor_id: args.actor_id,
-        actor_role: args.actor_role,
-        correlation_id: args.correlation_id,
-        last_transition_at: now,
-        updated_at: now,
-        // Toda troca de comando invalida o material da tentativa anterior:
-        // "abort/retry não reutilizam estado de tentativa anterior".
-        pairing_material: null,
-        pairing_material_key_id: null,
-        pairing_material_kind: null,
-        pairing_material_expires_at: null,
-      };
-
-      const patch =
-        args.command === 'start_pairing'
-          ? {
-              ...base,
-              state: 'pairing' as const,
-              pairing_method: args.method ?? null,
-              pairing_started_at: now,
-              pairing_expires_at: new Date(now.getTime() + ttl),
-              pairing_attempts: (current?.pairing_attempts ?? 0) + 1,
-              reason_code: null,
-              owner_instance: null,
-            }
-          : args.command === 'abort_pairing'
-            ? {
-                ...base,
-                // Havia pareamento em curso ⇒ vai para `aborting`, NÃO para
-                // `declared`: a linha só reabre para um novo start quando o
-                // runtime confirmar que a sessão morreu. Um abort sobre uma
-                // linha conectada não muda estado (não é um "desconectar").
-                ...(current === null || current.state === 'pairing'
-                  ? {
-                      state: 'aborting' as const,
-                      reason_code: 'operator_abort',
-                    }
-                  : {}),
-              }
-            : args.command === 'repair'
-              ? { ...base, reason_code: 'operator_repair_requested' }
-              : // `stop_line`: só a ORDEM de derrubar o socket. O estado
-                // (`disabled`) já foi decidido por quem pediu — este comando
-                // não redefine estado nem reason code.
-                base;
-
-      if (current === null) {
-        const inserted = await tx
-          .insert(channel_line_state)
-          .values({
-            channel_id: args.scope.channel_id,
-            tenant_id: args.scope.tenant_id,
-            agent_id: args.scope.agent_id,
-            state: 'declared',
-            ...patch,
-          })
-          .returning();
+    if (current === null) {
+      const inserted = await tx
+        .insert(channel_line_state)
+        .values({
+          channel_id: args.scope.channel_id,
+          tenant_id: args.scope.tenant_id,
+          agent_id: args.scope.agent_id,
+          state: 'declared',
+          ...decision.patch,
+        })
+        .onConflictDoNothing({ target: channel_line_state.channel_id })
+        .returning();
+      if (inserted.length > 0) {
         return { ok: true as const, row: inserted[0]!, idempotent: false };
       }
-
-      const updated = await tx
-        .update(channel_line_state)
-        .set(patch)
-        .where(eq(channel_line_state.channel_id, args.scope.channel_id))
-        .returning();
-      return { ok: true as const, row: updated[0]!, idempotent: false };
+      // Zero linhas ⇒ outra transação criou a linha e commitou. Volta ao topo
+      // para reler travado e deixar `decideCommand` julgar o estado do vencedor.
+      continue;
     }
+
+    const updated = await tx
+      .update(channel_line_state)
+      .set(decision.patch)
+      .where(eq(channel_line_state.channel_id, args.scope.channel_id))
+      .returning();
+    return { ok: true as const, row: updated[0]!, idempotent: false };
+  }
+
+  // Só se alcança aqui se, entre o conflito do INSERT e a releitura, alguém
+  // tiver APAGADO a linha — fail-closed explícito em vez de `undefined!`.
+  throw new Error(
+    `channel_line_state: linha de ${args.scope.channel_id} desapareceu entre o conflito do INSERT e a releitura`,
+  );
 }
 
 /** Trilha administrativa, na transacao do chamador. */

@@ -4,9 +4,10 @@
 # Uso:
 #   docker compose --env-file .env.infra -f compose.prod.yml up -d
 #
-# As variáveis de interpolação (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD)
-# são OBRIGATÓRIAS (sintaxe `:?` — o compose aborta se faltarem, nada de
-# fallback maia/maia). Elas vêm do shell do deploy ou de um env-file
+# As variáveis de interpolação (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD,
+# MAIA_ENV) são OBRIGATÓRIAS (sintaxe `:?` — o compose aborta se faltarem,
+# nada de fallback maia/maia e nada de perfil de produção assumido em
+# silêncio). Elas vêm do shell do deploy ou de um env-file
 # passado via `--env-file` (ex.: .env.infra). Esse arquivo serve SÓ para
 # interpolação — ele NÃO é injetado em nenhum container. Cada serviço
 # recebe apenas o seu próprio env_file:
@@ -155,6 +156,15 @@ services:
   # Réplicas: o job continua seguro se dois deploys rodarem ao mesmo tempo —
   # o advisory lock global do runner (src/migrations/lock.ts) serializa, e o
   # segundo migrator sai de forma limpa e observável.
+  #
+  # Este bloco é VERIFICADO DE DUAS FORMAS, e as duas são necessárias:
+  #   - `tests/unit/migrations/compose-migrate-job.spec.ts` lê este arquivo e
+  #     pina o que ele DIZ (restart, depends_on, uid, read_only, subset #515);
+  #   - `scripts/smoke-migrate-image.sh` (`npm run smoke:migrate:image`, job
+  #     `smoke-migrate-image` no CI) constrói a imagem real e RODA
+  #     `npm run db:migrate` dentro dela, uid 1001, rootfs read-only, contra
+  #     banco efêmero. Sem ele, `tmpfs: /tmp` abaixo pareceria higiene: é
+  #     requisito — o `tsx` cria `/tmp/tsx-1001` antes do primeiro módulo.
   migrate:
     build:
       context: .
@@ -172,10 +182,31 @@ services:
     # migration que vaze não pode vazar o que nunca recebeu.
     environment:
       NODE_ENV: production
-      # Obrigatória no profile production (contract.ts: `requiredIn`). Fica
-      # interpolável para permitir um ensaio `staging` com o mesmo arquivo —
-      # `staging` é compatível com NODE_ENV=production (src/config/profiles.ts).
-      MAIA_ENV: ${MAIA_ENV:-production}
+      # Obrigatória no profile production (contract.ts: `requiredIn`), e
+      # OBRIGATÓRIA TAMBÉM NA INTERPOLAÇÃO — `:?`, não `:-production`.
+      #
+      # O default parecia inofensivo: "produção é o caso comum, staging
+      # sobrescreve". Só que ele inverte o fail-closed exatamente no ponto em
+      # que o erro é invisível. Um staging que esquece MAIA_ENV no .env.infra
+      # não recebe um erro: recebe SILENCIOSAMENTE o perfil de produção, e a
+      # primeira notícia disso é uma regra de produção sendo aplicada — ou
+      # relaxada — num ambiente que ninguém achava que era produção. Com `:?`
+      # o compose aborta antes de criar container algum, e a mensagem diz o
+      # nome da variável que falta.
+      #
+      # `.env.infra` passa a declarar `MAIA_ENV=production` (ou `staging`)
+      # explicitamente — ver docs/runbooks/deploy-prod.md §1.
+      #
+      # A MESMA linha, byte por byte, está em `app` e em `admin-ui`. O
+      # contrato marca MAIA_ENV como `services: ALL` e
+      # `requiredIn: ['staging','production']`, e `.env.infra` serve SÓ para
+      # interpolação — declarar a variável lá NÃO a injeta em container
+      # nenhum. Sem estas três linhas o migrator terminava com sucesso e
+      # `app`/`admin-ui` reprovavam no boot por configuração ausente, seguindo
+      # o runbook à risca. Repetida em vez de ancorada (`&`/`*`) de propósito:
+      # o guard que lê este arquivo exige as três idênticas, e uma âncora
+      # esconderia a divergência dentro do YAML em vez de expô-la.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
       POSTGRES_USER: ${POSTGRES_USER:?}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
@@ -222,6 +253,12 @@ services:
       - .env.app
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` (ver o comentário lá em cima).
+      # `NODE_ENV=production` sozinho NÃO basta: o contrato exige MAIA_ENV nos
+      # profiles staging/production (`requiredIn`), e `.env.app` não a declara —
+      # o `.env.app.prod.example` manda explicitamente NÃO defini-la ali, para
+      # que não existam duas fontes que possam divergir do migrator.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       # DATABASE_URL/REDIS_URL compostas das MESMAS vars obrigatórias com que
       # os datastores sobem — sem fallback e sem drift entre serviço e URL.
       # NOTA: a senha entra numa URL — use senha URL-safe (ex.:
@@ -290,6 +327,10 @@ services:
       - .env.admin
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` e do `app` (ver os comentários
+      # acima). `.env.admin` não declara MAIA_ENV pelo mesmo motivo: uma
+      # segunda fonte é uma fonte que pode divergir.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
       # env.ts (importado transitivamente via @/db/client.ts) valida
       # REDIS_URL como URL mesmo que o admin-ui nunca abra conexão Redis.
