@@ -176,6 +176,20 @@ export const AUDIT_ACTIONS = [
   'turn_replayed',
   'turn_completed_without_reply',
   'turn_state_inconsistency_detected',
+  // Issue #504 — ownership distribuído. A régua de "o que vira audit_log" é a
+  // mesma de #503: só entra o que um humano precisa RECONSTRUIR depois. O claim
+  // rotineiro e a renovação de lease NÃO entram (seriam uma row por batida, e a
+  // pergunta que respondem já é respondida por `maia_turn_claim_total` /
+  // `maia_turn_lease_heartbeat_total`). Entram as duas anomalias:
+  //   - `turn_lease_lost`: alguém estava executando e PERDEU a posse. É o
+  //     evento a partir do qual se explica "por que este turno rodou duas
+  //     vezes?" ou "por que esta tentativa parou no meio?".
+  //   - `turn_fence_rejected`: uma gravação chegou ao banco com token velho e
+  //     foi RECUSADA. É a evidência de que o fence trabalhou — sem ela, o
+  //     incidente aparece só como um turno que "não concluiu".
+  // Nenhum dos dois carrega texto, prompt, telefone ou JID.
+  'turn_lease_lost',
+  'turn_fence_rejected',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

@@ -13,3 +13,7 @@
  */
 export * from './contract.js';
 export * from './lifecycle.js';
+// #504 — contexto de execução AMBIENTE da tentativa (posse propagada aos
+// limites de efeito). Exportado aqui porque `core.ts`, o dispatcher e o
+// outbound o consomem, e a regra da fachada é "importe sempre daqui".
+export * from './execution-context.js';
