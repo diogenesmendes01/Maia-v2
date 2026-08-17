@@ -36,9 +36,11 @@ jobs:
         # base image major changes.
         #
         # A perna do piso é pinada em 22.18 (e não no `22` flutuante): o piso
-        # que o repo SUPORTA continua sendo `engines.node: ">=22.0.0"` — isso
-        # não muda —, mas o que a lane EXERCITA passa a ser um número explícito
-        # e reproduzível, em vez de "o 22.x mais novo que o runner tiver hoje".
+        # que o repo SUPORTA é `engines.node: ">=22.13.0"` (o maior mínimo
+        # entre o npm@11.5.2 pinado e o eslint do lockfile, que o
+        # `engine-strict=true` do .npmrc torna obrigatório), mas o que a lane
+        # EXERCITA passa a ser um número explícito e reproduzível, em vez de
+        # "o 22.x mais novo que o runner tiver hoje".
         # DIVERGÊNCIA ABERTA (não resolvida aqui, de propósito): o comentário
         # acima afirma que a segunda perna espelha a imagem de produção com
         # `FROM node:26-alpine`. O Dockerfile hoje diz `FROM node:22-alpine`
@@ -101,6 +103,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -371,6 +384,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci

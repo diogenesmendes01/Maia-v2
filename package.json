@@ -6,8 +6,15 @@
   "type": "module",
   "packageManager": "npm@11.5.2",
   "engines": {
-    "node": ">=22.0.0",
+    "node": ">=22.13.0",
     "npm": ">=11.5.2 <12"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.13.0",
+      "onFail": "error"
+    }
   },
   "scripts": {
     "preinstall": "node scripts/check-node.mjs && node -e \"var ua=process.env.npm_config_user_agent||'';var m=ua.match(/npm\\/(\\d+)\\.(\\d+)\\.(\\d+)/);if(!m){process.exit(0)}var M=+m[1],n=+m[2],p=+m[3];if(!(M===11&&(n>5||(n===5&&p>=2)))){console.error('\\n\\u2716 npm '+m[1]+'.'+m[2]+'.'+m[3]+' is not in the pinned range (>=11.5.2 <12).\\n  This repo pins npm@11.5.2 so the package-lock.json format stays stable (see CONTRIBUTING.md).\\n  Installing with the wrong npm regenerates an incompatible lockfile and breaks CI.\\n  Fix: nvm install && nvm use   (Node 22 from .nvmrc)\\n       npm install -g npm@11.5.2\\n  Then re-run your install.\\n');process.exit(1)}\"",
