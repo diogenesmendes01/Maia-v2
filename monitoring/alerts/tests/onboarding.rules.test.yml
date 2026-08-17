@@ -260,3 +260,84 @@ tests:
         alertname: MaiaOnboardingExpiryBacklogStaleWarning
         exp_alerts:
           - *warn_alert
+
+  # -------------------------------------------------------------------------
+  # LIMITAÇÃO FIXADA — gauge ausente em UMA réplica NÃO dispara o guarda de
+  # cegueira. Este bloco prova o comportamento DOCUMENTADO, não o desejado.
+  #
+  # Duas réplicas conhecidas e scrapeadas (`up` = 1 nas duas). `maia-1` publica
+  # as duas gauges, saudáveis. `maia-0` está de pé e é scrapeada, mas NÃO
+  # publica nenhuma das duas — nem `NaN`, nada.
+  #
+  # Nenhum ramo do `MetricsAbsent` alcança isso, e é aritmética de conjunto,
+  # não bug:
+  #   - `absent(...)` é FROTA INTEIRA: o seletor casa a série de `maia-1`, logo
+  #     devolve vetor vazio;
+  #   - `x != x` é por réplica, mas só vê quem PUBLICA — uma série ausente não
+  #     é `NaN`, então não há amostra de `maia-0` para comparar.
+  # Resultado: a frota inteira parece saudável enquanto metade dela não está
+  # sendo lida. Quem cobre esse estado é o `up`/target health do Prometheus,
+  # não esta regra (ver o comentário de ALCANCE DOS RAMOS em
+  # ../onboarding.rules.yml e docs/runbooks/onboarding-saga.md §5.1).
+  #
+  # Este caso existe para QUEBRAR se alguém mudar a semântica sem atualizar a
+  # documentação junto — e para impedir o conserto barato de reescrever o
+  # comentário em vez do alerta.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: gauge ausente em UMA replica nao dispara
+    input_series:
+      # As duas réplicas existem e estão sendo scrapeadas.
+      - series: 'up{instance="maia-0:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'up{instance="maia-1:3000",job="maia"}'
+        values: '1+0x80'
+      # ...mas só `maia-1` publica as gauges de backlog. `maia-0` não aparece
+      # aqui de propósito: é ESSA a ausência que o alerta não vê.
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+    alert_rule_test:
+      # Muito além do `for: 10m`, e ainda assim silêncio.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts: []
+      # E os de atraso também calados — eles leem `max()` sobre a ÚNICA
+      # réplica que publica, e ela está saudável.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # O CONTRASTE que dá sentido ao bloco acima: a MESMA topologia, mas com
+  # `maia-0` publicando `NaN` em vez de nada. Agora o ramo `x != x` alcança, e
+  # o alerta fala com o `instance` da réplica cega — só dela.
+  #
+  # A diferença entre os dois blocos é exatamente a diferença entre "a leitura
+  # falhou" (o collector publica `NaN`, e isso é detectável) e "a réplica
+  # sumiu do /metrics" (não é, por esta regra).
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: a mesma replica publicando NaN JA dispara
+    input_series:
+      - series: 'up{instance="maia-0:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'up{instance="maia-1:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts:
+          - *absent_alert

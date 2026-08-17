@@ -39,8 +39,19 @@
  * `monitoring/alerts/tests/onboarding.rules.test.yml`, um caso de
  * `promtool test rules` de verdade (linha do tempo, `pending` → `firing`), que
  * é a fonte de verdade da semântica reproduzida pelo avaliador deste
- * repositório. `promtool` não é dependência do projeto e não roda no CI — ver o
- * cabeçalho daquele arquivo para o comando.
+ * repositório. Ele RODA NO CI, no job `alert-rules` (`.github/workflows/ci.yml`,
+ * `/bin/promtool` da imagem oficial do Prometheus); `promtool` não é
+ * dependência instalada do projeto — o cabeçalho daquele arquivo traz o
+ * comando `docker run` para reproduzir localmente na mesma versão.
+ *
+ * ## O alcance do `MetricsAbsent`, fixado aqui (review da PR #590)
+ *
+ * `absent()` é um teste de FROTA INTEIRA, não por réplica. Os dois `it()`s no
+ * fim deste arquivo travam a limitação que isso implica — uma réplica que pare
+ * de publicar a série enquanto outra saudável continua NÃO é detectada — e o
+ * contraste que a torna aceitável: a réplica que publica `NaN` (o que o
+ * collector faz quando a leitura falha) É detectada, pelo ramo `x != x`, com o
+ * `instance` dela preservado.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
@@ -236,6 +247,65 @@ describe('decisão 14 — o alerta de backlog do onboarding', () => {
       ],
     };
     expect(fires(expr(WARNING), mixed)).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------
+  // O ALCANCE do guarda de ausência, fixado. Espelha
+  // `monitoring/alerts/tests/onboarding.rules.test.yml` ("gauge ausente em
+  // UMA replica nao dispara" e o contraste com `NaN`). Estes dois provam o
+  // comportamento DOCUMENTADO, não o desejado: um teste que fixa a limitação
+  // é o que impede alguém de "consertar" o comentário em vez do alerta.
+  // ---------------------------------------------------------------------
+
+  it('gauge AUSENTE em uma réplica, com outra saudável, NÃO dispara o guarda', () => {
+    // `maia-0` está de pé e é scrapeada, mas não publica nenhuma das duas
+    // gauges — nem `NaN`, nada. `maia-1` publica as duas, saudáveis.
+    //
+    // Nenhum ramo alcança isso, e é aritmética de conjunto, não bug:
+    // `absent()` é FROTA INTEIRA e o seletor casa a série de `maia-1`, logo
+    // devolve vazio; `x != x` é por réplica mas só vê quem PUBLICA, e uma
+    // série ausente não é `NaN`. A frota inteira parece saudável enquanto
+    // metade dela não está sendo lida.
+    //
+    // Quem cobre esse estado é o `up`/target health do Prometheus — ver o
+    // comentário de ALCANCE DOS RAMOS em monitoring/alerts/onboarding.rules.yml
+    // e docs/runbooks/onboarding-saga.md §5.1. `unless on(instance, job) up`
+    // foi considerado e recusado: `prometheus.yml` não é versionado aqui e um
+    // `job` errado faria o alerta nunca disparar — fail-open no alerta de
+    // cegueira.
+    const soUmaReplicaPublica: SeriesDb = {
+      [BACKLOG]: [{ labels: { instance: 'maia-1:3000', job: 'maia' }, value: 0 }],
+      [OLDEST]: [{ labels: { instance: 'maia-1:3000', job: 'maia' }, value: 0 }],
+    };
+    expect(
+      fires(expr(ABSENT), soUmaReplicaPublica),
+      'se este caso passar a disparar, a regra mudou de semântica e a documentação (regra + runbook) precisa mudar junto',
+    ).toBe(false);
+    // ...e os de atraso leem `max()` sobre a única réplica que publica.
+    expect(fires(expr(WARNING), soUmaReplicaPublica)).toBe(false);
+    expect(fires(expr(CRITICAL), soUmaReplicaPublica)).toBe(false);
+  });
+
+  it('a MESMA réplica publicando `NaN` já dispara, e só com o `instance` dela', () => {
+    // O contraste que dá sentido ao caso acima: a diferença é entre "a leitura
+    // falhou" (o collector publica `NaN` — `onboarding-expiry-collector.ts`,
+    // "postura de falha" — e isso é detectável por réplica) e "a réplica sumiu
+    // do /metrics" (não é, por esta regra).
+    const cegaPublicaNaN: SeriesDb = {
+      [BACKLOG]: [
+        { labels: { instance: 'maia-0:3000', job: 'maia' }, value: Number.NaN },
+        { labels: { instance: 'maia-1:3000', job: 'maia' }, value: 0 },
+      ],
+      [OLDEST]: [
+        { labels: { instance: 'maia-0:3000', job: 'maia' }, value: Number.NaN },
+        { labels: { instance: 'maia-1:3000', job: 'maia' }, value: 0 },
+      ],
+    };
+    const out = evalInstant(expr(ABSENT), cegaPublicaNaN);
+    expect(out, 'a réplica que publica `NaN` tem de acordar o guarda').toHaveLength(1);
+    expect(out[0]!.labels.instance, 'o alerta tem de apontar a réplica cega, não a saudável').toBe(
+      'maia-0:3000',
+    );
   });
 
   // -------------------------------------------------------------------------

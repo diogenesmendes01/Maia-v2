@@ -125,6 +125,42 @@ groups:
       # cega entre vinte é o caso, e `max()` a esconderia atrás das saudáveis.
       # `for: 10m` porque o `NaN` transitório de um scrape é normal (a janela do
       # snapshot é de 15s); o que pede humano é o `NaN` sustentado.
+      #
+      # ## ALCANCE DOS RAMOS — eles não são o mesmo teste (review da PR #590)
+      #
+      # Os dois ramos cobrem coisas diferentes, e trocar um pelo outro na
+      # cabeça é o erro que esta nota existe para impedir:
+      #
+      #   absent(<série>)  → FROTA INTEIRA. `absent()` só devolve amostra
+      #     quando o seletor não casa NENHUMA série no instante avaliado. Basta
+      #     UMA réplica saudável ainda publicando a gauge para este ramo ficar
+      #     vazio. Ele pega "ninguém publica isto" — deploy que derrubou o
+      #     collector, série renomeada, `rule_files` apontando para o nada.
+      #
+      #   <série> != <série>  → POR RÉPLICA, e é ele que preserva `instance`.
+      #     `NaN != NaN` é verdadeiro, então cada réplica que publica `NaN`
+      #     rende sua própria amostra. É o ramo que faz "uma réplica cega entre
+      #     vinte" acordar alguém — e ele funciona porque o collector publica
+      #     `NaN` quando a leitura falha, em vez de omitir a série
+      #     (src/observability/onboarding-expiry-collector.ts, "postura de
+      #     falha"; a gauge é registrada no boot e uma réplica viva sempre a
+      #     expõe).
+      #
+      # O que NENHUM dos dois pega: uma réplica que pare de expor a série POR
+      # COMPLETO enquanto as outras continuam publicando. `absent()` fica vazio
+      # (as outras casam) e `x != x` não a vê (série ausente não é `NaN`). Isso
+      # é estado do PROCESSO, não da leitura — réplica morta ou fora do scrape
+      # — e quem cobre é o `up`/target health do Prometheus.
+      #
+      # `unless on(instance, job) up` foi considerado e RECUSADO: o
+      # `prometheus.yml` não é versionado neste repositório, então o valor de
+      # `job` seria um chute; errar o rótulo faria a expressão nunca casar e o
+      # alerta nunca disparar — fail-open no alerta que existe contra cegueira
+      # silenciosa. Preferimos definir o ramo `absent` como frota inteira e
+      # ESCREVER a limitação. Ela está travada por teste em
+      # tests/onboarding.rules.test.yml ("gauge ausente em UMA replica nao
+      # dispara") e no espelho vitest, para que ninguém conserte o comentário
+      # em vez do alerta.
       - alert: MaiaOnboardingExpiryMetricsAbsent
         expr: absent(maia_onboarding_expiry_backlog)
           or (maia_onboarding_expiry_backlog != maia_onboarding_expiry_backlog)
