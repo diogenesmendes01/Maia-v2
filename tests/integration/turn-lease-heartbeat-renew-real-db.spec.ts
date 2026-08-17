@@ -94,7 +94,7 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
 
   afterAll(async () => {
     for (const id of createdMensagens) {
-      await pool.query(`DELETE FROM agent_turns WHERE mensagem_id = $1`, [id]);
+      await pool.query(`DELETE FROM agent_turns WHERE representative_message_id = $1`, [id]);
       await pool.query(`DELETE FROM mensagens WHERE id = $1`, [id]);
     }
     await pool.end();
