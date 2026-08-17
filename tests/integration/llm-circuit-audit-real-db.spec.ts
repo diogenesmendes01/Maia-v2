@@ -441,18 +441,39 @@ d('kill switch → audit_log (Postgres real)', () => {
       (r) =>
         r.metadata.actor === ACTOR || String(r.metadata.reason ?? '').includes(ACTOR),
     );
-    expect(found.map((r) => r.acao)).toEqual([
+    // NAO se afirma ORDEM aqui, e a razao e do modelo de dados, nao do teste:
+    // `audit_log.created_at` tem default `now()`, que no Postgres e o horario
+    // de INICIO DA TRANSACAO — constante dentro dela. `drainCircuitAudits()`
+    // grava as duas linhas na mesma transacao, entao elas recebem o MESMO
+    // instante, e `ORDER BY created_at` nao tem como desempatar. O `id` e uuid
+    // v4, aleatorio, e tambem nao carrega ordem de insercao.
+    //
+    // Afirmar posicao sobre isso e afirmar sorte: o CI reprovou com os dois
+    // eventos certos na ordem trocada, nas DUAS tentativas do retry. A
+    // assercao abaixo e mais forte que a de ordem — ela amarra cada acao a
+    // evidencia que a IDENTIFICA (o ator na linha aplicada, o motivo na
+    // recusada), em vez de amarra-la a uma posicao que o banco nao promete.
+    const aplicada = found.filter((r) => r.metadata.actor === ACTOR);
+    const recusada = found.filter((r) => String(r.metadata.reason ?? '').includes(ACTOR));
+
+    expect(aplicada).toHaveLength(1);
+    expect(recusada).toHaveLength(1);
+    expect(aplicada[0]!.acao).toBe('llm_circuit_mode_override_applied');
+    expect(recusada[0]!.acao).toBe('llm_circuit_mode_override_rejected');
+    // E o conjunto continua sendo exatamente estes dois, sem terceiro evento.
+    expect([...found.map((r) => r.acao)].sort()).toEqual([
       'llm_circuit_mode_override_applied',
       'llm_circuit_mode_override_rejected',
     ]);
-    expect(found[0]!.tenant_id).toBe('system');
-    expect(found[0]!.entidade_alvo).toBe('llm_circuit');
-    expect(found[0]!.alvo_id).toBeNull();
-    expect(found[0]!.metadata).toMatchObject({
+
+    expect(aplicada[0]!.tenant_id).toBe('system');
+    expect(aplicada[0]!.entidade_alvo).toBe('llm_circuit');
+    expect(aplicada[0]!.alvo_id).toBeNull();
+    expect(aplicada[0]!.metadata).toMatchObject({
       actor: ACTOR,
       reason: 'INC-4412',
       mode: 'off',
     });
-    expect(String(found[1]!.metadata.error)).toContain('actor obrigatório');
+    expect(String(recusada[0]!.metadata.error)).toContain('actor obrigatório');
   });
 });
