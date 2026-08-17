@@ -77,7 +77,7 @@ describe('pending-gate — snapshot path', () => {
     // Per-pessoa cost breakdown: classifier must forward the id so the
     // call shows up under the right pessoa, not just the global aggregate.
     expect(args.pessoa_id).toBe('p1');
-    expect(out.kind).toBe('no_pending'); // race lost → no_pending
+    expect(out.kind).toBe('race_lost'); // perna perdedora: desfecho TERMINAL
   });
 });
 
@@ -195,7 +195,7 @@ describe('pending-gate — resolve path', () => {
     expect(lc.length).toBe(1);
   });
 
-  it('race-loss: re-check returns null → race_lost audit + no_pending', async () => {
+  it('race-loss na resolução: resolveAndDispatch recusa → race_lost/resolution, NUNCA no_pending', async () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-4',
       pergunta: 'Confirma?',
@@ -212,6 +212,72 @@ describe('pending-gate — resolve path', () => {
     resolveAndDispatch.mockResolvedValueOnce({ resolved: false, race_lost: true });
     const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
     const out = await checkPendingFirst({ pessoa, conversa, inbound });
-    expect(out).toEqual({ kind: 'no_pending' });
+    // `no_pending` aqui faria o core rodar o turno normal do agente sobre uma
+    // mensagem já classificada como resposta à pendência — reinterpretação
+    // perigosa num caminho que só existe sob concorrência.
+    expect(out).toEqual({ kind: 'race_lost', stage: 'resolution' });
+  });
+});
+
+describe('pending-gate — races de cancelamento e topic change', () => {
+  /** Monta snapshot + classificação e faz o re-check sob lock não achar nada. */
+  function armarRacePerdida(classify: string): void {
+    findActiveSnapshot.mockResolvedValueOnce({
+      id: 'pq-race',
+      pergunta: 'Confirma?',
+      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      acao_proposta: {},
+    });
+    callLLM.mockResolvedValueOnce({
+      content: classify,
+      usage: { input_tokens: 0, output_tokens: 0 },
+      tool_uses: [],
+      stop_reason: 'end_turn',
+      model: 'haiku',
+    });
+    // Outra perna já resolveu/cancelou a pendência: o SELECT … FOR UPDATE
+    // devolve null.
+    findActiveForUpdate.mockResolvedValueOnce(null);
+  }
+
+  it('cancelamento que perde a race → race_lost/cancellation + audit, sem cancelTx', async () => {
+    armarRacePerdida('{"resolves_pending":false,"is_cancellation":true,"confidence":0.95}');
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    // Terminal pelo mesmo motivo da resolução: "cancela" só significa algo
+    // amarrado à pendência que já não existe.
+    expect(out).toEqual({ kind: 'race_lost', stage: 'cancellation' });
+    // Nada a cancelar — a pendência já tinha sumido.
+    expect(cancelTx).not.toHaveBeenCalled();
+    const raceAudits = audit.mock.calls.filter((c) => c[0].acao === 'pending_race_lost');
+    expect(raceAudits.length).toBe(1);
+    expect(raceAudits[0]![0].metadata).toMatchObject({
+      pending_question_id: 'pq-race',
+      source: 'gate',
+      stage: 'cancellation',
+      observed_id: null,
+    });
+    // `pending_cancelled` afirmaria que ESTE turno cancelou a pendência.
+    expect(audit.mock.calls.filter((c) => c[0].acao === 'pending_cancelled').length).toBe(0);
+  });
+
+  it('topic change que perde a race → unresolved/topic_change auditado, NUNCA no_pending', async () => {
+    armarRacePerdida('{"resolves_pending":false,"is_topic_change":true,"confidence":0.9}');
+    const { checkPendingFirst } = await import('../../src/agent/pending-gate.js');
+    const out = await checkPendingFirst({ pessoa, conversa, inbound });
+    // NÃO é terminal, e isso é deliberado: o classificador disse que a mensagem
+    // não é resposta à pendência, é assunto novo. O significado dela não muda
+    // com a race, e o caminho SEM race também devolve unresolved/topic_change —
+    // deixá-la seguir para o ReAct é a única leitura possível. O defeito era o
+    // `no_pending` (que mente sobre ter havido pendência) e a falta de trilha.
+    expect(out).toEqual({ kind: 'unresolved', reason: 'topic_change' });
+    expect(cancelTx).not.toHaveBeenCalled();
+    const raceAudits = audit.mock.calls.filter((c) => c[0].acao === 'pending_race_lost');
+    expect(raceAudits.length).toBe(1);
+    expect(raceAudits[0]![0].metadata).toMatchObject({ stage: 'topic_change' });
+    // Nada foi cancelado, então o audit de cancelamento por topic change não cabe.
+    expect(
+      audit.mock.calls.filter((c) => c[0].acao === 'pending_unresolved_topic_change').length,
+    ).toBe(0);
   });
 });

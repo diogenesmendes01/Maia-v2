@@ -88,7 +88,7 @@ Only one of them can make "schema changed" and "schema recorded" atomic, so the 
 |---|---|---|---|---|
 | `runner` | file has no transaction control (110 of 122 today) | `BEGIN` → SQL → ledger row → `COMMIT` | nothing — the migration is simply pending | `failed` (retried) |
 | `self` | file has its own transaction control | commit `running` → SQL → flip to `applied` | a `running` row ⇒ dirty on the next pass | `failed` **only if the envelope is proven** (below), else `dirty` |
-| `none` | `-- maia:no-transaction` (CONCURRENTLY DDL) | commit `running` → statements one at a time → flip to `applied` | a `running` row ⇒ dirty on the next pass | `dirty` |
+| `none` | `-- maia:no-transaction` (CONCURRENTLY DDL; also a phased constraint swap — below) | commit `running` → statements one at a time → flip to `applied` | a `running` row ⇒ dirty on the next pass | `dirty` |
 
 The `self` mode fixes a latent defect in the pre-#516 runner. It wrapped every migration in `BEGIN`/`COMMIT` and wrote the ledger row inside that envelope, believing the pair was atomic. For a file that already contains `BEGIN; … COMMIT;` it was not: Postgres does not nest transactions, so the file's `COMMIT` ended the runner's transaction, the ledger `INSERT` ran in autocommit, and the runner's trailing `COMMIT` warned "no transaction in progress". A crash in that gap left the schema changed and the ledger silent, and the migration re-ran on the next boot.
 
@@ -119,6 +119,16 @@ Both spellings of the choice offered by the review are therefore taken: validate
 Tokenising also made the mode classifier stricter in a second way: `BEGIN WORK;` and `START TRANSACTION ISOLATION LEVEL …` are now recognised as own transaction control. The previous line-anchored regex missed them, so such a file was filed as `runner` mode and got a *second, nested* `BEGIN` — the original defect, undetected. The classification of every packaged file is unchanged; `tests/unit/migrations/discover.spec.ts` pins that.
 
 The five `self` migrations on disk today (007, 041, 050, 051, 108) all satisfy the envelope rule.
+
+### `none` is not only for `CONCURRENTLY` — a phased constraint swap needs it too
+
+`ADD CONSTRAINT … NOT VALID` + `VALIDATE CONSTRAINT` is the standard way to widen a CHECK on a hot table without holding `ACCESS EXCLUSIVE` for the full scan: the `ADD` is catalog-only and the `VALIDATE` takes just `SHARE UPDATE EXCLUSIVE`, which does not conflict with the `ROW EXCLUSIVE` a writer holds.
+
+That only works **across commits**. In `runner` mode the whole file is one transaction, so the `ACCESS EXCLUSIVE` taken by the `DROP` (or by the `ADD` itself) is still held when `VALIDATE` runs, and the scan blocks writes exactly as if the pair were not there. A file that pairs `NOT VALID` + `VALIDATE` without `-- maia:no-transaction` promises a guarantee it does not deliver — which is worse than not claiming it, because someone reads that comment in a maintenance window.
+
+`115_agent_turns_pending_race_lost.sql` is the worked example: three phases (new constraint under a temporary name `NOT VALID` → `VALIDATE` → short catalog-only swap), each its own commit. The price is the `none` protocol — the ledger row no longer commits with the DDL — so the file owes the reader an explicit crash matrix, and the runbook owes the operator a recovery table per intermediate state ([`docs/runbooks/migrations.md`](../../runbooks/migrations.md#dirty-on-115_agent_turns_pending_race_lostsql-troca-de-check-em-fases)). `tests/integration/migration-115-constraint-swap.spec.ts` pins the guarantee observably: a second client writes to `agent_turns` while the `VALIDATE` runs, under `lock_timeout`, and dies with `55P03` the moment the marker is removed.
+
+**Down files are the opposite case.** They are applied by hand with `psql -v ON_ERROR_STOP=1 -f`, statement by statement, in a maintenance window — so a down that is *meant* to fail (because reverting would destroy evidence) must be one complete `BEGIN; … COMMIT;`, or its deliberate failure commits the `DROP` and leaves the table without the constraint it was protecting.
 
 ## States and what blocks
 
@@ -207,6 +217,7 @@ The ledger is the primary operational trail, because migrations can run before `
 | `tests/integration/lifecycle-probes.spec.ts` | Each schema condition asserted as an HTTP 503 from the REAL `GET /readyz` route on `buildServer()` — a mirrored harness would pass even with the call site deleted |
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
 | `tests/unit/migrations/compose-migrate-job.spec.ts` | The REAL `docker-compose.yml` / `compose.prod.yml`: the job exists, is gated on by `app`/`admin-ui` with `service_completed_successfully`, cannot restart itself out of "completed", shares the app's build, and (executably) its production environment satisfies `loadServiceConfig('migrator')` |
+| `tests/integration/migration-115-constraint-swap.spec.ts` | Real Postgres, schema dedicado: os arquivos REAIS da 115 executados como `psql` os executa. O `_down` recusa **e** deixa a constraint de pé (`pg_get_constraintdef`), e a validação do `_up` não segura `ACCESS EXCLUSIVE` — aferido com escrita concorrente sob `lock_timeout` |
 | `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, `status` recomputed on both failure paths, the durability of a committed envelope (the hazard behind the guardrail) and the refusal of the file that would hit it, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
 ## How to extend
@@ -285,6 +296,7 @@ postgres healthy → migrate (runs `npm run db:migrate`, exits 0) → app + admi
 | `app` / `admin-ui` gate on `service_completed_successfully` | a blocker (dirty, checksum, missing file) fails the whole `up` instead of producing a permanently-503 instance |
 | prod: **no** `env_file` | the migrator gets only the `migrator` subset of the config contract (#515) — Postgres + process knobs, never the LLM keys, WhatsApp session or S3 credentials |
 | prod: `user 1001:1001`, `read_only`, `cap_drop: ALL`, `data` network only | the same hardened posture as every other production container; a job that only talks to Postgres has no business on the `web` network |
+| prod: `tmpfs: /tmp` | not hygiene — `tsx` creates `/tmp/tsx-<uid>` before loading the first module, so a read-only rootfs without it kills the job at line one (measured by the smoke gate below) |
 | dev: does **not** pin `NODE_ENV`/`MAIA_ENV` | `loadMigrationConfig()` rejects a contradiction between them (`profile/node-env-conflict`); pinning only `NODE_ENV=production` — what the `app` service does — would break every `.env` derived from `.env.example` |
 
 The local flow is untouched: `docker compose up -d postgres redis`
@@ -297,6 +309,46 @@ pins these properties, including an executable one: the environment
 and must validate. A missing `MAIA_ENV` there is not a subtle degradation — the
 job exits non-zero on its first line and, through the dependency edge, holds the
 whole stack down.
+
+`MAIA_ENV` is interpolated as `${MAIA_ENV:?…}`, not `${MAIA_ENV:-production}`.
+The default did not fail; it succeeded with the wrong answer. A **staging**
+whose `.env.infra` omitted the line silently adopted the **production** profile,
+and the first symptom was a production rule being applied — or relaxed — in an
+environment nobody thought was production. With `:?`, `docker compose` aborts
+before creating any container and names the missing variable. A staging rehearsal
+with the same file is still one line (`MAIA_ENV=staging`) — now a written one.
+
+## The smoke gate (the job actually running inside the image)
+
+Everything above is a claim about *files*. `scripts/smoke-migrate-image.sh`
+(`npm run smoke:migrate:image`, CI job `smoke-migrate-image`) is the claim about
+the *image*: it builds the real `Dockerfile`, brings up an ephemeral Postgres,
+and runs the real `npm run db:migrate` inside the image as uid 1001 with a
+read-only rootfs — the conditions `compose.prod.yml` imposes on the job and the
+one thing the Compose spec structurally cannot exercise.
+
+It matters because `npm run db:migrate` is `tsx scripts/migrate.ts`, and `tsx`
+resolves `@/*` at runtime from `tsconfig.json` rather than from the compiled
+`dist/`. Two properties that read as hygiene are in fact requirements, both
+measured by running the thing:
+
+| Removed | The job dies with |
+|---|---|
+| `COPY tsconfig.json` (Dockerfile) | `ERR_MODULE_NOT_FOUND: Cannot find package '@/config' imported from /app/scripts/migrate.ts` |
+| `tmpfs: - /tmp` (compose) | `ENOENT: no such file or directory, mkdir '/tmp/tsx-1001'` — `tsx` creates it before loading the first module |
+
+The gate is written to fail loudly rather than pass cheaply: the database must be
+provably empty first; a probe with the *same* flags asserts uid 1001 and that a
+write to `/app/media` (which uid 1001 owns) is refused with `Read-only file
+system`; the run must exit 0 **and** emit `migration.applied` events **and**
+leave the ledger with exactly as many `applied` rows as the image packages. A
+second run against the head must also exit 0 — that is the path every deploy
+without a new migration takes. `npm_config_cache=/tmp/.npm` was measured *not*
+to be load-bearing (`npm run` tolerates an unwritable cache) and is kept as
+defence in depth for whenever the command grows.
+
+There is no `--dockerfile` flag and no image fallback: the gate builds
+`Dockerfile` or fails.
 
 **What the job does NOT do.** It never runs a `_down.sql` (nothing in this
 module can), it does not replace the backup that must precede a destructive

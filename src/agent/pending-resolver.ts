@@ -47,6 +47,14 @@ export async function resolveAndDispatch(
         metadata: {
           pending_question_id: input.expected_pending_id,
           source: input.source,
+          // `stage` diz em QUAL travessia do lock a corrida foi perdida, e é o
+          // campo que o runbook (`docs/runbooks/turn-state-machine.md`) manda o
+          // operador ler para separar os desfechos. As outras duas travessias
+          // (`cancellation`, `topic_change`) já o gravam em
+          // `src/agent/pending-gate.ts`; sem esta linha a metade `resolution`
+          // — que é justamente a que termina em `ignored/pending_race_lost` —
+          // era a única sem o campo, e a trilha documentada não existia no banco.
+          stage: 'resolution',
           observed_id: locked?.id ?? null,
         },
       });

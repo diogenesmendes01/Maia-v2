@@ -30,6 +30,45 @@ Todo terminal carrega **outcome** (`reply_delivered`, `identity_unknown`,
 `retry_exhausted`, …). Um CHECK no banco recusa terminal sem outcome e par
 estado/outcome incompatível.
 
+**`ignored` / `pending_race_lost`** (migration 115) é o outcome que um operador
+vai encontrar sem contexto óbvio, então vale o parágrafo: o usuário respondeu
+duas vezes a uma mesma pergunta pendente (duas mensagens, ou mensagem + reação /
+voto), as duas respostas correram, uma venceu o `SELECT … FOR UPDATE` e a outra
+foi descartada **sem rodar o ReAct**. É o comportamento correto: a mensagem
+perdedora já significava "opção X da pergunta Y", e reinterpretá-la como comando
+novo entregaria ao LLM uma entrada com outro significado. O usuário fica sem
+resposta para a segunda mensagem — a primeira já foi respondida pelo turno
+vencedor.
+
+Correlação: `audit_log` tem `pending_race_lost` (a corrida perdida) para a mesma
+conversa, e `metadata.stage` diz em qual das travessias do lock ela foi perdida.
+**Os três valores NÃO levam ao mesmo desfecho** — só dois deles emparelham com
+`pending_race_lost` no turno:
+
+| `metadata.stage` | Onde é gravado | Desfecho do turno |
+|---|---|---|
+| `resolution` | `src/agent/pending-resolver.ts` — `resolveAndDispatch` recusou porque a pendência esperada já não é a ativa | **terminal**: `ignored` / `pending_race_lost` + `turn_ignored_by_policy` |
+| `cancellation` | `src/agent/pending-gate.ts` — a mensagem cancelava a pendência e ela já tinha sumido | **terminal**: `ignored` / `pending_race_lost` + `turn_ignored_by_policy` |
+| `topic_change` | `src/agent/pending-gate.ts` — o classificador disse que a mensagem **não** é resposta à pendência, é assunto novo | **segue para o ReAct**: o gate devolve `unresolved/topic_change` e o turno termina com o outcome normal (`completed`/`reply_delivered`, …) |
+
+`topic_change` é deliberado, não omissão: a mensagem nunca foi resposta à
+pendência, então não há reinterpretação a evitar, e o caminho **sem** race já
+segue para o ReAct. Tornar a race terminal faria a mesma pergunta do usuário ser
+respondida ou descartada conforme sorteio de timing. Consequência prática para
+quem investiga: uma linha `pending_race_lost` com `stage = 'topic_change'` e
+**nenhum** `turn_ignored_by_policy` na mesma conversa é o esperado — não procure
+o turno descartado, ele não existe.
+
+```sql
+SELECT metadata->>'stage' AS stage, count(*)
+  FROM audit_log
+ WHERE acao = 'pending_race_lost' AND tenant_id = $1 AND agent_id = $2
+ GROUP BY 1;
+```
+
+**Não** é incidente. Vira incidente se o volume subir sem tráfego correspondente
+— aí o suspeito é reentrega duplicada no gateway, não o gate.
+
 ## 2. Rollout (ordem obrigatória)
 
 1. `npm run db:migrate` — aplica 096 (índices `CONCURRENTLY` em `mensagens`) e
@@ -133,7 +172,16 @@ escrito, então o caminho legado está íntegro.
 campo legado imediatamente. `FEATURE_TURN_STATE_MACHINE=false` desliga também a
 escrita. Nenhum turno ou outcome já gravado é apagado.
 
-**De migration** — `097_agent_turns_down.sql` é **destrutivo** (apaga a trilha).
+**De migration, `115`** (`pending_race_lost`) — ordem obrigatória, e ela é o
+inverso do deploy. No deploy, a `115` vai **antes** do código: subir o código
+primeiro faz o `concludeTurn` da perna perdedora bater no CHECK antigo e virar
+`TurnStateWriteError` em modo autoritativo. No rollback, derrube o código
+primeiro e só então rode `115_agent_turns_pending_race_lost_down.sql` — que
+**falha de propósito** se já houver turno com `outcome = 'pending_race_lost'`,
+porque apagar essas linhas destruiria a evidência de que a perna perdedora foi
+descartada em vez de reinterpretada.
+
+**De migration, `097`** — `097_agent_turns_down.sql` é **destrutivo** (apaga a trilha).
 Só execute com TODAS estas condições: nenhuma versão nova rodando, nenhum turno
 em estado não-terminal, backup validado, runtime de volta à leitura legada. A
 `096` só pode cair **depois** da `097` (a FK composta depende do índice único).

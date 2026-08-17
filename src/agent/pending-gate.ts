@@ -9,8 +9,32 @@ import { resolveAndDispatch } from './pending-resolver.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 export type GateResult =
+  /** Não havia pendência aberta (ou o gate está desligado). O turno segue normal. */
   | { kind: 'no_pending' }
+  /** A pendência foi resolvida por esta mensagem e a ação já foi despachada. */
   | { kind: 'resolved' }
+  /**
+   * TERMINAL. Esta mensagem já foi classificada como RESPOSTA à pendência e
+   * perdeu a corrida para outra resposta que resolveu a mesma pendência.
+   *
+   * Por que não `{ kind: 'no_pending' }` — que é o que este caminho devolvia:
+   * `no_pending` faz o core rodar o turno normal do agente, ou seja,
+   * reinterpretar a mensagem como comando novo. Um "sim" que significava
+   * "opção sim da pergunta X" vira entrada livre para o LLM, com significado
+   * completamente diferente do que ela tinha — e só sob concorrência, que é
+   * raro e difícil de reproduzir. O core conclui/marca o turno sem executar
+   * ReAct (`concludeTurn(..., 'pending_race_lost')`).
+   *
+   * Reaproveitar a mensagem no futuro é possível, mas exige REAVALIAÇÃO
+   * EXPLÍCITA contra o estado novo — nunca por colapso em `no_pending`.
+   *
+   * `stage` diz em qual das duas travessias do lock a corrida foi perdida:
+   *   - `resolution`   — `resolveAndDispatch` recusou (a pendência esperada já
+   *                      não é a ativa);
+   *   - `cancellation` — a mensagem era um cancelamento explícito da pendência
+   *                      e ela já tinha sumido.
+   */
+  | { kind: 'race_lost'; stage: 'resolution' | 'cancellation' }
   | { kind: 'unresolved'; reason: 'low_confidence' | 'topic_change' | 'cancelled' };
 
 const CONFIDENCE_THRESHOLD = 0.7;
@@ -129,9 +153,51 @@ async function applyTx(
     const cancel_reason = resolution.is_cancellation ? 'user_cancelled' : 'topic_change';
     const audit_acao =
       resolution.is_cancellation ? 'pending_cancelled' : 'pending_unresolved_topic_change';
-    return await withTx(async (tx) => {
+    return await withTx(async (tx): Promise<GateResult> => {
       const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
-      if (!locked || locked.id !== snapshot_id) return { kind: 'no_pending' };
+      if (!locked || locked.id !== snapshot_id) {
+        // Race PERDIDA também aqui: entre o snapshot e este lock, outra perna
+        // resolveu/cancelou a mesma pendência (ou uma nova nasceu). Antes isto
+        // colapsava em `{ kind: 'no_pending' }` — a mesma mentira do caminho de
+        // resolução, e sem NENHUMA linha de auditoria: o gate tomava uma decisão
+        // e não deixava rastro (invariante #4 do ARCHITECTURE.md).
+        //
+        // A auditoria é a mesma ação (`pending_race_lost`) do resolver, com
+        // `stage` distinguindo por qual travessia do lock se passou. Não se
+        // escreve `pending_cancelled`/`pending_unresolved_topic_change`: nada
+        // foi cancelado, porque não havia mais o que cancelar.
+        await audit({
+          acao: 'pending_race_lost',
+          pessoa_id: input.pessoa.id,
+          conversa_id: input.conversa.id,
+          mensagem_id: input.inbound.id,
+          metadata: {
+            pending_question_id: snapshot_id,
+            source: 'gate',
+            stage: resolution.is_cancellation ? 'cancellation' : 'topic_change',
+            observed_id: locked?.id ?? null,
+          },
+        });
+        // Cancelamento e mudança de assunto divergem AQUI, de propósito.
+        //
+        // `cancellation` é terminal pelo mesmo motivo da resolução: a mensagem
+        // ("cancela", "deixa pra lá") só significa alguma coisa AMARRADA à
+        // pendência que já não existe. Solta, ela é um comando de cancelamento
+        // sem alvo — e dar isso ao LLM é o risco que esta mudança fecha.
+        //
+        // `topic_change` NÃO é terminal, e não é omissão: o classificador
+        // declarou que esta mensagem NÃO é resposta à pendência, é assunto
+        // novo. O significado dela não muda com a race — não há reinterpretação
+        // a evitar — e o caminho SEM race já devolve `unresolved/topic_change`,
+        // que o core deixa seguir para o ReAct. Torná-la terminal faria a mesma
+        // pergunta do usuário ser respondida ou descartada conforme um sorteio
+        // de timing, e perderia em silêncio um pedido legítimo. O que estava
+        // errado aqui era o `no_pending` (que mente sobre ter havido pendência)
+        // e a ausência de auditoria — os dois corrigidos acima.
+        return resolution.is_cancellation
+          ? { kind: 'race_lost', stage: 'cancellation' }
+          : { kind: 'unresolved', reason: 'topic_change' };
+      }
       await pendingQuestionsRepo.cancelTx(tx, snapshot_id, cancel_reason);
       await audit({
         acao: audit_acao as never,
@@ -174,6 +240,9 @@ async function applyTx(
     source: 'gate',
   });
 
-  if (!result.resolved) return { kind: 'no_pending' };
+  // `resolveAndDispatch` recusou: a pendência esperada já não é a ativa. Ele já
+  // auditou `pending_race_lost` DENTRO da transação que segurava o lock — este
+  // retorno só propaga o desfecho para o core, que conclui o turno sem ReAct.
+  if (!result.resolved) return { kind: 'race_lost', stage: 'resolution' };
   return { kind: 'resolved' };
 }
