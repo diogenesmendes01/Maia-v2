@@ -441,18 +441,26 @@ d('kill switch → audit_log (Postgres real)', () => {
       (r) =>
         r.metadata.actor === ACTOR || String(r.metadata.reason ?? '').includes(ACTOR),
     );
-    // NAO se afirma ORDEM aqui, e a razao e do modelo de dados, nao do teste:
-    // `audit_log.created_at` tem default `now()`, que no Postgres e o horario
-    // de INICIO DA TRANSACAO — constante dentro dela. `drainCircuitAudits()`
-    // grava as duas linhas na mesma transacao, entao elas recebem o MESMO
-    // instante, e `ORDER BY created_at` nao tem como desempatar. O `id` e uuid
-    // v4, aleatorio, e tambem nao carrega ordem de insercao.
+    // NAO se afirma ORDEM aqui, e a razao e CONCORRENCIA, nao empate de relogio.
     //
-    // Afirmar posicao sobre isso e afirmar sorte: o CI reprovou com os dois
-    // eventos certos na ordem trocada, nas DUAS tentativas do retry. A
-    // assercao abaixo e mais forte que a de ordem — ela amarra cada acao a
+    // `recordCircuitAudit()` e fire-and-forget: ele dispara `writeCircuitAudit()`
+    // e guarda a promise num set (`circuit-audit.ts`). As duas escritas sao
+    // INDEPENDENTES -- cada `auditRepo.write()` faz o proprio INSERT, em
+    // autocommit -- e `drainCircuitAudits()` so espera as promises pendentes.
+    // Nao ha transacao comum, nao ha ordem imposta: elas chegam ao banco na
+    // ordem que o event loop e o pool decidirem, e podem empatar em
+    // `created_at` OU inverter.
+    //
+    // Por isso trocar `now()` por `clock_timestamp()` NAO resolveria: daria
+    // instantes distintos, mas refletindo a ordem de CHEGADA ao banco, que nao
+    // e a ordem logica aplicada -> recusada. Ordem causal aqui exigiria
+    // serializacao explicita ou uma sequencia monotonica no proprio registro --
+    // relogio nao serve. Enquanto ordem nao for requisito de produto, o teste
+    // nao deve afirma-la.
+    //
+    // A assercao abaixo e mais forte que a de ordem: ela amarra cada acao a
     // evidencia que a IDENTIFICA (o ator na linha aplicada, o motivo na
-    // recusada), em vez de amarra-la a uma posicao que o banco nao promete.
+    // recusada), em vez de a uma posicao que nada promete.
     const aplicada = found.filter((r) => r.metadata.actor === ACTOR);
     const recusada = found.filter((r) => String(r.metadata.reason ?? '').includes(ACTOR));
 
