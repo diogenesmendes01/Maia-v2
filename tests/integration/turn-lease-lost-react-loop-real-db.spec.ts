@@ -78,7 +78,28 @@ const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'primary';
 const A = 'primary';
-const TTL_MS = 1_500;
+/**
+ * TTL da lease do DONO legitimo. 30s, e o numero importa.
+ *
+ * Era 1_500ms, e isso quebrava os casos de CONTROLE -- os que provam que, com
+ * a lease VIVA, o efeito acontece normalmente. Medido no CI: o controle do
+ * react-loop leva ~3.9s de corpo. Com TTL de 1.5s e heartbeat de 400ms, a
+ * lease precisa ser renovada ~9 vezes DURANTE o caso, e
+ * `MAX_HEARTBEAT_FAILURES` renovacoes falhas consecutivas a matam. Sob
+ * contencao ela morre, o guard recusa o efeito, e o CONTROLE reprova com
+ * `turn_ownership_lost` -- exatamente o que ele existe para provar que NAO
+ * acontece. O `retry: 1` absorvia, e o vermelho so apareceu porque o bloco
+ * RECUPERADOS PELA SEGUNDA TENTATIVA do reporter (#545/#566) o denunciou.
+ *
+ * Subir NAO enfraquece as BARREIRAS, e vale registrar por que: elas nao perdem
+ * a posse por expiracao. `loseOwnershipForReal()` forca o vencimento por SQL
+ * (`lease_expires_at = now() - interval '1 second'`) e entao um SUCESSOR
+ * reivindica -- e o proprio helper afirma `lostReason === 'token_mismatch'`,
+ * isto e, takeover. Verificado por sonda: com o TTL longo tambem nas
+ * barreiras, elas continuam passando. O TTL curto nao era load-bearing para
+ * nada; era so um cronometro competindo com o corpo do teste.
+ */
+const TTL_MS = 30_000;
 const HEARTBEAT_MS = 400;
 
 /**
