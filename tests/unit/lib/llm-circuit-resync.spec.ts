@@ -28,6 +28,8 @@
  * a queda real produz o `ready` que dispara tudo isto.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { logger } from '@/lib/logger.js';
 
 type Handler = (...args: unknown[]) => void;
@@ -945,7 +947,7 @@ describe('kill switch — releitura na reconexão', () => {
    * drain deliberado passava a produzir warning — ou PÁGINA, em
    * `state="enforce"` — para uma réplica que estava simplesmente saindo.
    *
-   * O desfecho de shutdown é `aborted` (`reason="resync_aborted"`): fora de
+   * O desfecho de shutdown é `cancelled` (`reason="resync_cancelled"`): fora de
    * `DIVERGENT_OUTCOMES` e fora dos dois alertas. Ele NÃO é `resynced`: a
    * releitura foi interrompida, não concluída, e afirmar convergência aqui
    * seria evidência verde falsa no gate que libera o `enforce`.
@@ -988,7 +990,7 @@ describe('kill switch — releitura na reconexão', () => {
       expect(
         resyncReasons(),
         'o drain acordou o plantão: uma releitura cancelada pelo shutdown saiu como divergência',
-      ).toEqual(['resync_aborted']);
+      ).toEqual(['resync_cancelled']);
       expect(
         redisMock.get.mock.calls.length,
         'a releitura acordou do backoff e gastou tentativas contra um cliente já encerrado',
@@ -1031,7 +1033,7 @@ describe('kill switch — releitura na reconexão', () => {
       expect(
         resyncReasons(),
         'o drain com `GET` pendurado saiu como divergência — página em `enforce` para uma réplica que está saindo',
-      ).toEqual(['resync_aborted']);
+      ).toEqual(['resync_cancelled']);
       expect(redisMock.get.mock.calls.length, 'gastou tentativa depois do `quit()`').toBe(1);
       expect(effectiveMode()).toBe('enforce');
     });
@@ -1064,9 +1066,9 @@ describe('kill switch — releitura na reconexão', () => {
     });
 
     /**
-     * O desenho do achado 2 dizia que `aborted` fica FORA de
+     * O desenho do achado 2 dizia que `cancelled` fica FORA de
      * `DIVERGENT_OUTCOMES` — mas nada pinava isso. Verifiquei acrescentando
-     * `'aborted'` ao conjunto: os 26 casos continuavam VERDES.
+     * `'cancelled'` ao conjunto: os 26 casos continuavam VERDES.
      *
      * A consequência de deixar solto não é abstrata. `DIVERGENT_OUTCOMES`
      * decide duas coisas em `finishResync`: o NÍVEL do log (ERROR, não WARN) e
@@ -1077,7 +1079,7 @@ describe('kill switch — releitura na reconexão', () => {
      * novo existe para evitar.
      *
      * Este caso fixa a decisão pelo efeito observável, não pela pertinência ao
-     * `Set`: um teste que afirmasse `DIVERGENT_OUTCOMES.has('aborted') ===
+     * `Set`: um teste que afirmasse `DIVERGENT_OUTCOMES.has('cancelled') ===
      * false` estaria olhando para a implementação, e sobreviveria a alguém
      * mudar o `if` do log.
      */
@@ -1111,7 +1113,7 @@ describe('kill switch — releitura na reconexão', () => {
         expect(
           warnMsgs,
           'o drain não deixou rastro com nome próprio',
-        ).toContain('llm_gateway.circuit_override_resync_aborted');
+        ).toContain('llm_gateway.circuit_override_resync_cancelled');
         expect(
           warnMsgs,
           'o cancelamento foi contado como convergência — evidência verde falsa no gate que libera `enforce`',
@@ -1121,5 +1123,54 @@ describe('kill switch — releitura na reconexão', () => {
         error.mockRestore();
       }
     });
+  });
+});
+
+/**
+ * DECISÃO 15 DO DONO — o nome do desfecho de cancelamento é `resync_cancelled`.
+ *
+ * Este caso não olha comportamento: olha COBERTURA do rename. Os casos acima
+ * pinam o rótulo da série e o nome do log, que são dois pontos; o nome antigo
+ * também vivia no tipo `ResyncOutcome`, na taxonomia de métricas
+ * (`src/observability/taxonomy.ts`) e nos comentários que o plantão lê quando
+ * está triando. Um rename pela metade é PIOR que nenhum: o dashboard passa a
+ * somar duas séries com nomes diferentes e o `grep` do pós-mortem devolve
+ * metade das linhas.
+ *
+ * O escopo é `src/` — código de produção e taxonomia — de propósito. Docs e
+ * runbooks PODEM citar o nome antigo, e devem: um operador olhando série
+ * histórica precisa saber como ela se chamava. O que não pode é `src/` ainda
+ * EMITIR o nome velho.
+ */
+describe('rename de `resync_aborted` para `resync_cancelled` (decisão 15)', () => {
+  const SRC = resolve(__dirname, '../../../src');
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === '.next') continue;
+        out.push(...walk(full));
+      } else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  it('nenhum ponto de `src/` sobreviveu com o nome antigo', () => {
+    const offenders: string[] = [];
+    for (const file of walk(SRC)) {
+      for (const [n, line] of readFileSync(file, 'utf8').split('\n').entries()) {
+        if (line.includes('resync_aborted')) {
+          offenders.push(`${file.slice(SRC.length + 1)}:${n + 1}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      'o rename ficou pela metade — o dashboard passa a somar duas séries: ' + offenders.join(' | '),
+    ).toEqual([]);
   });
 });

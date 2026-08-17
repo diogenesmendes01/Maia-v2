@@ -335,17 +335,26 @@ sobre essa série.
 - `superseded` (a releitura perdeu para uma mensagem do canal) e `cleared` (o
   `clear` perdido convergiu) são **convergência** e saem como
   `reason="resynced"`.
-- `aborted` — a réplica estava **drenando**. O subscriber foi fechado (deploy,
+- `cancelled` — a réplica estava **drenando**. O subscriber foi fechado (deploy,
   scale-in, restart) com a releitura em backoff ou com um `GET` em voo, e ela
-  foi **cancelada**, não concluída. Sai como `reason="resync_aborted"` e log
-  WARN `llm_gateway.circuit_override_resync_aborted`. Nenhum dos dois alertas o
+  foi **cancelada**, não concluída. Sai como `reason="resync_cancelled"` e log
+  WARN `llm_gateway.circuit_override_resync_cancelled`. Nenhum dos dois alertas o
   seleciona: um drain deliberado não pode acordar o plantão — era o defeito
   apontado na review da PR #561. Um pico deste desfecho durante um deploy é
   esperado; **fora** de janela de deploy, ele diz que alguma coisa está
   fechando o subscriber, e a pergunta passa a ser por que a réplica está
   reiniciando.
 
-Se `superseded`, `cleared` ou `aborted` começarem a aparecer como
+> **Série histórica.** Até 2026-08-17 este balde saía como
+> `reason="resync_aborted"` (log `llm_gateway.circuit_override_resync_aborted`),
+> nome introduzido na PR #561. O rename para `resync_cancelled` (decisão 15 do
+> dono) **quebra a continuidade da série**: um painel ou uma query que cubra a
+> virada precisa somar os dois rótulos
+> (`reason=~"resync_aborted|resync_cancelled"`) até o dado velho sair da
+> retenção. Nenhum alerta seleciona nenhum dos dois, então não há regra a
+> ajustar.
+
+Se `superseded`, `cleared` ou `cancelled` começarem a aparecer como
 `resync_failed`, o defeito é no balde `DIVERGENT_OUTCOMES`
 (`src/lib/llm/cache-invalidation.ts`), não no Redis.
 

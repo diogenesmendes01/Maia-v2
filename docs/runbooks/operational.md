@@ -405,8 +405,8 @@ diz qual:
 
 **Réplica drenando não é divergência.** Se o subscriber for fechado (deploy,
 scale-in, restart) com a releitura em voo, ela é **cancelada** e sai como
-`reason="resync_aborted"` + log WARN
-`llm_gateway.circuit_override_resync_aborted` — fora dos dois alertas. Um drain
+`reason="resync_cancelled"` + log WARN
+`llm_gateway.circuit_override_resync_cancelled` — fora dos dois alertas. Um drain
 deliberado não acorda o plantão (achado 2 da review da PR #561).
 
 Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há

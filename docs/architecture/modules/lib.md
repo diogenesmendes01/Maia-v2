@@ -327,8 +327,8 @@ atraso. A conta do teto vive em `resyncWorstCaseMs()`, num lugar só:
 *Drain: a releitura é CANCELADA, não esperada* (achado 2 da mesma review).
 `stopLLMSettingsInvalidationSubscriber()` marca o ciclo de vida do subscriber
 como morto antes de qualquer `await`, e a releitura em voo — em backoff ou com
-um `GET` pendurado — termina na hora como `aborted`, com
-`reason="resync_aborted"`, fora de `DIVERGENT_OUTCOMES` e fora dos dois alertas.
+um `GET` pendurado — termina na hora como `cancelled`, com
+`reason="resync_cancelled"`, fora de `DIVERGENT_OUTCOMES` e fora dos dois alertas.
 Antes, ela acordava depois do `quit()`, gastava as tentativas restantes contra
 um cliente encerrado e saía como `resync_failed`: um deploy deliberado podia
 PAGINAR (`state="enforce"`) uma réplica que estava apenas saindo. O `unref` dos
@@ -385,7 +385,7 @@ deixar rastro" — foi resolvida, não ignorada:
 1. **Override anônimo é RECUSADO.** `actor` e `reason` são obrigatórios e
    não-vazios. Não existe caminho para virar a chave sem se identificar.
 2. **Todo uso vira contador e log**: `maia_llm_circuit_mode_overrides_total{state,reason}`
-   (`reason` ∈ `applied|expired|cleared|rejected|adopted|resynced|resync_failed|resync_aborted`) e
+   (`reason` ∈ `applied|expired|cleared|rejected|adopted|resynced|resync_failed|resync_cancelled`) e
    `llm_gateway.circuit_mode_override` com ator, motivo e validade. Ator e
    motivo são texto livre: vivem no log, nunca em label.
 3. **A postura efetiva é uma série**: `maia_llm_circuit_mode{state}`, par de
