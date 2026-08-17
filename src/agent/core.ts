@@ -845,6 +845,36 @@ async function runAgentTurnPipeline(params: {
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
+  // Perna PERDEDORA de uma race de pendência: desfecho TERMINAL, sem ReAct.
+  //
+  // A mensagem já foi classificada como resposta à pergunta pendente e perdeu
+  // para outra resposta que resolveu a mesma pendência. Antes o gate colapsava
+  // isso em `{ kind: 'no_pending' }` e este ponto caía no turno normal — o LLM
+  // recebia um "sim"/"cancela" solto, com significado completamente diferente
+  // do que a mensagem tinha, e só sob concorrência. O invariante de
+  // exatamente-uma-vez nunca esteve em risco (issue #545); o defeito era o que
+  // acontecia com a perna perdedora DEPOIS.
+  //
+  // A conclusão usa exatamente a mesma forma dos outros short-circuits deste
+  // arquivo (identity_unknown, rate_limited_silent, pending_action_resolved):
+  // `concludeTurn` com outcome próprio + `markAllProcessed` + `touch` +
+  // `clearDebounceState`. `concludeTurn` é no-op com
+  // FEATURE_TURN_STATE_MACHINE desligada, e aí quem fecha o turno continua
+  // sendo `processada_em` — igual aos demais.
+  if (gate.kind === 'race_lost') {
+    logger.info(
+      { mensagem_id: inbound.id, conversa_id: c.id, stage: gate.stage },
+      'agent.pending_race_lost_terminal',
+    );
+    await concludeTurn(turn, 'pending_race_lost', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
   // 'unresolved' and 'no_pending' fall through.
 
   // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound

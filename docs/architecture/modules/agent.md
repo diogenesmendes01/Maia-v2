@@ -401,6 +401,59 @@ getters throw on a missing, empty or `'default'` scope. Batching narrows nothing
 a batched read is the same predicate with an `IN (…)` on a non-identifying
 column, never a dropped tenant predicate.
 
+## Pending gate: os desfechos, e por que `race_lost` é terminal
+
+`pending-gate.ts` roda ANTES do ReAct e devolve um `GateResult`. Cada `kind` é
+uma instrução diferente para `core.ts` — colapsar dois deles no mesmo valor é o
+defeito que a issue #545 destravou:
+
+| `kind` | O que aconteceu | O que `core.ts` faz |
+|---|---|---|
+| `no_pending` | não havia pendência aberta, ou a flag está desligada | turno normal (ReAct) |
+| `resolved` | esta mensagem resolveu a pendência; `resolveAndDispatch` já executou e auditou a ação | conclui: `completed` / `pending_action_resolved` |
+| `race_lost` | a mensagem foi classificada como RESPOSTA à pendência e **perdeu** a corrida para outra resposta | conclui: `ignored` / `pending_race_lost` — **sem ReAct** |
+| `unresolved` | havia pendência, mas esta mensagem não a resolveu (`low_confidence`, `topic_change`, `cancelled`) | turno normal (ReAct) |
+
+**Por que `race_lost` não pode voltar a ser `no_pending`.** Sob concorrência, duas
+respostas chegam para a mesma pergunta: uma vence o `SELECT … FOR UPDATE` em
+`pendingQuestionsRepo.findActiveForUpdate` e a outra perde. O invariante de
+exatamente-uma-vez está intacto — a ação é despachada uma vez só (veredito da
+#545, PR #562). O problema é o destino da perdedora: com `no_pending`, `core.ts`
+lê "não havia pendência nenhuma" e manda a mensagem para o ReAct. Um `"sim"` que
+significava "opção sim da pergunta X" vira comando novo e livre para o LLM —
+mudança de significado num caminho que, por definição, só existe sob
+concorrência, ou seja, raro e difícil de reproduzir.
+
+Reaproveitar a mensagem perdedora no futuro é possível, mas exige **reavaliação
+explícita contra o estado novo** — nunca por colapso em `no_pending`.
+
+**As duas travessias do lock, e por que cancelamento e topic change divergem.**
+O gate pega o lock em dois lugares: no ramo de cancelamento/topic change
+(`applyTx`) e dentro de `resolveAndDispatch`. Perder a corrida em qualquer um
+deles é auditado com a mesma ação, `pending_race_lost`, com `stage` em
+`metadata` (`resolution` · `cancellation` · `topic_change`) — antes, o ramo de
+cancelamento/topic change não deixava rastro nenhum.
+
+O **desfecho**, porém, difere de propósito:
+
+- **`cancellation` → terminal.** `"cancela"` / `"deixa pra lá"` só significa algo
+  amarrado à pendência que já não existe. Solto, é um comando de cancelamento
+  sem alvo — exatamente o risco que a regra fecha.
+- **`topic_change` → segue para o ReAct**, devolvendo `unresolved/topic_change`.
+  O classificador declarou que a mensagem **não** é resposta à pendência, é
+  assunto novo: o significado dela não muda com a race, e o caminho SEM race
+  também devolve `unresolved/topic_change`. Torná-la terminal faria a mesma
+  pergunta do usuário ser respondida ou descartada conforme um sorteio de
+  timing, e perderia em silêncio um pedido legítimo. O que estava errado ali era
+  o `no_pending` (que mente sobre ter havido pendência) e a ausência de trilha.
+
+**Trilha de auditoria do desfecho terminal** — duas linhas, dois fatos
+independentes: `pending_race_lost` (escrita dentro da transação que segurava o
+lock) diz que a corrida foi perdida; `turn_ignored_by_policy` (de `concludeTurn`,
+com `outcome = pending_race_lost`) diz que o turno foi descartado por causa
+disso. Ver [`runtime.md`](runtime.md) e o runbook
+[`turn-state-machine.md`](../../runbooks/turn-state-machine.md).
+
 ## Patterns it follows
 
 - [Action layer](../concerns/action-layer.md) — LLM proposes, backend disposes
@@ -436,6 +489,9 @@ column, never a dropped tenant predicate.
 | `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
 | `tests/unit/scripts/turn-context-gate.spec.ts` | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1 |
 | `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm. See the gate section above |
+| `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
+| `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |
+| `tests/integration/pending-race-lost-terminal.spec.ts` | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta |
 | `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
 | `tests/unit/agent/` | Per-step contracts |
 | `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |
