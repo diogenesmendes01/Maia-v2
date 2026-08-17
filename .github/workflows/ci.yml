@@ -348,3 +348,33 @@ jobs:
 
       - name: Run e2e tests
         run: npm run test:e2e
+
+  # ---------------------------------------------------------------------
+  # Gate permanente de release do job `migrate` (#516). Job NOVO, isolado e
+  # apendado de propósito: ele não compartilha nada com os jobs acima
+  # (sem `npm ci`, sem service containers, sem matriz), então uma edição
+  # aqui não conflita com trabalho em curso nos outros jobs.
+  #
+  # Por que ele existe: `tests/unit/migrations/compose-migrate-job.spec.ts`
+  # prova que os arquivos de Compose DIZEM a coisa certa, e nunca executa o
+  # comando. Este job constrói a imagem de produção real e roda
+  # `npm run db:migrate` dentro dela, como uid 1001, com rootfs read-only,
+  # contra um Postgres efêmero. Foi assim que se mediu que `COPY
+  # tsconfig.json` (Dockerfile) e `tmpfs: /tmp` (compose) são requisitos do
+  # job, e não higiene — sem eles o migrator sai != 0 e, via
+  # `service_completed_successfully`, segura app/admin-ui fora do ar.
+  # ---------------------------------------------------------------------
+  smoke-migrate-image:
+    name: smoke do job migrate na imagem real
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      # Sem `setup-node` e sem `npm ci`: o script só usa bash + docker, e
+      # tudo o que interessa (Node, npm 11.5.2, tsx, node_modules de
+      # produção) vem de DENTRO da imagem que ele constrói. Instalar
+      # dependências no runner só criaria a chance de o smoke passar por
+      # causa do runner em vez de por causa da imagem.
+      - name: Smoke do job migrate na imagem de produção
+        run: bash scripts/smoke-migrate-image.sh

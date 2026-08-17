@@ -296,6 +296,7 @@ postgres healthy → migrate (runs `npm run db:migrate`, exits 0) → app + admi
 | `app` / `admin-ui` gate on `service_completed_successfully` | a blocker (dirty, checksum, missing file) fails the whole `up` instead of producing a permanently-503 instance |
 | prod: **no** `env_file` | the migrator gets only the `migrator` subset of the config contract (#515) — Postgres + process knobs, never the LLM keys, WhatsApp session or S3 credentials |
 | prod: `user 1001:1001`, `read_only`, `cap_drop: ALL`, `data` network only | the same hardened posture as every other production container; a job that only talks to Postgres has no business on the `web` network |
+| prod: `tmpfs: /tmp` | not hygiene — `tsx` creates `/tmp/tsx-<uid>` before loading the first module, so a read-only rootfs without it kills the job at line one (measured by the smoke gate below) |
 | dev: does **not** pin `NODE_ENV`/`MAIA_ENV` | `loadMigrationConfig()` rejects a contradiction between them (`profile/node-env-conflict`); pinning only `NODE_ENV=production` — what the `app` service does — would break every `.env` derived from `.env.example` |
 
 The local flow is untouched: `docker compose up -d postgres redis`
@@ -308,6 +309,46 @@ pins these properties, including an executable one: the environment
 and must validate. A missing `MAIA_ENV` there is not a subtle degradation — the
 job exits non-zero on its first line and, through the dependency edge, holds the
 whole stack down.
+
+`MAIA_ENV` is interpolated as `${MAIA_ENV:?…}`, not `${MAIA_ENV:-production}`.
+The default did not fail; it succeeded with the wrong answer. A **staging**
+whose `.env.infra` omitted the line silently adopted the **production** profile,
+and the first symptom was a production rule being applied — or relaxed — in an
+environment nobody thought was production. With `:?`, `docker compose` aborts
+before creating any container and names the missing variable. A staging rehearsal
+with the same file is still one line (`MAIA_ENV=staging`) — now a written one.
+
+## The smoke gate (the job actually running inside the image)
+
+Everything above is a claim about *files*. `scripts/smoke-migrate-image.sh`
+(`npm run smoke:migrate:image`, CI job `smoke-migrate-image`) is the claim about
+the *image*: it builds the real `Dockerfile`, brings up an ephemeral Postgres,
+and runs the real `npm run db:migrate` inside the image as uid 1001 with a
+read-only rootfs — the conditions `compose.prod.yml` imposes on the job and the
+one thing the Compose spec structurally cannot exercise.
+
+It matters because `npm run db:migrate` is `tsx scripts/migrate.ts`, and `tsx`
+resolves `@/*` at runtime from `tsconfig.json` rather than from the compiled
+`dist/`. Two properties that read as hygiene are in fact requirements, both
+measured by running the thing:
+
+| Removed | The job dies with |
+|---|---|
+| `COPY tsconfig.json` (Dockerfile) | `ERR_MODULE_NOT_FOUND: Cannot find package '@/config' imported from /app/scripts/migrate.ts` |
+| `tmpfs: - /tmp` (compose) | `ENOENT: no such file or directory, mkdir '/tmp/tsx-1001'` — `tsx` creates it before loading the first module |
+
+The gate is written to fail loudly rather than pass cheaply: the database must be
+provably empty first; a probe with the *same* flags asserts uid 1001 and that a
+write to `/app/media` (which uid 1001 owns) is refused with `Read-only file
+system`; the run must exit 0 **and** emit `migration.applied` events **and**
+leave the ledger with exactly as many `applied` rows as the image packages. A
+second run against the head must also exit 0 — that is the path every deploy
+without a new migration takes. `npm_config_cache=/tmp/.npm` was measured *not*
+to be load-bearing (`npm run` tolerates an unwritable cache) and is kept as
+defence in depth for whenever the command grows.
+
+There is no `--dockerfile` flag and no image fallback: the gate builds
+`Dockerfile` or fails.
 
 **What the job does NOT do.** It never runs a `_down.sql` (nothing in this
 module can), it does not replace the backup that must precede a destructive
