@@ -57,6 +57,7 @@ export type ConfigGroup =
   | 'whatsapp'
   | 'owner'
   | 'governance'
+  | 'onboarding'
   | 'routing'
   | 'alerts'
   | 'backup'
@@ -82,6 +83,13 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
   { group: 'whatsapp', title: 'WhatsApp / Baileys' },
   { group: 'owner', title: 'Owner' },
   { group: 'governance', title: 'Governança (limites financeiros e TTLs)' },
+  // Decisão 13 (#519). As alavancas da saga de onboarding e do worker
+  // `onboarding_expirer` moravam em `governance`, entre TTLs de aprovação
+  // dupla e limites financeiros — grupos são o índice do operador, e ali a
+  // resposta a "onde configuro o onboarding" ficava numa seção de outro
+  // domínio. Logo depois de `governance` de propósito: é de onde as chaves
+  // saíram, então a seção nova nasce onde o leitor já procurava.
+  { group: 'onboarding', title: 'Onboarding (saga e expirer)' },
   { group: 'routing', title: 'Roteamento multi-linha' },
   { group: 'alerts', title: 'Observabilidade / alertas' },
   { group: 'backup', title: 'Backup / restore' },
