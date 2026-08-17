@@ -76,12 +76,28 @@ const A = 'primary';
  * Era 1_500ms, e isso quebrava os casos de CONTROLE -- os que provam que, com
  * a lease VIVA, o efeito acontece normalmente. Medido no CI: o controle do
  * react-loop leva ~3.9s de corpo. Com TTL de 1.5s e heartbeat de 400ms, a
- * lease precisa ser renovada ~9 vezes DURANTE o caso, e
- * `MAX_HEARTBEAT_FAILURES` renovacoes falhas consecutivas a matam. Sob
- * contencao ela morre, o guard recusa o efeito, e o CONTROLE reprova com
+ * lease precisa ser renovada ~9 vezes DURANTE o caso, e basta UMA renovacao
+ * chegar atrasada para ela morrer.
+ *
+ * O mecanismo e o CAS, nao falha de heartbeat -- e a primeira versao deste
+ * comentario errava nisso, atribuindo a perda a `MAX_HEARTBEAT_FAILURES`.
+ * Esse caminho exige o BANCO NAO RESPONDER, o que nao estava acontecendo. O
+ * que acontece e: o `UPDATE` de renovacao tem `AND lease_expires_at > now()`
+ * no `WHERE` (`turn-repos.ts`), entao um atraso de agendamento no Node ou de
+ * round-trip no banco maior que o TTL restante faz a lease vencer ANTES de a
+ * renovacao chegar; o CAS devolve zero linhas e a lease se marca perdida com
+ * `token_mismatch` -- sem sucessor nenhum e com o banco saudavel. Bate com o
+ * `lostReason` observado nos logs do CI.
+ *
+ * Sob contencao ela morre, o guard recusa o efeito, e o CONTROLE reprova com
  * `turn_ownership_lost` -- exatamente o que ele existe para provar que NAO
  * acontece. O `retry: 1` absorvia, e o vermelho so apareceu porque o bloco
  * RECUPERADOS PELA SEGUNDA TENTATIVA do reporter (#545/#566) o denunciou.
+ *
+ * Que a renovacao de fato escreve no banco e coberto separadamente, em
+ * `tests/integration/turn-lease-heartbeat-renew-real-db.spec.ts` -- com TTL
+ * curto de proposito, porque com 30s aqui os controles passariam ate se o
+ * timer parasse de disparar.
  *
  * Subir NAO enfraquece as BARREIRAS, e vale registrar por que: elas nao perdem
  * a posse por expiracao. `loseOwnershipForReal()` forca o vencimento por SQL
