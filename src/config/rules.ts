@@ -19,6 +19,10 @@ import {
   DRILL_TICK_HOURS,
   minHonourableDrillIntervalHours,
 } from '@/ops/backup/drill-schedule.js';
+// Mesma direção dos imports acima: a regra de lease PERGUNTA ao contrato de
+// claim qual relação é segura, em vez de reescrever a fórmula (que é como as
+// duas divergiriam).
+import { checkLeaseTiming, MAX_HEARTBEAT_TO_TTL_RATIO } from '@/runtime/turns/claim.js';
 import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
 import {
   type EnvVarSpec,
@@ -543,6 +547,40 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Lease do claim de turno (#504): o heartbeat tem de caber ao menos 3x no TTL.
+  //
+  // ERROR de escopo BOOT, e não warning de contrato, por uma razão que separa
+  // esta regra da anterior: aqui a consequência não é "afinação sem sentido", é
+  // TAKEOVER FALSO — um segundo worker reivindica um turno cujo dono está vivo e
+  // processando, e o usuário recebe a resposta duas vezes (ou uma tool com
+  // efeito externo roda duas vezes). Subir com essa relação é subir com a
+  // garantia central da issue desligada, então o boot para.
+  //
+  // A aritmética vive em `checkLeaseTiming` (src/runtime/turns/claim.ts), não
+  // aqui: o controlador de lease valida a mesma relação em runtime e duas
+  // cópias da fórmula divergiriam.
+  const leaseTtl = num(c.TURN_LEASE_TTL_MS);
+  const leaseHeartbeat = num(c.TURN_LEASE_HEARTBEAT_MS);
+  if (leaseTtl !== undefined && leaseHeartbeat !== undefined) {
+    const leaseCheck = checkLeaseTiming(leaseTtl, leaseHeartbeat);
+    if (!leaseCheck.ok) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'TURN_LEASE_HEARTBEAT_MS',
+        rule: 'turn-lease/heartbeat-ratio',
+        message:
+          `TURN_LEASE_HEARTBEAT_MS=${leaseHeartbeat} é inseguro para ` +
+          `TURN_LEASE_TTL_MS=${leaseTtl} (${leaseCheck.reason}): o heartbeat precisa caber ao ` +
+          `menos 3x no TTL, senão uma única renovação perdida deixa a lease vencer com o dono ` +
+          `ainda processando — e lease vencida com dono vivo é execução dupla do turno.`,
+        remediation:
+          `Use TURN_LEASE_HEARTBEAT_MS <= ${Math.floor(leaseTtl * MAX_HEARTBEAT_TO_TTL_RATIO)} ` +
+          `(um terço de TURN_LEASE_TTL_MS), ou aumente TURN_LEASE_TTL_MS.`,
+      });
+    }
+  }
+
   // Alertas: canal desconhecido é erro (um typo silenciaria o alerta).
   for (const ch of channels) {
     if (!['log', 'email', 'telegram'].includes(ch)) {
@@ -663,6 +701,25 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         'FEATURE_TURN_STATE_AUTHORITATIVE=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem dual-write não há agent_turns para o recovery eleger, e a decisão continua saindo de mensagens.processada_em.',
       remediation:
         'Ligue FEATURE_TURN_STATE_MACHINE (e conclua o backfill com `npm run backfill:turns`) antes do flip da leitura, ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. Ver docs/runbooks/turn-state-machine.md §2.',
+    });
+  }
+
+  // Issue #504 — o claim atômico depende da máquina de estados. Sem
+  // `agent_turns` não existe row a reivindicar, e `turnClaimEnabled()`
+  // (src/runtime/turns/lease.ts) devolve false: a combinação é INERTE. Mesmo
+  // raciocínio da regra acima, e a mesma razão para ser erro e não warning — um
+  // operador que acredita ter ligado a exclusão mútua e não ligou vai atribuir
+  // as execuções duplicadas a outra causa.
+  if (bool(c.FEATURE_TURN_CLAIM) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_CLAIM',
+      rule: 'turn-claim/requires-state-machine',
+      message:
+        'FEATURE_TURN_CLAIM=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não há turno durável para reivindicar, e duas réplicas continuam podendo processar o mesmo turno.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas) antes de ligar FEATURE_TURN_CLAIM, ou desligue FEATURE_TURN_CLAIM. Ver docs/runbooks/turn-state-machine.md §6.',
     });
   }
 

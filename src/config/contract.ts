@@ -1534,6 +1534,26 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_CLAIM: {
+    name: 'FEATURE_TURN_CLAIM',
+    description:
+      'Claim ATÔMICO do turno com lease e fencing (issue #504). OFF (default): o runtime usa o ' +
+      'claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas podem processar o ' +
+      'mesmo turno. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, renova ' +
+      'lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token vigente; ' +
+      'perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 aplicada e ' +
+      'FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a reivindicar). ' +
+      'Kill switch: false volta ao caminho de #503 sem perder claims já gravados. ' +
+      'Ver docs/runbooks/turn-state-machine.md §6.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_TURN_STATE_AUTHORITATIVE: {
     name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
     description:
@@ -2125,6 +2145,39 @@ export const ENV_CONTRACT = {
     schema: boolFlag('false'),
     example: 'false',
     fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_LEASE_TTL_MS: {
+    name: 'TURN_LEASE_TTL_MS',
+    description:
+      'Validade (ms) da lease do claim do turno (#504). É o tempo MÁXIMO que um turno fica preso ' +
+      'depois de o worker dono morrer sem aviso — mais curto recupera antes, e mais longo tolera ' +
+      'melhor uma pausa de GC ou um provedor lento. Curto demais produz takeover FALSO, que é ' +
+      'execução dupla; por isso deve ficar confortavelmente acima da duração p99 de um turno ' +
+      'quando somado ao heartbeat. Relação com TURN_LEASE_HEARTBEAT_MS validada no boot.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(60_000),
+    example: '60000',
+    fixture: '60000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_LEASE_HEARTBEAT_MS: {
+    name: 'TURN_LEASE_HEARTBEAT_MS',
+    description:
+      'Intervalo (ms) entre renovações da lease do turno (#504). DEVE caber ao menos três vezes ' +
+      'em TURN_LEASE_TTL_MS — com duas, uma única renovação perdida já deixa a lease vencer e o ' +
+      'turno é tomado por outro worker enquanto o dono ainda está processando. A regra ' +
+      'cross-field turn-lease/heartbeat-ratio recusa o boot quando a relação é insegura.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(15_000),
+    example: '15000',
+    fixture: '15000',
     restartRequired: true,
     commentedInExample: true,
   },

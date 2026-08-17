@@ -24,6 +24,19 @@ export type AgentJob = {
    * optimisation + explicit contract, never a correctness dependency.
    */
   trace_id?: string;
+  /**
+   * Issue #504 — identidade DURÁVEL do turno. Aditivo e opcional durante a
+   * janela de compatibilidade: um job armado por um processo anterior a esta
+   * issue não o carrega, e o consumidor continua reencontrando o turno pela
+   * mensagem (`findTurnByMessage`).
+   *
+   * Quando presente, é ele que dá o `jobId` determinístico
+   * (`agentTurnJobId`), e portanto é ele que faz ingresso e recovery
+   * COLIDIREM num único job em vez de criarem dois. Ver
+   * `src/runtime/turns/job.ts` para por que a identidade é o turno e não a
+   * mensagem.
+   */
+  turn_id?: string;
   /** Epoch ms when the job was armed. Feeds the queue-wait SLI. */
   enqueued_at_ms?: number;
   /** Epoch ms of `mensagens.created_at`. Feeds the inbound→delivered SLI. */

@@ -48,7 +48,19 @@ function resolveBearer(authSecretRef: string | null): string | null {
 }
 
 async function withClient<T>(
-  args: { url: string; auth_secret_ref: string | null; serverName: string },
+  args: {
+    url: string;
+    auth_secret_ref: string | null;
+    serverName: string;
+    /**
+     * Issue #504 §Fencing — sinal da TENTATIVA do turno. Quando a lease morre
+     * no meio de uma chamada MCP pendurada, abortar o HTTP é a única forma de
+     * o worker antigo parar de ocupar o servidor externo em nome de um turno
+     * que já é de outro. Composto com o timeout local: o que vier primeiro
+     * aborta. Ausente fora de um turno reivindicado (descoberta, admin).
+     */
+    signal?: AbortSignal;
+  },
   fn: (client: Client, opts: { signal: AbortSignal; timeout: number }) => Promise<T>,
 ): Promise<T> {
   const allowLocalhostHttp = config.NODE_ENV !== 'production';
@@ -58,6 +70,11 @@ async function withClient<T>(
   const bearer = resolveBearer(args.auth_secret_ref);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('mcp_op_timeout')), OP_TIMEOUT_MS);
+  const onTurnAbort = (): void => controller.abort(new Error('turn_ownership_lost'));
+  if (args.signal) {
+    if (args.signal.aborted) onTurnAbort();
+    else args.signal.addEventListener('abort', onTurnAbort, { once: true });
+  }
   const transport = new StreamableHTTPClientTransport(url, {
     requestInit: {
       signal: controller.signal,
@@ -70,6 +87,7 @@ async function withClient<T>(
     return await fn(client, { signal: controller.signal, timeout: OP_TIMEOUT_MS });
   } finally {
     clearTimeout(timer);
+    args.signal?.removeEventListener('abort', onTurnAbort);
     await client.close().catch(() => {});
   }
 }
@@ -95,6 +113,8 @@ export async function mcpCallTool(args: {
   serverName: string;
   tool: string;
   toolArgs: Record<string, unknown>;
+  /** Issue #504 §Fencing — ver `withClient`. */
+  signal?: AbortSignal;
 }): Promise<unknown> {
   return withClient(args, async (client, opts) => {
     const res = await client.callTool(

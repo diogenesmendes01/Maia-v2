@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
 const claimDueMock = vi.fn();
 const reclaimMock = vi.fn().mockResolvedValue([]);
@@ -95,6 +96,10 @@ const owner = {
   status: 'ativa',
 };
 
+// #545: o import a frio do grafo de produção domina o orçamento do primeiro
+// caso. No `beforeAll` ele tem orçamento próprio e não vira corpo órfão.
+const engine = moduloDeProducao(() => import('../../src/scheduling/engine.js'));
+
 describe('runSchedulingTick', () => {
   it('one_shot_reminder: enqueues outbox text, moves occurrence to in_progress, audits', async () => {
     claimDueMock.mockResolvedValue([
@@ -118,7 +123,7 @@ describe('runSchedulingTick', () => {
     pessoasFindByIdMock.mockResolvedValue(owner);
     tasksByOccMock.mockResolvedValue([{ id: 't1', kind: 'fire_reminder', status: 'pending' }]);
 
-    const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
+    const { runSchedulingTick } = engine();
     const r = await runSchedulingTick();
     expect(r.advanced).toBe(1);
     expect(enqueueMock).toHaveBeenCalledTimes(1);
@@ -148,7 +153,7 @@ describe('runSchedulingTick', () => {
       owner_pessoa_id: owner.id,
     });
 
-    const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
+    const { runSchedulingTick } = engine();
     await runSchedulingTick();
     expect(setStatusMock).toHaveBeenCalledWith('occ-cancel', 'cancelled');
     expect(
@@ -187,7 +192,7 @@ describe('runSchedulingTick', () => {
       },
     ]);
 
-    const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
+    const { runSchedulingTick } = engine();
     await runSchedulingTick();
     // The older one should be aged_skipped.
     expect(setStatusMock).toHaveBeenCalledWith(
@@ -229,7 +234,7 @@ describe('runSchedulingTick', () => {
     });
     pessoasFindByIdMock.mockResolvedValue(owner);
 
-    const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
+    const { runSchedulingTick } = engine();
     await runSchedulingTick();
     expect(setStatusMock).toHaveBeenCalledWith(
       'occ-big',

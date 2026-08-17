@@ -12,7 +12,7 @@
 |---|---|
 | `src/db/schema.ts` | Drizzle schema for all tables |
 | `src/db/repositories.ts` | Aggregated repository functions (transactions, audit, conversations, etc.) |
-| `src/db/repositories/turn-repos.ts` | `agentTurnsRepo` — única porta de escrita da máquina de estados do turno inbound (issue #503, migrations 096/097). Toda transição é compare-and-swap sobre `state_version`; transição terminal escreve, na MESMA transação, a projeção de compatibilidade `mensagens.processada_em`. Vocabulário e tabela de transições em [`src/runtime/turns/contract.ts`](runtime.md). |
+| `src/db/repositories/turn-repos.ts` | `agentTurnsRepo` — única porta de escrita da máquina de estados do turno inbound (issues #503/#504, migrations 096/097/114). Toda transição é compare-and-swap sobre `state_version`; transição terminal escreve, na MESMA transação, a projeção de compatibilidade `mensagens.processada_em`. `tryClaimTurn` é o claim ATÔMICO (um `UPDATE ... WHERE ... RETURNING`, relógio do PostgreSQL) e `expected_claim_token` é o FENCE de toda gravação da tentativa — zero linhas com fence declarado vira `stale_claim`, distinto de `state_mismatch`. Vocabulário em [`src/runtime/turns/contract.ts`](runtime.md) e [`claim.ts`](runtime.md). |
 | `src/db/repositories/holidays-repo.ts` | Holiday repository |
 | `src/db/repositories/holiday-entidades-repo.ts` | Per-entity holiday repository |
 | `src/db/client.ts` | Postgres connection pool (`max: 10`, process-wide) + Drizzle init |

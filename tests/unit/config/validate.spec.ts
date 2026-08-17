@@ -179,6 +179,56 @@ describe('validateConfig — cross-field rules (#515)', () => {
     expect(problem!.remediation).toContain('FEATURE_TURN_STATE_MACHINE');
   });
 
+  // Issue #504 — a relação TTL × heartbeat não é afinação: um heartbeat que não
+  // cabe três vezes no TTL produz takeover FALSO, ou seja, duas réplicas
+  // executando o mesmo turno. Por isso o contrato recusa, e recusa no BOOT.
+  it('TURN_LEASE_HEARTBEAT_MS acima de um terço do TTL é rejeitado', () => {
+    const result = validateConfig({
+      env: envFor('production', {
+        TURN_LEASE_TTL_MS: '60000',
+        TURN_LEASE_HEARTBEAT_MS: '30000',
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    const problem = result.errors.find((p) => p.rule === 'turn-lease/heartbeat-ratio');
+    expect(problem).toBeDefined();
+    expect(problem!.variable).toBe('TURN_LEASE_HEARTBEAT_MS');
+    // A remediação precisa dizer o NÚMERO, não só a regra: quem lê está com o
+    // boot quebrado às 3h da manhã.
+    expect(problem!.remediation).toContain('20000');
+  });
+
+  it.each([
+    ['60000', '20000'],
+    ['60000', '15000'],
+    ['30000', '5000'],
+  ] as const)('TTL=%s + heartbeat=%s é uma relação segura', (ttl, heartbeat) => {
+    const result = validateConfig({
+      env: envFor('production', {
+        TURN_LEASE_TTL_MS: ttl,
+        TURN_LEASE_HEARTBEAT_MS: heartbeat,
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    expect(result.errors.some((p) => p.rule === 'turn-lease/heartbeat-ratio')).toBe(false);
+  });
+
+  it('FEATURE_TURN_CLAIM sem FEATURE_TURN_STATE_MACHINE é rejeitado', () => {
+    const result = validateConfig({
+      env: envFor('production', {
+        FEATURE_TURN_STATE_MACHINE: 'false',
+        FEATURE_TURN_CLAIM: 'true',
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    const problem = result.errors.find((p) => p.rule === 'turn-claim/requires-state-machine');
+    expect(problem).toBeDefined();
+    expect(problem!.variable).toBe('FEATURE_TURN_CLAIM');
+  });
+
   it.each([
     ['true', 'true'],
     ['true', 'false'],

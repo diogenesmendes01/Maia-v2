@@ -22,6 +22,7 @@ import {
   withSpan,
   type SpanAttribution,
 } from '@/observability/tracer.js';
+import { agentTurnJobId } from '@/runtime/turns/job.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
 
@@ -284,6 +285,48 @@ function recordTurnOutcome(
 }
 
 /**
+ * Issue #504 — o preço do `jobId` determinístico, e como ele é pago.
+ *
+ * A BullMQ ignora `add` quando já existe um job com aquele id, e a retenção
+ * desta fila mantém jobs `completed` por 24h e `failed` por 7 dias. Isso é o
+ * que se quer enquanto o job está VIVO (waiting/active/delayed = "já tem
+ * alguém cuidando disto"), e é um bloqueio ilegítimo depois que ele terminou:
+ * um turno que voltou a ser elegível — retry com backoff vencido, replay manual
+ * de dead letter, takeover de lease — não conseguiria ser rearmado até a
+ * retenção expirar. É o risco que a própria issue lista ("Retenção da BullMQ
+ * pode conflitar com jobId determinístico").
+ *
+ * A resolução é assimétrica de propósito:
+ *   - job em estado TERMINAL (`completed`/`failed`): removido, o rearme segue;
+ *   - job VIVO: intocado, e o `add` seguinte é ignorado pela BullMQ — que é
+ *     exatamente a deduplicação desejada.
+ *
+ * Quem decide se o trabalho ainda vale continua sendo o PostgreSQL: aqui só se
+ * remove o CADÁVER de um job para que o transporte não vete uma decisão que já
+ * foi tomada no banco.
+ *
+ * Nunca lança: se a inspeção falhar, seguimos para o `add`. No pior caso o
+ * `add` é ignorado e o sweep tenta de novo no próximo tick — perde-se latência
+ * de recuperação, nunca correção.
+ */
+async function clearRetainedTurnJob(jobId: string): Promise<void> {
+  try {
+    const existing = await agentQueue.getJob(jobId);
+    if (!existing) return;
+    const state = await existing.getState();
+    if (state !== 'completed' && state !== 'failed') return;
+    await existing.remove();
+    incCounter('maia_turn_job_retained_cleared_total', { state });
+    logger.info({ job_id: jobId, state }, 'queue.turn_job_retained_cleared');
+  } catch (err) {
+    logger.warn(
+      { job_id: jobId, err: (err as Error).message },
+      'queue.turn_job_retained_clear_failed',
+    );
+  }
+}
+
+/**
  * Signal that `enqueueAgent` could not arm the BullMQ job because Redis is at
  * its memory cap (#309 follow-up, PR #324 B1). Mirrors the debouncer's
  * `DebouncerRedisUnavailableError`: a raw ioredis `ReplyError` from
@@ -330,12 +373,18 @@ export class QueueRedisUnavailableError extends Error {
  */
 export async function enqueueAgent(data: AgentJob): Promise<void> {
   try {
+    // Issue #504 — `jobId` DETERMINÍSTICO quando o produtor conhece o turno.
+    // Dois enfileiramentos do mesmo turno (ingresso + recovery, ou duas
+    // réplicas do recovery) colidem no mesmo id e a BullMQ cria UM job.
+    const jobId = data.turn_id ? agentTurnJobId(data.turn_id) : undefined;
+    if (jobId) await clearRetainedTurnJob(jobId);
     // Issue #514 §1 — stamp the correlation fields onto the payload. An
     // explicit `trace_id` from the caller always wins (the recovery sweep and
     // the unrouted replay both re-enqueue an existing turn); otherwise the id
     // is DERIVED from `mensagem_id`, so re-enqueueing the same row always
     // lands on the same root trace.
     await agentQueue.add('process-message', withCorrelation(data), {
+      ...(jobId ? { jobId } : {}),
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },
     });

@@ -1237,8 +1237,12 @@ async function handleIncoming(
     // Issue #514 §5 — carry the PERSISTED inbound timestamp so the E2E latency
     // SLI is measured from when the message actually arrived, not from when a
     // worker happened to pick it up.
+    // #504 — o `turn_id` dá ao job identidade DURÁVEL e, com ela, um `jobId`
+    // determinístico. Sem isto o ingresso e o sweep de recovery armavam dois
+    // jobs distintos para o mesmo turno; agora colidem num só.
     await enqueueAgent({
       mensagem_id: stored.id,
+      ...(turnHandle ? { turn_id: turnHandle.turn_id } : {}),
       received_at_ms: stored.created_at?.getTime(),
     });
   } catch (err) {

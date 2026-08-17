@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
 const sendMessage = vi.fn();
 const fakeSocket = { sendMessage };
@@ -67,9 +68,13 @@ beforeEach(() => {
 // Step 3 of this task). This Step 1 test will fail because the seam doesn't
 // exist yet — that's the TDD red.
 
+// #545: o grafo de `src/gateway/baileys.js` custa 5.77–6.83s para carregar a
+// frio, contra poucos ms de trabalho real por caso.
+const baileys = moduloDeProducao(() => import('../../src/gateway/baileys.js'));
+
 describe('sendOutboundText — view_once envelope contract', () => {
   it('passes { text, viewOnce: true } when opts.view_once && FEATURE_VIEW_ONCE_SENSITIVE', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('5511999999999@s.whatsapp.net', 'Saldo R$ 1.234', { view_once: true });
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -82,21 +87,21 @@ describe('sendOutboundText — view_once envelope contract', () => {
 
   it('does NOT pass viewOnce when FEATURE_VIEW_ONCE_SENSITIVE is false', async () => {
     viewOnceFlag = false;
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('jid', 'Saldo', { view_once: true });
     expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' }, undefined);
   });
 
   it('does NOT pass viewOnce when opts.view_once is false even with flag on', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('jid', 'Saldo', { view_once: false });
     expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'Saldo' }, undefined);
   });
 
   it('view_once + quoted forwards both', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;
     await mod.sendOutboundText('jid', 'R$ x', { view_once: true, quoted });
@@ -104,7 +109,7 @@ describe('sendOutboundText — view_once envelope contract', () => {
   });
 
   it('returns null when not connected (existing behaviour preserved)', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(null, false);
     const wid = await mod.sendOutboundText('jid', 'whatever', { view_once: true });
     expect(wid).toBeNull();
@@ -114,7 +119,7 @@ describe('sendOutboundText — view_once envelope contract', () => {
 
 describe('sendOutboundText — #327 provider-side dedup key (messageId)', () => {
   it('forwards opts.messageId to Baileys MiscMessageGenerationOptions', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('5511999999999@s.whatsapp.net', 'olá', {
       messageId: '3EB0ABCDEF0123456789',
@@ -128,7 +133,7 @@ describe('sendOutboundText — #327 provider-side dedup key (messageId)', () => 
   });
 
   it('forwards BOTH messageId and quoted when present', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;
     await mod.sendOutboundText('jid', 'oi', { messageId: '3EB0DEADBEEF00112233', quoted });
@@ -140,7 +145,7 @@ describe('sendOutboundText — #327 provider-side dedup key (messageId)', () => 
   });
 
   it('omits the third arg entirely when no opts are provided (call arity stable)', async () => {
-    const mod = await import('../../src/gateway/baileys.js');
+    const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await mod.sendOutboundText('jid', 'sem opts');
     expect(sendMessage).toHaveBeenCalledWith('jid', { text: 'sem opts' }, undefined);
