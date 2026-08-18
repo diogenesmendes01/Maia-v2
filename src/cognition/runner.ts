@@ -2,10 +2,78 @@ import type { RunModuleOptions, RunModuleResult } from './types.js';
 import { cognitiveModuleLogRepo } from '@/db/repositories.js';
 import { tryGetCurrentContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
+import { incCounter } from '@/lib/metrics.js';
+
+/**
+ * Motivo com que o runner aborta o sinal COMPOSTO quando o timeout local vence.
+ * Fica no `reason` do abort para que quem observa consiga distinguir "o caller
+ * cancelou" de "este módulo estourou o próprio limite".
+ */
+const TIMEOUT_ABORT_REASON = 'cognitive_module_timeout';
+
+/**
+ * Por que a execução terminou em `cancelled` — cardinalidade FECHADA, vai para
+ * `cognitive_module_log.metadata.cancel_cause` e para a label da métrica.
+ *
+ *   `signal_aborted`          — o `fn` rejeitou porque o sinal foi abortado.
+ *                               É o caminho COOPERATIVO: a operação subjacente
+ *                               (a requisição HTTP ao provedor, por exemplo)
+ *                               de fato parou.
+ *   `late_result_discarded`   — o `fn` RESOLVEU, mas o sinal do caller já
+ *                               estava abortado quando o resultado chegou. O
+ *                               trabalho foi feito e pago; o que não pode
+ *                               acontecer é o resultado ser usado ou auditado
+ *                               como sucesso desta tentativa.
+ */
+type CancelCause = 'signal_aborted' | 'late_result_discarded';
+
+/**
+ * Compõe o sinal do caller com o timeout local do módulo.
+ *
+ * Existe por uma razão que o `Promise.race` sozinho não cobre: o race decide
+ * quem responde ao CALLER, e não cancela nada. Com o controller, o timeout
+ * também vira um abort que chega ao `fn` — e daí à requisição subjacente, se o
+ * `fn` repassar o sinal. O race continua ali como rede para dependências NÃO
+ * cooperativas (as que ignoram o sinal): elas não podem prender o caller.
+ *
+ * `dispose()` é obrigatório em TODOS os caminhos de saída: sem ele o listener
+ * fica pendurado no sinal do caller (que vive o turno inteiro, não a chamada) e
+ * retém o controller — o mesmo vazamento que a PR #221 fechou no skill-runner.
+ */
+function composeSignal(caller: AbortSignal | undefined): {
+  signal: AbortSignal;
+  abortForTimeout: () => void;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  if (caller?.aborted) {
+    controller.abort(caller.reason);
+    return { signal: controller.signal, abortForTimeout: () => {}, dispose: () => {} };
+  }
+  const onCallerAbort = (): void => controller.abort(caller?.reason);
+  if (caller) caller.addEventListener('abort', onCallerAbort, { once: true });
+  return {
+    signal: controller.signal,
+    abortForTimeout: () => controller.abort(TIMEOUT_ABORT_REASON),
+    dispose: () => {
+      if (caller) caller.removeEventListener('abort', onCallerAbort);
+    },
+  };
+}
 
 export async function runCognitiveModule<TOut>(
   opts: RunModuleOptions<TOut>,
-  fn: () => Promise<TOut>,
+  /**
+   * Issue #507 — o `fn` passa a RECEBER o sinal composto (caller + timeout do
+   * módulo). Parâmetro, e não campo de `opts`, porque é o `fn` que conhece a
+   * operação subjacente e sabe onde entregá-lo — o parâmetro `signal` do
+   * gateway de LLM, por exemplo.
+   *
+   * Compatível com os call sites existentes: em TypeScript uma função que
+   * declara MENOS parâmetros é atribuível a uma que declara mais, então todo
+   * `() => Promise<T>` continua valendo sem alteração.
+   */
+  fn: (signal: AbortSignal) => Promise<TOut>,
 ): Promise<RunModuleResult<TOut>> {
   const startTime = Date.now();
   const timeoutMs = opts.timeoutMs ?? 30000;
@@ -18,6 +86,7 @@ export async function runCognitiveModule<TOut>(
   let output: TOut | null;
   let fallback_triggered = false;
   let error_message: string | undefined;
+  let cancel_cause: CancelCause | undefined;
 
   // Issue #224: store the timeout handle and clear it once the race settles.
   // Without this, every fn() that resolves (or rejects) before the timer fires
@@ -26,24 +95,62 @@ export async function runCognitiveModule<TOut>(
   // tests. The same shape as the listener-cleanup fix landing in
   // skill-runner.ts (sibling PR #221).
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Issue #507 — o timer disparou?
+   *
+   * Antes bastava comparar `e.message === 'timeout'`, porque o único jeito de o
+   * timeout chegar ao caller era a promessa sintética do race. Agora o timer
+   * ABORTA o sinal composto ANTES de rejeitar, e um `fn` COOPERATIVO rejeita na
+   * hora, de dentro do listener de abort — ou seja, síncronamente antes do
+   * `reject(new Error('timeout'))`. Sem esta flag, o race passaria a ser vencido
+   * pela rejeição do `fn` e um estouro de limite seria classificado como
+   * `error`: a cooperação que acabamos de ganhar apagaria a causa.
+   */
+  let timedOut = false;
+  const composed = composeSignal(opts.signal);
   try {
     output = await Promise.race([
-      fn(),
+      fn(composed.signal),
       new Promise<TOut>((_, reject) => {
-        timeoutHandle = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+        timeoutHandle = setTimeout(() => {
+          // Issue #507 — abortar ANTES de rejeitar. O race só escolhe quem
+          // responde ao caller; quem manda a operação subjacente parar é o
+          // abort. Na ordem inversa o caller sairia enquanto o trabalho seguia.
+          timedOut = true;
+          composed.abortForTimeout();
+          reject(new Error('timeout'));
+        }, timeoutMs);
       }),
     ]);
+    // Issue #507 — RESULTADO TARDIO. O `fn` resolveu, mas o caller já tinha
+    // cancelado. Auditar isto como `success` era a mentira que o dono apontou:
+    // uma row afirmando que um turno que já não era nosso deu certo. O output é
+    // DESCARTADO (não vira mutação nem resposta) e o desfecho é `cancelled`.
+    if (opts.signal?.aborted) {
+      output = null;
+      status = 'cancelled';
+      cancel_cause = 'late_result_discarded';
+    }
   } catch (err) {
     const e = err as Error;
     error_message = e.message;
-    status = e.message === 'timeout' ? 'timeout' : 'error';
-    fallback_triggered = true;
-    if (opts.fallback !== undefined) {
-      output = typeof opts.fallback === 'function'
-        ? (opts.fallback as () => TOut)()
-        : opts.fallback;
-    } else {
+    if (opts.signal?.aborted) {
+      // Cancelamento do caller vence o timeout: se o sinal já estava abortado,
+      // a causa REAL é o cancelamento, mesmo que o timer tenha disparado no
+      // mesmo tick. `fallback_triggered` fica false — ver RunModuleResult.
+      status = 'cancelled';
+      cancel_cause = 'signal_aborted';
       output = null;
+    } else {
+      status = timedOut || e.message === 'timeout' ? 'timeout' : 'error';
+      fallback_triggered = true;
+      if (opts.fallback !== undefined) {
+        output = typeof opts.fallback === 'function'
+          ? (opts.fallback as () => TOut)()
+          : opts.fallback;
+      } else {
+        output = null;
+      }
     }
   } finally {
     // Always clear the timeout — covers all exit paths:
@@ -51,9 +158,31 @@ export async function runCognitiveModule<TOut>(
     //  - fn() rejected first (timeoutHandle still scheduled)
     //  - timeout fired first (clearTimeout on an already-fired handle is a no-op)
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    // Issue #507 — e SEMPRE soltar o listener do sinal do caller. Ele vive o
+    // turno inteiro; a chamada, não.
+    composed.dispose();
   }
 
   const latency_ms = Date.now() - startTime;
+
+  if (status === 'cancelled') {
+    // Cardinalidade fechada: `module` é nome de módulo (enum de fato, vindo do
+    // código) e `cause` é a união acima. Nada de turno, pessoa ou conteúdo.
+    incCounter('maia_cognitive_module_cancelled_total', {
+      module: opts.name,
+      cause: cancel_cause ?? 'signal_aborted',
+    });
+    logger.warn(
+      {
+        module: opts.name,
+        cause: cancel_cause,
+        latency_ms,
+        conversa_id: opts.conversa_id ?? null,
+        turno_id: opts.turno_id ?? null,
+      },
+      'runner.module_cancelled',
+    );
+  }
 
   if (audit) {
     const ctx = tryGetCurrentContext();
@@ -98,9 +227,14 @@ export async function runCognitiveModule<TOut>(
         output_summary_hash: null,
         confidence: null,
         fallback_triggered,
-        fallback_reason: error_message ?? null,
+        // `fallback_reason` só é preenchido quando houve degradação de fato.
+        // Num cancelamento não houve — a causa vai em `metadata.cancel_cause`.
+        fallback_reason: status === 'cancelled' ? null : (error_message ?? null),
         status,
-        metadata: {},
+        // Issue #507 — a causa do cancelamento fica em `metadata`, e NÃO em
+        // `fallback_reason`: aquela coluna só faz sentido ao lado de
+        // `fallback_triggered=true`, e num cancelamento ela é false.
+        metadata: cancel_cause ? { cancel_cause } : {},
       });
     } catch (logErr) {
       logger.warn({ err: (logErr as Error).message, module: opts.name }, 'runner.audit_failed');

@@ -142,6 +142,228 @@ describe('runCognitiveModule', () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // Issue #507 — CANCELAMENTO É ESTADO PRÓPRIO.
+  //
+  // O defeito: `runCognitiveModule` recebia `fn: () => Promise<T>` e só sabia
+  // `Promise.race` com um timer. Um cancelamento do caller (na prática: a lease
+  // do turno perdida no meio do round-trip do reasoner) não tinha como chegar à
+  // operação subjacente NEM como aparecer no resultado. Os dois desfechos
+  // possíveis eram ambos falsos:
+  //   · o provedor terminava antes de qualquer um olhar o sinal, o `fn`
+  //     resolvia, e a row de `cognitive_module_log` dizia `success` — auditoria
+  //     afirmando que um turno que já não era nosso deu certo;
+  //   · o `fn` rejeitava por outro motivo e caía no catch genérico como
+  //     `error` + `fallback_triggered=true`, contaminando a taxa de fallback.
+  //
+  // Os casos abaixo fixam o contrato novo: o `fn` RECEBE o sinal composto, o
+  // desfecho é `cancelled`, o fallback NÃO dispara, o resultado tardio é
+  // DESCARTADO e a row de auditoria diz a verdade.
+  // -------------------------------------------------------------------------
+  describe('issue #507 — signal, cancelamento e resultado tardio', () => {
+    /** Rejeição que um `fn` cooperativo produz ao ver o sinal abortar. */
+    function abortError(): Error {
+      const e = new Error('llm_call_aborted');
+      e.name = 'AbortError';
+      return e;
+    }
+
+    it('o fn RECEBE um AbortSignal mesmo quando o caller não passa nenhum', async () => {
+      let received: unknown = 'não chamado';
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        await runCognitiveModule(
+          { name: 'test.507.recebe-sinal', triggered_by: 'sync_required' },
+          async (signal) => {
+            received = signal;
+            return 'ok';
+          },
+        );
+      });
+      // Sem isto, um call site que escreve `(signal) => callLLM({ signal })`
+      // passaria `undefined` adiante e o gateway não teria o que cancelar.
+      expect(received).toBeInstanceOf(AbortSignal);
+      expect((received as AbortSignal).aborted).toBe(false);
+    });
+
+    it('o timeout ABORTA o sinal entregue ao fn — não apenas vence o race', async () => {
+      let observed: AbortSignal | null = null;
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const result = await runCognitiveModule(
+          {
+            name: 'test.507.timeout-aborta',
+            triggered_by: 'sync_conditional',
+            timeoutMs: 20,
+            fallback: 'fb',
+          },
+          (signal) =>
+            new Promise<string>((_, reject) => {
+              observed = signal;
+              signal.addEventListener('abort', () => reject(abortError()), { once: true });
+            }),
+        );
+        // O vocabulário NÃO muda para quem não passou sinal: estourar o próprio
+        // limite continua sendo `timeout` com fallback, não `cancelled`. Isto é
+        // a regressão que o `timedOut` do runner protege — com o `fn` agora
+        // cooperativo, a rejeição dele vence o race e, sem a flag, um estouro de
+        // limite seria classificado como `error`.
+        expect(result.status).toBe('timeout');
+        expect(result.output).toBe('fb');
+        expect(result.fallback_triggered).toBe(true);
+      });
+      expect(observed).not.toBeNull();
+      expect(observed!.aborted).toBe(true);
+      expect(observed!.reason).toBe('cognitive_module_timeout');
+    });
+
+    it('caller cancela DURANTE a chamada: status=cancelled, sem fallback', async () => {
+      const ac = new AbortController();
+      const fallbackFn = vi.fn(() => 'fb');
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const result = await runCognitiveModule(
+          {
+            name: 'test.507.cancel-durante',
+            triggered_by: 'sync_required',
+            timeoutMs: 5000,
+            fallback: fallbackFn,
+            signal: ac.signal,
+          },
+          (signal) =>
+            new Promise<string>((_, reject) => {
+              signal.addEventListener('abort', () => reject(abortError()), { once: true });
+              setTimeout(() => ac.abort('lease_lost'), 5);
+            }),
+        );
+        expect(result.status).toBe('cancelled');
+        expect(result.output).toBeNull();
+        // A distinção que o dono pediu: cancelamento NÃO é degradação de
+        // produto. Marcar fallback aqui envenenaria a métrica que mede quanto o
+        // usuário recebeu de resposta pior.
+        expect(result.fallback_triggered).toBe(false);
+      });
+      expect(fallbackFn, 'o fallback não pode ser sintetizado num cancelamento').not.toHaveBeenCalled();
+    });
+
+    it('sinal JÁ abortado: nem chega a valer a pena esperar o fn', async () => {
+      const ac = new AbortController();
+      ac.abort('lease_lost');
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const result = await runCognitiveModule(
+          {
+            name: 'test.507.ja-abortado',
+            triggered_by: 'sync_required',
+            fallback: 'fb',
+            signal: ac.signal,
+          },
+          async (signal) => {
+            // O sinal composto já nasce abortado — é assim que `callLLM`
+            // curto-circuita antes de pagar pela requisição.
+            expect(signal.aborted).toBe(true);
+            throw abortError();
+          },
+        );
+        expect(result.status).toBe('cancelled');
+        expect(result.output).toBeNull();
+        expect(result.fallback_triggered).toBe(false);
+      });
+    });
+
+    it('RESULTADO TARDIO: o fn resolve depois do abort → output descartado', async () => {
+      const ac = new AbortController();
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const result = await runCognitiveModule(
+          {
+            name: 'test.507.late-result',
+            triggered_by: 'sync_required',
+            timeoutMs: 5000,
+            signal: ac.signal,
+          },
+          // Dependência NÃO cooperativa: ignora o sinal e entrega assim mesmo.
+          // É o caso exato que o dono descreveu — o LLM RETORNA e a row saía
+          // como `success` para um turno que já não era nosso.
+          async () => {
+            ac.abort('lease_lost');
+            await new Promise((r) => setTimeout(r, 5));
+            return 'resposta-cara-e-tardia';
+          },
+        );
+        expect(result.status).toBe('cancelled');
+        // Descartado, não devolvido: um resultado tardio não pode virar
+        // resposta ao usuário nem mutação de estado.
+        expect(result.output).toBeNull();
+        expect(result.fallback_triggered).toBe(false);
+      });
+    });
+
+    it('a row de auditoria diz cancelled + cancel_cause, e NÃO diz success', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      const ac = new AbortController();
+      await runWithTenantContext({ tenant_id: 'tenantY', agent_id: 'agentY' }, async () => {
+        await runCognitiveModule(
+          { name: 'test.507.audit', triggered_by: 'sync_required', signal: ac.signal },
+          async () => {
+            ac.abort('lease_lost');
+            return 'tardio';
+          },
+        );
+      });
+      expect(repo.cognitiveModuleLogRepo.record).toHaveBeenCalledTimes(1);
+      const row = vi.mocked(repo.cognitiveModuleLogRepo.record).mock.calls[0]![0];
+      expect(row.status).toBe('cancelled');
+      expect(row.fallback_triggered).toBe(false);
+      // `fallback_reason` só faz sentido ao lado de `fallback_triggered=true`;
+      // a causa do cancelamento vai em metadata, com cardinalidade fechada.
+      expect(row.fallback_reason).toBeNull();
+      expect(row.metadata).toEqual({ cancel_cause: 'late_result_discarded' });
+    });
+
+    it('o listener no sinal do CALLER é removido em todos os caminhos', async () => {
+      const ac = new AbortController();
+      const addSpy = vi.spyOn(ac.signal, 'addEventListener');
+      const removeSpy = vi.spyOn(ac.signal, 'removeEventListener');
+      try {
+        await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+          await runCognitiveModule(
+            { name: 'test.507.listener-sucesso', triggered_by: 'sync_required', signal: ac.signal },
+            async () => 'ok',
+          );
+          await runCognitiveModule(
+            { name: 'test.507.listener-erro', triggered_by: 'sync_required', signal: ac.signal },
+            async () => {
+              throw new Error('boom');
+            },
+          );
+        });
+        // O sinal do caller vive o TURNO inteiro; a chamada, não. Sem o
+        // `removeEventListener` cada módulo deixaria um listener (e o
+        // controller que ele retém) pendurado até o fim do turno.
+        expect(addSpy).toHaveBeenCalledTimes(2);
+        expect(removeSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        addSpy.mockRestore();
+        removeSpy.mockRestore();
+      }
+    });
+
+    it('REGRESSÃO: sem `signal`, nada muda — erro continua error + fallback', async () => {
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const result = await runCognitiveModule(
+          { name: 'test.507.sem-signal', triggered_by: 'async_event', fallback: 'fb' },
+          async () => {
+            throw abortError();
+          },
+        );
+        // Um `AbortError` vindo de outra fonte que não o sinal deste runner
+        // continua sendo falha: `cancelled` é reservado a quem OPTOU por passar
+        // o sinal, senão o vocabulário novo vazaria para os ~30 call sites que
+        // não migraram.
+        expect(result.status).toBe('error');
+        expect(result.output).toBe('fb');
+        expect(result.fallback_triggered).toBe(true);
+      });
+    });
+  });
+
   // Issue #224 — regression: the Promise.race timeout handle must be cleared
   // on every exit path. Otherwise pending setTimeout handles accumulate in
   // the event loop, retain closures, and surface as "open handles" warnings

@@ -6,6 +6,7 @@ import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { resolveAndDispatch } from './pending-resolver.js';
+import { getTurnExecutionContext } from '@/runtime/turns/execution-context.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 export type GateResult =
@@ -75,8 +76,17 @@ async function haikuClassifier(
     `Opções: ${opts.map((o) => `${o.key} (${o.label})`).join(', ')}\n` +
     `Resposta do usuário: ${inbound.conteudo ?? ''}`;
   const gateResult = await runCognitiveModule(
-    { name: 'pending-gate', triggered_by: 'sync_conditional', timeoutMs: 5000 },
-    () =>
+    {
+      name: 'pending-gate',
+      triggered_by: 'sync_conditional',
+      timeoutMs: 5000,
+      // Issue #507 — segundo call site de LLM DENTRO do turno reivindicado
+      // (`core.ts:837`, dentro do escopo aberto em `core.ts:578`). Mesmo
+      // defeito do reasoner, em escala menor: perdida a lease durante estes 5s,
+      // a chamada seguia paga até o fim e a row de auditoria dizia `success`.
+      signal: getTurnExecutionContext()?.signal,
+    },
+    (signal) =>
       callLLM({
         workload: 'pending_gate',
         system,
@@ -84,6 +94,7 @@ async function haikuClassifier(
         max_tokens: 200,
         temperature: 0,
         pessoa_id: ctx?.pessoa_id,
+        signal,
       }),
   );
   const res = gateResult.output;
@@ -91,6 +102,15 @@ async function haikuClassifier(
     // Timeout/erro do classificador — fallback de segurança: trata como
     // não-resolvido. Caller (checkPendingFirst) converte null em
     // { kind: 'unresolved', reason: 'low_confidence' }.
+    //
+    // Issue #507 — `cancelled` cai aqui DE PROPÓSITO, sem lançar. O catch de
+    // `TurnOwnershipLostError` em `core.ts:1526` cobre apenas a chamada a
+    // `runReActLoop` (o `try` começa em `core.ts:1495`); um throw daqui
+    // escaparia dele e o desfecho do turno passaria a ser decidido pelo
+    // tratamento genérico de erro do worker — um risco que esta issue não
+    // precisa correr para fechar o defeito. O ganho já está garantido: a
+    // chamada foi ABORTADA e a row de auditoria diz `cancelled`, não `success`.
+    // O turno segue para o ReAct, cujo guard de topo de iteração lança na hora.
     logger.warn(
       { status: gateResult.status },
       'pending_gate.classify_failed',

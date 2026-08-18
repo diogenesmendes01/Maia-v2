@@ -180,6 +180,12 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
   // Enquanto false, um retry é seguro; a partir de true, não é.
   let sideEffectsCommitted = false;
+  // Issue #507 — o sinal da tentativa, lido UMA vez. O `TurnExecutionContext`
+  // é estável durante todo o turno (o ALS não muda de store no meio), e ler
+  // fora do laço deixa explícito que é o mesmo orçamento de cancelamento em
+  // todas as iterações. `undefined` fora de um turno reivindicado: workers de
+  // agenda, playground e testes seguem com o comportamento anterior.
+  const turnSignal = getTurnExecutionContext()?.signal;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     // Issue #504 §Fencing — LIMITE DE EFEITO, no topo de cada iteração.
@@ -205,8 +211,17 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         timeoutMs: 30000,
         conversa_id: c.id,
         turno_id: inbound.id,
+        // Issue #507 — o sinal da TENTATIVA entra no runner.
+        //
+        // O guard acima recusa uma iteração NOVA. Ele não alcança a chamada JÁ
+        // EM VOO: perdida a lease no meio do round-trip do reasoner — que é o
+        // trecho mais longo do turno, logo o instante mais provável — o
+        // provedor seguia gerando e sendo cobrado até o fim, e o
+        // `cognitive_module_log` registrava `success` para um turno que já não
+        // era nosso. O sinal aqui é o que transforma isso em cancelamento.
+        signal: turnSignal,
       },
-      () =>
+      (signal) =>
         callLLM({
           // Issue #508: workload declarado → o backend decide tier, política
           // de retry e se fallback é permitido (src/lib/llm/workloads.ts).
@@ -216,8 +231,31 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           tools,
           max_tokens: 1024,
           pessoa_id: pessoa.id,
+          // Issue #507 — sem ESTA linha o resto é decoração: o gateway já
+          // cancela provider, retry, backoff e fallback quando recebe o sinal
+          // (`src/lib/llm/gateway.ts`), e o runner já compõe o sinal — mas o
+          // `Promise.race` sozinho apenas devolve ao caller enquanto a
+          // requisição HTTP continua viva.
+          signal,
         }),
     );
+
+    // Issue #507 — CANCELAMENTO NÃO É FALHA DE RACIOCÍNIO.
+    //
+    // Sem este ramo, `output: null` cairia no `if (!res)` abaixo e o turno
+    // sairia como `reasoner_failed` — que `core.ts` traduz em RETRY. Reenfileirar
+    // um turno cuja lease pertence a outro worker é exatamente a gravação que a
+    // #504 proíbe, agora escrita por engano de vocabulário.
+    //
+    // Lança pelo mesmo motivo do guard do topo: quem tem a lease decide o
+    // desfecho, e `core.ts:1526` sai sem concluir, sem retry e sem carimbar
+    // `processada_em`. Se o sinal tiver vindo de outra fonte que não a perda de
+    // posse, `assertTurnOwnership` não lança e o fluxo segue para o tratamento
+    // de `!res` — conservador de propósito.
+    if (reasonerResult.status === 'cancelled') {
+      assertTurnOwnership('react_reasoner');
+    }
+
     const res = reasonerResult.output;
     if (!res) {
       // Reasoner falhou (timeout/erro) — encerra loop com resposta vazia.

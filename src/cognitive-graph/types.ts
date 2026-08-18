@@ -31,7 +31,15 @@ export type ModuleDescriptor<TIn, TOut> = {
 
 /** Resultado de um único node. Mirror de `RunModuleResult` mas com nome do node. */
 export type NodeRunResult<TOut> = {
-  status: 'success' | 'timeout' | 'error' | 'skipped';
+  /**
+   * Issue #507 — espelha `RunModuleResult['status']`, e por isso ganhou
+   * `cancelled` junto. Hoje o valor é INALCANÇÁVEL por aqui: `runOne` não passa
+   * `signal` ao runner, e sem sinal o runner nunca produz `cancelled`. O tipo
+   * acompanha assim mesmo porque a alternativa — estreitar com um `else`
+   * inventado no orchestrator — criaria um ramo morto que mentiria sobre o
+   * desfecho no dia em que o grafo receber o sinal do turno.
+   */
+  status: 'success' | 'timeout' | 'error' | 'skipped' | 'cancelled';
   output: TOut | null;
   latency_ms: number;
   fallback_triggered: boolean;
