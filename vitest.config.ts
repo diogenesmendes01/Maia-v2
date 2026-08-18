@@ -29,6 +29,10 @@ export default defineConfig({
     exclude: ['tests/admin-ui/e2e/**'],
     environment: 'node',
     setupFiles: ['./tests/setup.ts'],
+    // #571: cria e migra o banco EXCLUSIVO desta worktree (e limpa o db do
+    // Redis dela) antes de qualquer worker subir. No checkout principal e no
+    // CI é um no-op — ver `tests/globalSetup.ts`.
+    globalSetup: [resolve(__dirname, 'tests/globalSetup.ts')],
     // ───────────────────────────────────────────────────────────────────────
     // Orçamento de tempo — issue #545, medido, não estimado
     // ───────────────────────────────────────────────────────────────────────

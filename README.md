@@ -246,19 +246,58 @@ sempre passa sem infra.
 # 1. Sobe Postgres + Redis via Docker Compose
 npm run test:integration:setup
 
-# 2. Aplica migrations
-TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run db:migrate
+# 2. Roda a suíte — cria o banco, aplica as migrations e roda
+npm run test:integration
 
-# 3. Roda a suíte (TEST_DB_URL liga os specs de DB ao vivo)
-TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run test:integration
+# ...ou só um arquivo
+npm run test:integration -- tests/integration/leak.spec.ts
 
-# 4. Para os serviços (remove volumes)
+# 3. Para os serviços (remove volumes)
 npm run test:integration:teardown
 ```
+
+Não existe mais o passo de exportar `TEST_DB_URL` à mão: `npm run test:integration`
+a preenche sozinho (`scripts/test-integration.ts`) e o banco é criado e migrado
+antes do primeiro worker subir (`tests/globalSetup.ts`). `npm test` continua
+passando sem infra nenhuma — sem `TEST_DB_URL` os specs de integração seguem
+dando `describe.skip`.
 
 Se um spec falhar com erro de conectividade, o helper em
 `tests/helpers/integrationSetup.ts` imprime mensagem acionável dizendo qual
 serviço está inalcançável e qual comando rodar.
+
+### Isolamento por worktree (issue #571)
+
+**Uma `git worktree` roda contra um Postgres e um db do Redis EXCLUSIVOS dela.**
+Nada a exportar, nada a lembrar — a derivação é automática e vale para
+`npm test`, `npm run test:integration` e `npm run test:leak`.
+
+| Eixo | O que a worktree ganha | Onde |
+|---|---|---|
+| Postgres | banco próprio, `<base>_wt_<pasta>_<hash>`, criado e migrado sozinho | `tests/globalSetup.ts` |
+| Ledger de migrations | vem junto: `schema_migrations` é uma tabela DENTRO do banco da worktree | idem |
+| Redis | um db lógico próprio (`redis://…/N`), limpo no início da rodada | `tests/helpers/worktree-scope.ts` |
+| `node_modules` | resolvido pela subida de diretórios até a raiz — a worktree **não** instala nada | `tests/helpers/pkg-path.ts` |
+
+Como saber qual é o seu: `psql -l | grep maia_test_wt_` e
+`cat .git/maia-redis-slots/*` (o arquivo do slot contém o caminho da worktree
+dona). O escopo desliga com `MAIA_TEST_SCOPE=off`, e no checkout principal e no
+CI ele já é inativo por construção — lá `.git` é um diretório, não um arquivo
+`gitdir:`, e o comportamento é o de sempre.
+
+**Limite conhecido, e é de infraestrutura:** um Redis de fábrica tem 16 dbs
+lógicos, e o 0 fica reservado para quem não é worktree — ou seja, 15 worktrees
+simultâneas. Os slots são reciclados quando a worktree some do disco ou fica 6h
+sem rodar nada, então o teto é de worktrees ATIVAS, não de worktrees existentes.
+Se ele apertar, suba o Redis com mais dbs e diga ao alocador:
+
+```bash
+redis-server --databases 64          # ou `--databases 64` no comando do compose
+export MAIA_TEST_REDIS_DATABASES=64
+```
+
+Sem isso, a 16ª worktree ativa falha com mensagem nomeando o remédio — em vez de
+silenciosamente compartilhar o db de outra.
 
 CI roda esses testes automaticamente em job dedicado (`integration` em
 `.github/workflows/ci.yml`), com `postgres` e `redis` como service containers.

@@ -166,9 +166,17 @@ npm run backup                    # DB backup
 
 ```bash
 npm run test:integration:setup    # docker compose up -d redis postgres
-npm run test:integration          # vitest run tests/integration --no-coverage
+npm run test:integration          # cria/migra o banco da worktree e roda
 npm run test:integration:teardown # docker compose down -v
 ```
+
+**Você está numa `git worktree`? Então seu Postgres e seu Redis já são só
+seus** (issue #571): banco `<base>_wt_<pasta>_<hash>` criado e migrado
+automaticamente, `schema_migrations` dentro dele, e um db lógico do Redis
+exclusivo. Não exporte `TEST_DB_URL` à mão — se você exportar, ela é reescrita
+para o banco da SUA árvore. O contrato inteiro (como descobrir qual é o seu, o
+teto de 15 worktrees ativas imposto pelos 16 dbs do Redis, e como desligar)
+está num lugar só: [README § Isolamento por worktree](README.md#isolamento-por-worktree-issue-571).
 
 CI runs these automatically in `.github/workflows/ci.yml` with service containers. The integration job is blocking: integration + e2e failures fail the run.
 
