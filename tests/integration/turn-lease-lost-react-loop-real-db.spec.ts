@@ -443,7 +443,7 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
     // dele. O que mudou é que agora ele para mais cedo, que é o ganho da #507.
     //
     // A TRADUÇÃO da recusa do dispatcher (`{ error: 'turn_ownership_lost' }` →
-    // `TurnOwnershipLostError('react_tool_refused')`, react-loop.ts:367) segue
+    // `TurnOwnershipLostError('react_tool_refused')`, react-loop.ts:405) segue
     // no código e segue certa: ela cobre a janela em que a posse se perde
     // DENTRO de `dispatchTool` (entre o guard de entrada e o handler), que é o
     // cenário de `turn-lease-lost-tool-handler-real-db.spec.ts`. O que este
