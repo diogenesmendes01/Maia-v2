@@ -79,7 +79,7 @@ export const BASE_REDIS_URL = 'redis://localhost:6379';
  * aceita mais — informe pelo env e o alocador usa.
  */
 const MAX_REDIS_DB = (() => {
-  const raw = process.env.MAIA_TEST_REDIS_DATABASES;
+  const raw = process.env.TEST_REDIS_DATABASES;
   const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isInteger(n) && n >= 2 ? n : 16;
 })();
@@ -200,7 +200,7 @@ function acquireRedisDb(commonGitDir: string, root: string): number {
       `Slots em ${dir}.`,
       'Remedeio: apague worktrees mortas (`git worktree prune` + `rm -rf`), ou',
       'suba o Redis com mais dbs (`redis-server --databases 64`) e exporte',
-      'MAIA_TEST_REDIS_DATABASES=64.',
+      'TEST_REDIS_DATABASES=64.',
     ].join(' '),
   );
 }
@@ -231,7 +231,7 @@ let cache: WorktreeScope | null | undefined;
 
 /**
  * Devolve o escopo desta worktree, ou `null` quando não há isolamento a fazer
- * (checkout principal, CI, ou `MAIA_TEST_SCOPE=off`).
+ * (checkout principal, CI, ou `TEST_WORKTREE_SCOPE=off`).
  *
  * O resultado é memoizado por processo: o custo de I/O acontece uma vez por
  * worker do vitest.
@@ -243,7 +243,7 @@ export function resolveWorktreeScope(): WorktreeScope | null {
 }
 
 function computeWorktreeScope(): WorktreeScope | null {
-  if (process.env.MAIA_TEST_SCOPE === 'off') return null;
+  if (process.env.TEST_WORKTREE_SCOPE === 'off') return null;
 
   const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
   if (!root) return null;

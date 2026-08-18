@@ -281,7 +281,7 @@ Nada a exportar, nada a lembrar — a derivação é automática e vale para
 
 Como saber qual é o seu: `psql -l | grep maia_test_wt_` e
 `cat .git/maia-redis-slots/*` (o arquivo do slot contém o caminho da worktree
-dona). O escopo desliga com `MAIA_TEST_SCOPE=off`, e no checkout principal e no
+dona). O escopo desliga com `TEST_WORKTREE_SCOPE=off`, e no checkout principal e no
 CI ele já é inativo por construção — lá `.git` é um diretório, não um arquivo
 `gitdir:`, e o comportamento é o de sempre.
 
@@ -293,11 +293,17 @@ Se ele apertar, suba o Redis com mais dbs e diga ao alocador:
 
 ```bash
 redis-server --databases 64          # ou `--databases 64` no comando do compose
-export MAIA_TEST_REDIS_DATABASES=64
+export TEST_REDIS_DATABASES=64
 ```
 
 Sem isso, a 16ª worktree ativa falha com mensagem nomeando o remédio — em vez de
 silenciosamente compartilhar o db de outra.
+
+As duas variáveis acima NÃO levam o prefixo `MAIA_` de propósito: o contrato de
+configuração reprova qualquer chave `MAIA_*`/`FEATURE_*` não declarada
+(`src/config/validate.ts:248`), e o runner de migrations disparado pelo
+`globalSetup` herda o ambiente inteiro — uma `MAIA_TEST_*` derrubaria a própria
+provisão que ela configura.
 
 CI roda esses testes automaticamente em job dedicado (`integration` em
 `.github/workflows/ci.yml`), com `postgres` e `redis` como service containers.
