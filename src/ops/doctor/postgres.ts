@@ -5,7 +5,7 @@
  * discipline: every statement runs inside `BEGIN READ ONLY … ROLLBACK`, so an
  * `INSERT`/`UPDATE`/`DELETE`/DDL is refused by Postgres with SQLSTATE `25006`
  * ("cannot execute … in a read-only transaction") regardless of what the check
- * author wrote. `tests/integration/doctor-read-only-real-db.spec.ts` proves it
+ * author wrote. `tests/integration/doctor-real-deps.spec.ts` proves it
  * against a real database by pushing a mutation THROUGH this handle and
  * asserting the rejection plus the absence of the row.
  *
