@@ -46,6 +46,7 @@
     "config:check": "tsx scripts/config.ts check",
     "config:check:drift": "tsx scripts/config.ts generate --check",
     "config:init": "tsx scripts/config.ts init",
+    "config:preflight": "tsx scripts/config.ts preflight",
     "docs:ai:check": "tsx scripts/check-ai-docs.ts",
     "pr:body:check": "tsx scripts/check-pr-body.ts",
     "audit:exceptions:check": "tsx scripts/check-audit-exceptions.ts",
