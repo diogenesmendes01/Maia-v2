@@ -32,6 +32,16 @@
  * aqui não é promessa de que o admin-ui sobe; é a garantia de que o CONTRATO
  * está satisfeito. A lista completa está em `docs/runbooks/deploy-prod.md` §1.
  *
+ * NA OUTRA DIREÇÃO, e é o motivo mais forte para este comando existir: para o
+ * subset `admin-ui` do contrato, ISTO AQUI É A ÚNICA CHECAGEM QUE RODA. O
+ * container do console importa `src/config/env.ts` transitivamente (via
+ * `@/db/client.ts`), e esse singleton valida com `service: 'runtime'` — as
+ * `OIDC_*` são `services: ['admin-ui']` e ficam fora daquele subset, então nem
+ * o `requiredIn` delas nem a regra `admin-ui/tenant-slugs-default-literal` são
+ * avaliados no boot do admin-ui. `loadAdminConfig()` existe e ninguém o chama.
+ * Sem preflight, um `.env.admin` com as quatro `OIDC_*` ausentes SOBE, e
+ * entrega a tela "no providers configured".
+ *
  * PUREZA: nada aqui toca disco, rede ou `process.env`. Quem lê arquivo é
  * `scripts/config.ts`.
  */

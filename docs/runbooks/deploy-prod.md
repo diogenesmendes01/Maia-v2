@@ -126,6 +126,35 @@ que o **contrato** está satisfeito. Fora do alcance dele:
 | **Qualquer coisa que o operador passe direto ao `docker compose` na linha de comando** (`-e`, `--env-file` extra, variáveis do shell). O preflight lê os arquivos, não a invocação. | — |
 | **Migrations, imagem e runtime.** O smoke do §0 é quem cobre isso. | `npm run smoke:migrate:image` |
 
+#### Por que o preflight é a ÚNICA checagem do subset `admin-ui`
+
+Vale dizer isto em voz alta, porque muda o que "reprova no boot" significa para
+o container do console.
+
+O `admin-ui` importa `src/config/env.ts` transitivamente (via `@/db/client.ts`),
+e esse singleton valida o contrato com **`service: 'runtime'`**
+([`src/config/env.ts`](../../src/config/env.ts), `loadConfig()`). As `OIDC_*` são
+`services: ['admin-ui']`, ou seja, estão FORA desse subset — o `requiredIn`
+delas nunca é avaliado ali, e o `validateConfig` descarta explicitamente
+achados cross-field sobre variáveis fora do escopo do serviço pedido
+([`src/config/validate.ts`](../../src/config/validate.ts)). `loadAdminConfig()`
+([`src/config/admin-config.ts`](../../src/config/admin-config.ts)) existe, mas
+**nenhum caminho de boot o chama**.
+
+Consequência prática, e ela é pior que "o container não sobe": com as quatro
+`OIDC_*` ausentes, o admin-ui **sobe**. `oidcProviderEnabled()` trata
+`OIDC_ISSUER` vazio como "este deploy não usa OIDC" e devolve `false` em
+silêncio — em produção, onde o provider de dev está desligado, isso registra
+ZERO providers e entrega a tela "no providers configured". E o literal
+`default` em `OIDC_TENANT_SLUGS` passa igual: a regra que o recusa
+(`admin-ui/tenant-slugs-default-literal`) vive no contrato, no subset
+`admin-ui`, que aquele boot não avalia.
+
+`npm run config:preflight` é, hoje, o único lugar que roda o loader
+`admin-ui` sobre o ambiente efetivo do container `admin-ui`. Fechar essa
+assimetria no código (fazer o admin-ui validar o SEU subset no boot) é
+trabalho separado, e está fora desta mudança.
+
 #### O gap que ele fechou
 
 Até a #572, `cp` + "preencha os placeholders" **não** produzia um ambiente que
