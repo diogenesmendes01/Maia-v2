@@ -736,6 +736,21 @@ d('pending-gate concurrency', () => {
         if (ids.conversa) {
           await c.query('DELETE FROM audit_log WHERE conversa_id = $1', [ids.conversa]);
           await c.query('DELETE FROM pending_questions WHERE conversa_id = $1', [ids.conversa]);
+          // ANTES de `mensagens`: `agent_turn_inputs` referencia a mensagem por
+          // `(tenant_id, agent_id, mensagem_id)` (FK
+          // `agent_turn_inputs_mensagem_scope_fk`). Uma row dessas sobrevivendo
+          // ao caso fazia este `DELETE` LANÇAR — e um `afterAll` que lança
+          // REPROVA O ARQUIVO INTEIRO, com `Tests N passed` ao lado de
+          // `Test Files 1 failed`. Foi assim que o CI ficou vermelho na PR #598
+          // com `executados=807 falharam=0`. Escolhemos `mensagem_id IN (…)` e
+          // não `turn_id IN (…)` porque são exatamente as rows que bloqueiam
+          // este DELETE, independentemente de a qual turno pertençam.
+          await c.query(
+            `DELETE FROM agent_turn_inputs
+              WHERE mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
+            [ids.conversa],
+          );
+          await c.query('DELETE FROM agent_turns WHERE conversa_id = $1', [ids.conversa]);
           await c.query('DELETE FROM mensagens WHERE conversa_id = $1', [ids.conversa]);
           await c.query('DELETE FROM conversas WHERE id = $1', [ids.conversa]);
         }
