@@ -237,6 +237,16 @@ d('maia doctor · dependências reais', () => {
       expect(out).toContain('categoria desconhecida');
     });
 
+    it('opção desconhecida sai 2 em vez de ser ignorada em silêncio', async () => {
+      // `--tenant` é uma forma que a issue esboça e esta build ainda não
+      // implementa. Ignorá-la produziria um verde que não respondeu nada
+      // sobre tenant — exatamente o falso sucesso que o doctor existe para
+      // não dar.
+      const { code, out } = await runCli(['--tenant', 'acme'], {});
+      expect(code).toBe(2);
+      expect(out).toContain('--tenant');
+    });
+
     it('--strict transforma warning em exit 1', async () => {
       // `redis.persistence` é advisory e, num Redis sem AOF, gera warning.
       const relaxed = await runCli(['--online', '--only', 'redis'], {

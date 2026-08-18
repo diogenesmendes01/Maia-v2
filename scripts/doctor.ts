@@ -150,7 +150,38 @@ export class DoctorUsageError extends Error {
   }
 }
 
+/**
+ * Flags the CLI understands. Anything else is a USAGE error, not a no-op.
+ *
+ * Silently ignoring an unknown flag is the worst failure mode a diagnostic
+ * tool has: `--tenant acme` (a shape the issue sketches but this build does not
+ * implement yet, see `docs/runbooks/doctor.md` §8) would produce a green report
+ * that answered nothing about tenants, and the operator would believe it did.
+ */
+const KNOWN_FLAGS: ReadonlySet<string> = new Set([
+  'help',
+  'h',
+  'online',
+  'profile',
+  'service',
+  'format',
+  'json',
+  'strict',
+  'verbose',
+  'timeout',
+  'only',
+  'skip',
+]);
+
 export function resolveOptions(args: Map<string, string | true>): DoctorCliOptions {
+  const unknown = [...args.keys()].filter((k) => !KNOWN_FLAGS.has(k));
+  if (unknown.length > 0) {
+    throw new DoctorUsageError(
+      `opção desconhecida: ${unknown.map((k) => `--${k}`).join(', ')}. ` +
+        'Um doctor que ignora uma flag em silêncio devolve um verde que não responde à pergunta feita.',
+    );
+  }
+
   const rawProfile = args.get('profile');
   if (rawProfile !== undefined && (typeof rawProfile !== 'string' || !isMaiaProfile(rawProfile))) {
     throw new DoctorUsageError(`--profile inválido. Use: ${MAIA_PROFILES.join(', ')}.`);

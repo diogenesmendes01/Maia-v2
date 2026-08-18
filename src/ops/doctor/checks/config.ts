@@ -23,11 +23,16 @@
  * to the live process environment. If the two ever disagree, the disagreement
  * IS the finding: the files say one thing and the container got another.
  *
+ * (`config preflight` is issue #572, in flight at the time of writing. It is
+ * referenced here by BEHAVIOUR, not by file path, precisely because it is not
+ * merged yet — a comment that names a file this tree does not contain rots on
+ * arrival. The boundary above holds regardless of where that code lands.)
+ *
  * `config.admin_boot_gates` covers the one class of problem NEITHER the
- * contract nor the preflight sees, and it is documented as such in
- * `src/config/preflight.ts`: the admin-ui applies its OWN, stricter gates at
- * boot (`src/admin-ui/lib/auth-gating.ts`) — `NEXTAUTH_SECRET` >= 32 chars
- * where the contract asks `min(8)`, `OIDC_CLIENT_SECRET` >= 16 chars where the
+ * contract nor the preflight sees, and #572 says so itself: the admin-ui
+ * applies its OWN, stricter gates at boot
+ * (`src/admin-ui/lib/auth-gating.ts`) — `NEXTAUTH_SECRET` >= 32 chars where
+ * the contract asks `min(8)`, `OIDC_CLIENT_SECRET` >= 16 chars where the
  * contract only asks for presence. A green contract is not a promise that the
  * console boots.
  */

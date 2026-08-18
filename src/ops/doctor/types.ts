@@ -12,11 +12,11 @@
  * short version, because getting it wrong is how a check ends up in the wrong
  * place:
  *
- *   - **`config preflight`** (#572) — reads `compose.prod.yml` + the `.env.*`
- *     files BEFORE `docker compose up` and validates each service's effective
- *     environment against the subset of the contract its loader owns. Pure:
- *     opens no socket. A syntactically valid `BACKUP_S3_BUCKET` pointing at a
- *     bucket that does not exist PASSES there.
+ *   - **`config preflight`** (#572, in flight) — reads `compose.prod.yml` +
+ *     the `.env.*` files BEFORE `docker compose up` and validates each
+ *     service's effective environment against the subset of the contract its
+ *     loader owns. Pure: opens no socket. A syntactically valid
+ *     `BACKUP_S3_BUCKET` pointing at a bucket that does not exist PASSES there.
  *   - **`maia doctor`** (this) — runs INSIDE the deployed container, against
  *     the environment that actually materialised, and OPENS CONNECTIONS.
  *     Liveness, versions, server-side policy, schema state. Read-only.
