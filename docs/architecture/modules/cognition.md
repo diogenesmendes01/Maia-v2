@@ -8,7 +8,7 @@
 
 | File | Role |
 |---|---|
-| `src/cognition/runner.ts` | `runCognitiveModule()` — universal timeout/fallback/audit wrapper |
+| `src/cognition/runner.ts` | `runCognitiveModule()` — universal timeout/**cancellation**/fallback/audit wrapper (see [Cancellation contract](#cancellation-contract-issue-507)) |
 | `src/cognition/reflector.ts` | Generates reflection candidates per trigger |
 | `src/cognition/classifier.ts` | Routes candidates to typed destination |
 | `src/cognition/persister.ts` | Persists classified outputs |
@@ -61,6 +61,33 @@
 | `src/cognitive-graph/` | Wraps cognitive modules as graph nodes via `runner.ts` |
 | `src/agent/` | `reflection.ts` triggers reflector; agent core invokes via graph |
 | `src/skills/` | Skill modes call step-evaluator |
+
+## Cancellation contract (issue #507)
+
+`runCognitiveModule` accepts an optional `signal` and hands the `fn` a
+**composed** signal (caller cancellation + the module's own timeout). The `fn`
+is what actually cancels: it must forward that signal to the underlying
+operation (the LLM gateway's `signal` parameter). A `Promise.race` alone only
+decides who answers the caller — the work keeps running and keeps being billed.
+
+Four things follow from that, and they are the contract:
+
+| Rule | Why |
+|---|---|
+| `status: 'cancelled'` is its own outcome, distinct from `timeout` and `error` | `timeout` is "our operation took too long"; `cancelled` is "authority over the turn changed hands". Collapsing them erases the split between budget spent on slowness and budget lost to takeover/shutdown. |
+| `fallback_triggered` stays **false** on `cancelled`, and the fallback is never synthesized | Cancellation is not product degradation. Marking fallback here poisons the metric that measures how much worse an answer the user got. |
+| A `fn` that resolves **after** the signal aborted has its output **discarded** (`metadata.cancel_cause = 'late_result_discarded'`) | A non-cooperative dependency still returns. The row used to say `success` for a turn that was no longer ours. The work was paid for either way; what must not happen is it becoming an answer, a mutation, or an audited success. |
+| `signal` is **opt-in** | ~30 call sites run outside a claimed turn (batch workers, drift, KSM). Passing no signal keeps the previous behaviour byte-for-byte. |
+
+Who passes it today: `src/agent/react-loop.ts` (reasoner) and
+`src/agent/pending-gate.ts`, both from `getTurnExecutionContext()?.signal` —
+the lease signal of issue #504. In the ReAct loop a `cancelled` reasoner is
+translated into `TurnOwnershipLostError('react_reasoner')`, because letting it
+fall through to `reasoner_failed` would make `core.ts` schedule a **retry** of a
+turn another worker already owns.
+
+Storage: `cognitive_module_log.status` admits `cancelled` since migration
+`117_cognitive_module_log_cancelled.sql`.
 
 ## Tests
 
