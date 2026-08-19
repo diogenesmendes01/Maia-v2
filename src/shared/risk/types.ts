@@ -143,8 +143,8 @@ export type LLMGate = (input: {
    *
    * Este gate é a ÚNICA chamada de LLM do caminho do Decision Engine que ainda
    * não recebia sinal: `engine.run` já compõe o seu e o repassa a
-   * `riskScorer.score(..., { signal })`, mas a cadeia parava aqui e o Haiku
-   * seguia pago depois de a lease do turno cair.
+   * `riskScorer.score(..., { signal })`, mas a cadeia parava aqui e a chamada
+   * seguia paga depois de a lease do turno cair.
    *
    * Opcional porque o outro consumidor (`scoreKnowledgeRisk`, no control-plane)
    * não roda dentro de um turno reivindicado.

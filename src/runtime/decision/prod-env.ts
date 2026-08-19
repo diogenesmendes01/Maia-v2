@@ -899,8 +899,8 @@ export class RiskScorerProdAdapter implements RiskScorer {
     };
 
     // Issue #507 (achado 2) — o sinal do turno segue até o `callLLM` do gate
-    // Haiku. Antes ele parava aqui: o parâmetro existia, chamava-se `_options`
-    // e nunca era lido.
+    // de risco. Antes ele parava aqui: o parâmetro existia, chamava-se
+    // `_options` e nunca era lido.
     const scored = await scoreTurn(signals, options?.signal ? { signal: options.signal } : {});
 
     // Map P9c 4-level ScoredRisk → DE 3-level risk_profile.
