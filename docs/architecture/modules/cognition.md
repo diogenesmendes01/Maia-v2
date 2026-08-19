@@ -70,21 +70,48 @@ is what actually cancels: it must forward that signal to the underlying
 operation (the LLM gateway's `signal` parameter). A `Promise.race` alone only
 decides who answers the caller — the work keeps running and keeps being billed.
 
-Four things follow from that, and they are the contract:
+Five things follow from that, and they are the contract:
 
 | Rule | Why |
 |---|---|
 | `status: 'cancelled'` is its own outcome, distinct from `timeout` and `error` | `timeout` is "our operation took too long"; `cancelled` is "authority over the turn changed hands". Collapsing them erases the split between budget spent on slowness and budget lost to takeover/shutdown. |
 | `fallback_triggered` stays **false** on `cancelled`, and the fallback is never synthesized | Cancellation is not product degradation. Marking fallback here poisons the metric that measures how much worse an answer the user got. |
 | A `fn` that resolves **after** the signal aborted has its output **discarded** (`metadata.cancel_cause = 'late_result_discarded'`) | A non-cooperative dependency still returns. The row used to say `success` for a turn that was no longer ours. The work was paid for either way; what must not happen is it becoming an answer, a mutation, or an audited success. |
+| A caller signal that is **already aborted** on entry means the `fn` is **never invoked** (`metadata.cancel_cause = 'caller_already_aborted'`) | The contract is generic: a `fn` that ignores its signal would hold the caller for the whole 5 s/30 s budget, and a `fn` with a synchronous effect would have produced it before the first `await`. With the signal now flowing through the cognitive graph, this is the normal case for the second node of a parallel layer. |
 | `signal` is **opt-in** | ~30 call sites run outside a claimed turn (batch workers, drift, KSM). Passing no signal keeps the previous behaviour byte-for-byte. |
 
-Who passes it today: `src/agent/react-loop.ts` (reasoner) and
-`src/agent/pending-gate.ts`, both from `getTurnExecutionContext()?.signal` —
-the lease signal of issue #504. In the ReAct loop a `cancelled` reasoner is
-translated into `TurnOwnershipLostError('react_reasoner')`, because letting it
-fall through to `reasoner_failed` would make `core.ts` schedule a **retry** of a
-turn another worker already owns.
+Who passes it today, all from `getTurnExecutionContext()?.signal` (the lease
+signal of issue #504):
+
+| Call site | Path to `callLLM` |
+|---|---|
+| `src/agent/react-loop.ts` | reasoner, direct |
+| `src/agent/pending-gate.ts` | classifier, direct |
+| `src/agent/core.ts` → `PreturnContext.signal` | `runNodes` → `runOne` → `runCognitiveModule` → `n.run(ctx, signal)` → `selectProcedure` / `selectRole` |
+| `src/runtime/decision/integration.ts` | `engine.run({ base, signal })` → ports (`intent_classifier`) and `riskScorer.score` → `scoreTurn` → `haikuRiskGate` |
+
+In the ReAct loop a `cancelled` reasoner is translated into
+`TurnOwnershipLostError('react_reasoner')`, because letting it fall through to
+`reasoner_failed` would make `core.ts` schedule a **retry** of a turn another
+worker already owns.
+
+**Propagating the signal is not by itself the protection.** A cancelled module
+returns `output: null`, and `null` is also what a timeout returns — the caller
+cannot tell them apart, and "no output" does not stop the code that comes after
+it from writing. What stops the turn is an ownership guard at each boundary,
+immediately after the await and **before** the result is consumed:
+`assertTurnOwnership('preturn_graph')` after `runNodes`,
+`assertTurnOwnership('decision_engine')` inside `runDecisionEngineForTurn`, and
+the `{ kind: 'cancelled' }` outcome of the pending gate. The signal saves the
+money; the guard saves the state.
+
+Metric: `maia_cognitive_module_cancelled_total`, emitted through
+`src/observability/metrics.ts::counter` (never `lib/metrics.ts` directly) so it
+carries `tenant_id`/`agent_id` and passes the label guard. Dimensions are the
+already-sanctioned `workload` (module name) and `reason` (the cancel cause) —
+the bound on cardinality is the sanitizer's per-(metric, key) budget, not the
+type, because `procedure-selector.${def.nome}` derives the module name from
+tenant data.
 
 Storage: `cognitive_module_log.status` admits `cancelled` since migration
 `117_cognitive_module_log_cancelled.sql`.
@@ -94,6 +121,9 @@ Storage: `cognitive_module_log.status` admits `cancelled` since migration
 | Test path | What it covers |
 |---|---|
 | `tests/unit/cognition/` | Per-module contracts |
+| `tests/unit/cognition-runner.spec.ts` | The cancellation contract above, including the "already-aborted caller never invokes `fn`" rule and the metric's tenant attribution / cardinality bound |
+| `tests/integration/turn-lease-lost-reasoner-real-db.spec.ts` | Lease lost during the ReAct reasoner, real DB |
+| `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | Lease lost at the pending gate, the pre-turn graph and the Decision Engine — proves no later mutation or reply, through the real `runAgentForMensagem` |
 | `tests/unit/control-plane/knowledge-state-machine/` | KSM uses cognition outputs |
 
 ## In-flight changes

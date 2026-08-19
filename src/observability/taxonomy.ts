@@ -467,6 +467,25 @@ export const METRIC = {
   /** Idade do artefato restaurável mais novo — o RPO medido, em segundos. */
   BACKUP_AGE_SECONDS: 'maia_backup_age_seconds',
 
+  // --- cognição -------------------------------------------------------------
+  /**
+   * Issue #507 — uma execução de módulo cognitivo terminou CANCELADA: o turno
+   * perdeu a posse (lease) enquanto o módulo rodava, ou já a tinha perdido
+   * quando ele foi chamado.
+   *
+   * `workload` é o nome do módulo (`reasoner`, `pending-gate`,
+   * `role_selector_llm`, `procedure-selector.*`); `reason` é a `CancelCause` de
+   * `src/cognition/runner.ts` (`signal_aborted` | `late_result_discarded` |
+   * `caller_already_aborted`). Ambas as chaves já pertencem à allowlist e o
+   * budget por (métrica, chave) fecha a cardinalidade — necessário porque o
+   * nome do módulo do `procedure-selector` é derivado de dado de tenant.
+   *
+   * Não é uma série de ERRO: cancelamento é administrativo. Alertar sobre ela
+   * como se fosse falha de produto é o mesmo engano que `fallback_triggered`
+   * evita em `cognitive_module_log`.
+   */
+  COGNITIVE_MODULE_CANCELLED: 'maia_cognitive_module_cancelled_total',
+
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */
   TRACE_COVERAGE: 'maia_runtime_trace_coverage_total',

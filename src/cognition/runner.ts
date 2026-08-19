@@ -2,7 +2,7 @@ import type { RunModuleOptions, RunModuleResult } from './types.js';
 import { cognitiveModuleLogRepo } from '@/db/repositories.js';
 import { tryGetCurrentContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
-import { incCounter } from '@/lib/metrics.js';
+import { counter, METRIC } from '@/observability/metrics.js';
 
 /**
  * Motivo com que o runner aborta o sinal COMPOSTO quando o timeout local vence.
@@ -24,8 +24,16 @@ const TIMEOUT_ABORT_REASON = 'cognitive_module_timeout';
  *                               trabalho foi feito e pago; o que não pode
  *                               acontecer é o resultado ser usado ou auditado
  *                               como sucesso desta tentativa.
+ *   `caller_already_aborted`  — o sinal do caller JÁ estava abortado quando
+ *                               este módulo foi chamado. O `fn` NÃO é
+ *                               invocado: nada é pago, nada roda.
+ *                               Distinto de `signal_aborted` de propósito —
+ *                               ali a perda aconteceu DURANTE este módulo;
+ *                               aqui ela aconteceu ANTES dele, num boundary a
+ *                               montante, e o valor é o que revela onde a
+ *                               propagação começou.
  */
-type CancelCause = 'signal_aborted' | 'late_result_discarded';
+type CancelCause = 'signal_aborted' | 'late_result_discarded' | 'caller_already_aborted';
 
 /**
  * Compõe o sinal do caller com o timeout local do módulo.
@@ -107,70 +115,116 @@ export async function runCognitiveModule<TOut>(
    * `error`: a cooperação que acabamos de ganhar apagaria a causa.
    */
   let timedOut = false;
-  const composed = composeSignal(opts.signal);
-  try {
-    output = await Promise.race([
-      fn(composed.signal),
-      new Promise<TOut>((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          // Issue #507 — abortar ANTES de rejeitar. O race só escolhe quem
-          // responde ao caller; quem manda a operação subjacente parar é o
-          // abort. Na ordem inversa o caller sairia enquanto o trabalho seguia.
-          timedOut = true;
-          composed.abortForTimeout();
-          reject(new Error('timeout'));
-        }, timeoutMs);
-      }),
-    ]);
-    // Issue #507 — RESULTADO TARDIO. O `fn` resolveu, mas o caller já tinha
-    // cancelado. Auditar isto como `success` era a mentira que o dono apontou:
-    // uma row afirmando que um turno que já não era nosso deu certo. O output é
-    // DESCARTADO (não vira mutação nem resposta) e o desfecho é `cancelled`.
-    if (opts.signal?.aborted) {
-      output = null;
-      status = 'cancelled';
-      cancel_cause = 'late_result_discarded';
-    }
-  } catch (err) {
-    const e = err as Error;
-    error_message = e.message;
-    if (opts.signal?.aborted) {
-      // Cancelamento do caller vence o timeout: se o sinal já estava abortado,
-      // a causa REAL é o cancelamento, mesmo que o timer tenha disparado no
-      // mesmo tick. `fallback_triggered` fica false — ver RunModuleResult.
-      status = 'cancelled';
-      cancel_cause = 'signal_aborted';
-      output = null;
-    } else {
-      status = timedOut || e.message === 'timeout' ? 'timeout' : 'error';
-      fallback_triggered = true;
-      if (opts.fallback !== undefined) {
-        output = typeof opts.fallback === 'function'
-          ? (opts.fallback as () => TOut)()
-          : opts.fallback;
-      } else {
+  /**
+   * Issue #507 (achado 3 da revisão do dono) — PREFLIGHT: caller já abortado
+   * ⇒ o `fn` NEM É INVOCADO.
+   *
+   * Antes, `composeSignal` devolvia o sinal composto já abortado e mesmo assim
+   * `fn(composed.signal)` era avaliado. O gateway de LLM tem preflight próprio,
+   * então ReAct e pending-gate não abriam request ao provedor — mas o contrato
+   * deste runner é GENÉRICO: um `fn` que ignora o sinal ficava pendurado até o
+   * timeout inteiro (5 s / 30 s) prendendo o caller, e um `fn` com efeito
+   * SÍNCRONO antes do primeiro `await` já tinha produzido o efeito.
+   *
+   * Com a propagação do sinal pelo grafo cognitivo (achado 2) este caminho
+   * deixa de ser hipotético: o segundo node de uma camada paralela e cada volta
+   * do laço do `procedure-selector` chegam aqui com o sinal JÁ abortado.
+   *
+   * O desfecho auditado é o mesmo `cancelled`, com causa própria
+   * (`caller_already_aborted`) — ver `CancelCause`.
+   */
+  if (opts.signal?.aborted) {
+    output = null;
+    status = 'cancelled';
+    cancel_cause = 'caller_already_aborted';
+  } else {
+    const composed = composeSignal(opts.signal);
+    try {
+      output = await Promise.race([
+        fn(composed.signal),
+        new Promise<TOut>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            // Issue #507 — abortar ANTES de rejeitar. O race só escolhe quem
+            // responde ao caller; quem manda a operação subjacente parar é o
+            // abort. Na ordem inversa o caller sairia enquanto o trabalho seguia.
+            timedOut = true;
+            composed.abortForTimeout();
+            reject(new Error('timeout'));
+          }, timeoutMs);
+        }),
+      ]);
+      // Issue #507 — RESULTADO TARDIO. O `fn` resolveu, mas o caller já tinha
+      // cancelado. Auditar isto como `success` era a mentira que o dono apontou:
+      // uma row afirmando que um turno que já não era nosso deu certo. O output é
+      // DESCARTADO (não vira mutação nem resposta) e o desfecho é `cancelled`.
+      if (opts.signal?.aborted) {
         output = null;
+        status = 'cancelled';
+        cancel_cause = 'late_result_discarded';
       }
+    } catch (err) {
+      const e = err as Error;
+      error_message = e.message;
+      if (opts.signal?.aborted) {
+        // Cancelamento do caller vence o timeout: se o sinal já estava abortado,
+        // a causa REAL é o cancelamento, mesmo que o timer tenha disparado no
+        // mesmo tick. `fallback_triggered` fica false — ver RunModuleResult.
+        status = 'cancelled';
+        cancel_cause = 'signal_aborted';
+        output = null;
+      } else {
+        status = timedOut || e.message === 'timeout' ? 'timeout' : 'error';
+        fallback_triggered = true;
+        if (opts.fallback !== undefined) {
+          output = typeof opts.fallback === 'function'
+            ? (opts.fallback as () => TOut)()
+            : opts.fallback;
+        } else {
+          output = null;
+        }
+      }
+    } finally {
+      // Always clear the timeout — covers all exit paths:
+      //  - fn() resolved first (timeoutHandle still scheduled)
+      //  - fn() rejected first (timeoutHandle still scheduled)
+      //  - timeout fired first (clearTimeout on an already-fired handle is a no-op)
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      // Issue #507 — e SEMPRE soltar o listener do sinal do caller. Ele vive o
+      // turno inteiro; a chamada, não.
+      composed.dispose();
     }
-  } finally {
-    // Always clear the timeout — covers all exit paths:
-    //  - fn() resolved first (timeoutHandle still scheduled)
-    //  - fn() rejected first (timeoutHandle still scheduled)
-    //  - timeout fired first (clearTimeout on an already-fired handle is a no-op)
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-    // Issue #507 — e SEMPRE soltar o listener do sinal do caller. Ele vive o
-    // turno inteiro; a chamada, não.
-    composed.dispose();
   }
 
   const latency_ms = Date.now() - startTime;
 
   if (status === 'cancelled') {
-    // Cardinalidade fechada: `module` é nome de módulo (enum de fato, vindo do
-    // código) e `cause` é a união acima. Nada de turno, pessoa ou conteúdo.
-    incCounter('maia_cognitive_module_cancelled_total', {
-      module: opts.name,
-      cause: cancel_cause ?? 'signal_aborted',
+    /**
+     * Issue #507 (achado 4 da revisão do dono) — emitido pela camada
+     * SANCIONADA (`src/observability/metrics.ts`), não por `incCounter` direto.
+     *
+     * O que a chamada direta contornava:
+     *   1. ATRIBUIÇÃO. Sem `tenant_id` + `agent_id` a série não pode ser
+     *      apontada ao tenant do turno — e a invariante #1 do AGENTS.md exige
+     *      isso de todo limite com estado. `counter()` os anexa do ALS.
+     *   2. GUARDA de PII/cardinalidade. `module`/`cause` nem sequer estão na
+     *      allowlist (`ALLOWED_LABEL_KEYS`), então as duas dimensões seriam
+     *      emitidas cruas, sem passar pelo sanitizador.
+     *   3. CARDINALIDADE REALMENTE FECHADA. A alegação anterior ("`module` é
+     *      enum de fato") é FALSA: `RunModuleOptions.name` é `string` e o
+     *      `procedure-selector` deriva o nome do módulo do NOME DO PROCEDIMENTO
+     *      (`procedure-selector.${def.nome}` em
+     *      `src/cognition/procedure-selector.ts`), que é dado de tenant. O tipo
+     *      não fecha nada; quem fecha é o budget por (métrica, chave) do
+     *      sanitizador, que colapsa o excedente em `__overflow__` e o texto
+     *      livre em `__sanitized__`.
+     *
+     * Dimensões: as JÁ sancionadas `workload` (a unidade de trabalho cognitivo)
+     * e `reason` (a `CancelCause`). Nenhuma chave nova — mudar a taxonomia para
+     * acomodar esta série seria decisão de produto, não desta correção.
+     */
+    counter(METRIC.COGNITIVE_MODULE_CANCELLED, {
+      workload: opts.name,
+      reason: cancel_cause ?? 'signal_aborted',
     });
     logger.warn(
       {

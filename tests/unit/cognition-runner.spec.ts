@@ -160,6 +160,114 @@ describe('runCognitiveModule', () => {
   // desfecho é `cancelled`, o fallback NÃO dispara, o resultado tardio é
   // DESCARTADO e a row de auditoria diz a verdade.
   // -------------------------------------------------------------------------
+  /**
+   * Achado 4 da revisão do dono na PR #599 — a métrica de cancelamento tem de
+   * passar pela camada SANCIONADA.
+   *
+   * A emissão original chamava `src/lib/metrics.ts::incCounter` direto, com as
+   * chaves `module`/`cause`. Três consequências, e as três são testadas aqui:
+   *
+   *   1. a série não recebia `tenant_id`/`agent_id` — não dava para atribuir o
+   *      cancelamento ao tenant do turno (invariante #1 do AGENTS.md);
+   *   2. `module`/`cause` nem estão em `ALLOWED_LABEL_KEYS`, então nada passava
+   *      pelo guard de PII/forma;
+   *   3. a alegação de cardinalidade fechada era falsa: o `procedure-selector`
+   *      deriva o nome do módulo do NOME DO PROCEDIMENTO, que é dado de tenant.
+   */
+  describe('issue #507 achado 4 — a métrica de cancelamento é atribuída e limitada', () => {
+    async function emitirCancelamento(
+      name: string,
+      escopo: { tenant_id: string; agent_id: string },
+    ): Promise<void> {
+      const ac = new AbortController();
+      ac.abort('lease_lost');
+      await runWithTenantContext(escopo, async () => {
+        await runCognitiveModule(
+          { name, triggered_by: 'sync_required', audit: false, signal: ac.signal },
+          async () => 'x',
+        );
+      });
+    }
+
+    it('ATRIBUIÇÃO: a série carrega tenant_id + agent_id do turno', async () => {
+      const metrics = await import('@/lib/metrics.js');
+      const labels = await import('@/observability/labels.js');
+      metrics._resetForTests();
+      labels._resetLabelGuardForTests();
+
+      await emitirCancelamento('reasoner', {
+        tenant_id: 'tenant-507',
+        agent_id: 'agent-507',
+      });
+
+      const exposicao = await metrics.renderPrometheus();
+      const linha = exposicao
+        .split('\n')
+        .find((l) => l.startsWith('maia_cognitive_module_cancelled_total'));
+      expect(linha, 'a série de cancelamento tem de ser emitida').toBeDefined();
+      expect(linha).toContain('tenant_id="tenant-507"');
+      expect(linha).toContain('agent_id="agent-507"');
+      // As dimensões são as JÁ sancionadas — nenhuma chave nova na taxonomia.
+      expect(linha).toContain('workload="reasoner"');
+      expect(linha).toContain('reason="caller_already_aborted"');
+      // E as chaves antigas, que não estão na allowlist, não sobrevivem.
+      expect(linha).not.toContain('module=');
+      expect(linha).not.toContain('cause=');
+    });
+
+    it('FORMA: um nome de módulo derivado de dado de tenant vira __sanitized__', async () => {
+      const metrics = await import('@/lib/metrics.js');
+      const labels = await import('@/observability/labels.js');
+      metrics._resetForTests();
+      labels._resetLabelGuardForTests();
+
+      // Exatamente o que `src/cognition/procedure-selector.ts` monta:
+      // `procedure-selector.${def.nome}` — e `def.nome` é texto do tenant.
+      await emitirCancelamento('procedure-selector.Fechamento Mensal da Loja', {
+        tenant_id: 'tenant-507',
+        agent_id: 'agent-507',
+      });
+
+      const exposicao = await metrics.renderPrometheus();
+      const linha = exposicao
+        .split('\n')
+        .find((l) => l.startsWith('maia_cognitive_module_cancelled_total'));
+      expect(linha).toContain('workload="__sanitized__"');
+      expect(linha, 'texto livre do tenant não pode virar label').not.toContain('Fechamento');
+    });
+
+    it('OVERFLOW: o budget por (métrica, chave) fecha a cardinalidade', async () => {
+      const metrics = await import('@/lib/metrics.js');
+      const labels = await import('@/observability/labels.js');
+      const taxonomy = await import('@/observability/taxonomy.js');
+      metrics._resetForTests();
+      labels._resetLabelGuardForTests();
+
+      const budget =
+        taxonomy.LABEL_CARDINALITY_BUDGET['workload'] ??
+        taxonomy.DEFAULT_LABEL_CARDINALITY_BUDGET;
+      for (let i = 0; i <= budget + 1; i++) {
+        await emitirCancelamento(`procedure-selector.proc-${i}`, {
+          tenant_id: 'tenant-507',
+          agent_id: 'agent-507',
+        });
+      }
+
+      const exposicao = await metrics.renderPrometheus();
+      const linhas = exposicao
+        .split('\n')
+        .filter((l) => l.startsWith('maia_cognitive_module_cancelled_total'));
+      expect(
+        linhas.some((l) => l.includes(`workload="${taxonomy.CARDINALITY_OVERFLOW_VALUE}"`)),
+        'passado o budget, o excedente tem de colapsar no bucket de overflow',
+      ).toBe(true);
+      expect(
+        linhas.length,
+        'e o número de séries não pode crescer com o número de procedimentos',
+      ).toBeLessThanOrEqual(budget + 1);
+    });
+  });
+
   describe('issue #507 — signal, cancelamento e resultado tardio', () => {
     /** Rejeição que um `fn` cooperativo produz ao ver o sinal abortar. */
     function abortError(): Error {
@@ -243,28 +351,70 @@ describe('runCognitiveModule', () => {
       expect(fallbackFn, 'o fallback não pode ser sintetizado num cancelamento').not.toHaveBeenCalled();
     });
 
-    it('sinal JÁ abortado: nem chega a valer a pena esperar o fn', async () => {
+    /**
+     * Achado 3 da revisão do dono na PR #599.
+     *
+     * A versão anterior deste caso passava um `fn` que conferia
+     * `signal.aborted` e lançava — ou seja, provava que o `fn` RECEBIA o sinal
+     * abortado, não que ele deixava de ser CHAMADO. E era o contrário do que o
+     * runner precisava garantir: `composeSignal` devolvia o sinal já abortado e
+     * `fn(composed.signal)` era avaliado assim mesmo. O gateway de LLM tem
+     * preflight próprio, então ReAct e pending-gate não abriam request — mas o
+     * contrato deste runner é genérico, e um `fn` que ignora o sinal ficava
+     * pendurado até o timeout inteiro prendendo o caller.
+     *
+     * As duas asserções são as que o dono pediu: `fn` NÃO chamado, e latência
+     * sem avançar timer nenhum.
+     */
+    it('sinal JÁ abortado: o fn NEM É CHAMADO, e não se espera o timeout', async () => {
       const ac = new AbortController();
       ac.abort('lease_lost');
+      const fn = vi.fn(async () => 'nunca deveria ter rodado');
       await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        const t0 = Date.now();
         const result = await runCognitiveModule(
           {
             name: 'test.507.ja-abortado',
             triggered_by: 'sync_required',
+            // Timeout GRANDE de propósito: se o runner invocasse o `fn` e
+            // esperasse o race, um `fn` não cooperativo seguraria o caller por
+            // este tempo todo. A latência abaixo é o que denuncia isso.
+            timeoutMs: 30_000,
             fallback: 'fb',
             signal: ac.signal,
           },
-          async (signal) => {
-            // O sinal composto já nasce abortado — é assim que `callLLM`
-            // curto-circuita antes de pagar pela requisição.
-            expect(signal.aborted).toBe(true);
-            throw abortError();
-          },
+          fn,
         );
+        const decorrido = Date.now() - t0;
+
+        expect(fn, 'o fn não pode ser invocado com o caller já cancelado').not.toHaveBeenCalled();
+        expect(decorrido, 'nada pode esperar o timeout do módulo').toBeLessThan(1_000);
         expect(result.status).toBe('cancelled');
         expect(result.output).toBeNull();
         expect(result.fallback_triggered).toBe(false);
       });
+    });
+
+    it('sinal JÁ abortado: a causa auditada é caller_already_aborted', async () => {
+      const repo = await import('@/db/repositories.js');
+      vi.mocked(repo.cognitiveModuleLogRepo.record).mockClear();
+      const ac = new AbortController();
+      ac.abort('lease_lost');
+      await runWithTenantContext({ tenant_id: 'tX', agent_id: 'aX' }, async () => {
+        await runCognitiveModule(
+          { name: 'test.507.ja-abortado.causa', triggered_by: 'sync_required', signal: ac.signal },
+          async () => 'x',
+        );
+      });
+      const row = vi.mocked(repo.cognitiveModuleLogRepo.record).mock.calls[0]![0] as {
+        status: string;
+        metadata: Record<string, unknown>;
+      };
+      expect(row.status).toBe('cancelled');
+      // Distinta de `signal_aborted` de propósito: ali a perda aconteceu
+      // DURANTE este módulo; aqui ela veio de um boundary a montante, e é isso
+      // que a série de cancelamento precisa conseguir dizer.
+      expect(row.metadata).toEqual({ cancel_cause: 'caller_already_aborted' });
     });
 
     it('RESULTADO TARDIO: o fn resolve depois do abort → output descartado', async () => {
