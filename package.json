@@ -30,6 +30,7 @@
     "migrate:reserve": "tsx scripts/migrate-reserve.ts",
     "migrate:reservations:check": "tsx scripts/check-migration-reservations.ts",
     "smoke:migrate:image": "bash scripts/smoke-migrate-image.sh",
+    "probe:drizzle-kit": "tsx scripts/probe-drizzle-kit.ts",
     "backfill:turns": "tsx scripts/backfill-agent-turns.ts",
     "import:ofx": "tsx scripts/import-ofx.ts",
     "import:list": "tsx scripts/import-review.ts list",

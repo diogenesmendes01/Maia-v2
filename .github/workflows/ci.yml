@@ -541,3 +541,85 @@ jobs:
           docker run --rm -v "$PWD:/rules" -w /rules \
             --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
             test rules $files
+
+  # ---------------------------------------------------------------------
+  # Round-trip REAL do `drizzle-kit` (#574, achado da revisão do PR #594).
+  #
+  # Por que ele existe: até aqui NADA versionado executava o binário que a
+  # #574 troca de major. `tests/unit/drizzle-kit-esbuild-advisory.spec.ts`
+  # afere LOCKFILE (e diz isso de si mesmo), e o `smoke-migrate-image` roda
+  # `tsx scripts/migrate.ts` sobre os `.sql` já versionados — nenhum dos dois
+  # carrega o loader/gerador do drizzle-kit. Uma regressão do gerador neste
+  # major, ou num update que o Dependabot abra dentro de `^0.31`, passava por
+  # todos os checks.
+  #
+  # `scripts/probe-drizzle-kit.ts` fecha `generate → up → down` contra um
+  # banco CRIADO E DERRUBADO pela própria execução, e exige que os literais
+  # que só existem depois do alias `@/*` resolvido apareçam no SQL gerado —
+  # foi exatamente aí que o drizzle-kit 0.28 morria.
+  #
+  # Job NOVO e isolado, no mesmo padrão de `smoke-migrate-image` e
+  # `alert-rules`: sem matriz e sem compartilhar nada com os jobs acima. NÃO
+  # tem `continue-on-error` de propósito — um gate de schema que só avisa não
+  # é gate. Medido: ~6s depois do `npm ci` (generate + up + down).
+  # ---------------------------------------------------------------------
+  drizzle-kit-roundtrip:
+    name: round-trip do drizzle-kit (generate + up + down)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # Mesma imagem do job `integration`: o SQL gerado hoje não usa
+        # `vector`, mas o dia em que o schema ganhar uma coluna dessas o job
+        # não pode virar o único lugar que reprova por falta de extensão.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # A sonda NUNCA escreve neste banco: ela só lê host/usuário/senha desta
+      # URL e cria o seu próprio `drizzle_kit_probe_*` ao lado, derrubado no
+      # `finally`. `POSTGRES_USER` é superusuário na imagem oficial, então o
+      # `CREATE DATABASE` funciona sem grant extra.
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          # Uma perna só, no piso de `engines.node`: o objeto sob teste é o
+          # binário do drizzle-kit, não a compatibilidade de Node major — essa
+          # já é coberta pela matriz dos jobs `validate` e `integration`.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Mesmo motivo dos demais jobs: o lockfile é npm 11 e `npm ci` com npm
+        # 10 quebra. Tem de rodar ANTES do `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # Mesmo motivo dos jobs `validate`/`integration`: quem barra de fato é
+        # `devEngines.runtime`, e este passo existe para a MENSAGEM. Tem de
+        # rodar ANTES do `npm ci` — `tests/unit/scripts/check-node.spec.ts`
+        # varre TODOS os workflows e reprova qualquer `npm ci` sem ele.
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        # `npm ci` (e não `npm i`): a sonda existe para exercitar a versão que
+        # o LOCKFILE resolve, que é o artefato central da #574.
+        run: npm ci
+
+      - name: Round-trip do drizzle-kit contra Postgres descartável
+        run: npm run probe:drizzle-kit
