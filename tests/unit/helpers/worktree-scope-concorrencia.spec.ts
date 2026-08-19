@@ -40,7 +40,17 @@
  * `tests/integration/worktree-isolamento-canario.spec.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   criarRepoDeSonda,
@@ -118,7 +128,78 @@ function exigirIsolamento(respostas: readonly RespostaDaSonda[], roots: readonly
   }
 }
 
+/** Espera um arquivo aparecer, sem prender a thread do teste. */
+async function esperarArquivo(caminho: string, prazoMs = 60_000): Promise<void> {
+  const limite = Date.now() + prazoMs;
+  while (!existsSync(caminho)) {
+    if (Date.now() > limite) throw new Error(`nada apareceu em ${caminho} em ${prazoMs}ms`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
+  /* ─────────────────────────────────────────────────────────────────────────
+   * O GUARD da corrida — determinístico, não estatístico.
+   *
+   * O caso probabilístico mais abaixo joga uma dúzia de processos contra uma
+   * dúzia de slots abandonados e torce para o escalonador produzir o
+   * interleaving ruim. A taxa de detecção dele, medida, oscilou entre 9/10 e
+   * ~2/8 para a MESMA regressão na MESMA máquina, só variando a carga (os
+   * números estão no comentário dele). Isso é bom para achar variantes de
+   * tempo e péssimo como gate: um guard que depende de sorte deixa a regressão
+   * passar, e no CI o perfil de escalonamento é diferente de novo.
+   *
+   * Este caso não espera sorte. Ele CONSTRÓI o interleaving exato do achado,
+   * usando o ponto de injeção descrito em `pausarNaDecisaoDeReciclar`
+   * (`tests/helpers/worktree-scope.ts`):
+   *
+   *   1. a sonda LENTA observa o slot 1, conclui "abandonado" e PARA ali;
+   *   2. a sonda RÁPIDA observa o mesmo slot, recicla, reivindica e sai;
+   *   3. a LENTA é solta, ainda segurando a observação velha.
+   *
+   * Com a reciclagem da PR #597 (sem mutex, sem fencing), o passo 3 apaga a
+   * posse que a rápida acabou de criar e as duas terminam com o MESMO db.
+   * Com mutex + fencing, a lenta revalida sob lock, vê posse fresca e viva, e
+   * segue para o próximo índice.
+   * ───────────────────────────────────────────────────────────────────────── */
+  it(
+    'a decisão de reciclar é REVALIDADA: quem observou antes não apaga posse nova',
+    async () => {
+      const pausa = mkdtempSync(join(tmpdir(), 'wt571-pausa-'));
+      try {
+        // Um único slot ocupado e abandonado — é sobre ele que as duas sondas
+        // vão decidir a mesma coisa a partir da mesma observação.
+        semearSlot(1, join(repo.base, 'dono-que-sumiu'), 7 * 60 * 60 * 1000);
+        const lenta = repo.criarWorktree('wt-lenta');
+        const rapida = repo.criarWorktree('wt-rapida');
+
+        // 1. a lenta para exatamente na fronteira do defeito
+        const promessaLenta = rodarSondas([lenta], { TEST_WORKTREE_SCOPE_PAUSA: pausa });
+        await esperarArquivo(join(pausa, 'observou'));
+
+        // 2. a rápida faz o ciclo inteiro enquanto a outra está parada
+        const [respostaRapida] = await rodarSondas([rapida]);
+        expect(respostaRapida.escopo?.redisDb, 'a rápida devia ter reciclado o slot 1').toBe(1);
+        expect(readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim()).toBe(rapida);
+
+        // 3. a lenta é solta com a observação VELHA na mão
+        writeFileSync(join(pausa, 'seguir'), '');
+        const [respostaLenta] = await promessaLenta;
+
+        expect(
+          respostaLenta.escopo?.redisDb,
+          'a lenta apagou a posse recém-criada da rápida e ficou com o mesmo db',
+        ).not.toBe(respostaRapida.escopo?.redisDb);
+        // E o slot 1 continua nomeando quem realmente o ganhou.
+        expect(readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim()).toBe(rapida);
+        exigirIsolamento([respostaRapida, respostaLenta], [rapida, lenta]);
+      } finally {
+        rmSync(pausa, { recursive: true, force: true });
+      }
+    },
+    PRAZO,
+  );
+
   it(
     'slot livre: cada árvore sai com banco, ledger e db do Redis próprios',
     async () => {
@@ -148,6 +229,25 @@ describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
     PRAZO,
   );
 
+  /* ─────────────────────────────────────────────────────────────────────────
+   * Caso ESTATÍSTICO — supridor de variantes, NÃO o gate.
+   *
+   * Ele joga 12 processos contra 12 slots abandonados e depende do escalonador
+   * do sistema para produzir o interleaving ruim. Isso acha variantes de tempo
+   * que o caso determinístico acima não modela, e por isso ele fica. Mas a
+   * taxa de detecção dele NÃO é confiável, e o número é medido, não estimado:
+   *
+   *   defeito reintroduzido, 10 execuções desta máquina (4 vCPU) ...... 9/10
+   *   defeito reintroduzido, mesma máquina, sob outra carga ............ ~2/8
+   *   sem defeito, 10 execuções (falso vermelho) ....................... 0/10
+   *
+   * Duas medições da MESMA regressão no MESMO host deram 90% e ~25%. Essa
+   * dispersão é justamente o argumento: um gate cuja sensibilidade depende da
+   * carga da máquina não protege critério de aceite — no runner do CI o perfil
+   * é outro de novo, e ninguém sabe qual. Quem protege é o caso determinístico
+   * acima (10/10 contra as duas formulações do defeito). Este aqui é rede
+   * secundária, e custa ~6.3s dos ~11s do arquivo.
+   * ───────────────────────────────────────────────────────────────────────── */
   it(
     'slot stale disputado: N processos, N slots abandonados, N dbs distintos',
     async () => {

@@ -60,11 +60,12 @@ import {
   statSync,
   unlinkSync,
   utimesSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { comLockDeDiretorio } from './lock-de-diretorio.js';
+import { comLockDeDiretorio, dormirSync } from './lock-de-diretorio.js';
 
 /**
  * Valor de referência do banco de teste — o mesmo que o README manda exportar e
@@ -206,6 +207,9 @@ function acquireRedisDb(commonGitDir: string, root: string): number {
     // decide se vale a pena pagar o mutex. Quem decide de verdade é
     // `reciclarSlot`, que reobserva tudo lá dentro.
     if (!pareceReciclavel(file)) continue;
+    // A linha abaixo é o PONTO DO ACHADO: daqui em diante este processo age a
+    // partir de uma observação já feita. Ver `pausarNaDecisaoDeReciclar`.
+    pausarNaDecisaoDeReciclar();
     const r = comLockDeDiretorio(lock, () => reciclarSlot(file, root));
     if (r.ok && r.valor) return idx;
   }
@@ -248,6 +252,56 @@ function pareceReciclavel(file: string): boolean {
   } catch {
     // Sumiu entre o `claimSlot` e agora: livre, e vale tentar sob lock.
     return true;
+  }
+}
+
+/**
+ * Ponto de injeção que torna a corrida de reciclagem REPRODUZÍVEL — issue
+ * #571, segunda rodada de revisão da PR #597.
+ *
+ * ## Por que existe
+ *
+ * O guard da corrida era probabilístico: com o defeito reintroduzido ele
+ * reprovava em ~1 de 4 execuções (medido). Um teste que deixa a regressão
+ * passar em 75% das rodadas não protege critério de aceite nenhum — e no
+ * runner do CI, com escalonamento diferente, ninguém sabe se a taxa sobe ou
+ * despenca. A saída não é jogar mais processos no problema até dar sorte: é
+ * FORÇAR o interleaving exato que o achado descreve.
+ *
+ * ## O que ele marca
+ *
+ * A chamada fica numa linha semanticamente precisa: **logo depois de este
+ * processo ter observado o slot e concluído que é reciclável, e antes de agir
+ * sobre essa conclusão.** É exatamente a fronteira do defeito. Na versão
+ * correta a conclusão é PROVISÓRIA (`reciclarSlot` reobserva tudo sob mutex);
+ * na versão da PR #597 ela era FINAL — o `unlink` vinha direto dela. Parar
+ * aqui, portanto, não fabrica um cenário artificial: expõe a diferença entre
+ * as duas versões no único ponto onde ela existe.
+ *
+ * O teste usa isso assim: a sonda LENTA para aqui com a observação na mão, a
+ * sonda RÁPIDA recicla o slot inteiro e reivindica, e só então a lenta é
+ * solta. Com o mutex + fencing ela revalida e desiste; sem eles ela apaga a
+ * posse recém-criada da outra e as duas saem com o mesmo db.
+ *
+ * ## Custo quando ninguém está testando
+ *
+ * A variável é lida UMA vez, na carga do módulo. Fora do teste, a chamada é
+ * uma comparação com `null` num caminho que só roda quando um slot ocupado
+ * precisa ser reciclado — nunca no caminho comum (slot próprio ou slot livre).
+ * No CI o escopo é `null` e nada disto sequer é alcançado.
+ */
+const PAUSA_NA_RECICLAGEM = process.env.TEST_WORKTREE_SCOPE_PAUSA ?? null;
+let jaPausou = false;
+
+function pausarNaDecisaoDeReciclar(): void {
+  if (PAUSA_NA_RECICLAGEM === null || jaPausou) return;
+  // Uma vez só por processo: a pausa é para o slot DISPUTADO, e a sonda lenta
+  // ainda precisa seguir a varredura normalmente depois de ser solta.
+  jaPausou = true;
+  writeFileSync(join(PAUSA_NA_RECICLAGEM, 'observou'), String(process.pid));
+  const limite = Date.now() + 60_000;
+  while (!existsSync(join(PAUSA_NA_RECICLAGEM, 'seguir')) && Date.now() < limite) {
+    dormirSync(5);
   }
 }
 
