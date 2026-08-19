@@ -17,6 +17,29 @@
 import { errorClass } from '../runner.js';
 import { pass, skip, type DoctorCheck, type DoctorContext, type DoctorResult } from '../types.js';
 
+/**
+ * `--online` was asked for and there is no Postgres handle — a FAILURE, not a
+ * skip, and this is the whole point of the distinction.
+ *
+ * The runner already turns every networked check into `skip` when the run is
+ * offline, so reaching this branch means the operator DID ask for connected
+ * checks and the CLI could not build a pool: `DATABASE_URL` absent or empty.
+ * Reporting `skip` there is how `doctor --online --only postgres` used to skip
+ * all six Postgres checks and still exit 0 saying `PRONTO` — a green gate over
+ * a dependency it never opened.
+ */
+function noPostgresHandle(): DoctorResult {
+  return {
+    status: 'fail',
+    summary: 'nenhum handle de Postgres foi aberto: `--online` foi pedido e DATABASE_URL está ausente ou vazia',
+    evidence: { handle_open: false, requested_online: true },
+    remediation: [
+      'Defina DATABASE_URL no ambiente DESTE container e rode de novo com `--online`.',
+      'Isto não é um `skip`: a dependência selecionada não foi exercida, então o gate não pode sair verde.',
+    ],
+  };
+}
+
 /** Server floor. Postgres 16 is what `compose.prod.yml` and CI both run. */
 export const MINIMUM_PG_SERVER_VERSION_NUM = 160000;
 
@@ -31,9 +54,7 @@ export const connectivityCheck: DoctorCheck = {
   deadlineMs: 5_000,
   requiresNetwork: true,
   async run(ctx: DoctorContext): Promise<DoctorResult> {
-    if (!ctx.postgres) {
-      return skip('nenhum handle de Postgres foi aberto para esta execução');
-    }
+    if (!ctx.postgres) return noPostgresHandle();
     const started = performance.now();
     let rows: readonly { one: number }[];
     try {
@@ -85,7 +106,7 @@ export const readOnlySessionCheck: DoctorCheck = {
   requiresNetwork: true,
   dependsOn: ['postgres.connectivity'],
   async run(ctx: DoctorContext): Promise<DoctorResult> {
-    if (!ctx.postgres) return skip('nenhum handle de Postgres foi aberto para esta execução');
+    if (!ctx.postgres) return noPostgresHandle();
     // `current_setting`, not `SHOW`: `SHOW transaction_read_only` names its
     // column after the GUC, and aliasing is not allowed on `SHOW`.
     const rows = await ctx.postgres.query<{ read_only: string }>(
@@ -115,7 +136,7 @@ export const serverVersionCheck: DoctorCheck = {
   requiresNetwork: true,
   dependsOn: ['postgres.connectivity'],
   async run(ctx: DoctorContext): Promise<DoctorResult> {
-    if (!ctx.postgres) return skip('nenhum handle de Postgres foi aberto para esta execução');
+    if (!ctx.postgres) return noPostgresHandle();
     const rows = await ctx.postgres.query<{ num: string; version: string }>(
       "SELECT current_setting('server_version_num') AS num, current_setting('server_version') AS version",
     );
@@ -151,7 +172,7 @@ export const pgvectorCheck: DoctorCheck = {
   requiresNetwork: true,
   dependsOn: ['postgres.connectivity'],
   async run(ctx: DoctorContext): Promise<DoctorResult> {
-    if (!ctx.postgres) return skip('nenhum handle de Postgres foi aberto para esta execução');
+    if (!ctx.postgres) return noPostgresHandle();
     const installed = await ctx.postgres.query<{ extversion: string }>(
       "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
     );
@@ -189,11 +210,20 @@ export const schemaReadinessCheck: DoctorCheck = {
   deadlineMs: 10_000,
   requiresNetwork: true,
   dependsOn: ['postgres.connectivity'],
-  async run(ctx: DoctorContext): Promise<DoctorResult> {
+  async run(ctx: DoctorContext, signal: AbortSignal): Promise<DoctorResult> {
     if (!ctx.schemaReadiness) {
-      return skip('o veredito de schema não foi ligado a um pool nesta execução');
+      return {
+        status: 'fail',
+        summary:
+          'o veredito de schema não foi ligado a um pool: `--online` foi pedido e DATABASE_URL está ausente ou vazia',
+        evidence: { handle_open: false, requested_online: true },
+        remediation: [
+          'Defina DATABASE_URL no ambiente DESTE container e rode de novo com `--online`.',
+          'Isto não é um `skip`: o estado do schema não foi consultado, então o gate não pode sair verde.',
+        ],
+      };
     }
-    const verdict = await ctx.schemaReadiness();
+    const verdict = await ctx.schemaReadiness(signal);
     const evidence = {
       state: verdict.state,
       expected_head: verdict.expected_head ?? 'unknown',
@@ -227,7 +257,7 @@ export const clockDriftCheck: DoctorCheck = {
   requiresNetwork: true,
   dependsOn: ['postgres.connectivity'],
   async run(ctx: DoctorContext): Promise<DoctorResult> {
-    if (!ctx.postgres) return skip('nenhum handle de Postgres foi aberto para esta execução');
+    if (!ctx.postgres) return noPostgresHandle();
     // `clock_timestamp()`, not `now()`: `now()` is the TRANSACTION start time
     // and would fold our own round trip into the "drift".
     const before = Date.now();

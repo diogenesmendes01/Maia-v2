@@ -15,6 +15,7 @@ import {
   type DoctorReportMeta,
 } from '@/ops/doctor/report.js';
 import { REDACTED } from '@/config/redact.js';
+import { exitCodeFor, verdictFor } from '@/ops/doctor/runner.js';
 import type { DoctorRun } from '@/ops/doctor/runner.js';
 import type { DoctorCheckOutcome } from '@/ops/doctor/types.js';
 
@@ -35,6 +36,15 @@ const meta: DoctorReportMeta = {
   strict: false,
 };
 
+function summaryOf(checks: readonly DoctorCheckOutcome[]) {
+  return {
+    pass: checks.filter((c) => c.status === 'pass').length,
+    warn: checks.filter((c) => c.status === 'warn').length,
+    fail: checks.filter((c) => c.status === 'fail').length,
+    skip: checks.filter((c) => c.status === 'skip').length,
+  };
+}
+
 function outcome(over: Partial<DoctorCheckOutcome> = {}): DoctorCheckOutcome {
   return {
     id: 'x.y',
@@ -50,14 +60,9 @@ function outcome(over: Partial<DoctorCheckOutcome> = {}): DoctorCheckOutcome {
 
 function run(checks: DoctorCheckOutcome[], over: Partial<DoctorRun> = {}): DoctorRun {
   return {
-    ok: checks.every((c) => !(c.status === 'fail' && c.criticality === 'blocker')),
+    ok: verdictFor({ checks, summary: summaryOf(checks) }, false) === 'ready',
     checks,
-    summary: {
-      pass: checks.filter((c) => c.status === 'pass').length,
-      warn: checks.filter((c) => c.status === 'warn').length,
-      fail: checks.filter((c) => c.status === 'fail').length,
-      skip: checks.filter((c) => c.status === 'skip').length,
-    },
+    summary: summaryOf(checks),
     duration_ms: 11,
     timed_out: false,
     ...over,
@@ -126,8 +131,33 @@ describe('maia doctor · JSON contract', () => {
         'strict',
         'summary',
         'timed_out',
+        'verdict',
       ].sort(),
     );
+  });
+
+  it('carries the VERDICT, not just the boolean — `ok` cannot say "não respondido"', () => {
+    const unproven = run([
+      outcome({ id: 'postgres.connectivity', status: 'skip', summary: 'offline' }),
+    ]);
+    const parsed = JSON.parse(renderJson(unproven, meta, {})) as Record<string, unknown>;
+    expect(parsed.verdict).toBe('incomplete');
+    expect(parsed.ok).toBe(false);
+  });
+
+  it('the JSON verdict and the exit code are the SAME decision', () => {
+    for (const [checks, strict] of [
+      [[outcome({ status: 'warn' })], true],
+      [[outcome({ status: 'skip' })], false],
+      [[outcome({ status: 'fail' })], false],
+      [[outcome()], false],
+    ] as [DoctorCheckOutcome[], boolean][]) {
+      const r = run(checks);
+      const parsed = JSON.parse(renderJson(r, { ...meta, strict }, {})) as { verdict: string };
+      expect(parsed.verdict, JSON.stringify(checks)).toBe(
+        { 0: 'ready', 1: 'not_ready', 3: 'incomplete' }[exitCodeFor(r, strict)],
+      );
+    }
   });
 
   it('every check carries id, status, criticality, duration and remediation', () => {
@@ -142,11 +172,31 @@ describe('maia doctor · JSON contract', () => {
         'evidence',
         'id',
         'remediation',
+        'skip_kind',
         'status',
         'summary',
         'timed_out',
       ].sort(),
     );
+  });
+
+  it('`skip_kind` defaults to `unproven` and is null for anything that is not a skip', () => {
+    const parsed = JSON.parse(
+      renderJson(
+        run([
+          outcome({ id: 'a.pass' }),
+          outcome({ id: 'b.skip', status: 'skip', criticality: 'advisory' }),
+          outcome({ id: 'c.na', status: 'skip', skip_kind: 'not_applicable' }),
+        ]),
+        meta,
+        {},
+      ),
+    ) as { checks: { id: string; skip_kind: string | null }[] };
+    expect(parsed.checks.map((c) => [c.id, c.skip_kind])).toEqual([
+      ['a.pass', null],
+      ['b.skip', 'unproven'],
+      ['c.na', 'not_applicable'],
+    ]);
   });
 
   it('is deterministic for the same run and meta', () => {
@@ -182,5 +232,45 @@ describe('maia doctor · human format', () => {
     const r = run([outcome({ status: 'warn', summary: 'policy frouxa' })]);
     expect(renderHuman(r, meta, {})).toContain('PRONTO');
     expect(renderHuman(r, { ...meta, strict: true }, {})).toContain('NÃO PRONTO');
+  });
+
+  /**
+   * The regression this pins: `exitCodeFor` treated ANY advisory `fail` as
+   * blocking under `--strict`, while `renderHuman` only ever looked at
+   * `summary.warn`. `redis.persistence` is advisory and can `fail`, so the
+   * shell got 1 while the last line of the report still read `PRONTO`.
+   */
+  it('an ADVISORY fail under --strict: the text and the exit code agree', () => {
+    const r = run([
+      outcome({ id: 'redis.persistence', status: 'fail', criticality: 'advisory', summary: 'AOF quebrado' }),
+    ]);
+    expect(exitCodeFor(r, true)).toBe(1);
+    expect(renderHuman(r, { ...meta, strict: true }, {})).toContain('NÃO PRONTO');
+    expect(renderHuman(r, { ...meta, strict: true }, {})).not.toMatch(/^PRONTO$/m);
+
+    expect(exitCodeFor(r, false)).toBe(0);
+    expect(renderHuman(r, meta, {})).toMatch(/^PRONTO$/m);
+  });
+
+  it('a skipped BLOCKER is announced INCOMPLETO and names the checks nobody exercised', () => {
+    const r = run([
+      outcome({ id: 'postgres.connectivity', status: 'skip', summary: 'requer rede' }),
+      outcome({ id: 'redis.memory_pressure', status: 'skip', criticality: 'advisory' }),
+    ]);
+    const human = renderHuman(r, { ...meta, online: false }, {});
+    expect(human).toContain('INCOMPLETO');
+    expect(human).toContain('postgres.connectivity');
+    // The advisory skip is not the reason and must not be blamed.
+    expect(human).not.toContain('redis.memory_pressure —');
+    expect(human).not.toMatch(/^PRONTO$/m);
+    expect(exitCodeFor(r, false)).toBe(3);
+  });
+
+  it('a `not_applicable` skip on a blocker still reads PRONTO', () => {
+    const r = run([
+      outcome({ id: 'config.admin_boot_gates', status: 'skip', skip_kind: 'not_applicable' }),
+    ]);
+    expect(renderHuman(r, meta, {})).toMatch(/^PRONTO$/m);
+    expect(exitCodeFor(r, false)).toBe(0);
   });
 });

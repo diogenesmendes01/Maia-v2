@@ -5,13 +5,17 @@
 > com exit code estável. Não conserta nada.
 
 ```bash
-npm run doctor                              # offline: runtime + configuração
+npm run doctor                              # offline: runtime + configuração (sai 3, INCOMPLETO)
 npm run doctor -- --online                  # + liveness de Postgres e Redis
 npm run doctor -- --online --format json
 npm run doctor -- --online --strict         # warnings também saem 1
 npm run doctor -- --online --only postgres
 npm run doctor -- --help
 ```
+
+> **O modo offline nunca sai 0.** Ele não abre conexão, portanto não exerce
+> nenhum bloqueador de dependência, portanto não prova prontidão. O veredito é
+> `INCOMPLETO` com exit `3` — ver §3. Como gate, use `--online`.
 
 **Dentro da imagem de produção**, sem alteração de Dockerfile: a imagem já leva
 `scripts/`, `src/`, `tsconfig.json`, `migrations/` e `tsx` (que é dependência de
@@ -78,11 +82,13 @@ Ordem do relatório = ordem do registry: primeiro o que responde sem socket.
 | `redis.server_version` | advisory | sim | O servidor é Redis >= 7. |
 | `redis.maxmemory_policy` | blocker | sim | A política de eviction não permite despejo **cross-tenant**. |
 | `redis.memory_pressure` | advisory | sim | A memória usada está longe do cap. |
-| `redis.persistence` | advisory | sim | Há AOF ou RDB, e o último save não falhou. |
+| `redis.persistence` | advisory | sim | Há AOF **configurado**, ou uma regra `save` não vazia, e o último save não falhou. |
 
 ¹ `config.admin_boot_gates` degrada para `warn` no profile `development`, onde
 o console não aplica os gates. Ele retorna `skip` quando nenhuma variável do
-admin-ui está presente — "não há console aqui" não é um `pass`.
+admin-ui está presente — "não há console aqui" não é um `pass`. É o **único**
+`skip` marcado `not_applicable` no registry, e por isso o único que não leva a
+rodada a `INCOMPLETO` (§3).
 
 ### `config.admin_boot_gates` — o gate que o contrato não vê
 
@@ -112,6 +118,21 @@ segue [`redis.md` §4](redis.md):
 | `allkeys-*` | `fail` — vetor de despejo cross-tenant |
 | `noeviction` com `maxmemory=0` | `warn` — sem cap, `noeviction` nunca dispara e o Redis cresce até o OOM killer do host |
 
+### `redis.persistence` — configuração, não "o último save deu certo"
+
+`rdb_last_bgsave_status` é o resultado da última **tentativa** de snapshot, não
+a prova de que existe snapshot agendado. Uma instância com `save ""` reporta
+`ok` para sempre — não houve tentativa que falhasse. Por isso o check lê
+`CONFIG GET save` (já na allowlist read-only; `CONFIG SET` não está e não
+entra) e só considera RDB ligado quando existe **regra não vazia**:
+
+| AOF | `save` | Verdicto |
+|---|---|---|
+| ligado | — | `pass`, ou `fail` se `aof_last_write_status: err` |
+| desligado | vazio (`save ""`) | `warn` — não persiste nada; a fila BullMQ some no restart |
+| desligado | regra presente | `pass`, ou `fail` se `rdb_last_bgsave_status: err` |
+| desligado | parâmetro ausente na resposta | `skip` — sem permissão para responder, e isso não é um `pass` |
+
 ---
 
 ## 3. Saída e exit codes
@@ -136,32 +157,82 @@ run_id 5d0e6c1e-…
 NÃO PRONTO — há bloqueador
 ```
 
+Uma rodada incompleta nomeia **quais** bloqueadores ficaram sem resposta:
+
+```text
+0 pass · 0 warn · 0 fail · 6 skip — 1ms
+INCOMPLETO — 5 bloqueador(es) não foram exercidos: postgres.connectivity, …
+O modo offline não abre conexão alguma. Rode com `--online` para exercer a liveness das dependências.
+```
+
 Evidência de check que passou só aparece com `--verbose`.
 
 ### JSON (`--format json`)
 
-Contrato versionado em `schema_version` (hoje `1.0`), aditivo: um campo novo
+Contrato versionado em `schema_version` (hoje `1.1`), aditivo: um campo novo
 sobe o MINOR; renomear ou remover um existente sobe o MAJOR. Envelope:
 `run_id`, `started_at`, `profile`, `app_version`, `commit`, `online`, `strict`,
-`ok`, `timed_out`, `duration_ms`, `summary`, `checks[]`. Cada check traz `id`,
-`category`, `criticality`, `status`, `summary`, `duration_ms`, `timed_out`,
-`evidence`, `remediation`.
+`ok`, `verdict`, `timed_out`, `duration_ms`, `summary`, `checks[]`. Cada check
+traz `id`, `category`, `criticality`, `status`, `summary`, `skip_kind`,
+`duration_ms`, `timed_out`, `evidence`, `remediation`.
+
+`1.1` acrescentou `verdict` (`ready` | `incomplete` | `not_ready`) e
+`skip_kind` (`unproven` | `not_applicable` | `null`). `ok` continua existindo e
+continua booleano — o que mudou foi **quando** ele é `true`: uma rodada que
+pulou um bloqueador selecionado dizia `ok: true` e não diz mais. Isso é correção
+de defeito, não quebra de contrato. Prefira `verdict` a `ok`: só ele distingue
+"reprovou" de "não respondeu".
 
 O `run_id` é aleatório **por execução** e serve só para correlacionar o
 relatório humano com o JSON da mesma rodada. Não é identificador de nada
 persistido: o doctor não escreve auditoria.
 
-### Exit codes
+### Veredito e exit codes
 
-| Código | Significado |
+O veredito tem **três** valores e sai de **uma** função — `verdictFor()` em
+`src/ops/doctor/runner.ts`. O exit code e a última linha do relatório humano
+são duas renderizações dela, e é por isso que não podem discordar (já
+discordaram: com `--strict` o shell recebia `1` e o texto dizia `PRONTO`).
+
+| Veredito | Exit | Significado |
+|---|---|---|
+| `PRONTO` | `0` | Todo bloqueador **selecionado** foi exercido e passou. Warnings permitidos (com `--strict`, nenhum). |
+| `NÃO PRONTO` | `1` | Um bloqueador **reprovou** — ou, com `--strict`, existe warning/falha advisory. Provamos que não dá. |
+| `INCOMPLETO` | `3` | A rodada terminou, mas um bloqueador selecionado **não foi exercido**. Não provamos nada sobre ele. |
+| — | `2` | Uso inválido, ou o próprio doctor quebrou. **O gate não rodou.** |
+
+**Por que `INCOMPLETO` tem código próprio.** Nenhum dos vizinhos carrega esse
+significado com honestidade: `0` seria um verde sobre uma dependência que
+ninguém tocou (era exatamente o defeito — `--online --only postgres` sem
+`DATABASE_URL` pulava os seis checks e imprimia `PRONTO`), `1` afirmaria que
+encontramos um defeito quando encontramos um ponto cego, e `2` afirmaria que o
+doctor quebrou quando ele funcionou perfeitamente. Um pipeline que promove
+apenas com `code === 0` não precisa de mudança alguma e continua correto nos
+quatro casos.
+
+**O que leva a `INCOMPLETO`** — qualquer `skip` num check `blocker`:
+
+| Situação | Exemplo |
 |---|---|
-| `0` | Pronto. Warnings permitidos (com `--strict`, nenhum). |
-| `1` | Há pelo menos um **blocker** em `fail`. |
-| `2` | Uso inválido, ou o próprio doctor quebrou. |
+| modo offline | `npm run doctor` sem `--online` |
+| handle ausente com `--online` | ver abaixo: isto virou `fail`, não `skip` |
+| `--skip` de um bloqueador | `--skip postgres.connectivity` |
+| dependência não satisfeita | `postgres.pgvector` depois de `postgres.connectivity` pular |
+| o próprio check não conseguiu responder | `redis.maxmemory_policy` sem `maxmemory-policy` no `CONFIG GET` |
 
-`2` **nunca** significa "o ambiente está ruim". Um pipeline que usa o doctor
-como gate deve tratar `2` como *"o gate não rodou"* — nem aprovado, nem
-reprovado.
+**A única exceção**, e ela é sobre o AMBIENTE, não sobre o nosso alcance: um
+`skip` marcado `not_applicable`. Hoje existe um só —
+`config.admin_boot_gates` quando **nenhuma** variável do admin-ui está
+presente: não há console aqui, então não há gate de console por satisfazer.
+Está no tipo (`DoctorSkipKind` em `src/ops/doctor/types.ts`), o default é o
+estrito (`unproven`), e cada uso de `notApplicable()` é uma afirmação
+revisável.
+
+**`--online` sem DSN é `fail`, não `skip`.** Se o operador pediu liveness e a
+CLI não conseguiu abrir o pool (`DATABASE_URL`/`REDIS_URL` ausente ou vazia), o
+check de conectividade **reprova** — a pergunta foi feita e a resposta é "não
+dá para responder daqui". Offline continua sendo `skip`, porque ali a pergunta
+não foi feita.
 
 ---
 
@@ -180,6 +251,22 @@ um banco real e checa que a linha não apareceu.
 
 O próprio relatório carrega a prova: `postgres.read_only_session` imprime
 `transaction_read_only` a cada execução.
+
+**O caminho do schema tem a mesma costura.** `getSchemaReadiness()` (#516)
+precisa de um cliente e de várias consultas, o que o handle estreito não
+oferece — então ele passa por `withReadOnlySchemaTransaction()`
+(`src/ops/doctor/schema.ts`), que abre o MESMO `BEGIN READ ONLY`, aplica
+`SET LOCAL statement_timeout` **menor que o deadline do check** (4s contra 10s,
+e o caminho de leitura emite no máximo duas consultas), e devolve o cliente de
+qualquer jeito no fim. Antes disso esse adapter entregava um cliente cru: sem
+transação, sem timeout de statement, e uma leitura travada segurava o cliente
+até `pool.end()` — o comando estourava tanto o prazo do check quanto o total.
+Quando o deadline dispara, a conexão é **destruída** em vez de devolvida ao
+pool: devolver um cliente com consulta em voo é o que faz `pool.end()` esperar,
+e fechar o socket é também o que cancela o statement no servidor.
+`tests/integration/doctor-real-deps.spec.ts` empurra uma mutação por esse
+adapter (SQLSTATE `25006`) e trava uma leitura com `pg_sleep`, medindo que o
+processo termina dentro do orçamento.
 
 **Redis — allowlist fechada.** Redis não tem modo read-only por conexão, então
 a garantia é de código: `PING`, `INFO`, `DBSIZE`, `CONFIG GET`, e nada mais.
@@ -203,9 +290,10 @@ faturável de LLM.
 - **Dependência que não passou vira `skip`, não `fail`** — e só nos dependentes.
   Com o Postgres morto, os checks de Redis continuam rodando; é isso que impede
   uma indisponibilidade de apagar o resto do diagnóstico.
-- **`skip` nunca é sucesso.** Ele aparece em três situações e todas dizem o
-  motivo: modo offline com check de rede, dependência não satisfeita, e
-  `--skip` explícito (que ainda imprime `DESABILITADO`).
+- **`skip` nunca é sucesso** — e, num bloqueador, ele agora é ativamente
+  `INCOMPLETO` (§3). Aparece em quatro situações e todas dizem o motivo: modo
+  offline com check de rede, dependência não satisfeita, `--skip` explícito
+  (que ainda imprime `DESABILITADO`) e o check que não conseguiu obter o dado.
 - **A saída é determinística.** Checks rodam com concorrência limitada, mas o
   relatório sai sempre na ordem do registry.
 
@@ -239,7 +327,9 @@ razão a maioria dos `fail` de conectividade mostra `ECONNREFUSED` /
 | `schema_readiness` = `dirty` / `checksum_mismatch` | Exige reparo explícito e auditado | `migrate repair` — o doctor é read-only e nunca repara |
 | `redis.maxmemory_policy` reprova | Política `allkeys-*` | Troque para `noeviction`; ver [`redis.md`](redis.md) §4 |
 | `postgres.clock_drift` avisa | Relógios divergentes | Sincronize NTP: leases, dedup e expiração comparam timestamps entre processos |
+| `redis.persistence` avisa `save` vazio | Snapshotting DESLIGADO; `rdb_last_bgsave_status: ok` não contradiz isso | Ligue `--appendonly yes` (o pin de produção) ou configure uma regra `save`. Sem isso a fila BullMQ some no restart |
 | exit `2` | O gate não rodou | Leia a mensagem de uso; não interprete como ambiente ruim |
+| exit `3` | O gate rodou e **não provou** o que foi pedido | Veja a linha `INCOMPLETO`: ela nomeia os bloqueadores não exercidos. Rode com `--online`, ou pare de `--skip`ar um bloqueador |
 
 ---
 

@@ -1,7 +1,7 @@
 /**
  * `maia doctor` — the check contract (issue #517).
  *
- * PURE module: types plus two tiny helpers. No I/O, no imports from the
+ * PURE module: types plus three tiny helpers. No I/O, no imports from the
  * runtime graph, so a check author can read the whole contract in one screen.
  *
  * ───────────────────────────────────────────────────────────────────────────
@@ -43,6 +43,26 @@ import type { SchemaReadiness } from '@/migrations/types.js';
  */
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip';
 
+/**
+ * WHY a check ended in `skip` — and the whole reason the run can tell
+ * "não pronto" apart from "não respondido".
+ *
+ *   - `unproven` (the DEFAULT) — the question this check exists to answer was
+ *     NOT answered on this run. On a `blocker`, that alone makes the run
+ *     INCOMPLETO: a gate that never exercised the dependency has not earned
+ *     the right to say "pronto".
+ *   - `not_applicable` — there is no question to answer in THIS environment,
+ *     so nothing was left unproven. Narrow and review-worthy: it is the only
+ *     way a `skip` on a blocker stops short of INCOMPLETO, so it belongs to
+ *     checks whose subject genuinely does not exist here (no admin-ui
+ *     variables at all ⇒ no console to gate), never to "we could not reach
+ *     it".
+ *
+ * The default is the strict one on purpose. A check author who does not think
+ * about this gets the honest answer, not the convenient one.
+ */
+export type DoctorSkipKind = 'unproven' | 'not_applicable';
+
 /** Coarse grouping used for output ordering and for `--only`. */
 export type DoctorCategory = 'runtime' | 'config' | 'postgres' | 'redis';
 
@@ -66,6 +86,8 @@ export interface DoctorResult {
   readonly evidence?: DoctorEvidence;
   /** Concrete next steps. REQUIRED by the runner for every `fail`. */
   readonly remediation?: readonly string[];
+  /** Only meaningful on `skip`. Absent reads as `unproven`. */
+  readonly skip_kind?: DoctorSkipKind;
 }
 
 /** A result with the runner's bookkeeping attached. */
@@ -160,8 +182,14 @@ export interface DoctorContext {
    * `src/migrations/index.ts` says so in as many words: "a consumer must never
    * re-derive schema health by parsing runner logs, counting rows or hashing
    * files itself". The doctor is one of the two consumers named there.
+   *
+   * It takes the check's `AbortSignal` because this evaluation is the ONE
+   * check that borrows a pooled client for several statements: when the
+   * deadline fires, the binding has to let go of that client, or the CLI's
+   * `pool.end()` waits on a query nobody is reading any more. See
+   * `src/ops/doctor/schema.ts`.
    */
-  readonly schemaReadiness: (() => Promise<SchemaReadiness>) | null;
+  readonly schemaReadiness: ((signal?: AbortSignal) => Promise<SchemaReadiness>) | null;
 }
 
 export interface DoctorCheck {
@@ -190,6 +218,23 @@ export function pass(summary: string, evidence?: DoctorEvidence): DoctorResult {
   return evidence ? { status: 'pass', summary, evidence } : { status: 'pass', summary };
 }
 
+/**
+ * "This run did NOT answer the question." On a blocker it makes the run
+ * INCOMPLETO — see `DoctorSkipKind`.
+ */
 export function skip(summary: string, evidence?: DoctorEvidence): DoctorResult {
-  return evidence ? { status: 'skip', summary, evidence } : { status: 'skip', summary };
+  return evidence
+    ? { status: 'skip', summary, evidence, skip_kind: 'unproven' }
+    : { status: 'skip', summary, skip_kind: 'unproven' };
+}
+
+/**
+ * "There is no question to answer here." The ONLY skip that does not leave a
+ * blocker unproven, so every call site is a deliberate claim that the check's
+ * subject does not exist in this environment — not that we failed to reach it.
+ */
+export function notApplicable(summary: string, evidence?: DoctorEvidence): DoctorResult {
+  return evidence
+    ? { status: 'skip', summary, evidence, skip_kind: 'not_applicable' }
+    : { status: 'skip', summary, skip_kind: 'not_applicable' };
 }

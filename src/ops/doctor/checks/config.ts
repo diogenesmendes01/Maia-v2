@@ -37,7 +37,7 @@
  * console boots.
  */
 import { validateConfig } from '@/config/validate.js';
-import { pass, skip, type DoctorCheck, type DoctorContext, type DoctorResult } from '../types.js';
+import { notApplicable, pass, type DoctorCheck, type DoctorContext, type DoctorResult } from '../types.js';
 
 /**
  * The admin-ui's OWN boot floors, mirrored here.
@@ -162,9 +162,15 @@ export const adminBootGatesCheck: DoctorCheck = {
     // credentials provider covers it), and `NEXTAUTH_SECRET` is only read by
     // the console. With neither present there is nothing to assert — and `skip`
     // says that, instead of a `pass` that would read as "the console boots".
+    //
+    // This is the ONE `not_applicable` skip in the registry, and it earns the
+    // exemption: there is no console in this environment, so no console gate
+    // was left unproven. Every OTHER skip on a blocker makes the run
+    // INCOMPLETO (`DoctorSkipKind`) — including this same check if the
+    // variables were present and we failed to evaluate them.
     if (nextauth === '' && issuer === '') {
       return Promise.resolve(
-        skip('nenhuma variável do admin-ui presente neste ambiente — nada a afirmar sobre o console', {
+        notApplicable('nenhuma variável do admin-ui presente neste ambiente — nada a afirmar sobre o console', {
           nextauth_secret_present: false,
           oidc_issuer_present: false,
         }),

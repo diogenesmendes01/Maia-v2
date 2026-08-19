@@ -29,10 +29,30 @@
  *
  * ### Verdict
  *
- * `fail` on a `blocker` check ⇒ not ready. `fail` on an `advisory` check is
- * reported as-is but counted as a warning. `skip` never makes a run ready that
- * would otherwise not be, and never makes one unready either — it is the
- * honest "not answered" that the issue asks for instead of a false success.
+ * THREE outcomes, not two, and `verdictFor()` is the ONLY place any of them is
+ * decided — the exit code and the human line are two renderings of that one
+ * function, never two conditions that can drift apart:
+ *
+ *   - **`not_ready`** — a `blocker` FAILED. We proved the environment is not
+ *     fit. (`--strict` also lands here: it promotes any warning or advisory
+ *     failure to blocking, which is what the operator asked for.)
+ *   - **`incomplete`** — no blocker failed, but at least one SELECTED blocker
+ *     was never exercised: offline, `--skip`ped, dependency unmet, or its
+ *     handle absent. Nothing was disproved and nothing was proved. A run that
+ *     did not open a socket has not earned "pronto", so this is what an
+ *     offline run reports.
+ *   - **`ready`** — every selected blocker actually answered, and answered
+ *     well.
+ *
+ * `fail` on an `advisory` check is reported as-is and counted as a warning. A
+ * `skip` marked `not_applicable` (there is no console in this environment, so
+ * there are no console gates to satisfy) leaves nothing unproven and does not
+ * reach `incomplete`; every other `skip` does.
+ *
+ * Why `skip` can no longer be neutral: it used to be, and the result was that
+ * `doctor --online --only postgres` with no `DATABASE_URL` skipped all six
+ * Postgres checks and printed `PRONTO` with exit 0 — a green gate over a
+ * dependency it never touched.
  */
 import type {
   DoctorCheck,
@@ -51,6 +71,19 @@ export const DEFAULT_TOTAL_DEADLINE_MS = 30_000;
 /** How many checks may be in flight at once. */
 export const DEFAULT_CONCURRENCY = 4;
 
+/**
+ * The run's overall answer. See the "Verdict" section above; `verdictFor()` is
+ * the only function that produces one.
+ */
+export type DoctorVerdict = 'ready' | 'incomplete' | 'not_ready';
+
+/** The exit-code contract, as data. `2` belongs to the CLI, not to a verdict. */
+export const EXIT_CODE_BY_VERDICT: Readonly<Record<DoctorVerdict, 0 | 1 | 3>> = {
+  ready: 0,
+  incomplete: 3,
+  not_ready: 1,
+};
+
 export interface DoctorRunOptions {
   readonly totalDeadlineMs?: number;
   readonly concurrency?: number;
@@ -68,7 +101,11 @@ export interface DoctorRunSummary {
 }
 
 export interface DoctorRun {
-  /** `true` when no blocker failed. Warnings do not clear this flag. */
+  /**
+   * `true` ONLY when the run positively proved readiness: no blocker failed
+   * AND no blocker was left unproven. It is `verdictFor(run, false) ===
+   * 'ready'`, kept as a field because the JSON contract has always carried it.
+   */
   readonly ok: boolean;
   readonly checks: readonly DoctorCheckOutcome[];
   readonly summary: DoctorRunSummary;
@@ -305,10 +342,10 @@ export async function runDoctor(
     skip: results.filter((r) => r.status === 'skip').length,
   };
 
-  const blockerFailed = results.some((r) => r.status === 'fail' && r.criticality === 'blocker');
+  const partial = { checks: results, summary };
 
   return {
-    ok: !blockerFailed,
+    ok: verdictFor(partial, false) === 'ready',
     checks: results,
     summary,
     duration_ms: Math.round(now() - started),
@@ -317,12 +354,57 @@ export async function runDoctor(
 }
 
 /**
- * Exit code contract (issue §4). `2` is NOT produced here — it belongs to the
- * CLI and means "invalid usage or the doctor itself broke", which must never be
- * confused with "the environment is unhealthy".
+ * A blocker that was never exercised, so its question is still open.
+ *
+ * `not_applicable` is the single exemption and it is a claim about the
+ * ENVIRONMENT ("there is no console here"), never about our reach.
  */
-export function exitCodeFor(run: DoctorRun, strict: boolean): 0 | 1 {
-  if (!run.ok) return 1;
-  if (strict && (run.summary.warn > 0 || run.summary.fail > 0)) return 1;
-  return 0;
+function leftUnproven(outcome: DoctorCheckOutcome): boolean {
+  return (
+    outcome.status === 'skip' &&
+    outcome.criticality === 'blocker' &&
+    (outcome.skip_kind ?? 'unproven') !== 'not_applicable'
+  );
+}
+
+/**
+ * THE verdict. One function, two consumers (`exitCodeFor` and `renderHuman`),
+ * so the shell and the operator can never be told different things — the bug
+ * that used to let `--strict` exit 1 while the report still read `PRONTO`.
+ *
+ * Order is precedence, and it is deliberate: a proven failure outranks an
+ * unanswered question, and an unanswered question outranks a policy
+ * downgrade. Nothing below `ready` ever exits 0.
+ */
+export function verdictFor(
+  run: Pick<DoctorRun, 'checks' | 'summary'>,
+  strict: boolean,
+): DoctorVerdict {
+  if (run.checks.some((r) => r.status === 'fail' && r.criticality === 'blocker')) {
+    return 'not_ready';
+  }
+  if (run.checks.some(leftUnproven)) return 'incomplete';
+  if (strict && (run.summary.warn > 0 || run.summary.fail > 0)) return 'not_ready';
+  return 'ready';
+}
+
+/**
+ * Exit code contract (issue §4, extended for `incomplete`).
+ *
+ *   0  `ready`      — proved fit.
+ *   1  `not_ready`  — proved unfit (a blocker failed, or `--strict` and a
+ *                     warning exists).
+ *   3  `incomplete` — the gate ran but did not prove what it was asked to
+ *                     prove.
+ *
+ * `2` is NOT produced here — it belongs to the CLI and means "invalid usage or
+ * the doctor itself broke", i.e. the gate did not run at all. `incomplete`
+ * needs its own code precisely because it must not borrow either neighbour:
+ * `0` would say "pronto" about a dependency nobody touched, `2` would say the
+ * doctor broke when it worked perfectly, and `1` would say we found a defect
+ * when what we found was a blind spot. A pipeline that only branches on
+ * `code === 0` is unaffected and stays correct.
+ */
+export function exitCodeFor(run: DoctorRun, strict: boolean): 0 | 1 | 3 {
+  return EXIT_CODE_BY_VERDICT[verdictFor(run, strict)];
 }

@@ -31,7 +31,17 @@ export interface PgClientLike {
     sql: string,
     values?: readonly unknown[],
   ): Promise<PgQueryResult<R>>;
-  release(): void;
+  /**
+   * `release(true)` DESTROYS the connection instead of returning it to the
+   * pool — `pg`'s own signature (`release(err?: Error | boolean)`).
+   *
+   * The doctor needs it for exactly one case: a client abandoned mid-query
+   * when a deadline fired. Returning such a client to the pool would hand the
+   * next borrower a socket with an unread result on it, and `pool.end()` would
+   * wait on a query nobody is reading. Destroying it closes the socket, which
+   * is also what cancels the statement server-side.
+   */
+  release(destroy?: boolean): void;
 }
 
 export interface PgPoolLike {

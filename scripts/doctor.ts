@@ -16,19 +16,30 @@
  * ```
  *
  * ── Exit codes ──────────────────────────────────────────────────────────────
- *   0  pronto (warnings permitidos; com `--strict`, nenhum warning)
- *   1  há pelo menos um bloqueador
+ *   0  PRONTO — every selected blocker was exercised and answered well
+ *   1  NÃO PRONTO — a blocker failed (or `--strict` and something warned)
  *   2  uso inválido, ou o próprio doctor quebrou
+ *   3  INCOMPLETO — the gate ran but a selected BLOCKER was never exercised
  *
  * `2` never means "the environment is unhealthy" — a pipeline gating on the
  * doctor must treat it as "the gate did not run", not as a pass or a fail.
+ *
+ * `3` is the third answer, and it exists because the first two could not carry
+ * it honestly: an offline run, or `--online` without a `DATABASE_URL`, or
+ * `--skip postgres.connectivity`, proves NOTHING about the dependency it was
+ * pointed at. `0` there would be a green gate over an untouched dependency
+ * (the bug this contract replaces), `1` would claim we found a defect, and `2`
+ * would claim the doctor broke. A pipeline that promotes only on `code === 0`
+ * needs no change and is correct under all four.
  *
  * ── Why this file reads `process.env` directly ──────────────────────────────
  * Every other entry point loads its configuration through `loadServiceConfig`,
  * which THROWS on an invalid environment. The doctor must not: an invalid
  * environment is the thing it exists to REPORT. So it takes the raw snapshot,
  * hands it to `validateConfig()` inside `config.contract`, and uses the two
- * DSNs opportunistically — a missing one becomes a `skip`, never a crash.
+ * DSNs opportunistically — a missing one never crashes the command. Under
+ * `--online` it becomes a blocker FAILURE (the operator asked for liveness and
+ * we cannot deliver it); offline it is a `skip` that makes the run INCOMPLETO.
  *
  * ── What this command never does ────────────────────────────────────────────
  * No writes, anywhere. No `checkAll()` (which inserts a health row per
@@ -46,11 +57,11 @@ import pg from 'pg';
 import { MAIA_PROFILES, type MaiaProfile, type MaiaService } from '@/config/metadata.js';
 import { isMaiaProfile, resolveProfile } from '@/config/profiles.js';
 import { MAIA_SERVICES } from '@/config/metadata.js';
-import { getSchemaReadiness, type ReadOnlyPool } from '@/migrations/index.js';
 import {
   DOCTOR_CATEGORIES,
   DEFAULT_TOTAL_DEADLINE_MS,
   checksForCategories,
+  evaluateSchemaReadiness,
   exitCodeFor,
   isDoctorCategory,
   doctorPostgresPool,
@@ -87,8 +98,9 @@ function usage(): string {
     '  npm run doctor -- [opções]',
     '',
     'OPÇÕES',
-    '  --online                 abre conexões (Postgres, Redis). Sem isto, ZERO I/O de rede',
-    '                           e todo check conectado retorna `skip` — nunca um falso `pass`.',
+    '  --online                 abre conexões (Postgres, Redis). Sem isto, ZERO I/O de rede,',
+    '                           todo check conectado retorna `skip` e a rodada sai INCOMPLETO (3):',
+    '                           diagnóstico parcial nunca é aprovação.',
     `  --profile <p>            força o profile (${MAIA_PROFILES.join(' | ')}); default: resolvido do ambiente`,
     `  --service <s>            subset do contrato a validar (${MAIA_SERVICES.join(' | ')}); default: runtime`,
     '  --format <human|json>    formato de saída (ou use --json)',
@@ -97,13 +109,17 @@ function usage(): string {
     `  --timeout <ms>           orçamento TOTAL da execução (default ${DEFAULT_TOTAL_DEADLINE_MS})`,
     `  --only <cats>            só estas categorias, separadas por vírgula (${DOCTOR_CATEGORIES.join(',')})`,
     '  --skip <ids>             desabilita checks por ID, separados por vírgula. O relatório marca',
-    '                           cada um como SKIP com aviso visível — nunca sucesso silencioso.',
+    '                           cada um como SKIP com aviso visível — nunca sucesso silencioso. Pular',
+    '                           um BLOQUEADOR leva a rodada a INCOMPLETO (3), não a PRONTO.',
     '  --help                   esta ajuda',
     '',
     'EXIT CODES',
-    '  0  pronto (warnings permitidos; com --strict, nenhum warning)',
-    '  1  há pelo menos um bloqueador',
+    '  0  PRONTO — todo bloqueador selecionado foi exercido e passou',
+    '  1  NÃO PRONTO — há bloqueador em falha (ou, com --strict, algum aviso)',
     '  2  uso inválido, ou falha interna do doctor — o gate NÃO rodou',
+    '  3  INCOMPLETO — a rodada terminou, mas um bloqueador selecionado não foi',
+    '     exercido (offline, --skip, dependência não satisfeita, handle ausente).',
+    '     Não é aprovação: nada foi provado sobre aquela dependência.',
     '',
     'ESCOPO',
     '  O doctor é estritamente read-only: não escreve no Postgres (toda consulta roda',
@@ -250,25 +266,6 @@ async function readAppVersion(): Promise<string> {
   }
 }
 
-/**
- * Adapter from the doctor's own pool to the shape `getSchemaReadiness()` wants.
- * It borrows one pooled client per evaluation and releases it in `finally`.
- */
-function schemaReadinessPool(pool: pg.Pool): ReadOnlyPool {
-  return {
-    async connect() {
-      const client = await pool.connect();
-      return {
-        query: <R>(text: string, values?: unknown[]) =>
-          client.query(text, values as unknown[]) as unknown as Promise<{ rows: R[] }>,
-        release: () => {
-          client.release();
-        },
-      };
-    },
-  };
-}
-
 export async function main(argv: readonly string[]): Promise<number> {
   const args = parseArgs(argv);
   if (args.get('help') === true || args.get('h') === true) {
@@ -335,11 +332,17 @@ export async function main(argv: readonly string[]): Promise<number> {
       migrationsDir: MIGRATIONS_DIR,
       postgres: pool ? readOnlyPostgres(pool) : null,
       redis: redis ? readOnlyRedis(redis, { lastErrorClass: () => lastRedisErrorClass }) : null,
+      // Not a raw client: `evaluateSchemaReadiness` holds ONE pooled client
+      // inside `BEGIN READ ONLY` with a `SET LOCAL statement_timeout` below
+      // this check's deadline, and gives the client up on the deadline instead
+      // of letting `pool.end()` below wait on a blocked read. See
+      // `src/ops/doctor/schema.ts`.
       schemaReadiness: pool
-        ? () =>
-            getSchemaReadiness({
-              pool: schemaReadinessPool(pool as pg.Pool),
+        ? (signal?: AbortSignal) =>
+            evaluateSchemaReadiness({
+              pool: pool as pg.Pool,
               migrationsDir: MIGRATIONS_DIR,
+              ...(signal ? { signal } : {}),
             })
         : null,
     };

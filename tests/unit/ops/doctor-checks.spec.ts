@@ -23,7 +23,17 @@ import {
   adminBootGatesCheck,
   configContractCheck,
 } from '@/ops/doctor/checks/config.js';
-import { classifyEvictionPolicy, evictionPolicyCheck } from '@/ops/doctor/checks/redis.js';
+import {
+  classifyEvictionPolicy,
+  evictionPolicyCheck,
+  persistenceCheck,
+  rdbConfigured,
+  redisConnectivityCheck,
+} from '@/ops/doctor/checks/redis.js';
+import {
+  connectivityCheck as pgConnectivityCheck,
+  schemaReadinessCheck,
+} from '@/ops/doctor/checks/postgres.js';
 import {
   DOCTOR_REDIS_ALLOWED,
   RedisCommandNotAllowedError,
@@ -130,6 +140,10 @@ describe('maia doctor · config.admin_boot_gates', () => {
   it('SKIPS — never passes — when no admin-ui variable is present', async () => {
     const result = await adminBootGatesCheck.run(ctx(), never);
     expect(result.status).toBe('skip');
+    // "não há console aqui" is a statement about the ENVIRONMENT, so it leaves
+    // nothing unproven and does not make the run INCOMPLETO. It is the only
+    // check in the registry entitled to that.
+    expect(result.skip_kind).toBe('not_applicable');
   });
 
   it('catches the secret the CONTRACT accepts and the console rejects', async () => {
@@ -197,6 +211,63 @@ describe('maia doctor · config.contract', () => {
     const env = { DATABASE_URL: 'postgres://u:canario-canario@h:5432/d' };
     const result = await configContractCheck.run(ctx({ env }), never);
     expect(JSON.stringify(result)).not.toContain('canario-canario');
+  });
+});
+
+/**
+ * `--online` sem DSN é FALHA, não `skip`.
+ *
+ * O runner já transforma todo check de rede em `skip` no modo offline, então
+ * chegar ao corpo do check com o handle nulo significa que o operador PEDIU
+ * liveness e a CLI não conseguiu abrir o pool. Um `skip` aqui era o que fazia
+ * `doctor --online --only postgres` sem `DATABASE_URL` pular os seis checks e
+ * ainda imprimir `PRONTO` com exit 0.
+ */
+describe('maia doctor · handle ausente com --online', () => {
+  it('postgres.connectivity REPROVA e nomeia a variável, em vez de pular', async () => {
+    const result = await pgConnectivityCheck.run(ctx({ postgres: null }), never);
+    expect(result.status).toBe('fail');
+    expect(pgConnectivityCheck.criticality).toBe('blocker');
+    expect(result.summary).toContain('DATABASE_URL');
+    expect(result.evidence?.handle_open).toBe(false);
+    expect(result.remediation?.length).toBeGreaterThan(0);
+  });
+
+  it('redis.connectivity REPROVA e nomeia a variável, em vez de pular', async () => {
+    const result = await redisConnectivityCheck.run(ctx({ redis: null }), never);
+    expect(result.status).toBe('fail');
+    expect(redisConnectivityCheck.criticality).toBe('blocker');
+    expect(result.summary).toContain('REDIS_URL');
+  });
+
+  it('postgres.schema_readiness REPROVA quando o veredito não foi ligado a pool nenhum', async () => {
+    const result = await schemaReadinessCheck.run(ctx({ schemaReadiness: null }), never);
+    expect(result.status).toBe('fail');
+    expect(schemaReadinessCheck.criticality).toBe('blocker');
+  });
+
+  it('passa o SINAL do check para a avaliação de schema, que é quem segura o cliente', async () => {
+    let received: AbortSignal | undefined;
+    const signal = new AbortController().signal;
+    await schemaReadinessCheck.run(
+      ctx({
+        schemaReadiness: (s?: AbortSignal) => {
+          received = s;
+          return Promise.resolve({
+            ready: true,
+            state: 'ready',
+            expected_head: 'x',
+            applied_head: 'x',
+            pending_count: 0,
+            dirty_count: 0,
+            blockers: [],
+            reason: null,
+          } as unknown as Awaited<ReturnType<NonNullable<DoctorContext['schemaReadiness']>>>);
+        },
+      }),
+      signal,
+    );
+    expect(received).toBe(signal);
   });
 });
 
@@ -298,5 +369,112 @@ describe('maia doctor · redis read-only allowlist', () => {
   it('parses an INFO payload, dropping section headers', () => {
     const parsed = parseRedisInfo('# Memory\r\nused_memory:123\r\nmaxmemory:456\r\n\r\n');
     expect(parsed).toEqual({ used_memory: '123', maxmemory: '456' });
+  });
+});
+
+/**
+ * `redis.persistence` — "o último bgsave deu certo" NÃO é "RDB está ligado".
+ *
+ * `rdb_last_bgsave_status` reporta o resultado da última TENTATIVA de snapshot.
+ * Uma instância com `save ""` reporta `ok` para sempre, porque não houve
+ * tentativa que falhasse — e o check antigo lia isso como "RDB", certificando
+ * como persistente um Redis que não persiste nada. A configuração vem de
+ * `CONFIG GET save`, que já está na allowlist read-only (`CONFIG SET` não está,
+ * e não entra).
+ */
+describe('maia doctor · redis.persistence', () => {
+  function redisWith(info: string, conf: Record<string, string>): DoctorRedis {
+    return {
+      ping: () => Promise.resolve('PONG'),
+      info: () => Promise.resolve(info),
+      configGet: () => Promise.resolve(conf),
+      lastErrorClass: () => null,
+    };
+  }
+
+  it('lê a regra `save` como configuração, e a string vazia como DESLIGADO', () => {
+    expect(rdbConfigured('3600 1 300 100 60 10000')).toBe(true);
+    expect(rdbConfigured('')).toBe(false);
+    expect(rdbConfigured('   ')).toBe(false);
+    // Ausente ≠ vazio: o parâmetro não veio na resposta, então não há resposta.
+    expect(rdbConfigured(undefined)).toBeNull();
+  });
+
+  it('AOF off + `save ""` AVISA, mesmo com rdb_last_bgsave_status: ok', async () => {
+    const result = await persistenceCheck.run(
+      ctx({
+        redis: redisWith('aof_enabled:0\r\nrdb_last_bgsave_status:ok\r\n', { save: '' }),
+      }),
+      never,
+    );
+    expect(result.status).toBe('warn');
+    expect(result.summary).toContain('DESLIGADO');
+    expect(result.evidence?.rdb_enabled).toBe(false);
+    // A evidência preserva o campo que enganava, para o operador ver por quê.
+    expect(result.evidence?.rdb_last_bgsave_status).toBe('ok');
+    expect(result.remediation?.join(' ')).toContain('rdb_last_bgsave_status');
+  });
+
+  it('AOF off + regra `save` presente PASSA, e a regra aparece na evidência', async () => {
+    const result = await persistenceCheck.run(
+      ctx({
+        redis: redisWith('aof_enabled:0\r\nrdb_last_bgsave_status:ok\r\n', {
+          save: '3600 1 300 100',
+        }),
+      }),
+      never,
+    );
+    expect(result.status).toBe('pass');
+    expect(result.evidence?.rdb_save_rules).toBe('3600 1 300 100');
+  });
+
+  it('AOF off + regra presente + último bgsave `err` REPROVA', async () => {
+    const result = await persistenceCheck.run(
+      ctx({
+        redis: redisWith('aof_enabled:0\r\nrdb_last_bgsave_status:err\r\n', { save: '3600 1' }),
+      }),
+      never,
+    );
+    expect(result.status).toBe('fail');
+  });
+
+  it('AOF ligado PASSA sem consultar regra de RDB, e reprova se a última escrita falhou', async () => {
+    const okAof = await persistenceCheck.run(
+      ctx({
+        redis: redisWith('aof_enabled:1\r\naof_last_write_status:ok\r\n', { save: '' }),
+      }),
+      never,
+    );
+    expect(okAof.status).toBe('pass');
+
+    const brokenAof = await persistenceCheck.run(
+      ctx({
+        redis: redisWith('aof_enabled:1\r\naof_last_write_status:err\r\n', { save: '3600 1' }),
+      }),
+      never,
+    );
+    expect(brokenAof.status).toBe('fail');
+  });
+
+  it('sem AOF e sem o parâmetro `save` na resposta, PULA — não inventa um pass', async () => {
+    const result = await persistenceCheck.run(
+      ctx({ redis: redisWith('aof_enabled:0\r\nrdb_last_bgsave_status:ok\r\n', {}) }),
+      never,
+    );
+    expect(result.status).toBe('skip');
+  });
+
+  it('nunca pede CONFIG SET: a allowlist recusaria, e a recusa é a garantia', async () => {
+    const issued: string[] = [];
+    const handle = readOnlyRedis({
+      call: (command: string, ...args: string[]) => {
+        issued.push([command, ...args].join(' '));
+        if (command === 'CONFIG') return Promise.resolve(['save', '']);
+        return Promise.resolve('aof_enabled:0\r\nrdb_last_bgsave_status:ok\r\n');
+      },
+    });
+    await persistenceCheck.run(ctx({ redis: handle }), never);
+    expect(issued).toEqual(['INFO persistence', 'CONFIG GET save']);
+    expect(DOCTOR_REDIS_ALLOWED.has('CONFIG|SET')).toBe(false);
   });
 });

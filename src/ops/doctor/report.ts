@@ -22,8 +22,9 @@
  * pin the major, and a new field never renames or removes an existing one.
  */
 import { scrubSecrets } from '@/config/redact.js';
+import { verdictFor } from './runner.js';
 import type { DoctorCheckOutcome, DoctorStatus } from './types.js';
-import type { DoctorRun } from './runner.js';
+import type { DoctorRun, DoctorVerdict } from './runner.js';
 
 /**
  * Version of the JSON contract below.
@@ -31,8 +32,14 @@ import type { DoctorRun } from './runner.js';
  * Bump the MAJOR when an existing field changes meaning or disappears; bump
  * the MINOR when a field is added. `tests/unit/ops/doctor-report.spec.ts` pins
  * the shape so a change here cannot land silently.
+ *
+ * `1.1` added `verdict` to the envelope and `skip_kind` to each check. Both are
+ * additive: `ok` still exists and still means what it says on the tin, so a
+ * consumer pinned to `1.x` keeps parsing. It NARROWED when `ok` is true — a run
+ * that skipped a selected blocker used to report `ok: true`, and no longer
+ * does — which is a bug fix, not a contract change.
  */
-export const DOCTOR_SCHEMA_VERSION = '1.0';
+export const DOCTOR_SCHEMA_VERSION = '1.1';
 
 export interface DoctorReportMeta {
   /** Random per-run id, for correlating a human report with its JSON. */
@@ -120,13 +127,42 @@ export function renderHuman(
   if (safe.timed_out) {
     lines.push('ATENÇÃO: pelo menos um check estourou o deadline; o diagnóstico está incompleto.');
   }
-  const verdict = safe.ok
-    ? meta.strict && safe.summary.warn > 0
-      ? 'NÃO PRONTO (--strict: warnings contam como bloqueio)'
-      : 'PRONTO'
-    : 'NÃO PRONTO — há bloqueador';
-  lines.push(verdict);
+  // The SAME predicate the exit code comes from. Deriving the text from its
+  // own condition is how `--strict` once managed to exit 1 under a report that
+  // read `PRONTO`.
+  lines.push(...verdictLines(verdictFor(safe, meta.strict), safe, meta));
   return lines.join('\n');
+}
+
+/** The human rendering of a verdict — text only; the decision was made above. */
+function verdictLines(
+  verdict: DoctorVerdict,
+  safe: DoctorRun,
+  meta: DoctorReportMeta,
+): readonly string[] {
+  if (verdict === 'ready') return ['PRONTO'];
+  if (verdict === 'not_ready') {
+    const blocker = safe.checks.some((c) => c.status === 'fail' && c.criticality === 'blocker');
+    return [
+      blocker
+        ? 'NÃO PRONTO — há bloqueador'
+        : 'NÃO PRONTO (--strict: warnings e falhas advisory contam como bloqueio)',
+    ];
+  }
+  const unproven = safe.checks
+    .filter(
+      (c) =>
+        c.status === 'skip' &&
+        c.criticality === 'blocker' &&
+        (c.skip_kind ?? 'unproven') !== 'not_applicable',
+    )
+    .map((c) => c.id);
+  return [
+    `INCOMPLETO — ${unproven.length} bloqueador(es) não foram exercidos: ${unproven.join(', ')}`,
+    meta.online
+      ? 'Um bloqueador pulado não é um bloqueador satisfeito: esta execução não provou o que foi pedido.'
+      : 'O modo offline não abre conexão alguma. Rode com `--online` para exercer a liveness das dependências.',
+  ];
 }
 
 /** The versioned JSON contract. */
@@ -147,6 +183,7 @@ export function renderJson(
       online: meta.online,
       strict: meta.strict,
       ok: safe.ok,
+      verdict: verdictFor(safe, meta.strict),
       timed_out: safe.timed_out,
       duration_ms: safe.duration_ms,
       summary: safe.summary,
@@ -156,6 +193,7 @@ export function renderJson(
         criticality: c.criticality,
         status: c.status,
         summary: c.summary,
+        skip_kind: c.status === 'skip' ? (c.skip_kind ?? 'unproven') : null,
         duration_ms: c.duration_ms,
         timed_out: c.timed_out,
         evidence: c.evidence ?? null,

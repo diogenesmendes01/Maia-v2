@@ -34,6 +34,10 @@ import {
   readOnlyPostgres,
   READ_ONLY_SQLSTATE,
 } from '@/ops/doctor/postgres.js';
+import {
+  SchemaEvaluationAbortedError,
+  withReadOnlySchemaTransaction,
+} from '@/ops/doctor/schema.js';
 import { main } from '../../scripts/doctor.js';
 
 /**
@@ -176,19 +180,183 @@ d('maia doctor · dependências reais', () => {
       });
       const a = JSON.parse(first.out) as { schema_version: string; run_id: string; checks: unknown[] };
       const b = JSON.parse(second.out) as { run_id: string };
-      expect(a.schema_version).toBe('1.0');
+      expect(a.schema_version).toBe('1.1');
       expect(a.checks.length).toBeGreaterThan(0);
       expect(a.run_id).not.toBe(b.run_id);
     }, 30_000);
 
     it('o modo OFFLINE não abre conexão: todo check de rede vira skip', async () => {
-      const { out } = await runCli(['--only', 'postgres,redis'], {
+      const { code, out } = await runCli(['--only', 'postgres,redis'], {
         DATABASE_URL: DB_URL,
         REDIS_URL,
       });
       expect(out).toContain('[SKIP] postgres.connectivity');
       expect(out).toContain('[SKIP] redis.connectivity');
       expect(out).not.toContain('[PASS] postgres.connectivity');
+      // E o veredito DIZ isso: uma rodada que não abriu socket nenhum não pode
+      // sair 0 dizendo PRONTO sobre liveness que nunca exerceu.
+      expect(out).toContain('INCOMPLETO');
+      expect(out).not.toMatch(/^PRONTO$/m);
+      expect(code).toBe(3);
+    }, 30_000);
+  });
+
+  /**
+   * Os três buracos do mesmo formato, pelo `main()` REAL: em todos eles o
+   * doctor saía 0 imprimindo `PRONTO` sem ter tocado a dependência que o
+   * operador mandou verificar.
+   */
+  describe('bloqueador não exercido nunca é aprovação', () => {
+    it('(a) `--online` sem handle nenhum: os dois liveness REPROVAM e sai 1', async () => {
+      const { code, out } = await runCli(['--online', '--only', 'postgres,redis'], {
+        DATABASE_URL: undefined,
+        REDIS_URL: undefined,
+      });
+      expect(out).toContain('[FAIL] postgres.connectivity');
+      expect(out).toContain('[FAIL] redis.connectivity');
+      expect(out).toContain('DATABASE_URL');
+      expect(out).toContain('REDIS_URL');
+      expect(out).not.toContain('[SKIP] postgres.connectivity');
+      expect(out).not.toMatch(/^PRONTO$/m);
+      expect(code).toBe(1);
+    }, 30_000);
+
+    it('(b) `--online --only postgres` sem DATABASE_URL: REPROVA em vez de pular, e sai 1', async () => {
+      const { code, out } = await runCli(['--online', '--only', 'postgres'], {
+        DATABASE_URL: undefined,
+      });
+      expect(out).toContain('[FAIL] postgres.connectivity');
+      // Os dependentes pulam, e isso está certo: quem não passou foi a
+      // conectividade. O que NÃO pode é a rodada inteira sair verde.
+      expect(out).toContain('[SKIP] postgres.pgvector');
+      expect(out).not.toMatch(/^PRONTO$/m);
+      expect(code).toBe(1);
+    }, 30_000);
+
+    it('(c) `--skip postgres.connectivity` sai INCOMPLETO (3), não PRONTO (0)', async () => {
+      const { code, out } = await runCli(
+        ['--online', '--only', 'postgres', '--skip', 'postgres.connectivity'],
+        { DATABASE_URL: DB_URL, REDIS_URL },
+      );
+      expect(out).toContain('[SKIP] postgres.connectivity');
+      expect(out).toContain('DESABILITADO');
+      expect(out).toContain('INCOMPLETO');
+      expect(out).toContain('postgres.connectivity');
+      expect(out).not.toMatch(/^PRONTO$/m);
+      expect(code).toBe(3);
+    }, 30_000);
+
+    it('o 3 não invade o 2: uso inválido continua sendo "o gate não rodou"', async () => {
+      const { code } = await runCli(['--only', 'inexistente'], {});
+      expect(code).toBe(2);
+    });
+  });
+
+  /**
+   * O SEAM do veredito de schema, pelo adapter REAL.
+   *
+   * `getSchemaReadiness()` não recebe o handle estreito — recebe um pool. Até
+   * aqui esse caminho não tinha `BEGIN READ ONLY` nem `statement_timeout`, e o
+   * teste negativo de read-only injetava mutação só por `ctx.postgres`, então
+   * nada exercia esta costura. Estes casos empurram a mutação e a consulta
+   * travada POR ELA.
+   */
+  describe('schema readiness — read-only e deadline pelo adapter real', () => {
+    it('REJEITA uma mutação empurrada pelo pool do schema readiness (SQLSTATE 25006)', async () => {
+      const pool = doctorPostgresPool(DB_URL!);
+      try {
+        await expect(
+          withReadOnlySchemaTransaction(pool, async (roPool) => {
+            const client = await roPool.connect();
+            try {
+              return await client.query(`INSERT INTO ${SCHEMA}.probe (id) VALUES ('schema-seam')`);
+            } finally {
+              client.release();
+            }
+          }),
+        ).rejects.toMatchObject({ code: READ_ONLY_SQLSTATE });
+      } finally {
+        await pool.end();
+      }
+
+      const { rows } = await admin.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM ${SCHEMA}.probe WHERE id = 'schema-seam'`,
+      );
+      expect(rows[0]?.n).toBe('0');
+    }, 30_000);
+
+    it('a transação é READ ONLY no SERVIDOR, não por disciplina do chamador', async () => {
+      const pool = doctorPostgresPool(DB_URL!);
+      try {
+        const value = await withReadOnlySchemaTransaction(pool, async (roPool) => {
+          const client = await roPool.connect();
+          try {
+            const res = await client.query<{ ro: string }>(
+              "SELECT current_setting('transaction_read_only') AS ro",
+            );
+            return res.rows[0]?.ro;
+          } finally {
+            client.release();
+          }
+        });
+        expect(value).toBe('on');
+      } finally {
+        await pool.end();
+      }
+    }, 30_000);
+
+    it('uma leitura TRAVADA morre no statement_timeout e o pool fecha dentro do orçamento', async () => {
+      const pool = doctorPostgresPool(DB_URL!);
+      const started = Date.now();
+      try {
+        await expect(
+          withReadOnlySchemaTransaction(
+            pool,
+            async (roPool) => {
+              const client = await roPool.connect();
+              try {
+                return await client.query('SELECT pg_sleep(30)');
+              } finally {
+                client.release();
+              }
+            },
+            // Bem abaixo do deadline do check, como em produção (4s vs 10s).
+            { statementTimeoutMs: 400 },
+          ),
+          // 57014 = query_canceled: quem cortou foi o SERVIDOR, não nós.
+        ).rejects.toMatchObject({ code: '57014' });
+        await pool.end();
+      } finally {
+        await pool.end().catch(() => {
+          /* já fechado */
+        });
+      }
+      // O ponto do achado: o `pool.end()` da CLI não fica pendurado na leitura.
+      expect(Date.now() - started).toBeLessThan(5_000);
+    }, 30_000);
+
+    it('com o deadline estourado, o pool AINDA fecha rápido: o cliente é destruído, não devolvido', async () => {
+      const pool = doctorPostgresPool(DB_URL!);
+      const controller = new AbortController();
+      const started = Date.now();
+      const evaluation = withReadOnlySchemaTransaction(
+        pool,
+        async (roPool) => {
+          const client = await roPool.connect();
+          try {
+            // Sem statement_timeout curto de propósito: aqui quem tem de
+            // desatar o nó é o sinal, não o servidor.
+            return await client.query('SELECT pg_sleep(30)');
+          } finally {
+            client.release();
+          }
+        },
+        { signal: controller.signal, statementTimeoutMs: 25_000 },
+      );
+      setTimeout(() => controller.abort(), 200);
+      await expect(evaluation).rejects.toBeInstanceOf(SchemaEvaluationAbortedError);
+      await pool.end();
+      expect(Date.now() - started).toBeLessThan(5_000);
     }, 30_000);
   });
 

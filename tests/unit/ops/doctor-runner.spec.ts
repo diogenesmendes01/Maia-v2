@@ -10,6 +10,8 @@ import { describe, it, expect } from 'vitest';
 import {
   runDoctor,
   exitCodeFor,
+  verdictFor,
+  EXIT_CODE_BY_VERDICT,
   DEFAULT_TOTAL_DEADLINE_MS,
 } from '@/ops/doctor/runner.js';
 import type { DoctorCheck, DoctorContext, DoctorResult } from '@/ops/doctor/types.js';
@@ -138,6 +140,10 @@ describe('maia doctor · runner', () => {
     expect(run.checks[0]?.evidence?.requires_network).toBe(true);
     // The point of the criterion: a skip is not a pass.
     expect(run.summary.pass).toBe(0);
+    // …and, on a blocker, it is not neutral either: nothing was proved.
+    expect(run.ok).toBe(false);
+    expect(verdictFor(run, false)).toBe('incomplete');
+    expect(exitCodeFor(run, false)).toBe(3);
   });
 
   it('`--skip` marks the check SKIP with a visible warning, never silent success', async () => {
@@ -146,6 +152,8 @@ describe('maia doctor · runner', () => {
     expect(run.checks[0]?.status).toBe('skip');
     expect(run.checks[0]?.summary).toContain('DESABILITADO');
     expect(run.checks[0]?.evidence?.disabled).toBe(true);
+    // Disabling a BLOCKER cannot buy a green run.
+    expect(exitCodeFor(run, false)).toBe(3);
   });
 
   it('an ADVISORY failure does not block the verdict; a BLOCKER failure does', async () => {
@@ -168,6 +176,51 @@ describe('maia doctor · runner', () => {
     expect(run.ok).toBe(true);
     expect(exitCodeFor(run, false)).toBe(0);
     expect(exitCodeFor(run, true)).toBe(1);
+  });
+
+  describe('o veredito INCOMPLETO — um bloqueador não exercido não é aprovação', () => {
+    it('um BLOQUEADOR pulado impede `ok`, e sai 3 em vez de 0', async () => {
+      const skipped = check('a.blk', { status: 'skip', summary: 'não deu' });
+      const run = await runDoctor([skipped], ctx());
+      expect(run.ok).toBe(false);
+      expect(verdictFor(run, false)).toBe('incomplete');
+      expect(exitCodeFor(run, false)).toBe(3);
+    });
+
+    it('um ADVISORY pulado não muda nada: não havia bloqueio para provar', async () => {
+      const skipped = check('a.adv', { status: 'skip', summary: 'não aplicável' }, {
+        criticality: 'advisory',
+      });
+      const run = await runDoctor([skipped, check('b.ok', ok)], ctx());
+      expect(run.ok).toBe(true);
+      expect(exitCodeFor(run, false)).toBe(0);
+    });
+
+    it('`not_applicable` é a ÚNICA saída de um bloqueador pulado, e é sobre o ambiente', async () => {
+      const na = check('a.blk', {
+        status: 'skip',
+        summary: 'não há console aqui',
+        skip_kind: 'not_applicable',
+      });
+      const run = await runDoctor([na], ctx());
+      expect(verdictFor(run, false)).toBe('ready');
+      expect(exitCodeFor(run, false)).toBe(0);
+    });
+
+    it('um bloqueador REPROVADO ganha do INCOMPLETO: sai 1, não 3', async () => {
+      // A dependência morta faz os dependentes pularem; o veredito não pode
+      // trocar "provamos que está quebrado" por "não conseguimos olhar".
+      const dead = check('pg.connect', { status: 'fail', summary: 'down' });
+      const dependent = check('pg.version', ok, { dependsOn: ['pg.connect'] });
+      const run = await runDoctor([dead, dependent], ctx());
+      expect(verdictFor(run, false)).toBe('not_ready');
+      expect(exitCodeFor(run, false)).toBe(1);
+    });
+
+    it('o exit 2 continua fora deste mapa: ele é da CLI, não de um veredito', () => {
+      expect(Object.values(EXIT_CODE_BY_VERDICT)).not.toContain(2);
+      expect(EXIT_CODE_BY_VERDICT).toEqual({ ready: 0, incomplete: 3, not_ready: 1 });
+    });
   });
 
   it('the TOTAL deadline stops the run and the unreached checks say so', async () => {
