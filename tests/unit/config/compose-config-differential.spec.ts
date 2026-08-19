@@ -21,7 +21,16 @@
  *
  * QUANDO NÃO HÁ `docker compose` NA MÁQUINA o arquivo é PULADO, com o motivo no
  * nome do `describe` — pulado não é passou, e o resumo da suíte conta os dois
- * separadamente. No CI a variável `MAIA_REQUIRE_COMPOSE_DIFFERENTIAL=1` (job
+ * separadamente. No CI a variável `TEST_REQUIRE_COMPOSE_DIFFERENTIAL=1` (job
+ *
+ * O nome NÃO leva o prefixo `MAIA_` de propósito, e isso não é estilo: o
+ * contrato reprova toda chave `MAIA_*`/`FEATURE_*` não declarada
+ * (`src/config/validate.ts:248`, regra `contract/unknown`), e uma variável de
+ * job do CI chega a TODO processo de teste — inclusive aos que carregam
+ * `src/config/env.ts`. Com o prefixo, 498 testes morreram no CI com
+ * `Invalid configuration: 1 problema(s)`, e nenhum deles tinha relação com o
+ * diferencial. É a mesma armadilha que a issue #571 documenta no README.
+ * (job
  * `validate` em `.github/workflows/ci.yml`) transforma a ausência em FALHA, para
  * que o diferencial não deixe de rodar em silêncio justamente onde ele importa.
  */
@@ -39,9 +48,9 @@ function composeCliDisponivel(): boolean {
 
 const DISPONIVEL = composeCliDisponivel();
 
-if (!DISPONIVEL && process.env.MAIA_REQUIRE_COMPOSE_DIFFERENTIAL === '1') {
+if (!DISPONIVEL && process.env.TEST_REQUIRE_COMPOSE_DIFFERENTIAL === '1') {
   throw new Error(
-    'MAIA_REQUIRE_COMPOSE_DIFFERENTIAL=1 mas `docker compose version` falhou. ' +
+    'TEST_REQUIRE_COMPOSE_DIFFERENTIAL=1 mas `docker compose version` falhou. ' +
       'Este ambiente deveria ter o CLI do Compose — sem ele o diferencial não mede nada.',
   );
 }

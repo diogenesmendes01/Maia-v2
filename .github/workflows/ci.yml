@@ -83,7 +83,7 @@ jobs:
       # esta variável transforma a ausência em FALHA. `docker compose` vem
       # pré-instalado no runner `ubuntu-latest` e NÃO precisa de daemon (o
       # subcomando `config` só carrega e interpola o modelo do projeto).
-      MAIA_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
+      TEST_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
     steps:
       - uses: actions/checkout@v6
 
