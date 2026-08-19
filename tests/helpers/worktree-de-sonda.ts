@@ -207,6 +207,15 @@ if (encontro) {
   }
 }
 
+// Aviso de chegada — a coordenação do teste mora AQUI, no programa da sonda,
+// nunca dentro do código sob teste. Um hook no alocador só straddleia a
+// observação que ele por acaso precede; um aviso aqui prova que o processo
+// entrou no alocador, e é isso que o teste do mutex precisa saber para não
+// passar vazio. Escrito imediatamente antes da chamada: o que sobra entre este
+// write e a tentativa de reciclagem é um punhado de syscalls.
+const aviso = process.env.SONDA_AVISO;
+if (aviso) writeFileSync(join(aviso, 'cheguei'), String(process.pid));
+
 try {
   const escopo = resolveWorktreeScope();
   const ambiente = escopo === null ? null : resolveTestEnv(process.env, escopo);

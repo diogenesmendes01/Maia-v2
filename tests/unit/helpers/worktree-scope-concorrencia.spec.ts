@@ -22,11 +22,15 @@
  *
  *  1. slot livre — duas árvores, dois processos, dbs/bancos/URLs distintos;
  *  2. dono ausente — o slot de uma worktree que sumiu do disco é reciclado;
- *  3. slot stale DISPUTADO — todos os slots pré-semeados como abandonados e
- *     uma sonda por slot, todas soltas no mesmo instante. Com a reciclagem sem
- *     serialização, duas sondas saem com o mesmo `redisDb` (ou uma estoura por
- *     falta de slot). Com o mutex + fencing de geração, a saída é sempre uma
- *     permutação: um root por slot.
+ *  3. **serialização** — com o mutex de reciclagem tomado por outro, ninguém
+ *     recicla. É o GATE da corrida, é determinístico, e não depende de tempo:
+ *     qualquer reciclagem que não passe pelo mutex reprova. Ver o comentário
+ *     longo do caso, inclusive por que a primeira tentativa (um ponto de pausa
+ *     dentro do alocador) media menos do que prometia;
+ *  4. revalidação — um slot que deixou de estar abandonado é declinado;
+ *  5. slot stale DISPUTADO — todos os slots pré-semeados como abandonados e
+ *     uma sonda por slot, todas soltas no mesmo instante. Rede SECUNDÁRIA: a
+ *     taxa de detecção dele é instável (medida no comentário do caso).
  *
  * Todo caso afirma `escopo !== null`. **Cair no caminho `scope === null` é
  * falha**, não motivo para `return` — foi assim que os 8 checks verdes da PR
@@ -52,6 +56,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { caminhoDoLockDeReciclagem, reciclarSlot } from '../../helpers/worktree-scope.js';
 import {
   criarRepoDeSonda,
   rodarSondas,
@@ -138,67 +143,6 @@ async function esperarArquivo(caminho: string, prazoMs = 60_000): Promise<void> 
 }
 
 describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
-  /* ─────────────────────────────────────────────────────────────────────────
-   * O GUARD da corrida — determinístico, não estatístico.
-   *
-   * O caso probabilístico mais abaixo joga uma dúzia de processos contra uma
-   * dúzia de slots abandonados e torce para o escalonador produzir o
-   * interleaving ruim. A taxa de detecção dele, medida, oscilou entre 9/10 e
-   * ~2/8 para a MESMA regressão na MESMA máquina, só variando a carga (os
-   * números estão no comentário dele). Isso é bom para achar variantes de
-   * tempo e péssimo como gate: um guard que depende de sorte deixa a regressão
-   * passar, e no CI o perfil de escalonamento é diferente de novo.
-   *
-   * Este caso não espera sorte. Ele CONSTRÓI o interleaving exato do achado,
-   * usando o ponto de injeção descrito em `pausarNaDecisaoDeReciclar`
-   * (`tests/helpers/worktree-scope.ts`):
-   *
-   *   1. a sonda LENTA observa o slot 1, conclui "abandonado" e PARA ali;
-   *   2. a sonda RÁPIDA observa o mesmo slot, recicla, reivindica e sai;
-   *   3. a LENTA é solta, ainda segurando a observação velha.
-   *
-   * Com a reciclagem da PR #597 (sem mutex, sem fencing), o passo 3 apaga a
-   * posse que a rápida acabou de criar e as duas terminam com o MESMO db.
-   * Com mutex + fencing, a lenta revalida sob lock, vê posse fresca e viva, e
-   * segue para o próximo índice.
-   * ───────────────────────────────────────────────────────────────────────── */
-  it(
-    'a decisão de reciclar é REVALIDADA: quem observou antes não apaga posse nova',
-    async () => {
-      const pausa = mkdtempSync(join(tmpdir(), 'wt571-pausa-'));
-      try {
-        // Um único slot ocupado e abandonado — é sobre ele que as duas sondas
-        // vão decidir a mesma coisa a partir da mesma observação.
-        semearSlot(1, join(repo.base, 'dono-que-sumiu'), 7 * 60 * 60 * 1000);
-        const lenta = repo.criarWorktree('wt-lenta');
-        const rapida = repo.criarWorktree('wt-rapida');
-
-        // 1. a lenta para exatamente na fronteira do defeito
-        const promessaLenta = rodarSondas([lenta], { TEST_WORKTREE_SCOPE_PAUSA: pausa });
-        await esperarArquivo(join(pausa, 'observou'));
-
-        // 2. a rápida faz o ciclo inteiro enquanto a outra está parada
-        const [respostaRapida] = await rodarSondas([rapida]);
-        expect(respostaRapida.escopo?.redisDb, 'a rápida devia ter reciclado o slot 1').toBe(1);
-        expect(readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim()).toBe(rapida);
-
-        // 3. a lenta é solta com a observação VELHA na mão
-        writeFileSync(join(pausa, 'seguir'), '');
-        const [respostaLenta] = await promessaLenta;
-
-        expect(
-          respostaLenta.escopo?.redisDb,
-          'a lenta apagou a posse recém-criada da rápida e ficou com o mesmo db',
-        ).not.toBe(respostaRapida.escopo?.redisDb);
-        // E o slot 1 continua nomeando quem realmente o ganhou.
-        expect(readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim()).toBe(rapida);
-        exigirIsolamento([respostaRapida, respostaLenta], [rapida, lenta]);
-      } finally {
-        rmSync(pausa, { recursive: true, force: true });
-      }
-    },
-    PRAZO,
-  );
 
   it(
     'slot livre: cada árvore sai com banco, ledger e db do Redis próprios',
@@ -230,6 +174,124 @@ describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
   );
 
   /* ─────────────────────────────────────────────────────────────────────────
+   * O GUARD da corrida — determinístico, e sobre o CONTRATO, não sobre tempo.
+   *
+   * ## Por que a primeira tentativa não servia
+   *
+   * A versão anterior deste caso expunha um ponto de pausa DENTRO do alocador
+   * (`pausarNaDecisaoDeReciclar`) e o usava para parar uma sonda "entre a
+   * observação e o ato". Ele reprovava a formulação do defeito que eu tinha
+   * escrito — e passava, 0/12, contra o bloco LITERAL da PR #597. O motivo é
+   * estrutural, não de calibração: aquele bloco faz a PRÓPRIA leitura do dono
+   * (`readFileSync` + `statSync`) DEPOIS do ponto de pausa. A sonda lenta
+   * acordava, relia, via a posse nova e fresca da outra árvore, e declinava
+   * corretamente. O hook só atravessa a observação que ele por acaso precede,
+   * e onde uma regressão futura coloca a SUA observação não é algo que este
+   * arquivo possa controlar. Um guard cuja validade depende disso mede menos
+   * do que promete, então o hook saiu do código sob teste.
+   *
+   * ## O que este caso faz no lugar
+   *
+   * Afirma o CONTRATO que torna a corrida impossível — "a reciclagem é
+   * serializada pelo mutex do diretório" — observando-o de fora, pelo sistema
+   * de arquivos, sem nenhum gancho no alocador:
+   *
+   *   1. o teste toma o mutex de reciclagem (`mkdir`, o mesmo primitivo);
+   *   2. dispara uma sonda contra um slot ocupado e abandonado;
+   *   3. espera o aviso de chegada que a SONDA emite (no programa dela, não no
+   *      código sob teste) — sem esse aviso o caso REPROVA, em vez de passar
+   *      vazio;
+   *   4. com o mutex ainda na mão, exige que o slot continue nomeando o dono
+   *      antigo e que a sonda não tenha terminado;
+   *   5. solta o mutex e exige que a sonda então recicle e saia com aquele
+   *      slot — o que prova que ela estava BLOQUEADA, e não desviada.
+   *
+   * Qualquer reciclagem que não passe pelo mutex — inclusive o bloco literal
+   * da PR #597, que nem sabe que o lock existe — reivindica o slot no passo 4
+   * e reprova. Não há tempo envolvido: só posse de um mutex.
+   *
+   * Medido, com o bloco literal da PR #597 reintroduzido no lugar da chamada
+   * ao mutex: **12/12 vermelho**. Sem defeito: **0/12**. E com o aviso de
+   * chegada da sonda suprimido (a coordenação falhando), o caso REPROVA em
+   * 15s com `nada apareceu em …/cheguei` — nunca passa vazio.
+   * ───────────────────────────────────────────────────────────────────────── */
+  it(
+    'a reciclagem é SERIALIZADA: com o mutex na mão de outro, ninguém recicla',
+    async () => {
+      const aviso = mkdtempSync(join(tmpdir(), 'wt571-aviso-'));
+      const fantasma = join(repo.base, 'dono-que-sumiu');
+      try {
+        semearSlot(1, fantasma, 7 * 60 * 60 * 1000);
+        const root = repo.criarWorktree('wt-bloqueada');
+        const lock = caminhoDoLockDeReciclagem(repo.gitDirComum);
+
+        // 1. o teste toma o mutex — o mesmo `mkdir` que o alocador usa.
+        mkdirSync(lock, { recursive: true });
+
+        let terminou = false;
+        const promessa = rodarSondas([root], { SONDA_AVISO: aviso }).then((r) => {
+          terminou = true;
+          return r;
+        });
+
+        try {
+          // 3. prova de que a sonda ENTROU no alocador. Se não vier, o caso
+          //    estoura aqui — é o oposto de virar no-op silencioso.
+          // 15s é ~10x o boot medido da sonda (0.4–1.5s): generoso para o
+          //     runner e ainda rápido o bastante para a REPROVAÇÃO por falta
+          //     de coordenação ser legível em vez de parecer travamento.
+          await esperarArquivo(join(aviso, 'cheguei'), 15_000);
+          // Margem enorme para o punhado de syscalls entre o aviso e a
+          // tentativa de reciclagem, e MUITO abaixo da validade do mutex
+          // (30s) e da espera do alocador (10s), para o lock não ser quebrado
+          // nem a espera expirar por conta própria.
+          await new Promise((r) => setTimeout(r, 2_000));
+
+          // 4. o observável do contrato.
+          expect(
+            readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim(),
+            'o slot foi reciclado enquanto o mutex de reciclagem estava tomado',
+          ).toBe(fantasma);
+          expect(terminou, 'a sonda alocou sem esperar o mutex').toBe(false);
+        } finally {
+          // 5. solta e deixa a sonda seguir.
+          rmSync(lock, { recursive: true, force: true });
+        }
+
+        const [resposta] = await promessa;
+        exigirIsolamento([resposta], [root]);
+        expect(
+          resposta.escopo?.redisDb,
+          'depois do mutex livre ela tinha de reciclar o MESMO slot — se pegou outro, estava desviando, não bloqueando',
+        ).toBe(1);
+      } finally {
+        rmSync(aviso, { recursive: true, force: true });
+      }
+    },
+    PRAZO,
+  );
+
+  /* ─────────────────────────────────────────────────────────────────────────
+   * A segunda defesa, também determinística: a decisão é REVALIDADA sob o
+   * mutex. É ela que faz o alocador declinar quando o slot deixou de estar
+   * abandonado entre o pré-teste barato e o momento de agir — e foi
+   * exatamente ela que segurou a formulação literal da PR #597 no cenário
+   * acima. Aqui a revalidação é exercitada direto, sem depender de tempo.
+   * ───────────────────────────────────────────────────────────────────────── */
+  it('a reciclagem declina um slot que deixou de estar abandonado', () => {
+    const vivo = join(repo.base, 'arvore-viva');
+    mkdirSync(vivo, { recursive: true });
+    semearSlot(1, join(repo.base, 'fantasma'), 7 * 60 * 60 * 1000);
+
+    // O estado mudou depois do pré-teste: agora o slot é de uma árvore que
+    // existe e acabou de tocar o mtime.
+    writeFileSync(join(repo.dirDeSlots, '1'), vivo, 'utf8');
+
+    expect(reciclarSlot(join(repo.dirDeSlots, '1'), join(repo.base, 'outra'))).toBe(false);
+    expect(readFileSync(join(repo.dirDeSlots, '1'), 'utf8').trim()).toBe(vivo);
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────────
    * Caso ESTATÍSTICO — supridor de variantes, NÃO o gate.
    *
    * Ele joga 12 processos contra 12 slots abandonados e depende do escalonador
@@ -237,16 +299,17 @@ describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
    * que o caso determinístico acima não modela, e por isso ele fica. Mas a
    * taxa de detecção dele NÃO é confiável, e o número é medido, não estimado:
    *
-   *   defeito reintroduzido, 10 execuções desta máquina (4 vCPU) ...... 9/10
-   *   defeito reintroduzido, mesma máquina, sob outra carga ............ ~2/8
-   *   sem defeito, 10 execuções (falso vermelho) ....................... 0/10
+   *   bloco literal da PR #597, 12 execuções ......................... 6/12
+   *   outra formulação do mesmo defeito, 10 execuções ................ 9/10
+   *   mesma máquina, sob outra carga ................................. ~2/8
+   *   sem defeito, 12 execuções (falso vermelho) ..................... 0/12
    *
-   * Duas medições da MESMA regressão no MESMO host deram 90% e ~25%. Essa
-   * dispersão é justamente o argumento: um gate cuja sensibilidade depende da
-   * carga da máquina não protege critério de aceite — no runner do CI o perfil
-   * é outro de novo, e ninguém sabe qual. Quem protege é o caso determinístico
-   * acima (10/10 contra as duas formulações do defeito). Este aqui é rede
-   * secundária, e custa ~6.3s dos ~11s do arquivo.
+   * Medições da MESMA regressão no MESMO host foram de 90% a 25%. Essa
+   * dispersão é o argumento: um gate cuja sensibilidade depende da carga da
+   * máquina não protege critério de aceite — no runner do CI o perfil é outro
+   * de novo, e ninguém sabe qual. Quem protege é o caso de SERIALIZAÇÃO acima
+   * (12/12 contra a formulação literal). Este aqui é rede secundária, e custa
+   * ~6.3s dos ~11s do arquivo.
    * ───────────────────────────────────────────────────────────────────────── */
   it(
     'slot stale disputado: N processos, N slots abandonados, N dbs distintos',
