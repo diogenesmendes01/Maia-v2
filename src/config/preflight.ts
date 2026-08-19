@@ -24,35 +24,71 @@
  * com Postgres, Redis, S3 ou IdP. Um `BACKUP_S3_BUCKET` sintaticamente válido
  * que aponta para um bucket inexistente passa. Liveness é `maia doctor` (#517).
  *
- * E ele vê só o contrato. O `admin-ui` tem um SEGUNDO validador no seu próprio
- * boot (`resolveSecret` / `oidcProviderEnabled` em
- * `src/admin-ui/lib/auth-gating.ts`) que é mais estrito em pelo menos dois
- * pontos — `NEXTAUTH_SECRET` >= 32 chars (o contrato pede `min(8)`) e
- * `OIDC_CLIENT_SECRET` >= 16 chars (o contrato só cobra presença). Um verde
- * aqui não é promessa de que o admin-ui sobe; é a garantia de que o CONTRATO
- * está satisfeito. A lista completa está em `docs/runbooks/deploy-prod.md` §1.
+ * ─────────────────────────────────────────────────────────────────────────
+ * TODOS os validadores que o container roda — não "o loader nominal dele"
+ * ─────────────────────────────────────────────────────────────────────────
+ * O `admin-ui` era validado só contra o subset `admin-ui`. Isso descrevia o
+ * loader que o container DEVERIA usar, não o que ele usa, e o próprio
+ * cabeçalho anterior documentava a divergência sem modelá-la — o container do
+ * console importa `src/config/env.ts` transitivamente
+ * (`src/admin-ui/trpc/tool-enablement.ts` e
+ * `src/admin-ui/trpc/routers/tools-catalog.ts` importam `@/config/env.js`
+ * diretamente; `@/db/client.ts` também), e aquele singleton chama
+ * `validateConfig({ service: 'runtime' })`. Tirar do `.env.admin` uma chave
+ * EXCLUSIVA de `runtime` (`BACKUP_S3_BUCKET`, por exemplo) deixava este
+ * preflight e os testes VERDES e derrubava o container no boot — o único modo
+ * de falha que um gate de bring-up não pode ter (review de PR #595, [Alta] 1).
+ *
+ * Agora cada serviço declara em `COMPOSE_SERVICE_CONTRACT` a LISTA de subsets
+ * efetivamente avaliados (`admin-ui` → `runtime` + `admin-ui`) e o preflight
+ * roda todos, mais os gates de boot PRÓPRIOS do console
+ * (`src/config/admin-boot-gates.ts`): `NEXTAUTH_SECRET` >= 32 chars onde o
+ * contrato pede `min(8)`, `OIDC_CLIENT_SECRET` >= 16 chars onde o contrato só
+ * cobra presença, e recusa de placeholders. Sem eles, um `.env.admin` podia
+ * passar no contrato inteiro e LANÇAR no boot.
  *
  * NA OUTRA DIREÇÃO, e é o motivo mais forte para este comando existir: para o
- * subset `admin-ui` do contrato, ISTO AQUI É A ÚNICA CHECAGEM QUE RODA. O
- * container do console importa `src/config/env.ts` transitivamente (via
- * `@/db/client.ts`), e esse singleton valida com `service: 'runtime'` — as
- * `OIDC_*` são `services: ['admin-ui']` e ficam fora daquele subset, então nem
- * o `requiredIn` delas nem a regra `admin-ui/tenant-slugs-default-literal` são
- * avaliados no boot do admin-ui. `loadAdminConfig()` existe e ninguém o chama.
- * Sem preflight, um `.env.admin` com as quatro `OIDC_*` ausentes SOBE, e
- * entrega a tela "no providers configured".
+ * subset `admin-ui` do contrato, ISTO AQUI É A ÚNICA CHECAGEM QUE RODA. As
+ * `OIDC_*` são `services: ['admin-ui']` e ficam fora do subset `runtime`, então
+ * nem o `requiredIn` delas nem a regra `admin-ui/tenant-slugs-default-literal`
+ * são avaliados no boot. `loadAdminConfig()` existe e ninguém o chama. Sem
+ * preflight, um `.env.admin` com as quatro `OIDC_*` ausentes SOBE, e entrega a
+ * tela "no providers configured".
  *
- * PUREZA: nada aqui toca disco, rede ou `process.env`. Quem lê arquivo é
- * `scripts/config.ts`.
+ * Isso continua sendo disciplina de runbook, e é honesto dizê-lo: fazer o BOOT
+ * do console chamar `loadAdminConfig()` é a **issue #596**, e não está feito
+ * aqui. Até lá, pular `npm run config:preflight` continua permitindo subir sem
+ * o subset OIDC/fail-closed.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * HERMÉTICO, e explícito sobre isso
+ * ─────────────────────────────────────────────────────────────────────────
+ * A interpolação sai do `.env.infra` e de mais nada. O `docker compose`, porém,
+ * dá PRECEDÊNCIA ao ambiente exportado no shell sobre o `--env-file`: uma
+ * `MAIA_ENV=staging` exportada vence o arquivo, e o `up` produziria um ambiente
+ * diferente do que foi certificado aqui (review de PR #595, [Média]).
+ *
+ * A saída não é "ler o shell": um preflight cujo veredito depende do shell de
+ * quem o roda não é reproduzível, e o operador não teria como saber disso. A
+ * saída é ser hermético E REPROVAR a divergência — `shellEnv` entra por
+ * parâmetro, e toda variável referenciada pelo compose cujo valor no shell
+ * DIFIRA do `.env.infra` vira falha nomeada, com a instrução de desexportá-la
+ * ou de alinhar o arquivo. Nenhum valor aparece na mensagem, só o nome.
+ *
+ * PUREZA: nada aqui toca disco, rede ou `process.env`. Quem lê arquivo e quem
+ * captura o shell é `scripts/config.ts`.
  */
+import { adminBootGateProblems, type AdminBootGateProblem } from '@/config/admin-boot-gates.js';
 import {
+  composeInterpolationRefs,
   effectiveServiceEnv,
   parseComposeText,
   preflightTargets,
+  type ComposeNode,
   type PreflightTarget,
 } from '@/config/compose-env.js';
 import { parseEnvFile } from '@/config/env-file.js';
-import type { MaiaProfile } from '@/config/metadata.js';
+import type { MaiaProfile, MaiaService } from '@/config/metadata.js';
 import { validateConfig, type ValidateConfigResult } from '@/config/validate.js';
 
 export interface PreflightInput {
@@ -70,12 +106,41 @@ export interface PreflightInput {
   readonly readEnvFile: (name: string) => string;
   /** Força um profile em vez de resolvê-lo do ambiente efetivo de cada serviço. */
   readonly profile?: MaiaProfile;
+  /**
+   * O ambiente do shell de quem rodará o `docker compose`. NÃO é usado para
+   * interpolar (a execução é hermética — ver o cabeçalho): serve só para
+   * DETECTAR que ele sequestraria uma variável do `.env.infra`. Omitido = o
+   * chamador afirma que não há shell a considerar.
+   */
+  readonly shellEnv?: Readonly<Record<string, string | undefined>>;
+}
+
+/** Uma variável que o shell sobrescreveria, com o nome — nunca com o valor. */
+export interface ShellDivergence {
+  readonly variable: string;
+  /** `true` quando o `.env.infra` sequer declara a variável. */
+  readonly absentFromInfra: boolean;
+}
+
+/** O veredito de UM subset do contrato para um serviço. */
+export interface PreflightContractReport {
+  readonly contract: MaiaService;
+  readonly result: ValidateConfigResult;
 }
 
 export interface PreflightServiceReport {
   readonly target: PreflightTarget;
-  /** `null` quando o ambiente efetivo nem pôde ser montado (ver `failure`). */
-  readonly result: ValidateConfigResult | null;
+  /**
+   * Um veredito por subset que o container avalia no boot, na ordem de
+   * `target.contracts`. VAZIO quando o ambiente efetivo nem pôde ser montado
+   * (ver `failure`).
+   */
+  readonly contracts: readonly PreflightContractReport[];
+  /**
+   * Os gates de boot PRÓPRIOS do serviço (hoje só o console). Vazio quando o
+   * serviço não tem gates, ou quando todos passaram.
+   */
+  readonly bootGateProblems: readonly AdminBootGateProblem[];
   /**
    * Falha ANTES da validação: `env_file` ausente, ou interpolação `${VAR:?…}`
    * sem valor no `.env.infra` (o mesmo caso em que o `docker compose up` aborta
@@ -87,16 +152,24 @@ export interface PreflightServiceReport {
 export interface PreflightReport {
   readonly ok: boolean;
   readonly services: readonly PreflightServiceReport[];
+  /**
+   * Variáveis exportadas no shell que o `docker compose` faria vencer o
+   * `.env.infra`. Não vazio ⇒ `ok === false`: o ambiente que este relatório
+   * certifica NÃO é o que o `up` produziria.
+   */
+  readonly shellDivergence: readonly ShellDivergence[];
 }
 
 /**
  * Monta o ambiente efetivo de cada serviço do compose e valida cada um contra
- * o subset do seu loader. Nunca para no primeiro problema: o operador conserta
- * os dois arquivos numa passada só.
+ * TODOS os subsets que o processo daquele container avalia, mais os gates de
+ * boot próprios dele. Nunca para no primeiro problema: o operador conserta os
+ * arquivos numa passada só.
  */
 export function runPreflight(input: PreflightInput): PreflightReport {
   const compose = parseComposeText(input.composeText, input.composeLabel);
   const infra = parseEnvFile(input.infraText);
+  const shellDivergence = detectShellDivergence(input, compose, infra);
   const services: PreflightServiceReport[] = [];
 
   for (const target of preflightTargets(compose)) {
@@ -104,24 +177,64 @@ export function runPreflight(input: PreflightInput): PreflightReport {
     try {
       env = effectiveServiceEnv(compose, target.compose, {
         envFileContents: target.envFiles.map((name) => input.readEnvFile(name)),
+        envFileNames: target.envFiles,
         infra,
       });
     } catch (err) {
       services.push({
         target,
-        result: null,
+        contracts: [],
+        bootGateProblems: [],
         failure: err instanceof Error ? err.message : String(err),
       });
       continue;
     }
     services.push({
       target,
-      result: validateConfig({ env, service: target.contract, profile: input.profile }),
+      contracts: target.contracts.map((contract) => ({
+        contract,
+        result: validateConfig({ env, service: contract, profile: input.profile }),
+      })),
+      bootGateProblems: target.adminBootGates ? adminBootGateProblems(env) : [],
     });
   }
 
   return {
-    ok: services.every((s) => s.failure === undefined && s.result?.ok === true),
+    ok:
+      shellDivergence.length === 0 &&
+      services.every(
+        (s) =>
+          s.failure === undefined &&
+          s.bootGateProblems.length === 0 &&
+          s.contracts.length > 0 &&
+          s.contracts.every((c) => c.result.ok),
+      ),
     services,
+    shellDivergence,
   };
+}
+
+/**
+ * As variáveis de interpolação que o shell sequestraria.
+ *
+ * Só as REFERENCIADAS pelo compose entram na conta — o shell tem centenas de
+ * variáveis e nenhuma delas importa aqui. Valor igual ao do `.env.infra` não é
+ * divergência: o `up` produziria o mesmo ambiente.
+ */
+function detectShellDivergence(
+  input: PreflightInput,
+  compose: Record<string, ComposeNode>,
+  infra: Readonly<Record<string, string>>,
+): ShellDivergence[] {
+  const shell = input.shellEnv;
+  if (shell === undefined) return [];
+  const out: ShellDivergence[] = [];
+  for (const name of [...composeInterpolationRefs(compose)].sort()) {
+    const fromShell = shell[name];
+    if (fromShell === undefined) continue;
+    const fromInfra = infra[name];
+    if (fromInfra === fromShell) continue;
+    out.push({ variable: name, absentFromInfra: fromInfra === undefined });
+  }
+  return out;
 }

@@ -105,10 +105,16 @@ const INFRA = {
  * conferido contra `COMPOSE_SERVICE_CONTRACT` (a tabela que o preflight usa)
  * num caso próprio abaixo.
  */
-const SERVICES: readonly { compose: string; contract: MaiaService }[] = [
-  { compose: 'migrate', contract: 'migrator' },
-  { compose: 'app', contract: 'runtime' },
-  { compose: 'admin-ui', contract: 'admin-ui' },
+const SERVICES: readonly { compose: string; contracts: readonly MaiaService[] }[] = [
+  { compose: 'migrate', contracts: ['migrator'] },
+  { compose: 'app', contracts: ['runtime'] },
+  // LISTA, e não escalar: o container do console avalia os DOIS no boot. Ele
+  // importa `src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts`
+  // e `src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), e
+  // aquele singleton chama `validateConfig({ service: 'runtime' })`. Medir só
+  // `admin-ui` aqui era medir um contrato que o container não roda — o falso
+  // verde do achado [Alta] nº 1 da review de PR #595.
+  { compose: 'admin-ui', contracts: ['runtime', 'admin-ui'] },
 ];
 
 /**
@@ -188,7 +194,23 @@ const FECHARAM_O_GAP: Readonly<Record<string, readonly string[]>> = {
     'BACKUP_S3_BUCKET',
     'BACKUP_S3_SECRET_KEY',
   ],
-  'admin-ui': ['OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_ISSUER', 'OIDC_TENANT_SLUGS'],
+  // As seis BACKUP_* entraram na review de PR #595, pelo mesmo motivo das seis
+  // do `app` e um nível acima: o container do console valida o subset `runtime`
+  // no boot (ver SERVICES), então `BACKUP_S3_BUCKET` (`requiredIn`) e
+  // `BACKUP_ENCRYPTION_MODE` (`backup/production-encryption`) o derrubavam — e
+  // nem o preflight nem este spec diziam isso, porque mediam só `admin-ui`.
+  'admin-ui': [
+    'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
+    'BACKUP_ENCRYPTION_KEYRING',
+    'BACKUP_ENCRYPTION_MODE',
+    'BACKUP_S3_ACCESS_KEY',
+    'BACKUP_S3_BUCKET',
+    'BACKUP_S3_SECRET_KEY',
+    'OIDC_CLIENT_ID',
+    'OIDC_CLIENT_SECRET',
+    'OIDC_ISSUER',
+    'OIDC_TENANT_SLUGS',
+  ],
 };
 
 /** `true` quando o exemplo deixa a chave para o operador preencher. */
@@ -255,15 +277,24 @@ function effectiveEnv(
   return env;
 }
 
-/** Variáveis que o loader do serviço reprova, para um dado ambiente efetivo. */
-function reprovadas(contract: MaiaService, env: Record<string, string>): string[] {
-  try {
-    loadServiceConfig(contract, { env });
-    return [];
-  } catch (err) {
-    if (!(err instanceof ConfigValidationError)) throw err;
-    return [...new Set(err.problems.map((p) => p.variable ?? '<config>'))].sort();
+/**
+ * Variáveis que os loaders do serviço reprovam, para um dado ambiente efetivo.
+ *
+ * TODOS os subsets que aquele container avalia, unidos: um `.env.admin` que
+ * satisfaça `admin-ui` e falhe em `runtime` derruba o container, e é essa a
+ * pergunta.
+ */
+function reprovadas(contracts: readonly MaiaService[], env: Record<string, string>): string[] {
+  const out = new Set<string>();
+  for (const contract of contracts) {
+    try {
+      loadServiceConfig(contract, { env });
+    } catch (err) {
+      if (!(err instanceof ConfigValidationError)) throw err;
+      for (const p of err.problems) out.add(p.variable ?? '<config>');
+    }
   }
+  return [...out].sort();
 }
 
 describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte só', () => {
@@ -303,21 +334,21 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
   });
 
   it.each(SERVICES)(
-    'MAIA_ENV chega ao ambiente efetivo de $compose e o loader de $contract NÃO reclama dela',
-    ({ compose: name, contract }) => {
+    'MAIA_ENV chega ao ambiente efetivo de $compose e os loaders $contracts NÃO reclamam dela',
+    ({ compose: name, contracts }) => {
       expect(effectiveEnv(name).MAIA_ENV).toBe(INFRA.MAIA_ENV);
-      expect(reprovadas(contract, effectiveEnv(name))).not.toContain('MAIA_ENV');
+      expect(reprovadas(contracts, effectiveEnv(name))).not.toContain('MAIA_ENV');
     },
   );
 
   it.each(SERVICES)(
     'tirar MAIA_ENV do ambiente efetivo de $compose acrescenta MAIA_ENV — e SÓ ela — às reprovas',
-    ({ compose: name, contract }) => {
+    ({ compose: name, contracts }) => {
       // Prova que a linha injetada é LOAD-BEARING, e não decoração: retirada do
       // ambiente efetivo (mantendo NODE_ENV=production), o profile continua
       // resolvendo para `production` e `requiredIn` reprova.
-      const com = reprovadas(contract, effectiveEnv(name));
-      const sem = reprovadas(contract, effectiveEnv(name, { drop: ['MAIA_ENV'] }));
+      const com = reprovadas(contracts, effectiveEnv(name));
+      const sem = reprovadas(contracts, effectiveEnv(name, { drop: ['MAIA_ENV'] }));
       expect(sem, `${name}: o loader aceitou um ambiente efetivo sem MAIA_ENV`).toEqual(
         [...com, 'MAIA_ENV'].sort(),
       );
@@ -364,11 +395,11 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
   it('o preflight cobre exatamente os serviços deste spec, com o mesmo loader dono', () => {
     // Sem isto, um serviço novo no compose sairia do preflight em silêncio e
     // este arquivo continuaria verde medindo três dos quatro consumidores.
-    expect(preflightTargets(compose()).map((t) => ({ compose: t.compose, contract: t.contract }))).toEqual(
-      [...SERVICES],
-    );
+    expect(
+      preflightTargets(compose()).map((t) => ({ compose: t.compose, contracts: [...t.contracts] })),
+    ).toEqual(SERVICES.map(({ compose: name, contracts }) => ({ compose: name, contracts: [...contracts] })));
     expect(COMPOSE_SERVICE_CONTRACT).toEqual(
-      Object.fromEntries(SERVICES.map(({ compose: name, contract }) => [name, contract])),
+      Object.fromEntries(SERVICES.map(({ compose: name, contracts }) => [name, contracts])),
     );
   });
 
@@ -380,7 +411,7 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
     // reprovava com BACKUP_ENCRYPTION_MODE/BACKUP_S3_BUCKET (e outras quatro
     // na segunda rodada) e `admin-ui` com as quatro OIDC_*.
     const reprovas = Object.fromEntries(
-      SERVICES.map(({ compose: name, contract }) => [name, reprovadas(contract, effectiveEnv(name))]),
+      SERVICES.map(({ compose: name, contracts }) => [name, reprovadas(contracts, effectiveEnv(name))]),
     );
     expect(
       reprovas,
@@ -407,14 +438,14 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
 
   it.each(SERVICES)(
     'cada chave que fechou o gap de $compose é LOAD-BEARING: tirá-la volta a reprovar',
-    ({ compose: name, contract }) => {
+    ({ compose: name, contracts }) => {
       // O contrafactual do caso acima. Sem ele, acrescentar as linhas ao
       // exemplo seria indistinguível de acrescentar comentários: o verde não
       // diria se alguma delas ainda é exigida. Uma chave que deixe de ser
       // necessária aparece aqui como "não reprovou", obrigando a encolher
       // FECHARAM_O_GAP DE PROPÓSITO em vez de deixá-la mentindo.
       const naoReprovaram = FECHARAM_O_GAP[name]!.filter(
-        (k) => reprovadas(contract, effectiveEnv(name, { drop: [k] })).length === 0,
+        (k) => reprovadas(contracts, effectiveEnv(name, { drop: [k] })).length === 0,
       );
       expect(
         naoReprovaram,
@@ -431,13 +462,13 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
     // `tenantsRepo.findById(tenant)`. Um `default` ali autentica gente contra o
     // bucket legado presumido-mal-roteado.
     const comDefault = reprovadas(
-      'admin-ui',
+      ['admin-ui'],
       effectiveEnv('admin-ui', { add: { OIDC_TENANT_SLUGS: 'default' } }),
     );
     expect(comDefault).toContain('OIDC_TENANT_SLUGS');
     // E não é só o literal sozinho: numa lista, também.
     expect(
-      reprovadas('admin-ui', effectiveEnv('admin-ui', { add: { OIDC_TENANT_SLUGS: 'primary,default' } })),
+      reprovadas(['admin-ui'], effectiveEnv('admin-ui', { add: { OIDC_TENANT_SLUGS: 'primary,default' } })),
     ).toContain('OIDC_TENANT_SLUGS');
   });
 });

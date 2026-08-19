@@ -47,10 +47,29 @@ import { parseEnvFile } from '@/config/env-file.js';
 
 export type ComposeNode = string | ComposeNode[] | { [key: string]: ComposeNode };
 
+/**
+ * Erro de parse do compose.
+ *
+ * A mensagem carrega ARQUIVO, LINHA e MOTIVO — e NUNCA o conteúdo da linha.
+ * Ela era `${file}:${lineNo}: ${why}\n  ${line}`, e o `${line}` é um vazamento:
+ * `cmdPreflight` imprime esta mensagem em stderr (e em `--json`), então um
+ * compose passado por `--compose` com um segredo literal numa linha malformada
+ * despejava o valor no terminal e no log do CI — contradizendo a garantia do
+ * cabeçalho de `scripts/config.ts` de nunca imprimir secret values (review de
+ * PR #595, achado [Alta] nº 2). Arquivo + linha localizam o problema tão bem
+ * quanto o eco, e um `sed -n '<n>p'` do próprio operador mostra o resto.
+ */
 export class ComposeParseError extends Error {
-  constructor(file: string, lineNo: number, line: string, why: string) {
-    super(`${file}:${lineNo}: ${why}\n  ${line}`);
+  /** Rótulo do compose (normalmente o caminho lido). */
+  readonly file: string;
+  /** Linha 1-based. */
+  readonly lineNo: number;
+
+  constructor(file: string, lineNo: number, why: string) {
+    super(`${file}:${lineNo}: ${why}`);
     this.name = 'ComposeParseError';
+    this.file = file;
+    this.lineNo = lineNo;
   }
 }
 
@@ -127,7 +146,7 @@ function parseBlock(lines: RawLine[], start: number, indent: number, file: strin
       const line = lines[i]!;
       if (line.indent < indent) break;
       if (line.indent > indent) {
-        throw new ComposeParseError(file, line.no, line.text, 'unexpected indentation inside a sequence');
+        throw new ComposeParseError(file, line.no, 'unexpected indentation inside a sequence');
       }
       if (!line.text.startsWith('- ') && line.text !== '-') {
         break;
@@ -137,7 +156,7 @@ function parseBlock(lines: RawLine[], start: number, indent: number, file: strin
       if (inline && (inline[2] === undefined || inline[2] === '')) {
         // `- key:` opening a nested map inside a sequence: not used by these
         // files. Refuse rather than guess.
-        throw new ComposeParseError(file, line.no, line.text, 'nested map inside a sequence is not supported');
+        throw new ComposeParseError(file, line.no, 'nested map inside a sequence is not supported');
       }
       seq.push(scalar(item));
       i += 1;
@@ -151,11 +170,11 @@ function parseBlock(lines: RawLine[], start: number, indent: number, file: strin
     const line = lines[i]!;
     if (line.indent < indent) break;
     if (line.indent > indent) {
-      throw new ComposeParseError(file, line.no, line.text, 'unexpected indentation inside a map');
+      throw new ComposeParseError(file, line.no, 'unexpected indentation inside a map');
     }
     const m = KEY_LINE.exec(line.text);
     if (!m) {
-      throw new ComposeParseError(file, line.no, line.text, 'line is neither a `key: value` nor a `- item`');
+      throw new ComposeParseError(file, line.no, 'line is neither a `key: value` nor a `- item`');
     }
     const key = m[1]!;
     const value = m[2];
@@ -190,47 +209,315 @@ export function parseComposeText(text: string, label: string): Record<string, Co
     .forEach((raw, idx) => {
       if (raw.trim() === '' || raw.trimStart().startsWith('#')) return;
       if (raw.includes('\t')) {
-        throw new ComposeParseError(label, idx + 1, raw, 'tab in indentation');
+        throw new ComposeParseError(label, idx + 1, 'tab in indentation');
       }
       lines.push({ indent: raw.length - raw.trimStart().length, text: raw.trim(), no: idx + 1 });
     });
   const [node, consumed] = parseBlock(lines, 0, 0, label);
   if (consumed !== lines.length) {
     const stray = lines[consumed]!;
-    throw new ComposeParseError(label, stray.no, stray.text, 'trailing content the parser did not consume');
+    throw new ComposeParseError(label, stray.no, 'trailing content the parser did not consume');
   }
   return node as Record<string, ComposeNode>;
+}
+
+/**
+ * O TIPO de um nó, para mensagem de erro. Nunca o CONTEÚDO.
+ *
+ * `asMap`/`asString` serializavam o nó com `JSON.stringify` — e o nó de um
+ * shape inesperado carrega valores do compose, que `cmdPreflight` imprime sem
+ * redaction (review de PR #595, achado [Alta] nº 2). O caminho estrutural
+ * (`services.app.environment.DATABASE_URL`) já diz onde olhar; o valor não
+ * acrescenta diagnóstico e é a única parte que pode ser segredo.
+ */
+function nodeKind(node: ComposeNode | undefined): string {
+  if (node === undefined) return 'nothing';
+  if (typeof node === 'string') return 'a scalar';
+  if (Array.isArray(node)) return `a sequence of ${node.length} item(s)`;
+  return `a map with ${Object.keys(node).length} key(s)`;
 }
 
 /** Narrowing helpers — a wrong shape is an error, not a silent `undefined`. */
 export function asMap(node: ComposeNode | undefined, what: string): Record<string, ComposeNode> {
   if (node === undefined || typeof node === 'string' || Array.isArray(node)) {
-    throw new Error(`expected ${what} to be a map, got ${JSON.stringify(node)}`);
+    throw new Error(`expected ${what} to be a map, got ${nodeKind(node)}`);
   }
   return node;
 }
 
 export function asString(node: ComposeNode | undefined, what: string): string {
   if (typeof node !== 'string') {
-    throw new Error(`expected ${what} to be a scalar, got ${JSON.stringify(node)}`);
+    throw new Error(`expected ${what} to be a scalar, got ${nodeKind(node)}`);
   }
   return node;
 }
 
 /**
- * Compose interpolation: `${VAR}`, `${VAR:-default}`, `${VAR:?message}`.
- * Uma variável `:?` ausente LANÇA — o mesmo fail-closed do `docker compose`,
- * para que o preflight não "resolva" uma credencial obrigatória para string
- * vazia e siga em frente.
+ * ─────────────────────────────────────────────────────────────────────────
+ * Interpolação — a do Compose, não uma aproximação dela
+ * ─────────────────────────────────────────────────────────────────────────
+ * A primeira versão entendia três formas (`${VAR}`, `${VAR:-d}`, `${VAR:?m}`)
+ * e deixava todo o resto passar VERBATIM. Isso não é conservador: `$$` (o
+ * escape do Compose para um `$` literal), `$VAR` sem chaves e `${VAR:+x}` são
+ * sintaxe legítima, e um compose que as use produzia aqui um ambiente
+ * DIFERENTE do que o `docker compose up` produz — com o preflight verde
+ * (review de PR #595, achado [Média]).
+ *
+ * Agora as formas do `compose-go/template` estão todas implementadas, e o que
+ * não for nenhuma delas LANÇA. Um `$` solto é erro no Compose também; falhar
+ * aqui é a única alternativa honesta a "resolver diferente e seguir em frente".
+ *
+ *   $$            → `$` literal
+ *   $VAR   ${VAR} → valor, ou '' se ausente
+ *   ${VAR:-d}     → d se ausente OU vazia
+ *   ${VAR-d}      → d só se AUSENTE (vazia continua vazia)
+ *   ${VAR:+r}     → r se presente E não vazia, senão ''
+ *   ${VAR+r}      → r se PRESENTE (mesmo vazia), senão ''
+ *   ${VAR:?m}     → LANÇA se ausente OU vazia
+ *   ${VAR?m}      → LANÇA se AUSENTE
+ *
+ * `:?`/`?` fail-closed é o mesmo do `docker compose`: o preflight não pode
+ * "resolver" uma credencial obrigatória para string vazia e seguir em frente.
+ * O default/replacement é ele próprio interpolado (o Compose aninha).
  */
-export function interpolate(value: string, env: Readonly<Record<string, string>>): string {
-  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([-?])([^}]*))?\}/g, (_all, name: string, op, rest: string) => {
-    const present = env[name];
-    if (present !== undefined && present !== '') return present;
-    if (op === '-') return rest;
-    if (op === '?') throw new Error(`compose interpolation: ${name} is required (\${${name}:?...})`);
-    return '';
-  });
+const NAME_HEAD = /[A-Za-z_]/;
+const NAME_TAIL = /[A-Za-z0-9_]/;
+
+/** Lê `${...}` a partir do `{`, respeitando aninhamento. Devolve o miolo e o índice após o `}`. */
+function readBraced(value: string, open: number, where: string): [string, number] {
+  let depth = 0;
+  for (let i = open; i < value.length; i += 1) {
+    const ch = value[i]!;
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return [value.slice(open + 1, i), i + 1];
+    }
+  }
+  throw new Error(`compose interpolation (${where}): unterminated \${...}`);
+}
+
+/**
+ * Expande uma expressão do Compose. `where` é um CAMINHO ESTRUTURAL
+ * (`services.app.environment.DATABASE_URL`, `.env.app:PGHOST`) — nunca o
+ * valor, que pode ser segredo.
+ */
+export function interpolate(
+  value: string,
+  env: Readonly<Record<string, string | undefined>>,
+  where = 'compose',
+): string {
+  let out = '';
+  let i = 0;
+  while (i < value.length) {
+    const ch = value[i]!;
+    if (ch !== '$') {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    const next = value[i + 1];
+    if (next === '$') {
+      out += '$';
+      i += 2;
+      continue;
+    }
+    if (next !== undefined && NAME_HEAD.test(next)) {
+      let j = i + 1;
+      while (j < value.length && NAME_TAIL.test(value[j]!)) j += 1;
+      out += env[value.slice(i + 1, j)] ?? '';
+      i = j;
+      continue;
+    }
+    if (next === '{') {
+      const [inner, after] = readBraced(value, i + 1, where);
+      out += expandBraced(inner, env, where);
+      i = after;
+      continue;
+    }
+    // `$` seguido de qualquer outra coisa. O Compose recusa o template inteiro;
+    // aceitar aqui significaria certificar um ambiente que o `up` não produz.
+    throw new Error(
+      `compose interpolation (${where}): a lone \`$\` is not valid — write \`$$\` for a literal dollar sign`,
+    );
+  }
+  return out;
+}
+
+/** O miolo de um `${...}` já sem as chaves. */
+function expandBraced(
+  inner: string,
+  env: Readonly<Record<string, string | undefined>>,
+  where: string,
+): string {
+  let n = 0;
+  while (n < inner.length && (n === 0 ? NAME_HEAD : NAME_TAIL).test(inner[n]!)) n += 1;
+  const name = inner.slice(0, n);
+  if (name === '') {
+    throw new Error(`compose interpolation (${where}): \${…} without a variable name`);
+  }
+  const rest = inner.slice(n);
+  const raw = env[name];
+
+  if (rest === '') return raw ?? '';
+
+  const colon = rest.startsWith(':');
+  const op = colon ? rest[1] : rest[0];
+  const arg = rest.slice(colon ? 2 : 1);
+  // "vazio conta como ausente" é o que o `:` liga.
+  const missing = colon ? raw === undefined || raw === '' : raw === undefined;
+
+  switch (op) {
+    case '-':
+      return missing ? interpolate(arg, env, where) : raw!;
+    case '+':
+      return missing ? '' : interpolate(arg, env, where);
+    case '?':
+      if (missing) {
+        // A mensagem do operador (`arg`) é texto do compose, não valor de
+        // variável — mas o nome basta, e não arrastar o `arg` mantém a
+        // mensagem imune a um compose que escreva segredo ali.
+        throw new Error(
+          `compose interpolation (${where}): ${name} is required (\${${name}${colon ? ':' : ''}?...})`,
+        );
+      }
+      return raw!;
+    default:
+      throw new Error(
+        `compose interpolation (${where}): unsupported operator in \${${name}…} — ` +
+          'use :-, -, :+, +, :? or ?',
+      );
+  }
+}
+
+/**
+ * Todo nome de variável referenciado por interpolação num texto. Base da
+ * checagem de divergência com o shell (ver `preflightTargets` / `runPreflight`).
+ */
+export function interpolationRefs(text: string, into: Set<string> = new Set()): Set<string> {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '$') {
+      i += 1;
+      continue;
+    }
+    const next = text[i + 1];
+    if (next === '$') {
+      i += 2;
+      continue;
+    }
+    if (next !== undefined && NAME_HEAD.test(next)) {
+      let j = i + 1;
+      while (j < text.length && NAME_TAIL.test(text[j]!)) j += 1;
+      into.add(text.slice(i + 1, j));
+      i = j;
+      continue;
+    }
+    if (next === '{') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < text.length; j += 1) {
+        if (text[j] === '{') depth += 1;
+        else if (text[j] === '}') {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      const inner = text.slice(i + 2, j);
+      let n = 0;
+      while (n < inner.length && (n === 0 ? NAME_HEAD : NAME_TAIL).test(inner[n]!)) n += 1;
+      if (n > 0) into.add(inner.slice(0, n));
+      // O default/replacement também é interpolado.
+      interpolationRefs(inner.slice(n), into);
+      i = j + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return into;
+}
+
+// ---------------------------------------------------------------------------
+// `env_file` — a semântica do Compose, não a do `dotenv/config`
+// ---------------------------------------------------------------------------
+
+/**
+ * Classificação de aspas por chave. Só isso: o VALOR continua vindo de
+ * `parseEnvFile` (`dotenv.parse`), para que preflight e boot não possam
+ * discordar sobre o que uma linha significa. O que este regex acrescenta é a
+ * única informação que o `dotenv.parse` apaga e da qual o Compose depende —
+ * se o valor estava entre aspas SIMPLES.
+ *
+ * Deriva do regex do próprio `dotenv` (v16), reduzido ao que interessa aqui.
+ */
+const ENV_LINE =
+  /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)('(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`|[^#\r\n]*)?\s*(?:#.*)?(?:$|$)/gm;
+
+/** Chaves cujo valor bruto estava entre aspas SIMPLES (a última ocorrência vence, como no dotenv). */
+function singleQuotedKeys(text: string): Set<string> {
+  const out = new Set<string>();
+  const src = text.replace(/\r\n?/g, '\n');
+  ENV_LINE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ENV_LINE.exec(src)) !== null) {
+    const key = m[1];
+    if (key === undefined) continue;
+    const raw = (m[2] ?? '').trim();
+    if (raw.startsWith("'")) out.add(key);
+    else out.delete(key);
+  }
+  return out;
+}
+
+/**
+ * Um `env_file` do Compose, com a semântica do Compose.
+ *
+ * O módulo lia `env_file` com `dotenv.parse` e mais nada. Está errado, e o
+ * review de PR #595 (achado [Média]) nomeia o erro: o `docker compose`
+ * INTERPOLA `${VAR}` dentro de um `env_file`
+ * (`compose-go/dotenv.ParseWithLookup`, chamado por `GetEnvFromFile`), o
+ * `dotenv.parse` do Node não interpola nada, e um `.env.app` com
+ * `NEXTAUTH_URL=https://${DOMAIN}/admin` produzia aqui o literal `${DOMAIN}` e
+ * lá o valor expandido. Dois ambientes, um verde.
+ *
+ * A cadeia de resolução é a do `compose-go`, nesta ordem:
+ *   1. o ambiente do projeto (`--env-file`, aqui o `.env.infra`, mais o shell
+ *      quando o operador o exporta — ver `runPreflight`);
+ *   2. as chaves JÁ definidas por este e pelos `env_file` anteriores.
+ *
+ * Valor entre ASPAS SIMPLES não é interpolado (o Compose também não interpola),
+ * e é por isso que `singleQuotedKeys` existe.
+ *
+ * `label` entra nas mensagens de erro como CAMINHO (`.env.app:PGHOST`), nunca
+ * o valor.
+ */
+export function parseComposeEnvFile(
+  text: string,
+  label: string,
+  opts: {
+    /** Ambiente do PROJETO (`--env-file` + shell). Vence tudo, como no compose-go. */
+    readonly project: Readonly<Record<string, string | undefined>>;
+    /** Chaves já definidas pelos `env_file` ANTERIORES da mesma lista. */
+    readonly previous?: Readonly<Record<string, string>>;
+  },
+): Record<string, string> {
+  const literal = singleQuotedKeys(text);
+  const parsed = parseEnvFile(text);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (literal.has(key)) {
+      out[key] = value;
+      continue;
+    }
+    // Precedência do `GetEnvFromFile`: projeto/shell primeiro, depois o `envMap`
+    // acumulado (arquivos anteriores, e as chaves já lidas DESTE arquivo).
+    out[key] = interpolate(
+      value,
+      { ...opts.previous, ...out, ...opts.project },
+      `${label}:${key}`,
+    );
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,14 +525,49 @@ export function interpolate(value: string, env: Readonly<Record<string, string>>
 // ---------------------------------------------------------------------------
 
 /**
- * Qual loader é dono de cada container. É esta tabela que faz o preflight
- * cobrir os TRÊS consumidores, e não só o subset do migrator.
+ * TODOS os validadores de contrato que o processo de cada container roda de
+ * fato — não "o loader nominal dele".
+ *
+ * A tabela era `Record<string, MaiaService>` e mapeava `admin-ui → 'admin-ui'`.
+ * Isso descrevia o loader que o container DEVERIA usar, não o que ele usa: o
+ * console importa `src/config/env.ts` transitivamente
+ * (`src/admin-ui/trpc/tool-enablement.ts` e
+ * `src/admin-ui/trpc/routers/tools-catalog.ts` importam `@/config/env.js`
+ * diretamente; `@/db/client.ts` também), e aquele singleton chama
+ * `validateConfig({ service: 'runtime' })`. Ou seja: o container do console
+ * valida o subset `runtime` no boot, e o preflight validava OUTRO contrato.
+ *
+ * A consequência é o falso verde que o review de PR #595 nomeia (achado [Alta]
+ * nº 1): tirar do `.env.admin` uma chave EXCLUSIVA de `runtime` deixava
+ * preflight e testes verdes e derrubava o container no boot. Agora cada serviço
+ * declara a LISTA de subsets efetivamente avaliados, e o preflight roda todos.
+ *
+ * Ordem importa só para o relatório: o subset mais amplo primeiro.
  */
-export const COMPOSE_SERVICE_CONTRACT: Readonly<Record<string, MaiaService>> = {
-  migrate: 'migrator',
-  app: 'runtime',
-  'admin-ui': 'admin-ui',
+export const COMPOSE_SERVICE_CONTRACT: Readonly<Record<string, readonly MaiaService[]>> = {
+  migrate: ['migrator'],
+  app: ['runtime'],
+  // `runtime` porque o boot do Next.js importa `@/config/env.js`; `admin-ui`
+  // porque `npm run config:preflight` é, hoje, o ÚNICO lugar que avalia aquele
+  // subset (as `OIDC_*` são `services: ['admin-ui']` e ficam fora do
+  // `runtime`). Fazer o boot chamar `loadAdminConfig()` é a issue #596 —
+  // enquanto ela não landar, o preflight é o gate, e é por isso que ele valida
+  // os DOIS em vez de escolher um.
+  'admin-ui': ['runtime', 'admin-ui'],
 };
+
+/**
+ * Serviços cujo BOOT aplica gates PRÓPRIOS, mais estritos que o contrato.
+ *
+ * Hoje só o console: `resolveSecret()` e `oidcProviderEnabled()` em
+ * `src/admin-ui/lib/auth-gating.ts` exigem `NEXTAUTH_SECRET` >= 32 e
+ * `OIDC_CLIENT_SECRET` >= 16 e recusam placeholders, onde o contrato pede
+ * `min(8)` e só presença. Um `.env.admin` que passe no contrato e falhe no gate
+ * é o segundo falso verde do achado [Alta] nº 1, e é por isso que ele é
+ * DECLARADO aqui em vez de ficar implícito num `if (service === 'admin-ui')`
+ * dentro do preflight.
+ */
+export const COMPOSE_SERVICES_WITH_ADMIN_BOOT_GATES: readonly string[] = ['admin-ui'];
 
 /**
  * Serviços do Compose que rodam imagem de terceiro e NÃO leem configuração da
@@ -259,10 +581,16 @@ export const COMPOSE_SERVICES_WITHOUT_MAIA_CONFIG: readonly string[] = ['postgre
 export interface PreflightTarget {
   /** Nome do serviço em `compose.prod.yml`. */
   readonly compose: string;
-  /** Loader dono dele em `src/config/contract.ts`. */
-  readonly contract: MaiaService;
+  /**
+   * TODOS os subsets do contrato que o processo deste container avalia no boot
+   * (`src/config/contract.ts`). Lista, não escalar — ver
+   * `COMPOSE_SERVICE_CONTRACT`.
+   */
+  readonly contracts: readonly MaiaService[];
   /** `env_file:` declarados, na ordem, exatamente como escritos no compose. */
   readonly envFiles: readonly string[];
+  /** O boot deste container aplica os gates de `src/config/admin-boot-gates.ts`. */
+  readonly adminBootGates: boolean;
 }
 
 /** `services:` do compose já parseado. */
@@ -281,18 +609,50 @@ export function envFileNamesOf(
   return list.map((f) => asString(f, 'env_file[]'));
 }
 
-/** O bloco `environment:` de um serviço, interpolado com o `.env.infra`. */
+/** O bloco `environment:` de um serviço, interpolado com o ambiente do projeto. */
 export function environmentOf(
   compose: Record<string, ComposeNode>,
   service: string,
-  infra: Readonly<Record<string, string>>,
+  infra: Readonly<Record<string, string | undefined>>,
 ): Record<string, string> {
   const raw = asMap(composeServices(compose)[service], `services.${service}`).environment;
   if (raw === undefined) return {};
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(asMap(raw, `services.${service}.environment`))) {
-    out[key] = interpolate(asString(value, `services.${service}.environment.${key}`), infra);
+    const where = `services.${service}.environment.${key}`;
+    out[key] = interpolate(asString(value, where), infra, where);
   }
+  return out;
+}
+
+/**
+ * Todo nome de variável que o compose resolve por interpolação. É o conjunto
+ * que o shell do operador pode SEQUESTRAR: o `docker compose` dá precedência
+ * ao ambiente exportado sobre o `--env-file`, então uma `MAIA_ENV` exportada
+ * vence o `.env.infra` e o `up` produz um ambiente diferente do certificado
+ * aqui (review de PR #595, achado [Média]). `runPreflight` usa isto para
+ * REPROVAR a divergência em vez de fingir que ela não existe.
+ *
+ * Anda pela ÁRVORE PARSEADA, e não pelo texto: o `docker compose` interpola
+ * valores de YAML, não comentários. `compose.prod.yml` menciona `$HOME` num
+ * comentário explicando um `tmpfs`, e uma varredura textual reportava o `HOME`
+ * do shell como divergência em toda execução — um alarme falso permanente é um
+ * alarme que o operador aprende a ignorar.
+ */
+export function composeInterpolationRefs(node: ComposeNode): Set<string> {
+  const out = new Set<string>();
+  const visit = (n: ComposeNode): void => {
+    if (typeof n === 'string') {
+      interpolationRefs(n, out);
+      return;
+    }
+    if (Array.isArray(n)) {
+      n.forEach(visit);
+      return;
+    }
+    Object.values(n).forEach(visit);
+  };
+  visit(node);
   return out;
 }
 
@@ -318,8 +678,9 @@ export function preflightTargets(compose: Record<string, ComposeNode>): Prefligh
     .filter((n) => n in COMPOSE_SERVICE_CONTRACT)
     .map((compose_) => ({
       compose: compose_,
-      contract: COMPOSE_SERVICE_CONTRACT[compose_]!,
+      contracts: COMPOSE_SERVICE_CONTRACT[compose_]!,
       envFiles: envFileNamesOf(compose, compose_),
+      adminBootGates: COMPOSE_SERVICES_WITH_ADMIN_BOOT_GATES.includes(compose_),
     }));
 }
 
@@ -329,22 +690,37 @@ export function preflightTargets(compose: Record<string, ComposeNode>): Prefligh
  * `MAIA_ENV` não precisar aparecer em `env_file` nenhum.
  *
  * `envFileContents` é o CONTEÚDO de cada `env_file`, na mesma ordem de
- * `envFileNamesOf`. Parseado por `parseEnvFile` — o mesmo `dotenv.parse` que o
- * boot usa —, para que preflight e boot não possam discordar sobre o que uma
- * linha significa.
+ * `envFileNamesOf`; `envFileNames` são os nomes, usados só como CAMINHO nas
+ * mensagens de erro. Cada arquivo passa por `parseComposeEnvFile`, que é
+ * `dotenv.parse` (o mesmo parser do boot, para que preflight e boot não
+ * discordem sobre o que uma linha significa) MAIS a interpolação que o Compose
+ * aplica em cima — sem ela, um `${VAR}` dentro de um `env_file` chegava aqui
+ * literal e no container expandido.
+ *
+ * `infra` é o ambiente do PROJETO: o `--env-file` do `docker compose`. Quando o
+ * chamador quiser modelar também o shell, é ele quem funde os dois nessa
+ * precedência — este módulo não lê `process.env` (ver PUREZA no topo).
  */
 export function effectiveServiceEnv(
   compose: Record<string, ComposeNode>,
   service: string,
   opts: {
     readonly envFileContents: readonly string[];
-    readonly infra: Readonly<Record<string, string>>;
+    readonly infra: Readonly<Record<string, string | undefined>>;
+    /** Nomes correspondentes, só para o caminho nas mensagens. */
+    readonly envFileNames?: readonly string[];
   },
 ): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const content of opts.envFileContents) {
-    Object.assign(env, parseEnvFile(content));
-  }
+  opts.envFileContents.forEach((content, idx) => {
+    Object.assign(
+      env,
+      parseComposeEnvFile(content, opts.envFileNames?.[idx] ?? `env_file[${idx}]`, {
+        project: opts.infra,
+        previous: { ...env },
+      }),
+    );
+  });
   Object.assign(env, environmentOf(compose, service, opts.infra));
   return env;
 }

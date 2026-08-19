@@ -11,7 +11,17 @@
  *   npm run config:preflight -- --compose compose.prod.yml --infra .env.infra
  *
  * This script NEVER prints a secret value: everything it emits comes from the
- * validator, which redacts by construction, or from the contract's metadata.
+ * validator, which redacts by construction, from the contract's metadata, or —
+ * for `preflight` — from errors that carry only FILE, LINE, structural PATH and
+ * variable NAME.
+ *
+ * That last clause is load-bearing and was not free: `ComposeParseError` used to
+ * echo the offending compose LINE, and the shape helpers serialised the node
+ * with `JSON.stringify`. A `--compose` file with a literal secret on a
+ * malformed line therefore printed that secret to stderr and into the `--json`
+ * output (review of PR #595). `tests/unit/config/compose-env-fidelity.spec.ts`
+ * runs THIS CLI with a canary value and asserts its absence from stdout, stderr
+ * and the JSON.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
@@ -211,6 +221,12 @@ function cmdPreflight(args: Map<string, string | true>): number {
       composeLabel: composeArg,
       infraText,
       profile: typeof rawProfile === 'string' ? (rawProfile as MaiaProfile) : undefined,
+      // O preflight é HERMÉTICO: `process.env` NÃO interpola nada. Ele entra
+      // só para DETECTAR que o shell sequestraria uma variável do `.env.infra`
+      // — o `docker compose` dá precedência ao ambiente exportado sobre o
+      // `--env-file`, então uma `MAIA_ENV` exportada faria o `up` produzir um
+      // ambiente diferente do certificado aqui (review de PR #595).
+      shellEnv: process.env,
       readEnvFile: (name) => {
         const abs = resolve(composeDir, name);
         const content = readIfExists(abs);
@@ -238,18 +254,26 @@ function cmdPreflight(args: Map<string, string | true>): number {
         {
           ok: report.ok,
           compose: composeArg,
+          // Nomes das variáveis, nunca valores — nem do shell, nem do arquivo.
+          shell_divergence: report.shellDivergence,
           services: report.services.map((s: PreflightServiceReport) => ({
             compose_service: s.target.compose,
-            contract_service: s.target.contract,
+            contract_services: s.target.contracts,
             env_files: s.target.envFiles,
             ...(s.failure !== undefined
               ? { ok: false, failure: s.failure }
               : {
-                  ok: s.result!.ok,
-                  profile: s.result!.profile,
-                  config_hash: s.result!.configHash,
-                  errors: s.result!.errors,
-                  warnings: s.result!.warnings,
+                  ok:
+                    s.bootGateProblems.length === 0 && s.contracts.every((c) => c.result.ok),
+                  contracts: s.contracts.map((c) => ({
+                    contract_service: c.contract,
+                    ok: c.result.ok,
+                    profile: c.result.profile,
+                    config_hash: c.result.configHash,
+                    errors: c.result.errors,
+                    warnings: c.result.warnings,
+                  })),
+                  boot_gate_problems: s.bootGateProblems,
                 }),
           })),
         },
@@ -261,24 +285,60 @@ function cmdPreflight(args: Map<string, string | true>): number {
   }
 
   console.log(`Maia config preflight — ${composeArg} (interpolação: ${infraArg})`);
+  if (report.shellDivergence.length > 0) {
+    console.log('');
+    console.log('── ambiente do shell');
+    console.log(
+      '  DIVERGÊNCIA: as variáveis abaixo estão EXPORTADAS no seu shell e o `docker compose` dá',
+    );
+    console.log(
+      '  precedência a ele sobre o `--env-file`. O ambiente certificado abaixo NÃO é o que o `up`',
+    );
+    console.log('  produziria neste terminal.');
+    for (const d of report.shellDivergence) {
+      console.log(
+        `    ${d.variable} — ${d.absentFromInfra ? `ausente de ${infraArg}` : `difere de ${infraArg}`}`,
+      );
+    }
+    console.log(
+      `  Conserte de um jeito só: \`unset\` a variável no shell, ou alinhe ${infraArg} com ela.`,
+    );
+  }
   for (const s of report.services) {
     const files = s.target.envFiles.length > 0 ? s.target.envFiles.join(', ') : '(nenhum)';
     console.log('');
     console.log(
-      `── serviço ${s.target.compose} → loader ${s.target.contract} · env_file: ${files}`,
+      `── serviço ${s.target.compose} → loaders ${s.target.contracts.join(' + ')} · env_file: ${files}`,
     );
     if (s.failure !== undefined) {
       console.log(`  FALHA ANTES DA VALIDAÇÃO: ${s.failure}`);
       continue;
     }
-    console.log(`  ${formatHuman(s.result!)}`.replace(/\n/g, '\n  '));
+    for (const c of s.contracts) {
+      console.log(`  · subset ${c.contract}`);
+      console.log(`    ${formatHuman(c.result)}`.replace(/\n/g, '\n    '));
+    }
+    if (s.target.adminBootGates) {
+      console.log('  · gates de boot do admin-ui (src/admin-ui/lib/auth-gating.ts)');
+      if (s.bootGateProblems.length === 0) {
+        console.log('    OK: comprimentos e padrões aceitos (isto NÃO testa o IdP).');
+      } else {
+        for (const g of s.bootGateProblems) {
+          console.log(`    ${g.variable} [${g.rule}]: ${g.message}`);
+          console.log(`      → ${g.remediation}`);
+        }
+      }
+    }
   }
   console.log('');
   if (report.ok) {
-    console.log('OK: os ambientes efetivos dos serviços satisfazem o contrato.');
     console.log(
-      'Isto NÃO testa conectividade (Postgres/Redis/S3/IdP) nem os gates de boot próprios do ' +
-        'admin-ui — ver docs/runbooks/deploy-prod.md §1, "O que o preflight NÃO cobre".',
+      'OK: os ambientes efetivos satisfazem TODOS os subsets do contrato que cada container avalia,',
+    );
+    console.log('e os gates de boot próprios do admin-ui.');
+    console.log(
+      'Isto NÃO testa conectividade (Postgres/Redis/S3/IdP) — ver docs/runbooks/deploy-prod.md §1, ' +
+        '"O que o preflight NÃO cobre".',
     );
     return 0;
   }

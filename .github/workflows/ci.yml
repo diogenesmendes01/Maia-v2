@@ -75,6 +75,15 @@ jobs:
       OWNER_NOME: Test Owner
       VOYAGE_API_KEY: test-voyage-key
       ALERT_CHANNELS: log
+      # `tests/unit/config/compose-config-differential.spec.ts` compara o
+      # ambiente que `src/config/compose-env.ts` reconstrói com o que o
+      # `docker compose config` REAL resolve — a única medição do preflight que
+      # não passa pelo parser customizado dele. Sem o CLI do Compose o arquivo
+      # se PULA, e um diferencial que se pula em silêncio no CI não mede nada:
+      # esta variável transforma a ausência em FALHA. `docker compose` vem
+      # pré-instalado no runner `ubuntu-latest` e NÃO precisa de daemon (o
+      # subcomando `config` só carrega e interpola o modelo do projeto).
+      MAIA_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
     steps:
       - uses: actions/checkout@v6
 

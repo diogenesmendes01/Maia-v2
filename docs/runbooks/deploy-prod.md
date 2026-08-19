@@ -78,12 +78,21 @@ docker compose --env-file .env.infra -f compose.prod.yml ps
 $ npm run config:preflight
 Maia config preflight — compose.prod.yml (interpolação: .env.infra)
 
-── serviço migrate → loader migrator · env_file: (nenhum)
-  Maia config — profile production (contrato 1.0.0, hash 895b4af7779cc842)
-  OK: nenhuma inconsistência encontrada.
+── serviço migrate → loaders migrator · env_file: (nenhum)
+  · subset migrator
+    Maia config — profile production (contrato 1.0.0, hash 895b4af7779cc842)
+    OK: nenhuma inconsistência encontrada.
 
-── serviço app → loader runtime · env_file: .env.app
+── serviço app → loaders runtime · env_file: .env.app
   ...
+
+── serviço admin-ui → loaders runtime + admin-ui · env_file: .env.admin
+  · subset runtime
+    ...
+  · subset admin-ui
+    ...
+  · gates de boot do admin-ui (src/admin-ui/lib/auth-gating.ts)
+    OK: comprimentos e padrões aceitos (isto NÃO testa o IdP).
 ```
 
 Sai **0** quando os três ambientes efetivos satisfazem o contrato, e **1** com
@@ -101,13 +110,41 @@ lados — acusa como ausente o que o compose injeta, e não vê o que o compose
 sobrescreve. E `config check` valida o contrato INTEIRO, então reprovaria o
 `migrate` (que de propósito recebe só o subset `migrator`) por variáveis que ele
 nunca deve ver. O preflight compõe as duas fontes na precedência do Compose
-(`env_file` primeiro, `environment:` por cima) e valida **cada serviço com o
-subset do seu próprio loader** — o mesmo `loadServiceConfig` do boot.
+(`env_file` primeiro, `environment:` por cima) e valida **cada serviço contra
+TODOS os subsets que o processo daquele container avalia no boot** — o mesmo
+`validateConfig` do boot.
+
+“Todos”, e não “o loader nominal”, é o ponto: o container do `admin-ui` importa
+`src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts` e
+`src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), e aquele
+singleton chama `validateConfig({ service: 'runtime' })`. Ele é portanto
+validado contra **`runtime` + `admin-ui`**, mais os **gates de boot próprios do
+console**. Antes da review de PR #595 o preflight validava só o subset
+`admin-ui`: tirar do `.env.admin` uma chave somente-runtime deixava o comando
+verde e o container caía no boot.
 
 Ele lê o compose com o mesmo parser subset estrito das specs de #516
-(`src/config/compose-env.ts`) e a mesma interpolação `${VAR:?…}` fail-closed do
-`docker compose`: um `.env.infra` sem `MAIA_ENV` **falha no preflight**, na
-mesma linha em que o `up` abortaria.
+(`src/config/compose-env.ts`) e a interpolação COMPLETA do
+`compose-go/template` — `$$`, `$VAR`, `${VAR}`, `${VAR:-d}`, `${VAR-d}`,
+`${VAR:+r}`, `${VAR+r}`, `${VAR:?m}`, `${VAR?m}` —, inclusive **dentro dos
+`env_file`**, que o `docker compose` também interpola (aspas simples continuam
+literais). Um `.env.infra` sem `MAIA_ENV` **falha no preflight**, na mesma linha
+em que o `up` abortaria; uma forma que o parser não reconheça **lança**, em vez
+de resolver diferente do Compose.
+
+`tests/unit/config/compose-config-differential.spec.ts` compara o ambiente
+reconstruído com o que o `docker compose config` REAL resolve (o subcomando
+`config` não precisa de daemon). É a única medição do preflight que não passa
+pelo parser dele — sem ela, os dois lados do teste poderiam errar juntos.
+
+**Execução HERMÉTICA, e o shell.** A interpolação sai do `.env.infra` e de mais
+nada. O `docker compose`, porém, dá **precedência ao ambiente exportado no
+shell** sobre o `--env-file`. Então o preflight compara: toda variável
+referenciada pelo compose que esteja exportada no seu shell **com valor
+diferente** do `.env.infra` é reportada como divergência e **reprova** o
+comando, com o nome da variável (nunca o valor) e a instrução de `unset` ou de
+alinhar o arquivo. Sem isso, um `export MAIA_ENV=staging` esquecido faria o
+preflight certificar um ambiente e o `up` subir outro.
 
 Argumentos: `--compose <arquivo>` (default `compose.prod.yml`), `--infra
 <arquivo>` (default `.env.infra`), `--profile <p>` para forçar um profile e
@@ -121,9 +158,9 @@ que o **contrato** está satisfeito. Fora do alcance dele:
 | Não cobre | Onde isso aparece |
 |---|---|
 | **Conectividade.** Nada abre conexão com Postgres, Redis, S3 ou IdP. Um `BACKUP_S3_BUCKET` sintaticamente válido apontando para bucket inexistente passa. | `maia doctor` (issue #517); a primeira run do `nightly_backup` |
-| **Os gates de boot PRÓPRIOS do admin-ui**, que são mais estritos que o contrato em pelo menos dois pontos: `NEXTAUTH_SECRET` >= 32 chars (o contrato pede `min(8)`) e `OIDC_CLIENT_SECRET` >= 16 chars (o contrato só cobra presença). | `resolveSecret` / `oidcProviderEnabled`, [`src/admin-ui/lib/auth-gating.ts`](../../src/admin-ui/lib/auth-gating.ts) |
+| **A CONECTIVIDADE do IdP.** Os gates de boot do admin-ui (comprimento de `NEXTAUTH_SECRET` e `OIDC_CLIENT_SECRET`, padrões de placeholder, `https://` do issuer) **passaram a ser cobertos** — `src/config/admin-boot-gates.ts`, espelhado com teste de paridade. O que continua fora é se o issuer existe, se o client é válido e se o IdP responde. | `maia doctor` (issue #517); a primeira tentativa de sign-in |
 | **O `.env.infra` além da interpolação.** Ele é lido para resolver `${…}`; o preflight não julga a força da senha do Postgres. | — |
-| **Qualquer coisa que o operador passe direto ao `docker compose` na linha de comando** (`-e`, `--env-file` extra, variáveis do shell). O preflight lê os arquivos, não a invocação. | — |
+| **Qualquer coisa que o operador passe direto ao `docker compose` na linha de comando** (`-e`, `--env-file` extra). O preflight lê os arquivos, não a invocação. Variáveis do SHELL são a exceção: elas são detectadas e reprovam (ver acima). | — |
 | **Migrations, imagem e runtime.** O smoke do §0 é quem cobre isso. | `npm run smoke:migrate:image` |
 
 #### Por que o preflight é a ÚNICA checagem do subset `admin-ui`
@@ -131,13 +168,24 @@ que o **contrato** está satisfeito. Fora do alcance dele:
 Vale dizer isto em voz alta, porque muda o que "reprova no boot" significa para
 o container do console.
 
-O `admin-ui` importa `src/config/env.ts` transitivamente (via `@/db/client.ts`),
-e esse singleton valida o contrato com **`service: 'runtime'`**
-([`src/config/env.ts`](../../src/config/env.ts), `loadConfig()`). As `OIDC_*` são
-`services: ['admin-ui']`, ou seja, estão FORA desse subset — o `requiredIn`
-delas nunca é avaliado ali, e o `validateConfig` descarta explicitamente
-achados cross-field sobre variáveis fora do escopo do serviço pedido
-([`src/config/validate.ts`](../../src/config/validate.ts)). `loadAdminConfig()`
+O `admin-ui` importa `src/config/env.ts` — direto em
+[`src/admin-ui/trpc/tool-enablement.ts`](../../src/admin-ui/trpc/tool-enablement.ts)
+e [`src/admin-ui/trpc/routers/tools-catalog.ts`](../../src/admin-ui/trpc/routers/tools-catalog.ts),
+e transitivamente via `@/db/client.ts` — e esse singleton valida o contrato com
+**`service: 'runtime'`** ([`src/config/env.ts`](../../src/config/env.ts),
+`loadConfig()`). Isso corta dos DOIS lados:
+
+- as `OIDC_*` são `services: ['admin-ui']`, ou seja, estão FORA desse subset — o
+  `requiredIn` delas nunca é avaliado ali, e o `validateConfig` descarta
+  explicitamente achados cross-field sobre variáveis fora do escopo do serviço
+  pedido ([`src/config/validate.ts`](../../src/config/validate.ts));
+- e o subset `runtime` INTEIRO é cobrado do container do console, inclusive
+  chaves que ele nunca usa (`WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_*`,
+  `RUNTIME_TRACE_HMAC_MASTER_SECRET` e as seis `BACKUP_*`). É por isso que
+  `.env.admin.prod.example` as traz — ver o CAVEAT no topo daquele arquivo, e o
+  aviso de blast radius do bloco `BACKUP_*`.
+
+`loadAdminConfig()`
 ([`src/config/admin-config.ts`](../../src/config/admin-config.ts)) existe, mas
 **nenhum caminho de boot o chama**.
 
@@ -151,9 +199,16 @@ ZERO providers e entrega a tela "no providers configured". E o literal
 `admin-ui`, que aquele boot não avalia.
 
 `npm run config:preflight` é, hoje, o único lugar que roda o loader
-`admin-ui` sobre o ambiente efetivo do container `admin-ui`. Fechar essa
-assimetria no código (fazer o admin-ui validar o SEU subset no boot) é
-trabalho separado, e está fora desta mudança.
+`admin-ui` sobre o ambiente efetivo do container `admin-ui` — e desde a review
+de PR #595 ele roda TAMBÉM o subset `runtime` e os gates de boot do console,
+porque é isso que o container faz.
+
+**O que continua dependendo de disciplina de runbook, dito sem eufemismo:**
+fechar a assimetria no CÓDIGO — fazer o boot do console chamar
+`loadAdminConfig()` — é a **issue #596**, e NÃO está feito. Enquanto ela não
+landar, pular `npm run config:preflight` ainda permite subir um `admin-ui` sem o
+subset OIDC/fail-closed avaliado. O preflight é o gate; ele só protege quem o
+roda.
 
 #### O gap que ele fechou
 
