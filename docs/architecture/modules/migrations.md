@@ -128,6 +128,8 @@ That only works **across commits**. In `runner` mode the whole file is one trans
 
 `115_agent_turns_pending_race_lost.sql` is the worked example: three phases (new constraint under a temporary name `NOT VALID` → `VALIDATE` → short catalog-only swap), each its own commit. The price is the `none` protocol — the ledger row no longer commits with the DDL — so the file owes the reader an explicit crash matrix, and the runbook owes the operator a recovery table per intermediate state ([`docs/runbooks/migrations.md`](../../runbooks/migrations.md#dirty-on-115_agent_turns_pending_race_lostsql-troca-de-check-em-fases)). `tests/integration/migration-115-constraint-swap.spec.ts` pins the guarantee observably: a second client writes to `agent_turns` while the `VALIDATE` runs, under `lock_timeout`, and dies with `55P03` the moment the marker is removed.
 
+`116_mensagens_tipo_evento.sql` is the second one, on `mensagens` — the inbound/outbound table, where holding `ACCESS EXCLUSIVE` for the scan blocks every message in and out. It shipped first as a bare `DROP` + `ADD` in `runner` mode and was rewritten to the same three phases; `tests/integration/migration-116-constraint-swap.spec.ts` pins it the same observable way.
+
 **Down files are the opposite case.** They are applied by hand with `psql -v ON_ERROR_STOP=1 -f`, statement by statement, in a maintenance window — so a down that is *meant* to fail (because reverting would destroy evidence) must be one complete `BEGIN; … COMMIT;`, or its deliberate failure commits the `DROP` and leaves the table without the constraint it was protecting.
 
 ## States and what blocks
