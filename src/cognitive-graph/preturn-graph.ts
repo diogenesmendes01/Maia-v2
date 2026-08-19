@@ -37,11 +37,16 @@ export function buildPreturnNodes(args: { multi_channel_on: boolean }): ModuleDe
     version: 'v1',
     parallelizable: true,
     fallback: null,
-    run: async (ctx) => {
+    // Issue #507 (achado 2) — `signal` é o sinal COMPOSTO do node (cancelamento
+    // do turno + timeout de 5 s). Ele desce até o `callLLM` de CADA candidato
+    // dentro de `selectProcedure`, que é um laço: sem isto, perder a lease no
+    // meio do laço ainda pagava todas as chamadas restantes.
+    run: async (ctx, signal) => {
       const r: SelectorDecision = await selectProcedure({
         conversa_id: ctx.conversa_id,
         current_message: ctx.inbound_text,
         current_execution: ctx.current_execution,
+        signal,
       });
       return r;
     },
@@ -62,7 +67,7 @@ export function buildPreturnNodes(args: { multi_channel_on: boolean }): ModuleDe
       parallelizable: true,
       runWhen: (ctx) => ctx.role_inputs !== undefined,
       fallback: null,
-      run: async (ctx) => {
+      run: async (ctx, signal) => {
         if (!ctx.role_inputs) return null;
         return await selectRole({
           inbound_text: ctx.inbound_text,
@@ -72,6 +77,10 @@ export function buildPreturnNodes(args: { multi_channel_on: boolean }): ModuleDe
           conversa_id: ctx.conversa_id,
           channel_id: ctx.role_inputs.channel_id,
           turno_id: ctx.turno_id,
+          // Issue #507 (achado 2) — desce ao `callLLM` do llm-suggester E ao
+          // guard que impede a gravação em `role_selector_decisions` depois de
+          // a posse cair.
+          signal,
         });
       },
     });

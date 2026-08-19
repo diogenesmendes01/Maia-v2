@@ -25,19 +25,33 @@ export type ModuleDescriptor<TIn, TOut> = {
   runWhen?: (input: TIn) => boolean;
   /** Valor (ou função geradora) usado em timeout/erro. Sem fallback: output=null. */
   fallback?: TOut | (() => TOut);
-  /** Implementação. Recebe input tipado, retorna output tipado. */
-  run: (input: TIn) => Promise<TOut>;
+  /**
+   * Implementação. Recebe input tipado, retorna output tipado.
+   *
+   * Issue #507 (achado 2 da revisão do dono) — o segundo parâmetro é o sinal
+   * COMPOSTO que `runCognitiveModule` monta (cancelamento do turno + timeout
+   * do node). Quem implementa o node é quem sabe onde entregá-lo: o parâmetro
+   * `signal` de `callLLM`, de um port, de um `fetch`.
+   *
+   * Opcional na prática: em TypeScript uma função que declara MENOS parâmetros
+   * é atribuível a uma que declara mais, então todo node `(ctx) => …` que
+   * existia continua válido — e continua sendo NÃO cooperativo, que é o estado
+   * anterior, não uma regressão nova.
+   */
+  run: (input: TIn, signal: AbortSignal) => Promise<TOut>;
 };
 
 /** Resultado de um único node. Mirror de `RunModuleResult` mas com nome do node. */
 export type NodeRunResult<TOut> = {
   /**
-   * Issue #507 — espelha `RunModuleResult['status']`, e por isso ganhou
-   * `cancelled` junto. Hoje o valor é INALCANÇÁVEL por aqui: `runOne` não passa
-   * `signal` ao runner, e sem sinal o runner nunca produz `cancelled`. O tipo
-   * acompanha assim mesmo porque a alternativa — estreitar com um `else`
-   * inventado no orchestrator — criaria um ramo morto que mentiria sobre o
-   * desfecho no dia em que o grafo receber o sinal do turno.
+   * Issue #507 — espelha `RunModuleResult['status']`, `cancelled` incluído.
+   *
+   * O valor É ALCANÇÁVEL desde a revisão do dono (achado 2): `runOne` repassa
+   * `ctx.signal` ao runner, e o core preenche esse campo com o
+   * `TurnExecutionContext.signal` da tentativa. Perdida a lease durante o
+   * `procedure-selector` ou o `role-selector`, o node termina em `cancelled`
+   * com `output: null` — e o guard logo após `runNodes` em `src/agent/core.ts`
+   * encerra a tentativa antes que qualquer output seja consumido.
    */
   status: 'success' | 'timeout' | 'error' | 'skipped' | 'cancelled';
   output: TOut | null;
@@ -62,4 +76,17 @@ export type GraphRunResult = {
 export type GraphContext = {
   conversa_id?: string;
   turno_id?: string;
+  /**
+   * Issue #507 (achado 2) — o sinal de CANCELAMENTO da tentativa de turno,
+   * vindo de `TurnExecutionContext.signal`.
+   *
+   * Sem ele, `procedure-selector` e `role-selector` — que rodam entre o
+   * pending-gate e o ReAct — seguiam até o próprio timeout depois de a lease
+   * cair, e seus resultados ainda podiam virar writes (`procedure_selector_
+   * decisions`, `role_selector_decisions`, start/switch de execução).
+   *
+   * Opcional porque o grafo também roda fora de um turno reivindicado (testes,
+   * workers). Ausente ⇒ comportamento idêntico ao anterior.
+   */
+  signal?: AbortSignal;
 };

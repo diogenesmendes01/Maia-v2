@@ -30,6 +30,10 @@ import type { MetricsClient } from './types.js';
 import { createProductionDecisionEngineEnv } from './prod-env.js';
 import { logger } from '@/lib/logger.js';
 import { traceTurnDecision } from '@/observability/turn-trace.js';
+import {
+  assertTurnOwnership,
+  getTurnExecutionContext,
+} from '@/runtime/turns/execution-context.js';
 
 // ============================================================================
 // Shared types
@@ -167,10 +171,27 @@ export async function runDecisionEngineForTurn(
 ): Promise<RunDecisionEngineResult> {
   const t0 = Date.now();
   let result: DecisionEngineResult;
+  /**
+   * Issue #507 (achado 2 da revisão do dono) — o Decision Engine roda ENTRE o
+   * pending-gate e o ReAct e era chamado sem sinal, embora `engine.run` já
+   * aceite `signal` e o repasse a todos os ports (classificador de intenção,
+   * risk scorer, seletores, PEPs — `src/runtime/decision/decision-engine.ts`).
+   *
+   * Sem ele, perder a lease durante a avaliação não interrompia nada: o motor
+   * ia até o próprio budget e o pacote resultante ainda podia virar BLOCK com
+   * resposta ao usuário (`src/agent/core.ts`, ramo `block`) — efeito de um
+   * turno alheio.
+   */
+  const turnSignal = getTurnExecutionContext()?.signal;
   try {
     const engine = getDecisionEngine();
-    result = await engine.run({ base });
+    result = await engine.run({ base, ...(turnSignal ? { signal: turnSignal } : {}) });
   } catch (err) {
+    // Issue #507 — a posse caiu DURANTE a avaliação. O erro é CONSEQUÊNCIA do
+    // cancelamento, não falha do motor: tratá-lo como fail-closed faria o core
+    // responder "Sistema indisponível" ao usuário e concluir/reagendar um turno
+    // que pertence a outro worker. O guard vem ANTES do wrap, de propósito.
+    assertTurnOwnership('decision_engine');
     logger.error(
       { err, tenant_id: base.tenant_id, trace_id: base.trace_id },
       'decision-engine error',
@@ -179,6 +200,12 @@ export async function runDecisionEngineForTurn(
     // fail-closed: caller MUST handle as block
     throw new DecisionEngineFailClosedError(err, base.tenant_id, base.trace_id);
   }
+
+  // Issue #507 — GUARD DE BOUNDARY: o motor devolveu, mas a posse pode ter
+  // caído durante o await. Nada abaixo pode acontecer sem posse — nem o
+  // envelope durável de `traceTurnDecision` (é write), nem o consumo do pacote
+  // pelo core (que pode bloquear o turno e RESPONDER ao usuário).
+  assertTurnOwnership('decision_engine');
 
   // Issue #514 §4 — durable runtime trace, written AFTER the decision exists
   // and BEFORE the caller acts on it. This is the ordering P10b invariant 12
