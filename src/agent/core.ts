@@ -62,6 +62,9 @@ import {
   turnStateAuthoritative,
   runWithTurnExecution,
   turnOwnershipLost,
+  getTurnExecutionContext,
+  assertTurnOwnership,
+  reportBlockedEffect,
   TurnOwnershipLostError,
   type TurnHandle,
 } from '@/runtime/turns/index.js';
@@ -574,10 +577,49 @@ async function runAgentForMensagemInner(
   // nenhum escopo é aberto e cada guard a jusante é no-op — o comportamento de
   // #503 fica idêntico.
   const execCtx = turn?.lease?.context() ?? null;
-  if (!execCtx) return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
-  return runWithTurnExecution(execCtx, () =>
-    runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
-  );
+  /**
+   * Issue #507 (achado 1 da revisão do dono) — AQUI mora o tratamento de
+   * `TurnOwnershipLostError`, e não mais em volta da chamada ao ReAct.
+   *
+   * O defeito: o `try` cobria só `runReActLoop`. Todo limite de efeito ANTES
+   * dele — o pending-gate (~700 linhas acima), o hook de scheduling, o grafo
+   * pre-turn, o Decision Engine — não tinha para onde lançar, então nenhum
+   * deles lançava; e um turno que já havia perdido a posse seguia gravando
+   * estado e podia até responder ao usuário.
+   *
+   * Por que ESTE ponto: é exatamente onde o escopo de execução da tentativa
+   * ABRE (`runWithTurnExecution`). Fazendo o handler coincidir com o escopo, a
+   * região "roda com posse" e a região "coberta pelo tratamento" passam a ser
+   * a MESMA por construção — um limite de efeito novo, em qualquer ponto do
+   * pipeline, já nasce coberto, sem ninguém precisar lembrar de esticar um
+   * `try`. A alternativa (um guard obrigatório logo após `checkPendingFirst`)
+   * fecharia o achado literal e deixaria o próximo await sem rede.
+   *
+   * O desfecho é o mesmo que a #504 escolheu para o ReAct e continua sendo o
+   * único honesto: SAIR sem concluir, sem agendar retry e sem carimbar
+   * `processada_em`. Quem tem a lease vigente decide o desfecho; qualquer
+   * transição nossa seria recusada pelo fence, e um RETRY seria a gravação em
+   * turno alheio que a #504 proíbe.
+   */
+  try {
+    if (!execCtx) return await runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+    return await runWithTurnExecution(execCtx, () =>
+      runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+    );
+  } catch (err) {
+    if (err instanceof TurnOwnershipLostError) {
+      logger.warn(
+        {
+          mensagem_id,
+          turn_id: turn?.turn_id ?? null,
+          boundary: err.boundary,
+        },
+        'agent.turn_ownership_lost_mid_execution',
+      );
+      return;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -875,6 +917,26 @@ async function runAgentTurnPipeline(params: {
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
+  /**
+   * Issue #507 (achado 1) — a TENTATIVA perdeu a posse durante o classificador
+   * do pending-gate. Isto NÃO é um desfecho de pendência, é o fim do turno
+   * para nós.
+   *
+   * Antes o gate colapsava este caso em `unresolved/low_confidence` e o turno
+   * seguia: `captureInboundForOutreach` logo abaixo, o grafo pre-turn com suas
+   * gravações, o Decision Engine (que pode responder ao usuário) — todos
+   * rodavam em nome de uma posse encerrada, e só ~700 linhas depois o guard do
+   * ReAct interrompia.
+   *
+   * Lançar (em vez de `return`) é o que faz o desfecho ser DECIDIDO num lugar
+   * só: o handler que embrulha o pipeline inteiro em
+   * `runAgentForMensagemInner`. Nada de `concludeTurn`, nada de
+   * `failTurnRetryable`, nada de `markAllProcessed` aqui — ver o comentário lá.
+   */
+  if (gate.kind === 'cancelled') {
+    reportBlockedEffect('pending_gate');
+    throw new TurnOwnershipLostError('pending_gate', turn?.turn_id ?? null);
+  }
   // 'unresolved' and 'no_pending' fall through.
 
   // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound
@@ -887,6 +949,12 @@ async function runAgentTurnPipeline(params: {
   //    answer the sender so they don't get silence.
   //  - no_match: no scheduling state cares about this inbound; continue.
   // PR #406: Scheduling V2 collapsed to always-on (FEATURE_SCHEDULING_V2 removed).
+  // Issue #507 (achado 1) — GUARD DE BOUNDARY. `captureInboundForOutreach`
+  // MUTA estado de scheduling (anexa a resposta à occurrence, avança a
+  // máquina, pode notificar o dono). Vem ANTES do `try` de propósito: o catch
+  // abaixo é fail-soft e engoliria a recusa, transformando "perdi a posse" em
+  // "o hook falhou, siga em frente" — que é o oposto do desfecho correto.
+  assertTurnOwnership('scheduling_inbound_hook');
   if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
       const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
@@ -957,6 +1025,7 @@ async function runAgentTurnPipeline(params: {
   // undefined` (que por sua vez exige channel_id resolvido + policy), então
   // passar true aqui apenas mantém o node disponível e deixa `buildRoleInputs`
   // decidir por turno.
+  const turnSignal = getTurnExecutionContext()?.signal;
   try {
     activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
     const role_inputs = await buildRoleInputs(channel_id);
@@ -973,8 +1042,20 @@ async function runAgentTurnPipeline(params: {
           }
         : null,
       ...(role_inputs ? { role_inputs } : {}),
+      // Issue #507 (achado 2) — o sinal da TENTATIVA entra no grafo. Daqui ele
+      // desce por `runOne` → `runCognitiveModule` → `n.run` → `callLLM` de cada
+      // reasoner (`procedure-selector`, `role-selector`).
+      ...(turnSignal ? { signal: turnSignal } : {}),
     };
     const result = await runNodes(nodes, ctx);
+
+    // Issue #507 (achado 2 da revisão do dono) — GUARD DE BOUNDARY, antes de
+    // CONSUMIR o resultado. Tudo o que vem abaixo é write:
+    // `procedure_selector_decisions`, `startExecution`, `abortExecution`, e o
+    // `activeRole`/`roleAnnouncement` que o ReAct usaria. Perdida a lease
+    // durante o grafo, os nodes voltam `cancelled`/`null`, mas o que impede a
+    // gravação é este guard — não o valor do output.
+    assertTurnOwnership('preturn_graph');
 
     // Side effects POST-graph — procedure-selector decision + start/switch.
     const selectorOutput = result.nodes['procedure-selector']?.output as
@@ -1086,6 +1167,11 @@ async function runAgentTurnPipeline(params: {
       }
     }
   } catch (err) {
+    // Issue #507 — a recusa por perda de posse ATRAVESSA este catch. Ele é
+    // fail-soft por desenho ("procedure runtime nunca derruba o turno"), e
+    // engolir `TurnOwnershipLostError` aqui devolveria o pipeline ao fluxo
+    // normal — exatamente o defeito do achado 1, um andar abaixo.
+    if (err instanceof TurnOwnershipLostError) throw err;
     logger.warn(
       { err: (err as Error).message, conversa_id: c.id },
       'preturn.graph_failed',
@@ -1455,6 +1541,10 @@ async function runAgentTurnPipeline(params: {
       await clearDebounceState(pessoa.telefone_whatsapp);
       return;
     }
+    // Issue #507 (achado 2) — perda de posse não é "erro de wiring". O ramo
+    // abaixo CONTINUA o turno; deixar a recusa cair nele faria a tentativa
+    // seguir para prompt, ReAct e outbound sem posse alguma.
+    if (err instanceof TurnOwnershipLostError) throw err;
     // Unexpected error from the wiring itself (not the engine) → warn and continue
     logger.warn(
       { err: (err as Error).message },
@@ -1510,32 +1600,15 @@ async function runAgentTurnPipeline(params: {
     reactOutboundText = result.outboundText;
     reactToolsCalled = result.toolsCalled;
     reactDelivery = result.delivery;
-  } catch (err) {
-    // Issue #504 §Fencing — a posse acabou NO MEIO da execução. O ReAct parou
-    // no topo de uma iteração, então nenhum LLM, nenhuma tool e nenhum outbound
-    // rodaram a partir dali.
-    //
-    // Saímos SEM concluir e SEM agendar retry, e isso é a escolha certa: o
-    // turno pertence a quem tem a lease vigente, e é essa tentativa que vai
-    // decidir o desfecho. Qualquer transição nossa aqui seria recusada pelo
-    // fence de qualquer forma (`resolveFence` devolveria `lost`); pular a
-    // tentativa evita o barulho de uma rejeição que já sabemos que virá.
-    //
-    // Também NÃO carimbamos `processada_em`: era exatamente assim que um
-    // zumbi fazia o turno do dono legítimo parecer processado por fora.
-    if (err instanceof TurnOwnershipLostError) {
-      logger.warn(
-        {
-          mensagem_id: inbound.id,
-          turn_id: turn?.turn_id ?? null,
-          boundary: err.boundary,
-        },
-        'agent.turn_ownership_lost_mid_execution',
-      );
-      return;
-    }
-    throw err;
   } finally {
+    // Issue #507 (achado 1) — o ramo `TurnOwnershipLostError` que ficava AQUI
+    // saiu: o tratamento é único e vive em `runAgentForMensagemInner`, em volta
+    // do pipeline inteiro. Dois handlers com a mesma decisão era o que dava a
+    // impressão de cobertura — e o de cima cobria só o ReAct.
+    //
+    // O `finally` fica, e é o motivo de este `try` continuar existindo: o
+    // indicador de "digitando" tem de parar em QUALQUER saída, inclusive na
+    // recusa por perda de posse a caminho do handler externo.
     stopTyping();
   }
 
