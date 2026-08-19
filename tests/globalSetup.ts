@@ -14,7 +14,8 @@
  *     registro de "aplicada";
  *  3. limpa o db lógico do Redis da worktree, para que resíduo de uma rodada
  *     anterior (`bull:agent:*` é o caso documentado no `vitest.config.ts`) não
- *     seja lido como resultado desta.
+ *     seja lido como resultado desta — e FALHA a rodada se não conseguir
+ *     limpar, porque prosseguir é ler resíduo como resultado.
  *
  * Fora de uma worktree ligada (checkout principal, CI) NADA disso roda: o
  * escopo é `null` e o comportamento é o de sempre — o CI já cria seus próprios
@@ -26,10 +27,11 @@ import pg from 'pg';
 import IORedis from 'ioredis';
 import { arquivoDoPacote } from './helpers/pkg-path.js';
 import {
-  BASE_REDIS_URL,
+  databaseNameOf,
+  resolveTestEnv,
   resolveWorktreeScope,
-  scopedDatabaseUrl,
-  scopedRedisUrl,
+  sanitizarMensagem,
+  sanitizarUrl,
   type WorktreeScope,
 } from './helpers/worktree-scope.js';
 
@@ -40,10 +42,6 @@ function maintenanceUrl(scopedUrl: string): string {
   const url = new URL(scopedUrl);
   url.pathname = '/postgres';
   return url.toString();
-}
-
-function databaseNameOf(url: string): string {
-  return new URL(url).pathname.replace(/^\//, '');
 }
 
 async function ensureDatabase(scopedUrl: string): Promise<void> {
@@ -89,21 +87,55 @@ async function migrate(scope: WorktreeScope, scopedUrl: string): Promise<void> {
   console.log(`[#571] migrations em ${databaseNameOf(scopedUrl)} — ${outcome}`);
 }
 
-async function flushRedis(scope: WorktreeScope): Promise<void> {
-  const url = scopedRedisUrl(process.env.REDIS_URL ?? BASE_REDIS_URL, scope);
+/**
+ * Limpa o db lógico do Redis desta worktree — e FALHA FECHADO se não
+ * conseguir.
+ *
+ * Isto só é chamado depois de `TEST_DB_URL` estar definida, ou seja: numa
+ * rodada que PEDIU infra real. A versão anterior engolia qualquer erro em
+ * silêncio com a justificativa de que "Redis fora do ar é o caso normal de uma
+ * rodada só de unit" — mas a rodada só de unit nem chega aqui, porque não tem
+ * `TEST_DB_URL`. O que o `catch` mudo cobria de fato era o caso ruim: ACL que
+ * recusa `FLUSHDB`, índice de db fora do `--databases` do servidor, Redis
+ * indisponível. Nesses casos a suíte seguia lendo resíduo da rodada anterior
+ * como resultado desta — que é o incidente que a issue #571 existe para
+ * fechar.
+ *
+ * A tolerância a Redis ausente continua existindo: ela mora no caminho que NÃO
+ * define `TEST_DB_URL` (`setup()` abaixo retorna antes), e nas specs que
+ * precisam de Redis e falham com mensagem própria (`assertRedisReachable`).
+ *
+ * O diagnóstico é sanitizado: diz para onde a conexão foi, sem a senha.
+ */
+export async function flushRedis(url: string, redisDb: number): Promise<void> {
   const client = new IORedis(url, {
     lazyConnect: true,
     maxRetriesPerRequest: 1,
     connectTimeout: 1_000,
     retryStrategy: () => null,
   });
+  // O ioredis emite `error` no cliente ALÉM de rejeitar o `connect()`. Sem um
+  // ouvinte, esse evento vira "Unhandled error event" no log — ruído que
+  // esconde a mensagem abaixo, que é a que interessa.
+  client.on('error', () => {});
   try {
     await client.connect();
     await client.flushdb();
-    console.log(`[#571] redis db ${scope.redisDb} limpo`);
-  } catch {
-    // Redis fora do ar é o caso normal de uma rodada só de unit: as specs que
-    // precisam dele já falham com mensagem própria (`assertRedisReachable`).
+    console.log(`[#571] redis db ${redisDb} limpo (${sanitizarUrl(url)})`);
+  } catch (erro) {
+    const causa = sanitizarMensagem(erro instanceof Error ? erro.message : String(erro));
+    throw new Error(
+      [
+        `#571: falhei em limpar o db ${redisDb} do Redis em ${sanitizarUrl(url)}.`,
+        'Esta rodada pediu infra real (TEST_DB_URL definida) e seguir sem limpar',
+        'deixaria resíduo de uma rodada anterior ser lido como resultado desta.',
+        `Causa: ${causa}.`,
+        'Remédio: suba a infra (`npm run test:integration:setup`), confira REDIS_URL,',
+        'e garanta que a ACL permite FLUSHDB e que o índice existe no servidor',
+        '(`--databases` do redis-server vs TEST_REDIS_DATABASES).',
+      ].join(' '),
+      { cause: erro },
+    );
   } finally {
     client.disconnect();
   }
@@ -118,8 +150,11 @@ export async function setup(): Promise<void> {
     return;
   }
 
-  const scopedUrl = scopedDatabaseUrl(process.env.TEST_DB_URL, scope);
-  await ensureDatabase(scopedUrl);
-  await migrate(scope, scopedUrl);
-  await flushRedis(scope);
+  // MESMA função que `tests/setup.ts` chama em cada worker: o banco que este
+  // processo cria e o db do Redis que ele limpa são, por construção, os que a
+  // rodada vai usar. Ver `resolveTestEnv` em `helpers/worktree-scope.ts`.
+  const ambiente = resolveTestEnv(process.env, scope);
+  await ensureDatabase(ambiente.DATABASE_URL);
+  await migrate(scope, ambiente.DATABASE_URL);
+  await flushRedis(ambiente.REDIS_URL, scope.redisDb);
 }

@@ -22,7 +22,7 @@
  */
 import { spawn } from 'node:child_process';
 import { arquivoDoPacote } from '../tests/helpers/pkg-path.js';
-import { BASE_TEST_DB_URL } from '../tests/helpers/worktree-scope.js';
+import { baseRedisUrl, basePostgresUrl } from '../tests/helpers/worktree-scope.js';
 
 const extra = process.argv.slice(2);
 const alvo = extra.length > 0 ? extra : ['tests/integration'];
@@ -32,7 +32,17 @@ const filho = spawn(
   [arquivoDoPacote('vitest', 'vitest.mjs'), 'run', ...alvo, '--no-coverage'],
   {
     stdio: 'inherit',
-    env: { ...process.env, TEST_DB_URL: process.env.TEST_DB_URL ?? BASE_TEST_DB_URL },
+    // As DUAS bases entram explicitamente no ambiente do filho — revisão da
+    // PR #597. Deixar `REDIS_URL` implícita foi como o setup global e os
+    // workers acabaram apontando para endpoints diferentes: cada um aplicava
+    // sua própria regra de fallback. Aqui a regra é aplicada UMA vez, no
+    // coordenador, e o que desce para o vitest (e dele para `globalSetup` e
+    // para cada worker) já é o valor resolvido.
+    env: {
+      ...process.env,
+      TEST_DB_URL: basePostgresUrl(process.env),
+      REDIS_URL: baseRedisUrl(process.env),
+    },
   },
 );
 

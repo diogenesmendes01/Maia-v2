@@ -6,14 +6,7 @@
  * from blowing up `loadConfig`.
  */
 import { beforeEach } from 'vitest';
-import {
-  BASE_REDIS_URL,
-  BASE_TEST_DB_URL,
-  resolveWorktreeScope,
-  scopedDatabaseName,
-  scopedDatabaseUrl,
-  scopedRedisUrl,
-} from './helpers/worktree-scope.js';
+import { resolveTestEnv, resolveWorktreeScope } from './helpers/worktree-scope.js';
 
 /**
  * Issue #571 — isolamento por worktree.
@@ -30,27 +23,23 @@ import {
  */
 const scope = resolveWorktreeScope();
 
-process.env.NODE_ENV = 'test';
-process.env.DATABASE_URL = scopedDatabaseUrl(BASE_TEST_DB_URL, scope);
-process.env.POSTGRES_USER = 'maia_test';
-process.env.POSTGRES_PASSWORD = 'test1234';
-process.env.POSTGRES_DB = scopedDatabaseName('maia_test', scope);
-process.env.REDIS_URL = scopedRedisUrl(BASE_REDIS_URL, scope);
-
 /**
- * `TEST_DB_URL` é o interruptor das specs de integração (sem ela, todas dão
- * `describe.skip`). NÃO a inventamos aqui — `npm test` continua passando sem
- * infra nenhuma. Mas quando ela existe, ela é REESCRITA para o banco desta
- * worktree: quem copiou a URL compartilhada do README ganha isolamento sem
- * saber que precisava dele.
+ * UMA derivação, dois processos — revisão da PR #597.
  *
- * As specs afirmam `DATABASE_URL === TEST_DB_URL` antes de rodar (54 arquivos);
- * escrever as duas com a mesma função é o que mantém essa igualdade de pé.
+ * `resolveTestEnv()` é a MESMA função que `tests/globalSetup.ts` chama para
+ * decidir qual banco criar/migrar e qual db do Redis limpar. Antes, cada
+ * arquivo montava as URLs por conta própria e as duas expressões divergiram:
+ * o setup global respeitava `REDIS_URL` do ambiente e os workers iam sempre
+ * para `redis://localhost:6379`. Com um Redis em porta/host/credencial
+ * customizados, o `FLUSHDB` acertava um endpoint e os testes rodavam noutro.
+ *
+ * `TEST_DB_URL` é o interruptor das specs de integração (sem ela, todas dão
+ * `describe.skip`) e NÃO é inventada aqui — `npm test` continua passando sem
+ * infra nenhuma. Quando ela existe, sai escopada, e `DATABASE_URL` sai igual a
+ * ela: 54 arquivos afirmam essa igualdade antes de rodar.
  */
-if (process.env.TEST_DB_URL) {
-  process.env.TEST_DB_URL = scopedDatabaseUrl(process.env.TEST_DB_URL, scope);
-  process.env.DATABASE_URL = process.env.TEST_DB_URL;
-}
+Object.assign(process.env, { NODE_ENV: 'test' }, resolveTestEnv(process.env, scope));
+
 process.env.ANTHROPIC_API_KEY = 'sk-ant-test-placeholder';
 process.env.OPENROUTER_API_KEY = 'sk-or-test-placeholder';
 process.env.WHATSAPP_NUMBER_MAIA = '+5500000000000';
