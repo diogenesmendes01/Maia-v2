@@ -14,7 +14,24 @@
 # Redis ficam publicados APENAS em 127.0.0.1 — nunca em 0.0.0.0 — para que
 # uma máquina de dev em rede aberta não exponha datastore com credencial
 # fraca (auditoria P0 cap. 6).
+#
+# PROJECT NAME FIXO (issue #571, revisão da PR #597). Sem esta linha, o
+# Compose deriva o nome do projeto do DIRETÓRIO que invocou o comando — e
+# como cada `git worktree` tem diretório próprio, cada árvore pedia uma
+# PILHA PRÓPRIA com `container_name` e portas GLOBAIS. A segunda worktree a
+# rodar `npm run test:integration:setup` batia em "container name already
+# in use".
+#
+# O modelo escolhido é INFRA FÍSICA COMPARTILHADA, um coordenador só: um
+# Postgres e um Redis para o host, e o isolamento entre worktrees uma camada
+# acima (banco por worktree + db lógico do Redis por worktree — README §
+# Isolamento por worktree). `maia-v2` é exatamente o nome que o Compose já
+# derivava do checkout principal, então nenhum volume existente vira órfão.
+# O bring-up e o teardown passam por `scripts/test-infra.ts`, que torna o
+# `up` idempotente sob mutex e exige consentimento explícito para o `down`.
 # =======================================================================
+name: maia-v2
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
