@@ -1,25 +1,36 @@
 /**
  * Issue #571 — o derivador de escopo por worktree.
  *
- * O que este arquivo cobre é a parte PURA (a reescrita das URLs) e a
- * ESTABILIDADE da parte com I/O (a alocação do db do Redis). A prova de que o
- * isolamento funciona de ponta a ponta é comportamental e vive noutro lugar:
- * duas rodadas concorrentes em worktrees diferentes, cada uma só enxergando os
- * próprios dados. Um teste unitário não substitui aquilo — ele impede que
- * alguém quebre a derivação sem perceber.
+ * O que este arquivo cobre é a parte PURA: a reescrita das URLs e a COMPOSIÇÃO
+ * do ambiente de teste. A prova comportamental — worktrees de verdade,
+ * processos concorrentes, dbs distintos — é
+ * `worktree-scope-concorrencia.spec.ts`, e a prova com infra ao vivo é
+ * `tests/integration/worktree-isolamento-canario.spec.ts`. Os três juntos
+ * substituem o que a PR #597 tinha: casos que faziam `return` quando o escopo
+ * era `null`, e portanto não executavam nada no CI.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { comLockDeDiretorio } from '../../helpers/lock-de-diretorio.js';
 import {
   BASE_REDIS_URL,
   BASE_TEST_DB_URL,
+  baseRedisUrl,
+  basePostgresUrl,
+  resolveTestEnv,
   resolveWorktreeScope,
+  sanitizarMensagem,
+  sanitizarUrl,
   scopedDatabaseName,
   scopedDatabaseUrl,
   scopedRedisUrl,
   type WorktreeScope,
 } from '../../helpers/worktree-scope.js';
+
+const RAIZ_DOS_TESTES = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const FAKE: WorktreeScope = {
   root: '/repo/.claude/worktrees/exemplo',
@@ -68,6 +79,165 @@ describe('#571 — derivação do escopo por worktree', () => {
 
     it('um `db` já presente na URL base do Redis é SUBSTITUÍDO, não concatenado', () => {
       expect(scopedRedisUrl('redis://localhost:6379/3', FAKE)).toBe('redis://localhost:6379/7');
+    });
+  });
+
+  describe('idempotência da reescrita', () => {
+    it('aplicar o escopo duas vezes dá o mesmo nome de banco', () => {
+      // `tests/setup.ts` passou a derivar a base do AMBIENTE, e um ambiente já
+      // escopado (herdado por um filho, ou reaplicado) geraria `…_wt_x_wt_x` —
+      // um banco que ninguém criou e no qual nenhuma migration rodou.
+      const uma = scopedDatabaseName('maia_test', FAKE);
+      expect(scopedDatabaseName(uma, FAKE)).toBe(uma);
+      const url = scopedDatabaseUrl(BASE_TEST_DB_URL, FAKE);
+      expect(scopedDatabaseUrl(url, FAKE)).toBe(url);
+    });
+  });
+
+  /* ───────────────────────────────────────────────────────────────────────
+   * UMA base, um destino — o achado da revisão da PR #597
+   *
+   * `globalSetup` limpava `process.env.REDIS_URL ?? BASE_REDIS_URL` e os
+   * workers iam sempre para `BASE_REDIS_URL`. Com Redis fora do default, o
+   * `FLUSHDB` acertava um endpoint e os clientes outro.
+   * ─────────────────────────────────────────────────────────────────────── */
+  describe('base única de Redis e Postgres', () => {
+    it('a base do Redis vem do ambiente quando ele diz algo', () => {
+      expect(baseRedisUrl({ REDIS_URL: 'rediss://u:p@r.interno:6380/2' })).toBe(
+        'rediss://u:p@r.interno:6380/2',
+      );
+      expect(baseRedisUrl({})).toBe(BASE_REDIS_URL);
+    });
+
+    it('a base do Postgres vem de TEST_DB_URL, e DATABASE_URL do shell NÃO conta', () => {
+      // `tests/setup.ts` existe para blindar a rodada do shell do
+      // desenvolvedor: quem exporta DATABASE_URL costuma estar apontando para
+      // o banco de DEV, não para o de teste.
+      expect(basePostgresUrl({ TEST_DB_URL: 'postgres://a:b@pg:5433/x' })).toBe(
+        'postgres://a:b@pg:5433/x',
+      );
+      expect(basePostgresUrl({ DATABASE_URL: 'postgres://dev:dev@localhost:5432/maia' })).toBe(
+        BASE_TEST_DB_URL,
+      );
+    });
+
+    it('host, porta, credencial e path não-default sobrevivem ao escopo', () => {
+      const ambiente = resolveTestEnv(
+        {
+          REDIS_URL: 'rediss://cache:s3nh%40@redis.interno:6380/4',
+          TEST_DB_URL: 'postgres://outro_user:outra%40senha@pg.interno:5433/base_custom',
+        },
+        FAKE,
+      );
+      // Só o índice do db muda — esquema, credencial, host e porta ficam.
+      expect(ambiente.REDIS_URL).toBe('rediss://cache:s3nh%40@redis.interno:6380/7');
+      expect(ambiente.DATABASE_URL).toBe(
+        'postgres://outro_user:outra%40senha@pg.interno:5433/base_custom_wt_exemplo_deadbeef',
+      );
+      // E as credenciais avulsas saem da MESMA URL, em vez de ficarem fixas em
+      // `maia_test`/`test1234` como antes.
+      expect(ambiente.POSTGRES_USER).toBe('outro_user');
+      expect(ambiente.POSTGRES_PASSWORD).toBe('outra@senha');
+      expect(ambiente.POSTGRES_DB).toBe('base_custom_wt_exemplo_deadbeef');
+      expect(ambiente.TEST_DB_URL).toBe(ambiente.DATABASE_URL);
+    });
+
+    it('a URL que o setup global LIMPA é a mesma que os workers USAM', () => {
+      // O achado, dito como igualdade. `tests/globalSetup.ts` chama
+      // `resolveTestEnv(process.env, scope).REDIS_URL` para o `FLUSHDB`;
+      // `tests/setup.ts` chama a MESMA função para o que os clientes leem.
+      const env = { REDIS_URL: 'redis://:senha@10.0.0.9:6399', TEST_DB_URL: BASE_TEST_DB_URL };
+      const limpa = resolveTestEnv(env, FAKE).REDIS_URL;
+      const usada = resolveTestEnv(env, FAKE).REDIS_URL;
+      expect(limpa).toBe(usada);
+      expect(limpa).toBe('redis://:senha@10.0.0.9:6399/7');
+    });
+
+    it('nenhum dos dois arquivos compõe URL por conta própria', () => {
+      // Guarda estrutural, e é a que teria pego a divergência original: as duas
+      // expressões existiam em DUAS cópias e uma delas mudou sozinha. Enquanto
+      // `resolveTestEnv` for o único caminho, elas não têm como divergir.
+      for (const arquivo of ['setup.ts', 'globalSetup.ts']) {
+        const fonte = readFileSync(join(RAIZ_DOS_TESTES, arquivo), 'utf8');
+        const codigo = fonte.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+        expect(codigo, `${arquivo} tem de derivar o ambiente por resolveTestEnv`).toContain(
+          'resolveTestEnv',
+        );
+        expect(codigo, `${arquivo} não pode montar a URL do Redis sozinho`).not.toContain(
+          'scopedRedisUrl',
+        );
+        expect(codigo, `${arquivo} não pode montar a URL do Postgres sozinho`).not.toContain(
+          'scopedDatabaseUrl',
+        );
+      }
+    });
+  });
+
+  describe('diagnóstico sem vazar credencial', () => {
+    it('a senha some da URL, o destino fica', () => {
+      expect(sanitizarUrl('rediss://usuario:sup3r-secreta@redis.interno:6380/4')).toBe(
+        'rediss://usuario:***@redis.interno:6380/4',
+      );
+      expect(sanitizarUrl('redis://localhost:6379/2')).toBe('redis://localhost:6379/2');
+      expect(sanitizarUrl('nao é uma url')).toBe('<url ilegível>');
+    });
+
+    it('a senha some também de texto livre de biblioteca', () => {
+      expect(sanitizarMensagem('connect ECONNREFUSED redis://u:sup3r@10.0.0.9:6399')).toBe(
+        'connect ECONNREFUSED redis://u:***@10.0.0.9:6399',
+      );
+    });
+  });
+
+  describe('lock de diretório entre processos', () => {
+    it('o segundo pedido não entra enquanto o primeiro não sai', () => {
+      const base = mkdtempSync(join(tmpdir(), 'wt571-lock-'));
+      const lock = join(base, 'l');
+      try {
+        const externo = comLockDeDiretorio(lock, () =>
+          // Tentativa aninhada: o mesmo caminho, já tomado. Sem espera, porque
+          // o teste não pode ficar 10s parado provando o óbvio.
+          comLockDeDiretorio(lock, () => 'entrou', { esperaMaximaMs: 0 }),
+        );
+        expect(externo.ok).toBe(true);
+        expect(externo.ok && externo.valor.ok, 'o aninhado NÃO podia entrar').toBe(false);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('um lock preso além da validade é quebrado, não eterniza a espera', () => {
+      const base = mkdtempSync(join(tmpdir(), 'wt571-lock-'));
+      const lock = join(base, 'l');
+      try {
+        comLockDeDiretorio(lock, () => {
+          const preso = comLockDeDiretorio(lock, () => 'quebrei', {
+            esperaMaximaMs: 2_000,
+            // Validade negativa: o lock de fora já nasce "velho".
+            validadeMs: -1,
+            passoMs: 1,
+          });
+          expect(preso.ok && preso.valor).toBe('quebrei');
+        });
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it('o corpo libera o lock mesmo estourando', () => {
+      const base = mkdtempSync(join(tmpdir(), 'wt571-lock-'));
+      const lock = join(base, 'l');
+      try {
+        expect(() =>
+          comLockDeDiretorio(lock, () => {
+            throw new Error('boom');
+          }),
+        ).toThrow('boom');
+        const depois = comLockDeDiretorio(lock, () => 'livre', { esperaMaximaMs: 0 });
+        expect(depois.ok && depois.valor).toBe('livre');
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
     });
   });
 
