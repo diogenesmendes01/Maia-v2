@@ -14,7 +14,10 @@
  * referencie (regra operacional verificada pelo sweeper — spec §1.4).
  */
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { config } from '../config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 import { TypedError } from '../lib/utils.js';
 
 const ENVELOPE_V1 = 0x01;

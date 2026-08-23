@@ -243,22 +243,115 @@ skipam automaticamente quando `TEST_DB_URL` não está definida — então `npm 
 sempre passa sem infra.
 
 ```bash
-# 1. Sobe Postgres + Redis via Docker Compose
+# 1. Sobe Postgres + Redis via Docker Compose (idempotente — ver abaixo)
 npm run test:integration:setup
 
-# 2. Aplica migrations
-TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run db:migrate
+# 2. Roda a suíte — cria o banco, aplica as migrations e roda
+npm run test:integration
 
-# 3. Roda a suíte (TEST_DB_URL liga os specs de DB ao vivo)
-TEST_DB_URL=postgres://maia_test:test1234@localhost:5432/maia_test npm run test:integration
+# ...ou só um arquivo
+npm run test:integration -- tests/integration/leak.spec.ts
 
-# 4. Para os serviços (remove volumes)
-npm run test:integration:teardown
+# 3. Para os serviços e remove volumes — DESTRÓI A INFRA DE TODAS AS ÁRVORES
+TEST_INFRA_TEARDOWN=yes npm run test:integration:teardown
 ```
+
+#### A infra física é COMPARTILHADA — um Postgres, um Redis, um coordenador
+
+Esta é uma escolha, e ela está registrada aqui porque a alternativa é
+igualmente defensável. **Modelo (a): uma pilha só para o host inteiro.** O
+`docker-compose.yml` fixa o nome do projeto (`name: maia-v2`), então
+`npm run test:integration:setup` de QUALQUER worktree fala com a MESMA pilha —
+antes, o Compose derivava o nome do projeto do diretório, e cada árvore pedia
+uma pilha própria com `container_name` e portas globais: a segunda worktree
+batia em *"container name already in use"*.
+
+O que **não** escolhemos foi (b), projeto/containers/portas por worktree: ela
+obriga a propagar a porta escolhida para `DATABASE_URL`, `TEST_DB_URL`,
+`REDIS_URL`, o `.env`, o runner de migrations e o `psql` de cada árvore,
+multiplica por dezenas o consumo de memória e disco da máquina de dev, e
+resolve um problema que já está resolvido — duas worktrees não se enxergam por
+causa do **banco e do db lógico** por árvore (seção seguinte), não por causa do
+container.
+
+Consequências práticas, e elas são o contrato:
+
+| Comando | Contrato |
+|---|---|
+| `npm run test:integration:setup` | **Idempotente e seguro em concorrência.** Roda sob mutex em disco (`$TMPDIR/maia-test-infra.lock`); a segunda árvore encontra a pilha de pé e sai 0. |
+| `npm run test:integration:teardown` | **Operação de coordenador.** Recusa por padrão: `docker compose down -v` apaga o Postgres e o Redis de TODAS as árvores, inclusive das que estão rodando. Exige `TEST_INFRA_TEARDOWN=yes`. |
+
+Os dois passam por [`scripts/test-infra.ts`](scripts/test-infra.ts), que é onde
+a decisão está escrita por extenso.
+
+Não existe mais o passo de exportar `TEST_DB_URL` à mão: `npm run test:integration`
+a preenche sozinho (`scripts/test-integration.ts`) e o banco é criado e migrado
+antes do primeiro worker subir (`tests/globalSetup.ts`). `npm test` continua
+passando sem infra nenhuma — sem `TEST_DB_URL` os specs de integração seguem
+dando `describe.skip`.
 
 Se um spec falhar com erro de conectividade, o helper em
 `tests/helpers/integrationSetup.ts` imprime mensagem acionável dizendo qual
 serviço está inalcançável e qual comando rodar.
+
+### Isolamento por worktree (issue #571)
+
+**Uma `git worktree` roda contra um Postgres e um db do Redis EXCLUSIVOS dela.**
+Nada a exportar, nada a lembrar — a derivação é automática e vale para
+`npm test`, `npm run test:integration` e `npm run test:leak`.
+
+| Eixo | O que a worktree ganha | Onde |
+|---|---|---|
+| Postgres | banco próprio, `<base>_wt_<pasta>_<hash>`, criado e migrado sozinho | `tests/globalSetup.ts` |
+| Ledger de migrations | vem junto: `schema_migrations` é uma tabela DENTRO do banco da worktree | idem |
+| Redis | um db lógico próprio (`redis://…/N`), limpo no início da rodada | `tests/helpers/worktree-scope.ts` |
+| `node_modules` | resolvido pela subida de diretórios até a raiz — a worktree **não** instala nada | `tests/helpers/pkg-path.ts` |
+
+Como saber qual é o seu: `psql -l | grep maia_test_wt_` e
+`cat .git/maia-redis-slots/[0-9]*` (o arquivo do slot contém o caminho da
+worktree dona; o `.reciclagem.lock` ao lado é o mutex, não um slot). O escopo
+desliga com `TEST_WORKTREE_SCOPE=off`, e no checkout principal e no CI ele já é
+inativo por construção — lá `.git` é um diretório, não um arquivo `gitdir:`, e o
+comportamento é o de sempre.
+
+**Uma base, um destino.** `REDIS_URL` e `TEST_DB_URL` do ambiente são
+respeitadas e escopadas: host, porta, credencial e esquema seguem intactos, só
+o índice do db (Redis) e o nome do banco (Postgres) mudam. A derivação é UMA
+função (`resolveTestEnv`), chamada tanto pelo setup global — que cria o banco e
+limpa o Redis — quanto por cada worker. Elas não podem apontar para endpoints
+diferentes porque não existem duas derivações. E se a limpeza do Redis falhar
+numa rodada que pediu infra real (`TEST_DB_URL` definida), a rodada **reprova**
+com o destino e o remédio na mensagem: seguir seria ler resíduo da rodada
+anterior como resultado desta.
+
+**Posse do slot: mutex e batimento.** Reciclar um slot abandonado é uma
+sequência (observar o dono → apagar → reivindicar), e o `open(…, 'wx')` só
+protege o último passo. Dois processos que concluíssem "abandonado" a partir da
+mesma leitura acabavam com o MESMO db. A reciclagem roda sob um mutex de
+diretório e confirma, antes de apagar, que ainda está removendo a geração
+observada (inode + mtime). Enquanto um processo vive, ele reafirma a posse a
+cada 5 min — é isso que faz as 6h de validade significarem "abandonado" e não
+"começou faz tempo". Desliga com `TEST_WORKTREE_SCOPE_HEARTBEAT=off`.
+
+**Limite conhecido, e é de infraestrutura:** um Redis de fábrica tem 16 dbs
+lógicos, e o 0 fica reservado para quem não é worktree — ou seja, 15 worktrees
+simultâneas. Os slots são reciclados quando a worktree some do disco ou fica 6h
+sem rodar nada, então o teto é de worktrees ATIVAS, não de worktrees existentes.
+Se ele apertar, suba o Redis com mais dbs e diga ao alocador:
+
+```bash
+redis-server --databases 64          # ou `--databases 64` no comando do compose
+export TEST_REDIS_DATABASES=64
+```
+
+Sem isso, a 16ª worktree ativa falha com mensagem nomeando o remédio — em vez de
+silenciosamente compartilhar o db de outra.
+
+As variáveis desta seção NÃO levam o prefixo `MAIA_` de propósito: o contrato de
+configuração reprova qualquer chave `MAIA_*`/`FEATURE_*` não declarada
+(`src/config/validate.ts:248`), e o runner de migrations disparado pelo
+`globalSetup` herda o ambiente inteiro — uma `MAIA_TEST_*` derrubaria a própria
+provisão que ela configura.
 
 CI roda esses testes automaticamente em job dedicado (`integration` em
 `.github/workflows/ci.yml`), com `postgres` e `redis` como service containers.

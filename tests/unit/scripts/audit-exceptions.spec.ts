@@ -11,7 +11,8 @@
  * ficam vermelhos.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import {
   LEDGER_PATH,
@@ -110,13 +111,39 @@ const RELATORIO_DE_ERRO = {
 
 const REPO_ROOT = process.cwd();
 
-/** Leitor de audit falso, indexado pelo caminho do projeto relativo à raiz. */
-function leitorFake(porProjeto: Record<string, unknown>): AuditReader {
+/** Leitor de audit falso, indexado pelo caminho do projeto relativo a `raiz`. */
+function leitorFakeEm(raiz: string, porProjeto: Record<string, unknown>): AuditReader {
   return (dir: string) => {
-    const rel = relative(REPO_ROOT, dir) || '.';
+    const rel = relative(raiz, dir) || '.';
     if (!(rel in porProjeto)) throw new Error(`projeto inesperado no teste: ${rel}`);
     return porProjeto[rel];
   };
+}
+
+/** Leitor de audit falso ancorado na raiz REAL do repositório. */
+function leitorFake(porProjeto: Record<string, unknown>): AuditReader {
+  return leitorFakeEm(REPO_ROOT, porProjeto);
+}
+
+/**
+ * Raiz descartável com um ledger FIXTURE.
+ *
+ * `evaluateGuard` lê `security/audit-exceptions.json` a partir da raiz que
+ * recebe, então este helper é o que permite exercitar o caminho ponta-a-ponta
+ * (ledger → cruzamento → diagnóstico) sem depender do CONTEÚDO do ledger real.
+ *
+ * Isso deixou de ser detalhe na #574. A versão anterior destes casos usava a
+ * entrada do `esbuild` do ledger COMMITADO como fixture; quando o advisory foi
+ * corrigido e a linha saiu — que é exatamente o que a #574 entregou — três
+ * testes de teto de severidade ficaram vermelhos sem que nada do guard tivesse
+ * mudado. Um teste sobre `max_severity` não deve depender de qual advisory
+ * está aberto hoje.
+ */
+function raizComLedger(exceptions: readonly Exception[]): string {
+  const raiz = mkdtempSync(join(tmpdir(), 'maia-ledger-'));
+  mkdirSync(join(raiz, 'security'), { recursive: true });
+  writeFileSync(join(raiz, LEDGER_PATH), JSON.stringify(exceptions, null, 2), 'utf8');
+  return raiz;
 }
 
 const CONGELADO = new Date('2026-08-14T12:00:00Z');
@@ -710,13 +737,29 @@ describe('findProblems — teto de severidade (max_severity)', () => {
  * PASSAVA.
  */
 describe('evaluateGuard — o cenário concreto da review', () => {
-  it('passa quando os dois lockfiles devolvem relatório válido', () => {
+  it('passa quando os dois lockfiles devolvem relatório válido e limpo', () => {
+    const { problems } = evaluateGuard(
+      REPO_ROOT,
+      CONGELADO,
+      leitorFake({ '.': RELATORIO_LIMPO, 'src/admin-ui': RELATORIO_LIMPO }),
+    );
+    expect(problems).toEqual([]);
+  });
+
+  /**
+   * #574: o `GHSA-67mh-4wv8-2f99` foi CORRIGIDO (drizzle-kit no major +
+   * override de `@esbuild-kit/core-utils → esbuild`) e a linha saiu do ledger.
+   * Se ele voltar ao lockfile, o guard tem de reprovar — não achar uma exceção
+   * antiga esperando por ele.
+   */
+  it('REPROVA se o advisory do esbuild voltar, agora que o ledger real não o cobre mais', () => {
     const { problems } = evaluateGuard(
       REPO_ROOT,
       CONGELADO,
       leitorFake({ '.': relatorioComEsbuild(), 'src/admin-ui': RELATORIO_LIMPO }),
     );
-    expect(problems).toEqual([]);
+    expect(problems.join('\n')).toContain('advisory sem exceção registrada');
+    expect(problems.join('\n')).toContain('GHSA-67mh-4wv8-2f99');
   });
 
   it('REPROVA quando o admin-ui devolve relatório de ERRO e a raiz está casada', () => {
@@ -751,22 +794,24 @@ describe('evaluateGuard — o cenário concreto da review', () => {
     expect(problems.join('\n')).toContain('não pôde ser executado: spawnSync npm ENOENT');
   });
 
-  it('REPROVA quando o advisory do ledger real escala ACIMA do teto', () => {
+  it('REPROVA quando o advisory escala ACIMA do teto do ledger', () => {
+    const raiz = raizComLedger([OK]);
     const { problems } = evaluateGuard(
-      REPO_ROOT,
+      raiz,
       CONGELADO,
-      leitorFake({ '.': relatorioComEsbuild('critical'), 'src/admin-ui': RELATORIO_LIMPO }),
+      leitorFakeEm(raiz, { '.': relatorioComEsbuild('critical'), 'src/admin-ui': RELATORIO_LIMPO }),
     );
     expect(problems.join('\n')).toContain('severidade ACIMA do teto aceito');
   });
 
-  it('PASSA quando o advisory do ledger real CAI de severidade', () => {
-    // Com a igualdade antiga isto reprovava. O ledger real aceita até
+  it('PASSA quando o advisory CAI de severidade abaixo do teto do ledger', () => {
+    // Com a igualdade antiga isto reprovava. O ledger da fixture aceita até
     // `moderate`; um `low` reportado hoje está dentro do que foi decidido.
+    const raiz = raizComLedger([OK]);
     const { problems } = evaluateGuard(
-      REPO_ROOT,
+      raiz,
       CONGELADO,
-      leitorFake({ '.': relatorioComEsbuild('low'), 'src/admin-ui': RELATORIO_LIMPO }),
+      leitorFakeEm(raiz, { '.': relatorioComEsbuild('low'), 'src/admin-ui': RELATORIO_LIMPO }),
     );
     expect(problems).toEqual([]);
   });

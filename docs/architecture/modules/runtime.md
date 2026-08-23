@@ -157,8 +157,19 @@ intocado (é ele quem faz a deduplicação).
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
 | `maia_turn_fence_rejected_total` | `operation` — incrementado **só** em `reportFenceRejection` (`lease.ts`). O repositório classifica `stale_claim` e NÃO conta: com as duas camadas contando, um CAS recusado valia 2 num `sum()`, e a recusa local (que nunca chega ao SQL) ficava invisível. |
-| `maia_turn_effect_blocked_total` | `boundary` = `tool_dispatch` / `outbound_send` / `react_iteration` |
+| `maia_turn_effect_blocked_total` | `tenant_id` + `agent_id` (atribuição automática do ALS — issue #601), mais `boundary` (vocabulário FECHADO `EFFECT_BOUNDARY` em [`src/observability/taxonomy.ts`](../../../src/observability/taxonomy.ts), budget de cardinalidade próprio) = `pending_gate` / `scheduling_inbound_hook` / `preturn_graph` / `role_selector_decision` / `decision_engine` / `react_iteration` / `react_reasoner` / `tool_dispatch` / `tool_handler` / `mcp_tool_call` / `outbound_dispatch` / `outbound_send` / `outbound_document` / `outbound_voice` / `outbound_poll` |
 | `maia_turn_job_retained_cleared_total` | `state` = `completed` / `failed` |
+
+Issue #601 — `maia_turn_effect_blocked_total` é emitida por
+[`src/observability/metrics.ts::counter`](../../../src/observability/metrics.ts),
+não por `src/lib/metrics.ts::incCounter`. A diferença é operacional: sem
+`tenant_id`/`agent_id` um pico dizia que o fencing atuou e não dizia PARA QUEM,
+que é a primeira pergunta de um incidente multi-tenant. `boundary` sobrevive à
+migração porque a série tem um consumidor que exige a distinção — a barreira de
+`tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` afirma QUAL
+limite recusou, não só que alguém recusou. `react_tool_refused` pertence ao
+vocabulário do ERRO (`TurnOwnershipLostError`) e NÃO à série: a recusa que o
+ReAct traduz já foi contada como `tool_dispatch`/`tool_handler`.
 
 Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
 heartbeat rotineiros ficam em métrica — auditá-los seria uma row por batida.
@@ -292,6 +303,7 @@ Rules this module enforces:
 | `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`); lease marcada como perdida e lease liberada **sem takeover** não alteram a linha; uma escrita recusada = UM incremento da métrica de fence |
 | `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona. Cobre também a posse perdida NO MEIO do turno (o core não carimba `processada_em`), que é o que pinga o `runWithTurnExecution` do core |
 | `tests/integration/turn-lease-lost-effects-real-db.spec.ts` | Perda de lease DURANTE a execução, pelo caminho real (takeover + heartbeat): nenhuma linha em `agent_facts` (tool) nem em `outbound_messages` (outbound), com caso de controle exigindo as duas presentes |
+| `tests/unit/decision-engine-trace-ownership-boundary.spec.ts` | A janela entre o guard de posse do Decision Engine e o CONSUMO do pacote: com `traceTurnDecision` DEFERIDO, a lease cai enquanto o envelope durável está em voo e o teste exige `TurnOwnershipLostError` — e nenhum efeito posterior — tanto no resolve quanto no reject |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 
 ## In-flight changes

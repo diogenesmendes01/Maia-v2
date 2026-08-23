@@ -18,6 +18,7 @@ import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
 import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
+import type { EffectBoundary } from '@/observability/taxonomy.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -249,7 +250,7 @@ async function recordLedgerFailed(
  * reservar aqui marcaria como 'pending' um envio que não vamos fazer, e isso
  * bloquearia o envio de quem TEM a posse.
  */
-function assertOutboundOwnership(boundary: string): void {
+function assertOutboundOwnership(boundary: EffectBoundary): void {
   if (!turnOwnershipLost()) return;
   reportBlockedEffect(boundary);
   throw new OutboundDeliveryError(false, 'turn_ownership_lost');

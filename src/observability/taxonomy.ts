@@ -205,6 +205,30 @@ export const METRIC = {
   /** inbound persisted → outbound handed to the provider. */
   TURN_DELIVERY_LATENCY_MS: 'maia_turn_delivery_latency_ms',
   STAGE_DURATION_MS: 'maia_turn_stage_duration_ms',
+  /**
+   * Issue #504 §Fencing / issue #601 — um LIMITE DE EFEITO recusou agir porque
+   * a tentativa já tinha perdido a posse do turno (lease morta ou takeover).
+   *
+   * `boundary` nomeia o ponto que recusou, no vocabulário FECHADO de
+   * `EFFECT_BOUNDARY` — quinze pontos, todos literais no código, nenhum
+   * derivado de dado de tenant. É a dimensão que responde "o turno parou NO
+   * LUGAR CERTO?", e não só "alguém barrou": o pipeline tem vários guards em
+   * sequência, então sem ela neutralizar o primeiro só faz o segundo pegar e a
+   * suíte segue verde com o defeito no lugar (é o falso verde que a revisão da
+   * PR #599 pegou, e que a barreira de
+   * `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` existe
+   * para impedir).
+   *
+   * `tenant_id` + `agent_id` vêm do ALS pela camada sancionada
+   * (`src/observability/metrics.ts::counter`). Antes da #601 a emissão chamava
+   * `src/lib/metrics.ts::incCounter` direto e a série não sabia dizer QUEM
+   * estava perdendo turnos por takeover — a primeira pergunta de um incidente
+   * multi-tenant.
+   *
+   * `turn_id`/`attempt`/`worker_id` NÃO são labels: ficam no log estruturado
+   * `turn.effect_blocked_ownership_lost`, que é onde id de correlação mora.
+   */
+  TURN_EFFECT_BLOCKED: 'maia_turn_effect_blocked_total',
 
   // --- queue ---------------------------------------------------------------
   QUEUE_DEPTH: 'maia_queue_depth',
@@ -467,6 +491,25 @@ export const METRIC = {
   /** Idade do artefato restaurável mais novo — o RPO medido, em segundos. */
   BACKUP_AGE_SECONDS: 'maia_backup_age_seconds',
 
+  // --- cognição -------------------------------------------------------------
+  /**
+   * Issue #507 — uma execução de módulo cognitivo terminou CANCELADA: o turno
+   * perdeu a posse (lease) enquanto o módulo rodava, ou já a tinha perdido
+   * quando ele foi chamado.
+   *
+   * `workload` é o nome do módulo (`reasoner`, `pending-gate`,
+   * `role_selector_llm`, `procedure-selector.*`); `reason` é a `CancelCause` de
+   * `src/cognition/runner.ts` (`signal_aborted` | `late_result_discarded` |
+   * `caller_already_aborted`). Ambas as chaves já pertencem à allowlist e o
+   * budget por (métrica, chave) fecha a cardinalidade — necessário porque o
+   * nome do módulo do `procedure-selector` é derivado de dado de tenant.
+   *
+   * Não é uma série de ERRO: cancelamento é administrativo. Alertar sobre ela
+   * como se fosse falha de produto é o mesmo engano que `fallback_triggered`
+   * evita em `cognitive_module_log`.
+   */
+  COGNITIVE_MODULE_CANCELLED: 'maia_cognitive_module_cancelled_total',
+
   // --- observability self-health ------------------------------------------
   /** Envelope coverage of the hot path — the §4 "measure coverage" ask. */
   TRACE_COVERAGE: 'maia_runtime_trace_coverage_total',
@@ -548,6 +591,11 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   'phase',
   'state',
   'required',
+  // limite de efeito do turno (issue #601) — conjunto FECHADO de 15 pontos,
+  // declarado abaixo em `EFFECT_BOUNDARY`. Todos são literais no código; o
+  // emissor (`reportBlockedEffect`) colapsa qualquer valor fora do vocabulário
+  // antes do sanitizador, e o tipo `EffectBoundary` fecha a porta no compilador.
+  'boundary',
   // saga de onboarding (issue #519) — os dois são conjuntos FECHADOS e
   // pequenos, declarados abaixo em `ONBOARDING_STEP_VALUES` e
   // `READINESS_CHECK_CODE_VALUES`. Nenhum dos dois aceita texto do chamador:
@@ -821,6 +869,98 @@ export const READINESS_CHECK_CODE_VALUES: readonly string[] = Object.freeze([
   'agent_activated',
 ]);
 
+// ---------------------------------------------------------------------------
+// 3.2 Limites de efeito do turno — vocabulário FECHADO (issue #601)
+// ---------------------------------------------------------------------------
+
+/**
+ * Valores admitidos no label `boundary` de `METRIC.TURN_EFFECT_BLOCKED`.
+ *
+ * Espelho EXATO dos nomes de limite de efeito que o código usa — os quinze que
+ * chamam `assertTurnOwnership` / `reportBlockedEffect` em
+ * `src/runtime/turns/execution-context.ts`, na ORDEM do pipeline (gate → hook de
+ * agenda → grafo pre-turn → seleção de papel → Decision Engine → ReAct → tools →
+ * outbound), mais `react_tool_refused`, que é só do erro e está explicado no
+ * membro. Quem pode virar LABEL é `EFFECT_BOUNDARY_METRIC_VALUES`. A igualdade
+ * com o código é pinada por
+ * `tests/unit/observability/effect-boundary-taxonomy.spec.ts`, para que um
+ * limite de efeito novo não possa emitir sem passar por aqui.
+ *
+ * ─── Por que uma chave NOVA, e não uma dimensão já sancionada ───────────────
+ *
+ * A #599 corrigiu o mesmo defeito em `maia_cognitive_module_cancelled_total`
+ * REMAPEANDO para `workload`/`reason`, e o critério que justificou aquilo não
+ * se repete aqui. Lá a alegação de cardinalidade fechada era FALSA — o nome do
+ * módulo saía de `procedure-selector.${def.nome}`, texto de tenant —, então
+ * qualquer chave nova teria um budget que não limitava nada de real e a coisa
+ * certa era cair numa dimensão que já existia.
+ *
+ * Aqui a alegação é VERDADEIRA e verificável: os quinze valores são literais no
+ * código, nenhum deriva de entrada. Além disso a série tem um CONSUMIDOR que
+ * exige a distinção — a barreira da #599 lê `boundary` para afirmar QUAL limite
+ * recusou o efeito, não só que alguém recusou. Remapear para `stage` ou `span`
+ * colapsaria essa dimensão em cima de chaves cuja closura é argumentada por
+ * outro motivo (`stage` é tipado contra `ContextLoadStage`, budget 60, e a nota
+ * daquele budget diz explicitamente que ele deixa de limitar qualquer coisa
+ * real assim que um call site deriva o valor de entrada). Uma chave própria com
+ * budget próprio é o que mantém os dois argumentos assertáveis em separado.
+ *
+ * O fechamento é imposto em DOIS níveis, de propósito: o tipo `EffectBoundary`
+ * o torna uma regra do compilador (o precedente de `ContextLoadStage`, que foi
+ * achado Medium na revisão da PR #554 e não pode regredir), e
+ * `closedVocabulary` o impõe em runtime para o call site que chegar por
+ * `unknown`/cast — o precedente da saga de onboarding.
+ */
+export const EFFECT_BOUNDARY = Object.freeze({
+  PENDING_GATE: 'pending_gate',
+  SCHEDULING_INBOUND_HOOK: 'scheduling_inbound_hook',
+  PRETURN_GRAPH: 'preturn_graph',
+  ROLE_SELECTOR_DECISION: 'role_selector_decision',
+  DECISION_ENGINE: 'decision_engine',
+  REACT_ITERATION: 'react_iteration',
+  REACT_REASONER: 'react_reasoner',
+  TOOL_DISPATCH: 'tool_dispatch',
+  TOOL_HANDLER: 'tool_handler',
+  MCP_TOOL_CALL: 'mcp_tool_call',
+  OUTBOUND_DISPATCH: 'outbound_dispatch',
+  OUTBOUND_SEND: 'outbound_send',
+  OUTBOUND_DOCUMENT: 'outbound_document',
+  OUTBOUND_VOICE: 'outbound_voice',
+  OUTBOUND_POLL: 'outbound_poll',
+  /**
+   * ÚNICO membro sem contraparte na série, e de propósito.
+   *
+   * `src/agent/react-loop.ts` TRADUZ a recusa do dispatcher (que devolve
+   * `{ error: 'turn_ownership_lost' }`, o contrato daquela fronteira) num
+   * `TurnOwnershipLostError` para encerrar a tentativa. A recusa em si já foi
+   * contada, um quadro antes, como `tool_dispatch` ou `tool_handler`; contá-la
+   * de novo aqui somaria dois pontos para UM efeito barrado e inflaria a série
+   * exatamente onde ela é lida como taxa.
+   *
+   * Fica no vocabulário porque `TurnOwnershipLostError.boundary` é do mesmo
+   * tipo — o nome do limite é um só, tenha ele virado métrica ou não —, e
+   * deixá-lo de fora obrigaria aquele call site a um `string` solto, que é o
+   * buraco que esta tipagem existe para fechar.
+   */
+  REACT_TOOL_REFUSED: 'react_tool_refused',
+} as const);
+
+export type EffectBoundary = (typeof EFFECT_BOUNDARY)[keyof typeof EFFECT_BOUNDARY];
+
+export const EFFECT_BOUNDARY_VALUES: readonly EffectBoundary[] = Object.freeze(
+  Object.values(EFFECT_BOUNDARY),
+);
+
+/**
+ * O subconjunto que a SÉRIE `METRIC.TURN_EFFECT_BLOCKED` pode carregar: os 15
+ * pontos que chamam `reportBlockedEffect`. É esta lista que o runbook
+ * `docs/runbooks/turn-state-machine.md` documenta, e a que o pinning test
+ * compara com o código.
+ */
+export const EFFECT_BOUNDARY_METRIC_VALUES: readonly EffectBoundary[] = Object.freeze(
+  Object.values(EFFECT_BOUNDARY).filter((b) => b !== 'react_tool_refused'),
+);
+
 /**
  * Colapsa um valor num vocabulário fechado. É a defesa que roda ANTES do
  * sanitizador de labels: o allowlist de CHAVES não diz nada sobre o VALOR, e
@@ -857,6 +997,11 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   // budget é o teto do contrato, não uma estimativa.
   step: 20,
   check_code: 24,
+  // Issue #601: `EFFECT_BOUNDARY` tem 16 membros (15 emitem) + o `other` do
+  // colapso, e a série carrega no máximo os 15 + `other`. O
+  // budget é o teto do contrato com folga para novos limites de efeito, não uma
+  // estimativa — e o vocabulário fechado já impede que texto livre chegue aqui.
+  boundary: 20,
 });
 
 /** Budget applied to any allowed key without an explicit entry above. */

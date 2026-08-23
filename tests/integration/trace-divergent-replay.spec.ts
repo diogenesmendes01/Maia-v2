@@ -117,6 +117,16 @@ vi.mock('@/config/env.js', () => ({
     RUNTIME_TRACE_BODY_ORPHAN_SEC: 300,
   },
 }));
+vi.mock('@/config/contract-env.js', () => ({
+  contractEnv: {
+    NODE_ENV: 'test',
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: 'divergent-replay-spec-secret',
+    RUNTIME_TRACE_HMAC_KEY_VERSION: 1,
+    RUNTIME_TRACE_DEBUG_AES_KEY: Buffer.alloc(32, 5).toString('base64'),
+    RUNTIME_TRACE_DEBUG_S3_BUCKET: undefined,
+    RUNTIME_TRACE_BODY_ORPHAN_SEC: 300,
+  },
+}));
 
 const { writeEnvelope, DivergentTraceReplayError, divergedEnvelopeFields, bodyPayloadDigest } =
   await import('@/control-plane/runtime-trace/envelope-writer.js');

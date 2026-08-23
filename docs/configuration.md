@@ -50,7 +50,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
 | `runtime` | 177 | 19 |
-| `admin-ui` | 23 | 4 |
+| `admin-ui` | 27 | 6 |
 | `migrator` | 11 | 2 |
 | `backup` | 42 | 7 |
 | `maintenance` | 61 | 13 |
@@ -237,7 +237,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `FEATURE_MESSAGE_UPDATE` | string | `false` | não | `runtime` | sim | Tratamento de edição/remoção de mensagem. |
 | `FEATURE_PENDING_REMINDER` | string | `false` | não | `runtime` | sim | Lembretes de pendências. |
 | `FEATURE_VIEW_ONCE_SENSITIVE` | string | `false` | não | `runtime` | sim | Respostas sensíveis (saldos, comparativos) enviadas com viewOnce, gatilhado por preferência da pessoa. |
-| `FEATURE_PDF_REPORTS` | string | `false` | não | `runtime` | sim | Relatórios PDF (extrato/comparativo) enviados como documento. |
+| `FEATURE_PDF_REPORTS` | string | `false` | não | `runtime`, `admin-ui` | sim | Relatórios PDF (extrato/comparativo) enviados como documento. |
 | `FEATURE_OUTBOUND_VOICE` | string | `false` | não | `runtime` | sim | Áudio de saída via OpenAI TTS (reutiliza OPENAI_API_KEY). |
 | `FEATURE_OUTBOUND_DEDUP` | string | `false` | não | `runtime` | sim | Ledger de idempotência de saída (#227) em outbound_messages. |
 | `FEATURE_MESSAGE_DEBOUNCE` | string | `false` | não | `runtime` | sim | Agrupa textos picotados do mesmo remetente numa única rodada. Mídia sempre passa direto. |
@@ -270,9 +270,9 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 |---|---|---|---|---|---|---|
 | `FEATURE_RUNTIME_TRACE_V1` | string | `false` | não | `runtime` | sim | Liga o runtime trace durável no hot path (#514). Default OFF: com a flag desligada o caminho do turno é idêntico ao anterior e o HMAC master secret não é exigido. Ligar em canário — ver docs/runbooks/observability-slo.md. |
 | `MAIA_STRICT_METRIC_LABELS` | string | `false` | não | `runtime` | sim | Promove violação da política de labels de métrica (PII / alta cardinalidade) a exceção em vez de descarte silencioso (#514). Para suíte de testes e diagnóstico; em produção o sanitizer já descarta sem lançar. |
-| `RUNTIME_TRACE_HMAC_KEY_VERSION` | number | `1` | não | `runtime` | sim | Versão da chave HMAC em uso (rotação a cada 90d). |
-| `RUNTIME_TRACE_HMAC_MASTER_SECRET` | string | — | sim | `runtime` | sim | Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis. Obrigatória em: staging, production. |
-| `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` | string | — | sim | `runtime` | sim | Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria. |
+| `RUNTIME_TRACE_HMAC_KEY_VERSION` | number | `1` | não | `runtime`, `admin-ui` | sim | Versão da chave HMAC em uso (rotação a cada 90d). |
+| `RUNTIME_TRACE_HMAC_MASTER_SECRET` | string | — | sim | `runtime`, `admin-ui` | sim | Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis. Obrigatória em: staging, production. |
+| `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` | string | — | sim | `runtime`, `admin-ui` | sim | Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria. |
 | `RUNTIME_TRACE_DEBUG_S3_BUCKET` | string | — | não | `runtime` | sim | Bucket dos snapshots cifrados do modo debug (TTL 24h). |
 | `RUNTIME_TRACE_DEBUG_AES_KEY` | string | — | sim | `runtime` | sim | Chave AES-GCM (base64) dos snapshots de debug. Obrigatória quando RUNTIME_TRACE_DEBUG_S3_BUCKET está definida. |
 | `RUNTIME_TRACE_BODY_ORPHAN_SEC` | number | `300` | não | `runtime` | sim | Idade máxima (s) de um envelope pendente antes do alerta do recoverer. |

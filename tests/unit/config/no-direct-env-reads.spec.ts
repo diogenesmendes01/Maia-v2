@@ -31,6 +31,9 @@ const SRC = join(REPO_ROOT, 'src');
 const ALLOWLIST = [
   'src/config/env.ts',
   'src/config/load.ts',
+  // Issue #596 — acessor por-variável do contrato para módulos compartilhados
+  // entre containers (ver src/config/contract-env.ts).
+  'src/config/contract-env.ts',
   'src/admin-ui/**',
   'src/agent/prompt-builder.ts',
   'src/db/tenant-context.ts',

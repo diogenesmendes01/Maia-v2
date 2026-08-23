@@ -1,5 +1,8 @@
 import pino from 'pino';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 
 const REDACT_PATHS = [
   '*.ANTHROPIC_API_KEY',

@@ -47,7 +47,9 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { logger } from '@/lib/logger.js';
-import { incCounter } from '@/lib/metrics.js';
+import { counter, METRIC } from '@/observability/metrics.js';
+import { EFFECT_BOUNDARY_VALUES, closedVocabulary } from '@/observability/taxonomy.js';
+import type { EffectBoundary } from '@/observability/taxonomy.js';
 import type { TurnExecutionContext } from './claim.js';
 
 const storage = new AsyncLocalStorage<TurnExecutionContext>();
@@ -95,10 +97,10 @@ export function turnOwnershipLost(): boolean {
  */
 export class TurnOwnershipLostError extends Error {
   readonly code = 'TURN_OWNERSHIP_LOST';
-  readonly boundary: string;
+  readonly boundary: EffectBoundary;
   readonly turn_id: string | null;
 
-  constructor(boundary: string, turn_id: string | null) {
+  constructor(boundary: EffectBoundary, turn_id: string | null) {
     super(
       `turn_ownership_lost: a tentativa perdeu a posse do turno${
         turn_id ? ` ${turn_id}` : ''
@@ -115,12 +117,40 @@ export class TurnOwnershipLostError extends Error {
  * Registra a recusa de um limite de efeito. Separado do throw porque nem todo
  * limite lança — e a observabilidade tem de ser a mesma nos dois.
  *
- * `boundary` tem cardinalidade FECHADA (os pontos de efeito são poucos e
- * nomeados no código); `turn_id` fica só no log, nunca em label.
+ * `turn_id` fica só no log, nunca em label.
+ *
+ * ─── Issue #601: por que `counter()` e não `incCounter()` ───────────────────
+ *
+ * Até a #601 esta linha chamava `src/lib/metrics.ts::incCounter` DIRETO, que é
+ * o transporte, e contornava a camada de política. Três consequências, as três
+ * fechadas aqui:
+ *
+ *   1. ATRIBUIÇÃO. A série não recebia `tenant_id` + `agent_id`, então um pico
+ *      dizia que o fencing atuou e não dizia PARA QUEM — a primeira pergunta de
+ *      um incidente multi-tenant, e a invariante #1 do AGENTS.md.
+ *      `counter()` os anexa do ALS (`src/db/tenant-context.ts`), com o fallback
+ *      sancionado `system` fora de escopo de tenant.
+ *   2. GUARD de PII/forma/cardinalidade. `boundary` nem estava em
+ *      `ALLOWED_LABEL_KEYS`: o rótulo saía cru, sem passar pelo sanitizador.
+ *      Agora está na taxonomia, com budget próprio.
+ *   3. FECHAMENTO REAL do vocabulário. A alegação de "cardinalidade fechada"
+ *      era só um comentário. Agora é (a) uma regra do compilador — o parâmetro
+ *      é `EffectBoundary`, não `string` — e (b) uma defesa de runtime:
+ *      `closedVocabulary` colapsa em `other` qualquer valor que chegue por cast
+ *      ou por `unknown`, ANTES do sanitizador, para que nenhum valor fora do
+ *      contrato chegue a existir como série.
+ *
+ * O que NÃO mudou, e é requisito: a dimensão `boundary` continua sendo emitida.
+ * A barreira da #599
+ * (`tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts`) lê este
+ * rótulo para afirmar QUAL limite recusou o efeito. Sem ele o teste voltaria a
+ * medir "alguém barrou", que é o falso verde que aquela revisão pegou.
  */
-export function reportBlockedEffect(boundary: string): void {
+export function reportBlockedEffect(boundary: EffectBoundary): void {
   const ctx = storage.getStore();
-  incCounter('maia_turn_effect_blocked_total', { boundary });
+  counter(METRIC.TURN_EFFECT_BLOCKED, {
+    boundary: closedVocabulary(boundary, EFFECT_BOUNDARY_VALUES),
+  });
   logger.error(
     {
       turn_id: ctx?.turn_id ?? null,
@@ -139,7 +169,7 @@ export function reportBlockedEffect(boundary: string): void {
  * Use imediatamente antes de qualquer coisa irreversível (envio ao usuário,
  * chamada externa) em caminhos cujo caller já trata exceção.
  */
-export function assertTurnOwnership(boundary: string): void {
+export function assertTurnOwnership(boundary: EffectBoundary): void {
   if (!turnOwnershipLost()) return;
   reportBlockedEffect(boundary);
   throw new TurnOwnershipLostError(boundary, storage.getStore()?.turn_id ?? null);

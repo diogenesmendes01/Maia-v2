@@ -282,6 +282,12 @@ export default [
       // Authorised loaders — this is where env legitimately enters the process.
       'src/config/env.ts',
       'src/config/load.ts',
+      // Issue #596: o acessor por-variável do contrato, para os módulos que
+      // MAIS DE UM container carrega. Ele não é uma leitura ad hoc — parseia
+      // com o schema do contrato, chave a chave, e é o que substituiu o
+      // `@/config/env.js` que arrastava o boot do subset `runtime` para dentro
+      // do console.
+      'src/config/contract-env.ts',
       // Admin UI: a separate Next.js app with its own build; migrating it to
       // the shared loader is tracked as the Admin rollout step of #515.
       'src/admin-ui/**',

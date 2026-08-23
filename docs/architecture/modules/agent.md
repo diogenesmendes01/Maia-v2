@@ -412,7 +412,30 @@ defeito que a issue #545 destravou:
 | `no_pending` | não havia pendência aberta, ou a flag está desligada | turno normal (ReAct) |
 | `resolved` | esta mensagem resolveu a pendência; `resolveAndDispatch` já executou e auditou a ação | conclui: `completed` / `pending_action_resolved` |
 | `race_lost` | a mensagem foi classificada como RESPOSTA à pendência e **perdeu** a corrida para outra resposta | conclui: `ignored` / `pending_race_lost` — **sem ReAct** |
-| `unresolved` | havia pendência, mas esta mensagem não a resolveu (`low_confidence`, `topic_change`, `cancelled`) | turno normal (ReAct) |
+| `cancelled` | a TENTATIVA perdeu a posse do turno (lease vencida / takeover) enquanto o gate rodava | lança `TurnOwnershipLostError('pending_gate')` — sai **sem concluir, sem retry, sem `processada_em`** |
+| `unresolved` | havia pendência, mas esta mensagem não a resolveu (`low_confidence`, `topic_change`) | turno normal (ReAct) |
+
+**Por que `cancelled` é um `kind` e não um `unresolved`** (issue #507, revisão da
+PR #599). Ele não fala sobre a pendência: fala sobre a POSSE. Colapsá-lo em
+`unresolved/low_confidence` — que foi o que a primeira entrega fez — devolve ao
+fluxo normal uma tentativa que já não é dona do turno, e entre
+`checkPendingFirst` e o guard do ReAct existem ~700 linhas de pipeline:
+`captureInboundForOutreach` (muta estado de scheduling), o grafo pre-turn (grava
+decisões e pode iniciar execuções) e o Decision Engine (pode BLOQUEAR e
+responder ao usuário). O guard do ReAct chega tarde demais para todos eles.
+
+**Onde vive o tratamento de `TurnOwnershipLostError`.** Num lugar só: o `try`
+que envolve `runWithTurnExecution` em `runAgentForMensagemInner`
+(`src/agent/core.ts`) — isto é, exatamente o ponto onde o escopo de execução da
+tentativa ABRE. Fazer o handler coincidir com o escopo torna "roda com posse" e
+"coberto pelo tratamento" a MESMA região por construção: um limite de efeito
+novo, em qualquer ponto do pipeline, já nasce coberto. Antes o `try` cobria só
+`runReActLoop`, e por isso nenhum limite anterior podia lançar.
+
+O desfecho é sempre o mesmo, e é o único honesto: **sair sem concluir, sem
+agendar retry e sem carimbar `processada_em`.** Quem tem a lease vigente decide
+o desfecho; um retry nosso seria gravação em turno alheio, que é o que a #504
+proíbe.
 
 **Por que `race_lost` não pode voltar a ser `no_pending`.** Sob concorrência, duas
 respostas chegam para a mesma pergunta: uma vence o `SELECT … FOR UPDATE` em
@@ -492,6 +515,7 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 | `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
 | `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |
 | `tests/integration/pending-race-lost-terminal.spec.ts` | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta |
+| `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | O desfecho `cancelled` e os guards a jusante: perda de posse real (claim SQL → takeover → heartbeat → `AbortSignal`) no gate, no hook de scheduling, no grafo pre-turn (inclusive entre a decisão do selector e o `startExecution`) e no Decision Engine, provando ausência de mutação e de resposta em cada um — e QUAL limite recusou, via `maia_turn_effect_blocked_total{boundary}` |
 | `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
 | `tests/unit/agent/` | Per-step contracts |
 | `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |

@@ -196,6 +196,12 @@ export function validateConfig(input: ValidateConfigInput): ValidateConfigResult
       rule: f.rule,
       message: f.message,
       remediation: f.remediation,
+      // `covers` is the ONLY place the second variable of a pair-rule exists
+      // (and, for the `variable: null` boot rules, the only place ANY variable
+      // exists). Dropping it here is what forced `maia doctor` to read variable
+      // names out of the message text — issue #602. Spread conditionally so a
+      // finding without `covers` keeps its exact previous serialized shape.
+      ...(f.covers !== undefined && f.covers.length > 0 ? { covers: f.covers } : {}),
     });
   }
 

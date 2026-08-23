@@ -4,6 +4,32 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — o console valida o subset `admin-ui` no boot, e o `.env.admin` encolhe ([#596](https://github.com/diogenesmendes01/Maia-v2/issues/596))
+
+> **Um `.env.admin` que sobe hoje pode recusar o boot depois deste release** — e é esse o ponto. Rode `npm run config:preflight` antes do `up`.
+
+1. **O boot do `admin-ui` passou a avaliar o subset `admin-ui` do contrato**, em `src/admin-ui/instrumentation.ts` — o hook que o Next.js aguarda em `BaseServer.prepare()`, antes do primeiro request. Um erro ali impede o container de servir.
+
+   | Condição | Antes | Agora |
+   |---|---|---|
+   | As quatro `OIDC_*` ausentes em `staging`/`production` | **sobe** e entrega a tela "no providers configured" | **não sobe** (`profile/required`) |
+   | `OIDC_TENANT_SLUGS=default` (o slug É o `tenant_id`) | sobe | **não sobe** (`admin-ui/tenant-slugs-default-literal`) |
+   | `NEXTAUTH_SECRET` fraco / placeholder | lançava no PRIMEIRO REQUEST | **não sobe** |
+   | Chave exclusivamente `runtime` ausente (as seis `BACKUP_*`, `WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_API_KEY`) | **não subia** | sobe — o console não as usa |
+
+   O `next build` **não** passa pelo hook (o Next pula instrumentation em `phase-production-build`), então a imagem continua construível sem `.env.admin`.
+
+2. **`.env.admin.prod.example` perdeu o bloco `BACKUP_*` e o bloco "exigidas transitivamente".** A orientação anterior — pôr no `.env.admin` uma credencial S3 separada e sem permissão, e keyring fictício mas válido — **não vale mais**: aquelas variáveis não vão mais para o container do console. Se o seu `.env.admin` as tem, remova-as: elas só aumentam o raio de explosão de um vazamento.
+
+   `RUNTIME_TRACE_HMAC_MASTER_SECRET` **fica**, e agora por direito: o console verifica a integridade dos envelopes de trace, então as três `RUNTIME_TRACE_HMAC_*` passaram a declarar `services: ['runtime', 'admin-ui']` no contrato. Sem ela, o explorador de traces mostraria tudo como "não verificável".
+
+3. **Causa raiz desfeita, e não contornada.** O console importava `src/config/env.ts` — direto em `src/admin-ui/trpc/tool-enablement.ts` e `src/admin-ui/trpc/routers/tools-catalog.ts`, e transitivamente por `@/db/client.ts` — e aquele singleton valida `service: 'runtime'` no import. Os sete módulos **compartilhados** pelos dois containers (`db/client.ts`, `lib/logger.ts`, `lib/llm-settings.ts`, `governance/idempotency.ts`, `control-plane/runtime-trace/lib/hmac.ts`, `gateway/staging-crypto.ts`, `config/feature-flags.ts`) passaram a ler o contrato por `src/config/contract-env.ts` — uma variável por vez, no acesso, com o mesmo schema. `tests/unit/config/admin-import-boundary.spec.ts` reprova se algum caminho de import do console voltar a alcançar o singleton.
+
+   O boot fail-closed do **runtime** não mudou: sete scripts que alcançavam `@/config/env.js` de carona (`import-ofx`, `import-review`, `seed-holidays`, `seed-proposals-fixtures`, `activate-synthetic-probe`, `backfill-agent-turns`, `p8d-migration-priorities`) ganharam o import explícito, e o mesmo teste fixa por nome o conjunto de entrypoints que o alcançam.
+
+4. **`COMPOSE_SERVICE_CONTRACT['admin-ui']` voltou a ser `['admin-ui']`.** `npm run config:preflight` continua sendo o gate que mede os ARQUIVOS antes de existir container; ele deixou de ser a ÚNICA checagem daquele subset.
+
+
 ### ⚠️ BREAKING (operacional) — `/readyz` passa a gatear no veredito canônico de schema ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **Duas mudanças que podem tirar instâncias de rotação (ou recusar o boot) num ambiente que sobe hoje.** Rode `tsx scripts/migrate.ts status` contra cada banco **antes** de deployar: se ele não imprimir `readiness: ready`, o `/readyz` do release novo responderá 503. Runbook: [`docs/runbooks/operational.md`](docs/runbooks/operational.md) §8.1.

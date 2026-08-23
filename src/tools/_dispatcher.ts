@@ -34,6 +34,7 @@ import {
   reportBlockedEffect,
   getTurnExecutionContext,
 } from '@/runtime/turns/execution-context.js';
+import type { EffectBoundary } from '@/observability/taxonomy.js';
 
 /**
  * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
@@ -116,7 +117,7 @@ function turnHandlerContext(): ToolTurnContext | null {
   };
 }
 
-function turnOwnershipLostResult(tool: string, boundary: string): DispatchResult {
+function turnOwnershipLostResult(tool: string, boundary: EffectBoundary): DispatchResult {
   reportBlockedEffect(boundary);
   logger.warn({ tool, boundary }, 'tool.turn_ownership_lost');
   return { error: 'turn_ownership_lost', details: { tool } };
