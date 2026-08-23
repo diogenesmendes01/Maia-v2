@@ -56,10 +56,19 @@ import { notApplicable, pass, type DoctorCheck, type DoctorContext, type DoctorR
  * console enforces; the contract asks only `min(8)`, so a 12-character
  * `NEXTAUTH_SECRET` passes `config check` and still fails to boot.
  */
-export const MIN_NEXTAUTH_SECRET_LEN = 32;
-
-/** Mirrors `MIN_OIDC_CLIENT_SECRET_LEN` in `src/admin-ui/lib/auth-gating.ts`. */
-export const MIN_OIDC_CLIENT_SECRET_LEN = 16;
+// Issue #572 (PR #595) trouxe `src/config/admin-boot-gates.ts`, que espelha os
+// mesmos pisos de `src/admin-ui/lib/auth-gating.ts` E é guardado por um teste de
+// paridade que lê aquele arquivo como TEXTO. Reexportamos de lá em vez de manter
+// uma segunda cópia: duas cópias do mesmo piso divergem em silêncio, e o guard de
+// paridade só protege a que ele conhece.
+export {
+  MIN_NEXTAUTH_SECRET_LEN,
+  MIN_OIDC_CLIENT_SECRET_LEN,
+} from '@/config/admin-boot-gates.js';
+import {
+  MIN_NEXTAUTH_SECRET_LEN,
+  MIN_OIDC_CLIENT_SECRET_LEN,
+} from '@/config/admin-boot-gates.js';
 
 /**
  * How many problems to name in the evidence before truncating. The point of
