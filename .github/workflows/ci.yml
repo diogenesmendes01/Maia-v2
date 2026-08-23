@@ -85,7 +85,7 @@ jobs:
       # subcomando `config` só carrega e interpola o modelo do projeto).
       TEST_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
@@ -249,7 +249,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
@@ -267,7 +267,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           # Mesmo piso pinado dos jobs matriciais (22.18), para o audit rodar
@@ -371,7 +371,7 @@ jobs:
       VOYAGE_API_KEY: test-voyage-key
       ALERT_CHANNELS: log
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
@@ -503,7 +503,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Sem `setup-node` e sem `npm ci`: o script só usa bash + docker, e
       # tudo o que interessa (Node, npm 11.5.2, tsx, node_modules de
@@ -535,7 +535,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
       # sintaticamente inválido ou uma `expr` que não compila derruba o
@@ -618,7 +618,7 @@ jobs:
       # `CREATE DATABASE` funciona sem grant extra.
       DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
