@@ -15,9 +15,16 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
  * traffic", which needs traffic. `docs/runbooks/observability-slo.md` §11 says
  * so rather than letting this file imply coverage it does not have.
  *
- * Timing assertions are RATIOS against a baseline measured in the same run,
- * never absolute microseconds — see the comment above the overhead block for
- * why that distinction cost this file a revision.
+ * Question 1 is answered on TWO axes, and the split is the point (issue #600):
+ *
+ *   - WORK, counted: how many times the instrumented path reaches for an
+ *     expensive primitive per span (`randomBytes`, `createHash`, a JSON
+ *     round-trip) and how many spans it emits. No clock is involved, so the
+ *     answer is the same on an idle laptop and on a runner with four other
+ *     jobs on the same cores, and the same on Node 22 and Node 26.
+ *   - TIME, as a ratio against work of COMPARABLE magnitude measured in the
+ *     same run — never against a sub-microsecond baseline, and never in
+ *     absolute microseconds. See the comment above the overhead block.
  */
 const cfg = vi.hoisted(() => ({ endpoint: undefined as string | undefined, ratio: 1 }));
 vi.mock('@/config/env.js', async (importOriginal) => {
@@ -34,6 +41,43 @@ vi.mock('@/config/env.js', async (importOriginal) => {
   };
 });
 
+/**
+ * Issue #600 — the clock-free half of the measurement.
+ *
+ * `node:crypto` is wrapped (never replaced: every call is forwarded verbatim)
+ * so the suite can COUNT the expensive primitives the span path reaches for,
+ * instead of timing them. A counted call is a fact; a timed one is a fact
+ * about the runner. Both `tracer.ts` and `correlation.ts` import from here, so
+ * the count covers the whole instrumentation path, not one module's share.
+ */
+const work = vi.hoisted(() => ({
+  randomBytes: 0,
+  randomBytesBytes: 0,
+  createHash: 0,
+  randomUUID: 0,
+  json: 0,
+}));
+
+vi.mock('node:crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:crypto')>();
+  return {
+    ...actual,
+    randomBytes: ((size: number, cb?: (err: Error | null, buf: Buffer) => void) => {
+      work.randomBytes++;
+      work.randomBytesBytes += size;
+      return cb === undefined ? actual.randomBytes(size) : actual.randomBytes(size, cb);
+    }) as typeof actual.randomBytes,
+    createHash: ((...args: Parameters<typeof actual.createHash>) => {
+      work.createHash++;
+      return actual.createHash(...args);
+    }) as typeof actual.createHash,
+    randomUUID: ((...args: Parameters<typeof actual.randomUUID>) => {
+      work.randomUUID++;
+      return actual.randomUUID(...args);
+    }) as typeof actual.randomUUID,
+  };
+});
+
 import { counter, histogram } from '../../../src/observability/metrics.js';
 import {
   incCounter,
@@ -41,7 +85,14 @@ import {
   renderPrometheus,
   _resetForTests,
 } from '../../../src/lib/metrics.js';
-import { setSpanSink, withSpan } from '../../../src/observability/tracer.js';
+import {
+  currentSpan,
+  newSpanId,
+  setSpanSink,
+  traceIdToW3C,
+  withSpan,
+} from '../../../src/observability/tracer.js';
+import { sanitizeSpanAttributes } from '../../../src/observability/span-attributes.js';
 import {
   _cardinalityFor,
   _resetLabelGuardForTests,
@@ -97,6 +148,11 @@ function compare(
   const ratios: number[] = [];
   const bases: number[] = [];
   const cands: number[] = [];
+  // WARMUP round, discarded: the first pass through either arm pays V8's
+  // interpreter-to-optimized transition, and whichever arm pays it first
+  // carries a penalty that has nothing to do with the code under test.
+  timeOnce(iterations, baseline);
+  timeOnce(iterations, candidate);
   for (let r = 0; r < runs; r++) {
     const b = timeOnce(iterations, baseline);
     const c = timeOnce(iterations, candidate);
@@ -116,6 +172,11 @@ async function compareAsync(
   const ratios: number[] = [];
   const bases: number[] = [];
   const cands: number[] = [];
+  // Same warmup round as `compare`, and for the same reason. It runs the arms
+  // for real, so a caller that counts side effects has to add `WARMUP_ROUNDS`
+  // to its arithmetic.
+  await timeOnceAsync(iterations, baseline);
+  await timeOnceAsync(iterations, candidate);
   for (let r = 0; r < runs; r++) {
     const b = await timeOnceAsync(iterations, baseline);
     const c = await timeOnceAsync(iterations, candidate);
@@ -128,6 +189,83 @@ async function compareAsync(
 
 function report(label: string, c: Comparison): string {
   return `${label}: ${c.candidate_us.toFixed(2)}µs vs baseline ${c.baseline_us.toFixed(2)}µs = ${c.ratio.toFixed(1)}x`;
+}
+
+/** Rounds `compare`/`compareAsync` run and DISCARD before measuring. */
+const WARMUP_ROUNDS = 1;
+
+export interface WorkCount {
+  randomBytes: number;
+  randomBytesBytes: number;
+  createHash: number;
+  randomUUID: number;
+  json: number;
+}
+
+/**
+ * Run `fn` with the expensive primitives counted, and return the tally.
+ *
+ * `JSON` is patched here rather than in a `vi.mock` because it is a global,
+ * not a module: the patch has to be narrow enough that it cannot outlive the
+ * measured block (an expectation matcher serializes, and would be counted).
+ */
+async function countWork(fn: () => Promise<void>): Promise<WorkCount> {
+  const realStringify = JSON.stringify;
+  const realParse = JSON.parse;
+  work.randomBytes = 0;
+  work.randomBytesBytes = 0;
+  work.createHash = 0;
+  work.randomUUID = 0;
+  work.json = 0;
+  JSON.stringify = function (...args: unknown[]) {
+    work.json++;
+    return (realStringify as (...a: unknown[]) => string)(...args);
+  } as typeof JSON.stringify;
+  JSON.parse = function (...args: unknown[]) {
+    work.json++;
+    return (realParse as (...a: unknown[]) => unknown)(...args);
+  } as typeof JSON.parse;
+  try {
+    await fn();
+  } finally {
+    JSON.stringify = realStringify;
+    JSON.parse = realParse;
+  }
+  return {
+    randomBytes: work.randomBytes,
+    randomBytesBytes: work.randomBytesBytes,
+    createHash: work.createHash,
+    randomUUID: work.randomUUID,
+    json: work.json,
+  };
+}
+
+/**
+ * Everything an enabled span MUST do, with the wrapper stripped away: mint the
+ * two W3C ids and run the attribute set through the gate.
+ *
+ * This is the baseline the timed assertion compares against, and choosing it
+ * is the whole fix for issue #600. The old baseline was a bare `await` at
+ * ~0.4µs, so the assertion divided a ~35µs numerator by a denominator smaller
+ * than the runner's scheduling jitter — a quantity that moved 80.2x → 86.5x
+ * between two retries of the SAME commit, and that Node 26 broke outright by
+ * making bare async frames cheaper without making crypto cheaper. This
+ * baseline is ~15-20µs, the same order as the thing it is divided into, and it
+ * is made of the SAME primitives, so a Node release that changes the cost of
+ * `randomBytes` or of the gate moves numerator and denominator together.
+ *
+ * What the ratio then states is the property worth stating: the span wrapper
+ * costs a small multiple of the work it exists to perform.
+ */
+function irreducibleSpanWork(): number {
+  const trace = traceIdToW3C(undefined);
+  const span = newSpanId();
+  const { attributes } = sanitizeSpanAttributes(SPAN.TURN, {
+    tenant_id: 'system',
+    agent_id: 'system',
+    status: 'ok',
+  });
+  return trace.length + span.length + Object.keys(attributes).length;
 }
 
 async function seriesCount(prefix: string): Promise<number> {
@@ -144,10 +282,7 @@ beforeEach(() => {
 });
 
 /**
- * Every overhead assertion below is a RATIO against a baseline measured by
- * INTERLEAVED rounds, never an absolute microsecond bound.
- *
- * Two revisions of this file were wrong before this one, and both mistakes are
+ * THREE revisions of this file were wrong before this one, and all three are
  * worth recording because they are the standard ways a micro benchmark lies:
  *
  *   1. absolute bounds. ~1µs/op in isolation became 60-80µs/op the moment
@@ -155,10 +290,31 @@ beforeEach(() => {
  *      bound measures the runner, not the code.
  *   2. sequential arms. Timing arm A fully, then arm B, lets load drift land
  *      entirely on one arm — it reported 23x for code that costs ~4x.
+ *   3. a DEGENERATE denominator (issue #600). Fixing 1 and 2 with a ratio was
+ *      right; picking a sub-microsecond baseline for it was not. `enabled span
+ *      vs disabled` divided ~35µs by ~0.4µs, and a 0.4µs quantity on a shared
+ *      runner is noise with a mean. The published symptom: the same commit
+ *      reported 80.2x and 86.5x on two retries of PR #598 and failed both,
+ *      passed on the Node 22.18 lane of that very run, and passed again on a
+ *      re-run. Raising the ceiling would have kept the noise and thrown away
+ *      the sensitivity, so the ceiling is not what changed.
  *
- * Interleaving the rounds and taking the median of the PER-ROUND ratios fixes
- * both, and the property asserted is the one that matters: what the POLICY
- * layer costs on top of the registry write it wraps.
+ * What changed: every span assertion below is now either COUNTED WORK (no
+ * clock at all) or a ratio against a baseline of the SAME ORDER OF MAGNITUDE
+ * built from the SAME primitives (`irreducibleSpanWork`). Reproduced locally
+ * with six CPU burners pinning a 4-vCPU box, 12 runs on each Node lane:
+ *
+ *              Node 22.22        Node 26.7
+ *   old file   3/12 red          5/12 red     (89.8x-152.3x, the #598 numbers)
+ *   this file  0/12 red          0/12 red
+ *
+ * and this file still goes red 12/12 on each injected regression — a JSON
+ * round-trip in `emit`, a digest per call, a regex recompiled per call.
+ *
+ * The two metric assertions keep the interleaved-ratio design of revision 2
+ * unchanged: their baseline is a raw registry write of the same order as the
+ * sanitized one, so they were never in the degenerate regime (0 failures in
+ * the same 12 loaded runs).
  */
 describe('issue #535 §4 — instrumentation overhead', () => {
   it('the sanitized counter costs a small multiple of the raw registry write', () => {
@@ -215,40 +371,127 @@ describe('issue #535 §4 — instrumentation overhead', () => {
     ).toBeLessThan(5);
   }, 60_000);
 
-  it('a span with tracing OFF is effectively free', async () => {
+  it('a span with tracing OFF does no work at all — not "a small multiple", zero', async () => {
     // This is what makes shipping the exporter disabled-by-default safe: with
     // no endpoint the wrapper is a boolean check plus a direct call, so the
     // hot path is the pre-#535 one.
-    const c = await compareAsync(
-      3,
-      10_000,
-      async (i) => (async () => i)(),
-      async (i) => withSpan(SPAN.TURN, async () => i),
-    );
-    expect(c.ratio, report('disabled span vs bare await', c)).toBeLessThan(4);
+    //
+    // The previous revision asserted `< 4x` a bare `await`. A bare await costs
+    // ~0.15µs, so that assertion was the #600 defect in miniature and it went
+    // red twice in 12 loaded runs (7.4x, 9.0x) on code that had not changed.
+    // The claim it was reaching for is not a multiple, it is a ZERO, and a
+    // zero is countable: no id minted, no digest, no serialization, no
+    // emission, and — the structural half — no `AsyncLocalStorage` frame
+    // entered, which is what "no allocation" reduces to here since the span
+    // object is created only inside `spanStorage.run`.
+    //
+    // The sink is INSTALLED and counting; only the endpoint is absent. That is
+    // the shipped default (`MAIA_OTLP_TRACES_ENDPOINT` unset) and it makes the
+    // emission count an observation rather than a tautology.
+    cfg.endpoint = undefined;
+    const N = 5_000;
+    let emitted = 0;
+    let framesEntered = 0;
+    let wrongResult = 0;
+    setSpanSink(() => {
+      emitted++;
+    });
+    const w = await countWork(async () => {
+      for (let i = 0; i < N; i++) {
+        const out = await withSpan(SPAN.TURN, async () => {
+          if (currentSpan() !== null) framesEntered++;
+          return i;
+        });
+        if (out !== i) wrongResult++;
+      }
+    });
+    expect(framesEntered, 'disabled withSpan entered a span context').toBe(0);
+    expect(wrongResult, 'disabled withSpan altered the callback result').toBe(0);
+    expect(emitted, 'a disabled span reached the sink').toBe(0);
+    expect(w.randomBytes, `${w.randomBytes} randomBytes calls for ${N} disabled spans`).toBe(0);
+    expect(w.createHash).toBe(0);
+    expect(w.randomUUID).toBe(0);
+    expect(w.json).toBe(0);
   }, 60_000);
 
-  it('a span with tracing ON stays within a small multiple of the disabled path', async () => {
+  it('an enabled span does a FIXED, counted amount of expensive work per span', async () => {
+    // The clock-free assertion, and the one that carries the sensitivity. It
+    // states the hot path's contract in units that do not move between an idle
+    // laptop, a loaded runner, Node 22.18 and Node 26:
+    //
+    //   two ids minted (16 bytes of trace id + 8 of span id), NOTHING hashed
+    //   (`MAIA_OTLP_SAMPLE_RATIO=1` must short-circuit the sampler before it
+    //   reaches SHA-256), NOTHING serialized, exactly one span emitted.
+    //
+    // These are exact equalities on purpose. An accidental deep clone
+    // (`JSON.parse(JSON.stringify(attrs))` in `emit`), a digest computed per
+    // call, a second id minted per span — the named regression classes — each
+    // move one of these numbers off its budget, deterministically, on the
+    // first run. Lowering one of them is a deliberate edit to this test, which
+    // is what a budget is for.
+    cfg.endpoint = 'http://collector:4318/v1/traces';
+    const N = 2_000;
     let emitted = 0;
+    setSpanSink(() => {
+      emitted++;
+    });
+    const w = await countWork(async () => {
+      for (let i = 0; i < N; i++) await withSpan(SPAN.TURN, async () => i);
+    });
+    expect(emitted, 'one emission per span').toBe(N);
+    expect(w.randomBytes / N, `${w.randomBytes} randomBytes calls for ${N} spans`).toBe(2);
+    expect(w.randomBytesBytes / N, 'bytes of randomness per span').toBe(24);
+    expect(w.createHash, 'ratio=1 must short-circuit before SHA-256').toBe(0);
+    expect(w.randomUUID).toBe(0);
+    expect(w.json, 'nothing on the span hot path may serialize').toBe(0);
+  }, 60_000);
+
+  it('an enabled span costs a small multiple of the work it is required to do', async () => {
+    // The timed assertion, kept because a counter cannot see a regression that
+    // adds no new primitive — a regex recompiled per call, an O(n) walk over
+    // the attribute set. Its baseline is `irreducibleSpanWork` (see there for
+    // why): same order of magnitude, same primitives, measured in the same
+    // interleaved rounds.
+    //
+    // Measured on a 4-vCPU box with six CPU burners pinning every core, 12
+    // runs per Node version:
+    //
+    //            Node 22.22        Node 26.7
+    //   this     1.0x - 1.7x       1.3x - 1.7x     (0/12 red, 0/12 red)
+    //   old      9.7x - 92.9x     89.8x - 152.3x   (3/12 red, 5/12 red)
+    //
+    // The absolute cost of BOTH arms inflated 5-8x under that load (20µs →
+    // 100-170µs per span) and the ratio did not move, because both arms are
+    // built from the same primitives and inflate together. That is also why
+    // the two Node lanes agree here and disagreed by an order of magnitude
+    // before: the old denominator was a bare async frame, and Node 26 made
+    // bare async frames cheaper without making `randomBytes` cheaper.
+    //
+    // The bound is 4: 2.4x over the worst round ever observed on either Node,
+    // so noise cannot reach it, and still well under what a regression of the
+    // class this exists to catch reports — a regex recompiled per call, the
+    // one regression that adds no COUNTABLE primitive and so is invisible to
+    // the test above, put it at 5.1x-8.1x on 12 of 12 runs.
+    cfg.endpoint = 'http://collector:4318/v1/traces';
+    const runs = 5;
+    const iterations = 2_000;
+    let emitted = 0;
+    setSpanSink(() => {
+      emitted++;
+    });
     const c = await compareAsync(
-      3,
-      2_000,
+      runs,
+      iterations,
       async (i) => {
-        cfg.endpoint = undefined;
-        setSpanSink(null);
-        return withSpan(SPAN.TURN, async () => i);
+        irreducibleSpanWork();
+        return i;
       },
-      async (i) => {
-        cfg.endpoint = 'http://collector:4318/v1/traces';
-        setSpanSink(() => {
-          emitted++;
-        });
-        return withSpan(SPAN.TURN, async () => i);
-      },
+      async (i) => withSpan(SPAN.TURN, async () => i),
     );
-    expect(emitted).toBe(3 * 2_000);
-    // Dominated by randomBytes(8) for the span id plus the attribute gate.
-    expect(c.ratio, report('enabled span vs disabled', c)).toBeLessThan(80);
+    expect(emitted, 'the candidate arm really emitted spans').toBe(
+      (runs + WARMUP_ROUNDS) * iterations,
+    );
+    expect(c.ratio, report('enabled span vs its irreducible work', c)).toBeLessThan(4);
   }, 60_000);
 });
 

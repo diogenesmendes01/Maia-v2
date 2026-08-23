@@ -696,7 +696,14 @@ Não presuma cobertura que não existe:
 - **benchmark de overhead é micro, não sob carga** —
   `tests/unit/observability/overhead-benchmark.spec.ts` mede o custo por
   emissão e o teto TEÓRICO de séries a partir dos orçamentos de cardinalidade.
-  Cardinalidade REAL sob tráfego continua sem medição;
+  Cardinalidade REAL sob tráfego continua sem medição. Desde a issue #600 o
+  custo do span é afirmado em dois eixos: TRABALHO CONTADO por span (duas
+  chamadas a `randomBytes`, 24 bytes, zero digests, zero serializações, uma
+  emissão) — que não usa relógio e portanto não depende do runner nem da versão
+  de Node — e TEMPO como razão contra o trabalho irredutível do próprio span
+  (mintar os dois ids + passar os atributos pelo portão), medido nas mesmas
+  rodadas intercaladas. A razão contra a rota DESLIGADA, de ~0,4µs, foi
+  removida: ela reprovava PRs alheias em lanes diferentes de Node;
 - **fault injection e teste de carga** (issue #510) não entraram.
 
 ---
