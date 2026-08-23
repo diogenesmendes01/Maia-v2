@@ -114,48 +114,87 @@ let pool: pg.Pool;
 const mensagensCriadas: string[] = [];
 const turnosCriados: string[] = [];
 
-/** Inbound SEM `telefone` — o caminho pós-resolução mais curto que existe. */
-async function mkInbound(tenant: string, agent: string): Promise<string> {
-  const id = randomUUID();
-  await pool.query(
-    `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, processada_em)
-     VALUES ($1, $2, $3, NULL, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-    [id, tenant, agent, `WAID-504V2-${randomInt(0, 1e9).toString(36)}`],
-  );
-  mensagensCriadas.push(id);
-  return id;
+/**
+ * A mensagem e o turno nascem na MESMA transação.
+ *
+ * Não é purismo: a suíte de integração roda em paralelo contra um Postgres
+ * compartilhado, e `agentTurnsRepo.backfillBatch` (exercitado por
+ * `agent-turns-real-db.spec.ts`) elege como candidato TODA mensagem `in` de
+ * `primary/primary` que ainda não tem row em `agent_turn_inputs`. Uma janela
+ * entre o INSERT da mensagem e o INSERT do turno — por menor que seja — é uma
+ * janela em que o backfill de outra suíte cria um turno para a NOSSA mensagem,
+ * e o "duas execuções não criam turno duplicado" daquela suíte falha por causa
+ * desta. Uma transação fecha a janela.
+ */
+async function comTx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const r = await fn(c);
+    await c.query('COMMIT');
+    return r;
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    c.release();
+  }
 }
 
 /**
- * Turno gravado por SQL direto, com o par (tenant, agent) e o ponteiro
- * declarados independentemente — é o que permite construir a combinação
- * cruzada que nenhuma API de repositório produziria.
+ * Inbound SEM `telefone` (o caminho pós-resolução mais curto que existe) + o
+ * turno que o representa, numa transação só.
+ *
+ * O par (tenant, agent) do TURNO e o do INBOUND são declarados
+ * independentemente — é o que permite construir a combinação cruzada que
+ * nenhuma API de repositório produziria. `agent_turn_inputs` só é criada quando
+ * os dois coincidem: as duas FKs dela são compostas por (tenant, agent), e é
+ * justamente por isso que ela não pode representar o cruzamento. A fronteira
+ * que falta é a de `representative_message_id`, que não tem FK nenhuma
+ * (`migrations/097_agent_turns.sql`).
  */
-async function mkTurn(args: {
-  tenant: string;
-  agent: string;
-  representative_message_id: string;
-  status?: string;
-}): Promise<string> {
-  const id = randomUUID();
+async function mkInboundComTurno(args: {
+  msg_tenant: string;
+  msg_agent: string;
+  turn_tenant: string;
+  turn_agent: string;
+}): Promise<{ mensagem_id: string; turn_id: string }> {
+  const mensagem_id = randomUUID();
+  const turn_id = randomUUID();
+  mensagensCriadas.push(mensagem_id);
+  turnosCriados.push(turn_id);
+  await comTx(async (c) => {
+    await c.query(
+      `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, processada_em)
+       VALUES ($1, $2, $3, NULL, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
+      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504V2-${randomInt(0, 1e9).toString(36)}`],
+    );
+    await c.query(
+      `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
+       VALUES ($1, $2, $3, $4, 'received', now())`,
+      [turn_id, args.turn_tenant, args.turn_agent, mensagem_id],
+    );
+    if (args.turn_tenant === args.msg_tenant && args.turn_agent === args.msg_agent) {
+      await c.query(
+        `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
+         VALUES ($1, $2, $3, $4, 0)`,
+        [args.turn_tenant, args.turn_agent, turn_id, mensagem_id],
+      );
+    }
+  });
+  return { mensagem_id, turn_id };
+}
+
+/** Turno ÓRFÃO: aponta para uma mensagem que nunca existiu. */
+async function mkTurnOrfao(tenant: string, agent: string): Promise<string> {
+  const turn_id = randomUUID();
+  turnosCriados.push(turn_id);
   await pool.query(
     `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
-     VALUES ($1, $2, $3, $4, $5, now())`,
-    [id, args.tenant, args.agent, args.representative_message_id, args.status ?? 'received'],
+     VALUES ($1, $2, $3, $4, 'received', now())`,
+    [turn_id, tenant, agent, randomUUID()],
   );
-  turnosCriados.push(id);
-  // A row de `agent_turn_inputs` só é criada quando o turno e a mensagem
-  // pertencem ao MESMO par: as duas FKs dela são compostas por (tenant, agent),
-  // e é justamente por isso que ela não pode representar o cruzamento — a
-  // fronteira que falta é a de `representative_message_id`.
-  if (args.tenant === VICTIM_T && args.agent === VICTIM_A) {
-    await pool.query(
-      `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
-       VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING`,
-      [args.tenant, args.agent, id, args.representative_message_id],
-    );
-  }
-  return id;
+  return turn_id;
 }
 
 async function readProcessadaEm(mensagem_id: string): Promise<unknown> {
@@ -217,11 +256,11 @@ d('#504 — o resolvedor de escopo do job V2 fecha a fronteira (DB real)', () =>
     // Sem este caso, o "nada aconteceu" do teste adversarial passaria também se
     // o consumidor nunca tivesse rodado. Ele é o que dá significado àquele nada.
     const { runAgentTurnJob } = await import('../../src/runtime/turns/job-consumer.js');
-    const mensagem_id = await mkInbound(VICTIM_T, VICTIM_A);
-    const turn_id = await mkTurn({
-      tenant: VICTIM_T,
-      agent: VICTIM_A,
-      representative_message_id: mensagem_id,
+    const { mensagem_id, turn_id } = await mkInboundComTurno({
+      msg_tenant: VICTIM_T,
+      msg_agent: VICTIM_A,
+      turn_tenant: VICTIM_T,
+      turn_agent: VICTIM_A,
     });
 
     const facts = { received_at_ms: null as number | null };
@@ -242,14 +281,14 @@ d('#504 — o resolvedor de escopo do job V2 fecha a fronteira (DB real)', () =>
       '../../src/runtime/turns/scope-resolver.js'
     );
 
-    // A vítima: mensagem do par baseline, ainda não processada.
-    const vitima = await mkInbound(VICTIM_T, VICTIM_A);
-    // O ponteiro cruzado: turno do ATACANTE apontando para a mensagem da
-    // vítima. Nenhuma FK impede — é a lacuna que o resolvedor cobre.
-    const turnoAtacante = await mkTurn({
-      tenant: ATTACKER_T,
-      agent: ATTACKER_A,
-      representative_message_id: vitima,
+    // A vítima é uma mensagem do par baseline, ainda não processada; o
+    // ponteiro cruzado é um turno do ATACANTE apontando para ela. Nenhuma FK
+    // impede — é a lacuna que o resolvedor cobre.
+    const { mensagem_id: vitima, turn_id: turnoAtacante } = await mkInboundComTurno({
+      msg_tenant: VICTIM_T,
+      msg_agent: VICTIM_A,
+      turn_tenant: ATTACKER_T,
+      turn_agent: ATTACKER_A,
     });
 
     const facts = { received_at_ms: null as number | null };
@@ -294,11 +333,7 @@ d('#504 — o resolvedor de escopo do job V2 fecha a fronteira (DB real)', () =>
     // Ponteiro para uma mensagem que nunca existiu. Sem FK, o INSERT passa —
     // e é por isso que o resolvedor precisa distinguir este caso de
     // "turno inexistente": os dois pedem triagem diferente.
-    const orfao = await mkTurn({
-      tenant: ATTACKER_T,
-      agent: ATTACKER_A,
-      representative_message_id: randomUUID(),
-    });
+    const orfao = await mkTurnOrfao(ATTACKER_T, ATTACKER_A);
     const facts = { received_at_ms: null as number | null };
     const erro = await runAgentTurnJob({ kind: 'v2', turn_id: orfao }, facts).then(
       () => null,

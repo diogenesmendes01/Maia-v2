@@ -79,37 +79,64 @@ let pool: pg.Pool;
 const mensagensCriadas: string[] = [];
 const turnosCriados: string[] = [];
 
-async function mkInbound(tenant: string, agent: string): Promise<string> {
-  const id = randomUUID();
-  await pool.query(
-    `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
-     VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-    [id, tenant, agent, `WAID-504V2C-${randomInt(0, 1e9).toString(36)}`],
-  );
-  mensagensCriadas.push(id);
-  return id;
+/**
+ * A mensagem e o turno nascem na MESMA transação.
+ *
+ * Não é purismo: a suíte de integração roda em paralelo contra um Postgres
+ * compartilhado, e `agentTurnsRepo.backfillBatch` (exercitado por
+ * `agent-turns-real-db.spec.ts`) elege como candidato TODA mensagem `in` de
+ * `primary/primary` que ainda não tem row em `agent_turn_inputs`. Uma janela
+ * entre o INSERT da mensagem e o INSERT do turno — por menor que seja — é uma
+ * janela em que o backfill de outra suíte cria um turno para a NOSSA mensagem,
+ * e o "duas execuções não criam turno duplicado" daquela suíte falha por causa
+ * desta. Uma transação fecha a janela.
+ */
+async function comTx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const r = await fn(c);
+    await c.query('COMMIT');
+    return r;
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    c.release();
+  }
 }
 
-async function mkTurn(args: {
-  tenant: string;
-  agent: string;
-  representative_message_id: string;
-}): Promise<string> {
-  const id = randomUUID();
-  await pool.query(
-    `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
-     VALUES ($1, $2, $3, $4, 'queued', now())`,
-    [id, args.tenant, args.agent, args.representative_message_id],
-  );
-  turnosCriados.push(id);
-  if (args.tenant === VICTIM_T && args.agent === VICTIM_A) {
-    await pool.query(
-      `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
-       VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING`,
-      [args.tenant, args.agent, id, args.representative_message_id],
+/** Inbound + turno (possivelmente de OUTRO par) numa transação só. */
+async function mkInboundComTurno(args: {
+  msg_tenant: string;
+  msg_agent: string;
+  turn_tenant: string;
+  turn_agent: string;
+}): Promise<{ mensagem_id: string; turn_id: string }> {
+  const mensagem_id = randomUUID();
+  const turn_id = randomUUID();
+  mensagensCriadas.push(mensagem_id);
+  turnosCriados.push(turn_id);
+  await comTx(async (c) => {
+    await c.query(
+      `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
+       VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
+      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504V2C-${randomInt(0, 1e9).toString(36)}`],
     );
-  }
-  return id;
+    await c.query(
+      `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
+       VALUES ($1, $2, $3, $4, 'queued', now())`,
+      [turn_id, args.turn_tenant, args.turn_agent, mensagem_id],
+    );
+    if (args.turn_tenant === args.msg_tenant && args.turn_agent === args.msg_agent) {
+      await c.query(
+        `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
+         VALUES ($1, $2, $3, $4, 0)`,
+        [args.turn_tenant, args.turn_agent, turn_id, mensagem_id],
+      );
+    }
+  });
+  return { mensagem_id, turn_id };
 }
 
 async function readProcessadaEm(mensagem_id: string): Promise<unknown> {
@@ -161,11 +188,11 @@ d('#504 — job V2 com FEATURE_TURN_CLAIM LIGADA (DB real)', () => {
 
   it('CONTROLE: o job V2 atravessa o claim atômico e o turno recebe posse', async () => {
     const { runAgentTurnJob } = await import('../../src/runtime/turns/job-consumer.js');
-    const mensagem_id = await mkInbound(VICTIM_T, VICTIM_A);
-    const turn_id = await mkTurn({
-      tenant: VICTIM_T,
-      agent: VICTIM_A,
-      representative_message_id: mensagem_id,
+    const { mensagem_id, turn_id } = await mkInboundComTurno({
+      msg_tenant: VICTIM_T,
+      msg_agent: VICTIM_A,
+      turn_tenant: VICTIM_T,
+      turn_agent: VICTIM_A,
     });
 
     await runAgentTurnJob({ kind: 'v2', turn_id }, { received_at_ms: null });
@@ -183,11 +210,11 @@ d('#504 — job V2 com FEATURE_TURN_CLAIM LIGADA (DB real)', () => {
     const { TurnScopeUnresolvedError } = await import(
       '../../src/runtime/turns/scope-resolver.js'
     );
-    const vitima = await mkInbound(VICTIM_T, VICTIM_A);
-    const turnoAtacante = await mkTurn({
-      tenant: ATTACKER_T,
-      agent: ATTACKER_A,
-      representative_message_id: vitima,
+    const { mensagem_id: vitima, turn_id: turnoAtacante } = await mkInboundComTurno({
+      msg_tenant: VICTIM_T,
+      msg_agent: VICTIM_A,
+      turn_tenant: ATTACKER_T,
+      turn_agent: ATTACKER_A,
     });
 
     const erro = await runAgentTurnJob(

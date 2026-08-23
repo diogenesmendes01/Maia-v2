@@ -49,49 +49,76 @@ const mensagens: string[] = [];
 const turnos: string[] = [];
 const armed: string[] = [];
 
-async function mkInbound(tenant: string, agent: string): Promise<string> {
-  const id = randomUUID();
-  await pool.query(
-    `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
-     VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-    [id, tenant, agent, `WAID-504DLQ-${randomInt(0, 1e9).toString(36)}`],
-  );
-  mensagens.push(id);
-  return id;
+/**
+ * A mensagem e o turno nascem na MESMA transação — ver a mesma nota em
+ * `turn-job-v2-scope-real-db.spec.ts`: uma janela entre os dois INSERTs é uma
+ * janela em que o `backfillBatch` de outra suíte adota a NOSSA mensagem.
+ */
+async function comTx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const r = await fn(c);
+    await c.query('COMMIT');
+    return r;
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    c.release();
+  }
 }
 
-async function mkTurn(args: {
-  tenant: string;
-  agent: string;
-  mensagem_id: string;
+/**
+ * Inbound + turno numa transação só. `turn_tenant`/`turn_agent` são declarados
+ * à parte para permitir o ponteiro que ATRAVESSA a fronteira (o último caso
+ * desta suíte); quando coincidem com os da mensagem, a row de
+ * `agent_turn_inputs` também entra.
+ */
+async function mkInboundComTurno(args: {
+  msg_tenant: string;
+  msg_agent: string;
+  turn_tenant: string;
+  turn_agent: string;
   status: 'received' | 'dead_letter';
-}): Promise<string> {
-  const id = randomUUID();
+}): Promise<{ mensagem_id: string; turn_id: string }> {
+  const mensagem_id = randomUUID();
+  const turn_id = randomUUID();
   const terminal = args.status === 'dead_letter';
-  await pool.query(
-    `INSERT INTO agent_turns
-       (id, tenant_id, agent_id, representative_message_id, status, outcome, attempt_count,
-        dead_lettered_at, last_error_code)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [
-      id,
-      args.tenant,
-      args.agent,
-      args.mensagem_id,
-      args.status,
-      terminal ? 'retry_exhausted' : null,
-      terminal ? 3 : 0,
-      terminal ? new Date() : null,
-      terminal ? 'reasoner_failed' : null,
-    ],
-  );
-  turnos.push(id);
-  await pool.query(
-    `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
-     VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING`,
-    [args.tenant, args.agent, id, args.mensagem_id],
-  );
-  return id;
+  mensagens.push(mensagem_id);
+  turnos.push(turn_id);
+  await comTx(async (c) => {
+    await c.query(
+      `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
+       VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
+      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504DLQ-${randomInt(0, 1e9).toString(36)}`],
+    );
+    await c.query(
+      `INSERT INTO agent_turns
+         (id, tenant_id, agent_id, representative_message_id, status, outcome, attempt_count,
+          dead_lettered_at, last_error_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        turn_id,
+        args.turn_tenant,
+        args.turn_agent,
+        mensagem_id,
+        args.status,
+        terminal ? 'retry_exhausted' : null,
+        terminal ? 3 : 0,
+        terminal ? new Date() : null,
+        terminal ? 'reasoner_failed' : null,
+      ],
+    );
+    if (args.turn_tenant === args.msg_tenant && args.turn_agent === args.msg_agent) {
+      await c.query(
+        `INSERT INTO agent_turn_inputs (tenant_id, agent_id, turn_id, mensagem_id, ingress_seq)
+         VALUES ($1, $2, $3, $4, 0)`,
+        [args.turn_tenant, args.turn_agent, turn_id, mensagem_id],
+      );
+    }
+  });
+  return { mensagem_id, turn_id };
 }
 
 async function readTurn(id: string): Promise<Record<string, unknown>> {
@@ -148,8 +175,13 @@ d('#504 — replay manual de turno em dead_letter (Postgres + Redis reais)', () 
   });
 
   it('um turno em dead_letter volta a `queued`, é AUDITADO e o job é REARMADO', async () => {
-    const mensagem_id = await mkInbound(T, A);
-    const turn_id = await mkTurn({ tenant: T, agent: A, mensagem_id, status: 'dead_letter' });
+    const { turn_id } = await mkInboundComTurno({
+      msg_tenant: T,
+      msg_agent: A,
+      turn_tenant: T,
+      turn_agent: A,
+      status: 'dead_letter',
+    });
     armed.push(agentTurnJobId(turn_id));
 
     // O operador digita só o `turn_id`. Ele NÃO informa tenant: deixar o
@@ -176,8 +208,13 @@ d('#504 — replay manual de turno em dead_letter (Postgres + Redis reais)', () 
   }, 60_000);
 
   it('um turno VIVO não é replayado, e NENHUM job é armado (fail-closed)', async () => {
-    const mensagem_id = await mkInbound(T, A);
-    const turn_id = await mkTurn({ tenant: T, agent: A, mensagem_id, status: 'received' });
+    const { turn_id } = await mkInboundComTurno({
+      msg_tenant: T,
+      msg_agent: A,
+      turn_tenant: T,
+      turn_agent: A,
+      status: 'received',
+    });
     armed.push(agentTurnJobId(turn_id));
 
     const outcome = await replayTurnByOperator({
@@ -197,16 +234,14 @@ d('#504 — replay manual de turno em dead_letter (Postgres + Redis reais)', () 
   }, 60_000);
 
   it('um turno cujo ponteiro atravessa a fronteira é RECUSADO antes de qualquer escrita', async () => {
-    const vitima = await mkInbound(OTHER_T, OTHER_A);
-    const turn_id = randomUUID();
-    turnos.push(turn_id);
     // Turno do par sintético apontando para a mensagem do par baseline.
-    await pool.query(
-      `INSERT INTO agent_turns
-         (id, tenant_id, agent_id, representative_message_id, status, outcome, attempt_count, dead_lettered_at)
-       VALUES ($1, $2, $3, $4, 'dead_letter', 'retry_exhausted', 3, now())`,
-      [turn_id, T, A, vitima],
-    );
+    const { turn_id } = await mkInboundComTurno({
+      msg_tenant: OTHER_T,
+      msg_agent: OTHER_A,
+      turn_tenant: T,
+      turn_agent: A,
+      status: 'dead_letter',
+    });
 
     const erro = await replayTurnByOperator({
       turn_id,
