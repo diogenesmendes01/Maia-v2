@@ -154,9 +154,32 @@ Não existe correção automática: a decisão é do operador.
 `dead_letter` **não** volta sozinho. O replay é operação explícita e auditada
 (`turn_replayed`), gera nova tentativa e descarta o `claim_token` anterior:
 
+```bash
+npm run dlq -- replay-turn <turn_id> --reason "<por quê>" --actor "ops:<seu-usuario>"
+```
+
+O comando faz três coisas, **nesta ordem**, e a ordem é a garantia:
+
+1. **resolve o dono** pelo `turn_id` (`resolveTurnJobScope`). Você não informa
+   tenant — deixar o operador escolher o escopo é deixar um erro de digitação
+   virar escrita cross-tenant. Se a mensagem representativa pertencer a outro
+   par (tenant, agent), o comando **recusa** (`scope_mismatch`) e não escreve
+   nada; isso é corrupção de ponteiro e pede investigação, não rearme;
+2. **transiciona `dead_letter -> queued`** por CAS auditado (`turn_replayed`),
+   gerando nova tentativa e descartando o `claim_token` anterior. Um turno que
+   **não** está em `dead_letter` é recusado aqui — e nada é rearmado;
+3. **rearma o job** com o `jobId` determinístico, removendo antes o job retido
+   pela BullMQ. Sem este passo o turno voltaria a `queued` e ficaria lá: com
+   `FEATURE_TURN_STATE_AUTHORITATIVE=false` (o default hoje) nada mais o
+   rearmaria.
+
+Exit code 0 = replayado e rearmado. Qualquer recusa sai com 1 e diz o motivo.
+
+A mesma operação, de dentro de um script Node:
+
 ```ts
-import { replayDeadLetteredTurn } from '@/runtime/turns/index.js';
-await replayDeadLetteredTurn({ turn_id, actor: 'ops:<seu-usuario>', reason: '<por quê>' });
+import { replayTurnByOperator } from '@/ops/turn-replay.js';
+await replayTurnByOperator({ turn_id, actor: 'ops:<seu-usuario>', reason: '<por quê>' });
 ```
 
 Antes de replayar, confirme que o efeito colateral do turno **não** ocorreu
@@ -278,7 +301,75 @@ reduzida, não neutro.
 em `claimed`/`running` com lease viva. O claim não quebra sem a coluna, mas o
 diagnóstico de §6.1 fica cego.
 
-## 7. Rollback
+## 7. Contrato do payload do job: V1 → V2 (#504)
+
+O job da fila `agent` existe em duas formas durante a janela de compatibilidade:
+
+| Forma | Payload | Quem resolve o tenant |
+|---|---|---|
+| **V1** (legado, o default hoje) | `{ mensagem_id, turn_id?, trace_id?, enqueued_at_ms?, received_at_ms? }` | `src/agent/core.ts`, pelo canal, depois que o worker já começou |
+| **V2** (`FEATURE_TURN_JOB_V2=true`) | `{ version: 2, turn_id }` e **nada mais** | `src/runtime/turns/scope-resolver.ts`, **antes** de qualquer trabalho de domínio |
+
+O worker lê **as duas** desde esta entrega (`parseAgentTurnJob`, chamado uma vez
+no topo de `startAgentWorker`). O produtor só muda com a flag.
+
+### 7.1 A ordem é obrigatória e não é simétrica
+
+1. deploy do código com `FEATURE_TURN_JOB_V2=false` — o consumidor passa a
+   entender V2, o produtor continua armando V1. **Todas** as réplicas de consumo
+   precisam estar neste build antes do passo 2: um worker antigo que receba um
+   payload V2 procura `mensagem_id`, não acha, e falha o job;
+2. confirme em `maia_turn_job_version_total` que a série existe e está toda em
+   `version="v1"`;
+3. ligue `FEATURE_TURN_JOB_V2=true`. Jobs armados a partir daí saem V2 — mas só
+   quando o produtor conhece o `turn_id` (exige `FEATURE_TURN_STATE_MACHINE`);
+   sem turno, o produtor continua armando V1, por construção;
+4. **o critério de remoção do V1** é esta série:
+   `sum(rate(maia_turn_job_version_total{version="v1"}[1h])) == 0` por uma
+   janela definida. Só então o ramo legado pode sair, em PR separado.
+
+`version="invalid"` **nunca** é ruído de fundo: é um payload que nenhum dos dois
+parsers reconheceu. O turno correspondente não roda, o job vai para retry e
+depois DLQ. Um ponto aqui é alerta.
+
+### 7.2 O que o V2 muda na observabilidade
+
+O payload V2 não carrega `received_at_ms`, `enqueued_at_ms` nem `trace_id` — a
+issue exige "apenas `version` e `turn_id`". O consumidor **recompõe** os três do
+banco, assim que o resolvedor devolve o escopo:
+
+| Sinal | V1 | V2 |
+|---|---|---|
+| `maia_turn_e2e_latency_ms` | `received_at_ms` do payload | `mensagens.created_at` |
+| `maia_queue_wait_ms` | `enqueued_at_ms` do payload, atribuída a `system` | `agent_turns.queued_at`, **atribuída ao dono** |
+| `trace_id` | do payload, ou derivado de `mensagem_id` | derivado de `mensagem_id` após a resolução (a janela pré-resolução usa o `turn_id`) |
+| span `queue.wait` | emitido | **não** emitido (não há instante de armação no payload) |
+
+Consequência operacional: um turno rearmado direto de `claimed`/`running` (lease
+vencida) pode não ter `queued_at`, e nesse caso a amostra de espera na fila
+simplesmente não existe — inventar uma seria pior.
+
+### 7.3 Recusas do resolvedor de escopo
+
+`maia_turn_scope_rejected_total{reason}` + audit `turn_job_scope_rejected`.
+Nenhum desses motivos é normal:
+
+| `reason` | Significa | Ação |
+|---|---|---|
+| `malformed_turn_id` | o payload trouxe algo que não é UUID | Payload forjado ou produtor fora do contrato. O banco nem é consultado. |
+| `turn_not_found` | nenhum turno com esse id | Payload forjado, retenção que apagou o turno, ou banco errado. |
+| `scope_unusable` | o par (tenant, agent) da linha é vazio, tem espaço, ou é `default`/`system` | Dado corrompido. Um turno inbound tem dono por definição. |
+| `representative_missing` | o turno aponta para uma mensagem que não existe | Corrupção de ponteiro. `representative_message_id` não tem FK. |
+| `scope_mismatch` | **a mensagem representativa pertence a outro par (tenant, agent)** | **Incidente de isolamento.** Não rearme. Investigue quem escreveu esse ponteiro. |
+
+### 7.4 Rollback
+
+`FEATURE_TURN_JOB_V2=false` faz o próximo `enqueueAgent` voltar a armar V1
+imediatamente. Jobs V2 já na fila continuam sendo entendidos pelo worker — é
+justamente por isso que o consumidor precede o produtor. Não há migration
+envolvida.
+
+## 8. Rollback
 
 **De aplicação** — volte o código; mantenha as tabelas; mantenha o dual-write
 enquanto houver versão mista rodando. `processada_em` nunca deixou de ser

@@ -142,6 +142,15 @@ cada limite de efeito pergunta pela posse antes de agir —
 round-trip de LLM) e a projeção legada `mensagens.processada_em` no próprio
 core. Fora de um turno reivindicado todo guard é no-op.
 
+**Backoff com jitter limitado.** `retryDelayMs` (`lifecycle.ts`) é exponencial
+com teto de 15min E jitter simétrico de ±20%, e o valor entra em
+`agent_turns.next_attempt_at`. Sem jitter, N turnos que falharam pela MESMA
+causa (LLM fora do ar, banco lento, deploy) recebem o mesmo `next_attempt_at` ao
+milissegundo e voltam todos juntos contra a dependência que acabou de cair — o
+backoff exponencial sozinho não resolve isso, porque ele afasta as tentativas do
+MESMO turno e mantém alinhadas as de turnos diferentes. O teto é reaplicado
+DEPOIS do jitter, então continua sendo um teto de verdade.
+
 **`jobId` determinístico.** `agentTurnJobId(turn_id)` = `turn-<uuid>`. "Mesmo
 trabalho lógico" é o TURNO, não a mensagem nem o evento de enfileiramento: o
 debounce agrega N mensagens numa execução, e ingresso e recovery (que podem
@@ -150,8 +159,38 @@ RETENÇÃO da BullMQ — um job `completed`/`failed` retido bloquearia o rearme
 legítimo, então `enqueueAgent` remove o cadáver antes do `add` e deixa job VIVO
 intocado (é ele quem faz a deduplicação).
 
+**Contrato do payload: V1 e V2 (`turns/job.ts` + `turns/scope-resolver.ts` +
+`turns/job-consumer.ts`).** O job V2 é `{version: 2, turn_id}` e nada mais — sem
+tenant, sem conteúdo, sem correlação. Isso obriga o consumidor a traduzir
+`turn_id -> (tenant, agent, mensagem representativa)` ANTES de qualquer trabalho
+de domínio, e essa tradução é CROSS-TENANT por construção: quem descobre o dono
+não pode já estar escopado por ele. `resolveTurnJobScope` é essa fronteira, e o
+que a torna aceitável são cinco predicados, não a intenção:
+
+1. o payload **não pode carregar escopo** — `AgentTurnJobV2Schema` é `.strict()`,
+   então um `{version, turn_id, tenant_id}` não parseia como V2 nem como V1 e
+   vira `invalid` antes de chegar ao banco;
+2. escopo e id da mensagem saem da **mesma row, no mesmo SELECT**, com projeção
+   mínima (nenhuma coluna de conteúdo atravessa a fronteira);
+3. a ligação turno → mensagem é **reconciliada**: `representative_message_id` não
+   tem foreign key (migration 097 só cria uma unique), então um turno do tenant A
+   apontando para a mensagem do tenant B é fisicamente representável — e é
+   recusado (`scope_mismatch`) em vez de atravessado;
+4. **fail-closed** em todo desfecho que não seja resolução inequívoca, incluindo
+   os sentinelas `default` e `system`;
+5. toda recusa é **auditada** (`turn_job_scope_rejected`) e medida, com `reason`
+   de vocabulário fechado.
+
+O resolvedor NÃO decide se o turno deve executar — elegibilidade e posse
+continuam sendo do claim. Depois dele, o consumidor abre
+`runWithTenantContext(escopo)` e entra no mesmo `runAgentForMensagem`; `core.ts`
+segue abrindo seu contexto ANINHADO com o par que o canal resolver, que vence
+para o escopo interno.
+
 | Métrica | Labels |
 |---|---|
+| `maia_turn_job_version_total` | `version` = `v1` / `v2` / `invalid` (vocabulário FECHADO `TURN_JOB_VERSION_VALUES`). Emitida no PARSE, em `startAgentWorker` — atribuição `system` por construção (nada resolveu o tenant ainda), pela camada de política de [`src/observability/metrics.ts`](../../../src/observability/metrics.ts). É o critério MENSURÁVEL de remoção do caminho V1: zero `v1` por uma janela definida. |
+| `maia_turn_scope_rejected_total` | `reason` = `malformed_turn_id` / `turn_not_found` / `scope_unusable` / `representative_missing` / `scope_mismatch`. Nenhum é normal; `scope_mismatch` é incidente de isolamento. |
 | `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` |
 | `maia_turn_claim_latency_ms` | `result` |
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
