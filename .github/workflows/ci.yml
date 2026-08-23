@@ -443,6 +443,24 @@ jobs:
         # step runs Postgres is accepting connections.
         run: npm run db:migrate
 
+      - name: maia doctor (read-only, NÃO bloqueante)
+        # Issue #517, etapa 6 do rollout ("rodar em CI sem bloquear").
+        #
+        # Roda contra os MESMOS service containers das specs, logo depois das
+        # migrations — o momento em que um schema recém-aplicado, o pgvector da
+        # imagem `pgvector/pgvector:pg16` e a política de eviction do
+        # `redis:7-alpine` são todos observáveis de uma vez.
+        #
+        # `continue-on-error` é deliberado e temporário: um gate novo que
+        # reprova o CI no primeiro dia é um gate que alguém desliga. Ele vira
+        # bloqueante em staging primeiro (etapa 7) e em produção depois
+        # (etapa 8) — ver docs/runbooks/doctor.md.
+        #
+        # O doctor é read-only: nada aqui altera o banco ou o Redis das specs
+        # que rodam em seguida.
+        continue-on-error: true
+        run: npm run doctor -- --online
+
       - name: Run integration tests
         env:
           VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
