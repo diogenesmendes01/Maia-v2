@@ -650,3 +650,242 @@ jobs:
 
       - name: Round-trip do drizzle-kit contra Postgres descartável
         run: npm run probe:drizzle-kit
+
+  # ---------------------------------------------------------------------
+  # Gate do console de administração (#472 parte A — pré-requisito das
+  # issues #604 e #605).
+  #
+  # Por que ele existe: até aqui o CI rodava `admin:typecheck` (tipos) e as
+  # specs de `tests/admin-ui/unit/` (routers tRPC, em processo). Nenhum dos
+  # dois EXECUTA o console: nada carregava o `next build`, o bundle de
+  # middleware (runtime Edge), os route handlers ou o bundle de cliente. Um
+  # `next build` quebrado e uma regressão de runtime do console passavam por
+  # todos os checks — e as duas issues de upgrade (#604 Next 16, #605
+  # Recharts 3) pedem exatamente esta rede antes de subirem major.
+  #
+  # Job NOVO e isolado, no padrão de `smoke-migrate-image`, `alert-rules` e
+  # `drizzle-kit-roundtrip`: uma perna só de Node, sem matriz, sem compartilhar
+  # nada com os jobs acima. NÃO tem `continue-on-error` de propósito.
+  #
+  # ARMADILHA DE ENV, deliberada no desenho: NÃO existe bloco `env:` de JOB
+  # aqui. Uma variável no `env:` de um job alcança TODO processo dele, e
+  # `src/config/validate.ts` REPROVA qualquer chave desconhecida sob os
+  # prefixos de `MAIA_KEY_PREFIXES` (`MAIA_`, `FEATURE_`, `BACKUP_`,
+  # `ADMIN_UI_`, `OWNER_`, ...). Além disso o build precisa de
+  # `NODE_ENV=production` e as migrations de `NODE_ENV=test`; misturar os dois
+  # num `env:` de job é como se fabrica uma falha em massa. Cada passo carrega
+  # o SEU bloco.
+  #
+  # Duração medida (ver corpo do PR): `next build` ~35s a frio / ~9s a quente,
+  # boot do console 0.4s, suíte Playwright 2.1s. O custo dominante do job são
+  # os dois `npm ci` e o download do Chromium.
+  # ---------------------------------------------------------------------
+  admin-ui:
+    name: build + e2e do console (admin-ui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        # Mesma imagem do job `integration`: o console importa
+        # `src/db/client.ts`, e o banco contra o qual ele roda tem de ser do
+        # mesmo tipo do de produção (pgvector incluso).
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          # Uma perna só, no piso de `engines.node`. O objeto sob teste é o
+          # artefato do console, não a compatibilidade de Node major — essa já
+          # é coberta pela matriz dos jobs `validate` e `integration`.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Mesmo motivo dos demais jobs: o lockfile é npm 11 e `npm ci` com npm
+        # 10 quebra. Tem de rodar ANTES do `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # Tem de rodar ANTES do `npm ci` — `tests/unit/scripts/check-node.spec.ts`
+        # varre TODOS os workflows e reprova qualquer `npm ci` sem ele.
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        # A raiz traz `@playwright/test` (devDependency): o runner e as specs
+        # vivem na raiz, então é de lá que `@playwright/test` precisa resolver.
+        # Antes disso `npm run test:admin-ui:e2e` morria em
+        # `Cannot find package '@playwright/test'` antes mesmo de carregar o
+        # próprio `playwright.config.ts`.
+        run: npm ci
+
+      - name: Install admin-ui deps
+        # O `npm ci` da raiz não instala `src/admin-ui`, que tem lockfile
+        # próprio (mesmo passo do job `validate`).
+        working-directory: src/admin-ui
+        run: npm ci
+
+      - name: Instalar Chromium do Playwright
+        # No CI o browser NAO vem pronto: sem este passo o job reprovaria com
+        # "Executable doesn't exist", que é falha de ambiente disfarçada de
+        # falha de teste. `--with-deps` traz as bibliotecas de sistema do
+        # runner. Só o chromium — é o único browser dos `projects` do config.
+        run: npx playwright install --with-deps chromium
+
+      # -- BUILD -----------------------------------------------------------
+      - name: Build do console (next build)
+        # BLOQUEANTE. Este bloco de env é o MESMO do estágio `build` de
+        # `src/admin-ui/Dockerfile` — o build real da imagem de produção — e
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` reprova se os dois
+        # divergirem. Não é higiene: o `next build` avalia a configuração da
+        # Maia na passada de "Collecting page data" (o console importa
+        # `@/db/client.ts` -> `@/config/env.ts`), então o build FALHA sem estas
+        # variáveis. Foi assim que se mediu que o bloco do Dockerfile estava
+        # DESATUALIZADO: sem `MAIA_ENV` e sem as três de `BACKUP_S3_*` ele
+        # morre em "Failed to collect page data for /api/auth/[...nextauth]"
+        # — ou seja, o build da imagem de produção do console estava quebrado
+        # e nada no CI dizia.
+        #
+        # `MAIA_ENV=staging`: `next build` fixa `NODE_ENV=production`, e o
+        # profile `production` do contrato exige keyring de backup e chaves de
+        # S3 de verdade. O build é um SANDBOX, não um deploy — nada daqui
+        # chega ao runtime, que valida com os valores reais no boot. `staging`
+        # é o profile estrito mais próximo que descreve isso honestamente.
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NODE_ENV: production
+          MAIA_ENV: staging
+          NEXTAUTH_SECRET: build-time-only-secret-min-32-chars-not-shipped-12345
+          NEXTAUTH_URL: http://localhost:4000
+          DATABASE_URL: postgres://build:build@localhost:5432/build
+          POSTGRES_USER: build
+          POSTGRES_PASSWORD: buildbuild
+          POSTGRES_DB: build
+          REDIS_URL: redis://localhost:6379
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: build
+          ANTHROPIC_API_KEY: sk-ant-build
+          OPENROUTER_API_KEY: sk-or-build
+          VOYAGE_API_KEY: voyage-build
+          ALERT_CHANNELS: log
+          RUNTIME_TRACE_HMAC_MASTER_SECRET: build-time-only-hmac-not-shipped-min-32-chars-1234567890
+          BACKUP_S3_BUCKET: build-bucket
+          BACKUP_S3_ACCESS_KEY: build
+          BACKUP_S3_SECRET_KEY: build
+        run: npm run admin:build
+
+      - name: Artefato do build existe
+        # Atômico com o passo acima: um `next build` que sai 0 sem emitir
+        # BUILD_ID não construiu nada.
+        run: test -f src/admin-ui/.next/BUILD_ID
+
+      # -- E2E -------------------------------------------------------------
+      - name: Apply migrations
+        # Bloco de env do PERFIL DE TESTE (NODE_ENV=test => profile
+        # development), espelhando o job `integration`. Separado do bloco de
+        # build de propósito: os dois se contradizem em `NODE_ENV`.
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+          REDIS_URL: redis://localhost:6379
+          ANTHROPIC_API_KEY: sk-ant-test-placeholder
+          OPENROUTER_API_KEY: sk-or-test-placeholder
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: Test Owner
+          VOYAGE_API_KEY: test-voyage-key
+          ALERT_CHANNELS: log
+        run: npm run db:migrate
+
+      - name: E2E do console (Playwright, projeto `smoke`)
+        # BLOQUEANTE. `scripts/admin-ui-e2e.sh` sobe o console CONSTRUÍDO,
+        # espera ele responder (e reprova com o log dele se não responder),
+        # roda o projeto `smoke` e depois exige, por
+        # `scripts/check-playwright-run.ts`, que a rodada tenha executado pelo
+        # menos `TEST_ADMIN_UI_MIN_TESTS` testes e NENHUM pulado. O Playwright
+        # sai com código 0 quando não encontra teste nenhum — sem esse piso,
+        # "Running 0 tests" seria um check verde.
+        #
+        # `AUTH_TRUST_HOST=true` é o mesmo valor de `compose.prod.yml`: sem
+        # ele o NextAuth v5 recusa o Host (`UntrustedHost`) e devolve 500 em
+        # /api/auth/*. Medido: a spec de boot reprova com três respostas 500.
+        env:
+          NODE_ENV: production
+          MAIA_ENV: staging
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXTAUTH_SECRET: e2e-only-secret-min-32-chars-not-shipped-12345
+          NEXTAUTH_URL: http://localhost:4000
+          AUTH_TRUST_HOST: 'true'
+          DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+          REDIS_URL: redis://localhost:6379
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: e2e
+          ANTHROPIC_API_KEY: sk-ant-e2e
+          OPENROUTER_API_KEY: sk-or-e2e
+          VOYAGE_API_KEY: voyage-e2e
+          ALERT_CHANNELS: log
+          RUNTIME_TRACE_HMAC_MASTER_SECRET: e2e-only-hmac-not-shipped-min-32-chars-1234567890
+          BACKUP_S3_BUCKET: e2e-bucket
+          BACKUP_S3_ACCESS_KEY: e2e
+          BACKUP_S3_SECRET_KEY: e2e
+          FEATURE_ADMIN_UI_V1: 'true'
+          # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
+          # `scripts/admin-ui-e2e.sh`.
+          TEST_ADMIN_UI_MIN_TESTS: '5'
+        run: npm run test:admin-ui:e2e:ci
+
+      - name: Quarentena da suíte e2e (o que NÃO foi medido)
+        # Nunca reprova: é legibilidade. As specs `@pendente-472` estão fora do
+        # gate porque exigem sessão autenticada e fixtures que
+        # `scripts/seed-proposals-fixtures.ts` ainda não cria. A lista é fixada
+        # em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode
+        # crescer em silêncio.
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "specs fora do gate (@pendente-472, issue #472):"
+          # Casa a TAG no título do describe (o que o grep do Playwright vê),
+          # não uma menção ao identificador em comentário.
+          grep -lE '^test\.describe\(.*@pendente-472' tests/admin-ui/e2e/*.spec.ts
+
+      - name: Relatório do Playwright (só quando reprova)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-admin-ui
+          path: |
+            .playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
