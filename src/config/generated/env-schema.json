@@ -1850,6 +1850,21 @@
         "false"
       ]
     },
+    "FEATURE_TURN_JOB_V2": {
+      "type": "string",
+      "description": "PRODUTOR do payload V2 do job de turno (issue #504 §Contrato do job). OFF (default): enqueueAgent arma o payload V1 legado ({mensagem_id, turn_id?, correlação}) — o consumidor já lê os DOIS formatos desde esta issue, então ligar aqui é o passo 5 do rollout e nunca o primeiro. ON: quando o produtor conhece o turno, o payload passa a ser exatamente {version: 2, turn_id} e mais nada; o worker redescobre tenant, agent e mensagem no PostgreSQL pelo resolvedor de escopo (src/runtime/turns/scope-resolver.ts). ORDEM OBRIGATÓRIA: só ligue depois que TODAS as réplicas de consumo estiverem no build que entende V2 — um worker antigo recebendo V2 não acha mensagem_id e falha o job. EXIGE FEATURE_TURN_STATE_MACHINE ligada (sem turno durável não há turn_id a transportar). CUSTO CONHECIDO: o payload V2 não carrega received_at_ms/enqueued_at_ms/trace_id; o consumidor os recompõe do banco, então maia_queue_wait_ms passa a medir agent_turns.queued_at em vez do carimbo do produtor. Kill switch: false volta a armar V1 no próximo enqueue. Ver docs/runbooks/turn-state-machine.md §7.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "FEATURE_TURN_STATE_AUTHORITATIVE": {
       "type": "string",
       "description": "Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno `retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído (`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. Ver docs/runbooks/turn-state-machine.md §2.",

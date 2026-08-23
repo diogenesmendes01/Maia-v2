@@ -30,7 +30,7 @@ import { logger } from '@/lib/logger.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
 import { startBaileys } from '@/gateway/baileys.js';
 import { startAgentWorker } from '@/gateway/queue.js';
-import { runAgentForMensagem } from '@/agent/core.js';
+import { runAgentTurnJob } from '@/runtime/turns/job-consumer.js';
 import { startServer } from '@/server.js';
 import { audit } from '@/governance/audit.js';
 import { probeDb } from '@/db/client.js';
@@ -211,8 +211,13 @@ async function main() {
     const ownsWorker = roleOwns(role, 'agent_worker');
     if (ownsWorker) {
       lifecycle.setComponent('agent_worker', 'starting');
-      startAgentWorker(async (job) => {
-        await runAgentForMensagem(job.data.mensagem_id);
+      // Issue #504 §Contrato do job — o worker recebe o payload JÁ classificado
+      // (`parsed`) pela leitura dual do `queue.ts` e despacha por
+      // `runAgentTurnJob`: V1 chama `runAgentForMensagem` como sempre, V2
+      // resolve o escopo cross-tenant antes de qualquer trabalho de domínio.
+      // Ver `src/runtime/turns/job-consumer.ts`.
+      startAgentWorker(async (_job, parsed, facts) => {
+        await runAgentTurnJob(parsed, facts);
       });
       // Spec roteamento v4 §1.4 — worker de replay do staging (job só carrega o
       // id; o payload cifrado vive no Postgres). Ativo em qualquer modo: rows só

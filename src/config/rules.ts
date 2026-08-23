@@ -723,6 +723,24 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #504 §Contrato do job — o PRODUTOR V2 depende da máquina de estados
+  // pela mesma razão que o claim: sem `agent_turns` não existe `turn_id`
+  // durável, e `enqueueAgent` cairia de volta no V1 em todo enfileiramento. A
+  // flag ligada seria uma promessa que o código não cumpre — e o operador
+  // acreditaria ter migrado o produtor sem ter migrado.
+  if (bool(c.FEATURE_TURN_JOB_V2) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_JOB_V2',
+      rule: 'turn-job-v2/requires-state-machine',
+      message:
+        'FEATURE_TURN_JOB_V2=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, e todo enfileiramento continua armando o payload V1.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas) antes de migrar o produtor, ou desligue FEATURE_TURN_JOB_V2. Ver docs/runbooks/turn-state-machine.md §7.',
+    });
+  }
+
   // Janelas/limites que precisam estar em ordem.
   const orderPairs: readonly [string, string, string][] = [
     ['MESSAGE_DEBOUNCE_MS', 'MESSAGE_DEBOUNCE_MAX_MS', 'debounce'],

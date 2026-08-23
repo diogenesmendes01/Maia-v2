@@ -92,6 +92,23 @@ export type TurnTransitionResult =
       current_state_version: number;
     };
 
+/**
+ * #504 — projeção MÍNIMA devolvida pela leitura cross-tenant do escopo de um
+ * job V2. Só colunas de escopo/identidade e dois timestamps operacionais;
+ * nenhuma coluna de conteúdo atravessa esta fronteira.
+ */
+export type TurnJobScopeRow = {
+  turn_tenant_id: string | null;
+  turn_agent_id: string | null;
+  turn_status: string;
+  representative_message_id: string;
+  queued_at: Date | string | null;
+  /** `null` quando a mensagem representativa não existe (LEFT JOIN sem par). */
+  message_tenant_id: string | null;
+  message_agent_id: string | null;
+  message_created_at: Date | string | null;
+};
+
 /** Candidato de recovery: o turno + o motivo pelo qual foi eleito. */
 export type RecoverableTurn = { turn: AgentTurn; reason: TurnRecoveryReason };
 
@@ -782,6 +799,57 @@ export const agentTurnsRepo = {
   },
 
   // ─── Leitura ─────────────────────────────────────────────────────────────
+
+  /**
+   * #504 §Contrato do job — a ÚNICA leitura CROSS-TENANT desta tabela feita a
+   * pedido de um payload de fila, e a razão pela qual ela existe.
+   *
+   * Um job V2 carrega só `{version, turn_id}`. O consumidor precisa descobrir
+   * QUEM é o dono antes de poder abrir contexto de tenant — é literalmente o
+   * mesmo problema (e o mesmo padrão sancionado de entry-point) de
+   * `channelsRepo.findByExternalCrossTenant` e
+   * `mensagensRepo.findOwnerByIdCrossTenant`: quem descobre o escopo não pode
+   * já estar escopado.
+   *
+   * O que este método faz para que essa exceção não vire um buraco:
+   *
+   *  1. **Projeção mínima.** Devolve `tenant_id`, `agent_id`, o id da mensagem
+   *     representativa e dois timestamps operacionais. NENHUMA coluna de
+   *     conteúdo — nem `last_error_summary`, nem conversa, nem a mensagem. Um
+   *     chamador que resolva o turno errado não consegue LER nada de outro
+   *     tenant por esta porta; no máximo descobre que o id existe.
+   *  2. **Uma única declaração.** O escopo e o id da mensagem saem da MESMA
+   *     row, no MESMO SELECT. Não existe janela entre "li o escopo" e "li a
+   *     mensagem" na qual os dois pudessem vir de linhas diferentes.
+   *  3. **O escopo da MENSAGEM vem junto.** `representative_message_id` NÃO
+   *     tem foreign key (ver `migrations/097_agent_turns.sql`: só uma unique),
+   *     então um turno do tenant A apontando para uma mensagem do tenant B é
+   *     fisicamente representável. Trazer os dois pares no mesmo SELECT é o que
+   *     permite ao resolvedor RECUSAR essa combinação em vez de atravessá-la —
+   *     ver `src/runtime/turns/scope-resolver.ts`.
+   *
+   * O LEFT JOIN é deliberado: sem ele, um turno cuja mensagem sumiu seria
+   * indistinguível de um turno inexistente, e os dois pedem reações diferentes
+   * (o primeiro é corrupção de dado, o segundo é payload forjado ou retenção).
+   */
+  async findJobScopeByIdCrossTenant(turn_id: string): Promise<TurnJobScopeRow | null> {
+    const result = await db.execute<TurnJobScopeRow>(sql`
+      SELECT
+        t.tenant_id                  AS turn_tenant_id,
+        t.agent_id                   AS turn_agent_id,
+        t.status                     AS turn_status,
+        t.representative_message_id  AS representative_message_id,
+        t.queued_at                  AS queued_at,
+        m.tenant_id                  AS message_tenant_id,
+        m.agent_id                   AS message_agent_id,
+        m.created_at                 AS message_created_at
+      FROM ${agent_turns} t
+      LEFT JOIN ${mensagens} m ON m.id = t.representative_message_id
+      WHERE t.id = ${turn_id}
+      LIMIT 1
+    `);
+    return (result.rows as unknown as TurnJobScopeRow[])[0] ?? null;
+  },
 
   async findById(turn_id: string): Promise<AgentTurn | null> {
     const { tenant_id, agent_id } = scope();
