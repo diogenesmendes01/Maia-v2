@@ -61,6 +61,19 @@ O caminho do **debounce** mantém o `jobId` próprio (`debounce:<escopo>`): ele
 depende de remover e re-adicionar o job a cada mensagem para reiniciar a janela,
 o que é incompatível com um id que representa o trabalho e não a janela.
 
+**Payload V1 e V2 (#504).** A fila `agent` transporta duas formas durante a
+janela de compatibilidade, e o tipo `AgentQueuePayload`
+([`queue.ts`](../../../src/gateway/queue.ts)) é a união das duas. `startAgentWorker`
+classifica com `parseAgentTurnJob` UMA vez, no topo, e entrega o resultado já
+classificado ao processor — duas leituras independentes do mesmo buffer são duas
+verdades que podem divergir. `enqueueAgent` arma V2 (`{version: 2, turn_id}`) só
+com `FEATURE_TURN_JOB_V2=true` E `turn_id` conhecido; caso contrário arma V1. A
+ordem consumidor-antes-de-produtor é obrigatória e está no
+[runbook §7](../../runbooks/turn-state-machine.md). Nenhuma das duas formas
+carrega tenant: no V1 quem resolve é o resolver de canal dentro de
+`agent/core.ts`; no V2, o resolvedor de escopo de
+[`runtime.md`](runtime.md), antes de qualquer trabalho de domínio.
+
 ## How to extend
 
 | Need | Where |

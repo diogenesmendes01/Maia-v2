@@ -99,13 +99,25 @@ let captured: EndedSpan[] = [];
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
+/** UUIDs estáveis: o payload V1 real carrega `mensagens.id`, que é uuid. */
+const MENSAGEM_IDS = {
+  default: '11111111-1111-4111-8111-111111111111',
+  a: '22222222-2222-4222-8222-222222222222',
+  b: '33333333-3333-4333-8333-333333333333',
+} as const;
+
 function fakeJob(overrides: Partial<AgentJob> & { id?: string } = {}): Job<AgentJob> {
   const { id = 'job-1', ...data } = overrides;
   return {
     id,
     attemptsMade: 0,
     opts: { attempts: 3 },
-    data: { mensagem_id: 'm1', enqueued_at_ms: Date.now() - 1_500, ...data },
+    // #504: o worker classifica o payload por `parseAgentTurnJob` antes de
+    // qualquer instrumentação, e o schema V1 exige `mensagem_id` em forma de
+    // UUID — que é o que `mensagens.id` sempre é em produção. Um id sintético
+    // fora de forma seria classificado `invalid` e o job nem chegaria ao span,
+    // então a fixture usa UUIDs de verdade.
+    data: { mensagem_id: MENSAGEM_IDS.default, enqueued_at_ms: Date.now() - 1_500, ...data },
   } as unknown as Job<AgentJob>;
 }
 
@@ -222,12 +234,12 @@ describe('startAgentWorker — exported span attribution (#535 review)', () => {
     };
 
     plan.tenant = { tenant_id: 'acme', agent_id: 'acme-bot' };
-    const a = capturedHandler.fn!(fakeJob({ id: 'job-a', mensagem_id: 'm-a' }));
+    const a = capturedHandler.fn!(fakeJob({ id: 'job-a', mensagem_id: MENSAGEM_IDS.a }));
     // Flip the plan the moment the first job is past its resolution point, so
     // the two turns are genuinely interleaved under different tenants.
     while (parked < 1) await tick();
     plan.tenant = { tenant_id: 'globex', agent_id: 'globex-bot' };
-    const b = capturedHandler.fn!(fakeJob({ id: 'job-b', mensagem_id: 'm-b' }));
+    const b = capturedHandler.fn!(fakeJob({ id: 'job-b', mensagem_id: MENSAGEM_IDS.b }));
 
     while (parked < 2) await tick();
     release();

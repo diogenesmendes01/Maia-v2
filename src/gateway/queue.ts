@@ -16,22 +16,62 @@ import {
   runWithCorrelation,
 } from '@/observability/correlation.js';
 import { counter, histogram } from '@/observability/metrics.js';
-import { METRIC, SPAN } from '@/observability/taxonomy.js';
+import {
+  METRIC,
+  SPAN,
+  TURN_JOB_VERSION_VALUES,
+  closedVocabulary,
+} from '@/observability/taxonomy.js';
 import {
   recordElapsedSpan,
   withSpan,
   type SpanAttribution,
 } from '@/observability/tracer.js';
-import { agentTurnJobId } from '@/runtime/turns/job.js';
+import {
+  agentTurnJobId,
+  jobVersionLabel,
+  parseAgentTurnJob,
+  type AgentTurnJobV2,
+  type ParsedAgentTurnJob,
+} from '@/runtime/turns/job.js';
+import type { AgentJobFacts } from '@/runtime/turns/job-consumer.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
+
+/**
+ * Issue #504 §Contrato do job — o que uma row da fila `agent` pode conter
+ * DURANTE a janela de compatibilidade.
+ *
+ * A união é temporária por contrato: o produtor emite V2 quando
+ * `FEATURE_TURN_JOB_V2` está ligada e o turno é conhecido, e V1 no resto dos
+ * casos. Quem decide qual dos dois chegou é `parseAgentTurnJob`, uma vez só, no
+ * topo do worker — nunca um `'mensagem_id' in job.data` espalhado.
+ */
+export type AgentQueuePayload = AgentJob | AgentTurnJobV2;
+
+/**
+ * O processor recebe o payload JÁ classificado. Passar `parsed` em vez de
+ * deixar o consumidor reparsear é o que garante que a métrica de versão e a
+ * decisão de despacho falem do MESMO parse: duas leituras independentes do
+ * mesmo buffer são duas verdades que podem divergir sem que ninguém perceba.
+ */
+export type AgentJobProcessor = (
+  job: Job<AgentQueuePayload>,
+  parsed: ParsedAgentTurnJob,
+  facts: AgentJobFacts,
+) => Promise<void>;
+
+/** Os campos que só existem no payload V1. `null` quando o job é V2/inválido. */
+function legacyFields(parsed: ParsedAgentTurnJob, data: AgentQueuePayload): AgentJob | null {
+  return parsed.kind === 'v1' ? (data as AgentJob) : null;
+}
 
 const connection = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,
   lazyConnect: true,
 });
 
-export const agentQueue = new Queue<AgentJob>('agent', { connection });
+export const agentQueue = new Queue<AgentQueuePayload>('agent', { connection });
 
 /**
  * How long a job deferred by the drain guard waits before becoming eligible
@@ -71,11 +111,11 @@ async function deferIfNotAcceptingWork(
   throw new DelayedError();
 }
 
-let worker: Worker<AgentJob> | null = null;
+let worker: Worker<AgentQueuePayload> | null = null;
 
-export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void>): Worker<AgentJob> {
+export function startAgentWorker(processor: AgentJobProcessor): Worker<AgentQueuePayload> {
   if (worker) return worker;
-  worker = new Worker<AgentJob>(
+  worker = new Worker<AgentQueuePayload>(
     'agent',
     async (job, token) => {
       // Drain guard FIRST — before any side effect, before ANY context, and
@@ -96,16 +136,48 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       // the attempt, which is exactly the "recovery preserves root trace, new
       // attempt id" contract. Falling back to `deriveTraceId(mensagem_id)`
       // makes jobs armed before this deploy correlate identically.
-      const trace_id = job.data.trace_id ?? deriveTraceId(job.data.mensagem_id);
+
+      // Issue #504 §Contrato do job — a LEITURA DUAL, no caminho real do
+      // worker. Um parse só, no topo, ANTES de qualquer decisão: é ele que
+      // classifica o payload, alimenta a métrica de versão e é entregue ao
+      // processor. Fazê-lo aqui (e não dentro do consumidor) é o que mantém a
+      // série `maia_turn_job_version_total` honesta mesmo quando o payload é
+      // irreconhecível — nesse caso o consumidor lança, e uma métrica emitida
+      // lá dentro nunca sairia.
+      const parsed = parseAgentTurnJob(job.data);
+      // Pela camada de POLÍTICA (`observability/metrics.ts::counter`), nunca
+      // por `incCounter` cru — foi o que a #601 estabeleceu. A atribuição sai
+      // `system` POR CONSTRUÇÃO: nada resolveu o tenant ainda, exatamente como
+      // em `maia_queue_wait_ms` logo abaixo.
+      counter(METRIC.TURN_JOB_VERSION, {
+        version: closedVocabulary(jobVersionLabel(parsed), TURN_JOB_VERSION_VALUES),
+      });
+      const legacy = legacyFields(parsed, job.data);
+      // Semente do `trace_id`: no V1 continua sendo o `mensagem_id` (byte a
+      // byte o comportamento anterior). No V2 não há mensagem conhecida aqui,
+      // então a janela pré-resolução usa o `turn_id` — e o consumidor
+      // REANCORA a correlação no `mensagem_id` assim que o resolvedor a
+      // devolve (`runtime/turns/job-consumer.ts`), para que o turno inteiro
+      // fique num único trace.
+      const seed =
+        parsed.kind === 'v1'
+          ? parsed.mensagem_id
+          : parsed.kind === 'v2'
+            ? parsed.turn_id
+            : (job.id ?? 'unknown-job');
+      const trace_id = legacy?.trace_id ?? deriveTraceId(seed);
       const attempt = (job.attemptsMade ?? 0) + 1;
+      // Ver `AgentJobFacts`: o consumidor preenche `received_at_ms` no V2, e o
+      // `recordTurnOutcome` abaixo o lê tanto no sucesso quanto no throw.
+      const facts: AgentJobFacts = { received_at_ms: legacy?.received_at_ms ?? null };
       await runWithCorrelation(
         {
           trace_id,
-          turn_id: job.data.mensagem_id,
+          turn_id: parsed.kind === 'v2' ? parsed.turn_id : (legacy?.mensagem_id ?? null),
           attempt,
           origin: 'queue',
-          received_at_ms: job.data.received_at_ms ?? null,
-          enqueued_at_ms: job.data.enqueued_at_ms ?? null,
+          received_at_ms: legacy?.received_at_ms ?? null,
+          enqueued_at_ms: legacy?.enqueued_at_ms ?? null,
         },
         async () => {
           // queue.wait — measured from the persisted arm timestamp, not from a
@@ -126,9 +198,14 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // the turn (it is emitted with no span open, so `parent_span_id`
           // is null either way) because the waiting happened BEFORE the turn
           // started running.
+          //
+          // V2 não carrega `enqueued_at_ms` (o contrato do payload proíbe), e
+          // por isso a amostra da espera é emitida pelo CONSUMIDOR a partir de
+          // `agent_turns.queued_at` — já atribuída ao dono, que o worker aqui
+          // não conhece.
           let queueWaitMs: number | null = null;
-          if (typeof job.data.enqueued_at_ms === 'number') {
-            const waited = Date.now() - job.data.enqueued_at_ms;
+          if (typeof legacy?.enqueued_at_ms === 'number') {
+            const waited = Date.now() - legacy.enqueued_at_ms;
             if (waited >= 0) {
               histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
               queueWaitMs = waited;
@@ -141,7 +218,12 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             phase: attempt === 1 ? 'first' : 'retry',
           });
           logger.debug(
-            { job_id: job.id, mensagem_id: job.data.mensagem_id, ...correlationLogFields() },
+            {
+              job_id: job.id,
+              job_version: jobVersionLabel(parsed),
+              ...(legacy ? { mensagem_id: legacy.mensagem_id } : {}),
+              ...correlationLogFields(),
+            },
             'agent.job.start',
           );
           counter(METRIC.TURN_STARTED, { origin: attempt === 1 ? 'queue' : 'recovery' });
@@ -184,19 +266,19 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             // deeper in the call stack (tool dispatch today, more later) lands
             // under it via ALS without threading a context object through the
             // hot path.
-            await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job)), {
+            await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job, parsed, facts)), {
               attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
               onAttribution: (attribution) => {
                 rootAttribution.value = attribution;
               },
             });
-            recordTurnOutcome(job, 'completed', t0);
+            recordTurnOutcome(job, 'completed', t0, facts);
           } catch (err) {
             // A turn that throws with retries left is RETRYABLE, not failed —
             // conflating the two would make the failure-rate SLI count every
             // transient blip as a lost turn.
             const exhausted = (job.attemptsMade ?? 0) + 1 >= (job.opts.attempts ?? 3);
-            recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0);
+            recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0, facts);
             throw err;
           } finally {
             // The deferred `queue.wait` span (see above). Emitted on the throw
@@ -205,11 +287,18 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             // when the queue is in trouble. `tenant_id`/`agent_id` are passed
             // EXPLICITLY because at this point the tenant scope has unwound —
             // caller-supplied attributes win over the tracer's own read.
-            if (queueWaitMs !== null && typeof job.data.enqueued_at_ms === 'number') {
+            //
+            // #504: `queueWaitMs` só é preenchido no ramo V1 (o payload V2 não
+            // carrega `enqueued_at_ms`), então a guarda de tipo abaixo lê o
+            // payload legado — no V2 o span simplesmente não é emitido, pela
+            // mesma razão pela qual a histograma da espera migra para o
+            // consumidor: aqui não existe instante de armação a reportar.
+            const armedAtMs = legacy?.enqueued_at_ms;
+            if (queueWaitMs !== null && typeof armedAtMs === 'number') {
               recordElapsedSpan(
                 SPAN.QUEUE_WAIT,
-                job.data.enqueued_at_ms,
-                job.data.enqueued_at_ms + queueWaitMs,
+                armedAtMs,
+                armedAtMs + queueWaitMs,
                 { queue: 'agent', ...(rootAttribution.value ?? {}) },
               );
             }
@@ -272,14 +361,22 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
  * and it survives a worker restart, a debounce reset and a recovery re-arm.
  */
 function recordTurnOutcome(
-  job: Job<AgentJob>,
+  job: Job<AgentQueuePayload>,
   outcome: 'completed' | 'retryable' | 'failed',
   startedAtMs: number,
+  facts: AgentJobFacts,
 ): void {
   counter(METRIC.TURN_COMPLETED, { outcome, queue: 'agent' });
   histogram(METRIC.TURN_DURATION_MS, Date.now() - startedAtMs, { outcome });
-  if (typeof job.data.received_at_ms === 'number') {
-    const e2e = Date.now() - job.data.received_at_ms;
+  // #504: no V1 o relógio vem do payload; no V2 o consumidor o recompõe de
+  // `mensagens.created_at` e o deposita em `facts` assim que resolve o escopo.
+  // A caixa vence o payload porque um job V2 simplesmente não tem o campo — e
+  // ler `job.data.received_at_ms` num payload V2 devolveria `undefined`,
+  // apagando em silêncio o SLI ponta-a-ponta do caminho novo.
+  const received_at_ms =
+    facts.received_at_ms ?? ((job.data as AgentJob).received_at_ms ?? null);
+  if (typeof received_at_ms === 'number') {
+    const e2e = Date.now() - received_at_ms;
     if (e2e >= 0) histogram(METRIC.TURN_E2E_LATENCY_MS, e2e, { outcome });
   }
 }
@@ -378,12 +475,29 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
     // réplicas do recovery) colidem no mesmo id e a BullMQ cria UM job.
     const jobId = data.turn_id ? agentTurnJobId(data.turn_id) : undefined;
     if (jobId) await clearRetainedTurnJob(jobId);
+    // Issue #504 §Contrato do job, passo 5 do rollout — o PRODUTOR V2.
+    //
+    // Só quando a flag está ligada E o turno é conhecido. As duas condições são
+    // necessárias: sem `turn_id` não há identidade durável a transportar, e um
+    // V2 armado antes de todas as réplicas de consumo entenderem V2 seria um
+    // job que nenhum worker antigo consegue processar (ele procuraria
+    // `mensagem_id` e falharia). É por isso que a flag existe e nasce OFF — o
+    // consumidor precede o produtor, sempre.
+    //
+    // O payload é EXATAMENTE `{version, turn_id}`. Nada de tenant, nada de
+    // correlação, nada de conteúdo: o worker redescobre tudo no PostgreSQL,
+    // depois de reconciliar o escopo. Carregar tenant aqui seria aceitar um
+    // escopo que ninguém verificou contra a linha persistida.
     // Issue #514 §1 — stamp the correlation fields onto the payload. An
     // explicit `trace_id` from the caller always wins (the recovery sweep and
     // the unrouted replay both re-enqueue an existing turn); otherwise the id
     // is DERIVED from `mensagem_id`, so re-enqueueing the same row always
     // lands on the same root trace.
-    await agentQueue.add('process-message', withCorrelation(data), {
+    const payload: AgentQueuePayload =
+      config.FEATURE_TURN_JOB_V2 && data.turn_id
+        ? { version: 2, turn_id: data.turn_id.toLowerCase() }
+        : withCorrelation(data);
+    await agentQueue.add('process-message', payload, {
       ...(jobId ? { jobId } : {}),
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },

@@ -216,12 +216,21 @@ describe('turn lifecycle — retry e dead letter', () => {
     expect(auditSpy).toHaveBeenCalledWith(expect.objectContaining({ acao: 'turn_dead_lettered' }));
   });
 
-  it('backoff é exponencial e limitado a 15min', () => {
-    expect(retryDelayMs(1)).toBe(30_000);
-    expect(retryDelayMs(2)).toBe(60_000);
-    expect(retryDelayMs(3)).toBe(120_000);
-    expect(retryDelayMs(50)).toBe(15 * 60_000);
-    expect(retryDelayMs(0)).toBe(30_000);
+  // #504 §Retry: o backoff passou a ter JITTER LIMITADO (±20%). Com
+  // `Math.random` fixado no MEIO da distribuição o jitter é exatamente zero, o
+  // que deixa a progressão exponencial e o teto assertáveis pelo valor exato —
+  // a mesma propriedade de antes, agora sem depender da ausência de jitter.
+  it('backoff é exponencial e limitado a 15min (jitter neutro)', () => {
+    const rand = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      expect(retryDelayMs(1)).toBe(30_000);
+      expect(retryDelayMs(2)).toBe(60_000);
+      expect(retryDelayMs(3)).toBe(120_000);
+      expect(retryDelayMs(50)).toBe(15 * 60_000);
+      expect(retryDelayMs(0)).toBe(30_000);
+    } finally {
+      rand.mockRestore();
+    }
   });
 });
 

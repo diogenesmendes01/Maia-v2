@@ -77,6 +77,30 @@ Every request entry-point (`src/gateway/baileys.ts`, every worker in `src/worker
 
 This pattern keeps function signatures clean (no `(tenant_id, agent_id, ...realArgs)` everywhere) while making the context impossible to lose silently — `getCurrentContext()` throws if called outside ALS.
 
+### 4.1.1 Sanctioned cross-tenant readers at entry points (and their price)
+
+An entry point that *discovers* which tenant owns the work cannot already be
+scoped by that tenant. Three readers bypass `applyTenantGuard` for exactly that
+reason, and they are the complete list:
+
+| Reader | Entry point |
+|---|---|
+| `channelsRepo.findByExternalCrossTenant` | Baileys ingress — resolves the channel that owns an inbound JID |
+| `mensagensRepo.findOwnerByIdCrossTenant` / `adoptToResolvedTenantCrossTenant` / `findByWhatsappIdCrossTenant` | `agent/core.ts` adoption + `messages.update` |
+| `agentTurnsRepo.findJobScopeByIdCrossTenant` | #504 — the queue consumer, translating a V2 job's `turn_id` into `(tenant_id, agent_id, representative_message_id)` |
+
+The bypass is not what makes these safe; the predicates around them are. For the
+third one — the newest — the guarantees are enumerated in
+[`src/runtime/turns/scope-resolver.ts`](../../../src/runtime/turns/scope-resolver.ts)
+and summarised in [`modules/runtime.md`](../modules/runtime.md): the payload
+cannot carry scope (the V2 schema is `.strict()`), the projection carries no
+content columns, the turn→message pointer is **reconciled** rather than trusted
+(`agent_turns.representative_message_id` has no foreign key), every non-resolution
+fails closed including the `default`/`system` sentinels, and every refusal is
+audited (`turn_job_scope_rejected`) and metered with a closed-vocabulary reason.
+
+Adding a fourth reader to this table is a reviewed decision with the same bar.
+
 ### 4.2 Synthetic `system` context for legitimately tenant-less paths
 
 Some paths legitimately have no tenant: setup CSRF failures, Baileys pairing, bot-detection, startup/shutdown, worker bootstrap. The audit writer wraps these in `runWithTenantContext({ tenant_id: 'system', agent_id: 'system' }, ...)` so the row is preserved and visible to the audit watcher, distinct from the legacy `'default'` literal. See `src/governance/audit.ts:73-83`.
@@ -117,6 +141,7 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 | `tests/unit/control-plane/knowledge-state-machine/ksm-rules-cross-tenant.spec.ts` | KSM transitions scoped |
 | `tests/property/knowledge-state-machine.spec.ts` | Property-based KSM invariants |
 | `tests/integration/p10a-knowledge-lifecycle.spec.ts` | KSM lifecycle stays scoped |
+| `tests/integration/turn-job-v2-scope-real-db.spec.ts` | #504 — a fronteira do payload V2: um job apontando para um turno cuja mensagem representativa pertence a OUTRO `(tenant_id, agent_id)` é recusado (`scope_mismatch`) antes de qualquer trabalho de domínio, e a mensagem da vítima não é tocada. O caso de CONTROLE prova que o mesmo harness executa com o ponteiro íntegro |
 | `tests/integration/onboarding-leak.spec.ts` | Saga de onboarding (#519): leitura, escrita, retomada, cancelamento e ativação escopadas; CHECK contra `'default'`/`'system'`. **Ainda não está no script `test:leak`** |
 | `tests/unit/onboarding/readiness-facts-scope.spec.ts` | DB-free: o loader de readiness compila `tenant_id + agent_id` em cada `WHERE` |
 | `tests/unit/onboarding/readiness.spec.ts` | Readiness nunca compõe profile de um agente com canal de outro (nem entre tenants) |

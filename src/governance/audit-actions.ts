@@ -190,6 +190,14 @@ export const AUDIT_ACTIONS = [
   // Nenhum dos dois carrega texto, prompt, telefone ou JID.
   'turn_lease_lost',
   'turn_fence_rejected',
+  // Issue #504 §Contrato do job — o RESOLVEDOR de escopo do payload V2 recusou
+  // um job. Vira audit_log (e não só métrica) porque é uma decisão de FRONTEIRA
+  // de confiança: um turno que não rodou porque o par (tenant, agent) não pôde
+  // ser reconciliado com a linha persistida. O caso `scope_mismatch` é a
+  // evidência durável de um ponteiro turno->mensagem cruzando tenants, que é
+  // exatamente o que a invariante nº 1 proíbe. A row carrega só o id do turno e
+  // o motivo de vocabulário fechado — nada vindo do payload.
+  'turn_job_scope_rejected',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

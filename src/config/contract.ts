@@ -1632,6 +1632,31 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_JOB_V2: {
+    name: 'FEATURE_TURN_JOB_V2',
+    description:
+      'PRODUTOR do payload V2 do job de turno (issue #504 §Contrato do job). OFF (default): ' +
+      'enqueueAgent arma o payload V1 legado ({mensagem_id, turn_id?, correlação}) — o consumidor ' +
+      'já lê os DOIS formatos desde esta issue, então ligar aqui é o passo 5 do rollout e nunca o ' +
+      'primeiro. ON: quando o produtor conhece o turno, o payload passa a ser exatamente ' +
+      '{version: 2, turn_id} e mais nada; o worker redescobre tenant, agent e mensagem no ' +
+      'PostgreSQL pelo resolvedor de escopo (src/runtime/turns/scope-resolver.ts). ' +
+      'ORDEM OBRIGATÓRIA: só ligue depois que TODAS as réplicas de consumo estiverem no build que ' +
+      'entende V2 — um worker antigo recebendo V2 não acha mensagem_id e falha o job. ' +
+      'EXIGE FEATURE_TURN_STATE_MACHINE ligada (sem turno durável não há turn_id a transportar). ' +
+      'CUSTO CONHECIDO: o payload V2 não carrega received_at_ms/enqueued_at_ms/trace_id; o ' +
+      'consumidor os recompõe do banco, então maia_queue_wait_ms passa a medir agent_turns.queued_at ' +
+      'em vez do carimbo do produtor. Kill switch: false volta a armar V1 no próximo enqueue. ' +
+      'Ver docs/runbooks/turn-state-machine.md §7.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_TURN_STATE_AUTHORITATIVE: {
     name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
     description:

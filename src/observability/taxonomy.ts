@@ -230,6 +230,42 @@ export const METRIC = {
    */
   TURN_EFFECT_BLOCKED: 'maia_turn_effect_blocked_total',
 
+  /**
+   * Issue #504 §Contrato do job — QUAL versão de payload o consumidor da fila
+   * acabou de ler, no vocabulário FECHADO de `TURN_JOB_VERSION_VALUES`
+   * (`v1` | `v2` | `invalid`).
+   *
+   * Esta série é o critério MENSURÁVEL de remoção do caminho legado que a issue
+   * exige ("zero jobs V1 observados por uma janela definida"). Sem ela, decidir
+   * apagar o V1 seria um palpite: o produtor pode estar migrado e ainda existir
+   * jobs V1 armados antes do deploy, retidos, ou vindos de uma réplica velha
+   * durante um rolling — todos invisíveis a qualquer leitura de código.
+   *
+   * `invalid` NÃO é ruído: é um payload que nenhum dos dois parsers reconheceu.
+   * Um ponto aqui significa que alguém armou um job fora do contrato (ou o
+   * corrompeu), e o turno correspondente não vai rodar — é alerta, não métrica
+   * de fundo.
+   *
+   * ATRIBUIÇÃO: emitida em `src/gateway/queue.ts`, no PARSE, antes de qualquer
+   * resolução — então `tenant_id`/`agent_id` são `system` POR CONSTRUÇÃO, pela
+   * mesma razão (e com o mesmo precedente) de `maia_queue_wait_ms`: nada
+   * resolveu o tenant ainda, e rotular com o que estivesse no ALS seria pior do
+   * que rotular `system`. Ainda assim passa por
+   * `src/observability/metrics.ts::counter` — a camada de política — e não por
+   * `incCounter` cru, que foi o defeito que a #601 fechou.
+   */
+  TURN_JOB_VERSION: 'maia_turn_job_version_total',
+  /**
+   * Issue #504 — o RESOLVEDOR de escopo do job V2 recusou o payload.
+   * `reason` tem cardinalidade FECHADA (`TURN_SCOPE_REJECTION_VALUES`).
+   *
+   * Todo ponto aqui é um turno que NÃO rodou por decisão de fronteira: id
+   * malformado, turno inexistente, escopo inutilizável ou — o caso que importa
+   * — a mensagem representativa pertencendo a um par (tenant, agent) diferente
+   * do turno. Nunca é normal.
+   */
+  TURN_SCOPE_REJECTED: 'maia_turn_scope_rejected_total',
+
   // --- queue ---------------------------------------------------------------
   QUEUE_DEPTH: 'maia_queue_depth',
   QUEUE_OLDEST_JOB_AGE_MS: 'maia_queue_oldest_job_age_ms',
@@ -656,6 +692,10 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   // o emissor colapsa qualquer valor fora do vocabulário.
   'step',
   'check_code',
+  // versão do payload do job de turno (issue #504) — conjunto FECHADO de três
+  // valores, declarado abaixo em `TURN_JOB_VERSION_VALUES`. O emissor colapsa
+  // qualquer valor fora do vocabulário antes do sanitizador.
+  'version',
 ]);
 
 /**
@@ -1016,6 +1056,46 @@ export const EFFECT_BOUNDARY_METRIC_VALUES: readonly EffectBoundary[] = Object.f
 );
 
 /**
+ * Issue #504 §Contrato do job — os três valores que o label `version` de
+ * `METRIC.TURN_JOB_VERSION` pode carregar.
+ *
+ * Espelho EXATO do retorno de `jobVersionLabel` (`src/runtime/turns/job.ts`), e
+ * a igualdade é pinada por `tests/unit/observability/turn-job-version-taxonomy.spec.ts`
+ * — uma quarta forma de payload não pode virar série sem passar por aqui.
+ */
+export const TURN_JOB_VERSION_VALUES: readonly string[] = Object.freeze([
+  'v1',
+  'v2',
+  'invalid',
+]);
+
+/**
+ * Issue #504 — motivos pelos quais o resolvedor de escopo do job V2 RECUSA um
+ * payload. Vocabulário FECHADO: é rótulo de fronteira de confiança, e um
+ * `reason` livre aqui viraria texto controlado por quem forjou o payload.
+ *
+ * `malformed_turn_id` — não é UUID. Recusado ANTES de qualquer ida ao banco.
+ * `turn_not_found`    — nenhum turno com esse id. Payload forjado, turno
+ *                       apagado por retenção, ou banco errado.
+ * `scope_unusable`    — o par (tenant, agent) da linha é vazio/branco ou é o
+ *                       literal `'default'`, que a invariante nº 8 recusa.
+ * `representative_missing` — o turno aponta para uma mensagem que não existe.
+ * `scope_mismatch`    — O CASO CENTRAL: a mensagem representativa pertence a um
+ *                       par (tenant, agent) DIFERENTE do turno. Nenhuma FK
+ *                       impede essa combinação (a coluna
+ *                       `representative_message_id` não tem FK — ver
+ *                       `migrations/097_agent_turns.sql`), então é ela que o
+ *                       resolvedor tem de recusar em vez de atravessar.
+ */
+export const TURN_SCOPE_REJECTION_VALUES: readonly string[] = Object.freeze([
+  'malformed_turn_id',
+  'turn_not_found',
+  'scope_unusable',
+  'representative_missing',
+  'scope_mismatch',
+]);
+
+/**
  * Colapsa um valor num vocabulário fechado. É a defesa que roda ANTES do
  * sanitizador de labels: o allowlist de CHAVES não diz nada sobre o VALOR, e
  * `reason` tem budget 60 — sem isto, 60 `reason_code` livres viravam 60 séries
@@ -1056,6 +1136,10 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   // budget é o teto do contrato com folga para novos limites de efeito, não uma
   // estimativa — e o vocabulário fechado já impede que texto livre chegue aqui.
   boundary: 20,
+  // Issue #504: `v1` | `v2` | `invalid` + o `other` do colapso. O budget é o
+  // teto do contrato, não uma estimativa — e o vocabulário fechado já impede
+  // que uma versão inventada chegue aqui.
+  version: 8,
 });
 
 /** Budget applied to any allowed key without an explicit entry above. */

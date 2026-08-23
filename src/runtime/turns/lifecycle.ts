@@ -636,10 +636,54 @@ const IGNORED_OUTCOMES: ReadonlySet<TurnOutcome> = new Set<TurnOutcome>([
   'pending_race_lost',
 ]);
 
-/** Backoff exponencial com teto, em ms — 30s, 60s, 120s, … até 15min. */
+/** Teto do backoff, em ms. O crescimento exponencial para aqui. */
+export const RETRY_BACKOFF_CEILING_MS = 15 * 60_000;
+
+/**
+ * Amplitude do jitter, como fração do atraso base. ±20%.
+ *
+ * "Jitter LIMITADO" (issue #504 §Retry, recovery e DLQ) e não jitter total: o
+ * atraso continua previsível dentro de uma janela que o operador consegue
+ * declarar num runbook, o que um `random(0, base)` destrói. 20% é largo o
+ * bastante para desmanchar a sincronização e estreito o bastante para que a
+ * tentativa 3 continue sendo reconhecivelmente "dois minutos".
+ */
+export const RETRY_JITTER_RATIO = 0.2;
+
+/**
+ * Backoff exponencial com teto E JITTER, em ms — ~30s, ~60s, ~120s, … até 15min.
+ *
+ * ─── Por que o jitter não é cosmético aqui ──────────────────────────────────
+ *
+ * `next_attempt_at` é PERSISTIDO, e o recovery varre por `next_attempt_at <=
+ * now()`. Sem jitter, N turnos que falharam pelo mesmo motivo no mesmo instante
+ * — que é o caso NORMAL, porque a causa costuma ser compartilhada (LLM fora do
+ * ar, banco lento, deploy) — recebem o MESMO `next_attempt_at` ao milissegundo
+ * e voltam todos juntos, contra a mesma dependência que acabou de cair. O
+ * backoff exponencial sozinho não resolve isso: ele afasta as tentativas do
+ * MESMO turno, e mantém alinhadas as de turnos DIFERENTES.
+ *
+ * ─── Onde o teto é aplicado, e por quê ──────────────────────────────────────
+ *
+ * O teto limita a BASE, e o resultado final é reclampado em `[0, teto]`. Duas
+ * consequências deliberadas:
+ *   - o teto continua sendo um teto de verdade: nenhum atraso passa de 15min,
+ *     que é o número que o runbook promete;
+ *   - no teto a janela vira `[12min, 15min]` em vez de `[12min, 18min]`. Ainda
+ *     é espalhamento — que é a única coisa que importa ali — e é o lado do
+ *     trade-off que não quebra a promessa documentada.
+ *
+ * `Math.random` é lido diretamente, sem injeção de dependência: um parâmetro
+ * `rand` faria todo teste de jitter medir a função que o próprio teste passou.
+ * A suíte espia `Math.random` no ponto de produção.
+ */
 export function retryDelayMs(attempt: number): number {
-  const base = 30_000 * Math.pow(2, Math.max(0, attempt - 1));
-  return Math.min(base, 15 * 60_000);
+  const base = Math.min(
+    30_000 * Math.pow(2, Math.max(0, attempt - 1)),
+    RETRY_BACKOFF_CEILING_MS,
+  );
+  const jitter = base * RETRY_JITTER_RATIO * (Math.random() * 2 - 1);
+  return Math.min(RETRY_BACKOFF_CEILING_MS, Math.max(0, Math.round(base + jitter)));
 }
 
 /** Tentativas antes do dead letter (espelha `attempts: 3` do BullMQ). */

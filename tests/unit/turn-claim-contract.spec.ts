@@ -101,6 +101,32 @@ describe('#504 — contrato do payload (janela de compatibilidade V1/V2)', () =>
     });
   });
 
+  it('#504 — um payload V2 que tenta CARREGAR escopo não parseia como nada', () => {
+    // É a primeira das cinco defesas do resolvedor (`scope-resolver.ts`): o
+    // tenant NUNCA pode vir do payload. `AgentTurnJobV2Schema` é `.strict()`,
+    // então uma chave extra reprova o V2; e como não há `mensagem_id`, o
+    // fallback V1 também reprova. O job forjado vira `invalid`, vira métrica e
+    // é recusado antes de qualquer ida ao banco.
+    for (const forjado of [
+      { version: 2, turn_id: TURN_A, tenant_id: 'vitima' },
+      { version: 2, turn_id: TURN_A, agent_id: 'vitima' },
+      { version: 2, turn_id: TURN_A, scope: { tenant_id: 'vitima' } },
+    ]) {
+      const parsed = parseAgentTurnJob(forjado);
+      expect(parsed.kind, JSON.stringify(forjado)).toBe('invalid');
+    }
+    // Contraste deliberado: um payload que carrega `mensagem_id` É um V1
+    // legítimo (o schema V1 é `passthrough`), e o `version: 2` ali é ruído.
+    // Ele NÃO alcança o resolvedor de escopo — segue o caminho legado, onde
+    // quem resolve o tenant é o resolver de canal, exatamente como antes desta
+    // issue. Nenhum dos dois ramos aceita tenant vindo do payload.
+    expect(parseAgentTurnJob({ version: 2, turn_id: TURN_A, mensagem_id: TURN_B })).toEqual({
+      kind: 'v1',
+      mensagem_id: TURN_B,
+      turn_id: TURN_A,
+    });
+  });
+
   it('payload irreconhecível vira resultado TIPADO, nunca throw', () => {
     const parsed = parseAgentTurnJob({ lixo: true });
     expect(parsed.kind).toBe('invalid');
