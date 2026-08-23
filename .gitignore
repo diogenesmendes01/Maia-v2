@@ -31,6 +31,10 @@ uploads/
 # Testes
 coverage/
 .nyc_output/
+# Saída do Playwright (relatório JSON lido por scripts/check-playwright-run.ts,
+# traces/screenshots das falhas). O CI publica como artefato quando reprova.
+.playwright-report/
+test-results/
 
 # OS
 .DS_Store

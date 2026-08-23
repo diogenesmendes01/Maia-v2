@@ -8,7 +8,12 @@
  */
 import { test, expect } from '@playwright/test';
 
-test.describe('Inbox — Tela 1', () => {
+// `@pendente-472`: fora do gate de CI (projeto `jornadas-pendentes` do
+// playwright.config.ts). Esta spec exige sessão autenticada e fixtures que
+// `scripts/seed-proposals-fixtures.ts` ainda não cria — ligá-la é a #472. A
+// lista de arquivos em quarentena é fixada em
+// `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair dela é um diff visível.
+test.describe('Inbox — Tela 1 @pendente-472', () => {
   test('loads page and shows header', async ({ page }) => {
     await page.goto('http://localhost:4000/inbox');
     await expect(page.locator('h1')).toContainText('Aprovações');

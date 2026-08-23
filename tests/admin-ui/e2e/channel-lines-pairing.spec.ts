@@ -17,7 +17,12 @@ import { test, expect } from '@playwright/test';
 const CONSOLE = 'http://localhost:4000';
 const CHANNELS = `${CONSOLE}/setup/channels`;
 
-test.describe('Setup → Canais: linhas WhatsApp', () => {
+// `@pendente-472`: fora do gate de CI (projeto `jornadas-pendentes` do
+// playwright.config.ts). Esta spec exige sessão autenticada e fixtures que
+// `scripts/seed-proposals-fixtures.ts` ainda não cria — ligá-la é a #472. A
+// lista de arquivos em quarentena é fixada em
+// `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair dela é um diff visível.
+test.describe('Setup → Canais: linhas WhatsApp @pendente-472', () => {
   test('canal WhatsApp recém-criado (inativo) PERMANECE visível com estado "declarada"', async ({
     page,
   }) => {
