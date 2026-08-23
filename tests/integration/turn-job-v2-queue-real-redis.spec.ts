@@ -103,7 +103,19 @@ d('#504 — o produtor emite o payload V2 (Redis real)', () => {
     // identidade durável a transportar.
     const mensagem_id = randomUUID();
     await enqueueAgent({ mensagem_id, received_at_ms: Date.now() });
-    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+    // Estados TERMINAIS entram na busca de propósito. Sem `turn_id` não há
+    // `jobId` determinístico, então o job só pode ser reencontrado varrendo a
+    // fila — e a fila é COMPARTILHADA: o worker de outra suíte pode ter
+    // consumido este job antes desta linha, movendo-o para `completed`. A
+    // propriedade sob teste é a FORMA do payload, não em que estado ele está.
+    const jobs = await agentQueue.getJobs([
+      'waiting',
+      'delayed',
+      'paused',
+      'active',
+      'completed',
+      'failed',
+    ]);
     const mine = jobs.filter(
       (j) => (j.data as { mensagem_id?: string }).mensagem_id === mensagem_id,
     );
@@ -111,5 +123,7 @@ d('#504 — o produtor emite o payload V2 (Redis real)', () => {
     expect(mine[0]!.data).toMatchObject({ mensagem_id });
     expect((mine[0]!.data as { version?: number }).version).toBeUndefined();
     await mine[0]!.remove().catch(() => undefined);
+    // Idem para o caso V2 do teste anterior: ele é reencontrado pelo `jobId`
+    // determinístico, então não depende de estado nenhum.
   }, 30_000);
 });
