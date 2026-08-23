@@ -1,0 +1,343 @@
+# `promtool test rules` — a PROVA TEMPORAL das regras de
+# ../onboarding.rules.yml (issue #519, decisão 14).
+#
+# ## Por que este arquivo existe separado da suíte Vitest
+#
+# `tests/unit/observability/onboarding-expiry-alert-rules.spec.ts` executa as
+# `expr` reais e cobre limiar, operador e escopo. O que ele NÃO cobre é `for:`,
+# que é temporal: um avaliador instantâneo não tem linha do tempo, e um teste
+# que afirmasse "sustentado por 5 minutos" sem ela estaria mentindo. Aqui há
+# linha do tempo de verdade — `pending` em t=4m30s, `firing` em t=5m.
+#
+# ## Como rodar
+#
+# Este arquivo RODA NO CI, no job `alert-rules` (`.github/workflows/ci.yml`),
+# que usa o `/bin/promtool` da imagem oficial do Prometheus. Sem isso ele seria
+# um teste que ninguém executa — e um teste que ninguém executa apodrece.
+#
+# Reproduzível localmente, com a MESMA versão que o CI usa:
+#
+#   docker run --rm -v "$PWD/monitoring/alerts:/rules" -w /rules \
+#     --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+#     test rules tests/onboarding.rules.test.yml
+#
+# `rule_files` é relativo a ESTE arquivo.
+rule_files:
+  - ../onboarding.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # -------------------------------------------------------------------------
+  # Caso decisivo 1 — backlog GRANDE e FRESCO não alerta.
+  # Uma regra `backlog > 100` estaria disparando desde o primeiro scrape.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: backlog grande e fresco nunca alerta
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '5000+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: '30+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # Caso decisivo 2 — UM único item parado alerta, e só depois de sustentado.
+  # Backlog de UMA run: qualquer regra por contagem fica calada para sempre.
+  # A idade entra em 300s e sobe 30s por scrape, cruzando 600s em t=5m30s
+  # (300 + 30*11 = 630). Com `for: 5m`, o `firing` só pode acontecer em
+  # t=10m30s — e é o par de asserções 10m/10m30s abaixo que prova a janela.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: um unico item parado alerta apos 5m sustentados
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '1+0x80'
+      # 300s no primeiro scrape, +30s a cada scrape: cruza 600s em t=5m30s.
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: '300+30x80'
+    alert_rule_test:
+      # Antes de cruzar o limiar: nada.
+      - eval_time: 4m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      # Limiar cruzado em t=5m30s (300 + 30*11 = 630 > 600), sustentação ainda
+      # não cumprida: o alerta está `pending`, e `pending` não é `firing`.
+      - eval_time: 10m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      # 5m30s + 5m de `for`: dispara. É ESTE par de asserções que prova o
+      # `for: 5m` — mova o `for` para `1m` e o de cima passa a falhar.
+      - eval_time: 10m30s
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts:
+          - &warn_alert
+            exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Onboarding: run vencida há mais de 10min sem ser expirada"
+              description: |
+                A run vencida mais ANTIGA não sai da fila há mais de 10 minutos, e a
+                varredura pega as vencidas por `expires_at ASC` — ela deveria ter
+                saído primeiro. Duas causas, e a série do worker separa as duas:
+                `maia_worker_last_success_timestamp{worker="onboarding_expirer"}`
+                parado é worker morto/desagendado; carimbando sucesso é teto pequeno
+                (ONBOARDING_EXPIRER_BATCH_LIMIT) ou uma run presa.
+                O TAMANHO do backlog não é o sinal — leia a idade.
+                Runbook: docs/runbooks/onboarding-saga.md §5.1
+      # ...e o critical continua calado: a idade ainda não chegou a 1800s.
+      - eval_time: 10m30s
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # Critical acima de 30 minutos, com o warning junto (escalada sem buraco).
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: critical acima de 1800s
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '3+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: '1801+0x80'
+    alert_rule_test:
+      # O critical NAO tem `for` (decisao do dono): 1800s ja E a sustentacao.
+      # Entao ele dispara na PRIMEIRA avaliacao acima do limiar, t=30s, e nao
+      # 5 minutos depois. Este par de assercoes e o que separa as duas leituras
+      # — com `for: 5m` de volta, a de 30s falha.
+      - eval_time: 30s
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts:
+          - &crit_alert
+            exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Onboarding: run vencida há mais de 30min sem ser expirada"
+              description: |
+                A varredura não está drenando. Uma run vencida que sobrevive 30
+                minutos ao worker está presa (transação segurando a linha) ou o
+                worker não está rodando. Vá direto ao §5.1 do runbook: identifique a
+                run mais antiga e o que a está segurando ANTES de subir
+                ONBOARDING_EXPIRER_BATCH_LIMIT — subir o teto não solta uma linha
+                travada.
+                Runbook: docs/runbooks/onboarding-saga.md §5.1
+      # ...e o warning, esse sim sustentado, so aparece 5 minutos depois. A
+      # escalada nao tem buraco, mas as duas cadencias sao diferentes de
+      # proposito.
+      - eval_time: 30s
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts:
+          - *warn_alert
+
+  # -------------------------------------------------------------------------
+  # Fila vazia: silêncio, inclusive no guarda de ausência.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: fila vazia e silencio
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '0+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: '0+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # `NaN` sustentado: os alertas de atraso ficam calados (não se sabe se há
+  # fila) e o guarda de ausência fala, com o `instance` preservado.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: NaN sustentado acorda o guarda de ausencia
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts:
+          - &absent_alert
+            exp_labels:
+              severity: warning
+              instance: "maia-0:3000"
+              job: "maia"
+            exp_annotations:
+              summary: Backlog do onboarding ilegível — cegueira, não fila vazia
+              description: |
+                As gauges de backlog do onboarding estão ausentes ou em `NaN` há mais
+                de 10 minutos. Enquanto isso durar, os dois alertas de atraso acima
+                NÃO podem disparar: não se sabe se há fila. `NaN` sustentado é
+                indisponibilidade da LEITURA (Postgres, pool), não do worker.
+                Runbook: docs/runbooks/onboarding-saga.md §5.1
+
+  # -------------------------------------------------------------------------
+  # SÓ a idade ilegível, backlog são. É a metade que o primeiro corte deixou
+  # de fora: os dois alertas de atraso são conjunções, então `max(NaN) > 600`
+  # os cala exatamente igual — e um guarda que olhasse só o backlog ficaria
+  # calado junto. Este bloco prova a expressão AMPLIADA e o `for: 10m` dela.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: so a idade ilegivel tambem e cegueira
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '7+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+    alert_rule_test:
+      # Backlog finito e idade ilegível: nenhum alerta de atraso pode falar.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+      # O guarda respeita o próprio `for: 10m` — calado antes...
+      - eval_time: 9m30s
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts: []
+      # ...e falando depois. Com a expressão estreita (só backlog), este caso
+      # devolve [] e a asserção cai.
+      - eval_time: 10m30s
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts:
+          - *absent_alert
+
+  # -------------------------------------------------------------------------
+  # Uma réplica cega não silencia a que enxerga — é o que `max()` garante.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: replica cega nao silencia a saudavel
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '900+0x80'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts:
+          - *warn_alert
+
+  # -------------------------------------------------------------------------
+  # Duas réplicas concordantes rendem UM alerta, não um por réplica — e o
+  # backlog não é multiplicado (o que `sum` faria).
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: duas replicas concordantes rendem um alerta
+    input_series:
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: '7+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: '900+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '7+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '900+0x80'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts:
+          - *warn_alert
+
+  # -------------------------------------------------------------------------
+  # LIMITAÇÃO FIXADA — gauge ausente em UMA réplica NÃO dispara o guarda de
+  # cegueira. Este bloco prova o comportamento DOCUMENTADO, não o desejado.
+  #
+  # Duas réplicas conhecidas e scrapeadas (`up` = 1 nas duas). `maia-1` publica
+  # as duas gauges, saudáveis. `maia-0` está de pé e é scrapeada, mas NÃO
+  # publica nenhuma das duas — nem `NaN`, nada.
+  #
+  # Nenhum ramo do `MetricsAbsent` alcança isso, e é aritmética de conjunto,
+  # não bug:
+  #   - `absent(...)` é FROTA INTEIRA: o seletor casa a série de `maia-1`, logo
+  #     devolve vetor vazio;
+  #   - `x != x` é por réplica, mas só vê quem PUBLICA — uma série ausente não
+  #     é `NaN`, então não há amostra de `maia-0` para comparar.
+  # Resultado: a frota inteira parece saudável enquanto metade dela não está
+  # sendo lida. Quem cobre esse estado é o `up`/target health do Prometheus,
+  # não esta regra (ver o comentário de ALCANCE DOS RAMOS em
+  # ../onboarding.rules.yml e docs/runbooks/onboarding-saga.md §5.1).
+  #
+  # Este caso existe para QUEBRAR se alguém mudar a semântica sem atualizar a
+  # documentação junto — e para impedir o conserto barato de reescrever o
+  # comentário em vez do alerta.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: gauge ausente em UMA replica nao dispara
+    input_series:
+      # As duas réplicas existem e estão sendo scrapeadas.
+      - series: 'up{instance="maia-0:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'up{instance="maia-1:3000",job="maia"}'
+        values: '1+0x80'
+      # ...mas só `maia-1` publica as gauges de backlog. `maia-0` não aparece
+      # aqui de propósito: é ESSA a ausência que o alerta não vê.
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+    alert_rule_test:
+      # Muito além do `for: 10m`, e ainda assim silêncio.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts: []
+      # E os de atraso também calados — eles leem `max()` sobre a ÚNICA
+      # réplica que publica, e ela está saudável.
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleWarning
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryBacklogStaleCritical
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # O CONTRASTE que dá sentido ao bloco acima: a MESMA topologia, mas com
+  # `maia-0` publicando `NaN` em vez de nada. Agora o ramo `x != x` alcança, e
+  # o alerta fala com o `instance` da réplica cega — só dela.
+  #
+  # A diferença entre os dois blocos é exatamente a diferença entre "a leitura
+  # falhou" (o collector publica `NaN`, e isso é detectável) e "a réplica
+  # sumiu do /metrics" (não é, por esta regra).
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: a mesma replica publicando NaN JA dispara
+    input_series:
+      - series: 'up{instance="maia-0:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'up{instance="maia-1:3000",job="maia"}'
+        values: '1+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-0:3000",job="maia"}'
+        values: 'NaN+0x80'
+      - series: 'maia_onboarding_expiry_backlog{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+      - series: 'maia_onboarding_expiry_oldest_age_seconds{instance="maia-1:3000",job="maia"}'
+        values: '0+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: MaiaOnboardingExpiryMetricsAbsent
+        exp_alerts:
+          - *absent_alert

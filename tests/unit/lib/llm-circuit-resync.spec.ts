@@ -28,6 +28,8 @@
  * a queda real produz o `ready` que dispara tudo isto.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { logger } from '@/lib/logger.js';
 
 type Handler = (...args: unknown[]) => void;
@@ -945,7 +947,7 @@ describe('kill switch — releitura na reconexão', () => {
    * drain deliberado passava a produzir warning — ou PÁGINA, em
    * `state="enforce"` — para uma réplica que estava simplesmente saindo.
    *
-   * O desfecho de shutdown é `aborted` (`reason="resync_aborted"`): fora de
+   * O desfecho de shutdown é `cancelled` (`reason="resync_cancelled"`): fora de
    * `DIVERGENT_OUTCOMES` e fora dos dois alertas. Ele NÃO é `resynced`: a
    * releitura foi interrompida, não concluída, e afirmar convergência aqui
    * seria evidência verde falsa no gate que libera o `enforce`.
@@ -988,7 +990,7 @@ describe('kill switch — releitura na reconexão', () => {
       expect(
         resyncReasons(),
         'o drain acordou o plantão: uma releitura cancelada pelo shutdown saiu como divergência',
-      ).toEqual(['resync_aborted']);
+      ).toEqual(['resync_cancelled']);
       expect(
         redisMock.get.mock.calls.length,
         'a releitura acordou do backoff e gastou tentativas contra um cliente já encerrado',
@@ -1031,7 +1033,7 @@ describe('kill switch — releitura na reconexão', () => {
       expect(
         resyncReasons(),
         'o drain com `GET` pendurado saiu como divergência — página em `enforce` para uma réplica que está saindo',
-      ).toEqual(['resync_aborted']);
+      ).toEqual(['resync_cancelled']);
       expect(redisMock.get.mock.calls.length, 'gastou tentativa depois do `quit()`').toBe(1);
       expect(effectiveMode()).toBe('enforce');
     });
@@ -1064,9 +1066,96 @@ describe('kill switch — releitura na reconexão', () => {
     });
 
     /**
-     * O desenho do achado 2 dizia que `aborted` fica FORA de
+     * DECISÃO 16 DO DONO — "emitir evento, não silêncio. (…) Um log INFO."
+     *
+     * Presença de log não basta: uma linha que só diz `outcome="cancelled"`
+     * não é acionável às 3h. O plantão que vê o balde subir FORA de janela de
+     * deploy precisa de duas coisas na mesma linha — POR QUE foi cancelado (o
+     * subscriber parou; não foi deadline, não foi divergência) e QUAL
+     * subscriber, no vocabulário que o resto do arquivo já usa para
+     * identificá-lo (`channels`, os dois canais deste subscriber). O `pid` e o
+     * `hostname` da réplica o pino já carimba em toda linha (`base` em
+     * `src/lib/logger.ts:82`).
+     *
+     * E a linha não pode carregar segredo. A mensagem que chega ao desfecho de
+     * cancelamento vem do driver, e a falha de conexão é justamente a que traz
+     * a DSN inteira — o par da #533 ("a mensagem mais perigosa é a mais
+     * consultada"). O contrato aqui é `safeFailure()`
+     * (`src/lib/safe-failure.ts`), que já censura URI: nada de redação nova. O
+     * caso abaixo prova as três coisas de uma vez, e prova a redação pelo
+     * MARCADOR do helper — um implementador que simplesmente jogasse a
+     * mensagem fora passaria no "não vaza" e reprovaria aqui, que é o ponto:
+     * o motivo do driver é diagnóstico, ele deve chegar, censurado.
+     */
+    it('o cancelamento diz POR QUE e QUAL subscriber, e sem segredo na linha', async () => {
+      const info = vi.spyOn(logger, 'info');
+      try {
+        const sub = await bootSubscriber();
+        const before = llmSettingsSubscriberResyncCount();
+
+        // A DSN com credencial, exatamente como o ioredis a devolve.
+        const SEGREDO = 'redis://maia:s3nh4-sup3r@redis.interno:6379/0';
+        let rejectGet: ((e: Error) => void) | undefined;
+        redisMock.get.mockImplementation(
+          () =>
+            new Promise<string | null>((_resolve, reject) => {
+              rejectGet = reject;
+            }),
+        );
+        redisMock.get.mockClear();
+        info.mockClear();
+
+        sub.emit('close');
+        sub.emit('reconnecting');
+        sub.emit('ready');
+        await waitUntil(() => redisMock.get.mock.calls.length >= 1);
+        expect(redisMock.get.mock.calls.length, 'nenhum `GET` em voo para falhar').toBe(1);
+
+        // O `GET` falha e o drain acontece na MESMA volta do event loop: é o
+        // caminho em que a mensagem do driver alcança o desfecho de
+        // cancelamento em vez de virar retry.
+        rejectGet!(new Error(`connect ECONNREFUSED ${SEGREDO}`));
+        await stopLLMSettingsInvalidationSubscriber();
+        await waitUntil(() => llmSettingsSubscriberResyncCount() > before, 500);
+        expect(
+          llmSettingsSubscriberResyncCount(),
+          'a releitura não terminou: o teste não chegou ao desfecho de cancelamento',
+        ).toBe(before + 1);
+
+        const linha = info.mock.calls.find(
+          (c) => c[1] === 'llm_gateway.circuit_override_resync_cancelled',
+        );
+        expect(linha, 'o cancelamento não emitiu evento nenhum em INFO — voltou o silêncio').toBeDefined();
+
+        const record = linha![0] as Record<string, unknown>;
+        expect(
+          record.cancel_reason,
+          'a linha não diz POR QUE foi cancelado: `outcome` sozinho não distingue drain de deadline',
+        ).toBe('subscriber_stopped');
+        expect(
+          record.channels,
+          'a linha não identifica o subscriber que foi fechado',
+        ).toEqual([LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL]);
+        expect(record.outcome).toBe('cancelled');
+
+        const serializada = JSON.stringify(record);
+        expect(serializada, 'a credencial do Redis vazou na linha de log').not.toContain(
+          's3nh4-sup3r',
+        );
+        expect(serializada, 'a URI de conexão vazou na linha de log').not.toContain('redis://');
+        expect(
+          serializada,
+          'o motivo do driver não chegou censurado — ou sumiu, ou passou por redação caseira em vez de `safeFailure()`',
+        ).toContain('[REDACTED_URL]');
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    /**
+     * O desenho do achado 2 dizia que `cancelled` fica FORA de
      * `DIVERGENT_OUTCOMES` — mas nada pinava isso. Verifiquei acrescentando
-     * `'aborted'` ao conjunto: os 26 casos continuavam VERDES.
+     * `'cancelled'` ao conjunto: os 26 casos continuavam VERDES.
      *
      * A consequência de deixar solto não é abstrata. `DIVERGENT_OUTCOMES`
      * decide duas coisas em `finishResync`: o NÍVEL do log (ERROR, não WARN) e
@@ -1077,17 +1166,19 @@ describe('kill switch — releitura na reconexão', () => {
      * novo existe para evitar.
      *
      * Este caso fixa a decisão pelo efeito observável, não pela pertinência ao
-     * `Set`: um teste que afirmasse `DIVERGENT_OUTCOMES.has('aborted') ===
+     * `Set`: um teste que afirmasse `DIVERGENT_OUTCOMES.has('cancelled') ===
      * false` estaria olhando para a implementação, e sobreviveria a alguém
      * mudar o `if` do log.
      */
-    it('o drain loga em WARN com nome próprio — nunca ERROR de divergência', async () => {
+    it('o drain loga em INFO com nome próprio — nunca ERROR de divergência', async () => {
+      const info = vi.spyOn(logger, 'info');
       const warn = vi.spyOn(logger, 'warn');
       const error = vi.spyOn(logger, 'error');
       try {
         const sub = await bootSubscriber();
         redisMock.get.mockRejectedValue(new Error('ECONNRESET'));
         redisMock.get.mockClear();
+        info.mockClear();
         warn.mockClear();
         error.mockClear();
 
@@ -1107,19 +1198,78 @@ describe('kill switch — releitura na reconexão', () => {
           'o drain escreveu linha de ERRO: um deploy deliberado vira incidente no pós-mortem',
         ).not.toContain('llm_gateway.circuit_override_resync_failed');
 
+        const infoMsgs = info.mock.calls.map((c) => c[1]);
+        expect(
+          infoMsgs,
+          'o drain não deixou rastro com nome próprio',
+        ).toContain('llm_gateway.circuit_override_resync_cancelled');
+
+        // NÍVEL, e não só presença (decisão 16): o cancelamento é operação
+        // NORMAL — o subscriber parou. WARN aqui devolve o ruído de deploy que
+        // a #561 tirou do ERROR, só um degrau abaixo.
         const warnMsgs = warn.mock.calls.map((c) => c[1]);
         expect(
           warnMsgs,
-          'o drain não deixou rastro com nome próprio',
-        ).toContain('llm_gateway.circuit_override_resync_aborted');
+          'o cancelamento saiu em WARN: um drain deliberado continua pintado como anomalia',
+        ).not.toContain('llm_gateway.circuit_override_resync_cancelled');
         expect(
           warnMsgs,
           'o cancelamento foi contado como convergência — evidência verde falsa no gate que libera `enforce`',
         ).not.toContain('llm_gateway.circuit_override_resynced');
       } finally {
+        info.mockRestore();
         warn.mockRestore();
         error.mockRestore();
       }
     });
+  });
+});
+
+/**
+ * DECISÃO 15 DO DONO — o nome do desfecho de cancelamento é `resync_cancelled`.
+ *
+ * Este caso não olha comportamento: olha COBERTURA do rename. Os casos acima
+ * pinam o rótulo da série e o nome do log, que são dois pontos; o nome antigo
+ * também vivia no tipo `ResyncOutcome`, na taxonomia de métricas
+ * (`src/observability/taxonomy.ts`) e nos comentários que o plantão lê quando
+ * está triando. Um rename pela metade é PIOR que nenhum: o dashboard passa a
+ * somar duas séries com nomes diferentes e o `grep` do pós-mortem devolve
+ * metade das linhas.
+ *
+ * O escopo é `src/` — código de produção e taxonomia — de propósito. Docs e
+ * runbooks PODEM citar o nome antigo, e devem: um operador olhando série
+ * histórica precisa saber como ela se chamava. O que não pode é `src/` ainda
+ * EMITIR o nome velho.
+ */
+describe('rename de `resync_aborted` para `resync_cancelled` (decisão 15)', () => {
+  const SRC = resolve(__dirname, '../../../src');
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === '.next') continue;
+        out.push(...walk(full));
+      } else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  it('nenhum ponto de `src/` sobreviveu com o nome antigo', () => {
+    const offenders: string[] = [];
+    for (const file of walk(SRC)) {
+      for (const [n, line] of readFileSync(file, 'utf8').split('\n').entries()) {
+        if (line.includes('resync_aborted')) {
+          offenders.push(`${file.slice(SRC.length + 1)}:${n + 1}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      'o rename ficou pela metade — o dashboard passa a somar duas séries: ' + offenders.join(' | '),
+    ).toEqual([]);
   });
 });

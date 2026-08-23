@@ -2,7 +2,7 @@
 
 **Path:** `src/ops/`
 
-**Purpose** — Verifiable business continuity and data lifecycle (issue #520). Two concerns live here: `backup/` turns "a backup ran" into evidence that an artifact is intact, encrypted, off-site and restorable; `retention/` turns "we delete old data" into a policy-driven, tenant-scoped, hold-aware, resurrection-proof mechanism.
+**Purpose** — Verifiable business continuity, data lifecycle and environment diagnosis. Three concerns live here: `backup/` turns "a backup ran" into evidence that an artifact is intact, encrypted, off-site and restorable (issue #520); `retention/` turns "we delete old data" into a policy-driven, tenant-scoped, hold-aware, resurrection-proof mechanism (#520); `doctor/` turns "it did not boot" into a read-only, deadline-bounded, redacted diagnosis with a stable exit code (#517).
 
 Everything in this module is written so the DECISION is pure and the SIDE EFFECT is injected. That is what lets the whole backup lifecycle — including the failure branches that only occur at 03:00 on a bad night — be exercised in unit tests with no Postgres, no S3 and no `pg_dump` binary.
 
@@ -30,6 +30,14 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | `src/ops/retention/data-classes.ts` | The machine-readable data inventory and retention matrix |
 | `src/ops/retention/legal-hold.ts` | Deterministic hold evaluator (backend decides) |
 | `src/ops/retention/tombstones.ts` | Pseudonymised, signed ledger + post-restore reconciliation gate |
+| `src/ops/doctor/types.ts` | The check contract: status, criticality, deadline, the narrow read-only handles a check may touch (issue #517) |
+| `src/ops/doctor/runner.ts` | Deadlines (per-check + total), dependency skipping, bounded concurrency, deterministic ordering, and `verdictFor()` — the SINGLE predicate behind both the exit code and the report's last line |
+| `src/ops/doctor/report.ts` | Human + versioned JSON render, and the LAST redaction gate — every operator-visible string passes `scrubSecrets()` here |
+| `src/ops/doctor/postgres.ts` | `doctorPostgresPool` + `readOnlyPostgres`: the two redundant halves of the read-only guarantee (`default_transaction_read_only=on` and `BEGIN READ ONLY … ROLLBACK`) |
+| `src/ops/doctor/schema.ts` | The read-only seam for `getSchemaReadiness()` — the one consumer that needs a pool rather than the narrow handle. Same `BEGIN READ ONLY`, plus a `statement_timeout` below the check's deadline, plus giving the client up on abort so `pool.end()` never waits on a blocked read |
+| `src/ops/doctor/redis.ts` | Closed command allowlist (`PING`, `INFO`, `DBSIZE`, `CONFIG GET`), keyed by SUBCOMMAND so `CONFIG SET` is a different entry and is absent |
+| `src/ops/doctor/registry.ts` | The check list, in report order: what answers without a socket first |
+| `src/ops/doctor/checks/` | One file per category — runtime, config, postgres, redis |
 
 ## Patterns it follows
 
@@ -48,6 +56,9 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 | Add a data class | `retention/data-classes.ts` + the matrix doc; state its `dpo_open_question` |
 | Add a readiness check | `rpo.ts` — every check must carry evidence and remediation |
 | Add a restore-drill probe | `drill-probes.ts`: a single-row SQL plus a PURE grader. `required: true` only when its failure means the snapshot is genuinely unusable; the query must return counts/booleans, never a row value |
+| Add a `maia doctor` check | A `DoctorCheck` in `doctor/checks/<category>.ts`, registered in `doctor/registry.ts`. It must declare a deadline, `requiresNetwork`, a criticality, and remediation for every `fail`. It may touch dependencies ONLY through `ctx.postgres` / `ctx.redis` — a check that reaches for the application pool, a repository or `checkAll()` breaks the read-only guarantee |
+| Let the doctor read a new dependency | Extend `DoctorContext` with a NARROW read-only handle (the way `ctx.schemaReadiness` binds `getSchemaReadiness()` through `doctor/schema.ts`), never with a client the check can write through |
+| Make a blocker's `skip` NOT count as unproven | `notApplicable()` instead of `skip()`, and only when the check's subject does not exist in this environment. Every other `skip` on a blocker makes the run INCOMPLETO (exit 3) — that is the point |
 | Support another off-site provider | `src/workers/backup-s3.ts` (protocol-compatible) or a new adapter behind `BackupPorts.upload`/`verifyRemote` |
 
 ## Public surface
@@ -57,6 +68,8 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 - `evaluateBackupReadiness(input)` — the RPO/RTO verdict for `maia doctor` / readiness
 - `resolveRetention(classId, policy)` / `evaluateHold(holds, query)` — the two purge gates
 - `planReconciliation(input)` / `canReleaseTraffic(plan, applied)` — the post-restore anti-resurrection gate
+- `runDoctor(checks, ctx, options)` / `verdictFor(run, strict)` / `exitCodeFor(run, strict)` — the read-only diagnosis and its verdict (`ready` 0 · `not_ready` 1 · `incomplete` 3; `2` belongs to the CLI and means the gate did not run). `scripts/doctor.ts` is its only caller today
+- `evaluateSchemaReadiness(deps)` — `getSchemaReadiness()` bound to a read-only, time-bounded transaction over the doctor's pool
 - `deriveTombstoneSecret(master)` — the ledger's keying material. Domain-separated from the manifest-signing key and FROZEN: changing the label invalidates every existing tombstone HMAC, and an unverifiable ledger blocks every restore
 
 ## Invariants
@@ -84,4 +97,5 @@ Everything in this module is written so the DECISION is pure and the SIDE EFFECT
 ## Related
 
 - Runbook: [`docs/runbooks/backup-restore.md`](../../runbooks/backup-restore.md)
+- Runbook: [`docs/runbooks/doctor.md`](../../runbooks/doctor.md) — `maia doctor`, and the boundary between it, the configuration preflight, `/readyz` and the synthetic probe
 - Migrations: `migrations/101_backup_runs_manifests.sql`, `migrations/102_data_lifecycle.sql`, `migrations/112_restore_drill_cleanup_status.sql`

@@ -55,6 +55,7 @@ import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { redis } from '@/lib/redis.js';
 import { logger } from '@/lib/logger.js';
+import { safeFailure } from '@/lib/safe-failure.js';
 import { incCounter } from '@/lib/metrics.js';
 import { counter, METRIC } from '@/observability/metrics.js';
 import {
@@ -530,7 +531,7 @@ type ResyncAttempt =
  *    ela é pelo menos tão nova quanto o que o `GET` leu — inclusive quando
  *    chega ENTRE duas tentativas, que é por isso que a geração é conferida
  *    antes de cada retry.
- *  - **não é falha, e não é convergência**: `aborted`. O subscriber foi fechado
+ *  - **não é falha, e não é convergência**: `cancelled`. O subscriber foi fechado
  *    (drain, deploy) no meio da releitura. Ver abaixo.
  *
  * ## Drain: a releitura é CANCELADA, não esperada (achado 2 da #561)
@@ -543,8 +544,8 @@ type ResyncAttempt =
  *
  * O que mudou é a outra ponta. `stopLLMSettingsInvalidationSubscriber()` agora
  * CANCELA a releitura em voo (`SubscriberLifecycle`), e ela termina como
- * `aborted` — desfecho NÃO divergente, fora de `DIVERGENT_OUTCOMES`, com
- * `reason="resync_aborted"` na série. Antes, uma releitura em backoff acordava
+ * `cancelled` — desfecho NÃO divergente, fora de `DIVERGENT_OUTCOMES`, com
+ * `reason="resync_cancelled"` na série. Antes, uma releitura em backoff acordava
  * depois do `quit()`, gastava as tentativas restantes contra um cliente
  * encerrado e saía como `failed`: um drain deliberado paginava
  * (`state="enforce"`) uma réplica que estava apenas saindo. O `unref` dos
@@ -552,7 +553,7 @@ type ResyncAttempt =
  * emissão enquanto o resto do drain ainda o mantém vivo.
  *
  * Isso NÃO relaxa o fail-closed: uma releitura que falha de verdade continua
- * terminando em `failed`, com o estado local preservado. `aborted` só existe
+ * terminando em `failed`, com o estado local preservado. `cancelled` só existe
  * para o caso em que ninguém perguntou nada — o subscriber deixou de existir.
  *
  * A mitigação antiga continua valendo como segunda linha: TODO timer deste
@@ -566,7 +567,7 @@ async function resyncAuthoritativeState(sub: IORedis, life: SubscriberLifecycle)
   // cai exatamente aqui. Ainda assim publica UM evento: "um `ready` por
   // releitura, sempre" é a propriedade que permite responder pelo silêncio.
   if (!life.alive) {
-    finishResync('aborted', { attempts: 0 });
+    finishResync('cancelled', { attempts: 0 });
     return;
   }
 
@@ -605,7 +606,7 @@ async function resyncAuthoritativeState(sub: IORedis, life: SubscriberLifecycle)
     await Promise.race([sleep(delay), life.stopped]);
 
     if (!life.alive) {
-      finishResync('aborted', { attempts: attempt });
+      finishResync('cancelled', { attempts: attempt });
       return;
     }
 
@@ -652,8 +653,11 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
     );
   } catch (err) {
     // Fechamento vem ANTES do log e do retry: uma réplica que está saindo não
-    // produz `settings_resubscribe_failed` nem gasta tentativa.
-    if (!life.alive) return { retry: false, outcome: 'aborted' };
+    // produz `settings_resubscribe_failed` nem gasta tentativa. O motivo do
+    // DRIVER vai junto — censurado por `safeFailure`, ver `finishResync`.
+    if (!life.alive) {
+      return { retry: false, outcome: 'cancelled', error: safeFailure(err).reason };
+    }
     logger.warn(
       { err: (err as Error).message, channels: SUBSCRIBED_CHANNELS },
       'llm_gateway.settings_resubscribe_failed',
@@ -695,14 +699,16 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
       life,
     );
   } catch (err) {
-    if (!life.alive) return { retry: false, outcome: 'aborted' };
+    if (!life.alive) {
+      return { retry: false, outcome: 'cancelled', error: safeFailure(err).reason };
+    }
     return { retry: true, error: (err as Error).message };
   }
 
   // O `GET` respondeu, mas o subscriber já não existe: aplicar a postura numa
   // réplica que está saindo só escreveria trilha de auditoria sem ninguém para
   // usá-la. Não é divergência — ninguém mais depende do estado desta réplica.
-  if (!life.alive) return { retry: false, outcome: 'aborted' };
+  if (!life.alive) return { retry: false, outcome: 'cancelled' };
 
   if (overrideGeneration() !== generation) {
     return { retry: false, outcome: 'superseded' };
@@ -762,7 +768,7 @@ type ResyncOutcome =
   | 'superseded'
   | 'rejected'
   | 'failed'
-  | 'aborted';
+  | 'cancelled';
 
 /**
  * Desfechos em que a réplica NÃO pode afirmar que está consistente com o Redis
@@ -785,10 +791,10 @@ type ResyncOutcome =
  * diferença que importa aqui (convergiu × pode estar divergente) e cegaria o
  * alerta com ruído de corrida normal.
  *
- * `aborted` também está FORA, e por um motivo DIFERENTE (achado 2 da #561): ali
- * a réplica não divergiu nem convergiu — ela está saindo. O subscriber foi
+ * `cancelled` também está FORA, e por um motivo DIFERENTE (achado 2 da #561):
+ * ali a réplica não divergiu nem convergiu — ela está saindo. O subscriber foi
  * fechado pelo drain no meio da releitura, e ninguém mais depende do estado
- * dela. Pôr `aborted` aqui faria todo deploy paginar.
+ * dela. Pôr `cancelled` aqui faria todo deploy paginar.
  */
 const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
   'failed',
@@ -812,15 +818,17 @@ const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
  *
  * ## Três baldes, não dois (achado 2 da #561)
  *
- * `resync_aborted` é o terceiro valor de `reason` desta família. Ele NÃO pode
+ * `resync_cancelled` é o terceiro valor de `reason` desta família. Ele NÃO pode
  * ser dobrado em nenhum dos outros dois: em `resync_failed` faria todo drain
  * paginar, que é o defeito; em `resynced` afirmaria uma convergência que não
  * houve — a releitura foi interrompida, não concluída, e um gate de promoção
  * que confie em `{reason="resynced"}` estaria lendo evidência verde falsa.
  * Nenhum alerta o seleciona, de propósito: uma réplica saindo não é incidente.
  */
-function resyncReason(outcome: ResyncOutcome): 'resynced' | 'resync_failed' | 'resync_aborted' {
-  if (outcome === 'aborted') return 'resync_aborted';
+function resyncReason(
+  outcome: ResyncOutcome,
+): 'resynced' | 'resync_failed' | 'resync_cancelled' {
+  if (outcome === 'cancelled') return 'resync_cancelled';
   return DIVERGENT_OUTCOMES.has(outcome) ? 'resync_failed' : 'resynced';
 }
 
@@ -851,10 +859,46 @@ function finishResync(
     logger.error(record, 'llm_gateway.circuit_override_resync_failed');
     return;
   }
-  if (outcome === 'aborted') {
-    // Nome de log PRÓPRIO: um `grep circuit_override_resynced` num pós-mortem
-    // não pode devolver linhas de releituras que foram canceladas pelo drain.
-    logger.warn(record, 'llm_gateway.circuit_override_resync_aborted');
+  if (outcome === 'cancelled') {
+    /**
+     * INFO, e não WARN — decisão 16 do dono: "emitir evento, não silêncio.
+     * (…) Um log INFO."
+     *
+     * O cancelamento é operação NORMAL: o subscriber parou (drain, deploy,
+     * scale-in) e ninguém mais depende do estado desta réplica. A #561 já
+     * tinha tirado este desfecho do ERROR de divergência — pintá-lo de WARN
+     * devolve o mesmo ruído um degrau abaixo, e um nível que aparece em todo
+     * deploy é um nível que o plantão aprende a ignorar. O que responde pelo
+     * silêncio é a linha EXISTIR e ser contável, não ela ser alarmante.
+     *
+     * Nome de log PRÓPRIO pelo mesmo motivo de antes: um
+     * `grep circuit_override_resynced` num pós-mortem não pode devolver
+     * linhas de releituras que foram canceladas pelo drain.
+     *
+     * O que a linha carrega além do `record` comum, e por quê:
+     *
+     *  - `cancel_reason` — a RAZÃO. `outcome="cancelled"` diz o quê; sozinho
+     *    ele não separa "o subscriber fechou" de um deadline ou de uma
+     *    divergência. Hoje só existe uma razão para este desfecho (o
+     *    `life.alive` caiu, em qualquer um dos cinco pontos de decisão da
+     *    releitura), e escrevê-la explicitamente é o que permite acrescentar
+     *    uma segunda sem quebrar quem já lê esta linha.
+     *  - `channels` — QUAL subscriber foi fechado, no mesmo vocabulário de
+     *    `settings_invalidation_subscriber_started` e de
+     *    `settings_resubscribe_failed`. A réplica em si (`pid`, `hostname`) o
+     *    pino já carimba em toda linha (`base`, `src/lib/logger.ts`), então
+     *    repeti-la aqui só engordaria o registro.
+     *
+     * `record.err`, quando existe, é a mensagem do DRIVER e já vem por
+     * `safeFailure()` (`src/lib/safe-failure.ts`) lá de `attemptResync`: uma
+     * falha de conexão é exatamente o erro que carrega a DSN inteira, e é
+     * exatamente o que alguém vai ler no meio de um incidente (#533). Redação
+     * é do helper, nunca escrita de novo aqui.
+     */
+    logger.info(
+      { ...record, cancel_reason: 'subscriber_stopped', channels: SUBSCRIBED_CHANNELS },
+      'llm_gateway.circuit_override_resync_cancelled',
+    );
     return;
   }
   logger.warn(record, 'llm_gateway.circuit_override_resynced');
@@ -1028,7 +1072,7 @@ export function llmSettingsSubscriberResyncCount(): number {
  *
  * O `stop` marca o ciclo de vida como morto ANTES de qualquer `await`, então
  * uma releitura em backoff ou com um `GET` pendurado sai na hora, como
- * `aborted`. Sem isso ela acordava depois do `quit()`, gastava as tentativas
+ * `cancelled`. Sem isso ela acordava depois do `quit()`, gastava as tentativas
  * restantes contra um cliente encerrado e terminava em `resync_failed` — que
  * nesta leva virou alerta, com página em `state="enforce"`. Um drain deliberado
  * não pode acordar o plantão.

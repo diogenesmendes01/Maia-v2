@@ -355,6 +355,28 @@ export default [
     rules: TS_RULES,
   },
 
+  // Guards em ESM puro (`scripts/*.mjs`). Eles ficam FORA do tsc de propósito
+  // — tsconfig.json inclui só `src/**/*`, e todo o `scripts/` já está fora —,
+  // então o lint é a única verificação estática que os alcança. Sem este bloco
+  // eles cairiam só no `js.configs.recommended`, sem globals de Node, e
+  // `process`/`console` virariam `no-undef`.
+  //
+  // `ecmaVersion` fica em 2015 de caso pensado: um guard que precisa rodar num
+  // Node velho para reclamar dele não pode usar sintaxe que o Node velho não
+  // parseia (`?.`, `??`, top-level await). O parser reprovando é mais barato
+  // que descobrir isso no runtime de quem está travado.
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2015,
+      sourceType: 'module',
+      globals: NODE_GLOBALS,
+    },
+    rules: {
+      'no-var': 'off',
+    },
+  },
+
   // CommonJS scripts (rare here but defensive)
   {
     files: ['*.cjs', '**/*.cjs'],

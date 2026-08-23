@@ -819,21 +819,6 @@
         "24"
       ]
     },
-    "ONBOARDING_EXPIRER_BATCH_LIMIT": {
-      "type": "string",
-      "description": "Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes.",
-      "x-maia-type": "number",
-      "x-maia-group": "governance",
-      "x-maia-secret": false,
-      "x-maia-services": [
-        "runtime"
-      ],
-      "x-maia-restart-required": true,
-      "default": "100",
-      "examples": [
-        "100"
-      ]
-    },
     "IDEMPOTENCY_BUCKET_MINUTES": {
       "type": "string",
       "description": "Janela (min) do bucket de idempotência.",
@@ -907,6 +892,21 @@
       "default": "5",
       "examples": [
         "5"
+      ]
+    },
+    "ONBOARDING_EXPIRER_BATCH_LIMIT": {
+      "type": "string",
+      "description": "Teto de runs de onboarding vencidas expiradas por tick do worker onboarding_expirer. É trabalho limitado por tick, não vazão contratada: o backlog restante fica visível em maia_onboarding_expiry_backlog e drena nos ticks seguintes.",
+      "x-maia-type": "number",
+      "x-maia-group": "onboarding",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "100",
+      "examples": [
+        "100"
       ]
     },
     "MAIA_MULTI_LINE": {

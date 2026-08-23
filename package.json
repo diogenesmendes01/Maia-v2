@@ -6,11 +6,19 @@
   "type": "module",
   "packageManager": "npm@11.5.2",
   "engines": {
-    "node": ">=22.0.0",
+    "node": ">=22.13.0",
     "npm": ">=11.5.2 <12"
   },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.13.0",
+      "onFail": "error"
+    }
+  },
   "scripts": {
-    "preinstall": "node -e \"var ua=process.env.npm_config_user_agent||'';var m=ua.match(/npm\\/(\\d+)\\.(\\d+)\\.(\\d+)/);if(!m){process.exit(0)}var M=+m[1],n=+m[2],p=+m[3];if(!(M===11&&(n>5||(n===5&&p>=2)))){console.error('\\n\\u2716 npm '+m[1]+'.'+m[2]+'.'+m[3]+' is not in the pinned range (>=11.5.2 <12).\\n  This repo pins npm@11.5.2 so the package-lock.json format stays stable (see CONTRIBUTING.md).\\n  Installing with the wrong npm regenerates an incompatible lockfile and breaks CI.\\n  Fix: nvm install && nvm use   (Node 22 from .nvmrc)\\n       npm install -g npm@11.5.2\\n  Then re-run your install.\\n');process.exit(1)}\"",
+    "preinstall": "node scripts/check-node.mjs && node -e \"var ua=process.env.npm_config_user_agent||'';var m=ua.match(/npm\\/(\\d+)\\.(\\d+)\\.(\\d+)/);if(!m){process.exit(0)}var M=+m[1],n=+m[2],p=+m[3];if(!(M===11&&(n>5||(n===5&&p>=2)))){console.error('\\n\\u2716 npm '+m[1]+'.'+m[2]+'.'+m[3]+' is not in the pinned range (>=11.5.2 <12).\\n  This repo pins npm@11.5.2 so the package-lock.json format stays stable (see CONTRIBUTING.md).\\n  Installing with the wrong npm regenerates an incompatible lockfile and breaks CI.\\n  Fix: nvm install && nvm use   (Node 22 from .nvmrc)\\n       npm install -g npm@11.5.2\\n  Then re-run your install.\\n');process.exit(1)}\"",
+    "check:node": "node scripts/check-node.mjs",
     "dev": "tsx watch src/index.ts",
     "build": "tsc && tsc-alias",
     "start": "node dist/index.js",
@@ -22,6 +30,7 @@
     "migrate:reserve": "tsx scripts/migrate-reserve.ts",
     "migrate:reservations:check": "tsx scripts/check-migration-reservations.ts",
     "smoke:migrate:image": "bash scripts/smoke-migrate-image.sh",
+    "probe:drizzle-kit": "tsx scripts/probe-drizzle-kit.ts",
     "backfill:turns": "tsx scripts/backfill-agent-turns.ts",
     "import:ofx": "tsx scripts/import-ofx.ts",
     "import:list": "tsx scripts/import-review.ts list",
@@ -38,6 +47,8 @@
     "config:check": "tsx scripts/config.ts check",
     "config:check:drift": "tsx scripts/config.ts generate --check",
     "config:init": "tsx scripts/config.ts init",
+    "config:preflight": "tsx scripts/config.ts preflight",
+    "doctor": "tsx scripts/doctor.ts",
     "docs:ai:check": "tsx scripts/check-ai-docs.ts",
     "pr:body:check": "tsx scripts/check-pr-body.ts",
     "audit:exceptions:check": "tsx scripts/check-audit-exceptions.ts",
@@ -45,9 +56,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:leak": "vitest run tests/integration/leak.spec.ts tests/integration/repos-leak.spec.ts tests/integration/agent-tool-grants-leak.spec.ts tests/integration/playground-objectives-mcp-leak.spec.ts tests/unit/cross-entity.spec.ts tests/unit/constitutional.spec.ts tests/unit/agent-tool-grants-repo-scope.spec.ts tests/integration/synthetic-probe.spec.ts tests/unit/turn-context-cache.spec.ts tests/unit/turn-context-warm-cache.spec.ts tests/integration/turn-context-batch-repos.spec.ts tests/integration/agent-turns-leak.spec.ts tests/integration/onboarding-leak.spec.ts tests/unit/onboarding/readiness-facts-scope.spec.ts",
-    "test:integration:setup": "docker compose up -d redis postgres",
-    "test:integration:teardown": "docker compose down -v",
-    "test:integration": "vitest run tests/integration --no-coverage",
+    "test:integration:setup": "tsx scripts/test-infra.ts up",
+    "test:integration:teardown": "tsx scripts/test-infra.ts down",
+    "test:integration": "tsx scripts/test-integration.ts",
     "test:integration:real-db": "vitest run tests/integration/**/*real-db*.spec.ts --no-coverage",
     "test:e2e": "vitest run tests/e2e",
     "lint": "eslint src tests scripts",
@@ -79,7 +90,7 @@
     "fastify": "^5.1.0",
     "ioredis": "^5.11.0",
     "node-cron": "^4.2.1",
-    "nodemailer": "^9.0.3",
+    "nodemailer": "^9.0.5",
     "openai": "^6.37.0",
     "pdfmake": "^0.3.8",
     "pg": "^8.13.0",
@@ -93,7 +104,10 @@
   },
   "overrides": {
     "protobufjs": "^7.6.5",
-    "ioredis": "$ioredis"
+    "ioredis": "$ioredis",
+    "@esbuild-kit/core-utils": {
+      "esbuild": "^0.25.4"
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -108,7 +122,7 @@
     "@types/qrcode-terminal": "^0.12.2",
     "@typescript-eslint/eslint-plugin": "^8.61.0",
     "@typescript-eslint/parser": "^8.13.0",
-    "drizzle-kit": "^0.28.0",
+    "drizzle-kit": "^0.31.10",
     "eslint": "^10.4.1",
     "fast-check": "^4.8.0",
     "prettier": "^3.3.3",

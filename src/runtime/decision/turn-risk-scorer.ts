@@ -25,6 +25,12 @@ export type TurnRiskScorerOptions = {
   gate?: LLMGate;
   /** Texto que vai ao LLM se o gate disparar. Default: ''. */
   contextText?: string;
+  /**
+   * Issue #507 (achado 2) — cancelamento do caller. O Decision Engine já
+   * entrega este sinal ao port `riskScorer.score`; sem repassá-lo daqui a
+   * cadeia morria antes do `callLLM` do gate.
+   */
+  signal?: AbortSignal;
 };
 
 export async function scoreTurn(
@@ -34,6 +40,8 @@ export async function scoreTurn(
   return scoreTurnRisk(signals, {
     gate: opts.gate ?? haikuRiskGate,
     contextText: opts.contextText ?? '',
+    // Issue #507 (achado 2) — o sinal do turno, vindo do Decision Engine.
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
 }
 

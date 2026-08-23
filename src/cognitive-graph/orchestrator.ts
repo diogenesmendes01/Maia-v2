@@ -85,8 +85,16 @@ async function runOne<TCtx extends GraphContext>(
       fallback: n.fallback,
       conversa_id: ctx.conversa_id,
       turno_id: ctx.turno_id,
+      // Issue #507 (achado 2 da revisão do dono) — o sinal da TENTATIVA de
+      // turno atravessa o grafo. Sem isto o runner nunca via cancelamento por
+      // aqui e `cancelled` era literalmente inalcançável no grafo: os nodes
+      // rodavam até o próprio timeout depois de a lease cair, e o resultado
+      // ainda podia virar write.
+      signal: ctx.signal,
     },
-    () => n.run(ctx),
+    // ... e o sinal COMPOSTO (turno + timeout do node) chega ao `run` do node,
+    // que é quem sabe entregá-lo à operação subjacente (`callLLM`, um port).
+    (signal) => n.run(ctx, signal),
   );
 
   return {

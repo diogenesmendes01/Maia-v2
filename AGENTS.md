@@ -90,7 +90,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | 2 | **Fail-closed in security** | Missing `tenant_id`/`agent_id` → reject. Unmatched policy → reject. Unresolved channel → reject. Never fall back to `'default'` in production paths. |
 | 3 | **Backend decides, LLM proposes** | LLM emits typed intents (Zod). Backend validates against state + rules. Backend executes (or denies). See [`concerns/action-layer.md`](docs/architecture/concerns/action-layer.md). |
 | 4 | **Audit every decision** | Side-effect or governance decision → `audit()` row in `audit_logs` with action label and tenant context. |
-| 5 | **Confidence is computed (self-model) / gated (routing)** | **Self-model & governance confidence** comes from deterministic formulas over evidence counts — the LLM never declares it. **Decision-engine *routing* confidence** (intent / pending-gate / procedure-selector) MAY be LLM-proposed, but a backend threshold always decides ("LLM proposes, backend decides"). Canonical: [`docs/ai/maia-invariants-checklist.md` § Deterministic Confidence](docs/ai/maia-invariants-checklist.md#deterministic-confidence). See `src/agent/pending-gate.ts:150` (`resolution.confidence >= CONFIDENCE_THRESHOLD`), `src/cognition/procedure-selector.ts:91` (`top.confidence < threshold`), `src/runtime/decision/intent-classifier.ts:126` (`confidence: haiku.confidence`). |
+| 5 | **Confidence is computed (self-model) / gated (routing)** | **Self-model & governance confidence** comes from deterministic formulas over evidence counts — the LLM never declares it. **Decision-engine *routing* confidence** (intent / pending-gate / procedure-selector) MAY be LLM-proposed, but a backend threshold always decides ("LLM proposes, backend decides"). Canonical: [`docs/ai/maia-invariants-checklist.md` § Deterministic Confidence](docs/ai/maia-invariants-checklist.md#deterministic-confidence). See `src/agent/pending-gate.ts:277` (`resolution.confidence >= CONFIDENCE_THRESHOLD`), `src/cognition/procedure-selector.ts:109` (`top.confidence < threshold`), `src/runtime/decision/intent-classifier.ts:126` (`confidence: haiku.confidence`). |
 | 6 | **Migrations are append-only** | New migration file with `_up` + `_down`. Never edit a merged migration. |
 | 7 | **Branch before commit** | `git checkout -b claude/<short-purpose>` off `main`. Never commit to `main` directly. |
 | 8 | **No `'default'` literal in dynamic paths** | Schema seeds `tenant_id='default'`/`agent_id='default'` for single-tenant runtime, but production code rejects the literal when it appears in resolver/context-builder paths. |
@@ -122,6 +122,7 @@ npm run test:e2e                  # e2e
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
+npm run check:node                # guard de versão do Node (.mjs puro, roda com `node` direto — o mesmo que o `preinstall` dispara)
 npm run docs:ai:check             # AI engineering docs governance
 npm run config:check:drift        # config contract: generated artifacts up to date? (#515)
 npm run typecheck                 # tsc --noEmit
@@ -133,6 +134,9 @@ npm run audit:exceptions:check    # todo advisory do npm audit está corrigido o
 npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
 npm run config:check -- --profile production --env-file .env
 npm run config:init -- --profile development
+npm run config:preflight          # ambiente EFETIVO de cada serviço do compose
+                                  # (env_file + environment: interpolado),
+                                  # validado ANTES do `up` (#572)
 
 # Build
 npm run build                     # tsc + tsc-alias
@@ -153,6 +157,8 @@ npm run test:admin-ui:unit
 npm run test:admin-ui:e2e         # Playwright
 
 # Operational
+npm run doctor                    # diagnóstico READ-ONLY do ambiente (#517) — offline por default
+npm run doctor -- --online        # + liveness de Postgres/Redis; --format json, --strict, --only
 npm run dlq                       # dead-letter queue inspection
 npm run embeddings:rebuild        # regenerate vector embeddings
 npm run import:ofx                # OFX file import flow
@@ -164,10 +170,26 @@ npm run backup                    # DB backup
 `npm run test:integration` requires real Postgres + Redis:
 
 ```bash
-npm run test:integration:setup    # docker compose up -d redis postgres
-npm run test:integration          # vitest run tests/integration --no-coverage
-npm run test:integration:teardown # docker compose down -v
+npm run test:integration:setup    # sobe a pilha COMPARTILHADA (idempotente)
+npm run test:integration          # cria/migra o banco da worktree e roda
+# O teardown apaga o Postgres e o Redis de TODAS as árvores — inclusive das
+# que estão rodando agora. Ele recusa sem consentimento explícito:
+TEST_INFRA_TEARDOWN=yes npm run test:integration:teardown
 ```
+
+**A infra física é COMPARTILHADA por decisão registrada** (modelo (a): um
+Postgres, um Redis, um coordenador — `scripts/test-infra.ts`). O que isola sua
+árvore não é o container: é o banco e o db lógico do Redis por worktree. Nunca
+derrube a pilha para "limpar" a sua rodada — o que limpa a sua rodada é o
+`globalSetup`, que já cria o seu banco e limpa o SEU db do Redis.
+
+**Você está numa `git worktree`? Então seu Postgres e seu Redis já são só
+seus** (issue #571): banco `<base>_wt_<pasta>_<hash>` criado e migrado
+automaticamente, `schema_migrations` dentro dele, e um db lógico do Redis
+exclusivo. Não exporte `TEST_DB_URL` à mão — se você exportar, ela é reescrita
+para o banco da SUA árvore. O contrato inteiro (como descobrir qual é o seu, o
+teto de 15 worktrees ativas imposto pelos 16 dbs do Redis, e como desligar)
+está num lugar só: [README § Isolamento por worktree](README.md#isolamento-por-worktree-issue-571).
 
 CI runs these automatically in `.github/workflows/ci.yml` with service containers. The integration job is blocking: integration + e2e failures fail the run.
 

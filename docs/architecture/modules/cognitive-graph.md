@@ -28,6 +28,26 @@
 | Change execution policy | Extend `CognitiveLayer` enum in `src/types/enums.ts`; handle in `orchestrator.ts:runNodes()` |
 | Adjust latency budget | Edit `latency-budget.ts` policy; never bypass per-node `timeoutMs` |
 
+## Turn cancellation (issue #507)
+
+`GraphContext.signal` carries the claimed turn's `AbortSignal`
+(`TurnExecutionContext.signal`, issue #504). `src/agent/core.ts` fills it from
+`getTurnExecutionContext()?.signal`; `runOne` hands it to `runCognitiveModule`
+**and** to `n.run(ctx, signal)` — the node implementation is what forwards it to
+`callLLM`. Absent (outside a claimed turn) everything behaves exactly as before.
+
+Two things this does NOT do, and the distinction matters:
+
+- it does not stop the turn. A cancelled node returns `output: null`, which is
+  indistinguishable from a timeout at the call site. `src/agent/core.ts` calls
+  `assertTurnOwnership('preturn_graph')` right after `runNodes` and before
+  reading `result.nodes[...]`, and that guard is what prevents
+  `procedure_selector_decisions`, `startExecution` and `abortExecution` from
+  running without ownership;
+- it does not cover writes that happen **inside** a node. `selectRole` writes
+  `role_selector_decisions` before returning, so it carries its own
+  `assertTurnOwnership('role_selector_decision')`.
+
 ## Public surface
 
 | Consumed by | What |
@@ -43,6 +63,7 @@
 | `tests/unit/cognitive-graph-latency-budget.spec.ts` | p95 + budget math |
 | `tests/integration/p7-cognitive-graph.spec.ts` | Audit-invariant: every node invocation writes `cognitive_module_log` |
 | `tests/integration/p7-cognitive-graph-parity.spec.ts` | DB side-effect parity (#412): step-evaluator emits the full `procedure_execution_events` set; reflection nodes persist candidates |
+| `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | Lease lost mid-graph: the in-flight `callLLM` aborts and no post-graph write happens |
 
 ## In-flight changes
 

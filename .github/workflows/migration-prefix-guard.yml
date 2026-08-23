@@ -33,15 +33,34 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          # Pinado em 22.18, o MESMO piso das lanes matriciais de ci.yml.
+          # `node-version: 22` (major flutuante) deixava esta lane escorregar
+          # para qualquer 22.x — inclusive a faixa 22.0.0-22.12.x, em que o
+          # `npm ci` deste repo NÃO instala. Duas restrições somam, e vale a
+          # maior: o npm@11.5.2 pinado declara `^20.17.0 || >=22.9.0`, e o
+          # eslint do lockfile declara `^20.19.0 || ^22.13.0 || >=24` — com
+          # `engine-strict=true`, a segunda é vinculante. Piso real: 22.13.0
+          # (`engines.node`), medido com binários reais em `npm ci --dry-run`.
+          # Esta workflow só dispara em mudanças de migrations/scripts, então
+          # a divergência não aparecia nos checks da PR. Coberto por
+          # tests/unit/scripts/check-node.spec.ts (varredura de
+          # .github/workflows/**).
+          node-version: '22.18'
           cache: 'npm'
 
       - name: Pin npm to 11.5.2
         # Match package.json's packageManager + the lockfile generator (see
         # ci.yml for the full rationale). Must run BEFORE npm ci.
         run: npm install -g npm@11.5.2
+
+      - name: Node version guard (readable message)
+        # Ver ci.yml: o `preinstall` não gateia a instalação (engine-strict
+        # preempta os lifecycle scripts, e num `npm ci` que passa ele roda
+        # depois da árvore). O gate é `devEngines.runtime`; este passo garante
+        # a MENSAGEM legível por construção. Deve rodar ANTES do `npm ci`.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
