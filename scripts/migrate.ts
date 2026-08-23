@@ -28,7 +28,7 @@ import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { loadMigrationConfig } from '@/config/migration-config.js';
+import { loadMigrationConfig, migrationRunOptions } from '@/config/migration-config.js';
 import { ConfigValidationError } from '@/config/load.js';
 import {
   getSchemaReadiness,
@@ -171,7 +171,11 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       }
 
       case 'up': {
-        const result = await runMigrations(deps);
+        // Os tetos de lock/statement vêm do CONTRATO (#515/#516), não de
+        // constante de módulo: `src/migrations/` nunca lê `process.env`, então
+        // é aqui — o adaptador — que ambiente vira opção. Os defaults do
+        // contrato são os mesmos valores que as constantes tinham.
+        const result = await runMigrations(deps, migrationRunOptions(config));
         printRunResult(result);
         return result.ok ? 0 : 1;
       }

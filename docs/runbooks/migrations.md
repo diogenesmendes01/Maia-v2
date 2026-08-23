@@ -117,6 +117,26 @@ A second migrator started concurrently **waits** for the first (30s by
 default) and then exits cleanly with `lock_unavailable` — it never
 applies anything unguarded.
 
+### Os quatro tetos, e onde mexer neles
+
+Todos vêm do contrato de configuração (#515) e só o serviço `migrator` os
+recebe. Os defaults são os valores que antes eram constantes de módulo, então
+não mexer em nada preserva o comportamento anterior.
+
+| Variável | Default | O que limita |
+|---|---:|---|
+| `MIGRATION_LOCK_WAIT_MS` | `30000` | Quanto um segundo migrator espera pelo advisory lock antes de sair com `lock_unavailable`. |
+| `MIGRATION_LOCK_POLL_MS` | `500` | Intervalo entre tentativas de `pg_try_advisory_lock` durante essa espera. |
+| `MIGRATION_LOCK_TIMEOUT_MS` | `10000` | `SET lock_timeout` da sessão que aplica cada migration. `0` desliga (fail-OPEN). |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | `0` (sem teto) | `SET statement_timeout` da mesma sessão. Uma migration específica sobe o próprio teto com `-- maia:statement-timeout=<ms>`. |
+
+Quando o `up` falha com erro de lock numa tabela quente, o teto que você quer
+é `MIGRATION_LOCK_TIMEOUT_MS` — e a resposta certa quase nunca é subi-lo:
+falhar em 10s é recuperável, segurar `ACCESS EXCLUSIVE` por minutos derruba
+toda query que encostar na tabela. `MIGRATION_STATEMENT_TIMEOUT_MS` continua
+sem teto por default de propósito: matar uma migration `-- maia:no-transaction`
+no meio **fabrica** o dirty state que este runbook existe para evitar.
+
 ### No deploy, quem roda isto é o Compose (issue #516)
 
 `docker-compose.yml` e `compose.prod.yml` têm um job one-shot `migrate`
@@ -502,27 +522,106 @@ Two rules follow, and they are the operator's responsibility:
   not rollback of schema. If a domain migration must actually be undone,
   take a backup first and follow the manual procedure above.
 
+## Métricas do schema (Prometheus)
+
+O veredito canônico (`getSchemaReadiness()`) é publicado como série no
+`/metrics` do runtime — `src/observability/migration-collector.ts`, fiado
+no boot por `registerRuntimeObservability()`. As quatro famílias são
+lidas **no scrape**, do mesmo adaptador cacheado que o `/readyz` consome,
+então a métrica e o gate não podem divergir:
+
+| Série | O que é |
+|---|---|
+| `maia_schema_migration_head{kind="expected"}` | Posição (1-based) do head desta build na lista ordenada de migrations conhecidas. |
+| `maia_schema_migration_head{kind="applied"}` | Idem para o head aplicado no banco. `0` = banco virgem. |
+| `maia_schema_migrations_pending` | Migrations que faltam aplicar (inclui as `failed`, retentáveis). |
+| `maia_schema_migrations_dirty` | Migrations em `dirty`. `> 0` é intervenção humana pendente. |
+| `maia_schema_migration_last_duration_ms` | `execution_ms` da migration aplicada mais recentemente pelo relógio. |
+
+Duas leituras que valem escrever no alerta:
+
+- **`expected - applied`** é quantas migrations o banco está atrás, sem o
+  alerta precisar conhecer o head da release.
+- **`NaN` não é `0`.** `0` pendente e `0` dirty são a leitura saudável, então
+  uma leitura que falha **não pode** produzir 0: todas as séries viram `NaN`
+  quando o veredito não pôde ser lido (banco fora do ar, ledger ilegível,
+  estado `unknown`). Alerta escrito sobre `> 0` continua correto; alerta que
+  precisa distinguir "verificado saudável" de "não olhei" tem de testar
+  `absent()`/`NaN` explicitamente.
+
+Posição ordinal, e não o número do arquivo, porque o número **não é único**
+neste repositório (issue #308 — doze números compartilhados), então `063` não
+identifica um head.
+
+**O tempo esperando o lock não é uma série, de propósito.** Ele é conhecido só
+dentro do processo que migrou (`MigrationRunResult.lock_waited_ms`), e esse
+processo é o job one-shot `migrate`, que sai e morre — ninguém o raspa. Um
+gauge publicado por ele congelaria sem medição nenhuma, que é pior que
+ausência porque parece um sinal. O valor continua nos eventos estruturados
+`migration.lock_wait` / `migration.lock_acquired` que a CLI imprime (`docker
+compose logs migrate`), e a consequência de alguém segurar o lock demais
+aparece em `maia_schema_migrations_pending` que não cai.
+
 ## Future work (issue #516 remainder)
 
-- **DONE** — `/readyz` consumes `getSchemaReadiness()`. The `schema`
-  component now goes through
-  `src/runtime/lifecycle/schema-readiness.ts`, so a checksum mismatch, a
-  dirty or orphaned `running` row, a migration file this build does not
-  ship, an incompatible head and an unreadable database each answer
-  **503**. `READINESS_SCHEMA_CHECK=false` is refused at boot in the
-  `production` profile. Operator detail (including the 10s verdict
-  cache) in [`operational.md`](operational.md) §8.1.
-- The **boot** step (`src/index.ts`, lifecycle step `schema`) still uses
-  `checkSchemaVersion()`. Unifying it with the readiness verdict would
-  turn every schema condition that currently yields a diagnosable
-  never-ready instance into a crash loop — a policy decision still open
-  on #516.
-- Add a one-shot `migrate` service to `docker-compose.yml` /
-  `compose.prod.yml`, with `app` and `admin-ui` depending on its
-  successful completion, so a fresh database reaches head before any
-  service starts.
-- `maia doctor` (#517) consuming `status` + readiness.
-- Move the lock/statement timeouts into the configuration contract
-  (#515) instead of call-site defaults.
-- A `--down=NNN` flag remains deliberately unbuilt: down migrations stay
-  manual and reviewed.
+O escopo da #516 foi reduzido formalmente pelo dono em 2026-08-15: o
+`maia doctor` migrou para a #517 e o material de Coolify/K8s para a #565.
+O que sobra está abaixo.
+
+### Entregue (não refazer)
+
+- `/readyz` consome `getSchemaReadiness()`. O componente `schema` passa por
+  `src/runtime/lifecycle/schema-readiness.ts`, então checksum divergente,
+  linha `dirty` ou `running` órfã, arquivo de migration que esta build não
+  empacota, head incompatível e banco ilegível respondem **503** cada um.
+  `READINESS_SCHEMA_CHECK=false` é recusado no boot no profile `production`.
+  Detalhe operacional (inclusive o cache de 10s do veredito) em
+  [`operational.md`](operational.md) §8.1.
+- Job one-shot `migrate` no Compose (PR #563): `docker-compose.yml:125` e
+  `compose.prod.yml:168`, com `app` e `admin-ui` dependendo dele por
+  `service_completed_successfully`. Ver
+  [§ No deploy, quem roda isto é o Compose](#no-deploy-quem-roda-isto-é-o-compose-issue-516).
+- `maia doctor` consumindo o veredito (PR #598): o check
+  `postgres.schema_readiness` (`src/ops/doctor/checks/postgres.ts`) chama
+  `getSchemaReadiness()` pelo seam read-only de `src/ops/doctor/schema.ts` —
+  `BEGIN READ ONLY`, `SET LOCAL statement_timeout` e o `AbortSignal` do check.
+  O doctor **não** re-deriva estado de schema; ele pergunta.
+- Tetos de lock/statement no contrato de configuração (#515):
+  `MIGRATION_LOCK_WAIT_MS`, `MIGRATION_LOCK_POLL_MS`,
+  `MIGRATION_LOCK_TIMEOUT_MS` e `MIGRATION_STATEMENT_TIMEOUT_MS`, só no
+  serviço `migrator`, com os defaults iguais aos valores que eram constantes
+  de módulo (30000 / 500 / 10000 / sem teto). `src/migrations/` continua sem
+  ler `process.env`: quem injeta é `scripts/migrate.ts`, via
+  `migrationRunOptions()`.
+- Métricas de migration no `/metrics` — ver a seção acima.
+
+### Aberto
+
+- **Drill em staging.** Nada aqui foi exercitado contra um banco de staging
+  real: subir uma réplica atrás do head, ver o `/readyz` recusar, rodar o job,
+  ver a rotação voltar. Depende do ambiente do dono, não de código.
+- **Decisão de política do passo de boot — do dono, não do agente.**
+  `src/index.ts` (lifecycle step `schema`) ainda usa `checkSchemaVersion()`,
+  que compara só o id mais novo do ledger com o `.sql` mais novo em disco. O
+  veredito canônico é o de `src/migrations/status.ts`, exposto por
+  `getSchemaReadiness()`, e ele vê o que o outro não vê: checksum divergente,
+  `dirty`, `running` órfã, arquivo ausente, head incompatível.
+
+  Unificar os dois **não é uma limpeza, é uma troca de postura**, e os dois
+  lados são defensáveis:
+
+  - *Manter como está* — uma condição de schema derruba a readiness e o
+    processo fica de pé respondendo 503. A instância é diagnosticável: dá para
+    entrar nela, rodar `migrate status`, ler o log. O custo é que uma
+    instância nunca-pronta pode ficar assim indefinidamente sem que ninguém
+    olhe, se o alerta de readiness não estiver ligado.
+  - *Unificar* — a mesma condição vira falha de boot e, sob um supervisor que
+    reinicia, **crash loop**. O sinal é impossível de ignorar, e nenhuma
+    instância meio-viva entra na rotação. O custo é que o container que você
+    precisa inspecionar é justamente o que não fica de pé, e o loop de
+    reinício apaga o rastro.
+
+  A escolha depende de quem opera (supervisor, política de alerta, se há
+  acesso ao container). Fica registrada como decisão do dono na #516.
+- Um flag `--down=NNN` continua deliberadamente não construído: rollback de
+  migration é manual e revisado.

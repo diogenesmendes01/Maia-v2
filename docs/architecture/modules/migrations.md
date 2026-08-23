@@ -19,7 +19,9 @@ Introduced by issue #516. Replaces the loop that used to live inline in `scripts
 | `src/migrations/runner.ts` | `runMigrations` / `repairMigration` — the only things that change the schema. |
 | `src/migrations/readiness.ts` | `getSchemaReadiness` / `getMigrationStatus` — read-only, never-throwing API. |
 | `src/migrations/index.ts` | Public surface. |
-| `scripts/migrate.ts` | CLI: `up` (default), `plan`, `status`, `repair`. Parses argv, prints, picks an exit code. Nothing else. |
+| `scripts/migrate.ts` | CLI: `up` (default), `plan`, `status`, `repair`. Parses argv, prints, picks an exit code, and injects the contract's timeouts. Nothing else. |
+| `src/config/migration-config.ts` | The migrator's config projection: `loadMigrationConfig()` + `migrationRunOptions()` (contract ⇒ `RunOptions`). Keeps `src/migrations/` free of `process.env`. |
+| `src/observability/migration-collector.ts` | Scrape-time publication of the canonical verdict as Prometheus gauges. Reads, never writes. |
 
 ## Scope: migrations are GLOBAL, not tenant-scoped
 
@@ -205,6 +207,26 @@ Every payload is ids, short (12-char) checksums, durations, transaction mode and
 
 The ledger is the primary operational trail, because migrations can run before `audit_logs` exists (migration 001 is what creates the audited world).
 
+### Prometheus series (issue #516 §Observabilidade)
+
+`src/observability/migration-collector.ts`, wired at boot from `registerRuntimeObservability()`, publishes the canonical verdict as four gauge families read **at scrape time** from `checkSchemaReadiness()` — the same cached adapter `/readyz` consumes, so the metric and the gate cannot disagree:
+
+| Series | Meaning |
+|---|---|
+| `maia_schema_migration_head{kind="expected"}` | 1-based position of this build's head in the ordered list of known migrations |
+| `maia_schema_migration_head{kind="applied"}` | Same for the database's applied head; `0` = nothing applied |
+| `maia_schema_migrations_pending` | Migrations still to apply (includes `failed`, which are retryable) |
+| `maia_schema_migrations_dirty` | Migrations in `dirty` — `> 0` is pending human intervention |
+| `maia_schema_migration_last_duration_ms` | `execution_ms` of the most recently applied migration, by clock |
+
+Three decisions worth knowing before writing an alert:
+
+- **Ordinal position, not the file number.** Twelve numbers are shared by more than one migration in this repo (issue #308), so `063` does not identify a head. The ordinal is computed over the same ordering the runner applies.
+- **`NaN`, never `0`, on a failed read.** `0` pending and `0` dirty are the *healthy* reading, so a collector that returned 0 on failure would report "schema at head, nothing dirty" during a database outage. A failed refresh drops the snapshot rather than re-serving the last good one — same fail-closed posture as `backup-readiness-collector.ts`.
+- **Global attribution, on purpose.** No `tenant_id`/`agent_id`: schema DDL is whole-database work that runs before per-tenant rows exist, and the advisory lock that serialises it is one for the entire database. Emission still goes through the sanctioned layer (`src/observability/metrics.ts::gauge`), which applies the label allowlist, the PII guard and the cardinality budget — that is the part issue #601 made non-negotiable.
+
+**The lock wait is deliberately not a series.** `MigrationRunResult.lock_waited_ms` is known only inside the process that migrated, and that process is the one-shot `migrate` job, which exits and is never scraped. A gauge it published would sit frozen with no measurement at all — worse than absence, because it looks like a signal. It stays in the structured events above (`docker compose logs migrate`); the consequence of somebody holding the lock too long shows up as `maia_schema_migrations_pending` that does not fall.
+
 ## Tests
 
 | Test path | What it covers |
@@ -220,6 +242,8 @@ The ledger is the primary operational trail, because migrations can run before `
 | `tests/unit/migrations/ledger-schema-parity.spec.ts` | Migration 108 mirrors `LEDGER_V2_DDL`; the down truly reverses it |
 | `tests/unit/migrations/compose-migrate-job.spec.ts` | The REAL `docker-compose.yml` / `compose.prod.yml`: the job exists, is gated on by `app`/`admin-ui` with `service_completed_successfully`, cannot restart itself out of "completed", shares the app's build, and (executably) its production environment satisfies `loadServiceConfig('migrator')` |
 | `tests/integration/migration-115-constraint-swap.spec.ts` | Real Postgres, schema dedicado: os arquivos REAIS da 115 executados como `psql` os executa. O `_down` recusa **e** deixa a constraint de pé (`pg_get_constraintdef`), e a validação do `_up` não segura `ACCESS EXCLUSIVE` — aferido com escrita concorrente sob `lock_timeout` |
+| `tests/unit/migrations/timeouts-from-contract.spec.ts` | The REAL CLI call site: `scripts/migrate.ts` hands `runMigrations` the timeouts projected from the contract (defaults = the previous constants), honours an operator override, maps `0` to "no ceiling", and refuses a negative value instead of ignoring it |
+| `tests/unit/observability/migration-collector.spec.ts` | The gauge families, their fail-closed `NaN`, and — the anti-mirror-trap case — that they are wired from `registerRuntimeObservability()` rather than only from the spec |
 | `tests/integration/migrations-runner-real-db.spec.ts` | Real Postgres: concurrent migrators, real dirty state, `status` recomputed on both failure paths, the durability of a committed envelope (the hazard behind the guardrail) and the refusal of the file that would hit it, v1→v2 backfill, CHECK constraints, the `--as applied` refusal against a real unpackaged row (+ the CLI's exit code). Skips without `TEST_DB_URL`. |
 
 ## How to extend
@@ -366,18 +390,23 @@ second migrator exits cleanly.
 
 ## In-flight / not yet done (issue #516 DoD)
 
-Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API, the `/readyz` gate that consumes it, and the one-shot Compose job that puts the schema at the head before `app`/`admin-ui` start (see the two sections above).
+The owner reduced #516's scope formally on 2026-08-15: `maia doctor` moved to #517, and the Coolify/Kubernetes material to #565.
 
-Not yet delivered, tracked on #516:
+Delivered here: ledger v2, shared runner library, advisory lock, checksums + backfill, dirty state, repair, read-only status/plan, readiness API, the `/readyz` gate that consumes it, the one-shot Compose job that puts the schema at the head before `app`/`admin-ui` start (see the two sections above), the lock/statement timeouts as contract variables, and the Prometheus series.
 
-- **the BOOT step still uses the weaker check.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. Readiness no longer does. Unifying them is a POLICY decision, not a wiring one: readiness answering "no" costs one instance out of rotation with a self-describing 503 body, while boot answering "no" costs a crash loop, and every condition that currently produces a diagnosable never-ready instance would become a restart loop. Deferred pending an owner decision;
-- `maia doctor` (#517) is a separate issue and consumes this module. **Open question for the owner:** the DoD of #516 lists "Doctor integrado", and the "integrated doctor" (a read-only preflight) is not built here — does that item belong to #516 or does it move to #517? Treated as out of scope until the owner decides;
-- timeouts are call-site options with defaults, not configuration-contract variables (#515);
-- the equivalent of the job outside Compose (Kubernetes init job / Coolify release command) is documented nowhere yet — the issue asks for it and this repo deploys via Compose today.
+Two things that used to be listed here are done and must not be redone:
+
+- `maia doctor` consuming status + readiness — the `postgres.schema_readiness` check (`src/ops/doctor/checks/postgres.ts`) calls `getSchemaReadiness()` through the read-only seam in `src/ops/doctor/schema.ts`. The doctor never re-derives schema state;
+- the timeouts — `MIGRATION_LOCK_WAIT_MS`, `MIGRATION_LOCK_POLL_MS`, `MIGRATION_LOCK_TIMEOUT_MS`, `MIGRATION_STATEMENT_TIMEOUT_MS`, declared on the `migrator` service only, with defaults identical to the constants they replace (30000 / 500 / 10000 / no ceiling). This module still never reads `process.env`: `scripts/migrate.ts` injects them via `migrationRunOptions()`.
+
+Still open on #516:
+
+- **a staging drill.** None of this has been exercised against a real staging database: bring up a replica behind the head, watch `/readyz` refuse, run the job, watch it rejoin rotation. Depends on the owner's environment, not on code;
+- **the BOOT step still uses the weaker check — an OWNER decision, not an agent's.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. The canonical verdict (`src/migrations/status.ts`, exposed by `getSchemaReadiness()`) also sees checksum mismatch, `dirty`, orphaned `running`, a missing file and an incompatible head. Unifying them is a POLICY change with two defensible sides: keeping it means a schema condition costs one instance out of rotation with a self-describing 503 body, and that instance stays *inspectable*; unifying it means the same condition becomes a boot failure and, under a restarting supervisor, a **crash loop** — impossible to ignore, but the container you need to inspect is the one that will not stay up. The right answer depends on the supervisor, the alerting and whether anyone can reach the container. Recorded as the owner's decision on #516.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-08-14 |
-| Against `main` HEAD | `8de8da4f` |
+| Last verified | 2026-08-23 |
+| Against `main` HEAD | `a932dedd` |

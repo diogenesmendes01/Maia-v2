@@ -11,6 +11,7 @@
  */
 import { logger } from '@/lib/logger.js';
 import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
+import { registerMigrationGauges } from './migration-collector.js';
 import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
 import {
@@ -123,6 +124,19 @@ export async function registerRuntimeObservability(): Promise<void> {
   registerOnboardingExpiryGauges(async () => {
     const { onboardingRunsRepo } = await import('@/db/repositories/onboarding-repos.js');
     return onboardingRunsRepo.snapshotExpiryBacklog();
+  });
+
+  // Issue #516 §Observabilidade — head esperado vs. aplicado, pendentes, dirty
+  // e duração da última execução. Lido no SCRAPE, do veredito CANÔNICO
+  // (`getSchemaReadiness`), nunca de uma re-derivação: `checkSchemaReadiness()`
+  // é o mesmo adaptador cacheado que o `/readyz` consome, então a métrica e o
+  // gate não podem divergir — se divergissem, o dashboard estaria explicando um
+  // 503 que ele mesmo não vê.
+  registerMigrationGauges({
+    readVerdict: async () => {
+      const { checkSchemaReadiness } = await import('@/runtime/lifecycle/schema-readiness.js');
+      return checkSchemaReadiness();
+    },
   });
 
   startOtlpExporter();

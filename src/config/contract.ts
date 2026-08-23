@@ -241,6 +241,77 @@ export const ENV_CONTRACT = {
     restartRequired: true,
   },
 
+  // ---- database · migration runner (issue #516) --------------------------
+  //
+  // Os quatro tetos abaixo eram defaults de CALL SITE — `DEFAULT_LOCK_WAIT_MS`
+  // e `DEFAULT_LOCK_POLL_MS` em `src/migrations/lock.ts`,
+  // `DEFAULT_STATEMENT_LOCK_TIMEOUT_MS` em `src/migrations/runner.ts`, e o
+  // `?? null` do `statementTimeoutMs`. Constante de módulo é um teto que só
+  // muda com deploy: no incidente em que ele é curto demais (backfill legítimo
+  // levando mais que o previsto) ou longo demais (migration segurando ACCESS
+  // EXCLUSIVE), o operador não tem alavanca nenhuma. Aqui ele tem uma, e ela
+  // passa por schema.
+  //
+  // Os defaults são EXATAMENTE os valores anteriores — mover para o contrato
+  // não muda comportamento. Só o `migrator` os recebe: o runtime não migra.
+  //
+  // As constantes em `src/migrations/` continuam existindo e continuam sendo o
+  // default da BIBLIOTECA (ela nunca lê `process.env`). Quem injeta a
+  // configuração é o adaptador, `scripts/migrate.ts`, via
+  // `migrationRunOptions()`.
+  MIGRATION_LOCK_WAIT_MS: {
+    name: 'MIGRATION_LOCK_WAIT_MS',
+    description:
+      'Quanto um segundo migrator espera pelo advisory lock global antes de desistir com `lock_unavailable` (issue #516). Ele NUNCA aplica nada sem o lock — o teto decide só quanto tempo ele tenta. Subir ajuda quando a migration do vencedor é longa e o perdedor é um deploy paralelo; descer devolve o container mais rápido.',
+    group: 'database',
+    secret: false,
+    services: ['migrator'],
+    schema: posInt(30_000),
+    example: '30000',
+    fixture: '30000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_LOCK_POLL_MS: {
+    name: 'MIGRATION_LOCK_POLL_MS',
+    description:
+      'Intervalo entre tentativas de `pg_try_advisory_lock` enquanto o migrator espera (issue #516). O runner faz POLL em vez de bloquear dentro de `pg_advisory_lock` porque um backend bloqueado é invisível: com poll ele emite `migration.lock_wait`, respeita o prazo e é testável sem Postgres. Valores muito baixos viram round-trip à toa; muito altos atrasam a largada do perdedor depois que o vencedor termina.',
+    group: 'database',
+    secret: false,
+    services: ['migrator'],
+    schema: posInt(500),
+    example: '500',
+    fixture: '500',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_LOCK_TIMEOUT_MS: {
+    name: 'MIGRATION_LOCK_TIMEOUT_MS',
+    description:
+      '`SET lock_timeout` aplicado à sessão que roda cada migration (issue #516). Guarda o apagão clássico: o `ALTER TABLE` da migration entra na fila atrás de uma query longa e TODA query seguinte entra na fila atrás do pedido de lock dela. Falhar em 10s é recuperável; travar a tabela por minutos não é. `0` desliga (default do Postgres) e é fail-OPEN — use só com intenção.',
+    group: 'database',
+    secret: false,
+    services: ['migrator'],
+    schema: z.coerce.number().int().nonnegative().default(10_000),
+    example: '10000',
+    fixture: '10000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MIGRATION_STATEMENT_TIMEOUT_MS: {
+    name: 'MIGRATION_STATEMENT_TIMEOUT_MS',
+    description:
+      '`SET statement_timeout` aplicado à sessão que roda cada migration (issue #516). Default `0` = SEM teto, e isso é deliberado: um backfill legítimo roda por minutos, e matar uma migration `-- maia:no-transaction` no meio FABRICA exatamente o dirty state que a #516 existe para evitar. Uma migration específica sobe o próprio teto com `-- maia:statement-timeout=<ms>`, onde o revisor vê; esta variável é o piso do ambiente.',
+    group: 'database',
+    secret: false,
+    services: ['migrator'],
+    schema: z.coerce.number().int().nonnegative().default(0),
+    example: '0',
+    fixture: '0',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
   // ---- redis ------------------------------------------------------------
   REDIS_URL: {
     name: 'REDIS_URL',
