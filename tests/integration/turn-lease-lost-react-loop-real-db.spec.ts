@@ -486,6 +486,28 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
     expect(thrown, 'o laço deveria ter encerrado a tentativa').toBeInstanceOf(
       TurnOwnershipLostError,
     );
-    expect((thrown as { boundary: string }).boundary).toBe('react_tool_refused');
+    // Issue #507 — A BARREIRA SUBIU UM DEGRAU, e é por isso que este valor
+    // mudou de `react_tool_refused` para `react_reasoner`.
+    //
+    // Quando este caso foi escrito, o `callLLM` do reasoner era chamado SEM
+    // `signal`: a perda encenada aqui — durante o round-trip da última
+    // iteração — não era percebida por ninguém até a tool seguinte bater no
+    // guard do dispatcher. A #507 levou o `AbortSignal` da tentativa até o
+    // `callLLM`, então a MESMA perda, no MESMO instante, agora encerra o laço no
+    // próprio reasoner: a chamada paga é abortada em voo, e o laço nem chega a
+    // considerar a tool.
+    //
+    // O que este caso PROVA continua idêntico — nenhuma gravação aterrissa
+    // depois da perda, e o core não decide o desfecho de um turno que não é
+    // dele. O que mudou é que agora ele para mais cedo, que é o ganho da #507.
+    //
+    // A TRADUÇÃO da recusa do dispatcher (`{ error: 'turn_ownership_lost' }` →
+    // `TurnOwnershipLostError('react_tool_refused')`, react-loop.ts:405) segue
+    // no código e segue certa: ela cobre a janela em que a posse se perde
+    // DENTRO de `dispatchTool` (entre o guard de entrada e o handler), que é o
+    // cenário de `turn-lease-lost-tool-handler-real-db.spec.ts`. O que este
+    // arquivo deixou de alcançar foi o instante "durante o reasoner", porque
+    // ele agora é interceptado antes — e interceptar antes era o objetivo.
+    expect((thrown as { boundary: string }).boundary).toBe('react_reasoner');
   }, 60_000);
 });

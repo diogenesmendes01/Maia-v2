@@ -65,7 +65,7 @@ export class LLMGateParseError extends Error {
  * querem isolar do SDK, passe um stub conformante a `LLMGate` aos
  * scorers em vez deste.
  */
-export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) => {
+export const haikuRiskGate: LLMGate = async ({ current_level, context_text, signal: caller }) => {
   const result = await runCognitiveModule<{ suggested_level: RiskLevel; reason: string } | null>(
     {
       name: 'risk_assessor_llm',
@@ -73,8 +73,11 @@ export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) =>
       triggered_by: 'sync_conditional',
       timeoutMs: 2500,
       fallback: null,
+      // Issue #507 (achado 2) — cancelamento do turno. Sem ele o desfecho de
+      // uma lease perdida aqui era `error` + fallback, e não `cancelled`.
+      signal: caller,
     },
-    async () => {
+    async (signal) => {
       const system = [
         'Você é um classificador de risco operacional. Recebe o nível atual',
         '(heurístico determinístico) e um texto de contexto, e retorna o nível',
@@ -101,6 +104,8 @@ export const haikuRiskGate: LLMGate = async ({ current_level, context_text }) =>
         max_tokens: 150,
         system,
         messages: [{ role: 'user', content: user }],
+        // Issue #507 — sinal COMPOSTO (turno + timeout de 2,5 s) até o gateway.
+        signal,
       });
       const text = completion.content ?? '';
 

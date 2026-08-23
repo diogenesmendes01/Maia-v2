@@ -885,7 +885,7 @@ export class RiskScorerProdAdapter implements RiskScorer {
       intent: DecisionPacket['intent'];
       base: BaseContextPacket;
     },
-    _options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal },
   ): Promise<DecisionPacket['risk_profile']> {
     const topic = intentLabelToTopicSignal(input.intent.label);
     const tool_kinds = derivedToolKinds(topic, input.base);
@@ -898,7 +898,10 @@ export class RiskScorerProdAdapter implements RiskScorer {
       // risk_override not carried in BaseContextPacket directly — omit.
     };
 
-    const scored = await scoreTurn(signals);
+    // Issue #507 (achado 2) — o sinal do turno segue até o `callLLM` do gate
+    // de risco. Antes ele parava aqui: o parâmetro existia, chamava-se
+    // `_options` e nunca era lido.
+    const scored = await scoreTurn(signals, options?.signal ? { signal: options.signal } : {});
 
     // Map P9c 4-level ScoredRisk → DE 3-level risk_profile.
     // Build reasons from triggers (audit-visible).
