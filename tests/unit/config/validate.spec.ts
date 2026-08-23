@@ -354,6 +354,72 @@ describe('validateConfig — cross-field rules (#515)', () => {
     expect(rules(result).errors).toContain('whatsapp/auth-dir-safe');
   });
 
+  // Issue #602 — `CrossFieldFinding.covers` is the ONLY structured place the
+  // second variable of a pair-rule exists, and `validateConfig()` used to drop
+  // it when building the `ConfigProblem`. These cases go through the REAL
+  // validator (no hand-built problem) so that re-dropping the field turns them
+  // red.
+  describe('covers survives the trip from CrossFieldFinding to ConfigProblem', () => {
+    it('a rule about a PAIR of keys names BOTH, not just the one in `variable`', () => {
+      const result = validateConfig({
+        env: envFor('production', { BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined }),
+        profile: 'production',
+        allowSyntheticFixtures: true,
+      });
+      const problem = result.errors.find((p) => p.rule === 'backup/encryption-key');
+      expect(problem, formatHuman(result)).toBeDefined();
+      // The historical shape: the rule files itself under the keyring.
+      expect(problem!.variable).toBe('BACKUP_ENCRYPTION_KEYRING');
+      // The key that used to vanish entirely from the structured payload —
+      // the operator would fix the keyring and hit the same wall again.
+      expect(problem!.covers).toEqual([
+        'BACKUP_ENCRYPTION_KEYRING',
+        'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
+      ]);
+      expect(problem!.covers).toContain('BACKUP_ENCRYPTION_ACTIVE_KEY_ID');
+    });
+
+    it('a boot rule with the legacy `<root>` path still names its variable', () => {
+      const result = validateConfig({
+        env: envFor('production', { ANTHROPIC_API_KEY: undefined }),
+        profile: 'production',
+        allowSyntheticFixtures: true,
+      });
+      const problem = result.errors.find((p) => p.rule === 'llm/provider-key');
+      expect(problem, formatHuman(result)).toBeDefined();
+      // `variable: null` is preserved on purpose (the pre-contract loader
+      // reported these under the Zod `<root>` path), so WITHOUT `covers` this
+      // problem names no variable at all.
+      expect(problem!.variable).toBeNull();
+      expect(problem!.covers).toEqual(['ANTHROPIC_API_KEY']);
+    });
+
+    it('a problem that is about exactly one variable does not grow the field', () => {
+      const result = validateConfig({ env: {}, profile: 'production' });
+      const problem = result.errors.find(
+        (p) => p.rule === 'profile/required' && p.variable === 'DATABASE_URL',
+      );
+      expect(problem).toBeDefined();
+      // Absent, not `[]`: the serialized shape of every non-cross-field
+      // problem (and therefore of `--json`) is unchanged.
+      expect(problem!.covers).toBeUndefined();
+      expect(Object.keys(problem!)).not.toContain('covers');
+    });
+
+    it('the field survives the redaction gate and reaches --json', () => {
+      const result = validateConfig({
+        env: envFor('production', { BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined }),
+        profile: 'production',
+        allowSyntheticFixtures: true,
+      });
+      const parsed = JSON.parse(formatJson(result)) as {
+        errors: { rule: string; covers?: string[] }[];
+      };
+      const problem = parsed.errors.find((p) => p.rule === 'backup/encryption-key');
+      expect(problem?.covers).toContain('BACKUP_ENCRYPTION_ACTIVE_KEY_ID');
+    });
+  });
+
   it('FEATURE_MCP_TOOLS cannot be enabled in production', () => {
     const result = validateConfig({
       env: envFor('production', { FEATURE_MCP_TOOLS: 'true' }),

@@ -43,6 +43,7 @@ import {
   readOnlyRedis,
 } from '@/ops/doctor/redis.js';
 import { DOCTOR_CATEGORIES, DOCTOR_CHECKS, checksForCategories } from '@/ops/doctor/registry.js';
+import { buildFixture } from '@/config/generate.js';
 import type { DoctorContext, DoctorRedis } from '@/ops/doctor/types.js';
 
 const ROOT = process.cwd();
@@ -211,6 +212,39 @@ describe('maia doctor · config.contract', () => {
     const env = { DATABASE_URL: 'postgres://u:canario-canario@h:5432/d' };
     const result = await configContractCheck.run(ctx({ env }), never);
     expect(JSON.stringify(result)).not.toContain('canario-canario');
+  });
+
+  // Issue #602 — the listing used to name variables by `problem.variable` and
+  // lean on the MESSAGE to mention the rest. It now reads `problem.covers`.
+  // These assert the RENDERED PREFIX (the names before `[rule]`), which is the
+  // only part that distinguishes the structured read from the old workaround:
+  // both messages happen to name every key, so a substring check on the whole
+  // line would stay green with the field dropped.
+  it('names BOTH keys of a pair-rule, from the structured field', async () => {
+    const env = {
+      ...buildFixture('production'),
+      BACKUP_ENCRYPTION_ACTIVE_KEY_ID: undefined,
+    } as Record<string, string | undefined>;
+    const result = await configContractCheck.run(ctx({ env }), never);
+    expect(result.status).toBe('fail');
+    const first = String(result.evidence?.problems).split(' | ')[0];
+    // Without `covers` this reads `BACKUP_ENCRYPTION_KEYRING [backup/...`,
+    // and the operator fixes the keyring only to hit the same wall again.
+    expect(first).toMatch(
+      /^BACKUP_ENCRYPTION_KEYRING, BACKUP_ENCRYPTION_ACTIVE_KEY_ID \[backup\/encryption-key\] /,
+    );
+  });
+
+  it("names the variable of a rule that kept the legacy '<config>' path", async () => {
+    const env = {
+      ...buildFixture('production'),
+      ANTHROPIC_API_KEY: undefined,
+    } as Record<string, string | undefined>;
+    const result = await configContractCheck.run(ctx({ env }), never);
+    const first = String(result.evidence?.problems).split(' | ')[0];
+    // `llm/provider-key` carries `variable: null`, so without `covers` this
+    // line named NO variable at all: `<config> [llm/provider-key] …`.
+    expect(first).toMatch(/^ANTHROPIC_API_KEY \[llm\/provider-key\] /);
   });
 });
 

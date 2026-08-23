@@ -57,6 +57,19 @@ npm run config:check -- --profile production --env-file .env
 Saída `OK` ⇒ o boot vai passar. Qualquer erro ⇒ corrija antes, com a remediação
 que o próprio comando imprime. Para automação, `--json`.
 
+> **`covers` (issue #602).** Cada problema traz `variable` — **um** nome. As
+> regras cross-field que valem por um PAR de chaves só conseguem arquivar-se sob
+> uma delas (`backup/encryption-key` fica sob `BACKUP_ENCRYPTION_KEYRING`, e
+> `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` não aparecia em campo nenhum), e as regras de
+> boot que preservam o caminho histórico `<root>` do Zod carregam
+> `variable: null` nomeando uma variável real (`llm/provider-key` →
+> `ANTHROPIC_API_KEY`). Para esses casos o problema agora traz também
+> `covers: [...]`, com **todas** as variáveis envolvidas. É **aditivo**: o campo
+> é omitido quando o problema é sobre exatamente a variável em `variable`, então
+> a forma serializada dos demais não mudou. Quem lista variáveis deve ler
+> `covers ?? [variable]` — não procurar nomes dentro da `message`. Vale para o
+> `--json` do `config check` e do `config preflight`.
+
 **Ações mais prováveis:**
 
 1. **Adicione `MAIA_ENV`.** Staging e produção passam a exigir o profile
