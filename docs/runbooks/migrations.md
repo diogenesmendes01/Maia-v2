@@ -272,6 +272,57 @@ Rodar o `_down` da 115 também sai desse estado (ele derruba o nome
 temporário junto), mas isso é reverter, não reparar — e ele **recusa** se
 já houver turno com `outcome = 'pending_race_lost'`.
 
+### Dirty on `116_mensagens_tipo_evento.sql` (troca de CHECK em fases)
+
+Mesmo desenho da 115, em `mensagens` — a tabela de entrada/saída, onde
+segurar ACCESS EXCLUSIVE pela varredura bloqueia inbound e outbound do
+produto inteiro. Cinco statements, quatro estados intermediários:
+
+```sql
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'mensagens'::regclass AND conname LIKE '%tipo_check%';
+```
+
+| O que você vê | Onde a 116 parou | O que fazer |
+|---|---|---|
+| só `mensagens_tipo_check`, `convalidated = t`, sem `evento` na definição | antes da fase 1 | `repair --as pending` e reaplicar |
+| `…_tipo_check` + `…_tipo_check_v116` com `convalidated = f` | depois da fase 1 | `repair --as pending` e reaplicar |
+| `…_tipo_check` + `…_tipo_check_v116`, ambas `convalidated = t` | depois da fase 2 | `repair --as pending` e reaplicar |
+| **só** `…_tipo_check_v116`, `convalidated = t` | entre os dois statements da fase 3 | **não reaplique o arquivo** — ver abaixo |
+
+Nos três primeiros a canônica ainda está de pé e reaplicar o arquivo é
+seguro. No quarto ela já caiu, e reaplicar deixaria `mensagens` sem
+NENHUMA constraint de `tipo` entre dois statements. Ali a remediação é um
+statement só, e então marcar como aplicada:
+
+```sql
+ALTER TABLE mensagens
+  RENAME CONSTRAINT mensagens_tipo_check_v116 TO mensagens_tipo_check;
+```
+
+```bash
+tsx scripts/migrate.ts repair --id 116_mensagens_tipo_evento.sql --as applied \
+  --reason "crash entre os dois statements da fase 3; rename manual conferido"
+```
+
+O `_down` da 116 também sai desse estado (derruba o nome temporário
+junto), mas isso é reverter, não reparar. Ele apaga **só** o formato
+completo que `flushUnconfirmedToolSummaries()` produz (`direcao='out'`,
+`conteudo=''`, `midia_url IS NULL`, `metadata.event_only=true`,
+`metadata.in_reply_to` presente, `metadata.flush_reason` no vocabulário de
+`ReActExitReason`, `ferramentas_chamadas` não vazio) e **recusa**, com o
+`ADD CONSTRAINT` abortando em 23514, se sobrar qualquer outra row
+`tipo='evento'` — a recusa é atômica (`BEGIN`/`COMMIT`), então nem as rows
+nem a constraint se movem. Para ver o que sobrou antes de decidir:
+
+```sql
+SELECT id, direcao, conteudo IS NULL AS conteudo_null,
+       metadata->>'event_only'   AS event_only,
+       metadata->>'flush_reason' AS flush_reason,
+       jsonb_array_length(ferramentas_chamadas) AS n_tools
+  FROM mensagens WHERE tipo = 'evento';
+```
+
 ### When `repair --as applied` refuses
 
 `--as applied` records the **packaged** checksum for the id. If this build
