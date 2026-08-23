@@ -838,7 +838,22 @@ jobs:
         # /api/auth/*. Medido: a spec de boot reprova com três respostas 500.
         env:
           NODE_ENV: production
-          MAIA_ENV: staging
+          # `development`, e NÃO `staging` como no passo de build. A diferença
+          # é que AQUI o console SOBE de verdade: o hook `instrumentation.ts`
+          # (issue #596, PR #608) roda `assertAdminBootConfig()` antes do
+          # primeiro request, e no profile `staging` o contrato exige as quatro
+          # `OIDC_*` e `NEXTAUTH_URL` em https. Um harness em `http://localhost`
+          # sem provedor de identidade NÃO É staging, e fingir que é só faria o
+          # gate reprovar por uma mentira sobre o ambiente. No profile
+          # `development` o subset `admin-ui` exige apenas `DATABASE_URL`, e
+          # `oidcProviderEnabled()` devolve `false` sem lançar quando não há
+          # issuer — que é o estado esperado de uma instalação sem OIDC.
+          #
+          # O gate da #608 continua sendo medido, e por quem deve:
+          # `tests/admin-ui/unit/admin-boot-config.spec.ts` prova que as quatro
+          # `OIDC_*` ausentes REPROVAM o boot em staging/production, e
+          # `npm run config:preflight` mede os arquivos do bring-up real.
+          MAIA_ENV: development
           NEXT_TELEMETRY_DISABLED: '1'
           NEXTAUTH_SECRET: e2e-only-secret-min-32-chars-not-shipped-12345
           NEXTAUTH_URL: http://localhost:4000
