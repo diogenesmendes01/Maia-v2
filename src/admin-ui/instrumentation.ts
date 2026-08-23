@@ -36,9 +36,17 @@
  * não é otimização: sem ele o bundle edge falharia a compilar.
  */
 export async function register(): Promise<void> {
-  if (process.env.NEXT_RUNTIME !== 'nodejs') return;
-  // Dinâmico de propósito: mantém o grafo de imports do bundle edge livre do
-  // contrato, que é código de Node.
-  const { assertAdminBootConfig } = await import('./lib/boot-config.js');
-  assertAdminBootConfig();
+  // A FORMA desta condição importa, e é a documentada pelo Next: o `import()`
+  // tem de estar DENTRO de um `if (process.env.NEXT_RUNTIME === 'nodejs')`.
+  // `NEXT_RUNTIME` é uma constante de DefinePlugin, então no bundle EDGE a
+  // condição dobra para `false` e o webpack elimina o ramo inteiro. Escrita
+  // como guard invertido (`!== 'nodejs'` → `return`), a eliminação não
+  // acontece: o webpack segue o `import()` e tenta empacotar o contrato para o
+  // edge, que não sabe ler `node:path`/`node:os` — `next build` falha com
+  // `UnhandledSchemeError`. (Há bundle edge aqui porque `middleware.ts`
+  // existe.)
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    const { assertAdminBootConfig } = await import('./lib/boot-config.js');
+    assertAdminBootConfig();
+  }
 }

@@ -204,6 +204,32 @@ describe('o hook está onde o Next.js o procura', () => {
     const nextConfig = readFileSync(resolve(root, 'next.config.mjs'), 'utf8');
     expect(nextConfig).toMatch(/pageExtensions:\s*\[[^\]]*'ts'/);
   });
+
+  it('o `import()` do contrato está DENTRO de um `NEXT_RUNTIME === \'nodejs\'` positivo', async () => {
+    // Lock textual, e a razão de ele existir é que a falha que ele previne só
+    // aparece em `next build` — que não roda nesta suíte.
+    //
+    // `middleware.ts` faz o Next compilar TAMBÉM um `edge-instrumentation.js`.
+    // `NEXT_RUNTIME` é constante de DefinePlugin: na forma positiva
+    // (`=== 'nodejs'`) a condição dobra para `false` no bundle edge e o webpack
+    // elimina o ramo com o `import()` junto. Escrita como guard invertido
+    // (`!== 'nodejs'` → `return`), a eliminação NÃO acontece — o webpack segue o
+    // `import()`, tenta empacotar `@/config/*` para o edge e o build morre com
+    // `UnhandledSchemeError: Reading from "node:path"`.
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const src = readFileSync(
+      resolve(__dirname, '../../../src/admin-ui/instrumentation.ts'),
+      'utf8',
+    ).replace(/\/\*[\s\S]*?\*\//g, '');
+    const bloco = /if\s*\(\s*process\.env\.NEXT_RUNTIME\s*===\s*'nodejs'\s*\)\s*\{([\s\S]*?)\n  \}/.exec(src);
+    expect(bloco, 'o guard positivo de NEXT_RUNTIME sumiu de instrumentation.ts').not.toBeNull();
+    expect(bloco![1]).toContain("await import('./lib/boot-config.js')");
+    expect(bloco![1]).toContain('assertAdminBootConfig()');
+    // E nenhum import ESTÁTICO do contrato no arquivo — ele iria para os dois
+    // bundles, e o edge não sabe ler `node:`.
+    expect(src).not.toMatch(/^\s*import\s.*from\s*'[^']*(config|boot-config)[^']*'/m);
+  });
 });
 
 describe('o .env.admin.prod.example REAL sobe o console (#596)', () => {
