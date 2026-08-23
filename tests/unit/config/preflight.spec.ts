@@ -117,12 +117,14 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
     ).toEqual([
       { compose: 'migrate', contracts: ['migrator'], envFiles: [], adminBootGates: false },
       { compose: 'app', contracts: ['runtime'], envFiles: ['.env.app'], adminBootGates: false },
-      // DOIS subsets: o boot do console importa `@/config/env.js` e valida
-      // `runtime`, e o subset `admin-ui` só é avaliado aqui. Um só deles é o
-      // falso verde do achado [Alta] nº 1 da review de PR #595.
+      // UM subset, e é o do próprio serviço — issue #596. Entre a #572 e a
+      // #596 esta lista era `['runtime', 'admin-ui']`, porque o console
+      // importava `@/config/env.js` e validava `runtime` no boot. Hoje não
+      // importa mais (`tests/unit/config/admin-import-boundary.spec.ts`), e o
+      // boot do console valida `admin-ui` em `src/admin-ui/instrumentation.ts`.
       {
         compose: 'admin-ui',
-        contracts: ['runtime', 'admin-ui'],
+        contracts: ['admin-ui'],
         envFiles: ['.env.admin'],
         adminBootGates: true,
       },
@@ -213,15 +215,25 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
    * `__SET_ME__`, não vazio), que vivem SÓ no subset `runtime` — fora do
    * subset `admin-ui` — e que o contrato EXIGE no profile production.
    *
-   * São exatamente as que, removidas do `.env.admin`, passavam despercebidas:
-   * o preflight validava `admin-ui` e nem olhava para elas; o boot valida
-   * `runtime` e morre. A lista é DERIVADA do contrato de propósito: escrita à
-   * mão, ela envelheceria em silêncio.
+   * ESTE CONJUNTO TEM QUE SER VAZIO, e o sinal dele inverteu na issue #596.
+   *
+   * Entre a #572 e a #596 ele era NÃO-VAZIO de propósito: o container do
+   * console importava `src/config/env.ts`, validava o subset `runtime` no boot
+   * e portanto EXIGIA as seis `BACKUP_*`, uma chave de LLM e o número do
+   * WhatsApp. O canário daquela época media o outro lado da mesma verdade —
+   * "tirar qualquer uma delas do `.env.admin` acrescenta uma reprova ao
+   * preflight" — e existia porque o preflight era o único gate.
+   *
+   * A #596 removeu a causa: nenhum import do console alcança
+   * `src/config/env.ts`, `COMPOSE_SERVICE_CONTRACT['admin-ui']` voltou a ser
+   * `['admin-ui']`, e o `.env.admin.prod.example` perdeu o bloco inteiro. O
+   * que sobrou para afirmar é o inverso, e é mais forte: o console não deve
+   * carregar NENHUM segredo cuja única razão de estar ali seja o subset do
+   * outro container.
    *
    * O filtro `requiredIn` não é cosmético: uma chave somente-runtime COM
    * default (`LLM_PROVIDER`, `ALERT_CHANNELS`) some do arquivo sem reprovar
-   * nada — e deve ser assim. O canário mede o que o container exige, não o
-   * que o arquivo escreve.
+   * nada. O canário mede o que o container exige, não o que o arquivo escreve.
    */
   function somenteRuntimeNoExemploDoAdmin(): string[] {
     const doAdmin = new Set(entriesForService('admin-ui').map((e) => e.name));
@@ -240,32 +252,36 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
       .sort();
   }
 
-  it('há chaves SOMENTE-runtime com valor real no .env.admin — senão o canário abaixo não mede nada', () => {
-    expect(somenteRuntimeNoExemploDoAdmin().length).toBeGreaterThan(0);
+  it('o .env.admin não declara NENHUMA chave que só o subset `runtime` exige (#596)', () => {
+    expect(
+      somenteRuntimeNoExemploDoAdmin(),
+      'O .env.admin voltou a carregar segredo que só o container `app` precisa. ' +
+        'Ou o console voltou a importar src/config/env.ts (ver ' +
+        'tests/unit/config/admin-import-boundary.spec.ts), ou a chave foi copiada para o ' +
+        'exemplo sem o contrato declarar `admin-ui` em `services` — e nos dois casos o ' +
+        'raio de explosão de um vazamento do .env.admin cresceu de graça.',
+    ).toEqual([]);
   });
 
-  it.each(somenteRuntimeNoExemploDoAdmin())(
-    'CANÁRIO: tirar %s (somente-runtime) do .env.admin REPROVA o preflight do admin-ui',
-    (chave) => {
-      // O delta, e não o valor absoluto: o exemplo CRU já reprova nos
-      // `__SET_ME__` que ele deixa ao operador. O que este caso afirma é que
-      // remover a linha ACRESCENTA uma reprova nomeada — o que só acontece
-      // porque o preflight agora roda o subset `runtime` no serviço `admin-ui`.
-      const antes = new Set(
-        errosDeContrato(servico(preflightSobreOsExemplos(), 'admin-ui')).map((e) => e.variable),
-      );
-      const depois = errosDeContrato(
-        servico(preflightSobreOsExemplos({}, { drop: [chave] }), 'admin-ui'),
-      ).map((e) => e.variable);
-      expect(antes.has(chave)).toBe(false);
-      expect(
-        depois,
-        `${chave} sumiu do .env.admin e o preflight do admin-ui continuou sem reprová-la. ` +
-          'O container do console valida o subset `runtime` no boot (ele importa @/config/env.js), ' +
-          'então este verde é o container caindo em produção.',
-      ).toContain(chave);
-    },
-  );
+  it('o conjunto medido acima NÃO é vazio por construção — há o que ele poderia pegar', () => {
+    // Sem isto, um bug no filtro (um `requiredIn` lido errado, um parse vazio)
+    // deixaria o caso acima verde por não medir nada. Aqui a MESMA derivação é
+    // aplicada ao `.env.app.prod.example`, onde as chaves somente-runtime são
+    // legítimas e abundantes.
+    const doAdmin = new Set(entriesForService('admin-ui').map((e) => e.name));
+    const exigidasEmProd = new Set(
+      entriesForService('runtime')
+        .filter((e) => e.requiredIn?.includes('production') === true)
+        .map((e) => e.name),
+    );
+    const noApp = Object.entries(parseEnvFile(readExampleFor('.env.app')))
+      .filter(
+        ([k, v]) =>
+          exigidasEmProd.has(k) && !doAdmin.has(k) && v !== '' && !v.includes('__SET_ME__'),
+      )
+      .map(([k]) => k);
+    expect(noApp.length).toBeGreaterThan(0);
+  });
 
   it('CANÁRIO: secrets que PASSAM no contrato e FALHAM no gate de boot reprovam o preflight', () => {
     // Comprimentos escolhidos na fresta exata entre os dois validadores:

@@ -27,38 +27,36 @@
  * ─────────────────────────────────────────────────────────────────────────
  * TODOS os validadores que o container roda — não "o loader nominal dele"
  * ─────────────────────────────────────────────────────────────────────────
- * O `admin-ui` era validado só contra o subset `admin-ui`. Isso descrevia o
- * loader que o container DEVERIA usar, não o que ele usa, e o próprio
- * cabeçalho anterior documentava a divergência sem modelá-la — o container do
- * console importa `src/config/env.ts` transitivamente
- * (`src/admin-ui/trpc/tool-enablement.ts` e
- * `src/admin-ui/trpc/routers/tools-catalog.ts` importam `@/config/env.js`
- * diretamente; `@/db/client.ts` também), e aquele singleton chama
+ * Cada serviço declara em `COMPOSE_SERVICE_CONTRACT` a LISTA de subsets que o
+ * PROCESSO daquele container avalia no boot, e o preflight roda todos — mais
+ * os gates de boot PRÓPRIOS do console (`src/config/admin-boot-gates.ts`):
+ * `NEXTAUTH_SECRET` >= 32 chars onde o contrato pede `min(8)`,
+ * `OIDC_CLIENT_SECRET` >= 16 chars onde o contrato só cobra presença, e recusa
+ * de placeholders. Sem eles, um `.env.admin` podia passar no contrato inteiro
+ * e LANÇAR no boot.
+ *
+ * A LISTA existe porque entre a #572 e a #596 o `admin-ui` avaliava DOIS
+ * subsets: ele importava `src/config/env.ts` (nos dois routers de tools e
+ * transitivamente por `@/db/client.ts`), e aquele singleton chama
  * `validateConfig({ service: 'runtime' })`. Tirar do `.env.admin` uma chave
  * EXCLUSIVA de `runtime` (`BACKUP_S3_BUCKET`, por exemplo) deixava este
- * preflight e os testes VERDES e derrubava o container no boot — o único modo
- * de falha que um gate de bring-up não pode ter (review de PR #595, [Alta] 1).
+ * preflight VERDE e derrubava o container no boot — o único modo de falha que
+ * um gate de bring-up não pode ter (review de PR #595, [Alta] 1).
  *
- * Agora cada serviço declara em `COMPOSE_SERVICE_CONTRACT` a LISTA de subsets
- * efetivamente avaliados (`admin-ui` → `runtime` + `admin-ui`) e o preflight
- * roda todos, mais os gates de boot PRÓPRIOS do console
- * (`src/config/admin-boot-gates.ts`): `NEXTAUTH_SECRET` >= 32 chars onde o
- * contrato pede `min(8)`, `OIDC_CLIENT_SECRET` >= 16 chars onde o contrato só
- * cobra presença, e recusa de placeholders. Sem eles, um `.env.admin` podia
- * passar no contrato inteiro e LANÇAR no boot.
+ * A #596 removeu a causa: os módulos compartilhados leem o contrato por
+ * `src/config/contract-env.ts`, nenhum import do console alcança
+ * `src/config/env.ts`, e o console valida o subset `admin-ui` no boot
+ * (`src/admin-ui/instrumentation.ts`). `COMPOSE_SERVICE_CONTRACT['admin-ui']`
+ * voltou a ser `['admin-ui']` — e a estrutura de lista fica, porque é ela que
+ * torna a pergunta "quais validadores este container roda?" respondível em vez
+ * de presumida.
  *
- * NA OUTRA DIREÇÃO, e é o motivo mais forte para este comando existir: para o
- * subset `admin-ui` do contrato, ISTO AQUI É A ÚNICA CHECAGEM QUE RODA. As
- * `OIDC_*` são `services: ['admin-ui']` e ficam fora do subset `runtime`, então
- * nem o `requiredIn` delas nem a regra `admin-ui/tenant-slugs-default-literal`
- * são avaliados no boot. `loadAdminConfig()` existe e ninguém o chama. Sem
- * preflight, um `.env.admin` com as quatro `OIDC_*` ausentes SOBE, e entrega a
- * tela "no providers configured".
- *
- * Isso continua sendo disciplina de runbook, e é honesto dizê-lo: fazer o BOOT
- * do console chamar `loadAdminConfig()` é a **issue #596**, e não está feito
- * aqui. Até lá, pular `npm run config:preflight` continua permitindo subir sem
- * o subset OIDC/fail-closed.
+ * ISTO AQUI NÃO É MAIS A ÚNICA CHECAGEM DO SUBSET `admin-ui`, e a diferença
+ * entre as duas é o motivo de as duas existirem: o preflight mede os ARQUIVOS
+ * (`env_file` + `environment:` interpolado) ANTES de existir container; o boot
+ * mede o ambiente que o processo REALMENTE recebeu. Um `docker compose up`
+ * feito sem rodar o preflight agora também reprova — no boot, com o container
+ * recusando-se a servir — em vez de subir e entregar "no providers configured".
  *
  * ─────────────────────────────────────────────────────────────────────────
  * HERMÉTICO, e explícito sobre isso

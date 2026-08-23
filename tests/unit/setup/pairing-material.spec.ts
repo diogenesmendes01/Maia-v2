@@ -20,6 +20,12 @@ vi.mock('../../../src/config/env.js', () => ({
     MAIA_STAGING_ACTIVE_KEY_ID: 'k1',
   },
 }));
+vi.mock('../../../src/config/contract-env.js', () => ({
+  contractEnv: {
+    MAIA_STAGING_KEYRING: JSON.stringify({ k1: Buffer.alloc(32, 7).toString('base64') }),
+    MAIA_STAGING_ACTIVE_KEY_ID: 'k1',
+  },
+}));
 
 import {
   sealPairingMaterial,

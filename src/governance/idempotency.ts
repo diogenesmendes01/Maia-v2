@@ -75,7 +75,10 @@
  * Proven by `tests/unit/governance/idempotency-cross-tenant.spec.ts`.
  */
 import { sha256, bucketMinutes, canonicalize, stripDiacritics } from '@/lib/utils.js';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 /**

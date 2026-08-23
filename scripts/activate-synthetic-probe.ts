@@ -26,6 +26,18 @@
  *   npm run probe:activate            # ativa
  *   npm run probe:activate -- --deactivate
  */
+// Boot fail-closed do subset `runtime`, EXPLÍCITO (issue #596).
+//
+// Este processo já validava o contrato inteiro no boot — mas por acidente: ele
+// alcançava `@/config/env.ts` de carona, por `@/lib/logger.js` ou
+// `@/db/client.ts`. A #596 tirou o singleton daqueles módulos (eles são
+// COMPARTILHADOS com o container do console, que não pode pagar o boot do
+// `runtime`), e sem esta linha o script passaria a descobrir configuração
+// inválida uma variável por vez, em runtime, em vez de reprovar de uma vez no
+// início. `tests/unit/config/admin-import-boundary.spec.ts` fixa a lista dos
+// processos que precisam dela.
+import '@/config/env.js';
+
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { audit } from '@/governance/audit.js';
 import { shutdownDb } from '@/db/client.js';

@@ -86,9 +86,7 @@ Maia config preflight — compose.prod.yml (interpolação: .env.infra)
 ── serviço app → loaders runtime · env_file: .env.app
   ...
 
-── serviço admin-ui → loaders runtime + admin-ui · env_file: .env.admin
-  · subset runtime
-    ...
+── serviço admin-ui → loaders admin-ui · env_file: .env.admin
   · subset admin-ui
     ...
   · gates de boot do admin-ui (src/admin-ui/lib/auth-gating.ts)
@@ -114,14 +112,18 @@ nunca deve ver. O preflight compõe as duas fontes na precedência do Compose
 TODOS os subsets que o processo daquele container avalia no boot** — o mesmo
 `validateConfig` do boot.
 
-“Todos”, e não “o loader nominal”, é o ponto: o container do `admin-ui` importa
-`src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts` e
-`src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), e aquele
-singleton chama `validateConfig({ service: 'runtime' })`. Ele é portanto
-validado contra **`runtime` + `admin-ui`**, mais os **gates de boot próprios do
-console**. Antes da review de PR #595 o preflight validava só o subset
-`admin-ui`: tirar do `.env.admin` uma chave somente-runtime deixava o comando
-verde e o container caía no boot.
+“Todos”, e não “o loader nominal”, é o ponto — e a lista do `admin-ui`
+encolheu de dois subsets para um na **issue #596**. Entre a #572 e a #596 o
+container do console importava `src/config/env.ts` (direto em
+`src/admin-ui/trpc/tool-enablement.ts` e
+`src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), aquele
+singleton chama `validateConfig({ service: 'runtime' })`, e o preflight tinha de
+validar **`runtime` + `admin-ui`** para não ficar verde num `.env.admin` que
+derrubava o container. A #596 removeu a causa: os módulos compartilhados entre
+os dois containers leem o contrato por
+[`src/config/contract-env.ts`](../../src/config/contract-env.ts), nenhum import
+do console alcança o singleton, e o `admin-ui` volta a ser validado contra
+**`admin-ui`** mais os **gates de boot próprios do console**.
 
 Ele lê o compose com o mesmo parser subset estrito das specs de #516
 (`src/config/compose-env.ts`) e a interpolação COMPLETA do
@@ -172,52 +174,64 @@ que o **contrato** está satisfeito. Fora do alcance dele:
 | **Qualquer coisa que o operador passe direto ao `docker compose` na linha de comando** (`-e`, `--env-file` extra). O preflight lê os arquivos, não a invocação. Variáveis do SHELL são a exceção: elas são detectadas e reprovam (ver acima). | — |
 | **Migrations, imagem e runtime.** O smoke do §0 é quem cobre isso. | `npm run smoke:migrate:image` |
 
-#### Por que o preflight é a ÚNICA checagem do subset `admin-ui`
+#### O boot do console valida o subset `admin-ui` (issue #596)
 
-Vale dizer isto em voz alta, porque muda o que "reprova no boot" significa para
+Vale dizer isto em voz alta, porque MUDOU o que "reprova no boot" significa para
 o container do console.
 
-O `admin-ui` importa `src/config/env.ts` — direto em
-[`src/admin-ui/trpc/tool-enablement.ts`](../../src/admin-ui/trpc/tool-enablement.ts)
-e [`src/admin-ui/trpc/routers/tools-catalog.ts`](../../src/admin-ui/trpc/routers/tools-catalog.ts),
-e transitivamente via `@/db/client.ts` — e esse singleton valida o contrato com
-**`service: 'runtime'`** ([`src/config/env.ts`](../../src/config/env.ts),
-`loadConfig()`). Isso corta dos DOIS lados:
+**Até a #596**, o `admin-ui` importava `src/config/env.ts` — direto em
+`src/admin-ui/trpc/tool-enablement.ts` e
+`src/admin-ui/trpc/routers/tools-catalog.ts`, e transitivamente via
+`@/db/client.ts` — e esse singleton valida o contrato com
+**`service: 'runtime'`**. Isso cortava dos DOIS lados:
 
-- as `OIDC_*` são `services: ['admin-ui']`, ou seja, estão FORA desse subset — o
-  `requiredIn` delas nunca é avaliado ali, e o `validateConfig` descarta
-  explicitamente achados cross-field sobre variáveis fora do escopo do serviço
-  pedido ([`src/config/validate.ts`](../../src/config/validate.ts));
-- e o subset `runtime` INTEIRO é cobrado do container do console, inclusive
-  chaves que ele nunca usa (`WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_*`,
-  `RUNTIME_TRACE_HMAC_MASTER_SECRET` e as seis `BACKUP_*`). É por isso que
-  `.env.admin.prod.example` as traz — ver o CAVEAT no topo daquele arquivo, e o
-  aviso de blast radius do bloco `BACKUP_*`.
+- as `OIDC_*` são `services: ['admin-ui']`, ou seja, estavam FORA daquele subset
+  — o `requiredIn` delas nunca era avaliado, e o `validateConfig` descarta
+  achados cross-field sobre variáveis fora do escopo do serviço pedido
+  ([`src/config/validate.ts`](../../src/config/validate.ts)). Com as quatro
+  ausentes, o console **subia** e entregava a tela "no providers configured";
+  o literal `default` em `OIDC_TENANT_SLUGS` passava pelo mesmo motivo;
+- e o subset `runtime` INTEIRO era cobrado do container do console, inclusive
+  chaves que ele nunca usa (`WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_*` e
+  as seis `BACKUP_*`, credencial de S3 incluída).
 
-`loadAdminConfig()`
-([`src/config/admin-config.ts`](../../src/config/admin-config.ts)) existe, mas
-**nenhum caminho de boot o chama**.
+**Desde a #596**, as duas pontas estão fechadas, e no CÓDIGO:
 
-Consequência prática, e ela é pior que "o container não sobe": com as quatro
-`OIDC_*` ausentes, o admin-ui **sobe**. `oidcProviderEnabled()` trata
-`OIDC_ISSUER` vazio como "este deploy não usa OIDC" e devolve `false` em
-silêncio — em produção, onde o provider de dev está desligado, isso registra
-ZERO providers e entrega a tela "no providers configured". E o literal
-`default` em `OIDC_TENANT_SLUGS` passa igual: a regra que o recusa
-(`admin-ui/tenant-slugs-default-literal`) vive no contrato, no subset
-`admin-ui`, que aquele boot não avalia.
+- [`src/admin-ui/instrumentation.ts`](../../src/admin-ui/instrumentation.ts) é o
+  hook que o Next.js aguarda em `BaseServer.prepare()` ANTES do primeiro
+  request. Ele chama `assertAdminBootConfig()`
+  ([`src/admin-ui/lib/boot-config.ts`](../../src/admin-ui/lib/boot-config.ts)),
+  que roda `loadAdminConfig()` (subset `admin-ui`: `requiredIn` das quatro
+  `OIDC_*` e a regra `admin-ui/tenant-slugs-default-literal`) mais os gates
+  próprios do console (`resolveSecret()` / `oidcProviderEnabled()`). `register()`
+  que lança = container que **não serve**. O `next build` não passa por aqui (o
+  Next pula o hook em `phase-production-build`), então a imagem continua
+  construível sem `.env.admin`.
+- os módulos COMPARTILHADOS pelos dois containers (`@/db/client.ts`,
+  `@/lib/logger.ts`, `@/lib/llm-settings.ts`, `@/governance/idempotency.ts`,
+  `@/control-plane/runtime-trace/lib/hmac.ts`, `@/gateway/staging-crypto.ts`,
+  `@/config/feature-flags.ts`) leem o contrato por
+  [`src/config/contract-env.ts`](../../src/config/contract-env.ts) — uma
+  variável por vez, no acesso — em vez de arrastar o boot do subset `runtime`.
+  `tests/unit/config/admin-import-boundary.spec.ts` reprova se algum caminho de
+  import do console voltar a alcançar `src/config/env.ts`, e fixa o conjunto de
+  entrypoints do runtime que continuam alcançando-o.
+- por consequência, `.env.admin.prod.example` **perdeu** o bloco `BACKUP_*` e o
+  bloco "exigidas transitivamente". A orientação anterior — usar credencial S3
+  separada e sem permissão, e keyring fictício mas válido, no `.env.admin` —
+  **não vale mais e não deve ser seguida**: aquelas variáveis simplesmente não
+  vão para o container do console.
+  `RUNTIME_TRACE_HMAC_MASTER_SECRET` ficou, e por motivo oposto: o console
+  **verifica** a integridade dos envelopes de trace, então a #596 declarou as
+  três `RUNTIME_TRACE_HMAC_*` como `services: ['runtime', 'admin-ui']`.
 
-`npm run config:preflight` é, hoje, o único lugar que roda o loader
-`admin-ui` sobre o ambiente efetivo do container `admin-ui` — e desde a review
-de PR #595 ele roda TAMBÉM o subset `runtime` e os gates de boot do console,
-porque é isso que o container faz.
-
-**O que continua dependendo de disciplina de runbook, dito sem eufemismo:**
-fechar a assimetria no CÓDIGO — fazer o boot do console chamar
-`loadAdminConfig()` — é a **issue #596**, e NÃO está feito. Enquanto ela não
-landar, pular `npm run config:preflight` ainda permite subir um `admin-ui` sem o
-subset OIDC/fail-closed avaliado. O preflight é o gate; ele só protege quem o
-roda.
+**Os dois gates coexistem, e medem coisas diferentes.** O preflight mede os
+ARQUIVOS (`env_file` + `environment:` interpolado) ANTES de existir container —
+é ele que dá o veredito na sua frente, com o `up` ainda por rodar. O boot mede o
+ambiente que o processo REALMENTE recebeu. Pular `npm run config:preflight` já
+não permite subir um console sem sign-in configurado: o container recusa-se a
+servir. O preflight continua sendo o jeito de descobrir isso ANTES do deploy, e
+não pelo container em CrashLoop.
 
 #### O gap que ele fechou
 
@@ -253,9 +267,9 @@ estavam abertas na issue, e a evidência de cada uma:
   `appUsersRepo.getByEmail(tenant, email)` e `tenantsRepo.findById(tenant)` em
   [`src/admin-ui/lib/auth-resolver.ts`](../../src/admin-ui/lib/auth-resolver.ts):
   ele **é** o `tenant_id`, num caminho dinâmico que `AGENTS.md` §4 (regras 2 e 8)
-  proíbe. A regra `admin-ui/tenant-slugs-default-literal` recusa — e o preflight
-  é o que faz essa regra rodar antes do deploy, porque o boot do admin-ui **não**
-  chama o validador do contrato (ver "O que o preflight NÃO cobre").
+  proíbe. A regra `admin-ui/tenant-slugs-default-literal` recusa — no preflight,
+  antes do deploy, e desde a issue #596 também no **boot** do console
+  (`src/admin-ui/instrumentation.ts`), que passou a avaliar o subset `admin-ui`.
 
 Preso por teste nos dois lados:
 [`tests/unit/config/preflight.spec.ts`](../../tests/unit/config/preflight.spec.ts)

@@ -1446,7 +1446,7 @@ export const ENV_CONTRACT = {
     description: 'Relatórios PDF (extrato/comparativo) enviados como documento.',
     group: 'feature-flags',
     secret: false,
-    services: ['runtime'],
+    services: ['runtime', 'admin-ui'],
     schema: boolFlag('false'),
     example: 'false',
     fixture: 'false',
@@ -1748,7 +1748,7 @@ export const ENV_CONTRACT = {
     description: 'Versão da chave HMAC em uso (rotação a cada 90d).',
     group: 'runtime-trace',
     secret: false,
-    services: ['runtime'],
+    services: ['runtime', 'admin-ui'],
     schema: posInt(1),
     example: '1',
     fixture: '1',
@@ -1761,7 +1761,7 @@ export const ENV_CONTRACT = {
       'Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis.',
     group: 'runtime-trace',
     secret: true,
-    services: ['runtime'],
+    services: ['runtime', 'admin-ui'],
     schema: z.string().optional(),
     example: '__SET_ME__openssl_rand_base64_48',
     fixture: 'fixture-runtime-trace-master-secret-0000',
@@ -1775,7 +1775,7 @@ export const ENV_CONTRACT = {
       'Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria.',
     group: 'runtime-trace',
     secret: true,
-    services: ['runtime'],
+    services: ['runtime', 'admin-ui'],
     schema: z.string().optional(),
     example: '__SET_ME__1=<segredo-anterior>',
     fixture: '1=fixture-runtime-trace-prev-secret-0000',
@@ -2744,6 +2744,20 @@ export function isSyntheticFixtureValue(name: string, value: string): boolean {
 export type KeysForService<S extends MaiaService> = {
   [K in ContractKey]: S extends (typeof ENV_CONTRACT)[K]['services'][number] ? K : never;
 }[ContractKey];
+
+/**
+ * TODA variável do contrato, já PARSEADA — a união dos subsets de serviço.
+ *
+ * É a forma de `contractEnv` (`src/config/contract-env.ts`), o acessor que os
+ * módulos COMPARTILHADOS entre containers usam. Um módulo que o runtime e o
+ * console carregam (`src/db/client.ts`, `src/lib/logger.ts`, ...) não pertence
+ * a um serviço só, então não há subset correto para tipá-lo: o tipo aqui é o
+ * contrato inteiro, e quem decide o que cada CONTAINER precisa continua sendo o
+ * loader do serviço (`loadServiceConfig`), no boot.
+ */
+export type ContractValues = {
+  readonly [K in ContractKey]: z.infer<(typeof ENV_CONTRACT)[K]['schema']>;
+};
 
 /** Zod raw shape for the subset of the contract a service may read. */
 export type ServiceShape<S extends MaiaService> = {

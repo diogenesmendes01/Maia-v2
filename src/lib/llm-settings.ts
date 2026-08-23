@@ -1,7 +1,10 @@
 import { sql } from 'drizzle-orm';
 import { globalSettingsRepo } from '@/db/repositories.js';
 import { db } from '@/db/client.js';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 import { logger } from '@/lib/logger.js';
 
 /**

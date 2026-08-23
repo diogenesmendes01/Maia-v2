@@ -1891,6 +1891,34 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_PDF_REPORTS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_KEY_VERSION",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+          "secret": true,
+          "required": true,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+          "secret": true,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
           "name": "ADMIN_UI_PORT",
           "secret": false,
           "required": false,
@@ -1999,6 +2027,8 @@
       ],
       "secrets": [
         "DATABASE_URL",
+        "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+        "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "NEXTAUTH_SECRET",
         "ADMIN_UI_DEV_LOGIN_TOKEN",
         "OIDC_CLIENT_SECRET"
@@ -2016,6 +2046,10 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "NEXTAUTH_SECRET",
@@ -2037,6 +2071,7 @@
           "required": [
             "MAIA_ENV",
             "DATABASE_URL",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "NEXTAUTH_SECRET",
             "OIDC_ISSUER",
             "OIDC_CLIENT_ID",
@@ -2050,6 +2085,9 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",
@@ -2066,6 +2104,7 @@
           "required": [
             "MAIA_ENV",
             "DATABASE_URL",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "NEXTAUTH_SECRET",
             "OIDC_ISSUER",
             "OIDC_CLIENT_ID",
@@ -2079,6 +2118,9 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",

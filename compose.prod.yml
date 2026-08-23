@@ -321,8 +321,11 @@ services:
       migrate:
         condition: service_completed_successfully
     user: "1001:1001"
-    # Apenas os segredos DO ADMIN (NextAuth/OIDC + o mínimo transitivo que
-    # src/config/env.ts exige) — o .env do app NÃO entra aqui.
+    # Apenas os segredos DO ADMIN (NextAuth/OIDC + o HMAC de verificação de
+    # trace) — o .env do app NÃO entra aqui. Desde a issue #596 não há mais
+    # "mínimo transitivo que src/config/env.ts exige": o console não importa
+    # aquele singleton, valida o subset `admin-ui` no boot
+    # (src/admin-ui/instrumentation.ts) e não recebe mais as seis BACKUP_*.
     env_file:
       - .env.admin
     environment:
@@ -332,8 +335,12 @@ services:
       # segunda fonte é uma fonte que pode divergir.
       MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
-      # env.ts (importado transitivamente via @/db/client.ts) valida
-      # REDIS_URL como URL mesmo que o admin-ui nunca abra conexão Redis.
+      # O console publica invalidação de cache (best-effort, engolida em caso
+      # de falha) por `@/lib/llm/cache-invalidation.js` e
+      # `@/agent/turn-context/cache.js`, ambos por import DINÂMICO — sem
+      # REDIS_URL essas publicações se perdem e o cache degrada para o TTL.
+      # Desde a issue #596 ela não é mais exigida no BOOT do console (o subset
+      # `admin-ui` não a declara); continua injetada porque o caminho existe.
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
       POSTGRES_USER: ${POSTGRES_USER:?}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}

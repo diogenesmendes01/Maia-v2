@@ -26,8 +26,12 @@
  *   only runtime-derived field, `enabled`, is computed here per request from
  *   the live config feature flags — see `isToolEnabled` below.
  *
- *   `@/config/env` is side-effect-free (zod validation only; no timers/Redis)
- *   and the admin-ui already imports it transitively via the DB client.
+ *   Issue #596: this router used to read `config` from `@/config/env`. That
+ *   singleton validates the `runtime` subset AT IMPORT, so the line made the
+ *   console's container demand the six `BACKUP_*` (S3 credentials included) in
+ *   a process that never runs a backup. `contractEnv` parses ONE variable with
+ *   the contract's own schema, on read; the console's boot validation lives in
+ *   `src/admin-ui/instrumentation.ts` (subset `admin-ui`, fail-closed).
  *
  * Different from `getToolSchemas()` (`_registry.ts`): that helper returns the
  * canonical JSON Schema the MODEL receives (issue #509, `schema-json.ts`) and is
@@ -36,7 +40,7 @@
  * which flag turns it on) plus a flat, human-readable input field list.
  */
 import { router, protectedProcedure } from '../server.js';
-import { config } from '@/config/env.js';
+import { contractEnv } from '@/config/contract-env.js';
 import { TOOL_CATALOG } from '../../generated/tool-catalog.js';
 
 /**
@@ -53,9 +57,12 @@ import { TOOL_CATALOG } from '../../generated/tool-catalog.js';
  * catalog carries `feature_flag: null` for them (→ enabled). `FEATURE_PDF_REPORTS`
  * (the PRODUCT-gated PDF tool) is the only flag NAME that still appears.
  */
-const FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
-  FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
-};
+function flagValue(name: string): boolean | undefined {
+  // Read at CALL time (per request), not at module load: `contractEnv` parses
+  // on access, and `enabled` is documented above as the one runtime-derived
+  // field of this response.
+  return name === 'FEATURE_PDF_REPORTS' ? contractEnv.FEATURE_PDF_REPORTS : undefined;
+}
 
 /**
  * Whether a catalog tool is currently enabled, given its gating flag name.
@@ -65,7 +72,7 @@ const FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
  */
 function isToolEnabled(feature_flag: string | null): boolean {
   if (feature_flag === null) return true;
-  return FLAG_TO_CONFIG[feature_flag] ?? false;
+  return flagValue(feature_flag) ?? false;
 }
 
 export const toolsCatalogRouter = router({
