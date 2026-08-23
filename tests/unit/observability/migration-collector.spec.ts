@@ -14,6 +14,7 @@ import {
   _resetMigrationCollectorForTests,
   migrationGaugeSnapshot,
   registerMigrationGauges,
+  HEAD_SERIES,
   type MigrationCollectorDeps,
 } from '../../../src/observability/migration-collector.js';
 import { renderPrometheus, _resetForTests as resetMetrics } from '../../../src/lib/metrics.js';
@@ -96,8 +97,6 @@ function deps(verdict: SchemaReadiness | Error): MigrationCollectorDeps {
   };
 }
 
-const HEAD = 'maia_schema_migration_head';
-
 beforeEach(() => {
   _resetMigrationCollectorForTests();
 });
@@ -105,8 +104,8 @@ beforeEach(() => {
 describe('head esperado vs. aplicado', () => {
   it('coincidem quando o banco está no head desta build', async () => {
     const g = await migrationGaugeSnapshot(deps(healthy()));
-    expect(g[`${HEAD}:expected`]).toBe(3);
-    expect(g[`${HEAD}:applied`]).toBe(3);
+    expect(g[HEAD_SERIES.expected]).toBe(3);
+    expect(g[HEAD_SERIES.applied]).toBe(3);
   });
 
   it('a distância entre eles é quantas migrations o banco está atrás', async () => {
@@ -122,14 +121,14 @@ describe('head esperado vs. aplicado', () => {
         }),
       ),
     );
-    expect(g[`${HEAD}:expected`]).toBe(3);
-    expect(g[`${HEAD}:applied`]).toBe(1);
+    expect(g[HEAD_SERIES.expected]).toBe(3);
+    expect(g[HEAD_SERIES.applied]).toBe(1);
     expect(g.maia_schema_migrations_pending).toBe(2);
   });
 
   it('banco virgem lê 0 aplicado — que é verdade, e por isso falha NÃO pode ler 0', async () => {
     const g = await migrationGaugeSnapshot(deps(healthy({ applied_head: null, pending_count: 3 })));
-    expect(g[`${HEAD}:applied`]).toBe(0);
+    expect(g[HEAD_SERIES.applied]).toBe(0);
   });
 
   it('é NaN quando o banco rodou uma migration que esta build não conhece', async () => {
@@ -137,7 +136,7 @@ describe('head esperado vs. aplicado', () => {
     // não há. O bloqueio de readiness já cobre o caso; a série não mente sobre
     // ele.
     const g = await migrationGaugeSnapshot(deps(healthy({ applied_head: '099_de_outra_build.sql' })));
-    expect(g[`${HEAD}:applied`]).toBeNaN();
+    expect(g[HEAD_SERIES.applied]).toBeNaN();
   });
 });
 
@@ -197,7 +196,7 @@ describe('fail-closed — 0 é uma leitura válida, então falha tem de ser NaN'
     const g = await migrationGaugeSnapshot(flaky);
     expect(g.maia_schema_migrations_pending).toBeNaN();
     expect(g.maia_schema_migrations_dirty).toBeNaN();
-    expect(g[`${HEAD}:applied`]).toBeNaN();
+    expect(g[HEAD_SERIES.applied]).toBeNaN();
   });
 
   it('o veredito `unknown` (nada legível) também é NaN, nunca 0', async () => {

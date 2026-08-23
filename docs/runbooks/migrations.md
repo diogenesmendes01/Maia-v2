@@ -117,6 +117,26 @@ A second migrator started concurrently **waits** for the first (30s by
 default) and then exits cleanly with `lock_unavailable` — it never
 applies anything unguarded.
 
+### Os quatro tetos, e onde mexer neles
+
+Todos vêm do contrato de configuração (#515) e só o serviço `migrator` os
+recebe. Os defaults são os valores que antes eram constantes de módulo, então
+não mexer em nada preserva o comportamento anterior.
+
+| Variável | Default | O que limita |
+|---|---:|---|
+| `MIGRATION_LOCK_WAIT_MS` | `30000` | Quanto um segundo migrator espera pelo advisory lock antes de sair com `lock_unavailable`. |
+| `MIGRATION_LOCK_POLL_MS` | `500` | Intervalo entre tentativas de `pg_try_advisory_lock` durante essa espera. |
+| `MIGRATION_LOCK_TIMEOUT_MS` | `10000` | `SET lock_timeout` da sessão que aplica cada migration. `0` desliga (fail-OPEN). |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | `0` (sem teto) | `SET statement_timeout` da mesma sessão. Uma migration específica sobe o próprio teto com `-- maia:statement-timeout=<ms>`. |
+
+Quando o `up` falha com erro de lock numa tabela quente, o teto que você quer
+é `MIGRATION_LOCK_TIMEOUT_MS` — e a resposta certa quase nunca é subi-lo:
+falhar em 10s é recuperável, segurar `ACCESS EXCLUSIVE` por minutos derruba
+toda query que encostar na tabela. `MIGRATION_STATEMENT_TIMEOUT_MS` continua
+sem teto por default de propósito: matar uma migration `-- maia:no-transaction`
+no meio **fabrica** o dirty state que este runbook existe para evitar.
+
 ### No deploy, quem roda isto é o Compose (issue #516)
 
 `docker-compose.yml` e `compose.prod.yml` têm um job one-shot `migrate`

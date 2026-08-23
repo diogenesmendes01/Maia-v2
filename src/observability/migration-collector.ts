@@ -38,7 +38,7 @@
  * nomes: DDL de schema não é trabalho de tenant, e o lock que a serializa é um
  * só para o database inteiro.
  */
-import { gauge } from './metrics.js';
+import { gauge, gaugeName } from './metrics.js';
 import { METRIC } from './taxonomy.js';
 import { logger } from '@/lib/logger.js';
 import type { SchemaReadiness } from '@/migrations/types.js';
@@ -165,6 +165,18 @@ async function refresh(deps: MigrationCollectorDeps): Promise<void> {
   return inFlight;
 }
 
+/**
+ * Nome das duas séries de head, EXATAMENTE como saem no `/metrics`.
+ *
+ * Exportado porque o snapshot abaixo é chaveado por ele: quem inspeciona sem
+ * registrar (teste, `maia doctor`) lê a mesma chave que apareceria na raspagem,
+ * em vez de uma convenção paralela que pode divergir da série de verdade.
+ */
+export const HEAD_SERIES = {
+  expected: gaugeName(METRIC.SCHEMA_MIGRATION_HEAD, { kind: 'expected' }),
+  applied: gaugeName(METRIC.SCHEMA_MIGRATION_HEAD, { kind: 'applied' }),
+} as const;
+
 /** Calcula as séries sem registrar nada (testes, inspeção). */
 export async function migrationGaugeSnapshot(
   deps: MigrationCollectorDeps,
@@ -172,8 +184,8 @@ export async function migrationGaugeSnapshot(
   await refresh(deps);
   const s = snapshot;
   return {
-    [`${METRIC.SCHEMA_MIGRATION_HEAD}:expected`]: s?.expected_head_ordinal ?? Number.NaN,
-    [`${METRIC.SCHEMA_MIGRATION_HEAD}:applied`]: s?.applied_head_ordinal ?? Number.NaN,
+    [HEAD_SERIES.expected]: s?.expected_head_ordinal ?? Number.NaN,
+    [HEAD_SERIES.applied]: s?.applied_head_ordinal ?? Number.NaN,
     [METRIC.SCHEMA_MIGRATIONS_PENDING]: s?.pending ?? Number.NaN,
     [METRIC.SCHEMA_MIGRATIONS_DIRTY]: s?.dirty ?? Number.NaN,
     [METRIC.SCHEMA_MIGRATION_LAST_DURATION_MS]: s?.last_duration_ms ?? Number.NaN,

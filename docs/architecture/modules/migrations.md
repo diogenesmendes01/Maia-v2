@@ -408,5 +408,5 @@ Still open on #516:
 
 | | |
 |---|---|
-| Last verified | 2026-08-14 |
-| Against `main` HEAD | `8de8da4f` |
+| Last verified | 2026-08-23 |
+| Against `main` HEAD | `a932dedd` |
