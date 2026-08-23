@@ -20,7 +20,11 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { runPreflight, type PreflightServiceReport } from '@/config/preflight.js';
-import { envFileNamesOf, parseComposeText } from '@/config/compose-env.js';
+import {
+  composeInterpolationRefs,
+  envFileNamesOf,
+  parseComposeText,
+} from '@/config/compose-env.js';
 import { parseEnvFile } from '@/config/env-file.js';
 import { entriesForService } from '@/config/contract.js';
 import {
@@ -356,6 +360,87 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
       shellEnv: { HOME: '/root' },
     });
     expect(report.shellDivergence).toEqual([]);
+  });
+
+  it('uma variável referenciada só DENTRO de um `env_file` também é divergência', () => {
+    // O buraco da rodada 1 (review de PR #595, [Média]): a checagem olhava só
+    // `composeInterpolationRefs(compose)`. O ambiente efetivo também interpola
+    // `${VAR}` dentro de cada `env_file`, e ali o mapa do projeto (`--env-file`
+    // + shell) VENCE as chaves do próprio arquivo — logo um `DOMAIN` que só
+    // aparece no `.env.admin` é igualmente sequestrável, e o preflight saía
+    // verde certificando outra `NEXTAUTH_URL` que a do `up`.
+    // A premissa do caso: `DOMAIN` não é referência do YAML. Ele APARECE em
+    // `compose.prod.yml`, mas dentro de um comentário sobre o roteamento —
+    // exatamente o que a varredura pela árvore parseada ignora.
+    expect(COMPOSE_TEXT).toMatch(/#[^\n]*\$\{DOMAIN\}/);
+    expect([
+      ...composeInterpolationRefs(parseComposeText(COMPOSE_TEXT, 'compose.prod.yml')),
+    ]).not.toContain('DOMAIN');
+    const report = runPreflight({
+      composeText: COMPOSE_TEXT,
+      composeLabel: 'compose.prod.yml',
+      infraText: `${INFRA_TEXT}DOMAIN=example.com\n`,
+      readEnvFile: (name) =>
+        name === '.env.admin'
+          ? `${readExampleFor(name)}\nNEXTAUTH_URL=https://\${DOMAIN}/admin\n`
+          : readExampleFor(name),
+      shellEnv: { DOMAIN: 'outro.example' },
+    });
+    expect(report.shellDivergence).toEqual([{ variable: 'DOMAIN', absentFromInfra: false }]);
+    expect(report.ok).toBe(false);
+    // Só o NOME. Nem o valor do shell nem o do arquivo entram no relatório.
+    const serializado = JSON.stringify(report.shellDivergence);
+    expect(serializado).not.toContain('outro.example');
+    expect(serializado).not.toContain('example.com');
+  });
+
+  it('uma variável citada só num COMENTÁRIO de um `env_file` não é divergência', () => {
+    // O mesmo alarme falso que a varredura da ÁRVORE evita no YAML, do lado do
+    // `env_file`: o `dotenv.parse` descarta comentários e o Compose não
+    // interpola nada ali. Os dois `.prod.example` do repositório citam
+    // `${MAIA_ENV:?...}` em comentário — se a varredura fosse textual, todo
+    // operador com essas variáveis exportadas levaria um vermelho eterno.
+    const report = runPreflight({
+      composeText: COMPOSE_TEXT,
+      composeLabel: 'compose.prod.yml',
+      infraText: INFRA_TEXT,
+      readEnvFile: (name) => `${readExampleFor(name)}\n# NOTA: use \${SO_EM_COMENTARIO} aqui\n`,
+      shellEnv: { SO_EM_COMENTARIO: 'qualquer' },
+    });
+    expect(report.shellDivergence).toEqual([]);
+  });
+
+  it('uma referência entre ASPAS SIMPLES num `env_file` não é divergência', () => {
+    // O Compose não interpola valor entre aspas simples (provado contra o
+    // `docker compose config` real em compose-config-differential.spec.ts), e
+    // o shell não tem como sequestrar o que ninguém expande.
+    const report = runPreflight({
+      composeText: COMPOSE_TEXT,
+      composeLabel: 'compose.prod.yml',
+      infraText: INFRA_TEXT,
+      readEnvFile: (name) => `${readExampleFor(name)}\nLITERAL='x \${SO_LITERAL} y'\n`,
+      shellEnv: { SO_LITERAL: 'qualquer' },
+    });
+    expect(report.shellDivergence).toEqual([]);
+  });
+
+  it('um `env_file` AUSENTE vira falha nomeada do serviço, não crash da divergência', () => {
+    // A varredura de referências lê os `env_file`. Se ela propagasse o erro de
+    // leitura, um `.env.app` faltando trocaria a mensagem que diz qual arquivo
+    // copiar por um stack trace do preflight.
+    const report = runPreflight({
+      composeText: COMPOSE_TEXT,
+      composeLabel: 'compose.prod.yml',
+      infraText: INFRA_TEXT,
+      readEnvFile: (name) => {
+        if (name === '.env.app') throw new Error(`env_file declarado no compose não existe: ${name}`);
+        return readExampleFor(name);
+      },
+      shellEnv: { MAIA_ENV: 'staging' },
+    });
+    expect(servico(report, 'app').failure).toMatch(/\.env\.app/);
+    // …e o que o YAML referencia continua sendo medido.
+    expect(report.shellDivergence).toEqual([{ variable: 'MAIA_ENV', absentFromInfra: false }]);
   });
 
   it('um shell com o MESMO valor do .env.infra não é divergência', () => {

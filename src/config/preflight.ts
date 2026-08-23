@@ -71,15 +71,24 @@
  * A saída não é "ler o shell": um preflight cujo veredito depende do shell de
  * quem o roda não é reproduzível, e o operador não teria como saber disso. A
  * saída é ser hermético E REPROVAR a divergência — `shellEnv` entra por
- * parâmetro, e toda variável referenciada pelo compose cujo valor no shell
+ * parâmetro, e toda variável referenciada por interpolação cujo valor no shell
  * DIFIRA do `.env.infra` vira falha nomeada, com a instrução de desexportá-la
  * ou de alinhar o arquivo. Nenhum valor aparece na mensagem, só o nome.
+ *
+ * REFERENCIADA inclui os `env_file`, não só o YAML: o Compose interpola
+ * `${VAR}` dentro deles e o ambiente do projeto vence as chaves do próprio
+ * arquivo, então um `DOMAIN` que só apareça no `.env.admin` é igualmente
+ * sequestrável. Contar só o YAML deixava esse caso verde — é o achado [Média]
+ * da rodada 2 do review de PR #595, e `detectShellDivergence` documenta a
+ * união.
  *
  * PUREZA: nada aqui toca disco, rede ou `process.env`. Quem lê arquivo e quem
  * captura o shell é `scripts/config.ts`.
  */
 import { adminBootGateProblems, type AdminBootGateProblem } from '@/config/admin-boot-gates.js';
 import {
+  composeEnvFileInterpolationRefs,
+  composeEnvFileNames,
   composeInterpolationRefs,
   effectiveServiceEnv,
   parseComposeText,
@@ -217,9 +226,27 @@ export function runPreflight(input: PreflightInput): PreflightReport {
 /**
  * As variáveis de interpolação que o shell sequestraria.
  *
- * Só as REFERENCIADAS pelo compose entram na conta — o shell tem centenas de
- * variáveis e nenhuma delas importa aqui. Valor igual ao do `.env.infra` não é
- * divergência: o `up` produziria o mesmo ambiente.
+ * Só as REFERENCIADAS entram na conta — o shell tem centenas de variáveis e
+ * nenhuma delas importa aqui. Valor igual ao do `.env.infra` não é divergência:
+ * o `up` produziria o mesmo ambiente.
+ *
+ * REFERENCIADAS ONDE: a UNIÃO do YAML com os `env_file`. A primeira versão
+ * olhava só `composeInterpolationRefs(compose)`, e isso reabria pelo outro lado
+ * o falso verde que ela fechava (review de PR #595, rodada 2). O ambiente
+ * efetivo também interpola `${VAR}` dentro de cada `env_file`, com o mapa do
+ * projeto (`--env-file` + shell) VENCENDO as chaves do próprio arquivo — ver
+ * `parseComposeEnvFile`. Um `.env.admin` com `NEXTAUTH_URL=https://${DOMAIN}` e
+ * um `DOMAIN` exportado diferente do `.env.infra` fazia o `up` materializar
+ * outra URL, e como `DOMAIN` não aparece no YAML nada era reportado.
+ *
+ * Os `env_file` são lidos SÓ para colher nomes: `composeEnvFileInterpolationRefs`
+ * não interpola e não devolve valor algum, e a mensagem continua sendo o nome
+ * da variável e mais nada — nem o valor do shell, nem o do `.env.infra`.
+ *
+ * Um `env_file` declarado e ausente é ignorado AQUI de propósito: ele já vira
+ * `failure` nomeada no relatório do serviço (e o `docker compose up` também
+ * aborta). Lançar neste ponto trocaria aquela falha nomeada por um crash do
+ * preflight inteiro, que é uma mensagem pior para o mesmo problema.
  */
 function detectShellDivergence(
   input: PreflightInput,
@@ -228,8 +255,18 @@ function detectShellDivergence(
 ): ShellDivergence[] {
   const shell = input.shellEnv;
   if (shell === undefined) return [];
+  const refs = composeInterpolationRefs(compose);
+  for (const name of composeEnvFileNames(compose)) {
+    let text: string;
+    try {
+      text = input.readEnvFile(name);
+    } catch {
+      continue;
+    }
+    composeEnvFileInterpolationRefs(text, refs);
+  }
   const out: ShellDivergence[] = [];
-  for (const name of [...composeInterpolationRefs(compose)].sort()) {
+  for (const name of [...refs].sort()) {
     const fromShell = shell[name];
     if (fromShell === undefined) continue;
     const fromInfra = infra[name];

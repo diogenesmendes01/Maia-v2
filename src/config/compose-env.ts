@@ -520,6 +520,42 @@ export function parseComposeEnvFile(
   return out;
 }
 
+/**
+ * Todo nome de variável que o Compose resolve por interpolação DENTRO de um
+ * `env_file` — a OUTRA metade do conjunto que o shell do operador pode
+ * sequestrar (review de PR #595, rodada 2, achado [Média]).
+ *
+ * `composeInterpolationRefs` anda pelo YAML e só pelo YAML. Mas o ambiente
+ * efetivo também interpola `${VAR}` dentro de cada `env_file`, e ali a
+ * precedência é a mesma: em `parseComposeEnvFile` o mapa do PROJETO (o
+ * `--env-file` mais o shell) vence as chaves do próprio arquivo. Um
+ * `.env.admin` com `NEXTAUTH_URL=https://${DOMAIN}` e um `DOMAIN` exportado
+ * diferente do `.env.infra` produzia um `up` com OUTRA URL — e como `DOMAIN`
+ * não aparece no YAML, a checagem de divergência não a via. Verde falso, mesma
+ * classe do achado que ela existia para fechar.
+ *
+ * VARRE OS VALORES PARSEADOS, não o texto cru, e por duas razões que são a
+ * mesma: o `dotenv.parse` já descartou comentários (`# ${MAIA_ENV:?…}` aparece
+ * literalmente nos dois `.prod.example` e NÃO é interpolado por ninguém), e
+ * `singleQuotedKeys` diz quais valores o Compose trata como literais. Varrer o
+ * texto cru daria o alarme falso permanente que `composeInterpolationRefs`
+ * já evita para o `$HOME` do comentário do `tmpfs`.
+ *
+ * Coleta NOMES. Nenhum valor é lido, guardado nem devolvido, e nada aqui
+ * interpola de fato — logo um `${VAR:?}` sem valor não lança por este caminho.
+ */
+export function composeEnvFileInterpolationRefs(
+  text: string,
+  into: Set<string> = new Set(),
+): Set<string> {
+  const literal = singleQuotedKeys(text);
+  for (const [key, value] of Object.entries(parseEnvFile(text))) {
+    if (literal.has(key)) continue;
+    interpolationRefs(value, into);
+  }
+  return into;
+}
+
 // ---------------------------------------------------------------------------
 // Serviço do Compose → serviço do contrato
 // ---------------------------------------------------------------------------
@@ -609,6 +645,29 @@ export function envFileNamesOf(
   return list.map((f) => asString(f, 'env_file[]'));
 }
 
+/**
+ * Todo `env_file` declarado no compose, sem repetição e na ordem em que
+ * aparecem — de TODOS os serviços, não só dos que o preflight valida.
+ *
+ * A escolha de escopo é deliberada e é a mesma de `composeInterpolationRefs`,
+ * que anda pelo documento INTEIRO: `shellDivergence` é um veredito sobre o
+ * PROJETO, não sobre um serviço. O que ele afirma é "o `docker compose up`
+ * neste terminal produziria outro ambiente que o certificado aqui", e o `up`
+ * sobe todos os serviços. Restringir aos alvos do preflight deixaria de fora
+ * justamente os serviços que rodam imagem de terceiro
+ * (`COMPOSE_SERVICES_WITHOUT_MAIA_CONFIG`): um `POSTGRES_PASSWORD` sequestrado
+ * no `env_file` do banco não reprova contrato nenhum e ainda assim faz o `app`
+ * falhar ao conectar — que é exatamente o bring-up quebrado que este gate
+ * existe para evitar.
+ */
+export function composeEnvFileNames(compose: Record<string, ComposeNode>): string[] {
+  const seen = new Set<string>();
+  for (const service of Object.keys(composeServices(compose))) {
+    for (const name of envFileNamesOf(compose, service)) seen.add(name);
+  }
+  return [...seen];
+}
+
 /** O bloco `environment:` de um serviço, interpolado com o ambiente do projeto. */
 export function environmentOf(
   compose: Record<string, ComposeNode>,
@@ -638,6 +697,11 @@ export function environmentOf(
  * comentário explicando um `tmpfs`, e uma varredura textual reportava o `HOME`
  * do shell como divergência em toda execução — um alarme falso permanente é um
  * alarme que o operador aprende a ignorar.
+ *
+ * É METADE do conjunto: o Compose também interpola dentro de cada `env_file`, e
+ * essas referências saem de `composeEnvFileInterpolationRefs`. `runPreflight`
+ * usa a UNIÃO das duas — sozinha, esta função deixava passar uma variável
+ * referenciada só no `env_file` (review de PR #595, rodada 2).
  */
 export function composeInterpolationRefs(node: ComposeNode): Set<string> {
   const out = new Set<string>();

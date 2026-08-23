@@ -247,12 +247,20 @@ describe('CANÁRIO de vazamento — a CLI, em stdout, stderr e --json', () => {
   // `tsx/cli` é o subpath EXPORTADO (o caminho físico `tsx/dist/cli.mjs` não é).
   const TSX = require_.resolve('tsx/cli');
 
-  function rodarPreflight(composeText: string, json: boolean) {
+  function rodarPreflight(
+    composeText: string,
+    json: boolean,
+    opts: {
+      readonly infra?: string;
+      readonly envApp?: string;
+      readonly shell?: Readonly<Record<string, string>>;
+    } = {},
+  ) {
     const dir = mkdtempSync(join(tmpdir(), 'maia-preflight-'));
     try {
       writeFileSync(join(dir, 'compose.yml'), composeText);
-      writeFileSync(join(dir, '.env.infra'), 'MAIA_ENV=production\n');
-      writeFileSync(join(dir, '.env.app'), 'ALERT_CHANNELS=log\n');
+      writeFileSync(join(dir, '.env.infra'), opts.infra ?? 'MAIA_ENV=production\n');
+      writeFileSync(join(dir, '.env.app'), opts.envApp ?? 'ALERT_CHANNELS=log\n');
       const args = [
         TSX,
         'scripts/config.ts',
@@ -266,7 +274,7 @@ describe('CANÁRIO de vazamento — a CLI, em stdout, stderr e --json', () => {
       const r = spawnSync(process.execPath, args, {
         cwd: REPO_ROOT,
         encoding: 'utf8',
-        env: { ...process.env, NO_COLOR: '1' },
+        env: { ...process.env, NO_COLOR: '1', ...opts.shell },
       });
       return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
     } finally {
@@ -308,4 +316,56 @@ describe('CANÁRIO de vazamento — a CLI, em stdout, stderr e --json', () => {
     expect(r.stdout).not.toContain(CANARIO);
     expect(r.stderr).not.toContain(CANARIO);
   }, 60_000);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Divergência de shell numa variável que só existe DENTRO do `env_file`
+  // ─────────────────────────────────────────────────────────────────────────
+  // A checagem passou a ler os `env_file` para colher NOMES de referência
+  // (review de PR #595, rodada 2). Ler arquivo é justamente o passo em que um
+  // valor pode escorregar para a mensagem — e o achado anterior desta mesma PR
+  // foi exatamente isso, do outro lado. Aqui os DOIS valores em jogo são
+  // canários: o do `.env.infra` e o que o shell tenta impor.
+
+  /** Valores montados, repetitivos e sem entropia — não são segredo. */
+  const CANARIO_ARQUIVO = ['canario', 'arquivo', 'a'.repeat(12)].join('-');
+  const CANARIO_SHELL = ['canario', 'shell', 's'.repeat(12)].join('-');
+
+  /** `CANARIO_HOST` é referenciado SÓ dentro do `.env.app`, nunca no YAML. */
+  const SO_NO_ENV_FILE = [
+    'services:',
+    '  app:',
+    '    image: busybox',
+    '    env_file:',
+    '      - .env.app',
+    '    environment:',
+    '      MAIA_ENV: ${MAIA_ENV:?obrigatória}',
+    '',
+  ].join('\n');
+
+  const INFRA_COM_CANARIO = `MAIA_ENV=production\nCANARIO_HOST=${CANARIO_ARQUIVO}\n`;
+  const ENV_APP_COM_CANARIO = 'ALERT_CHANNELS=log\nURL_DO_CANARIO=https://${CANARIO_HOST}/x\n';
+
+  it.each([
+    ['humana', false],
+    ['--json', true],
+  ])(
+    'saída %s: a divergência nomeia CANARIO_HOST e não vaza NENHUM dos dois valores',
+    (_nome, json) => {
+      expect(SO_NO_ENV_FILE).not.toContain('CANARIO_HOST'); // a premissa, escrita
+      const r = rodarPreflight(SO_NO_ENV_FILE, json, {
+        infra: INFRA_COM_CANARIO,
+        envApp: ENV_APP_COM_CANARIO,
+        shell: { CANARIO_HOST: CANARIO_SHELL },
+      });
+      expect(r.status).toBe(1);
+      // Não vacuidade: se a divergência não fosse detectada, as três negativas
+      // abaixo passariam sozinhas e o canário não mediria nada.
+      expect(r.stdout).toContain('CANARIO_HOST');
+      for (const saida of [r.stdout, r.stderr]) {
+        expect(saida).not.toContain(CANARIO_SHELL);
+        expect(saida).not.toContain(CANARIO_ARQUIVO);
+      }
+    },
+    60_000,
+  );
 });

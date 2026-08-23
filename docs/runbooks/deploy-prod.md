@@ -140,11 +140,20 @@ pelo parser dele — sem ela, os dois lados do teste poderiam errar juntos.
 **Execução HERMÉTICA, e o shell.** A interpolação sai do `.env.infra` e de mais
 nada. O `docker compose`, porém, dá **precedência ao ambiente exportado no
 shell** sobre o `--env-file`. Então o preflight compara: toda variável
-referenciada pelo compose que esteja exportada no seu shell **com valor
+**referenciada por interpolação** que esteja exportada no seu shell **com valor
 diferente** do `.env.infra` é reportada como divergência e **reprova** o
 comando, com o nome da variável (nunca o valor) e a instrução de `unset` ou de
 alinhar o arquivo. Sem isso, um `export MAIA_ENV=staging` esquecido faria o
 preflight certificar um ambiente e o `up` subir outro.
+
+"Referenciada" é a **união** do YAML com os `env_file`, e não só o YAML: o
+Compose interpola `${…}` dentro de um `env_file` e o ambiente do projeto
+(`--env-file` + shell) vence até as chaves definidas no próprio arquivo. Um
+`.env.admin` com `NEXTAUTH_URL=https://${DOMAIN}/admin` e um `DOMAIN` exportado
+diferente do `.env.infra` mudaria a URL que o `up` materializa sem que `DOMAIN`
+apareça em lugar nenhum do `compose.prod.yml`. Referência em **comentário** e
+valor entre **aspas simples** não contam — o Compose não interpola nem um nem
+outro, e um alarme falso permanente é um alarme que se aprende a ignorar.
 
 Argumentos: `--compose <arquivo>` (default `compose.prod.yml`), `--infra
 <arquivo>` (default `.env.infra`), `--profile <p>` para forçar um profile e

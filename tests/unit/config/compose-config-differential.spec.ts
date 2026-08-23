@@ -22,6 +22,8 @@
  * QUANDO NÃO HÁ `docker compose` NA MÁQUINA o arquivo é PULADO, com o motivo no
  * nome do `describe` — pulado não é passou, e o resumo da suíte conta os dois
  * separadamente. No CI a variável `TEST_REQUIRE_COMPOSE_DIFFERENTIAL=1` (job
+ * `validate` em `.github/workflows/ci.yml`) transforma a ausência em FALHA, para
+ * que o diferencial não deixe de rodar em silêncio justamente onde ele importa.
  *
  * O nome NÃO leva o prefixo `MAIA_` de propósito, e isso não é estilo: o
  * contrato reprova toda chave `MAIA_*`/`FEATURE_*` não declarada
@@ -30,16 +32,29 @@
  * `src/config/env.ts`. Com o prefixo, 498 testes morreram no CI com
  * `Invalid configuration: 1 problema(s)`, e nenhum deles tinha relação com o
  * diferencial. É a mesma armadilha que a issue #571 documenta no README.
- * (job
- * `validate` em `.github/workflows/ci.yml`) transforma a ausência em FALHA, para
- * que o diferencial não deixe de rodar em silêncio justamente onde ele importa.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * O que a rodada 2 do review acrescentou
+ * ─────────────────────────────────────────────────────────────────────────
+ * O caso de precedência do shell media um override de variável referenciada no
+ * YAML. A checagem de divergência do preflight tinha o mesmo recorte, e por
+ * isso não via um `${VAR}` que existisse SÓ dentro de um `env_file` — onde o
+ * Compose interpola do mesmo jeito e o ambiente do projeto vence. O caso do
+ * `DOMAIN` fecha isso medindo os dois lados: o Compose REAL confirma que o
+ * shell sequestra a interpolação dentro do `env_file`, e `runPreflight` reprova
+ * nomeando só a variável.
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { effectiveServiceEnv, parseComposeText } from '@/config/compose-env.js';
+import {
+  composeInterpolationRefs,
+  effectiveServiceEnv,
+  parseComposeText,
+} from '@/config/compose-env.js';
+import { runPreflight } from '@/config/preflight.js';
 
 function composeCliDisponivel(): boolean {
   const r = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8' });
@@ -106,6 +121,13 @@ const ENV_A = [
 ].join('\n');
 
 const ENV_B = ['DE_CIMA=do-b', 'DEPOIS=${PRIMEIRA}/y', ''].join('\n');
+
+/**
+ * O valor que o shell tentaria impor. MONTADO e repetitivo de propósito: um
+ * literal com cara de segredo faria o gitleaks reprovar o próprio teste (o
+ * corte é entropia de Shannon > 3.5; esta forma fica em 3.2).
+ */
+const SEQUESTRADO = ['sequestrado', 'sequestrado', 'sequestrado'].join('-');
 
 /**
  * `docker compose config` reescreve `$` como `$$` na SAÍDA (é a forma de
@@ -183,6 +205,50 @@ describe.skipIf(!DISPONIVEL)(
         // …e o nosso, hermético, continua no valor do arquivo. A diferença é
         // exatamente o que `runPreflight` reprova via `shellDivergence`.
         expect(nossoAmbiente().MAIA_ENV).toBe('production');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    it('o override do shell de uma variável que só existe no `env_file` REPROVA o preflight', () => {
+      // O caso que a rodada 1 deixou aberto (review de PR #595, [Média]).
+      // `DOMAIN` NÃO aparece no YAML — só dentro do `.env.a`. A checagem de
+      // divergência olhava apenas `composeInterpolationRefs(compose)`, então o
+      // preflight saía VERDE certificando `BRACED=example.com` enquanto o
+      // `docker compose up` materializava o valor do shell.
+      expect(COMPOSE).not.toContain('DOMAIN'); // a premissa do caso, escrita
+      expect([...composeInterpolationRefs(parseComposeText(COMPOSE, 'compose.yml'))]).not.toContain(
+        'DOMAIN',
+      );
+      expect(ENV_A).toContain('${DOMAIN}');
+
+      const dir = projeto();
+      try {
+        // 1. O COMPOSE REAL confirma a precedência dentro do `env_file`.
+        const comShell = ambienteDoCompose(dir, { DOMAIN: SEQUESTRADO });
+        expect(comShell.BRACED).toBe(SEQUESTRADO);
+        expect(comShell.PLAIN).toBe(SEQUESTRADO);
+        // …e o valor entre ASPAS SIMPLES continua literal mesmo assim: é por
+        // isso que a varredura de referências pula essas chaves.
+        expect(comShell.ASPAS_SIMPLES).toBe('literal ${DOMAIN} x');
+
+        // 2. O nosso lado, hermético, segue no valor do arquivo — a diferença
+        //    exata que o preflight tem de recusar.
+        expect(nossoAmbiente().BRACED).toBe('example.com');
+
+        // 3. E o preflight REPROVA, nomeando SÓ a variável.
+        const report = runPreflight({
+          composeText: COMPOSE,
+          composeLabel: 'compose.yml',
+          infraText: INFRA,
+          readEnvFile: (name) => (name === '.env.a' ? ENV_A : ENV_B),
+          shellEnv: { DOMAIN: SEQUESTRADO },
+        });
+        expect(report.shellDivergence).toEqual([{ variable: 'DOMAIN', absentFromInfra: false }]);
+        expect(report.ok).toBe(false);
+        const serializado = JSON.stringify(report.shellDivergence);
+        expect(serializado).not.toContain(SEQUESTRADO);
+        expect(serializado).not.toContain('example.com');
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
