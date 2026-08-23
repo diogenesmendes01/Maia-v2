@@ -36,6 +36,7 @@
  * contract only asks for presence. A green contract is not a promise that the
  * console boots.
  */
+import type { ConfigProblem } from '@/config/metadata.js';
 import { validateConfig } from '@/config/validate.js';
 import { notApplicable, pass, type DoctorCheck, type DoctorContext, type DoctorResult } from '../types.js';
 
@@ -80,20 +81,22 @@ const MAX_LISTED_PROBLEMS = 12;
 /**
  * Render one problem for the report.
  *
- * Uses the problem's MESSAGE, not just `problem.variable`, and that is
- * deliberate. Some cross-field rules are about a PAIR of variables and report
- * only one of them in `variable` (`backup/encryption-key` files itself under
- * `BACKUP_ENCRYPTION_KEYRING`, and `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` appears
- * nowhere in the structured field). Listing by variable alone would silently
- * omit the second key and leave the operator fixing one half in a loop. The
- * message names both.
+ * The variables come from the STRUCTURED fields — `problem.covers` when the
+ * rule knows it is about more than one key, `problem.variable` otherwise
+ * (issue #602). `covers` is what makes `BACKUP_ENCRYPTION_ACTIVE_KEY_ID`
+ * appear at all: `backup/encryption-key` files itself under
+ * `BACKUP_ENCRYPTION_KEYRING`, and the boot-scope rules that keep the
+ * historical `<root>` path carry `variable: null` while naming a real variable.
+ * Listing by `variable` alone omits the second key and leaves the operator
+ * fixing one half in a loop.
+ *
+ * The message is still printed — it is the explanation — but it is no longer
+ * load-bearing for WHICH variables the operator must touch, so rewording a
+ * rule's message cannot silently truncate this list.
  */
-function describeProblem(p: {
-  readonly variable: string | null;
-  readonly rule: string;
-  readonly message: string;
-}): string {
-  return `${p.variable ?? '<config>'} [${p.rule}] ${p.message}`;
+function describeProblem(p: ConfigProblem): string {
+  const named = p.covers ?? (p.variable === null ? [] : [p.variable]);
+  return `${named.length > 0 ? named.join(', ') : '<config>'} [${p.rule}] ${p.message}`;
 }
 
 export const configContractCheck: DoctorCheck = {
