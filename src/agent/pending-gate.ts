@@ -6,6 +6,10 @@ import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { resolveAndDispatch } from './pending-resolver.js';
+import {
+  getTurnExecutionContext,
+  turnOwnershipLost,
+} from '@/runtime/turns/execution-context.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 export type GateResult =
@@ -35,6 +39,25 @@ export type GateResult =
    *                      e ela já tinha sumido.
    */
   | { kind: 'race_lost'; stage: 'resolution' | 'cancellation' }
+  /**
+   * TERMINAL, e por um motivo diferente de todos os outros: a TENTATIVA perdeu
+   * a posse do turno (lease vencida / takeover) enquanto o gate rodava.
+   *
+   * Issue #507, achado 1 da revisão do dono. Até aqui este caminho colapsava em
+   * `{ kind: 'unresolved', reason: 'low_confidence' }` — deliberadamente, sob o
+   * argumento de que "o guard do topo do ReAct lança logo em seguida". O
+   * argumento estava errado no ponto que importa: entre `checkPendingFirst`
+   * (`core.ts:879`) e `runReActLoop` (`core.ts:1586`) há ~700 linhas de
+   * pipeline que o guard do ReAct não alcança — `captureInboundForOutreach`,
+   * o grafo pre-turn com suas gravações de decisão/execução, e o Decision
+   * Engine, que pode inclusive RESPONDER ao usuário num bloqueio.
+   *
+   * `cancelled` não é um desfecho de pendência: é a constatação de que este
+   * turno não é mais nosso. O core reage encerrando a tentativa (sem concluir,
+   * sem retry, sem `processada_em`) — quem tem a lease vigente decide o
+   * desfecho.
+   */
+  | { kind: 'cancelled' }
   | { kind: 'unresolved'; reason: 'low_confidence' | 'topic_change' | 'cancelled' };
 
 const CONFIDENCE_THRESHOLD = 0.7;
@@ -75,8 +98,17 @@ async function haikuClassifier(
     `Opções: ${opts.map((o) => `${o.key} (${o.label})`).join(', ')}\n` +
     `Resposta do usuário: ${inbound.conteudo ?? ''}`;
   const gateResult = await runCognitiveModule(
-    { name: 'pending-gate', triggered_by: 'sync_conditional', timeoutMs: 5000 },
-    () =>
+    {
+      name: 'pending-gate',
+      triggered_by: 'sync_conditional',
+      timeoutMs: 5000,
+      // Issue #507 — segundo call site de LLM DENTRO do turno reivindicado
+      // (`core.ts:837`, dentro do escopo aberto em `core.ts:578`). Mesmo
+      // defeito do reasoner, em escala menor: perdida a lease durante estes 5s,
+      // a chamada seguia paga até o fim e a row de auditoria dizia `success`.
+      signal: getTurnExecutionContext()?.signal,
+    },
+    (signal) =>
       callLLM({
         workload: 'pending_gate',
         system,
@@ -84,6 +116,7 @@ async function haikuClassifier(
         max_tokens: 200,
         temperature: 0,
         pessoa_id: ctx?.pessoa_id,
+        signal,
       }),
   );
   const res = gateResult.output;
@@ -91,6 +124,16 @@ async function haikuClassifier(
     // Timeout/erro do classificador — fallback de segurança: trata como
     // não-resolvido. Caller (checkPendingFirst) converte null em
     // { kind: 'unresolved', reason: 'low_confidence' }.
+    //
+    // Issue #507 — um `status: 'cancelled'` (perda de posse) também chega aqui
+    // como `null`, e isso continua correto: o CLASSIFICADOR não tem o que
+    // dizer sobre a pendência. Quem distingue cancelamento de falha é
+    // `checkPendingFirst`, logo após o await, olhando a posse do turno — e o
+    // desfecho é `{ kind: 'cancelled' }`, não `unresolved`.
+    //
+    // (A revisão do dono derrubou o argumento anterior, que mandava o turno
+    // seguir para o ReAct "cujo guard lança na hora": o guard só existe dentro
+    // de `runReActLoop`, ~700 linhas de pipeline depois.)
     logger.warn(
       { status: gateResult.status },
       'pending_gate.classify_failed',
@@ -133,6 +176,23 @@ export async function checkPendingFirst(input: {
 
   // Step 2: classify (OUTSIDE the lock)
   const resolution = await _classifier(snapshot, input.inbound, { pessoa_id: input.pessoa.id });
+
+  /**
+   * Issue #507 (achado 1) — GUARD DE BOUNDARY, logo após o await.
+   *
+   * A pergunta não é "o classificador falhou?", é "este turno ainda é nosso?".
+   * Por isso o guard vem ANTES do teste de `resolution` e vale também para o
+   * classificador que respondeu com sucesso: uma resolução calculada com a
+   * lease já perdida não pode virar `applyTx` — que cancela pendência, audita e
+   * DESPACHA a ação proposta.
+   *
+   * A checagem é da posse (`turnOwnershipLost`), não do retorno do
+   * classificador, de propósito: o classificador é injetável (DI de teste) e
+   * amarrar o desfecho ao valor que ele devolve deixaria o limite de efeito à
+   * mercê de um dublê. Fora de um turno reivindicado é NO-OP.
+   */
+  if (turnOwnershipLost()) return { kind: 'cancelled' };
+
   if (!resolution) return { kind: 'unresolved', reason: 'low_confidence' };
 
   return await applyTx(snapshot.id, snapshot, resolution, input);

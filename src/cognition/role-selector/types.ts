@@ -21,6 +21,16 @@ export type RoleSelectorInput = {
   conversa_id?: string;
   channel_id?: string;   // propagado para audit (role_selector_decisions.channel_id)
   turno_id?: string;     // opcional, propagado para audit
+  /**
+   * Issue #507 (achado 2 da revisão do dono) — cancelamento da tentativa de
+   * turno, vindo do node do grafo já composto com o timeout de 3 s do node.
+   *
+   * Dois destinos, e os dois importam: o `callLLM` do `llmSuggester` (para a
+   * chamada em voo parar) e o guard imediatamente antes da gravação em
+   * `role_selector_decisions` (para a decisão de um turno perdido não virar
+   * row).
+   */
+  signal?: AbortSignal;
 };
 
 export type RoleCandidate = {
