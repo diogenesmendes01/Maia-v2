@@ -252,6 +252,60 @@ export const METRIC = {
    */
   DB_POOL: 'maia_db_pool',
 
+  // --- schema / migrations (issue #516 §Observabilidade) -------------------
+  //
+  // ATRIBUIÇÃO: estas séries são GLOBAIS e não carregam `tenant_id`/`agent_id`
+  // — decisão, não esquecimento, e a #601 é justamente o precedente que obriga
+  // a justificá-la. A #601 moveu `maia_turn_effect_blocked_total` de
+  // `lib/metrics.ts::incCounter` para a camada de atribuição porque a série
+  // descreve TRABALHO DE UM TENANT e a pergunta do incidente era "de quem?".
+  // Aqui não existe essa pergunta: migration é DDL de banco inteiro, roda antes
+  // de as linhas por tenant existirem, e o advisory lock que a serializa é um só
+  // para todo o database (`src/migrations/lock.ts`: "Global by design: schema
+  // DDL is not tenant-scoped"). Rotular por tenant multiplicaria séries por
+  // tenant para repetir um valor idêntico em todas — exatamente o que
+  // `runtime-collectors.ts` recusa fazer com o pool do Postgres.
+  //
+  // O que NÃO se abre mão é do CAMINHO: a emissão passa por
+  // `src/observability/metrics.ts::gauge`, que aplica o allowlist de labels, o
+  // guard de PII e o teto de cardinalidade, e que já resolve gauge como série
+  // global (`attribute: false`). O antipadrão que a #601 condena é chamar
+  // `lib/metrics.ts` direto — que é, aliás, o que
+  // `backup-readiness-collector.ts` ainda faz.
+  /**
+   * Posição (1-based) do head na lista ordenada de migrations conhecidas,
+   * `kind` ∈ expected|applied. Duas séries em vez de uma porque a pergunta do
+   * operador é a DIFERENÇA entre elas; `expected - applied` em PromQL responde
+   * "quantas migrations atrás este banco está" sem depender de o alerta
+   * conhecer o head da release.
+   *
+   * Posição ordinal, e não o número do arquivo, porque o número NÃO é único
+   * neste repositório: doze números são compartilhados por mais de uma
+   * migration (issue #308), então `063` não identifica um head. A ordinal é
+   * calculada sobre a mesma ordenação que o runner aplica.
+   *
+   * `NaN` — nunca 0 — quando o veredito não pôde ser lido. Zero é a resposta
+   * verdadeira para "nenhuma migration aplicada", e essa é justamente a leitura
+   * que não pode colidir com "não consegui olhar".
+   */
+  SCHEMA_MIGRATION_HEAD: 'maia_schema_migration_head',
+  /** Migrations que faltam aplicar (inclui as `failed`, que são retentáveis). */
+  SCHEMA_MIGRATIONS_PENDING: 'maia_schema_migrations_pending',
+  /**
+   * Migrations em `dirty` — uma no-transaction que falhou no meio e cujo
+   * schema pode estar parcialmente aplicado. NUNCA é retentada automaticamente
+   * e bloqueia toda migration seguinte, então `> 0` é intervenção humana
+   * pendente, não um pico que se resolve sozinho.
+   */
+  SCHEMA_MIGRATIONS_DIRTY: 'maia_schema_migrations_dirty',
+  /**
+   * Duração da migration aplicada mais recentemente, em ms (`execution_ms` do
+   * ledger). É o sinal de tendência que antecede o apagão de lock: uma
+   * migration que passou de 200ms para 40s é a que vai encontrar
+   * `lock_timeout` no próximo ambiente maior.
+   */
+  SCHEMA_MIGRATION_LAST_DURATION_MS: 'maia_schema_migration_last_duration_ms',
+
   // --- scheduler (issue #535 §2) ------------------------------------------
   /** How late the oldest DUE-but-unclaimed unit of work is, per `queue`. */
   SCHEDULER_LAG_MS: 'maia_scheduler_lag_ms',

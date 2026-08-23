@@ -2213,6 +2213,34 @@
           "required": false,
           "group": "database",
           "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_WAIT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_POLL_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_STATEMENT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2234,7 +2262,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         },
         "staging": {
@@ -2251,7 +2283,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         },
         "production": {
@@ -2268,7 +2304,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         }
       }

@@ -51,7 +51,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 |---|---:|---:|
 | `runtime` | 177 | 19 |
 | `admin-ui` | 27 | 6 |
-| `migrator` | 11 | 2 |
+| `migrator` | 15 | 2 |
 | `backup` | 42 | 7 |
 | `maintenance` | 61 | 13 |
 
@@ -81,6 +81,10 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `POSTGRES_PASSWORD` | string | — | sim | `runtime`, `migrator`, `backup`, `maintenance` | sim | Senha do Postgres (mínimo 8 caracteres). Obrigatória em: development, staging, production. |
 | `POSTGRES_DB` | string | — | não | `runtime`, `migrator`, `backup`, `maintenance` | sim | Nome do banco. Obrigatória em: development, staging, production. |
 | `POSTGRES_PORT` | number | `5432` | não | `runtime`, `migrator`, `backup`, `maintenance` | sim | Porta do Postgres. |
+| `MIGRATION_LOCK_WAIT_MS` | number | `30000` | não | `migrator` | sim | Quanto um segundo migrator espera pelo advisory lock global antes de desistir com `lock_unavailable` (issue #516). Ele NUNCA aplica nada sem o lock — o teto decide só quanto tempo ele tenta. Subir ajuda quando a migration do vencedor é longa e o perdedor é um deploy paralelo; descer devolve o container mais rápido. |
+| `MIGRATION_LOCK_POLL_MS` | number | `500` | não | `migrator` | sim | Intervalo entre tentativas de `pg_try_advisory_lock` enquanto o migrator espera (issue #516). O runner faz POLL em vez de bloquear dentro de `pg_advisory_lock` porque um backend bloqueado é invisível: com poll ele emite `migration.lock_wait`, respeita o prazo e é testável sem Postgres. Valores muito baixos viram round-trip à toa; muito altos atrasam a largada do perdedor depois que o vencedor termina. |
+| `MIGRATION_LOCK_TIMEOUT_MS` | number | `10000` | não | `migrator` | sim | `SET lock_timeout` aplicado à sessão que roda cada migration (issue #516). Guarda o apagão clássico: o `ALTER TABLE` da migration entra na fila atrás de uma query longa e TODA query seguinte entra na fila atrás do pedido de lock dela. Falhar em 10s é recuperável; travar a tabela por minutos não é. `0` desliga (default do Postgres) e é fail-OPEN — use só com intenção. |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | number | `0` | não | `migrator` | sim | `SET statement_timeout` aplicado à sessão que roda cada migration (issue #516). Default `0` = SEM teto, e isso é deliberado: um backfill legítimo roda por minutos, e matar uma migration `-- maia:no-transaction` no meio FABRICA exatamente o dirty state que a #516 existe para evitar. Uma migration específica sobe o próprio teto com `-- maia:statement-timeout=<ms>`, onde o revisor vê; esta variável é o piso do ambiente. |
 
 ### Redis
 
