@@ -214,8 +214,18 @@ export function oidcProviderEnabled(): boolean {
           `to boot — a partially configured OIDC provider would register ` +
           `zero auth providers in production and surface as a generic ` +
           `"no providers configured" screen. Set OIDC_TENANT_SLUGS to a ` +
-          `comma-separated list (e.g. "acme,default"), or unset OIDC_ISSUER ` +
-          `entirely to disable the OIDC provider. See issue #167.`,
+          `comma-separated list of REAL tenant slugs (e.g. "acme,foundry"), ` +
+          `or unset OIDC_ISSUER entirely to disable the OIDC provider. ` +
+          // NUNCA sugerir `default` aqui (issue #572): o slug vai direto para
+          // `appUsersRepo.getByEmail(tenant, email)` em `auth-resolver.ts`, ou
+          // seja, ELE É o `tenant_id` num caminho dinâmico — o literal que
+          // AGENTS.md §4 (regras 2 e 8) proíbe exatamente aí. Esta mensagem
+          // sugeria `"acme,default"`, e o `.env.admin.prod.example` trazia
+          // `OIDC_TENANT_SLUGS=default`. A regra que recusa
+          // (`admin-ui/tenant-slugs-default-literal`, src/config/rules.ts) vive
+          // no CONTRATO, e este boot não chama o validador do contrato — quem
+          // a faz rodar antes do deploy é `npm run config:preflight`.
+          `See issue #167.`,
       );
     }
     return true;

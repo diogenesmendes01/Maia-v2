@@ -1,3 +1,4 @@
+import { pgErrorCode } from '@/db/client.js';
 import { mensagensRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
@@ -27,9 +28,65 @@ import {
  * (iteration cap, empty final text, or outbound failure) but tools ran,
  * persist the tool summaries via a placeholder "event-only" mensagem so
  * the next turn's prompt-builder can still surface them in the
- * "## Eventos confirmados pelo backend" block. Best-effort: if persistence
- * fails, the next turn loses its anchor — that's the soft failure mode.
+ * "## Eventos confirmados pelo backend" block.
+ *
+ * Issue #577 — `tipo: 'evento'` só passou a caber no CHECK de `mensagens.tipo`
+ * em `migrations/116_mensagens_tipo_evento.sql`. Antes disso TODO INSERT daqui
+ * violava `mensagens_tipo_check`, o catch abaixo engolia, e o helper era código
+ * morto: o rastro de ferramentas de qualquer turno sem outbound sumia do
+ * histórico deixando só um `warn`.
+ *
+ * ─── Por que continua best-effort ──────────────────────────────────────────
+ *
+ * Porque falhar o turno aqui é ESTRITAMENTE PIOR, e a razão está escrita no
+ * caller: em `src/agent/core.ts` ("`iteration_cap` NÃO é retryable: tools já
+ * rodaram, reexecutar duplicaria efeito colateral"). Este flush só roda nos
+ * caminhos SEM outbound — exatamente aqueles em que as tools já rodaram e
+ * `sideEffectsCommitted` pode estar marcado. Um throw daqui subiria como erro
+ * genérico, o turno viraria falha e o recovery reexecutaria o ReAct do zero:
+ * trocaríamos a perda de UM anchor de prompt pela duplicação de um efeito
+ * externo irreversível (um boleto emitido duas vezes).
+ *
+ * E o invariante de auditoria da §4 não depende desta row: o laço já escreveu
+ * um `audit()` em `audit_log` por tool-use, ANTES de chegar aqui. Esta row é o
+ * anchor anti-anchoring do turno SEGUINTE, não o livro-razão.
+ *
+ * ─── O log tem de ser distinguível ─────────────────────────────────────────
+ *
+ * O que não pode voltar a acontecer é o modo de falha desta issue: um defeito
+ * PERMANENTE de esquema/código indistinguível de um soluço de banco. Por isso
+ * classificamos pelo SQLSTATE — classe 22 (data exception) e 23 (integrity
+ * constraint violation) são determinísticas: vão falhar de novo, idênticas, em
+ * toda tentativa. Essas saem em `error` com `failure_kind: 'permanent'` e o
+ * nome da constraint; o resto (conexão caída, deadlock, timeout) segue em
+ * `warn` como `'transient'`.
  */
+function classifyFlushFailure(err: unknown): {
+  failure_kind: 'permanent' | 'transient';
+  pg_code: string | undefined;
+  pg_constraint: string | undefined;
+} {
+  const pg_code = pgErrorCode(err);
+  // 22xxx data exception, 23xxx integrity constraint violation — nenhuma delas
+  // muda de resultado na próxima tentativa: é esquema ou código, não infra.
+  const permanent =
+    typeof pg_code === 'string' && (pg_code.startsWith('22') || pg_code.startsWith('23'));
+  let constraint: unknown;
+  for (let cur: unknown = err, depth = 0; cur != null && depth < 8; depth++) {
+    const c = (cur as { constraint?: unknown }).constraint;
+    if (typeof c === 'string' && c.length > 0) {
+      constraint = c;
+      break;
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return {
+    failure_kind: permanent ? 'permanent' : 'transient',
+    pg_code,
+    pg_constraint: typeof constraint === 'string' ? constraint : undefined,
+  };
+}
+
 async function flushUnconfirmedToolSummaries(
   conversa_id: string,
   inbound_id: string,
@@ -58,10 +115,26 @@ async function flushUnconfirmedToolSummaries(
       'agent.tool_summaries_flushed_no_outbound',
     );
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, conversa_id, reason },
-      'agent.tool_summaries_flush_failed',
-    );
+    const { failure_kind, pg_code, pg_constraint } = classifyFlushFailure(err);
+    // `err` do Drizzle traz a query e os PARÂMETROS inteiros na mensagem — ou
+    // seja, o conteúdo das ferramentas — então nunca o repassamos cru.
+    const fields = {
+      conversa_id,
+      inbound_id,
+      reason,
+      count: toolSummaries.length,
+      failure_kind,
+      pg_code: pg_code ?? null,
+      pg_constraint: pg_constraint ?? null,
+      err: (err as Error).name,
+    };
+    if (failure_kind === 'permanent') {
+      // Defeito nosso: o mesmo INSERT vai falhar igual na próxima vez. Some o
+      // rastro de ferramentas de TODO turno sem outbound até alguém consertar.
+      logger.error(fields, 'agent.tool_summaries_flush_rejected');
+    } else {
+      logger.warn(fields, 'agent.tool_summaries_flush_failed');
+    }
   }
 }
 

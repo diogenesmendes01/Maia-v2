@@ -134,6 +134,9 @@ npm run audit:exceptions:check    # todo advisory do npm audit está corrigido o
 npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
 npm run config:check -- --profile production --env-file .env
 npm run config:init -- --profile development
+npm run config:preflight          # ambiente EFETIVO de cada serviço do compose
+                                  # (env_file + environment: interpolado),
+                                  # validado ANTES do `up` (#572)
 
 # Build
 npm run build                     # tsc + tsc-alias
@@ -165,10 +168,26 @@ npm run backup                    # DB backup
 `npm run test:integration` requires real Postgres + Redis:
 
 ```bash
-npm run test:integration:setup    # docker compose up -d redis postgres
-npm run test:integration          # vitest run tests/integration --no-coverage
-npm run test:integration:teardown # docker compose down -v
+npm run test:integration:setup    # sobe a pilha COMPARTILHADA (idempotente)
+npm run test:integration          # cria/migra o banco da worktree e roda
+# O teardown apaga o Postgres e o Redis de TODAS as árvores — inclusive das
+# que estão rodando agora. Ele recusa sem consentimento explícito:
+TEST_INFRA_TEARDOWN=yes npm run test:integration:teardown
 ```
+
+**A infra física é COMPARTILHADA por decisão registrada** (modelo (a): um
+Postgres, um Redis, um coordenador — `scripts/test-infra.ts`). O que isola sua
+árvore não é o container: é o banco e o db lógico do Redis por worktree. Nunca
+derrube a pilha para "limpar" a sua rodada — o que limpa a sua rodada é o
+`globalSetup`, que já cria o seu banco e limpa o SEU db do Redis.
+
+**Você está numa `git worktree`? Então seu Postgres e seu Redis já são só
+seus** (issue #571): banco `<base>_wt_<pasta>_<hash>` criado e migrado
+automaticamente, `schema_migrations` dentro dele, e um db lógico do Redis
+exclusivo. Não exporte `TEST_DB_URL` à mão — se você exportar, ela é reescrita
+para o banco da SUA árvore. O contrato inteiro (como descobrir qual é o seu, o
+teto de 15 worktrees ativas imposto pelos 16 dbs do Redis, e como desligar)
+está num lugar só: [README § Isolamento por worktree](README.md#isolamento-por-worktree-issue-571).
 
 CI runs these automatically in `.github/workflows/ci.yml` with service containers. The integration job is blocking: integration + e2e failures fail the run.
 

@@ -16,14 +16,24 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { arquivoDoPacote } from '../helpers/pkg-path.js';
+
+/**
+ * Issue #571 — `resolve('node_modules/vitest/vitest.mjs')` resolvia contra o
+ * `process.cwd()`, ou seja `<worktree>/node_modules`, que não existe numa
+ * `git worktree` (ela não tem árvore de dependências própria). Este arquivo
+ * falhava 4/4 em qualquer worktree. `require.resolve` sobe a árvore de
+ * diretórios até o `node_modules` do repositório raiz, que é onde o vitest
+ * realmente está. Ver `tests/helpers/pkg-path.ts`.
+ */
+const VITEST_CLI = arquivoDoPacote('vitest', 'vitest.mjs', import.meta.url);
 
 function rodarVitestFilho(): string {
   try {
     return execFileSync(
       process.execPath,
       [
-        resolve('node_modules/vitest/vitest.mjs'),
+        VITEST_CLI,
         'run',
         '--config',
         'tests/reporters/fixtures/vitest.fixture.config.ts',
