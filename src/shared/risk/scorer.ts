@@ -53,6 +53,8 @@ export type ScorerOptions = {
   gate: LLMGate;
   /** Texto contextual fornecido ao LLM. Caller controla redaction de PII. */
   contextText: string;
+  /** Issue #507 — cancelamento do caller, repassado ao gate. Ver `LLMGate`. */
+  signal?: AbortSignal;
 };
 
 /**
@@ -129,6 +131,7 @@ async function applyGate(
     suggested = await opts.gate({
       current_level: heuristic.level,
       context_text: opts.contextText,
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
   } catch {
     // Defensive — gate impl deveria capturar e retornar null. Aqui

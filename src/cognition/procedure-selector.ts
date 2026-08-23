@@ -30,6 +30,16 @@ export async function selectProcedure(input: {
   conversa_id: string;
   current_message: string;
   current_execution: { id: string; definition_id: string; status: string } | null;
+  /**
+   * Issue #507 (achado 2 da revisão do dono) — cancelamento da tentativa de
+   * turno. Vem do node do grafo (`preturn-graph.ts`), que por sua vez o recebe
+   * de `runCognitiveModule` já COMPOSTO com o timeout do node.
+   *
+   * Este selector é o pior caso da propagação faltante: um LAÇO de chamadas de
+   * LLM, uma por procedimento atribuído. Sem o sinal, perder a lease na
+   * primeira volta ainda pagava todas as demais até o fim.
+   */
+  signal?: AbortSignal;
 }): Promise<SelectorDecision> {
   // Has active execution? Default = continue
   if (input.current_execution && input.current_execution.status === 'in_progress') {
@@ -56,19 +66,32 @@ export async function selectProcedure(input: {
     if (!def || def.status !== 'active') continue;
 
     const result = await runCognitiveModule(
-      { name: `procedure-selector.${def.nome}`, triggered_by: 'sync_conditional', timeoutMs: 5000 },
-      async () => {
+      {
+        name: `procedure-selector.${def.nome}`,
+        triggered_by: 'sync_conditional',
+        timeoutMs: 5000,
+        signal: input.signal,
+      },
+      async (signal) => {
         const res = await callLLM({
           workload: 'procedure_selector',
           system: matchPrompt(def),
           messages: [{ role: 'user', content: input.current_message }],
           max_tokens: 150,
           temperature: 0.0,
+          signal,
         });
         const text = (res.content ?? '').trim();
         return safeExtractAndParseJson(text, MatchResponseSchema);
       },
     );
+
+    // Issue #507 — a posse acabou. SAI DO LAÇO: sem isto, cada volta restante
+    // ainda faria um `findById` e mais uma row `cancelled` em
+    // `cognitive_module_log` para um turno que já não é nosso. Os candidatos
+    // colhidos até aqui seguem no retorno, mas o guard após `runNodes`
+    // (`src/agent/core.ts`) encerra a tentativa antes que alguém os consuma.
+    if (result.status === 'cancelled') break;
 
     if (result.output) {
       candidates.push({
