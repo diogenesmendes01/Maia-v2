@@ -157,8 +157,19 @@ intocado (é ele quem faz a deduplicação).
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
 | `maia_turn_fence_rejected_total` | `operation` — incrementado **só** em `reportFenceRejection` (`lease.ts`). O repositório classifica `stale_claim` e NÃO conta: com as duas camadas contando, um CAS recusado valia 2 num `sum()`, e a recusa local (que nunca chega ao SQL) ficava invisível. |
-| `maia_turn_effect_blocked_total` | `boundary` (cardinalidade fechada) = `pending_gate` / `scheduling_inbound_hook` / `preturn_graph` / `role_selector_decision` / `decision_engine` / `react_iteration` / `react_reasoner` / `tool_dispatch` / `tool_handler` / `mcp_tool_call` / `outbound_dispatch` / `outbound_send` / `outbound_document` / `outbound_voice` / `outbound_poll` |
+| `maia_turn_effect_blocked_total` | `tenant_id` + `agent_id` (atribuição automática do ALS — issue #601), mais `boundary` (vocabulário FECHADO `EFFECT_BOUNDARY` em [`src/observability/taxonomy.ts`](../../../src/observability/taxonomy.ts), budget de cardinalidade próprio) = `pending_gate` / `scheduling_inbound_hook` / `preturn_graph` / `role_selector_decision` / `decision_engine` / `react_iteration` / `react_reasoner` / `tool_dispatch` / `tool_handler` / `mcp_tool_call` / `outbound_dispatch` / `outbound_send` / `outbound_document` / `outbound_voice` / `outbound_poll` |
 | `maia_turn_job_retained_cleared_total` | `state` = `completed` / `failed` |
+
+Issue #601 — `maia_turn_effect_blocked_total` é emitida por
+[`src/observability/metrics.ts::counter`](../../../src/observability/metrics.ts),
+não por `src/lib/metrics.ts::incCounter`. A diferença é operacional: sem
+`tenant_id`/`agent_id` um pico dizia que o fencing atuou e não dizia PARA QUEM,
+que é a primeira pergunta de um incidente multi-tenant. `boundary` sobrevive à
+migração porque a série tem um consumidor que exige a distinção — a barreira de
+`tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` afirma QUAL
+limite recusou, não só que alguém recusou. `react_tool_refused` pertence ao
+vocabulário do ERRO (`TurnOwnershipLostError`) e NÃO à série: a recusa que o
+ReAct traduz já foi contada como `tool_dispatch`/`tool_handler`.
 
 Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
 heartbeat rotineiros ficam em métrica — auditá-los seria uma row por batida.
