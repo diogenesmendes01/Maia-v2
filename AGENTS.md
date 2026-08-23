@@ -157,6 +157,8 @@ npm run test:admin-ui:unit
 npm run test:admin-ui:e2e         # Playwright
 
 # Operational
+npm run doctor                    # diagnóstico READ-ONLY do ambiente (#517) — offline por default
+npm run doctor -- --online        # + liveness de Postgres/Redis; --format json, --strict, --only
 npm run dlq                       # dead-letter queue inspection
 npm run embeddings:rebuild        # regenerate vector embeddings
 npm run import:ofx                # OFX file import flow

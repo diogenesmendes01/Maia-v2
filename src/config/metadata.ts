@@ -357,6 +357,26 @@ export interface ConfigProblem {
   readonly rule: string;
   readonly message: string;
   readonly remediation: string;
+  /**
+   * EVERY variable this finding is about, when the rule that produced it knows
+   * more than `variable` can say (issue #602).
+   *
+   * `variable` holds ONE name — a Zod issue path, or the single key a rule
+   * files itself under — and that is not enough for the cross-field rules:
+   * `backup/encryption-key` fires for the PAIR
+   * `BACKUP_ENCRYPTION_KEYRING` + `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` and files
+   * itself under the first, and the boot-scope rules that preserve the
+   * historical `<root>` Zod path carry `variable: null` while naming a real
+   * variable (`llm/provider-key` → `ANTHROPIC_API_KEY`). A consumer listing
+   * "which variables does this problem involve?" by `variable` alone omits the
+   * second key, or every key.
+   *
+   * Populated from `CrossFieldFinding.covers` by `validateConfig()`. ABSENT —
+   * not empty — when the finding is about exactly the variable in `variable`,
+   * so the serialized shape of every other problem is unchanged. Read it as
+   * `p.covers ?? (p.variable ? [p.variable] : [])`.
+   */
+  readonly covers?: readonly string[];
 }
 
 /**
