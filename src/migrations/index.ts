@@ -1,7 +1,7 @@
 /**
  * Issue #516 — public surface of the migration subsystem.
  *
- * Two audiences:
+ * Três audiências:
  *
  *   - **Writers** (`scripts/migrate.ts`, the compose init job): `runMigrations`,
  *     `repairMigration`. They take the global advisory lock and are the ONLY
@@ -9,6 +9,10 @@
  *   - **Readers** (`maia doctor` #517, `/readyz`, `migrate plan|status`):
  *     `getSchemaReadiness`, `getMigrationStatus`. Read-only, never throwing,
  *     fail-closed.
+ *   - **Gate fora do Compose** (`scripts/release-migrate.ts`, issue #565):
+ *     `runReleaseGate`. Não toca no banco — filtra o ambiente e propaga o
+ *     exit code do writer acima para um orquestrador que não tem
+ *     `service_completed_successfully`.
  *
  * Down migrations are NOT here, by design: rollback stays manual
  * (`docs/runbooks/migrations.md`). Nothing in this module can execute a
@@ -88,6 +92,17 @@ export {
   type RunOptions,
   type RunOutcome,
 } from './runner.js';
+
+export {
+  normalizeExitCode,
+  runReleaseGate,
+  scrubToMigratorSubset,
+  MIGRATE_COMMAND,
+  PROCESS_PASSTHROUGH,
+  type MigratorOutcome,
+  type ReleaseGateDeps,
+  type ScrubReport,
+} from './release-gate.js';
 
 export {
   getMigrationStatus,
