@@ -837,7 +837,15 @@ jobs:
         # ele o NextAuth v5 recusa o Host (`UntrustedHost`) e devolve 500 em
         # /api/auth/*. Medido: a spec de boot reprova com três respostas 500.
         env:
-          NODE_ENV: production
+          # `development`, e NÃO `production` como no passo de build. Os
+          # bundles JÁ foram construídos como produção pelo passo anterior
+          # (`next build` fixa `NODE_ENV=production` internamente e o passo
+          # "Artefato do build existe" confere o `BUILD_ID`); `next start` só
+          # SERVE o artefato pronto, não reconstrói nada. O contrato tem uma
+          # regra cross-field — `profile/node-env-contradiction` — que recusa
+          # `MAIA_ENV=development` com `NODE_ENV=production`, e ela está certa:
+          # os dois campos precisam contar a mesma história sobre o ambiente.
+          NODE_ENV: development
           # `development`, e NÃO `staging` como no passo de build. A diferença
           # é que AQUI o console SOBE de verdade: o hook `instrumentation.ts`
           # (issue #596, PR #608) roda `assertAdminBootConfig()` antes do
