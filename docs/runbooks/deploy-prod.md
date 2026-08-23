@@ -4,6 +4,11 @@
 > dev: portas de datastore no host, fallback `maia/maia`, Redis sem auth,
 > `.env` inteiro em todos os containers, processos root).
 
+> **Não deploya por Compose?** O gate de migration da #516 é feito de
+> primitivas do Compose e não sobrevive fora dele. O equivalente para
+> Coolify está em [§7](#7-deploy-fora-do-compose--coolify-issue-565), que
+> começa dizendo o que ali foi executado e o que não foi.
+
 ## 0. Pré-voo OBRIGATÓRIO: smoke do job `migrate` na imagem real
 
 ```bash
@@ -445,3 +450,177 @@ docker compose --env-file .env.infra -f compose.prod.yml up -d --build
 - Se o rollback for para uma versão anterior a este runbook (imagens
   root-era), os volumes chownados para 1001 continuam legíveis pelo
   processo root antigo — sem passo extra.
+
+## 7. Deploy fora do Compose — Coolify (issue #565)
+
+Esta seção existe porque o gate da #516 é feito de primitivas do **Compose**:
+`restart: "no"`, a ausência de `env_file:` no serviço `migrate`, e
+`depends_on: { migrate: { condition: service_completed_successfully } }`.
+`service_completed_successfully` **não existe fora do Compose**. Um deploy
+que assuma "é só rodar a mesma imagem" perde o invariante em silêncio — que é
+exatamente o modo de falha que o gate existe para eliminar.
+
+O repositório descreve a topologia de Coolify em
+[`docs/admin-ui-deploy.md`](../admin-ui-deploy.md): **duas aplicações** (`app`
+e `admin-ui`) apontando para o mesmo repositório, cada uma com build por
+Dockerfile e seu próprio editor de variáveis. Nessa topologia não existe
+"não passar" um segredo para o passo de migration: ele nasce dentro do
+ambiente completo da aplicação.
+
+### 7.0 O que foi EXECUTADO e o que NÃO foi
+
+Leia esta tabela antes de seguir qualquer passo abaixo. Ela é a razão de esta
+seção poder existir sem virar ficção: um runbook que descreve um caminho que
+ninguém executou é pior que a ausência dele — ele é lido no meio de um
+incidente.
+
+| Afirmação | Status | Onde a prova está |
+|---|---|---|
+| O gate roda **o mesmo comando** do job `migrate` do Compose (`npm run db:migrate`) | **EXECUTADO** | `tests/unit/migrations/release-gate.spec.ts` lê `compose.prod.yml` do disco e compara |
+| Ele **sai 0** quando as migrations aplicam, e o ledger fica no head | **EXECUTADO** | `tests/integration/release-migrate-gate.spec.ts`, processo real contra Postgres real, banco descartável |
+| Ele **sai != 0** quando o migrate falha (ledger `dirty`) | **EXECUTADO** | idem |
+| Ele entrega ao migrator **só o subset `migrator`** (#515) — nada de chave de LLM, sessão de WhatsApp ou credencial S3 | **EXECUTADO** | idem: a mesma variável derruba o migrator cru (saída 2) e não chega nele pelo gate (saída 0) |
+| `gate && consumidor` **impede o consumidor de rodar** quando o gate falha | **EXECUTADO** | idem: o marcador que o consumidor escreveria não existe no disco |
+| **O painel do Coolify executa o gate antes do rollout e desiste do rollout quando ele sai != 0** | **NÃO VERIFICADO** | Não há instância de Coolify acessível a quem escreveu isto. O que se afirma é só o contrato: *"rode este comando; se ele sair != 0, não suba"* |
+| **O nome e a localização do campo do painel onde o comando é colado** | **NÃO VERIFICADO** | Varia por versão do Coolify e não foi conferido em nenhuma. Procure-o na sua instância; o texto abaixo descreve o que o campo precisa fazer, não onde ele fica |
+| Um redeploy **re-executa** o gate, e o que acontece quando ele sai `up_to_date` | **NÃO VERIFICADO** | Ver §7.4 |
+
+### 7.1 O comando
+
+```bash
+npm run release:migrate
+```
+
+[`scripts/release-migrate.ts`](../../scripts/release-migrate.ts) sobre
+[`src/migrations/release-gate.ts`](../../src/migrations/release-gate.ts). Ele
+faz três coisas, e nada além:
+
+1. **filtra o ambiente** para o subset `migrator` do contrato (#515) mais um
+   punhado de variáveis de processo (`PATH`, `HOME`, `npm_config_cache`, …).
+   Allowlist, não denylist: uma chave nova em `.env.app` já nasce de fora.
+   `NODE_OPTIONS` é retida de propósito — um passo que aplica DDL não carrega
+   código que o painel injetou;
+2. **roda `npm run db:migrate`** — o mesmo `command:` do serviço `migrate` em
+   `compose.prod.yml`, com o mesmo `stdio`, então os eventos
+   `migration.applied` / `migration.blocked` vão direto para o log do deploy;
+3. **propaga o exit code** do migrator sem alterá-lo. Sai 0 por um caminho só:
+   o migrator saiu 0. Spawn que falha, morte por sinal e código fora da faixa
+   viram falha.
+
+O que ele **retém** é reportado por nome (nunca por valor) numa linha JSON.
+Esta é a saída literal de uma rodada de
+`tests/integration/release-migrate-gate.spec.ts`, quebrada em linhas para
+caber (no log ela é uma linha só):
+
+```json
+{"event":"release_gate.env_scrubbed","command":"npm run db:migrate",
+ "passed":["DATABASE_URL","HOME","MAIA_ENV","NODE_ENV","PATH","POSTGRES_DB","POSTGRES_PASSWORD","POSTGRES_USER","PWD","TZ","npm_config_cache"],
+ "withheld_contract":["ANTHROPIC_API_KEY","BACKUP_S3_SECRET_KEY","NEXTAUTH_SECRET"],
+ "withheld_unknown_maia":["MAIA_TEST_MARKER"],"withheld_other":25}
+```
+
+`withheld_contract` é a lista acionável: são segredos de `app`/`admin-ui` que
+chegaram ao passo de migration porque o painel injeta um ambiente só.
+`withheld_unknown_maia` não vazio é **erro de configuração seu** — uma chave
+`MAIA_*`/`FEATURE_*` que o contrato não declara, ou seja, um typo numa
+configuração que você acha ativa. O gate a retém (senão o migrator recusaria o
+boot), e por isso mesmo a nomeia.
+
+### 7.2 Duas formas de ligar o gate, e o que cada uma custa
+
+| | (A) campo de comando pré-deploy | (B) encadeado no comando de start |
+|---|---|---|
+| Como fica | o painel roda o gate; se sair != 0, não faz o rollout | `npm run release:migrate && exec node dist/index.js` |
+| Quem faz o exit code valer | o painel | o `&&` do shell |
+| Roda quantas vezes | uma por deploy | uma por container que sobe (o lock global de `src/migrations/lock.ts` serializa) |
+| Falha aparece como | deploy abortado, versão anterior intacta | container em crash-loop |
+| **Verificado aqui?** | **NÃO** — depende do painel | **SIM** — `tests/integration/release-migrate-gate.spec.ts` roda o encadeamento num shell e prova que o consumidor não executa |
+
+Prefira **(A)** se a sua instância tem o campo: um deploy abortado deixa a
+versão anterior de pé, um crash-loop não. Use **(B)** como rede de segurança —
+ela é a única das duas cuja semântica não depende de nenhuma promessa de
+painel, e é a que está exercitada em teste.
+
+Com **(B)**, o comando de start de cada aplicação passa a ser:
+
+```bash
+# aplicação `app` — precisa de um SHELL, porque quem faz o `&&` valer é ele
+sh -c 'npm run release:migrate && exec node dist/index.js'
+```
+
+`node dist/index.js` é o `CMD` do `Dockerfile`; o `ENTRYPOINT` é
+`/sbin/tini --`, então o `sh` acima entra como argumento do tini e continua
+sendo PID 1 quem repassa sinais. Se o painel já monta um `sh -c` em volta do
+que você digita, digite só o miolo — dois `sh -c` aninhados funcionam, mas a
+mensagem de erro fica pior.
+
+O `admin-ui` **não pode** rodar este comando, e a razão é da imagem, não de
+preferência: `src/admin-ui/Dockerfile` produz o `standalone` do Next.js — o
+estágio de runtime copia `.next/standalone` e `.next/static` e mais nada.
+Não há `scripts/`, não há `migrations/`, não há o `package.json` da raiz (logo
+não existe o script `release:migrate`) e não há `tsx`. Colar o comando no
+editor da Aplicação 2 falha com "missing script", não com um erro de
+migration.
+
+O gate mora na Aplicação 1 (`app`), e só nela — o que também evita dois
+migradores disputando o lock global. O `admin-ui` depende de o gate do `app`
+ter passado, e essa dependência **não existe como aresta** fora do Compose:
+é ordem de deploy. Deploy do `app` primeiro.
+
+### 7.3 O que este gate NÃO recupera do Compose
+
+Dito por inteiro, porque a diferença importa num incidente:
+
+- **`app` e `admin-ui` continuam sem aresta entre si.** No Compose, os dois
+  esperam o mesmo job. Aqui, o `admin-ui` pode subir contra um schema atrasado
+  se for deployado antes do `app`. E **nada o segura**: a checagem de readiness
+  de schema (`getSchemaReadiness()`, #516) está ligada ao `/readyz` do `app`
+  (`src/runtime/lifecycle/schema-readiness.ts`) — o console não tem
+  equivalente. Deploy do `app` primeiro, e é disciplina de ordem, não uma
+  aresta;
+- **o container ainda POSSUI os segredos.** No Compose, o migrator não recebe
+  `.env.app` — ele não pode vazar o que nunca teve. Aqui, o processo do
+  migrator não os recebe, mas o container em volta dele sim. É um raio de
+  explosão menor, não o mesmo raio de explosão. Se a sua instância permitir um
+  serviço/aplicação separado só para o passo de migration, com o seu próprio
+  conjunto de variáveis, use isso e o gate volta a valer o que vale no
+  Compose;
+- **nada aqui verifica configuração de `app`/`admin-ui`.** O migrator satisfaz
+  o contrato dele e sai 0; `app`/`admin-ui` ainda podem reprovar no boot pelas
+  chaves listadas em §1. O gate é sobre schema, não sobre bring-up.
+
+E o que **não** foi reusado, com o motivo — porque a pergunta é razoável:
+
+- **o preflight de configuração** (issue #572) recebe um arquivo de Compose e
+  os `env_file` do disco e certifica o ambiente EFETIVO de cada serviço. No
+  painel não existe nenhum dos dois: o ambiente mora no editor da aplicação.
+  A entrada dele não existe aqui, então não há o que reusar do comando. O que
+  É reusado é a checagem por baixo: o migrator chama `loadMigrationConfig()`
+  → `loadServiceConfig('migrator')`, o mesmo loader, e o gate não
+  reimplementa validação nenhuma;
+- **`maia doctor`** (issue #517) é liveness — ele abre conexão e responde
+  "está de pé?". O gate roda ANTES de existir instância para perguntar. São
+  passos diferentes do mesmo deploy, não um substituto do outro.
+
+### 7.4 Perguntas que só uma instância real responde
+
+Registradas aqui em vez de respondidas, porque respondê-las de cabeça é
+exatamente o que esta seção não faz:
+
+1. Se o seu Coolify deploya por **arquivo de Compose** (e não por Dockerfile),
+   o gate da #516 pode valer como está — mas só se a versão de Compose usada
+   honrar `service_completed_successfully`, que é `depends_on` de forma longa
+   e é **ignorada em silêncio** por versões antigas. Confirme antes de assumir
+   que esta seção inteira é desnecessária.
+2. Como `${MAIA_ENV:?…}` se comporta na interpolação do painel. A variável é
+   obrigatória de propósito (§1); um orquestrador que injete env por outro
+   caminho pode reintroduzir o default silencioso que ela eliminou.
+3. Se um redeploy re-executa o gate e o que o painel faz com a saída
+   `up_to_date` (que é 0, e é o caso normal de todo deploy sem migration
+   nova).
+
+### 7.5 Kubernetes
+
+Entrega futura, fora do escopo desta issue por decisão do dono. Não há
+manifesto nem init container neste repositório, e nenhuma linha deste runbook
+descreve um.
