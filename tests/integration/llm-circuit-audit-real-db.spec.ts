@@ -441,18 +441,47 @@ d('kill switch → audit_log (Postgres real)', () => {
       (r) =>
         r.metadata.actor === ACTOR || String(r.metadata.reason ?? '').includes(ACTOR),
     );
-    expect(found.map((r) => r.acao)).toEqual([
+    // NAO se afirma ORDEM aqui, e a razao e CONCORRENCIA, nao empate de relogio.
+    //
+    // `recordCircuitAudit()` e fire-and-forget: ele dispara `writeCircuitAudit()`
+    // e guarda a promise num set (`circuit-audit.ts`). As duas escritas sao
+    // INDEPENDENTES -- cada `auditRepo.write()` faz o proprio INSERT, em
+    // autocommit -- e `drainCircuitAudits()` so espera as promises pendentes.
+    // Nao ha transacao comum, nao ha ordem imposta: elas chegam ao banco na
+    // ordem que o event loop e o pool decidirem, e podem empatar em
+    // `created_at` OU inverter.
+    //
+    // Por isso trocar `now()` por `clock_timestamp()` NAO resolveria: daria
+    // instantes distintos, mas refletindo a ordem de CHEGADA ao banco, que nao
+    // e a ordem logica aplicada -> recusada. Ordem causal aqui exigiria
+    // serializacao explicita ou uma sequencia monotonica no proprio registro --
+    // relogio nao serve. Enquanto ordem nao for requisito de produto, o teste
+    // nao deve afirma-la.
+    //
+    // A assercao abaixo e mais forte que a de ordem: ela amarra cada acao a
+    // evidencia que a IDENTIFICA (o ator na linha aplicada, o motivo na
+    // recusada), em vez de a uma posicao que nada promete.
+    const aplicada = found.filter((r) => r.metadata.actor === ACTOR);
+    const recusada = found.filter((r) => String(r.metadata.reason ?? '').includes(ACTOR));
+
+    expect(aplicada).toHaveLength(1);
+    expect(recusada).toHaveLength(1);
+    expect(aplicada[0]!.acao).toBe('llm_circuit_mode_override_applied');
+    expect(recusada[0]!.acao).toBe('llm_circuit_mode_override_rejected');
+    // E o conjunto continua sendo exatamente estes dois, sem terceiro evento.
+    expect([...found.map((r) => r.acao)].sort()).toEqual([
       'llm_circuit_mode_override_applied',
       'llm_circuit_mode_override_rejected',
     ]);
-    expect(found[0]!.tenant_id).toBe('system');
-    expect(found[0]!.entidade_alvo).toBe('llm_circuit');
-    expect(found[0]!.alvo_id).toBeNull();
-    expect(found[0]!.metadata).toMatchObject({
+
+    expect(aplicada[0]!.tenant_id).toBe('system');
+    expect(aplicada[0]!.entidade_alvo).toBe('llm_circuit');
+    expect(aplicada[0]!.alvo_id).toBeNull();
+    expect(aplicada[0]!.metadata).toMatchObject({
       actor: ACTOR,
       reason: 'INC-4412',
       mode: 'off',
     });
-    expect(String(found[1]!.metadata.error)).toContain('actor obrigatório');
+    expect(String(recusada[0]!.metadata.error)).toContain('actor obrigatório');
   });
 });

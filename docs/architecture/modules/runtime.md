@@ -157,7 +157,7 @@ intocado (é ele quem faz a deduplicação).
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
 | `maia_turn_fence_rejected_total` | `operation` — incrementado **só** em `reportFenceRejection` (`lease.ts`). O repositório classifica `stale_claim` e NÃO conta: com as duas camadas contando, um CAS recusado valia 2 num `sum()`, e a recusa local (que nunca chega ao SQL) ficava invisível. |
-| `maia_turn_effect_blocked_total` | `boundary` = `tool_dispatch` / `outbound_send` / `react_iteration` |
+| `maia_turn_effect_blocked_total` | `boundary` (cardinalidade fechada) = `pending_gate` / `scheduling_inbound_hook` / `preturn_graph` / `role_selector_decision` / `decision_engine` / `react_iteration` / `react_reasoner` / `tool_dispatch` / `tool_handler` / `mcp_tool_call` / `outbound_dispatch` / `outbound_send` / `outbound_document` / `outbound_voice` / `outbound_poll` |
 | `maia_turn_job_retained_cleared_total` | `state` = `completed` / `failed` |
 
 Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
@@ -292,6 +292,7 @@ Rules this module enforces:
 | `tests/integration/turn-claim-lifecycle-real-db.spec.ts` | O claim visto pela FACHADA (`beginTurnExecution`/`concludeTurn`); lease marcada como perdida e lease liberada **sem takeover** não alteram a linha; uma escrita recusada = UM incremento da métrica de fence |
 | `tests/integration/turn-claim-core-barrier-real-db.spec.ts` | O core OBEDECE a barreira: entra por `runAgentForMensagem` com o turno genuinamente reivindicado por outro dono e observa o efeito no banco — prova que o cadeado está na PORTA, não só que funciona. Cobre também a posse perdida NO MEIO do turno (o core não carimba `processada_em`), que é o que pinga o `runWithTurnExecution` do core |
 | `tests/integration/turn-lease-lost-effects-real-db.spec.ts` | Perda de lease DURANTE a execução, pelo caminho real (takeover + heartbeat): nenhuma linha em `agent_facts` (tool) nem em `outbound_messages` (outbound), com caso de controle exigindo as duas presentes |
+| `tests/unit/decision-engine-trace-ownership-boundary.spec.ts` | A janela entre o guard de posse do Decision Engine e o CONSUMO do pacote: com `traceTurnDecision` DEFERIDO, a lease cai enquanto o envelope durável está em voo e o teste exige `TurnOwnershipLostError` — e nenhum efeito posterior — tanto no resolve quanto no reject |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 
 ## In-flight changes

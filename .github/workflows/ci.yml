@@ -34,7 +34,21 @@ jobs:
         #    incompatibilities were never caught in CI (#396).
         # Keep these in sync: bump the second entry whenever the Dockerfile
         # base image major changes.
-        node: [22, 26]
+        #
+        # A perna do piso é pinada em 22.18 (e não no `22` flutuante): o piso
+        # que o repo SUPORTA é `engines.node: ">=22.13.0"` (o maior mínimo
+        # entre o npm@11.5.2 pinado e o eslint do lockfile, que o
+        # `engine-strict=true` do .npmrc torna obrigatório), mas o que a lane
+        # EXERCITA passa a ser um número explícito e reproduzível, em vez de
+        # "o 22.x mais novo que o runner tiver hoje".
+        # DIVERGÊNCIA ABERTA (não resolvida aqui, de propósito): o comentário
+        # acima afirma que a segunda perna espelha a imagem de produção com
+        # `FROM node:26-alpine`. O Dockerfile hoje diz `FROM node:22-alpine`
+        # (topo do arquivo, com o comentário explicando a descida de 26 -> 22).
+        # Ou seja: a perna 26 não espelha mais nada — ela cobre um major que
+        # produção não usa. Manter as duas pernas ou derrubar a 26 é decisão do
+        # dono; esta mudança só pinou o piso da perna 22.
+        node: ['22.18', 26]
     services:
       redis:
         image: redis:7-alpine
@@ -61,6 +75,15 @@ jobs:
       OWNER_NOME: Test Owner
       VOYAGE_API_KEY: test-voyage-key
       ALERT_CHANNELS: log
+      # `tests/unit/config/compose-config-differential.spec.ts` compara o
+      # ambiente que `src/config/compose-env.ts` reconstrói com o que o
+      # `docker compose config` REAL resolve — a única medição do preflight que
+      # não passa pelo parser customizado dele. Sem o CLI do Compose o arquivo
+      # se PULA, e um diferencial que se pula em silêncio no CI não mede nada:
+      # esta variável transforma a ausência em FALHA. `docker compose` vem
+      # pré-instalado no runner `ubuntu-latest` e NÃO precisa de daemon (o
+      # subcomando `config` só carrega e interpola o modelo do projeto).
+      TEST_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
     steps:
       - uses: actions/checkout@v6
 
@@ -89,6 +112,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -236,7 +270,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          # Mesmo piso pinado dos jobs matriciais (22.18), para o audit rodar
+          # no Node que as outras lanes rodam.
+          node-version: '22.18'
           cache: 'npm'
       - name: Pin npm to 11.5.2
         # Mesmo pin do job validate (ci.yml acima): o audit resolve advisories
@@ -287,7 +323,9 @@ jobs:
         # Same rationale as the `validate` job: cover the engines floor (22,
         # the .nvmrc dev pin) and the production image major (26, Dockerfile
         # `FROM node:26-alpine`). See #396. Keep in sync with the Dockerfile.
-        node: [22, 26]
+        # Piso pinado em 22.18, pelo mesmo motivo do job `validate` — e com a
+        # mesma divergência aberta sobre a perna 26 vs `node:22-alpine`.
+        node: ['22.18', 26]
     services:
       postgres:
         # pgvector/pgvector:pg16 ships pgvector preinstalled. The image is
@@ -355,6 +393,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -445,3 +494,141 @@ jobs:
       # causa do runner em vez de por causa da imagem.
       - name: Smoke do job migrate na imagem de produção
         run: bash scripts/smoke-migrate-image.sh
+
+  # ---------------------------------------------------------------------
+  # Regras de alerta, avaliadas pelo motor REAL (#519, decisão 14). Job novo,
+  # isolado e apendado no mesmo padrão do `smoke-migrate-image`: sem
+  # `setup-node`, sem `npm ci`, sem service containers, sem matriz.
+  #
+  # Por que ele existe: `tests/unit/observability/*-alert-rules.spec.ts`
+  # executa as `expr` reais e cobre limiar, operador e escopo, mas com um
+  # avaliador INSTANTÂNEO — ele afirma o `for:` como CAMPO e não consegue
+  # simular tempo. Quem prova `pending → firing` é `promtool test rules`, e
+  # um arquivo de teste que ninguém executa apodrece.
+  #
+  # Usa o `/bin/promtool` da imagem oficial do Prometheus em vez de baixar o
+  # binário Go solto: a imagem é assinada, versionada e já está no cache do
+  # runner. A tag é pinada — não existe Prometheus versionado neste repo
+  # hoje (só um exemplo sem tag em `docs/runbooks/redis.md`); quando existir,
+  # ESTA tag e a do deploy têm de andar juntas.
+  # ---------------------------------------------------------------------
+  alert-rules:
+    name: regras de alerta (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
+      # sintaticamente inválido ou uma `expr` que não compila derruba o
+      # carregamento do grupo inteiro no Prometheus, em silêncio.
+      #
+      # Os globs sao expandidos AQUI, no runner, dentro de `monitoring/alerts`,
+      # e so os nomes resolvidos entram no `docker run`. A primeira versao
+      # passava `*.rules.yml` cru: o shell do runner tem `cwd` na RAIZ do repo,
+      # o glob nao casava nada, bash o repassava literal e o promtool respondia
+      # `path '*.rules.yml' does not exist`. Expandir dentro do container
+      # resolveria tambem, mas exigiria `--entrypoint sh` e um shell na imagem;
+      # assim o job nao depende de nada alem do proprio binario.
+      - name: promtool check rules (todos os arquivos)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./*.rules.yml)
+          echo "arquivos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            check rules $files
+
+      # E a prova temporal, que é a razão de o job existir.
+      - name: promtool test rules (semântica de for:)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./tests/*.test.yml)
+          echo "casos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            test rules $files
+
+  # ---------------------------------------------------------------------
+  # Round-trip REAL do `drizzle-kit` (#574, achado da revisão do PR #594).
+  #
+  # Por que ele existe: até aqui NADA versionado executava o binário que a
+  # #574 troca de major. `tests/unit/drizzle-kit-esbuild-advisory.spec.ts`
+  # afere LOCKFILE (e diz isso de si mesmo), e o `smoke-migrate-image` roda
+  # `tsx scripts/migrate.ts` sobre os `.sql` já versionados — nenhum dos dois
+  # carrega o loader/gerador do drizzle-kit. Uma regressão do gerador neste
+  # major, ou num update que o Dependabot abra dentro de `^0.31`, passava por
+  # todos os checks.
+  #
+  # `scripts/probe-drizzle-kit.ts` fecha `generate → up → down` contra um
+  # banco CRIADO E DERRUBADO pela própria execução, e exige que os literais
+  # que só existem depois do alias `@/*` resolvido apareçam no SQL gerado —
+  # foi exatamente aí que o drizzle-kit 0.28 morria.
+  #
+  # Job NOVO e isolado, no mesmo padrão de `smoke-migrate-image` e
+  # `alert-rules`: sem matriz e sem compartilhar nada com os jobs acima. NÃO
+  # tem `continue-on-error` de propósito — um gate de schema que só avisa não
+  # é gate. Medido: ~6s depois do `npm ci` (generate + up + down).
+  # ---------------------------------------------------------------------
+  drizzle-kit-roundtrip:
+    name: round-trip do drizzle-kit (generate + up + down)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # Mesma imagem do job `integration`: o SQL gerado hoje não usa
+        # `vector`, mas o dia em que o schema ganhar uma coluna dessas o job
+        # não pode virar o único lugar que reprova por falta de extensão.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # A sonda NUNCA escreve neste banco: ela só lê host/usuário/senha desta
+      # URL e cria o seu próprio `drizzle_kit_probe_*` ao lado, derrubado no
+      # `finally`. `POSTGRES_USER` é superusuário na imagem oficial, então o
+      # `CREATE DATABASE` funciona sem grant extra.
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          # Uma perna só, no piso de `engines.node`: o objeto sob teste é o
+          # binário do drizzle-kit, não a compatibilidade de Node major — essa
+          # já é coberta pela matriz dos jobs `validate` e `integration`.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Mesmo motivo dos demais jobs: o lockfile é npm 11 e `npm ci` com npm
+        # 10 quebra. Tem de rodar ANTES do `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # Mesmo motivo dos jobs `validate`/`integration`: quem barra de fato é
+        # `devEngines.runtime`, e este passo existe para a MENSAGEM. Tem de
+        # rodar ANTES do `npm ci` — `tests/unit/scripts/check-node.spec.ts`
+        # varre TODOS os workflows e reprova qualquer `npm ci` sem ele.
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        # `npm ci` (e não `npm i`): a sonda existe para exercitar a versão que
+        # o LOCKFILE resolve, que é o artefato central da #574.
+        run: npm ci
+
+      - name: Round-trip do drizzle-kit contra Postgres descartável
+        run: npm run probe:drizzle-kit

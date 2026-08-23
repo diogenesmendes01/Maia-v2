@@ -51,10 +51,9 @@ cd /opt/maia   # checkout do repo no host
 cp .env.app.prod.example .env.app       && chmod 600 .env.app
 cp .env.admin.prod.example .env.admin   && chmod 600 .env.admin
 # preencha ambos — placeholders __SET_ME__ são rejeitados no boot.
-#
-# ATENÇÃO: `cp` + preencher os placeholders NÃO basta para app/admin-ui
-# subirem. Os dois exemplos não cobrem tudo que o profile `production`
-# exige — leia "O que os exemplos NÃO cobrem" logo abaixo ANTES do `up`.
+# Desde a issue #572, `cp` + preencher os `__SET_ME__` É o conjunto completo:
+# os exemplos declaram TODAS as chaves que o profile `production` exige.
+# Quem prova isso é o preflight abaixo — não este comentário.
 
 # Credenciais de infra — usadas SÓ para interpolação do compose
 cat > .env.infra <<'EOF'
@@ -66,60 +65,205 @@ MAIA_ENV=production                        # OBRIGATÓRIA — ver abaixo
 EOF
 chmod 600 .env.infra
 
+# Pré-voo de configuração — OBRIGATÓRIO, e antes do `up`
+npm run config:preflight
+
 docker compose --env-file .env.infra -f compose.prod.yml up -d --build
 docker compose --env-file .env.infra -f compose.prod.yml ps
 ```
 
-### O que os exemplos NÃO cobrem (gap conhecido — issue #572)
+### O pré-voo de configuração (`npm run config:preflight`, issue #572)
 
-`cp` + "preencha os placeholders" **não** produz um ambiente que sobe. Os dois
-`.prod.example` são o conjunto mínimo do schema Zod de `src/config/env.ts`; o
-**contrato** (`src/config/contract.ts`) exige mais no profile `production`, e
-essas chaves não estão nos exemplos.
+```
+$ npm run config:preflight
+Maia config preflight — compose.prod.yml (interpolação: .env.infra)
 
-O gate que a issue #516 entrega cobre o **migrator, e só ele**: `migrate` não
-tem `env_file`, recebe apenas o subset `migrator` do contrato pelo
-`environment:` do compose, e satisfaz o loader. `app` e `admin-ui` **reprovam
-no boot** — depois de o migrator ter saído com sucesso e o gate
-`service_completed_successfully` ter liberado a subida.
+── serviço migrate → loaders migrator · env_file: (nenhum)
+  · subset migrator
+    Maia config — profile production (contrato 1.0.0, hash 895b4af7779cc842)
+    OK: nenhuma inconsistência encontrada.
 
-Acrescente à mão, depois do `cp`:
+── serviço app → loaders runtime · env_file: .env.app
+  ...
 
-**`.env.app` — nenhuma destas aparece em `.env.app.prod.example`, nem
-comentada.** Não há linha para descomentar; são seis chaves novas:
+── serviço admin-ui → loaders runtime + admin-ui · env_file: .env.admin
+  · subset runtime
+    ...
+  · subset admin-ui
+    ...
+  · gates de boot do admin-ui (src/admin-ui/lib/auth-gating.ts)
+    OK: comprimentos e padrões aceitos (isto NÃO testa o IdP).
+```
 
-| Chave | Por que o contrato exige em `production` |
+Sai **0** quando os três ambientes efetivos satisfazem o contrato, e **1** com
+a lista completa de problemas quando não. Rode-o depois de preencher os
+`__SET_ME__` e **antes** do `up`: é a diferença entre corrigir um `.env` na sua
+frente e descobrir a falta no boot de um container, depois de o `migrate` já ter
+saído com sucesso e o gate `service_completed_successfully` ter liberado a
+subida.
+
+**Por que não `config:check --env-file .env.app`.** Porque ele dá falso
+positivo. O container `app` não recebe só o `.env.app`: `compose.prod.yml`
+injeta `DATABASE_URL`, `REDIS_URL`, `POSTGRES_*`, `NODE_ENV` e `MAIA_ENV` pelo
+`environment:`, interpolados do `.env.infra`. Checar uma fonte só erra dos dois
+lados — acusa como ausente o que o compose injeta, e não vê o que o compose
+sobrescreve. E `config check` valida o contrato INTEIRO, então reprovaria o
+`migrate` (que de propósito recebe só o subset `migrator`) por variáveis que ele
+nunca deve ver. O preflight compõe as duas fontes na precedência do Compose
+(`env_file` primeiro, `environment:` por cima) e valida **cada serviço contra
+TODOS os subsets que o processo daquele container avalia no boot** — o mesmo
+`validateConfig` do boot.
+
+“Todos”, e não “o loader nominal”, é o ponto: o container do `admin-ui` importa
+`src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts` e
+`src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), e aquele
+singleton chama `validateConfig({ service: 'runtime' })`. Ele é portanto
+validado contra **`runtime` + `admin-ui`**, mais os **gates de boot próprios do
+console**. Antes da review de PR #595 o preflight validava só o subset
+`admin-ui`: tirar do `.env.admin` uma chave somente-runtime deixava o comando
+verde e o container caía no boot.
+
+Ele lê o compose com o mesmo parser subset estrito das specs de #516
+(`src/config/compose-env.ts`) e a interpolação COMPLETA do
+`compose-go/template` — `$$`, `$VAR`, `${VAR}`, `${VAR:-d}`, `${VAR-d}`,
+`${VAR:+r}`, `${VAR+r}`, `${VAR:?m}`, `${VAR?m}` —, inclusive **dentro dos
+`env_file`**, que o `docker compose` também interpola (aspas simples continuam
+literais). Um `.env.infra` sem `MAIA_ENV` **falha no preflight**, na mesma linha
+em que o `up` abortaria; uma forma que o parser não reconheça **lança**, em vez
+de resolver diferente do Compose.
+
+`tests/unit/config/compose-config-differential.spec.ts` compara o ambiente
+reconstruído com o que o `docker compose config` REAL resolve (o subcomando
+`config` não precisa de daemon). É a única medição do preflight que não passa
+pelo parser dele — sem ela, os dois lados do teste poderiam errar juntos.
+
+**Execução HERMÉTICA, e o shell.** A interpolação sai do `.env.infra` e de mais
+nada. O `docker compose`, porém, dá **precedência ao ambiente exportado no
+shell** sobre o `--env-file`. Então o preflight compara: toda variável
+**referenciada por interpolação** que esteja exportada no seu shell **com valor
+diferente** do `.env.infra` é reportada como divergência e **reprova** o
+comando, com o nome da variável (nunca o valor) e a instrução de `unset` ou de
+alinhar o arquivo. Sem isso, um `export MAIA_ENV=staging` esquecido faria o
+preflight certificar um ambiente e o `up` subir outro.
+
+"Referenciada" é a **união** do YAML com os `env_file`, e não só o YAML: o
+Compose interpola `${…}` dentro de um `env_file` e o ambiente do projeto
+(`--env-file` + shell) vence até as chaves definidas no próprio arquivo. Um
+`.env.admin` com `NEXTAUTH_URL=https://${DOMAIN}/admin` e um `DOMAIN` exportado
+diferente do `.env.infra` mudaria a URL que o `up` materializa sem que `DOMAIN`
+apareça em lugar nenhum do `compose.prod.yml`. Referência em **comentário** e
+valor entre **aspas simples** não contam — o Compose não interpola nem um nem
+outro, e um alarme falso permanente é um alarme que se aprende a ignorar.
+
+Argumentos: `--compose <arquivo>` (default `compose.prod.yml`), `--infra
+<arquivo>` (default `.env.infra`), `--profile <p>` para forçar um profile e
+`--json` para saída de máquina.
+
+#### O que o preflight NÃO cobre
+
+Um verde aqui **não** é promessa de que os containers sobem. Ele é a garantia de
+que o **contrato** está satisfeito. Fora do alcance dele:
+
+| Não cobre | Onde isso aparece |
 |---|---|
-| `BACKUP_S3_BUCKET` | `requiredIn: ['staging','production']` |
-| `BACKUP_S3_ACCESS_KEY` | `requiredWhen`: `BACKUP_S3_BUCKET` presente |
-| `BACKUP_S3_SECRET_KEY` | `requiredWhen`: `BACKUP_S3_BUCKET` presente |
-| `BACKUP_ENCRYPTION_MODE` | o default `none` é **recusado** em production (`backup/production-encryption`) — o valor de produção é `envelope_aes256_gcm` |
-| `BACKUP_ENCRYPTION_KEYRING` | `requiredWhen`: `BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm` |
-| `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` | `requiredWhen`: `BACKUP_ENCRYPTION_MODE=envelope_aes256_gcm` |
+| **Conectividade.** Nada abre conexão com Postgres, Redis, S3 ou IdP. Um `BACKUP_S3_BUCKET` sintaticamente válido apontando para bucket inexistente passa. | `maia doctor` (issue #517); a primeira run do `nightly_backup` |
+| **A CONECTIVIDADE do IdP.** Os gates de boot do admin-ui (comprimento de `NEXTAUTH_SECRET` e `OIDC_CLIENT_SECRET`, padrões de placeholder, `https://` do issuer) **passaram a ser cobertos** — `src/config/admin-boot-gates.ts`, espelhado com teste de paridade. O que continua fora é se o issuer existe, se o client é válido e se o IdP responde. | `maia doctor` (issue #517); a primeira tentativa de sign-in |
+| **O `.env.infra` além da interpolação.** Ele é lido para resolver `${…}`; o preflight não julga a força da senha do Postgres. | — |
+| **Qualquer coisa que o operador passe direto ao `docker compose` na linha de comando** (`-e`, `--env-file` extra). O preflight lê os arquivos, não a invocação. Variáveis do SHELL são a exceção: elas são detectadas e reprovam (ver acima). | — |
+| **Migrations, imagem e runtime.** O smoke do §0 é quem cobre isso. | `npm run smoke:migrate:image` |
 
-São **duas rodadas de erro**, não uma: o primeiro boot acusa apenas
-`BACKUP_ENCRYPTION_MODE` e `BACKUP_S3_BUCKET`; preenchê-las é o que destrava a
-exigência das outras quatro. Preencher só o que a primeira mensagem lista
-devolve uma segunda falha de boot.
+#### Por que o preflight é a ÚNICA checagem do subset `admin-ui`
 
-**`.env.admin` — as quatro `OIDC_*` existem no exemplo, porém COMENTADAS**
-(`.env.admin.prod.example`, seção "Sign-in de produção"). O exemplo dizia
-"configure as quatro (ou nenhuma)"; esse "ou nenhuma" **não vale em
-production** — o contrato marca as quatro com
-`requiredIn: ['staging','production']` — e o texto do arquivo já foi corrigido.
-Descomente e preencha `OIDC_ISSUER` (tem de ser `https://`), `OIDC_CLIENT_ID`,
-`OIDC_CLIENT_SECRET` e `OIDC_TENANT_SLUGS`.
+Vale dizer isto em voz alta, porque muda o que "reprova no boot" significa para
+o container do console.
 
-> **TODO (issue #572)** — alinhar contrato, `.prod.example` e este runbook, e
-> acrescentar um preflight `config:check` real dos **dois** consumidores, para
-> que esta seção vire um comando em vez de uma lista conferida à mão. Decidir
-> se produção realmente obriga backup off-site cifrado e SSO é decisão de
-> produto, não de wiring — por isso ela não foi tomada aqui.
->
-> Enquanto isso, o gap está preso em
-> `tests/unit/migrations/compose-prod-effective-env.spec.ts` (`describe` "gap
-> conhecido…"), que afirma as chaves acima pelos dois lados: fica vermelho se o
-> gap crescer **e** se ele fechar sem esta seção ser atualizada junto.
+O `admin-ui` importa `src/config/env.ts` — direto em
+[`src/admin-ui/trpc/tool-enablement.ts`](../../src/admin-ui/trpc/tool-enablement.ts)
+e [`src/admin-ui/trpc/routers/tools-catalog.ts`](../../src/admin-ui/trpc/routers/tools-catalog.ts),
+e transitivamente via `@/db/client.ts` — e esse singleton valida o contrato com
+**`service: 'runtime'`** ([`src/config/env.ts`](../../src/config/env.ts),
+`loadConfig()`). Isso corta dos DOIS lados:
+
+- as `OIDC_*` são `services: ['admin-ui']`, ou seja, estão FORA desse subset — o
+  `requiredIn` delas nunca é avaliado ali, e o `validateConfig` descarta
+  explicitamente achados cross-field sobre variáveis fora do escopo do serviço
+  pedido ([`src/config/validate.ts`](../../src/config/validate.ts));
+- e o subset `runtime` INTEIRO é cobrado do container do console, inclusive
+  chaves que ele nunca usa (`WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_*`,
+  `RUNTIME_TRACE_HMAC_MASTER_SECRET` e as seis `BACKUP_*`). É por isso que
+  `.env.admin.prod.example` as traz — ver o CAVEAT no topo daquele arquivo, e o
+  aviso de blast radius do bloco `BACKUP_*`.
+
+`loadAdminConfig()`
+([`src/config/admin-config.ts`](../../src/config/admin-config.ts)) existe, mas
+**nenhum caminho de boot o chama**.
+
+Consequência prática, e ela é pior que "o container não sobe": com as quatro
+`OIDC_*` ausentes, o admin-ui **sobe**. `oidcProviderEnabled()` trata
+`OIDC_ISSUER` vazio como "este deploy não usa OIDC" e devolve `false` em
+silêncio — em produção, onde o provider de dev está desligado, isso registra
+ZERO providers e entrega a tela "no providers configured". E o literal
+`default` em `OIDC_TENANT_SLUGS` passa igual: a regra que o recusa
+(`admin-ui/tenant-slugs-default-literal`) vive no contrato, no subset
+`admin-ui`, que aquele boot não avalia.
+
+`npm run config:preflight` é, hoje, o único lugar que roda o loader
+`admin-ui` sobre o ambiente efetivo do container `admin-ui` — e desde a review
+de PR #595 ele roda TAMBÉM o subset `runtime` e os gates de boot do console,
+porque é isso que o container faz.
+
+**O que continua dependendo de disciplina de runbook, dito sem eufemismo:**
+fechar a assimetria no CÓDIGO — fazer o boot do console chamar
+`loadAdminConfig()` — é a **issue #596**, e NÃO está feito. Enquanto ela não
+landar, pular `npm run config:preflight` ainda permite subir um `admin-ui` sem o
+subset OIDC/fail-closed avaliado. O preflight é o gate; ele só protege quem o
+roda.
+
+#### O gap que ele fechou
+
+Até a #572, `cp` + "preencha os placeholders" **não** produzia um ambiente que
+sobe, e o runbook trazia aqui uma lista de dez chaves para acrescentar à mão:
+
+- **`.env.app`** — seis `BACKUP_*` que não apareciam no exemplo **nem
+  comentadas**, em **duas rodadas** de erro (o primeiro boot acusava só
+  `BACKUP_ENCRYPTION_MODE` e `BACKUP_S3_BUCKET`; preenchê-las destravava
+  `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY`, `BACKUP_ENCRYPTION_KEYRING` e
+  `BACKUP_ENCRYPTION_ACTIVE_KEY_ID`).
+- **`.env.admin`** — as quatro `OIDC_*`, presentes porém **comentadas**, sob um
+  texto que dizia "configure as quatro (ou nenhuma)". Comentário não chega a
+  `process.env`: para um container, elas estavam ausentes.
+
+As dez agora são linhas reais nos dois `.prod.example`, com os mesmos valores
+que `npm run config:init -- --profile production` emite. Duas decisões que
+estavam abertas na issue, e a evidência de cada uma:
+
+- **As `BACKUP_*` são mesmo do `app`.** Nesta topologia o `app` **é** o executor
+  do backup: `compose.prod.yml` não tem container de backup, e o processo sobe
+  no role default `all`, que possui `cron_scheduler`
+  ([`src/runtime/lifecycle/roles.ts`](../../src/runtime/lifecycle/roles.ts)) —
+  de onde saem `nightly_backup`, `backup_retention` e `restore_drill`
+  ([`src/workers/index.ts`](../../src/workers/index.ts)), que leem os valores por
+  [`src/ops/backup/config-input.ts`](../../src/ops/backup/config-input.ts).
+  Afrouxar o `requiredIn` não daria um "deploy sem backup remoto": em
+  `production`, `BACKUP_ENABLED=false` e `BACKUP_OFFSITE_REQUIRED=false` já são
+  recusados (issue #520), e sem bucket a regra `backup/offsite-destination`
+  reprovaria o mesmo boot com uma mensagem pior.
+- **`OIDC_TENANT_SLUGS` nunca é `default`.** O exemplo trazia
+  `OIDC_TENANT_SLUGS=default` na linha comentada. O slug vai **direto** para
+  `appUsersRepo.getByEmail(tenant, email)` e `tenantsRepo.findById(tenant)` em
+  [`src/admin-ui/lib/auth-resolver.ts`](../../src/admin-ui/lib/auth-resolver.ts):
+  ele **é** o `tenant_id`, num caminho dinâmico que `AGENTS.md` §4 (regras 2 e 8)
+  proíbe. A regra `admin-ui/tenant-slugs-default-literal` recusa — e o preflight
+  é o que faz essa regra rodar antes do deploy, porque o boot do admin-ui **não**
+  chama o validador do contrato (ver "O que o preflight NÃO cobre").
+
+Preso por teste nos dois lados:
+[`tests/unit/config/preflight.spec.ts`](../../tests/unit/config/preflight.spec.ts)
+(toda reprova sobre o exemplo cru é de uma chave que o exemplo deixa ao
+operador — nenhuma sobra sem dono) e
+[`tests/unit/migrations/compose-prod-effective-env.spec.ts`](../../tests/unit/migrations/compose-prod-effective-env.spec.ts)
+(o ambiente efetivo dos três satisfaz o loader, e cada linha acrescentada é
+load-bearing: tirá-la volta a reprovar).
 
 ### `MAIA_ENV` é obrigatória, e de propósito não tem default
 
@@ -148,10 +292,10 @@ fontes são duas fontes que podem divergir — o migrator rodaria num profile e
 os consumidores em outro, sem nada apontando a contradição. Fonte única,
 `.env.infra`, propagada pelo compose.
 `tests/unit/migrations/compose-prod-effective-env.spec.ts` monta o ambiente
-efetivo dos três (env file + `environment:`, ambos lidos do repositório) e
-roda o loader de cada um — verificando que `MAIA_ENV` deixou de ser um dos
-problemas. Ele **não** afirma que esse ambiente sobe: o que falta para isso
-está na seção anterior, e o próprio spec o prende por nome.
+efetivo dos três (env file + `environment:`, ambos lidos do repositório, pelo
+mesmo módulo que o preflight usa) e roda o loader de cada um — verificando que
+`MAIA_ENV` deixou de ser um dos problemas **e**, desde a #572, que não sobrou
+nenhum outro.
 
 Faltou a linha no `.env.infra`, o compose **aborta antes de criar container
 algum**:

@@ -121,11 +121,44 @@ export type RunModuleOptions<TOut> = {
   conversa_id?: string;
   turno_id?: string;
   audit?: boolean;
+  /**
+   * Issue #507 — CANCELAMENTO do caller (hoje: perda da lease do turno, via
+   * `TurnExecutionContext.signal`).
+   *
+   * Opcional de propósito. `runCognitiveModule` tem ~30 call sites, e a maioria
+   * roda FORA de um turno reivindicado (workers de batch, drift, KSM). Exigir o
+   * sinal de todos seria uma migração grande sem defeito correspondente. Quem
+   * passa o sinal opta pelo vocabulário novo (`status: 'cancelled'`); quem não
+   * passa mantém exatamente o comportamento anterior.
+   *
+   * ATENÇÃO ao contrato: passar `signal` NÃO basta para cancelar de verdade. O
+   * runner repassa o sinal composto ao `fn`, e é o `fn` que precisa entregá-lo
+   * à operação subjacente — o parâmetro `signal` do gateway de LLM, por
+   * exemplo. Sem isso o `Promise.race` devolve ao caller enquanto o trabalho
+   * continua: o defeito que a #507 existe para fechar.
+   */
+  signal?: AbortSignal;
 };
 
 export type RunModuleResult<TOut> = {
   output: TOut | null;
-  status: 'success' | 'timeout' | 'error' | 'skipped';
+  /**
+   * Issue #507 — `cancelled` é ESTADO PRÓPRIO, não um sabor de `error`.
+   *
+   * Antes, um abort caía no `catch` genérico e virava `status='error'` com
+   * `fallback_triggered=true`. No ReAct isso fazia um cancelamento DELIBERADO
+   * (a lease do turno foi perdida) aparecer no log e na métrica como falha de
+   * raciocínio — e o `cognitive_module_log` afirmava, para um turno que já não
+   * era nosso, ou `success` (quando o LLM voltava antes de alguém olhar o
+   * sinal) ou `error` (quando abortava). As duas linhas mentem sobre coisas
+   * diferentes; nenhuma delas é "esta tentativa foi cancelada".
+   *
+   * `fallback_triggered` fica FALSE neste caminho: não houve degradação de
+   * qualidade a explicar, houve interrupção. Marcar fallback aqui contaminaria
+   * a taxa de fallback — a métrica que existe para dizer quanto o produto
+   * degradou — com cancelamentos administrativos.
+   */
+  status: 'success' | 'timeout' | 'error' | 'skipped' | 'cancelled';
   fallback_triggered: boolean;
   latency_ms: number;
 };

@@ -36,8 +36,10 @@ export const llmSuggester: RoleSuggester = {
         timeoutMs: 3000,
         triggered_by: 'sync_conditional',
         fallback: null,
+        // Issue #507 (achado 2) — cancelamento da tentativa de turno.
+        signal: input.signal,
       },
-      async () => {
+      async (signal) => {
         const rolesBlock = input.available_roles
           .map(
             (r) =>
@@ -61,6 +63,9 @@ export const llmSuggester: RoleSuggester = {
           max_tokens: 200,
           system,
           messages: [{ role: 'user', content: user }],
+          // Issue #507 — o sinal COMPOSTO (turno + timeout do módulo) chega ao
+          // gateway; sem ele a requisição seguia paga até o fim da lease alheia.
+          signal,
         });
         const text = completion.content ?? '';
         const match = text.match(/\{[\s\S]*\}/);

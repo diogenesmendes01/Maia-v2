@@ -128,6 +128,8 @@ That only works **across commits**. In `runner` mode the whole file is one trans
 
 `115_agent_turns_pending_race_lost.sql` is the worked example: three phases (new constraint under a temporary name `NOT VALID` → `VALIDATE` → short catalog-only swap), each its own commit. The price is the `none` protocol — the ledger row no longer commits with the DDL — so the file owes the reader an explicit crash matrix, and the runbook owes the operator a recovery table per intermediate state ([`docs/runbooks/migrations.md`](../../runbooks/migrations.md#dirty-on-115_agent_turns_pending_race_lostsql-troca-de-check-em-fases)). `tests/integration/migration-115-constraint-swap.spec.ts` pins the guarantee observably: a second client writes to `agent_turns` while the `VALIDATE` runs, under `lock_timeout`, and dies with `55P03` the moment the marker is removed.
 
+`116_mensagens_tipo_evento.sql` is the second one, on `mensagens` — the inbound/outbound table, where holding `ACCESS EXCLUSIVE` for the scan blocks every message in and out. It shipped first as a bare `DROP` + `ADD` in `runner` mode and was rewritten to the same three phases; `tests/integration/migration-116-constraint-swap.spec.ts` pins it the same observable way.
+
 **Down files are the opposite case.** They are applied by hand with `psql -v ON_ERROR_STOP=1 -f`, statement by statement, in a maintenance window — so a down that is *meant* to fail (because reverting would destroy evidence) must be one complete `BEGIN; … COMMIT;`, or its deliberate failure commits the `DROP` and leaves the table without the constraint it was protecting.
 
 ## States and what blocks
@@ -299,9 +301,14 @@ postgres healthy → migrate (runs `npm run db:migrate`, exits 0) → app + admi
 | prod: `tmpfs: /tmp` | not hygiene — `tsx` creates `/tmp/tsx-<uid>` before loading the first module, so a read-only rootfs without it kills the job at line one (measured by the smoke gate below) |
 | dev: does **not** pin `NODE_ENV`/`MAIA_ENV` | `loadMigrationConfig()` rejects a contradiction between them (`profile/node-env-conflict`); pinning only `NODE_ENV=production` — what the `app` service does — would break every `.env` derived from `.env.example` |
 
-The local flow is untouched: `docker compose up -d postgres redis`
-(`npm run test:integration:setup`) names its services explicitly, so it starts
-only those two and their dependencies — never the job.
+The local flow is untouched: `npm run test:integration:setup` (which runs
+`docker compose up -d --wait postgres redis` through `scripts/test-infra.ts`)
+names its services explicitly, so it starts only those two and their
+dependencies — never the job. Since issue #571 the Compose project name is
+pinned in the file (`name: maia-v2`) so every `git worktree` drives the SAME
+shared stack instead of asking for a private one with global container names;
+the teardown, which destroys that shared stack, requires
+`TEST_INFRA_TEARDOWN=yes`.
 
 `tests/unit/migrations/compose-migrate-job.spec.ts` reads BOTH real files and
 pins these properties, including an executable one: the environment
