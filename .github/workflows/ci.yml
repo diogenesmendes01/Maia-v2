@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
           # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
@@ -268,7 +268,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Mesmo piso pinado dos jobs matriciais (22.18), para o audit rodar
           # no Node que as outras lanes rodam.
@@ -373,7 +373,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
           # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
@@ -620,7 +620,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Uma perna só, no piso de `engines.node`: o objeto sob teste é o
           # binário do drizzle-kit, não a compatibilidade de Node major — essa
