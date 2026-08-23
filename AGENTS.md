@@ -134,6 +134,9 @@ npm run audit:exceptions:check    # todo advisory do npm audit está corrigido o
 npm run config:generate           # regenera .env.example, docs/configuration.md, schema, manifest, fixtures
 npm run config:check -- --profile production --env-file .env
 npm run config:init -- --profile development
+npm run config:preflight          # ambiente EFETIVO de cada serviço do compose
+                                  # (env_file + environment: interpolado),
+                                  # validado ANTES do `up` (#572)
 
 # Build
 npm run build                     # tsc + tsc-alias
