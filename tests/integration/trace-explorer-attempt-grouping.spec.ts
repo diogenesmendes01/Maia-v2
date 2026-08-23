@@ -98,6 +98,18 @@ vi.mock('@/config/env.js', () => ({
     RUNTIME_TRACE_BODY_ORPHAN_SEC: 300,
   },
 }));
+vi.mock('@/config/contract-env.js', () => ({
+  contractEnv: {
+    NODE_ENV: 'test',
+    FEATURE_RUNTIME_TRACE_V1: true,
+    MAIA_STRICT_METRIC_LABELS: false,
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: 'attempt-grouping-spec-secret',
+    RUNTIME_TRACE_HMAC_KEY_VERSION: 1,
+    RUNTIME_TRACE_DEBUG_AES_KEY: Buffer.alloc(32, 3).toString('base64'),
+    RUNTIME_TRACE_DEBUG_S3_BUCKET: undefined,
+    RUNTIME_TRACE_BODY_ORPHAN_SEC: 300,
+  },
+}));
 
 const { traceTurnDecision, envelopeTraceIdForAttempt } = await import(
   '@/observability/turn-trace.js'

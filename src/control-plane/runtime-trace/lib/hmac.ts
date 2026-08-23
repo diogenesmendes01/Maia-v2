@@ -24,7 +24,10 @@
  * insertion order, so a re-signed payload always produces the same HMAC.
  */
 import { createHmac, hkdfSync } from 'node:crypto';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 
 const KEY_CACHE = new Map<string, Buffer>();
 

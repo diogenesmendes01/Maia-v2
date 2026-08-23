@@ -10,6 +10,13 @@ vi.mock('../../src/config/env.js', () => ({
     RUNTIME_TRACE_HMAC_MASTER_SECRET: undefined,
   },
 }));
+vi.mock('../../src/config/contract-env.js', () => ({
+  contractEnv: {
+    NODE_ENV: 'test',
+    RUNTIME_TRACE_HMAC_KEY_VERSION: 1,
+    RUNTIME_TRACE_HMAC_MASTER_SECRET: undefined,
+  },
+}));
 
 import {
   signHmac,

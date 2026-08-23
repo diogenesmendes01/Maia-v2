@@ -583,13 +583,23 @@ export function composeEnvFileInterpolationRefs(
 export const COMPOSE_SERVICE_CONTRACT: Readonly<Record<string, readonly MaiaService[]>> = {
   migrate: ['migrator'],
   app: ['runtime'],
-  // `runtime` porque o boot do Next.js importa `@/config/env.js`; `admin-ui`
-  // porque `npm run config:preflight` é, hoje, o ÚNICO lugar que avalia aquele
-  // subset (as `OIDC_*` são `services: ['admin-ui']` e ficam fora do
-  // `runtime`). Fazer o boot chamar `loadAdminConfig()` é a issue #596 —
-  // enquanto ela não landar, o preflight é o gate, e é por isso que ele valida
-  // os DOIS em vez de escolher um.
-  'admin-ui': ['runtime', 'admin-ui'],
+  // UM subset, e é o do próprio serviço — desde a issue #596.
+  //
+  // Esta entrada foi `['runtime', 'admin-ui']` entre a #572 e a #596, e a lista
+  // não era exagero: o container do console importava `src/config/env.ts` (nos
+  // dois routers de tools e transitivamente por `@/db/client.ts`), aquele
+  // singleton chamava `validateConfig({ service: 'runtime' })`, e medir só
+  // `admin-ui` aqui deixava o preflight verde para um `.env.admin` que
+  // derrubava o container no boot.
+  //
+  // A #596 desfez a causa em vez de continuar modelando o sintoma: os módulos
+  // COMPARTILHADOS passaram a ler o contrato por `src/config/contract-env.ts`,
+  // nenhum caminho de import do console chega mais a `src/config/env.ts`
+  // (`tests/unit/config/admin-import-boundary.spec.ts` reprova se voltar), e o
+  // boot do console valida o subset `admin-ui` em
+  // `src/admin-ui/instrumentation.ts`. Voltar a listar `runtime` aqui passaria
+  // a cobrar do `.env.admin` as seis `BACKUP_*` que o console não usa.
+  'admin-ui': ['admin-ui'],
 };
 
 /**

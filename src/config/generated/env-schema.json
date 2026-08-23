@@ -1736,7 +1736,8 @@
       "x-maia-group": "feature-flags",
       "x-maia-secret": false,
       "x-maia-services": [
-        "runtime"
+        "runtime",
+        "admin-ui"
       ],
       "x-maia-restart-required": true,
       "default": "false",
@@ -2070,7 +2071,8 @@
       "x-maia-group": "runtime-trace",
       "x-maia-secret": false,
       "x-maia-services": [
-        "runtime"
+        "runtime",
+        "admin-ui"
       ],
       "x-maia-restart-required": true,
       "default": "1",
@@ -2085,7 +2087,8 @@
       "x-maia-group": "runtime-trace",
       "x-maia-secret": true,
       "x-maia-services": [
-        "runtime"
+        "runtime",
+        "admin-ui"
       ],
       "x-maia-restart-required": true,
       "x-maia-required-in": [
@@ -2100,7 +2103,8 @@
       "x-maia-group": "runtime-trace",
       "x-maia-secret": true,
       "x-maia-services": [
-        "runtime"
+        "runtime",
+        "admin-ui"
       ],
       "x-maia-restart-required": true
     },

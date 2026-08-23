@@ -37,6 +37,13 @@ vi.mock('../../src/config/env.js', () => ({
     MAIA_CHANNEL_ROUTING_MODE: 'strict',
   },
 }));
+vi.mock('../../src/config/contract-env.js', () => ({
+  contractEnv: {
+    MAIA_STAGING_KEYRING: JSON.stringify({ k1: KEY }),
+    MAIA_STAGING_ACTIVE_KEY_ID: 'k1',
+    MAIA_CHANNEL_ROUTING_MODE: 'strict',
+  },
+}));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));

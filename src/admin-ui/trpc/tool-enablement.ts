@@ -24,14 +24,20 @@
  *     drift bug, surfaced by treating the tool as off rather than silently on).
  *
  * IMPORT SAFETY (PR #207 critical, re-verified round-2): this module imports
- * ONLY `@/config/env` (zod validation; side-effect-free) and
- * `@/config/feature-flags` (the `featureFlags` singleton). The feature-flags
- * module's transitive imports are `@/types/enums` (pure literal maps, zero
- * imports) and `@/config/env` (zod + dotenv config load + a pure path-validation
- * import) — NO tool handlers, NO gateway, NO timers/Redis/BullMQ. It is
- * therefore the SAME import-cost class as `tools-catalog.ts` (which already
- * imports `config` directly). Do NOT import the registry or any tool handler
- * here, or the gateway side-effects PR #207 removed return.
+ * ONLY `@/config/contract-env` (contract schemas + a lazy `process.env` read)
+ * and `@/config/feature-flags` (the `featureFlags` singleton, which since issue
+ * #596 reads through the same accessor). Their transitive imports are
+ * `@/types/enums` (pure literal maps, zero imports) and `@/config/contract`
+ * (zod only) — NO tool handlers, NO gateway, NO timers/Redis/BullMQ. Do NOT
+ * import the registry or any tool handler here, or the gateway side-effects
+ * PR #207 removed return.
+ *
+ * NOT `@/config/env` (issue #596): that singleton validates the `runtime`
+ * subset AT IMPORT, so this line made the console's container demand the six
+ * `BACKUP_*` — S3 credentials included — in a process that never runs a
+ * backup. `contractEnv` parses ONE variable, with the contract's own schema,
+ * when it is read; the console's boot validation lives where it belongs, in
+ * `src/admin-ui/instrumentation.ts` (subset `admin-ui`, fail-closed).
  *
  * CROSS-CONTAINER CAVEAT: admin-ui and maia-app run in SEPARATE processes, each
  * with its OWN in-memory `featureFlags` singleton (overrides/kill switches are
@@ -42,7 +48,7 @@
  * gate available without a shared flag store. (Config-initial values are
  * identical across containers when the env is, so the common case agrees.)
  */
-import { config } from '@/config/env.js';
+import { contractEnv } from '@/config/contract-env.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { FeatureFlagName } from '@/types/enums.js';
 
@@ -58,9 +64,12 @@ import { FeatureFlagName } from '@/types/enums.js';
  * tool) is the only env-var-name flag that remains. Mirrors `tools-catalog.ts`'s
  * `FLAG_TO_CONFIG`.
  */
-const ENV_FLAG_TO_CONFIG: Readonly<Record<string, boolean>> = {
-  FEATURE_PDF_REPORTS: config.FEATURE_PDF_REPORTS,
-};
+function envFlagValue(name: string): boolean | undefined {
+  // Read at CALL time, not at module load: `contractEnv` parses on access, and
+  // a module-level read would put a config parse in the import graph of every
+  // consumer of this helper.
+  return name === 'FEATURE_PDF_REPORTS' ? contractEnv.FEATURE_PDF_REPORTS : undefined;
+}
 
 /** The set of valid `FeatureFlagName` VALUES, for the runtime-vs-env decision. */
 const FEATURE_FLAG_VALUES: ReadonlySet<string> = new Set(
@@ -81,5 +90,5 @@ export function isToolEnabledByFlag(feature_flag: string | null): boolean {
     return featureFlags.isEnabled(feature_flag as FeatureFlagName);
   }
   // Env-var-name flag (REGISTRY presence gate) → static config.
-  return ENV_FLAG_TO_CONFIG[feature_flag] ?? false;
+  return envFlagValue(feature_flag) ?? false;
 }

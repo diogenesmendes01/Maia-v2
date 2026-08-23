@@ -108,13 +108,20 @@ const INFRA = {
 const SERVICES: readonly { compose: string; contracts: readonly MaiaService[] }[] = [
   { compose: 'migrate', contracts: ['migrator'] },
   { compose: 'app', contracts: ['runtime'] },
-  // LISTA, e não escalar: o container do console avalia os DOIS no boot. Ele
-  // importa `src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts`
-  // e `src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`), e
+  // A LISTA fica; o CONTEÚDO dela encolheu na issue #596. Entre a #572 e a
+  // #596 o console avaliava os DOIS subsets no boot, porque importava
+  // `src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts` e
+  // `src/admin-ui/trpc/routers/tools-catalog.ts`, e via `@/db/client.ts`) e
   // aquele singleton chama `validateConfig({ service: 'runtime' })`. Medir só
-  // `admin-ui` aqui era medir um contrato que o container não roda — o falso
-  // verde do achado [Alta] nº 1 da review de PR #595.
-  { compose: 'admin-ui', contracts: ['runtime', 'admin-ui'] },
+  // `admin-ui` naquela época era medir um contrato que o container não rodava —
+  // o falso verde do achado [Alta] nº 1 da review de PR #595.
+  //
+  // A #596 desfez a causa: nenhum import do console alcança o singleton
+  // (`tests/unit/config/admin-import-boundary.spec.ts`) e o boot do console
+  // valida `admin-ui` em `src/admin-ui/instrumentation.ts`. A estrutura de
+  // lista permanece porque a pergunta continua sendo "quais validadores este
+  // container roda?" — hoje a resposta é um.
+  { compose: 'admin-ui', contracts: ['admin-ui'] },
 ];
 
 /**
@@ -194,22 +201,27 @@ const FECHARAM_O_GAP: Readonly<Record<string, readonly string[]>> = {
     'BACKUP_S3_BUCKET',
     'BACKUP_S3_SECRET_KEY',
   ],
-  // As seis BACKUP_* entraram na review de PR #595, pelo mesmo motivo das seis
-  // do `app` e um nível acima: o container do console valida o subset `runtime`
-  // no boot (ver SERVICES), então `BACKUP_S3_BUCKET` (`requiredIn`) e
-  // `BACKUP_ENCRYPTION_MODE` (`backup/production-encryption`) o derrubavam — e
-  // nem o preflight nem este spec diziam isso, porque mediam só `admin-ui`.
+  // As seis BACKUP_* estiveram aqui entre a review de PR #595 e a issue #596,
+  // pelo mesmo motivo das seis do `app` e um nível acima: o container do
+  // console validava o subset `runtime` no boot, então `BACKUP_S3_BUCKET`
+  // (`requiredIn`) e `BACKUP_ENCRYPTION_MODE` (`backup/production-encryption`)
+  // o derrubavam. SAÍRAM na #596 — o console não valida mais `runtime`, e
+  // mantê-las no `.env.admin` seria dar a um container web as credenciais do
+  // bucket de backup sem nenhuma razão que sobrevivesse à pergunta "quem lê
+  // isto?". O caso "LOAD-BEARING" abaixo é o que impede a lista de voltar por
+  // inércia: uma chave que o loader já não exige reprova ali.
+  //
+  // RUNTIME_TRACE_HMAC_MASTER_SECRET entrou no lugar, e por motivo oposto: o
+  // console LÊ o segredo (os repositórios de trace verificam a integridade dos
+  // envelopes), então a #596 declarou as três `RUNTIME_TRACE_HMAC_*` como
+  // `services: ['runtime', 'admin-ui']` no contrato. Ela está aqui porque é
+  // exigida, não porque veio de carona.
   'admin-ui': [
-    'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
-    'BACKUP_ENCRYPTION_KEYRING',
-    'BACKUP_ENCRYPTION_MODE',
-    'BACKUP_S3_ACCESS_KEY',
-    'BACKUP_S3_BUCKET',
-    'BACKUP_S3_SECRET_KEY',
     'OIDC_CLIENT_ID',
     'OIDC_CLIENT_SECRET',
     'OIDC_ISSUER',
     'OIDC_TENANT_SLUGS',
+    'RUNTIME_TRACE_HMAC_MASTER_SECRET',
   ],
 };
 
