@@ -218,13 +218,42 @@ export async function runDecisionEngineForTurn(
   // Deliberately OUTSIDE the try/catch above: a `traceTurnDecision` throw means
   // a MANDATORY envelope could not be written, which must fail the turn closed
   // — but it must not be misreported as "the engine crashed", so it surfaces as
-  // itself rather than being wrapped in DecisionEngineFailClosedError.
-  await traceTurnDecision({
-    base,
-    packet: result.packet,
-    block: result.block ?? null,
-    evaluation_ms: Date.now() - t0,
-  });
+  // itself rather than being wrapped in DecisionEngineFailClosedError. O
+  // try/catch abaixo PRESERVA isso: ele só reclassifica perda de posse e
+  // RELANÇA o erro original intacto, sem envolvê-lo em nada.
+  try {
+    await traceTurnDecision({
+      base,
+      packet: result.packet,
+      block: result.block ?? null,
+      evaluation_ms: Date.now() - t0,
+    });
+  } catch (err) {
+    // Issue #507 (achado da rodada 2) — CAMINHO DE ERRO DO TRACE.
+    //
+    // Com `FEATURE_RUNTIME_TRACE_V1` ligado, a gravação do envelope durável é
+    // outro await longo, e a lease pode cair no meio dele. Se o erro subisse
+    // cru, `src/agent/core.ts` reconheceria `MandatoryTraceEnvelopeError` e
+    // entraria no handler dele: `audit(...)` + `failTurnRetryable(...)` — duas
+    // escritas no turno que JÁ É de outro worker, exatamente o desfecho que o
+    // fencing existe para impedir.
+    //
+    // A ORDEM é o ponto: a posse é conferida PRIMEIRO. Se ela caiu, o que
+    // emerge é `TurnOwnershipLostError` e o handler de envelope nunca roda; se
+    // ela está intacta, o erro ORIGINAL segue — não engolimos falha de
+    // evidência, que continua fail-closed no caller.
+    assertTurnOwnership('decision_engine');
+    throw err;
+  }
+
+  // Issue #507 (achado da rodada 2) — GUARD DEPOIS DO AWAIT DO TRACE.
+  //
+  // O guard que roda ANTES do trace cobre o intervalo até ele, não além. Sem
+  // este, uma gravação de envelope que resolve depois do abort devolvia o
+  // packet ao core, que pode executar `block`/`escalate`/`execute_skill` —
+  // inclusive RESPONDER ao usuário — em nome da tentativa velha. Nenhum
+  // consumo do pacote pode acontecer sem uma conferência imediatamente antes.
+  assertTurnOwnership('decision_engine');
 
   return { engine_ran: true, result };
 }

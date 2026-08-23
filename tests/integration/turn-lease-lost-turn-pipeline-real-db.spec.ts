@@ -206,6 +206,57 @@ vi.mock('@/scheduling/disambiguation.js', async (importOriginal) => {
   };
 });
 
+/**
+ * Os PONTOS DE PAUSA da rodada 2 da revisão do dono — o mesmo padrão do achado
+ * do Decision Engine ("guard, await, consumo sem guard depois"), nos dois
+ * outros limites onde ele existia:
+ *
+ *  - `pessoasRepo.findByPhone` roda ENTRE `assertTurnOwnership('scheduling_inbound_hook')`
+ *    e `captureInboundForOutreach`, que MUTA estado de scheduling;
+ *  - `procedureSelectorDecisionsRepo.record` roda ENTRE
+ *    `assertTurnOwnership('preturn_graph')` e `procedureEngine.startExecution`,
+ *    que CRIA uma `procedure_executions`.
+ *
+ * Ambos DELEGAM ao repositório real e só então chamam o gancho: a operação
+ * observada acontece de verdade, e a perda de posse cai exatamente na janela.
+ * O gancho é de UM DISPARO — `procedure-selector` também chama `findById`, e
+ * `captureInboundForOutreach` também busca pessoas.
+ */
+const repoHooks = vi.hoisted(() => ({
+  aposFindByPhone: null as null | (() => Promise<void>),
+  aposSelectorRecord: null as null | (() => Promise<void>),
+}));
+vi.mock('@/db/repositories.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/db/repositories.js')>();
+  const umDisparo = async (k: 'aposFindByPhone' | 'aposSelectorRecord'): Promise<void> => {
+    const gancho = repoHooks[k];
+    if (!gancho) return;
+    repoHooks[k] = null;
+    await gancho();
+  };
+  return {
+    ...actual,
+    pessoasRepo: {
+      ...actual.pessoasRepo,
+      findByPhone: async (...args: Parameters<typeof actual.pessoasRepo.findByPhone>) => {
+        const r = await actual.pessoasRepo.findByPhone(...args);
+        await umDisparo('aposFindByPhone');
+        return r;
+      },
+    },
+    procedureSelectorDecisionsRepo: {
+      ...actual.procedureSelectorDecisionsRepo,
+      record: async (
+        ...args: Parameters<typeof actual.procedureSelectorDecisionsRepo.record>
+      ) => {
+        const r = await actual.procedureSelectorDecisionsRepo.record(...args);
+        await umDisparo('aposSelectorRecord');
+        return r;
+      },
+    },
+  };
+});
+
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
@@ -490,20 +541,42 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     llm.abortadas = [];
     llm.before = async () => {};
     outreach.calls = 0;
+    repoHooks.aposFindByPhone = null;
+    repoHooks.aposSelectorRecord = null;
 
     const conversa_id = await mkConversa();
     await mkPendingQuestion(conversa_id);
     const mensagem_id = await mkInbound(conversa_id);
 
-    if (opts.perderEm !== null && opts.perderEm !== 'pending_gate') {
+    const perder = async (): Promise<void> =>
+      loseOwnershipForReal(await turnIdFor(mensagem_id));
+
+    // Os dois pontos de pausa de repositório (rodada 2). Armados fora do
+    // `llm.before` porque nenhum dos dois passa por chamada de LLM.
+    if (opts.perderEm === 'procedure_start') {
+      repoHooks.aposSelectorRecord = perder;
+    }
+
+    if (
+      opts.perderEm !== null &&
+      opts.perderEm !== 'pending_gate' &&
+      opts.perderEm !== 'scheduling_hook' &&
+      opts.perderEm !== 'procedure_start'
+    ) {
       llm.before = async (workload: string) => {
-        if (workload === opts.perderEm) await loseOwnershipForReal(await turnIdFor(mensagem_id));
+        if (workload === opts.perderEm) await perder();
       };
     }
 
     setClassifierForTesting(async () => {
       if (opts.perderEm === 'pending_gate') {
-        await loseOwnershipForReal(await turnIdFor(mensagem_id));
+        await perder();
+      }
+      // O gate é a última coisa antes do hook de scheduling: armar aqui garante
+      // que o gancho de UM DISPARO caia no `findByPhone` DELE, e não numa busca
+      // anterior do pipeline.
+      if (opts.perderEm === 'scheduling_hook') {
+        repoHooks.aposFindByPhone = perder;
       }
       // Resolução DELIBERADAMENTE fraca: sem o desfecho `cancelled`, o gate
       // devolve `unresolved/low_confidence` e o core segue para o pipeline
@@ -538,6 +611,12 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     expect(
       await selectorDecisionRows(turno_id),
       'e a decisão do selector tem de ter virado estado',
+    ).toBeGreaterThan(0);
+    // Rodada 2 — sem esta linha o zero de `execucoesDaConversa` nas barreiras
+    // não significaria nada: talvez o CONTROLE também nunca crie execução.
+    expect(
+      await execucoesDaConversa(conversa_id),
+      'e o procedimento selecionado tem de ter iniciado uma execução',
     ).toBeGreaterThan(0);
     // A SEQUÊNCIA COMPLETA do que roda depois do gate, na ordem do pipeline:
     // o reasoner do grafo pre-turn, o classificador de risco do Decision Engine
@@ -658,6 +737,98 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     ).toBeNull();
 
     // 4. E parou NO GRAFO — não num guard mais adiante.
+    expect(
+      await boundariesBloqueados(),
+      'a recusa tem de vir do grafo pre-turn',
+    ).toEqual(['preturn_graph']);
+  }, 60_000);
+
+  /**
+   * ─── Rodada 2 da revisão do dono, MESMO PADRÃO em outro limite ────────────
+   *
+   * O achado da rodada 2 é sobre o Decision Engine: "guard antes, await,
+   * consumo com efeito depois — sem novo guard". O hook de scheduling tinha a
+   * mesma forma: `assertTurnOwnership('scheduling_inbound_hook')` roda ANTES de
+   * dois `import()` dinâmicos e de `pessoasRepo.findByPhone`, e só DEPOIS disso
+   * vem `captureInboundForOutreach`, que MUTA estado de scheduling (anexa a
+   * resposta à occurrence, avança a máquina, pode notificar o dono).
+   *
+   * A pausa é no `findByPhone` do próprio hook: a busca acontece de verdade, a
+   * lease é tomada de verdade, e o que se mede é se a MUTAÇÃO seguinte
+   * aconteceu.
+   */
+  it('BARREIRA (hook de scheduling): a lease cai entre a busca e a mutação', async () => {
+    const { mensagem_id, turno_id, conversa_id, desde } = await rodarTurno({
+      perderEm: 'scheduling_hook',
+    });
+
+    // 1. A MUTAÇÃO não aconteceu. É o observável do achado, e é o que separa
+    //    este caso do guard de fora (que já havia rodado, com posse, e deixado
+    //    passar).
+    expect(
+      outreach.calls,
+      'captureInboundForOutreach mutou scheduling depois de a posse acabar',
+    ).toBe(0);
+
+    // 2. E nada depois dele: o pipeline inteiro parou aqui.
+    expect(llm.workloads, 'nenhum reasoner pode rodar depois da perda').toEqual([]);
+    expect(await selectorLogRows(desde), 'o grafo pre-turn rodou sem posse').toBe(0);
+    expect(
+      await selectorDecisionRows(turno_id),
+      'procedure_selector_decisions foi gravado sem posse',
+    ).toBe(0);
+    expect(await execucoesDaConversa(conversa_id), 'uma execução nasceu sem posse').toBe(0);
+    expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
+    expect(
+      await processadaEm(mensagem_id),
+      'processada_em foi carimbado por quem já não tinha a posse',
+    ).toBeNull();
+
+    // 3. E o limite que recusou é o hook — não um guard mais adiante. Sem o
+    //    guard NOVO (o de dentro do `if (owner)`), a mutação rodaria e quem
+    //    recusaria seria `preturn_graph`: é esta linha que discrimina.
+    expect(
+      await boundariesBloqueados(),
+      'a recusa tem de vir do hook de scheduling',
+    ).toEqual(['scheduling_inbound_hook']);
+  }, 60_000);
+
+  /**
+   * Mesmo padrão, terceiro limite: o INÍCIO DE PROCEDIMENTO pós-grafo.
+   *
+   * `assertTurnOwnership('preturn_graph')` roda antes de
+   * `procedureSelectorDecisionsRepo.record`; entre ele e
+   * `procedureEngine.startExecution` ainda há esse INSERT e um
+   * `procedureDefinitionsRepo.findById`. `procedure_executions` é estado do
+   * turno — nascer de uma tentativa sem posse é a gravação que a #504 fecha.
+   *
+   * O CONTRASTE aqui é interno ao próprio caso: a row de
+   * `procedure_selector_decisions` EXISTE (foi escrita com a posse intacta) e a
+   * execução NÃO. É o que prova que a barreira é esta, e não uma anterior.
+   */
+  it('BARREIRA (início de procedimento): a decisão fica, a execução não nasce', async () => {
+    const { mensagem_id, turno_id, conversa_id } = await rodarTurno({
+      perderEm: 'procedure_start',
+    });
+
+    expect(
+      await selectorDecisionRows(turno_id),
+      'a decisão foi gravada COM posse — sem ela o caso não chegou onde devia',
+    ).toBeGreaterThan(0);
+    expect(
+      await execucoesDaConversa(conversa_id),
+      'procedure_executions nasceu de uma tentativa sem posse',
+    ).toBe(0);
+
+    // O turno parou aqui: o Decision Engine e o ReAct nunca foram alcançados.
+    expect(llm.workloads, 'nenhum reasoner posterior ao grafo pode rodar').toEqual([
+      'procedure_selector',
+    ]);
+    expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
+    expect(
+      await processadaEm(mensagem_id),
+      'processada_em foi carimbado por quem já não tinha a posse',
+    ).toBeNull();
     expect(
       await boundariesBloqueados(),
       'a recusa tem de vir do grafo pre-turn',

@@ -961,6 +961,13 @@ async function runAgentTurnPipeline(params: {
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;
       const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
       if (owner) {
+        // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard acima roda
+        // ANTES de dois `import()` dinâmicos e de um round-trip ao banco
+        // (`findByPhone`). Entre ele e a MUTAÇÃO abaixo há awaits, logo há
+        // janela para o takeover. Conferir de novo imediatamente antes do
+        // efeito é o que fecha a janela; o guard de fora continua existindo
+        // pelo motivo dele (recusar cedo, fora do `catch` fail-soft).
+        assertTurnOwnership('scheduling_inbound_hook');
         await captureInboundForOutreach({
           sender: pessoa,
           inbound,
@@ -968,6 +975,10 @@ async function runAgentTurnPipeline(params: {
         });
       }
     } catch (err) {
+      // Issue #507 — perda de posse NÃO é "o hook falhou, siga em frente".
+      // Este `catch` é fail-soft de propósito para erros de scheduling, mas
+      // engolir a recusa de posse devolveria o turno alheio ao pipeline.
+      if (err instanceof TurnOwnershipLostError) throw err;
       logger.warn(
         { err: (err as Error).message, mensagem_id: inbound.id },
         'agent.scheduling_inbound_hook_failed',
@@ -1090,6 +1101,13 @@ async function runAgentTurnPipeline(params: {
       // them into the single outer `try` regressed that isolation — a
       // procedure-engine throw dropped activeRole + roleAnnouncement
       // (user-facing). Restore the boundary here.
+      //
+      // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard do grafo roda
+      // antes do `record()` acima; daqui até cada escrita do procedure engine
+      // ainda há awaits (`record`, `findById`). `startExecution` /
+      // `abortExecution` mudam `procedure_executions`, que é estado do turno:
+      // cada uma leva a conferência imediatamente antes de si, e não uma só no
+      // topo do bloco.
       try {
         if (
           selectorOutput.decision === 'start' &&
@@ -1100,6 +1118,7 @@ async function runAgentTurnPipeline(params: {
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
+            assertTurnOwnership('preturn_graph');
             const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
@@ -1113,6 +1132,7 @@ async function runAgentTurnPipeline(params: {
           selectorOutput.selected_procedure_id &&
           activeExecution
         ) {
+          assertTurnOwnership('preturn_graph');
           await procedureEngine.abortExecution({
             execution_id: activeExecution.id,
             reason: 'switched_by_selector',
@@ -1122,6 +1142,7 @@ async function runAgentTurnPipeline(params: {
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
+            assertTurnOwnership('preturn_graph');
             const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
@@ -1132,6 +1153,10 @@ async function runAgentTurnPipeline(params: {
           }
         }
       } catch (err) {
+        // Issue #507 — este catch existe para não deixar o procedure engine
+        // derrubar o turno; a recusa por perda de posse não é falha dele e
+        // tem de atravessar até o handler do escopo da tentativa.
+        if (err instanceof TurnOwnershipLostError) throw err;
         logger.warn(
           { err: (err as Error).message, conversa_id: c.id },
           'procedure.start_failed',

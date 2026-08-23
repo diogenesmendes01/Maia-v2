@@ -515,7 +515,7 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 | `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
 | `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |
 | `tests/integration/pending-race-lost-terminal.spec.ts` | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta |
-| `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | O desfecho `cancelled` e os guards a jusante: perda de posse real (claim SQL → takeover → heartbeat → `AbortSignal`) no gate, no grafo pre-turn e no Decision Engine, provando ausência de mutação e de resposta em cada um — e QUAL limite recusou, via `maia_turn_effect_blocked_total{boundary}` |
+| `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | O desfecho `cancelled` e os guards a jusante: perda de posse real (claim SQL → takeover → heartbeat → `AbortSignal`) no gate, no hook de scheduling, no grafo pre-turn (inclusive entre a decisão do selector e o `startExecution`) e no Decision Engine, provando ausência de mutação e de resposta em cada um — e QUAL limite recusou, via `maia_turn_effect_blocked_total{boundary}` |
 | `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
 | `tests/unit/agent/` | Per-step contracts |
 | `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |
