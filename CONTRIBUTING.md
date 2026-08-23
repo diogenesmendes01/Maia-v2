@@ -155,8 +155,21 @@ npm run admin:dev
 
 ```bash
 npm run test:admin-ui:unit          # Vitest (58+ testes)
-npm run test:admin-ui:e2e           # Playwright (requer dev server up)
+npm run test:admin-ui:e2e           # Playwright, projeto `smoke` (exige console no ar)
+npm run test:admin-ui:e2e:ci        # o que o CI roda: `admin:build` -> sobe o
+                                    # console construído -> smoke -> derruba
 npm run admin:acceptance            # 11 gates (skip-e2e por padrão)
+```
+
+O job `admin-ui` do CI é o gate: `next build` e o projeto `smoke` do Playwright
+reprovam a PR. As specs marcadas `@pendente-472` em `tests/admin-ui/e2e/` estão
+FORA do gate — elas exigem sessão autenticada e fixtures que
+`scripts/seed-proposals-fixtures.ts` ainda não cria (issue #472). A lista de
+arquivos em quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`,
+então sair dela é um diff visível.
+
+```bash
+npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha hoje, por desenho)
 ```
 
 ### Feature flags

@@ -125,7 +125,12 @@ echo "Gate 11: E2E tests (Playwright)"
 if [ "$SKIP_E2E" = "1" ]; then
   echo "  SKIP  Gate 11: --skip-e2e flag set"
 elif [ -d "src/admin-ui/node_modules" ] && [ -d "node_modules/@playwright" ]; then
-  npx playwright test tests/admin-ui/e2e/ > /tmp/p8.5-e2e.log 2>&1 \
+  # Delega ao MESMO runner do CI (sobe o console construído, roda o projeto
+  # `smoke`, reprova rodada com 0 teste). Antes daqui este gate chamava
+  # `npx playwright test tests/admin-ui/e2e/` sem servidor no ar — o que
+  # reprovaria tudo se o `@playwright/test` estivesse instalado na raiz, e
+  # pulava em silêncio porque ele não estava.
+  npm run test:admin-ui:e2e:ci > /tmp/p8.5-e2e.log 2>&1 \
     && pass "Gate 11: Playwright E2E suite" \
     || { cat /tmp/p8.5-e2e.log; fail "Gate 11: E2E failed"; }
 else

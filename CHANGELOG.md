@@ -29,6 +29,27 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 4. **`COMPOSE_SERVICE_CONTRACT['admin-ui']` voltou a ser `['admin-ui']`.** `npm run config:preflight` continua sendo o gate que mede os ARQUIVOS antes de existir container; ele deixou de ser a ÚNICA checagem daquele subset.
 
+### Added — CI constrói e executa o console de administração ([#472](https://github.com/diogenesmendes01/Maia-v2/issues/472) parte A)
+
+Pré-requisito declarado das issues [#604](https://github.com/diogenesmendes01/Maia-v2/issues/604) (Next 15.5 → 16) e [#605](https://github.com/diogenesmendes01/Maia-v2/issues/605) (Recharts 2 → 3): até aqui o CI rodava `admin:typecheck` e as specs de `tests/admin-ui/unit/`, e **nenhum dos dois executa o console**. Um `next build` quebrado e uma regressão de runtime do Admin passavam por todos os checks.
+
+- **Job novo `admin-ui`** em `.github/workflows/ci.yml`, bloqueante: `next build` + Playwright contra o console **construído**, com Postgres (pgvector) e Redis de serviço, migrations aplicadas e Chromium instalado pelo próprio workflow.
+- **`tests/admin-ui/e2e/console-boot.spec.ts`**: smoke de boot do artefato — redirect do middleware (bundle Edge), route handler do NextAuth, hidratação do bundle de cliente, cabeçalhos de segurança de `next.config.mjs`, e canário de "zero erro de console / zero 5xx".
+- **`scripts/admin-ui-e2e.sh`** sobe e derruba o console e **falha fechado** em cada pré-requisito ausente (sem build, sem `DATABASE_URL`/`REDIS_URL`/`NEXTAUTH_SECRET`, servidor que não responde).
+- **`scripts/check-playwright-run.ts`** reprova rodada com **0 teste executado** ou com **qualquer teste pulado**. O Playwright sai com código 0 quando não acha teste nenhum; sem esse piso, "Running 0 tests" seria um check verde.
+- **`tests/unit/ci/admin-ui-e2e-gate.spec.ts`** impede o gate de ser desarmado por edição: `continue-on-error` num passo de veredito, piso de testes removido, quarentena crescendo em silêncio, e divergência entre o env de build do CI e o do `src/admin-ui/Dockerfile`.
+
+### Fixed — o build da imagem do console estava quebrado, e três comandos documentados não rodavam
+
+Encontrados ao construir o gate acima. Todos eram invisíveis porque nada no CI executava o console.
+
+- **`src/admin-ui/Dockerfile`**: o bloco de env do estágio `build` estava desatualizado em relação ao contrato #515. Sem `MAIA_ENV` e sem `BACKUP_S3_BUCKET`/`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, `next build` morria em `Failed to collect page data for /api/auth/[...nextauth]` — ou seja, a imagem de produção do Admin **não construía**.
+- **`npm run admin:build` / `admin:start`**: eram `cd src/admin-ui && next build`, e o `next` só existe em `src/admin-ui/node_modules`, que não está no `PATH` de um script npm da raiz. Falhavam com `sh: 1: next: not found`. Agora delegam via `npm --prefix src/admin-ui run build`.
+- **`npm run test:admin-ui:e2e`**: morria em `Cannot find package '@playwright/test' imported from playwright.config.ts` antes mesmo de carregar o config — o pacote só existia no `node_modules` do admin-ui. `@playwright/test` passa a ser `devDependency` da raiz, onde o config e as specs vivem.
+
+### Changed — suíte e2e do Admin dividida em `smoke` e `jornadas-pendentes`
+
+`playwright.config.ts` ganha dois `projects`. O gate do CI roda **`smoke`**. As dez specs de P8.5/#518 ficam marcadas `@pendente-472` no título do `describe` e **fora do gate**: elas navegam para telas atrás de sessão (o `middleware.ts` redireciona tudo para `/auth/signin`) e dependem de fixtures que `scripts/seed-proposals-fixtures.ts` não cria (`test-id`, `locked-test`, `hard-limit-test`, `audit-test`, `reject-test`, `test-trace-id`). Fazê-las passar é o corpo da #472. A quarentena é auditável: a lista exata de arquivos é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, e uma spec e2e nova entra em `smoke` por construção.
 
 ### ⚠️ BREAKING (operacional) — `/readyz` passa a gatear no veredito canônico de schema ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 

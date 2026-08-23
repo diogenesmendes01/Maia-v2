@@ -66,11 +66,13 @@
     "typecheck": "tsc --noEmit",
     "admin:install": "cd src/admin-ui && npm install",
     "admin:dev": "bash scripts/admin-ui-dev.sh",
-    "admin:build": "cd src/admin-ui && next build",
-    "admin:start": "cd src/admin-ui && next start --port 4000",
+    "admin:build": "npm --prefix src/admin-ui run build",
+    "admin:start": "npm --prefix src/admin-ui run start",
     "admin:typecheck": "cd src/admin-ui && tsc --noEmit",
     "test:admin-ui:unit": "vitest run tests/admin-ui/unit/",
-    "test:admin-ui:e2e": "playwright test tests/admin-ui/e2e/",
+    "test:admin-ui:e2e": "playwright test --project=smoke",
+    "test:admin-ui:e2e:ci": "bash scripts/admin-ui-e2e.sh",
+    "test:admin-ui:e2e:pendentes": "playwright test --project=jornadas-pendentes",
     "admin:acceptance": "bash scripts/admin-ui-acceptance-gates.sh"
   },
   "dependencies": {
@@ -111,6 +113,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.51.1",
     "@testcontainers/postgresql": "^12.0.1",
     "@trpc/server": "11.17.0",
     "@types/node": "^25.9.2",
