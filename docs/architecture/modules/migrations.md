@@ -22,6 +22,8 @@ Introduced by issue #516. Replaces the loop that used to live inline in `scripts
 | `scripts/migrate.ts` | CLI: `up` (default), `plan`, `status`, `repair`. Parses argv, prints, picks an exit code, and injects the contract's timeouts. Nothing else. |
 | `src/config/migration-config.ts` | The migrator's config projection: `loadMigrationConfig()` + `migrationRunOptions()` (contract ⇒ `RunOptions`). Keeps `src/migrations/` free of `process.env`. |
 | `src/observability/migration-collector.ts` | Scrape-time publication of the canonical verdict as Prometheus gauges. Reads, never writes. |
+| `src/migrations/release-gate.ts` | **The gate outside Compose (#565).** Pure: filters an orchestrator's environment down to the `migrator` subset and decides the exit code. Touches no database. |
+| `scripts/release-migrate.ts` | CLI (`npm run release:migrate`): spawns the migrator with the filtered environment and propagates its exit code. The thing you paste into a deploy panel. |
 
 ## Scope: migrations are GLOBAL, not tenant-scoped
 
@@ -388,6 +390,49 @@ migration, and it is not a boot-time migrator inside the app: `app` still starts
 and if two deploys overlap, the global advisory lock serialises them and the
 second migrator exits cleanly.
 
+## The gate outside Compose (issue #565)
+
+`service_completed_successfully` is a Compose primitive. The three guarantees
+the job buys are properties of the FILE — `restart: "no"`, the *absence* of
+`env_file:`, and the `depends_on` edge — so a deploy that runs the same image
+under a different orchestrator loses them silently, which is the failure mode
+the job exists to eliminate.
+
+`npm run release:migrate` (`scripts/release-migrate.ts` over
+`src/migrations/release-gate.ts`) reproduces what a single command can
+reproduce:
+
+| Guarantee (#516) | How the gate reproduces it |
+|---|---|
+| runs the migrations **once**, exit 0 / non-zero | spawns the same `npm run db:migrate` and propagates the child's exit code unchanged; 0 leaves the gate by exactly one path |
+| gets **only** the `migrator` subset (#515) | allowlist over the contract plus a closed list of process variables (`PATH`, `HOME`, `npm_config_cache`, …). `NODE_OPTIONS` and every `npm_config_*` other than the cache are withheld on purpose |
+| consumers do not start until it succeeds | **only when chained** — `release:migrate && exec node dist/index.js`, where the `&&` is what enforces it. A panel's pre-deploy field can do the same, and whether a given panel does is NOT verified anywhere in this repo |
+
+What is withheld is reported by name, never by value, in a
+`release_gate.env_scrubbed` line. A withheld `MAIA_*`/`FEATURE_*` key the
+contract does not declare gets its own list: the migrator would have refused
+to boot on it (`contract/unknown`), so withholding it silently would turn a
+loud configuration error into a green deploy.
+
+Two things this does NOT recover, stated because the difference matters during
+an incident: the surrounding container still HOLDS the secrets (only the
+migrator *process* is denied them — a smaller blast radius, not the same one),
+and `app`/`admin-ui` have no edge between them outside Compose, so ordering is
+deploy discipline rather than a declared dependency.
+
+Verified by execution: `tests/integration/release-migrate-gate.spec.ts` runs
+the real command against a real Postgres in a disposable database — happy path
+exit 0 with the full ledger, a dirty ledger exiting non-zero, the filtering
+measured by a discriminator (the same variable makes the raw migrator exit 2
+and never reaches it through the gate), and a chained consumer that does not
+run when the gate fails. `tests/unit/migrations/release-gate.spec.ts` pins the
+command against `compose.prod.yml` itself.
+
+Not verified anywhere: that a deploy panel calls this command before the
+rollout and abandons the rollout when it exits non-zero. That needs an
+instance of the panel, and `docs/runbooks/deploy-prod.md` §7 says so where the
+operator will read it.
+
 ## In-flight / not yet done (issue #516 DoD)
 
 The owner reduced #516's scope formally on 2026-08-15: `maia doctor` moved to #517, and the Coolify/Kubernetes material to #565.
@@ -403,6 +448,11 @@ Still open on #516:
 
 - **a staging drill.** None of this has been exercised against a real staging database: bring up a replica behind the head, watch `/readyz` refuse, run the job, watch it rejoin rotation. Depends on the owner's environment, not on code;
 - **the BOOT step still uses the weaker check — an OWNER decision, not an agent's.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. The canonical verdict (`src/migrations/status.ts`, exposed by `getSchemaReadiness()`) also sees checksum mismatch, `dirty`, orphaned `running`, a missing file and an incompatible head. Unifying them is a POLICY change with two defensible sides: keeping it means a schema condition costs one instance out of rotation with a self-describing 503 body, and that instance stays *inspectable*; unifying it means the same condition becomes a boot failure and, under a restarting supervisor, a **crash loop** — impossible to ignore, but the container you need to inspect is the one that will not stay up. The right answer depends on the supervisor, the alerting and whether anyone can reach the container. Recorded as the owner's decision on #516.
+- **Coolify: entregue na #565** — `npm run release:migrate`, com a separação
+  entre o que foi executado e o que não foi em
+  `docs/runbooks/deploy-prod.md` §7 e na seção abaixo. **Kubernetes segue
+  fora**: decisão do dono, entrega futura; não há manifesto nem init
+  container neste repositório.
 
 ---
 
