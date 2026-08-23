@@ -222,7 +222,7 @@ describe('o hook está onde o Next.js o procura', () => {
       resolve(__dirname, '../../../src/admin-ui/instrumentation.ts'),
       'utf8',
     ).replace(/\/\*[\s\S]*?\*\//g, '');
-    const bloco = /if\s*\(\s*process\.env\.NEXT_RUNTIME\s*===\s*'nodejs'\s*\)\s*\{([\s\S]*?)\n  \}/.exec(src);
+    const bloco = /if\s*\(\s*process\.env\.NEXT_RUNTIME\s*===\s*'nodejs'\s*\)\s*\{([\s\S]*?)\n {2}\}/.exec(src);
     expect(bloco, 'o guard positivo de NEXT_RUNTIME sumiu de instrumentation.ts').not.toBeNull();
     expect(bloco![1]).toContain("await import('./lib/boot-config.js')");
     expect(bloco![1]).toContain('assertAdminBootConfig()');
