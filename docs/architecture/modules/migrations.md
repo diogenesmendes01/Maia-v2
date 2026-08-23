@@ -299,9 +299,14 @@ postgres healthy → migrate (runs `npm run db:migrate`, exits 0) → app + admi
 | prod: `tmpfs: /tmp` | not hygiene — `tsx` creates `/tmp/tsx-<uid>` before loading the first module, so a read-only rootfs without it kills the job at line one (measured by the smoke gate below) |
 | dev: does **not** pin `NODE_ENV`/`MAIA_ENV` | `loadMigrationConfig()` rejects a contradiction between them (`profile/node-env-conflict`); pinning only `NODE_ENV=production` — what the `app` service does — would break every `.env` derived from `.env.example` |
 
-The local flow is untouched: `docker compose up -d postgres redis`
-(`npm run test:integration:setup`) names its services explicitly, so it starts
-only those two and their dependencies — never the job.
+The local flow is untouched: `npm run test:integration:setup` (which runs
+`docker compose up -d --wait postgres redis` through `scripts/test-infra.ts`)
+names its services explicitly, so it starts only those two and their
+dependencies — never the job. Since issue #571 the Compose project name is
+pinned in the file (`name: maia-v2`) so every `git worktree` drives the SAME
+shared stack instead of asking for a private one with global container names;
+the teardown, which destroys that shared stack, requires
+`TEST_INFRA_TEARDOWN=yes`.
 
 `tests/unit/migrations/compose-migrate-job.spec.ts` reads BOTH real files and
 pins these properties, including an executable one: the environment

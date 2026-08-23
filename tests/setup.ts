@@ -6,13 +6,40 @@
  * from blowing up `loadConfig`.
  */
 import { beforeEach } from 'vitest';
+import { resolveTestEnv, resolveWorktreeScope } from './helpers/worktree-scope.js';
 
-process.env.NODE_ENV = 'test';
-process.env.DATABASE_URL = 'postgres://maia_test:test1234@localhost:5432/maia_test';
-process.env.POSTGRES_USER = 'maia_test';
-process.env.POSTGRES_PASSWORD = 'test1234';
-process.env.POSTGRES_DB = 'maia_test';
-process.env.REDIS_URL = 'redis://localhost:6379';
+/**
+ * Issue #571 — isolamento por worktree.
+ *
+ * Numa worktree ligada, `scope` deixa de ser `null` e TODA a infra de teste
+ * passa a apontar para um banco Postgres e um db lógico do Redis exclusivos
+ * daquela árvore. No checkout principal e no CI (`.git` é diretório, não
+ * arquivo) `scope` é `null` e nada muda — os valores abaixo são exatamente os
+ * de antes.
+ *
+ * A derivação é pura, então este arquivo (que roda em CADA worker) e
+ * `tests/globalSetup.ts` (que roda uma vez, e é quem cria e migra o banco)
+ * chegam ao mesmo destino sem depender de herança de env entre processos.
+ */
+const scope = resolveWorktreeScope();
+
+/**
+ * UMA derivação, dois processos — revisão da PR #597.
+ *
+ * `resolveTestEnv()` é a MESMA função que `tests/globalSetup.ts` chama para
+ * decidir qual banco criar/migrar e qual db do Redis limpar. Antes, cada
+ * arquivo montava as URLs por conta própria e as duas expressões divergiram:
+ * o setup global respeitava `REDIS_URL` do ambiente e os workers iam sempre
+ * para `redis://localhost:6379`. Com um Redis em porta/host/credencial
+ * customizados, o `FLUSHDB` acertava um endpoint e os testes rodavam noutro.
+ *
+ * `TEST_DB_URL` é o interruptor das specs de integração (sem ela, todas dão
+ * `describe.skip`) e NÃO é inventada aqui — `npm test` continua passando sem
+ * infra nenhuma. Quando ela existe, sai escopada, e `DATABASE_URL` sai igual a
+ * ela: 54 arquivos afirmam essa igualdade antes de rodar.
+ */
+Object.assign(process.env, { NODE_ENV: 'test' }, resolveTestEnv(process.env, scope));
+
 process.env.ANTHROPIC_API_KEY = 'sk-ant-test-placeholder';
 process.env.OPENROUTER_API_KEY = 'sk-or-test-placeholder';
 process.env.WHATSAPP_NUMBER_MAIA = '+5500000000000';
