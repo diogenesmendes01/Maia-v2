@@ -16,22 +16,30 @@
  * tinha entregue a outro worker. O oposto de "perda de lease cancela o
  * restante da tentativa e impede gravações posteriores".
  *
- * ─── Uma correção ao achado: a row do flush NÃO nasce hoje ─────────────────
+ * ─── A row do flush: era vacuosa, hoje é carga real (issue #577) ───────────
  *
- * O achado cita `flushUnconfirmedToolSummaries()` criando uma row nova em
- * `mensagens`. Contra o schema atual isso NÃO acontece — e não porque alguém
- * tenha consertado: `mensagens_tipo_check` só admite
- * ('texto','audio','imagem','documento','sistema'), e o flush insere
- * `tipo:'evento'`. O INSERT viola a constraint, o `catch` do helper engole o
- * erro e loga `agent.tool_summaries_flush_failed`. Ou seja, o flush é código
- * morto desde sempre, um bug pré-existente FORA do escopo desta rodada.
+ * Uma versão anterior deste cabeçalho registrava que a row do flush NÃO nascia:
+ * `mensagens_tipo_check` só admitia ('texto','audio','imagem','documento',
+ * 'sistema') e `flushUnconfirmedToolSummaries()` insere `tipo:'evento'`, então
+ * todo INSERT violava a constraint e o `catch` do helper engolia. O flush era
+ * código morto desde sempre — e a asserção `countFlushRows === 0` da BARREIRA
+ * passava por esse motivo, não pela barreira que ela diz medir.
  *
- * A asserção sobre `mensagens` fica no teste assim mesmo, marcada como
- * VAZIA hoje: se alguém adicionar 'evento' ao CHECK, ela vira carga real sem
- * ninguém precisar lembrar. O que a barreira de fato observa são as gravações
- * que ATERRISSAM: o `audit_log` da chamada recusada e — a maior delas — o
- * RETORNO normal do laço, que faz `core.ts` decidir o desfecho (concluir ou
- * reenfileirar) de um turno que já não é dele.
+ * A #577 corrigiu o CHECK (`migrations/116_mensagens_tipo_evento.sql`). Isso
+ * muda o significado deste arquivo em dois lugares:
+ *
+ *   - o CONTROLE ganhou a asserção POSITIVA: com a lease viva, cinco tools e
+ *     nenhum outbound, o flush TEM de gravar a row, e o teste confere
+ *     `ferramentas_chamadas` item a item (nome e status das cinco chamadas).
+ *     É o único lugar onde o rastro daquele turno existe;
+ *   - o zero da BARREIRA passa a significar alguma coisa. Ele só é evidência de
+ *     que a perda de posse impede a gravação porque o CONTROLE, nas MESMAS
+ *     cinco iterações, prova que a gravação acontece quando a posse é válida.
+ *
+ * Além dela, a barreira observa as outras gravações que ATERRISSAM: o
+ * `audit_log` da chamada recusada e — a maior delas — o RETORNO normal do laço,
+ * que faz `core.ts` decidir o desfecho (concluir ou reenfileirar) de um turno
+ * que já não é dele.
  *
  * ─── Por que o caso precisa das CINCO iterações ─────────────────────────────
  *
@@ -78,7 +86,44 @@ const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'primary';
 const A = 'primary';
-const TTL_MS = 1_500;
+/**
+ * TTL da lease do DONO legitimo. 30s, e o numero importa.
+ *
+ * Era 1_500ms, e isso quebrava os casos de CONTROLE -- os que provam que, com
+ * a lease VIVA, o efeito acontece normalmente. Medido no CI: o controle do
+ * react-loop leva ~3.9s de corpo. Com TTL de 1.5s e heartbeat de 400ms, a
+ * lease precisa ser renovada ~9 vezes DURANTE o caso, e basta UMA renovacao
+ * chegar atrasada para ela morrer.
+ *
+ * O mecanismo e o CAS, nao falha de heartbeat -- e a primeira versao deste
+ * comentario errava nisso, atribuindo a perda a `MAX_HEARTBEAT_FAILURES`.
+ * Esse caminho exige o BANCO NAO RESPONDER, o que nao estava acontecendo. O
+ * que acontece e: o `UPDATE` de renovacao tem `AND lease_expires_at > now()`
+ * no `WHERE` (`turn-repos.ts`), entao um atraso de agendamento no Node ou de
+ * round-trip no banco maior que o TTL restante faz a lease vencer ANTES de a
+ * renovacao chegar; o CAS devolve zero linhas e a lease se marca perdida com
+ * `token_mismatch` -- sem sucessor nenhum e com o banco saudavel. Bate com o
+ * `lostReason` observado nos logs do CI.
+ *
+ * Sob contencao ela morre, o guard recusa o efeito, e o CONTROLE reprova com
+ * `turn_ownership_lost` -- exatamente o que ele existe para provar que NAO
+ * acontece. O `retry: 1` absorvia, e o vermelho so apareceu porque o bloco
+ * RECUPERADOS PELA SEGUNDA TENTATIVA do reporter (#545/#566) o denunciou.
+ *
+ * Que a renovacao de fato escreve no banco e coberto separadamente, em
+ * `tests/integration/turn-lease-heartbeat-renew-real-db.spec.ts` -- com TTL
+ * curto de proposito, porque com 30s aqui os controles passariam ate se o
+ * timer parasse de disparar.
+ *
+ * Subir NAO enfraquece as BARREIRAS, e vale registrar por que: elas nao perdem
+ * a posse por expiracao. `loseOwnershipForReal()` forca o vencimento por SQL
+ * (`lease_expires_at = now() - interval '1 second'`) e entao um SUCESSOR
+ * reivindica -- e o proprio helper afirma `lostReason === 'token_mismatch'`,
+ * isto e, takeover. Verificado por sonda: com o TTL longo tambem nas
+ * barreiras, elas continuam passando. O TTL curto nao era load-bearing para
+ * nada; era so um cronometro competindo com o corpo do teste.
+ */
+const TTL_MS = 30_000;
 const HEARTBEAT_MS = 400;
 
 /**
@@ -194,15 +239,36 @@ async function loseOwnershipForReal(
   );
 }
 
-/** Rows que o ReAct grava DEPOIS da recusa — o que a issue proíbe. */
-async function countFlushRows(mensagem_id: string): Promise<number> {
-  const r = await pool.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM mensagens
+/**
+ * A row do flush (`flushUnconfirmedToolSummaries`, `src/agent/react-loop.ts`).
+ *
+ * Issue #577 — as DUAS pontas dependem deste mesmo SELECT: no CONTROLE ele tem
+ * de ENCONTRAR a row (o flush é a única gravação do rastro de ferramentas de um
+ * turno sem outbound); na BARREIRA ele tem de NÃO encontrar (a posse acabou).
+ * Antes da #577 o zero da barreira era vacuoso: `mensagens_tipo_check` rejeitava
+ * `tipo='evento'` e o `catch` do helper engolia, então NENHUMA das duas pontas
+ * gravava. O caso do CONTROLE existe para que o zero da barreira volte a
+ * significar alguma coisa.
+ */
+type FlushRow = {
+  conteudo: string | null;
+  metadata: Record<string, unknown>;
+  ferramentas_chamadas: Array<{ tool_name: string; status: string; side_effect: string | null }>;
+};
+
+async function selectFlushRows(mensagem_id: string): Promise<FlushRow[]> {
+  const r = await pool.query<FlushRow>(
+    `SELECT conteudo, metadata, ferramentas_chamadas FROM mensagens
       WHERE tenant_id=$1 AND agent_id=$2 AND direcao='out' AND tipo='evento'
-        AND metadata->>'in_reply_to' = $3`,
+        AND metadata->>'in_reply_to' = $3
+      ORDER BY created_at`,
     [T, A, mensagem_id],
   );
-  return Number(r.rows[0]!.n);
+  return r.rows;
+}
+
+async function countFlushRows(mensagem_id: string): Promise<number> {
+  return (await selectFlushRows(mensagem_id)).length;
 }
 
 /** O audit que o laço escreve por tool-use — inclusive pela chamada recusada. */
@@ -336,6 +402,36 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
     expect((result as { delivery: { exitReason: string } }).delivery.exitReason).toBe(
       'iteration_cap',
     );
+
+    // Issue #577 — A ROW DO FLUSH. Este turno terminou por `iteration_cap`, sem
+    // NENHUM outbound, e cinco ferramentas rodaram: o rastro delas só existe no
+    // histórico se `flushUnconfirmedToolSummaries()` gravar. Não basta afirmar
+    // que o `catch` não disparou — a asserção é o SELECT achando a linha e o
+    // conteúdo de `ferramentas_chamadas` conferido item a item.
+    const flushed = await selectFlushRows(inbound.id);
+    expect(flushed.length, 'o flush TEM de gravar a row do turno sem outbound').toBe(1);
+    const row = flushed[0]!;
+    expect(row.metadata.event_only, 'a row é o placeholder event-only').toBe(true);
+    expect(row.metadata.flush_reason, 'e carrega o motivo da saída sem outbound').toBe(
+      'iteration_cap',
+    );
+    expect(row.conteudo, 'placeholder não tem texto para o LLM ler').toBe('');
+    // As CINCO chamadas do roteiro: 4x `remember_safe_fact` (sucesso) e, na
+    // última iteração, `tool_que_nao_existe` (erro ordinário de tool).
+    expect(
+      row.ferramentas_chamadas.map((s) => s.tool_name),
+      'uma entrada por tool-use do turno, na ordem',
+    ).toEqual([
+      'remember_safe_fact',
+      'remember_safe_fact',
+      'remember_safe_fact',
+      'remember_safe_fact',
+      'tool_que_nao_existe',
+    ]);
+    expect(
+      row.ferramentas_chamadas.map((s) => s.status),
+      'o sucesso e o erro chegam DISTINGUÍVEIS ao histórico',
+    ).toEqual(['success', 'success', 'success', 'success', 'error']);
   }, 60_000);
 
   it('BARREIRA: perdida a posse na última iteração, nenhuma gravação posterior', async () => {
@@ -374,9 +470,9 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
       await countRefusalAudits(inbound.id),
       'o laço tem de parar ANTES do audit da chamada recusada',
     ).toBe(0);
-    // VAZIA hoje (ver cabeçalho): `mensagens_tipo_check` rejeita
-    // `tipo='evento'`, então o flush nunca grava. Fica aqui para virar carga
-    // real no dia em que o CHECK admitir 'evento'.
+    // Issue #577 — este zero NÃO é mais vacuoso: o CONTROLE acima, nas mesmas
+    // cinco iterações e com a lease viva, exige a row PRESENTE. A ausência aqui
+    // é a barreira, não o CHECK.
     expect(
       await countFlushRows(inbound.id),
       'o flush não pode criar row em mensagens depois da perda',
@@ -390,6 +486,28 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
     expect(thrown, 'o laço deveria ter encerrado a tentativa').toBeInstanceOf(
       TurnOwnershipLostError,
     );
-    expect((thrown as { boundary: string }).boundary).toBe('react_tool_refused');
+    // Issue #507 — A BARREIRA SUBIU UM DEGRAU, e é por isso que este valor
+    // mudou de `react_tool_refused` para `react_reasoner`.
+    //
+    // Quando este caso foi escrito, o `callLLM` do reasoner era chamado SEM
+    // `signal`: a perda encenada aqui — durante o round-trip da última
+    // iteração — não era percebida por ninguém até a tool seguinte bater no
+    // guard do dispatcher. A #507 levou o `AbortSignal` da tentativa até o
+    // `callLLM`, então a MESMA perda, no MESMO instante, agora encerra o laço no
+    // próprio reasoner: a chamada paga é abortada em voo, e o laço nem chega a
+    // considerar a tool.
+    //
+    // O que este caso PROVA continua idêntico — nenhuma gravação aterrissa
+    // depois da perda, e o core não decide o desfecho de um turno que não é
+    // dele. O que mudou é que agora ele para mais cedo, que é o ganho da #507.
+    //
+    // A TRADUÇÃO da recusa do dispatcher (`{ error: 'turn_ownership_lost' }` →
+    // `TurnOwnershipLostError('react_tool_refused')`, react-loop.ts:405) segue
+    // no código e segue certa: ela cobre a janela em que a posse se perde
+    // DENTRO de `dispatchTool` (entre o guard de entrada e o handler), que é o
+    // cenário de `turn-lease-lost-tool-handler-real-db.spec.ts`. O que este
+    // arquivo deixou de alcançar foi o instante "durante o reasoner", porque
+    // ele agora é interceptado antes — e interceptar antes era o objetivo.
+    expect((thrown as { boundary: string }).boundary).toBe('react_reasoner');
   }, 60_000);
 });

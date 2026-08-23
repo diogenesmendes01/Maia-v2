@@ -23,6 +23,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { arquivoDoPacote } from '../../helpers/pkg-path.js';
 
 const run = promisify(execFile);
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -37,8 +38,18 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
  * ter executado a CLI. Foi exatamente o que aconteceu aqui — o caso de canário
  * passava por vacuidade. `process.execPath` + caminho de arquivo é portátil e
  * não depende de resolução de shim.
+ *
+ * A resolução é `arquivoDoPacote()`, NÃO um caminho relativo ao
+ * arquivo (issue #571). `new URL('../../../node_modules/tsx/…', import.meta.url)`
+ * apontava para `<worktree>/node_modules`, que não existe: uma `git worktree`
+ * não tem árvore de dependências própria — ela reaproveita a do repositório raiz
+ * pela subida de diretórios do Node, que é exatamente o que `require.resolve`
+ * faz e um caminho relativo não faz. Este arquivo falhava 2/2 em qualquer
+ * worktree, mesmo num checkout limpo de `main`, com
+ * `Cannot find module '<worktree>/node_modules/tsx/dist/cli.mjs'`. Ver
+ * `tests/helpers/pkg-path.ts`.
  */
-const TSX_CLI = fileURLToPath(new URL('../../../node_modules/tsx/dist/cli.mjs', import.meta.url));
+const TSX_CLI = arquivoDoPacote('tsx', 'dist/cli.mjs', import.meta.url);
 
 type RunResult = { code: number; stdout: string; stderr: string; started: boolean };
 
