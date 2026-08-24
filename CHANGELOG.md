@@ -4,6 +4,100 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — `markSuperseded` vira DUAS operações: o fence pertence a quem ABSORVE ([#504](https://github.com/diogenesmendes01/Maia-v2/issues/504))
+
+`markSuperseded` era uma operação para dois fatos diferentes — e por isso não tinha fence nenhum.
+
+Marcar um turno `superseded` acontece em dois lugares, e a AUTORIDADE de cada um
+é de uma linha diferente:
+
+| Operação | Linha que muda | Posse exigida |
+|---|---|---|
+| `markSupersededSelf` (auto-supersessão) | o próprio turno | o `claim_token` **do próprio turno** |
+| `markSupersededByAbsorber` (absorção de irmão pelo debounce) | o turno **irmão** | o `claim_token` + lease VIVA do turno **ABSORVEDOR**, num `EXISTS` na mesma declaração |
+
+O erro que isso corrige é conceitual, e os dois jeitos de errar são simétricos.
+**Exigir claim do irmão** tornaria a absorção legítima impossível no caso comum:
+o turno absorvido normalmente NUNCA foi reivindicado — quem foi reivindicado é o
+executor da rajada —, então `claim_token IS NULL` é o estado normal dele.
+**Não exigir nada dos dois lados** — o que estava no código — deixava um worker
+zumbi (lease vencida, tentativa já sucedida) absorver turnos e apagar trabalho do
+sucessor, e deixava `superseded` ser a **única transição terminal** que uma
+tentativa sem posse conseguia atravessar: como `superseded` é terminal, o
+sucessor perdia o turno e nada aparecia como conflito. **O fence pertence a quem
+absorve.**
+
+O compare-and-swap na linha do irmão (`expected_version`) passou a ser
+**obrigatório** na assinatura, e não opcional como nas demais transições: é ele
+que decide a corrida entre duas absorções concorrentes, e omiti-lo por descuido
+faria a rajada produzir dois turnos executáveis disputando as mesmas mensagens.
+
+`absorbDebounceInputs` (`src/runtime/turns/lifecycle.ts`) ganhou o guard de posse
+que não tinha: uma tentativa que JÁ SABE ter perdido a lease não absorve nada —
+nem o irmão, nem o `attachInputTx` da irmã sem turno — e uma recusa vinda do
+banco (`stale_claim`) PARA a rajada inteira em vez de insistir. A posse é
+reavaliada a cada irmã, porque a rajada pode ser longa e a lease pode morrer no
+meio dela.
+
+**Evidência, e por que ela não é um espelho.** O `WHERE` do compare-and-swap
+saiu de dentro de `runTransition` para um módulo PURO
+(`src/db/repositories/turn-fence-sql.ts`), e `runTransition` não acrescenta
+predicado nenhum depois de chamá-lo. Isso é o que permite a
+`tests/unit/db/turn-fence-sql.spec.ts` compilar o SQL **real** de produção com
+`PgDialect` — sem Postgres — e afirmar caractere a caractere que
+`absorvedor.lease_expires_at > now()` está lá, que só existe UMA referência a
+`claim_token` e que ela está dentro do `EXISTS` (nenhuma sobre o irmão), e que
+`state_version` está no `WHERE`. Um teste que remontasse a query com o próprio
+harness continuaria verde depois de alguém deletar o call site.
+`tests/unit/runtime/turn-absorption-fence.spec.ts` prova o mesmo contrato no call
+site real do lifecycle, e `tests/integration/turn-absorption-fence-real-db.spec.ts`
+prova contra PostgreSQL o que só o banco decide (lease pelo relógio dele,
+takeover, corrida de duas absorções, projeção legada na mesma transação).
+
+### ⚠️ BREAKING (operacional) — as três flags de turno passam a vir `true` ([#504](https://github.com/diogenesmendes01/Maia-v2/issues/504))
+
+> **Um `.env` que não menciona as flags de turno muda de comportamento neste
+> release.** `FEATURE_TURN_CLAIM` e `FEATURE_TURN_STATE_AUTHORITATIVE` saíram de
+> `false` para `true` no contrato. Quem já declarava um valor não é afetado.
+
+| Flag | Antes | Agora |
+|---|---|---|
+| `FEATURE_TURN_STATE_MACHINE` | `true` | `true` |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | **`true`** |
+| `FEATURE_TURN_CLAIM` | `false` | **`true`** |
+| `FEATURE_TURN_JOB_V2` | `false` | `false` (inalterada — exige todas as réplicas de consumo no build que entende V2) |
+
+Numa produção greenfield não existe histórico a backfillar nem coorte a
+comparar, e o rollout por etapas só serviria para deixar a produção rodando, por
+semanas, no caminho que **não** tem exclusão mútua. `FEATURE_TURN_CLAIM=false`
+não é "modo conservador": é a janela de execução dupla aberta.
+`FEATURE_TURN_STATE_AUTHORITATIVE=false` faz um turno `retryable` (timeout de
+reasoner, falha pre-send do outbound) sumir do recovery.
+
+**`false` nas três é rollback emergencial, não configuração suportada.** Está
+escrito no contrato, no `.env.app.prod.example` (que agora declara as três
+explicitamente, para que o regime não dependa de o leitor saber qual é o
+default), no runbook (§2.0 greenfield, §2.1 base com histórico, §2.2 rollback) e
+no doc de módulo. O código do caminho legado continua existindo **e testado** —
+sem isso o rollback não funcionaria —, mas deixou de ser o caminho que um teste
+herda sem pedir. Desligar SÓ `FEATURE_TURN_STATE_MACHINE` é recusado no boot (as
+outras duas ficariam inertes); a remediação das regras
+`turn-state/authoritative-requires-dual-write` e `turn-claim/requires-state-machine`
+agora diz para desligar as três juntas.
+
+**O que o flip do default quebrou, e por quê.** 13 casos em
+`tests/unit/workers/message-recovery-{cross-tenant,oom}.spec.ts`. Nenhum era bug
+de produção: os dois arquivos **nunca declaravam o regime** e herdavam o default,
+então provavam o contrato do dispatcher e o fail-closed por OOM em UM dos dois
+inners de `runMessageRecovery` — e ninguém sabia em qual. Com o default novo eles
+passaram a rodar o inner autoritativo, cujo `agentTurnsRepo` não estava no mock.
+Os dois arquivos agora escolhem o regime EXPLICITAMENTE e rodam a matriz nos
+DOIS, o que é cobertura nova: a abortagem por OOM de `runTurnRecoveryInner`
+nunca tinha sido exercitada. O bloco de READ ISOLATION, que dirige a query
+drizzle real do inner legado, fixa `authoritative = false` e diz por escrito que
+é o caminho de rollback.
+
+
 ### ⚠️ AÇÃO DO OPERADOR — se algum health check seu aponta para `GET /health`, ele nunca reprovou nada ([#613](https://github.com/diogenesmendes01/Maia-v2/issues/613))
 
 > **Nada quebra neste release. O que muda é que agora está escrito.** Se você
