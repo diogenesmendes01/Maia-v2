@@ -343,6 +343,7 @@ describe('runExportSweep — o guarda ANTES da remoção', () => {
     const w = world({ bindingOverride: () => null });
     const out = await runExportSweep(w.ports, OPTS);
     expect(w.ports.remove).not.toHaveBeenCalled();
+    expect(out.refused).toBe(1);
     expect(w.audits[0].metadata.reason).toBe('request_vanished');
   });
 
