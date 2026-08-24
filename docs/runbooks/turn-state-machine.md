@@ -442,9 +442,11 @@ envolvida.
 enquanto houver versão mista rodando. `processada_em` nunca deixou de ser
 escrito, então o caminho legado está íntegro.
 
-**De feature** — `FEATURE_TURN_STATE_AUTHORITATIVE=false` devolve a decisão ao
-campo legado imediatamente. `FEATURE_TURN_STATE_MACHINE=false` desliga também a
-escrita. Nenhum turno ou outcome já gravado é apagado.
+**De feature** — as três flags de turno vêm ON por default (#504), então o
+rollback é DECLARÁ-LAS `false`, e as **três juntas**: desligar só
+`FEATURE_TURN_STATE_MACHINE` é recusado no boot. Ver §2.2, que tem a lista do
+que cada uma devolve ao ser desligada. Nenhum turno, outcome, claim ou lease já
+gravado é apagado.
 
 **De migration, `115`** (`pending_race_lost`) — ordem obrigatória, e ela é o
 inverso do deploy. No deploy, a `115` vai **antes** do código: subir o código
