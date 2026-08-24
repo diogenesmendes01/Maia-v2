@@ -700,7 +700,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       message:
         'FEATURE_TURN_STATE_AUTHORITATIVE=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem dual-write não há agent_turns para o recovery eleger, e a decisão continua saindo de mensagens.processada_em.',
       remediation:
-        'Ligue FEATURE_TURN_STATE_MACHINE (e conclua o backfill com `npm run backfill:turns`) antes do flip da leitura, ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. Ver docs/runbooks/turn-state-machine.md §2.',
+        'Ligue FEATURE_TURN_STATE_MACHINE (e, numa base COM histórico, conclua o backfill com `npm run backfill:turns`), ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. ATENÇÃO: desde #504 as três flags de turno vêm ON por default, então um rollback emergencial que desliga só FEATURE_TURN_STATE_MACHINE cai aqui — desligue as TRÊS juntas (FEATURE_TURN_STATE_MACHINE, FEATURE_TURN_STATE_AUTHORITATIVE e FEATURE_TURN_CLAIM). Ver docs/runbooks/turn-state-machine.md §2.',
     });
   }
 
@@ -719,7 +719,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       message:
         'FEATURE_TURN_CLAIM=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não há turno durável para reivindicar, e duas réplicas continuam podendo processar o mesmo turno.',
       remediation:
-        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas) antes de ligar FEATURE_TURN_CLAIM, ou desligue FEATURE_TURN_CLAIM. Ver docs/runbooks/turn-state-machine.md §6.',
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas), ou desligue FEATURE_TURN_CLAIM. ATENÇÃO: desde #504 as duas vêm ON por default, então um rollback emergencial que desliga só FEATURE_TURN_STATE_MACHINE cai aqui — desligue as TRÊS flags de turno juntas. Ver docs/runbooks/turn-state-machine.md §6.',
     });
   }
 

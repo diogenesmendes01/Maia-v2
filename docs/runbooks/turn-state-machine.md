@@ -70,24 +70,88 @@ SELECT metadata->>'stage' AS stage, count(*)
 **Não** é incidente. Vira incidente se o volume subir sem tráfego correspondente
 — aí o suspeito é reentrega duplicada no gateway, não o gate.
 
-## 2. Rollout (ordem obrigatória)
+## 2. Rollout
+
+### 2.0 Produção GREENFIELD — o caminho que a Maia usa hoje
+
+**As três flags de turno já vêm `true` no contrato**
+(`FEATURE_TURN_STATE_MACHINE`, `FEATURE_TURN_STATE_AUTHORITATIVE`,
+`FEATURE_TURN_CLAIM`), e é assim que o **primeiro deploy** sobe — decisão do
+dono na #504. Não há coorte, não há shadow, não há backfill: numa base sem
+histórico não existe `mensagens.processada_em` divergente para comparar, e um
+rollout por etapas só serviria para deixar a produção rodando, por semanas, no
+caminho que **não** tem exclusão mútua.
+
+Só isto é obrigatório:
+
+1. `npm run db:migrate` — 096, 097 e 114. **Antes** de subir o processo: com as
+   flags ligadas e as migrations ausentes, o ingresso inteiro cai.
+2. Confirme `TURN_LEASE_TTL_MS` acima da duração p99 do turno
+   (`maia_turn_duration_ms`). O heartbeat precisa caber 3× no TTL — o boot
+   recusa fora dessa relação.
+3. Suba. `.env.app.prod.example` já traz as três escritas explicitamente.
+4. Observe por uma janela: `maia_turn_lease_lost_total{reason="token_mismatch"}`
+   próximo de zero significa TTL bem dimensionado. Ver §6.2.
+
+`FEATURE_TURN_JOB_V2` continua **`false`** e é o único knob que ainda exige
+etapa: só ligue depois que TODAS as réplicas de consumo estiverem no build que
+entende V2 (§7).
+
+**`false` nas três é rollback emergencial, não configuração suportada.** O
+código do caminho legado continua existindo — e continua testado — só para que o
+rollback funcione. Ver §2.2.
+
+### 2.1 Base COM histórico — rollout por etapas
+
+Aplique este caminho quando existir volume anterior à máquina de estados (uma
+instalação que rodou o runtime antigo). Aqui as flags precisam ser desligadas
+explicitamente no `.env` antes do deploy, porque o default é ON:
 
 1. `npm run db:migrate` — aplica 096 (índices `CONCURRENTLY` em `mensagens`) e
    097 (tabelas). A 096 **não** roda em transação; se ela falhar no meio, o
    índice fica `INVALID` — rode o `_down` da 096 e reaplique.
-2. Deploy com `FEATURE_TURN_STATE_MACHINE=true` (padrão) e
-   `FEATURE_TURN_STATE_AUTHORITATIVE=false` (padrão). Nesse ponto o turno é
+2. Deploy com `FEATURE_TURN_STATE_MACHINE=true` e
+   `FEATURE_TURN_STATE_AUTHORITATIVE=false` **declarada**. Nesse ponto o turno é
    **shadow**: escreve, mede, não decide. Comportamento observável idêntico ao
    anterior.
 3. `npm run backfill:turns` — em lotes, idempotente, resumível.
    `npm run backfill:turns -- --dry-run` mostra o volume antes.
 4. Observe `maia_turn_legacy_projection_mismatch_total` por pelo menos um ciclo
    de retenção. Ver §4 para o que fazer com divergência.
-5. Só então ligue `FEATURE_TURN_STATE_AUTHORITATIVE=true`. A partir daí o
-   recovery elege por estado — e turnos `retryable` (timeout de reasoner, falha
-   pre-send) voltam para a fila em vez de morrerem silenciosamente.
+5. Só então volte `FEATURE_TURN_STATE_AUTHORITATIVE` ao default (`true`). A
+   partir daí o recovery elege por estado — e turnos `retryable` (timeout de
+   reasoner, falha pre-send) voltam para a fila em vez de morrerem
+   silenciosamente.
 6. Mantenha o dual-write por, no mínimo, uma janela de rollback completa.
    `mensagens.processada_em` **não** é removido nesta fase.
+
+### 2.2 Rollback emergencial das flags de turno
+
+Desligue as **três juntas**:
+
+```
+FEATURE_TURN_STATE_MACHINE=false
+FEATURE_TURN_STATE_AUTHORITATIVE=false
+FEATURE_TURN_CLAIM=false
+```
+
+Desligar só `FEATURE_TURN_STATE_MACHINE` **é recusado no boot** (regras
+`turn-state/authoritative-requires-dual-write` e
+`turn-claim/requires-state-machine`): com as outras duas em ON por default, a
+combinação seria inerte, e o contrato prefere reprovar a deixar o operador
+acreditar que reivindicou algo. A mensagem de remediação diz isso.
+
+O que você perde ao fazer isso, e precisa estar escrito antes de alguém decidir
+sob pressão:
+
+| Flag desligada | O que volta |
+|---|---|
+| `FEATURE_TURN_CLAIM` | A janela de **execução dupla**. O claim de estado de #503 não é exclusão mútua, e as gravações deixam de carregar fence. |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | `mensagens.processada_em` volta a decidir; um turno `retryable` fica **invisível** para o recovery. Falha de escrita da máquina volta a ser fail-soft. |
+| `FEATURE_TURN_STATE_MACHINE` | Tudo acima, e nenhum turno novo é criado. |
+
+Nenhum turno, claim ou lease já gravado é apagado. As leases vivas simplesmente
+vencem e param de ser renovadas.
 
 ## 3. Turno preso
 
@@ -277,14 +341,17 @@ também funciona.
 
 ### 6.5 Rollout e rollback do claim
 
-Ordem obrigatória:
+**Produção greenfield: `FEATURE_TURN_CLAIM=true` já é o default e sobe no
+primeiro deploy** — ver §2.0. Só isto é obrigatório:
 
-1. `npm run db:migrate` (migration **114**);
-2. deploy do código com `FEATURE_TURN_CLAIM=false` — nada muda;
-3. confirme `TURN_LEASE_TTL_MS` acima da duração p99 do turno (`maia_turn_duration_ms`);
-4. ligue `FEATURE_TURN_CLAIM=true`;
-5. observe por uma janela: `maia_turn_lease_lost_total{reason="token_mismatch"}`
+1. `npm run db:migrate` (migration **114**) ANTES de subir o processo;
+2. confirme `TURN_LEASE_TTL_MS` acima da duração p99 do turno (`maia_turn_duration_ms`);
+3. observe por uma janela: `maia_turn_lease_lost_total{reason="token_mismatch"}`
    próximo de zero é o sinal de que o TTL está bem dimensionado.
+
+Numa base COM histórico, e só nela, faz sentido a etapa intermediária: declarar
+`FEATURE_TURN_CLAIM=false` no `.env`, deployar, medir, e então remover a
+declaração para voltar ao default.
 
 **Abortar** se: `lease_lost{token_mismatch}` cresce (TTL curto — takeover falso),
 `fence_rejected` cresce sem `lease_lost` correspondente (algo está gravando com
