@@ -61,7 +61,7 @@ async function show(requestId: string): Promise<number> {
   }
   if (view.state === 'purged') {
     console.log(
-      '  o artefato foi REMOVIDO pelo TTL. A trilha está em audit_logs, ação ' +
+      '  o artefato foi REMOVIDO pelo TTL. A trilha está em audit_log, ação ' +
         '`privacy_export_purged`. Reemitir exige um novo pedido de acesso.',
     );
   }
@@ -91,7 +91,7 @@ async function sweep(dryRun: boolean): Promise<number> {
     console.error(
       'RECUSA do guarda de locator: algum pedido carrega um locator que não ' +
         'corresponde a um artefato desta árvore. NADA foi apagado nesses casos. ' +
-        'Veja audit_logs, ação `privacy_export_purge_refused`, e o runbook ' +
+        'Veja audit_log, ação `privacy_export_purge_refused`, e o runbook ' +
         'docs/runbooks/privacy-export-ttl.md §4.',
     );
   }

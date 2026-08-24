@@ -81,11 +81,19 @@ Qualquer uma que falhe é **recusa auditada**, e o arquivo **não é tocado**.
 
 ## 4. O varredor recusou. E agora?
 
+**Você provavelmente chegou aqui por um alerta.** A regra
+`privacy_export_locator_refused` (`src/workers/audit-watcher.ts`) dispara com
+**uma única** ocorrência em 60 min, e não com três: a taxa normal desta ação é
+**zero**, então agrupá-la por volume esconderia o primeiro evento — que é o único
+que importa. A severidade é `urgent` e não `critical` porque **nada foi apagado**:
+o guarda recusou antes da remoção. O que existe é uma linha de banco para
+investigar antes que alguém a "conserte" no braço.
+
 ```sql
 SELECT created_at, metadata->>'privacy_request_id' AS pedido,
        metadata->>'reason'                        AS motivo,
        metadata->>'export_locator_sample'         AS amostra
-  FROM audit_logs
+  FROM audit_log
  WHERE acao = 'privacy_export_purge_refused'
  ORDER BY created_at DESC
  LIMIT 50;
@@ -93,7 +101,7 @@ SELECT created_at, metadata->>'privacy_request_id' AS pedido,
 
 | `reason` | O que aconteceu | O que fazer |
 |---|---|---|
-| `path_separator`, `parent_traversal`, `absolute_path`, `drive_letter`, `control_character`, `not_an_export_locator` | `privacy_requests.export_locator` carrega algo que não é um locator desta plataforma. **Trate como incidente**: ou uma escrita defeituosa, ou uma linha plantada | Não conserte a linha "no braço" antes de entender a origem. Confira `audit_logs` do pedido, e o `updated_at`/`created_at` da linha |
+| `path_separator`, `parent_traversal`, `absolute_path`, `drive_letter`, `control_character`, `not_an_export_locator` | `privacy_requests.export_locator` carrega algo que não é um locator desta plataforma. **Trate como incidente**: ou uma escrita defeituosa, ou uma linha plantada | Não conserte a linha "no braço" antes de entender a origem. Confira `audit_log` do pedido, e o `updated_at`/`created_at` da linha |
 | `symlink`, `not_a_regular_file` | O caminho existe mas não é o arquivo que o banco diz que é | Inspecione o diretório de exports à mão. Alguém (ou algo) mexeu nele |
 | `multiply_linked` | Existe **outro nome** para os mesmos bytes. Apagar o nosso destruiria o rastro e não o dado | Ache o outro link (`find <BACKUP_DIR> -samefile <arquivo>`), remova-o, e rode o varredor de novo |
 | `locator_not_bound_to_request`, `request_vanished` | A linha mudou entre planejar e apagar | Normalmente benigno (uma corrida). Se repetir, procure quem está escrevendo em `privacy_requests` fora do fluxo |
