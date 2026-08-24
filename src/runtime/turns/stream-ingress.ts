@@ -17,17 +17,17 @@
  *
  * ─── O que vira métrica e o que vira audit_log ─────────────────────────────
  *
- * A régua é a mesma de #503/#504: só entra em `audit_logs` o que um humano
+ * A régua é a mesma de #503/#504: só entra em `audit_log` o que um humano
  * precisa RECONSTRUIR depois.
  *
- *   * TODA recusa vira `audit_logs`. É uma mensagem de usuário que a
+ *   * TODA recusa vira `audit_log`. É uma mensagem de usuário que a
  *     plataforma decidiu não processar — a decisão governável por excelência,
  *     e o operador precisa saber que ela existiu.
- *   * O NASCIMENTO de uma stream (`ingress_seq === 1`) vira `audit_logs`. É o
+ *   * O NASCIMENTO de uma stream (`ingress_seq === 1`) vira `audit_log`. É o
  *     registro durável de "esta stream passou a existir, sob este algoritmo",
  *     e é o que permite reconstruir o começo de uma ordem meses depois.
  *   * TODO ingresso sequenciado vira LOG ESTRUTURADO (`stream.ingress_sequenced`),
- *     nunca audit. Auditar uma row por mensagem inflaria `audit_logs` na razão
+ *     nunca audit. Auditar uma row por mensagem inflaria `audit_log` na razão
  *     do tráfego sem acrescentar decisão governável — e a issue pede a
  *     auditoria "quando relevante" (§Observability), exatamente essa ressalva.
  *     A reconstrução de `first_ingress_seq`/`last_ingress_seq` que a issue
@@ -35,7 +35,7 @@
  *
  * NENHUM dos três carrega `stream_key`, `remote_jid`, telefone ou conteúdo em
  * LABEL de métrica (a issue proíbe explicitamente). `stream_key` aparece em log
- * estruturado — é um hash, não a identidade em claro — e em `audit_logs`, que é
+ * estruturado — é um hash, não a identidade em claro — e em `audit_log`, que é
  * armazenamento protegido, jamais como dimensão de série.
  */
 import { audit } from '@/governance/audit.js';

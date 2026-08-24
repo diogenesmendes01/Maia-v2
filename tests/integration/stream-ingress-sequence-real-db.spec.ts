@@ -35,6 +35,7 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { deriveStreamKey } from '@/runtime/turns/stream-key.js';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -56,7 +57,7 @@ const CANAL_B = '505c0505-0505-4505-8505-05050505050b';
 const TELEFONE = '+5511988887777';
 
 let pool: pg.Pool;
-let repos: typeof import('../../src/db/repositories.js');
+
 
 const inA = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: T_A, agent_id: A_A }, fn);
@@ -130,9 +131,22 @@ const chaveEsperada = (tenant: string, agent: string, channel_id = CANAL): strin
 };
 
 d('#505 — sequência de ingresso por stream (DB real)', () => {
+  /**
+   * O grafo de `@/db/repositories.js` custa ~2s a frio e disputa CPU com os
+   * outros ~20 workers da rodada. Carregá-lo no MESMO `beforeAll` do `pg.Pool`
+   * e da semeadura somava tudo num hook só e estourou o `hookTimeout` de 20s
+   * numa rodada completa — o arquivo inteiro virou "13 skipped", que num
+   * relatório se parece com "nada a testar".
+   *
+   * `moduloDeProducao` (AGENTS.md §7.1, issue #545) dá ao import um `beforeAll`
+   * PRÓPRIO, com orçamento próprio, e deixa o hook abaixo só com a infra.
+   * Registrado DENTRO do `d(...)`: numa rodada sem `TEST_DB_URL` o describe é
+   * pulado e o import nem acontece.
+   */
+  const repos = moduloDeProducao(() => import('../../src/db/repositories.js'));
+
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
-    repos = await import('../../src/db/repositories.js');
     await ensureTenantAgent(T_A, A_A);
     await ensureTenantAgent(T_B, A_B);
     await ensureChannel(T_A, A_A, CANAL);
@@ -160,7 +174,7 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('ingressos sequenciais recebem 1, 2, 3 na mesma stream', async () => {
     const rows = [];
     for (let i = 0; i < 3; i++) {
-      rows.push(await inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true })));
+      rows.push(await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true })));
     }
     expect(rows.map((r) => r.row.ingress_seq)).toEqual([1, 2, 3]);
     expect(new Set(rows.map((r) => r.row.stream_key))).toEqual(new Set([chaveEsperada(T_A, A_A)]));
@@ -169,7 +183,7 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
 
   it('o turno simples nasce com first_ingress_seq = last_ingress_seq', async () => {
     const { turn } = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound(), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound(), { withTurn: true }),
     );
     expect(turn).toBeDefined();
     const { rows } = await pool.query(
@@ -188,7 +202,7 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('50 ingressos CONCORRENTES na mesma stream: 50 sequências únicas, sem buraco', async () => {
     const resultados = await Promise.all(
       Array.from({ length: 50 }, () =>
-        inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true })),
+        inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true })),
       ),
     );
     const seqs = resultados.map((r) => r.row.ingress_seq!).sort((a, b) => a - b);
@@ -199,10 +213,10 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('reentrega do mesmo whatsapp_id reusa a row — e a sequência — original', async () => {
     const wa = `wa-fixo-${randomUUID()}`;
     const primeiro = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
     );
     const reentrega = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
     );
     expect(reentrega.duplicate).toBe(true);
     expect(reentrega.row.id).toBe(primeiro.row.id);
@@ -225,8 +239,8 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
     // buraco permanente.
     const wa = `wa-corrida-${randomUUID()}`;
     const [x, y] = await Promise.all([
-      inA(() => repos.mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
-      inA(() => repos.mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
+      inA(() => repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
+      inA(() => repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
     ]);
     expect(x.row.id).toBe(y.row.id);
     expect(x.row.ingress_seq).toBe(y.row.ingress_seq);
@@ -285,9 +299,9 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
 
     // A metade do CONTADOR é provada no banco: duas linhas, duas sequências que
     // começam do 1 sem se ver.
-    const a = await inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true }));
+    const a = await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true }));
     const b = await inB(() =>
-      repos.mensagensRepo.createInbound(inbound({ channel_id: CANAL_B }), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound({ channel_id: CANAL_B }), { withTurn: true }),
     );
 
     expect(a.row.stream_key).not.toBe(b.row.stream_key);
@@ -306,10 +320,10 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
 
   it('o MESMO remoto em duas LINHAS do mesmo agente são duas streams', async () => {
     const linhaA = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound(), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound(), { withTurn: true }),
     );
     const linhaB = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound({ channel_id: OUTRA_LINHA }), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound({ channel_id: OUTRA_LINHA }), { withTurn: true }),
     );
     expect(linhaA.row.stream_key).toBe(chaveEsperada(T_A, A_A));
     expect(linhaB.row.stream_key).toBe(chaveEsperada(T_A, A_A, OUTRA_LINHA));
@@ -320,15 +334,15 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('turno agregado ESTENDE last_ingress_seq — e só com ingressos da MESMA stream', async () => {
     // Três ingressos na stream A (seqs 1,2,3) e um na stream B (linha
     // diferente, seq 1). O turno do primeiro absorve as irmãs.
-    const m1 = await inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true }));
-    const m2 = await inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true }));
-    const m3 = await inA(() => repos.mensagensRepo.createInbound(inbound(), { withTurn: true }));
+    const m1 = await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true }));
+    const m2 = await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true }));
+    const m3 = await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true }));
     const outraStream = await inA(() =>
-      repos.mensagensRepo.createInbound(inbound({ channel_id: OUTRA_LINHA }), { withTurn: true }),
+      repos().mensagensRepo.createInbound(inbound({ channel_id: OUTRA_LINHA }), { withTurn: true }),
     );
 
     const estendeu = await inA(() =>
-      repos.agentTurnsRepo.extendTurnStreamBoundaryTx({
+      repos().agentTurnsRepo.extendTurnStreamBoundaryTx({
         turn_id: m1.turn!.id,
         // A mensagem da OUTRA stream entra na lista DE PROPÓSITO: ela não pode
         // mover a fronteira. Sem o predicado `m.stream_key = agent_turns.stream_key`
@@ -349,7 +363,7 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('identidade irresolúvel: RECUSA e NADA é persistido', async () => {
     await expect(
       inA(() =>
-        repos.mensagensRepo.createInbound(inbound({ channel_id: null }), { withTurn: true }),
+        repos().mensagensRepo.createInbound(inbound({ channel_id: null }), { withTurn: true }),
       ),
     ).rejects.toMatchObject({ code: 'STREAM_IDENTITY_UNRESOLVED' });
 

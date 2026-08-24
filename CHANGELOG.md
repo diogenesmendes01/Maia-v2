@@ -85,7 +85,7 @@ fronteira, o que é fail-closed por construção em vez de validação do chamad
 `maia_stream_ingress_rejected_total{reason}` — vocabulários FECHADOS.
 `stream_key`, `remote_jid` e `turn_id` **não** são labels (a issue proíbe): eles
 vivem no log estruturado `stream.ingress_sequenced`, que é de onde se reconstrói
-a ordem de uma conversa. Em `audit_logs` entram só dois fatos: a recusa, e o
+a ordem de uma conversa. Em `audit_log` entram só dois fatos: a recusa, e o
 NASCIMENTO da stream (`ingress_seq = 1`). Auditar cada mensagem inflaria a tabela
 na razão do tráfego sem acrescentar decisão governável — a issue pede a auditoria
 "quando relevante" (§Observability), e é essa a ressalva.

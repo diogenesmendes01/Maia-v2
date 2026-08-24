@@ -389,7 +389,7 @@ existe e o INSERT falha. Mesma armadilha, mesma ordem, do
 ### 8.2 A única mudança de comportamento observável
 
 Um ingresso cuja identidade de stream não é derivável passa a ser **recusado**:
-`audit_logs` recebe `stream_ingress_rejected`, o log estruturado
+`audit_log` recebe `stream_ingress_rejected`, o log estruturado
 `baileys.stream_identity_unresolved_drop` traz o `whatsapp_id`, e a mensagem
 **não** é persistida. Nunca há queda para stream genérica ou `'default'` — a
 issue nomeia esse fallback como uma das falhas que ela existe para impedir.
@@ -408,7 +408,7 @@ configuração (linha não semeada, `MAIA_CHANNEL_ROUTING_MODE` mal ajustado) e
 | `maia_stream_ingress_total{channel_kind,result}` | `/metrics` | `result="rejected"` deve ser ZERO. Qualquer ponto é mensagem de usuário não processada. |
 | `maia_stream_ingress_rejected_total{reason}` | `/metrics` | Vocabulário fechado: `missing_tenant`, `missing_agent`, `reserved_scope_literal`, `missing_channel_kind`, `missing_channel`, `missing_remote_identity`, `unnormalizable_remote_identity`. |
 | `stream.ingress_sequenced` | log estruturado | `stream_key`, versão, `ingress_seq`, `mensagem_id` — é daqui que se reconstrói a ordem de uma conversa. |
-| `stream_ingress_sequenced` | `audit_logs` | Só o NASCIMENTO da stream (`ingress_seq = 1`). Auditar cada mensagem inflaria a tabela na razão do tráfego. |
+| `stream_ingress_sequenced` | `audit_log` | Só o NASCIMENTO da stream (`ingress_seq = 1`). Auditar cada mensagem inflaria a tabela na razão do tráfego. |
 
 Buraco na numeração de uma stream:
 

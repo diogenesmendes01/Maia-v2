@@ -1128,7 +1128,7 @@ async function handleIncoming(
   } catch (err) {
     if (!isStreamIdentityUnresolved(err)) throw err;
     // `resolveIngressStream` já escreveu `stream_ingress_rejected` em
-    // `audit_logs` e incrementou as duas séries. Esta linha é o breadcrumb POR
+    // `audit_log` e incrementou as duas séries. Esta linha é o breadcrumb POR
     // MENSAGEM que o operador usa para achar o evento no provedor — o
     // `whatsapp_id` é o único identificador estável, já que a row NÃO foi
     // persistida.

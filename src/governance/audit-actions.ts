@@ -205,7 +205,7 @@ export const AUDIT_ACTIONS = [
   // o motivo de vocabulário fechado — nada vindo do payload.
   'turn_job_scope_rejected',
   // Issue #505 (fases 1–2, shadow) — identidade de STREAM no ingresso. Dois
-  // fatos, e só dois, entram em `audit_logs`:
+  // fatos, e só dois, entram em `audit_log`:
   //   - `stream_ingress_rejected`: a plataforma RECUSOU uma mensagem de usuário
   //     porque não soube a que conversa ela pertence. É a decisão governável por
   //     excelência — alguém escreveu e não foi atendido —, e é a evidência de que

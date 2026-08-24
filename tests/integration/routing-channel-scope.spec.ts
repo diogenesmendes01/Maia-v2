@@ -74,6 +74,13 @@ if (SHOULD_RUN) {
       await q(`DELETE FROM conversas WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM pessoas WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM channels WHERE tenant_id = $1`, [t]);
+      // #505 — o ingresso passou a AUDITAR o nascimento de cada stream
+      // (`stream_ingress_sequenced`), e `audit_log.agent_id` tem FK para
+      // `agents`. Sem esta linha o `DELETE FROM agents` abaixo falha com
+      // `audit_log_agent_id_fkey` e o arquivo inteiro não carrega — que é
+      // exatamente o que aconteceu ao ligar o protocolo. A trilha é escopada
+      // por tenant, então apagá-la aqui não toca nada de outra suíte.
+      await q(`DELETE FROM audit_log WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM agents WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM tenants WHERE id = $1`, [t]);
     }
