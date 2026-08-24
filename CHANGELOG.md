@@ -4,6 +4,84 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — o ledger `outbound_messages` vira outbox durável, e a saída do turno ganha DUAS identidades ([#630](https://github.com/diogenesmendes01/Maia-v2/issues/630), fatia A de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+**Nada muda em runtime.** A fatia é aditiva: schema + tipos, nenhum caminho
+novo de envio, nenhum call site tocado. `src/agent/output-dispatch.ts` continua
+byte-a-byte o que era. O que passa a existir é o vocabulário que as fatias
+irmãs (#631 commit transacional, #632 delivery worker, #633 recovery/DLQ, #634
+call sites, #635 multipart) precisam para não divergirem entre si.
+
+**Por que duas chaves, e não uma.** `logical_dedupe_key` responde "qual saída
+lógica é esta, dentro da Maia" e é o eixo do UNIQUE que impede um retry do
+turno de virar uma segunda resposta. `provider_idempotency_key` responde "que
+identificador o adaptador usa" e vira o `messageId` que o Baileys grava na key
+da mensagem — dedupe real do lado do WhatsApp, que chaveia por
+`(remoteJid, fromMe, id)`. Colapsá-las numa coluna só custaria uma das duas
+coisas: ou a Maia perde unicidade para caber no formato alheio (`3EB0` + 18
+hex), ou entrega a um terceiro o identificador que é a sua própria chave de
+dedupe. As duas saem do **mesmo material canônico** com **rótulo de domínio
+diferente**: mesma origem, namespaces disjuntos, nenhuma derivável da outra.
+
+**A ambiguidade de encoding é real, não teórica — e foi por isso que o
+separador `:` sugerido em #506 não foi usado.** `tenants.id` e `agents.id` são
+`TEXT PRIMARY KEY` **sem CHECK de formato** (migração `007`): um id **pode**
+conter `:`. Sob concatenação ingênua, `tenant='acme:x' agent='y'` e
+`tenant='acme' agent='x:y'` produzem o **mesmo** material — dois tenants, uma
+chave, violação do invariante nº 1. O material usa **netstring**
+(`<bytes>:<conteúdo>`, bytes em UTF-8), injetiva para qualquer string,
+inclusive uma que contenha o separador ou NUL. Evidência: a sonda que troca o
+enquadramento por `join(':')` deixa `SONDA 1` vermelha com as duas chaves
+idênticas.
+
+**O material só tem campo imutável** — `tenant_id`, `agent_id`, `turn_id`,
+`sequence_in_turn`, `payload_hash`. `attempt`, `status`, `claim_token` e
+timestamps ficam de fora: uma chave que muda entre a tentativa 1 e a 2 não
+deduplica nada, garante o duplo envio que existe para impedir.
+`deriveOutboundKeysFromRow` aceita a row **inteira**, com os mutáveis, e o
+corpo projeta só os imutáveis — é o que torna a propriedade verificável num
+lugar só.
+
+**O risco declarado na mãe ("constraints em tabela existente podem falhar com
+duplicatas históricas") não se materializa, e a razão é estrutural, não
+otimista.** Os dois uniques são **PARCIAIS** (`WHERE … IS NOT NULL`) sobre
+colunas **novas**, que nascem NULL em toda row existente: o conjunto indexado
+no momento do apply é **vazio**, então não há entrada possível para colidir.
+Não há backfill (promover row legada é decisão de dado, não de schema). Ainda
+assim a migração pré-checa com `RAISE EXCEPTION` que conta as duplicatas e
+nomeia o escopo, para o caso de rodar depois de um backfill de outra branch.
+
+**O que a plataforma realmente sabe enviar foi verificado, não presumido.** A
+fronteira única de saída (`LineOutput`, `src/gateway/line-output.ts`) declara
+`sendText`/`sendVoice`/`sendDocument`/`sendPoll`/`sendReaction`. Portanto:
+`image` e `video` **não** entram na união nem no CHECK — não há primitiva, e
+#506 §Out of Scope proíbe implementar tipo não suportado; admiti-lo só no
+schema criaria row que nenhum worker entrega, um `pending` eterno vendido como
+completude. `interactive` genérico também não existe: a única forma real é a
+enquete, e o valor chama-se `interactive_poll` justamente para ninguém concluir
+que botão/lista estão cobertos.
+
+**Segredo não é filtrado por regex — não tem onde caber.** Mídia só existe
+como `local_path` ou `storage_object`; nenhuma variante aceita URL, então URL
+assinada de vida longa não é persistível por construção. Cada membro da união
+é `.strict()`, inclusive o objeto aninhado de mídia — o teste de contrato pegou
+exatamente esse buraco (um `signed_url` extra era silenciosamente descartado em
+vez de recusado) antes do primeiro commit.
+
+Migração `121_outbound_messages_durable_outbox.sql` (+ `_down` com envelope
+`BEGIN`/`COMMIT`, que o `psql -v ON_ERROR_STOP=1 -f` exige para não ser
+fail-open). O `_down` aborta **inteiro** e com mensagem acionável se houver row
+nos estados novos: reescrevê-los para caber no vocabulário de 063 apagaria a
+distinção entre "o provedor aceitou" e "não sabemos", que é a origem do reenvio
+cego.
+
+Contrato puro em `src/runtime/outbound/contract.ts` (irmão de
+`src/runtime/turns/contract.ts`: sem `db`, sem I/O, sem ALS, sem relógio).
+Docs: [`modules/runtime.md`](docs/architecture/modules/runtime.md),
+[`modules/db.md`](docs/architecture/modules/db.md) (§ acrescentar constraint a
+tabela com dado),
+[`modules/agent.md`](docs/architecture/modules/agent.md).
+
 ### ⚠️ AÇÃO DO OPERADOR — se algum health check seu aponta para `GET /health`, ele nunca reprovou nada ([#613](https://github.com/diogenesmendes01/Maia-v2/issues/613))
 
 > **Nada quebra neste release. O que muda é que agora está escrito.** Se você

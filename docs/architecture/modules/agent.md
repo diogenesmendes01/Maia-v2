@@ -508,7 +508,7 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 |---|---|
 | Add a new per-turn step | New file under `src/agent/`; wire into `core.ts` |
 | Add a new pending-question type | Extend `pending-questions.ts` (under `src/workflows/`); resolver in `pending-resolver.ts` |
-| Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter |
+| Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
 | Change prompt structure | Edit `prompt-builder.ts`; keep `<user_message>` / `<ocr>` / `<audio_transcript>` delimiters for injection safety |
 | Add data to the prompt | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise |
 
