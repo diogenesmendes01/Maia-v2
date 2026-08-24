@@ -75,6 +75,16 @@ nos estados novos: reescrevê-los para caber no vocabulário de 063 apagaria a
 distinção entre "o provedor aceitou" e "não sabemos", que é a origem do reenvio
 cego.
 
+**Evidência de reversibilidade, contra Postgres real** (não só afirmada):
+`up` aplica; `down` devolve a tabela às 12 colunas e aos CHECKs de 4 valores
+da 063 — com `provider_message_id` PRESERVADA, porque ela é da 063 e a 121 só
+a reaproveitou (dropá-la seria o erro clássico de down escrito por lista de
+colunas em vez de por diff); `up` reaplica; e uma segunda aplicação seguida do
+`up` não produz nenhum erro (idempotente). Com uma row em `delivery_unknown`
+plantada, o `down` aborta com a mensagem acionável **e a coluna
+`logical_dedupe_key` continua existindo** — isto é, o rollback inteiro voltou
+atrás, que é precisamente o que o envelope existe para garantir.
+
 Contrato puro em `src/runtime/outbound/contract.ts` (irmão de
 `src/runtime/turns/contract.ts`: sem `db`, sem I/O, sem ALS, sem relógio).
 Docs: [`modules/runtime.md`](docs/architecture/modules/runtime.md),

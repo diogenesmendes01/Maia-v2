@@ -53,13 +53,26 @@
 -- erro genérico de índice único aparecer. Se alguém aplicar esta migração
 -- DEPOIS de um backfill de outra branch, a falha diz o que fazer.
 --
--- Inventário manual, se você tiver o banco (esta árvore não tem — Postgres
--- fora do ar; ver o relatório da issue):
+-- Inventário manual, ANTES de aplicar em produção. O que importa aqui é o
+-- eixo do unique que JÁ existe (a 063), porque é o único dado histórico com
+-- que um backfill futuro poderia popular `logical_dedupe_key`:
+--   SELECT count(*) AS total,
+--          count(DISTINCT (tenant_id, agent_id, idempotency_key)) AS escopos
+--     FROM outbound_messages;
+--   -- total = escopos por construção: a 063 já impõe UNIQUE nesse trio.
+-- E, DEPOIS de aplicar (antes as colunas nem existem):
 --   SELECT count(*) AS total,
 --          count(*) FILTER (WHERE turn_id IS NOT NULL) AS com_turn,
 --          count(*) FILTER (WHERE logical_dedupe_key IS NOT NULL) AS com_ldk
 --     FROM outbound_messages;
---   -- (só faz sentido DEPOIS de 121; antes as colunas nem existem)
+--
+-- ATENÇÃO — o que NÃO foi verificado: esta migração foi aplicada e revertida
+-- contra um Postgres real, mas um banco de TESTE, com a tabela vazia. O
+-- conteúdo de `outbound_messages` em PRODUÇÃO não foi inventariado. O
+-- argumento acima (colunas novas ⇒ NULL ⇒ fora do índice parcial) é o que
+-- dispensa esse inventário: ele não depende de quantas rows existem nem do
+-- que elas contêm. O que o inventário ainda serve é para dimensionar a
+-- janela de lock do build dos índices.
 --
 -- ------------------------------------------------------------------
 -- TRANSAÇÃO E LOCK
