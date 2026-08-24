@@ -52,7 +52,12 @@ import {
   type EnvelopeSignedFields,
 } from './lib/signature.js';
 import { logger } from '@/lib/logger.js';
-import { config } from '@/config/env.js';
+// Issue #596: este é um módulo COMPARTILHADO — o console o alcança pelo
+// `tracesRouter`. Importar `@/config/env.js` aqui arrastaria a validação do
+// subset `runtime` INTEIRO para o boot do container do admin-ui, exigindo dele
+// segredo que ele não usa. `contractEnv` lê UMA variável com o MESMO schema do
+// contrato, sob demanda, sem reprovar subset nenhum.
+import { contractEnv as config } from '@/config/contract-env.js';
 
 export type EnvelopeIntegrity = 'verified' | 'invalid' | 'unknown' | 'rejected_version';
 
