@@ -109,7 +109,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 
 | Path | Role | Module doc |
 |---|---|---|
-| `src/admin-ui/` | Next.js 15.5 + React 19 + tRPC + NextAuth governance console (16 routers) | [admin-ui.md](docs/architecture/modules/admin-ui.md) |
+| `src/admin-ui/` | Next.js 16 + React 19 + tRPC + NextAuth governance console (16 routers) | [admin-ui.md](docs/architecture/modules/admin-ui.md) |
 | `src/agent/` | Prompt builder + ReAct loop entry | [agent.md](docs/architecture/modules/agent.md) |
 | `src/cognition/` | Reflector, classifier, self-model, capability/skill proposers, drift detector, gap-escalation, procedure/role selectors, step-evaluator | [cognition.md](docs/architecture/modules/cognition.md) |
 | `src/cognitive-graph/` | Orchestrator, pre/post-turn graphs, node registry, latency budget | [cognitive-graph.md](docs/architecture/modules/cognitive-graph.md) |

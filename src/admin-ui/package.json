@@ -4,14 +4,13 @@
   "private": true,
   "description": "P8.5 — Admin UI for governance, approvals, audit, and trace exploration.",
   "scripts": {
-    "dev": "next dev --port 4000",
-    "build": "next build",
+    "dev": "next dev --webpack --port 4000",
+    "build": "next build --webpack",
     "start": "next start --port 4000",
-    "lint": "next lint",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "15.5.22",
+    "next": "16.3.2",
     "next-auth": "5.0.0-beta.32",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
@@ -36,8 +35,8 @@
     "tailwindcss": "3.4.15",
     "postcss": "^8.5.23",
     "autoprefixer": "10.4.20",
-    "eslint": "^9.25.0",
-    "eslint-config-next": "15.5.22",
+    "eslint": "^10.8.1",
+    "eslint-config-next": "16.3.2",
     "@playwright/test": "^1.51.1"
   },
   "overrides": {

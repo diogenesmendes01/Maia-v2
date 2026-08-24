@@ -34,7 +34,7 @@ If a project instruction conflicts with a skill, the project wins. If the user s
 | Cache / Queue | Redis + BullMQ (`ioredis`) |
 | Channel | WhatsApp via Baileys; multi-channel schema present |
 | LLM | Anthropic Claude (Sonnet 4.6 + Haiku 4.5); OpenAI Whisper (audio); Claude Vision (images) |
-| Admin UI | Next.js 15.5 + React 19 + tRPC + NextAuth (`src/admin-ui/`) |
+| Admin UI | Next.js 16 + React 19 + tRPC + NextAuth (`src/admin-ui/`) |
 | Validation | Zod everywhere |
 | Tests | Vitest (unit/integration/e2e) + Playwright (admin-ui) |
 | Migrations | Versioned SQL in `migrations/` |

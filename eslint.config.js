@@ -159,9 +159,11 @@ export default [
       '.claude/**',
       // Next.js build artifacts (admin-ui). The dev `next build` produces
       // .next/{static,standalone,server}/*.js bundles that ESLint shouldn't
-      // try to type-check. next-env.d.ts is generated too (gitignored): Next
-      // 15.5 emits a triple-slash reference in it that trips
-      // @typescript-eslint/triple-slash-reference.
+      // try to type-check. next-env.d.ts is generated too (gitignored): o Next
+      // emite nele referências triple-slash que trombam com
+      // @typescript-eslint/triple-slash-reference (segue valendo no 16, que
+      // ainda gera `/// <reference types="next" />` e agora também importa
+      // `.next/types/routes.d.ts`).
       'src/admin-ui/.next/**',
       'src/admin-ui/next-env.d.ts',
     ],

@@ -20,14 +20,17 @@ import { IconArrowLeft } from '../../../components/ui/icons.js';
 export default function TraceDetailPage({
   params,
 }: {
-  params: { traceId: string };
+  // Next 16 — `params` é uma Promise. A compatibilidade síncrona da 15 foi
+  // REMOVIDA; em componente de cliente quem a resolve é `React.use()`.
+  params: Promise<{ traceId: string }>;
 }) {
+  const { traceId } = React.use(params);
   const { data: session } = useSession();
   const tenantId = session?.user?.tenant_id ?? '';
   const [showSnapshotModal, setShowSnapshotModal] = React.useState(false);
 
   const traceQuery = trpc.traces.getTrace.useQuery(
-    { tenantId, traceId: params.traceId },
+    { tenantId, traceId },
     { enabled: tenantId !== '' },
   );
 
@@ -73,7 +76,7 @@ export default function TraceDetailPage({
         title={
           <>
             Trace{' '}
-            <span className="font-mono">{params.traceId.slice(0, 8)}</span>
+            <span className="font-mono">{traceId.slice(0, 8)}</span>
           </>
         }
         description={
@@ -276,7 +279,7 @@ export default function TraceDetailPage({
 
       {showSnapshotModal && (
         <SnapshotRequestModal
-          traceId={params.traceId}
+          traceId={traceId}
           tenantId={tenantId}
           onClose={() => {
             setShowSnapshotModal(false);

@@ -51,6 +51,36 @@ const nextConfig = {
   // Next's webpack default doesn't resolve `.js` → `.ts(x)`; this alias does.
   // Without it, `next build` / `next dev` fail with "Module not found" on
   // every internal import.
+  //
+  // ---------------------------------------------------------------------
+  // Next 16 — por que `dev` e `build` passam `--webpack` (issue #604)
+  // ---------------------------------------------------------------------
+  // No Next 16 o Turbopack virou o bundler PADRÃO de `next dev` e de
+  // `next build`, e um projeto com config `webpack` REPROVA o build de
+  // propósito ("This build is using Turbopack, with a `webpack` config and
+  // no `turbopack` config"). O guia de migração dá três saídas; a escolhida
+  // aqui é a terceira, e as outras duas foram MEDIDAS antes de descartadas:
+  //
+  //   1. Usar o Turbopack assim mesmo (`--turbopack` / `turbopack: {}`).
+  //      Medido nesta worktree: o build morre com "Module not found" em
+  //      TODO import interno — `../../lib/auth.js`, `../../trpc/context.js`,
+  //      `middleware.ts:65`, `app/layout.tsx:4`, ~30 arquivos. O Turbopack
+  //      não reimplementa o `extensionAlias` do webpack.
+  //
+  //   2. Migrar a config para opções equivalentes do Turbopack. NÃO EXISTE
+  //      equivalente: o Turbopack expõe `resolveAlias` e `resolveExtensions`
+  //      (ver `turbopack.md` nos docs embarcados em node_modules/next), e
+  //      nenhum dos dois reescreve o especificador `foo.js` para `foo.ts` —
+  //      `resolveExtensions` só vale para especificador SEM extensão. A
+  //      alternativa seria tirar o `.js` de todo import interno do console,
+  //      que é um refactor de toda a árvore e contradiz a convenção de
+  //      módulos da raiz — fora do escopo de um upgrade.
+  //
+  //   3. `--webpack`: o opt-out documentado. Mantém a resolução de módulos
+  //      IGUAL à do 15.5, que é exatamente o que um upgrade deve preservar.
+  //
+  // O dia em que o `.js` sair dos imports internos, este bloco e os dois
+  // `--webpack` do package.json saem juntos.
   webpack(config) {
     config.resolve.extensionAlias = {
       '.js': ['.ts', '.tsx', '.js'],
