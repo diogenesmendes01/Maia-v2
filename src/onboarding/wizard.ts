@@ -453,17 +453,7 @@ export type StartRunOutcome =
   | { status: 'started'; run: OnboardingRunView; replayed: boolean }
   | { status: 'conflict'; code: string; message: string; run?: OnboardingRunView };
 
-/**
- * Abre a saga. IDEMPOTENTE (review do PR #541, achado 2): `idempotency_key` é
- * obrigatória e opaca, exatamente como no `executeOnboardingStep`, e o retry
- * com a mesma chave devolve a run JÁ MATERIALIZADA em vez de abrir outra.
- *
- * `metadata` deixou de ser `Record<string, unknown>` arbitrário: é um schema
- * TIPADO com vocabulário fechado (`runMetadataSchema`), e só os campos
- * aprovados são projetados para persistência (achado 5). Uma chave livre como
- * `note` — que atravessava a denylist porque o NOME dela é inofensivo — passa
- * a ser recusada na entrada.
- */
+/** A intenção de abrir uma saga, como a superfície a entrega. */
 export type StartRunInput = {
   kind: 'global_bootstrap' | 'tenant_onboarding';
   tenant_id: string | null;
@@ -474,6 +464,21 @@ export type StartRunInput = {
   metadata?: OnboardingRunMetadata;
 };
 
+/**
+ * Abre a saga. IDEMPOTENTE (review do PR #541, achado 2): `idempotency_key` é
+ * obrigatória e opaca, exatamente como no `executeOnboardingStep`, e o retry
+ * com a mesma chave devolve a run JÁ MATERIALIZADA em vez de abrir outra.
+ *
+ * `metadata` deixou de ser `Record<string, unknown>` arbitrário: é um schema
+ * TIPADO com vocabulário fechado (`runMetadataSchema`), e só os campos
+ * aprovados são projetados para persistência (achado 5). Uma chave livre como
+ * `note` — que atravessava a denylist porque o NOME dela é inofensivo — passa
+ * a ser recusada na entrada.
+ *
+ * A decisão inteira mora em `openRun`; esta camada existe só para tornar a
+ * RECUSA observável (`countRefusal`). Sem ela, o comando que mais interessa
+ * ver sendo recusado — `tenant_id: 'default'` — não deixava rastro nenhum.
+ */
 export async function startOnboardingRun(input: StartRunInput): Promise<StartRunOutcome> {
   try {
     return await openRun(input);
