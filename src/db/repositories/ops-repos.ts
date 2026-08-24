@@ -377,6 +377,49 @@ export async function readTombstoneLedger(): Promise<{
   }
 }
 
+/**
+ * O `tombstone_watermark` do artefato que foi restaurado (issue #536 §3).
+ *
+ * `null` no retorno significa "não há watermark conhecido para este backup", e
+ * `planReconciliation` bloqueia nesse caso — que é o certo: sem saber até onde
+ * o snapshot já continha exclusões, não se sabe o que reaplicar.
+ */
+export async function readBackupWatermark(backupId: string): Promise<Date | null> {
+  const res = await db.execute<{ tombstone_watermark: string | null }>(sql`
+    SELECT tombstone_watermark FROM ${backup_runs} WHERE id = ${backupId}::uuid LIMIT 1
+  `);
+  const raw = res.rows[0]?.tombstone_watermark ?? null;
+  return raw === null ? null : new Date(raw);
+}
+
+/** A linha de `privacy_requests` que o executor precisa, e nada além dela. */
+export async function readPrivacyRequest(id: string): Promise<{
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  type: string;
+  status: string;
+  subject_ref: string;
+  identity_verified_by: string | null;
+  approved_by: string | null;
+} | null> {
+  const res = await db.execute<{
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    type: string;
+    status: string;
+    subject_ref: string;
+    identity_verified_by: string | null;
+    approved_by: string | null;
+  }>(sql`
+    SELECT id, tenant_id, agent_id, type, status, subject_ref,
+           identity_verified_by, approved_by
+      FROM privacy_requests WHERE id = ${id}::uuid LIMIT 1
+  `);
+  return res.rows[0] ?? null;
+}
+
 export interface ReadinessFacts {
   last_local_verified_at: Date | null;
   last_offsite_verified_at: Date | null;

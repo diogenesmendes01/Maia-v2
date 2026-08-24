@@ -9,7 +9,10 @@
 | | State |
 |---|---|
 | **Mechanism** (inventory, per-class purge, legal hold, tombstones, dry-run, audit) | Implemented and tested — `src/ops/retention/` |
+| **Subject requests** (resolution, encrypted export, erasure execution, tombstone re-application) | Implemented and unit-tested — `src/ops/privacy/`. **Never executed against a real database**; the SQL in `adapters.ts` deletes, and no line of it has run. |
 | **Policy** (how long each class is kept, on what legal basis, with what exceptions) | **Not decided.** Pending DPO approval |
+
+The two rows are different levers and only the first two are live. A **subject** asking for erasure is a legal obligation with a named requester, and it executes today (behind a recorded human approval). A **period-based** sweep deletes on the platform's own initiative, and it deletes nothing until the DPO approves a policy.
 
 The executable mirror of this document is [`src/ops/retention/data-classes.ts`](../../../src/ops/retention/data-classes.ts). Every class there ships with `retention_days: null` and `approval_state: 'pending_dpo'`, and `resolveRetention()` returns `purgeable: false` for all of them. **Today the retention executor deletes nothing.**
 
@@ -79,7 +82,23 @@ Each of these is carried in code as `DataClass.dpo_open_question` and is printed
 | `queue.redis` | None — ops owns the TTLs. |
 | `backup.artifact` | Local vs off-site retention, and the maximum window during which a deleted subject may still exist inside a retained artifact. |
 | `privacy.export` | Export package lifetime before it must expire. |
-| `privacy.tombstone` | The MINIMUM tombstone retention. **It must exceed the longest backup retention**, or resurrection becomes possible again once tombstones are gone. |
+| `privacy.tombstone` | ~~The MINIMUM tombstone retention.~~ **ANSWERED — technical, not legal.** See below. |
+
+### `privacy.tombstone` — answered (issue #536)
+
+Issue #536 flagged this one as *"técnica e não jurídica, e vale resolver antes das outras"*. It is answered, and the answer needed no new code — only the statement of why the existing structure already satisfies it.
+
+**The requirement**: the minimum tombstone retention must exceed the longest backup retention. Otherwise restoring an old artifact resurrects data that should already be gone, and the ledger has no way to stop it — the exact scenario tombstones exist to cover.
+
+**The answer**: tombstones are never purged, so they outlive any backup retention by construction, whatever period the DPO later sets for `backup.artifact`. This is not a default that could drift:
+
+- `privacy.tombstone` is declared `purge_mechanism: 'not_purgeable'` in [`data-classes.ts`](../../../src/ops/retention/data-classes.ts);
+- `parseRetentionPolicy` **drops** any policy entry for a structurally non-purgeable class, so a future `RETENTION_POLICY` cannot make tombstones expire even if it asks (`tests/unit/ops/retention-data-classes.spec.ts`);
+- `resolveRetention('privacy.tombstone', …)` returns `purgeable: false` with `reason: 'class_not_purgeable'` for every policy, approved or not.
+
+**What this does NOT settle**: how long a *retained backup artifact* may keep a deleted subject's data inside it. That stays open under `backup.artifact` and is a different question — it bounds the window in which a restore still needs reconciliation, not the life of the ledger. The mechanism for that window is [§3.6 of the runbook](../../runbooks/backup-restore.md): the reconciliation job re-applies every tombstone newer than the artifact's watermark before traffic is released.
+
+**Consequence to accept**: the tombstone ledger grows without bound. It is one small pseudonymised row per deletion, and `readTombstoneLedger` already caps its read and reports `available: false` when the cap is exceeded — which **blocks** restores rather than silently truncating the plan. If that cap is ever reached in practice, the fix is a bigger cap or a compaction design, never an expiry.
 
 ## Legal hold
 
@@ -100,12 +119,14 @@ The ledger stores **pseudonyms** (keyed HMAC), never raw identifiers — a tombs
 
 **The ledger's key is now defined** (issue #536). `deriveTombstoneSecret()` in [`tombstones.ts`](../../../src/ops/retention/tombstones.ts) derives it from the platform HMAC master secret under the fixed label `maia.tombstone.hmac.v1`, so the ledger key is not the manifest-signing key even though both descend from the same master. It could be pinned now precisely because nothing has written a tombstone yet; once rows exist it is frozen, since a different derivation makes every existing HMAC fail and an unverifiable ledger blocks every restore by design. This is a **key-management** decision, not a legal one — no retention period is implied or set by it.
 
-**The gate is now exercised, not merely described.** The restore drill (`npm run restore:test`, [`drill.ts`](../../../src/ops/backup/drill.ts)) runs `planReconciliation` + `canReleaseTraffic` as a DRY RUN against the restored snapshot and records `restore_drills.tombstones_pending`. So an unreadable ledger, a missing watermark or a planted row now fails a scheduled drill instead of being discovered during an incident. Re-APPLYING the tombstones is still manual — it needs the per-class deletion mechanism the privacy workflow will build.
+**The gate is now exercised, not merely described.** The restore drill (`npm run restore:test`, [`drill.ts`](../../../src/ops/backup/drill.ts)) runs `planReconciliation` + `canReleaseTraffic` as a DRY RUN against the restored snapshot and records `restore_drills.tombstones_pending`. So an unreadable ledger, a missing watermark or a planted row now fails a scheduled drill instead of being discovered during an incident.
+
+**Re-applying is now a job too** (issue #536). `npm run restore:reconcile` ([`reapply.ts`](../../../src/ops/privacy/reapply.ts)) replays every pending tombstone through the *same* per-class purge the privacy workflow uses, then asks `canReleaseTraffic` with the ids it actually **confirmed** — never the list it intended to apply. One guard is worth naming here because no automated check can replace it: after a `pg_restore`, `data_tombstones` inside the restored database is the OLD ledger, so a plan built from it comes back `ok` with `pending: []` and would release traffic with every erased subject back online. The rows are identical to a good ledger's. The job therefore **requires** an explicit `--ledger-source` assertion and blocks without it.
 
 ## Review
 
 | | |
 |---|---|
-| Last updated | 2026-08-04 (issue #536 — tombstone key derivation + the drill's reconciliation dry run; **no period was decided**) |
+| Last updated | 2026-08-24 (issue #536 — subject-request execution, encrypted export, tombstone re-application job, and the `privacy.tombstone` question answered on technical grounds; **no legal period was decided**) |
 | Approved by legal/DPO | **No — draft** |
 | Re-review when | A class is added, a period is approved, or the media/Redis decisions land |

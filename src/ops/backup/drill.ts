@@ -326,6 +326,171 @@ export function assertSafeDatabaseName(name: string): string {
 }
 
 /**
+ * Databases a drill must never touch, whatever the name guard says. `postgres`
+ * is the maintenance database this module CONNECTS to in order to run its DDL;
+ * the templates are the cluster's seed. Dropping any of the three is not a
+ * failed drill, it is an outage.
+ */
+const RESERVED_DATABASES: ReadonlySet<string> = new Set(['postgres', 'template0', 'template1']);
+
+/**
+ * The positive marker every ephemeral drill database must carry.
+ *
+ * Deliberately the exact shape `drillDatabaseName` produces — `<base>_drill_
+ * <14 digits>_<hex>`. A regex that merely looked for the substring `_drill_`
+ * would accept `maia_drill_prod`, i.e. a hand-typed name that happens to
+ * contain the marker, which is precisely the class of mistake this exists to
+ * stop.
+ */
+const DRILL_NAMESPACE = /^[a-z][a-z0-9_]{0,23}_drill_[0-9]{14}_[0-9a-f]{1,12}$/;
+
+/**
+ * Extract the database name from a URL connection string.
+ *
+ * Returns `null` for anything it cannot read with certainty — an unparseable
+ * URL, an empty path, a path with a slash inside it. `null` is NOT "no
+ * database": it is "this module cannot tell", and every caller below treats it
+ * as a refusal, never as permission to skip a comparison.
+ */
+export function databaseNameFromUrl(url: string | undefined): string | null {
+  if (typeof url !== 'string' || url.trim().length === 0) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const name = decodeURIComponent(parsed.pathname).replace(/^\//, '');
+  if (name.length === 0 || name.includes('/')) return null;
+  return name;
+}
+
+/**
+ * THE DESTRUCTIVE GUARD (issue #536).
+ *
+ * `assertSafeDatabaseName` answers a different, narrower question: "can this
+ * string be interpolated into DDL without carrying a quote out?". It says
+ * nothing about WHICH database is about to be created, restored over, or
+ * dropped — `assertSafeDatabaseName('maia')` passes, and `maia` is production.
+ *
+ * A restore drill materialises a full plaintext copy of production data and
+ * then runs `CREATE DATABASE`, `pg_restore -d …` and `DROP DATABASE … WITH
+ * (FORCE)` on the SAME cluster production lives in, because that is where the
+ * dump has to land. The only thing between "drill" and "outage" is the target
+ * name, so the target name is PROVEN, on three axes, before any destructive
+ * adapter acts:
+ *
+ *  1. **namespace** — the name must be one this module minted
+ *     (`drillDatabaseName`): not an operator's, not a value read back from a
+ *     row, not a stale variable;
+ *  2. **database** — it must not be the database the runtime itself is
+ *     configured against, and must not be one of the cluster's reserved
+ *     databases;
+ *  3. **host** — the comparison in (2) is only meaningful if we know WHICH
+ *     database production is. If `DATABASE_URL` is absent, unparseable or
+ *     carries no database, we cannot know, and the drill REFUSES rather than
+ *     proceeding on an unchecked name.
+ *
+ * (3) is the fail-closed half, and it is the half that is easy to get wrong:
+ * an implementation that skipped the comparison when it could not parse the
+ * production URL would degrade, silently, into no guard at all — in exactly
+ * the misconfigured environment where a guard matters most.
+ *
+ * Raised as `TypedError` so `drillFailureCode` maps it to `isolation_failed`
+ * and the drill records evidence instead of dying anonymously.
+ */
+export function assertDrillTarget(name: string, productionUrl: string | undefined): string {
+  assertSafeDatabaseName(name);
+
+  // ORDER IS PART OF THE CONTRACT. The identity checks come before the
+  // namespace check so the code an operator reads names the WORST true thing
+  // about the target: a drill aimed at `maia` must report
+  // `drill_target_is_production`, not the technically-also-true "it does not
+  // look like a name I minted". The two are not equally alarming, and the
+  // failure code is what lands in `restore_drills`, in the alert and in the
+  // metric label.
+  const production = databaseNameFromUrl(productionUrl);
+  if (production === null) {
+    // Fail closed. Not knowing which database is production is not permission
+    // to skip the check — it is the reason to stop.
+    throw new TypedError(
+      'drill_target_unverifiable',
+      'cannot determine the production database, so no destructive operation may be proven safe',
+      {},
+    );
+  }
+
+  if (name.toLowerCase() === production.toLowerCase()) {
+    throw new TypedError(
+      'drill_target_is_production',
+      'refusing a destructive operation on the production database',
+      {},
+    );
+  }
+
+  if (RESERVED_DATABASES.has(name.toLowerCase())) {
+    throw new TypedError(
+      'drill_target_is_reserved',
+      'refusing a destructive operation on a reserved database',
+      { name_sample: name.slice(0, 64) },
+    );
+  }
+
+  if (!DRILL_NAMESPACE.test(name)) {
+    throw new TypedError(
+      'drill_target_not_namespaced',
+      'refusing a destructive operation on a database this drill did not mint',
+      { name_sample: name.slice(0, 64) },
+    );
+  }
+
+  return name;
+}
+
+/**
+ * The other half of the same question: the CONNECTION the DDL runs on.
+ *
+ * `CREATE DATABASE` / `DROP DATABASE` execute against a maintenance
+ * connection. If that connection were built wrong — a `DATABASE_URL` whose
+ * path manipulation misfired, a copy-pasted URL pointing at another cluster —
+ * the target-name guard above would still pass while the statement landed
+ * somewhere nobody intended. So the admin URL is proven too: same host, same
+ * port, and a database that IS a maintenance one.
+ */
+export function assertAdminTarget(adminUrl: string, productionUrl: string | undefined): string {
+  let admin: URL;
+  let production: URL;
+  try {
+    admin = new URL(adminUrl);
+    production = new URL(productionUrl ?? '');
+  } catch {
+    throw new TypedError(
+      'drill_admin_target_unverifiable',
+      'cannot compare the maintenance connection against the configured one',
+      {},
+    );
+  }
+  if (admin.host !== production.host) {
+    // `host` INCLUDES the port. A drill that reaches a different cluster than
+    // the one this process is configured for is not isolated, it is lost.
+    throw new TypedError(
+      'drill_admin_target_foreign_host',
+      'refusing to run drill DDL against a host this process is not configured for',
+      {},
+    );
+  }
+  const adminDb = databaseNameFromUrl(adminUrl);
+  if (adminDb === null || !RESERVED_DATABASES.has(adminDb.toLowerCase())) {
+    throw new TypedError(
+      'drill_admin_target_not_maintenance',
+      'refusing to run drill DDL on a connection that is not the maintenance database',
+      {},
+    );
+  }
+  return adminUrl;
+}
+
+/**
  * Codes this module raises itself and records verbatim.
  *
  * `cleanup_failed` and `drill_not_recorded` are deliberately absent: they are
@@ -365,6 +530,16 @@ const TRANSLATED_FAILURE_CODES: Readonly<Record<string, RestoreDrillFailureCode>
   backup_keyring_invalid: 'decryption_failed',
   unsafe_artifact_ref: 'artifact_fetch_failed',
   unsafe_drill_database_name: 'isolation_failed',
+  // The destructive guard. Every one of these means "this drill refused to
+  // touch a target it could not prove safe" — an isolation failure, never a
+  // restore or a probe diagnosis.
+  drill_target_not_namespaced: 'isolation_failed',
+  drill_target_unverifiable: 'isolation_failed',
+  drill_target_is_production: 'isolation_failed',
+  drill_target_is_reserved: 'isolation_failed',
+  drill_admin_target_unverifiable: 'isolation_failed',
+  drill_admin_target_foreign_host: 'isolation_failed',
+  drill_admin_target_not_maintenance: 'isolation_failed',
   // An unkeyable ledger cannot be verified, and an unverifiable ledger cannot
   // clear a restore for production. Blocked, never "no tombstones found".
   tombstone_secret_missing: 'reconciliation_blocked',

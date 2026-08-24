@@ -39,7 +39,11 @@ import { resolveArtifactObjectKey, resolveArtifactPath } from './artifact-path.j
 import { sha256File } from './checksum.js';
 import { decryptFile, parseBackupKeyring } from './encryption.js';
 import { backupManifestKeyring } from './manifest-keyring.js';
-import { assertSafeDatabaseName, type RestoreDrillPorts } from './drill.js';
+import {
+  assertAdminTarget,
+  assertDrillTarget,
+  type RestoreDrillPorts,
+} from './drill.js';
 import { RESTORE_DRILL_PROBES, type ProbeContext, type ProbeRow } from './drill-probes.js';
 
 /** Where staged (downloaded / decrypted) artifacts live during a drill. */
@@ -50,16 +54,28 @@ export function drillWorkspace(): string {
 /**
  * Connection URL for the maintenance database, used to CREATE/DROP the
  * ephemeral drill database. Never logged — it carries the password.
+ *
+ * `assertAdminTarget` proves the URL we just built still points at the cluster
+ * this process is configured for, and at a maintenance database. Building it
+ * and checking it in the same function is deliberate: there is no way to
+ * obtain an admin URL here that skipped the check.
  */
 function adminUrl(): string {
   const u = new URL(config.DATABASE_URL);
   u.pathname = '/postgres';
-  return u.toString();
+  return assertAdminTarget(u.toString(), config.DATABASE_URL);
 }
 
+/**
+ * Connection URL for the ephemeral drill database.
+ *
+ * This is the choke point for `pg_restore -d` and for the probe client, i.e.
+ * the "restore over the top" path. `assertDrillTarget` — not merely the name
+ * shape — decides whether the name may become a connection at all.
+ */
 function databaseUrl(databaseName: string): string {
   const u = new URL(config.DATABASE_URL);
-  u.pathname = `/${assertSafeDatabaseName(databaseName)}`;
+  u.pathname = `/${assertDrillTarget(databaseName, config.DATABASE_URL)}`;
   return u.toString();
 }
 
@@ -67,8 +83,8 @@ function databaseUrl(databaseName: string): string {
  * Run one statement on the maintenance database.
  *
  * `CREATE DATABASE` / `DROP DATABASE` cannot run inside a transaction and
- * cannot be parameterised, which is why `assertSafeDatabaseName` gates every
- * name before it reaches this function.
+ * cannot be parameterised, which is why `assertDrillTarget` gates every name
+ * before it reaches this function.
  */
 async function adminExec(statement: string): Promise<void> {
   const client = new pg.Client({ connectionString: adminUrl() });
@@ -92,12 +108,18 @@ async function adminExec(statement: string): Promise<void> {
  * swallowing the error here would put the false certification straight back.
  */
 async function databaseExists(name: string): Promise<boolean> {
+  // The guard runs BEFORE the connection, not inside the query arguments. This
+  // call is read-only, but it takes its name from the same variable the
+  // destructive ones do; letting a production name reach the wire here would
+  // make "the drill talked about production" an ordinary event in the logs,
+  // and it is the one event that must never be ordinary.
+  const target = assertDrillTarget(name, config.DATABASE_URL);
   const client = new pg.Client({ connectionString: adminUrl() });
   await client.connect();
   try {
     const res = await client.query<{ ok: number }>(
       'SELECT 1 AS ok FROM pg_database WHERE datname = $1',
-      [assertSafeDatabaseName(name)],
+      [target],
     );
     return res.rowCount !== null && res.rowCount > 0;
   } finally {
@@ -180,7 +202,7 @@ export function createRestoreDrillPorts(): RestoreDrillPorts {
     },
 
     createIsolatedDatabase: async (name) => {
-      await adminExec(`CREATE DATABASE "${assertSafeDatabaseName(name)}"`);
+      await adminExec(`CREATE DATABASE "${assertDrillTarget(name, config.DATABASE_URL)}"`);
     },
 
     restore: async (databaseName, artifactPath) => {
@@ -231,7 +253,9 @@ export function createRestoreDrillPorts(): RestoreDrillPorts {
       // FORCE (PostgreSQL 13+) terminates any connection still attached — a
       // probe client that failed to close must not leave a full copy of
       // production data behind on the host.
-      await adminExec(`DROP DATABASE IF EXISTS "${assertSafeDatabaseName(name)}" WITH (FORCE)`);
+      await adminExec(
+        `DROP DATABASE IF EXISTS "${assertDrillTarget(name, config.DATABASE_URL)}" WITH (FORCE)`,
+      );
     },
 
     removeFile: async (path) => {
