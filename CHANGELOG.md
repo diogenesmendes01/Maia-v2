@@ -4,6 +4,15 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Removed — `recharts` sai do console; o upgrade 2 → 3 não tinha o que migrar ([#605](https://github.com/diogenesmendes01/Maia-v2/issues/605))
+
+A issue pedia o major `recharts` 2 → 3 "com o visual do console verificado", e o primeiro critério de aceite era o **inventário das telas que usam Recharts**. O inventário deu **vazio**: nenhum arquivo do repositório importa `recharts`, e nenhum commit da história inteira jamais importou (`git log --all -S "from 'recharts"` não devolve nada). O pacote entrou no scaffold do P8.5 (`e23c8523`) junto com um kit de UI que nunca foi ligado. As telas do console — `audit`, `dashboard`, `drift`, `traces` — são tabelas, badges e formulários; **não há gráfico**.
+
+- **`recharts` removido** de `src/admin-ui/package.json`. O critério de aceite da issue exigia "snapshot visual, ou asserção sobre o SVG gerado, ou E2E que confira os elementos do gráfico; **nenhuma verificação não serve**" — com zero telas afetadas esse critério é insatisfazível para um upgrade: não existe SVG para assertar. Subir para o 3.x seria trocar um major por outro sem uma única evidência de render. A remoção, essa sim, é verificável: nada importava o pacote, então nada era empacotado, e o build e o smoke E2E do console não mudam.
+- **Lockfile: remoção pura.** `src/admin-ui/package-lock.json` foi de 572 para 538 pacotes — 34 saíram (`recharts`, `recharts-scale`, `victory-vendor`, `react-smooth`, os 11 `d3-*` e 9 `@types/d3-*`, `lodash`, `clsx`, `eventemitter3`, `tiny-invariant`, `decimal.js-light`, `dom-helpers`, `fast-equals`, `internmap`, `react-transition-group`, `react-is@18` aninhado), **zero adicionados e zero com versão alterada**.
+- **`tests/unit/admin-ui-dependencia-sem-importador.spec.ts`** tranca a invariante geral, não o nome: toda dependência de runtime do console tem importador em `src/`, ou tem motivo escrito. Uma dependência fantasma não é inerte — ela vira advisory no ledger de exceções ([#526](https://github.com/diogenesmendes01/Maia-v2/issues/526)) e PR de major do Dependabot (foi a [#587](https://github.com/diogenesmendes01/Maia-v2/issues/587)) por código que não existe.
+- **Três dívidas da mesma origem ficaram documentadas** na allowlist do guard, em vez de invisíveis: `@tanstack/react-table`, `react-hook-form` e `react-diff-viewer-continued` também vieram do scaffold e também não têm importador. Removê-las está fora do escopo desta issue.
+
 ### ⚠️ BREAKING (operacional) — o console valida o subset `admin-ui` no boot, e o `.env.admin` encolhe ([#596](https://github.com/diogenesmendes01/Maia-v2/issues/596))
 
 > **Um `.env.admin` que sobe hoje pode recusar o boot depois deste release** — e é esse o ponto. Rode `npm run config:preflight` antes do `up`.
