@@ -64,6 +64,8 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
 | `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
 | `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
+| `stream-key.ts` | Derivação CANÔNICA da `stream_key` (#505). PURO e versionado: material comprimento-prefixado (netstring) sobre `tenant_id + agent_id + canal + linha + identidade remota normalizada`. Nenhum caminho devolve chave "genérica" — ou é inequívoca ou é `{ ok: false, reason }`. |
+| `stream-ingress.ts` | A FRONTEIRA fail-closed do ingresso (#505): audita, mede e RECUSA (`StreamIdentityUnresolvedError`) quando a stream não é derivável. Dono de `maia_stream_ingress_total` e `maia_stream_ingress_rejected_total`. |
 | `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
 | `index.ts` | Superfície pública — importe daqui. |
 
@@ -89,6 +91,49 @@ classificada como resposta a uma pergunta pendente e perdeu para outra resposta
 que resolveu a mesma pendência. `completed` seria mentira — quem despachou a
 ação foi o OUTRO turno; este não executou nada e é descartado por regra
 explícita. Ver [`agent.md`](agent.md) § Pending gate.
+
+#### Identidade de stream e sequência de ingresso (#505, fases 1–2)
+
+A #505 quer FIFO **por conversa** sem serializar a fila inteira. A unidade de
+serialização precisa existir **no ingresso**, e `conversa_id` não serve: ele é
+resolvido depois e é `NULL` na hora em que a ordem de chegada é decidida — uma
+unidade que às vezes é NULL colapsa todo mundo numa stream só, que é a
+serialização global que a issue proíbe.
+
+**`stream_key`** é derivada de material que já existe no ingresso: `tenant_id`,
+`agent_id`, o tipo de canal, a LINHA (`channel_id`) e a identidade remota
+normalizada. O encoding é **comprimento-prefixado** (netstring `<bytes>:<valor>,`),
+não concatenação com separador: `["a:b","c"]` e `["a","b:c"]` produzem a mesma
+string sob `join(':')`, e duas conversas com a mesma chave compartilhariam ordem,
+lock e — na fase de enforcement — exclusão mútua. A issue trata colisão como risco
+de **segurança**. A versão do algoritmo aparece no valor (`v1:<sha256>`) **e** na
+coluna `stream_key_version`.
+
+**Fail-closed.** `tenant_id`/`agent_id` são obrigatórios, `'default'` e `'system'`
+são recusados, e a LINHA é obrigatória (desde a migration 090 a conversa é
+escopada por canal — sem `channel_id` no material, o mesmo interlocutor em duas
+linhas colapsaria numa stream). Um ingresso irresolúvel é RECUSADO, auditado
+(`stream_ingress_rejected`) e nunca persistido. Em produção esse caso já era
+fail-closed antes daqui: todo ramo não-lançante de `resolveChannel` devolve
+`channel_id`.
+
+**`ingress_seq`** é monotônica **por stream**, alocada por
+`INSERT … ON CONFLICT DO UPDATE … RETURNING` numa linha de `agent_stream_sequences`
+— uma declaração atômica cujo lock de row serializa apenas aquela stream (streams
+distintas nunca se veem, e não há lock global por tenant, agente ou fila). A
+alocação corre **dentro da transação do INSERT** da mensagem: se a reentrega
+colidir na unique de dedup, o rollback devolve o número, e é assim que
+"redelivery reusa a sequência original" fica garantido por construção. A dedup
+por `whatsapp_id` precede tudo isso, no pre-check de `createInbound`.
+
+**Fronteiras.** O turno persiste `first_ingress_seq`/`last_ingress_seq`. Turno
+simples: iguais. Turno agregado pelo debounce: `absorbDebounceInputs` estende a
+fronteira com `LEAST`/`GREATEST` e **só** com ingressos da mesma `stream_key` —
+uma mensagem de outra conversa não move a fronteira.
+
+**Fora desta fatia** (fases 5–9 da issue): head-of-line como condição do claim,
+exclusão "no máximo um turno ativo por stream", debounce transacional, promoção
+de sucessor, política de retry/DLQ por stream, fairness e backfill.
 
 #### Claim atômico, lease e fencing (#504)
 
@@ -223,6 +268,7 @@ contrato, nunca o `.env.example`):
 | `FEATURE_TURN_STATE_MACHINE` | `true` | Dual-write: cria/transiciona turnos. Só ESCRITA — o comportamento observável não muda. **Exige as migrations 096/097 aplicadas.** |
 | `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | Flip da LEITURA: o recovery elege por `agent_turns.status` em vez de `processada_em`. |
 | `FEATURE_TURN_CLAIM` | `false` | Claim atômico + lease + fencing (#504). É o único regime em que `beginTurnExecution` pode devolver `started: false` e BARRAR a execução. **Exige a migration 114.** |
+| `FEATURE_TURN_STREAM_KEY` | `true` | Identidade de stream e sequência de ingresso (#505, fases 1–2: SHADOW). Só ESCRITA — nada lê as colunas para decidir. A ÚNICA mudança observável é a recusa fail-closed de ingresso sem identidade derivável. **Exige as migrations 118/119.** |
 
 `TURN_LEASE_TTL_MS` (60s) e `TURN_LEASE_HEARTBEAT_MS` (15s) dimensionam a lease.
 O heartbeat DEVE caber ao menos 3× no TTL — com 2×, uma renovação perdida já

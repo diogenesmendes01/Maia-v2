@@ -369,7 +369,79 @@ imediatamente. Jobs V2 já na fila continuam sendo entendidos pelo worker — é
 justamente por isso que o consumidor precede o produtor. Não há migration
 envolvida.
 
-## 8. Rollback
+## 8. Identidade de stream e sequência de ingresso (#505, fases 1–2)
+
+Fase SHADOW: as colunas `stream_key`/`stream_key_version`/`ingress_seq`
+(`mensagens`) e `stream_key`/`first_ingress_seq`/`last_ingress_seq`
+(`agent_turns`) passam a ser preenchidas, e **nada as lê para decidir**.
+Head-of-line, exclusão por stream, debounce transacional e promoção de sucessor
+são fases posteriores.
+
+### 8.1 Ordem obrigatória do deploy
+
+1. `npm run db:migrate` (aplica `118` e `119`);
+2. só então suba o código com `FEATURE_TURN_STREAM_KEY=true` (o default).
+
+Subir o código antes da migration derruba **todo o ingresso**: a coluna não
+existe e o INSERT falha. Mesma armadilha, mesma ordem, do
+`FEATURE_TURN_STATE_MACHINE` com as `096`/`097`.
+
+### 8.2 A única mudança de comportamento observável
+
+Um ingresso cuja identidade de stream não é derivável passa a ser **recusado**:
+`audit_logs` recebe `stream_ingress_rejected`, o log estruturado
+`baileys.stream_identity_unresolved_drop` traz o `whatsapp_id`, e a mensagem
+**não** é persistida. Nunca há queda para stream genérica ou `'default'` — a
+issue nomeia esse fallback como uma das falhas que ela existe para impedir.
+
+Em produção esse caso já era fail-closed antes desta issue: todo ramo
+não-lançante de `resolveChannel` devolve `channel_id`, e um miss de resolução já
+derrubava a mensagem no `handleIncoming`. Se
+`maia_stream_ingress_rejected_total` sair de zero, a causa provável é
+configuração (linha não semeada, `MAIA_CHANNEL_ROUTING_MODE` mal ajustado) e
+**não** tráfego legítimo.
+
+### 8.3 O que olhar
+
+| Sinal | Onde | Leitura |
+|---|---|---|
+| `maia_stream_ingress_total{channel_kind,result}` | `/metrics` | `result="rejected"` deve ser ZERO. Qualquer ponto é mensagem de usuário não processada. |
+| `maia_stream_ingress_rejected_total{reason}` | `/metrics` | Vocabulário fechado: `missing_tenant`, `missing_agent`, `reserved_scope_literal`, `missing_channel_kind`, `missing_channel`, `missing_remote_identity`, `unnormalizable_remote_identity`. |
+| `stream.ingress_sequenced` | log estruturado | `stream_key`, versão, `ingress_seq`, `mensagem_id` — é daqui que se reconstrói a ordem de uma conversa. |
+| `stream_ingress_sequenced` | `audit_logs` | Só o NASCIMENTO da stream (`ingress_seq = 1`). Auditar cada mensagem inflaria a tabela na razão do tráfego. |
+
+Buraco na numeração de uma stream:
+
+```sql
+SELECT s.stream_key, s.last_ingress_seq, count(m.id) AS ingressos
+  FROM agent_stream_sequences s
+  LEFT JOIN mensagens m
+    ON m.tenant_id = s.tenant_id AND m.agent_id = s.agent_id
+   AND m.stream_key = s.stream_key
+ WHERE s.tenant_id = $1 AND s.agent_id = $2
+ GROUP BY s.stream_key, s.last_ingress_seq
+HAVING count(m.id) <> s.last_ingress_seq;
+```
+
+Zero linhas é o esperado. Uma linha significa sequência queimada — o sintoma de
+alocação fora da transação, ou de remoção de mensagens sem ajuste do contador.
+
+### 8.4 Rollback
+
+`FEATURE_TURN_STREAM_KEY=false` faz o próximo ingresso voltar a persistir sem
+stream (colunas NULL) e desliga a recusa fail-closed. As sequências já alocadas
+ficam: religar a flag CONTINUA de onde o contador parou, então o kill switch não
+reordena nada — só abre um trecho sem ordem canônica.
+
+**De migration** — ordem inversa do deploy, e a `119` cai **antes** da `118` (as
+constraints e os índices da `119` dependem das colunas da `118`). O `_down` da
+`119` não tem envelope `BEGIN`/`COMMIT` porque `DROP INDEX CONCURRENTLY` é
+recusado dentro de transação; em compensação todo statement dele é idempotente e
+independente, e reexecutar termina o trabalho. O `_down` da `118` **tem**
+envelope e apaga `agent_stream_sequences` — a ordem das streams vivas se perde e
+não é reconstruível. Só é seguro enquanto o protocolo for shadow.
+
+## 9. Rollback
 
 **De aplicação** — volte o código; mantenha as tabelas; mantenha o dual-write
 enquanto houver versão mista rodando. `processada_em` nunca deixou de ser

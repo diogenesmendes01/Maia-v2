@@ -44,6 +44,7 @@ import {
   noteTurnQueued,
   noteTurnEnqueueFailed,
   turnStateMachineEnabled,
+  isStreamIdentityUnresolved,
   type TurnStatus,
 } from '@/runtime/turns/index.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
@@ -1073,52 +1074,71 @@ async function handleIncoming(
   // transação. Se o processo morrer entre o commit e o enqueue, o recovery
   // reencontra o turno em `received` (a ordem persistir-antes-de-enfileirar já
   // era a fundação correta; o turno só a torna diagnosticável).
-  const {
-    row: stored,
-    duplicate,
-    turn,
-  } = await mensagensRepo.createInbound(
-    {
-      conversa_id: null,
-      // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
-      // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
-      // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
-      // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
-      // cai na partial unique legada por (tenant, agent, whatsapp_id).
-      channel_id: _resolvedChannelId,
-      direcao: 'in',
-      tipo: type,
-      conteudo: content,
-      midia_url: mediaPath,
-      metadata: {
-        whatsapp_id,
-        remote_jid,
-        telefone: tel,
-        pushname: msg.pushName ?? null,
-        timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
-        media_mime: mediaMime,
-        media_sha256: mediaSha256,
-        // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
-        // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
-        // processes; only the media fields are withheld.
-        media_rejected: mediaRejected,
-        // [Issue #290] Channel resolved at the ingress. In single-tenant this is
-        // the seeded default channel id (#411 catch-all); null only when the
-        // resolver path didn't surface a channel_id (e.g., tests driving
-        // handleIncoming directly). Persisted for triage and as defense-in-depth
-        // — the worker's adoption probe is unaffected by this field.
-        ingress_channel_id: _resolvedChannelId,
-        // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
-        // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
-        // exact-match por linha nos modos shadow/exact_first/strict.
-        bot_line_external_id: _botLine,
+  //
+  // Issue #505 — o `createInbound` passou a ser FAIL-CLOSED quanto à identidade
+  // de stream: um ingresso cuja conversa não pode ser derivada com segurança
+  // lança em vez de ser persistido. O `catch` abaixo converte isso no MESMO
+  // desfecho que este arquivo já dá a toda falha de resolução — audita e
+  // derruba a mensagem — em vez de deixá-lo escapar como `baileys.handle_failed`
+  // opaco, que perderia o motivo tipado.
+  let ingress: Awaited<ReturnType<typeof mensagensRepo.createInbound>>;
+  try {
+    ingress = await mensagensRepo.createInbound(
+      {
+        conversa_id: null,
+        // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
+        // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
+        // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
+        // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
+        // cai na partial unique legada por (tenant, agent, whatsapp_id).
+        channel_id: _resolvedChannelId,
+        direcao: 'in',
+        tipo: type,
+        conteudo: content,
+        midia_url: mediaPath,
+        metadata: {
+          whatsapp_id,
+          remote_jid,
+          telefone: tel,
+          pushname: msg.pushName ?? null,
+          timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
+          media_mime: mediaMime,
+          media_sha256: mediaSha256,
+          // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
+          // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
+          // processes; only the media fields are withheld.
+          media_rejected: mediaRejected,
+          // [Issue #290] Channel resolved at the ingress. In single-tenant this is
+          // the seeded default channel id (#411 catch-all); null only when the
+          // resolver path didn't surface a channel_id (e.g., tests driving
+          // handleIncoming directly). Persisted for triage and as defense-in-depth
+          // — the worker's adoption probe is unaffected by this field.
+          ingress_channel_id: _resolvedChannelId,
+          // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
+          // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
+          // exact-match por linha nos modos shadow/exact_first/strict.
+          bot_line_external_id: _botLine,
+        },
+        processada_em: null,
+        ferramentas_chamadas: [],
+        tokens_usados: null,
       },
-      processada_em: null,
-      ferramentas_chamadas: [],
-      tokens_usados: null,
-    },
-    { withTurn: turnStateMachineEnabled() },
-  );
+      { withTurn: turnStateMachineEnabled() },
+    );
+  } catch (err) {
+    if (!isStreamIdentityUnresolved(err)) throw err;
+    // `resolveIngressStream` já escreveu `stream_ingress_rejected` em
+    // `audit_logs` e incrementou as duas séries. Esta linha é o breadcrumb POR
+    // MENSAGEM que o operador usa para achar o evento no provedor — o
+    // `whatsapp_id` é o único identificador estável, já que a row NÃO foi
+    // persistida.
+    logger.warn(
+      { whatsapp_id, reason: err.reason },
+      'baileys.stream_identity_unresolved_drop',
+    );
+    return;
+  }
+  const { row: stored, duplicate, turn } = ingress;
   // Handle do turno recém-criado (null quando a flag está OFF). Só transições
   // de ESTADO passam por ele — nenhum dado da mensagem.
   const turnHandle = turn
