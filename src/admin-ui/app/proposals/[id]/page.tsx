@@ -19,7 +19,14 @@ import { TYPE_LABELS } from '../../inbox/_components/labels.js';
  * (tipo, risco, origem, status, progresso de aprovação dupla), travas de
  * arquitetura, o diff por tipo e a trilha de decisões anteriores.
  */
-export default function ProposalDetailPage({ params }: { params: { id: string } }) {
+export default function ProposalDetailPage({
+  params,
+}: {
+  // Next 16 — `params` é uma Promise. A compatibilidade síncrona da 15 foi
+  // REMOVIDA; em componente de cliente quem a resolve é `React.use()`.
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = React.use(params);
   const { data: session, status } = useSession();
   const tenantId = session?.user?.tenant_id ?? '';
   const userRole = session?.user?.role ?? 'viewer';
@@ -29,7 +36,7 @@ export default function ProposalDetailPage({ params }: { params: { id: string } 
   );
 
   const proposalQuery = trpc.proposals.getProposal.useQuery(
-    { id: params.id, tenantId },
+    { id, tenantId },
     { enabled: tenantId !== '' },
   );
 

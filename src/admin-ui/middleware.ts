@@ -60,6 +60,32 @@
  *
  * If/when `lib/auth.ts` is split into edge-safe + node-only halves, this file
  * should collapse back into the `auth()` wrapper and this comment can go.
+ *
+ * ---------------------------------------------------------------------------
+ * Next 16 — por que este arquivo continua `middleware.ts` (issue #604)
+ * ---------------------------------------------------------------------------
+ *
+ * O Next 16 DEPRECIOU o nome `middleware` em favor de `proxy`, e o
+ * `next build` imprime o aviso a cada build:
+ *
+ *     ⚠ The "middleware" file convention is deprecated.
+ *       Please use "proxy" instead.
+ *
+ * Depreciado NÃO é removido: o 16 continua compilando e executando este
+ * arquivo (o build o lista como `ƒ Proxy (Middleware)`). Manter o nome é
+ * DELIBERADO, e o próprio guia de migração sanciona a escolha — "The `edge`
+ * runtime is NOT supported in `proxy`. (...) If you want to continue using
+ * the `edge` runtime, keep using `middleware`."
+ *
+ * E este gate é edge por construção, pelo motivo que o bloco acima já
+ * documenta: `proxy` roda SEMPRE em `nodejs`, sem opção de configurar. Trocar
+ * o nome não seria renomear um arquivo — seria mudar o runtime do portão de
+ * autenticação de TODA requisição do console, que é precisamente a mudança
+ * que um upgrade não deve embutir de carona.
+ *
+ * Migrar para `proxy` é trabalho próprio, e a hora certa é junto com o split
+ * `auth.config.ts` / `auth.ts` já previsto acima: com o runtime `nodejs` o
+ * wrapper `auth()` passa a ser possível, e os dois se resolvem no mesmo diff.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { hasSessionCookie, isPublicPath } from './middleware-cookie.js';
