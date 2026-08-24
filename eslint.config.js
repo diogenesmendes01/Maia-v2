@@ -363,6 +363,21 @@ export default [
     rules: TS_RULES,
   },
 
+  // Fixtures de processo filho do harness de confiabilidade (issue #510).
+  // São `.mjs` de propósito: sobem com `node <arquivo>` direto, sem `tsx` e sem
+  // transformação, porque um filho que demora 2s para subir some dentro do
+  // orçamento de qualquer cenário de fault injection. Sem este bloco eles
+  // cairiam só no `js.configs.recommended`, sem globals de Node, e
+  // `process`/`Buffer` virariam `no-undef`.
+  {
+    files: ['tests/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: NODE_GLOBALS,
+    },
+  },
+
   // Guards em ESM puro (`scripts/*.mjs`). Eles ficam FORA do tsc de propósito
   // — tsconfig.json inclui só `src/**/*`, e todo o `scripts/` já está fora —,
   // então o lint é a única verificação estática que os alcança. Sem este bloco
