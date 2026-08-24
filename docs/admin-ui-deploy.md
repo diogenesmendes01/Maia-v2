@@ -36,6 +36,13 @@ admin.${DOMAIN}    → admin-ui container  (Next.js :4000) — governance consol
 In Coolify, create **two separate applications** pointing at the same git
 repo + branch. Coolify will deploy each on a push.
 
+> Há um **terceiro** recurso, e este arquivo não o cobre: o job de migration
+> (issue #565), que roda `npm run db:migrate` e recebe só o subset `migrator`
+> — nenhum segredo de aplicação. Ele é deployado ANTES destes dois. O escopo
+> aqui continua sendo a topologia das duas aplicações que servem tráfego; o
+> terceiro recurso está em
+> [`docs/runbooks/deploy-prod.md`](runbooks/deploy-prod.md) §7.5.
+
 ### Application 1 — `maia` (existing)
 
 - Build pack: **Dockerfile**
@@ -219,10 +226,16 @@ roda ANTES de qualquer container de aplicação subir (issue #516):
   `admin-ui` declaram
   `depends_on: { migrate: { condition: service_completed_successfully } }`.
   O próprio `up` aplica; um migrate que falha derruba o `up` inteiro;
-- **fora do Compose (Coolify)** — `npm run release:migrate`, ligado como
-  comando pré-deploy ou encadeado no comando de start. Ver
-  [`docs/runbooks/deploy-prod.md`](runbooks/deploy-prod.md) §7, que separa
-  linha a linha o que foi executado do que não foi.
+- **fora do Compose (Coolify)** — a topologia adotada tem um **TERCEIRO
+  recurso**, só de migration, que roda `npm run db:migrate` com o seu próprio
+  conjunto de variáveis: apenas o subset `migrator`
+  ([`.env.migrator.prod.example`](../.env.migrator.prod.example)), sem nenhum
+  segredo de aplicação. Deploy dele primeiro; só siga se sair 0. Ver
+  [`docs/runbooks/deploy-prod.md`](runbooks/deploy-prod.md) §7.5. Se a sua
+  instância não tiver o recurso separado — ou se o painel herdar variáveis de
+  projeto para todos os recursos —, o caminho é `npm run release:migrate`,
+  ligado como comando pré-deploy ou encadeado no comando de start (§7.1–§7.2,
+  que separam linha a linha o que foi executado do que não foi).
 
 A instrução antiga desta seção mandava rodar
 `docker compose run --rm app npm run db:migrate` **depois** do deploy. Entre

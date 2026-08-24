@@ -450,9 +450,16 @@ Still open on #516:
 - **the BOOT step still uses the weaker check — an OWNER decision, not an agent's.** `src/index.ts` (lifecycle step `schema`) calls `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`), which compares the newest ledger id with the newest file on disk and nothing else. The canonical verdict (`src/migrations/status.ts`, exposed by `getSchemaReadiness()`) also sees checksum mismatch, `dirty`, orphaned `running`, a missing file and an incompatible head. Unifying them is a POLICY change with two defensible sides: keeping it means a schema condition costs one instance out of rotation with a self-describing 503 body, and that instance stays *inspectable*; unifying it means the same condition becomes a boot failure and, under a restarting supervisor, a **crash loop** — impossible to ignore, but the container you need to inspect is the one that will not stay up. The right answer depends on the supervisor, the alerting and whether anyone can reach the container. Recorded as the owner's decision on #516.
 - **Coolify: entregue na #565** — `npm run release:migrate`, com a separação
   entre o que foi executado e o que não foi em
-  `docs/runbooks/deploy-prod.md` §7 e na seção abaixo. **Kubernetes segue
-  fora**: decisão do dono, entrega futura; não há manifesto nem init
-  container neste repositório.
+  `docs/runbooks/deploy-prod.md` §7 e na seção abaixo. **A configuração de
+  deploy real, que a #565 deixara em aberto, também está fechada**: a
+  infraestrutura tem um RECURSO DE MIGRATION SEPARADO, que recebe só o subset
+  `migrator` (`.env.migrator.prod.example`, `deploy-prod.md` §7.5). O teto
+  desse subset é travado por CATEGORIA em `src/config/migrator-subset.ts`
+  (grupo do contrato, namespace, segredo-só-de-banco) e conferido no boot por
+  `loadMigrationConfig()`, então uma chave de aplicação acrescentada ao subset
+  derruba o migrator em vez de ampliar o raio de explosão em silêncio.
+  **Kubernetes segue fora**: decisão do dono, entrega futura; não há manifesto
+  nem init container neste repositório.
 
 ---
 

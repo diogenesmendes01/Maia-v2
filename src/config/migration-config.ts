@@ -9,14 +9,33 @@
  * Side-effect free at import time.
  */
 import { loadServiceConfig, type LoadOptions, type ServiceConfig } from '@/config/load.js';
+import { assertMigratorSubsetMinimal } from '@/config/migrator-subset.js';
 import { manifestForService } from '@/config/services.js';
 import type { MaiaProfile } from '@/config/metadata.js';
 import type { RunOptions } from '@/migrations/runner.js';
 
 export type MigrationConfig = ServiceConfig<'migrator'>;
 
-/** Load + validate the migrator's configuration. Throws `ConfigValidationError`. */
+/**
+ * Load + validate the migrator's configuration.
+ *
+ * Duas checagens, em ordem, e a ordem importa:
+ *
+ *   1. `assertMigratorSubsetMinimal()` mede o CONTRATO — "o subset `migrator`
+ *      continua sendo só processo + banco?". Vem primeiro porque um subset
+ *      que ganhou uma chave de aplicação já é o defeito, mesmo que o
+ *      ambiente daquele deploy não a tenha: a próxima plataforma que injetar
+ *      um ambiente único (Coolify, #565) passaria a entregá-la ao job de
+ *      DDL, e o `.env.migrator.prod.example` passaria a mandar preenchê-la.
+ *      Lança `MigratorSubsetError`;
+ *   2. `loadServiceConfig('migrator')` mede o AMBIENTE contra esse subset —
+ *      e SÓ contra ele. Um migrator que morresse por falta de `WHATSAPP_*`
+ *      seria o defeito da #596 do outro lado. Lança `ConfigValidationError`.
+ *
+ * As duas lançam com nome de variável e remediação, nunca com valor.
+ */
 export function loadMigrationConfig(options: LoadOptions = {}): MigrationConfig {
+  assertMigratorSubsetMinimal();
   return loadServiceConfig('migrator', options);
 }
 

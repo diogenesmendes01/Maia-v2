@@ -10,9 +10,14 @@ dist/
 .env.*.local
 # Fase 0 cap. 6 — env files reais do compose de produção (nunca commitar).
 # Os exemplos versionados são .env.app.prod.example / .env.admin.prod.example.
+# `.env.migrator` é o do recurso de migration separado da infra real (#565),
+# cujo exemplo é .env.migrator.prod.example — ele não é usado pelo compose (o
+# serviço `migrate` não tem `env_file` de propósito), mas o runbook manda
+# copiá-lo, e um `cp` na raiz não pode virar commit.
 .env.app
 .env.admin
 .env.infra
+.env.migrator
 
 # WhatsApp / Baileys
 .baileys-auth/
