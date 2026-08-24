@@ -94,6 +94,26 @@ UPDATE backup_runs
 
 **Janela de perda**: até 24h (o dump é noturno). Um RPO menor exige PITR/WAL archiving — sub-escopo planejado, não prometido.
 
+### 3.6 A reconciliação pós-restore (issue #536)
+
+Era um passo manual: "liste os tombstones posteriores e reaplique cada exclusão". Enquanto for manual, a proteção contra ressurreição de dado depende de alguém lembrar — no dia em que se acabou de perder o banco. Agora é um job, e ele usa **o mesmo mecanismo de exclusão** do workflow LGPD (§7.1). Se tivesse uma implementação própria, as duas divergiriam, e a divergência apareceria como dado de titular voltando à vida depois de um incidente.
+
+A cadeia: `tombstone_watermark` do backup → `planReconciliation` → reaplicação → `canReleaseTraffic`. O gate recebe **o que foi confirmado**, nunca a lista de pendentes.
+
+Bloqueios, todos com saída 1 e nenhum deles silencioso:
+
+| `reason` | O que significa |
+|---|---|
+| `ledger_not_independent` | Você não afirmou de onde veio o ledger. Ver abaixo — é o mais importante da tabela. |
+| `ledger_unavailable` | O ledger não pôde ser lido (ou estourou o teto de leitura). |
+| `watermark_missing` | O backup não tem watermark: não se sabe o que reaplicar. |
+| `invalid_tombstone` | Alguma linha falhou o HMAC. O ledger inteiro deixa de ser confiável — investigue adulteração. |
+| `tombstones_not_reapplied` | Alguma reaplicação falhou. A saída lista classe e código de cada uma. |
+
+> **`--ledger-source` é obrigatório e não tem default.** Depois do `pg_restore`, `data_tombstones` **dentro do banco restaurado** é a cópia ANTIGA do ledger. Nenhuma linha dela é mais nova que o watermark do próprio snapshot, então o plano sai `ok` com `pending: []` — indistinguível de "não havia nada a reaplicar" — e libera o tráfego com todo o dado que o titular mandou apagar de volta no ar. As linhas são idênticas às de um ledger bom; nenhuma checagem automática separa as duas leituras. Só quem operou o restore sabe. Passe `--ledger-source=live` (banco ainda vivo, rollback) ou `--ledger-source=export` (export de ledger tirado **antes** do restore). Na dúvida, **não** passe: o bloqueio é a resposta certa.
+
+Uma reaplicação que falha no meio **não** interrompe as demais — as outras continuam sendo reaplicadas, e o gate bloqueia por causa da que faltou. Parar na primeira deixaria mais dado ressuscitado vivo sem mudar o veredito. Reaplicar sobre dado que já não existe devolve zero linhas e conta como aplicado: é isso que permite a §7.1 gravar o tombstone antes da purga.
+
 ## 4. Drill de restore
 
 ```bash
@@ -132,6 +152,27 @@ Se o perfil **exige** off-site (`BACKUP_OFFSITE_REQUIRED`), drillar a cópia loc
 | `running` | — | `unknown` | O processo morreu no meio. **Ninguém conferiu** — trate como resíduo possível (§4.2). |
 
 Por que `cleanup_failed` não é "só mais um código de falha": um drill verde que deixa uma cópia da produção para trás é **pior** que um drill vermelho, porque ensina o operador a confiar num sinal nocivo. Até a PR #541 o teardown só logava, e o drill terminava `passed` com o banco efêmero de pé. Por isso, também, o resíduo é **auditado numa ação própria** (`restore_drill_unsafe_residue`) e dispara um **alerta próprio**, com assunto diferente do alerta de "nada é restaurável": as duas emergências pedem ações opostas.
+
+### 4.1.1 A guarda de alvo destrutivo (issue #536)
+
+O drill é o único job que, **por desenho**, roda `CREATE DATABASE`, `pg_restore -d …` e `DROP DATABASE … WITH (FORCE)` no **mesmo cluster** em que a produção vive — é ali que o dump tem de aterrissar. A única coisa entre "drill" e "incidente" é o nome do alvo.
+
+`assertSafeDatabaseName` responde uma pergunta mais estreita: "esta string pode ser interpolada em DDL sem levar uma aspa junto?". Ela diz **nada** sobre *qual* banco vai ser criado, restaurado por cima ou derrubado — `assertSafeDatabaseName('maia')` passa, e `maia` é produção.
+
+Por isso, todo caminho destrutivo passa antes por `assertDrillTarget`, que prova três eixos e falha fechado:
+
+| `failure_code` | Código interno | O que a guarda recusou |
+|---|---|---|
+| `isolation_failed` | `drill_target_is_production` | O alvo É o banco de `DATABASE_URL`. |
+| `isolation_failed` | `drill_target_is_reserved` | O alvo é `postgres`/`template0`/`template1`. |
+| `isolation_failed` | `drill_target_not_namespaced` | O nome não é um que o próprio módulo cunhou (`<base>_drill_<14 dígitos>_<hex>`). Um `maia_drill_prod` digitado à mão **não** passa: conter `_drill_` não basta. |
+| `isolation_failed` | `drill_target_unverifiable` | `DATABASE_URL` ausente, impossível de parsear ou sem banco no path. **Não saber qual banco é produção não é permissão para pular a comparação — é o motivo para parar.** |
+| `isolation_failed` | `drill_admin_target_foreign_host` | A conexão de manutenção aponta para outro host/porta. |
+| `isolation_failed` | `drill_admin_target_not_maintenance` | O DDL ia rodar numa conexão que não é a maintenance database. |
+
+A ordem das checagens é parte do contrato: a identidade vem antes do namespace, para que um drill apontado para `maia` registre `drill_target_is_production` e não o também-verdadeiro-mas-menos-alarmante "não parece um nome que eu cunhei". O código registrado é o que vai para `restore_drills`, para o alerta e para o label da métrica.
+
+A recusa acontece **antes de qualquer conexão**. Nenhuma dessas guardas ecoa a URL de conexão.
 
 ### 4.2 Resíduo: como achar e remover
 
@@ -379,9 +420,10 @@ FROM privacy_requests WHERE id = '<uuid>';
 
 Registrado aqui para que ninguém opere com expectativa errada:
 
-- O executor de retenção existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes de dado — mensagens, mídia, memória, traces — só existem o mecanismo de decisão e o schema; não há job que os varra.
-- O workflow de execução das solicitações de privacidade ainda não existe — só o schema e os invariantes de banco. (Issue #536, eixo 2.)
-- A **reaplicação** de tombstones pós-restore continua manual (passo 3.6). O drill agora executa `planReconciliation` e `canReleaseTraffic` em **dry-run** contra o snapshot restaurado, então a proteção deixou de depender de alguém lembrar de *avaliar* — mas não existe executor que *reaplique* as exclusões, porque reaplicar exige o mesmo mecanismo de exclusão por classe que o eixo 2 vai construir. (Issue #536, eixo 3.)
+- O executor de retenção **por prazo** existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes não há job que as varre por prazo — e não pode haver enquanto a `RETENTION_POLICY` não for aprovada pelo DPO. O apagamento **por pedido de titular** já existe e é outro caminho (§7.1).
+- O workflow de privacidade cobre `access_export`, `anonymization` e `deletion` (§7.1). **`rectification` não é executada** — precisa do conteúdo corrigido, e o motor recusa explicitamente em vez de "concluir" sem corrigir. (Issue #536, eixo 2.)
+- O mecanismo de purga por titular alcança hoje `postgres.people`, `postgres.conversations` e `postgres.messages`. As demais classes entram no pedido como **exceção registrada** com código de motivo, nunca como purga de zero linhas: `media.blobs` e `gateway.baileys_session` estão fora do PostgreSQL (eixo 4); `postgres.audit` e `privacy.export` dependem de decisão do DPO (quais campos redigir, vida do export); `postgres.memory` e `postgres.traces` não têm ligação de titular no schema — purgar por aproximação apagaria dado de outros titulares.
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
+- **Nada deste eixo rodou contra Postgres real.** O domínio (`src/ops/privacy/`) é coberto por unit tests com fakes; `src/ops/privacy/adapters.ts` e os dois CLIs (`restore:reconcile`, `privacy:execute`) **não foram executados** contra banco nenhum. Vale a mesma ressalva dos adapters de backup, mais uma: aqui o SQL APAGA.
 - O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.
 - Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.
