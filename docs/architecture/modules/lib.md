@@ -20,7 +20,7 @@
 | `src/lib/logger.ts` | Pino structured logger |
 | `src/lib/metrics.ts` | `incCounter`, `observeHistogram`, `setGauge` + Prometheus registry |
 | `src/lib/alerts.ts` | Email + Telegram alert channels |
-| `src/lib/healthcheck.ts` | Component probes (`checkDb`/`checkRedis`/`checkWhatsApp`/`checkAll`) + the #297 Redis-memory readiness gate. **Read-only** since #512: `recordHealthSnapshot()` is called by the `health_monitor` cron, never by an endpoint, and `toPublicHealthReport()` strips raw driver text at the HTTP edge. The composite, role-aware `/readyz` lives in `src/runtime/lifecycle/readiness.ts` |
+| `src/lib/healthcheck.ts` | Component probes (`checkDb`/`checkRedis`/`checkWhatsApp`/`checkAll`) + the #297 Redis-memory readiness gate. **Read-only** since #512: `recordHealthSnapshot()` is called by the `health_monitor` cron, never by an endpoint, and `toPublicHealthReport()` strips raw driver text at the HTTP edge. **Diagnostic, not a probe** since #613: `checkAll()` is role-blind and flat, so `/health*` answers 200 even when the report says `down` — the constants `DIAGNOSTIC_ENDPOINT_HEADER` / `PROBE_ENDPOINTS` put that contract on the wire. See [ADR 0003](../decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md). The composite, role-aware `/readyz` lives in `src/runtime/lifecycle/readiness.ts` |
 | `src/lib/decimal.ts` | `decimal.js` wrapper — `toDecimal()`, `fmtBRL()` |
 | `src/lib/brazilian.ts` | Brazilian formatting (CPF, CNPJ, currency, dates) |
 | `src/lib/business-days.ts` | Business-day arithmetic |

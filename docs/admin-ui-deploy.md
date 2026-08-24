@@ -44,12 +44,26 @@ repo + branch. Coolify will deploy each on a push.
 - Domain: `${DOMAIN}` (e.g. `maia.menddes.com`)
 - Container port: `3000`
 - Health check: `GET /livez` → 200 — o MESMO endpoint que
-  `compose.prod.yml` usa (issue #512). **Não use `/health`**: ele agrega
-  dependências para consumo humano e responde 200 mesmo degradado
-  (`src/server.ts`, o handler não chama `reply.code`), então como health
-  check ele nunca detecta nada. Se o campo do painel decide **roteamento de
-  tráfego** (e não restart), o endpoint certo é `/readyz`, que é
-  fail-closed e é onde a readiness de schema da #516 está ligada.
+  `compose.prod.yml` usa (issue #512). Se o campo do painel decide
+  **roteamento de tráfego** (e não restart), o endpoint certo é `/readyz`,
+  que é fail-closed e é onde a readiness de schema da #516 está ligada.
+
+  > **Não use `/health`, e isso agora é contrato, não acidente.** Desde a
+  > issue #613 ele é um endpoint **de diagnóstico**: responde **200 sempre**
+  > que consegue produzir o relatório, inclusive quando o corpo diz
+  > `"status": "down"`. Como health check ele **nunca detecta nada** — e,
+  > diferente de antes, isso está declarado: `reply.code(200)` explícito no
+  > handler (`src/server.ts`, `asDiagnostic()`), header
+  > `x-maia-endpoint-kind: diagnostic` em toda resposta de `/health*` e
+  > `"probe": false` + o mapa `probes` no corpo. O motivo de ele não passar a
+  > 503 está na [ADR 0003](architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):
+  > `checkAll()` é role-blind, e `whatsapp: down` é o estado normal de um
+  > processo `api`/`worker`/`scheduler` — um LB apontado para lá drenaria
+  > instâncias corretas.
+  >
+  > **Se você configurou este campo como `GET /health` antes de ler isto,
+  > troque agora.** Aquele check está verde desde sempre, inclusive durante
+  > as quedas que ele deveria ter pego.
 - Resources: the same `app` you already have. After this PR, the
   Fastify-served `/dashboard` is gone — `${DOMAIN}/dashboard` returns 404,
   which is correct.
@@ -223,7 +237,7 @@ divergiam. O que foi corrigido aqui, e contra o quê:
 | O que este arquivo dizia | O que vale | Fonte |
 |---|---|---|
 | "After deploy, run migrations once" | Migrations rodam ANTES da subida, num job que a bloqueia | `compose.prod.yml` (serviço `migrate`), runbook §1 e §7, issue #516 |
-| Health check do `app`: `GET /health` → 200 | `GET /livez` — `/health` responde 200 mesmo degradado | `compose.prod.yml`, `src/server.ts`, issue #512 |
+| Health check do `app`: `GET /health` → 200 | `GET /livez` (restart) ou `GET /readyz` (roteamento). `/health` é **diagnóstico** e responde 200 mesmo `down`, por decisão | `compose.prod.yml`, `src/server.ts`, issues #512 e **#613**, [ADR 0003](architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md) |
 | Health check do `admin-ui`: `GET /api/auth/csrf` | `GET /` com status < 500 | `compose.prod.yml` |
 | `MAIA_ENV` ausente da tabela de variáveis | Obrigatória em `staging`/`production`, nas DUAS aplicações | `src/config/contract.ts`, runbook §1 |
 | `OIDC_*` "for SSO" (opcionais) | Obrigatórias em `staging`/`production` | `src/config/contract.ts`, `.env.admin.prod.example` |

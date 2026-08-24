@@ -116,6 +116,37 @@ export function _resetHealthCacheForTests(): void {
   healthCache = null;
 }
 
+/**
+ * Issue #613 — the `/health*` family is DIAGNOSTIC, never a probe.
+ *
+ * ADR 0003 (`docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md`):
+ * `/health` answers 200 whenever it can produce a report, INCLUDING when the
+ * report says `degraded` or `down`. 200 here is a claim about the request ("I
+ * produced the report"), not about the system — the verdict is the body, which
+ * is the whole point of the endpoint.
+ *
+ * The reason it is not promoted to a verdict-carrying probe is `checkAll()`
+ * itself: it is role-blind and flat. It has no notion of `MAIA_PROCESS_ROLE`,
+ * no required-vs-observed split and no degradation policy, so `whatsapp: down`
+ * collapses the aggregate to `down` — which is the NORMAL steady state of an
+ * `api`, `worker` or `scheduler` process. Wiring a load balancer to it would
+ * drain correctly-healthy instances. The role-aware, fail-closed gate is
+ * `/readyz` (`src/runtime/lifecycle/readiness.ts`), and it is the only one.
+ *
+ * These constants exist so the contract is on the wire and in the tests, not
+ * only in a comment: `src/server.ts` stamps the header on every `/health*`
+ * response and the aggregate body carries `probe: false` plus `PROBE_ENDPOINTS`.
+ */
+export const DIAGNOSTIC_ENDPOINT_HEADER = 'x-maia-endpoint-kind';
+export const DIAGNOSTIC_ENDPOINT_KIND = 'diagnostic';
+
+/** The endpoints that DO carry a verdict in the HTTP status. */
+export const PROBE_ENDPOINTS = {
+  liveness: '/livez',
+  startup: '/startupz',
+  readiness: '/readyz',
+} as const;
+
 export type ReadinessReport = {
   ready: boolean;
   /** Why the instance is not ready, when `ready === false`. */
