@@ -118,6 +118,10 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  *                            `observability/instrumentation.ts`
  *   - `context.load`       → `src/agent/turn-context/loader.ts`
  *                            (`loadTurnContext`) via the same wrapper
+ *   - `llm.request`        → `src/lib/llm/telemetry.ts` (`emitUsage`), the
+ *                            single emission point every terminal path of
+ *                            `executeLLM` already passes through (#508), via
+ *                            `recordLlmRequestSpan` in the same wrapper file
  *
  * `emitted` means "production reaches this span", NOT "an instrumentation site
  * exists in the tree". The two came apart on `context.load` and the review of
@@ -160,7 +164,7 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.fr
   [SPAN.CONTEXT_LOAD]: 'emitted',
   [SPAN.PROMPT_RENDER]: 'declared',
   [SPAN.REACT_ITERATION]: 'declared',
-  [SPAN.LLM_REQUEST]: 'declared',
+  [SPAN.LLM_REQUEST]: 'emitted',
   [SPAN.TOOL_DISPATCH]: 'emitted',
   [SPAN.PERMISSION_CHECK]: 'declared',
   [SPAN.CONSTITUTIONAL_CHECK]: 'declared',

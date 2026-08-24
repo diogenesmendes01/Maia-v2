@@ -595,8 +595,30 @@ o mesmo `mensagem_id` amostra de novo.
 
 `SPAN_EMISSION` em `src/observability/taxonomy.ts` é a fonte de verdade e é
 verificada por teste — a taxonomia não consegue mais superestimar a cobertura.
-Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch` e `context.load`. Todo o
-resto está **declarado, não emitido**; o span não vai aparecer no waterfall.
+Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch`, `context.load` e
+`llm.request`. Todo o resto está **declarado, não emitido**; o span não vai
+aparecer no waterfall.
+
+`llm.request` sai de `emitUsage` (`src/lib/llm/telemetry.ts`), **não** dos seis
+pontos de saída do `executeLLM`. O motivo é a mesma invariante que a #508 criou
+para as métricas: todo desfecho do gateway — sucesso, erro do provider,
+timeout, 429, cancelamento, teto de orçamento, disjuntor aberto, contexto de
+tenant ausente e chave de API ausente — passa por aquele ponto único, então o
+span não pode ficar para trás quando um desfecho novo for adicionado. A janela
+é RECONSTRUÍDA de `duration_ms`, a mesma medição que
+`maia_llm_request_duration_ms` publica, então span e histograma não divergem.
+
+Atributos: `provider`, `model`, `tier`, `workload`, `result` e `attempt_count`.
+`result` carrega o vocabulário VERBATIM de sete valores do gateway
+(`ok|error|timeout|rate_limit|cancelled|budget_exhausted|circuit_open`); o
+`status` do span colapsa nos cinco do OTLP, com `budget_exhausted` e
+`circuit_open` virando `blocked` (**nós** recusamos) e `rate_limit` virando
+`error` (**eles** recusaram, e o turno pagou). Se você estiver caçando um
+incidente de provider, filtre por `result`, não por `status`.
+
+`attempt_count` são as tentativas do PROVIDER. `attempt` é o índice de retry do
+TURNO e continua vindo da correlação — as duas chaves são distintas de
+propósito, porque colidi-las quebraria o agrupamento de tentativas no Explorer.
 
 `emitted` significa **produção alcança este span** — não "existe site de
 instrumentação no repositório". A review da PR #554 fixou essa leitura, que é a
@@ -677,9 +699,13 @@ usa as recording rules deste arquivo, então painel e alerta nunca discordam.
 
 Não presuma cobertura que não existe:
 
-- **spans operacionais parciais** — só `turn`, `queue.wait`, `tool.dispatch` e
-  `context.load` têm emissor que produção alcança. As outras 19 entradas da
-  taxonomia estão marcadas `declared`;
+- **spans operacionais parciais** — só `turn`, `queue.wait`, `tool.dispatch`,
+  `context.load` e `llm.request` têm emissor que produção alcança. As outras 18
+  entradas da taxonomia estão marcadas `declared`. O waterfall de um turno hoje
+  mostra espera de fila, carga de contexto, a chamada de modelo e cada dispatch
+  de tool; **não** mostra ingress, resolução de identidade/audiência, o
+  pré-turno, render de prompt, a iteração ReAct, os guards internos do dispatch
+  nem o commit de saída;
 - **`context.load` não tem família de métrica própria — por decisão.** O span
   sai de `loadTurnContext`; duração e round-trips da MESMA carga saem de
   `recordTurnContextLoad` (`maia_turn_context_load_duration_ms{phase,result}`,
@@ -710,6 +736,6 @@ Não presuma cobertura que não existe:
 
 | | |
 |---|---|
-| Last verified | 2026-08-14 |
-| Issue | #514 → #535 (review da PR #554) |
+| Last verified | 2026-08-24 |
+| Issue | #514 → #535 (`llm.request` emitido) |
 | Re-verify when | `src/observability/taxonomy.ts` mudar; ou um limiar de `monitoring/alerts/slo.rules.yml` mudar; ou um span sair de `declared` para `emitted`. |
