@@ -86,3 +86,8 @@ bench-*.out
 # Resumo de diagnóstico dos testes (#545) — gerado por VITEST_SUMMARY_FILE,
 # usado pelo passo "Resumo dos testes" do CI. Efêmero, nunca versionado.
 .ci-test-summary/
+
+# Artefatos do harness de fault injection (#510) — timeline, stdout/stderr e
+# snapshots sanitizados de uma rodada que reprovou. São diagnóstico local/CI,
+# retidos pelo job, nunca versionados.
+tests/reliability/artifacts/
