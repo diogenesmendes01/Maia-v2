@@ -667,6 +667,17 @@ jobs:
   # `drizzle-kit-roundtrip`: uma perna só de Node, sem matriz, sem compartilhar
   # nada com os jobs acima. NÃO tem `continue-on-error` de propósito.
   #
+  # ORDEM DOS PASSOS, e por que ela é a invariante (decisão do dono):
+  #   build -> artefato existe -> TYPECHECK -> migrations -> E2E standalone
+  # O typecheck vem DEPOIS do build porque metade do que ele tem para checar
+  # só existe depois: `.next/types/**` é gerado pelo `next build` e é lá que o
+  # Next 16 declara o contrato de cada rota. E o E2E não roda mais `next
+  # start`: ele monta e executa o MESMO artefato do `src/admin-ui/Dockerfile`
+  # (`.next/standalone` + `.next/static`, `node src/admin-ui/server.js`), para
+  # que o que o CI mede seja o que o Coolify executa.
+  # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` trava as duas coisas lendo este
+  # arquivo do disco.
+  #
   # ARMADILHA DE ENV, deliberada no desenho: NÃO existe bloco `env:` de JOB
   # aqui. Uma variável no `env:` de um job alcança TODO processo dele, e
   # `src/config/validate.ts` REPROVA qualquer chave desconhecida sob os
@@ -800,8 +811,44 @@ jobs:
 
       - name: Artefato do build existe
         # Atômico com o passo acima: um `next build` que sai 0 sem emitir
-        # BUILD_ID não construiu nada.
-        run: test -f src/admin-ui/.next/BUILD_ID
+        # BUILD_ID não construiu nada. Confere também o artefato STANDALONE —
+        # é ele que o Dockerfile copia para a imagem e é ele que o passo de
+        # E2E abaixo executa; um build que emite BUILD_ID mas não emite
+        # `server.js` (por perder o `output: 'standalone'` em
+        # `next.config.mjs`) produziria uma imagem sem entrypoint.
+        run: |
+          test -f src/admin-ui/.next/BUILD_ID
+          test -f src/admin-ui/.next/standalone/src/admin-ui/server.js
+          test -d src/admin-ui/.next/static
+
+      # -- TYPECHECK PÓS-BUILD ---------------------------------------------
+      - name: Typecheck do console PÓS-BUILD (tsc --noEmit)
+        # BLOQUEANTE, e DEPOIS do build de propósito (decisão do dono).
+        #
+        # O `next build` GERA tipos em `src/admin-ui/.next/types/**` — um
+        # arquivo por rota, que confronta o que a página exporta com o que o
+        # Next 16 exige. `src/admin-ui/tsconfig.json` já os listava em
+        # `include`, mas o `exclude` trazia `.next` e exclude vence include:
+        # eles NUNCA eram checados. O `exclude` foi encolhido para
+        # `["node_modules", "dist"]` e este passo é quem colhe o resultado.
+        #
+        # MEDIDO nesta árvore, revertendo `params: Promise<{id}>` para
+        # `params: {id}` em `app/proposals/[id]/page.tsx` (a armadilha nº 1 do
+        # major do Next 16):
+        #   - com `.next` no exclude:  `tsc --noEmit` sai 0. Silêncio total.
+        #   - sem `.next` no exclude:  reprova em
+        #     `.next/types/app/proposals/[id]/page.ts(39,29): error TS2344`.
+        # Ou seja: antes deste passo, o gate de tipos do console não olhava
+        # para o contrato de rotas do framework.
+        #
+        # Por que não substitui o `Typecheck admin-ui` do job `validate`:
+        # aquele job não constrói o console, então lá `.next/types/**` não
+        # existe e o glob casa zero arquivo — ele cobre o CÓDIGO-FONTE, em
+        # duas pernas de Node, e continua sendo o gate rápido da #550. Este
+        # cobre o que só existe DEPOIS do build. Sem bloco `env:`: `tsc` não
+        # lê configuração da Maia, e uma variável a mais aqui só reintroduziria
+        # a armadilha de namespace descrita no topo do job.
+        run: npm run admin:typecheck
 
       # -- E2E -------------------------------------------------------------
       - name: Apply migrations
@@ -825,46 +872,77 @@ jobs:
         run: npm run db:migrate
 
       - name: E2E do console (Playwright, projeto `smoke`)
-        # BLOQUEANTE. `scripts/admin-ui-e2e.sh` sobe o console CONSTRUÍDO,
-        # espera ele responder (e reprova com o log dele se não responder),
-        # roda o projeto `smoke` e depois exige, por
-        # `scripts/check-playwright-run.ts`, que a rodada tenha executado pelo
-        # menos `TEST_ADMIN_UI_MIN_TESTS` testes e NENHUM pulado. O Playwright
-        # sai com código 0 quando não encontra teste nenhum — sem esse piso,
-        # "Running 0 tests" seria um check verde.
+        # BLOQUEANTE. `scripts/admin-ui-e2e.sh` MONTA o artefato standalone
+        # (`.next/standalone` + `.next/static` na posição do Dockerfile), sobe
+        # `node src/admin-ui/server.js` — o mesmo `CMD` da imagem —, espera ele
+        # responder (e reprova com o log dele se não responder), roda o projeto
+        # `smoke` e depois exige, por `scripts/check-playwright-run.ts`, que a
+        # rodada tenha executado pelo menos `TEST_ADMIN_UI_MIN_TESTS` testes e
+        # NENHUM pulado. O Playwright sai com código 0 quando não encontra
+        # teste nenhum — sem esse piso, "Running 0 tests" seria um check verde.
         #
         # `AUTH_TRUST_HOST=true` é o mesmo valor de `compose.prod.yml`: sem
         # ele o NextAuth v5 recusa o Host (`UntrustedHost`) e devolve 500 em
         # /api/auth/*. Medido: a spec de boot reprova com três respostas 500.
+        #
+        # ─────────────────────────────────────────────────────────────────
+        # POR QUE ESTE BLOCO DEIXOU DE SER `development` (decisão do dono)
+        # ─────────────────────────────────────────────────────────────────
+        # Enquanto o E2E usava `next start`, o profile era escolha nossa e
+        # `development` era a escolha honesta: um harness em http://localhost
+        # sem IdP não é staging.
+        #
+        # Com o artefato standalone a escolha ACABOU. O `server.js` que o Next
+        # gera abre com `process.env.NODE_ENV = 'production'` — linha 5 do
+        # arquivo, antes do `require('next')` e MUITO antes de
+        # `instrumentation.register()`. Não há flag, env var ou ordem de
+        # invocação que mude isso: quando `assertAdminBootConfig()` roda,
+        # `NODE_ENV` JÁ É `production`. Medido nesta árvore, com o artefato
+        # real e `loadAdminConfig()`:
+        #   MAIA_ENV=development -> `profile/node-env-contradiction`
+        #                           ("MAIA_ENV=development contradiz
+        #                            NODE_ENV=production") -> boot morto;
+        #   MAIA_ENV ausente     -> profile `production`, e o contrato cobra
+        #                           MAIA_ENV + as quatro OIDC_* + https;
+        #   MAIA_ENV=staging     -> `COMPATIBLE_NODE_ENV` aceita
+        #                           NODE_ENV=production (src/config/profiles.ts),
+        #                           e o contrato cobra as quatro OIDC_* + https.
+        # Ou seja: contra o artefato de produção, `staging` é o ÚNICO profile
+        # satisfazível — e é o mesmo que `compose.prod.yml` injeta no
+        # container. As quatro `OIDC_*` abaixo existem por isso, e não para
+        # "fazer passar": elas descrevem um IdP que o smoke nunca contata (o
+        # host é `.invalid`, RFC 2606 — não resolve por definição, e nenhuma
+        # asserção do `smoke` inicia sign-in). MEDIDO: `/api/auth/providers`
+        # responde 200 sem tentar discovery, e os 5 testes do `smoke` passam.
+        #
+        # O que este bloco NÃO faz é enfraquecer gate: ele ENDURECE. Antes o
+        # boot do console era validado no profile `development`, onde o subset
+        # `admin-ui` só exige `DATABASE_URL`. Agora o E2E prova que o artefato
+        # de produção sobe sob a validação ESTRITA do contrato — as mesmas
+        # regras que o Coolify vai aplicar. `MAIA_CONFIG_STRICT_BOOT` continua
+        # de fora: desligar o contrato para o E2E passar seria exatamente o
+        # desarme que `tests/unit/ci/admin-ui-e2e-gate.spec.ts` existe para
+        # impedir.
         env:
-          # `development`, e NÃO `production` como no passo de build. Os
-          # bundles JÁ foram construídos como produção pelo passo anterior
-          # (`next build` fixa `NODE_ENV=production` internamente e o passo
-          # "Artefato do build existe" confere o `BUILD_ID`); `next start` só
-          # SERVE o artefato pronto, não reconstrói nada. O contrato tem uma
-          # regra cross-field — `profile/node-env-contradiction` — que recusa
-          # `MAIA_ENV=development` com `NODE_ENV=production`, e ela está certa:
-          # os dois campos precisam contar a mesma história sobre o ambiente.
-          NODE_ENV: development
-          # `development`, e NÃO `staging` como no passo de build. A diferença
-          # é que AQUI o console SOBE de verdade: o hook `instrumentation.ts`
-          # (issue #596, PR #608) roda `assertAdminBootConfig()` antes do
-          # primeiro request, e no profile `staging` o contrato exige as quatro
-          # `OIDC_*` e `NEXTAUTH_URL` em https. Um harness em `http://localhost`
-          # sem provedor de identidade NÃO É staging, e fingir que é só faria o
-          # gate reprovar por uma mentira sobre o ambiente. No profile
-          # `development` o subset `admin-ui` exige apenas `DATABASE_URL`, e
-          # `oidcProviderEnabled()` devolve `false` sem lançar quando não há
-          # issuer — que é o estado esperado de uma instalação sem OIDC.
-          #
-          # O gate da #608 continua sendo medido, e por quem deve:
-          # `tests/admin-ui/unit/admin-boot-config.spec.ts` prova que as quatro
-          # `OIDC_*` ausentes REPROVAM o boot em staging/production, e
-          # `npm run config:preflight` mede os arquivos do bring-up real.
-          MAIA_ENV: development
+          # Explícito, e igual ao estágio `runtime` do Dockerfile e ao
+          # `environment:` de `compose.prod.yml`. O `server.js` do standalone
+          # forçaria `production` de qualquer forma; declarar aqui evita que o
+          # bloco conte uma história diferente da que o processo vive.
+          NODE_ENV: production
+          # `staging`, e não `production`: o profile estrito mais próximo que
+          # descreve honestamente um harness efêmero contra banco de teste — a
+          # mesma razão pela qual o passo de build (e o Dockerfile) usam
+          # `staging`. `production` cobraria keyring de backup e credenciais de
+          # S3 REAIS, que este job não tem e não deve ter.
+          MAIA_ENV: staging
           NEXT_TELEMETRY_DISABLED: '1'
           NEXTAUTH_SECRET: e2e-only-secret-min-32-chars-not-shipped-12345
-          NEXTAUTH_URL: http://localhost:4000
+          # https porque a regra `url/https-required` (src/config/rules.ts) o
+          # exige fora de `development`. O servidor segue em http://localhost —
+          # e é `AUTH_TRUST_HOST=true` que faz o NextAuth v5 aceitar o Host da
+          # requisição em vez desta URL. Medido: os 5 testes do `smoke` passam
+          # com este par.
+          NEXTAUTH_URL: https://localhost:4000
           AUTH_TRUST_HOST: 'true'
           DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
           POSTGRES_USER: maia_test
@@ -883,6 +961,27 @@ jobs:
           BACKUP_S3_ACCESS_KEY: e2e
           BACKUP_S3_SECRET_KEY: e2e
           FEATURE_ADMIN_UI_V1: 'true'
+          # As quatro `OIDC_*`: `requiredIn: ['staging','production']` no
+          # contrato (src/config/contract.ts). Descrevem um IdP que NÃO EXISTE
+          # e que o `smoke` nunca contata — o TLD `.invalid` é reservado pela
+          # RFC 2606 justamente para isso, então nenhum resolvedor do mundo o
+          # aponta para lugar nenhum.
+          OIDC_ISSUER: https://sem-idp.invalid/realms/e2e
+          OIDC_CLIENT_ID: maia-admin-e2e
+          # `sem-idp` repetido, não um valor com cara de segredo: precisa de
+          # >= 16 chars (MIN_OIDC_CLIENT_SECRET_LEN em
+          # src/admin-ui/lib/auth-gating.ts) e de NÃO casar
+          # `isOperatorPlaceholder` nem a fixture sintética do contrato
+          # (`secret/synthetic-fixture`). Entropia de Shannon 2.77 — bem abaixo
+          # do corte de 3.5 da regra `generic-api-key` do gitleaks, que varre o
+          # HISTÓRICO e não a árvore.
+          OIDC_CLIENT_SECRET: sem-idp-sem-idp-sem-idp-sem-idp
+          # `primary` é o tenant reservado do runtime single-tenant. NUNCA
+          # `default`: o slug vai direto para `appUsersRepo.getByEmail(tenant,
+          # email)` em `auth-resolver.ts` — ele É o `tenant_id` num caminho
+          # dinâmico —, e a regra `admin-ui/tenant-slugs-default-literal`
+          # (src/config/rules.ts) recusa o literal de propósito.
+          OIDC_TENANT_SLUGS: primary
           # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
           # `scripts/admin-ui-e2e.sh`.
           TEST_ADMIN_UI_MIN_TESTS: '5'
