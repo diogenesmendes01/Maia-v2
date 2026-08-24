@@ -51,6 +51,34 @@
  * agora com um produtor que parece existir. Por isso o alvo vai em
  * `entidade_alvo` (TEXT) + `metadata` (JSONB), e `alvo_id` fica NULO.
  *
+ * ## A identidade da RÉPLICA, e por que ela é parte do alvo
+ *
+ * (achado 4 da RE-REVISÃO do owner na PR #541.)
+ *
+ * O disjuntor é estado **em memória**, chaveado por `(provider, workload)`
+ * (`circuit-breaker.ts`, `keyOf`) — e portanto **por processo**: cada réplica
+ * tem a própria janela, o próprio cooldown e o próprio estado. Duas réplicas
+ * podem estar honestamente discordando sobre o mesmo par no mesmo instante.
+ *
+ * A regra `llm_circuit_long_open` do `audit-watcher.ts` casa um
+ * `llm_circuit_opened` com o `llm_circuit_closed` que vem depois. Sem saber de
+ * QUEM é cada linha, ela casava linhas de circuitos diferentes: um par que
+ * abriu e fechou normalmente desarmava o alerta de outro par que continuava
+ * preso aberto — o alerta ficava cego exatamente no cenário que existe para
+ * pegar. `provider` e `workload` já iam no metadata; a identidade da réplica
+ * não, e sem as três o alvo não é único.
+ *
+ * `runtimeInstanceId()` (`<hostname>:<pid>`) é a mesma identidade que a posse
+ * de linha WhatsApp já usa (`src/runtime/instance-identity.ts`), e não
+ * `lifecycle.instanceId` (UUID aleatório): o operador que recebe o alerta
+ * precisa saber QUAL container está com o disjuntor preso, não um id opaco.
+ *
+ * Vai em `metadata` (JSONB), NUNCA em label Prometheus: `hostname:pid` é
+ * cardinalidade sem teto e `instance_id` não está — nem deve estar — em
+ * `ALLOWED_LABEL_KEYS` (#514). No Prometheus a mesma distinção já existe de
+ * graça: cada réplica expõe a própria série `maia_llm_circuit_state`, separada
+ * pelos labels de target que o scraper adiciona.
+ *
  * ## Por que import dinâmico
  *
  * `@/governance/audit.js` puxa `@/db/repositories.js` → `@/db/client.js`, que
@@ -77,6 +105,7 @@
  */
 import { logger } from '@/lib/logger.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
+import { runtimeInstanceId } from '@/runtime/instance-identity.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
 
 /** Ações desta trilha. Todas existem em `AUDIT_ACTIONS` (typecheck garante). */
@@ -109,7 +138,10 @@ async function writeCircuitAudit(
       acao,
       // TEXT, não `alvo_id` (uuid). Ver o bloco "armadilha" acima.
       entidade_alvo: 'llm_circuit',
-      metadata,
+      // `instance_id` por ÚLTIMO de propósito: é a identidade da réplica e
+      // nenhum chamador pode sobrescrevê-la sem querer. Ver o bloco
+      // "identidade da réplica" no topo do arquivo.
+      metadata: { ...metadata, instance_id: runtimeInstanceId() },
     }),
   );
 }
