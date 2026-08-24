@@ -7,9 +7,9 @@
  * NÃO EXECUTADO no sandbox de desenvolvimento (sem Postgres). Pulado sem
  * `TEST_DB_URL`, exatamente como `agent-tool-grants-leak.spec.ts`.
  *
- * NOTA para quem mantiver `package.json`: este arquivo PRECISA entrar no
- * script `test:leak`. Ele não foi adicionado aqui porque `package.json` estava
- * fora do escopo de edição desta entrega.
+ * Já está no script `test:leak` (`package.json`), junto de
+ * `tests/unit/onboarding/readiness-facts-scope.spec.ts` — a nota que pedia
+ * essa inclusão cumpriu seu papel e saiu daqui.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
