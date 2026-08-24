@@ -332,6 +332,7 @@ Rules this module enforces:
 | `tests/unit/gateway/queue-drain-guard.spec.ts` | No job starts after draining |
 | `tests/unit/gateway/queue-await-ready.spec.ts` | `waitUntilReady` before claiming ready |
 | `tests/integration/lifecycle-probes.spec.ts` | Probes against real Postgres/Redis; `/health` writes no rows |
+| `tests/unit/server/health-probe-contract.spec.ts` | Which endpoint carries the verdict (#613): `/health` stays 200 when `down`, `/livez` 200 with no I/O, `/startupz`/`/readyz` 503 — all through the real `buildServer()` |
 | `tests/integration/lifecycle-drain-queue.spec.ts` | Real Redis: job enqueued during the drain never runs |
 | `tests/unit/turn-state-machine.spec.ts` | Tabela completa de transições válidas/inválidas, outcome obrigatório em terminal, sanitização do erro |
 | `tests/unit/turn-lifecycle.spec.ts` | Kill switch, derivação outcome→estado, retry/dead letter, fail-soft |

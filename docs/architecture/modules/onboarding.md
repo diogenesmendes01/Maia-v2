@@ -45,6 +45,7 @@ O que `scripts/setup.ts` ganhou foi **uma linha de verdade**: no fim ele imprime
 | `tests/unit/onboarding/schema-constraint-compatibility.spec.ts` | Literais do código ⊆ `CHECK` real, sem banco |
 | `tests/unit/onboarding/audit-fk-safety.spec.ts` | `tx` falso **com integridade referencial**: a auditoria nunca referencia tenant inexistente |
 | `tests/unit/onboarding/metrics-taxonomy.spec.ts` | vocabulários fechados ≡ constantes do código; texto livre/PII nunca vira label |
+| `tests/unit/onboarding/provisioning-agent-born-inoperable.spec.ts` | `tx` falso mínimo: `provision_agent` escreve `provisioning`, **nunca** `active` — a rede unitária do contrato central, que antes só existia em suíte de integração |
 | `tests/integration/onboarding-review-541.spec.ts` | as cinco correções da 1ª rodada de review do PR #541, contra Postgres real |
 | `tests/integration/onboarding-review-541-round2.spec.ts` | as cinco correções da 2ª rodada (conjunção por canal, criação idempotente, resultados conclusivos, ponto de retomada, entradas tipadas) |
 
@@ -497,6 +498,17 @@ Os valores vêm de **vocabulários fechados** declarados em `src/observability/t
 
 Todas carregam `tenant_id` + `agent_id` (bucket `system` enquanto a run ainda não resolveu o escopo). `tests/unit/onboarding/metrics-taxonomy.spec.ts` pina os vocabulários contra `ONBOARDING_STEPS`, `ONBOARDING_ERROR_CODES` e `READINESS_CHECK_CODES`, e `wizard.spec.ts` lê o registro renderizado para provar que um `reason_code` com telefone não vira série.
 
+#### A recusa PRÉ-commit também é contada
+
+`maia_onboarding_step_failed_total` cobre as **duas** metades da negativa, e isso não era verdade até recentemente. A negativa que chega ao `commitStep` já tinha a trilha completa — `admin_audit_log` e evento append-only na mesma transação do estado da run. A que acontece **antes** de existir transação (escopo proibido na abertura, RBAC, contrato de payload) não tinha nada: `startOnboardingRun` sequer possuía `try`. O caso que mais dói é exatamente o do invariante 8 do `AGENTS.md` — `startOnboardingRun({ tenant_id: 'default' })`, a tentativa de provisionar no bucket legado que a migration 109 barra por `CHECK` e `scope.ts` por erro tipado, era a única negativa da saga invisível à observabilidade.
+
+Duas propriedades do `countRefusal` de `wizard.ts` sustentam isso, e ambas são pinadas por `wizard.spec.ts`:
+
+- **a atribuição nunca usa o escopo PROPOSTO pelo chamador** — o par vem da run carregada do banco, ou é o bucket `system` enquanto não há run. Rotular a série com o `tenant_id` que o operador mandou poria texto arbitrário (cardinalidade ilimitada) num label, no caminho em que esse texto acabou de ser rejeitado por não ser escopo válido;
+- **o log leva o código, nunca a exceção** — a mensagem de `OnboardingError` interpola o valor recusado, e `reason_code` de cancelamento é entrada livre. Cem motivos livres distintos produzem **uma** série (`reason="invalid_scope"`).
+
+Os pseudo-passos `create_run`/`cancel_run` colapsam em `step="other"`, como já colapsam na série de replay.
+
 O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_agent_id`); divergência é recusada. É a defesa contra ativar o agente errado a partir de uma aba antiga do console.
 
 ## Patterns it follows
@@ -522,7 +534,7 @@ O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_age
 
 | Consumed by | What |
 |---|---|
-| `maia doctor` (#517) | `evaluateAgentReadiness` — a fonte canônica de prontidão |
+| `maia doctor` (#517) | `evaluateAgentReadiness` — a fonte canônica de prontidão. **Ainda não consumida:** ver Known gaps |
 | `scripts/setup.ts` | mesma função, para reportar o readiness de `primary` no fim do seed |
 | Console administrativo (a construir) | `startOnboardingRun`, `executeOnboardingStep`, `cancelOnboardingRun`, `getOnboardingRun`, `listOnboardingRuns` |
 | `src/db/repositories/channel-line-state-repos.ts` | via `PairingPort` — o wizard enfileira o pareamento de #518, não o reimplementa |
@@ -532,14 +544,15 @@ O operador precisa **confirmar o par exato** (`confirm_tenant_id` / `confirm_age
 Verifique contra as issues antes de confiar nesta lista.
 
 - **Bootstrap global (`kind='global_bootstrap'`) não implementado.** A coluna e o `CHECK` existem (migrations são append-only e adiar custaria outra migration), mas `startOnboardingRun` recusa esse kind com `kind_not_implemented`. Falta a credencial de uso único, o endpoint restrito e a invalidação atômica — a criação do primeiro admin ainda é a via documentada em `docs/admin-ui-deploy.md`.
-- **Sem superfície de UI.** Não há router tRPC nem telas; o módulo é backend puro.
+- **Sem superfície de UI.** Não há router tRPC nem telas; o módulo é backend puro. `grep -ril onboarding src/admin-ui` não devolve nada.
+- **`maia doctor` (#517) ainda não consome o readiness canônico.** O módulo existe (`src/ops/doctor/`), mas seu registro tem quatro categorias — `runtime`, `config`, `postgres`, `redis` (`src/ops/doctor/registry.ts`) — e nenhuma delas avalia um par `(tenant, agente)`. O único consumidor de `evaluateAgentReadiness` fora dos testes é `scripts/setup.ts:208`. O critério "dashboard, checklist, wizard, doctor e ativação usam a mesma fonte" está, hoje, satisfeito pelo lado do wizard e da ativação apenas — o doctor não usa OUTRA fonte (o que seria pior), simplesmente não pergunta.
 - **Compensação é conservadora.** O cancelamento encerra a run e preserva tudo; não desprovisiona. Nenhum recurso criado pela saga é exclusivo dela (um tenant/agente/canal pode já estar em uso por outro caminho), e compensação cega sobre recurso compartilhado é explicitamente proibida pela issue.
-- **`tests/integration/onboarding-leak.spec.ts` ainda não está no script `test:leak`** — `package.json` estava fora do escopo da entrega que criou o módulo.
+- **`decideIdempotency` (`src/onboarding/idempotency.ts`) não tem chamador de produção.** `commitStep` decide replay/conflito em SQL, dentro da transação, e nunca chama a função pura. `tests/unit/onboarding/idempotency.spec.ts` a exercita, mas quebrá-la **não** produz vermelho em nenhum caminho real — o teste dela não é rede de segurança, é documentação executável do critério. Ou o repositório passa a consumi-la, ou ela deveria sair da superfície pública.
 
 ---
 
 | | |
 |---|---|
-| Last verified | 2026-08-08 |
-| Against `main` HEAD | `ce1f0f69` (branch `claude/leva-agentes-2026-08-04` @ `6bf0fa27` + 2ª rodada de review do PR #541) |
+| Last verified | 2026-08-24 |
+| Against `main` HEAD | `4c6f29e8` (auditoria integral da #519: o backend está entregue; o resíduo é bootstrap global, superfície de UI e o consumo do readiness pelo `maia doctor`) |
 | Re-verify when | Older than 30 days; OR `src/onboarding/**` muda; OR uma migration nova toca `onboarding_*`; OR #517/#518 mudam o contrato consumido aqui |

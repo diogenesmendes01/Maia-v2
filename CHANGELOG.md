@@ -4,6 +4,47 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ AÇÃO DO OPERADOR — se algum health check seu aponta para `GET /health`, ele nunca reprovou nada ([#613](https://github.com/diogenesmendes01/Maia-v2/issues/613))
+
+> **Nada quebra neste release. O que muda é que agora está escrito.** Se você
+> configurou o health check do `app` (Coolify, load balancer, uptime monitor)
+> como `GET /health` → 200 — o que `docs/admin-ui-deploy.md` mandava fazer até
+> a #565 —, esse check está **verde desde sempre**, inclusive durante as quedas
+> de Postgres, Redis e WhatsApp que ele deveria ter pego. Troque:
+>
+> | O campo decide… | Endpoint certo |
+> |---|---|
+> | reiniciar o container | **`GET /livez`** — é o que `compose.prod.yml` usa; sem I/O, não vira restart loop numa queda de dependência |
+> | mandar tráfego (pool do LB) | **`GET /readyz`** — role-aware, fail-closed, é onde a readiness de schema da #516 está ligada |
+>
+> `compose.prod.yml` já usa `/livez` (#512), então quem sobe só por Compose não
+> tem nada a fazer.
+
+**A decisão, e por que ela não é "fazer `/health` responder 503"** — [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md).
+
+`/health` e `/health/{db,redis,whatsapp}` passam a ser **explicitamente
+endpoints de diagnóstico**: respondem **200 sempre** que conseguem produzir o
+relatório, inclusive com `"status": "down"` no corpo. O 200 afirma *"produzi o
+relatório"*; o veredito é o corpo.
+
+A alternativa — 503 quando `unhealthy` — foi considerada e **recusada**, porque
+`checkAll()` (`src/lib/healthcheck.ts`) é **role-blind e chapado**: não conhece
+`MAIA_PROCESS_ROLE`, não separa componente obrigatório de observado e não tem
+política de degradação. `whatsapp: down` derruba o agregado para `down`, e esse
+é o estado **normal** de um processo `api`, `worker` ou `scheduler` — que nunca
+teve sessão de WhatsApp. Promover esse agregado a veredito de roteamento não
+tiraria de rotação instâncias erradamente saudáveis; tiraria instâncias
+**corretamente saudáveis**, e faria o `all` flapar a cada reconexão de rotina do
+Baileys. O gate role-aware continua sendo o `/readyz`, e passa a ser o único.
+
+O que mudou no código e no contrato de resposta:
+
+- **`src/server.ts`**: os quatro handlers de `/health*` chamam `asDiagnostic(reply)` — `reply.code(200)` **explícito**. Antes o handler simplesmente não chamava `reply.code`, e uma omissão não se distingue de uma decisão.
+- **Header novo em toda resposta de `/health*`**: `x-maia-endpoint-kind: diagnostic`.
+- **Corpo do `/health` ganhou dois campos**: `"probe": false` e `"probes": { "liveness": "/livez", "startup": "/startupz", "readiness": "/readyz" }` — para quem apontou um check para lá descobrir isso na resposta que já está lendo. Nada neste repositório consome o corpo do `/health`; um consumidor externo que afirme conjunto exato de chaves precisa de ajuste.
+- **`tests/unit/server/health-probe-contract.spec.ts`** fixa a distinção entre os quatro endpoints contra o `buildServer()` **real** (não um Fastify espelhado): fica vermelho tanto se alguém fizer `/health` reprovar quanto se remover a marcação de diagnóstico do handler.
+- Docs reconciliados: `docs/admin-ui-deploy.md`, `docs/runbooks/operational.md` §8.1, `docs/architecture/modules/lib.md`, `docs/architecture/modules/runtime.md`.
+
 ### Removed — `recharts` sai do console; o upgrade 2 → 3 não tinha o que migrar ([#605](https://github.com/diogenesmendes01/Maia-v2/issues/605))
 
 A issue pedia o major `recharts` 2 → 3 "com o visual do console verificado", e o primeiro critério de aceite era o **inventário das telas que usam Recharts**. O inventário deu **vazio**: nenhum arquivo do repositório importa `recharts`, e nenhum commit da história inteira jamais importou (`git log --all -S "from 'recharts"` não devolve nada). O pacote entrou no scaffold do P8.5 (`e23c8523`) junto com um kit de UI que nunca foi ligado. As telas do console — `audit`, `dashboard`, `drift`, `traces` — são tabelas, badges e formulários; **não há gráfico**.

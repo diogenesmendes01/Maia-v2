@@ -38,6 +38,29 @@ Leitura dos `event_type`:
 | `step_failed` | falha de infraestrutura |
 | `run_expired` | a varredura de TTL encerrou a run |
 
+### "O operador diz que tentou e não apareceu run nenhuma"
+
+Se o comando foi **recusado antes de existir transação** — escopo proibido
+(`'default'`/`'system'`), RBAC, payload fora do contrato, chave de idempotência
+ausente — não há run, não há evento e não há linha em `admin_audit_log`: não
+houve o que auditar. O rastro está na série e no log:
+
+```promql
+sum by (step, reason) (increase(maia_onboarding_step_failed_total[1h]))
+```
+
+`reason="forbidden_scope_literal"` é a tentativa de provisionar em `'default'`
+ou `'system'`, e ela é sempre digna de investigação: o operador está pedindo o
+bucket legado ou o de manutenção global como alvo. `step="other"` significa que
+a recusa foi na **abertura** ou no **cancelamento** da run (os pseudo-passos
+`create_run`/`cancel_run` não estão no vocabulário fechado de `step`).
+
+No log da API, a mesma recusa sai como `msg="onboarding.command_refused"`, com
+`step` e `reason`. Ela **não** carrega o valor recusado: a mensagem da exceção
+interpola o `tenant_id` que o operador mandou, e `reason_code` de cancelamento
+é entrada livre. Para saber o que exatamente foi digitado, pergunte ao
+operador — não ao log.
+
 ### A trilha administrativa de uma run — cuidado com o bucket `system`
 
 `admin_audit_log.tenant_id` é FK para `tenants(id)`, e os primeiros eventos de

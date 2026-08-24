@@ -126,6 +126,25 @@ appears. In production the same number is published on
 `maia_turn_context_db_queries{phase="loader"}` by the counter frame in
 `buildPrompt` (`src/db/query-counter.ts`).
 
+That spec counts repository CALLS, with `src/db/repositories.js` mocked. It is
+the right shape for asserting the read SET, but it rests on an assumption it
+cannot check — one repository method is one statement — and a method that grew a
+second statement would leave it green at 13 while production paid 14.
+`tests/unit/turn-context-statement-count.spec.ts` closes that gap without a
+database by mocking one layer lower: only `pg` is faked, at `client.query`, the
+exact seam `instrumentQueries` hooks. Everything above it is production —
+`buildPrompt`, `loadTurnContext`, the real repositories, the real drizzle SQL
+compilation — so the 13 it measures is a count of statements that would have
+gone down a socket. It reads the count twice per assertion (the production
+counter, and the fake client's own log) and fails if the two disagree, so the
+instrumentation is under test rather than trusted. Because the whole read set is
+materialised there as SQL text, it also asserts that every one of the 13
+statements carries a `tenant_id` AND an `agent_id` predicate — a cheap
+unit-lane companion to the real isolation proof in the integration suite, which
+is why it is part of `npm run test:leak`. It says nothing about whether a
+predicate binds the RIGHT value; that stays with
+`tests/integration/turn-context-batch-repos.spec.ts`.
+
 **The `context.load` span.** `loadTurnContext` is wrapped by
 `instrumentContextLoad` (`src/observability/instrumentation.ts`,
 `stage="turn_context"`) at the EXPORTED entry point, delegating to
@@ -505,6 +524,7 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 | Test path | What it covers |
 |---|---|
 | `tests/unit/turn-context-round-trips.spec.ts` | The round-trip budget: exact counts, the named read set, and that the renderer costs zero |
+| `tests/unit/turn-context-statement-count.spec.ts` | The same budget counted in SQL STATEMENTS (real repos + real drizzle, only `pg` faked), plus tenant+agent scoping on every statement |
 | `tests/unit/turn-context-renderer-purity.spec.ts` | The renderer runs with every repository rigged to throw |
 | `tests/unit/turn-context-baseline.spec.ts` | Zero slope + `resolveScope` batching and its cross-tenant counterfactual |
 | `tests/unit/turn-context-read-gate.spec.ts` | The semaphore's contract: ceiling, FIFO order, permit released on rejection |
@@ -542,5 +562,5 @@ Verify: `gh pr list --state open --search "agent OR react OR turn"`.
 
 | | |
 |---|---|
-| Last verified | 2026-05-28 |
+| Last verified | 2026-08-24 |
 | Against `main` HEAD | `c49c3855` |

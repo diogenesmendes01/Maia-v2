@@ -20,7 +20,7 @@
 | `src/lib/logger.ts` | Pino structured logger |
 | `src/lib/metrics.ts` | `incCounter`, `observeHistogram`, `setGauge` + Prometheus registry |
 | `src/lib/alerts.ts` | Email + Telegram alert channels |
-| `src/lib/healthcheck.ts` | Component probes (`checkDb`/`checkRedis`/`checkWhatsApp`/`checkAll`) + the #297 Redis-memory readiness gate. **Read-only** since #512: `recordHealthSnapshot()` is called by the `health_monitor` cron, never by an endpoint, and `toPublicHealthReport()` strips raw driver text at the HTTP edge. The composite, role-aware `/readyz` lives in `src/runtime/lifecycle/readiness.ts` |
+| `src/lib/healthcheck.ts` | Component probes (`checkDb`/`checkRedis`/`checkWhatsApp`/`checkAll`) + the #297 Redis-memory readiness gate. **Read-only** since #512: `recordHealthSnapshot()` is called by the `health_monitor` cron, never by an endpoint, and `toPublicHealthReport()` strips raw driver text at the HTTP edge. **Diagnostic, not a probe** since #613: `checkAll()` is role-blind and flat, so `/health*` answers 200 even when the report says `down` — the constants `DIAGNOSTIC_ENDPOINT_HEADER` / `PROBE_ENDPOINTS` put that contract on the wire. See [ADR 0003](../decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md). The composite, role-aware `/readyz` lives in `src/runtime/lifecycle/readiness.ts` |
 | `src/lib/decimal.ts` | `decimal.js` wrapper — `toDecimal()`, `fmtBRL()` |
 | `src/lib/brazilian.ts` | Brazilian formatting (CPF, CNPJ, currency, dates) |
 | `src/lib/business-days.ts` | Business-day arithmetic |
@@ -438,6 +438,73 @@ Só `healthy` e `outage` admitem igualdade byte a byte entre braços: em
 de que lado da fronteira temporal ela caiu — sob concorrência real (e com o
 `Math.random()` do backoff do gateway) isso não se repete. Nesses dois o
 veredicto usa folga de 5% e diz isso na saída. Ver `DETERMINISTIC_SCENARIOS`.
+
+#### Tabela p50/p95/p99 e custo — antes e depois (DoD da #508)
+
+"Antes" é a postura `off`: exatamente o gateway que a #531 deixou em `main`,
+sem disjuntor. "Depois" é `enforce`. Mesma carga, mesmo processo, mesma tabela
+de preços do ledger (`estimateLLMCostUsd`) — o que muda entre as duas linhas de
+cada cenário é só a postura.
+
+Comandos que produziram cada linha (defaults: 200 requests, concorrência 10, 3
+tenants, latência sintética 25ms, `--failure-rate 0.6`, workload `reasoner`):
+
+```
+npm run llm:bench -- --scenario healthy
+npm run llm:bench -- --scenario outage
+npm run llm:bench -- --scenario brownout
+npm run llm:bench -- --scenario recovery --requests 500 --think-ms 700
+```
+
+| cenário | postura | requisições ao provider | sucesso / erro / recusado | p50 (ms) | p95 (ms) | p99 (ms) | custo (USD) |
+|---|---|---|---|---|---|---|---|
+| `healthy` | antes (`off`) | 200 | 200 / 0 / 0 | 27 | 32 | 74 | 1.0800 |
+| `healthy` | depois (`enforce`) | 200 | 200 / 0 / 0 | 26 | 31 | 31 | 1.0800 |
+| `outage` | antes (`off`) | 800 | 0 / 200 / 0 | 122 | 139 | 162 | 0.0000 |
+| `outage` | depois (`enforce`) | **10** | 0 / 0 / 200 | **0** | **1** | **45** | 0.0000 |
+| `brownout` | antes (`off`) | 451 | 167 / 33 / 0 | 65 | 128 | 132 | 0.9018 |
+| `brownout` | depois (`enforce`) | 460 | 169 / 31 / 0 | 62 | 127 | 130 | 0.9126 |
+| `recovery` | antes (`off`) | 950 | 350 / 150 / 0 | 28 | 128 | 169 | 1.8900 |
+| `recovery` | depois (`enforce`) | 276 | 263 / 0 / 237 | 22 | 31 | 39 | 1.4202 |
+
+**Como ler isto, sem vender o que não está aí.**
+
+1. **O disjuntor não economiza dólar numa queda.** Em `outage` o custo é
+   `0.0000` dos dois lados: chamada que falha não fatura token. O que ele corta
+   é **carga sobre uma dependência que já está mal** (800 → 10 requisições,
+   −98,8%) e o tempo que o caller paga para descobrir que não vai dar (p50 122ms
+   → 0ms, p99 162ms → 45ms). Quem citar economia de custo a partir desta linha
+   está citando errado.
+2. **Em provider saudável ele não cobra pedágio.** `healthy` entrega os mesmos
+   200 sucessos pelos mesmos USD 1,0800, com p50 27ms → 26ms. O preço do
+   controle é o do hot path — ~690ns por tentativa no micro-benchmark, cinco
+   ordens de grandeza abaixo de uma chamada real.
+3. **Em brownout ele fica FORA do caminho, de propósito.** A 60% de erro POR
+   TENTATIVA o retry do `reasoner` ainda entrega ~84% das chamadas, e o
+   disjuntor não abre (estado final `closed` nos três braços): custo e latência
+   ficam dentro do ruído (USD 0,9018 × 0,9126). É a medição do "disjuntor que
+   abre demais" — abrir aqui trocaria 167 sucessos por 200 recusas.
+4. **Na recuperação ele custa throughput, e é aqui que o número precisa ser
+   honesto.** `recovery` troca 87 chamadas bem-sucedidas (350 → 263) por 674
+   requisições a menos no provider. O custo cai de USD 1,8900 para 1,4202, mas o
+   custo POR SUCESSO é o mesmo nos dois (~USD 0,0054): isso não é economia, é
+   menos trabalho feito. O que se ganha de verdade é p95 128ms → 31ms e uma
+   dependência que volta sem levar a carga inteira de volta na cara.
+
+**Armadilha de medição do cenário `recovery`.** Com carga curta demais a corrida
+termina ANTES de o cooldown expirar, e o braço `enforce` sai com 0 sucessos e
+estado final `open` — artefato do harness, não disjuntor preso. Medido:
+`--requests 200 --think-ms 120` (corrida de ~4,9s contra queda de 12s) devolve
+`0 / 0 / 200` e `open`; a mesma corrida com `--requests 500 --think-ms 700`
+(~37,8s) atravessa a queda, a sonda passa e o disjuntor **fecha sozinho** — é a
+linha `recovery` da tabela. A corrida precisa durar mais que `--outage-ms` mais
+o cooldown acumulado.
+
+**Onde estes números foram tirados.** Container de desenvolvimento, provider
+sintético, processo único. Com Postgres fora do ar a trilha durável da transição
+falha e a corrida imprime `audit.write_failed` — a auditoria é fire-and-forget
+(`circuit-audit.ts`) e não entra no caminho medido, mas a linha aparece e não é
+regressão.
 
 ### Decisão fechada: `tier` NÃO é obrigatório no call site (issue #534)
 

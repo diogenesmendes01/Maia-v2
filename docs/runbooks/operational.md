@@ -850,17 +850,38 @@ nada a ligar em `src/server.ts`. **Um par que nunca recebeu tráfego não tem
 série alguma**, o que é diferente de ter série em `0`: a primeira coisa a checar
 quando um alerta não dispara é se aquele workload chegou a rodar.
 
-### 8.1 Probes — qual endpoint usar onde (issue #512)
+### 8.1 Probes — qual endpoint usar onde (issues #512 e #613)
 
-Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
-endpoint errado transforma queda de dependência em restart loop.
+Quatro superfícies com **contratos diferentes**. **Três são probes; a quarta
+não é.** Apontar o probe errado para o endpoint errado transforma queda de
+dependência em restart loop — ou, no caso do `/health`, em um health check que
+nunca reprova nada.
 
-| Endpoint | Pergunta que responde | Faz I/O? | Usar em |
-|---|---|---|---|
-| `/livez` | o processo está vivo? | **não** (nenhum) | liveness do orquestrador / `healthcheck` do compose |
-| `/startupz` | a inicialização terminou? | não | startup probe |
-| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | readiness probe / pool do LB |
-| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | diagnóstico humano, dashboards |
+| Endpoint | Pergunta que responde | Faz I/O? | Veredito no status HTTP? | Usar em |
+|---|---|---|---|---|
+| `/livez` | o processo está vivo? | **não** (nenhum) | **sim** — 200 sempre que o processo responde | liveness do orquestrador / `healthcheck` do compose |
+| `/startupz` | a inicialização terminou? | não | **sim** — 503 até `ready` | startup probe |
+| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | **sim** — 503 fail-closed | readiness probe / pool do LB |
+| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | **NÃO — 200 sempre** (issue #613) | diagnóstico humano, dashboards. **Nunca como probe** |
+
+> **`/health` responde 200 mesmo dizendo `"status":"down"`, e isso é a decisão,
+> não o defeito** — [ADR 0003](../architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md),
+> issue #613. O 200 ali afirma *"produzi o relatório"*, não *"o sistema está
+> bem"*; o veredito é o corpo. O motivo de ele não virar 503 é `checkAll()`
+> (`src/lib/healthcheck.ts`): ele é **role-blind e chapado** — não conhece
+> `MAIA_PROCESS_ROLE`, não separa componente obrigatório de observado e não tem
+> política de degradação, então `whatsapp: down` derruba o agregado para `down`,
+> que é o **estado normal** de um processo `api`, `worker` ou `scheduler`. Um LB
+> apontado para lá tiraria de rotação instâncias corretas. O gate role-aware é
+> o `/readyz`, e é o único.
+>
+> Como reconhecer o endpoint em campo: toda resposta de `/health*` traz o header
+> `x-maia-endpoint-kind: diagnostic`, e o corpo do agregado traz
+> `"probe": false` mais o mapa `probes` com `/livez`, `/startupz` e `/readyz`.
+>
+> **Se o seu health check aponta para `/health`, ele nunca detectou nada.**
+> Troque: `/livez` se o campo decide **restart**, `/readyz` se decide
+> **roteamento de tráfego**.
 
 Não há `/health/llm` — use `maia_llm_requests_total{status}` no Prometheus (a
 legada `maia_llm_calls_total` não separa por workload).
@@ -881,6 +902,11 @@ Regras que o código garante (`src/runtime/lifecycle/`):
   `health_monitor` (1×/min).
 - **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
   HTTP; a mensagem completa vai só para o log).
+- **`/health*` nunca reprova** (issue #613): o `reply.code(200)` é explícito no
+  handler (`asDiagnostic()`, `src/server.ts`) e
+  `tests/unit/server/health-probe-contract.spec.ts` reprova se alguém torná-lo
+  condicional — ou se remover a marcação que declara o endpoint como
+  diagnóstico.
 
 > **Cold start / pareamento.** Nos papéis que exigem a sessão (`all`,
 > `session-owner`), o primeiro `connection.update = open` real — e não o
