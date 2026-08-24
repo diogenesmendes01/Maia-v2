@@ -41,6 +41,25 @@ async function criarTurno(tenant: string, agent: string): Promise<string> {
   return rows[0].id as string;
 }
 
+/**
+ * Chave lógica sintética e ÚNICA por chamada.
+ *
+ * Ela precisa ser única por default e o motivo é uma lição do próprio teste:
+ * a primeira versão devolvia um literal fixo (`mol1_bbb…`), e três casos que
+ * nada tinham a ver com unicidade quebraram com `duplicate key value violates
+ * … outbound_messages_logical_dedupe_uq` — porque as rows de casos ANTERIORES
+ * seguiam na tabela. O unique estava certo; o fixture é que afirmava, sem
+ * querer, que duas saídas lógicas distintas compartilhavam identidade.
+ *
+ * Formato de baixa entropia e obviamente sintético (hex de um UUID, sem
+ * segredo): o gitleaks varre a HISTÓRIA, e uma "chave" aleatória num teste de
+ * idempotência é exatamente o que a regra `generic-api-key` procura.
+ * O caso que TESTA a colisão passa a mesma chave explicitamente.
+ */
+function chaveLogicaSintetica(): string {
+  return `mol1_${randomUUID().replace(/-/g, '')}${randomUUID().replace(/-/g, '')}`;
+}
+
 /** Row durável completa. `over` altera um campo por vez para isolar o CHECK. */
 function rowDuravel(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -57,7 +76,7 @@ function rowDuravel(over: Record<string, unknown> = {}): Record<string, unknown>
     payload_type: 'text',
     payload_json: JSON.stringify({ type: 'text', text: 'oi' }),
     payload_hash: 'a'.repeat(64),
-    logical_dedupe_key: `mol1_${'b'.repeat(64)}`,
+    logical_dedupe_key: chaveLogicaSintetica(),
     provider_idempotency_key: `3EB0${'C'.repeat(18)}`,
     next_attempt_at: new Date().toISOString(),
     ...over,
@@ -171,7 +190,7 @@ d('#630 — migração 121: outbox durável em outbound_messages', () => {
 
   it('o unique parcial recusa a SEGUNDA saída lógica com a mesma chave', async () => {
     const turn = await criarTurno(T, A);
-    const ldk = `mol1_${randomUUID().replace(/-/g, '').repeat(2)}`.slice(0, 69);
+    const ldk = chaveLogicaSintetica();
     await inserir(rowDuravel({ turn_id: turn, sequence_in_turn: 0, logical_dedupe_key: ldk }));
     await expect(
       inserir(rowDuravel({ turn_id: turn, sequence_in_turn: 1, logical_dedupe_key: ldk })),
@@ -181,7 +200,7 @@ d('#630 — migração 121: outbox durável em outbound_messages', () => {
   it('a MESMA chave lógica em OUTRO tenant é permitida — o escopo é (tenant, agent, key)', async () => {
     const turn = await criarTurno(T, A);
     const turn2 = await criarTurno(T2, 'agente-630-vizinho');
-    const ldk = `mol1_${randomUUID().replace(/-/g, '')}`;
+    const ldk = chaveLogicaSintetica();
     await inserir(rowDuravel({ turn_id: turn, logical_dedupe_key: ldk }));
     await expect(
       inserir(
