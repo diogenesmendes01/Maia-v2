@@ -64,8 +64,8 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
 | `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
 | `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
-| `stream-key.ts` | Derivação CANÔNICA da `stream_key` (#505). PURO e versionado: material comprimento-prefixado (netstring) sobre `tenant_id + agent_id + canal + linha + identidade remota normalizada`. Nenhum caminho devolve chave "genérica" — ou é inequívoca ou é `{ ok: false, reason }`. |
-| `stream-ingress.ts` | A FRONTEIRA fail-closed do ingresso (#505): audita, mede e RECUSA (`StreamIdentityUnresolvedError`) quando a stream não é derivável. Dono de `maia_stream_ingress_total` e `maia_stream_ingress_rejected_total`. |
+| `stream-key.ts` | Derivação CANÔNICA da `stream_key` (#505) **e a guarda fail-closed** (`requireStreamIdentity`, `StreamIdentityUnresolvedError`). PURO — só `node:crypto`: material comprimento-prefixado (netstring) sobre `tenant_id + agent_id + canal + linha + identidade remota normalizada`. Nenhum caminho devolve chave "genérica". A pureza é **estrutural**: quem chama a guarda é o repositório, que é compartilhado com o console e não pode alcançar `src/config/env.ts` (#596). |
+| `stream-ingress.ts` | O RELATO da decisão (#505): métrica, `audit_log` e log estruturado. Consumido pelo **gateway**, que já paga por `@/config/env.js`. Dono de `maia_stream_ingress_total` e `maia_stream_ingress_rejected_total`. |
 | `lifecycle.ts` | Fachada usada por gateway/agent/workers: flag de rollout, fail-soft, auditoria e métricas. |
 | `index.ts` | Superfície pública — importe daqui. |
 
@@ -112,10 +112,21 @@ coluna `stream_key_version`.
 **Fail-closed.** `tenant_id`/`agent_id` são obrigatórios, `'default'` e `'system'`
 são recusados, e a LINHA é obrigatória (desde a migration 090 a conversa é
 escopada por canal — sem `channel_id` no material, o mesmo interlocutor em duas
-linhas colapsaria numa stream). Um ingresso irresolúvel é RECUSADO, auditado
-(`stream_ingress_rejected`) e nunca persistido. Em produção esse caso já era
-fail-closed antes daqui: todo ramo não-lançante de `resolveChannel` devolve
-`channel_id`.
+linhas colapsaria numa stream). Um ingresso irresolúvel é RECUSADO e nunca
+persistido. Em produção esse caso já era fail-closed antes daqui: todo ramo
+não-lançante de `resolveChannel` devolve `channel_id`.
+
+**Onde a decisão mora, e por quê.** A GUARDA (`requireStreamIdentity`) é chamada
+por `mensagensRepo.createInbound`, no ponto em que o inbound seria persistido —
+a recusa acontece antes de qualquer escrita. O RELATO (métrica, `audit_log`,
+log) é chamado pelo GATEWAY, no `catch`. A divisão não é estética:
+`src/db/repositories/` é compartilhado entre o container `app` e o console
+`admin-ui`, e a cadeia `métrica → labels → src/config/env.ts` faria o console
+validar o subset `runtime` no boot (#596, fixado por
+`tests/unit/config/admin-import-boundary.spec.ts`). Pela mesma razão a flag é
+lida por `contractEnv`, não por `config`. Consequência honesta: um chamador
+futuro de `createInbound` que não relate continua fail-closed, mas a recusa dele
+não vira série nem `audit_log`.
 
 **`ingress_seq`** é monotônica **por stream**, alocada por
 `INSERT … ON CONFLICT DO UPDATE … RETURNING` numa linha de `agent_stream_sequences`

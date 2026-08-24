@@ -388,8 +388,9 @@ existe e o INSERT falha. Mesma armadilha, mesma ordem, do
 
 ### 8.2 A única mudança de comportamento observável
 
-Um ingresso cuja identidade de stream não é derivável passa a ser **recusado**:
-`audit_log` recebe `stream_ingress_rejected`, o log estruturado
+Um ingresso cuja identidade de stream não é derivável passa a ser **recusado**
+pelo repositório, ANTES de qualquer escrita. O gateway converte a recusa em
+trilha: `audit_log` recebe `stream_ingress_rejected`, o log estruturado
 `baileys.stream_identity_unresolved_drop` traz o `whatsapp_id`, e a mensagem
 **não** é persistida. Nunca há queda para stream genérica ou `'default'` — a
 issue nomeia esse fallback como uma das falhas que ela existe para impedir.

@@ -1,11 +1,26 @@
 /**
  * Issue #505 — derivação CANÔNICA da `stream_key`.
  *
- * Este módulo é PURO: sem banco, sem ALS, sem relógio, sem log. Ele responde a
- * uma pergunta e só a ela — "qual é a identidade durável da stream de ordenação
- * deste ingresso?" — e devolve ou a chave ou o motivo tipado da recusa. Quem
- * audita, mede e derruba o ingresso é `stream-ingress.ts`; separá-los é o que
- * torna a derivação exaustivamente testável sem infraestrutura.
+ * Este módulo é PURO: sem banco, sem ALS, sem relógio, sem log, sem config.
+ * Ele responde a uma pergunta e só a ela — "qual é a identidade durável da
+ * stream de ordenação deste ingresso?" — e devolve ou a chave ou o motivo
+ * tipado da recusa.
+ *
+ * ─── Por que a pureza é ESTRUTURAL aqui, e não estética ────────────────────
+ *
+ * A fronteira fail-closed é aplicada em `mensagensRepo.createInbound`, que vive
+ * em `src/db/repositories/` — um módulo COMPARTILHADO entre o container `app` e
+ * o console `admin-ui`. Um import de valor daqui até `src/config/env.ts` faria
+ * o console validar o subset `runtime` inteiro no boot e exigir dele as seis
+ * `BACKUP_*` (credencial de S3 inclusive) num processo que nunca roda backup —
+ * exatamente o que a issue #596 fechou, e o que
+ * `tests/unit/config/admin-import-boundary.spec.ts` mantém fechado.
+ *
+ * Por isso a divisão: aqui fica TUDO o que o repositório precisa (derivação,
+ * erro tipado, guarda que lança), e a OBSERVABILIDADE — métrica, auditoria,
+ * log — mora em `stream-ingress.ts`, consumido pelo gateway, que é a camada que
+ * já paga por `@/config/env.js`. Não é organização: é o que mantém o console
+ * bootável.
  *
  * ─── Por que a chave existe ────────────────────────────────────────────────
  *
@@ -279,6 +294,69 @@ export function deriveStreamKey(input: StreamKeyInput): StreamKeyDerivation {
     stream_key: `${STREAM_KEY_PREFIX}${digest}`,
     stream_key_version: STREAM_KEY_VERSION,
   };
+}
+
+/** A stream resolvida, selada. Os dois campos vieram da MESMA derivação. */
+export type ResolvedStream = {
+  readonly stream_key: string;
+  readonly stream_key_version: number;
+};
+
+/**
+ * O ingresso não pôde ser atribuído a uma stream inequívoca.
+ *
+ * Carrega o motivo de vocabulário fechado e NADA do conteúdo — a mensagem do
+ * erro pode acabar num log genérico, e ela não pode ser o vetor por onde
+ * telefone ou texto vazam.
+ */
+export class StreamIdentityUnresolvedError extends Error {
+  readonly code = 'STREAM_IDENTITY_UNRESOLVED';
+  readonly reason: StreamKeyRejection;
+
+  constructor(reason: StreamKeyRejection) {
+    super(
+      `identidade de stream não pôde ser resolvida (reason=${reason}); ` +
+        `o ingresso é recusado em vez de cair numa stream genérica — issue #505, invariante MUST nº 2/nº 8`,
+    );
+    this.name = 'StreamIdentityUnresolvedError';
+    this.reason = reason;
+  }
+}
+
+/** `true` para o erro acima, sem depender de `instanceof` cruzando módulos. */
+export function isStreamIdentityUnresolved(
+  err: unknown,
+): err is StreamIdentityUnresolvedError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { code?: unknown }).code === 'STREAM_IDENTITY_UNRESOLVED'
+  );
+}
+
+/**
+ * A GUARDA FAIL-CLOSED: devolve a stream ou LANÇA.
+ *
+ * ─── Por que um `throw`, e não um `null` ──────────────────────────────────
+ *
+ * Um `null` convida o chamador a seguir em frente. Um erro TIPADO obriga a
+ * decidir: ou trata (o gateway derruba a mensagem com trilha) ou propaga. É a
+ * mesma escolha, pela mesma razão, de `TurnScopeUnresolvedError` em
+ * `scope-resolver.ts` — sem stream não há ordem, e persistir sem ordem é
+ * precisamente o fail-open que a issue proíbe (§Falhas 8: "mensagem sem
+ * identidade resolvida cai em stream `default` ou global").
+ *
+ * Quem chama isto é o REPOSITÓRIO, no ponto em que o inbound seria persistido.
+ * A recusa acontece, portanto, ANTES de qualquer escrita — recusar depois de
+ * persistir seria fail-open com log bonito.
+ */
+export function requireStreamIdentity(input: StreamKeyInput): ResolvedStream {
+  const derived = deriveStreamKey(input);
+  if (!derived.ok) throw new StreamIdentityUnresolvedError(derived.reason);
+  return Object.freeze({
+    stream_key: derived.stream_key,
+    stream_key_version: derived.stream_key_version,
+  });
 }
 
 /**

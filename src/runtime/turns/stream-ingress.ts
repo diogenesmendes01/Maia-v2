@@ -1,28 +1,35 @@
 /**
- * Issue #505 — a FRONTEIRA FAIL-CLOSED do ingresso.
+ * Issue #505 — a OBSERVABILIDADE da fronteira de identidade de stream.
  *
- * `stream-key.ts` decide QUAL é a stream. Este módulo decide o que acontece
- * quando ela não pode ser decidida — e a resposta é sempre a mesma: o ingresso
- * é RECUSADO, medido e auditado. Nunca agrupado numa stream genérica, nunca
- * `'default'`, nunca "processa assim mesmo e resolve depois".
+ * ─── A divisão de responsabilidade, e por que ela é estrutural ─────────────
  *
- * ─── Por que a recusa é um `throw`, e não um `null` ────────────────────────
+ * A DECISÃO (derivar a stream, ou recusar o ingresso) mora em `stream-key.ts`,
+ * que é puro e é chamado pelo REPOSITÓRIO, no ponto em que o inbound seria
+ * persistido. A recusa acontece portanto ANTES de qualquer escrita.
  *
- * Um `null` convida o chamador a seguir em frente. Um erro TIPADO obriga a
- * decidir: quem chama ou trata (o gateway derruba a mensagem com trilha) ou
- * propaga. É a mesma escolha, pela mesma razão, de
- * `TurnScopeUnresolvedError` em `scope-resolver.ts` — sem stream não há ordem,
- * e executar sem ordem é precisamente o fail-open que a issue proíbe (§Falhas
- * 8: "mensagem sem identidade resolvida cai em stream `default` ou global").
+ * O RELATO da decisão — métrica, auditoria, log — mora aqui, e é chamado pelo
+ * GATEWAY. A separação não é estética: `src/db/repositories/` é COMPARTILHADO
+ * entre o container `app` e o console `admin-ui`, e a cadeia
+ * `métrica -> labels -> src/config/env.ts` faria o console validar o subset
+ * `runtime` inteiro no boot, exigindo dele as seis `BACKUP_*` (credencial de S3
+ * inclusive) num processo que nunca roda backup — a issue #596, fixada por
+ * `tests/unit/config/admin-import-boundary.spec.ts`. O gateway já paga por
+ * `@/config/env.js`; o repositório não pode passar a pagar.
+ *
+ * Consequência honesta dessa divisão: um chamador futuro de `createInbound` que
+ * NÃO chame estas funções continua FAIL-CLOSED (o repositório recusa), mas a
+ * recusa dele não vira métrica nem `audit_log`. O que impede isso hoje é haver
+ * um único chamador de produção (`src/gateway/baileys.ts`); o que impediria
+ * estruturalmente seria o repositório poder falar com a camada de métrica — e é
+ * exatamente isso que a fronteira de import do console proíbe.
  *
  * ─── O que vira métrica e o que vira audit_log ─────────────────────────────
  *
  * A régua é a mesma de #503/#504: só entra em `audit_log` o que um humano
  * precisa RECONSTRUIR depois.
  *
- *   * TODA recusa vira `audit_log`. É uma mensagem de usuário que a
- *     plataforma decidiu não processar — a decisão governável por excelência,
- *     e o operador precisa saber que ela existiu.
+ *   * TODA recusa vira `audit_log`. É uma mensagem de usuário que a plataforma
+ *     decidiu não processar — a decisão governável por excelência.
  *   * O NASCIMENTO de uma stream (`ingress_seq === 1`) vira `audit_log`. É o
  *     registro durável de "esta stream passou a existir, sob este algoritmo",
  *     e é o que permite reconstruir o começo de uma ordem meses depois.
@@ -42,102 +49,67 @@ import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { counter } from '@/observability/metrics.js';
 import { METRIC, closedVocabulary } from '@/observability/taxonomy.js';
-import {
-  deriveStreamKey,
-  STREAM_KEY_REJECTIONS,
-  type StreamKeyInput,
-  type StreamKeyRejection,
-} from './stream-key.js';
-
-/** A stream resolvida, selada. Os dois campos vieram da MESMA derivação. */
-export type ResolvedStream = {
-  readonly stream_key: string;
-  readonly stream_key_version: number;
-};
+import { STREAM_KEY_REJECTIONS, type StreamKeyRejection } from './stream-key.js';
 
 /**
- * O ingresso não pôde ser atribuído a uma stream inequívoca.
- *
- * Carrega o motivo de vocabulário fechado e NADA do conteúdo — a mensagem do
- * erro pode acabar num log de erro genérico, e ela não pode ser o vetor por
- * onde telefone ou texto vazam.
+ * Vocabulário FECHADO do label `channel_kind`. Espelha o union de
+ * `resolveChannel`; qualquer outra coisa colapsa para o fallback do
+ * `closedVocabulary` em vez de virar série nova.
  */
-export class StreamIdentityUnresolvedError extends Error {
-  readonly code = 'STREAM_IDENTITY_UNRESOLVED';
-  readonly reason: StreamKeyRejection;
+const CHANNEL_KIND_LABELS: readonly string[] = Object.freeze([
+  'whatsapp',
+  'telegram',
+  'email',
+  'sms',
+  'web',
+  'api',
+  'other',
+]);
 
-  constructor(reason: StreamKeyRejection) {
-    super(
-      `resolveIngressStream: identidade de stream não pôde ser resolvida (reason=${reason}); ` +
-        `o ingresso é recusado em vez de cair numa stream genérica — issue #505, invariante MUST nº 2/nº 8`,
-    );
-    this.name = 'StreamIdentityUnresolvedError';
-    this.reason = reason;
-  }
-}
-
-/** `true` para o erro acima, sem depender de `instanceof` cruzando módulos. */
-export function isStreamIdentityUnresolved(
-  err: unknown,
-): err is StreamIdentityUnresolvedError {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    (err as { code?: unknown }).code === 'STREAM_IDENTITY_UNRESOLVED'
-  );
-}
-
-/**
- * Resolve a stream do ingresso ou RECUSA-O.
- *
- * @throws {StreamIdentityUnresolvedError} em qualquer desfecho que não seja uma
- *   derivação inequívoca. A recusa já foi medida e auditada quando o erro sobe.
- */
-export async function resolveIngressStream(input: StreamKeyInput): Promise<ResolvedStream> {
-  const derived = deriveStreamKey(input);
-  if (derived.ok) {
-    counter(METRIC.STREAM_INGRESS, {
-      channel_kind: closedVocabulary(input.channel_kind ?? null, CHANNEL_KIND_LABELS),
-      result: 'resolved',
-    });
-    return Object.freeze({
-      stream_key: derived.stream_key,
-      stream_key_version: derived.stream_key_version,
-    });
-  }
-
+/** O ingresso foi atribuído a uma stream. Só métrica — o detalhe vai no log. */
+export function reportStreamIngressResolved(channel_kind: string | null): void {
   counter(METRIC.STREAM_INGRESS, {
-    channel_kind: closedVocabulary(input.channel_kind ?? null, CHANNEL_KIND_LABELS),
+    channel_kind: closedVocabulary(channel_kind, CHANNEL_KIND_LABELS),
+    result: 'resolved',
+  });
+}
+
+/**
+ * O ingresso foi RECUSADO por identidade irresolúvel: mede, loga e audita.
+ *
+ * Chamado pelo gateway no `catch` de `StreamIdentityUnresolvedError`.
+ */
+export async function reportStreamIngressRejected(args: {
+  reason: StreamKeyRejection;
+  channel_kind: string | null;
+  /** Identificador do evento no provedor. A row NÃO foi persistida. */
+  whatsapp_id?: string | null;
+}): Promise<void> {
+  counter(METRIC.STREAM_INGRESS, {
+    channel_kind: closedVocabulary(args.channel_kind, CHANNEL_KIND_LABELS),
     result: 'rejected',
   });
   counter(METRIC.STREAM_INGRESS_REJECTED, {
-    reason: closedVocabulary(derived.reason, STREAM_KEY_REJECTIONS),
+    reason: closedVocabulary(args.reason, STREAM_KEY_REJECTIONS),
   });
   logger.error(
     {
-      reason: derived.reason,
-      // Só a FORMA dos componentes, nunca os valores. `tenant_id`/`agent_id`
-      // seriam seguros, mas quando o motivo é `missing_tenant` não há o que
-      // registrar — e registrar "presente/ausente" responde a pergunta inteira.
-      has_tenant: typeof input.tenant_id === 'string' && input.tenant_id.length > 0,
-      has_agent: typeof input.agent_id === 'string' && input.agent_id.length > 0,
-      has_channel: typeof input.channel_id === 'string' && input.channel_id.length > 0,
-      has_remote_identity:
-        typeof input.remote_identity === 'string' && input.remote_identity.length > 0,
+      reason: args.reason,
+      // O `whatsapp_id` é o ÚNICO identificador estável que sobra: a mensagem
+      // não foi persistida, então não existe `mensagem_id` para citar.
+      whatsapp_id: args.whatsapp_id ?? null,
       ops_alert: true,
     },
     'stream.ingress_rejected',
   );
-  // Sem contexto de tenant ativo, `audit()` embrulha em `system` — a atribuição
-  // HONESTA de uma recusa cujo tema é justamente não saber o dono.
   await audit({
     acao: 'stream_ingress_rejected',
     metadata: {
-      reason: derived.reason,
-      channel_kind: typeof input.channel_kind === 'string' ? input.channel_kind : null,
+      reason: args.reason,
+      channel_kind: args.channel_kind,
+      whatsapp_id: args.whatsapp_id ?? null,
     },
   });
-  throw new StreamIdentityUnresolvedError(derived.reason);
 }
 
 /**
@@ -179,18 +151,3 @@ export async function noteIngressSequenced(args: {
     });
   }
 }
-
-/**
- * Vocabulário FECHADO do label `channel_kind`. Espelha o union de
- * `resolveChannel`; qualquer outra coisa colapsa para o fallback do
- * `closedVocabulary` em vez de virar série nova.
- */
-const CHANNEL_KIND_LABELS: readonly string[] = Object.freeze([
-  'whatsapp',
-  'telegram',
-  'email',
-  'sms',
-  'web',
-  'api',
-  'other',
-]);

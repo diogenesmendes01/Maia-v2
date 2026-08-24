@@ -35,6 +35,7 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { deriveStreamKey } from '@/runtime/turns/stream-key.js';
+import { reportStreamIngressRejected } from '@/runtime/turns/stream-ingress.js';
 import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
 const SHOULD_RUN =
@@ -375,14 +376,21 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
 
     // A RECUSA CHEGA A `audit_log` DE VERDADE.
     //
-    // Não é redundante com o `expect(auditMock)` do teste unitário: lá o módulo
-    // de auditoria é um dublê. Aqui a escrita percorre o grafo real, que tem um
-    // CICLO de import (`repositories -> stream-ingress -> governance/audit ->
-    // repositories`). ESM resolve ciclos por live binding, e `audit()` engole a
-    // própria falha de escrita num `catch` — ou seja, um `auditRepo` ainda em
-    // TDZ apareceria como recusa "silenciosamente não auditada", que é o pior
-    // desfecho possível para uma trilha. Esta asserção é o que impede isso de
-    // passar despercebido.
+    // O relato é do GATEWAY (o repositório não pode importar a camada de
+    // métrica — ver `src/runtime/turns/stream-ingress.ts`), então aqui
+    // reproduzimos o `catch` de produção chamando a MESMA função que ele chama.
+    // Não é redundante com o `expect(auditMock)` do teste unitário do gateway:
+    // lá o módulo de auditoria é um dublê; aqui a escrita percorre o writer
+    // real até a tabela real. `audit()` engole a própria falha num `catch`, e é
+    // por isso que "auditou" precisa ser afirmado contra a LINHA, não contra a
+    // chamada.
+    await runWithTenantContext({ tenant_id: T_A, agent_id: A_A }, () =>
+      reportStreamIngressRejected({
+        reason: 'missing_channel',
+        channel_kind: 'whatsapp',
+        whatsapp_id: 'wa-recusado',
+      }),
+    );
     const trilha = await pool.query(
       `SELECT metadata FROM audit_log
         WHERE tenant_id = $1 AND acao = 'stream_ingress_rejected'

@@ -63,18 +63,31 @@ número volta. Não há caminho de compensação a lembrar de escrever. A dedup 
 `whatsapp_id` precede tudo, no pre-check de `createInbound`, então a reentrega
 comum nem abre transação.
 
+**Onde a decisão mora, e por quê.** A GUARDA (`requireStreamIdentity`, pura) é
+chamada por `mensagensRepo.createInbound`; o RELATO (métrica, `audit_log`, log)
+é chamado pelo GATEWAY. A divisão não é estética: `src/db/repositories/` é
+compartilhado entre o container `app` e o console `admin-ui`, e a cadeia
+`métrica → labels → src/config/env.ts` faria o console validar o subset `runtime`
+no boot e exigir dele as seis `BACKUP_*` num processo que nunca roda backup — a
+regressão que `tests/unit/config/admin-import-boundary.spec.ts` pegou nesta
+própria fatia. Pela mesma razão a flag é lida por `contractEnv`. Consequência
+honesta: um chamador futuro de `createInbound` que não relate continua
+fail-closed, mas a recusa dele não vira série nem `audit_log`.
+
 **A evidência de que cada invariante está de fato travada** — cada defeito
 reintroduzido com UMA edição no código de PRODUÇÃO, não num harness espelhado:
 
 | Defeito reintroduzido | Teste que ficou vermelho |
 |---|---|
-| a recusa vira `return { stream_key: 'default' }` em `resolveIngressStream` | 4 casos: `createinbound-stream-fail-closed` (3) + `stream-ingress-sequence-real-db` (1) — todos `promise resolved … instead of rejecting` |
+| a recusa vira `return { stream_key: 'default' }` em `requireStreamIdentity` | 4 casos: `createinbound-stream-fail-closed` (3) + `stream-ingress-sequence-real-db` (1) — todos `promise resolved … instead of rejecting` |
 | `lengthPrefixed` volta a ser `` `${value}:` `` | 7 casos de `stream-key-canonical` — `expected 'maia.stream.v1:a:b:c:' not to be 'maia.stream.v1:a:b:c:'` |
 | a alocação sai da transação (`allocateIngressSeq(db, …)` no lugar de `(tx, …)`) | `stream-ingress-sequence-real-db` — `expected '6' to be '1'` no contador, e a corrida de 50 estoura o pool |
+| `reportStreamIngressRejected` some do `catch` do gateway | `baileys-stream-identity-drop` — a recusa vira queda SEM trilha |
 
 O teste de fail-closed entra por `mensagensRepo.createInbound`, o call site REAL
-do ingresso (`src/gateway/baileys.ts:1080`), e afirma a ausência do INSERT — não
-só o `throw`. Recusar depois de persistir seria fail-open com log bonito.
+do ingresso, e afirma a ausência do INSERT — não só o `throw`. Recusar depois de
+persistir seria fail-open com log bonito. O da trilha entra por
+`ingressUpsertMessage`, o ponto por onde o Baileys entrega `messages.upsert`.
 
 **Fronteiras do turno.** `first_ingress_seq`/`last_ingress_seq` nascem iguais
 (turno simples). `absorbDebounceInputs` estende com `LEAST`/`GREATEST` e **só**

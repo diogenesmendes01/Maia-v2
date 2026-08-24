@@ -45,6 +45,9 @@ import {
   noteTurnEnqueueFailed,
   turnStateMachineEnabled,
   isStreamIdentityUnresolved,
+  noteIngressSequenced,
+  reportStreamIngressRejected,
+  reportStreamIngressResolved,
   type TurnStatus,
 } from '@/runtime/turns/index.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
@@ -967,6 +970,14 @@ async function resolveTenantCtxForUpsert(
   }
 }
 
+/**
+ * #505 — o TIPO de canal deste gateway. Literal porque `mensagens` guarda só o
+ * `channel_id` da linha, não o tipo, e WhatsApp é o único canal habilitado no
+ * runtime (ARCHITECTURE.md §1). É o rótulo (de vocabulário fechado) das séries
+ * `maia_stream_ingress_*`.
+ */
+const INGRESS_CHANNEL_KIND = 'whatsapp';
+
 async function handleIncoming(
   msg: proto.IWebMessageInfo,
   // [Issue #290] Optional channel_id resolved at the upsert listener. Kept
@@ -1127,11 +1138,17 @@ async function handleIncoming(
     );
   } catch (err) {
     if (!isStreamIdentityUnresolved(err)) throw err;
-    // `resolveIngressStream` já escreveu `stream_ingress_rejected` em
-    // `audit_log` e incrementou as duas séries. Esta linha é o breadcrumb POR
-    // MENSAGEM que o operador usa para achar o evento no provedor — o
-    // `whatsapp_id` é o único identificador estável, já que a row NÃO foi
-    // persistida.
+    // O repositório RECUSOU e não persistiu nada. Aqui é onde a recusa vira
+    // evidência: métrica (`maia_stream_ingress_total{result="rejected"}` +
+    // `maia_stream_ingress_rejected_total{reason}`), `audit_log` e log
+    // estruturado. A observabilidade mora nesta camada — e não no repositório —
+    // porque `src/db/repositories/` é compartilhado com o console `admin-ui`,
+    // que não pode alcançar `src/config/env.js` (issue #596).
+    await reportStreamIngressRejected({
+      reason: err.reason,
+      channel_kind: INGRESS_CHANNEL_KIND,
+      whatsapp_id,
+    });
     logger.warn(
       { whatsapp_id, reason: err.reason },
       'baileys.stream_identity_unresolved_drop',
@@ -1139,6 +1156,20 @@ async function handleIncoming(
     return;
   }
   const { row: stored, duplicate, turn } = ingress;
+  // #505 — o ingresso foi atribuído a uma stream e recebeu sua posição nela.
+  // `duplicate` fica de fora de propósito: uma reentrega NÃO recebe sequência
+  // nova (ela reusa a da row original), então registrá-la aqui contaria a mesma
+  // posição duas vezes na trilha.
+  if (!duplicate && stored.stream_key && stored.ingress_seq !== null) {
+    reportStreamIngressResolved(INGRESS_CHANNEL_KIND);
+    await noteIngressSequenced({
+      stream_key: stored.stream_key,
+      stream_key_version: stored.stream_key_version ?? 0,
+      ingress_seq: Number(stored.ingress_seq),
+      mensagem_id: stored.id,
+      channel_kind: INGRESS_CHANNEL_KIND,
+    });
+  }
   // Handle do turno recém-criado (null quando a flag está OFF). Só transições
   // de ESTADO passam por ele — nenhum dado da mensagem.
   const turnHandle = turn

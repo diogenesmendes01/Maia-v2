@@ -46,22 +46,28 @@ nunca cria turno órfão. Falha de enqueue **não** vira `retryable`: não houve
 tentativa de execução, o turno fica em `received` para o sweep. Ver
 [`runtime.md`](runtime.md) e [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
-**Identidade de stream (#505, fases 1–2: shadow).** `createInbound` é a porta
-ÚNICA por onde um inbound entra no banco, e é onde a `stream_key` é derivada —
-não no `handleIncoming`. A escolha é deliberada: um segundo caminho de ingresso
-escrito amanhã herda a fronteira em vez de precisar lembrar dela. A ordem é
-dedup ⇒ derivação fail-closed ⇒ alocação da `ingress_seq` **dentro** da
-transação do INSERT.
+**Identidade de stream (#505, fases 1–2: shadow).** A DECISÃO mora em
+`createInbound` — a porta ÚNICA por onde um inbound entra no banco — e não no
+`handleIncoming`: um segundo caminho de ingresso escrito amanhã herda a fronteira
+em vez de precisar lembrar dela. A ordem lá é dedup ⇒ guarda fail-closed
+(`requireStreamIdentity`) ⇒ alocação da `ingress_seq` **dentro** da transação do
+INSERT.
 
-O que muda no gateway: `handleIncoming` passa a tratar
-`StreamIdentityUnresolvedError` como mais um desfecho de resolução falha — audita
-(a recusa já virou `stream_ingress_rejected` no repositório), loga
-`baileys.stream_identity_unresolved_drop` com o `whatsapp_id` e **derruba a
-mensagem**, em vez de deixar o erro virar um `baileys.handle_failed` opaco. Nunca
-há queda para stream genérica. Em produção o caso já era fail-closed antes daqui:
-todo ramo não-lançante de `resolveChannel` devolve `channel_id`, e um miss de
-resolução já derruba a mensagem mais acima. A derivação e a semântica completa
-estão em [`runtime.md`](runtime.md#identidade-de-stream-e-sequência-de-ingresso-505-fases-12).
+O RELATO é do gateway, e é aqui que ele fica porque `src/db/repositories/` é
+compartilhado com o console `admin-ui` e não pode alcançar `src/config/env.ts`
+(#596) — a camada de métrica alcança. `handleIncoming` portanto:
+
+| Desfecho | O que o gateway faz |
+|---|---|
+| `StreamIdentityUnresolvedError` | `reportStreamIngressRejected` (duas séries + `stream_ingress_rejected` em `audit_log`), loga `baileys.stream_identity_unresolved_drop` com o `whatsapp_id` e **derruba** — sem virar `baileys.handle_failed` opaco, que perderia o motivo tipado |
+| ingresso novo sequenciado | `reportStreamIngressResolved` + `noteIngressSequenced` (log `stream.ingress_sequenced`; `audit_log` só no NASCIMENTO da stream) |
+| reentrega (`duplicate`) | nada — a reentrega reusa a sequência da row original, e registrá-la contaria a mesma posição duas vezes |
+
+Nunca há queda para stream genérica. Em produção o caso irresolúvel já era
+fail-closed antes daqui: todo ramo não-lançante de `resolveChannel` devolve
+`channel_id`, e um miss de resolução já derruba a mensagem mais acima. A
+derivação e a semântica completa estão em
+[`runtime.md`](runtime.md#identidade-de-stream-e-sequência-de-ingresso-505-fases-12).
 
 **`jobId` determinístico (#504).** Quando o produtor conhece o turno, ele passa
 `turn_id` a `enqueueAgent`, que deriva `jobId = turn-<uuid>`

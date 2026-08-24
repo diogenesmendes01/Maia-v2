@@ -32,17 +32,24 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { getTableName, is, Param, SQL, StringChunk, Table } from 'drizzle-orm';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
-const auditMock = vi.fn().mockResolvedValue(undefined);
-const counterMock = vi.fn();
-
-vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
-vi.mock('@/observability/metrics.js', async (orig) => {
-  const real = (await orig()) as Record<string, unknown>;
-  return { ...real, counter: counterMock };
+// A flag é lida por `contractEnv` — o leitor sancionado para módulos
+// COMPARTILHADOS entre o container `app` e o console (#596). Mockar
+// `@/config/env.js` aqui não teria efeito: o repositório não o importa, e
+// `tests/unit/config/admin-import-boundary.spec.ts` existe para que continue
+// assim.
+vi.mock('@/config/contract-env.js', async (orig) => {
+  const real = (await orig()) as { contractEnv: Record<string, unknown> };
+  // Só a flag é forçada; o resto do contrato continua o real, porque
+  // `src/lib/logger.ts` lê `LOG_LEVEL` do mesmo objeto e um mock magro o
+  // derruba com `default level:undefined must be included in custom levels`.
+  return {
+    ...real,
+    contractEnv: new Proxy(real.contractEnv, {
+      get: (alvo, chave) =>
+        chave === 'FEATURE_TURN_STREAM_KEY' ? true : Reflect.get(alvo, chave),
+    }),
+  };
 });
-vi.mock('@/config/env.js', () => ({
-  config: { FEATURE_TURN_STREAM_KEY: true, FEATURE_TURN_STATE_MACHINE: false },
-}));
 
 /** Tudo o que a produção mandou o banco fazer, em ordem. */
 type Operacao =
@@ -183,32 +190,20 @@ beforeEach(() => {
   operacoes.length = 0;
   dedupRows = [];
   proximaSeq = 1;
-  auditMock.mockClear();
-  counterMock.mockClear();
 });
 
 describe('#505 — createInbound recusa identidade irresolúvel (call site real)', () => {
-  it('sem channel_id: lança, NÃO persiste, audita e mede', async () => {
+  it('sem channel_id: lança e NÃO persiste — nem a mensagem, nem a sequência', async () => {
     await expect(
       runWithTenantContext(ESCOPO, () =>
         mensagensRepo.createInbound(inbound({ channel_id: null })),
       ),
     ).rejects.toMatchObject({ code: 'STREAM_IDENTITY_UNRESOLVED', reason: 'missing_channel' });
 
-    // A METADE QUE IMPORTA: nada foi escrito.
+    // A METADE QUE IMPORTA: nada foi escrito. Um `throw` depois do INSERT seria
+    // fail-open com log bonito.
     expect(inserts('mensagens')).toHaveLength(0);
     expect(upserts()).toHaveLength(0);
-
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        acao: 'stream_ingress_rejected',
-        metadata: expect.objectContaining({ reason: 'missing_channel' }),
-      }),
-    );
-    expect(counterMock).toHaveBeenCalledWith(
-      'maia_stream_ingress_rejected_total',
-      expect.objectContaining({ reason: 'missing_channel' }),
-    );
   });
 
   it('sem identidade remota: lança e não persiste', async () => {
@@ -231,14 +226,6 @@ describe('#505 — createInbound recusa identidade irresolúvel (call site real)
     expect(inserts('mensagens')).toHaveLength(0);
   });
 
-  it('nenhuma métrica desta fronteira carrega stream_key, telefone ou jid como LABEL', async () => {
-    await runWithTenantContext(ESCOPO, () => mensagensRepo.createInbound(inbound()));
-    for (const [, labels] of counterMock.mock.calls) {
-      for (const chave of Object.keys((labels ?? {}) as Record<string, unknown>)) {
-        expect(['stream_key', 'remote_jid', 'jid', 'telefone', 'turn_id']).not.toContain(chave);
-      }
-    }
-  });
 });
 
 describe('#505 — createInbound sequencia o ingresso resolvido', () => {

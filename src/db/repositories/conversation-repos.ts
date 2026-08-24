@@ -18,22 +18,20 @@ import type { AgentTurn, Conversa, Mensagem, PendingQuestion } from '../schema.j
 // Issue #503 — ingresso atômico (mensagem + turno na mesma transação). Import
 // unidirecional: `turn-repos` NÃO importa este módulo, então não há ciclo.
 import { agentTurnsRepo } from './turn-repos.js';
-// Issue #505 — a fronteira fail-closed da identidade de stream.
+// Issue #505 — a guarda FAIL-CLOSED da identidade de stream.
 //
-// ATENÇÃO: este import FECHA UM CICLO — `repositories -> stream-ingress ->
-// governance/audit -> repositories`. Ele é seguro porque `audit()` só toca
-// `auditRepo` em TEMPO DE CHAMADA, nunca na avaliação do módulo, e ESM resolve
-// ciclos por live binding. O risco real não é um crash: é que `audit()` engole a
-// própria falha de escrita num `catch`, então um `auditRepo` ainda em TDZ
-// apareceria como recusa "silenciosamente não auditada". Por isso
-// `tests/integration/stream-ingress-sequence-real-db.spec.ts` afirma a LINHA em
-// `audit_log`, contra o grafo real, e não só o mock.
-import { config } from '@/config/env.js';
-import {
-  noteIngressSequenced,
-  resolveIngressStream,
-} from '@/runtime/turns/stream-ingress.js';
-import type { StreamKeyInput } from '@/runtime/turns/stream-key.js';
+// `requireStreamIdentity` é PURO (só `node:crypto`), e isso é estrutural, não
+// estilístico: este arquivo é COMPARTILHADO entre o container `app` e o console
+// `admin-ui`, e `tests/unit/config/admin-import-boundary.spec.ts` proíbe que ele
+// alcance `src/config/env.ts` — alcançá-lo faria o console validar o subset
+// `runtime` no boot e exigir dele as seis `BACKUP_*` num processo que nunca roda
+// backup (issue #596). Pela mesma razão a flag é lida por `contractEnv` (uma
+// variável, sob demanda, sem validar subset de ninguém) e a OBSERVABILIDADE da
+// recusa — métrica, `audit_log`, log — mora no gateway, em
+// `src/runtime/turns/stream-ingress.ts`.
+import { contractEnv } from '@/config/contract-env.js';
+import { requireStreamIdentity } from '@/runtime/turns/stream-key.js';
+import type { ResolvedStream, StreamKeyInput } from '@/runtime/turns/stream-key.js';
 
 export const conversasRepo = {
   /**
@@ -367,15 +365,20 @@ export const conversasRepo = {
  * Literal e não derivado porque `mensagens` não guarda o TIPO do canal, só o
  * `channel_id` da linha, e WhatsApp é o único canal habilitado no runtime
  * (ARCHITECTURE.md §1). Quando um segundo canal entrar, este valor passa a vir
- * de `channels.tipo` — e a assinatura de `resolveIngressStream` já o exige como
+ * de `channels.tipo` — e a assinatura de `requireStreamIdentity` já o exige como
  * componente, então a mudança é uma linha aqui, não uma reescrita do material
  * canônico.
  */
 const INGRESS_CHANNEL_KIND = 'whatsapp';
 
-/** O protocolo de stream (#505, shadow) está ligado? */
+/**
+ * O protocolo de stream (#505, shadow) está ligado?
+ *
+ * Lido por `contractEnv` (o MESMO schema do contrato, uma variável, na LEITURA)
+ * e não por `config` de `@/config/env.js` — ver o bloco de imports.
+ */
 function streamShadowEnabled(): boolean {
-  return config.FEATURE_TURN_STREAM_KEY;
+  return contractEnv.FEATURE_TURN_STREAM_KEY;
 }
 
 /**
@@ -410,7 +413,7 @@ function streamInputFor(input: MensagemInsertInput): StreamKeyInput {
 // resolvido DEVEM passá-lo (dedup por canal); legado/proativo sem canal grava
 // NULL (coberto pela partial unique legada por tenant+agent).
 // #505 — as três colunas de stream saem do INPUT de propósito. Elas são
-// DERIVADAS aqui dentro (`streamInputFor` + `resolveIngressStream` + a alocação
+// DERIVADAS aqui dentro (`streamInputFor` + `requireStreamIdentity` + a alocação
 // transacional) e nunca fornecidas pelo chamador: um caller capaz de passar
 // `stream_key` seria um caller capaz de escolher a fila de outra conversa, e a
 // própria assinatura é o que torna isso inexprimível.
@@ -454,9 +457,11 @@ export const mensagensRepo = {
    *   1. pre-check de duplicata por `whatsapp_id` — uma reentrega comum devolve
    *      a row original, COM a sequência que ela já tinha, sem abrir transação
    *      e sem tocar o contador;
-   *   2. resolução FAIL-CLOSED da stream (`resolveIngressStream`) — identidade
-   *      irresolúvel lança `StreamIdentityUnresolvedError`, auditada, e o
-   *      inbound NÃO é persistido. Nunca cai em stream genérica;
+   *   2. resolução FAIL-CLOSED da stream (`requireStreamIdentity`) — identidade
+   *      irresolúvel lança `StreamIdentityUnresolvedError` e o inbound NÃO é
+   *      persistido. Nunca cai em stream genérica. Quem MEDE e AUDITA a recusa
+   *      é o gateway, no `catch` — o repositório é compartilhado com o console
+   *      e não pode importar a camada de métrica (issue #596);
    *   3. alocação da sequência DENTRO da mesma transação do INSERT, para que a
    *      corrida que escapou do pre-check aborte as duas coisas juntas.
    *
@@ -481,10 +486,12 @@ export const mensagensRepo = {
     const preExisting = await findExisting();
     if (preExisting) return { row: preExisting, duplicate: true };
 
-    // #505 — FAIL-CLOSED. Lança `StreamIdentityUnresolvedError` (já auditada)
-    // quando a identidade não é derivável; nunca devolve stream genérica.
-    const stream = streamShadowEnabled()
-      ? await resolveIngressStream(streamInputFor(input))
+    // #505 — FAIL-CLOSED. Lança `StreamIdentityUnresolvedError` quando a
+    // identidade não é derivável; nunca devolve stream genérica. A recusa
+    // acontece AQUI, antes de qualquer escrita — quem a MEDE e AUDITA é o
+    // gateway, no `catch` (ver `src/runtime/turns/stream-ingress.ts`).
+    const stream: ResolvedStream | null = streamShadowEnabled()
+      ? requireStreamIdentity(streamInputFor(input))
       : null;
 
     try {
@@ -494,14 +501,6 @@ export const mensagensRepo = {
           channel_id: input.channel_id ?? null,
           stream,
         });
-        if (stream && created.ingress_seq !== null) {
-          await noteIngressSequenced({
-            ...stream,
-            ingress_seq: created.ingress_seq,
-            mensagem_id: created.mensagem.id,
-            channel_kind: INGRESS_CHANNEL_KIND,
-          });
-        }
         return { row: created.mensagem, duplicate: false, turn: created.turn };
       }
       if (stream) {
@@ -512,12 +511,6 @@ export const mensagensRepo = {
           mensagem: { ...input, channel_id: input.channel_id ?? null },
           channel_id: input.channel_id ?? null,
           stream,
-        });
-        await noteIngressSequenced({
-          ...stream,
-          ingress_seq: created.ingress_seq,
-          mensagem_id: created.mensagem.id,
-          channel_kind: INGRESS_CHANNEL_KIND,
         });
         return { row: created.mensagem, duplicate: false };
       }
