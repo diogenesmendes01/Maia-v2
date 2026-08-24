@@ -124,6 +124,8 @@ SELECT id, tenant_id, export_expires_at
  ORDER BY export_expires_at ASC;
 
 -- Passes que começaram e nunca terminaram (processo morto no meio).
+-- O claim é gravado DEPOIS do guarda, então uma recusa NÃO aparece aqui — este
+-- predicado é só sobre "estávamos prestes a remover e não voltamos".
 -- A execução seguinte retoma sozinha; uma linha ANTIGA aqui é sinal de que o
 -- varredor parou de rodar.
 SELECT id, export_purge_started_at

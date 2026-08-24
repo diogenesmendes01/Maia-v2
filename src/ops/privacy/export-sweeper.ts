@@ -398,8 +398,6 @@ async function sweepOne(
   options: ExportSweepOptions,
   outcome: ExportSweepOutcome,
 ): Promise<void> {
-  await ports.claim(candidate.request_id, ports.now());
-
   // O quarto eixo: o locator ainda é DESTE pedido? Entre planejar e apagar a
   // linha pode ter mudado, e apagar o arquivo do plano destruiria um artefato
   // vivo enquanto o pedido acha que ele existe.
@@ -419,6 +417,15 @@ async function sweepOne(
     candidate.locator,
     ports.probe,
   );
+
+  // O claim vem DEPOIS do guarda, e isso importa para o diagnóstico. Ele
+  // significa "estávamos prestes a remover", não "olhamos para este pedido".
+  // Marcado antes, um locator RECUSADO deixaria `export_purge_started_at`
+  // preenchido para sempre, e a consulta de plantão "algum passe começou e
+  // nunca terminou?" — que existe para achar processo morto no meio —
+  // devolveria também toda recusa, que é um diagnóstico completamente
+  // diferente e já tem auditoria própria.
+  await ports.claim(candidate.request_id, ports.now());
 
   if (proven.present) {
     await ports.remove(proven.path);

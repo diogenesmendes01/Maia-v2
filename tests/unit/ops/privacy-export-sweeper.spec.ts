@@ -300,6 +300,14 @@ describe('runExportSweep — o guarda ANTES da remoção', () => {
     ]);
     // E o pedido NÃO é marcado como varrido — nada foi removido.
     expect(w.rows.get('req-1')?.purged_at).toBeNull();
+    /**
+     * Nem como "em varredura". O claim vem DEPOIS do guarda de propósito: ele
+     * significa "estávamos prestes a remover". Marcado antes, toda recusa
+     * apareceria na consulta de plantão que existe para achar processo morto
+     * no meio de um passe — dois diagnósticos opostos no mesmo predicado.
+     */
+    expect(w.rows.get('req-1')?.purge_started_at).toBeNull();
+    expect(w.ports.claim).not.toHaveBeenCalled();
   });
 
   it('um symlink no lugar do artefato NÃO ALCANÇA a remoção', async () => {
