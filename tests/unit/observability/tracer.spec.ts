@@ -286,8 +286,20 @@ describe('issue #535 — tracer', () => {
       // a real turn opens it is `tests/integration/context-load-span-hot-path.spec.ts`,
       // which enters through `runAgentForMensagem` — this list is the
       // bookkeeping, that spec is the evidence.
+      //
+      // `llm.request` joined under the same rule: its emitter is `emitUsage`
+      // (`src/lib/llm/telemetry.ts`), the point EVERY terminal path of
+      // `executeLLM` already passes through, and
+      // `tests/unit/observability/llm-request-span.spec.ts` drives the real
+      // `executeLLM` — not a stand-in — to prove a turn's model call opens it.
       expect([...EMITTED_SPANS].sort()).toEqual(
-        [SPAN.CONTEXT_LOAD, SPAN.QUEUE_WAIT, SPAN.TOOL_DISPATCH, SPAN.TURN].sort(),
+        [
+          SPAN.CONTEXT_LOAD,
+          SPAN.LLM_REQUEST,
+          SPAN.QUEUE_WAIT,
+          SPAN.TOOL_DISPATCH,
+          SPAN.TURN,
+        ].sort(),
       );
     });
 

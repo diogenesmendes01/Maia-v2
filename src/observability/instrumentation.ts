@@ -26,14 +26,22 @@
  * participant.
  */
 import { counter, histogram } from './metrics.js';
-import { METRIC, SPAN, type ContextLoadStage } from './taxonomy.js';
-import { withSpan } from './tracer.js';
+import { METRIC, SPAN, type ContextLoadStage, type SpanStatus } from './taxonomy.js';
+import { recordElapsedSpan, withSpan } from './tracer.js';
 import type { SpanAttributes } from './span-attributes.js';
 import {
   TOOL_FAILURE_CODES,
   TOOL_INVALID_CODES,
   TOOL_REFUSAL_CODES,
 } from '@/tools/_dispatch-error-codes.js';
+/**
+ * TYPE-ONLY, and that direction is deliberate: `src/lib/llm/telemetry.ts`
+ * imports this module at runtime, so a value import back would be an ESM
+ * cycle. Erased at compile time, it costs nothing and buys the exhaustiveness
+ * check on `SPAN_STATUS_BY_LLM_STATUS` — the producer owns the vocabulary and
+ * observability imports it, exactly as `_dispatch-error-codes.ts` above.
+ */
+import type { LLMCallStatus } from '@/lib/llm/telemetry.js';
 
 /**
  * Outcome vocabulary for a tool dispatch. Bounded and enumerated — a tool's
@@ -171,4 +179,112 @@ export async function instrumentContextLoad<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   return withSpan(SPAN.CONTEXT_LOAD, fn, { attributes: { stage } });
+}
+
+/**
+ * Record the span `llm.request` for one FINISHED LLM gateway call.
+ *
+ * ## Why this is `recordElapsedSpan` and not `withSpan`
+ *
+ * `executeLLM` (`src/lib/llm/gateway.ts`) has six terminal paths — missing
+ * tenant context, missing API key, an open circuit, retry exhaustion, fallback
+ * exhaustion, success — and each one is its own `return` or `throw`. Wrapping
+ * its body would mean restructuring the one function on the critical path of
+ * every turn in order to hang an observation off it, and a wrapper a seventh
+ * exit can later bypass is a coverage claim with a hole in it.
+ *
+ * `emitUsage` already solved that problem for metrics: issue #508 collapsed
+ * every outcome onto ONE emission point precisely because per-path emission
+ * had left error, timeout, rate limit and cancellation counting nothing while
+ * the runbook documented them. Binding the span to the same point makes "one
+ * span per LLM request, on every outcome" structural — the span cannot drift
+ * away from `maia_llm_requests_total`, because the same call emits both.
+ *
+ * The window is RECONSTRUCTED rather than measured live: `duration_ms` is the
+ * gateway's own measurement and is what the histogram publishes, so the span
+ * and `maia_llm_request_duration_ms` cannot disagree about how long the call
+ * took. Same mechanism, and same reason, as `queue.wait`.
+ *
+ * ## Span ONLY — deliberately no metric family
+ *
+ * Same rule as `instrumentContextLoad`: `emitUsage` already publishes
+ * `maia_llm_requests_total`, `maia_llm_request_duration_ms` and
+ * `maia_llm_tokens_total` over this exact call. A second family measuring one
+ * operation is the drift the taxonomy exists to prevent, and it is also the
+ * only way this change could add cardinality — it does not. What the span adds
+ * is POSITION: the model call next to the queue wait, the context load and the
+ * tool dispatches of the same turn, in one waterfall.
+ *
+ * ## Status mapping
+ *
+ * `SpanStatus` has five members and `LLMCallStatus` seven, so two collapse —
+ * along the line the runbook already draws between "the platform broke" and
+ * "a control refused":
+ *
+ *   - `budget_exhausted` and `circuit_open` → `blocked`. WE refused: a quota
+ *     ceiling, and the breaker. Rendering them `error` would put the
+ *     protection working into the same bucket as the provider failing, which
+ *     is the exact confusion `status="circuit_open"` was split out to prevent
+ *     (#534). It is the same line `classifyToolResult` draws above.
+ *   - `rate_limit` → `error`. THEY refused. The call did not happen and the
+ *     turn ate it, which is a failure of the call however polite the 429 was.
+ *
+ * Nothing is lost: the verbatim seven-value vocabulary rides on the `result`
+ * attribute. It cannot ride on `status` — `tracer.ts::emit` stamps the span's
+ * own `SpanStatus` there last, and it wins on purpose so a span's `status`
+ * attribute always equals its OTLP status code.
+ *
+ * The map is a TOTAL `Record`, so adding a member to `LLMCallStatus` without
+ * deciding what it means for a trace fails `npm run typecheck`. That is the
+ * closure; a review convention would not survive the next status.
+ */
+const SPAN_STATUS_BY_LLM_STATUS: Readonly<Record<LLMCallStatus, SpanStatus>> =
+  Object.freeze({
+    ok: 'ok',
+    error: 'error',
+    timeout: 'timeout',
+    rate_limit: 'error',
+    cancelled: 'cancelled',
+    budget_exhausted: 'blocked',
+    circuit_open: 'blocked',
+  });
+
+export interface LlmRequestSpanInput {
+  /** The gateway's own measurement of the call, in ms. */
+  duration_ms: number;
+  status: LLMCallStatus;
+  provider: string;
+  model: string;
+  tier: string;
+  workload: string;
+  /** Provider attempts this call consumed (`0` when it never reached one). */
+  attempts: number;
+  /** Instant the call was observed to have finished (epoch ms). */
+  observed_at_ms: number;
+}
+
+export function recordLlmRequestSpan(input: LlmRequestSpanInput): void {
+  const end = input.observed_at_ms;
+  const duration = Number.isFinite(input.duration_ms)
+    ? Math.max(0, input.duration_ms)
+    : 0;
+  recordElapsedSpan(
+    SPAN.LLM_REQUEST,
+    end - duration,
+    end,
+    {
+      provider: input.provider,
+      model: input.model,
+      tier: input.tier,
+      workload: input.workload,
+      // The verbatim gateway vocabulary — see the status-mapping note above.
+      result: input.status,
+      // `attempt_count`, never `attempt`: `attempt` is the TURN's retry index
+      // and `correlationAttributes()` stamps it on every span. Reusing the key
+      // here would overwrite it and make a retried turn unjoinable in the
+      // collector.
+      attempt_count: input.attempts,
+    },
+    SPAN_STATUS_BY_LLM_STATUS[input.status],
+  );
 }

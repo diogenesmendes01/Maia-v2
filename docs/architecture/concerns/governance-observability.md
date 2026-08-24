@@ -362,6 +362,7 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/unit/observability/otlp-exporter.spec.ts` | OTLP wire contract + bounded/counted loss |
 | `tests/unit/observability/runtime-collectors.spec.ts` | pool/session/scheduler gauges render NaN, never a healthy 0 |
 | `tests/unit/observability/instrumentation.spec.ts` | Returned `{error}` is classified, not counted as success |
+| `tests/unit/observability/llm-request-span.spec.ts` | `llm.request` reaches the OTLP wire from the real `executeLLM`, on every outcome |
 | `tests/unit/observability/dashboards.spec.ts` | Dashboards ↔ emitted metrics / recording rules drift guard |
 | `tests/unit/observability/overhead-benchmark.spec.ts` | Per-emission cost + cardinality budget actually bounds series |
 | `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
@@ -388,10 +389,21 @@ Issue #514 landed the foundation; issue #535 landed the exporter, four of the
 five missing metric families and the dashboards. Still open — do **not** assume
 coverage that does not exist:
 
-- **Span emission is partial.** `turn`, `queue.wait`, `tool.dispatch` and
-  `context.load` have emitters production reaches; the other 19 taxonomy
-  entries are marked `declared` in `SPAN_EMISSION` and produce nothing. The
-  marking is test-enforced, so this list cannot silently go stale.
+- **Span emission is partial.** `turn`, `queue.wait`, `tool.dispatch`,
+  `context.load` and `llm.request` have emitters production reaches; the other
+  18 taxonomy entries are marked `declared` in `SPAN_EMISSION` and produce
+  nothing. The marking is test-enforced, so this list cannot silently go stale.
+- **`llm.request` is emitted from `emitUsage`, not from `executeLLM`.** The
+  gateway has six terminal paths and issue #508 already collapsed all of them
+  onto one telemetry emission point precisely because per-path emission had let
+  error, timeout, rate limit and cancellation count nothing. Binding the span
+  there makes "one span per LLM request, on every outcome" structural rather
+  than a convention a seventh exit could bypass, and the span window is
+  reconstructed from the gateway's own `duration_ms` so it cannot disagree with
+  `maia_llm_request_duration_ms`. Like `context.load`, it adds NO metric family:
+  `emitUsage` already publishes calls, duration and tokens for the same call,
+  so this change adds zero label cardinality. `tests/unit/observability/llm-request-span.spec.ts`
+  drives the real `executeLLM` and scrapes the OTLP body the exporter POSTs.
 - **`context.load` carries no metric family of its own — by decision.** The
   span is emitted by `loadTurnContext` (`src/agent/turn-context/loader.ts`),
   wrapped at the exported entry point so "once per turn-context load" is
@@ -415,7 +427,10 @@ coverage that does not exist:
 - **Runtime trace on the hot path is gated OFF** (`FEATURE_RUNTIME_TRACE_V1`)
   pending the canary rollout in `docs/runbooks/observability-slo.md`.
 - **Not yet instrumented**: outbound send duration (`maia_outbound_send_ms`),
-  ingress normalize/persist, identity/audience resolution.
+  ingress normalize/persist, identity/audience resolution, the ReAct iteration
+  boundary (`react.iteration` — so `llm.request` and `tool.dispatch` currently
+  attach to `turn` and a multi-iteration turn shows a flat list of model calls
+  and tool calls rather than one group per iteration).
 - **The overhead benchmark is micro, not under load.** Real cardinality under
   production traffic is still unmeasured; the budget is proven to BOUND the
   series count, not sized against observed traffic.
