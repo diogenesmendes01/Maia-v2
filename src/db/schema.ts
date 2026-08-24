@@ -874,6 +874,47 @@ export const outbound_messages = pgTable(
     error: text('error'),
     sent_at: timestamp('sent_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+
+    // ---------------------------------------------------------------
+    // Issue #630 (fatia A de #506) — evolução para OUTBOX DURÁVEL.
+    // Migração 121. Todas as colunas abaixo são NULLABLE porque a row
+    // LEGADA (anterior ao outbox) não as tem; o CHECK
+    // `outbound_messages_durable_row_complete_check` é que exige o tuplo
+    // INTEIRO quando `turn_id IS NOT NULL`. Ou seja: "nullable no tipo,
+    // obrigatório na row nova" — a nulabilidade serve à coexistência com o
+    // legado, nunca a um fallback.
+    // O vocabulário (payload types, status, delivery outcomes) vive em
+    // src/runtime/outbound/contract.ts; aqui só a forma da tabela.
+    // ---------------------------------------------------------------
+    /** Turno dono da saída (#503). FK COMPOSTA (tenant, agent, turn_id) na 121. */
+    turn_id: uuid('turn_id'),
+    /** Posição da saída no turno (0-based). Eixo de ordenação do multipart (#635). */
+    sequence_in_turn: integer('sequence_in_turn'),
+    /** Versão da união Zod + da serialização canônica (OUTBOUND_PAYLOAD_VERSION). */
+    payload_version: integer('payload_version'),
+    /** Discriminante da união. Sem `image`/`video`: LineOutput não tem primitiva. */
+    payload_type: text('payload_type'),
+    /** Payload validado. Mídia por REFERÊNCIA — o contrato TS não tem variante que aceite URL. */
+    payload_json: jsonb('payload_json'),
+    /** sha256 hex da serialização canônica versionada. Entra na derivação das duas chaves. */
+    payload_hash: text('payload_hash'),
+    /** Identidade da saída lógica DENTRO da Maia. UNIQUE parcial por (tenant, agent, key). */
+    logical_dedupe_key: text('logical_dedupe_key'),
+    /** Chave estável entregue ao ADAPTADOR. Mesmo material, domínio de hash DIFERENTE. */
+    provider_idempotency_key: text('provider_idempotency_key'),
+    /** Tentativas de entrega. MUTÁVEL — por isso nunca entra na derivação das chaves. */
+    attempt: integer('attempt').notNull().default(0),
+    claimed_by: text('claimed_by'),
+    /** Token de FENCING do delivery worker (#632). Mesmo vocabulário de agent_turns. */
+    claim_token: uuid('claim_token'),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    /** Gate de backoff. Relógio do BANCO (now()), nunca do processo. */
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }),
+    provider_timestamp: timestamp('provider_timestamp', { withTimezone: true }),
+    /** Código de baixa cardinalidade e sanitizado (≤64 chars por CHECK). */
+    last_error_code: text('last_error_code'),
+    /** Resultado NORMALIZADO do provedor: separa "aceitou" de "usuário recebeu". */
+    delivery_outcome: text('delivery_outcome'),
   },
   (t) => ({
     byTenantCreated: index('idx_outbound_messages_tenant_created').on(
@@ -900,6 +941,29 @@ export const outbound_messages = pgTable(
       t.agent_id,
       t.idempotency_key,
     ),
+    // #630 — identidade lógica da saída. UNIQUE PARCIAL de propósito: o
+    // predicado `IS NOT NULL` é o que torna a criação do índice IMUNE a
+    // duplicata histórica (nenhuma row legada satisfaz o predicado, logo
+    // nenhuma entra no índice, logo nenhuma pode colidir). Ver o bloco
+    // "O RISCO DECLARADO NA MÃE" no topo da migração 121.
+    logicalDedupeUq: uniqueIndex('outbound_messages_logical_dedupe_uq')
+      .on(t.tenant_id, t.agent_id, t.logical_dedupe_key)
+      .where(sql`logical_dedupe_key IS NOT NULL`),
+    // #630 — rede INDEPENDENTE da anterior: aquela impede "mesmo conteúdo
+    // duas vezes"; esta impede "mesma posição do turno com conteúdo
+    // diferente", que a outra deixaria passar (payload_hash entra na
+    // derivação, então conteúdo diferente gera chave diferente).
+    turnSequenceUq: uniqueIndex('outbound_messages_turn_sequence_uq')
+      .on(t.tenant_id, t.agent_id, t.turn_id, t.sequence_in_turn)
+      .where(sql`turn_id IS NOT NULL`),
+    // #630 — seleção do delivery worker (#632). O status vai no PREDICADO
+    // parcial e não na chave: são exatamente dois valores, então o índice
+    // fica menor e não indexa row terminal (a maioria, sob retenção de 30d).
+    // A lista espelha OUTBOUND_SELECTABLE_STATUSES em
+    // src/runtime/outbound/contract.ts.
+    readyIdx: index('idx_outbound_messages_ready')
+      .on(t.tenant_id, t.agent_id, t.next_attempt_at)
+      .where(sql`status IN ('pending', 'retryable')`),
   }),
 );
 
