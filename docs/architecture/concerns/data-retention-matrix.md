@@ -55,7 +55,7 @@ The default is deliberately "do not delete". Deletion is irreversible, so the fa
 | `gateway.baileys_session` | platform_ops | secret | tenant | **not purgeable** | **excluded (secret)** | no |
 | `queue.redis` | platform_ops | internal | system | delete | **excluded (rebuildable)** | no |
 | `backup.artifact` | platform_ops | sensitive personal | system | delete | in dump | yes |
-| `privacy.export` | security | sensitive personal | tenant+agent | delete | **excluded (volume)** | no |
+| `privacy.export` | security | sensitive personal | tenant+agent | delete | **excluded (volume)** | **yes** |
 | `privacy.tombstone` | security | internal | tenant+agent | **not purgeable** | in dump | no |
 
 ### Data outside PostgreSQL (issue §14)
@@ -81,8 +81,20 @@ Each of these is carried in code as `DataClass.dpo_open_question` and is printed
 | `gateway.baileys_session` | None for privacy; the security owner must approve re-pair vs encrypted backup. |
 | `queue.redis` | None — ops owns the TTLs. |
 | `backup.artifact` | Local vs off-site retention, and the maximum window during which a deleted subject may still exist inside a retained artifact. |
-| `privacy.export` | Export package lifetime before it must expire. |
+| `privacy.export` | ~~Export package lifetime before it must expire.~~ **INITIAL POLICY SET — seven days, awaiting DPO confirmation.** See below. |
 | `privacy.tombstone` | ~~The MINIMUM tombstone retention.~~ **ANSWERED — technical, not legal.** See below. |
+
+### `privacy.export` — an initial policy, and a mechanism that enforces it (issue #536)
+
+**Decided by the platform owner, pending DPO confirmation: seven days.** This is the one period in this document that is set, and it is set as an INITIAL POLICY rather than a legal conclusion — the DPO may replace the number, and the number lives in configuration (`PRIVACY_EXPORT_TTL_DAYS`) precisely so that replacing it is an environment change and not a code change.
+
+Why this class could be decided ahead of the others: the conservative direction here is the **opposite** of every other class. For erasure, erring toward a longer period is recoverable; for an encrypted package containing a subject's consolidated data sitting on disk, erring toward a *shorter* period is the recoverable side. Keeping it longer is the risk, not the safety.
+
+**The mechanism is now live, and that is the substantive change.** Before this, `privacy_requests.export_expires_at` was a stamp with no executor: the deadline existed in the database and the `.enc` stayed on disk forever. `privacy_export_sweep` (hourly) now removes the expired artifact, audits every removal (`privacy_export_purged`), refuses and audits any locator it cannot prove (`privacy_export_purge_refused`), and marks the request so a reader sees `purged` instead of a locator pointing at a file that no longer exists. Runbook: [`docs/runbooks/privacy-export-ttl.md`](../../runbooks/privacy-export-ttl.md).
+
+**`legal_hold_applicable` moved from `no` to `yes` for this class.** The old value was written when nothing deleted the artifact, so the question had no consequence. Now that the class is destructible, an active hold on the subject freezes the package: the copy handed to a subject is responsive material exactly as much as the rows it was built from. **Operational consequence the DPO should know about:** an open-ended hold keeps that subject's `.enc` on disk indefinitely. That is the recoverable direction, but a forgotten hold becomes an eternal artifact — the runbook carries the query that lists them.
+
+**Still open, and deliberately separate:** whether a *deletion* request from one subject should also destroy the export artifacts of that same subject. That is a different question from the TTL, and `privacy.export` remains in `UNSUPPORTED_CLASSES` until it is answered.
 
 ### `privacy.tombstone` — answered (issue #536)
 
@@ -127,6 +139,6 @@ The ledger stores **pseudonyms** (keyed HMAC), never raw identifiers — a tombs
 
 | | |
 |---|---|
-| Last updated | 2026-08-24 (issue #536 — subject-request execution, encrypted export, tombstone re-application job, and the `privacy.tombstone` question answered on technical grounds; **no legal period was decided**) |
+| Last updated | 2026-08-24 (issue #536 — subject-request execution, encrypted export, tombstone re-application job, the `privacy.tombstone` question answered on technical grounds, and the `privacy.export` TTL given an **initial policy of seven days with a live executor**, pending DPO confirmation; **no other period was decided**) |
 | Approved by legal/DPO | **No — draft** |
 | Re-review when | A class is added, a period is approved, or the media/Redis decisions land |
