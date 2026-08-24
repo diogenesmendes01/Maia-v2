@@ -298,6 +298,35 @@ describe('#525 turn round-trips, counted as SQL statements', () => {
     expect(system).toContain('## Escopo desta conversa');
   });
 
+  /**
+   * AGENTS.md §4.1/§4.2, checked in the compiled SQL rather than in a mock.
+   *
+   * `npm run test:leak` proves isolation by ASKING a repository for another
+   * tenant's ids against a real Postgres — the right test, and it needs a
+   * database, so it does not run in the unit lane. This is the complementary
+   * cheap check: the turn's read set is fully materialised here as SQL text, so
+   * a read that simply forgot its `tenant_id`/`agent_id` predicate is visible
+   * without any database at all. It cannot replace the integration suite (it
+   * says nothing about whether the predicate binds the RIGHT value), but it
+   * fails in the unit lane, on every push, the moment a turn read is added
+   * without scoping.
+   */
+  it('every statement of the turn is scoped by tenant_id AND agent_id', async () => {
+    await measureTurn(1);
+    expect(h.statements).toHaveLength(13);
+
+    const unscoped = h.statements
+      .map((s) => ({
+        table: /\bfrom\s+"?([a-z_]+)"?/i.exec(s)?.[1] ?? '<unparsed>',
+        tenant: /tenant_id"?\s*=/i.test(s),
+        agent: /agent_id"?\s*=/i.test(s),
+      }))
+      .filter((s) => !s.tenant || !s.agent)
+      .map((s) => s.table);
+
+    expect(unscoped).toEqual([]);
+  });
+
   it('the ≤8 target of #525 is still open, and the gap is honest', async () => {
     const { TURN_ROUND_TRIP_BUDGET, TURN_ROUND_TRIP_TARGET } = await import(
       '../../src/agent/turn-context/types.js'
