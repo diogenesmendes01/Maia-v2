@@ -57,6 +57,12 @@ export async function runPrivacyRequestJob(
   requestId: string,
   identifier: SubjectIdentifier,
 ): Promise<PrivacyJobOutcome> {
+  // A ÚNICA leitura fora do escopo do tenant, e por necessidade: o operador
+  // traz um id de pedido opaco, e é a própria linha que diz a que tenant ele
+  // pertence. Não há como abrir o contexto do tenant antes de descobrir qual
+  // é. A busca é por chave primária (não enumera nada) e devolve só as colunas
+  // de controle — nenhum dado de titular. Todo o resto da execução, incluindo
+  // cada `audit()`, roda dentro do `runWithTenantContext` do tenant resolvido.
   const row = await runWithSystemContext(() => readPrivacyRequest(requestId));
   if (row === null) return { status: 'not_found' };
 

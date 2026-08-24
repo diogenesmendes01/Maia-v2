@@ -392,6 +392,8 @@ npm run privacy:execute -- --request=<uuid> --person-id=<uuid>
 
 O identificador vem de **você**, não do banco: `privacy_requests.subject_ref` é um HMAC de mão única — o banco *reconhece* o titular, nunca o enumera. O executor deriva o `subject_ref` do que você digitou e **recusa** se não bater com a linha. Sem essa conferência, um erro de digitação executaria uma exclusão irreversível em nome de outra pessoa.
 
+> **Prefira `--person-id`.** Um argumento de linha de comando fica no histórico do shell e é visível em `ps` para qualquer usuário do host enquanto o comando roda. `--person-id` é um UUID e não é dado pessoal; `--phone` é. Os dois resolvem o mesmo titular (o resolvedor deriva as duas formas). Se precisar mesmo do telefone, use `HISTCONTROL=ignorespace` e prefixe o comando com um espaço.
+
 O comando **não aprova nada**. Um pedido que não esteja `approved`, com `approved_by` e `identity_verified_by` preenchidos, é recusado.
 
 O que acontece, na ordem:
@@ -399,7 +401,17 @@ O que acontece, na ordem:
 1. **Legal hold, pré-voo, sobre TODAS as classes.** Hold ativo em qualquer classe aplicável ⇒ o pedido inteiro termina `denied` com `denied_reason_code='legal_hold'`, **nada é apagado, nem parcialmente**, e a decisão é auditada (`legal_hold_blocked_purge` + `privacy_request_denied`). `denied` é terminal: hold **vence** apagamento, e vence bloqueando — não adiando em silêncio. Para reabrir o pedido, libere o hold pelo procedimento próprio (§7) e crie um pedido novo.
    Holds ilegíveis ⇒ `failed`/`hold_unreadable`, também sem apagar nada. "Não sei se há hold" nunca vira "não há hold".
 2. **Tombstone antes da purga**, classe a classe. As duas ordens erram, para lados de custo muito diferente: tombstone *depois*, com o processo morrendo no meio, deixa dado apagado **sem** registro no ledger — e um restore o ressuscita. Tombstone *antes* deixa, no pior caso, um tombstone para dado que ainda vive, e a reaplicação (§3.6) apaga de novo. Um exagera e se auto-corrige; o outro omite e não tem conserto.
-3. **Exceções são registradas, não omitidas.** `postgres.financial` e `privacy.tombstone` são estruturalmente não-purgáveis; `media.blobs`, `gateway.baileys_session`, `postgres.audit`, `postgres.memory`, `postgres.traces` e `privacy.export` ainda **não têm mecanismo** neste adapter. Todas aparecem em `privacy_requests.exceptions` com código de motivo. Elas **não** são "purgadas com zero linhas" — isso faria o pedido se declarar cumprido sem ter apagado nada.
+3. **Exceções são registradas, não omitidas.** O que este adapter purga hoje é `postgres.people` (anonimização), `postgres.conversations` e `postgres.messages`. Todo o resto aparece em `privacy_requests.exceptions` com código de motivo — nunca como "purga de zero linhas", que faria o pedido se declarar cumprido sem ter apagado nada:
+
+   | Classe | Motivo |
+   |---|---|
+   | `privacy.tombstone` | `class_not_purgeable` — é o próprio ledger anti-ressurreição |
+   | `postgres.financial` | `class_not_purgeable,no_subject_linkage` — retenção contábil **e** `transacoes` não tem `pessoa_id` (tem `contraparte_id` e `registrado_por`, e qual dos dois é "a transação deste titular" não está decidido). Exportar pelo join errado entregaria a um titular o extrato de outro |
+   | `media.blobs`, `gateway.baileys_session` | `mechanism_not_implemented` — fora do PostgreSQL (eixo 4 da #536) |
+   | `postgres.audit`, `privacy.export` | `pending_dpo_decision` — quais campos redigir / vida do export |
+   | `postgres.memory`, `postgres.traces` | `no_subject_linkage` — `agent_memories`/`agent_facts` são escopo de agente, `runtime_trace_bodies` é por turno. Purgar por aproximação apagaria dado de outros titulares |
+
+   Quando as duas razões valem, as duas são registradas (vírgula-separadas) — "por que nada foi apagado" e "por que nada foi exportado" são perguntas diferentes.
 
 ```sql
 SELECT status, denied_reason_code, systems_covered, exceptions, evidence,
@@ -422,7 +434,7 @@ Registrado aqui para que ninguém opere com expectativa errada:
 
 - O executor de retenção **por prazo** existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes não há job que as varre por prazo — e não pode haver enquanto a `RETENTION_POLICY` não for aprovada pelo DPO. O apagamento **por pedido de titular** já existe e é outro caminho (§7.1).
 - O workflow de privacidade cobre `access_export`, `anonymization` e `deletion` (§7.1). **`rectification` não é executada** — precisa do conteúdo corrigido, e o motor recusa explicitamente em vez de "concluir" sem corrigir. (Issue #536, eixo 2.)
-- O mecanismo de purga por titular alcança hoje `postgres.people`, `postgres.conversations` e `postgres.messages`. As demais classes entram no pedido como **exceção registrada** com código de motivo, nunca como purga de zero linhas: `media.blobs` e `gateway.baileys_session` estão fora do PostgreSQL (eixo 4); `postgres.audit` e `privacy.export` dependem de decisão do DPO (quais campos redigir, vida do export); `postgres.memory` e `postgres.traces` não têm ligação de titular no schema — purgar por aproximação apagaria dado de outros titulares.
+- O mecanismo de purga por titular alcança hoje `postgres.people`, `postgres.conversations` e `postgres.messages`; o export cobre essas três. As demais classes entram no pedido como **exceção registrada** com código de motivo — a tabela está em §7.1.
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
 - **Nada deste eixo rodou contra Postgres real.** O domínio (`src/ops/privacy/`) é coberto por unit tests com fakes; `src/ops/privacy/adapters.ts` e os dois CLIs (`restore:reconcile`, `privacy:execute`) **não foram executados** contra banco nenhum. Vale a mesma ressalva dos adapters de backup, mais uma: aqui o SQL APAGA.
 - O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.

@@ -326,6 +326,19 @@ describe('cobertura e exceções', () => {
     expect(out.systems_covered).not.toContain('media.blobs');
   });
 
+  it('quando as DUAS razões valem, as duas são registradas', async () => {
+    // `postgres.financial` é não-purgável por retenção contábil E não tem
+    // ligação de titular utilizável para o export. São perguntas diferentes —
+    // "por que nada foi apagado" e "por que nada foi exportado" — e registrar
+    // só uma deixaria a outra sem resposta no relatório do pedido.
+    const r = recorder({ unsupported: { 'postgres.financial': 'no_subject_linkage' } });
+    const out = await executePrivacyRequest(approvedRequest(), subject(), r.ports);
+    expect(out.exceptions).toContainEqual({
+      data_class: 'postgres.financial',
+      reason: 'class_not_purgeable,no_subject_linkage',
+    });
+  });
+
   it('classe sem mecanismo também não entra no export — e a exceção é reportada', async () => {
     const r = recorder({ unsupported: { 'media.blobs': 'mechanism_not_implemented' } });
     const out = await executePrivacyRequest(
@@ -335,6 +348,30 @@ describe('cobertura e exceções', () => {
     );
     expect(out.systems_covered).not.toContain('media.blobs');
     expect(out.exceptions.map((e) => e.data_class)).toContain('media.blobs');
+  });
+
+  it('mensagens são purgadas ANTES das conversas — o cascade mentiria na contagem', async () => {
+    // `mensagens.conversa_id` é `REFERENCES conversas(id) ON DELETE CASCADE`
+    // (migration 001). Em ordem alfabética `postgres.conversations` viria
+    // primeiro, o DELETE das conversas levaria as mensagens junto, e a purga
+    // de mensagens contaria ZERO — dado apagado, evidência dizendo que não.
+    const r = recorder();
+    await executePrivacyRequest(approvedRequest(), subject(), r.ports);
+    const order = r.purges.map((p) => p.data_class);
+    expect(order.indexOf('postgres.messages')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('postgres.messages')).toBeLessThan(
+      order.indexOf('postgres.conversations'),
+    );
+  });
+
+  it('pessoas é a ÚLTIMA — anonimizar antes cegaria a resolução do sujeito', async () => {
+    // O adapter acha o titular derivando o `subject_ref` de cada linha de
+    // `pessoas`. Anonimizar primeiro apagaria o telefone de que essa derivação
+    // depende, e as classes seguintes não achariam mais ninguém.
+    const r = recorder();
+    await executePrivacyRequest(approvedRequest(), subject(), r.ports);
+    const order = r.purges.map((p) => p.data_class);
+    expect(order.at(-1)).toBe('postgres.people');
   });
 
   it('nenhuma classe de escopo de SISTEMA entra num pedido de titular', async () => {

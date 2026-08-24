@@ -67,6 +67,13 @@ export const UNSUPPORTED_CLASSES: Readonly<Record<string, string>> = Object.free
   'postgres.memory': 'no_subject_linkage',
   'postgres.traces': 'no_subject_linkage',
   'privacy.export': 'pending_dpo_decision',
+  // `transacoes` NÃO tem `pessoa_id`. Tem `contraparte_id` e `registrado_por`,
+  // e qual dos dois é "a transação DESTE titular" não está decidido em lugar
+  // nenhum. A classe já é não-purgável (retenção contábil), então o efeito
+  // prático é sobre o EXPORT — e exportar pelo join errado entregaria a um
+  // titular o extrato de outro. Chutar aqui é um vazamento; recusar é uma
+  // dívida nomeada.
+  'postgres.financial': 'no_subject_linkage',
 });
 
 /**
@@ -112,12 +119,29 @@ async function resolveSubjectPeople(
   `);
   const ids: string[] = [];
   for (const row of res.rows) {
-    const derived = resolveSubjectRef(
-      scope,
-      { kind: 'phone_e164', value: row.telefone_whatsapp },
-      secret,
-    ).subject_ref;
-    if (derived === subject.subject_ref) ids.push(row.id);
+    // As DUAS formas, porque um pedido pode ter nascido de qualquer uma e o
+    // `subject_ref` gravado depende do `kind`. Derivar só uma faria um pedido
+    // aberto por `person_id` não casar com linha nenhuma — e "não casou" aqui
+    // não vira erro: vira uma exclusão que conclui sem apagar nada.
+    for (const candidate of [
+      { kind: 'phone_e164' as const, value: row.telefone_whatsapp },
+      { kind: 'person_id' as const, value: row.id },
+    ]) {
+      let derived: string;
+      try {
+        derived = resolveSubjectRef(scope, candidate, secret).subject_ref;
+      } catch {
+        // Uma linha já anonimizada tem `telefone_whatsapp='anon:…'`, que não é
+        // E.164 e faz o resolvedor recusar — corretamente. Ela simplesmente não
+        // é candidata; deixar a exceção subir derrubaria a resolução do escopo
+        // inteiro no primeiro titular já anonimizado.
+        continue;
+      }
+      if (derived === subject.subject_ref) {
+        ids.push(row.id);
+        break;
+      }
+    }
   }
   return ids;
 }
@@ -156,6 +180,10 @@ async function purgeClass(
 
   switch (job.data_class) {
     case 'postgres.messages': {
+      // Roda ANTES de `postgres.conversations` — ver `PURGE_ORDER` em
+      // `execution.ts`. `mensagens.conversa_id` tem `ON DELETE CASCADE`, então
+      // apagar as conversas primeiro levaria as mensagens junto e esta contagem
+      // sairia zero, mentindo na evidência do pedido.
       const res = await db.execute(sql`
         DELETE FROM mensagens
          WHERE tenant_id = ${job.scope.tenant_id}
@@ -183,8 +211,14 @@ async function purgeClass(
       // classe `postgres.financial` mantém por obrigação contábil. Apagá-la
       // quebraria a integridade do que a lei manda guardar. O telefone vira um
       // valor irreversível e único (o pseudônimo do próprio titular), para que
-      // a unicidade composta continue valendo e nenhuma nova mensagem se ligue
-      // a ele.
+      // a unicidade composta `(tenant, agent, telefone_whatsapp)` continue
+      // valendo e nenhuma mensagem nova se ligue a ele.
+      //
+      // `status` vai para `inativa`, um dos quatro valores que
+      // `pessoas_status_check` (migration 002) admite — `ativa`, `inativa`,
+      // `bloqueada`, `quarentena`. Um status novo como `anonimizada` precisaria
+      // de migration própria; o marcador de anonimização é o prefixo `anon:` no
+      // telefone, e é ele que torna a operação idempotente.
       const res = await db.execute(sql`
         UPDATE pessoas
            SET nome = 'anonimizado',
@@ -194,12 +228,12 @@ async function purgeClass(
                telefone_whatsapp = ${`anon:${job.subject.subject_ref.slice(0, 32)}`},
                preferencias = '{}'::jsonb,
                modelo_mental = '{}'::jsonb,
-               status = 'anonimizada',
+               status = 'inativa',
                updated_at = now()
          WHERE tenant_id = ${job.scope.tenant_id}
            AND agent_id = ${job.scope.agent_id}
            AND id = ANY(${people}::uuid[])
-           AND status <> 'anonimizada'
+           AND telefone_whatsapp NOT LIKE 'anon:%'
       `);
       return res.rowCount ?? 0;
     }
@@ -313,17 +347,6 @@ async function exportClass(
           JOIN conversas c ON c.id = m.conversa_id
          WHERE m.tenant_id = ${scope.tenant_id} AND m.agent_id = ${scope.agent_id}
            AND c.pessoa_id = ANY(${people}::uuid[])
-      `);
-      return res.rows;
-    }
-    case 'postgres.financial': {
-      // Não é purgável, mas É exportável: o titular tem direito de acesso ao
-      // que a obrigação contábil obriga a manter.
-      const res = await db.execute(sql`
-        SELECT id, valor, descricao, data_transacao, created_at
-          FROM transacoes
-         WHERE tenant_id = ${scope.tenant_id} AND agent_id = ${scope.agent_id}
-           AND pessoa_id = ANY(${people}::uuid[])
       `);
       return res.rows;
     }

@@ -206,6 +206,17 @@ describe('o runtime CONTINUA alcançando src/config/env.ts (o contrapeso)', () =
     'scripts/p8d-migration-priorities.ts',
     'scripts/p8e-seed-policies.ts',
     'scripts/pessoa-add.ts',
+    // Issue #536. Os dois entram na lista por VONTADE, não de carona. Ambos
+    // executam caminhos irreversíveis — `privacy-request` apaga e anonimiza
+    // dado de titular; `post-restore-reconcile` reaplica exclusões contra o
+    // banco recém-restaurado — e ambos dependem de configuração que, torta,
+    // faz a operação errar em silêncio: `DATABASE_URL` (qual banco vai ser
+    // apagado), `RUNTIME_TRACE_HMAC_MASTER_SECRET` (o segredo do ledger, sem o
+    // qual nenhum `subject_ref` casa e uma exclusão "conclui" sem apagar
+    // nada) e o keyring de backup (a cifragem do export). Boot fail-closed é a
+    // única hora barata de descobrir isso.
+    'scripts/post-restore-reconcile.ts',
+    'scripts/privacy-request.ts',
     'scripts/restore-test.ts',
     'scripts/seed-holidays.ts',
     'scripts/seed-proposals-fixtures.ts',

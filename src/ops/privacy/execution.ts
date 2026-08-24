@@ -41,11 +41,7 @@ import {
   type TombstoneAction,
   type TombstoneRecord,
 } from '@/ops/retention/tombstones.js';
-import {
-  getDataClass,
-  subjectScopedClasses,
-  type DataClass,
-} from '@/ops/retention/data-classes.js';
+import { subjectScopedClasses, type DataClass } from '@/ops/retention/data-classes.js';
 import {
   assertPrivacyTransition,
   type PrivacyRequestStatus,
@@ -152,6 +148,41 @@ export interface PrivacyExecutionResult {
 }
 
 /**
+ * A ORDEM DE PURGA. Declarada, não alfabética — e a diferença não é estética.
+ *
+ * `mensagens.conversa_id` é `REFERENCES conversas(id) ON DELETE CASCADE`
+ * (migration 001). Em ordem alfabética, `postgres.conversations` viria ANTES de
+ * `postgres.messages`: o `DELETE` das conversas levaria as mensagens junto pelo
+ * cascade, e a purga de mensagens em seguida contaria ZERO. O dado teria ido
+ * embora, mas a evidência do pedido diria "nenhuma mensagem apagada" — e a
+ * evidência é a única coisa que sobra para defender o pedido depois. As
+ * dependências saem das folhas para a raiz.
+ *
+ * `postgres.people` é a ÚLTIMA por outro motivo: o adapter resolve o titular
+ * derivando o `subject_ref` de cada linha de `pessoas`. Anonimizar primeiro
+ * apagaria o telefone de que essa derivação depende, e as classes seguintes não
+ * achariam mais ninguém.
+ *
+ * Classes fora desta lista vão para o fim, em ordem alfabética — determinismo
+ * sem fingir que sabemos uma dependência que não declaramos.
+ */
+const PURGE_ORDER: readonly string[] = Object.freeze([
+  'postgres.messages',
+  'postgres.conversations',
+  'postgres.traces',
+  'postgres.memory',
+  'postgres.audit',
+  'media.blobs',
+  'privacy.export',
+  'postgres.people',
+]);
+
+function purgeRank(id: string): number {
+  const i = PURGE_ORDER.indexOf(id);
+  return i === -1 ? PURGE_ORDER.length : i;
+}
+
+/**
  * Ordem determinística de execução.
  *
  * Duas execuções do mesmo pedido tocam as mesmas classes na mesma sequência, o
@@ -159,7 +190,9 @@ export interface PrivacyExecutionResult {
  * onde foi, e a ordem diz o que faltava.
  */
 function classesForRequest(type: PrivacyRequestType): readonly DataClass[] {
-  const all = [...subjectScopedClasses()].sort((a, b) => a.id.localeCompare(b.id));
+  const all = [...subjectScopedClasses()].sort(
+    (a, b) => purgeRank(a.id) - purgeRank(b.id) || a.id.localeCompare(b.id),
+  );
   if (type === 'access_export') {
     // O ledger de tombstones é sobre o titular, mas é registro interno de
     // conformidade — exportá-lo devolveria ao titular a lista pseudonimizada
@@ -262,10 +295,16 @@ export async function executePrivacyRequest(
     .filter((c) => c.purge_mechanism === 'not_purgeable' || ports.unsupported[c.id] !== undefined)
     .map((c) => ({
       data_class: c.id,
-      reason:
-        c.purge_mechanism === 'not_purgeable'
-          ? 'class_not_purgeable'
-          : (ports.unsupported[c.id] ?? 'mechanism_not_implemented'),
+      // As duas razões podem valer ao mesmo tempo e respondem a perguntas
+      // diferentes: "por que nada foi apagado" (estrutural, jurídica) e "por
+      // que nada foi exportado" (dívida deste adapter). Registrar só uma
+      // deixaria a outra pergunta sem resposta no relatório do pedido.
+      reason: [
+        c.purge_mechanism === 'not_purgeable' ? 'class_not_purgeable' : null,
+        ports.unsupported[c.id] ?? null,
+      ]
+        .filter((r): r is string => r !== null)
+        .join(','),
     }));
 
   // ── 1. Hold: pré-voo sobre TODAS as classes, antes de tocar em qualquer uma.
@@ -503,6 +542,3 @@ async function finish(
 
   return result;
 }
-
-/** Reexportado para o adapter montar `PurgeJob` sem reimplementar o lookup. */
-export { getDataClass };
