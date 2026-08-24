@@ -6,7 +6,7 @@
 
 A two-table audit pipeline + durable outbox + 3 workers + 1 materialized view:
 
-- `runtime_trace_envelopes` (migration 052): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `body_status`.
+- `runtime_trace_envelopes` (migration 052): the narrow synchronous record proving a decision was made. PK = `trace_id`. Written in <20ms p99 (audit gate). Carries `decision`, `side_effect_level`, `policy_id`, `redaction_class`, `envelope_hmac`, `hmac_key_version`, `signature_version`, `body_status`.
 - `runtime_trace_bodies` + `runtime_trace_body_outbox` (migration 053): the heavy body — redacted `ExecutionContextPacket` + `DecisionPacket` (PK = `trace_id`, `ON CONFLICT DO NOTHING` for idempotent at-least-once delivery), plus a **durable outbox** table written transactionally with the envelope so a process crash never strands the packet (Codex review #102 issue 4).
 - `unified_trace_events` matview (migration 054): UNION ALL across 7 source tables (audit_log, cognitive_module_log, agent_drift_alerts, role_selector_decisions, capability_test_results, procedure_execution_events, runtime_trace_envelopes), refreshed CONCURRENTLY every 5 minutes.
 
@@ -23,6 +23,7 @@ Workers (in `src/workers/`):
 | # | Invariant | Where enforced |
 |---|---|---|
 | 8 | HMAC-SHA256 is tenant-scoped (no cross-tenant dictionary attack) | `src/control-plane/runtime-trace/lib/hmac.ts` — HKDF derives a per-tenant key from the master KMS material. **Fail-closed**: throws if `RUNTIME_TRACE_HMAC_MASTER_SECRET` is absent in prod (Codex #102 issue 2). |
+| 8b | `envelope_hmac` is **versioned** and production writes only `signature_version=2`, which covers `root_trace_id`, `attempt` and the version itself (issue #535) | `src/control-plane/runtime-trace/lib/signature.ts` — the writer reads `CURRENT_ENVELOPE_SIGNATURE_VERSION`, a constant, never its input. The verifier still reads v1; v1 rows are never re-signed. |
 | 12 | Envelope MUST be written BEFORE any side effect with `side_effect_level >= medium` | `src/control-plane/runtime-trace/envelope-writer.ts` throws on failure; caller MUST abort the side effect |
 | — | Redaction policy is a **strict allowlist** — `STRUCTURAL_TOP_LEVEL` + `DECISION_TOP_LEVEL` + special-cased `request`/`soul`/`user_layer`; unknown top-level fields are DROPPED (Codex #102 issue 5) | `src/control-plane/runtime-trace/lib/redaction.ts` |
 | — | Debug mode is AES-256-GCM + S3 with 24h TTL + MFA-gated read. **Durability**: real `PutObject` when bucket configured, or inline ciphertext in DB row when not — never silent-drop (Codex #102 issue 3). | `lib/debug-encrypt.ts` + `body-writer.ts` + DB CHECK constraint `runtime_trace_bodies_encrypted_has_storage` |
@@ -40,7 +41,28 @@ RUNTIME_TRACE_HMAC_KEY_VERSION=1
 RUNTIME_TRACE_DEBUG_S3_BUCKET=maia-trace-debug-prod
 RUNTIME_TRACE_DEBUG_AES_KEY=<base64 32 bytes>
 RUNTIME_TRACE_BODY_ORPHAN_SEC=300
+# Optional — issue #535. `true` (default) keeps v1 envelopes verifiable, for
+# fixtures and environments that already hold some. Set `false` ONLY in an
+# environment confirmed to hold no v1 rows: on a v1 row `root_trace_id` and
+# `attempt` are outside the signature and can be edited without detection.
+# With `false`, a v1 row reads `rejected_version` — NOT `invalid`, because a
+# v1 signature may be perfectly genuine.
+RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=true
 ```
+
+### Signature versions and the `rejected_version` verdict (issue #535)
+
+| Verdict | Meaning | Operator action |
+|---|---|---|
+| `verified` | HMAC recomputes under the version the row declares | none |
+| `invalid` | It does not recompute — a field or the signature was changed. **A v2 row relabelled as v1 lands here**, because v2 signs its own version | integrity incident |
+| `unknown` | The master secret for that `hmac_key_version` is not configured in this process | check key rotation / reader config; NOT tampering |
+| `rejected_version` | The row declares a version this deployment refuses (v1 with `RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false`), or a version it does not know | policy decision, not evidence. Re-read with the switch on if you need the verdict |
+
+Rolling back to `signature_version=1` is **not** an operation this system
+supports: there is no re-signing path, forwards or backwards. If v2 turns out to
+be wrong, the fix is a v3 material — see the migration-119 header for why the
+`_down` refuses while v2 rows exist.
 
 With the flag OFF, `trace()` returns a no-op envelope (empty `envelope_hmac`, `hmac_key_version=0`) and does NOT touch the DB. Side-effect callers that wrap themselves with `trace()` keep working — they just have no audit row to look up later.
 
