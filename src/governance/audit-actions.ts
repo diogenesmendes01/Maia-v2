@@ -121,6 +121,12 @@ export const AUDIT_ACTIONS = [
   'privacy_request_approved',
   'privacy_request_completed',
   'privacy_request_denied',
+  // Issue #536 §2 — `denied` e `failed` NÃO são a mesma coisa e conflatá-los
+  // tornaria irrespondível a única pergunta que importa depois: "este pedido
+  // foi RECUSADO por fundamento jurídico (hold ativo) ou QUEBROU no meio?".
+  // A primeira é uma decisão defensável perante a ANPD; a segunda é um
+  // incidente com dado possivelmente meio apagado.
+  'privacy_request_failed',
   'post_restore_reconciliation_completed',
   'post_restore_reconciliation_failed',
   'whatsapp_connected',

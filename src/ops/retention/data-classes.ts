@@ -314,6 +314,24 @@ export function getDataClass(id: string): DataClass {
 }
 
 /** Classes that a `pg_dump` does NOT capture — the manifest declares these as excluded. */
+/**
+ * As classes que um pedido de um TITULAR alcança (issue #536 §2).
+ *
+ * O critério é o escopo: `tenant_agent` é a única faixa em que uma linha
+ * pertence a um titular identificável. `gateway.baileys_session` é de tenant
+ * (é credencial da linha, não dado do titular), e `queue.redis` /
+ * `backup.artifact` são de sistema — apagar qualquer um deles "em nome" de um
+ * titular destruiria dado de todos os outros.
+ *
+ * Inclui deliberadamente as classes NÃO purgáveis: elas viram EXCEÇÃO
+ * registrada no pedido, não omissão. Um relatório de conformidade que
+ * simplesmente não mencionasse `postgres.financial` não estaria dizendo que a
+ * retenção contábil sobrepôs o apagamento — estaria escondendo.
+ */
+export function subjectScopedClasses(): readonly DataClass[] {
+  return DATA_CLASSES.filter((c) => c.scope === 'tenant_agent');
+}
+
 export function classesExcludedFromDump(): string[] {
   return DATA_CLASSES.filter((c) => c.backup_behavior !== 'in_pg_dump').map((c) => c.id);
 }

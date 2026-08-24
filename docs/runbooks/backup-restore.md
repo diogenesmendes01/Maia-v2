@@ -83,11 +83,12 @@ UPDATE backup_runs
 3. **Baixe e verifique** — confira o SHA-256 contra `backup_runs.sha256` (que é o digest do CIPHERTEXT quando o artefato é cifrado) e valide a assinatura do manifesto antes de tocar em qualquer coisa.
 4. **Decifre** (se `encryption_mode <> 'none'`): o artefato é um envelope `MBK1`; a chave é resolvida pelo `key_id` gravado no header, então uma chave rotacionada mas ainda presente no keyring funciona.
 5. **Restaure**: `pg_restore --no-owner -d maia <arquivo>`; depois `npm run db:migrate` se o schema avançou desde o snapshot (compare `manifest.migration_head`).
-6. **Reconcilie os tombstones** — obrigatório:
-   - obtenha `tombstone_watermark` do manifesto;
-   - liste os tombstones posteriores e reaplique cada exclusão/anonimização;
-   - **se o ledger estiver ilegível, o watermark for nulo, ou qualquer linha falhar na verificação HMAC, PARE** — o runtime não pode voltar a produção (`planReconciliation` devolve `ok:false`).
-   - Antecipe esse número: o último drill já mediu quantos tombstones este artefato deveria reaplicar (`restore_drills.tombstones_pending`, §4). Se o drill mais recente do mesmo artefato falhou com `reconciliation_blocked`, o restore vai parar aqui — resolva o ledger **antes** de derrubar o banco.
+6. **Reconcilie os tombstones** — obrigatório, e agora um comando (§3.6):
+   ```bash
+   npm run restore:reconcile -- --backup-id=<uuid> --ledger-source=live
+   ```
+   Saída 0 = tráfego liberado; saída 1 = **BLOQUEADO**, o runtime não pode voltar a produção.
+   - Antecipe o número: o último drill já mediu quantos tombstones este artefato deveria reaplicar (`restore_drills.tombstones_pending`, §4). Se o drill mais recente do mesmo artefato falhou com `reconciliation_blocked`, o restore vai parar aqui — resolva o ledger **antes** de derrubar o banco.
 7. **Reconcilie o que não está no dump**: mídia (`/app/media`), Redis/BullMQ e a sessão Baileys **não** vêm no `pg_dump`. Ver §5.
 8. **Só então** inicie: `sudo systemctl start maia` e confira `/health/db`.
 
@@ -339,6 +340,33 @@ O único lugar onde mtime sobrevive é a varredura de `.partial` órfão — que
 **Legal hold** — criação e liberação exigem papel e são auditadas. Um hold ativo bloqueia o purge aplicável; a liberação **não** dispara exclusão, apenas permite reavaliação.
 
 **Solicitação LGPD** — o pedido é persistido por tenant, a identidade é verificada **fora do LLM** (o banco recusa avançar sem o carimbo humano — `privacy_requests_identity_chk`), e um export só existe com prazo de expiração. O LLM nunca autoriza nem executa exclusão.
+
+### 7.1 Executar um pedido de privacidade (issue #536)
+
+```bash
+npm run privacy:execute -- --request=<uuid> --phone=+5511999990000
+# ou
+npm run privacy:execute -- --request=<uuid> --person-id=<uuid>
+```
+
+O identificador vem de **você**, não do banco: `privacy_requests.subject_ref` é um HMAC de mão única — o banco *reconhece* o titular, nunca o enumera. O executor deriva o `subject_ref` do que você digitou e **recusa** se não bater com a linha. Sem essa conferência, um erro de digitação executaria uma exclusão irreversível em nome de outra pessoa.
+
+O comando **não aprova nada**. Um pedido que não esteja `approved`, com `approved_by` e `identity_verified_by` preenchidos, é recusado.
+
+O que acontece, na ordem:
+
+1. **Legal hold, pré-voo, sobre TODAS as classes.** Hold ativo em qualquer classe aplicável ⇒ o pedido inteiro termina `denied` com `denied_reason_code='legal_hold'`, **nada é apagado, nem parcialmente**, e a decisão é auditada (`legal_hold_blocked_purge` + `privacy_request_denied`). `denied` é terminal: hold **vence** apagamento, e vence bloqueando — não adiando em silêncio. Para reabrir o pedido, libere o hold pelo procedimento próprio (§7) e crie um pedido novo.
+   Holds ilegíveis ⇒ `failed`/`hold_unreadable`, também sem apagar nada. "Não sei se há hold" nunca vira "não há hold".
+2. **Tombstone antes da purga**, classe a classe. As duas ordens erram, para lados de custo muito diferente: tombstone *depois*, com o processo morrendo no meio, deixa dado apagado **sem** registro no ledger — e um restore o ressuscita. Tombstone *antes* deixa, no pior caso, um tombstone para dado que ainda vive, e a reaplicação (§3.6) apaga de novo. Um exagera e se auto-corrige; o outro omite e não tem conserto.
+3. **Exceções são registradas, não omitidas.** `postgres.financial` e `privacy.tombstone` são estruturalmente não-purgáveis; `media.blobs`, `gateway.baileys_session`, `postgres.audit`, `postgres.memory`, `postgres.traces` e `privacy.export` ainda **não têm mecanismo** neste adapter. Todas aparecem em `privacy_requests.exceptions` com código de motivo. Elas **não** são "purgadas com zero linhas" — isso faria o pedido se declarar cumprido sem ter apagado nada.
+
+```sql
+SELECT status, denied_reason_code, systems_covered, exceptions, evidence,
+       export_locator IS NOT NULL AS tem_export, export_expires_at
+FROM privacy_requests WHERE id = '<uuid>';
+```
+
+`rectification` **não** é executada por este motor (precisa do conteúdo corrigido, que ele não tem) — ele recusa explicitamente em vez de "concluir" sem corrigir nada.
 
 ## 8. Rollback
 
