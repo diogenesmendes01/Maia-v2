@@ -140,6 +140,51 @@ function reasonLabel(code: string | null | undefined): string {
   return closedVocabulary(code, ONBOARDING_REASONS);
 }
 
+/**
+ * A recusa que acontece ANTES do `commitStep` — e por isso não deixa rastro
+ * NENHUM sem esta função.
+ *
+ * Toda negativa que CHEGA à transação já é auditada onde deve: `commitStep`
+ * grava `admin_audit_log` e o evento append-only na mesma unidade de
+ * consistência do estado da run. Mas escopo proibido na abertura da run, RBAC
+ * e contrato de payload são recusados antes de existir run, transação ou
+ * evento — e ficavam invisíveis. O caso que mais dói é justamente o do
+ * invariante 8 do `AGENTS.md`: `startOnboardingRun({ tenant_id: 'default' })`
+ * era a única negativa da saga inteira que nem a série de falha nem a trilha
+ * registravam. Quem tenta o literal reservado é exatamente quem se quer ver
+ * tentando.
+ *
+ * Duas decisões que este helper carrega, e que não são detalhe:
+ *
+ *   1. **A atribuição NUNCA usa o escopo PROPOSTO pelo chamador.** O par vem da
+ *      RUN carregada do banco, ou é `null` (bucket `system`) enquanto não há
+ *      run. Rotular a série com o `tenant_id` que o operador mandou colocaria
+ *      texto arbitrário — e portanto cardinalidade ilimitada — num label,
+ *      exatamente no caminho em que esse texto acabou de ser REJEITADO por não
+ *      ser um escopo válido.
+ *   2. **O log leva o CÓDIGO, nunca a exceção.** A mensagem de `OnboardingError`
+ *      interpola o valor recusado (`tenant_id='…'`), e `reason_code` de
+ *      cancelamento é entrada livre do operador. Código tipado + passo bastam
+ *      para operar; o valor original, quando é legítimo persistir, já vai para
+ *      a trilha.
+ *
+ * Devolve o erro para o chamador reemitir (`throw countRefusal(...)`) — o
+ * contrato de quem chama não muda, só passa a ser observável.
+ */
+function countRefusal(step: string, scope: MetricScope, err: unknown): unknown {
+  const code = toOnboardingErrorCode(err);
+  counter(METRIC.ONBOARDING_STEP_FAILED, {
+    step: stepLabel(step),
+    reason: reasonLabel(code),
+    ...attribution(scope),
+  });
+  logger.warn({ step, reason: code }, 'onboarding.command_refused');
+  return err;
+}
+
+/** Escopo de atribuição de um comando recusado antes de existir run. */
+const UNRESOLVED_SCOPE: MetricScope = { tenant_id: null, agent_id: null };
+
 /** Versão do contrato desta saga. Gravada em cada run para o rollout/rollback. */
 export const ONBOARDING_CONTRACT_VERSION = '1';
 
@@ -419,7 +464,7 @@ export type StartRunOutcome =
  * `note` — que atravessava a denylist porque o NOME dela é inofensivo — passa
  * a ser recusada na entrada.
  */
-export async function startOnboardingRun(input: {
+export type StartRunInput = {
   kind: 'global_bootstrap' | 'tenant_onboarding';
   tenant_id: string | null;
   actor: OnboardingActor;
@@ -427,7 +472,22 @@ export async function startOnboardingRun(input: {
   correlation_id?: string;
   ttl_ms?: number;
   metadata?: OnboardingRunMetadata;
-}): Promise<StartRunOutcome> {
+};
+
+export async function startOnboardingRun(input: StartRunInput): Promise<StartRunOutcome> {
+  try {
+    return await openRun(input);
+  } catch (err) {
+    // A run não existe (é o que este comando estava tentando abrir), então NÃO
+    // há par para atribuir: cai no bucket `system`, que é o sancionado para
+    // trabalho sem dono. O `tenant_id` proposto é justamente o que acabou de
+    // ser recusado — usá-lo como label seria pôr texto arbitrário do chamador
+    // numa série.
+    throw countRefusal('create_run', UNRESOLVED_SCOPE, err);
+  }
+}
+
+async function openRun(input: StartRunInput): Promise<StartRunOutcome> {
   if (input.kind === 'global_bootstrap') {
     // O bootstrap global exige uma credencial de uso único e um endpoint
     // restrito, que NÃO fazem parte desta fatia. Recusar explicitamente é
@@ -557,14 +617,31 @@ export async function listOnboardingRuns(input: {
  *     de chave e nunca olhou esse valor. Agora o valor persistido é o mesmo
  *     que vira label de métrica.
  */
-export async function cancelOnboardingRun(input: {
+export type CancelRunInput = {
   run_id: string;
   expected_version: number;
   actor: OnboardingActor;
   reason_code: OnboardingCancelReason;
   idempotency_key: string;
   correlation_id?: string;
-}): Promise<StepOutcome> {
+};
+
+export async function cancelOnboardingRun(input: CancelRunInput): Promise<StepOutcome> {
+  // Holder porque o escopo só é CONHECIDO depois de carregar a run: antes
+  // disso o comando é recusado sem dono (`system`), depois ele é atribuído ao
+  // par da run — nunca ao que o chamador afirmou ter.
+  const scope: { current: MetricScope } = { current: UNRESOLVED_SCOPE };
+  try {
+    return await runCancel(input, scope);
+  } catch (err) {
+    throw countRefusal('cancel_run', scope.current, err);
+  }
+}
+
+async function runCancel(
+  input: CancelRunInput,
+  scope: { current: MetricScope },
+): Promise<StepOutcome> {
   const reason_code = parseCancelReason(input.reason_code);
   if (typeof input.idempotency_key !== 'string' || input.idempotency_key.length < 8) {
     throw new OnboardingError(
@@ -578,6 +655,7 @@ export async function cancelOnboardingRun(input: {
     tenant_id: tenantFilterFor(input.actor),
   });
   if (!existing) return { status: 'not_found' };
+  scope.current = { tenant_id: existing.tenant_id, agent_id: existing.agent_id };
   assertMayMutate(input.actor, existing.tenant_id);
 
   const outcome = await onboardingRunsRepo.cancel({
@@ -620,21 +698,43 @@ export async function executeOnboardingStep(input: {
   correlation_id?: string;
   deps?: WizardDeps;
 }): Promise<StepOutcome> {
-  const def = getStepDefinition(input.step);
-  const step = def.step;
   const correlation_id = input.correlation_id ?? randomUUID();
   const started = Date.now();
 
-  const existing = await onboardingRunsRepo.getForScope({
-    run_id: input.run_id,
-    tenant_id: tenantFilterFor(input.actor),
-  });
-  if (!existing) return { status: 'not_found' };
-  assertMayMutate(input.actor, existing.tenant_id);
+  // O PRELÚDIO também é recusa.
+  //
+  // O `try` de baixo só cobria o `commitStep`; passo desconhecido, RBAC e
+  // contrato de payload são recusados AQUI, antes de qualquer transação, e não
+  // produziam série nenhuma. São as mesmas negativas, para o mesmo operador —
+  // separar os dois caminhos dava um painel que enxergava metade delas.
+  //
+  // `input.step` (e não `step`) no label porque `getStepDefinition` é uma das
+  // coisas que podem falhar: um passo inexistente colapsa em `other` pelo
+  // vocabulário fechado, em vez de estourar uma variável não atribuída.
+  let step: OnboardingStep;
+  let existing: OnboardingRunRow;
+  let idempotency_key_hash: string;
+  let payload: unknown;
+  let payload_hash: string;
+  let refusalScope: MetricScope = UNRESOLVED_SCOPE;
+  try {
+    step = getStepDefinition(input.step).step;
 
-  const idempotency_key_hash = hashIdempotencyKey(input.idempotency_key);
-  const payload = parseStepPayload(step, input.payload);
-  const payload_hash = hashPayload({ step, payload });
+    const loaded = await onboardingRunsRepo.getForScope({
+      run_id: input.run_id,
+      tenant_id: tenantFilterFor(input.actor),
+    });
+    if (!loaded) return { status: 'not_found' };
+    existing = loaded;
+    refusalScope = { tenant_id: existing.tenant_id, agent_id: existing.agent_id };
+    assertMayMutate(input.actor, existing.tenant_id);
+
+    idempotency_key_hash = hashIdempotencyKey(input.idempotency_key);
+    payload = parseStepPayload(step, input.payload);
+    payload_hash = hashPayload({ step, payload });
+  } catch (err) {
+    throw countRefusal(input.step, refusalScope, err);
+  }
 
   // `evaluate_readiness`/`activate` produzem um relatório que o caller precisa
   // ver mesmo quando a transição é negada. Capturado aqui, fora do `apply`.

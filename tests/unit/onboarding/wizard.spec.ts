@@ -1462,3 +1462,126 @@ describe('`failed_retryable` — a retomada é o passo que falhou', () => {
     expect(runs.get('run-1')!.resume_state).toBeNull();
   });
 });
+
+/**
+ * Issue #519, critério "Negações têm telemetria/auditoria sanitizada", e o
+ * invariante 8 do `AGENTS.md` ("nenhum fallback `'default'` em paths
+ * dinâmicos").
+ *
+ * A saga já auditava toda negativa que CHEGA ao `commitStep`: a linha vai para
+ * `admin_audit_log` dentro da mesma transação e o evento append-only registra o
+ * ator. Mas as recusas que acontecem ANTES de existir transação — escopo
+ * proibido na abertura da run, RBAC, contrato de payload — não têm run, não têm
+ * transação e não tinham NADA: nem série, nem log estruturado.
+ * `startOnboardingRun` sequer possuía `try`.
+ *
+ * O efeito prático era o pior possível para o eixo que a issue mais protege:
+ * `startOnboardingRun({ tenant_id: 'default' })` — a tentativa exata de
+ * provisionar no bucket legado que a migration 109 barra com CHECK e que
+ * `scope.ts` barra com erro tipado — era a ÚNICA negativa da saga inteira
+ * completamente invisível à observabilidade. Quem tenta o literal reservado é
+ * exatamente quem se quer ver tentando.
+ *
+ * A série é a MESMA de qualquer outra falha de passo
+ * (`maia_onboarding_step_failed_total{step,reason}`), porque o operador não
+ * quer dois painéis para "o comando foi recusado". Os pseudo-passos
+ * `create_run`/`cancel_run` colapsam em `other`, como já colapsam na série de
+ * replay.
+ */
+describe('recusa PRÉ-commit é observável — a que nunca chega ao banco', () => {
+  const scrape = async (): Promise<string> => {
+    const { renderPrometheus } = await import('../../../src/lib/metrics.js');
+    return renderPrometheus();
+  };
+  const reset = async (): Promise<void> => {
+    const { _resetForTests } = await import('../../../src/lib/metrics.js');
+    _resetForTests();
+  };
+
+  it.each(['default', 'system'])(
+    'o literal reservado `%s` na ABERTURA da run é recusado E contado',
+    async (literal) => {
+      await reset();
+      await expect(
+        startOnboardingRun({
+          kind: 'tenant_onboarding',
+          tenant_id: literal,
+          actor: FOUNDER,
+          idempotency_key: 'chave-literal-reservado',
+        }),
+      ).rejects.toMatchObject({ code: 'forbidden_scope_literal' });
+
+      // Nenhuma run foi aberta — a recusa é fail-closed, não "abre e falha".
+      expect(runs.size).toBe(0);
+      expect(await scrape()).toMatch(
+        /maia_onboarding_step_failed_total\{[^}]*reason="forbidden_scope_literal"[^}]*step="other"/,
+      );
+    },
+  );
+
+  it('o RBAC recusado ANTES do commitStep também vira série, com o passo real', async () => {
+    await reset();
+    runs.set('run-1', makeRun());
+    await expect(
+      executeOnboardingStep({
+        run_id: 'run-1',
+        step: 'provision_tenant',
+        payload: { tenant_id: 'acme', nome: 'Acme' },
+        idempotency_key: 'chave-rbac-observavel',
+        expected_version: 1,
+        actor: { actor_id: 'u5', actor_role: 'viewer', tenant_id: 'acme' },
+      }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+
+    expect(applyCalls).toEqual([]);
+    expect(await scrape()).toMatch(
+      /maia_onboarding_step_failed_total\{[^}]*reason="forbidden"[^}]*step="provision_tenant"/,
+    );
+  });
+
+  it('o payload fora do contrato é contado com o passo que o recusou', async () => {
+    await reset();
+    runs.set('run-1', makeRun());
+    await expect(
+      executeOnboardingStep({
+        run_id: 'run-1',
+        step: 'provision_tenant',
+        payload: { tenant_id: 'acme' }, // falta `nome`
+        idempotency_key: 'chave-payload-observavel',
+        expected_version: 1,
+        actor: OWNER,
+      }),
+    ).rejects.toBeInstanceOf(OnboardingError);
+
+    expect(applyCalls).toEqual([]);
+    expect(await scrape()).toMatch(
+      /maia_onboarding_step_failed_total\{[^}]*step="provision_tenant"/,
+    );
+  });
+
+  it('a recusa do cancelamento é contada — e cem motivos livres continuam UMA série', async () => {
+    await reset();
+    for (let i = 0; i < 100; i += 1) {
+      runs.set('run-1', makeRun({ state: 'policy_ready', version: 4 }));
+      await expect(
+        cancelOnboardingRun({
+          run_id: 'run-1',
+          expected_version: 4,
+          actor: OWNER,
+          reason_code: `motivo-do-operador-${i}` as never,
+          idempotency_key: `chave-livre-observavel-${i}`,
+        }),
+      ).rejects.toBeInstanceOf(OnboardingError);
+    }
+
+    const failed = (await scrape())
+      .split('\n')
+      .filter((l) => l.startsWith('maia_onboarding_step_failed_total{'));
+    // Cem entradas livres distintas, UMA série: o texto do operador nunca é o
+    // label — quem vira `reason` é o código tipado `invalid_scope`.
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatch(/reason="invalid_scope"/);
+    expect(failed[0]).toMatch(/step="other"/);
+    expect(failed[0]).toMatch(/ 100$/);
+  });
+});
