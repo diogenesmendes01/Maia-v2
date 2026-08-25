@@ -350,15 +350,19 @@ d('#636 — guardrail: nenhum caminho registra tool automaticamente', () => {
       expect(fechou.fechados).toBe(0);
       await exigirNadaInstalado(c, 'depois de rodar o fechamento');
 
-      // O aceite produziu UMA reserva, e ela é um DOCUMENTO: nem número de
-      // issue (o relayer ainda não rodou), nem efeito sobre capability.
-      const reservas = await c.query<{ n: number; status: string }>(
-        `SELECT count(*)::int AS n, min(status) AS status FROM tool_request_issues
+      // O aceite produziu UMA reserva, e só. O que ela É (pendente, criada,
+      // falha) NÃO é assunto deste arquivo e NÃO é afirmado aqui de propósito:
+      // o relayer é CROSS-TENANT, e outra spec da mesma rodada pode drená-la
+      // entre o `INSERT` e este `SELECT`. Uma asserção sobre `status` seria um
+      // flake entre arquivos disfarçado de guardrail. O que o guardrail afirma
+      // é o que `exigirNadaInstalado` já afirmou acima: nada foi instalado,
+      // concedido ou criado como capability.
+      const reservas = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM tool_request_issues
           WHERE tenant_id = $1 AND agent_id = $2`,
         [T, AG],
       );
       expect(reservas.rows[0]!.n).toBe(1);
-      expect(reservas.rows[0]!.status).toBe('pending');
     } finally {
       await faxina(c, gapId);
       c.release();

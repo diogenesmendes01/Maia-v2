@@ -110,6 +110,85 @@ function EstadoDoAceite({
   );
 }
 
+/**
+ * A EVIDÊNCIA de um pedido, sob demanda: os membros ativos com a intenção que
+ * cada um registrou, e a ação de triagem REVERSÍVEL (desagrupar).
+ *
+ * O texto das situações mora aqui e NÃO no corpo da issue: esta tela está atrás
+ * de autenticação, uma issue pode ser pública.
+ *
+ * Desagrupar não apaga nada — `detached_at` + motivo + autor, e o `original_spec`
+ * do membro continua legível. O REPRESENTANTE não pode ser destacado (ele ancora
+ * o agregado), e o backend recusa com erro explícito em vez de um clique sem
+ * efeito.
+ */
+function Evidencia({
+  tenantId,
+  agentId,
+  aggregateId,
+}: {
+  tenantId: string;
+  agentId: string;
+  aggregateId: string;
+}) {
+  const utils = trpc.useUtils();
+  const detalhe = trpc.toolRequests.detail.useQuery({ tenantId, agentId, aggregateId });
+  const [erro, setErro] = React.useState<string | null>(null);
+  const desagrupar = trpc.toolRequests.desagrupar.useMutation({
+    onSuccess: async () => {
+      setErro(null);
+      await utils.toolRequests.list.invalidate();
+      await utils.toolRequests.detail.invalidate({ tenantId, agentId, aggregateId });
+    },
+    onError: (e) => setErro(e.message),
+  });
+
+  if (detalhe.isLoading) return <LoadingState label="Carregando evidência…" />;
+  if (detalhe.error) return <ErrorState message={detalhe.error.message} />;
+
+  return (
+    <div className="space-y-2 border-t border-zinc-200 pt-3">
+      {erro ? <Alert tone="danger">{erro}</Alert> : null}
+      <ul className="space-y-1.5">
+        {(detalhe.data?.membros ?? []).map((m) => (
+          <li key={m.member_id} className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs text-zinc-700">
+              {m.is_representative ? <Badge tone="brand">representante</Badge> : null}{' '}
+              {m.intent} · {m.occurrences} ocorrência(s) · similaridade {m.similaridade}
+            </span>
+            {m.is_representative ? null : (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  desagrupar.mutate({
+                    tenantId,
+                    agentId,
+                    memberId: m.member_id,
+                    motivo: 'triagem: pedidos diferentes apesar da redação parecida',
+                  })
+                }
+              >
+                Desagrupar
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {(detalhe.data?.avisos ?? []).map((a) => (
+        <p key={a.tool_name} className="text-xs text-emerald-700">
+          {/* `String(...)` e não `new Date(...)`: o tipo do router diz `Date`, mas
+              o que chega pelo transporte tRPC é a string ISO — e o construtor
+              de `Date` não aceita `Date` na tipagem padrão. */}
+          O agente foi avisado em {new Date(String(a.notified_at)).toLocaleString('pt-BR')} de que{' '}
+          <code>{a.tool_name}</code> passou a existir — a lacuna fechou porque a ferramenta
+          está registrada <strong>e</strong> concedida a este agente.
+        </p>
+      ))}
+    </div>
+  );
+}
+
 export default function ToolRequests({
   tenantId,
   agentId,
@@ -124,6 +203,7 @@ export default function ToolRequests({
   );
   const [erroDoAceite, setErroDoAceite] = React.useState<string | null>(null);
   const [emVoo, setEmVoo] = React.useState<string | null>(null);
+  const [aberto, setAberto] = React.useState<string | null>(null);
 
   const aceitar = trpc.toolRequests.aceitar.useMutation({
     onSuccess: async () => {
@@ -210,6 +290,15 @@ export default function ToolRequests({
                   ) : null}
 
                   <div className="flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-brand-700 underline"
+                      onClick={() =>
+                        setAberto(aberto === item.aggregate_id ? null : item.aggregate_id)
+                      }
+                    >
+                      {aberto === item.aggregate_id ? 'Ocultar evidência' : 'Ver evidência'}
+                    </button>
                     {jaAceito ? (
                       <EstadoDoAceite aceite={item.aceite!} />
                     ) : (
@@ -233,6 +322,14 @@ export default function ToolRequests({
                       {jaAceito ? 'Já aceito' : 'Aceitar e abrir issue'}
                     </Button>
                   </div>
+
+                  {aberto === item.aggregate_id ? (
+                    <Evidencia
+                      tenantId={tenantId}
+                      agentId={agentId}
+                      aggregateId={item.aggregate_id}
+                    />
+                  ) : null}
                 </CardBody>
               </Card>
             );
