@@ -49,11 +49,11 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 178 | 19 |
+| `runtime` | 180 | 19 |
 | `admin-ui` | 27 | 6 |
 | `migrator` | 15 | 2 |
-| `backup` | 42 | 7 |
-| `maintenance` | 61 | 13 |
+| `backup` | 44 | 7 |
+| `maintenance` | 63 | 13 |
 
 O manifest completo (por serviço e por profile) é gerado em [`src/config/generated/service-env-manifest.json`](../src/config/generated/service-env-manifest.json).
 
@@ -220,6 +220,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` | number | `168` | não | `runtime`, `backup`, `maintenance` | sim | Intervalo máximo entre drills de restore aprovados. Vencido, a readiness degrada — até um drill passar, nenhum artefato é sabidamente restaurável. |
 | `RETENTION_DRY_RUN` | string | `true` | não | `runtime`, `backup`, `maintenance` | sim | Executor de retenção só CONTA, não apaga. Default `true` de propósito: exclusão é irreversível, então desligar isso é uma decisão explícita por ambiente. Só `false`/`0` desligam. |
 | `RETENTION_POLICY` | string | — | não | `runtime`, `backup`, `maintenance` | sim | Política de retenção APROVADA pelo jurídico/DPO, em JSON { version, approved_by, approved_at, classes: { <classe>: { retention_days } } }. Ausente ou malformada = nenhuma classe é purgável (o mecanismo conta, não apaga). Ver docs/architecture/concerns/data-retention-matrix.md. |
+| `PRIVACY_EXPORT_TTL_DAYS` | number | `7` | não | `runtime`, `backup`, `maintenance` | sim | Vida útil do pacote cifrado de export de privacidade, em dias. Sete é a POLÍTICA INICIAL decidida pelo dono (issue #536); o DPO ajusta depois, e por isso o prazo é configuração e não constante no código. Vale no momento da EMISSÃO: o prazo fica carimbado em privacy_requests.export_expires_at e é ele que o varredor honra, para que um export já entregue não mude de prazo debaixo do titular. |
+| `PRIVACY_EXPORT_SWEEP_DRY_RUN` | string | `false` | não | `runtime`, `backup`, `maintenance` | sim | Varredor do TTL do export só CONTA, não apaga. Default `false` — ao contrário de RETENTION_DRY_RUN, aqui a direção segura é EXECUTAR: o prazo de sete dias já é decisão tomada, e um varredor inerte deixa o pacote cifrado do titular no disco para sempre, que é o vazamento que o TTL fecha. Só `true`/`1` ligam o dry-run, então um valor inesperado mantém o varredor ativo. |
 
 ### Custo
 
@@ -341,7 +343,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `SHUTDOWN_FORCED_EXIT_CODE` | number | `1` | não | `runtime` | sim | Código de saída quando o drain termina INCOMPLETO (deadline estourado com trabalho em voo, segundo sinal, ou fase de boot que não cedeu). Distinto do 0 de um drain limpo, para o supervisor e o log distinguirem os dois casos. |
 | `READINESS_CACHE_MS` | number | `2000` | não | `runtime` | sim | Janela de cache da avaliação de componentes do /readyz, para que um polling agressivo do load balancer não vire gerador de carga em DB/Redis. O ESTADO do lifecycle nunca é cacheado: o drain derruba o /readyz para 503 na requisição seguinte. |
 | `READINESS_PROBE_TIMEOUT_MS` | number | `1500` | não | `runtime` | sim | Timeout por componente nas probes de readiness. Componente que não responde a tempo é reportado como `unknown` — o que é fail-closed para um componente obrigatório do papel. |
-| `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Exige que o veredito canônico de schema (getSchemaReadiness, #516) esteja `ready` antes de anunciar readiness: dirty state, checksum divergente, arquivo de migration ausente e schema incompatível derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). A readiness NUNCA aplica migration — só recusa servir num schema que ela não consegue verificar. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso. |
+| `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso. |
 | `READINESS_BACKLOG_MAX` | number | `0` | não | `runtime` | sim | Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog. |
 | `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. |
 

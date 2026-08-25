@@ -1373,6 +1373,39 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  PRIVACY_EXPORT_TTL_DAYS: {
+    name: 'PRIVACY_EXPORT_TTL_DAYS',
+    description:
+      'Vida útil do pacote cifrado de export de privacidade, em dias. Sete é a POLÍTICA INICIAL decidida pelo dono (issue #536); o DPO ajusta depois, e por isso o prazo é configuração e não constante no código. Vale no momento da EMISSÃO: o prazo fica carimbado em privacy_requests.export_expires_at e é ele que o varredor honra, para que um export já entregue não mude de prazo debaixo do titular.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(7),
+    example: '7',
+    fixture: '7',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  PRIVACY_EXPORT_SWEEP_DRY_RUN: {
+    name: 'PRIVACY_EXPORT_SWEEP_DRY_RUN',
+    description:
+      'Varredor do TTL do export só CONTA, não apaga. Default `false` — ao contrário de RETENTION_DRY_RUN, aqui a direção segura é EXECUTAR: o prazo de sete dias já é decisão tomada, e um varredor inerte deixa o pacote cifrado do titular no disco para sempre, que é o vazamento que o TTL fecha. Só `true`/`1` ligam o dry-run, então um valor inesperado mantém o varredor ativo.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // NÃO usa boolFlag: com boolFlag um valor inesperado (`yes`) viraria
+    // `true` num campo cujo `true` DESLIGA a proteção. A inversão aqui é
+    // deliberada e é o espelho do comentário de RETENTION_DRY_RUN — nos dois
+    // casos o valor inesperado cai no lado seguro, que é o oposto em cada um.
+    schema: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
 
   // ---- cost -------------------------------------------------------------
   DAILY_LLM_USD_THRESHOLD: {
@@ -2457,7 +2490,7 @@ export const ENV_CONTRACT = {
   READINESS_SCHEMA_CHECK: {
     name: 'READINESS_SCHEMA_CHECK',
     description:
-      'Exige que o veredito canônico de schema (getSchemaReadiness, #516) esteja `ready` antes de anunciar readiness: dirty state, checksum divergente, arquivo de migration ausente e schema incompatível derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). A readiness NUNCA aplica migration — só recusa servir num schema que ela não consegue verificar. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.',
+      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],

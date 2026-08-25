@@ -1621,6 +1621,40 @@
         "{\"version\":\"v1-dpo-2026-07\",\"approved_by\":\"<responsável jurídico>\",\"approved_at\":\"2026-07-01T00:00:00.000Z\",\"classes\":{}}"
       ]
     },
+    "PRIVACY_EXPORT_TTL_DAYS": {
+      "type": "string",
+      "description": "Vida útil do pacote cifrado de export de privacidade, em dias. Sete é a POLÍTICA INICIAL decidida pelo dono (issue #536); o DPO ajusta depois, e por isso o prazo é configuração e não constante no código. Vale no momento da EMISSÃO: o prazo fica carimbado em privacy_requests.export_expires_at e é ele que o varredor honra, para que um export já entregue não mude de prazo debaixo do titular.",
+      "x-maia-type": "number",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "7",
+      "examples": [
+        "7"
+      ]
+    },
+    "PRIVACY_EXPORT_SWEEP_DRY_RUN": {
+      "type": "string",
+      "description": "Varredor do TTL do export só CONTA, não apaga. Default `false` — ao contrário de RETENTION_DRY_RUN, aqui a direção segura é EXECUTAR: o prazo de sete dias já é decisão tomada, e um varredor inerte deixa o pacote cifrado do titular no disco para sempre, que é o vazamento que o TTL fecha. Só `true`/`1` ligam o dry-run, então um valor inesperado mantém o varredor ativo.",
+      "x-maia-type": "string",
+      "x-maia-group": "backup",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "backup",
+        "maintenance"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "DAILY_LLM_USD_THRESHOLD": {
       "type": "string",
       "description": "Teto diário (USD) do cost monitor. Acima dispara alerta.",
@@ -2847,7 +2881,7 @@
     },
     "READINESS_SCHEMA_CHECK": {
       "type": "string",
-      "description": "Exige que o veredito canônico de schema (getSchemaReadiness, #516) esteja `ready` antes de anunciar readiness: dirty state, checksum divergente, arquivo de migration ausente e schema incompatível derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). A readiness NUNCA aplica migration — só recusa servir num schema que ela não consegue verificar. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.",
+      "description": "Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.",
       "x-maia-type": "string",
       "x-maia-group": "lifecycle",
       "x-maia-secret": false,

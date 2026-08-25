@@ -904,9 +904,10 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   // A checagem de schema é um gate fail-closed. Desde a #516 o /readyz consome
   // o veredito canônico (`getSchemaReadiness()`): dirty state, checksum
   // divergente, arquivo de migration ausente e schema incompatível derrubam a
-  // instância para 503. Desligar isso é desligar a ÚNICA coisa que impede a
-  // plataforma de servir tráfego contra um schema que ela não consegue
-  // verificar.
+  // instância para 503 — e, desde a ADR 0004, as MESMAS condições recusam o
+  // BOOT com exit code próprio. Desligar isso é desligar a ÚNICA coisa que
+  // impede a plataforma de servir tráfego contra um schema que ela não
+  // consegue verificar.
   //
   // Em production isso é INVÁLIDO — o boot é recusado, não avisado (decisão do
   // owner na #516). Escopo `boot` de propósito: a regra vale também no caminho
@@ -924,7 +925,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         variable: 'READINESS_SCHEMA_CHECK',
         rule: 'lifecycle/schema-check-disabled',
         message:
-          'READINESS_SCHEMA_CHECK=false não é permitido no profile production: o /readyz deixaria de consultar o veredito de schema (#516) e a instância anunciaria readiness com migration pendente, ledger dirty, checksum divergente ou arquivo de migration ausente.',
+          'READINESS_SCHEMA_CHECK=false não é permitido no profile production: o boot deixaria de consultar o veredito de schema (#516/ADR 0004) e o /readyz também, e a instância subiria e anunciaria readiness com migration pendente, ledger dirty, checksum divergente ou arquivo de migration ausente.',
         remediation:
           'Remova READINESS_SCHEMA_CHECK=false (o default é true). Se código e schema são publicados fora de banda, faça isso em staging/development — em production o gate é obrigatório.',
       });
@@ -935,9 +936,9 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         variable: 'READINESS_SCHEMA_CHECK',
         rule: 'lifecycle/schema-check-disabled',
         message:
-          'READINESS_SCHEMA_CHECK=false: a instância vai anunciar readiness mesmo com migration pendente, ledger dirty ou checksum divergente, e falhará na primeira query que tocar uma coluna nova.',
+          'READINESS_SCHEMA_CHECK=false: o boot não vai recusar e a instância vai anunciar readiness mesmo com migration pendente, ledger dirty ou checksum divergente — e falhará na primeira query que tocar uma coluna nova.',
         remediation:
-          'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente. Em production o valor `false` é recusado no boot.',
+          'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente — é a alavanca declarada para manter dev/staging vivos contra um banco desalinhado. Em production o valor `false` é recusado no boot.',
       });
     }
   }
