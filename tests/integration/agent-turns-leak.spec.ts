@@ -133,7 +133,13 @@ d('agent turns — leak suite cross-tenant', () => {
           outcome: 'reply_delivered',
           expected_version: v,
         }),
-      () => agentTurnsRepo.markSuperseded({ turn_id: turnB.id, expected_version: v }),
+      () => agentTurnsRepo.markSupersededSelf({ turn_id: turnB.id, expected_version: v }),
+      () =>
+        agentTurnsRepo.markSupersededByAbsorber({
+          turn_id: turnB.id,
+          absorbed_by_turn_id: turnB.id,
+          expected_version: v,
+        }),
       () =>
         agentTurnsRepo.markRetryable({
           turn_id: turnB.id,

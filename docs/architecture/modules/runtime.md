@@ -120,6 +120,30 @@ passar o zumbi enquanto o sucessor renova. Zero linhas com fence declarado é
 é oposta (parar, não reler e reinsistir). Ele cancela o `AbortSignal` da lease,
 emite `maia_turn_fence_rejected_total` e audita `turn_fence_rejected`.
 
+**O fence pertence a quem ABSORVE.** Marcar um turno `superseded` são DUAS
+operações, não uma, e elas têm regras opostas — colapsá-las numa só foi o que
+deixou a transição terminal `superseded` sem fence nenhum:
+
+| Operação | Linha que muda | De quem é a posse exigida |
+|---|---|---|
+| `markSupersededSelf` | o próprio turno | do **próprio turno** (`claim_token` vigente, como toda transição terminal) |
+| `markSupersededByAbsorber` | o turno **irmão** | do turno **ABSORVEDOR** (token + `lease_expires_at > now()`, num `EXISTS` na mesma declaração), mais o compare-and-swap na linha do irmão |
+
+O irmão absorvido **não precisa de claim, e normalmente não tem nenhum**: quem
+foi reivindicado é o executor da rajada de debounce, então `claim_token IS NULL`
+é o estado normal dele. Exigir claim do irmão tornaria a absorção legítima
+impossível no caso comum; não exigir nada dos dois lados deixaria um worker
+zumbi — lease vencida, tentativa já sucedida — absorvendo turnos e apagando
+trabalho do sucessor. O compare-and-swap na linha do irmão (`expected_version`,
+**obrigatório**) é o que decide a corrida entre duas absorções concorrentes; o
+fence do absorvedor é o que decide se ela pode sequer ser tentada.
+
+O `WHERE` das duas formas é montado por
+[`src/db/repositories/turn-fence-sql.ts`](../../../src/db/repositories/turn-fence-sql.ts),
+um módulo PURO — `runTransition` não acrescenta predicado nenhum depois dessa
+chamada. É o que permite a `tests/unit/db/turn-fence-sql.spec.ts` compilar o SQL
+REAL com `PgDialect` e provar o fence sem Postgres no ar.
+
 **As TRÊS posses.** `resolveFence()` (`lifecycle.ts`) classifica o handle em
 `unfenced` (não há lease: `FEATURE_TURN_CLAIM` OFF, regime de #503),
 `fenced` (lease viva → token no `WHERE`) e `lost` (a lease EXISTIU e morreu:
@@ -220,9 +244,22 @@ contrato, nunca o `.env.example`):
 
 | Flag | Default | Efeito |
 |---|---|---|
-| `FEATURE_TURN_STATE_MACHINE` | `true` | Dual-write: cria/transiciona turnos. Só ESCRITA — o comportamento observável não muda. **Exige as migrations 096/097 aplicadas.** |
-| `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | Flip da LEITURA: o recovery elege por `agent_turns.status` em vez de `processada_em`. |
-| `FEATURE_TURN_CLAIM` | `false` | Claim atômico + lease + fencing (#504). É o único regime em que `beginTurnExecution` pode devolver `started: false` e BARRAR a execução. **Exige a migration 114.** |
+| `FEATURE_TURN_STATE_MACHINE` | `true` | Cria/transiciona turnos. **Exige as migrations 096/097 aplicadas.** |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | `true` | A LEITURA é do estado: o recovery elege por `agent_turns.status` em vez de `processada_em`, e falha de escrita da máquina vira `TurnStateWriteError` (bloqueante) em vez de fail-soft. |
+| `FEATURE_TURN_CLAIM` | `true` | Claim atômico + lease + fencing (#504). É o único regime em que `beginTurnExecution` pode devolver `started: false` e BARRAR a execução. **Exige a migration 114.** |
+| `FEATURE_TURN_JOB_V2` | `false` | PRODUTOR do payload V2. Continua OFF por default: é o passo de rollout que exige TODAS as réplicas de consumo já no build que entende V2. |
+
+**Os três defaults ON valem desde o PRIMEIRO deploy de produção** (decisão do
+dono, #504). Numa produção greenfield não existe histórico a backfillar nem
+coorte a comparar, e deixar o caminho legado como padrão criaria dependência
+dele: `FEATURE_TURN_CLAIM=false` não é "modo conservador", é a janela de
+execução dupla aberta, e `FEATURE_TURN_STATE_AUTHORITATIVE=false` faz um turno
+`retryable` sumir do recovery. **`false` nas três é rollback emergencial, não
+configuração suportada** — o código do caminho legado (`markClaimed` sem lease,
+shadow com `processada_em` decidindo) continua existindo e testado justamente
+para que o rollback funcione, mas nenhum teste novo deve assumi-lo como padrão.
+Desligar SÓ `FEATURE_TURN_STATE_MACHINE` é recusado no boot (as outras duas
+ficariam inertes): num rollback, desligue as três juntas.
 
 `TURN_LEASE_TTL_MS` (60s) e `TURN_LEASE_HEARTBEAT_MS` (15s) dimensionam a lease.
 O heartbeat DEVE caber ao menos 3× no TTL — com 2×, uma renovação perdida já
@@ -239,6 +276,20 @@ Enquanto a segunda flag estiver OFF, `mensagens.processada_em` continua sendo a
 decisão de negócio e a máquina roda em **shadow**; a divergência é medida por
 `maia_turn_legacy_projection_mismatch_total`. Runbook:
 [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
+
+**Com ela ON — o default — `processada_em` deixa de ser o sinal de "o turno
+rodou até o fim".** A projeção legada passa a SEGUIR o estado: `runTransition`
+([`src/db/repositories/turn-repos.ts`](../../../src/db/repositories/turn-repos.ts))
+só carimba `processada_em` em transição **terminal**, na mesma transação do CAS
+e restrito às mensagens ligadas por `agent_turn_inputs`; fora disso
+`src/agent/core.ts` registra `agent.legacy_projection_skipped_non_terminal`. Um
+turno que termina `retryable` (timeout de reasoner, falha pre-send do outbound)
+corretamente **não** carimba — carimbar é o que matava o retry, porque a
+reentrada morria no early-return legado. Consequência prática para quem escreve
+teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
+(`status`/`outcome`/`last_error_code`/`state_version`) mais a ligação
+`agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
+encerrado por um turno TERMINAL".
 
 ### Feature flags (`src/runtime/feature-flags/`)
 

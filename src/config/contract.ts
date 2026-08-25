@@ -1610,12 +1610,16 @@ export const ENV_CONTRACT = {
   FEATURE_TURN_STATE_MACHINE: {
     name: 'FEATURE_TURN_STATE_MACHINE',
     description:
-      'Máquina de estados durável do turno inbound (issue #503): dual-write de agent_turns. ' +
+      'Máquina de estados durável do turno inbound (issue #503): agent_turns. ' +
       'EXIGE as migrations 096 e 097 APLICADAS — subir o processo com esta flag ligada antes de ' +
-      '`npm run db:migrate` derruba todo o ingresso. Default ON, e só ESCRITA: enquanto ' +
-      'FEATURE_TURN_STATE_AUTHORITATIVE estiver false, `mensagens.processada_em` continua sendo a ' +
-      'decisão de negócio e o comportamento observável não muda. Kill switch: false volta ao ' +
-      'runtime anterior sem perder os turnos já gravados. Ver docs/runbooks/turn-state-machine.md.',
+      '`npm run db:migrate` derruba todo o ingresso. Default ON. Com ' +
+      'FEATURE_TURN_STATE_AUTHORITATIVE também ON (o default desde #504), agent_turns é a fonte ' +
+      'de verdade do turno e `mensagens.processada_em` fica sendo apenas projeção de ' +
+      'compatibilidade; com ela OFF a máquina roda em shadow e `processada_em` decide. ' +
+      'OFF é ROLLBACK EMERGENCIAL, não configuração suportada — e desligar SÓ esta flag é ' +
+      'recusado no boot, porque FEATURE_TURN_CLAIM e FEATURE_TURN_STATE_AUTHORITATIVE (ambas ON ' +
+      'por default) ficariam inertes: desligue as três juntas. Nenhum turno já gravado é perdido. ' +
+      'Ver docs/runbooks/turn-state-machine.md.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
@@ -1648,20 +1652,21 @@ export const ENV_CONTRACT = {
   FEATURE_TURN_CLAIM: {
     name: 'FEATURE_TURN_CLAIM',
     description:
-      'Claim ATÔMICO do turno com lease e fencing (issue #504). OFF (default): o runtime usa o ' +
-      'claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas podem processar o ' +
-      'mesmo turno. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, renova ' +
-      'lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token vigente; ' +
-      'perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 aplicada e ' +
-      'FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a reivindicar). ' +
-      'Kill switch: false volta ao caminho de #503 sem perder claims já gravados. ' +
-      'Ver docs/runbooks/turn-state-machine.md §6.',
+      'Claim ATÔMICO do turno com lease e fencing (issue #504). Default ON — inclusive no PRIMEIRO ' +
+      'deploy de produção. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, ' +
+      'renova lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token ' +
+      'vigente; perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 ' +
+      'aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a ' +
+      'reivindicar). OFF é ROLLBACK EMERGENCIAL, não configuração suportada: o runtime volta ao ' +
+      'claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas voltam a poder ' +
+      'processar o mesmo turno e as gravações deixam de carregar fence. Nenhum claim já gravado é ' +
+      'perdido. Ver docs/runbooks/turn-state-machine.md §6.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
-    schema: boolFlag('false'),
-    example: 'false',
-    fixture: 'false',
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
     restartRequired: true,
     commentedInExample: true,
   },
@@ -1694,17 +1699,21 @@ export const ENV_CONTRACT = {
     name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
     description:
       'Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos ' +
-      'por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno ' +
-      '`retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, ' +
-      'muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído ' +
+      'por agent_turns.status em vez de processada_em IS NULL. Default ON — numa produção ' +
+      'greenfield não existe histórico a backfillar, e é o ÚNICO modo em que um turno `retryable` ' +
+      '(timeout de reasoner, falha pre-send do outbound) volta para a fila; com ele OFF esses ' +
+      'turnos ficam invisíveis para o recovery. Também torna BLOQUEANTE a falha de escrita da ' +
+      'máquina de estados (`TurnStateWriteError`), como exige "PostgreSQL é a fonte de verdade". ' +
+      'Exige FEATURE_TURN_STATE_MACHINE ligada e, numa base COM histórico, o backfill concluído ' +
       '(`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. ' +
-      'Ver docs/runbooks/turn-state-machine.md §2.',
+      'OFF é ROLLBACK EMERGENCIAL: devolve a decisão a `mensagens.processada_em` e volta a ' +
+      'fail-soft. Ver docs/runbooks/turn-state-machine.md §2.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
-    schema: boolFlag('false'),
-    example: 'false',
-    fixture: 'false',
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
     restartRequired: true,
     commentedInExample: true,
   },

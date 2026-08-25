@@ -47,6 +47,11 @@ import {
   type ClaimResult,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
+import {
+  statusList,
+  turnWriteConditions,
+  type TurnWriteFence,
+} from './turn-fence-sql.js';
 
 /** Colunas devolvidas pelo `RETURNING` do claim atômico. */
 type ClaimRow = {
@@ -159,23 +164,6 @@ function transitionLabel(from: TurnStatus | 'any', to: TurnStatus): string {
   return `${from}->${to}`;
 }
 
-/**
- * Lista de estados como argumentos de um `IN (...)`, cada um parametrizado.
- *
- * Interpolar um array JS direto num template `sql` do Drizzle NÃO produz um
- * array do Postgres: ele vira uma lista de placeholders `($1, $2, $3)`, e
- * `($1,$2,$3)::text[]` é um RECORD, que o Postgres recusa converter
- * (`cannot cast type record to text[]`). O erro só aparece em tempo de
- * execução, contra banco real — este helper existe para que a forma correta
- * seja a única disponível.
- */
-function statusList(statuses: readonly string[]) {
-  return sql.join(
-    statuses.map((s) => sql`${s}`),
-    sql`, `,
-  );
-}
-
 export const agentTurnsRepo = {
   /**
    * Ingresso ATÔMICO: persiste a mensagem inbound, cria o turno em `received` e
@@ -277,6 +265,13 @@ export const agentTurnsRepo = {
    *   um token que casa — e escreveria como dono de uma posse que já não tem.
    *   Só a lease não basta, porque o sucessor renova a lease e o zumbi passaria.
    *   Falha aqui é `stale_claim`, nunca `state_mismatch`.
+   * @param input.absorber_fence #504 (decisão do dono) — o fence pertence a
+   *   OUTRA linha: a transição só passa se o turno ABSORVEDOR nomeado aqui
+   *   ainda tiver este `claim_token` e lease viva. Usado pela absorção de
+   *   irmão do debounce, onde a linha que muda (o irmão) não tem — e não
+   *   precisa ter — claim próprio. MUTUAMENTE EXCLUSIVO com
+   *   `expected_claim_token`: uma gravação tem UMA autoridade, e declarar as
+   *   duas significa que quem chamou não sabe de quem é a posse.
    */
   async transitionTurn(input: {
     turn_id: string;
@@ -285,9 +280,16 @@ export const agentTurnsRepo = {
     expected_statuses?: readonly TurnStatus[];
     expected_version?: number;
     expected_claim_token?: string;
+    absorber_fence?: { turn_id: string; claim_token: string };
     patch?: TurnTransitionPatch;
     manual?: boolean;
   }): Promise<TurnTransitionResult> {
+    if (input.expected_claim_token !== undefined && input.absorber_fence !== undefined) {
+      throw new Error(
+        'transitionTurn: expected_claim_token e absorber_fence são mutuamente exclusivos — ' +
+          'uma gravação tem UMA autoridade (a própria tentativa OU o turno absorvedor).',
+      );
+    }
     const outcome = input.outcome ?? null;
     const allowedSources = sourceStatusesFor(input.to, { manual: input.manual === true });
     const sources = input.expected_statuses
@@ -320,6 +322,9 @@ export const agentTurnsRepo = {
         : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
+        : {}),
+      ...(input.absorber_fence !== undefined
+        ? { absorber_fence: input.absorber_fence }
         : {}),
       patch: input.patch ?? {},
     });
@@ -674,12 +679,27 @@ export const agentTurnsRepo = {
     });
   },
 
-  /** Turno incorporado a outro pelo debounce (`received | queued -> superseded`). */
-  async markSuperseded(input: {
+  /**
+   * AUTO-SUPERSESSÃO: o turno declara a si mesmo incorporado a outro
+   * (`received | queued -> superseded`), sem nomear o absorvedor.
+   *
+   * É a MESMA tentativa gravando o próprio desfecho, então o fence é o comum a
+   * toda gravação da tentativa: o `claim_token` VIGENTE DO PRÓPRIO TURNO. Sem
+   * ele esta porta era a única transição terminal sem posse — um worker que já
+   * havia perdido a lease conseguia fechar o turno como `superseded` por cima
+   * da tentativa do sucessor, e `superseded` é terminal, então o sucessor
+   * perdia o turno sem que nada aparecesse como conflito.
+   *
+   * `expected_claim_token` é opcional pela MESMA razão que nas outras
+   * transições: com `FEATURE_TURN_CLAIM` OFF não existe lease e não há token a
+   * exigir (regime de #503). Quem decide se há posse a exigir é
+   * `resolveFence()` em `src/runtime/turns/lifecycle.ts`, e é lá — não aqui —
+   * que a posse PERDIDA recusa a gravação antes mesmo de ir ao banco.
+   */
+  async markSupersededSelf(input: {
     turn_id: string;
-    /** Turno EXECUTOR que absorveu este. Persistido em `superseded_by_turn_id`. */
-    absorbed_by_turn_id?: string;
     expected_version?: number;
+    expected_claim_token?: string;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
@@ -688,12 +708,67 @@ export const agentTurnsRepo = {
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
+      ...(input.expected_claim_token !== undefined
+        ? { expected_claim_token: input.expected_claim_token }
+        : {}),
+      patch: { next_attempt_at: null, clearClaim: true },
+    });
+  },
+
+  /**
+   * ABSORÇÃO DE IRMÃO: o turno EXECUTOR da rajada de debounce absorve o turno
+   * de uma mensagem irmã (`received | queued -> superseded`), gravando a
+   * relação em `superseded_by_turn_id`.
+   *
+   * Aqui a linha que muda e a autoridade que manda mudá-la são DUAS LINHAS
+   * DIFERENTES, e é isso que torna esta operação distinta da anterior:
+   *
+   *  - o FENCE é do ABSORVEDOR — `absorber_claim_token` + lease viva dele,
+   *    verificados na MESMA declaração (ver `absorberFenceCondition`). Sem essa
+   *    verificação, um worker zumbi (lease vencida, tentativa já sucedida)
+   *    continuaria absorvendo turnos e apagando trabalho do sucessor;
+   *  - o IRMÃO NÃO precisa de claim, e é por isso que não existe parâmetro para
+   *    exigi-lo. O turno absorvido nunca foi reivindicado no caso normal
+   *    (`claim_token IS NULL`), porque quem foi reivindicado foi o executor.
+   *    Exigir claim do irmão tornaria a absorção legítima IMPOSSÍVEL no caminho
+   *    comum;
+   *  - o que decide a corrida entre duas absorções concorrentes é o
+   *    COMPARE-AND-SWAP na linha do irmão: `expected_version` é OBRIGATÓRIO
+   *    (não opcional como nas demais transições) exatamente para que ninguém
+   *    possa omiti-lo por descuido — sem ele, duas absorções que leram o mesmo
+   *    estado poderiam ambas se declarar vencedoras e a rajada produziria dois
+   *    turnos executáveis disputando as mesmas mensagens.
+   */
+  async markSupersededByAbsorber(input: {
+    /** O IRMÃO absorvido — a linha que muda. */
+    turn_id: string;
+    /** O ABSORVEDOR: turno executor da rajada. Persistido em `superseded_by_turn_id`. */
+    absorbed_by_turn_id: string;
+    /**
+     * Posse do ABSORVEDOR. Ausente só no regime de #503 (`FEATURE_TURN_CLAIM`
+     * OFF), onde não existe lease em lugar nenhum.
+     */
+    absorber_claim_token?: string;
+    /** CAS na linha do irmão. OBRIGATÓRIO — ver acima. */
+    expected_version: number;
+  }): Promise<TurnTransitionResult> {
+    return this.transitionTurn({
+      turn_id: input.turn_id,
+      to: 'superseded',
+      outcome: 'merged_into_turn',
+      expected_version: input.expected_version,
+      ...(input.absorber_claim_token !== undefined
+        ? {
+            absorber_fence: {
+              turn_id: input.absorbed_by_turn_id,
+              claim_token: input.absorber_claim_token,
+            },
+          }
+        : {}),
       patch: {
         next_attempt_at: null,
         clearClaim: true,
-        ...(input.absorbed_by_turn_id !== undefined
-          ? { superseded_by_turn_id: input.absorbed_by_turn_id }
-          : {}),
+        superseded_by_turn_id: input.absorbed_by_turn_id,
       },
     });
   },
@@ -1287,6 +1362,42 @@ async function findTurnByRepresentative(
 }
 
 /**
+ * O absorvedor AINDA é dono? Releitura de classificação, feita só quando a
+ * absorção voltou zero linhas.
+ *
+ * Deliberadamente a MESMA condição de `absorberFenceCondition` — escopo,
+ * token, lease viva e estado gravável — porque a pergunta é literalmente "o
+ * predicado que reprovou foi este?". `lease_live` é avaliada NO BANCO pelo
+ * mesmo motivo de sempre: comparar `lease_expires_at` com o relógio do
+ * processo reintroduziria o clock skew que o fence existe para eliminar.
+ */
+async function absorberStillOwns(
+  tx: Executor,
+  args: {
+    tenant_id: string;
+    agent_id: string;
+    absorber_turn_id: string;
+    claim_token: string;
+  },
+): Promise<boolean> {
+  const rows = await tx
+    .select({ id: agent_turns.id })
+    .from(agent_turns)
+    .where(
+      and(
+        eq(agent_turns.tenant_id, args.tenant_id),
+        eq(agent_turns.agent_id, args.agent_id),
+        eq(agent_turns.id, args.absorber_turn_id),
+        eq(agent_turns.claim_token, args.claim_token),
+        inArray(agent_turns.status, [...FENCED_WRITE_STATUSES]),
+        sql`${agent_turns.lease_expires_at} > now()`,
+      ),
+    )
+    .limit(1);
+  return rows.length === 1;
+}
+
+/**
  * O UPDATE compare-and-swap + (quando terminal) a projeção legada, na MESMA
  * transação. Zero rows -> releitura para classificar o conflito.
  */
@@ -1297,10 +1408,25 @@ async function runTransition(args: {
   sources: readonly TurnStatus[];
   expected_version?: number;
   expected_claim_token?: string;
+  absorber_fence?: { turn_id: string; claim_token: string };
   patch: TurnTransitionPatch;
 }): Promise<TurnTransitionResult> {
   const { tenant_id, agent_id } = scope();
   const terminal = isTerminalTurnStatus(args.to);
+  // O fence desta gravação, numa forma só. `turnWriteConditions` é a fonte
+  // ÚNICA do `WHERE` — nada é acrescentado a ele depois desta chamada, e é o
+  // que permite a `tests/unit/db/turn-fence-sql.spec.ts` compilar o predicado
+  // REAL de produção sem Postgres.
+  const fence: TurnWriteFence =
+    args.absorber_fence !== undefined
+      ? {
+          kind: 'absorber',
+          absorber_turn_id: args.absorber_fence.turn_id,
+          claim_token: args.absorber_fence.claim_token,
+        }
+      : args.expected_claim_token !== undefined
+        ? { kind: 'self', claim_token: args.expected_claim_token }
+        : { kind: 'none' };
 
   return withTx(async (tx) => {
     const set: Record<string, unknown> = {
@@ -1341,22 +1467,16 @@ async function runTransition(args: {
       .set(set as never)
       .where(
         and(
-          eq(agent_turns.tenant_id, tenant_id),
-          eq(agent_turns.agent_id, agent_id),
-          eq(agent_turns.id, args.turn_id),
-          inArray(agent_turns.status, [...args.sources]),
-          ...(args.expected_version !== undefined
-            ? [eq(agent_turns.state_version, args.expected_version)]
-            : []),
-          // #504 — o FENCE. Token vigente E lease viva: ver o comentário de
-          // `transitionTurn`. `now()` é o relógio do PostgreSQL, o único
-          // comparável entre réplicas.
-          ...(args.expected_claim_token !== undefined
-            ? [
-                eq(agent_turns.claim_token, args.expected_claim_token),
-                sql`${agent_turns.lease_expires_at} > now()`,
-              ]
-            : []),
+          ...turnWriteConditions({
+            tenant_id,
+            agent_id,
+            turn_id: args.turn_id,
+            sources: args.sources,
+            ...(args.expected_version !== undefined
+              ? { expected_version: args.expected_version }
+              : {}),
+            fence,
+          }),
         ),
       )
       .returning();
@@ -1391,9 +1511,24 @@ async function runTransition(args: {
       // não bate, a causa é a PERDA DE POSSE — mesmo que o status também tenha
       // andado. Reportar `state_mismatch` aqui faria o caller reler e tentar de
       // novo, que é a reação exatamente errada para um zumbi.
-      const fenceBroken =
+      //
+      // Com fence de ABSORVEDOR a pergunta é a mesma, feita na OUTRA linha:
+      // "o turno que mandou absorver ainda tem a posse?". Um `state_mismatch`
+      // aqui mandaria o absorvedor reler o irmão e reinsistir — e insistir é
+      // exatamente o que um zumbi não pode fazer. Custa uma leitura escapada,
+      // só no caminho de fracasso.
+      const selfFenceBroken =
         args.expected_claim_token !== undefined &&
         (row.claim_token !== args.expected_claim_token || row.lease_live !== true);
+      const absorberFenceBroken =
+        args.absorber_fence !== undefined &&
+        !(await absorberStillOwns(tx, {
+          tenant_id,
+          agent_id,
+          absorber_turn_id: args.absorber_fence.turn_id,
+          claim_token: args.absorber_fence.claim_token,
+        }));
+      const fenceBroken = selfFenceBroken || absorberFenceBroken;
       if (fenceBroken) {
         // NÃO incrementa `maia_turn_fence_rejected_total` aqui, e isso é uma
         // escolha de DONO, não um esquecimento.
