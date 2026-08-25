@@ -3202,6 +3202,16 @@ export const agent_turns = pgTable(
     stream_key_version: smallint('stream_key_version'),
     first_ingress_seq: bigint('first_ingress_seq', { mode: 'number' }),
     last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }),
+    // 127 (#627, fatia D) — a DECISÃO de promoção, persistida ANTES do sinal da
+    // BullMQ. `promoted_at` marca "este turno foi eleito para avançar e alguém
+    // deve um wake-up a ele"; é o que permite ao varredor reconciliar o caso
+    // "commit feito, enqueue não feito" (a fila é wake-up, não fonte de
+    // verdade). `promoted_by_turn_id` é o predecessor TERMINAL que promoveu —
+    // NULL quando o re-arme veio da recuperação de claim expirado da própria
+    // stream, onde não existe promotor. Deliberadamente NÃO reescrevem
+    // `queued_at`: a idade do head mede a espera real, não a última promoção.
+    promoted_at: timestamp('promoted_at', { withTimezone: true }),
+    promoted_by_turn_id: uuid('promoted_by_turn_id'),
     queued_at: timestamp('queued_at', { withTimezone: true }),
     claimed_at: timestamp('claimed_at', { withTimezone: true }),
     started_at: timestamp('started_at', { withTimezone: true }),

@@ -128,16 +128,23 @@ describe('#626 — contrato do head-of-line', () => {
   // ─── "Uma única função": a estrutura, não a intenção ─────────────────────
 
   it('todos os consumidores da regra no repositório chamam a MESMA função', () => {
-    // Os quatro: o `WHERE` do claim, o filtro do recovery, o dispatcher
-    // cross-tenant e o canário do recovery. O número é afirmado para que
+    // Os CINCO: o `WHERE` do claim, o filtro do recovery, o dispatcher
+    // cross-tenant, o canário do recovery e — desde #627 — a eleição do
+    // sucessor em `promoteStreamSuccessor`. O número é afirmado para que
     // acrescentar um consumidor NOVO sem passar pela função obrigue a mexer
     // aqui — que é o momento de perguntar por quê.
+    //
+    // Por que a promoção conta: ela é a resposta à MESMA pergunta ("quem é o
+    // head desta stream?") num terceiro momento do ciclo. Se ela tivesse
+    // predicado próprio, o claim e a promoção poderiam eleger turnos
+    // DIFERENTES — e o sintoma seria um turno promovido que o claim recusa
+    // com `not_head`, isto é, uma conversa que recebe wake-up e não anda.
     const codigo = repoFonte
       .split('\n')
       .filter((l) => !/^\s*(\*|\/\/)/.test(l))
       .join('\n');
     const chamadas = codigo.match(/streamHeadOfLineNotExists\(/g) ?? [];
-    expect(chamadas.length).toBe(4);
+    expect(chamadas.length).toBe(5);
   });
 
   it('o repositório NÃO tem uma segunda cópia do predicado escrita à mão', () => {

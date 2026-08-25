@@ -8,11 +8,13 @@
  * elegibilidade divergem, e a divergência só aparece durante um recovery."
  *
  * O jeito de tornar isso verdadeiro não é disciplina: é não existir um segundo
- * lugar onde a regra possa ser escrita. Os TRÊS consumidores da regra —
+ * lugar onde a regra possa ser escrita. Os CINCO consumidores da regra —
  *
  *   1. `claimNextEligibleTurn` (o `WHERE` do claim),
  *   2. `findRecoverableTurns` (quais turnos o recovery rearma),
  *   3. `listTenantAgentPairsWithRecoverableTurns` (o dispatcher cross-tenant),
+ *   4. `listNonHeadTurns` (o canário do recovery),
+ *   5. `promoteStreamSuccessor` (#627 — quem o predecessor terminal promove),
  *
  * — chamam `streamHeadOfLineNotExists()`. Nenhum deles monta predicado próprio.
  * Apagar a condição de um só deles é o defeito que a issue nomeia, e
@@ -199,6 +201,68 @@ export function earlierLiveTurnCount(input: { tenant: SQL; agent: SQL; alvo: SQL
  * abriria a janela em que o turno muda entre as duas, e a explicação do
  * fracasso passaria a descrever um estado que já não existe.
  */
+/**
+ * #627 (fatia D) — o SUCESSOR: o turno não terminal MAIS ANTIGO da stream do
+ * predecessor, trancado para escrita.
+ *
+ * ─── Por que a "posterior" mora AQUI, e não no repositório ────────────────
+ *
+ * Este módulo é o dono da ordem da stream: `first_ingress_seq` só pode ser
+ * comparada com a de outro turno dentro deste arquivo. A regra é a mesma da
+ * #626 vista do outro lado — lá "existe alguém ANTES de mim?", aqui "quem vem
+ * DEPOIS que eu terminei?" — e escrever a segunda no `turn-repos.ts` criaria a
+ * divergência que a fatia C existe para eliminar: duas noções de "próximo" que
+ * concordam hoje e discordam no dia em que alguém mexer no desempate.
+ * `tests/unit/runtime/stream-head-of-line-contract.spec.ts` proíbe, por regex,
+ * que essa comparação apareça no repositório.
+ *
+ * ─── Por que a eleição NÃO tem `first_ingress_seq > <a do predecessor>` ───
+ *
+ * A tentação é "o próximo depois de mim". Está errado, e o erro é silencioso:
+ * um turno com sequência MENOR que a do predecessor e ainda não terminal
+ * (backfill, replay manual, um irmão absorvido fora de ordem) ficaria invisível
+ * para sempre, e a stream avançaria por cima dele — a inversão que a #505
+ * existe para impedir, produzida pela própria promoção.
+ *
+ * A eleição correta é ABSOLUTA: o MENOR `first_ingress_seq` não terminal da
+ * stream, qualquer que seja o do predecessor. Como o predecessor já está
+ * terminal quando esta consulta roda (mesma transação do CAS), ele está fora do
+ * conjunto por construção — não é preciso excluí-lo, e excluí-lo por `id` seria
+ * a única forma de a consulta MENTIR caso o CAS não tivesse acontecido.
+ *
+ * ─── `FOR UPDATE OF s`, e o que ele compra ────────────────────────────────
+ *
+ * Duas conclusões simultâneas na MESMA stream (o head e um irmão absorvido,
+ * por exemplo) elegeriam o mesmo sucessor e o promoveriam duas vezes. O lock de
+ * linha serializa: a segunda transação espera, re-avalia o `WHERE` do UPDATE
+ * contra a versão nova (EvalPlanQual) e não casa mais — "exatamente um
+ * sucessor" vira propriedade do banco, não da ordem em que os callers rodam.
+ *
+ * `LIMIT 1` é o que mantém o lock estreito: uma linha por stream, nunca a fila.
+ */
+export function streamSuccessorCandidate(input: {
+  tenant: SQL;
+  agent: SQL;
+  predecessor_turn_id: string;
+}): SQL {
+  return sql`
+    SELECT s.id, s.status
+      FROM ${agent_turns} AS pred
+      JOIN ${agent_turns} AS s
+        ON  s.tenant_id  = ${input.tenant}
+        AND s.agent_id   = ${input.agent}
+        AND s.stream_key = pred.stream_key
+        AND s.first_ingress_seq IS NOT NULL
+        AND s.status NOT IN (${statusLiterals(STREAM_FIFO_TERMINAL_STATUSES)})
+     WHERE pred.tenant_id  = ${input.tenant}
+       AND pred.agent_id   = ${input.agent}
+       AND pred.id         = ${input.predecessor_turn_id}
+       AND pred.stream_key IS NOT NULL
+     ORDER BY s.first_ingress_seq
+     LIMIT 1
+       FOR UPDATE OF s`;
+}
+
 export function earlierLiveTurnProbe(input: {
   tenant: SQL;
   agent: SQL;

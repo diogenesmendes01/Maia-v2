@@ -302,7 +302,12 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
       }),
     );
     expect(claim.ok).toBe(true);
-    expect(claim.recovered_stream_claims).toEqual([morto]);
+    // #627 mudou o CONTEÚDO deste campo de `string[]` para o objeto de promoção
+    // (`StreamClaimRecovery`): o turno recuperado precisa ser RE-ARMADO, e o
+    // wake-up exige o `representative_message_id` da linha recuperada. A
+    // afirmação da fatia B é a mesma; o payload do sinal veio junto.
+    expect(claim.recovered_stream_claims?.map((r) => r.turn_id)).toEqual([morto]);
+    expect(claim.recovered_stream_claims?.[0]?.representative_message_id).toBeTruthy();
 
     const recuperado = await readTurn(morto);
     // Devolvido à fila, não descartado: o varredor de recovery já procura

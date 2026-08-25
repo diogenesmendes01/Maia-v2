@@ -1682,6 +1682,34 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_STREAM_PROMOTION: {
+    name: 'FEATURE_TURN_STREAM_PROMOTION',
+    description:
+      'PROMOÇÃO DO SUCESSOR quando o head-of-line chega a estado terminal (issue #627, fatia D ' +
+      'da #505; fase 6 do rollout). EXIGE a migration 127 APLICADA (colunas promoted_at e ' +
+      'promoted_by_turn_id) e FEATURE_TURN_HEAD_OF_LINE ligada. Default ON. ON: a MESMA transação ' +
+      'que conclui um turno elege o próximo turno elegível da stream, persiste a decisão e só ' +
+      'DEPOIS do commit sinaliza a BullMQ — a fila é wake-up, não fonte de verdade, e um crash ' +
+      'entre o commit e o enqueue é reconciliado pelo varredor (promoted_at). Também re-arma o ' +
+      'turno cujo claim expirado foi recuperado na transação do claim (#625), que sem isto ' +
+      'esperava até STUCK_AFTER_MS (2 min) pelo varredor. Um worker STALE não promove ninguém: o ' +
+      'fence do CAS terminal recusa a conclusão antes de a promoção rodar. ' +
+      'OFF é ROLLBACK: a conclusão deixa de promover, a ordem CONTINUA correta (o head-of-line ' +
+      'não depende disto) e a conversa volta a andar na cadência do varredor de recovery — ' +
+      'latência, não inversão. Sem head-of-line a flag é INERTE de propósito: naquele regime ' +
+      'nenhum job é recusado por posição, então não há fila a destravar. ' +
+      'Vigie maia_stream_promotion_total{result} — `enqueue_failed` subindo sem `recovered` ' +
+      'acompanhando é varredor parado, não promoção quebrada. ' +
+      'Ver docs/runbooks/turn-state-machine.md §12.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_STRICT_TOOL_SCHEMAS: {
     name: 'FEATURE_STRICT_TOOL_SCHEMAS',
     description:

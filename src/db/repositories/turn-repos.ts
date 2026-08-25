@@ -52,6 +52,7 @@ import {
   STREAM_OCCUPYING_STATUSES,
   type ClaimRejection,
   type ClaimResult,
+  type StreamClaimRecovery,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
 import { recordStreamBlocked, recordStreamFifoViolation } from '@/runtime/turns/stream-metrics.js';
@@ -60,15 +61,17 @@ import {
   turnWriteConditions,
   type TurnWriteFence,
 } from './turn-fence-sql.js';
-// #626 — a REGRA FIFO, num módulo puro. Os QUATRO consumidores dela neste
+// #626 — a REGRA FIFO, num módulo puro. Os CINCO consumidores dela neste
 // arquivo — o `WHERE` de `claimNextEligibleTurn`, o filtro de
-// `findRecoverableTurns`, o dispatcher cross-tenant e o canário
-// `listNonHeadTurns` — chamam estas funções; nenhum monta predicado próprio.
+// `findRecoverableTurns`, o dispatcher cross-tenant, o canário
+// `listNonHeadTurns` e (desde #627) a eleição de `promoteStreamSuccessor` —
+// chamam estas funções; nenhum monta predicado próprio.
 // `tests/unit/runtime/stream-head-of-line-contract.spec.ts` conta as chamadas.
 import {
   earlierLiveTurnCount,
   earlierLiveTurnProbe,
   streamHeadOfLineNotExists,
+  streamSuccessorCandidate,
 } from './stream-head-sql.js';
 // A flag é lida por `contractEnv`, e não por `@/config/env.js`, pela MESMA
 // razão de `conversation-repos.ts` (#596): este arquivo é alcançado pelo
@@ -94,9 +97,44 @@ type ClaimRow = {
   state_version: number | string;
 };
 
+/**
+ * #627 (fatia D) — o SUCESSOR promovido pela transição terminal, quando houve
+ * um.
+ *
+ * Vem no RESULTADO em vez de virar `enqueueAgent()` aqui dentro pela mesma
+ * razão de `recovered_stream_claims` (#625) e do canário de FIFO (#626): este
+ * módulo é puro-DB. Alcançar a BullMQ a partir do repositório arrastaria
+ * `ioredis` — que `src/gateway/queue.ts` conecta NO IMPORT — para dentro de
+ * todo processo que toca `agent_turns`, inclusive o console.
+ *
+ * A separação também é o que faz a ordem exigida pela issue ser estrutural em
+ * vez de convencional: a decisão está COMITADA quando este objeto chega ao
+ * chamador, então "persistir antes de sinalizar" não depende de ninguém
+ * lembrar da ordem — não existe caminho em que o sinal venha primeiro.
+ *
+ * A FORMA é `StreamClaimRecovery`, do vocabulário puro, e não um tipo próprio:
+ * "o turno recuperado de um claim expirado" e "o sucessor promovido por uma
+ * conclusão" são o MESMO fato — *este turno é quem deve avançar, e alguém lhe
+ * deve um wake-up* — contraído por dois caminhos. Dois tipos idênticos com
+ * nomes diferentes convidariam duas funções de sinalização, e a segunda é a que
+ * um dia esqueceria a auditoria.
+ */
+export type StreamPromotion = StreamClaimRecovery;
+
 /** Resultado tipado de uma transição CAS. Conflito NUNCA é sucesso silencioso. */
 export type TurnTransitionResult =
-  | { ok: true; turn: AgentTurn; from: TurnStatus; to: TurnStatus }
+  | {
+      ok: true;
+      turn: AgentTurn;
+      from: TurnStatus;
+      to: TurnStatus;
+      /**
+       * #627 — presente SÓ quando esta transição foi TERMINAL e havia sucessor
+       * elegível na stream. Ausente é o caso normal (a conversa acabou), e
+       * ausente NUNCA significa "falhou": significa "não havia quem promover".
+       */
+      promotion?: StreamPromotion;
+    }
   | { ok: false; conflict: 'not_found'; to: TurnStatus }
   | {
       ok: false;
@@ -1648,8 +1686,13 @@ export const agentTurnsRepo = {
 async function recoverExpiredStreamClaims(
   tx: Executor,
   args: { tenant_id: string; agent_id: string; turn_id: string },
-): Promise<string[]> {
-  const result = await tx.execute<{ id: string; previous_status: string }>(sql`
+): Promise<StreamPromotion[]> {
+  const result = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    previous_status: string;
+  }>(sql`
     WITH alvo AS MATERIALIZED (
       SELECT t.stream_key
         FROM ${agent_turns} t
@@ -1675,6 +1718,16 @@ async function recoverExpiredStreamClaims(
            last_error_code    = 'stream_lease_expired',
            last_error_summary = 'claim expirado recuperado na transacao de claim da stream (#625)',
            state_version      = u.state_version + 1,
+           -- #627 — o turno recuperado E o head desta stream (quem tentou
+           -- reivindicar esta ATRAS dele, senao nao haveria o que recuperar), e
+           -- ele acabou de perder o unico wake-up que tinha: o job do dono
+           -- morto. Carimbar promoted_at aqui declara que ELE e quem deve
+           -- avancar e que alguem lhe deve um sinal -- a mesma divida da
+           -- promocao por conclusao, contraida por outro caminho.
+           -- promoted_by_turn_id fica NULL de proposito: nao houve promotor.
+           -- Sem isto, a stream espera o varredor (STUCK_AFTER_MS), que e a
+           -- janela descrita no runbook 11.5.
+           promoted_at        = now(),
            updated_at         = now()
       FROM ativos
      WHERE u.id        = ativos.id
@@ -1683,15 +1736,207 @@ async function recoverExpiredStreamClaims(
        AND u.id       <> ${args.turn_id}
        AND ativos.lease_expires_at IS NOT NULL
        AND ativos.lease_expires_at <= now()
-    RETURNING u.id, ativos.status AS previous_status
+    RETURNING u.id, u.representative_message_id, u.conversa_id,
+              ativos.status AS previous_status
   `);
   const rows = Array.from(
-    result.rows as unknown as Array<{ id: string; previous_status: string }>,
+    result.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      previous_status: string;
+    }>,
   );
   for (const row of rows) {
     incCounter('maia_turn_stream_claim_recovered_total', { from: row.previous_status });
   }
-  return rows.map((row) => row.id);
+  // #627 — devolve o mesmo formato da promoção por conclusão, e não só os ids:
+  // o caller precisa do `representative_message_id` para armar o wake-up, e uma
+  // segunda consulta para buscá-lo abriria a janela em que o turno muda entre
+  // as duas leituras. `status_before` é o estado ATIVO de onde ele veio
+  // (`claimed`/`running`), que é o que o log precisa dizer.
+  return rows.map((row) => ({
+    turn_id: row.id,
+    representative_message_id: row.representative_message_id,
+    conversa_id: row.conversa_id,
+    status_before: row.previous_status as TurnStatus,
+    status_after: 'retryable' as TurnStatus,
+  }));
+}
+
+/**
+ * #627 (fatia D da #505) — PROMOÇÃO DO SUCESSOR: o head chegou a terminal, quem
+ * é o próximo?
+ *
+ * ─── Por que isto roda DENTRO da transação do CAS terminal ────────────────
+ *
+ * A issue pede três coisas que, separadas, não se sustentam:
+ *
+ *   1. "validar o `claim_token` do turno que está terminando — uma tentativa
+ *      stale não pode liberar o sucessor";
+ *   2. "persistir a decisão ANTES de sinalizar a BullMQ";
+ *   3. "promover de forma IDEMPOTENTE".
+ *
+ * Rodando aqui, dentro de `runTransitionTx`, as três saem da estrutura em vez
+ * de saírem de disciplina:
+ *
+ *   (1) é DE GRAÇA e é EXATA. Esta função só é chamada depois de o UPDATE
+ *       terminal ter casado — e o `WHERE` daquele UPDATE já carrega
+ *       `claim_token = <o meu>` + `lease_expires_at > now()`
+ *       (`turnWriteConditions`). Um worker zumbi não chega aqui: o CAS dele
+ *       devolve zero linhas e a transação inteira vira `stale_claim`. Uma
+ *       validação SEPARADA do token seria uma SEGUNDA cópia da regra de fence —
+ *       o mesmo defeito que a fatia C eliminou na regra de ordem, com o mesmo
+ *       modo de falha (as duas concordam até o dia em que não concordam).
+ *
+ *   (2) é estrutural: o `enqueueAgent` mora em `src/runtime/turns/stream-promotion.ts`
+ *       e só recebe este objeto DEPOIS do commit. Não existe caminho de código
+ *       em que o sinal preceda a decisão.
+ *
+ *   (3) o `LIMIT 1 FOR UPDATE` da eleição serializa duas conclusões simultâneas
+ *       da mesma stream: a segunda espera, re-avalia o `WHERE` contra a linha
+ *       nova e não casa. "Exatamente um sucessor" é propriedade do banco.
+ *
+ * E há a razão que não é da issue e é a mais importante na prática: se a
+ * promoção fosse uma transação SEPARADA, um crash entre o commit terminal e o
+ * commit da promoção deixaria a stream parada — e a única coisa que a
+ * destravaria seria o varredor, isto é, exatamente a janela de 2 minutos que
+ * esta fatia existe para fechar. A promoção atômica com a conclusão não tem
+ * esse estado intermediário.
+ *
+ * ─── Por que ela NÃO passa por `transitionTurn` ──────────────────────────
+ *
+ * Mesma razão de `claimNextEligibleTurn` e de `recoverExpiredStreamClaims`:
+ * `transitionTurn` é compare-and-swap sobre UMA linha conhecida, com versão
+ * esperada — e aqui não sabemos, antes de olhar, QUEM é o sucessor nem em que
+ * versão ele está. O par (from, to) continua sendo do contrato:
+ * `received -> queued` e `retryable -> queued` são arestas de
+ * `TURN_TRANSITIONS`, e `tests/unit/runtime/stream-promotion-contract.spec.ts`
+ * falha se alguém as remover.
+ *
+ * ─── O que a promoção FAZ com o sucessor, campo a campo ──────────────────
+ *
+ *  - `status = 'queued'`: o turno passa a declarar que existe wake-up para ele.
+ *    Um sucessor que JÁ estava `queued` continua `queued` — e ainda assim é
+ *    promovido. Isso não é redundância, é o caso NORMAL e a razão de a fatia
+ *    existir: todo turno é enfileirado no ingresso, o job acorda, o claim
+ *    recusa com `not_head` (#626) e o job TERMINA. O wake-up foi CONSUMIDO. Sem
+ *    re-armar o que está `queued`, a promoção não promoveria quase ninguém;
+ *  - `queued_at` é PRESERVADO (`COALESCE`): ele mede quando a espera começou, e
+ *    reescrevê-lo faria uma conversa presa há uma hora parecer recém-chegada
+ *    para `maia_stream_head_age_seconds`;
+ *  - `state_version` sobe SÓ quando o estado muda de fato. Um re-arme de turno
+ *    já `queued` não é transição de estado, e bumpar ali invalidaria o CAS
+ *    otimista que uma absorção de debounce concorrente carrega — a rajada
+ *    perderia o irmão por um evento que não mudou estado nenhum;
+ *  - `attempt_count` NÃO sobe: quem conta tentativa é o claim. Contar aqui
+ *    gastaria o orçamento de retry do turno com a conclusão de OUTRO turno;
+ *  - `next_attempt_at = NULL` porque, para chegar aqui, o backoff já venceu (o
+ *    `WHERE` exige) — deixá-lo preenchido faria o varredor continuar tratando o
+ *    turno como "esperando backoff".
+ *
+ * ─── O que ela NÃO promove, e por quê ────────────────────────────────────
+ *
+ * O `WHERE` admite só `CLAIMABLE_STATUSES` com o backoff vencido. Fora ficam:
+ *   - `claimed`/`running`: já têm dono vivo. Enfileirar seria pedir um segundo
+ *     executor para um turno que está sendo executado;
+ *   - `outbound_pending`: nenhum claim o move — quem o move é o delivery worker
+ *     (#506). Promovê-lo produziria um job que só pode ser recusado;
+ *   - `retryable` com `next_attempt_at` no FUTURO: a issue-mãe é literal —
+ *     "backoff não autoriza ultrapassagem silenciosa". A conversa espera, e
+ *     quem a acorda é o varredor quando o backoff vencer.
+ * Em todos esses casos o resultado é `null` ⇒ `no_successor`, e a stream
+ * continua parada de propósito.
+ *
+ * ─── A condição de HEAD-OF-LINE no `WHERE`, que parece redundante ────────
+ *
+ * A eleição já devolve o MENOR `first_ingress_seq` não terminal da stream, o
+ * que faz dele o head por construção. `streamHeadOfLineNotExists` é aplicada
+ * assim mesmo, e é a MESMA função do claim e do recovery — não uma cópia. Ela
+ * é o que impede a promoção de furar a ordem se a eleição um dia mudar (um
+ * `ORDER BY` reescrito, um índice novo, um `LIMIT` movido): a promoção passaria
+ * a eleger outro turno e continuaria não conseguindo promovê-lo. Fura-ordem
+ * vira "não promoveu", que é falha SEGURA — a stream espera o varredor em vez
+ * de responder M3 antes de M2.
+ */
+async function promoteStreamSuccessor(
+  tx: Executor,
+  args: { tenant_id: string; agent_id: string; predecessor_turn_id: string },
+): Promise<StreamPromotion | null> {
+  const escopo = escopoSql(args.tenant_id, args.agent_id);
+  const alvo = { tenant: escopo.tenant, agent: escopo.agent, alvo: sql`u` };
+  const result = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    status_before: string;
+    status_after: string;
+  }>(sql`
+    WITH sucessor AS MATERIALIZED (
+      ${streamSuccessorCandidate({
+        tenant: escopo.tenant,
+        agent: escopo.agent,
+        predecessor_turn_id: args.predecessor_turn_id,
+      })}
+    )
+    UPDATE ${agent_turns} u
+       SET status              = 'queued',
+           queued_at           = COALESCE(u.queued_at, now()),
+           promoted_at         = now(),
+           promoted_by_turn_id = ${args.predecessor_turn_id},
+           next_attempt_at     = NULL,
+           state_version       = u.state_version
+                                 + CASE WHEN u.status = 'queued' THEN 0 ELSE 1 END,
+           updated_at          = now()
+      FROM sucessor
+     WHERE u.id        = sucessor.id
+       AND u.tenant_id = ${args.tenant_id}
+       AND u.agent_id  = ${args.agent_id}
+       AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+       AND (u.status <> 'retryable' OR u.next_attempt_at IS NULL OR u.next_attempt_at <= now())
+       AND ${streamHeadOfLineNotExists(alvo)}
+    RETURNING u.id, u.representative_message_id, u.conversa_id,
+              sucessor.status AS status_before, u.status AS status_after
+  `);
+  const row = (
+    result.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      status_before: string;
+      status_after: string;
+    }>
+  )[0];
+  if (!row) return null;
+  return {
+    turn_id: row.id,
+    representative_message_id: row.representative_message_id,
+    conversa_id: row.conversa_id,
+    status_before: row.status_before as TurnStatus,
+    status_after: row.status_after as TurnStatus,
+  };
+}
+
+/**
+ * #627 — a promoção do sucessor está LIGADA?
+ *
+ * Exige as DUAS flags, e a segunda não é zelo: sem head-of-line (#626) nenhum
+ * job é recusado por posição, então todo turno já tem o próprio wake-up vivo e
+ * não há fila a destravar. Promover ali seria enfileirar de novo o que já está
+ * enfileirado — inócuo (o `jobId` é determinístico), mas seria trabalho e
+ * métrica descrevendo um problema que não existe naquele regime.
+ *
+ * A dependência é de INÉRCIA, não de segurança, e por isso ela mora aqui e não
+ * numa regra cross-field que reprova o boot: o rollback emergencial da fatia C
+ * é `FEATURE_TURN_HEAD_OF_LINE=false` + restart, e transformar isso em "o
+ * processo não sobe até você desligar também a outra flag" seria pôr um segundo
+ * passo obrigatório no meio de um incidente.
+ *
+ * Lida a cada transição terminal (o memo é de `contractEnv`) pelo mesmo motivo
+ * de `headOfLineEnabled`: um kill switch que só vale no boot não é kill switch.
+ */
+function promotionEnabled(): boolean {
+  return contractEnv.FEATURE_TURN_STREAM_PROMOTION && headOfLineEnabled();
 }
 
 /**
@@ -1783,6 +2028,14 @@ async function claimWithinStreamExclusion(
            attempt_count     = attempt_count + 1,
            state_version     = state_version + 1,
            next_attempt_at   = NULL,
+           -- #627 -- a divida do wake-up foi PAGA: alguem acordou e reivindicou.
+           -- promoted_at existe para dizer "este turno foi eleito para avancar e
+           -- ainda nao foi acordado"; deixa-lo preenchido depois do claim faria o
+           -- varredor contar como reconciliacao todo turno que a promocao
+           -- acordou com sucesso -- isto e, mediria o caminho FELIZ como se
+           -- fosse recuperacao de falha. Zerar aqui e o que torna
+           -- maia_stream_promotion_total{result="recovered"} um sinal.
+           promoted_at       = NULL,
            updated_at        = now()
      WHERE tenant_id = ${tenant_id}
        AND agent_id  = ${agent_id}
@@ -1854,7 +2107,7 @@ async function claimWithinStreamExclusion(
 async function explainClaimRejection(
   tx: Executor,
   args: { tenant_id: string; agent_id: string; turn_id: string; fifo: boolean },
-  trail: { recovered_stream_claims?: readonly string[] },
+  trail: { recovered_stream_claims?: readonly StreamClaimRecovery[] },
 ): Promise<ClaimResult> {
   const escopo = escopoSql(args.tenant_id, args.agent_id);
   const alvo = await tx
@@ -2325,6 +2578,28 @@ async function runTransitionTx(
         );
     }
 
+    // #627 (fatia D) — A PROMOÇÃO DO SUCESSOR, na MESMA transação do CAS
+    // terminal. Depois desta linha a decisão está tomada e comitará junto com a
+    // conclusão; quem sinaliza a BullMQ é `src/runtime/turns/stream-promotion.ts`,
+    // com o objeto devolvido aqui, DEPOIS do commit.
+    //
+    // Só transições TERMINAIS promovem: um turno que vai para `running` ou
+    // `retryable` continua ocupando a posição na fila da conversa, e promover
+    // ali seria exatamente a ultrapassagem que a issue-mãe proíbe.
+    //
+    // O fence do predecessor já foi cobrado pelo `WHERE` do UPDATE acima — se a
+    // tentativa fosse stale, o CAS teria devolvido zero linhas e não estaríamos
+    // aqui. É assim que "uma tentativa stale não pode liberar o sucessor" deixa
+    // de depender de uma verificação a mais para depender da estrutura.
+    const promotion =
+      terminal && promotionEnabled()
+        ? await promoteStreamSuccessor(tx, {
+            tenant_id,
+            agent_id,
+            predecessor_turn_id: args.turn_id,
+          })
+        : null;
+
     incCounter('maia_turn_transitions_total', {
       from: args.sources.length === 1 ? args.sources[0]! : 'any',
       to: args.to,
@@ -2335,6 +2610,7 @@ async function runTransitionTx(
       turn,
       from: (args.sources.length === 1 ? args.sources[0]! : 'any') as TurnStatus,
       to: args.to,
+      ...(promotion ? { promotion } : {}),
     };
   });
 }

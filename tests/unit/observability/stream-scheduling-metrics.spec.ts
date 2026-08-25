@@ -20,6 +20,7 @@ import {
 import {
   STREAM_BLOCKED_REASONS,
   STREAM_FIFO_VIOLATION_STAGES,
+  STREAM_PROMOTION_RESULTS,
 } from '../../../src/runtime/turns/claim.js';
 import { renderPrometheus, _resetForTests as resetMetrics } from '../../../src/lib/metrics.js';
 
@@ -37,6 +38,12 @@ describe('#626 — séries do escalonamento por stream', () => {
     }
     for (const reason of STREAM_BLOCKED_REASONS) {
       expect(body).toContain(`maia_stream_blocked_total{reason="${reason}"} 0`);
+    }
+    // #627 — e aqui a semeadura importa MAIS do que nas outras: numa instalação
+    // saudável `fence_rejected` e `recovered` podem passar semanas em zero, e
+    // uma série ausente é indistinguível de "nunca aconteceu" para o alerta.
+    for (const result of STREAM_PROMOTION_RESULTS) {
+      expect(body).toContain(`maia_stream_promotion_total{result="${result}"} 0`);
     }
   });
 
@@ -94,5 +101,8 @@ describe('#626 — séries do escalonamento por stream', () => {
     expect(body).toContain('maia_stream_fifo_violation_total{stage="claim"} 0');
     expect(body).toContain('maia_stream_fifo_violation_total{stage="recovery"} 0');
     expect(body).toContain('maia_stream_blocked_total{reason="not_head"} 0');
+    expect(body).toContain('maia_stream_promotion_total{result="promoted"} 0');
+    expect(body).toContain('maia_stream_promotion_total{result="fence_rejected"} 0');
+    expect(body).toContain('maia_stream_promotion_total{result="recovered"} 0');
   }, 30_000);
 });

@@ -276,6 +276,28 @@ export const AUDIT_ACTIONS = [
   // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
   'turn_stream_blocked',
   'turn_stream_fifo_violation',
+  // Issue #627 (fatia D da #505) — PROMOÇÃO do sucessor. Duas rows, e elas
+  // respondem às duas perguntas que um incidente de ordem faz:
+  //   - `turn_promoted`: a plataforma DECIDIU que este turno é quem avança, e
+  //     sinalizou a fila. É a ação `stream.turn_promoted` da auditoria mínima da
+  //     issue-mãe. Ela existe porque a decisão vive no BANCO e o sinal vive no
+  //     Redis: sem a row, um job que aparece na fila não tem procedência, e
+  //     "quem mandou este turno rodar?" só teria como resposta uma inferência.
+  //     `metadata.source` separa os três produtores — conclusão terminal do
+  //     predecessor, recuperação de claim expirado da stream, e reconciliação
+  //     do varredor —, que têm leituras operacionais diferentes: o primeiro é
+  //     rotina, o segundo diz que um worker morreu, o terceiro diz que um sinal
+  //     se perdeu. `metadata.promoted_by_turn_id` reconstrói a fila sem
+  //     recorrer à `stream_key`.
+  //   - `turn_promotion_rejected`: uma tentativa STALE tentou concluir o turno
+  //     e, com isso, liberar o sucessor — e foi recusada pelo fence. É a falha
+  //     nº 9 da issue-mãe ("takeover após lease expirado permite ao worker
+  //     antigo liberar o sucessor") registrada no momento em que ela NÃO
+  //     acontece. Sem a row, um zumbi barrado e uma stream sem sucessor
+  //     produziriam o mesmo silêncio.
+  // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
+  'turn_promoted',
+  'turn_promotion_rejected',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
