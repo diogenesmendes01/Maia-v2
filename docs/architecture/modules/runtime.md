@@ -348,6 +348,79 @@ teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
 `agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
 encerrado por um turno TERMINAL".
 
+### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatia A (#630)
+
+| File | Role |
+|---|---|
+| `contract.ts` | Vocabulário puro do outbox de saída: união Zod dos payloads, serialização canônica versionada, `payload_hash` e as DUAS identidades |
+| `index.ts` | Fachada — importe sempre daqui |
+
+Módulo **puro**, na mesma natureza de `src/runtime/turns/contract.ts`: sem
+`db`, sem I/O, sem ALS, sem relógio. A fatia A é **aditiva** — nada envia,
+nada persiste. As fatias irmãs (#631 commit transacional, #632 delivery
+worker, #633 recovery/DLQ, #634 call sites, #635 multipart) ligam a máquina.
+
+#### As duas identidades, e por que são duas
+
+| Chave | Responde | Quem vê |
+|---|---|---|
+| `logical_dedupe_key` | "qual saída lógica é esta, dentro da Maia" | só a Maia (é o eixo do UNIQUE parcial) |
+| `provider_idempotency_key` | "que identificador o adaptador usa" | o provedor (vira `messageId` do Baileys) |
+
+As duas saem do **mesmo material canônico** — `tenant_id`, `agent_id`,
+`turn_id`, `sequence_in_turn`, `payload_hash` — e se separam por **rótulo de
+domínio diferente** no hash. Consequências:
+
+- **mesma saída lógica em retry reutiliza as duas chaves** (o material só tem
+  campo imutável — `attempt`, `status` e timestamps ficam de fora; uma chave
+  que muda entre tentativas garantiria o duplo envio que existe para impedir);
+- **payload diferente não reutiliza chave** (`payload_hash` entra no material);
+- **o provedor nunca recebe a chave de dedupe interna da Maia** (domínios
+  disjuntos: nenhuma é derivável da outra sem o material);
+- **nenhuma expõe tenant, telefone ou conteúdo** — são digests, então logá-las
+  é inerte.
+
+#### Enquadramento por prefixo de comprimento
+
+`tenants.id` e `agents.id` são `TEXT PRIMARY KEY` **sem CHECK de formato**
+(migração `007_p0_tenants_agents.sql`) — um id **pode** conter `:`. A
+concatenação sugerida em #506 (`maia:outbound:v1:<tenant>:<agent>:…`) é
+portanto ambígua **de verdade**, não em teoria:
+
+```
+tenant='acme:x'  agent='y'    →  "…:acme:x:y:…"
+tenant='acme'    agent='x:y'  →  "…:acme:x:y:…"
+```
+
+Dois tenants diferentes, uma chave só — violação do invariante nº 1. O
+material usa **netstring** (`<bytes>:<conteúdo>`, bytes em UTF-8), que é
+injetivo para qualquer string, inclusive uma que contenha o separador ou NUL.
+Não reusa o separador NUL de `deriveProviderDedupKey`
+(`src/governance/idempotency-effects.ts`) porque aquilo depende de "nenhum
+componente contém NUL" — outra suposição sobre dado de terceiro.
+
+#### Tipos de payload — o que foi verificado, não presumido
+
+A fronteira única de saída física é a interface `LineOutput`
+(`src/gateway/line-output.ts`; acesso direto às primitivas é proibido por
+lint). Ela declara `sendText` / `sendVoice` / `sendDocument` / `sendPoll` /
+`sendReaction`. Daí:
+
+- suportados: `text`, `audio`, `document`, `reaction`, `interactive_poll`,
+  `status_fallback`;
+- **`image` e `video` não existem** — não há primitiva, e #506 §Out of Scope
+  proíbe implementar tipo que a plataforma ainda não suporta. Admiti-los só no
+  schema criaria row que nenhum worker entrega: um `pending` eterno, fail-open
+  fantasiado de completude;
+- **`interactive` genérico não existe** — a única forma real é a enquete, e o
+  nome é `interactive_poll` justamente para ninguém concluir que botão/lista
+  estão cobertos.
+
+Mídia entra por **referência** (`local_path` / `storage_object`), nunca URL:
+segredo, token e URL assinada não têm forma de ser persistidos porque **não
+existe variante do tipo que os aceite** — garantia estrutural, não uma lista
+de regex de assinatura que se espera completa.
+
 ### Feature flags (`src/runtime/feature-flags/`)
 
 | File | Role |
@@ -453,6 +526,8 @@ Rules this module enforces:
 | `tests/integration/turn-lease-lost-effects-real-db.spec.ts` | Perda de lease DURANTE a execução, pelo caminho real (takeover + heartbeat): nenhuma linha em `agent_facts` (tool) nem em `outbound_messages` (outbound), com caso de controle exigindo as duas presentes |
 | `tests/unit/decision-engine-trace-ownership-boundary.spec.ts` | A janela entre o guard de posse do Decision Engine e o CONSUMO do pacote: com `traceTurnDecision` DEFERIDO, a lease cai enquanto o envelope durável está em voo e o teste exige `TurnOwnershipLostError` — e nenhum efeito posterior — tanto no resolve quanto no reject |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
+| `tests/unit/runtime/outbound-contract.spec.ts` | #630: união Zod por tipo, canonicalização (ordem de chave não move o hash; ordem das opções da enquete move), e as quatro propriedades das chaves — estabilidade no retry sob campos mutáveis, isolamento entre tenants, não-colisão sob ambiguidade de separador, e payload distinto não reutiliza chave. **Nenhuma cópia da fórmula**: tudo é relação entre saídas da função real |
+| `tests/integration/outbound-durable-outbox-schema-real-db.spec.ts` | #630 com Postgres real: row legada continua inserível, uniques PARCIAIS recusam a segunda saída e ignoram o legado, CHECK de completude impede meia-row, FK composta impede apontar para turno de outro tenant |
 
 ## In-flight changes
 

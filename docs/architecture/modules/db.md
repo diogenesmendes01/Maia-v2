@@ -76,6 +76,43 @@ route.
 - [Tenant isolation](../concerns/tenant-isolation.md) — `runWithTenantContext` + `applyTenantGuard` are the canonical scoping mechanism
 - Migrations are append-only: new `<n>_<name>.sql` files in `migrations/`; never edit a merged file. Since #516 this is enforced, not just documented — the runner records a checksum per applied migration and blocks (`up`, `status` and readiness all fail) when a merged file's content changes. See [`migrations`](migrations.md).
 
+## Acrescentar constraint a tabela que já tem dado (issue #630)
+
+Um `CREATE UNIQUE INDEX` sobre coluna **já populada** aborta a migração
+inteira se houver uma duplicata — e o operador descobre isso em produção, no
+meio da janela. `outbound_messages` é o caso canônico e a migração 121 é o
+padrão a copiar:
+
+1. **A coluna nova nasce NULL em toda row existente.** `ALTER TABLE … ADD
+   COLUMN` sem `DEFAULT` garante isso.
+2. **O unique é PARCIAL** (`WHERE <coluna> IS NOT NULL`). Row legada não
+   satisfaz o predicado, não entra no índice, não pode colidir: o conjunto
+   indexado no apply é **vazio**. Isso troca "pode explodir com dado que não
+   dá para inspecionar" por "não existe entrada possível para explodir".
+3. **Nada de backfill na mesma migração.** Promover row legada em massa é
+   decisão de dado, não de schema, e exige classificar por nível de confiança.
+4. **Pré-checagem com `RAISE EXCEPTION` legível**, para o caso de a migração
+   rodar depois de um backfill de outra branch: a mensagem conta as duplicatas
+   e diz o que reconciliar, em vez de "duplicate key value violates…".
+5. **Row nova completa por CHECK, não por nulabilidade de coluna.** A coluna
+   fica nullable para conviver com o legado; um CHECK
+   `CASE WHEN <discriminante> IS NULL THEN true ELSE (… IS NOT NULL AND …) END`
+   exige o tuplo inteiro na row nova. Nunca escreva esse CHECK com `IN` —
+   ver a armadilha ternária abaixo.
+
+**Armadilha ternária (bug real, pego pelo CI na PR #532):** um CHECK do
+Postgres só **reprova** quando o predicado dá `FALSE`. Se der `NULL`, a row é
+**aceita**. `col IN (...)` com `col` NULL dá NULL. Escreva
+`col IS NULL OR col IN (...)`, ou `CASE` com `IS NULL`/`IS NOT NULL` — formas
+que nunca produzem NULL.
+
+**O `_down` precisa de envelope `BEGIN;`/`COMMIT;`.** Os `_down.sql` não são
+executados pelo runner forward; são aplicados à mão com
+`psql -v ON_ERROR_STOP=1 -f`, que faz **autocommit por statement**. Um `_down`
+sem envelope que falha no meio é fail-open: metade do rollback fica aplicada e
+ninguém sabe qual metade. (Exceção: arquivo `-- maia:no-transaction`, que não
+pode ter envelope — os dois regimes não convivem no mesmo arquivo.)
+
 ## How to extend
 
 | Need | Where |
