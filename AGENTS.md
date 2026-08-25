@@ -155,7 +155,8 @@ npm run admin:build
 npm run admin:typecheck
 npm run test:admin-ui:unit
 npm run test:admin-ui:e2e         # Playwright, projeto `smoke` (exige console no ar)
-npm run test:admin-ui:e2e:ci      # sobe o console construído, roda o smoke e derruba
+npm run test:admin-ui:e2e:ci      # monta o artefato standalone (o mesmo do Dockerfile),
+                                  # sobe `node src/admin-ui/server.js`, roda o smoke e derruba
 npm run test:admin-ui:e2e:pendentes  # jornadas em quarentena (#472) — vermelhas hoje
 
 # Operational
