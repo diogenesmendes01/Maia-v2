@@ -486,6 +486,60 @@ describe('runGapEscalationMonitor', () => {
     ).toBeDefined();
   });
 
+  it('#637: pedido AGREGADO — o log diz que somou demanda, e o genérico não roda', async () => {
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-agregado',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
+    // O desfecho da fatia B: NÃO houve proposta nova; o pedido entrou num
+    // agregado que já existia. Se o worker tratasse isso como recusa, chamaria
+    // o proposer genérico e criaria a segunda proposta que a agregação existe
+    // para evitar.
+    proposeToolRequestForGapMock.mockResolvedValue({
+      ok: true,
+      resultado: 'agregado',
+      proposal_id: 'prop-representante',
+      spec: {
+        contract_draft: { proposed_tool_name: 'emitir_guia' },
+        frequency: { occurrences: 4 },
+      },
+      aggregate_id: 'agg-1',
+      member_id: 'mem-2',
+      similaridade: 0.92,
+      member_count: 3,
+      contract_state: 'consistent',
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+
+    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    const linha = loggerInfoMock.mock.calls.find(
+      (c) => c[1] === 'gap_escalation.tool_request_created',
+    );
+    expect(linha).toBeDefined();
+    // `criado` e `agregado` pedem leituras diferentes de quem prioriza: um é
+    // backlog novo, o outro é demanda somada. Colapsar os dois num log mudo
+    // esconderia justamente o número que esta fatia produz.
+    const campos = linha![0] as {
+      resultado: string;
+      aggregate_id: string;
+      member_count: number;
+      similaridade: number;
+    };
+    expect(campos.resultado).toBe('agregado');
+    expect(campos.aggregate_id).toBe('agg-1');
+    expect(campos.member_count).toBe(3);
+    expect(campos.similaridade).toBe(0.92);
+  });
+
   it('#636: pedido de ferramenta RECUSADO → o proposer genérico assume', async () => {
     seedTuple('tenant-a', 'agent-1', {
       gaps: [
