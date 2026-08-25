@@ -438,12 +438,15 @@ d('#635 — histórico idempotente e a janela delivered→completed (Postgres re
         },
       }),
     );
-    // INVARIANTE ABSOLUTA: UMA row de histórico, sempre — contada pela ÂNCORA
-    // e contada pelo que o usuário vê na conversa. As duas juntas: sem a chave,
-    // a segunda conclusão insere uma SEGUNDA resposta, e é a contagem da
-    // conversa que diz isso sem ambiguidade.
-    expect(await historicoDe(f!.outbound_id)).toHaveLength(1);
+    // INVARIANTE ABSOLUTA: UMA resposta de saída na conversa, sempre.
+    //
+    // A contagem da CONVERSA vem primeiro de propósito: é ela que distingue os
+    // dois vermelhos possíveis. Sem a chave, a segunda conclusão insere uma
+    // SEGUNDA resposta e esta linha diz "esperava 1, veio 2" — duplicação, o
+    // defeito real. A contagem pela ÂNCORA, logo abaixo, diria só "veio 0",
+    // que é ambíguo entre "não ancorou" e "não inseriu".
     expect(await historicoDaConversa(conversaId)).toBe(1);
+    expect(await historicoDe(f!.outbound_id)).toHaveLength(1);
     // E a segunda gravação DIZ que não inseriu — a idempotência é observável,
     // não silenciosa.
     expect(segunda.history_inserted).toBe(false);
