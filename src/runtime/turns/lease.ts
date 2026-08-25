@@ -29,7 +29,11 @@ import {
   type TurnExecutionContext,
 } from './claim.js';
 import { signalStreamPromotion } from './stream-promotion.js';
-import { recordStreamFifoViolation } from './stream-metrics.js';
+import {
+  declararBaldesDeEspera,
+  recordStreamFifoViolation,
+  STREAM_TURN_WAIT_METRIC,
+} from './stream-metrics.js';
 
 /** Claim com lease ligado? (kill switch da issue) */
 export function turnClaimEnabled(): boolean {
@@ -293,6 +297,26 @@ export async function acquireTurnLease(turn_id: string): Promise<
   if (result.fifo_violation) {
     await reportStreamFifoViolation(turn_id, result.fifo_violation);
   }
+  // #629 (fatia F da #505) — A ESPERA, no ponto em que ela ACABA.
+  //
+  // Observada aqui e não no ingresso porque só aqui os dois instantes existem:
+  // o turno entrou na fila em `queued_at` e começou AGORA. O valor vem do
+  // `RETURNING` do claim (`claim.wait_seconds`), medido pelo relógio do BANCO —
+  // calculá-lo com `Date.now()` mediria o skew entre este processo e o
+  // PostgreSQL junto com a espera, e a métrica de fairness passaria a medir NTP.
+  //
+  // Sem labels, e a ausência é decisão: `turn_id` derrubaria a cardinalidade,
+  // `stream_key` a issue-mãe proíbe, e um label de resultado seria constante
+  // (só o caminho ADQUIRIDO chega aqui). O que a série precisa dizer é a
+  // DISTRIBUIÇÃO, e o critério de pronto da issue pede exatamente isso:
+  // "fairness demonstrada com percentis".
+  // Idempotente e O(1). Está aqui, e não só no boot da observabilidade, porque
+  // `src/lib/metrics.ts` congela os baldes de uma série na PRIMEIRA amostra: um
+  // processo que só roda workers reivindicaria o primeiro turno antes de
+  // `registerRuntimeObservability` e a série nasceria com baldes de
+  // milissegundos, para sempre. Ver `declararBaldesDeEspera`.
+  declararBaldesDeEspera();
+  observeHistogram(STREAM_TURN_WAIT_METRIC, result.claim.wait_seconds);
   logger.info(
     {
       turn_id,

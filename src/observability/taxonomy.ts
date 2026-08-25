@@ -333,6 +333,114 @@ export const METRIC = {
    * enumeração).
    */
   STREAM_DEBOUNCE_CLOSE: 'maia_stream_debounce_close_total',
+  /**
+   * Issue #629 (fatia F da #505) — **A IDADE DO HEAD MAIS VELHO**, em segundos.
+   * É a série que a issue-mãe lista há mais tempo e que nenhuma fatia anterior
+   * implementou, porque nenhuma tinha fairness no critério de pronto.
+   *
+   * GAUGE sem labels, lido no SCRAPE do banco. Sem labels porque as dimensões
+   * que alguém quereria — `stream_key`, tenant — são exatamente as que a
+   * issue-mãe proíbe ou cuja cardinalidade cresce com o tráfego. Lido no scrape
+   * (e não publicado por um worker) porque uma série publicada congela no
+   * último valor quando o worker para, e "o escalonador parou" é a falha que
+   * ela existe para pegar.
+   *
+   * O MÁXIMO, e não a média, e essa é a decisão que importa: fairness é uma
+   * pergunta sobre o PIOR caso. Dez mil conversas instantâneas e uma parada há
+   * duas horas dão média excelente e um usuário abandonado.
+   *
+   * A leitura: um valor que sobe e não volta é uma conversa presa — cruze com
+   * `maia_stream_blocked_total{reason}` para saber por quê (`not_head` é fila
+   * andando, `stream_blocked` é o outbox, `stream_poisoned` é interdição
+   * humana). Um valor que sobe em degraus junto com `maia_stream_live_total` é
+   * a plataforma inteira atrasando, que é outro problema.
+   */
+  STREAM_HEAD_AGE: 'maia_stream_head_age_seconds',
+  /**
+   * Issue #629 — o p95 das idades de head. É o PAR de `STREAM_HEAD_AGE`, e sem
+   * ele o máximo é ambíguo: "uma conversa presa" e "a plataforma toda atrasada"
+   * produzem o mesmo máximo e p95 completamente diferentes.
+   */
+  STREAM_HEAD_AGE_P95: 'maia_stream_head_age_p95_seconds',
+  /**
+   * Issue #629 — **QUANTO UM TURNO ESPEROU** antes de começar a executar, em
+   * segundos. Observada no CLAIM, a partir de `now() - COALESCE(queued_at,
+   * created_at)` medido pelo relógio do BANCO.
+   *
+   * HISTOGRAMA porque a pergunta de fairness é sobre a DISTRIBUIÇÃO — o
+   * critério de pronto da issue diz "fairness demonstrada com percentis". Com
+   * baldes PRÓPRIOS em segundos (`STREAM_TURN_WAIT_BUCKETS`): os baldes padrão
+   * de `src/lib/metrics.ts` são de milissegundos e colapsariam toda espera
+   * abaixo de 10s num balde só.
+   *
+   * O par com `STREAM_HEAD_AGE` é o que separa as duas perguntas de fairness:
+   * esta mede o que JÁ COMEÇOU (e portanto só existe para quem foi atendido);
+   * aquela mede o que AINDA NÃO começou. Uma plataforma que abandona uma
+   * conversa tem `turn_wait` excelente e `head_age` péssimo — e é por isso que
+   * medir só a primeira é a forma clássica de não ver starvation.
+   */
+  STREAM_TURN_WAIT: 'maia_stream_turn_wait_seconds',
+  /**
+   * Issue #629 — quantas conversas têm um turno ATIVO (`claimed`/`running`)
+   * agora. Série pedida por nome pela issue-mãe (`maia_stream_active_total`).
+   *
+   * É o numerador da prova de que uma conversa lenta não serializa o agente:
+   * com head-of-line, cada stream ocupa NO MÁXIMO uma vaga, então
+   * `active_total` é literalmente "quantas conversas distintas estão sendo
+   * atendidas em paralelo". Um valor que fica preso em 1 com
+   * `maia_stream_live_total` alto é serialização — o sintoma que a issue-mãe
+   * manda vigiar.
+   */
+  STREAM_ACTIVE: 'maia_stream_active_total',
+  /**
+   * Issue #629 — quantas conversas têm ao menos um turno NÃO terminal. É o
+   * DENOMINADOR de `STREAM_ACTIVE`, e sem ele aquele número não distingue "há
+   * pouco trabalho" de "o escalonador parou de distribuir".
+   */
+  STREAM_LIVE: 'maia_stream_live_total',
+  /**
+   * Issue #629 — o maior backlog de uma ÚNICA conversa.
+   *
+   * A issue pede "limites de backlog por stream e política de pressão". Esta
+   * série é a MEDIÇÃO; o limite não é aplicado (ver runbook §14.5), e a razão
+   * está lá: a única pressão possível no ingresso seria RECUSAR mensagem de
+   * usuário do WhatsApp, que é perda de dado — e o backlog por stream é
+   * limitado na prática pelo próprio usuário, que não digita mil mensagens
+   * enquanto espera.
+   *
+   * É o número em que se calibra um limite, se um dia ele for necessário.
+   */
+  STREAM_BACKLOG_MAX: 'maia_stream_backlog_max',
+  /**
+   * Issue #629 — quantas conversas estão INTERDITADAS por política de poison
+   * (`agent_stream_blocks` com `unblocked_at IS NULL`).
+   *
+   * O gauge que impede a falha nº 5 da issue-mãe de acontecer em silêncio:
+   * cada ponto é uma conversa que NENHUM mecanismo automático vai destravar. Um
+   * valor que não volta a zero é trabalho de operador acumulando, e essa é
+   * exatamente a dívida que a fatia F contrai ao reintroduzir o bloqueio.
+   */
+  STREAM_POISONED: 'maia_stream_poisoned_streams',
+  /**
+   * Issue #629 — quantas conversas passaram do limiar de STARVATION
+   * (`TURN_STREAM_STARVATION_AFTER_MS`). Série pedida por nome pela issue-mãe.
+   *
+   * CONTADOR de EPISÓDIOS, não de amostras: o coletor deduplica por token opaco
+   * em memória, então uma conversa parada há uma hora conta UMA vez, e não uma
+   * por scrape. Sem essa deduplicação a série mediria a frequência do
+   * Prometheus — ver `src/observability/stream-fairness-collector.ts`.
+   *
+   * Sem labels, e semeada em ZERO no registro: numa instalação saudável ela
+   * nunca é incrementada, e uma série ausente é indistinguível de "nunca
+   * aconteceu" para todo alerta escrito contra ela.
+   */
+  STREAM_STARVATION: 'maia_stream_starvation_total',
+  /**
+   * Issue #629 — a DECISÃO da política de poison/DLQ, por categoria de erro e
+   * por saída (`{category, disposition}`). Ver
+   * `src/runtime/turns/stream-metrics.ts`.
+   */
+  STREAM_POISON: 'maia_stream_poison_total',
 
   // --- queue ---------------------------------------------------------------
   QUEUE_DEPTH: 'maia_queue_depth',

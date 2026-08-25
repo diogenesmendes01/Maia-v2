@@ -9,6 +9,7 @@
  * module, so importing the taxonomy or the label gate still does not drag the
  * driver, the WhatsApp stack or the DB client into a unit test.
  */
+import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
 import { registerMigrationGauges } from './migration-collector.js';
@@ -16,6 +17,7 @@ import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js
 import { startOtlpExporter } from './otlp-exporter.js';
 import { registrarSeriesDeStream } from '@/runtime/turns/stream-metrics.js';
 import { registrarSeriesDeDebounce } from '@/runtime/turns/stream-debounce.js';
+import { registerStreamFairnessGauges } from './stream-fairness-collector.js';
 import {
   registerDbPoolGauges,
   registerSchedulerLagGauges,
@@ -165,7 +167,38 @@ export async function registerRuntimeObservability(): Promise<void> {
     },
   });
 
+  // Issue #629 (fatia F da #505) — os gauges de FAIRNESS do escalonamento por
+  // stream, e os baldes (em SEGUNDOS) de `maia_stream_turn_wait_seconds`.
+  //
+  // Lidos no SCRAPE, do banco, pela mesma razão do gate de restore e do backlog
+  // de onboarding: uma série publicada pelo worker congela no último valor
+  // quando o worker para — e "o escalonador parou de distribuir" é justamente a
+  // falha que estas séries existem para pegar. Tudo o que o coletor precisa é
+  // importado LAZY, como nos demais.
+  registerStreamFairnessGauges({
+    snapshot: async (starvation_after_ms) => {
+      const { agentTurnsRepo } = await import('@/db/repositories/turn-repos.js');
+      return agentTurnsRepo.snapshotStreamScheduling(starvation_after_ms);
+    },
+    countBlocked: async () => {
+      const { agentTurnsRepo } = await import('@/db/repositories/turn-repos.js');
+      return agentTurnsRepo.countBlockedStreams();
+    },
+    // Lido a CADA coleta, e não capturado no registro: um limiar que só vale no
+    // boot obrigaria a reiniciar o processo para recalibrar um alerta.
+    starvationAfterMs: () => contractEnvForStarvation(),
+  });
+
   startOtlpExporter();
+}
+
+/**
+ * O limiar de starvation, lido do contrato. Isolado numa função para que o
+ * coletor continue puro (ele recebe um `() => number`) e para que o import de
+ * configuração não vire dependência de topo deste módulo.
+ */
+function contractEnvForStarvation(): number {
+  return config.TURN_STREAM_STARVATION_AFTER_MS;
 }
 
 /** Exposed for tests — the SQL snapshot without the registration side effect. */
