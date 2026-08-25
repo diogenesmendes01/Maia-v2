@@ -18,8 +18,26 @@
  *
  * — chamam `streamHeadOfLineNotExists()`. Nenhum deles monta predicado próprio.
  * Apagar a condição de um só deles é o defeito que a issue nomeia, e
- * `tests/unit/runtime/stream-head-of-line-sql.spec.ts` compila os três com
- * `PgDialect` e falha se qualquer um deixar de carregá-la.
+ * `tests/unit/runtime/stream-head-of-line-contract.spec.ts` compila a regra com
+ * `PgDialect`, CONTA as chamadas no repositório e falha se qualquer um deixar
+ * de carregá-la.
+ *
+ * ─── E a SEGUNDA regra de stream, desde a #629 ────────────────────────────
+ *
+ * `streamNotPoisoned()` — "esta conversa está interditada por política de
+ * poison?" — mora aqui pela MESMA razão e tem QUATRO consumidores (o `WHERE` do
+ * claim, o filtro do recovery, o dispatcher cross-tenant e a eleição da
+ * promoção), contados por `tests/unit/runtime/poison-policy-contract.spec.ts`.
+ * Ela é DELIBERADAMENTE separada de `streamHeadOfLineNotExists`: o canário de
+ * `maia_stream_fifo_violation_total` usa o núcleo do head-of-line, e misturar o
+ * bloqueio ali faria uma conversa interditada contar como violação de FIFO —
+ * uma série que a issue-mãe trata como critério de ABORTAR o rollout passaria a
+ * subir por uma decisão de política deliberada.
+ *
+ * `committedOrderNotBroken()` é a TERCEIRA, e olha para o outro lado da
+ * sequência: "algum turno POSTERIOR desta conversa já terminou?". Só o replay
+ * manual a consome — é a cláusula "um rearmamento manual não pode violar a
+ * ordem já comprometida".
  *
  * ─── Por que PURO (a mesma razão de `turn-fence-sql.ts`) ───────────────────
  *
@@ -37,7 +55,7 @@
  * fronteira que a fatia A (#624) passou a persistir.
  */
 import { sql, type SQL } from 'drizzle-orm';
-import { agent_turns } from '../schema.js';
+import { agent_turns, agent_stream_blocks } from '../schema.js';
 import { TERMINAL_TURN_STATUSES } from '@/runtime/turns/contract.js';
 
 /**
@@ -261,6 +279,179 @@ export function streamSuccessorCandidate(input: {
      ORDER BY s.first_ingress_seq
      LIMIT 1
        FOR UPDATE OF s`;
+}
+
+/**
+ * #629 (fatia F) — **A SEGUNDA REGRA DA STREAM.** `TRUE` quando a conversa do
+ * alvo **não** está bloqueada por poison message.
+ *
+ * ─── Por que ela mora aqui, e por que NÃO dentro de `streamHeadOfLineNotExists` ──
+ *
+ * Aqui porque este módulo é o dono de tudo que a `stream_key` do alvo decide, e
+ * porque o mesmo motivo da fatia C vale de novo: o predicado tem MAIS DE UM
+ * consumidor (o claim, o filtro do recovery e a eleição da promoção), e uma
+ * segunda cópia divergiria — com o agravante de que, aqui, a divergência é
+ * SILENCIOSA nos dois sentidos. Se o claim recusa e o recovery não filtra, o
+ * varredor rearma a cada ciclo um turno que o claim vai recusar: trabalho
+ * infinito, e a única evidência é uma métrica que ninguém está olhando. Se a
+ * promoção não filtra e o claim filtra, uma stream bloqueada "promove" o
+ * sucessor a cada conclusão, e `promoted` deixa de significar "a fila andou".
+ *
+ * FORA de `streamHeadOfLineNotExists` porque as duas respondem a perguntas
+ * diferentes e o CANÁRIO prova isso: `earlierLiveTurnCount` (a pós-condição de
+ * `maia_stream_fifo_violation_total`) usa o MESMO núcleo do head-of-line, e
+ * misturar o bloqueio ali faria uma stream bloqueada contar como violação de
+ * FIFO. Uma métrica que a issue-mãe manda tratar como critério de ABORTAR o
+ * rollout passaria a subir por uma decisão de política deliberada.
+ *
+ * ─── Por que `NOT EXISTS` sobre a tabela, e não uma coluna no turno ──────
+ *
+ * Ver o cabeçalho da migration 133. O que importa para o custo: a subconsulta é
+ * um lookup no índice único parcial `agent_stream_blocks_active_uq`
+ * `(tenant_id, agent_id, stream_key) WHERE unblocked_at IS NULL`, sobre uma
+ * tabela que em operação saudável está VAZIA. O predicado do índice é
+ * TEXTUALMENTE o mesmo da cláusula (`unblocked_at IS NULL`), pela mesma razão
+ * dos literais de status: o planejador só prova a implicação quando os dois
+ * lados coincidem.
+ *
+ * ─── O escape, e por que ele não é fail-open ─────────────────────────────
+ *
+ * `stream_key IS NULL` devolve `TRUE`. É a mesma resposta (e a mesma razão) de
+ * `streamHeadOfLineNotExists`: um turno sem identidade de stream não pertence a
+ * conversa nenhuma, e portanto não há bloqueio de conversa que possa alcançá-lo.
+ * Um bloqueio só nasce a partir de um turno que TEM `stream_key` — quem não tem
+ * nunca poderia tê-lo criado nem ser alcançado por ele.
+ */
+export function streamNotPoisoned(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
+  return sql`(
+        ${input.alvo}.stream_key IS NULL
+     OR NOT EXISTS (
+          SELECT 1
+            FROM ${agent_stream_blocks} AS bloqueio
+           WHERE bloqueio.tenant_id    = ${input.tenant}
+             AND bloqueio.agent_id     = ${input.agent}
+             AND bloqueio.stream_key   = ${input.alvo}.stream_key
+             AND bloqueio.unblocked_at IS NULL
+        )
+  )`;
+}
+
+/**
+ * #629 (fatia F) — **A ORDEM JÁ COMPROMETIDA.** Quantos turnos POSTERIORES da
+ * mesma stream já chegaram a estado terminal.
+ *
+ * ─── Que cláusula da issue isto executa ──────────────────────────────────
+ *
+ * "Rearmamento manual não pode violar a ordem já comprometida. Exige modo de
+ * replay/reconciliação explícito, auditado."
+ *
+ * "Ordem já comprometida" é uma afirmação sobre o PASSADO, e ela tem um teste
+ * exato: existe algum turno com `first_ingress_seq` MAIOR que o deste e que já
+ * terminou? Se existe, a plataforma já respondeu (ou já descartou) uma mensagem
+ * POSTERIOR a esta. Devolver o turno morto para a fila agora o executaria fora
+ * de ordem em relação a algo que o usuário já viu — a inversão que a #505
+ * existe para impedir, produzida por uma operação de recuperação.
+ *
+ * ─── Por que TERMINAL, e não "não terminal" ──────────────────────────────
+ *
+ * O head-of-line (#626) pergunta pelos ANTERIORES **não** terminais: "alguém na
+ * minha frente ainda vai rodar?". Aqui a pergunta é o espelho exato, nas duas
+ * dimensões: POSTERIORES e **terminais**, isto é "alguém atrás de mim já
+ * rodou?". Um posterior ainda vivo não compromete nada — ele será recusado com
+ * `not_head` assim que este turno voltar a ser o head, que é precisamente o
+ * protocolo funcionando. Só o que JÁ terminou é irreversível.
+ *
+ * ─── Contagem, e não `EXISTS` ────────────────────────────────────────────
+ *
+ * O número vai para `metadata.committed_after` da `audit_log` do replay
+ * reconciliado: "o operador autorizou processar um turno que estava atrás de 14
+ * turnos já concluídos" e "atrás de 1" são decisões de gravidade muito
+ * diferente, e um booleano apagaria essa diferença exatamente no registro que
+ * existe para ser lido depois.
+ */
+export function committedOrderAfterCount(input: {
+  tenant: SQL;
+  agent: SQL;
+  alvo: SQL;
+}): SQL {
+  return sql`(
+    SELECT count(*)::int
+      FROM ${agent_turns} AS posterior
+     WHERE posterior.tenant_id = ${input.tenant}
+       AND posterior.agent_id  = ${input.agent}
+       AND posterior.stream_key IS NOT NULL
+       AND posterior.status IN (${statusLiterals(STREAM_FIFO_TERMINAL_STATUSES)})
+       AND posterior.stream_key        = ${input.alvo}.stream_key
+       AND posterior.first_ingress_seq > ${input.alvo}.first_ingress_seq
+  )`;
+}
+
+/**
+ * #629 — o PREDICADO correspondente: `TRUE` quando a ordem da conversa ainda
+ * NÃO foi comprometida depois deste turno, e portanto um replay é seguro.
+ *
+ * Entra no `WHERE` do UPDATE do replay, e não numa consulta anterior, porque
+ * essa é a única posição em que a garantia é ATÔMICA: entre um `SELECT count`
+ * e um `UPDATE` separados, um sucessor pode concluir — e o replay atravessaria
+ * a ordem tendo verificado que não a atravessaria. Aqui não há vão.
+ *
+ * Os dois escapes (`stream_key IS NULL`, `first_ingress_seq IS NULL`) devolvem
+ * `TRUE` pela mesma razão de `streamHeadOfLineNotExists`: um turno sem
+ * identidade de stream ou sem sequência não pertence a ordem nenhuma, e não há
+ * "posterior" a respeitar. Recusar o replay deles tornaria irrecuperável todo
+ * turno anterior ao protocolo — a proteção causando a perda que ela evita.
+ */
+export function committedOrderNotBroken(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
+  return sql`(
+        ${input.alvo}.stream_key IS NULL
+     OR ${input.alvo}.first_ingress_seq IS NULL
+     OR NOT EXISTS (
+          SELECT 1
+            FROM ${agent_turns} AS posterior
+           WHERE posterior.tenant_id = ${input.tenant}
+             AND posterior.agent_id  = ${input.agent}
+             AND posterior.stream_key IS NOT NULL
+             AND posterior.status IN (${statusLiterals(STREAM_FIFO_TERMINAL_STATUSES)})
+             AND posterior.stream_key        = ${input.alvo}.stream_key
+             AND posterior.first_ingress_seq > ${input.alvo}.first_ingress_seq
+        )
+  )`;
+}
+
+/**
+ * #629 — QUEM interditou esta conversa. Só o caminho de FRACASSO do claim usa
+ * isto, pela mesma razão de `earlierLiveTurnProbe`: sem ele, `stream_poisoned`
+ * diria "a conversa está bloqueada" e nada mais, e o operador teria de
+ * reconstruir a interdição a partir da `stream_key` — que é justamente o dado
+ * que a issue-mãe restringe.
+ *
+ * Mora AQUI, e não no repositório, porque é a mesma pergunta de
+ * `streamNotPoisoned` feita como leitura em vez de como predicado. Duas
+ * gravações de `unblocked_at IS NULL` em arquivos diferentes é como a
+ * divergência começa: alguém acrescenta um segundo estado de bloqueio
+ * (`expires_at`, digamos) ao predicado e esquece a sonda, e o claim passa a
+ * recusar sem conseguir dizer por quê.
+ *
+ * Devolve `blocked_by_turn_id` — o turno ENVENENADO —, nunca a `stream_key`.
+ */
+export function streamPoisonProbe(input: {
+  tenant: SQL;
+  agent: SQL;
+  turn_id: string;
+}): SQL {
+  return sql`
+    SELECT bloqueio.id, bloqueio.blocked_by_turn_id, bloqueio.reason, bloqueio.category
+      FROM ${agent_turns} AS alvo
+      JOIN ${agent_stream_blocks} AS bloqueio
+        ON  bloqueio.tenant_id    = ${input.tenant}
+        AND bloqueio.agent_id     = ${input.agent}
+        AND bloqueio.stream_key   = alvo.stream_key
+        AND bloqueio.unblocked_at IS NULL
+     WHERE alvo.tenant_id  = ${input.tenant}
+       AND alvo.agent_id   = ${input.agent}
+       AND alvo.id         = ${input.turn_id}
+       AND alvo.stream_key IS NOT NULL
+     LIMIT 1`;
 }
 
 export function earlierLiveTurnProbe(input: {

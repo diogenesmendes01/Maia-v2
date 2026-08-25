@@ -116,6 +116,21 @@ export const STREAM_SCHEDULING_RESULTS = [
   'stream_blocked',
   'stream_busy',
   'promoted',
+  /**
+   * #629 (fatia F) — a conversa está BLOQUEADA por poison message: um turno
+   * anterior esgotou tentativas numa categoria de erro cuja política manda
+   * bloquear em vez de liberar (`agent_stream_blocks`, migration 133).
+   *
+   * Sexto código, e ele merece a mesma justificativa que a #626 deu para NÃO
+   * acrescentar um: mudar o domínio de um label depois que ele está num
+   * dashboard quebra alerta sem ninguém perceber. A diferença é que aqui o
+   * valor é ACRESCENTADO, não redefinido — nenhuma série existente muda de
+   * significado, e a série nova é semeada em zero como as outras. O que não se
+   * podia fazer era reusar `stream_blocked`: as duas param a conversa, e as
+   * remediações são opostas (`stream_blocked` é "vá ao runbook do outbox e
+   * espere"; `stream_poisoned` é "nada vai acontecer até um humano desbloquear").
+   */
+  'stream_poisoned',
 ] as const;
 
 export type StreamSchedulingResult = (typeof STREAM_SCHEDULING_RESULTS)[number];
@@ -128,7 +143,20 @@ export type StreamSchedulingResult = (typeof STREAM_SCHEDULING_RESULTS)[number];
  * `eligible` e `promoted` ficam de fora porque não são bloqueio; contá-los ali
  * transformaria um contador de "quanto a fila segurou" num contador de tráfego.
  */
-export const STREAM_BLOCKED_REASONS = ['not_head', 'stream_blocked', 'stream_busy'] as const;
+export const STREAM_BLOCKED_REASONS = [
+  'not_head',
+  'stream_blocked',
+  'stream_busy',
+  /**
+   * #629 — a conversa está bloqueada por política de poison. Entra aqui porque
+   * é bloqueio de verdade, e sai da leitura de `not_head`: `not_head` cresce e
+   * volta sozinho ao normal quando o head anda; `stream_poisoned` cresce e NÃO
+   * volta — cada ponto é uma tentativa contra uma conversa que nenhum worker
+   * vai destravar. É a série cuja subida sustentada é o sinal de "há operação
+   * manual pendente", que nenhuma das outras três dá.
+   */
+  'stream_poisoned',
+] as const;
 
 export type StreamBlockedReason = (typeof STREAM_BLOCKED_REASONS)[number];
 
@@ -214,6 +242,33 @@ export type StreamClaimRecovery = {
   conversa_id: string | null;
   status_before: TurnStatus;
   status_after: TurnStatus;
+};
+
+/**
+ * #629 (fatia F) — uma STREAM foi INTERDITADA por política de poison, e este é
+ * o fato que atravessa as camadas.
+ *
+ * Mora aqui, no vocabulário PURO, pela mesma razão de `StreamClaimRecovery`: é
+ * a moeda entre três camadas que não podem se importar em cadeia — o
+ * repositório o PRODUZ (dentro da transação do CAS terminal),
+ * `src/runtime/turns/lifecycle.ts` o AUDITA e `src/ops/stream-unblock.ts` o
+ * resolve.
+ *
+ * O que ele NÃO carrega: `stream_key`. A issue-mãe a restringe a log protegido,
+ * e nenhum consumidor precisa dela — o bloqueio é endereçado por `block_id`, e
+ * "qual conversa?" se responde pelo `blocked_turn_id`. Carregá-la aqui seria
+ * pô-la a um `logger.info` de distância de virar campo de log de rotina.
+ */
+export type StreamBlockRecord = {
+  block_id: string;
+  /** `POISON_CATEGORIES` de `poison-policy.ts` — a categoria que DECIDIU. */
+  category: string;
+  /** `STREAM_BLOCK_REASONS` de `poison-policy.ts`. */
+  reason: string;
+  /** O turno envenenado, que foi para `dead_letter` nesta mesma transação. */
+  blocked_turn_id: string;
+  conversa_id: string | null;
+  error_code: string | null;
 };
 
 /**
@@ -314,6 +369,23 @@ export const CLAIM_REJECTIONS = [
    * de `stream_blocked` é "vá ao runbook do outbox".
    */
   'stream_blocked',
+  /**
+   * #629 — a CONVERSA está bloqueada por política de poison: um turno anterior
+   * esgotou tentativas numa categoria de erro cuja política manda BLOQUEAR em
+   * vez de liberar, e existe uma linha ATIVA em `agent_stream_blocks`
+   * (migration 133).
+   *
+   * Distinto de `stream_blocked` porque a leitura operacional é a mais
+   * diferente de todas as cinco: `stream_blocked` é "espere o outbox";
+   * `stream_poisoned` é "NADA vai acontecer sem um humano". Nenhum worker,
+   * nenhum varredor, nenhuma promoção e nenhuma quantidade de tempo destravam
+   * esta conversa — só `npm run dlq -- unblock`, que é operação auditada.
+   *
+   * Distinto de `not_eligible` porque não fala do TURNO: o turno pode estar
+   * perfeitamente elegível, com backoff vencido e ninguém o disputando. É a
+   * conversa que está interditada, por decisão de política.
+   */
+  'stream_poisoned',
 ] as const;
 
 export type ClaimRejection = (typeof CLAIM_REJECTIONS)[number];
@@ -332,6 +404,30 @@ export type TurnClaim = {
   lease_expires_at: Date;
   status: TurnStatus;
   state_version: number;
+  /**
+   * #629 — QUANTO TEMPO este turno esperou antes de começar, em segundos,
+   * medido pelo relógio do PostgreSQL (`now() - COALESCE(queued_at,
+   * created_at)`) no mesmo `RETURNING` do claim.
+   *
+   * ─── Por que no banco, e por que nesta consulta ────────────────────────
+   *
+   * No BANCO porque a espera é a diferença entre dois instantes gravados por
+   * processos possivelmente diferentes: calculá-la com `Date.now()` do worker
+   * mediria o skew entre o relógio dele e o do banco junto com a espera, e num
+   * cluster com nós dessincronizados a métrica de fairness passaria a medir
+   * NTP. É a mesma regra que faz toda elegibilidade do claim usar `now()`.
+   *
+   * NESTA consulta porque ler `queued_at` depois abriria a janela em que a
+   * linha muda entre as duas leituras — e a promoção (#627) preserva
+   * `queued_at` de propósito justamente para que esta conta continue medindo
+   * desde a PRIMEIRA vez que o turno entrou na fila, não desde o último
+   * re-arme.
+   *
+   * `queued_at` nulo (turno que nunca passou por `queued`: um `received`
+   * reivindicado direto) cai em `created_at`, que é o instante do ingresso — a
+   * espera real do usuário, e nunca zero.
+   */
+  wait_seconds: number;
 };
 
 /**

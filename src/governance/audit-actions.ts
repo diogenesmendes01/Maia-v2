@@ -315,6 +315,39 @@ export const AUDIT_ACTIONS = [
   // rotina do protocolo — dezenas por minuto —, não decisões governáveis, e
   // vivem em `maia_stream_debounce_close_total{result}`.
   'stream_batch_closed',
+  // Issue #629 (fatia F da #505) — POISON, DLQ e REPLAY. Quatro rows, e cada
+  // uma existe porque a issue-mãe nomeia a ação na sua auditoria mínima
+  // (`stream.poison_dead_lettered`, `stream.blocked`, `stream.unblocked`,
+  // `stream.manual_replay_requested`) e porque, sem ela, uma DECISÃO da
+  // plataforma seria indistinguível de um efeito colateral:
+  //   - `stream_poisoned`: a política de poison DECIDIU interditar a conversa
+  //     em vez de liberá-la. É a linha que separa "esta conversa parou porque
+  //     a política manda parar depois de um efeito irreversível pela metade"
+  //     de "esta conversa parou". `metadata.category` traz a categoria de erro
+  //     que decidiu, `metadata.disposition` a saída escolhida e
+  //     `metadata.blocked_by_turn_id` o turno envenenado — é o conjunto que
+  //     permite reconstruir a decisão sem recorrer à `stream_key`.
+  //   - `stream_unblocked`: um OPERADOR desfez a interdição. Sem ela, uma
+  //     conversa que volta a andar não tem autor: `unblocked_by` mora na
+  //     tabela, mas a `audit_log` é onde as decisões humanas da plataforma
+  //     são procuradas. `metadata.actor` e `metadata.reason` são obrigatórios
+  //     no caminho de código E no CHECK da migration 133.
+  //   - `turn_replay_refused`: um replay manual foi RECUSADO porque a ordem da
+  //     conversa já estava comprometida — existe turno POSTERIOR já terminal.
+  //     É a cláusula "um rearmamento manual não pode violar a ordem já
+  //     comprometida" registrada no momento em que ela é HONRADA. Sem a row, a
+  //     recusa seria um exit code que ninguém guarda, e a pergunta "por que
+  //     este turno nunca voltou?" não teria resposta durável.
+  //   - `turn_replay_reconciled`: o operador ATRAVESSOU a recusa acima, em modo
+  //     de reconciliação explícito. É a row mais importante das quatro: ela é a
+  //     única evidência de que a plataforma processou algo FORA da ordem
+  //     comprometida, e o `metadata.committed_after` diz quantos turnos
+  //     posteriores já haviam terminado quando isso foi autorizado.
+  // Nenhuma das quatro carrega `stream_key`, texto, prompt, telefone ou JID.
+  'stream_poisoned',
+  'stream_unblocked',
+  'turn_replay_refused',
+  'turn_replay_reconciled',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
