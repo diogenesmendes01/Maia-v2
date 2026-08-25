@@ -66,6 +66,23 @@ async function limpar(c: pg.PoolClient, l: Lixo) {
       .query(`DELETE FROM ${tabela} WHERE ${coluna} = ANY($1::uuid[])`, [ids])
       .catch(() => undefined);
   }
+  // #637 — o agregado referencia a proposta representante (sem ON DELETE
+  // CASCADE, de propósito: agrupamento não deve poder ser apagado de carona).
+  // Então ele sai ANTES, ou o DELETE das propostas falha por FK e a faxina
+  // deixa rastro que a rodada seguinte herdaria como linha de base.
+  if (l.gaps.length > 0) {
+    await c
+      .query('DELETE FROM tool_request_aggregate_members WHERE gap_id = ANY($1::uuid[])', [
+        l.gaps,
+      ])
+      .catch(() => undefined);
+    await c
+      .query(
+        'DELETE FROM tool_request_aggregates WHERE representative_gap_id = ANY($1::uuid[])',
+        [l.gaps],
+      )
+      .catch(() => undefined);
+  }
   // A proposta pode ter sido criada pelo código de produção com um id que o
   // teste não viu; o gap é o eixo confiável de faxina.
   if (l.gaps.length > 0) {
