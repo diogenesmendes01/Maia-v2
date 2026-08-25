@@ -106,11 +106,20 @@
 -- ARMADILHA OPERACIONAL — a que a issue-mãe nomeia: um `CREATE UNIQUE INDEX
 -- CONCURRENTLY` que FALHA (inclusive por encontrar duplicata pré-existente)
 -- deixa para trás um índice INVÁLIDO, que continua custando escrita e não serve
--- a nenhuma leitura. Ele não some sozinho e o `IF NOT EXISTS` desta linha vai
--- ENCONTRÁ-LO e não reconstruir nada. A limpeza é manual e está no runbook
--- (docs/runbooks/turn-state-machine.md §10.4): identificar por
--- `pg_index.indisvalid = false`, `DROP INDEX CONCURRENTLY`, resolver a
--- duplicata, reaplicar.
+-- a nenhuma leitura, e não some sozinho.
+--
+-- O que torna isso pior que uma migration que simplesmente falha, e foi
+-- VERIFICADO contra o PostgreSQL 16 em vez de deduzido: reaplicar este arquivo
+-- depois da falha DEVOLVE SUCESSO. O `IF NOT EXISTS` encontra o índice
+-- inválido, emite `NOTICE: … already exists, skipping`, responde
+-- `CREATE INDEX`, e o runner marca a migration como aplicada — com o índice
+-- ainda inválido e A EXCLUSÃO INEXISTENTE. Nenhum sinal do runner distingue
+-- esse desfecho de um deploy bem-sucedido.
+--
+-- A limpeza é manual e está no runbook (docs/runbooks/turn-state-machine.md
+-- §10.4): identificar por `pg_index.indisvalid = false`, `DROP INDEX
+-- CONCURRENTLY`, resolver a duplicata, reaplicar — e CONFERIR `indisvalid`
+-- depois, que é a única coisa que distingue os dois desfechos.
 --
 -- A duplicata pré-existente é o modo de falha REAL desta migration, não uma
 -- hipótese: qualquer par de turnos ativos da mesma stream que já esteja no

@@ -628,9 +628,17 @@ válido** — vá para §10.4.
 
 `CREATE UNIQUE INDEX CONCURRENTLY` que falha — inclusive por duplicata
 pré-existente — **não some sozinho**: deixa um índice `indisvalid = false`, que
-continua custando escrita e não serve a nenhuma leitura, e o `IF NOT EXISTS` da
-migration vai ENCONTRÁ-LO e não reconstruir nada. O mesmo vale para um
-`DROP INDEX CONCURRENTLY` cancelado no meio. Diagnóstico:
+continua custando escrita e não serve a nenhuma leitura. O mesmo vale para um
+`DROP INDEX CONCURRENTLY` cancelado no meio.
+
+**A armadilha, verificada contra o PostgreSQL 16 e não deduzida:** reaplicar a
+migration depois disso **DEVOLVE SUCESSO**. O `IF NOT EXISTS` encontra o índice
+inválido, emite `NOTICE: relation "agent_turns_stream_active_uq" already exists,
+skipping`, responde `CREATE INDEX`, e o runner marca a migration como aplicada —
+com o índice ainda inválido e **a exclusão inexistente**. Nenhum sinal do
+runner distingue esse desfecho de um deploy bem-sucedido. A checagem abaixo é a
+única coisa que distingue, e ela precisa entrar no roteiro de deploy, não na
+lista de coisas a lembrar durante um incidente:
 
 ```sql
 SELECT indexrelid::regclass AS indice, indisvalid, indisready
