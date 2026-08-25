@@ -680,4 +680,74 @@ d('#628 — debounce transacional (DB real)', () => {
     );
     expect(rows).toEqual([{ tenant_id: T_A, turn_id: a1.turn_id }]);
   });
+
+  // ─── 12: a MESMA stream_key em tenants diferentes ────────────────────────
+  //
+  // O caso 11 acima usa as chaves DERIVADAS de cada escopo, que são distintas
+  // por construção — e por isso ele nao consegue exercitar o `tenant_id`/
+  // `agent_id` do `WHERE` do fechamento: `stream_key` sozinho ja e seletivo.
+  // Medido: removendo as duas colunas do `UPDATE` de `closeDueDebounceBatchTx`,
+  // a suite inteira continuava 16/16 verde.
+  //
+  // Chave IGUAL em tenants diferentes e estado REAL (backfill, replay manual), e
+  // e o mesmo cenario que a fatia B trata em `turn-stream-exclusion-real-db`
+  // ("a MESMA stream_key em TENANTS diferentes nao compete"). Aqui ele existe
+  // para que o escopo do fechamento seja carregado por teste, e nao pela
+  // improbabilidade de colisao da chave derivada.
+  it('a MESMA stream_key em TENANTS diferentes: fechar a de um nao toca a do outro', async () => {
+    const compartilhada = `deb628-compartilhada-${randomUUID()}`;
+    const a1 = await texto(inA);
+    const b1 = await texto(inB, { channel_id: CANAL_B });
+    const b2 = await texto(inB, { channel_id: CANAL_B });
+
+    // Backfill: as tres linhas passam a carregar a MESMA chave literal, e cada
+    // escopo ganha a SUA linha de mutex — `lockStreamForDebounce` trava em
+    // `agent_stream_sequences` por (tenant, agent, stream_key), e sem ela o
+    // fechamento sai por `stream_locked` antes de chegar ao `WHERE` que este
+    // caso existe para exercitar.
+    await pool.query(`UPDATE agent_turns SET stream_key = $1 WHERE id = ANY($2::uuid[])`, [
+      compartilhada,
+      [a1.turn_id, b1.turn_id, b2.turn_id],
+    ]);
+    for (const [tn, ag] of [
+      [T_A, A_A],
+      [T_B, A_B],
+    ]) {
+      await pool.query(
+        `INSERT INTO agent_stream_sequences (tenant_id, agent_id, stream_key, stream_key_version, last_ingress_seq)
+         VALUES ($1, $2, $3, 1, 100) ON CONFLICT DO NOTHING`,
+        [tn, ag, compartilhada],
+      );
+    }
+
+    // Vence a janela SO do tenant A. Sem o escopo no fechamento, fechar A
+    // arrastaria as linhas de B, que nem sequer estao vencidas.
+    await pool.query(
+      `UPDATE agent_turns SET debounce_deadline_at = now() - interval '1 second'
+        WHERE stream_key = $1 AND tenant_id = $2 AND agent_id = $3
+          AND debounce_deadline_at IS NOT NULL AND debounce_closed_at IS NULL`,
+      [compartilhada, T_A, A_A],
+    );
+
+    await worker().runStreamDebounceCloser({ budget_ms: 0 });
+
+    const turnoA = await lerTurno(a1.turn_id);
+    expect(turnoA['status']).toBe('queued');
+    expect(turnoA['debounce_closed_at']).not.toBeNull();
+
+    // B nao foi tocado: nem fechado, nem absorvido, nem contado.
+    for (const id of [b1.turn_id, b2.turn_id]) {
+      const t = await lerTurno(id);
+      expect(t['status'], `turno de B (${id}) foi tocado pelo fechamento de A`).toBe('received');
+      expect(t['debounce_closed_at']).toBeNull();
+      expect(t['debounce_batch_size']).toBeNull();
+    }
+
+    // E nenhum input de B migrou para o turno de A.
+    const { rows } = await pool.query(
+      `SELECT DISTINCT tenant_id FROM agent_turn_inputs WHERE turn_id = $1`,
+      [a1.turn_id],
+    );
+    expect(rows).toEqual([{ tenant_id: T_A }]);
+  });
 });
