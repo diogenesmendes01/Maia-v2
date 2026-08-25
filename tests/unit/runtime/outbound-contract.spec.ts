@@ -301,6 +301,38 @@ describe('#630 — as duas identidades são estáveis, distintas e não vazam', 
   });
 });
 
+describe('#630 — SONDA 0: separação de domínio entre as DUAS chaves', () => {
+  /**
+   * O docstring de `deriveProviderIdempotencyKey` afirma uma propriedade de
+   * segurança: "nenhuma é derivável da outra sem o material — quem vê a chave
+   * no provedor não obtém a chave de dedupe interna da Maia".
+   *
+   * Essa propriedade vem INTEIRAMENTE de `PROVIDER_KEY_DOMAIN` ser diferente
+   * de `LOGICAL_KEY_DOMAIN`. São duas constantes adjacentes no arquivo, e
+   * igualá-las — por refactor, por copiar-colar, por unificar "os dois
+   * rótulos que ninguém usa" — não quebrava NENHUM teste antes deste.
+   *
+   * MEDIDO: com os domínios iguais, `deriveProviderIdempotencyKey` devolve
+   * `3EB0` + os 18 primeiros hex do MESMO digest que a chave lógica publica
+   * por inteiro. Ou seja, o WhatsApp (e todo log do provedor) passaria a
+   * carregar 72 bits do eixo de unicidade interno da Maia.
+   */
+  it('a chave do provedor NÃO é um prefixo do digest da chave lógica', () => {
+    const logico = deriveLogicalDedupeKey(identidade()).replace(/^mol1_/, '');
+    const provedor = deriveProviderIdempotencyKey(identidade(), 'whatsapp')
+      .replace(/^3EB0/, '')
+      .toLowerCase();
+
+    expect(provedor).toHaveLength(18);
+    expect(
+      logico.startsWith(provedor),
+      'os dois rótulos de domínio colapsaram: a chave entregue ao provedor virou ' +
+        'prefixo do digest da chave lógica, e a separação que o contrato promete ' +
+        'deixou de existir',
+    ).toBe(false);
+  });
+});
+
 describe('#630 — SONDA 1: o enquadramento por comprimento impede colisão por ambiguidade', () => {
   it('tenant/agent que contêm o separador NÃO colidem', () => {
     // `tenants.id` e `agents.id` são TEXT PRIMARY KEY sem CHECK de formato
