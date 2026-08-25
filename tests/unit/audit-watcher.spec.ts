@@ -109,6 +109,10 @@ describe('audit-watcher', () => {
     expect(ids).toContain('pairing_recovery_stuck');
     expect(ids).toContain('llm_circuit_long_open');
     expect(ids).toContain('bot_volume_burst');
+    // Issue #536 — a recusa do guarda de locator do export. Threshold 1: a
+    // taxa normal desta ação é ZERO, então agrupá-la por volume esconderia o
+    // primeiro evento, que é o único que importa.
+    expect(ids).toContain('privacy_export_locator_refused');
   });
 
   // Regression: a rule referencing a non-existent audit action would never

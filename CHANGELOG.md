@@ -56,6 +56,57 @@ morre no passo seguinte com exit 1 (sentinela do Redis), então o gate não est�
 recusando tudo. Em Postgres real, `tests/integration/migrations-runner-real-db.spec.ts`
 repete a tradução veredito ⇒ exit code contra ledger de verdade.
 
+### ⚠️ AÇÃO DO OPERADOR — o TTL do export de privacidade passa a APAGAR o arquivo ([#536](https://github.com/diogenesmendes01/Maia-v2/issues/536))
+
+> **Até este release, `privacy_requests.export_expires_at` era um carimbo sem
+> executor.** O prazo existia no banco; o `.enc` — um pacote cifrado com o dado
+> consolidado de um titular — ficava no disco **para sempre**. Não era uma
+> retenção frouxa: era um vazamento com deadline infinito, e mais fácil de
+> esquecer que o comum, porque a coluna dá a impressão de que alguém já cuidou
+> disso.
+>
+> A partir daqui um cron horário (`privacy_export_sweep`) **remove** o artefato
+> vencido. Duas coisas para fazer antes de subir:
+>
+> 1. **rode um passe em dry-run** e compare com a expectativa —
+>    `npm run privacy:export -- sweep --dry-run`. Num ambiente que nunca teve
+>    varredura, o primeiro passe real pode apagar todo o acervo acumulado;
+> 2. **confira `PRIVACY_EXPORT_TTL_DAYS`** (novo, default `7`). Ele vale na
+>    EMISSÃO e fica carimbado em `export_expires_at`; o varredor honra o
+>    carimbo, nunca a configuração atual — mudar o número não encurta nem
+>    estica o que já foi emitido (o runbook §8 traz o `UPDATE` para quando isso
+>    for deliberado).
+>
+> Migration **118** (aditiva, `IF NOT EXISTS`). Para desarmar temporariamente:
+> `PRIVACY_EXPORT_SWEEP_DRY_RUN=true` — mas leia o §9 do runbook antes, porque
+> o dry-run permanente devolve exatamente o estado que esta entrega conserta.
+
+**Sete dias viram a política inicial, e o mecanismo que a cumpre existe.** Decisão do dono sobre a #536: aceite o prazo, mas implemente o TTL de verdade antes do go-live. O prazo saiu do código (`const EXPORT_TTL_MS`) e virou `PRIVACY_EXPORT_TTL_DAYS`, porque quem decide é o DPO e a decisão vai mudar.
+
+**Idempotência mora na ORDEM, e a ordem é evidência.** O varredor cruza um arquivo no disco com uma linha no banco, e os dois não commitam juntos — então a pergunta é qual ordem deixa o estado intermediário LEGÍVEL. `marcar → apagar` deixa o pedido dizendo "artefato removido" com o `.enc` vivo e sem candidato para reencontrá-lo: órfão para sempre. `apagar → marcar` deixa, no pior caso, o arquivo removido e o pedido ainda na fila — a execução seguinte prova o caminho, encontra a ausência (`already_absent`), e conclui. Escolhemos a segunda. A marcação e a auditoria vão na MESMA transação, condicionadas a `export_purged_at IS NULL`: quem não ganha a transição não audita, então rodar duas vezes (em série ou em paralelo) produz **exatamente uma** linha `privacy_export_purged`.
+
+**O locator é entrada não confiável para um `rm`, e é tratado como tal** (`src/ops/privacy/export-locator.ts`). Quatro camadas antes de qualquer remoção: forma (o UUID que o próprio `sealExport` emite), contenção (filho direto da raiz, provado por identidade — `startsWith` sozinho aceita `/exports-evil/x` para uma raiz `/exports`), inode (`lstat` e nunca `stat`, porque `stat` segue o symlink e esconde justamente o caso; mais arquivo-regular e `nlink === 1`, já que um segundo hard link significa que remover o nosso destrói o rastro e não o dado) e **binding** — a linha é relida no instante da remoção, porque entre planejar e apagar o export pode ter sido reemitido e o arquivo do plano pode ser um artefato vivo. A ordem das checagens é contrato, como em `assertDrillTarget`: as recusas estruturais vêm primeiro para que o código auditado nomeie o **pior fato verdadeiro** — `../../etc/passwd` tem que ser registrado como `path_separator`, não como o também-verdadeiro "não parece um UUID". Toda recusa é auditada (`privacy_export_purge_refused`) e **nada é apagado**.
+
+**Evidência de que o guarda está NO CAMINHO, e não apenas disponível.** A sonda que vale para código destrutivo é a chamada de remoção nem ser alcançada. Neutralizando a validação no call site real (`const proven = { path: ..., present: true }` no lugar de `proveExportArtifact`), `tests/unit/ops/privacy-export-sweeper.spec.ts` fica vermelho com a chamada mostrada:
+
+```
+AssertionError: expected "vi.fn()" to not be called at all, but actually been called 1 times
+Received:
+  1st vi.fn() call:
+    Array [ "/srv/backups/privacy-export/../../etc/passwd" ]
+```
+
+**Legal hold congela o export, não só a origem.** O varredor avalia o hold sobre `privacy.export` **e** sobre toda classe de escopo de titular que o pacote empacota: a cópia entregue é material responsivo tanto quanto as linhas de que ela foi feita. A avaliação **não** consulta o `legal_hold_applicable` da classe — condicionar uma recusa destrutiva a um campo mutável de registro significa que uma edição de um caractere desarma a proteção. Hold ilegível reprova o passe inteiro; "não sei se há hold" nunca vira "não há hold". `privacy.export` passou de `legal_hold_applicable: false` para `true` em `data-classes.ts`, corrigindo uma declaração que só era inócua enquanto nada apagava a classe.
+
+**O pedido passa a indicar artefato expirado.** `readExportArtifact` é o único lugar que decide o que um leitor vê: `none` · `available` · `expired` · `purged`. `expired` **retém** o locator de propósito — entre o vencimento e a passagem do varredor o arquivo ainda existe, e entregá-lo nessa janela furaria o próprio TTL. `npm run privacy:export -- show --request=<uuid>` é a leitura do operador.
+
+- **Migration 118** — `export_purge_started_at` (passe que caiu fica visível) + `export_purged_at` (a transição de vencedor único), CHECK recusando "varrido sem nunca ter tido artefato", e dois índices **parciais** no padrão de `067`/`070`: a fila do varredor e a pergunta de incidente "algum passe começou e nunca terminou?".
+- **Cobertura**: 75 testes unitários novos + 9 casos na spec de forma das migrations (`ops-migrations-shape.spec.ts` passa de 42 para 51: colunas, CHECK, os dois índices PARCIAIS, idempotência do up e o envelope `BEGIN`/`COMMIT` do down — sem Postgres) (`privacy-export-locator.spec.ts` 30, `privacy-export-sweeper.spec.ts` 33, `privacy-export-sweep-scheduler.spec.ts` 12) + 12 de integração (`privacy-export-ttl-real-db.spec.ts`) que provam o que só o banco prova — o CHECK, a ordem da fila e o `RETURNING` do UPDATE condicional sob concorrência real. Os de integração **não foram executados** nesta rodada: Postgres está fora do ar no ambiente de desenvolvimento; rodam no CI.
+- **Alerta novo, com threshold 1** — `privacy_export_locator_refused` em `src/workers/audit-watcher.ts`. A taxa normal de `privacy_export_purge_refused` é **zero**, então agrupá-la por volume (como as outras regras de threshold, que usam 3) esconderia o primeiro evento — o único que importa. `urgent` e não `critical`: nada foi apagado, o guarda recusou antes da remoção.
+- **Contra a armadilha do espelho**: `tests/unit/workers/privacy-export-sweep-scheduler.spec.ts` passa pelo REGISTRO real (`JOBS`) e pelo adaptador real (`runPrivacyExportSweepJob` → `withOpsLock`), não por um agendador próprio. Remover a entrada do cron reprova 11 dos 12 casos com `Error: o job privacy_export_sweep não está no registro de workers` — um harness privado continuaria verde com o TTL desligado, que é exatamente o defeito original em outra roupa.
+- **Fora de escopo, e deliberadamente**: purgar `privacy.export` como parte de um pedido de EXCLUSÃO de outro titular (continua em `UNSUPPORTED_CLASSES` — é uma pergunta diferente do TTL) e qualquer redação de `postgres.audit`, que segue bloqueada até decisão campo a campo do DPO.
+- Runbook novo: [`docs/runbooks/privacy-export-ttl.md`](docs/runbooks/privacy-export-ttl.md). Docs reconciliados: `docs/architecture/modules/ops.md`, `docs/architecture/concerns/data-retention-matrix.md` e `docs/runbooks/backup-restore.md` §7/§9 — a frase "a retenção não apaga nada hoje" deixou de ser verdade inteira e agora nomeia as duas exceções, para que ninguém opere com a expectativa errada.
+
 ### ⚠️ AÇÃO DO OPERADOR — o recurso de migration da infra real recebe SÓ o subset `migrator` ([#565](https://github.com/diogenesmendes01/Maia-v2/issues/565))
 
 > **Se o seu Coolify já tem um recurso próprio para o passo de migration**,
