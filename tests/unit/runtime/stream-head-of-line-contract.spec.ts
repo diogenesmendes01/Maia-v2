@@ -167,9 +167,20 @@ describe('#626 — contrato do head-of-line', () => {
 
   // ─── Vocabulário centralizado ────────────────────────────────────────────
 
-  it('os cinco códigos da issue existem, e são exatamente cinco', () => {
+  it('os cinco códigos da issue existem, mais o `stream_poisoned` da #629', () => {
+    // A #629 (fatia F) ACRESCENTOU um sexto: `stream_poisoned`. Acrescentar não
+    // é o mesmo que redefinir — nenhuma série existente mudou de significado, e
+    // a nova é semeada em zero como as outras. O que continua proibido é grafar
+    // um dos códigos de outro jeito, ou ter dois nomes para o mesmo fato.
     expect([...STREAM_SCHEDULING_RESULTS].sort()).toEqual(
-      ['eligible', 'not_head', 'promoted', 'stream_blocked', 'stream_busy'].sort(),
+      [
+        'eligible',
+        'not_head',
+        'promoted',
+        'stream_blocked',
+        'stream_busy',
+        'stream_poisoned',
+      ].sort(),
     );
     expect(new Set(STREAM_SCHEDULING_RESULTS).size).toBe(STREAM_SCHEDULING_RESULTS.length);
   });
@@ -178,7 +189,7 @@ describe('#626 — contrato do head-of-line', () => {
     // Se `CLAIM_REJECTIONS` puder carregar um código que não está no
     // vocabulário, o label de métrica e o motivo tipado voltam a poder divergir
     // — que é a duplicação que a issue manda eliminar, na outra dimensão.
-    for (const reason of ['not_head', 'stream_blocked', 'stream_busy'] as const) {
+    for (const reason of ['not_head', 'stream_blocked', 'stream_busy', 'stream_poisoned'] as const) {
       expect(CLAIM_REJECTIONS).toContain(reason);
       expect(STREAM_SCHEDULING_RESULTS).toContain(reason);
     }
