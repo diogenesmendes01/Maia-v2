@@ -945,9 +945,9 @@ curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | s
 Desde a #516 o componente `schema` **é o veredito canônico de migrations**
 (`getSchemaReadiness()`, `src/migrations/readiness.ts`), e não mais a
 comparação "id mais novo do ledger × arquivo mais novo em disco". O check
-antigo (`checkSchemaVersion()`) não enxergava checksum divergente, linha
-`dirty`/`running` órfã nem migration aplicada que o build não empacota — e
-reportava "banco à frente do artefato" como saudável.
+antigo (`checkSchemaVersion()`, removido na ADR 0004) não enxergava checksum
+divergente, linha `dirty`/`running` órfã nem migration aplicada que o build não
+empacota — e reportava "banco à frente do artefato" como saudável.
 
 Cada uma destas condições responde **HTTP 503** e mantém a instância fora de
 rotação:
@@ -1015,11 +1015,84 @@ em `development` é silencioso. Desligar o flag faz o componente `schema`
 reportar `ok` sem consultar nada — é exatamente a porta que a #516 fechou para
 produção.
 
-> **Nota:** o passo de **boot** (`src/index.ts`, etapa `schema`) continua usando
-> `checkSchemaVersion()`, o check mais fraco. Isso é deliberado: readiness
-> responde "posso servir tráfego?" e um "não" custa uma instância fora de
-> rotação com um 503 auto-explicativo; boot responde "posso existir?" e um "não"
-> custa crash loop. Unificar os dois é decisão de política em aberto na #516.
+#### O gate de BOOT: o mesmo veredito, mas o processo MORRE (issue #516, ADR 0004)
+
+Desde a decisão do owner na #516 ([ADR 0004](../architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md))
+o passo `schema` do boot (`src/index.ts`) consulta **o mesmo
+`getSchemaReadiness()`** e **encerra o processo** quando o veredito não é
+`ready`. O check fraco anterior (`checkSchemaVersion()`) foi REMOVIDO — não
+existe mais um segundo, mais permissivo, veredito de schema em lugar nenhum.
+
+O exit code diz **qual invariante quebrou**, antes de qualquer log ser lido:
+
+| Exit | Invariante | O que fazer |
+|---|---|---|
+| `90` | ledger `dirty` (ou `running` órfão): schema possivelmente parcial | Inspecione e repare: `tsx scripts/migrate.ts repair --id <id> --as applied\|pending --reason "..."` |
+| `91` | **checksum divergente** — migration aplicada foi editada, ou o build é outro | Restaure o arquivo / publique a release certa. Migrations são append-only |
+| `92` | checksum **ausente** (ledger v1 nunca backfillado) | `npm run db:migrate` uma vez (adota o checksum empacotado) |
+| `93` | o banco aplicou migration que **este build não empacota** | Release velha contra banco novo: publique a release nova |
+| `94` | **migration obrigatória ausente** — schema abaixo do mínimo | `npm run db:migrate` (ou `npm run release:migrate` no pré-deploy) |
+| `95` | schema **acima** do máximo suportado por este build | Publique a release nova; não sirva tráfego desta |
+| `96` | migration `running` — migrator em voo, ou morto | Aguarde o job; se não há migrator, é entulho (`migrate status`) |
+| `97` | veredito `unknown` — ledger ausente/ilegível, banco fora do ar | `npm run doctor -- --online`; confirme DSN e permissões |
+| `1` | qualquer OUTRA falha de boot (Redis, keyring, config…) | Ver `maia.fatal` no log |
+
+```bash
+docker inspect --format '{{.State.ExitCode}}' <container>   # 90-97 ⇒ é schema
+docker logs <container> 2>&1 | grep maia.schema_boot_refused
+```
+
+A linha `maia.schema_boot_refused` carrega, em campos estruturados:
+`exit_code`, `blocker`, `blockers` (todos os presentes), `verdict`,
+`migration_id`, `expected_checksum` (arquivo empacotado), `found_checksum`
+(linha do ledger), `expected_head`, `applied_head` e `remediation`. A mensagem
+do erro (`maia.fatal`) traz o mesmo em bloco legível, começando por
+`SCHEMA BOOT REFUSED`. **Nada disso carrega SQL, texto de driver ou DSN.**
+
+##### Árvore de decisão do operador — exit code OU readiness, nunca os dois
+
+Coerente com a [ADR 0003](../architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):
+o `/readyz` continua sendo o **único** gate de roteamento, role-aware e
+fail-closed. O que mudou é que existe agora um estado anterior a ele — o
+processo pode nem chegar a escutar HTTP.
+
+```text
+O container está de pé?
+├─ NÃO (crash loop)  → o sinal é o EXIT CODE. /readyz nunca respondeu.
+│                      90-97 ⇒ schema (tabela acima). 1 ⇒ outra dependência.
+│                      Log: maia.schema_boot_refused → maia.fatal.
+│                      NÃO existe instância para inspecionar: leia o log do
+│                      container morto, não o endpoint.
+└─ SIM               → o sinal é o /readyz (503 com o componente nomeado).
+   ├─ 503 com checks[].component=="schema"
+   │     ⇒ o schema mudou DEBAIXO de um processo que já tinha subido
+   │       (deploy de migration com o app no ar). O app sai de rotação e
+   │       fica inspecionável. Mesmas condições, mesma remediação.
+   └─ 503 em outro componente ⇒ §8.1, tabela de probes.
+```
+
+Por que as duas posturas coexistem sem se contradizer: o boot pergunta **"posso
+existir?"** e a readiness pergunta **"posso receber tráfego?"**. Um processo que
+NASCE sobre um schema que não pode verificar não tem trabalho legítimo a fazer —
+morrer é mais honesto (e mais visível) do que ficar de pé eternamente 503. Um
+processo que JÁ ESTAVA servindo e vê o schema mudar sai de rotação e continua
+inspecionável, que é o comportamento certo para um deploy em andamento.
+
+**O crash loop não deveria acontecer no caminho normal.** Quem o impede é o gate
+de migration: o job one-shot do `compose.prod.yml` (`depends_on:
+service_completed_successfully`) ou `npm run release:migrate` no pré-deploy do
+painel (#565). Se o app está em crash loop por schema, ou o gate não rodou, ou
+ele rodou e falhou sem bloquear o rollout — verifique isso ANTES de mexer no
+banco.
+
+**Dev e teste morrem igual, de propósito.** Não há variável nova nem exceção por
+ambiente: a única alavanca é a que já existe no contrato,
+`READINESS_SCHEMA_CHECK=false` — silenciosa em `development`, aviso em
+`staging`, **recusada no boot em `production`**. Use-a apenas onde código e
+schema são publicados fora de banda de propósito (ex.: `npm run dev` contra um
+banco de outra branch). O CI não é afetado: nenhuma suíte executa o `main()` de
+`src/index.ts` a não ser `tests/unit/runtime/schema-boot-gate.spec.ts`, que
+injeta o próprio ledger.
 
 > As variáveis desta seção vivem no contrato de configuração (#515): grupo
 > **Lifecycle do processo** em `src/config/contract.ts`, documentadas em
