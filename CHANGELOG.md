@@ -4,11 +4,65 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — migration com índice `CONCURRENTLY` inválido deixa de ser marcada como aplicada ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658))
+
+**O defeito, medido contra o Postgres 16.** `CREATE UNIQUE INDEX CONCURRENTLY`
+que reprova — por duplicata pré-existente, deadlock ou cancelamento — **não
+desaparece**: o índice fica no catálogo com `pg_index.indisvalid = false`. E o
+`IF NOT EXISTS` da tentativa seguinte o enxerga, pula a criação e devolve
+sucesso:
+
+```
+1a tentativa:  ERROR: could not create unique index "t_k_uq"
+catálogo:      t_k_uq | indisvalid = f
+2a tentativa:  NOTICE: relation "t_k_uq" already exists, skipping
+               CREATE INDEX          ← exit 0
+catálogo:      t_k_uq | indisvalid = f     ← continua inválido
+```
+
+O runner lia exit 0 e gravava `applied`. Como aqui índice único parcial é
+**mecanismo de exclusão** e não otimização (`agent_turns_stream_active_uq` e
+afins), o resultado era a exclusão mútua **não existir** com o ledger dizendo
+"aplicada" — a mesma classe de defeito que a épica
+[#505](https://github.com/diogenesmendes01/Maia-v2/issues/505) existe para
+eliminar.
+
+**A correção** é uma invariante ABSOLUTA — "nenhum índice inválido no escopo" —,
+não um diff de `pg_index` antes/depois (delta é vazio justamente na
+reaplicação, que é o caso perigoso). Ela é asserida em dois pontos:
+
+- **pré-voo**, antes de qualquer DDL: um índice inválido produz o blocker
+  `invalid_index` e o `up` sai `blocked` sem enviar statement nenhum. É o que
+  fecha a reaplicação — e ela sobrevive inclusive a um `repair --as pending`,
+  porque limpar a linha do ledger não conserta o catálogo;
+- **na hora de escrever `applied`** (modos `self`/`none`): a migration vira
+  `dirty` com `error_class = MIGRATION_INVALID_INDEX`, mesmo tendo terminado
+  sem levantar erro. É o caso do operador que roda DDL concorrente à mão numa
+  sessão paralela enquanto o job de migration está em voo.
+
+Como o pré-estado é provadamente vazio, qualquer índice inválido encontrado
+depois nasceu naquela migration: atribuição por invariante, sem parser de SQL.
+
+**O que o operador vê.** `MigrationStatusReport` passa a carregar
+`invalid_indexes`; `getSchemaReadiness()` responde `blocked` com o índice
+nomeado e o remédio no texto; e o boot morre com **exit 98** — código novo,
+à frente do 90 na precedência, porque quando os dois aparecem juntos o índice
+inválido é a CAUSA e o `dirty` é a consequência. Remédio completo (`DROP INDEX
+CONCURRENTLY` → resolver a duplicata → reaplicar) em
+[`docs/runbooks/migrations.md`](docs/runbooks/migrations.md#índice-inválido-deixado-por-ddl-concurrently);
+tabela de exit codes em
+[`docs/runbooks/operational.md` §8.1](docs/runbooks/operational.md).
+
+Efeito colateral declarado: o caminho de leitura de `getSchemaReadiness()`
+passou de duas para três consultas, então o teto por statement do `maia doctor`
+caiu de 4s para 3s (3 × 3s = 9s < 10s de deadline), agora travado contra a
+contagem real de statements em vez de um `2` literal.
+
 ### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **O que muda no seu dia:** antes, um app que subisse contra um schema
 > incompatível ficava **de pé** respondendo 503 no `/readyz`. Agora ele **não
-> sobe** — encerra com exit code **90-97**, e sob um supervisor que reinicia
+> sobe** — encerra com exit code **90-98**, e sob um supervisor que reinicia
 > isso é **crash loop**. Se o seu deploy não tem gate de migration, ele passa a
 > ter um sintoma novo. Verifique, ANTES de subir este release, que o migrator
 > roda antes do app: `depends_on: { migrate: { condition:
@@ -38,7 +92,7 @@ só.
 O que mudou:
 
 - **`src/index.ts` (etapa `schema`)** chama `checkSchemaReadiness()` — o MESMO adaptador cacheado do `/readyz`, então boot e probe não podem divergir — e lança `SchemaBootAbortError`; o handler de `main()` sai com `bootExitCode(err)`.
-- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown`. `1` continua sendo qualquer outra falha de boot. A faixa 90-97 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
+- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown` · **98** índice `indisvalid = false` ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658)). `1` continua sendo qualquer outra falha de boot. A faixa 90-98 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
 - **Mensagem de morte acionável**, porque um crash loop sem diagnóstico é pior que um 503: `maia.schema_boot_refused` carrega `exit_code`, `blocker`, `blockers`, `migration_id`, `expected_checksum` (arquivo empacotado) vs. `found_checksum` (linha do ledger), os dois heads e a `remediation` (o comando exato). Nada disso carrega SQL, texto de driver ou DSN — a mensagem de erro do `pg` embute a connection string com senha.
 - **`checkSchemaVersion()` e `src/runtime/lifecycle/schema-version.ts` foram REMOVIDOS**, com o spec dedicado. Não sobrou um segundo veredito de schema para divergir.
 - **Coerência com a [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):** o `/readyz` continua sendo o único gate de roteamento, role-aware e fail-closed, e continua respondendo 503 quando o schema muda debaixo de um processo **que já subiu** — esse caso não vira crash loop. A árvore de decisão do operador (quando olhar exit code, quando olhar readiness) está em `docs/runbooks/operational.md` §8.1.
