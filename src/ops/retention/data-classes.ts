@@ -273,10 +273,25 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     source_of_truth: 'privacy_requests.export_locator',
     purge_mechanism: 'delete',
     backup_behavior: 'excluded_volume',
-    legal_hold_applicable: false,
+    // ERA `false`, e era uma declaração obsoleta: foi escrita quando NADA
+    // apagava o artefato, então a pergunta "um hold congela o export?" não
+    // tinha consequência. O TTL do #536 tornou a classe destrutível, e um
+    // pacote cifrado é uma cópia materializada do dado do titular — material
+    // responsivo tanto quanto a origem. Destruí-lo sob hold é a pior saída
+    // possível deste módulo, e a direção recuperável é conservá-lo.
+    //
+    // O varredor NÃO consulta este campo para decidir se avalia hold (ver
+    // `src/ops/privacy/export-sweeper.ts`): condicionar uma recusa destrutiva a
+    // um campo mutável de registro significa que uma edição de um caractere
+    // desarma a proteção. O campo declara a verdade; a proteção é incondicional.
+    legal_hold_applicable: true,
     reversible: false,
-    audit_event: 'privacy_request_completed',
-    dpo_open_question: 'export package lifetime before it must expire',
+    audit_event: 'privacy_export_purged',
+    // Sete dias é a POLÍTICA INICIAL decidida pelo dono (issue #536) e vive em
+    // `PRIVACY_EXPORT_TTL_DAYS`, não numa constante. O que continua com o DPO é
+    // confirmar (ou mudar) o número.
+    dpo_open_question:
+      'confirm or replace the initial 7-day export package lifetime (PRIVACY_EXPORT_TTL_DAYS); the mechanism that enforces it is live',
   }),
   cls({
     id: 'privacy.tombstone',

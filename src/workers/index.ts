@@ -18,6 +18,7 @@ import { runOutboxDrainWorker } from './outbox-drain-worker.js';
 import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
 import { runNightlyBackup, runBackupRetention, runScheduledRestoreDrill } from './backup.js';
+import { runPrivacyExportSweepJob } from './privacy.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -148,6 +149,20 @@ export const JOBS: Job[] = [
   // every deletion from the manifest, evaluates legal hold under a lock, and
   // covers both destinations. Deletes nothing while RETENTION_DRY_RUN=true.
   { name: 'backup_retention', cron: '0 4 * * 0', fn: runBackupRetention, phase: 1 },
+  // Issue #536 — o TTL do export de privacidade, executado.
+  //
+  // HORÁRIO e não diário: o prazo é de dias, mas a granularidade da varredura é
+  // a JANELA DE EXPOSIÇÃO de um pacote cifrado com o dado consolidado de um
+  // titular já vencido. Com um passe diário essa janela chega a 24h; com um
+  // horário, a uma. O custo de um passe sem trabalho é uma leitura indexada
+  // sobre um índice parcial (migration 118) que, no caso saudável, tem zero
+  // linhas.
+  //
+  // No minuto 50 de propósito: longe do :00 (onde `nightly_backup`,
+  // `inactivity_sweep` e a maioria dos cron de hora cheia se acumulam) e longe
+  // do :40 do `restore_drill`, que é o único outro job que pode segurar um lock
+  // de ops por muito tempo.
+  { name: 'privacy_export_sweep', cron: '50 * * * *', fn: runPrivacyExportSweepJob, phase: 1 },
   // Issue #536 — o GATE do drill de restore. `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`
   // é a IDADE MÁXIMA ACEITÁVEL DA EVIDÊNCIA, não um agendamento: por isso a
   // cadência aqui é um TICK fixo de hora em hora e não um cron derivado do
