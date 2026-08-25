@@ -11,6 +11,19 @@
  *  - `agent_turns.status = 'dead_letter'` (subcomando `replay-turn`): a DLQ do
  *    ESTADO, de #503/#504. O turno é a unidade durável; o job é só o despertar.
  *
+ *  - `outbound_messages.status = 'dead_letter'` (subcomandos `outbound-show`/
+ *    `outbound-rearm`, issue #633): a DLQ do OUTBOX — uma saída lógica de que a
+ *    plataforma DESISTIU (teto de tentativas, ou prazo de reconciliação
+ *    vencido). Distinta de `failed_terminal`, que é a recusa DEFINITIVA do
+ *    provedor e NÃO deve ser rearmada.
+ *
+ * O `outbound-rearm` é a operação da falha #12 da épica #506 — o operador
+ * rearmar um item incerto e duplicar mensagem para o usuário. Ela é recusada
+ * quando o estado é incerto E o provedor não deduplica aquele tipo de payload,
+ * a menos que o operador passe `--confirm-duplicate-risk` EXPLICITAMENTE; o
+ * reconhecimento vai para a auditoria junto com o `--reason`. Use
+ * `outbound-show` antes: é ele que imprime o risco que a flag reconhece.
+ *
  * O `replay-turn` é o único caminho SUPORTADO para ressuscitar um turno morto,
  * e faz as três coisas que fazê-lo à mão não faz:
  *   1. resolve o dono do turno pela fronteira de confiança
@@ -25,7 +38,12 @@
 import { dlqRepo } from '@/db/repositories.js';
 import { agentQueue } from '@/gateway/queue.js';
 import { replayTurnByOperator } from '@/ops/turn-replay.js';
+import {
+  inspectOutboundForOperator,
+  rearmOutboundByOperator,
+} from '@/ops/outbound-rearm.js';
 import { TurnScopeUnresolvedError } from '@/runtime/turns/scope-resolver.js';
+import { OutboundScopeUnresolvedError } from '@/runtime/outbound/delivery-scope.js';
 
 async function listOpen() {
   const items = await dlqRepo.listOpen(50);
@@ -94,6 +112,70 @@ async function replayTurn(turn_id: string, args: { actor: string; reason: string
   );
 }
 
+/**
+ * Inspeção READ-ONLY de uma linha do outbox. Imprime o risco de duplicata em
+ * texto, porque é ele que `--confirm-duplicate-risk` reconhece — uma flag que
+ * se digita sem conseguir consultar o que ela assume é ritual, não controle.
+ */
+async function outboundShow(outbound_id: string) {
+  const row = await inspectOutboundForOperator(outbound_id).catch(operatorScopeError);
+  if (!row) {
+    console.error(`outbound ${outbound_id} não encontrado no escopo resolvido.`);
+    process.exit(1);
+  }
+  console.log(`outbound   ${row.outbound_id}`);
+  console.log(`escopo     ${row.tenant_id}/${row.agent_id}`);
+  console.log(`status     ${row.status}`);
+  console.log(`tipo       ${row.payload_type}`);
+  console.log(`tentativas ${row.attempt}`);
+  console.log(`desfecho   ${row.delivery_outcome ?? '(nenhum registrado)'}`);
+  console.log(`erro       ${row.last_error_code ?? '-'}`);
+  console.log(`criado em  ${row.created_at.toISOString()}`);
+  console.log(`duplicata  ${row.duplicate_risk ? 'RISCO' : 'sem risco'} — ${row.idempotency_note}`);
+}
+
+/**
+ * Rearmamento manual. Adaptador de CLI em volta de `rearmOutboundByOperator`
+ * (`src/ops/outbound-rearm.ts`), onde a operação — e a ordem fail-closed dos
+ * seus quatro passos — de fato vive.
+ */
+async function outboundRearm(
+  outbound_id: string,
+  args: { actor: string; reason: string; confirm: boolean },
+) {
+  const outcome = await rearmOutboundByOperator({
+    outbound_id,
+    actor: args.actor,
+    reason: args.reason,
+    acknowledge_duplicate_risk: args.confirm,
+  }).catch(operatorScopeError);
+
+  if (!outcome.rearmed) {
+    console.error(`rearmamento RECUSADO para ${outcome.outbound_id} (${outcome.refusal}).`);
+    console.error(outcome.detail);
+    console.error('Nada foi alterado.');
+    process.exit(1);
+  }
+  console.log(
+    `outbound ${outcome.outbound_id} rearmado (tenant=${outcome.tenant_id} ` +
+      `agent=${outcome.agent_id}), de '${outcome.from_status}' para 'retryable'; ` +
+      `risco de duplicata=${outcome.duplicate_risk}; actor=${args.actor}`,
+  );
+}
+
+/** Traduz a recusa da fronteira de confiança em mensagem de operador. */
+function operatorScopeError(err: unknown): never {
+  if (err instanceof OutboundScopeUnresolvedError) {
+    console.error(`escopo da linha recusado (reason=${err.reason}): ${err.outbound_id}`);
+    console.error(
+      'Nada foi alterado. `scope_mismatch` significa que a conversa pertence a outro ' +
+        '(tenant, agent) que a linha do outbox — investigue antes de qualquer rearme.',
+    );
+    process.exit(1);
+  }
+  throw err;
+}
+
 /** `--flag valor` e `--flag=valor`. */
 function flag(argv: readonly string[], name: string): string | null {
   const long = `--${name}`;
@@ -111,7 +193,10 @@ const arg = argv[1];
 
 const USAGE =
   'usage: tsx scripts/dlq.ts list | retry <id> | resolve <id> | ' +
-  'replay-turn <turn_id> --reason "<motivo>" [--actor <quem>]';
+  'replay-turn <turn_id> --reason "<motivo>" [--actor <quem>] | ' +
+  'outbound-show <outbound_id> | ' +
+  'outbound-rearm <outbound_id> --reason "<motivo>" [--actor <quem>] ' +
+  '[--confirm-duplicate-risk]';
 
 (async () => {
   if (cmd === 'list') await listOpen();
@@ -128,6 +213,25 @@ const USAGE =
       process.exit(2);
     }
     await replayTurn(arg, { actor: flag(argv, 'actor') ?? 'dlq-cli', reason });
+  } else if (cmd === 'outbound-show' && arg) {
+    await outboundShow(arg);
+  } else if (cmd === 'outbound-rearm' && arg) {
+    const reason = flag(argv, 'reason');
+    if (!reason) {
+      // `reason` é OBRIGATÓRIO: ele vai para a row de auditoria
+      // `outbound_manual_rearm`, e um rearmamento sem motivo registrado é uma
+      // intervenção que ninguém consegue reconstruir depois.
+      console.error('outbound-rearm exige --reason "<motivo>" — ele vai para a auditoria.');
+      console.error(USAGE);
+      process.exit(2);
+    }
+    await outboundRearm(arg, {
+      actor: flag(argv, 'actor') ?? 'dlq-cli',
+      reason,
+      // Presença da flag, não valor: `--confirm-duplicate-risk` é um ato, e um
+      // `--confirm-duplicate-risk=false` seria uma forma confusa de dizer não.
+      confirm: argv.includes('--confirm-duplicate-risk'),
+    });
   } else {
     console.log(USAGE);
     process.exit(2);

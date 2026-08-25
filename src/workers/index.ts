@@ -35,6 +35,7 @@ import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
+import { runOutboundRecovery } from './outbound-recovery.js';
 import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
 import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
@@ -132,6 +133,16 @@ export const JOBS: Job[] = [
   // Dispatcher per-tenant via runWithTenantContext (espelha reflection-batch
   // #240/#251) — NÃO usa sentinela 'default'.
   { name: 'outbound_messages_sweeper', cron: '*/5 * * * *', fn: runOutboundMessagesSweeper, phase: 1 },
+  // Issue #633 (fatia D da #506) — varredura de recuperação do OUTBOX DURÁVEL.
+  // Distinto de `outbound_messages_sweeper` acima, que é o housekeeping do
+  // ledger LEGADO (rows sem `turn_id`) e agora as ignora explicitamente.
+  //
+  // Cadência de 1 min e não de 5: aqui o que se recupera é uma RESPOSTA ao
+  // usuário, e o SLI é a latência percebida. PHASE 1 de propósito —
+  // `startWorkers(1)` ignora phase>1, então em phase 2 o worker nunca rodaria.
+  // A FLAG é o gate real: com FEATURE_OUTBOUND_RECOVERY off ele é no-op na
+  // PRIMEIRA linha, sem tocar o banco.
+  { name: 'outbound_recovery', cron: '* * * * *', fn: runOutboundRecovery, phase: 1 },
   // Issue #316 — transactional effect outbox relayer. Dispatches NON-IDEMPOTENT
   // external effects (e.g. WhatsApp sends) recorded atomically with the winning
   // idempotency reservation, EXACTLY ONCE, with retry/backoff. Every minute so
