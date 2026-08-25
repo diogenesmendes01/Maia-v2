@@ -120,10 +120,12 @@ export default function TraceDetailPage({
                 label="Integridade"
                 value={
                   trace.envelope_integrity === 'verified'
-                    ? `HMAC v${trace.hmac_key_version} verificado`
+                    ? `HMAC v${trace.hmac_key_version} verificado (assinatura v${trace.signature_version})`
                     : trace.envelope_integrity === 'invalid'
                       ? 'ADULTERADO — HMAC não confere'
-                      : `Não verificável (chave v${trace.hmac_key_version} ausente)`
+                      : trace.envelope_integrity === 'rejected_version'
+                        ? `Versão de assinatura v${trace.signature_version} recusada por este ambiente`
+                        : `Não verificável (chave v${trace.hmac_key_version} ausente)`
                 }
               />
               <Meta
@@ -171,6 +173,17 @@ export default function TraceDetailPage({
                 com base neste trace. Ver docs/runbooks/observability-slo.md §4.1.
               </Alert>
             )}
+            {trace.envelope_integrity === 'rejected_version' && (
+              <Alert tone="warning">
+                Este envelope declara assinatura v{trace.signature_version}, que
+                este ambiente recusa ler
+                (<code>RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false</code>). Isso NÃO
+                significa adulteração: a assinatura pode ser legítima, mas a v1
+                deixa <code>root_trace_id</code> e <code>attempt</code> fora dela
+                e o ambiente optou por não apresentá-la como evidência. Ver
+                issue #535.
+              </Alert>
+            )}
             {trace.envelope_integrity === 'unknown' && (
               <Alert tone="warning">
                 Não foi possível verificar a assinatura: a chave HMAC v
@@ -200,9 +213,18 @@ export default function TraceDetailPage({
           <Card>
             <CardHeader
               title={`Tentativas deste turno (${trace.attempt_count})`}
-              description="Retry e recovery reusam o mesmo turno; cada tentativa tem seu próprio envelope."
+              description="Retry e recovery reusam o mesmo turno; cada tentativa tem seu próprio envelope. O agrupamento exige o turno_id ASSINADO — duas tentativas só aparecem juntas se concordarem num campo coberto pelo HMAC de cada uma."
             />
             <CardBody>
+              {!trace.attempt_grouping_signed && (
+                <Alert tone="warning">
+                  Ao menos uma tentativa desta lista usa assinatura v1, que
+                  deixa <code>root_trace_id</code> e <code>attempt</code> fora do
+                  HMAC. A ORDEM das tentativas não é evidência assinada nessas
+                  linhas; a pertença ao turno continua sendo, via
+                  <code> turno_id</code>. Ver issue #535.
+                </Alert>
+              )}
               <ul className="divide-y divide-zinc-100">
                 {trace.attempts.map((a) => (
                   <li key={a.trace_id} className="flex items-center gap-3 py-2 text-sm">

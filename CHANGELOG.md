@@ -221,6 +221,44 @@ contra os dois defeitos que a nova pega: um `markAllProcessed` incondicional
 Nenhuma barreira foi enfraquecida — a contagem de efeitos pós-gate, os
 `workloads` de LLM e o `boundary` que recusou continuam iguais.
 
+### ⚠️ BREAKING (esquema de evidência) — `envelope_hmac` vira versionado e passa a assinar `root_trace_id`/`attempt` ([#535](https://github.com/diogenesmendes01/Maia-v2/issues/535))
+
+> **Rode a migration 119 ANTES de subir a aplicação.** O escritor grava `runtime_trace_envelopes.signature_version`; sem a coluna, todo turno com `side_effect_level >= medium` falha fechado no envelope obrigatório — ou seja, **aborta**. Ordem inversa não existe: o `_down` da 119 recusa enquanto houver linha v2, de propósito.
+
+**O que mudou.** A migration 107 acrescentou `root_trace_id` e `attempt` e os deixou **fora** do `envelope_hmac`, com o argumento — escrito no próprio arquivo — de que assiná-los invalidaria todo envelope já escrito. O argumento caducou antes de valer: `FEATURE_RUNTIME_TRACE_V1` nunca foi ligada em produção, então **não existe corpus a invalidar**. Decisão do owner: consertar o contrato agora, de forma versionada.
+
+| | v1 | v2 |
+|---|---|---|
+| Campos assinados | `trace_id`, `tenant_id`, `agent_id`, `conversa_id`, `turno_id`, `policy_id`, `decision`, `side_effect_level`, `redaction_class`, `hmac_key_version` | v1 **∪** `root_trace_id`, `attempt`, `signature_version` |
+| Escrito por produção | **não**, nunca mais | **sim**, sempre |
+| Lido pelo verifier | sim (fixtures / ambientes antigos) | sim |
+| Reassinado retroativamente | **não** | — |
+
+O escritor lê a versão de uma **constante** (`CURRENT_ENVELOPE_SIGNATURE_VERSION`), nunca do input: um chamador não consegue pedir assinatura mais fraca. As duas materiais canônicas moram num arquivo só (`src/control-plane/runtime-trace/lib/signature.ts`) para que assinador e verificador não possam divergir.
+
+**Por que isso não é um downgrade attack.** A versão mora numa coluna, e coluna é justamente o que um atacante com escrita no banco controla. Por isso a material da v2 contém `"signature_version":2` — separação de domínio explícita. Virar a coluna de uma linha v2 para `1` faz o verifier recomputar a material **v1** e comparar com um HMAC tirado sobre a material **v2**: não bate, e a linha lê `invalid`. O relabel na direção oposta é detectado do mesmo jeito. Evidência: `tests/unit/observability/verify-envelope.spec.ts` → "DOWNGRADE: relabelling a v2 row as v1 does not free the new fields".
+
+**O risco que continua aberto, e é decisão de operador.** Uma linha *genuinamente* assinada em v1 mantém `root_trace_id`/`attempt` fora da assinatura — nelas, essas duas colunas seguem editáveis sem detecção. Produção não escreve mais v1, então isso está limitado a fixtures e a ambientes que já gravaram alguma. Duas defesas, ambas independentes da assinatura:
+
+- **`RUNTIME_TRACE_ACCEPT_SIGNATURE_V1`** (nova, default `true`) recusa v1 **na leitura** quando `false`. O veredito é `rejected_version`, deliberadamente distinto de `invalid`: uma assinatura v1 pode ser perfeitamente legítima, e chamá-la de adulteração é o mesmo erro de categoria que o antigo `hmac.length > 0` cometia, ao contrário. O default é `true` porque virar toda linha legada para `rejected_version` no dia do deploy destruiria exatamente a evidência que a chave existe para proteger.
+- **`listAttempts()` passa a exigir o `turno_id` ASSINADO** (abaixo).
+
+### Changed — `listAttempts()` exige o `turno_id` assinado; dois turnos não podem mais se fundir visualmente ([#535](https://github.com/diogenesmendes01/Maia-v2/issues/535))
+
+`runtimeTraceRepo.listAttempts()` recebia `{ tenantId, rootTraceId }`. `root_trace_id` é o campo que diz "estas linhas são do mesmo turno", e até a #535 ele não era assinado — um único `root_trace_id` editado enxertava a tentativa de um turno na cadeia de **outro**, e o Explorer renderizava dois turnos distintos como uma sequência de retry. Essa é a fusão visual que o owner mandou fechar.
+
+Agora a assinatura do método é `{ tenantId, rootTraceId, turnoId }`, os três obrigatórios, e:
+
+1. `turnoId` em branco/ausente **falha fechado** (`TraceAttemptScopeError`) em vez de cair para agrupamento só por `root_trace_id`. O fallback seria o controle desligado por omissão de argumento;
+2. o filtro por `turno_id` está **no SQL**, servido por `runtime_trace_env_attempt_turn_idx` (migration 119) — `turno_id` está dentro do `envelope_hmac` desde a migration 052, nas **duas** versões, então entrar no grupo passa a exigir concordar num campo que a própria assinatura da linha cobre;
+3. um irmão devolvido cujo envelope verifica como `invalid` é **descartado** — e devolvido ao chamador em `refused`, que o router audita como `runtime_trace_attempt_group_row_refused`. Detecção que ninguém consegue ler depois não é detecção. `unknown` e `rejected_version` são reportados, não escondidos: sumir com uma linha que o operador já vê na listagem pareceria evidência desaparecendo.
+
+Isto é **defesa em profundidade**, não o controle primário — o controle primário é a v2 assinar `root_trace_id` e `attempt`. Esta camada é a que continua valendo numa linha v1.
+
+Evidência: `tests/unit/observability/envelope-signature-v2.spec.ts` compila o WHERE que a produção construiu (`PgDialect.sqlToQuery`) em vez de olhar argumentos de mock, e `tests/integration/trace-explorer-attempt-grouping.spec.ts` roda escritor real → repositório real → router e enxerta uma linha de outro turno com o `root_trace_id` reescrito, exigindo que ela seja recusada e auditada.
+
+**Codificação canônica — achado negativo, verificado.** A pergunta era se um valor contendo o separador consegue forjar outro envelope. Não consegue: a codificação é `canonicalJson` (JSON de verdade, chaves ordenadas, `JSON.stringify` em toda chave e string), não concatenação com separador — aspas, vírgulas e dois-pontos dentro de um valor saem escapados e não fecham a própria string. Passou a ser teste em vez de comentário (`envelope-signature-v2.spec.ts` → "canonical encoding is unambiguous"), incluindo o caso de deslocamento de fronteira entre campos adjacentes (`tenant_id`+`agent_id`).
+
 
 ### ⚠️ AÇÃO DO OPERADOR — se algum health check seu aponta para `GET /health`, ele nunca reprovou nada ([#613](https://github.com/diogenesmendes01/Maia-v2/issues/613))
 

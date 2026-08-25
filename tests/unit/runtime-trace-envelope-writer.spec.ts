@@ -142,39 +142,109 @@ describe('writeEnvelope', () => {
     expect(out.redaction_class).toBe('standard');
   });
 
-  it('HMAC verifies against the canonical envelope payload', async () => {
-    const out = await writeEnvelope(baseInput);
-    const payload = {
-      trace_id: baseInput.trace_id,
-      tenant_id: baseInput.tenant_id,
-      agent_id: baseInput.agent_id,
-      conversa_id: baseInput.conversa_id,
-      turno_id: baseInput.turno_id,
-      policy_id: baseInput.decision.policy_id,
-      decision: baseInput.decision.decision,
-      side_effect_level: baseInput.decision.side_effect_level,
+  /**
+   * Issue #535 — this payload is written out LITERALLY on purpose.
+   *
+   * The obvious version of this test rebuilds the expected material by calling
+   * `envelopeSignedPayload()`, the same function the writer calls. That test
+   * passes whatever the writer signs, including nothing at all: signer and
+   * "expectation" move together. A literal is the only form in which the SET of
+   * signed fields is asserted rather than echoed — drop `root_trace_id` from the
+   * production material and this goes red, because the literal still has it.
+   */
+  const RETRY_INPUT: TraceEnvelopeInput = {
+    ...baseInput,
+    root_trace_id: 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+    attempt: 3,
+  };
+
+  function v2MaterialLiteral(hmac_key_version: number) {
+    return {
+      trace_id: RETRY_INPUT.trace_id,
+      tenant_id: RETRY_INPUT.tenant_id,
+      agent_id: RETRY_INPUT.agent_id,
+      conversa_id: RETRY_INPUT.conversa_id,
+      turno_id: RETRY_INPUT.turno_id,
+      policy_id: RETRY_INPUT.decision.policy_id,
+      decision: RETRY_INPUT.decision.decision,
+      side_effect_level: RETRY_INPUT.decision.side_effect_level,
       redaction_class: 'standard',
-      hmac_key_version: out.hmac_key_version,
+      hmac_key_version,
+      // The two fields the owner decision adds, plus the version that makes a
+      // relabel detectable.
+      root_trace_id: RETRY_INPUT.root_trace_id,
+      attempt: RETRY_INPUT.attempt,
+      signature_version: 2,
     };
-    expect(verifyHmac(baseInput.tenant_id, out.hmac_key_version, payload, out.envelope_hmac)).toBe(true);
+  }
+
+  it('HMAC verifies against the canonical v2 envelope payload', async () => {
+    const out = await writeEnvelope(RETRY_INPUT);
+    expect(
+      verifyHmac(
+        RETRY_INPUT.tenant_id,
+        out.hmac_key_version,
+        v2MaterialLiteral(out.hmac_key_version),
+        out.envelope_hmac,
+      ),
+    ).toBe(true);
+  });
+
+  it('a forged root_trace_id does not verify against what production signed', async () => {
+    const out = await writeEnvelope(RETRY_INPUT);
+    const forged = {
+      ...v2MaterialLiteral(out.hmac_key_version),
+      root_trace_id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
+    };
+    expect(
+      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac),
+    ).toBe(false);
+  });
+
+  it('a forged attempt does not verify against what production signed', async () => {
+    const out = await writeEnvelope(RETRY_INPUT);
+    const forged = { ...v2MaterialLiteral(out.hmac_key_version), attempt: 99 };
+    expect(
+      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac),
+    ).toBe(false);
+  });
+
+  it('production writes signature_version=2 on the ROW, and never v1', async () => {
+    const out = await writeEnvelope(RETRY_INPUT);
+    const row = dbInsertMock.mock.calls[0]![0];
+    expect(row.signature_version).toBe(2);
+    expect(out.signature_version).toBe(2);
+    // And the stored HMAC is genuinely the v2 material, not a v1 one carrying a
+    // "2" label: the v1 material must NOT reproduce it.
+    const v1Material = { ...v2MaterialLiteral(out.hmac_key_version) } as Record<string, unknown>;
+    delete v1Material.root_trace_id;
+    delete v1Material.attempt;
+    delete v1Material.signature_version;
+    expect(
+      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, v1Material, out.envelope_hmac),
+    ).toBe(false);
+  });
+
+  it('the signature version is NOT caller-controlled (no downgrade oracle)', async () => {
+    // A caller that smuggles a version through the input must not get a v1
+    // envelope out: the writer takes it from a constant.
+    const out = await writeEnvelope({
+      ...RETRY_INPUT,
+      // @ts-expect-error — deliberately passing a field the input type refuses
+      signature_version: 1,
+    });
+    expect(out.signature_version).toBe(2);
+    expect(dbInsertMock.mock.calls[0]![0].signature_version).toBe(2);
   });
 
   it('tampered side_effect_level fails HMAC verify', async () => {
-    const out = await writeEnvelope(baseInput);
+    const out = await writeEnvelope(RETRY_INPUT);
     const tampered = {
-      trace_id: baseInput.trace_id,
-      tenant_id: baseInput.tenant_id,
-      agent_id: baseInput.agent_id,
-      conversa_id: baseInput.conversa_id,
-      turno_id: baseInput.turno_id,
-      policy_id: baseInput.decision.policy_id,
-      decision: baseInput.decision.decision,
+      ...v2MaterialLiteral(out.hmac_key_version),
       side_effect_level: 'low', // ← tampered down from 'medium'
-      redaction_class: 'standard',
-      hmac_key_version: out.hmac_key_version,
     };
     expect(
-      verifyHmac(baseInput.tenant_id, out.hmac_key_version, tampered, out.envelope_hmac),
+      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, tampered, out.envelope_hmac),
     ).toBe(false);
   });
 

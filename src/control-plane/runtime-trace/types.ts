@@ -94,6 +94,11 @@ export interface TraceEnvelopeWritten {
   attempt: number;
   envelope_hmac: string;
   hmac_key_version: number;
+  /**
+   * Issue #535: canonical material `envelope_hmac` covers. Always 2 on a
+   * production write — the writer takes it from a constant, never from input.
+   */
+  signature_version: number;
   side_effect_level: SideEffectLevel;
   decision: Decision;
   policy_id: string | null;
