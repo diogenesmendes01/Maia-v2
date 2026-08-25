@@ -596,7 +596,14 @@ export const METRIC = {
   /**
    * Issue #633 — o que a reconciliação DECIDIU sobre uma linha incerta.
    * `result` ∈ `await_grace` | `resend_idempotent` | `escalate_manual` |
-   * `dead_letter` | `noop` | `history_recovered` (`RECONCILIATION_RESULTS`).
+   * `dead_letter` | `noop` | `history_recovered` | `history_fabricated`
+   * (`RECONCILIATION_RESULTS`).
+   *
+   * Issue #635 acrescentou `history_fabricated`: a linha `delivered` órfã NÃO
+   * tinha histórico e ele foi PROJETADO do artefato imutável. É a série que
+   * conta crashes do delivery worker na janela `delivered -> completed` — e por
+   * isso é separada de `history_recovered` ("o histórico já estava lá, só o
+   * estado atrasou"), que é ruído de concorrência.
    *
    * `resend_idempotent` e `escalate_manual` são as duas metades da regra da
    * épica, e vê-las lado a lado é o ponto: a primeira só acontece quando o
