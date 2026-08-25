@@ -35,6 +35,7 @@ import { runMigrations, repairMigration, repairAppliedRefusal } from '@/migratio
 import { main as migrateCli } from '../../scripts/migrate.js';
 import { getMigrationStatus, getSchemaReadiness } from '@/migrations/readiness.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
+import { describeSchemaBootFailure } from '@/runtime/lifecycle/schema-boot-gate.js';
 
 /**
  * Gated on TEST_DB_URL ONLY, matching every other real-DB spec here (e.g.
@@ -538,6 +539,50 @@ d('migration runner — real Postgres (#516)', () => {
       ]),
     ).rejects.toThrow();
   }, 30_000);
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Issue #516 / ADR 0004 — o BOOT decide pelo mesmo veredito, e o exit code
+  // nomeia a invariante. Aqui contra ledger REAL (DDL real, linha `dirty`
+  // real escrita pelo runner, ledger v1 real), não contra um fake.
+  // ──────────────────────────────────────────────────────────────────────
+  it('o gate de BOOT traduz o veredito real em exit code por invariante', async () => {
+    await write('001_plain.sql', PLAIN);
+    await write('002_self.sql', SELF_TX);
+
+    // (a) schema completo e verificado — o boot NÃO recusa.
+    expect(await runMigrations(deps())).toMatchObject({ ok: true });
+    expect(
+      describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })),
+    ).toBeNull();
+
+    // (b) checksum divergente: alguém editou uma migration já aplicada.
+    await write('002_self.sql', `${SELF_TX}-- an edit after the fact\n`);
+    const mismatch = describeSchemaBootFailure(
+      await getSchemaReadiness({ pool, migrationsDir: dir }),
+    );
+    expect(mismatch).toMatchObject({ exit_code: 91, kind: 'checksum_mismatch', migration_id: '002_self.sql' });
+    expect(mismatch!.expected_checksum).not.toBe(mismatch!.found_checksum);
+    expect(mismatch!.message).toContain('SCHEMA BOOT REFUSED');
+    await write('002_self.sql', SELF_TX);
+
+    // (c) dirty REAL, escrito no ledger pelo próprio Postgres.
+    await pool.query("UPDATE schema_migrations SET status = 'dirty' WHERE id = $1", [
+      '002_self.sql',
+    ]);
+    const dirty = describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir }));
+    expect(dirty).toMatchObject({ exit_code: 90, kind: 'dirty_migration' });
+
+    // (d) migration obrigatória ausente: a linha some do ledger.
+    await pool.query('DELETE FROM schema_migrations WHERE id = $1', ['002_self.sql']);
+    expect(describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })))
+      .toMatchObject({ exit_code: 94, kind: 'schema_below_minimum' });
+
+    // (e) ledger inteiro fora do ar ⇒ `unknown`, que também recusa.
+    await admin.query(`DROP SCHEMA ${SCHEMA} CASCADE`);
+    await admin.query(`CREATE SCHEMA ${SCHEMA}`);
+    expect(describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })))
+      .toMatchObject({ exit_code: 97, state: 'unknown' });
+  }, 60_000);
 
   it('readiness on a database with no ledger at all is unknown, never ready', async () => {
     await write('001_plain.sql', PLAIN);

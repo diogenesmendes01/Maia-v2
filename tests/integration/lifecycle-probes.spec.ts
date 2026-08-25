@@ -39,7 +39,7 @@ import {
   _resetSchemaReadinessCacheForTests,
   _setSchemaReadinessDepsForTests,
 } from '@/runtime/lifecycle/schema-readiness.js';
-import { checkSchemaVersion, _resetSchemaVersionCacheForTests } from '@/runtime/lifecycle/schema-version.js';
+import { describeSchemaBootFailure } from '@/runtime/lifecycle/schema-boot-gate.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
 import { LEDGER_V2_COLUMNS } from '@/migrations/ledger.js';
 import type { ReadOnlyPool, ReadOnlyPoolClient } from '@/migrations/index.js';
@@ -85,7 +85,6 @@ d('issue #512 — lifecycle probes (real deps)', () => {
     lifecycle._resetForTests();
     _resetReadinessCacheForTests();
     _resetHealthCacheForTests();
-    _resetSchemaVersionCacheForTests();
     _resetSchemaReadinessCacheForTests();
   });
 
@@ -155,9 +154,9 @@ d('issue #512 — lifecycle probes (real deps)', () => {
     const r = await checkSchemaReadiness();
     expect(r.state).toBe('ready');
     expect(r.applied_head).toBe(r.expected_head);
-    // The pre-#516 boot check (still the boot step in src/index.ts) agrees.
-    const legacy = await checkSchemaVersion();
-    expect(legacy.status).toBe('ok');
+    // …e o MESMO veredito é o gate de BOOT desde a #516 (ADR 0004): num banco
+    // migrado ele não produz recusa nenhuma, então `src/index.ts` segue.
+    expect(describeSchemaBootFailure(r)).toBeNull();
   });
 });
 
