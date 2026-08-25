@@ -521,6 +521,62 @@ export const METRIC = {
    * banco é o gargalo.
    */
   OUTBOUND_COMMIT_REJECTED: 'maia_outbound_commit_rejected_total',
+  /**
+   * Issue #632 — resultado do CLAIM de entrega. `result` ∈ `acquired` |
+   * `not_found` | `not_eligible` | `terminal`.
+   *
+   * `terminal` é separado de `not_eligible` de propósito: uma linha terminal
+   * nunca voltará a ser elegível, então um pico ali é job duplicado (ou um
+   * replay manual sobre trabalho já concluído), enquanto `not_eligible` é
+   * contenção normal entre réplicas. Colapsá-los faria as duas triagens
+   * parecerem o mesmo incidente.
+   */
+  OUTBOUND_DELIVERY_CLAIM: 'maia_outbound_delivery_claim_total',
+  /**
+   * Issue #632 — a POSSE de uma linha do outbox foi perdida: uma gravação
+   * fenced voltou zero linhas, ou a tentativa foi abortada. `reason` ∈
+   * `fence_rejected` | `lease_expired` | `aborted`
+   * (`DELIVERY_LEASE_LOSS_REASONS`).
+   *
+   * É a série que torna o takeover OBSERVÁVEL. Sem ela, um worker zumbi que
+   * perde a posse termina em silêncio — o fence do banco recusa a gravação, o
+   * sucessor entrega, e nada indica que houve dois donos. Um pico aqui
+   * significa leases dimensionadas curto demais para a latência real do
+   * provedor, que é a causa mais comum de takeover FALSO.
+   *
+   * SEM `recipient`, `phone` ou conteúdo como label — nem poderia: `reason` é
+   * vocabulário fechado e o sanitizador de `labels.ts` derruba qualquer chave
+   * fora de `ALLOWED_LABEL_KEYS`. A correlação (`outbound_id`) fica no log
+   * estruturado, que tem política de retenção própria.
+   */
+  OUTBOUND_LEASE_LOST: 'maia_outbound_lease_lost_total',
+  /**
+   * Issue #632 — a entrega terminou em estado DESCONHECIDO, por `channel`.
+   *
+   * Um ponto aqui é uma resposta sobre a qual a plataforma não pode afirmar
+   * nem que chegou nem que não chegou: `accepted_unconfirmed`,
+   * `timeout_unknown` ou `cancelled_after_send_unknown`
+   * (`DELIVERY_UNKNOWN_OUTCOMES`). É a fila de entrada da reconciliação de
+   * #633, e é a métrica que a issue exige publicar porque ela é a única que
+   * mede o custo real de NÃO reenviar às cegas.
+   *
+   * `channel` é o canal de EGRESSO (`OUTBOUND_PROVIDER_CHANNELS`), e não
+   * `channel_kind`: aquele vocabulário inclui `internal`, `playground` e
+   * `probe`, que não são provedores de saída e não têm história de
+   * idempotência. Misturá-los faria uma adição futura ao ingresso aparecer
+   * nesta série sem que ninguém tivesse enviado nada.
+   */
+  OUTBOUND_DELIVERY_UNKNOWN: 'maia_outbound_delivery_unknown_total',
+  /**
+   * Issue #632 — desfecho NORMALIZADO da tentativa de entrega, por `outcome`
+   * (os sete de #506) e `channel`.
+   *
+   * Existe ao lado de `OUTBOUND_DELIVERY_UNKNOWN` e não a substitui: esta é a
+   * distribuição completa, aquela é o alvo de alerta. Um alerta sobre um
+   * subconjunto de rótulos de uma série grande é frágil (basta um rótulo novo
+   * para o seletor deixar de casar); a série dedicada não tem esse problema.
+   */
+  OUTBOUND_DELIVERY_OUTCOME: 'maia_outbound_delivery_outcome_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
   /**
@@ -731,6 +787,13 @@ export const ALLOWED_LABEL_KEYS: ReadonlySet<string> = new Set([
   'stage',
   'span',
   'channel_kind',
+  // canal de EGRESSO do outbox durável (issue #632) — conjunto FECHADO,
+  // `OUTBOUND_PROVIDER_CHANNELS` em `src/runtime/outbound/contract.ts`, com um
+  // membro hoje (`whatsapp`). Distinto de `channel_kind` de propósito: aquele
+  // classifica a natureza do canal e inclui `internal`/`playground`/`probe`,
+  // que não são provedores de saída. Um id de canal NUNCA entra aqui — o valor
+  // é o nome do provedor, não o `channel_id`.
+  'channel',
   'direction',
   'origin',
   'operation',
@@ -877,6 +940,10 @@ export const ENUM_VALUES = Object.freeze({
   ] as const,
   direction: ['inbound', 'outbound'] as const,
   channel_kind: ['whatsapp', 'internal', 'playground', 'probe'] as const,
+  // Issue #632 — canal de EGRESSO. Espelha `OUTBOUND_PROVIDER_CHANNELS`; um
+  // canal novo tem que DECIDIR a sua história de idempotência lá antes de
+  // aparecer aqui.
+  channel: ['whatsapp'] as const,
   origin: ['ingress', 'queue', 'recovery', 'replay', 'probe', 'internal'] as const,
   required: ['true', 'false'] as const,
 });
