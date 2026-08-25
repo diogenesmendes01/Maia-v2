@@ -1,13 +1,37 @@
 #!/usr/bin/env bash
-# E2E do Admin UI contra o console CONSTRUÍDO (não o dev server).
+# E2E do Admin UI contra o ARTEFATO STANDALONE — o mesmo que o Coolify executa.
 #
 # Roda igual no CI e na máquina de quem desenvolve, e é o único lugar que sabe
-# subir e derrubar o servidor. `playwright.config.ts` NÃO usa `webServer` de
-# propósito: aqui cada pré-requisito ausente vira uma mensagem própria e um
-# código de saída != 0, em vez de um timeout genérico do Playwright.
+# montar, subir e derrubar o servidor. `playwright.config.ts` NÃO usa
+# `webServer` de propósito: aqui cada pré-requisito ausente vira uma mensagem
+# própria e um código de saída != 0, em vez de um timeout genérico do
+# Playwright.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Por que STANDALONE e não `next start` (decisão do dono, issue #472)
+# ─────────────────────────────────────────────────────────────────────────
+# `next start` serve o `.next` da árvore de trabalho, com o `node_modules`
+# completo do repositório ao alcance. O que vai para produção é OUTRA coisa:
+# `src/admin-ui/Dockerfile` copia `.next/standalone` para `/app`, copia
+# `.next/static` para dentro dele e roda `node src/admin-ui/server.js` — um
+# bundle com um SUBCONJUNTO traçado do `node_modules` (`outputFileTracingRoot`
+# aponta para a raiz do repo, ver `next.config.mjs`).
+#
+# As duas classes de defeito que só o standalone enxerga:
+#   - módulo que o tracer (nft) não seguiu -> o container morre no boot com
+#     `Cannot find module`, e `next start` NUNCA reproduz isso;
+#   - `.next/static` fora da posição esperada -> o HTML renderiza, os chunks
+#     dão 404 e o console fica preso na tela de carregamento. MEDIDO nesta
+#     árvore: sem o `cp` de `.next/static`, 2 dos 5 testes do `smoke`
+#     reprovam (hidratação e o canário de jornada pública).
+#
+# A montagem abaixo é a tradução 1:1 dos dois `COPY --from=build` do
+# Dockerfile, e `tests/unit/ci/admin-ui-e2e-gate.spec.ts` trava a equivalência
+# (entrypoint e destino do estático saem do PRÓPRIO Dockerfile, lido do disco).
 #
 # Contrato de falha (tudo FECHA, nada pula):
 #   - sem build em src/admin-ui/.next        -> falha
+#   - sem artefato standalone / sem estático -> falha
 #   - sem DATABASE_URL / REDIS_URL           -> falha
 #   - servidor não responde no prazo         -> falha, com o log do servidor
 #   - Playwright reprova                     -> falha
@@ -27,8 +51,8 @@ cd "$ROOT"
 # Prefixo `TEST_` e NÃO `ADMIN_UI_`: `ADMIN_UI_` é um dos namespaces
 # reservados em `src/config/metadata.ts` (MAIA_KEY_PREFIXES), e uma chave
 # desconhecida sob ele REPROVA o boot de qualquer processo Maia que herde o
-# ambiente — inclusive o `next start` que este script sobe. `TEST_` é neutro
-# (mesmo prefixo de TEST_DB_URL e TEST_REQUIRE_COMPOSE_DIFFERENTIAL).
+# ambiente — inclusive o servidor standalone que este script sobe. `TEST_` é
+# neutro (mesmo prefixo de TEST_DB_URL e TEST_REQUIRE_COMPOSE_DIFFERENTIAL).
 PORTA="${TEST_ADMIN_UI_PORT:-4000}"
 ESPERA_S="${TEST_ADMIN_UI_BOOT_TIMEOUT_S:-120}"
 # Mínimo de testes que a rodada precisa ter EXECUTADO. Ver
@@ -38,9 +62,29 @@ MINIMO="${TEST_ADMIN_UI_MIN_TESTS:-1}"
 RELATORIO=".playwright-report/admin-ui.json"
 LOG_SERVIDOR="$(mktemp -t admin-ui-e2e-XXXXXX.log)"
 
+# Raiz do artefato standalone: é o `/app` do container (o Dockerfile faz
+# `COPY --from=build /app/src/admin-ui/.next/standalone ./`).
+STANDALONE="src/admin-ui/.next/standalone"
+# Entrypoint RELATIVO a essa raiz — o mesmo caminho do `CMD` do Dockerfile.
+# `outputFileTracingRoot` = raiz do repo faz o Next preservar o formato de
+# diretórios original, então o `server.js` nasce em `src/admin-ui/`, não na
+# raiz do bundle.
+SERVIDOR_REL="src/admin-ui/server.js"
+# Onde o estático precisa aterrissar dentro do artefato — o destino do segundo
+# `COPY` do Dockerfile.
+ESTATICO_DESTINO="$STANDALONE/src/admin-ui/.next/static"
+
 # ─── pré-requisitos ────────────────────────────────────────────────────────
 if [ ! -f "src/admin-ui/.next/BUILD_ID" ]; then
   echo "::error::sem build do console em src/admin-ui/.next — rode 'npm run admin:build' antes." >&2
+  exit 1
+fi
+if [ ! -f "$STANDALONE/$SERVIDOR_REL" ]; then
+  echo "::error::sem artefato standalone em $STANDALONE/$SERVIDOR_REL. É o que o Dockerfile executa em produção; sem ele o E2E mediria outro servidor. Confira 'output: standalone' e 'outputFileTracingRoot' em src/admin-ui/next.config.mjs e refaça 'npm run admin:build'." >&2
+  exit 1
+fi
+if [ ! -d "src/admin-ui/.next/static" ]; then
+  echo "::error::sem src/admin-ui/.next/static — o build não emitiu os assets de cliente." >&2
   exit 1
 fi
 for var in DATABASE_URL REDIS_URL NEXTAUTH_SECRET; do
@@ -49,16 +93,28 @@ for var in DATABASE_URL REDIS_URL NEXTAUTH_SECRET; do
     exit 1
   fi
 done
-if [ ! -x "src/admin-ui/node_modules/.bin/next" ]; then
-  echo "::error::next não instalado em src/admin-ui/node_modules — rode 'npm ci' em src/admin-ui." >&2
-  exit 1
-fi
+
+# ─── montagem do artefato (os dois COPY do Dockerfile) ─────────────────────
+# O `next build` NÃO põe o estático dentro do standalone: quem faz isso é a
+# imagem. Aqui é o mesmo movimento, para que o servidor abaixo sirva
+# exatamente o que o container serve.
+echo "▸ montando o artefato standalone (.next/static -> $ESTATICO_DESTINO)"
+rm -rf "$ESTATICO_DESTINO"
+mkdir -p "$(dirname "$ESTATICO_DESTINO")"
+cp -R "src/admin-ui/.next/static" "$ESTATICO_DESTINO"
 
 # ─── servidor ──────────────────────────────────────────────────────────────
-echo "▸ subindo o console construído em http://localhost:${PORTA} (log: ${LOG_SERVIDOR})"
+echo "▸ subindo o artefato standalone em http://localhost:${PORTA} (log: ${LOG_SERVIDOR})"
 (
-  cd src/admin-ui
-  exec ./node_modules/.bin/next start --port "$PORTA"
+  cd "$STANDALONE"
+  # `PORT`/`HOSTNAME` são a ÚNICA interface do server.js gerado (não há flag de
+  # linha de comando: ele lê `process.env.PORT` e `process.env.HOSTNAME`). Os
+  # dois valores vêm do estágio `runtime` do Dockerfile — e `HOSTNAME` precisa
+  # ser explícito porque em muitos ambientes a variável já existe com o NOME DA
+  # MÁQUINA, e o servidor tentaria bindar nele.
+  export PORT="$PORTA"
+  export HOSTNAME=0.0.0.0
+  exec node "$SERVIDOR_REL"
 ) >"$LOG_SERVIDOR" 2>&1 &
 PID_SERVIDOR=$!
 
