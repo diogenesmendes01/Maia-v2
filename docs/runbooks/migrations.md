@@ -152,9 +152,15 @@ postgres healthy → migrate (`npm run db:migrate`, exit 0) → app + admin-ui
 Consequência operacional que importa: **um blocker segura o deploy
 inteiro**. Se o `up` falhar com `service "migrate" didn't complete
 successfully`, `app` e `admin-ui` ficam em `created` e nunca sobem. Isso
-é intencional (fail-closed): uma instância de pé contra schema
-incompatível responderia 503 no `/readyz` indefinidamente, o que é pior
-de diagnosticar do que um deploy que não subiu.
+é intencional (fail-closed).
+
+**Este job é o que impede o crash loop.** Desde a ADR 0004 o `app` não fica de
+pé respondendo 503 sobre um schema que não consegue verificar: ele **morre** no
+boot, com exit code 90-97 nomeando a invariante (ver
+[`operational.md`](operational.md) §8.1). Se o app entrou em crash loop por
+schema, a primeira pergunta não é sobre o banco — é **o gate rodou?** No
+Compose ele é o `depends_on: service_completed_successfully`; fora do Compose é
+`npm run release:migrate` no comando de pré-deploy (#565).
 
 ```bash
 C="docker compose --env-file .env.infra -f compose.prod.yml"   # prod
@@ -631,34 +637,23 @@ O que sobra está abaixo.
   ler `process.env`: quem injeta é `scripts/migrate.ts`, via
   `migrationRunOptions()`.
 - Métricas de migration no `/metrics` — ver a seção acima.
+- **O BOOT decide pelo mesmo veredito e MATA o processo** (decisão do dono,
+  [ADR 0004](../architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md)).
+  `src/index.ts` (etapa `schema`) chama `checkSchemaReadiness()` e encerra o
+  processo com exit code **90-97**, um por invariante: 90 dirty/`running`
+  órfão · 91 checksum divergente · 92 checksum ausente · 93 migration que este
+  build não empacota · 94 migration obrigatória ausente · 95 schema acima do
+  máximo · 96 `running` em voo · 97 veredito `unknown`. `checkSchemaVersion()`
+  foi REMOVIDO — não há mais um segundo veredito de schema. A mensagem de
+  morte (`maia.schema_boot_refused`) nomeia migration, checksum esperado vs.
+  encontrado e o comando de remediação. Árvore de decisão do operador (exit
+  code vs. `/readyz`) em [`operational.md`](operational.md) §8.1.
 
 ### Aberto
 
 - **Drill em staging.** Nada aqui foi exercitado contra um banco de staging
-  real: subir uma réplica atrás do head, ver o `/readyz` recusar, rodar o job,
-  ver a rotação voltar. Depende do ambiente do dono, não de código.
-- **Decisão de política do passo de boot — do dono, não do agente.**
-  `src/index.ts` (lifecycle step `schema`) ainda usa `checkSchemaVersion()`,
-  que compara só o id mais novo do ledger com o `.sql` mais novo em disco. O
-  veredito canônico é o de `src/migrations/status.ts`, exposto por
-  `getSchemaReadiness()`, e ele vê o que o outro não vê: checksum divergente,
-  `dirty`, `running` órfã, arquivo ausente, head incompatível.
-
-  Unificar os dois **não é uma limpeza, é uma troca de postura**, e os dois
-  lados são defensáveis:
-
-  - *Manter como está* — uma condição de schema derruba a readiness e o
-    processo fica de pé respondendo 503. A instância é diagnosticável: dá para
-    entrar nela, rodar `migrate status`, ler o log. O custo é que uma
-    instância nunca-pronta pode ficar assim indefinidamente sem que ninguém
-    olhe, se o alerta de readiness não estiver ligado.
-  - *Unificar* — a mesma condição vira falha de boot e, sob um supervisor que
-    reinicia, **crash loop**. O sinal é impossível de ignorar, e nenhuma
-    instância meio-viva entra na rotação. O custo é que o container que você
-    precisa inspecionar é justamente o que não fica de pé, e o loop de
-    reinício apaga o rastro.
-
-  A escolha depende de quem opera (supervisor, política de alerta, se há
-  acesso ao container). Fica registrada como decisão do dono na #516.
+  real: subir uma réplica atrás do head, ver o container MORRER com exit code
+  94 (e o `/readyz` de uma réplica já no ar recusar), rodar o job, ver a
+  rotação voltar. Depende do ambiente do dono, não de código.
 - Um flag `--down=NNN` continua deliberadamente não construído: rollback de
   migration é manual e revisado.
