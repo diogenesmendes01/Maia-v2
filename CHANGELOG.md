@@ -4,6 +4,58 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
+
+> **O que muda no seu dia:** antes, um app que subisse contra um schema
+> incompatível ficava **de pé** respondendo 503 no `/readyz`. Agora ele **não
+> sobe** — encerra com exit code **90-97**, e sob um supervisor que reinicia
+> isso é **crash loop**. Se o seu deploy não tem gate de migration, ele passa a
+> ter um sintoma novo. Verifique, ANTES de subir este release, que o migrator
+> roda antes do app: `depends_on: { migrate: { condition:
+> service_completed_successfully } }` no Compose (já é assim em
+> `compose.prod.yml` e `docker-compose.yml`), ou `npm run release:migrate` no
+> comando de pré-deploy do painel ([#565](https://github.com/diogenesmendes01/Maia-v2/issues/565)).
+>
+> **Em `development`/`staging`**, a alavanca declarada continua sendo
+> `READINESS_SCHEMA_CHECK=false` (silenciosa em dev, aviso em staging,
+> **recusada no boot em production**). Nenhuma variável nova foi criada.
+
+**A decisão é do dono e está registrada** — [ADR 0004](docs/architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md):
+*"Produção greenfield não precisa preservar a postura intermediária.
+`getSchemaReadiness()` deve decidir o boot… Se acontecer, o crash loop é sinal
+de quebra de invariante."*
+
+**O PORQUÊ.** A #516 entregou o veredito canônico de schema
+(`getSchemaReadiness()`) e ligou o `/readyz` nele. O **boot**, porém, ficou com
+`checkSchemaVersion()` — que comparava o id mais novo do ledger com o `.sql`
+mais novo em disco e **nada mais**. Havia dois vereditos de schema no mesmo
+processo, com forças diferentes, e **o mais fraco decidia se o processo
+nascia**: um app subia tranquilo sobre uma migration editada depois de aplicada,
+sobre uma linha `dirty` e sobre uma migration que o build não empacota, e só
+descobria na primeira query que tocasse a coluna nova. Agora existe um veredito
+só.
+
+O que mudou:
+
+- **`src/index.ts` (etapa `schema`)** chama `checkSchemaReadiness()` — o MESMO adaptador cacheado do `/readyz`, então boot e probe não podem divergir — e lança `SchemaBootAbortError`; o handler de `main()` sai com `bootExitCode(err)`.
+- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown`. `1` continua sendo qualquer outra falha de boot. A faixa 90-97 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
+- **Mensagem de morte acionável**, porque um crash loop sem diagnóstico é pior que um 503: `maia.schema_boot_refused` carrega `exit_code`, `blocker`, `blockers`, `migration_id`, `expected_checksum` (arquivo empacotado) vs. `found_checksum` (linha do ledger), os dois heads e a `remediation` (o comando exato). Nada disso carrega SQL, texto de driver ou DSN — a mensagem de erro do `pg` embute a connection string com senha.
+- **`checkSchemaVersion()` e `src/runtime/lifecycle/schema-version.ts` foram REMOVIDOS**, com o spec dedicado. Não sobrou um segundo veredito de schema para divergir.
+- **Coerência com a [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):** o `/readyz` continua sendo o único gate de roteamento, role-aware e fail-closed, e continua respondendo 503 quando o schema muda debaixo de um processo **que já subiu** — esse caso não vira crash loop. A árvore de decisão do operador (quando olhar exit code, quando olhar readiness) está em `docs/runbooks/operational.md` §8.1.
+
+**A evidência.** `tests/unit/runtime/schema-boot-gate.spec.ts` importa o
+**`src/index.ts` real** (a avaliação do módulo dispara `main()` e o handler de
+falha) e injeta apenas o que um unitário não pode ter: um pool de ledger falso e
+um diretório temporário de migrations — a classificação do veredito é a de
+produção. Reintroduzindo o defeito no call site REAL, um de cada vez:
+neutralizar a decisão (`if (false && failure)`) deixa **7 de 10 casos
+vermelhos** (`expected 1 to be 90`, `expected 1 to be 91`, …); trocar
+`process.exit(bootExitCode(err))` por `process.exit(1)` deixa **os mesmos 7
+vermelhos**. Contraste no verde: com o schema verificado o boot passa da etapa e
+morre no passo seguinte com exit 1 (sentinela do Redis), então o gate não está
+recusando tudo. Em Postgres real, `tests/integration/migrations-runner-real-db.spec.ts`
+repete a tradução veredito ⇒ exit code contra ledger de verdade.
+
 ### ⚠️ AÇÃO DO OPERADOR — o TTL do export de privacidade passa a APAGAR o arquivo ([#536](https://github.com/diogenesmendes01/Maia-v2/issues/536))
 
 > **Até este release, `privacy_requests.export_expires_at` era um carimbo sem
