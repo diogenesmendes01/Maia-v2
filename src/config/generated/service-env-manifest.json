@@ -782,6 +782,13 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_OUTBOUND_DURABLE_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_MESSAGE_DEBOUNCE",
           "secret": false,
           "required": false,
@@ -1429,6 +1436,7 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
@@ -1618,6 +1626,7 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
@@ -1806,6 +1815,7 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",

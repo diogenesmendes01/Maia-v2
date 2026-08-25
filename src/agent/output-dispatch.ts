@@ -19,6 +19,9 @@ import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
 import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
+import { commitOutboundIntent, type OutboundCommitOutcome } from '@/runtime/outbound/commit.js';
+import type { OutboundPayload } from '@/runtime/outbound/contract.js';
+import { outboundOutboxRepo } from '@/db/repositories/outbound-outbox-repo.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -256,6 +259,153 @@ function assertOutboundOwnership(boundary: EffectBoundary): void {
   throw new OutboundDeliveryError(false, 'turn_ownership_lost');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #631 (fatia B da épica #506) — COMMIT TRANSACIONAL antes do canal.
+//
+// A ordem de cada ramo deste arquivo passa a ser, sem exceção:
+//
+//   assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT  →  canal
+//
+// O commit é a ÚLTIMA coisa antes do efeito irreversível, e é literal: entre
+// ele e a chamada ao canal não pode existir nenhum `await`, porque cada await
+// ali é uma janela em que a resposta está comprometida e algo ainda pode
+// falhar. Mover a chamada ao canal para ANTES do commit é o defeito que a
+// sonda 1 reintroduz.
+//
+// O ledger legado vem ANTES do commit de propósito: ele é a checagem de
+// "alguém já respondeu este turno?" e um `skip` significa que não vamos
+// enviar. Commitar primeiro deixaria o turno em `outbound_pending` com uma
+// linha durável que ninguém pretende entregar.
+// ---------------------------------------------------------------------------
+
+/**
+ * Posição da RESPOSTA PRINCIPAL do turno no outbox. Zero, sempre.
+ *
+ * A política de multipart — quantas partes, em que ordem, o que fazer com falha
+ * parcial — é a #635. O que existe hoje é o EIXO: uma resposta ocupa a posição
+ * 0, e o único caso que já produz uma segunda saída lógica no mesmo turno é o
+ * fallback poll→texto abaixo.
+ */
+const OUTBOUND_PRIMARY_SEQUENCE = 0;
+
+/**
+ * Posição da saída de TEXTO quando a enquete já ocupou a 0 e caiu para o
+ * fallback numerado. Ver o call site.
+ */
+const OUTBOUND_POLL_FALLBACK_SEQUENCE = 1;
+
+/**
+ * Commita a intenção de resposta e traduz a falha para o vocabulário desta
+ * fronteira.
+ *
+ * Isto NÃO é um `catch` que engole: é uma RECLASSIFICAÇÃO, e a diferença está
+ * no que sai daqui. O erro é RELANÇADO — só que como
+ * `OutboundDeliveryError(delivered: false)`, que é a verdade literal (nada foi
+ * ao canal) e é o que faz `safeDispatchOutput` devolver `not_sent` em vez de
+ * `sent_no_persist`. Sem esta tradução, um throw sem tipo cairia no ramo
+ * conservador `unknown` do `handleDispatchError` e o turno seria concluído como
+ * "pode ter sido entregue" — proibindo um retry que é perfeitamente seguro,
+ * porque nada foi enviado.
+ *
+ * Trocar o `throw` por um `return` — em qualquer forma: um `catch` que loga e
+ * segue, um `?? { committed: false }`, um `.catch(() => …)` — é a reintrodução
+ * do fail-open que a #506 documentou em `claimOutboundLedgerOrFailOpen`
+ * ("log the issue and proceed as if there's no prior row"). É o que a sonda 2
+ * reintroduz.
+ */
+async function commitOutboundOrRefuse(input: {
+  payload: OutboundPayload;
+  sequence_in_turn: number;
+  conversa_id: string;
+  in_reply_to: string;
+  pessoa_id?: string | null;
+}): Promise<OutboundCommitOutcome> {
+  try {
+    return await commitOutboundIntent({
+      payload: input.payload,
+      // Único canal de egresso declarado hoje (`OUTBOUND_PROVIDER_CHANNELS`).
+      // Um canal novo decide a própria história de idempotência no contrato de
+      // #630, não aqui.
+      channel: 'whatsapp',
+      sequence_in_turn: input.sequence_in_turn,
+      conversa_id: input.conversa_id,
+      in_reply_to: input.in_reply_to,
+      ...(input.pessoa_id !== undefined ? { pessoa_id: input.pessoa_id } : {}),
+    });
+  } catch (e) {
+    throw new OutboundDeliveryError(false, `outbound_commit_failed:${(e as Error).message}`);
+  }
+}
+
+/**
+ * Fecha a linha durável com o desfecho da tentativa feita por ESTE processo.
+ *
+ * Provisório e declarado como tal: o delivery worker com claim/lease é a #632.
+ * Enquanto ele não existe, quem entrega é o mesmo processo que commitou, e sem
+ * este registro TODA linha entregue ficaria `pending` para sempre — de modo que
+ * a #632, ao subir, varreria e reenviaria mensagens que o usuário já recebeu.
+ *
+ * Nunca lança: quando roda, o efeito externo JÁ ocorreu. Uma exceção aqui não
+ * desfaz o envio; ela só trocaria uma linha desatualizada por um turno
+ * abortado. Falhar deixa a linha `pending`, que é exatamente o estado que a
+ * reconciliação de #633 existe para resolver.
+ */
+async function recordCommittedDelivery(
+  commit: OutboundCommitOutcome,
+  outcome:
+    | { kind: 'delivered'; provider_message_id: string | null; confirmed: boolean }
+    | { kind: 'unknown'; error_code: string }
+    | { kind: 'retryable'; error_code: string },
+): Promise<void> {
+  if (!commit.committed) return;
+  try {
+    await outboundOutboxRepo.recordInlineDeliveryOutcome({
+      outbound_id: commit.outbound_id,
+      ...(outcome.kind === 'delivered'
+        ? {
+            status: 'delivered' as const,
+            delivery_outcome: outcome.confirmed
+              ? ('accepted_confirmed' as const)
+              : ('accepted_unconfirmed' as const),
+            provider_message_id: outcome.provider_message_id,
+          }
+        : outcome.kind === 'unknown'
+          ? {
+              status: 'delivery_unknown' as const,
+              delivery_outcome: 'timeout_unknown' as const,
+              last_error_code: outcome.error_code,
+            }
+          : {
+              status: 'retryable' as const,
+              delivery_outcome: 'rejected_retryable' as const,
+              last_error_code: outcome.error_code,
+            }),
+    });
+  } catch (err) {
+    logger.error(
+      {
+        err: (err as Error).message,
+        outbound_id: commit.outbound_id,
+        outcome: outcome.kind,
+        ops_alert: true,
+      },
+      'outbound.inline_outcome_record_failed',
+    );
+  }
+}
+
+/**
+ * Código de erro de BAIXA cardinalidade para `outbound_messages.last_error_code`
+ * (CHECK de 64 chars na 121, o mesmo teto de `agent_turns`).
+ *
+ * A mensagem crua do erro NÃO entra: ela é o vetor por onde payload e PII
+ * vazariam para a trilha durável. A mensagem completa continua no log
+ * estruturado, que tem política de retenção própria.
+ */
+function outboundErrorCode(kind: string): string {
+  return kind.slice(0, 64);
+}
+
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
   const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
   const toolSummaries = ctx.toolSummaries ?? [];
@@ -331,6 +481,30 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'document');
       if (ledger.skip) return;
       const captionText = text.slice(0, 1024);
+      // #631 — COMMIT antes do canal. A mídia entra por REFERÊNCIA
+      // (`local_path`), nunca embutida: o contrato de #630 não tem variante que
+      // aceite bytes nem URL assinada, e o teto de 256 KiB do
+      // `payload_json_size_check` existe para que ninguém tente.
+      //
+      // LIMITE CONHECIDO, e declarado: este `path` é o PDF temporário desta
+      // tentativa, removido no `finally` logo abaixo. Para o caminho de hoje
+      // (commita, envia em seguida, no mesmo processo) a referência é válida
+      // durante toda a vida útil dela. Para o delivery worker de #632, que pode
+      // entregar minutos depois e de outra réplica, ela NÃO é — a migração para
+      // `storage_object` é parte da #634, junto com o inventário dos caminhos.
+      const commit = await commitOutboundOrRefuse({
+        payload: {
+          type: 'document',
+          media: { kind: 'local_path', path: pdf.path },
+          mimetype: pdf.mimetype,
+          file_name: pdf.fileName,
+          ...(captionText ? { caption: captionText } : {}),
+        },
+        sequence_in_turn: OUTBOUND_PRIMARY_SEQUENCE,
+        conversa_id: c.id,
+        in_reply_to: inbound.id,
+        pessoa_id: pessoa.id,
+      });
       let wid: string | null;
       try {
         wid = await line.sendDocument(jid, pdf.path, {
@@ -357,6 +531,12 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // delivered:false — genuine pre-send, ReAct retry is safe.
         const ambiguous = classifyDocumentThrow(e);
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
+        await recordCommittedDelivery(
+          commit,
+          ambiguous
+            ? { kind: 'unknown', error_code: outboundErrorCode('document_transport_throw') }
+            : { kind: 'retryable', error_code: outboundErrorCode('document_read_failed') },
+        );
         throw new OutboundDeliveryError(ambiguous, (e as Error).message);
       }
       if (!wid) {
@@ -366,14 +546,28 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // `finally` below either way.
         if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
+          await recordCommittedDelivery(commit, {
+            kind: 'delivered',
+            provider_message_id: null,
+            confirmed: false,
+          });
           throw new OutboundDeliveryError(true, 'document_channel_sent_without_id');
         }
         await recordLedgerFailed(c.id, inbound.id, 'document_channel_disconnected', false);
+        await recordCommittedDelivery(commit, {
+          kind: 'retryable',
+          error_code: outboundErrorCode('document_channel_disconnected'),
+        });
         throw new OutboundDeliveryError(false, 'document_channel_disconnected');
       }
       // Document acked — record 'sent' BEFORE the persist block so a persist
       // throw doesn't leave the ledger 'pending' while the user has the file.
       await recordLedgerSent(c.id, inbound.id, wid);
+      await recordCommittedDelivery(commit, {
+        kind: 'delivered',
+        provider_message_id: wid,
+        confirmed: true,
+      });
       try {
         const file_size_bytes = await stat(pdf.path)
           .then((s) => s.size)
@@ -447,6 +641,25 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // Issue #504 §Fencing — REVALIDAÇÃO no limite do efeito. `synthesizeSpeech`
       // é uma chamada de rede: a posse pode ter acabado exatamente durante ela.
       assertOutboundOwnership('outbound_voice');
+      // ─────────────────────────────────────────────────────────────────────
+      // EXCEÇÃO DECLARADA de #631: este ramo NÃO commita artefato durável.
+      //
+      // Não é esquecimento e não é preguiça — é o único ramo cujo payload não é
+      // EXPRESSÁVEL hoje. `audio` exige um `MediaRef` (`local_path` ou
+      // `storage_object`, nunca bytes: o contrato de #630 não tem variante que
+      // os aceite, e o teto de 256 KiB da 121 existe para que ninguém tente).
+      // `synthesizeSpeech` devolve um Buffer EM MEMÓRIA — não há arquivo nem
+      // objeto a referenciar. Inventar um aqui significaria criar um artefato
+      // temporário novo, com ciclo de vida e limpeza próprios, dentro de uma
+      // fatia cujo escopo é o commit transacional.
+      //
+      // O risco disto ficar aberto é limitado e verificável: `FEATURE_OUTBOUND_VOICE`
+      // tem default `false` (src/config/contract.ts), ou seja, não é caminho de
+      // produção hoje. A resolução — decidir onde o áudio sintetizado passa a
+      // MORAR para que uma tentativa posterior o encontre — é a #634
+      // (inventário e migração de TODOS os caminhos de envio), que é onde a
+      // decisão pertence.
+      // ─────────────────────────────────────────────────────────────────────
       // #227: claim the turn before the voice send (no-op when flag off,
       // fail-open on DB throws — see claimOutboundLedgerOrFailOpen).
       const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'voice');
@@ -712,6 +925,29 @@ export async function sendOutbound(
      * ambiguidade, tratado como pre-send).
      */
     channel_id?: string | null;
+    /**
+     * Issue #631 — posição desta saída no turno, para o commit durável.
+     *
+     * Default `OUTBOUND_PRIMARY_SEQUENCE` (0): a resposta principal. O único
+     * caller que passa outra coisa é o fallback poll→texto, que já commitou a
+     * enquete na posição 0 e por isso ocupa a 1. Ver o comentário lá.
+     *
+     * DETERMINÍSTICA por call site, nunca "a próxima livre" — a razão está em
+     * `commitOutboundIntent`: a posição entra no material da chave, então
+     * alocá-la dinamicamente faria o retry da MESMA resposta derivar outra
+     * `logical_dedupe_key` e nascer como uma SEGUNDA linha.
+     */
+    outbound_sequence?: number;
+    /**
+     * Issue #631 — esta saída é um FALLBACK visível ao usuário (timeout,
+     * deadline, erro permitido, recusa por política)?
+     *
+     * Muda o `payload_type` de `text` para `status_fallback`, que é o tipo que
+     * #506 exige para "fallback/timeout também usam outbox". `reason` é rótulo
+     * de cardinalidade BAIXA e fechada, nunca a mensagem crua do erro — é o
+     * vetor por onde conteúdo vazaria para a trilha durável.
+     */
+    fallback_reason?: 'timeout' | 'deadline_exceeded' | 'internal_error' | 'policy_refusal';
   },
 ): Promise<string | null> {
   // Issue #504 §Fencing — LIMITE DE EFEITO. O outbound é o efeito MENOS
@@ -763,6 +999,29 @@ export async function sendOutbound(
   const sendOpts: { quoted?: WAQuotedContext; view_once?: boolean } = {};
   if (opts?.quoted) sendOpts.quoted = opts.quoted;
   if (opts?.view_once) sendOpts.view_once = true;
+  // ─── #631 — COMMIT TRANSACIONAL, o último passo antes do canal. ──────────
+  //
+  // Este é o CALL SITE PRINCIPAL da fatia: `sendOutbound` é a primitiva de
+  // texto por onde passa a resposta do ReAct, a resposta das skills, o fallback
+  // do Decision Engine e o fallback de TTS.
+  //
+  // A posição é literal e é o contrato: entre esta linha e `line.sendText`
+  // abaixo NÃO EXISTE `await`. Todo trabalho que podia falhar — resolver a
+  // linha, achar a pessoa, resolver o JID — já aconteceu. Inserir qualquer
+  // coisa aqui, ou mover o `sendText` para cima desta chamada, é reabrir a
+  // janela em que uma mensagem chega ao usuário sem que o banco saiba.
+  //
+  // `commitOutboundOrRefuse` LANÇA se a transação falhar: o `sendText` abaixo
+  // não é alcançado, e o erro sobe classificado como `delivered:false`.
+  const commit = await commitOutboundOrRefuse({
+    payload: opts?.fallback_reason
+      ? { type: 'status_fallback', text, reason: opts.fallback_reason }
+      : { type: 'text', text },
+    sequence_in_turn: opts?.outbound_sequence ?? OUTBOUND_PRIMARY_SEQUENCE,
+    conversa_id,
+    in_reply_to,
+    pessoa_id,
+  });
   // Delivery happens in two phases: send to the channel, THEN persist. Tag
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
@@ -784,6 +1043,10 @@ export async function sendOutbound(
     );
   } catch (e) {
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
+    await recordCommittedDelivery(commit, {
+      kind: 'unknown',
+      error_code: outboundErrorCode('text_transport_throw'),
+    });
     throw new OutboundDeliveryError(true, (e as Error).message);
   }
   // A null id means the gateway did NOT confirm a send. Disambiguate
@@ -794,14 +1057,28 @@ export async function sendOutbound(
   if (wid === null) {
     if (line.isConnected()) {
       await recordLedgerSent(conversa_id, in_reply_to, null);
+      await recordCommittedDelivery(commit, {
+        kind: 'delivered',
+        provider_message_id: null,
+        confirmed: false,
+      });
       throw new OutboundDeliveryError(true, 'channel_sent_without_id');
     }
     await recordLedgerFailed(conversa_id, in_reply_to, 'channel_disconnected', false);
+    await recordCommittedDelivery(commit, {
+      kind: 'retryable',
+      error_code: outboundErrorCode('channel_disconnected'),
+    });
     throw new OutboundDeliveryError(false, 'channel_disconnected');
   }
   // Channel acked — record 'sent' BEFORE the persist so a later persist throw
   // doesn't leave the ledger 'pending' while the user already has the message.
   await recordLedgerSent(conversa_id, in_reply_to, wid);
+  await recordCommittedDelivery(commit, {
+    kind: 'delivered',
+    provider_message_id: wid,
+    confirmed: true,
+  });
   const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
   if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
   if (opts?.view_once) metadata.view_once = true;
@@ -864,6 +1141,21 @@ export async function sendOutboundPoll(
     await recordLedgerFailed(conversa_id, in_reply_to, err.message, false);
     throw err;
   }
+  // #631 — COMMIT antes do canal, mesma regra do texto: nenhum `await` entre
+  // esta linha e `line.sendPoll`. O payload é `interactive_poll`, a ÚNICA
+  // forma real de "interactive" que a plataforma declara (`LineOutput.sendPoll`);
+  // botão e lista não têm primitiva e por isso não têm tipo no contrato de #630.
+  const commit = await commitOutboundOrRefuse({
+    payload: {
+      type: 'interactive_poll',
+      question: text,
+      options: pending.opcoes_validas,
+    },
+    sequence_in_turn: OUTBOUND_PRIMARY_SEQUENCE,
+    conversa_id,
+    in_reply_to,
+    pessoa_id,
+  });
   let sent: Awaited<ReturnType<LineOutput['sendPoll']>>;
   try {
     sent = await line.sendPoll(jid, text, pending.opcoes_validas);
@@ -876,6 +1168,10 @@ export async function sendOutboundPoll(
     // ReAct turn whose own dispatch would be blocked anyway. No double-send
     // risk: the row is 'unknown'.
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
+    await recordCommittedDelivery(commit, {
+      kind: 'unknown',
+      error_code: outboundErrorCode('poll_transport_throw'),
+    });
     throw new OutboundDeliveryError(true, (e as Error).message);
   }
   // Without all three (whatsapp_id, message_secret, creator_jid) the inbound
@@ -895,17 +1191,36 @@ export async function sendOutboundPoll(
       'poll_missing_secrets_fallback_to_text',
       false,
     );
+    // #631 — a enquete já foi COMMITADA na posição 0 e não vai ser entregue.
+    // Fecha aquela linha como `retryable`/`rejected_retryable` (configuração
+    // incompleta, nada foi ao canal) para que o recovery de #633 não a leia
+    // como trabalho pendente e a reenvie depois — o duplo envio pela porta dos
+    // fundos.
+    await recordCommittedDelivery(commit, {
+      kind: 'retryable',
+      error_code: outboundErrorCode('poll_missing_secrets'),
+    });
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
       pending_question_id: pending.id,
       tool_summaries: opts?.tool_summaries,
       channel_id: opts?.channel_id,
+      // A saída de texto é a SEGUNDA saída lógica deste turno — a posição 0 é
+      // da enquete. Fixa e não "a próxima livre": um retry deste mesmo fallback
+      // tem de recalcular exatamente esta chave e reencontrar a linha, não
+      // criar outra.
+      outbound_sequence: OUTBOUND_POLL_FALLBACK_SEQUENCE,
     });
     return { fell_back: true };
   }
   // Poll acked — record 'sent' BEFORE persist so a persist throw doesn't leave
   // the ledger 'pending' while the user already sees the poll.
   await recordLedgerSent(conversa_id, in_reply_to, sent.whatsapp_id);
+  await recordCommittedDelivery(commit, {
+    kind: 'delivered',
+    provider_message_id: sent.whatsapp_id,
+    confirmed: true,
+  });
   try {
     await mensagensRepo.create({
       conversa_id,

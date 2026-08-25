@@ -4,6 +4,125 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a resposta do turno é COMMITADA antes de chegar ao canal ([#631](https://github.com/diogenesmendes01/Maia-v2/issues/631), fatia B de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** até este release, uma falha do banco no caminho de
+> saída era **absorvida** e a mensagem seguia para o WhatsApp assim mesmo. A
+> partir daqui ela **impede o envio**. Se o PostgreSQL estiver indisponível no
+> instante da resposta, o usuário deixa de receber — e o turno vai para
+> `retryable`/`not_sent`, que é recuperável. Isso é uma troca deliberada de
+> *liveness* por *durabilidade*, e é o inverso da política anterior, que estava
+> escrita no código como *"liveness > strict dedupe"*.
+>
+> A série a observar é `maia_outbound_commit_rejected_total{reason}` (nova). A
+> distância entre ela e `maia_outbound_committed_total` é o custo real da troca.
+>
+> **A flag `FEATURE_OUTBOUND_DURABLE_COMMIT` (default ON) é a alavanca de
+> rollback — e ela NÃO pode ser desligada em `production`: o boot é RECUSADO.**
+> Em staging avisa; em development é silencioso. Uma garantia de durabilidade
+> que pode ser desligada em produção não é um kill switch, é o caminho
+> fail-open com outro nome.
+
+**O PORQUÊ.** A auditoria da #506 nomeou dois defeitos no mesmo arquivo,
+`src/agent/output-dispatch.ts`: o ledger tratado em caminho **opcional e
+fail-open** (`claimOutboundLedgerOrFailOpen`, cujo próprio comentário dizia
+*"log the issue and proceed as if there's no prior row"*), e uma sequência em
+que **enviar e persistir ficavam separados por uma janela de crash**. Os dois
+produzem a mesma consequência, e ela é a pior que um sistema de mensagens pode
+ter: existe estado do mundo — uma mensagem no telefone de alguém — que o banco
+nunca soube que ia existir. Nenhum retry, nenhuma reconciliação e nenhuma
+auditoria conseguem raciocinar sobre um efeito que não foi declarado antes de
+acontecer.
+
+Agora a ordem de **todo** ramo de saída é fixa, e "antes" é literal — entre o
+commit e a chamada ao canal não existe nenhum `await`:
+
+```
+assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT durável  →  canal
+```
+
+O commit é **uma** transação (`src/db/repositories/outbound-outbox-repo.ts::commitTurnOutboundTx`)
+que, na MESMA conexão: valida que o worker ainda possui o `claim_token` do turno
+(fence + lease viva + CAS por `state_version`), insere o artefato determinístico
+de #630 com a `logical_dedupe_key`, transiciona o turno para `outbound_pending`,
+liga `agent_turns.outbound_message_id` e grava a auditoria `outbound_committed`
+por `auditTx` — que, ao contrário de `audit()`, **não engole erro**. Qualquer
+falha faz ROLLBACK e **lança**.
+
+Decisões que parecem detalhe e não são:
+
+- **`agentTurnsRepo.markOutboundCommittedTx` NÃO é usada aqui.** Ela abre a
+  própria transação (`runTransition` chama `withTx`), então o UPDATE do turno
+  sairia por uma conexão e o INSERT do outbox por outra: dois commits
+  independentes, e exatamente a janela de crash que esta fatia fecha. O `WHERE`
+  do fence, porém, não é reescrito — vem de `turnWriteConditions()`
+  (`src/db/repositories/turn-fence-sql.ts`), a mesma fonte ÚNICA de
+  `runTransition`. Apagar a condição de lease de lá deixa a produção insegura
+  nos dois caminhos ao mesmo tempo, que é a única relação que faz um predicado
+  compartilhado valer alguma coisa.
+- **`sequence_in_turn` é determinística por call site, nunca "a próxima
+  livre".** A posição entra no material da chave: alocá-la dinamicamente faria
+  o retry da MESMA resposta derivar outra `logical_dedupe_key` e nascer como
+  uma SEGUNDA linha — o duplo envio criado pelo mecanismo que existe para
+  impedi-lo.
+- **O escopo do turno guarda o `TurnHandle` por REFERÊNCIA**
+  (`src/runtime/outbound/turn-scope.ts`, AsyncLocalStorage aberto em
+  `src/agent/core.ts` junto de `runWithTurnExecution`). `concludeTurn` grava com
+  `expected_version: handle.state_version`; guardar uma cópia congelada faria o
+  CAS seguinte usar a versão anterior ao commit, ser recusado como
+  `state_mismatch`, e o turno ficaria preso em `outbound_pending` — resposta
+  entregue, turno eternamente aberto. Era a consequência silenciosa mais
+  provável da fatia.
+- **Enqueue é wake-up, não fonte de verdade.** No instante do commit a linha já
+  está `pending` com `next_attempt_at = now()`, ou seja, já satisfaz o predicado
+  de `idx_outbound_messages_ready` (migração 121). Um crash entre o commit e o
+  enqueue deixa trabalho visível **sem que nada consulte a BullMQ**.
+
+**Exceção declarada, não esquecida:** o ramo de **voz** não commita artefato
+durável. O payload `audio` exige um `MediaRef` (`local_path`/`storage_object`) e
+`synthesizeSpeech` devolve um Buffer **em memória** — não há arquivo nem objeto
+a referenciar, e inventar um seria criar artefato temporário novo dentro de uma
+fatia cujo escopo é o commit. `FEATURE_OUTBOUND_VOICE` tem default `false`, ou
+seja, não é caminho de produção hoje; decidir onde o áudio sintetizado passa a
+MORAR é #634. O ramo de **documento** commita com `local_path`, válido enquanto
+quem entrega é o mesmo processo — a migração para `storage_object` é da mesma
+fatia.
+
+**Provisório e declarado como tal:** `recordCommittedDelivery` fecha a linha com
+o desfecho normalizado da tentativa feita por este processo. Enquanto o delivery
+worker de #632 não existe, quem entrega é quem commitou, e sem isso TODA linha
+entregue ficaria `pending` para sempre — de modo que a #632, ao subir, varreria
+e **reenviaria** mensagens já recebidas. Ele nunca lança: quando roda, o efeito
+externo já ocorreu, e uma exceção ali só trocaria uma linha desatualizada por um
+turno abortado.
+
+**A evidência.** `tests/integration/outbound-commit-transacional-real-db.spec.ts`
+entra por `dispatchOutput`/`sendOutbound` — as funções que o ReAct, as skills e
+os fallbacks chamam — contra Postgres real; o único mock é a saída física do
+canal, e ele **não é passivo**: consulta o banco por uma conexão própria NO
+INSTANTE do envio e registra o que estava commitado ali. É isso que transforma
+"nada vai ao canal antes do banco" numa afirmação verificável em vez de uma
+inspeção de ordem de linhas. Reintroduzindo o defeito no call site REAL, um de
+cada vez:
+
+- **mover `line.sendText` para ANTES do commit** → 9 de 12 casos vermelhos, com
+  a foto do instante do envio virando `{ linhasOutbound: 0, statusDoTurno:
+  "running" }` (esperado `{ 1, "outbound_pending" }`);
+- **trocar o `throw` de `commitOutboundOrRefuse` por um retorno fail-open** → 6
+  vermelhos, todos na forma `expected "vi.fn()" to not be called at all, but
+  actually been called 1 times` — ou seja, o canal volta a ser chamado com o
+  banco recusando;
+- **remover `expected_claim_token` da chamada a `commitTurnOutboundTx`** → o
+  caso do worker sem posse fica vermelho: um zumbi consegue commitar resposta;
+- **tirar o INSERT do outbox de dentro do `withTx` do turno** → o caso de
+  rollback fica vermelho, com o turno em `outbound_pending` e uma linha parcial
+  sobrando.
+
+`tests/unit/config/outbound-durable-commit-rule.spec.ts` trava a flag: default
+ON, `false` em production é ERRO de escopo `boot` (logo sobrevive a
+`MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e
+ligada sem `FEATURE_TURN_STATE_MACHINE` é inerte — e inerte é erro.
+
 ### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **O que muda no seu dia:** antes, um app que subisse contra um schema

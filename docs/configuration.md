@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 182 | 19 |
+| `runtime` | 183 | 19 |
 | `admin-ui` | 27 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -246,6 +246,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `FEATURE_PDF_REPORTS` | string | `false` | não | `runtime`, `admin-ui` | sim | Relatórios PDF (extrato/comparativo) enviados como documento. |
 | `FEATURE_OUTBOUND_VOICE` | string | `false` | não | `runtime` | sim | Áudio de saída via OpenAI TTS (reutiliza OPENAI_API_KEY). |
 | `FEATURE_OUTBOUND_DEDUP` | string | `false` | não | `runtime` | sim | Ledger de idempotência de saída (#227) em outbound_messages. |
+| `FEATURE_OUTBOUND_DURABLE_COMMIT` | string | `true` | não | `runtime` | sim | Commit TRANSACIONAL da resposta do turno (issue #631, fatia B da #506). Default ON. ON: ao concluir a cognição, uma ÚNICA transação valida o claim_token do turno, insere o artefato outbound com a logical_dedupe_key, move o turno para outbound_pending e grava a auditoria — e SÓ DEPOIS do commit alguma coisa vai ao canal. Falha da transação IMPEDE o envio, com erro observável (maia_outbound_commit_rejected_total). EXIGE a migration 121 aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem turno durável não há turn_id, e a FK composta da 121 torna a row inexprimível). OFF NÃO É CONFIGURAÇÃO SUPORTADA EM PRODUÇÃO — o boot é RECUSADO no profile production, porque desligar aqui restaura exatamente o caminho fail-open que a #506 documentou: envio ao canal sem registro durável. Fora de produção é a alavanca de rollback declarada. Ver docs/runbooks/turn-state-machine.md. |
 | `FEATURE_MESSAGE_DEBOUNCE` | string | `false` | não | `runtime` | sim | Agrupa textos picotados do mesmo remetente numa única rodada. Mídia sempre passa direto. |
 | `FEATURE_PROCEDURE_RUNTIME` | string | `true` | não | `runtime` | sim | Kill switch do runtime de procedimentos (selector + engine + avaliador). Default ON; a rodada ReAct base não depende dele. |
 | `FEATURE_TURN_STATE_MACHINE` | string | `true` | não | `runtime` | sim | Máquina de estados durável do turno inbound (issue #503): agent_turns. EXIGE as migrations 096 e 097 APLICADAS — subir o processo com esta flag ligada antes de `npm run db:migrate` derruba todo o ingresso. Default ON. Com FEATURE_TURN_STATE_AUTHORITATIVE também ON (o default desde #504), agent_turns é a fonte de verdade do turno e `mensagens.processada_em` fica sendo apenas projeção de compatibilidade; com ela OFF a máquina roda em shadow e `processada_em` decide. OFF é ROLLBACK EMERGENCIAL, não configuração suportada — e desligar SÓ esta flag é recusado no boot, porque FEATURE_TURN_CLAIM e FEATURE_TURN_STATE_AUTHORITATIVE (ambas ON por default) ficariam inertes: desligue as três juntas. Nenhum turno já gravado é perdido. Ver docs/runbooks/turn-state-machine.md. |
