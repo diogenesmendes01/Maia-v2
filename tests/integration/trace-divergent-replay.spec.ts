@@ -302,6 +302,11 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
       envelope_hmac: 'h',
       root_trace_id: 'r',
       attempt: 1,
+      // Issue #535: a versão da assinatura entra na comparação. Ela já está
+      // implícita no HMAC (a v2 assina a própria versão), mas a comparação
+      // precisa NOMEAR o campo divergente para a row de auditoria —
+      // "envelope_hmac" sozinho diria ao operador que algo mudou sem dizer o quê.
+      signature_version: 2,
     };
 
     it('identical rows diverge on nothing', () => {
@@ -324,8 +329,24 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
           envelope_hmac: 'other',
           root_trace_id: 'other',
           attempt: 9,
+          signature_version: 1,
         }),
-      ).toEqual(['tenant_id', 'envelope_hmac', 'root_trace_id', 'attempt']);
+      ).toEqual([
+        'tenant_id',
+        'envelope_hmac',
+        'root_trace_id',
+        'attempt',
+        'signature_version',
+      ]);
+    });
+
+    it('issue #535 — um replay que só troca a versão da assinatura é divergência', () => {
+      // Reescrever a linha armazenada como v1 mantendo o resto é exatamente a
+      // jogada do downgrade. Aqui ela aparece pelo nome, não só como um HMAC
+      // que deixou de bater.
+      expect(divergedEnvelopeFields(base, { ...base, signature_version: 1 })).toEqual([
+        'signature_version',
+      ]);
     });
 
     it('the body digest is stable under key reordering', () => {

@@ -301,6 +301,9 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
     await traceTurnDecision({ base: baseFixture('acme', trace_id), packet: packetFixture() });
     const row = txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row;
 
+    // Issue #535 — the canonical v2 material, written out LITERALLY. Rebuilding
+    // it through the production helper would make this expectation track the
+    // writer wherever it went, including into signing nothing at all.
     const signed = {
       trace_id: row.trace_id,
       tenant_id: row.tenant_id,
@@ -312,6 +315,9 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
       side_effect_level: row.side_effect_level,
       redaction_class: row.redaction_class,
       hmac_key_version: row.hmac_key_version,
+      root_trace_id: row.root_trace_id,
+      attempt: row.attempt,
+      signature_version: 2,
     };
     expect(
       verifyHmac('acme', row.hmac_key_version as number, signed, row.envelope_hmac as string),
@@ -325,6 +331,22 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
         row.envelope_hmac as string,
       ),
     ).toBe(false);
+    // ...including the two the hot path used to leave unsigned.
+    for (const tamper of [
+      { root_trace_id: '44444444-4444-4444-8444-444444444444' },
+      { attempt: 99 },
+    ]) {
+      expect(
+        verifyHmac(
+          'acme',
+          row.hmac_key_version as number,
+          { ...signed, ...tamper },
+          row.envelope_hmac as string,
+        ),
+      ).toBe(false);
+    }
+    // The hot path stamps the version on the row, and it is v2.
+    expect(row.signature_version).toBe(2);
     expect(canonicalJson(signed)).toBeTypeOf('string');
   });
 

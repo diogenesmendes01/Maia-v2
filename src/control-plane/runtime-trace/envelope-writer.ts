@@ -34,48 +34,48 @@ import type {
 import { createHash } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { signHmac, currentKeyVersion, canonicalJson } from './lib/hmac.js';
+import {
+  CURRENT_ENVELOPE_SIGNATURE_VERSION,
+  envelopeSignedPayload,
+  normalizeAttempt,
+  type EnvelopeSignatureVersion,
+  type EnvelopeSignedFields,
+} from './lib/signature.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
 
 /**
- * The exact field set covered by `envelope_hmac`, in one place.
+ * The exact field set covered by `envelope_hmac` lives in ONE place —
+ * `lib/signature.ts` — and both the signer (below) and the verifier
+ * (`verify-envelope.ts`) build their bytes from it.
  *
  * Issue #514 review round 1 [P2]: the Trace Explorer needs to VERIFY this
  * signature, not just check that the string is non-empty. Signer and verifier
- * must agree byte-for-byte, so both go through this function — a field added
- * to the signature here is automatically covered by the check, and the two
+ * must agree byte-for-byte, so both go through the same builder — a field added
+ * to the signature there is automatically covered by the check, and the two
  * cannot silently drift apart.
  *
- * `canonicalJson` (in `lib/hmac.ts`) sorts keys, so declaration order here is
- * irrelevant; what matters is the SET of fields and their exact values.
+ * Issue #535: the builder is now VERSIONED. This module re-exports the pieces
+ * so the historical import path (`envelopeSignedPayload` from the writer) keeps
+ * working for the specs and the repo that already use it.
  */
-export interface EnvelopeSignedFields {
-  trace_id: string;
-  tenant_id: string;
-  agent_id: string;
-  conversa_id: string | null;
-  turno_id: string | null;
-  policy_id: string | null;
-  decision: Decision;
-  side_effect_level: SideEffectLevel;
-  redaction_class: string;
-  hmac_key_version: number;
-}
-
-export function envelopeSignedPayload(fields: EnvelopeSignedFields): EnvelopeSignedFields {
-  return {
-    trace_id: fields.trace_id,
-    tenant_id: fields.tenant_id,
-    agent_id: fields.agent_id,
-    conversa_id: fields.conversa_id ?? null,
-    turno_id: fields.turno_id ?? null,
-    policy_id: fields.policy_id ?? null,
-    decision: fields.decision,
-    side_effect_level: fields.side_effect_level,
-    redaction_class: fields.redaction_class,
-    hmac_key_version: fields.hmac_key_version,
-  };
-}
+export {
+  envelopeSignedPayload,
+  envelopeSignedPayloadV1,
+  envelopeSignedPayloadV2,
+  normalizeAttempt,
+  CURRENT_ENVELOPE_SIGNATURE_VERSION,
+  ENVELOPE_SIGNATURE_V1,
+  ENVELOPE_SIGNATURE_V2,
+  SUPPORTED_ENVELOPE_SIGNATURE_VERSIONS,
+  isSupportedSignatureVersion,
+} from './lib/signature.js';
+export type {
+  EnvelopeSignatureVersion,
+  EnvelopeSignedFields,
+  EnvelopeSignedFieldsV1,
+  EnvelopeSignedFieldsV2,
+} from './lib/signature.js';
 
 /**
  * A replay reused an existing `trace_id` but carries DIFFERENT content.
@@ -114,24 +114,29 @@ export class DivergentTraceReplayError extends Error {
  * cross-tenant collision changes it too), which makes it a single sufficient
  * check for the decision evidence. `tenant_id` is compared explicitly anyway —
  * relying on a hash to prove tenant isolation would be indirect where the
- * invariant deserves to be direct. `root_trace_id`/`attempt` are unsigned
- * (migration 107), so they need their own comparison.
+ * invariant deserves to be direct.
+ *
+ * Issue #535: `root_trace_id`/`attempt` ARE signed from v2 on, and
+ * `signature_version` is signed too, so all three are already implied by the
+ * HMAC comparison. They stay in this list on purpose — the comparison must keep
+ * naming the diverging FIELD for the audit row (`diverged_fields`), and
+ * "envelope_hmac" alone would tell an operator that something differs without
+ * telling them what. A v1 row still needs them compared directly, since v1
+ * leaves them outside the signature.
  *
  * @returns the names of the fields that differ; empty ⇒ identical replay.
  */
+export interface ComparableEnvelope {
+  tenant_id: string;
+  envelope_hmac: string;
+  root_trace_id: string | null;
+  attempt: number;
+  signature_version: number;
+}
+
 export function divergedEnvelopeFields(
-  stored: {
-    tenant_id: string;
-    envelope_hmac: string;
-    root_trace_id: string | null;
-    attempt: number;
-  },
-  attempted: {
-    tenant_id: string;
-    envelope_hmac: string;
-    root_trace_id: string | null;
-    attempt: number;
-  },
+  stored: ComparableEnvelope,
+  attempted: ComparableEnvelope,
 ): string[] {
   const diverged: string[] = [];
   if (stored.tenant_id !== attempted.tenant_id) diverged.push('tenant_id');
@@ -140,6 +145,9 @@ export function divergedEnvelopeFields(
     diverged.push('root_trace_id');
   }
   if (stored.attempt !== attempted.attempt) diverged.push('attempt');
+  if (stored.signature_version !== attempted.signature_version) {
+    diverged.push('signature_version');
+  }
   return diverged;
 }
 
@@ -172,12 +180,7 @@ type Queryable = Pick<typeof db, 'select'>;
 async function assertIdenticalEnvelopeReplay(
   q: Queryable,
   trace_id: string,
-  attempted: {
-    tenant_id: string;
-    envelope_hmac: string;
-    root_trace_id: string | null;
-    attempt: number;
-  },
+  attempted: ComparableEnvelope,
 ): Promise<void> {
   const rows = await q
     .select({
@@ -185,6 +188,7 @@ async function assertIdenticalEnvelopeReplay(
       envelope_hmac: runtime_trace_envelopes.envelope_hmac,
       root_trace_id: runtime_trace_envelopes.root_trace_id,
       attempt: runtime_trace_envelopes.attempt,
+      signature_version: runtime_trace_envelopes.signature_version,
     })
     .from(runtime_trace_envelopes)
     .where(eq(runtime_trace_envelopes.trace_id, trace_id))
@@ -257,11 +261,18 @@ export async function writeEnvelope(
   // Issue #514 review round 2: attempt grouping. Defaults keep every existing
   // caller (and attempt 1) writing exactly what it wrote before.
   const root_trace_id = input.root_trace_id ?? input.trace_id;
-  const attempt = Math.max(1, Math.floor(input.attempt ?? 1));
+  const attempt = normalizeAttempt(input.attempt);
+
+  // Issue #535 — PRODUCTION WRITES ONLY v2. This is the single place a written
+  // envelope's signature version is decided, and it is a constant, not an
+  // input: a caller-chosen version would be a downgrade oracle handed to
+  // whoever can reach the writer. v1 stays readable (`verify-envelope.ts`) and
+  // is never re-signed — a v1 row keeps its v1 signature forever.
+  const signature_version: EnvelopeSignatureVersion = CURRENT_ENVELOPE_SIGNATURE_VERSION;
 
   // Payload to sign — canonical JSON guarantees stable bytes regardless of
   // insertion order. We sign the envelope contents (no DB-assigned fields).
-  const signedPayload = envelopeSignedPayload({
+  const signedFields: EnvelopeSignedFields = {
     trace_id: input.trace_id,
     tenant_id: input.tenant_id,
     agent_id: input.agent_id,
@@ -272,7 +283,12 @@ export async function writeEnvelope(
     side_effect_level,
     redaction_class,
     hmac_key_version,
-  });
+    // Signed from v2 on. Before #535 an `attempt` edit was undetectable and a
+    // `root_trace_id` edit could move an attempt into another turn's group.
+    root_trace_id,
+    attempt,
+  };
+  const signedPayload = envelopeSignedPayload(signedFields, signature_version);
   const envelope_hmac = signHmac(input.tenant_id, hmac_key_version, signedPayload);
 
   // ONE row definition for both write paths — they had drifted into
@@ -292,6 +308,7 @@ export async function writeEnvelope(
     redaction_class,
     envelope_hmac,
     hmac_key_version,
+    signature_version,
     body_status: 'pending' as const,
   };
 
@@ -377,6 +394,7 @@ export async function writeEnvelope(
     attempt,
     envelope_hmac,
     hmac_key_version,
+    signature_version,
     side_effect_level,
     decision,
     policy_id,

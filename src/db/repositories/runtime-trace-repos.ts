@@ -32,6 +32,7 @@ import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
 import {
   verifyEnvelopeIntegrity,
   verifyBodyIntegrity,
+  attemptGroupingIsSigned,
   type EnvelopeIntegrity,
   type BodyIntegrity,
 } from '@/control-plane/runtime-trace/verify-envelope.js';
@@ -53,12 +54,47 @@ export interface TraceListItem {
   root_trace_id: string | null;
   /** 1-based attempt ordinal. */
   attempt: number;
+  /**
+   * Issue #535: which canonical material `envelope_hmac` covers. 2 ⇒
+   * `root_trace_id`/`attempt` are inside the signature; 1 ⇒ they are not.
+   */
+  signature_version: number;
   decision: string;
   side_effect_level: string;
   redaction_class: string;
   body_status: string;
   body_persisted_at: Date | null;
   created_at: Date;
+}
+
+/**
+ * An attempt as the Explorer's grouping view returns it: the list row plus the
+ * verdict this repo reached about the row's OWN signature.
+ *
+ * The verdict travels with the row on purpose. `listAttempts()` already refuses
+ * to return an `invalid` sibling, but "we checked and it held" and "we could
+ * not check" are different facts and the operator is the one who has to weigh
+ * them during an incident.
+ */
+export interface TraceAttemptItem extends TraceListItem {
+  integrity: EnvelopeIntegrity;
+  /** False on a v1 row: `root_trace_id`/`attempt` are outside its signature. */
+  grouping_signed: boolean;
+}
+
+/**
+ * A row that reached the group's predicate and was refused by its own
+ * signature. Ids and the verdict only — never a field value.
+ */
+export interface TraceAttemptRefusal {
+  trace_id: string;
+  attempt: number;
+  integrity: EnvelopeIntegrity;
+}
+
+export interface TraceAttemptGroup {
+  items: TraceAttemptItem[];
+  refused: TraceAttemptRefusal[];
 }
 
 export interface TraceDetail extends TraceListItem {
@@ -157,6 +193,20 @@ export class TraceTenantScopeError extends Error {
 }
 
 /**
+ * Issue #535 — `listAttempts()` was called without the signed `turno_id`.
+ *
+ * Its own class, not a reused `TraceTenantScopeError`: this is not a tenant
+ * problem and an operator reading the log should not be sent looking for one.
+ */
+export class TraceAttemptScopeError extends Error {
+  readonly code = 'TRACE_ATTEMPT_TURN_SCOPE_REQUIRED';
+  constructor(detail: string) {
+    super(`runtimeTraceRepo: ${detail}`);
+    this.name = 'TraceAttemptScopeError';
+  }
+}
+
+/**
  * Fail-closed tenant guard. Missing/blank ⇒ throw; the `'default'` literal is
  * routed through the shared `assertNotDefaultLiteral` so this repo cannot
  * diverge from the platform-wide policy.
@@ -217,6 +267,7 @@ export const runtimeTraceRepo = {
         turno_id: t.turno_id,
         root_trace_id: t.root_trace_id,
         attempt: t.attempt,
+        signature_version: t.signature_version,
         decision: t.decision,
         side_effect_level: t.side_effect_level,
         redaction_class: t.redaction_class,
@@ -275,6 +326,7 @@ export const runtimeTraceRepo = {
       turno_id: env.turno_id,
       root_trace_id: env.root_trace_id,
       attempt: env.attempt,
+      signature_version: env.signature_version,
       policy_id: env.policy_id,
       decision: env.decision,
       side_effect_level: env.side_effect_level,
@@ -294,6 +346,11 @@ export const runtimeTraceRepo = {
         side_effect_level: env.side_effect_level as VerifiableSideEffectLevel,
         redaction_class: env.redaction_class,
         hmac_key_version: env.hmac_key_version,
+        // Issue #535: signed from v2 on. Passing them for a v1 row is harmless
+        // — `envelopeSignedPayloadV1` never reads them.
+        root_trace_id: env.root_trace_id,
+        attempt: env.attempt,
+        signature_version: env.signature_version,
         envelope_hmac: env.envelope_hmac,
       }),
       body_status: env.body_status,
@@ -323,24 +380,74 @@ export const runtimeTraceRepo = {
   },
 
   /**
-   * All attempts of ONE turn, oldest attempt first (issue #514 review round 2).
+   * All attempts of ONE turn, oldest attempt first (issue #514 review round 2;
+   * hardened in #535).
    *
    * Retries deliberately get their own `trace_id` so they cannot collide on the
    * primary key; without this query the Explorer would show them as N unrelated
    * traces and a retry investigation would stay fragmented.
    *
-   * Served by `runtime_trace_env_attempt_group_idx (tenant_id, root_trace_id,
-   * attempt)` from migration 107 — tenant-leading like every other read here.
+   * ## Why `turnoId` is REQUIRED (issue #535)
    *
-   * Bounded at 50: an attempt count beyond that is a runaway retry loop, and
-   * the operator needs the first few plus the fact that it ran away, not 500
-   * rows.
+   * `root_trace_id` is the field that says "these rows belong together". Before
+   * #535 it was not signed at all; from v2 on it is — but v1 rows exist (in
+   * fixtures, and in any environment that already wrote some), and on those it
+   * is still an ordinary editable column. A single edited `root_trace_id` there
+   * would splice one turn's attempt into ANOTHER turn's attempt list, and the
+   * Explorer would render two distinct turns as one retry chain. That is the
+   * "fusão visual entre turnos" the owner asked to close.
+   *
+   * `turno_id` has been inside `envelope_hmac` since migration 052, in EVERY
+   * version. Requiring it as a second predicate means a row can only join this
+   * group if it agrees with the group on a field its own signature covers.
+   *
+   * Two more rules follow from the same reasoning, and neither is optional:
+   *
+   *   1. A blank/absent `turnoId` FAILS CLOSED (throws) rather than falling
+   *      back to grouping by `root_trace_id` alone. A fallback would be the
+   *      whole control, switched off by omitting an argument.
+   *   2. A returned row whose own signature does NOT verify is DROPPED. Letting
+   *      an `invalid` row into the group would let a forger re-add exactly the
+   *      row this predicate excluded, by also rewriting its `turno_id` — the
+   *      signature is what makes that rewrite detectable, so it has to be
+   *      checked, not merely relied upon.
+   *
+   * This is DEFENCE IN DEPTH, not the primary control. The primary control is
+   * that production signs `root_trace_id` and `attempt` (v2). This layer is what
+   * still holds when the row predates that.
+   *
+   * Served by `runtime_trace_env_attempt_turn_idx (tenant_id, root_trace_id,
+   * turno_id, attempt)` from migration 119 — tenant-leading like every other
+   * read here.
+   *
+   * Bounded at 50: an attempt count beyond that is a runaway retry loop, and the
+   * operator needs the first few plus the fact that it ran away, not 500 rows.
+   *
+   * Returns the accepted attempts AND the ones it refused. The refusals are the
+   * interesting half: a row that satisfied the tenant/root/turno predicate and
+   * still failed its own signature is a row someone edited to reach this group.
+   * Dropping it silently would leave that fact only in a log line, so the caller
+   * gets it back and audits it.
    */
   async listAttempts(input: {
     tenantId: string;
     rootTraceId: string;
-  }): Promise<TraceListItem[]> {
+    /**
+     * The SIGNED `turno_id` of the trace being viewed. Required — see the
+     * docstring. Callers get it from a row they have already verified.
+     */
+    turnoId: string;
+  }): Promise<TraceAttemptGroup> {
     assertTenant(input.tenantId);
+    if (typeof input.turnoId !== 'string' || input.turnoId.trim().length === 0) {
+      // Fail closed. The alternative — grouping by `root_trace_id` alone — is
+      // the exact behaviour #535 removed, and it would be reachable by simply
+      // not passing the argument.
+      throw new TraceAttemptScopeError(
+        'listAttempts requires the signed turno_id (fail-closed): grouping by root_trace_id ' +
+          'alone lets a tampered root splice two turns into one attempt chain',
+      );
+    }
     const t = runtime_trace_envelopes;
     const rows = await db
       .select({
@@ -351,18 +458,77 @@ export const runtimeTraceRepo = {
         turno_id: t.turno_id,
         root_trace_id: t.root_trace_id,
         attempt: t.attempt,
+        signature_version: t.signature_version,
+        policy_id: t.policy_id,
         decision: t.decision,
         side_effect_level: t.side_effect_level,
         redaction_class: t.redaction_class,
+        envelope_hmac: t.envelope_hmac,
+        hmac_key_version: t.hmac_key_version,
         body_status: t.body_status,
         body_persisted_at: t.body_persisted_at,
         created_at: t.created_at,
       })
       .from(t)
-      .where(and(eq(t.tenant_id, input.tenantId), eq(t.root_trace_id, input.rootTraceId)))
+      .where(
+        and(
+          eq(t.tenant_id, input.tenantId),
+          eq(t.root_trace_id, input.rootTraceId),
+          // The signed predicate. Everything above it is grouping metadata; this
+          // is the one field an attacker cannot move without breaking the HMAC.
+          eq(t.turno_id, input.turnoId),
+        ),
+      )
       .orderBy(t.attempt, t.created_at)
       .limit(50);
-    return rows as TraceListItem[];
+
+    const out: TraceAttemptItem[] = [];
+    const refused: TraceAttemptRefusal[] = [];
+    for (const r of rows) {
+      const integrity = verifyEnvelopeIntegrity({
+        trace_id: r.trace_id,
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
+        conversa_id: r.conversa_id,
+        turno_id: r.turno_id,
+        policy_id: r.policy_id,
+        decision: r.decision as VerifiableDecision,
+        side_effect_level: r.side_effect_level as VerifiableSideEffectLevel,
+        redaction_class: r.redaction_class,
+        hmac_key_version: r.hmac_key_version,
+        root_trace_id: r.root_trace_id,
+        attempt: r.attempt,
+        signature_version: r.signature_version,
+        envelope_hmac: r.envelope_hmac,
+      });
+      // `invalid` is the only verdict that excludes. `unknown` (secret not
+      // configured here) and `rejected_version` (policy) are reported, not
+      // silently dropped: hiding a row an operator can see in the list view
+      // would look like evidence going missing.
+      if (integrity === 'invalid') {
+        refused.push({ trace_id: r.trace_id, attempt: r.attempt, integrity });
+        continue;
+      }
+      out.push({
+        trace_id: r.trace_id,
+        tenant_id: r.tenant_id,
+        agent_id: r.agent_id,
+        conversa_id: r.conversa_id,
+        turno_id: r.turno_id,
+        root_trace_id: r.root_trace_id,
+        attempt: r.attempt,
+        signature_version: r.signature_version,
+        decision: r.decision,
+        side_effect_level: r.side_effect_level,
+        redaction_class: r.redaction_class,
+        body_status: r.body_status,
+        body_persisted_at: r.body_persisted_at,
+        created_at: r.created_at,
+        integrity,
+        grouping_signed: attemptGroupingIsSigned(r),
+      });
+    }
+    return { items: out, refused };
   },
 
   /**
