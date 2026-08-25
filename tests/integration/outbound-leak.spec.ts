@@ -25,6 +25,18 @@
  * primeiro pelo SCHEMA, e o `WHERE` de escopo é defesa em profundidade — o que a
  * sonda ainda consegue exigir.
  *
+ * ─── E a colisão que quase passou despercebida ─────────────────────────────
+ *
+ * Comparar o par A contra o par B prova apenas que **pelo menos um** dos dois
+ * predicados de escopo existe: os dois pares diferem em tenant E em agente,
+ * então apagar um dos predicados deixa o outro segurando, e a suíte continua
+ * verde. Isso foi VERIFICADO removendo cada metade de `hasHistoryFor`
+ * separadamente — as duas vezes, verde.
+ *
+ * Por isso existe um TERCEIRO par (`T_A` + `A_A2`: mesmo tenant, outro agente)
+ * e a sonda "cada METADE do escopo carrega peso", que isola cada predicado
+ * contra a row que só ele exclui.
+ *
  * Cada `it` diz QUAL consulta carrega o peso, para que a falha aponte a função
  * e não a suíte.
  *
@@ -49,15 +61,25 @@ const T_A = 'outboundleak-tenant-a';
 const A_A = 'outboundleak-agent-a';
 const T_B = 'outboundleak-tenant-b';
 const A_B = 'outboundleak-agent-b';
+/**
+ * O TERCEIRO par: **mesmo tenant que A**, agente diferente.
+ *
+ * Ele existe porque sem ele nenhuma sonda deste arquivo prova qual METADE do
+ * escopo carrega o peso — ver o `it` "cada metade do escopo carrega peso".
+ */
+const A_A2 = 'outboundleak-agent-a2';
 
 let pool: pg.Pool;
 let conversaA: string;
 let conversaB: string;
+let conversaA2: string;
 
 const inA = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: T_A, agent_id: A_A }, fn);
 const inB = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: T_B, agent_id: A_B }, fn);
+const inA2 = <T>(fn: () => Promise<T>): Promise<T> =>
+  runWithTenantContext({ tenant_id: T_A, agent_id: A_A2 }, fn);
 
 async function ensureTenantAgent(tenant: string, agent: string): Promise<string> {
   await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING`, [
@@ -162,9 +184,14 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 10 });
     conversaA = await ensureTenantAgent(T_A, A_A);
     conversaB = await ensureTenantAgent(T_B, A_B);
+    conversaA2 = await ensureTenantAgent(T_A, A_A2);
   });
 
   afterAll(async () => {
+    // DUAS passadas, e não uma por tenant: a sonda "cada metade do escopo"
+    // grava deliberadamente uma row com o PAR INCOERENTE (tenant de B, agente
+    // de A). Apagando tenant a tenant, `agents` de A cairia antes de
+    // `mensagens` de B e a FK `mensagens_agent_id_fkey` recusaria a limpeza.
     for (const tenant of [T_A, T_B]) {
       await pool.query(`DELETE FROM audit_log WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [tenant]);
@@ -173,6 +200,8 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
       await pool.query(`DELETE FROM mensagens WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM conversas WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM pessoas WHERE tenant_id = $1`, [tenant]);
+    }
+    for (const tenant of [T_A, T_B]) {
       await pool.query(`DELETE FROM agents WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM tenants WHERE id = $1`, [tenant]);
     }
@@ -369,6 +398,86 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
       }),
     );
     expect(vistoPorB).toBe(true);
+  });
+
+  it('cada METADE do escopo de `hasHistoryFor` carrega peso, separadamente', async () => {
+    // ─── Por que este `it` existe ─────────────────────────────────────────
+    //
+    // As sondas acima comparam um par contra OUTRO PAR, que difere em tenant E
+    // em agente. Elas provam que "pelo menos um dos dois predicados está lá" —
+    // e isso foi verificado: apagando `tenant_id` de `hasHistoryFor` elas
+    // continuam VERDES (o `agent_id` segura), e apagando `agent_id` elas também
+    // continuam verdes (o `tenant_id` segura). Uma regressão PARCIAL passaria
+    // despercebida, que é a armadilha nº 4 desta leva.
+    //
+    // Aqui cada metade é isolada contra a row que só ela exclui.
+    const a = await mkOutbound({
+      tenant: T_A,
+      agent: A_A,
+      conversa_id: conversaA,
+      texto: 'resposta de A',
+      status: 'delivered',
+      delivery_outcome: 'accepted_confirmed',
+    });
+
+    // (1) `agent_id`: histórico do MESMO TENANT, OUTRO AGENTE, ancorado no
+    //     `outbound_id` de A. Só `agent_id` o exclui.
+    const inbA2 = await pool.query<{ id: string }>(
+      `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo)
+       VALUES ($1,$2,$3,'in','texto','pergunta A2') RETURNING id`,
+      [T_A, A_A2, conversaA2],
+    );
+    await pool.query(
+      `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo,
+                             outbound_id, metadata)
+       VALUES ($1,$2,$3,'out','texto','resposta do OUTRO AGENTE do mesmo tenant',$4,
+               jsonb_build_object('in_reply_to', $5::text))`,
+      [T_A, A_A2, conversaA2, a.outbound_id, inbA2.rows[0]!.id],
+    );
+
+    // (2) `tenant_id`: uma row com o PAR INCOERENTE (tenant de B, agente de A).
+    //     `mensagens` referencia `tenants` e `agents` SEPARADAMENTE — não há FK
+    //     composta que amarre o agente ao tenant —, então esta row é
+    //     expressável, e é exatamente a classe de dado que o predicado
+    //     `tenant_id` existe para excluir. Só `tenant_id` a exclui.
+    await pool.query(
+      `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo,
+                             outbound_id, metadata)
+       VALUES ($1,$2,NULL,'out','texto','row de par incoerente',$3,
+               jsonb_build_object('in_reply_to', $4::text))`,
+      [T_B, A_A, a.outbound_id, inbA2.rows[0]!.id],
+    );
+
+    // A pergunta de A não enxerga NENHUMA das duas.
+    expect(
+      await inA(() =>
+        outboundRecoveryRepo.hasHistoryFor({
+          outbound_id: a.outbound_id,
+          conversa_id: conversaA,
+          in_reply_to: a.inbound_id,
+        }),
+      ),
+    ).toBe(false);
+
+    // CONTROLES — sem eles, uma função que devolvesse `false` sempre passaria.
+    expect(
+      await inA2(() =>
+        outboundRecoveryRepo.hasHistoryFor({
+          outbound_id: a.outbound_id,
+          conversa_id: conversaA2,
+          in_reply_to: inbA2.rows[0]!.id,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      await runWithTenantContext({ tenant_id: T_B, agent_id: A_A }, () =>
+        outboundRecoveryRepo.hasHistoryFor({
+          outbound_id: a.outbound_id,
+          conversa_id: conversaA,
+          in_reply_to: a.inbound_id,
+        }),
+      ),
+    ).toBe(true);
   });
 
   it('`artifactForHistoryRecovery` não devolve o artefato do vizinho', async () => {
