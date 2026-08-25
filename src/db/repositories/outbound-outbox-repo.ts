@@ -46,7 +46,7 @@
  * com `@/db/repositories/turn-repos.js`.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { db, withTx } from '../client.js';
+import { withTx } from '../client.js';
 import { agent_turns, outbound_messages } from '../schema.js';
 import type { AgentTurn } from '../schema.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
@@ -360,65 +360,5 @@ export const outboundOutboxRepo = {
 
       return { row, turn: linked[0] ?? turn, inserted: inserted.length > 0 };
     });
-  },
-
-  /**
-   * Resultado da tentativa de entrega feita PELO PRÓPRIO worker que commitou.
-   *
-   * ─── Por que isto existe, e por que é explicitamente provisório ──────────
-   *
-   * A fatia B entrega o commit; o delivery worker com claim/lease é a #632.
-   * Enquanto ela não chega, quem entrega é o mesmo processo, logo em seguida —
-   * e sem registrar o desfecho a linha durável ficaria `pending` PARA SEMPRE,
-   * inclusive nas saídas que o usuário já recebeu. Quando a #632 subir, ela
-   * varreria essas linhas e reenviaria tudo: um duplo envio criado justamente
-   * pela mecânica que existe para impedi-lo.
-   *
-   * Então esta função fecha a linha com o desfecho NORMALIZADO de #506 §Resultado
-   * do provider. Ela NÃO tem claim, NÃO tem lease e NÃO tem fence de outbound —
-   * isso é #632, e o comentário fica para que a ausência seja lida como escopo,
-   * não como esquecimento.
-   *
-   * NÃO lança: quando ela roda, o efeito externo JÁ ocorreu. Falhar aqui não
-   * desfaz o envio, e transformar bookkeeping pós-efeito em exceção só trocaria
-   * uma linha desatualizada por um turno abortado. A linha fica `pending` e a
-   * reconciliação de #633 é quem decide — que é o desfecho honesto para
-   * "enviamos e não conseguimos registrar".
-   */
-  async recordInlineDeliveryOutcome(input: {
-    outbound_id: string;
-    status: 'delivered' | 'delivery_unknown' | 'retryable';
-    delivery_outcome:
-      | 'accepted_confirmed'
-      | 'accepted_unconfirmed'
-      | 'rejected_retryable'
-      | 'timeout_unknown';
-    provider_message_id?: string | null;
-    last_error_code?: string | null;
-  }): Promise<void> {
-    const tenant_id = getCurrentTenant();
-    const agent_id = getCurrentAgent();
-    await db
-      .update(outbound_messages)
-      .set({
-        status: input.status,
-        delivery_outcome: input.delivery_outcome,
-        provider_message_id: input.provider_message_id ?? null,
-        last_error_code: input.last_error_code ?? null,
-        attempt: sql`${outbound_messages.attempt} + 1`,
-        ...(input.status === 'delivered'
-          ? { sent_at: sql`now()`, provider_timestamp: sql`now()` }
-          : {}),
-      } as never)
-      .where(
-        and(
-          eq(outbound_messages.tenant_id, tenant_id),
-          eq(outbound_messages.agent_id, agent_id),
-          eq(outbound_messages.id, input.outbound_id),
-          // CAS de estado: só uma linha AINDA pendente aceita desfecho. Impede
-          // que um caminho tardio sobrescreva um `delivered` já registrado.
-          eq(outbound_messages.status, 'pending'),
-        ),
-      );
   },
 };
