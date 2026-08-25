@@ -30,6 +30,11 @@
 | `src/cognition/tool-request/similarity.ts` | **Métrica e limiar** da agregação (Dice sobre tokens de conteúdo, θ = 0,85) e a medição que os sustenta (#637) |
 | `src/cognition/tool-request/draft-merge.ts` | **Política de fusão de rascunhos**: união quando compatíveis, `divergent` quando não (#637) |
 | `src/cognition/tool-request/aggregation.ts` | A política de agrupamento: decidir, juntar, recomputar, destacar (#637) |
+| `src/cognition/tool-request/acceptance.ts` | **Aceitar** um pedido: reserva UMA linha em `tool_request_issues` e audita. Não fala com o GitHub, não instala, não fecha gap (#638) |
+| `src/cognition/tool-request/issue-body.ts` | O título, o corpo e a **chave determinística** da issue. Puro, sem configuração e sem credencial no alcance léxico (#638) |
+| `src/cognition/tool-request/github-issues.ts` | O único módulo que fala com o GitHub e o único que toca o token. Procura pelo marcador **antes** de criar (#638) |
+| `src/cognition/tool-request/availability.ts` | "A tool existe no registro **e** está concedida a este agente?" — o fato que fecha o gap (#638) |
+| `src/cognition/tool-request/closure.ts` | Fecha o gap a partir desse fato, avisa o agente e audita as duas coisas (#638) |
 | `src/cognition/proposal-approval-handlers/holiday.ts` | Holiday-specific approval handler |
 | `src/cognition/step-evaluator.ts` | Generic step success check |
 | `src/cognition/step-evaluator-llm-judge.ts` | LLM-as-judge evaluator |
@@ -160,6 +165,125 @@ não-representantes, o que o reduz ao pedido original.
 Auditoria: `tool_request_proposed`, `tool_request_aggregated` (com similaridade,
 limiar, métrica e versão da assinatura) e `tool_request_aggregate_detached`.
 
+## A triagem no console e o fechamento do ciclo (#638 — fecha a épica #471)
+
+O pedido existe (#636) e está agrupado com contador (#637). A fatia C é o que
+faz alguma coisa **acontecer** com ele: o dono triaga, aceitar vira issue, e
+quando a ferramenta finalmente existe o gap fecha e o agente é avisado.
+
+### O caminho, e onde cada peça mora
+
+```
+console /capabilities → "Pedidos de ferramenta"
+  toolRequests.list      → lê agregado + aceite (NÃO recalcula nada)
+  toolRequests.aceitar   → acceptance.ts → RESERVA em tool_request_issues
+                                            (audita; não fala com o GitHub)
+  toolRequests.desagrupar→ aggregation.ts (detached_at, reversível e auditado)
+
+runtime (workers)
+  tool_request_issue_relayer   (*/5)  → github-issues.ts → a issue de verdade
+  tool_request_closure_monitor (7 * *) → availability.ts → closure.ts
+                                          → resolved_at + aviso + auditoria
+
+turno seguinte
+  loader.listParaOTurno → prompt-builder → "## Capacidades novas"
+```
+
+### Aceitar duas vezes cria UMA issue
+
+A idempotência **não** é um `if` que consulta antes de inserir — essa janela é
+onde dois cliques rápidos caem. É a UNIQUE `(tenant_id, agent_id,
+aggregate_id)` de `tool_request_issues` com `ON CONFLICT DO NOTHING`: o segundo
+aceite não colhe linha, lê a que existe e devolve `ja_aceito` (auditado como
+`tool_request_accept_duplicado`, porque um aceite sem efeito não pode ser
+indistinguível de um aceite que nunca chegou).
+
+A chave `idempotency_key` é **determinística** (`sha256` truncado de
+`maia.tool_request.v1|tenant|agent|aggregate`) e viaja no **corpo da issue**
+como marcador. Isso estende a idempotência para além do banco: se o processo
+morrer entre a chamada externa ter sucedido e o resultado ser gravado, o relayer
+**encontra** a issue pelo marcador e a adota (`adopted = true`) em vez de abrir
+a segunda. Limitação declarada: a busca pagina no máximo `MAX_PAGINAS` × 100
+issues com o label da triagem — o caminho normal não depende disso (é a UNIQUE
+que o serve), só a janela de crash.
+
+O **corpo** é montado no aceite e gravado na linha. O relayer envia o texto
+gravado: o que o dono aceitou é o que vai para o GitHub, e o corpo continua
+sendo evidência auditável mesmo se a chamada externa nunca suceder.
+
+### O que NÃO vai para o corpo da issue
+
+Uma issue pode ser pública, e o corpo é escrito sob essa suposição.
+
+| Fora | Por quê |
+|---|---|
+| `tenant_id` / `agent_id` em texto claro | "tenant:acme" num corpo público é vazamento de cliente por descuido de formato. A correlação é o **hash** |
+| o texto livre de cada situação (`situations[].intent`/`.detail`) | sai de turno real e pode carregar nome, valor ou assunto do interlocutor. O corpo diz onde lê-las (o console, atrás de autenticação). Mesma decisão que a fatia A tomou para `attempted_args` |
+| qualquer credencial | `issue-body.ts` não importa configuração nenhuma — não há token no alcance léxico dele |
+
+Consequência aceita: a issue sozinha não reconstrói o caso de uso em detalhe.
+Ela permite **decidir** — o que falta, para quantos pedidos, com que contrato
+imaginado.
+
+### A credencial do GitHub não existe no processo do console
+
+| Variável | Serviços | Por quê |
+|---|---|---|
+| `MAIA_TOOL_REQUEST_ISSUE_REPO` | `runtime`, `admin-ui` | é o DESTINO, não credencial: o dono precisa ver para onde a issue vai antes de aceitar |
+| `MAIA_TOOL_REQUEST_GITHUB_TOKEN` | `runtime` | o Admin UI valida o **próprio subset** no boot; um token fora do subset não é lido, não é tipado e não existe naquele processo |
+
+O preço é uma indireção (aceitar reserva; o relayer abre em até 5 min). O ganho
+é que a separação é **estrutural**, não disciplina — afirmada por
+`tests/unit/tool-request-credencial.spec.ts`, que varre o grafo de imports a
+partir do router real.
+
+### O gap fecha por fato verificável
+
+`closure.ts` só escreve `resolved_at` quando `availability.ts` responde SIM às
+**duas** perguntas, lidas do estado real:
+
+1. o nome é chave viva do registro de tools (uma tool desligada por flag não
+   está lá — e o agente de fato não pode chamá-la);
+2. o nome está no conjunto que `resolveGrantedToolNames` deriva do grant
+   **daquele** tenant/agent.
+
+O casamento de nome é a MESMA função da fatia A (`encontrarToolExistente`), na
+direção oposta: o gap virou pedido porque ela devolveu `null`; ele fecha quando
+ela devolve um nome — agora contra o catálogo **disponível**. Consequência
+aceita: uma ferramenta implementada com nome que não aparece no texto do gap nem
+entre os nomes propostos **não** fecha sozinha. O erro cai do lado barato.
+
+Nenhuma rota do console escreve essas colunas, e o teste arquitetural do
+console (`tests/integration/tool-request-guardrail-real-db.spec.ts`, bloco
+`#638`) proíbe `resolverGap(` e `resolved_at:` em todo o caminho da triagem.
+
+### O agente é avisado — o que isso é, e o que não é
+
+O aviso é uma **linha** em `tool_request_notifications` (qual tool, por qual
+gap, com que evidência, quando) mais a ação `tool_request_agent_notified`. A
+ENTREGA acontece no turno seguinte: o gap resolvido some do bloco de limitações
+e entra em `## Capacidades novas`, que diz em primeira pessoa qual ferramenta
+passou a existir. Os dois blocos saem da **mesma** leitura
+(`capabilityGapsRepo.listParaOTurno`), então o aviso custa **zero** ida a mais
+ao banco no caminho mais quente do sistema.
+
+O que NÃO é: recibo de entrega por turno. Não gravamos "o agente leu o aviso no
+turno X". O que é auditável é a EMISSÃO; que o prompt daquele agente passa a
+carregá-la é provado por teste sobre o `buildPrompt` de produção
+(`tests/unit/prompt-builder-gap-mention.spec.ts`).
+
+A janela de anúncio é `JANELA_DE_AVISO_DE_CAPACIDADE_DIAS` (7): capacidade nova
+é notícia, não estado permanente.
+
+### Auditoria da fatia C
+
+`tool_request_accepted`, `tool_request_accept_duplicado`,
+`tool_request_issue_created` (com `adopted`), `tool_request_issue_failed` (só
+falha TERMINAL — auditar cada retentativa de um 500 transitório viraria log de
+rede), `tool_request_gap_closed` e `tool_request_agent_notified`. As três
+primeiras carregam `instalou_tool: false` / `concedeu_capability: false` na
+própria linha, para quem lê a auditoria sem ler o código.
+
 ## Cancellation contract (issue #507)
 
 `runCognitiveModule` accepts an optional `signal` and hands the `fn` a
@@ -224,6 +348,11 @@ Storage: `cognitive_module_log.status` admits `cancelled` since migration
 | `tests/unit/tool-request-limiar-medicao.spec.ts` | A medição do limiar, executável contra o catálogo vivo |
 | `tests/unit/tool-request-draft-merge.spec.ts` | A política de fusão de rascunhos, incluindo o caso incompatível |
 | `tests/unit/tool-request-similaridade.spec.ts` | A métrica discrimina: pares difíceis dos dois lados |
+| `tests/integration/tool-request-triagem-console-real-db.spec.ts` | A triagem inteira contra banco real: escopo (tenant **e** agente), aceitar duas vezes → UMA issue, o console não recalcula (o dado é quebrado no banco e a rota muda junto), a janela de crash do relayer, o gap que só fecha com a tool CONCEDIDA, e o desagrupamento reversível |
+| `tests/unit/tool-request-credencial.spec.ts` | O token é `secret`, está fora do subset do `admin-ui`, e o caminho do console (grafo de imports) não o alcança nem chama a API do GitHub |
+| `tests/unit/tool-request-issue-body.spec.ts` | A chave determinística e o que o corpo da issue NÃO carrega (escopo, texto de situação, credencial) |
+| `tests/unit/tool-request-github-issues.spec.ts` | Procurar antes de criar, adotar pelo marcador, terminal × recuperável, e o token só no header |
+| `tests/unit/prompt-builder-gap-mention.spec.ts` | O gap fechado sai das limitações e entra em "## Capacidades novas", de uma leitura só |
 | `tests/unit/cognition-runner.spec.ts` | The cancellation contract above, including the "already-aborted caller never invokes `fn`" rule and the metric's tenant attribution / cardinality bound |
 | `tests/integration/turn-lease-lost-reasoner-real-db.spec.ts` | Lease lost during the ReAct reasoner, real DB |
 | `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | Lease lost at the pending gate, the pre-turn graph and the Decision Engine — proves no later mutation or reply, through the real `runAgentForMensagem` |

@@ -1456,9 +1456,31 @@ export const agent_capability_gaps = pgTable(
       .notNull()
       .defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // #638 (fatia C da épica #471) — o gap FECHA a partir do estado real da
+    // capability, nunca de uma marcação no console. O único escritor de
+    // produção é `src/cognition/tool-request/closure.ts`, e ele só escreve
+    // quando a tool existe no registro committado E está concedida a este
+    // tenant+agent. `resolved_reason` é NOT NULL exatamente quando
+    // `resolved_at` é (CHECK da migração 132): fechar sem motivo registrado é
+    // fechar por ninguém.
+    //
+    // O nível NÃO é usado para fechar: um gap resolvido rebaixado para
+    // 'silent' seria indistinguível de um que nunca subiu, e apagaria a
+    // história da escalada — a evidência que justificou o pedido.
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    resolved_reason: text('resolved_reason'),
+    resolved_tool_name: text('resolved_tool_name'),
   },
   (t) => ({
     levelIdx: index('caps_gaps_level_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    // Índices PARCIAIS na DB (WHERE resolved_at IS NULL / IS NOT NULL);
+    // Drizzle não expressa o WHERE, então aqui eles aparecem como comuns.
+    abertosIdx: index('caps_gaps_abertos_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    resolvidosIdx: index('caps_gaps_resolvidos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.resolved_at,
+    ),
   }),
 );
 
@@ -1625,6 +1647,97 @@ export const tool_request_aggregate_members = pgTable(
       t.tenant_id,
       t.agent_id,
       t.aggregate_id,
+      t.gap_id,
+    ),
+  }),
+);
+
+// #638 (fatia C da épica #471) — `tool_request_issues`: a RESERVA que torna o
+// aceite idempotente ANTES de a chamada externa sair.
+//
+// Abrir issue no GitHub é irreversível do lado de fora. Por isso o aceite não
+// começa pela chamada: ele começa por esta linha, cuja UNIQUE
+// (tenant_id, agent_id, aggregate_id) faz o segundo clique perder a corrida NO
+// BANCO. `idempotency_key` é determinística, viaja no CORPO da issue como
+// marcador, e é o que permite ADOTAR uma issue já aberta quando o processo
+// morreu entre a chamada e o registro do resultado.
+//
+// NENHUMA coluna de credencial, de propósito: o token do GitHub existe só na
+// configuração do serviço `runtime`, e o `admin-ui` — que serve o botão
+// "aceitar" — não tem essa variável no seu subset.
+export const tool_request_issues = pgTable(
+  'tool_request_issues',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    idempotency_key: text('idempotency_key').notNull(),
+    repo_slug: text('repo_slug').notNull(),
+    // 'pending' | 'created' | 'failed'
+    status: text('status').notNull().default('pending'),
+    title: text('title').notNull(),
+    /** O corpo COMO O DONO ACEITOU. O relayer envia isto, não uma remontagem. */
+    body: text('body').notNull(),
+    issue_number: integer('issue_number'),
+    issue_url: text('issue_url'),
+    adopted: boolean('adopted').notNull().default(false),
+    accepted_by: text('accepted_by').notNull(),
+    accepted_at: timestamp('accepted_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+    last_error: text('last_error'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_issues_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.accepted_at,
+    ),
+    // Índice PARCIAL na DB (WHERE status = 'pending'); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `tool_request_aggregate_members_ativos_idx`.
+    pendentesIdx: index('tool_request_issues_pendentes_idx').on(t.status, t.last_attempt_at),
+    agregadoUnico: unique('tool_request_issues_aggregate_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+    ),
+    chaveUnica: unique('tool_request_issues_key_unique').on(t.idempotency_key),
+  }),
+);
+
+// #638 — `tool_request_notifications`: o aviso ao agente guardado como FATO.
+//
+// "O agente é notificado" precisa ser verificável depois do turno em que
+// aconteceu. Esta linha é o registro: qual tool, por causa de qual gap e de
+// qual agregado, com que evidência de disponibilidade, e quando. A UNIQUE por
+// gap existe porque o monitor roda em cron — sem ela, cada passada reavisaria.
+export const tool_request_notifications = pgTable(
+  'tool_request_notifications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    /** NULO quando o pedido nunca teve agregado (`sem_assinatura`, fatia B). */
+    aggregate_id: uuid('aggregate_id'),
+    tool_name: text('tool_name').notNull(),
+    evidencia: jsonb('evidencia').notNull().default(sql`'{}'::jsonb`),
+    notified_at: timestamp('notified_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_notifications_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.notified_at,
+    ),
+    gapUnico: unique('tool_request_notifications_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
       t.gap_id,
     ),
   }),
@@ -2721,6 +2834,10 @@ export type NewToolRequestAggregate = typeof tool_request_aggregates.$inferInser
 export type ToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferSelect;
 export type NewToolRequestAggregateMember =
   typeof tool_request_aggregate_members.$inferInsert;
+export type ToolRequestIssue = typeof tool_request_issues.$inferSelect;
+export type NewToolRequestIssue = typeof tool_request_issues.$inferInsert;
+export type ToolRequestNotification = typeof tool_request_notifications.$inferSelect;
+export type NewToolRequestNotification = typeof tool_request_notifications.$inferInsert;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;
