@@ -69,6 +69,67 @@ export const DELIVERY_CLAIMABLE_STATUSES = ['pending', 'retryable'] as const;
  */
 export const DELIVERY_TAKEOVER_STATUSES = ['claimed', 'sending'] as const;
 
+// =====================================================================
+// 2b. A ORDEM DO MULTIPART (#635)
+// =====================================================================
+
+/**
+ * Estados em que um artefato ANTERIOR do mesmo turno já se RESOLVEU — isto é,
+ * a pergunta "esta parte da resposta ainda pode aparecer no telefone do
+ * usuário, depois?" tem resposta definitiva.
+ *
+ * É a lista que autoriza a entrega do artefato SEGUINTE. A política escrita
+ * está em `docs/runbooks/outbound-recovery.md` §3; o que segue é por que cada
+ * membro está aqui e — mais importante — por que os ausentes estão ausentes.
+ *
+ *   `completed`      — entregue e historiado. Resolvido no sentido pleno.
+ *   `delivered`      — chegou ao usuário; falta o histórico. Para a ORDEM isso
+ *                      basta: quem lê a conversa no telefone já viu esta parte.
+ *   `failed_terminal`— o provedor recusou. Nunca vai chegar, então não há
+ *                      ordem a preservar em relação a ela.
+ *   `cancelled`      — nunca saiu e nunca sairá (inclui a saída "sem envio").
+ *   `dead_letter`    — a plataforma desistiu. A decisão seguinte é humana, e
+ *                      travar o resto do turno esperando por ela transformaria
+ *                      um artefato morto num bloqueio permanente da conversa.
+ *
+ * ─── Quem NÃO está, e por quê ─────────────────────────────────────────────
+ *
+ * `delivery_unknown` e `reconciling`. Elas são o caso INTERESSANTE: a mensagem
+ * PODE ter chegado e a reconciliação PODE reenviá-la (quando o provedor
+ * deduplica o tipo). Se o artefato seguinte fosse entregue agora e o anterior
+ * aparecesse depois, o usuário leria a resposta fora de ordem — e a ordem é o
+ * que #505 gastou uma fatia inteira para garantir no ingresso. Bloquear é a
+ * escolha honesta: o turno para, `maia_outbound_pending_age_seconds` sobe, e o
+ * operador vê exatamente uma linha incerta em vez de uma conversa embaralhada.
+ *
+ * `pending`, `retryable`, `claimed`, `sending` — trabalho em curso, óbvio.
+ *
+ * ─── Por que uma lista de INCLUSÃO ────────────────────────────────────────
+ *
+ * Mesma razão de `DELIVERY_CLAIMABLE_STATUSES`: uma lista de EXCLUSÃO erra por
+ * omissão. Um estado novo acrescentado ao vocabulário de #630 entraria por
+ * default como "resolvido" e destravaria a ordem sem que ninguém decidisse
+ * isso. Aqui ele entra como BLOQUEANTE até alguém escrever o contrário.
+ */
+export const MULTIPART_RESOLVED_STATUSES = [
+  'completed',
+  'delivered',
+  'failed_terminal',
+  'cancelled',
+  'dead_letter',
+] as const;
+
+/**
+ * Este estado de um artefato anterior LIBERA o artefato seguinte?
+ *
+ * Existe como função e não como `.includes()` solto nos call sites porque é a
+ * única pergunta que autoriza uma saída a passar na frente de outra — e um
+ * predicado invertido num `if` seria a resposta fora de ordem.
+ */
+export function multipartArtifactResolved(status: string): boolean {
+  return (MULTIPART_RESOLVED_STATUSES as readonly string[]).includes(status);
+}
+
 /**
  * O que o worker faz com a linha que ele acabou de reivindicar.
  *
