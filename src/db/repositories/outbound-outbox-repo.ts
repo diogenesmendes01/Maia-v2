@@ -33,6 +33,17 @@
  * `assertTurnTransition` — antes de tocar o banco, pela mesma razão que
  * `transitionTurn` o faz: uma transição ilegal é erro de programação, não
  * conflito de corrida.
+ *
+ * ─── Por que NÃO entra no barril `src/db/repositories.ts` ───────────────────
+ *
+ * Este é o único repositório que importa `auditTx` (`@/governance/audit.js`), e
+ * aquele módulo importa `auditRepo` de `@/db/repositories.js`. Reexportar daqui
+ * no barril fecharia o ciclo `repositories -> outbound-outbox-repo ->
+ * governance/audit -> repositories`. É exatamente o ciclo que `turn-repos.ts`
+ * evita mantendo `audit()` fora dele; aqui a auditoria PRECISA estar dentro da
+ * transação (é o passo 3), então o que sai do barril é o repositório. Os
+ * consumidores importam por caminho direto — o mesmo que `lifecycle.ts` já faz
+ * com `@/db/repositories/turn-repos.js`.
  */
 import { and, eq, sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';

@@ -355,6 +355,14 @@ async function commitOutboundOrRefuse(input: {
  * ela AGORA), `delivery_unknown`/`reconciling` (incerto: reenviar às cegas é
  * exatamente o que #506 proíbe), `failed_terminal`/`cancelled` (encerrada por
  * decisão).
+ *
+ * O ledger LEGADO de #227 (quando `FEATURE_OUTBOUND_DEDUP` está ON) fica em
+ * `pending` neste caminho, e de propósito: uma linha `pending` já é o marcador
+ * de "em voo, não mande de novo" que aquele ledger usa, então ela BLOQUEIA
+ * tentativas futuras — que é justamente o que se quer aqui. O sweeper de #292 a
+ * promove a `unknown` depois de `OUTBOUND_SWEEPER_STALE_PENDING_SEC`, mesma
+ * leitura conservadora. Reescrevê-la para `sent` seria mentira quando o estado
+ * durável é `delivery_unknown`.
  */
 function saidaLogicaJaTentada(commit: OutboundCommitOutcome): boolean {
   if (!commit.committed) return false;
