@@ -42,7 +42,7 @@ const migracaoDown = readFileSync(
 
 describe('#625 — contrato da exclusão por stream', () => {
   it('o índice se chama exatamente como a constante que o código procura no erro', () => {
-    // `tryClaimTurn` só converte um `23505` em `stream_busy` quando o nome da
+    // `claimNextEligibleTurn` só converte um `23505` em `stream_busy` quando o nome da
     // constraint bate. Renomear o índice na migration sem renomear a constante
     // faz o `23505` VAZAR como erro 500 — a corrida rotineira vira incidente.
     expect(migracao).toContain(STREAM_EXCLUSION_CONSTRAINT);

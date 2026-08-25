@@ -22,9 +22,12 @@ import {
   MAX_HEARTBEAT_FAILURES,
   type ClaimResult,
   type LeaseLossReason,
+  type StreamBlockedReason,
+  type StreamFifoViolationStage,
   type TurnClaim,
   type TurnExecutionContext,
 } from './claim.js';
+import { recordStreamFifoViolation } from './stream-metrics.js';
 
 /** Claim com lease ligado? (kill switch da issue) */
 export function turnClaimEnabled(): boolean {
@@ -261,7 +264,11 @@ export async function acquireTurnLease(turn_id: string): Promise<
   const heartbeat_ms = config.TURN_LEASE_HEARTBEAT_MS;
   const worker_id = turnWorkerId();
   const started = Date.now();
-  const result = await agentTurnsRepo.tryClaimTurn({ turn_id, worker_id, lease_ms: ttl_ms });
+  const result = await agentTurnsRepo.claimNextEligibleTurn({
+    turn_id,
+    worker_id,
+    lease_ms: ttl_ms,
+  });
   // Sem `turn_id` como label (cardinalidade): o que interessa é a distribuição,
   // e um label por turno derrubaria o Prometheus antes de dizer qualquer coisa.
   observeHistogram('maia_turn_claim_latency_ms', Date.now() - started, {
@@ -270,8 +277,19 @@ export async function acquireTurnLease(turn_id: string): Promise<
   await reportStreamClaimsRecovered(turn_id, result.recovered_stream_claims);
   if (!result.ok) {
     if (result.reason === 'stream_busy') await reportStreamBusy(turn_id, worker_id);
+    // #626 — as duas recusas por POSIÇÃO na fila. Auditadas como uma só ação
+    // (`turn_stream_blocked`) com o motivo no metadata: são o mesmo fato
+    // operacional ("a conversa não avançou e o claim foi recusado") visto de
+    // dois lugares, e separá-las em duas ações obrigaria todo consumidor de
+    // auditoria a conhecer as duas para responder uma pergunta só.
+    if (result.reason === 'not_head' || result.reason === 'stream_blocked') {
+      await reportStreamHeadBlocked(turn_id, worker_id, result.reason, result.head_block);
+    }
     logger.debug({ turn_id, worker_id, reason: result.reason }, 'turn.claim_not_acquired');
     return { lease: null, result };
+  }
+  if (result.fifo_violation) {
+    await reportStreamFifoViolation(turn_id, result.fifo_violation);
   }
   logger.info(
     {
@@ -314,6 +332,92 @@ async function reportStreamBusy(turn_id: string, worker_id: string): Promise<voi
     alvo_id: turn_id,
     metadata: { worker_id, reason: 'stream_busy' },
   }).catch((err) => logger.warn({ err: (err as Error).message }, 'turn.stream_busy_audit_failed'));
+}
+
+/**
+ * #626 — o claim foi recusado porque a CONVERSA tem fila.
+ *
+ * Vira `audit_log` (`turn_stream_blocked`, a ação `stream.blocked` que a
+ * issue-mãe pede na auditoria mínima) e `maia_stream_blocked_total{reason}`.
+ * A métrica agrega; a row responde "esta conversa parou por quê, e atrás de
+ * quem?" depois do incidente — sem ela, `not_head` em massa e uma stream morta
+ * são indistinguíveis.
+ *
+ * `head_block.turn_id` entra no metadata e NUNCA como label de métrica
+ * (cardinalidade). `stream_key` não entra em lugar nenhum: a issue-mãe a
+ * restringe a log estruturado protegido, e o par (turno recusado, turno
+ * bloqueador) já ancora a investigação.
+ *
+ * VOLUME: uma row por claim RECUSADO. Com o head-of-line ligado, um turno
+ * posterior deixa de ser rearmado pelo recovery (a mesma regra filtra os
+ * candidatos), então o custo é proporcional a quantas vezes o job de um turno
+ * posterior ainda acorda — o backlog de conversas quentes, não o tráfego.
+ */
+async function reportStreamHeadBlocked(
+  turn_id: string,
+  worker_id: string,
+  reason: StreamBlockedReason,
+  head_block: { turn_id: string; status: string } | undefined,
+): Promise<void> {
+  logger.info(
+    { turn_id, worker_id, reason, blocked_by: head_block?.turn_id ?? null },
+    'turn.stream_head_blocked',
+  );
+  await audit({
+    acao: 'turn_stream_blocked',
+    alvo_id: turn_id,
+    metadata: {
+      worker_id,
+      reason,
+      ...(head_block
+        ? { blocked_by_turn_id: head_block.turn_id, blocked_by_status: head_block.status }
+        : {}),
+    },
+  }).catch((err) =>
+    logger.warn({ err: (err as Error).message }, 'turn.stream_head_blocked_audit_failed'),
+  );
+}
+
+/**
+ * #626 — o CANÁRIO disparou. Isto não deveria acontecer NUNCA.
+ *
+ * `maia_stream_fifo_violation_total` é, pela issue-mãe, um critério de ABORTAR
+ * o rollout — está na mesma lista de "violação de isolamento". Por isso aqui é
+ * `logger.error` com `ops_alert` e uma `audit_log` própria: uma inversão de
+ * ordem que só existisse como incremento de contador seria impossível de
+ * investigar depois, porque o contador não diz QUAL turno furou a fila nem
+ * quantos estavam na frente.
+ *
+ * O claim NÃO é desfeito. A tentativa já está autorizada e revogá-la deixaria a
+ * stream sem ninguém — trocaríamos uma inversão de ordem por uma parada. A
+ * decisão de parar a coorte é do operador, com este sinal na mão.
+ */
+export async function reportStreamFifoViolation(
+  turn_id: string,
+  violation: { stage: StreamFifoViolationStage; earlier_live: number },
+): Promise<void> {
+  // A métrica do estágio `claim` já foi contada no repositório, dentro da
+  // transação — contá-la de novo aqui dobraria o número. A do estágio
+  // `recovery` é contada AQUI porque quem detecta é o varredor, que não tem
+  // transação de claim nenhuma. Uma linha, duas origens: é a única forma de o
+  // contador significar "violações", e não "relatos de violação".
+  if (violation.stage === 'recovery') recordStreamFifoViolation('recovery');
+  logger.error(
+    {
+      turn_id,
+      stage: violation.stage,
+      earlier_live: violation.earlier_live,
+      ops_alert: true,
+    },
+    'turn.stream_fifo_violation',
+  );
+  await audit({
+    acao: 'turn_stream_fifo_violation',
+    alvo_id: turn_id,
+    metadata: { stage: violation.stage, earlier_live: violation.earlier_live },
+  }).catch((err) =>
+    logger.warn({ err: (err as Error).message }, 'turn.stream_fifo_violation_audit_failed'),
+  );
 }
 
 /**

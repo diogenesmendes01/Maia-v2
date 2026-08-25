@@ -70,6 +70,88 @@ export const STREAM_OCCUPYING_STATUSES = ['claimed', 'running'] as const;
 export const STREAM_EXCLUSION_CONSTRAINT = 'agent_turns_stream_active_uq';
 
 /**
+ * #626 — nome do índice PARCIAL que sustenta a pergunta do head-of-line
+ * ("existe turno anterior não terminal nesta stream?", migration 126).
+ *
+ * Ele não DECIDE nada — quem decide é o `NOT EXISTS` de
+ * `src/db/repositories/stream-head-sql.ts`. Ele decide o CUSTO, e é por isso
+ * que o nome mora no vocabulário e não só no arquivo de migration: sem ele a
+ * regra continua correta e passa a varrer o histórico inteiro de uma conversa
+ * quente a cada claim — a degradação que a issue nomeia ("`NOT EXISTS` sem o
+ * índice certo degrada rápido"). O runbook §11.4 usa este nome para checar
+ * `pg_index.indisvalid`.
+ */
+export const STREAM_HEAD_OF_LINE_INDEX = 'agent_turns_stream_head_live_idx';
+
+/**
+ * #626 — VOCABULÁRIO ÚNICO dos resultados do escalonamento por stream.
+ *
+ * A issue pede "códigos de resultado centralizados: `not_head`, `stream_busy`,
+ * `eligible`, `stream_blocked`, `promoted`". Centralizar não é catalogar: é
+ * fazer com que nenhuma camada possa inventar um sexto código nem grafar um
+ * dos cinco de outro jeito. Métrica, `audit_log`, log e o tipo de retorno saem
+ * todos daqui, e `tests/unit/runtime/stream-head-of-line-contract.spec.ts`
+ * fixa o conjunto — acrescentar um código sem tocar no teste é impossível.
+ *
+ * Quem PRODUZ cada um, hoje:
+ *
+ * | código | quem produz | significado |
+ * |---|---|---|
+ * | `eligible` | `claimNextEligibleTurn` (caminho de sucesso) | o turno É o head-of-line da stream e o claim foi concedido |
+ * | `not_head` | `claimNextEligibleTurn` (recusa) | existe turno ANTERIOR não terminal na mesma stream, e ele avança sozinho |
+ * | `stream_blocked` | `claimNextEligibleTurn` (recusa) | o anterior está em `outbound_pending`: NENHUM claim o move, quem o move é o delivery worker (#506) |
+ * | `stream_busy` | o índice `agent_turns_stream_active_uq` (#625) | outro turno da stream já está ATIVO com lease viva |
+ * | `promoted` | **ninguém ainda** — #627 | o sucessor foi promovido/enfileirado quando o head chegou a terminal |
+ *
+ * `promoted` entra agora, sem produtor, deliberadamente. A alternativa era a
+ * #627 acrescentar um sexto rótulo a uma série de métrica já em uso — e
+ * mudar o domínio de um label depois que ele está num dashboard é a forma mais
+ * fácil de quebrar um alerta sem ninguém perceber. Uma série que existe em
+ * zero é barata; um vocabulário que muda debaixo do painel, não.
+ */
+export const STREAM_SCHEDULING_RESULTS = [
+  'eligible',
+  'not_head',
+  'stream_blocked',
+  'stream_busy',
+  'promoted',
+] as const;
+
+export type StreamSchedulingResult = (typeof STREAM_SCHEDULING_RESULTS)[number];
+
+/**
+ * #626 — os motivos de BLOQUEIO da stream, o subconjunto de
+ * `STREAM_SCHEDULING_RESULTS` que vira label de
+ * `maia_stream_blocked_total{reason}`.
+ *
+ * `eligible` e `promoted` ficam de fora porque não são bloqueio; contá-los ali
+ * transformaria um contador de "quanto a fila segurou" num contador de tráfego.
+ */
+export const STREAM_BLOCKED_REASONS = ['not_head', 'stream_blocked', 'stream_busy'] as const;
+
+export type StreamBlockedReason = (typeof STREAM_BLOCKED_REASONS)[number];
+
+/**
+ * #626 — onde uma violação de FIFO pode ser DETECTADA.
+ *
+ * `maia_stream_fifo_violation_total{stage}` é, pela issue, "sempre zero" — e um
+ * contador que ninguém sabe incrementar também é sempre zero, sem provar nada.
+ * Cada estágio aqui é um detector REAL, e a pergunta que ele responde é
+ * diferente:
+ *
+ *  - `claim` — PÓS-CONDIÇÃO dentro da transação do claim concedido: o turno que
+ *    acabou de ser reivindicado tinha, mesmo assim, um anterior não terminal na
+ *    stream. Acusa a regra não ter sido aplicada (removida do `WHERE`, aplicada
+ *    à linha errada, índice e código discordando);
+ *  - `recovery` — o varredor rearmou um turno que não era o head-of-line.
+ *    Acusa a divergência que a issue nomeia por escrito: "duas cópias da regra
+ *    de elegibilidade divergem, e a divergência só aparece durante um recovery".
+ */
+export const STREAM_FIFO_VIOLATION_STAGES = ['claim', 'recovery'] as const;
+
+export type StreamFifoViolationStage = (typeof STREAM_FIFO_VIOLATION_STAGES)[number];
+
+/**
  * Resultado TIPADO de uma tentativa de claim. `not_claimed` NÃO é erro: é a
  * resposta correta para "outro worker chegou primeiro" e para "ainda não está
  * elegível". O que ele nunca é: autorização para processar.
@@ -81,8 +163,38 @@ export const STREAM_EXCLUSION_CONSTRAINT = 'agent_turns_stream_active_uq';
  * é o caso normal.
  */
 export type ClaimResult =
-  | { ok: true; claim: TurnClaim; recovered_stream_claims?: readonly string[] }
-  | { ok: false; reason: ClaimRejection; recovered_stream_claims?: readonly string[] };
+  | {
+      ok: true;
+      claim: TurnClaim;
+      recovered_stream_claims?: readonly string[];
+      /**
+       * #626 — o CANÁRIO disparou: o claim foi concedido e, ainda assim, havia
+       * turno anterior não terminal na stream. Presente só na anomalia.
+       *
+       * Vem no resultado em vez de virar log dentro do repositório pela mesma
+       * razão de `recovered_stream_claims`: o repositório é puro-DB, e `audit()`
+       * lá fecharia o ciclo de import governance/audit -> repositories. Quem
+       * relata é `src/runtime/turns/lease.ts`.
+       */
+      fifo_violation?: { stage: StreamFifoViolationStage; earlier_live: number };
+    }
+  | {
+      ok: false;
+      reason: ClaimRejection;
+      recovered_stream_claims?: readonly string[];
+      /**
+       * #626 — QUEM está na frente, quando a recusa é `not_head` ou
+       * `stream_blocked`. Diagnóstico, nunca instrução: esta fatia NÃO
+       * enfileira o bloqueador (promoção é #627), e agir sobre ele aqui
+       * transformaria um claim recusado em escrita num turno alheio.
+       *
+       * Sem este campo, "a conversa parou" e "a conversa parou por causa DAQUELE
+       * turno" seriam o mesmo log, e o operador teria de reconstruir a fila à
+       * mão a partir da `stream_key` — que é justamente o dado que a issue-mãe
+       * restringe.
+       */
+      head_block?: { turn_id: string; status: TurnStatus };
+    };
 
 /** Por que o claim não foi concedido — label de métrica, cardinalidade fechada. */
 export const CLAIM_REJECTIONS = [
@@ -103,6 +215,30 @@ export const CLAIM_REJECTIONS = [
    * (§Risk: "índice inadequado pode serializar hot streams").
    */
   'stream_busy',
+  /**
+   * #626 — o turno NÃO é o head-of-line: existe turno ANTERIOR não terminal na
+   * mesma stream (`first_ingress_seq` menor).
+   *
+   * Distinto de `stream_busy` porque as perguntas são diferentes e as
+   * remediações também. `stream_busy` é "a conversa está OCUPADA agora" — o
+   * anterior tem lease viva e está executando; some sozinho quando ele termina.
+   * `not_head` é "a conversa tem FILA" — o anterior pode estar apenas
+   * `received`, sem ninguém tê-lo tocado. Colapsar os dois esconderia o caso em
+   * que a fila cresce sem nada estar executando, que é o sintoma de starvation
+   * que a issue-mãe manda vigiar.
+   */
+  'not_head',
+  /**
+   * #626 — o turno anterior está em `outbound_pending`: a stream não avança por
+   * escalonamento nenhum.
+   *
+   * É a recusa que NÃO se resolve com tempo nem com outro worker. Quem tira um
+   * turno de `outbound_pending` é o delivery worker do outbox (#506); enquanto
+   * ele não o fizer, todo claim desta stream continuará sendo recusado. Por
+   * isso não é `not_head`: a leitura operacional de `not_head` é "espere", e a
+   * de `stream_blocked` é "vá ao runbook do outbox".
+   */
+  'stream_blocked',
 ] as const;
 
 export type ClaimRejection = (typeof CLAIM_REJECTIONS)[number];

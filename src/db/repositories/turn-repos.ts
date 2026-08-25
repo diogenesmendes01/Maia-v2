@@ -22,7 +22,7 @@
  * produção — manter `audit()` fora daqui também evita o ciclo de import
  * governance/audit -> repositories -> turn-repos.
  */
-import { and, asc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
 import {
   agent_stream_sequences,
@@ -54,11 +54,28 @@ import {
   type ClaimResult,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
+import { recordStreamBlocked, recordStreamFifoViolation } from '@/runtime/turns/stream-metrics.js';
 import {
   statusList,
   turnWriteConditions,
   type TurnWriteFence,
 } from './turn-fence-sql.js';
+// #626 — a REGRA FIFO, num módulo puro. Os QUATRO consumidores dela neste
+// arquivo — o `WHERE` de `claimNextEligibleTurn`, o filtro de
+// `findRecoverableTurns`, o dispatcher cross-tenant e o canário
+// `listNonHeadTurns` — chamam estas funções; nenhum monta predicado próprio.
+// `tests/unit/runtime/stream-head-of-line-contract.spec.ts` conta as chamadas.
+import {
+  earlierLiveTurnCount,
+  earlierLiveTurnProbe,
+  streamHeadOfLineNotExists,
+} from './stream-head-sql.js';
+// A flag é lida por `contractEnv`, e não por `@/config/env.js`, pela MESMA
+// razão de `conversation-repos.ts` (#596): este arquivo é alcançado pelo
+// console via `conversation-repos`, e `tests/unit/config/admin-import-boundary.spec.ts`
+// proíbe que o grafo compartilhado valide o subset `runtime` no boot — o que
+// faria o console exigir as seis `BACKUP_*` num processo que nunca roda backup.
+import { contractEnv } from '@/config/contract-env.js';
 
 /** SQLSTATE de violação de unique. Ver `pgErrorCode` em `../client.ts`. */
 const PG_UNIQUE_VIOLATION = '23505';
@@ -512,12 +529,29 @@ export const agentTurnsRepo = {
    *     máquinas diferentes; com relógios locais, um nó adiantado em 30s toma
    *     leases ainda vivas — takeover falso, ou seja, execução dupla.
    *
-   * Elegibilidade (issue §Claim atômico):
+   * Elegibilidade DO TURNO (issue #504 §Claim atômico):
    *   - `received`/`queued`: ninguém possui;
    *   - `retryable` com `next_attempt_at` vencido (ou nulo): o backoff é do
    *     PostgreSQL, não da BullMQ;
    *   - `claimed`/`running` com `lease_expires_at <= now()`: takeover de dono
    *     morto. `outbound_pending` NÃO entra — a resposta já foi comprometida.
+   *
+   * Elegibilidade DA STREAM (issue #626, fatia C da #505 — **o head-of-line**):
+   *   - não existe turno ANTERIOR não terminal na mesma stream
+   *     (`first_ingress_seq` menor). É `streamHeadOfLineNotExists`, a mesma
+   *     função que filtra os candidatos do recovery — a issue proíbe duas
+   *     cópias da regra, porque a divergência entre elas só aparece durante um
+   *     recovery, que é o pior momento para descobri-la;
+   *   - e, pela fatia B, não existe outro turno ATIVO com lease viva — quem
+   *     recusa esse é o índice `agent_turns_stream_active_uq` (`23505` ⇒
+   *     `stream_busy`).
+   *
+   * As duas condições da issue são, portanto, uma no `WHERE` e outra no índice,
+   * e a ordem em que falham é observável: o `WHERE` roda primeiro, então um
+   * turno POSTERIOR cuja conversa está ocupada devolve `not_head` (a fila) e
+   * não `stream_busy` (a posse). `stream_busy` sobra para o que o head-of-line
+   * não consegue ordenar — turnos sem `first_ingress_seq`, sequências
+   * empatadas por backfill, e a janela em que a flag está desligada.
    *
    * Efeito atômico do claim: incrementa `attempt` (a tentativa CANÔNICA nasce
    * aqui, não em `markRunning`), gera `claim_token` novo, grava `claimed_by`,
@@ -566,8 +600,8 @@ export const agentTurnsRepo = {
    * (from, to) continua sendo do contrato: `claimed -> retryable` e
    * `running -> retryable` são arestas de `TURN_TRANSITIONS`, e
    * `tests/unit/runtime/stream-exclusion-contract.spec.ts` falha se alguém as
-   * remover. `tryClaimTurn` já era, desde #504, o outro ponto do módulo que
-   * escreve `status` sem passar pelo CAS genérico, pela mesma razão: a
+   * remover. `claimNextEligibleTurn` já era, desde #504, o outro ponto do
+   * módulo que escreve `status` sem passar pelo CAS genérico, pela mesma razão: a
    * elegibilidade do claim não cabe na tabela de transições.
    *
    * ─── A ordem de lock, e a janela em que ela importa ────────────────────
@@ -593,7 +627,7 @@ export const agentTurnsRepo = {
    * no meio. Ela segura locks de linha de UMA stream; streams distintas não se
    * tocam, que é a exigência "sem lock global por tenant, agente ou fila".
    */
-  async tryClaimTurn(input: {
+  async claimNextEligibleTurn(input: {
     turn_id: string;
     worker_id: string;
     lease_ms: number;
@@ -730,7 +764,7 @@ export const agentTurnsRepo = {
    * Continua existindo porque `FEATURE_TURN_CLAIM` é um kill switch de verdade:
    * desligada, o runtime volta a este caminho. Ele NÃO é exclusão mútua e nunca
    * foi — duas réplicas ainda entram no mesmo turno. Quem dá exclusão mútua é
-   * `tryClaimTurn`.
+   * `claimNextEligibleTurn`.
    *
    * Deliberadamente NÃO admite `claimed`/`running` como origem: o takeover é
    * privilégio do claim com lease, que sabe verificar se o dono morreu. Se esta
@@ -755,8 +789,8 @@ export const agentTurnsRepo = {
    *
    * @param input.bump_attempt conta a tentativa neste UPDATE. `true` (default)
    *   preserva o comportamento de #503. O caminho de #504 passa `false`, porque
-   *   ali a tentativa canônica JÁ foi incrementada pelo `tryClaimTurn` — contar
-   *   nos dois lugares dobraria `attempt_count` e esgotaria `MAX_TURN_ATTEMPTS`
+   *   ali a tentativa canônica JÁ foi incrementada pelo `claimNextEligibleTurn`
+   *   — contar nos dois lugares dobraria `attempt_count` e esgotaria `MAX_TURN_ATTEMPTS`
    *   na metade das tentativas reais.
    * @param input.expected_claim_token fence da tentativa (#504).
    */
@@ -1173,6 +1207,31 @@ export const agentTurnsRepo = {
    *
    * NUNCA elegíveis: `outbound_pending`, `completed`, `ignored`, `superseded`,
    * `dead_letter`.
+   *
+   * ─── #626 — o recovery usa A MESMA REGRA FIFO do worker ──────────────────
+   *
+   * O filtro acima elege por ESTADO. Desde a fatia C ele também elege por
+   * POSIÇÃO: `streamHeadOfLineNotExists` — a MESMA função que o `WHERE` de
+   * `claimNextEligibleTurn` chama, não uma cópia dela.
+   *
+   * A issue é explícita sobre por quê: "duas cópias da regra de elegibilidade
+   * divergem, e a divergência só aparece durante um recovery". O formato
+   * concreto do defeito, se o filtro daqui não tivesse a regra: o varredor
+   * rearma um turno POSTERIOR de uma conversa com fila, o job acorda, o claim
+   * recusa com `not_head` e o job termina. Nada quebra — e é justamente isso
+   * que o torna caro: a fila cresce, o Redis roda, a métrica de recovery diz
+   * que houve trabalho, e a conversa não anda. O turno que precisava ser
+   * rearmado (o head) talvez nem apareça, se o `limit` tiver sido consumido
+   * pelos posteriores.
+   *
+   * A ordenação por `created_at` é mantida — dentro de uma stream ela e
+   * `first_ingress_seq` concordam, e entre streams distintas não há ordem a
+   * impor.
+   *
+   * Consequência assumida: uma stream cujo head está em `outbound_pending`
+   * (não recuperável, e não terminal) some inteira desta lista até o outbox
+   * destravar. É FIFO correto — e é observável por
+   * `maia_stream_blocked_total{reason="stream_blocked"}`, que o claim emite.
    */
   async findRecoverableTurns(stale_ms: number, limit = 200): Promise<RecoverableTurn[]> {
     const { tenant_id, agent_id } = scope();
@@ -1199,6 +1258,9 @@ export const agentTurnsRepo = {
               sql`${agent_turns.lease_expires_at} IS NOT NULL AND ${agent_turns.lease_expires_at} <= now()`,
             ),
           ),
+          ...(headOfLineEnabled()
+            ? [streamHeadOfLineNotExists(escopoSql(tenant_id, agent_id))]
+            : []),
         ),
       )
       .orderBy(asc(agent_turns.created_at))
@@ -1207,11 +1269,52 @@ export const agentTurnsRepo = {
   },
 
   /**
+   * #626 — O CANÁRIO DO RECOVERY: quais destes turnos NÃO são o head-of-line da
+   * sua stream?
+   *
+   * A resposta esperada é lista vazia, porque `findRecoverableTurns` já filtrou
+   * por essa mesma regra. Perguntar de novo parece redundante — e é exatamente
+   * por isso que serve: o valor não está na resposta, está em ela ser obtida
+   * por um caminho DIFERENTE. O filtro é um predicado no `WHERE` de uma
+   * consulta; esta é uma consulta separada sobre os ids que aquela devolveu. Se
+   * alguém remover a regra do filtro, o `WHERE` deixa de barrar e este
+   * `SELECT` acusa — que é o cenário que a issue nomeia ("a divergência só
+   * aparece durante um recovery") e o que `maia_stream_fifo_violation_total`
+   * `{stage="recovery"}` existe para contar.
+   *
+   * Uma consulta por VARREDURA, não por candidato: os ids entram todos de uma
+   * vez. Numa varredura com o `limit` cheio (200) isso é uma sonda indexada por
+   * turno, ainda dentro do orçamento de um job que já leu 200 linhas.
+   */
+  async listNonHeadTurns(
+    turn_ids: readonly string[],
+  ): Promise<Array<{ turn_id: string; earlier_live: number }>> {
+    if (turn_ids.length === 0) return [];
+    const { tenant_id, agent_id } = scope();
+    const escopo = escopoSql(tenant_id, agent_id);
+    const rows = await db
+      .select({ id: agent_turns.id, earlier_live: earlierLiveTurnCount(escopo) })
+      .from(agent_turns)
+      .where(
+        and(
+          eq(agent_turns.tenant_id, tenant_id),
+          eq(agent_turns.agent_id, agent_id),
+          inArray(agent_turns.id, [...turn_ids]),
+          sql`NOT ${streamHeadOfLineNotExists(escopo)}`,
+        ),
+      );
+    return rows.map((r) => ({ turn_id: r.id, earlier_live: Number(r.earlier_live) }));
+  },
+
+  /**
    * Enumeração CROSS-TENANT dos pares (tenant, agent) com turnos recuperáveis.
    * Roda FORA de contexto de tenant — é o dispatcher, como o de mensagens
    * (`listTenantAgentPairsWithUnprocessedOlderThan`, issue #345). O predicado
    * espelha EXATAMENTE `findRecoverableTurns`, para que um par só seja
-   * enumerado quando o inner de fato teria trabalho.
+   * enumerado quando o inner de fato teria trabalho — e desde #626 isso inclui
+   * a regra FIFO, pela mesma função. Sem ela, um par cujos únicos candidatos
+   * estão todos atrás de um head parado seria enumerado a cada varredura para
+   * o inner devolver lista vazia.
    */
   async listTenantAgentPairsWithRecoverableTurns(
     stale_ms: number,
@@ -1227,6 +1330,21 @@ export const agentTurnsRepo = {
           OR (status = 'retryable' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now())
           OR (status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= now())
         )
+        AND ${
+          headOfLineEnabled()
+            ? streamHeadOfLineNotExists({
+                // CROSS-TENANT: o escopo vem das COLUNAS da própria linha, não
+                // de parâmetros do ALS — este dispatcher roda fora de contexto
+                // de tenant, como o de mensagens (#345). É exatamente por isso
+                // que `stream-head-sql` recebe fragmentos e não strings: com
+                // strings, este call site teria de escrever o predicado à mão,
+                // e a segunda cópia da regra nasceria aqui.
+                tenant: sql`${agent_turns}.tenant_id`,
+                agent: sql`${agent_turns}.agent_id`,
+                alvo: sql`${agent_turns}`,
+              })
+            : sql`TRUE`
+        }
     `);
     return Array.from(
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
@@ -1518,7 +1636,7 @@ export const agentTurnsRepo = {
  *
  * Com o índice de pé o conjunto tem no máximo UMA linha, então a ordem é
  * inócua; ela protege a janela em que o índice não existe (pré-migration,
- * pós-rollback, índice inválido) — ver o bloco em `tryClaimTurn`.
+ * pós-rollback, índice inválido) — ver o bloco em `claimNextEligibleTurn`.
  *
  * `MATERIALIZED` não é decoração: uma CTE inlinada pode ser replanejada, e o
  * `ORDER BY` — a única coisa que faz o lock ser determinístico — se perderia.
@@ -1577,12 +1695,49 @@ async function recoverExpiredStreamClaims(
 }
 
 /**
- * #625 — o corpo transacional de `tryClaimTurn`: recuperar, depois reivindicar.
+ * #626 — o head-of-line está LIGADO?
+ *
+ * Lido a cada claim (o memo é de `contractEnv`, não daqui) porque um kill
+ * switch que só vale no boot não é kill switch: o rollback da fatia é
+ * `FEATURE_TURN_HEAD_OF_LINE=false` + restart, e ler no import faria o valor
+ * congelar num módulo que o console também carrega.
+ */
+function headOfLineEnabled(): boolean {
+  return contractEnv.FEATURE_TURN_HEAD_OF_LINE;
+}
+
+/** O escopo corrente como FRAGMENTOS, que é o que `stream-head-sql` consome. */
+function escopoSql(tenant_id: string, agent_id: string): { tenant: SQL; agent: SQL; alvo: SQL } {
+  return { tenant: sql`${tenant_id}`, agent: sql`${agent_id}`, alvo: sql`${agent_turns}` };
+}
+
+/**
+ * #625 + #626 — o corpo transacional de `claimNextEligibleTurn`: recuperar,
+ * depois reivindicar o HEAD-OF-LINE.
  *
  * Vive fora do objeto do repositório porque precisa receber o `tx` — e porque a
- * ordem dos dois passos é o contrato inteiro desta fatia. Invertê-los (claim
+ * ordem dos dois passos é o contrato inteiro da fatia B. Invertê-los (claim
  * primeiro, recuperação depois) reproduziria exatamente o defeito: o claim
  * bateria no índice ocupado por um dono morto e a stream nunca destravaria.
+ *
+ * ─── O que a fatia C muda aqui, e o que ela NÃO muda ──────────────────────
+ *
+ * Muda uma linha do `WHERE` — `streamHeadOfLineNotExists(...)` — e acrescenta o
+ * canário no `RETURNING`. Não muda a recuperação, e a interação entre as duas
+ * merece ser dita em voz alta porque ela INVERTE quem se beneficia:
+ *
+ *   ANTES (#625): o head morre com a lease vencida; o SUCESSOR reivindica, a
+ *     transação recupera o morto (⇒ `retryable`) e o sucessor ENTRA. A conversa
+ *     avança na hora, fora de ordem.
+ *   DEPOIS (#626): a mesma transação recupera o morto — e então recusa o
+ *     sucessor com `not_head`, porque `retryable` não é terminal. Quem avança é
+ *     o MORTO, na sua vez, quando alguém o reivindicar de novo.
+ *
+ * A recuperação continua valendo a pena, e é por isso que ela roda mesmo no
+ * caminho que vai fracassar: sem ela o morto ficaria `claimed` para sempre e a
+ * stream nunca destravaria, nem para ele. O custo é latência — a conversa espera
+ * até o recovery rearmar o morto (`STUCK_AFTER_MS`) em vez de o sucessor entrar
+ * na hora. Fechar essa janela é promoção de sucessor, que é a fatia #627.
  */
 async function claimWithinStreamExclusion(
   tx: Executor,
@@ -1590,6 +1745,8 @@ async function claimWithinStreamExclusion(
 ): Promise<ClaimResult> {
   const { tenant_id, agent_id } = scope();
   const leaseSeconds = input.lease_ms / 1000;
+  const escopo = escopoSql(tenant_id, agent_id);
+  const fifo = headOfLineEnabled();
 
   const recovered = await recoverExpiredStreamClaims(tx, {
     tenant_id,
@@ -1601,7 +1758,21 @@ async function claimWithinStreamExclusion(
   // claim expirado nenhum.
   const trail = recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
 
-  const result = await tx.execute<ClaimRow>(sql`
+  // A CONDIÇÃO DE HEAD-OF-LINE. Uma linha, e é a fatia inteira.
+  //
+  // `sql`TRUE`` com a flag desligada, e não um `if` em volta do statement: o
+  // claim precisa ser UMA declaração atômica (ver o bloco de `claimNextEligibleTurn`
+  // sobre EvalPlanQual), então os dois regimes têm de ser o MESMO SQL com um
+  // predicado a mais. Montar duas queries diferentes é como se perde a
+  // equivalência entre o caminho testado e o caminho de rollback.
+  const condicaoHead = fifo ? streamHeadOfLineNotExists(escopo) : sql`TRUE`;
+  // O CANÁRIO de `maia_stream_fifo_violation_total{stage="claim"}`: quantos
+  // anteriores não terminais existiam DEPOIS de o claim ter sido concedido.
+  // Zero é a resposta única. Só é computado quando a regra está ligada — com a
+  // flag off ele seria legitimamente > 0 e o alarme viraria ruído.
+  const canario = fifo ? earlierLiveTurnCount(escopo) : sql`0`;
+
+  const result = await tx.execute<ClaimRow & { fifo_anteriores: number | string }>(sql`
     UPDATE ${agent_turns}
        SET status            = 'claimed',
            claimed_by        = ${input.worker_id},
@@ -1623,33 +1794,30 @@ async function claimWithinStreamExclusion(
                AND lease_expires_at IS NOT NULL
                AND lease_expires_at <= now())
        )
+       AND ${condicaoHead}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
-              claimed_by, claimed_at, lease_expires_at, state_version
+              claimed_by, claimed_at, lease_expires_at, state_version,
+              ${canario} AS fifo_anteriores
   `);
-  const row = (result.rows as unknown as ClaimRow[])[0];
-  if (!row) {
-    // Distinguir "não existe aqui" de "não elegível" custa uma leitura
-    // ESCOPADA, feita só no caminho de fracasso. Sem ela, um turno de outro
-    // tenant e uma corrida perdida seriam o mesmo evento na métrica — e o
-    // primeiro é bug de roteamento, o segundo é operação normal.
-    const exists = await tx
-      .select({ id: agent_turns.id })
-      .from(agent_turns)
-      .where(
-        and(
-          eq(agent_turns.tenant_id, tenant_id),
-          eq(agent_turns.agent_id, agent_id),
-          eq(agent_turns.id, input.turn_id),
-        ),
-      )
-      .limit(1);
-    const reason: ClaimRejection = exists.length === 0 ? 'not_found' : 'not_eligible';
-    incCounter('maia_turn_claim_total', { result: reason });
-    return { ok: false, reason, ...trail };
-  }
+  const row = (result.rows as unknown as Array<ClaimRow & { fifo_anteriores: number | string }>)[0];
+  if (!row) return await explainClaimRejection(tx, { tenant_id, agent_id, fifo, ...input }, trail);
+
+  // PÓS-CONDIÇÃO. `> 0` significa que o claim passou por cima de um turno
+  // anterior vivo — a inversão de ordem que a #505 existe para impedir, e um
+  // dos critérios de ABORTAR o rollout na issue-mãe. Não desfazemos o claim: a
+  // tentativa já é autorizada e desfazê-la aqui deixaria a stream sem ninguém.
+  // O que se faz é MEDIR aqui e RELATAR em `src/runtime/turns/lease.ts` — o
+  // repositório continua puro-DB, e `audit()` nele fecharia o ciclo de import
+  // governance/audit -> repositories.
+  const anteriores = Number(row.fifo_anteriores);
+  if (anteriores > 0) recordStreamFifoViolation('claim');
+
   incCounter('maia_turn_claim_total', { result: 'acquired' });
   return {
     ok: true,
+    ...(anteriores > 0
+      ? { fifo_violation: { stage: 'claim' as const, earlier_live: anteriores } }
+      : {}),
     claim: {
       turn_id: row.id,
       tenant_id: row.tenant_id,
@@ -1664,6 +1832,79 @@ async function claimWithinStreamExclusion(
     },
     ...trail,
   };
+}
+
+/**
+ * POR QUE o claim não foi concedido — a leitura ESCOPADA do caminho de
+ * fracasso.
+ *
+ * Custa consultas, e por isso só roda quando já se sabe que o claim falhou.
+ * Distinguir os motivos não é luxo de log: `not_found` é bug de roteamento,
+ * `not_eligible` é corrida normal, `not_head` é fila da conversa e
+ * `stream_blocked` é o outbox travado. Colapsá-los daria um único número que
+ * sobe por quatro causas com quatro remediações diferentes — e, na prática,
+ * ninguém investiga um número assim.
+ *
+ * A ORDEM importa: `not_head`/`stream_blocked` são verificados ANTES de
+ * `not_eligible`. Um turno que é ao mesmo tempo não-head e não-elegível
+ * (`retryable` com backoff em aberto, atrás de um anterior vivo) é reportado
+ * como não-head, porque é a stream que decide primeiro — o backoff dele nem
+ * chega a importar enquanto houver alguém na frente.
+ */
+async function explainClaimRejection(
+  tx: Executor,
+  args: { tenant_id: string; agent_id: string; turn_id: string; fifo: boolean },
+  trail: { recovered_stream_claims?: readonly string[] },
+): Promise<ClaimResult> {
+  const escopo = escopoSql(args.tenant_id, args.agent_id);
+  const alvo = await tx
+    .select({ id: agent_turns.id, status: agent_turns.status })
+    .from(agent_turns)
+    .where(
+      and(
+        eq(agent_turns.tenant_id, args.tenant_id),
+        eq(agent_turns.agent_id, args.agent_id),
+        eq(agent_turns.id, args.turn_id),
+      ),
+    )
+    .limit(1);
+  const encontrado = alvo[0];
+  if (!encontrado) {
+    incCounter('maia_turn_claim_total', { result: 'not_found' });
+    return { ok: false, reason: 'not_found', ...trail };
+  }
+
+  // Um turno TERMINAL nunca é `not_head`, ainda que a conversa tenha fila: a
+  // fila dele acabou. Dizer "não é o head" de um turno concluído mandaria o
+  // operador procurar o bloqueador de um trabalho que já terminou — e o motivo
+  // honesto (`not_eligible`, "este turno não pode ser reivindicado") é o que
+  // descreve o que de fato aconteceu.
+  if (args.fifo && !isTerminalTurnStatus(encontrado.status as TurnStatus)) {
+    const bloqueio = await tx.execute<{ id: string; status: string }>(
+      earlierLiveTurnProbe({ tenant: escopo.tenant, agent: escopo.agent, turn_id: args.turn_id }),
+    );
+    const head = (bloqueio.rows as unknown as Array<{ id: string; status: string }>)[0];
+    if (head) {
+      // `outbound_pending` é a única situação em que NENHUM claim destrava a
+      // stream: quem tira um turno dali é o delivery worker do outbox (#506).
+      // A leitura operacional de `not_head` é "espere"; a de `stream_blocked`
+      // é "vá ao runbook do outbox". Dar o mesmo código às duas mandaria o
+      // operador esperar por algo que não vai acontecer.
+      const reason: ClaimRejection =
+        head.status === 'outbound_pending' ? 'stream_blocked' : 'not_head';
+      incCounter('maia_turn_claim_total', { result: reason });
+      recordStreamBlocked(reason);
+      return {
+        ok: false,
+        reason,
+        head_block: { turn_id: head.id, status: head.status as TurnStatus },
+        ...trail,
+      };
+    }
+  }
+
+  incCounter('maia_turn_claim_total', { result: 'not_eligible' });
+  return { ok: false, reason: 'not_eligible', ...trail };
 }
 
 /**
@@ -1880,7 +2121,7 @@ async function runTransition(args: {
     return await runTransitionTx(args, fence);
   } catch (err) {
     // NARROW: só o índice de exclusão por stream. Ver o comentário do tipo
-    // `TurnTransitionResult` e o de `tryClaimTurn`.
+    // `TurnTransitionResult` e o de `claimNextEligibleTurn`.
     if (
       pgErrorCode(err) === PG_UNIQUE_VIOLATION &&
       pgErrorConstraint(err) === STREAM_EXCLUSION_CONSTRAINT

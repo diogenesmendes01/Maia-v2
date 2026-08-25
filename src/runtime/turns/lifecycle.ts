@@ -43,6 +43,12 @@ import {
   type TurnLease,
 } from './lease.js';
 
+// #626 — a fachada reexporta o relator de violação de FIFO porque quem o chama
+// não é só o claim: o varredor de recovery (`src/workers/message-recovery.ts`)
+// tem um canário próprio, e a regra da fachada é "importe sempre de
+// `@/runtime/turns/index.js`".
+export { reportStreamFifoViolation } from './lease.js';
+
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
   turn_id: string;
@@ -363,6 +369,20 @@ export type TurnExecutionStart =
    * massa, e como nada em particular se o motivo virasse `not_claimed`.
    */
   | { started: false; reason: 'stream_busy' }
+  /**
+   * #626 — a conversa tem FILA: existe turno anterior não terminal na mesma
+   * stream. Distinto de `stream_busy` (a conversa está OCUPADA por um turno com
+   * lease viva) e de `not_claimed` (o TURNO não está elegível) — as três param
+   * a execução, e só a leitura difere: `not_head` é normal e some quando o
+   * anterior avança.
+   */
+  | { started: false; reason: 'not_head' }
+  /**
+   * #626 — o turno anterior está em `outbound_pending` e NENHUM claim o move.
+   * Quem destrava é o delivery worker do outbox (#506); esperar não resolve, e
+   * é por isso que ele não é `not_head`.
+   */
+  | { started: false; reason: 'stream_blocked' }
   /** Perdemos a posse entre o claim e o `running`. */
   | { started: false; reason: 'stale_claim' }
   /** O estado andou por baixo de nós — alguém concluiu, absorveu ou matou o turno. */
@@ -373,7 +393,7 @@ export type TurnExecutionStart =
  *
  * Dois regimes, escolhidos por `FEATURE_TURN_CLAIM`:
  *
- * **ON (#504).** `tryClaimTurn` é a autoridade: uma declaração SQL atômica
+ * **ON (#504).** `claimNextEligibleTurn` é a autoridade: uma declaração SQL atômica
  * decide o dono, incrementa a tentativa canônica, gera o `claim_token` e abre a
  * lease. `started: false` significa **não processe** — e é a primeira vez nesta
  * máquina de estados em que um "não" aqui de fato barra a execução. Note que o
@@ -465,12 +485,14 @@ async function beginClaimedExecution(
     return { started: false, reason: 'not_claimed' };
   }
   if (!acquired.lease) {
-    return {
-      started: false,
-      reason: acquired.result.ok === false && acquired.result.reason === 'stream_busy'
-        ? 'stream_busy'
-        : 'not_claimed',
-    };
+    // As recusas por STREAM chegam ao caller com o nome delas. Colapsá-las em
+    // `not_claimed` apagaria, no log de `src/agent/core.ts`, a diferença entre
+    // "outro worker pegou este turno" e "esta conversa tem fila" — e é a
+    // segunda que explica por que uma conversa inteira parou.
+    const streamReasons = ['stream_busy', 'not_head', 'stream_blocked'] as const;
+    const rejeicao = acquired.result.ok === false ? acquired.result.reason : null;
+    const porStream = streamReasons.find((r) => r === rejeicao);
+    return { started: false, reason: porStream ?? 'not_claimed' };
   }
 
   const lease = acquired.lease;

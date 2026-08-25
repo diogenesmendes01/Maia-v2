@@ -6,6 +6,7 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
   noteTurnQueued,
   reportLegacyProjectionDivergence,
+  reportStreamFifoViolation,
   turnStateAuthoritative,
   turnStateMachineEnabled,
 } from '@/runtime/turns/index.js';
@@ -168,6 +169,7 @@ export async function runMessageRecovery(): Promise<void> {
 async function runTurnRecoveryInner(): Promise<void> {
   const candidates = await agentTurnsRepo.findRecoverableTurns(STUCK_AFTER_MS, MAX_PER_RUN);
   if (candidates.length === 0) return;
+  await auditarFifoDoRecovery(candidates.map(({ turn }) => turn.id));
   let requeued = 0;
   for (const { turn, reason } of candidates) {
     incCounter('maia_turn_recovery_candidates_total', { reason });
@@ -212,6 +214,37 @@ async function runTurnRecoveryInner(): Promise<void> {
     }
   }
   logger.info({ requeued, scanned: candidates.length }, 'turn_recovery.done');
+}
+
+/**
+ * Issue #626 — o CANÁRIO de `maia_stream_fifo_violation_total{stage="recovery"}`.
+ *
+ * `findRecoverableTurns` já elege só o head-of-line de cada stream, pela MESMA
+ * função que o claim usa. Esta checagem pergunta de novo, por um caminho
+ * diferente (uma consulta sobre os ids devolvidos, em vez do predicado no
+ * `WHERE` daquela consulta), e o resultado esperado é sempre vazio.
+ *
+ * Ela existe porque a issue nomeia este ponto como o lugar onde a divergência
+ * aparece: "duas cópias da regra de elegibilidade divergem, e a divergência só
+ * aparece durante um recovery". Se alguém remover a regra do filtro, este
+ * canário acusa ANTES de o job acordar e ser recusado pelo claim — a diferença
+ * entre um alerta e uma investigação de por que a fila cresce sem nada executar.
+ *
+ * NUNCA lança: um canário que derruba o varredor transformaria uma anomalia de
+ * observabilidade numa parada de recuperação.
+ */
+async function auditarFifoDoRecovery(turn_ids: readonly string[]): Promise<void> {
+  try {
+    const foraDeOrdem = await agentTurnsRepo.listNonHeadTurns(turn_ids);
+    for (const { turn_id, earlier_live } of foraDeOrdem) {
+      await reportStreamFifoViolation(turn_id, { stage: 'recovery', earlier_live });
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'turn_recovery.fifo_canary_failed',
+    );
+  }
 }
 
 async function runMessageRecoveryInner(): Promise<void> {

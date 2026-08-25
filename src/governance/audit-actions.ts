@@ -256,6 +256,26 @@ export const AUDIT_ACTIONS = [
   // só ids de turno e um motivo de vocabulário fechado.
   'turn_stream_busy',
   'turn_stream_claim_recovered',
+  // Issue #626 (fatia C da #505) — HEAD-OF-LINE como condição do claim. Duas
+  // rows, pela mesma régua, e elas dizem coisas de gravidade oposta:
+  //   - `turn_stream_blocked`: o claim foi recusado porque existe turno
+  //     ANTERIOR não terminal na conversa. É a ação `stream.blocked` que a
+  //     issue-mãe pede na auditoria mínima, e é ROTINA saudável — a fila
+  //     funcionando. O `metadata.reason` separa `not_head` ("o anterior avança
+  //     sozinho; espere") de `stream_blocked` ("o anterior está no outbox e
+  //     nenhum claim o move; vá ao runbook do outbox"), duas leituras com
+  //     remediações opostas. `metadata.blocked_by_turn_id` é o que permite
+  //     reconstruir a fila depois sem recorrer à `stream_key`.
+  //   - `turn_stream_fifo_violation`: o canário do claim detectou que um turno
+  //     foi reivindicado COM turno anterior vivo na stream — isto é, a ordem
+  //     foi furada. NUNCA deveria aparecer: a issue-mãe lista
+  //     `fifo_violation_total > 0` entre os critérios de ABORTAR o rollout, ao
+  //     lado de violação de isolamento. Vira audit porque o contador agregado
+  //     não diz QUAL turno furou nem quantos estavam na frente, e sem isso a
+  //     investigação depois do incidente é impossível.
+  // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
+  'turn_stream_blocked',
+  'turn_stream_fifo_violation',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

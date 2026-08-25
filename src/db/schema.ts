@@ -3243,6 +3243,21 @@ export const agent_turns = pgTable(
     streamHeadIdx: index('agent_turns_stream_head_idx')
       .on(t.tenant_id, t.agent_id, t.stream_key, t.first_ingress_seq, t.status)
       .where(sql`stream_key IS NOT NULL`),
+    // #626 (migration 126): o MESMO prefixo, mas com os terminais fora do
+    // ÍNDICE em vez de fora do resultado. No índice acima `status` vem DEPOIS
+    // de `first_ingress_seq`, então `status NOT IN (<terminais>)` é filtro, não
+    // busca: o `NOT EXISTS` do head-of-line percorre todas as entradas
+    // anteriores da stream — o histórico inteiro de uma conversa quente, a cada
+    // claim. Aqui o predicado tira os terminais do índice, e a sonda passa a
+    // custar o BACKLOG da conversa (0–2 linhas) em vez do tráfego acumulado.
+    // Os literais precisam casar TEXTUALMENTE com os da consulta
+    // (`src/db/repositories/stream-head-sql.ts`) para o Postgres provar a
+    // implicação e escolher o índice parcial.
+    streamHeadLiveIdx: index('agent_turns_stream_head_live_idx')
+      .on(t.tenant_id, t.agent_id, t.stream_key, t.first_ingress_seq)
+      .where(
+        sql`stream_key IS NOT NULL AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')`,
+      ),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),

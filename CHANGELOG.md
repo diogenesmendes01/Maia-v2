@@ -4,6 +4,124 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Ordenação: só o HEAD-OF-LINE da conversa é reivindicável ([#626](https://github.com/diogenesmendes01/Maia-v2/issues/626), fatia C de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `126` ANTES de subir o código, e
+> confirme `pg_index.indisvalid` à mão depois** ([runbook §11.4](docs/runbooks/turn-state-machine.md)).
+> Ao contrário da `124`, aqui um índice inválido não quebra a invariante —
+> quebra o DESEMPENHO: a regra continua correta e passa a varrer o histórico
+> inteiro de cada conversa a cada claim. Um `CREATE INDEX CONCURRENTLY` que
+> falha deixa o índice inválido e **reaplicar a migration devolve sucesso**, sem
+> nenhum sinal do runner.
+
+**O problema.** A #625 respondeu *quantos* turnos de uma conversa podem estar
+ativos (um). Faltava responder *qual* — e sem essa resposta, o turno que
+ganhava a corrida era o que chegasse primeiro ao claim, não o que chegou
+primeiro ao usuário. São as falhas nº 1 e nº 3 da issue-mãe: *M1 e M2 chegam
+nessa ordem, mas M2 termina antes de M1*, e *um retry antigo reaparece depois de
+um turno mais novo*.
+
+**A regra.** Um turno só é reivindicável quando **não existe turno anterior não
+terminal na mesma stream** — "anterior" medido por `first_ingress_seq`, a
+fronteira que a fatia A ([#624](https://github.com/diogenesmendes01/Maia-v2/issues/624))
+passou a persistir. Nunca por timestamp: a issue-mãe proíbe explicitamente
+("timestamps não são fonte primária de ordenação"), porque ordenar por tempo
+faria a ordem depender do relógio de cada réplica.
+
+**Uma única definição, quatro consumidores.** A issue é literal sobre o modo de
+falha: *"duas cópias da regra de elegibilidade divergem, e a divergência só
+aparece durante um recovery"*. A regra vive num módulo PURO
+([`src/db/repositories/stream-head-sql.ts`](src/db/repositories/stream-head-sql.ts))
+e é chamada pelo `WHERE` do claim (`claimNextEligibleTurn`, renomeado de
+`tryClaimTurn`), pelo filtro do recovery (`findRecoverableTurns`), pelo
+dispatcher cross-tenant e pelo canário do varredor. Nenhum monta predicado
+próprio, e um teste unitário conta as chamadas e proíbe uma segunda cópia
+escrita à mão. Sem isso, o varredor rearmaria turnos que o claim vai recusar: a
+fila cresce, a métrica de recovery diz que houve trabalho, e a conversa não anda.
+
+**O índice não decide nada — decide o CUSTO.** A regra é um `NOT EXISTS`,
+correta sem índice nenhum. A migration `126` cria
+`agent_turns_stream_head_live_idx` sobre
+`(tenant_id, agent_id, stream_key, first_ingress_seq)` **com os terminais fora
+do índice**, e não é redundante com o `agent_turns_stream_head_idx` da `122`:
+naquele, `status` vem depois de `first_ingress_seq`, então o `NOT IN` é FILTRO,
+não busca. Medido contra PostgreSQL 16 com 205.000 turnos / 20.001 streams /
+1.003 vivos / 2 tenants, numa conversa com 5.000 turnos (4.997 concluídos):
+
+| | plano | buffers | tempo |
+|---|---|---|---|
+| com a `126` | `Index Only Scan`, `Rows Removed by Filter: 0` | 2 | 0,097 ms |
+| sem a `126` | `Index Only Scan` no índice largo, **`Rows Removed by Filter: 4997`** | 97 | 2,362 ms |
+
+Sem o índice o custo cresce com o HISTÓRICO da conversa, que nunca encolhe. Com
+ele, cresce com o BACKLOG, que é 0–2 na operação normal. Os estados terminais
+entram na consulta como **literais**, não parâmetros: o PostgreSQL só usa um
+índice parcial quando prova que a cláusula implica o predicado, e com `$1..$4` a
+prova depende de plano CUSTOM — a degradação apareceria só depois da sexta
+execução da mesma sessão.
+
+**Duas recusas novas, e elas não são sinônimos.** `not_head` é "a conversa tem
+fila, e ela anda sozinha" — não faça nada. `stream_blocked` é "o anterior está
+em `outbound_pending`, e nenhum claim o move" — vá ao runbook do outbox
+([#506](https://github.com/diogenesmendes01/Maia-v2/issues/506)). Esperar
+resolve a primeira e não resolve a segunda.
+
+**A decisão de projeto a contestar.** `outbound_pending` **bloqueia a ordem**,
+embora a fatia B tenha decidido que ele **não ocupa** a stream. As duas
+convivem porque respondem a perguntas diferentes, mas o efeito prático é que uma
+indisponibilidade do provedor de saída para a CONVERSA (não o tenant, não a
+fila). É o preço de FIFO — responder M2 antes de a resposta de M1 ter saído é
+exatamente a inversão que a #505 existe para impedir. A alavanca para não pagar
+esse preço é a flag, nunca mexer no predicado.
+
+**O que a recuperação de claim expirado deixou de fazer.** Antes desta fatia, um
+head que morria com a lease vencida era destravado pelo SUCESSOR: ele
+reivindicava, a transação da #625 recuperava o morto e a conversa andava na hora
+— fora de ordem. Agora a recuperação continua acontecendo (é o que devolve o
+head a `retryable`), e o sucessor é recusado como `not_head`: quem avança é o
+head, na vez dele, quando o varredor o rearmar (até 2 min). **É ordem comprada
+com latência no caminho de crash.** A promoção idempotente do sucessor
+([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627)) devolve a
+latência sem devolver a inversão.
+
+**Observabilidade.** `maia_stream_fifo_violation_total{stage}` (`claim` /
+`recovery`) — **sempre zero**, e publicada em ZERO no import: um contador que
+nasce na primeira violação satisfaria "sempre zero" por AUSÊNCIA, e nenhum
+alerta escrito contra ele dispararia. O estágio `claim` é uma pós-condição
+dentro da transação do claim concedido; o estágio `recovery` é uma consulta
+separada sobre os ids que o filtro devolveu. Mais
+`maia_stream_blocked_total{reason}` e as `audit_log` `turn_stream_blocked`
+(com `blocked_by_turn_id`, para reconstruir a fila sem recorrer à `stream_key`)
+e `turn_stream_fifo_violation`. Nenhuma carrega `stream_key`, telefone ou
+conteúdo.
+
+**Códigos centralizados.** `eligible`, `not_head`, `stream_blocked`,
+`stream_busy`, `promoted` — os cinco que a issue nomeia, num vocabulário único
+(`STREAM_SCHEDULING_RESULTS` em [`src/runtime/turns/claim.ts`](src/runtime/turns/claim.ts)).
+`promoted` entra **sem produtor**, de propósito: a #627 acrescentar um sexto
+rótulo a uma série de métrica já em uso quebraria um alerta em silêncio.
+
+**Kill switch:** `FEATURE_TURN_HEAD_OF_LINE=false` + restart. O claim volta ao
+comportamento de #625 e a plataforma volta a poder responder M2 antes de M1.
+Religar não reordena nada — a ordem vem de `first_ingress_seq`, gravado nas duas
+posições. A combinação com `FEATURE_TURN_STREAM_KEY=false` é **recusada no
+boot**: seria inerte, e o operador acreditaria ter ligado o FIFO.
+
+**Fora de escopo (fatias irmãs):** promoção de sucessor (#627), debounce
+transacional (#628), retry/DLQ/fairness (#629).
+
+Arquivos: `migrations/126_agent_turns_stream_head_live{,_down}.sql`,
+`src/db/repositories/stream-head-sql.ts` (novo, puro),
+`src/db/repositories/turn-repos.ts` (`claimNextEligibleTurn`,
+`explainClaimRejection`, `listNonHeadTurns`, filtro FIFO no recovery e no
+dispatcher), `src/runtime/turns/claim.ts` (vocabulário dos cinco códigos),
+`src/runtime/turns/stream-metrics.ts` (novo), `src/runtime/turns/lease.ts`
+(auditoria), `src/runtime/turns/lifecycle.ts` (motivos `not_head`/
+`stream_blocked`), `src/workers/message-recovery.ts` (canário),
+`src/config/contract.ts` + `src/config/rules.ts` (`FEATURE_TURN_HEAD_OF_LINE`),
+`src/governance/audit-actions.ts`, `src/db/schema.ts`.
+
+
 ### Ordenação: o banco passa a garantir NO MÁXIMO UM turno ativo por conversa ([#625](https://github.com/diogenesmendes01/Maia-v2/issues/625), fatia B de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 5 de 9)
 
 > **AÇÃO DO OPERADOR: pause os consumidores do turno antes de aplicar a
