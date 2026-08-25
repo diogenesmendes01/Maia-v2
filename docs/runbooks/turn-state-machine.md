@@ -1187,6 +1187,26 @@ alternativa — tirar `claimed`/`running` do conjunto de membros — seria pior:
 `LAG` não veria quebra na primeira linha, e o batch fecharia **por cima** de um
 turno em execução.
 
+### 13.7-bis Isolamento entre tenants na MESMA `stream_key`
+
+A `stream_key` embute tenant e agent no material canônico, mas **embutir não é
+escopar**. Duas linhas com a mesma chave em tenants diferentes são estado real
+(backfill, replay manual, colisão de hash), e a fatia B já trata o caso na
+exclusão. No fechamento do debounce, o escopo se divide em dois grupos — e a
+distinção importa para quem for refatorar:
+
+| Consulta | Escopo carrega peso? | Por quê |
+|---|---|---|
+| `openDebounceWindowMembers` (prefixo do fechamento **e** armar da janela) | **SIM** | é a única que seleciona por `stream_key` sem um `id` único. Sem escopo, o batch de um tenant absorve os turnos do outro |
+| GC do passo 2 (janelas de turnos mortos por outro caminho) | **SIM** | mesma razão: `stream_key` sem `id`. Sem escopo, fechar um tenant fecha a janela órfã do outro |
+| `UPDATE` de fechamento, `listClosedDebounceBatch`, os dois statements de `armDebounceWindowTx` | não — **defesa em profundidade** | todos têm `id = <único>` no `WHERE`, e o id vem de consulta já escopada |
+
+Os dois primeiros estão cobertos por `tests/integration/turn-stream-debounce-real-db.spec.ts`
+("a MESMA stream_key em TENANTS diferentes…"), com mensagem própria em cada
+asserção para que o vermelho diga qual dos dois quebrou. Os três últimos ficam
+sem cobertura **de propósito**: um teste que só pode falhar depois de alguém
+trocar a origem do `id` provaria o harness, não o código.
+
 ### 13.8 A composição do batch, depois do fato
 
 ```sql

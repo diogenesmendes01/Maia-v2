@@ -681,34 +681,96 @@ d('#628 — debounce transacional (DB real)', () => {
     expect(rows).toEqual([{ tenant_id: T_A, turn_id: a1.turn_id }]);
   });
 
-  // ─── 12: a MESMA stream_key em tenants diferentes ────────────────────────
+  // ─── 12: a MESMA stream_key em TENANTS diferentes ────────────────────────
   //
   // O caso 11 acima usa as chaves DERIVADAS de cada escopo, que são distintas
-  // por construção — e por isso ele nao consegue exercitar o `tenant_id`/
-  // `agent_id` do `WHERE` do fechamento: `stream_key` sozinho ja e seletivo.
-  // Medido: removendo as duas colunas do `UPDATE` de `closeDueDebounceBatchTx`,
-  // a suite inteira continuava 16/16 verde.
+  // por construção — e por isso ele NÃO exercita o escopo de nenhuma consulta:
+  // com chaves diferentes, `stream_key` sozinho já é seletivo. Chave IGUAL em
+  // tenants diferentes é estado REAL (backfill, replay manual, colisão de
+  // hash), e é o mesmo cenário que a fatia B trata em
+  // `turn-stream-exclusion-real-db` ("a MESMA stream_key em TENANTS diferentes
+  // não compete").
   //
-  // Chave IGUAL em tenants diferentes e estado REAL (backfill, replay manual), e
-  // e o mesmo cenario que a fatia B trata em `turn-stream-exclusion-real-db`
-  // ("a MESMA stream_key em TENANTS diferentes nao compete"). Aqui ele existe
-  // para que o escopo do fechamento seja carregado por teste, e nao pela
-  // improbabilidade de colisao da chave derivada.
-  it('a MESMA stream_key em TENANTS diferentes: fechar a de um nao toca a do outro', async () => {
+  // ─── ONDE o escopo é LOAD-BEARING, medido por sonda ─────────────────────
+  //
+  // A invariante do AGENTS.md §4 é escopo em TODO caminho dinâmico. Mas nem
+  // todo `tenant_id` do fechamento carrega peso, e a diferença é estrutural:
+  //
+  //   * `openDebounceWindowMembers` (o conjunto de membros, que alimenta o
+  //     prefixo do fechamento E o armar da janela) — **LOAD-BEARING**. É a
+  //     única consulta que seleciona por `stream_key` SEM um `id` único.
+  //     Removendo o escopo dela, o batch de A absorve os turnos de B:
+  //     `debounce_batch_size` vira 3 em vez de 1;
+  //   * o **GC do passo 2** (fecha janelas de turnos que morreram por outro
+  //     caminho) — **LOAD-BEARING** pela mesma razão: `stream_key` sem `id`.
+  //     Removendo o escopo, fechar A fecha a janela órfã de B;
+  //   * o `UPDATE` de fechamento, o `listClosedDebounceBatch` e os dois
+  //     statements de `armDebounceWindowTx` — **DEFESA EM PROFUNDIDADE**, não
+  //     carregam peso: todos têm `u.id = <um id único>` no `WHERE`, e esse id
+  //     vem de uma consulta JÁ escopada. Medido: removendo `tenant_id`/
+  //     `agent_id` de qualquer um dos três, a suíte segue verde — inclusive com
+  //     este caso. Ficam porque o dia em que alguém trocar a origem do id (um
+  //     `ORDER BY` diferente, um `LIMIT` movido) o escopo é a única coisa entre
+  //     a refatoração e uma escrita cross-tenant.
+  //
+  // Este caso cobre os DOIS load-bearing, com mensagem própria em cada
+  // asserção para que o vermelho diga qual dos dois quebrou.
+  it('a MESMA stream_key em TENANTS diferentes: fechar a de um não toca a do outro', async () => {
     const compartilhada = `deb628-compartilhada-${randomUUID()}`;
     const a1 = await texto(inA);
     const b1 = await texto(inB, { channel_id: CANAL_B });
     const b2 = await texto(inB, { channel_id: CANAL_B });
+    // Um turno TERMINAL com janela AINDA ABERTA em cada escopo. Ele existe para
+    // o passo 2 do fechamento — o GC das janelas cujo turno morreu por outro
+    // caminho (um operador o ignorou, um irmão o absorveu) —, que é o ÚNICO
+    // outro lugar do fechamento que seleciona por `stream_key` sem um `id`
+    // único no `WHERE`, e portanto o único outro que pode escrever na linha de
+    // outro tenant. Medido: sem estas duas linhas, remover `tenant_id`/
+    // `agent_id` do GC deixava a suíte verde.
+    const aMorto = await texto(inA);
+    const bMorto = await texto(inB, { channel_id: CANAL_B });
 
-    // Backfill: as tres linhas passam a carregar a MESMA chave literal, e cada
+    // Backfill: as cinco linhas passam a carregar a MESMA chave literal, e cada
     // escopo ganha a SUA linha de mutex — `lockStreamForDebounce` trava em
     // `agent_stream_sequences` por (tenant, agent, stream_key), e sem ela o
-    // fechamento sai por `stream_locked` antes de chegar ao `WHERE` que este
-    // caso existe para exercitar.
+    // fechamento sairia por `stream_locked` antes de chegar às consultas que
+    // este caso existe para exercitar.
     await pool.query(`UPDATE agent_turns SET stream_key = $1 WHERE id = ANY($2::uuid[])`, [
       compartilhada,
-      [a1.turn_id, b1.turn_id, b2.turn_id],
+      [a1.turn_id, b1.turn_id, b2.turn_id, aMorto.turn_id, bMorto.turn_id],
     ]);
+    // Os dois morrem por FORA do debounce, com a janela deles ainda aberta.
+    await pool.query(
+      `UPDATE agent_turns SET status = 'ignored', outcome = 'operator_cancelled'
+        WHERE id = ANY($1::uuid[])`,
+      [[aMorto.turn_id, bMorto.turn_id]],
+    );
+    // AS SEQUÊNCIAS SÃO FIXADAS À MÃO, e isso é o que torna as duas sondas
+    // DETERMINÍSTICAS em vez de sorteadas.
+    //
+    // Cada escopo aloca de um contador PRÓPRIO, então A e B nascem os dois em
+    // 1, 2, 3 — e um prefixo lido sem escopo veria empates de sequência cuja
+    // ordenação o PostgreSQL não garante: a sonda passaria ou falharia por
+    // sorte. Aqui a stream compartilhada recebe uma ordem ÚNICA e contígua
+    // (a1=1, b1=2, b2=3), de modo que um prefixo sem escopo a partir do head de
+    // A engole necessariamente os dois turnos de B — nunca "às vezes".
+    //
+    // Os dois turnos MORTOS ficam no fim (10 e 11), fora da contiguidade, para
+    // que eles exercitem SÓ o GC do passo 2 e não interfiram na composição do
+    // batch.
+    const seqs: Array<[string, number]> = [
+      [a1.turn_id, 1],
+      [b1.turn_id, 2],
+      [b2.turn_id, 3],
+      [aMorto.turn_id, 10],
+      [bMorto.turn_id, 11],
+    ];
+    for (const [id, seq] of seqs) {
+      await pool.query(
+        `UPDATE agent_turns SET first_ingress_seq = $2, last_ingress_seq = $2 WHERE id = $1`,
+        [id, seq],
+      );
+    }
     for (const [tn, ag] of [
       [T_A, A_A],
       [T_B, A_B],
@@ -720,8 +782,8 @@ d('#628 — debounce transacional (DB real)', () => {
       );
     }
 
-    // Vence a janela SO do tenant A. Sem o escopo no fechamento, fechar A
-    // arrastaria as linhas de B, que nem sequer estao vencidas.
+    // Vence a janela SÓ do tenant A. As linhas de B nem sequer estão vencidas,
+    // então qualquer escrita nelas é vazamento de escopo, nunca corrida.
     await pool.query(
       `UPDATE agent_turns SET debounce_deadline_at = now() - interval '1 second'
         WHERE stream_key = $1 AND tenant_id = $2 AND agent_id = $3
@@ -734,8 +796,23 @@ d('#628 — debounce transacional (DB real)', () => {
     const turnoA = await lerTurno(a1.turn_id);
     expect(turnoA['status']).toBe('queued');
     expect(turnoA['debounce_closed_at']).not.toBeNull();
+    // O batch de A tem UM membro — o dele. Se o conjunto de membros perder o
+    // escopo, este número vira 3 (os dois turnos de B entram por contiguidade).
+    expect(
+      Number(turnoA['debounce_batch_size']),
+      'o batch de A absorveu turnos de OUTRO tenant (escopo perdido no conjunto de membros)',
+    ).toBe(1);
 
-    // B nao foi tocado: nem fechado, nem absorvido, nem contado.
+    // O GC do PRÓPRIO escopo rodou: a janela órfã de A foi fechada, e é o que
+    // impede o índice do varredor de vazar uma linha que ninguém mais fecha.
+    expect((await lerTurno(aMorto.turn_id))['debounce_closed_at']).not.toBeNull();
+    // E a janela órfã de B — mesma `stream_key`, outro tenant — NÃO foi.
+    expect(
+      (await lerTurno(bMorto.turn_id))['debounce_closed_at'],
+      'o GC do fechamento de A fechou a janela órfã de B (escopo perdido no passo 2)',
+    ).toBeNull();
+
+    // B não foi tocado: nem fechado, nem absorvido, nem contado.
     for (const id of [b1.turn_id, b2.turn_id]) {
       const t = await lerTurno(id);
       expect(t['status'], `turno de B (${id}) foi tocado pelo fechamento de A`).toBe('received');
@@ -743,7 +820,9 @@ d('#628 — debounce transacional (DB real)', () => {
       expect(t['debounce_batch_size']).toBeNull();
     }
 
-    // E nenhum input de B migrou para o turno de A.
+    // E nenhum input de B migrou para o turno de A — a re-ancoragem do passo 6
+    // é escopada, e um vazamento aqui moveria a MENSAGEM de um cliente para o
+    // turno de outro, que é a invariante nº 1 da issue-mãe.
     const { rows } = await pool.query(
       `SELECT DISTINCT tenant_id FROM agent_turn_inputs WHERE turn_id = $1`,
       [a1.turn_id],
