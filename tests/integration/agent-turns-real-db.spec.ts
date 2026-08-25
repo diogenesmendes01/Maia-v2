@@ -795,7 +795,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     const sibling = await mkTurn();
 
     const r = await inPrimary(() =>
-      agentTurnsRepo.markSuperseded({
+      agentTurnsRepo.markSupersededByAbsorber({
         turn_id: sibling.id,
         absorbed_by_turn_id: executor.id,
         expected_version: sibling.state_version,

@@ -32,6 +32,13 @@ export const OPS_LOCK_KEYS = {
   restore_drill: 'maia_ops_restore_drill',
   retention_run: 'maia_ops_retention_run',
   tombstone_reconcile: 'maia_ops_tombstone_reconcile',
+  // Issue #536 — o varredor do TTL do export. CHAVE PRÓPRIA, e não a de
+  // `retention_run`: o varredor apaga ARQUIVOS numa árvore que nenhum outro
+  // passe toca, e compartilhar a chave faria uma varredura de TTL bloquear a
+  // execução de um pedido de exclusão de titular (e vice-versa) sem que as duas
+  // disputem uma única linha. O que impede a corrida com um pedido é a
+  // releitura do binding imediatamente antes da remoção, não o lock.
+  privacy_export_sweep: 'maia_ops_privacy_export_sweep',
 } as const;
 
 export type OpsLockKey = (typeof OPS_LOCK_KEYS)[keyof typeof OPS_LOCK_KEYS];

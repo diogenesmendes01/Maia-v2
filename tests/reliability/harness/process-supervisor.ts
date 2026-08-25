@@ -11,9 +11,10 @@
  * — é exatamente por isso que ele é o teste, e é exatamente isso que não existe
  * no repositório hoje.
  *
- * `FEATURE_TURN_CLAIM` tem default `false` (`src/config/contract.ts:1615`).
- * Ligar esse claim em produção sem prova de sobrevivência a `SIGKILL` é o risco
- * que este supervisor existe para remover.
+ * `FEATURE_TURN_CLAIM` tem default `true` desde a decisão do dono na #504
+ * (`src/config/contract.ts`), então o claim já roda em produção. O risco que
+ * este supervisor existe para remover deixou de ser hipotético: é a ausência de
+ * prova de sobrevivência a `SIGKILL` para um caminho que JÁ está ligado.
  *
  * ─── A regra de segurança, e por que ela é assim ─────────────────────────────
  *

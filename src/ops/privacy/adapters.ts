@@ -77,18 +77,33 @@ export const UNSUPPORTED_CLASSES: Readonly<Record<string, string>> = Object.free
 });
 
 /**
- * Vida útil do export, conservadora por default.
+ * Vida útil do export — POLÍTICA INICIAL de sete dias, agora configurável.
  *
- * "Vida do export de privacidade" é uma das perguntas abertas ao DPO, então
- * este número é provisório — mas a direção conservadora aqui é o OPOSTO da
- * retenção: para apagamento, errar para mais tempo é recuperável; para um
- * pacote cifrado com os dados de um titular parado no disco, errar para menos
- * tempo é que é. Sete dias dá ao titular uma janela real e não deixa o
- * artefato virar acervo.
+ * A direção conservadora aqui é o OPOSTO da retenção: para apagamento, errar
+ * para mais tempo é recuperável; para um pacote cifrado com os dados de um
+ * titular parado no disco, errar para menos tempo é que é. Sete dias dá ao
+ * titular uma janela real e não deixa o artefato virar acervo.
+ *
+ * O prazo saiu do código e virou `PRIVACY_EXPORT_TTL_DAYS` (issue #536,
+ * decisão do dono) porque quem decide é o DPO e a decisão vai mudar. O valor
+ * vale no momento da EMISSÃO e fica carimbado em
+ * `privacy_requests.export_expires_at`; é esse carimbo que o varredor honra.
+ * Um prazo aplicado retroativamente mudaria, debaixo do titular, a janela que
+ * já lhe foi comunicada.
  */
-const EXPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+function exportTtlMs(): number {
+  return config.PRIVACY_EXPORT_TTL_DAYS * 24 * 60 * 60 * 1000;
+}
 
-function privacyWorkspace(): string {
+/**
+ * A raiz da árvore de exports. UMA definição, exportada de propósito.
+ *
+ * Quem escreve o `.enc` (`sealExport`) e quem o apaga (o varredor de TTL, em
+ * `export-sweeper-adapters.ts`) precisam concordar sobre o diretório. Duas
+ * definições que divergissem produziriam um varredor que não acha nada — o TTL
+ * viraria de novo um carimbo sem execução, silenciosamente.
+ */
+export function privacyWorkspace(): string {
   // Mesma razão de `drillWorkspace()`: `BACKUP_DIR` já é tratado como
   // sensível pelo operador; espalhar dados de titular em `/tmp` desfaria a
   // criptografia que acabamos de aplicar.
@@ -244,7 +259,7 @@ async function purgeClass(
   }
 }
 
-async function listHolds(scope: PrivacyScope): Promise<readonly HoldRecord[] | null> {
+export async function listHolds(scope: PrivacyScope): Promise<readonly HoldRecord[] | null> {
   try {
     const res = await db.execute<{
       id: string;
@@ -417,7 +432,7 @@ export function createPrivacyPorts(): PrivacyPorts {
     now: () => new Date(),
     newId: () => randomUUID(),
     tombstoneSecret,
-    exportTtlMs: EXPORT_TTL_MS,
+    exportTtlMs: exportTtlMs(),
     unsupported: UNSUPPORTED_CLASSES,
   };
 }
