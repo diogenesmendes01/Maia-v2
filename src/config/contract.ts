@@ -1373,6 +1373,39 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  PRIVACY_EXPORT_TTL_DAYS: {
+    name: 'PRIVACY_EXPORT_TTL_DAYS',
+    description:
+      'Vida útil do pacote cifrado de export de privacidade, em dias. Sete é a POLÍTICA INICIAL decidida pelo dono (issue #536); o DPO ajusta depois, e por isso o prazo é configuração e não constante no código. Vale no momento da EMISSÃO: o prazo fica carimbado em privacy_requests.export_expires_at e é ele que o varredor honra, para que um export já entregue não mude de prazo debaixo do titular.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    schema: posInt(7),
+    example: '7',
+    fixture: '7',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  PRIVACY_EXPORT_SWEEP_DRY_RUN: {
+    name: 'PRIVACY_EXPORT_SWEEP_DRY_RUN',
+    description:
+      'Varredor do TTL do export só CONTA, não apaga. Default `false` — ao contrário de RETENTION_DRY_RUN, aqui a direção segura é EXECUTAR: o prazo de sete dias já é decisão tomada, e um varredor inerte deixa o pacote cifrado do titular no disco para sempre, que é o vazamento que o TTL fecha. Só `true`/`1` ligam o dry-run, então um valor inesperado mantém o varredor ativo.',
+    group: 'backup',
+    secret: false,
+    services: ['runtime', 'backup', 'maintenance'],
+    // NÃO usa boolFlag: com boolFlag um valor inesperado (`yes`) viraria
+    // `true` num campo cujo `true` DESLIGA a proteção. A inversão aqui é
+    // deliberada e é o espelho do comentário de RETENTION_DRY_RUN — nos dois
+    // casos o valor inesperado cai no lado seguro, que é o oposto em cada um.
+    schema: z
+      .string()
+      .default('false')
+      .transform((s) => s === 'true' || s === '1'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
 
   // ---- cost -------------------------------------------------------------
   DAILY_LLM_USD_THRESHOLD: {
@@ -1577,12 +1610,16 @@ export const ENV_CONTRACT = {
   FEATURE_TURN_STATE_MACHINE: {
     name: 'FEATURE_TURN_STATE_MACHINE',
     description:
-      'Máquina de estados durável do turno inbound (issue #503): dual-write de agent_turns. ' +
+      'Máquina de estados durável do turno inbound (issue #503): agent_turns. ' +
       'EXIGE as migrations 096 e 097 APLICADAS — subir o processo com esta flag ligada antes de ' +
-      '`npm run db:migrate` derruba todo o ingresso. Default ON, e só ESCRITA: enquanto ' +
-      'FEATURE_TURN_STATE_AUTHORITATIVE estiver false, `mensagens.processada_em` continua sendo a ' +
-      'decisão de negócio e o comportamento observável não muda. Kill switch: false volta ao ' +
-      'runtime anterior sem perder os turnos já gravados. Ver docs/runbooks/turn-state-machine.md.',
+      '`npm run db:migrate` derruba todo o ingresso. Default ON. Com ' +
+      'FEATURE_TURN_STATE_AUTHORITATIVE também ON (o default desde #504), agent_turns é a fonte ' +
+      'de verdade do turno e `mensagens.processada_em` fica sendo apenas projeção de ' +
+      'compatibilidade; com ela OFF a máquina roda em shadow e `processada_em` decide. ' +
+      'OFF é ROLLBACK EMERGENCIAL, não configuração suportada — e desligar SÓ esta flag é ' +
+      'recusado no boot, porque FEATURE_TURN_CLAIM e FEATURE_TURN_STATE_AUTHORITATIVE (ambas ON ' +
+      'por default) ficariam inertes: desligue as três juntas. Nenhum turno já gravado é perdido. ' +
+      'Ver docs/runbooks/turn-state-machine.md.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
@@ -1641,20 +1678,21 @@ export const ENV_CONTRACT = {
   FEATURE_TURN_CLAIM: {
     name: 'FEATURE_TURN_CLAIM',
     description:
-      'Claim ATÔMICO do turno com lease e fencing (issue #504). OFF (default): o runtime usa o ' +
-      'claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas podem processar o ' +
-      'mesmo turno. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, renova ' +
-      'lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token vigente; ' +
-      'perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 aplicada e ' +
-      'FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a reivindicar). ' +
-      'Kill switch: false volta ao caminho de #503 sem perder claims já gravados. ' +
-      'Ver docs/runbooks/turn-state-machine.md §6.',
+      'Claim ATÔMICO do turno com lease e fencing (issue #504). Default ON — inclusive no PRIMEIRO ' +
+      'deploy de produção. ON: antes de executar, o worker exige um claim atômico no PostgreSQL, ' +
+      'renova lease por heartbeat e TODA gravação da tentativa passa a exigir o claim_token ' +
+      'vigente; perder a lease cancela a tentativa em vez de concluí-la. EXIGE a migration 114 ' +
+      'aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem a máquina de estados não há turno a ' +
+      'reivindicar). OFF é ROLLBACK EMERGENCIAL, não configuração suportada: o runtime volta ao ' +
+      'claim apenas de ESTADO de #503, que NÃO é exclusão mútua — duas réplicas voltam a poder ' +
+      'processar o mesmo turno e as gravações deixam de carregar fence. Nenhum claim já gravado é ' +
+      'perdido. Ver docs/runbooks/turn-state-machine.md §6.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
-    schema: boolFlag('false'),
-    example: 'false',
-    fixture: 'false',
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
     restartRequired: true,
     commentedInExample: true,
   },
@@ -1687,17 +1725,21 @@ export const ENV_CONTRACT = {
     name: 'FEATURE_TURN_STATE_AUTHORITATIVE',
     description:
       'Flip da LEITURA da máquina de estados do turno (issue #503): o recovery elege candidatos ' +
-      'por agent_turns.status em vez de processada_em IS NULL. Único modo em que um turno ' +
-      '`retryable` (timeout de reasoner, falha pre-send do outbound) volta para a fila — logo, ' +
-      'muda comportamento e custo. Exige FEATURE_TURN_STATE_MACHINE ligada, backfill concluído ' +
+      'por agent_turns.status em vez de processada_em IS NULL. Default ON — numa produção ' +
+      'greenfield não existe histórico a backfillar, e é o ÚNICO modo em que um turno `retryable` ' +
+      '(timeout de reasoner, falha pre-send do outbound) volta para a fila; com ele OFF esses ' +
+      'turnos ficam invisíveis para o recovery. Também torna BLOQUEANTE a falha de escrita da ' +
+      'máquina de estados (`TurnStateWriteError`), como exige "PostgreSQL é a fonte de verdade". ' +
+      'Exige FEATURE_TURN_STATE_MACHINE ligada e, numa base COM histórico, o backfill concluído ' +
       '(`npm run backfill:turns`) e maia_turn_legacy_projection_mismatch_total estável. ' +
-      'Ver docs/runbooks/turn-state-machine.md §2.',
+      'OFF é ROLLBACK EMERGENCIAL: devolve a decisão a `mensagens.processada_em` e volta a ' +
+      'fail-soft. Ver docs/runbooks/turn-state-machine.md §2.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
-    schema: boolFlag('false'),
-    example: 'false',
-    fixture: 'false',
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
     restartRequired: true,
     commentedInExample: true,
   },
@@ -2474,7 +2516,7 @@ export const ENV_CONTRACT = {
   READINESS_SCHEMA_CHECK: {
     name: 'READINESS_SCHEMA_CHECK',
     description:
-      'Exige que o veredito canônico de schema (getSchemaReadiness, #516) esteja `ready` antes de anunciar readiness: dirty state, checksum divergente, arquivo de migration ausente e schema incompatível derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). A readiness NUNCA aplica migration — só recusa servir num schema que ela não consegue verificar. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito; isso é política explícita, não fallback silencioso.',
+      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],

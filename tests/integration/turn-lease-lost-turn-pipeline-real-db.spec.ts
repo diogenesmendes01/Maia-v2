@@ -333,6 +333,15 @@ async function turnIdFor(mensagem_id: string): Promise<string> {
 }
 
 /**
+ * `state_version` de `agent_turns` LOGO DEPOIS do takeover — a marca d'água que
+ * torna "o perdedor não gravou nada" uma afirmação verificável e não uma
+ * suposição. Toda escrita de estado do turno incrementa a versão, então
+ * comparar o valor final com este é a forma mais forte (e a mais barata) de
+ * dizer que a última gravação da linha foi a do SUCESSOR.
+ */
+let versaoAposTakeover: number | null = null;
+
+/**
  * A PERDA DE POSSE, pelo mecanismo REAL: a lease vence por SQL, um sucessor
  * reivindica de verdade (`tryClaimTurn`), o heartbeat do dono descobre o
  * `token_mismatch` e aborta o `AbortSignal` da tentativa. Nada é sinalizado à
@@ -353,6 +362,9 @@ async function loseOwnershipForReal(turn_id: string): Promise<void> {
     }),
   );
   expect(successor.ok, 'o sucessor deveria assumir a lease vencida').toBe(true);
+  // Estreitamento para o TS — e a captura da marca d'água do takeover.
+  if (!successor.ok) throw new Error('o sucessor não assumiu a lease vencida');
+  versaoAposTakeover = successor.claim.state_version;
   const deadline = Date.now() + 10_000;
   while (!getTurnExecutionContext()?.signal.aborted && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 25));
@@ -430,9 +442,73 @@ async function boundariesBloqueados(): Promise<string[]> {
     .sort();
 }
 
-async function processadaEm(mensagem_id: string): Promise<unknown> {
-  const r = await pool.query(`SELECT processada_em FROM mensagens WHERE id = $1`, [mensagem_id]);
-  return r.rows[0]?.processada_em ?? null;
+/**
+ * O DESFECHO DO TURNO na fonte de verdade — `agent_turns` —, com a ligação
+ * `agent_turn_inputs` e a projeção legada que hoje DERIVA dela.
+ *
+ * Por que não basta olhar `mensagens.processada_em`: com
+ * `FEATURE_TURN_STATE_AUTHORITATIVE` ligada (default desde a #504), a projeção
+ * legada deixou de ser um efeito INDEPENDENTE do fim do pipeline e passou a ser
+ * consequência do ESTADO — `runTransition` (`src/db/repositories/turn-repos.ts`)
+ * só carimba `processada_em` em transição TERMINAL, na mesma transação do CAS e
+ * restrita às mensagens ligadas por `agent_turn_inputs`; fora disso
+ * `src/agent/core.ts` registra `agent.legacy_projection_skipped_non_terminal`.
+ * Um turno que termina `retryable` — o caso deste harness — corretamente NÃO
+ * carimba, porque carimbar é justamente o que matava o retry (achado P1).
+ *
+ * Então o sinal equivalente, e mais forte, é este: QUEM escreveu o desfecho da
+ * tentativa, QUAL desfecho, se a posse foi devolvida e se a mensagem está
+ * ligada ao turno. `state_version` fecha a prova — nenhuma gravação de estado
+ * passa por ela sem incrementá-la.
+ */
+type DesfechoDoTurno = {
+  status: string;
+  outcome: string | null;
+  last_error_code: string | null;
+  posse_liberada: boolean;
+  ligada_por_inputs: boolean;
+  projecao_legada: unknown;
+  state_version: number;
+};
+
+async function desfechoDoTurno(mensagem_id: string): Promise<DesfechoDoTurno> {
+  const r = await pool.query<DesfechoDoTurno>(
+    `SELECT t.status,
+            t.outcome,
+            t.last_error_code,
+            (t.claim_token IS NULL) AS posse_liberada,
+            t.state_version::int   AS state_version,
+            EXISTS (SELECT 1 FROM agent_turn_inputs i
+                     WHERE i.turn_id = t.id AND i.mensagem_id = m.id) AS ligada_por_inputs,
+            m.processada_em AS projecao_legada
+       FROM mensagens m
+       JOIN agent_turns t ON t.representative_message_id = m.id
+      WHERE m.id = $1`,
+    [mensagem_id],
+  );
+  const row = r.rows[0];
+  if (!row) throw new Error(`nenhum agent_turns para a mensagem ${mensagem_id}`);
+  return { ...row, projecao_legada: row.projecao_legada ?? null };
+}
+
+/**
+ * O desfecho que um turno PERDIDO tem de exibir: a última gravação da linha é a
+ * do SUCESSOR (`claimed`, versão a do takeover, lease dele) e o perdedor não
+ * escreveu NADA — nem outcome, nem erro, nem a projeção legada.
+ */
+function desfechoIntactoDoSucessor(): DesfechoDoTurno {
+  if (versaoAposTakeover === null) {
+    throw new Error('o takeover não aconteceu — a marca d\'água não foi capturada');
+  }
+  return {
+    status: 'claimed',
+    outcome: null,
+    last_error_code: null,
+    posse_liberada: false,
+    ligada_por_inputs: true,
+    projecao_legada: null,
+    state_version: versaoAposTakeover,
+  };
 }
 
 d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do efeito', () => {
@@ -543,6 +619,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     outreach.calls = 0;
     repoHooks.aposFindByPhone = null;
     repoHooks.aposSelectorRecord = null;
+    versaoAposTakeover = null;
 
     const conversa_id = await mkConversa();
     await mkPendingQuestion(conversa_id);
@@ -625,7 +702,32 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
       llm.workloads,
       'o pipeline pós-gate inteiro tem de ter sido alcançado',
     ).toEqual(['procedure_selector', 'risk_classifier', 'reasoner']);
-    expect(await processadaEm(mensagem_id), 'e o turno tem de ter sido projetado').not.toBeNull();
+    // O DESFECHO, escrito pelo DONO na fonte de verdade.
+    //
+    // Aqui o ReAct produz resposta e o ENVIO falha — o Baileys é dublê e o par
+    // tenant/agent desta suíte não tem canal ativo (`line_output.sole_channel_
+    // unresolvable`). `decideTurnAction` (`src/agent/turn-outcome.ts`) classifica
+    // isso como `outbound_failure` RETRYABLE, e o dono fecha a tentativa em
+    // `retryable`, devolvendo a lease. É o fim de pipeline mais PROFUNDO que
+    // este harness alcança: só se chega a `outbound_failure` depois de o
+    // reasoner ter rodado e produzido.
+    //
+    // A projeção legada nula NÃO é ausência de rastro: é a regra do regime
+    // autoritativo (`agent.legacy_projection_skipped_non_terminal`) — estado
+    // não-terminal não carimba `processada_em`, e é isso que mantém o turno
+    // visível para o recovery. Ela entra na igualdade para continuar coberta.
+    expect(
+      await desfechoDoTurno(mensagem_id),
+      'o dono tem de ter fechado a tentativa no estado do turno',
+    ).toEqual({
+      status: 'retryable',
+      outcome: null,
+      last_error_code: 'outbound_failure',
+      posse_liberada: true,
+      ligada_por_inputs: true,
+      projecao_legada: null,
+      state_version: 3, // created -> claimed (dono) -> retryable
+    });
     expect(
       await boundariesBloqueados(),
       'com a posse intacta nenhum limite de efeito pode ter recusado nada',
@@ -669,12 +771,16 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     //    concluir) sequer foram alcançados.
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
 
-    // 5. E a projeção legada NÃO foi carimbada: era assim que um zumbi fazia o
-    //    turno do dono legítimo parecer processado por fora.
+    // 5. E o DESFECHO do turno é o do SUCESSOR, intacto: quem perdeu a posse
+    //    não gravou estado nem projeção. `state_version` é o discriminador —
+    //    ela ainda é a do takeover, então a ÚLTIMA gravação da linha foi a do
+    //    sucessor. `projecao_legada` (o antigo `processada_em`) entra aqui como
+    //    parte do mesmo desfecho: era assim que um zumbi fazia o turno do dono
+    //    legítimo parecer processado por fora.
     expect(
-      await processadaEm(mensagem_id),
-      'processada_em foi carimbado por quem já não tinha a posse',
-    ).toBeNull();
+      await desfechoDoTurno(mensagem_id),
+      'quem já não tinha a posse gravou desfecho no turno',
+    ).toEqual(desfechoIntactoDoSucessor());
 
     // A REDE, e o que prova que o core REALMENTE entrou (sem ela o teste
     // passaria por não ter rodado): a posse na linha é a do SUCESSOR.
@@ -732,9 +838,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     expect(await execucoesDaConversa(conversa_id), 'uma execução nasceu sem posse').toBe(0);
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
     expect(
-      await processadaEm(mensagem_id),
-      'processada_em foi carimbado por quem já não tinha a posse',
-    ).toBeNull();
+      await desfechoDoTurno(mensagem_id),
+      'quem já não tinha a posse gravou desfecho no turno',
+    ).toEqual(desfechoIntactoDoSucessor());
 
     // 4. E parou NO GRAFO — não num guard mais adiante.
     expect(
@@ -780,9 +886,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     expect(await execucoesDaConversa(conversa_id), 'uma execução nasceu sem posse').toBe(0);
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
     expect(
-      await processadaEm(mensagem_id),
-      'processada_em foi carimbado por quem já não tinha a posse',
-    ).toBeNull();
+      await desfechoDoTurno(mensagem_id),
+      'quem já não tinha a posse gravou desfecho no turno',
+    ).toEqual(desfechoIntactoDoSucessor());
 
     // 3. E o limite que recusou é o hook — não um guard mais adiante. Sem o
     //    guard NOVO (o de dentro do `if (owner)`), a mutação rodaria e quem
@@ -826,9 +932,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     ]);
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
     expect(
-      await processadaEm(mensagem_id),
-      'processada_em foi carimbado por quem já não tinha a posse',
-    ).toBeNull();
+      await desfechoDoTurno(mensagem_id),
+      'quem já não tinha a posse gravou desfecho no turno',
+    ).toEqual(desfechoIntactoDoSucessor());
     expect(
       await boundariesBloqueados(),
       'a recusa tem de vir do grafo pre-turn',
@@ -866,9 +972,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     expect(llm.workloads, 'nenhum reasoner pode rodar depois da perda').not.toContain('reasoner');
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
     expect(
-      await processadaEm(mensagem_id),
-      'processada_em foi carimbado por quem já não tinha a posse',
-    ).toBeNull();
+      await desfechoDoTurno(mensagem_id),
+      'quem já não tinha a posse gravou desfecho no turno',
+    ).toEqual(desfechoIntactoDoSucessor());
 
     // 3. O CONTRASTE que prova que a barreira é a do Decision Engine e não uma
     //    anterior: o grafo pre-turn rodou COM posse e deixou o rastro dele.

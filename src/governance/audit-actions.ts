@@ -127,6 +127,23 @@ export const AUDIT_ACTIONS = [
   // A primeira é uma decisão defensável perante a ANPD; a segunda é um
   // incidente com dado possivelmente meio apagado.
   'privacy_request_failed',
+  // Issue #536 (decisão do dono sobre o TTL do export). O prazo do export
+  // deixou de ser só um carimbo em `export_expires_at` e passou a ter execução:
+  // um varredor remove o `.enc` vencido. Remoção de arquivo é efeito colateral
+  // irreversível, então cada uma tem linha própria — quem, quando, qual pedido,
+  // qual locator, qual resultado.
+  //  - privacy_export_purged: o artefato foi removido e a ausência foi
+  //    PROVADA. `already_absent: true` distingue a retomada de um passe que
+  //    caiu (arquivo já não estava lá) de uma remoção efetiva; as duas
+  //    concluem o TTL, mas só a segunda destruiu bytes nesta execução.
+  //  - privacy_export_purge_refused: o guarda de path/locator RECUSOU, ou a
+  //    remoção não pôde ser confirmada. NADA foi apagado. É deliberadamente uma
+  //    ação separada de `_purged`: "o TTL foi cumprido" e "um locator
+  //    irreconhecível apareceu apontando para fora da árvore de exports" pedem
+  //    remediações opostas, e conflatá-las esconderia a segunda dentro do
+  //    volume normal da primeira.
+  'privacy_export_purged',
+  'privacy_export_purge_refused',
   'post_restore_reconciliation_completed',
   'post_restore_reconciliation_failed',
   'whatsapp_connected',

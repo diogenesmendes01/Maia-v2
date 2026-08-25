@@ -511,6 +511,28 @@ async function beginClaimedExecution(
  * A associação DEFINITIVA (um turno por rajada, decidido no ingresso) é
  * fechada em #505 — aqui o objetivo é que a rajada produza UM turno executável
  * e nenhum turno órfão executável.
+ *
+ * ─── O FENCE PERTENCE A QUEM ABSORVE (#504, decisão do dono) ────────────────
+ *
+ * Absorver é uma gravação com DUAS linhas: a que muda (o irmão) e a que
+ * autoriza (este turno). A posse exigida é a DESTE turno — o irmão
+ * normalmente nunca foi reivindicado, porque quem foi reivindicado foi o
+ * executor da rajada, e exigir claim dele tornaria a absorção legítima
+ * impossível no caso comum.
+ *
+ * Duas camadas, e as duas são necessárias:
+ *
+ *  1. AQUI, em memória: se esta tentativa já SABE que perdeu a lease
+ *     (heartbeat morto, `release()` do shutdown), não escrevemos nada — nem a
+ *     supersessão do irmão, nem o `attachInputTx` das irmãs sem turno. Entre a
+ *     perda e o takeover existe uma janela em que o token antigo ainda é o
+ *     vigente no banco, e nela o predicado SQL sozinho aprovaria a escrita.
+ *  2. NO BANCO, via `absorber_claim_token`: um zumbi que ainda NÃO percebeu a
+ *     perda passa pelo guard local e é recusado pelo `EXISTS` que exige token
+ *     vigente E `lease_expires_at > now()` deste turno.
+ *
+ * A posse é reavaliada a CADA irmã: a rajada pode ser longa e a lease pode
+ * morrer no meio dela.
  */
 export async function absorbDebounceInputs(
   handle: TurnHandle | null,
@@ -520,6 +542,11 @@ export async function absorbDebounceInputs(
   await guarded('absorb_inputs', async () => {
     let seq = 1;
     for (const mensagem_id of mensagem_ids) {
+      const fence = resolveFence(handle);
+      if (fence.kind === 'lost') {
+        await refuseLostOwnership(handle, 'absorb_inputs', fence.reason);
+        return;
+      }
       const sibling = await agentTurnsRepo.findTurnByMessage(mensagem_id);
       if (!sibling) {
         await agentTurnsRepo.attachInputTx({
@@ -530,11 +557,22 @@ export async function absorbDebounceInputs(
         continue;
       }
       if (sibling.id === handle.turn_id) continue;
-      const result = await agentTurnsRepo.markSuperseded({
+      const result = await agentTurnsRepo.markSupersededByAbsorber({
         turn_id: sibling.id,
         absorbed_by_turn_id: handle.turn_id,
+        // O CAS do IRMÃO: é ele que decide a corrida entre duas absorções
+        // concorrentes. O fence acima diz "posso absorver"; este diz "este
+        // irmão ainda está no estado que eu li".
         expected_version: Number(sibling.state_version),
+        ...(fence.kind === 'fenced'
+          ? { absorber_claim_token: fence.expected_claim_token }
+          : {}),
       });
+      // `stale_claim` aqui significa que a posse DESTE turno acabou — não que o
+      // irmão andou. Parar a rajada inteira é a única reação correta: as
+      // próximas absorções seriam recusadas pelo mesmo motivo, e insistir é o
+      // comportamento de zumbi que o fence existe para impedir.
+      if (await handleStaleClaim(handle, result, 'absorb_inputs')) return;
       if (result.ok) {
         logger.debug(
           { turn_id: sibling.id, to_status: 'superseded', absorbed_by: handle.turn_id },
@@ -579,10 +617,17 @@ export async function concludeTurn(
     // A lease morreu antes da conclusão (heartbeat perdido, `release()` do
     // shutdown, ou um fence anterior desta mesma tentativa). Concluir agora é
     // gravar sem posse — e é exatamente o cenário do worker lento que a issue
-    // fecha. Vale inclusive para `merged_into_turn`: `markSuperseded` é
-    // deliberadamente SEM fence (quem absorve nunca teve a posse do absorvido),
-    // mas isso é uma afirmação sobre o turno ABSORVIDO, não licença para o
-    // absorvedor gravar depois de perder a própria posse.
+    // fecha.
+    //
+    // `merged_into_turn` NÃO é exceção, e já foi. Aqui o turno declara a SI
+    // MESMO absorvido, então a gravação pertence a esta tentativa como
+    // qualquer outra e leva o fence do PRÓPRIO turno
+    // (`markSupersededSelf`). A absorção de um IRMÃO — onde o fence é do
+    // absorvedor e o irmão não precisa de claim — é outra operação, e mora em
+    // `absorbDebounceInputs`. Enquanto as duas eram a mesma chamada sem fence,
+    // esta porta era a única transição terminal que um worker sem posse
+    // conseguia atravessar, e `superseded` é terminal: o sucessor perdia o
+    // turno sem que nada aparecesse como conflito.
     const fence = resolveFence(handle);
     if (fence.kind === 'lost') {
       await refuseLostOwnership(handle, `conclude_${outcome}`, fence.reason);
@@ -590,9 +635,10 @@ export async function concludeTurn(
     }
     const result =
       outcome === 'merged_into_turn'
-        ? await agentTurnsRepo.markSuperseded({
+        ? await agentTurnsRepo.markSupersededSelf({
             turn_id: handle.turn_id,
             expected_version: handle.state_version,
+            ...fenceArgs(fence),
           })
         : IGNORED_OUTCOMES.has(outcome)
           ? await agentTurnsRepo.markIgnored({
