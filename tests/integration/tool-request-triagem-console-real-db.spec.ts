@@ -45,8 +45,6 @@ const AG_A2 = 'wt638_agente_a2';
 const T_B = 'wt638_triagem_b';
 const AG_B = 'wt638_agente_b';
 
-const REPO_SLUG = 'org-fixture/repo-fixture';
-
 let pool: pg.Pool;
 
 const proposer = moduloDeProducao(() => import('@/cognition/tool-request/proposer.js'));
