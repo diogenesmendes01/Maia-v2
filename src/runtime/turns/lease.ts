@@ -267,7 +267,9 @@ export async function acquireTurnLease(turn_id: string): Promise<
   observeHistogram('maia_turn_claim_latency_ms', Date.now() - started, {
     result: result.ok ? 'acquired' : result.reason,
   });
+  await reportStreamClaimsRecovered(turn_id, result.recovered_stream_claims);
   if (!result.ok) {
+    if (result.reason === 'stream_busy') await reportStreamBusy(turn_id, worker_id);
     logger.debug({ turn_id, worker_id, reason: result.reason }, 'turn.claim_not_acquired');
     return { lease: null, result };
   }
@@ -281,6 +283,69 @@ export async function acquireTurnLease(turn_id: string): Promise<
     'turn.claimed',
   );
   return { lease: new TurnLease(result.claim, { ttl_ms, heartbeat_ms }), result };
+}
+
+/**
+ * #625 — a stream estava OCUPADA: o banco recusou um segundo turno ativo.
+ *
+ * Vira `audit_log` e não só métrica porque é a única evidência durável de que a
+ * exclusão por stream AGIU. A issue-mãe pede `stream.blocked` na auditoria
+ * mínima, e sem a row não há como responder, depois do incidente, "esta
+ * conversa parou porque o índice barrou, ou porque ninguém a reivindicou?" —
+ * duas causas com remediações opostas.
+ *
+ * NÃO carrega `stream_key`: ela é um hash, mas o `turn_id` já ancora a
+ * investigação, e a issue-mãe restringe `stream_key` a log estruturado e
+ * armazenamento protegido. Como LABEL de métrica ela não aparece em lugar
+ * nenhum — `maia_turn_claim_total{result="stream_busy"}` é agregada.
+ *
+ * VOLUME, e o que vigiar: uma row por claim RECUSADO, não por mensagem. Sem
+ * head-of-line (#626) o job de um turno não-elegível ainda acorda, é recusado e
+ * termina — então o custo é proporcional ao backlog de conversas QUENTES, não
+ * ao tráfego. Se `maia_turn_claim_total{result="stream_busy"}` subir de forma
+ * sustentada, o problema a resolver é a serialização, não o volume de audit; a
+ * decisão de amostrar esta row pertence ao dono, e o runbook (§10.3) diz onde
+ * ela apareceria primeiro.
+ */
+async function reportStreamBusy(turn_id: string, worker_id: string): Promise<void> {
+  logger.info({ turn_id, worker_id }, 'turn.stream_busy');
+  await audit({
+    acao: 'turn_stream_busy',
+    alvo_id: turn_id,
+    metadata: { worker_id, reason: 'stream_busy' },
+  }).catch((err) => logger.warn({ err: (err as Error).message }, 'turn.stream_busy_audit_failed'));
+}
+
+/**
+ * #625 — claims EXPIRADOS da stream foram recuperados dentro da transação do
+ * claim, devolvendo turnos de donos mortos a `retryable`.
+ *
+ * É a metade TEMPORAL da exclusão por stream, e ela precisa de trilha própria
+ * por uma razão operacional concreta: sem ela, um turno reaparece em
+ * `retryable` sem que nada diga QUEM o rearmou. O varredor de recovery
+ * (`src/workers/message-recovery.ts`) e este caminho produzem o mesmo estado
+ * final, e distinguir "o sweeper achou" de "o claim da stream destravou" é o
+ * que separa um deploy normal de uma stream que estava presa.
+ *
+ * `turn_id` aqui é o turno que ESTAVA reivindicando, não o recuperado — os
+ * recuperados vão em `metadata.recovered`, que é o conjunto.
+ */
+async function reportStreamClaimsRecovered(
+  turn_id: string,
+  recovered: readonly string[] | undefined,
+): Promise<void> {
+  if (!recovered || recovered.length === 0) return;
+  logger.warn(
+    { turn_id, recovered_turn_ids: recovered, count: recovered.length, ops_alert: true },
+    'turn.stream_claims_recovered',
+  );
+  await audit({
+    acao: 'turn_stream_claim_recovered',
+    alvo_id: turn_id,
+    metadata: { recovered: [...recovered], count: recovered.length },
+  }).catch((err) =>
+    logger.warn({ err: (err as Error).message }, 'turn.stream_claims_recovered_audit_failed'),
+  );
 }
 
 /**

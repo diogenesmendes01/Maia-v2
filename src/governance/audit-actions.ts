@@ -238,6 +238,24 @@ export const AUDIT_ACTIONS = [
   // um hash e o motivo tem vocabulário fechado.
   'stream_ingress_rejected',
   'stream_ingress_sequenced',
+  // Issue #625 (fatia B da #505) — EXCLUSÃO de no máximo um turno ativo por
+  // stream. Duas rows, e só duas, pela mesma régua de #503/#504: entra o que um
+  // humano precisa RECONSTRUIR depois.
+  //   - `turn_stream_busy`: o banco RECUSOU um segundo turno ativo da mesma
+  //     conversa (`agent_turns_stream_active_uq`, migration 124). É a evidência
+  //     durável de que a exclusão AGIU — sem ela, o incidente aparece só como
+  //     "esta conversa parou", e "o índice barrou" e "ninguém reivindicou" são
+  //     indistinguíveis, apesar de terem remediações opostas.
+  //   - `turn_stream_claim_recovered`: um claim EXPIRADO da stream foi
+  //     recuperado dentro da transação do claim (a metade temporal da
+  //     exclusão). Vira audit porque o estado final — turno de volta em
+  //     `retryable` — é IDÊNTICO ao que o varredor de recovery produz, e sem a
+  //     row não há como saber que a stream chegou a ficar presa por um dono
+  //     morto. Não é rotina: em operação saudável ela nunca aparece.
+  // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID —
+  // só ids de turno e um motivo de vocabulário fechado.
+  'turn_stream_busy',
+  'turn_stream_claim_recovered',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

@@ -1,0 +1,133 @@
+-- maia:no-transaction
+-- 124 — EXCLUSÃO de no máximo um turno ATIVO por stream (issue #625, fatia B
+-- da #505; fase 5 do rollout da issue-mãe).
+--
+-- ─── O que esta migration decide, e por que ela é o objeto inteiro ─────────
+--
+-- A #505 lista dez falhas. Esta migration fecha a de número 2 — *dois turnos da
+-- mesma conversa são claimed por réplicas diferentes* — e não toca em nenhuma
+-- outra. Head-of-line (#626), promoção de sucessor (#627), debounce
+-- transacional (#628) e retry/DLQ (#629) continuam exatamente como estavam.
+--
+-- A escolha de ONDE colocar a exclusão é a decisão de projeto, e a issue-mãe
+-- já a tomou (§Head-of-line e exclusão): "Não usar apenas mutex em memória ou
+-- Redis lock sem fence persistido." O motivo é operacional, não estético. Um
+-- mutex de processo não existe para a segunda réplica. Um lock de Redis sem
+-- fence persistido sobrevive à sua própria expiração: o dono cujo lock venceu
+-- não descobre que venceu, e continua escrevendo. Só o BANCO sabe, no instante
+-- do UPDATE, quantos turnos daquela stream estão ativos — porque é ele quem
+-- guarda o estado.
+--
+-- ─── Por que uma UNIQUE PARCIAL, e não uma constraint "de verdade" ─────────
+--
+-- A invariante desejada é temporal: "no máximo um turno com LEASE VIVA por
+-- stream". O PostgreSQL não expressa isso diretamente — uma constraint não
+-- consegue depender de `now()`, porque ela é reavaliada só na escrita e uma
+-- lease vence sozinha, sem nenhuma escrita acontecer. Uma `EXCLUDE` com
+-- `tstzrange(claimed_at, lease_expires_at)` chegaria perto, mas exigiria
+-- `btree_gist`, transformaria toda a exclusão numa comparação de intervalos
+-- (com o clock skew de volta ao centro do problema) e AINDA deixaria a linha
+-- vencida ocupando o intervalo até alguém escrevê-la.
+--
+-- Então a issue-mãe prescreve a COMBINAÇÃO de duas metades, e as duas são
+-- necessárias:
+--
+--   (a) este índice único parcial sobre os estados `claimed`/`running` — a
+--       metade ESTRUTURAL, que torna dois turnos ativos fisicamente
+--       impossíveis, independentemente de qual código escreveu;
+--   (b) a recuperação de claims expirados DENTRO da transação de claim
+--       (`agentTurnsRepo.tryClaimTurn`, src/db/repositories/turn-repos.ts) — a
+--       metade TEMPORAL, que remove do índice a linha cuja lease já venceu.
+--
+-- Sem (a), duas réplicas claimam turnos distintos da mesma stream e a #505
+-- falha exatamente onde ela dói. Sem (b), o primeiro crash de worker deixa uma
+-- linha `claimed` com lease vencida ocupando a chave, e a stream fica
+-- BLOQUEADA PARA SEMPRE — o índice deixa de ser proteção e vira o defeito.
+-- Elas são metades de uma coisa só; nenhuma das duas isolada é a invariante.
+--
+-- ─── O escopo do índice é (tenant_id, agent_id, stream_key) ────────────────
+--
+-- `stream_key` já EMBUTE tenant e agent no material canônico
+-- (src/runtime/turns/stream-key.ts), então em regime normal `(stream_key)`
+-- sozinha bastaria. Embutir não é o mesmo que ESCOPAR, e a diferença aparece
+-- justamente nos casos que importam:
+--
+--   * uma colisão de hash (a issue trata colisão como risco de SEGURANÇA, não
+--     de qualidade) faria duas tenants disputarem a MESMA chave de índice —
+--     isto é, um turno da tenant A bloquearia a conversa da tenant B, e o
+--     bloqueio seria invisível porque nada na row diria "isto é de outra
+--     tenant";
+--   * um backfill, um replay manual ou uma futura versão do algoritmo podem
+--     produzir `stream_key` fora do minter canônico;
+--   * a invariante nº 1 do AGENTS.md ("toda fronteira com estado escopa por
+--     tenant_id + agent_id") vale para índices como vale para queries — e um
+--     índice é uma fronteira com estado.
+--
+-- O prefixo é também o mesmo de `agent_turns_stream_head_idx` (migration 122),
+-- de propósito: a pergunta do claim ("esta stream tem turno ativo?") e a
+-- pergunta do head-of-line ("esta stream tem turno anterior não terminal?")
+-- percorrem a mesma árvore, na mesma ordem.
+--
+-- ─── Por que `claimed`/`running` e não também `outbound_pending` ───────────
+--
+-- A issue-mãe nomeia os dois estados e para nos dois. `outbound_pending`
+-- significa "a resposta JÁ foi comprometida no outbox" — quem termina o turno
+-- dali em diante é o delivery worker (#506), nunca uma nova execução do ReAct,
+-- e ele não disputa a posse com ninguém. Incluí-lo aqui prenderia a stream pela
+-- latência do provedor de saída, que é o pior acoplamento possível: uma
+-- indisponibilidade do WhatsApp viraria uma conversa inteira parada, sem que
+-- nada estivesse errado com a conversa.
+--
+-- Consequência HONESTA da escolha, e o operador precisa dela: entre
+-- `outbound_pending` e o terminal, a stream aceita um novo claim. Isso NÃO é
+-- reordenação — o turno seguinte só é elegível quando o head-of-line entrar
+-- (#626), que é a fatia que decide QUEM pode ser reivindicado. Esta fatia
+-- decide QUANTOS podem estar ativos ao mesmo tempo, e a resposta é um.
+--
+-- ─── Parcial em `stream_key IS NOT NULL` ──────────────────────────────────
+--
+-- Turno anterior ao protocolo (sem backfill, por decisão da fatia A) tem
+-- `stream_key` NULL. Numa unique comum NULLs já não colidem entre si, então o
+-- predicado não muda a semântica — ele muda o CUSTO. O índice passa a valer o
+-- trabalho EM VOO com stream, e não o histórico de `agent_turns`, que cresce
+-- indefinidamente. É o mesmo raciocínio dos parciais das migrations 097, 114 e
+-- 122.
+--
+-- ─── CONCURRENTLY, e o que fazer se falhar ────────────────────────────────
+--
+-- `agent_turns` é escrita em todo ingresso e em toda transição. Construir o
+-- índice sob `ACCESS EXCLUSIVE` (o `CREATE INDEX` comum) bloquearia claim,
+-- transição e conclusão durante a varredura inteira. `CONCURRENTLY` varre sob
+-- `SHARE UPDATE EXCLUSIVE`, que não conflita com `ROW EXCLUSIVE` — o runtime
+-- continua trabalhando enquanto o índice nasce. Daí o marcador
+-- `maia:no-transaction`: `CREATE INDEX CONCURRENTLY` é recusado dentro de um
+-- bloco de transação, e o runner envia um statement por vez em autocommit.
+--
+-- ARMADILHA OPERACIONAL — a que a issue-mãe nomeia: um `CREATE UNIQUE INDEX
+-- CONCURRENTLY` que FALHA (inclusive por encontrar duplicata pré-existente)
+-- deixa para trás um índice INVÁLIDO, que continua custando escrita e não serve
+-- a nenhuma leitura. Ele não some sozinho e o `IF NOT EXISTS` desta linha vai
+-- ENCONTRÁ-LO e não reconstruir nada. A limpeza é manual e está no runbook
+-- (docs/runbooks/turn-state-machine.md §10.4): identificar por
+-- `pg_index.indisvalid = false`, `DROP INDEX CONCURRENTLY`, resolver a
+-- duplicata, reaplicar.
+--
+-- A duplicata pré-existente é o modo de falha REAL desta migration, não uma
+-- hipótese: qualquer par de turnos ativos da mesma stream que já esteja no
+-- banco no momento da aplicação a reprova. A consulta que os encontra ANTES de
+-- aplicar está no runbook (§10.2), e ela deve ser rodada com os consumidores
+-- pausados — pausar consumidores antes de alterar índices/constraints é parte
+-- do runbook por exigência da issue-mãe (§Risk).
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS agent_turns_stream_active_uq
+  ON agent_turns (tenant_id, agent_id, stream_key)
+  WHERE stream_key IS NOT NULL AND status IN ('claimed', 'running');
+
+-- NOTA AO PRÓXIMO AUTOR: o literal abaixo não pode conter `;` nem `--`. Este
+-- arquivo é `maia:no-transaction`, e o runner o quebra em statements com um
+-- split ingênuo por `;` depois de apagar comentários de linha
+-- (src/migrations/discover.ts, `splitNoTxStatements`). Um ponto e vírgula
+-- dentro da string partiria o COMMENT ao meio e a migration morreria no
+-- primeiro deploy que a aplicasse.
+COMMENT ON INDEX agent_turns_stream_active_uq IS
+  'Issue #625 (fatia B da #505): no máximo UM turno em claimed/running por (tenant, agent, stream_key). Metade ESTRUTURAL da exclusão por stream. A metade TEMPORAL é a recuperação de claims expirados dentro da transação de claim (agentTurnsRepo.tryClaimTurn). Rollback = derrubar este índice.';

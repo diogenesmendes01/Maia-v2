@@ -352,6 +352,17 @@ export type TurnExecutionStart =
   | { started: true }
   /** Outro worker tem a posse (ou o turno não está elegível). NÃO é erro. */
   | { started: false; reason: 'not_claimed' }
+  /**
+   * #625 — a STREAM está ocupada por outro turno ativo. O banco recusou o
+   * segundo claim.
+   *
+   * Separado de `not_claimed` porque o diagnóstico é outro: `not_claimed` diz
+   * "este turno não é meu", `stream_busy` diz "esta CONVERSA está ocupada".
+   * Colapsar os dois apagaria justamente o sinal que a issue-mãe manda vigiar
+   * durante o rollout — uma stream que serializa aparece como `stream_busy` em
+   * massa, e como nada em particular se o motivo virasse `not_claimed`.
+   */
+  | { started: false; reason: 'stream_busy' }
   /** Perdemos a posse entre o claim e o `running`. */
   | { started: false; reason: 'stale_claim' }
   /** O estado andou por baixo de nós — alguém concluiu, absorveu ou matou o turno. */
@@ -453,7 +464,14 @@ async function beginClaimedExecution(
     logger.error({ turn_id: handle.turn_id, error_code: code }, 'turn.claim_failed');
     return { started: false, reason: 'not_claimed' };
   }
-  if (!acquired.lease) return { started: false, reason: 'not_claimed' };
+  if (!acquired.lease) {
+    return {
+      started: false,
+      reason: acquired.result.ok === false && acquired.result.reason === 'stream_busy'
+        ? 'stream_busy'
+        : 'not_claimed',
+    };
+  }
 
   const lease = acquired.lease;
   handle.lease = lease;

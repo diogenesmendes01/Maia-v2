@@ -23,7 +23,7 @@
  * governance/audit -> repositories -> turn-repos.
  */
 import { and, asc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm';
-import { db, withTx } from '../client.js';
+import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
 import {
   agent_stream_sequences,
   agent_turns,
@@ -48,6 +48,8 @@ import {
   CLAIMABLE_STATUSES,
   FENCED_WRITE_STATUSES,
   LEASE_TAKEOVER_STATUSES,
+  STREAM_EXCLUSION_CONSTRAINT,
+  STREAM_OCCUPYING_STATUSES,
   type ClaimRejection,
   type ClaimResult,
   type LeaseRenewalResult,
@@ -57,6 +59,9 @@ import {
   turnWriteConditions,
   type TurnWriteFence,
 } from './turn-fence-sql.js';
+
+/** SQLSTATE de violação de unique. Ver `pgErrorCode` em `../client.ts`. */
+const PG_UNIQUE_VIOLATION = '23505';
 
 /** Colunas devolvidas pelo `RETURNING` do claim atômico. */
 type ClaimRow = {
@@ -100,7 +105,23 @@ export type TurnTransitionResult =
       to: TurnStatus;
       current_status: TurnStatus;
       current_state_version: number;
-    };
+    }
+  /**
+   * #625 — a transição foi recusada pela EXCLUSÃO POR STREAM: outro turno da
+   * mesma conversa já está ativo (`agent_turns_stream_active_uq`).
+   *
+   * Só alcançável por um caminho que escreva `claimed`/`running` FORA do claim
+   * atômico — hoje, o `markClaimed` legado (`FEATURE_TURN_CLAIM=false`). O
+   * claim de #504 tem tratamento próprio e devolve `stream_busy` como
+   * `ClaimRejection`, não como conflito de transição.
+   *
+   * Existe como resultado TIPADO, e não como exceção vazando, porque a
+   * alternativa é concreta e ruim: um `23505` cru viraria `TurnStateWriteError`
+   * em modo autoritativo, o job do BullMQ falharia e o turno entraria em loop
+   * de retry enquanto a conversa estivesse legitimamente ocupada — um turno
+   * saudável consumindo tentativas até a DLQ por causa de uma corrida normal.
+   */
+  | { ok: false; conflict: 'stream_busy'; to: TurnStatus };
 
 /**
  * #504 — projeção MÍNIMA devolvida pela leitura cross-tenant do escopo de um
@@ -507,76 +528,94 @@ export const agentTurnsRepo = {
    * processar. `not_found` distingue "não existe neste escopo" de "existe e não
    * está elegível", que é a diferença entre um bug de roteamento e uma corrida
    * normal.
+   *
+   * ─── #625 — a EXCLUSÃO POR STREAM entra aqui, e por que ela é uma TX ──────
+   *
+   * A #504 garantia exclusão por TURNO. Faltava a exclusão por CONVERSA: dois
+   * turnos DIFERENTES da mesma stream podiam ser reivindicados por réplicas
+   * diferentes, no mesmo instante (falha nº 2 da lista da #505). O PostgreSQL
+   * não expressa "no máximo um turno com lease viva por stream" numa constraint
+   * — uma constraint não depende de `now()`, e uma lease vence sem que nenhuma
+   * escrita aconteça. A issue-mãe prescreve, então, a combinação de duas
+   * metades, e este método executa as duas NA MESMA TRANSAÇÃO:
+   *
+   *   PASSO 1 (metade TEMPORAL) — recupera os claims EXPIRADOS da stream deste
+   *     turno, devolvendo-os a `retryable`. Sem isto, a linha `claimed` de um
+   *     worker morto ocuparia a chave do índice e a stream ficaria bloqueada
+   *     PARA SEMPRE: o índice deixaria de ser proteção e viraria o defeito.
+   *
+   *   PASSO 2 (metade ESTRUTURAL) — o claim de sempre. O índice único parcial
+   *     `agent_turns_stream_active_uq` (migration 124) é quem DECIDE: se outro
+   *     turno da stream já está ativo com lease viva, este UPDATE levanta
+   *     `23505` e vira `stream_busy`.
+   *
+   * ─── Por que a mesma transação, e não um sweeper à parte ────────────────
+   *
+   * O critério de pronto da issue é literal: "Claim expirado é recuperado
+   * dentro da transação, não por sweeper à parte". A razão é uma corrida:
+   * entre um sweeper recuperar a linha vencida e este claim rodar, um TERCEIRO
+   * worker pode reivindicar aquele turno de volta — e aí o índice recusa este
+   * claim por um motivo legítimo, mas a stream ficou parada um ciclo inteiro do
+   * sweeper por nada. Dentro da transação, "liberar" e "ocupar" são o mesmo
+   * instante lógico: ninguém observa a stream vazia e ninguém a ocupa no vão.
+   *
+   * ─── Por que a recuperação NÃO passa por `transitionTurn` ───────────────
+   *
+   * `transitionTurn` é compare-and-swap sobre UMA row conhecida, com versão
+   * esperada — e aqui nem sabemos quais rows existem antes de olhar. O par
+   * (from, to) continua sendo do contrato: `claimed -> retryable` e
+   * `running -> retryable` são arestas de `TURN_TRANSITIONS`, e
+   * `tests/unit/runtime/stream-exclusion-contract.spec.ts` falha se alguém as
+   * remover. `tryClaimTurn` já era, desde #504, o outro ponto do módulo que
+   * escreve `status` sem passar pelo CAS genérico, pela mesma razão: a
+   * elegibilidade do claim não cabe na tabela de transições.
+   *
+   * ─── A ordem de lock, e a janela em que ela importa ────────────────────
+   *
+   * O PASSO 1 tranca as linhas ATIVAS da stream com `FOR UPDATE` numa CTE
+   * `MATERIALIZED` **ordenada por `id`**, e tranca INCLUSIVE o próprio alvo (a
+   * exclusão do alvo mora no `WHERE` do UPDATE, onde ela não afeta locks).
+   *
+   * Com o índice de pé, o conjunto trancado tem NO MÁXIMO uma linha por stream
+   * — a exclusão garante isso —, e nesse regime não há ordem a escolher. A
+   * ordenação existe para a janela em que o conjunto pode ter mais de uma
+   * linha: antes da migration 124 ser aplicada, depois de um rollback, ou com
+   * o índice em estado inválido. Aí duas réplicas recuperando o claim expirado
+   * UMA DA OUTRA visitariam as linhas na ordem que o plano escolhesse e
+   * fechariam ciclo (`40P01`). Com o `ORDER BY`, elas adquirem os mesmos locks
+   * na mesma ordem e uma espera pela outra.
+   *
+   * `MATERIALIZED` é o que garante a ordenação: uma CTE inlinada pode ser
+   * replanejada, e a ordem — a única propriedade de que dependemos aqui —
+   * se perderia sem nenhum sintoma até a primeira janela de carga.
+   *
+   * A transação é CURTA de propósito — dois statements, nenhuma chamada de rede
+   * no meio. Ela segura locks de linha de UMA stream; streams distintas não se
+   * tocam, que é a exigência "sem lock global por tenant, agente ou fila".
    */
   async tryClaimTurn(input: {
     turn_id: string;
     worker_id: string;
     lease_ms: number;
   }): Promise<ClaimResult> {
-    const { tenant_id, agent_id } = scope();
-    const leaseSeconds = input.lease_ms / 1000;
-    const result = await db.execute<ClaimRow>(sql`
-      UPDATE ${agent_turns}
-         SET status            = 'claimed',
-             claimed_by        = ${input.worker_id},
-             claim_token       = gen_random_uuid(),
-             claimed_at        = now(),
-             heartbeat_at      = now(),
-             lease_expires_at  = now() + make_interval(secs => ${leaseSeconds}),
-             attempt_count     = attempt_count + 1,
-             state_version     = state_version + 1,
-             next_attempt_at   = NULL,
-             updated_at        = now()
-       WHERE tenant_id = ${tenant_id}
-         AND agent_id  = ${agent_id}
-         AND id        = ${input.turn_id}
-         AND (
-               (status IN (${statusList(CLAIMABLE_STATUSES)})
-                 AND (status <> 'retryable' OR next_attempt_at IS NULL OR next_attempt_at <= now()))
-            OR (status IN (${statusList(LEASE_TAKEOVER_STATUSES)})
-                 AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at <= now())
-         )
-      RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
-                claimed_by, claimed_at, lease_expires_at, state_version
-    `);
-    const row = (result.rows as unknown as ClaimRow[])[0];
-    if (!row) {
-      // Distinguir "não existe aqui" de "não elegível" custa uma leitura
-      // ESCOPADA, feita só no caminho de fracasso. Sem ela, um turno de outro
-      // tenant e uma corrida perdida seriam o mesmo evento na métrica — e o
-      // primeiro é bug de roteamento, o segundo é operação normal.
-      const exists = await db
-        .select({ id: agent_turns.id })
-        .from(agent_turns)
-        .where(
-          and(
-            eq(agent_turns.tenant_id, tenant_id),
-            eq(agent_turns.agent_id, agent_id),
-            eq(agent_turns.id, input.turn_id),
-          ),
-        )
-        .limit(1);
-      const reason: ClaimRejection = exists.length === 0 ? 'not_found' : 'not_eligible';
-      incCounter('maia_turn_claim_total', { result: reason });
-      return { ok: false, reason };
+    try {
+      return await withTx((tx) => claimWithinStreamExclusion(tx, input));
+    } catch (err) {
+      // NARROW de propósito: só o índice de exclusão por stream vira
+      // `stream_busy`. `agent_turns` tem outras uniques
+      // (`agent_turns_representative_uq`, `agent_turns_scope_id_uq`), e mapear
+      // todo `23505` para "stream ocupada" transformaria um defeito de
+      // idempotência do ingresso numa corrida rotineira na métrica — a falha
+      // ficaria invisível exatamente onde ela é grave.
+      if (
+        pgErrorCode(err) === PG_UNIQUE_VIOLATION &&
+        pgErrorConstraint(err) === STREAM_EXCLUSION_CONSTRAINT
+      ) {
+        incCounter('maia_turn_claim_total', { result: 'stream_busy' });
+        return { ok: false, reason: 'stream_busy' };
+      }
+      throw err;
     }
-    incCounter('maia_turn_claim_total', { result: 'acquired' });
-    return {
-      ok: true,
-      claim: {
-        turn_id: row.id,
-        tenant_id: row.tenant_id,
-        agent_id: row.agent_id,
-        attempt: Number(row.attempt_count),
-        claim_token: row.claim_token,
-        worker_id: row.claimed_by,
-        claimed_at: new Date(row.claimed_at),
-        lease_expires_at: new Date(row.lease_expires_at),
-        status: row.status as TurnStatus,
-        state_version: Number(row.state_version),
-      },
-    };
   },
 
   /**
@@ -1440,6 +1479,194 @@ export const agentTurnsRepo = {
 // ─── internals ───────────────────────────────────────────────────────────────
 
 /**
+ * #625 — PASSO 1 do claim: recupera os claims EXPIRADOS da stream deste turno.
+ *
+ * ─── O que "recuperar" significa, e por que `retryable` ──────────────────
+ *
+ * A linha vencida vai para `retryable` com `next_attempt_at = now()`. Três
+ * consequências, todas queridas:
+ *
+ *   1. ela SAI do predicado do índice `agent_turns_stream_active_uq`, então a
+ *      stream deixa de estar ocupada por um dono que não existe mais;
+ *   2. ela continua ELEGÍVEL: o varredor de recovery já procura por
+ *      `retryable` com `next_attempt_at` vencido (`findRecoverableTurns`), e o
+ *      próprio claim aceita `retryable` direto. O trabalho não é descartado —
+ *      só devolvido à fila;
+ *   3. `state_version` avança, então qualquer CAS otimista que o worker morto
+ *      ainda carregue passa a falhar.
+ *
+ * O `claim_token` e o `claimed_by` são PRESERVADOS de propósito, pelo mesmo
+ * motivo de `releaseTurnClaim`: são a forense de "quem tinha este turno quando
+ * o pod morreu?". Apagá-los devolveria a row a um estado que finge que nunca
+ * houve dono. E eles não reabrem porta nenhuma — toda gravação fenced exige
+ * `status IN (FENCED_WRITE_STATUSES)`, e `retryable` não está lá.
+ *
+ * `attempt_count` NÃO é incrementado: a tentativa morta já foi contada quando
+ * ela foi reivindicada. Contar de novo aqui gastaria o orçamento de tentativas
+ * do turno com o crash de um worker, e um turno inocente iria para DLQ por
+ * causa de um deploy.
+ *
+ * ─── A ordem de lock ────────────────────────────────────────────────────
+ *
+ * A CTE `ativos` tranca TODAS as linhas ativas da stream — inclusive o próprio
+ * alvo — em ordem de `id`. Trancar o alvo junto, e não excluí-lo do conjunto,
+ * é o que faz o conjunto trancado ser o MESMO para toda transação que toque
+ * esta stream: se cada uma pulasse o próprio alvo, duas réplicas em takeover
+ * cruzado (A recuperando o claim de B enquanto B recupera o de A) adquiririam
+ * conjuntos diferentes e poderiam fechar ciclo. A exclusão do alvo acontece só
+ * no `WHERE` do UPDATE, onde ela não afeta locks.
+ *
+ * Com o índice de pé o conjunto tem no máximo UMA linha, então a ordem é
+ * inócua; ela protege a janela em que o índice não existe (pré-migration,
+ * pós-rollback, índice inválido) — ver o bloco em `tryClaimTurn`.
+ *
+ * `MATERIALIZED` não é decoração: uma CTE inlinada pode ser replanejada, e o
+ * `ORDER BY` — a única coisa que faz o lock ser determinístico — se perderia.
+ *
+ * Devolve os ids recuperados (vazio é o caso normal) para que o caller possa
+ * auditar o desbloqueio. Nenhuma auditoria acontece AQUI: o repositório é
+ * puro-DB, e `audit()` vive em `src/runtime/turns/lease.ts`.
+ */
+async function recoverExpiredStreamClaims(
+  tx: Executor,
+  args: { tenant_id: string; agent_id: string; turn_id: string },
+): Promise<string[]> {
+  const result = await tx.execute<{ id: string; previous_status: string }>(sql`
+    WITH alvo AS MATERIALIZED (
+      SELECT t.stream_key
+        FROM ${agent_turns} t
+       WHERE t.tenant_id = ${args.tenant_id}
+         AND t.agent_id  = ${args.agent_id}
+         AND t.id        = ${args.turn_id}
+         AND t.stream_key IS NOT NULL
+    ),
+    ativos AS MATERIALIZED (
+      SELECT t.id, t.status, t.lease_expires_at
+        FROM ${agent_turns} t
+        JOIN alvo ON t.stream_key = alvo.stream_key
+       WHERE t.tenant_id = ${args.tenant_id}
+         AND t.agent_id  = ${args.agent_id}
+         AND t.status IN (${statusList(STREAM_OCCUPYING_STATUSES)})
+       ORDER BY t.id
+         FOR UPDATE OF t
+    )
+    UPDATE ${agent_turns} u
+       SET status             = 'retryable',
+           next_attempt_at    = now(),
+           lease_expires_at   = now(),
+           last_error_code    = 'stream_lease_expired',
+           last_error_summary = 'claim expirado recuperado na transacao de claim da stream (#625)',
+           state_version      = u.state_version + 1,
+           updated_at         = now()
+      FROM ativos
+     WHERE u.id        = ativos.id
+       AND u.tenant_id = ${args.tenant_id}
+       AND u.agent_id  = ${args.agent_id}
+       AND u.id       <> ${args.turn_id}
+       AND ativos.lease_expires_at IS NOT NULL
+       AND ativos.lease_expires_at <= now()
+    RETURNING u.id, ativos.status AS previous_status
+  `);
+  const rows = Array.from(
+    result.rows as unknown as Array<{ id: string; previous_status: string }>,
+  );
+  for (const row of rows) {
+    incCounter('maia_turn_stream_claim_recovered_total', { from: row.previous_status });
+  }
+  return rows.map((row) => row.id);
+}
+
+/**
+ * #625 — o corpo transacional de `tryClaimTurn`: recuperar, depois reivindicar.
+ *
+ * Vive fora do objeto do repositório porque precisa receber o `tx` — e porque a
+ * ordem dos dois passos é o contrato inteiro desta fatia. Invertê-los (claim
+ * primeiro, recuperação depois) reproduziria exatamente o defeito: o claim
+ * bateria no índice ocupado por um dono morto e a stream nunca destravaria.
+ */
+async function claimWithinStreamExclusion(
+  tx: Executor,
+  input: { turn_id: string; worker_id: string; lease_ms: number },
+): Promise<ClaimResult> {
+  const { tenant_id, agent_id } = scope();
+  const leaseSeconds = input.lease_ms / 1000;
+
+  const recovered = await recoverExpiredStreamClaims(tx, {
+    tenant_id,
+    agent_id,
+    turn_id: input.turn_id,
+  });
+  // Presente só quando houve o que recuperar: um campo vazio em todo resultado
+  // convidaria o caller a tratar `[]` como evento, e o normal é NÃO haver
+  // claim expirado nenhum.
+  const trail = recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
+
+  const result = await tx.execute<ClaimRow>(sql`
+    UPDATE ${agent_turns}
+       SET status            = 'claimed',
+           claimed_by        = ${input.worker_id},
+           claim_token       = gen_random_uuid(),
+           claimed_at        = now(),
+           heartbeat_at      = now(),
+           lease_expires_at  = now() + make_interval(secs => ${leaseSeconds}),
+           attempt_count     = attempt_count + 1,
+           state_version     = state_version + 1,
+           next_attempt_at   = NULL,
+           updated_at        = now()
+     WHERE tenant_id = ${tenant_id}
+       AND agent_id  = ${agent_id}
+       AND id        = ${input.turn_id}
+       AND (
+             (status IN (${statusList(CLAIMABLE_STATUSES)})
+               AND (status <> 'retryable' OR next_attempt_at IS NULL OR next_attempt_at <= now()))
+          OR (status IN (${statusList(LEASE_TAKEOVER_STATUSES)})
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at <= now())
+       )
+    RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
+              claimed_by, claimed_at, lease_expires_at, state_version
+  `);
+  const row = (result.rows as unknown as ClaimRow[])[0];
+  if (!row) {
+    // Distinguir "não existe aqui" de "não elegível" custa uma leitura
+    // ESCOPADA, feita só no caminho de fracasso. Sem ela, um turno de outro
+    // tenant e uma corrida perdida seriam o mesmo evento na métrica — e o
+    // primeiro é bug de roteamento, o segundo é operação normal.
+    const exists = await tx
+      .select({ id: agent_turns.id })
+      .from(agent_turns)
+      .where(
+        and(
+          eq(agent_turns.tenant_id, tenant_id),
+          eq(agent_turns.agent_id, agent_id),
+          eq(agent_turns.id, input.turn_id),
+        ),
+      )
+      .limit(1);
+    const reason: ClaimRejection = exists.length === 0 ? 'not_found' : 'not_eligible';
+    incCounter('maia_turn_claim_total', { result: reason });
+    return { ok: false, reason, ...trail };
+  }
+  incCounter('maia_turn_claim_total', { result: 'acquired' });
+  return {
+    ok: true,
+    claim: {
+      turn_id: row.id,
+      tenant_id: row.tenant_id,
+      agent_id: row.agent_id,
+      attempt: Number(row.attempt_count),
+      claim_token: row.claim_token,
+      worker_id: row.claimed_by,
+      claimed_at: new Date(row.claimed_at),
+      lease_expires_at: new Date(row.lease_expires_at),
+      status: row.status as TurnStatus,
+      state_version: Number(row.state_version),
+    },
+    ...trail,
+  };
+}
+
+/**
  * #505 — aloca a PRÓXIMA sequência de ingresso da stream, dentro da transação
  * do chamador.
  *
@@ -1634,8 +1861,6 @@ async function runTransition(args: {
   absorber_fence?: { turn_id: string; claim_token: string };
   patch: TurnTransitionPatch;
 }): Promise<TurnTransitionResult> {
-  const { tenant_id, agent_id } = scope();
-  const terminal = isTerminalTurnStatus(args.to);
   // O fence desta gravação, numa forma só. `turnWriteConditions` é a fonte
   // ÚNICA do `WHERE` — nada é acrescentado a ele depois desta chamada, e é o
   // que permite a `tests/unit/db/turn-fence-sql.spec.ts` compilar o predicado
@@ -1651,6 +1876,41 @@ async function runTransition(args: {
         ? { kind: 'self', claim_token: args.expected_claim_token }
         : { kind: 'none' };
 
+  try {
+    return await runTransitionTx(args, fence);
+  } catch (err) {
+    // NARROW: só o índice de exclusão por stream. Ver o comentário do tipo
+    // `TurnTransitionResult` e o de `tryClaimTurn`.
+    if (
+      pgErrorCode(err) === PG_UNIQUE_VIOLATION &&
+      pgErrorConstraint(err) === STREAM_EXCLUSION_CONSTRAINT
+    ) {
+      incCounter('maia_turn_transitions_total', {
+        from: 'any',
+        to: args.to,
+        outcome: 'stream_busy',
+      });
+      return { ok: false, conflict: 'stream_busy', to: args.to };
+    }
+    throw err;
+  }
+}
+
+async function runTransitionTx(
+  args: {
+    turn_id: string;
+    to: TurnStatus;
+    outcome: TurnOutcome | null;
+    sources: readonly TurnStatus[];
+    expected_version?: number;
+    expected_claim_token?: string;
+    absorber_fence?: { turn_id: string; claim_token: string };
+    patch: TurnTransitionPatch;
+  },
+  fence: TurnWriteFence,
+): Promise<TurnTransitionResult> {
+  const { tenant_id, agent_id } = scope();
+  const terminal = isTerminalTurnStatus(args.to);
   return withTx(async (tx) => {
     const set: Record<string, unknown> = {
       status: args.to,
