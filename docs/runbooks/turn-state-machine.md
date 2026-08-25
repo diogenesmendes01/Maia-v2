@@ -699,6 +699,15 @@ A metade temporal continua rodando após o DROP, e continua correta: ela apenas
 devolve à fila turnos cuja lease venceu — o que o recovery já fazia. Não há
 "meio rollback" a considerar.
 
+**Interação com `FEATURE_TURN_CLAIM=false`** (o kill switch de #504, §9): com a
+flag desligada, quem escreve `claimed` é o `markClaimed` legado, que passa pelo
+CAS genérico e não pelo claim atômico. O índice continua valendo para ele — a
+transição é recusada com o conflito tipado `stream_busy` em vez de virar um
+`23505` cru, então nada explode e o turno continua elegível. Ainda assim, se
+você desligar a flag por incidente, **derrube o índice junto**: o regime legado
+não tem a metade temporal (não recupera claim expirado), e uma lease vencida
+passaria a prender a stream até o recovery rearmar o MESMO turno.
+
 O `_down` da `124` **não** tem envelope `BEGIN`/`COMMIT`, pela mesma razão do
 `_down` da `122`: `DROP INDEX CONCURRENTLY` é recusado dentro de transação, e
 trocar por `DROP INDEX` simples para poder envelopar tomaria `ACCESS EXCLUSIVE`
