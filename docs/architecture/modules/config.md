@@ -17,6 +17,7 @@
 | `src/config/services.ts` | Minimum configuration per service; `manifestForService`, `assertServiceMayRead` |
 | `src/config/load.ts` | `loadServiceConfig()` + `ConfigValidationError` + `bootSummary()` |
 | `src/config/migration-config.ts` · `admin-config.ts` · `backup-config.ts` | Named loaders for the migration runner (#516), the Admin UI and backup/restore |
+| `src/config/migrator-subset.ts` | The `migrator` subset's **ceiling and floor**, expressed by the ORIGIN of each key — contract `group` (only `core` + `database`), Maia namespace (only `MAIA_`), secrets-must-be-database — plus the floor (`DATABASE_URL`, required in every profile). Called by `loadMigrationConfig()`, so a subset that gained an application key makes the migrator refuse to run (#565) |
 | `src/config/generate.ts` | Deterministic generators for every artifact |
 | `src/config/env-file.ts` | `parseEnvFile()` — delegates to `dotenv.parse`, the same parser the boot uses, so CLI and runtime cannot disagree about a `.env` line |
 | `src/config/env.ts` | **Thin** boot loader: `dotenv/config` + the runtime schema from the contract; exports the `config` singleton. Importing it costs the WHOLE `runtime` subset validation — which is why only runtime processes may reach it |
@@ -116,6 +117,8 @@ fixture files themselves, accepts them. `--allow-placeholders` (used for
 | `tests/unit/config/contract-env.spec.ts` | `contractEnv` yields the same value as the service schema, variable by variable, and reading one does not require another service's subset |
 | `tests/unit/config/admin-import-boundary.spec.ts` | No import path from `src/admin-ui/**` reaches `src/config/env.ts`, and the runtime entrypoints that still do are pinned by name |
 | `tests/admin-ui/unit/admin-boot-config.spec.ts` | The Next.js `register()` hook validates the `admin-ui` subset: boots with zero runtime-only variables, refuses the four missing `OIDC_*` and `OIDC_TENANT_SLUGS=default` |
+| `tests/unit/config/migrator-subset.spec.ts` | The `migrator` subset's invariant by CATEGORY over the real contract (no application domain, no foreign Maia namespace, no non-database secret, floor intact), the guard's own canaries, and `.env.migrator.prod.example` read from disk |
+| `tests/unit/scripts/migrate-subset-boot.spec.ts` | The real CLI (`tsx scripts/migrate.ts`) boots in a separate process with `.env.migrator.prod.example` and nothing else — it must not demand the application contract |
 
 ## In-flight changes
 

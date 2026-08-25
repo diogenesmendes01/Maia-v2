@@ -30,6 +30,7 @@ import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { loadMigrationConfig, migrationRunOptions } from '@/config/migration-config.js';
 import { ConfigValidationError } from '@/config/load.js';
+import { MigratorSubsetError } from '@/config/migrator-subset.js';
 import {
   getSchemaReadiness,
   repairMigration,
@@ -221,6 +222,19 @@ if (isDirectInvocation(process.argv[1], import.meta.url) && !process.env.MIGRATE
       // desperdiçando o diagnóstico acionável que o contrato da #515 existe
       // para dar.
       if (err instanceof ConfigValidationError) {
+        console.error(`migrate: ${err.message}`);
+        process.exitCode = 2;
+        return;
+      }
+      // Mesma exceção à redaction, e pela mesma razão: a mensagem de
+      // `MigratorSubsetError` é feita só de NOME de variável, grupo e regra
+      // (`src/config/migrator-subset.ts`), nunca do valor lido. A diferença é
+      // o que o operador faz com ela: aqui não há `.env` a consertar — o
+      // subset `migrator` do contrato DESTA build ganhou uma chave de
+      // aplicação, e a correção é em `src/config/contract.ts`. Sai 2 junto com
+      // a outra: as duas são "a configuração está errada", não "o runner
+      // falhou".
+      if (err instanceof MigratorSubsetError) {
         console.error(`migrate: ${err.message}`);
         process.exitCode = 2;
         return;
