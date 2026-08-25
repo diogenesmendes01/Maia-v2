@@ -564,7 +564,121 @@ pode entrar ali: ela FECHA uma janela em vez de abrir (sem ela a linha fica
 - **Nenhum consumidor de fila foi registrado.** `deliverOutbound` é a
   responsabilidade isolada e o `jobId` é determinístico, mas quem enfileira e
   quem consome é #633/#634 — registrar um worker aqui exigiria uma flag de
-  rollout cujo escopo é daquelas fatias.
+  rollout cujo escopo é daquelas fatias. **Fechado por #633** (ver abaixo).
+
+#### A recuperação (#633) — o que fazer com o que ficou para trás
+
+Quatro operações por tick de `outbound_recovery`
+(`src/workers/outbound-recovery.ts`, 1 min, gated por `FEATURE_OUTBOUND_RECOVERY`):
+
+1. **rearmar o entregável** — `pending`/`retryable` com o gate de backoff vencido
+   E `claimed`/`sending` com lease morta (takeover). As duas famílias saem juntas
+   porque o consumidor faz a MESMA coisa com as duas: rearmar o job. A diferença
+   entre "nunca teve dono" e "o dono morreu" é resolvida DENTRO do claim atômico
+   (`claimDisposition`), que é onde ela precisa ser resolvida;
+2. **reconciliar o incerto** — `delivery_unknown`, `reconciling` e a janela
+   `delivered -> completed`;
+3. **DLQ** — teto de tentativas (12) e prazo de reconciliação (24h), auditados;
+4. **divergência turno↔outbound**, nos dois sentidos, como OBSERVAÇÃO.
+
+##### Por que sweepers concorrentes não duplicam — sem advisory lock
+
+O sweeper legado (#292) usa um advisory lock GLOBAL, e ali faz sentido: aquele
+sweep promove rows por predicado de idade, e duas promoções concorrentes da
+mesma row seriam dois efeitos. Aqui a garantia é mais forte e mais barata:
+
+- toda MUTAÇÃO é `UPDATE ... WHERE status = <origem esperada>` (CAS). Duas
+  réplicas que decidam o mesmo produzem UM vencedor e um `UPDATE` que volta zero
+  linhas — no lock de row do PostgreSQL, não em disciplina de código;
+- o REARME é idempotente pelo `jobId` determinístico;
+- a ENTREGA é protegida pelo claim atômico de #632, que já é a camada que
+  sobrevive a jobs duplicados de qualquer origem.
+
+Um lock global não acrescentaria segurança e custaria disponibilidade: enquanto
+uma réplica varre, as outras não fariam nada — e a recuperação é justamente o
+que precisa continuar funcionando quando uma réplica está doente.
+
+##### A decisão da reconciliação, e o que ela NÃO consegue expressar
+
+`reconciliationDisposition` (`src/runtime/outbound/recovery-contract.ts`) é pura
+e tem quatro saídas: `await_grace`, `resend_idempotent`, `escalate_manual`,
+`dead_letter`. **Não existe `resend_blind`** — não é omissão nem TODO: o tipo
+não consegue expressá-lo, então nenhum call site consegue pedi-lo.
+
+A ordem das perguntas é a garantia:
+
+1. **prazo total / teto de tentativas primeiro** — uma linha que estourou o
+   orçamento não ganha mais uma chance por ser de tipo idempotente; reordenar
+   produziria um laço infinito de reenvios "seguros";
+2. **carência depois** — nem escalada acontece antes dela, para não encher a
+   fila humana com linhas que o worker vivo ainda vai fechar;
+3. **a política de reenvio por último, e DELEGADA** a `autoResendAllowed` (#632).
+   Reimplementar a condição aqui — mesmo "para deixar explícito" — criaria duas
+   cópias que divergem no dia em que um canal novo entrar, e a divergência nesse
+   ponto é a mensagem duplicada no telefone do usuário.
+
+##### O rearmamento manual é a falha #12 da épica, virada tipo
+
+`rearmOutboundByOperator` (`src/ops/outbound-rearm.ts`) recusa quando o estado é
+INCERTO **e** o provedor não deduplica aquele `payload_type`, a menos que o
+operador reconheça o risco EXPLICITAMENTE (`acknowledge_duplicate_risk === true`
+— `undefined` é recusa). O reconhecimento vai para a auditoria
+`outbound_manual_rearm` junto com `actor`, `reason` e `from_status`.
+
+`failed_terminal` **não** é rearmável: recusa definitiva do provedor, e rearmar
+é pedir a mesma recusa num laço.
+
+##### O heartbeat, e o que ele protege
+
+`withDeliveryHeartbeat` (`src/runtime/outbound/delivery.ts`) renova a lease a
+cada terço do TTL enquanto a chamada ao provedor está em voo. Sem ele, uma
+chamada mais longa que `TURN_LEASE_TTL_MS` perdia a posse **com o desfecho já
+conhecido**: o fence impedia o duplo envio, mas a tentativa viva era descartada
+e a linha ficava incerta quando alguém sabia a resposta. Uma renovação recusada
+NÃO aborta a chamada — o efeito externo já pode ter ocorrido, e abortar só
+trocaria um desfecho conhecido por um `aborted`.
+
+##### O índice da varredura, e o que o EXPLAIN mostrou
+
+Migração 131: `idx_outbound_messages_expired_claims (lease_expires_at,
+tenant_id, agent_id) WHERE status IN ('claimed','sending')`. `lease_expires_at`
+na FRENTE porque o dispatcher cross-tenant não tem igualdade em `tenant_id` para
+ancorar a sondagem — mesmo diagnóstico da 114 para `agent_turns`.
+
+**MEDIDO:** sem esse índice o planejador NÃO cai em Seq Scan; cai em
+`idx_outbound_messages_tenant_agent_status_created` (067) com `lease_expires_at`
+como filtro, exatamente como #632 previu. O ganho é SELETIVIDADE — a 067 indexa
+toda row, inclusive as terminais que são a maioria sob retenção, então o custo
+cresce com o HISTÓRICO; o parcial cresce com o trabalho EM VOO. A sonda de
+EXPLAIN exige o índice NOMEADO por isso: só "sem Seq Scan" ficaria verde sem ele.
+
+##### O sweeper LEGADO deixou de tocar a linha durável
+
+`outbound_messages_sweeper` (#292) promovia a `unknown` toda row `pending` mais
+velha que `OUTBOUND_SWEEPER_STALE_PENDING_SEC`. Depois da #630 a mesma tabela
+hospeda o outbox durável, cuja row NASCE em `pending` esperando o worker — e
+`unknown` é TERMINAL para o claim (`DELIVERY_TERMINAL_STATUSES`). O housekeeping
+do ledger antigo estava a caminho de virar uma máquina de perder respostas do
+ledger novo, em silêncio. Todas as consultas daquele worker agora filtram
+`turn_id IS NULL`.
+
+#### Limitações declaradas de #633
+
+- **`delivered` sem histórico não é reparado automaticamente.** A varredura
+  detecta, loga com `ops_alert` e para. Fabricar o histórico exigiria
+  re-renderizar o texto do payload num segundo lugar (a lógica de
+  `buildHistorico` já existe em `delivery.ts`), e reconstrução de conteúdo é
+  #635.
+- **Não há retenção para a linha DURÁVEL.** O sweeper legado agora a ignora, e
+  a retenção do outbox durável (#506 §Retenção) não tem dono. A tabela cresce.
+- **`storage_object` continua irresolúvel** (dívida de #632, é #634).
+- **Os limites de política são constantes, não env vars** —
+  `OUTBOUND_MAX_DELIVERY_ATTEMPTS`, `RECONCILIATION_GRACE_MS`,
+  `RECONCILIATION_DEADLINE_MS`. Uma env var aqui seria a alavanca com que
+  alguém, no meio de um incidente, silencia o alarme subindo o teto.
+- **Nada enfileira no caminho QUENTE.** O commit de #631 continua sem
+  `enqueueOutboundDelivery`; quem arma é a varredura (até 1 min de latência) ou o
+  operador. Ligar o commit à fila é #634.
 
 #### A flag, e por que ela não pode ser desligada em produção
 
@@ -577,6 +691,12 @@ switch — é o caminho fail-open com outro nome. Por isso duas regras cross-fie
 |---|---|
 | `outbound-commit/production-required` | `false` no profile `production` ⇒ **erro de BOOT**. Escopo `boot` de propósito: a regra vale também sob `MAIA_CONFIG_STRICT_BOOT=false`, senão a alavanca de emergência do contrato viraria a alavanca para desligar a durabilidade. Em staging avisa; em development é silencioso |
 | `outbound-commit/requires-state-machine` | `true` com `FEATURE_TURN_STATE_MACHINE=false` é INERTE (sem `turn_id` a FK composta da 121 torna a row inexprimível) ⇒ erro de contrato |
+| `outbound-recovery/requires-delivery-worker` | (#633) `FEATURE_OUTBOUND_RECOVERY=true` com `FEATURE_OUTBOUND_DELIVERY_WORKER=false` enfileira jobs que ninguém consome ⇒ erro de contrato. **O consumidor precede o produtor** |
+| `outbound-recovery/requires-durable-commit` | (#633) `FEATURE_OUTBOUND_DELIVERY_WORKER=true` com `FEATURE_OUTBOUND_DURABLE_COMMIT=false` é INERTE (sem #631 não há linha a entregar) ⇒ erro de contrato |
+
+As duas flags de #633 nascem **OFF** e nenhuma é `boot`-required: desligá-las
+NÃO restaura fail-open (o caminho síncrono de #631/#632 continua entregando com
+posse e fence). O que se perde é a RECUPERAÇÃO automática.
 
 #### As duas identidades, e por que são duas
 
@@ -750,6 +870,10 @@ Rules this module enforces:
 | `tests/unit/config/outbound-durable-commit-rule.spec.ts` | #631: a flag não pode ser fail-open — default ON, `false` em production é erro de escopo `boot` (sobrevive a `MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e inerte sem a máquina de estados é erro |
 | `tests/unit/runtime/outbound-delivery-contract.spec.ts` | #632: o contrato PURO da entrega — elegibilidade do claim alinhada ao índice de #630, nenhum estado terminal reivindicável, a matriz TOTAL (7 desfechos × 6 tipos) da política de reenvio, a capability declarada para todo `payload_type` (nenhum default otimista), e o jobId determinístico por `outbound_id` (colisão do multipart, namespace disjunto do turno, fail-loud em id malformado, payload `.strict()`) |
 | `tests/integration/outbound-delivery-claim-lease-fence-real-db.spec.ts` | #632 com Postgres real, entrando por `deliverOutbound`: claim concorrente com **2, 10 e 50** workers (exatamente um vence, `attempt` prova UM update); takeover por lease com o token velho recusado nas TRÊS gravações (confirmar, reenviar, renovar); **crash depois de o provider aceitar não vira reenvio** (o fake conta 1 chamada e a linha termina `delivery_unknown`); `delivered` não é marcado por chamada iniciada; caminho feliz até `completed` com histórico único e a chave idempotente entregue ao adaptador |
+| `tests/unit/runtime/outbound-recovery-contract.spec.ts` | #633: o contrato PURO da recuperação — a matriz TOTAL (tipos × desfechos incertos) provando que nenhum tipo sem chave nativa alcança `resend_idempotent`, a concordância obrigatória com `autoResendAllowed` (a política tem um dono só), a ordem das perguntas (teto vence idempotência; prazo vence carência), e a confirmação de risco FAIL-CLOSED (`undefined` e `false` são recusa) |
+| `tests/integration/outbound-recovery-reconciliation-real-db.spec.ts` | #633 com Postgres real, sob tenant PRÓPRIO (as contagens são invariantes absolutas, não deltas), entrando por `runOutboundRecoveryForScope` e `rearmOutboundByOperator`: reenvio cego impossível, capability discriminando `text` × `audio` no MESMO tick, takeover com o fence antigo recusado, 10 varreduras concorrentes produzindo UMA promoção e UMA auditoria, DLQ por teto e por prazo, rearmamento manual recusado sem confirmação e auditado com ela, divergência turno↔outbound nos dois sentidos, e a janela `delivered -> completed` |
+| `tests/integration/outbound-delivery-job-real-redis.spec.ts` | #633 com Redis/BullMQ e Postgres reais: dois `add` do mesmo `outbound_id` colidem num job só; o consumidor de PRODUÇÃO concede UMA posse (`attempt = 1`) mesmo com o job entregue duas vezes; um job RETIDO em `completed` não veta o rearme legítimo; payload malformado não derruba o worker |
+| `tests/integration/outbound-recovery-explain-real-db.spec.ts` | #633: o PLANO das quatro varreduras sob ~20k rows, explicando o SQL de PRODUÇÃO (as mesmas funções que o repositório executa). Exige o índice NOMEADO e RECUSA o de fallback — porque, medido, a ausência do índice da 131 não produz Seq Scan, produz a 067 com `lease_expires_at` como filtro |
 | `tests/unit/observability/outbound-delivery-metrics-sem-pii.spec.ts` | #632: as duas séries que a issue exige existem com o nome e o rótulo (`maia_outbound_lease_lost_total{reason}`, `maia_outbound_delivery_unknown_total{channel}`), e o texto RENDERIZADO do `/metrics` não contém telefone, JID nem conteúdo — nem quando eles são passados como chave (deny list) nem como valor de um label permitido (guarda de PII por valor) |
 
 ## In-flight changes
