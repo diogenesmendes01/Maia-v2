@@ -175,6 +175,43 @@ O job roda **apenas** forward. Ele não executa nenhum `_down.sql`, não
 substitui o backup exigido antes de uma migration destrutiva, e não muda
 nada do procedimento manual descrito no resto deste runbook.
 
+### Fora do Compose: o recurso de migration é SEPARADO (issue #565)
+
+A infraestrutura real (Coolify) **não roda o `compose.prod.yml`**: ela tem um
+recurso próprio, só de migration, ao lado dos recursos `app` e `admin-ui`. Ele
+roda o mesmo comando (`npm run db:migrate`), a partir da mesma imagem, e
+recebe **apenas o subset `migrator` do contrato** — o arquivo versionado é
+[`.env.migrator.prod.example`](../../.env.migrator.prod.example), e o passo a
+passo está em [`deploy-prod.md` §7.5](deploy-prod.md#75-o-recurso-de-migration-separado--a-topologia-adotada).
+
+O que isso significa aqui, para quem opera migrations:
+
+- **o container de migration não tem os segredos da aplicação.** Nenhuma
+  `WHATSAPP_*`/`BAILEYS_*`, nenhuma `OWNER_*`, nenhuma chave de LLM, nenhuma
+  `VOYAGE_API_KEY`, nenhuma `BACKUP_S3_*`, nenhum `NEXTAUTH_SECRET`, nenhuma
+  `OIDC_*`. Num incidente em que se pergunta "o que esse container podia
+  vazar?", a resposta é: a credencial do banco que ele estava migrando, e mais
+  nada;
+- **o boot dele valida esse subset e só ele.** `scripts/migrate.ts` chama
+  `loadMigrationConfig()` → `loadServiceConfig('migrator')`. Um migrator que
+  morresse cobrando `WHATSAPP_*` seria o defeito da #596 do outro lado, e
+  `tests/unit/scripts/migrate-subset-boot.spec.ts` roda a CLI de verdade com o
+  `.env.migrator.prod.example` para que isso não volte em silêncio;
+- **o teto do subset é travado por categoria, não por lista de nomes.**
+  [`src/config/migrator-subset.ts`](../../src/config/migrator-subset.ts) mede a
+  ORIGEM de cada chave (grupo do contrato, namespace, segredo-só-de-banco).
+  Acrescentar uma chave de aplicação ao subset `migrator` não aumenta o raio de
+  explosão do deploy: faz o migrator **recusar rodar**, com exit 2 e a
+  variável nomeada. O guard de CI é
+  `tests/unit/config/migrator-subset.spec.ts`;
+- **a ordem do deploy vira disciplina.** `service_completed_successfully` é
+  primitiva do Compose e não existe no painel. Deploy o recurso de migration
+  primeiro e só siga se ele sair 0 — ver `deploy-prod.md` §7.5.
+
+O `docker compose` continua sendo o caminho do bring-up local e do compose de
+produção versionado aqui; o recurso separado é o que roda na infraestrutura
+real. Os dois executam o MESMO comando, de propósito.
+
 ### Checksums on migrations that predate them
 
 The first `up` after this change adopts the packaged checksum for every

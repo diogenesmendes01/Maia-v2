@@ -206,6 +206,15 @@ read-only. Verificação pós-deploy (portas, non-root), migração de volumes d
 deployments antigos e rollback:
 [`docs/runbooks/deploy-prod.md`](docs/runbooks/deploy-prod.md).
 
+**Não é por Compose?** A infraestrutura real (Coolify) tem um **recurso de
+migration separado**, e ele recebe só o subset `migrator` do contrato — nenhum
+segredo de aplicação. O arquivo é
+[`.env.migrator.prod.example`](.env.migrator.prod.example) e o passo a passo
+(inclusive a ordem do deploy, que fora do Compose é disciplina e não aresta)
+está em [`docs/runbooks/deploy-prod.md`](docs/runbooks/deploy-prod.md) §7.5.
+Aqui no Compose não há o que copiar: o serviço `migrate` não tem `env_file` de
+propósito.
+
 ---
 
 ## Admin UI

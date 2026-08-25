@@ -467,6 +467,15 @@ Dockerfile e seu próprio editor de variáveis. Nessa topologia não existe
 "não passar" um segredo para o passo de migration: ele nasce dentro do
 ambiente completo da aplicação.
 
+> **DECISÃO DO DONO — a infraestrutura real tem um TERCEIRO recurso, só de
+> migration.** Com ele, "não passar o segredo" volta a existir: o recurso de
+> migration tem editor de variáveis próprio e recebe **apenas o subset
+> `migrator`**. O que muda em relação ao texto abaixo está em
+> [§7.5](#75-o-recurso-de-migration-separado--a-topologia-adotada), e é lá que
+> começa quem já opera nessa topologia. O gate de §7.1 continua valendo — como
+> rede de segurança dentro do recurso separado, e como o caminho único para
+> quem ainda roda com duas aplicações.
+
 ### 7.0 O que foi EXECUTADO e o que NÃO foi
 
 Leia esta tabela antes de seguir qualquer passo abaixo. Ela é a razão de esta
@@ -484,6 +493,9 @@ incidente.
 | **O painel do Coolify executa o gate antes do rollout e desiste do rollout quando ele sai != 0** | **NÃO VERIFICADO** | Não há instância de Coolify acessível a quem escreveu isto. O que se afirma é só o contrato: *"rode este comando; se ele sair != 0, não suba"* |
 | **O nome e a localização do campo do painel onde o comando é colado** | **NÃO VERIFICADO** | Varia por versão do Coolify e não foi conferido em nenhuma. Procure-o na sua instância; o texto abaixo descreve o que o campo precisa fazer, não onde ele fica |
 | Um redeploy **re-executa** o gate, e o que acontece quando ele sai `up_to_date` | **NÃO VERIFICADO** | Ver §7.4 |
+| O recurso de migration separado recebe **só** o subset `migrator`, e o processo dele valida **só** esse subset | **EXECUTADO** | `tests/unit/scripts/migrate-subset-boot.spec.ts` roda `tsx scripts/migrate.ts` num processo com o `.env.migrator.prod.example` (lido do disco) e nada mais |
+| Uma chave de aplicação acrescentada ao subset `migrator` **derruba o migrator**, em vez de aumentar o raio de explosão em silêncio | **EXECUTADO** | `src/config/migrator-subset.ts`, chamado por `loadMigrationConfig()`; guard em `tests/unit/config/migrator-subset.spec.ts` |
+| **O painel do Coolify permite criar o recurso separado, e como se chama o campo** | **NÃO VERIFICADO** | Mesma razão das duas linhas acima: não há instância acessível a quem escreveu isto. O que §7.5 descreve é o CONJUNTO DE VARIÁVEIS do recurso, que é verificável aqui, e não a navegação do painel |
 
 ### 7.1 O comando
 
@@ -567,6 +579,11 @@ migradores disputando o lock global. O `admin-ui` depende de o gate do `app`
 ter passado, e essa dependência **não existe como aresta** fora do Compose:
 é ordem de deploy. Deploy do `app` primeiro.
 
+**Na topologia adotada (§7.5) o gate não mora na Aplicação 1: ele é um recurso
+próprio, o terceiro.** Tudo desta subseção continua descrevendo o caminho de
+duas aplicações — leia-a se a sua instância não tiver o recurso separado, ou
+como a rede de segurança de §7.5 quando o painel herdar variáveis de projeto.
+
 ### 7.3 O que este gate NÃO recupera do Compose
 
 Dito por inteiro, porque a diferença importa num incidente:
@@ -581,10 +598,10 @@ Dito por inteiro, porque a diferença importa num incidente:
 - **o container ainda POSSUI os segredos.** No Compose, o migrator não recebe
   `.env.app` — ele não pode vazar o que nunca teve. Aqui, o processo do
   migrator não os recebe, mas o container em volta dele sim. É um raio de
-  explosão menor, não o mesmo raio de explosão. Se a sua instância permitir um
-  serviço/aplicação separado só para o passo de migration, com o seu próprio
-  conjunto de variáveis, use isso e o gate volta a valer o que vale no
-  Compose;
+  explosão menor, não o mesmo raio de explosão. **Esta é exatamente a lacuna
+  que o recurso separado de §7.5 fecha**, e é por isso que ele é a topologia
+  adotada: com editor de variáveis próprio, o container também nunca tem o que
+  não usa;
 - **nada aqui verifica configuração de `app`/`admin-ui`.** O migrator satisfaz
   o contrato dele e sai 0; `app`/`admin-ui` ainda podem reprovar no boot pelas
   chaves listadas em §1. O gate é sobre schema, não sobre bring-up.
@@ -619,7 +636,105 @@ exatamente o que esta seção não faz:
    `up_to_date` (que é 0, e é o caso normal de todo deploy sem migration
    nova).
 
-### 7.5 Kubernetes
+### 7.5 O recurso de migration SEPARADO — a topologia adotada
+
+Decisão do dono, já tomada: a infraestrutura real tem **uma aplicação/job de
+migration própria**, além das duas de `docs/admin-ui-deploy.md`. São três
+recursos apontando para o mesmo repositório:
+
+| Recurso | Comando | Editor de variáveis |
+|---|---|---|
+| 1. `app` | `node dist/index.js` | `.env.app.prod.example` |
+| 2. `admin-ui` | `server.js` do standalone | `.env.admin.prod.example` |
+| 3. **`migrate`** | `npm run db:migrate` | **`.env.migrator.prod.example`** |
+
+O que isso compra, e é o motivo inteiro de existir: **o container de migration
+não recebe os segredos da aplicação**. Não "recebe e o gate filtra" — não
+recebe. Um job que só aplica DDL não tem motivo para carregar a chave que fala
+com o cliente, e o que ele nunca teve ele não pode vazar. É a garantia (2) da
+#516, que §7.3 listava como perdida fora do Compose, de volta inteira.
+
+#### O conjunto de variáveis
+
+```bash
+cp .env.migrator.prod.example .env.migrator && chmod 600 .env.migrator
+```
+
+Cole o conteúdo no editor de variáveis do recurso 3 e preencha os
+`__SET_ME__`. São 15 chaves — o subset `migrator` do contrato
+(`src/config/contract.ts`, #515) inteiro, das quais 5 o operador preenche:
+
+| Chave | Por quê |
+|---|---|
+| `MAIA_ENV` | o profile. Obrigatória em staging/production; sem ela o boot reprova |
+| `NODE_ENV` | otimizações da plataforma Node. `production` com `MAIA_ENV=production` — a combinação contrária é recusada |
+| `DATABASE_URL` | o destino do DDL. **As mesmas credenciais do `app`**: um migrator que aponta para outro banco não gateia nada |
+| `POSTGRES_USER` · `POSTGRES_PASSWORD` · `POSTGRES_DB` | o mesmo banco, pelas partes |
+| `TZ` · `LOG_LEVEL` | knobs de processo |
+| `MAIA_BUILD_COMMIT` · `MAIA_CONFIG_STRICT_BOOT` | opcionais, comentadas no exemplo |
+| as quatro `MIGRATION_*_MS` | os tetos de lock/statement da #516, com default do contrato |
+
+E o que ele **não** recebe, que é a metade que importa: nenhuma `WHATSAPP_*`
+ou `BAILEYS_*`, nenhuma `OWNER_*`, nenhuma chave de LLM
+(`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`), nenhuma
+`VOYAGE_API_KEY`/`COHERE_API_KEY`, nenhuma `BACKUP_S3_*` ou
+`BACKUP_ENCRYPTION_*`, nenhum `NEXTAUTH_SECRET`, nenhuma `OIDC_*`, nenhuma
+`REDIS_URL`, nenhum transporte de alerta.
+
+Essa lista **não é uma lista para manter à mão** — uma allowlist copiada
+envelhece em silêncio, e a `WHATSAPP_*` criada na semana que vem passaria por
+ela. A invariante é travada pela ORIGEM da chave em
+[`src/config/migrator-subset.ts`](../../src/config/migrator-subset.ts): grupo
+do contrato (só `core` e `database`), namespace (só `MAIA_` entre os da Maia)
+e segredo-só-de-banco. Um domínio novo em `GROUP_ORDER`, ou um prefixo novo em
+`MAIA_KEY_PREFIXES`, nasce proibido para o migrator sem ninguém editar nada.
+`loadMigrationConfig()` chama esse guard no boot: um contrato que dê ao
+migrator uma chave de aplicação vira um migrator que **recusa rodar**,
+nomeando a variável e a regra, com exit 2.
+
+#### Ordem do deploy, que continua sendo disciplina e não aresta
+
+```
+recurso 3 (migrate) → sai 0 → recurso 1 (app) → recurso 2 (admin-ui)
+```
+
+`service_completed_successfully` não existe no painel: quem segura o rollout é
+o painel desistir quando o recurso 3 sai != 0. **Deploy o recurso 3 primeiro,
+e só siga se ele sair 0.** Réplicas simultâneas continuam seguras — o advisory
+lock global (`src/migrations/lock.ts`) serializa e o perdedor sai de forma
+limpa e observável.
+
+O comando do recurso 3 é `npm run db:migrate` — **o mesmo `command:` do
+serviço `migrate` do Compose**, pinado em
+`tests/unit/migrations/release-gate.spec.ts`. Ele sai 0 em sucesso e em
+"já no head" (o caso normal de todo deploy sem migration nova), e != 0 em
+falha, blocker (dirty, checksum mismatch, missing_file) ou lock indisponível.
+
+#### E se o painel injetar as variáveis do projeto em todo recurso
+
+Alguns painéis têm variáveis de PROJETO, herdadas por todos os recursos. Nesse
+caso o recurso 3 recebe o ambiente completo mesmo tendo editor próprio, e a
+separação some. A rede de segurança é o gate de §7.1:
+
+```bash
+npm run release:migrate     # em vez de `npm run db:migrate`
+```
+
+Ele filtra o ambiente para este mesmo subset antes de chamar o migrator, e
+**nomeia** (nunca por valor) o que reteve na linha
+`release_gate.env_scrubbed`. `withheld_contract` não vazio nesse recurso é o
+sinal de que a herança está acontecendo — o raio de explosão volta a ser o do
+container, não o do processo.
+
+#### O que continua NÃO verificável daqui
+
+- se o painel realmente desiste do rollout quando o recurso 3 sai != 0 (§7.0);
+- se `${MAIA_ENV:?…}` sobrevive à interpolação do painel — no recurso 3 a
+  variável é declarada literalmente (`MAIA_ENV=production`), sem interpolação,
+  justamente para não depender disso;
+- o que o painel faz com um redeploy que sai `up_to_date` (§7.4).
+
+### 7.6 Kubernetes
 
 Entrega futura, fora do escopo desta issue por decisão do dono. Não há
 manifesto nem init container neste repositório, e nenhuma linha deste runbook

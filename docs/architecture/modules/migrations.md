@@ -450,9 +450,16 @@ Still open on #516:
 - **the BOOT step now uses the SAME canonical verdict, and kills the process** (owner decision on #516, [ADR 0004](../decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md)). `src/index.ts` (lifecycle step `schema`) calls `checkSchemaReadiness()` and exits with a code that names the broken invariant — 90 dirty/orphaned `running`, 91 checksum mismatch, 92 checksum unknown, 93 missing file, 94 below minimum, 95 above maximum, 96 `running` in flight, 97 `unknown`. `checkSchemaVersion()` (`src/runtime/lifecycle/schema-version.ts`) was DELETED: there is no weaker second verdict left. The trade-off the previous note left open was resolved in favour of the crash loop, on the explicit condition that (a) the death message is actionable — `maia.schema_boot_refused` carries the migration id, expected vs. found checksum and the remediation command — and (b) the migration gate (#516 §7 in Compose, #565 outside it) keeps it from happening on the normal path. Operator decision tree (exit code vs. readiness) in [`docs/runbooks/operational.md`](../../runbooks/operational.md) §8.1.
 - **Coolify: entregue na #565** — `npm run release:migrate`, com a separação
   entre o que foi executado e o que não foi em
-  `docs/runbooks/deploy-prod.md` §7 e na seção abaixo. **Kubernetes segue
-  fora**: decisão do dono, entrega futura; não há manifesto nem init
-  container neste repositório.
+  `docs/runbooks/deploy-prod.md` §7 e na seção abaixo. **A configuração de
+  deploy real, que a #565 deixara em aberto, também está fechada**: a
+  infraestrutura tem um RECURSO DE MIGRATION SEPARADO, que recebe só o subset
+  `migrator` (`.env.migrator.prod.example`, `deploy-prod.md` §7.5). O teto
+  desse subset é travado por CATEGORIA em `src/config/migrator-subset.ts`
+  (grupo do contrato, namespace, segredo-só-de-banco) e conferido no boot por
+  `loadMigrationConfig()`, então uma chave de aplicação acrescentada ao subset
+  derruba o migrator em vez de ampliar o raio de explosão em silêncio.
+  **Kubernetes segue fora**: decisão do dono, entrega futura; não há manifesto
+  nem init container neste repositório.
 
 ---
 
