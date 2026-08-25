@@ -287,6 +287,16 @@ export const AUDIT_ACTIONS = [
    * se esta linha não entrar, a transação inteira reverte e NADA é enviado.
    */
   'outbound_committed',
+  /**
+   * Issue #632 — a saída lógica chegou ao HISTÓRICO da conversa e a linha do
+   * outbox foi para `completed`, na MESMA transação. É o fim honesto do ciclo:
+   * `delivered` diz que o provedor confirmou, `completed` diz que o registro
+   * interno acompanhou. Gravado por `auditTx` — se esta linha não entrar, a
+   * transição e a row de histórico revertem juntas, e a linha continua
+   * `delivered` (visível para a reconciliação de #633) em vez de virar um
+   * `completed` sem histórico.
+   */
+  'outbound_delivery_completed',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',
