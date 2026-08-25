@@ -1028,3 +1028,234 @@ rode o `_down`. Na ordem inversa a aplicação escreve numa coluna que não exis
 
 Ordem no rollback COMPLETO do protocolo de stream: `127` → `126` → `124` →
 `122` → `120`.
+
+## 13. Debounce transacional (#628, fatia E da #505)
+
+Fase 7 do rollout da #505. A regra em uma frase: **a janela do debounce é uma
+linha do PostgreSQL — aberta na mesma transação que persiste o ingresso,
+estendida na mesma transação do ingresso seguinte, e fechada por um
+compare-and-swap sob o mutex da stream. Nenhum timer em memória é fonte de
+verdade.**
+
+### 13.1 O que mudou, e o que quebrava antes
+
+Antes desta fatia a janela vivia em dois lugares que não são o banco: um job
+ATRASADO da BullMQ (`debounce:<tenant>:<agent>:<phone>`, com o prazo no `delay`)
+e uma chave no Redis com o `first_enqueued_at`. Dois defeitos, os dois nomeados
+pela issue:
+
+| Defeito | Como aparecia em produção |
+|---|---|
+| duas réplicas fechando batches **sobrepostos** | duas respostas para a mesma rajada, ou uma resposta que ignora metade das mensagens. Nenhuma linha do banco fica inconsistente — só a conversa |
+| **reinício perde a janela inteira** | um deploy entre o `agentQueue.add` e o disparo deixava a rajada sem ninguém para fechá-la. As mensagens não se perdiam (o recovery por estado as rearmava depois de `STUCK_AFTER_MS`), mas saíam como N turnos separados, até 2 min depois |
+
+Depois: `agent_turns.debounce_window_opened_at` / `debounce_deadline_at` /
+`debounce_closed_at` / `debounce_batch_size` (migration `130`). O caminho de
+ingresso do debounce **não toca o Redis** — é a metade da issue que nenhum teste
+de concorrência prova sozinho: um reinício não pode perder um `add` que não
+existe.
+
+### 13.2 A BORDA — a pergunta que a issue-mãe chamava de risco
+
+O risco declarado era *"debounce distribuído é suscetível a bordas temporais mal
+definidas"*. A borda escolhida está escrita em
+`src/db/repositories/stream-debounce-sql.ts`, e ela é de **serialização**, não de
+relógio:
+
+1. **O mutex da stream é a linha de `agent_stream_sequences`** — a MESMA que
+   `allocateIngressSeq` tranca para alocar `ingress_seq`, e que o PostgreSQL
+   segura até o COMMIT do ingresso. Enquanto qualquer ingresso da stream estiver
+   em voo, o fechamento **não começa**;
+2. **Um ingresso que COMITA antes de o fechador pegar o mutex entra no batch
+   atual; um que comita depois entra no PRÓXIMO.** Não depende de skew entre
+   réplicas nem da ordem em que os `Date.now()` foram lidos;
+3. **O batch é um PREFIXO CONTÍGUO**, nunca um conjunto esparso.
+
+Consequência de (1): não existe instante em que o fechador enxergue a sequência
+7 sem enxergar a 6. A lacuna que a issue proíbe absorver silenciosamente é
+**impossível**, não apenas improvável.
+
+Consequência de (3), e é a que aparece na operação: **mídia no meio da rajada
+FECHA o batch antes dela.** "M1 texto, M2 áudio, M3 texto" produz o batch `{M1}`;
+o áudio segue pelo caminho direto e M3 espera a próxima janela. Absorver M3 por
+cima do áudio responderia a terceira mensagem antes da segunda.
+
+### 13.3 O ciclo de vida da janela
+
+```
+ingresso de texto (mesma transação que grava a mensagem e o turno)
+   ├─ carimba debounce_window_opened_at neste turno
+   └─ recalcula debounce_deadline_at de TODOS os membros vivos da janela:
+        LEAST(now() + MESSAGE_DEBOUNCE_MS, MIN(opened_at) + MESSAGE_DEBOUNCE_MAX_MS)
+
+stream_debounce_closer (cron 1/min, drena ~50s sondando a cada 500ms)
+   ├─ listDueDebounceStreams()  → cross-tenant, WHERE deadline <= now()
+   └─ por stream, em UMA transação:
+        1. mutex (FOR UPDATE SKIP LOCKED)      → sem linha ⇒ stream_locked
+        2. GC das janelas de turnos terminais
+        3. prefixo contíguo de membros          → vazio ⇒ no_window
+        4. deadline <= now() avaliado NO BANCO  → não ⇒ not_due
+        5. head: status=queued, debounce_closed_at, debounce_batch_size,
+           promoted_at, fronteira last_ingress_seq estendida  → 0 linhas ⇒ lost_race
+        6. irmãos: superseded/merged_into_turn + inputs REANCORADOS no head
+   └─ depois do COMMIT: audit stream_batch_closed, métrica, enqueueAgent(head)
+```
+
+O prazo mora em **todos** os membros, não só no head. Se o head morrer por outro
+caminho (um operador o ignora, uma absorção o supersede), o relógio da janela
+sobrevive nos irmãos — sem isso, a rajada só sairia quando chegasse uma mensagem
+nova.
+
+### 13.4 Por que o turno fica em `received` até o fechamento
+
+`queued` significa *"existe wake-up para este turno"*, e antes do fechamento não
+existe. Carimbá-lo no ingresso faria o varredor de recovery enxergar um turno
+enfileirado sem job e rearmá-lo por conta própria — furando a janela que acabou
+de ser aberta.
+
+Consequência operacional: durante a janela (5 s típicos, teto de 30 s) uma
+rajada aparece como N turnos `received`. Isso é normal. O que **não** é normal é
+`received` acumulando junto com `agent_turns_debounce_due_idx` cheio — ver §13.7.
+
+### 13.5 O batch é um FATO do banco, não uma redescoberta em memória
+
+O fechamento **repõe** `agent_turn_inputs.turn_id` dos irmãos para o head. É por
+isso que `agentTurnsRepo.listClosedDebounceBatch(turn_id)` devolve a rajada
+inteira em ordem de `mensagens.ingress_seq`, e é dela que `src/agent/core.ts` lê
+quando a flag está ligada — em vez de redescobrir os irmãos por telefone +
+`processada_em` + `created_at`, que é uma SEGUNDA definição de batch e diverge da
+primeira no dia em que uma mensagem chega entre o fechamento e a execução.
+
+Dois efeitos que valem saber:
+
+* `processada_em` do irmão passa a ser carimbado quando o **head** chega a
+  terminal, e não quando o irmão é absorvido. É mais honesto (a mensagem só foi
+  respondida quando a resposta da rajada saiu) e evita que o probe de divergência
+  de #503 acuse todo irmão absorvido;
+* `absorbDebounceInputs` (o caminho de #503) **não** roda para um batch já
+  fechado: a absorção já aconteceu, e reexecutá-la só conseguiria conflitar.
+
+### 13.6 "Fechamento comitado, wake-up não enviado"
+
+Fechar o batch **é** eleger quem avança, então o head fechado carimba
+`promoted_at` — a MESMA coluna da fatia D. Um processo que morra entre o commit e
+o `enqueueAgent` cai exatamente no caso que a §12.3 já cobre: o varredor de
+`message-recovery` reencontra o turno promovido sem job, o rearma e conta
+`maia_stream_promotion_total{result="recovered"}`.
+
+Não existe uma segunda reconciliação para esta fatia, de propósito. Duas
+reconciliações com o mesmo modo de falha é como uma delas fica sem manutenção.
+
+### 13.7 O que vigiar
+
+| Sinal | Leitura |
+|---|---|
+| `maia_stream_debounce_batch_size` (`_sum/_count`) | tamanho médio do batch. **1 constante** significa que o debounce não está agrupando nada — a fatia estaria pagando escrita e varredura por nada. `le="1"` sobre o total é a fração de rodadas sem agrupamento |
+| `maia_stream_debounce_close_total{result="closed"}` | parou de crescer com janelas abertas acumulando ⇒ **varredor morto** |
+| `..._total{result="stream_locked"}` | dominando ⇒ contenção de ingresso: transações de ingresso longas segurando o mutex da stream |
+| `..._total{result="lost_race"}` | constante para a MESMA stream ⇒ o head da janela saiu de `CLAIMABLE_STATUSES` sem ficar terminal — está `claimed`/`running`. Ver abaixo |
+| `..._total{result="not_due"}` | **é o caso saudável**: o prazo esticou depois da enumeração |
+| `audit_log` `stream_batch_closed` | a resposta para "por que a Maia respondeu três mensagens minhas de uma vez?" e "por que não agrupou a quarta?". Carrega `batch_size` e `absorbed_turn_ids` |
+
+Consulta de triagem — janelas abertas e vencidas há mais de um minuto (isto é,
+que o varredor deveria ter fechado):
+
+```sql
+SELECT tenant_id, agent_id, count(*) AS janelas,
+       min(debounce_deadline_at) AS mais_antiga
+  FROM agent_turns
+ WHERE debounce_deadline_at IS NOT NULL
+   AND debounce_closed_at IS NULL
+   AND debounce_deadline_at < now() - interval '1 minute'
+ GROUP BY 1, 2
+ ORDER BY mais_antiga;
+```
+
+Linhas aqui significam varredor parado, ou uma stream cujo mutex está preso.
+Verifique primeiro se `stream_debounce_closer` está registrado e rodando
+(`maia_worker_*`), depois procure transação longa em `pg_stat_activity`.
+
+**O caso `lost_race` que se repete, e por que ele NÃO é um bug a consertar.**
+Se o varredor ficar parado por mais de `STUCK_AFTER_MS` (2 min), o recovery por
+estado alcança o head ainda `received`, o rearma e um worker o executa **sozinho**
+— a rajada perde o agrupamento, mas nada se perde. Nessa janela o head está
+`claimed`/`running`, que não é terminal (continua sendo membro) e não é
+reivindicável (`CLAIMABLE_STATUSES`), então todo tick devolve `lost_race` para
+aquela stream. É estado transitório e conservador: quando o head chega a
+terminal, o passo de GC fecha a janela dele e o próximo membro vira head. A
+alternativa — tirar `claimed`/`running` do conjunto de membros — seria pior: o
+`LAG` não veria quebra na primeira linha, e o batch fecharia **por cima** de um
+turno em execução.
+
+### 13.8 A composição do batch, depois do fato
+
+```sql
+-- quem o head absorveu
+SELECT id, status, outcome, first_ingress_seq, last_ingress_seq
+  FROM agent_turns
+ WHERE superseded_by_turn_id = '<head>'
+ ORDER BY first_ingress_seq;
+
+-- as mensagens que o head vai responder, na ordem canônica
+SELECT i.ingress_seq, m.ingress_seq AS seq_da_stream, m.tipo
+  FROM agent_turn_inputs i
+  JOIN mensagens m ON m.id = i.mensagem_id
+ WHERE i.turn_id = '<head>'
+ ORDER BY m.ingress_seq;
+```
+
+`agent_turns.debounce_batch_size` guarda o número já consolidado — é a evidência
+que sobrevive à retenção levar os turnos `superseded`.
+
+### 13.9 Rollout e rollback
+
+Ordem obrigatória do deploy:
+
+1. `npm run db:migrate` (aplica a `130`). O arquivo **não é atômico**: ele usa
+   `CONCURRENTLY` e portanto `maia:no-transaction`, e o runner autocommita por
+   statement. Se o índice falhar, as colunas ficam — estado correto, só lento.
+   Reaplicar conserta;
+2. **confira o índice à mão** (armadilha da §10.4 / issue #658 — um
+   `CONCURRENTLY` que falha devolve exit 0 na reaplicação):
+
+   ```sql
+   SELECT indexrelid::regclass, indisvalid, indisready
+     FROM pg_index
+    WHERE indexrelid::regclass::text = 'agent_turns_debounce_due_idx';
+   ```
+
+3. suba o código. `FEATURE_TURN_STREAM_DEBOUNCE` vem `true`, e é **inerte**
+   enquanto `FEATURE_MESSAGE_DEBOUNCE` estiver `false` (o default do
+   repositório): sem debounce não há janela a tornar transacional.
+
+Subir o código antes da migration **não** é seguro: a janela é aberta dentro da
+transação do ingresso, e sem as colunas todo ingresso de texto falha.
+
+O kill switch é a flag:
+
+```
+FEATURE_TURN_STREAM_DEBOUNCE=false   # + restart
+```
+
+Com ela OFF volta o debounce em memória, com as duas falhas conhecidas da §13.1.
+**Nenhuma mensagem é perdida em nenhuma das posições.** Janelas já abertas e não
+fechadas param de ser fechadas — os turnos ficam `received` e quem os rearma
+passa a ser o recovery por estado (até `STUCK_AFTER_MS`), um turno por mensagem,
+em ordem. Antes de rodar o `_down`, drene-as:
+
+```sql
+SELECT count(*) FROM agent_turns
+ WHERE debounce_deadline_at IS NOT NULL AND debounce_closed_at IS NULL;
+```
+
+A flag **exige** `FEATURE_TURN_HEAD_OF_LINE`, e a dependência é de SEGURANÇA, não
+de inércia: o fechamento marca os irmãos `superseded` sem fence, e só pode fazer
+isso porque um turno que não é o head é INCLAIMÁVEL — ninguém o está executando.
+Sem head-of-line o fechamento poderia absorver um irmão que um worker está
+executando neste instante. Desligar a #626 sem desligar esta fatia é a
+combinação a evitar; o boot **não** a recusa (pelo mesmo motivo da §12.6: um
+segundo passo obrigatório no meio de um incidente é pior), então a ordem correta
+de um rollback da #626 é desligar as duas.
+
+Ordem no rollback COMPLETO do protocolo de stream: `130` → `127` → `126` →
+`124` → `122` → `120`.

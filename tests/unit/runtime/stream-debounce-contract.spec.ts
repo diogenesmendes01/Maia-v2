@@ -129,10 +129,13 @@ describe('#628 — contrato do debounce transacional', () => {
 
   // ─── O FECHAMENTO ÚNICO ──────────────────────────────────────────────────
 
-  it('o UPDATE que fecha exige `debounce_closed_at IS NULL` — o CAS, não a convenção', () => {
-    // Sem esta condição, duas réplicas que passassem pelo mutex em sequência
-    // fechariam o mesmo batch duas vezes: a segunda reabriria o head já
-    // enfileirado e reabsorveria irmãos já `superseded`.
+  it('o UPDATE que fecha exige `debounce_closed_at IS NULL` — defesa em profundidade', () => {
+    // Sonda medida: esta condição SOZINHA não é o que garante o fechamento
+    // único (o mutex cobre o caminho concorrente e o conjunto de membros cobre
+    // o sequencial), e removê-la deixa a suíte verde. Ela é mantida — e
+    // afirmada aqui — porque é o que fecha a janela em que alguém mexa no
+    // conjunto de membros sem perceber o que ele sustentava: sem as DUAS, um
+    // segundo fechamento passa e reescreve `debounce_batch_size` para 1.
     expect(codigoDoDebounce).toMatch(
       /debounce_batch_size = \$\{[\s\S]{0,900}debounce_closed_at IS NULL/,
     );

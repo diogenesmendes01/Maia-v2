@@ -21,6 +21,26 @@
  * `audit_log` do MESMO evento em três callers é como um deles acaba sem
  * auditoria — e o que falta é sempre o do caminho raro.
  *
+ * ─── Por que `incCounter`/`observeHistogram` CRUS, e não a camada de política ─
+ *
+ * A regra da #601 é que métrica de produção sai por `src/observability/metrics.ts`,
+ * que ATRIBUI `tenant_id`/`agent_id` do ALS. Aqui não, e é a mesma decisão que
+ * `stream-metrics.ts` (#626) tomou nesta mesma épica:
+ *
+ *   1. as duas séries descrevem o VARREDOR, não a carga de um cliente —
+ *      "quantas janelas fecharam" e "de que tamanho" são perguntas de
+ *      escalonamento, e cortá-las por tenant multiplica a cardinalidade sem
+ *      responder nada que alguém pergunte;
+ *   2. a SEMEADURA em zero (`registrarSeriesDeDebounce`) roda no boot, FORA de
+ *      qualquer contexto de tenant. Se a emissão atribuísse, a série semeada
+ *      (`{result="closed"}`) e a série real (`{result="closed",tenant_id=…}`)
+ *      seriam SÉRIES DIFERENTES — e a semeadura, que existe para que um alerta
+ *      possa ser escrito contra um contador que passa semanas em zero, deixaria
+ *      de servir para exatamente isso.
+ *
+ * QUEM foi agrupado com quem vive na `audit_log` `stream_batch_closed`, que é
+ * escopada por tenant e é armazenamento protegido.
+ *
  * ─── A ORDEM: auditar, depois sinalizar ───────────────────────────────────
  *
  * A `audit_log` é o registro durável de que a plataforma DECIDIU agrupar estas

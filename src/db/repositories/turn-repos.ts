@@ -2294,12 +2294,25 @@ async function armDebounceWindowTx(
  *
  *  5. **O CAS DE FECHAMENTO** sobre o head, com `debounce_closed_at IS NULL` E
  *     `state_version` esperada. Zero linhas ⇒ `lost_race`, nunca sucesso
- *     silencioso. As DUAS condições são necessárias, e a primeira não é
- *     redundante: um head que já estava `queued` (promovido pela #627, ou
- *     re-armado pelo varredor de recovery) NÃO tem `state_version`
+ *     silencioso.
+ *
+ *     Honestidade sobre o que carrega o peso aqui, medida por sonda: o
+ *     fechamento único NÃO depende destas duas linhas. Quem o garante são (a) o
+ *     mutex do passo 1, no caminho CONCORRENTE, e (b) `debounce_closed_at IS
+ *     NULL` dentro de `openDebounceWindowMembers`, no caminho SEQUENCIAL — um
+ *     head já fechado sai do conjunto de membros, então a segunda tentativa
+ *     devolve `no_window` antes de chegar a este UPDATE. Removendo qualquer uma
+ *     das duas condições daqui a suíte continua verde; removendo AS DUAS
+ *     JUNTAS com a do conjunto de membros, um segundo fechamento passa e
+ *     reescreve `debounce_batch_size` para 1.
+ *
+ *     Ficam como DEFESA EM PROFUNDIDADE, e não por simetria: o
+ *     `state_version` não protege sozinho porque um head já `queued`
+ *     (promovido pela #627, ou re-armado pelo varredor) NÃO tem a versão
  *     incrementada pelo fechamento — de propósito, porque re-armar um turno já
- *     `queued` não é transição de estado. Nesse caso o CAS de versão aprovaria
- *     as duas réplicas, e só `debounce_closed_at IS NULL` recusa a segunda;
+ *     `queued` não é transição de estado (a decisão da fatia D). Custam um
+ *     predicado sobre uma linha já encontrada e fecham a janela em que alguém
+ *     mexa no conjunto de membros sem notar o que ele estava sustentando;
  *
  *  6. **A ABSORÇÃO DOS IRMÃOS** — `superseded`/`merged_into_turn` apontando
  *     para o head — e a RE-ANCORAGEM dos inputs.
