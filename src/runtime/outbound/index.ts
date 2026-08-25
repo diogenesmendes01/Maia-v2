@@ -17,9 +17,22 @@
  *   `commit.ts`     — #631: a fronteira que o dispatcher atravessa antes de
  *                     qualquer chamada ao canal. É a única camada com efeito.
  *
- * O delivery worker (#632), o recovery/DLQ (#633), a migração dos call sites
- * (#634) e o multipart (#635) ainda não existem.
+ *   `delivery-contract.ts` — #632: o contrato PURO da entrega (elegibilidade do
+ *                     claim, capability de idempotência do provedor,
+ *                     normalização dos SETE desfechos, política de reenvio).
+ *   `delivery-job.ts`      — #632: identidade determinística do job por
+ *                     `outbound_id`. Puro, sem `bullmq`.
+ *   `provider-adapter.ts`  — #632: união de #630 ⇒ primitiva de `LineOutput`,
+ *                     e a limitação de chave nativa do Baileys encapsulada.
+ *   `delivery.ts`          — #632: o CICLO. Segunda camada com efeito.
+ *
+ * O recovery/DLQ (#633), a migração dos call sites (#634) e o multipart (#635)
+ * ainda não existem.
  */
 export * from './contract.js';
 export * from './turn-scope.js';
 export * from './commit.js';
+export * from './delivery-contract.js';
+export * from './delivery-job.js';
+export * from './provider-adapter.js';
+export * from './delivery.js';
