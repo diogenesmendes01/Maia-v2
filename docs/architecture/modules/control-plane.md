@@ -35,9 +35,22 @@
 | `src/control-plane/runtime-trace/index.ts` | Public surface |
 | `src/control-plane/runtime-trace/envelope-writer.ts` | Sync envelope per turn |
 | `src/control-plane/runtime-trace/body-writer.ts` | Async body with full detail |
+| `src/control-plane/runtime-trace/verify-envelope.ts` | Recomputes `envelope_hmac`/`packet_hmac`; `verified` / `invalid` / `unknown` / `rejected_version` |
+| `src/control-plane/runtime-trace/lib/signature.ts` | **Versioned** canonical material for `envelope_hmac` (v1 read-only, v2 written) |
 | `src/control-plane/runtime-trace/lib/redaction.ts` | PII redaction |
 | `src/control-plane/runtime-trace/lib/hmac.ts` | HMAC chain envelope ↔ body |
 | `src/control-plane/runtime-trace/lib/debug-encrypt.ts` | Optional debug-time encryption |
+
+**Envelope signature versions (issue #535).** `signature_version` is a column
+(migration 119). **v1** signs the migration-052 field set; **v2** signs that set
+plus `root_trace_id`, `attempt` and the version itself. Production writes **only
+v2** — the writer takes the version from a constant, never from its input, so a
+caller cannot request a weaker signature. The verifier still reads v1, so
+fixtures and environments that already hold v1 rows keep a real verdict; v1 rows
+are **never** re-signed. Signing the version is what makes the two-version
+verifier safe: relabelling a v2 row as v1 makes the recomputation fail, so the
+column is not a downgrade lever. Full rationale in
+[`concerns/governance-observability.md` §4.4a](../concerns/governance-observability.md).
 
 ### Skill registry
 
@@ -66,6 +79,7 @@
 | Add a new KSM state or transition | Extend `state-machine.ts`; new transition method in `transitions.ts`; add property tests in `tests/property/knowledge-state-machine.spec.ts` |
 | Add a new policy operator | Extend `src/governance/policy-dsl/` (DSL); resolver and cache in this module read |
 | Add a new trace field | Decide envelope vs body (durability vs detail); update `envelope-writer.ts` or `body-writer.ts`; respect redaction rules |
+| Add a field to `envelope_hmac` | **Never edit v1 in place** — that invalidates every stored v1 row. Add a `signature_version=3` material in `lib/signature.ts`, bump `CURRENT_ENVELOPE_SIGNATURE_VERSION`, widen the migration-119 CHECK, and leave the older builders untouched |
 | Add a new soul bias type | Extend `soul-biases-repo.ts`; ensure append-only contract; respect origin-gate |
 
 ## Public surface
@@ -85,6 +99,10 @@
 | `tests/property/knowledge-state-machine.spec.ts` | Property-based KSM invariants |
 | `tests/unit/control-plane/knowledge-state-machine/` | Per-method contracts |
 | `tests/integration/p10b-runtime-trace.spec.ts` (if present) | Trace envelope/body integrity |
+| `tests/unit/observability/verify-envelope.spec.ts` | Per-field tampering, both signature versions, version relabelling |
+| `tests/unit/observability/envelope-signature-v2.spec.ts` | Canonical-encoding ambiguity; `listAttempts()` signed-`turno_id` requirement |
+| `tests/unit/runtime-trace-envelope-writer.spec.ts` | The written row is v2, against a LITERAL canonical material |
+| `tests/integration/trace-explorer-attempt-grouping.spec.ts` | writer → real repo → Explorer, including a spliced foreign turn |
 
 ## In-flight changes
 
