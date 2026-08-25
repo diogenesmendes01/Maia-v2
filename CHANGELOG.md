@@ -97,6 +97,27 @@ nunca tinha sido exercitada. O bloco de READ ISOLATION, que dirige a query
 drizzle real do inner legado, fixa `authoritative = false` e diz por escrito que
 é o caminho de rollback.
 
+**E `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts`, pelo mesmo
+motivo: media o fim do turno na fonte de verdade ANTIGA.** O CONTROLE dessa
+suíte exigia `mensagens.processada_em` não-nulo. Com o regime autoritativo por
+default isso passou a ser a asserção ERRADA, não um defeito do pipeline: a
+projeção legada agora SEGUE o estado — `runTransition` só carimba
+`processada_em` em transição terminal —, e o turno do CONTROLE termina
+`retryable`/`outbound_failure`, porque no harness o Baileys é dublê e não há
+canal ativo para entregar. Carimbar ali é exatamente o que matava o retry.
+
+A asserção foi trocada pelo sinal EQUIVALENTE na fonte nova, e ficou mais forte
+nas duas pontas: o CONTROLE exige que o **dono** tenha fechado a tentativa
+(`status`/`outcome`/`last_error_code`, lease devolvida, mensagem ligada por
+`agent_turn_inputs`, `state_version` = 3) e cada BARREIRA exige que a última
+gravação da linha tenha sido a do **sucessor** — `state_version` idêntica à do
+takeover, sem outcome, sem erro, sem projeção. A versão antiga era vacinada
+contra os dois defeitos que a nova pega: um `markAllProcessed` incondicional
+(o P1 que mata o retry) deixava o CONTROLE VERDE, e um zumbi que grava
+`markRetryable` sem fence no turno alheio deixava as cinco barreiras VERDES.
+Nenhuma barreira foi enfraquecida — a contagem de efeitos pós-gate, os
+`workloads` de LLM e o `boundary` que recusou continuam iguais.
+
 
 ### ⚠️ AÇÃO DO OPERADOR — se algum health check seu aponta para `GET /health`, ele nunca reprovou nada ([#613](https://github.com/diogenesmendes01/Maia-v2/issues/613))
 

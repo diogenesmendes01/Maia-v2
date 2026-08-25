@@ -277,6 +277,20 @@ decisão de negócio e a máquina roda em **shadow**; a divergência é medida p
 `maia_turn_legacy_projection_mismatch_total`. Runbook:
 [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
+**Com ela ON — o default — `processada_em` deixa de ser o sinal de "o turno
+rodou até o fim".** A projeção legada passa a SEGUIR o estado: `runTransition`
+([`src/db/repositories/turn-repos.ts`](../../../src/db/repositories/turn-repos.ts))
+só carimba `processada_em` em transição **terminal**, na mesma transação do CAS
+e restrito às mensagens ligadas por `agent_turn_inputs`; fora disso
+`src/agent/core.ts` registra `agent.legacy_projection_skipped_non_terminal`. Um
+turno que termina `retryable` (timeout de reasoner, falha pre-send do outbound)
+corretamente **não** carimba — carimbar é o que matava o retry, porque a
+reentrada morria no early-return legado. Consequência prática para quem escreve
+teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
+(`status`/`outcome`/`last_error_code`/`state_version`) mais a ligação
+`agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
+encerrado por um turno TERMINAL".
+
 ### Feature flags (`src/runtime/feature-flags/`)
 
 | File | Role |
