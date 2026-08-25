@@ -403,6 +403,14 @@ export const mensagens = pgTable('mensagens', {
   processada_em: timestamp('processada_em', { withTimezone: true }),
   ferramentas_chamadas: jsonb('ferramentas_chamadas').notNull().default(sql`'[]'::jsonb`),
   tokens_usados: integer('tokens_usados'),
+  // 118 (#505, shadow) — identidade da STREAM de ordenação e a posição deste
+  // ingresso dentro dela. NULL = row anterior ao protocolo, ou outbound (que
+  // nunca recebe stream). NÃO confundir `ingress_seq` com o homônimo de
+  // `agent_turn_inputs`: aquele é a posição DENTRO DO TURNO (começa em 0), este
+  // é a posição DENTRO DA STREAM (começa em 1) — ver migrations/118.
+  stream_key: text('stream_key'),
+  stream_key_version: smallint('stream_key_version'),
+  ingress_seq: bigint('ingress_seq', { mode: 'number' }),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -3186,6 +3194,14 @@ export const agent_turns = pgTable(
     deadline_at: timestamp('deadline_at', { withTimezone: true }),
     // Reservado para #506 (outbox durável).
     outbound_message_id: uuid('outbound_message_id'),
+    // 118 (#505, shadow) — a STREAM a que o turno pertence e as FRONTEIRAS de
+    // sequência que ele consumiu. Turno simples: `first === last`. Turno
+    // agregado pelo debounce: o intervalo fechado dos ingressos absorvidos.
+    // NULL = turno anterior ao protocolo (sem backfill).
+    stream_key: text('stream_key'),
+    stream_key_version: smallint('stream_key_version'),
+    first_ingress_seq: bigint('first_ingress_seq', { mode: 'number' }),
+    last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }),
     queued_at: timestamp('queued_at', { withTimezone: true }),
     claimed_at: timestamp('claimed_at', { withTimezone: true }),
     started_at: timestamp('started_at', { withTimezone: true }),
@@ -3220,6 +3236,13 @@ export const agent_turns = pgTable(
     leaseExpiryIdx: index('agent_turns_lease_expiry_idx')
       .on(t.lease_expires_at)
       .where(sql`status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL`),
+    // #505 (migration 119): "existe turno ANTERIOR não terminal nesta stream?"
+    // — o predicado do head-of-line das fases 5–6. Criado já na fase shadow
+    // para que a ativação do enforcement não some uma construção de índice a
+    // uma mudança de comportamento na mesma janela.
+    streamHeadIdx: index('agent_turns_stream_head_idx')
+      .on(t.tenant_id, t.agent_id, t.stream_key, t.first_ingress_seq, t.status)
+      .where(sql`stream_key IS NOT NULL`),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),
@@ -3258,10 +3281,43 @@ export const agent_turn_inputs = pgTable(
   }),
 );
 
+// Issue #505 (migration 118) — contador TRANSACIONAL de ingresso por stream.
+//
+// Uma linha por (tenant, agent, stream_key). O incremento é uma única
+// declaração `INSERT … ON CONFLICT DO UPDATE … RETURNING`, atômica e monotônica
+// sob múltiplos produtores: o lock da linha serializa APENAS a stream em
+// questão, e streams distintas não se veem (é isso que dá paralelismo entre
+// conversas sem lock global).
+//
+// A PK inclui tenant e agent mesmo com a `stream_key` já embutindo os dois no
+// material canônico: embutir não é escopar. Com o par na chave, uma stream_key
+// forjada ou colidida não consegue nem ENDEREÇAR o contador de outro tenant.
+export const agent_stream_sequences = pgTable(
+  'agent_stream_sequences',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    stream_key: text('stream_key').notNull(),
+    /** Versão do algoritmo que MINTOU a stream — não muda no incremento. */
+    stream_key_version: smallint('stream_key_version').notNull(),
+    /** Última sequência ENTREGUE. 0 = linha nova; a 1ª alocação devolve 1. */
+    last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }).notNull().default(0),
+    first_seen_at: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'agent_stream_sequences_pk',
+      columns: [t.tenant_id, t.agent_id, t.stream_key],
+    }),
+  }),
+);
+
 export type AgentTurn = typeof agent_turns.$inferSelect;
 export type NewAgentTurn = typeof agent_turns.$inferInsert;
 export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
 export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
+export type AgentStreamSequence = typeof agent_stream_sequences.$inferSelect;
 
 // ---------------------------------------------------------------------------
 // Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de

@@ -1629,6 +1629,32 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_STREAM_KEY: {
+    name: 'FEATURE_TURN_STREAM_KEY',
+    description:
+      'Identidade de STREAM e sequência de ingresso do turno (issue #505, fases 1–2 do rollout: ' +
+      'SHADOW). EXIGE as migrations 118 e 119 APLICADAS. Default ON e apenas ESCRITA: as colunas ' +
+      'stream_key/stream_key_version/ingress_seq (mensagens) e stream_key/first_ingress_seq/' +
+      'last_ingress_seq (agent_turns) passam a ser preenchidas, e NADA as lê para decidir — o ' +
+      'head-of-line, a exclusão por stream e o debounce transacional são fases posteriores. ' +
+      'A ÚNICA mudança de comportamento observável: um ingresso cuja identidade de stream não ' +
+      'pode ser derivada com segurança (tenant/agent/canal/identidade remota ausentes, ou o ' +
+      "literal 'default') passa a ser RECUSADO e auditado (`stream_ingress_rejected`) em vez de " +
+      'seguir — é a invariante MUST nº 2/nº 8, e a issue proíbe explicitamente agrupar esse ' +
+      'ingresso numa stream genérica. Em produção esse caso já era fail-closed antes daqui: todo ' +
+      'ramo não-lançante de resolveChannel devolve channel_id. Kill switch: false volta a ' +
+      'persistir sem stream (colunas NULL) sem perder as sequências já alocadas — mas a stream ' +
+      'retomada continua de onde parou, então religar NÃO reordena nada. ' +
+      'Ver docs/runbooks/turn-state-machine.md §8.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_STRICT_TOOL_SCHEMAS: {
     name: 'FEATURE_STRICT_TOOL_SCHEMAS',
     description:

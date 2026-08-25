@@ -74,6 +74,13 @@ if (SHOULD_RUN) {
       await q(`DELETE FROM conversas WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM pessoas WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM channels WHERE tenant_id = $1`, [t]);
+      // #505 — o ingresso passou a AUDITAR o nascimento de cada stream
+      // (`stream_ingress_sequenced`), e `audit_log.agent_id` tem FK para
+      // `agents`. Sem esta linha o `DELETE FROM agents` abaixo falha com
+      // `audit_log_agent_id_fkey` e o arquivo inteiro não carrega — que é
+      // exatamente o que aconteceu ao ligar o protocolo. A trilha é escopada
+      // por tenant, então apagá-la aqui não toca nada de outra suíte.
+      await q(`DELETE FROM audit_log WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM agents WHERE tenant_id = $1`, [t]);
       await q(`DELETE FROM tenants WHERE id = $1`, [t]);
     }
@@ -174,7 +181,12 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
         tipo: 'texto' as const,
         conteudo: 'oi',
         midia_url: null,
-        metadata: { whatsapp_id: 'WID-COLIDE-1' },
+        // #505 — `telefone` é a identidade remota de onde a `stream_key` é
+        // derivada. Sem ela `createInbound` recusa FAIL-CLOSED (o inbound real
+        // sempre a carimba, ver src/gateway/baileys.ts). O assunto deste caso é
+        // dedup por canal; a identidade só precisa existir e ser a MESMA nas
+        // três chamadas, para que a variável seja a linha.
+        metadata: { whatsapp_id: 'WID-COLIDE-1', telefone: '+5511900000001' },
         processada_em: null,
         ferramentas_chamadas: [],
         tokens_usados: null,
@@ -204,7 +216,8 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       tipo: 'texto' as const,
       conteudo: 'colisão cross-tenant',
       midia_url: null,
-      metadata: { whatsapp_id: 'WID-XTENANT-1' },
+      // #505 — idem: sem identidade remota o ingresso é recusado fail-closed.
+      metadata: { whatsapp_id: 'WID-XTENANT-1', telefone: '+5511900000002' },
       processada_em: null,
       ferramentas_chamadas: [],
       tokens_usados: null,

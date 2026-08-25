@@ -321,6 +321,133 @@ em volta dele sim"*. Agora nem o container recebe.
   descrever a topologia como só duas aplicações;
   `docs/architecture/modules/{migrations,config}.md`.
 
+### Ordenação: a conversa passa a ter identidade e sequência duráveis — em shadow ([#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fases 1–2 de 9)
+
+> **AÇÃO DO OPERADOR: aplique as migrations 118/119 ANTES de subir o código.**
+> `FEATURE_TURN_STREAM_KEY` nasce ON, e um processo com a flag ligada contra um
+> banco sem as colunas derruba **todo o ingresso** — a mesma armadilha (e a
+> mesma ordem) do `FEATURE_TURN_STATE_MACHINE` com as `096`/`097`.
+
+**O problema.** A BullMQ controla a concorrência do worker e não expressa
+contrato de ordenação: duas mensagens da mesma conversa podem ser processadas
+fora de ordem ou ao mesmo tempo. A #505 quer FIFO **por conversa** sem
+serializar a fila inteira — e para isso a unidade de serialização precisa
+existir **no ingresso**, antes de qualquer resolução de identidade, porque é ali
+que a ordem de chegada é decidida. `conversa_id` não serve: `agent_turns.conversa_id`
+é nullable por construção (o inbound é persistido antes da resolução), e uma
+unidade de ordenação que às vezes é NULL colapsa todo mundo numa stream só —
+exatamente a serialização global que a issue proíbe.
+
+**Esta fatia entrega as fases 1–2 (shadow) e nada além.** As colunas passam a
+ser preenchidas; **nada as lê para decidir**. Head-of-line como condição do
+claim, exclusão "no máximo um turno ativo por stream", debounce transacional,
+promoção de sucessor, política de retry/DLQ por stream e backfill ficam para as
+fatias seguintes.
+
+**`stream_key` — por que comprimento-prefixado, e não `a:b:c`.** A chave é um
+SHA-256 de material canônico sobre `tenant_id + agent_id + tipo de canal + linha
++ identidade remota normalizada`. Concatenar com separador é ambíguo:
+`["a:b","c"]` e `["a","b:c"]` produzem a **mesma** string, e duas conversas
+distintas passariam a compartilhar ordem, lock e — na fase de enforcement —
+exclusão mútua. A issue classifica colisão como risco de **segurança**, não de
+qualidade. O encoding é netstring (`<bytes>:<valor>,`, comprimento em bytes UTF-8),
+que é injetivo por construção; escapar o separador consertaria também, mas
+transferiria a corretude para quem lembrasse de aplicar o escape em cada
+componente novo. A versão do algoritmo aparece no valor (`v1:<sha256>`) **e** na
+coluna `stream_key_version` — o prefixo torna a chave auto-descritiva e faz duas
+versões nunca colidirem.
+
+**Fail-closed, sem exceção.** `tenant_id`/`agent_id` são obrigatórios;
+`'default'` e `'system'` são recusados; a LINHA (`channel_id`) é obrigatória
+(desde a `090` a conversa é escopada por canal — sem ela, o mesmo interlocutor
+em duas linhas colapsaria numa stream). Ingresso irresolúvel é **recusado**,
+auditado (`stream_ingress_rejected`) e **não persistido**. Nunca há queda para
+stream genérica: é a invariante MUST nº 2/nº 8, e a issue nomeia esse fallback
+como uma das falhas que ela existe para impedir (§Falhas 8). Em produção esse
+caso já era fail-closed antes daqui — todo ramo não-lançante de `resolveChannel`
+devolve `channel_id`, e um miss já derrubava a mensagem no `handleIncoming`.
+
+**`ingress_seq` — por que a alocação mora DENTRO da transação do INSERT.**
+`SELECT max(seq)+1` seguido de INSERT é a forma intuitiva e está errada: dois
+produtores leem o mesmo máximo e alocam o mesmo número. A alocação é um
+`INSERT … ON CONFLICT DO UPDATE … RETURNING` sobre `agent_stream_sequences` —
+uma declaração atômica cujo lock de row serializa **apenas** aquela stream
+(streams distintas nunca se veem, e não há lock global por tenant, agente ou
+fila). Ela corre na mesma transação do INSERT da mensagem, e é isso que faz
+"redelivery reusa a sequência original" (§Acceptance) valer **por construção**:
+se a reentrega colidir na unique de dedup, a transação inteira reverte e o
+número volta. Não há caminho de compensação a lembrar de escrever. A dedup por
+`whatsapp_id` precede tudo, no pre-check de `createInbound`, então a reentrega
+comum nem abre transação.
+
+**Onde a decisão mora, e por quê.** A GUARDA (`requireStreamIdentity`, pura) é
+chamada por `mensagensRepo.createInbound`; o RELATO (métrica, `audit_log`, log)
+é chamado pelo GATEWAY. A divisão não é estética: `src/db/repositories/` é
+compartilhado entre o container `app` e o console `admin-ui`, e a cadeia
+`métrica → labels → src/config/env.ts` faria o console validar o subset `runtime`
+no boot e exigir dele as seis `BACKUP_*` num processo que nunca roda backup — a
+regressão que `tests/unit/config/admin-import-boundary.spec.ts` pegou nesta
+própria fatia. Pela mesma razão a flag é lida por `contractEnv`. Consequência
+honesta: um chamador futuro de `createInbound` que não relate continua
+fail-closed, mas a recusa dele não vira série nem `audit_log`.
+
+**A evidência de que cada invariante está de fato travada** — cada defeito
+reintroduzido com UMA edição no código de PRODUÇÃO, não num harness espelhado:
+
+| Defeito reintroduzido | Teste que ficou vermelho |
+|---|---|
+| a recusa vira `return { stream_key: 'default' }` em `requireStreamIdentity` | 4 casos: `createinbound-stream-fail-closed` (3) + `stream-ingress-sequence-real-db` (1) — todos `promise resolved … instead of rejecting` |
+| `lengthPrefixed` volta a ser `` `${value}:` `` | 7 casos de `stream-key-canonical` — `expected 'maia.stream.v1:a:b:c:' not to be 'maia.stream.v1:a:b:c:'` |
+| a alocação sai da transação (`allocateIngressSeq(db, …)` no lugar de `(tx, …)`) | `stream-ingress-sequence-real-db` — `expected '6' to be '1'` no contador, e a corrida de 50 estoura o pool |
+| `reportStreamIngressRejected` some do `catch` do gateway | `baileys-stream-identity-drop` — a recusa vira queda SEM trilha |
+
+O teste de fail-closed entra por `mensagensRepo.createInbound`, o call site REAL
+do ingresso, e afirma a ausência do INSERT — não só o `throw`. Recusar depois de
+persistir seria fail-open com log bonito. O da trilha entra por
+`ingressUpsertMessage`, o ponto por onde o Baileys entrega `messages.upsert`.
+
+**Fronteiras do turno.** `first_ingress_seq`/`last_ingress_seq` nascem iguais
+(turno simples). `absorbDebounceInputs` estende com `LEAST`/`GREATEST` e **só**
+com ingressos da mesma `stream_key`: uma mensagem de outra conversa não move a
+fronteira, o que é fail-closed por construção em vez de validação do chamador.
+
+**Observabilidade.** `maia_stream_ingress_total{channel_kind,result}` e
+`maia_stream_ingress_rejected_total{reason}` — vocabulários FECHADOS.
+`stream_key`, `remote_jid` e `turn_id` **não** são labels (a issue proíbe): eles
+vivem no log estruturado `stream.ingress_sequenced`, que é de onde se reconstrói
+a ordem de uma conversa. Em `audit_log` entram só dois fatos: a recusa, e o
+NASCIMENTO da stream (`ingress_seq = 1`). Auditar cada mensagem inflaria a tabela
+na razão do tráfego sem acrescentar decisão governável — a issue pede a auditoria
+"quando relevante" (§Observability), e é essa a ressalva.
+
+**Schema (migrations 118 + 119, ambas com `_down`).** `mensagens` ganha
+`stream_key`/`stream_key_version`/`ingress_seq`; `agent_turns` ganha
+`stream_key`/`stream_key_version`/`first_ingress_seq`/`last_ingress_seq`; nasce
+`agent_stream_sequences` (PK `(tenant_id, agent_id, stream_key)` — a chave já
+embute o par no material canônico, mas embutir não é **escopar**: com o par na
+PK, uma `stream_key` forjada não consegue nem endereçar o contador de outro
+tenant). Tudo NULLABLE nesta fase, **sem backfill** — inventar ordem histórica
+que nunca existiu seria pior que admitir que ela não existe (§Backfill).
+
+A `119` é separada e `no-transaction` pela mesma razão que a `096` foi separada
+da `097`: a unique parcial `(tenant_id, agent_id, stream_key, ingress_seq)` e o
+índice de head-of-line são construídos `CONCURRENTLY`, e os CHECK entram
+`NOT VALID` com `VALIDATE` em statement próprio — validar sob ACCESS EXCLUSIVE
+numa tabela quente é janela de perda de ingresso. Os CHECK usam
+`(x IS NULL) = (y IS NULL)` como guarda porque um CHECK do Postgres só reprova
+em FALSE: com NULL ele **aceita**, que é a armadilha ternária documentada na
+`097`. O `_down` da `118` tem envelope `BEGIN`/`COMMIT` (o runbook aplica `_down`
+com `psql -f`, que é autocommit por statement); o da `119` **não pode** ter —
+`DROP INDEX CONCURRENTLY` é recusado em transação —, e em compensação todo
+statement dele é idempotente e independente. Round-trip up→down→up verificado
+contra PostgreSQL 16 real.
+
+**`ingress_seq` colide de nome com o de `agent_turn_inputs`, e a colisão é
+deliberada — registre a distinção:** aquele é a posição **dentro do turno**
+(0 = representativa, `integer`); este é a posição **dentro da stream** (começa em
+1, `bigint`, porque uma stream longeva pode passar de 2^31 ao longo de anos e
+migrar o tipo depois exigiria reescrever a tabela mais quente do runtime).
+
 ### Added — o ledger `outbound_messages` vira outbox durável, e a saída do turno ganha DUAS identidades ([#630](https://github.com/diogenesmendes01/Maia-v2/issues/630), fatia A de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 **Nada muda em runtime.** A fatia é aditiva: schema + tipos, nenhum caminho
