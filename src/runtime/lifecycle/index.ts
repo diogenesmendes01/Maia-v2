@@ -39,8 +39,10 @@ export {
 } from './readiness.js';
 
 /**
- * The schema gate `/readyz` uses (issue #516) — the canonical migration
- * verdict, cached. New consumers use THIS, not `checkSchemaVersion()`.
+ * The canonical schema verdict, cached — issue #516. It is BOTH the `/readyz`
+ * gate and, through `./schema-boot-gate.js`, the boot gate. There is no second,
+ * weaker schema check any more: `checkSchemaVersion()` was deleted with the
+ * boot unification (ADR 0004).
  */
 export {
   checkSchemaReadiness,
@@ -50,7 +52,14 @@ export {
 } from './schema-readiness.js';
 
 /**
- * The pre-#516 comparison. Still the BOOT step in `src/index.ts`; it is NOT the
- * readiness verdict any more — see the module doc for why both exist.
+ * The BOOT decision over that verdict (issue #516, ADR 0004): which exit code
+ * a negative verdict costs, and the actionable message that goes with it.
  */
-export { checkSchemaVersion, expectedSchemaVersion, type SchemaVersionResult } from './schema-version.js';
+export {
+  bootExitCode,
+  describeSchemaBootFailure,
+  SchemaBootAbortError,
+  SCHEMA_BOOT_BLOCKER_PRECEDENCE,
+  SCHEMA_BOOT_EXIT_CODES,
+  type SchemaBootFailure,
+} from './schema-boot-gate.js';
