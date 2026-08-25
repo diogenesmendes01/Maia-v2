@@ -411,6 +411,56 @@ d('#631 — commit transacional da resposta (Postgres real)', () => {
     expect(linhas[0]!.logical_dedupe_key).toBe(`mol1_${'c'.repeat(64)}`);
   });
 
+  it('falha da AUDITORIA — depois do INSERT do artefato — reverte tudo: nem linha, nem transição', async () => {
+    // ─────────────────────────────────────────────────────────────────────
+    // Este caso existe porque o anterior NÃO distingue atômico de partido.
+    //
+    // Lá a falha nasce NO PRÓPRIO INSERT, então tirar o INSERT de dentro do
+    // `withTx` produz o mesmo desfecho observável (nada persiste) e a sonda
+    // volta VERDE com o defeito no lugar. Isso é um falso negativo, e a lição
+    // é sobre a forma do teste: para provar que duas escritas são atômicas, a
+    // falha tem de acontecer ENTRE elas.
+    //
+    // Aqui ela acontece: o `in_reply_to` é um UUID que NÃO existe em
+    // `mensagens` (a forma de produção é uma mensagem apagada por retenção).
+    // `outbound_messages` não tem FK para `mensagens` (migração 063), então o
+    // INSERT do artefato PASSA; `audit_log.mensagem_id` TEM
+    // (`REFERENCES mensagens(id)`, migração 001), então o `auditTx` seguinte
+    // viola a FK e aborta a transação — com o artefato já inserido.
+    //
+    // Com o INSERT dentro do `withTx`: rollback total.
+    // Com o INSERT fora (a sonda 4): a linha fica COMMITADA enquanto o turno
+    // volta para `running` — uma saída lógica órfã, sem turno que a reclame.
+    // ─────────────────────────────────────────────────────────────────────
+    const mensagemApagada = randomUUID();
+    const handle = handleComPosse(claimToken, 3);
+
+    await expect(
+      comoOWorkerDono(handle, () =>
+        sendOutbound(pessoaId, conversaId, 'resposta órfã', mensagemApagada, {
+          channel_id: null,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(OutboundDeliveryError);
+
+    expect(canal.sendText).not.toHaveBeenCalled();
+    // A linha do artefato NÃO sobreviveu ao rollback.
+    const { rows } = await pool.query(
+      `SELECT id FROM outbound_messages WHERE in_reply_to = $1`,
+      [mensagemApagada],
+    );
+    expect(rows).toHaveLength(0);
+    // E o turno voltou: as duas escritas eram a MESMA transação.
+    expect((await statusDoTurno())!.status).toBe('running');
+    expect((await statusDoTurno())!.state_version).toBe(3);
+    // A auditoria também não sobrou pela metade.
+    const auditoria = await pool.query(
+      `SELECT id FROM audit_log WHERE conversa_id = $1 AND acao = 'outbound_committed'`,
+      [conversaId],
+    );
+    expect(auditoria.rows).toHaveLength(0);
+  });
+
   it('o erro do commit é classificado como PRE-SEND (delivered:false), não como ambíguo', async () => {
     const zumbi = handleComPosse(null, 3);
     const erro = await comoOWorkerDono(zumbi, () =>

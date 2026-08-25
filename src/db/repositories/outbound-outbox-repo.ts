@@ -38,9 +38,6 @@ import { and, eq, sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { agent_turns, outbound_messages } from '../schema.js';
 import type { AgentTurn } from '../schema.js';
-
-/** A row do outbox, como o Drizzle a projeta. */
-export type OutboundOutboxRow = typeof outbound_messages.$inferSelect;
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import { auditTx } from '@/governance/audit.js';
 import { assertTurnTransition } from '@/runtime/turns/contract.js';
@@ -48,6 +45,9 @@ import type { TurnStatus } from '@/runtime/turns/contract.js';
 import { turnWriteConditions } from './turn-fence-sql.js';
 import type { OutboundArtifact } from '@/runtime/outbound/contract.js';
 import { legacyChannelFor } from '@/runtime/outbound/contract.js';
+
+/** A row do outbox, como o Drizzle a projeta. */
+export type OutboundOutboxRow = typeof outbound_messages.$inferSelect;
 
 /**
  * Estados do turno a partir dos quais o commit outbound é aceito.
