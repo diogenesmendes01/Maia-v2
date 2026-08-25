@@ -17,7 +17,8 @@ const repo = {
   markClaimed: vi.fn(),
   markRunning: vi.fn(),
   markIgnored: vi.fn(),
-  markSuperseded: vi.fn(),
+  markSupersededSelf: vi.fn(),
+  markSupersededByAbsorber: vi.fn(),
   completeTurnTx: vi.fn(),
   markRetryable: vi.fn(),
   markDeadLetter: vi.fn(),
@@ -142,9 +143,9 @@ describe('turn lifecycle — o outcome determina o estado terminal', () => {
   });
 
   it('`merged_into_turn` vai para `superseded`', async () => {
-    repo.markSuperseded.mockResolvedValue(ok('superseded', 'merged_into_turn'));
+    repo.markSupersededSelf.mockResolvedValue(ok('superseded', 'merged_into_turn'));
     await concludeTurn(handle(), 'merged_into_turn');
-    expect(repo.markSuperseded).toHaveBeenCalled();
+    expect(repo.markSupersededSelf).toHaveBeenCalled();
     expect(repo.markIgnored).not.toHaveBeenCalled();
   });
 
@@ -263,7 +264,7 @@ describe('turn lifecycle — AUTORITATIVO: falha de transição é BLOQUEANTE', 
   it.each([
     ['reply_delivered (completed)', 'completeTurnTx' as const],
     ['identity_unknown (ignored)', 'markIgnored' as const],
-    ['merged_into_turn (superseded)', 'markSuperseded' as const],
+    ['merged_into_turn (superseded)', 'markSupersededSelf' as const],
   ])('conclusão terminal %s propaga TurnStateWriteError', async (_label, method) => {
     repo[method].mockRejectedValue(boom());
     const outcome =

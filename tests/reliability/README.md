@@ -7,10 +7,13 @@
 
 ## Por que este harness existe
 
-`FEATURE_TURN_CLAIM` tem default `false` (`src/config/contract.ts:1615`). O
-claim atômico da #504 está implementado e **desligado em produção**, e hoje não
-existe prova de que ele sobrevive a um `SIGKILL` real: as suítes atuais simulam
-réplicas concorrentes **dentro de um mesmo processo**, com `worker_id` distinto.
+`FEATURE_TURN_CLAIM` passou a ter default **`true`** (`src/config/contract.ts`,
+decisão do dono na #504): o claim atômico está implementado e **ligado em
+produção desde o primeiro deploy**. Isso não afrouxa a necessidade deste
+harness — inverte o ônus dela. Antes a pergunta era "podemos ligar?"; agora é
+"o que está ligado sobrevive a um `SIGKILL` real?", e essa prova continua não
+existindo: as suítes atuais simulam réplicas concorrentes **dentro de um mesmo
+processo**, com `worker_id` distinto.
 
 Um `throw` simulado ainda roda `finally`, ainda fecha o pool, ainda deixa o
 heartbeat cancelar o timer. Um `SIGKILL` não roda nada disso — é exatamente por
