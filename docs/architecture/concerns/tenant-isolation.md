@@ -68,6 +68,7 @@ Every request entry-point (`src/gateway/baileys.ts`, every worker in `src/worker
 | Audit log | `audit_logs.tenant_id + agent_id` + metric labels | `src/governance/audit.ts` (see §4) |
 | Outbox | `outbox.tenant_id + agent_id` | `src/scheduling/repos.ts` |
 | Policy pubsub | Per-tenant Redis channel | `src/control-plane/policy/policy-cache.ts` |
+| Stream de ordenação do turno (#505) | `tenant_id + agent_id` são componentes OBRIGATÓRIOS do material canônico da `stream_key` **e** as duas primeiras colunas da PK de `agent_stream_sequences` — embutir na chave não é escopar, e é a PK que impede uma `stream_key` forjada de endereçar o contador de outro tenant | `src/runtime/turns/stream-key.ts`, `src/db/repositories/turn-repos.ts` |
 
 ## 4. Patterns
 
