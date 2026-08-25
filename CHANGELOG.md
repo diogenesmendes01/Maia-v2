@@ -260,6 +260,67 @@ Evidência: `tests/unit/observability/envelope-signature-v2.spec.ts` compila o W
 **Codificação canônica — achado negativo, verificado.** A pergunta era se um valor contendo o separador consegue forjar outro envelope. Não consegue: a codificação é `canonicalJson` (JSON de verdade, chaves ordenadas, `JSON.stringify` em toda chave e string), não concatenação com separador — aspas, vírgulas e dois-pontos dentro de um valor saem escapados e não fecham a própria string. Passou a ser teste em vez de comentário (`envelope-signature-v2.spec.ts` → "canonical encoding is unambiguous"), incluindo o caso de deslocamento de fronteira entre campos adjacentes (`tenant_id`+`agent_id`).
 
 
+### ⚠️ AÇÃO DO OPERADOR — o recurso de migration da infra real recebe SÓ o subset `migrator` ([#565](https://github.com/diogenesmendes01/Maia-v2/issues/565))
+
+> **Se o seu Coolify já tem um recurso próprio para o passo de migration**,
+> copie `.env.migrator.prod.example` para o editor de variáveis dele, preencha
+> os `__SET_ME__`, e **remova de lá qualquer chave de aplicação que estiver
+> sobrando** — `WHATSAPP_*`, `OWNER_*`, chave de LLM, `VOYAGE_API_KEY`,
+> `BACKUP_S3_*`, `NEXTAUTH_SECRET`, `OIDC_*`. Elas não são usadas, e o único
+> efeito de estarem ali é aumentar o que um container comprometido pode vazar.
+> Passo a passo: `docs/runbooks/deploy-prod.md` §7.5. Quem sobe por
+> `compose.prod.yml` não tem nada a fazer — lá o serviço `migrate` já não tem
+> `env_file` desde a #516.
+
+A #565 entregou o gate (`npm run release:migrate`) e deixou em aberto a
+**configuração de deploy real**. Decisão do dono: a infraestrutura tem uma
+aplicação/job de migration **separada**, então ela recebe o subset `migrator` e
+nada mais. Isso fecha, fora do Compose, a lacuna que `deploy-prod.md` §7.3
+listava por escrito — *"o processo do migrator não os recebe, mas o container
+em volta dele sim"*. Agora nem o container recebe.
+
+- **`.env.migrator.prod.example`** (novo) — o subset `migrator` inteiro, 15
+  chaves, com o porquê de cada uma e a lista explícita do que ele NÃO recebe.
+  Ele é lido do disco por `tests/unit/config/migrator-subset.spec.ts`: o
+  arquivo cru **reprova** (os `__SET_ME__` são placeholders de verdade,
+  `secret/placeholder`) e, preenchido, faz `loadMigrationConfig()` passar. Um
+  exemplo que ninguém executa é um exemplo que apodrece.
+- **`src/config/migrator-subset.ts`** (novo) — a invariante do subset, e a
+  razão de ela não ser uma lista de nomes. O guard que existia
+  (`tests/unit/config/contract.spec.ts`) congelava sete nomes; a `WHATSAPP_*`
+  criada na semana que vem passaria por ele em silêncio. Aqui a afirmação é
+  sobre a **origem** da chave, lida do contrato: `group` (só `core` e
+  `database`), namespace Maia (só `MAIA_`, todo o resto de
+  `MAIA_KEY_PREFIXES` nomeia domínio de aplicação) e segredo-só-de-banco. Um
+  grupo novo em `GROUP_ORDER` ou um prefixo novo em `MAIA_KEY_PREFIXES` nasce
+  proibido **sem ninguém editar nada**. O PISO é a outra metade: `DATABASE_URL`
+  presente e obrigatória nos três profiles — um subset que encolhe demais não é
+  raio de explosão menor, é job quebrado.
+- **`loadMigrationConfig()` chama o guard no boot** (`src/config/migration-config.ts`),
+  e `scripts/migrate.ts` imprime a `MigratorSubsetError` inteira com exit 2 —
+  mesma exceção à redaction que a `ConfigValidationError` já tinha, e pela
+  mesma razão: a mensagem é feita de nome de variável, grupo e regra, nunca de
+  valor. Acrescentar `WHATSAPP_NUMBER_MAIA` ao subset não amplia o raio de
+  explosão do próximo deploy: derruba o migrator, nomeando a variável e a
+  regra.
+- **`tests/unit/scripts/migrate-subset-boot.spec.ts`** (novo) — a CLI REAL
+  (`tsx scripts/migrate.ts`) num processo separado, com o
+  `.env.migrator.prod.example` e mais nada (`PATH`/`HOME` à parte, que é o que
+  a imagem dá ao container). Ela tem de **atravessar** o gate de configuração —
+  a prova positiva é o `readiness: unknown … (ECONNREFUSED)` que só se imprime
+  depois dele — e não pode nomear nenhuma chave de aplicação. Evidência de que
+  fica vermelho: trocando `loadServiceConfig('migrator')` por
+  `loadServiceConfig('runtime')` em `src/config/migration-config.ts` (uma
+  linha, no call site de produção), o processo sai 2 com `Invalid configuration
+  for service "runtime"` cobrando `REDIS_URL`, `WHATSAPP_NUMBER_MAIA`,
+  `OWNER_*`, `BACKUP_S3_BUCKET`, `RUNTIME_TRACE_HMAC_MASTER_SECRET` e
+  `ANTHROPIC_API_KEY`. É o defeito da #596 do outro lado.
+- **Docs**: `docs/runbooks/deploy-prod.md` §7.5 (nova; Kubernetes virou §7.6),
+  com a tabela "executado / não verificado" estendida; `docs/runbooks/migrations.md`
+  ganhou a seção do recurso separado; `docs/admin-ui-deploy.md` deixa de
+  descrever a topologia como só duas aplicações;
+  `docs/architecture/modules/{migrations,config}.md`.
+
 ### Ordenação: a conversa passa a ter identidade e sequência duráveis — em shadow ([#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fases 1–2 de 9)
 
 > **AÇÃO DO OPERADOR: aplique as migrations 118/119 ANTES de subir o código.**
