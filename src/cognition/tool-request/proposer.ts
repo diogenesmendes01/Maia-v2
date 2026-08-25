@@ -36,6 +36,21 @@
  * e tem uma consequência prática: duas rodadas sobre a mesma evidência produzem
  * exatamente o mesmo rascunho, então uma proposta que mudou significa que a
  * EVIDÊNCIA mudou, não que o modelo teve outro dia.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * #637 (fatia B) — AGREGAÇÃO ANTES DE CRIAR
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A partir da fatia B, este call site pergunta PRIMEIRO se o pedido já existe
+ * no escopo (`aggregation.ts`, passo 6) e só cria proposta quando não existe. A
+ * ordem é o recurso: agregar depois de criar deixaria uma linha de
+ * `capability_proposals` por pedido e transformaria a agregação numa etiqueta
+ * em cima de duplicatas. Um pedido que se funde NÃO vira proposta — vira membro
+ * do agregado, com o `proposed_spec` INTEIRO preservado em
+ * `tool_request_aggregate_members.original_spec`, para que a fusão não possa
+ * apagar a evidência do pedido original.
+ *
+ * O guardrail continua valendo palavra por palavra: agregar não registra tool,
+ * não concede nada e não avalia `zod_source`.
  */
 import { GapLevel } from '@/types/enums.js';
 import { logger } from '@/lib/logger.js';
@@ -49,6 +64,14 @@ import type { AgentCapabilityGap, AgentCapabilityGapObservation } from '@/db/sch
 import { REGISTRY } from '@/tools/_registry.js';
 import { encontrarToolExistente, esbocarNomeDeTool } from './existing-tool.js';
 import { construirRascunhoDeContrato } from './contract-draft.js';
+import { decidirAgregacao, juntarAoAgregado } from './aggregation.js';
+import {
+  ASSINATURA_VERSION,
+  LIMIAR_SIMILARIDADE,
+  METRICA_SIMILARIDADE,
+} from './similarity.js';
+import { toolRequestAggregatesRepo } from '@/db/repositories.js';
+import type { EstadoDoContrato } from './draft-merge.js';
 import {
   TOOL_REQUEST_CAPABILITY_TYPE,
   TOOL_REQUEST_CONTRACT_STATUS,
@@ -65,8 +88,39 @@ const MAX_OBSERVACOES = 20;
 
 const MS_POR_DIA = 24 * 60 * 60 * 1000;
 
+/**
+ * #637 — o desfecho de um pedido, agora com o AGRUPAMENTO junto.
+ *
+ * `resultado` diz o que aconteceu, e os três valores pedem leituras diferentes:
+ *
+ *   · `criado` ..... não havia pedido parecido no escopo; virou proposta nova e
+ *                    representante de um agregado de 1.
+ *   · `agregado` ... havia. NÃO foi criada proposta: o pedido entrou como
+ *                    membro do agregado existente, e `proposal_id` é a do
+ *                    REPRESENTANTE. É este o caso em que "N pedidos viram 1".
+ *   · `ja_membro` .. este gap já era membro ativo. Rodar o worker de novo não
+ *                    cria proposta nem incrementa contador — a idempotência é
+ *                    do lado do dado, não da sorte de o cron não repetir.
+ *
+ * `spec` é SEMPRE o spec deste pedido, mesmo quando ele foi agregado — quem
+ * chama precisa poder logar o que ESTE gap dizia, não o que o representante diz.
+ */
 export type ToolRequestOutcome =
-  | { ok: true; proposal_id: string; spec: ToolRequestSpec }
+  | {
+      ok: true;
+      resultado: 'criado' | 'agregado' | 'ja_membro';
+      /** A proposta que representa o pedido. Em `agregado`, a do representante. */
+      proposal_id: string;
+      spec: ToolRequestSpec;
+      /** `null` só quando a descrição não deixou token de conteúdo nenhum. */
+      aggregate_id: string | null;
+      member_id: string | null;
+      /** O score que justificou a fusão. `null` quando não houve fusão. */
+      similaridade: number | null;
+      /** O contador do agregado depois deste pedido. */
+      member_count: number;
+      contract_state: EstadoDoContrato | null;
+    }
   | {
       ok: false;
       reason:
@@ -197,7 +251,74 @@ export async function proposeToolRequestForGap(args: {
     return { ok: false, reason: 'spec_invalido', detail: validado.error.message };
   }
 
+  // 6 · #637 — ANTES de criar proposta, pergunte se este pedido já existe.
+  //
+  //     A ordem é o recurso. Se a proposta fosse criada primeiro e a agregação
+  //     viesse depois, o backlog ganharia UMA LINHA POR PEDIDO e a agregação
+  //     seria uma etiqueta em cima de duplicatas — exatamente o que a issue
+  //     manda evitar. Decidindo antes, o pedido parecido NUNCA vira linha de
+  //     `capability_proposals`: ele vira MEMBRO, com o spec inteiro preservado.
+  let decisao;
   try {
+    decisao = await decidirAgregacao({
+      gap_id: gap.id,
+      capability_description: gap.capability_description,
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      reason: 'repo_falhou',
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
+
+  try {
+    // 6a · Já é membro ativo: nada a criar, nada a contar. Idempotência do lado
+    //      do dado — duas passadas do cron sobre o mesmo gap não inflam o
+    //      contador, que é o número que a issue existe para tornar significativo.
+    if (decisao.decisao === 'ja_membro') {
+      const agregado = await toolRequestAggregatesRepo.findById(decisao.aggregate_id);
+      return {
+        ok: true,
+        resultado: 'ja_membro',
+        proposal_id: agregado?.representative_proposal_id ?? '',
+        spec: validado.data,
+        aggregate_id: decisao.aggregate_id,
+        member_id: null,
+        similaridade: null,
+        member_count: agregado?.member_count ?? 0,
+        contract_state: (agregado?.contract_state as EstadoDoContrato | undefined) ?? null,
+      };
+    }
+
+    // 6b · Achou pedido parecido. N vira 1: SEM proposta nova.
+    if (decisao.decisao === 'funde') {
+      const agregado = await toolRequestAggregatesRepo.findById(decisao.aggregate_id);
+      if (!agregado) {
+        return { ok: false, reason: 'repo_falhou', detail: 'agregado sumiu entre ler e escrever' };
+      }
+      const { member_id, estado } = await juntarAoAgregado({
+        aggregate_id: decisao.aggregate_id,
+        representative_gap_id: agregado.representative_gap_id,
+        assinatura: decisao.assinatura,
+        similaridade: decisao.similaridade,
+        gap_id: gap.id,
+        spec: validado.data,
+      });
+      return {
+        ok: true,
+        resultado: 'agregado',
+        proposal_id: decisao.representative_proposal_id,
+        spec: validado.data,
+        aggregate_id: decisao.aggregate_id,
+        member_id,
+        similaridade: decisao.similaridade,
+        member_count: estado.member_count,
+        contract_state: estado.contract_state,
+      };
+    }
+
+    // 6c · Pedido novo: a proposta é criada, como na fatia A.
     const proposta = await capabilityProposalsRepo.create({
       gap_id: gap.id,
       capability_type: TOOL_REQUEST_CAPABILITY_TYPE,
@@ -216,6 +337,52 @@ export async function proposeToolRequestForGap(args: {
       test_scenarios: [],
     });
 
+    // O agregado de 1. Criá-lo já aqui — e não só quando aparecer o segundo
+    // pedido — é o que faz o SEGUNDO ter com que se comparar. Sem isto a
+    // agregação só começaria a valer a partir do terceiro pedido, em silêncio.
+    //
+    // LIMITAÇÃO CONHECIDA, e escrita: proposta e agregado são DUAS escritas
+    // sem transação (o repositório deste projeto não usa `db.transaction`).
+    // Se a segunda falhar, sobra uma proposta sem agregado, e a passada
+    // seguinte do worker abre OUTRA proposta para o mesmo gap — uma duplicata,
+    // que é o erro barato desta fatia (a triagem fecha) e não o caro (demanda
+    // apagada). Fechar essa janela pede transação no repositório, que é
+    // mudança de padrão do projeto inteiro e não cabe aqui.
+    //
+    // `sem_assinatura` é a exceção declarada: uma descrição sem token de
+    // conteúdo não tem chave de comparação, então o pedido fica como proposta
+    // isolada. Fail-open no AGRUPAMENTO é fail-closed na FUSÃO — o erro cai no
+    // lado barato (uma duplicata que a triagem fecha), nunca no caro.
+    let aggregate_id: string | null = null;
+    let member_id: string | null = null;
+    let contract_state: EstadoDoContrato | null = null;
+    if (decisao.decisao === 'novo') {
+      const criado = await toolRequestAggregatesRepo.criarComRepresentante({
+        assinatura: decisao.assinatura,
+        assinatura_version: ASSINATURA_VERSION,
+        metrica: METRICA_SIMILARIDADE,
+        limiar: LIMIAR_SIMILARIDADE,
+        representative_proposal_id: proposta.id,
+        representative_gap_id: gap.id,
+        proposed_tool_name: nomeProposto,
+        nomes_propostos: [nomeProposto],
+        contract_state: 'single',
+        merged_contract_draft: validado.data.contract_draft,
+        contract_conflicts: [],
+        intent: validado.data.intent,
+        occurrences: validado.data.frequency.occurrences,
+        original_spec: validado.data,
+      });
+      aggregate_id = criado.agregado.id;
+      member_id = criado.membro.id;
+      contract_state = 'single';
+    } else {
+      logger.warn(
+        { gap_id: gap.id },
+        'tool_request.sem_assinatura_para_agregar',
+      );
+    }
+
     // Invariante #4 — decisão de governança auditada. O que a linha registra é
     // que a Maia PEDIU, com o nome que propôs e a evidência que usou; nada
     // sobre instalação, porque nada foi instalado.
@@ -230,10 +397,22 @@ export async function proposeToolRequestForGap(args: {
         situations_with_trace: validado.data.situations.filter((s) => s.trace_resolved).length,
         completeness: validado.data.contract_draft.completeness,
         contract_status: TOOL_REQUEST_CONTRACT_STATUS,
+        aggregate_id,
+        assinatura_version: aggregate_id === null ? null : ASSINATURA_VERSION,
       },
     });
 
-    return { ok: true, proposal_id: proposta.id, spec: validado.data };
+    return {
+      ok: true,
+      resultado: 'criado',
+      proposal_id: proposta.id,
+      spec: validado.data,
+      aggregate_id,
+      member_id,
+      similaridade: null,
+      member_count: aggregate_id === null ? 0 : 1,
+      contract_state,
+    };
   } catch (e) {
     return {
       ok: false,

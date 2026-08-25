@@ -106,12 +106,21 @@ async function proporParaGapNoTopo(gap: AgentCapabilityGap): Promise<void> {
   try {
     const pedido = await proposeToolRequestForGap({ gap });
     if (pedido.ok) {
+      // #637 — `resultado` distingue os três desfechos, e a distinção importa
+      // para quem lê o log: `criado` é backlog novo, `agregado` é demanda
+      // somada a um pedido que já existia (nenhuma proposta nova foi criada), e
+      // `ja_membro` é a passada repetida do cron não contando duas vezes.
       logger.info(
         {
+          resultado: pedido.resultado,
           proposal_id: pedido.proposal_id,
           gap_id: gap.id,
           proposed_tool_name: pedido.spec.contract_draft.proposed_tool_name,
           occurrences: pedido.spec.frequency.occurrences,
+          aggregate_id: pedido.aggregate_id,
+          similaridade: pedido.similaridade,
+          member_count: pedido.member_count,
+          contract_state: pedido.contract_state,
         },
         'gap_escalation.tool_request_created',
       );

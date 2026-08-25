@@ -122,6 +122,15 @@ export function renderizarZodSource(args: {
   outputs: readonly CampoDoContrato[];
   ocorrencias: number;
   gap_id: string;
+  /**
+   * #637 — linhas de comentário acrescentadas logo abaixo do cabeçalho fixo.
+   * A fusão de rascunhos (`draft-merge.ts`) usa isto para dizer, DENTRO do
+   * texto, que aquele rascunho é a união de N pedidos agregados — para que a
+   * marcação sobreviva ao copiar-e-colar do trecho para fora do JSON, pelo
+   * mesmo motivo que `MARCADOR_DE_RASCUNHO` existe. Opcional: sem elas, a
+   * renderização é byte-a-byte a mesma de antes.
+   */
+  notas?: readonly string[];
 }): string {
   const base = paraCamelCase(args.proposed_tool_name);
   return [
@@ -131,6 +140,7 @@ export function renderizarZodSource(args: {
     '// NENHUMA tool foi registrada, instalada ou executada por causa deste texto.',
     '// O caminho de uma tool nova continua sendo o normal: código revisado,',
     '// contrato Zod, classe de risco e aprovação.',
+    ...(args.notas ?? []),
     '',
     `// tool proposta: ${args.proposed_tool_name}`,
     `const ${base}InputProposto = ${renderizarObjeto(
