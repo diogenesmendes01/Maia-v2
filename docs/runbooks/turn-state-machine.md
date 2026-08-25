@@ -717,3 +717,185 @@ sobre `agent_turns` — bloqueio de runtime durante um rollback. O arquivo tem u
 Ordem no rollback COMPLETO do protocolo de stream: `124` → `122` → `120`. A
 `124` sozinha é independente e pode ser derrubada e reaplicada sem tocar nas
 outras duas — é isso que a torna o kill switch da fatia.
+
+---
+
+## 11. Head-of-line como condição do claim (#626, fatia C da #505)
+
+Fase 6 do rollout da #505, e a primeira que muda **quem** pode ser
+reivindicado. Depois desta fatia, um turno só é claimável quando **não existe
+turno anterior não terminal na mesma stream** — "anterior" medido por
+`first_ingress_seq`, a fronteira que a fatia A (#624) passou a persistir.
+
+Isso fecha as falhas nº 1 e nº 3 da issue-mãe (*M1 e M2 chegam nessa ordem, mas
+M2 termina antes de M1*; *um retry antigo reaparece depois de um turno mais
+novo*). O que ela **não** faz: promover o sucessor quando o head termina — isso
+é a #627, e a consequência está na §11.5.
+
+### 11.1 As duas condições, e onde cada uma mora
+
+A issue-mãe pede duas coisas ao mesmo tempo, e elas moram em lugares diferentes
+de propósito:
+
+| Condição | Onde | Recusa |
+|---|---|---|
+| não existe turno **anterior não terminal** na stream | `NOT EXISTS` no `WHERE` do claim — [`src/db/repositories/stream-head-sql.ts`](../../src/db/repositories/stream-head-sql.ts) | `not_head` / `stream_blocked` |
+| não existe outro turno **ativo com lease válida** na stream | índice `agent_turns_stream_active_uq` (#625, migration 124) | `stream_busy` |
+
+A **ordem em que falham é observável**: o `WHERE` roda antes do índice, então um
+turno posterior numa conversa ocupada devolve `not_head` — não `stream_busy`.
+O `stream_busy` continua existindo para o que a ordem não consegue decidir:
+turnos com `stream_key` e **sem** `first_ingress_seq` (backfill, replay), e
+sequências empatadas dentro da mesma stream. Se `stream_busy` subir depois desta
+fatia, procure por esses dois — não por conversas quentes.
+
+### 11.2 `not_head` e `stream_blocked` não são sinônimos
+
+As duas param o claim. A leitura operacional é oposta, e é por isso que são
+códigos diferentes:
+
+| Código | Estado do bloqueador | O que fazer |
+|---|---|---|
+| `not_head` | `received`, `queued`, `claimed`, `running`, `retryable` | **nada.** A conversa tem fila e ela anda sozinha. |
+| `stream_blocked` | `outbound_pending` | **runbook do outbox (#506).** Nenhum claim tira um turno de `outbound_pending`; quem o move é o delivery worker. Esperar não resolve. |
+
+**A decisão de projeto que merece ser contestada:** `outbound_pending` bloqueia a
+ordem, e a fatia B decidiu que ele **não** ocupa a stream (§10.1). As duas coisas
+são verdadeiras porque respondem a perguntas diferentes — "quantos podem estar
+ativos?" e "quem é o próximo?" —, mas o efeito prático é que uma
+indisponibilidade do provedor de saída **para a conversa** (não o tenant, não a
+fila). É o preço de FIFO: responder M2 antes de a resposta de M1 ter saído é
+exatamente a inversão que a #505 existe para impedir. Se esse preço não for
+aceitável para uma coorte, o kill switch é `FEATURE_TURN_HEAD_OF_LINE=false`
+(§11.6), não mexer no predicado.
+
+### 11.3 O que olhar
+
+| Sinal | Onde | Leitura |
+|---|---|---|
+| `maia_stream_fifo_violation_total{stage}` | `/metrics` | **Sempre zero.** A issue-mãe lista `fifo_violation_total > 0` entre os critérios de ABORTAR o rollout, ao lado de violação de isolamento. `stage="claim"` é o canário da pós-condição do claim; `stage="recovery"` é o do varredor. A série é publicada em ZERO no boot — se ela sumir de `/metrics`, o problema é o processo, não a métrica. |
+| `maia_stream_blocked_total{reason}` | `/metrics` | `not_head` é ROTINA: cada mensagem que chega enquanto a anterior roda conta um ponto. O que se vigia é a FORMA — `not_head` crescendo sem `maia_turn_claim_total{result="acquired"}` correspondente é uma conversa que parou. `stream_blocked` sustentado é o outbox. |
+| `maia_turn_claim_total{result}` | `/metrics` | ganhou `not_head` e `stream_blocked`. `stream_busy` deve CAIR quase a zero depois desta fatia (§11.1). |
+| `turn_stream_blocked` | `audit_log` | `metadata.reason` + `metadata.blocked_by_turn_id`: é o que permite reconstruir a fila sem recorrer à `stream_key`. |
+| `turn_stream_fifo_violation` | `audit_log` | Nunca deveria existir. `metadata.stage` e `metadata.earlier_live` dizem onde e quantos. |
+| `turn.stream_head_blocked` / `turn.stream_fifo_violation` | log estruturado | o segundo com `ops_alert: true`. |
+
+A fila de uma conversa, agora:
+
+```sql
+SELECT id, status, first_ingress_seq, last_ingress_seq,
+       attempt_count, next_attempt_at, lease_expires_at
+  FROM agent_turns
+ WHERE tenant_id = $1 AND agent_id = $2 AND stream_key = $3
+   AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')
+ ORDER BY first_ingress_seq;
+```
+
+A primeira linha é o head. Se ela não avança, a conversa inteira não avança —
+vá para a §11.5.
+
+### 11.4 O índice, e como confirmar que ele está de pé
+
+A regra é um `NOT EXISTS`, então ela é **correta sem índice nenhum** — só fica
+cara. A migration `126` cria `agent_turns_stream_head_live_idx`:
+
+```
+(tenant_id, agent_id, stream_key, first_ingress_seq)
+WHERE stream_key IS NOT NULL
+  AND status NOT IN ('completed','ignored','superseded','dead_letter')
+```
+
+Por que ele e não o `agent_turns_stream_head_idx` da `122`: naquele, `status` vem
+**depois** de `first_ingress_seq`, então a desigualdade `NOT IN` é FILTRO, não
+busca — o `NOT EXISTS` percorre todas as entradas anteriores da stream. Medido
+contra PostgreSQL 16, numa conversa com 5.000 turnos (4.997 já concluídos):
+
+| | plano | buffers | tempo |
+|---|---|---|---|
+| com a `126` | `Index Only Scan using agent_turns_stream_head_live_idx`, `Rows Removed by Filter: 0` | 2 | 0,097 ms |
+| sem a `126` | `Index Only Scan using agent_turns_stream_head_idx`, **`Rows Removed by Filter: 4997`** | 97 | 2,362 ms |
+
+O custo sem o índice cresce com o HISTÓRICO da conversa, que nunca encolhe —
+turno terminal não sai da tabela. Com ele, cresce com o BACKLOG, que é 0–2 na
+operação normal.
+
+**Confirme `indisvalid` à mão depois de aplicar.** Um `CREATE INDEX
+CONCURRENTLY` que falha deixa o índice inválido, e reaplicar a migration
+**devolve sucesso** (o `IF NOT EXISTS` encontra o índice inválido e responde
+`CREATE INDEX`) — o runner marca a migration como aplicada sem o índice, e nada
+distingue isso de um deploy bem-sucedido:
+
+```sql
+SELECT indexrelid::regclass AS indice, indisvalid, indisready
+  FROM pg_index
+ WHERE indexrelid::regclass::text = 'agent_turns_stream_head_live_idx';
+```
+
+`indisvalid = false` ⇒ `DROP INDEX CONCURRENTLY IF EXISTS
+agent_turns_stream_head_live_idx;` e reaplique a `126`. Ao contrário da `124`,
+aqui um índice inválido **não** quebra a invariante — quebra o desempenho. Trate
+como degradação, não como incidente de correção.
+
+### 11.5 Stream parada, e o que mudou em relação à §10.5
+
+O sintoma novo: `turn_stream_blocked` repetido para os turnos de uma conversa e
+o head sem avançar. Rode a consulta da §11.3 e leia a PRIMEIRA linha:
+
+| Head | Causa | Remediação |
+|---|---|---|
+| `claimed`/`running`, lease no FUTURO, heartbeat recente | worker saudável, trabalho longo | **nada**. É o FIFO funcionando. |
+| `claimed`/`running`, lease no PASSADO | dono morto | o próximo claim **do head** recupera sozinho (§10.1). Se ninguém tenta, rearme pelo recovery (§3). |
+| `retryable` com `next_attempt_at` no futuro | backoff em aberto | **nada**. A issue-mãe é explícita: "backoff não autoriza ultrapassagem silenciosa por mensagens posteriores". |
+| `outbound_pending` | outbox travado | runbook do outbox (#506). O código de recusa é `stream_blocked`, não `not_head`. |
+| `received`/`queued` há muito tempo | o job do head sumiu da fila | recovery (§3) — e ele já elege o head, pela mesma função do claim. |
+
+**A janela de latência que esta fatia introduz, e que a #627 fecha.** Antes, um
+head que morria com a lease vencida era destravado pelo SUCESSOR: ele
+reivindicava, a transação recuperava o morto e a conversa andava na hora — fora
+de ordem. Agora a recuperação continua acontecendo (é o que devolve o head a
+`retryable`), mas o sucessor é recusado como `not_head`. Quem avança é o head, na
+vez dele — e ele só volta à fila quando o varredor de recovery o rearma, o que
+leva até `STUCK_AFTER_MS` (2 min). É ordem comprada com latência no caminho de
+crash. A promoção idempotente do sucessor (#627) é o que devolve a latência sem
+devolver a inversão.
+
+**Nunca** conserte com `UPDATE agent_turns SET status = ...` à mão: isso pula o
+`state_version`, o fence e a trilha. Um turno que "não devia estar na frente"
+tem de sair pelo caminho normal (conclusão, `ignored` por política, ou DLQ
+auditada — que é a #629).
+
+### 11.6 Rollout e rollback
+
+Ordem obrigatória do deploy:
+
+1. `npm run db:migrate` (aplica a `126`) e **confirme `indisvalid` (§11.4)**;
+2. suba o código com `FEATURE_TURN_HEAD_OF_LINE=true` (o default).
+
+Subir o código antes da migration é **seguro em correção e caro em desempenho**:
+a regra funciona sem o índice e passa a varrer o histórico de cada conversa a
+cada claim. Não faça isso de propósito.
+
+O kill switch é a flag, não a migration:
+
+```
+FEATURE_TURN_HEAD_OF_LINE=false   # + restart
+```
+
+Com ela OFF o claim volta ao comportamento de #625 (qualquer turno elegível,
+com no máximo um ativo por stream) e a plataforma volta a poder responder M2
+antes de M1. Nenhum turno já gravado é perdido, e **religar não reordena nada**:
+a ordem vem de `first_ingress_seq`, que continua sendo gravado nas duas
+posições. A flag exige `FEATURE_TURN_STREAM_KEY` ligada — a combinação
+`HEAD_OF_LINE=true` + `STREAM_KEY=false` é recusada no boot pela regra
+`turn-head-of-line/requires-stream-key`, porque seria inerte (sem `stream_key`
+gravada, todo turno passa no predicado) e o operador acreditaria ter ligado o
+FIFO.
+
+O `_down` da `126` derruba **o índice, não a regra**. Num rollback de verdade a
+ordem é: desligue a flag primeiro, confirme que as réplicas recarregaram, e só
+então derrube o índice — na ordem inversa você deixa a regra ligada sem índice,
+que é exatamente a degradação que a fatia existe para evitar, aplicada de
+propósito durante um incidente.
+
+Ordem no rollback COMPLETO do protocolo de stream: `126` → `124` → `122` →
+`120`.
