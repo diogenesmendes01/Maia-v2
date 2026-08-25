@@ -74,6 +74,30 @@
  *   - maia_outbound_ledger_sweeper_promoted_total{tenant_id,agent_id}
  *   - maia_outbound_ledger_sweeper_cleaned_total{tenant_id,agent_id}
  *
+ * (C) O QUE ESTE SWEEPER **NÃO** TOCA — issue #633 (fatia D da #506)
+ *
+ *     Toda consulta abaixo filtra `turn_id IS NULL`, e o predicado é
+ *     CORRETIVO, não cosmético.
+ *
+ *     `outbound_messages` deixou de ser só o ledger do caminho síncrono: a
+ *     migração 121 (#630) a evoluiu para o OUTBOX DURÁVEL do turno, e uma row
+ *     nova nasce com `status='pending'` e `turn_id NOT NULL`, esperando o
+ *     delivery worker (#632). Sem `turn_id IS NULL` na operação (A), este
+ *     sweeper promoveria essa row a `'unknown'` cinco minutos depois de ela ser
+ *     criada — e `'unknown'` é TERMINAL para o claim de entrega
+ *     (`DELIVERY_TERMINAL_STATUSES`), então a resposta NUNCA seria entregue e
+ *     ninguém saberia: a row estaria num estado que o contrato legado chama de
+ *     "sent_no_persist", isto é, "não re-envie".
+ *
+ *     Ou seja: o housekeeping do ledger antigo teria virado uma máquina de
+ *     perder respostas do ledger novo. As duas coexistem na mesma tabela por
+ *     decisão explícita da 121 (uma autoridade só sobre "esta resposta saiu?"),
+ *     e o preço dessa decisão é exatamente este predicado.
+ *
+ *     Quem cuida da row DURÁVEL é `src/workers/outbound-recovery.ts` (#633):
+ *     ele rearma, reconcilia e manda para `dead_letter` — nunca promove a
+ *     `unknown` por idade.
+ *
  * Padrão de fan-out per-tenant: enumera (tenant_id, agent_id) DISTINCT em
  * outbound_messages (que tenham qualquer trabalho a fazer — rows pending
  * antigas OU rows terminais antigas), abre runWithTenantContext por tupla.
@@ -198,6 +222,8 @@ async function listTenantsWithWork(
     FROM ${outbound_messages}
     WHERE tenant_id IS NOT NULL
       AND agent_id IS NOT NULL
+      -- Issue #633: SÓ row LEGADA. Ver o bloco (C) no topo do arquivo.
+      AND turn_id IS NULL
       AND (
         (status = 'pending' AND created_at < now() - (${stalePendingSec} || ' seconds')::interval)
         OR (status IN ('sent', 'failed', 'unknown') AND created_at < now() - (${retentionDays} || ' days')::interval)
@@ -256,6 +282,11 @@ async function runSweepInner(
       WHERE tenant_id = ${tenant_id}
         AND agent_id = ${agent_id}
         AND status = 'pending'
+        -- Issue #633: SÓ row LEGADA. Sem este predicado, uma linha do OUTBOX
+        -- DURÁVEL (#630) esperando entrega seria promovida a 'unknown' — que é
+        -- TERMINAL para o delivery worker (#632) — e a resposta nunca sairia.
+        -- Ver o bloco (C) no topo do arquivo.
+        AND turn_id IS NULL
         AND created_at < now() - (${stalePendingSec} || ' seconds')::interval
       ORDER BY created_at ASC
       LIMIT ${recoveryLimitPerTenant}
@@ -329,6 +360,10 @@ async function runSweepInner(
         WHERE tenant_id = ${tenant_id}
           AND agent_id = ${agent_id}
           AND status IN ('sent', 'failed', 'unknown')
+          -- Issue #633: SÓ row LEGADA. A retenção do outbox DURÁVEL é outro
+          -- assunto (#506 §Retenção) e ainda não tem dono; apagar uma linha
+          -- durável por este caminho destruiria a trilha do turno.
+          AND turn_id IS NULL
           AND created_at < now() - (${retentionDays} || ' days')::interval
         ORDER BY created_at ASC
         LIMIT ${retentionBatchSize}
