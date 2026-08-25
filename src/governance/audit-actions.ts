@@ -330,6 +330,15 @@ export const AUDIT_ACTIONS = [
   // quantas situações têm trace resolvido). NADA sobre instalação: o pedido é
   // um documento inerte, e o guardrail é que só humano implementa e instala.
   'tool_request_proposed',
+  // #637 (fatia B da épica #471) — DOIS pedidos parecidos viraram UM.
+  // `tool_request_aggregated` registra a fusão com o número que a justificou
+  // (similaridade, limiar, métrica, versão da assinatura) e o estado em que o
+  // contrato ficou; `tool_request_aggregate_detached` registra o desfazimento.
+  // Um agrupamento automático sobre dado de governança sem o score que o
+  // produziu é um fato sem prova — e sem o par de ações, desfazer seria
+  // indistinguível de nunca ter agrupado.
+  'tool_request_aggregated',
+  'tool_request_aggregate_detached',
   // Issue #268 — channel resolver fail-loud: emitted when channel resolution
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.

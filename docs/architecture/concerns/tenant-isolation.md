@@ -146,6 +146,7 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 | `tests/integration/onboarding-leak.spec.ts` | Saga de onboarding (#519): leitura, escrita, retomada, cancelamento e ativação escopadas; CHECK contra `'default'`/`'system'`. **Ainda não está no script `test:leak`** |
 | `tests/unit/onboarding/readiness-facts-scope.spec.ts` | DB-free: o loader de readiness compila `tenant_id + agent_id` em cada `WHERE` |
 | `tests/unit/onboarding/readiness.spec.ts` | Readiness nunca compõe profile de um agente com canal de outro (nem entre tenants) |
+| `tests/integration/tool-request-aggregation-real-db.spec.ts` | #637 — a agregação de pedidos de ferramenta COMPARA o texto do pedido de um cliente com o de outro, então o escopo aqui não é formalidade: dois tenants com pedidos **byte a byte iguais** produzem dois agregados de 1, nunca um de 2; e o repositório não devolve o agregado do outro tenant nem com o `id` na mão (`id` não é fronteira de isolamento — #367/#368). **Está no script `test:leak`** |
 
 There is a dedicated npm script `npm run test:leak` that runs the leak suite — invoke it on any change that touches state or context.
 

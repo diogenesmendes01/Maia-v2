@@ -1514,6 +1514,122 @@ export const agent_capability_gap_observations = pgTable(
   }),
 );
 
+// #637 (fatia B da épica #471) — `tool_request_aggregates`: N pedidos de
+// ferramenta parecidos, vistos como UM pedido com contador.
+//
+// O escopo é `tenant_id` + `agent_id`, sem exceção e sem contador global — a
+// justificativa está no cabeçalho da migração 129 e em
+// `src/cognition/tool-request/aggregation.ts`.
+//
+// `metrica`, `limiar` e `assinatura_version` moram na LINHA porque um
+// agrupamento é uma decisão automática sobre dado de governança: sem o número
+// que a justificou, ninguém consegue dizer depois se ela era certa sob a regra
+// vigente na época.
+export const tool_request_aggregates = pgTable(
+  'tool_request_aggregates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    representative_proposal_id: uuid('representative_proposal_id').notNull(),
+    representative_gap_id: uuid('representative_gap_id').notNull(),
+    proposed_tool_name: text('proposed_tool_name').notNull(),
+    nomes_propostos: jsonb('nomes_propostos').notNull().default(sql`'[]'::jsonb`),
+    member_count: integer('member_count').notNull().default(0),
+    total_occurrences: integer('total_occurrences').notNull().default(0),
+    // 'single' | 'consistent' | 'divergent' — ver `draft-merge.ts`.
+    contract_state: text('contract_state').notNull(),
+    // NULO exatamente quando `contract_state = 'divergent'`; o CHECK
+    // `tool_request_aggregates_divergent_has_no_draft` (migração 129) impede
+    // que os dois se separem.
+    merged_contract_draft: jsonb('merged_contract_draft'),
+    contract_conflicts: jsonb('contract_conflicts').notNull().default(sql`'[]'::jsonb`),
+    first_member_at: timestamp('first_member_at', { withTimezone: true }).notNull().defaultNow(),
+    last_member_at: timestamp('last_member_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    demandaIdx: index('tool_request_aggregates_scope_demand_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.member_count,
+      t.last_member_at,
+    ),
+    assinaturaIdx: index('tool_request_aggregates_scope_signature_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.assinatura_version,
+    ),
+    representanteUnico: unique('tool_request_aggregates_representative_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.representative_proposal_id,
+    ),
+  }),
+);
+
+// #637 — `tool_request_aggregate_members`: o ledger APPEND-ONLY do agrupamento.
+//
+// `proposal_id` é NULO para todo membro que não é o representante: ele nunca
+// gerou linha em `capability_proposals`, e é isso que faz N pedidos virarem 1.
+// A evidência dele não se perde — `original_spec` guarda o `proposed_spec`
+// INTEIRO como ele entrou (situações com link de trace, janela de frequência e
+// o rascunho de contrato original).
+//
+// Sair do agregado é `detached_at`, NUNCA `DELETE`: é assim que a fusão é
+// reversível sem apagar a evidência do pedido original.
+export const tool_request_aggregate_members = pgTable(
+  'tool_request_aggregate_members',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    proposal_id: uuid('proposal_id'),
+    is_representative: boolean('is_representative').notNull().default(false),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    similaridade: numeric('similaridade', { precision: 5, scale: 4 }).notNull(),
+    intent: text('intent').notNull(),
+    occurrences: integer('occurrences').notNull().default(0),
+    original_spec: jsonb('original_spec').notNull(),
+    joined_at: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
+    detached_at: timestamp('detached_at', { withTimezone: true }),
+    detached_reason: text('detached_reason'),
+    detached_by: text('detached_by'),
+  },
+  (t) => ({
+    // Índice PARCIAL na DB (WHERE detached_at IS NULL); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `gap_observations_root_trace_idx`.
+    ativosIdx: index('tool_request_aggregate_members_ativos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.joined_at,
+    ),
+    gapIdx: index('tool_request_aggregate_members_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+    ),
+    gapUnico: unique('tool_request_aggregate_members_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.gap_id,
+    ),
+  }),
+);
+
 export const procedure_definitions = pgTable(
   'procedure_definitions',
   {
@@ -2600,6 +2716,11 @@ export type AgentCapabilityGapObservation =
   typeof agent_capability_gap_observations.$inferSelect;
 export type NewAgentCapabilityGapObservation =
   typeof agent_capability_gap_observations.$inferInsert;
+export type ToolRequestAggregate = typeof tool_request_aggregates.$inferSelect;
+export type NewToolRequestAggregate = typeof tool_request_aggregates.$inferInsert;
+export type ToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferSelect;
+export type NewToolRequestAggregateMember =
+  typeof tool_request_aggregate_members.$inferInsert;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;

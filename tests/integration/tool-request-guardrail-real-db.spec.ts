@@ -146,6 +146,18 @@ async function prepararCenario(c: pg.PoolClient): Promise<{ gapId: string }> {
 
 async function faxina(c: pg.PoolClient, gapId: string) {
   if (!gapId) return;
+  // #637 — o agregado referencia a proposta representante (sem ON DELETE
+  // CASCADE), então ele sai ANTES. Sem isto o DELETE da proposta falha por FK,
+  // o `.catch` engole o erro, e o agregado sobrevive: o caso seguinte — que
+  // usa a MESMA descrição de gap — seria AGREGADO em vez de virar proposta
+  // nova, e a contagem `= 1` deste arquivo daria 0 por um motivo que não tem
+  // nada a ver com o guardrail.
+  await c
+    .query('DELETE FROM tool_request_aggregate_members WHERE gap_id = $1', [gapId])
+    .catch(() => undefined);
+  await c
+    .query('DELETE FROM tool_request_aggregates WHERE representative_gap_id = $1', [gapId])
+    .catch(() => undefined);
   await c
     .query('DELETE FROM capability_proposals WHERE gap_id = $1', [gapId])
     .catch(() => undefined);

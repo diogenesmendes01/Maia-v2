@@ -50,8 +50,13 @@ export function normalizarTexto(texto: string): string {
 /**
  * Palavras que não ajudam a nomear uma tool. Lista curta e fechada de propósito:
  * uma lista grande passa a apagar o verbo que dá sentido ao nome.
+ *
+ * #637 — exportada para que a ASSINATURA de similaridade
+ * (`similarity.ts`) parta EXATAMENTE desta lista em vez de manter uma cópia que
+ * se afasta em silêncio. A assinatura ESTENDE a lista (lá o que sobra não vira
+ * nome, então uma lista maior é barata); o que ela não pode é discordar dela.
  */
-const PALAVRAS_VAZIAS = new Set([
+export const PALAVRAS_VAZIAS: ReadonlySet<string> = new Set([
   'a', 'as', 'o', 'os', 'um', 'uma', 'uns', 'umas',
   'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'nos', 'nas',
   'para', 'por', 'com', 'sem', 'e', 'ou', 'que', 'ao', 'aos', 'the',

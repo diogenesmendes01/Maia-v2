@@ -1,4 +1,4 @@
-import { eq, and, inArray, desc, sql } from 'drizzle-orm';
+import { eq, and, inArray, desc, isNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   agent_capabilities_domain,
@@ -9,6 +9,8 @@ import {
   capability_proposals,
   capability_test_results,
   runtime_trace_envelopes,
+  tool_request_aggregates,
+  tool_request_aggregate_members,
 } from '../schema.js';
 import { currentTraceId } from '@/observability/correlation.js';
 import { logger } from '@/lib/logger.js';
@@ -24,6 +26,8 @@ import type {
   NewGapEscalationRule,
   CapabilityProposal,
   CapabilityTestResult,
+  ToolRequestAggregate,
+  ToolRequestAggregateMember,
 } from '../schema.js';
 
 export const capabilitiesDomainRepo = {
@@ -856,6 +860,316 @@ export const capabilityTestResultsRepo = {
       )
       .orderBy(desc(capability_test_results.ran_at))
       .limit(1);
+    return rows[0] ?? null;
+  },
+};
+
+/**
+ * #637 (fatia B da épica #471) — o repositório do AGRUPAMENTO de pedidos de
+ * ferramenta.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TODA LEITURA E TODA ESCRITA SÃO ESCOPADAS POR (tenant_id, agent_id)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Isso não é zelo genérico: é a defesa central desta fatia. A agregação COMPARA
+ * o texto de um pedido com o texto de outro. Se a busca por candidato saísse do
+ * escopo, a demanda de um cliente entraria no contador de outro — e o vazamento
+ * seria pelo caminho mais difícil de notar, porque o resultado é só um número
+ * maior. Por isso:
+ *
+ *   · `candidatosParaFusao` filtra por tenant+agent ANTES de comparar, e nunca
+ *     recebe escopo por parâmetro (ele vem do ALS, sempre);
+ *   · `id` NUNCA é fronteira de isolamento (#367/#368): todo método que recebe
+ *     um `aggregate_id` também filtra por tenant+agent, então um id vazado de
+ *     outro escopo não colhe linha nenhuma;
+ *   · o teste de leak (`tests/integration/tool-request-aggregation-real-db.spec.ts`)
+ *     prova as duas coisas com dado semeado adversarialmente: pedidos IDÊNTICOS
+ *     em dois tenants.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * O CONTADOR É RECALCULADO, NUNCA INCREMENTADO
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `member_count` e `total_occurrences` são materializados para a listagem da
+ * triagem, mas toda escrita os recomputa a partir das linhas ATIVAS de
+ * `tool_request_aggregate_members`. Um contador incrementado diverge da
+ * realidade em silêncio no primeiro erro (uma retentativa, um destaque, um
+ * membro que entrou por outro caminho); um recalculado não tem como divergir
+ * sem que a tabela de membros esteja errada — e essa é a tabela que a auditoria
+ * lê de qualquer jeito.
+ */
+export const toolRequestAggregatesRepo = {
+  /**
+   * Os agregados DESTE escopo comparáveis com uma assinatura da versão dada.
+   *
+   * Só entram agregados da MESMA `assinatura_version`: uma assinatura produzida
+   * por outra regra não é comparável com esta, e comparar mesmo assim produziria
+   * um número de similaridade que não significa nada.
+   */
+  async candidatosParaFusao(assinatura_version: number): Promise<ToolRequestAggregate[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(tool_request_aggregates)
+      .where(
+        and(
+          eq(tool_request_aggregates.tenant_id, tenant_id),
+          eq(tool_request_aggregates.agent_id, agent_id),
+          eq(tool_request_aggregates.assinatura_version, assinatura_version),
+        ),
+      )
+      .orderBy(desc(tool_request_aggregates.last_member_at));
+  },
+
+  async findById(aggregate_id: string): Promise<ToolRequestAggregate | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(tool_request_aggregates)
+      .where(
+        and(
+          eq(tool_request_aggregates.tenant_id, tenant_id),
+          eq(tool_request_aggregates.agent_id, agent_id),
+          eq(tool_request_aggregates.id, aggregate_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  /** Os membros ATIVOS de um agregado, na ordem em que entraram. */
+  async membrosAtivos(aggregate_id: string): Promise<ToolRequestAggregateMember[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(tool_request_aggregate_members)
+      .where(
+        and(
+          eq(tool_request_aggregate_members.tenant_id, tenant_id),
+          eq(tool_request_aggregate_members.agent_id, agent_id),
+          eq(tool_request_aggregate_members.aggregate_id, aggregate_id),
+          isNull(tool_request_aggregate_members.detached_at),
+        ),
+      )
+      .orderBy(tool_request_aggregate_members.joined_at);
+  },
+
+  /**
+   * TODAS as linhas de membro deste gap — inclusive as DESTACADAS.
+   *
+   * As destacadas são o que impede o worker de desfazer sozinho, na rodada
+   * seguinte, um destaque que um humano fez: um gap já destacado de um agregado
+   * não volta a ele por similaridade. Sem esta leitura, "reversível" duraria até
+   * o próximo cron.
+   */
+  async membrosDoGap(gap_id: string): Promise<ToolRequestAggregateMember[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(tool_request_aggregate_members)
+      .where(
+        and(
+          eq(tool_request_aggregate_members.tenant_id, tenant_id),
+          eq(tool_request_aggregate_members.agent_id, agent_id),
+          eq(tool_request_aggregate_members.gap_id, gap_id),
+        ),
+      );
+  },
+
+  /**
+   * Um membro pelo id — escopado, porque `id` NUNCA é fronteira de isolamento
+   * (#367/#368): um id vazado de outro tenant não colhe linha.
+   */
+  async membroPorId(member_id: string): Promise<ToolRequestAggregateMember | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select()
+      .from(tool_request_aggregate_members)
+      .where(
+        and(
+          eq(tool_request_aggregate_members.tenant_id, tenant_id),
+          eq(tool_request_aggregate_members.agent_id, agent_id),
+          eq(tool_request_aggregate_members.id, member_id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+
+  /** Cria o agregado com o seu primeiro membro — o REPRESENTANTE. */
+  async criarComRepresentante(input: {
+    assinatura: string;
+    assinatura_version: number;
+    metrica: string;
+    limiar: number;
+    representative_proposal_id: string;
+    representative_gap_id: string;
+    proposed_tool_name: string;
+    nomes_propostos: string[];
+    contract_state: string;
+    merged_contract_draft: unknown;
+    contract_conflicts: unknown;
+    intent: string;
+    occurrences: number;
+    original_spec: unknown;
+  }): Promise<{ agregado: ToolRequestAggregate; membro: ToolRequestAggregateMember }> {
+    const agregadoGuardado = applyTenantGuard({
+      assinatura: input.assinatura,
+      assinatura_version: input.assinatura_version,
+      metrica: input.metrica,
+      limiar: input.limiar.toFixed(4),
+      representative_proposal_id: input.representative_proposal_id,
+      representative_gap_id: input.representative_gap_id,
+      proposed_tool_name: input.proposed_tool_name,
+      nomes_propostos: input.nomes_propostos,
+      member_count: 1,
+      total_occurrences: input.occurrences,
+      contract_state: input.contract_state,
+      merged_contract_draft: input.merged_contract_draft ?? null,
+      contract_conflicts: input.contract_conflicts ?? [],
+    });
+    const [agregado] = await db
+      .insert(tool_request_aggregates)
+      .values(agregadoGuardado as typeof tool_request_aggregates.$inferInsert)
+      .returning();
+
+    const membroGuardado = applyTenantGuard({
+      aggregate_id: agregado!.id,
+      gap_id: input.representative_gap_id,
+      proposal_id: input.representative_proposal_id,
+      is_representative: true,
+      assinatura: input.assinatura,
+      assinatura_version: input.assinatura_version,
+      metrica: input.metrica,
+      limiar: input.limiar.toFixed(4),
+      // O representante é comparado consigo mesmo. `1.0000` não é enfeite: é o
+      // que faz a coluna ter o mesmo significado em toda linha.
+      similaridade: '1.0000',
+      intent: input.intent,
+      occurrences: input.occurrences,
+      original_spec: input.original_spec,
+    });
+    const [membro] = await db
+      .insert(tool_request_aggregate_members)
+      .values(membroGuardado as typeof tool_request_aggregate_members.$inferInsert)
+      .returning();
+
+    return { agregado: agregado!, membro: membro! };
+  },
+
+  /**
+   * Acrescenta um membro a um agregado existente. NÃO cria proposta: é aqui
+   * que N pedidos viram 1.
+   */
+  async acrescentarMembro(input: {
+    aggregate_id: string;
+    gap_id: string;
+    assinatura: string;
+    assinatura_version: number;
+    metrica: string;
+    limiar: number;
+    similaridade: number;
+    intent: string;
+    occurrences: number;
+    original_spec: unknown;
+  }): Promise<ToolRequestAggregateMember> {
+    const guardado = applyTenantGuard({
+      aggregate_id: input.aggregate_id,
+      gap_id: input.gap_id,
+      proposal_id: null,
+      is_representative: false,
+      assinatura: input.assinatura,
+      assinatura_version: input.assinatura_version,
+      metrica: input.metrica,
+      limiar: input.limiar.toFixed(4),
+      similaridade: input.similaridade.toFixed(4),
+      intent: input.intent,
+      occurrences: input.occurrences,
+      original_spec: input.original_spec,
+    });
+    const [row] = await db
+      .insert(tool_request_aggregate_members)
+      .values(guardado as typeof tool_request_aggregate_members.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  /**
+   * Reescreve o CONTADOR e o estado do contrato a partir dos membros ativos.
+   *
+   * Recebe os números já calculados porque a política de fusão de rascunhos
+   * (`draft-merge.ts`) é lógica de cognição e não pertence ao repositório; o
+   * que pertence aqui é a escrita escopada.
+   */
+  async atualizarAgregado(input: {
+    aggregate_id: string;
+    member_count: number;
+    total_occurrences: number;
+    contract_state: string;
+    merged_contract_draft: unknown;
+    contract_conflicts: unknown;
+    nomes_propostos: string[];
+    last_member_at?: Date;
+  }): Promise<ToolRequestAggregate | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(tool_request_aggregates)
+      .set({
+        member_count: input.member_count,
+        total_occurrences: input.total_occurrences,
+        contract_state: input.contract_state,
+        merged_contract_draft: input.merged_contract_draft ?? null,
+        contract_conflicts: input.contract_conflicts ?? [],
+        nomes_propostos: input.nomes_propostos,
+        ...(input.last_member_at ? { last_member_at: input.last_member_at } : {}),
+        updated_at: new Date(),
+      })
+      .where(
+        and(
+          eq(tool_request_aggregates.tenant_id, tenant_id),
+          eq(tool_request_aggregates.agent_id, agent_id),
+          eq(tool_request_aggregates.id, input.aggregate_id),
+        ),
+      )
+      .returning();
+    return rows[0] ?? null;
+  },
+
+  /**
+   * DESTACA um membro: marca `detached_at`, e NUNCA apaga.
+   *
+   * O `UPDATE` exige `detached_at IS NULL` para que dois destaques concorrentes
+   * não sobrescrevam o motivo do primeiro — quem chegou depois não colhe linha e
+   * o chamador sabe disso pelo `null`.
+   */
+  async destacarMembro(input: {
+    member_id: string;
+    reason: string;
+    by: string | null;
+  }): Promise<ToolRequestAggregateMember | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(tool_request_aggregate_members)
+      .set({
+        detached_at: new Date(),
+        detached_reason: input.reason,
+        detached_by: input.by,
+      })
+      .where(
+        and(
+          eq(tool_request_aggregate_members.tenant_id, tenant_id),
+          eq(tool_request_aggregate_members.agent_id, agent_id),
+          eq(tool_request_aggregate_members.id, input.member_id),
+          isNull(tool_request_aggregate_members.detached_at),
+        ),
+      )
+      .returning();
     return rows[0] ?? null;
   },
 };
