@@ -4,6 +4,93 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — a triagem no console fecha o ciclo: aceitar → issue → tool registrada → gap fechado ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638), fatia C de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471) — fecha a épica)
+
+**O que faltava.** A fatia A (#636) fez o gap recorrente virar pedido
+estruturado; a fatia B (#637) fez N pedidos parecidos virarem UM com contador.
+Nas duas, o pedido morria no backlog: ninguém decidia nada sobre ele, e nada
+acontecia quando a ferramenta finalmente existia. A tela que havia (`#476`)
+montava o corpo de uma issue **no navegador** e abria um link para
+`issues/new?...` — sem idempotência (dois cliques, duas abas), duplicando lógica
+de backend (um `slugify` próprio que não é o `esbocarNomeDeTool` da fatia A) e
+mostrando o GAP em vez do PEDIDO AGRUPADO.
+
+**O que passa a existir.** `tool_request_issues` (a reserva do aceite),
+`resolved_at`/`resolved_reason`/`resolved_tool_name` em `agent_capability_gaps`
+(o fechamento) e `tool_request_notifications` (o aviso ao agente) — migração
+132. No console, o router `toolRequests` com `list` / `detail` / `aceitar` /
+`desagrupar`. No runtime, dois workers: o relayer que abre a issue (a cada 5
+min) e o monitor que fecha o gap (de hora em hora).
+
+**Aceitar duas vezes cria UMA issue, e a decisão é do banco.** Não é um `if` que
+consulta antes de inserir — essa janela é exatamente onde dois cliques rápidos
+caem. É a UNIQUE `(tenant_id, agent_id, aggregate_id)` com
+`ON CONFLICT DO NOTHING`: o segundo aceite não colhe linha, lê a existente e
+devolve `ja_aceito`, auditado como `tool_request_accept_duplicado` — um aceite
+sem efeito não pode ser indistinguível de um aceite que nunca chegou.
+
+**A chave de idempotência viaja no corpo da issue.** `sha256` truncado de
+`maia.tool_request.v1|tenant|agent|aggregate`, determinística e reproduzível.
+Ela estende a idempotência para além do banco: se o processo morrer entre a
+chamada externa ter sucedido e o resultado ser gravado, o relayer **encontra** a
+issue pelo marcador e a ADOTA (`adopted = true`) em vez de abrir a segunda.
+Limitação declarada: a busca pagina no máximo 5 × 100 issues com o label da
+triagem; o caminho normal não depende disso (é a UNIQUE que o serve), só a
+janela de crash.
+
+**O corpo da issue é escrito supondo que a issue é pública.** Fora dele, de
+propósito: `tenant_id`/`agent_id` em texto claro (a correlação é o hash) e o
+texto livre de cada situação, que sai de turno real e pode carregar nome, valor
+ou assunto do interlocutor — o corpo diz onde lê-las (o console, atrás de
+autenticação). É a mesma decisão de privacidade que a fatia A tomou para
+`attempted_args`, levada até o fim. Consequência aceita: a issue sozinha não
+reconstrói o caso de uso em detalhe; ela permite DECIDIR.
+
+**A credencial do GitHub não existe no processo que serve o botão.**
+`MAIA_TOOL_REQUEST_GITHUB_TOKEN` é declarado com `services: ['runtime']`, e o
+Admin UI valida o próprio subset no boot — o token não é lido, não é tipado e
+não existe lá. O DESTINO (`MAIA_TOOL_REQUEST_ISSUE_REPO`) é lido pelos dois,
+porque o dono precisa ver para onde a issue vai antes de aceitar. O preço é uma
+indireção (aceitar reserva; o relayer abre em até 5 min); o ganho é que a
+separação é estrutural, não disciplina.
+
+**O gap fecha por FATO, nunca por caixa marcada.** `resolved_at` só é escrito
+quando a tool é chave viva do registro **e** está no conjunto que o grant
+daquele tenant/agent deriva. O casamento de nome é a MESMA função da fatia A
+(`encontrarToolExistente`), na direção oposta. Nenhuma rota do console escreve
+essas colunas, e o teste arquitetural do console proíbe `resolverGap(` e
+`resolved_at:` em todo o caminho da triagem. Consequência aceita e escrita: uma
+ferramenta implementada com nome que não aparece no texto do gap nem entre os
+nomes propostos **não** fecha sozinha — o erro cai do lado barato.
+
+**O agente é avisado, e o aviso custa zero ida a mais ao banco.** O gap resolvido
+sai do bloco de limitações (ele parava de dizer "não consigo" só por isso) e
+entra num bloco novo, `## Capacidades novas`, que diz qual ferramenta passou a
+existir. Os dois blocos saem da MESMA leitura
+(`capabilityGapsRepo.listParaOTurno`), no caminho mais quente do sistema. O que
+isso NÃO é: recibo de entrega por turno — o que é auditável é a EMISSÃO
+(`tool_request_agent_notified`); que o prompt carrega o aviso é provado por
+teste sobre o `buildPrompt` de produção.
+
+**O guardrail continua inegociável.** *O agente especifica; humano implementa e
+instala.* Não há botão "aprovar e instalar". Aceitar cria uma issue e nada mais.
+Além da invariante de runtime do #636 (agora rodada também depois de ACEITAR e
+de FECHAR), a fatia traz uma varredura estática **do console**, derivada do
+grafo de imports a partir do router real — a do #636 não cobria isso, porque
+`admin-ui/` é barreira lá (o console legitimamente edita grants em outras
+telas).
+
+**Reversibilidade.** `desagrupar` expõe no console a ação da fatia B:
+`detached_at` + motivo + autor, nunca `DELETE`; o `original_spec` do membro
+continua legível e o contador é recalculado a partir dos ativos.
+
+**Auditoria.** `tool_request_accepted`, `tool_request_accept_duplicado`,
+`tool_request_issue_created` (com `adopted`), `tool_request_issue_failed` (só
+falha TERMINAL — auditar cada retentativa de um 500 transitório viraria log de
+rede), `tool_request_gap_closed` e `tool_request_agent_notified`. As três
+primeiras carregam `instalou_tool: false` / `concedeu_capability: false` na
+própria linha.
+
 ### Added — N pedidos de ferramenta parecidos viram UM pedido com contador ([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637), fatia B de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
 
 **O que mudava de mão antes.** A fatia A (#636) faz cada gap recorrente de tool

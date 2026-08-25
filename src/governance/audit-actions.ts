@@ -339,6 +339,34 @@ export const AUDIT_ACTIONS = [
   // indistinguível de nunca ter agrupado.
   'tool_request_aggregated',
   'tool_request_aggregate_detached',
+  // #638 (fatia C da épica #471) — a TRIAGEM. Cinco ações, e cada uma existe
+  // porque o fato que ela registra é distinguível dos outros:
+  //
+  //   · `tool_request_accepted` — o dono decidiu abrir issue para o pedido. A
+  //     linha diz o que foi aceito, com que chave de idempotência e para qual
+  //     repositório, e declara `instalou_tool: false` / `concedeu_capability:
+  //     false` — porque aceitar é criar uma issue, e nada mais.
+  //   · `tool_request_accept_duplicado` — o segundo clique, que NÃO abriu uma
+  //     segunda issue. É a prova de que a idempotência mordeu; sem ela, um
+  //     aceite sem efeito seria indistinguível de um aceite que nunca chegou.
+  //   · `tool_request_issue_created` — o efeito EXTERNO consumado, com o número
+  //     da issue. `adopted:true` distingue "criei agora" de "reconheci pelo
+  //     marcador uma issue que eu já tinha aberto antes de um crash".
+  //   · `tool_request_issue_failed` — a chamada externa falhou de forma
+  //     TERMINAL (credencial, permissão, destino inexistente). Falha
+  //     recuperável NÃO gera ação: ela volta para a fila e auditá-la a cada
+  //     tentativa transformaria a auditoria em log de retentativa.
+  //   · `tool_request_gap_closed` / `tool_request_agent_notified` — o gap
+  //     fechou porque a ferramenta EXISTE e ESTÁ CONCEDIDA (a evidência da
+  //     verificação vai no metadata), e o agente foi avisado. São dois fatos e
+  //     duas linhas: um gap pode fechar sem aviso novo (já havia um), e ler as
+  //     duas juntas é o que permite auditar o laço inteiro da épica.
+  'tool_request_accepted',
+  'tool_request_accept_duplicado',
+  'tool_request_issue_created',
+  'tool_request_issue_failed',
+  'tool_request_gap_closed',
+  'tool_request_agent_notified',
   // Issue #268 — channel resolver fail-loud: emitted when channel resolution
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.

@@ -84,6 +84,12 @@ export const SECTION_BUDGETS = {
   hints: { max_items: 20, max_bytes: 4_000 },
   capabilities: { max_items: 5, max_bytes: 2_000 },
   gaps: { max_items: 5, max_bytes: 2_000 },
+  // #638 (fatia C da épica #471) — o aviso "isto você JÁ consegue", para os
+  // gaps que fecharam porque a ferramenta pedida passou a existir e a estar
+  // concedida. Orçamento pequeno de propósito: é notícia, não estado — três
+  // itens e 1 KB bastam para dizer o fato, e o teto impede que uma leva de
+  // ferramentas novas coma o contexto do turno.
+  capacidades_novas: { max_items: 3, max_bytes: 1_000 },
   entity_states: { max_items: 100, max_bytes: 8_000 },
 } as const satisfies Record<string, SectionBudget>;
 
@@ -193,6 +199,23 @@ export const TURN_ROUND_TRIP_TARGET = 8;
  * item cap, because "5 skills" and "3 gaps" are independent editorial choices.
  */
 export const SELF_AWARENESS_GAP_MAX_ITEMS = 3;
+
+/**
+ * #638 — por quantos dias um gap FECHADO continua sendo anunciado ao agente
+ * como capacidade recém-adquirida.
+ *
+ * Existe uma janela porque o aviso é NOTÍCIA, não estado permanente: passado
+ * esse prazo a ferramenta é só mais uma tool na caixa do agente, e repetir o
+ * anúncio para sempre gastaria contexto em todo turno para sempre. Sete dias é
+ * a folga entre um deploy e o primeiro turno em que o assunto volte a aparecer
+ * numa conversa real — curto o bastante para não virar mobília, longo o
+ * bastante para um agente pouco usado receber o aviso pelo menos uma vez.
+ *
+ * A janela também é o que permite a leitura ÚNICA do turno: os gaps abertos e
+ * os recém-fechados saem do mesmo `SELECT` (`capabilityGapsRepo.listParaOTurno`),
+ * sem custar uma segunda ida ao banco no caminho mais quente do sistema.
+ */
+export const JANELA_DE_AVISO_DE_CAPACIDADE_DIAS = 7;
 
 /** Roll-up published once per turn, and logged with the trace id. */
 export type TurnContextDiagnostics = {

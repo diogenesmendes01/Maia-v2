@@ -82,6 +82,10 @@ let pool: pg.Pool;
 const proposer = moduloDeProducao(() => import('@/cognition/tool-request/proposer.js'));
 const registro = moduloDeProducao(() => import('@/tools/_registry.js'));
 const aprovacao = moduloDeProducao(() => import('@/cognition/proposal-approval-handler.js'));
+// #638 (fatia C) — os dois call sites novos: ACEITAR (o botão do console) e
+// FECHAR (o monitor que constata a disponibilidade real da capability).
+const aceite = moduloDeProducao(() => import('@/cognition/tool-request/acceptance.js'));
+const fechamento = moduloDeProducao(() => import('@/cognition/tool-request/closure.js'));
 
 /**
  * As tools VIVAS que o catálogo committado não declara.
@@ -146,6 +150,18 @@ async function prepararCenario(c: pg.PoolClient): Promise<{ gapId: string }> {
 
 async function faxina(c: pg.PoolClient, gapId: string) {
   if (!gapId) return;
+  // #638 — os avisos e as reservas de aceite saem ANTES dos agregados: a
+  // reserva referencia o agregado (sem cascade), e o aviso referencia o gap.
+  await c
+    .query('DELETE FROM tool_request_notifications WHERE gap_id = $1', [gapId])
+    .catch(() => undefined);
+  await c
+    .query(
+      `DELETE FROM tool_request_issues WHERE aggregate_id IN (
+         SELECT aggregate_id FROM tool_request_aggregate_members WHERE gap_id = $1)`,
+      [gapId],
+    )
+    .catch(() => undefined);
   // #637 — o agregado referencia a proposta representante (sem ON DELETE
   // CASCADE), então ele sai ANTES. Sem isto o DELETE da proposta falha por FK,
   // o `.catch` engole o erro, e o agregado sobrevive: o caso seguinte — que
@@ -291,6 +307,58 @@ d('#636 — guardrail: nenhum caminho registra tool automaticamente', () => {
         status: 'acknowledged_for_humans',
         capability_type: 'tool_request',
       });
+    } finally {
+      await faxina(c, gapId);
+      c.release();
+    }
+  });
+
+  it('#638 — ACEITAR e FECHAR também não registram tool nem concedem capability', async () => {
+    const c = await pool.connect();
+    let gapId = '';
+    try {
+      await exigirNadaInstalado(c, 'antes de aceitar');
+      ({ gapId } = await prepararCenario(c));
+
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
+      const r = await runWithTenantContext({ tenant_id: T, agent_id: AG }, () =>
+        proposer().proposeToolRequestForGap({ gap: gap as never }),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok || !r.aggregate_id) return;
+
+      // ACEITAR — o botão do console. É aqui que alguém escreveria "aceitou,
+      // então instala".
+      const aceitou = await runWithTenantContext({ tenant_id: T, agent_id: AG }, () =>
+        aceite().aceitarPedidoDeFerramenta({
+          aggregate_id: r.aggregate_id!,
+          repo_slug: 'org-fixture/repo-fixture',
+          accepted_by: 'dono',
+        }),
+      );
+      expect(aceitou.ok).toBe(true);
+      await exigirNadaInstalado(c, 'depois de aceitar');
+
+      // FECHAR — o monitor que LÊ o registro e o grant. Ele constata; não
+      // concede. Com o grant semeado (`baseline.core`), a tool proposta não
+      // está disponível, então nada fecha — e, o que importa aqui, nada é
+      // instalado nem concedido para fazer fechar.
+      const fechou = await runWithTenantContext({ tenant_id: T, agent_id: AG }, () =>
+        fechamento().fecharGapsComFerramentaDisponivel(),
+      );
+      expect(fechou.fechados).toBe(0);
+      await exigirNadaInstalado(c, 'depois de rodar o fechamento');
+
+      // O aceite produziu UMA reserva, e ela é um DOCUMENTO: nem número de
+      // issue (o relayer ainda não rodou), nem efeito sobre capability.
+      const reservas = await c.query<{ n: number; status: string }>(
+        `SELECT count(*)::int AS n, min(status) AS status FROM tool_request_issues
+          WHERE tenant_id = $1 AND agent_id = $2`,
+        [T, AG],
+      );
+      expect(reservas.rows[0]!.n).toBe(1);
+      expect(reservas.rows[0]!.status).toBe('pending');
     } finally {
       await faxina(c, gapId);
       c.release();
@@ -462,6 +530,149 @@ describe('#636 — nenhum arquivo do CAMINHO contém verbo de instalação', () 
   });
 
   it('nenhum arquivo do caminho registra, concede ou executa', () => {
+    const achados: string[] = [];
+    for (const arquivo of alcancados()) {
+      const codigo = semComentarios(readFileSync(arquivo, 'utf8'));
+      for (const { padrao, porque } of PROIBIDOS) {
+        if (padrao.test(codigo)) {
+          achados.push(`${arquivo.slice(raizDoSrc.length)}: ${porque} (${padrao})`);
+        }
+      }
+    }
+    expect(achados).toEqual([]);
+  });
+});
+
+/**
+ * #638 (fatia C da épica #471) — a varredura do CONSOLE.
+ *
+ * A issue #638 exige, com todas as letras: *"Nenhum caminho do console
+ * registra tool ou concede capability — teste arquitetural que prova isso"*.
+ *
+ * A varredura do #636 acima NÃO cobre isso: `admin-ui/` é uma das BARREIRAS
+ * dela, porque o console legitimamente edita grants em OUTRAS telas (a de
+ * agentes e a de MCP chamam `agentToolGrantsRepo.updateWithAudit`, que é o
+ * caminho normal de o dono conceder uma tool). Varrer o console inteiro ficaria
+ * vermelho por um motivo que não tem nada a ver com este guardrail.
+ *
+ * A fronteira certa é o CAMINHO DA TRIAGEM: o grafo de imports a partir do
+ * router `toolRequests`, que é a superfície inteira que a tela usa. Um arquivo
+ * novo que esse caminho passe a importar entra sozinho no conjunto varrido — e
+ * um `import` de `agents.ts`/`mcp.ts` (as telas que de fato concedem) faria a
+ * varredura acusar, que é exatamente o que se quer: a triagem não pode ganhar
+ * um atalho para conceder.
+ */
+describe('#638 — nenhum caminho do CONSOLE registra tool ou concede capability', () => {
+  const raizDoSrc = fileURLToPath(new URL('../../src/', import.meta.url));
+  const doSrc = (rel: string) => fileURLToPath(new URL(`../../src/${rel}`, import.meta.url));
+
+  /** O router da triagem: tudo o que a tela pode chamar passa por aqui. */
+  const ENTRADAS_DO_CONSOLE = ['admin-ui/trpc/routers/tool-requests.ts'].map(doSrc);
+
+  /**
+   * As mesmas barreiras do bloco anterior — `admin-ui/` NÃO está entre elas,
+   * porque atravessar o console é justamente o objetivo. As duas exceções
+   * declaradas são a infraestrutura tRPC/auth do próprio console, que puxa
+   * NextAuth e metade do framework.
+   */
+  const BARREIRAS_DO_CONSOLE = [
+    'db/',
+    'tools/_registry.ts',
+    'tools/packs.ts',
+    'tools/grant-math.ts',
+    'tools/runtime-filter.ts',
+    'lib/',
+    'config/',
+    'governance/',
+    'observability/',
+    'shared/',
+    'types/',
+    'control-plane/',
+    'runtime/',
+    'identity/',
+    'admin-ui/trpc/server.ts',
+    'admin-ui/lib/auth.ts',
+  ];
+
+  const PROIBIDOS: Array<{ padrao: RegExp; porque: string }> = [
+    { padrao: /\bREGISTRY\b[^\n;]*\[[^\]\n]*\]\s*=[^=]/, porque: 'escrita no registro de tools' },
+    {
+      padrao: /\bREGISTRY\b[^\n;]*\.[A-Za-z_$][\w$]*\s*=[^=]/,
+      porque: 'escrita no registro de tools',
+    },
+    {
+      padrao: /\bObject\.(assign|defineProperty)\s*\(\s*\(?\s*REGISTRY\b/,
+      porque: 'escrita no registro de tools',
+    },
+    { padrao: /agentToolGrantsRepo/, porque: 'concessão de tool ao agente' },
+    { padrao: /capabilitiesSkillRepo|capabilitiesDomainRepo/, porque: 'criação de capability' },
+    // #638 — o console também não pode FECHAR gap por decisão própria. Fechar é
+    // constatação de fato, feita pelo monitor a partir do estado real da
+    // capability; uma rota que escrevesse `resolved_at` seria a "caixinha
+    // marcada" que a issue proíbe.
+    { padrao: /resolverGap\s*\(/, porque: 'fechamento de gap decidido no console' },
+    { padrao: /resolved_at\s*:/, porque: 'fechamento de gap decidido no console' },
+    { padrao: /\beval\s*\(/, porque: 'execução de código proposto' },
+    { padrao: /new\s+Function\s*\(/, porque: 'execução de código proposto' },
+  ];
+
+  function semComentarios(fonte: string): string {
+    return fonte.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  }
+
+  const alcancados = (): string[] =>
+    arquivosAlcancados({
+      entradas: ENTRADAS_DO_CONSOLE,
+      raizDoSrc,
+      barreiras: BARREIRAS_DO_CONSOLE,
+    });
+
+  it('o grafo do console alcança o aceite e a agregação (senão a varredura é vazia)', () => {
+    const rel = alcancados().map((f) => f.slice(raizDoSrc.length));
+    for (const obrigatorio of [
+      'admin-ui/trpc/routers/tool-requests.ts',
+      'admin-ui/trpc/tenant-resolver.ts',
+      'admin-ui/lib/env.ts',
+      'cognition/tool-request/acceptance.ts',
+      'cognition/tool-request/issue-body.ts',
+      'cognition/tool-request/aggregation.ts',
+      'cognition/tool-request/draft-merge.ts',
+      'cognition/tool-request/similarity.ts',
+      'cognition/tool-request/types.ts',
+    ]) {
+      expect(rel, `o grafo do console perdeu ${obrigatorio}`).toContain(obrigatorio);
+    }
+    expect(rel.length).toBeGreaterThan(ENTRADAS_DO_CONSOLE.length);
+  });
+
+  it('a varredura enxerga um botão "aprovar e instalar" plantado (autoteste)', () => {
+    const formas = [
+      "REGISTRY['nova'] = handler;",
+      '(REGISTRY as Record<string, unknown>)[nome] = t;',
+      'await agentToolGrantsRepo.updateWithAudit({});',
+      'await capabilitiesSkillRepo.upsertConfidence({});',
+      'await capabilityGapsRepo.resolverGap({ id });',
+      'await repo.update({ resolved_at: new Date() });',
+    ];
+    for (const forma of formas) {
+      expect(
+        PROIBIDOS.some((pr) => pr.padrao.test(semComentarios(forma))),
+        `nao pegou: ${forma}`,
+      ).toBe(true);
+    }
+    // E não pode acusar LEITURA nem o vocabulário legítimo da triagem.
+    for (const leitura of [
+      'const items = await ctx.repos.toolRequestAggregatesRepo.listarDoEscopo();',
+      'if (gap.resolved_at === null) continue;',
+    ]) {
+      expect(
+        PROIBIDOS.some((pr) => pr.padrao.test(semComentarios(leitura))),
+        `falso positivo em: ${leitura}`,
+      ).toBe(false);
+    }
+  });
+
+  it('nenhum arquivo do caminho do console registra, concede, executa ou fecha gap', () => {
     const achados: string[] = [];
     for (const arquivo of alcancados()) {
       const codigo = semComentarios(readFileSync(arquivo, 'utf8'));
