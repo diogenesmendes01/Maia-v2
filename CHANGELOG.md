@@ -4,6 +4,95 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Poison/DLQ com escolha explícita, replay que respeita a ordem, e fairness medida ([#629](https://github.com/diogenesmendes01/Maia-v2/issues/629), fatia F de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 8 de 9 — **fecha a épica**)
+
+> **AÇÃO DO OPERADOR: aplique a migration `133` ANTES de subir o código.** Ela é
+> atômica (tabela NOVA e vazia, sem `CONCURRENTLY`, num envelope
+> `BEGIN`/`COMMIT`), então **não** está exposta à armadilha do índice inválido
+> que devolve sucesso na reaplicação. Subir o código antes quebra a conclusão de
+> todo turno envenenado da categoria bloqueante: o INSERT da interdição
+> referencia a tabela, e a falha cai DENTRO da transação do CAS terminal — o
+> turno nem morre.
+
+**O problema.** Até aqui, `dead_letter` liberava a conversa. Não por decisão: por
+OMISSÃO. `dead_letter` é terminal, um turno terminal sai do predicado de
+head-of-line (#626), logo o sucessor virava reivindicável — sem que ninguém
+tivesse escolhido isso. A issue-mãe chama exatamente essa situação de falha nº 5
+e exige que a política escolha **conscientemente** entre duas saídas defensáveis
+e incompatíveis: liberar preserva disponibilidade às custas da semântica (a
+plataforma responde M2 sem nunca ter respondido M1); bloquear preserva a
+semântica às custas da conversa (nada anda até um humano olhar).
+
+**A escolha, por categoria de erro.** `src/runtime/turns/poison-policy.ts` (puro,
+sem I/O) classifica `(código, outcome)` em seis categorias de cardinalidade
+fechada — `effect_committed`, `model`, `transport`, `infrastructure`, `operator`,
+`unknown` — e `TURN_POISON_BLOCK_CATEGORIES` diz quais BLOQUEIAM. O `outcome`
+domina o código: `unsafe_to_retry` é produzido por `decideTurnAction` exatamente
+quando uma tool irreversível já rodou, e é evidência de primeira ordem; o código
+que o acompanha (`reasoner_failed`, `outbound_failure`) é sintoma.
+
+**Default: `effect_committed`, e só ele.** É a única categoria em que a conversa
+já está semanticamente quebrada ANTES de a política decidir. As outras têm causa
+COMPARTILHADA e transitória — um incidente de LLM ou de rede que bloqueasse
+pararia milhares de conversas de uma vez, com desbloqueio manual uma a uma. Uma
+categoria com erro de digitação **reprova o boot**, porque silenciá-la produziria
+um dashboard sem bloqueio nenhum e a leitura natural seria "não aconteceu nenhum
+caso" em vez de "a política está desligada".
+
+**A interdição é uma linha do PostgreSQL.** `agent_stream_blocks` (migration
+`133`), uma linha ATIVA por `(tenant, agent, stream_key)` garantida por índice
+único parcial. Ela é gravada na MESMA transação do CAS terminal e **antes** da
+eleição da promoção — a ordem é a fatia inteira: a eleição carrega
+`streamNotPoisoned`, então a promoção vê a interdição que a própria conclusão
+acabou de criar. Invertê-las produziria conversa bloqueada E sucessor acordado, e
+o defeito seria invisível.
+
+**A saída existe no mesmo commit.** `npm run dlq -- blocks` lista as conversas
+interditadas com o backlog de cada uma; `npm run dlq -- unblock-stream <turn_id>
+--reason "..."` desfaz, audita e re-arma o head. O turno envenenado **continua
+morto**, de propósito: desbloquear e ressuscitar são decisões diferentes, e
+fundi-las faria a segunda acontecer por acidente.
+
+**Replay manual não viola mais a ordem comprometida.** `replay-turn` recusa
+quando existe turno POSTERIOR da mesma stream já terminal — a plataforma já
+respondeu algo que veio depois. O guarda mora no `WHERE` do `UPDATE`, não numa
+consulta anterior: entre um `SELECT count` e o `UPDATE` um sucessor pode
+concluir. A saída é `--reconcile`, o "modo de replay/reconciliação explícito" da
+issue-mãe, auditado com row própria (`turn_replay_reconciled`).
+
+**Fairness e starvation, medidos pela primeira vez.** Nenhuma fatia da #505 os
+mediu: a #626 provou paralelismo, que é outra pergunta — um escalonador pode ter
+doze conversas rodando e ainda assim deixar a décima terceira parada para
+sempre. Entram `maia_stream_head_age_seconds` (+ p95), `maia_stream_turn_wait_seconds`
+(histograma, baldes em SEGUNDOS com cortes nos marcos reais do sistema),
+`maia_stream_active_total`, `maia_stream_live_total`, `maia_stream_backlog_max`,
+`maia_stream_starvation_total` e `maia_stream_poisoned_streams` — as três
+primeiras pedidas por nome pela issue-mãe desde o primeiro dia. Nenhuma carrega
+`stream_key`, `turn_id`, tenant ou o código de erro cru como label.
+
+`starvation_total` conta EPISÓDIOS, não amostras: um contador incrementado a
+cada coleta mediria a frequência do Prometheus. A deduplicação é por token opaco
+(`md5(tenant:agent:stream_key)`) em memória — o token nunca vira label nem log.
+
+**A medição, contra PostgreSQL real.** Com 4 vagas, 25 turnos numa conversa
+quente e 20 conversas de um turno, e os 25 jobs da quente entrando ANTES (o pior
+caso), as pequenas terminam com mediana de posição **11 de 45** — sem fairness
+sairiam todas depois do turno 25. E com o head de uma conversa segurado por um
+worker vivo durante toda a rodada, as outras **30 terminam inteiras**.
+
+**Limite de backlog: MEDIDO, não APLICADO.** `maia_stream_backlog_max` entrega o
+número; o limite não é aplicado porque a única pressão possível no ingresso seria
+RECUSAR mensagem de usuário do WhatsApp — perda de dado, contra um backlog que na
+prática o próprio usuário limita.
+
+**Kill switch:** `TURN_POISON_BLOCK_CATEGORIES=` (lista vazia) + restart. Nenhum
+bloqueio NOVO nasce e a conclusão volta ao comportamento da #627. Ela **não**
+desfaz interdições existentes — quem as desfaz é o comando auditado. É
+deliberado: uma conversa que um humano interditou não volta a andar porque
+alguém mexeu numa variável de ambiente.
+
+Runbook: [`docs/runbooks/turn-state-machine.md` §14](docs/runbooks/turn-state-machine.md).
+
 ### Debounce transacional: a janela sai da memória e vira uma linha ([#628](https://github.com/diogenesmendes01/Maia-v2/issues/628), fatia E de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 7 de 9)
 
 > **AÇÃO DO OPERADOR: aplique a migration `130` ANTES de subir o código.** Ela
