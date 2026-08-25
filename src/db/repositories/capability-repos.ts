@@ -4,10 +4,14 @@ import {
   agent_capabilities_domain,
   agent_capabilities_skill,
   agent_capability_gaps,
+  agent_capability_gap_observations,
   gap_escalation_rules,
   capability_proposals,
   capability_test_results,
+  runtime_trace_envelopes,
 } from '../schema.js';
+import { currentTraceId } from '@/observability/correlation.js';
+import { logger } from '@/lib/logger.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import type { GapLevel, ProposalStatus } from '@/types/enums.js';
@@ -15,6 +19,7 @@ import type {
   AgentCapabilityDomain,
   AgentCapabilitySkill,
   AgentCapabilityGap,
+  AgentCapabilityGapObservation,
   GapEscalationRule,
   NewGapEscalationRule,
   CapabilityProposal,
@@ -150,12 +155,167 @@ export const capabilitiesSkillRepo = {
   },
 };
 
+/**
+ * #636 (fatia A da épica #471) — uma OCORRÊNCIA do gap, como o call site a viu.
+ *
+ * `root_trace_id` NÃO é um parâmetro que o call site precisa lembrar de passar:
+ * quando o registro roda dentro do escopo de correlação do turno
+ * (`runWithCorrelation`, `src/observability/correlation.ts`), o id do turno é o
+ * `trace_id` da ALS — o MESMO id que `runtime_trace_envelopes.root_trace_id`
+ * guarda. Herdá-lo é o que faz a situação apontar para um trace REAL sem
+ * inventar plumbing novo, e é o que faz um call site fora de turno (worker,
+ * backfill) registrar honestamente `null` em vez de um link falso.
+ */
+export type GapObservationInput = {
+  /** O que o agente queria fazer nesta ocorrência. */
+  intent: string;
+  /** Detalhe da situação, quando houver. */
+  detail?: string | null;
+  conversa_id?: string | null;
+  /**
+   * Sobrescreve o id herdado da correlação. Use só quando o call site conhece
+   * o turno mas não roda dentro do escopo dele (replay, backfill).
+   */
+  root_trace_id?: string | null;
+  /** Id do envelope da TENTATIVA, quando o call site o conhece. */
+  trace_id?: string | null;
+  /** Argumentos que o agente tentou usar. `{}`/ausente = não observado. */
+  attempted_args?: Record<string, unknown>;
+  /** Retorno que o agente esperava. `{}`/ausente = não observado. */
+  expected_output?: Record<string, unknown>;
+  observed_at?: Date;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** `null` para qualquer coisa que não caiba numa coluna `uuid`. */
+function comoUuidOuNulo(v: string | null | undefined): string | null {
+  return typeof v === 'string' && UUID_RE.test(v) ? v : null;
+}
+
+/**
+ * #636 — o ledger de ocorrências do gap.
+ *
+ * Todo método é escopado por (tenant_id, agent_id) do contexto ALS: uma
+ * observação de outro escopo é INVISÍVEL, e um `gap_id` vazado de outro tenant
+ * não colhe linha nenhuma (o `id` nunca é fronteira de isolamento — #367/#368).
+ */
+export const capabilityGapObservationsRepo = {
+  async record(
+    gap_id: string,
+    input: GapObservationInput,
+  ): Promise<AgentCapabilityGapObservation> {
+    const guarded = applyTenantGuard({
+      gap_id,
+      intent: input.intent,
+      detail: input.detail ?? null,
+      conversa_id: comoUuidOuNulo(input.conversa_id),
+      // Herda o id do turno da correlação quando o call site não o passa.
+      root_trace_id: comoUuidOuNulo(
+        input.root_trace_id !== undefined ? input.root_trace_id : currentTraceId(),
+      ),
+      trace_id: comoUuidOuNulo(input.trace_id),
+      attempted_args: input.attempted_args ?? {},
+      expected_output: input.expected_output ?? {},
+      ...(input.observed_at ? { observed_at: input.observed_at } : {}),
+    });
+    const [row] = await db
+      .insert(agent_capability_gap_observations)
+      .values(guarded as typeof agent_capability_gap_observations.$inferInsert)
+      .returning();
+    return row!;
+  },
+
+  /**
+   * `record` que NÃO propaga erro — ver a nota em `capabilityGapsRepo.upsert`:
+   * o gap é o dado de governança, a observação é o enriquecimento. Devolve
+   * `null` quando não conseguiu gravar, e diz no log por quê.
+   */
+  async recordBestEffort(
+    gap_id: string,
+    input: GapObservationInput,
+  ): Promise<AgentCapabilityGapObservation | null> {
+    try {
+      return await capabilityGapObservationsRepo.record(gap_id, input);
+    } catch (err) {
+      logger.warn(
+        { gap_id, err: (err as Error).message },
+        'gap_observation.record_failed',
+      );
+      return null;
+    }
+  },
+
+  /** As `limit` ocorrências mais recentes DESTE gap, neste escopo. */
+  async listForGap(
+    gap_id: string,
+    limit = 20,
+  ): Promise<AgentCapabilityGapObservation[]> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select()
+      .from(agent_capability_gap_observations)
+      .where(
+        and(
+          eq(agent_capability_gap_observations.tenant_id, tenant_id),
+          eq(agent_capability_gap_observations.agent_id, agent_id),
+          eq(agent_capability_gap_observations.gap_id, gap_id),
+        ),
+      )
+      .orderBy(desc(agent_capability_gap_observations.observed_at))
+      .limit(limit);
+  },
+
+  /**
+   * Quais desses `root_trace_id` existem COMO ENVELOPE NESTE ESCOPO.
+   *
+   * É aqui que "link para trace real" deixa de ser promessa. A observação
+   * guarda o id sem FK (o envelope é purgável por retenção — ver migração
+   * 125), então quem afirma que a situação tem trace é esta leitura, e ela
+   * filtra por tenant+agent: um id que aponta para o envelope de OUTRO tenant
+   * não resolve, e a situação sai da proposta sem link em vez de com um link
+   * que atravessa a fronteira.
+   */
+  async resolveTraceIdsInScope(rootTraceIds: readonly string[]): Promise<Set<string>> {
+    const ids = [...new Set(rootTraceIds.filter((id) => comoUuidOuNulo(id) !== null))];
+    if (ids.length === 0) return new Set();
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ root_trace_id: runtime_trace_envelopes.root_trace_id })
+      .from(runtime_trace_envelopes)
+      .where(
+        and(
+          eq(runtime_trace_envelopes.tenant_id, tenant_id),
+          eq(runtime_trace_envelopes.agent_id, agent_id),
+          inArray(runtime_trace_envelopes.root_trace_id, ids),
+        ),
+      );
+    return new Set(rows.map((r) => r.root_trace_id).filter((v): v is string => v !== null));
+  },
+};
+
 export const capabilityGapsRepo = {
   async upsert(input: {
     capability_description: string;
     tipo: 'tool' | 'knowledge' | 'procedure';
     contexto?: string;
     source_candidate_id?: string;
+    /**
+     * #636 — a OCORRÊNCIA que motivou este upsert. Quando presente, além de
+     * incrementar `frequency_score` gravamos uma linha em
+     * `agent_capability_gap_observations`: o contador diz "quantas vezes", a
+     * linha diz "quando, em que turno, tentando o quê". Sem isso o pedido de
+     * ferramenta não tem como carregar situações com link de trace nem janela
+     * de frequência.
+     *
+     * FALHA ISOLADA de propósito: não gravar a observação NÃO pode derrubar o
+     * upsert do gap. O gap é o dado de governança (é ele que escala e vira
+     * dashboard); a observação é o enriquecimento. Perder o enriquecimento
+     * degrada a proposta futura; perder o gap apaga o sinal.
+     */
+    observation?: GapObservationInput;
   }): Promise<AgentCapabilityGap> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -190,6 +350,12 @@ export const capabilityGapsRepo = {
             eq(agent_capability_gaps.agent_id, agent_id),
           ),
         );
+      if (input.observation) {
+        await capabilityGapObservationsRepo.recordBestEffort(
+          existing[0].id,
+          input.observation,
+        );
+      }
       return existing[0];
     }
 
@@ -204,6 +370,9 @@ export const capabilityGapsRepo = {
         source_candidate_id: input.source_candidate_id ?? null,
       } as typeof agent_capability_gaps.$inferInsert)
       .returning();
+    if (input.observation) {
+      await capabilityGapObservationsRepo.recordBestEffort(created!.id, input.observation);
+    }
     return created!;
   },
 
@@ -371,6 +540,12 @@ export const gapEscalationRulesRepo = {
 // the P9a Skill Registry to flow proposals through the same approval inbox;
 // 'soul_bias' / 'policy_rule' / 'holiday' antecipam P8e/P9b/scheduling sem
 // ativar uso até o respectivo phase.
+// #636 — 'tool_request' é o pedido de ferramenta: o gap recorrente que exige
+// uma tool que NÃO EXISTE, virado documento estruturado para um dev avaliar.
+// Distinto de 'tool' de propósito: 'tool' é a spec genérica que o LLM escreve
+// para uma capability qualquer; 'tool_request' carrega intenção, situações com
+// link de trace, janela de frequência e um RASCUNHO de contrato Zod — e é
+// INERTE por construção (nada nele registra tool ou cria capability).
 export type CapabilityProposalType =
   | 'tool'
   | 'knowledge'
@@ -380,7 +555,8 @@ export type CapabilityProposalType =
   | 'skill'
   | 'soul_bias'
   | 'policy_rule'
-  | 'holiday';
+  | 'holiday'
+  | 'tool_request';
 
 export const capabilityProposalsRepo = {
   async create(input: {
