@@ -271,7 +271,9 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
     provider_idempotency_key: row.provider_idempotency_key,
     ...(signal ? { signal } : {}),
   };
-  const observation = await sendPayloadToProvider(payload, target);
+  const observation = await withDeliveryHeartbeat(claim, lease_ms, () =>
+    sendPayloadToProvider(payload, target),
+  );
   const outcome = normalizeProviderOutcome(observation);
 
   // ── (10) O RESULTADO NORMALIZADO, COM FENCE. ─────────────────────────────
@@ -537,6 +539,85 @@ async function finalizeOutcome(
     counter(METRIC.OUTBOUND_DELIVERY_UNKNOWN, { channel: EGRESS_CHANNEL });
   }
   return status;
+}
+
+/**
+ * Issue #633 — o HEARTBEAT da entrega, ligado.
+ *
+ * A #632 entregou `renewDeliveryLease` e declarou a dívida em uma linha: *nada
+ * a chama em loop*. Sem heartbeat, a lease default (`TURN_LEASE_TTL_MS`, 60s)
+ * cobre exatamente uma entrega — e uma chamada ao provedor que passe disso
+ * (mídia grande, sessão do WhatsApp reconectando, rede degradada) faz a lease
+ * vencer COM A CHAMADA EM VOO. A varredura de takeover então encontra a linha
+ * em `sending` com lease morta e a move para `delivery_unknown`, enquanto a
+ * primeira tentativa ainda está viva e vai gravar o desfecho real.
+ *
+ * O resultado disso não é duplo envio — o fence do `claim_token` impede que os
+ * dois escrevam —, mas é pior do que parece: a tentativa VIVA perde a posse e
+ * seu desfecho CONHECIDO é descartado, e a linha fica marcada como incerta
+ * quando alguém sabia a resposta. Trocar informação por incerteza é o oposto do
+ * que a épica quer.
+ *
+ * ─── As três decisões deste helper ─────────────────────────────────────────
+ *
+ * **Um terço da lease.** Duas renovações cabem dentro de cada TTL, então uma
+ * renovação perdida (blip do banco) não expira a posse. É a mesma proporção que
+ * o heartbeat do turno usa.
+ *
+ * **A renovação RECUSADA não aborta a chamada.** `renewDeliveryLease` devolve
+ * `{ ok: false }` quando o token não é mais o vigente ou a lease já venceu — e
+ * nesse ponto a chamada ao provedor já está em voo. Abortá-la não desfaria o
+ * efeito externo; só trocaria um desfecho conhecido por um `aborted`. O que
+ * protege continua sendo o fence na GRAVAÇÃO: se um sucessor tomou a linha,
+ * `recordDeliveryOutcome` volta zero linhas e esta tentativa não confirma nada.
+ * A perda é REGISTRADA (`OUTBOUND_LEASE_LOST{reason:lease_expired}`) para que o
+ * operador veja leases dimensionadas curto demais, que é a causa mais comum de
+ * takeover falso.
+ *
+ * **O timer é `unref`ado.** Um `setInterval` vivo segura o event loop; num
+ * processo que já drenou a fila, isso é um shutdown que não termina.
+ */
+async function withDeliveryHeartbeat<T>(
+  claim: OutboundDeliveryClaim,
+  lease_ms: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const every = Math.max(1_000, Math.floor(lease_ms / 3));
+  let lost = false;
+  const timer = setInterval(() => {
+    void (async () => {
+      if (lost) return;
+      try {
+        const renewed = await outboundDeliveryRepo.renewDeliveryLease({
+          outbound_id: claim.outbound_id,
+          claim_token: claim.claim_token,
+          lease_ms,
+        });
+        if (!renewed.ok) {
+          lost = true;
+          counter(METRIC.OUTBOUND_LEASE_LOST, { reason: 'lease_expired' });
+          logger.warn(
+            { outbound_id: claim.outbound_id, ops_alert: true },
+            'outbound.delivery_heartbeat_lost',
+          );
+        }
+      } catch (err) {
+        // Um blip do banco NÃO é perda de posse: a lease continua válida até
+        // vencer, e a próxima batida pode renová-la. Tratar erro como perda
+        // faria uma indisponibilidade de 1s virar takeover.
+        logger.debug(
+          { outbound_id: claim.outbound_id, err: (err as Error).message },
+          'outbound.delivery_heartbeat_failed',
+        );
+      }
+    })();
+  }, every);
+  timer.unref?.();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 /**

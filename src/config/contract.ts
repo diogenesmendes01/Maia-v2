@@ -1604,6 +1604,52 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_OUTBOUND_DELIVERY_WORKER: {
+    name: 'FEATURE_OUTBOUND_DELIVERY_WORKER',
+    description:
+      'CONSUMIDOR da fila BullMQ `outbound-delivery` (issue #633, fatia D da #506). Default OFF. ' +
+      'ON: o processo registra o worker que consome jobs de entrega — payload `{version:1, ' +
+      'outbound_id}`, jobId DETERMINISTICO por outbound_id — resolve o escopo pela fronteira de ' +
+      'confianca e chama o ciclo de entrega de #632 (claim atomico, lease, fence). ' +
+      'NASCE DESLIGADA porque o CONSUMIDOR PRECEDE O PRODUTOR: ligue esta primeiro, confirme que ' +
+      'a fila drena, e so entao ligue FEATURE_OUTBOUND_RECOVERY (que e quem enfileira). O ' +
+      'inverso acumula jobs que ninguem consome. ' +
+      'EXIGE a migration 131 aplicada e FEATURE_OUTBOUND_DURABLE_COMMIT ligada (sem linha ' +
+      'duravel nao ha o que entregar). Ver docs/runbooks/outbound-recovery.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_OUTBOUND_RECOVERY: {
+    name: 'FEATURE_OUTBOUND_RECOVERY',
+    description:
+      'VARREDURA de recuperacao, reconciliacao e DLQ do outbox duravel (issue #633, fatia D da ' +
+      '#506). Default OFF. ' +
+      'ON: a cada minuto o worker `outbound_recovery` rearma o trabalho entregavel (pending/' +
+      'retryable vencidos e claims com lease morta), reconcilia o incerto (delivery_unknown, ' +
+      'reconciling e a janela delivered->completed), manda para dead_letter o que estourou o teto ' +
+      'de tentativas ou o prazo de reconciliacao, e detecta divergencia turno<->outbound nos dois ' +
+      'sentidos. Publica maia_outbound_pending_age_seconds, ' +
+      'maia_outbound_reconciliation_total{result} e maia_outbound_turn_inconsistency_total{kind}. ' +
+      'OFF: o worker e NO-OP na primeira linha (nenhuma consulta ao banco) — e nada rearma o ' +
+      'outbox, entao uma linha que falhe a entrega fica parada ate intervencao manual ' +
+      '(`npm run dlq outbound-rearm`). ' +
+      'EXIGE FEATURE_OUTBOUND_DELIVERY_WORKER ligada: a varredura ENFILEIRA, e sem consumidor os ' +
+      'jobs se acumulam no Redis sem ninguem os processar. Ver docs/runbooks/outbound-recovery.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MESSAGE_DEBOUNCE: {
     name: 'FEATURE_MESSAGE_DEBOUNCE',
     description:
