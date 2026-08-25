@@ -216,6 +216,14 @@ describe('o runtime CONTINUA alcançando src/config/env.ts (o contrapeso)', () =
     // nada) e o keyring de backup (a cifragem do export). Boot fail-closed é a
     // única hora barata de descobrir isso.
     'scripts/post-restore-reconcile.ts',
+    // Issue #536 (TTL do export). Mesma razão dos dois acima, e uma a mais:
+    // `privacy-export -- sweep` é o comando que APAGA ARQUIVO no host. O alvo
+    // é derivado de `BACKUP_DIR` e o prazo de `PRIVACY_EXPORT_TTL_DAYS` — com
+    // `BACKUP_DIR` torto o varredor ou não acha nada (TTL vira carimbo de novo,
+    // em silêncio) ou aponta para uma árvore que não é a dele. Boot
+    // fail-closed é a hora barata de descobrir; o guarda de locator é a cara,
+    // e ele recusa em vez de apagar.
+    'scripts/privacy-export.ts',
     'scripts/privacy-request.ts',
     'scripts/restore-test.ts',
     'scripts/seed-holidays.ts',

@@ -354,7 +354,9 @@ Versão desconhecida **falha fechado**: nunca há fallback para "tenta com a cha
 
 ## 7. Retenção, legal hold e LGPD
 
-**A retenção não apaga nada hoje.** `RETENTION_DRY_RUN=true` é o default e, sem uma `RETENTION_POLICY` aprovada pelo DPO, `resolveRetention` devolve `purgeable: false` para todas as classes. Ver a [matriz](../architecture/concerns/data-retention-matrix.md) para as perguntas em aberto e o procedimento de ativação.
+**A retenção por prazo não apaga nada hoje, com DUAS exceções.** `RETENTION_DRY_RUN=true` é o default e, sem uma `RETENTION_POLICY` aprovada pelo DPO, `resolveRetention` devolve `purgeable: false` para todas as classes. Ver a [matriz](../architecture/concerns/data-retention-matrix.md) para as perguntas em aberto e o procedimento de ativação.
+
+As exceções são as duas classes cujo prazo **já foi decidido** e por isso não esperam a matriz: `backup.artifact` (job `backup_retention`, abaixo) e `privacy.export` — o TTL de sete dias do pacote cifrado do titular, executado de hora em hora pelo job `privacy_export_sweep` desde a issue #536. O runbook dele é [`privacy-export-ttl.md`](privacy-export-ttl.md); ele não é coberto aqui porque o alvo, o guarda e a evidência são outros.
 
 ### Retenção de artefatos (`backup_retention`, domingos 04:00)
 
@@ -408,7 +410,7 @@ O que acontece, na ordem:
    | `privacy.tombstone` | `class_not_purgeable` — é o próprio ledger anti-ressurreição |
    | `postgres.financial` | `class_not_purgeable,no_subject_linkage` — retenção contábil **e** `transacoes` não tem `pessoa_id` (tem `contraparte_id` e `registrado_por`, e qual dos dois é "a transação deste titular" não está decidido). Exportar pelo join errado entregaria a um titular o extrato de outro |
    | `media.blobs`, `gateway.baileys_session` | `mechanism_not_implemented` — fora do PostgreSQL (eixo 4 da #536) |
-   | `postgres.audit`, `privacy.export` | `pending_dpo_decision` — quais campos redigir / vida do export |
+   | `postgres.audit`, `privacy.export` | `pending_dpo_decision` — quais campos redigir / apagar o export de **outro** pedido a mando deste titular. **Não confunda com o TTL:** a vida do export por PRAZO já é executada (sete dias, [`privacy-export-ttl.md`](privacy-export-ttl.md)); o que segue aberto é destruir o artefato a pedido, que é outra pergunta |
    | `postgres.memory`, `postgres.traces` | `no_subject_linkage` — `agent_memories`/`agent_facts` são escopo de agente, `runtime_trace_bodies` é por turno. Purgar por aproximação apagaria dado de outros titulares |
 
    Quando as duas razões valem, as duas são registradas (vírgula-separadas) — "por que nada foi apagado" e "por que nada foi exportado" são perguntas diferentes.
@@ -432,10 +434,10 @@ FROM privacy_requests WHERE id = '<uuid>';
 
 Registrado aqui para que ninguém opere com expectativa errada:
 
-- O executor de retenção **por prazo** existe para a classe `backup.artifact` (job `backup_retention`, §7). Para as DEMAIS classes não há job que as varre por prazo — e não pode haver enquanto a `RETENTION_POLICY` não for aprovada pelo DPO. O apagamento **por pedido de titular** já existe e é outro caminho (§7.1).
+- O executor de retenção **por prazo** existe para `backup.artifact` (job `backup_retention`, §7) e para `privacy.export` (job `privacy_export_sweep`, [`privacy-export-ttl.md`](privacy-export-ttl.md)) — as duas classes cujo prazo já foi decidido. Para as DEMAIS não há job que as varre por prazo, e não pode haver enquanto a `RETENTION_POLICY` não for aprovada pelo DPO. O apagamento **por pedido de titular** já existe e é outro caminho (§7.1).
 - O workflow de privacidade cobre `access_export`, `anonymization` e `deletion` (§7.1). **`rectification` não é executada** — precisa do conteúdo corrigido, e o motor recusa explicitamente em vez de "concluir" sem corrigir. (Issue #536, eixo 2.)
 - O mecanismo de purga por titular alcança hoje `postgres.people`, `postgres.conversations` e `postgres.messages`; o export cobre essas três. As demais classes entram no pedido como **exceção registrada** com código de motivo — a tabela está em §7.1.
 - Backup próprio de mídia e da sessão Baileys: política declarada, mecanismo não implementado. (Issue #536, eixo 4.)
-- **Nada deste eixo rodou contra Postgres real.** O domínio (`src/ops/privacy/`) é coberto por unit tests com fakes; `src/ops/privacy/adapters.ts` e os dois CLIs (`restore:reconcile`, `privacy:execute`) **não foram executados** contra banco nenhum. Vale a mesma ressalva dos adapters de backup, mais uma: aqui o SQL APAGA.
+- **Nada deste eixo rodou contra Postgres real.** O domínio (`src/ops/privacy/`) é coberto por unit tests com fakes; `src/ops/privacy/adapters.ts`, `src/ops/privacy/export-sweeper-adapters.ts` e os três CLIs (`restore:reconcile`, `privacy:execute`, `privacy:export`) **não foram executados** contra banco nenhum. Vale a mesma ressalva dos adapters de backup, mais uma: aqui o SQL APAGA.
 - O drill **prova** o próprio teardown (§4.1), mas não varre resíduo de execuções **anteriores**: um banco `maia_drill_%` deixado por um drill que morreu antes de conferir continua lá até alguém rodar as consultas de §4.2. Não existe sweeper — e ele teria que distinguir "resíduo" de "drill em andamento", o que só o lock `maia_ops_restore_drill` responde com segurança.
 - Os adapters reais (`pg_dump`, `pg_restore`, `link(2)`, `HeadObject`/`GetObject`) continuam cobertos apenas por fakes e pela suíte de integração; falta a passada em staging contra Postgres e S3 de verdade.

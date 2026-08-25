@@ -63,7 +63,16 @@ async function run(): Promise<number> {
     console.log(`  EXCEÇÃO ${e.data_class}: ${e.reason}`);
   }
   if (r.export_issued) {
-    console.log('export cifrado emitido — o locator está em privacy_requests.export_locator.');
+    // O locator NÃO é impresso aqui: esta saída costuma ir para um ticket, e o
+    // locator é o que dá acesso ao pacote. `privacy:export -- show` é a leitura
+    // própria, e ela respeita o prazo (issue #536).
+    console.log(
+      'export cifrado emitido. O pacote TEM PRAZO ' +
+        `(${process.env.PRIVACY_EXPORT_TTL_DAYS ?? '7'} dias) e é removido por ` +
+        'varredura automática quando vence.\n' +
+        '  consulte com: npm run privacy:export -- show --request=' +
+        r.request_id,
+    );
   }
 
   if (r.status === 'completed') return 0;

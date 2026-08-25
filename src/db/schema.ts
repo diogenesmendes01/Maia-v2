@@ -3378,6 +3378,19 @@ export const privacy_requests = pgTable(
     export_locator: text('export_locator'),
     export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
     export_downloaded_at: timestamp('export_downloaded_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o varredor de TTL COMEÇOU neste pedido. Não autoriza
+     * nada e não tira o pedido da fila; existe para que um passe interrompido
+     * seja visível (started sem purged) em vez de ter que ser deduzido de log.
+     */
+    export_purge_started_at: timestamp('export_purge_started_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o `.enc` foi removido e a ausência foi PROVADA. É a
+     * condição (`IS NULL`) que torna a marcação uma transição de vencedor
+     * único: quem não ganha não audita, e é assim que a segunda execução do
+     * varredor não duplica auditoria.
+     */
+    export_purged_at: timestamp('export_purged_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
