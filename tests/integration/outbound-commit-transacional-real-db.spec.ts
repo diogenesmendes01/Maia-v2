@@ -501,6 +501,11 @@ d('#631 — commit transacional da resposta (Postgres real)', () => {
     expect(depoisDaSegunda).toHaveLength(1);
     expect(depoisDaSegunda[0]!.id).toBe(depoisDaPrimeira[0]!.id);
     expect(depoisDaSegunda[0]!.logical_dedupe_key).toBe(depoisDaPrimeira[0]!.logical_dedupe_key);
+    // E — o ponto que "uma linha" sozinho NÃO garante — o canal foi chamado
+    // UMA vez. Sem o guard `saidaLogicaJaTentada`, a segunda tentativa reusaria
+    // a linha e mandaria a mensagem de novo: uma saída lógica, dois envios
+    // físicos. Uma linha só não é idempotência; é contabilidade.
+    expect(canal.sendText).toHaveBeenCalledTimes(1);
   });
 
   it('payload DIFERENTE na mesma posição não reaproveita a chave — ele é recusado', async () => {

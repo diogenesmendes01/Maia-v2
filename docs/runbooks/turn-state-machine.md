@@ -536,3 +536,72 @@ em estado não-terminal, backup validado, runtime de volta à leitura legada. A
 `096` só pode cair **depois** da `097` (a FK composta depende do índice único).
 Nunca rode down migration automática durante incidente — ver
 [`migrations.md`](migrations.md).
+
+## 10. Commit transacional da resposta (#631, fatia B da #506)
+
+### 10.1 O que mudou, em uma frase
+
+A resposta do turno é **commitada no outbox durável antes** de qualquer chamada
+ao canal, na MESMA transação que move o turno para `outbound_pending`. Se a
+transação falhar, **nenhuma mensagem é enviada**.
+
+Isso inverte a política anterior, que estava escrita no código como *"liveness >
+strict dedupe"*: um blip do PostgreSQL deixava a mensagem sair assim mesmo. A
+partir daqui ele faz a resposta **não sair**, e o turno vira `retryable`.
+
+### 10.2 O sintoma novo, e como distingui-lo
+
+| Sinal | Significado |
+|---|---|
+| `maia_outbound_commit_rejected_total{reason="db_error"}` subindo | O banco está indisponível/lento no caminho de saída. Usuários não estão recebendo resposta. **É incidente de PostgreSQL, não de WhatsApp** — a fila e a sessão estão bem. |
+| `...{reason="stale_claim"}` | Takeover: um worker perdeu a lease e foi recusado ao tentar commitar. Sozinho **não** é incidente — é o fencing funcionando. Crescimento sustentado = takeover falso; veja §6 (TTL × heartbeat). |
+| `...{reason="state_mismatch"}` | O turno andou de versão entre a leitura e o commit. Raro; investigue escrita concorrente no mesmo turno. |
+| `...{reason="ownership_lost"}` | Recusa em memória, antes de ir ao banco (a lease já era conhecida como morta). Mesma leitura de `stale_claim`. |
+| `maia_outbound_committed_total{kind}` | Intenções de resposta comprometidas, por tipo de payload. A **distância** entre esta série e a de recusas é o custo real da troca liveness↔durabilidade. |
+
+Log correlato: `outbound.commit_failed_send_blocked` (com `ops_alert: true`,
+`turn_id`, `sequence_in_turn`, `payload_type`) e `outbound.committed` no sucesso.
+
+### 10.3 Rollback de feature
+
+`FEATURE_OUTBOUND_DURABLE_COMMIT=false` devolve o comportamento anterior
+(envio sem commit prévio). **Ela é RECUSADA no boot no profile `production`** —
+propositalmente: uma garantia de durabilidade que pode ser desligada em produção
+é o caminho fail-open com outro nome. Em staging o boot passa com AVISO; em
+development é silencioso.
+
+Consequência operacional que precisa estar clara antes de um incidente: **não
+existe alavanca de produção para "só desta vez, mande mesmo sem registrar"**. Se
+o PostgreSQL está fora, a resposta não sai — e o turno fica recuperável. A
+alavanca é consertar o banco.
+
+A flag também exige `FEATURE_TURN_STATE_MACHINE` ligada; a combinação inversa é
+recusada no contrato como INERTE (sem `turn_id` não há row de outbox
+exprimível — a FK composta da migração 121).
+
+### 10.4 Turno em `outbound_pending` com linha `pending`
+
+É o estado normal entre o commit e a entrega. **Nunca rearme pelo recovery de
+turno** (§3): `outbound_pending` está fora de `RECOVERABLE_TURN_STATUSES` de
+propósito — a resposta já foi comprometida e uma nova execução do ReAct a
+duplicaria.
+
+Enquanto o delivery worker de #632 não existe, quem entrega é o mesmo processo
+que commitou, e ele fecha a linha com o desfecho (`delivered`,
+`delivery_unknown` ou `retryable`). Uma linha que fica `pending` por muito tempo
+significa que o processo morreu entre o commit e o registro do desfecho: ela é
+selecionável por
+
+```sql
+SELECT id, turn_id, status, attempt, next_attempt_at
+  FROM outbound_messages
+ WHERE tenant_id = $1 AND agent_id = $2
+   AND status IN ('pending', 'retryable')
+   AND next_attempt_at <= now()
+ ORDER BY next_attempt_at
+ LIMIT 50;
+```
+
+que é o predicado de `idx_outbound_messages_ready`. **Não reenvie manualmente
+uma linha `delivery_unknown`**: ela significa "o transporte lançou depois de
+iniciar o envio", e o reenvio cego é o duplo envio. A reconciliação é #633.

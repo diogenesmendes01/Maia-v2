@@ -338,6 +338,31 @@ async function commitOutboundOrRefuse(input: {
 }
 
 /**
+ * A saída lógica já foi ENTREGUE (ou está em voo, ou já foi encerrada) por uma
+ * tentativa anterior — então esta NÃO pode chamar o canal.
+ *
+ * O commit é idempotente por construção: a `logical_dedupe_key` faz o retry da
+ * MESMA resposta reencontrar a linha em vez de criar uma segunda
+ * (`inserted: false`). Mas "uma linha" não é a garantia inteira — sem esta
+ * checagem, a segunda tentativa reusaria a linha e **mandaria a mensagem de
+ * novo**: uma saída lógica, dois envios físicos, que é o duplo envio pela porta
+ * dos fundos.
+ *
+ * `pending` é a ÚNICA continuação segura, e é o caso do crash: a tentativa
+ * anterior commitou e morreu antes de registrar qualquer desfecho, então nada
+ * chegou a ser tentado. Qualquer outro estado significa que alguém já tentou —
+ * `delivered`/`completed` (chegou), `sending`/`claimed` (outro worker está com
+ * ela AGORA), `delivery_unknown`/`reconciling` (incerto: reenviar às cegas é
+ * exatamente o que #506 proíbe), `failed_terminal`/`cancelled` (encerrada por
+ * decisão).
+ */
+function saidaLogicaJaTentada(commit: OutboundCommitOutcome): boolean {
+  if (!commit.committed) return false;
+  if (commit.inserted) return false;
+  return commit.row.status !== 'pending';
+}
+
+/**
  * Fecha a linha durável com o desfecho da tentativa feita por ESTE processo.
  *
  * Provisório e declarado como tal: o delivery worker com claim/lease é a #632.
@@ -505,6 +530,13 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         in_reply_to: inbound.id,
         pessoa_id: pessoa.id,
       });
+      if (saidaLogicaJaTentada(commit)) {
+        logger.warn(
+          { conversa_id: c.id, outbound_id: commit.committed ? commit.outbound_id : null },
+          'outbound.logical_output_already_attempted_skipping_send',
+        );
+        return;
+      }
       let wid: string | null;
       try {
         wid = await line.sendDocument(jid, pdf.path, {
@@ -1022,6 +1054,17 @@ export async function sendOutbound(
     in_reply_to,
     pessoa_id,
   });
+  if (saidaLogicaJaTentada(commit)) {
+    logger.warn(
+      {
+        conversa_id,
+        outbound_id: commit.committed ? commit.outbound_id : null,
+        status: commit.committed ? commit.row.status : null,
+      },
+      'outbound.logical_output_already_attempted_skipping_send',
+    );
+    return commit.committed ? commit.row.provider_message_id : null;
+  }
   // Delivery happens in two phases: send to the channel, THEN persist. Tag
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
@@ -1156,6 +1199,13 @@ export async function sendOutboundPoll(
     in_reply_to,
     pessoa_id,
   });
+  if (saidaLogicaJaTentada(commit)) {
+    logger.warn(
+      { conversa_id, outbound_id: commit.committed ? commit.outbound_id : null },
+      'outbound.logical_output_already_attempted_skipping_send',
+    );
+    return { fell_back: false };
+  }
   let sent: Awaited<ReturnType<LineOutput['sendPoll']>>;
   try {
     sent = await line.sendPoll(jid, text, pending.opcoes_validas);
