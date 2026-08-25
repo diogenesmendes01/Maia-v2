@@ -348,20 +348,23 @@ teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
 `agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
 encerrado por um turno TERMINAL".
 
-### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatias A (#630) e B (#631)
+### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatias A (#630), B (#631) e C (#632)
 
 | File | Role |
 |---|---|
 | `contract.ts` | Vocabulário puro do outbox de saída: união Zod dos payloads, serialização canônica versionada, `payload_hash`, as DUAS identidades e a ponte com a coluna legada `channel` |
 | `commit.ts` | **#631** — a fronteira que o dispatcher de saída atravessa antes de qualquer chamada ao canal. Constrói o artefato, chama a transação única e **lança** se ela falhar |
 | `turn-scope.ts` | **#631** — o `TurnHandle` visível para os limites de saída, por AsyncLocalStorage (aberto em `src/agent/core.ts`, junto de `runWithTurnExecution`) |
+| `delivery-contract.ts` | **#632** — contrato PURO da entrega: elegibilidade do claim, capability de idempotência do provedor por tipo de payload, normalização dos SETE desfechos, tabela estado↔desfecho e a política de reenvio |
+| `delivery-job.ts` | **#632** — identidade determinística do job por `outbound_id` (`outbound-<uuid>`) e o payload `.strict()` que carrega só o id. Puro, sem `bullmq` |
+| `provider-adapter.ts` | **#632** — união de #630 ⇒ primitiva de `LineOutput`, com a chave idempotente entregue só onde ela é honrada |
+| `delivery.ts` | **#632** — o CICLO: carregar → claim → validar → deadline → `sending` fenced → adaptador → resultado normalizado → `delivered` → histórico → `completed` |
 | `index.ts` | Fachada — importe sempre daqui |
 
-`contract.ts` é **puro**, na mesma natureza de `src/runtime/turns/contract.ts`:
-sem `db`, sem I/O, sem ALS, sem relógio. As fatias irmãs que ainda faltam são
-#632 (delivery worker com claim/lease), #633 (recovery/reconciliação/DLQ),
-#634 (inventário e migração de TODOS os caminhos de envio) e #635 (histórico
-idempotente e multipart).
+`contract.ts` e `delivery-contract.ts` são **puros**, na mesma natureza de
+`src/runtime/turns/contract.ts`: sem `db`, sem I/O, sem ALS, sem relógio. As
+fatias irmãs que ainda faltam são #633 (recovery/reconciliação/DLQ), #634
+(inventário e migração de TODOS os caminhos de envio) e #635 (multipart).
 
 #### O commit transacional (#631) — "nada vai ao canal antes do banco"
 
@@ -431,6 +434,137 @@ arquivo nem objeto a referenciar. `FEATURE_OUTBOUND_VOICE` tem default `false`
 (não é caminho de produção hoje); decidir onde o áudio sintetizado passa a morar
 é #634. O ramo de **documento** commita com `local_path`, válido enquanto quem
 entrega é o mesmo processo — a migração para `storage_object` é da mesma fatia.
+
+#### O ciclo de entrega (#632) — "aceito" não é "recebido"
+
+O repositório da posse é `src/db/repositories/outbound-delivery-repo.ts`. Toda
+mutação lá é **um** `UPDATE ... WHERE ... RETURNING`, nunca "SELECT elegível,
+depois UPDATE": sob READ COMMITTED dois workers que disputam a mesma row
+serializam no lock de row e o perdedor RE-AVALIA o `WHERE` (EvalPlanQual) contra
+a versão nova, então volta zero linhas. Todo relógio é o do PostgreSQL.
+
+**A máquina de estados da entrega:**
+
+```
+pending|retryable --claim--> claimed --markSending--> sending --outcome--> delivered --tx--> completed
+                                                                       \-> delivery_unknown | retryable
+                                                                           | failed_terminal | cancelled
+```
+
+**As três decisões que carregam a fatia:**
+
+- **`sending` existe para tornar o crash diagnosticável.** Uma linha encontrada
+  em `sending` com lease morta significa "a chamada ao provedor foi iniciada e o
+  desfecho nunca foi registrado" — a mensagem pode estar no telefone do usuário.
+  Sem essa escrita, o crash pré-envio e o pós-envio deixariam a linha idêntica
+  em `claimed`, e o sucessor reenviaria algo já entregue.
+
+- **O takeover de `sending` NÃO normaliza o estado de volta para `claimed`.** O
+  `SET` do claim é
+  `CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END`, e
+  `markSending` exige `status = 'claimed'` no `WHERE`. O sucessor de uma chamada
+  em voo é portanto **estruturalmente incapaz** de enviar — a garantia não
+  depende de um `if` no worker. Ele registra `cancelled_after_send_unknown` e a
+  linha vai para `delivery_unknown`.
+
+- **`accepted_unconfirmed → delivery_unknown`, não `delivered`.** É a leitura
+  literal de "não marcar `delivered` só porque a chamada foi iniciada".
+  Consequência operacional concreta: `delivered` sai do radar da reconciliação,
+  então uma resposta que nunca chegou ficaria marcada como entregue para sempre.
+
+**Tabela desfecho ⇒ estado** (`statusForOutcome`, fonte única):
+
+| Desfecho normalizado | Estado | Reenvio automático |
+|---|---|---|
+| `accepted_confirmed` | `delivered` → `completed` | — |
+| `accepted_unconfirmed` | `delivery_unknown` | só com chave nativa |
+| `rejected_retryable` | `retryable` | **sim** (semântica exclui entrega) |
+| `rejected_terminal` | `failed_terminal` | nunca |
+| `timeout_unknown` | `delivery_unknown` | só com chave nativa |
+| `cancelled_before_send` | `cancelled` | **sim** (semântica exclui entrega) |
+| `cancelled_after_send_unknown` | `delivery_unknown` | só com chave nativa |
+
+#### A capability de idempotência do provedor — o Baileys honra UM tipo
+
+`LineOutput` (`src/gateway/line-output.ts`) declara `messageId` em **`sendText`
+e mais nada**. Ele desce para `MiscMessageGenerationOptions.messageId`, o
+Baileys o grava verbatim na key da mensagem, e o WhatsApp chaveia por
+`(remoteJid, fromMe, id)` — para texto a dedupe é do provedor, de verdade.
+`sendDocument`, `sendVoice`, `sendPoll` e `sendReaction` não aceitam a chave: um
+reenvio produz mensagem NOVA no telefone do usuário.
+
+Isso é encapsulado em `providerIdempotencySupport(channel, payload_type)`, com
+`satisfies Record<OutboundPayloadType, …>` — um `payload_type` novo sem entrada
+é **erro de compilação**, não um default silencioso (e o default silencioso
+perigoso seria `native`). Duas perguntas separadas de propósito:
+`shouldPassIdempotencyKey` decide se o valor é passado adiante (inofensivo);
+`retrySafety` decide se ele autoriza reenvio (é aí que mora a duplicata).
+
+| `payload_type` | Chave nativa no WhatsApp |
+|---|---|
+| `text`, `status_fallback` | `native` (`sendText(…, { messageId })`) |
+| `audio`, `document`, `reaction`, `interactive_poll` | `none` |
+
+`retrySafety` devolve **três** valores e não dois: `safe` (a semântica exclui
+entrega anterior), `idempotent` (pode ter saído, mas o provedor deduplica **para
+este tipo**) e `reconcile` (pode ter saído e o provedor não deduplica — #633).
+
+#### Histórico idempotente, e o job determinístico
+
+`delivered → completed` e o `INSERT` em `mensagens` acontecem na **mesma
+transação** (`completeDeliveryTx`), fenced pelo `claim_token`. A idempotência é
+do ESTADO e é atômica: `delivered` = sem histórico, `completed` = com histórico.
+`completed` não é reivindicável, então não há caminho que produza duas linhas de
+histórico para a mesma saída lógica — e nenhuma chave de dedupe nova foi
+inventada em `mensagens`.
+
+Por isso `recordDeliveryOutcome` **preserva** a posse quando o desfecho é
+`accepted_confirmed`: soltar o `claim_token` ali deixaria `completeDeliveryTx`
+sem fence a exibir, e a linha ficaria eternamente `delivered` sem histórico.
+Nos demais desfechos a posse é liberada, porque a linha é terminal para a
+entrega e um dono morto faria o recovery esperar por um worker que já foi
+embora.
+
+`outboundDeliveryJobId(outbound_id)` → `outbound-<uuid>` (`delivery-job.ts`). É
+por `outbound_id` e **não** por turno: multipart tem N saídas do mesmo turno, e
+um id derivado do turno faria a segunda parte colidir com a primeira e ser
+descartada pela BullMQ — uma resposta que some. `attempt` não participa da
+derivação: incluí-lo daria id novo por tentativa e a colisão desapareceria
+exatamente no cenário que ela cobre.
+
+#### O que aconteceu com `recordInlineDeliveryOutcome` (escopo emprestado de #631)
+
+Ele foi **removido**. `src/agent/output-dispatch.ts` agora reivindica a linha e a
+move para `sending` antes de cada chamada ao canal
+(`claimInlineDeliveryOrRefuse` → `beginInlineDelivery`) e grava o desfecho com o
+fence (`recordInlineDelivery`). Os três buracos que a função provisória tinha,
+todos fechados: sem claim/lease/fence (o caminho síncrono sobrescrevia o
+desfecho de um delivery worker); sem `sending` (crash pós-envio deixava
+`pending`, e o recovery reenviaria); e `accepted_unconfirmed → delivered`
+(estado desonesto). O que continua diferente do worker de verdade — quem envia
+ainda é o processo do turno, montando `line.send*` no dispatcher em vez de usar
+`sendPayloadToProvider` — é **#634**.
+
+Isso acrescenta **um** `await` entre o commit e o canal, e é a única coisa que
+pode entrar ali: ela FECHA uma janela em vez de abrir (sem ela a linha fica
+`pending` durante o envio) e falha fechado (sem posse não há `send*`).
+
+#### Limitações declaradas de #632
+
+- **`sendReaction` devolve `void`.** Sem identificador e sem confirmação, o
+  melhor desfecho honesto é `accepted_unconfirmed` — uma reação termina em
+  `delivery_unknown`. Fingir `accepted_confirmed` seria inventar confirmação.
+- **`storage_object` não é resolvível ainda.** O worker lê `local_path` do
+  disco; uma referência de storage é recusada como `rejected_terminal`
+  (`media_ref_unresolved`) em vez de enviar outra coisa. O resolvedor é #634.
+- **Janela entre `delivered` e `completed`.** Um crash ali deixa a linha com
+  claim vivo e lease vencendo, e ela **não** volta a ser reivindicável — o que é
+  correto (a mensagem chegou; reenviar duplicaria). O histórico faltante é
+  reconciliação de #633, não entrega.
+- **Nenhum consumidor de fila foi registrado.** `deliverOutbound` é a
+  responsabilidade isolada e o `jobId` é determinístico, mas quem enfileira e
+  quem consome é #633/#634 — registrar um worker aqui exigiria uma flag de
+  rollout cujo escopo é daquelas fatias.
 
 #### A flag, e por que ela não pode ser desligada em produção
 
@@ -614,6 +748,9 @@ Rules this module enforces:
 | `tests/integration/outbound-durable-outbox-schema-real-db.spec.ts` | #630 com Postgres real: row legada continua inserível, uniques PARCIAIS recusam a segunda saída e ignoram o legado, CHECK de completude impede meia-row, FK composta impede apontar para turno de outro tenant |
 | `tests/integration/outbound-commit-transacional-real-db.spec.ts` | #631 com Postgres real, entrando por `dispatchOutput`/`sendOutbound` (o call site de produção, não um harness): o double do canal **consulta o banco por conexão própria no instante do envio**, de modo que "nada vai ao canal antes do banco" vira afirmação verificável. Cobre também worker sem posse, CAS de versão, rollback total quando a falha acontece ENTRE as duas escritas, idempotência da saída lógica (uma linha **e** um envio), `delivery_unknown` em vez de `delivered` fingido, e a linha selecionável pelo recovery no instante seguinte ao commit |
 | `tests/unit/config/outbound-durable-commit-rule.spec.ts` | #631: a flag não pode ser fail-open — default ON, `false` em production é erro de escopo `boot` (sobrevive a `MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e inerte sem a máquina de estados é erro |
+| `tests/unit/runtime/outbound-delivery-contract.spec.ts` | #632: o contrato PURO da entrega — elegibilidade do claim alinhada ao índice de #630, nenhum estado terminal reivindicável, a matriz TOTAL (7 desfechos × 6 tipos) da política de reenvio, a capability declarada para todo `payload_type` (nenhum default otimista), e o jobId determinístico por `outbound_id` (colisão do multipart, namespace disjunto do turno, fail-loud em id malformado, payload `.strict()`) |
+| `tests/integration/outbound-delivery-claim-lease-fence-real-db.spec.ts` | #632 com Postgres real, entrando por `deliverOutbound`: claim concorrente com **2, 10 e 50** workers (exatamente um vence, `attempt` prova UM update); takeover por lease com o token velho recusado nas TRÊS gravações (confirmar, reenviar, renovar); **crash depois de o provider aceitar não vira reenvio** (o fake conta 1 chamada e a linha termina `delivery_unknown`); `delivered` não é marcado por chamada iniciada; caminho feliz até `completed` com histórico único e a chave idempotente entregue ao adaptador |
+| `tests/unit/observability/outbound-delivery-metrics-sem-pii.spec.ts` | #632: as duas séries que a issue exige existem com o nome e o rótulo (`maia_outbound_lease_lost_total{reason}`, `maia_outbound_delivery_unknown_total{channel}`), e o texto RENDERIZADO do `/metrics` não contém telefone, JID nem conteúdo — nem quando eles são passados como chave (deny list) nem como valor de um label permitido (guarda de PII por valor) |
 
 ## In-flight changes
 
