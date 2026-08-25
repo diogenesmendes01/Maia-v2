@@ -451,7 +451,6 @@ d('#627 — promoção do sucessor (DB real)', () => {
     // limite do relógio transformaria a sonda numa fonte de flake.
     expect(acordadoEm).toBeGreaterThan(0);
     expect(latencia).toBeLessThan(JANELA_DO_VARREDOR_MS / 20);
-    // eslint-disable-next-line no-console
     console.log(
       `[#627] latência medida da promoção: ${latencia}ms ` +
         `(janela do varredor documentada na §11.5: ${JANELA_DO_VARREDOR_MS}ms)`,
@@ -473,8 +472,6 @@ d('#627 — promoção do sucessor (DB real)', () => {
 
     // O SUCESSOR tenta — e é recusado. Pela porta de produção (`acquireTurnLease`),
     // que é quem sinaliza a recuperação.
-    const lease = moduloDeProducao;
-    void lease;
     const { acquireTurnLease } = await import('@/runtime/turns/lease.js');
     const t0 = Date.now();
     const tentativa = await inA(() => acquireTurnLease(m2));
@@ -493,7 +490,6 @@ d('#627 — promoção do sucessor (DB real)', () => {
     expect((enqueueAgentMock.mock.calls[0]![0] as { turn_id: string }).turn_id).toBe(m1);
     expect(await contador('promoted')).toBe(1);
     expect(latencia).toBeLessThan(JANELA_DO_VARREDOR_MS / 20);
-    // eslint-disable-next-line no-console
     console.log(
       `[#627] latência medida do re-arme por claim expirado: ${latencia}ms ` +
         `(janela do varredor documentada na §11.5: ${JANELA_DO_VARREDOR_MS}ms)`,
@@ -651,6 +647,45 @@ d('#627 — promoção do sucessor (DB real)', () => {
 
     expect((await readTurn(b1))['promoted_at']).toBeNull();
     expect(enqueueAgentMock).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it('KILL SWITCH: com FEATURE_TURN_STREAM_PROMOTION=false a conversa volta ao varredor', async () => {
+    // O rollback desta fatia precisa ser barato e precisa ser VERDADE. Com a
+    // flag OFF a ordem continua correta (o head-of-line não depende da
+    // promoção) e a conversa volta a andar na cadência do varredor: latência,
+    // não inversão. Um kill switch que não desliga nada é pior que nenhum.
+    const { _resetContractEnvCacheForTests } = await import('@/config/contract-env.js');
+    const anterior = process.env['FEATURE_TURN_STREAM_PROMOTION'];
+    process.env['FEATURE_TURN_STREAM_PROMOTION'] = 'false';
+    _resetContractEnvCacheForTests();
+    try {
+      const key = streamKey();
+      const m1 = await turnInStream({ stream_key: key, seq: 1, repos: repos() });
+      const m2 = await turnInStream({ stream_key: key, seq: 2, repos: repos() });
+
+      const head = await executarHead(m1);
+      enqueueAgentMock.mockClear();
+      await inA(() => turns().concludeTurn(head as never, 'reply_delivered'));
+
+      // O turno concluiu normalmente — só a promoção não aconteceu.
+      expect((await readTurn(m1))['status']).toBe('completed');
+      expect((await readTurn(m2))['promoted_at']).toBeNull();
+      expect(enqueueAgentMock).not.toHaveBeenCalled();
+      // E a ORDEM continua de pé: o sucessor é reivindicável (o head saiu da
+      // frente), só que ninguém o acordou.
+      const claim = await inA(() =>
+        repos().agentTurnsRepo.claimNextEligibleTurn({
+          turn_id: m2,
+          worker_id: 'w2',
+          lease_ms: LEASE_MS,
+        }),
+      );
+      expect(claim.ok).toBe(true);
+    } finally {
+      if (anterior === undefined) delete process.env['FEATURE_TURN_STREAM_PROMOTION'];
+      else process.env['FEATURE_TURN_STREAM_PROMOTION'] = anterior;
+      _resetContractEnvCacheForTests();
+    }
   }, 30_000);
 
   it('promoção IDEMPOTENTE: concluir duas vezes não promove duas vezes', async () => {
