@@ -38,7 +38,53 @@ São estados diferentes porque a ação é oposta: de `failed_terminal` não se
 rearma; de `dead_letter` rearmar é legítimo, porque a causa (rede, sessão do
 WhatsApp caída) pode ter passado.
 
-## 2. As duas flags, e a ORDEM de ligá-las
+## 2. VERIFICAÇÃO PÓS-DEPLOY — rode isto antes de ligar qualquer flag
+
+Uma linha e não é opcional:
+
+```sql
+-- Quantas respostas do outbox DURÁVEL foram perdidas pelo sweeper legado?
+SELECT count(*) FROM outbound_messages
+ WHERE turn_id IS NOT NULL AND status = 'unknown';
+```
+
+**O esperado é `0`.** Qualquer número acima disso é uma resposta que foi
+commitada, nunca entregue, e marcada com um estado que o claim de entrega trata
+como terminal — perda SILENCIOSA, sem exceção e sem métrica.
+
+A causa: `outbound_messages_sweeper` (#292) promovia a `unknown` toda row
+`pending` mais velha que `OUTBOUND_SWEEPER_STALE_PENDING_SEC` (300s). Depois da
+#630 a mesma tabela passou a hospedar o outbox durável, cuja row **nasce** em
+`pending`. A #633 fechou isso (`turn_id IS NULL` nas três consultas daquele
+worker, protegido por
+`tests/integration/outbound-legacy-sweeper-ignora-outbox-duravel-real-db.spec.ts`),
+mas **quem rodou #630/#631 por mais de cinco minutos com o sweeper ligado já tem
+o estrago no banco.**
+
+Se o número for > 0, inventarie antes de agir:
+
+```sql
+SELECT id, payload_type, attempt, delivery_outcome, error, created_at
+  FROM outbound_messages
+ WHERE turn_id IS NOT NULL AND status = 'unknown'
+ ORDER BY created_at;
+```
+
+`error = 'sweeper_promoted_stale_pending'` identifica as promovidas pelo
+sweeper. Elas **nunca foram enviadas** (`delivery_outcome IS NULL`, `attempt =
+0`): a promoção acontecia antes de qualquer claim. Ou seja, reenviá-las NÃO tem
+risco de duplicata — é o caso raro em que o rearmamento é seguro. O caminho é
+devolvê-las a `retryable` (uma a uma, com `--reason` na trilha) pelo comando da
+§6, depois de confirmar `attempt = 0` e `delivery_outcome IS NULL` em cada uma.
+
+Com `delivery_outcome` preenchido, a linha JÁ passou pelo provedor e a decisão
+volta a ser a da §5.3 — leia o risco antes.
+
+A retenção do sweeper legado também deixou de apagar a linha durável, então este
+inventário continua encontrando o estrago mesmo passados 30 dias. Isso é
+deliberado: apagar o rastro forense seria a segunda perda.
+
+## 3. As duas flags, e a ORDEM de ligá-las
 
 | Flag | Default | O que liga |
 |---|---|---|
@@ -58,7 +104,7 @@ Desligar as duas NÃO restaura fail-open: o caminho síncrono de #631/#632
 continua entregando com posse e fence. O que se perde é a RECUPERAÇÃO
 automática — uma linha que falhe fica parada até rearmamento manual.
 
-## 3. Os números que o alarme lê
+## 4. Os números que o alarme lê
 
 | Série | Rótulos | O que um pico significa |
 |---|---|---|
@@ -75,9 +121,9 @@ provider que lê o último valor. Ela é, no pior caso, um minuto velha — para
 série cujo alerta dispara em minutos, isso é irrelevante; o que se ganha é não
 transformar a frequência de scrape em carga de Postgres.
 
-## 4. Diagnóstico por sintoma
+## 5. Diagnóstico por sintoma
 
-### 4.1 `pending` acumulando
+### 5.1 `pending` acumulando
 
 ```sql
 SELECT status, count(*), min(created_at)
@@ -96,7 +142,7 @@ Causas, em ordem de probabilidade:
    `outbound_recovery.rearm_failed` e tenta de novo no tick seguinte. A ROW
    nunca é perdida.
 
-### 4.2 `sending` antigo
+### 5.2 `sending` antigo
 
 ```sql
 SELECT id, attempt, claimed_by, lease_expires_at, created_at
@@ -110,7 +156,7 @@ o desfecho nunca foi registrado.** A mensagem pode estar no telefone da pessoa.
 
 Não faça nada à mão. A varredura reivindica a linha (o takeover a MANTÉM em
 `sending`, e `markSending` exige `claimed`, então nem o código consegue
-reenviá-la) e a move para `delivery_unknown`. A partir daí é a §4.3.
+reenviá-la) e a move para `delivery_unknown`. A partir daí é a §5.3.
 
 Se `sending` antigo for FREQUENTE, o problema é lease curta demais para a
 latência real do provedor: olhe `maia_outbound_lease_lost_total{reason="lease_expired"}`
@@ -118,7 +164,7 @@ antes de mexer em qualquer outra coisa. O heartbeat renova a lease a cada terço
 do TTL enquanto a chamada está em voo; um pico aqui com o heartbeat ligado quer
 dizer que o banco ficou indisponível durante a chamada.
 
-### 4.3 `delivery_unknown` / `reconciling` acumulando
+### 5.3 `delivery_unknown` / `reconciling` acumulando
 
 ```sql
 SELECT payload_type, delivery_outcome, status, count(*), min(created_at)
@@ -151,7 +197,7 @@ npm run dlq outbound-show <outbound_id>
 Ele imprime estado, tipo, tentativas, desfecho e — a linha que importa — se há
 **RISCO** de duplicata e por quê.
 
-### 4.4 `delivered` sem histórico
+### 5.4 `delivered` sem histórico
 
 É a janela declarada pela #632: um crash entre `delivered` e `completed`. A
 mensagem CHEGOU; o que falta é o registro na conversa.
@@ -167,7 +213,7 @@ A varredura, depois de um minuto de carência:
 A resposta operacional é reconstruir o histórico a partir de `payload_json`, à
 mão, com o `provider_message_id` da linha. Não há comando para isso ainda.
 
-### 4.5 Divergência turno ↔ outbound
+### 5.5 Divergência turno ↔ outbound
 
 `maia_outbound_turn_inconsistency_total{kind}` ≠ 0. Os dois sentidos têm causas
 OPOSTAS:
@@ -199,9 +245,9 @@ Como #631 move o turno e insere a linha na MESMA transação, o sentido 1 não p
 nascer do commit. Se aparecer, procure escrita fora das fronteiras: migração de
 dados, `UPDATE agent_turns` manual, ou uma linha apagada à mão.
 
-## 5. DLQ e rearmamento manual
+## 6. DLQ e rearmamento manual
 
-### 5.1 Ver o que morreu
+### 6.1 Ver o que morreu
 
 ```sql
 SELECT id, payload_type, attempt, last_error_code, delivery_outcome, created_at
@@ -214,7 +260,7 @@ SELECT id, payload_type, attempt, last_error_code, delivery_outcome, created_at
 **12** tentativas) ou `reconciliation_timeout` (ficou incerta por 24h). Toda ida
 para a DLQ tem uma row de auditoria `outbound_dead_lettered`.
 
-### 5.2 Rearmar
+### 6.2 Rearmar
 
 ```bash
 npm run dlq outbound-show  <outbound_id>
@@ -238,7 +284,7 @@ motivo registrado é uma intervenção que ninguém consegue reconstruir depois.
 **`failed_terminal` não é rearmável** e a recusa é intencional: o provedor
 recusou de forma definitiva, e rearmar é pedir a mesma recusa num laço.
 
-### 5.3 Rearmar em lote
+### 6.3 Rearmar em lote
 
 Não existe, e a ausência é deliberada. Um lote de `dead_letter` mistura linhas
 sem risco (`text`) com linhas de risco (`audio`, `document`), e um comando de
@@ -246,7 +292,7 @@ lote transformaria a confirmação de risco num flag que se digita uma vez para 
 mensagens que o usuário pode receber em dobro. Se você precisa de lote, faça o
 laço no shell — e leia cada `outbound-show`.
 
-## 6. Rollback
+## 7. Rollback
 
 1. Desligue `FEATURE_OUTBOUND_RECOVERY` (para de enfileirar e de reconciliar).
 2. Desligue `FEATURE_OUTBOUND_DELIVERY_WORKER` (para de consumir). Nesta ordem —
@@ -267,7 +313,7 @@ NÃO detecta índice inválido (issue #658):
 SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
 ```
 
-## 7. O risco residual que esta fatia ADMINISTRA e não resolve
+## 8. O risco residual que esta fatia ADMINISTRA e não resolve
 
 Sem confirmação e idempotência confiáveis do provedor, a janela *"o provedor
 recebeu, o processo não confirmou"* é **impossível de fechar**. Nenhuma

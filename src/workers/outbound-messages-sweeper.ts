@@ -212,8 +212,17 @@ async function tryAcquireSweepLock(): Promise<AcquiredLock | null> {
  * Filtra explicitamente tenant_id/agent_id NOT NULL (belt-and-suspenders;
  * o schema já garante via NOT NULL, mas o predicate protege contra futura
  * relaxação de schema — mesmo padrão de #251).
+ *
+ * EXPORTADA para teste (#633), e a razão é a mesma de `deliverableStatement`
+ * em `outbound-recovery-repo.ts`: o predicado `turn_id IS NULL` que a #633
+ * acrescentou aqui não é observável pelo entrypoint — remover só dele deixa a
+ * tupla ser enumerada, e as outras duas consultas (que ainda filtram) fazem o
+ * passe virar no-op. Sem esta porta, a única sonda possível seria sobre o log,
+ * que é global e portanto frágil num banco compartilhado. Não é seam de
+ * comportamento: nada em produção chama esta função além de
+ * `runOutboundMessagesSweeper`.
  */
-async function listTenantsWithWork(
+export async function listTenantsWithWork(
   stalePendingSec: number,
   retentionDays: number,
 ): Promise<TenantAgentRow[]> {

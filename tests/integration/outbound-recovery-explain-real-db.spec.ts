@@ -43,11 +43,31 @@
  *
  * ## O volume, e por que ele tem esta forma
  *
- * ~20 000 linhas TERMINAIS (`sent`, o vocabulário legado sob retenção de 30
- * dias) mais ~300 linhas de trabalho EM VOO. É a proporção real de um outbox:
- * a esmagadora maioria da tabela é histórico, e o que a varredura procura é
- * uma fração minúscula. É exatamente a forma em que um Seq Scan é caro e um
- * índice parcial é barato — e é a forma em que a ausência do índice DÓI.
+ * ~4 000 linhas TERMINAIS (`sent`, o vocabulário legado sob retenção de 30
+ * dias) mais ~300 linhas de trabalho EM VOO. É a PROPORÇÃO que importa, não o
+ * valor absoluto: a esmagadora maioria da tabela é histórico, e o que a
+ * varredura procura é uma fração minúscula.
+ *
+ * O número começou em 20 000 e foi REDUZIDO depois de medido: o poder
+ * discriminante desta suíte vem de exigir o índice NOMEADO (ver "MEDIDO"
+ * acima), não de tornar o Seq Scan caro, e 4 000 já produz exatamente as mesmas
+ * quatro escolhas de plano — inclusive os três vermelhos com o índice da 131
+ * derrubado. Menos linhas = menos perturbação das estatísticas compartilhadas,
+ * que é o efeito colateral declarado logo abaixo.
+ *
+ * ## Efeito colateral declarado: `ANALYZE` num banco COMPARTILHADO
+ *
+ * `EXPLAIN` só fala do banco que existe se as estatísticas forem frescas, e
+ * `ANALYZE` é por TABELA — não há como escopá-lo a um tenant. Enquanto esta
+ * suíte roda, `pg_statistic` para `outbound_messages` reflete o volume dela, e
+ * as suítes vizinhas do mesmo banco de worktree veem essas estatísticas.
+ *
+ * O que limita o dano, na ordem em que importa: (1) nenhuma outra suíte afirma
+ * PLANO, então o pior caso alheio é uma escolha de plano diferente, nunca um
+ * resultado diferente; (2) o `afterAll` apaga as linhas e roda `ANALYZE` de
+ * novo, devolvendo as estatísticas ao estado anterior; (3) a janela é de
+ * ~200ms. É risco RESIDUAL, e está escrito aqui porque quem o encontrar depois
+ * merece achá-lo declarado em vez de deduzi-lo.
  *
  * Pulado sem `TEST_DB_URL` — e `pulado` NÃO é `passou`.
  */
@@ -68,7 +88,7 @@ const d = SHOULD_RUN ? describe : describe.skip;
 
 const TENANT = 't633x';
 const AGENT = 'a633x';
-const LEGADAS = 20_000;
+const LEGADAS = 4_000;
 const EM_VOO = 300;
 
 let pool: pg.Pool;
