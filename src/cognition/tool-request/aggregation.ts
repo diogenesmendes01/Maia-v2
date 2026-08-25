@@ -128,6 +128,11 @@ export async function decidirAgregacao(args: {
     ASSINATURA_VERSION,
   );
 
+  // O MAIOR score vence, e o empate é resolvido pela ordem em que o
+  // repositório devolve — `last_member_at DESC`, isto é, o agregado mais
+  // ativo. É determinístico (o `>` estrito nunca troca de campeão num empate)
+  // e é a leitura certa: entre dois pedidos igualmente parecidos, somar ao que
+  // está vivo é o que faz o contador significar demanda corrente.
   let melhor: { aggregate_id: string; proposal_id: string; similaridade: number } | null =
     null;
   for (const c of candidatos) {
