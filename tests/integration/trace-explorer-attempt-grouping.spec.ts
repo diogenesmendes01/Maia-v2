@@ -76,11 +76,30 @@ const { txRows, persisted, dbTransactionMock, dbInsertValuesMock, dbExecuteMock 
   },
 );
 
+/**
+ * Issue #535: the Explorer's attempt grouping now goes through the REAL
+ * `runtimeTraceRepo.listAttempts`, which verifies each sibling's signature. So
+ * this spec needs a `db.select` too. It deliberately returns EVERY candidate
+ * row and lets the repository decide: a fake that pre-filtered by `turno_id`
+ * would be the harness re-implementing the control under test.
+ */
+const selectRows: Record<string, unknown>[] = [];
+
 vi.mock('@/db/client.js', () => ({
   db: {
     insert: () => ({ values: dbInsertValuesMock }),
     execute: dbExecuteMock,
     transaction: dbTransactionMock,
+    select: () => {
+      const self = {
+        from: () => self,
+        where: () => self,
+        orderBy: () => self,
+        limit: () => Promise.resolve(selectRows),
+        then: (resolve: (v: unknown) => void) => resolve(selectRows),
+      };
+      return self;
+    },
   },
 }));
 vi.mock('@/lib/logger.js', () => ({
@@ -115,7 +134,11 @@ const { traceTurnDecision, envelopeTraceIdForAttempt } = await import(
   '@/observability/turn-trace.js'
 );
 const { runWithCorrelation, deriveTraceId } = await import('@/observability/correlation.js');
+const { verifyEnvelopeIntegrity } = await import(
+  '@/control-plane/runtime-trace/verify-envelope.js'
+);
 const { tracesRouter } = await import('@/admin-ui/trpc/routers/traces.js');
+const { runtimeTraceRepo } = await import('@/db/repositories/runtime-trace-repos.js');
 
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
 
@@ -174,6 +197,9 @@ function envelopeRows() {
     .map((r) => r.row);
 }
 
+/** Every admin audit row the router wrote during a test. */
+const auditRows: Array<Record<string, unknown>> = [];
+
 /** Router ctx backed by the rows the real writer produced. */
 function makeCtx() {
   const rows = envelopeRows();
@@ -206,15 +232,30 @@ function makeCtx() {
             body_available: true,
           };
         },
-        async listAttempts({ rootTraceId }: { rootTraceId: string }) {
-          return rows
-            .filter((r) => r.root_trace_id === rootTraceId)
-            .sort((a, b) => Number(a.attempt) - Number(b.attempt))
-            .map((r) => ({ ...r, created_at: new Date() }));
+        /**
+         * Issue #535 — the REAL repository, not a stand-in. It is what enforces
+         * the signed `turno_id` and drops a sibling whose own HMAC does not
+         * hold; re-implementing either here would make this spec pass with the
+         * production control deleted.
+         */
+        listAttempts: (args: { tenantId: string; rootTraceId: string; turnoId: string }) => {
+          selectRows.length = 0;
+          selectRows.push(
+            ...rows
+              .filter((r) => r.root_trace_id === args.rootTraceId)
+              .sort((a, b) => Number(a.attempt) - Number(b.attempt))
+              .map((r) => ({ ...r, created_at: new Date(), body_persisted_at: null })),
+          );
+          return runtimeTraceRepo.listAttempts(args);
         },
       },
       debugSnapshotGrantsRepo: { async findActive() { return null; } },
-      adminAuditLogRepo: { async append(r: unknown) { return r; } },
+      adminAuditLogRepo: {
+        async append(r: Record<string, unknown>) {
+          auditRows.push(r);
+          return r;
+        },
+      },
     } as unknown as typeof import('@/db/repositories.js'),
     assertTenant: () => {},
     assertRole: () => {
@@ -227,6 +268,7 @@ describe('issue #514 [P1] — attempt grouping, writer → repo → Explorer', (
   beforeEach(async () => {
     txRows.length = 0;
     persisted.clear();
+    auditRows.length = 0;
     dbTransactionMock.mockClear();
     await attemptTurn(1);
     await attemptTurn(2);
@@ -256,15 +298,38 @@ describe('issue #514 [P1] — attempt grouping, writer → repo → Explorer', (
       expect(new Set(rows.map((r) => r.trace_id)).size).toBe(3);
     });
 
-    it('grouping columns are NOT part of the signed payload', () => {
-      // They are denormalised navigation, not decision evidence. `turno_id` —
-      // which IS signed — remains the authoritative turn identity, so a
-      // tampered `attempt` cannot merge two different turns.
+    it('issue #535 — every attempt is written with signature_version=2, never v1', () => {
+      // The write path has ONE version and it is a constant. If production ever
+      // emits v1 again, this is the row-level tripwire.
+      expect(envelopeRows().map((r) => r.signature_version)).toEqual([2, 2, 2]);
+    });
+
+    it('issue #535 — the grouping columns are now INSIDE the signature', () => {
       const rows = envelopeRows();
       expect(new Set(rows.map((r) => r.turno_id))).toEqual(new Set([TURNO_ID]));
-      // Same decision content on every attempt ⇒ same signature INPUT except
-      // trace_id, so the HMACs differ only because trace_id differs.
       expect(new Set(rows.map((r) => r.envelope_hmac)).size).toBe(3);
+      // Re-verifying the row as written must hold; flipping `root_trace_id` or
+      // `attempt` must not. Before #535 both of those flips verified fine —
+      // that is exactly the gap the owner asked to close.
+      for (const r of rows) {
+        const asWritten = {
+          ...r,
+          envelope_hmac: r.envelope_hmac as string,
+        } as never;
+        expect(verifyEnvelopeIntegrity(asWritten)).toBe('verified');
+        expect(
+          verifyEnvelopeIntegrity({
+            ...(r as Record<string, unknown>),
+            root_trace_id: '44444444-4444-4444-8444-444444444444',
+          } as never),
+        ).toBe('invalid');
+        expect(
+          verifyEnvelopeIntegrity({
+            ...(r as Record<string, unknown>),
+            attempt: 99,
+          } as never),
+        ).toBe('invalid');
+      }
     });
   });
 
@@ -298,6 +363,65 @@ describe('issue #514 [P1] — attempt grouping, writer → repo → Explorer', (
       expect(res.items.map((i) => i.is_retry)).toEqual([false, true, true]);
       expect(res.items.map((i) => i.attempt)).toEqual([1, 2, 3]);
       expect(new Set(res.items.map((i) => i.root_trace_id))).toEqual(new Set([ROOT]));
+    });
+
+    it('issue #535 — the Explorer passes the SIGNED turno_id into the grouping', async () => {
+      // Anchored on the real repo: it throws when the turno_id is absent, so a
+      // router that stopped passing it would fail here rather than quietly go
+      // back to grouping on `root_trace_id` alone.
+      const seen: Array<Record<string, unknown>> = [];
+      const ctx = makeCtx();
+      const inner = ctx.repos.runtimeTraceRepo.listAttempts as (a: never) => unknown;
+      (ctx.repos.runtimeTraceRepo as unknown as Record<string, unknown>).listAttempts = (
+        args: Record<string, unknown>,
+      ) => {
+        seen.push(args);
+        return inner(args as never);
+      };
+      const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: ROOT });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.turnoId).toBe(TURNO_ID);
+      expect(res.attempt_grouping_signed).toBe(true);
+    });
+
+    it('issue #535 — a foreign turn spliced in by rewriting root_trace_id is refused', async () => {
+      // The "fusão visual entre turnos" the owner named. The forged row is a
+      // genuine envelope of ANOTHER turn whose `root_trace_id` was edited to
+      // point at this one. Its `turno_id` is signed, so the moment the SQL
+      // predicate is satisfied by also rewriting it, the signature breaks.
+      const genuineOther = { ...envelopeRows()[0]! };
+      const forged = {
+        ...genuineOther,
+        trace_id: '00000000-0000-4000-8000-0000000000ff',
+        attempt: 4,
+        root_trace_id: ROOT,
+        // Rewritten to satisfy the new predicate — and detected by the HMAC.
+        turno_id: TURNO_ID,
+        envelope_hmac: 'assinatura-forjada-neste-teste',
+      };
+      txRows.push({ table: 'runtime_trace_envelopes', row: forged });
+      const res = await tracesRouter.createCaller(makeCtx()).getTrace({ traceId: ROOT });
+      expect(res.attempts.map((a) => a.trace_id)).not.toContain(forged.trace_id);
+      expect(res.attempt_count).toBe(3);
+
+      // The refusal is AUDITED, not merely logged: a detection nobody can read
+      // back later is not a detection.
+      const audited = auditRows.filter(
+        (r) => r.action === 'runtime_trace_attempt_group_row_refused',
+      );
+      expect(audited).toHaveLength(1);
+      const summary = audited[0]!.change_summary as {
+        refused: Array<{ trace_id: string; integrity: string }>;
+      };
+      expect(summary.refused.map((r) => r.trace_id)).toEqual([forged.trace_id]);
+      expect(summary.refused[0]!.integrity).toBe('invalid');
+    });
+
+    it('a clean group audits nothing — the audit is the exception, not the trace', async () => {
+      await tracesRouter.createCaller(makeCtx()).getTrace({ traceId: ROOT });
+      expect(
+        auditRows.filter((r) => r.action === 'runtime_trace_attempt_group_row_refused'),
+      ).toHaveLength(0);
     });
 
     it('a single-attempt turn reports a group of one (no retry noise)', async () => {

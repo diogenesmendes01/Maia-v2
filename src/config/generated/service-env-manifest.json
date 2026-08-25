@@ -670,6 +670,20 @@
           "restartRequired": true
         },
         {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -927,6 +941,13 @@
           "required": false,
           "group": "runtime-trace",
           "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": false
         },
         {
           "name": "RUNTIME_TRACE_DEBUG_S3_BUCKET",
@@ -1385,6 +1406,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1422,6 +1445,7 @@
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1570,6 +1594,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1606,6 +1632,7 @@
             "MAIA_STRICT_METRIC_LABELS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1754,6 +1781,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1790,6 +1819,7 @@
             "MAIA_STRICT_METRIC_LABELS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -2626,6 +2656,20 @@
           "required": false,
           "group": "backup",
           "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2683,7 +2727,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         },
         "staging": {
@@ -2731,7 +2777,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         },
         "production": {
@@ -2779,7 +2827,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         }
       }
@@ -3213,6 +3263,20 @@
           "restartRequired": true
         },
         {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -3306,6 +3370,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3373,6 +3439,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3440,6 +3508,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]

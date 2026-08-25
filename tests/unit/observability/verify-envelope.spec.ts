@@ -12,7 +12,10 @@ import {
   verifyEnvelopeIntegrity,
   verifyBodyIntegrity,
 } from '@/control-plane/runtime-trace/verify-envelope.js';
-import { envelopeSignedPayload } from '@/control-plane/runtime-trace/envelope-writer.js';
+import {
+  envelopeSignedPayload,
+  type EnvelopeSignatureVersion,
+} from '@/control-plane/runtime-trace/envelope-writer.js';
 import {
   signHmac,
   _resetHmacCacheForTests,
@@ -22,10 +25,19 @@ import {
 } from '@/control-plane/runtime-trace/lib/hmac.js';
 
 const TRACE_ID = '3f1a9d2e-4c5b-4a7e-9f0d-1b2c3d4e5f60';
+const ROOT_TRACE_ID = '7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918';
 const CONVERSA_ID = '11111111-2222-4333-8444-555555555555';
 const TURNO_ID = '99999999-8888-4777-8666-555555555555';
 
-function signedRow(over: Record<string, unknown> = {}) {
+/**
+ * Issue #535: the row is now VERSIONED. Default v2 — the version production
+ * writes — with v1 still exercised below so the "verifier keeps reading v1"
+ * half of the owner decision has a test and not just a comment.
+ */
+function signedRow(
+  over: Record<string, unknown> = {},
+  version: EnvelopeSignatureVersion = 2,
+) {
   const fields = {
     trace_id: TRACE_ID,
     tenant_id: 'acme',
@@ -37,11 +49,18 @@ function signedRow(over: Record<string, unknown> = {}) {
     side_effect_level: 'medium' as const,
     redaction_class: 'standard',
     hmac_key_version: 1,
+    root_trace_id: ROOT_TRACE_ID,
+    attempt: 2,
     ...over,
   };
   return {
     ...fields,
-    envelope_hmac: signHmac(fields.tenant_id, fields.hmac_key_version, envelopeSignedPayload(fields)),
+    signature_version: version,
+    envelope_hmac: signHmac(
+      fields.tenant_id,
+      fields.hmac_key_version,
+      envelopeSignedPayload(fields, version),
+    ),
   };
 }
 
@@ -70,6 +89,9 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
       ['trace_id', '00000000-0000-4000-8000-000000000000'],
       ['conversa_id', '22222222-2222-4222-8222-222222222222'],
       ['turno_id', '33333333-3333-4333-8333-333333333333'],
+      // Issue #535 — the two fields v1 left outside the signature.
+      ['root_trace_id', '44444444-4444-4444-8444-444444444444'],
+      ['attempt', 7],
     ])('flipping %s ⇒ invalid', (field, value) => {
       const row = signedRow();
       const tampered = { ...row, [field]: value };
@@ -115,7 +137,7 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
     it('a signature from a different key version ⇒ invalid', () => {
       _setTestKeyringEntryForTests(2, 'a-different-master-secret-for-v2');
       const row = signedRow({ hmac_key_version: 1 });
-      const v2 = signHmac('acme', 2, envelopeSignedPayload({ ...row, hmac_key_version: 2 }));
+      const v2 = signHmac('acme', 2, envelopeSignedPayload({ ...row, hmac_key_version: 2 }, 2));
       expect(verifyEnvelopeIntegrity({ ...row, envelope_hmac: v2 })).toBe('invalid');
     });
   });
@@ -226,20 +248,74 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
     // If someone adds a field to the signature in `envelopeSignedPayload`, the
     // verifier picks it up for free — that is the point of the shared helper.
     const row = signedRow();
-    const payload = envelopeSignedPayload(row);
-    expect(Object.keys(payload).sort()).toEqual(
-      [
-        'agent_id',
-        'conversa_id',
-        'decision',
-        'hmac_key_version',
-        'policy_id',
-        'redaction_class',
-        'side_effect_level',
-        'tenant_id',
-        'trace_id',
-        'turno_id',
-      ].sort(),
+    const V1_FIELDS = [
+      'agent_id',
+      'conversa_id',
+      'decision',
+      'hmac_key_version',
+      'policy_id',
+      'redaction_class',
+      'side_effect_level',
+      'tenant_id',
+      'trace_id',
+      'turno_id',
+    ];
+    expect(Object.keys(envelopeSignedPayload(row, 1)).sort()).toEqual([...V1_FIELDS].sort());
+    // Issue #535: v2 = v1 ∪ {root_trace_id, attempt, signature_version}. This
+    // list is the CONTRACT, so widening the signature without deciding to is a
+    // failing test rather than a silent invalidation of every stored envelope.
+    expect(Object.keys(envelopeSignedPayload(row, 2)).sort()).toEqual(
+      [...V1_FIELDS, 'root_trace_id', 'attempt', 'signature_version'].sort(),
     );
+  });
+
+  describe('issue #535 — the verifier reads BOTH versions, and version is not a lever', () => {
+    it('a genuine v1 envelope still verifies (fixtures / old environments)', () => {
+      expect(verifyEnvelopeIntegrity(signedRow({}, 1))).toBe('verified');
+    });
+
+    it('v1 leaves root_trace_id/attempt outside the signature — that is why v2 exists', () => {
+      // This is NOT a bug being asserted as correct: it is the exact reason the
+      // owner asked for v2. Pinning it keeps the v1 encoding frozen and stops
+      // anyone from "fixing" v1 in place, which would invalidate every v1 row.
+      const v1 = signedRow({}, 1);
+      expect(verifyEnvelopeIntegrity({ ...v1, root_trace_id: TRACE_ID })).toBe('verified');
+      expect(verifyEnvelopeIntegrity({ ...v1, attempt: 99 })).toBe('verified');
+    });
+
+    it('DOWNGRADE: relabelling a v2 row as v1 does not free the new fields', () => {
+      // The attack: an attacker with DB write flips `signature_version` to 1 so
+      // the verifier recomputes a material that never covered `root_trace_id`,
+      // then edits it. It fails because v2 signs its own version — the v1
+      // material cannot reproduce an HMAC taken over the v2 material.
+      const v2 = signedRow({}, 2);
+      const downgraded = {
+        ...v2,
+        signature_version: 1,
+        root_trace_id: '44444444-4444-4444-8444-444444444444',
+      };
+      expect(verifyEnvelopeIntegrity(downgraded)).toBe('invalid');
+      // Even without touching any other field, the relabel alone is detected.
+      expect(verifyEnvelopeIntegrity({ ...v2, signature_version: 1 })).toBe('invalid');
+    });
+
+    it('UPGRADE: relabelling a v1 row as v2 is detected too', () => {
+      const v1 = signedRow({}, 1);
+      expect(verifyEnvelopeIntegrity({ ...v1, signature_version: 2 })).toBe('invalid');
+    });
+
+    it('an unknown signature version is refused, never silently read as v1', () => {
+      const row = signedRow({}, 2);
+      expect(verifyEnvelopeIntegrity({ ...row, signature_version: 3 })).toBe(
+        'rejected_version',
+      );
+    });
+
+    it('a missing signature_version column is read as v1, matching the DB default', () => {
+      const v1 = signedRow({}, 1);
+      const { signature_version: _drop, ...withoutColumn } = v1;
+      void _drop;
+      expect(verifyEnvelopeIntegrity(withoutColumn)).toBe('verified');
+    });
   });
 });

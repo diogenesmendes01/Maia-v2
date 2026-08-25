@@ -133,14 +133,61 @@ export const tracesRouter = router({
       });
 
       // Review round 2 [P1]: every attempt of this turn, so the detail page can
-      // show "attempt 2 of 3" and link to the siblings. Falls back to just this
-      // trace for rows written before migration 107 backfilled the root.
-      const attempts = trace.root_trace_id
+      // show "attempt 2 of 3" and link to the siblings.
+      //
+      // Issue #535: grouping now requires the SIGNED `turno_id` as well, and
+      // the turno_id is only trustworthy if THIS row's own signature holds. So
+      // the group is built only when both are available:
+      //   - no `root_trace_id` (row predates migration 107's backfill) ⇒ no
+      //     group, exactly as before;
+      //   - no `turno_id` (a standalone caller that never persisted an inbound
+      //     row) ⇒ no group, because there is no signed field to join on;
+      //   - this row's envelope does not verify (`invalid`) ⇒ no group, because
+      //     the `turno_id` we would join on is itself unverified. `unknown` and
+      //     `rejected_version` still group: they are statements about this
+      //     deployment's keys/policy, not about the row.
+      // Every one of those paths returns an EMPTY list, which the page already
+      // renders as "no sibling attempts" — a degraded grouping, never a merged
+      // one.
+      const groupingIsTrustworthy =
+        typeof trace.root_trace_id === 'string' &&
+        trace.root_trace_id.length > 0 &&
+        typeof trace.turno_id === 'string' &&
+        trace.turno_id.length > 0 &&
+        trace.integrity !== 'invalid';
+      const group = groupingIsTrustworthy
         ? await ctx.repos.runtimeTraceRepo.listAttempts({
             tenantId,
-            rootTraceId: trace.root_trace_id,
+            rootTraceId: trace.root_trace_id!,
+            turnoId: trace.turno_id!,
           })
-        : [];
+        : { items: [], refused: [] };
+      const attempts = group.items;
+
+      // Issue #535: a row that satisfied (tenant, root_trace_id, turno_id) and
+      // still failed its OWN signature is a row someone edited to reach this
+      // turn's attempt chain. That is the splice attempt itself, and it must
+      // leave a durable trace — a dropped row visible only in a log line is a
+      // detection that nobody detects. Ids and the verdict only: never a field
+      // value, same rule as `runtime_trace_envelope_divergent_replay`.
+      if (group.refused.length > 0) {
+        await ctx.repos.adminAuditLogRepo.append({
+          tenant_id: tenantId,
+          actor_id: ctx.userId,
+          actor_role: ctx.userRole,
+          action: 'runtime_trace_attempt_group_row_refused',
+          resource_type: 'runtime_trace',
+          resource_id: trace.trace_id,
+          change_summary: {
+            root_trace_id: trace.root_trace_id,
+            refused: group.refused.map((r) => ({
+              trace_id: r.trace_id,
+              attempt: r.attempt,
+              integrity: r.integrity,
+            })),
+          },
+        });
+      }
 
       const packet = (trace.redacted_packet ?? null) as Record<string, unknown> | null;
       const hooks = Array.isArray(packet?.policy_hooks)
@@ -164,8 +211,21 @@ export const tracesRouter = router({
           body_status: a.body_status,
           started_at: a.created_at,
           is_current: a.trace_id === trace.trace_id,
+          // Issue #535: per-sibling verdict. An operator deciding whether two
+          // rows really are attempts of one turn needs to know which of them
+          // proved it.
+          integrity: a.integrity,
+          signature_version: a.signature_version,
+          grouping_signed: a.grouping_signed,
         })),
         attempt_count: attempts.length,
+        /**
+         * Issue #535: whether the attempt chain shown above rests on signed
+         * evidence end to end. False when any sibling is a v1 envelope, whose
+         * `root_trace_id`/`attempt` sit outside its signature.
+         */
+        attempt_grouping_signed:
+          attempts.length > 0 && attempts.every((a) => a.grouping_signed),
         started_at: trace.created_at,
         decision: trace.decision,
         side_effect_level: trace.side_effect_level,
@@ -181,6 +241,11 @@ export const tracesRouter = router({
         hmac_key_version: trace.hmac_key_version,
         envelope_integrity: trace.integrity,
         envelope_signed: trace.integrity === 'verified',
+        // Issue #535: which canonical material the signature covers. 2 ⇒
+        // `root_trace_id`/`attempt` are inside it; 1 ⇒ they are not, and this
+        // deployment may be configured to refuse v1 outright
+        // (`RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false` ⇒ `rejected_version`).
+        signature_version: trace.signature_version,
         // Round 2 [P2]: the BODY carries its own `packet_hmac`, which was
         // persisted and never read back — the same omission the envelope check
         // just fixed. `absent` means "not persisted yet", not "failed to

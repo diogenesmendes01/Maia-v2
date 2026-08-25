@@ -4,6 +4,262 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
+
+> **O que muda no seu dia:** antes, um app que subisse contra um schema
+> incompatível ficava **de pé** respondendo 503 no `/readyz`. Agora ele **não
+> sobe** — encerra com exit code **90-97**, e sob um supervisor que reinicia
+> isso é **crash loop**. Se o seu deploy não tem gate de migration, ele passa a
+> ter um sintoma novo. Verifique, ANTES de subir este release, que o migrator
+> roda antes do app: `depends_on: { migrate: { condition:
+> service_completed_successfully } }` no Compose (já é assim em
+> `compose.prod.yml` e `docker-compose.yml`), ou `npm run release:migrate` no
+> comando de pré-deploy do painel ([#565](https://github.com/diogenesmendes01/Maia-v2/issues/565)).
+>
+> **Em `development`/`staging`**, a alavanca declarada continua sendo
+> `READINESS_SCHEMA_CHECK=false` (silenciosa em dev, aviso em staging,
+> **recusada no boot em production**). Nenhuma variável nova foi criada.
+
+**A decisão é do dono e está registrada** — [ADR 0004](docs/architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md):
+*"Produção greenfield não precisa preservar a postura intermediária.
+`getSchemaReadiness()` deve decidir o boot… Se acontecer, o crash loop é sinal
+de quebra de invariante."*
+
+**O PORQUÊ.** A #516 entregou o veredito canônico de schema
+(`getSchemaReadiness()`) e ligou o `/readyz` nele. O **boot**, porém, ficou com
+`checkSchemaVersion()` — que comparava o id mais novo do ledger com o `.sql`
+mais novo em disco e **nada mais**. Havia dois vereditos de schema no mesmo
+processo, com forças diferentes, e **o mais fraco decidia se o processo
+nascia**: um app subia tranquilo sobre uma migration editada depois de aplicada,
+sobre uma linha `dirty` e sobre uma migration que o build não empacota, e só
+descobria na primeira query que tocasse a coluna nova. Agora existe um veredito
+só.
+
+O que mudou:
+
+- **`src/index.ts` (etapa `schema`)** chama `checkSchemaReadiness()` — o MESMO adaptador cacheado do `/readyz`, então boot e probe não podem divergir — e lança `SchemaBootAbortError`; o handler de `main()` sai com `bootExitCode(err)`.
+- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown`. `1` continua sendo qualquer outra falha de boot. A faixa 90-97 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
+- **Mensagem de morte acionável**, porque um crash loop sem diagnóstico é pior que um 503: `maia.schema_boot_refused` carrega `exit_code`, `blocker`, `blockers`, `migration_id`, `expected_checksum` (arquivo empacotado) vs. `found_checksum` (linha do ledger), os dois heads e a `remediation` (o comando exato). Nada disso carrega SQL, texto de driver ou DSN — a mensagem de erro do `pg` embute a connection string com senha.
+- **`checkSchemaVersion()` e `src/runtime/lifecycle/schema-version.ts` foram REMOVIDOS**, com o spec dedicado. Não sobrou um segundo veredito de schema para divergir.
+- **Coerência com a [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):** o `/readyz` continua sendo o único gate de roteamento, role-aware e fail-closed, e continua respondendo 503 quando o schema muda debaixo de um processo **que já subiu** — esse caso não vira crash loop. A árvore de decisão do operador (quando olhar exit code, quando olhar readiness) está em `docs/runbooks/operational.md` §8.1.
+
+**A evidência.** `tests/unit/runtime/schema-boot-gate.spec.ts` importa o
+**`src/index.ts` real** (a avaliação do módulo dispara `main()` e o handler de
+falha) e injeta apenas o que um unitário não pode ter: um pool de ledger falso e
+um diretório temporário de migrations — a classificação do veredito é a de
+produção. Reintroduzindo o defeito no call site REAL, um de cada vez:
+neutralizar a decisão (`if (false && failure)`) deixa **7 de 10 casos
+vermelhos** (`expected 1 to be 90`, `expected 1 to be 91`, …); trocar
+`process.exit(bootExitCode(err))` por `process.exit(1)` deixa **os mesmos 7
+vermelhos**. Contraste no verde: com o schema verificado o boot passa da etapa e
+morre no passo seguinte com exit 1 (sentinela do Redis), então o gate não está
+recusando tudo. Em Postgres real, `tests/integration/migrations-runner-real-db.spec.ts`
+repete a tradução veredito ⇒ exit code contra ledger de verdade.
+
+### ⚠️ AÇÃO DO OPERADOR — o TTL do export de privacidade passa a APAGAR o arquivo ([#536](https://github.com/diogenesmendes01/Maia-v2/issues/536))
+
+> **Até este release, `privacy_requests.export_expires_at` era um carimbo sem
+> executor.** O prazo existia no banco; o `.enc` — um pacote cifrado com o dado
+> consolidado de um titular — ficava no disco **para sempre**. Não era uma
+> retenção frouxa: era um vazamento com deadline infinito, e mais fácil de
+> esquecer que o comum, porque a coluna dá a impressão de que alguém já cuidou
+> disso.
+>
+> A partir daqui um cron horário (`privacy_export_sweep`) **remove** o artefato
+> vencido. Duas coisas para fazer antes de subir:
+>
+> 1. **rode um passe em dry-run** e compare com a expectativa —
+>    `npm run privacy:export -- sweep --dry-run`. Num ambiente que nunca teve
+>    varredura, o primeiro passe real pode apagar todo o acervo acumulado;
+> 2. **confira `PRIVACY_EXPORT_TTL_DAYS`** (novo, default `7`). Ele vale na
+>    EMISSÃO e fica carimbado em `export_expires_at`; o varredor honra o
+>    carimbo, nunca a configuração atual — mudar o número não encurta nem
+>    estica o que já foi emitido (o runbook §8 traz o `UPDATE` para quando isso
+>    for deliberado).
+>
+> Migration **118** (aditiva, `IF NOT EXISTS`). Para desarmar temporariamente:
+> `PRIVACY_EXPORT_SWEEP_DRY_RUN=true` — mas leia o §9 do runbook antes, porque
+> o dry-run permanente devolve exatamente o estado que esta entrega conserta.
+
+**Sete dias viram a política inicial, e o mecanismo que a cumpre existe.** Decisão do dono sobre a #536: aceite o prazo, mas implemente o TTL de verdade antes do go-live. O prazo saiu do código (`const EXPORT_TTL_MS`) e virou `PRIVACY_EXPORT_TTL_DAYS`, porque quem decide é o DPO e a decisão vai mudar.
+
+**Idempotência mora na ORDEM, e a ordem é evidência.** O varredor cruza um arquivo no disco com uma linha no banco, e os dois não commitam juntos — então a pergunta é qual ordem deixa o estado intermediário LEGÍVEL. `marcar → apagar` deixa o pedido dizendo "artefato removido" com o `.enc` vivo e sem candidato para reencontrá-lo: órfão para sempre. `apagar → marcar` deixa, no pior caso, o arquivo removido e o pedido ainda na fila — a execução seguinte prova o caminho, encontra a ausência (`already_absent`), e conclui. Escolhemos a segunda. A marcação e a auditoria vão na MESMA transação, condicionadas a `export_purged_at IS NULL`: quem não ganha a transição não audita, então rodar duas vezes (em série ou em paralelo) produz **exatamente uma** linha `privacy_export_purged`.
+
+**O locator é entrada não confiável para um `rm`, e é tratado como tal** (`src/ops/privacy/export-locator.ts`). Quatro camadas antes de qualquer remoção: forma (o UUID que o próprio `sealExport` emite), contenção (filho direto da raiz, provado por identidade — `startsWith` sozinho aceita `/exports-evil/x` para uma raiz `/exports`), inode (`lstat` e nunca `stat`, porque `stat` segue o symlink e esconde justamente o caso; mais arquivo-regular e `nlink === 1`, já que um segundo hard link significa que remover o nosso destrói o rastro e não o dado) e **binding** — a linha é relida no instante da remoção, porque entre planejar e apagar o export pode ter sido reemitido e o arquivo do plano pode ser um artefato vivo. A ordem das checagens é contrato, como em `assertDrillTarget`: as recusas estruturais vêm primeiro para que o código auditado nomeie o **pior fato verdadeiro** — `../../etc/passwd` tem que ser registrado como `path_separator`, não como o também-verdadeiro "não parece um UUID". Toda recusa é auditada (`privacy_export_purge_refused`) e **nada é apagado**.
+
+**Evidência de que o guarda está NO CAMINHO, e não apenas disponível.** A sonda que vale para código destrutivo é a chamada de remoção nem ser alcançada. Neutralizando a validação no call site real (`const proven = { path: ..., present: true }` no lugar de `proveExportArtifact`), `tests/unit/ops/privacy-export-sweeper.spec.ts` fica vermelho com a chamada mostrada:
+
+```
+AssertionError: expected "vi.fn()" to not be called at all, but actually been called 1 times
+Received:
+  1st vi.fn() call:
+    Array [ "/srv/backups/privacy-export/../../etc/passwd" ]
+```
+
+**Legal hold congela o export, não só a origem.** O varredor avalia o hold sobre `privacy.export` **e** sobre toda classe de escopo de titular que o pacote empacota: a cópia entregue é material responsivo tanto quanto as linhas de que ela foi feita. A avaliação **não** consulta o `legal_hold_applicable` da classe — condicionar uma recusa destrutiva a um campo mutável de registro significa que uma edição de um caractere desarma a proteção. Hold ilegível reprova o passe inteiro; "não sei se há hold" nunca vira "não há hold". `privacy.export` passou de `legal_hold_applicable: false` para `true` em `data-classes.ts`, corrigindo uma declaração que só era inócua enquanto nada apagava a classe.
+
+**O pedido passa a indicar artefato expirado.** `readExportArtifact` é o único lugar que decide o que um leitor vê: `none` · `available` · `expired` · `purged`. `expired` **retém** o locator de propósito — entre o vencimento e a passagem do varredor o arquivo ainda existe, e entregá-lo nessa janela furaria o próprio TTL. `npm run privacy:export -- show --request=<uuid>` é a leitura do operador.
+
+- **Migration 118** — `export_purge_started_at` (passe que caiu fica visível) + `export_purged_at` (a transição de vencedor único), CHECK recusando "varrido sem nunca ter tido artefato", e dois índices **parciais** no padrão de `067`/`070`: a fila do varredor e a pergunta de incidente "algum passe começou e nunca terminou?".
+- **Cobertura**: 75 testes unitários novos + 9 casos na spec de forma das migrations (`ops-migrations-shape.spec.ts` passa de 42 para 51: colunas, CHECK, os dois índices PARCIAIS, idempotência do up e o envelope `BEGIN`/`COMMIT` do down — sem Postgres) (`privacy-export-locator.spec.ts` 30, `privacy-export-sweeper.spec.ts` 33, `privacy-export-sweep-scheduler.spec.ts` 12) + 12 de integração (`privacy-export-ttl-real-db.spec.ts`) que provam o que só o banco prova — o CHECK, a ordem da fila e o `RETURNING` do UPDATE condicional sob concorrência real. Os de integração **não foram executados** nesta rodada: Postgres está fora do ar no ambiente de desenvolvimento; rodam no CI.
+- **Alerta novo, com threshold 1** — `privacy_export_locator_refused` em `src/workers/audit-watcher.ts`. A taxa normal de `privacy_export_purge_refused` é **zero**, então agrupá-la por volume (como as outras regras de threshold, que usam 3) esconderia o primeiro evento — o único que importa. `urgent` e não `critical`: nada foi apagado, o guarda recusou antes da remoção.
+- **Contra a armadilha do espelho**: `tests/unit/workers/privacy-export-sweep-scheduler.spec.ts` passa pelo REGISTRO real (`JOBS`) e pelo adaptador real (`runPrivacyExportSweepJob` → `withOpsLock`), não por um agendador próprio. Remover a entrada do cron reprova 11 dos 12 casos com `Error: o job privacy_export_sweep não está no registro de workers` — um harness privado continuaria verde com o TTL desligado, que é exatamente o defeito original em outra roupa.
+- **Fora de escopo, e deliberadamente**: purgar `privacy.export` como parte de um pedido de EXCLUSÃO de outro titular (continua em `UNSUPPORTED_CLASSES` — é uma pergunta diferente do TTL) e qualquer redação de `postgres.audit`, que segue bloqueada até decisão campo a campo do DPO.
+- Runbook novo: [`docs/runbooks/privacy-export-ttl.md`](docs/runbooks/privacy-export-ttl.md). Docs reconciliados: `docs/architecture/modules/ops.md`, `docs/architecture/concerns/data-retention-matrix.md` e `docs/runbooks/backup-restore.md` §7/§9 — a frase "a retenção não apaga nada hoje" deixou de ser verdade inteira e agora nomeia as duas exceções, para que ninguém opere com a expectativa errada.
+
+### Fixed — `markSuperseded` vira DUAS operações: o fence pertence a quem ABSORVE ([#504](https://github.com/diogenesmendes01/Maia-v2/issues/504))
+
+`markSuperseded` era uma operação para dois fatos diferentes — e por isso não tinha fence nenhum.
+
+Marcar um turno `superseded` acontece em dois lugares, e a AUTORIDADE de cada um
+é de uma linha diferente:
+
+| Operação | Linha que muda | Posse exigida |
+|---|---|---|
+| `markSupersededSelf` (auto-supersessão) | o próprio turno | o `claim_token` **do próprio turno** |
+| `markSupersededByAbsorber` (absorção de irmão pelo debounce) | o turno **irmão** | o `claim_token` + lease VIVA do turno **ABSORVEDOR**, num `EXISTS` na mesma declaração |
+
+O erro que isso corrige é conceitual, e os dois jeitos de errar são simétricos.
+**Exigir claim do irmão** tornaria a absorção legítima impossível no caso comum:
+o turno absorvido normalmente NUNCA foi reivindicado — quem foi reivindicado é o
+executor da rajada —, então `claim_token IS NULL` é o estado normal dele.
+**Não exigir nada dos dois lados** — o que estava no código — deixava um worker
+zumbi (lease vencida, tentativa já sucedida) absorver turnos e apagar trabalho do
+sucessor, e deixava `superseded` ser a **única transição terminal** que uma
+tentativa sem posse conseguia atravessar: como `superseded` é terminal, o
+sucessor perdia o turno e nada aparecia como conflito. **O fence pertence a quem
+absorve.**
+
+O compare-and-swap na linha do irmão (`expected_version`) passou a ser
+**obrigatório** na assinatura, e não opcional como nas demais transições: é ele
+que decide a corrida entre duas absorções concorrentes, e omiti-lo por descuido
+faria a rajada produzir dois turnos executáveis disputando as mesmas mensagens.
+
+`absorbDebounceInputs` (`src/runtime/turns/lifecycle.ts`) ganhou o guard de posse
+que não tinha: uma tentativa que JÁ SABE ter perdido a lease não absorve nada —
+nem o irmão, nem o `attachInputTx` da irmã sem turno — e uma recusa vinda do
+banco (`stale_claim`) PARA a rajada inteira em vez de insistir. A posse é
+reavaliada a cada irmã, porque a rajada pode ser longa e a lease pode morrer no
+meio dela.
+
+**Evidência, e por que ela não é um espelho.** O `WHERE` do compare-and-swap
+saiu de dentro de `runTransition` para um módulo PURO
+(`src/db/repositories/turn-fence-sql.ts`), e `runTransition` não acrescenta
+predicado nenhum depois de chamá-lo. Isso é o que permite a
+`tests/unit/db/turn-fence-sql.spec.ts` compilar o SQL **real** de produção com
+`PgDialect` — sem Postgres — e afirmar caractere a caractere que
+`absorvedor.lease_expires_at > now()` está lá, que só existe UMA referência a
+`claim_token` e que ela está dentro do `EXISTS` (nenhuma sobre o irmão), e que
+`state_version` está no `WHERE`. Um teste que remontasse a query com o próprio
+harness continuaria verde depois de alguém deletar o call site.
+`tests/unit/runtime/turn-absorption-fence.spec.ts` prova o mesmo contrato no call
+site real do lifecycle, e `tests/integration/turn-absorption-fence-real-db.spec.ts`
+prova contra PostgreSQL o que só o banco decide (lease pelo relógio dele,
+takeover, corrida de duas absorções, projeção legada na mesma transação).
+
+### ⚠️ BREAKING (operacional) — as três flags de turno passam a vir `true` ([#504](https://github.com/diogenesmendes01/Maia-v2/issues/504))
+
+> **Um `.env` que não menciona as flags de turno muda de comportamento neste
+> release.** `FEATURE_TURN_CLAIM` e `FEATURE_TURN_STATE_AUTHORITATIVE` saíram de
+> `false` para `true` no contrato. Quem já declarava um valor não é afetado.
+
+| Flag | Antes | Agora |
+|---|---|---|
+| `FEATURE_TURN_STATE_MACHINE` | `true` | `true` |
+| `FEATURE_TURN_STATE_AUTHORITATIVE` | `false` | **`true`** |
+| `FEATURE_TURN_CLAIM` | `false` | **`true`** |
+| `FEATURE_TURN_JOB_V2` | `false` | `false` (inalterada — exige todas as réplicas de consumo no build que entende V2) |
+
+Numa produção greenfield não existe histórico a backfillar nem coorte a
+comparar, e o rollout por etapas só serviria para deixar a produção rodando, por
+semanas, no caminho que **não** tem exclusão mútua. `FEATURE_TURN_CLAIM=false`
+não é "modo conservador": é a janela de execução dupla aberta.
+`FEATURE_TURN_STATE_AUTHORITATIVE=false` faz um turno `retryable` (timeout de
+reasoner, falha pre-send do outbound) sumir do recovery.
+
+**`false` nas três é rollback emergencial, não configuração suportada.** Está
+escrito no contrato, no `.env.app.prod.example` (que agora declara as três
+explicitamente, para que o regime não dependa de o leitor saber qual é o
+default), no runbook (§2.0 greenfield, §2.1 base com histórico, §2.2 rollback) e
+no doc de módulo. O código do caminho legado continua existindo **e testado** —
+sem isso o rollback não funcionaria —, mas deixou de ser o caminho que um teste
+herda sem pedir. Desligar SÓ `FEATURE_TURN_STATE_MACHINE` é recusado no boot (as
+outras duas ficariam inertes); a remediação das regras
+`turn-state/authoritative-requires-dual-write` e `turn-claim/requires-state-machine`
+agora diz para desligar as três juntas.
+
+**O que o flip do default quebrou, e por quê.** 13 casos em
+`tests/unit/workers/message-recovery-{cross-tenant,oom}.spec.ts`. Nenhum era bug
+de produção: os dois arquivos **nunca declaravam o regime** e herdavam o default,
+então provavam o contrato do dispatcher e o fail-closed por OOM em UM dos dois
+inners de `runMessageRecovery` — e ninguém sabia em qual. Com o default novo eles
+passaram a rodar o inner autoritativo, cujo `agentTurnsRepo` não estava no mock.
+Os dois arquivos agora escolhem o regime EXPLICITAMENTE e rodam a matriz nos
+DOIS, o que é cobertura nova: a abortagem por OOM de `runTurnRecoveryInner`
+nunca tinha sido exercitada. O bloco de READ ISOLATION, que dirige a query
+drizzle real do inner legado, fixa `authoritative = false` e diz por escrito que
+é o caminho de rollback.
+
+**E `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts`, pelo mesmo
+motivo: media o fim do turno na fonte de verdade ANTIGA.** O CONTROLE dessa
+suíte exigia `mensagens.processada_em` não-nulo. Com o regime autoritativo por
+default isso passou a ser a asserção ERRADA, não um defeito do pipeline: a
+projeção legada agora SEGUE o estado — `runTransition` só carimba
+`processada_em` em transição terminal —, e o turno do CONTROLE termina
+`retryable`/`outbound_failure`, porque no harness o Baileys é dublê e não há
+canal ativo para entregar. Carimbar ali é exatamente o que matava o retry.
+
+A asserção foi trocada pelo sinal EQUIVALENTE na fonte nova, e ficou mais forte
+nas duas pontas: o CONTROLE exige que o **dono** tenha fechado a tentativa
+(`status`/`outcome`/`last_error_code`, lease devolvida, mensagem ligada por
+`agent_turn_inputs`, `state_version` = 3) e cada BARREIRA exige que a última
+gravação da linha tenha sido a do **sucessor** — `state_version` idêntica à do
+takeover, sem outcome, sem erro, sem projeção. A versão antiga era vacinada
+contra os dois defeitos que a nova pega: um `markAllProcessed` incondicional
+(o P1 que mata o retry) deixava o CONTROLE VERDE, e um zumbi que grava
+`markRetryable` sem fence no turno alheio deixava as cinco barreiras VERDES.
+Nenhuma barreira foi enfraquecida — a contagem de efeitos pós-gate, os
+`workloads` de LLM e o `boundary` que recusou continuam iguais.
+
+### ⚠️ BREAKING (esquema de evidência) — `envelope_hmac` vira versionado e passa a assinar `root_trace_id`/`attempt` ([#535](https://github.com/diogenesmendes01/Maia-v2/issues/535))
+
+> **Rode a migration 119 ANTES de subir a aplicação.** O escritor grava `runtime_trace_envelopes.signature_version`; sem a coluna, todo turno com `side_effect_level >= medium` falha fechado no envelope obrigatório — ou seja, **aborta**. Ordem inversa não existe: o `_down` da 119 recusa enquanto houver linha v2, de propósito.
+
+**O que mudou.** A migration 107 acrescentou `root_trace_id` e `attempt` e os deixou **fora** do `envelope_hmac`, com o argumento — escrito no próprio arquivo — de que assiná-los invalidaria todo envelope já escrito. O argumento caducou antes de valer: `FEATURE_RUNTIME_TRACE_V1` nunca foi ligada em produção, então **não existe corpus a invalidar**. Decisão do owner: consertar o contrato agora, de forma versionada.
+
+| | v1 | v2 |
+|---|---|---|
+| Campos assinados | `trace_id`, `tenant_id`, `agent_id`, `conversa_id`, `turno_id`, `policy_id`, `decision`, `side_effect_level`, `redaction_class`, `hmac_key_version` | v1 **∪** `root_trace_id`, `attempt`, `signature_version` |
+| Escrito por produção | **não**, nunca mais | **sim**, sempre |
+| Lido pelo verifier | sim (fixtures / ambientes antigos) | sim |
+| Reassinado retroativamente | **não** | — |
+
+O escritor lê a versão de uma **constante** (`CURRENT_ENVELOPE_SIGNATURE_VERSION`), nunca do input: um chamador não consegue pedir assinatura mais fraca. As duas materiais canônicas moram num arquivo só (`src/control-plane/runtime-trace/lib/signature.ts`) para que assinador e verificador não possam divergir.
+
+**Por que isso não é um downgrade attack.** A versão mora numa coluna, e coluna é justamente o que um atacante com escrita no banco controla. Por isso a material da v2 contém `"signature_version":2` — separação de domínio explícita. Virar a coluna de uma linha v2 para `1` faz o verifier recomputar a material **v1** e comparar com um HMAC tirado sobre a material **v2**: não bate, e a linha lê `invalid`. O relabel na direção oposta é detectado do mesmo jeito. Evidência: `tests/unit/observability/verify-envelope.spec.ts` → "DOWNGRADE: relabelling a v2 row as v1 does not free the new fields".
+
+**O risco que continua aberto, e é decisão de operador.** Uma linha *genuinamente* assinada em v1 mantém `root_trace_id`/`attempt` fora da assinatura — nelas, essas duas colunas seguem editáveis sem detecção. Produção não escreve mais v1, então isso está limitado a fixtures e a ambientes que já gravaram alguma. Duas defesas, ambas independentes da assinatura:
+
+- **`RUNTIME_TRACE_ACCEPT_SIGNATURE_V1`** (nova, default `true`) recusa v1 **na leitura** quando `false`. O veredito é `rejected_version`, deliberadamente distinto de `invalid`: uma assinatura v1 pode ser perfeitamente legítima, e chamá-la de adulteração é o mesmo erro de categoria que o antigo `hmac.length > 0` cometia, ao contrário. O default é `true` porque virar toda linha legada para `rejected_version` no dia do deploy destruiria exatamente a evidência que a chave existe para proteger.
+- **`listAttempts()` passa a exigir o `turno_id` ASSINADO** (abaixo).
+
+### Changed — `listAttempts()` exige o `turno_id` assinado; dois turnos não podem mais se fundir visualmente ([#535](https://github.com/diogenesmendes01/Maia-v2/issues/535))
+
+`runtimeTraceRepo.listAttempts()` recebia `{ tenantId, rootTraceId }`. `root_trace_id` é o campo que diz "estas linhas são do mesmo turno", e até a #535 ele não era assinado — um único `root_trace_id` editado enxertava a tentativa de um turno na cadeia de **outro**, e o Explorer renderizava dois turnos distintos como uma sequência de retry. Essa é a fusão visual que o owner mandou fechar.
+
+Agora a assinatura do método é `{ tenantId, rootTraceId, turnoId }`, os três obrigatórios, e:
+
+1. `turnoId` em branco/ausente **falha fechado** (`TraceAttemptScopeError`) em vez de cair para agrupamento só por `root_trace_id`. O fallback seria o controle desligado por omissão de argumento;
+2. o filtro por `turno_id` está **no SQL**, servido por `runtime_trace_env_attempt_turn_idx` (migration 119) — `turno_id` está dentro do `envelope_hmac` desde a migration 052, nas **duas** versões, então entrar no grupo passa a exigir concordar num campo que a própria assinatura da linha cobre;
+3. um irmão devolvido cujo envelope verifica como `invalid` é **descartado** — e devolvido ao chamador em `refused`, que o router audita como `runtime_trace_attempt_group_row_refused`. Detecção que ninguém consegue ler depois não é detecção. `unknown` e `rejected_version` são reportados, não escondidos: sumir com uma linha que o operador já vê na listagem pareceria evidência desaparecendo.
+
+Isto é **defesa em profundidade**, não o controle primário — o controle primário é a v2 assinar `root_trace_id` e `attempt`. Esta camada é a que continua valendo numa linha v1.
+
+Evidência: `tests/unit/observability/envelope-signature-v2.spec.ts` compila o WHERE que a produção construiu (`PgDialect.sqlToQuery`) em vez de olhar argumentos de mock, e `tests/integration/trace-explorer-attempt-grouping.spec.ts` roda escritor real → repositório real → router e enxerta uma linha de outro turno com o `root_trace_id` reescrito, exigindo que ela seja recusada e auditada.
+
+**Codificação canônica — achado negativo, verificado.** A pergunta era se um valor contendo o separador consegue forjar outro envelope. Não consegue: a codificação é `canonicalJson` (JSON de verdade, chaves ordenadas, `JSON.stringify` em toda chave e string), não concatenação com separador — aspas, vírgulas e dois-pontos dentro de um valor saem escapados e não fecham a própria string. Passou a ser teste em vez de comentário (`envelope-signature-v2.spec.ts` → "canonical encoding is unambiguous"), incluindo o caso de deslocamento de fronteira entre campos adjacentes (`tenant_id`+`agent_id`).
+
+
 ### Added — o ledger `outbound_messages` vira outbox durável, e a saída do turno ganha DUAS identidades ([#630](https://github.com/diogenesmendes01/Maia-v2/issues/630), fatia A de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 **Nada muda em runtime.** A fatia é aditiva: schema + tipos, nenhum caminho

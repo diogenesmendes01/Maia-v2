@@ -120,6 +120,29 @@ const RULES: Rule[] = [
      */
     correlate_by: ['provider', 'workload', REPLICA_METADATA_KEY],
   },
+  /**
+   * UMA recusa do guarda de locator já é sinal (issue #536).
+   *
+   * O caminho feliz da varredura do TTL não produz esta ação NENHUMA vez: um
+   * locator recusado significa que `privacy_requests.export_locator` carrega
+   * algo que não é um artefato desta árvore — escrita defeituosa, restore
+   * torto, ou linha plantada. Threshold 1, e não 3: agrupar por volume um
+   * evento cuja taxa normal é zero esconderia o primeiro, que é justamente o
+   * que importa. O throttle de 30 min já impede que uma varredura com muitas
+   * recusas vire uma enxurrada de alertas.
+   *
+   * `urgent` e não `critical`: nada foi apagado (o guarda recusou ANTES da
+   * remoção), então não há dano consumado — há uma linha de banco a
+   * investigar antes que alguém a "conserte" no braço.
+   */
+  {
+    kind: 'threshold',
+    id: 'privacy_export_locator_refused',
+    acao: 'privacy_export_purge_refused',
+    threshold: 1,
+    window_min: 60,
+    severity: 'urgent',
+  },
   // 3+ anomalous-volume blocks in 1 h — multiple bots within an hour.
   {
     kind: 'threshold',

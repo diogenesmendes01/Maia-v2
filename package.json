@@ -42,6 +42,7 @@
     "restore:test": "tsx scripts/restore-test.ts",
     "restore:reconcile": "tsx scripts/post-restore-reconcile.ts",
     "privacy:execute": "tsx scripts/privacy-request.ts",
+    "privacy:export": "tsx scripts/privacy-export.ts",
     "embeddings:rebuild": "tsx scripts/embeddings-rebuild.ts",
     "gen:tool-catalog": "tsx scripts/gen-tool-catalog.ts",
     "llm:bench": "tsx scripts/llm-benchmark.ts",

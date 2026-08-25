@@ -1,5 +1,8 @@
 /**
- * The schema verdict `/readyz` gates on — issue #516 §6.
+ * The schema verdict `/readyz` gates on — issue #516 §6 — and, since ADR 0004,
+ * the verdict the BOOT gates on too (`src/index.ts` → `./schema-boot-gate.ts`).
+ * One evaluation, one cache, one answer: the boot cannot disagree with the
+ * probe, because there is nothing left for it to disagree with.
  *
  * This module is a THIN, CACHED adapter over `getSchemaReadiness()`
  * (`src/migrations/readiness.ts`), which is the canonical, fail-closed answer

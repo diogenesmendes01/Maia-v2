@@ -8,11 +8,19 @@
  * uma exclusão por titular competiriam pelas mesmas linhas; duas reaplicações
  * pós-restore competiriam pelo mesmo ledger.
  *
- * NENHUM DOS DOIS É CRON, de propósito. Um pedido de privacidade nasce de um
- * titular e é aprovado por um humano; uma reconciliação pós-restore acontece
- * depois de um restore, que é uma operação manual. Agendá-los daria a
+ * OS DOIS PRIMEIROS NÃO SÃO CRON, de propósito. Um pedido de privacidade nasce
+ * de um titular e é aprovado por um humano; uma reconciliação pós-restore
+ * acontece depois de um restore, que é uma operação manual. Agendá-los daria a
  * impressão de que a plataforma decide sozinha quando apagar dado de gente.
+ *
+ * O TERCEIRO — `runPrivacyExportSweepJob`, o varredor do TTL do export — É
+ * cron, e a diferença não é inconsistência. Ali o prazo JÁ FOI decidido (sete
+ * dias, `PRIVACY_EXPORT_TTL_DAYS`) e comunicado ao titular no próprio pedido; o
+ * cron não decide nada, cumpre. Um TTL que dependesse de alguém lembrar de
+ * rodar um comando não seria um TTL, seria uma intenção — e foi exatamente esse
+ * o estado que a decisão do dono sobre a #536 mandou consertar.
  */
+import { randomUUID } from 'node:crypto';
 import { config } from '@/config/env.js';
 import { pool } from '@/db/client.js';
 import { runWithSystemContext, runWithTenantContext } from '@/db/tenant-context.js';
@@ -23,9 +31,13 @@ import {
   readBackupWatermark,
   readPrivacyRequest,
   readTombstoneLedger,
+  recordRetentionRun,
 } from '@/db/repositories/ops-repos.js';
 import { deriveTombstoneSecret, planReconciliation } from '@/ops/retention/tombstones.js';
 import { createPrivacyPorts, createReapplyPorts } from '@/ops/privacy/adapters.js';
+import { createExportSweepPorts } from '@/ops/privacy/export-sweeper-adapters.js';
+import { runExportSweep, type ExportSweepOutcome } from '@/ops/privacy/export-sweeper.js';
+import { audit } from '@/governance/audit.js';
 import {
   executePrivacyRequest,
   type PrivacyExecutionResult,
@@ -155,4 +167,153 @@ export async function runPostRestoreReconciliationJob(input: {
 
   if (outcome.status === 'already_running') return { status: 'already_running' };
   return { status: 'ran', result: outcome.result };
+}
+
+/**
+ * O TETO DO PASSE.
+ *
+ * Um passe sem limite seguraria o advisory lock enquanto percorresse um backlog
+ * arbitrário — e, num incidente em que muitos exports vencem de uma vez, é
+ * justamente quando a varredura não pode virar uma operação longa e opaca. 500
+ * artefatos por passe, de hora em hora, escoam 12 mil por dia; o que sobra sai
+ * no passe seguinte, e a ordem por vencimento garante que o mais exposto vai
+ * primeiro. Não é configuração: é uma propriedade da cadência do job, e um
+ * operador que precisar acelerar roda o CLI.
+ */
+const EXPORT_SWEEP_LIMIT = 500;
+
+export type ExportSweepJobOutcome =
+  | { status: 'already_running' }
+  | { status: 'ran'; result: ExportSweepOutcome };
+
+/**
+ * Issue #536 — o varredor do TTL do export.
+ *
+ * ESTE É CRON, ao contrário dos dois jobs acima, e a diferença não é
+ * inconsistência. Um pedido de privacidade nasce de um titular e é aprovado por
+ * um humano; uma reconciliação pós-restore acontece depois de uma operação
+ * manual. Agendá-los daria a impressão de que a plataforma decide sozinha
+ * quando apagar dado de gente. Aqui é o contrário: o prazo JÁ FOI decidido
+ * (sete dias, `PRIVACY_EXPORT_TTL_DAYS`) e comunicado ao titular no próprio
+ * pedido. O que o cron faz é CUMPRIR uma decisão tomada — e um TTL que depende
+ * de alguém lembrar de rodar um comando não é um TTL, é uma intenção.
+ *
+ * Single-flight em chave própria: dois passes concorrentes planejariam sobre os
+ * mesmos artefatos. Perder a corrida NÃO é erro (o outro passe está fazendo o
+ * trabalho) — é `already_running`, e o job seguinte pega o que sobrar.
+ *
+ * O passe roda sob `system` porque é manutenção cross-tenant; cada linha de
+ * auditoria da remoção, porém, é escrita no contexto do tenant DAQUELE pedido
+ * (ver `createExportSweepPorts`).
+ */
+export async function runPrivacyExportSweep(
+  options: { dryRun?: boolean } = {},
+): Promise<ExportSweepJobOutcome> {
+  const correlationId = randomUUID();
+  // O override do CLI é POR CHAMADA, nunca por variável de ambiente reescrita
+  // em runtime: `config` é validada uma vez no boot, então mexer no `process.env`
+  // depois ou não teria efeito nenhum ou (pior) mudaria o comportamento do CRON
+  // até o próximo restart — que é o oposto do que quem digita `--dry-run` quer.
+  const dryRun = options.dryRun ?? config.PRIVACY_EXPORT_SWEEP_DRY_RUN;
+
+  const outcome = await withOpsLock(
+    OPS_LOCK_KEYS.privacy_export_sweep,
+    { pool, onWarn: (event, detail) => logger.warn(detail, event) },
+    () =>
+      runWithSystemContext(async () => {
+        await audit({
+          acao: 'retention_run_started',
+          metadata: {
+            correlation_id: correlationId,
+            data_class: 'privacy.export',
+            dry_run: dryRun,
+          },
+        });
+
+        const result = await runExportSweep(createExportSweepPorts(), {
+          dryRun,
+          correlationId,
+          limit: EXPORT_SWEEP_LIMIT,
+        });
+
+        // A MESMA tabela de evidência da retenção de artefatos (`retention_runs`,
+        // migration 102), com `data_class='privacy.export'`. Um ledger próprio
+        // para este passe seria uma segunda fonte da verdade sobre a mesma
+        // pergunta — "quanto a política apagou, e quando?" — e as duas
+        // divergiriam.
+        //
+        // `skipped_held` conta os artefatos que um hold ativo congelou; `failed`
+        // soma falha e RECUSA, porque para quem lê a evidência as duas dizem a
+        // mesma coisa: o artefato continua no host.
+        await recordRetentionRun({
+          correlation_id: correlationId,
+          data_class: 'privacy.export',
+          dry_run: dryRun,
+          policy_version: `privacy-export-ttl-${config.PRIVACY_EXPORT_TTL_DAYS}d`,
+          status: result.status,
+          scanned: result.scanned,
+          eligible: result.eligible,
+          deleted: result.purged,
+          skipped_held: result.skipped_held,
+          failed: result.failed + result.refused,
+          cursor_watermark: result.cursor_watermark,
+          error_code: result.error_code,
+        }).catch((err: unknown) => {
+          // A evidência do PASSE não pode derrubar o passe: as remoções já
+          // foram auditadas uma a uma, e é essa trilha que defende o pedido.
+          logger.error(
+            { err: (err as Error).name },
+            'privacy.export_sweep_run_record_failed',
+          );
+        });
+
+        await audit({
+          acao:
+            result.status === 'completed' ? 'retention_run_completed' : 'retention_run_failed',
+          metadata: {
+            correlation_id: correlationId,
+            data_class: 'privacy.export',
+            dry_run: dryRun,
+            status: result.status,
+            scanned: result.scanned,
+            eligible: result.eligible,
+            purged: result.purged,
+            already_absent: result.already_absent,
+            skipped_held: result.skipped_held,
+            refused: result.refused,
+            failed: result.failed,
+            error_code: result.error_code,
+          },
+        });
+
+        return result;
+      }),
+  );
+
+  if (outcome.status === 'already_running') return { status: 'already_running' };
+  return { status: 'ran', result: outcome.result };
+}
+
+/** A face do cron: sem retorno, sem lançar — `runTick` loga o resto. */
+export async function runPrivacyExportSweepJob(): Promise<void> {
+  const outcome = await runPrivacyExportSweep();
+  if (outcome.status === 'already_running') {
+    logger.info({}, 'privacy.export_sweep_already_running');
+    return;
+  }
+  const r = outcome.result;
+  const level = r.status === 'completed' ? 'info' : 'error';
+  logger[level](
+    {
+      status: r.status,
+      scanned: r.scanned,
+      eligible: r.eligible,
+      purged: r.purged,
+      skipped_held: r.skipped_held,
+      refused: r.refused,
+      failed: r.failed,
+      error_code: r.error_code,
+    },
+    'privacy.export_sweep_finished',
+  );
 }

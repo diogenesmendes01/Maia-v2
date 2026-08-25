@@ -2390,7 +2390,9 @@ export const runtime_trace_envelopes = pgTable(
     turno_id: uuid('turno_id'),
     // Issue #514 (migration 107): attempt grouping. `root_trace_id` equals
     // `trace_id` on attempt 1; retries get a derived id and point back here.
-    // NOT covered by `envelope_hmac` — see the migration for why.
+    // Issue #535 (migration 119): BOTH are now covered by `envelope_hmac` —
+    // under signature v2. v1 rows keep them unsigned; see
+    // `src/control-plane/runtime-trace/lib/signature.ts`.
     root_trace_id: uuid('root_trace_id'),
     attempt: integer('attempt').notNull().default(1),
     policy_id: uuid('policy_id'),
@@ -2399,6 +2401,11 @@ export const runtime_trace_envelopes = pgTable(
     redaction_class: text('redaction_class').notNull().default('standard'),
     envelope_hmac: text('envelope_hmac').notNull(),
     hmac_key_version: integer('hmac_key_version').notNull(),
+    // Issue #535 (migration 119): which canonical material `envelope_hmac`
+    // covers. DEFAULT 1 because every row that predates the column was signed
+    // with the v1 field set. Production writes 2 and nothing else; the verifier
+    // still reads 1 so fixtures and old environments keep a real verdict.
+    signature_version: integer('signature_version').notNull().default(1),
     body_status: text('body_status').notNull().default('pending'),
     body_persisted_at: timestamp('body_persisted_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -3442,6 +3449,19 @@ export const privacy_requests = pgTable(
     export_locator: text('export_locator'),
     export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
     export_downloaded_at: timestamp('export_downloaded_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o varredor de TTL COMEÇOU neste pedido. Não autoriza
+     * nada e não tira o pedido da fila; existe para que um passe interrompido
+     * seja visível (started sem purged) em vez de ter que ser deduzido de log.
+     */
+    export_purge_started_at: timestamp('export_purge_started_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o `.enc` foi removido e a ausência foi PROVADA. É a
+     * condição (`IS NULL`) que torna a marcação uma transição de vencedor
+     * único: quem não ganha não audita, e é assim que a segunda execução do
+     * varredor não duplica auditoria.
+     */
+    export_purged_at: timestamp('export_purged_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

@@ -8,7 +8,8 @@
  * a real tenant context is rejected by the database, not silently accepted.
  */
 import { and, desc, eq, sql } from 'drizzle-orm';
-import { db } from '@/db/client.js';
+import { db, withTx } from '@/db/client.js';
+import { audit, auditTx } from '@/governance/audit.js';
 import {
   backup_manifests,
   backup_runs,
@@ -23,6 +24,8 @@ import type { RetentionCandidate } from '@/ops/backup/retention.js';
 import type { BackupEvidenceStore, BackupTrigger } from '@/ops/backup/service.js';
 import type { BackupState } from '@/ops/backup/state-machine.js';
 import type { TombstoneRecord } from '@/ops/retention/tombstones.js';
+import type { ExportBinding } from '@/ops/privacy/export-locator.js';
+import type { ExpiredExportCandidate } from '@/ops/privacy/export-sweeper.js';
 
 export const backupEvidenceStore: BackupEvidenceStore = {
   async createRun(row: {
@@ -418,6 +421,238 @@ export async function readPrivacyRequest(id: string): Promise<{
       FROM privacy_requests WHERE id = ${id}::uuid LIMIT 1
   `);
   return res.rows[0] ?? null;
+}
+
+/* ──────────── TTL do export de privacidade (issue #536, migration 118) ─────────── */
+
+/**
+ * A fila do varredor: exports com locator vivo que ainda não foram varridos.
+ *
+ * ORDEM E TETO fazem parte do contrato. `ORDER BY export_expires_at ASC` faz o
+ * passe atacar o artefato que está vencido há mais tempo (o de maior exposição)
+ * primeiro, e o `LIMIT` impede que um passe segure o lock de varredura
+ * indefinidamente num backlog grande — o restante sai no passe seguinte, que é
+ * horário. Sem ordem determinística, dois passes concorrentes se pisariam nos
+ * mesmos artefatos e o `cursor_watermark` do desfecho não significaria nada.
+ *
+ * O filtro é por EVIDÊNCIA da linha (locator presente, `export_purged_at`
+ * nulo), nunca pelo que está no diretório — a inversão disso foi o achado P1 da
+ * rodada 1 da #520 na retenção de artefatos, e o mesmo erro aqui apagaria um
+ * `.enc` que nenhum pedido reivindica.
+ */
+export async function listExpiredExportArtifacts(
+  now: Date,
+  limit: number,
+): Promise<ExpiredExportCandidate[]> {
+  const res = await db.execute<{
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    subject_ref: string;
+    export_locator: string;
+    export_expires_at: string | null;
+    export_purged_at: string | null;
+  }>(sql`
+    SELECT id, tenant_id, agent_id, subject_ref, export_locator,
+           export_expires_at::text AS export_expires_at,
+           export_purged_at::text AS export_purged_at
+      FROM privacy_requests
+     WHERE export_locator IS NOT NULL
+       AND export_purged_at IS NULL
+       AND export_expires_at IS NOT NULL
+       AND export_expires_at <= ${now}
+     ORDER BY export_expires_at ASC
+     LIMIT ${limit}
+  `);
+  return res.rows.map((r) => ({
+    request_id: r.id,
+    tenant_id: r.tenant_id,
+    agent_id: r.agent_id,
+    subject_ref: r.subject_ref,
+    locator: r.export_locator,
+    expires_at: r.export_expires_at ? new Date(r.export_expires_at) : null,
+    purged_at: r.export_purged_at ? new Date(r.export_purged_at) : null,
+  }));
+}
+
+/**
+ * A releitura do instante da remoção — o quarto eixo do guarda de path.
+ *
+ * Existe porque planejar e apagar não são o mesmo instante. Entre os dois a
+ * linha pode ter mudado de locator (um export reemitido) ou sumido, e apagar o
+ * arquivo do PLANO destruiria um artefato vivo enquanto o pedido acha que ele
+ * existe. `assertLocatorBoundToRequest` compara os quatro campos; esta função
+ * só os lê.
+ */
+export async function readExportBinding(requestId: string): Promise<ExportBinding | null> {
+  const res = await db.execute<{
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    export_locator: string | null;
+  }>(sql`
+    SELECT id, tenant_id, agent_id, export_locator
+      FROM privacy_requests WHERE id = ${requestId}::uuid LIMIT 1
+  `);
+  const row = res.rows[0];
+  if (!row || row.export_locator === null) return null;
+  return {
+    request_id: row.id,
+    tenant_id: row.tenant_id,
+    agent_id: row.agent_id,
+    locator: row.export_locator,
+  };
+}
+
+/**
+ * Registra que um passe COMEÇOU neste pedido. Idempotente de propósito.
+ *
+ * Não é um lease e não autoriza nada: o `WHERE export_purged_at IS NULL` evita
+ * reescrever um pedido já concluído, e um segundo passe sobre um pedido ainda
+ * aberto simplesmente atualiza o carimbo. O que impede duas execuções
+ * concorrentes é o advisory lock do job, não esta coluna — ela existe para que
+ * um passe que caiu no meio seja VISÍVEL (started sem purged) em vez de ter que
+ * ser deduzido de log.
+ */
+export async function claimExportPurge(requestId: string, at: Date): Promise<void> {
+  await db.execute(sql`
+    UPDATE privacy_requests
+       SET export_purge_started_at = ${at}, updated_at = now()
+     WHERE id = ${requestId}::uuid
+       AND export_purged_at IS NULL
+  `);
+}
+
+/**
+ * Marca o pedido como varrido E audita a remoção, NA MESMA TRANSAÇÃO.
+ *
+ * É aqui que a idempotência do varredor se fecha. O `WHERE export_purged_at IS
+ * NULL` torna a marcação uma transição de VENCEDOR ÚNICO, e a auditoria só
+ * acontece dentro da transação que venceu: rodar duas vezes — em série ou em
+ * paralelo — produz exatamente uma linha `privacy_export_purged`. Uma marcação
+ * seguida de um `audit()` separado deixaria uma janela em que uma queda perde a
+ * linha de auditoria de uma remoção que realmente aconteceu, e a auditoria é a
+ * única coisa que sobra para provar o que o TTL fez.
+ *
+ * Devolve `false` quando outra execução já tinha marcado — o chamador NÃO conta
+ * a remoção de novo.
+ */
+export async function finalizeExportPurge(record: {
+  request_id: string;
+  tenant_id: string;
+  agent_id: string;
+  locator: string;
+  expires_at: Date | null;
+  purged_at: Date;
+  already_absent: boolean;
+  correlation_id: string;
+}): Promise<boolean> {
+  return withTx(async (tx) => {
+    const updated = await tx.execute<{ id: string }>(sql`
+      UPDATE privacy_requests
+         SET export_purged_at = ${record.purged_at}, updated_at = now()
+       WHERE id = ${record.request_id}::uuid
+         AND export_purged_at IS NULL
+      RETURNING id
+    `);
+    if (updated.rows.length === 0) return false;
+
+    await auditTx(tx, {
+      acao: 'privacy_export_purged',
+      alvo_id: record.request_id,
+      entidade_alvo: 'privacy_request',
+      metadata: {
+        privacy_request_id: record.request_id,
+        correlation_id: record.correlation_id,
+        data_class: 'privacy.export',
+        // Locator OPACO — é um identificador, nunca um caminho, nunca um dado
+        // do titular. O caminho não entra: um log com o diretório de exports é
+        // um mapa para quem quiser ir buscar os que ainda estão lá.
+        export_locator: record.locator,
+        export_expires_at: record.expires_at?.toISOString() ?? null,
+        purged_at: record.purged_at.toISOString(),
+        // Distingue a remoção efetiva da retomada de um passe que caiu depois
+        // de apagar e antes de marcar. As duas concluem o TTL; só a primeira
+        // destruiu bytes nesta execução.
+        already_absent: record.already_absent,
+        actor: 'privacy_export_sweeper',
+      },
+    });
+    return true;
+  });
+}
+
+/**
+ * Audita uma RECUSA do guarda (ou uma remoção não confirmada). NADA foi
+ * apagado, e o silêncio não é opção: um locator irreconhecível apontando para
+ * fora da árvore de exports é o sinal de que uma linha do banco foi corrompida
+ * ou plantada, e ele precisa chegar a alguém.
+ */
+export async function recordExportPurgeRefusal(record: {
+  request_id: string;
+  tenant_id: string;
+  agent_id: string;
+  locator: string;
+  reason: string;
+  correlation_id: string;
+}): Promise<void> {
+  await audit({
+    acao: 'privacy_export_purge_refused',
+    alvo_id: record.request_id,
+    entidade_alvo: 'privacy_request',
+    metadata: {
+      privacy_request_id: record.request_id,
+      correlation_id: record.correlation_id,
+      data_class: 'privacy.export',
+      reason: record.reason,
+      // Truncado: um locator envenenado pode ser arbitrariamente longo, e o
+      // que interessa ao operador é reconhecer a forma, não guardá-la inteira.
+      export_locator_sample: record.locator.slice(0, 120),
+      outcome: 'refused',
+      actor: 'privacy_export_sweeper',
+    },
+  });
+}
+
+/**
+ * A LEITURA do pedido do ponto de vista do artefato (issue #536).
+ *
+ * Devolve a linha crua; quem decide o que o leitor pode ver é
+ * `readExportArtifact` (`src/ops/privacy/export-sweeper.ts`), que é puro e
+ * testável. Sem esse par, um pedido varrido continuaria devolvendo
+ * `export_locator` e apontando para um arquivo que não existe mais.
+ */
+export async function readPrivacyExportRow(requestId: string): Promise<{
+  request_id: string;
+  tenant_id: string;
+  agent_id: string;
+  export_locator: string | null;
+  export_expires_at: Date | null;
+  export_purged_at: Date | null;
+} | null> {
+  const res = await db.execute<{
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    export_locator: string | null;
+    export_expires_at: string | null;
+    export_purged_at: string | null;
+  }>(sql`
+    SELECT id, tenant_id, agent_id, export_locator,
+           export_expires_at::text AS export_expires_at,
+           export_purged_at::text AS export_purged_at
+      FROM privacy_requests WHERE id = ${requestId}::uuid LIMIT 1
+  `);
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    request_id: row.id,
+    tenant_id: row.tenant_id,
+    agent_id: row.agent_id,
+    export_locator: row.export_locator,
+    export_expires_at: row.export_expires_at ? new Date(row.export_expires_at) : null,
+    export_purged_at: row.export_purged_at ? new Date(row.export_purged_at) : null,
+  };
 }
 
 export interface ReadinessFacts {
