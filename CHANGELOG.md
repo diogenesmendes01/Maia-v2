@@ -4,6 +4,64 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — o gap recorrente que exige uma tool INEXISTENTE vira um pedido estruturado, e inerte ([#636](https://github.com/diogenesmendes01/Maia-v2/issues/636), fatia A de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** Um gap recorrente subia pela cadeia
+determinística de escalada (`src/cognition/gap-escalation/engine.ts`) e, no
+topo, virava uma spec em prosa escrita por Sonnet — ou morria no dashboard. Um
+dev que recebesse isso ainda tinha de reconstruir do zero as quatro coisas que
+decidem o pedido: **o que** o agente queria fazer, **em que situações reais**,
+**quantas vezes e em que janela**, e **qual seria o contrato**.
+
+**O que passa a existir.** Um tipo novo de proposta, `capability_type =
+'tool_request'`, gerado SEM LLM a partir de evidência persistida:
+
+- **intenção** — a descrição da lacuna, nas palavras em que foi registrada;
+- **situações** — as ocorrências reais, com `root_trace_id` ligando ao envelope
+  em `runtime_trace_envelopes`. Um id que não resolve **no mesmo tenant+agent**
+  vira situação SEM link, nunca link que atravessa fronteira;
+- **frequência com janela** — `agent_capability_gap_observations`, o ledger novo
+  de ocorrências. O contador `frequency_score` responde "quantas vezes" e nada
+  mais; janela e situação precisam de linhas com timestamp;
+- **rascunho de contrato Zod** — nome, inputs e outputs **derivados** dos
+  argumentos que o agente tentou usar. Quando nenhuma ocorrência registrou
+  argumentos, o rascunho diz `completeness: 'name_only'` em vez de inventar
+  campos: um contrato imaginado pareceria mais completo e valeria menos.
+
+**O guardrail é o recurso, não uma nota de rodapé.** *O agente especifica;
+humano implementa e instala.* Nada nesta fatia registra tool, executa o código
+proposto ou cria capability — a proposta é um documento inerte, e aprová-la
+(`dispatchApproval` → `acknowledged_for_humans`) continua não instalando nada.
+Tool nova segue o caminho normal: código revisado, contrato Zod, classe de
+risco, aprovação. A marcação que impede confundir o rascunho com contrato
+vigente é redundante de propósito e vive em três camadas independentes — o
+literal Zod (`contract_status`), o CHECK
+`capability_proposals_tool_request_marking_check` da migração 125 (que recusa o
+INSERT venha ele de onde vier, inclusive de um `psql`), e o cabeçalho literal do
+`zod_source`, que sobrevive ao copiar-e-colar.
+
+**Precedência no topo da escalada.** O pedido de ferramenta é a rota
+ESPECÍFICA e roda primeiro; o `capability-proposer` genérico continua atendendo
+todo o resto — knowledge, procedure, e o gap de tool cuja ferramenta **já
+existe** (aí não falta código, falta grant). Se a rota nova falhar ou lançar, a
+genérica assume: uma rota recém-introduzida não pode derrubar em silêncio o
+comportamento que já existia.
+
+**Fora de escopo desta fatia**, de propósito: agregação por similaridade
+([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637)) e triagem no
+console ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638)).
+
+- Migração **125** (`125_tool_request_proposals.sql`): `agent_capability_gap_observations`
+  (com CHECK fail-closed contra o literal `default`), `tool_request` na lista
+  fechada de `capability_type`, e o CHECK da marcação. O `_down` **recusa** com
+  dado presente — apagar a evidência não é rollback, é perda.
+- `src/cognition/tool-request/` — `types.ts` (contrato Zod + marcação),
+  `existing-tool.ts` (a tool já existe no `REGISTRY`?), `contract-draft.ts`
+  (derivação dos campos) e `proposer.ts` (o call site).
+- `src/workers/gap-escalation-monitor.ts` — as duas rotas a partir de `proposed`.
+- `src/db/repositories/capability-repos.ts` — `capabilityGapObservationsRepo` e
+  o registro da ocorrência junto ao upsert do gap.
+
 ### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **O que muda no seu dia:** antes, um app que subisse contra um schema

@@ -325,6 +325,11 @@ export const AUDIT_ACTIONS = [
   'manage_calendar',
   'capability_proposal_approved',
   'capability_proposal_rejected',
+  // #636 (fatia A da épica #471) — a Maia PEDIU uma ferramenta que não existe.
+  // Registra a decisão de gerar o pedido (nome proposto, ocorrências usadas,
+  // quantas situações têm trace resolvido). NADA sobre instalação: o pedido é
+  // um documento inerte, e o guardrail é que só humano implementa e instala.
+  'tool_request_proposed',
   // Issue #268 — channel resolver fail-loud: emitted when channel resolution
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.

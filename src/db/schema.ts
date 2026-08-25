@@ -1462,6 +1462,58 @@ export const agent_capability_gaps = pgTable(
   }),
 );
 
+// #636 (fatia A da épica #471) — `agent_capability_gap_observations`: o LEDGER
+// de ocorrências do gap, uma linha por vez em que o agente esbarrou nele.
+//
+// Por que existe, dado que `agent_capability_gaps.frequency_score` já conta:
+// um contador responde "quantas vezes" e NADA mais. O pedido de ferramenta
+// precisa de "em que JANELA" e "em QUAIS situações reais" — e as duas só saem
+// de linhas com timestamp e com o link do turno (`root_trace_id`, o mesmo id
+// que `runtime_trace_envelopes` agrupa por tentativa). Um contador não guarda
+// nem uma nem outra.
+//
+// `attempted_args`/`expected_output` são a EVIDÊNCIA de onde o rascunho de
+// contrato Zod deriva seus inputs/outputs. `{}` significa "não observado", e o
+// rascunho declara isso (`completeness:'name_only'`) em vez de imaginar campos.
+//
+// Sem FK para `runtime_trace_envelopes` de propósito — ver o cabeçalho da
+// migração 125: o envelope é sujeito a retenção e some antes da observação. A
+// integridade é verificada na LEITURA, escopada por tenant+agent.
+export const agent_capability_gap_observations = pgTable(
+  'agent_capability_gap_observations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    intent: text('intent').notNull(),
+    detail: text('detail'),
+    conversa_id: uuid('conversa_id'),
+    root_trace_id: uuid('root_trace_id'),
+    trace_id: uuid('trace_id'),
+    attempted_args: jsonb('attempted_args').notNull().default(sql`'{}'::jsonb`),
+    expected_output: jsonb('expected_output').notNull().default(sql`'{}'::jsonb`),
+    observed_at: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeGapIdx: index('gap_observations_scope_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+      t.observed_at,
+    ),
+    // Índice PARCIAL na DB (WHERE root_trace_id IS NOT NULL); Drizzle não
+    // expressa o WHERE, então aqui ele aparece como índice comum — mesma
+    // ressalva do `agent_drift_unresolved_idx`.
+    rootTraceIdx: index('gap_observations_root_trace_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.root_trace_id,
+    ),
+  }),
+);
+
 export const procedure_definitions = pgTable(
   'procedure_definitions',
   {
@@ -2544,6 +2596,10 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
+export type AgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferSelect;
+export type NewAgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferInsert;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;
