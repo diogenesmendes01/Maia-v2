@@ -4,6 +4,100 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Added — N pedidos de ferramenta parecidos viram UM pedido com contador ([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637), fatia B de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** A fatia A (#636) faz cada gap recorrente de tool
+virar UMA proposta. Nada nela sabe que dois gaps diferentes podem ser o MESMO
+pedido dito com outras palavras — então o backlog acumularia duplicatas em que
+nenhum item carrega o peso da demanda real: cinco pedidos de duas ocorrências,
+em vez de um pedido de dez.
+
+**O que passa a existir.** `tool_request_aggregates` (UM pedido, com contador) e
+`tool_request_aggregate_members` (o ledger append-only de quem entrou, com que
+número e quando), ambos escopados por `tenant_id + agent_id`. A decisão de
+agregar acontece **antes** de criar a proposta: um pedido que se funde NÃO vira
+linha em `capability_proposals` — é esse o "N vira 1".
+
+**O limiar tem medição, não gosto.** Métrica `dice_token_v1` (coeficiente de
+Dice sobre os tokens de conteúdo da descrição do gap), limiar **0,85**, escolhido
+pela regra escrita antes do número: *o menor θ da grade de 0,05 com zero falsas
+fusões no conjunto negativo real*. O conjunto negativo tem rótulo REAL — os 2080
+pares de tools distintas do catálogo committado, que são 65 coisas que este
+projeto já decidiu que merecem implementações separadas. Em 0,80 ainda há uma
+falsa fusão (`save_fact` × `save_rule`, 0,833); em 0,90 não há segurança a mais
+e há 10 pontos de recall a menos. Reproduzir:
+`npx tsx scripts/medir-limiar-tool-request.ts`. O número é mantido honesto por
+`tests/unit/tool-request-limiar-medicao.spec.ts`, que reroda a medição contra o
+catálogo VIVO — uma tool nova que empurre o pior par negativo acima de 0,85 fica
+VERMELHA no CI em vez de virar agrupamento errado em produção.
+
+**O que a medição NÃO prova, dito aqui e não só no código.** O conjunto positivo
+é SINTÉTICO (325 paráfrases por cinco transformações committadas), porque não
+existe no repositório um par de gaps rotulado como "mesmo pedido" — o ledger de
+ocorrências nasceu na fatia A e está vazio em todo ambiente. E há a limitação
+herdada: enquanto `completeness` for `'name_only'`, a assinatura sai de uma frase
+curta, e Dice sobre conjuntos pequenos é grosso — a 0,85, duas descrições de 4–5
+tokens só fundem se o conjunto de tokens for IGUAL. Na prática, HOJE o contador
+sobe para repetição quase literal. Quando os rascunhos ficarem ricos, o limiar
+**não vale como está**; por isso a assinatura é versionada e a versão é
+persistida por agregado e por membro.
+
+**A política de fusão de rascunhos: nenhum vence, nunca.** Compatíveis → UNIÃO
+(nenhum campo descartado, `observed_in` soma, `required` só sobrevive quando é
+obrigatório em todos). Incompatíveis → `contract_state = 'divergent'`: NÃO se
+produz contrato fundido, os rascunhos ficam lado a lado como variantes, e o
+conflito é NOMEADO (campo, lado, as expressões Zod em disputa e de quem vieram).
+O contador continua contando — a demanda é real —, mas o contrato fica
+explicitamente indefinido. Fundir dois contratos incompatíveis produziria uma
+spec que não descreve nenhum dos dois casos; escolher um deles apagaria o outro
+por ordem de chegada, que não é evidência de nada. O CHECK
+`tool_request_aggregates_divergent_has_no_draft` (migração 129) torna impossível
+gravar `divergent` com um rascunho pendurado, venha o INSERT de onde vier.
+
+**Escopo: por tenant + agent, sem contador global.** A agregação compara o texto
+do pedido de um cliente com o de outro; um contador global exigiria que o dado de
+A entrasse no cálculo que produz a linha de B, e "só o número atravessa" não
+salva, porque contagem pequena é reconstruível. A pergunta legítima ("quantos
+clientes pediram isto?") tem caminho próprio — agregação estatística deliberada
+com anonimização e ADR —, nunca efeito colateral de agrupar pedidos.
+Consequência aceita e escrita: dois tenants que precisam da mesma ferramenta
+produzem dois pedidos. Provado por teste de leak com pedidos BYTE A BYTE iguais
+em dois tenants.
+
+**A fusão não pode apagar a evidência, em três camadas.** (1) A agregação só
+escreve em tabelas NOVAS — `capability_proposals`, `agent_capability_gaps` e
+`agent_capability_gap_observations` não são tocadas. (2) Cada membro guarda o
+`proposed_spec` INTEIRO como entrou (`original_spec`), com situações, links de
+trace e o rascunho original — necessário porque o pedido fundido não gera
+proposta. (3) Sair do agregado é `detached_at` com motivo e autor, nunca
+`DELETE`; e um gap já destacado NÃO volta ao agregado por similaridade, senão
+"reversível" duraria até a próxima passada do cron.
+
+**Sem coluna `vector` e sem índice ivfflat/hnsw, de propósito.** Um limiar de
+cosseno dependeria de uma API paga externa que o CI não tem — logo não seria
+calibrável nem retestável, e trocar de provedor moveria a escala inteira em
+silêncio sobre dado de governança. Some-se a isso que `name_only` é o regime em
+que cosseno de frase curta separa pior. Uma coluna vazia que ninguém popula é
+dívida com cara de recurso, e um índice ivfflat sobre dezenas de linhas por
+tenant é mais lento que a varredura sequencial. O ponto de extensão fica: sinal
+semântico calibrado entra como `ASSINATURA_VERSION` nova, **com re-medição**.
+
+**O guardrail da fatia A continua valendo palavra por palavra.** Agregar não
+registra tool, não concede nada e não avalia `zod_source`. Os arquivos novos
+entram sozinhos na varredura estática do guardrail porque ela deriva do grafo de
+imports dos call sites reais — e a sonda que planta um registro de tool dentro
+de `aggregation.ts` fica vermelha nas DUAS defesas (a invariante absoluta de
+runtime e a varredura de fonte).
+
+Migração `129_tool_request_aggregation.sql` (+ `_down` com envelope
+`BEGIN`/`COMMIT` explícito, que RECUSA reverter com dado: um membro
+não-representante não tem linha em `capability_proposals`, então derrubar a
+tabela apagaria pedidos inteiros, não o agrupamento).
+
+Auditoria: `tool_request_aggregated` (com similaridade, limiar, métrica e versão
+da assinatura — agrupamento sem o número que o justificou é fato sem prova) e
+`tool_request_aggregate_detached`.
+
 ### Added — o gap recorrente que exige uma tool INEXISTENTE vira um pedido estruturado, e inerte ([#636](https://github.com/diogenesmendes01/Maia-v2/issues/636), fatia A de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
 
 **O que mudava de mão antes.** Um gap recorrente subia pela cadeia
