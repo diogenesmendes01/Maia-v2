@@ -15,6 +15,7 @@ import { registerMigrationGauges } from './migration-collector.js';
 import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
 import { registrarSeriesDeStream } from '@/runtime/turns/stream-metrics.js';
+import { registrarSeriesDeDebounce } from '@/runtime/turns/stream-debounce.js';
 import {
   registerDbPoolGauges,
   registerSchedulerLagGauges,
@@ -111,6 +112,15 @@ export async function registerRuntimeObservability(): Promise<void> {
   // do `import` de qualquer spec que mocke `@/lib/metrics.js` — o arquivo
   // inteiro deixa de carregar, com um erro que não aponta para a causa.
   registrarSeriesDeStream();
+
+  // Issue #628 (fatia E da #505) — a mesma semeadura para as séries do debounce
+  // transacional, mais a DECLARAÇÃO dos baldes de
+  // `maia_stream_debounce_batch_size` (que mede mensagens por batch, não
+  // milissegundos, e portanto não pode usar os baldes padrão). Precisa rodar
+  // ANTES da primeira amostra: `src/lib/metrics.ts` congela os baldes de uma
+  // série na criação dela, de propósito — trocá-los depois mudaria o
+  // significado das contagens já acumuladas.
+  registrarSeriesDeDebounce();
 
   // Issue #536 — the restore-drill gate. `maia_restore_drill_check_level` goes
   // to 2 when the newest drill in `restore_drills` is older than

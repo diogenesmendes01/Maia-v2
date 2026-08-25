@@ -298,6 +298,23 @@ export const AUDIT_ACTIONS = [
   // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
   'turn_promoted',
   'turn_promotion_rejected',
+  // Issue #628 (fatia E da #505) — DEBOUNCE TRANSACIONAL. UMA row, e ela é a
+  // ação `stream.batch_closed` que a issue-mãe pede na auditoria mínima:
+  //   - `stream_batch_closed`: a plataforma FECHOU um batch de debounce — isto
+  //     é, decidiu que este conjunto de mensagens vira UMA rodada e que o head
+  //     é quem a executa. Vira audit, e não só log, porque é a decisão que
+  //     explica a resposta que o usuário recebeu: "por que a Maia respondeu
+  //     três mensagens minhas de uma vez?" e "por que ela NÃO agrupou a quarta?"
+  //     são perguntas de suporte, e a resposta é esta row.
+  //     `metadata.batch_size` e `metadata.absorbed_turn_ids` reconstroem a
+  //     composição mesmo depois de a retenção levar os turnos `superseded`;
+  //     `metadata.first_ingress_seq`/`last_ingress_seq` reconstroem a FRONTEIRA,
+  //     que é o que a issue-mãe manda ser reconstruível. Não carrega
+  //     `stream_key`, texto, prompt, telefone nem JID.
+  // As RECUSAS de fechamento (`not_due`, `stream_locked`, …) NÃO entram: são
+  // rotina do protocolo — dezenas por minuto —, não decisões governáveis, e
+  // vivem em `maia_stream_debounce_close_total{result}`.
+  'stream_batch_closed',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

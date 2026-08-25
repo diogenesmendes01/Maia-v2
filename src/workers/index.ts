@@ -12,6 +12,7 @@ import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runPatternDetector } from './pattern-detector.js';
 import { runMessageRecovery } from './message-recovery.js';
+import { runStreamDebounceCloser } from './stream-debounce-closer.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
@@ -55,6 +56,15 @@ export const JOBS: Job[] = [
   { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
+  // Issue #628 (fatia E da #505) — o RELÓGIO DE PAREDE do debounce
+  // transacional. O cron é 1/min, mas o tick DRENA por ~50s sondando a cada
+  // 500ms, porque uma janela de debounce é de segundos e fechar só no tick
+  // acrescentaria até 60s à resposta. FASE 1: com a flag ligada, este worker é
+  // o único caminho pelo qual uma rajada de texto vira turno executável — se
+  // ele não roda, a conversa espera o recovery por estado (STUCK_AFTER_MS).
+  // No-op barato com FEATURE_TURN_STREAM_DEBOUNCE (ou FEATURE_MESSAGE_DEBOUNCE)
+  // desligada: nem consulta o banco.
+  { name: 'stream_debounce_closer', cron: '* * * * *', fn: runStreamDebounceCloser, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
   // Spec 18 §10 — three scheduling workers:
   //  - scheduling_tick: every minute, claims due occurrences and advances

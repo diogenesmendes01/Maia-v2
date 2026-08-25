@@ -73,6 +73,17 @@ import {
   streamHeadOfLineNotExists,
   streamSuccessorCandidate,
 } from './stream-head-sql.js';
+// #628 — a FRONTEIRA do batch de debounce, no mesmo formato e pela mesma razão
+// do módulo acima: SQL puro, compilável sem banco, com a borda escrita num
+// lugar só. `armDebounceWindowTx` e `closeDueDebounceBatchTx` são os únicos
+// consumidores; nenhum dos dois monta predicado de contiguidade próprio.
+import {
+  debounceBatchPrefix,
+  debounceDeadlineExpression,
+  debounceWindowDue,
+  lockStreamForDebounce,
+  openDebounceWindowMembers,
+} from './stream-debounce-sql.js';
 // A flag é lida por `contractEnv`, e não por `@/config/env.js`, pela MESMA
 // razão de `conversation-repos.ts` (#596): este arquivo é alcançado pelo
 // console via `conversation-repos`, e `tests/unit/config/admin-import-boundary.spec.ts`
@@ -120,6 +131,56 @@ type ClaimRow = {
  * um dia esqueceria a auditoria.
  */
 export type StreamPromotion = StreamClaimRecovery;
+
+/**
+ * #628 (fatia E) — a stream que o varredor de debounce deve visitar.
+ *
+ * Enumerada FORA de contexto de tenant: o varredor é um dispatcher, como o de
+ * `message-recovery` (#345). O par (tenant, agent) vem na linha porque é ele
+ * que o varredor usa para abrir `runWithTenantContext` antes de fechar.
+ */
+export type DueDebounceStream = {
+  tenant_id: string;
+  agent_id: string;
+  stream_key: string;
+};
+
+/**
+ * #628 — o desfecho de UMA tentativa de fechar o batch de uma stream.
+ *
+ * TIPADO, e não booleano, porque os quatro fracassos pedem leituras opostas do
+ * operador e a issue-mãe manda centralizar códigos de resultado:
+ *
+ *  - `stream_locked` — o mutex da stream está com outra transação (um ingresso
+ *    em voo, ou outro varredor). É o caminho NORMAL da concorrência: nada se
+ *    perde, a janela continua vencida e o próximo tick fecha. É também a metade
+ *    do "fechamento único" que impede duas réplicas de fecharem juntas;
+ *  - `no_window` — não há turno com janela aberta nesta stream. Acontece quando
+ *    o batch já foi fechado entre a enumeração e a visita;
+ *  - `not_due` — existe janela, e o prazo AINDA NÃO venceu pelo relógio do
+ *    BANCO. Um ingresso novo esticou o prazo depois de o varredor ter
+ *    enumerado. Recusar aqui é o que faz o timer do processo não ser fonte de
+ *    verdade;
+ *  - `lost_race` — o CAS de fechamento (`debounce_closed_at IS NULL` +
+ *    `state_version`) não casou. Sob o mutex isto é raro; quando acontece, foi
+ *    o executor do próprio turno mexendo nele.
+ */
+export type DebounceCloseResult =
+  | {
+      closed: true;
+      /** O head do batch — quem executa a rajada e recebe o wake-up. */
+      head: StreamPromotion;
+      /** Quantos ingressos o batch consumiu (>= 1: o head sempre entra). */
+      batch_size: number;
+      /** Os turnos irmãos marcados `superseded` — vazio num batch de um só. */
+      absorbed_turn_ids: readonly string[];
+      /** As mensagens que passaram a ser inputs do head. */
+      absorbed_message_ids: readonly string[];
+    }
+  | {
+      closed: false;
+      reason: 'stream_locked' | 'no_window' | 'not_due' | 'lost_race';
+    };
 
 /** Resultado tipado de uma transição CAS. Conflito NUNCA é sucesso silencioso. */
 export type TurnTransitionResult =
@@ -310,6 +371,30 @@ export const agentTurnsRepo = {
             ? { ...input.stream, ingress_seq }
             : null,
       });
+      // #628 (fatia E) — A JANELA DE DEBOUNCE, ABERTA NA MESMA TRANSAÇÃO.
+      //
+      // É aqui, e não no gateway, que a fatia deixa de depender de um timer.
+      // Quando o commit desta transação acontece, três fatos passam a existir
+      // JUNTOS ou nenhum existe: a mensagem, o turno e o prazo em que a rajada
+      // dela pode fechar. Um crash em qualquer ponto não deixa nem mensagem sem
+      // janela nem janela sem mensagem — que era exatamente o estado que o
+      // `agentQueue.add` + `writeState` do Redis podia produzir.
+      //
+      // A ELEGIBILIDADE é `tipo = 'texto'`: mídia sempre passou direto (ver
+      // `src/gateway/baileys.ts`), e um turno sem janela é o que faz a
+      // contiguidade do batch QUEBRAR na mídia em vez de agrupar por cima dela.
+      // Derivada aqui, da row que está sendo gravada, e não recebida por
+      // parâmetro: um chamador que esquecesse de passá-la abriria janela para
+      // áudio, e o defeito só apareceria numa rajada mista.
+      if (input.stream && ingress_seq !== null && debouncePersistidoAtivo()) {
+        const tipo = input.mensagem['tipo'];
+        if (tipo === 'texto') {
+          await armDebounceWindowTx(tx, {
+            turn_id: turn.id,
+            stream_key: input.stream.stream_key,
+          });
+        }
+      }
       incCounter('maia_turn_transitions_total', { from: 'none', to: 'received', outcome: 'none' });
       return { mensagem: row, turn, ingress_seq };
     });
@@ -709,6 +794,112 @@ export const agentTurnsRepo = {
    * incrementasse, cada batida invalidaria o CAS otimista que o caller carrega
    * e toda conclusão de turno longo falharia por versão obsoleta.
    */
+  /**
+   * #628 (fatia E) — FECHA o batch de debounce de UMA stream, numa transação.
+   *
+   * Ver `closeDueDebounceBatchTx` para o corpo e para as escritas que ele faz
+   * juntas. Aqui só a abertura da transação, pelo mesmo motivo de
+   * `claimNextEligibleTurn`: o `withTx` é o que dá sentido ao mutex da stream —
+   * o lock de linha de `agent_stream_sequences` só vale até o COMMIT, e é ele
+   * que exclui o ingresso concorrente.
+   */
+  async closeDueDebounceBatch(input: { stream_key: string }): Promise<DebounceCloseResult> {
+    return withTx((tx) => closeDueDebounceBatchTx(tx, input));
+  },
+
+  /**
+   * #628 — as streams com janela de debounce VENCIDA, CROSS-TENANT.
+   *
+   * A enumeração do dispatcher, no mesmo formato de
+   * `listTenantAgentPairsWithRecoverableTurns` (#345) e pela mesma razão: o
+   * varredor precisa descobrir QUEM tem trabalho antes de poder abrir contexto
+   * de tenant para fazê-lo. Sem tenant guard de propósito — iteração
+   * cross-tenant é o contrato do varredor, e o `runWithTenantContext` que ele
+   * abre por linha é onde o escopo volta.
+   *
+   * `debounce_deadline_at <= now()` é avaliado no BANCO: o varredor não compara
+   * o prazo com o próprio relógio em nenhum ponto, nem aqui nem no fechamento.
+   *
+   * `GROUP BY` em vez de `DISTINCT` porque a ordenação é por `MIN(prazo)` — a
+   * janela que venceu HÁ MAIS TEMPO é servida primeiro. Com `LIMIT` e um
+   * backlog maior que ele, ordenar por qualquer outra coisa deixaria uma stream
+   * antiga para trás indefinidamente enquanto streams novas passam à frente:
+   * starvation produzida pela própria varredura.
+   */
+  async listDueDebounceStreams(limit = 200): Promise<DueDebounceStream[]> {
+    const result = await db.execute<DueDebounceStream>(sql`
+      SELECT t.tenant_id, t.agent_id, t.stream_key
+        FROM ${agent_turns} t
+       WHERE t.stream_key IS NOT NULL
+         AND t.debounce_deadline_at IS NOT NULL
+         AND t.debounce_closed_at IS NULL
+         AND t.debounce_deadline_at <= now()
+       GROUP BY t.tenant_id, t.agent_id, t.stream_key
+       ORDER BY MIN(t.debounce_deadline_at)
+       LIMIT ${limit}
+    `);
+    return Array.from(result.rows as unknown as DueDebounceStream[]);
+  },
+
+  /**
+   * #628 — A COMPOSIÇÃO do batch que este turno vai executar, lida do BANCO.
+   *
+   * ─── Por que o executor NÃO recalcula a rajada ────────────────────────────
+   *
+   * `aggregateUnprocessedTexts` (src/agent/core.ts) descobria os irmãos por
+   * `telefone` + `processada_em IS NULL` + comparação de `created_at`, em
+   * memória, no momento da execução. Isso é uma SEGUNDA definição de batch,
+   * feita depois e por outro critério — exatamente o tipo de divergência que a
+   * #626 eliminou na regra de ordem. Duas definições concordam até o dia em que
+   * uma mensagem chega entre o fechamento e a execução: a agregação a varre, o
+   * batch fechado não a contém, e a rajada responde por uma mensagem que
+   * pertence à PRÓXIMA — furando a fronteira que o fechamento acabou de
+   * declarar.
+   *
+   * Aqui o executor só LÊ o que já foi decidido. `debounce_closed_at IS NOT
+   * NULL` no `WHERE` é o que impede esta função de devolver alguma coisa para
+   * um turno cuja janela ainda está aberta.
+   *
+   * ─── A ORDEM é a canônica da stream ───────────────────────────────────────
+   *
+   * `ORDER BY m.ingress_seq` — a sequência transacional por stream (migration
+   * 120), não `created_at` e não `agent_turn_inputs.ingress_seq`. A issue-mãe é
+   * explícita ("timestamps não são fonte primária de ordenação"), e o texto
+   * concatenado que o modelo lê depende dessa ordem: trocá-la reescreve a
+   * pergunta do usuário.
+   *
+   * `NULLS LAST` cobre a row anterior ao protocolo (sem `ingress_seq`), que não
+   * tem posição e portanto vai para o fim em vez de para o começo.
+   *
+   * Devolve TODAS as mensagens do turno, inclusive a representativa; quem
+   * separa é o caller, que já sabe qual é a sua.
+   */
+  async listClosedDebounceBatch(
+    turn_id: string,
+  ): Promise<Array<{ mensagem_id: string; conteudo: string | null }>> {
+    const { tenant_id, agent_id } = scope();
+    const result = await db.execute<{ mensagem_id: string; conteudo: string | null }>(sql`
+      SELECT i.mensagem_id, m.conteudo
+        FROM ${agent_turn_inputs} i
+        JOIN ${agent_turns} t
+          ON  t.id        = i.turn_id
+          AND t.tenant_id = ${tenant_id}
+          AND t.agent_id  = ${agent_id}
+        JOIN ${mensagens} m
+          ON  m.id        = i.mensagem_id
+          AND m.tenant_id = ${tenant_id}
+          AND m.agent_id  = ${agent_id}
+       WHERE i.turn_id   = ${turn_id}::uuid
+         AND i.tenant_id = ${tenant_id}
+         AND i.agent_id  = ${agent_id}
+         AND t.debounce_closed_at IS NOT NULL
+       ORDER BY m.ingress_seq NULLS LAST
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ mensagem_id: string; conteudo: string | null }>,
+    );
+  },
+
   async renewTurnLease(input: {
     turn_id: string;
     claim_token: string;
@@ -1949,6 +2140,391 @@ function promotionEnabled(): boolean {
  */
 function headOfLineEnabled(): boolean {
   return contractEnv.FEATURE_TURN_HEAD_OF_LINE;
+}
+
+/**
+ * #628 — o debounce TRANSACIONAL está LIGADO?
+ *
+ * Exige TRÊS flags, e nenhuma das duas dependências é zelo:
+ *
+ *  - `FEATURE_MESSAGE_DEBOUNCE` — sem debounce não existe rajada a agrupar, e
+ *    abrir janela para cada mensagem produziria um batch de um só por mensagem:
+ *    escrita e varredura a mais para descrever o comportamento que já existe.
+ *    É por isso que a fatia é INERTE no default do repositório (a flag do
+ *    debounce vem `false`), e isso é deliberado — ligar o debounce e ligar a
+ *    versão transacional dele são duas decisões;
+ *  - `FEATURE_TURN_HEAD_OF_LINE` — esta é de SEGURANÇA. O fechamento marca os
+ *    irmãos `superseded` sem fence, e pode fazê-lo porque, com head-of-line
+ *    ligado, um turno que NÃO é o head da stream é INCLAIMÁVEL: ninguém o está
+ *    executando, então não há posse a respeitar. Sem head-of-line qualquer
+ *    turno elegível pode ser reivindicado, e o fechamento passaria a poder
+ *    absorver um irmão que um worker está executando NESTE instante — o mesmo
+ *    defeito que `absorbDebounceInputs` cobre com `absorber_claim_token`.
+ *
+ * Lida a cada ingresso e a cada varredura (o memo é de `contractEnv`) pelo
+ * mesmo motivo das demais: um kill switch que só vale no boot não é kill
+ * switch.
+ *
+ * NÃO existe regra cross-field que reprove o boot, e a escolha é a mesma que a
+ * #627 fez: o rollback emergencial da fatia C é `FEATURE_TURN_HEAD_OF_LINE=false`
+ * + restart, e transformar isso em "o processo não sobe até você desligar
+ * também a outra flag" seria pôr um segundo passo obrigatório no meio de um
+ * incidente.
+ */
+function debouncePersistidoAtivo(): boolean {
+  return (
+    contractEnv.FEATURE_TURN_STREAM_DEBOUNCE &&
+    contractEnv.FEATURE_MESSAGE_DEBOUNCE &&
+    headOfLineEnabled()
+  );
+}
+
+/**
+ * #628 (fatia E da #505) — ABRE ou ESTENDE a janela de debounce da stream, na
+ * MESMA transação do ingresso.
+ *
+ * ─── Os dois statements, e por que não podem ser um ───────────────────────
+ *
+ * O primeiro carimba `debounce_window_opened_at` no turno recém-criado; o
+ * segundo recalcula o PRAZO de todos os membros da janela — inclusive dele.
+ * Fundi-los numa CTE que escreve e lê não funcionaria: uma CTE que MODIFICA e
+ * outra que LÊ, no mesmo statement, enxergam o MESMO snapshot, então a segunda
+ * não veria o carimbo da primeira e o turno novo ficaria de fora da própria
+ * janela que acabou de entrar. Dois statements na mesma transação são atômicos
+ * do lado de fora, que é o que importa.
+ *
+ * ─── Por que o prazo é reescrito em TODOS os membros ──────────────────────
+ *
+ * A alternativa era mantê-lo só no head. Ela tem um estado absorvente: se o
+ * head morrer por outro caminho (um operador o ignora, uma absorção o
+ * supersede), o prazo morre com ele e o novo head da janela fica SEM relógio —
+ * ninguém o fecha, e a rajada só sai quando chegar uma mensagem nova. Com o
+ * prazo em todos, qualquer membro sobrevivente carrega o relógio da janela e o
+ * varredor continua achando a stream.
+ *
+ * O custo é um UPDATE sobre o BACKLOG da conversa — 0 a 3 linhas na operação
+ * normal, porque membro fechado e membro terminal saem do conjunto —, e ele
+ * roda sob o mutex da stream que a alocação de `ingress_seq` já segurava.
+ *
+ * ─── A ÂNCORA DO TETO é `MIN(debounce_window_opened_at)` ──────────────────
+ *
+ * Não é o `opened_at` do turno que chegou (que seria sempre `now()`, e o teto
+ * nunca venceria), e não é um valor em memória: é o instante em que o PRIMEIRO
+ * membro vivo da janela abriu. Persistido, portanto imune a reinício — o
+ * processo que estende a janela quase nunca é o que a abriu.
+ */
+async function armDebounceWindowTx(
+  tx: Executor,
+  args: { turn_id: string; stream_key: string },
+): Promise<void> {
+  const { tenant_id, agent_id } = scope();
+  const escopo = escopoSql(tenant_id, agent_id);
+  const membros = {
+    tenant: escopo.tenant,
+    agent: escopo.agent,
+    stream_key: sql`${args.stream_key}`,
+  };
+
+  await tx.execute(sql`
+    UPDATE ${agent_turns}
+       SET debounce_window_opened_at = now(),
+           updated_at = now()
+     WHERE ${agent_turns}.id        = ${args.turn_id}::uuid
+       AND ${agent_turns}.tenant_id = ${tenant_id}
+       AND ${agent_turns}.agent_id  = ${agent_id}
+       AND ${agent_turns}.debounce_window_opened_at IS NULL
+  `);
+
+  await tx.execute(sql`
+    WITH janela AS MATERIALIZED (
+      SELECT t.id, t.debounce_window_opened_at
+        FROM ${agent_turns} AS t
+       WHERE ${openDebounceWindowMembers({ ...membros, alvo: sql`t` })}
+       ORDER BY t.id
+         FOR UPDATE OF t
+    ),
+    abertura AS (
+      SELECT MIN(j.debounce_window_opened_at) AS at FROM janela j
+    )
+    UPDATE ${agent_turns} u
+       SET debounce_deadline_at = ${debounceDeadlineExpression({
+         opened_at: sql`abertura.at`,
+         delay_ms: contractEnv.MESSAGE_DEBOUNCE_MS,
+         max_hold_ms: contractEnv.MESSAGE_DEBOUNCE_MAX_MS,
+       })},
+           updated_at = now()
+      FROM janela, abertura
+     WHERE u.id        = janela.id
+       AND u.tenant_id = ${tenant_id}
+       AND u.agent_id  = ${agent_id}
+  `);
+}
+
+/**
+ * #628 (fatia E da #505) — O FECHAMENTO DO BATCH, com as escritas na MESMA
+ * transação.
+ *
+ * A issue pede, literalmente: *"lock transacional — `FOR UPDATE SKIP LOCKED`
+ * onde couber; fechamento único do batch; criação do turno e associação dos
+ * ingressos na mesma transação"*. Esta função é as três coisas.
+ *
+ * ─── A ordem dos passos, e por que ela é a ordem ──────────────────────────
+ *
+ *  1. **MUTEX DA STREAM** (`lockStreamForDebounce`, `SKIP LOCKED`). Sem linha
+ *     ⇒ `stream_locked`: ou existe um ingresso em voo (e fechar agora
+ *     enxergaria a stream pela metade), ou outra réplica está fechando ESTA
+ *     stream. É aqui que "duas réplicas não fecham batches sobrepostos" deixa
+ *     de ser uma promessa e vira um lock;
+ *
+ *  2. **GC das janelas órfãs.** Um turno que chegou a TERMINAL por outro
+ *     caminho (operador o ignorou, um irmão o absorveu) pode ter ficado com
+ *     `debounce_deadline_at` preenchido e `debounce_closed_at` nulo — isto é,
+ *     dentro do índice do varredor para sempre, sendo reenumerado a cada tick.
+ *     Fechá-lo aqui é o que faz o índice ENCOLHER em vez de vazar. Sem esta
+ *     linha o vazamento não quebra nada e não aparece em teste nenhum: só
+ *     aumenta o custo da varredura, todo dia, para sempre;
+ *
+ *  3. **A BORDA** (`debounceBatchPrefix`). O prefixo contíguo de membros. Vazio
+ *     ⇒ `no_window`;
+ *
+ *  4. **O RELÓGIO PERSISTENTE.** `due` vem do BANCO (`debounceWindowDue`),
+ *     nunca de `Date.now()`. Não vencido ⇒ `not_due` — que é o caso NORMAL
+ *     quando uma mensagem esticou o prazo depois de o varredor enumerar, e é a
+ *     linha que faz o timer do processo não ser fonte de verdade;
+ *
+ *  5. **O CAS DE FECHAMENTO** sobre o head, com `debounce_closed_at IS NULL` E
+ *     `state_version` esperada. Zero linhas ⇒ `lost_race`, nunca sucesso
+ *     silencioso. As DUAS condições são necessárias, e a primeira não é
+ *     redundante: um head que já estava `queued` (promovido pela #627, ou
+ *     re-armado pelo varredor de recovery) NÃO tem `state_version`
+ *     incrementada pelo fechamento — de propósito, porque re-armar um turno já
+ *     `queued` não é transição de estado. Nesse caso o CAS de versão aprovaria
+ *     as duas réplicas, e só `debounce_closed_at IS NULL` recusa a segunda;
+ *
+ *  6. **A ABSORÇÃO DOS IRMÃOS** — `superseded`/`merged_into_turn` apontando
+ *     para o head — e a RE-ANCORAGEM dos inputs.
+ *
+ * ─── Por que os inputs MUDAM DE TURNO (e a absorção de #503 não fazia isso) ─
+ *
+ * `absorbDebounceInputs` (lifecycle.ts) marca o irmão `superseded` e DEIXA a
+ * associação onde está, porque lá a absorção acontece DEPOIS de o irmão já ter
+ * sido varrido pela agregação em memória — os textos já estão no prompt.
+ *
+ * Aqui não há agregação em memória: o batch É a composição, e ela precisa ser
+ * legível pelo executor, que roda em outro processo e outro instante. Repontar
+ * `agent_turn_inputs.turn_id` para o head faz `listClosedDebounceBatch` devolver
+ * a rajada inteira, em ordem — o batch vira um FATO do banco, que é a exigência
+ * da fatia. A invariante "uma mensagem inbound pertence a no máximo um turno"
+ * continua sendo do banco (unique em `agent_turn_inputs.mensagem_id`); o que
+ * muda é QUAL turno, e ele muda uma vez só, sob o mutex.
+ *
+ * Efeito colateral BOM e deliberado: a projeção legada `processada_em` passa a
+ * ser carimbada quando o HEAD chega a terminal, e não quando o irmão é
+ * absorvido. É mais honesto — a mensagem do irmão só foi de fato processada
+ * quando a resposta da rajada saiu — e é o que impede o probe de divergência de
+ * #503 (`terminal_without_projection`) de acusar todo irmão absorvido.
+ *
+ * ─── Por que a absorção aqui NÃO passa por `transitionTurn` ───────────────
+ *
+ * Mesma razão de `promoteStreamSuccessor` e de `claimNextEligibleTurn`:
+ * `transitionTurn` é CAS sobre UMA linha conhecida, e aqui o conjunto só é
+ * conhecido depois de a borda ser calculada, dentro da transação. O par
+ * (from, to) continua sendo do contrato — `received -> superseded` e
+ * `queued -> superseded` são arestas de `TURN_TRANSITIONS`, e
+ * `tests/unit/runtime/stream-debounce-contract.spec.ts` falha se saírem.
+ *
+ * ─── `promoted_at` no head, e por que reusar a coluna da #627 ─────────────
+ *
+ * Fechar o batch É eleger quem avança. O sinal (o `enqueueAgent`) sai DEPOIS do
+ * commit, no caller — então existe a mesma janela de "commit feito, enqueue não
+ * feito" que a fatia D já resolve, e resolvê-la de novo com uma coluna própria
+ * seria uma segunda reconciliação com o mesmo modo de falha. Carimbando
+ * `promoted_at`, o varredor de `message-recovery` reconcilia o batch fechado e
+ * não sinalizado pelo caminho que já existe e já é medido
+ * (`maia_stream_promotion_total{result="recovered"}`).
+ */
+async function closeDueDebounceBatchTx(
+  tx: Executor,
+  args: { stream_key: string },
+): Promise<DebounceCloseResult> {
+  const { tenant_id, agent_id } = scope();
+  const escopo = escopoSql(tenant_id, agent_id);
+  const membros = {
+    tenant: escopo.tenant,
+    agent: escopo.agent,
+    stream_key: sql`${args.stream_key}`,
+  };
+
+  // 1. MUTEX DA STREAM.
+  const travado = await tx.execute<{ stream_key: string }>(
+    sql`${lockStreamForDebounce(membros)}`,
+  );
+  if (Array.from(travado.rows as unknown as unknown[]).length === 0) {
+    return { closed: false, reason: 'stream_locked' };
+  }
+
+  // 2. GC das janelas cujo turno morreu por outro caminho.
+  await tx.execute(sql`
+    UPDATE ${agent_turns} u
+       SET debounce_closed_at = now(),
+           updated_at = now()
+     WHERE u.tenant_id  = ${tenant_id}
+       AND u.agent_id   = ${agent_id}
+       AND u.stream_key = ${args.stream_key}
+       AND u.debounce_window_opened_at IS NOT NULL
+       AND u.debounce_closed_at IS NULL
+       AND u.status IN (${statusList(TERMINAL_TURN_STATUSES)})
+  `);
+
+  // 3. A BORDA.
+  type MembroRow = {
+    id: string;
+    status: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    first_ingress_seq: string | number;
+    last_ingress_seq: string | number;
+    state_version: string | number;
+    due: boolean;
+  };
+  const prefixo = await tx.execute<MembroRow>(sql`
+    WITH prefixo AS (${debounceBatchPrefix(membros)})
+    SELECT p.id, p.status, p.representative_message_id, p.conversa_id,
+           p.first_ingress_seq, p.last_ingress_seq, p.state_version,
+           ${debounceWindowDue(sql`p`)} AS due
+      FROM prefixo p
+     ORDER BY p.first_ingress_seq
+  `);
+  const membrosDoBatch = Array.from(prefixo.rows as unknown as MembroRow[]);
+  const head = membrosDoBatch[0];
+  if (!head) return { closed: false, reason: 'no_window' };
+
+  // 4. O RELÓGIO PERSISTENTE. `due` foi avaliado no banco; basta UM membro
+  // vencido — o prazo é o mesmo em todos, e exigir que fosse o head tornaria o
+  // fechamento refém de uma linha que pode ter perdido o carimbo.
+  if (!membrosDoBatch.some((m) => m.due === true)) {
+    return { closed: false, reason: 'not_due' };
+  }
+
+  const irmaos = membrosDoBatch.slice(1);
+  const ultimaSeq = membrosDoBatch.reduce(
+    (max, m) => Math.max(max, Number(m.last_ingress_seq)),
+    Number(head.last_ingress_seq),
+  );
+
+  // 5. O CAS DE FECHAMENTO.
+  const fechado = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    status: string;
+  }>(sql`
+    UPDATE ${agent_turns} u
+       SET status              = 'queued',
+           queued_at           = COALESCE(u.queued_at, now()),
+           last_ingress_seq    = GREATEST(u.last_ingress_seq, ${ultimaSeq}),
+           debounce_closed_at  = now(),
+           debounce_batch_size = ${membrosDoBatch.length},
+           promoted_at         = now(),
+           next_attempt_at     = NULL,
+           state_version       = u.state_version
+                                 + CASE WHEN u.status = 'queued' THEN 0 ELSE 1 END,
+           updated_at          = now()
+     WHERE u.id            = ${head.id}::uuid
+       AND u.tenant_id     = ${tenant_id}
+       AND u.agent_id      = ${agent_id}
+       AND u.state_version = ${Number(head.state_version)}
+       AND u.debounce_closed_at IS NULL
+       AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+    RETURNING u.id, u.representative_message_id, u.conversa_id, u.status
+  `);
+  const headFechado = Array.from(
+    fechado.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      status: string;
+    }>,
+  )[0];
+  if (!headFechado) return { closed: false, reason: 'lost_race' };
+
+  // 6. A ABSORÇÃO DOS IRMÃOS + a re-ancoragem dos inputs.
+  const absorvidos: string[] = [];
+  const mensagensAbsorvidas: string[] = [];
+  if (irmaos.length > 0) {
+    const ids = sql.join(
+      irmaos.map((m) => sql`${m.id}::uuid`),
+      sql`, `,
+    );
+    const supersedidos = await tx.execute<{ id: string }>(sql`
+      UPDATE ${agent_turns} u
+         SET status                = 'superseded',
+             outcome               = 'merged_into_turn',
+             superseded_by_turn_id = ${headFechado.id}::uuid,
+             debounce_closed_at    = now(),
+             state_version         = u.state_version + 1,
+             updated_at            = now()
+       WHERE u.id IN (${ids})
+         AND u.tenant_id = ${tenant_id}
+         AND u.agent_id  = ${agent_id}
+         AND u.debounce_closed_at IS NULL
+         AND u.status NOT IN (${statusList(TERMINAL_TURN_STATUSES)})
+      RETURNING u.id
+    `);
+    absorvidos.push(
+      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map((r) => r.id),
+    );
+
+    if (absorvidos.length > 0) {
+      const absorvidosSql = sql.join(
+        absorvidos.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      );
+      // A ordem dentro do turno passa a ser a ordem CANÔNICA da stream
+      // (`mensagens.ingress_seq`), e não a de chegada do UPDATE. `+ 1` porque
+      // `ingress_seq = 0` é, por contrato, a mensagem representativa do head.
+      const repontados = await tx.execute<{ mensagem_id: string }>(sql`
+        UPDATE ${agent_turn_inputs} i
+           SET turn_id     = ${headFechado.id}::uuid,
+               ingress_seq = ordenados.ord
+          FROM (
+            SELECT ai.id,
+                   ROW_NUMBER() OVER (ORDER BY m.ingress_seq) AS ord
+              FROM ${agent_turn_inputs} ai
+              JOIN ${mensagens} m
+                ON  m.id        = ai.mensagem_id
+                AND m.tenant_id = ${tenant_id}
+                AND m.agent_id  = ${agent_id}
+             WHERE ai.tenant_id = ${tenant_id}
+               AND ai.agent_id  = ${agent_id}
+               AND ai.turn_id IN (${absorvidosSql})
+          ) AS ordenados
+         WHERE i.id        = ordenados.id
+           AND i.tenant_id = ${tenant_id}
+           AND i.agent_id  = ${agent_id}
+        RETURNING i.mensagem_id
+      `);
+      mensagensAbsorvidas.push(
+        ...Array.from(repontados.rows as unknown as Array<{ mensagem_id: string }>).map(
+          (r) => r.mensagem_id,
+        ),
+      );
+    }
+  }
+
+  return {
+    closed: true,
+    head: {
+      turn_id: headFechado.id,
+      representative_message_id: headFechado.representative_message_id,
+      conversa_id: headFechado.conversa_id,
+      status_before: head.status as TurnStatus,
+      status_after: headFechado.status as TurnStatus,
+    },
+    batch_size: membrosDoBatch.length,
+    absorbed_turn_ids: absorvidos,
+    absorbed_message_ids: mensagensAbsorvidas,
+  };
 }
 
 /** O escopo corrente como FRAGMENTOS, que é o que `stream-head-sql` consome. */
