@@ -181,6 +181,11 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
     const bEnv = await trace({ ...baseInput(), tenant_id: 'tenant-beta' });
     expect(aEnv.envelope_hmac).not.toBe(bEnv.envelope_hmac);
     // Verify tenant-alpha's HMAC does NOT validate under tenant-beta's key.
+    //
+    // Issue #535: this literal is the CANONICAL v2 MATERIAL, spelled out rather
+    // than rebuilt with the production helper. Rebuilding it would make the
+    // expectation follow the writer wherever it goes — including nowhere. The
+    // last three keys are what v2 adds over v1.
     const payload = {
       trace_id: aEnv.trace_id,
       tenant_id: 'tenant-alpha',
@@ -192,9 +197,19 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
       side_effect_level: 'medium',
       redaction_class: 'standard',
       hmac_key_version: aEnv.hmac_key_version,
+      root_trace_id: aEnv.root_trace_id,
+      attempt: aEnv.attempt,
+      signature_version: 2,
     };
     expect(verifyHmac('tenant-alpha', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(true);
     expect(verifyHmac('tenant-beta', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(false);
+    // And production stamped the version on the row it inserted.
+    expect(aEnv.signature_version).toBe(2);
+    const inserted = txInsertValuesMock.mock.calls
+      .map((c) => c[0] as Record<string, unknown>)
+      .filter((r) => 'envelope_hmac' in r);
+    expect(inserted.length).toBeGreaterThan(0);
+    for (const r of inserted) expect(r.signature_version).toBe(2);
   });
 
   it('5. envelope write failure → trace() throws → invariant 12 holds', async () => {

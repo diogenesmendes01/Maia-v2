@@ -168,6 +168,48 @@ After PR #275, every `maia_*` counter has `tenant_id` and `agent_id` labels. Out
 - HMAC chains the envelope to the body so tampering is detectable
 - Redaction and optional encryption apply to the body, not the envelope
 
+### 4.4a `envelope_hmac` is versioned: `signature_version` (issue #535)
+
+The envelope signature has **two versions**, and which one a row uses is a
+column (`runtime_trace_envelopes.signature_version`, migration 119).
+
+| | v1 | v2 |
+|---|---|---|
+| Signed fields | `trace_id`, `tenant_id`, `agent_id`, `conversa_id`, `turno_id`, `policy_id`, `decision`, `side_effect_level`, `redaction_class`, `hmac_key_version` | v1 **∪** `root_trace_id`, `attempt`, `signature_version` |
+| Written by production | **no** — never again | **yes**, always |
+| Read by the verifier | yes (fixtures / old environments) | yes |
+| Re-signed retroactively | **no** | — |
+
+Both materials are built in one file,
+[`src/control-plane/runtime-trace/lib/signature.ts`](../../../src/control-plane/runtime-trace/lib/signature.ts),
+so signer and verifier cannot drift.
+
+**Why now.** Migration 107 left `root_trace_id`/`attempt` outside the signature
+on the argument that signing them would invalidate every envelope already
+written. `FEATURE_RUNTIME_TRACE_V1` has never been on in production, so there is
+no corpus to invalidate — this was the last cheap window to fix the contract.
+
+**Why this is not a downgrade attack.** The version lives in a column, and a
+column is what an attacker with DB write access controls. The v2 material
+therefore contains `"signature_version":2` — explicit domain separation. Flipping
+a v2 row's column to `1` makes the verifier recompute the *v1* material and
+compare it against an HMAC taken over the *v2* material: it cannot match, and
+the row reads `invalid`. Relabelling in the other direction is detected the same
+way.
+
+**What remains open.** A row that is *genuinely* v1-signed still has
+`root_trace_id`/`attempt` outside its signature, so on such rows those two
+columns are editable without detection. Two defences, both independent of the
+signature:
+
+- `RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false` refuses v1 **at read time**. The
+  verdict is `rejected_version` — deliberately distinct from `invalid`, because
+  a v1 signature may be perfectly genuine and calling it tampering is the same
+  category error the old `hmac.length > 0` check made, in reverse. Default is
+  `true`; turn it off in an environment confirmed to hold no v1 rows.
+- `listAttempts()` requires the **signed `turno_id`** (§4.4b below), which is
+  inside the signature in *both* versions.
+
 ### 4.4b Correlation: one `trace_id` per turn (issue #514)
 
 `src/observability/correlation.ts` owns a dedicated AsyncLocalStorage, separate
@@ -185,6 +227,30 @@ is distinguishable without splitting the trace.
 
 Context builders must **not** mint a new root (`build-base-context.ts:83`,
 `base-context-builder.ts:132` both read the ambient id first).
+
+**Grouping attempts requires the signed `turno_id` (issue #535).**
+`runtimeTraceRepo.listAttempts()` takes `{ tenantId, rootTraceId, turnoId }` —
+all three required — and:
+
+1. **fails closed** (`TraceAttemptScopeError`) when `turnoId` is blank or
+   absent, rather than falling back to grouping on `root_trace_id` alone. A
+   fallback would be the control switched off by omitting an argument;
+2. filters on `turno_id` **in the SQL**, served by
+   `runtime_trace_env_attempt_turn_idx` (migration 119);
+3. **drops** a returned sibling whose own envelope verifies as `invalid`.
+   `unknown` and `rejected_version` are reported, not hidden — a row an
+   operator can already see in the list view must not silently vanish from the
+   group.
+
+This is **defence in depth**, not the primary control: the primary control is
+that v2 signs `root_trace_id` and `attempt`. This layer is what still holds on a
+v1 row. What it buys is the property the owner named — two distinct turns can
+never render as attempts of one, because joining a group now requires agreeing
+on a field that every version signs.
+
+`tracesRouter.getTrace` only builds the group when the row it is showing has a
+`root_trace_id`, has a `turno_id`, and did not itself verify as `invalid`;
+otherwise the attempt list is empty (degraded grouping, never a merged one).
 
 ### 4.4c Metric labels are a closed allowlist (issue #514 §6)
 
@@ -434,8 +500,15 @@ coverage that does not exist:
 - **The overhead benchmark is micro, not under load.** Real cardinality under
   production traffic is still unmeasured; the budget is proven to BOUND the
   series count, not sized against observed traffic.
-- **`root_trace_id` / `attempt` are still outside `envelope_hmac`** — the
-  owner decision the issue asks for has not been recorded.
+- **v1 envelopes remain readable, and on them `root_trace_id`/`attempt` are
+  still unsigned** (issue #535, §4.4a). Production writes only v2, so this is
+  bounded to fixtures and to environments that already hold v1 rows — but the
+  read side accepts v1 by default (`RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=true`),
+  and nothing in the code can tell a genuine v1 row from one an attacker
+  planted with a key they should not have. Turning the switch off is an
+  operator decision per environment, not a code default, because flipping every
+  legacy row to `rejected_version` on deploy day would destroy the evidence the
+  switch exists to protect.
 
 ## 7.5 Documented exception — staging de inbound não-roteado (`inbound_unrouted`)
 

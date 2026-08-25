@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 181 | 19 |
+| `runtime` | 182 | 19 |
 | `admin-ui` | 27 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -281,6 +281,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `RUNTIME_TRACE_HMAC_KEY_VERSION` | number | `1` | não | `runtime`, `admin-ui` | sim | Versão da chave HMAC em uso (rotação a cada 90d). |
 | `RUNTIME_TRACE_HMAC_MASTER_SECRET` | string | — | sim | `runtime`, `admin-ui` | sim | Segredo mestre do HMAC de auditoria. OBRIGATÓRIO em produção — sem ele os HMACs de auditoria seriam forjáveis. Obrigatória em: staging, production. |
 | `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` | string | — | sim | `runtime`, `admin-ui` | sim | Segredos anteriores, formato `versao=segredo` separados por `;`, retidos pela janela de retenção de auditoria. |
+| `RUNTIME_TRACE_ACCEPT_SIGNATURE_V1` | string | `true` | não | `runtime` | não | Aceita envelopes de runtime trace com `signature_version=1` na LEITURA (#535). Default `true`: produção só escreve v2, mas fixtures e ambientes que já têm linhas v1 precisam continuar recebendo veredito real de integridade. Com `false`, uma linha v1 lê `rejected_version` — distinto de `invalid`, porque a assinatura pode ser genuína. Ligue `false` no ambiente que comprovadamente não tem linha v1: a v1 deixa `root_trace_id`/`attempt` fora da assinatura. |
 | `RUNTIME_TRACE_DEBUG_S3_BUCKET` | string | — | não | `runtime` | sim | Bucket dos snapshots cifrados do modo debug (TTL 24h). |
 | `RUNTIME_TRACE_DEBUG_AES_KEY` | string | — | sim | `runtime` | sim | Chave AES-GCM (base64) dos snapshots de debug. Obrigatória quando RUNTIME_TRACE_DEBUG_S3_BUCKET está definida. |
 | `RUNTIME_TRACE_BODY_ORPHAN_SEC` | number | `300` | não | `runtime` | sim | Idade máxima (s) de um envelope pendente antes do alerta do recoverer. |

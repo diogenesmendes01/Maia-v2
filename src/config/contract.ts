@@ -1946,6 +1946,19 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  RUNTIME_TRACE_ACCEPT_SIGNATURE_V1: {
+    name: 'RUNTIME_TRACE_ACCEPT_SIGNATURE_V1',
+    description:
+      'Aceita envelopes de runtime trace com `signature_version=1` na LEITURA (#535). Default `true`: produção só escreve v2, mas fixtures e ambientes que já têm linhas v1 precisam continuar recebendo veredito real de integridade. Com `false`, uma linha v1 lê `rejected_version` — distinto de `invalid`, porque a assinatura pode ser genuína. Ligue `false` no ambiente que comprovadamente não tem linha v1: a v1 deixa `root_trace_id`/`attempt` fora da assinatura.',
+    group: 'runtime-trace',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: false,
+    commentedInExample: true,
+  },
   RUNTIME_TRACE_DEBUG_S3_BUCKET: {
     name: 'RUNTIME_TRACE_DEBUG_S3_BUCKET',
     description: 'Bucket dos snapshots cifrados do modo debug (TTL 24h).',
