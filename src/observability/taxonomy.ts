@@ -270,6 +270,35 @@ export const METRIC = {
    */
   TURN_SCOPE_REJECTED: 'maia_turn_scope_rejected_total',
 
+  /**
+   * Issue #505 §Observability — um ingresso passou pela fronteira de identidade
+   * de stream. `result` é `resolved` | `rejected` (`STREAM_INGRESS_RESULT_VALUES`)
+   * e `channel_kind` é o vocabulário FECHADO dos canais.
+   *
+   * `stream_key`, `remote_jid` e `turn_id` NÃO são labels — a issue proíbe
+   * explicitamente ("Não usar `stream_key`, `remote_jid`, `turn_id` ou conteúdo
+   * como labels"), e são justamente as três dimensões cuja cardinalidade cresce
+   * com o TRÁFEGO. Elas vivem no log estruturado `stream.ingress_sequenced`.
+   *
+   * `result="rejected"` NUNCA é normal: é uma mensagem de usuário que a
+   * plataforma decidiu não processar porque não soube a que conversa ela
+   * pertence. Um ponto aqui é alerta, não métrica de fundo.
+   */
+  STREAM_INGRESS: 'maia_stream_ingress_total',
+  /**
+   * Issue #505 — POR QUE a identidade de stream foi recusada. `reason` tem
+   * cardinalidade FECHADA (`STREAM_KEY_REJECTIONS` em
+   * `src/runtime/turns/stream-key.ts`), porque o motivo é derivado de dado que
+   * chega de fora e um texto livre aqui seria cardinalidade controlada por quem
+   * manda a mensagem.
+   *
+   * Série separada de `STREAM_INGRESS` de propósito: a contagem por canal e a
+   * contagem por motivo têm consumidores diferentes (capacidade vs. triagem), e
+   * cruzá-las numa série só multiplicaria `channel_kind × reason` sem que
+   * ninguém faça essa pergunta.
+   */
+  STREAM_INGRESS_REJECTED: 'maia_stream_ingress_rejected_total',
+
   // --- queue ---------------------------------------------------------------
   QUEUE_DEPTH: 'maia_queue_depth',
   QUEUE_OLDEST_JOB_AGE_MS: 'maia_queue_oldest_job_age_ms',
@@ -1097,6 +1126,21 @@ export const TURN_SCOPE_REJECTION_VALUES: readonly string[] = Object.freeze([
   'scope_unusable',
   'representative_missing',
   'scope_mismatch',
+]);
+
+/**
+ * Issue #505 — os dois valores que o label `result` de `METRIC.STREAM_INGRESS`
+ * pode carregar.
+ *
+ * Deliberadamente binário: "a plataforma soube a que stream este ingresso
+ * pertence?" tem duas respostas, e um terceiro valor (`degraded`, `partial`,
+ * `unknown`) seria a porta pela qual um fallback voltaria a existir. O DETALHE
+ * da recusa mora em `METRIC.STREAM_INGRESS_REJECTED{reason}`, cujo vocabulário
+ * é `STREAM_KEY_REJECTIONS` (`src/runtime/turns/stream-key.ts`).
+ */
+export const STREAM_INGRESS_RESULT_VALUES: readonly string[] = Object.freeze([
+  'resolved',
+  'rejected',
 ]);
 
 /**

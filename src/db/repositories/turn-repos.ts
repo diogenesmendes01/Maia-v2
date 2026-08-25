@@ -24,7 +24,12 @@
  */
 import { and, asc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
-import { agent_turns, agent_turn_inputs, mensagens } from '../schema.js';
+import {
+  agent_stream_sequences,
+  agent_turns,
+  agent_turn_inputs,
+  mensagens,
+} from '../schema.js';
 import type { AgentTurn, AgentTurnInput, Mensagem } from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
@@ -182,12 +187,40 @@ export const agentTurnsRepo = {
     mensagem: Record<string, unknown>;
     channel_id?: string | null;
     deadline_at?: Date | null;
-  }): Promise<{ mensagem: Mensagem; turn: AgentTurn }> {
-    const guardedMensagem = applyTenantGuard({
-      ...input.mensagem,
-      channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
-    });
+    /**
+     * #505 — a stream JÁ RESOLVIDA (fail-closed) pelo chamador. `null` quando o
+     * protocolo de stream está desligado; nunca uma stream inventada aqui.
+     */
+    stream?: { stream_key: string; stream_key_version: number } | null;
+  }): Promise<{ mensagem: Mensagem; turn: AgentTurn; ingress_seq: number | null }> {
     return withTx(async (tx) => {
+      // ORDEM DELIBERADA: a sequência é alocada ANTES do INSERT da mensagem,
+      // e as duas coisas estão na MESMA transação.
+      //
+      // O que essa combinação garante — e que a issue exige (§Acceptance:
+      // "Redelivery do mesmo evento não recebe nova sequência"): se o INSERT
+      // colidir na unique de dedup (`whatsapp_id`), a transação INTEIRA aborta,
+      // e o `UPDATE` do contador aborta com ela. O número volta. A reentrega
+      // relê a row original — que já carrega a sequência dela — em vez de
+      // ganhar uma nova. Não existe caminho de compensação a lembrar de
+      // escrever: é o rollback do Postgres fazendo o trabalho.
+      //
+      // A dedup PRECEDE a alocação também no nível de cima: `createInbound`
+      // faz o pre-check por `whatsapp_id` ANTES de chamar aqui, então uma
+      // reentrega comum nem chega a abrir transação (§Implementation Notes:
+      // "Deduplicação do ingresso deve acontecer antes da alocação de nova
+      // sequência").
+      const ingress_seq = input.stream
+        ? await allocateIngressSeq(tx, input.stream)
+        : null;
+
+      const guardedMensagem = applyTenantGuard({
+        ...input.mensagem,
+        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
+        stream_key: input.stream?.stream_key ?? null,
+        stream_key_version: input.stream?.stream_key_version ?? null,
+        ingress_seq,
+      });
       const inserted = await tx
         .insert(mensagens)
         .values(guardedMensagem as never)
@@ -196,9 +229,43 @@ export const agentTurnsRepo = {
       const turn = await createTurnForMessage(tx, {
         mensagem: row,
         deadline_at: input.deadline_at ?? null,
+        stream:
+          input.stream && ingress_seq !== null
+            ? { ...input.stream, ingress_seq }
+            : null,
       });
       incCounter('maia_turn_transitions_total', { from: 'none', to: 'received', outcome: 'none' });
-      return { mensagem: row, turn };
+      return { mensagem: row, turn, ingress_seq };
+    });
+  },
+
+  /**
+   * #505 — persiste a mensagem inbound COM stream/sequência, sem criar turno.
+   *
+   * É o caminho de `createInbound` quando `FEATURE_TURN_STATE_MACHINE` está
+   * OFF. Existe para que a captura de ordem (fase shadow) NÃO dependa da flag
+   * da máquina de estados: são dois rollouts independentes, e amarrá-los faria
+   * o kill switch de um apagar a evidência do outro.
+   */
+  async createSequencedInboundTx(input: {
+    mensagem: Record<string, unknown>;
+    channel_id?: string | null;
+    stream: { stream_key: string; stream_key_version: number };
+  }): Promise<{ mensagem: Mensagem; ingress_seq: number }> {
+    return withTx(async (tx) => {
+      const ingress_seq = await allocateIngressSeq(tx, input.stream);
+      const guardedMensagem = applyTenantGuard({
+        ...input.mensagem,
+        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
+        stream_key: input.stream.stream_key,
+        stream_key_version: input.stream.stream_key_version,
+        ingress_seq,
+      });
+      const inserted = await tx
+        .insert(mensagens)
+        .values(guardedMensagem as never)
+        .returning();
+      return { mensagem: inserted[0]!, ingress_seq };
     });
   },
 
@@ -243,6 +310,78 @@ export const agentTurnsRepo = {
       .onConflictDoNothing()
       .returning({ id: agent_turn_inputs.id });
     return rows.length === 1 ? { attached: true } : { attached: false, reason: 'already_attached' };
+  },
+
+  /**
+   * #505 — ESTENDE as fronteiras de sequência do turno para cobrir os ingressos
+   * que o debounce absorveu.
+   *
+   * Turno simples nasce com `first === last` (a mensagem representativa). Um
+   * turno AGREGADO consome mais ingressos, e a issue exige que ele persista o
+   * intervalo (§Relação entre ingressos e turnos), porque é o intervalo — não a
+   * mensagem representativa — que o head-of-line de fases posteriores compara.
+   *
+   * ─── O predicado que impede a fronteira de atravessar streams ────────────
+   *
+   * `m.stream_key = agent_turns.stream_key` no subselect é a parte que importa.
+   * Sem ele, uma mensagem de OUTRA conversa (por bug de agrupamento, por replay
+   * manual, por um `mensagem_ids` mal montado) alargaria o intervalo deste
+   * turno até cobrir sequências que ele nunca consumiu — e o head-of-line
+   * passaria a barrar, ou liberar, a stream errada. Com ele, uma mensagem de
+   * fora simplesmente não entra na agregação: o `max`/`min` a ignora e a
+   * fronteira não se move. É fail-closed por construção, não por validação do
+   * chamador.
+   *
+   * `GREATEST`/`LEAST` do Postgres IGNORAM NULL, então uma lista que não casa
+   * com nada deixa as fronteiras exatamente como estavam — nenhuma escrita
+   * espúria, nenhum `NULL` acidental.
+   *
+   * NÃO é uma transição de estado: não toca `status`, não incrementa
+   * `state_version`, não passa pelo CAS. É a atualização de um dado
+   * DERIVADO da composição do batch, e submetê-la ao compare-and-swap faria uma
+   * absorção concorrente falhar por conflito de versão sem que nada de estado
+   * tivesse mudado.
+   *
+   * Devolve `false` quando nada foi atualizado — turno inexistente, de outro
+   * escopo, ou ainda sem `stream_key` (anterior ao protocolo).
+   */
+  async extendTurnStreamBoundaryTx(input: {
+    turn_id: string;
+    mensagem_ids: readonly string[];
+  }): Promise<boolean> {
+    if (input.mensagem_ids.length === 0) return false;
+    const { tenant_id, agent_id } = scope();
+    const ids = sql.join(
+      input.mensagem_ids.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    );
+    const result = await db.execute<{ id: string }>(sql`
+      UPDATE ${agent_turns}
+      SET first_ingress_seq = LEAST(
+            ${agent_turns}.first_ingress_seq,
+            (SELECT min(m.ingress_seq) FROM ${mensagens} m
+              WHERE m.tenant_id = ${tenant_id}
+                AND m.agent_id = ${agent_id}
+                AND m.id IN (${ids})
+                AND m.stream_key = ${agent_turns}.stream_key)
+          ),
+          last_ingress_seq = GREATEST(
+            ${agent_turns}.last_ingress_seq,
+            (SELECT max(m.ingress_seq) FROM ${mensagens} m
+              WHERE m.tenant_id = ${tenant_id}
+                AND m.agent_id = ${agent_id}
+                AND m.id IN (${ids})
+                AND m.stream_key = ${agent_turns}.stream_key)
+          ),
+          updated_at = now()
+      WHERE ${agent_turns}.id = ${input.turn_id}::uuid
+        AND ${agent_turns}.tenant_id = ${tenant_id}
+        AND ${agent_turns}.agent_id = ${agent_id}
+        AND ${agent_turns}.stream_key IS NOT NULL
+        AND ${agent_turns}.first_ingress_seq IS NOT NULL
+      RETURNING ${agent_turns}.id
+    `);
+    return Array.from(result.rows as unknown as Array<{ id: string }>).length === 1;
   },
 
   /**
@@ -1300,20 +1439,104 @@ export const agentTurnsRepo = {
 
 // ─── internals ───────────────────────────────────────────────────────────────
 
+/**
+ * #505 — aloca a PRÓXIMA sequência de ingresso da stream, dentro da transação
+ * do chamador.
+ *
+ * ─── Por que uma única declaração, e não read-modify-write ────────────────
+ *
+ * `SELECT max(ingress_seq)+1` seguido de `INSERT` é a forma intuitiva e está
+ * errada: dois produtores leem o mesmo máximo e alocam o mesmo número. Corrigir
+ * isso exigiria `SERIALIZABLE` (com o retry que ninguém escreve) ou um lock
+ * explícito sobre uma linha que talvez ainda não exista.
+ *
+ * `INSERT … ON CONFLICT DO UPDATE … RETURNING` resolve os dois casos numa
+ * declaração ATÔMICA:
+ *   - stream nova  -> a linha nasce com `last_ingress_seq = 1`;
+ *   - stream viva  -> o `DO UPDATE` incrementa sob o lock de linha, que o
+ *     Postgres já segura para fazer o próprio `ON CONFLICT`.
+ *
+ * Um segundo produtor na MESMA stream bloqueia no lock até esta transação
+ * terminar. Se ela COMITAR, ele lê o valor novo e soma 1 — monotônico, sem
+ * buraco. Se ela ABORTAR, ele lê o valor antigo e soma 1 — o número volta,
+ * que é exatamente o que faz uma reentrega não queimar sequência.
+ *
+ * Produtores em streams DIFERENTES não se encontram: linhas distintas, locks
+ * distintos. É isto que dá o paralelismo entre conversas que a issue exige sem
+ * nenhum lock global por tenant, agente ou fila.
+ *
+ * ─── Por que o WHERE do UPDATE repete tenant e agent ──────────────────────
+ *
+ * O `ON CONFLICT (tenant_id, agent_id, stream_key)` já garante que a linha
+ * atingida é a do escopo — mas o predicado adicional torna a invariante
+ * LEGÍVEL no lugar em que ela é aplicada, e sobrevive a uma futura mudança de
+ * índice de conflito. Custo zero: as colunas estão na PK.
+ */
+async function allocateIngressSeq(
+  tx: Executor,
+  stream: { stream_key: string; stream_key_version: number },
+): Promise<number> {
+  const { tenant_id, agent_id } = scope();
+  const result = await tx.execute<{ last_ingress_seq: string | number }>(sql`
+    INSERT INTO ${agent_stream_sequences}
+      (tenant_id, agent_id, stream_key, stream_key_version, last_ingress_seq)
+    VALUES (${tenant_id}, ${agent_id}, ${stream.stream_key}, ${stream.stream_key_version}, 1)
+    ON CONFLICT (tenant_id, agent_id, stream_key) DO UPDATE
+      SET last_ingress_seq = ${agent_stream_sequences}.last_ingress_seq + 1,
+          updated_at = now()
+      WHERE ${agent_stream_sequences}.tenant_id = ${tenant_id}
+        AND ${agent_stream_sequences}.agent_id = ${agent_id}
+    RETURNING last_ingress_seq
+  `);
+  const rows = Array.from(result.rows as unknown as Array<{ last_ingress_seq: string | number }>);
+  const raw = rows[0]?.last_ingress_seq;
+  const seq = typeof raw === 'string' ? Number(raw) : raw;
+  if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 1) {
+    // Inalcançável pelo caminho normal: o `RETURNING` de um UPSERT sempre
+    // devolve uma linha. Falha ALTO em vez de devolver um número inventado —
+    // uma sequência errada aqui é reordenação silenciosa lá na frente.
+    throw new Error(
+      `allocateIngressSeq: alocação de ingress_seq não devolveu sequência utilizável ` +
+        `(stream_key_version=${stream.stream_key_version})`,
+    );
+  }
+  return seq;
+}
+
 async function createTurnForMessage(
   tx: Executor,
   args: {
     mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>;
     deadline_at: Date | null;
+    /**
+     * #505 — a stream e a posição do ingresso representativo. Ausente para
+     * turnos criados fora do protocolo (backfill, rede de compatibilidade de
+     * uma row anterior à migration 118): nesses casos as colunas nascem NULL,
+     * que é a verdade — "este turno não tem ordem canônica" —, e nunca um zero
+     * ou uma stream inventada.
+     */
+    stream?: {
+      stream_key: string;
+      stream_key_version: number;
+      ingress_seq: number;
+    } | null;
   },
 ): Promise<AgentTurn> {
   const { mensagem } = args;
+  const stream = args.stream ?? null;
   const guarded = applyTenantGuard({
     conversa_id: mensagem.conversa_id ?? null,
     channel_id: mensagem.channel_id ?? null,
     representative_message_id: mensagem.id,
     status: 'received' as const,
     deadline_at: args.deadline_at,
+    // Turno SIMPLES: as duas fronteiras são o mesmo ingresso (§Relação entre
+    // ingressos e turnos: "Para turno simples: first_ingress_seq =
+    // last_ingress_seq"). A absorção do debounce estende `last` — nunca `first`.
+    stream_key: stream?.stream_key ?? null,
+    stream_key_version: stream?.stream_key_version ?? null,
+    first_ingress_seq: stream?.ingress_seq ?? null,
+    last_ingress_seq: stream?.ingress_seq ?? null,
   });
   const inserted = await tx
     .insert(agent_turns)

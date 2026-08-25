@@ -17,3 +17,9 @@ export * from './lifecycle.js';
 // limites de efeito). Exportado aqui porque `core.ts`, o dispatcher e o
 // outbound o consomem, e a regra da fachada é "importe sempre daqui".
 export * from './execution-context.js';
+// #505 — identidade de STREAM do ingresso. `stream-key` é a derivação PURA
+// (versionada, sem I/O); `stream-ingress` é a fronteira fail-closed que audita,
+// mede e recusa. O gateway consome `isStreamIdentityUnresolved` para derrubar o
+// ingresso com trilha em vez de deixá-lo virar erro opaco de listener.
+export * from './stream-key.js';
+export * from './stream-ingress.js';

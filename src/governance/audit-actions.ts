@@ -221,6 +221,23 @@ export const AUDIT_ACTIONS = [
   // exatamente o que a invariante nº 1 proíbe. A row carrega só o id do turno e
   // o motivo de vocabulário fechado — nada vindo do payload.
   'turn_job_scope_rejected',
+  // Issue #505 (fases 1–2, shadow) — identidade de STREAM no ingresso. Dois
+  // fatos, e só dois, entram em `audit_log`:
+  //   - `stream_ingress_rejected`: a plataforma RECUSOU uma mensagem de usuário
+  //     porque não soube a que conversa ela pertence. É a decisão governável por
+  //     excelência — alguém escreveu e não foi atendido —, e é a evidência de que
+  //     o sistema falhou FECHADO em vez de agrupar o ingresso numa stream
+  //     genérica (a `default` que a invariante MUST nº 8 proíbe).
+  //   - `stream_ingress_sequenced`: uma stream NASCEU (`ingress_seq = 1`). É o
+  //     marco a partir do qual a ordem daquela conversa passa a existir, com a
+  //     versão do algoritmo que a mintou. Ingressos subsequentes NÃO entram —
+  //     seriam uma row por mensagem, e a reconstrução de
+  //     `first_ingress_seq`/`last_ingress_seq` sai do log estruturado
+  //     `stream.ingress_sequenced`, que é onde ela pertence.
+  // Nenhuma das duas carrega texto, prompt, telefone ou JID: a `stream_key` é
+  // um hash e o motivo tem vocabulário fechado.
+  'stream_ingress_rejected',
+  'stream_ingress_sequenced',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

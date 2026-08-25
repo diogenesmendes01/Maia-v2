@@ -580,6 +580,21 @@ export async function absorbDebounceInputs(
         );
       }
     }
+    // #505 — o turno agregado passa a declarar o INTERVALO de ingressos que
+    // consumiu, não só o da mensagem representativa. Roda DEPOIS da absorção
+    // para que a fronteira reflita o batch já fechado. Só estende (LEAST/
+    // GREATEST) e só com ingressos da MESMA stream — ver
+    // `extendTurnStreamBoundaryTx`.
+    const extended = await agentTurnsRepo.extendTurnStreamBoundaryTx({
+      turn_id: handle.turn_id,
+      mensagem_ids,
+    });
+    if (extended) {
+      logger.debug(
+        { turn_id: handle.turn_id, absorbed: mensagem_ids.length },
+        'stream.turn_boundary_extended',
+      );
+    }
   });
 }
 
