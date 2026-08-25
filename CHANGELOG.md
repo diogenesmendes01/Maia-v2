@@ -47,6 +47,21 @@ existe** (aí não falta código, falta grant). Se a rota nova falhar ou lançar
 genérica assume: uma rota recém-introduzida não pode derrubar em silêncio o
 comportamento que já existia.
 
+**O guardrail afirma INVARIANTE, não delta** (correção pós-revisão). A primeira
+versão do teste fotografava o registro de tools antes e depois e comparava as
+duas fotos. Um delta sobre estado global e mutável não sobrevive ao `retry: 1`
+do vitest: a tentativa 1 ficava vermelha, a mutação persistia no objeto de
+módulo, e a tentativa 2 tomava o estrago como sua própria linha de base — delta
+zero, verde, `falharam=0`. O guardrail passou a afirmar três coisas ABSOLUTAS,
+verdadeiras ou falsas por si só em qualquer tentativa: nenhuma tool viva fora do
+catálogo committado (`src/admin-ui/generated/tool-catalog.ts`), o grant do
+agente exatamente como semeado, e zero capability criada. E a varredura de
+fonte deixou de ser `readdirSync` de uma pasta — ela agora percorre o GRAFO DE
+IMPORTS a partir dos call sites reais (gerar, disparar, **aprovar**), porque a
+fronteira do comportamento proibido não é um diretório: `proposal-approval-handler.ts`
+é precisamente o arquivo onde alguém escreveria "aprovou, então instala", e ele
+ficava de fora.
+
 **Fora de escopo desta fatia**, de propósito: agregação por similaridade
 ([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637)) e triagem no
 console ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638)).
@@ -59,6 +74,9 @@ console ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638)).
   `existing-tool.ts` (a tool já existe no `REGISTRY`?), `contract-draft.ts`
   (derivação dos campos) e `proposer.ts` (o call site).
 - `src/workers/gap-escalation-monitor.ts` — as duas rotas a partir de `proposed`.
+- `tests/helpers/grafo-de-imports.ts` — travessia de imports com fronteira
+  declarada, para que uma varredura estática não volte a mentir quando nascer um
+  arquivo novo fora da pasta.
 - `src/db/repositories/capability-repos.ts` — `capabilityGapObservationsRepo` e
   o registro da ocorrência junto ao upsert do gap.
 
