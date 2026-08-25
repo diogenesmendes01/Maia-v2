@@ -411,6 +411,13 @@ export const mensagens = pgTable('mensagens', {
   stream_key: text('stream_key'),
   stream_key_version: smallint('stream_key_version'),
   ingress_seq: bigint('ingress_seq', { mode: 'number' }),
+  // 135 (#635) — o ARTEFATO do outbox que esta row de histórico registra.
+  // É a CHAVE IDEMPOTENTE do histórico de saída: unique PARCIAL
+  // (tenant_id, agent_id, outbound_id) WHERE outbound_id IS NOT NULL. NULL =
+  // ingresso, histórico anterior a esta fatia, ou saída sem linha durável.
+  // Referência SOFT (sem FK) porque `outbound_messages` está sob retenção — ver
+  // migrations/135.
+  outbound_id: uuid('outbound_id'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
