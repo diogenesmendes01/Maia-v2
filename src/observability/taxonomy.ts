@@ -298,6 +298,41 @@ export const METRIC = {
    * ninguém faça essa pergunta.
    */
   STREAM_INGRESS_REJECTED: 'maia_stream_ingress_rejected_total',
+  /**
+   * Issue #628 (fatia E da #505) — QUANTAS mensagens um batch de debounce
+   * agrupou. Critério de pronto literal da issue ("`maia_stream_debounce_batch_size`
+   * publicada").
+   *
+   * HISTOGRAMA sem labels, e as duas coisas são decisão. Sem labels porque as
+   * dimensões que alguém quereria aqui — `stream_key`, `tenant`, `channel` —
+   * são exatamente as que a issue-mãe proíbe ou cuja cardinalidade cresce com o
+   * tráfego; a atribuição por tenant já é feita pela camada de política de
+   * `src/observability/metrics.ts`. Histograma (e não contador) porque a
+   * pergunta operacional é sobre a DISTRIBUIÇÃO: `_sum/_count` dá o tamanho
+   * médio do batch, e a cauda diz se existe conversa em que o debounce está
+   * agrupando demais.
+   *
+   * Baldes PRÓPRIOS (1,2,3,5,10,25,50), declarados via `registerHistogramBuckets`:
+   * os baldes padrão de `src/lib/metrics.ts` são de MILISSEGUNDOS, e com eles
+   * todo batch cairia em `le="50"`.
+   *
+   * A leitura que importa: 1 constante significa que o debounce não está
+   * agrupando nada (janela curta demais, ou tráfego que não é picotado) — a
+   * fatia estaria pagando escrita e varredura por nada.
+   */
+  STREAM_DEBOUNCE_BATCH_SIZE: 'maia_stream_debounce_batch_size',
+  /**
+   * Issue #628 — o DESFECHO de cada tentativa de fechar um batch. `result` tem
+   * cardinalidade FECHADA (`STREAM_DEBOUNCE_CLOSE_RESULTS`).
+   *
+   * É o par de `STREAM_DEBOUNCE_BATCH_SIZE`: a histograma só existe quando
+   * fechou, então sem esta série "o varredor não fecha nada" e "o varredor não
+   * roda" seriam o mesmo silêncio. `stream_locked` constante é contenção de
+   * ingresso; `lost_race` constante é mais varredor do que a fila precisa;
+   * `not_due` é o caso normal e saudável (o prazo esticou depois da
+   * enumeração).
+   */
+  STREAM_DEBOUNCE_CLOSE: 'maia_stream_debounce_close_total',
 
   // --- queue ---------------------------------------------------------------
   QUEUE_DEPTH: 'maia_queue_depth',
@@ -1141,6 +1176,29 @@ export const TURN_SCOPE_REJECTION_VALUES: readonly string[] = Object.freeze([
 export const STREAM_INGRESS_RESULT_VALUES: readonly string[] = Object.freeze([
   'resolved',
   'rejected',
+]);
+
+/**
+ * Issue #628 (fatia E da #505) — os cinco desfechos do label `result` de
+ * `METRIC.STREAM_DEBOUNCE_CLOSE`.
+ *
+ * Espelho EXATO de `DebounceCloseResult` (`src/db/repositories/turn-repos.ts`):
+ * `closed` mais os quatro motivos tipados de recusa. A igualdade é pinada por
+ * `tests/unit/runtime/stream-debounce-contract.spec.ts` — um quinto motivo de
+ * recusa não pode virar série sem passar por aqui, que é o momento de perguntar
+ * se ele é mesmo um fato novo.
+ *
+ * Nenhum deles é erro por si só. `not_due` e `stream_locked` são o protocolo
+ * funcionando (o prazo esticou; o ingresso está escrevendo). O que se lê é a
+ * FORMA: `closed` que para de crescer com janelas abertas acumulando é varredor
+ * morto; `stream_locked` que domina é contenção de ingresso.
+ */
+export const STREAM_DEBOUNCE_CLOSE_RESULTS: readonly string[] = Object.freeze([
+  'closed',
+  'stream_locked',
+  'no_window',
+  'not_due',
+  'lost_race',
 ]);
 
 /**

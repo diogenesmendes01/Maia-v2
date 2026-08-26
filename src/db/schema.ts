@@ -3506,6 +3506,24 @@ export const agent_turns = pgTable(
     // `queued_at`: a idade do head mede a espera real, não a última promoção.
     promoted_at: timestamp('promoted_at', { withTimezone: true }),
     promoted_by_turn_id: uuid('promoted_by_turn_id'),
+    // 130 (#628, fatia E) — a JANELA DE DEBOUNCE, como DADO. Antes daqui ela
+    // era um `setTimeout` da BullMQ mais uma chave no Redis, e por isso duas
+    // réplicas podiam fechar batches sobrepostos e um reinício perdia a janela
+    // inteira. As quatro colunas moram no turno-CABEÇA da stream porque a
+    // janela e o head-of-line são a mesma entidade: quem executa a rajada é o
+    // turno de menor `first_ingress_seq`, e é ele que absorve os irmãos.
+    //   * `debounce_window_opened_at` — âncora do teto `MESSAGE_DEBOUNCE_MAX_MS`;
+    //   * `debounce_deadline_at` — o RELÓGIO PERSISTENTE: fechar exige
+    //     `debounce_deadline_at <= now()` avaliado NO BANCO;
+    //   * `debounce_closed_at` — o fechamento ÚNICO, por compare-and-swap
+    //     (`WHERE debounce_closed_at IS NULL`);
+    //   * `debounce_batch_size` — a evidência forense da composição do batch.
+    // NULL em `debounce_deadline_at` = turno SEM janela (anterior à fatia,
+    // mídia, ou flag desligada).
+    debounce_window_opened_at: timestamp('debounce_window_opened_at', { withTimezone: true }),
+    debounce_deadline_at: timestamp('debounce_deadline_at', { withTimezone: true }),
+    debounce_closed_at: timestamp('debounce_closed_at', { withTimezone: true }),
+    debounce_batch_size: integer('debounce_batch_size'),
     queued_at: timestamp('queued_at', { withTimezone: true }),
     claimed_at: timestamp('claimed_at', { withTimezone: true }),
     started_at: timestamp('started_at', { withTimezone: true }),
@@ -3562,6 +3580,15 @@ export const agent_turns = pgTable(
       .where(
         sql`stream_key IS NOT NULL AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')`,
       ),
+    // #628 (migration 130): "quais streams têm janela de debounce VENCIDA?" —
+    // a pergunta do varredor, feita FORA de contexto de tenant (ele é um
+    // dispatcher: descobre os pares com trabalho ANTES de abrir contexto). Sem
+    // `tenant_id` no prefixo pela mesma razão de `leaseExpiryIdx`. O predicado
+    // deixa no índice só as janelas ABERTAS, que são dezenas — ele ENCOLHE
+    // quando o batch fecha, em vez de crescer com o tráfego.
+    debounceDueIdx: index('agent_turns_debounce_due_idx')
+      .on(t.debounce_deadline_at)
+      .where(sql`debounce_deadline_at IS NOT NULL AND debounce_closed_at IS NULL`),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),

@@ -1710,6 +1710,42 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_TURN_STREAM_DEBOUNCE: {
+    name: 'FEATURE_TURN_STREAM_DEBOUNCE',
+    description:
+      'DEBOUNCE TRANSACIONAL — a janela deixa de ser um timer em memória (issue #628, fatia E ' +
+      'da #505; fase 7 do rollout). EXIGE a migration 130 APLICADA (colunas debounce_*) e ' +
+      'FEATURE_TURN_HEAD_OF_LINE ligada — sem head-of-line um turno NÃO-cabeça pode ser ' +
+      'reivindicado, e o fechamento do batch precisaria de fence sobre cada irmão em vez de ' +
+      'poder confiar em que ninguém os executa. Default ON, e INERTE enquanto ' +
+      'FEATURE_MESSAGE_DEBOUNCE estiver OFF (o default do repositório): sem debounce não há ' +
+      'janela a tornar transacional. ' +
+      'ON: a janela é uma LINHA do PostgreSQL, aberta na MESMA transação que persiste o ' +
+      'ingresso e estendida na MESMA transação do ingresso seguinte; o prazo é comparado com ' +
+      'now() do BANCO (nunca Date.now() de réplica); o fechamento é compare-and-swap sob o ' +
+      'mutex da stream (a linha de agent_stream_sequences), então duas réplicas produzem um ' +
+      'fechamento e zero; o batch é o PREFIXO CONTÍGUO de ingressos a partir do head, de modo ' +
+      'que uma lacuna (mídia no meio da rajada) fecha o batch em vez de ser absorvida; e o ' +
+      'wake-up sai do Redis para o varredor stream_debounce_closer, que reencontra a janela ' +
+      'vencida depois de um reinício. ' +
+      'OFF é ROLLBACK: volta o debounce em memória (BullMQ atrasada + chave no Redis), com as ' +
+      'duas falhas conhecidas — réplicas podem fechar batches sobrepostos e um reinício perde ' +
+      'a janela. Nenhuma mensagem é perdida em nenhuma das posições; janelas já abertas e não ' +
+      'fechadas param de ser fechadas e os turnos voltam a ser rearmados pelo recovery por ' +
+      'estado (até STUCK_AFTER_MS), um turno por mensagem, em ordem. ' +
+      'Vigie maia_stream_debounce_batch_size (a distribuição do tamanho do batch) e ' +
+      'maia_stream_debounce_close_total{result} — `stream_locked` constante é contenção de ' +
+      'ingresso, `lost_race` constante é mais de um varredor do que a fila precisa. ' +
+      'Ver docs/runbooks/turn-state-machine.md §13.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_STRICT_TOOL_SCHEMAS: {
     name: 'FEATURE_STRICT_TOOL_SCHEMAS',
     description:

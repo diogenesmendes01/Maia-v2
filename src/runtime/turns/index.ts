@@ -28,3 +28,8 @@ export * from './stream-ingress.js';
 // recovery (`src/workers/message-recovery.ts`) é consumidor de primeira classe
 // da reconciliação, e a regra do barril é "importe sempre daqui".
 export * from './stream-promotion.js';
+// #628 — o FECHAMENTO do batch de debounce: a métrica, a auditoria
+// `stream_batch_closed` e o wake-up do head. Fica na fachada porque o varredor
+// (`src/workers/stream-debounce-closer.ts`) e o boot da observabilidade são
+// consumidores de primeira classe, e a regra do barril é "importe sempre daqui".
+export * from './stream-debounce.js';

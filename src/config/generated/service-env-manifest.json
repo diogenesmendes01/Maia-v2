@@ -824,6 +824,13 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_TURN_STREAM_DEBOUNCE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_STRICT_TOOL_SCHEMAS",
           "secret": false,
           "required": false,
@@ -1465,6 +1472,7 @@
             "FEATURE_TURN_STREAM_KEY",
             "FEATURE_TURN_HEAD_OF_LINE",
             "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
@@ -1658,6 +1666,7 @@
             "FEATURE_TURN_STREAM_KEY",
             "FEATURE_TURN_HEAD_OF_LINE",
             "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
@@ -1850,6 +1859,7 @@
             "FEATURE_TURN_STREAM_KEY",
             "FEATURE_TURN_HEAD_OF_LINE",
             "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",

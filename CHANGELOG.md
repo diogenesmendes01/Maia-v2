@@ -4,6 +4,105 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Debounce transacional: a janela sai da memória e vira uma linha ([#628](https://github.com/diogenesmendes01/Maia-v2/issues/628), fatia E de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 7 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `130` ANTES de subir o código.** Ela
+> **não é atômica** — usa `CREATE INDEX CONCURRENTLY`, portanto
+> `maia:no-transaction`, e o runner autocommita por statement. Se o índice
+> falhar, as colunas ficam: estado correto, só lento, e reaplicar conserta.
+> **Confira `pg_index.indisvalid` à mão** depois de aplicar (a armadilha do
+> `CONCURRENTLY` que devolve sucesso com o índice inválido — runbook §10.4).
+> Subir o código antes da migration quebra todo ingresso de texto: a janela é
+> aberta dentro da transação que persiste a mensagem.
+
+**O problema.** A janela do debounce vivia em dois lugares que não são o banco:
+um job atrasado da BullMQ (o prazo no `delay`) e uma chave no Redis (o
+`first_enqueued_at`). Duas consequências, as duas nomeadas pela issue:
+
+* com N réplicas, duas podiam fechar **o mesmo batch — ou batches sobrepostos**,
+  porque não havia um ponto único onde "este batch fechou" pudesse ser afirmado
+  uma vez só. O sintoma é duas respostas para a mesma rajada, ou uma resposta que
+  ignora metade das mensagens; nenhuma linha do banco fica inconsistente;
+* um **reinício** entre o `agentQueue.add` e o disparo perdia a janela inteira.
+  As mensagens não se perdiam — o recovery por estado as rearmava —, mas saíam
+  como N turnos separados, até 2 minutos depois.
+
+**A janela como dado.** `agent_turns.debounce_window_opened_at` (âncora do teto,
+persistida), `debounce_deadline_at` (o prazo), `debounce_closed_at` (o
+fechamento) e `debounce_batch_size` (a evidência forense da composição). Ela é
+**aberta na MESMA transação que persiste o ingresso** e estendida na MESMA
+transação do ingresso seguinte: quando o commit acontece, a mensagem, o turno e o
+prazo em que a rajada dela pode fechar passam a existir juntos, ou nenhum existe.
+
+**O relógio é o do PostgreSQL.** Fechar exige `debounce_deadline_at <= now()`
+avaliado no banco, nunca um `Date.now()` de réplica — o mesmo raciocínio de
+`lease_expires_at > now()` no fence do claim (#504): existe um relógio só. O teto
+(`MESSAGE_DEBOUNCE_MAX_MS`) é ancorado no instante **persistido** da abertura, e é
+o que o faz sobreviver ao reinício do processo que abriu a janela.
+
+**A BORDA — o risco que a issue-mãe declarava.** *"Debounce distribuído é
+suscetível a bordas temporais mal definidas."* A borda escolhida está escrita em
+`src/db/repositories/stream-debounce-sql.ts`, e é de **serialização**, não de
+relógio: o mutex da stream é a linha de `agent_stream_sequences` — a MESMA que a
+alocação de `ingress_seq` já tranca —, então **um ingresso que comita antes de o
+fechador pegar o mutex entra no batch atual; um que comita depois entra no
+próximo.** Não existe instante em que o fechador enxergue a sequência 7 sem a 6:
+a lacuna que a issue proíbe absorver silenciosamente é **impossível**, e não
+apenas improvável.
+
+E o batch é um **prefixo contíguo**, nunca um conjunto esparso: mídia no meio da
+rajada não é membro, abre lacuna numérica e **fecha o batch antes dela**. "M1
+texto, M2 áudio, M3 texto" produz o batch `{M1}`; absorver M3 por cima do áudio
+responderia a terceira mensagem antes da segunda.
+
+**Fechamento único, e o que realmente o carrega.** Duas réplicas sobre a mesma
+stream: uma pega o mutex e a outra sai com `stream_locked`. Sequencialmente, um
+head já fechado sai do conjunto de membros e a segunda tentativa devolve
+`no_window`. O `debounce_closed_at IS NULL` do UPDATE e o CAS por `state_version`
+ficam como **defesa em profundidade** — medido por sonda: removendo qualquer um
+deles sozinho a suíte continua verde; removendo-os junto com a condição do
+conjunto de membros, um segundo fechamento passa e reescreve
+`debounce_batch_size` para 1.
+
+**Uma transação, seis escritas.** Fechar o head, enfileirá-lo, estender a
+fronteira `last_ingress_seq`, marcar os irmãos `superseded`/`merged_into_turn` e
+**reancorar os inputs deles no head** acontecem juntos ou não acontecem. A
+reancoragem é o que faz o batch virar um **fato do banco**, legível pelo executor
+— que roda em outro processo e outro instante — em vez de ser redescoberto em
+memória por telefone e `created_at`, que é uma segunda definição de batch e
+diverge da primeira no dia em que uma mensagem chega entre o fechamento e a
+execução.
+
+**"Fechamento comitado, wake-up não enviado".** O head fechado carimba
+`promoted_at` — a MESMA coluna da fatia D —, então o varredor de
+`message-recovery` reconcilia pelo caminho que já existe e já é medido
+(`maia_stream_promotion_total{result="recovered"}`). Duas reconciliações com o
+mesmo modo de falha é como uma delas fica sem manutenção.
+
+**O varredor.** `stream_debounce_closer` (cron 1/min, drena ~50s sondando a cada
+500ms — o mesmo padrão de `outbox_drain` e `playground_turn_drain`) substitui o
+job atrasado. É um dispatcher cross-tenant e **não decide nada**: pergunta ao
+banco quais janelas venceram e manda fechar. Duas instâncias não produzem batch
+sobreposto; uma instância que morre não perde janela nenhuma.
+
+**Observabilidade.** `maia_stream_debounce_batch_size` (histograma com baldes
+PRÓPRIOS — 1, 2, 3, 5, 10, 25, 50 —, porque os baldes padrão são de
+milissegundos e todo batch cairia em `le="50"`) e
+`maia_stream_debounce_close_total{result}` com vocabulário fechado
+(`closed`/`stream_locked`/`no_window`/`not_due`/`lost_race`). Auditoria
+`stream_batch_closed` com `batch_size` e `absorbed_turn_ids` — é a resposta para
+"por que a Maia respondeu três mensagens minhas de uma vez?". Nenhum label
+carrega `stream_key`, `turn_id` ou telefone.
+
+**Flag e rollback.** `FEATURE_TURN_STREAM_DEBOUNCE` (default ON), **inerte**
+enquanto `FEATURE_MESSAGE_DEBOUNCE` estiver OFF — o default do repositório —,
+porque sem debounce não há janela a tornar transacional. Exige
+`FEATURE_TURN_HEAD_OF_LINE`, e a dependência é de **segurança**: o fechamento
+marca os irmãos `superseded` sem fence, e só pode porque um turno que não é o
+head é inclaimável. OFF volta o debounce em memória, com as duas falhas de cima;
+nenhuma mensagem é perdida em nenhuma das posições. Ver
+[runbook §13](docs/runbooks/turn-state-machine.md).
+
 ### Promoção do sucessor: o head que termina destrava a conversa ([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627), fatia D de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
 
 > **AÇÃO DO OPERADOR: aplique a migration `127` ANTES de subir o código.** Ela é
