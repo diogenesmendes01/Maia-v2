@@ -51,6 +51,12 @@ export type TurnContextSection =
   | 'hints'
   | 'capabilities'
   | 'gaps'
+  // #638 (fatia C da épica #471) — o aviso de capacidade recém-adquirida. NÃO
+  // é uma seção carregada: ela sai da MESMA leitura de `gaps`. O rótulo existe
+  // porque o corte do orçamento é reportado por seção, e um corte aqui
+  // atribuído a `gaps` faria o painel dizer que limitações foram descartadas
+  // quando o que foi cortado é o oposto.
+  | 'capacidades_novas'
   | 'role'
   | 'procedure';
 

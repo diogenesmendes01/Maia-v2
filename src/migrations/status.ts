@@ -14,7 +14,9 @@
  */
 import { compareMigrationIds } from './discover.js';
 import { shortChecksum } from './checksum.js';
+import { invalidIndexBlockers } from './invalid-indexes.js';
 import type {
+  InvalidIndex,
   LedgerEntry,
   MigrationArtifact,
   MigrationCompatibilityManifest,
@@ -37,6 +39,13 @@ export interface ComputeStatusOptions {
    * Read-only callers (status, doctor, readiness) MUST leave this false.
    */
   readonly lockHeld?: boolean;
+  /**
+   * Índices `indisvalid = false` lidos do catálogo (#658). Omitido = `[]`, que
+   * significa "não consultado", NÃO "verificado e limpo" — esta função é pura e
+   * não pode consultar nada. Quem consulta é `readInvalidIndexes`, e todo
+   * caminho que fala com um banco (`readiness.ts`, `runner.ts`) o passa.
+   */
+  readonly invalidIndexes?: readonly InvalidIndex[];
 }
 
 /** States that make an entry block `up` and keep the schema out of readiness. */
@@ -157,6 +166,7 @@ export function computeMigrationStatus(
     out_of_order: outOfOrder,
     counts,
     problems: artifact.problems,
+    invalid_indexes: options.invalidIndexes ?? [],
   };
 }
 
@@ -232,11 +242,17 @@ export interface ReadinessOptions {
  * Blocking rules, in evaluation order:
  *
  *   1. the ledger itself is absent or unreadable ⇒ `unknown` (never `ready`);
- *   2. any entry in a blocking state (dirty, running, orphaned, checksum
+ *   2. any INVALID index in scope (#658) — `pg_index.indisvalid = false`. A
+ *      partial unique index is an EXCLUSION mechanism here, not an
+ *      optimisation, so an invalid one means the invariant does not exist,
+ *      whatever the ledger says about the migration that should have created
+ *      it. Listed first because when it coexists with a `dirty` row it is the
+ *      cause, not the consequence;
+ *   3. any entry in a blocking state (dirty, running, orphaned, checksum
  *      mismatch/unknown, missing file);
- *   3. the schema is BELOW the minimum this build supports — i.e. some
+ *   4. the schema is BELOW the minimum this build supports — i.e. some
  *      migration at or before `min_supported_migration` is not applied;
- *   4. the schema is ABOVE `max_supported_migration`, when the build declares
+ *   5. the schema is ABOVE `max_supported_migration`, when the build declares
  *      a ceiling.
  *
  * Artifact integrity problems (a forward migration without its `_down`
@@ -275,7 +291,12 @@ export function evaluateSchemaReadiness(
     };
   }
 
-  const blockers: SchemaBlocker[] = [];
+  // Primeiro os índices inválidos (#658): quando coexistem com um `dirty` eles
+  // são a CAUSA, não a consequência — reparar a linha do ledger antes de tratar
+  // o índice deixa a invariante de exclusão ausente com o ledger dizendo
+  // "aplicada". `reason` é o primeiro blocker, e é este que o operador precisa
+  // ler primeiro.
+  const blockers: SchemaBlocker[] = invalidIndexBlockers(status.invalid_indexes);
   for (const entry of status.entries) {
     if (!entry.blocking) continue;
     const blocker = describeBlocker(entry);

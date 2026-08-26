@@ -1456,9 +1456,290 @@ export const agent_capability_gaps = pgTable(
       .notNull()
       .defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // #638 (fatia C da épica #471) — o gap FECHA a partir do estado real da
+    // capability, nunca de uma marcação no console. O único escritor de
+    // produção é `src/cognition/tool-request/closure.ts`, e ele só escreve
+    // quando a tool existe no registro committado E está concedida a este
+    // tenant+agent. `resolved_reason` é NOT NULL exatamente quando
+    // `resolved_at` é (CHECK da migração 132): fechar sem motivo registrado é
+    // fechar por ninguém.
+    //
+    // O nível NÃO é usado para fechar: um gap resolvido rebaixado para
+    // 'silent' seria indistinguível de um que nunca subiu, e apagaria a
+    // história da escalada — a evidência que justificou o pedido.
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    resolved_reason: text('resolved_reason'),
+    resolved_tool_name: text('resolved_tool_name'),
   },
   (t) => ({
     levelIdx: index('caps_gaps_level_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    // Índices PARCIAIS na DB (WHERE resolved_at IS NULL / IS NOT NULL);
+    // Drizzle não expressa o WHERE, então aqui eles aparecem como comuns.
+    abertosIdx: index('caps_gaps_abertos_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    resolvidosIdx: index('caps_gaps_resolvidos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.resolved_at,
+    ),
+  }),
+);
+
+// #636 (fatia A da épica #471) — `agent_capability_gap_observations`: o LEDGER
+// de ocorrências do gap, uma linha por vez em que o agente esbarrou nele.
+//
+// Por que existe, dado que `agent_capability_gaps.frequency_score` já conta:
+// um contador responde "quantas vezes" e NADA mais. O pedido de ferramenta
+// precisa de "em que JANELA" e "em QUAIS situações reais" — e as duas só saem
+// de linhas com timestamp e com o link do turno (`root_trace_id`, o mesmo id
+// que `runtime_trace_envelopes` agrupa por tentativa). Um contador não guarda
+// nem uma nem outra.
+//
+// `attempted_args`/`expected_output` são a EVIDÊNCIA de onde o rascunho de
+// contrato Zod deriva seus inputs/outputs. `{}` significa "não observado", e o
+// rascunho declara isso (`completeness:'name_only'`) em vez de imaginar campos.
+//
+// Sem FK para `runtime_trace_envelopes` de propósito — ver o cabeçalho da
+// migração 125: o envelope é sujeito a retenção e some antes da observação. A
+// integridade é verificada na LEITURA, escopada por tenant+agent.
+export const agent_capability_gap_observations = pgTable(
+  'agent_capability_gap_observations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    intent: text('intent').notNull(),
+    detail: text('detail'),
+    conversa_id: uuid('conversa_id'),
+    root_trace_id: uuid('root_trace_id'),
+    trace_id: uuid('trace_id'),
+    attempted_args: jsonb('attempted_args').notNull().default(sql`'{}'::jsonb`),
+    expected_output: jsonb('expected_output').notNull().default(sql`'{}'::jsonb`),
+    observed_at: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeGapIdx: index('gap_observations_scope_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+      t.observed_at,
+    ),
+    // Índice PARCIAL na DB (WHERE root_trace_id IS NOT NULL); Drizzle não
+    // expressa o WHERE, então aqui ele aparece como índice comum — mesma
+    // ressalva do `agent_drift_unresolved_idx`.
+    rootTraceIdx: index('gap_observations_root_trace_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.root_trace_id,
+    ),
+  }),
+);
+
+// #637 (fatia B da épica #471) — `tool_request_aggregates`: N pedidos de
+// ferramenta parecidos, vistos como UM pedido com contador.
+//
+// O escopo é `tenant_id` + `agent_id`, sem exceção e sem contador global — a
+// justificativa está no cabeçalho da migração 129 e em
+// `src/cognition/tool-request/aggregation.ts`.
+//
+// `metrica`, `limiar` e `assinatura_version` moram na LINHA porque um
+// agrupamento é uma decisão automática sobre dado de governança: sem o número
+// que a justificou, ninguém consegue dizer depois se ela era certa sob a regra
+// vigente na época.
+export const tool_request_aggregates = pgTable(
+  'tool_request_aggregates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    representative_proposal_id: uuid('representative_proposal_id').notNull(),
+    representative_gap_id: uuid('representative_gap_id').notNull(),
+    proposed_tool_name: text('proposed_tool_name').notNull(),
+    nomes_propostos: jsonb('nomes_propostos').notNull().default(sql`'[]'::jsonb`),
+    member_count: integer('member_count').notNull().default(0),
+    total_occurrences: integer('total_occurrences').notNull().default(0),
+    // 'single' | 'consistent' | 'divergent' — ver `draft-merge.ts`.
+    contract_state: text('contract_state').notNull(),
+    // NULO exatamente quando `contract_state = 'divergent'`; o CHECK
+    // `tool_request_aggregates_divergent_has_no_draft` (migração 129) impede
+    // que os dois se separem.
+    merged_contract_draft: jsonb('merged_contract_draft'),
+    contract_conflicts: jsonb('contract_conflicts').notNull().default(sql`'[]'::jsonb`),
+    first_member_at: timestamp('first_member_at', { withTimezone: true }).notNull().defaultNow(),
+    last_member_at: timestamp('last_member_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    demandaIdx: index('tool_request_aggregates_scope_demand_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.member_count,
+      t.last_member_at,
+    ),
+    assinaturaIdx: index('tool_request_aggregates_scope_signature_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.assinatura_version,
+    ),
+    representanteUnico: unique('tool_request_aggregates_representative_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.representative_proposal_id,
+    ),
+  }),
+);
+
+// #637 — `tool_request_aggregate_members`: o ledger APPEND-ONLY do agrupamento.
+//
+// `proposal_id` é NULO para todo membro que não é o representante: ele nunca
+// gerou linha em `capability_proposals`, e é isso que faz N pedidos virarem 1.
+// A evidência dele não se perde — `original_spec` guarda o `proposed_spec`
+// INTEIRO como ele entrou (situações com link de trace, janela de frequência e
+// o rascunho de contrato original).
+//
+// Sair do agregado é `detached_at`, NUNCA `DELETE`: é assim que a fusão é
+// reversível sem apagar a evidência do pedido original.
+export const tool_request_aggregate_members = pgTable(
+  'tool_request_aggregate_members',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    proposal_id: uuid('proposal_id'),
+    is_representative: boolean('is_representative').notNull().default(false),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    similaridade: numeric('similaridade', { precision: 5, scale: 4 }).notNull(),
+    intent: text('intent').notNull(),
+    occurrences: integer('occurrences').notNull().default(0),
+    original_spec: jsonb('original_spec').notNull(),
+    joined_at: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
+    detached_at: timestamp('detached_at', { withTimezone: true }),
+    detached_reason: text('detached_reason'),
+    detached_by: text('detached_by'),
+  },
+  (t) => ({
+    // Índice PARCIAL na DB (WHERE detached_at IS NULL); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `gap_observations_root_trace_idx`.
+    ativosIdx: index('tool_request_aggregate_members_ativos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.joined_at,
+    ),
+    gapIdx: index('tool_request_aggregate_members_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+    ),
+    gapUnico: unique('tool_request_aggregate_members_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.gap_id,
+    ),
+  }),
+);
+
+// #638 (fatia C da épica #471) — `tool_request_issues`: a RESERVA que torna o
+// aceite idempotente ANTES de a chamada externa sair.
+//
+// Abrir issue no GitHub é irreversível do lado de fora. Por isso o aceite não
+// começa pela chamada: ele começa por esta linha, cuja UNIQUE
+// (tenant_id, agent_id, aggregate_id) faz o segundo clique perder a corrida NO
+// BANCO. `idempotency_key` é determinística, viaja no CORPO da issue como
+// marcador, e é o que permite ADOTAR uma issue já aberta quando o processo
+// morreu entre a chamada e o registro do resultado.
+//
+// NENHUMA coluna de credencial, de propósito: o token do GitHub existe só na
+// configuração do serviço `runtime`, e o `admin-ui` — que serve o botão
+// "aceitar" — não tem essa variável no seu subset.
+export const tool_request_issues = pgTable(
+  'tool_request_issues',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    idempotency_key: text('idempotency_key').notNull(),
+    repo_slug: text('repo_slug').notNull(),
+    // 'pending' | 'created' | 'failed'
+    status: text('status').notNull().default('pending'),
+    title: text('title').notNull(),
+    /** O corpo COMO O DONO ACEITOU. O relayer envia isto, não uma remontagem. */
+    body: text('body').notNull(),
+    issue_number: integer('issue_number'),
+    issue_url: text('issue_url'),
+    adopted: boolean('adopted').notNull().default(false),
+    accepted_by: text('accepted_by').notNull(),
+    accepted_at: timestamp('accepted_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+    last_error: text('last_error'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_issues_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.accepted_at,
+    ),
+    // Índice PARCIAL na DB (WHERE status = 'pending'); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `tool_request_aggregate_members_ativos_idx`.
+    pendentesIdx: index('tool_request_issues_pendentes_idx').on(t.status, t.last_attempt_at),
+    agregadoUnico: unique('tool_request_issues_aggregate_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+    ),
+    chaveUnica: unique('tool_request_issues_key_unique').on(t.idempotency_key),
+  }),
+);
+
+// #638 — `tool_request_notifications`: o aviso ao agente guardado como FATO.
+//
+// "O agente é notificado" precisa ser verificável depois do turno em que
+// aconteceu. Esta linha é o registro: qual tool, por causa de qual gap e de
+// qual agregado, com que evidência de disponibilidade, e quando. A UNIQUE por
+// gap existe porque o monitor roda em cron — sem ela, cada passada reavisaria.
+export const tool_request_notifications = pgTable(
+  'tool_request_notifications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    /** NULO quando o pedido nunca teve agregado (`sem_assinatura`, fatia B). */
+    aggregate_id: uuid('aggregate_id'),
+    tool_name: text('tool_name').notNull(),
+    evidencia: jsonb('evidencia').notNull().default(sql`'{}'::jsonb`),
+    notified_at: timestamp('notified_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_notifications_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.notified_at,
+    ),
+    gapUnico: unique('tool_request_notifications_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+    ),
   }),
 );
 
@@ -2544,6 +2825,19 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
+export type AgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferSelect;
+export type NewAgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferInsert;
+export type ToolRequestAggregate = typeof tool_request_aggregates.$inferSelect;
+export type NewToolRequestAggregate = typeof tool_request_aggregates.$inferInsert;
+export type ToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferSelect;
+export type NewToolRequestAggregateMember =
+  typeof tool_request_aggregate_members.$inferInsert;
+export type ToolRequestIssue = typeof tool_request_issues.$inferSelect;
+export type NewToolRequestIssue = typeof tool_request_issues.$inferInsert;
+export type ToolRequestNotification = typeof tool_request_notifications.$inferSelect;
+export type NewToolRequestNotification = typeof tool_request_notifications.$inferInsert;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;

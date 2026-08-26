@@ -469,12 +469,321 @@ agent_turns_stream_active_uq` (ou o `_down` da `124`, que é esse mesmo
 statement) devolve o claim ao comportamento de #504 na primeira tentativa
 seguinte. Nenhuma linha muda de estado, nenhuma coluna é apagada, o escalonador
 não é revertido — foi para isso que a fatia foi separada.
+### Fixed — migration com índice `CONCURRENTLY` inválido deixa de ser marcada como aplicada ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658))
+
+**O defeito, medido contra o Postgres 16.** `CREATE UNIQUE INDEX CONCURRENTLY`
+que reprova — por duplicata pré-existente, deadlock ou cancelamento — **não
+desaparece**: o índice fica no catálogo com `pg_index.indisvalid = false`. E o
+`IF NOT EXISTS` da tentativa seguinte o enxerga, pula a criação e devolve
+sucesso:
+
+```
+1a tentativa:  ERROR: could not create unique index "t_k_uq"
+catálogo:      t_k_uq | indisvalid = f
+2a tentativa:  NOTICE: relation "t_k_uq" already exists, skipping
+               CREATE INDEX          ← exit 0
+catálogo:      t_k_uq | indisvalid = f     ← continua inválido
+```
+
+O runner lia exit 0 e gravava `applied`. Como aqui índice único parcial é
+**mecanismo de exclusão** e não otimização (`agent_turns_stream_active_uq` e
+afins), o resultado era a exclusão mútua **não existir** com o ledger dizendo
+"aplicada" — a mesma classe de defeito que a épica
+[#505](https://github.com/diogenesmendes01/Maia-v2/issues/505) existe para
+eliminar.
+
+**A correção** é uma invariante ABSOLUTA — "nenhum índice inválido no escopo" —,
+não um diff de `pg_index` antes/depois (delta é vazio justamente na
+reaplicação, que é o caso perigoso). Ela é asserida em dois pontos:
+
+- **pré-voo**, antes de qualquer DDL: um índice inválido produz o blocker
+  `invalid_index` e o `up` sai `blocked` sem enviar statement nenhum. É o que
+  fecha a reaplicação — e ela sobrevive inclusive a um `repair --as pending`,
+  porque limpar a linha do ledger não conserta o catálogo;
+- **na hora de escrever `applied`** (modos `self`/`none`): a migration vira
+  `dirty` com `error_class = MIGRATION_INVALID_INDEX`, mesmo tendo terminado
+  sem levantar erro. É o caso do operador que roda DDL concorrente à mão numa
+  sessão paralela enquanto o job de migration está em voo.
+
+Como o pré-estado é provadamente vazio, qualquer índice inválido encontrado
+depois nasceu naquela migration: atribuição por invariante, sem parser de SQL.
+
+**O que o operador vê.** `MigrationStatusReport` passa a carregar
+`invalid_indexes`; `getSchemaReadiness()` responde `blocked` com o índice
+nomeado e o remédio no texto; e o boot morre com **exit 98** — código novo,
+à frente do 90 na precedência, porque quando os dois aparecem juntos o índice
+inválido é a CAUSA e o `dirty` é a consequência. Remédio completo (`DROP INDEX
+CONCURRENTLY` → resolver a duplicata → reaplicar) em
+[`docs/runbooks/migrations.md`](docs/runbooks/migrations.md#índice-inválido-deixado-por-ddl-concurrently);
+tabela de exit codes em
+[`docs/runbooks/operational.md` §8.1](docs/runbooks/operational.md).
+
+Efeito colateral declarado: o caminho de leitura de `getSchemaReadiness()`
+passou de duas para três consultas, então o teto por statement do `maia doctor`
+caiu de 4s para 3s (3 × 3s = 9s < 10s de deadline), agora travado contra a
+contagem real de statements em vez de um `2` literal.
+### Added — a triagem no console fecha o ciclo: aceitar → issue → tool registrada → gap fechado ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638), fatia C de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471) — fecha a épica)
+
+**O que faltava.** A fatia A (#636) fez o gap recorrente virar pedido
+estruturado; a fatia B (#637) fez N pedidos parecidos virarem UM com contador.
+Nas duas, o pedido morria no backlog: ninguém decidia nada sobre ele, e nada
+acontecia quando a ferramenta finalmente existia. A tela que havia (`#476`)
+montava o corpo de uma issue **no navegador** e abria um link para
+`issues/new?...` — sem idempotência (dois cliques, duas abas), duplicando lógica
+de backend (um `slugify` próprio que não é o `esbocarNomeDeTool` da fatia A) e
+mostrando o GAP em vez do PEDIDO AGRUPADO.
+
+**O que passa a existir.** `tool_request_issues` (a reserva do aceite),
+`resolved_at`/`resolved_reason`/`resolved_tool_name` em `agent_capability_gaps`
+(o fechamento) e `tool_request_notifications` (o aviso ao agente) — migração
+132. No console, o router `toolRequests` com `list` / `detail` / `aceitar` /
+`desagrupar`. No runtime, dois workers: o relayer que abre a issue (a cada 5
+min) e o monitor que fecha o gap (de hora em hora).
+
+**Aceitar duas vezes cria UMA issue, e a decisão é do banco.** Não é um `if` que
+consulta antes de inserir — essa janela é exatamente onde dois cliques rápidos
+caem. É a UNIQUE `(tenant_id, agent_id, aggregate_id)` com
+`ON CONFLICT DO NOTHING`: o segundo aceite não colhe linha, lê a existente e
+devolve `ja_aceito`, auditado como `tool_request_accept_duplicado` — um aceite
+sem efeito não pode ser indistinguível de um aceite que nunca chegou.
+
+**A chave de idempotência viaja no corpo da issue.** `sha256` truncado de
+`maia.tool_request.v1|tenant|agent|aggregate`, determinística e reproduzível.
+Ela estende a idempotência para além do banco: se o processo morrer entre a
+chamada externa ter sucedido e o resultado ser gravado, o relayer **encontra** a
+issue pelo marcador e a ADOTA (`adopted = true`) em vez de abrir a segunda.
+Limitação declarada: a busca pagina no máximo 5 × 100 issues com o label da
+triagem; o caminho normal não depende disso (é a UNIQUE que o serve), só a
+janela de crash.
+
+**O corpo da issue é escrito supondo que a issue é pública.** Fora dele, de
+propósito: `tenant_id`/`agent_id` em texto claro (a correlação é o hash) e o
+texto livre de cada situação, que sai de turno real e pode carregar nome, valor
+ou assunto do interlocutor — o corpo diz onde lê-las (o console, atrás de
+autenticação). É a mesma decisão de privacidade que a fatia A tomou para
+`attempted_args`, levada até o fim. Consequência aceita: a issue sozinha não
+reconstrói o caso de uso em detalhe; ela permite DECIDIR.
+
+**A credencial do GitHub não existe no processo que serve o botão.**
+`MAIA_TOOL_REQUEST_GITHUB_TOKEN` é declarado com `services: ['runtime']`, e o
+Admin UI valida o próprio subset no boot — o token não é lido, não é tipado e
+não existe lá. O DESTINO (`MAIA_TOOL_REQUEST_ISSUE_REPO`) é lido pelos dois,
+porque o dono precisa ver para onde a issue vai antes de aceitar. O preço é uma
+indireção (aceitar reserva; o relayer abre em até 5 min); o ganho é que a
+separação é estrutural, não disciplina.
+
+**O gap fecha por FATO, nunca por caixa marcada.** `resolved_at` só é escrito
+quando a tool é chave viva do registro **e** está no conjunto que o grant
+daquele tenant/agent deriva. O casamento de nome é a MESMA função da fatia A
+(`encontrarToolExistente`), na direção oposta. Nenhuma rota do console escreve
+essas colunas, e o teste arquitetural do console proíbe `resolverGap(` e
+`resolved_at:` em todo o caminho da triagem. Consequência aceita e escrita: uma
+ferramenta implementada com nome que não aparece no texto do gap nem entre os
+nomes propostos **não** fecha sozinha — o erro cai do lado barato.
+
+**O agente é avisado, e o aviso custa zero ida a mais ao banco.** O gap resolvido
+sai do bloco de limitações (ele parava de dizer "não consigo" só por isso) e
+entra num bloco novo, `## Capacidades novas`, que diz qual ferramenta passou a
+existir. Os dois blocos saem da MESMA leitura
+(`capabilityGapsRepo.listParaOTurno`), no caminho mais quente do sistema. O que
+isso NÃO é: recibo de entrega por turno — o que é auditável é a EMISSÃO
+(`tool_request_agent_notified`); que o prompt carrega o aviso é provado por
+teste sobre o `buildPrompt` de produção.
+
+**O guardrail continua inegociável.** *O agente especifica; humano implementa e
+instala.* Não há botão "aprovar e instalar". Aceitar cria uma issue e nada mais.
+Além da invariante de runtime do #636 (agora rodada também depois de ACEITAR e
+de FECHAR), a fatia traz uma varredura estática **do console**, derivada do
+grafo de imports a partir do router real — a do #636 não cobria isso, porque
+`admin-ui/` é barreira lá (o console legitimamente edita grants em outras
+telas).
+
+**Reversibilidade.** `desagrupar` expõe no console a ação da fatia B:
+`detached_at` + motivo + autor, nunca `DELETE`; o `original_spec` do membro
+continua legível e o contador é recalculado a partir dos ativos.
+
+**Auditoria.** `tool_request_accepted`, `tool_request_accept_duplicado`,
+`tool_request_issue_created` (com `adopted`), `tool_request_issue_failed` (só
+falha TERMINAL — auditar cada retentativa de um 500 transitório viraria log de
+rede), `tool_request_gap_closed` e `tool_request_agent_notified`. As três
+primeiras carregam `instalou_tool: false` / `concedeu_capability: false` na
+própria linha.
+
+### Added — N pedidos de ferramenta parecidos viram UM pedido com contador ([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637), fatia B de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** A fatia A (#636) faz cada gap recorrente de tool
+virar UMA proposta. Nada nela sabe que dois gaps diferentes podem ser o MESMO
+pedido dito com outras palavras — então o backlog acumularia duplicatas em que
+nenhum item carrega o peso da demanda real: cinco pedidos de duas ocorrências,
+em vez de um pedido de dez.
+
+**O que passa a existir.** `tool_request_aggregates` (UM pedido, com contador) e
+`tool_request_aggregate_members` (o ledger append-only de quem entrou, com que
+número e quando), ambos escopados por `tenant_id + agent_id`. A decisão de
+agregar acontece **antes** de criar a proposta: um pedido que se funde NÃO vira
+linha em `capability_proposals` — é esse o "N vira 1".
+
+**O limiar tem medição, não gosto.** Métrica `dice_token_v1` (coeficiente de
+Dice sobre os tokens de conteúdo da descrição do gap), limiar **0,85**, escolhido
+pela regra escrita antes do número: *o menor θ da grade de 0,05 com zero falsas
+fusões no conjunto negativo real*. O conjunto negativo tem rótulo REAL — os 2080
+pares de tools distintas do catálogo committado, que são 65 coisas que este
+projeto já decidiu que merecem implementações separadas. Em 0,80 ainda há uma
+falsa fusão (`save_fact` × `save_rule`, 0,833); em 0,90 não há segurança a mais
+e há 10 pontos de recall a menos. Reproduzir:
+`npx tsx scripts/medir-limiar-tool-request.ts`. O número é mantido honesto por
+`tests/unit/tool-request-limiar-medicao.spec.ts`, que reroda a medição contra o
+catálogo VIVO — uma tool nova que empurre o pior par negativo acima de 0,85 fica
+VERMELHA no CI em vez de virar agrupamento errado em produção.
+
+**O que a medição NÃO prova, dito aqui e não só no código.** O conjunto positivo
+é SINTÉTICO (325 paráfrases por cinco transformações committadas), porque não
+existe no repositório um par de gaps rotulado como "mesmo pedido" — o ledger de
+ocorrências nasceu na fatia A e está vazio em todo ambiente. E há a limitação
+herdada: enquanto `completeness` for `'name_only'`, a assinatura sai de uma frase
+curta, e Dice sobre conjuntos pequenos é grosso — a 0,85, duas descrições de 4–5
+tokens só fundem se o conjunto de tokens for IGUAL. Na prática, HOJE o contador
+sobe para repetição quase literal. Quando os rascunhos ficarem ricos, o limiar
+**não vale como está**; por isso a assinatura é versionada e a versão é
+persistida por agregado e por membro.
+
+**A política de fusão de rascunhos: nenhum vence, nunca.** Compatíveis → UNIÃO
+(nenhum campo descartado, `observed_in` soma, `required` só sobrevive quando é
+obrigatório em todos). Incompatíveis → `contract_state = 'divergent'`: NÃO se
+produz contrato fundido, os rascunhos ficam lado a lado como variantes, e o
+conflito é NOMEADO (campo, lado, as expressões Zod em disputa e de quem vieram).
+O contador continua contando — a demanda é real —, mas o contrato fica
+explicitamente indefinido. Fundir dois contratos incompatíveis produziria uma
+spec que não descreve nenhum dos dois casos; escolher um deles apagaria o outro
+por ordem de chegada, que não é evidência de nada. O CHECK
+`tool_request_aggregates_divergent_has_no_draft` (migração 129) torna impossível
+gravar `divergent` com um rascunho pendurado, venha o INSERT de onde vier.
+
+**Escopo: por tenant + agent, sem contador global.** A agregação compara o texto
+do pedido de um cliente com o de outro; um contador global exigiria que o dado de
+A entrasse no cálculo que produz a linha de B, e "só o número atravessa" não
+salva, porque contagem pequena é reconstruível. A pergunta legítima ("quantos
+clientes pediram isto?") tem caminho próprio — agregação estatística deliberada
+com anonimização e ADR —, nunca efeito colateral de agrupar pedidos.
+Consequência aceita e escrita: dois tenants que precisam da mesma ferramenta
+produzem dois pedidos. Provado por teste de leak com pedidos BYTE A BYTE iguais
+em dois tenants.
+
+**A fusão não pode apagar a evidência, em três camadas.** (1) A agregação só
+escreve em tabelas NOVAS — `capability_proposals`, `agent_capability_gaps` e
+`agent_capability_gap_observations` não são tocadas. (2) Cada membro guarda o
+`proposed_spec` INTEIRO como entrou (`original_spec`), com situações, links de
+trace e o rascunho original — necessário porque o pedido fundido não gera
+proposta. (3) Sair do agregado é `detached_at` com motivo e autor, nunca
+`DELETE`; e um gap já destacado NÃO volta ao agregado por similaridade, senão
+"reversível" duraria até a próxima passada do cron.
+
+**Sem coluna `vector` e sem índice ivfflat/hnsw, de propósito.** Um limiar de
+cosseno dependeria de uma API paga externa que o CI não tem — logo não seria
+calibrável nem retestável, e trocar de provedor moveria a escala inteira em
+silêncio sobre dado de governança. Some-se a isso que `name_only` é o regime em
+que cosseno de frase curta separa pior. Uma coluna vazia que ninguém popula é
+dívida com cara de recurso, e um índice ivfflat sobre dezenas de linhas por
+tenant é mais lento que a varredura sequencial. O ponto de extensão fica: sinal
+semântico calibrado entra como `ASSINATURA_VERSION` nova, **com re-medição**.
+
+**O guardrail da fatia A continua valendo palavra por palavra.** Agregar não
+registra tool, não concede nada e não avalia `zod_source`. Os arquivos novos
+entram sozinhos na varredura estática do guardrail porque ela deriva do grafo de
+imports dos call sites reais — e a sonda que planta um registro de tool dentro
+de `aggregation.ts` fica vermelha nas DUAS defesas (a invariante absoluta de
+runtime e a varredura de fonte).
+
+Migração `129_tool_request_aggregation.sql` (+ `_down` com envelope
+`BEGIN`/`COMMIT` explícito, que RECUSA reverter com dado: um membro
+não-representante não tem linha em `capability_proposals`, então derrubar a
+tabela apagaria pedidos inteiros, não o agrupamento).
+
+Auditoria: `tool_request_aggregated` (com similaridade, limiar, métrica e versão
+da assinatura — agrupamento sem o número que o justificou é fato sem prova) e
+`tool_request_aggregate_detached`.
+
+### Added — o gap recorrente que exige uma tool INEXISTENTE vira um pedido estruturado, e inerte ([#636](https://github.com/diogenesmendes01/Maia-v2/issues/636), fatia A de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** Um gap recorrente subia pela cadeia
+determinística de escalada (`src/cognition/gap-escalation/engine.ts`) e, no
+topo, virava uma spec em prosa escrita por Sonnet — ou morria no dashboard. Um
+dev que recebesse isso ainda tinha de reconstruir do zero as quatro coisas que
+decidem o pedido: **o que** o agente queria fazer, **em que situações reais**,
+**quantas vezes e em que janela**, e **qual seria o contrato**.
+
+**O que passa a existir.** Um tipo novo de proposta, `capability_type =
+'tool_request'`, gerado SEM LLM a partir de evidência persistida:
+
+- **intenção** — a descrição da lacuna, nas palavras em que foi registrada;
+- **situações** — as ocorrências reais, com `root_trace_id` ligando ao envelope
+  em `runtime_trace_envelopes`. Um id que não resolve **no mesmo tenant+agent**
+  vira situação SEM link, nunca link que atravessa fronteira;
+- **frequência com janela** — `agent_capability_gap_observations`, o ledger novo
+  de ocorrências. O contador `frequency_score` responde "quantas vezes" e nada
+  mais; janela e situação precisam de linhas com timestamp;
+- **rascunho de contrato Zod** — nome, inputs e outputs **derivados** dos
+  argumentos que o agente tentou usar. Quando nenhuma ocorrência registrou
+  argumentos, o rascunho diz `completeness: 'name_only'` em vez de inventar
+  campos: um contrato imaginado pareceria mais completo e valeria menos.
+
+**O guardrail é o recurso, não uma nota de rodapé.** *O agente especifica;
+humano implementa e instala.* Nada nesta fatia registra tool, executa o código
+proposto ou cria capability — a proposta é um documento inerte, e aprová-la
+(`dispatchApproval` → `acknowledged_for_humans`) continua não instalando nada.
+Tool nova segue o caminho normal: código revisado, contrato Zod, classe de
+risco, aprovação. A marcação que impede confundir o rascunho com contrato
+vigente é redundante de propósito e vive em três camadas independentes — o
+literal Zod (`contract_status`), o CHECK
+`capability_proposals_tool_request_marking_check` da migração 125 (que recusa o
+INSERT venha ele de onde vier, inclusive de um `psql`), e o cabeçalho literal do
+`zod_source`, que sobrevive ao copiar-e-colar.
+
+**Precedência no topo da escalada.** O pedido de ferramenta é a rota
+ESPECÍFICA e roda primeiro; o `capability-proposer` genérico continua atendendo
+todo o resto — knowledge, procedure, e o gap de tool cuja ferramenta **já
+existe** (aí não falta código, falta grant). Se a rota nova falhar ou lançar, a
+genérica assume: uma rota recém-introduzida não pode derrubar em silêncio o
+comportamento que já existia.
+
+**O guardrail afirma INVARIANTE, não delta** (correção pós-revisão). A primeira
+versão do teste fotografava o registro de tools antes e depois e comparava as
+duas fotos. Um delta sobre estado global e mutável não sobrevive ao `retry: 1`
+do vitest: a tentativa 1 ficava vermelha, a mutação persistia no objeto de
+módulo, e a tentativa 2 tomava o estrago como sua própria linha de base — delta
+zero, verde, `falharam=0`. O guardrail passou a afirmar três coisas ABSOLUTAS,
+verdadeiras ou falsas por si só em qualquer tentativa: nenhuma tool viva fora do
+catálogo committado (`src/admin-ui/generated/tool-catalog.ts`), o grant do
+agente exatamente como semeado, e zero capability criada. E a varredura de
+fonte deixou de ser `readdirSync` de uma pasta — ela agora percorre o GRAFO DE
+IMPORTS a partir dos call sites reais (gerar, disparar, **aprovar**), porque a
+fronteira do comportamento proibido não é um diretório: `proposal-approval-handler.ts`
+é precisamente o arquivo onde alguém escreveria "aprovou, então instala", e ele
+ficava de fora.
+
+**Fora de escopo desta fatia**, de propósito: agregação por similaridade
+([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637)) e triagem no
+console ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638)).
+
+- Migração **125** (`125_tool_request_proposals.sql`): `agent_capability_gap_observations`
+  (com CHECK fail-closed contra o literal `default`), `tool_request` na lista
+  fechada de `capability_type`, e o CHECK da marcação. O `_down` **recusa** com
+  dado presente — apagar a evidência não é rollback, é perda.
+- `src/cognition/tool-request/` — `types.ts` (contrato Zod + marcação),
+  `existing-tool.ts` (a tool já existe no `REGISTRY`?), `contract-draft.ts`
+  (derivação dos campos) e `proposer.ts` (o call site).
+- `src/workers/gap-escalation-monitor.ts` — as duas rotas a partir de `proposed`.
+- `tests/helpers/grafo-de-imports.ts` — travessia de imports com fronteira
+  declarada, para que uma varredura estática não volte a mentir quando nascer um
+  arquivo novo fora da pasta.
+- `src/db/repositories/capability-repos.ts` — `capabilityGapObservationsRepo` e
+  o registro da ocorrência junto ao upsert do gap.
 
 ### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **O que muda no seu dia:** antes, um app que subisse contra um schema
 > incompatível ficava **de pé** respondendo 503 no `/readyz`. Agora ele **não
-> sobe** — encerra com exit code **90-97**, e sob um supervisor que reinicia
+> sobe** — encerra com exit code **90-98**, e sob um supervisor que reinicia
 > isso é **crash loop**. Se o seu deploy não tem gate de migration, ele passa a
 > ter um sintoma novo. Verifique, ANTES de subir este release, que o migrator
 > roda antes do app: `depends_on: { migrate: { condition:
@@ -504,7 +813,7 @@ só.
 O que mudou:
 
 - **`src/index.ts` (etapa `schema`)** chama `checkSchemaReadiness()` — o MESMO adaptador cacheado do `/readyz`, então boot e probe não podem divergir — e lança `SchemaBootAbortError`; o handler de `main()` sai com `bootExitCode(err)`.
-- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown`. `1` continua sendo qualquer outra falha de boot. A faixa 90-97 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
+- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown` · **98** índice `indisvalid = false` ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658)). `1` continua sendo qualquer outra falha de boot. A faixa 90-98 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
 - **Mensagem de morte acionável**, porque um crash loop sem diagnóstico é pior que um 503: `maia.schema_boot_refused` carrega `exit_code`, `blocker`, `blockers`, `migration_id`, `expected_checksum` (arquivo empacotado) vs. `found_checksum` (linha do ledger), os dois heads e a `remediation` (o comando exato). Nada disso carrega SQL, texto de driver ou DSN — a mensagem de erro do `pg` embute a connection string com senha.
 - **`checkSchemaVersion()` e `src/runtime/lifecycle/schema-version.ts` foram REMOVIDOS**, com o spec dedicado. Não sobrou um segundo veredito de schema para divergir.
 - **Coerência com a [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):** o `/readyz` continua sendo o único gate de roteamento, role-aware e fail-closed, e continua respondendo 503 quando o schema muda debaixo de um processo **que já subiu** — esse caso não vira crash loop. A árvore de decisão do operador (quando olhar exit code, quando olhar readiness) está em `docs/runbooks/operational.md` §8.1.
