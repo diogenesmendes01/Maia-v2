@@ -38,6 +38,7 @@ import type { OutboundDeliveryOutcome } from '@/runtime/outbound/contract.js';
 import {
   DELIVERY_CLAIMABLE_STATUSES,
   DELIVERY_TAKEOVER_STATUSES,
+  MULTIPART_RESOLVED_STATUSES,
   DeliveryFenceError,
   statusForOutcome,
   type DeliveryClaimResult,
@@ -394,19 +395,38 @@ export const outboundDeliveryRepo = {
    * ─── Por que uma transação, e não duas escritas ─────────────────────────
    *
    * A issue pede "persistir histórico idempotentemente → `completed`". A forma
-   * fraca seria inserir em `mensagens` e depois marcar `completed`, com uma
-   * chave de deduplicação no histórico para o retry. Ela tem duas fragilidades:
-   * a chave de dedupe do histórico não existe hoje (a unicidade de `mensagens`
-   * é por `id`), e a janela entre as duas escritas é uma janela de crash — a
-   * mesma que #631 fechou para o commit.
+   * fraca seria inserir em `mensagens` e depois marcar `completed`: a janela
+   * entre as duas escritas é uma janela de crash — a mesma que #631 fechou para
+   * o commit.
    *
    * Aqui a idempotência é do ESTADO, e é atômica por construção: ou as duas
    * escritas acontecem, ou nenhuma. Uma linha em `completed` tem histórico; uma
    * em `delivered` não tem. Um retry a partir de `delivered` reexecuta as duas,
    * e um retry a partir de `completed` não é sequer elegível — `completed` não
    * está em `DELIVERY_CLAIMABLE_STATUSES` nem em `DELIVERY_TAKEOVER_STATUSES`,
-   * então o claim recusa com `terminal` antes de chegar aqui. Não há caminho
-   * que produza duas linhas de histórico para a mesma saída lógica.
+   * então o claim recusa com `terminal` antes de chegar aqui.
+   *
+   * ─── Issue #635: a idempotência do estado ganha uma CHAVE ────────────────
+   *
+   * A garantia acima é real e continua valendo, mas ela tem exatamente UM
+   * escritor. A #635 acrescenta o segundo — a reconciliação, que FABRICA o
+   * histórico perdido na janela `delivered -> completed` —, e a partir de dois
+   * escritores a unicidade não pode mais ser efeito colateral de uma máquina de
+   * estados.
+   *
+   * Por isso o INSERT passa a carimbar `outbound_id` e a terminar em
+   * `ON CONFLICT DO NOTHING` sobre a unique parcial
+   * `mensagens_outbound_history_uq` (migração 135). O conflito representa
+   * idempotência LEGÍTIMA e uma coisa só — "o histórico deste artefato já
+   * existe" —, porque não há outro predicado naquele índice que possa colidir.
+   * `DO NOTHING` e não `DO UPDATE`: o histórico é o FATO do que foi dito, e
+   * reescrevê-lo seria admitir que a segunda gravação pode discordar da
+   * primeira.
+   *
+   * A transição para `completed` acontece de qualquer forma. Ela é a verdade
+   * sobre o CICLO ("este artefato terminou"), e a row de `mensagens` já
+   * existente é a prova de que o histórico está lá — recusar a conclusão porque
+   * a linha já existia deixaria o artefato preso em `delivered` para sempre.
    *
    * FENCED: sem posse não se conclui. A auditoria vai no MESMO `tx` — a prova
    * durável de que a resposta chegou ao histórico não pode viver fora da
@@ -425,7 +445,7 @@ export const outboundDeliveryRepo = {
       conteudo: string;
       metadata: Record<string, unknown>;
     };
-  }): Promise<{ history_message_id: string }> {
+  }): Promise<{ history_message_id: string | null; history_inserted: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     return withTx(async (tx) => {
@@ -450,6 +470,11 @@ export const outboundDeliveryRepo = {
         });
       }
 
+      // `midia_url: null` LITERAL, e não um campo do input: é a política de
+      // retenção de #635 §Retenção sendo ESTRUTURAL. A referência de mídia de
+      // #630 é `local_path`/`storage_object`; persistir um caminho de arquivo
+      // temporário no histórico seria um link morto no dia seguinte e uma pista
+      // de onde o binário mora, numa tabela sem expiração própria.
       const inserted = await tx
         .insert(mensagens)
         .values({
@@ -462,10 +487,22 @@ export const outboundDeliveryRepo = {
           conteudo: input.historico.conteudo,
           midia_url: null,
           metadata: input.historico.metadata,
+          outbound_id: input.outbound_id,
           processada_em: new Date(),
         } as never)
+        // O `where` é o PREDICADO do índice parcial, não um filtro de linhas: o
+        // PostgreSQL só infere um índice parcial como alvo do `ON CONFLICT`
+        // quando o predicado é informado. Sem ele a declaração é recusada com
+        // "there is no unique or exclusion constraint matching the ON CONFLICT
+        // specification" — em runtime, dentro da transação que fecha a entrega.
+        .onConflictDoNothing({
+          target: [mensagens.tenant_id, mensagens.agent_id, mensagens.outbound_id],
+          where: sql`${mensagens.outbound_id} IS NOT NULL`,
+        })
         .returning({ id: mensagens.id });
-      const history_message_id = inserted[0]!.id;
+      // Vazio = a unique parcial da 135 recusou porque o histórico deste
+      // artefato já existe. Ver o bloco §Issue #635 acima.
+      const history_message_id = inserted[0]?.id ?? null;
 
       await auditTx(tx, {
         acao: 'outbound_delivery_completed',
@@ -476,13 +513,66 @@ export const outboundDeliveryRepo = {
         metadata: {
           outbound_id: input.outbound_id,
           history_message_id,
+          history_inserted: history_message_id !== null,
           from_status: 'delivered',
           to_status: 'completed',
         },
       });
 
-      return { history_message_id };
+      return { history_message_id, history_inserted: history_message_id !== null };
     });
+  },
+
+  /**
+   * Issue #635 — MULTIPART: existe artefato ANTERIOR do mesmo turno ainda NÃO
+   * resolvido?
+   *
+   * Devolve o de MENOR `sequence_in_turn` entre os bloqueantes (não um
+   * booleano) porque o log e o runbook precisam dizer *qual* parte segura a
+   * fila: "o turno parou" sem apontar a linha obriga o operador a repetir esta
+   * consulta à mão.
+   *
+   * ─── A forma da declaração ────────────────────────────────────────────────
+   *
+   * `NOT IN (<resolvidos>)` e não `IN (<bloqueantes>)`, ao contrário da
+   * disciplina usual deste arquivo — e a inversão é deliberada. O vocabulário
+   * autoritativo é `MULTIPART_RESOLVED_STATUSES` (lista de INCLUSÃO no
+   * contrato); escrever a lista complementar aqui criaria uma segunda lista a
+   * manter em sincronia, e a divergência apareceria como resposta fora de
+   * ordem. Com a negação, o SQL DERIVA do contrato: um estado novo no
+   * vocabulário de #630 é BLOQUEANTE até alguém acrescentá-lo à lista de
+   * resolvidos, que é o default seguro.
+   *
+   * `status` é NOT NULL desde a 063, então a lógica ternária do `NOT IN` não
+   * tem por onde produzir NULL e deixar uma linha escapar.
+   *
+   * O índice é `outbound_messages_turn_sequence_uq` (121): unique PARCIAL em
+   * (tenant_id, agent_id, turn_id, sequence_in_turn) WHERE turn_id IS NOT NULL
+   * — exatamente o prefixo de igualdade mais a coluna do range e do ORDER BY.
+   */
+  async findBlockingEarlierArtifact(input: {
+    turn_id: string;
+    sequence_in_turn: number;
+  }): Promise<{ outbound_id: string; sequence_in_turn: number; status: string } | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute(sql`
+      SELECT id AS outbound_id, sequence_in_turn, status
+        FROM ${outbound_messages}
+       WHERE tenant_id        = ${tenant_id}
+         AND agent_id         = ${agent_id}
+         AND turn_id          = ${input.turn_id}::uuid
+         AND sequence_in_turn < ${input.sequence_in_turn}
+         AND status NOT IN (${statusList(MULTIPART_RESOLVED_STATUSES)})
+       ORDER BY sequence_in_turn ASC
+       LIMIT 1
+    `);
+    const rows = result.rows as unknown as Array<{
+      outbound_id: string;
+      sequence_in_turn: number;
+      status: string;
+    }>;
+    return rows[0] ?? null;
   },
 
   /**

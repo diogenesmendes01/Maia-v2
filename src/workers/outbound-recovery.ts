@@ -65,7 +65,11 @@ import {
   reconciliationDisposition,
   type ReconciliationResult,
 } from '@/runtime/outbound/recovery-contract.js';
-import type { OutboundProviderChannel } from '@/runtime/outbound/contract.js';
+import {
+  parseOutboundPayload,
+  type OutboundProviderChannel,
+} from '@/runtime/outbound/contract.js';
+import { buildHistoricoFromArtifact } from '@/runtime/outbound/historico.js';
 
 /** O canal de egresso desta fatia — fechado, como em `delivery.ts`. */
 const EGRESS_CHANNEL: OutboundProviderChannel = 'whatsapp';
@@ -139,6 +143,7 @@ function emptyReconciled(): Record<ReconciliationResult, number> {
     dead_letter: 0,
     noop: 0,
     history_recovered: 0,
+    history_fabricated: 0,
   };
 }
 
@@ -302,7 +307,8 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
 }
 
 /**
- * A janela `delivered -> completed` declarada pela #632.
+ * A janela `delivered -> completed` — declarada pela #632, REPORTADA pela #633,
+ * FECHADA aqui (#635).
  *
  * A leitura do histórico PRECEDE a transição, e é o que impede um segundo
  * registro na conversa: o caminho síncrono de `output-dispatch.ts` grava o
@@ -312,9 +318,33 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
  * Uma linha `delivered` SEM histórico e ainda jovem é concorrência normal (a
  * transação de `completeDeliveryTx` pode estar em voo) — a carência a protege.
  * Depois dela, é a janela de crash: a mensagem chegou e o histórico se perdeu.
- * Esta fatia REPORTA isso; ela não fabrica o histórico faltante, porque o texto
- * viria do payload e reconstruí-lo aqui duplicaria a lógica de `buildHistorico`
- * num segundo lugar.
+ *
+ * ─── O que mudou em relação à #633 ─────────────────────────────────────────
+ *
+ * A #633 parava aqui com `escalate_manual` + `ops_alert`, com esta
+ * justificativa: *"não fabrico o histórico porque o texto teria de ser
+ * re-renderizado a partir do payload, duplicando `buildHistorico`"*. A objeção
+ * era contra DUPLICAR a projeção, e estava certa: duas definições do que foi
+ * dito é pior do que histórico faltando, porque a divergência não aparece.
+ *
+ * A resposta desta fatia não é duplicar. `buildHistoricoFromArtifact`
+ * (`src/runtime/outbound/historico.ts`) é uma definição ÚNICA, pura e total,
+ * que o ciclo de entrega e este worker importam do mesmo lugar. O texto não é
+ * re-renderizado: ele é projetado do `payload_json` — imutável desde o commit
+ * de #631, coberto por `payload_hash` (#630) — exatamente como o ciclo de
+ * entrega já fazia. Não existe cognição, template, locale, relógio ou
+ * configuração no caminho; mesmos bytes de entrada, mesmos bytes de saída.
+ *
+ * O único fato que NÃO está no artefato é o `remote_jid`, e ele vem do
+ * ingresso (`artifactForHistoryRecovery`) — nunca derivado do telefone.
+ *
+ * ─── O que continua sendo escalado ─────────────────────────────────────────
+ *
+ * Uma linha cujo `payload_json` não satisfaz mais a união de #630 (schema
+ * evoluído, row adulterada). Fabricar dali seria inventar conteúdo, e o
+ * `parseOutboundPayload` é fail-closed de propósito. A linha fica em
+ * `delivered` — a mensagem chegou, e reenviar continua fora de questão — com
+ * `ops_alert`.
  */
 async function reconcileDelivered(
   row: RecoveryCandidate,
@@ -324,29 +354,79 @@ async function reconcileDelivered(
     recordReconciliation(stats, 'await_grace');
     return;
   }
-  const correlation = await outboundRecoveryRepo.correlationOf(row.outbound_id);
-  if (!correlation) {
+  const artefato = await outboundRecoveryRepo.artifactForHistoryRecovery(row.outbound_id);
+  if (!artefato) {
     recordReconciliation(stats, 'noop');
     return;
   }
-  const hasHistory = await outboundRecoveryRepo.hasHistoryFor(correlation);
-  if (!hasHistory) {
-    // A mensagem CHEGOU (só `accepted_confirmed` produz `delivered`) e o
-    // histórico não entrou. Não se reenvia — duplicaria. Não se inventa o
-    // histórico — o texto teria de ser re-renderizado.
-    recordReconciliation(stats, 'escalate_manual');
-    logger.error(
-      { outbound_id: row.outbound_id, age_ms: Math.round(row.age_ms), ops_alert: true },
-      'outbound_recovery.delivered_without_history — a mensagem chegou e o histórico da ' +
-        'conversa não registrou. NÃO reenviar. Ver docs/runbooks/outbound-recovery.md',
-    );
-    return;
-  }
-  const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx({
+  const correlation = {
+    conversa_id: artefato.conversa_id,
+    in_reply_to: artefato.in_reply_to,
+  };
+  const hasHistory = await outboundRecoveryRepo.hasHistoryFor({
     outbound_id: row.outbound_id,
     ...correlation,
   });
-  recordReconciliation(stats, completed.completed ? 'history_recovered' : 'noop');
+  if (hasHistory) {
+    // O histórico está lá (caminho síncrono, ou uma tentativa anterior desta
+    // mesma reconciliação). Só o ESTADO ficou para trás.
+    const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx({
+      outbound_id: row.outbound_id,
+      ...correlation,
+    });
+    recordReconciliation(stats, completed.completed ? 'history_recovered' : 'noop');
+    return;
+  }
+
+  // A mensagem CHEGOU (só `accepted_confirmed` produz `delivered`) e o
+  // histórico não entrou. Não se reenvia — duplicaria. Projeta-se o artefato.
+  let payload;
+  try {
+    payload = parseOutboundPayload(artefato.payload_json);
+  } catch {
+    // Fail-closed: sem artefato válido não há o que projetar, e inventar é
+    // exatamente o que a épica proíbe. A linha fica `delivered` e visível.
+    recordReconciliation(stats, 'escalate_manual');
+    logger.error(
+      { outbound_id: row.outbound_id, payload_type: row.payload_type, ops_alert: true },
+      'outbound_recovery.history_unrecoverable_invalid_payload — o payload persistido não ' +
+        'satisfaz mais a união de #630; o histórico NÃO pode ser projetado. NÃO reenviar. ' +
+        'Ver docs/runbooks/outbound-recovery.md',
+    );
+    return;
+  }
+  const recovered = await outboundRecoveryRepo.recoverHistoryAndCompleteTx({
+    outbound_id: row.outbound_id,
+    ...correlation,
+    channel_id: artefato.channel_id,
+    historico: buildHistoricoFromArtifact(payload, {
+      provider_message_id: artefato.provider_message_id,
+      // `jid` do INGRESSO, nunca derivado do telefone — ver
+      // `artifactForHistoryRecovery`. String vazia é impossível aqui: a coluna
+      // do ingresso ou tem o valor ou é NULL.
+      jid: artefato.remote_jid ?? '',
+      in_reply_to: artefato.in_reply_to,
+    }),
+  });
+  if (!recovered.completed) {
+    // Outra réplica venceu o CAS `status = 'delivered'`. Nada foi inserido e
+    // nada foi auditado — o critério "sweepers concorrentes são idempotentes",
+    // no lock de row do PostgreSQL.
+    recordReconciliation(stats, 'noop');
+    return;
+  }
+  recordReconciliation(stats, 'history_fabricated');
+  logger.warn(
+    {
+      outbound_id: row.outbound_id,
+      payload_type: row.payload_type,
+      age_ms: Math.round(row.age_ms),
+      history_message_id: recovered.history_message_id,
+    },
+    'outbound_recovery.history_fabricated_from_artifact — o processo que enviou morreu na ' +
+      'janela `delivered -> completed`; o histórico foi projetado do artefato imutável. ' +
+      'Nenhuma mensagem foi reenviada.',
+  );
 }
 
 /**

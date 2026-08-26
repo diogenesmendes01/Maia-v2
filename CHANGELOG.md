@@ -4,6 +4,91 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ MUDANÇA DE COMPORTAMENTO — histórico idempotente, multipart ordenado e a saída "sem envio" ([#635](https://github.com/diogenesmendes01/Maia-v2/issues/635), fatia F de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** três coisas, e a segunda é um bug que já estava em
+> produção esperando a hora.
+>
+> **(1) A reconciliação passou a FABRICAR o histórico perdido.** Uma linha
+> `delivered` sem histórico — o crash na janela `delivered -> completed` que a
+> #632 declarou e a #633 recusou fechar — agora vira `completed` COM a resposta
+> registrada na conversa, projetada do artefato imutável. **Nada é reenviado ao
+> provedor.** A série nova é
+> `maia_outbound_reconciliation_total{result="history_fabricated"}`, e ela é o
+> alarme certo para "o worker de entrega está morrendo no meio".
+>
+> **(2) A enquete que virou texto deixou de ser reenviada.** No fallback
+> enquete→texto, a linha da enquete era fechada como `rejected_retryable` —
+> literalmente com o comentário "para que o recovery não a reenvie". Só que
+> `rejected_retryable` mapeia para `retryable`, que é EXATAMENTE o estado que a
+> varredura de recuperação seleciona: cinco segundos de backoff depois, o job
+> era rearmado e o usuário recebia o texto do fallback **e** a enquete que o
+> fallback existia para substituir. Agora ela é fechada como
+> `cancelled_before_send` ⇒ `cancelled` — terminal, não entregável, honesto.
+> **Se você rodou #631/#633 com o worker de entrega ligado, inventarie:**
+> `SELECT count(*) FROM outbound_messages WHERE turn_id IS NOT NULL AND payload_type = 'interactive_poll' AND last_error_code = 'poll_missing_secrets';`
+>
+> **(3) `mensagens` ganhou `outbound_id`** (migração 135) com unique parcial por
+> `(tenant_id, agent_id, outbound_id)`. É a chave idempotente do histórico de
+> saída. `NULL` continua legítimo — ingresso, histórico antigo, e as saídas sem
+> linha durável (regime de rollback de #631, voz sintetizada, que é a exceção
+> declarada de #634).
+
+**O PORQUÊ.** A #506 pede, textualmente, que a gravação do histórico use
+`outbound_id` como chave idempotente. Até aqui a idempotência era inteiramente
+**de estado**: `completeDeliveryTx` fazia `delivered -> completed` e o INSERT na
+mesma transação, então "uma linha `completed` tem histórico" era verdade por
+construção. Essa garantia é real e continua valendo — mas ela tem exatamente UM
+escritor, e esta fatia acrescenta o segundo. A partir de dois escritores a
+unicidade não pode mais ser efeito colateral de uma máquina de estados; precisa
+ser uma declaração do banco.
+
+**A objeção da #633, e por que ela não bloqueia.** A fatia D recusou fabricar o
+histórico com esta justificativa: *"o texto teria de ser re-renderizado a partir
+do payload, duplicando `buildHistorico`"*. A regra que ela protegia é a da épica
+— o texto final vem do ARTEFATO, nunca de uma nova passada de cognição — e
+continua valendo integralmente. O que esta fatia faz não é re-renderizar: é
+**projetar**. `buildHistoricoFromArtifact`
+(`src/runtime/outbound/historico.ts`) é pura, total, sem LLM, template, locale,
+relógio ou configuração, sobre um `payload_json` imutável desde o commit de #631
+e coberto por `payload_hash`. Existe **uma** definição, importada pelos dois
+caminhos — e é justamente DUPLICÁ-LA que criaria a divergência que a #633
+temia. A prova de não-divergência não é circular: a sonda compara o `conteudo`
+recuperado com a string exata que o adaptador entregou ao provedor, capturada
+por um `LineOutput` fake.
+
+**Também nesta fatia:**
+
+- **O predicado de "já tem histórico?" deixou de ser uma heurística.** A #633
+  perguntava por `metadata->>'in_reply_to'`, que não é uma chave e ERRAVA em
+  multipart: os dois artefatos do turno respondem ao mesmo ingresso, então o
+  histórico do artefato 0 fazia a leitura responder "já existe" para o artefato
+  1 — e o artefato 1 era concluído SEM histórico, com a linha em `completed`
+  mentindo. Agora a pergunta é pela âncora; a perna legada (`outbound_id IS NULL`)
+  fica só para rows anteriores à migração, e é conservadora de propósito.
+- **A ordem do multipart virou regra do ciclo de entrega.** `deliverOutbound`
+  recusa um artefato enquanto existir artefato de `sequence_in_turn` menor do
+  mesmo turno que não se resolveu (`awaiting_earlier_artifact`), ANTES do claim
+  para não consumir orçamento de tentativas. `delivery_unknown` e `reconciling`
+  BLOQUEIAM: a mensagem pode ter chegado e pode ainda ser reenviada, e liberar o
+  seguinte ali faria o usuário ler a resposta fora de ordem.
+- **Retenção estrutural.** A projeção monta o `metadata` campo a campo e nunca
+  espalha o payload, e `midia_url` é `null` literal em quem insere. Nenhuma
+  referência de mídia (`local_path`, `storage_object`) entra no histórico — a
+  sonda de unidade percorre `OUTBOUND_PAYLOAD_TYPES` inteiro exigindo ausência,
+  então um tipo novo sem tratamento quebra a suíte em vez de vazar.
+- **A política de multipart está ESCRITA**: `docs/runbooks/outbound-recovery.md`
+  §9 (ordenação, o que resolve um artefato, falha parcial, retomada,
+  cancelamento) e §10 (a chave do histórico).
+
+**O que esta fatia NÃO fez**, e por quê: o turno continua sendo concluído pelo
+processo que despachou, sem esperar que TODOS os artefatos cheguem a `completed`.
+Fazer o `concludeTurn` esperar exigiria mover a conclusão do turno para o
+delivery worker, que é uma reorganização do ciclo do turno inteiro e não cabe
+nesta fatia. A consequência é observável e já tem série
+(`maia_outbound_turn_inconsistency_total{kind="outbound_without_live_turn"}`),
+não silenciosa.
+
 ### ⚠️ MUDANÇA DE COMPORTAMENTO — a mídia de saída passa a ser durável, e o envio direto ao canal passa a ser RECUSADO ([#634](https://github.com/diogenesmendes01/Maia-v2/issues/634), fatia E de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 > **O que muda no seu dia:** três coisas.

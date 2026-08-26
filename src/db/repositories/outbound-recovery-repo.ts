@@ -330,12 +330,29 @@ export const outboundRecoveryRepo = {
    * avançou". Sem esta leitura, a reconciliação inseriria um segundo histórico
    * para uma resposta que já está na conversa.
    *
-   * O predicado é `metadata->>'in_reply_to'`, o mesmo campo que
-   * `buildHistorico` (#632) e o dispatcher síncrono gravam. Não há unique em
-   * `mensagens` sobre isso (a unicidade da tabela é por `id`), e é justamente
-   * por não haver que esta leitura precede a escrita.
+   * ─── Issue #635: o predicado deixa de ser uma heurística ──────────────────
+   *
+   * A #633 perguntou por `metadata->>'in_reply_to'`, porque era o único campo
+   * comum entre os dois escritores. Isso não é uma chave, e ERRA num caso real
+   * desta fatia: numa resposta MULTIPART os dois artefatos do turno respondem
+   * ao MESMO ingresso, então o histórico do artefato 0 fazia a leitura
+   * responder "já existe" para o artefato 1 — e o artefato 1 era concluído sem
+   * histórico. Falha silenciosa, com a linha em `completed` mentindo.
+   *
+   * Agora a primeira perna é a CHAVE (`mensagens.outbound_id`, unique parcial
+   * `mensagens_outbound_history_uq` da 135), que identifica o ARTEFATO e não o
+   * turno.
+   *
+   * A segunda perna é a de TRANSIÇÃO, e é conservadora de propósito: uma row de
+   * histórico gravada ANTES desta migração não tem `outbound_id`, e para ela o
+   * único vínculo disponível continua sendo o ingresso. Fabricar por cima dela
+   * duplicaria a resposta na conversa do usuário — o dano é assimétrico, então
+   * a perna legada BLOQUEIA a fabricação em vez de permiti-la. Ela é limitada a
+   * `outbound_id IS NULL`, então não reintroduz o falso positivo de multipart
+   * para nada que esta fatia escreva.
    */
   async hasHistoryFor(input: {
+    outbound_id: string;
     conversa_id: string;
     in_reply_to: string;
   }): Promise<boolean> {
@@ -346,11 +363,181 @@ export const outboundRecoveryRepo = {
         FROM ${mensagens}
        WHERE tenant_id   = ${tenant_id}
          AND agent_id    = ${agent_id}
-         AND conversa_id = ${input.conversa_id}::uuid
          AND direcao     = 'out'
-         AND metadata->>'in_reply_to' = ${input.in_reply_to}
+         AND (
+               outbound_id = ${input.outbound_id}::uuid
+            OR (
+                 outbound_id IS NULL
+                 AND conversa_id = ${input.conversa_id}::uuid
+                 AND metadata->>'in_reply_to' = ${input.in_reply_to}
+               )
+             )
     `);
     return Number((result.rows as unknown as Array<{ n: string }>)[0]?.n ?? 0) > 0;
+  },
+
+  /**
+   * Issue #635 — tudo que a FABRICAÇÃO do histórico precisa, numa leitura.
+   *
+   * O artefato (`payload_json`) e os metadados do provedor vêm da PRÓPRIA
+   * linha do outbox, que é imutável depois de pronta para envio (#630/#631):
+   * é a mesma entrada que o ciclo de entrega teve. `parseOutboundPayload`
+   * revalida no consumidor, fail-closed.
+   *
+   * ─── O que NÃO vem da linha do outbox, e de onde vem ─────────────────────
+   *
+   * `channel_id`: `outbound_messages` não tem a coluna (a 090 a acrescentou a
+   * `conversas`/`mensagens`, não ao ledger de saída), e no caminho de envio ela
+   * vem de `line.scope.channel_id` — um objeto de PROCESSO que não existe mais
+   * quando a reconciliação roda. A fonte durável equivalente é o `channel_id`
+   * do INGRESSO: é a linha em que a conversa acontece, é o valor que
+   * `sendOutbound` resolveria, e é o único que satisfaz a FK composta
+   * `mensagens_channel_scope_fk`.
+   *
+   * `remote_jid`: também ausente por decisão — o outbox não persiste
+   * destinatário (#630 manteve telefone fora do payload). Recuperado do
+   * INGRESSO, que é a mesma fonte que
+   * `resolveOutboundJid` prefere no caminho de envio. Pode vir `null` (ingresso
+   * sem `remote_jid`), e nesse caso o histórico fabricado o registra como
+   * `null` em vez de derivar um JID a partir do telefone: derivar seria
+   * AFIRMAR um endereço que ninguém observou, e a fatia inteira existe para
+   * não afirmar o que não se sabe.
+   */
+  async artifactForHistoryRecovery(outbound_id: string): Promise<{
+    conversa_id: string;
+    in_reply_to: string;
+    channel_id: string | null;
+    provider_message_id: string | null;
+    payload_json: unknown;
+    remote_jid: string | null;
+  } | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const result = await db.execute(sql`
+      SELECT o.conversa_id,
+             o.in_reply_to,
+             i.channel_id,
+             o.provider_message_id,
+             o.payload_json,
+             i.metadata->>'remote_jid' AS remote_jid
+        FROM ${outbound_messages} o
+        LEFT JOIN ${mensagens} i
+               ON i.tenant_id = o.tenant_id
+              AND i.agent_id  = o.agent_id
+              AND i.id        = o.in_reply_to
+       WHERE o.tenant_id = ${tenant_id}
+         AND o.agent_id  = ${agent_id}
+         AND o.id        = ${outbound_id}::uuid
+       LIMIT 1
+    `);
+    const rows = result.rows as unknown as Array<{
+      conversa_id: string;
+      in_reply_to: string;
+      channel_id: string | null;
+      provider_message_id: string | null;
+      payload_json: unknown;
+      remote_jid: string | null;
+    }>;
+    return rows[0] ?? null;
+  },
+
+  /**
+   * Issue #635 — FABRICA o histórico perdido e conclui, na MESMA transação.
+   *
+   * ─── O que a #633 recusou fazer, e por que agora é seguro ────────────────
+   *
+   * A #633 parou aqui com um `ops_alert` e esta justificativa: *"não fabrico o
+   * histórico porque o texto teria de ser re-renderizado a partir do payload,
+   * duplicando `buildHistorico`"*. A objeção era sobre DUPLICAR a projeção — e
+   * a resposta desta fatia não é duplicá-la: é `src/runtime/outbound/historico.ts`,
+   * uma definição única que os DOIS caminhos importam. O texto não é
+   * re-renderizado; ele é PROJETADO de um artefato imutável, pela mesma função
+   * pura que o ciclo de entrega já usava. Ver o cabeçalho daquele módulo.
+   *
+   * ─── Por que uma transação, e por que ON CONFLICT DO NOTHING ─────────────
+   *
+   * Duas réplicas do sweeper podem decidir a mesma coisa no mesmo tick. O CAS
+   * `status = 'delivered'` elege UM vencedor para a transição — mas o INSERT do
+   * histórico acontece na MESMA transação, então sem a unique da 135 o perdedor
+   * poderia inserir antes de descobrir que perdeu. Com ela, o segundo INSERT é
+   * um no-op e o segundo `UPDATE` volta zero linhas: uma row de histórico, uma
+   * transição, uma auditoria.
+   *
+   * NÃO é fenced pelo `claim_token`, pela mesma razão de
+   * `completeDeliveredWithHistoryTx`: o dono original morreu, e o token dele —
+   * se ainda estiver na row — é justamente o que impede qualquer um de concluir.
+   */
+  async recoverHistoryAndCompleteTx(input: {
+    outbound_id: string;
+    conversa_id: string;
+    in_reply_to: string;
+    channel_id: string | null;
+    historico: { tipo: string; conteudo: string; metadata: Record<string, unknown> };
+  }): Promise<{ completed: boolean; history_message_id: string | null }> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return withTx(async (tx) => {
+      const moved = await tx.execute(sql`
+        UPDATE ${outbound_messages}
+           SET status           = 'completed',
+               claimed_by       = NULL,
+               claim_token      = NULL,
+               lease_expires_at = NULL
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND id        = ${input.outbound_id}::uuid
+           AND status    = 'delivered'
+        RETURNING id
+      `);
+      if (moved.rows.length === 0) return { completed: false, history_message_id: null };
+
+      // `midia_url: null` LITERAL — a política de retenção de #635 §Retenção,
+      // estrutural e não por limpeza posterior. Ver `historico.ts`.
+      const inserted = await tx
+        .insert(mensagens)
+        .values({
+          tenant_id,
+          agent_id,
+          conversa_id: input.conversa_id,
+          channel_id: input.channel_id,
+          direcao: 'out',
+          tipo: input.historico.tipo,
+          conteudo: input.historico.conteudo,
+          midia_url: null,
+          metadata: input.historico.metadata,
+          outbound_id: input.outbound_id,
+          processada_em: new Date(),
+        } as never)
+        // O `where` é o PREDICADO do índice parcial: sem ele o PostgreSQL não
+        // infere `mensagens_outbound_history_uq` como alvo do `ON CONFLICT`.
+        .onConflictDoNothing({
+          target: [mensagens.tenant_id, mensagens.agent_id, mensagens.outbound_id],
+          where: sql`${mensagens.outbound_id} IS NOT NULL`,
+        })
+        .returning({ id: mensagens.id });
+      const history_message_id = inserted[0]?.id ?? null;
+
+      await auditTx(tx, {
+        acao: 'outbound_delivery_completed',
+        conversa_id: input.conversa_id,
+        mensagem_id: input.in_reply_to,
+        alvo_id: input.outbound_id,
+        metadata: {
+          outbound_id: input.outbound_id,
+          history_message_id,
+          from_status: 'delivered',
+          to_status: 'completed',
+          recovered_by: 'reconciliation',
+          // A distinção que o operador precisa ver na trilha: esta row de
+          // histórico NÃO foi gravada pelo processo que enviou a mensagem — ela
+          // foi projetada do artefato depois, porque aquele processo morreu na
+          // janela. O texto é o mesmo; a proveniência não.
+          history_fabricated: history_message_id !== null,
+        },
+      });
+
+      return { completed: true, history_message_id };
+    });
   },
 
   /**

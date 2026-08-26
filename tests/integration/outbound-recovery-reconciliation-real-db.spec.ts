@@ -689,7 +689,21 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
     expect((await linha(f.outbound_id)).status).toBe('completed');
   });
 
-  it('linha `delivered` SEM histórico NÃO é reenviada nem concluída', async () => {
+  // A metade que a #633 NÃO fechou — e o que a #635 fez com ela.
+  //
+  // Esta sonda dizia `expect(status).toBe('delivered')`: a fatia D recusava
+  // fabricar o histórico faltante ("o texto teria de ser re-renderizado a
+  // partir do payload"), então a linha ficava parada com `ops_alert`.
+  //
+  // A #635 resolveu a objeção sem re-renderizar: `buildHistoricoFromArtifact`
+  // é uma projeção PURA do artefato imutável, com uma definição só, importada
+  // pelos dois caminhos. A metade que continua valendo — e que esta sonda
+  // continua exigindo — é a que importa de verdade: NADA é reenviado.
+  //
+  // A prova de que o texto recuperado não diverge do que o usuário recebeu
+  // exige um oráculo externo (o que o adaptador entregou ao provedor) e vive em
+  // `outbound-historico-idempotente-real-db.spec.ts`.
+  it('linha `delivered` SEM histórico é RECUPERADA sem reenvio (#635)', async () => {
     const f = await criarLinha({
       status: 'delivered',
       delivery_outcome: 'accepted_confirmed',
@@ -698,9 +712,15 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
 
     await comoEscopo(() => runOutboundRecoveryForScope(SCOPE));
 
-    // A mensagem CHEGOU. Concluir sem histórico mentiria; reenviar duplicaria.
-    expect((await linha(f.outbound_id)).status).toBe('delivered');
+    // A mensagem CHEGOU: reenviar duplicaria. Nenhum job de entrega é armado.
     expect(await jobExiste(f.outbound_id)).toBe(false);
+    // E o ciclo FECHA, porque o histórico foi projetado do artefato.
+    expect((await linha(f.outbound_id)).status).toBe('completed');
+    const { rows } = await pool.query<{ n: string }>(
+      `SELECT count(*) AS n FROM mensagens WHERE outbound_id = $1`,
+      [f.outbound_id],
+    );
+    expect(Number(rows[0]!.n)).toBe(1);
   });
 
   // ═══════════════════════════════════════════════════════════════════════

@@ -417,6 +417,12 @@ function streamInputFor(input: MensagemInsertInput): StreamKeyInput {
 // transacional) e nunca fornecidas pelo chamador: um caller capaz de passar
 // `stream_key` seria um caller capaz de escolher a fila de outra conversa, e a
 // própria assinatura é o que torna isso inexprimível.
+// #635 — `outbound_id` sai do tipo base e volta OPCIONAL pela mesma razão que
+// `channel_id`: só o histórico de SAÍDA ancorado num artefato do outbox o
+// carimba, e todo o ingresso (que é a maioria absoluta dos call sites) não tem
+// o que dizer sobre ele. Torná-lo obrigatório faria cada chamada de ingresso
+// escrever `outbound_id: null` — ruído que ensina a passar `null` por reflexo,
+// que é exatamente como uma saída deixaria de ser ancorada sem ninguém notar.
 type MensagemInsertInput = Omit<
   Mensagem,
   | 'id'
@@ -427,7 +433,8 @@ type MensagemInsertInput = Omit<
   | 'stream_key'
   | 'stream_key_version'
   | 'ingress_seq'
-> & { channel_id?: string | null };
+  | 'outbound_id'
+> & { channel_id?: string | null; outbound_id?: string | null };
 
 export const mensagensRepo = {
   async create(input: MensagemInsertInput): Promise<Mensagem> {

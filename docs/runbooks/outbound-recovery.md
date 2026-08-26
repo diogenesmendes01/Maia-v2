@@ -25,13 +25,19 @@ Isso vale para o worker e vale para você às 3h da manhã.
 | `retryable` | Uma tentativa falhou de forma TRANSITÓRIA. Nada saiu | worker, após `next_attempt_at` |
 | `claimed` | Alguém tem a posse; o adaptador ainda não foi tocado | o dono, ou o takeover se a lease vencer |
 | `sending` | A chamada ao provedor foi INICIADA. O desfecho é desconhecido | **nunca reenviar** — takeover vira `delivery_unknown` |
-| `delivered` | O provedor devolveu identificador. A mensagem CHEGOU | falta só o histórico |
+| `delivered` | O provedor devolveu identificador. A mensagem CHEGOU | falta só o histórico — a reconciliação o PROJETA do artefato (#635) |
 | `completed` | Chegou E o histórico da conversa registrou | ninguém |
 | `delivery_unknown` | Pode ter chegado. Ninguém confirmou | reconciliação |
 | `reconciling` | Incerta e triada: o provedor NÃO deduplica este tipo | **um humano** |
 | `failed_terminal` | O provedor recusou DEFINITIVAMENTE | ninguém — rearmar é pedir a mesma recusa |
-| `cancelled` | Abortada ANTES do envio. Nada saiu | worker (é auto-retryable) |
+| `cancelled` | **Saída SEM ENVIO.** Abortada antes do canal, ou superada por outra saída do mesmo turno. Nada saiu e nada sairá | ninguém — é terminal para o ciclo de entrega |
 | `dead_letter` | **Nós** desistimos: teto de tentativas ou prazo de reconciliação | um humano, com confirmação de risco |
+
+`cancelled` é **terminal para a entrega** apesar de a semântica do desfecho
+(`cancelled_before_send`) admitir reenvio: o estado não está em
+`DELIVERY_CLAIMABLE_STATUSES` nem em `DELIVERY_TAKEOVER_STATUSES`, então o
+worker não o alcança e a varredura não o seleciona. Quem quiser reenviar uma
+saída cancelada usa o rearmamento MANUAL.
 
 A distinção que mais importa na madrugada é `failed_terminal` × `dead_letter`.
 São estados diferentes porque a ação é oposta: de `failed_terminal` não se
@@ -109,7 +115,7 @@ automática — uma linha que falhe fica parada até rearmamento manual.
 | Série | Rótulos | O que um pico significa |
 |---|---|---|
 | `maia_outbound_pending_age_seconds` | `tenant_id`, `agent_id` | **A série do alarme.** Idade da resposta não entregue mais antiga. Crescente = algo parou |
-| `maia_outbound_reconciliation_total` | `result` | `escalate_manual` crescendo = fila HUMANA acumulando; `await_grace` alto e constante = carência longa demais |
+| `maia_outbound_reconciliation_total` | `result` | `escalate_manual` crescendo = fila HUMANA acumulando; `await_grace` alto e constante = carência longa demais; **`history_fabricated` ≠ 0 = o delivery worker está MORRENDO na janela `delivered -> completed`** |
 | `maia_outbound_dead_letter_total` | `reason` | `attempt_limit` = falha persistente de entrega; `reconciliation_timeout` = incerteza que ninguém resolveu em 24h |
 | `maia_outbound_turn_inconsistency_total` | `kind` | **Qualquer valor ≠ 0 é bug**, não ruído esperado |
 | `maia_outbound_delivery_unknown_total` | `channel` | (#632) A fila de entrada da reconciliação |
@@ -198,21 +204,87 @@ npm run dlq outbound-show <outbound_id>
 Ele imprime estado, tipo, tentativas, desfecho e — a linha que importa — se há
 **RISCO** de duplicata e por quê.
 
-### 5.4 `delivered` sem histórico
+### 5.4 `delivered` sem histórico — FECHADA pela #635
 
 É a janela declarada pela #632: um crash entre `delivered` e `completed`. A
 mensagem CHEGOU; o que falta é o registro na conversa.
 
-A varredura, depois de um minuto de carência:
+A varredura, depois de um minuto de carência, faz uma pergunta e tem três
+respostas:
 
-- se o histórico existir (o caminho síncrono o grava por conta própria), conclui
-  a linha para `completed` — `maia_outbound_reconciliation_total{result="history_recovered"}`;
-- se não existir, **loga `outbound_recovery.delivered_without_history` com
-  `ops_alert` e não faz mais nada.** Ela não reenvia (duplicaria) e não fabrica
-  o histórico (o texto teria de ser re-renderizado, e isso é #635).
+- **o histórico existe** (o caminho síncrono o gravou por conta própria) —
+  conclui a linha para `completed` sem inserir nada;
+  `maia_outbound_reconciliation_total{result="history_recovered"}`;
+- **o histórico não existe** — PROJETA o histórico do artefato e o insere junto
+  com a conclusão, na mesma transação;
+  `maia_outbound_reconciliation_total{result="history_fabricated"}` e o log
+  `outbound_recovery.history_fabricated_from_artifact`. **Nada é reenviado ao
+  provedor**;
+- **o `payload_json` não satisfaz mais a união de #630** (schema evoluído, row
+  adulterada) — `escalate_manual` + `ops_alert`
+  (`outbound_recovery.history_unrecoverable_invalid_payload`). A linha fica em
+  `delivered`. É o único caso em que ainda há trabalho humano aqui, e o §5.4.1
+  diz o que fazer.
 
-A resposta operacional é reconstruir o histórico a partir de `payload_json`, à
-mão, com o `provider_message_id` da linha. Não há comando para isso ainda.
+**Projetar não é re-renderizar, e a diferença é a razão de a #633 ter recusado
+fazer isto.** `buildHistoricoFromArtifact`
+(`src/runtime/outbound/historico.ts`) é uma função pura, total e sem
+dependências externas — sem LLM, sem template, sem locale, sem relógio — sobre
+o `payload_json`, que é IMUTÁVEL desde o commit de #631 e coberto por
+`payload_hash`. Existe **uma** definição, importada pelo ciclo de entrega e pela
+reconciliação. Duplicá-la — que era o risco que a #633 nomeou — é o que
+permitiria a divergência; compartilhá-la a torna inexprimível.
+
+Só o `remote_jid` não vem do artefato (o outbox não persiste destinatário, por
+política de PII de #630): ele é lido do INGRESSO, nunca derivado do telefone.
+
+A trilha distingue as duas origens: a auditoria `outbound_delivery_completed`
+carrega `recovered_by: "reconciliation"` e `history_fabricated: true`.
+
+**O que investigar quando `history_fabricated` ≠ 0**: não é o histórico — ele foi
+recuperado. É *por que o processo morreu ali*. Comece pelos reinícios do worker
+de entrega na mesma janela de tempo.
+
+#### 5.4.1 `history_unrecoverable_invalid_payload` — o fail-closed
+
+**Não conserte isto fabricando o histórico.** A recusa é deliberada e é a única
+propriedade desta fatia que protege o USUÁRIO em vez do estado: um
+`payload_json` que não passa pela união de #630 significa artefato corrompido,
+ou escrito por uma versão que este processo não sabe ler. Projetar dali gravaria
+na conversa um texto que **ninguém enviou** — indistinguível de mensagem real,
+com `recovered_by: "reconciliation"` como única pista de que foi inventado.
+
+Achar as linhas afetadas:
+
+```sql
+SELECT id, payload_type, payload_version, payload_json, provider_message_id, created_at
+  FROM outbound_messages
+ WHERE tenant_id = :t AND agent_id = :a
+   AND status = 'delivered'
+   AND turn_id IS NOT NULL
+ ORDER BY created_at;
+```
+
+Triagem, nesta ordem:
+
+1. **`payload_version` maior do que a que este binário conhece?** É deploy
+   misto: uma réplica nova commitou, uma antiga está reconciliando. Não é
+   corrupção — atualize a réplica antiga e a linha se resolve sozinha no tick
+   seguinte.
+2. **`payload_type` da coluna diverge do `payload_json->>'type'`?** A row foi
+   escrita fora do caminho de produção (migração manual, replay artesanal).
+   Trate como corrupção.
+3. **Corrupção confirmada:** a mensagem CHEGOU (só `accepted_confirmed` produz
+   `delivered`), então **não reenvie**. O histórico daquela resposta está
+   perdido, e a decisão é humana: ou se reconstrói a row de `mensagens` à mão a
+   partir de uma fonte externa confiável (o telefone do usuário, um export do
+   WhatsApp), ou se aceita a lacuna e a linha é fechada manualmente. Não há
+   comando para isso, de propósito: um comando que "conserta" isto sozinho é a
+   fabricação que esta seção proíbe.
+
+A linha fica em `delivered`, portanto continua contando em
+`maia_outbound_pending_age_seconds` e continua visível a cada tick. Isso é
+intencional — sair do radar seria pior que envelhecer nele.
 
 ### 5.5 Divergência turno ↔ outbound
 
@@ -398,3 +470,111 @@ o rearmamento manual pergunta antes de agir.
 Se um dia existir uma API de consulta de status, o lugar de ligá-la é
 `reconciliationDisposition` (`src/runtime/outbound/recovery-contract.ts`): uma
 quinta disposição `query_provider`, ANTES de `escalate_manual`.
+
+## 9. Multipart — a política ESCRITA (#635)
+
+Um turno pode produzir mais de uma saída lógica. Hoje o caso real é um só (o
+fallback enquete→texto: a enquete ocupa a posição 0 e o texto a posição 1), mas
+a política vale para qualquer número de artefatos.
+
+### 9.1 Ordenação
+
+O eixo é `outbound_messages.sequence_in_turn`, **escolhido pelo call site** e
+nunca "a próxima posição livre" — a posição entra no material da
+`logical_dedupe_key`, então alocá-la dinamicamente faria o retry da mesma
+resposta derivar outra chave e nascer como uma segunda linha (#631).
+
+A entrega respeita essa ordem por construção: `deliverOutbound` recusa um
+artefato enquanto existir artefato de posição MENOR do mesmo turno que ainda não
+se resolveu. A recusa é `awaiting_earlier_artifact`, acontece **antes do claim**
+(para não consumir orçamento de tentativas) e deixa o log
+`outbound.delivery_awaiting_earlier_artifact` dizendo qual posição segura a fila.
+
+Custo: zero para a resposta de uma parte só — `sequence_in_turn = 0` não tem
+irmã anterior possível e a consulta é pulada.
+
+### 9.2 O que RESOLVE um artefato
+
+`MULTIPART_RESOLVED_STATUSES` (`src/runtime/outbound/delivery-contract.ts`):
+`completed`, `delivered`, `failed_terminal`, `cancelled`, `dead_letter`.
+
+`delivery_unknown` e `reconciling` **não** resolvem, e essa é a decisão
+importante: a mensagem pode ter chegado e pode ainda ser reenviada pela
+reconciliação. Liberar o artefato seguinte ali faria o usuário ler a resposta
+fora de ordem. Preferimos parar o turno e deixar a incerteza visível.
+
+É uma lista de INCLUSÃO: um estado novo no vocabulário de #630 é BLOQUEANTE até
+alguém decidir o contrário.
+
+### 9.3 Falha parcial
+
+Sintoma: um turno com artefatos em estados diferentes, e
+`maia_outbound_pending_age_seconds` subindo sem `pending` acumulando.
+
+```sql
+SELECT sequence_in_turn, status, delivery_outcome, attempt, last_error_code
+  FROM outbound_messages
+ WHERE tenant_id = :t AND agent_id = :a AND turn_id = :turn
+ ORDER BY sequence_in_turn;
+```
+
+Leitura: a PRIMEIRA linha cujo `status` não está em §9.2 é a que segura o resto.
+Trate essa linha pelo sintoma dela (§5), não o turno inteiro.
+
+### 9.4 Retomada
+
+Automática, e sem repetir o que já foi confirmado: a varredura só rearma
+`pending`/`retryable` (e faz takeover de lease morta), e nenhum desses estados é
+alcançável a partir de `delivered`/`completed`. O artefato confirmado é
+literalmente inalcançável pelo ciclo de entrega — o claim o recusa como
+`terminal`.
+
+### 9.5 Cancelamento
+
+Uma saída commitada que **não vai ser entregue** — porque outra a substituiu —
+é fechada como `cancelled_before_send` ⇒ `cancelled`, com
+`last_error_code = 'superseded_by_text_fallback'`. Ela sai do trabalho
+entregável, resolve a ordem para os artefatos seguintes, e não mente sobre
+entrega.
+
+> **O defeito que isto corrigiu**, e vale como aviso permanente: até a #635 essa
+> linha era fechada como `rejected_retryable` ⇒ `retryable`, com o comentário
+> "para que o recovery não a reenvie". `retryable` é EXATAMENTE o estado que a
+> varredura seleciona. Cinco segundos depois o job era rearmado e o usuário
+> recebia o texto do fallback **e** a enquete que ele substituía.
+
+## 10. A CHAVE idempotente do histórico (#635)
+
+`mensagens.outbound_id` (migração 135) diz qual artefato do outbox cada row de
+histórico de saída registra. Unique PARCIAL
+`mensagens_outbound_history_uq (tenant_id, agent_id, outbound_id) WHERE outbound_id IS NOT NULL`.
+
+É o que torna a gravação do histórico idempotente **por chave** e não só por
+ordem de execução — necessário porque a #635 deu ao histórico um SEGUNDO
+escritor (a reconciliação). Os dois inserem com `ON CONFLICT DO NOTHING`: o
+segundo é um no-op, e a conclusão acontece de qualquer forma.
+
+`NULL` é legítimo: ingresso, histórico anterior à migração, e as saídas que
+ainda não têm linha durável (regime de rollback de #631, voz sintetizada —
+exceção declarada de #634). Essas rows ficam fora do índice e se comportam como
+antes.
+
+Verificação pós-deploy (o runner **não** detecta `CONCURRENTLY` inválido —
+issue #658):
+
+```sql
+SELECT indisvalid, indisunique, pg_get_indexdef(indexrelid)
+  FROM pg_index WHERE indexrelid = 'mensagens_outbound_history_uq'::regclass;
+```
+
+`indisvalid = f` ⇒ `DROP INDEX CONCURRENTLY mensagens_outbound_history_uq;` e
+reaplique a 135.
+
+Quantas respostas de saída ainda estão sem âncora (esperado: só as três
+exceções acima):
+
+```sql
+SELECT count(*) FROM mensagens
+ WHERE tenant_id = :t AND agent_id = :a AND direcao = 'out' AND outbound_id IS NULL
+   AND created_at > now() - interval '1 day';
+```

@@ -439,6 +439,26 @@ async function claimInlineDeliveryOrRefuse(
 }
 
 /**
+ * Issue #635 — a ÂNCORA do histórico: qual artefato do outbox esta row de
+ * `mensagens` registra.
+ *
+ * É o que torna a gravação do histórico IDEMPOTENTE por chave, e não só por
+ * ordem de execução: `mensagens.outbound_id` é coberto pela unique parcial
+ * `mensagens_outbound_history_uq` (migração 135), então uma segunda gravação da
+ * mesma saída lógica — por retry deste caminho ou pela reconciliação de #633,
+ * que a partir da #635 FABRICA o histórico perdido — colide em vez de duplicar
+ * a resposta na conversa do usuário.
+ *
+ * `null` é legítimo e nomeado: é o caminho sem linha durável (regime de
+ * rollback de #631, worker sem turno, e a voz sintetizada que continua sendo a
+ * exceção declarada de #634). Uma row com âncora `null` fica fora do índice
+ * parcial e continua se comportando como antes desta fatia.
+ */
+function historyAnchor(handle: InlineDeliveryHandle): string | null {
+  return handle.claim?.outbound_id ?? null;
+}
+
+/**
  * Fecha a linha durável com o desfecho NORMALIZADO da tentativa deste processo,
  * COM FENCE.
  *
@@ -456,7 +476,30 @@ async function recordCommittedDelivery(
   outcome:
     | { kind: 'delivered'; provider_message_id: string | null; confirmed: boolean }
     | { kind: 'unknown'; error_code: string }
-    | { kind: 'retryable'; error_code: string },
+    | { kind: 'retryable'; error_code: string }
+    /**
+     * Issue #635 — a saída "SEM ENVIO": o artefato foi commitado, NADA foi ao
+     * canal, e nada será. Estado próprio (`cancelled`), nenhum `delivered`
+     * falso — e, o que importa mais aqui, nenhum `retryable` falso.
+     *
+     * ─── O defeito que esta categoria corrige ──────────────────────────────
+     *
+     * O fallback enquete→texto commitava a enquete na posição 0, descobria que
+     * o provedor não devolveu os segredos, e fechava aquela linha como
+     * `{ kind: 'retryable' }` — com este comentário: *"para que o recovery de
+     * #633 não a leia como trabalho pendente e a reenvie depois"*. A intenção
+     * estava certa e o estado escolhido fazia o oposto EXATO dela:
+     * `rejected_retryable` mapeia para `retryable`, que é justamente o estado
+     * que `listDeliverable` seleciona. Cinco segundos de backoff depois, a
+     * varredura rearmava o job e o delivery worker enviava a ENQUETE — o
+     * usuário recebia o texto do fallback e, em seguida, a enquete que o
+     * fallback existia para substituir.
+     *
+     * `cancelled_before_send` é terminal, não é reivindicável e não é
+     * entregável. Também é o único desfecho honesto: nada saiu, e a semântica
+     * do desfecho EXCLUI entrega anterior.
+     */
+    | { kind: 'no_send'; error_code: string },
 ): Promise<void> {
   await recordInlineDelivery(handle, {
     payload_type,
@@ -469,7 +512,9 @@ async function recordCommittedDelivery(
         }
       : outcome.kind === 'unknown'
         ? { outcome: 'timeout_unknown' as const, last_error_code: outcome.error_code }
-        : { outcome: 'rejected_retryable' as const, last_error_code: outcome.error_code }),
+        : outcome.kind === 'no_send'
+          ? { outcome: 'cancelled_before_send' as const, last_error_code: outcome.error_code }
+          : { outcome: 'rejected_retryable' as const, last_error_code: outcome.error_code }),
   });
 }
 
@@ -769,6 +814,8 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           tipo: 'documento',
           conteudo: captionText,
           midia_url: null,
+          // #635 — a âncora idempotente. Ver `historyAnchor`.
+          outbound_id: historyAnchor(entrega),
           metadata: {
             whatsapp_id: wid,
             in_reply_to: inbound.id,
@@ -1344,6 +1391,8 @@ export async function sendOutbound(
       tipo: 'texto',
       conteudo: text,
       midia_url: null,
+      // #635 — a âncora idempotente. Ver `historyAnchor`.
+      outbound_id: historyAnchor(entrega),
       metadata,
       processada_em: new Date(),
       ferramentas_chamadas: opts?.tool_summaries ?? [],
@@ -1458,13 +1507,22 @@ export async function sendOutboundPoll(
       false,
     );
     // #631 — a enquete já foi COMMITADA na posição 0 e não vai ser entregue.
-    // Fecha aquela linha como `retryable`/`rejected_retryable` (configuração
-    // incompleta, nada foi ao canal) para que o recovery de #633 não a leia
-    // como trabalho pendente e a reenvie depois — o duplo envio pela porta dos
-    // fundos.
+    // #635 — e o estado que diz isso é `cancelled`, não `retryable`.
+    //
+    // A #631 escolheu `rejected_retryable` "para que o recovery de #633 não a
+    // leia como trabalho pendente". Fazia exatamente o contrário:
+    // `rejected_retryable` mapeia para `retryable`, que é o estado que
+    // `listDeliverable` SELECIONA. Cinco segundos de backoff depois, a
+    // varredura rearmava o job e o delivery worker mandava a enquete — o
+    // usuário recebia o texto do fallback E a enquete que ele substituía. Era o
+    // duplo envio pela porta dos fundos, criado pela linha escrita para
+    // impedi-lo.
+    //
+    // `no_send` ⇒ `cancelled_before_send` ⇒ `cancelled`: terminal, não
+    // reivindicável, não entregável. Nada saiu ao canal e nada sairá.
     await recordCommittedDelivery(entrega, 'interactive_poll', {
-      kind: 'retryable',
-      error_code: outboundErrorCode('poll_missing_secrets'),
+      kind: 'no_send',
+      error_code: outboundErrorCode('superseded_by_text_fallback'),
     });
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
@@ -1495,6 +1553,8 @@ export async function sendOutboundPoll(
       tipo: 'texto',
       conteudo: text,
       midia_url: null,
+      // #635 — a âncora idempotente. Ver `historyAnchor`.
+      outbound_id: historyAnchor(entrega),
       metadata: {
         whatsapp_id: sent.whatsapp_id,
         remote_jid: jid,

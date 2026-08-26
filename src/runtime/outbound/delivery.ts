@@ -60,6 +60,7 @@ import {
 } from './delivery-contract.js';
 import { sendPayloadToProvider, type ProviderCallTarget } from './provider-adapter.js';
 import { withOutboxEgress } from './egress-guard.js';
+import { buildHistoricoFromArtifact } from './historico.js';
 
 /**
  * O canal de egresso desta fatia. Fechado em `whatsapp` porque
@@ -74,7 +75,11 @@ export type DeliverySkipReason =
   | 'row_not_found'
   | 'scope_mismatch'
   | 'deadline_exceeded'
-  | 'takeover_of_in_flight_send';
+  | 'takeover_of_in_flight_send'
+  // #635 — MULTIPART. Existe um artefato ANTERIOR do mesmo turno que ainda não
+  // se resolveu. Não é falha: é a ordem sendo respeitada, e a linha continua
+  // elegível para o próximo tick.
+  | 'awaiting_earlier_artifact';
 
 export type DeliveryResult =
   | { delivered: true; outbound_id: string; provider_message_id: string | null }
@@ -146,6 +151,58 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
   // "entregar" uma row assim seria inventar conteúdo.
   if (!row.turn_id || !row.payload_json || !row.provider_idempotency_key) {
     return { delivered: false, outbound_id: input.outbound_id, reason: 'row_not_found' };
+  }
+
+  // ── (2b) ORDENAÇÃO DO MULTIPART. Antes do claim, de propósito. ──────────
+  //
+  // A política escrita está em `docs/runbooks/outbound-recovery.md` §3. A regra
+  // que ESTA linha impõe: um artefato só é entregue quando todo artefato de
+  // `sequence_in_turn` MENOR do mesmo turno já se resolveu.
+  //
+  // ─── Por que aqui e não no rearme ─────────────────────────────────────────
+  //
+  // O rearme (#633) não é a única porta: um job da BullMQ redelivered, um
+  // rearmamento manual, ou o consumidor processando dois jobs do mesmo turno em
+  // paralelo chegam DIRETO aqui. Uma checagem no sweeper protegeria um caminho
+  // e deixaria três abertos — e o efeito de deixá-los abertos é o usuário ler a
+  // segunda metade da resposta antes da primeira.
+  //
+  // ─── Por que ANTES do claim ───────────────────────────────────────────────
+  //
+  // Reivindicar para depois desistir consumiria uma tentativa (`attempt + 1`),
+  // e o orçamento de tentativas é o que leva à DLQ. Uma linha bem-comportada
+  // que só está esperando a irmã chegaria à `dead_letter` por ter esperado.
+  //
+  // ─── Custo ────────────────────────────────────────────────────────────────
+  //
+  // ZERO para a resposta de uma parte só, que é a forma de praticamente todo
+  // turno hoje: `sequence_in_turn === 0` não tem irmã anterior possível, e a
+  // consulta é pulada. Quando roda, é uma sondagem do índice
+  // `outbound_messages_turn_sequence_uq` (121), cujo prefixo é exatamente
+  // (tenant, agent, turn_id, sequence_in_turn).
+  if ((row.sequence_in_turn ?? 0) > 0) {
+    const blocking = await outboundDeliveryRepo.findBlockingEarlierArtifact({
+      turn_id: row.turn_id,
+      sequence_in_turn: row.sequence_in_turn ?? 0,
+    });
+    if (blocking) {
+      counter(METRIC.OUTBOUND_DELIVERY_CLAIM, { result: 'awaiting_earlier_artifact' });
+      logger.info(
+        {
+          outbound_id: input.outbound_id,
+          turn_id: row.turn_id,
+          sequence_in_turn: row.sequence_in_turn,
+          blocked_by_sequence: blocking.sequence_in_turn,
+          blocked_by_status: blocking.status,
+        },
+        'outbound.delivery_awaiting_earlier_artifact',
+      );
+      return {
+        delivered: false,
+        outbound_id: input.outbound_id,
+        reason: 'awaiting_earlier_artifact',
+      };
+    }
   }
 
   // ── (3) CLAIM ATÔMICO com lease e fencing. ───────────────────────────────
@@ -347,7 +404,7 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
       conversa_id: row.conversa_id,
       channel_id: line.scope.channel_id,
       in_reply_to: row.in_reply_to,
-      historico: buildHistorico(payload, {
+      historico: buildHistoricoFromArtifact(payload, {
         provider_message_id,
         jid: input.jid,
         in_reply_to: row.in_reply_to,

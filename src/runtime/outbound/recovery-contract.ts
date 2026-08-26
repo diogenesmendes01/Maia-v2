@@ -145,8 +145,23 @@ export type ReconciliationDisposition = (typeof RECONCILIATION_DISPOSITIONS)[num
 export const RECONCILIATION_RESULTS = [
   ...RECONCILIATION_DISPOSITIONS,
   'noop',
-  /** A linha `delivered` órfã ganhou o histórico que faltava e foi a `completed`. */
+  /**
+   * A linha `delivered` órfã JÁ TINHA histórico (o caminho síncrono o gravou) e
+   * só o estado ficou para trás. A transição foi feita; nada foi inserido.
+   */
   'history_recovered',
+  /**
+   * Issue #635 — a linha `delivered` órfã NÃO tinha histórico, e ele foi
+   * PROJETADO do artefato imutável e inserido junto com a conclusão.
+   *
+   * Série separada de `history_recovered` de propósito, e a distinção é
+   * operacional: `history_recovered` significa "duas escritas, a segunda
+   * atrasou"; `history_fabricated` significa "um processo MORREU na janela
+   * `delivered -> completed`". A primeira é ruído de concorrência; a segunda
+   * conta crashes, e colapsar as duas apagaria a única série que mede a saúde
+   * do delivery worker por dentro.
+   */
+  'history_fabricated',
 ] as const;
 
 export type ReconciliationResult = (typeof RECONCILIATION_RESULTS)[number];
