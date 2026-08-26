@@ -53,7 +53,24 @@ export default function ProposalDetailPage({
     return <EmptyState title="Proposta não encontrada" />;
 
   const proposal = proposalQuery.data;
-  const lockBlocked = proposal.locks.length > 0 && userRole !== 'founder';
+  /**
+   * Issue #623 — a trava que a TELA lê tem de ser a MESMA que o servidor
+   * aplica. `proposal.locks` traz só as travas DERIVADAS do spec
+   * (`deriveCapabilityLocks`); `proposal.architecture_locks` é a união delas
+   * com as travas da CLASSE de aprovação (`architectureLocksFor`) — e é essa
+   * união que `proposals.approve`/`reject` usam para exigir papel founder.
+   *
+   * Lendo `locks`, toda classe cuja trava vem da MATRIZ e não do spec
+   * (`capability_dangerous_tool`, `policy_rule_hard_limit`,
+   * `soul_bias_core_value`, `identity_drift_correction`) renderizava a tela
+   * SEM banner e com os botões HABILITADOS para owner — e o clique voltava
+   * `FORBIDDEN: Architecture-lock proposals require founder role` dentro do
+   * modal. O servidor estava certo; a tela é que prometia uma ação que ele
+   * recusa. MEDIDO pela jornada `architecture-lock.spec.ts` quando ela saiu da
+   * quarentena.
+   */
+  const locks = proposal.architecture_locks;
+  const lockBlocked = locks.length > 0 && userRole !== 'founder';
   // Post-Codex-review #101: founder is always allowed at the role-gate layer;
   // architecture locks then restrict to founder via lockBlocked above.
   const canApprove =
@@ -122,7 +139,7 @@ export default function ProposalDetailPage({
           </CardBody>
         </Card>
 
-        {proposal.locks.length > 0 && (
+        {locks.length > 0 && (
           <Alert
             tone={userRole === 'founder' ? 'warning' : 'danger'}
             title={
@@ -134,9 +151,9 @@ export default function ProposalDetailPage({
               </span>
             }
           >
-            <p>Esta proposta toca {proposal.locks.length} trava(s) de arquitetura:</p>
+            <p>Esta proposta toca {locks.length} trava(s) de arquitetura:</p>
             <ul className="mt-1 list-inside list-disc">
-              {proposal.locks.map((lock) => (
+              {locks.map((lock) => (
                 <li key={lock}>
                   <code className="rounded bg-white/70 px-1 font-mono">{lock}</code>
                 </li>

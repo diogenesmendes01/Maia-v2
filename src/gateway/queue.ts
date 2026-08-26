@@ -35,6 +35,12 @@ import {
   type ParsedAgentTurnJob,
 } from '@/runtime/turns/job.js';
 import type { AgentJobFacts } from '@/runtime/turns/job-consumer.js';
+import {
+  buildOutboundDeliveryJob,
+  outboundDeliveryJobId,
+  parseOutboundDeliveryJob,
+  type OutboundDeliveryJob,
+} from '@/runtime/outbound/delivery-job.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
 
@@ -99,7 +105,7 @@ const DRAIN_REQUEUE_DELAY_MS = 5_000;
 async function deferIfNotAcceptingWork(
   job: Job<unknown>,
   token: string | undefined,
-  queue: 'agent' | 'unrouted-replay',
+  queue: 'agent' | 'unrouted-replay' | 'outbound-delivery',
 ): Promise<void> {
   if (lifecycle.isAcceptingWork()) return;
   await job.moveToDelayed(Date.now() + DRAIN_REQUEUE_DELAY_MS, token);
@@ -594,6 +600,141 @@ export async function enqueueUnroutedReplay(args: {
   );
 }
 
+// ─── #633 (fatia D da épica #506) — a fila de ENTREGA do outbox durável ────
+//
+// O que ela transporta é UM `outbound_id` (`OutboundDeliveryJobSchema`, #632).
+// Nada de tenant, telefone, texto ou canal: o consumidor redescobre tudo no
+// PostgreSQL depois de reivindicar a linha. Carregar tenant no payload seria
+// aceitar um escopo que ninguém reconciliou com a row persistida — e aqui seria
+// pior que na fila `agent`, porque o payload atravessa o Redis.
+//
+// O `jobId` é DETERMINÍSTICO por `outbound_id` (`outboundDeliveryJobId`), então
+// commit, varredura de recuperação e rearmamento manual COLIDEM num job só. A
+// colisão não é a garantia sozinha — jobs armados antes deste deploy, ou um job
+// já removido e re-adicionado, ainda produzem concorrência real. O que fecha é
+// o claim atômico com lease de #632. As duas camadas são independentes de
+// propósito.
+//
+// Retenção: `removeOnFail: { count: 0 }`, o mesmo desenho de `unrouted-replay`
+// e pela mesma razão — a ROW do outbox é o registro durável, e um job `failed`
+// RETIDO com o mesmo id bloquearia o `add` do próximo tick da varredura. É
+// exatamente o risco "job retido bloqueia rearmamento legítimo" que #504
+// documentou; aqui ele é resolvido nas DUAS pontas (retenção curta + limpeza
+// explícita em `enqueueOutboundDelivery`).
+
+export const outboundDeliveryQueue = new Queue<OutboundDeliveryJob>('outbound-delivery', {
+  connection,
+});
+
+let outboundDeliveryWorker: Worker<OutboundDeliveryJob> | null = null;
+
+/**
+ * Registra o CONSUMIDOR da fila de entrega. Idempotente.
+ *
+ * O processor recebe o `outbound_id` já validado — um payload irreconhecível
+ * NÃO derruba o worker nem chega ao consumidor: vira métrica e job descartado,
+ * pela mesma razão de #504 (um job envenenado não pode parar a fila inteira).
+ *
+ * `concurrency` vem do chamador porque o custo de uma entrega é uma chamada de
+ * rede ao provedor, não CPU; o teto real é a sessão do WhatsApp, que é
+ * compartilhada.
+ */
+export function startOutboundDeliveryWorker(
+  processor: (outbound_id: string, job: Job<OutboundDeliveryJob>) => Promise<void>,
+  opts?: { concurrency?: number },
+): Worker<OutboundDeliveryJob> {
+  if (outboundDeliveryWorker) return outboundDeliveryWorker;
+  outboundDeliveryWorker = new Worker<OutboundDeliveryJob>(
+    'outbound-delivery',
+    async (job, token) => {
+      await deferIfNotAcceptingWork(job, token, 'outbound-delivery');
+      const parsed = parseOutboundDeliveryJob(job.data);
+      if (parsed.kind === 'invalid') {
+        // A mensagem carrega o CAMINHO do campo, nunca o valor: o payload de um
+        // job malformado pode conter qualquer coisa que alguém tenha enfiado
+        // nele, inclusive conteúdo de conversa.
+        counter(METRIC.OUTBOUND_DELIVERY_CLAIM, { result: 'not_found' });
+        logger.error(
+          { job_id: job.id, issue: parsed.issue, ops_alert: true },
+          'outbound_delivery.job_payload_invalid',
+        );
+        return;
+      }
+      // `runWithSystemContext` pelo mesmo motivo do worker `agent` (#369): a
+      // janela ANTES da resolução do escopo nunca roda sem contexto. O escopo
+      // real é aberto pelo consumidor, a partir da row.
+      await runWithSystemContext(() => processor(parsed.outbound_id, job));
+    },
+    {
+      connection,
+      concurrency: opts?.concurrency ?? 4,
+      removeOnComplete: { age: 86_400 },
+      removeOnFail: { count: 0 },
+    },
+  );
+  outboundDeliveryWorker.on('failed', (job, err) => {
+    logger.warn(
+      { job_id: job?.id, err: err?.message },
+      'outbound_delivery.job_failed_will_be_rearmed_by_sweep',
+    );
+  });
+  return outboundDeliveryWorker;
+}
+
+/**
+ * Arma (ou re-arma) o job de entrega de UMA linha do outbox. Idempotente pelo
+ * `jobId` determinístico.
+ *
+ * ─── Por que a limpeza do job retido vem ANTES do `add` ─────────────────────
+ *
+ * A BullMQ ignora o `add` quando já existe job com aquele id — inclusive um
+ * job já `completed` ou `failed` que a retenção ainda não removeu. Sem a
+ * limpeza, uma linha cuja primeira entrega falhou ficaria com o cadáver do job
+ * ocupando o id e NENHUM tick da varredura conseguiria rearmá-la: a linha
+ * ficaria `retryable` para sempre, sem ninguém a consumir.
+ *
+ * Quem decide se o trabalho ainda vale continua sendo o PostgreSQL — aqui só se
+ * remove o cadáver para que o transporte não vete uma decisão já tomada no
+ * banco. É o mesmo movimento de `clearRetainedTurnJob` (#504), e a razão de ele
+ * existir nos dois lugares é a mesma.
+ *
+ * Um job em `waiting`/`active`/`delayed` NÃO é removido: ele é trabalho vivo, e
+ * removê-lo para "rearmar" seria cancelar uma entrega possivelmente em voo.
+ * Nesse caso o `add` é ignorado — que é exatamente o comportamento desejado.
+ *
+ * Nunca lança por falha de inspeção: no pior caso o `add` é ignorado e o
+ * próximo tick tenta de novo. Perde-se latência de recuperação, nunca correção.
+ */
+export async function enqueueOutboundDelivery(outbound_id: string): Promise<void> {
+  const jobId = outboundDeliveryJobId(outbound_id);
+  await clearRetainedOutboundJob(jobId);
+  await outboundDeliveryQueue.add('deliver', buildOutboundDeliveryJob(outbound_id), {
+    jobId,
+    // Poucas tentativas de TRANSPORTE de propósito: o retry que importa é o do
+    // PostgreSQL (`next_attempt_at` + `attempt`), que sobrevive ao processo e
+    // ao Redis. Três tentativas cobrem um blip; o resto é da varredura.
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5_000 },
+  });
+}
+
+async function clearRetainedOutboundJob(jobId: string): Promise<void> {
+  try {
+    const existing = await outboundDeliveryQueue.getJob(jobId);
+    if (!existing) return;
+    const state = await existing.getState();
+    if (state !== 'completed' && state !== 'failed') return;
+    await existing.remove();
+    incCounter('maia_outbound_job_retained_cleared_total', { state });
+    logger.info({ job_id: jobId, state }, 'outbound_delivery.job_retained_cleared');
+  } catch (err) {
+    logger.warn(
+      { job_id: jobId, err: (err as Error).message },
+      'outbound_delivery.job_retained_clear_failed',
+    );
+  }
+}
+
 /**
  * Stop CONSUMING, immediately — issue #512 review round 1 (P1 on
  * `src/index.ts:260`). This is the first atomic move of the shutdown, well
@@ -610,8 +751,13 @@ export async function enqueueUnroutedReplay(args: {
 export async function pauseQueueWorkers(): Promise<void> {
   await worker?.pause(true);
   await unroutedWorker?.pause(true);
+  await outboundDeliveryWorker?.pause(true);
   logger.info(
-    { agent_paused: worker?.isPaused() ?? null, unrouted_paused: unroutedWorker?.isPaused() ?? null },
+    {
+      agent_paused: worker?.isPaused() ?? null,
+      unrouted_paused: unroutedWorker?.isPaused() ?? null,
+      outbound_delivery_paused: outboundDeliveryWorker?.isPaused() ?? null,
+    },
     'queue.workers_paused',
   );
 }
@@ -632,9 +778,11 @@ export async function pauseQueueWorkers(): Promise<void> {
 export async function awaitQueueReady(opts?: { includeWorkers?: boolean }): Promise<void> {
   await agentQueue.waitUntilReady();
   await unroutedQueue.waitUntilReady();
+  await outboundDeliveryQueue.waitUntilReady();
   if (opts?.includeWorkers === false) return;
   await worker?.waitUntilReady();
   await unroutedWorker?.waitUntilReady();
+  await outboundDeliveryWorker?.waitUntilReady();
 }
 
 /**
@@ -653,9 +801,12 @@ export async function awaitQueueReady(opts?: { includeWorkers?: boolean }): Prom
 export async function shutdownQueue(): Promise<void> {
   await worker?.close();
   await unroutedWorker?.close();
+  await outboundDeliveryWorker?.close();
   worker = null;
   unroutedWorker = null;
+  outboundDeliveryWorker = null;
   await agentQueue.close().catch(() => undefined);
   await unroutedQueue.close().catch(() => undefined);
+  await outboundDeliveryQueue.close().catch(() => undefined);
   if (connection.status !== 'end') await connection.quit().catch(() => undefined);
 }

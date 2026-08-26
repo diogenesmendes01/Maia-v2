@@ -110,6 +110,23 @@ d('#630 — migração 121: outbox durável em outbound_messages', () => {
 
   afterAll(async () => {
     await client.query(`DELETE FROM outbound_messages WHERE idempotency_key LIKE 'k-%'`);
+    // #631 — a partir da fatia B, um turno REAL (de qualquer outra spec desta
+    // rodada) deixa uma row DURÁVEL em `outbound_messages`, e a FK composta da
+    // 121 é `ON DELETE RESTRICT`. Este `DELETE` varre `tenant_id = 'primary'`
+    // inteiro, então ele encontrava essas rows e o `afterAll` explodia com
+    // `violates foreign key constraint "outbound_messages_turn_scope_fk"` —
+    // um arquivo que NÃO CARREGA, que é pior que um caso vermelho porque
+    // nenhum caso chega a rodar.
+    //
+    // A limpeza segue a ordem das FKs: o outbox dos turnos que vão sair, e só
+    // então os turnos. Não é "apagar mais": é apagar na ordem que o
+    // `RESTRICT` exige — e o `RESTRICT` existe justamente para que apagar um
+    // turno com outbound pendente não aconteça em silêncio.
+    await client.query(
+      `DELETE FROM outbound_messages
+        WHERE turn_id IN (SELECT id FROM agent_turns WHERE tenant_id IN ($1, $2))`,
+      [T, T2],
+    );
     await client.query(`DELETE FROM agent_turns WHERE tenant_id IN ($1, $2)`, [T, T2]);
     await client.query(`DELETE FROM agents WHERE tenant_id = $1`, [T2]);
     await client.query(`DELETE FROM tenants WHERE id = $1`, [T2]);

@@ -79,7 +79,7 @@ async function claimedTurn(): Promise<{ id: string; claim_token: string }> {
   const { agentTurnsRepo } = await loadRepos();
   const turn = await freshTurn();
   const claim = await inA(() =>
-    agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'absorvedor', lease_ms: LEASE_MS }),
+    agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'absorvedor', lease_ms: LEASE_MS }),
   );
   if (!claim.ok) throw new Error('setup: o claim do absorvedor deveria ter sido concedido');
   return { id: turn.id, claim_token: claim.claim.claim_token };
@@ -194,7 +194,7 @@ d('#504 — absorção de irmão: o fence pertence a quem absorve (DB real)', ()
     // Takeover: a lease vence e outro worker assume — o token muda.
     await expireLease(absorber.id);
     const successor = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({
+      agentTurnsRepo.claimNextEligibleTurn({
         turn_id: absorber.id,
         worker_id: 'sucessor',
         lease_ms: LEASE_MS,
@@ -311,7 +311,7 @@ d('#504 — absorção de irmão: o fence pertence a quem absorve (DB real)', ()
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'dono', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'dono', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;

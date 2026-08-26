@@ -28,8 +28,10 @@
  *
  * SEM sessão e SEM fixtures de propósito: tudo aqui vale contra um console
  * recém-construído apontado para um banco migrado e vazio. As jornadas
- * autenticadas são a #472 (ver `@pendente-472` nas outras specs deste
- * diretório).
+ * autenticadas passaram a rodar no MESMO gate na #623 — elas montam a sessão
+ * em `tests/admin-ui/e2e/_apoio/sessao.ts` e dependem das fixtures de
+ * `scripts/seed-admin-ui-e2e-fixtures.ts`. Esta spec continua não dependendo
+ * de nenhuma das duas: é o caso que ainda vale contra banco vazio.
  */
 import { test, expect, type ConsoleMessage, type Response } from '@playwright/test';
 

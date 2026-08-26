@@ -1581,6 +1581,75 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_OUTBOUND_DURABLE_COMMIT: {
+    name: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+    description:
+      'Commit TRANSACIONAL da resposta do turno (issue #631, fatia B da #506). Default ON. ' +
+      'ON: ao concluir a cognição, uma ÚNICA transação valida o claim_token do turno, insere o ' +
+      'artefato outbound com a logical_dedupe_key, move o turno para outbound_pending e grava a ' +
+      'auditoria — e SÓ DEPOIS do commit alguma coisa vai ao canal. Falha da transação IMPEDE o ' +
+      'envio, com erro observável (maia_outbound_commit_rejected_total). EXIGE a migration 121 ' +
+      'aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem turno durável não há turn_id, e a FK ' +
+      'composta da 121 torna a row inexprimível). ' +
+      'OFF NÃO É CONFIGURAÇÃO SUPORTADA EM PRODUÇÃO — o boot é RECUSADO no profile production, ' +
+      'porque desligar aqui restaura exatamente o caminho fail-open que a #506 documentou: envio ' +
+      'ao canal sem registro durável. Fora de produção é a alavanca de rollback declarada. ' +
+      'Ver docs/runbooks/turn-state-machine.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_OUTBOUND_DELIVERY_WORKER: {
+    name: 'FEATURE_OUTBOUND_DELIVERY_WORKER',
+    description:
+      'CONSUMIDOR da fila BullMQ `outbound-delivery` (issue #633, fatia D da #506). Default OFF. ' +
+      'ON: o processo registra o worker que consome jobs de entrega — payload `{version:1, ' +
+      'outbound_id}`, jobId DETERMINISTICO por outbound_id — resolve o escopo pela fronteira de ' +
+      'confianca e chama o ciclo de entrega de #632 (claim atomico, lease, fence). ' +
+      'NASCE DESLIGADA porque o CONSUMIDOR PRECEDE O PRODUTOR: ligue esta primeiro, confirme que ' +
+      'a fila drena, e so entao ligue FEATURE_OUTBOUND_RECOVERY (que e quem enfileira). O ' +
+      'inverso acumula jobs que ninguem consome. ' +
+      'EXIGE a migration 131 aplicada e FEATURE_OUTBOUND_DURABLE_COMMIT ligada (sem linha ' +
+      'duravel nao ha o que entregar). Ver docs/runbooks/outbound-recovery.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_OUTBOUND_RECOVERY: {
+    name: 'FEATURE_OUTBOUND_RECOVERY',
+    description:
+      'VARREDURA de recuperacao, reconciliacao e DLQ do outbox duravel (issue #633, fatia D da ' +
+      '#506). Default OFF. ' +
+      'ON: a cada minuto o worker `outbound_recovery` rearma o trabalho entregavel (pending/' +
+      'retryable vencidos e claims com lease morta), reconcilia o incerto (delivery_unknown, ' +
+      'reconciling e a janela delivered->completed), manda para dead_letter o que estourou o teto ' +
+      'de tentativas ou o prazo de reconciliacao, e detecta divergencia turno<->outbound nos dois ' +
+      'sentidos. Publica maia_outbound_pending_age_seconds, ' +
+      'maia_outbound_reconciliation_total{result} e maia_outbound_turn_inconsistency_total{kind}. ' +
+      'OFF: o worker e NO-OP na primeira linha (nenhuma consulta ao banco) — e nada rearma o ' +
+      'outbox, entao uma linha que falhe a entrega fica parada ate intervencao manual ' +
+      '(`npm run dlq outbound-rearm`). ' +
+      'EXIGE FEATURE_OUTBOUND_DELIVERY_WORKER ligada: a varredura ENFILEIRA, e sem consumidor os ' +
+      'jobs se acumulam no Redis sem ninguem os processar. Ver docs/runbooks/outbound-recovery.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MESSAGE_DEBOUNCE: {
     name: 'FEATURE_MESSAGE_DEBOUNCE',
     description:
@@ -1646,6 +1715,97 @@ export const ENV_CONTRACT = {
       'persistir sem stream (colunas NULL) sem perder as sequências já alocadas — mas a stream ' +
       'retomada continua de onde parou, então religar NÃO reordena nada. ' +
       'Ver docs/runbooks/turn-state-machine.md §8.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_TURN_HEAD_OF_LINE: {
+    name: 'FEATURE_TURN_HEAD_OF_LINE',
+    description:
+      'HEAD-OF-LINE como condição do claim (issue #626, fatia C da #505; fase 6 do rollout). ' +
+      'EXIGE a migration 126 APLICADA e FEATURE_TURN_STREAM_KEY ligada — sem stream_key e ' +
+      'first_ingress_seq gravados não existe ordem a impor, e a regra vira no-op silencioso. ' +
+      'Default ON. ON: um turno só é reivindicável quando NÃO existe turno anterior não terminal ' +
+      'na mesma stream (menor first_ingress_seq). Recusas tipadas: `not_head` (o anterior avança ' +
+      'sozinho) e `stream_blocked` (o anterior está em outbound_pending e nenhum claim o move). ' +
+      'A MESMA regra filtra os candidatos do recovery, para que o varredor não rearme um turno ' +
+      'que o claim vai recusar. OFF é ROLLBACK EMERGENCIAL, não configuração suportada: o claim ' +
+      'volta ao comportamento de #625 (qualquer turno elegível pode ser reivindicado, com no ' +
+      'máximo um ATIVO por stream), e a plataforma volta a poder responder M2 antes de M1. ' +
+      'Nenhum turno já gravado é perdido e religar não reordena nada — a ordem vem de ' +
+      'first_ingress_seq, que continua sendo gravado nas duas posições. ' +
+      'CUSTO CONHECIDO ao ligar: um head preso em estado não terminal segura a conversa inteira; ' +
+      'vigie maia_stream_blocked_total{reason} e maia_stream_fifo_violation_total (sempre zero). ' +
+      'Ver docs/runbooks/turn-state-machine.md §11.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_TURN_STREAM_PROMOTION: {
+    name: 'FEATURE_TURN_STREAM_PROMOTION',
+    description:
+      'PROMOÇÃO DO SUCESSOR quando o head-of-line chega a estado terminal (issue #627, fatia D ' +
+      'da #505; fase 6 do rollout). EXIGE a migration 127 APLICADA (colunas promoted_at e ' +
+      'promoted_by_turn_id) e FEATURE_TURN_HEAD_OF_LINE ligada. Default ON. ON: a MESMA transação ' +
+      'que conclui um turno elege o próximo turno elegível da stream, persiste a decisão e só ' +
+      'DEPOIS do commit sinaliza a BullMQ — a fila é wake-up, não fonte de verdade, e um crash ' +
+      'entre o commit e o enqueue é reconciliado pelo varredor (promoted_at). Também re-arma o ' +
+      'turno cujo claim expirado foi recuperado na transação do claim (#625), que sem isto ' +
+      'esperava até STUCK_AFTER_MS (2 min) pelo varredor. Um worker STALE não promove ninguém: o ' +
+      'fence do CAS terminal recusa a conclusão antes de a promoção rodar. ' +
+      'OFF é ROLLBACK: a conclusão deixa de promover, a ordem CONTINUA correta (o head-of-line ' +
+      'não depende disto) e a conversa volta a andar na cadência do varredor de recovery — ' +
+      'latência, não inversão. Sem head-of-line a flag é INERTE de propósito: naquele regime ' +
+      'nenhum job é recusado por posição, então não há fila a destravar. ' +
+      'Vigie maia_stream_promotion_total{result} — `enqueue_failed` subindo sem `recovered` ' +
+      'acompanhando é varredor parado, não promoção quebrada. ' +
+      'Ver docs/runbooks/turn-state-machine.md §12.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  FEATURE_TURN_STREAM_DEBOUNCE: {
+    name: 'FEATURE_TURN_STREAM_DEBOUNCE',
+    description:
+      'DEBOUNCE TRANSACIONAL — a janela deixa de ser um timer em memória (issue #628, fatia E ' +
+      'da #505; fase 7 do rollout). EXIGE a migration 130 APLICADA (colunas debounce_*) e ' +
+      'FEATURE_TURN_HEAD_OF_LINE ligada — sem head-of-line um turno NÃO-cabeça pode ser ' +
+      'reivindicado, e o fechamento do batch precisaria de fence sobre cada irmão em vez de ' +
+      'poder confiar em que ninguém os executa. Default ON, e INERTE enquanto ' +
+      'FEATURE_MESSAGE_DEBOUNCE estiver OFF (o default do repositório): sem debounce não há ' +
+      'janela a tornar transacional. ' +
+      'ON: a janela é uma LINHA do PostgreSQL, aberta na MESMA transação que persiste o ' +
+      'ingresso e estendida na MESMA transação do ingresso seguinte; o prazo é comparado com ' +
+      'now() do BANCO (nunca Date.now() de réplica); o fechamento é compare-and-swap sob o ' +
+      'mutex da stream (a linha de agent_stream_sequences), então duas réplicas produzem um ' +
+      'fechamento e zero; o batch é o PREFIXO CONTÍGUO de ingressos a partir do head, de modo ' +
+      'que uma lacuna (mídia no meio da rajada) fecha o batch em vez de ser absorvida; e o ' +
+      'wake-up sai do Redis para o varredor stream_debounce_closer, que reencontra a janela ' +
+      'vencida depois de um reinício. ' +
+      'OFF é ROLLBACK: volta o debounce em memória (BullMQ atrasada + chave no Redis), com as ' +
+      'duas falhas conhecidas — réplicas podem fechar batches sobrepostos e um reinício perde ' +
+      'a janela. Nenhuma mensagem é perdida em nenhuma das posições; janelas já abertas e não ' +
+      'fechadas param de ser fechadas e os turnos voltam a ser rearmados pelo recovery por ' +
+      'estado (até STUCK_AFTER_MS), um turno por mensagem, em ordem. ' +
+      'Vigie maia_stream_debounce_batch_size (a distribuição do tamanho do batch) e ' +
+      'maia_stream_debounce_close_total{result} — `stream_locked` constante é contenção de ' +
+      'ingresso, `lost_race` constante é mais de um varredor do que a fila precisa. ' +
+      'Ver docs/runbooks/turn-state-machine.md §13.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],
@@ -2365,6 +2525,90 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  TURN_POISON_BLOCK_CATEGORIES: {
+    name: 'TURN_POISON_BLOCK_CATEGORIES',
+    description:
+      'POLÍTICA DE POISON/DLQ por CATEGORIA DE ERRO (issue #629, fatia F da #505; fase 8 do ' +
+      'rollout). EXIGE a migration 133 APLICADA (tabela agent_stream_blocks) — sem ela toda ' +
+      'conclusão de turno envenenado falha, porque o INSERT do bloqueio referencia uma tabela ' +
+      'inexistente. Lista separada por vírgula das categorias em que ESGOTAR TENTATIVAS deve ' +
+      'BLOQUEAR a conversa para intervenção humana, em vez de dead-letter que LIBERA o próximo ' +
+      'turno. Categorias válidas: effect_committed, model, transport, infrastructure, operator, ' +
+      'unknown (espelho de POISON_CATEGORIES em src/runtime/turns/poison-policy.ts; uma ' +
+      'categoria desconhecida REPROVA o boot em vez de ser ignorada, porque silenciá-la faria o ' +
+      'operador acreditar ter ligado o bloqueio). ' +
+      'Default `effect_committed`, e a escolha é o núcleo da issue-mãe: as duas saídas são ' +
+      'defensáveis e INCOMPATÍVEIS — liberar preserva disponibilidade às custas da semântica ' +
+      '(a plataforma responde M2 sem nunca ter respondido M1), bloquear preserva a semântica às ' +
+      'custas da conversa (nada anda até alguém olhar). effect_committed é a única categoria em ' +
+      'que a conversa já está semanticamente quebrada ANTES de a política decidir: uma tool ' +
+      'irreversível rodou e o turno falhou depois. As demais têm causa COMPARTILHADA e ' +
+      'transitória — um incidente de LLM ou de rede que bloqueasse pararia milhares de conversas ' +
+      'de uma vez, com desbloqueio manual uma a uma. ' +
+      'LISTA VAZIA é o KILL SWITCH da fatia: nenhum bloqueio NOVO nasce e a conclusão volta ao ' +
+      'comportamento da #627. Ela NÃO desfaz bloqueios existentes — quem os desfaz é ' +
+      '`npm run dlq -- unblock`, que é operação auditada. ' +
+      'Vigie maia_stream_blocked_total{reason="stream_poisoned"} (sobe e NÃO volta sozinha: ' +
+      'cada ponto é uma tentativa contra uma conversa que nenhum worker vai destravar) e ' +
+      'maia_stream_poisoned_streams (o gauge de quantas conversas estão interditadas agora). ' +
+      'Ver docs/runbooks/turn-state-machine.md §14.',
+    group: 'governance',
+    secret: false,
+    services: ['runtime'],
+    // A validação do CONTEÚDO é aqui, e não em `parsePoisonBlockCategories`,
+    // porque o boot é o único momento em que o operador ainda pode corrigir a
+    // digitação. `parsePoison…` também lança — defesa em profundidade, para o
+    // caso de a lista chegar por um caminho que não passou pelo contrato.
+    schema: z
+      .string()
+      .default('effect_committed')
+      .refine(
+        (raw) =>
+          raw
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter((s) => s.length > 0)
+            .every((s) =>
+              [
+                'effect_committed',
+                'model',
+                'transport',
+                'infrastructure',
+                'operator',
+                'unknown',
+              ].includes(s),
+            ),
+        {
+          message:
+            'categorias válidas: effect_committed, model, transport, infrastructure, operator, ' +
+            'unknown (lista separada por vírgula; vazia desliga o bloqueio)',
+        },
+      ),
+    example: 'effect_committed',
+    fixture: 'effect_committed',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_STREAM_STARVATION_AFTER_MS: {
+    name: 'TURN_STREAM_STARVATION_AFTER_MS',
+    description:
+      'A partir de quantos ms um head-of-line parado conta como STARVATION (issue #629). É o ' +
+      'limiar de maia_stream_starvation_total e do gauge maia_stream_head_age_seconds — não ' +
+      'muda comportamento nenhum do escalonador, só o ponto em que a plataforma passa a AFIRMAR ' +
+      'que uma conversa está sendo preterida. Default 300000 (5 min), que é folgado de ' +
+      'propósito: STUCK_AFTER_MS do varredor é 2 min e o backoff de retry vai a 15 min, então um ' +
+      'limiar abaixo de 5 min contaria como starvation um backoff legítimo em aberto — e uma ' +
+      'métrica de fairness que dispara com o retry funcionando é uma métrica que o plantão ' +
+      'aprende a ignorar. Ver docs/runbooks/turn-state-machine.md §14.4.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(300_000),
+    example: '300000',
+    fixture: '300000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   TURN_CONTEXT_CACHE_TTL_MS: {
     name: 'TURN_CONTEXT_CACHE_TTL_MS',
     description:
@@ -2529,7 +2773,7 @@ export const ENV_CONTRACT = {
   READINESS_SCHEMA_CHECK: {
     name: 'READINESS_SCHEMA_CHECK',
     description:
-      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
+      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-98, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],
@@ -2577,6 +2821,51 @@ export const ENV_CONTRACT = {
     schema: z.string().optional(),
     example: '__SET_ME__setup_token',
     fixture: 'fixture-setup-token',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
+  // ---- pedidos de ferramenta (issues da triagem) -------------------------
+  //
+  // #638 (fatia C da épica #471). As duas variáveis do efeito EXTERNO da
+  // triagem: para onde a issue vai, e com que credencial.
+  //
+  // O DESTINO é lido pelos dois serviços; a CREDENCIAL, só pelo `runtime`. Essa
+  // assimetria é a defesa central do critério "credencial do GitHub não vaza
+  // para o payload da proposta nem para log". O botão "aceitar" é servido pelo
+  // `admin-ui`, que valida o PRÓPRIO subset no boot: um token fora do subset
+  // dele não é lido, não é tipado e não existe naquele processo. O console
+  // reserva a linha (e precisa dizer ao dono para onde a issue vai, por isso
+  // conhece o repositório); quem fala com o GitHub é o relayer do `runtime`. A
+  // separação é estrutural, não é disciplina —
+  // `tests/unit/tool-request-credencial.spec.ts` a afirma contra o contrato.
+  MAIA_TOOL_REQUEST_ISSUE_REPO: {
+    name: 'MAIA_TOOL_REQUEST_ISSUE_REPO',
+    description:
+      'Repositório GitHub "owner/repo" onde a triagem de pedidos de ferramenta abre issues. Ausente = o aceite é recusado com motivo explícito (nada de destino implícito para efeito externo).',
+    group: 'tool-requests',
+    secret: false,
+    services: ['runtime', 'admin-ui'],
+    schema: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/, 'formato esperado: owner/repo')
+      .optional(),
+    example: 'minha-org/meu-repo',
+    fixture: 'maia-fixture/maia-fixture',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_TOOL_REQUEST_GITHUB_TOKEN: {
+    name: 'MAIA_TOOL_REQUEST_GITHUB_TOKEN',
+    description:
+      'Token do GitHub usado SOMENTE pelo relayer de pedidos de ferramenta (escopo mínimo: abrir issue no repositório acima). Não é lido pelo Admin UI — o console reserva o aceite, o runtime faz a chamada.',
+    group: 'tool-requests',
+    secret: true,
+    services: ['runtime'],
+    schema: z.string().optional(),
+    example: '__SET_ME__tool_request_github_token',
+    fixture: 'fixture-tool-request-token',
+    requiredWhen: { var: 'MAIA_TOOL_REQUEST_ISSUE_REPO', present: true },
     restartRequired: true,
     commentedInExample: true,
   },

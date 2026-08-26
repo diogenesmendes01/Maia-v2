@@ -156,7 +156,7 @@ successfully`, `app` e `admin-ui` ficam em `created` e nunca sobem. Isso
 
 **Este job é o que impede o crash loop.** Desde a ADR 0004 o `app` não fica de
 pé respondendo 503 sobre um schema que não consegue verificar: ele **morre** no
-boot, com exit code 90-97 nomeando a invariante (ver
+boot, com exit code 90-98 nomeando a invariante (ver
 [`operational.md`](operational.md) §8.1). Se o app entrou em crash loop por
 schema, a primeira pergunta não é sobre o banco — é **o gate rodou?** No
 Compose ele é o `depends_on: service_completed_successfully`; fora do Compose é
@@ -268,7 +268,10 @@ refused as an artifact problem before it can run.)
    - they are not, and you have undone the partial ones.
 
    For a partially-created `CREATE INDEX CONCURRENTLY`, Postgres leaves
-   an INVALID index behind; drop it before choosing option (b):
+   an INVALID index behind. Desde a #658 o runner **recusa** aplicar
+   qualquer coisa enquanto ele existir, e `repair --as pending` NÃO
+   destrava — o remédio completo (e a ordem certa) está em
+   [§Índice inválido deixado por DDL `CONCURRENTLY`](#índice-inválido-deixado-por-ddl-concurrently):
 
    ```sql
    SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
@@ -434,6 +437,79 @@ the change in a NEW migration. The only legitimate exception — the file
 was corrupted in transit, not edited — is handled by verifying the schema
 by hand and then `repair --as applied --reason "..."`, which re-adopts
 the packaged checksum and leaves an audit trail.
+
+## Índice inválido deixado por DDL `CONCURRENTLY`
+
+**Sintoma.** `migrate up` responde `blocked` com um blocker
+`invalid_index`, ou o app morre no boot com **exit 98**. A linha nomeia
+o índice: `index "public.<indice>" on table "<tabela>" is INVALID`.
+
+**O que aconteceu.** Um `CREATE INDEX CONCURRENTLY` reprovou — duplicata
+pré-existente, deadlock, cancelamento ou `statement_timeout`. O índice
+**não desaparece**: fica no catálogo com `pg_index.indisvalid = false`.
+Um índice inválido não é consultado pelo planejador e, se for `UNIQUE`,
+**não impõe nada** — a exclusão que ele deveria garantir simplesmente
+não existe.
+
+**Por que o runner recusa em vez de só avisar.** Reaplicar o arquivo
+devolveria SUCESSO sem criar índice nenhum: o `IF NOT EXISTS` enxerga o
+índice inválido, pula a criação e responde `CREATE INDEX` com exit 0.
+Sem esta guarda, o ledger passaria a dizer `applied` com a invariante de
+exclusão ausente e nenhum sinal (issue #658). Por isso a recusa
+sobrevive inclusive a um `repair --as pending`: **limpar a linha do
+ledger não conserta o catálogo**.
+
+### Remédio
+
+1. **Liste os índices inválidos** (mesma consulta que o runner usa,
+   `src/migrations/invalid-indexes.ts`):
+
+   ```sql
+   SELECT n.nspname, c.relname, i.indisready, i.indislive
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indexrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT i.indisvalid
+      AND n.nspname = ANY (current_schemas(false));
+   ```
+
+   `indisready = false` = construção concorrente reprovou;
+   `indislive = false` = `DROP INDEX CONCURRENTLY` interrompido.
+
+2. **Descubra POR QUE reprovou** — em geral a duplicata que o índice
+   único ia proibir. Para um índice único parcial, rode o `GROUP BY …
+   HAVING count(*) > 1` correspondente às colunas e ao `WHERE` dele.
+   **Isto é o passo que importa**: os dados são o defeito, o índice é só
+   o mensageiro.
+
+3. **Remova o índice inválido.** Fora de transação — `CONCURRENTLY` é
+   recusado dentro de `BEGIN`:
+
+   ```sql
+   DROP INDEX CONCURRENTLY <schema>.<indice>;
+   ```
+
+4. **Resolva a duplicata** (mescle, arquive ou apague as linhas
+   excedentes, conforme o significado da tabela). Registre o que foi
+   feito — esta parte não tem trilha automática.
+
+5. **Reaplique a migration.** Se a linha do ledger ficou `dirty`, repare
+   primeiro, na ordem: `repair --as pending --reason "indice invalido
+   dropado; duplicata resolvida"`, e só então `npm run db:migrate`.
+
+6. **Confirme.** A consulta do passo 1 tem de voltar vazia e
+   `tsx scripts/migrate.ts status` tem de sair limpo. O boot só volta a
+   subir quando o veredito é `ready`.
+
+### Escopo da varredura
+
+A checagem cobre os schemas que a conexão do migrator realmente resolve
+(`current_schemas(false)` — o `search_path`, sem o `pg_catalog`
+implícito). Um índice criado explicitamente num schema fora do
+`search_path` não é visto; nenhuma migration deste repositório faz isso.
+Ampliar para "todo schema não-sistema" faria qualquer schema descartável
+de teste ou de ferramenta externa bloquear o migrator e o boot de
+produção.
 
 ## Reverting a migration (down) — manual procedure
 
@@ -640,10 +716,11 @@ O que sobra está abaixo.
 - **O BOOT decide pelo mesmo veredito e MATA o processo** (decisão do dono,
   [ADR 0004](../architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md)).
   `src/index.ts` (etapa `schema`) chama `checkSchemaReadiness()` e encerra o
-  processo com exit code **90-97**, um por invariante: 90 dirty/`running`
+  processo com exit code **90-98**, um por invariante: 90 dirty/`running`
   órfão · 91 checksum divergente · 92 checksum ausente · 93 migration que este
   build não empacota · 94 migration obrigatória ausente · 95 schema acima do
-  máximo · 96 `running` em voo · 97 veredito `unknown`. `checkSchemaVersion()`
+  máximo · 96 `running` em voo · 97 veredito `unknown` · 98 índice
+  `indisvalid = false` (#658). `checkSchemaVersion()`
   foi REMOVIDO — não há mais um segundo veredito de schema. A mensagem de
   morte (`maia.schema_boot_refused`) nomeia migration, checksum esperado vs.
   encontrado e o comando de remediação. Árvore de decisão do operador (exit

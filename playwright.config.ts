@@ -23,23 +23,27 @@ import { defineConfig, devices } from '@playwright/test';
  * ## Os dois projetos
  *
  * `smoke` — o que roda no CI e é BLOQUEANTE. Exercita o console CONSTRUÍDO:
- *   middleware, route handlers, render de servidor e hidratação do cliente.
- *   É a rede de segurança que as issues #604 (Next 16) e #605 (Recharts 3)
- *   exigem como pré-requisito.
+ *   middleware, route handlers, render de servidor e hidratação do cliente,
+ *   e — desde a #623 — as JORNADAS autenticadas do operador (inbox, detalhe
+ *   de proposta, aprovação simples e dupla, rejeição, trava de arquitetura,
+ *   trilha de auditoria, drift, traces e versões). A sessão é montada em
+ *   `tests/admin-ui/e2e/_apoio/sessao.ts` e as fixtures em
+ *   `scripts/seed-admin-ui-e2e-fixtures.ts`, que `scripts/admin-ui-e2e.sh`
+ *   executa antes da suíte.
  *
- * `jornadas-pendentes` — as specs de P8.5/#518 marcadas `@pendente-472`.
- *   Elas navegam para telas atrás de sessão (`middleware.ts` redireciona TUDO
- *   para /auth/signin) e dependem de fixtures que `scripts/seed-proposals-
- *   fixtures.ts` não cria (`test-id`, `locked-test`, `hard-limit-test`,
- *   `audit-test`, `reject-test`, `test-trace-id`). Fazê-las passar é a #472
- *   inteira, não este pré-requisito. Ficam FORA do gate de propósito e de
- *   forma auditável: `tests/unit/ci/admin-ui-e2e-gate.spec.ts` fixa a lista
- *   exata de arquivos em quarentena, então entrar ou sair dela é um diff
+ * `jornadas-pendentes` — o que sobrou da quarentena. Depois da #623 é UM
+ *   arquivo: `channel-lines-pairing.spec.ts`. A causa dele não é sessão nem
+ *   fixture — é que o QR e o código de pareamento são produzidos pelo WORKER
+ *   DO RUNTIME (`channel_pairing`), e este job sobe só o console. O cabeçalho
+ *   daquele arquivo traz a medição e o critério objetivo de saída; a tag
+ *   mudou de `@pendente-472` para `@pendente-runtime` porque a #472 fechou e
+ *   o motivo que resta é outro. `tests/unit/ci/admin-ui-e2e-gate.spec.ts`
+ *   continua fixando a lista exata, então entrar ou sair dela é um diff
  *   visível — não um `skip` condicional que ninguém lê.
  *
  * Spec NOVA entra em `smoke` por construção (a quarentena é opt-in por tag).
  */
-const PENDENTE_472 = /@pendente-472/;
+const PENDENTE_RUNTIME = /@pendente-runtime/;
 
 /**
  * Escape hatch para ambiente de agente com Chromium pré-instalado num registry
@@ -94,12 +98,12 @@ export default defineConfig({
   projects: [
     {
       name: 'smoke',
-      grepInvert: PENDENTE_472,
+      grepInvert: PENDENTE_RUNTIME,
       use: chromium,
     },
     {
       name: 'jornadas-pendentes',
-      grep: PENDENTE_472,
+      grep: PENDENTE_RUNTIME,
       use: chromium,
     },
   ],

@@ -1,19 +1,21 @@
 /**
- * P8.5 — Tela 4 (Drift & Incidents) E2E tests.
+ * Jornada — DRIFT E INCIDENTES, Tela 4 (P8.5; saiu da quarentena na #623).
+ *
+ * Só leitura: os três cartões de incidente existem mesmo com zero incidentes
+ * (o valor é o contador), então a jornada vale contra o banco semeado sem
+ * fixture própria. Sem sessão ela media a tela de login — era essa, e só
+ * essa, a causa da quarentena.
  */
 import { test, expect } from '@playwright/test';
+import { autenticarComo } from './_apoio/sessao.js';
 
-// `@pendente-472`: fora do gate de CI (projeto `jornadas-pendentes` do
-// playwright.config.ts). Esta spec exige sessão autenticada e fixtures que
-// `scripts/seed-proposals-fixtures.ts` ainda não cria — ligá-la é a #472. A
-// lista de arquivos em quarentena é fixada em
-// `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair dela é um diff visível.
-test.describe('Drift & Incidents — Tela 4 @pendente-472', () => {
-  test('loads drift page with all 3 incident cards', async ({ page }) => {
-    await page.goto('http://localhost:4000/drift');
+test.describe('Drift e incidentes — Tela 4', () => {
+  test('a tela carrega com os três cartões de incidente', async ({ page, context }) => {
+    await autenticarComo(context, 'owner');
+    await page.goto('/drift');
     await expect(page.locator('h1')).toContainText('Drift');
-    await expect(page.locator('text=Bloqueios PEP')).toBeVisible();
-    await expect(page.locator('text=Alertas de orçamento')).toBeVisible();
-    await expect(page.locator('text=Alertas de regressão')).toBeVisible();
+    await expect(page.getByText('Bloqueios PEP')).toBeVisible();
+    await expect(page.getByText('Alertas de orçamento')).toBeVisible();
+    await expect(page.getByText('Alertas de regressão')).toBeVisible();
   });
 });
