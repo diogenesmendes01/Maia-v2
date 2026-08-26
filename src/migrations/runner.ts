@@ -14,11 +14,23 @@
  *   └─ ensure ledger v2 schema
  *   └─ promote orphaned `running` rows to `dirty`   (crash recovery)
  *   └─ backfill checksums for pre-checksum rows     (one-time adoption)
- *   └─ compute status  (pure; src/migrations/status.ts)
+ *   └─ compute status  (ledger + pg_index; src/migrations/status.ts)
  *   └─ REFUSE if anything blocks   ← fail-closed, before touching the schema
  *   └─ apply pending, in artifact order, stopping at the first failure
+ *        └─ before writing `applied` (self/none): reassert "no INVALID index"
  * release lock (finally)
  * ```
+ *
+ * ### Índice inválido (#658)
+ *
+ * DDL `CONCURRENTLY` que reprova deixa o índice no catálogo com
+ * `indisvalid = false`, e o `IF NOT EXISTS` da tentativa seguinte o enxerga,
+ * pula a criação e devolve SUCESSO — o runner leria exit 0 e marcaria a
+ * migration como aplicada com a invariante de exclusão inexistente. A regra é
+ * uma invariante ABSOLUTA em dois pontos: nenhum índice inválido no escopo
+ * quando o run começa (blocker `invalid_index`, antes de qualquer DDL), e
+ * nenhum no momento de escrever `applied` (`assertNoInvalidIndexes`). Ver
+ * `src/migrations/invalid-indexes.ts`.
  *
  * ### Three transaction modes, because only one of them can be atomic
  *
@@ -80,8 +92,14 @@ import {
 import { acquireMigrationLock, type LockDeps, type LockOptions } from './lock.js';
 import { computeMigrationStatus } from './status.js';
 import { shortChecksum } from './checksum.js';
+import {
+  invalidIndexBlockers,
+  invalidIndexKey,
+  readInvalidIndexes,
+} from './invalid-indexes.js';
 import type {
   DiscoveredMigration,
+  InvalidIndex,
   MigrationArtifact,
   MigrationStatusReport,
   SchemaBlocker,
@@ -110,6 +128,7 @@ export type MigrationEvent =
   | 'migration.checksum_mismatch'
   | 'migration.checksum_backfilled'
   | 'migration.blocked'
+  | 'migration.invalid_index'
   | 'migration.repaired';
 
 /**
@@ -210,6 +229,36 @@ export function terminalLedgerStatusFor(
   }
 }
 
+/**
+ * `error_class` gravado no ledger quando uma migration termina com um índice
+ * inválido no escopo. Constante exportada porque o runbook e o teste citam o
+ * valor — e um literal repetido em três lugares é o que envelhece.
+ */
+export const INVALID_INDEX_ERROR_CODE = 'MIGRATION_INVALID_INDEX';
+
+/**
+ * A migration rodou sem levantar erro, mas o catálogo terminou com pelo menos
+ * um índice `indisvalid = false` (issue #658).
+ *
+ * Carrega `code` (e não só o nome da classe) porque `errorClass` prefere
+ * `err.code`: é assim que `MIGRATION_INVALID_INDEX` chega ao ledger, ao evento
+ * estruturado e ao `migrate status` do operador.
+ */
+export class InvalidIndexAfterMigrationError extends Error {
+  readonly code = INVALID_INDEX_ERROR_CODE;
+  readonly indexes: readonly InvalidIndex[];
+
+  constructor(migrationId: string, indexes: readonly InvalidIndex[]) {
+    super(
+      `migration "${migrationId}" finished without raising, but the schema carries ` +
+        `${indexes.length} INVALID index(es): ${indexes.map(invalidIndexKey).join(', ')}. ` +
+        `Refusing to record it as applied.`,
+    );
+    this.name = 'InvalidIndexAfterMigrationError';
+    this.indexes = indexes;
+  }
+}
+
 function errorClass(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === 'string' && code.length > 0) return code;
@@ -239,11 +288,65 @@ async function readStatus(
   artifact: MigrationArtifact,
 ): Promise<MigrationStatusReport> {
   const ledger = await readLedger(client, { present: true, version: 2 });
+  // #658: o catálogo entra no relatório junto com o ledger, e não como um
+  // log à parte — `status` é contratado como a descrição COMPLETA de
+  // "artefato × banco", e um índice inválido é estado do banco que nenhuma
+  // linha do ledger revela.
+  const invalidIndexes = await readInvalidIndexes(client);
   return computeMigrationStatus(artifact, ledger, {
     ledgerPresent: true,
     ledgerVersion: 2,
     lockHeld: true,
+    invalidIndexes,
   });
+}
+
+/**
+ * Issue #658 — reassere, NO MOMENTO de escrever `applied`, que o escopo não
+ * carrega nenhum índice inválido. Lança se carregar.
+ *
+ * ### Como o runner sabe quais índices a migration criou: ele NÃO precisa saber
+ *
+ * Parsear o arquivo atrás de `CREATE INDEX CONCURRENTLY` é frágil (nome
+ * derivado, DO block, `IF NOT EXISTS`, comentário) e diff de `pg_index`
+ * antes/depois é uma asserção por DELTA — e delta é exatamente o que a
+ * reaplicação lava: o índice já estava inválido antes, então o delta é vazio e
+ * o runner marcaria a migration como aplicada.
+ *
+ * A regra aqui é uma INVARIANTE ABSOLUTA: "nenhum índice inválido no escopo".
+ * Ela é estabelecida antes do loop (o bloco `invalid_index` em
+ * `applyUnderLock`, que recusa o run inteiro) e reasserida aqui. Como o
+ * pré-estado é provadamente vazio, qualquer índice inválido encontrado agora
+ * nasceu durante ESTA migration — atribuição por invariante, sem parser e sem
+ * delta.
+ *
+ * ### Por que só `self` e `none`
+ *
+ * São os dois modos em que a linha do ledger é escrita DEPOIS do DDL, ou seja,
+ * os únicos em que ainda dá para recusar. No modo `runner` a linha e o DDL
+ * commitam juntos e o Postgres recusa DDL `CONCURRENTLY` dentro de transação,
+ * então o modo não consegue produzir um índice inválido; se um aparecer por
+ * outra via (um operador rodando DDL à mão numa sessão paralela), quem o
+ * enxerga é o pré-voo do próximo run e a readiness — nunca em silêncio.
+ */
+async function assertNoInvalidIndexes(
+  client: LedgerClient,
+  migrationId: string,
+  emit: MigrationEventSink,
+): Promise<void> {
+  const found = await readInvalidIndexes(client);
+  if (found.length === 0) return;
+  for (const index of found) {
+    emit('migration.invalid_index', {
+      migration_id: migrationId,
+      index: invalidIndexKey(index),
+      table: index.table,
+      indisready: index.ready,
+      indislive: index.live,
+      phase: 'post_apply',
+    });
+  }
+  throw new InvalidIndexAfterMigrationError(migrationId, found);
 }
 
 async function applyTimeouts(
@@ -351,7 +454,28 @@ async function applyUnderLock(
 
   const status = await readStatus(client, artifact);
 
-  const blockers: SchemaBlocker[] = [];
+  // #658 — ÍNDICE INVÁLIDO BLOQUEIA ANTES DE QUALQUER DDL.
+  //
+  // Este é o braço que fecha a reaplicação: depois de um
+  // `CREATE UNIQUE INDEX CONCURRENTLY` que reprovou, o índice fica no catálogo
+  // com `indisvalid = false`, e o `IF NOT EXISTS` da tentativa seguinte o
+  // enxerga, pula a criação e devolve SUCESSO. Rodar o arquivo de novo — mesmo
+  // depois de um `repair --as pending` — marcaria a migration como aplicada com
+  // a invariante de exclusão inexistente.
+  //
+  // Vem PRIMEIRO na lista porque, quando coexiste com o `dirty` que a mesma
+  // falha produziu, ele é a causa: reparar a linha do ledger sem tratar o índice
+  // é exatamente o erro que a issue existe para eliminar.
+  const blockers: SchemaBlocker[] = invalidIndexBlockers(status.invalid_indexes);
+  for (const index of status.invalid_indexes) {
+    emit('migration.invalid_index', {
+      index: invalidIndexKey(index),
+      table: index.table,
+      indisready: index.ready,
+      indislive: index.live,
+      phase: 'preflight',
+    });
+  }
   for (const entry of status.entries) {
     if (!entry.blocking) continue;
     if (entry.state === 'checksum_mismatch') {
@@ -457,6 +581,7 @@ async function applyUnderLock(
             await client.query('ROLLBACK').catch(() => undefined);
             throw err;
           }
+          await assertNoInvalidIndexes(client, id, emit);
           await markApplied(client, id, migration.checksum, now() - startedAt, provenance);
           break;
 
@@ -465,15 +590,22 @@ async function applyUnderLock(
           for (const stmt of splitNoTxStatements(migration.sql)) {
             await client.query(stmt);
           }
+          await assertNoInvalidIndexes(client, id, emit);
           await markApplied(client, id, migration.checksum, now() - startedAt, provenance);
           break;
       }
     } catch (err) {
       const cls = errorClass(err);
+      const invalidIndex = err instanceof InvalidIndexAfterMigrationError;
       // `dirty` only where a partial change is actually possible — decided from
       // the file's PROVEN transaction envelope, not from its `BEGIN;`. See
       // `terminalLedgerStatusFor`.
-      const ledgerStatus = terminalLedgerStatusFor(migration);
+      //
+      // #658 força `dirty` quando o motivo é um índice inválido, qualquer que
+      // seja o envelope: o índice está DURAVELMENTE no catálogo, nenhum
+      // ROLLBACK o remove, e `failed` o devolveria à fila de retentativa
+      // automática — onde o `IF NOT EXISTS` o transformaria em sucesso falso.
+      const ledgerStatus = invalidIndex ? 'dirty' : terminalLedgerStatusFor(migration);
       await markTerminalFailure(
         client,
         id,
@@ -502,13 +634,22 @@ async function applyUnderLock(
         applied,
         backfilled,
         orphaned,
-        blockers: [
-          {
-            kind: ledgerStatus === 'dirty' ? 'dirty_migration' : 'migration_failed',
-            id,
-            detail: `migration "${id}" failed (${cls}); recorded as ${ledgerStatus}. Subsequent migrations were NOT attempted.`,
-          },
-        ],
+        blockers: invalidIndex
+          ? [
+              ...invalidIndexBlockers((err as InvalidIndexAfterMigrationError).indexes),
+              {
+                kind: 'dirty_migration' as const,
+                id,
+                detail: `migration "${id}" ran without raising but left the schema carrying an INVALID index; recorded as dirty, NOT as applied. Subsequent migrations were NOT attempted.`,
+              },
+            ]
+          : [
+              {
+                kind: ledgerStatus === 'dirty' ? 'dirty_migration' : 'migration_failed',
+                id,
+                detail: `migration "${id}" failed (${cls}); recorded as ${ledgerStatus}. Subsequent migrations were NOT attempted.`,
+              },
+            ],
         status: failureStatus,
         failure: { id, error_class: cls, ledger_status: ledgerStatus },
         lock_waited_ms: lockWaited,

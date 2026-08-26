@@ -32,7 +32,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { migrationChecksum } from '@/migrations/checksum.js';
 import { LEDGER_V2_COLUMNS } from '@/migrations/ledger.js';
-import type { ReadOnlyPool, ReadOnlyPoolClient } from '@/migrations/index.js';
+import type { InvalidIndex, ReadOnlyPool, ReadOnlyPoolClient } from '@/migrations/index.js';
 
 // ── o grafo pesado do boot, mockado (o boot morre antes de tudo isto) ────────
 vi.mock('@/lib/logger.js', () => ({
@@ -128,14 +128,25 @@ function appliedRow(name: string, overrides: Partial<LedgerRow> = {}): LedgerRow
 
 function ledgerPool(
   rows: readonly LedgerRow[],
-  options: { connectError?: Error } = {},
+  options: { connectError?: Error; invalidIndexes?: readonly InvalidIndex[] } = {},
 ): ReadOnlyPool {
   return {
     async connect() {
       if (options.connectError) throw options.connectError;
       const client: ReadOnlyPoolClient = {
         query: <R,>(text: string): Promise<{ rows: R[] }> => {
-          const out = text.includes('information_schema.columns')
+          // #658 — a sonda de `pg_index`. Reconhecida explicitamente: sem isto
+          // o `else` devolveria as linhas do LEDGER para a consulta de
+          // catálogo, e todo veredito nasceria com um índice inválido fantasma.
+          const out = text.includes('NOT i.indisvalid')
+            ? (options.invalidIndexes ?? []).map((i) => ({
+                schema_name: i.schema,
+                index_name: i.index,
+                table_name: i.table,
+                is_ready: i.ready,
+                is_live: i.live,
+              }))
+            : text.includes('information_schema.columns')
             ? V2_COLUMNS.map((column_name) => ({ column_name }))
             : rows.map((r) => ({
                 applied_at: '2026-01-01T00:00:00.000Z',
@@ -177,7 +188,7 @@ interface BootOutcome {
  */
 async function boot(
   rows: readonly LedgerRow[],
-  options: { connectError?: Error } = {},
+  options: { connectError?: Error; invalidIndexes?: readonly InvalidIndex[] } = {},
 ): Promise<BootOutcome> {
   vi.resetModules();
   // `vi.resetModules()` limpa o registro de MÓDULOS, não o de mocks: as
@@ -229,7 +240,10 @@ describe('a tabela de exit codes', () => {
     const { SCHEMA_BOOT_EXIT_CODES } = await import('@/runtime/lifecycle/schema-boot-gate.js');
     for (const [kind, code] of Object.entries(SCHEMA_BOOT_EXIT_CODES)) {
       expect(code, kind).toBeGreaterThanOrEqual(90);
-      expect(code, kind).toBeLessThanOrEqual(97);
+      // 98 é o teto desde a #658 (`invalid_index`). O que a faixa precisa
+      // garantir é não colidir com 0/1/2, com os 1-14 do Node e com os 126-165
+      // do shell — e 98 satisfaz todas.
+      expect(code, kind).toBeLessThanOrEqual(98);
     }
   });
 
@@ -258,6 +272,38 @@ describe('src/index.ts — o passo `schema` decide pelo veredito canônico', () 
     expect(String(out.refusal?.remediation)).toMatch(/migrate\.ts repair/);
     expect(out.fatalMessage).toContain('SCHEMA BOOT REFUSED');
     expect(out.fatalMessage).toContain(HEAD);
+  }, 20_000);
+
+  /**
+   * #658 — o ledger diz `applied` para TUDO, e mesmo assim o boot recusa,
+   * porque o catálogo carrega um índice `indisvalid = false`. É o caso que o
+   * gate anterior não tinha como enxergar: nenhuma linha do ledger o revela.
+   *
+   * O `dirty` entra junto de propósito: os dois blockers coexistem no mundo
+   * real (a mesma falha produz ambos), e a precedência tem de escolher o 98 —
+   * um operador que lesse 90 primeiro repararia a linha e reaplicaria o
+   * arquivo, e o `IF NOT EXISTS` devolveria sucesso sobre o índice ainda
+   * inválido.
+   */
+  it('ÍNDICE INVÁLIDO: exit 98, à frente do `dirty`, com o índice nomeado e o DROP na remediação', async () => {
+    const out = await boot([appliedRow('001_first.sql'), appliedRow(HEAD, { status: 'dirty' })], {
+      invalidIndexes: [
+        {
+          schema: 'public',
+          index: 'agent_turns_stream_active_uq',
+          table: 'agent_turns',
+          ready: false,
+          live: true,
+        },
+      ],
+    });
+    expect(out.exitCode).toBe(98);
+    expect(out.refusal).toMatchObject({ exit_code: 98, blocker: 'invalid_index', verdict: 'blocked' });
+    expect(String(out.refusal?.remediation)).toMatch(/DROP INDEX CONCURRENTLY/);
+    expect(out.fatalMessage).toContain('SCHEMA BOOT REFUSED');
+    expect(out.fatalMessage).toContain('agent_turns_stream_active_uq');
+    // O `dirty` continua visível — o operador precisa saber que há os dois.
+    expect(out.refusal?.blockers).toContain('dirty_migration');
   }, 20_000);
 
   it('CHECKSUM DIVERGENTE: exit 91, com esperado vs. encontrado no log', async () => {

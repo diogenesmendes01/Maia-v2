@@ -183,10 +183,38 @@ export interface MigrationEntryStatus {
   readonly error_class: string | null;
 }
 
+/**
+ * Um índice que existe no catálogo com `pg_index.indisvalid = false` — issue
+ * #658. Não é otimização ausente: quando o índice é único e parcial, ele é o
+ * MECANISMO DE EXCLUSÃO, e inválido significa que a exclusão não existe.
+ *
+ * Lido por `readInvalidIndexes` (`invalid-indexes.ts`), transportado no
+ * `MigrationStatusReport` e transformado em blocker por `evaluateSchemaReadiness`.
+ */
+export interface InvalidIndex {
+  /** Schema do índice (sempre dentro do `search_path` da conexão). */
+  readonly schema: string;
+  /** Nome do índice. */
+  readonly index: string;
+  /** Tabela indexada. */
+  readonly table: string;
+  /** `pg_index.indisready` — `false` = build concorrente reprovou. */
+  readonly ready: boolean;
+  /** `pg_index.indislive` — `false` = `DROP INDEX CONCURRENTLY` interrompido. */
+  readonly live: boolean;
+}
+
 export type SchemaBlockerKind =
   | 'ledger_unavailable'
   | 'ledger_missing'
   | 'dirty_migration'
+  /**
+   * Há um índice `indisvalid = false` no escopo desta conexão (#658). Bloqueia
+   * o migrator ANTES de qualquer DDL e bloqueia a readiness, porque um índice
+   * único inválido é uma invariante de exclusão que não existe — e porque
+   * `IF NOT EXISTS` transformaria a próxima tentativa em um sucesso falso.
+   */
+  | 'invalid_index'
   /**
    * A migration failed cleanly (its transaction rolled back). Reported by the
    * runner; readiness surfaces the same situation as `schema_below_minimum`,
@@ -263,6 +291,16 @@ export interface MigrationStatusReport {
   readonly out_of_order: readonly string[];
   readonly counts: MigrationStatusCounts;
   readonly problems: readonly ArtifactProblem[];
+  /**
+   * Índices `indisvalid = false` observados no escopo da conexão (#658).
+   *
+   * Vive no relatório — e não só nos logs do runner — porque o relatório é
+   * contratado como a descrição COMPLETA de "artefato × banco", e um índice
+   * inválido é estado do BANCO que nenhuma linha do ledger revela: o ledger
+   * pode dizer `applied` para a migration que deveria tê-lo criado.
+   * `[]` quando o catálogo não foi consultado (chamadores puros/unitários).
+   */
+  readonly invalid_indexes: readonly InvalidIndex[];
 }
 
 /**
