@@ -14,6 +14,7 @@ Introduced by issue #516. Replaces the loop that used to live inline in `scripts
 | `src/migrations/checksum.ts` | Canonicalisation + SHA-256. The determinism contract. |
 | `src/migrations/discover.ts` | Reads `migrations/`, orders it, detects markers, pairs `_down` siblings, tokenises SQL into top-level statements and **proves** the transaction envelope. Pure core (`buildMigrationArtifact`) + disk wrapper. |
 | `src/migrations/status.ts` | **The decision core.** `computeMigrationStatus` (artifact + ledger ⇒ status) and `evaluateSchemaReadiness` (status + manifest ⇒ verdict). Pure, no DB. |
+| `src/migrations/invalid-indexes.ts` | **A sonda de `pg_index` (#658).** Lê os índices `indisvalid = false` no escopo da conexão e os transforma em blockers. Uma consulta somente-leitura, segura dentro de `BEGIN READ ONLY`. |
 | `src/migrations/lock.ts` | Global advisory lock on a dedicated client, with waiting semantics. |
 | `src/migrations/ledger.ts` | `schema_migrations` v2: bootstrap DDL, reads, state transitions, checksum backfill, repair. |
 | `src/migrations/runner.ts` | `runMigrations` / `repairMigration` — the only things that change the schema. |
@@ -149,6 +150,21 @@ That only works **across commits**. In `runner` mode the whole file is one trans
 | `checksum_mismatch` | an applied migration was edited (or this build ships a different file) | **yes** | **yes** |
 | `checksum_unknown` | applied with no recorded checksum | **yes** | **yes** |
 | `missing_file` | the DB ran a migration this build does not ship | **yes** | **yes** |
+
+### Índice inválido — um blocker que não é uma linha do ledger (#658)
+
+`CREATE UNIQUE INDEX CONCURRENTLY` que reprova **não desaparece**: fica no catálogo com `pg_index.indisvalid = false`. E o `IF NOT EXISTS` da tentativa seguinte enxerga o índice inválido, pula a criação e devolve `CREATE INDEX` com sucesso — o runner leria exit 0 e marcaria a migration como `applied` com a invariante de exclusão inexistente. Neste projeto índice único parcial é **mecanismo de exclusão**, não otimização, então isso é a mesma classe de defeito que a épica #505 existe para eliminar.
+
+A regra é uma **invariante ABSOLUTA** — "nenhum índice inválido no escopo" —, não um delta de `pg_index` antes/depois. Delta é exatamente o que a reaplicação lava: o índice já estava inválido antes do run, o delta é vazio, e a migration seria certificada. Ela é asserida em dois pontos:
+
+| Ponto | Quando | Efeito |
+|---|---|---|
+| pré-voo (`runner.ts`, antes do loop) | todo `up` | blocker `invalid_index`, `outcome: 'blocked'`, **nenhuma DDL enviada** |
+| reasserção (`assertNoInvalidIndexes`, antes de `markApplied`) | modos `self` e `none` | `dirty` com `error_class = MIGRATION_INVALID_INDEX`; nunca `applied` |
+
+Como o pré-estado é provadamente vazio, qualquer índice inválido encontrado na reasserção nasceu naquela migration — **atribuição por invariante**, sem parser de SQL e sem delta. O modo `runner` não participa: a linha do ledger e a DDL commitam juntas, e o Postgres recusa DDL `CONCURRENTLY` dentro de transação, então o modo não consegue produzir um índice inválido.
+
+O veredito de schema carrega os índices em `MigrationStatusReport.invalid_indexes` (`[]` significa "não consultado", não "verificado e limpo" — quem consulta é `readInvalidIndexes`), `getSchemaReadiness` vira `blocked`, e o boot morre com **exit 98**, à frente do 90 na precedência: quando os dois aparecem juntos o índice inválido é a causa e o `dirty` é a consequência. Escopo da varredura: `current_schemas(false)`. Remédio: [`docs/runbooks/migrations.md` §Índice inválido deixado por DDL `CONCURRENTLY`](../../runbooks/migrations.md#índice-inválido-deixado-por-ddl-concurrently).
 
 Two things are **reported but not blocking**, deliberately:
 

@@ -1,0 +1,43 @@
+-- maia:no-transaction
+-- Rollback da 126 (issue #626, fatia C da #505).
+--
+-- ─── O QUE ESTE ROLLBACK É, E O QUE ELE NÃO É ─────────────────────────────
+--
+-- Ele derruba o índice de SUPORTE do head-of-line. Ele NÃO desliga o
+-- head-of-line: a regra é um `NOT EXISTS` no `WHERE` do claim, não uma
+-- constraint, e ela continua CORRETA sem índice nenhum — só fica cara.
+--
+-- Isso é deliberado e é a diferença em relação à 124 (fatia B), cujo `_down`
+-- desliga a invariante inteira. Aqui a invariante mora no código, então o kill
+-- switch da fatia é a flag `FEATURE_TURN_HEAD_OF_LINE=false`, não este arquivo.
+--
+-- **Ordem obrigatória num rollback de verdade:** desligue a flag PRIMEIRO,
+-- confirme que as réplicas recarregaram, e só então derrube o índice. Na ordem
+-- inversa você deixa a regra ligada sem índice — que é a degradação de hot
+-- stream que a fatia inteira existe para evitar, aplicada de propósito, durante
+-- um incidente.
+--
+-- ─── POR QUE NÃO HÁ ENVELOPE `BEGIN`/`COMMIT` ────────────────────────────
+--
+-- Mesma razão do `_down` da 122 e da 124: o runner aplica com
+-- `psql -v ON_ERROR_STOP=1 -f`, que é autocommit por statement, e a regra geral
+-- do repositório manda envelopar — mas `DROP INDEX CONCURRENTLY` é RECUSADO
+-- pelo PostgreSQL dentro de um bloco de transação. Trocar por `DROP INDEX`
+-- simples para poder envelopar tomaria ACCESS EXCLUSIVE sobre `agent_turns` e
+-- bloquearia claim, transição e conclusão durante um rollback.
+--
+-- O que compensa: UM único statement, idempotente (`IF EXISTS`). Não existe
+-- estado intermediário — ou o índice caiu, ou não caiu — e reexecutar é seguro.
+--
+-- NOTA OPERACIONAL: um `DROP INDEX CONCURRENTLY` cancelado no meio deixa o
+-- índice INVÁLIDO (`pg_index.indisvalid = false`): ele para de servir leitura e
+-- continua custando escrita, e não some sozinho. Reexecutar este arquivo o
+-- remove. Ver docs/runbooks/turn-state-machine.md §11.4.
+--
+-- A 122 (`agent_turns_stream_head_idx`) NÃO é tocada aqui: ela é de outra fatia
+-- e responde a outras perguntas. Ordem no rollback COMPLETO do protocolo de
+-- stream: 126 → 124 → 122 → 120.
+--
+-- Nunca rodar automaticamente durante incidente — ver docs/runbooks/migrations.md.
+
+DROP INDEX CONCURRENTLY IF EXISTS agent_turns_stream_head_live_idx;
