@@ -857,8 +857,15 @@ async function runAgentTurnPipeline(params: {
         metadata: { count: decision.count, threshold: decision.threshold },
       });
       const reply = formatPoliteReply(decision.threshold);
+      // #634 — esta é uma RECUSA POR POLÍTICA visível ao usuário, não a
+      // resposta do agente. `fallback_reason` muda o `payload_type` do artefato
+      // durável de `text` para `status_fallback`, que é o tipo que #506 exige
+      // para "fallback/timeout também usam outbox". Sem ele o outbox registrava
+      // a recusa como se fosse conteúdo do agente, e nenhuma consulta
+      // conseguia separar as duas.
       await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
         channel_id: c.channel_id,
+        fallback_reason: 'policy_refusal',
       }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
@@ -1308,8 +1315,10 @@ async function runAgentTurnPipeline(params: {
         // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
         // Never expose internal policy text (effect.message) to the user.
         const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — recusa por política do Decision Engine.
         await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
@@ -1332,8 +1341,10 @@ async function runAgentTurnPipeline(params: {
       if (packet.action_mode === 'escalate') {
         const escalateMsg =
           'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — escalada para aprovação também é recusa por política.
         await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
@@ -1557,8 +1568,11 @@ async function runAgentTurnPipeline(params: {
       //     envio, ou persistência falhou): NUNCA reenviar.
       let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
       try {
+        // #634 — o fail-closed do Decision Engine é ERRO INTERNO exposto ao
+        // usuário, o caso canônico de `status_fallback`.
         await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'internal_error',
         });
       } catch (e) {
         fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';
