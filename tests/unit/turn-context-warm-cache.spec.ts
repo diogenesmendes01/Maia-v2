@@ -88,7 +88,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: h.count('capabilitiesSkillRepo.listAll', async () => []) },
   capabilityGapsRepo: {
     listByLevel: h.count('capabilityGapsRepo.listByLevel', async () => []),
-    listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []),
+    listParaOTurno: h.count('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   procedureExecutionsRepo: {
     findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
@@ -200,7 +200,7 @@ describe('#511 warm-cache query budget', () => {
     expect(Object.keys(h.calls).sort()).toEqual([
       'behavioralHintRepo.findActiveForScopes',
       'capabilitiesSkillRepo.listAll',
-      'capabilityGapsRepo.listByLevels',
+      'capabilityGapsRepo.listParaOTurno',
       'entidadesRepo.byIdsWithState',
       'factsRepo.listMentionableForScopes',
       'memoryEntryRepo.findRelevant',
@@ -257,7 +257,7 @@ describe('#511 warm-cache query budget', () => {
     // between two turns takes effect on the next one — not after a TTL.
     expect(h.calls['capabilitiesSkillRepo.listAll']).toBe(1);
     // Issue #525 — ONE gap read now serves both gap blocks.
-    expect(h.calls['capabilityGapsRepo.listByLevels']).toBe(1);
+    expect(h.calls['capabilityGapsRepo.listParaOTurno']).toBe(1);
     expect(h.calls['capabilityGapsRepo.listByLevel']).toBeUndefined();
   });
 

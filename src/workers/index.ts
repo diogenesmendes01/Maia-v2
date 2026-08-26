@@ -30,6 +30,10 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import {
+  runToolRequestIssueRelayer,
+  runToolRequestClosureMonitor,
+} from './tool-request-triage.js';
 import { runTraceBodyWriter } from './trace-body-writer.js';
 import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
@@ -194,6 +198,27 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // #638 (fatia C da épica #471) — a metade de backend da triagem de pedidos de
+  // ferramenta. O relayer roda de 5 em 5 minutos porque ele é o que o dono está
+  // esperando depois de clicar em "aceitar"; o monitor de fechamento roda de
+  // hora em hora porque o fato que ele observa (uma tool nova concedida a um
+  // agente) muda em escala de deploy, não de segundo.
+  {
+    name: 'tool_request_issue_relayer',
+    cron: '*/5 * * * *',
+    fn: async () => {
+      await runToolRequestIssueRelayer();
+    },
+    phase: 5,
+  },
+  {
+    name: 'tool_request_closure_monitor',
+    cron: '7 * * * *',
+    fn: async () => {
+      await runToolRequestClosureMonitor();
+    },
+    phase: 5,
+  },
   // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
   // reinforced→verified→active by evidence_count + age, and expires stale
   // rows to deprecated).

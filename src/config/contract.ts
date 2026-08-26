@@ -2556,7 +2556,7 @@ export const ENV_CONTRACT = {
   READINESS_SCHEMA_CHECK: {
     name: 'READINESS_SCHEMA_CHECK',
     description:
-      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
+      'Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-98, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],
@@ -2604,6 +2604,51 @@ export const ENV_CONTRACT = {
     schema: z.string().optional(),
     example: '__SET_ME__setup_token',
     fixture: 'fixture-setup-token',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+
+  // ---- pedidos de ferramenta (issues da triagem) -------------------------
+  //
+  // #638 (fatia C da épica #471). As duas variáveis do efeito EXTERNO da
+  // triagem: para onde a issue vai, e com que credencial.
+  //
+  // O DESTINO é lido pelos dois serviços; a CREDENCIAL, só pelo `runtime`. Essa
+  // assimetria é a defesa central do critério "credencial do GitHub não vaza
+  // para o payload da proposta nem para log". O botão "aceitar" é servido pelo
+  // `admin-ui`, que valida o PRÓPRIO subset no boot: um token fora do subset
+  // dele não é lido, não é tipado e não existe naquele processo. O console
+  // reserva a linha (e precisa dizer ao dono para onde a issue vai, por isso
+  // conhece o repositório); quem fala com o GitHub é o relayer do `runtime`. A
+  // separação é estrutural, não é disciplina —
+  // `tests/unit/tool-request-credencial.spec.ts` a afirma contra o contrato.
+  MAIA_TOOL_REQUEST_ISSUE_REPO: {
+    name: 'MAIA_TOOL_REQUEST_ISSUE_REPO',
+    description:
+      'Repositório GitHub "owner/repo" onde a triagem de pedidos de ferramenta abre issues. Ausente = o aceite é recusado com motivo explícito (nada de destino implícito para efeito externo).',
+    group: 'tool-requests',
+    secret: false,
+    services: ['runtime', 'admin-ui'],
+    schema: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/, 'formato esperado: owner/repo')
+      .optional(),
+    example: 'minha-org/meu-repo',
+    fixture: 'maia-fixture/maia-fixture',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_TOOL_REQUEST_GITHUB_TOKEN: {
+    name: 'MAIA_TOOL_REQUEST_GITHUB_TOKEN',
+    description:
+      'Token do GitHub usado SOMENTE pelo relayer de pedidos de ferramenta (escopo mínimo: abrir issue no repositório acima). Não é lido pelo Admin UI — o console reserva o aceite, o runtime faz a chamada.',
+    group: 'tool-requests',
+    secret: true,
+    services: ['runtime'],
+    schema: z.string().optional(),
+    example: '__SET_ME__tool_request_github_token',
+    fixture: 'fixture-tool-request-token',
+    requiredWhen: { var: 'MAIA_TOOL_REQUEST_ISSUE_REPO', present: true },
     restartRequired: true,
     commentedInExample: true,
   },

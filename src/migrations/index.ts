@@ -77,11 +77,21 @@ export {
 } from './ledger.js';
 
 export {
+  describeInvalidIndex,
+  invalidIndexBlockers,
+  invalidIndexKey,
+  readInvalidIndexes,
+  INVALID_INDEX_QUERY,
+} from './invalid-indexes.js';
+
+export {
   repairAppliedRefusal,
   repairMigration,
   runMigrations,
   terminalLedgerStatusFor,
+  InvalidIndexAfterMigrationError,
   DEFAULT_STATEMENT_LOCK_TIMEOUT_MS,
+  INVALID_INDEX_ERROR_CODE,
   RUNNER_VERSION,
   type MigrationEventSink,
   type MigrationRunResult,

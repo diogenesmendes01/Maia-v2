@@ -602,9 +602,21 @@ function buildGapMentionSection(gaps: readonly AgentCapabilityGap[]): string | n
   // resolved must stop being announced immediately, not after a TTL.
   //
   // Issue #525: the rows arrive from the loader's SINGLE
-  // `listByLevels([mentionable, proposed])` read, shared with the
-  // self-awareness clause below — one statement now serves both blocks.
-  if (gaps.length === 0) return null;
+  // `listParaOTurno([mentionable, proposed], janela)` read, shared with the
+  // self-awareness clause below — one statement now serves three blocks.
+  //
+  // #638 (fatia C da épica #471): a mesma leitura traz também os gaps
+  // RECÉM-FECHADOS, e eles não são limitação — são o oposto. Sem este filtro, o
+  // agente continuaria dizendo "isto eu não consigo" sobre exatamente a
+  // ferramenta que acabou de ganhar, que é a regressão que fecharia o ciclo da
+  // épica de cabeça para baixo.
+  // `!g.resolved_at` e não `=== null`: a linha do banco traz `null`, mas um
+  // chamador que monte a linha à mão (teste, dublê de repositório) pode omitir
+  // o campo. "Sem data de resolução" é gap ABERTO nos dois casos, e tratar
+  // `undefined` como fechado esconderia limitações reais.
+  const abertos = gaps.filter((g) => !g.resolved_at);
+  if (abertos.length === 0) return null;
+  gaps = abertos;
   // #511: the 5-gap cap is now metered instead of silent (token bloat guard).
   const lines = applyBudget(
     'gaps',
@@ -621,6 +633,59 @@ function buildGapMentionSection(gaps: readonly AgentCapabilityGap[]): string | n
     return `- Se o usuário perguntar sobre ${g.capability_description}, você pode explicar honestamente que isso é uma limitação atual${proposedSuffix}.`;
   });
   return `## Limitações conhecidas (mencionar com transparência se vier à tona)\n${lines.join('\n')}`;
+}
+
+/**
+ * #638 (fatia C da épica #471) — "## Capacidades novas": o AVISO ao agente de
+ * que a ferramenta que ele pediu passou a existir.
+ *
+ * É a metade que fecha o laço da épica. O gap que virou pedido de ferramenta
+ * sai do bloco de limitações no instante em que fecha — isso sozinho já faz o
+ * agente parar de dizer "não consigo". Este bloco é a metade POSITIVA: ele diz,
+ * em primeira pessoa, qual ferramenta passou a existir e por causa de qual
+ * limitação. Sem ele, o agente descobriria a capacidade nova por acaso, quando
+ * a tool aparecesse na lista de tools do turno.
+ *
+ * A fonte é o `resolved_at`/`resolved_tool_name` do próprio gap, escrito pelo
+ * monitor de fechamento a partir do estado REAL da capability. O prompt não
+ * decide nada aqui — ele mostra o que o backend já decidiu, que é a mesma
+ * disciplina que a triagem no console segue.
+ *
+ * A JANELA (`JANELA_DE_AVISO_DE_CAPACIDADE_DIAS`) é aplicada no `SELECT` do
+ * loader: passado o prazo, a ferramenta é só mais uma tool na caixa e o aviso
+ * some sozinho. Repetir a notícia para sempre gastaria contexto todo turno.
+ *
+ * NÃO cacheado, pela mesma razão que o bloco de limitações não é: um fato de
+ * capacidade que muda tem de aparecer no turno seguinte, não depois de um TTL.
+ */
+function buildCapacidadeAdquiridaSection(
+  gaps: readonly AgentCapabilityGap[],
+): string | null {
+  const fechados = gaps
+    .filter((g) => Boolean(g.resolved_at) && (g.resolved_tool_name ?? '').length > 0)
+    // Mais recente primeiro: se o orçamento cortar, o que sobra é a notícia
+    // mais nova, que é a que o agente ainda não teve chance de usar.
+    .sort((a, b) => (b.resolved_at?.getTime() ?? 0) - (a.resolved_at?.getTime() ?? 0));
+  if (fechados.length === 0) return null;
+
+  const lines = applyBudget(
+    'capacidades_novas',
+    fechados,
+    SECTION_BUDGETS.capacidades_novas,
+    (g) => utf8Bytes(g.capability_description),
+    (g, maxBytes) => ({
+      ...g,
+      capability_description: truncateUtf8(g.capability_description, maxBytes),
+    }),
+  )
+    .items.filter((g) => g.capability_description.length > 0)
+    .map(
+      (g) =>
+        `- ${wrapGap(g.capability_description)} deixou de ser limitação: use a ferramenta \`${g.resolved_tool_name}\`.`,
+    );
+  if (lines.length === 0) return null;
+
+  return `## Capacidades novas (o que você pediu e agora existe)\n${lines.join('\n')}`;
 }
 
 /**
@@ -730,7 +795,11 @@ function renderSelfAwarenessSection(
   skills: readonly AgentCapabilitySkill[],
   gaps: readonly AgentCapabilityGap[],
 ): string {
-  const mentionableGapRows = gaps.filter((g) => g.current_level === GapLevel.MENTIONABLE);
+  // #638: aberto E mentionable. Um gap fechado sai da cláusula "Ainda não
+  // tem:" pelo mesmo motivo pelo qual sai do bloco de limitações.
+  const mentionableGapRows = gaps.filter(
+    (g) => g.current_level === GapLevel.MENTIONABLE && !g.resolved_at,
+  );
 
   // Deterministic order before the cut: sort by confidence, then by name so two
   // skills with equal confidence never swap places between turns (which would
@@ -951,6 +1020,10 @@ export function renderTurnPrompt(
   // P5 Task 10: surface gaps at mentionable/proposed level so the agent can be
   // transparent about known limitations if they come up.
   const gapMentionBlock = buildGapMentionSection(snapshot.gaps.value);
+  // #638: a metade POSITIVA da mesma leitura — o que fechou porque a
+  // ferramenta pedida passou a existir e a estar concedida.
+  const capacidadeNovaBlock = buildCapacidadeAdquiridaSection(snapshot.gaps.value);
+  const capacidadeNovaSection = capacidadeNovaBlock ? '\n' + capacidadeNovaBlock : '';
   const gapMentionSection = gapMentionBlock ? '\n' + gapMentionBlock : '';
 
   // Issue #73 — scope-change sentinel + backend events + contradiction overlay.
@@ -1037,7 +1110,8 @@ export function renderTurnPrompt(
     + selfAwarenessSection
     + roleSection
     + procedureSection
-    + gapMentionSection;
+    + gapMentionSection
+    + capacidadeNovaSection;
 
   // Build conversation messages: oldest first.
   // History stays RAW — no inline tool-summary injection (auditability + the

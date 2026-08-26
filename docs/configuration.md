@@ -49,8 +49,8 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 183 | 19 |
-| `admin-ui` | 27 | 6 |
+| `runtime` | 185 | 20 |
+| `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
 | `maintenance` | 63 | 13 |
@@ -346,7 +346,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `SHUTDOWN_FORCED_EXIT_CODE` | number | `1` | não | `runtime` | sim | Código de saída quando o drain termina INCOMPLETO (deadline estourado com trabalho em voo, segundo sinal, ou fase de boot que não cedeu). Distinto do 0 de um drain limpo, para o supervisor e o log distinguirem os dois casos. |
 | `READINESS_CACHE_MS` | number | `2000` | não | `runtime` | sim | Janela de cache da avaliação de componentes do /readyz, para que um polling agressivo do load balancer não vire gerador de carga em DB/Redis. O ESTADO do lifecycle nunca é cacheado: o drain derruba o /readyz para 503 na requisição seguinte. |
 | `READINESS_PROBE_TIMEOUT_MS` | number | `1500` | não | `runtime` | sim | Timeout por componente nas probes de readiness. Componente que não responde a tempo é reportado como `unknown` — o que é fail-closed para um componente obrigatório do papel. |
-| `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso. |
+| `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-98, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso. |
 | `READINESS_BACKLOG_MAX` | number | `0` | não | `runtime` | sim | Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog. |
 | `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. |
 
@@ -355,6 +355,13 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
 | `SETUP_TOKEN_OVERRIDE` | string | — | sim | `runtime` | sim | Override do token de bootstrap. Desencorajado em produção (env vaza mais que arquivo 0600), mas não proibido — deploys scriptados legítimos usam. |
+
+### Pedidos de ferramenta (issues da triagem)
+
+| Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
+|---|---|---|---|---|---|---|
+| `MAIA_TOOL_REQUEST_ISSUE_REPO` | string | — | não | `runtime`, `admin-ui` | sim | Repositório GitHub "owner/repo" onde a triagem de pedidos de ferramenta abre issues. Ausente = o aceite é recusado com motivo explícito (nada de destino implícito para efeito externo). |
+| `MAIA_TOOL_REQUEST_GITHUB_TOKEN` | string | — | sim | `runtime` | sim | Token do GitHub usado SOMENTE pelo relayer de pedidos de ferramenta (escopo mínimo: abrir issue no repositório acima). Não é lido pelo Admin UI — o console reserva o aceite, o runtime faz a chamada. Obrigatória quando MAIA_TOOL_REQUEST_ISSUE_REPO está definida. |
 
 ### Admin UI (container Next.js separado)
 

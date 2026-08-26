@@ -47,7 +47,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: capabilitiesSkillListAll },
   capabilityGapsRepo: {
     listByLevel: capabilityGapsListByLevel,
-    listByLevels: capabilityGapsListByLevels,
+    listParaOTurno: capabilityGapsListByLevels,
   },
   procedureExecutionsRepo: { findActiveForConversa: procedureExecutionsFindActiveForConversa },
   procedureDefinitionsRepo: { findById: procedureDefinitionsFindById },

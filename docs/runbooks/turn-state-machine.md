@@ -634,11 +634,19 @@ continua custando escrita e não serve a nenhuma leitura. O mesmo vale para um
 **A armadilha, verificada contra o PostgreSQL 16 e não deduzida:** reaplicar a
 migration depois disso **DEVOLVE SUCESSO**. O `IF NOT EXISTS` encontra o índice
 inválido, emite `NOTICE: relation "agent_turns_stream_active_uq" already exists,
-skipping`, responde `CREATE INDEX`, e o runner marca a migration como aplicada —
-com o índice ainda inválido e **a exclusão inexistente**. Nenhum sinal do
-runner distingue esse desfecho de um deploy bem-sucedido. A checagem abaixo é a
-única coisa que distingue, e ela precisa entrar no roteiro de deploy, não na
-lista de coisas a lembrar durante um incidente:
+skipping`, responde `CREATE INDEX`, e o `psql` sai 0 — com o índice ainda
+inválido e **a exclusão inexistente**.
+
+**Desde a [#658](https://github.com/diogenesmendes01/Maia-v2/issues/658) isto
+não depende mais de disciplina humana.** O runner de migrations recusa o run
+inteiro ANTES de qualquer DDL quando o escopo carrega um índice inválido
+(blocker `invalid_index`), recusa marcar como aplicada uma migration que
+terminou com um índice inválido no catálogo, e o boot da aplicação morre com
+**exit 98**. A recusa sobrevive inclusive a um `repair --as pending`, porque
+limpar a linha do ledger não conserta o catálogo.
+
+O que continua valendo aqui é o diagnóstico do incidente: se a consulta de
+§10.3 devolver alguma stream com `ativos > 1`, confirme o estado do índice —
 
 ```sql
 SELECT indexrelid::regclass AS indice, indisvalid, indisready
@@ -646,14 +654,11 @@ SELECT indexrelid::regclass AS indice, indisvalid, indisready
  WHERE indexrelid::regclass::text = 'agent_turns_stream_active_uq';
 ```
 
-`indisvalid = false` ⇒ limpeza **manual**, nesta ordem:
-
-1. `DROP INDEX CONCURRENTLY IF EXISTS agent_turns_stream_active_uq;`
-2. rode a consulta de duplicatas do §10.2 e resolva o que ela devolver;
-3. reaplique a `124`.
-
-Enquanto o índice estiver inválido a exclusão **não existe** — trate como
-incidente aberto, não como pendência de limpeza.
+— e siga o remédio completo em
+[`docs/runbooks/migrations.md` §Índice inválido deixado por DDL `CONCURRENTLY`](migrations.md),
+que é a fonte única desse procedimento. Enquanto o índice estiver inválido a
+exclusão **não existe**: trate como incidente aberto, não como pendência de
+limpeza.
 
 ### 10.5 Stream travada
 
