@@ -198,7 +198,14 @@ function ledgerPool(
       if (options.connectError) throw options.connectError;
       const client: ReadOnlyPoolClient = {
         query: <R,>(text: string): Promise<{ rows: R[] }> => {
-          const out = text.includes('information_schema.columns')
+          // #658 — a sonda de `pg_index`. Sem este ramo o `else` devolveria as
+          // linhas do LEDGER para a consulta de catálogo e todo veredito
+          // nasceria com um índice inválido fantasma. Este ledger forjado nunca
+          // tem um; o caso positivo roda contra Postgres real em
+          // `tests/integration/migrations-runner-real-db.spec.ts`.
+          const out = text.includes('NOT i.indisvalid')
+            ? []
+            : text.includes('information_schema.columns')
             ? V2_COLUMNS.map((column_name) => ({ column_name }))
             : rows.map((r) => ({
                 applied_at: '2026-01-01T00:00:00.000Z',

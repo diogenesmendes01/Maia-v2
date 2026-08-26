@@ -196,12 +196,786 @@ cada vez:
 ON, `false` em production é ERRO de escopo `boot` (logo sobrevive a
 `MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e
 ligada sem `FEATURE_TURN_STATE_MACHINE` é inerte — e inerte é erro.
+### Poison/DLQ com escolha explícita, replay que respeita a ordem, e fairness medida ([#629](https://github.com/diogenesmendes01/Maia-v2/issues/629), fatia F de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 8 de 9 — **fecha a épica**)
+
+> **AÇÃO DO OPERADOR: aplique a migration `133` ANTES de subir o código.** Ela é
+> atômica (tabela NOVA e vazia, sem `CONCURRENTLY`, num envelope
+> `BEGIN`/`COMMIT`), então **não** está exposta à armadilha do índice inválido
+> que devolve sucesso na reaplicação. Subir o código antes quebra a conclusão de
+> todo turno envenenado da categoria bloqueante: o INSERT da interdição
+> referencia a tabela, e a falha cai DENTRO da transação do CAS terminal — o
+> turno nem morre.
+
+**O problema.** Até aqui, `dead_letter` liberava a conversa. Não por decisão: por
+OMISSÃO. `dead_letter` é terminal, um turno terminal sai do predicado de
+head-of-line (#626), logo o sucessor virava reivindicável — sem que ninguém
+tivesse escolhido isso. A issue-mãe chama exatamente essa situação de falha nº 5
+e exige que a política escolha **conscientemente** entre duas saídas defensáveis
+e incompatíveis: liberar preserva disponibilidade às custas da semântica (a
+plataforma responde M2 sem nunca ter respondido M1); bloquear preserva a
+semântica às custas da conversa (nada anda até um humano olhar).
+
+**A escolha, por categoria de erro.** `src/runtime/turns/poison-policy.ts` (puro,
+sem I/O) classifica `(código, outcome)` em seis categorias de cardinalidade
+fechada — `effect_committed`, `model`, `transport`, `infrastructure`, `operator`,
+`unknown` — e `TURN_POISON_BLOCK_CATEGORIES` diz quais BLOQUEIAM. O `outcome`
+domina o código: `unsafe_to_retry` é produzido por `decideTurnAction` exatamente
+quando uma tool irreversível já rodou, e é evidência de primeira ordem; o código
+que o acompanha (`reasoner_failed`, `outbound_failure`) é sintoma.
+
+**Default: `effect_committed`, e só ele.** É a única categoria em que a conversa
+já está semanticamente quebrada ANTES de a política decidir. As outras têm causa
+COMPARTILHADA e transitória — um incidente de LLM ou de rede que bloqueasse
+pararia milhares de conversas de uma vez, com desbloqueio manual uma a uma. Uma
+categoria com erro de digitação **reprova o boot**, porque silenciá-la produziria
+um dashboard sem bloqueio nenhum e a leitura natural seria "não aconteceu nenhum
+caso" em vez de "a política está desligada".
+
+**A interdição é uma linha do PostgreSQL.** `agent_stream_blocks` (migration
+`133`), uma linha ATIVA por `(tenant, agent, stream_key)` garantida por índice
+único parcial. Ela é gravada na MESMA transação do CAS terminal e **antes** da
+eleição da promoção — a ordem é a fatia inteira: a eleição carrega
+`streamNotPoisoned`, então a promoção vê a interdição que a própria conclusão
+acabou de criar. Invertê-las produziria conversa bloqueada E sucessor acordado, e
+o defeito seria invisível.
+
+**A saída existe no mesmo commit.** `npm run dlq -- blocks` lista as conversas
+interditadas com o backlog de cada uma; `npm run dlq -- unblock-stream <turn_id>
+--reason "..."` desfaz, audita e re-arma o head. O turno envenenado **continua
+morto**, de propósito: desbloquear e ressuscitar são decisões diferentes, e
+fundi-las faria a segunda acontecer por acidente.
+
+**Replay manual não viola mais a ordem comprometida.** `replay-turn` recusa
+quando existe turno POSTERIOR da mesma stream já terminal — a plataforma já
+respondeu algo que veio depois. O guarda mora no `WHERE` do `UPDATE`, não numa
+consulta anterior: entre um `SELECT count` e o `UPDATE` um sucessor pode
+concluir. A saída é `--reconcile`, o "modo de replay/reconciliação explícito" da
+issue-mãe, auditado com row própria (`turn_replay_reconciled`).
+
+**Fairness e starvation, medidos pela primeira vez.** Nenhuma fatia da #505 os
+mediu: a #626 provou paralelismo, que é outra pergunta — um escalonador pode ter
+doze conversas rodando e ainda assim deixar a décima terceira parada para
+sempre. Entram `maia_stream_head_age_seconds` (+ p95), `maia_stream_turn_wait_seconds`
+(histograma, baldes em SEGUNDOS com cortes nos marcos reais do sistema),
+`maia_stream_active_total`, `maia_stream_live_total`, `maia_stream_backlog_max`,
+`maia_stream_starvation_total` e `maia_stream_poisoned_streams` — as três
+primeiras pedidas por nome pela issue-mãe desde o primeiro dia. Nenhuma carrega
+`stream_key`, `turn_id`, tenant ou o código de erro cru como label.
+
+`starvation_total` conta EPISÓDIOS, não amostras: um contador incrementado a
+cada coleta mediria a frequência do Prometheus. A deduplicação é por token opaco
+(`md5(tenant:agent:stream_key)`) em memória — o token nunca vira label nem log.
+
+**A medição, contra PostgreSQL real.** Com 4 vagas, 25 turnos numa conversa
+quente e 20 conversas de um turno, e os 25 jobs da quente entrando ANTES (o pior
+caso), as pequenas terminam com mediana de posição **11 de 45** — sem fairness
+sairiam todas depois do turno 25. E com o head de uma conversa segurado por um
+worker vivo durante toda a rodada, as outras **30 terminam inteiras**.
+
+**Limite de backlog: MEDIDO, não APLICADO.** `maia_stream_backlog_max` entrega o
+número; o limite não é aplicado porque a única pressão possível no ingresso seria
+RECUSAR mensagem de usuário do WhatsApp — perda de dado, contra um backlog que na
+prática o próprio usuário limita.
+
+**Kill switch:** `TURN_POISON_BLOCK_CATEGORIES=` (lista vazia) + restart. Nenhum
+bloqueio NOVO nasce e a conclusão volta ao comportamento da #627. Ela **não**
+desfaz interdições existentes — quem as desfaz é o comando auditado. É
+deliberado: uma conversa que um humano interditou não volta a andar porque
+alguém mexeu numa variável de ambiente.
+
+Runbook: [`docs/runbooks/turn-state-machine.md` §14](docs/runbooks/turn-state-machine.md).
+
+### Debounce transacional: a janela sai da memória e vira uma linha ([#628](https://github.com/diogenesmendes01/Maia-v2/issues/628), fatia E de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 7 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `130` ANTES de subir o código.** Ela
+> **não é atômica** — usa `CREATE INDEX CONCURRENTLY`, portanto
+> `maia:no-transaction`, e o runner autocommita por statement. Se o índice
+> falhar, as colunas ficam: estado correto, só lento, e reaplicar conserta.
+> **Confira `pg_index.indisvalid` à mão** depois de aplicar (a armadilha do
+> `CONCURRENTLY` que devolve sucesso com o índice inválido — runbook §10.4).
+> Subir o código antes da migration quebra todo ingresso de texto: a janela é
+> aberta dentro da transação que persiste a mensagem.
+
+**O problema.** A janela do debounce vivia em dois lugares que não são o banco:
+um job atrasado da BullMQ (o prazo no `delay`) e uma chave no Redis (o
+`first_enqueued_at`). Duas consequências, as duas nomeadas pela issue:
+
+* com N réplicas, duas podiam fechar **o mesmo batch — ou batches sobrepostos**,
+  porque não havia um ponto único onde "este batch fechou" pudesse ser afirmado
+  uma vez só. O sintoma é duas respostas para a mesma rajada, ou uma resposta que
+  ignora metade das mensagens; nenhuma linha do banco fica inconsistente;
+* um **reinício** entre o `agentQueue.add` e o disparo perdia a janela inteira.
+  As mensagens não se perdiam — o recovery por estado as rearmava —, mas saíam
+  como N turnos separados, até 2 minutos depois.
+
+**A janela como dado.** `agent_turns.debounce_window_opened_at` (âncora do teto,
+persistida), `debounce_deadline_at` (o prazo), `debounce_closed_at` (o
+fechamento) e `debounce_batch_size` (a evidência forense da composição). Ela é
+**aberta na MESMA transação que persiste o ingresso** e estendida na MESMA
+transação do ingresso seguinte: quando o commit acontece, a mensagem, o turno e o
+prazo em que a rajada dela pode fechar passam a existir juntos, ou nenhum existe.
+
+**O relógio é o do PostgreSQL.** Fechar exige `debounce_deadline_at <= now()`
+avaliado no banco, nunca um `Date.now()` de réplica — o mesmo raciocínio de
+`lease_expires_at > now()` no fence do claim (#504): existe um relógio só. O teto
+(`MESSAGE_DEBOUNCE_MAX_MS`) é ancorado no instante **persistido** da abertura, e é
+o que o faz sobreviver ao reinício do processo que abriu a janela.
+
+**A BORDA — o risco que a issue-mãe declarava.** *"Debounce distribuído é
+suscetível a bordas temporais mal definidas."* A borda escolhida está escrita em
+`src/db/repositories/stream-debounce-sql.ts`, e é de **serialização**, não de
+relógio: o mutex da stream é a linha de `agent_stream_sequences` — a MESMA que a
+alocação de `ingress_seq` já tranca —, então **um ingresso que comita antes de o
+fechador pegar o mutex entra no batch atual; um que comita depois entra no
+próximo.** Não existe instante em que o fechador enxergue a sequência 7 sem a 6:
+a lacuna que a issue proíbe absorver silenciosamente é **impossível**, e não
+apenas improvável.
+
+E o batch é um **prefixo contíguo**, nunca um conjunto esparso: mídia no meio da
+rajada não é membro, abre lacuna numérica e **fecha o batch antes dela**. "M1
+texto, M2 áudio, M3 texto" produz o batch `{M1}`; absorver M3 por cima do áudio
+responderia a terceira mensagem antes da segunda.
+
+**Fechamento único, e o que realmente o carrega.** Duas réplicas sobre a mesma
+stream: uma pega o mutex e a outra sai com `stream_locked`. Sequencialmente, um
+head já fechado sai do conjunto de membros e a segunda tentativa devolve
+`no_window`. O `debounce_closed_at IS NULL` do UPDATE e o CAS por `state_version`
+ficam como **defesa em profundidade** — medido por sonda: removendo qualquer um
+deles sozinho a suíte continua verde; removendo-os junto com a condição do
+conjunto de membros, um segundo fechamento passa e reescreve
+`debounce_batch_size` para 1.
+
+**Uma transação, seis escritas.** Fechar o head, enfileirá-lo, estender a
+fronteira `last_ingress_seq`, marcar os irmãos `superseded`/`merged_into_turn` e
+**reancorar os inputs deles no head** acontecem juntos ou não acontecem. A
+reancoragem é o que faz o batch virar um **fato do banco**, legível pelo executor
+— que roda em outro processo e outro instante — em vez de ser redescoberto em
+memória por telefone e `created_at`, que é uma segunda definição de batch e
+diverge da primeira no dia em que uma mensagem chega entre o fechamento e a
+execução.
+
+**"Fechamento comitado, wake-up não enviado".** O head fechado carimba
+`promoted_at` — a MESMA coluna da fatia D —, então o varredor de
+`message-recovery` reconcilia pelo caminho que já existe e já é medido
+(`maia_stream_promotion_total{result="recovered"}`). Duas reconciliações com o
+mesmo modo de falha é como uma delas fica sem manutenção.
+
+**O varredor.** `stream_debounce_closer` (cron 1/min, drena ~50s sondando a cada
+500ms — o mesmo padrão de `outbox_drain` e `playground_turn_drain`) substitui o
+job atrasado. É um dispatcher cross-tenant e **não decide nada**: pergunta ao
+banco quais janelas venceram e manda fechar. Duas instâncias não produzem batch
+sobreposto; uma instância que morre não perde janela nenhuma.
+
+**Observabilidade.** `maia_stream_debounce_batch_size` (histograma com baldes
+PRÓPRIOS — 1, 2, 3, 5, 10, 25, 50 —, porque os baldes padrão são de
+milissegundos e todo batch cairia em `le="50"`) e
+`maia_stream_debounce_close_total{result}` com vocabulário fechado
+(`closed`/`stream_locked`/`no_window`/`not_due`/`lost_race`). Auditoria
+`stream_batch_closed` com `batch_size` e `absorbed_turn_ids` — é a resposta para
+"por que a Maia respondeu três mensagens minhas de uma vez?". Nenhum label
+carrega `stream_key`, `turn_id` ou telefone.
+
+**Flag e rollback.** `FEATURE_TURN_STREAM_DEBOUNCE` (default ON), **inerte**
+enquanto `FEATURE_MESSAGE_DEBOUNCE` estiver OFF — o default do repositório —,
+porque sem debounce não há janela a tornar transacional. Exige
+`FEATURE_TURN_HEAD_OF_LINE`, e a dependência é de **segurança**: o fechamento
+marca os irmãos `superseded` sem fence, e só pode porque um turno que não é o
+head é inclaimável. OFF volta o debounce em memória, com as duas falhas de cima;
+nenhuma mensagem é perdida em nenhuma das posições. Ver
+[runbook §13](docs/runbooks/turn-state-machine.md).
+
+### Promoção do sucessor: o head que termina destrava a conversa ([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627), fatia D de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `127` ANTES de subir o código.** Ela é
+> um `ALTER TABLE ... ADD COLUMN` nullable (metadata-only, sem reescrita de
+> tabela e sem `CONCURRENTLY`), então não herda a armadilha de índice inválido
+> da `124`/`126`. Subir o código antes dela quebra toda conclusão de turno: a
+> promoção escreve colunas que ainda não existem.
+
+**O problema, que a fatia anterior criou de propósito.** Com o head-of-line
+ligado (#626), um turno só é reivindicável se for o primeiro vivo da conversa —
+e ninguém acordava o primeiro quando o anterior terminava. O sucessor até estava
+`queued` desde o ingresso, mas o job dele já tinha sido consumido: acordou, o
+claim recusou com `not_head`, o job terminou. Quem avançava era o head, na vez
+dele, **quando o varredor o rearmasse — até 2 minutos** ([runbook
+§11.5](docs/runbooks/turn-state-machine.md)). Ordem comprada com latência.
+
+**A promoção.** A MESMA transação que conclui um turno elege o próximo turno
+elegível da stream, carimba a decisão (`promoted_at`, `promoted_by_turn_id`) e
+só **depois do commit** sinaliza a BullMQ. Vale para todo terminal — inclusive
+`dead_letter`, que é o que impede um turno envenenado de prender a conversa para
+sempre (falha nº 5 da issue-mãe). O re-arme do turno cujo claim expirado é
+recuperado dentro da transação do claim (#625) entra pela mesma porta: ele
+perdeu o único wake-up que tinha, o job do dono morto.
+
+**Latência medida contra PostgreSQL real:** 8ms na promoção por conclusão e 13ms
+no re-arme por claim expirado, contra os 120000ms da janela documentada.
+
+**O fence, de graça e exato.** A issue exige validar o `claim_token` do turno
+que está terminando — *"uma tentativa stale não pode liberar o sucessor"*, a
+falha nº 9 da issue-mãe. A promoção roda DENTRO da transação do CAS terminal,
+cujo `WHERE` já carrega token + lease viva: um worker zumbi não chega à
+promoção, porque o CAS dele devolve zero linhas. Uma validação separada seria
+uma segunda cópia da regra de fence, com o mesmo modo de falha que a fatia C
+eliminou na regra de ordem. A recusa é contada
+(`maia_stream_promotion_total{result="fence_rejected"}`) e auditada
+(`turn_promotion_rejected`).
+
+**A fila é wake-up, não fonte de verdade.** Se o processo cai entre o commit e o
+`enqueueAgent`, o turno promovido existe no banco e não existe na fila. É
+`promoted_at` que permite ao varredor reconciliar, e a reconciliação é contada
+(`result="recovered"`) — o par a vigiar é `enqueue_failed` **sem** `recovered`
+acompanhando, que significa varredor parado, não promoção quebrada. O claim zera
+`promoted_at` quando a dívida é paga, para que o caminho feliz não seja medido
+como recuperação de falha.
+
+**`promoted` ganhou produtor.** O código que a #626 reservou deliberadamente sem
+produtor — para não mudar o domínio de um label depois que ele estivesse num
+dashboard — é produzido por esta fatia, com o mesmo nome.
+
+**Uma única definição, agora com cinco consumidores.** A eleição do sucessor
+mora em [`stream-head-sql.ts`](src/db/repositories/stream-head-sql.ts), o dono
+da ordem, e o UPDATE da promoção carrega `streamHeadOfLineNotExists` — a MESMA
+função do claim, do recovery, do dispatcher e do canário. O teste de contrato
+conta as chamadas.
+
+**Kill switch:** `FEATURE_TURN_STREAM_PROMOTION=false` + restart. Com ela OFF a
+ordem continua correta (o head-of-line não depende da promoção) e a conversa
+volta à cadência do varredor: latência, não inversão. Sem
+`FEATURE_TURN_HEAD_OF_LINE` a flag é inerte de propósito — naquele regime nenhum
+job é recusado por posição, logo não há fila a destravar.
+
+**Decisão que merece ser contestada:** um sucessor `retryable` com backoff em
+aberto **não** é promovido, e a conversa espera o varredor rearmá-lo quando o
+backoff vencer. É a cláusula literal da issue-mãe (*"backoff não autoriza
+ultrapassagem silenciosa"*) e o preço é latência num caminho de falha — a
+alternativa seria apagar o backoff de um turno que acabou de falhar.
+
+### Ordenação: só o HEAD-OF-LINE da conversa é reivindicável ([#626](https://github.com/diogenesmendes01/Maia-v2/issues/626), fatia C de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `126` ANTES de subir o código, e
+> confirme `pg_index.indisvalid` à mão depois** ([runbook §11.4](docs/runbooks/turn-state-machine.md)).
+> Ao contrário da `124`, aqui um índice inválido não quebra a invariante —
+> quebra o DESEMPENHO: a regra continua correta e passa a varrer o histórico
+> inteiro de cada conversa a cada claim. Um `CREATE INDEX CONCURRENTLY` que
+> falha deixa o índice inválido e **reaplicar a migration devolve sucesso**, sem
+> nenhum sinal do runner.
+
+**O problema.** A #625 respondeu *quantos* turnos de uma conversa podem estar
+ativos (um). Faltava responder *qual* — e sem essa resposta, o turno que
+ganhava a corrida era o que chegasse primeiro ao claim, não o que chegou
+primeiro ao usuário. São as falhas nº 1 e nº 3 da issue-mãe: *M1 e M2 chegam
+nessa ordem, mas M2 termina antes de M1*, e *um retry antigo reaparece depois de
+um turno mais novo*.
+
+**A regra.** Um turno só é reivindicável quando **não existe turno anterior não
+terminal na mesma stream** — "anterior" medido por `first_ingress_seq`, a
+fronteira que a fatia A ([#624](https://github.com/diogenesmendes01/Maia-v2/issues/624))
+passou a persistir. Nunca por timestamp: a issue-mãe proíbe explicitamente
+("timestamps não são fonte primária de ordenação"), porque ordenar por tempo
+faria a ordem depender do relógio de cada réplica.
+
+**Uma única definição, quatro consumidores.** A issue é literal sobre o modo de
+falha: *"duas cópias da regra de elegibilidade divergem, e a divergência só
+aparece durante um recovery"*. A regra vive num módulo PURO
+([`src/db/repositories/stream-head-sql.ts`](src/db/repositories/stream-head-sql.ts))
+e é chamada pelo `WHERE` do claim (`claimNextEligibleTurn`, renomeado de
+`tryClaimTurn`), pelo filtro do recovery (`findRecoverableTurns`), pelo
+dispatcher cross-tenant e pelo canário do varredor. Nenhum monta predicado
+próprio, e um teste unitário conta as chamadas e proíbe uma segunda cópia
+escrita à mão. Sem isso, o varredor rearmaria turnos que o claim vai recusar: a
+fila cresce, a métrica de recovery diz que houve trabalho, e a conversa não anda.
+
+**O índice não decide nada — decide o CUSTO.** A regra é um `NOT EXISTS`,
+correta sem índice nenhum. A migration `126` cria
+`agent_turns_stream_head_live_idx` sobre
+`(tenant_id, agent_id, stream_key, first_ingress_seq)` **com os terminais fora
+do índice**, e não é redundante com o `agent_turns_stream_head_idx` da `122`:
+naquele, `status` vem depois de `first_ingress_seq`, então o `NOT IN` é FILTRO,
+não busca. Medido contra PostgreSQL 16 com 205.000 turnos / 20.001 streams /
+1.003 vivos / 2 tenants, numa conversa com 5.000 turnos (4.997 concluídos):
+
+| | plano | buffers | tempo |
+|---|---|---|---|
+| com a `126` | `Index Only Scan`, `Rows Removed by Filter: 0` | 2 | 0,097 ms |
+| sem a `126` | `Index Only Scan` no índice largo, **`Rows Removed by Filter: 4997`** | 97 | 2,362 ms |
+
+Sem o índice o custo cresce com o HISTÓRICO da conversa, que nunca encolhe. Com
+ele, cresce com o BACKLOG, que é 0–2 na operação normal. Os estados terminais
+entram na consulta como **literais**, não parâmetros: o PostgreSQL só usa um
+índice parcial quando prova que a cláusula implica o predicado, e com `$1..$4` a
+prova depende de plano CUSTOM — a degradação apareceria só depois da sexta
+execução da mesma sessão.
+
+**Duas recusas novas, e elas não são sinônimos.** `not_head` é "a conversa tem
+fila, e ela anda sozinha" — não faça nada. `stream_blocked` é "o anterior está
+em `outbound_pending`, e nenhum claim o move" — vá ao runbook do outbox
+([#506](https://github.com/diogenesmendes01/Maia-v2/issues/506)). Esperar
+resolve a primeira e não resolve a segunda.
+
+**A decisão de projeto a contestar.** `outbound_pending` **bloqueia a ordem**,
+embora a fatia B tenha decidido que ele **não ocupa** a stream. As duas
+convivem porque respondem a perguntas diferentes, mas o efeito prático é que uma
+indisponibilidade do provedor de saída para a CONVERSA (não o tenant, não a
+fila). É o preço de FIFO — responder M2 antes de a resposta de M1 ter saído é
+exatamente a inversão que a #505 existe para impedir. A alavanca para não pagar
+esse preço é a flag, nunca mexer no predicado.
+
+**O que a recuperação de claim expirado deixou de fazer.** Antes desta fatia, um
+head que morria com a lease vencida era destravado pelo SUCESSOR: ele
+reivindicava, a transação da #625 recuperava o morto e a conversa andava na hora
+— fora de ordem. Agora a recuperação continua acontecendo (é o que devolve o
+head a `retryable`), e o sucessor é recusado como `not_head`: quem avança é o
+head, na vez dele, quando o varredor o rearmar (até 2 min). **É ordem comprada
+com latência no caminho de crash.** A promoção idempotente do sucessor
+([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627)) devolve a
+latência sem devolver a inversão.
+
+**Observabilidade.** `maia_stream_fifo_violation_total{stage}` (`claim` /
+`recovery`) — **sempre zero**, e publicada em ZERO no import: um contador que
+nasce na primeira violação satisfaria "sempre zero" por AUSÊNCIA, e nenhum
+alerta escrito contra ele dispararia. O estágio `claim` é uma pós-condição
+dentro da transação do claim concedido; o estágio `recovery` é uma consulta
+separada sobre os ids que o filtro devolveu. Mais
+`maia_stream_blocked_total{reason}` e as `audit_log` `turn_stream_blocked`
+(com `blocked_by_turn_id`, para reconstruir a fila sem recorrer à `stream_key`)
+e `turn_stream_fifo_violation`. Nenhuma carrega `stream_key`, telefone ou
+conteúdo.
+
+**Códigos centralizados.** `eligible`, `not_head`, `stream_blocked`,
+`stream_busy`, `promoted` — os cinco que a issue nomeia, num vocabulário único
+(`STREAM_SCHEDULING_RESULTS` em [`src/runtime/turns/claim.ts`](src/runtime/turns/claim.ts)).
+`promoted` entra **sem produtor**, de propósito: a #627 acrescentar um sexto
+rótulo a uma série de métrica já em uso quebraria um alerta em silêncio.
+
+**Kill switch:** `FEATURE_TURN_HEAD_OF_LINE=false` + restart. O claim volta ao
+comportamento de #625 e a plataforma volta a poder responder M2 antes de M1.
+Religar não reordena nada — a ordem vem de `first_ingress_seq`, gravado nas duas
+posições. A combinação com `FEATURE_TURN_STREAM_KEY=false` é **recusada no
+boot**: seria inerte, e o operador acreditaria ter ligado o FIFO.
+
+**Fora de escopo (fatias irmãs):** promoção de sucessor (#627), debounce
+transacional (#628), retry/DLQ/fairness (#629).
+
+Arquivos: `migrations/126_agent_turns_stream_head_live{,_down}.sql`,
+`src/db/repositories/stream-head-sql.ts` (novo, puro),
+`src/db/repositories/turn-repos.ts` (`claimNextEligibleTurn`,
+`explainClaimRejection`, `listNonHeadTurns`, filtro FIFO no recovery e no
+dispatcher), `src/runtime/turns/claim.ts` (vocabulário dos cinco códigos),
+`src/runtime/turns/stream-metrics.ts` (novo), `src/runtime/turns/lease.ts`
+(auditoria), `src/runtime/turns/lifecycle.ts` (motivos `not_head`/
+`stream_blocked`), `src/workers/message-recovery.ts` (canário),
+`src/config/contract.ts` + `src/config/rules.ts` (`FEATURE_TURN_HEAD_OF_LINE`),
+`src/governance/audit-actions.ts`, `src/db/schema.ts`.
+
+
+### Ordenação: o banco passa a garantir NO MÁXIMO UM turno ativo por conversa ([#625](https://github.com/diogenesmendes01/Maia-v2/issues/625), fatia B de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 5 de 9)
+
+> **AÇÃO DO OPERADOR: pause os consumidores do turno antes de aplicar a
+> migration `124`, e rode a consulta de duplicatas do
+> [runbook §10.2](docs/runbooks/turn-state-machine.md) ANTES.** Um par de turnos
+> já ativos da mesma stream reprova o `CREATE UNIQUE INDEX CONCURRENTLY` e deixa
+> um índice **inválido** para trás, que custa escrita, não serve a leitura e não
+> some sozinho — a limpeza é manual (§10.4). Diferente da `120`, a ordem entre
+> código e migration aqui é indiferente: nenhuma das duas metades quebra sem a
+> outra estar presente.
+
+**O problema.** A #504 entregou exclusão por **turno**: dois workers não
+reivindicam a mesma linha. Faltava a exclusão por **conversa** — dois turnos
+DIFERENTES da mesma stream podiam ser `claimed` por réplicas diferentes no mesmo
+instante e executar em paralelo. É a falha nº 2 da lista da issue-mãe, e é a que
+o usuário percebe: duas respostas para a mesma conversa, produzidas por
+processos que não sabiam um do outro.
+
+**Onde a exclusão foi colocada, e por quê.** No **banco**. Um mutex de processo
+não existe para a segunda réplica; um lock de Redis sem fence persistido
+sobrevive à própria expiração (o dono cujo lock venceu não descobre que venceu e
+continua escrevendo). Só o PostgreSQL sabe, no instante do UPDATE, quantos
+turnos daquela conversa estão ativos — porque é ele quem guarda o estado.
+
+**O PostgreSQL não expressa a invariante numa constraint.** O que se quer é
+temporal ("um turno com lease VIVA por stream"), e uma constraint não depende de
+`now()` — uma lease vence sozinha, sem nenhuma escrita acontecer. A issue-mãe
+prescreve, então, a combinação de duas metades, e **nenhuma delas isolada é a
+invariante**:
+
+- **estrutural** — índice único parcial `agent_turns_stream_active_uq`
+  (migration `124`) sobre `(tenant_id, agent_id, stream_key)` onde
+  `status IN ('claimed','running')`. É ele que DECIDE: um segundo claim na mesma
+  stream levanta `23505` e vira o motivo tipado `stream_busy`;
+- **temporal** — a recuperação de claims **expirados dentro da MESMA transação**
+  do claim (`agentTurnsRepo.tryClaimTurn`). Sem ela, o primeiro crash de worker
+  deixa uma linha `claimed` com lease vencida ocupando a chave e a stream fica
+  **bloqueada para sempre**: o índice deixa de ser proteção e vira o defeito.
+
+**Por que a recuperação não é um sweeper à parte.** Entre um sweeper liberar a
+linha vencida e o claim rodar, um terceiro worker pode reivindicar aquele turno
+de volta — e a stream fica parada um ciclo inteiro do sweeper por nada. Dentro
+da transação, "liberar" e "ocupar" são o mesmo instante lógico: ninguém observa
+a stream vazia e ninguém a ocupa no vão. O turno recuperado volta a `retryable`
+com `next_attempt_at = now()`, **preservando** `claim_token`/`claimed_by` (a
+forense de "quem tinha este turno quando o pod morreu?") e **sem** gastar
+tentativa — contar o crash de um worker como tentativa mandaria um turno
+inocente para a DLQ por causa de um deploy.
+
+**O escopo é parte da chave do índice, e isso não é cerimônia.** A `stream_key`
+já embute tenant e agent no material canônico, mas embutir não é escopar: uma
+colisão de hash (que a issue trata como risco de **segurança**), um backfill ou
+um replay manual fariam duas tenants disputarem a MESMA chave — e o turno da
+tenant A bloquearia a conversa da tenant B, de forma invisível, porque nada na
+linha de B diria que a causa é de A.
+
+**Sem lock global.** Streams distintas não se tocam: o índice serializa por
+chave, e o `FOR UPDATE` da recuperação tranca só as linhas ativas **daquela**
+stream. Medido com volume representativo (200 mil turnos, 20 mil streams, 1000
+ativos): o claim custa `Execution Time: 0.254 ms` e a recuperação `0.938 ms`,
+ambos por Index Scan, sem nenhum sequential scan. Numa stream **quente** (5 mil
+turnos na mesma conversa) os números não mudam — a recuperação lê pelo índice de
+exclusão, que é proporcional ao trabalho EM VOO, não ao histórico. O índice
+parcial ocupa **152 kB** contra 46 MB da tabela.
+
+**`outbound_pending` está deliberadamente FORA** do predicado. A resposta já foi
+comprometida no outbox e quem finaliza é o delivery worker (#506), que não
+disputa posse com ninguém; prender a conversa ali faria uma indisponibilidade do
+provedor de saída parar a stream inteira. Consequência honesta: entre
+`outbound_pending` e o terminal, a stream aceita um novo claim. Isso **não** é
+reordenação — QUEM pode ser reivindicado é o head-of-line (#626), que é a fatia
+seguinte. Esta decide QUANTOS podem estar ativos, e a resposta é um.
+
+**Esta fatia não toca na elegibilidade.** Head-of-line no claim (#626), promoção
+de sucessor (#627), debounce transacional (#628) e retry/DLQ/fairness por stream
+(#629) continuam como estavam.
+
+**Observabilidade.** `maia_turn_claim_total` ganha `result="stream_busy"` —
+distinto de `not_eligible` de propósito: um fala da STREAM ("a conversa está
+ocupada"), o outro do TURNO ("este aqui não pode ser reivindicado agora"), e
+colapsar os dois apagaria o único sinal de uma conversa serializando.
+`maia_turn_stream_claim_recovered_total{from}` conta claims expirados devolvidos
+à fila e deve ser **zero** em operação saudável. Duas linhas novas de
+`audit_log`: `turn_stream_busy` (a exclusão agiu) e `turn_stream_claim_recovered`
+(a stream estava presa por um dono morto) — nenhuma carrega `stream_key`,
+telefone, texto ou prompt.
+
+**Rollback: derrubar um índice.** `DROP INDEX CONCURRENTLY IF EXISTS
+agent_turns_stream_active_uq` (ou o `_down` da `124`, que é esse mesmo
+statement) devolve o claim ao comportamento de #504 na primeira tentativa
+seguinte. Nenhuma linha muda de estado, nenhuma coluna é apagada, o escalonador
+não é revertido — foi para isso que a fatia foi separada.
+### Fixed — migration com índice `CONCURRENTLY` inválido deixa de ser marcada como aplicada ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658))
+
+**O defeito, medido contra o Postgres 16.** `CREATE UNIQUE INDEX CONCURRENTLY`
+que reprova — por duplicata pré-existente, deadlock ou cancelamento — **não
+desaparece**: o índice fica no catálogo com `pg_index.indisvalid = false`. E o
+`IF NOT EXISTS` da tentativa seguinte o enxerga, pula a criação e devolve
+sucesso:
+
+```
+1a tentativa:  ERROR: could not create unique index "t_k_uq"
+catálogo:      t_k_uq | indisvalid = f
+2a tentativa:  NOTICE: relation "t_k_uq" already exists, skipping
+               CREATE INDEX          ← exit 0
+catálogo:      t_k_uq | indisvalid = f     ← continua inválido
+```
+
+O runner lia exit 0 e gravava `applied`. Como aqui índice único parcial é
+**mecanismo de exclusão** e não otimização (`agent_turns_stream_active_uq` e
+afins), o resultado era a exclusão mútua **não existir** com o ledger dizendo
+"aplicada" — a mesma classe de defeito que a épica
+[#505](https://github.com/diogenesmendes01/Maia-v2/issues/505) existe para
+eliminar.
+
+**A correção** é uma invariante ABSOLUTA — "nenhum índice inválido no escopo" —,
+não um diff de `pg_index` antes/depois (delta é vazio justamente na
+reaplicação, que é o caso perigoso). Ela é asserida em dois pontos:
+
+- **pré-voo**, antes de qualquer DDL: um índice inválido produz o blocker
+  `invalid_index` e o `up` sai `blocked` sem enviar statement nenhum. É o que
+  fecha a reaplicação — e ela sobrevive inclusive a um `repair --as pending`,
+  porque limpar a linha do ledger não conserta o catálogo;
+- **na hora de escrever `applied`** (modos `self`/`none`): a migration vira
+  `dirty` com `error_class = MIGRATION_INVALID_INDEX`, mesmo tendo terminado
+  sem levantar erro. É o caso do operador que roda DDL concorrente à mão numa
+  sessão paralela enquanto o job de migration está em voo.
+
+Como o pré-estado é provadamente vazio, qualquer índice inválido encontrado
+depois nasceu naquela migration: atribuição por invariante, sem parser de SQL.
+
+**O que o operador vê.** `MigrationStatusReport` passa a carregar
+`invalid_indexes`; `getSchemaReadiness()` responde `blocked` com o índice
+nomeado e o remédio no texto; e o boot morre com **exit 98** — código novo,
+à frente do 90 na precedência, porque quando os dois aparecem juntos o índice
+inválido é a CAUSA e o `dirty` é a consequência. Remédio completo (`DROP INDEX
+CONCURRENTLY` → resolver a duplicata → reaplicar) em
+[`docs/runbooks/migrations.md`](docs/runbooks/migrations.md#índice-inválido-deixado-por-ddl-concurrently);
+tabela de exit codes em
+[`docs/runbooks/operational.md` §8.1](docs/runbooks/operational.md).
+
+Efeito colateral declarado: o caminho de leitura de `getSchemaReadiness()`
+passou de duas para três consultas, então o teto por statement do `maia doctor`
+caiu de 4s para 3s (3 × 3s = 9s < 10s de deadline), agora travado contra a
+contagem real de statements em vez de um `2` literal.
+### Added — a triagem no console fecha o ciclo: aceitar → issue → tool registrada → gap fechado ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638), fatia C de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471) — fecha a épica)
+
+**O que faltava.** A fatia A (#636) fez o gap recorrente virar pedido
+estruturado; a fatia B (#637) fez N pedidos parecidos virarem UM com contador.
+Nas duas, o pedido morria no backlog: ninguém decidia nada sobre ele, e nada
+acontecia quando a ferramenta finalmente existia. A tela que havia (`#476`)
+montava o corpo de uma issue **no navegador** e abria um link para
+`issues/new?...` — sem idempotência (dois cliques, duas abas), duplicando lógica
+de backend (um `slugify` próprio que não é o `esbocarNomeDeTool` da fatia A) e
+mostrando o GAP em vez do PEDIDO AGRUPADO.
+
+**O que passa a existir.** `tool_request_issues` (a reserva do aceite),
+`resolved_at`/`resolved_reason`/`resolved_tool_name` em `agent_capability_gaps`
+(o fechamento) e `tool_request_notifications` (o aviso ao agente) — migração
+132. No console, o router `toolRequests` com `list` / `detail` / `aceitar` /
+`desagrupar`. No runtime, dois workers: o relayer que abre a issue (a cada 5
+min) e o monitor que fecha o gap (de hora em hora).
+
+**Aceitar duas vezes cria UMA issue, e a decisão é do banco.** Não é um `if` que
+consulta antes de inserir — essa janela é exatamente onde dois cliques rápidos
+caem. É a UNIQUE `(tenant_id, agent_id, aggregate_id)` com
+`ON CONFLICT DO NOTHING`: o segundo aceite não colhe linha, lê a existente e
+devolve `ja_aceito`, auditado como `tool_request_accept_duplicado` — um aceite
+sem efeito não pode ser indistinguível de um aceite que nunca chegou.
+
+**A chave de idempotência viaja no corpo da issue.** `sha256` truncado de
+`maia.tool_request.v1|tenant|agent|aggregate`, determinística e reproduzível.
+Ela estende a idempotência para além do banco: se o processo morrer entre a
+chamada externa ter sucedido e o resultado ser gravado, o relayer **encontra** a
+issue pelo marcador e a ADOTA (`adopted = true`) em vez de abrir a segunda.
+Limitação declarada: a busca pagina no máximo 5 × 100 issues com o label da
+triagem; o caminho normal não depende disso (é a UNIQUE que o serve), só a
+janela de crash.
+
+**O corpo da issue é escrito supondo que a issue é pública.** Fora dele, de
+propósito: `tenant_id`/`agent_id` em texto claro (a correlação é o hash) e o
+texto livre de cada situação, que sai de turno real e pode carregar nome, valor
+ou assunto do interlocutor — o corpo diz onde lê-las (o console, atrás de
+autenticação). É a mesma decisão de privacidade que a fatia A tomou para
+`attempted_args`, levada até o fim. Consequência aceita: a issue sozinha não
+reconstrói o caso de uso em detalhe; ela permite DECIDIR.
+
+**A credencial do GitHub não existe no processo que serve o botão.**
+`MAIA_TOOL_REQUEST_GITHUB_TOKEN` é declarado com `services: ['runtime']`, e o
+Admin UI valida o próprio subset no boot — o token não é lido, não é tipado e
+não existe lá. O DESTINO (`MAIA_TOOL_REQUEST_ISSUE_REPO`) é lido pelos dois,
+porque o dono precisa ver para onde a issue vai antes de aceitar. O preço é uma
+indireção (aceitar reserva; o relayer abre em até 5 min); o ganho é que a
+separação é estrutural, não disciplina.
+
+**O gap fecha por FATO, nunca por caixa marcada.** `resolved_at` só é escrito
+quando a tool é chave viva do registro **e** está no conjunto que o grant
+daquele tenant/agent deriva. O casamento de nome é a MESMA função da fatia A
+(`encontrarToolExistente`), na direção oposta. Nenhuma rota do console escreve
+essas colunas, e o teste arquitetural do console proíbe `resolverGap(` e
+`resolved_at:` em todo o caminho da triagem. Consequência aceita e escrita: uma
+ferramenta implementada com nome que não aparece no texto do gap nem entre os
+nomes propostos **não** fecha sozinha — o erro cai do lado barato.
+
+**O agente é avisado, e o aviso custa zero ida a mais ao banco.** O gap resolvido
+sai do bloco de limitações (ele parava de dizer "não consigo" só por isso) e
+entra num bloco novo, `## Capacidades novas`, que diz qual ferramenta passou a
+existir. Os dois blocos saem da MESMA leitura
+(`capabilityGapsRepo.listParaOTurno`), no caminho mais quente do sistema. O que
+isso NÃO é: recibo de entrega por turno — o que é auditável é a EMISSÃO
+(`tool_request_agent_notified`); que o prompt carrega o aviso é provado por
+teste sobre o `buildPrompt` de produção.
+
+**O guardrail continua inegociável.** *O agente especifica; humano implementa e
+instala.* Não há botão "aprovar e instalar". Aceitar cria uma issue e nada mais.
+Além da invariante de runtime do #636 (agora rodada também depois de ACEITAR e
+de FECHAR), a fatia traz uma varredura estática **do console**, derivada do
+grafo de imports a partir do router real — a do #636 não cobria isso, porque
+`admin-ui/` é barreira lá (o console legitimamente edita grants em outras
+telas).
+
+**Reversibilidade.** `desagrupar` expõe no console a ação da fatia B:
+`detached_at` + motivo + autor, nunca `DELETE`; o `original_spec` do membro
+continua legível e o contador é recalculado a partir dos ativos.
+
+**Auditoria.** `tool_request_accepted`, `tool_request_accept_duplicado`,
+`tool_request_issue_created` (com `adopted`), `tool_request_issue_failed` (só
+falha TERMINAL — auditar cada retentativa de um 500 transitório viraria log de
+rede), `tool_request_gap_closed` e `tool_request_agent_notified`. As três
+primeiras carregam `instalou_tool: false` / `concedeu_capability: false` na
+própria linha.
+
+### Added — N pedidos de ferramenta parecidos viram UM pedido com contador ([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637), fatia B de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** A fatia A (#636) faz cada gap recorrente de tool
+virar UMA proposta. Nada nela sabe que dois gaps diferentes podem ser o MESMO
+pedido dito com outras palavras — então o backlog acumularia duplicatas em que
+nenhum item carrega o peso da demanda real: cinco pedidos de duas ocorrências,
+em vez de um pedido de dez.
+
+**O que passa a existir.** `tool_request_aggregates` (UM pedido, com contador) e
+`tool_request_aggregate_members` (o ledger append-only de quem entrou, com que
+número e quando), ambos escopados por `tenant_id + agent_id`. A decisão de
+agregar acontece **antes** de criar a proposta: um pedido que se funde NÃO vira
+linha em `capability_proposals` — é esse o "N vira 1".
+
+**O limiar tem medição, não gosto.** Métrica `dice_token_v1` (coeficiente de
+Dice sobre os tokens de conteúdo da descrição do gap), limiar **0,85**, escolhido
+pela regra escrita antes do número: *o menor θ da grade de 0,05 com zero falsas
+fusões no conjunto negativo real*. O conjunto negativo tem rótulo REAL — os 2080
+pares de tools distintas do catálogo committado, que são 65 coisas que este
+projeto já decidiu que merecem implementações separadas. Em 0,80 ainda há uma
+falsa fusão (`save_fact` × `save_rule`, 0,833); em 0,90 não há segurança a mais
+e há 10 pontos de recall a menos. Reproduzir:
+`npx tsx scripts/medir-limiar-tool-request.ts`. O número é mantido honesto por
+`tests/unit/tool-request-limiar-medicao.spec.ts`, que reroda a medição contra o
+catálogo VIVO — uma tool nova que empurre o pior par negativo acima de 0,85 fica
+VERMELHA no CI em vez de virar agrupamento errado em produção.
+
+**O que a medição NÃO prova, dito aqui e não só no código.** O conjunto positivo
+é SINTÉTICO (325 paráfrases por cinco transformações committadas), porque não
+existe no repositório um par de gaps rotulado como "mesmo pedido" — o ledger de
+ocorrências nasceu na fatia A e está vazio em todo ambiente. E há a limitação
+herdada: enquanto `completeness` for `'name_only'`, a assinatura sai de uma frase
+curta, e Dice sobre conjuntos pequenos é grosso — a 0,85, duas descrições de 4–5
+tokens só fundem se o conjunto de tokens for IGUAL. Na prática, HOJE o contador
+sobe para repetição quase literal. Quando os rascunhos ficarem ricos, o limiar
+**não vale como está**; por isso a assinatura é versionada e a versão é
+persistida por agregado e por membro.
+
+**A política de fusão de rascunhos: nenhum vence, nunca.** Compatíveis → UNIÃO
+(nenhum campo descartado, `observed_in` soma, `required` só sobrevive quando é
+obrigatório em todos). Incompatíveis → `contract_state = 'divergent'`: NÃO se
+produz contrato fundido, os rascunhos ficam lado a lado como variantes, e o
+conflito é NOMEADO (campo, lado, as expressões Zod em disputa e de quem vieram).
+O contador continua contando — a demanda é real —, mas o contrato fica
+explicitamente indefinido. Fundir dois contratos incompatíveis produziria uma
+spec que não descreve nenhum dos dois casos; escolher um deles apagaria o outro
+por ordem de chegada, que não é evidência de nada. O CHECK
+`tool_request_aggregates_divergent_has_no_draft` (migração 129) torna impossível
+gravar `divergent` com um rascunho pendurado, venha o INSERT de onde vier.
+
+**Escopo: por tenant + agent, sem contador global.** A agregação compara o texto
+do pedido de um cliente com o de outro; um contador global exigiria que o dado de
+A entrasse no cálculo que produz a linha de B, e "só o número atravessa" não
+salva, porque contagem pequena é reconstruível. A pergunta legítima ("quantos
+clientes pediram isto?") tem caminho próprio — agregação estatística deliberada
+com anonimização e ADR —, nunca efeito colateral de agrupar pedidos.
+Consequência aceita e escrita: dois tenants que precisam da mesma ferramenta
+produzem dois pedidos. Provado por teste de leak com pedidos BYTE A BYTE iguais
+em dois tenants.
+
+**A fusão não pode apagar a evidência, em três camadas.** (1) A agregação só
+escreve em tabelas NOVAS — `capability_proposals`, `agent_capability_gaps` e
+`agent_capability_gap_observations` não são tocadas. (2) Cada membro guarda o
+`proposed_spec` INTEIRO como entrou (`original_spec`), com situações, links de
+trace e o rascunho original — necessário porque o pedido fundido não gera
+proposta. (3) Sair do agregado é `detached_at` com motivo e autor, nunca
+`DELETE`; e um gap já destacado NÃO volta ao agregado por similaridade, senão
+"reversível" duraria até a próxima passada do cron.
+
+**Sem coluna `vector` e sem índice ivfflat/hnsw, de propósito.** Um limiar de
+cosseno dependeria de uma API paga externa que o CI não tem — logo não seria
+calibrável nem retestável, e trocar de provedor moveria a escala inteira em
+silêncio sobre dado de governança. Some-se a isso que `name_only` é o regime em
+que cosseno de frase curta separa pior. Uma coluna vazia que ninguém popula é
+dívida com cara de recurso, e um índice ivfflat sobre dezenas de linhas por
+tenant é mais lento que a varredura sequencial. O ponto de extensão fica: sinal
+semântico calibrado entra como `ASSINATURA_VERSION` nova, **com re-medição**.
+
+**O guardrail da fatia A continua valendo palavra por palavra.** Agregar não
+registra tool, não concede nada e não avalia `zod_source`. Os arquivos novos
+entram sozinhos na varredura estática do guardrail porque ela deriva do grafo de
+imports dos call sites reais — e a sonda que planta um registro de tool dentro
+de `aggregation.ts` fica vermelha nas DUAS defesas (a invariante absoluta de
+runtime e a varredura de fonte).
+
+Migração `129_tool_request_aggregation.sql` (+ `_down` com envelope
+`BEGIN`/`COMMIT` explícito, que RECUSA reverter com dado: um membro
+não-representante não tem linha em `capability_proposals`, então derrubar a
+tabela apagaria pedidos inteiros, não o agrupamento).
+
+Auditoria: `tool_request_aggregated` (com similaridade, limiar, métrica e versão
+da assinatura — agrupamento sem o número que o justificou é fato sem prova) e
+`tool_request_aggregate_detached`.
+
+### Added — o gap recorrente que exige uma tool INEXISTENTE vira um pedido estruturado, e inerte ([#636](https://github.com/diogenesmendes01/Maia-v2/issues/636), fatia A de [#471](https://github.com/diogenesmendes01/Maia-v2/issues/471))
+
+**O que mudava de mão antes.** Um gap recorrente subia pela cadeia
+determinística de escalada (`src/cognition/gap-escalation/engine.ts`) e, no
+topo, virava uma spec em prosa escrita por Sonnet — ou morria no dashboard. Um
+dev que recebesse isso ainda tinha de reconstruir do zero as quatro coisas que
+decidem o pedido: **o que** o agente queria fazer, **em que situações reais**,
+**quantas vezes e em que janela**, e **qual seria o contrato**.
+
+**O que passa a existir.** Um tipo novo de proposta, `capability_type =
+'tool_request'`, gerado SEM LLM a partir de evidência persistida:
+
+- **intenção** — a descrição da lacuna, nas palavras em que foi registrada;
+- **situações** — as ocorrências reais, com `root_trace_id` ligando ao envelope
+  em `runtime_trace_envelopes`. Um id que não resolve **no mesmo tenant+agent**
+  vira situação SEM link, nunca link que atravessa fronteira;
+- **frequência com janela** — `agent_capability_gap_observations`, o ledger novo
+  de ocorrências. O contador `frequency_score` responde "quantas vezes" e nada
+  mais; janela e situação precisam de linhas com timestamp;
+- **rascunho de contrato Zod** — nome, inputs e outputs **derivados** dos
+  argumentos que o agente tentou usar. Quando nenhuma ocorrência registrou
+  argumentos, o rascunho diz `completeness: 'name_only'` em vez de inventar
+  campos: um contrato imaginado pareceria mais completo e valeria menos.
+
+**O guardrail é o recurso, não uma nota de rodapé.** *O agente especifica;
+humano implementa e instala.* Nada nesta fatia registra tool, executa o código
+proposto ou cria capability — a proposta é um documento inerte, e aprová-la
+(`dispatchApproval` → `acknowledged_for_humans`) continua não instalando nada.
+Tool nova segue o caminho normal: código revisado, contrato Zod, classe de
+risco, aprovação. A marcação que impede confundir o rascunho com contrato
+vigente é redundante de propósito e vive em três camadas independentes — o
+literal Zod (`contract_status`), o CHECK
+`capability_proposals_tool_request_marking_check` da migração 125 (que recusa o
+INSERT venha ele de onde vier, inclusive de um `psql`), e o cabeçalho literal do
+`zod_source`, que sobrevive ao copiar-e-colar.
+
+**Precedência no topo da escalada.** O pedido de ferramenta é a rota
+ESPECÍFICA e roda primeiro; o `capability-proposer` genérico continua atendendo
+todo o resto — knowledge, procedure, e o gap de tool cuja ferramenta **já
+existe** (aí não falta código, falta grant). Se a rota nova falhar ou lançar, a
+genérica assume: uma rota recém-introduzida não pode derrubar em silêncio o
+comportamento que já existia.
+
+**O guardrail afirma INVARIANTE, não delta** (correção pós-revisão). A primeira
+versão do teste fotografava o registro de tools antes e depois e comparava as
+duas fotos. Um delta sobre estado global e mutável não sobrevive ao `retry: 1`
+do vitest: a tentativa 1 ficava vermelha, a mutação persistia no objeto de
+módulo, e a tentativa 2 tomava o estrago como sua própria linha de base — delta
+zero, verde, `falharam=0`. O guardrail passou a afirmar três coisas ABSOLUTAS,
+verdadeiras ou falsas por si só em qualquer tentativa: nenhuma tool viva fora do
+catálogo committado (`src/admin-ui/generated/tool-catalog.ts`), o grant do
+agente exatamente como semeado, e zero capability criada. E a varredura de
+fonte deixou de ser `readdirSync` de uma pasta — ela agora percorre o GRAFO DE
+IMPORTS a partir dos call sites reais (gerar, disparar, **aprovar**), porque a
+fronteira do comportamento proibido não é um diretório: `proposal-approval-handler.ts`
+é precisamente o arquivo onde alguém escreveria "aprovou, então instala", e ele
+ficava de fora.
+
+**Fora de escopo desta fatia**, de propósito: agregação por similaridade
+([#637](https://github.com/diogenesmendes01/Maia-v2/issues/637)) e triagem no
+console ([#638](https://github.com/diogenesmendes01/Maia-v2/issues/638)).
+
+- Migração **125** (`125_tool_request_proposals.sql`): `agent_capability_gap_observations`
+  (com CHECK fail-closed contra o literal `default`), `tool_request` na lista
+  fechada de `capability_type`, e o CHECK da marcação. O `_down` **recusa** com
+  dado presente — apagar a evidência não é rollback, é perda.
+- `src/cognition/tool-request/` — `types.ts` (contrato Zod + marcação),
+  `existing-tool.ts` (a tool já existe no `REGISTRY`?), `contract-draft.ts`
+  (derivação dos campos) e `proposer.ts` (o call site).
+- `src/workers/gap-escalation-monitor.ts` — as duas rotas a partir de `proposed`.
+- `tests/helpers/grafo-de-imports.ts` — travessia de imports com fronteira
+  declarada, para que uma varredura estática não volte a mentir quando nascer um
+  arquivo novo fora da pasta.
+- `src/db/repositories/capability-repos.ts` — `capabilityGapObservationsRepo` e
+  o registro da ocorrência junto ao upsert do gap.
 
 ### ⚠️ BREAKING (operacional) — schema incompatível agora MATA o processo, com exit code por invariante ([#516](https://github.com/diogenesmendes01/Maia-v2/issues/516))
 
 > **O que muda no seu dia:** antes, um app que subisse contra um schema
 > incompatível ficava **de pé** respondendo 503 no `/readyz`. Agora ele **não
-> sobe** — encerra com exit code **90-97**, e sob um supervisor que reinicia
+> sobe** — encerra com exit code **90-98**, e sob um supervisor que reinicia
 > isso é **crash loop**. Se o seu deploy não tem gate de migration, ele passa a
 > ter um sintoma novo. Verifique, ANTES de subir este release, que o migrator
 > roda antes do app: `depends_on: { migrate: { condition:
@@ -231,7 +1005,7 @@ só.
 O que mudou:
 
 - **`src/index.ts` (etapa `schema`)** chama `checkSchemaReadiness()` — o MESMO adaptador cacheado do `/readyz`, então boot e probe não podem divergir — e lança `SchemaBootAbortError`; o handler de `main()` sai com `bootExitCode(err)`.
-- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown`. `1` continua sendo qualquer outra falha de boot. A faixa 90-97 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
+- **Exit codes distinguíveis** (`src/runtime/lifecycle/schema-boot-gate.ts`), porque `1` para tudo não diz nada a quem lê `docker inspect --format '{{.State.ExitCode}}'`: **90** dirty/`running` órfão · **91** checksum divergente · **92** checksum ausente (ledger v1 nunca backfillado) · **93** migration no banco que este build não empacota · **94** migration obrigatória ausente · **95** schema acima do máximo suportado · **96** `running` em voo · **97** veredito `unknown` · **98** índice `indisvalid = false` ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658)). `1` continua sendo qualquer outra falha de boot. A faixa 90-98 não colide com os códigos do migrator (0/1/2), do Node (1-14), do shell (126-165) nem com 255.
 - **Mensagem de morte acionável**, porque um crash loop sem diagnóstico é pior que um 503: `maia.schema_boot_refused` carrega `exit_code`, `blocker`, `blockers`, `migration_id`, `expected_checksum` (arquivo empacotado) vs. `found_checksum` (linha do ledger), os dois heads e a `remediation` (o comando exato). Nada disso carrega SQL, texto de driver ou DSN — a mensagem de erro do `pg` embute a connection string com senha.
 - **`checkSchemaVersion()` e `src/runtime/lifecycle/schema-version.ts` foram REMOVIDOS**, com o spec dedicado. Não sobrou um segundo veredito de schema para divergir.
 - **Coerência com a [ADR 0003](docs/architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):** o `/readyz` continua sendo o único gate de roteamento, role-aware e fail-closed, e continua respondendo 503 quando o schema muda debaixo de um processo **que já subiu** — esse caso não vira crash loop. A árvore de decisão do operador (quando olhar exit code, quando olhar readiness) está em `docs/runbooks/operational.md` §8.1.

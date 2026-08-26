@@ -48,6 +48,7 @@ import {
   noteIngressSequenced,
   reportStreamIngressRejected,
   reportStreamIngressResolved,
+  transactionalDebounceEnabled,
   type TurnStatus,
 } from '@/runtime/turns/index.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
@@ -1214,6 +1215,31 @@ async function handleIncoming(
   //   The metric / log here is the signal an operator uses to surface
   //   the outage.
   if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
+    // #628 (fatia E da #505) — O DEBOUNCE TRANSACIONAL SUBSTITUI ESTE BLOCO.
+    //
+    // Com a flag ligada, a janela desta rajada JÁ FOI aberta (ou estendida) na
+    // MESMA transação que persistiu a mensagem, alguns statements atrás, dentro
+    // de `createReceivedTurnTx`. Não há nada a armar aqui, e armar seria pior
+    // que redundante: o job atrasado da BullMQ voltaria a ser um segundo prazo,
+    // com relógio próprio, competindo com o do banco pelo mesmo batch — que é
+    // exatamente a borda mal definida que a fatia existe para eliminar.
+    //
+    // O turno fica em `received` DE PROPÓSITO. `queued` significa "existe
+    // wake-up para este turno", e ainda não existe: quem o cria é o fechamento
+    // do batch, quando o prazo vencer. Carimbar `queued` aqui faria o varredor
+    // de recovery enxergar um turno enfileirado sem job e rearmá-lo por conta
+    // própria — furando a janela de debounce que acabou de ser aberta.
+    //
+    // E o caminho fica SEM REDIS. É a metade da issue que nenhum teste de
+    // concorrência prova sozinho: um reinício entre a persistência e o `add`
+    // não pode perder a janela se não existe `add`.
+    if (transactionalDebounceEnabled()) {
+      logger.info(
+        { mensagem_id: stored.id, tel: '[REDACTED]', debounce: 'window_armed' },
+        'baileys.message.debounce_window_armed',
+      );
+      return;
+    }
     try {
       // `phone` (the user's tel) feeds the tenant-scoped debounce identity.
       // The composite key (`${tenant_id}:${agent_id}:${phone}`) is derived

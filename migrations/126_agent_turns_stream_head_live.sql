@@ -1,0 +1,113 @@
+-- maia:no-transaction
+-- 126 — o índice que sustenta o HEAD-OF-LINE (issue #626, fatia C da #505;
+-- fase 6 do rollout da issue-mãe).
+--
+-- ─── A pergunta que este índice responde ───────────────────────────────────
+--
+-- A fatia C acrescenta ao claim a condição de elegibilidade da issue-mãe:
+-- "não existe turno anterior não terminal para a mesma stream". Em SQL isso é
+-- um `NOT EXISTS` sobre `(tenant_id, agent_id, stream_key)` com
+-- `first_ingress_seq < <o do alvo>` e `status NOT IN (<terminais>)` — ver
+-- src/db/repositories/stream-head-sql.ts, que é o ÚNICO lugar onde a regra é
+-- escrita.
+--
+-- A issue avisa, com todas as letras, qual é o modo de falha: "`NOT EXISTS`
+-- sem o índice certo degrada rápido". Este arquivo é a resposta.
+--
+-- ─── Por que a 122 NÃO basta, ainda que tenha o mesmo prefixo ──────────────
+--
+-- A migration 122 já criou `agent_turns_stream_head_idx`:
+--
+--   (tenant_id, agent_id, stream_key, first_ingress_seq, status)
+--   WHERE stream_key IS NOT NULL
+--
+-- Ele é CORRETO para a pergunta e é ruim para ela, e a diferença só aparece na
+-- conversa quente — que é exatamente onde a issue manda olhar.
+--
+-- Naquele índice `status` é a ÚLTIMA coluna, depois de `first_ingress_seq`.
+-- Uma condição de DESIGUALDADE (`NOT IN`) sobre a última coluna não é
+-- pesquisável: ela vira FILTRO. O plano fica sendo "percorra todas as entradas
+-- desta stream com sequência menor que a do alvo e descarte as terminais".
+-- No caso NORMAL — o head-of-line de verdade — nenhuma delas casa, então o
+-- percurso vai até o fim: uma conversa com 5.000 turnos já concluídos custa
+-- ~5.000 entradas de índice A CADA CLAIM, e o custo cresce para sempre, porque
+-- turno terminal nunca sai da tabela. É a serialização de hot stream que a
+-- issue-mãe lista como risco ("índice inadequado pode serializar hot streams").
+--
+-- Este índice inverte a coisa: `status NOT IN (<terminais>)` sai do corpo e vai
+-- para o PREDICADO. O índice passa a conter APENAS os turnos vivos — o backlog
+-- da conversa, tipicamente 0, 1 ou 2 linhas — e o `NOT EXISTS` vira uma sonda
+-- de duas ou três entradas, INDEPENDENTE do histórico. Um turno que termina SAI
+-- do índice; o índice não cresce com o tráfego, só com o que está pendente.
+--
+-- ─── Por que a 122 continua de pé ──────────────────────────────────────────
+--
+-- Ela não é substituída aqui, de propósito. Duas razões:
+--
+--   1. o rollback desta fatia (`126_..._down.sql`) precisa ser "derrube um
+--      índice" e nada mais. Se a 126 derrubasse a 122, o `_down` teria de
+--      RECONSTRUIR um índice — e reconstruir sob incidente é o oposto de um
+--      rollback barato;
+--   2. o índice largo ainda responde perguntas que incluem turnos TERMINAIS
+--      ("todo o histórico desta stream em ordem", a consulta forense do
+--      runbook), que o parcial não pode responder por construção.
+--
+-- O custo de manter os dois é escrita: dois índices com o mesmo prefixo em
+-- `agent_turns`. Consolidá-los é limpeza para depois de o head-of-line estar
+-- estável, e ela precisa ser uma migration própria com sua própria janela.
+--
+-- ─── Por que os terminais entram como LITERAIS ─────────────────────────────
+--
+-- O predicado é `status NOT IN ('completed','ignored','superseded','dead_letter')`,
+-- escrito exatamente assim, e a consulta escreve exatamente a mesma coisa
+-- (`statusLiterals` em src/db/repositories/stream-head-sql.ts). O PostgreSQL só
+-- usa um índice PARCIAL quando consegue PROVAR que a cláusula da consulta
+-- implica o predicado do índice, e a prova é sobre a árvore de expressão: com
+-- os quatro estados vindo como parâmetros (`$1..$4`) ela depende de o
+-- planejador ter substituído os parâmetros, o que ele faz no plano CUSTOM e
+-- deixa de fazer se cachear um plano GENÉRICO. O sintoma seria uma degradação
+-- que aparece só depois da sexta execução da mesma sessão — o pior formato
+-- possível de regressão de desempenho.
+--
+-- Consequência assumida: acrescentar um estado terminal ao contrato
+-- (`TERMINAL_TURN_STATUSES`) exige uma migration nova para reconstruir este
+-- índice. `tests/unit/runtime/stream-head-of-line-contract.spec.ts` amarra a
+-- lista do contrato ao texto deste arquivo, para que a exigência não dependa de
+-- alguém lembrar.
+--
+-- ─── Por que `first_ingress_seq` e não `created_at` ────────────────────────
+--
+-- A issue-mãe é explícita: "timestamps não são fonte primária de ordenação" e
+-- "não usar timestamp do WhatsApp como único desempate". `first_ingress_seq`
+-- vem do contador transacional por stream (`agent_stream_sequences`, migration
+-- 120) e é monotônico por construção, inclusive sob múltiplos produtores e
+-- reentrega. Ordenar por tempo faria a ordem depender de relógio de réplica.
+--
+-- ─── CONCURRENTLY, e a armadilha que ele traz ──────────────────────────────
+--
+-- `agent_turns` é tabela quente: um `CREATE INDEX` comum tomaria ACCESS
+-- EXCLUSIVE e pararia claim, transição e conclusão pela duração da construção.
+-- Daí o `CONCURRENTLY` e o marcador `maia:no-transaction`.
+--
+-- ARMADILHA VERIFICADA (issue #658, e o mesmo texto do `_down` da 124): um
+-- `CREATE INDEX CONCURRENTLY` que FALHA deixa o índice com
+-- `pg_index.indisvalid = false`, e REAPLICAR este arquivo DEVOLVE SUCESSO — o
+-- `IF NOT EXISTS` encontra o índice inválido, emite um NOTICE e responde
+-- `CREATE INDEX`. O runner marca a migration como aplicada COM O ÍNDICE
+-- INVÁLIDO. Nenhum sinal do runner distingue isso de um deploy bem-sucedido.
+--
+-- Aqui o desfecho não é uma invariante quebrada (a regra do head-of-line
+-- continua CORRETA sem o índice — ela é um `NOT EXISTS`, não uma constraint);
+-- é a degradação silenciosa da consulta, que é o que esta migration existe para
+-- impedir. Confira à mão depois de aplicar:
+--
+--   SELECT indexrelid::regclass, indisvalid, indisready
+--     FROM pg_index
+--    WHERE indexrelid::regclass::text = 'agent_turns_stream_head_live_idx';
+--
+-- Ver docs/runbooks/turn-state-machine.md §11.4.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_turns_stream_head_live_idx
+  ON agent_turns (tenant_id, agent_id, stream_key, first_ingress_seq)
+  WHERE stream_key IS NOT NULL
+    AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter');

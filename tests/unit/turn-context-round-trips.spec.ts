@@ -31,7 +31,7 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *
  *   - the gap catalogue was read TWICE, once as `listByLevel('mentionable')`
  *     for the self-awareness clause and once as
- *     `listByLevels([mentionable, proposed])` for the "known limitations"
+ *     `listParaOTurno([mentionable, proposed])` for the "known limitations"
  *     block. The second is a strict superset, so the first is a filter.
  *   - entity NAMES and entity STATES were two reads of the same entity set,
  *     joined on `entity_states.entidade_id = entidades.id`. That is a LEFT
@@ -114,7 +114,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: failable('capabilitiesSkillRepo.listAll', async () => []) },
   capabilityGapsRepo: {
     listByLevel: failable('capabilityGapsRepo.listByLevel', async () => []),
-    listByLevels: failable('capabilityGapsRepo.listByLevels', async () => []),
+    listParaOTurno: failable('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   procedureExecutionsRepo: {
     findActiveForConversa: failable('procedureExecutionsRepo.findActiveForConversa', async () => null),
@@ -212,7 +212,7 @@ function resetCalls(): void {
 const PROMPT_READS_SELF_STATE = [
   'behavioralHintRepo.findActiveForScopes',
   'capabilitiesSkillRepo.listAll',
-  'capabilityGapsRepo.listByLevels',
+  'capabilityGapsRepo.listParaOTurno',
   'entidadesRepo.byIdsWithState',
   'factsRepo.listMentionableForScopes',
   'memoryEntryRepo.findRelevant',
@@ -242,10 +242,10 @@ describe('#525 turn round-trip budget', () => {
 
     it('reads the gap catalogue ONCE for both gap blocks', async () => {
       await buildPrompt(mkCtx(1));
-      // `listByLevels([mentionable, proposed])` is a superset of
+      // `listParaOTurno([mentionable, proposed])` is a superset of
       // `listByLevel('mentionable')`, so the self-awareness clause filters the
       // rows it already has instead of paying a second statement.
-      expect(h.calls['capabilityGapsRepo.listByLevels']).toBe(1);
+      expect(h.calls['capabilityGapsRepo.listParaOTurno']).toBe(1);
       expect(h.calls['capabilityGapsRepo.listByLevel']).toBeUndefined();
     });
 
@@ -411,7 +411,7 @@ describe('#525 turn round-trip budget', () => {
     });
 
     it('a failed gap read degrades the gap blocks but NOT the skills clause', async () => {
-      h.failing.add('capabilityGapsRepo.listByLevels');
+      h.failing.add('capabilityGapsRepo.listParaOTurno');
       const { system } = await buildPrompt(mkCtx(1));
       expect(system).not.toContain('## Limitações conhecidas');
       expect(h.calls['capabilitiesSkillRepo.listAll']).toBe(1);
