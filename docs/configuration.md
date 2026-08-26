@@ -49,8 +49,8 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 182 | 19 |
-| `admin-ui` | 27 | 6 |
+| `runtime` | 184 | 20 |
+| `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
 | `maintenance` | 63 | 13 |
@@ -354,6 +354,13 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
 | `SETUP_TOKEN_OVERRIDE` | string | — | sim | `runtime` | sim | Override do token de bootstrap. Desencorajado em produção (env vaza mais que arquivo 0600), mas não proibido — deploys scriptados legítimos usam. |
+
+### Pedidos de ferramenta (issues da triagem)
+
+| Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
+|---|---|---|---|---|---|---|
+| `MAIA_TOOL_REQUEST_ISSUE_REPO` | string | — | não | `runtime`, `admin-ui` | sim | Repositório GitHub "owner/repo" onde a triagem de pedidos de ferramenta abre issues. Ausente = o aceite é recusado com motivo explícito (nada de destino implícito para efeito externo). |
+| `MAIA_TOOL_REQUEST_GITHUB_TOKEN` | string | — | sim | `runtime` | sim | Token do GitHub usado SOMENTE pelo relayer de pedidos de ferramenta (escopo mínimo: abrir issue no repositório acima). Não é lido pelo Admin UI — o console reserva o aceite, o runtime faz a chamada. Obrigatória quando MAIA_TOOL_REQUEST_ISSUE_REPO está definida. |
 
 ### Admin UI (container Next.js separado)
 
