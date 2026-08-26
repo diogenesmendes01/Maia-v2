@@ -33,7 +33,10 @@
  *      nesse ambiente.
  * Com esses dois fatos, tirar a tag daqui é um diff de uma linha.
  *
- * Rastreamento: issue própria, referenciada em `playwright.config.ts`.
+ * Rastreamento: os dois fatos acima são o critério; enquanto não existir
+ * issue própria para subir o runtime no job, este cabeçalho e a lista fixa de
+ * `tests/unit/ci/admin-ui-e2e-gate.spec.ts` são o registro — a quarentena não
+ * pode crescer sem passar por eles.
  *
  * Os dois casos que NÃO dependem do runtime (a linha declarada aparecer na
  * listagem e o viewer não enxergar a tela) ficam junto de propósito: partir o
