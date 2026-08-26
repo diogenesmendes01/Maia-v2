@@ -16,6 +16,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  SCHEMA_READINESS_STATEMENT_COUNT,
   SCHEMA_READINESS_STATEMENT_TIMEOUT_MS,
   SchemaEvaluationAbortedError,
   withReadOnlySchemaTransaction,
@@ -72,14 +73,16 @@ describe('maia doctor · avaliação de schema em transação READ ONLY', () => 
     expect(client.destroyed).toBe(0);
   });
 
-  it('o statement_timeout é MENOR que o deadline do check, com folga para as duas consultas do ledger', () => {
-    // `describeLedger` + `readLedger` = no máximo duas consultas. Se o teto por
-    // statement fosse >= metade do deadline, uma leitura lenta estouraria o
-    // prazo do check antes de o servidor cortar a consulta.
+  it('o statement_timeout é MENOR que o deadline do check, com folga para TODAS as consultas do caminho de leitura', () => {
+    // `describeLedger` + `readLedger` + `readInvalidIndexes` (#658) = três
+    // consultas. Se o teto por statement fosse >= um terço do deadline, uma
+    // leitura lenta estouraria o prazo do check antes de o servidor cortar a
+    // consulta.
+    expect(SCHEMA_READINESS_STATEMENT_COUNT).toBe(3);
     expect(SCHEMA_READINESS_STATEMENT_TIMEOUT_MS).toBeLessThan(schemaReadinessCheck.deadlineMs);
-    expect(SCHEMA_READINESS_STATEMENT_TIMEOUT_MS * 2).toBeLessThanOrEqual(
-      schemaReadinessCheck.deadlineMs,
-    );
+    expect(
+      SCHEMA_READINESS_STATEMENT_TIMEOUT_MS * SCHEMA_READINESS_STATEMENT_COUNT,
+    ).toBeLessThanOrEqual(schemaReadinessCheck.deadlineMs);
   });
 
   it('devolve o cliente mesmo quando a avaliação LANÇA, e ainda faz ROLLBACK', async () => {

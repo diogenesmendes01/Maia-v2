@@ -56,13 +56,18 @@ import type { SchemaBlockerKind, SchemaReadiness } from '@/migrations/index.js';
 /**
  * Exit codes do gate de schema — a PRIMEIRA coisa que um operador lê.
  *
- * A faixa 90-97 é escolhida para não colidir com nada que já signifique outra
+ * A faixa 90-98 é escolhida para não colidir com nada que já signifique outra
  * coisa: `0`/`1`/`2` são os do migrator (`scripts/migrate.ts`) e o `1`
  * genérico de qualquer outra falha de boot; `SHUTDOWN_FORCED_EXIT_CODE` tem
  * default 1; o Node reserva 1-14 para seus próprios erros fatais; o shell usa
  * 126-165 (não executável, sinais) e 255. Um código dedicado por invariante
  * significa que `docker inspect --format '{{.State.ExitCode}}'` já responde
  * "qual invariante quebrou" antes de qualquer log ser lido.
+ *
+ * O `98` foi acrescentado pela #658 e estende a faixa em um degrau: reusar o
+ * `90` (`dirty`) violaria a regra logo abaixo — a remediação de um índice
+ * inválido é `DROP INDEX CONCURRENTLY` + resolver a duplicata, não
+ * `migrate repair` —, e 98 continua fora de TODAS as faixas reservadas acima.
  *
  * Códigos IGUAIS para blockers diferentes só quando a remediação é a mesma
  * (`dirty_migration`/`orphaned_running` → repair auditável;
@@ -78,6 +83,7 @@ import type { SchemaBlockerKind, SchemaReadiness } from '@/migrations/index.js';
  * | 95 | schema acima do máximo suportado — build velha, banco novo | publicar a release nova |
  * | 96 | migration `running` — migrator em voo (ou morto) | aguardar o job; se não há migrator, é entulho |
  * | 97 | veredito `unknown` — ledger ausente/ilegível, banco fora do ar | `npm run doctor -- --online` |
+ * | 98 | índice `indisvalid = false` — DDL `CONCURRENTLY` reprovou e a invariante de exclusão NÃO existe | `DROP INDEX CONCURRENTLY` + resolver a duplicata + reaplicar |
  */
 export const SCHEMA_BOOT_EXIT_CODES = {
   dirty_migration: 90,
@@ -91,6 +97,7 @@ export const SCHEMA_BOOT_EXIT_CODES = {
   running_migration: 96,
   ledger_missing: 97,
   ledger_unavailable: 97,
+  invalid_index: 98,
   // Problemas de artefato não bloqueiam a readiness (descrevem o repositório,
   // não o schema no banco), então na prática não chegam aqui. Mapeado mesmo
   // assim: um `kind` sem código viraria um `undefined` no exit code.
@@ -111,6 +118,12 @@ export const SCHEMA_BOOT_EXIT_CODES = {
  * `dirty` rodaria o migrator contra um schema parcial.
  */
 export const SCHEMA_BOOT_BLOCKER_PRECEDENCE: readonly SchemaBlockerKind[] = [
+  // #658 vem ANTES do `dirty`: quando os dois aparecem juntos, o índice
+  // inválido é a CAUSA e o `dirty` é a consequência. Um operador que lesse 90
+  // primeiro repararia a linha do ledger e reaplicaria o arquivo — e o
+  // `IF NOT EXISTS` devolveria sucesso sobre o índice ainda inválido, que é
+  // precisamente o fail-open que esta invariante existe para fechar.
+  'invalid_index',
   'dirty_migration',
   'orphaned_running',
   'checksum_mismatch',
@@ -130,6 +143,8 @@ export const SCHEMA_BOOT_BLOCKER_PRECEDENCE: readonly SchemaBlockerKind[] = [
  * ou a decisão de deploy que ele deve tomar. Nunca SQL, nunca DSN.
  */
 const REMEDIATION: Record<SchemaBlockerKind, string> = {
+  invalid_index:
+    'Um índice ficou com `pg_index.indisvalid = false`: a DDL `CONCURRENTLY` que o criaria reprovou e o índice inválido NÃO impõe nada — se ele é um índice único parcial, a exclusão mútua simplesmente não existe. NÃO reaplique a migration antes de removê-lo: o `IF NOT EXISTS` pularia a criação e devolveria sucesso. Ordem: `DROP INDEX CONCURRENTLY <schema>.<indice>;` (fora de transação), resolva as linhas que fizeram a construção reprovar, e só então `npm run db:migrate` (docs/runbooks/migrations.md §Índice inválido deixado por DDL CONCURRENTLY).',
   dirty_migration:
     'Inspecione o schema e repare com `tsx scripts/migrate.ts repair --id <migration.sql> --as applied|pending --reason "<motivo>"` (docs/runbooks/migrations.md §Recovery). NUNCA limpe a flag sem verificar o schema.',
   orphaned_running:

@@ -2911,7 +2911,7 @@
     },
     "READINESS_SCHEMA_CHECK": {
       "type": "string",
-      "description": "Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-97, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.",
+      "description": "Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-98, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso.",
       "x-maia-type": "string",
       "x-maia-group": "lifecycle",
       "x-maia-secret": false,
@@ -2964,6 +2964,33 @@
         "runtime"
       ],
       "x-maia-restart-required": true
+    },
+    "MAIA_TOOL_REQUEST_ISSUE_REPO": {
+      "type": "string",
+      "description": "Repositório GitHub \"owner/repo\" onde a triagem de pedidos de ferramenta abre issues. Ausente = o aceite é recusado com motivo explícito (nada de destino implícito para efeito externo).",
+      "x-maia-type": "string",
+      "x-maia-group": "tool-requests",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime",
+        "admin-ui"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "minha-org/meu-repo"
+      ]
+    },
+    "MAIA_TOOL_REQUEST_GITHUB_TOKEN": {
+      "type": "string",
+      "description": "Token do GitHub usado SOMENTE pelo relayer de pedidos de ferramenta (escopo mínimo: abrir issue no repositório acima). Não é lido pelo Admin UI — o console reserva o aceite, o runtime faz a chamada.",
+      "x-maia-type": "string",
+      "x-maia-group": "tool-requests",
+      "x-maia-secret": true,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "x-maia-required-when": "MAIA_TOOL_REQUEST_ISSUE_REPO está definida"
     },
     "ADMIN_UI_PORT": {
       "type": "string",

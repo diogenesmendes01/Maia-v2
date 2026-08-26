@@ -376,7 +376,7 @@ main().catch(async (err) => {
   }).catch(() => undefined);
   await lifecycle.shutdown({ reason: 'startup_failed' }).catch(() => undefined);
   // Issue #516: o exit code DISTINGUE a invariante quebrada. `1` continua
-  // sendo qualquer outra falha de boot; o gate de schema devolve 90-97 (ver
+  // sendo qualquer outra falha de boot; o gate de schema devolve 90-98 (ver
   // `schema-boot-gate.ts` e docs/runbooks/operational.md §8.1), para que
   // `docker inspect --format '{{.State.ExitCode}}'` já diga o que houve.
   process.exit(bootExitCode(err));
