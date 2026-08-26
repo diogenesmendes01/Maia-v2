@@ -141,7 +141,23 @@ async function criarTurnoComArtefatos(opts: {
   scope?: { tenant_id: string; agent_id: string };
   conversa_id?: string;
   /** Um artefato por posição, na ordem. */
-  artefatos: Array<{ texto: string; status: string; delivery_outcome?: string | null }>;
+  artefatos: Array<{
+    texto: string;
+    status: string;
+    delivery_outcome?: string | null;
+    /**
+     * Sobrescreve o `payload_json` GRAVADO, mantendo tudo o mais derivado do
+     * artefato válido (`payload_type`, `payload_hash`, as duas chaves).
+     *
+     * É a forma REAL da corrupção que a reconciliação tem de recusar: as
+     * colunas de metadado continuam coerentes — o CHECK
+     * `outbound_messages_payload_type_check` da 121 só restringe a COLUNA
+     * `payload_type`, e sobre `payload_json` o banco só impõe tamanho —, e é o
+     * corpo do JSON que deixou de satisfazer a união de #630. Nada aqui é mock:
+     * a row corrompida é expressável no schema, e é assim que ela chega.
+     */
+    payload_json_corrompido?: unknown;
+  }>;
   idade_s?: number;
 }): Promise<Fixture[]> {
   const scope = opts.scope ?? SCOPE;
@@ -196,7 +212,9 @@ async function criarTurnoComArtefatos(opts: {
           seq,
           artefato.payload_version,
           artefato.payload_type,
-          JSON.stringify(artefato.payload),
+          JSON.stringify(
+            'payload_json_corrompido' in a ? a.payload_json_corrompido : artefato.payload,
+          ),
           artefato.payload_hash,
           artefato.logical_dedupe_key,
           artefato.provider_idempotency_key,
@@ -508,6 +526,104 @@ d('#635 — histórico idempotente e a janela delivered→completed (Postgres re
     expect(hist[0]!.conteudo).toBe(capturas[0]!.text);
     // E a retenção: nem mídia, nem URL.
     expect(hist[0]!.midia_url).toBeNull();
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // SONDA 8 — O FAIL-CLOSED DO PAYLOAD INVÁLIDO.
+  //
+  // A terceira saída da reconciliação, e a única das três que protege o USUÁRIO
+  // em vez do estado: um `payload_json` que não satisfaz mais a união de #630
+  // significa artefato corrompido, ou escrito por uma versão que este código não
+  // entende. Fabricar histórico dali gravaria na conversa um texto que NINGUÉM
+  // ENVIOU — indistinguível de mensagem real, com `recovered_by:
+  // 'reconciliation'` como única pista.
+  //
+  // ─── Por que a row é REAL e não um mock do parser ──────────────────────────
+  //
+  // O CHECK `outbound_messages_payload_type_check` (121) restringe a COLUNA
+  // `payload_type`; sobre `payload_json` o banco só impõe TAMANHO
+  // (`..._payload_json_size_check`, 256 KiB). A row corrompida é, portanto,
+  // plenamente expressável — e é exatamente assim que ela chegaria em produção:
+  // colunas de metadado coerentes, corpo do JSON fora do contrato. Mockar
+  // `parseOutboundPayload` provaria o mock; esta fixture prova a produção.
+  //
+  // Duas formas, porque são as duas causas nomeadas no código:
+  //   (a) discriminante DESCONHECIDO — "schema evoluído" (payload de uma versão
+  //       futura que este processo não sabe ler);
+  //   (b) campo obrigatório AUSENTE   — "row adulterada".
+  //
+  // ─── O CONTROLE, no MESMO passe ───────────────────────────────────────────
+  //
+  // Um terceiro artefato VÁLIDO que TEM de ser fabricado. Sem ele o caso ficaria
+  // verde com a reconciliação inteira desligada — que é o erro que as outras
+  // sondas deste arquivo evitam por contraste.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  it('payload_json fora da união de #630 NÃO vira histórico — e o artefato válido do mesmo passe vira', async () => {
+    const [desconhecido] = await criarTurnoComArtefatos({
+      artefatos: [
+        {
+          texto: 'irrelevante — o corpo gravado é outro',
+          status: 'delivered',
+          delivery_outcome: 'accepted_confirmed',
+          // (a) discriminante que a união não conhece.
+          payload_json_corrompido: { type: 'carrier_pigeon', text: 'texto que ninguém enviou' },
+        },
+      ],
+      idade_s: 3600,
+    });
+    const [incompleto] = await criarTurnoComArtefatos({
+      artefatos: [
+        {
+          texto: 'irrelevante — o corpo gravado é outro',
+          status: 'delivered',
+          delivery_outcome: 'accepted_confirmed',
+          // (b) `text` é obrigatório em `textPayloadSchema`.
+          payload_json_corrompido: { type: 'text' },
+        },
+      ],
+      idade_s: 3600,
+    });
+    const [valido] = await criarTurnoComArtefatos({
+      artefatos: [
+        {
+          texto: 'o CONTROLE: este tem de ser fabricado',
+          status: 'delivered',
+          delivery_outcome: 'accepted_confirmed',
+        },
+      ],
+      idade_s: 3600,
+    });
+
+    const stats = await comoEscopo(() => runOutboundRecoveryForScope(SCOPE));
+
+    // ── INVARIANTE ABSOLUTA 1: nada foi inventado. ──────────────────────────
+    for (const corrompido of [desconhecido!, incompleto!]) {
+      expect(
+        await historicoDe(corrompido.outbound_id),
+        `o artefato ${corrompido.outbound_id} ganhou histórico a partir de payload inválido`,
+      ).toHaveLength(0);
+      // ── INVARIANTE ABSOLUTA 2: a linha NÃO é concluída. ──────────────────
+      // `completed` sem histórico mentiria sobre o ciclo, e tiraria a linha do
+      // radar da reconciliação — a corrupção deixaria de ser visível.
+      expect((await linha(corrompido.outbound_id)).status).toBe('delivered');
+    }
+
+    // ── INVARIANTE ABSOLUTA 3: o CONTROLE foi fabricado. ────────────────────
+    // Sem esta asserção, tudo acima ficaria verde com a reconciliação desligada.
+    expect(await historicoDe(valido!.outbound_id)).toHaveLength(1);
+    expect((await linha(valido!.outbound_id)).status).toBe('completed');
+
+    // ── INVARIANTE ABSOLUTA 4: a conversa do usuário tem UMA resposta. ──────
+    // A contagem que importa de verdade: nenhum texto inventado chegou lá.
+    expect(await historicoDaConversa(conversaId)).toBe(1);
+
+    // ── A SÉRIE, no MESMO passe. Duas recusas e uma fabricação. ─────────────
+    // Contagem do próprio tick (`SweepStats` nasce em cada invocação), nunca um
+    // delta sobre estado compartilhado — a segunda tentativa do `retry: 1` parte
+    // de linhas novas e não herda nada.
+    expect(stats.reconciled.escalate_manual).toBe(2);
+    expect(stats.reconciled.history_fabricated).toBe(1);
   });
 
   it('a auditoria distingue histórico FABRICADO de histórico que já existia', async () => {

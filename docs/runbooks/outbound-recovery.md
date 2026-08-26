@@ -222,7 +222,8 @@ respostas:
 - **o `payload_json` não satisfaz mais a união de #630** (schema evoluído, row
   adulterada) — `escalate_manual` + `ops_alert`
   (`outbound_recovery.history_unrecoverable_invalid_payload`). A linha fica em
-  `delivered`. É o único caso em que ainda há trabalho humano aqui.
+  `delivered`. É o único caso em que ainda há trabalho humano aqui, e o §5.4.1
+  diz o que fazer.
 
 **Projetar não é re-renderizar, e a diferença é a razão de a #633 ter recusado
 fazer isto.** `buildHistoricoFromArtifact`
@@ -242,6 +243,47 @@ carrega `recovered_by: "reconciliation"` e `history_fabricated: true`.
 **O que investigar quando `history_fabricated` ≠ 0**: não é o histórico — ele foi
 recuperado. É *por que o processo morreu ali*. Comece pelos reinícios do worker
 de entrega na mesma janela de tempo.
+
+#### 5.4.1 `history_unrecoverable_invalid_payload` — o fail-closed
+
+**Não conserte isto fabricando o histórico.** A recusa é deliberada e é a única
+propriedade desta fatia que protege o USUÁRIO em vez do estado: um
+`payload_json` que não passa pela união de #630 significa artefato corrompido,
+ou escrito por uma versão que este processo não sabe ler. Projetar dali gravaria
+na conversa um texto que **ninguém enviou** — indistinguível de mensagem real,
+com `recovered_by: "reconciliation"` como única pista de que foi inventado.
+
+Achar as linhas afetadas:
+
+```sql
+SELECT id, payload_type, payload_version, payload_json, provider_message_id, created_at
+  FROM outbound_messages
+ WHERE tenant_id = :t AND agent_id = :a
+   AND status = 'delivered'
+   AND turn_id IS NOT NULL
+ ORDER BY created_at;
+```
+
+Triagem, nesta ordem:
+
+1. **`payload_version` maior do que a que este binário conhece?** É deploy
+   misto: uma réplica nova commitou, uma antiga está reconciliando. Não é
+   corrupção — atualize a réplica antiga e a linha se resolve sozinha no tick
+   seguinte.
+2. **`payload_type` da coluna diverge do `payload_json->>'type'`?** A row foi
+   escrita fora do caminho de produção (migração manual, replay artesanal).
+   Trate como corrupção.
+3. **Corrupção confirmada:** a mensagem CHEGOU (só `accepted_confirmed` produz
+   `delivered`), então **não reenvie**. O histórico daquela resposta está
+   perdido, e a decisão é humana: ou se reconstrói a row de `mensagens` à mão a
+   partir de uma fonte externa confiável (o telefone do usuário, um export do
+   WhatsApp), ou se aceita a lacuna e a linha é fechada manualmente. Não há
+   comando para isso, de propósito: um comando que "conserta" isto sozinho é a
+   fabricação que esta seção proíbe.
+
+A linha fica em `delivered`, portanto continua contando em
+`maia_outbound_pending_age_seconds` e continua visível a cada tick. Isso é
+intencional — sair do radar seria pior que envelhecer nele.
 
 ### 5.5 Divergência turno ↔ outbound
 
