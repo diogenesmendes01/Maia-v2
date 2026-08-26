@@ -3659,11 +3659,47 @@ export const agent_stream_sequences = pgTable(
   }),
 );
 
+// Issue #629 (fatia F da #505, migration 133) — a STREAM BLOQUEADA para
+// intervenção, como dado.
+//
+// É a segunda saída da política de poison/DLQ que a issue-mãe exige escolher
+// CONSCIENTEMENTE (a primeira é `dead_letter` que libera o sucessor). Uma linha
+// ATIVA — `unblocked_at IS NULL` — faz o claim recusar todo turno da conversa
+// com `stream_poisoned`, até um operador desbloquear pela porta auditada.
+//
+// Tabela, e não coluna em `agent_turns`, porque o bloqueio é da STREAM: um
+// marcador no turno exigiria varrer o histórico da conversa a cada claim (a
+// mesma varredura que a migration 126 existe para eliminar), e o ciclo de vida
+// do bloqueio — quem bloqueou, quem desbloqueou, com que justificativa — não é
+// o ciclo de vida do turno.
+export const agent_stream_blocks = pgTable('agent_stream_blocks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
+  stream_key: text('stream_key').notNull(),
+  /** Vocabulário fechado — `STREAM_BLOCK_REASONS` de `poison-policy.ts`. */
+  reason: text('reason').notNull(),
+  /** A categoria de erro (`POISON_CATEGORIES`) que DECIDIU o bloqueio. */
+  category: text('category').notNull(),
+  /** O turno envenenado. Sem FK — coluna forense, como `promoted_by_turn_id`. */
+  blocked_by_turn_id: uuid('blocked_by_turn_id').notNull(),
+  /** `last_error_code` já sanitizado. NUNCA o resumo (pode conter conteúdo). */
+  error_code: text('error_code'),
+  blocked_at: timestamp('blocked_at', { withTimezone: true }).notNull().defaultNow(),
+  /** `NULL` = bloqueio ATIVO. É o predicado do índice único parcial. */
+  unblocked_at: timestamp('unblocked_at', { withTimezone: true }),
+  unblocked_by: text('unblocked_by'),
+  unblock_reason: text('unblock_reason'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type AgentTurn = typeof agent_turns.$inferSelect;
 export type NewAgentTurn = typeof agent_turns.$inferInsert;
 export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
 export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
 export type AgentStreamSequence = typeof agent_stream_sequences.$inferSelect;
+export type AgentStreamBlock = typeof agent_stream_blocks.$inferSelect;
 
 // ---------------------------------------------------------------------------
 // Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de

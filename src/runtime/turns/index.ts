@@ -33,3 +33,9 @@ export * from './stream-promotion.js';
 // (`src/workers/stream-debounce-closer.ts`) e o boot da observabilidade são
 // consumidores de primeira classe, e a regra do barril é "importe sempre daqui".
 export * from './stream-debounce.js';
+// #629 — a POLÍTICA de poison/DLQ. Vocabulário e classificação PUROS, e a
+// fachada os exporta porque o consumidor não é só `lifecycle.ts`: quem lê a
+// configuração e quem AUDITA a interdição precisam das mesmas categorias, e a
+// operação de desbloqueio (`src/ops/stream-unblock.ts`) fala do mesmo
+// vocabulário. A regra do barril é "importe sempre daqui".
+export * from './poison-policy.js';

@@ -2456,6 +2456,90 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  TURN_POISON_BLOCK_CATEGORIES: {
+    name: 'TURN_POISON_BLOCK_CATEGORIES',
+    description:
+      'POLÍTICA DE POISON/DLQ por CATEGORIA DE ERRO (issue #629, fatia F da #505; fase 8 do ' +
+      'rollout). EXIGE a migration 133 APLICADA (tabela agent_stream_blocks) — sem ela toda ' +
+      'conclusão de turno envenenado falha, porque o INSERT do bloqueio referencia uma tabela ' +
+      'inexistente. Lista separada por vírgula das categorias em que ESGOTAR TENTATIVAS deve ' +
+      'BLOQUEAR a conversa para intervenção humana, em vez de dead-letter que LIBERA o próximo ' +
+      'turno. Categorias válidas: effect_committed, model, transport, infrastructure, operator, ' +
+      'unknown (espelho de POISON_CATEGORIES em src/runtime/turns/poison-policy.ts; uma ' +
+      'categoria desconhecida REPROVA o boot em vez de ser ignorada, porque silenciá-la faria o ' +
+      'operador acreditar ter ligado o bloqueio). ' +
+      'Default `effect_committed`, e a escolha é o núcleo da issue-mãe: as duas saídas são ' +
+      'defensáveis e INCOMPATÍVEIS — liberar preserva disponibilidade às custas da semântica ' +
+      '(a plataforma responde M2 sem nunca ter respondido M1), bloquear preserva a semântica às ' +
+      'custas da conversa (nada anda até alguém olhar). effect_committed é a única categoria em ' +
+      'que a conversa já está semanticamente quebrada ANTES de a política decidir: uma tool ' +
+      'irreversível rodou e o turno falhou depois. As demais têm causa COMPARTILHADA e ' +
+      'transitória — um incidente de LLM ou de rede que bloqueasse pararia milhares de conversas ' +
+      'de uma vez, com desbloqueio manual uma a uma. ' +
+      'LISTA VAZIA é o KILL SWITCH da fatia: nenhum bloqueio NOVO nasce e a conclusão volta ao ' +
+      'comportamento da #627. Ela NÃO desfaz bloqueios existentes — quem os desfaz é ' +
+      '`npm run dlq -- unblock`, que é operação auditada. ' +
+      'Vigie maia_stream_blocked_total{reason="stream_poisoned"} (sobe e NÃO volta sozinha: ' +
+      'cada ponto é uma tentativa contra uma conversa que nenhum worker vai destravar) e ' +
+      'maia_stream_poisoned_streams (o gauge de quantas conversas estão interditadas agora). ' +
+      'Ver docs/runbooks/turn-state-machine.md §14.',
+    group: 'governance',
+    secret: false,
+    services: ['runtime'],
+    // A validação do CONTEÚDO é aqui, e não em `parsePoisonBlockCategories`,
+    // porque o boot é o único momento em que o operador ainda pode corrigir a
+    // digitação. `parsePoison…` também lança — defesa em profundidade, para o
+    // caso de a lista chegar por um caminho que não passou pelo contrato.
+    schema: z
+      .string()
+      .default('effect_committed')
+      .refine(
+        (raw) =>
+          raw
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter((s) => s.length > 0)
+            .every((s) =>
+              [
+                'effect_committed',
+                'model',
+                'transport',
+                'infrastructure',
+                'operator',
+                'unknown',
+              ].includes(s),
+            ),
+        {
+          message:
+            'categorias válidas: effect_committed, model, transport, infrastructure, operator, ' +
+            'unknown (lista separada por vírgula; vazia desliga o bloqueio)',
+        },
+      ),
+    example: 'effect_committed',
+    fixture: 'effect_committed',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  TURN_STREAM_STARVATION_AFTER_MS: {
+    name: 'TURN_STREAM_STARVATION_AFTER_MS',
+    description:
+      'A partir de quantos ms um head-of-line parado conta como STARVATION (issue #629). É o ' +
+      'limiar de maia_stream_starvation_total e do gauge maia_stream_head_age_seconds — não ' +
+      'muda comportamento nenhum do escalonador, só o ponto em que a plataforma passa a AFIRMAR ' +
+      'que uma conversa está sendo preterida. Default 300000 (5 min), que é folgado de ' +
+      'propósito: STUCK_AFTER_MS do varredor é 2 min e o backoff de retry vai a 15 min, então um ' +
+      'limiar abaixo de 5 min contaria como starvation um backoff legítimo em aberto — e uma ' +
+      'métrica de fairness que dispara com o retry funcionando é uma métrica que o plantão ' +
+      'aprende a ignorar. Ver docs/runbooks/turn-state-machine.md §14.4.',
+    group: 'performance',
+    secret: false,
+    services: ['runtime'],
+    schema: posInt(300_000),
+    example: '300000',
+    fixture: '300000',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   TURN_CONTEXT_CACHE_TTL_MS: {
     name: 'TURN_CONTEXT_CACHE_TTL_MS',
     description:

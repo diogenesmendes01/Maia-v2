@@ -1284,3 +1284,310 @@ de um rollback da #626 é desligar as duas.
 
 Ordem no rollback COMPLETO do protocolo de stream: `130` → `127` → `126` →
 `124` → `122` → `120`.
+
+## 14. Retry, poison/DLQ, fairness e replay (#629, fatia F da #505)
+
+Fase 8 e ÚLTIMA do rollout da #505. Três coisas, e as três fecham cláusulas
+literais da issue-mãe:
+
+1. a política de **poison/DLQ** passa a ESCOLHER, por categoria de erro, entre
+   liberar a conversa e interditá-la — e a escolha é auditada;
+2. o **replay manual** deixa de poder violar a ordem já comprometida sem uma
+   declaração explícita;
+3. **fairness e starvation** passam a ser MEDIDOS. Até aqui não eram, em fatia
+   nenhuma.
+
+### 14.1 A escolha que não existia, e por que a ausência dela era um bug
+
+Até a #627, `dead_letter` liberava a conversa. Não por decisão: por OMISSÃO.
+`dead_letter` é terminal (#503), um turno terminal sai do predicado de
+head-of-line (#626), logo o sucessor vira reivindicável. Ninguém escolheu isso —
+foi efeito colateral da máquina de estados, e a issue-mãe chama exatamente essa
+situação de falha nº 5.
+
+As duas saídas são **defensáveis e incompatíveis**:
+
+| Saída | Preserva | Custa |
+|---|---|---|
+| `release` — `dead_letter` e a conversa anda | disponibilidade | a semântica: a plataforma responde M2 sem nunca ter respondido M1 |
+| `block_stream` — `dead_letter` + interdição | a semântica | a conversa: nada anda até um humano olhar |
+
+A decisão é `(código de erro, outcome) -> categoria -> saída`, e a configuração
+é **por categoria**:
+
+```
+TURN_POISON_BLOCK_CATEGORIES=effect_committed     # default
+```
+
+| Categoria | O que é | No default |
+|---|---|---|
+| `effect_committed` | uma tool IRREVERSÍVEL rodou e o turno falhou depois (`outcome = unsafe_to_retry`, produzido por `decideTurnAction`) | **BLOQUEIA** |
+| `model` | o LLM expirou, recusou, ou devolveu algo que não parseia | libera |
+| `transport` | a resposta estava pronta e o ENVIO falhou | libera |
+| `infrastructure` | banco, Redis, fila, lease | libera |
+| `operator` | um humano cancelou | libera |
+| `unknown` | não classificado | libera |
+
+O `outcome` DOMINA o código de erro, e a razão decide a fatia: `unsafe_to_retry`
+é produzido por `decideTurnAction` (`src/agent/turn-outcome.ts`) exatamente
+quando `delivery.sideEffectsCommitted` é verdade — a plataforma SABE, por um
+fato durável, que uma tool irreversível rodou. O código que acompanha é o motivo
+da SAÍDA do ReAct (`reasoner_failed`, `outbound_failure`), que classificaria como
+`model` ou `transport` e apagaria a única informação que importa.
+
+**Por que só `effect_committed` no default, e por que isso merece ser
+contestado.** As outras categorias têm causa COMPARTILHADA e transitória: um
+incidente de LLM ou de rede que bloqueasse pararia milhares de conversas ao
+mesmo tempo, com desbloqueio manual uma a uma — trocar uma degradação por uma
+parada, com trabalho de recuperação que cresce com o tráfego. `effect_committed`
+é a única em que a conversa já está semanticamente quebrada ANTES de a política
+decidir. `unknown` ficou de fora porque é o destino de todo código novo (uma
+tool nova, um erro de provedor novo): incluí-la faria a plataforma bloquear
+conversas por causa de uma OMISSÃO da tabela de classificação, e o sintoma seria
+conversas paradas depois de um deploy que não mexeu na política. Quem prefere o
+outro lado escreve `TURN_POISON_BLOCK_CATEGORIES=effect_committed,unknown`.
+
+Uma categoria com erro de digitação **reprova o boot**. É deliberado: silenciada,
+ela produziria um dashboard sem bloqueio nenhum porque não HÁ bloqueio nenhum, e
+a leitura natural seria "não aconteceu nenhum caso" em vez de "a política está
+desligada" — indistinguível de sucesso.
+
+### 14.2 A interdição, e o que ela é no banco
+
+Uma linha ATIVA (`unblocked_at IS NULL`) em `agent_stream_blocks` (migration
+`133`). Enquanto ela existir, **todo** claim daquela conversa é recusado com
+`stream_poisoned`, o recovery não a enumera e a promoção não elege ninguém nela.
+
+O bloqueio é gravado na **MESMA transação** do CAS terminal, e **antes** da
+eleição da promoção. A ordem não é estética: a eleição carrega
+`streamNotPoisoned`, então inserir primeiro faz a promoção ver a interdição que a
+própria conclusão acabou de criar. Invertê-las produziria o pior estado possível
+— conversa bloqueada E sucessor acordado —, e o defeito seria invisível: o job
+acordaria, o claim recusaria, e o único sintoma seria um `promoted` que não
+corresponde a fila nenhuma.
+
+`agent_stream_blocks_active_uq` `(tenant_id, agent_id, stream_key) WHERE
+unblocked_at IS NULL` é o que faz "no máximo UMA interdição por conversa" ser
+propriedade do banco: duas conclusões terminais simultâneas produzem uma linha e
+um `ON CONFLICT DO NOTHING`.
+
+### 14.3 As conversas interditadas, e como desbloquear
+
+```bash
+npm run dlq -- blocks
+```
+
+Lista cross-tenant, ordenada pela mais antiga, com o `backlog` de cada uma — que
+é o número que decide prioridade: 40 turnos presos é incidente de usuário, zero é
+faxina.
+
+```bash
+npm run dlq -- unblock-stream <turn_id> --reason "<motivo>" [--actor <quem>]
+```
+
+`--reason` é OBRIGATÓRIO: ele vai para a `audit_log` `stream_unblocked` E para o
+CHECK da migration 133, que recusa um desbloqueio sem autor e sem justificativa.
+
+O comando faz quatro coisas, nesta ordem: resolve o dono pela fronteira de
+confiança (o operador digita um `turn_id`, nunca um tenant), faz o CAS do
+desbloqueio, AUDITA, e só então re-arma o head. Dois operadores simultâneos
+produzem um desbloqueio e um `not_blocked` — e o segundo **não** audita.
+
+**O turno ENVENENADO continua em `dead_letter`, de propósito.** Desbloquear e
+ressuscitar são decisões diferentes com riscos diferentes: liberar a conversa
+deixa as mensagens SEGUINTES andarem; replayar o turno morto reexecuta um
+trabalho que já pode ter aplicado metade de um efeito irreversível. Quem quer as
+duas roda `unblock-stream` e depois `replay-turn`, nessa ordem.
+
+Consulta direta, quando o CLI não estiver à mão:
+
+```sql
+SELECT b.id, b.tenant_id, b.agent_id, b.category, b.error_code,
+       b.blocked_by_turn_id, b.blocked_at
+  FROM agent_stream_blocks b
+ WHERE b.unblocked_at IS NULL
+ ORDER BY b.blocked_at;
+```
+
+**Nunca** desbloqueie com `UPDATE agent_stream_blocks SET unblocked_at = now()` à
+mão: isso pula a auditoria e o re-arme do head, e a conversa fica liberada sem
+que ninguém a acorde até o varredor passar.
+
+### 14.4 Replay manual: a ordem já comprometida
+
+`replay-turn` agora RECUSA quando existe turno POSTERIOR na mesma stream que já
+chegou a estado terminal — isto é, quando a plataforma já respondeu (ou já
+descartou) uma mensagem posterior àquela. Devolver o turno morto à fila ali o
+executaria depois de algo que o usuário já viu.
+
+```
+replay RECUSADO para <id>: a ordem desta conversa já está COMPROMETIDA —
+3 turno(s) POSTERIOR(es) da mesma stream já chegaram a estado terminal.
+```
+
+A recusa é **permanente** até alguém decidir o contrário; a remediação não é
+tentar de novo:
+
+```bash
+npm run dlq -- replay-turn <turn_id> --reason "<motivo>" --reconcile
+```
+
+`--reconcile` é o "modo de replay/reconciliação explícito" que a issue-mãe exige.
+Ele é auditado com row PRÓPRIA (`turn_replay_reconciled`), e não só com um campo
+de metadata: é a única evidência de que a plataforma processou algo fora da ordem
+que já havia entregue, e uma consulta de rotina sobre `turn_replayed` a filtraria
+fora sem querer.
+
+Um posterior ainda VIVO (não terminal) **não** compromete nada e não recusa nada
+— ele será recusado com `not_head` assim que o turno replayado voltar a ser o
+head, que é o protocolo funcionando.
+
+O guarda mora no `WHERE` do `UPDATE` do replay, não numa consulta anterior: entre
+um `SELECT count` e o `UPDATE` um sucessor pode concluir, e o replay atravessaria
+a ordem tendo acabado de verificar que não a atravessaria.
+
+### 14.5 Fairness, starvation e o que os números querem dizer
+
+| Sinal | Onde | Leitura |
+|---|---|---|
+| `maia_stream_head_age_seconds` | `/metrics` | idade do head MAIS VELHO. É o pior caso, e é isso que fairness mede — uma média com 10 mil conversas instantâneas e uma parada há duas horas fica excelente e esconde o usuário abandonado. Sobe e não volta = conversa presa; cruze com `maia_stream_blocked_total{reason}` |
+| `maia_stream_head_age_p95_seconds` | `/metrics` | o PAR do anterior. Sem ele, "uma conversa presa" e "a plataforma toda atrasada" produzem o mesmo máximo |
+| `maia_stream_turn_wait_seconds` | `/metrics` | histograma da espera de quem JÁ COMEÇOU, medida pelo relógio do BANCO no claim. Baldes em SEGUNDOS, com cortes nos marcos reais (120s = varredor, 300s = starvation, 900s = teto do backoff): um quantil que cruza um corte diz QUAL mecanismo domina a espera |
+| `maia_stream_active_total` | `/metrics` | conversas com turno ATIVO agora. Com head-of-line cada stream ocupa no máximo UMA vaga, então este número é literalmente "quantas conversas distintas estão sendo atendidas em paralelo". Preso em 1 com `live_total` alto = serialização |
+| `maia_stream_live_total` | `/metrics` | o DENOMINADOR do anterior. Sem ele, `active_total` não distingue "há pouco trabalho" de "o escalonador parou" |
+| `maia_stream_backlog_max` | `/metrics` | maior backlog de uma ÚNICA conversa. É o número em que se calibra um limite, se ele um dia for necessário — ver abaixo |
+| `maia_stream_starvation_total` | `/metrics` | EPISÓDIOS (não amostras) de head parado além de `TURN_STREAM_STARVATION_AFTER_MS`. Ver a nota do atraso de um scrape |
+| `maia_stream_poisoned_streams` | `/metrics` | conversas interditadas AGORA. Cada ponto é uma conversa que NENHUM mecanismo automático destrava; não voltar a zero é trabalho de operador acumulando |
+| `maia_stream_poison_total{category,disposition}` | `/metrics` | a DECISÃO da política. `{category="effect_committed",disposition="release"}` crescendo significa que alguém tirou a categoria da lista e a plataforma está seguindo conversas por cima de efeitos irreversíveis pela metade |
+| `stream_poisoned` / `stream_unblocked` | `audit_log` | a decisão e o seu desfazimento, com `category`, `actor` e `operator_reason`. Nenhuma carrega `stream_key` |
+| `turn_replay_refused` / `turn_replay_reconciled` | `audit_log` | a invariante HONRADA e a invariante ATRAVESSADA. `metadata.committed_after` diz atrás de quantos turnos já concluídos o operador inseriu trabalho |
+
+**Duas propriedades destas séries que não são óbvias e mordem quem não as
+souber:**
+
+* **`starvation_total` atrasa um scrape.** `renderPrometheus` emite os
+  CONTADORES antes de rodar os providers de GAUGE, e quem detecta starvation é o
+  provider. O scrape que DETECTA ainda mostra o valor anterior; quem mostra o
+  incremento é o seguinte. Num scrape de 15s isso é irrelevante para alerta e
+  fatal para quem confere à mão uma vez só;
+* **a deduplicação é em MEMÓRIA e morre com o processo.** Uma conversa ainda
+  faminta depois de um restart é contada de novo. É recontagem, não invenção — a
+  conversa ESTÁ faminta —, e fechar isso exigiria persistir estado de métrica a
+  cada scrape numa tabela quente.
+
+**Limite de backlog por stream: MEDIDO, não APLICADO.** A issue-mãe pede "limites
+de backlog por stream e política de pressão". `maia_stream_backlog_max` entrega a
+medição; o limite não é aplicado, e a razão é que a única pressão possível no
+ingresso seria RECUSAR mensagem de usuário do WhatsApp — perda de dado, para
+proteger a plataforma de um backlog que na prática é limitado pelo próprio
+usuário (ninguém digita mil mensagens enquanto espera). Se algum dia a série
+mostrar backlogs que justifiquem um limite, o número para calibrá-lo já está lá.
+
+**O que a medição mostrou, contra PostgreSQL real** (`tests/integration/turn-stream-fairness-real-db.spec.ts`,
+impresso a cada rodada): com 4 vagas, 25 turnos numa conversa quente e 20
+conversas de um turno — e os 25 jobs da quente entrando na fila ANTES dos outros,
+o pior caso — as conversas pequenas terminam com mediana de posição 11 de 45.
+Sem fairness elas sairiam todas depois do turno 25. E, com o head de uma
+conversa segurado por um worker vivo durante toda a rodada, as outras 30
+terminam INTEIRAS: a conversa lenta não serializa o tenant nem o agente.
+
+### 14.6 Conversa que não anda: a árvore completa
+
+Rode a consulta da §11.3 e, ANTES de ler a primeira linha, pergunte se a conversa
+está interditada:
+
+```sql
+SELECT id, category, error_code, blocked_by_turn_id, blocked_at
+  FROM agent_stream_blocks
+ WHERE tenant_id = $1 AND agent_id = $2 AND stream_key = $3
+   AND unblocked_at IS NULL;
+```
+
+| Sintoma | Causa | Remediação |
+|---|---|---|
+| linha em `agent_stream_blocks`, claim recusa `stream_poisoned` | política de poison interditou | §14.3 — **nada** acontece sem um humano |
+| head `retryable` com `next_attempt_at` no futuro | backoff em aberto | **nada.** "Backoff não autoriza ultrapassagem silenciosa"; a conversa espera |
+| head `outbound_pending` | outbox travado | runbook do outbox (#506) |
+| head `queued` com `promoted_at` antigo | wake-up perdido | §12.3 |
+| head `claimed`/`running`, lease no futuro, heartbeat recente | worker saudável | **nada** |
+
+`stream_poisoned` e `stream_blocked` NÃO são sinônimos, e é a distinção mais
+importante das cinco: `stream_blocked` é "espere o outbox"; `stream_poisoned` é
+"NADA vai acontecer sem um humano". Nenhum worker, nenhum varredor, nenhuma
+promoção e nenhuma quantidade de tempo destravam uma conversa interditada.
+
+### 14.7 Poison message: o roteiro
+
+1. `npm run dlq -- blocks` — quantas conversas, há quanto tempo, com que
+   backlog;
+2. para cada uma, leia o turno envenenado:
+
+   ```sql
+   SELECT status, outcome, attempt_count, last_error_code, last_error_summary,
+          first_ingress_seq, dead_lettered_at
+     FROM agent_turns WHERE id = $1;
+   ```
+
+3. **decida sobre o EFEITO antes de decidir sobre a fila.** `category =
+   'effect_committed'` significa que uma tool irreversível rodou e ninguém sabe
+   o que ficou aplicado. Concilie no sistema externo primeiro;
+4. `npm run dlq -- unblock-stream <turn_id> --reason "<o que você conciliou>"` —
+   a conversa volta a andar, o turno continua morto;
+5. se — e só se — o trabalho do turno morto ainda precisar acontecer,
+   `npm run dlq -- replay-turn <turn_id> --reason "..."`. Ele passa pelo guarda
+   de ordem comprometida; se recusar, pare e leia a §14.4 antes de usar
+   `--reconcile`.
+
+Nunca pule o passo 3 porque o passo 4 é rápido. A interdição existe exatamente
+para comprar esse tempo.
+
+### 14.8 Rollout e rollback
+
+Ordem obrigatória do deploy:
+
+1. `npm run db:migrate` (aplica a `133` — tabela NOVA e vazia, sem
+   `CONCURRENTLY`, num envelope `BEGIN`/`COMMIT`, portanto **sem** a armadilha
+   de índice inválido da §10.4);
+2. suba o código com `TURN_POISON_BLOCK_CATEGORIES=effect_committed` (o
+   default).
+
+Subir o código antes da migration **não** é seguro: o INSERT da interdição
+referencia a tabela, e sem ela toda conclusão de turno envenenado da categoria
+bloqueante falha — e falha DENTRO da transação do CAS terminal, então o turno
+nem morre.
+
+O kill switch é a configuração, não a migration:
+
+```
+TURN_POISON_BLOCK_CATEGORIES=      # lista VAZIA + restart
+```
+
+Com ela vazia nenhum bloqueio NOVO nasce e a conclusão volta ao comportamento da
+#627. Ela **não** desfaz interdições existentes — quem as desfaz é
+`npm run dlq -- unblock-stream`, que é operação auditada. Isso é deliberado: uma
+conversa que um humano interditou não pode voltar a andar porque alguém mexeu
+numa variável de ambiente.
+
+**Ordem obrigatória de um rollback de verdade:**
+
+1. `TURN_POISON_BLOCK_CATEGORIES=` (vazio) e restart das réplicas;
+2. confirme que não há interdição ATIVA — cada uma é uma conversa parada que o
+   `_down` faria voltar a andar SEM ninguém ter decidido isso:
+
+   ```sql
+   SELECT count(*) FROM agent_stream_blocks WHERE unblocked_at IS NULL;
+   ```
+
+   Zero é o esperado. Cada linha devolvida deve sair pelo caminho normal;
+3. só então `migrations/133_agent_stream_blocks_down.sql`.
+
+O `_down` apaga o HISTÓRICO inteiro de envenenamento, inclusive os bloqueios já
+resolvidos — que são o que responde "esta conversa já parou por isto antes?".
+Não há como preservá-lo derrubando a tabela.
+
+O guarda de ordem do replay e as métricas de fairness **não** têm kill switch, e
+não precisam: o primeiro só age numa operação manual (e tem `--reconcile` como
+saída explícita), e as segundas são leitura.
+
+Ordem no rollback COMPLETO do protocolo de stream: `133` → `130` → `127` →
+`126` → `124` → `122` → `120`.

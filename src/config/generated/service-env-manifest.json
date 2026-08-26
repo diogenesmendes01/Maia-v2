@@ -1203,6 +1203,20 @@
           "restartRequired": true
         },
         {
+          "name": "TURN_POISON_BLOCK_CATEGORIES",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_STREAM_STARVATION_AFTER_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
           "name": "TURN_CONTEXT_CACHE_TTL_MS",
           "secret": false,
           "required": false,
@@ -1526,6 +1540,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1719,6 +1735,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1912,6 +1930,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
