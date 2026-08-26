@@ -76,6 +76,12 @@ const DELIVERY_TERMINAL_STATUSES = [
   'reconciling',
   'failed_terminal',
   'cancelled',
+  // Issue #633 — a DLQ do outbox. Terminal para o worker de entrega: a única
+  // saída é o rearmamento MANUAL auditado (`rearmOutboundByOperator`), que
+  // devolve a linha a `retryable` antes de rearmar o job. Sem esta entrada a
+  // recusa do claim seria classificada como `not_eligible` e um pico na DLQ
+  // apareceria como contenção entre réplicas.
+  'dead_letter',
   // Vocabulário legado da 063 — uma row do caminho síncrono antigo também
   // não é trabalho de entrega deste worker.
   'sent',

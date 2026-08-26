@@ -720,6 +720,71 @@ export const METRIC = {
    * para o seletor deixar de casar); a série dedicada não tem esse problema.
    */
   OUTBOUND_DELIVERY_OUTCOME: 'maia_outbound_delivery_outcome_total',
+  /**
+   * Issue #633 — idade, em segundos, da saída lógica NÃO ENTREGUE mais antiga
+   * do escopo. GAUGE, por (tenant_id, agent_id).
+   *
+   * É a métrica que o critério de pronto exige para que "`delivery_unknown` não
+   * acumule sem alarme" seja verificável: um contador de reconciliações diz
+   * quanto trabalho foi feito, não quanto ficou parado. Só esta série responde
+   * "há quanto tempo a resposta mais antiga está esperando?", e é sobre ela que
+   * o alerta se escreve.
+   *
+   * "Não entregue" é tudo que não é `completed` e não é terminal por decisão
+   * (`failed_terminal`, `cancelled`, `dead_letter`). Uma `delivered` sem
+   * histórico CONTA: a mensagem chegou, mas o ciclo não fechou — e é justamente
+   * a janela que a #632 declarou e esta fatia recupera.
+   */
+  OUTBOUND_PENDING_AGE_SECONDS: 'maia_outbound_pending_age_seconds',
+  /**
+   * Issue #633 — o que a reconciliação DECIDIU sobre uma linha incerta.
+   * `result` ∈ `await_grace` | `resend_idempotent` | `escalate_manual` |
+   * `dead_letter` | `noop` | `history_recovered` (`RECONCILIATION_RESULTS`).
+   *
+   * `resend_idempotent` e `escalate_manual` são as duas metades da regra da
+   * épica, e vê-las lado a lado é o ponto: a primeira só acontece quando o
+   * provedor honra a chave idempotente para aquele tipo de payload; a segunda é
+   * todo o resto. Um `resend_idempotent` para um tipo sem chave nativa seria a
+   * mensagem duplicada, e é um valor que o código não consegue emitir —
+   * `reconciliationDisposition` delega a decisão a `autoResendAllowed`.
+   *
+   * `await_grace` sendo alto e constante significa carência longa demais para a
+   * latência real do provedor; `escalate_manual` crescendo é fila humana
+   * acumulando, que é o alarme operacional desta fatia.
+   */
+  OUTBOUND_RECONCILIATION: 'maia_outbound_reconciliation_total',
+  /**
+   * Issue #633 — a plataforma desistiu de uma saída lógica. `reason` ∈
+   * `attempt_limit` | `reconciliation_timeout` (`OUTBOUND_DEAD_LETTER_REASONS`).
+   *
+   * Separada de `OUTBOUND_DELIVERY_OUTCOME{outcome=rejected_terminal}` de
+   * propósito: lá o PROVEDOR recusou (rearmar é pedir a mesma recusa), aqui NÓS
+   * paramos de tentar (rearmar pode funcionar). As duas triagens são opostas.
+   */
+  OUTBOUND_DEAD_LETTER: 'maia_outbound_dead_letter_total',
+  /**
+   * Issue #633 — um job de entrega foi armado (ou re-armado) para uma linha.
+   * `origin` ∈ `recovery` | `replay` (`OUTBOUND_REARM_ORIGINS`).
+   *
+   * O `jobId` é determinístico por `outbound_id`, então esta série conta
+   * TENTATIVAS de armar, não jobs criados: dois pontos com o mesmo
+   * `outbound_id` produzem UM job. A distância entre ela e
+   * `OUTBOUND_DELIVERY_CLAIM{result=acquired}` é o quanto o transporte está
+   * absorvendo de re-armamento redundante.
+   */
+  OUTBOUND_REARM: 'maia_outbound_rearm_total',
+  /**
+   * Issue #633 — divergência entre a máquina de estados do turno e o outbox.
+   * `kind` ∈ `turn_pending_without_outbound` | `outbound_without_live_turn`
+   * (`OUTBOUND_TURN_INCONSISTENCY_KINDS`).
+   *
+   * Os DOIS sentidos, porque as causas são opostas e nenhuma implica a outra:
+   * um turno que espera uma resposta que ninguém vai entregar é silêncio para o
+   * usuário; uma linha viva cujo turno já terminou é mensagem que sai depois do
+   * encerramento. Qualquer valor diferente de zero é bug de escrita fora das
+   * fronteiras de #631/#632 — não é ruído esperado.
+   */
+  OUTBOUND_TURN_INCONSISTENCY: 'maia_outbound_turn_inconsistency_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
   /**

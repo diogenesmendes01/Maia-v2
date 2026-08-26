@@ -407,6 +407,37 @@ export const AUDIT_ACTIONS = [
    * `completed` sem histórico.
    */
   'outbound_delivery_completed',
+  /**
+   * Issue #633 — a plataforma DESISTIU de entregar esta saída lógica: o teto de
+   * tentativas estourou (`attempt_limit`) ou a linha incerta atravessou o prazo
+   * de reconciliação (`reconciliation_timeout`). Gravado por `auditTx` na MESMA
+   * transação da transição para `dead_letter`.
+   *
+   * DISTINTO de `outbound_dispatch_failed` (caminho síncrono legado) e de uma
+   * recusa definitiva do provedor: aqui ninguém recusou nada — nós paramos de
+   * tentar, e a mensagem pode nunca ter chegado. É o registro que torna o
+   * silêncio auditável em vez de silencioso.
+   */
+  'outbound_dead_lettered',
+  /**
+   * Issue #633 — um OPERADOR devolveu uma linha morta/incerta ao ciclo de
+   * entrega. A falha #12 da épica #506 é exatamente esta operação feita sem
+   * trilha: rearmar um item incerto e duplicar a mensagem para o usuário.
+   *
+   * O metadata carrega `actor`, `reason`, o estado de origem e — o campo que
+   * importa — `duplicate_risk` + `acknowledged_duplicate_risk`: se o provedor
+   * NÃO deduplica este tipo de payload, o rearmamento só é aceito com
+   * reconhecimento EXPLÍCITO, e a trilha registra que ele foi dado.
+   */
+  'outbound_manual_rearm',
+  /**
+   * Issue #633 — a varredura encontrou divergência entre `agent_turns` e
+   * `outbound_messages`, nos dois sentidos (turno em `outbound_pending` sem
+   * linha; linha viva com turno terminal). É OBSERVAÇÃO auditada, nunca
+   * correção: consertar sozinho significaria inventar uma resposta ou cancelar
+   * uma entrega possivelmente em voo.
+   */
+  'outbound_turn_inconsistency_detected',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',

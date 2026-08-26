@@ -26,8 +26,22 @@
  *                     e a limitação de chave nativa do Baileys encapsulada.
  *   `delivery.ts`          — #632: o CICLO. Segunda camada com efeito.
  *
- * O recovery/DLQ (#633), a migração dos call sites (#634) e o multipart (#635)
- * ainda não existem.
+ *   `recovery-contract.ts` — #633: o contrato PURO da recuperação (disposição
+ *                     da reconciliação, teto de tentativas, risco de duplicata
+ *                     do rearmamento manual, os dois sentidos da divergência
+ *                     turno<->outbound). Puro, como os dois irmãos.
+ *   `delivery-scope.ts`    — #633: a fronteira de confiança do job de entrega
+ *                     (`outbound_id` -> escopo selado + destinatário). É
+ *                     CROSS-TENANT por construção, como o resolvedor de #504.
+ *   `delivery-consumer.ts` — #633: o consumidor da fila `outbound-delivery`.
+ *                     Fino de propósito — resolve, abre escopo, chama o ciclo.
+ *
+ * A migração dos call sites (#634) e o multipart (#635) ainda não existem.
+ *
+ * O que fica FORA deste barril, e por quê: `src/db/repositories/outbound-recovery-repo.ts`
+ * (importa `auditTx`, que fecharia ciclo com `@/db/repositories.js` — mesma
+ * razão dos dois repositórios irmãos), `src/workers/outbound-recovery.ts` (é um
+ * worker, não contrato) e `src/ops/outbound-rearm.ts` (é operação de operador).
  */
 export * from './contract.js';
 export * from './turn-scope.js';
@@ -36,3 +50,6 @@ export * from './delivery-contract.js';
 export * from './delivery-job.js';
 export * from './provider-adapter.js';
 export * from './delivery.js';
+export * from './recovery-contract.js';
+export * from './delivery-scope.js';
+export * from './delivery-consumer.js';

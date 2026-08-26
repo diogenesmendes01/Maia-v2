@@ -4,6 +4,97 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ MUDANÇA DE COMPORTAMENTO — o outbox ganhou consumidor, reconciliação e DLQ ([#633](https://github.com/diogenesmendes01/Maia-v2/issues/633), fatia D de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** duas coisas.
+>
+> **(1) O sweeper legado deixou de tocar a linha durável.**
+> `outbound_messages_sweeper` (#292) promovia a `unknown` toda row `pending`
+> mais velha que `OUTBOUND_SWEEPER_STALE_PENDING_SEC` (300s por default). Depois
+> da #630 essa tabela passou a hospedar TAMBÉM o outbox durável, cuja row nasce
+> em `pending` esperando o worker de entrega — e `unknown` é TERMINAL para o
+> claim. O sweeper legado estava, portanto, a caminho de virar uma máquina de
+> perder respostas cinco minutos depois de elas serem commitadas. Todas as suas
+> consultas agora filtram `turn_id IS NULL`. **Se você rodou #630/#631 em algum
+> ambiente por mais de cinco minutos com o sweeper ligado, inventarie:**
+> `SELECT count(*) FROM outbound_messages WHERE turn_id IS NOT NULL AND status = 'unknown';`
+>
+> **(2) `outbound_messages.status` admite `dead_letter`.** É a DLQ do outbox, e
+> ela é DISTINTA de `failed_terminal`: aquela é a recusa DEFINITIVA do provedor
+> (rearmar é pedir a mesma recusa), esta é a plataforma DESISTINDO (teto de
+> tentativas, ou incerteza que atravessou 24h) — e daí rearmar é legítimo. Um
+> `_down` que encontre rows em `dead_letter` **aborta**, de propósito.
+>
+> Nada disso liga sozinho: as duas flags novas nascem **OFF**.
+
+**O PORQUÊ.** A #632 entregou o ciclo de entrega e declarou cinco dívidas, e
+quatro delas eram a mesma frase dita de ângulos diferentes: *ninguém consome*.
+`outboundDeliveryJobId` existia e era testado, mas nada enfileirava nem
+consumia; `renewDeliveryLease` existia, mas nada a chamava em laço;
+`delivery_unknown` passou a ser PRODUZIDO em volume (`accepted_unconfirmed`
+deixou de virar `delivered`) e nada o consumia; e a varredura de takeover não
+tinha índice próprio. Uma resposta que falhasse a primeira entrega ficava parada
+para sempre, sem alarme.
+
+**O que esta fatia acrescenta:**
+
+- **Consumidor de fila.** `outbound-delivery` (BullMQ) com `jobId`
+  determinístico por `outbound_id`, payload `{version, outbound_id}` `.strict()`
+  e nada mais — nem tenant, nem telefone, nem texto. O escopo é redescoberto no
+  PostgreSQL por uma fronteira de confiança cross-tenant
+  (`src/runtime/outbound/delivery-scope.ts`), irmã da de #504.
+- **Heartbeat ligado.** A lease é renovada a cada terço do TTL **enquanto a
+  chamada ao provedor está em voo**. Sem ele, uma chamada mais longa que
+  `TURN_LEASE_TTL_MS` perdia a posse com o desfecho já conhecido — e trocava
+  informação por incerteza.
+- **Reconciliação.** A fila `delivery_unknown` finalmente tem consumidor, e a
+  decisão está num lugar só e é pura (`reconciliationDisposition`): carência →
+  `resend_idempotent` **apenas** quando o provedor honra a chave para aquele
+  `payload_type` → `escalate_manual` em todo o resto → `dead_letter` no prazo.
+  Não existe `resend_blind` no vocabulário: o **tipo** não consegue expressá-lo.
+- **Rearmamento manual com confirmação de risco.** `npm run dlq outbound-show` /
+  `outbound-rearm`. Quando o estado é incerto E o provedor não deduplica aquele
+  tipo, o comando **recusa** sem reconhecimento explícito, e o reconhecimento vai
+  para a auditoria junto com o `--reason` obrigatório. É a falha #12 da épica,
+  virada tipo.
+- **Divergência turno↔outbound nos dois sentidos**, como OBSERVAÇÃO. Corrigir
+  automaticamente significaria inventar uma resposta (sentido 1) ou cancelar uma
+  entrega em voo (sentido 2).
+
+**Migração 131** (`migrations/131_outbound_recovery_dlq.sql`): o estado
+`dead_letter` e dois índices parciais — `idx_outbound_messages_expired_claims`
+(varredura de takeover; `lease_expires_at` na FRENTE, como a 114 fez para
+`agent_turns`, porque o dispatcher cross-tenant não tem igualdade em `tenant_id`
+para ancorar a sondagem) e `idx_outbound_messages_reconcile`.
+
+**MEDIDO, e ao contrário do que se poderia supor:** sem
+`idx_outbound_messages_expired_claims` o planejador **não** cai em Seq Scan —
+cai em `idx_outbound_messages_tenant_agent_status_created` (a 067) com
+`lease_expires_at` como filtro, exatamente como a #632 previu. O ganho do índice
+novo é SELETIVIDADE, não evitar varredura: a 067 indexa toda row, inclusive as
+terminais que sob retenção de 30 dias são a maioria, então o custo cresce com o
+HISTÓRICO; o índice parcial cresce com o trabalho EM VOO. A sonda de EXPLAIN
+exige o índice NOMEADO por isso — só "sem Seq Scan" ficaria verde sem ele.
+
+**Séries novas:** `maia_outbound_pending_age_seconds{tenant_id,agent_id}` (a do
+alarme — idade da resposta não entregue mais antiga),
+`maia_outbound_reconciliation_total{result}`,
+`maia_outbound_dead_letter_total{reason}`,
+`maia_outbound_turn_inconsistency_total{kind}` e
+`maia_outbound_rearm_total{origin}`.
+
+**Flags novas, ambas OFF, e a ORDEM importa:**
+`FEATURE_OUTBOUND_DELIVERY_WORKER` (consumidor) **antes** de
+`FEATURE_OUTBOUND_RECOVERY` (produtor). A ordem inversa acumula jobs que ninguém
+consome, e o contrato de config a recusa
+(`outbound-recovery/requires-delivery-worker`).
+
+**O risco residual, declarado:** sem confirmação e idempotência confiáveis do
+provedor, a janela *"o provedor recebeu, o processo não confirmou"* é impossível
+de fechar. Esta fatia a ADMINISTRA — estado incerto + reconciliação — e não a
+resolve. Ver [`docs/runbooks/outbound-recovery.md`](docs/runbooks/outbound-recovery.md).
+
+
 ### ⚠️ MUDANÇA DE COMPORTAMENTO — a entrega tem dono, e "o provedor aceitou" deixou de ser "o usuário recebeu" ([#632](https://github.com/diogenesmendes01/Maia-v2/issues/632), fatia C de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 > **O que muda no seu dia:** uma resposta cujo envio retorna **sem

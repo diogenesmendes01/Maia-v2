@@ -127,6 +127,18 @@ export const OUTBOUND_DURABLE_STATUSES = [
   'reconciling',
   'failed_terminal',
   'cancelled',
+  /**
+   * Issue #633 (fatia D) — NÓS desistimos: o teto de tentativas estourou, ou a
+   * reconciliação de uma linha incerta venceu o prazo. DISTINTO de
+   * `failed_terminal`, que é a recusa DEFINITIVA do provedor.
+   *
+   * A distinção é operacional e não estética: de `failed_terminal` rearmar é
+   * pedir a mesma recusa; de `dead_letter` a causa pode ter passado (rede,
+   * sessão caída), e o rearmamento manual auditado é legítimo. Mesma palavra
+   * de `agent_turns.status = 'dead_letter'` (#503), de propósito — quem conhece
+   * um comando conhece o outro. Espelha o CHECK da migração 131.
+   */
+  'dead_letter',
 ] as const;
 
 export const OUTBOUND_STATUSES = [
