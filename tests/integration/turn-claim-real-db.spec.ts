@@ -142,7 +142,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
       const results = await Promise.all(
         Array.from({ length: callers }, (_, i) =>
           inA(() =>
-            agentTurnsRepo.tryClaimTurn({
+            agentTurnsRepo.claimNextEligibleTurn({
               turn_id: turn.id,
               worker_id: `worker-${i}`,
               lease_ms: LEASE_MS,
@@ -180,7 +180,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claimed = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(claimed.ok).toBe(true);
     if (!claimed.ok) return;
@@ -209,10 +209,10 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     const second = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     expect(second.ok).toBe(false);
     expect(second.ok === false && second.reason).toBe('not_eligible');
@@ -224,7 +224,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;
@@ -253,7 +253,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;
@@ -280,14 +280,14 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const first = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(first.ok).toBe(true);
     if (!first.ok) return;
     await expireLease(turn.id);
 
     const second = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     expect(second.ok).toBe(true);
     if (!second.ok) return;
@@ -300,7 +300,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const zombie = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(zombie.ok).toBe(true);
     if (!zombie.ok) return;
@@ -315,7 +315,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     // O worker lento perde a lease e o sucessor assume.
     await expireLease(turn.id);
     const successor = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     expect(successor.ok).toBe(true);
     if (!successor.ok) return;
@@ -361,12 +361,12 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const first = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(first.ok).toBe(true);
     await expireLease(turn.id);
     const second = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     expect(second.ok).toBe(true);
     if (!second.ok) return;
@@ -413,7 +413,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;
@@ -428,7 +428,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
 
     // Sucessor reivindica imediatamente...
     const next = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     expect(next.ok).toBe(true);
 
@@ -460,7 +460,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     );
 
     const tooEarly = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(tooEarly.ok).toBe(false);
     expect(tooEarly.ok === false && tooEarly.reason).toBe('not_eligible');
@@ -469,7 +469,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
       turn.id,
     ]);
     const due = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     // `retryable -> claimed` DIRETO: o claim tem predicado próprio e não passa
     // pela tabela de transições (que exigiria o desvio por `queued`).
@@ -480,7 +480,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w1', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;
@@ -501,7 +501,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     await expireLease(turn.id);
 
     const taken = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'w2', lease_ms: LEASE_MS }),
     );
     // A resposta já foi comprometida: uma segunda execução do ReAct a
     // duplicaria. Quem finaliza é o outbox (#506), nunca um takeover.
@@ -515,7 +515,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
     const turn = await freshTurn(T_A, A_A);
 
     const alien = await inB(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'wB', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'wB', lease_ms: LEASE_MS }),
     );
     expect(alien.ok).toBe(false);
     // `not_found` e não `not_eligible`: o turno não EXISTE naquele escopo. A
@@ -530,7 +530,7 @@ d('#504 — claim atômico / lease / fencing (DB real)', () => {
 
     // Renovação e liberação cruzadas também falham.
     const claim = await inA(() =>
-      agentTurnsRepo.tryClaimTurn({ turn_id: turn.id, worker_id: 'wA', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'wA', lease_ms: LEASE_MS }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;

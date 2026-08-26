@@ -127,6 +127,18 @@ export const OUTBOUND_DURABLE_STATUSES = [
   'reconciling',
   'failed_terminal',
   'cancelled',
+  /**
+   * Issue #633 (fatia D) — NÓS desistimos: o teto de tentativas estourou, ou a
+   * reconciliação de uma linha incerta venceu o prazo. DISTINTO de
+   * `failed_terminal`, que é a recusa DEFINITIVA do provedor.
+   *
+   * A distinção é operacional e não estética: de `failed_terminal` rearmar é
+   * pedir a mesma recusa; de `dead_letter` a causa pode ter passado (rede,
+   * sessão caída), e o rearmamento manual auditado é legítimo. Mesma palavra
+   * de `agent_turns.status = 'dead_letter'` (#503), de propósito — quem conhece
+   * um comando conhece o outro. Espelha o CHECK da migração 131.
+   */
+  'dead_letter',
 ] as const;
 
 export const OUTBOUND_STATUSES = [
@@ -726,4 +738,41 @@ export function buildOutboundArtifact(input: {
     logical_dedupe_key: keys.logical_dedupe_key,
     provider_idempotency_key: keys.provider_idempotency_key,
   };
+}
+
+// =====================================================================
+// 7. PONTE COM A COLUNA LEGADA `channel` (#631)
+// =====================================================================
+
+/**
+ * Issue #631 — o valor da coluna LEGADA `outbound_messages.channel` para cada
+ * `payload_type`.
+ *
+ * As duas colunas convivem de propósito e medem coisas diferentes:
+ * `payload_type` é o discriminante da união (o eixo NOVO e autoritativo);
+ * `channel` é a PRIMITIVA de saída que a 063 registrava, ainda coberta pelo
+ * CHECK `outbound_messages_channel_check` — que a 121 estendeu exatamente para
+ * que reação e fallback fossem expressáveis quando esta fatia chegasse.
+ *
+ * A tradução mora aqui, e não num objeto literal dentro do repositório, por
+ * dois motivos: `satisfies Record<OutboundPayloadType, …>` torna um tipo novo
+ * sem canal um ERRO DE COMPILAÇÃO (e não uma row recusada em produção pelo
+ * CHECK, tarde demais), e o vocabulário dos dois lados fica num arquivo só —
+ * que é onde o teste de contrato consegue compará-los.
+ */
+export const OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE = {
+  text: 'text',
+  audio: 'voice',
+  document: 'document',
+  reaction: 'reaction',
+  interactive_poll: 'poll',
+  status_fallback: 'status_fallback',
+} as const satisfies Record<OutboundPayloadType, string>;
+
+export type OutboundLegacyChannel =
+  (typeof OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE)[OutboundPayloadType];
+
+/** O `channel` legado de um `payload_type`. Total por construção. */
+export function legacyChannelFor(type: OutboundPayloadType): OutboundLegacyChannel {
+  return OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE[type];
 }

@@ -3,6 +3,7 @@ import { pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositor
 import type { Pessoa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { logger } from '@/lib/logger.js';
 import { parseDecision, maskPhone } from './quarantine-utils.js';
 
@@ -18,7 +19,9 @@ async function sendViaLine(
   channel_id: string | null,
 ): Promise<string | null> {
   const line = await forCurrentAgentChannel(channel_id);
-  return line.sendText(jid, text);
+  // #634 — exceção INVENTARIADA (`identity.quarantine`): roda ANTES de existir
+  // turno, então não há `turn_id` a cercar nem transação de commit possível.
+  return withDeclaredEgressException('identity.quarantine', () => line.sendText(jid, text));
 }
 
 const HOLDING_MESSAGE =

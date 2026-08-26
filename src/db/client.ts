@@ -137,6 +137,27 @@ export function pgErrorCode(err: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Extract the CONSTRAINT name a PostgreSQL error blames, walking the `cause`
+ * chain exactly like `pgErrorCode`.
+ *
+ * Why a caller needs this and not just the SQLSTATE: `23505` says "some unique
+ * was violated", and a table can carry several. Mapping every `23505` on
+ * `agent_turns` to "stream busy" (issue #625) would silently swallow a
+ * violation of `agent_turns_representative_uq` — a completely different defect,
+ * reported as a routine race. The constraint name is what makes the mapping
+ * NARROW: anything else is re-thrown untouched.
+ */
+export function pgErrorConstraint(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current != null && depth < 8; depth++) {
+    const name = (current as { constraint?: unknown }).constraint;
+    if (typeof name === 'string' && name.length > 0) return name;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export async function shutdownDb(): Promise<void> {
   await pool.end();
 }

@@ -138,6 +138,15 @@ const CASES: Record<string, Case> = {
     satisfiedOtherwise: { ALLOW_DEV_AUTH: 'false' },
     rule: 'contract/required-when',
   },
+  // #638 (fatia C da épica #471): configurar o DESTINO das issues da triagem
+  // sem a credencial é uma instalação que aceita pedidos e nunca abre issue —
+  // as linhas ficariam `pending` para sempre, e o dono só descobriria pela
+  // ausência. Declarar o repositório exige declarar o token.
+  MAIA_TOOL_REQUEST_GITHUB_TOKEN: {
+    trigger: { MAIA_TOOL_REQUEST_ISSUE_REPO: 'org-fixture/repo-fixture' },
+    satisfiedOtherwise: { MAIA_TOOL_REQUEST_ISSUE_REPO: undefined },
+    rule: 'contract/required-when',
+  },
 };
 
 function envWithout(profile: 'development' | 'production', name: string, deltas: Env): Env {

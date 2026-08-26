@@ -131,7 +131,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: h.count('capabilitiesSkillRepo.listAll', async () => []) },
   capabilityGapsRepo: {
     listByLevel: h.count('capabilityGapsRepo.listByLevel', async () => []),
-    listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []),
+    listParaOTurno: h.count('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   // --- procedures -------------------------------------------------------
   procedureExecutionsRepo: {
@@ -260,7 +260,7 @@ describe('#511 baseline — turn-context query cost', () => {
      *   behavioralHintRepo.findActiveForScopes          1  (was: 1 per scope)
      *   capabilitiesSkillRepo.listAll                   1
      *   procedureExecutionsRepo.findActiveForConversa   1
-     *   capabilityGapsRepo.listByLevels                 1  (was TWO gap reads)
+     *   capabilityGapsRepo.listParaOTurno                 1  (was TWO gap reads)
      *                                                  --
      *                                                  12, independent of N
      *

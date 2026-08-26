@@ -16,7 +16,8 @@
  *   2. **Cost.** `/readyz` is polled by a load balancer. `getSchemaReadiness()`
  *      does REAL I/O per call: it re-reads and SHA-256s every packaged
  *      migration (123 files / 1.3 MB today) and then reads the whole ledger.
- *      Measured on this repo it is ~50-100 ms of disk + CPU + two round trips.
+ *      Measured on this repo it is ~50-100 ms of disk + CPU + three round
+ *      trips (ledger shape, ledger rows, and the `pg_index` probe from #658).
  *      Doing that per request — or even per `READINESS_CACHE_MS` (2 s by
  *      default) — would be an operational regression against the check it
  *      replaces, which cached a single-row query for 60 s.

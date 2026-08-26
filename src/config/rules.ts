@@ -723,6 +723,28 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #626 (fatia C da #505) — o head-of-line depende da IDENTIDADE de
+  // stream, não da máquina de estados em geral. A regra é "não existe turno
+  // anterior não terminal na MESMA stream", e ela é medida por `stream_key` +
+  // `first_ingress_seq`. Com `FEATURE_TURN_STREAM_KEY=false` esses campos ficam
+  // NULL em todo turno novo, e o predicado devolve TRUE para todos —
+  // exatamente o comportamento de antes da fatia. A flag ligada seria uma
+  // promessa que o código não cumpre, e o modo de falha é o pior possível: o
+  // operador acredita ter ligado o FIFO e a plataforma continua podendo
+  // responder M2 antes de M1, sem nenhum sinal.
+  if (bool(c.FEATURE_TURN_HEAD_OF_LINE) && !bool(c.FEATURE_TURN_STREAM_KEY)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_HEAD_OF_LINE',
+      rule: 'turn-head-of-line/requires-stream-key',
+      message:
+        'FEATURE_TURN_HEAD_OF_LINE=true com FEATURE_TURN_STREAM_KEY=false é inerte: sem stream_key e first_ingress_seq gravados não existe ordem a impor, e todo turno passa no predicado de head-of-line.',
+      remediation:
+        'Ligue FEATURE_TURN_STREAM_KEY (migrations 120/122/126 aplicadas), ou desligue FEATURE_TURN_HEAD_OF_LINE. As duas vêm ON por default — um rollback que desliga só FEATURE_TURN_STREAM_KEY cai aqui. Ver docs/runbooks/turn-state-machine.md §11.',
+    });
+  }
+
   // Issue #504 §Contrato do job — o PRODUTOR V2 depende da máquina de estados
   // pela mesma razão que o claim: sem `agent_turns` não existe `turn_id`
   // durável, e `enqueueAgent` cairia de volta no V1 em todo enfileiramento. A
@@ -738,6 +760,121 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         'FEATURE_TURN_JOB_V2=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, e todo enfileiramento continua armando o payload V1.',
       remediation:
         'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas) antes de migrar o produtor, ou desligue FEATURE_TURN_JOB_V2. Ver docs/runbooks/turn-state-machine.md §7.',
+    });
+  }
+
+  // Issue #631 (fatia B da #506) §Escopo de flag — "uma garantia de durabilidade
+  // não pode ficar desligada em produção sem falha explícita".
+  //
+  // As duas regras abaixo são de naturezas DIFERENTES e nenhuma substitui a
+  // outra:
+  //
+  //  (a) INERTE — a flag ligada sem `FEATURE_TURN_STATE_MACHINE` não commita
+  //      nada: sem `agent_turns` não existe `turn_id`, e a FK composta da
+  //      migração 121 torna a row durável inexprimível. Mesmo raciocínio (e
+  //      mesmo formato) das regras de #503/#504 logo acima: silêncio aqui faria
+  //      o operador acreditar que ligou a durabilidade sem ter ligado.
+  //
+  //  (b) FAIL-OPEN EM PRODUÇÃO — a flag DESLIGADA restaura o caminho que a
+  //      auditoria da #506 descreveu: `src/agent/output-dispatch.ts` volta a
+  //      enviar ao canal com o registro durável tratado como opcional. Isso é
+  //      escopo `boot` e severidade `error`, e o escopo é deliberado: a regra
+  //      tem de valer TAMBÉM no caminho de rollback `MAIA_CONFIG_STRICT_BOOT=false`,
+  //      senão a alavanca de emergência do contrato viraria, sem querer, a
+  //      alavanca para desligar a durabilidade do outbound. É o mesmo desenho
+  //      de `lifecycle/schema-check-disabled` (#516/ADR 0004).
+  //
+  //      Fora de produção continua permitido — é a alavanca de rollback
+  //      declarada, e em dev/staging existem fluxos legítimos (bisect,
+  //      reprodução de bug do caminho legado) que precisam dela. Em staging
+  //      AVISA, para que o valor não atravesse a promoção despercebido.
+  if (bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+      rule: 'outbound-commit/requires-state-machine',
+      message:
+        'FEATURE_OUTBOUND_DURABLE_COMMIT=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, a FK composta da migração 121 torna a row do outbox inexprimível, e todo envio volta a ocorrer sem commit transacional.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114/121 aplicadas), ou desligue FEATURE_OUTBOUND_DURABLE_COMMIT — ciente de que em production desligá-la é recusado no boot. Ver docs/runbooks/turn-state-machine.md.',
+    });
+  }
+  if (c.FEATURE_OUTBOUND_DURABLE_COMMIT === false) {
+    if (profile === 'production') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false não é permitido no profile production: a intenção de resposta deixaria de ser commitada antes da chamada ao canal, e o registro durável do outbound voltaria a ser opcional/fail-open — ou seja, uma mensagem pode chegar ao usuário sem que o PostgreSQL saiba que ela existiria (issue #506).',
+        remediation:
+          'Remova FEATURE_OUTBOUND_DURABLE_COMMIT=false (o default é true) e garanta a migration 121 aplicada. Se o objetivo é reproduzir o caminho legado, faça isso em staging/development — em production a durabilidade do outbound é obrigatória.',
+      });
+    } else if (profile !== 'development') {
+      push({
+        scope: 'contract',
+        severity: 'warning',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false: o envio volta a ocorrer sem commit transacional prévio, e uma falha do ledger deixa de impedir a entrega. Em production este valor é recusado no boot.',
+        remediation:
+          'Deixe FEATURE_OUTBOUND_DURABLE_COMMIT=true, a menos que este ambiente exista de propósito para exercitar o caminho legado.',
+      });
+    }
+  }
+
+  // Issue #633 (fatia D da #506) — as duas flags da recuperação do outbox.
+  //
+  // A ordem de rollout NÃO é simétrica, e é isso que as duas regras abaixo
+  // codificam: o CONSUMIDOR precede o PRODUTOR, sempre (mesmo princípio de
+  // FEATURE_TURN_JOB_V2 em #504).
+  //
+  //  (a) VARREDURA SEM CONSUMIDOR — `FEATURE_OUTBOUND_RECOVERY` ligada com
+  //      `FEATURE_OUTBOUND_DELIVERY_WORKER` desligada faz o sweeper ENFILEIRAR
+  //      um job por linha entregável a cada minuto, sem ninguém para consumir.
+  //      Os jobs se acumulam no Redis (que tem teto de memória e derruba a fila
+  //      `agent` junto quando estoura), a linha nunca é entregue, e o operador
+  //      vê "a recuperação está ligada" enquanto nada se recupera. É `error`, e
+  //      não `warning`, porque o modo degradado é indistinguível do saudável
+  //      pelo lado de fora.
+  //
+  //  (b) CONSUMIDOR SEM COMMIT DURÁVEL — `FEATURE_OUTBOUND_DELIVERY_WORKER`
+  //      ligada com `FEATURE_OUTBOUND_DURABLE_COMMIT` desligada é INERTE:
+  //      #631 é quem cria a linha do outbox, e sem ela não existe `outbound_id`
+  //      a entregar. O worker sobe, conecta no Redis e nunca recebe trabalho.
+  //      Mesmo formato das regras de #503/#504/#631 acima — silêncio aqui faria
+  //      o operador acreditar que ligou a entrega assíncrona.
+  //
+  // Nenhuma das duas é regra de `boot`/production-required: ao contrário de
+  // FEATURE_OUTBOUND_DURABLE_COMMIT, desligar estas NÃO restaura fail-open.
+  // Com as duas OFF o caminho síncrono de #631/#632 continua sendo o que
+  // entrega, com posse e fence — o que se perde é a RECUPERAÇÃO automática, e
+  // o rearmamento manual (`npm run dlq outbound-rearm`) continua existindo.
+  if (bool(c.FEATURE_OUTBOUND_RECOVERY) && !bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_RECOVERY',
+      rule: 'outbound-recovery/requires-delivery-worker',
+      message:
+        'FEATURE_OUTBOUND_RECOVERY=true com FEATURE_OUTBOUND_DELIVERY_WORKER=false enfileira jobs de entrega que NENHUM processo consome: a fila `outbound-delivery` cresce no Redis a cada tick, as linhas do outbox continuam sem ser entregues, e a varredura parece saudável de fora.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DELIVERY_WORKER primeiro (o consumidor precede o produtor), confirme que a fila drena, e só então mantenha FEATURE_OUTBOUND_RECOVERY ligada. Ver docs/runbooks/outbound-recovery.md.',
+    });
+  }
+  if (bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER) && !bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DELIVERY_WORKER',
+      rule: 'outbound-recovery/requires-durable-commit',
+      message:
+        'FEATURE_OUTBOUND_DELIVERY_WORKER=true com FEATURE_OUTBOUND_DURABLE_COMMIT=false é inerte: sem o commit transacional de #631 nenhuma linha do outbox durável é criada, então não existe outbound_id a entregar e o worker nunca recebe trabalho.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DURABLE_COMMIT (migrations 121 e 131 aplicadas), ou desligue FEATURE_OUTBOUND_DELIVERY_WORKER. Ver docs/runbooks/outbound-recovery.md.',
     });
   }
 

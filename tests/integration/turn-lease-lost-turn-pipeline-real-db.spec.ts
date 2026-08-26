@@ -343,7 +343,7 @@ let versaoAposTakeover: number | null = null;
 
 /**
  * A PERDA DE POSSE, pelo mecanismo REAL: a lease vence por SQL, um sucessor
- * reivindica de verdade (`tryClaimTurn`), o heartbeat do dono descobre o
+ * reivindica de verdade (`claimNextEligibleTurn`), o heartbeat do dono descobre o
  * `token_mismatch` e aborta o `AbortSignal` da tentativa. Nada é sinalizado à
  * mão — o teste apenas ESPERA o sinal do contexto ambiente virar `aborted`.
  */
@@ -355,7 +355,7 @@ async function loseOwnershipForReal(turn_id: string): Promise<void> {
     [turn_id],
   );
   const successor = await inT(() =>
-    agentTurnsRepo.tryClaimTurn({
+    agentTurnsRepo.claimNextEligibleTurn({
       turn_id,
       worker_id: `sucessor-${randomUUID().slice(0, 8)}`,
       lease_ms: 60_000,

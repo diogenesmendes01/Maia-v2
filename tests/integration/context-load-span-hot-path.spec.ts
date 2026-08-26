@@ -166,6 +166,13 @@ async function seedTurn(): Promise<string> {
  * Ordem de remoção = ordem das FKs (`audit_log` e `agent_turn_inputs` apontam
  * para `mensagens`, e o turno escreve nas duas). Um `DELETE` na ordem errada
  * falha no `afterEach` e mascara o resultado do caso com um erro de limpeza.
+ *
+ * Desde #631 (fatia B da #506) um turno REAL também deixa uma row em
+ * `outbound_messages`: a resposta é commitada no outbox durável antes de ir ao
+ * canal. A migração 121 liga essa row ao turno por FK composta com
+ * `ON DELETE RESTRICT` — de propósito, porque apagar um turno que tem outbound
+ * pendente é exatamente o que não pode acontecer em silêncio. Logo o outbox sai
+ * ANTES do turno, e o `RESTRICT` faz este arquivo reprovar caso alguém inverta.
  */
 async function cleanup(): Promise<void> {
   if (!conversaId) return;
@@ -181,6 +188,7 @@ async function cleanup(): Promise<void> {
         WHERE mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
       [conversaId],
     );
+    await c.query(`DELETE FROM outbound_messages WHERE conversa_id = $1`, [conversaId]);
     await c.query(`DELETE FROM agent_turns WHERE conversa_id = $1`, [conversaId]);
     await c.query(`DELETE FROM mensagens WHERE conversa_id = $1`, [conversaId]);
     await c.query(`DELETE FROM pending_questions WHERE conversa_id = $1`, [conversaId]);

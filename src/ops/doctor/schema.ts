@@ -32,9 +32,9 @@
  *      whatever the caller passed in. Same guarantee the other checks get.
  *   2. `SET LOCAL statement_timeout` — the only bound that stops work inside
  *      Postgres. It is deliberately smaller than the check's deadline, and the
- *      read path issues at most two statements (`describeLedger` +
- *      `readLedger`), so the whole evaluation cannot outlive the deadline by
- *      waiting on the server.
+ *      read path issues at most three statements (`describeLedger` +
+ *      `readLedger` + `readInvalidIndexes`, the last added by #658), so the
+ *      whole evaluation cannot outlive the deadline by waiting on the server.
  *   3. The check's `AbortSignal` — the wall-clock backstop. When it fires we
  *      stop waiting AND destroy the connection, because a client abandoned
  *      mid-query must never go back to the pool: `pool.end()` would wait on
@@ -48,11 +48,23 @@ import type { PgPoolLike } from './postgres.js';
 /**
  * Server-side ceiling for each statement of the schema evaluation.
  *
- * MUST stay below `schemaReadinessCheck.deadlineMs` (10s) with room for the
- * two statements the ledger read issues. 4s × 2 = 8s < 10s.
- * `tests/unit/ops/doctor-schema.spec.ts` pins the inequality.
+ * MUST stay below `schemaReadinessCheck.deadlineMs` (10s) with room for EVERY
+ * statement the read path issues. Since #658 that is three — `describeLedger`,
+ * `readLedger` and `readInvalidIndexes` — so the ceiling dropped from 4s to 3s:
+ * 3s × 3 = 9s < 10s, where 4s × 3 = 12s would have let a slow catalog read blow
+ * the check's deadline before the server cut the statement.
+ * `tests/unit/ops/doctor-schema.spec.ts` pins the inequality against the real
+ * statement count, so adding a fourth statement fails the test instead of
+ * silently widening the window.
  */
-export const SCHEMA_READINESS_STATEMENT_TIMEOUT_MS = 4_000;
+export const SCHEMA_READINESS_STATEMENT_TIMEOUT_MS = 3_000;
+
+/**
+ * Quantas consultas o caminho de leitura de `getSchemaReadiness()` emite dentro
+ * da transação READ ONLY. Exportado para o teste multiplicar pelo teto acima em
+ * vez de repetir um `2` (ou um `3`) que envelhece.
+ */
+export const SCHEMA_READINESS_STATEMENT_COUNT = 3;
 
 export interface ReadOnlySchemaOptions {
   readonly statementTimeoutMs?: number;
