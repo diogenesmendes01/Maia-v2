@@ -536,3 +536,189 @@ em estado não-terminal, backup validado, runtime de volta à leitura legada. A
 `096` só pode cair **depois** da `097` (a FK composta depende do índice único).
 Nunca rode down migration automática durante incidente — ver
 [`migrations.md`](migrations.md).
+
+## 10. Exclusão de um turno ativo por stream (#625, fatia B da #505)
+
+Fase 5 do rollout da #505. Depois desta fatia o banco garante que **no máximo um
+turno de cada stream está em `claimed` ou `running`**. Isso fecha a falha nº 2
+da issue-mãe — *dois turnos da mesma conversa são claimed por réplicas
+diferentes* — e **não** muda a regra de elegibilidade: quem pode ser
+reivindicado continua sendo qualquer turno elegível, porque o head-of-line é a
+fatia seguinte (#626).
+
+### 10.1 As duas metades, e por que nenhuma sozinha basta
+
+A invariante desejada é temporal ("um turno com lease VIVA por stream") e o
+PostgreSQL não a expressa numa constraint — uma constraint não depende de
+`now()`, e uma lease vence sem que nenhuma escrita aconteça. Então ela é feita
+de duas peças:
+
+| Metade | Onde | O que quebra sem ela |
+|---|---|---|
+| **estrutural** | índice único parcial `agent_turns_stream_active_uq` (migration `124`) sobre `(tenant_id, agent_id, stream_key)` `WHERE stream_key IS NOT NULL AND status IN ('claimed','running')` | duas réplicas claimam turnos distintos da mesma conversa e executam em paralelo |
+| **temporal** | recuperação de claims EXPIRADOS **dentro da transação** de `agentTurnsRepo.tryClaimTurn` ([`src/db/repositories/turn-repos.ts`](../../src/db/repositories/turn-repos.ts)) | o primeiro crash de worker deixa uma linha `claimed` com lease vencida ocupando a chave e a **stream fica bloqueada para sempre** |
+
+A recuperação devolve o turno morto a `retryable` com `next_attempt_at = now()`,
+**preservando** `claim_token`/`claimed_by` (forense: "quem tinha este turno
+quando o pod morreu?") e **sem** gastar tentativa (o crash de um worker não pode
+mandar um turno inocente para a DLQ). O varredor de recovery já procura
+exatamente por esse estado.
+
+`outbound_pending` **não** ocupa a stream, de propósito: a resposta já está
+comprometida no outbox e quem finaliza é o delivery worker (#506). Prender a
+conversa ali faria uma indisponibilidade do provedor de saída parar a stream
+inteira.
+
+### 10.2 Ordem obrigatória do deploy (e a pré-checagem que não é opcional)
+
+1. **pause os consumidores** do turno. A issue-mãe exige isto antes de alterar
+   índices/constraints, e o motivo é o passo 2;
+2. procure duplicatas **antes** de aplicar — elas reprovam a migration e deixam
+   índice inválido para trás:
+
+```sql
+SELECT tenant_id, agent_id, stream_key, count(*) AS ativos,
+       array_agg(id) AS turnos
+  FROM agent_turns
+ WHERE stream_key IS NOT NULL
+   AND status IN ('claimed', 'running')
+ GROUP BY tenant_id, agent_id, stream_key
+HAVING count(*) > 1;
+```
+
+   Zero linhas é o esperado. Cada linha devolvida é uma conversa que **já** tem
+   dois turnos ativos: escolha um (o de menor `first_ingress_seq`) e mova os
+   demais para `retryable` pelo caminho normal, **nunca** com `DELETE`;
+3. `npm run db:migrate` (aplica a `124`);
+4. suba o código;
+5. religue os consumidores.
+
+Subir o código antes da migration é **seguro** nesta fatia (ao contrário da
+`120`): sem o índice, o claim simplesmente não tem o que recusar e volta ao
+comportamento de #504. O inverso — índice sem código — também é seguro: o
+`23505` viraria erro de claim, o turno continuaria elegível e o próximo tick
+tentaria de novo. A pausa dos consumidores é pela janela de construção do
+índice, não por incompatibilidade.
+
+### 10.3 O que olhar
+
+| Sinal | Onde | Leitura |
+|---|---|---|
+| `maia_turn_claim_total{result="stream_busy"}` | `/metrics` | Alguns pontos são NORMAIS (duas réplicas acordando com a mesma conversa). Uma taxa alta e sustentada numa janela curta é **serialização**: uma conversa quente consumindo tentativas de claim. Correlacione com `maia_turn_claim_latency_ms{result="stream_busy"}`. |
+| `maia_turn_stream_claim_recovered_total{from}` | `/metrics` | Deve ser **zero** em operação saudável. Cada ponto é um worker que morreu segurando uma conversa. Um pico junto de um deploy é esperado e passa; um pico contínuo é worker instável ou `TURN_LEASE_TTL_MS` curto demais para o trabalho real. |
+| `turn_stream_busy` | `audit_log` | A evidência durável de que a exclusão AGIU. Sem ela, "esta conversa parou porque o índice barrou" e "porque ninguém a reivindicou" são indistinguíveis — e têm remediações opostas. **Volume:** uma row por claim recusado, proporcional ao backlog de conversas quentes (não ao tráfego). Se a tabela crescer, a causa é serialização — trate a serialização, não o log. |
+| `turn_stream_claim_recovered` | `audit_log` | `metadata.recovered` traz os turnos devolvidos à fila. É o que distingue "o sweeper achou" de "o claim da stream destravou": os dois produzem o mesmo estado final. |
+| `turn.stream_claims_recovered` | log estruturado | `ops_alert: true`. Carrega `recovered_turn_ids` e o turno que estava reivindicando. |
+
+Turnos ativos por stream, agora:
+
+```sql
+SELECT stream_key, count(*) AS ativos
+  FROM agent_turns
+ WHERE tenant_id = $1 AND agent_id = $2
+   AND stream_key IS NOT NULL AND status IN ('claimed', 'running')
+ GROUP BY stream_key
+ ORDER BY ativos DESC;
+```
+
+Nenhuma linha pode ter `ativos > 1`. Se alguma tiver, o índice **não está
+válido** — vá para §10.4.
+
+### 10.4 Índice inválido (o modo de falha da migration)
+
+`CREATE UNIQUE INDEX CONCURRENTLY` que falha — inclusive por duplicata
+pré-existente — **não some sozinho**: deixa um índice `indisvalid = false`, que
+continua custando escrita e não serve a nenhuma leitura. O mesmo vale para um
+`DROP INDEX CONCURRENTLY` cancelado no meio.
+
+**A armadilha, verificada contra o PostgreSQL 16 e não deduzida:** reaplicar a
+migration depois disso **DEVOLVE SUCESSO**. O `IF NOT EXISTS` encontra o índice
+inválido, emite `NOTICE: relation "agent_turns_stream_active_uq" already exists,
+skipping`, responde `CREATE INDEX`, e o `psql` sai 0 — com o índice ainda
+inválido e **a exclusão inexistente**.
+
+**Desde a [#658](https://github.com/diogenesmendes01/Maia-v2/issues/658) isto
+não depende mais de disciplina humana.** O runner de migrations recusa o run
+inteiro ANTES de qualquer DDL quando o escopo carrega um índice inválido
+(blocker `invalid_index`), recusa marcar como aplicada uma migration que
+terminou com um índice inválido no catálogo, e o boot da aplicação morre com
+**exit 98**. A recusa sobrevive inclusive a um `repair --as pending`, porque
+limpar a linha do ledger não conserta o catálogo.
+
+O que continua valendo aqui é o diagnóstico do incidente: se a consulta de
+§10.3 devolver alguma stream com `ativos > 1`, confirme o estado do índice —
+
+```sql
+SELECT indexrelid::regclass AS indice, indisvalid, indisready
+  FROM pg_index
+ WHERE indexrelid::regclass::text = 'agent_turns_stream_active_uq';
+```
+
+— e siga o remédio completo em
+[`docs/runbooks/migrations.md` §Índice inválido deixado por DDL `CONCURRENTLY`](migrations.md),
+que é a fonte única desse procedimento. Enquanto o índice estiver inválido a
+exclusão **não existe**: trate como incidente aberto, não como pendência de
+limpeza.
+
+### 10.5 Stream travada
+
+Sintoma: uma conversa parou de avançar e `turn_stream_busy` aparece repetidas
+vezes para os turnos dela.
+
+```sql
+SELECT id, status, attempt_count, claimed_by, claim_token,
+       lease_expires_at, heartbeat_at, next_attempt_at,
+       first_ingress_seq, last_ingress_seq
+  FROM agent_turns
+ WHERE tenant_id = $1 AND agent_id = $2 AND stream_key = $3
+   AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')
+ ORDER BY first_ingress_seq;
+```
+
+| O que a leitura mostra | Causa | Remediação |
+|---|---|---|
+| um turno `claimed`/`running` com `lease_expires_at` no FUTURO e `heartbeat_at` recente | worker saudável, trabalho longo | **nada**. É a exclusão funcionando. |
+| `lease_expires_at` no futuro e `heartbeat_at` antigo | worker agonizante (renovou uma vez e parou) | espere o vencimento; o próximo claim recupera sozinho |
+| `lease_expires_at` no PASSADO e nada acontecendo | ninguém está tentando reivindicar a stream — o job sumiu da fila | rearme pelo recovery (§3); a recuperação acontece no claim, não por varredura |
+| um turno em `outbound_pending` há muito tempo | outbox travado (#506), **não** exclusão de stream | runbook do outbox — a stream não está bloqueada por ele |
+
+**Nunca** conserte com `UPDATE agent_turns SET status = ...` à mão para
+"destravar": isso pula o `state_version`, o fence e a trilha, e o worker antigo
+— se estiver vivo — volta a escrever. O caminho é rearmar pela fila.
+
+### 10.6 Rollback
+
+**É derrubar um índice, e só.** Esta fatia foi separada exatamente para que o
+rollback não toque no escalonador:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS agent_turns_stream_active_uq;
+```
+
+(ou `migrations/124_agent_turns_stream_exclusion_down.sql`, que é esse mesmo
+statement.) Efeito imediato: o claim volta ao comportamento de #504 (exclusão
+por TURNO) na primeira tentativa após o DROP. Nenhuma linha muda de estado,
+nenhum turno é perdido, nenhuma coluna é apagada.
+
+A metade temporal continua rodando após o DROP, e continua correta: ela apenas
+devolve à fila turnos cuja lease venceu — o que o recovery já fazia. Não há
+"meio rollback" a considerar.
+
+**Interação com `FEATURE_TURN_CLAIM=false`** (o kill switch de #504, §9): com a
+flag desligada, quem escreve `claimed` é o `markClaimed` legado, que passa pelo
+CAS genérico e não pelo claim atômico. O índice continua valendo para ele — a
+transição é recusada com o conflito tipado `stream_busy` em vez de virar um
+`23505` cru, então nada explode e o turno continua elegível. Ainda assim, se
+você desligar a flag por incidente, **derrube o índice junto**: o regime legado
+não tem a metade temporal (não recupera claim expirado), e uma lease vencida
+passaria a prender a stream até o recovery rearmar o MESMO turno.
+
+O `_down` da `124` **não** tem envelope `BEGIN`/`COMMIT`, pela mesma razão do
+`_down` da `122`: `DROP INDEX CONCURRENTLY` é recusado dentro de transação, e
+trocar por `DROP INDEX` simples para poder envelopar tomaria `ACCESS EXCLUSIVE`
+sobre `agent_turns` — bloqueio de runtime durante um rollback. O arquivo tem um
+único statement idempotente, então não existe estado intermediário.
+
+Ordem no rollback COMPLETO do protocolo de stream: `124` → `122` → `120`. A
+`124` sozinha é independente e pode ser derrubada e reaplicada sem tocar nas
+outras duas — é isso que a torna o kill switch da fatia.

@@ -47,13 +47,42 @@ export const LEASE_TAKEOVER_STATUSES = ['claimed', 'running'] as const;
 export const FENCED_WRITE_STATUSES = ['claimed', 'running', 'outbound_pending'] as const;
 
 /**
+ * Estados que OCUPAM a stream: enquanto um turno está em um deles, nenhum outro
+ * turno da mesma stream pode ser reivindicado (issue #625, fatia B da #505).
+ *
+ * É a MESMA lista de `LEASE_TAKEOVER_STATUSES`, e a igualdade não é
+ * coincidência: um turno ocupa a stream exatamente enquanto pode ter dono vivo.
+ * Ainda assim são constantes SEPARADAS, porque respondem a perguntas
+ * diferentes — "de quais estados se pode tomar posse?" e "quais estados
+ * bloqueiam a stream?" — e uma fatia futura pode mover uma sem mover a outra
+ * (incluir `outbound_pending` aqui, por exemplo, prenderia a stream pela
+ * latência do provedor de saída sem torná-la reivindicável).
+ *
+ * ESTA LISTA ESPELHA O PREDICADO DO ÍNDICE `agent_turns_stream_active_uq`
+ * (migration 124). Mudar uma sem a outra faz a exclusão do banco e a
+ * recuperação da aplicação discordarem — e a forma dessa discordância é uma
+ * stream travada. `tests/unit/runtime/stream-exclusion-contract.spec.ts` amarra
+ * as duas ao mesmo texto.
+ */
+export const STREAM_OCCUPYING_STATUSES = ['claimed', 'running'] as const;
+
+/** Nome do índice único parcial que garante a exclusão NO BANCO. */
+export const STREAM_EXCLUSION_CONSTRAINT = 'agent_turns_stream_active_uq';
+
+/**
  * Resultado TIPADO de uma tentativa de claim. `not_claimed` NÃO é erro: é a
  * resposta correta para "outro worker chegou primeiro" e para "ainda não está
  * elegível". O que ele nunca é: autorização para processar.
+ *
+ * `recovered_stream_claims` (#625) carrega os turnos da MESMA stream cujo claim
+ * expirado foi recuperado DENTRO da transação deste claim. Vem nos dois ramos
+ * de propósito: a recuperação acontece antes de sabermos se venceremos a
+ * corrida, e quem perdeu ainda precisa relatar que desbloqueou a stream. Vazio
+ * é o caso normal.
  */
 export type ClaimResult =
-  | { ok: true; claim: TurnClaim }
-  | { ok: false; reason: ClaimRejection };
+  | { ok: true; claim: TurnClaim; recovered_stream_claims?: readonly string[] }
+  | { ok: false; reason: ClaimRejection; recovered_stream_claims?: readonly string[] };
 
 /** Por que o claim não foi concedido — label de métrica, cardinalidade fechada. */
 export const CLAIM_REJECTIONS = [
@@ -61,6 +90,19 @@ export const CLAIM_REJECTIONS = [
   'not_found',
   /** Existe, mas outro worker tem lease viva — ou o estado não é elegível. */
   'not_eligible',
+  /**
+   * #625 — o turno estava elegível, mas OUTRO turno da mesma stream já está
+   * ativo com lease viva, e o banco recusou o segundo claim.
+   *
+   * Deliberadamente distinto de `not_eligible`. `not_eligible` fala do TURNO
+   * ("este aqui não pode ser reivindicado agora"); `stream_busy` fala da
+   * STREAM ("a conversa está ocupada por outro turno"). A reação operacional é
+   * a mesma — parar —, mas o diagnóstico é oposto: `not_eligible` em massa é
+   * problema de roteamento ou de backoff, `stream_busy` em massa é uma
+   * conversa serializando, que é o sintoma que a issue-mãe manda vigiar
+   * (§Risk: "índice inadequado pode serializar hot streams").
+   */
+  'stream_busy',
 ] as const;
 
 export type ClaimRejection = (typeof CLAIM_REJECTIONS)[number];

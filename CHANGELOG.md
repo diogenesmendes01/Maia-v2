@@ -4,6 +4,98 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Ordenação: o banco passa a garantir NO MÁXIMO UM turno ativo por conversa ([#625](https://github.com/diogenesmendes01/Maia-v2/issues/625), fatia B de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 5 de 9)
+
+> **AÇÃO DO OPERADOR: pause os consumidores do turno antes de aplicar a
+> migration `124`, e rode a consulta de duplicatas do
+> [runbook §10.2](docs/runbooks/turn-state-machine.md) ANTES.** Um par de turnos
+> já ativos da mesma stream reprova o `CREATE UNIQUE INDEX CONCURRENTLY` e deixa
+> um índice **inválido** para trás, que custa escrita, não serve a leitura e não
+> some sozinho — a limpeza é manual (§10.4). Diferente da `120`, a ordem entre
+> código e migration aqui é indiferente: nenhuma das duas metades quebra sem a
+> outra estar presente.
+
+**O problema.** A #504 entregou exclusão por **turno**: dois workers não
+reivindicam a mesma linha. Faltava a exclusão por **conversa** — dois turnos
+DIFERENTES da mesma stream podiam ser `claimed` por réplicas diferentes no mesmo
+instante e executar em paralelo. É a falha nº 2 da lista da issue-mãe, e é a que
+o usuário percebe: duas respostas para a mesma conversa, produzidas por
+processos que não sabiam um do outro.
+
+**Onde a exclusão foi colocada, e por quê.** No **banco**. Um mutex de processo
+não existe para a segunda réplica; um lock de Redis sem fence persistido
+sobrevive à própria expiração (o dono cujo lock venceu não descobre que venceu e
+continua escrevendo). Só o PostgreSQL sabe, no instante do UPDATE, quantos
+turnos daquela conversa estão ativos — porque é ele quem guarda o estado.
+
+**O PostgreSQL não expressa a invariante numa constraint.** O que se quer é
+temporal ("um turno com lease VIVA por stream"), e uma constraint não depende de
+`now()` — uma lease vence sozinha, sem nenhuma escrita acontecer. A issue-mãe
+prescreve, então, a combinação de duas metades, e **nenhuma delas isolada é a
+invariante**:
+
+- **estrutural** — índice único parcial `agent_turns_stream_active_uq`
+  (migration `124`) sobre `(tenant_id, agent_id, stream_key)` onde
+  `status IN ('claimed','running')`. É ele que DECIDE: um segundo claim na mesma
+  stream levanta `23505` e vira o motivo tipado `stream_busy`;
+- **temporal** — a recuperação de claims **expirados dentro da MESMA transação**
+  do claim (`agentTurnsRepo.tryClaimTurn`). Sem ela, o primeiro crash de worker
+  deixa uma linha `claimed` com lease vencida ocupando a chave e a stream fica
+  **bloqueada para sempre**: o índice deixa de ser proteção e vira o defeito.
+
+**Por que a recuperação não é um sweeper à parte.** Entre um sweeper liberar a
+linha vencida e o claim rodar, um terceiro worker pode reivindicar aquele turno
+de volta — e a stream fica parada um ciclo inteiro do sweeper por nada. Dentro
+da transação, "liberar" e "ocupar" são o mesmo instante lógico: ninguém observa
+a stream vazia e ninguém a ocupa no vão. O turno recuperado volta a `retryable`
+com `next_attempt_at = now()`, **preservando** `claim_token`/`claimed_by` (a
+forense de "quem tinha este turno quando o pod morreu?") e **sem** gastar
+tentativa — contar o crash de um worker como tentativa mandaria um turno
+inocente para a DLQ por causa de um deploy.
+
+**O escopo é parte da chave do índice, e isso não é cerimônia.** A `stream_key`
+já embute tenant e agent no material canônico, mas embutir não é escopar: uma
+colisão de hash (que a issue trata como risco de **segurança**), um backfill ou
+um replay manual fariam duas tenants disputarem a MESMA chave — e o turno da
+tenant A bloquearia a conversa da tenant B, de forma invisível, porque nada na
+linha de B diria que a causa é de A.
+
+**Sem lock global.** Streams distintas não se tocam: o índice serializa por
+chave, e o `FOR UPDATE` da recuperação tranca só as linhas ativas **daquela**
+stream. Medido com volume representativo (200 mil turnos, 20 mil streams, 1000
+ativos): o claim custa `Execution Time: 0.254 ms` e a recuperação `0.938 ms`,
+ambos por Index Scan, sem nenhum sequential scan. Numa stream **quente** (5 mil
+turnos na mesma conversa) os números não mudam — a recuperação lê pelo índice de
+exclusão, que é proporcional ao trabalho EM VOO, não ao histórico. O índice
+parcial ocupa **152 kB** contra 46 MB da tabela.
+
+**`outbound_pending` está deliberadamente FORA** do predicado. A resposta já foi
+comprometida no outbox e quem finaliza é o delivery worker (#506), que não
+disputa posse com ninguém; prender a conversa ali faria uma indisponibilidade do
+provedor de saída parar a stream inteira. Consequência honesta: entre
+`outbound_pending` e o terminal, a stream aceita um novo claim. Isso **não** é
+reordenação — QUEM pode ser reivindicado é o head-of-line (#626), que é a fatia
+seguinte. Esta decide QUANTOS podem estar ativos, e a resposta é um.
+
+**Esta fatia não toca na elegibilidade.** Head-of-line no claim (#626), promoção
+de sucessor (#627), debounce transacional (#628) e retry/DLQ/fairness por stream
+(#629) continuam como estavam.
+
+**Observabilidade.** `maia_turn_claim_total` ganha `result="stream_busy"` —
+distinto de `not_eligible` de propósito: um fala da STREAM ("a conversa está
+ocupada"), o outro do TURNO ("este aqui não pode ser reivindicado agora"), e
+colapsar os dois apagaria o único sinal de uma conversa serializando.
+`maia_turn_stream_claim_recovered_total{from}` conta claims expirados devolvidos
+à fila e deve ser **zero** em operação saudável. Duas linhas novas de
+`audit_log`: `turn_stream_busy` (a exclusão agiu) e `turn_stream_claim_recovered`
+(a stream estava presa por um dono morto) — nenhuma carrega `stream_key`,
+telefone, texto ou prompt.
+
+**Rollback: derrubar um índice.** `DROP INDEX CONCURRENTLY IF EXISTS
+agent_turns_stream_active_uq` (ou o `_down` da `124`, que é esse mesmo
+statement) devolve o claim ao comportamento de #504 na primeira tentativa
+seguinte. Nenhuma linha muda de estado, nenhuma coluna é apagada, o escalonador
+não é revertido — foi para isso que a fatia foi separada.
 ### Fixed — migration com índice `CONCURRENTLY` inválido deixa de ser marcada como aplicada ([#658](https://github.com/diogenesmendes01/Maia-v2/issues/658))
 
 **O defeito, medido contra o Postgres 16.** `CREATE UNIQUE INDEX CONCURRENTLY`

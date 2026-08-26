@@ -60,9 +60,9 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | File | Role |
 |---|---|
 | `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
-| `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. |
+| `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. Desde #625 também guarda a exclusão POR STREAM: `STREAM_OCCUPYING_STATUSES` (o predicado do índice `agent_turns_stream_active_uq` escrito em TypeScript), `STREAM_EXCLUSION_CONSTRAINT` (o nome que o `23505` precisa carregar para virar `stream_busy`) e o próprio motivo `stream_busy`. |
 | `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
-| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
+| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. Desde #625 também AUDITA a exclusão por stream: `turn_stream_busy` (o banco recusou um segundo turno ativo) e `turn_stream_claim_recovered` (um claim expirado foi recuperado dentro da transação do claim). O repositório continua puro-DB e não audita. |
 | `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
 | `stream-key.ts` | Derivação CANÔNICA da `stream_key` (#505) **e a guarda fail-closed** (`requireStreamIdentity`, `StreamIdentityUnresolvedError`). PURO — só `node:crypto`: material comprimento-prefixado (netstring) sobre `tenant_id + agent_id + canal + linha + identidade remota normalizada`. Nenhum caminho devolve chave "genérica". A pureza é **estrutural**: quem chama a guarda é o repositório, que é compartilhado com o console e não pode alcançar `src/config/env.ts` (#596). |
 | `stream-ingress.ts` | O RELATO da decisão (#505): métrica, `audit_log` e log estruturado. Consumido pelo **gateway**, que já paga por `@/config/env.js`. Dono de `maia_stream_ingress_total` e `maia_stream_ingress_rejected_total`. |
@@ -271,7 +271,8 @@ para o escopo interno.
 |---|---|
 | `maia_turn_job_version_total` | `version` = `v1` / `v2` / `invalid` (vocabulário FECHADO `TURN_JOB_VERSION_VALUES`). Emitida no PARSE, em `startAgentWorker` — atribuição `system` por construção (nada resolveu o tenant ainda), pela camada de política de [`src/observability/metrics.ts`](../../../src/observability/metrics.ts). É o critério MENSURÁVEL de remoção do caminho V1: zero `v1` por uma janela definida. |
 | `maia_turn_scope_rejected_total` | `reason` = `malformed_turn_id` / `turn_not_found` / `scope_unusable` / `representative_missing` / `scope_mismatch`. Nenhum é normal; `scope_mismatch` é incidente de isolamento. |
-| `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` |
+| `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` / `stream_busy` (#625). `stream_busy` fala da STREAM (a conversa está ocupada), `not_eligible` fala do TURNO — colapsar os dois apagaria o único sinal de uma conversa serializando, que é o risco que a #505 manda vigiar no rollout. |
+| `maia_turn_stream_claim_recovered_total` | `from` = `claimed` / `running` (#625). Quantos claims EXPIRADOS a transação de claim devolveu à fila. Em operação saudável é ZERO — cada ponto é um worker que morreu segurando uma conversa. |
 | `maia_turn_claim_latency_ms` | `result` |
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
@@ -290,8 +291,30 @@ limite recusou, não só que alguém recusou. `react_tool_refused` pertence ao
 vocabulário do ERRO (`TurnOwnershipLostError`) e NÃO à série: a recusa que o
 ReAct traduz já foi contada como `tool_dispatch`/`tool_handler`.
 
-Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
-heartbeat rotineiros ficam em métrica — auditá-los seria uma row por batida.
+Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`, e desde
+#625 `turn_stream_busy` e `turn_stream_claim_recovered`). Claim e heartbeat
+rotineiros ficam em métrica — auditá-los seria uma row por batida.
+
+**Exclusão por stream (#625, fatia B da #505).** A invariante é "no máximo um
+turno ativo por stream", e ela vive em DUAS metades que só funcionam juntas:
+
+1. **estrutural** — o índice único parcial `agent_turns_stream_active_uq`
+   (migration 124) sobre `(tenant_id, agent_id, stream_key)` onde
+   `status IN ('claimed','running')`. É ele que DECIDE: um segundo claim na
+   mesma stream levanta `23505` e vira `stream_busy`. O escopo faz parte da
+   chave — sem `tenant_id`/`agent_id` nela, duas tenants com a mesma
+   `stream_key` passariam a competir;
+2. **temporal** — a recuperação de claims EXPIRADOS dentro da MESMA transação
+   do claim (`agentTurnsRepo.tryClaimTurn`). Sem ela, o primeiro crash de worker
+   deixa uma linha `claimed` com lease vencida ocupando a chave e a stream fica
+   bloqueada para sempre: o índice deixa de ser proteção e vira o defeito.
+
+`outbound_pending` está deliberadamente FORA do predicado — a resposta já está
+comprometida no outbox (#506) e quem finaliza é o delivery worker, que não
+disputa posse. Incluí-lo prenderia a conversa pela latência do provedor de
+saída. Consequência honesta: entre `outbound_pending` e o terminal a stream
+aceita um novo claim. Isso não é reordenação — QUEM pode ser reivindicado é o
+head-of-line (#626), que é outra fatia; esta decide QUANTOS podem estar ativos.
 
 **Rollout** — duas flags, registradas em `ENV_CONTRACT`
 ([`src/config/contract.ts`](../../../src/config/contract.ts)) e documentadas em
