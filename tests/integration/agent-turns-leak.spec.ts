@@ -65,6 +65,9 @@ d('agent turns — leak suite cross-tenant', () => {
   });
 
   afterAll(async () => {
+    await pool.query(`DELETE FROM agent_stream_blocks WHERE tenant_id = ANY($1::text[])`, [
+      [T_A, T_B],
+    ]);
     if (createdMensagens.length > 0) {
       await pool.query(`DELETE FROM agent_turn_inputs WHERE mensagem_id = ANY($1::uuid[])`, [
         createdMensagens,
@@ -258,6 +261,92 @@ d('agent turns — leak suite cross-tenant', () => {
       expect(r.turn.tenant_id).toBe(T_A);
       expect(r.turn.agent_id).toBe(A_A);
     }
+  });
+
+  /**
+   * Issue #629 (fatia F da #505) — a INTERDIÇÃO de conversa é um estado novo com
+   * escopo próprio, e ela entra na suíte de leak pela mesma razão que os
+   * demais: o vetor real é "alguém acrescenta um método e esquece o escopo".
+   *
+   * A colisão é FORÇADA: a MESMA `stream_key` literal nos dois pares. Sem
+   * forçá-la, a chave derivada já seria seletiva sozinha e a sonda passaria sem
+   * provar nada — foi o que aconteceu duas vezes nesta leva.
+   */
+  it('interdição de stream: o bloqueio de um par não alcança o outro', async () => {
+    const { agentTurnsRepo, streamBlocksRepo } = await loadRepos();
+    const chave = `v1:${randomUUID().replace(/-/g, '').repeat(2)}`;
+
+    const turnos: Record<'A' | 'B', string> = { A: '', B: '' };
+    for (const [rotulo, tenant, agent, escopo] of [
+      ['A', T_A, A_A, inA],
+      ['B', T_B, A_B, inB],
+    ] as const) {
+      const msg = await mkInbound(tenant, agent);
+      const turno = await escopo(() =>
+        agentTurnsRepo.ensureTurnForMessage({
+          id: msg,
+          tenant_id: tenant,
+          agent_id: agent,
+          conversa_id: null,
+          channel_id: null,
+        }),
+      );
+      await pool.query(
+        `UPDATE agent_turns SET stream_key = $2, stream_key_version = 1,
+                first_ingress_seq = 1, last_ingress_seq = 1
+          WHERE id = $1`,
+        [turno.id, chave],
+      );
+      turnos[rotulo] = turno.id;
+    }
+
+    // O par B interdita a SUA conversa. A escrita é direta de propósito: o que
+    // esta suíte cobra é o ESCOPO DE LEITURA dos métodos, não o caminho que
+    // produziu a linha (esse é coberto por `turn-poison-dlq-real-db.spec.ts`).
+    await pool.query(
+      `INSERT INTO agent_stream_blocks
+         (tenant_id, agent_id, stream_key, reason, category, blocked_by_turn_id)
+       VALUES ($1, $2, $3, 'poison', 'effect_committed', $4)`,
+      [T_B, A_B, chave, turnos.B],
+    );
+
+    // A NÃO vê a interdição de B — nem pelo turno dele, nem pela chave.
+    expect(await inA(() => streamBlocksRepo.findActiveByTurn(turnos.A))).toBeNull();
+    expect(await inA(() => streamBlocksRepo.findActiveByTurn(turnos.B))).toBeNull();
+    // ...e o dono continua enxergando.
+    expect((await inB(() => streamBlocksRepo.findActiveByTurn(turnos.B)))?.tenant_id).toBe(T_B);
+
+    // O claim de A PASSA, apesar de a MESMA `stream_key` estar interditada em B.
+    const claimA = await inA(() =>
+      agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: turnos.A,
+        worker_id: 'leak-w-a',
+        lease_ms: 60_000,
+      }),
+    );
+    expect(claimA.ok).toBe(true);
+    // E o de B é recusado — a interdição vale para quem é dela.
+    const claimB = await inB(() =>
+      agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: turnos.B,
+        worker_id: 'leak-w-b',
+        lease_ms: 60_000,
+      }),
+    );
+    expect(claimB.ok === false && claimB.reason).toBe('stream_poisoned');
+
+    // O desbloqueio de A NÃO desfaz o de B: `unblockTx` é escopado pelo ALS, e
+    // um `block_id` de outro par simplesmente não existe para ele.
+    const ativo = await inB(() => streamBlocksRepo.findActiveByTurn(turnos.B));
+    const alheio = await inA(() =>
+      streamBlocksRepo.unblockTx({ block_id: ativo!.id, actor: 'x', reason: 'y' }),
+    );
+    expect(alheio.ok).toBe(false);
+    expect((await inB(() => streamBlocksRepo.findActiveByTurn(turnos.B)))?.id).toBe(ativo!.id);
+
+    // E o gauge cross-tenant (`countBlockedStreams`) é agregado — devolve
+    // NÚMEROS, e a única interdição do banco é a de B.
+    expect(await inA(() => agentTurnsRepo.countBlockedStreams())).toBeGreaterThanOrEqual(1);
   });
 
   it('divergência legado: countLegacyProjectionMismatch conta só o par corrente', async () => {

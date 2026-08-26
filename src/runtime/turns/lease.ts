@@ -23,11 +23,17 @@ import {
   type ClaimResult,
   type LeaseLossReason,
   type StreamBlockedReason,
+  type StreamClaimRecovery,
   type StreamFifoViolationStage,
   type TurnClaim,
   type TurnExecutionContext,
 } from './claim.js';
-import { recordStreamFifoViolation } from './stream-metrics.js';
+import { signalStreamPromotion } from './stream-promotion.js';
+import {
+  declararBaldesDeEspera,
+  recordStreamFifoViolation,
+  STREAM_TURN_WAIT_METRIC,
+} from './stream-metrics.js';
 
 /** Claim com lease ligado? (kill switch da issue) */
 export function turnClaimEnabled(): boolean {
@@ -291,6 +297,26 @@ export async function acquireTurnLease(turn_id: string): Promise<
   if (result.fifo_violation) {
     await reportStreamFifoViolation(turn_id, result.fifo_violation);
   }
+  // #629 (fatia F da #505) — A ESPERA, no ponto em que ela ACABA.
+  //
+  // Observada aqui e não no ingresso porque só aqui os dois instantes existem:
+  // o turno entrou na fila em `queued_at` e começou AGORA. O valor vem do
+  // `RETURNING` do claim (`claim.wait_seconds`), medido pelo relógio do BANCO —
+  // calculá-lo com `Date.now()` mediria o skew entre este processo e o
+  // PostgreSQL junto com a espera, e a métrica de fairness passaria a medir NTP.
+  //
+  // Sem labels, e a ausência é decisão: `turn_id` derrubaria a cardinalidade,
+  // `stream_key` a issue-mãe proíbe, e um label de resultado seria constante
+  // (só o caminho ADQUIRIDO chega aqui). O que a série precisa dizer é a
+  // DISTRIBUIÇÃO, e o critério de pronto da issue pede exatamente isso:
+  // "fairness demonstrada com percentis".
+  // Idempotente e O(1). Está aqui, e não só no boot da observabilidade, porque
+  // `src/lib/metrics.ts` congela os baldes de uma série na PRIMEIRA amostra: um
+  // processo que só roda workers reivindicaria o primeiro turno antes de
+  // `registerRuntimeObservability` e a série nasceria com baldes de
+  // milissegundos, para sempre. Ver `declararBaldesDeEspera`.
+  declararBaldesDeEspera();
+  observeHistogram(STREAM_TURN_WAIT_METRIC, result.claim.wait_seconds);
   logger.info(
     {
       turn_id,
@@ -436,20 +462,41 @@ export async function reportStreamFifoViolation(
  */
 async function reportStreamClaimsRecovered(
   turn_id: string,
-  recovered: readonly string[] | undefined,
+  recovered: readonly StreamClaimRecovery[] | undefined,
 ): Promise<void> {
   if (!recovered || recovered.length === 0) return;
+  const ids = recovered.map((r) => r.turn_id);
   logger.warn(
-    { turn_id, recovered_turn_ids: recovered, count: recovered.length, ops_alert: true },
+    { turn_id, recovered_turn_ids: ids, count: ids.length, ops_alert: true },
     'turn.stream_claims_recovered',
   );
   await audit({
     acao: 'turn_stream_claim_recovered',
     alvo_id: turn_id,
-    metadata: { recovered: [...recovered], count: recovered.length },
+    metadata: { recovered: ids, count: ids.length },
   }).catch((err) =>
     logger.warn({ err: (err as Error).message }, 'turn.stream_claims_recovered_audit_failed'),
   );
+
+  // ─── #627 (fatia D) — A JANELA DE LATÊNCIA DA FATIA C, FECHADA ──────────
+  //
+  // O turno recuperado voltou a `retryable` com `next_attempt_at = now()`: ele
+  // é reivindicável AGORA, e é o head da stream (quem tentou reivindicar está
+  // atrás dele — senão não haveria claim expirado a recuperar). O que ele NÃO
+  // tem é wake-up: o único job que existia era o do worker que morreu.
+  //
+  // Antes desta fatia, o desfecho documentado no runbook §11.5 era: a stream
+  // destrava, o sucessor é recusado com `not_head`, e quem avança é o head — na
+  // vez dele, quando o varredor o rearmar, o que leva até `STUCK_AFTER_MS`
+  // (2 min). Ordem comprada com latência. Aqui a dívida é paga na hora.
+  //
+  // Roda DEPOIS de a transação do claim ter comitado (o `await` do repositório
+  // já retornou), então a regra da issue vale igual: a decisão está no banco
+  // (`promoted_at`, carimbado por `recoverExpiredStreamClaims`) antes de
+  // qualquer sinal. Se este processo morrer aqui, o varredor reconcilia.
+  for (const promocao of recovered) {
+    await signalStreamPromotion(promocao, { source: 'stream_claim_recovery' });
+  }
 }
 
 /**

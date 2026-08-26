@@ -617,7 +617,13 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // A metade TEMPORAL da fatia B agiu mesmo no caminho que ia fracassar —
     // sem ela o head ficaria `claimed` para sempre e a stream não destravaria
     // nem para ele.
-    expect(doSucessor.recovered_stream_claims).toEqual([m1]);
+    // #627 mudou o CONTEÚDO deste campo de `string[]` para o objeto de promoção
+    // (`StreamClaimRecovery`): o turno recuperado perdeu o único wake-up que
+    // tinha — o job do dono morto — e re-armá-lo exige o
+    // `representative_message_id`, que só existe na linha recuperada. A
+    // afirmação da fatia C continua a mesma, e ganhou o payload do sinal.
+    expect(doSucessor.recovered_stream_claims?.map((r) => r.turn_id)).toEqual([m1]);
+    expect(doSucessor.recovered_stream_claims?.[0]?.representative_message_id).toBeTruthy();
     expect((await readTurn(m1))['status']).toBe('retryable');
 
     // E o head, rearmado, entra.

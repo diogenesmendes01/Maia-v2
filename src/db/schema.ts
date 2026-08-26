@@ -3496,6 +3496,34 @@ export const agent_turns = pgTable(
     stream_key_version: smallint('stream_key_version'),
     first_ingress_seq: bigint('first_ingress_seq', { mode: 'number' }),
     last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }),
+    // 127 (#627, fatia D) — a DECISÃO de promoção, persistida ANTES do sinal da
+    // BullMQ. `promoted_at` marca "este turno foi eleito para avançar e alguém
+    // deve um wake-up a ele"; é o que permite ao varredor reconciliar o caso
+    // "commit feito, enqueue não feito" (a fila é wake-up, não fonte de
+    // verdade). `promoted_by_turn_id` é o predecessor TERMINAL que promoveu —
+    // NULL quando o re-arme veio da recuperação de claim expirado da própria
+    // stream, onde não existe promotor. Deliberadamente NÃO reescrevem
+    // `queued_at`: a idade do head mede a espera real, não a última promoção.
+    promoted_at: timestamp('promoted_at', { withTimezone: true }),
+    promoted_by_turn_id: uuid('promoted_by_turn_id'),
+    // 130 (#628, fatia E) — a JANELA DE DEBOUNCE, como DADO. Antes daqui ela
+    // era um `setTimeout` da BullMQ mais uma chave no Redis, e por isso duas
+    // réplicas podiam fechar batches sobrepostos e um reinício perdia a janela
+    // inteira. As quatro colunas moram no turno-CABEÇA da stream porque a
+    // janela e o head-of-line são a mesma entidade: quem executa a rajada é o
+    // turno de menor `first_ingress_seq`, e é ele que absorve os irmãos.
+    //   * `debounce_window_opened_at` — âncora do teto `MESSAGE_DEBOUNCE_MAX_MS`;
+    //   * `debounce_deadline_at` — o RELÓGIO PERSISTENTE: fechar exige
+    //     `debounce_deadline_at <= now()` avaliado NO BANCO;
+    //   * `debounce_closed_at` — o fechamento ÚNICO, por compare-and-swap
+    //     (`WHERE debounce_closed_at IS NULL`);
+    //   * `debounce_batch_size` — a evidência forense da composição do batch.
+    // NULL em `debounce_deadline_at` = turno SEM janela (anterior à fatia,
+    // mídia, ou flag desligada).
+    debounce_window_opened_at: timestamp('debounce_window_opened_at', { withTimezone: true }),
+    debounce_deadline_at: timestamp('debounce_deadline_at', { withTimezone: true }),
+    debounce_closed_at: timestamp('debounce_closed_at', { withTimezone: true }),
+    debounce_batch_size: integer('debounce_batch_size'),
     queued_at: timestamp('queued_at', { withTimezone: true }),
     claimed_at: timestamp('claimed_at', { withTimezone: true }),
     started_at: timestamp('started_at', { withTimezone: true }),
@@ -3552,6 +3580,15 @@ export const agent_turns = pgTable(
       .where(
         sql`stream_key IS NOT NULL AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')`,
       ),
+    // #628 (migration 130): "quais streams têm janela de debounce VENCIDA?" —
+    // a pergunta do varredor, feita FORA de contexto de tenant (ele é um
+    // dispatcher: descobre os pares com trabalho ANTES de abrir contexto). Sem
+    // `tenant_id` no prefixo pela mesma razão de `leaseExpiryIdx`. O predicado
+    // deixa no índice só as janelas ABERTAS, que são dezenas — ele ENCOLHE
+    // quando o batch fecha, em vez de crescer com o tráfego.
+    debounceDueIdx: index('agent_turns_debounce_due_idx')
+      .on(t.debounce_deadline_at)
+      .where(sql`debounce_deadline_at IS NOT NULL AND debounce_closed_at IS NULL`),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),
@@ -3622,11 +3659,47 @@ export const agent_stream_sequences = pgTable(
   }),
 );
 
+// Issue #629 (fatia F da #505, migration 133) — a STREAM BLOQUEADA para
+// intervenção, como dado.
+//
+// É a segunda saída da política de poison/DLQ que a issue-mãe exige escolher
+// CONSCIENTEMENTE (a primeira é `dead_letter` que libera o sucessor). Uma linha
+// ATIVA — `unblocked_at IS NULL` — faz o claim recusar todo turno da conversa
+// com `stream_poisoned`, até um operador desbloquear pela porta auditada.
+//
+// Tabela, e não coluna em `agent_turns`, porque o bloqueio é da STREAM: um
+// marcador no turno exigiria varrer o histórico da conversa a cada claim (a
+// mesma varredura que a migration 126 existe para eliminar), e o ciclo de vida
+// do bloqueio — quem bloqueou, quem desbloqueou, com que justificativa — não é
+// o ciclo de vida do turno.
+export const agent_stream_blocks = pgTable('agent_stream_blocks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
+  stream_key: text('stream_key').notNull(),
+  /** Vocabulário fechado — `STREAM_BLOCK_REASONS` de `poison-policy.ts`. */
+  reason: text('reason').notNull(),
+  /** A categoria de erro (`POISON_CATEGORIES`) que DECIDIU o bloqueio. */
+  category: text('category').notNull(),
+  /** O turno envenenado. Sem FK — coluna forense, como `promoted_by_turn_id`. */
+  blocked_by_turn_id: uuid('blocked_by_turn_id').notNull(),
+  /** `last_error_code` já sanitizado. NUNCA o resumo (pode conter conteúdo). */
+  error_code: text('error_code'),
+  blocked_at: timestamp('blocked_at', { withTimezone: true }).notNull().defaultNow(),
+  /** `NULL` = bloqueio ATIVO. É o predicado do índice único parcial. */
+  unblocked_at: timestamp('unblocked_at', { withTimezone: true }),
+  unblocked_by: text('unblocked_by'),
+  unblock_reason: text('unblock_reason'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type AgentTurn = typeof agent_turns.$inferSelect;
 export type NewAgentTurn = typeof agent_turns.$inferInsert;
 export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
 export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
 export type AgentStreamSequence = typeof agent_stream_sequences.$inferSelect;
+export type AgentStreamBlock = typeof agent_stream_blocks.$inferSelect;
 
 // ---------------------------------------------------------------------------
 // Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de

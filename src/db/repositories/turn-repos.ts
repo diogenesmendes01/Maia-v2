@@ -25,6 +25,7 @@
 import { and, asc, eq, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
 import {
+  agent_stream_blocks,
   agent_stream_sequences,
   agent_turns,
   agent_turn_inputs,
@@ -52,6 +53,8 @@ import {
   STREAM_OCCUPYING_STATUSES,
   type ClaimRejection,
   type ClaimResult,
+  type StreamBlockRecord,
+  type StreamClaimRecovery,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
 import { recordStreamBlocked, recordStreamFifoViolation } from '@/runtime/turns/stream-metrics.js';
@@ -60,16 +63,33 @@ import {
   turnWriteConditions,
   type TurnWriteFence,
 } from './turn-fence-sql.js';
-// #626 — a REGRA FIFO, num módulo puro. Os QUATRO consumidores dela neste
+// #626 — a REGRA FIFO, num módulo puro. Os CINCO consumidores dela neste
 // arquivo — o `WHERE` de `claimNextEligibleTurn`, o filtro de
-// `findRecoverableTurns`, o dispatcher cross-tenant e o canário
-// `listNonHeadTurns` — chamam estas funções; nenhum monta predicado próprio.
+// `findRecoverableTurns`, o dispatcher cross-tenant, o canário
+// `listNonHeadTurns` e (desde #627) a eleição de `promoteStreamSuccessor` —
+// chamam estas funções; nenhum monta predicado próprio.
 // `tests/unit/runtime/stream-head-of-line-contract.spec.ts` conta as chamadas.
 import {
   earlierLiveTurnCount,
   earlierLiveTurnProbe,
+  committedOrderAfterCount,
+  committedOrderNotBroken,
   streamHeadOfLineNotExists,
+  streamNotPoisoned,
+  streamPoisonProbe,
+  streamSuccessorCandidate,
 } from './stream-head-sql.js';
+// #628 — a FRONTEIRA do batch de debounce, no mesmo formato e pela mesma razão
+// do módulo acima: SQL puro, compilável sem banco, com a borda escrita num
+// lugar só. `armDebounceWindowTx` e `closeDueDebounceBatchTx` são os únicos
+// consumidores; nenhum dos dois monta predicado de contiguidade próprio.
+import {
+  debounceBatchPrefix,
+  debounceDeadlineExpression,
+  debounceWindowDue,
+  lockStreamForDebounce,
+  openDebounceWindowMembers,
+} from './stream-debounce-sql.js';
 // A flag é lida por `contractEnv`, e não por `@/config/env.js`, pela MESMA
 // razão de `conversation-repos.ts` (#596): este arquivo é alcançado pelo
 // console via `conversation-repos`, e `tests/unit/config/admin-import-boundary.spec.ts`
@@ -92,12 +112,149 @@ type ClaimRow = {
   claimed_at: string;
   lease_expires_at: string;
   state_version: number | string;
+  /** #629 — a espera, medida pelo relógio do BANCO no mesmo `RETURNING`. */
+  wait_seconds: number | string;
+};
+
+/**
+ * #627 (fatia D) — o SUCESSOR promovido pela transição terminal, quando houve
+ * um.
+ *
+ * Vem no RESULTADO em vez de virar `enqueueAgent()` aqui dentro pela mesma
+ * razão de `recovered_stream_claims` (#625) e do canário de FIFO (#626): este
+ * módulo é puro-DB. Alcançar a BullMQ a partir do repositório arrastaria
+ * `ioredis` — que `src/gateway/queue.ts` conecta NO IMPORT — para dentro de
+ * todo processo que toca `agent_turns`, inclusive o console.
+ *
+ * A separação também é o que faz a ordem exigida pela issue ser estrutural em
+ * vez de convencional: a decisão está COMITADA quando este objeto chega ao
+ * chamador, então "persistir antes de sinalizar" não depende de ninguém
+ * lembrar da ordem — não existe caminho em que o sinal venha primeiro.
+ *
+ * A FORMA é `StreamClaimRecovery`, do vocabulário puro, e não um tipo próprio:
+ * "o turno recuperado de um claim expirado" e "o sucessor promovido por uma
+ * conclusão" são o MESMO fato — *este turno é quem deve avançar, e alguém lhe
+ * deve um wake-up* — contraído por dois caminhos. Dois tipos idênticos com
+ * nomes diferentes convidariam duas funções de sinalização, e a segunda é a que
+ * um dia esqueceria a auditoria.
+ */
+export type StreamPromotion = StreamClaimRecovery;
+
+/**
+ * #628 (fatia E) — a stream que o varredor de debounce deve visitar.
+ *
+ * Enumerada FORA de contexto de tenant: o varredor é um dispatcher, como o de
+ * `message-recovery` (#345). O par (tenant, agent) vem na linha porque é ele
+ * que o varredor usa para abrir `runWithTenantContext` antes de fechar.
+ */
+export type DueDebounceStream = {
+  tenant_id: string;
+  agent_id: string;
+  stream_key: string;
+};
+
+/**
+ * #628 — o desfecho de UMA tentativa de fechar o batch de uma stream.
+ *
+ * TIPADO, e não booleano, porque os quatro fracassos pedem leituras opostas do
+ * operador e a issue-mãe manda centralizar códigos de resultado:
+ *
+ *  - `stream_locked` — o mutex da stream está com outra transação (um ingresso
+ *    em voo, ou outro varredor). É o caminho NORMAL da concorrência: nada se
+ *    perde, a janela continua vencida e o próximo tick fecha. É também a metade
+ *    do "fechamento único" que impede duas réplicas de fecharem juntas;
+ *  - `no_window` — não há turno com janela aberta nesta stream. Acontece quando
+ *    o batch já foi fechado entre a enumeração e a visita;
+ *  - `not_due` — existe janela, e o prazo AINDA NÃO venceu pelo relógio do
+ *    BANCO. Um ingresso novo esticou o prazo depois de o varredor ter
+ *    enumerado. Recusar aqui é o que faz o timer do processo não ser fonte de
+ *    verdade;
+ *  - `lost_race` — o CAS de fechamento (`debounce_closed_at IS NULL` +
+ *    `state_version`) não casou. Sob o mutex isto é raro; quando acontece, foi
+ *    o executor do próprio turno mexendo nele.
+ */
+export type DebounceCloseResult =
+  | {
+      closed: true;
+      /** O head do batch — quem executa a rajada e recebe o wake-up. */
+      head: StreamPromotion;
+      /** Quantos ingressos o batch consumiu (>= 1: o head sempre entra). */
+      batch_size: number;
+      /** Os turnos irmãos marcados `superseded` — vazio num batch de um só. */
+      absorbed_turn_ids: readonly string[];
+      /** As mensagens que passaram a ser inputs do head. */
+      absorbed_message_ids: readonly string[];
+    }
+  | {
+      closed: false;
+      reason: 'stream_locked' | 'no_window' | 'not_due' | 'lost_race';
+    };
+
+/**
+ * #629 — o retrato de FAIRNESS lido no scrape. Só números e tokens opacos:
+ * nenhuma `stream_key`, nenhum id de turno, nenhum tenant.
+ */
+export type StreamSchedulingSnapshot = {
+  /** Conversas com ao menos um turno NÃO terminal. */
+  live_streams: number;
+  /** Quantas dessas têm um turno `claimed`/`running` AGORA. */
+  active_streams: number;
+  /** O maior backlog de uma única conversa. É o número em que se calibra um limite. */
+  max_backlog: number;
+  /** A idade do head MAIS VELHO, em segundos. O pior caso, que é o que fairness mede. */
+  max_head_age_s: number;
+  /** p95 das idades de head. Distingue "uma conversa presa" de "a plataforma parada". */
+  p95_head_age_s: number;
+  /**
+   * Tokens OPACOS (`md5(tenant:agent:stream_key)`) das conversas cujo head
+   * passou do limiar de starvation. Servem só à deduplicação em memória do
+   * coletor — nunca viram label, log nem saída de CLI. Truncados em 1000.
+   */
+  starving_tokens: readonly string[];
 };
 
 /** Resultado tipado de uma transição CAS. Conflito NUNCA é sucesso silencioso. */
 export type TurnTransitionResult =
-  | { ok: true; turn: AgentTurn; from: TurnStatus; to: TurnStatus }
+  | {
+      ok: true;
+      turn: AgentTurn;
+      from: TurnStatus;
+      to: TurnStatus;
+      /**
+       * #627 — presente SÓ quando esta transição foi TERMINAL e havia sucessor
+       * elegível na stream. Ausente é o caso normal (a conversa acabou), e
+       * ausente NUNCA significa "falhou": significa "não havia quem promover".
+       */
+      promotion?: StreamPromotion;
+      /**
+       * #629 — presente SÓ quando esta transição foi `dead_letter` E a política
+       * mandou BLOQUEAR a conversa E o bloqueio nasceu AGORA. Ausente cobre
+       * três casos deliberadamente indistinguíveis para o caller: a política
+       * mandou liberar, o turno não tinha `stream_key`, ou a conversa já estava
+       * interditada (o `ON CONFLICT DO NOTHING` não criou linha nova). Nos três
+       * não há bloqueio NOVO a auditar — e auditar de novo o mesmo bloqueio
+       * faria o operador procurar dois incidentes onde há um.
+       */
+      stream_block?: StreamBlockRecord;
+    }
   | { ok: false; conflict: 'not_found'; to: TurnStatus }
+  /**
+   * #629 — a transição foi recusada porque a ORDEM DA CONVERSA JÁ ESTÁ
+   * COMPROMETIDA: existe turno POSTERIOR na mesma stream que já chegou a
+   * estado terminal.
+   *
+   * Só alcançável por quem pede o guarda (`guard_committed_order`), e hoje o
+   * único que pede é o replay manual de dead letter. É a cláusula "um
+   * rearmamento manual não pode violar a ordem já comprometida" como resultado
+   * TIPADO, e não como convenção do operador — a alternativa seria um runbook
+   * dizendo "confira antes", que é exatamente o tipo de garantia que falha às
+   * três da manhã.
+   *
+   * `committed_after` é a contagem, não um booleano: "atrás de 14 turnos já
+   * concluídos" e "atrás de 1" são decisões de gravidade diferente, e é esse
+   * número que entra na `audit_log` quando o operador decide atravessar.
+   */
+  | { ok: false; conflict: 'order_committed'; to: TurnStatus; committed_after: number }
   | {
       ok: false;
       conflict: 'state_mismatch';
@@ -272,6 +429,30 @@ export const agentTurnsRepo = {
             ? { ...input.stream, ingress_seq }
             : null,
       });
+      // #628 (fatia E) — A JANELA DE DEBOUNCE, ABERTA NA MESMA TRANSAÇÃO.
+      //
+      // É aqui, e não no gateway, que a fatia deixa de depender de um timer.
+      // Quando o commit desta transação acontece, três fatos passam a existir
+      // JUNTOS ou nenhum existe: a mensagem, o turno e o prazo em que a rajada
+      // dela pode fechar. Um crash em qualquer ponto não deixa nem mensagem sem
+      // janela nem janela sem mensagem — que era exatamente o estado que o
+      // `agentQueue.add` + `writeState` do Redis podia produzir.
+      //
+      // A ELEGIBILIDADE é `tipo = 'texto'`: mídia sempre passou direto (ver
+      // `src/gateway/baileys.ts`), e um turno sem janela é o que faz a
+      // contiguidade do batch QUEBRAR na mídia em vez de agrupar por cima dela.
+      // Derivada aqui, da row que está sendo gravada, e não recebida por
+      // parâmetro: um chamador que esquecesse de passá-la abriria janela para
+      // áudio, e o defeito só apareceria numa rajada mista.
+      if (input.stream && ingress_seq !== null && debouncePersistidoAtivo()) {
+        const tipo = input.mensagem['tipo'];
+        if (tipo === 'texto') {
+          await armDebounceWindowTx(tx, {
+            turn_id: turn.id,
+            stream_key: input.stream.stream_key,
+          });
+        }
+      }
       incCounter('maia_turn_transitions_total', { from: 'none', to: 'received', outcome: 'none' });
       return { mensagem: row, turn, ingress_seq };
     });
@@ -460,6 +641,10 @@ export const agentTurnsRepo = {
     absorber_fence?: { turn_id: string; claim_token: string };
     patch?: TurnTransitionPatch;
     manual?: boolean;
+    /** #629 — ver `runTransition`. Só tem efeito em `to: 'dead_letter'`. */
+    block_stream?: { category: string; reason: string };
+    /** #629 — ver `runTransition`. Recusa com `order_committed`. */
+    guard_committed_order?: boolean;
   }): Promise<TurnTransitionResult> {
     if (input.expected_claim_token !== undefined && input.absorber_fence !== undefined) {
       throw new Error(
@@ -503,6 +688,8 @@ export const agentTurnsRepo = {
       ...(input.absorber_fence !== undefined
         ? { absorber_fence: input.absorber_fence }
         : {}),
+      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
+      ...(input.guard_committed_order === true ? { guard_committed_order: true } : {}),
       patch: input.patch ?? {},
     });
   },
@@ -671,6 +858,112 @@ export const agentTurnsRepo = {
    * incrementasse, cada batida invalidaria o CAS otimista que o caller carrega
    * e toda conclusão de turno longo falharia por versão obsoleta.
    */
+  /**
+   * #628 (fatia E) — FECHA o batch de debounce de UMA stream, numa transação.
+   *
+   * Ver `closeDueDebounceBatchTx` para o corpo e para as escritas que ele faz
+   * juntas. Aqui só a abertura da transação, pelo mesmo motivo de
+   * `claimNextEligibleTurn`: o `withTx` é o que dá sentido ao mutex da stream —
+   * o lock de linha de `agent_stream_sequences` só vale até o COMMIT, e é ele
+   * que exclui o ingresso concorrente.
+   */
+  async closeDueDebounceBatch(input: { stream_key: string }): Promise<DebounceCloseResult> {
+    return withTx((tx) => closeDueDebounceBatchTx(tx, input));
+  },
+
+  /**
+   * #628 — as streams com janela de debounce VENCIDA, CROSS-TENANT.
+   *
+   * A enumeração do dispatcher, no mesmo formato de
+   * `listTenantAgentPairsWithRecoverableTurns` (#345) e pela mesma razão: o
+   * varredor precisa descobrir QUEM tem trabalho antes de poder abrir contexto
+   * de tenant para fazê-lo. Sem tenant guard de propósito — iteração
+   * cross-tenant é o contrato do varredor, e o `runWithTenantContext` que ele
+   * abre por linha é onde o escopo volta.
+   *
+   * `debounce_deadline_at <= now()` é avaliado no BANCO: o varredor não compara
+   * o prazo com o próprio relógio em nenhum ponto, nem aqui nem no fechamento.
+   *
+   * `GROUP BY` em vez de `DISTINCT` porque a ordenação é por `MIN(prazo)` — a
+   * janela que venceu HÁ MAIS TEMPO é servida primeiro. Com `LIMIT` e um
+   * backlog maior que ele, ordenar por qualquer outra coisa deixaria uma stream
+   * antiga para trás indefinidamente enquanto streams novas passam à frente:
+   * starvation produzida pela própria varredura.
+   */
+  async listDueDebounceStreams(limit = 200): Promise<DueDebounceStream[]> {
+    const result = await db.execute<DueDebounceStream>(sql`
+      SELECT t.tenant_id, t.agent_id, t.stream_key
+        FROM ${agent_turns} t
+       WHERE t.stream_key IS NOT NULL
+         AND t.debounce_deadline_at IS NOT NULL
+         AND t.debounce_closed_at IS NULL
+         AND t.debounce_deadline_at <= now()
+       GROUP BY t.tenant_id, t.agent_id, t.stream_key
+       ORDER BY MIN(t.debounce_deadline_at)
+       LIMIT ${limit}
+    `);
+    return Array.from(result.rows as unknown as DueDebounceStream[]);
+  },
+
+  /**
+   * #628 — A COMPOSIÇÃO do batch que este turno vai executar, lida do BANCO.
+   *
+   * ─── Por que o executor NÃO recalcula a rajada ────────────────────────────
+   *
+   * `aggregateUnprocessedTexts` (src/agent/core.ts) descobria os irmãos por
+   * `telefone` + `processada_em IS NULL` + comparação de `created_at`, em
+   * memória, no momento da execução. Isso é uma SEGUNDA definição de batch,
+   * feita depois e por outro critério — exatamente o tipo de divergência que a
+   * #626 eliminou na regra de ordem. Duas definições concordam até o dia em que
+   * uma mensagem chega entre o fechamento e a execução: a agregação a varre, o
+   * batch fechado não a contém, e a rajada responde por uma mensagem que
+   * pertence à PRÓXIMA — furando a fronteira que o fechamento acabou de
+   * declarar.
+   *
+   * Aqui o executor só LÊ o que já foi decidido. `debounce_closed_at IS NOT
+   * NULL` no `WHERE` é o que impede esta função de devolver alguma coisa para
+   * um turno cuja janela ainda está aberta.
+   *
+   * ─── A ORDEM é a canônica da stream ───────────────────────────────────────
+   *
+   * `ORDER BY m.ingress_seq` — a sequência transacional por stream (migration
+   * 120), não `created_at` e não `agent_turn_inputs.ingress_seq`. A issue-mãe é
+   * explícita ("timestamps não são fonte primária de ordenação"), e o texto
+   * concatenado que o modelo lê depende dessa ordem: trocá-la reescreve a
+   * pergunta do usuário.
+   *
+   * `NULLS LAST` cobre a row anterior ao protocolo (sem `ingress_seq`), que não
+   * tem posição e portanto vai para o fim em vez de para o começo.
+   *
+   * Devolve TODAS as mensagens do turno, inclusive a representativa; quem
+   * separa é o caller, que já sabe qual é a sua.
+   */
+  async listClosedDebounceBatch(
+    turn_id: string,
+  ): Promise<Array<{ mensagem_id: string; conteudo: string | null }>> {
+    const { tenant_id, agent_id } = scope();
+    const result = await db.execute<{ mensagem_id: string; conteudo: string | null }>(sql`
+      SELECT i.mensagem_id, m.conteudo
+        FROM ${agent_turn_inputs} i
+        JOIN ${agent_turns} t
+          ON  t.id        = i.turn_id
+          AND t.tenant_id = ${tenant_id}
+          AND t.agent_id  = ${agent_id}
+        JOIN ${mensagens} m
+          ON  m.id        = i.mensagem_id
+          AND m.tenant_id = ${tenant_id}
+          AND m.agent_id  = ${agent_id}
+       WHERE i.turn_id   = ${turn_id}::uuid
+         AND i.tenant_id = ${tenant_id}
+         AND i.agent_id  = ${agent_id}
+         AND t.debounce_closed_at IS NOT NULL
+       ORDER BY m.ingress_seq NULLS LAST
+    `);
+    return Array.from(
+      result.rows as unknown as Array<{ mensagem_id: string; conteudo: string | null }>,
+    );
+  },
+
   async renewTurnLease(input: {
     turn_id: string;
     claim_token: string;
@@ -1043,11 +1336,19 @@ export const agentTurnsRepo = {
     error_summary: string | null;
     expected_version?: number;
     expected_claim_token?: string;
+    /**
+     * #629 — a DECISÃO da política de poison, já tomada por `deadLetterTurn`.
+     * Presente ⇒ a stream é bloqueada na MESMA transação do CAS terminal, e o
+     * sucessor NÃO é promovido (a eleição vê o bloqueio). Ausente ⇒ o
+     * comportamento da #627: `dead_letter` libera a conversa.
+     */
+    block_stream?: { category: string; reason: string };
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'dead_letter',
       outcome: input.outcome,
+      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
@@ -1072,12 +1373,26 @@ export const agentTurnsRepo = {
   async replayDeadLetterTx(input: {
     turn_id: string;
     expected_version?: number;
+    /**
+     * #629 — MODO DE RECONCILIAÇÃO EXPLÍCITO. `false` (o default) recusa o
+     * replay quando a ordem da conversa já foi comprometida por um turno
+     * posterior já terminal. `true` atravessa a recusa — e o caller DEVE
+     * auditar isso como `turn_replay_reconciled`, porque é a única evidência de
+     * que a plataforma processou algo fora da ordem que já entregou.
+     *
+     * O default é o lado seguro de propósito: um operador que não sabe da
+     * regra recebe a recusa e o número de turnos já concluídos atrás dos quais
+     * ele estava prestes a inserir trabalho. Um default permissivo daria a ele
+     * o mesmo comando com o mesmo resultado aparente e nenhuma pergunta.
+     */
+    reconcile?: boolean;
   }): Promise<TurnTransitionResult> {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'queued',
       expected_statuses: ['dead_letter'],
       manual: true,
+      ...(input.reconcile === true ? {} : { guard_committed_order: true }),
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
@@ -1261,6 +1576,14 @@ export const agentTurnsRepo = {
           ...(headOfLineEnabled()
             ? [streamHeadOfLineNotExists(escopoSql(tenant_id, agent_id))]
             : []),
+          // #629 — uma conversa BLOQUEADA por poison não tem trabalho
+          // recuperável, e o filtro é obrigatório aqui pela mesma razão que a
+          // regra FIFO é: sem ele o varredor rearma, a cada ciclo, um turno que
+          // o claim vai recusar com `stream_poisoned`. Nada quebraria — e é
+          // isso que o tornaria caro: trabalho infinito com aparência de
+          // recuperação, e o `limit` da varredura consumido por conversas que
+          // nenhum worker pode destravar.
+          streamNotPoisoned(escopoSql(tenant_id, agent_id)),
         ),
       )
       .orderBy(asc(agent_turns.created_at))
@@ -1345,10 +1668,155 @@ export const agentTurnsRepo = {
               })
             : sql`TRUE`
         }
+        AND ${streamNotPoisoned({
+          // CROSS-TENANT, pela mesma razão do fragmento acima: o escopo sai das
+          // COLUNAS da linha. Espelha `findRecoverableTurns` — um par só é
+          // enumerado quando o inner de fato teria trabalho.
+          tenant: sql`${agent_turns}.tenant_id`,
+          agent: sql`${agent_turns}.agent_id`,
+          alvo: sql`${agent_turns}`,
+        })}
     `);
     return Array.from(
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
     );
+  },
+
+  /**
+   * #629 (fatia F da #505) — o RETRATO DE FAIRNESS do escalonamento por stream,
+   * lido no SCRAPE.
+   *
+   * ─── Por que um agregado CROSS-TENANT, e por que ele é sancionado ────────
+   *
+   * A issue-mãe pede `maia_stream_head_age_seconds`,
+   * `maia_stream_active_total` e `maia_stream_starvation_total`, e nenhuma das
+   * três tem tenant: a pergunta é "a plataforma está tratando as conversas com
+   * justiça?", feita por um scrape que não roda dentro de contexto nenhum. É a
+   * MESMA forma de `snapshotLiveTurnStates()` e do `schedulerLagSnapshot` de
+   * `src/observability/register.ts` — o escopo mora no `GROUP BY`, não num
+   * `WHERE` sobre o ALS, e o que sai da consulta são NÚMEROS.
+   *
+   * ─── Por que `md5` da chave, e não a chave ───────────────────────────────
+   *
+   * `starvation_total` é um CONTADOR, e um contador que sobe a cada scrape não
+   * conta eventos: conta scrapes. Para incrementá-lo uma vez por conversa
+   * faminta é preciso reconhecer a MESMA conversa entre duas coletas — e a
+   * issue-mãe proíbe `stream_key` como label, com razão.
+   *
+   * O `md5(tenant:agent:stream_key)` resolve os dois lados: é estável entre
+   * coletas (serve à deduplicação, que acontece em MEMÓRIA no coletor) e é
+   * opaco (não vira label, não vai para log, não identifica ninguém). A
+   * `stream_key` já é ela própria um hash; este é um segundo hash cujo único
+   * propósito é ser um token de igualdade sem ser um identificador.
+   *
+   * ─── Por que a idade do head, e não a média das idades ───────────────────
+   *
+   * Porque a pergunta de fairness é sobre o PIOR caso, não sobre o típico. Uma
+   * plataforma com 10 mil conversas instantâneas e uma parada há duas horas tem
+   * média excelente e um usuário abandonado. `max` e `p95` respondem isso; a
+   * média o esconderia.
+   *
+   * O head de cada stream é o menor `first_ingress_seq` NÃO terminal, e a idade
+   * é medida desde `COALESCE(queued_at, created_at)` — a PRIMEIRA entrada na
+   * fila, que a promoção (#627) preserva de propósito.
+   */
+  async snapshotStreamScheduling(starvation_after_ms: number): Promise<StreamSchedulingSnapshot> {
+    const result = await db.execute<{
+      live_streams: string;
+      active_streams: string;
+      max_backlog: string;
+      max_head_age_s: string;
+      p95_head_age_s: string;
+      starving: string[] | null;
+    }>(sql`
+      WITH vivos AS (
+        SELECT tenant_id, agent_id, stream_key, status, queued_at, created_at,
+               first_ingress_seq
+          FROM ${agent_turns}
+         WHERE stream_key IS NOT NULL
+           AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')
+      ),
+      cabeca AS (
+        SELECT DISTINCT ON (tenant_id, agent_id, stream_key)
+               tenant_id, agent_id, stream_key,
+               GREATEST(
+                 EXTRACT(EPOCH FROM (now() - COALESCE(queued_at, created_at))),
+                 0
+               )::float8 AS head_age_s
+          FROM vivos
+         ORDER BY tenant_id, agent_id, stream_key,
+                  first_ingress_seq NULLS LAST, created_at
+      ),
+      por_stream AS (
+        SELECT tenant_id, agent_id, stream_key,
+               count(*)::int AS backlog,
+               bool_or(status IN ('claimed', 'running')) AS ativo
+          FROM vivos
+         GROUP BY tenant_id, agent_id, stream_key
+      ),
+      streams AS (
+        SELECT p.tenant_id, p.agent_id, p.stream_key, p.backlog, p.ativo,
+               c.head_age_s,
+               md5(p.tenant_id || ':' || p.agent_id || ':' || p.stream_key) AS token
+          FROM por_stream p
+          JOIN cabeca c
+            ON  c.tenant_id  = p.tenant_id
+            AND c.agent_id   = p.agent_id
+            AND c.stream_key = p.stream_key
+      )
+      SELECT count(*)::text AS live_streams,
+             count(*) FILTER (WHERE ativo)::text AS active_streams,
+             COALESCE(max(backlog), 0)::text AS max_backlog,
+             COALESCE(max(head_age_s), 0)::text AS max_head_age_s,
+             COALESCE(
+               percentile_disc(0.95) WITHIN GROUP (ORDER BY head_age_s), 0
+             )::text AS p95_head_age_s,
+             COALESCE(
+               (array_agg(token ORDER BY head_age_s DESC)
+                  FILTER (WHERE head_age_s * 1000 > ${starvation_after_ms}))[1:1000],
+               ARRAY[]::text[]
+             ) AS starving
+        FROM streams
+    `);
+    const row = (
+      result.rows as unknown as Array<{
+        live_streams: string;
+        active_streams: string;
+        max_backlog: string;
+        max_head_age_s: string;
+        p95_head_age_s: string;
+        starving: string[] | null;
+      }>
+    )[0];
+    return {
+      live_streams: Number(row?.live_streams ?? 0),
+      active_streams: Number(row?.active_streams ?? 0),
+      max_backlog: Number(row?.max_backlog ?? 0),
+      max_head_age_s: Number(row?.max_head_age_s ?? 0),
+      p95_head_age_s: Number(row?.p95_head_age_s ?? 0),
+      starving_tokens: row?.starving ?? [],
+    };
+  },
+
+  /**
+   * #629 — quantas conversas estão INTERDITADAS agora.
+   *
+   * Consulta separada, e não mais uma coluna do agregado acima, porque as duas
+   * perguntas têm domínios diferentes: aquele conta streams com turno VIVO
+   * (`agent_turns`), esta conta interdições ativas (`agent_stream_blocks`), e
+   * uma conversa pode estar interditada sem ter nenhum turno vivo atrás —
+   * exatamente o caso em que o único turno era o envenenado. Fundi-las num
+   * `LEFT JOIN` faria o gauge de interdições depender de haver backlog, e o
+   * caso mais comum sumiria do painel.
+   */
+  async countBlockedStreams(): Promise<number> {
+    const result = await db.execute<{ total: string }>(sql`
+      SELECT count(*)::text AS total
+        FROM ${agent_stream_blocks}
+       WHERE unblocked_at IS NULL
+    `);
+    const row = (result.rows as unknown as Array<{ total: string }>)[0];
+    return Number(row?.total ?? 0);
   },
 
   /**
@@ -1648,8 +2116,13 @@ export const agentTurnsRepo = {
 async function recoverExpiredStreamClaims(
   tx: Executor,
   args: { tenant_id: string; agent_id: string; turn_id: string },
-): Promise<string[]> {
-  const result = await tx.execute<{ id: string; previous_status: string }>(sql`
+): Promise<StreamPromotion[]> {
+  const result = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    previous_status: string;
+  }>(sql`
     WITH alvo AS MATERIALIZED (
       SELECT t.stream_key
         FROM ${agent_turns} t
@@ -1675,6 +2148,16 @@ async function recoverExpiredStreamClaims(
            last_error_code    = 'stream_lease_expired',
            last_error_summary = 'claim expirado recuperado na transacao de claim da stream (#625)',
            state_version      = u.state_version + 1,
+           -- #627 — o turno recuperado E o head desta stream (quem tentou
+           -- reivindicar esta ATRAS dele, senao nao haveria o que recuperar), e
+           -- ele acabou de perder o unico wake-up que tinha: o job do dono
+           -- morto. Carimbar promoted_at aqui declara que ELE e quem deve
+           -- avancar e que alguem lhe deve um sinal -- a mesma divida da
+           -- promocao por conclusao, contraida por outro caminho.
+           -- promoted_by_turn_id fica NULL de proposito: nao houve promotor.
+           -- Sem isto, a stream espera o varredor (STUCK_AFTER_MS), que e a
+           -- janela descrita no runbook 11.5.
+           promoted_at        = now(),
            updated_at         = now()
       FROM ativos
      WHERE u.id        = ativos.id
@@ -1683,15 +2166,215 @@ async function recoverExpiredStreamClaims(
        AND u.id       <> ${args.turn_id}
        AND ativos.lease_expires_at IS NOT NULL
        AND ativos.lease_expires_at <= now()
-    RETURNING u.id, ativos.status AS previous_status
+    RETURNING u.id, u.representative_message_id, u.conversa_id,
+              ativos.status AS previous_status
   `);
   const rows = Array.from(
-    result.rows as unknown as Array<{ id: string; previous_status: string }>,
+    result.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      previous_status: string;
+    }>,
   );
   for (const row of rows) {
     incCounter('maia_turn_stream_claim_recovered_total', { from: row.previous_status });
   }
-  return rows.map((row) => row.id);
+  // #627 — devolve o mesmo formato da promoção por conclusão, e não só os ids:
+  // o caller precisa do `representative_message_id` para armar o wake-up, e uma
+  // segunda consulta para buscá-lo abriria a janela em que o turno muda entre
+  // as duas leituras. `status_before` é o estado ATIVO de onde ele veio
+  // (`claimed`/`running`), que é o que o log precisa dizer.
+  return rows.map((row) => ({
+    turn_id: row.id,
+    representative_message_id: row.representative_message_id,
+    conversa_id: row.conversa_id,
+    status_before: row.previous_status as TurnStatus,
+    status_after: 'retryable' as TurnStatus,
+  }));
+}
+
+/**
+ * #627 (fatia D da #505) — PROMOÇÃO DO SUCESSOR: o head chegou a terminal, quem
+ * é o próximo?
+ *
+ * ─── Por que isto roda DENTRO da transação do CAS terminal ────────────────
+ *
+ * A issue pede três coisas que, separadas, não se sustentam:
+ *
+ *   1. "validar o `claim_token` do turno que está terminando — uma tentativa
+ *      stale não pode liberar o sucessor";
+ *   2. "persistir a decisão ANTES de sinalizar a BullMQ";
+ *   3. "promover de forma IDEMPOTENTE".
+ *
+ * Rodando aqui, dentro de `runTransitionTx`, as três saem da estrutura em vez
+ * de saírem de disciplina:
+ *
+ *   (1) é DE GRAÇA e é EXATA. Esta função só é chamada depois de o UPDATE
+ *       terminal ter casado — e o `WHERE` daquele UPDATE já carrega
+ *       `claim_token = <o meu>` + `lease_expires_at > now()`
+ *       (`turnWriteConditions`). Um worker zumbi não chega aqui: o CAS dele
+ *       devolve zero linhas e a transação inteira vira `stale_claim`. Uma
+ *       validação SEPARADA do token seria uma SEGUNDA cópia da regra de fence —
+ *       o mesmo defeito que a fatia C eliminou na regra de ordem, com o mesmo
+ *       modo de falha (as duas concordam até o dia em que não concordam).
+ *
+ *   (2) é estrutural: o `enqueueAgent` mora em `src/runtime/turns/stream-promotion.ts`
+ *       e só recebe este objeto DEPOIS do commit. Não existe caminho de código
+ *       em que o sinal preceda a decisão.
+ *
+ *   (3) o `LIMIT 1 FOR UPDATE` da eleição serializa duas conclusões simultâneas
+ *       da mesma stream: a segunda espera, re-avalia o `WHERE` contra a linha
+ *       nova e não casa. "Exatamente um sucessor" é propriedade do banco.
+ *
+ * E há a razão que não é da issue e é a mais importante na prática: se a
+ * promoção fosse uma transação SEPARADA, um crash entre o commit terminal e o
+ * commit da promoção deixaria a stream parada — e a única coisa que a
+ * destravaria seria o varredor, isto é, exatamente a janela de 2 minutos que
+ * esta fatia existe para fechar. A promoção atômica com a conclusão não tem
+ * esse estado intermediário.
+ *
+ * ─── Por que ela NÃO passa por `transitionTurn` ──────────────────────────
+ *
+ * Mesma razão de `claimNextEligibleTurn` e de `recoverExpiredStreamClaims`:
+ * `transitionTurn` é compare-and-swap sobre UMA linha conhecida, com versão
+ * esperada — e aqui não sabemos, antes de olhar, QUEM é o sucessor nem em que
+ * versão ele está. O par (from, to) continua sendo do contrato:
+ * `received -> queued` e `retryable -> queued` são arestas de
+ * `TURN_TRANSITIONS`, e `tests/unit/runtime/stream-promotion-contract.spec.ts`
+ * falha se alguém as remover.
+ *
+ * ─── O que a promoção FAZ com o sucessor, campo a campo ──────────────────
+ *
+ *  - `status = 'queued'`: o turno passa a declarar que existe wake-up para ele.
+ *    Um sucessor que JÁ estava `queued` continua `queued` — e ainda assim é
+ *    promovido. Isso não é redundância, é o caso NORMAL e a razão de a fatia
+ *    existir: todo turno é enfileirado no ingresso, o job acorda, o claim
+ *    recusa com `not_head` (#626) e o job TERMINA. O wake-up foi CONSUMIDO. Sem
+ *    re-armar o que está `queued`, a promoção não promoveria quase ninguém;
+ *  - `queued_at` é PRESERVADO (`COALESCE`): ele mede quando a espera começou, e
+ *    reescrevê-lo faria uma conversa presa há uma hora parecer recém-chegada
+ *    para `maia_stream_head_age_seconds`;
+ *  - `state_version` sobe SÓ quando o estado muda de fato. Um re-arme de turno
+ *    já `queued` não é transição de estado, e bumpar ali invalidaria o CAS
+ *    otimista que uma absorção de debounce concorrente carrega — a rajada
+ *    perderia o irmão por um evento que não mudou estado nenhum;
+ *  - `attempt_count` NÃO sobe: quem conta tentativa é o claim. Contar aqui
+ *    gastaria o orçamento de retry do turno com a conclusão de OUTRO turno;
+ *  - `next_attempt_at = NULL` porque, para chegar aqui, o backoff já venceu (o
+ *    `WHERE` exige) — deixá-lo preenchido faria o varredor continuar tratando o
+ *    turno como "esperando backoff".
+ *
+ * ─── O que ela NÃO promove, e por quê ────────────────────────────────────
+ *
+ * O `WHERE` admite só `CLAIMABLE_STATUSES` com o backoff vencido. Fora ficam:
+ *   - `claimed`/`running`: já têm dono vivo. Enfileirar seria pedir um segundo
+ *     executor para um turno que está sendo executado;
+ *   - `outbound_pending`: nenhum claim o move — quem o move é o delivery worker
+ *     (#506). Promovê-lo produziria um job que só pode ser recusado;
+ *   - `retryable` com `next_attempt_at` no FUTURO: a issue-mãe é literal —
+ *     "backoff não autoriza ultrapassagem silenciosa". A conversa espera, e
+ *     quem a acorda é o varredor quando o backoff vencer.
+ * Em todos esses casos o resultado é `null` ⇒ `no_successor`, e a stream
+ * continua parada de propósito.
+ *
+ * ─── A condição de HEAD-OF-LINE no `WHERE`, que parece redundante ────────
+ *
+ * A eleição já devolve o MENOR `first_ingress_seq` não terminal da stream, o
+ * que faz dele o head por construção. `streamHeadOfLineNotExists` é aplicada
+ * assim mesmo, e é a MESMA função do claim e do recovery — não uma cópia. Ela
+ * é o que impede a promoção de furar a ordem se a eleição um dia mudar (um
+ * `ORDER BY` reescrito, um índice novo, um `LIMIT` movido): a promoção passaria
+ * a eleger outro turno e continuaria não conseguindo promovê-lo. Fura-ordem
+ * vira "não promoveu", que é falha SEGURA — a stream espera o varredor em vez
+ * de responder M3 antes de M2.
+ */
+async function promoteStreamSuccessor(
+  tx: Executor,
+  args: { tenant_id: string; agent_id: string; predecessor_turn_id: string },
+): Promise<StreamPromotion | null> {
+  const escopo = escopoSql(args.tenant_id, args.agent_id);
+  const alvo = { tenant: escopo.tenant, agent: escopo.agent, alvo: sql`u` };
+  const result = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    status_before: string;
+    status_after: string;
+  }>(sql`
+    WITH sucessor AS MATERIALIZED (
+      ${streamSuccessorCandidate({
+        tenant: escopo.tenant,
+        agent: escopo.agent,
+        predecessor_turn_id: args.predecessor_turn_id,
+      })}
+    )
+    UPDATE ${agent_turns} u
+       SET status              = 'queued',
+           queued_at           = COALESCE(u.queued_at, now()),
+           promoted_at         = now(),
+           promoted_by_turn_id = ${args.predecessor_turn_id},
+           next_attempt_at     = NULL,
+           state_version       = u.state_version
+                                 + CASE WHEN u.status = 'queued' THEN 0 ELSE 1 END,
+           updated_at          = now()
+      FROM sucessor
+     WHERE u.id        = sucessor.id
+       AND u.tenant_id = ${args.tenant_id}
+       AND u.agent_id  = ${args.agent_id}
+       AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+       AND (u.status <> 'retryable' OR u.next_attempt_at IS NULL OR u.next_attempt_at <= now())
+       AND ${streamHeadOfLineNotExists(alvo)}
+       -- #629 -- a conversa envenenada NAO promove ninguem. A ordem importa e e
+       -- estrutural: o bloqueio e inserido ANTES desta consulta, na MESMA
+       -- transacao do CAS terminal (ver runTransitionTx), entao a promocao ve o
+       -- bloqueio que a propria conclusao acabou de criar e devolve null =>
+       -- no_successor. Sem isto, o dead_letter que BLOQUEIA a stream ainda
+       -- assim acordaria o sucessor -- um wake-up para um turno que o claim vai
+       -- recusar, e a metrica promoted deixaria de significar 'a fila andou'.
+       AND ${streamNotPoisoned(alvo)}
+    RETURNING u.id, u.representative_message_id, u.conversa_id,
+              sucessor.status AS status_before, u.status AS status_after
+  `);
+  const row = (
+    result.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      status_before: string;
+      status_after: string;
+    }>
+  )[0];
+  if (!row) return null;
+  return {
+    turn_id: row.id,
+    representative_message_id: row.representative_message_id,
+    conversa_id: row.conversa_id,
+    status_before: row.status_before as TurnStatus,
+    status_after: row.status_after as TurnStatus,
+  };
+}
+
+/**
+ * #627 — a promoção do sucessor está LIGADA?
+ *
+ * Exige as DUAS flags, e a segunda não é zelo: sem head-of-line (#626) nenhum
+ * job é recusado por posição, então todo turno já tem o próprio wake-up vivo e
+ * não há fila a destravar. Promover ali seria enfileirar de novo o que já está
+ * enfileirado — inócuo (o `jobId` é determinístico), mas seria trabalho e
+ * métrica descrevendo um problema que não existe naquele regime.
+ *
+ * A dependência é de INÉRCIA, não de segurança, e por isso ela mora aqui e não
+ * numa regra cross-field que reprova o boot: o rollback emergencial da fatia C
+ * é `FEATURE_TURN_HEAD_OF_LINE=false` + restart, e transformar isso em "o
+ * processo não sobe até você desligar também a outra flag" seria pôr um segundo
+ * passo obrigatório no meio de um incidente.
+ *
+ * Lida a cada transição terminal (o memo é de `contractEnv`) pelo mesmo motivo
+ * de `headOfLineEnabled`: um kill switch que só vale no boot não é kill switch.
+ */
+function promotionEnabled(): boolean {
+  return contractEnv.FEATURE_TURN_STREAM_PROMOTION && headOfLineEnabled();
 }
 
 /**
@@ -1704,6 +2387,404 @@ async function recoverExpiredStreamClaims(
  */
 function headOfLineEnabled(): boolean {
   return contractEnv.FEATURE_TURN_HEAD_OF_LINE;
+}
+
+/**
+ * #628 — o debounce TRANSACIONAL está LIGADO?
+ *
+ * Exige TRÊS flags, e nenhuma das duas dependências é zelo:
+ *
+ *  - `FEATURE_MESSAGE_DEBOUNCE` — sem debounce não existe rajada a agrupar, e
+ *    abrir janela para cada mensagem produziria um batch de um só por mensagem:
+ *    escrita e varredura a mais para descrever o comportamento que já existe.
+ *    É por isso que a fatia é INERTE no default do repositório (a flag do
+ *    debounce vem `false`), e isso é deliberado — ligar o debounce e ligar a
+ *    versão transacional dele são duas decisões;
+ *  - `FEATURE_TURN_HEAD_OF_LINE` — esta é de SEGURANÇA. O fechamento marca os
+ *    irmãos `superseded` sem fence, e pode fazê-lo porque, com head-of-line
+ *    ligado, um turno que NÃO é o head da stream é INCLAIMÁVEL: ninguém o está
+ *    executando, então não há posse a respeitar. Sem head-of-line qualquer
+ *    turno elegível pode ser reivindicado, e o fechamento passaria a poder
+ *    absorver um irmão que um worker está executando NESTE instante — o mesmo
+ *    defeito que `absorbDebounceInputs` cobre com `absorber_claim_token`.
+ *
+ * Lida a cada ingresso e a cada varredura (o memo é de `contractEnv`) pelo
+ * mesmo motivo das demais: um kill switch que só vale no boot não é kill
+ * switch.
+ *
+ * NÃO existe regra cross-field que reprove o boot, e a escolha é a mesma que a
+ * #627 fez: o rollback emergencial da fatia C é `FEATURE_TURN_HEAD_OF_LINE=false`
+ * + restart, e transformar isso em "o processo não sobe até você desligar
+ * também a outra flag" seria pôr um segundo passo obrigatório no meio de um
+ * incidente.
+ */
+function debouncePersistidoAtivo(): boolean {
+  return (
+    contractEnv.FEATURE_TURN_STREAM_DEBOUNCE &&
+    contractEnv.FEATURE_MESSAGE_DEBOUNCE &&
+    headOfLineEnabled()
+  );
+}
+
+/**
+ * #628 (fatia E da #505) — ABRE ou ESTENDE a janela de debounce da stream, na
+ * MESMA transação do ingresso.
+ *
+ * ─── Os dois statements, e por que não podem ser um ───────────────────────
+ *
+ * O primeiro carimba `debounce_window_opened_at` no turno recém-criado; o
+ * segundo recalcula o PRAZO de todos os membros da janela — inclusive dele.
+ * Fundi-los numa CTE que escreve e lê não funcionaria: uma CTE que MODIFICA e
+ * outra que LÊ, no mesmo statement, enxergam o MESMO snapshot, então a segunda
+ * não veria o carimbo da primeira e o turno novo ficaria de fora da própria
+ * janela que acabou de entrar. Dois statements na mesma transação são atômicos
+ * do lado de fora, que é o que importa.
+ *
+ * ─── Por que o prazo é reescrito em TODOS os membros ──────────────────────
+ *
+ * A alternativa era mantê-lo só no head. Ela tem um estado absorvente: se o
+ * head morrer por outro caminho (um operador o ignora, uma absorção o
+ * supersede), o prazo morre com ele e o novo head da janela fica SEM relógio —
+ * ninguém o fecha, e a rajada só sai quando chegar uma mensagem nova. Com o
+ * prazo em todos, qualquer membro sobrevivente carrega o relógio da janela e o
+ * varredor continua achando a stream.
+ *
+ * O custo é um UPDATE sobre o BACKLOG da conversa — 0 a 3 linhas na operação
+ * normal, porque membro fechado e membro terminal saem do conjunto —, e ele
+ * roda sob o mutex da stream que a alocação de `ingress_seq` já segurava.
+ *
+ * ─── A ÂNCORA DO TETO é `MIN(debounce_window_opened_at)` ──────────────────
+ *
+ * Não é o `opened_at` do turno que chegou (que seria sempre `now()`, e o teto
+ * nunca venceria), e não é um valor em memória: é o instante em que o PRIMEIRO
+ * membro vivo da janela abriu. Persistido, portanto imune a reinício — o
+ * processo que estende a janela quase nunca é o que a abriu.
+ */
+async function armDebounceWindowTx(
+  tx: Executor,
+  args: { turn_id: string; stream_key: string },
+): Promise<void> {
+  const { tenant_id, agent_id } = scope();
+  const escopo = escopoSql(tenant_id, agent_id);
+  const membros = {
+    tenant: escopo.tenant,
+    agent: escopo.agent,
+    stream_key: sql`${args.stream_key}`,
+  };
+
+  await tx.execute(sql`
+    UPDATE ${agent_turns}
+       SET debounce_window_opened_at = now(),
+           updated_at = now()
+     WHERE ${agent_turns}.id        = ${args.turn_id}::uuid
+       AND ${agent_turns}.tenant_id = ${tenant_id}
+       AND ${agent_turns}.agent_id  = ${agent_id}
+       AND ${agent_turns}.debounce_window_opened_at IS NULL
+  `);
+
+  await tx.execute(sql`
+    WITH janela AS MATERIALIZED (
+      SELECT t.id, t.debounce_window_opened_at
+        FROM ${agent_turns} AS t
+       WHERE ${openDebounceWindowMembers({ ...membros, alvo: sql`t` })}
+       ORDER BY t.id
+         FOR UPDATE OF t
+    ),
+    abertura AS (
+      SELECT MIN(j.debounce_window_opened_at) AS at FROM janela j
+    )
+    UPDATE ${agent_turns} u
+       SET debounce_deadline_at = ${debounceDeadlineExpression({
+         opened_at: sql`abertura.at`,
+         delay_ms: contractEnv.MESSAGE_DEBOUNCE_MS,
+         max_hold_ms: contractEnv.MESSAGE_DEBOUNCE_MAX_MS,
+       })},
+           updated_at = now()
+      FROM janela, abertura
+     WHERE u.id        = janela.id
+       AND u.tenant_id = ${tenant_id}
+       AND u.agent_id  = ${agent_id}
+  `);
+}
+
+/**
+ * #628 (fatia E da #505) — O FECHAMENTO DO BATCH, com as escritas na MESMA
+ * transação.
+ *
+ * A issue pede, literalmente: *"lock transacional — `FOR UPDATE SKIP LOCKED`
+ * onde couber; fechamento único do batch; criação do turno e associação dos
+ * ingressos na mesma transação"*. Esta função é as três coisas.
+ *
+ * ─── A ordem dos passos, e por que ela é a ordem ──────────────────────────
+ *
+ *  1. **MUTEX DA STREAM** (`lockStreamForDebounce`, `SKIP LOCKED`). Sem linha
+ *     ⇒ `stream_locked`: ou existe um ingresso em voo (e fechar agora
+ *     enxergaria a stream pela metade), ou outra réplica está fechando ESTA
+ *     stream. É aqui que "duas réplicas não fecham batches sobrepostos" deixa
+ *     de ser uma promessa e vira um lock;
+ *
+ *  2. **GC das janelas órfãs.** Um turno que chegou a TERMINAL por outro
+ *     caminho (operador o ignorou, um irmão o absorveu) pode ter ficado com
+ *     `debounce_deadline_at` preenchido e `debounce_closed_at` nulo — isto é,
+ *     dentro do índice do varredor para sempre, sendo reenumerado a cada tick.
+ *     Fechá-lo aqui é o que faz o índice ENCOLHER em vez de vazar. Sem esta
+ *     linha o vazamento não quebra nada e não aparece em teste nenhum: só
+ *     aumenta o custo da varredura, todo dia, para sempre;
+ *
+ *  3. **A BORDA** (`debounceBatchPrefix`). O prefixo contíguo de membros. Vazio
+ *     ⇒ `no_window`;
+ *
+ *  4. **O RELÓGIO PERSISTENTE.** `due` vem do BANCO (`debounceWindowDue`),
+ *     nunca de `Date.now()`. Não vencido ⇒ `not_due` — que é o caso NORMAL
+ *     quando uma mensagem esticou o prazo depois de o varredor enumerar, e é a
+ *     linha que faz o timer do processo não ser fonte de verdade;
+ *
+ *  5. **O CAS DE FECHAMENTO** sobre o head, com `debounce_closed_at IS NULL` E
+ *     `state_version` esperada. Zero linhas ⇒ `lost_race`, nunca sucesso
+ *     silencioso.
+ *
+ *     Honestidade sobre o que carrega o peso aqui, medida por sonda: o
+ *     fechamento único NÃO depende destas duas linhas. Quem o garante são (a) o
+ *     mutex do passo 1, no caminho CONCORRENTE, e (b) `debounce_closed_at IS
+ *     NULL` dentro de `openDebounceWindowMembers`, no caminho SEQUENCIAL — um
+ *     head já fechado sai do conjunto de membros, então a segunda tentativa
+ *     devolve `no_window` antes de chegar a este UPDATE. Removendo qualquer uma
+ *     das duas condições daqui a suíte continua verde; removendo AS DUAS
+ *     JUNTAS com a do conjunto de membros, um segundo fechamento passa e
+ *     reescreve `debounce_batch_size` para 1.
+ *
+ *     Ficam como DEFESA EM PROFUNDIDADE, e não por simetria: o
+ *     `state_version` não protege sozinho porque um head já `queued`
+ *     (promovido pela #627, ou re-armado pelo varredor) NÃO tem a versão
+ *     incrementada pelo fechamento — de propósito, porque re-armar um turno já
+ *     `queued` não é transição de estado (a decisão da fatia D). Custam um
+ *     predicado sobre uma linha já encontrada e fecham a janela em que alguém
+ *     mexa no conjunto de membros sem notar o que ele estava sustentando;
+ *
+ *  6. **A ABSORÇÃO DOS IRMÃOS** — `superseded`/`merged_into_turn` apontando
+ *     para o head — e a RE-ANCORAGEM dos inputs.
+ *
+ * ─── Por que os inputs MUDAM DE TURNO (e a absorção de #503 não fazia isso) ─
+ *
+ * `absorbDebounceInputs` (lifecycle.ts) marca o irmão `superseded` e DEIXA a
+ * associação onde está, porque lá a absorção acontece DEPOIS de o irmão já ter
+ * sido varrido pela agregação em memória — os textos já estão no prompt.
+ *
+ * Aqui não há agregação em memória: o batch É a composição, e ela precisa ser
+ * legível pelo executor, que roda em outro processo e outro instante. Repontar
+ * `agent_turn_inputs.turn_id` para o head faz `listClosedDebounceBatch` devolver
+ * a rajada inteira, em ordem — o batch vira um FATO do banco, que é a exigência
+ * da fatia. A invariante "uma mensagem inbound pertence a no máximo um turno"
+ * continua sendo do banco (unique em `agent_turn_inputs.mensagem_id`); o que
+ * muda é QUAL turno, e ele muda uma vez só, sob o mutex.
+ *
+ * Efeito colateral BOM e deliberado: a projeção legada `processada_em` passa a
+ * ser carimbada quando o HEAD chega a terminal, e não quando o irmão é
+ * absorvido. É mais honesto — a mensagem do irmão só foi de fato processada
+ * quando a resposta da rajada saiu — e é o que impede o probe de divergência de
+ * #503 (`terminal_without_projection`) de acusar todo irmão absorvido.
+ *
+ * ─── Por que a absorção aqui NÃO passa por `transitionTurn` ───────────────
+ *
+ * Mesma razão de `promoteStreamSuccessor` e de `claimNextEligibleTurn`:
+ * `transitionTurn` é CAS sobre UMA linha conhecida, e aqui o conjunto só é
+ * conhecido depois de a borda ser calculada, dentro da transação. O par
+ * (from, to) continua sendo do contrato — `received -> superseded` e
+ * `queued -> superseded` são arestas de `TURN_TRANSITIONS`, e
+ * `tests/unit/runtime/stream-debounce-contract.spec.ts` falha se saírem.
+ *
+ * ─── `promoted_at` no head, e por que reusar a coluna da #627 ─────────────
+ *
+ * Fechar o batch É eleger quem avança. O sinal (o `enqueueAgent`) sai DEPOIS do
+ * commit, no caller — então existe a mesma janela de "commit feito, enqueue não
+ * feito" que a fatia D já resolve, e resolvê-la de novo com uma coluna própria
+ * seria uma segunda reconciliação com o mesmo modo de falha. Carimbando
+ * `promoted_at`, o varredor de `message-recovery` reconcilia o batch fechado e
+ * não sinalizado pelo caminho que já existe e já é medido
+ * (`maia_stream_promotion_total{result="recovered"}`).
+ */
+async function closeDueDebounceBatchTx(
+  tx: Executor,
+  args: { stream_key: string },
+): Promise<DebounceCloseResult> {
+  const { tenant_id, agent_id } = scope();
+  const escopo = escopoSql(tenant_id, agent_id);
+  const membros = {
+    tenant: escopo.tenant,
+    agent: escopo.agent,
+    stream_key: sql`${args.stream_key}`,
+  };
+
+  // 1. MUTEX DA STREAM.
+  const travado = await tx.execute<{ stream_key: string }>(
+    sql`${lockStreamForDebounce(membros)}`,
+  );
+  if (Array.from(travado.rows as unknown as unknown[]).length === 0) {
+    return { closed: false, reason: 'stream_locked' };
+  }
+
+  // 2. GC das janelas cujo turno morreu por outro caminho.
+  await tx.execute(sql`
+    UPDATE ${agent_turns} u
+       SET debounce_closed_at = now(),
+           updated_at = now()
+     WHERE u.tenant_id  = ${tenant_id}
+       AND u.agent_id   = ${agent_id}
+       AND u.stream_key = ${args.stream_key}
+       AND u.debounce_window_opened_at IS NOT NULL
+       AND u.debounce_closed_at IS NULL
+       AND u.status IN (${statusList(TERMINAL_TURN_STATUSES)})
+  `);
+
+  // 3. A BORDA.
+  type MembroRow = {
+    id: string;
+    status: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    first_ingress_seq: string | number;
+    last_ingress_seq: string | number;
+    state_version: string | number;
+    due: boolean;
+  };
+  const prefixo = await tx.execute<MembroRow>(sql`
+    WITH prefixo AS (${debounceBatchPrefix(membros)})
+    SELECT p.id, p.status, p.representative_message_id, p.conversa_id,
+           p.first_ingress_seq, p.last_ingress_seq, p.state_version,
+           ${debounceWindowDue(sql`p`)} AS due
+      FROM prefixo p
+     ORDER BY p.first_ingress_seq
+  `);
+  const membrosDoBatch = Array.from(prefixo.rows as unknown as MembroRow[]);
+  const head = membrosDoBatch[0];
+  if (!head) return { closed: false, reason: 'no_window' };
+
+  // 4. O RELÓGIO PERSISTENTE. `due` foi avaliado no banco; basta UM membro
+  // vencido — o prazo é o mesmo em todos, e exigir que fosse o head tornaria o
+  // fechamento refém de uma linha que pode ter perdido o carimbo.
+  if (!membrosDoBatch.some((m) => m.due === true)) {
+    return { closed: false, reason: 'not_due' };
+  }
+
+  const irmaos = membrosDoBatch.slice(1);
+  const ultimaSeq = membrosDoBatch.reduce(
+    (max, m) => Math.max(max, Number(m.last_ingress_seq)),
+    Number(head.last_ingress_seq),
+  );
+
+  // 5. O CAS DE FECHAMENTO.
+  const fechado = await tx.execute<{
+    id: string;
+    representative_message_id: string;
+    conversa_id: string | null;
+    status: string;
+  }>(sql`
+    UPDATE ${agent_turns} u
+       SET status              = 'queued',
+           queued_at           = COALESCE(u.queued_at, now()),
+           last_ingress_seq    = GREATEST(u.last_ingress_seq, ${ultimaSeq}),
+           debounce_closed_at  = now(),
+           debounce_batch_size = ${membrosDoBatch.length},
+           promoted_at         = now(),
+           next_attempt_at     = NULL,
+           state_version       = u.state_version
+                                 + CASE WHEN u.status = 'queued' THEN 0 ELSE 1 END,
+           updated_at          = now()
+     WHERE u.id            = ${head.id}::uuid
+       AND u.tenant_id     = ${tenant_id}
+       AND u.agent_id      = ${agent_id}
+       AND u.state_version = ${Number(head.state_version)}
+       AND u.debounce_closed_at IS NULL
+       AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+    RETURNING u.id, u.representative_message_id, u.conversa_id, u.status
+  `);
+  const headFechado = Array.from(
+    fechado.rows as unknown as Array<{
+      id: string;
+      representative_message_id: string;
+      conversa_id: string | null;
+      status: string;
+    }>,
+  )[0];
+  if (!headFechado) return { closed: false, reason: 'lost_race' };
+
+  // 6. A ABSORÇÃO DOS IRMÃOS + a re-ancoragem dos inputs.
+  const absorvidos: string[] = [];
+  const mensagensAbsorvidas: string[] = [];
+  if (irmaos.length > 0) {
+    const ids = sql.join(
+      irmaos.map((m) => sql`${m.id}::uuid`),
+      sql`, `,
+    );
+    const supersedidos = await tx.execute<{ id: string }>(sql`
+      UPDATE ${agent_turns} u
+         SET status                = 'superseded',
+             outcome               = 'merged_into_turn',
+             superseded_by_turn_id = ${headFechado.id}::uuid,
+             debounce_closed_at    = now(),
+             state_version         = u.state_version + 1,
+             updated_at            = now()
+       WHERE u.id IN (${ids})
+         AND u.tenant_id = ${tenant_id}
+         AND u.agent_id  = ${agent_id}
+         AND u.debounce_closed_at IS NULL
+         AND u.status NOT IN (${statusList(TERMINAL_TURN_STATUSES)})
+      RETURNING u.id
+    `);
+    absorvidos.push(
+      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map((r) => r.id),
+    );
+
+    if (absorvidos.length > 0) {
+      const absorvidosSql = sql.join(
+        absorvidos.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      );
+      // A ordem dentro do turno passa a ser a ordem CANÔNICA da stream
+      // (`mensagens.ingress_seq`), e não a de chegada do UPDATE. `+ 1` porque
+      // `ingress_seq = 0` é, por contrato, a mensagem representativa do head.
+      const repontados = await tx.execute<{ mensagem_id: string }>(sql`
+        UPDATE ${agent_turn_inputs} i
+           SET turn_id     = ${headFechado.id}::uuid,
+               ingress_seq = ordenados.ord
+          FROM (
+            SELECT ai.id,
+                   ROW_NUMBER() OVER (ORDER BY m.ingress_seq) AS ord
+              FROM ${agent_turn_inputs} ai
+              JOIN ${mensagens} m
+                ON  m.id        = ai.mensagem_id
+                AND m.tenant_id = ${tenant_id}
+                AND m.agent_id  = ${agent_id}
+             WHERE ai.tenant_id = ${tenant_id}
+               AND ai.agent_id  = ${agent_id}
+               AND ai.turn_id IN (${absorvidosSql})
+          ) AS ordenados
+         WHERE i.id        = ordenados.id
+           AND i.tenant_id = ${tenant_id}
+           AND i.agent_id  = ${agent_id}
+        RETURNING i.mensagem_id
+      `);
+      mensagensAbsorvidas.push(
+        ...Array.from(repontados.rows as unknown as Array<{ mensagem_id: string }>).map(
+          (r) => r.mensagem_id,
+        ),
+      );
+    }
+  }
+
+  return {
+    closed: true,
+    head: {
+      turn_id: headFechado.id,
+      representative_message_id: headFechado.representative_message_id,
+      conversa_id: headFechado.conversa_id,
+      status_before: head.status as TurnStatus,
+      status_after: headFechado.status as TurnStatus,
+    },
+    batch_size: membrosDoBatch.length,
+    absorbed_turn_ids: absorvidos,
+    absorbed_message_ids: mensagensAbsorvidas,
+  };
 }
 
 /** O escopo corrente como FRAGMENTOS, que é o que `stream-head-sql` consome. */
@@ -1783,6 +2864,14 @@ async function claimWithinStreamExclusion(
            attempt_count     = attempt_count + 1,
            state_version     = state_version + 1,
            next_attempt_at   = NULL,
+           -- #627 -- a divida do wake-up foi PAGA: alguem acordou e reivindicou.
+           -- promoted_at existe para dizer "este turno foi eleito para avancar e
+           -- ainda nao foi acordado"; deixa-lo preenchido depois do claim faria o
+           -- varredor contar como reconciliacao todo turno que a promocao
+           -- acordou com sucesso -- isto e, mediria o caminho FELIZ como se
+           -- fosse recuperacao de falha. Zerar aqui e o que torna
+           -- maia_stream_promotion_total{result="recovered"} um sinal.
+           promoted_at       = NULL,
            updated_at        = now()
      WHERE tenant_id = ${tenant_id}
        AND agent_id  = ${agent_id}
@@ -1795,8 +2884,24 @@ async function claimWithinStreamExclusion(
                AND lease_expires_at <= now())
        )
        AND ${condicaoHead}
+       -- #629 -- A CONVERSA ESTA INTERDITADA? Predicado INCONDICIONAL, sem flag:
+       -- uma linha ativa em agent_stream_blocks e uma decisao ja tomada e
+       -- auditada, e uma flag que a ignorasse faria a plataforma voltar a
+       -- executar um turno cuja conversa um humano interditou. O kill switch da
+       -- fatia e TURN_POISON_BLOCK_CATEGORIES= (vazio), que impede NOVOS
+       -- bloqueios de nascer -- nunca desrespeita os que existem.
+       AND ${streamNotPoisoned(escopo)}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
               claimed_by, claimed_at, lease_expires_at, state_version,
+              -- #629 -- a ESPERA deste turno, do relogio do BANCO. E o que
+              -- alimenta maia_stream_turn_wait_seconds, a serie de fairness que
+              -- a issue-mae pede. GREATEST(...,0) porque um relogio que ande
+              -- para tras produziria amostra negativa e a histograma cairia
+              -- toda no primeiro balde sem nenhum sinal de que algo esta errado.
+              GREATEST(
+                EXTRACT(EPOCH FROM (now() - COALESCE(queued_at, created_at))),
+                0
+              ) AS wait_seconds,
               ${canario} AS fifo_anteriores
   `);
   const row = (result.rows as unknown as Array<ClaimRow & { fifo_anteriores: number | string }>)[0];
@@ -1829,6 +2934,7 @@ async function claimWithinStreamExclusion(
       lease_expires_at: new Date(row.lease_expires_at),
       status: row.status as TurnStatus,
       state_version: Number(row.state_version),
+      wait_seconds: Number(row.wait_seconds),
     },
     ...trail,
   };
@@ -1854,7 +2960,7 @@ async function claimWithinStreamExclusion(
 async function explainClaimRejection(
   tx: Executor,
   args: { tenant_id: string; agent_id: string; turn_id: string; fifo: boolean },
-  trail: { recovered_stream_claims?: readonly string[] },
+  trail: { recovered_stream_claims?: readonly StreamClaimRecovery[] },
 ): Promise<ClaimResult> {
   const escopo = escopoSql(args.tenant_id, args.agent_id);
   const alvo = await tx
@@ -1872,6 +2978,41 @@ async function explainClaimRejection(
   if (!encontrado) {
     incCounter('maia_turn_claim_total', { result: 'not_found' });
     return { ok: false, reason: 'not_found', ...trail };
+  }
+
+  // #629 — A CONVERSA ESTÁ INTERDITADA? Verificado ANTES de tudo o mais, e a
+  // ordem é a leitura operacional: `not_head` diz "espere, a conversa anda
+  // sozinha" e é FALSO numa stream envenenada — ela não anda, nem sozinha nem
+  // com mais workers. Reportar `not_head` aqui mandaria o operador esperar por
+  // algo que nunca acontece, que é exatamente o erro que a #626 evitou ao
+  // separar `stream_blocked` de `not_head`, agora um degrau adiante.
+  //
+  // Custa uma consulta, e só no caminho que JÁ falhou — como o resto deste
+  // diagnóstico.
+  const interdito = await tx.execute<{ id: string; blocked_by_turn_id: string; reason: string }>(
+    streamPoisonProbe({ tenant: escopo.tenant, agent: escopo.agent, turn_id: args.turn_id }),
+  );
+  const bloqueio = (
+    interdito.rows as unknown as Array<{
+      id: string;
+      blocked_by_turn_id: string;
+      reason: string;
+    }>
+  )[0];
+  if (bloqueio) {
+    incCounter('maia_turn_claim_total', { result: 'stream_poisoned' });
+    recordStreamBlocked('stream_poisoned');
+    return {
+      ok: false,
+      reason: 'stream_poisoned',
+      // `head_block` carrega QUEM envenenou — o turno que foi para
+      // `dead_letter` —, não um turno anterior vivo. O campo é o mesmo porque
+      // a pergunta do operador é a mesma ("quem está segurando esta
+      // conversa?"), e o `status` responde a diferença: um bloqueador
+      // `dead_letter` só pode ter vindo daqui.
+      head_block: { turn_id: bloqueio.blocked_by_turn_id, status: 'dead_letter' },
+      ...trail,
+    };
   }
 
   // Um turno TERMINAL nunca é `not_head`, ainda que a conversa tenha fila: a
@@ -2101,6 +3242,19 @@ async function runTransition(args: {
   expected_claim_token?: string;
   absorber_fence?: { turn_id: string; claim_token: string };
   patch: TurnTransitionPatch;
+  /**
+   * #629 — quando presente E a transição é `dead_letter`, a stream é BLOQUEADA
+   * na mesma transação. A DECISÃO não é tomada aqui: ela chega pronta de
+   * `deadLetterTurn` (`src/runtime/turns/lifecycle.ts`), onde a configuração
+   * mora. O repositório continua puro-DB — ele executa a política, nunca a lê.
+   */
+  block_stream?: { category: string; reason: string };
+  /**
+   * #629 — quando `true`, o UPDATE só casa se a ordem da conversa AINDA não
+   * foi comprometida por um turno posterior já terminal. Usado pelo replay
+   * manual, que é a única escrita que pode ressuscitar um turno antigo.
+   */
+  guard_committed_order?: boolean;
 }): Promise<TurnTransitionResult> {
   // O fence desta gravação, numa forma só. `turnWriteConditions` é a fonte
   // ÚNICA do `WHERE` — nada é acrescentado a ele depois desta chamada, e é o
@@ -2147,6 +3301,8 @@ async function runTransitionTx(
     expected_claim_token?: string;
     absorber_fence?: { turn_id: string; claim_token: string };
     patch: TurnTransitionPatch;
+    block_stream?: { category: string; reason: string };
+    guard_committed_order?: boolean;
   },
   fence: TurnWriteFence,
 ): Promise<TurnTransitionResult> {
@@ -2201,6 +3357,14 @@ async function runTransitionTx(
               : {}),
             fence,
           }),
+          // #629 — A ORDEM JÁ COMPROMETIDA, no `WHERE` e não numa consulta
+          // anterior. É o que torna a garantia ATÔMICA: entre um `SELECT count`
+          // e este `UPDATE`, um sucessor pode concluir — e o replay
+          // atravessaria a ordem tendo acabado de verificar que não a
+          // atravessaria. Aqui não há vão.
+          ...(args.guard_committed_order === true
+            ? [committedOrderNotBroken(escopoSql(tenant_id, agent_id))]
+            : []),
         ),
       )
       .returning();
@@ -2231,6 +3395,34 @@ async function runTransitionTx(
         .limit(1);
       const row = current[0];
       if (!row) return { ok: false as const, conflict: 'not_found' as const, to: args.to };
+      // #629 — o guarda de ORDEM COMPROMETIDA é classificado ANTES do fence e
+      // do `state_mismatch`, e a ordem é a leitura operacional: um replay
+      // recusado por ordem comprometida NÃO deve ser retentado (a recusa é
+      // permanente até alguém decidir reconciliar), enquanto `state_mismatch`
+      // convida a reler e tentar de novo. Dar o código errado aqui mandaria um
+      // operador insistir contra uma recusa que nunca vai ceder.
+      if (args.guard_committed_order === true) {
+        const posteriores = await tx
+          .select({ n: committedOrderAfterCount(escopoSql(tenant_id, agent_id)) })
+          .from(agent_turns)
+          .where(
+            and(
+              eq(agent_turns.tenant_id, tenant_id),
+              eq(agent_turns.agent_id, agent_id),
+              eq(agent_turns.id, args.turn_id),
+            ),
+          )
+          .limit(1);
+        const committed_after = Number(posteriores[0]?.n ?? 0);
+        if (committed_after > 0) {
+          return {
+            ok: false as const,
+            conflict: 'order_committed' as const,
+            to: args.to,
+            committed_after,
+          };
+        }
+      }
       // Classificação do conflito. A ordem importa: quando havia fence e ele
       // não bate, a causa é a PERDA DE POSSE — mesmo que o status também tenha
       // andado. Reportar `state_mismatch` aqui faria o caller reler e tentar de
@@ -2325,6 +3517,57 @@ async function runTransitionTx(
         );
     }
 
+    // #627 (fatia D) — A PROMOÇÃO DO SUCESSOR, na MESMA transação do CAS
+    // terminal. Depois desta linha a decisão está tomada e comitará junto com a
+    // conclusão; quem sinaliza a BullMQ é `src/runtime/turns/stream-promotion.ts`,
+    // com o objeto devolvido aqui, DEPOIS do commit.
+    //
+    // Só transições TERMINAIS promovem: um turno que vai para `running` ou
+    // `retryable` continua ocupando a posição na fila da conversa, e promover
+    // ali seria exatamente a ultrapassagem que a issue-mãe proíbe.
+    //
+    // O fence do predecessor já foi cobrado pelo `WHERE` do UPDATE acima — se a
+    // tentativa fosse stale, o CAS teria devolvido zero linhas e não estaríamos
+    // aqui. É assim que "uma tentativa stale não pode liberar o sucessor" deixa
+    // de depender de uma verificação a mais para depender da estrutura.
+    // #629 (fatia F) — O BLOQUEIO DA STREAM, **ANTES** DA PROMOÇÃO E NA MESMA
+    // TRANSAÇÃO.
+    //
+    // A ordem entre estas duas escritas é a fatia inteira, e ela não é
+    // convencional: a eleição da promoção carrega `streamNotPoisoned` no
+    // `WHERE`, então inserir o bloqueio primeiro faz a promoção VER o bloqueio
+    // que a própria conclusão acabou de criar e devolver `null`. Inverter as
+    // duas produziria o pior estado possível — a conversa bloqueada E o
+    // sucessor acordado — e o defeito seria invisível: o job do sucessor
+    // acordaria, o claim o recusaria com `stream_poisoned`, e o único sintoma
+    // seria um `promoted` que não corresponde a fila nenhuma.
+    //
+    // Na MESMA transação porque as duas escritas são um átomo semântico: "este
+    // turno morreu E esta conversa está interditada". Um commit com a primeira
+    // sem a segunda é a falha nº 5 da issue-mãe pela porta dos fundos — o
+    // sucessor vira head de uma conversa que a política mandou parar, e nenhum
+    // varredor conserta isso porque, do ponto de vista de todo mundo, nada
+    // falhou.
+    const stream_block =
+      terminal && args.to === 'dead_letter' && args.block_stream
+        ? await blockStreamForPoison(tx, {
+            tenant_id,
+            agent_id,
+            turn,
+            category: args.block_stream.category,
+            reason: args.block_stream.reason,
+          })
+        : null;
+
+    const promotion =
+      terminal && promotionEnabled()
+        ? await promoteStreamSuccessor(tx, {
+            tenant_id,
+            agent_id,
+            predecessor_turn_id: args.turn_id,
+          })
+        : null;
+
     incCounter('maia_turn_transitions_total', {
       from: args.sources.length === 1 ? args.sources[0]! : 'any',
       to: args.to,
@@ -2335,8 +3578,71 @@ async function runTransitionTx(
       turn,
       from: (args.sources.length === 1 ? args.sources[0]! : 'any') as TurnStatus,
       to: args.to,
+      ...(promotion ? { promotion } : {}),
+      ...(stream_block ? { stream_block } : {}),
     };
   });
+}
+
+/**
+ * #629 — grava o BLOQUEIO da stream, dentro da transação do CAS terminal.
+ *
+ * ─── `ON CONFLICT DO NOTHING`, e o que ele significa ─────────────────────
+ *
+ * O índice único parcial `agent_stream_blocks_active_uq` (migration 133) admite
+ * no máximo uma linha ATIVA por `(tenant, agent, stream_key)`. Duas conclusões
+ * terminais da mesma stream — o head e um irmão absorvido que também esgotou —
+ * produzem UMA linha e um no-op, e o no-op devolve `null`: a segunda conclusão
+ * não teve um bloqueio a relatar porque a conversa JÁ estava interditada.
+ *
+ * `null` aqui, portanto, não é falha. É "não havia nada de novo a declarar", e
+ * é por isso que o caller (`deadLetterTurn`) só audita quando há objeto — uma
+ * segunda `audit_log` de bloqueio para a mesma interdição faria o operador
+ * procurar dois incidentes onde há um.
+ *
+ * ─── Turno SEM `stream_key` ──────────────────────────────────────────────
+ *
+ * Devolve `null` sem escrever. Um turno anterior ao protocolo (migration 120:
+ * "NULL = turno anterior ao protocolo, sem backfill") não pertence a conversa
+ * nenhuma; inventar uma `stream_key` para poder bloqueá-la criaria a stream
+ * genérica que a issue-mãe proíbe (§Falhas nº 8), e o CHECK de escopo da
+ * própria tabela recusaria o único valor que se poderia inventar.
+ */
+async function blockStreamForPoison(
+  tx: Executor,
+  args: {
+    tenant_id: string;
+    agent_id: string;
+    turn: AgentTurn;
+    category: string;
+    reason: string;
+  },
+): Promise<StreamBlockRecord | null> {
+  const stream_key = args.turn.stream_key;
+  if (!stream_key) return null;
+  const inserted = await tx
+    .insert(agent_stream_blocks)
+    .values({
+      tenant_id: args.tenant_id,
+      agent_id: args.agent_id,
+      stream_key,
+      reason: args.reason,
+      category: args.category,
+      blocked_by_turn_id: args.turn.id,
+      error_code: args.turn.last_error_code ?? null,
+    })
+    .onConflictDoNothing()
+    .returning({ id: agent_stream_blocks.id });
+  const row = inserted[0];
+  if (!row) return null;
+  return {
+    block_id: row.id,
+    category: args.category,
+    reason: args.reason,
+    blocked_turn_id: args.turn.id,
+    conversa_id: args.turn.conversa_id,
+    error_code: args.turn.last_error_code ?? null,
+  };
 }
 
 function recoveryReasonFor(turn: AgentTurn): TurnRecoveryReason {

@@ -276,6 +276,78 @@ export const AUDIT_ACTIONS = [
   // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
   'turn_stream_blocked',
   'turn_stream_fifo_violation',
+  // Issue #627 (fatia D da #505) — PROMOÇÃO do sucessor. Duas rows, e elas
+  // respondem às duas perguntas que um incidente de ordem faz:
+  //   - `turn_promoted`: a plataforma DECIDIU que este turno é quem avança, e
+  //     sinalizou a fila. É a ação `stream.turn_promoted` da auditoria mínima da
+  //     issue-mãe. Ela existe porque a decisão vive no BANCO e o sinal vive no
+  //     Redis: sem a row, um job que aparece na fila não tem procedência, e
+  //     "quem mandou este turno rodar?" só teria como resposta uma inferência.
+  //     `metadata.source` separa os três produtores — conclusão terminal do
+  //     predecessor, recuperação de claim expirado da stream, e reconciliação
+  //     do varredor —, que têm leituras operacionais diferentes: o primeiro é
+  //     rotina, o segundo diz que um worker morreu, o terceiro diz que um sinal
+  //     se perdeu. `metadata.promoted_by_turn_id` reconstrói a fila sem
+  //     recorrer à `stream_key`.
+  //   - `turn_promotion_rejected`: uma tentativa STALE tentou concluir o turno
+  //     e, com isso, liberar o sucessor — e foi recusada pelo fence. É a falha
+  //     nº 9 da issue-mãe ("takeover após lease expirado permite ao worker
+  //     antigo liberar o sucessor") registrada no momento em que ela NÃO
+  //     acontece. Sem a row, um zumbi barrado e uma stream sem sucessor
+  //     produziriam o mesmo silêncio.
+  // Nenhuma das duas carrega `stream_key`, texto, prompt, telefone ou JID.
+  'turn_promoted',
+  'turn_promotion_rejected',
+  // Issue #628 (fatia E da #505) — DEBOUNCE TRANSACIONAL. UMA row, e ela é a
+  // ação `stream.batch_closed` que a issue-mãe pede na auditoria mínima:
+  //   - `stream_batch_closed`: a plataforma FECHOU um batch de debounce — isto
+  //     é, decidiu que este conjunto de mensagens vira UMA rodada e que o head
+  //     é quem a executa. Vira audit, e não só log, porque é a decisão que
+  //     explica a resposta que o usuário recebeu: "por que a Maia respondeu
+  //     três mensagens minhas de uma vez?" e "por que ela NÃO agrupou a quarta?"
+  //     são perguntas de suporte, e a resposta é esta row.
+  //     `metadata.batch_size` e `metadata.absorbed_turn_ids` reconstroem a
+  //     composição mesmo depois de a retenção levar os turnos `superseded`;
+  //     `metadata.first_ingress_seq`/`last_ingress_seq` reconstroem a FRONTEIRA,
+  //     que é o que a issue-mãe manda ser reconstruível. Não carrega
+  //     `stream_key`, texto, prompt, telefone nem JID.
+  // As RECUSAS de fechamento (`not_due`, `stream_locked`, …) NÃO entram: são
+  // rotina do protocolo — dezenas por minuto —, não decisões governáveis, e
+  // vivem em `maia_stream_debounce_close_total{result}`.
+  'stream_batch_closed',
+  // Issue #629 (fatia F da #505) — POISON, DLQ e REPLAY. Quatro rows, e cada
+  // uma existe porque a issue-mãe nomeia a ação na sua auditoria mínima
+  // (`stream.poison_dead_lettered`, `stream.blocked`, `stream.unblocked`,
+  // `stream.manual_replay_requested`) e porque, sem ela, uma DECISÃO da
+  // plataforma seria indistinguível de um efeito colateral:
+  //   - `stream_poisoned`: a política de poison DECIDIU interditar a conversa
+  //     em vez de liberá-la. É a linha que separa "esta conversa parou porque
+  //     a política manda parar depois de um efeito irreversível pela metade"
+  //     de "esta conversa parou". `metadata.category` traz a categoria de erro
+  //     que decidiu, `metadata.disposition` a saída escolhida e
+  //     `metadata.blocked_by_turn_id` o turno envenenado — é o conjunto que
+  //     permite reconstruir a decisão sem recorrer à `stream_key`.
+  //   - `stream_unblocked`: um OPERADOR desfez a interdição. Sem ela, uma
+  //     conversa que volta a andar não tem autor: `unblocked_by` mora na
+  //     tabela, mas a `audit_log` é onde as decisões humanas da plataforma
+  //     são procuradas. `metadata.actor` e `metadata.reason` são obrigatórios
+  //     no caminho de código E no CHECK da migration 133.
+  //   - `turn_replay_refused`: um replay manual foi RECUSADO porque a ordem da
+  //     conversa já estava comprometida — existe turno POSTERIOR já terminal.
+  //     É a cláusula "um rearmamento manual não pode violar a ordem já
+  //     comprometida" registrada no momento em que ela é HONRADA. Sem a row, a
+  //     recusa seria um exit code que ninguém guarda, e a pergunta "por que
+  //     este turno nunca voltou?" não teria resposta durável.
+  //   - `turn_replay_reconciled`: o operador ATRAVESSOU a recusa acima, em modo
+  //     de reconciliação explícito. É a row mais importante das quatro: ela é a
+  //     única evidência de que a plataforma processou algo FORA da ordem
+  //     comprometida, e o `metadata.committed_after` diz quantos turnos
+  //     posteriores já haviam terminado quando isso foi autorizado.
+  // Nenhuma das quatro carrega `stream_key`, texto, prompt, telefone ou JID.
+  'stream_poisoned',
+  'stream_unblocked',
+  'turn_replay_refused',
+  'turn_replay_reconciled',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
@@ -318,6 +390,13 @@ export const AUDIT_ACTIONS = [
   'outbound_sent_document',
   'outbound_sent_voice',
   'outbound_dispatch_failed',
+  /**
+   * Issue #631 — a INTENÇÃO de resposta foi comprometida no outbox durável, na
+   * MESMA transação que moveu o turno para `outbound_pending`. É o
+   * `outbound.created` de #506 §Auditoria mínima, e é gravado por `auditTx`:
+   * se esta linha não entrar, a transação inteira reverte e NADA é enviado.
+   */
+  'outbound_committed',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',

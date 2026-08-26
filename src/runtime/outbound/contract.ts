@@ -727,3 +727,40 @@ export function buildOutboundArtifact(input: {
     provider_idempotency_key: keys.provider_idempotency_key,
   };
 }
+
+// =====================================================================
+// 7. PONTE COM A COLUNA LEGADA `channel` (#631)
+// =====================================================================
+
+/**
+ * Issue #631 — o valor da coluna LEGADA `outbound_messages.channel` para cada
+ * `payload_type`.
+ *
+ * As duas colunas convivem de propósito e medem coisas diferentes:
+ * `payload_type` é o discriminante da união (o eixo NOVO e autoritativo);
+ * `channel` é a PRIMITIVA de saída que a 063 registrava, ainda coberta pelo
+ * CHECK `outbound_messages_channel_check` — que a 121 estendeu exatamente para
+ * que reação e fallback fossem expressáveis quando esta fatia chegasse.
+ *
+ * A tradução mora aqui, e não num objeto literal dentro do repositório, por
+ * dois motivos: `satisfies Record<OutboundPayloadType, …>` torna um tipo novo
+ * sem canal um ERRO DE COMPILAÇÃO (e não uma row recusada em produção pelo
+ * CHECK, tarde demais), e o vocabulário dos dois lados fica num arquivo só —
+ * que é onde o teste de contrato consegue compará-los.
+ */
+export const OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE = {
+  text: 'text',
+  audio: 'voice',
+  document: 'document',
+  reaction: 'reaction',
+  interactive_poll: 'poll',
+  status_fallback: 'status_fallback',
+} as const satisfies Record<OutboundPayloadType, string>;
+
+export type OutboundLegacyChannel =
+  (typeof OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE)[OutboundPayloadType];
+
+/** O `channel` legado de um `payload_type`. Total por construção. */
+export function legacyChannelFor(type: OutboundPayloadType): OutboundLegacyChannel {
+  return OUTBOUND_LEGACY_CHANNEL_BY_PAYLOAD_TYPE[type];
+}

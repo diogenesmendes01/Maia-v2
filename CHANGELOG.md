@@ -65,6 +65,378 @@ true`.
 `tests/unit/ci/admin-ui-e2e-gate.spec.ts` passa a conferir esse piso contra a
 contagem de casos das specs fora da quarentena — um piso que não acompanha a
 suíte deixaria apagar as jornadas do checkout sem ficar vermelho.
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a resposta do turno é COMMITADA antes de chegar ao canal ([#631](https://github.com/diogenesmendes01/Maia-v2/issues/631), fatia B de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** até este release, uma falha do banco no caminho de
+> saída era **absorvida** e a mensagem seguia para o WhatsApp assim mesmo. A
+> partir daqui ela **impede o envio**. Se o PostgreSQL estiver indisponível no
+> instante da resposta, o usuário deixa de receber — e o turno vai para
+> `retryable`/`not_sent`, que é recuperável. Isso é uma troca deliberada de
+> *liveness* por *durabilidade*, e é o inverso da política anterior, que estava
+> escrita no código como *"liveness > strict dedupe"*.
+>
+> A série a observar é `maia_outbound_commit_rejected_total{reason}` (nova). A
+> distância entre ela e `maia_outbound_committed_total` é o custo real da troca.
+>
+> **A flag `FEATURE_OUTBOUND_DURABLE_COMMIT` (default ON) é a alavanca de
+> rollback — e ela NÃO pode ser desligada em `production`: o boot é RECUSADO.**
+> Em staging avisa; em development é silencioso. Uma garantia de durabilidade
+> que pode ser desligada em produção não é um kill switch, é o caminho
+> fail-open com outro nome.
+
+**O PORQUÊ.** A auditoria da #506 nomeou dois defeitos no mesmo arquivo,
+`src/agent/output-dispatch.ts`: o ledger tratado em caminho **opcional e
+fail-open** (`claimOutboundLedgerOrFailOpen`, cujo próprio comentário dizia
+*"log the issue and proceed as if there's no prior row"*), e uma sequência em
+que **enviar e persistir ficavam separados por uma janela de crash**. Os dois
+produzem a mesma consequência, e ela é a pior que um sistema de mensagens pode
+ter: existe estado do mundo — uma mensagem no telefone de alguém — que o banco
+nunca soube que ia existir. Nenhum retry, nenhuma reconciliação e nenhuma
+auditoria conseguem raciocinar sobre um efeito que não foi declarado antes de
+acontecer.
+
+Agora a ordem de **todo** ramo de saída é fixa, e "antes" é literal — entre o
+commit e a chamada ao canal não existe nenhum `await`:
+
+```
+assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT durável  →  canal
+```
+
+O commit é **uma** transação (`src/db/repositories/outbound-outbox-repo.ts::commitTurnOutboundTx`)
+que, na MESMA conexão: valida que o worker ainda possui o `claim_token` do turno
+(fence + lease viva + CAS por `state_version`), insere o artefato determinístico
+de #630 com a `logical_dedupe_key`, transiciona o turno para `outbound_pending`,
+liga `agent_turns.outbound_message_id` e grava a auditoria `outbound_committed`
+por `auditTx` — que, ao contrário de `audit()`, **não engole erro**. Qualquer
+falha faz ROLLBACK e **lança**.
+
+Decisões que parecem detalhe e não são:
+
+- **`agentTurnsRepo.markOutboundCommittedTx` NÃO é usada aqui.** Ela abre a
+  própria transação (`runTransition` chama `withTx`), então o UPDATE do turno
+  sairia por uma conexão e o INSERT do outbox por outra: dois commits
+  independentes, e exatamente a janela de crash que esta fatia fecha. O `WHERE`
+  do fence, porém, não é reescrito — vem de `turnWriteConditions()`
+  (`src/db/repositories/turn-fence-sql.ts`), a mesma fonte ÚNICA de
+  `runTransition`. Apagar a condição de lease de lá deixa a produção insegura
+  nos dois caminhos ao mesmo tempo, que é a única relação que faz um predicado
+  compartilhado valer alguma coisa.
+- **`sequence_in_turn` é determinística por call site, nunca "a próxima
+  livre".** A posição entra no material da chave: alocá-la dinamicamente faria
+  o retry da MESMA resposta derivar outra `logical_dedupe_key` e nascer como
+  uma SEGUNDA linha — o duplo envio criado pelo mecanismo que existe para
+  impedi-lo.
+- **O escopo do turno guarda o `TurnHandle` por REFERÊNCIA**
+  (`src/runtime/outbound/turn-scope.ts`, AsyncLocalStorage aberto em
+  `src/agent/core.ts` junto de `runWithTurnExecution`). `concludeTurn` grava com
+  `expected_version: handle.state_version`; guardar uma cópia congelada faria o
+  CAS seguinte usar a versão anterior ao commit, ser recusado como
+  `state_mismatch`, e o turno ficaria preso em `outbound_pending` — resposta
+  entregue, turno eternamente aberto. Era a consequência silenciosa mais
+  provável da fatia.
+- **Enqueue é wake-up, não fonte de verdade.** No instante do commit a linha já
+  está `pending` com `next_attempt_at = now()`, ou seja, já satisfaz o predicado
+  de `idx_outbound_messages_ready` (migração 121). Um crash entre o commit e o
+  enqueue deixa trabalho visível **sem que nada consulte a BullMQ**.
+
+**Exceção declarada, não esquecida:** o ramo de **voz** não commita artefato
+durável. O payload `audio` exige um `MediaRef` (`local_path`/`storage_object`) e
+`synthesizeSpeech` devolve um Buffer **em memória** — não há arquivo nem objeto
+a referenciar, e inventar um seria criar artefato temporário novo dentro de uma
+fatia cujo escopo é o commit. `FEATURE_OUTBOUND_VOICE` tem default `false`, ou
+seja, não é caminho de produção hoje; decidir onde o áudio sintetizado passa a
+MORAR é #634. O ramo de **documento** commita com `local_path`, válido enquanto
+quem entrega é o mesmo processo — a migração para `storage_object` é da mesma
+fatia.
+
+**Provisório e declarado como tal:** `recordCommittedDelivery` fecha a linha com
+o desfecho normalizado da tentativa feita por este processo. Enquanto o delivery
+worker de #632 não existe, quem entrega é quem commitou, e sem isso TODA linha
+entregue ficaria `pending` para sempre — de modo que a #632, ao subir, varreria
+e **reenviaria** mensagens já recebidas. Ele nunca lança: quando roda, o efeito
+externo já ocorreu, e uma exceção ali só trocaria uma linha desatualizada por um
+turno abortado.
+
+**A evidência.** `tests/integration/outbound-commit-transacional-real-db.spec.ts`
+entra por `dispatchOutput`/`sendOutbound` — as funções que o ReAct, as skills e
+os fallbacks chamam — contra Postgres real; o único mock é a saída física do
+canal, e ele **não é passivo**: consulta o banco por uma conexão própria NO
+INSTANTE do envio e registra o que estava commitado ali. É isso que transforma
+"nada vai ao canal antes do banco" numa afirmação verificável em vez de uma
+inspeção de ordem de linhas. Reintroduzindo o defeito no call site REAL, um de
+cada vez:
+
+- **mover `line.sendText` para ANTES do commit** → 9 de 12 casos vermelhos, com
+  a foto do instante do envio virando `{ linhasOutbound: 0, statusDoTurno:
+  "running" }` (esperado `{ 1, "outbound_pending" }`);
+- **trocar o `throw` de `commitOutboundOrRefuse` por um retorno fail-open** → 6
+  vermelhos, todos na forma `expected "vi.fn()" to not be called at all, but
+  actually been called 1 times` — ou seja, o canal volta a ser chamado com o
+  banco recusando;
+- **remover `expected_claim_token` da chamada a `commitTurnOutboundTx`** → o
+  caso do worker sem posse fica vermelho: um zumbi consegue commitar resposta;
+- **tirar o INSERT do outbox de dentro do `withTx` do turno** → o caso de
+  rollback fica vermelho, com o turno em `outbound_pending` e uma linha parcial
+  sobrando.
+
+`tests/unit/config/outbound-durable-commit-rule.spec.ts` trava a flag: default
+ON, `false` em production é ERRO de escopo `boot` (logo sobrevive a
+`MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e
+ligada sem `FEATURE_TURN_STATE_MACHINE` é inerte — e inerte é erro.
+### Poison/DLQ com escolha explícita, replay que respeita a ordem, e fairness medida ([#629](https://github.com/diogenesmendes01/Maia-v2/issues/629), fatia F de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 8 de 9 — **fecha a épica**)
+
+> **AÇÃO DO OPERADOR: aplique a migration `133` ANTES de subir o código.** Ela é
+> atômica (tabela NOVA e vazia, sem `CONCURRENTLY`, num envelope
+> `BEGIN`/`COMMIT`), então **não** está exposta à armadilha do índice inválido
+> que devolve sucesso na reaplicação. Subir o código antes quebra a conclusão de
+> todo turno envenenado da categoria bloqueante: o INSERT da interdição
+> referencia a tabela, e a falha cai DENTRO da transação do CAS terminal — o
+> turno nem morre.
+
+**O problema.** Até aqui, `dead_letter` liberava a conversa. Não por decisão: por
+OMISSÃO. `dead_letter` é terminal, um turno terminal sai do predicado de
+head-of-line (#626), logo o sucessor virava reivindicável — sem que ninguém
+tivesse escolhido isso. A issue-mãe chama exatamente essa situação de falha nº 5
+e exige que a política escolha **conscientemente** entre duas saídas defensáveis
+e incompatíveis: liberar preserva disponibilidade às custas da semântica (a
+plataforma responde M2 sem nunca ter respondido M1); bloquear preserva a
+semântica às custas da conversa (nada anda até um humano olhar).
+
+**A escolha, por categoria de erro.** `src/runtime/turns/poison-policy.ts` (puro,
+sem I/O) classifica `(código, outcome)` em seis categorias de cardinalidade
+fechada — `effect_committed`, `model`, `transport`, `infrastructure`, `operator`,
+`unknown` — e `TURN_POISON_BLOCK_CATEGORIES` diz quais BLOQUEIAM. O `outcome`
+domina o código: `unsafe_to_retry` é produzido por `decideTurnAction` exatamente
+quando uma tool irreversível já rodou, e é evidência de primeira ordem; o código
+que o acompanha (`reasoner_failed`, `outbound_failure`) é sintoma.
+
+**Default: `effect_committed`, e só ele.** É a única categoria em que a conversa
+já está semanticamente quebrada ANTES de a política decidir. As outras têm causa
+COMPARTILHADA e transitória — um incidente de LLM ou de rede que bloqueasse
+pararia milhares de conversas de uma vez, com desbloqueio manual uma a uma. Uma
+categoria com erro de digitação **reprova o boot**, porque silenciá-la produziria
+um dashboard sem bloqueio nenhum e a leitura natural seria "não aconteceu nenhum
+caso" em vez de "a política está desligada".
+
+**A interdição é uma linha do PostgreSQL.** `agent_stream_blocks` (migration
+`133`), uma linha ATIVA por `(tenant, agent, stream_key)` garantida por índice
+único parcial. Ela é gravada na MESMA transação do CAS terminal e **antes** da
+eleição da promoção — a ordem é a fatia inteira: a eleição carrega
+`streamNotPoisoned`, então a promoção vê a interdição que a própria conclusão
+acabou de criar. Invertê-las produziria conversa bloqueada E sucessor acordado, e
+o defeito seria invisível.
+
+**A saída existe no mesmo commit.** `npm run dlq -- blocks` lista as conversas
+interditadas com o backlog de cada uma; `npm run dlq -- unblock-stream <turn_id>
+--reason "..."` desfaz, audita e re-arma o head. O turno envenenado **continua
+morto**, de propósito: desbloquear e ressuscitar são decisões diferentes, e
+fundi-las faria a segunda acontecer por acidente.
+
+**Replay manual não viola mais a ordem comprometida.** `replay-turn` recusa
+quando existe turno POSTERIOR da mesma stream já terminal — a plataforma já
+respondeu algo que veio depois. O guarda mora no `WHERE` do `UPDATE`, não numa
+consulta anterior: entre um `SELECT count` e o `UPDATE` um sucessor pode
+concluir. A saída é `--reconcile`, o "modo de replay/reconciliação explícito" da
+issue-mãe, auditado com row própria (`turn_replay_reconciled`).
+
+**Fairness e starvation, medidos pela primeira vez.** Nenhuma fatia da #505 os
+mediu: a #626 provou paralelismo, que é outra pergunta — um escalonador pode ter
+doze conversas rodando e ainda assim deixar a décima terceira parada para
+sempre. Entram `maia_stream_head_age_seconds` (+ p95), `maia_stream_turn_wait_seconds`
+(histograma, baldes em SEGUNDOS com cortes nos marcos reais do sistema),
+`maia_stream_active_total`, `maia_stream_live_total`, `maia_stream_backlog_max`,
+`maia_stream_starvation_total` e `maia_stream_poisoned_streams` — as três
+primeiras pedidas por nome pela issue-mãe desde o primeiro dia. Nenhuma carrega
+`stream_key`, `turn_id`, tenant ou o código de erro cru como label.
+
+`starvation_total` conta EPISÓDIOS, não amostras: um contador incrementado a
+cada coleta mediria a frequência do Prometheus. A deduplicação é por token opaco
+(`md5(tenant:agent:stream_key)`) em memória — o token nunca vira label nem log.
+
+**A medição, contra PostgreSQL real.** Com 4 vagas, 25 turnos numa conversa
+quente e 20 conversas de um turno, e os 25 jobs da quente entrando ANTES (o pior
+caso), as pequenas terminam com mediana de posição **11 de 45** — sem fairness
+sairiam todas depois do turno 25. E com o head de uma conversa segurado por um
+worker vivo durante toda a rodada, as outras **30 terminam inteiras**.
+
+**Limite de backlog: MEDIDO, não APLICADO.** `maia_stream_backlog_max` entrega o
+número; o limite não é aplicado porque a única pressão possível no ingresso seria
+RECUSAR mensagem de usuário do WhatsApp — perda de dado, contra um backlog que na
+prática o próprio usuário limita.
+
+**Kill switch:** `TURN_POISON_BLOCK_CATEGORIES=` (lista vazia) + restart. Nenhum
+bloqueio NOVO nasce e a conclusão volta ao comportamento da #627. Ela **não**
+desfaz interdições existentes — quem as desfaz é o comando auditado. É
+deliberado: uma conversa que um humano interditou não volta a andar porque
+alguém mexeu numa variável de ambiente.
+
+Runbook: [`docs/runbooks/turn-state-machine.md` §14](docs/runbooks/turn-state-machine.md).
+
+### Debounce transacional: a janela sai da memória e vira uma linha ([#628](https://github.com/diogenesmendes01/Maia-v2/issues/628), fatia E de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 7 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `130` ANTES de subir o código.** Ela
+> **não é atômica** — usa `CREATE INDEX CONCURRENTLY`, portanto
+> `maia:no-transaction`, e o runner autocommita por statement. Se o índice
+> falhar, as colunas ficam: estado correto, só lento, e reaplicar conserta.
+> **Confira `pg_index.indisvalid` à mão** depois de aplicar (a armadilha do
+> `CONCURRENTLY` que devolve sucesso com o índice inválido — runbook §10.4).
+> Subir o código antes da migration quebra todo ingresso de texto: a janela é
+> aberta dentro da transação que persiste a mensagem.
+
+**O problema.** A janela do debounce vivia em dois lugares que não são o banco:
+um job atrasado da BullMQ (o prazo no `delay`) e uma chave no Redis (o
+`first_enqueued_at`). Duas consequências, as duas nomeadas pela issue:
+
+* com N réplicas, duas podiam fechar **o mesmo batch — ou batches sobrepostos**,
+  porque não havia um ponto único onde "este batch fechou" pudesse ser afirmado
+  uma vez só. O sintoma é duas respostas para a mesma rajada, ou uma resposta que
+  ignora metade das mensagens; nenhuma linha do banco fica inconsistente;
+* um **reinício** entre o `agentQueue.add` e o disparo perdia a janela inteira.
+  As mensagens não se perdiam — o recovery por estado as rearmava —, mas saíam
+  como N turnos separados, até 2 minutos depois.
+
+**A janela como dado.** `agent_turns.debounce_window_opened_at` (âncora do teto,
+persistida), `debounce_deadline_at` (o prazo), `debounce_closed_at` (o
+fechamento) e `debounce_batch_size` (a evidência forense da composição). Ela é
+**aberta na MESMA transação que persiste o ingresso** e estendida na MESMA
+transação do ingresso seguinte: quando o commit acontece, a mensagem, o turno e o
+prazo em que a rajada dela pode fechar passam a existir juntos, ou nenhum existe.
+
+**O relógio é o do PostgreSQL.** Fechar exige `debounce_deadline_at <= now()`
+avaliado no banco, nunca um `Date.now()` de réplica — o mesmo raciocínio de
+`lease_expires_at > now()` no fence do claim (#504): existe um relógio só. O teto
+(`MESSAGE_DEBOUNCE_MAX_MS`) é ancorado no instante **persistido** da abertura, e é
+o que o faz sobreviver ao reinício do processo que abriu a janela.
+
+**A BORDA — o risco que a issue-mãe declarava.** *"Debounce distribuído é
+suscetível a bordas temporais mal definidas."* A borda escolhida está escrita em
+`src/db/repositories/stream-debounce-sql.ts`, e é de **serialização**, não de
+relógio: o mutex da stream é a linha de `agent_stream_sequences` — a MESMA que a
+alocação de `ingress_seq` já tranca —, então **um ingresso que comita antes de o
+fechador pegar o mutex entra no batch atual; um que comita depois entra no
+próximo.** Não existe instante em que o fechador enxergue a sequência 7 sem a 6:
+a lacuna que a issue proíbe absorver silenciosamente é **impossível**, e não
+apenas improvável.
+
+E o batch é um **prefixo contíguo**, nunca um conjunto esparso: mídia no meio da
+rajada não é membro, abre lacuna numérica e **fecha o batch antes dela**. "M1
+texto, M2 áudio, M3 texto" produz o batch `{M1}`; absorver M3 por cima do áudio
+responderia a terceira mensagem antes da segunda.
+
+**Fechamento único, e o que realmente o carrega.** Duas réplicas sobre a mesma
+stream: uma pega o mutex e a outra sai com `stream_locked`. Sequencialmente, um
+head já fechado sai do conjunto de membros e a segunda tentativa devolve
+`no_window`. O `debounce_closed_at IS NULL` do UPDATE e o CAS por `state_version`
+ficam como **defesa em profundidade** — medido por sonda: removendo qualquer um
+deles sozinho a suíte continua verde; removendo-os junto com a condição do
+conjunto de membros, um segundo fechamento passa e reescreve
+`debounce_batch_size` para 1.
+
+**Uma transação, seis escritas.** Fechar o head, enfileirá-lo, estender a
+fronteira `last_ingress_seq`, marcar os irmãos `superseded`/`merged_into_turn` e
+**reancorar os inputs deles no head** acontecem juntos ou não acontecem. A
+reancoragem é o que faz o batch virar um **fato do banco**, legível pelo executor
+— que roda em outro processo e outro instante — em vez de ser redescoberto em
+memória por telefone e `created_at`, que é uma segunda definição de batch e
+diverge da primeira no dia em que uma mensagem chega entre o fechamento e a
+execução.
+
+**"Fechamento comitado, wake-up não enviado".** O head fechado carimba
+`promoted_at` — a MESMA coluna da fatia D —, então o varredor de
+`message-recovery` reconcilia pelo caminho que já existe e já é medido
+(`maia_stream_promotion_total{result="recovered"}`). Duas reconciliações com o
+mesmo modo de falha é como uma delas fica sem manutenção.
+
+**O varredor.** `stream_debounce_closer` (cron 1/min, drena ~50s sondando a cada
+500ms — o mesmo padrão de `outbox_drain` e `playground_turn_drain`) substitui o
+job atrasado. É um dispatcher cross-tenant e **não decide nada**: pergunta ao
+banco quais janelas venceram e manda fechar. Duas instâncias não produzem batch
+sobreposto; uma instância que morre não perde janela nenhuma.
+
+**Observabilidade.** `maia_stream_debounce_batch_size` (histograma com baldes
+PRÓPRIOS — 1, 2, 3, 5, 10, 25, 50 —, porque os baldes padrão são de
+milissegundos e todo batch cairia em `le="50"`) e
+`maia_stream_debounce_close_total{result}` com vocabulário fechado
+(`closed`/`stream_locked`/`no_window`/`not_due`/`lost_race`). Auditoria
+`stream_batch_closed` com `batch_size` e `absorbed_turn_ids` — é a resposta para
+"por que a Maia respondeu três mensagens minhas de uma vez?". Nenhum label
+carrega `stream_key`, `turn_id` ou telefone.
+
+**Flag e rollback.** `FEATURE_TURN_STREAM_DEBOUNCE` (default ON), **inerte**
+enquanto `FEATURE_MESSAGE_DEBOUNCE` estiver OFF — o default do repositório —,
+porque sem debounce não há janela a tornar transacional. Exige
+`FEATURE_TURN_HEAD_OF_LINE`, e a dependência é de **segurança**: o fechamento
+marca os irmãos `superseded` sem fence, e só pode porque um turno que não é o
+head é inclaimável. OFF volta o debounce em memória, com as duas falhas de cima;
+nenhuma mensagem é perdida em nenhuma das posições. Ver
+[runbook §13](docs/runbooks/turn-state-machine.md).
+
+### Promoção do sucessor: o head que termina destrava a conversa ([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627), fatia D de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `127` ANTES de subir o código.** Ela é
+> um `ALTER TABLE ... ADD COLUMN` nullable (metadata-only, sem reescrita de
+> tabela e sem `CONCURRENTLY`), então não herda a armadilha de índice inválido
+> da `124`/`126`. Subir o código antes dela quebra toda conclusão de turno: a
+> promoção escreve colunas que ainda não existem.
+
+**O problema, que a fatia anterior criou de propósito.** Com o head-of-line
+ligado (#626), um turno só é reivindicável se for o primeiro vivo da conversa —
+e ninguém acordava o primeiro quando o anterior terminava. O sucessor até estava
+`queued` desde o ingresso, mas o job dele já tinha sido consumido: acordou, o
+claim recusou com `not_head`, o job terminou. Quem avançava era o head, na vez
+dele, **quando o varredor o rearmasse — até 2 minutos** ([runbook
+§11.5](docs/runbooks/turn-state-machine.md)). Ordem comprada com latência.
+
+**A promoção.** A MESMA transação que conclui um turno elege o próximo turno
+elegível da stream, carimba a decisão (`promoted_at`, `promoted_by_turn_id`) e
+só **depois do commit** sinaliza a BullMQ. Vale para todo terminal — inclusive
+`dead_letter`, que é o que impede um turno envenenado de prender a conversa para
+sempre (falha nº 5 da issue-mãe). O re-arme do turno cujo claim expirado é
+recuperado dentro da transação do claim (#625) entra pela mesma porta: ele
+perdeu o único wake-up que tinha, o job do dono morto.
+
+**Latência medida contra PostgreSQL real:** 8ms na promoção por conclusão e 13ms
+no re-arme por claim expirado, contra os 120000ms da janela documentada.
+
+**O fence, de graça e exato.** A issue exige validar o `claim_token` do turno
+que está terminando — *"uma tentativa stale não pode liberar o sucessor"*, a
+falha nº 9 da issue-mãe. A promoção roda DENTRO da transação do CAS terminal,
+cujo `WHERE` já carrega token + lease viva: um worker zumbi não chega à
+promoção, porque o CAS dele devolve zero linhas. Uma validação separada seria
+uma segunda cópia da regra de fence, com o mesmo modo de falha que a fatia C
+eliminou na regra de ordem. A recusa é contada
+(`maia_stream_promotion_total{result="fence_rejected"}`) e auditada
+(`turn_promotion_rejected`).
+
+**A fila é wake-up, não fonte de verdade.** Se o processo cai entre o commit e o
+`enqueueAgent`, o turno promovido existe no banco e não existe na fila. É
+`promoted_at` que permite ao varredor reconciliar, e a reconciliação é contada
+(`result="recovered"`) — o par a vigiar é `enqueue_failed` **sem** `recovered`
+acompanhando, que significa varredor parado, não promoção quebrada. O claim zera
+`promoted_at` quando a dívida é paga, para que o caminho feliz não seja medido
+como recuperação de falha.
+
+**`promoted` ganhou produtor.** O código que a #626 reservou deliberadamente sem
+produtor — para não mudar o domínio de um label depois que ele estivesse num
+dashboard — é produzido por esta fatia, com o mesmo nome.
+
+**Uma única definição, agora com cinco consumidores.** A eleição do sucessor
+mora em [`stream-head-sql.ts`](src/db/repositories/stream-head-sql.ts), o dono
+da ordem, e o UPDATE da promoção carrega `streamHeadOfLineNotExists` — a MESMA
+função do claim, do recovery, do dispatcher e do canário. O teste de contrato
+conta as chamadas.
+
+**Kill switch:** `FEATURE_TURN_STREAM_PROMOTION=false` + restart. Com ela OFF a
+ordem continua correta (o head-of-line não depende da promoção) e a conversa
+volta à cadência do varredor: latência, não inversão. Sem
+`FEATURE_TURN_HEAD_OF_LINE` a flag é inerte de propósito — naquele regime nenhum
+job é recusado por posição, logo não há fila a destravar.
+
+**Decisão que merece ser contestada:** um sucessor `retryable` com backoff em
+aberto **não** é promovido, e a conversa espera o varredor rearmá-lo quando o
+backoff vencer. É a cláusula literal da issue-mãe (*"backoff não autoriza
+ultrapassagem silenciosa"*) e o preço é latência num caminho de falha — a
+alternativa seria apagar o backoff de um turno que acabou de falhar.
 
 ### Ordenação: só o HEAD-OF-LINE da conversa é reivindicável ([#626](https://github.com/diogenesmendes01/Maia-v2/issues/626), fatia C de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
 

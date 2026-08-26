@@ -128,16 +128,23 @@ describe('#626 — contrato do head-of-line', () => {
   // ─── "Uma única função": a estrutura, não a intenção ─────────────────────
 
   it('todos os consumidores da regra no repositório chamam a MESMA função', () => {
-    // Os quatro: o `WHERE` do claim, o filtro do recovery, o dispatcher
-    // cross-tenant e o canário do recovery. O número é afirmado para que
+    // Os CINCO: o `WHERE` do claim, o filtro do recovery, o dispatcher
+    // cross-tenant, o canário do recovery e — desde #627 — a eleição do
+    // sucessor em `promoteStreamSuccessor`. O número é afirmado para que
     // acrescentar um consumidor NOVO sem passar pela função obrigue a mexer
     // aqui — que é o momento de perguntar por quê.
+    //
+    // Por que a promoção conta: ela é a resposta à MESMA pergunta ("quem é o
+    // head desta stream?") num terceiro momento do ciclo. Se ela tivesse
+    // predicado próprio, o claim e a promoção poderiam eleger turnos
+    // DIFERENTES — e o sintoma seria um turno promovido que o claim recusa
+    // com `not_head`, isto é, uma conversa que recebe wake-up e não anda.
     const codigo = repoFonte
       .split('\n')
       .filter((l) => !/^\s*(\*|\/\/)/.test(l))
       .join('\n');
     const chamadas = codigo.match(/streamHeadOfLineNotExists\(/g) ?? [];
-    expect(chamadas.length).toBe(4);
+    expect(chamadas.length).toBe(5);
   });
 
   it('o repositório NÃO tem uma segunda cópia do predicado escrita à mão', () => {
@@ -160,9 +167,20 @@ describe('#626 — contrato do head-of-line', () => {
 
   // ─── Vocabulário centralizado ────────────────────────────────────────────
 
-  it('os cinco códigos da issue existem, e são exatamente cinco', () => {
+  it('os cinco códigos da issue existem, mais o `stream_poisoned` da #629', () => {
+    // A #629 (fatia F) ACRESCENTOU um sexto: `stream_poisoned`. Acrescentar não
+    // é o mesmo que redefinir — nenhuma série existente mudou de significado, e
+    // a nova é semeada em zero como as outras. O que continua proibido é grafar
+    // um dos códigos de outro jeito, ou ter dois nomes para o mesmo fato.
     expect([...STREAM_SCHEDULING_RESULTS].sort()).toEqual(
-      ['eligible', 'not_head', 'promoted', 'stream_blocked', 'stream_busy'].sort(),
+      [
+        'eligible',
+        'not_head',
+        'promoted',
+        'stream_blocked',
+        'stream_busy',
+        'stream_poisoned',
+      ].sort(),
     );
     expect(new Set(STREAM_SCHEDULING_RESULTS).size).toBe(STREAM_SCHEDULING_RESULTS.length);
   });
@@ -171,7 +189,7 @@ describe('#626 — contrato do head-of-line', () => {
     // Se `CLAIM_REJECTIONS` puder carregar um código que não está no
     // vocabulário, o label de métrica e o motivo tipado voltam a poder divergir
     // — que é a duplicação que a issue manda eliminar, na outra dimensão.
-    for (const reason of ['not_head', 'stream_blocked', 'stream_busy'] as const) {
+    for (const reason of ['not_head', 'stream_blocked', 'stream_busy', 'stream_poisoned'] as const) {
       expect(CLAIM_REJECTIONS).toContain(reason);
       expect(STREAM_SCHEDULING_RESULTS).toContain(reason);
     }
