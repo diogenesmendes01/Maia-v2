@@ -4,6 +4,68 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Console: as dez jornadas saem da quarentena e viram gate ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), continuação da [#472](https://github.com/diogenesmendes01/Maia-v2/issues/472))
+
+**O que estava acontecendo.** O job `build + e2e do console (admin-ui)` media
+cinco testes de boot. As dez jornadas do operador estavam marcadas
+`@pendente-472` e ninguém as executava. Medido nesta árvore, contra o artefato
+standalone e um banco migrado: **27 casos, 23 reprovando e 4 passando — e os 4
+passavam por engano**. `audit-log.spec.ts` terminava num comentário
+(`// Verify via API: audit count incremented by 1`) sem asserção nenhuma;
+`proposal-approval.spec.ts` afirmava só que existia um `h1`, e o `h1` que ele
+encontrava era `Entrar no Maia Console`. Uma suíte que não roda não envelhece:
+ela apodrece e mente.
+
+**As duas causas, medidas.** (1) SESSÃO: toda rota protegida redireciona para
+`/auth/signin`, e contra o artefato de produção o único profile satisfazível é
+`staging`, onde o console registra apenas OIDC. (2) FIXTURES: os ids das specs
+(`test-id`, `locked-test`, `test-trace-id`) nem chegavam ao repositório —
+`proposals.getProposal` e `traces.getTrace` validam `z.string().uuid()`.
+
+**O que passou a existir.** `tests/admin-ui/e2e/_apoio/sessao.ts` minta o cookie
+de sessão com o `encode()` do próprio Auth.js e o `NEXTAUTH_SECRET` do processo:
+nenhum provider novo é registrado, nenhuma flag de dev-auth é ligada, e o
+middleware, o `auth()`, o `createTRPCContext` e o `assertRole` continuam sendo
+exercitados de verdade — o que o teste pula é o handshake com o IdP, que não é
+do console. `scripts/seed-admin-ui-e2e-fixtures.ts` semeia usuários por papel,
+propostas cujo risco e travas são DERIVADOS do spec pelo caminho de produção
+(`src/db/capability-risk.ts`), duas versões de perfil e um trace escrito por
+`writeEnvelope`/`writeBody` — assinado, porque a tela recomputa o HMAC na
+leitura.
+
+**Um defeito de produção que a quarentena escondia.** A tela de detalhe lia
+`proposal.locks` (só as travas DERIVADAS do spec) para decidir banner e botões,
+enquanto `proposals.approve` aplica a UNIÃO com as travas da CLASSE de aprovação
+(`architectureLocksFor`). Para toda classe cuja trava vem da matriz —
+`capability_dangerous_tool`, `policy_rule_hard_limit`, `soul_bias_core_value`,
+`identity_drift_correction` — o console mostrava os botões HABILITADOS para
+`owner` e o clique voltava `FORBIDDEN: Architecture-lock proposals require
+founder role` dentro do modal. O servidor estava certo; a tela prometia uma ação
+que ele recusa. Corrigido em
+[`src/admin-ui/app/proposals/[id]/page.tsx`](src/admin-ui/app/proposals/%5Bid%5D/page.tsx),
+com caso de regressão em `architecture-lock.spec.ts`.
+
+**Determinismo, não retentativa.** As jornadas que MUTAM restauram a própria
+fixture antes de cada caso e afirmam o estado FINAL de forma absoluta
+(`exatamente uma linha de auditoria`, `exatamente três rejeições`), nunca por
+delta: com `retries: 2` no CI, uma asserção por delta ficaria verde na segunda
+tentativa herdando a mutação da primeira. A fila do inbox, que é um agregado,
+restaura TODAS as fixtures — sem isso ela passaria conforme quem rodou antes.
+
+**O que sobrou em quarentena, e por quê.** Uma spec:
+`channel-lines-pairing.spec.ts`, agora marcada `@pendente-runtime` (a #472
+fechou; o motivo que resta é outro). `channelLines.startPairing` só grava um
+COMANDO em `channel_line_state`: quem produz o QR e o código é o worker
+`channel_pairing` do RUNTIME, e o job sobe apenas o console. O critério objetivo
+de saída está escrito no cabeçalho do arquivo — subir um runtime com adapter de
+canal falso no mesmo job e `getPairingStatus` responder `pairing_available:
+true`.
+
+**Gate.** `TEST_ADMIN_UI_MIN_TESTS` sobe de `5` para `27`, e
+`tests/unit/ci/admin-ui-e2e-gate.spec.ts` passa a conferir esse piso contra a
+contagem de casos das specs fora da quarentena — um piso que não acompanha a
+suíte deixaria apagar as jornadas do checkout sem ficar vermelho.
+
 ### Ordenação: só o HEAD-OF-LINE da conversa é reivindicável ([#626](https://github.com/diogenesmendes01/Maia-v2/issues/626), fatia C de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
 
 > **AÇÃO DO OPERADOR: aplique a migration `126` ANTES de subir o código, e
