@@ -1313,6 +1313,21 @@
           "required": false,
           "group": "setup",
           "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_GITHUB_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true,
+          "requiredWhen": "MAIA_TOOL_REQUEST_ISSUE_REPO está definida"
         }
       ],
       "secrets": [
@@ -1334,7 +1349,8 @@
         "RUNTIME_TRACE_HMAC_MASTER_SECRET",
         "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "RUNTIME_TRACE_DEBUG_AES_KEY",
-        "SETUP_TOKEN_OVERRIDE"
+        "SETUP_TOKEN_OVERRIDE",
+        "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
       ],
       "by_profile": {
         "development": {
@@ -1525,7 +1541,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "staging": {
@@ -1716,7 +1734,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "production": {
@@ -1907,7 +1927,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         }
       }
@@ -1996,6 +2018,13 @@
           "secret": true,
           "required": false,
           "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
           "restartRequired": true
         },
         {
@@ -2130,6 +2159,7 @@
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "NEXTAUTH_SECRET",
@@ -2168,6 +2198,7 @@
             "FEATURE_PDF_REPORTS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",
@@ -2201,6 +2232,7 @@
             "FEATURE_PDF_REPORTS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",

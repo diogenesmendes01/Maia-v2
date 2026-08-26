@@ -36,12 +36,14 @@ const contextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 const {
   updateLevelMock,
   proposeCapabilityForGapMock,
+  proposeToolRequestForGapMock,
   loggerInfoMock,
   loggerWarnMock,
   loggerErrorMock,
 } = vi.hoisted(() => ({
   updateLevelMock: vi.fn(),
   proposeCapabilityForGapMock: vi.fn(),
+  proposeToolRequestForGapMock: vi.fn(),
   loggerInfoMock: vi.fn(),
   loggerWarnMock: vi.fn(),
   loggerErrorMock: vi.fn(),
@@ -116,6 +118,12 @@ vi.mock('@/cognition/capability-proposer.js', () => ({
   proposeCapabilityForGap: proposeCapabilityForGapMock,
 }));
 
+// #636 — a rota ESPECÍFICA do topo da escalada. Ela tem precedência sobre o
+// `capability-proposer`; o fallback genérico só roda quando ela RECUSA.
+vi.mock('@/cognition/tool-request/proposer.js', () => ({
+  proposeToolRequestForGap: proposeToolRequestForGapMock,
+}));
+
 import { runGapEscalationMonitor } from '@/workers/gap-escalation-monitor.js';
 
 function seedTuple(
@@ -186,6 +194,13 @@ describe('runGapEscalationMonitor', () => {
     daysSinceProposedByTuple.clear();
     updateLevelMock.mockReset();
     proposeCapabilityForGapMock.mockReset();
+    proposeToolRequestForGapMock.mockReset();
+    // Baseline dos cenários pré-#636: o gap não é pedido de ferramenta, então
+    // o worker cai no proposer genérico exatamente como antes.
+    proposeToolRequestForGapMock.mockResolvedValue({
+      ok: false,
+      reason: 'gap_nao_e_de_tool',
+    });
     loggerInfoMock.mockReset();
     loggerWarnMock.mockReset();
     loggerErrorMock.mockReset();
@@ -436,5 +451,159 @@ describe('runGapEscalationMonitor', () => {
     const done = loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation_monitor.done');
     expect((done![0] as Record<string, unknown>).total_changed).toBe(2);
     expect((done![0] as Record<string, unknown>).agents_processed).toBe(2);
+  });
+
+  // ─── #636 · as duas rotas a partir de `proposed` ──────────────────────────
+  it('#636: pedido de ferramenta gerado → o proposer genérico NÃO é chamado', async () => {
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-tool-request',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
+    proposeToolRequestForGapMock.mockResolvedValue({
+      ok: true,
+      proposal_id: 'prop-tr-1',
+      spec: {
+        contract_draft: { proposed_tool_name: 'emitir_guia' },
+        frequency: { occurrences: 3 },
+      },
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+
+    expect(proposeToolRequestForGapMock).toHaveBeenCalledTimes(1);
+    // Rodar os dois geraria DUAS propostas para o mesmo gap.
+    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    expect(
+      loggerInfoMock.mock.calls.find((c) => c[1] === 'gap_escalation.tool_request_created'),
+    ).toBeDefined();
+  });
+
+  it('#637: pedido AGREGADO — o log diz que somou demanda, e o genérico não roda', async () => {
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-agregado',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
+    // O desfecho da fatia B: NÃO houve proposta nova; o pedido entrou num
+    // agregado que já existia. Se o worker tratasse isso como recusa, chamaria
+    // o proposer genérico e criaria a segunda proposta que a agregação existe
+    // para evitar.
+    proposeToolRequestForGapMock.mockResolvedValue({
+      ok: true,
+      resultado: 'agregado',
+      proposal_id: 'prop-representante',
+      spec: {
+        contract_draft: { proposed_tool_name: 'emitir_guia' },
+        frequency: { occurrences: 4 },
+      },
+      aggregate_id: 'agg-1',
+      member_id: 'mem-2',
+      similaridade: 0.92,
+      member_count: 3,
+      contract_state: 'consistent',
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+
+    expect(proposeCapabilityForGapMock).not.toHaveBeenCalled();
+    const linha = loggerInfoMock.mock.calls.find(
+      (c) => c[1] === 'gap_escalation.tool_request_created',
+    );
+    expect(linha).toBeDefined();
+    // `criado` e `agregado` pedem leituras diferentes de quem prioriza: um é
+    // backlog novo, o outro é demanda somada. Colapsar os dois num log mudo
+    // esconderia justamente o número que esta fatia produz.
+    const campos = linha![0] as {
+      resultado: string;
+      aggregate_id: string;
+      member_count: number;
+      similaridade: number;
+    };
+    expect(campos.resultado).toBe('agregado');
+    expect(campos.aggregate_id).toBe('agg-1');
+    expect(campos.member_count).toBe(3);
+    expect(campos.similaridade).toBe(0.92);
+  });
+
+  it('#636: pedido de ferramenta RECUSADO → o proposer genérico assume', async () => {
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-fallback',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
+    proposeToolRequestForGapMock.mockResolvedValue({
+      ok: false,
+      reason: 'tool_ja_existe',
+      detail: 'query_balance',
+    });
+    proposeCapabilityForGapMock.mockResolvedValue({
+      ok: true,
+      proposal_id: 'prop-2',
+      draft: {},
+    });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
+    const pulado = loggerInfoMock.mock.calls.find(
+      (c) => c[1] === 'gap_escalation.tool_request_skipped',
+    );
+    expect(pulado).toBeDefined();
+    // O MOTIVO da recusa é registrado: "já existe" e "sem ocorrências" pedem
+    // ações opostas do operador.
+    expect((pulado![0] as { reason: string }).reason).toBe('tool_ja_existe');
+  });
+
+  it('#636: pedido de ferramenta que LANÇA não derruba o proposer genérico', async () => {
+    seedTuple('tenant-a', 'agent-1', {
+      gaps: [
+        makeGap({
+          id: 'gap-explode',
+          current_level: GapLevel.MENTIONABLE,
+          frequency_score: 4,
+          severity_score: 5,
+          contexto: 'ctx-A',
+        }),
+      ],
+    });
+    // A rota NOVA quebra (bug, ledger de ocorrências indisponível). A rota que
+    // já existia não pode desaparecer junto: sem esta blindagem, o log diria
+    // apenas "proposer_threw" e ninguém veria que o proposer genérico nunca
+    // chegou a ser chamado. Este é exatamente o modo de falha que a spec
+    // `tests/integration/p5-dialogical-acquisition.spec.ts` flagrou.
+    proposeToolRequestForGapMock.mockRejectedValue(new Error('ledger fora do ar'));
+    proposeCapabilityForGapMock.mockResolvedValue({ ok: true, proposal_id: 'p3', draft: {} });
+
+    await runGapEscalationMonitor();
+    await flushMicrotasks();
+    await flushMicrotasks();
+
+    expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
+    expect(
+      loggerWarnMock.mock.calls.find((c) => c[1] === 'gap_escalation.tool_request_threw'),
+    ).toBeDefined();
   });
 });

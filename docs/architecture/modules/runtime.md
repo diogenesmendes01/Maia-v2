@@ -506,7 +506,7 @@ through `/livez`, `/startupz` and `/readyz`.
 | `shutdown-sequence.ts` | The ordered steps and the signal handlers. Order is the contract: stop accepting work → drain crons → drain BullMQ → drain background tasks → close the turn-context subscriber (#511, its own ioredis connection) → close sessions → HTTP → audit → pools |
 | `readiness.ts` | Composite, role-aware `/readyz` + `/startupz` evaluation. Read-only, per-component timeout, memoized, sanitized output |
 | `schema-readiness.ts` | **The `/readyz` schema gate** (#516): cached, single-flight adapter over `getSchemaReadiness()`. Dirty state, checksum divergence, a migration file this build does not ship, an incompatible head and an unreadable database all keep the instance at 503. Verdict cached for `SCHEMA_READINESS_TTL_MS` (10s) so an LB poll is not a load generator |
-| `schema-boot-gate.ts` | **The BOOT decision** over that verdict (#516, ADR 0004): blocker kind ⇒ exit code (90-97), precedence between simultaneous blockers, and the actionable death message. PURE — no I/O; `src/index.ts` is the only caller and the only place that calls `process.exit()`. Replaced `schema-version.ts`, the pre-#516 comparison, which was deleted |
+| `schema-boot-gate.ts` | **The BOOT decision** over that verdict (#516, ADR 0004): blocker kind ⇒ exit code (90-98), precedence between simultaneous blockers, and the actionable death message. PURE — no I/O; `src/index.ts` is the only caller and the only place that calls `process.exit()`. Replaced `schema-version.ts`, the pre-#516 comparison, which was deleted |
 | `index.ts` | Public barrel (import the role contract from here) |
 
 Rules this module enforces:

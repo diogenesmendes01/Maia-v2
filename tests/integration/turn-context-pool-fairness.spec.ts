@@ -123,7 +123,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   memoryEntryRepo: { findRelevant: () => barrier([]) },
   behavioralHintRepo: { findActiveForScopes: () => barrier([]) },
   capabilitiesSkillRepo: { listAll: () => barrier([]) },
-  capabilityGapsRepo: { listByLevels: () => barrier([]) },
+  capabilityGapsRepo: { listParaOTurno: () => barrier([]) },
   procedureExecutionsRepo: { findActiveForConversa: () => barrier(null) },
   procedureDefinitionsRepo: { findById: () => barrier(null) },
 }));
