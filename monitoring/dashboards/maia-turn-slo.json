@@ -1,0 +1,208 @@
+{
+  "uid": "maia-turn-slo",
+  "title": "Maia — Turnos, SLO e orçamento de erro",
+  "description": "Painel do SLO de turno (issue #535). Toda expressão usa as recording rules de monitoring/alerts/slo.rules.yml, para que painel e alerta nunca discordem. Runbook: docs/runbooks/observability-slo.md.",
+  "tags": ["maia", "slo", "turn"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Disponibilidade",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Sucesso de turno (5m)",
+      "description": "Denominador = APENAS outcomes terminais (completed|failed). `retryable` não é desfecho: contá-lo faria um turno com duas retentativas e sucesso final aparecer como 33% de sucesso.",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "expr": "maia:turn_success_ratio:rate5m", "legendFormat": "sucesso" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Falha vs retry (5m)",
+      "description": "Retry ALTO com falha BAIXA = a plataforma está absorvendo transitórios; investigue, não pagine. Falha subindo = retentativas esgotadas, veja a DLQ.",
+      "gridPos": { "h": 6, "w": 12, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:turn_failure_ratio:rate5m", "legendFormat": "falha" },
+        { "expr": "maia:turn_retry_ratio:rate5m", "legendFormat": "retry" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Falha por tenant/agente (5m)",
+      "description": "A razão de existir dos labels tenant_id+agent_id (AGENTS.md §4.1): um tenant barulhento tem que ser distinguível de um outage da plataforma.",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "topk(5, maia:turn_failure_ratio:rate5m:by_tenant)",
+          "legendFormat": "{{tenant_id}}/{{agent_id}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "Latência",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Latência E2E do turno (p95 / p99)",
+      "description": "Medida do timestamp PERSISTIDO do inbound até o desfecho — sobrevive a restart, debounce e recovery. Só turnos `completed`: turno que falhou nunca respondeu. COM debounce configurado, subtraia a janela antes de comparar com o SLO.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:turn_e2e_latency_ms:p95", "legendFormat": "p95" },
+        { "expr": "maia:turn_e2e_latency_ms:p99", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 5000 },
+              { "color": "red", "value": 15000 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Subtração diagnóstica: fila vs contexto vs LLM",
+      "description": "O diagnóstico de latência é uma subtração (runbook §4.5): espera de fila alta = capacidade; carga de contexto alta = banco; latência LLM alta = provider. As três no mesmo eixo tornam a subtração visual.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:queue_wait_ms:p95", "legendFormat": "fila p95 — {{queue}}" },
+        { "expr": "maia:turn_context_load_ms:p95", "legendFormat": "contexto p95 — {{phase}}" },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(maia_llm_latency_ms_bucket[5m])))",
+          "legendFormat": "LLM p95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Orçamento de erro",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Burn rate (1h / 6h)",
+      "description": "SLO 99,9% ⇒ orçamento 0,1%. 14,4x em 1h esgota em ~2 dias (página); 6x em 6h esgota em ~5 dias (ticket). Enquanto o orçamento estiver estourado, mudança de comportamento do agente entra em congelamento.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:turn_error_budget_burn:1h", "legendFormat": "1h (limiar 14,4x)" },
+        { "expr": "maia:turn_error_budget_burn:6h", "legendFormat": "6h (limiar 6x)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Cobertura de envelope do runtime trace",
+      "description": "Fração de decisões cujo envelope durável foi gravado. Alvo 100% em side effect: um efeito de nível >= medium sem envelope ABORTA o turno por design (P10b invariante 12) — o incidente é o Postgres/HMAC atrás, não o abort.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "maia:trace_envelope_coverage:rate5m", "legendFormat": "cobertura" },
+        {
+          "expr": "sum by (reason) (rate(maia_runtime_trace_coverage_total{result=\"skipped\"}[5m]))",
+          "legendFormat": "skipped — {{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Portão de labels: violações bloqueadas",
+      "description": "O portão BLOQUEOU algo — nada vazou, mas há um call site errado para corrigir. NUNCA resolva relaxando o sanitizer; corrija o call site e mantenha a correlação em log/trace.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (metric, reason) (rate(maia_metric_label_rejected_total[5m]))",
+          "legendFormat": "rejeitada — {{metric}}/{{reason}}"
+        },
+        {
+          "expr": "sum by (metric) (rate(maia_metric_label_cardinality_overflow_total[5m]))",
+          "legendFormat": "overflow — {{metric}}"
+        },
+        {
+          "expr": "sum by (span, reason) (rate(maia_span_attribute_rejected_total[5m]))",
+          "legendFormat": "atributo de span — {{span}}/{{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] }
+    }
+  ]
+}

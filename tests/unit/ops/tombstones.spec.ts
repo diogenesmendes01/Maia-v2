@@ -6,8 +6,11 @@ import {
   planReconciliation,
   canReleaseTraffic,
   isResurrected,
+  deriveTombstoneSecret,
+  TOMBSTONE_KEY_LABEL,
   type TombstoneRecord,
 } from '../../../src/ops/retention/tombstones.js';
+import { TypedError } from '../../../src/lib/utils.js';
 
 /**
  * Issue #520 §13 — "restore antigo reaplica tombstones posteriores"; "falha de
@@ -327,5 +330,65 @@ describe('isResurrected — the end-to-end anti-resurrection property', () => {
         resource_locator: null,
       }),
     ).toBe(false);
+  });
+});
+
+/**
+ * Issue #536 — the ledger's keying material.
+ *
+ * Nothing writes a tombstone yet, so the derivation can still be DEFINED
+ * rather than discovered. Once rows exist it is frozen: a different derivation
+ * makes every existing HMAC fail, and an unverifiable ledger blocks every
+ * restore by design.
+ */
+describe('deriveTombstoneSecret', () => {
+  it('is deterministic', () => {
+    expect(deriveTombstoneSecret('master')).toBe(deriveTombstoneSecret('master'));
+  });
+
+  it('is DOMAIN-SEPARATED from the master secret it descends from', () => {
+    // Using one secret for two protocols is how a signature produced by one
+    // becomes a valid signature in the other. The manifest signer uses the
+    // master directly; the ledger must not.
+    expect(deriveTombstoneSecret('master')).not.toBe('master');
+    expect(deriveTombstoneSecret('master')).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('separates two master secrets', () => {
+    expect(deriveTombstoneSecret('a')).not.toBe(deriveTombstoneSecret('b'));
+  });
+
+  it('THROWS when no master secret is configured — never returns a weak key', () => {
+    expect(() => deriveTombstoneSecret(undefined)).toThrow(TypedError);
+    expect(() => deriveTombstoneSecret('')).toThrow(TypedError);
+  });
+
+  it('produces a key that actually signs and verifies a tombstone', () => {
+    const secret = deriveTombstoneSecret('master');
+    const body = {
+      id: 'ts-derived',
+      tenant_id: 'acme',
+      agent_id: 'fin',
+      data_class: 'postgres.messages',
+      subject_ref: 'pseudo',
+      resource_locator: null,
+      action: 'delete' as const,
+      effective_at: new Date('2026-07-25T00:00:00.000Z'),
+      origin: 'privacy_request' as const,
+      version: 1,
+    };
+    const record: TombstoneRecord = {
+      ...body,
+      hmac: signTombstone(body, secret),
+      hmac_key_version: 1,
+    };
+    expect(verifyTombstone(record, secret)).toBe(true);
+    // A tombstone keyed with the RAW master does not verify under the derived
+    // key — the separation is real, not cosmetic.
+    expect(verifyTombstone({ ...record, hmac: signTombstone(body, 'master') }, secret)).toBe(false);
+  });
+
+  it('the derivation label is pinned (changing it invalidates the whole ledger)', () => {
+    expect(TOMBSTONE_KEY_LABEL).toBe('maia.tombstone.hmac.v1');
   });
 });

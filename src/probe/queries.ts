@@ -4,7 +4,7 @@
  * sonda roda sob `runWithSystemContext` e correlaciona por `whatsapp_id` (o
  * handle do run) → `mensagens.id` da entrada → efeitos.
  */
-import { and, eq, sql, desc } from 'drizzle-orm';
+import { and, eq, ne, sql, desc } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { mensagens, transacoes } from '../db/schema.js';
 import { PROBE_TENANT_ID, PROBE_AGENT_ID } from './constants.js';
@@ -61,6 +61,29 @@ export async function findPendingTransacao(input: {
 }
 
 /**
+ * Issue #577 — RESPOSTA DE VERDADE, não placeholder.
+ *
+ * As duas consultas abaixo procuram a resposta do agente por
+ * `direcao='out' AND metadata->>'in_reply_to'`, sem olhar `tipo`. Isso bastava
+ * enquanto o único `out` com `in_reply_to` era um outbound real: a row
+ * placeholder de `flushUnconfirmedToolSummaries()` (`src/agent/react-loop.ts`)
+ * tem os dois campos, mas nunca chegava a nascer — `mensagens_tipo_check`
+ * rejeitava `tipo='evento'`. Com a `116_mensagens_tipo_evento.sql` ela nasce, e
+ * ela é exatamente o oposto do que a sonda quer afirmar: existe PORQUE o turno
+ * terminou SEM outbound. Sem este filtro, um turno que estourou o teto de
+ * iterações e não respondeu nada passaria no LIVENESS, e o LLM-judge receberia
+ * `''` como "texto da resposta".
+ */
+const isRealOutbound = (mensagem_id: string) =>
+  and(
+    eq(mensagens.tenant_id, PROBE_TENANT_ID),
+    eq(mensagens.agent_id, PROBE_AGENT_ID),
+    eq(mensagens.direcao, 'out'),
+    ne(mensagens.tipo, 'evento'),
+    sql`${mensagens.metadata} ->> 'in_reply_to' = ${mensagem_id}`,
+  );
+
+/**
  * Asserção de LIVENESS (§1.4b): existe uma `mensagens direcao='out'` que
  * responde à entrada do run (metadata.in_reply_to = mensagem_id)? Prova que a
  * cadeia chegou à fronteira de saída (a row é persistida mesmo com o sink — a
@@ -70,14 +93,7 @@ export async function hasOutboundReply(mensagem_id: string): Promise<boolean> {
   const rows = await db
     .select({ id: mensagens.id })
     .from(mensagens)
-    .where(
-      and(
-        eq(mensagens.tenant_id, PROBE_TENANT_ID),
-        eq(mensagens.agent_id, PROBE_AGENT_ID),
-        eq(mensagens.direcao, 'out'),
-        sql`${mensagens.metadata} ->> 'in_reply_to' = ${mensagem_id}`,
-      ),
-    )
+    .where(isRealOutbound(mensagem_id))
     .limit(1);
   return rows.length > 0;
 }
@@ -87,14 +103,7 @@ export async function latestOutboundText(mensagem_id: string): Promise<string | 
   const rows = await db
     .select({ conteudo: mensagens.conteudo })
     .from(mensagens)
-    .where(
-      and(
-        eq(mensagens.tenant_id, PROBE_TENANT_ID),
-        eq(mensagens.agent_id, PROBE_AGENT_ID),
-        eq(mensagens.direcao, 'out'),
-        sql`${mensagens.metadata} ->> 'in_reply_to' = ${mensagem_id}`,
-      ),
-    )
+    .where(isRealOutbound(mensagem_id))
     .orderBy(desc(mensagens.created_at))
     .limit(1);
   return rows[0]?.conteudo ?? null;

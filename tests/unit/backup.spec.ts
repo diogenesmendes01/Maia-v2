@@ -249,12 +249,26 @@ describe('a backup killed mid-run does not block the next one (#512 drain intera
   });
 
   it('uses a cutoff of twice the dump budget — a live run is never stolen', async () => {
+    // BACKUP_DUMP_TIMEOUT_MS is 3_600_000 in the mocked config.
+    const BUDGET = 2 * 3_600_000;
     const before = Date.now();
     const { runNightlyBackup } = await import('../../src/workers/backup.js');
     await runNightlyBackup();
+    const after = Date.now();
     const cutoff = reclaimAbandonedRunsMock.mock.calls[0]![0] as Date;
-    // BACKUP_DUMP_TIMEOUT_MS is 3_600_000 in the mocked config.
-    expect(before - cutoff.getTime()).toBeGreaterThanOrEqual(2 * 3_600_000);
+
+    // O corte é `Date.now() - BUDGET` medido DENTRO da produção, num instante
+    // entre `before` e `after`. Então a única afirmação verdadeira em toda
+    // corrida é que ele cai nessa janela deslocada — e é isso que fixa a regra
+    // "duas vezes o orçamento" sem depender do relógio.
+    //
+    // A versão anterior comparava só com `before` e exigia `>= BUDGET`, o que
+    // é `BUDGET - decorrido >= BUDGET`: verdadeiro apenas quando as duas
+    // leituras de relógio caem no MESMO milissegundo. Passava por sorte e
+    // reprovava com um milissegundo de diferença
+    // (`expected 7199999 to be greater than or equal to 7200000`).
+    expect(after - cutoff.getTime()).toBeGreaterThanOrEqual(BUDGET);
+    expect(before - cutoff.getTime()).toBeLessThanOrEqual(BUDGET);
   });
 
   it('audits every reclaimed run — it is a state change on evidence', async () => {

@@ -37,6 +37,19 @@ WORKDIR /app
 RUN apk add --no-cache libc6-compat \
   && npm install -g npm@11.5.2
 COPY package.json package-lock.json ./
+# O guard precisa existir no filesystem antes do `npm ci`: o `preinstall` do
+# package.json ainda o encadeia (rede de segurança do caminho `npm install`),
+# e a linha `RUN node scripts/check-node.mjs` abaixo o invoca de propósito.
+# Copiar só o guard (e não o `scripts/` inteiro) preserva o cache deste layer.
+COPY scripts/check-node.mjs ./scripts/check-node.mjs
+# O guard é INVOCADO explicitamente, e não deixado a cargo do `preinstall`:
+# com `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+# `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que passa o
+# `preinstall` só roda DEPOIS de a árvore estar escrita. Quem barra de fato é
+# `devEngines.runtime` (package.json, onFail: error); esta linha garante a
+# MENSAGEM legível por construção. Coberto por
+# tests/unit/scripts/check-node.spec.ts.
+RUN node scripts/check-node.mjs
 # `npm ci`: instala exatamente o lockfile, falha em drift.
 RUN npm ci --omit=dev --no-audit --no-fund
 
@@ -63,6 +76,19 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # Stub values so the build doesn't fail validating env. None of these reach
 # the runtime image — Coolify supplies the real values at container start.
 ENV NODE_ENV=production
+# MAIA_ENV: sem ele o profile resolvido é `production` (derivado de NODE_ENV),
+# e o contrato #515 exige nesse profile keyring de backup e chaves de S3
+# REAIS. Este estágio é um SANDBOX DE BUILD, não um deploy: nada daqui chega
+# ao runtime, que valida com os valores injetados pelo Coolify no boot.
+# `staging` é o profile estrito mais próximo que descreve isso honestamente.
+#
+# Este bloco estava DESATUALIZADO e o build da imagem do console estava
+# quebrado: sem `MAIA_ENV` e sem as três `BACKUP_S3_*` abaixo, `next build`
+# morre em "Failed to collect page data for /api/auth/[...nextauth]".
+# Ninguém percebeu porque nada no CI construía o console — é exatamente o
+# buraco que o job `admin-ui` de `.github/workflows/ci.yml` fecha, e
+# `tests/unit/ci/admin-ui-e2e-gate.spec.ts` mantém os dois blocos iguais.
+ENV MAIA_ENV=staging
 ENV NEXTAUTH_SECRET=build-time-only-secret-min-32-chars-not-shipped-12345
 ENV NEXTAUTH_URL=http://localhost:4000
 ENV DATABASE_URL=postgres://build:build@localhost:5432/build
@@ -86,6 +112,12 @@ ENV ALERT_CHANNELS=log
 # secret is injected by Coolify at container START (same value as the main app —
 # see docs/admin-ui-deploy.md "Inherited env vars"). This stub never ships.
 ENV RUNTIME_TRACE_HMAC_MASTER_SECRET=build-time-only-hmac-not-shipped-min-32-chars-1234567890
+# O profile `staging` exige destino de backup off-site + credenciais. Valores
+# de sandbox, curtos e sem entropia de propósito (o gitleaks varre o
+# HISTÓRICO); nenhum deles chega ao runtime.
+ENV BACKUP_S3_BUCKET=build-bucket
+ENV BACKUP_S3_ACCESS_KEY=build
+ENV BACKUP_S3_SECRET_KEY=build
 
 COPY --from=root-deps  /app/node_modules ./node_modules
 COPY --from=admin-deps /app/node_modules ./src/admin-ui/node_modules

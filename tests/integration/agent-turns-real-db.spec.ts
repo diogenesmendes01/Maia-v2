@@ -99,6 +99,25 @@ d('agent_turns — DB real (migrations 096/097)', () => {
       );
       await pool.query(`DELETE FROM mensagens WHERE id = ANY($1::uuid[])`, [createdMensagens]);
     }
+    // Limpeza por ESCOPO, não só pelos ids que este processo rastreou. Uma
+    // execução interrompida deixa linha para trás, e o `DELETE FROM agents`
+    // seguinte quebra em `mensagens_agent_id_fkey` — derrubando a SUÍTE
+    // INTEIRA no `afterAll`, com todos os casos verdes. Falha de arquivo sem
+    // teste vermelho é especialmente difícil de ler. Os ids são namespaced
+    // (`turns503-*`), então apagar por escopo não alcança dado de outro spec.
+    await pool.query(
+      `DELETE FROM agent_turn_inputs WHERE mensagem_id IN
+         (SELECT id FROM mensagens WHERE tenant_id = $1 AND agent_id = $2)`,
+      [OTHER_TENANT, OTHER_AGENT],
+    );
+    await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2`, [
+      OTHER_TENANT,
+      OTHER_AGENT,
+    ]);
+    await pool.query(`DELETE FROM mensagens WHERE tenant_id = $1 AND agent_id = $2`, [
+      OTHER_TENANT,
+      OTHER_AGENT,
+    ]);
     await pool.query(`DELETE FROM agents WHERE id = $1`, [OTHER_AGENT]);
     await pool.query(`DELETE FROM tenants WHERE id = $1`, [OTHER_TENANT]);
     await pool.end();
@@ -561,25 +580,170 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     expect(byMsg.get(pending).next_attempt_at).not.toBeNull();
   });
 
-  it('(9) a consulta de recovery usa o índice escopado (não Seq Scan)', async () => {
-    // O planner só escolhe índice quando vale a pena; forçamos a comparação
-    // desabilitando seqscan, o que prova que existe um caminho por índice
-    // compatível com (tenant, agent, status, next_attempt_at).
+  /**
+   * Nó de plano do `EXPLAIN (FORMAT JSON)`. Só o que este arquivo usa.
+   */
+  type PlanNode = {
+    'Node Type': string;
+    'Index Name'?: string;
+    Plans?: PlanNode[];
+  };
+
+  /**
+   * Todos os índices citados na ÁRVORE do plano, em qualquer profundidade.
+   *
+   * Um `Bitmap Heap Scan` traz o `Index Name` no filho, não na raiz — checar só
+   * o topo devolveria vazio justamente no plano que este teste espera.
+   */
+  /** Todos os `Node Type` da árvore do plano, em qualquer profundidade. */
+  function collectNodeTypes(node: PlanNode): string[] {
+    return [node['Node Type'], ...(node.Plans ?? []).flatMap(collectNodeTypes)];
+  }
+
+  function collectIndexNames(node: PlanNode): string[] {
+    const here = node['Index Name'] ? [node['Index Name']] : [];
+    return [...here, ...(node.Plans ?? []).flatMap(collectIndexNames)];
+  }
+
+  /**
+   * Roda `fn` num bloco de transação com `enable_seqscan` desligado, e SEMPRE
+   * desfaz.
+   *
+   * Dois motivos, os dois vindos de defeito real neste arquivo:
+   *
+   *  - `SET LOCAL` só vale dentro de transação. Fora dela o Postgres responde
+   *    `WARNING: SET LOCAL can only be used in transaction blocks` e não aplica
+   *    nada. O WARNING não vira erro no driver, então o teste seguia com o
+   *    seqscan ligado e falhava por um motivo que não era o que ele mede.
+   *  - O `ROLLBACK` precisa rodar TAMBÉM quando a asserção lança. `pg.Pool` não
+   *    desfaz nada no `release()`: um client devolvido ainda em transação, e com
+   *    `enable_seqscan=off` local, contamina o próximo teste que pegar o slot.
+   */
+  async function explainWithoutSeqScan<T>(
+    fn: (client: pg.PoolClient) => Promise<T>,
+  ): Promise<T> {
     const client = await pool.connect();
     try {
-      await client.query('SET LOCAL enable_seqscan = off');
-      const plan = await client.query(
-        `EXPLAIN (FORMAT TEXT)
-         SELECT * FROM agent_turns
-         WHERE tenant_id = 'primary' AND agent_id = 'primary'
-           AND status IN ('received','queued','claimed','running','retryable')
-           AND next_attempt_at <= now()`,
-      );
-      const text = plan.rows.map((r) => r['QUERY PLAN']).join('\n');
-      expect(text).toMatch(/Index (Scan|Only Scan|Cond)|Bitmap Index Scan/);
+      await client.query('BEGIN');
+      try {
+        await client.query('SET LOCAL enable_seqscan = off');
+        return await fn(client);
+      } finally {
+        await client.query('ROLLBACK').catch(() => undefined);
+      }
     } finally {
       client.release();
     }
+  }
+
+  it('(9) o ramo `retryable` do recovery é servido por ÍNDICE, nunca por Seq Scan', async () => {
+    // POR QUE ESTE CASO NÃO NOMEIA UM ÍNDICE.
+    //
+    // A review pediu, com razão, que ele parasse de asserir "algum índice" e
+    // nomeasse `agent_turns_scope_status_next_attempt_idx`. Tentei, e a
+    // tentativa produziu o achado registrado aqui: a ESCOLHA não é propriedade
+    // do sistema. TRÊS índices servem este ramo, todos legitimamente:
+    //
+    //   scope_status_next_attempt  (tenant_id, agent_id, status, next_attempt_at)
+    //   live_status                (status, updated_at)                  PARCIAL
+    //   pending_dispatch           (status, next_attempt_at, created_at) PARCIAL
+    //
+    // Medi o custo com massa realista: 481.39 pelo primeiro contra 486.57 pelo
+    // `live_status` — ~1%. E o `pending_dispatch` ainda carrega `created_at`,
+    // que atende o `ORDER BY` sem Sort. Qual vence depende da distribuição:
+    // local escolhia um, o CI escolhia outro, e ao remover um a escolha caiu no
+    // terceiro. Nenhum estava errado.
+    //
+    // Asserir a escolha seria fixar um acidente de dados e gerar vermelho a
+    // cada mudança de massa em qualquer outro spec da mesma lane. O que É
+    // estável tem duas partes, e as duas estão abaixo:
+    //   (a) o SCHEMA garante o índice de recovery com as quatro colunas certas;
+    //   (b) o PLANO não faz Seq Scan neste ramo.
+    //
+    // REGISTRADO PARA REVISÃO DE SCHEMA, fora do escopo desta PR: com ~1% de
+    // diferença e dois índices parciais cobrindo o mesmo predicado,
+    // `agent_turns_scope_status_next_attempt_idx` pode não se pagar. Três
+    // índices sobrepostos custam escrita em toda inserção e atualização de
+    // `agent_turns`, a tabela do hot path do turno.
+    const nonce = randomUUID().slice(0, 8);
+    const tenant = `idx-${nonce}`;
+    const agent = `idx-${nonce}-probe`;
+
+    // (a) Garantia de SCHEMA — determinística, e é o que "o recovery tem
+    // índice" realmente significa.
+    const def = await pool.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+        WHERE tablename = 'agent_turns' AND indexname = $1`,
+      ['agent_turns_scope_status_next_attempt_idx'],
+    );
+    expect(def.rows, 'o índice de recovery sumiu do schema').toHaveLength(1);
+    for (const col of ['tenant_id', 'agent_id', 'status', 'next_attempt_at']) {
+      expect(def.rows[0]!.indexdef, `o índice não cobre ${col}`).toContain(col);
+    }
+
+    // (b) Garantia de PLANO, com o predicado REAL do ramo `retryable` de
+    // `findRecoverableTurns` — `IS NOT NULL`, ordenação e limite inclusive.
+    const nodes = await explainWithoutSeqScan(async (client) => {
+      await client.query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$1,'active')`, [
+        tenant,
+      ]);
+      await client.query(
+        `INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$1,'active')`,
+        [agent, tenant],
+      );
+      await client.query(
+        `INSERT INTO agent_turns (tenant_id, agent_id, representative_message_id, status, next_attempt_at)
+         SELECT $1, $2, gen_random_uuid(), 'retryable', now() - interval '1 minute'
+           FROM generate_series(1, 200)`,
+        [tenant, agent],
+      );
+      const plan = await client.query<{ 'QUERY PLAN': Array<{ Plan: PlanNode }> }>(
+        `EXPLAIN (FORMAT JSON)
+         SELECT * FROM agent_turns
+         WHERE tenant_id = $1 AND agent_id = $2
+           AND status = 'retryable'
+           AND next_attempt_at IS NOT NULL AND next_attempt_at <= now()
+         ORDER BY created_at
+         LIMIT 200`,
+        [tenant, agent],
+      );
+      return collectNodeTypes(plan.rows[0]!['QUERY PLAN'][0]!.Plan);
+    });
+
+    expect(nodes, `o plano varreu a tabela: ${nodes.join(' → ')}`).not.toContain('Seq Scan');
+    expect(
+      nodes.some((n) => n.includes('Index')),
+      `nenhum nó de índice: ${nodes.join(' → ')}`,
+    ).toBe(true);
+  });
+
+  it('(9b) o `SET LOCAL` REALMENTE se aplica, e não vaza da transação', async () => {
+    // Guarda do guard: sem transação, o `SET LOCAL` é um no-op silencioso e o
+    // caso (9) volta a falhar por um motivo que não é o que ele mede. Aqui a
+    // ausência de transação é o defeito sendo asserido, não um acidente.
+    const dentro = await explainWithoutSeqScan((client) =>
+      client.query<{ enable_seqscan: string }>('SHOW enable_seqscan'),
+    );
+    expect(dentro.rows[0]!.enable_seqscan, 'SET LOCAL não pegou dentro do BEGIN').toBe('off');
+
+    // Depois do ROLLBACK o valor volta ao default — inclusive para o próximo
+    // teste que pegar este slot do pool.
+    const fora = await pool.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+    expect(fora.rows[0]!.enable_seqscan, 'o SET LOCAL vazou da transação').toBe('on');
+  });
+
+  it('(9c) uma asserção que LANÇA ainda desfaz a transação', async () => {
+    // O caminho de falha é o que estava desprotegido: `pg.Pool` não faz
+    // rollback no `release()`, então um throw no meio devolvia ao pool um
+    // client ainda em transação e com `enable_seqscan=off`.
+    await expect(
+      explainWithoutSeqScan(async () => {
+        throw new Error('asserção falhou no meio da transação');
+      }),
+    ).rejects.toThrow('asserção falhou');
+
+    const fora = await pool.query<{ enable_seqscan: string }>('SHOW enable_seqscan');
+    expect(fora.rows[0]!.enable_seqscan, 'o slot voltou ao pool contaminado').toBe('on');
   });
 
   it('(10) cross-tenant: turno do outro tenant é invisível', async () => {
@@ -631,7 +795,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     const sibling = await mkTurn();
 
     const r = await inPrimary(() =>
-      agentTurnsRepo.markSuperseded({
+      agentTurnsRepo.markSupersededByAbsorber({
         turn_id: sibling.id,
         absorbed_by_turn_id: executor.id,
         expected_version: sibling.state_version,

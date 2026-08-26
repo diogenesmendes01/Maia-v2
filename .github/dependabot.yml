@@ -10,6 +10,31 @@ updates:
         patterns: ["@types/*"]
       eslint:
         patterns: ["eslint*", "@typescript-eslint/*"]
+  # O admin-ui é um projeto npm SEPARADO (`src/admin-ui/package.json` +
+  # lockfile próprio), e o bloco acima, ancorado em "/", nunca o enxergou. Foi
+  # exatamente por isso que um `critical` do Next viveu meses sem PR automática
+  # — o mesmo ponto cego que motivou o audit dos DOIS lockfiles no job
+  # `dependency-audit` (#521) e o ledger de exceções (#526).
+  #
+  # O ledger fechou a INVISIBILIDADE: hoje um advisory novo no admin-ui reprova
+  # o CI. Mas reprovar sem ninguém abrir a PR de correção transforma o próximo
+  # advisory em CI travado à espera de trabalho manual. Este bloco é a outra
+  # metade: o ledger avisa, o Dependabot propõe a correção.
+  #
+  # Cadência, limite de PRs e agrupamentos espelham o bloco da raiz de
+  # propósito — a política de atualização do repo é uma só; o que muda é o
+  # diretório.
+  - package-ecosystem: npm
+    directory: "/src/admin-ui"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      types:
+        patterns: ["@types/*"]
+      eslint:
+        patterns: ["eslint*", "@typescript-eslint/*"]
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -18,3 +43,15 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
+    ignore:
+      # Node 25 é uma linha ÍMPAR: entrou em EOL sem nunca ter sido LTS. Subir a
+      # imagem base para ela troca uma linha suportada por uma que já não recebe
+      # correção — o oposto do que um bump de dependência deveria fazer. A PR
+      # #538 propunha exatamente isso.
+      #
+      # O ignore é de `25.x` e SÓ de `25.x`, deliberadamente: bloquear todos os
+      # majors ímpares esconderia também o próximo major PAR quando ele chegar
+      # numerado logo depois, e o objetivo aqui é pular uma linha morta, não
+      # parar de acompanhar o Node.
+      - dependency-name: node
+        versions: ["25.x"]

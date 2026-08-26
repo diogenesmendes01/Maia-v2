@@ -4,10 +4,10 @@ import type { Mensagem, Pessoa, Conversa } from '../../src/db/schema.js';
 /**
  * Issue #511 — the warm-cache query budget.
  *
- * The cold number (13 prompt queries) is asserted in
- * `turn-context-baseline.spec.ts` with the cache feature OFF. This spec turns it
- * ON and pins what the cache is actually worth on the second turn of an agent:
- * the two identity reads disappear, taking the prompt to 11.
+ * The cold number is asserted in `turn-context-round-trips.spec.ts` with the
+ * cache feature OFF. This spec turns it ON and pins what the cache is actually
+ * worth on the second turn of an agent: exactly ONE query, the operational
+ * profile lookup.
  *
  * Round-1 review, P1: this used to be 8, because `capabilities` and `gaps` were
  * cached too. They were removed — only profile activation published an
@@ -73,7 +73,11 @@ vi.mock('../../src/db/repositories.js', () => ({
   mensagensRepo: {
     recentInConversation: h.count('mensagensRepo.recentInConversation', async () => []),
   },
-  entidadesRepo: { byIds: h.count('entidadesRepo.byIds', async () => []) },
+  entidadesRepo: {
+    byIds: h.count('entidadesRepo.byIds', async () => []),
+    // Issue #525 — entity rows and their state rows in ONE statement.
+    byIdsWithState: h.count('entidadesRepo.byIdsWithState', async () => []),
+  },
   entityStatesRepo: { byIds: h.count('entityStatesRepo.byIds', async () => []) },
   factsRepo: { listMentionableForScopes: h.count('factsRepo.listMentionableForScopes', async () => []) },
   rulesRepo: { listActive: h.count('rulesRepo.listActive', async () => []) },
@@ -84,7 +88,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: h.count('capabilitiesSkillRepo.listAll', async () => []) },
   capabilityGapsRepo: {
     listByLevel: h.count('capabilityGapsRepo.listByLevel', async () => []),
-    listByLevels: h.count('capabilityGapsRepo.listByLevels', async () => []),
+    listParaOTurno: h.count('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   procedureExecutionsRepo: {
     findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
@@ -174,10 +178,10 @@ describe('#511 warm-cache query budget', () => {
     for (const k of Object.keys(h.calls)) delete h.calls[k];
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
 
-    expect(totalCalls()).toBe(13);
+    expect(totalCalls()).toBe(11);
   });
 
-  it('drops from 13 to 12 queries on the legacy self_state path', async () => {
+  it('drops from 11 to 10 queries on the legacy self_state path', async () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const cold = totalCalls();
 
@@ -185,8 +189,8 @@ describe('#511 warm-cache query budget', () => {
     await runWithTenantContext(SCOPE, () => buildPrompt(mkCtx()));
     const warm = totalCalls();
 
-    expect(cold).toBe(13);
-    expect(warm).toBe(12);
+    expect(cold).toBe(11);
+    expect(warm).toBe(10);
 
     // Only the operational-profile lookup is served from cache (as a negative
     // entry: "no active profile v2"). Everything else is re-read every turn —
@@ -196,10 +200,8 @@ describe('#511 warm-cache query budget', () => {
     expect(Object.keys(h.calls).sort()).toEqual([
       'behavioralHintRepo.findActiveForScopes',
       'capabilitiesSkillRepo.listAll',
-      'capabilityGapsRepo.listByLevel',
-      'capabilityGapsRepo.listByLevels',
-      'entidadesRepo.byIds',
-      'entityStatesRepo.byIds',
+      'capabilityGapsRepo.listParaOTurno',
+      'entidadesRepo.byIdsWithState',
       'factsRepo.listMentionableForScopes',
       'memoryEntryRepo.findRelevant',
       'mensagensRepo.recentInConversation',
@@ -239,8 +241,8 @@ describe('#511 warm-cache query budget', () => {
 
     // The v2 path never reads self_state at all, so cold is one lower and the
     // cache removes the remaining identity query.
-    expect(cold).toBe(12);
-    expect(warm).toBe(11);
+    expect(cold).toBe(10);
+    expect(warm).toBe(9);
     expect(h.calls['operationalProfileVersionsRepo.getActive']).toBeUndefined();
     expect(h.calls['selfStateRepo.getActive']).toBeUndefined();
   });
@@ -254,8 +256,9 @@ describe('#511 warm-cache query budget', () => {
     // The catalogue is re-read every turn, so a revocation that commits
     // between two turns takes effect on the next one — not after a TTL.
     expect(h.calls['capabilitiesSkillRepo.listAll']).toBe(1);
-    expect(h.calls['capabilityGapsRepo.listByLevel']).toBe(1);
-    expect(h.calls['capabilityGapsRepo.listByLevels']).toBe(1);
+    // Issue #525 — ONE gap read now serves both gap blocks.
+    expect(h.calls['capabilityGapsRepo.listParaOTurno']).toBe(1);
+    expect(h.calls['capabilityGapsRepo.listByLevel']).toBeUndefined();
   });
 
   it('does NOT reuse one agent cached identity for another agent', async () => {
@@ -269,7 +272,7 @@ describe('#511 warm-cache query budget', () => {
     // A second agent in the same tenant is a cold cache, not a free ride.
     expect(h.calls['operationalProfileVersionsRepo.getActive']).toBe(1);
     expect(h.calls['selfStateRepo.getActive']).toBe(1);
-    expect(totalCalls()).toBe(13);
+    expect(totalCalls()).toBe(11);
   });
 
   it('does NOT reuse one tenant cached identity for another tenant', async () => {
@@ -280,6 +283,6 @@ describe('#511 warm-cache query budget', () => {
       buildPrompt(mkCtx()),
     );
 
-    expect(totalCalls()).toBe(13);
+    expect(totalCalls()).toBe(11);
   });
 });

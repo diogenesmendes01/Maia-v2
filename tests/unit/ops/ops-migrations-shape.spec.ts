@@ -14,6 +14,8 @@ import * as schema from '@/db/schema.js';
 const MIGRATIONS = join(process.cwd(), 'migrations');
 const sql101 = readFileSync(join(MIGRATIONS, '101_backup_runs_manifests.sql'), 'utf8');
 const sql102 = readFileSync(join(MIGRATIONS, '102_data_lifecycle.sql'), 'utf8');
+const sql112 = readFileSync(join(MIGRATIONS, '112_restore_drill_cleanup_status.sql'), 'utf8');
+const sql118 = readFileSync(join(MIGRATIONS, '118_privacy_export_purge.sql'), 'utf8');
 
 /** SQL with `--` comments removed, so prose about a literal is not mistaken for it. */
 function statementsOnly(sql: string): string {
@@ -30,6 +32,8 @@ describe('migrations are append-only with a _down sibling (AGENTS.md §4.6)', ()
   it.each([
     '101_backup_runs_manifests',
     '102_data_lifecycle',
+    '112_restore_drill_cleanup_status',
+    '118_privacy_export_purge',
   ])('%s has both _up and _down', (name) => {
     expect(existsSync(join(MIGRATIONS, `${name}.sql`))).toBe(true);
     expect(existsSync(join(MIGRATIONS, `${name}_down.sql`))).toBe(true);
@@ -99,6 +103,86 @@ describe('101 — backup evidence is scoped to the reserved `system` sentinel', 
   });
 });
 
+describe('118 — o TTL do export tem execução, e a execução é retomável', () => {
+  const down = readFileSync(join(MIGRATIONS, '118_privacy_export_purge_down.sql'), 'utf8');
+
+  /**
+   * DUAS colunas, e não uma. "Começou" e "terminou" precisam ser fatos
+   * separados: com uma só, um passe interrompido vira ou um pedido que se
+   * declara varrido com o `.enc` vivo (se a marcação fosse no começo) ou um
+   * passe sem rastro nenhum (se fosse no fim).
+   */
+  it('separa "começou a varrer" de "varreu"', () => {
+    expect(sql118).toMatch(/ADD COLUMN IF NOT EXISTS export_purge_started_at timestamptz/);
+    expect(sql118).toMatch(/ADD COLUMN IF NOT EXISTS export_purged_at timestamptz/);
+  });
+
+  it('recusa um pedido que se declare varrido sem nunca ter tido artefato', () => {
+    expect(sql118).toMatch(
+      /privacy_requests_export_purge_chk[\s\S]*?export_purged_at IS NULL OR export_locator IS NOT NULL/,
+    );
+  });
+
+  /**
+   * A fila do varredor é um índice PARCIAL, no padrão de 067/070: um índice
+   * completo pagaria manutenção em toda linha de `privacy_requests` para
+   * responder uma pergunta que só alcança as que têm artefato vivo.
+   */
+  it('indexa a fila do varredor PARCIALMENTE', () => {
+    expect(sql118).toMatch(
+      /privacy_requests_export_sweep_idx[\s\S]*?WHERE export_locator IS NOT NULL AND export_purged_at IS NULL/,
+    );
+  });
+
+  it('indexa o passe interrompido num predicado próprio', () => {
+    expect(sql118).toMatch(
+      /privacy_requests_export_purge_open_idx[\s\S]*?WHERE export_purge_started_at IS NOT NULL AND export_purged_at IS NULL/,
+    );
+  });
+
+  it('é idempotente — reaplicar não quebra', () => {
+    const stmts = statementsOnly(sql118)
+      .split(';')
+      .map((x) => x.trim())
+      .filter((x) => x.length > 0);
+    expect(stmts.length).toBeGreaterThan(0);
+    for (const stmt of stmts) {
+      // `ADD CONSTRAINT` não tem `IF NOT EXISTS` no PostgreSQL — o par
+      // `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` é o idioma equivalente,
+      // e é o que a 112 já usa.
+      expect(stmt).toMatch(/IF NOT EXISTS|DROP CONSTRAINT IF EXISTS|ADD CONSTRAINT/);
+    }
+  });
+
+  /**
+   * O down do 118 tem ENVELOPE EXPLÍCITO. O runner de down usa
+   * `psql -v ON_ERROR_STOP=1 -f`, que é autocommit por statement: sem
+   * BEGIN/COMMIT um erro no meio deixaria o schema parcialmente revertido e já
+   * commitado — fail-open no caminho que existe para desfazer.
+   */
+  it('o down tem envelope BEGIN/COMMIT', () => {
+    expect(down).toMatch(/^BEGIN;/m);
+    expect(down).toMatch(/^COMMIT;/m);
+    expect(down.indexOf('BEGIN;')).toBeLessThan(down.indexOf('ALTER TABLE'));
+  });
+
+  it('o down derruba índice e constraint ANTES das colunas', () => {
+    expect(down.indexOf('DROP INDEX')).toBeLessThan(down.indexOf('DROP COLUMN'));
+    expect(down.indexOf('DROP CONSTRAINT')).toBeLessThan(down.indexOf('DROP COLUMN'));
+  });
+
+  it('o down avisa que destrói evidência de conformidade', () => {
+    expect(down).toMatch(/dev\/CI/);
+    expect(down).toMatch(/evid[êe]ncia/i);
+  });
+
+  it('o schema Drizzle acompanha as colunas novas', () => {
+    const cols = Object.keys(schema.privacy_requests);
+    expect(cols).toContain('export_purge_started_at');
+    expect(cols).toContain('export_purged_at');
+  });
+});
+
 describe('102 — data lifecycle is genuinely per-tenant', () => {
   it.each(['legal_holds', 'privacy_requests', 'data_tombstones', 'retention_runs'])(
     '%s rejects the legacy `default` literal fail-closed',
@@ -148,6 +232,35 @@ describe('102 — data lifecycle is genuinely per-tenant', () => {
     // be exactly the "suposição jurídica como fato" the issue forbids.
     expect(sql102).not.toMatch(/retention_days\s+integer\s+NOT NULL DEFAULT/);
     expect(sql102).toMatch(/DPO/);
+  });
+});
+
+describe('112 — the drill teardown verdict is its own axis (issue #536, review of #541)', () => {
+  it('defaults to `unknown`, never to `clean`', () => {
+    // A row whose process died between `createDrill` and `finishDrill` must not
+    // read as a host that was checked. `clean` here would manufacture the very
+    // certification the column exists to withhold.
+    expect(sql112).toMatch(/cleanup_status text NOT NULL DEFAULT 'unknown'/);
+  });
+
+  it('constrains the vocabulary in the database, not only in TypeScript', () => {
+    expect(sql112).toMatch(
+      /CHECK \(cleanup_status IN \('unknown', 'clean', 'unsafe'\)\)/,
+    );
+  });
+
+  it('indexes the residue question, which is the one asked in an incident', () => {
+    // Partial: the healthy answer is zero rows, so a full index over a column
+    // that is 99% `clean` would not serve the query it exists for.
+    expect(sql112).toMatch(/CREATE INDEX IF NOT EXISTS restore_drills_unsafe_idx[\s\S]*?WHERE cleanup_status = 'unsafe'/);
+  });
+
+  it('adds a column instead of overloading failure_code', () => {
+    // The whole point: a probe failure and a teardown failure are different
+    // diagnoses that can happen together, and one column cannot hold both
+    // without the first masking the second.
+    expect(sql112).not.toMatch(/DROP COLUMN/);
+    expect(sql112).toMatch(/ADD COLUMN IF NOT EXISTS cleanup_status/);
   });
 });
 

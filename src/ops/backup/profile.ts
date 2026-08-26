@@ -151,6 +151,8 @@ export function resolveBackupProfile(input: BackupConfigInput): ResolvedBackupPr
  *   backup/production-encryption       BACKUP_ENCRYPTION_MODE=none em production
  *   backup/encryption-key              cifra exigida sem keyring/key id
  *   backup/rpo-feasible                BACKUP_RPO_TARGET_HOURS < 24
+ *   backup/drill-interval-feasible     intervalo do drill menor que o piso que
+ *                                      o agendador consegue honrar (#536)
  *   backup/retention-ordering          retenção cloud < local com off-site exigido
  *   backup/s3-credentials              bucket sem credenciais (regra da #515)
  *

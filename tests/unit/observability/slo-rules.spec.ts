@@ -1,6 +1,6 @@
 /**
- * Issue #514 §9 — drift guard between `monitoring/alerts/slo.rules.yml` and
- * the code that actually emits the metrics.
+ * Issue #514 §9 — drift guard between the committed alert rules and the code
+ * that actually emits the metrics.
  *
  * An alert that references a metric nobody emits is worse than no alert: it
  * looks like coverage and fires never. This spec fails the build when the two
@@ -8,17 +8,53 @@
  *
  * Parsed with a regex rather than a YAML library on purpose — `yaml` is only a
  * transitive dependency here, and this issue is not allowed to add one.
+ *
+ * ISSUE #536 — WHY THIS SCANS A DIRECTORY NOW. The guard was pinned to
+ * `monitoring/alerts/slo.rules.yml`. `monitoring/alerts/` then grew three more
+ * rule files, and every one of them was outside the guard's reach: a new file
+ * could point an alert at a series nobody emits and the suite stayed green —
+ * exactly the `maia_llm_calls_total{reason="rate_limit"}` failure this guard
+ * was written for, just in a file it was not looking at. The metric check now
+ * walks EVERY `*.yml` under `monitoring/alerts/`; a rule file that does not
+ * exist yet is covered the day it is added, with no edit here.
+ *
+ * The checks that encode SLO-specific semantics (turn-counter denominators,
+ * queue aggregation, burn rates) stay scoped to `slo.rules.yml`, because they
+ * are statements about those rules, not about alert files in general.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { METRIC_NAMES } from '../../../src/observability/taxonomy.js';
 
 const ROOT = resolve(__dirname, '../../..');
-const RULES_PATH = resolve(ROOT, 'monitoring/alerts/slo.rules.yml');
+const ALERTS_DIR = resolve(ROOT, 'monitoring/alerts');
 const RUNBOOK_PATH = resolve(ROOT, 'docs/runbooks/observability-slo.md');
 
-const rules = readFileSync(RULES_PATH, 'utf8');
+/** Every committed rule file, by basename. */
+const RULE_FILES: readonly string[] = readdirSync(ALERTS_DIR)
+  .filter((f) => f.endsWith('.yml'))
+  .sort();
+
+const RULE_TEXT: Record<string, string> = Object.fromEntries(
+  RULE_FILES.map((f) => [f, readFileSync(resolve(ALERTS_DIR, f), 'utf8')]),
+);
+
+/**
+ * Rule files whose alerts must be narrated in a runbook, and where.
+ *
+ * A MAP rather than a derivation from each alert's own link: six alerts in
+ * `redis.rules.yml` / `working-memory.rules.yml` predate this rule and would
+ * fail it today. Widening the map is the cleanup that fixes them — and it is a
+ * one-line change per file, which is the point of writing it as data.
+ */
+const RULES_TO_RUNBOOK: Record<string, string> = {
+  'slo.rules.yml': 'docs/runbooks/observability-slo.md',
+  'backup.rules.yml': 'docs/runbooks/backup-restore.md',
+};
+
+/** The SLO rules specifically — the subject of every `slo.rules.yml` check below. */
+const rules = RULE_TEXT['slo.rules.yml']!;
 
 /**
  * `maia_*` metrics emitted OUTSIDE the #514 taxonomy but genuinely present in
@@ -26,6 +62,12 @@ const rules = readFileSync(RULES_PATH, 'utf8');
  * claim instead of trusting the list.
  */
 const PRE_EXISTING_METRICS: Record<string, string> = {
+  // Emitida direto por `incCounter` em `src/lib/llm/telemetry.ts` — a camada
+  // crua, que não passa pelo gate de rótulos da taxonomia. Entrou nas regras
+  // quando `MaiaLlmRateLimited` deixou de casar a série legada
+  // `maia_llm_calls_total{reason=...}`, que nunca teve `reason` (rodada 3 da
+  // review da PR #541).
+  maia_llm_requests_total: 'src/lib/llm/telemetry.ts:110',
   maia_audit_events_total: 'src/governance/audit.ts:58',
   maia_audit_write_failed_total: 'src/governance/audit.ts:83',
   maia_tenant_id_default_literal_total: 'src/db/tenant-context.ts:260',
@@ -33,6 +75,20 @@ const PRE_EXISTING_METRICS: Record<string, string> = {
     'src/control-plane/runtime-trace/envelope-writer.ts:131',
   maia_baileys_connected: 'src/server.ts:21',
   maia_db_connected: 'src/server.ts:22',
+  // Família da carga de contexto do turno (#525). Emitida por
+  // `recordTurnContextLoad`, que usa `incCounter/observeHistogram` de
+  // `src/lib/metrics.ts` direto — fora do gate de rótulos da taxonomia, como as
+  // demais entradas desta tabela. Entrou nas regras na review da PR #554, quando
+  // `maia:context_load_ms:p95` deixou de ter emissor: `maia_context_load_ms` era
+  // da montagem P8a, cujo hot path a PR #406 removeu.
+  maia_turn_context_load_duration_ms: 'src/agent/turn-context/metrics.ts:91',
+  // Gauges por worker, registradas em `registerWorkerGauges` com
+  // `metricsInternal.key(...)` — fora do gate de rótulos da taxonomia, como as
+  // demais entradas desta tabela. Entrou aqui com `onboarding.rules.yml`
+  // (#519): a descrição do alerta de backlog manda o plantão comparar o atraso
+  // da fila com o último sucesso do `onboarding_expirer`, e essa comparação é
+  // o que separa "worker morto" de "teto pequeno demais".
+  maia_worker_last_success_timestamp: 'src/workers/index.ts:239',
 };
 
 /**
@@ -210,5 +266,298 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
     for (const forbidden of ['$labels.trace_id', '$labels.conversa_id', '$labels.telefone']) {
       expect(rules).not.toContain(forbidden);
     }
+  });
+});
+
+/**
+ * Issue #534 — o alerta de `resync_failed`, e a propriedade que ele não pode
+ * perder: uma réplica divergente basta.
+ *
+ * A série existia desde a #552 e nada a observava. O que ela responde é "esta
+ * réplica pode estar divergente da frota, e o kill switch pode não tê-la
+ * alcançado" — uma pergunta POR RÉPLICA. Escrita com `sum`, `avg` ou como razão
+ * sobre o total de releituras, ela deixa de responder isso: uma réplica entre
+ * vinte vira 5% de alguma coisa e não cruza limiar nenhum, ou vira um alerta sem
+ * `instance` que já está firing quando a segunda réplica diverge. Este bloco é o
+ * guard dessa propriedade — o texto do YAML é a única superfície onde ela pode
+ * ser verificada sem um servidor Prometheus.
+ */
+describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
+  const RESYNC_ALERTS = {
+    MaiaLlmCircuitResyncFailedEnforcing: 'critical',
+    MaiaLlmCircuitResyncFailed: 'warning',
+  } as const;
+
+  /** Bloco de um alerta: do nome dele até o próximo `- alert:` (ou o fim). */
+  function alertBlock(name: string): string {
+    const start = rules.indexOf(`- alert: ${name}\n`);
+    expect(start, `alerta ${name} não existe em slo.rules.yml`).toBeGreaterThan(-1);
+    const rest = rules.slice(start + 1);
+    const end = rest.indexOf('- alert: ');
+    return end === -1 ? rest : rest.slice(0, end);
+  }
+
+  /** A `expr` do bloco, escalar ou em bloco YAML, já sem indentação. */
+  function exprOf(block: string): string {
+    const lines = block.split('\n');
+    const i = lines.findIndex((l) => /^\s*expr:/.test(l));
+    expect(i, 'bloco de alerta sem `expr`').toBeGreaterThanOrEqual(0);
+    const indent = lines[i]!.match(/^\s*/)![0].length;
+    const out = [lines[i]!.replace(/^\s*expr:\s*\|?\s*/, '')];
+    for (const line of lines.slice(i + 1)) {
+      if (line.trim() === '') continue;
+      if (line.match(/^\s*/)![0].length <= indent) break;
+      out.push(line.trim());
+    }
+    return out.join(' ').trim();
+  }
+
+  it('os dois alertas existem, com a severidade que o modo pede', () => {
+    // `enforce` = a réplica pode estar recusando tráfego que o plantão já
+    // mandou parar de recusar ⇒ página. Fora dele, warning.
+    for (const [name, severity] of Object.entries(RESYNC_ALERTS)) {
+      expect(alertBlock(name), `${name} não declara severity: ${severity}`).toMatch(
+        new RegExp(`severity: ${severity}\\b`),
+      );
+    }
+  });
+
+  it('a severidade é decidida pelo rótulo `state`, que é a postura PRESERVADA', () => {
+    // `state` na série de resync é `effectiveMode()` no fim da releitura
+    // (`src/lib/llm/cache-invalidation.ts`, `finishResync`). É o caminho que já
+    // existe para correlacionar postura e falha — não há rótulo novo.
+    expect(exprOf(alertBlock('MaiaLlmCircuitResyncFailedEnforcing'))).toContain('state="enforce"');
+    expect(exprOf(alertBlock('MaiaLlmCircuitResyncFailed'))).toContain('state!="enforce"');
+  });
+
+  it('nenhuma das duas expressões agrega por cima das réplicas', () => {
+    // O defeito que este teste existe para pegar: `sum by (state) (...)`,
+    // `avg(...)`, ou uma razão sobre o total de releituras. Qualquer um deles
+    // apaga o `instance` — e uma réplica divergente entre vinte, que é o caso
+    // do alerta, some.
+    const AGGREGATORS = /\b(sum|avg|min|max|count|count_values|topk|bottomk|quantile|group|stddev|stdvar)\s*(by|without)?\s*(\([^)]*\))?\s*\(/;
+    for (const name of Object.keys(RESYNC_ALERTS)) {
+      const expr = exprOf(alertBlock(name));
+      expect(expr, `${name} agrega a série e perde o \`instance\`: ${expr}`).not.toMatch(
+        AGGREGATORS,
+      );
+      expect(expr, `${name} tem \`by(...)\`/\`without(...)\`: o \`instance\` some`).not.toMatch(
+        /\b(by|without)\s*\(/,
+      );
+      // Razão é a outra forma de diluir uma réplica na frota.
+      expect(expr, `${name} virou razão: uma réplica entre vinte não cruza limiar`).not.toContain(
+        '/',
+      );
+      expect(expr).toContain('maia_llm_circuit_mode_overrides_total');
+      expect(expr).toContain('reason="resync_failed"');
+    }
+  });
+
+  it('a série de resync não é agregada em NENHUMA linha executável, em nenhum arquivo', () => {
+    // O guard acima é sobre os dois alertas de hoje. Este é sobre a série: um
+    // `sum(...)` sobre `resync_failed` em qualquer regra futura (recording rule
+    // inclusive) reintroduz o mesmo defeito por outra porta.
+    const offenders: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const [n, line] of RULE_TEXT[file]!.split('\n').entries()) {
+        if (/^\s*#/.test(line)) continue;
+        if (!line.includes('resync_failed')) continue;
+        if (/\b(sum|avg|count|topk|group)\s*(by|without)?\s*(\([^)]*\))?\s*\(/.test(line)) {
+          offenders.push(`${file}:${n + 1}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      'agregação sobre `resync_failed` — a réplica divergente some no total: ' +
+        offenders.join(' | '),
+    ).toEqual([]);
+  });
+
+  /**
+   * Achado 2 da review do dono na PR #561. O desfecho de shutdown
+   * (`reason="resync_cancelled"`, `src/lib/llm/cache-invalidation.ts`) é a
+   * releitura CANCELADA por um drain — a réplica está saindo, não divergindo.
+   * Se ele cair nestes seletores, TODO deploy passa a paginar em `enforce`, que
+   * é exatamente o defeito apontado.
+   *
+   * A propriedade que sustenta isso é o seletor de IGUALDADE em `reason`.
+   * `reason=~"resync_.*"` ou `reason!="resynced"` teriam nome de métrica válido
+   * e casariam o balde novo em silêncio.
+   */
+  it('o desfecho de drain (`resync_cancelled`) não é selecionado por alerta nenhum', () => {
+    for (const name of Object.keys(RESYNC_ALERTS)) {
+      const expr = exprOf(alertBlock(name));
+      expect(
+        expr,
+        `${name} seleciona o desfecho de drain: um deploy deliberado passa a alertar`,
+      ).not.toContain('resync_cancelled');
+      // Igualdade exata, nunca regex nem negação: as duas formas casariam
+      // `resync_cancelled` sem citá-lo.
+      expect(expr, `${name} usa regex em \`reason\` — o balde de drain entra junto`).not.toMatch(
+        /reason\s*=~/,
+      );
+      expect(expr, `${name} usa negação em \`reason\` — o balde de drain entra junto`).not.toMatch(
+        /reason\s*!=/,
+      );
+      expect(expr).toMatch(/reason="resync_failed"/);
+    }
+
+    // E a mesma propriedade sobre a SÉRIE, em todo arquivo de regra: uma
+    // recording rule futura reintroduziria o defeito por outra porta.
+    const offenders: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const [n, line] of RULE_TEXT[file]!.split('\n').entries()) {
+        if (/^\s*#/.test(line)) continue;
+        if (line.includes('resync_cancelled')) offenders.push(`${file}:${n + 1}: ${line.trim()}`);
+      }
+    }
+    expect(
+      offenders,
+      'regra executável seleciona `resync_cancelled` — drain vira alerta: ' + offenders.join(' | '),
+    ).toEqual([]);
+  });
+
+  it('nenhum `resync_failed` fica sem alerta: os dois seletores cobrem todo `state`', () => {
+    // "Qualquer `resync_failed` deve alertar" (decisão do owner). Listar só
+    // `shadow` no segundo deixaria uma réplica divergente em `off` sem alerta
+    // nenhum — o buraco que esta leva vem fechando.
+    const selectors = Object.keys(RESYNC_ALERTS).map((n) => exprOf(alertBlock(n)));
+    const enforce = selectors.filter((s) => /state="enforce"/.test(s));
+    const rest = selectors.filter((s) => /state!="enforce"/.test(s));
+    expect(enforce, 'ninguém alerta `state="enforce"`').toHaveLength(1);
+    expect(
+      rest,
+      'o complemento de `enforce` não é coberto: um `resync_failed` em `off` ou `shadow` não alertaria',
+    ).toHaveLength(1);
+  });
+});
+
+/**
+ * Issue #536 — the same guard, over EVERY committed rule file.
+ *
+ * The block above is about `slo.rules.yml` and its SLO semantics. This one is
+ * about the property that must hold for any alert file the repository ships,
+ * including files that do not exist yet: what an alert queries has to be
+ * something the code emits.
+ */
+describe('issue #536 — every committed alert file is under the drift guard', () => {
+  /** Names of every alert in `file`, in declaration order. */
+  function alertsIn(file: string): string[] {
+    return [...RULE_TEXT[file]!.matchAll(/- alert: (\w+)/g)].map((m) => m[1]!);
+  }
+
+  it('the scan actually finds the rule files (a broken glob must not pass silently)', () => {
+    // Without this, a renamed directory would make every check below iterate an
+    // empty list and report success — the exact shape of failure this guard
+    // exists to prevent, one level up.
+    expect(RULE_FILES.length).toBeGreaterThanOrEqual(4);
+    expect(RULE_FILES).toContain('slo.rules.yml');
+    for (const file of RULE_FILES) {
+      expect(RULE_TEXT[file], `${file} is empty`).toContain('groups:');
+    }
+  });
+
+  it('every metric referenced by ANY alert file is actually emitted', () => {
+    const known = new Set<string>([...METRIC_NAMES, ...Object.keys(PRE_EXISTING_METRICS)]);
+    const unknown: string[] = [];
+    for (const file of RULE_FILES) {
+      for (const metric of referencedMetrics(RULE_TEXT[file]!)) {
+        if (!known.has(metric)) unknown.push(`${file}: ${metric}`);
+      }
+    }
+    expect(
+      unknown,
+      'alert files reference metrics that nothing emits — add the series to ' +
+        'METRIC (src/observability/taxonomy.ts) or, if it is emitted outside the ' +
+        'taxonomy, to PRE_EXISTING_METRICS WITH its emitter at file:line: ' +
+        unknown.join(', '),
+    ).toEqual([]);
+  });
+
+  it('every alert name is unique across ALL files, not just within one', () => {
+    // Prometheus loads every rule file into one namespace; two alerts sharing a
+    // name make a firing alert unattributable to the rule that produced it.
+    const all = RULE_FILES.flatMap(alertsIn);
+    const seen = new Set<string>();
+    const duplicated = all.filter((a) => {
+      if (seen.has(a)) return true;
+      seen.add(a);
+      return false;
+    });
+    expect(duplicated, `alert names defined twice: ${duplicated.join(', ')}`).toEqual([]);
+    expect(all.length).toBeGreaterThan(30);
+  });
+
+  it('no alert file leaks a high-cardinality id through an annotation template', () => {
+    for (const file of RULE_FILES) {
+      for (const forbidden of ['$labels.trace_id', '$labels.conversa_id', '$labels.telefone']) {
+        expect(RULE_TEXT[file], `${file} leaks ${forbidden}`).not.toContain(forbidden);
+      }
+    }
+  });
+
+  it('every alert in a mapped file is narrated in its runbook', () => {
+    for (const [file, runbookPath] of Object.entries(RULES_TO_RUNBOOK)) {
+      // Deleting a mapped rule file deletes coverage; the map is the assertion
+      // that it still exists.
+      expect(RULE_FILES, `${file} is missing from monitoring/alerts/`).toContain(file);
+      const runbook = readFileSync(resolve(ROOT, runbookPath), 'utf8');
+      const undocumented = alertsIn(file).filter((a) => !runbook.includes(a));
+      expect(
+        undocumented,
+        `${file}: alerts with no operator guidance in ${runbookPath}: ${undocumented.join(', ')}`,
+      ).toEqual([]);
+    }
+  });
+
+  it('every rule file is declared in the deployment wiring list', () => {
+    // There is no committed `prometheus.yml` — the deploy's config lives
+    // outside this repository, and `docs/runbooks/observability-slo.md` §8 is
+    // the only place that says which files to load. A rules file that exists
+    // but is never loaded is the same lie as an alert on a series nobody
+    // emits: it looks like coverage and fires never.
+    const wiring = readFileSync(RUNBOOK_PATH, 'utf8');
+    const unwired = RULE_FILES.filter((f) => !wiring.includes(`/etc/prometheus/rules/${f}`));
+    expect(
+      unwired,
+      'rule files missing from the rule_files list in docs/runbooks/observability-slo.md §8: ' +
+        unwired.join(', '),
+    ).toEqual([]);
+  });
+
+  it('the restore-drill gate is alerted on, and on the series the code emits', () => {
+    // The #536 gate specifically: `backup.rules.yml` must query the same series
+    // `readinessGauges` produces. Pointing it at a plausible-looking name that
+    // nothing emits is what the generic check above catches; this one pins
+    // WHICH series, so a silent rename of the gate cannot slip through as
+    // "well, the new name is in the taxonomy too".
+    const backup = RULE_TEXT['backup.rules.yml'];
+    expect(backup, 'monitoring/alerts/backup.rules.yml is gone').toBeDefined();
+    expect(backup).toContain('maia_restore_drill_check_level >= 2');
+    expect(alertsIn('backup.rules.yml')).toEqual([
+      'RestoreDrillEvidenceNotProvable',
+      'RestoreDrillEvidenceAging',
+    ]);
+  });
+
+  it('the gate alert names the non-terminal case, which is the one that asks for a different action', () => {
+    // The gate reproves for five different reasons and four of them are
+    // answered by reading `restore_drills` and re-drilling. The fifth — an
+    // execution that never reached a terminal state — asks the operator to go
+    // look at the HOST, because a decrypted copy of production may be sitting
+    // on it. An annotation that lists only the other four is actively
+    // misleading during exactly that incident.
+    const backup = RULE_TEXT['backup.rules.yml']!;
+    const critical = backup.slice(
+      backup.indexOf('- alert: RestoreDrillEvidenceNotProvable'),
+      backup.indexOf('- alert: RestoreDrillEvidenceAging'),
+    );
+    expect(critical, 'the gate alert does not mention the non-terminal execution').toMatch(
+      /NOT IN \('passed','failed','skipped'\)/,
+    );
+    expect(critical, 'the gate alert does not point at the runbook section for it').toContain(
+      '§4.4',
+    );
   });
 });

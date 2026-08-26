@@ -6,17 +6,20 @@ import { runHealthMonitor } from './health-monitor.js';
 import { runPendingExpirer } from './pending-expirer.js';
 import { runIdempotencyCleanup } from './idempotency-cleanup.js';
 import { runAuditModeExpirer } from './audit-mode-expirer.js';
+import { runOnboardingExpirer } from './onboarding-expirer.js';
 import { runInactivitySweep } from './inactivity-sweep.js';
 import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runPatternDetector } from './pattern-detector.js';
 import { runMessageRecovery } from './message-recovery.js';
+import { runStreamDebounceCloser } from './stream-debounce-closer.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
 import { runUnroutedRecovery } from './unrouted-recovery.js';
 import { runSeriesNextSchedulerWorker } from './series-next-scheduler.js';
-import { runNightlyBackup, runBackupRetention } from './backup.js';
+import { runNightlyBackup, runBackupRetention, runScheduledRestoreDrill } from './backup.js';
+import { runPrivacyExportSweepJob } from './privacy.js';
 import { runCostMonitor } from './cost-monitor.js';
 import { runAuditWatcher } from './audit-watcher.js';
 import { runDlqMonitor } from './dlq-monitor.js';
@@ -28,11 +31,16 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import {
+  runToolRequestIssueRelayer,
+  runToolRequestClosureMonitor,
+} from './tool-request-triage.js';
 import { runTraceBodyWriter } from './trace-body-writer.js';
 import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
+import { runOutboundRecovery } from './outbound-recovery.js';
 import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
 import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
@@ -53,6 +61,15 @@ export const JOBS: Job[] = [
   { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
+  // Issue #628 (fatia E da #505) — o RELÓGIO DE PAREDE do debounce
+  // transacional. O cron é 1/min, mas o tick DRENA por ~50s sondando a cada
+  // 500ms, porque uma janela de debounce é de segundos e fechar só no tick
+  // acrescentaria até 60s à resposta. FASE 1: com a flag ligada, este worker é
+  // o único caminho pelo qual uma rajada de texto vira turno executável — se
+  // ele não roda, a conversa espera o recovery por estado (STUCK_AFTER_MS).
+  // No-op barato com FEATURE_TURN_STREAM_DEBOUNCE (ou FEATURE_MESSAGE_DEBOUNCE)
+  // desligada: nem consulta o banco.
+  { name: 'stream_debounce_closer', cron: '* * * * *', fn: runStreamDebounceCloser, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
   // Spec 18 §10 — three scheduling workers:
   //  - scheduling_tick: every minute, claims due occurrences and advances
@@ -116,6 +133,12 @@ export const JOBS: Job[] = [
   // tuple under `runWithTenantContext`, fail-isolated.
   { name: 'workflow_engine_tick', cron: '*/30 * * * * *', fn: runWorkflowEngineTick, phase: 1 },
   { name: 'audit_mode_expirer', cron: '*/15 * * * *', fn: runAuditModeExpirer, phase: 1 },
+  // Issue #519 — housekeeping da saga de onboarding: marca `cancelled`
+  // (`last_error_code='expired'`) as runs cujo `expires_at` passou e que ainda
+  // não são terminais. Varredura GLOBAL sob contexto `system` (a run pode nem
+  // ter tenant ainda), em lotes de 100 por tick — ver o cabeçalho de
+  // `./onboarding-expirer.ts` para o porquê de não haver single-flight.
+  { name: 'onboarding_expirer', cron: '*/5 * * * *', fn: runOnboardingExpirer, phase: 1 },
   { name: 'idempotency_cleanup', cron: '0 4 * * *', fn: runIdempotencyCleanup, phase: 1 },
   // Issue #292 — outbound_messages sweeper (#227/#233 follow-up).
   // Cadence ~5min: stale-pending cutoff é 5min default, então rodar a cada
@@ -124,6 +147,16 @@ export const JOBS: Job[] = [
   // Dispatcher per-tenant via runWithTenantContext (espelha reflection-batch
   // #240/#251) — NÃO usa sentinela 'default'.
   { name: 'outbound_messages_sweeper', cron: '*/5 * * * *', fn: runOutboundMessagesSweeper, phase: 1 },
+  // Issue #633 (fatia D da #506) — varredura de recuperação do OUTBOX DURÁVEL.
+  // Distinto de `outbound_messages_sweeper` acima, que é o housekeeping do
+  // ledger LEGADO (rows sem `turn_id`) e agora as ignora explicitamente.
+  //
+  // Cadência de 1 min e não de 5: aqui o que se recupera é uma RESPOSTA ao
+  // usuário, e o SLI é a latência percebida. PHASE 1 de propósito —
+  // `startWorkers(1)` ignora phase>1, então em phase 2 o worker nunca rodaria.
+  // A FLAG é o gate real: com FEATURE_OUTBOUND_RECOVERY off ele é no-op na
+  // PRIMEIRA linha, sem tocar o banco.
+  { name: 'outbound_recovery', cron: '* * * * *', fn: runOutboundRecovery, phase: 1 },
   // Issue #316 — transactional effect outbox relayer. Dispatches NON-IDEMPOTENT
   // external effects (e.g. WhatsApp sends) recorded atomically with the winning
   // idempotency reservation, EXACTLY ONCE, with retry/backoff. Every minute so
@@ -141,6 +174,34 @@ export const JOBS: Job[] = [
   // every deletion from the manifest, evaluates legal hold under a lock, and
   // covers both destinations. Deletes nothing while RETENTION_DRY_RUN=true.
   { name: 'backup_retention', cron: '0 4 * * 0', fn: runBackupRetention, phase: 1 },
+  // Issue #536 — o TTL do export de privacidade, executado.
+  //
+  // HORÁRIO e não diário: o prazo é de dias, mas a granularidade da varredura é
+  // a JANELA DE EXPOSIÇÃO de um pacote cifrado com o dado consolidado de um
+  // titular já vencido. Com um passe diário essa janela chega a 24h; com um
+  // horário, a uma. O custo de um passe sem trabalho é uma leitura indexada
+  // sobre um índice parcial (migration 118) que, no caso saudável, tem zero
+  // linhas.
+  //
+  // No minuto 50 de propósito: longe do :00 (onde `nightly_backup`,
+  // `inactivity_sweep` e a maioria dos cron de hora cheia se acumulam) e longe
+  // do :40 do `restore_drill`, que é o único outro job que pode segurar um lock
+  // de ops por muito tempo.
+  { name: 'privacy_export_sweep', cron: '50 * * * *', fn: runPrivacyExportSweepJob, phase: 1 },
+  // Issue #536 — o GATE do drill de restore. `BACKUP_RESTORE_DRILL_INTERVAL_HOURS`
+  // é a IDADE MÁXIMA ACEITÁVEL DA EVIDÊNCIA, não um agendamento: por isso a
+  // cadência aqui é um TICK fixo de hora em hora e não um cron derivado do
+  // intervalo. O tick lê `restore_drills`, e só dispara um drill quando a
+  // evidência está perto de vencer (75% do intervalo) ou nunca existiu —
+  // evidência fresca faz o tick não fazer nada. Esta cadência de 1h é um dos
+  // três parâmetros do piso que o boot exige (`backup/drill-interval-feasible`,
+  // `src/config/rules.ts`): com os timeouts default o intervalo mínimo
+  // honrável é 10h, e abaixo disso o processo NÃO SOBE — mudar este cron muda
+  // aquele piso.
+  // Single-flight pelo lock `maia_ops_restore_drill` (o próprio
+  // `runRestoreDrillJob`), então CLI, réplica e tick anterior nunca correm
+  // juntos. PHASE 1 de propósito: startWorkers(1) ignora phase>1.
+  { name: 'restore_drill', cron: '40 * * * *', fn: runScheduledRestoreDrill, phase: 1 },
   { name: 'cost_monitor', cron: '30 2 * * *', fn: runCostMonitor, phase: 1 },
   { name: 'dlq_monitor', cron: '*/5 * * * *', fn: runDlqMonitor, phase: 1 },
   { name: 'conversation_summarizer', cron: '0 2 * * *', fn: runConversationSummarizer, phase: 2 },
@@ -158,6 +219,27 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // #638 (fatia C da épica #471) — a metade de backend da triagem de pedidos de
+  // ferramenta. O relayer roda de 5 em 5 minutos porque ele é o que o dono está
+  // esperando depois de clicar em "aceitar"; o monitor de fechamento roda de
+  // hora em hora porque o fato que ele observa (uma tool nova concedida a um
+  // agente) muda em escala de deploy, não de segundo.
+  {
+    name: 'tool_request_issue_relayer',
+    cron: '*/5 * * * *',
+    fn: async () => {
+      await runToolRequestIssueRelayer();
+    },
+    phase: 5,
+  },
+  {
+    name: 'tool_request_closure_monitor',
+    cron: '7 * * * *',
+    fn: async () => {
+      await runToolRequestClosureMonitor();
+    },
+    phase: 5,
+  },
   // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
   // reinforced→verified→active by evidence_count + age, and expires stale
   // rows to deprecated).

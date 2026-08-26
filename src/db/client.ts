@@ -1,6 +1,9 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 import { recordDbQuery } from './query-counter.js';
 
 export const pool = new pg.Pool({
@@ -129,6 +132,27 @@ export function pgErrorCode(err: unknown): string | undefined {
   for (let depth = 0; current != null && depth < 8; depth++) {
     const code = (current as { code?: unknown }).code;
     if (typeof code === 'string' && code.length > 0) return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * Extract the CONSTRAINT name a PostgreSQL error blames, walking the `cause`
+ * chain exactly like `pgErrorCode`.
+ *
+ * Why a caller needs this and not just the SQLSTATE: `23505` says "some unique
+ * was violated", and a table can carry several. Mapping every `23505` on
+ * `agent_turns` to "stream busy" (issue #625) would silently swallow a
+ * violation of `agent_turns_representative_uq` — a completely different defect,
+ * reported as a routine race. The constraint name is what makes the mapping
+ * NARROW: anything else is re-thrown untouched.
+ */
+export function pgErrorConstraint(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current != null && depth < 8; depth++) {
+    const name = (current as { constraint?: unknown }).constraint;
+    if (typeof name === 'string' && name.length > 0) return name;
     current = (current as { cause?: unknown }).cause;
   }
   return undefined;

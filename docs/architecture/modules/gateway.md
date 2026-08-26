@@ -46,6 +46,81 @@ nunca cria turno órfão. Falha de enqueue **não** vira `retryable`: não houve
 tentativa de execução, o turno fica em `received` para o sweep. Ver
 [`runtime.md`](runtime.md) e [`docs/runbooks/turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
+**Identidade de stream (#505, fases 1–2: shadow).** A DECISÃO mora em
+`createInbound` — a porta ÚNICA por onde um inbound entra no banco — e não no
+`handleIncoming`: um segundo caminho de ingresso escrito amanhã herda a fronteira
+em vez de precisar lembrar dela. A ordem lá é dedup ⇒ guarda fail-closed
+(`requireStreamIdentity`) ⇒ alocação da `ingress_seq` **dentro** da transação do
+INSERT.
+
+O RELATO é do gateway, e é aqui que ele fica porque `src/db/repositories/` é
+compartilhado com o console `admin-ui` e não pode alcançar `src/config/env.ts`
+(#596) — a camada de métrica alcança. `handleIncoming` portanto:
+
+| Desfecho | O que o gateway faz |
+|---|---|
+| `StreamIdentityUnresolvedError` | `reportStreamIngressRejected` (duas séries + `stream_ingress_rejected` em `audit_log`), loga `baileys.stream_identity_unresolved_drop` com o `whatsapp_id` e **derruba** — sem virar `baileys.handle_failed` opaco, que perderia o motivo tipado |
+| ingresso novo sequenciado | `reportStreamIngressResolved` + `noteIngressSequenced` (log `stream.ingress_sequenced`; `audit_log` só no NASCIMENTO da stream) |
+| reentrega (`duplicate`) | nada — a reentrega reusa a sequência da row original, e registrá-la contaria a mesma posição duas vezes |
+
+Nunca há queda para stream genérica. Em produção o caso irresolúvel já era
+fail-closed antes daqui: todo ramo não-lançante de `resolveChannel` devolve
+`channel_id`, e um miss de resolução já derruba a mensagem mais acima. A
+derivação e a semântica completa estão em
+[`runtime.md`](runtime.md#identidade-de-stream-e-sequência-de-ingresso-505-fases-12).
+
+**`jobId` determinístico (#504).** Quando o produtor conhece o turno, ele passa
+`turn_id` a `enqueueAgent`, que deriva `jobId = turn-<uuid>`
+([`src/runtime/turns/job.ts`](runtime.md)). Ingresso e sweep de recovery — que
+não se conhecem e podem rodar em réplicas distintas — passam a COLIDIR num único
+job em vez de armarem dois. O preço é a retenção da BullMQ: um job
+`completed`/`failed` retido vetaria o rearme legítimo de um turno que voltou a
+ser elegível, então `enqueueAgent` remove o cadáver antes do `add` e deixa job
+VIVO intocado (é ele quem faz a deduplicação). Quem decide se o trabalho ainda
+vale continua sendo o PostgreSQL — aqui só se impede que o transporte vete uma
+decisão já tomada no banco.
+
+O caminho do **debounce** mantém o `jobId` próprio (`debounce:<escopo>`): ele
+depende de remover e re-adicionar o job a cada mensagem para reiniciar a janela,
+o que é incompatível com um id que representa o trabalho e não a janela.
+
+**Payload V1 e V2 (#504).** A fila `agent` transporta duas formas durante a
+janela de compatibilidade, e o tipo `AgentQueuePayload`
+([`queue.ts`](../../../src/gateway/queue.ts)) é a união das duas. `startAgentWorker`
+classifica com `parseAgentTurnJob` UMA vez, no topo, e entrega o resultado já
+classificado ao processor — duas leituras independentes do mesmo buffer são duas
+verdades que podem divergir. `enqueueAgent` arma V2 (`{version: 2, turn_id}`) só
+com `FEATURE_TURN_JOB_V2=true` E `turn_id` conhecido; caso contrário arma V1. A
+ordem consumidor-antes-de-produtor é obrigatória e está no
+[runbook §7](../../runbooks/turn-state-machine.md). Nenhuma das duas formas
+carrega tenant: no V1 quem resolve é o resolver de canal dentro de
+`agent/core.ts`; no V2, o resolvedor de escopo de
+[`runtime.md`](runtime.md), antes de qualquer trabalho de domínio.
+
+**A terceira fila: `outbound-delivery` (#633).** Ela transporta um
+`outbound_id` e mais nada (`{version: 1, outbound_id}`, schema `.strict()`), com
+`jobId` DETERMINÍSTICO por `outbound_id` — `outbound-<uuid>`, namespace disjunto
+de `turn-*` e de `debounce:*`. Commit, varredura de recuperação e rearmamento
+manual colidem num job só.
+
+A colisão do `jobId` não é a garantia sozinha: jobs armados antes do deploy, ou
+um job já removido e re-adicionado, ainda produzem concorrência real. O que
+fecha é o claim atômico com lease de #632, e as duas camadas são independentes
+de propósito. Isso é verificável — a sonda de Redis real mostra que remover o
+`jobId` do produtor faz a primeira camada ficar vermelha e a segunda continuar
+verde.
+
+`enqueueOutboundDelivery` limpa o job RETIDO em `completed`/`failed` com o mesmo
+id ANTES do `add`, pela mesma razão de `clearRetainedTurnJob` (#504): sem isso a
+BullMQ ignoraria o `add` e a linha ficaria `retryable` para sempre, sem
+consumidor. Um job em `waiting`/`active`/`delayed` NÃO é removido — é trabalho
+vivo, e removê-lo para "rearmar" cancelaria uma entrega possivelmente em voo.
+
+O consumidor é registrado só com `FEATURE_OUTBOUND_DELIVERY_WORKER` ligada (um
+`Worker` da BullMQ consome assim que existe, então "registrar e não usar" não é
+opção), e a flag nasce OFF: o consumidor precede o produtor. Ver
+[`docs/runbooks/outbound-recovery.md`](../../runbooks/outbound-recovery.md).
+
 ## How to extend
 
 | Need | Where |

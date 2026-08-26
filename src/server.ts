@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+import Fastify, { type FastifyReply } from 'fastify';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -7,6 +7,9 @@ import {
   checkRedis,
   checkWhatsApp,
   toPublicHealthReport,
+  DIAGNOSTIC_ENDPOINT_HEADER,
+  DIAGNOSTIC_ENDPOINT_KIND,
+  PROBE_ENDPOINTS,
 } from '@/lib/healthcheck.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
 import { checkRoleReadiness, checkStartup } from '@/runtime/lifecycle/readiness.js';
@@ -17,7 +20,24 @@ import { isDbConnected, probeDb } from '@/db/client.js';
 import { startRedisMemoryCollector } from '@/observability/redis-memory-collector.js';
 import { registerTurnStateGauges } from '@/observability/turn-state-collector.js';
 import { registerQueueGauges } from '@/observability/queue-metrics.js';
+import { registerRuntimeObservability } from '@/observability/register.js';
 import { agentQueue, unroutedQueue } from '@/gateway/queue.js';
+
+/**
+ * Mark a response as a DIAGNOSTIC report rather than a probe verdict — issue
+ * #613, ADR 0003.
+ *
+ * The explicit `reply.code(200)` is the point. Before #613 the `/health`
+ * handler simply never called `reply.code`, and an omission cannot be told
+ * apart from a decision: the endpoint answered 200 while its body said
+ * `"status":"down"`, and `docs/admin-ui-deploy.md` told operators to use it as
+ * the `app` health check. The status is now written down, at the call site,
+ * next to the reason.
+ */
+function asDiagnostic(reply: FastifyReply): void {
+  reply.code(200);
+  reply.header(DIAGNOSTIC_ENDPOINT_HEADER, DIAGNOSTIC_ENDPOINT_KIND);
+}
 
 export async function buildServer() {
   const app = Fastify({ logger: false });
@@ -46,6 +66,14 @@ export async function buildServer() {
   // `max by (queue, state)` in the recording rules collapses the duplicates.
   registerQueueGauges(agentQueue, 'agent');
   registerQueueGauges(unroutedQueue, 'unrouted-replay');
+
+  // Issue #535 §1/§2 — the families #514 declared but never emitted: pg pool
+  // saturation, WhatsApp session presence/age and scheduler lag, plus the OTLP
+  // span exporter. All inert by default: the gauges are scrape-time providers
+  // (no work until a scrape) and the exporter does nothing without
+  // `MAIA_OTLP_TRACES_ENDPOINT`. Awaited so a registration failure surfaces at
+  // boot rather than as a silently missing series during an incident.
+  await registerRuntimeObservability();
 
   // Sonda sintética (spec §1.6) — sinal PRIMÁRIO de outage, DURÁVEL (lido de
   // synthetic_probe_state.last_ok_at, não in-memory): segundos desde o último
@@ -79,9 +107,16 @@ export async function buildServer() {
   app.addHook('onClose', async () => {
     clearInterval(dbProbeTimer);
     redisMemoryCollector.stop();
+    // Issue #535 — stop the OTLP batch timer and make one last flush attempt,
+    // so the spans of the turns that ran just before a deploy are not the ones
+    // an operator loses.
+    const { stopOtlpExporter } = await import('@/observability/otlp-exporter.js');
+    await stopOtlpExporter();
   });
 
-  // Issue #512 — three DISTINCT probes with three distinct jobs.
+  // Issue #512 — three DISTINCT probes with three distinct jobs. The fourth
+  // health-shaped surface, `/health*`, is NOT one of them: issue #613 / ADR
+  // 0003 makes it explicitly diagnostic (always 200 — see below).
   //
   // /livez     — is the process alive? NO I/O at all: no DB, no Redis, no
   //              WhatsApp, no disk. A liveness probe that touches a dependency
@@ -114,16 +149,44 @@ export async function buildServer() {
     return report;
   });
 
-  // `/health` is the component view for humans and the container healthcheck.
-  // Issue #512: it is now READ-ONLY (no `system_health_events` rows per poll),
-  // cached, and stripped of raw driver text before leaving the process.
-  app.get('/health', async () => {
+  // `/health*` is the component view for humans and dashboards. Issue #512:
+  // READ-ONLY (no `system_health_events` rows per poll), cached, and stripped
+  // of raw driver text before leaving the process.
+  //
+  // Issue #613 / ADR 0003 — it is a DIAGNOSTIC endpoint and NOT a probe. The
+  // 200 below is DELIBERATE and unconditional: it reports that the report was
+  // produced, not that the system is well. The verdict is in the body, and the
+  // endpoints that carry a verdict in the STATUS are the three above.
+  //
+  // Do NOT make this conditional on `report.status`. `checkAll()` is
+  // role-blind and flat (see the note on the constants in
+  // `src/lib/healthcheck.ts`): `whatsapp: down` is the normal steady state of
+  // an `api`/`worker`/`scheduler` process, so a 503 here would drain
+  // correctly-healthy instances that `/readyz` — the role-aware, fail-closed
+  // gate — keeps in rotation on purpose.
+  app.get('/health', async (_req, reply) => {
     const report = await checkAll();
-    return { status: report.status, components: report.components.map(toPublicHealthReport) };
+    asDiagnostic(reply);
+    return {
+      status: report.status,
+      // On the wire, for whoever pointed a health check here by mistake.
+      probe: false,
+      probes: PROBE_ENDPOINTS,
+      components: report.components.map(toPublicHealthReport),
+    };
   });
-  app.get('/health/db', async () => toPublicHealthReport(await checkDb()));
-  app.get('/health/redis', async () => toPublicHealthReport(await checkRedis()));
-  app.get('/health/whatsapp', async () => toPublicHealthReport(await checkWhatsApp()));
+  app.get('/health/db', async (_req, reply) => {
+    asDiagnostic(reply);
+    return toPublicHealthReport(await checkDb());
+  });
+  app.get('/health/redis', async (_req, reply) => {
+    asDiagnostic(reply);
+    return toPublicHealthReport(await checkRedis());
+  });
+  app.get('/health/whatsapp', async (_req, reply) => {
+    asDiagnostic(reply);
+    return toPublicHealthReport(await checkWhatsApp());
+  });
   app.get('/metrics', async (_req, reply) => {
     reply.header('content-type', 'text/plain; version=0.0.4');
     return renderPrometheus();

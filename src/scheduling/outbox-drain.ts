@@ -24,6 +24,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { sendAlert } from '@/lib/alerts.js';
 import { outboxRepo, occurrencesRepo, tasksRepo } from './repos.js';
 import { tryAcquireSendSlot, releasePaceKey } from './backpressure.js';
@@ -303,7 +304,12 @@ function pickChannel(msg: OutboxMessage): Channel | null {
         // resolve o canal único do agente). A linha chega JÁ resolvida e
         // gated pelo processOne (review #496 alto 4); o retorno é o provider
         // id — null vira falha retryable no chamador.
-        send: (line) => line!.sendText(p.jid, p.text),
+        // #634 — exceção INVENTARIADA (`scheduling.outbox_drain`): o drain JÁ é um
+        // outbox durável com claim, retry e DLQ próprios, e sem `turn_id`.
+        send: (line) =>
+          withDeclaredEgressException('scheduling.outbox_drain', () =>
+            line!.sendText(p.jid, p.text),
+          ),
       };
     }
     case 'whatsapp_pending_question': {

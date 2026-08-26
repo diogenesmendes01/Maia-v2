@@ -146,6 +146,17 @@ vi.mock('../../src/config/env.js', () => ({
     CLAUDE_MODEL_FAST: 'claude-haiku-4-5-20251001',
   },
 }));
+vi.mock('../../src/config/contract-env.js', () => ({
+  contractEnv: {
+    get LLM_PROVIDER() {
+      return mockLlmProvider;
+    },
+    OPENROUTER_MODEL_MAIN: 'anthropic/claude-sonnet-4.6',
+    OPENROUTER_MODEL_FAST: 'anthropic/claude-haiku-4.5',
+    CLAUDE_MODEL_MAIN: 'claude-sonnet-4-6',
+    CLAUDE_MODEL_FAST: 'claude-haiku-4-5-20251001',
+  },
+}));
 
 beforeEach(() => {
   globalByKey.clear();

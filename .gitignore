@@ -10,9 +10,14 @@ dist/
 .env.*.local
 # Fase 0 cap. 6 — env files reais do compose de produção (nunca commitar).
 # Os exemplos versionados são .env.app.prod.example / .env.admin.prod.example.
+# `.env.migrator` é o do recurso de migration separado da infra real (#565),
+# cujo exemplo é .env.migrator.prod.example — ele não é usado pelo compose (o
+# serviço `migrate` não tem `env_file` de propósito), mas o runbook manda
+# copiá-lo, e um `cp` na raiz não pode virar commit.
 .env.app
 .env.admin
 .env.infra
+.env.migrator
 
 # WhatsApp / Baileys
 .baileys-auth/
@@ -31,6 +36,10 @@ uploads/
 # Testes
 coverage/
 .nyc_output/
+# Saída do Playwright (relatório JSON lido por scripts/check-playwright-run.ts,
+# traces/screenshots das falhas). O CI publica como artefato quando reprova.
+.playwright-report/
+test-results/
 
 # OS
 .DS_Store
@@ -67,3 +76,23 @@ p8.5-plan.md
 p8.5-spec.md
 
 src/admin-ui/next-env.d.ts
+
+# Artefato do redis-server quando ele é iniciado a partir da raiz do repo
+# (sandbox de teste). Nunca é código.
+dump.rdb
+
+# Baseline do gate da #525 (`npm run turn:bench`): é uma medição DAQUELA máquina,
+# não um artefato compartilhado. Cada host/esteira grava o seu com --write-baseline.
+scripts/turn-context-baseline.json
+
+# Saídas de corrida do gate da #525 (`npm run turn:bench`) — artefatos locais.
+bench-*.out
+
+# Resumo de diagnóstico dos testes (#545) — gerado por VITEST_SUMMARY_FILE,
+# usado pelo passo "Resumo dos testes" do CI. Efêmero, nunca versionado.
+.ci-test-summary/
+
+# Artefatos do harness de fault injection (#510) — timeline, stdout/stderr e
+# snapshots sanitizados de uma rodada que reprovou. São diagnóstico local/CI,
+# retidos pelo job, nunca versionados.
+tests/reliability/artifacts/

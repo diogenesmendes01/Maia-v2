@@ -182,7 +182,12 @@ curl -s -H "x-maia-setup-token: $TOKEN" \
 
 ## 3. LLM provider down (Anthropic, OpenAI, Voyage)
 
-**Sinal**: audit `llm_circuit_opened` aparecendo, métrica `maia_llm_calls_total{status="error"}` crescendo, mensagens demorando ou falhando.
+**Sinal**: audit `llm_circuit_opened` aparecendo, mensagens demorando ou
+falhando, e `maia_llm_requests_total{status=~"error|timeout"}` crescendo — o
+`timeout` do SDK é status PRÓPRIO e é uma das três falhas que abrem o disjuntor,
+então olhar só `status="error"` esconde metade do incidente. Para saber QUAL par
+está sofrendo, agrupe por `(provider, workload)`: a série legada
+`maia_llm_calls_total` não carrega `workload`.
 
 **Diagnóstico**:
 
@@ -205,6 +210,514 @@ GROUP BY acao;
 **Audit log relacionado**: `llm_circuit_opened`, `llm_circuit_closed`.
 
 > Quando a PR #24 (audit_watcher) for mergeada, a regra `llm_circuit_long_open` dispara alerta após 5 min sem `_closed`.
+
+---
+
+## 3.1 Disjuntor de LLM — postura, kill switch e promoção
+
+O disjuntor tem TRÊS posturas. **Em produção o default é `shadow`**: ele observa
+e mede, mas não recusa nada. Promover para `enforce` é uma decisão com número na
+mão, e este é o procedimento.
+
+| Postura | O caller vê | Estado guardado |
+|---|---|---|
+| `off` | nada muda | nenhum |
+| `shadow` (default) | nada muda — **nunca recusa** | sim, e mede |
+| `enforce` | recusa com `circuit_open` | sim |
+
+### Qual é a postura AGORA
+
+```bash
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode
+# maia_llm_circuit_mode{state="off"} 0
+# maia_llm_circuit_mode{state="shadow"} 1     ← esta é a que vale
+# maia_llm_circuit_mode{state="enforce"} 0
+```
+
+Par de séries, exatamente uma valendo `1` — nunca leia por valor numérico. Se
+nenhuma das três aparecer, o processo ainda não fez chamada de LLM alguma (as
+séries são registradas na primeira leitura da postura).
+
+### Alerta `llm_circuit_long_open` — como ler
+
+O watcher de auditoria (`src/workers/audit-watcher.ts`) acusa `llm_circuit_opened`
+sem `llm_circuit_closed` correspondente há mais de 5 min. Desde a revisão da PR
+#541 o par é correlacionado por **`provider` / `workload` / `replica`**, e o
+corpo do alerta NOMEIA cada circuito preso:
+
+```
+2 instance(s) with `llm_circuit_opened` older than 5 min and no matching `llm_circuit_closed`.
+Identity is `provider/workload/replica`:
+  - anthropic/reasoner/maia-app-7d9f:1#a1b2c3d4 (3 event(s), oldest 2026-08-09T00:11:54Z)
+```
+
+Antes disso a regra casava QUALQUER fechamento posterior com QUALQUER abertura:
+um circuito que abriu e fechou normalmente desarmava o alerta de outro que
+continuava preso. O estado do disjuntor é por `(provider, workload)` **e por
+réplica** — a janela de amostras vive na memória de cada processo —, então
+correlacionar por menos que isso cega o alerta exatamente no caso que ele existe
+para pegar.
+
+**`replica` é `<hostname>:<pid>#<boot>`.** O sufixo de boot é sorteado por
+processo: sem ele, um container que reinicia (hostname estável, PID 1) herdaria
+a identidade do processo morto e fecharia o par que ele deixou pendurado.
+
+**Falso positivo conhecido: réplica que morreu com o circuito aberto.** Ela nunca
+emite o `closed`, e a abertura órfã alerta enquanto estiver na janela de 24 h do
+watcher. É o preço deliberado de não deixar o boot seguinte fechar o par.
+Como distinguir em 10 segundos:
+
+```bash
+# A réplica citada ainda existe? `maia_llm_circuit_state` só existe em processo
+# VIVO — se o par não aparece em lugar nenhum da frota, o alerta é o rastro de
+# um processo que já morreu.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_state.*state="open"'
+```
+
+Se nenhuma réplica viva reporta `state="open"` para aquele par, o incidente já
+passou junto com o processo — anote e siga. Se alguma reporta, o circuito está
+preso de verdade: vá para a seção 3 (LLM provider down).
+
+### KILL SWITCH — desligar durante um incidente, sem restart e sem deploy
+
+Use quando **o disjuntor é o incidente**: recusando tráfego que o provider ainda
+serviria, preso em `open` por um falso positivo, ou abrindo em brownout.
+
+```bash
+# 1. Monte o payload. `actor` e `reason` são OBRIGATÓRIOS — um override sem eles
+#    é RECUSADO (e a recusa também é contada). Não há como virar esta chave
+#    anonimamente, de propósito.
+#    A validade vai como `expires_at` ABSOLUTO (epoch ms), NUNCA como `ttl_ms`:
+#    ver a caixa "duas regras" logo abaixo.
+EXP=$(( ($(date +%s) + 1800) * 1000 ))    # 30 min a partir de agora
+PAYLOAD="{\"mode\":\"off\",\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 disjuntor abrindo em brownout\",\"expires_at\":$EXP}"
+
+# 2. Chave durável PRIMEIRO (réplica que subir no meio do incidente adota o
+#    resto do arrendamento), depois o broadcast. O `PX` tem que casar com o
+#    `expires_at` do payload.
+redis-cli SET  maia:llm:circuit:override "$PAYLOAD" PX 1800000
+redis-cli PUBLISH maia:llm:circuit:override "$PAYLOAD"
+
+# 3. Confirme que a chave REALMENTE expira. `-1` aqui significa chave eterna:
+#    aborte e regrave com PX antes de seguir.
+redis-cli PTTL maia:llm:circuit:override
+
+# 4. Confirme em TODAS as réplicas.
+curl -s http://localhost:3000/metrics | grep 'maia_llm_circuit_mode{state="off"} 1'
+```
+
+> **Duas regras da chave durável — as duas são o que faz o kill switch poder ser
+> esquecido sem virar configuração permanente (revisão da #541).**
+>
+> 1. **Sempre `PX`.** Uma chave sem TTL vive para sempre. `PTTL` retornando `-1`
+>    é o sinal.
+> 2. **Sempre `expires_at` absoluto no payload, nunca `ttl_ms`.** Validade
+>    relativa numa chave durável é reinterpretada contra o relógio de cada boot:
+>    toda réplica que reiniciasse ressuscitaria o arrendamento inteiro, e o
+>    override atravessaria deploys. Uma chave assim é **recusada na adoção**
+>    (`maia_llm_circuit_mode_overrides_total{reason="rejected"}`), então o
+>    sintoma é a frota não adotar o override — não é falha silenciosa, mas
+>    também não é o que você quer no meio de um incidente.
+>
+> Quem publica pelo código (`publishCircuitOverride`) já recebe as duas de
+> graça: ele normaliza `ttl_ms` para absoluto, valida os limites antes de tocar
+> no Redis e sempre grava com `PX`. As regras acima existem para o caminho do
+> `redis-cli` na mão.
+>
+> **Relógio:** `expires_at` é resolvido no relógio de quem publica e comparado
+> no de quem recebe. Assume-se skew NTP de ordem de segundos, o que é ruído
+> contra um arrendamento de 30min. Réplica adiantada volta cedo para a postura
+> versionada (direção segura); réplica atrasada estica o arrendamento pelo skew
+> e só nela. Skew grosseiro não passa: vira `rejected` por "já vencido na
+> chegada" ou pelo teto de 24h.
+
+**Reverter antes do TTL:**
+
+```bash
+CLEAR="{\"clear\":true,\"actor\":\"sre:seu-usuario\",\"reason\":\"INC-1234 encerrado\"}"
+redis-cli DEL maia:llm:circuit:override
+redis-cli PUBLISH maia:llm:circuit:override "$CLEAR"
+```
+
+**Se o Redis estiver fora**, o override não propaga. Segunda alavanca, com o
+custo honesto de um restart: `LLM_CIRCUIT_MODE=off` no `.env` +
+`docker compose up -d --no-deps app`. É por isso que a variável é declarada
+`restartRequired: true` no contrato — vendê-la como quente seria mentira.
+
+**Restrições que o código impõe** (e por que existem):
+
+- `actor` e `reason` vazios ⇒ recusado. Um kill switch anônimo não é auditável,
+  e a objeção original da #534 a toggles de runtime era exatamente essa.
+- TTL acima de 24h ⇒ recusado, não truncado. Desligar o disjuntor por mais de um
+  dia é decisão de deploy, não de plantão.
+- Sem TTL declarado ⇒ 30 min. Ele **expira sozinho** e volta para a postura do
+  contrato; o retorno também é um evento contado.
+- Chave durável sem `expires_at` absoluto ⇒ recusada na adoção. Ver a caixa
+  "duas regras" acima.
+
+**Réplica que sobe durante a virada.** Uma réplica nova só lê a chave durável
+depois que a inscrição no canal está CONFIRMADA pelo Redis. Isso fecha a janela
+em que ela leria a chave antes do seu `SET` e perderia o `PUBLISH` por ainda não
+estar inscrita — o modo de falha em que metade da frota atravessa o incidente na
+postura antiga.
+
+**Réplica que RECONECTA durante a virada.** Pub/sub é at-most-once e não tem
+replay: a mensagem publicada enquanto o socket estava caído está perdida. Desde
+o gate 4 da #534, toda volta da conexão do subscriber (o segundo `ready` do
+ioredis em diante) dispara uma RELEITURA do estado autoritativo — chave presente
+⇒ adota o que sobrou do arrendamento; chave ausente ⇒ limpa o override local e
+volta à postura do contrato. Não é preciso republicar nem esperar TTL. Para
+confirmar que uma réplica específica passou por isso:
+
+```bash
+curl -s http://localhost:3000/metrics | grep 'reason="resync'
+# maia_llm_circuit_mode_overrides_total{state="off",reason="resynced"} 1
+journalctl -u maia | grep llm_gateway.circuit_override_resync
+```
+
+A releitura tem **retry limitado** (decisão do owner na #534): tentativa
+imediata + 3 retries, com backoff exponencial, jitter e deadline por tentativa
+(`RESYNC_RETRY`, `src/lib/llm/cache-invalidation.ts`). Uma tentativa
+intermediária que falha sai só como `llm_gateway.circuit_override_resync_retry`
+(WARN, com `attempt` e o erro) e **não** entra na série de convergência — a
+falha típica aqui é um `LOADING` de failover, e desistir dela marcaria a réplica
+como divergente por causa de um soluço.
+
+O deadline vale para a tentativa INTEIRA — ack de re-inscrição e `GET` dividem
+o mesmo orçamento —, então o pior caso de uma releitura que esgota é **~10,1s**:
+4 × 2 000 ms + 300 + 600 + 1 200 ms de backoff no pior jitter
+(`resyncWorstCaseMs()`).
+
+`resync_failed` (log de ERRO `llm_gateway.circuit_override_resync_failed`, campo
+`attempts`) é a saída ruim, é **terminal** e cobre TODA releitura que não pôde
+afirmar consistência com o Redis. Terminal por dois caminhos: **esgotamento das
+falhas retentáveis** (`attempts=4`) **ou recusa determinística** do payload lido
+(`attempts=1` — retentar daria o mesmo veredito). É a série que os alertas
+`MaiaLlmCircuitResyncFailedEnforcing` (crítico) e `MaiaLlmCircuitResyncFailed`
+(warning) observam, por réplica; leitura do alerta em
+[`observability-slo.md` §4.9.3](observability-slo.md). O campo `outcome` do log
+diz qual:
+
+| `outcome` | O que aconteceu |
+|---|---|
+| `failed` | `GET` falhou (ou estourou o deadline), chave ilegível, ou re-inscrição sem ack — não houve leitura defensável em nenhuma das 4 tentativas |
+| `rejected` | a chave FOI lida e foi recusada (sem `expires_at` absoluto, sem ator, vencida, acima do teto) — terminal na primeira leitura |
+
+**Réplica drenando não é divergência.** Se o subscriber for fechado (deploy,
+scale-in, restart) com a releitura em voo, ela é **cancelada** e sai como
+`reason="resync_cancelled"` + log **INFO**
+`llm_gateway.circuit_override_resync_cancelled` — fora dos dois alertas. Um drain
+deliberado não acorda o plantão (achado 2 da review da PR #561). A linha traz
+`cancel_reason` (por que foi cancelado) e `channels` (qual subscriber fechou);
+INFO, e não WARN, porque um subscriber que para é operação normal (decisão 16).
+
+Nos dois o estado local é **preservado** — fail-closed, porque concluir "não há
+override" a partir de um Redis mudo (ou de um payload que não passa na
+governança) desligaria o kill switch sozinho. Uma réplica nesse estado pode
+estar divergente da frota: republique o `SET` + `PUBLISH` (é idempotente); se
+o `outcome` for `rejected`, olhe o payload da chave antes (`redis-cli GET
+maia:llm:circuit:override`), porque republicar não conserta payload inválido —
+e é por isso que a recusa NÃO é retentada: o veredito é determinístico sobre o
+conteúdo da chave, e retentar só encheria a trilha durável de linhas
+`_rejected` idênticas. Se persistir, trate como Redis fora do ar — segunda
+alavanca.
+
+`superseded` **não** é falha: ali a releitura perdeu para uma mensagem do canal,
+que é sempre pelo menos tão nova quanto o que o `GET` leu — o estado final é o
+do Redis, e sai como `resynced`.
+
+### Auditoria — como saber que alguém mexeu
+
+```bash
+# Métrica (é onde o alerta deve morar):
+curl -s http://localhost:3000/metrics | grep maia_llm_circuit_mode_overrides_total
+# maia_llm_circuit_mode_overrides_total{state="off",reason="applied"} 1
+
+# Log estruturado (carrega ator e motivo — texto livre não vai para label):
+journalctl -u maia | grep llm_gateway.circuit_mode_override
+```
+
+`reason` ∈ `applied` · `expired` · `cleared` · `rejected` · `adopted` ·
+`resynced` · `resync_failed` · `resync_cancelled`. Um `rejected` no gráfico
+significa que alguém TENTOU virar a chave e não conseguiu — vale investigar
+tanto quanto um `applied`.
+
+Os **três últimos** são a releitura de reconexão, uma linha por releitura, e
+eles não querem dizer a mesma coisa:
+
+| `reason` | O que aconteceu | O que fazer |
+|---|---|---|
+| `resynced` | a releitura CONVERGIU — leu o estado autoritativo e o aplicou (inclusive quando não mudou nada) | nada; é o caminho feliz |
+| `resync_failed` | a releitura DIVERGIU — esgotou as tentativas sem conseguir ler | investigar Redis/rede; é o único dos três que alerta |
+| `resync_cancelled` | a releitura foi ABANDONADA porque o subscriber parou (shutdown) | nada, se houve deploy/restart. Se aparecer sem restart, a pergunta é por que a réplica está reiniciando |
+
+`resync_cancelled` não é falha: o estado local é preservado e nenhuma postura
+é aplicada, limpa ou recusada. Por isso ele fica fora de `DIVERGENT_OUTCOMES`
+e nenhum alerta o seleciona.
+
+> **Série histórica.** Até 2026-08-17 este balde saía como
+> `reason="resync_aborted"`. O rename **quebra a continuidade da série** — uma
+> query que cubra a virada precisa somar os dois rótulos
+> (`reason=~"resync_aborted|resync_cancelled"`) até o dado velho sair da
+> retenção. Detalhe em [`observability-slo.md`](observability-slo.md).
+
+**A fonte DURÁVEL é `audit_log`** (revisão da PR #541). Métrica expira na
+retenção do Prometheus e log expira na do coletor — é a trilha que responde
+"quem virou a chave em março?". Toda virada, limpeza, expiração e recusa vira
+linha, sob `tenant_id='system'` (a postura é da frota, não de um tenant):
+
+```sql
+SELECT created_at, acao,
+       metadata->>'actor'  AS actor,
+       metadata->>'reason' AS motivo,
+       metadata->>'mode'   AS postura,
+       metadata->>'expires_at' AS validade,
+       metadata->>'source' AS origem,   -- 'adopted' = chave durável no boot; 'resynced' = releitura de reconexão
+       metadata->>'error'  AS erro      -- só nas recusas
+  FROM audit_log
+ WHERE acao LIKE 'llm_circuit_mode_override_%'
+   AND created_at > NOW() - INTERVAL '30 days'
+ ORDER BY created_at DESC;
+```
+
+Ações: `llm_circuit_mode_override_applied` · `_cleared` · `_expired` ·
+`_rejected`. A adoção da chave durável no boot entra como `applied` com
+`metadata.source = 'adopted'`, e a releitura de reconexão com
+`metadata.source = 'resynced'` — é o mesmo desfecho de governança (a postura
+mudou), com procedência diferente. Uma limpeza vinda da releitura aparece como
+`_cleared` com `actor = 'system:llm_circuit_resync'`: não houve humano, o que
+mudou a postura foi a convergência com o Redis.
+
+Se a métrica registrar um `applied` e a trilha não tiver a linha, o suspeito é
+a escrita: cheque `maia_audit_write_failed_total{action=...}` e o log
+`llm_gateway.circuit_audit_failed`.
+
+### Promoção `shadow` → `enforce`
+
+> **A postura é GLOBAL.** `LLM_CIRCUIT_MODE` vale para o processo inteiro —
+> `effectiveMode()` em `src/lib/llm/circuit-mode.ts` não recebe `provider` nem
+> `workload`. **Não existe promoção seletiva por workload.** Ou TODOS os
+> workloads ativos passam nos critérios abaixo, ou não se promove: promover
+> "porque o `reasoner` está limpo" liga o `enforce` para `summarizer`,
+> `vision`, `skill` e todo o resto junto. Se a promoção parcial for mesmo o que
+> se quer, o trabalho é implementar postura POR WORKLOAD primeiro — não
+> promover mesmo assim e torcer.
+
+> **PRÉ-REQUISITO — a lacuna de reconexão do pub/sub: FECHADA (gate 4 da #534).**
+> O kill switch (`maia:llm:circuit:override`) chega por pub/sub do Redis, que é
+> **at-most-once**. A chave durável cobria a réplica que **SOBE** no meio do
+> incidente (`adoptPersistedOverride`, depois do `SUBSCRIBE` confirmado), mas
+> **não** cobria a que **RECONECTA** nele: uma queda de socket entre a
+> confirmação e a mensagem perdia a notificação para sempre, e aquela réplica
+> continuava na postura antiga até o TTL do arrendamento. Em `shadow` isso era
+> divergência de medição; em `enforce` seria uma réplica **recusando tráfego
+> depois de o plantão ter desligado o disjuntor**.
+>
+> Hoje `resyncAuthoritativeState` (`src/lib/llm/cache-invalidation.ts`) é
+> encadeada no `ready` do ioredis a partir da SEGUNDA vez: re-inscreve nos dois
+> canais, espera o ack, solta o cache de settings e **relê** a chave durável.
+> Chave presente ⇒ adota o **arrendamento restante** (o payload carrega
+> `expires_at` absoluto, então não há como reiniciar a contagem); chave ausente
+> ⇒ **limpa o override local** e volta à postura do contrato. Falha de leitura
+> não vira "não há override": o estado é preservado e sai `resync_failed`.
+>
+> Provas: `tests/integration/llm-circuit-reconnect-resync.spec.ts` (socket
+> morto de verdade, mensagem comprovadamente perdida) e
+> `tests/unit/lib/llm-circuit-resync.spec.ts` (fail-closed e a corrida entre a
+> releitura em voo e uma mensagem do canal). **Verificação antes de promover:**
+> derrube o socket de uma réplica, vire a chave nesse intervalo e confirme
+> `maia_llm_circuit_mode_overrides_total{reason="resynced"}` subindo naquela
+> réplica com a postura convergida — o passo 4 desta seção, com a queda no
+> meio.
+
+#### Janela mínima de observação
+
+Nada abaixo disto conta como evidência:
+
+| Requisito | Valor | Por quê |
+|---|---|---|
+| Ambiente | **staging** | Não se aprende a recusar tráfego em produção. |
+| Duração | **7 dias completos** | Menos que isso não pega o ciclo semanal (segunda de manhã ≠ sábado de madrugada), e o limiar do disjuntor é sensível ao volume da janela. |
+| Volume | **≥ 1.000 chamadas por `(provider, workload)`** | `MIN_SAMPLES` é 10 numa janela de 30 s; abaixo de mil chamadas no período, um par sequer exercitou a máquina e "não abriu" não é informação. |
+| Falhas | **outage, brownout e recovery INJETADOS** | Esperar um incidente natural em staging é esperar para sempre. Os três cenários existem prontos em `scripts/llm-benchmark.ts`. |
+
+```promql
+# Volume por par — todo par ATIVO precisa cruzar 1.000 no período.
+# `maia_llm_requests_total` é a série que carrega `workload`; a legada
+# `maia_llm_calls_total` só tem provider/model/status e NÃO responde isto.
+sum by (provider, workload) (increase(maia_llm_requests_total[7d]))
+```
+
+Injeção das falhas — é o mesmo harness que produziu as constantes do disjuntor,
+e ele já compara as três posturas lado a lado:
+
+```bash
+npm run llm:bench -- --scenario outage   --workload reasoner --requests 300 --concurrency 20
+npm run llm:bench -- --scenario brownout --workload reasoner --failure-rate 0.6
+npm run llm:bench -- --scenario recovery --workload reasoner --outage-ms 12000 --think-ms 50
+```
+
+#### Critérios de ida (todos, não algum)
+
+**Todas as consultas abaixo agrupam por `(provider, workload)` e usam
+`maia_llm_requests_total`.** A série legada `maia_llm_calls_total` carrega
+apenas `provider`, `model` e `status` (`src/lib/llm/telemetry.ts`): agrupar por
+`workload` nela devolve UM grupo com tudo somado, e `status="error"` **não
+inclui `timeout`** — que é justamente um dos desfechos que abrem o disjuntor
+(`PROVIDER_FAULT_KINDS` = `provider_5xx` · `network` · `timeout`). Por isso todo
+seletor de falha aqui é `status=~"error|timeout"`.
+
+**1. Zero `would_open` fora de erro elevado.** Um falso positivo bloqueia a
+promoção — em `enforce` ele seria carga recusada sem provider quebrado.
+
+```promql
+# Taxa de falha REAL do par (inclui timeout do SDK).
+sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+  /
+clamp_min(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+  1e-9
+)
+
+# Aberturas simuladas SEM falha elevada por trás = falso positivo.
+# `TARGET_CALL_FAILURE_RATE` é 0.5; abaixo disso o disjuntor não deveria abrir.
+(sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[5m])) > 0)
+  unless
+(
+  sum by (provider, workload) (rate(maia_llm_requests_total{status=~"error|timeout"}[5m]))
+    /
+  clamp_min(
+    sum by (provider, workload) (rate(maia_llm_requests_total{status=~"ok|error|timeout"}[5m])),
+    1e-9
+  ) > 0.5
+)
+```
+
+Critério: **vazio** durante os 7 dias. Qualquer série que sobre é um par que
+teria aberto sem motivo.
+
+**2. Abertura em até 30 s / 10 amostras durante a falha.** A janela do disjuntor
+é de 30 s com `MIN_SAMPLES=10`: se a falha injetada tem volume, a abertura tem
+que aparecer dentro dela.
+
+```promql
+# Plote os dois no MESMO gráfico, step 15s, sobre o intervalo da injeção.
+# O critério é a distância horizontal entre a primeira subida de cada um.
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+sum by (provider, workload) (increase(maia_llm_circuit_would_open_total[1m]))
+```
+
+Não há PromQL honesta para "quantos segundos entre A e B" num painel de
+plantão; o número exato sai do harness, que carimba a transição no relatório do
+cenário `outage`.
+
+**3. Recuperação em até 60 s.** Depois de o provider voltar, o par tem que
+fechar. `MAX_OPEN_MS` é 60 s, então mais que isso significa que a sonda não está
+rodando (falta de tráfego) ou que o cooldown geométrico ficou preso.
+
+```promql
+# Exatamente uma das três séries vale 1 — nunca leia por valor numérico.
+maia_llm_circuit_state{state="closed"}
+# Cruze com o instante em que a falha parou:
+sum by (provider, workload) (increase(maia_llm_requests_total{status=~"error|timeout"}[1m]))
+```
+
+No cenário `recovery` do harness isso é medido direto: ele espaça a carga
+justamente para a sonda chegar a rodar.
+
+**4. `would_reject` limitado à falha mais o cooldown.** Recusa simulada
+sobrando DEPOIS de o provider voltar é cooldown longo demais — em `enforce`
+seria tráfego bom recusado.
+
+```promql
+sum by (provider, workload) (increase(maia_llm_circuit_would_reject_total[5m]))
+```
+
+Critério: a série zera dentro de `MAX_OPEN_MS` (60 s) após a última falha do
+par. Sobrar depois disso bloqueia a promoção.
+
+**5. ≥ 90% de redução das TENTATIVAS contra o provider numa indisponibilidade
+total.** É o único critério que mede o BENEFÍCIO; sem ele a promoção paga o
+risco de recusar tráfego e não compra nada.
+
+Tentativa ≠ chamada. `maia_llm_requests_total` conta CHAMADAS; quem conta o que
+o provider realmente comeu é `maia_llm_attempts_total`, incrementada uma vez por
+tentativa e **só depois de `provider.call()` ter rodado**
+(`recordAttempt` em `src/lib/llm/gateway.ts`) — uma chamada recusada pelo
+disjuntor não gera tentativa nenhuma. Num workload com retry + fallback a
+diferença entre as duas é o multiplicador que o disjuntor corta.
+
+```promql
+# A carga REAL contra o provider, por par. É esta série que precisa cair.
+sum by (provider, workload) (increase(maia_llm_attempts_total[5m]))
+
+# Baseline: a mesma série durante a queda injetada AINDA em `shadow` — é o que
+# o provider come quando o disjuntor não recusa nada.
+# Critério: numa queda equivalente sob `enforce`, esta soma tem que ficar
+# em <= 10% do baseline para o mesmo par.
+
+# Cruze com as recusas, que são o outro lado da mesma moeda:
+sum by (provider, workload) (increase(maia_llm_requests_total{status="circuit_open"}[5m]))
+  /
+clamp_min(sum by (provider, workload) (increase(maia_llm_requests_total[5m])), 1e-9)
+```
+
+O veredicto formal continua saindo do harness, que roda os três braços sobre a
+MESMA sequência de falhas — em staging não dá para ter `off` e `enforce` ao
+mesmo tempo:
+
+```bash
+# `provider_calls` do relatório é a mesma grandeza de `maia_llm_attempts_total`.
+npm run llm:bench -- --scenario outage --workload reasoner --requests 300 --concurrency 20
+# Critério: enforce.provider_calls <= 0.10 * off.provider_calls
+```
+
+**6. A recusa simulada não concentra num tenant só.** O estado do disjuntor é
+global de propósito, mas a evidência é escopada: se um tenant come 95% das
+recusas simuladas, entenda por quê antes de ligar.
+
+```promql
+topk(5, sum by (tenant_id) (increase(maia_llm_circuit_would_reject_total[24h])))
+```
+
+#### Checklist final
+
+- [ ] A lacuna de reconexão do pub/sub foi corrigida (pré-requisito bloqueante acima).
+- [ ] 7 dias completos em staging, com outage + brownout + recovery injetados.
+- [ ] Todo par `(provider, workload)` ATIVO com ≥ 1.000 chamadas na janela.
+- [ ] Critério 1 vazio: zero `would_open` fora de erro elevado.
+- [ ] Critério 2: abertura dentro de 30 s / 10 amostras na falha injetada.
+- [ ] Critério 3: recuperação em até 60 s.
+- [ ] Critério 4: `would_reject` limitado à falha + cooldown.
+- [ ] Critério 5: `enforce.provider_calls ≤ 10%` de `off.provider_calls` no `outage`.
+- [ ] Critério 6: distribuição por tenant explicada.
+- [ ] TODOS os workloads ativos passaram — a postura é global.
+
+**Como promover:** `LLM_CIRCUIT_MODE=enforce` no `.env` do ambiente + restart.
+É deploy-time de propósito — promover é decisão versionada, não de plantão.
+
+
+### Rollback da promoção
+
+| Sintoma | Ação | Custo |
+|---|---|---|
+| `circuit_open` subindo sem queda de provider correspondente | kill switch para `off` (acima) | segundos, sem restart |
+| Quer manter a medição mas parar de recusar | mesmo procedimento, `"mode":"shadow"` | segundos, sem restart |
+| Redis fora, ou o incidente vai durar mais que 24h | `LLM_CIRCUIT_MODE=shadow`/`off` + restart | um restart |
+
+Depois de estabilizar: **deixe o override expirar sozinho e reverta a env var no
+código**. Um kill switch renovado indefinidamente vira configuração escondida —
+que é como um controle morre de vez, sem ninguém perceber.
+
+> **Nota de honestidade.** A #534 defendeu por escrito que política de
+> degradação é código versionado, não toggle de runtime. Esta seção existe
+> porque o owner overruled aquilo, e a razão é boa: o argumento vale para
+> AJUSTAR limiares e não vale para DESLIGAR um controle que virou o incidente.
+> A parte certa da objeção ("sem deixar rastro") foi endereçada — o override é
+> obrigatoriamente identificado, contado, logado, **auditado em `audit_log`** e
+> temporário. O "auditado" só passou a ser verdade na revisão da PR #541: até
+> ali o rastro vivia só em métrica e log, os dois com retenção curta, e
+> `grep -rn "audit(" src/lib/llm/` devolvia zero.
 
 ---
 
@@ -296,26 +809,82 @@ curl -s http://localhost:3000/metrics | grep -E "maia_(baileys|redis|llm|audit)_
 |---|---|---|
 | `maia_baileys_connected` | gauge | =0 por > 2min |
 | `maia_redis_connected` | gauge | =0 por > 30s |
-| `maia_llm_calls_total{status="error"}` | counter | rate alto |
+| `maia_llm_requests_total{status=~"error\|timeout"}` | counter | rate alto — inclui o timeout do SDK, que `status="error"` sozinho não pega |
+| `maia_llm_calls_total{status="error"}` | counter | legada (só provider/model/status); mantida para dashboards antigos |
 | `maia_llm_tokens_total{kind=...}` | counter | rate alto = custo |
 | `maia_llm_latency_ms` | histogram | p99 > 30s |
 | `maia_audit_events_total{action,tenant_id,agent_id}` | counter | crescimento súbito em ações sensíveis (filtrável por tenant) |
+| `maia_llm_circuit_state{provider,workload,state}` | gauge | `{state="open"} == 1` por > 2min |
+| `maia_llm_circuit_transitions_total{provider,workload,state,reason}` | counter | qualquer transição com `state="open"` |
+| `maia_llm_circuit_short_circuited_total{provider,workload,state}` | counter | rate alto = carga sendo recusada |
+| `maia_llm_requests_total{status="circuit_open"}` | counter | separa carga recusada por nós de erro do provider |
+| `maia_llm_circuit_mode{state}` | gauge | `{state="off"} == 1` por > 1h (kill switch esquecido ligado) |
+| `maia_llm_circuit_mode_overrides_total{state,reason}` | counter | **qualquer** incremento — é o kill switch sendo usado |
+| `maia_llm_circuit_would_open_total{provider,workload,reason}` | counter | em `shadow`: abertura simulada. Cruze com a taxa de erro real antes de promover |
+| `maia_llm_circuit_would_reject_total{provider,workload,state}` | counter | em `shadow`: carga que SERIA recusada. Carrega `tenant_id`/`agent_id` |
 
-> Adicionar `maia_llm_circuit_state` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessa, abre uma PR.
+O gauge é um **par de séries**, uma por estado, exatamente uma valendo `1` —
+mesmo formato de `maia_lifecycle_state{role,state}`. Alerte em
+`maia_llm_circuit_state{state="open"} == 1`, nunca num valor numérico. O mesmo
+vale para `maia_llm_circuit_mode{state}`.
 
-### 8.1 Probes — qual endpoint usar onde (issue #512)
+**Leia `maia_llm_circuit_state` junto com `maia_llm_circuit_mode`.** Um disjuntor
+marcando `open` na postura `shadow` **não está recusando nada** — ele está
+medindo. Alertar em `state="open"` sem qualificar a postura produz plantão
+acordado por um incidente que não existe:
 
-Quatro superfícies com **contratos diferentes**. Apontar o probe errado para o
-endpoint errado transforma queda de dependência em restart loop.
+```promql
+# "o disjuntor está REALMENTE recusando":
+maia_llm_circuit_state{state="open"} == 1 and on() maia_llm_circuit_mode{state="enforce"} == 1
+```
 
-| Endpoint | Pergunta que responde | Faz I/O? | Usar em |
-|---|---|---|---|
-| `/livez` | o processo está vivo? | **não** (nenhum) | liveness do orquestrador / `healthcheck` do compose |
-| `/startupz` | a inicialização terminou? | não | startup probe |
-| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | readiness probe / pool do LB |
-| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | diagnóstico humano, dashboards |
+Em `off` a série de estado vira `NaN` (amostra ausente), nunca `0` — `0` diria
+"fechado e saudável" sobre um disjuntor que não está observando coisa alguma.
 
-Não há `/health/llm` — use `maia_llm_calls_total{status}` no Prometheus.
+`would_open` e `would_reject` só existem em `shadow`; `short_circuited` só em
+`enforce`. Procedimento de promoção e rollback: §3.1.
+
+Ele é registrado pelo próprio disjuntor (`src/lib/llm/circuit-breaker.ts`), sob
+demanda, na primeira vez que um par `(provider, workload)` é exercitado — não há
+nada a ligar em `src/server.ts`. **Um par que nunca recebeu tráfego não tem
+série alguma**, o que é diferente de ter série em `0`: a primeira coisa a checar
+quando um alerta não dispara é se aquele workload chegou a rodar.
+
+### 8.1 Probes — qual endpoint usar onde (issues #512 e #613)
+
+Quatro superfícies com **contratos diferentes**. **Três são probes; a quarta
+não é.** Apontar o probe errado para o endpoint errado transforma queda de
+dependência em restart loop — ou, no caso do `/health`, em um health check que
+nunca reprova nada.
+
+| Endpoint | Pergunta que responde | Faz I/O? | Veredito no status HTTP? | Usar em |
+|---|---|---|---|---|
+| `/livez` | o processo está vivo? | **não** (nenhum) | **sim** — 200 sempre que o processo responde | liveness do orquestrador / `healthcheck` do compose |
+| `/startupz` | a inicialização terminou? | não | **sim** — 503 até `ready` | startup probe |
+| `/readyz` | o load balancer deve mandar tráfego? | sim, read-only e cacheado | **sim** — 503 fail-closed | readiness probe / pool do LB |
+| `/health`, `/health/{db,redis,whatsapp}` | qual componente está ruim? | sim, read-only e cacheado | **NÃO — 200 sempre** (issue #613) | diagnóstico humano, dashboards. **Nunca como probe** |
+
+> **`/health` responde 200 mesmo dizendo `"status":"down"`, e isso é a decisão,
+> não o defeito** — [ADR 0003](../architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md),
+> issue #613. O 200 ali afirma *"produzi o relatório"*, não *"o sistema está
+> bem"*; o veredito é o corpo. O motivo de ele não virar 503 é `checkAll()`
+> (`src/lib/healthcheck.ts`): ele é **role-blind e chapado** — não conhece
+> `MAIA_PROCESS_ROLE`, não separa componente obrigatório de observado e não tem
+> política de degradação, então `whatsapp: down` derruba o agregado para `down`,
+> que é o **estado normal** de um processo `api`, `worker` ou `scheduler`. Um LB
+> apontado para lá tiraria de rotação instâncias corretas. O gate role-aware é
+> o `/readyz`, e é o único.
+>
+> Como reconhecer o endpoint em campo: toda resposta de `/health*` traz o header
+> `x-maia-endpoint-kind: diagnostic`, e o corpo do agregado traz
+> `"probe": false` mais o mapa `probes` com `/livez`, `/startupz` e `/readyz`.
+>
+> **Se o seu health check aponta para `/health`, ele nunca detectou nada.**
+> Troque: `/livez` se o campo decide **restart**, `/readyz` se decide
+> **roteamento de tráfego**.
+
+Não há `/health/llm` — use `maia_llm_requests_total{status}` no Prometheus (a
+legada `maia_llm_calls_total` não separa por workload).
 
 Regras que o código garante (`src/runtime/lifecycle/`):
 
@@ -325,7 +894,7 @@ Regras que o código garante (`src/runtime/lifecycle/`):
 - **`/readyz` é role-aware** (`MAIA_PROCESS_ROLE`, ver §8.2) e **fail-closed**:
   503 enquanto `starting`, `draining`, `failed` ou `stopped`, e 503 se um
   componente obrigatório do papel estiver `down`/`unknown` (DB, Redis,
-  pressão de memória do Redis, versão de schema, fila/worker, sessão).
+  pressão de memória do Redis, schema, fila/worker, sessão).
 - **`/readyz` vira 503 no primeiro request depois do SIGTERM** — o estado é
   checado antes (e fora) do cache.
 - **Nenhum probe escreve.** Antes do #512 cada chamada de `/health` inseria 3
@@ -333,6 +902,11 @@ Regras que o código garante (`src/runtime/lifecycle/`):
   `health_monitor` (1×/min).
 - **Nenhum probe devolve texto cru de driver** (`details` é removido na borda
   HTTP; a mensagem completa vai só para o log).
+- **`/health*` nunca reprova** (issue #613): o `reply.code(200)` é explícito no
+  handler (`asDiagnostic()`, `src/server.ts`) e
+  `tests/unit/server/health-probe-contract.spec.ts` reprova se alguém torná-lo
+  condicional — ou se remover a marcação que declara o endpoint como
+  diagnóstico.
 
 > **Cold start / pareamento.** Nos papéis que exigem a sessão (`all`,
 > `session-owner`), o primeiro `connection.update = open` real — e não o
@@ -365,6 +939,161 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/livez     # 200 s
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/startupz  # 503 → boot ainda em andamento
 curl -s http://localhost:3000/readyz | jq '.ready, .state, .role, (.checks[] | select(.required))'
 ```
+
+#### O componente `schema` do `/readyz` (issue #516)
+
+Desde a #516 o componente `schema` **é o veredito canônico de migrations**
+(`getSchemaReadiness()`, `src/migrations/readiness.ts`), e não mais a
+comparação "id mais novo do ledger × arquivo mais novo em disco". O check
+antigo (`checkSchemaVersion()`, removido na ADR 0004) não enxergava checksum
+divergente, linha `dirty`/`running` órfã nem migration aplicada que o build não
+empacota — e reportava "banco à frente do artefato" como saudável.
+
+Cada uma destas condições responde **HTTP 503** e mantém a instância fora de
+rotação:
+
+| Condição | `state` | `checks[].detail` contém | Como sair |
+|---|---|---|---|
+| Linha `dirty` no ledger | `blocked` | `dirty_migration` | Inspeção + `migrate repair` — ver [`migrations.md`](migrations.md) |
+| Checksum do artefato ≠ checksum do ledger | `blocked` | `checksum_mismatch` | Um arquivo já aplicado foi editado, ou o build errado subiu. Reverta o deploy ou corrija o artefato |
+| Ledger cita migration que este build não empacota | `blocked` | `missing_file` | O banco está num schema que este release não verifica: suba o release novo, não este |
+| Migration aplicada sem checksum registrado | `blocked` | `checksum_unknown` | Rode `npm run db:migrate` uma vez (o runner faz o backfill) |
+| Head esperado não aplicado | `blocked` | `schema_below_minimum` | `npm run db:migrate` |
+| Migration `running` (migrator em voo ou que morreu) | `blocked` | `running_migration` | Espere o migrator; se ninguém está rodando, é debris — `migrate up` promove para `dirty` |
+| Banco fora, ledger ausente ou `migrations/` ilegível | `unknown` | `ledger_unavailable` / `ledger_missing` | **`unknown` também é 503** — nunca "não consegui ler ⇒ pronto" |
+
+Diagnóstico:
+
+```bash
+curl -s http://localhost:3000/readyz | jq '.checks[] | select(.component=="schema")'
+npm run db:migrate -- status      # mesmo veredito, com o relatório completo
+```
+
+O corpo do `/readyz` carrega apenas literais nossos (`kind` do blocker + o
+texto do blocker). Mensagem de driver, SQL e `DATABASE_URL` **nunca** saem —
+uma mensagem de erro do pg embute a DSN com senha.
+
+**Custo e cache.** `getSchemaReadiness()` relê e faz SHA-256 de todas as
+migrations empacotadas e lê o ledger inteiro (~50-100 ms medidos neste repo).
+O veredito é cacheado por **10 s** (`SCHEMA_READINESS_TTL_MS` em
+`src/runtime/lifecycle/schema-readiness.ts`) e chamadas concorrentes são
+coalescidas, então o custo é ~uma avaliação por 10 s por réplica,
+independentemente da frequência do LB.
+
+**Não confunda "uma avaliação por 10 s" com "obsoleto por até 10 s".** São
+números diferentes, e o segundo é o que importa durante um incidente. O
+`/readyz` passa por DOIS caches: este TTL de 10 s e o cache composto de
+`evaluateComponents()`, que memoiza o conjunto inteiro de componentes por
+`READINESS_CACHE_MS` (2 s no default). Uma entrada composta preenchida um
+milissegundo antes do TTL interno expirar continua servindo aquele veredito até
+ELA expirar. Então:
+
+| pergunta | número |
+|---|---|
+| com que frequência o schema é REAVALIADO | uma vez por 10 s por réplica |
+| por quanto tempo um 200 obsoleto pode sobreviver | **`SCHEMA_READINESS_TTL_MS + READINESS_CACHE_MS`** — 12 s nos defaults |
+| e se eu subir o `READINESS_CACHE_MS` | a janela cresce junto, **sem teto no contrato de config hoje** |
+
+Consequência operacional: depois que o schema fica incompatível a instância
+ainda pode responder 200 por até 12 s — dentro da janela em que o próprio load
+balancer ainda não declarou o alvo unhealthy — e depois que o `migrate up`
+conserta, ela leva até 12 s a mais para voltar à rotação.
+
+A soma está fixada em `tests/unit/runtime/lifecycle-schema-readiness.spec.ts`:
+mexer em qualquer um dos dois valores reprova o teste com o número novo, para
+esta tabela não apodrecer.
+
+**Ordem de deploy.** O migrator precisa rodar **antes** da aplicação. Um banco
+com ledger v1 (linhas sem checksum) deixa o `/readyz` em 503 com
+`checksum_unknown` até o `migrate up` adotar os checksums empacotados.
+
+**`READINESS_SCHEMA_CHECK=false` é inválido em production.** A validação de
+configuração **recusa o boot** (`lifecycle/schema-check-disabled`, severidade
+`error`, escopo `boot` — vale inclusive sob
+`MAIA_CONFIG_STRICT_BOOT=false`). Em `staging` continua permitido, com aviso;
+em `development` é silencioso. Desligar o flag faz o componente `schema`
+reportar `ok` sem consultar nada — é exatamente a porta que a #516 fechou para
+produção.
+
+#### O gate de BOOT: o mesmo veredito, mas o processo MORRE (issue #516, ADR 0004)
+
+Desde a decisão do owner na #516 ([ADR 0004](../architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md))
+o passo `schema` do boot (`src/index.ts`) consulta **o mesmo
+`getSchemaReadiness()`** e **encerra o processo** quando o veredito não é
+`ready`. O check fraco anterior (`checkSchemaVersion()`) foi REMOVIDO — não
+existe mais um segundo, mais permissivo, veredito de schema em lugar nenhum.
+
+O exit code diz **qual invariante quebrou**, antes de qualquer log ser lido:
+
+| Exit | Invariante | O que fazer |
+|---|---|---|
+| `90` | ledger `dirty` (ou `running` órfão): schema possivelmente parcial | Inspecione e repare: `tsx scripts/migrate.ts repair --id <id> --as applied\|pending --reason "..."` |
+| `91` | **checksum divergente** — migration aplicada foi editada, ou o build é outro | Restaure o arquivo / publique a release certa. Migrations são append-only |
+| `92` | checksum **ausente** (ledger v1 nunca backfillado) | `npm run db:migrate` uma vez (adota o checksum empacotado) |
+| `93` | o banco aplicou migration que **este build não empacota** | Release velha contra banco novo: publique a release nova |
+| `94` | **migration obrigatória ausente** — schema abaixo do mínimo | `npm run db:migrate` (ou `npm run release:migrate` no pré-deploy) |
+| `95` | schema **acima** do máximo suportado por este build | Publique a release nova; não sirva tráfego desta |
+| `96` | migration `running` — migrator em voo, ou morto | Aguarde o job; se não há migrator, é entulho (`migrate status`) |
+| `97` | veredito `unknown` — ledger ausente/ilegível, banco fora do ar | `npm run doctor -- --online`; confirme DSN e permissões |
+| `98` | **índice `indisvalid = false`** — DDL `CONCURRENTLY` reprovou, e um índice único inválido **não impõe nada** | `DROP INDEX CONCURRENTLY <schema>.<indice>`, resolva a duplicata, reaplique. NÃO reaplique antes de dropar: o `IF NOT EXISTS` devolve sucesso sobre o índice inválido ([runbook de migrations](migrations.md#índice-inválido-deixado-por-ddl-concurrently)) |
+| `1` | qualquer OUTRA falha de boot (Redis, keyring, config…) | Ver `maia.fatal` no log |
+
+```bash
+docker inspect --format '{{.State.ExitCode}}' <container>   # 90-98 ⇒ é schema
+docker logs <container> 2>&1 | grep maia.schema_boot_refused
+```
+
+A linha `maia.schema_boot_refused` carrega, em campos estruturados:
+`exit_code`, `blocker`, `blockers` (todos os presentes), `verdict`,
+`migration_id`, `expected_checksum` (arquivo empacotado), `found_checksum`
+(linha do ledger), `expected_head`, `applied_head` e `remediation`. A mensagem
+do erro (`maia.fatal`) traz o mesmo em bloco legível, começando por
+`SCHEMA BOOT REFUSED`. **Nada disso carrega SQL, texto de driver ou DSN.**
+
+##### Árvore de decisão do operador — exit code OU readiness, nunca os dois
+
+Coerente com a [ADR 0003](../architecture/decisions/0003-health-is-diagnostic-livez-readyz-are-the-probes.md):
+o `/readyz` continua sendo o **único** gate de roteamento, role-aware e
+fail-closed. O que mudou é que existe agora um estado anterior a ele — o
+processo pode nem chegar a escutar HTTP.
+
+```text
+O container está de pé?
+├─ NÃO (crash loop)  → o sinal é o EXIT CODE. /readyz nunca respondeu.
+│                      90-98 ⇒ schema (tabela acima). 1 ⇒ outra dependência.
+│                      Log: maia.schema_boot_refused → maia.fatal.
+│                      NÃO existe instância para inspecionar: leia o log do
+│                      container morto, não o endpoint.
+└─ SIM               → o sinal é o /readyz (503 com o componente nomeado).
+   ├─ 503 com checks[].component=="schema"
+   │     ⇒ o schema mudou DEBAIXO de um processo que já tinha subido
+   │       (deploy de migration com o app no ar). O app sai de rotação e
+   │       fica inspecionável. Mesmas condições, mesma remediação.
+   └─ 503 em outro componente ⇒ §8.1, tabela de probes.
+```
+
+Por que as duas posturas coexistem sem se contradizer: o boot pergunta **"posso
+existir?"** e a readiness pergunta **"posso receber tráfego?"**. Um processo que
+NASCE sobre um schema que não pode verificar não tem trabalho legítimo a fazer —
+morrer é mais honesto (e mais visível) do que ficar de pé eternamente 503. Um
+processo que JÁ ESTAVA servindo e vê o schema mudar sai de rotação e continua
+inspecionável, que é o comportamento certo para um deploy em andamento.
+
+**O crash loop não deveria acontecer no caminho normal.** Quem o impede é o gate
+de migration: o job one-shot do `compose.prod.yml` (`depends_on:
+service_completed_successfully`) ou `npm run release:migrate` no pré-deploy do
+painel (#565). Se o app está em crash loop por schema, ou o gate não rodou, ou
+ele rodou e falhou sem bloquear o rollout — verifique isso ANTES de mexer no
+banco.
+
+**Dev e teste morrem igual, de propósito.** Não há variável nova nem exceção por
+ambiente: a única alavanca é a que já existe no contrato,
+`READINESS_SCHEMA_CHECK=false` — silenciosa em `development`, aviso em
+`staging`, **recusada no boot em `production`**. Use-a apenas onde código e
+schema são publicados fora de banda de propósito (ex.: `npm run dev` contra um
+banco de outra branch). O CI não é afetado: nenhuma suíte executa o `main()` de
+`src/index.ts` a não ser `tests/unit/runtime/schema-boot-gate.spec.ts`, que
+injeta o próprio ledger.
 
 > As variáveis desta seção vivem no contrato de configuração (#515): grupo
 > **Lifecycle do processo** em `src/config/contract.ts`, documentadas em
@@ -478,7 +1207,36 @@ deadline — cobre todas as tentativas, backoff, fallback e parsing, e não
 reinicia a cada retry. `CLAUDE_TIMEOUT_MS` é o teto por TENTATIVA e nunca
 excede o que resta do deadline.
 
-> Adicionar `maia_db_connected` e `maia_llm_circuit_state` é um follow-up trivial (uma linha cada em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nessas, abre uma PR.
+**Quando o provider cai:** o disjuntor por `(provider, workload)` para de tentar
+depois de uma janela deslizante de 30s com no mínimo 10 tentativas em que a
+perda estimada de CHAMADAS passa de 50%, e passa a recusar com erro
+`circuit_open` — não retentável, carregando `retry_after_ms`. Ele só conta falha
+atribuível ao provider (`provider_5xx`, `network`, `timeout` do SDK): payload
+inválido, orçamento estourado ou turno cancelado não abrem o disjuntor de
+ninguém. O estado é por réplica e em memória, e o restart o zera.
+
+A conta é por CHAMADA, não por tentativa, e cada classe de falha entra com o
+expoente do orçamento que ela realmente gasta: um `provider_5xx` retentável só
+perde a chamada quando as 3 tentativas do `reasoner` falham (≈84% por
+tentativa), enquanto um `timeout` do SDK mata a chamada na primeira (50%). Na
+triagem, `window_terminal_faults` no log `llm_gateway.circuit_transition` (e na
+linha de `audit_log`) diz qual dos dois foi. Ver
+`docs/architecture/modules/lib.md` para os limiares e o porquê de cada um, e
+`docs/runbooks/observability-slo.md` §4.9.1 para a leitura do alerta.
+
+Toda transição para `open`/`closed` também vira linha em `audit_log`
+(`llm_circuit_opened` / `llm_circuit_closed`, contexto `system`). É o que
+alimenta a regra `llm_circuit_long_open` do audit-watcher — o alerta DURÁVEL de
+"aberto há mais de 5 min", que sobrevive ao coletor caído.
+
+**…mas só se a postura for `enforce`.** `LLM_CIRCUIT_MODE` tem default
+**`shadow`**: por padrão o disjuntor roda a máquina inteira e mede o que faria,
+sem recusar chamada nenhuma. Antes de concluir "o disjuntor recusou", cheque
+`maia_llm_circuit_mode{state}`. Para desligar durante um incidente sem restart e
+sem deploy, ou para promover para `enforce`, o procedimento inteiro está em
+**§3.1**.
+
+> Adicionar `maia_db_connected` é um follow-up trivial (uma linha em `src/server.ts` via `setGaugeProvider`). Se quiser alertas baseados nela, abre uma PR.
 
 ---
 
@@ -594,6 +1352,230 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 - [ ] `/health/whatsapp` ok
 - [ ] Mande mensagem teste pro número Maia → log mostra `baileys.message.enqueued` → resposta do agente em ~3-8s
 - [ ] (Opcional) Configurar nginx (uma vez que a PR #23 land, ver `docs/runbooks/setup-nginx.md`): IP whitelist, TLS, fail2ban
+
+---
+
+## 11. Gate de desempenho da carga de contexto do turno (issue #525)
+
+`npm run turn:bench` roda o gate que o dono fixou para a #525: Postgres real,
+pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades,
+braços `cold` e `warm`. Ele **exercita `buildPrompt`** — o call site de produção,
+que é quem publica `maia_turn_context_load_duration_ms{phase="loader"}`.
+
+Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
+escreve ~13 mil linhas de massa e devolve o veredicto por **exit code**.
+
+### Pré-requisitos
+
+```bash
+# Postgres migrado e alcançável. O harness usa o mesmo default de tests/setup.ts
+# e qualquer variável já presente no ambiente VENCE sobre esse default.
+export DATABASE_URL=postgres://maia_test:test1234@localhost:5432/maia_test
+export REDIS_URL=redis://localhost:6379     # o braço `warm` usa o subscriber de invalidação
+npm run db:migrate
+```
+
+### Medir e barrar são coisas diferentes (`--mode`)
+
+O harness faz as duas, e o modo é DECLARADO — não deduzido de uma flag no meio
+do comando:
+
+| `--mode` | o que é | exit code |
+|---|---|---|
+| `gate` (**default**) | o veredicto. Todo critério obrigatório precisa ter sido AVALIADO | `0` aprovado · `1` reprovado (inclui "não avaliado") · `2` erro de uso/infra |
+| `measure` | medição absoluta. **NÃO emite veredicto de gate** e diz isso em caixa alta no relatório | `0` (a medição aconteceu) · `2` erro |
+| `self-test` | prova que o gate reprova, sobre valores sintéticos | como `gate` |
+
+A regra que amarra tudo: **um critério `n/a` reprova em modo `gate`**. Não
+avaliado deixou de ser sinônimo de aprovado — era essa igualdade que deixava um
+checkout limpo, sem baseline registrado, sair com exit 0 como se tivesse passado
+pelo critério relativo. Se você quer medir sem ter a evidência completa, o modo
+é `measure`, e ali o relatório não se apresenta como gate.
+
+### O comando do gate
+
+```bash
+# Perfil canônico: 60 s de carga sustentada por braço (~3 min no total).
+# A janela de 60 s é o que torna o critério de saturação do pool FALSIFICÁVEL;
+# sem --sustain-s ele sai como "não avaliado" — e "não avaliado" REPROVA.
+npm run turn:bench -- --sustain-s 60
+
+echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
+```
+
+Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
+Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
+comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+o que não mediu. Para medir sem baseline, use `--mode measure`.
+
+Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
+O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
+
+### Os limites, e o que fazer quando um deles fica vermelho
+
+| veredicto vermelho | leitura | primeiro passo |
+|---|---|---|
+| `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
+| `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
+| `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
+| `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
+| `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
+| `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
+| `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
+| `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
+| `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
+| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
+| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
+| `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
+
+### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
+
+O gerador é de **malha fechada**: `--concurrency` workers, cada um começando o
+turno seguinte assim que o anterior acaba. Com `--think-ms 0` isso mantém 20
+turnos sempre em voo; como cada turno pode segurar até 6 conexões de um pool de
+10, a fila **não tem como esvaziar** — é aritmética, não defeito. Medido em host
+de 4 vCPU com Postgres local, braço `cold`, concorrência 20:
+
+| `--think-ms` | turnos/s | p50 | p95 | amostras saturadas | maior sequência |
+|---|---|---|---|---|---|
+| 0 | 90,7 | 187,7 ms | 386,8 ms | 142/142 (100%) | a corrida inteira |
+| 150 (default) | 102,1 | 28,8 ms | 108,7 ms | 99/145 (68%) | 1,3 s |
+| 300 | 60,0 | 14,5 ms | 87,1 ms | 27/149 (18%) | 0,3 s |
+
+Note que o martelo entrega **menos** vazão que o ritmo de 150 ms: passado o
+joelho da capacidade, a fila só acrescenta espera.
+
+### Os dois perfis (decisão do dono sobre a #525)
+
+> "Concorrência 20 continua como máximo de requisições em voo, mas o perfil
+> normal deve definir ritmo/`think_ms`. O perfil sem ritmo passa a ser **teste de
+> saturação**; nele, exige-se zero erros/timeouts e **drenagem depois que o
+> produtor para** — não drenagem enquanto 20 turnos são repostos continuamente."
+
+| perfil | como se roda | critério de drenagem |
+|---|---|---|
+| **normal** | `--think-ms 150` (default), o do gate canônico | a fila esvazia **durante** a carga e nunca fica saturada por 60 s seguidos |
+| **saturação** | `--think-ms 0` | a fila esvazia **depois que o produtor para**. Zero erros/timeouts continua valendo |
+
+Cobrar drenagem durante a carga no perfil sem ritmo era pedir o impossível — 20
+turnos repostos continuamente, até 6 conexões cada, contra um pool de 10 — e
+produzia vermelho que não significava regressão.
+
+Por isso toda corrida tem duas **fases**: carga (produtor emitindo) e escoamento
+(produtor parado, `--drain-window-ms`, default 2 s). O amostrador marca a
+fronteira por timestamp e conta as amostras de cada lado. Sem essa janela não
+existe fase de escoamento para observar: o gerador é de malha fechada, então
+quando os workers retornam todo turno já terminou, e o amostrador era parado
+nesse mesmo instante — zero amostras do lado que interessa.
+
+**Amostras só da fase de carga não são evidência de drenagem.** Esse caso sai
+`n/a` e, em modo `gate`, reprova — pelo mesmo motivo que zero amostras reprova.
+
+Medido neste host, perfil de saturação (`--think-ms 0 --turns 400`, braço
+`cold`): 40/40 amostras saturadas na carga — 100 %, como a aritmética manda — e
+0/20 na janela de escoamento, com a fila esvaziando **39 ms** depois de o
+produtor parar. Exit 0.
+
+### Baseline
+
+```bash
+# Grava o p95/p99 medidos como referência. NUNCA acontece como efeito colateral
+# de uma corrida de gate: baseline é decisão, e por isso exige --mode measure.
+npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline
+```
+
+`--write-baseline` em modo `gate` é **recusado com exit 2**. Sem essa trava, a
+mesma corrida que julga produziria a referência contra a qual ela seria julgada
+depois, e "medição absoluta" e "gate" voltariam a ser a mesma saída.
+
+`scripts/turn-context-baseline.json` carrega `recorded_at`, `host`, um `note`
+dizendo se é a PRIMEIRA medição ou uma re-gravação, e — desde a correção dos
+achados Medium — o **fingerprint da carga**. O arquivo **não é versionado**
+(está no `.gitignore`): é a medição da SUA máquina, e cada host grava o seu na
+primeira corrida. Três regras:
+
+1. **O baseline é por host — e por momento do host.** Não é figura de retórica.
+   Um baseline gravado neste repositório a p95 67,0 ms (`cold`) / 75,9 ms (`warm`)
+   foi reproduzido no MESMO host de 4 vCPU, com o mesmo código e o banco vazio,
+   num contêiner posterior: 135,5 / 118,5 ms, e depois 154,1 / 114,9 ms. De 56 %
+   a 130 % acima do número gravado, sem que nenhum limite absoluto do gate
+   (600 ms / 1 s) chegasse perto de cair. Versionar esse arquivo entregaria um
+   gate vermelho na chegada para todo mundo que não fosse a máquina que o gravou.
+2. **A variação entre corridas iguais na mesma sessão é de ~10–15 %**; a folga de
+   +20 % é dimensionada para isso. Ela NÃO absorve troca de máquina, de contêiner
+   nem host ocupado — nesses casos re-grave, não discuta o delta.
+3. **Re-gravar é uma decisão de revisão.** A folga existe para absorver ruído, não
+   regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
+   aceitou o motivo — não numa corrida solta.
+
+#### O fingerprint: comparar dois p95 medidos com cargas diferentes não é comparar
+
+O baseline grava a FORMA da corrida que o produziu, e a comparação é **recusada**
+— não apenas avisada — quando ela diverge. Comparados:
+
+| campo | por que muda o número medido |
+|---|---|
+| `pairs` | quantos pares distintos a carga toca: localidade de cache e volume por escopo |
+| `concurrency` | é o regime de fila; domina a cauda |
+| `think_ms` | **o que mais move o número**: p95 de 28,8 ms com 150 ms contra 187,7 ms com 0 |
+| `identity` | `legacy` paga um round-trip a mais por turno |
+| `cardinalities` | o tamanho do escopo decide quantas entidades cada turno lê |
+| `pool_max` | o denominador da saturação. Pool 10 e pool 20 são dois sistemas |
+| `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`, lido do código |
+| `turns` · `sustain_s` | a duração amortiza o transiente de aquecimento. Mesmo host, mesmo código, minutos de intervalo: 600 turnos (5,7 s) → p95 **118,6 ms**; 60 s sustentados (7 389 turnos) → p95 **22,4 ms**. 5× de diferença por duração de corrida |
+
+Registrados mas **não** comparados, de propósito — um fingerprint que invalida o
+baseline a cada corrida vira ruído que o operador aprende a ignorar: `host` e
+`node`/`platform` (o baseline já é por máquina), `timeout_ms` (classifica
+timeouts, não move latência) e `sample_ms` (observa o POOL, não entra no p95 do
+turno).
+
+Consequência prática: **o baseline precisa ser gravado com o mesmo comando com
+que o gate roda.** Um baseline de `--turns 600` sem `--sustain-s` comparado
+contra o gate canônico não é regressão, é outra corrida — e o harness diz isso
+em vez de pintar 342 % de delta.
+
+Um baseline em formato antigo — sem fingerprint — também é recusado: ele não
+prova com que carga foi medido, e assumir que foi com a certa é o buraco que
+esta trava fecha. Apague o arquivo e re-grave.
+
+Quando um número tem que valer para todo mundo, ele está nos critérios absolutos:
+p95 ≤ 600 ms, p99 ≤ 1 s, zero erros, pico ≤ 6, o pool drenando, a métrica cobrindo
+todos os turnos e a carga com a forma do enunciado. Leia esses primeiro.
+
+### Provar que o gate reprova
+
+O veredicto é código, e código sem prova de falha é decoração. Sem tocar no
+banco:
+
+```bash
+npm run turn:bench -- --self-test --inject p95_ms=900              # exit 1
+npm run turn:bench -- --self-test --inject peak_reads_per_turn=7   # exit 1
+npm run turn:bench -- --self-test --inject cold.errors=1           # exit 1
+npm run turn:bench -- --self-test --inject pool_samples=0          # exit 1 — zero amostras não é "drenou"
+npm run turn:bench -- --self-test --self-test-baseline missing     # exit 1 — sem baseline não há gate
+npm run turn:bench -- --self-test --self-test-baseline incompatible # exit 1 — baseline de outra carga
+```
+
+`--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
+fundos que faz qualquer regressão passar. O autoteste usa um baseline SINTÉTICO,
+nunca o arquivo da máquina: um gate cujo autoteste muda de resultado conforme o
+host não prova nada. A bateria completa (todos os critérios, incluindo pico baixo
+demais, pool que nunca drena, amostragem cega e baseline incompatível) vive em
+`tests/unit/scripts/turn-context-gate.spec.ts` e roda na suíte normal.
+
+### Massa e limpeza
+
+Tudo que o harness cria usa `tenant_id` com prefixo `bench525-` e é removido no
+`finally` e também em `SIGINT`/`SIGTERM`. Se uma corrida morreu de um jeito que
+não deixou nada rodar:
+
+```bash
+npm run turn:bench -- --cleanup-only
+```
+
+O harness **nunca roda `ANALYZE`** — num banco compartilhado com a suíte,
+`ANALYZE` não é desfeito por `ROLLBACK` e envenenaria o plano dos outros specs.
 
 ---
 

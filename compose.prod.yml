@@ -4,14 +4,22 @@
 # Uso:
 #   docker compose --env-file .env.infra -f compose.prod.yml up -d
 #
-# As variáveis de interpolação (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD)
-# são OBRIGATÓRIAS (sintaxe `:?` — o compose aborta se faltarem, nada de
-# fallback maia/maia). Elas vêm do shell do deploy ou de um env-file
+# As variáveis de interpolação (POSTGRES_USER/PASSWORD/DB, REDIS_PASSWORD,
+# MAIA_ENV) são OBRIGATÓRIAS (sintaxe `:?` — o compose aborta se faltarem,
+# nada de fallback maia/maia e nada de perfil de produção assumido em
+# silêncio). Elas vêm do shell do deploy ou de um env-file
 # passado via `--env-file` (ex.: .env.infra). Esse arquivo serve SÓ para
 # interpolação — ele NÃO é injetado em nenhum container. Cada serviço
 # recebe apenas o seu próprio env_file:
 #   app      → .env.app    (ver .env.app.prod.example)
 #   admin-ui → .env.admin  (ver .env.admin.prod.example)
+#   migrate  → NENHUM env_file: só o subset `migrator` do contrato (#515),
+#              injetado direto no `environment:` do serviço.
+#
+# Ordem de subida (issue #516): postgres healthy → `migrate` (job one-shot)
+# sair com 0 → app + admin-ui. Nenhum serviço de aplicação sobe contra um
+# schema atrasado, e um blocker de migration (dirty/checksum/missing_file)
+# segura o deploy inteiro em vez de deixar o app subir e responder 503.
 #
 # Postura de segurança vs docker-compose.yml (dev):
 #   - postgres/redis NÃO publicam porta no host: vivem na rede `data`
@@ -126,6 +134,103 @@ services:
       timeout: 5s
       retries: 10
 
+  # migrate — JOB ONE-SHOT (issue #516). Aplica as migrations e SAI.
+  #
+  #   postgres healthy → migrate completed successfully → app + admin-ui
+  #
+  # Antes disto o deploy documentado subia os serviços e o operador rodava
+  # `exec app npm run db:migrate` DEPOIS, à mão: entre um passo e outro a
+  # aplicação já estava de pé contra um schema atrasado. Com o job, a
+  # ordem é uma propriedade do arquivo, não da memória de quem deployou.
+  #
+  # Contrato do job (é dele que `service_completed_successfully` depende):
+  # `tsx scripts/migrate.ts up` roda UMA vez e sai 0 em sucesso/já-atualizado,
+  # != 0 em falha, blocker (dirty, checksum mismatch, missing_file) ou lock
+  # indisponível. Um blocker portanto SEGURA app/admin-ui fora do ar — que é
+  # o comportamento fail-closed pedido pela issue.
+  #
+  # `restart: "no"` é OBRIGATÓRIO e explícito: com `unless-stopped` (o que
+  # todos os outros serviços usam aqui) o container reiniciaria ao sair e
+  # NUNCA chegaria a "completed" — app/admin-ui esperariam para sempre.
+  #
+  # Réplicas: o job continua seguro se dois deploys rodarem ao mesmo tempo —
+  # o advisory lock global do runner (src/migrations/lock.ts) serializa, e o
+  # segundo migrator sai de forma limpa e observável.
+  #
+  # Este bloco é VERIFICADO DE DUAS FORMAS, e as duas são necessárias:
+  #   - `tests/unit/migrations/compose-migrate-job.spec.ts` lê este arquivo e
+  #     pina o que ele DIZ (restart, depends_on, uid, read_only, subset #515);
+  #   - `scripts/smoke-migrate-image.sh` (`npm run smoke:migrate:image`, job
+  #     `smoke-migrate-image` no CI) constrói a imagem real e RODA
+  #     `npm run db:migrate` dentro dela, uid 1001, rootfs read-only, contra
+  #     banco efêmero. Sem ele, `tmpfs: /tmp` abaixo pareceria higiene: é
+  #     requisito — o `tsx` cria `/tmp/tsx-1001` antes do primeiro módulo.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    user: "1001:1001"
+    # SEM env_file: o migrator recebe SÓ o subset `migrator` do contrato
+    # (#515 — src/config/migration-config.ts, src/config/generated/
+    # service-env-manifest.json): Postgres + knobs de processo. Nada de
+    # .env.app (LLM keys, sessão WhatsApp, credenciais S3): um container de
+    # migration que vaze não pode vazar o que nunca recebeu.
+    environment:
+      NODE_ENV: production
+      # Obrigatória no profile production (contract.ts: `requiredIn`), e
+      # OBRIGATÓRIA TAMBÉM NA INTERPOLAÇÃO — `:?`, não `:-production`.
+      #
+      # O default parecia inofensivo: "produção é o caso comum, staging
+      # sobrescreve". Só que ele inverte o fail-closed exatamente no ponto em
+      # que o erro é invisível. Um staging que esquece MAIA_ENV no .env.infra
+      # não recebe um erro: recebe SILENCIOSAMENTE o perfil de produção, e a
+      # primeira notícia disso é uma regra de produção sendo aplicada — ou
+      # relaxada — num ambiente que ninguém achava que era produção. Com `:?`
+      # o compose aborta antes de criar container algum, e a mensagem diz o
+      # nome da variável que falta.
+      #
+      # `.env.infra` passa a declarar `MAIA_ENV=production` (ou `staging`)
+      # explicitamente — ver docs/runbooks/deploy-prod.md §1.
+      #
+      # A MESMA linha, byte por byte, está em `app` e em `admin-ui`. O
+      # contrato marca MAIA_ENV como `services: ALL` e
+      # `requiredIn: ['staging','production']`, e `.env.infra` serve SÓ para
+      # interpolação — declarar a variável lá NÃO a injeta em container
+      # nenhum. Sem estas três linhas o migrator terminava com sucesso e
+      # `app`/`admin-ui` reprovavam no boot por configuração ausente, seguindo
+      # o runbook à risca. Repetida em vez de ancorada (`&`/`*`) de propósito:
+      # o guard que lê este arquivo exige as três idênticas, e uma âncora
+      # esconderia a divergência dentro do YAML em vez de expô-la.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      # rootfs read-only: sem isto o npm tentaria escrever o cache em
+      # $HOME (/home/maia), que não é gravável aqui.
+      npm_config_cache: /tmp/.npm
+      TZ: America/Sao_Paulo
+    command: ["npm", "run", "db:migrate"]
+    # SEM `ports:`, SEM rede `web` — o job só fala com o Postgres.
+    networks:
+      - data
+    # As migrations vêm empacotadas na imagem (Dockerfile: COPY migrations),
+    # que é o que torna checksum/`missing_file` uma afirmação sobre ESTA
+    # build. Nenhum volume de estado.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+
   app:
     build:
       context: .
@@ -137,6 +242,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # O schema tem que estar no head ANTES do primeiro request (#516).
+      migrate:
+        condition: service_completed_successfully
     # uid/gid 1001 (`maia`) já é o USER do runtime stage do Dockerfile;
     # repetir aqui garante que um drift na imagem não traga root de volta.
     user: "1001:1001"
@@ -145,6 +253,12 @@ services:
       - .env.app
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` (ver o comentário lá em cima).
+      # `NODE_ENV=production` sozinho NÃO basta: o contrato exige MAIA_ENV nos
+      # profiles staging/production (`requiredIn`), e `.env.app` não a declara —
+      # o `.env.app.prod.example` manda explicitamente NÃO defini-la ali, para
+      # que não existam duas fontes que possam divergir do migrator.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       # DATABASE_URL/REDIS_URL compostas das MESMAS vars obrigatórias com que
       # os datastores sobem — sem fallback e sem drift entre serviço e URL.
       # NOTA: a senha entra numa URL — use senha URL-safe (ex.:
@@ -202,16 +316,31 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Mesma razão do `app`: o console lê tabelas que só existem depois
+      # das migrations (#516).
+      migrate:
+        condition: service_completed_successfully
     user: "1001:1001"
-    # Apenas os segredos DO ADMIN (NextAuth/OIDC + o mínimo transitivo que
-    # src/config/env.ts exige) — o .env do app NÃO entra aqui.
+    # Apenas os segredos DO ADMIN (NextAuth/OIDC + o HMAC de verificação de
+    # trace) — o .env do app NÃO entra aqui. Desde a issue #596 não há mais
+    # "mínimo transitivo que src/config/env.ts exige": o console não importa
+    # aquele singleton, valida o subset `admin-ui` no boot
+    # (src/admin-ui/instrumentation.ts) e não recebe mais as seis BACKUP_*.
     env_file:
       - .env.admin
     environment:
       NODE_ENV: production
+      # MESMA fonte única do job `migrate` e do `app` (ver os comentários
+      # acima). `.env.admin` não declara MAIA_ENV pelo mesmo motivo: uma
+      # segunda fonte é uma fonte que pode divergir.
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
-      # env.ts (importado transitivamente via @/db/client.ts) valida
-      # REDIS_URL como URL mesmo que o admin-ui nunca abra conexão Redis.
+      # O console publica invalidação de cache (best-effort, engolida em caso
+      # de falha) por `@/lib/llm/cache-invalidation.js` e
+      # `@/agent/turn-context/cache.js`, ambos por import DINÂMICO — sem
+      # REDIS_URL essas publicações se perdem e o cache degrada para o TTL.
+      # Desde a issue #596 ela não é mais exigida no BOOT do console (o subset
+      # `admin-ui` não a declara); continua injetada porque o caminho existe.
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
       POSTGRES_USER: ${POSTGRES_USER:?}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}

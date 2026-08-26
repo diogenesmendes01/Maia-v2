@@ -159,9 +159,11 @@ export default [
       '.claude/**',
       // Next.js build artifacts (admin-ui). The dev `next build` produces
       // .next/{static,standalone,server}/*.js bundles that ESLint shouldn't
-      // try to type-check. next-env.d.ts is generated too (gitignored): Next
-      // 15.5 emits a triple-slash reference in it that trips
-      // @typescript-eslint/triple-slash-reference.
+      // try to type-check. next-env.d.ts is generated too (gitignored): o Next
+      // emite nele referências triple-slash que trombam com
+      // @typescript-eslint/triple-slash-reference (segue valendo no 16, que
+      // ainda gera `/// <reference types="next" />` e agora também importa
+      // `.next/types/routes.d.ts`).
       'src/admin-ui/.next/**',
       'src/admin-ui/next-env.d.ts',
     ],
@@ -282,6 +284,12 @@ export default [
       // Authorised loaders — this is where env legitimately enters the process.
       'src/config/env.ts',
       'src/config/load.ts',
+      // Issue #596: o acessor por-variável do contrato, para os módulos que
+      // MAIS DE UM container carrega. Ele não é uma leitura ad hoc — parseia
+      // com o schema do contrato, chave a chave, e é o que substituiu o
+      // `@/config/env.js` que arrastava o boot do subset `runtime` para dentro
+      // do console.
+      'src/config/contract-env.ts',
       // Admin UI: a separate Next.js app with its own build; migrating it to
       // the shared loader is tracked as the Admin rollout step of #515.
       'src/admin-ui/**',
@@ -353,6 +361,43 @@ export default [
       '@typescript-eslint': tsPlugin,
     },
     rules: TS_RULES,
+  },
+
+  // Fixtures de processo filho do harness de confiabilidade (issue #510).
+  // São `.mjs` de propósito: sobem com `node <arquivo>` direto, sem `tsx` e sem
+  // transformação, porque um filho que demora 2s para subir some dentro do
+  // orçamento de qualquer cenário de fault injection. Sem este bloco eles
+  // cairiam só no `js.configs.recommended`, sem globals de Node, e
+  // `process`/`Buffer` virariam `no-undef`.
+  {
+    files: ['tests/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: NODE_GLOBALS,
+    },
+  },
+
+  // Guards em ESM puro (`scripts/*.mjs`). Eles ficam FORA do tsc de propósito
+  // — tsconfig.json inclui só `src/**/*`, e todo o `scripts/` já está fora —,
+  // então o lint é a única verificação estática que os alcança. Sem este bloco
+  // eles cairiam só no `js.configs.recommended`, sem globals de Node, e
+  // `process`/`console` virariam `no-undef`.
+  //
+  // `ecmaVersion` fica em 2015 de caso pensado: um guard que precisa rodar num
+  // Node velho para reclamar dele não pode usar sintaxe que o Node velho não
+  // parseia (`?.`, `??`, top-level await). O parser reprovando é mais barato
+  // que descobrir isso no runtime de quem está travado.
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2015,
+      sourceType: 'module',
+      globals: NODE_GLOBALS,
+    },
+    rules: {
+      'no-var': 'off',
+    },
   },
 
   // CommonJS scripts (rare here but defensive)

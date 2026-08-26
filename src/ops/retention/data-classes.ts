@@ -217,6 +217,37 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
       'whether media is durable data requiring its own backup, or ephemeral/recreatable and purgeable — and its retention if durable',
   }),
   cls({
+    // Issue #634 (fatia E da #506) — a mídia de SAÍDA ganhou um lugar durável
+    // para morar (`<MEDIA_ROOT>/outbound/`, ver
+    // `src/runtime/outbound/media-store.ts`), e um lugar onde dado do
+    // interlocutor passa a morar TEM de entrar neste inventário. Um objeto que
+    // sobrevive a um pedido de exclusão é incidente, não dívida.
+    //
+    // Classe SEPARADA de `media.blobs` de propósito, e a separação é o que
+    // torna o mecanismo implementável: `media.blobs` é a mídia de ENTRADA,
+    // endereçada por `<tenant>/<mês>/<sha>` — sem ligação com o titular, que é
+    // por isso que ela está em `UNSUPPORTED_CLASSES` com
+    // `mechanism_not_implemented`. O store de saída é endereçado por
+    // `<tenant>/<agent>/<pessoa_id>/<sha>`, então "quais objetos são deste
+    // titular" TEM resposta: é um diretório. Fundir as duas classes teria
+    // arrastado a de saída para a exceção da de entrada.
+    id: 'media.outbound_artifacts',
+    data_owner: 'platform_ops',
+    purpose:
+      'voice notes synthesised and documents generated for a reply, staged durably so a later delivery attempt sends the same bytes',
+    sensitivity: 'sensitive_personal',
+    scope: 'tenant_agent',
+    source_of_truth: 'filesystem:MEDIA_ROOT/outbound',
+    purge_mechanism: 'delete',
+    // Mesmo volume de `media.blobs`: o `pg_dump` não o captura.
+    backup_behavior: 'excluded_volume',
+    legal_hold_applicable: true,
+    reversible: false,
+    audit_event: 'retention_run_completed',
+    dpo_open_question:
+      'how long an outbound media object whose delivery ended uncertain or terminal may be kept so reconciliation and manual re-arm can still send the SAME bytes — deleting it earlier turns a recoverable delivery into a permanent media_ref_unresolved',
+  }),
+  cls({
     id: 'gateway.baileys_session',
     data_owner: 'platform_ops',
     purpose: 'WhatsApp session credentials for the bot line',
@@ -273,10 +304,25 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     source_of_truth: 'privacy_requests.export_locator',
     purge_mechanism: 'delete',
     backup_behavior: 'excluded_volume',
-    legal_hold_applicable: false,
+    // ERA `false`, e era uma declaração obsoleta: foi escrita quando NADA
+    // apagava o artefato, então a pergunta "um hold congela o export?" não
+    // tinha consequência. O TTL do #536 tornou a classe destrutível, e um
+    // pacote cifrado é uma cópia materializada do dado do titular — material
+    // responsivo tanto quanto a origem. Destruí-lo sob hold é a pior saída
+    // possível deste módulo, e a direção recuperável é conservá-lo.
+    //
+    // O varredor NÃO consulta este campo para decidir se avalia hold (ver
+    // `src/ops/privacy/export-sweeper.ts`): condicionar uma recusa destrutiva a
+    // um campo mutável de registro significa que uma edição de um caractere
+    // desarma a proteção. O campo declara a verdade; a proteção é incondicional.
+    legal_hold_applicable: true,
     reversible: false,
-    audit_event: 'privacy_request_completed',
-    dpo_open_question: 'export package lifetime before it must expire',
+    audit_event: 'privacy_export_purged',
+    // Sete dias é a POLÍTICA INICIAL decidida pelo dono (issue #536) e vive em
+    // `PRIVACY_EXPORT_TTL_DAYS`, não numa constante. O que continua com o DPO é
+    // confirmar (ou mudar) o número.
+    dpo_open_question:
+      'confirm or replace the initial 7-day export package lifetime (PRIVACY_EXPORT_TTL_DAYS); the mechanism that enforces it is live',
   }),
   cls({
     id: 'privacy.tombstone',
@@ -314,6 +360,24 @@ export function getDataClass(id: string): DataClass {
 }
 
 /** Classes that a `pg_dump` does NOT capture — the manifest declares these as excluded. */
+/**
+ * As classes que um pedido de um TITULAR alcança (issue #536 §2).
+ *
+ * O critério é o escopo: `tenant_agent` é a única faixa em que uma linha
+ * pertence a um titular identificável. `gateway.baileys_session` é de tenant
+ * (é credencial da linha, não dado do titular), e `queue.redis` /
+ * `backup.artifact` são de sistema — apagar qualquer um deles "em nome" de um
+ * titular destruiria dado de todos os outros.
+ *
+ * Inclui deliberadamente as classes NÃO purgáveis: elas viram EXCEÇÃO
+ * registrada no pedido, não omissão. Um relatório de conformidade que
+ * simplesmente não mencionasse `postgres.financial` não estaria dizendo que a
+ * retenção contábil sobrepôs o apagamento — estaria escondendo.
+ */
+export function subjectScopedClasses(): readonly DataClass[] {
+  return DATA_CLASSES.filter((c) => c.scope === 'tenant_agent');
+}
+
 export function classesExcludedFromDump(): string[] {
   return DATA_CLASSES.filter((c) => c.backup_behavior !== 'in_pg_dump').map((c) => c.id);
 }

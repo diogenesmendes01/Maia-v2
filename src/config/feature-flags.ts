@@ -36,8 +36,15 @@ export class FeatureFlags {
   }
 }
 
-// Instância singleton lida do config
-import { config } from './env.js';
+// Instância singleton lida do contrato.
+//
+// Issue #596: era `./env.js`, o singleton do subset `runtime`. Este módulo é
+// carregado pelo console (`src/admin-ui/trpc/tool-enablement.ts`), e aquele
+// import fazia o container do admin-ui validar `runtime` no boot — exigindo as
+// seis `BACKUP_*` que ele nunca usa. `FEATURE_MCP_TOOLS` é declarada
+// `services: ['runtime', 'admin-ui']`, então os dois containers têm direito de
+// lê-la; o que nenhum dos dois precisa é do boot do outro.
+import { contractEnv as config } from './contract-env.js';
 
 export const featureFlags = new FeatureFlags({
   // MCP externo v1 (issue #478) — fail-closed por default.

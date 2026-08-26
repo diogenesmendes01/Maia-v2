@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited` está aqui de propósito. O job roda `pr:body:check`, que valida o
+    # CORPO do PR — e os tipos default (`opened`, `synchronize`, `reopened`) não
+    # incluem edição de descrição. Sem isto o check é insatisfazível: ele reprova
+    # por causa do corpo, corrigir o corpo não dispara nada, e a única saída é
+    # empurrar um commit que não tem relação com o problema. Um gate que não pode
+    # ficar verde consertando aquilo de que ele reclama não é um gate.
+    types: [opened, synchronize, reopened, edited]
 
 # Cancel in-progress runs on the same branch when a new push lands.
 concurrency:
@@ -27,7 +34,21 @@ jobs:
         #    incompatibilities were never caught in CI (#396).
         # Keep these in sync: bump the second entry whenever the Dockerfile
         # base image major changes.
-        node: [22, 26]
+        #
+        # A perna do piso é pinada em 22.18 (e não no `22` flutuante): o piso
+        # que o repo SUPORTA é `engines.node: ">=22.13.0"` (o maior mínimo
+        # entre o npm@11.5.2 pinado e o eslint do lockfile, que o
+        # `engine-strict=true` do .npmrc torna obrigatório), mas o que a lane
+        # EXERCITA passa a ser um número explícito e reproduzível, em vez de
+        # "o 22.x mais novo que o runner tiver hoje".
+        # DIVERGÊNCIA ABERTA (não resolvida aqui, de propósito): o comentário
+        # acima afirma que a segunda perna espelha a imagem de produção com
+        # `FROM node:26-alpine`. O Dockerfile hoje diz `FROM node:22-alpine`
+        # (topo do arquivo, com o comentário explicando a descida de 26 -> 22).
+        # Ou seja: a perna 26 não espelha mais nada — ela cobre um major que
+        # produção não usa. Manter as duas pernas ou derrubar a 26 é decisão do
+        # dono; esta mudança só pinou o piso da perna 22.
+        node: ['22.18', 26]
     services:
       redis:
         image: redis:7-alpine
@@ -54,10 +75,19 @@ jobs:
       OWNER_NOME: Test Owner
       VOYAGE_API_KEY: test-voyage-key
       ALERT_CHANNELS: log
+      # `tests/unit/config/compose-config-differential.spec.ts` compara o
+      # ambiente que `src/config/compose-env.ts` reconstrói com o que o
+      # `docker compose config` REAL resolve — a única medição do preflight que
+      # não passa pelo parser customizado dele. Sem o CLI do Compose o arquivo
+      # se PULA, e um diferencial que se pula em silêncio no CI não mede nada:
+      # esta variável transforma a ausência em FALHA. `docker compose` vem
+      # pré-instalado no runner `ubuntu-latest` e NÃO precisa de daemon (o
+      # subcomando `config` só carrega e interpola o modelo do projeto).
+      TEST_REQUIRE_COMPOSE_DIFFERENTIAL: '1'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
           # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
@@ -82,6 +112,17 @@ jobs:
         # Fail loudly here if the pin didn't take, instead of surfacing a
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
 
       - name: Install dependencies
         run: npm ci
@@ -146,6 +187,26 @@ jobs:
         # `npx` instead of an npm script keeps CI independent of script renames.
         run: npx tsc --noEmit
 
+      - name: Install admin-ui deps
+        # O `npm ci` da raiz não instala o `src/admin-ui`, que tem lockfile
+        # próprio. Sem isto o passo abaixo reprovaria com "Cannot find module
+        # 'next'" — falha de ambiente disfarçada de erro de tipo.
+        working-directory: src/admin-ui
+        run: npm ci
+
+      - name: Typecheck admin-ui (tsc --noEmit)
+        # Issue #550: o `AGENTS.md` manda rodar `npm run admin:typecheck`, e ele
+        # estava QUEBRADO no `main` sem que nada reprovasse — porque nenhuma
+        # esteira o executava. Um comando que o manual exige e que ninguém
+        # verifica é pior que não ter o comando: quem segue o manual vê vermelho
+        # e não sabe se foi ele que quebrou.
+        #
+        # Passo próprio, e não `&&` no anterior, para a falha apontar o projeto
+        # certo. O admin fixa `@types/node` em 22.9.0 enquanto a raiz está em
+        # 25.x, então este passo cobre um conjunto de typings que o `tsc` da raiz
+        # não exercita — a divergência em si segue aberta na #550.
+        run: npm run admin:typecheck
+
       - name: Build + verify artifact
         # Atomic: dist/ check is chained with `&&` so the step fails if build
         # fails OR if no dist/index.js was produced.
@@ -155,6 +216,10 @@ jobs:
         # Integration tests skip when TEST_DB_URL is unset. Redis is still
         # present because several unit-regression paths load runtime modules
         # that initialize Redis-backed queues/caches from REDIS_URL.
+        env:
+          # Ver o passo "Resumo dos testes" abaixo e
+          # `tests/reporters/diagnostico-reporter.ts` (#545).
+          VITEST_SUMMARY_FILE: .ci-test-summary/unit.txt
         run: npx vitest run
 
       - name: Lint
@@ -162,12 +227,29 @@ jobs:
         # warnings for now so existing code can be cleaned incrementally.
         run: npm run lint
 
+      - name: Resumo dos testes
+        # Issue #545. Numa falha, o log deste job termina com o dump dos service
+        # containers, e o sumário do vitest fica soterrado — inalcançável para
+        # quem lê o log pelo fim (inclusive as ferramentas de leitura de log,
+        # que truncam pela cauda). Este passo reimprime o bloco de diagnóstico
+        # num passo PRÓPRIO e endereçável, e é o ÚLTIMO passo do job — o mais
+        # tarde que conseguimos controlar. Nunca reprova: é legibilidade, não
+        # gate.
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
+
   secret-scan:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
@@ -185,10 +267,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          # Mesmo piso pinado dos jobs matriciais (22.18), para o audit rodar
+          # no Node que as outras lanes rodam.
+          node-version: '22.18'
           cache: 'npm'
       - name: Pin npm to 11.5.2
         # Mesmo pin do job validate (ci.yml acima): o audit resolve advisories
@@ -202,6 +286,33 @@ jobs:
         working-directory: src/admin-ui
         run: npm audit --omit=dev --audit-level=high
 
+      - name: Audit exceptions ledger (dev tree + moderates)
+        # Issue #526. Os dois passos acima deixam DOIS silêncios: `--omit=dev`
+        # apaga a árvore de desenvolvimento inteira (um `critical` de RCE no
+        # vitest do admin-ui viveu meses sem ninguém no CI mencioná-lo), e
+        # `--audit-level=high` deixa `moderate` de produção passar sem registro.
+        #
+        # Este passo fecha os dois: TODO advisory que o `npm audit` reporta em
+        # qualquer um dos dois lockfiles precisa estar corrigido OU ter linha em
+        # `security/audit-exceptions.json` com motivo, dono e `expires`. Uma
+        # exceção vencida reprova; uma exceção que não casa mais com nenhum
+        # advisory também reprova, o que força a limpeza do ledger; e uma
+        # exceção cujo `max_severity` (TETO, não igualdade) ficou ABAIXO da
+        # severidade que o npm reporta hoje reprova também, porque a decisão
+        # registrada valia para um risco menor. Queda de severidade não reprova.
+        #
+        # O guard NÃO confia no exit code do `npm audit` (ele sai != 0 quando
+        # ACHA vulnerabilidade), e por isso valida a FORMA do relatório: falha
+        # de registry/auth devolve `{"error":...}` em stdout, e sem essa
+        # checagem o passo leria isso como "zero advisories" e ficaria verde —
+        # fail-open no guard que existe para ser fail-closed.
+        #
+        # Chamado com `node` direto, e não pelo script npm: este job NÃO roda
+        # `npm ci` (é o que o mantém rápido e sem serviços), então não há `tsx`.
+        # O guard é escrito só com sintaxe TS apagável e o Node 22 do runner
+        # remove os tipos nativamente. Localmente use `npm run audit:exceptions:check`.
+        run: node scripts/check-audit-exceptions.ts
+
   integration:
     name: integration + e2e (node ${{ matrix.node }})
     runs-on: ubuntu-latest
@@ -212,7 +323,9 @@ jobs:
         # Same rationale as the `validate` job: cover the engines floor (22,
         # the .nvmrc dev pin) and the production image major (26, Dockerfile
         # `FROM node:26-alpine`). See #396. Keep in sync with the Dockerfile.
-        node: [22, 26]
+        # Piso pinado em 22.18, pelo mesmo motivo do job `validate` — e com a
+        # mesma divergência aberta sobre a perna 26 vs `node:22-alpine`.
+        node: ['22.18', 26]
     services:
       postgres:
         # pgvector/pgvector:pg16 ships pgvector preinstalled. The image is
@@ -258,9 +371,9 @@ jobs:
       VOYAGE_API_KEY: test-voyage-key
       ALERT_CHANNELS: log
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Matrixed across the engines floor (.nvmrc, Node 22) and the prod
           # image major (Node 26, Dockerfile) — see this job's strategy.matrix.
@@ -281,16 +394,640 @@ jobs:
         # confusing `npm ci` lockfile-mismatch error later.
         run: test "$(npm --version)" = "11.5.2"
 
+      - name: Node version guard (readable message)
+        # O `preinstall` do package.json NÃO serve de gate: com
+        # `engine-strict=true` (.npmrc) um Node fora de `engines` morre em
+        # `EBADENGINE` antes de qualquer lifecycle script, e num `npm ci` que
+        # passa o `preinstall` só roda DEPOIS de a árvore estar escrita. Quem
+        # barra de fato é `devEngines.runtime` (package.json, onFail: error).
+        # Este passo existe para a MENSAGEM: invocado explicitamente, ele é
+        # garantido por construção e não por lifecycle. Deve rodar ANTES do
+        # `npm ci`. Coberto por tests/unit/scripts/check-node.spec.ts.
+        run: node scripts/check-node.mjs
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Silenciar o log do Postgres de teste (#545)
+        # O log deste job terminava com centenas de linhas do service container
+        # de Postgres: `checkpoint complete` a cada poucos segundos e as
+        # violações de constraint que as próprias specs PROVOCAM de propósito
+        # (leak suite, testes de FK, race de unique). Nenhuma delas é lida ali —
+        # o teste que as provoca já as asserta — e juntas empurravam o sumário
+        # do vitest para fora do alcance de quem lê o log.
+        #
+        # `log_min_messages = fatal` mantém FATAL e PANIC (o Postgres morrendo
+        # continua visível) e corta LOG/ERROR/WARNING;
+        # `log_min_error_statement = panic` corta o dump do SQL que falhou.
+        # Ambos são sighup, então `pg_reload_conf()` basta — sem restart.
+        #
+        # Nunca reprova o job: isto é cosmética de log. Se `psql` não existir na
+        # imagem do runner, o passo avisa e segue.
+        continue-on-error: true
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "psql ausente no runner — log do Postgres segue verboso"
+            exit 0
+          fi
+          PGPASSWORD=test1234 psql -h localhost -U maia_test -d maia_test -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET log_checkpoints = 'off';
+          ALTER SYSTEM SET log_connections = 'off';
+          ALTER SYSTEM SET log_disconnections = 'off';
+          ALTER SYSTEM SET log_min_messages = 'fatal';
+          ALTER SYSTEM SET log_min_error_statement = 'panic';
+          SELECT pg_reload_conf();
+          SQL
 
       - name: Apply migrations
         # Service container health-checks gate startup, so by the time this
         # step runs Postgres is accepting connections.
         run: npm run db:migrate
 
+      - name: maia doctor (read-only, NÃO bloqueante)
+        # Issue #517, etapa 6 do rollout ("rodar em CI sem bloquear").
+        #
+        # Roda contra os MESMOS service containers das specs, logo depois das
+        # migrations — o momento em que um schema recém-aplicado, o pgvector da
+        # imagem `pgvector/pgvector:pg16` e a política de eviction do
+        # `redis:7-alpine` são todos observáveis de uma vez.
+        #
+        # `continue-on-error` é deliberado e temporário: um gate novo que
+        # reprova o CI no primeiro dia é um gate que alguém desliga. Ele vira
+        # bloqueante em staging primeiro (etapa 7) e em produção depois
+        # (etapa 8) — ver docs/runbooks/doctor.md.
+        #
+        # O doctor é read-only: nada aqui altera o banco ou o Redis das specs
+        # que rodam em seguida.
+        continue-on-error: true
+        run: npm run doctor -- --online
+
       - name: Run integration tests
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 
       - name: Run e2e tests
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
         run: npm run test:e2e
+
+      - name: Resumo dos testes
+        # Mesma razão do job `validate` — e aqui o problema é pior, porque este
+        # job tem DOIS service containers dumpando no fim. Ver #545.
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
+
+  # ---------------------------------------------------------------------
+  # Gate permanente de release do job `migrate` (#516). Job NOVO, isolado e
+  # apendado de propósito: ele não compartilha nada com os jobs acima
+  # (sem `npm ci`, sem service containers, sem matriz), então uma edição
+  # aqui não conflita com trabalho em curso nos outros jobs.
+  #
+  # Por que ele existe: `tests/unit/migrations/compose-migrate-job.spec.ts`
+  # prova que os arquivos de Compose DIZEM a coisa certa, e nunca executa o
+  # comando. Este job constrói a imagem de produção real e roda
+  # `npm run db:migrate` dentro dela, como uid 1001, com rootfs read-only,
+  # contra um Postgres efêmero. Foi assim que se mediu que `COPY
+  # tsconfig.json` (Dockerfile) e `tmpfs: /tmp` (compose) são requisitos do
+  # job, e não higiene — sem eles o migrator sai != 0 e, via
+  # `service_completed_successfully`, segura app/admin-ui fora do ar.
+  # ---------------------------------------------------------------------
+  smoke-migrate-image:
+    name: smoke do job migrate na imagem real
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      # Sem `setup-node` e sem `npm ci`: o script só usa bash + docker, e
+      # tudo o que interessa (Node, npm 11.5.2, tsx, node_modules de
+      # produção) vem de DENTRO da imagem que ele constrói. Instalar
+      # dependências no runner só criaria a chance de o smoke passar por
+      # causa do runner em vez de por causa da imagem.
+      - name: Smoke do job migrate na imagem de produção
+        run: bash scripts/smoke-migrate-image.sh
+
+  # ---------------------------------------------------------------------
+  # Regras de alerta, avaliadas pelo motor REAL (#519, decisão 14). Job novo,
+  # isolado e apendado no mesmo padrão do `smoke-migrate-image`: sem
+  # `setup-node`, sem `npm ci`, sem service containers, sem matriz.
+  #
+  # Por que ele existe: `tests/unit/observability/*-alert-rules.spec.ts`
+  # executa as `expr` reais e cobre limiar, operador e escopo, mas com um
+  # avaliador INSTANTÂNEO — ele afirma o `for:` como CAMPO e não consegue
+  # simular tempo. Quem prova `pending → firing` é `promtool test rules`, e
+  # um arquivo de teste que ninguém executa apodrece.
+  #
+  # Usa o `/bin/promtool` da imagem oficial do Prometheus em vez de baixar o
+  # binário Go solto: a imagem é assinada, versionada e já está no cache do
+  # runner. A tag é pinada — não existe Prometheus versionado neste repo
+  # hoje (só um exemplo sem tag em `docs/runbooks/redis.md`); quando existir,
+  # ESTA tag e a do deploy têm de andar juntas.
+  # ---------------------------------------------------------------------
+  alert-rules:
+    name: regras de alerta (promtool)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # `check rules` em TODOS os arquivos, não só no que tem teste: um YAML
+      # sintaticamente inválido ou uma `expr` que não compila derruba o
+      # carregamento do grupo inteiro no Prometheus, em silêncio.
+      #
+      # Os globs sao expandidos AQUI, no runner, dentro de `monitoring/alerts`,
+      # e so os nomes resolvidos entram no `docker run`. A primeira versao
+      # passava `*.rules.yml` cru: o shell do runner tem `cwd` na RAIZ do repo,
+      # o glob nao casava nada, bash o repassava literal e o promtool respondia
+      # `path '*.rules.yml' does not exist`. Expandir dentro do container
+      # resolveria tambem, mas exigiria `--entrypoint sh` e um shell na imagem;
+      # assim o job nao depende de nada alem do proprio binario.
+      - name: promtool check rules (todos os arquivos)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./*.rules.yml)
+          echo "arquivos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            check rules $files
+
+      # E a prova temporal, que é a razão de o job existir.
+      - name: promtool test rules (semântica de for:)
+        run: |
+          set -euo pipefail
+          cd monitoring/alerts
+          files=$(ls -1 ./tests/*.test.yml)
+          echo "casos: $files"
+          docker run --rm -v "$PWD:/rules" -w /rules \
+            --entrypoint /bin/promtool prom/prometheus:v2.53.5 \
+            test rules $files
+
+  # ---------------------------------------------------------------------
+  # Round-trip REAL do `drizzle-kit` (#574, achado da revisão do PR #594).
+  #
+  # Por que ele existe: até aqui NADA versionado executava o binário que a
+  # #574 troca de major. `tests/unit/drizzle-kit-esbuild-advisory.spec.ts`
+  # afere LOCKFILE (e diz isso de si mesmo), e o `smoke-migrate-image` roda
+  # `tsx scripts/migrate.ts` sobre os `.sql` já versionados — nenhum dos dois
+  # carrega o loader/gerador do drizzle-kit. Uma regressão do gerador neste
+  # major, ou num update que o Dependabot abra dentro de `^0.31`, passava por
+  # todos os checks.
+  #
+  # `scripts/probe-drizzle-kit.ts` fecha `generate → up → down` contra um
+  # banco CRIADO E DERRUBADO pela própria execução, e exige que os literais
+  # que só existem depois do alias `@/*` resolvido apareçam no SQL gerado —
+  # foi exatamente aí que o drizzle-kit 0.28 morria.
+  #
+  # Job NOVO e isolado, no mesmo padrão de `smoke-migrate-image` e
+  # `alert-rules`: sem matriz e sem compartilhar nada com os jobs acima. NÃO
+  # tem `continue-on-error` de propósito — um gate de schema que só avisa não
+  # é gate. Medido: ~6s depois do `npm ci` (generate + up + down).
+  # ---------------------------------------------------------------------
+  drizzle-kit-roundtrip:
+    name: round-trip do drizzle-kit (generate + up + down)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # Mesma imagem do job `integration`: o SQL gerado hoje não usa
+        # `vector`, mas o dia em que o schema ganhar uma coluna dessas o job
+        # não pode virar o único lugar que reprova por falta de extensão.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # A sonda NUNCA escreve neste banco: ela só lê host/usuário/senha desta
+      # URL e cria o seu próprio `drizzle_kit_probe_*` ao lado, derrubado no
+      # `finally`. `POSTGRES_USER` é superusuário na imagem oficial, então o
+      # `CREATE DATABASE` funciona sem grant extra.
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # Uma perna só, no piso de `engines.node`: o objeto sob teste é o
+          # binário do drizzle-kit, não a compatibilidade de Node major — essa
+          # já é coberta pela matriz dos jobs `validate` e `integration`.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Mesmo motivo dos demais jobs: o lockfile é npm 11 e `npm ci` com npm
+        # 10 quebra. Tem de rodar ANTES do `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # Mesmo motivo dos jobs `validate`/`integration`: quem barra de fato é
+        # `devEngines.runtime`, e este passo existe para a MENSAGEM. Tem de
+        # rodar ANTES do `npm ci` — `tests/unit/scripts/check-node.spec.ts`
+        # varre TODOS os workflows e reprova qualquer `npm ci` sem ele.
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        # `npm ci` (e não `npm i`): a sonda existe para exercitar a versão que
+        # o LOCKFILE resolve, que é o artefato central da #574.
+        run: npm ci
+
+      - name: Round-trip do drizzle-kit contra Postgres descartável
+        run: npm run probe:drizzle-kit
+
+  # ---------------------------------------------------------------------
+  # Gate do console de administração (#472 parte A — pré-requisito das
+  # issues #604 e #605).
+  #
+  # Por que ele existe: até aqui o CI rodava `admin:typecheck` (tipos) e as
+  # specs de `tests/admin-ui/unit/` (routers tRPC, em processo). Nenhum dos
+  # dois EXECUTA o console: nada carregava o `next build`, o bundle de
+  # middleware (runtime Edge), os route handlers ou o bundle de cliente. Um
+  # `next build` quebrado e uma regressão de runtime do console passavam por
+  # todos os checks — e as duas issues de upgrade (#604 Next 16, #605
+  # Recharts 3) pedem exatamente esta rede antes de subirem major.
+  #
+  # Job NOVO e isolado, no padrão de `smoke-migrate-image`, `alert-rules` e
+  # `drizzle-kit-roundtrip`: uma perna só de Node, sem matriz, sem compartilhar
+  # nada com os jobs acima. NÃO tem `continue-on-error` de propósito.
+  #
+  # ORDEM DOS PASSOS, e por que ela é a invariante (decisão do dono):
+  #   build -> artefato existe -> TYPECHECK -> migrations -> E2E standalone
+  # O typecheck vem DEPOIS do build porque metade do que ele tem para checar
+  # só existe depois: `.next/types/**` é gerado pelo `next build` e é lá que o
+  # Next 16 declara o contrato de cada rota. E o E2E não roda mais `next
+  # start`: ele monta e executa o MESMO artefato do `src/admin-ui/Dockerfile`
+  # (`.next/standalone` + `.next/static`, `node src/admin-ui/server.js`), para
+  # que o que o CI mede seja o que o Coolify executa.
+  # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` trava as duas coisas lendo este
+  # arquivo do disco.
+  #
+  # ARMADILHA DE ENV, deliberada no desenho: NÃO existe bloco `env:` de JOB
+  # aqui. Uma variável no `env:` de um job alcança TODO processo dele, e
+  # `src/config/validate.ts` REPROVA qualquer chave desconhecida sob os
+  # prefixos de `MAIA_KEY_PREFIXES` (`MAIA_`, `FEATURE_`, `BACKUP_`,
+  # `ADMIN_UI_`, `OWNER_`, ...). Além disso o build precisa de
+  # `NODE_ENV=production` e as migrations de `NODE_ENV=test`; misturar os dois
+  # num `env:` de job é como se fabrica uma falha em massa. Cada passo carrega
+  # o SEU bloco.
+  #
+  # Duração medida (ver corpo do PR): `next build` ~35s a frio / ~9s a quente,
+  # boot do console 0.4s, suíte Playwright 2.1s. O custo dominante do job são
+  # os dois `npm ci` e o download do Chromium.
+  # ---------------------------------------------------------------------
+  admin-ui:
+    name: build + e2e do console (admin-ui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        # Mesma imagem do job `integration`: o console importa
+        # `src/db/client.ts`, e o banco contra o qual ele roda tem de ser do
+        # mesmo tipo do de produção (pgvector incluso).
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          # Uma perna só, no piso de `engines.node`. O objeto sob teste é o
+          # artefato do console, não a compatibilidade de Node major — essa já
+          # é coberta pela matriz dos jobs `validate` e `integration`.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        # Mesmo motivo dos demais jobs: o lockfile é npm 11 e `npm ci` com npm
+        # 10 quebra. Tem de rodar ANTES do `npm ci`.
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        # Tem de rodar ANTES do `npm ci` — `tests/unit/scripts/check-node.spec.ts`
+        # varre TODOS os workflows e reprova qualquer `npm ci` sem ele.
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        # A raiz traz `@playwright/test` (devDependency): o runner e as specs
+        # vivem na raiz, então é de lá que `@playwright/test` precisa resolver.
+        # Antes disso `npm run test:admin-ui:e2e` morria em
+        # `Cannot find package '@playwright/test'` antes mesmo de carregar o
+        # próprio `playwright.config.ts`.
+        run: npm ci
+
+      - name: Install admin-ui deps
+        # O `npm ci` da raiz não instala `src/admin-ui`, que tem lockfile
+        # próprio (mesmo passo do job `validate`).
+        working-directory: src/admin-ui
+        run: npm ci
+
+      - name: Instalar Chromium do Playwright
+        # No CI o browser NAO vem pronto: sem este passo o job reprovaria com
+        # "Executable doesn't exist", que é falha de ambiente disfarçada de
+        # falha de teste. `--with-deps` traz as bibliotecas de sistema do
+        # runner. Só o chromium — é o único browser dos `projects` do config.
+        run: npx playwright install --with-deps chromium
+
+      # -- BUILD -----------------------------------------------------------
+      - name: Build do console (next build)
+        # BLOQUEANTE. Este bloco de env é o MESMO do estágio `build` de
+        # `src/admin-ui/Dockerfile` — o build real da imagem de produção — e
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` reprova se os dois
+        # divergirem. Não é higiene: o `next build` avalia a configuração da
+        # Maia na passada de "Collecting page data" (o console importa
+        # `@/db/client.ts` -> `@/config/env.ts`), então o build FALHA sem estas
+        # variáveis. Foi assim que se mediu que o bloco do Dockerfile estava
+        # DESATUALIZADO: sem `MAIA_ENV` e sem as três de `BACKUP_S3_*` ele
+        # morre em "Failed to collect page data for /api/auth/[...nextauth]"
+        # — ou seja, o build da imagem de produção do console estava quebrado
+        # e nada no CI dizia.
+        #
+        # `MAIA_ENV=staging`: `next build` fixa `NODE_ENV=production`, e o
+        # profile `production` do contrato exige keyring de backup e chaves de
+        # S3 de verdade. O build é um SANDBOX, não um deploy — nada daqui
+        # chega ao runtime, que valida com os valores reais no boot. `staging`
+        # é o profile estrito mais próximo que descreve isso honestamente.
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NODE_ENV: production
+          MAIA_ENV: staging
+          NEXTAUTH_SECRET: build-time-only-secret-min-32-chars-not-shipped-12345
+          NEXTAUTH_URL: http://localhost:4000
+          DATABASE_URL: postgres://build:build@localhost:5432/build
+          POSTGRES_USER: build
+          POSTGRES_PASSWORD: buildbuild
+          POSTGRES_DB: build
+          REDIS_URL: redis://localhost:6379
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: build
+          ANTHROPIC_API_KEY: sk-ant-build
+          OPENROUTER_API_KEY: sk-or-build
+          VOYAGE_API_KEY: voyage-build
+          ALERT_CHANNELS: log
+          RUNTIME_TRACE_HMAC_MASTER_SECRET: build-time-only-hmac-not-shipped-min-32-chars-1234567890
+          BACKUP_S3_BUCKET: build-bucket
+          BACKUP_S3_ACCESS_KEY: build
+          BACKUP_S3_SECRET_KEY: build
+        run: npm run admin:build
+
+      - name: Artefato do build existe
+        # Atômico com o passo acima: um `next build` que sai 0 sem emitir
+        # BUILD_ID não construiu nada. Confere também o artefato STANDALONE —
+        # é ele que o Dockerfile copia para a imagem e é ele que o passo de
+        # E2E abaixo executa; um build que emite BUILD_ID mas não emite
+        # `server.js` (por perder o `output: 'standalone'` em
+        # `next.config.mjs`) produziria uma imagem sem entrypoint.
+        run: |
+          test -f src/admin-ui/.next/BUILD_ID
+          test -f src/admin-ui/.next/standalone/src/admin-ui/server.js
+          test -d src/admin-ui/.next/static
+
+      # -- TYPECHECK PÓS-BUILD ---------------------------------------------
+      - name: Typecheck do console PÓS-BUILD (tsc --noEmit)
+        # BLOQUEANTE, e DEPOIS do build de propósito (decisão do dono).
+        #
+        # O `next build` GERA tipos em `src/admin-ui/.next/types/**` — um
+        # arquivo por rota, que confronta o que a página exporta com o que o
+        # Next 16 exige. `src/admin-ui/tsconfig.json` já os listava em
+        # `include`, mas o `exclude` trazia `.next` e exclude vence include:
+        # eles NUNCA eram checados. O `exclude` foi encolhido para
+        # `["node_modules", "dist"]` e este passo é quem colhe o resultado.
+        #
+        # MEDIDO nesta árvore, revertendo `params: Promise<{id}>` para
+        # `params: {id}` em `app/proposals/[id]/page.tsx` (a armadilha nº 1 do
+        # major do Next 16):
+        #   - com `.next` no exclude:  `tsc --noEmit` sai 0. Silêncio total.
+        #   - sem `.next` no exclude:  reprova em
+        #     `.next/types/app/proposals/[id]/page.ts(39,29): error TS2344`.
+        # Ou seja: antes deste passo, o gate de tipos do console não olhava
+        # para o contrato de rotas do framework.
+        #
+        # Por que não substitui o `Typecheck admin-ui` do job `validate`:
+        # aquele job não constrói o console, então lá `.next/types/**` não
+        # existe e o glob casa zero arquivo — ele cobre o CÓDIGO-FONTE, em
+        # duas pernas de Node, e continua sendo o gate rápido da #550. Este
+        # cobre o que só existe DEPOIS do build. Sem bloco `env:`: `tsc` não
+        # lê configuração da Maia, e uma variável a mais aqui só reintroduziria
+        # a armadilha de namespace descrita no topo do job.
+        run: npm run admin:typecheck
+
+      # -- E2E -------------------------------------------------------------
+      - name: Apply migrations
+        # Bloco de env do PERFIL DE TESTE (NODE_ENV=test => profile
+        # development), espelhando o job `integration`. Separado do bloco de
+        # build de propósito: os dois se contradizem em `NODE_ENV`.
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+          REDIS_URL: redis://localhost:6379
+          ANTHROPIC_API_KEY: sk-ant-test-placeholder
+          OPENROUTER_API_KEY: sk-or-test-placeholder
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: Test Owner
+          VOYAGE_API_KEY: test-voyage-key
+          ALERT_CHANNELS: log
+        run: npm run db:migrate
+
+      - name: E2E do console (Playwright, projeto `smoke`)
+        # BLOQUEANTE. `scripts/admin-ui-e2e.sh` MONTA o artefato standalone
+        # (`.next/standalone` + `.next/static` na posição do Dockerfile), sobe
+        # `node src/admin-ui/server.js` — o mesmo `CMD` da imagem —, espera ele
+        # responder (e reprova com o log dele se não responder), roda o projeto
+        # `smoke` e depois exige, por `scripts/check-playwright-run.ts`, que a
+        # rodada tenha executado pelo menos `TEST_ADMIN_UI_MIN_TESTS` testes e
+        # NENHUM pulado.
+        #
+        # Desde a #623 o script também SEMEIA as fixtures das jornadas
+        # (`scripts/seed-admin-ui-e2e-fixtures.ts`) antes de subir o servidor —
+        # é o que faz o projeto `smoke` incluir as jornadas autenticadas do
+        # operador, e não só o boot. A sessão delas é montada no teste
+        # (`tests/admin-ui/e2e/_apoio/sessao.ts`) com o MESMO `NEXTAUTH_SECRET`
+        # deste bloco: nenhum provider novo é registrado no console, e o
+        # middleware, o `auth()`, o `assertRole` e os gates de papel continuam
+        # sendo exercitados de verdade. O Playwright sai com código 0 quando não encontra
+        # teste nenhum — sem esse piso, "Running 0 tests" seria um check verde.
+        #
+        # `AUTH_TRUST_HOST=true` é o mesmo valor de `compose.prod.yml`: sem
+        # ele o NextAuth v5 recusa o Host (`UntrustedHost`) e devolve 500 em
+        # /api/auth/*. Medido: a spec de boot reprova com três respostas 500.
+        #
+        # ─────────────────────────────────────────────────────────────────
+        # POR QUE ESTE BLOCO DEIXOU DE SER `development` (decisão do dono)
+        # ─────────────────────────────────────────────────────────────────
+        # Enquanto o E2E usava `next start`, o profile era escolha nossa e
+        # `development` era a escolha honesta: um harness em http://localhost
+        # sem IdP não é staging.
+        #
+        # Com o artefato standalone a escolha ACABOU. O `server.js` que o Next
+        # gera abre com `process.env.NODE_ENV = 'production'` — linha 5 do
+        # arquivo, antes do `require('next')` e MUITO antes de
+        # `instrumentation.register()`. Não há flag, env var ou ordem de
+        # invocação que mude isso: quando `assertAdminBootConfig()` roda,
+        # `NODE_ENV` JÁ É `production`. Medido nesta árvore, com o artefato
+        # real e `loadAdminConfig()`:
+        #   MAIA_ENV=development -> `profile/node-env-contradiction`
+        #                           ("MAIA_ENV=development contradiz
+        #                            NODE_ENV=production") -> boot morto;
+        #   MAIA_ENV ausente     -> profile `production`, e o contrato cobra
+        #                           MAIA_ENV + as quatro OIDC_* + https;
+        #   MAIA_ENV=staging     -> `COMPATIBLE_NODE_ENV` aceita
+        #                           NODE_ENV=production (src/config/profiles.ts),
+        #                           e o contrato cobra as quatro OIDC_* + https.
+        # Ou seja: contra o artefato de produção, `staging` é o ÚNICO profile
+        # satisfazível — e é o mesmo que `compose.prod.yml` injeta no
+        # container. As quatro `OIDC_*` abaixo existem por isso, e não para
+        # "fazer passar": elas descrevem um IdP que o smoke nunca contata (o
+        # host é `.invalid`, RFC 2606 — não resolve por definição, e nenhuma
+        # asserção do `smoke` inicia sign-in). MEDIDO: `/api/auth/providers`
+        # responde 200 sem tentar discovery, e os 5 testes do `smoke` passam.
+        #
+        # O que este bloco NÃO faz é enfraquecer gate: ele ENDURECE. Antes o
+        # boot do console era validado no profile `development`, onde o subset
+        # `admin-ui` só exige `DATABASE_URL`. Agora o E2E prova que o artefato
+        # de produção sobe sob a validação ESTRITA do contrato — as mesmas
+        # regras que o Coolify vai aplicar. `MAIA_CONFIG_STRICT_BOOT` continua
+        # de fora: desligar o contrato para o E2E passar seria exatamente o
+        # desarme que `tests/unit/ci/admin-ui-e2e-gate.spec.ts` existe para
+        # impedir.
+        env:
+          # Explícito, e igual ao estágio `runtime` do Dockerfile e ao
+          # `environment:` de `compose.prod.yml`. O `server.js` do standalone
+          # forçaria `production` de qualquer forma; declarar aqui evita que o
+          # bloco conte uma história diferente da que o processo vive.
+          NODE_ENV: production
+          # `staging`, e não `production`: o profile estrito mais próximo que
+          # descreve honestamente um harness efêmero contra banco de teste — a
+          # mesma razão pela qual o passo de build (e o Dockerfile) usam
+          # `staging`. `production` cobraria keyring de backup e credenciais de
+          # S3 REAIS, que este job não tem e não deve ter.
+          MAIA_ENV: staging
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXTAUTH_SECRET: e2e-only-secret-min-32-chars-not-shipped-12345
+          # https porque a regra `url/https-required` (src/config/rules.ts) o
+          # exige fora de `development`. O servidor segue em http://localhost —
+          # e é `AUTH_TRUST_HOST=true` que faz o NextAuth v5 aceitar o Host da
+          # requisição em vez desta URL. Medido: os 5 testes do `smoke` passam
+          # com este par.
+          NEXTAUTH_URL: https://localhost:4000
+          AUTH_TRUST_HOST: 'true'
+          DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+          REDIS_URL: redis://localhost:6379
+          WHATSAPP_NUMBER_MAIA: '+5500000000000'
+          OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+          OWNER_NOME: e2e
+          ANTHROPIC_API_KEY: sk-ant-e2e
+          OPENROUTER_API_KEY: sk-or-e2e
+          VOYAGE_API_KEY: voyage-e2e
+          ALERT_CHANNELS: log
+          RUNTIME_TRACE_HMAC_MASTER_SECRET: e2e-only-hmac-not-shipped-min-32-chars-1234567890
+          BACKUP_S3_BUCKET: e2e-bucket
+          BACKUP_S3_ACCESS_KEY: e2e
+          BACKUP_S3_SECRET_KEY: e2e
+          FEATURE_ADMIN_UI_V1: 'true'
+          # As quatro `OIDC_*`: `requiredIn: ['staging','production']` no
+          # contrato (src/config/contract.ts). Descrevem um IdP que NÃO EXISTE
+          # e que o `smoke` nunca contata — o TLD `.invalid` é reservado pela
+          # RFC 2606 justamente para isso, então nenhum resolvedor do mundo o
+          # aponta para lugar nenhum.
+          OIDC_ISSUER: https://sem-idp.invalid/realms/e2e
+          OIDC_CLIENT_ID: maia-admin-e2e
+          # `sem-idp` repetido, não um valor com cara de segredo: precisa de
+          # >= 16 chars (MIN_OIDC_CLIENT_SECRET_LEN em
+          # src/admin-ui/lib/auth-gating.ts) e de NÃO casar
+          # `isOperatorPlaceholder` nem a fixture sintética do contrato
+          # (`secret/synthetic-fixture`). Entropia de Shannon 2.77 — bem abaixo
+          # do corte de 3.5 da regra `generic-api-key` do gitleaks, que varre o
+          # HISTÓRICO e não a árvore.
+          OIDC_CLIENT_SECRET: sem-idp-sem-idp-sem-idp-sem-idp
+          # `primary` é o tenant reservado do runtime single-tenant. NUNCA
+          # `default`: o slug vai direto para `appUsersRepo.getByEmail(tenant,
+          # email)` em `auth-resolver.ts` — ele É o `tenant_id` num caminho
+          # dinâmico —, e a regra `admin-ui/tenant-slugs-default-literal`
+          # (src/config/rules.ts) recusa o literal de propósito.
+          OIDC_TENANT_SLUGS: primary
+          # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
+          # `scripts/admin-ui-e2e.sh`.
+          #
+          # 27 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
+          # #623 (inbox, detalhe de proposta, aprovação simples e dupla,
+          # rejeição, trava de arquitetura, trilha de auditoria, drift, traces
+          # e versões). O piso não é cosmético: sem ele, um `grep` que deixasse
+          # de casar faria a rodada executar só o boot e o job continuaria
+          # verde — que é exatamente como a quarentena passou despercebida.
+          # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este número
+          # contra a contagem de casos das specs FORA da quarentena.
+          TEST_ADMIN_UI_MIN_TESTS: '27'
+        run: npm run test:admin-ui:e2e:ci
+
+      - name: Quarentena da suíte e2e (o que NÃO foi medido)
+        # Nunca reprova: é legibilidade. Depois da #623 sobrou UMA spec fora do
+        # gate, e não por sessão nem por fixture: o QR e o código de pareamento
+        # são produzidos pelo worker `channel_pairing` do RUNTIME, e este job
+        # sobe só o console. O cabeçalho de `channel-lines-pairing.spec.ts` tem
+        # a medição e o critério objetivo de saída; a lista é fixada em
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode crescer
+        # em silêncio.
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "specs fora do gate (@pendente-runtime — dependem de um runtime Maia no job):"
+          # Casa a TAG no título do describe (o que o grep do Playwright vê),
+          # não uma menção ao identificador em comentário.
+          grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts
+
+      - name: Relatório do Playwright (só quando reprova)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-admin-ui
+          path: |
+            .playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore

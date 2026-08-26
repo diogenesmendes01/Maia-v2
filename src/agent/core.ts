@@ -1,4 +1,5 @@
 import {
+  agentTurnsRepo,
   mensagensRepo,
   conversasRepo,
   procedureExecutionsRepo,
@@ -60,7 +61,17 @@ import {
   deadLetterTurn,
   isTerminalTurnStatus,
   turnStateAuthoritative,
+  runWithTurnExecution,
+  turnOwnershipLost,
+  getTurnExecutionContext,
+  assertTurnOwnership,
+  reportBlockedEffect,
+  transactionalDebounceEnabled,
+  TurnOwnershipLostError,
+  type TurnHandle,
 } from '@/runtime/turns/index.js';
+// #631 — o escopo de SAÍDA do turno (ver a chamada, mais abaixo).
+import { runWithOutboundTurnScope } from '@/runtime/outbound/turn-scope.js';
 import {
   runWithTenantContext,
   getCurrentTenant,
@@ -82,6 +93,7 @@ import {
 } from '@/runtime/decision/integration.js';
 // Issue #514 — a failed MANDATORY trace envelope is a turn-blocking condition.
 import { MandatoryTraceEnvelopeError } from '@/observability/turn-trace.js';
+import { publishSpanAttribution } from '@/observability/tracer.js';
 import {
   buildBaseContextPacketFromTurn,
   applyToolReductions,
@@ -136,18 +148,64 @@ const AGGREGATE_SEPARATOR = '\n';
  * Only `tipo = 'texto'` is merged. Media bypasses the debouncer
  * upstream (see `baileys.handleIncoming`).
  */
-async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
+async function aggregateUnprocessedTexts(
+  target: Mensagem,
+  turn: TurnHandle | null,
+): Promise<{
   text: string;
   merged_ids: string[];
+  /**
+   * #628 — o batch veio FECHADO do banco, e portanto os irmãos JÁ são inputs
+   * deste turno. O caller usa isto para NÃO chamar `absorbDebounceInputs`: a
+   * absorção já aconteceu, dentro da transação de fechamento, e reexecutá-la
+   * tentaria transicionar irmãos que já são `superseded` — um conflito de CAS
+   * ruidoso descrevendo trabalho que não existe.
+   */
+  preclosed: boolean;
 }> {
   const targetText = target.conteudo ?? '';
 
   // Gate 1: off-flag → no aggregation. Each inbound is its own turn.
-  if (!config.FEATURE_MESSAGE_DEBOUNCE) return { text: targetText, merged_ids: [] };
+  if (!config.FEATURE_MESSAGE_DEBOUNCE) {
+    return { text: targetText, merged_ids: [], preclosed: false };
+  }
+
+  // #628 (fatia E da #505) — O BATCH VEM DO BANCO, NÃO É RECALCULADO AQUI.
+  //
+  // Com o debounce transacional ligado, a composição da rajada já foi decidida
+  // e COMITADA pelo fechamento (`closeDueDebounceBatch`): os irmãos são inputs
+  // deste turno e seus turnos próprios são `superseded`. Ler a composição em
+  // vez de redescobri-la por telefone/`processada_em` é o que impede a segunda
+  // definição de batch — a que varreria uma mensagem chegada DEPOIS do
+  // fechamento e faria esta rodada responder por algo que pertence à próxima,
+  // furando a fronteira que o fechamento acabou de declarar.
+  //
+  // Um turno sem batch fechado (mídia, turno anterior à fatia, janela ainda
+  // aberta que o recovery rearmou por estado) cai no caminho de baixo — o
+  // legado —, que continua correto: ele agrega o que ainda não foi processado.
+  if (turn && transactionalDebounceEnabled()) {
+    const batch = await agentTurnsRepo.listClosedDebounceBatch(turn.turn_id);
+    if (batch.length > 0) {
+      const irmaos = batch.filter((b) => b.mensagem_id !== target.id);
+      // A ORDEM é a do banco (`ingress_seq`), e o alvo entra NA POSIÇÃO DELE —
+      // não colado no fim como no caminho legado. Num batch fechado o alvo é a
+      // mensagem representativa, isto é, a PRIMEIRA; concatenar por cima
+      // inverteria a rajada inteira.
+      const texto = batch
+        .map((b) => b.conteudo ?? '')
+        .filter((s) => s.length > 0)
+        .join(AGGREGATE_SEPARATOR);
+      return {
+        text: texto.length > 0 ? texto : targetText,
+        merged_ids: irmaos.map((b) => b.mensagem_id),
+        preclosed: true,
+      };
+    }
+  }
 
   const tel = (target.metadata as Record<string, unknown> | null)?.['telefone'];
   if (typeof tel !== 'string' || tel.length === 0) {
-    return { text: targetText, merged_ids: [] };
+    return { text: targetText, merged_ids: [], preclosed: false };
   }
 
   const siblings = await mensagensRepo.listUnprocessedByTelefone(tel, {
@@ -167,12 +225,12 @@ async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
       (m.created_at?.getTime() ?? 0) <= targetMs &&
       (m.conversa_id === null || m.conversa_id === target.conversa_id),
   );
-  if (textSiblings.length === 0) return { text: targetText, merged_ids: [] };
+  if (textSiblings.length === 0) return { text: targetText, merged_ids: [], preclosed: false };
 
   // Chronological order: oldest sibling first, target last.
   const parts = textSiblings.map((m) => m.conteudo ?? '');
   const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
-  return { text: merged, merged_ids: textSiblings.map((m) => m.id) };
+  return { text: merged, merged_ids: textSiblings.map((m) => m.id), preclosed: false };
 }
 
 /**
@@ -469,6 +527,25 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     }
   }
 
+  // Atribuição do span-raiz, publicada AQUI e não numa extensão da fronteira
+  // de tenant (#535, rodada 2 da review da PR #541).
+  //
+  // O `maia.turn` é aberto pelo worker (`src/gateway/queue.ts`) ANTES desta
+  // resolução e fechado depois que este escopo já desmontou, então uma leitura
+  // ambiental em qualquer das duas pontas devolve `system` — o root exportado
+  // saía sem atribuição utilizável e divergia dos próprios filhos.
+  //
+  // Este é o ponto exato em que a tupla passa a existir: `resolved` acabou de
+  // ser derivada e o escopo ainda não foi aberto. Publicar aqui — e não por um
+  // hook em `runWithTenantContext` — mantém a fronteira fail-closed sem ponto
+  // de extensão e evita carimbar o span com uma tupla que ainda não passou por
+  // `assertNotDefaultLiteral` (que só roda na LEITURA do contexto).
+  //
+  // `publishSpanAttribution` é write-once com a primeira tupla real e ignora
+  // `system`; sem tracing ligado é um no-op. Nunca participa do fluxo de
+  // controle do turno.
+  publishSpanAttribution({ tenant_id: resolved.tenant_id, agent_id: resolved.agent_id });
+
   await runWithTenantContext(
     { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
     () => runAgentForMensagemInner(mensagem_id, resolved.channel_id),
@@ -517,10 +594,149 @@ async function runAgentForMensagemInner(
     return;
   }
 
-  // ATENÇÃO (#504): `beginTurnExecution` registra que a execução COMEÇOU; NÃO é
-  // exclusão mútua. Duas réplicas ainda podem entrar no mesmo turno até o claim
-  // atômico com lease/fencing. Por isso um conflito aqui não aborta o turno.
-  await beginTurnExecution(turn, { channel_id });
+  // #504 — CLAIM ATÔMICO. Com `FEATURE_TURN_CLAIM` ligada, este é o portão de
+  // exclusão mútua do turno: `started: false` significa que outro worker tem a
+  // posse (ou que o turno não está elegível), e a única reação correta é PARAR.
+  //
+  // Parar aqui é deliberadamente SILENCIOSO quanto ao estado: não concluímos,
+  // não marcamos `processada_em`, não auditamos descarte. O turno pertence a
+  // outra tentativa e é ela quem decide o desfecho — qualquer escrita nossa
+  // seria escrita sem posse, que é exatamente o que a issue fecha.
+  //
+  // Com a flag desligada o retorno é sempre `started: true` e o comportamento é
+  // o de #503 (registra que começou, nunca barra ninguém).
+  const start = await beginTurnExecution(turn, { channel_id });
+  if (!start.started) {
+    logger.info(
+      { mensagem_id, turn_id: turn?.turn_id ?? null, reason: start.reason },
+      'agent.turn_not_owned',
+    );
+    return;
+  }
+  // #504 §Fencing — a partir daqui existe uma TENTATIVA AUTORIZADA, e todo o
+  // resto do turno roda DENTRO do contexto de execução dela.
+  //
+  // Sem isto o claim era um portão que se consultava uma vez: depois da
+  // barreira, nada no pipeline sabia que a posse podia acabar no meio. O
+  // `AbortSignal` da `TurnLease` disparava e não havia ouvinte — o worker
+  // seguia chamando LLM e executando tools em nome de uma posse encerrada, e a
+  // recusa só aparecia na transição final, tarde demais para o efeito.
+  //
+  // O escopo abre AQUI e não antes: antes da barreira não há posse a propagar.
+  // Com `FEATURE_TURN_CLAIM` OFF (ou sem turno) não há lease, `execCtx` é null,
+  // nenhum escopo é aberto e cada guard a jusante é no-op — o comportamento de
+  // #503 fica idêntico.
+  const execCtx = turn?.lease?.context() ?? null;
+  /**
+   * Issue #507 (achado 1 da revisão do dono) — AQUI mora o tratamento de
+   * `TurnOwnershipLostError`, e não mais em volta da chamada ao ReAct.
+   *
+   * O defeito: o `try` cobria só `runReActLoop`. Todo limite de efeito ANTES
+   * dele — o pending-gate (~700 linhas acima), o hook de scheduling, o grafo
+   * pre-turn, o Decision Engine — não tinha para onde lançar, então nenhum
+   * deles lançava; e um turno que já havia perdido a posse seguia gravando
+   * estado e podia até responder ao usuário.
+   *
+   * Por que ESTE ponto: é exatamente onde o escopo de execução da tentativa
+   * ABRE (`runWithTurnExecution`). Fazendo o handler coincidir com o escopo, a
+   * região "roda com posse" e a região "coberta pelo tratamento" passam a ser
+   * a MESMA por construção — um limite de efeito novo, em qualquer ponto do
+   * pipeline, já nasce coberto, sem ninguém precisar lembrar de esticar um
+   * `try`. A alternativa (um guard obrigatório logo após `checkPendingFirst`)
+   * fecharia o achado literal e deixaria o próximo await sem rede.
+   *
+   * O desfecho é o mesmo que a #504 escolheu para o ReAct e continua sendo o
+   * único honesto: SAIR sem concluir, sem agendar retry e sem carimbar
+   * `processada_em`. Quem tem a lease vigente decide o desfecho; qualquer
+   * transição nossa seria recusada pelo fence, e um RETRY seria a gravação em
+   * turno alheio que a #504 proíbe.
+   */
+  /**
+   * Issue #631 (fatia B da #506) — o TURNO também precisa ser visível para os
+   * limites de SAÍDA, e não só o `AbortSignal` da tentativa.
+   *
+   * `dispatchOutput`/`sendOutbound` (`src/agent/output-dispatch.ts`) não
+   * recebem o handle por parâmetro — a fronteira pública deles é chamada de
+   * skills, do ReAct, do fallback do Decision Engine e do fallback de TTS, e um
+   * parâmetro obrigatório em todos significaria um call site esquecido, que é
+   * um limite de efeito SEM commit transacional. O escopo abre AQUI, no mesmo
+   * ponto de `runWithTurnExecution`, para que "tem posse" e "tem turno para
+   * commitar" sejam a mesma região por construção. Ver
+   * `src/runtime/outbound/turn-scope.ts`.
+   *
+   * Sem turno (`turn === null`: máquina de estados desligada, caminho legado) o
+   * escopo não abre e `commitOutboundIntent` devolve `no_turn_scope` — o mesmo
+   * regime de no-op que todo guard de #504 já tem.
+   */
+  const comEscopoDeSaida = <T>(fn: () => Promise<T>): Promise<T> =>
+    turn ? runWithOutboundTurnScope(turn, fn) : fn();
+
+  try {
+    if (!execCtx) {
+      return await comEscopoDeSaida(() =>
+        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+      );
+    }
+    return await runWithTurnExecution(execCtx, () =>
+      comEscopoDeSaida(() =>
+        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+      ),
+    );
+  } catch (err) {
+    if (err instanceof TurnOwnershipLostError) {
+      logger.warn(
+        {
+          mensagem_id,
+          turn_id: turn?.turn_id ?? null,
+          boundary: err.boundary,
+        },
+        'agent.turn_ownership_lost_mid_execution',
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * O TURNO propriamente dito — tudo que acontece depois de a posse estar
+ * garantida (identidade, debounce, gates, ReAct, conclusão, projeção).
+ *
+ * Separado de `runAgentForMensagemInner` por uma razão só: o corpo precisa
+ * rodar DENTRO de `runWithTurnExecution`, e um escopo de ALS exige uma função
+ * para embrulhar. O corpo é o mesmo de antes, com a mesma indentação — a única
+ * adição é o helper `stampProcessed` logo abaixo.
+ */
+async function runAgentTurnPipeline(params: {
+  mensagem_id: string;
+  channel_id: string | null;
+  inbound: Mensagem;
+  turn: TurnHandle | null;
+}): Promise<void> {
+  const { mensagem_id, channel_id, inbound, turn } = params;
+
+  /**
+   * Issue #504 §Fencing — a PROJEÇÃO LEGADA também é um limite de efeito.
+   *
+   * `mensagens.processada_em` é o campo que o early-return legado de
+   * `runAgentForMensagemInner` consulta, e é o discriminador de
+   * `turn-claim-core-barrier-real-db.spec.ts`: um worker que o carimba faz o
+   * turno do dono legítimo parecer processado por fora, e o recovery deixa de
+   * rearmá-lo. O fence do banco não alcança esta tabela — ele protege
+   * `agent_turns` —, então o guard tem de ser aqui.
+   *
+   * Fora de um turno reivindicado é no-op e o comportamento é o de #503.
+   */
+  const stampProcessed = async (id: string, tokens: number | null): Promise<void> => {
+    if (turnOwnershipLost()) {
+      logger.warn(
+        { mensagem_id: id, turn_id: turn?.turn_id ?? null },
+        'agent.legacy_projection_skipped_ownership_lost',
+      );
+      return;
+    }
+    await mensagensRepo.markProcessed(id, tokens);
+  };
 
   if (!inbound.conversa_id) {
     const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
@@ -531,7 +747,7 @@ async function runAgentForMensagemInner(
       // reencontraria). Descarte EXPLÍCITO, com outcome.
       logger.warn({ mensagem_id }, 'agent.inbound_without_telefone');
       await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
-      await mensagensRepo.markProcessed(inbound.id, 0).catch((err) =>
+      await stampProcessed(inbound.id, 0).catch((err) =>
         logger.warn(
           { err: (err as Error).message, mensagem_id },
           'agent.mark_processed_failed',
@@ -547,7 +763,7 @@ async function runAgentForMensagemInner(
       // #503: descarte INTENCIONAL por regra explícita → `ignored`, com outcome
       // próprio (antes era indistinguível de "processado com sucesso").
       await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'blocked') {
@@ -556,7 +772,7 @@ async function runAgentForMensagemInner(
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
       });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     if (resolved.kind === 'quarantined') {
@@ -565,7 +781,7 @@ async function runAgentForMensagemInner(
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
       });
-      await mensagensRepo.markProcessed(inbound.id, 0);
+      await stampProcessed(inbound.id, 0);
       return;
     }
     // Owner reply on a pending identity_confirmation? handled before the LLM
@@ -584,7 +800,7 @@ async function runAgentForMensagemInner(
           pessoa_id: resolved.pessoa.id,
           mensagem_id: inbound.id,
         });
-        await mensagensRepo.markProcessed(inbound.id, 0);
+        await stampProcessed(inbound.id, 0);
         return;
       }
     }
@@ -614,14 +830,14 @@ async function runAgentForMensagemInner(
   // adopted into the target's conversa (so history queries + recovery
   // sweeps see the right linkage) and marked processed at the end.
   const aggregated = inbound.conteudo
-    ? await aggregateUnprocessedTexts(inbound).catch((err) => {
+    ? await aggregateUnprocessedTexts(inbound, turn).catch((err) => {
         logger.warn(
           { err: (err as Error).message, mensagem_id: inbound.id },
           'agent.aggregate_failed_continuing_solo',
         );
-        return { text: inbound.conteudo ?? '', merged_ids: [] as string[] };
+        return { text: inbound.conteudo ?? '', merged_ids: [] as string[], preclosed: false };
       })
-    : { text: '', merged_ids: [] as string[] };
+    : { text: '', merged_ids: [] as string[], preclosed: false };
   if (aggregated.merged_ids.length > 0) {
     inbound.conteudo = aggregated.text;
     // Adopt orphans (conversa_id NULL) into the target's conversation.
@@ -650,7 +866,16 @@ async function runAgentForMensagemInner(
   // #503 — a rajada do debounce produz UM turno executável: as irmãs viram
   // inputs deste turno (ou têm seu próprio turno marcado `superseded`). A
   // associação definitiva no ingresso é fechada em #505.
-  await absorbDebounceInputs(turn, aggregated.merged_ids);
+  //
+  // #628 — quando o batch veio FECHADO do banco (`preclosed`), a absorção já
+  // aconteceu DENTRO da transação de fechamento, e ela é a mesma coisa que esta
+  // linha faria: irmãos `superseded`/`merged_into_turn` apontando para este
+  // turno, inputs reancorados, fronteira estendida. Reexecutá-la aqui só
+  // conseguiria conflitar — os irmãos já são terminais, e um CAS sobre eles
+  // devolveria `state_mismatch` ruidoso descrevendo trabalho que não existe.
+  if (!aggregated.preclosed) {
+    await absorbDebounceInputs(turn, aggregated.merged_ids);
+  }
   const markAllProcessed = async (tokens: number | null): Promise<void> => {
     // Per-row update keeps the existing repo contract (single-id) and
     // mirrors the audit semantics: each row gets its own processada_em.
@@ -658,7 +883,7 @@ async function runAgentForMensagemInner(
     // the others — recovery worker will catch any stragglers.
     for (const id of allInboundIds) {
       try {
-        await mensagensRepo.markProcessed(id, id === inbound.id ? tokens : 0);
+        await stampProcessed(id, id === inbound.id ? tokens : 0);
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, mensagem_id: id },
@@ -689,8 +914,15 @@ async function runAgentForMensagemInner(
         metadata: { count: decision.count, threshold: decision.threshold },
       });
       const reply = formatPoliteReply(decision.threshold);
+      // #634 — esta é uma RECUSA POR POLÍTICA visível ao usuário, não a
+      // resposta do agente. `fallback_reason` muda o `payload_type` do artefato
+      // durável de `text` para `status_fallback`, que é o tipo que #506 exige
+      // para "fallback/timeout também usam outbox". Sem ele o outbox registrava
+      // a recusa como se fosse conteúdo do agente, e nenhuma consulta
+      // conseguia separar as duas.
       await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
         channel_id: c.channel_id,
+        fallback_reason: 'policy_refusal',
       }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
@@ -747,6 +979,56 @@ async function runAgentForMensagemInner(
     await clearDebounceState(pessoa.telefone_whatsapp);
     return;
   }
+  // Perna PERDEDORA de uma race de pendência: desfecho TERMINAL, sem ReAct.
+  //
+  // A mensagem já foi classificada como resposta à pergunta pendente e perdeu
+  // para outra resposta que resolveu a mesma pendência. Antes o gate colapsava
+  // isso em `{ kind: 'no_pending' }` e este ponto caía no turno normal — o LLM
+  // recebia um "sim"/"cancela" solto, com significado completamente diferente
+  // do que a mensagem tinha, e só sob concorrência. O invariante de
+  // exatamente-uma-vez nunca esteve em risco (issue #545); o defeito era o que
+  // acontecia com a perna perdedora DEPOIS.
+  //
+  // A conclusão usa exatamente a mesma forma dos outros short-circuits deste
+  // arquivo (identity_unknown, rate_limited_silent, pending_action_resolved):
+  // `concludeTurn` com outcome próprio + `markAllProcessed` + `touch` +
+  // `clearDebounceState`. `concludeTurn` é no-op com
+  // FEATURE_TURN_STATE_MACHINE desligada, e aí quem fecha o turno continua
+  // sendo `processada_em` — igual aos demais.
+  if (gate.kind === 'race_lost') {
+    logger.info(
+      { mensagem_id: inbound.id, conversa_id: c.id, stage: gate.stage },
+      'agent.pending_race_lost_terminal',
+    );
+    await concludeTurn(turn, 'pending_race_lost', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
+  /**
+   * Issue #507 (achado 1) — a TENTATIVA perdeu a posse durante o classificador
+   * do pending-gate. Isto NÃO é um desfecho de pendência, é o fim do turno
+   * para nós.
+   *
+   * Antes o gate colapsava este caso em `unresolved/low_confidence` e o turno
+   * seguia: `captureInboundForOutreach` logo abaixo, o grafo pre-turn com suas
+   * gravações, o Decision Engine (que pode responder ao usuário) — todos
+   * rodavam em nome de uma posse encerrada, e só ~700 linhas depois o guard do
+   * ReAct interrompia.
+   *
+   * Lançar (em vez de `return`) é o que faz o desfecho ser DECIDIDO num lugar
+   * só: o handler que embrulha o pipeline inteiro em
+   * `runAgentForMensagemInner`. Nada de `concludeTurn`, nada de
+   * `failTurnRetryable`, nada de `markAllProcessed` aqui — ver o comentário lá.
+   */
+  if (gate.kind === 'cancelled') {
+    reportBlockedEffect('pending_gate');
+    throw new TurnOwnershipLostError('pending_gate', turn?.turn_id ?? null);
+  }
   // 'unresolved' and 'no_pending' fall through.
 
   // Blocker 9 — Scheduling inbound hook (spec 18 §7.4). When the inbound
@@ -759,12 +1041,25 @@ async function runAgentForMensagemInner(
   //    answer the sender so they don't get silence.
   //  - no_match: no scheduling state cares about this inbound; continue.
   // PR #406: Scheduling V2 collapsed to always-on (FEATURE_SCHEDULING_V2 removed).
+  // Issue #507 (achado 1) — GUARD DE BOUNDARY. `captureInboundForOutreach`
+  // MUTA estado de scheduling (anexa a resposta à occurrence, avança a
+  // máquina, pode notificar o dono). Vem ANTES do `try` de propósito: o catch
+  // abaixo é fail-soft e engoliria a recusa, transformando "perdi a posse" em
+  // "o hook falhou, siga em frente" — que é o oposto do desfecho correto.
+  assertTurnOwnership('scheduling_inbound_hook');
   if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
       const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;
       const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
       if (owner) {
+        // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard acima roda
+        // ANTES de dois `import()` dinâmicos e de um round-trip ao banco
+        // (`findByPhone`). Entre ele e a MUTAÇÃO abaixo há awaits, logo há
+        // janela para o takeover. Conferir de novo imediatamente antes do
+        // efeito é o que fecha a janela; o guard de fora continua existindo
+        // pelo motivo dele (recusar cedo, fora do `catch` fail-soft).
+        assertTurnOwnership('scheduling_inbound_hook');
         await captureInboundForOutreach({
           sender: pessoa,
           inbound,
@@ -772,6 +1067,10 @@ async function runAgentForMensagemInner(
         });
       }
     } catch (err) {
+      // Issue #507 — perda de posse NÃO é "o hook falhou, siga em frente".
+      // Este `catch` é fail-soft de propósito para erros de scheduling, mas
+      // engolir a recusa de posse devolveria o turno alheio ao pipeline.
+      if (err instanceof TurnOwnershipLostError) throw err;
       logger.warn(
         { err: (err as Error).message, mensagem_id: inbound.id },
         'agent.scheduling_inbound_hook_failed',
@@ -829,6 +1128,7 @@ async function runAgentForMensagemInner(
   // undefined` (que por sua vez exige channel_id resolvido + policy), então
   // passar true aqui apenas mantém o node disponível e deixa `buildRoleInputs`
   // decidir por turno.
+  const turnSignal = getTurnExecutionContext()?.signal;
   try {
     activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
     const role_inputs = await buildRoleInputs(channel_id);
@@ -845,8 +1145,20 @@ async function runAgentForMensagemInner(
           }
         : null,
       ...(role_inputs ? { role_inputs } : {}),
+      // Issue #507 (achado 2) — o sinal da TENTATIVA entra no grafo. Daqui ele
+      // desce por `runOne` → `runCognitiveModule` → `n.run` → `callLLM` de cada
+      // reasoner (`procedure-selector`, `role-selector`).
+      ...(turnSignal ? { signal: turnSignal } : {}),
     };
     const result = await runNodes(nodes, ctx);
+
+    // Issue #507 (achado 2 da revisão do dono) — GUARD DE BOUNDARY, antes de
+    // CONSUMIR o resultado. Tudo o que vem abaixo é write:
+    // `procedure_selector_decisions`, `startExecution`, `abortExecution`, e o
+    // `activeRole`/`roleAnnouncement` que o ReAct usaria. Perdida a lease
+    // durante o grafo, os nodes voltam `cancelled`/`null`, mas o que impede a
+    // gravação é este guard — não o valor do output.
+    assertTurnOwnership('preturn_graph');
 
     // Side effects POST-graph — procedure-selector decision + start/switch.
     const selectorOutput = result.nodes['procedure-selector']?.output as
@@ -881,6 +1193,13 @@ async function runAgentForMensagemInner(
       // them into the single outer `try` regressed that isolation — a
       // procedure-engine throw dropped activeRole + roleAnnouncement
       // (user-facing). Restore the boundary here.
+      //
+      // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard do grafo roda
+      // antes do `record()` acima; daqui até cada escrita do procedure engine
+      // ainda há awaits (`record`, `findById`). `startExecution` /
+      // `abortExecution` mudam `procedure_executions`, que é estado do turno:
+      // cada uma leva a conferência imediatamente antes de si, e não uma só no
+      // topo do bloco.
       try {
         if (
           selectorOutput.decision === 'start' &&
@@ -891,6 +1210,7 @@ async function runAgentForMensagemInner(
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
+            assertTurnOwnership('preturn_graph');
             const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
@@ -904,6 +1224,7 @@ async function runAgentForMensagemInner(
           selectorOutput.selected_procedure_id &&
           activeExecution
         ) {
+          assertTurnOwnership('preturn_graph');
           await procedureEngine.abortExecution({
             execution_id: activeExecution.id,
             reason: 'switched_by_selector',
@@ -913,6 +1234,7 @@ async function runAgentForMensagemInner(
           );
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
+            assertTurnOwnership('preturn_graph');
             const { execution: started } = await procedureEngine.startExecution({
               definition_id: def.id,
               definition_version: def.version_number,
@@ -923,6 +1245,10 @@ async function runAgentForMensagemInner(
           }
         }
       } catch (err) {
+        // Issue #507 — este catch existe para não deixar o procedure engine
+        // derrubar o turno; a recusa por perda de posse não é falha dele e
+        // tem de atravessar até o handler do escopo da tentativa.
+        if (err instanceof TurnOwnershipLostError) throw err;
         logger.warn(
           { err: (err as Error).message, conversa_id: c.id },
           'procedure.start_failed',
@@ -958,6 +1284,11 @@ async function runAgentForMensagemInner(
       }
     }
   } catch (err) {
+    // Issue #507 — a recusa por perda de posse ATRAVESSA este catch. Ele é
+    // fail-soft por desenho ("procedure runtime nunca derruba o turno"), e
+    // engolir `TurnOwnershipLostError` aqui devolveria o pipeline ao fluxo
+    // normal — exatamente o defeito do achado 1, um andar abaixo.
+    if (err instanceof TurnOwnershipLostError) throw err;
     logger.warn(
       { err: (err as Error).message, conversa_id: c.id },
       'preturn.graph_failed',
@@ -1041,8 +1372,10 @@ async function runAgentForMensagemInner(
         // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
         // Never expose internal policy text (effect.message) to the user.
         const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — recusa por política do Decision Engine.
         await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
@@ -1065,8 +1398,10 @@ async function runAgentForMensagemInner(
       if (packet.action_mode === 'escalate') {
         const escalateMsg =
           'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — escalada para aprovação também é recusa por política.
         await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
@@ -1290,8 +1625,11 @@ async function runAgentForMensagemInner(
       //     envio, ou persistência falhou): NUNCA reenviar.
       let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
       try {
+        // #634 — o fail-closed do Decision Engine é ERRO INTERNO exposto ao
+        // usuário, o caso canônico de `status_fallback`.
         await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'internal_error',
         });
       } catch (e) {
         fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';
@@ -1327,6 +1665,10 @@ async function runAgentForMensagemInner(
       await clearDebounceState(pessoa.telefone_whatsapp);
       return;
     }
+    // Issue #507 (achado 2) — perda de posse não é "erro de wiring". O ramo
+    // abaixo CONTINUA o turno; deixar a recusa cair nele faria a tentativa
+    // seguir para prompt, ReAct e outbound sem posse alguma.
+    if (err instanceof TurnOwnershipLostError) throw err;
     // Unexpected error from the wiring itself (not the engine) → warn and continue
     logger.warn(
       { err: (err as Error).message },
@@ -1383,6 +1725,14 @@ async function runAgentForMensagemInner(
     reactToolsCalled = result.toolsCalled;
     reactDelivery = result.delivery;
   } finally {
+    // Issue #507 (achado 1) — o ramo `TurnOwnershipLostError` que ficava AQUI
+    // saiu: o tratamento é único e vive em `runAgentForMensagemInner`, em volta
+    // do pipeline inteiro. Dois handlers com a mesma decisão era o que dava a
+    // impressão de cobertura — e o de cima cobria só o ReAct.
+    //
+    // O `finally` fica, e é o motivo de este `try` continuar existindo: o
+    // indicador de "digitando" tem de parar em QUALQUER saída, inclusive na
+    // recusa por perda de posse a caminho do handler externo.
     stopTyping();
   }
 

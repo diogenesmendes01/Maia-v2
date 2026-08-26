@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from 'vitest';
+import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 import { writeFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -22,8 +23,13 @@ const dispatchTool = vi.fn();
 const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 
+// #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
+// resolve a raiz por `MEDIA_ROOT`. O double precisa fornecê-la: sem ela o ramo
+// falha ANTES do canal (pré-envio, fail-closed), que é o comportamento certo em
+// produção e um falso vermelho aqui.
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, isBaileysConnected: () => true,
+  MEDIA_ROOT: SANDBOX,
 }));
 // Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
 // sai pela fronteira única LineOutput. A linha mockada roteia para os MESMOS
@@ -129,6 +135,10 @@ const PESSOA = { id: 'p1', telefone_whatsapp: '+5511888888888', nome: 'Owner', t
 const CONVERSA = { id: 'c1', pessoa_id: 'p1', status: 'ativa' } as never;
 const INBOUND = { id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'texto' as const, conteudo: 'manda extrato', metadata: { whatsapp_id: 'WAID-IN' }, processada_em: null };
 
+// #545: o grafo de `src/agent/core.js` custa 6.38–6.60s para carregar a frio,
+// contra ~7ms de trabalho real por caso. Ver `tests/helpers/modulo-de-producao.ts`.
+const core = moduloDeProducao(() => import('../../src/agent/core.js'));
+
 describe('agent loop — PDF flow (B3b)', () => {
   let pdfPath: string;
 
@@ -174,7 +184,7 @@ describe('agent loop — PDF flow (B3b)', () => {
       summary: { period: '01/04/2026 a 30/04/2026', rowCount: 3, totals: { receita: 100, despesa: 50, lucro: 50 } },
     });
 
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
     // sendOutboundText must NOT have been called (PDF route taken instead)
@@ -183,7 +193,14 @@ describe('agent loop — PDF flow (B3b)', () => {
     expect(sendOutboundDocument).toHaveBeenCalledTimes(1);
     const [jid, path, opts] = sendOutboundDocument.mock.calls[0]!;
     expect(jid).toMatch(/@s\.whatsapp\.net$/);
-    expect(path).toBe(pdfPath);
+    // #634 — o que vai ao canal é o OBJETO DURÁVEL, não o PDF temporário desta
+    // tentativa. A troca é o ponto da fatia: o temporário morre no `finally`,
+    // então enviar dele deixava a row do outbox descrevendo um arquivo que
+    // nenhuma segunda tentativa encontraria. O objeto vive sob
+    // `<MEDIA_ROOT>/outbound/<tenant>/<agent>/<pessoa>/<sha>.pdf`.
+    expect(path).not.toBe(pdfPath);
+    expect(path).toContain(join(SANDBOX, 'outbound'));
+    expect(path).toMatch(/\/[0-9a-f]{64}\.pdf$/);
     expect(opts).toMatchObject({
       mimetype: 'application/pdf',
       fileName: 'extrato-empresa-x-2026-04.pdf',
@@ -214,7 +231,7 @@ describe('agent loop — PDF flow (B3b)', () => {
       path: pdfPath, fileName: 'x.pdf', mimetype: 'application/pdf', tipo: 'extrato',
       summary: { period: '01/04/2026 a 30/04/2026' },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     const auditAcoes = audit.mock.calls.map((c) => c[0].acao);
     expect(auditAcoes).not.toContain('outbound_sent_document');
@@ -235,7 +252,7 @@ describe('agent loop — PDF flow (B3b)', () => {
       path: pdfPath, fileName: 'x.pdf', mimetype: 'application/pdf', tipo: 'extrato',
       summary: { period: '01/04/2026 a 30/04/2026' },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     const [, , opts] = sendOutboundDocument.mock.calls[0]!;
     expect(opts.caption.length).toBe(1024);
@@ -245,7 +262,7 @@ describe('agent loop — PDF flow (B3b)', () => {
     callLLM.mockResolvedValueOnce({
       content: 'plain reply', tool_uses: [], usage: { input_tokens: 50, output_tokens: 20 },
     });
-    const { runAgentForMensagem } = await import('../../src/agent/core.js');
+    const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(sendOutboundText).toHaveBeenCalledTimes(1);
     expect(sendOutboundDocument).not.toHaveBeenCalled();

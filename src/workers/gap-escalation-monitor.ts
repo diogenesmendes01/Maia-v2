@@ -52,8 +52,13 @@ import {
 import { decideEscalation } from '@/cognition/gap-escalation/engine.js';
 import { DEFAULT_RULES } from '@/cognition/gap-escalation/types.js';
 import { proposeCapabilityForGap } from '@/cognition/capability-proposer.js';
+import { proposeToolRequestForGap } from '@/cognition/tool-request/proposer.js';
 import { GapLevel } from '@/types/enums.js';
-import { agent_capability_gaps, type GapEscalationRule } from '@/db/schema.js';
+import {
+  agent_capability_gaps,
+  type AgentCapabilityGap,
+  type GapEscalationRule,
+} from '@/db/schema.js';
 
 type TenantAgentRow = { tenant_id: string; agent_id: string };
 
@@ -83,6 +88,64 @@ async function listAgentsWithOpenGaps(): Promise<TenantAgentRow[]> {
     })
     .from(agent_capability_gaps)
     .where(inArray(agent_capability_gaps.current_level, [...OPEN_LEVELS]));
+}
+
+/**
+ * #636 — as duas rotas do topo da escalada, na ordem certa e com a rota antiga
+ * BLINDADA contra a nova.
+ *
+ * A precedência do pedido de ferramenta está descrita no call site. O que este
+ * helper acrescenta é o `try` em volta da rota nova: se ela LANÇAR (bug,
+ * indisponibilidade do ledger de ocorrências), o gap ainda assim recebe a
+ * proposta genérica. Sem isso, uma falha na rota recém-introduzida derrubaria
+ * em silêncio o comportamento que já existia — a pior forma de regressão,
+ * porque o log diria "proposer_threw" e ninguém veria que o proposer genérico
+ * nunca chegou a ser chamado.
+ */
+async function proporParaGapNoTopo(gap: AgentCapabilityGap): Promise<void> {
+  try {
+    const pedido = await proposeToolRequestForGap({ gap });
+    if (pedido.ok) {
+      // #637 — `resultado` distingue os três desfechos, e a distinção importa
+      // para quem lê o log: `criado` é backlog novo, `agregado` é demanda
+      // somada a um pedido que já existia (nenhuma proposta nova foi criada), e
+      // `ja_membro` é a passada repetida do cron não contando duas vezes.
+      logger.info(
+        {
+          resultado: pedido.resultado,
+          proposal_id: pedido.proposal_id,
+          gap_id: gap.id,
+          proposed_tool_name: pedido.spec.contract_draft.proposed_tool_name,
+          occurrences: pedido.spec.frequency.occurrences,
+          aggregate_id: pedido.aggregate_id,
+          similaridade: pedido.similaridade,
+          member_count: pedido.member_count,
+          contract_state: pedido.contract_state,
+        },
+        'gap_escalation.tool_request_created',
+      );
+      return;
+    }
+    logger.info(
+      { gap_id: gap.id, reason: pedido.reason, detail: pedido.detail },
+      'gap_escalation.tool_request_skipped',
+    );
+  } catch (err) {
+    logger.warn(
+      { gap_id: gap.id, err: (err as Error).message },
+      'gap_escalation.tool_request_threw',
+    );
+  }
+
+  const r = await proposeCapabilityForGap({ gap });
+  if (r.ok) {
+    logger.info(
+      { proposal_id: r.proposal_id, gap_id: gap.id },
+      'gap_escalation.proposal_created',
+    );
+  } else {
+    logger.warn({ gap_id: gap.id, reason: r.reason }, 'gap_escalation.proposal_failed');
+  }
 }
 
 export async function runGapEscalationMonitor(): Promise<void> {
@@ -149,24 +212,24 @@ export async function runGapEscalationMonitor(): Promise<void> {
           );
 
           if (decision.new_level === GapLevel.PROPOSED) {
-            // Fire-and-forget proposer — Sonnet pode demorar; o worker não bloqueia.
-            // Eventuais erros são logados mas não propagam para a iteração.
-            void proposeCapabilityForGap({
-              gap: { ...gap, current_level: decision.new_level },
-            })
-              .then((r) => {
-                if (r.ok) {
-                  logger.info(
-                    { proposal_id: r.proposal_id, gap_id: gap.id },
-                    'gap_escalation.proposal_created',
-                  );
-                } else {
-                  logger.warn(
-                    { gap_id: gap.id, reason: r.reason },
-                    'gap_escalation.proposal_failed',
-                  );
-                }
-              })
+            // #636 — DUAS rotas a partir de `proposed`, e a ordem importa.
+            //
+            // O pedido de ferramenta (`tool_request`) tem precedência porque é
+            // a rota ESPECÍFICA: ele só aceita o gap que é de tool E cuja tool
+            // não existe no código, e devolve um documento derivado de
+            // evidência, sem LLM. O `capability-proposer` é a rota genérica
+            // (spec em prosa escrita por Sonnet) e continua atendendo todo o
+            // resto — knowledge, procedure, e o gap de tool cuja ferramenta já
+            // existe (aí o que falta é grant, não código).
+            //
+            // Rodar as duas geraria DUAS propostas para o mesmo gap, com o
+            // mesmo `gap_id`, dizendo a mesma coisa em formatos diferentes — a
+            // triagem (#638) teria de desempatar o que nunca devia ter
+            // empatado. Por isso o fallback é condicional.
+            //
+            // Continua fire-and-forget: o `capability-proposer` chama Sonnet e
+            // pode levar 15s; o worker não bloqueia por isso.
+            void proporParaGapNoTopo({ ...gap, current_level: decision.new_level })
               .catch((err) => {
                 logger.error({ gap_id: gap.id, err }, 'gap_escalation.proposer_threw');
               });

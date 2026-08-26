@@ -11,6 +11,18 @@
  * touches no filesystem, and never interpolates a secret VALUE into a message.
  */
 import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
+// Pure, leaf-level helpers: the drill SCHEDULE owns the arithmetic of what it
+// can honour, so the boot gate asks it instead of restating the formula (which
+// is how the two would drift). Same direction as the `@/setup` import above —
+// this module stays pure, it just does not re-implement other modules' rules.
+import {
+  DRILL_TICK_HOURS,
+  minHonourableDrillIntervalHours,
+} from '@/ops/backup/drill-schedule.js';
+// Mesma direção dos imports acima: a regra de lease PERGUNTA ao contrato de
+// claim qual relação é segura, em vez de reescrever a fórmula (que é como as
+// duas divergiriam).
+import { checkLeaseTiming, MAX_HEARTBEAT_TO_TTL_RATIO } from '@/runtime/turns/claim.js';
 import { CONTRACT_ENTRIES, isSyntheticFixtureValue } from '@/config/contract.js';
 import {
   type EnvVarSpec,
@@ -393,6 +405,48 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       });
     }
 
+    // O intervalo do drill precisa ser HONRÁVEL pelo agendador (issue #536).
+    //
+    // `BACKUP_RESTORE_DRILL_INTERVAL_HOURS` é a idade máxima aceitável da
+    // evidência, e quem a renova é o worker `restore_drill`: ele acorda a cada
+    // hora e dispara o drill a 75% do intervalo, deixando os 25% restantes para
+    // o drill acontecer. Se esses 25% não cobrirem "um tick de latência + a
+    // duração do drill", a evidência vence antes de ser renovada e o gate fica
+    // piscando vermelho para sempre — a plataforma prometeria uma idade máxima
+    // que a própria arquitetura não cumpre.
+    //
+    // Mesma família de raciocínio do `backup/rpo-feasible` acima, e por isso
+    // também `error` no boot: não se anuncia um objetivo inalcançável. O piso é
+    // DERIVADO dos outros parâmetros (tick, upload, restore) por
+    // `minHonourableDrillIntervalHours` — nos defaults, 10h — em vez de ser um
+    // número solto que envelhece quando alguém mexe num timeout.
+    const drillIntervalHours = num(c.BACKUP_RESTORE_DRILL_INTERVAL_HOURS);
+    const drillUploadMs = num(c.BACKUP_UPLOAD_TIMEOUT_MS);
+    const drillRestoreMs = num(c.BACKUP_RESTORE_TIMEOUT_MS);
+    if (
+      drillIntervalHours !== undefined &&
+      drillUploadMs !== undefined &&
+      drillRestoreMs !== undefined
+    ) {
+      const floorHours = minHonourableDrillIntervalHours({
+        tickHours: DRILL_TICK_HOURS,
+        uploadMs: drillUploadMs,
+        restoreMs: drillRestoreMs,
+      });
+      if (drillIntervalHours < floorHours) {
+        push({
+          scope: 'boot',
+          severity: 'error',
+          variable: 'BACKUP_RESTORE_DRILL_INTERVAL_HOURS',
+          rule: 'backup/drill-interval-feasible',
+          message:
+            `BACKUP_RESTORE_DRILL_INTERVAL_HOURS=${drillIntervalHours} cannot be honoured by the restore-drill scheduler, which needs at least ${floorHours}h here: it wakes every ${DRILL_TICK_HOURS}h and starts the drill at 75% of the interval, leaving 25% for a drill bounded by BACKUP_UPLOAD_TIMEOUT_MS (${Math.round(drillUploadMs / 60_000)}min) + BACKUP_RESTORE_TIMEOUT_MS (${Math.round(drillRestoreMs / 60_000)}min). The evidence would expire before it could be refreshed — do not advertise a maximum evidence age the architecture cannot meet.`,
+          remediation:
+            `Use BACKUP_RESTORE_DRILL_INTERVAL_HOURS >= ${floorHours}, ou reduza BACKUP_UPLOAD_TIMEOUT_MS/BACKUP_RESTORE_TIMEOUT_MS (o piso é derivado deles e da cadência do tick).`,
+        });
+      }
+    }
+
     // A cópia autoritativa não pode expirar antes da secundária.
     const localDays = num(c.BACKUP_RETENTION_LOCAL_DAYS);
     const cloudDays = num(c.BACKUP_RETENTION_CLOUD_DAYS);
@@ -491,6 +545,40 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         'Deixe o TTL negativo menor ou igual ao positivo — ele cobre "sem perfil ativo", ' +
         'que deve expirar rápido para uma ativação recente aparecer.',
     });
+  }
+
+  // Lease do claim de turno (#504): o heartbeat tem de caber ao menos 3x no TTL.
+  //
+  // ERROR de escopo BOOT, e não warning de contrato, por uma razão que separa
+  // esta regra da anterior: aqui a consequência não é "afinação sem sentido", é
+  // TAKEOVER FALSO — um segundo worker reivindica um turno cujo dono está vivo e
+  // processando, e o usuário recebe a resposta duas vezes (ou uma tool com
+  // efeito externo roda duas vezes). Subir com essa relação é subir com a
+  // garantia central da issue desligada, então o boot para.
+  //
+  // A aritmética vive em `checkLeaseTiming` (src/runtime/turns/claim.ts), não
+  // aqui: o controlador de lease valida a mesma relação em runtime e duas
+  // cópias da fórmula divergiriam.
+  const leaseTtl = num(c.TURN_LEASE_TTL_MS);
+  const leaseHeartbeat = num(c.TURN_LEASE_HEARTBEAT_MS);
+  if (leaseTtl !== undefined && leaseHeartbeat !== undefined) {
+    const leaseCheck = checkLeaseTiming(leaseTtl, leaseHeartbeat);
+    if (!leaseCheck.ok) {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'TURN_LEASE_HEARTBEAT_MS',
+        rule: 'turn-lease/heartbeat-ratio',
+        message:
+          `TURN_LEASE_HEARTBEAT_MS=${leaseHeartbeat} é inseguro para ` +
+          `TURN_LEASE_TTL_MS=${leaseTtl} (${leaseCheck.reason}): o heartbeat precisa caber ao ` +
+          `menos 3x no TTL, senão uma única renovação perdida deixa a lease vencer com o dono ` +
+          `ainda processando — e lease vencida com dono vivo é execução dupla do turno.`,
+        remediation:
+          `Use TURN_LEASE_HEARTBEAT_MS <= ${Math.floor(leaseTtl * MAX_HEARTBEAT_TO_TTL_RATIO)} ` +
+          `(um terço de TURN_LEASE_TTL_MS), ou aumente TURN_LEASE_TTL_MS.`,
+      });
+    }
   }
 
   // Alertas: canal desconhecido é erro (um typo silenciaria o alerta).
@@ -612,7 +700,181 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       message:
         'FEATURE_TURN_STATE_AUTHORITATIVE=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem dual-write não há agent_turns para o recovery eleger, e a decisão continua saindo de mensagens.processada_em.',
       remediation:
-        'Ligue FEATURE_TURN_STATE_MACHINE (e conclua o backfill com `npm run backfill:turns`) antes do flip da leitura, ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. Ver docs/runbooks/turn-state-machine.md §2.',
+        'Ligue FEATURE_TURN_STATE_MACHINE (e, numa base COM histórico, conclua o backfill com `npm run backfill:turns`), ou desligue FEATURE_TURN_STATE_AUTHORITATIVE. ATENÇÃO: desde #504 as três flags de turno vêm ON por default, então um rollback emergencial que desliga só FEATURE_TURN_STATE_MACHINE cai aqui — desligue as TRÊS juntas (FEATURE_TURN_STATE_MACHINE, FEATURE_TURN_STATE_AUTHORITATIVE e FEATURE_TURN_CLAIM). Ver docs/runbooks/turn-state-machine.md §2.',
+    });
+  }
+
+  // Issue #504 — o claim atômico depende da máquina de estados. Sem
+  // `agent_turns` não existe row a reivindicar, e `turnClaimEnabled()`
+  // (src/runtime/turns/lease.ts) devolve false: a combinação é INERTE. Mesmo
+  // raciocínio da regra acima, e a mesma razão para ser erro e não warning — um
+  // operador que acredita ter ligado a exclusão mútua e não ligou vai atribuir
+  // as execuções duplicadas a outra causa.
+  if (bool(c.FEATURE_TURN_CLAIM) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_CLAIM',
+      rule: 'turn-claim/requires-state-machine',
+      message:
+        'FEATURE_TURN_CLAIM=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não há turno durável para reivindicar, e duas réplicas continuam podendo processar o mesmo turno.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas), ou desligue FEATURE_TURN_CLAIM. ATENÇÃO: desde #504 as duas vêm ON por default, então um rollback emergencial que desliga só FEATURE_TURN_STATE_MACHINE cai aqui — desligue as TRÊS flags de turno juntas. Ver docs/runbooks/turn-state-machine.md §6.',
+    });
+  }
+
+  // Issue #626 (fatia C da #505) — o head-of-line depende da IDENTIDADE de
+  // stream, não da máquina de estados em geral. A regra é "não existe turno
+  // anterior não terminal na MESMA stream", e ela é medida por `stream_key` +
+  // `first_ingress_seq`. Com `FEATURE_TURN_STREAM_KEY=false` esses campos ficam
+  // NULL em todo turno novo, e o predicado devolve TRUE para todos —
+  // exatamente o comportamento de antes da fatia. A flag ligada seria uma
+  // promessa que o código não cumpre, e o modo de falha é o pior possível: o
+  // operador acredita ter ligado o FIFO e a plataforma continua podendo
+  // responder M2 antes de M1, sem nenhum sinal.
+  if (bool(c.FEATURE_TURN_HEAD_OF_LINE) && !bool(c.FEATURE_TURN_STREAM_KEY)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_HEAD_OF_LINE',
+      rule: 'turn-head-of-line/requires-stream-key',
+      message:
+        'FEATURE_TURN_HEAD_OF_LINE=true com FEATURE_TURN_STREAM_KEY=false é inerte: sem stream_key e first_ingress_seq gravados não existe ordem a impor, e todo turno passa no predicado de head-of-line.',
+      remediation:
+        'Ligue FEATURE_TURN_STREAM_KEY (migrations 120/122/126 aplicadas), ou desligue FEATURE_TURN_HEAD_OF_LINE. As duas vêm ON por default — um rollback que desliga só FEATURE_TURN_STREAM_KEY cai aqui. Ver docs/runbooks/turn-state-machine.md §11.',
+    });
+  }
+
+  // Issue #504 §Contrato do job — o PRODUTOR V2 depende da máquina de estados
+  // pela mesma razão que o claim: sem `agent_turns` não existe `turn_id`
+  // durável, e `enqueueAgent` cairia de volta no V1 em todo enfileiramento. A
+  // flag ligada seria uma promessa que o código não cumpre — e o operador
+  // acreditaria ter migrado o produtor sem ter migrado.
+  if (bool(c.FEATURE_TURN_JOB_V2) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_JOB_V2',
+      rule: 'turn-job-v2/requires-state-machine',
+      message:
+        'FEATURE_TURN_JOB_V2=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, e todo enfileiramento continua armando o payload V1.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114 aplicadas) antes de migrar o produtor, ou desligue FEATURE_TURN_JOB_V2. Ver docs/runbooks/turn-state-machine.md §7.',
+    });
+  }
+
+  // Issue #631 (fatia B da #506) §Escopo de flag — "uma garantia de durabilidade
+  // não pode ficar desligada em produção sem falha explícita".
+  //
+  // As duas regras abaixo são de naturezas DIFERENTES e nenhuma substitui a
+  // outra:
+  //
+  //  (a) INERTE — a flag ligada sem `FEATURE_TURN_STATE_MACHINE` não commita
+  //      nada: sem `agent_turns` não existe `turn_id`, e a FK composta da
+  //      migração 121 torna a row durável inexprimível. Mesmo raciocínio (e
+  //      mesmo formato) das regras de #503/#504 logo acima: silêncio aqui faria
+  //      o operador acreditar que ligou a durabilidade sem ter ligado.
+  //
+  //  (b) FAIL-OPEN EM PRODUÇÃO — a flag DESLIGADA restaura o caminho que a
+  //      auditoria da #506 descreveu: `src/agent/output-dispatch.ts` volta a
+  //      enviar ao canal com o registro durável tratado como opcional. Isso é
+  //      escopo `boot` e severidade `error`, e o escopo é deliberado: a regra
+  //      tem de valer TAMBÉM no caminho de rollback `MAIA_CONFIG_STRICT_BOOT=false`,
+  //      senão a alavanca de emergência do contrato viraria, sem querer, a
+  //      alavanca para desligar a durabilidade do outbound. É o mesmo desenho
+  //      de `lifecycle/schema-check-disabled` (#516/ADR 0004).
+  //
+  //      Fora de produção continua permitido — é a alavanca de rollback
+  //      declarada, e em dev/staging existem fluxos legítimos (bisect,
+  //      reprodução de bug do caminho legado) que precisam dela. Em staging
+  //      AVISA, para que o valor não atravesse a promoção despercebido.
+  if (bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+      rule: 'outbound-commit/requires-state-machine',
+      message:
+        'FEATURE_OUTBOUND_DURABLE_COMMIT=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, a FK composta da migração 121 torna a row do outbox inexprimível, e todo envio volta a ocorrer sem commit transacional.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114/121 aplicadas), ou desligue FEATURE_OUTBOUND_DURABLE_COMMIT — ciente de que em production desligá-la é recusado no boot. Ver docs/runbooks/turn-state-machine.md.',
+    });
+  }
+  if (c.FEATURE_OUTBOUND_DURABLE_COMMIT === false) {
+    if (profile === 'production') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false não é permitido no profile production: a intenção de resposta deixaria de ser commitada antes da chamada ao canal, e o registro durável do outbound voltaria a ser opcional/fail-open — ou seja, uma mensagem pode chegar ao usuário sem que o PostgreSQL saiba que ela existiria (issue #506).',
+        remediation:
+          'Remova FEATURE_OUTBOUND_DURABLE_COMMIT=false (o default é true) e garanta a migration 121 aplicada. Se o objetivo é reproduzir o caminho legado, faça isso em staging/development — em production a durabilidade do outbound é obrigatória.',
+      });
+    } else if (profile !== 'development') {
+      push({
+        scope: 'contract',
+        severity: 'warning',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false: o envio volta a ocorrer sem commit transacional prévio, e uma falha do ledger deixa de impedir a entrega. Em production este valor é recusado no boot.',
+        remediation:
+          'Deixe FEATURE_OUTBOUND_DURABLE_COMMIT=true, a menos que este ambiente exista de propósito para exercitar o caminho legado.',
+      });
+    }
+  }
+
+  // Issue #633 (fatia D da #506) — as duas flags da recuperação do outbox.
+  //
+  // A ordem de rollout NÃO é simétrica, e é isso que as duas regras abaixo
+  // codificam: o CONSUMIDOR precede o PRODUTOR, sempre (mesmo princípio de
+  // FEATURE_TURN_JOB_V2 em #504).
+  //
+  //  (a) VARREDURA SEM CONSUMIDOR — `FEATURE_OUTBOUND_RECOVERY` ligada com
+  //      `FEATURE_OUTBOUND_DELIVERY_WORKER` desligada faz o sweeper ENFILEIRAR
+  //      um job por linha entregável a cada minuto, sem ninguém para consumir.
+  //      Os jobs se acumulam no Redis (que tem teto de memória e derruba a fila
+  //      `agent` junto quando estoura), a linha nunca é entregue, e o operador
+  //      vê "a recuperação está ligada" enquanto nada se recupera. É `error`, e
+  //      não `warning`, porque o modo degradado é indistinguível do saudável
+  //      pelo lado de fora.
+  //
+  //  (b) CONSUMIDOR SEM COMMIT DURÁVEL — `FEATURE_OUTBOUND_DELIVERY_WORKER`
+  //      ligada com `FEATURE_OUTBOUND_DURABLE_COMMIT` desligada é INERTE:
+  //      #631 é quem cria a linha do outbox, e sem ela não existe `outbound_id`
+  //      a entregar. O worker sobe, conecta no Redis e nunca recebe trabalho.
+  //      Mesmo formato das regras de #503/#504/#631 acima — silêncio aqui faria
+  //      o operador acreditar que ligou a entrega assíncrona.
+  //
+  // Nenhuma das duas é regra de `boot`/production-required: ao contrário de
+  // FEATURE_OUTBOUND_DURABLE_COMMIT, desligar estas NÃO restaura fail-open.
+  // Com as duas OFF o caminho síncrono de #631/#632 continua sendo o que
+  // entrega, com posse e fence — o que se perde é a RECUPERAÇÃO automática, e
+  // o rearmamento manual (`npm run dlq outbound-rearm`) continua existindo.
+  if (bool(c.FEATURE_OUTBOUND_RECOVERY) && !bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_RECOVERY',
+      rule: 'outbound-recovery/requires-delivery-worker',
+      message:
+        'FEATURE_OUTBOUND_RECOVERY=true com FEATURE_OUTBOUND_DELIVERY_WORKER=false enfileira jobs de entrega que NENHUM processo consome: a fila `outbound-delivery` cresce no Redis a cada tick, as linhas do outbox continuam sem ser entregues, e a varredura parece saudável de fora.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DELIVERY_WORKER primeiro (o consumidor precede o produtor), confirme que a fila drena, e só então mantenha FEATURE_OUTBOUND_RECOVERY ligada. Ver docs/runbooks/outbound-recovery.md.',
+    });
+  }
+  if (bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER) && !bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DELIVERY_WORKER',
+      rule: 'outbound-recovery/requires-durable-commit',
+      message:
+        'FEATURE_OUTBOUND_DELIVERY_WORKER=true com FEATURE_OUTBOUND_DURABLE_COMMIT=false é inerte: sem o commit transacional de #631 nenhuma linha do outbox durável é criada, então não existe outbound_id a entregar e o worker nunca recebe trabalho.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DURABLE_COMMIT (migrations 121 e 131 aplicadas), ou desligue FEATURE_OUTBOUND_DELIVERY_WORKER. Ver docs/runbooks/outbound-recovery.md.',
     });
   }
 
@@ -776,20 +1038,46 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
-  // A checagem de schema é um gate fail-closed: desligá-la é política
-  // explícita e legítima (deploy de código e schema fora de banda), mas fora
-  // de development o operador precisa ver que ela está desligada.
-  if (profile !== 'development' && c.READINESS_SCHEMA_CHECK === false) {
-    push({
-      scope: 'contract',
-      severity: 'warning',
-      variable: 'READINESS_SCHEMA_CHECK',
-      rule: 'lifecycle/schema-check-disabled',
-      message:
-        'READINESS_SCHEMA_CHECK=false: a instância vai anunciar readiness mesmo com migration pendente, e falhará na primeira query que tocar uma coluna nova.',
-      remediation:
-        'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente.',
-    });
+  // A checagem de schema é um gate fail-closed. Desde a #516 o /readyz consome
+  // o veredito canônico (`getSchemaReadiness()`): dirty state, checksum
+  // divergente, arquivo de migration ausente e schema incompatível derrubam a
+  // instância para 503 — e, desde a ADR 0004, as MESMAS condições recusam o
+  // BOOT com exit code próprio. Desligar isso é desligar a ÚNICA coisa que
+  // impede a plataforma de servir tráfego contra um schema que ela não
+  // consegue verificar.
+  //
+  // Em production isso é INVÁLIDO — o boot é recusado, não avisado (decisão do
+  // owner na #516). Escopo `boot` de propósito: a regra vale também no caminho
+  // de rollback `MAIA_CONFIG_STRICT_BOOT=false`, senão a alavanca de emergência
+  // do contrato viraria, sem querer, a alavanca para desligar o gate de schema.
+  //
+  // Fora de production continua permitido: publicar código e schema fora de
+  // banda é um fluxo legítimo em dev/staging. Em staging avisa; em development
+  // é silencioso (fluxo normal de dev).
+  if (c.READINESS_SCHEMA_CHECK === false) {
+    if (profile === 'production') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'READINESS_SCHEMA_CHECK',
+        rule: 'lifecycle/schema-check-disabled',
+        message:
+          'READINESS_SCHEMA_CHECK=false não é permitido no profile production: o boot deixaria de consultar o veredito de schema (#516/ADR 0004) e o /readyz também, e a instância subiria e anunciaria readiness com migration pendente, ledger dirty, checksum divergente ou arquivo de migration ausente.',
+        remediation:
+          'Remova READINESS_SCHEMA_CHECK=false (o default é true). Se código e schema são publicados fora de banda, faça isso em staging/development — em production o gate é obrigatório.',
+      });
+    } else if (profile !== 'development') {
+      push({
+        scope: 'contract',
+        severity: 'warning',
+        variable: 'READINESS_SCHEMA_CHECK',
+        rule: 'lifecycle/schema-check-disabled',
+        message:
+          'READINESS_SCHEMA_CHECK=false: o boot não vai recusar e a instância vai anunciar readiness mesmo com migration pendente, ledger dirty ou checksum divergente — e falhará na primeira query que tocar uma coluna nova.',
+        remediation:
+          'Deixe READINESS_SCHEMA_CHECK=true, a menos que código e schema sejam publicados fora de banda de propósito neste ambiente — é a alavanca declarada para manter dev/staging vivos contra um banco desalinhado. Em production o valor `false` é recusado no boot.',
+      });
+    }
   }
 
   // A separação de topologia (#513) ainda não foi entregue: o contrato de

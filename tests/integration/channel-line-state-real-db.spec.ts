@@ -8,8 +8,15 @@
  *      (a `listActive` antiga o fazia sumir da tela).
  *   3. IDEMPOTÊNCIA + CONCORRÊNCIA: a mesma idempotency key devolve a
  *      tentativa existente; duas chaves diferentes com pairing vivo geram
- *      exatamente UM vencedor e um `pairing_in_progress` determinístico
- *      (o `FOR UPDATE` dentro da transação é o juiz).
+ *      exatamente UM vencedor e um `pairing_in_progress` determinístico.
+ *      QUEM arbitra depende de a linha do canal já existir (#573):
+ *        - linha EXISTENTE ⇒ o `FOR UPDATE` dentro da transação é o juiz;
+ *          a perdedora serializa atrás da vencedora e lê o pairing vivo dela.
+ *        - linha AINDA INEXISTENTE ⇒ `FOR UPDATE` não tranca o que não
+ *          existe, e o árbitro é o índice único de `channel_id`. Por isso o
+ *          INSERT é `ON CONFLICT DO NOTHING`: a colisão vira zero linhas em
+ *          vez de `23505`, e é a RELEITURA travada (aí sim com o `FOR UPDATE`
+ *          fazendo efeito) que devolve `pairing_in_progress`.
  *   4. RESTART: uma tentativa órfã vira `failed` retryable, NUNCA `verified`,
  *      e o material cifrado é destruído junto.
  *   5. O material só entra na row como envelope — a coluna é `bytea` e o
@@ -20,10 +27,14 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
+import { useExclusivePairingQueue } from './helpers/pairing-queue-lock.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
+
+// A fila de `channel_line_state` é global por desenho — ver o helper.
+useExclusivePairingQueue();
 
 const T = 'i518-tenant';
 const T2 = 'i518-tenant-b';
@@ -72,6 +83,40 @@ async function expireSessionLease(channel_id: string): Promise<void> {
         WHERE channel_id = $1`,
       [channel_id],
     );
+  } finally {
+    c.release();
+  }
+}
+
+/**
+ * Espera até que ALGUMA outra transação esteja bloqueada pela de `holderPid`.
+ *
+ * É o que torna o teste de corrida do #573 determinístico em vez de torcer
+ * pelo escalonador: em vez de dormir um tempo arbitrário antes de commitar,
+ * o teste só solta o commit depois que o Postgres CONFIRMA que a chamada de
+ * produção travou esperando a linha segurada.
+ */
+async function waitUntilBlockedBy(holderPid: number, timeoutMs = 8_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const c = await pool.connect();
+  try {
+    for (;;) {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n
+           FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid()
+            AND $1 = ANY (pg_blocking_pids(pid))`,
+        [holderPid],
+      );
+      if (r.rows[0]!.n > 0) return;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `#573: nada ficou bloqueado pelo pid ${holderPid} em ${timeoutMs}ms — ` +
+            `o INSERT concorrente não chegou a disputar o índice único`,
+        );
+      }
+      await new Promise((done) => setTimeout(done, 20));
+    }
   } finally {
     c.release();
   }
@@ -251,6 +296,87 @@ d('channel_line_state — idempotência e concorrência', () => {
     expect(oks).toHaveLength(1);
     expect(conflicts).toHaveLength(1);
     expect((conflicts[0] as { reason: string }).reason).toBe('pairing_in_progress');
+  });
+
+  /**
+   * Issue #573 — regressão DETERMINÍSTICA da corrida de criação da linha.
+   *
+   * O caso acima só reproduzia o defeito por sorte: a janela entre o
+   * `SELECT … FOR UPDATE` e o `INSERT` é sub-milissegundo. Aqui a ordem é
+   * FORÇADA. Uma transação nossa cria a linha vencedora e SEGURA o commit;
+   * `requestCommand` — a chamada de produção de verdade, não um harness
+   * espelho — roda com essa linha ainda invisível, lê `null` (o `FOR UPDATE`
+   * não tem fantasma para trancar) e trava no índice único; só então o
+   * vencedor commita.
+   *
+   * Com o defeito, a perdedora estoura `duplicate key value violates unique
+   * constraint "channel_line_state_pkey"` (23505). Com a correção, o
+   * `ON CONFLICT DO NOTHING` devolve zero linhas, a releitura travada enxerga
+   * o pairing vivo do vencedor e a resposta é `pairing_in_progress`.
+   *
+   * Deadlock não é possível: o bloqueio é de mão única (a transação segurada
+   * não pede nada que a de `requestCommand` detenha). Ainda assim a espera
+   * pelo bloqueio tem prazo próprio (8s, dentro do `testTimeout` de 20s) e a
+   * transação segurada é sempre encerrada no `finally`.
+   */
+  it('linha AINDA INEXISTENTE: o INSERT perdedor devolve pairing_in_progress, não 23505', async () => {
+    const { channelLineStateRepo } = await import('../../src/db/repositories.js');
+    const scope = { tenant_id: T, agent_id: A, channel_id: channelId };
+
+    const holder = await pool.connect();
+    let settled: Promise<{ value?: unknown; error?: unknown }> | null = null;
+    let committed = false;
+    try {
+      await holder.query('BEGIN');
+      const holderPid = (await holder.query<{ pid: number }>('SELECT pg_backend_pid() AS pid'))
+        .rows[0]!.pid;
+
+      // O VENCEDOR: pairing VIVO, escrito mas ainda NÃO commitado.
+      await holder.query(
+        `INSERT INTO channel_line_state
+           (channel_id, tenant_id, agent_id, state, command, command_method, command_id,
+            command_requested_at, actor_id, actor_role, correlation_id,
+            pairing_method, pairing_started_at, pairing_expires_at,
+            pairing_attempts, last_transition_at)
+         VALUES ($1, $2, $3, 'pairing', 'start_pairing', 'qr', $4,
+                 now(), $5, $6, $7, 'qr', now(), now() + interval '15 minutes', 1, now())`,
+        [channelId, T, A, randomUUID(), ACTOR.actor_id, ACTOR.actor_role, ACTOR.correlation_id],
+      );
+
+      // O PERDEDOR. Captura o desfecho dos dois lados para que uma falha na
+      // espera não vire unhandled rejection.
+      settled = channelLineStateRepo
+        .requestCommand({
+          scope,
+          command: 'start_pairing',
+          method: 'code',
+          command_id: randomUUID(),
+          ...ACTOR,
+        })
+        .then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+
+      await waitUntilBlockedBy(holderPid);
+      await holder.query('COMMIT');
+      committed = true;
+    } finally {
+      if (!committed) await holder.query('ROLLBACK').catch(() => undefined);
+      // Não deixa a transação de produção pendurada para o próximo `wipe()`.
+      if (settled) await settled;
+      holder.release();
+    }
+
+    const outcome = await settled!;
+    // Com o defeito, isto relança o 23505 literal — é o vermelho da regressão.
+    if (outcome.error !== undefined) throw outcome.error;
+    expect(outcome.value).toEqual({ ok: false, reason: 'pairing_in_progress' });
+
+    // E o vencedor continua sendo o vencedor: a perdedora não escreveu nada.
+    const state = await channelLineStateRepo.getStateForScope(scope);
+    expect(state?.pairing_method).toBe('qr');
+    expect(state?.pairing_attempts).toBe(1);
   });
 
   it('SEQUÊNCIA start → abort → start ANTES do tick: o segundo start é rejeitado', async () => {

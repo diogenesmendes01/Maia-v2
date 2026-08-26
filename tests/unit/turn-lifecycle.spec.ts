@@ -17,7 +17,8 @@ const repo = {
   markClaimed: vi.fn(),
   markRunning: vi.fn(),
   markIgnored: vi.fn(),
-  markSuperseded: vi.fn(),
+  markSupersededSelf: vi.fn(),
+  markSupersededByAbsorber: vi.fn(),
   completeTurnTx: vi.fn(),
   markRetryable: vi.fn(),
   markDeadLetter: vi.fn(),
@@ -142,9 +143,9 @@ describe('turn lifecycle — o outcome determina o estado terminal', () => {
   });
 
   it('`merged_into_turn` vai para `superseded`', async () => {
-    repo.markSuperseded.mockResolvedValue(ok('superseded', 'merged_into_turn'));
+    repo.markSupersededSelf.mockResolvedValue(ok('superseded', 'merged_into_turn'));
     await concludeTurn(handle(), 'merged_into_turn');
-    expect(repo.markSuperseded).toHaveBeenCalled();
+    expect(repo.markSupersededSelf).toHaveBeenCalled();
     expect(repo.markIgnored).not.toHaveBeenCalled();
   });
 
@@ -216,12 +217,21 @@ describe('turn lifecycle — retry e dead letter', () => {
     expect(auditSpy).toHaveBeenCalledWith(expect.objectContaining({ acao: 'turn_dead_lettered' }));
   });
 
-  it('backoff é exponencial e limitado a 15min', () => {
-    expect(retryDelayMs(1)).toBe(30_000);
-    expect(retryDelayMs(2)).toBe(60_000);
-    expect(retryDelayMs(3)).toBe(120_000);
-    expect(retryDelayMs(50)).toBe(15 * 60_000);
-    expect(retryDelayMs(0)).toBe(30_000);
+  // #504 §Retry: o backoff passou a ter JITTER LIMITADO (±20%). Com
+  // `Math.random` fixado no MEIO da distribuição o jitter é exatamente zero, o
+  // que deixa a progressão exponencial e o teto assertáveis pelo valor exato —
+  // a mesma propriedade de antes, agora sem depender da ausência de jitter.
+  it('backoff é exponencial e limitado a 15min (jitter neutro)', () => {
+    const rand = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    try {
+      expect(retryDelayMs(1)).toBe(30_000);
+      expect(retryDelayMs(2)).toBe(60_000);
+      expect(retryDelayMs(3)).toBe(120_000);
+      expect(retryDelayMs(50)).toBe(15 * 60_000);
+      expect(retryDelayMs(0)).toBe(30_000);
+    } finally {
+      rand.mockRestore();
+    }
   });
 });
 
@@ -233,7 +243,11 @@ describe('turn lifecycle — SHADOW: fail-soft não derruba o hot path', () => {
 
   it('erro no begin não impede o turno de seguir', async () => {
     repo.markClaimed.mockRejectedValue(new Error('DB down'));
-    await expect(beginTurnExecution(handle({ status: 'queued' }))).resolves.toBeUndefined();
+    // #504 mudou a assinatura para um resultado TIPADO. A propriedade sob teste
+    // é a mesma e continua sendo a que importa em modo shadow: o turno segue.
+    await expect(beginTurnExecution(handle({ status: 'queued' }))).resolves.toEqual({
+      started: true,
+    });
   });
 });
 
@@ -250,7 +264,7 @@ describe('turn lifecycle — AUTORITATIVO: falha de transição é BLOQUEANTE', 
   it.each([
     ['reply_delivered (completed)', 'completeTurnTx' as const],
     ['identity_unknown (ignored)', 'markIgnored' as const],
-    ['merged_into_turn (superseded)', 'markSuperseded' as const],
+    ['merged_into_turn (superseded)', 'markSupersededSelf' as const],
   ])('conclusão terminal %s propaga TurnStateWriteError', async (_label, method) => {
     repo[method].mockRejectedValue(boom());
     const outcome =
@@ -363,7 +377,7 @@ describe('turn lifecycle — begin execution', () => {
     expect(repo.markRunning).not.toHaveBeenCalled();
   });
 
-  it('conflito no claim NÃO aborta o turno (exclusão mútua é #504)', async () => {
+  it('com FEATURE_TURN_CLAIM OFF, conflito no claim NÃO aborta o turno', async () => {
     repo.markClaimed.mockResolvedValue({
       ok: false,
       conflict: 'state_mismatch',
@@ -372,7 +386,11 @@ describe('turn lifecycle — begin execution', () => {
       current_state_version: 7,
     });
     const h = handle({ status: 'queued', state_version: 1 });
-    await expect(beginTurnExecution(h)).resolves.toBeUndefined();
+    // Com a flag de claim DESLIGADA o regime é o de #503:  não é
+    // exclusão mútua, então um conflito aqui não pode barrar a execução — seria
+    // falsa sensação de segurança. Quem barra é o claim atômico de #504, e a
+    // prova disso está em tests/integration/turn-claim-lifecycle-real-db.spec.ts.
+    await expect(beginTurnExecution(h)).resolves.toEqual({ started: true });
     expect(repo.markRunning).not.toHaveBeenCalled();
     expect(h.status).toBe('queued');
   });

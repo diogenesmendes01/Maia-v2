@@ -16,7 +16,7 @@
     "resolveJsonModule": true,
     "declaration": false,
     "sourceMap": true,
-    "jsx": "preserve",
+    "jsx": "react-jsx",
     "lib": [
       "ES2022",
       "DOM",
@@ -50,11 +50,11 @@
   "include": [
     "**/*.ts",
     "**/*.tsx",
-    ".next/types/**/*.ts"
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",
-    "dist",
-    ".next"
+    "dist"
   ]
 }

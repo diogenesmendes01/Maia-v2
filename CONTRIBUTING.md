@@ -10,13 +10,58 @@ rodava npm 10): a forma do bloco `esbuild` divergia. Para isso nunca mais
 acontecer, **a versão do Node e do npm é fixada e tem uma única fonte da
 verdade**:
 
-- **Node:** `.nvmrc` (`22`). O CI usa `node-version-file: '.nvmrc'`, então
-  local e CI nunca divergem.
+- **Node:** `.nvmrc` (`22`) fixa o toolchain **local**. O CI **não** usa
+  `node-version-file`: os jobs de `ci.yml` rodam uma matriz
+  `node: ['22.18', 26]` e as lanes não-matriciais pinam `node-version: '22.18'`
+  explicitamente. Ou seja, local e CI **podem** divergir dentro da linha 22 —
+  `.nvmrc` dá o 22.x corrente, o CI dá 22.18 — e a perna 26 cobre de propósito
+  o major da imagem de produção. O que impede a divergência de virar bug é o
+  piso comum (`engines.node`), não um arquivo compartilhado.
+  `tests/unit/scripts/check-node.spec.ts` percorre `.github/workflows/**` e
+  reprova qualquer lane da linha 22 sem minor pinado.
 - **npm:** `npm@11.5.2`, declarado em `package.json` (`packageManager` +
-  `engines`: `node >=22.0.0`, `npm >=11.5.2 <12`). A versão ativa é fixada com
-  `npm install -g npm@11.5.2` — **exatamente o que o CI faz**. O `.npmrc`
-  (`engine-strict=true`) e o script `preinstall` recusam o install se o npm
-  ativo estiver fora dessa faixa, então o pin é obrigatório, não só sugestão.
+  `engines`: `node >=22.13.0`, `npm >=11.5.2 <12`). A versão ativa é fixada com
+  `npm install -g npm@11.5.2` — **exatamente o que o CI faz**.
+
+  > **Por que o piso do Node é 22.13.0, e não 22.0.0.** Duas restrições se
+  > somam, e vale a maior:
+  >
+  > 1. O `engines` do próprio npm 11.5.2 é `^20.17.0 || >=22.9.0`. Rodando os
+  >    binários reais, Node 22.0.0 e 22.8.0 fazem o npm pinado imprimir
+  >    `npm warn cli npm v11.5.2 does not support Node.js v22.8.0`.
+  > 2. Com `engine-strict=true`, o npm recusa qualquer pacote da árvore fora do
+  >    `engines` dele — e o `eslint` deste lockfile pede
+  >    `^20.19.0 || ^22.13.0 || >=24`. Medido com `npm ci --dry-run` real:
+  >    Node 22.9.0 e 22.12.0 morrem em `EBADENGINE`; Node 22.13.0 instala
+  >    (`added 810 packages`).
+  >
+  > Um piso em `22.0.0` aprovava toolchains em que o `npm ci` deste repo não
+  > completa. O piso é derivado do `package-lock.json` por
+  > `tests/unit/scripts/check-node.spec.ts`, então um bump de dependência que
+  > suba a exigência reprova no teste em vez de no install de alguém.
+
+### O que realmente barra um toolchain errado
+
+Três mecanismos, em ordem de quando o npm os avalia — e vale saber a ordem,
+porque ela já foi descrita errado aqui:
+
+1. **`devEngines.runtime` (`package.json`, `onFail: "error"`)** — este é o
+   **gate**. O npm o avalia **antes** de escrever `node_modules`; num Node fora
+   da faixa o comando morre em `EBADDEVENGINES` e a árvore nem chega a existir
+   (vale inclusive para `npm install --package-lock-only`).
+2. **`engine-strict=true` (`.npmrc`) + `engines`** — recusa o install com
+   `EBADENGINE`. Também roda **antes** dos lifecycle scripts.
+3. **`node scripts/check-node.mjs`** — a **mensagem** legível, com instrução de
+   conserto. O CI e os Dockerfiles a invocam como passo próprio **antes** do
+   `npm ci`; é o que a torna garantida por construção.
+
+> **O `preinstall` não é gate.** Ele encadeia o guard, mas num `npm ci` os
+> lifecycle scripts rodam **depois** de a árvore já estar instalada, e com
+> `engine-strict` um Node fora de `engines` nem chega a disparar `preinstall`.
+> Medido com Node 20.19.5 e npm 11.5.2 reais contra este `package.json`: o
+> primeiro (e único) erro é `npm error code EBADENGINE`, e a mensagem do guard
+> nunca aparece. Por isso ele é invocado explicitamente, e por isso o gate é o
+> `devEngines`.
 
 ### Setup (uma vez)
 
@@ -110,8 +155,37 @@ npm run admin:dev
 
 ```bash
 npm run test:admin-ui:unit          # Vitest (58+ testes)
-npm run test:admin-ui:e2e           # Playwright (requer dev server up)
+npm run test:admin-ui:e2e           # Playwright, projeto `smoke` (exige console no ar)
+npm run test:admin-ui:e2e:ci        # o que o CI roda: `admin:build` -> semeia as
+                                    # fixtures -> sobe o console construído ->
+                                    # smoke (boot + jornadas) -> derruba
 npm run admin:acceptance            # 11 gates (skip-e2e por padrão)
+```
+
+O job `admin-ui` do CI é o gate: `next build` e o projeto `smoke` do Playwright
+reprovam a PR. Desde a **#623** o `smoke` inclui as JORNADAS autenticadas do
+operador (inbox, detalhe de proposta, aprovação simples e dupla, rejeição,
+trava de arquitetura, trilha de auditoria, drift, traces e versões). Duas peças
+sustentam isso, e nenhuma toca código de produção:
+
+- **sessão** — `tests/admin-ui/e2e/_apoio/sessao.ts` MINTA o cookie de sessão
+  com o `encode()` do próprio Auth.js e o `NEXTAUTH_SECRET` do processo. O
+  middleware, o `auth()`, o `assertRole` e os gates de papel continuam
+  valendo; o que o teste pula é o handshake com o IdP;
+- **fixtures** — `scripts/seed-admin-ui-e2e-fixtures.ts` (o `admin-ui-e2e.sh`
+  o chama sozinho) semeia usuários por papel, propostas com risco/trava
+  DERIVADOS do spec, duas versões de perfil e um trace assinado pelo escritor
+  de produção.
+
+Fora do gate sobrou uma spec, `channel-lines-pairing.spec.ts`, marcada
+`@pendente-runtime`: o QR e o código de pareamento são produzidos pelo worker
+`channel_pairing` do RUNTIME, e este job sobe só o console — o cabeçalho do
+arquivo traz a medição e o critério objetivo de saída. A lista de arquivos em
+quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair
+dela é um diff visível.
+
+```bash
+npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha sem um runtime no ar)
 ```
 
 ### Feature flags

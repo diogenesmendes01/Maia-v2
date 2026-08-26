@@ -136,6 +136,26 @@ function shouldThrowOnDefaultLiteral(): boolean {
   return process.env.MAIA_REJECT_DEFAULT_LITERAL !== 'false';
 }
 
+/**
+ * Esta fronteira NÃO tem ponto de extensão, e é deliberado.
+ *
+ * A rodada 2 da review da PR #541 (#535) chegou a instalar aqui um observer
+ * genérico, para que a camada de observabilidade aprendesse a tupla que o turno
+ * resolveu. O owner recusou, e a razão técnica é mais forte que a preferência
+ * de desenho: a validação canônica deste módulo — `assertTruthyContext` e
+ * `assertNotDefaultLiteral` — roda em tempo de LEITURA, dentro de
+ * `getCurrentTenant()`/`getCurrentAgent()`, e não na entrada do escopo. Um
+ * observer notificado aqui recebia uma tupla que ainda não passou por nada:
+ * podia carimbar um span com `'default'`, com string vazia ou com espaço em
+ * volta, enquanto `getCurrentTenant()` lançaria para o mesmo contexto. Ou seja,
+ * a telemetria passaria a afirmar exatamente o que o `AGENTS.md` §4 proíbe.
+ *
+ * Some-se a isso que havia um único consumidor. A atribuição de span é
+ * publicada explicitamente por quem RESOLVE a tupla, depois de resolvê-la e
+ * antes de entrar no escopo — hoje `src/agent/core.ts`, via
+ * `publishSpanAttribution`. O core já depende de observabilidade; esta
+ * fronteira segue sem depender.
+ */
 export async function runWithTenantContext<T>(
   ctx: TenantContext,
   fn: () => Promise<T>,

@@ -64,6 +64,9 @@ vi.mock('@/lib/cost-ledger.js', () => ({
 vi.mock('@/lib/metrics.js', () => ({
   incCounter: vi.fn(),
   observeHistogram: vi.fn(),
+  // Registrado pelo disjuntor (issue #534) na primeira chamada de cada
+  // `(provider, workload)`.
+  setGaugeProvider: vi.fn(),
 }));
 
 // Force a deterministic provider + retry count regardless of dev env. The

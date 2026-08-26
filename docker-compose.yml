@@ -6,11 +6,32 @@
 # e docs/runbooks/deploy-prod.md.
 #
 # Este arquivo existe para o fluxo local (`docker compose up -d postgres
-# redis`, usado também por `npm run test:integration:setup`). Postgres e
+# redis`, usado também por `npm run test:integration:setup` — esse fluxo
+# NÃO passa pelo job `migrate`, porque nomear serviços explicitamente sobe
+# só eles e suas dependências, e `postgres`/`redis` não dependem do job).
+# Um `docker compose up -d` completo, esse sim, aplica as migrations antes
+# de `app`/`admin-ui` (issue #516). Postgres e
 # Redis ficam publicados APENAS em 127.0.0.1 — nunca em 0.0.0.0 — para que
 # uma máquina de dev em rede aberta não exponha datastore com credencial
 # fraca (auditoria P0 cap. 6).
+#
+# PROJECT NAME FIXO (issue #571, revisão da PR #597). Sem esta linha, o
+# Compose deriva o nome do projeto do DIRETÓRIO que invocou o comando — e
+# como cada `git worktree` tem diretório próprio, cada árvore pedia uma
+# PILHA PRÓPRIA com `container_name` e portas GLOBAIS. A segunda worktree a
+# rodar `npm run test:integration:setup` batia em "container name already
+# in use".
+#
+# O modelo escolhido é INFRA FÍSICA COMPARTILHADA, um coordenador só: um
+# Postgres e um Redis para o host, e o isolamento entre worktrees uma camada
+# acima (banco por worktree + db lógico do Redis por worktree — README §
+# Isolamento por worktree). `maia-v2` é exatamente o nome que o Compose já
+# derivava do checkout principal, então nenhum volume existente vira órfão.
+# O bring-up e o teardown passam por `scripts/test-infra.ts`, que torna o
+# `up` idempotente sob mutex e exige consentimento explícito para o `down`.
 # =======================================================================
+name: maia-v2
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -81,6 +102,53 @@ services:
       timeout: 5s
       retries: 10
 
+  # migrate — JOB ONE-SHOT (issue #516). Aplica as migrations e SAI.
+  #
+  # Por que existe: sem ele, `app` e `admin-ui` subiam assim que o Postgres
+  # ficava healthy, ou seja, contra um schema vazio/atrasado. Todo o trabalho
+  # de readiness da #516 (`/readyz` consumindo `getSchemaReadiness`) só vira
+  # deploy repetível quando existe alguém que ADIANTA o schema — caso
+  # contrário a instância sobe, responde 503 e fica assim para sempre.
+  #
+  # Contrato do job (é dele que `service_completed_successfully` depende):
+  #   - roda `tsx scripts/migrate.ts up` UMA vez;
+  #   - exit 0 em sucesso/já-atualizado; != 0 em falha, blocker ou lock
+  #     indisponível (ver "Exit codes" em scripts/migrate.ts).
+  #
+  # `restart: "no"` é OBRIGATÓRIO e explícito: um job com `unless-stopped`
+  # (o que os outros serviços usam) reinicia após sair e NUNCA atinge o
+  # estado "completed" — `app` esperaria para sempre.
+  #
+  # Mesma imagem do `app` (mesmo build context + Dockerfile): o migrator
+  # aplica exatamente as migrations que ESTA build empacota, que é a
+  # premissa de checksum/`missing_file` do runner.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # DEV-ONLY: .env inteiro — mesma ressalva do serviço `app` abaixo. Em
+    # produção o migrator recebe SÓ o subset `migrator` do contrato (#515):
+    # Postgres + knobs de processo, nada de LLM/WhatsApp/S3.
+    env_file:
+      - .env
+    environment:
+      # NODE_ENV/MAIA_ENV NÃO são sobrescritos aqui de propósito. O
+      # `loadMigrationConfig()` (src/config/migration-config.ts) resolve o
+      # profile por MAIA_ENV/NODE_ENV e RECUSA a combinação contraditória
+      # (src/config/profiles.ts: `profile/node-env-conflict`). Fixar
+      # NODE_ENV=production aqui, como o `app` faz, quebraria todo .env
+      # derivado do .env.example (MAIA_ENV=development). Deixando os dois
+      # virem do .env, o job vê exatamente o mesmo profile que
+      # `npm run db:migrate` no host — uma resposta, não duas.
+      DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
+      TZ: America/Sao_Paulo
+    command: ["npm", "run", "db:migrate"]
+
   app:
     build:
       context: .
@@ -92,6 +160,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # O schema tem que estar no head ANTES do primeiro request. Sem esta
+      # aresta o app sobe contra banco vazio (issue #516).
+      migrate:
+        condition: service_completed_successfully
     # DEV-ONLY: injeta o .env inteiro. Em produção cada container recebe
     # apenas o SEU env file (.env.app / .env.admin) — ver compose.prod.yml.
     env_file:
@@ -120,6 +192,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Mesma razão do `app`: o console lê tabelas que só existem depois
+      # das migrations (issue #516).
+      migrate:
+        condition: service_completed_successfully
     # DEV-ONLY: .env inteiro — mesma ressalva do serviço `app` acima.
     env_file:
       - .env

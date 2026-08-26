@@ -216,6 +216,19 @@ export async function persistCandidate(
           tipo: candidate.tipo,
           contexto: candidate.contexto,
           source_candidate_id: row.id,
+          // #636 — a OCORRÊNCIA, além do contador. `frequency_score` sabe
+          // "quantas vezes"; a linha de observação sabe "quando, em que
+          // conversa e em que turno", que é o que o pedido de ferramenta
+          // precisa carregar como situação e como janela.
+          //
+          // `root_trace_id` NÃO é passado: `capabilityGapObservationsRepo`
+          // herda o id do turno do escopo de correlação quando existe. Passar
+          // aqui um id que este call site não conhece seria inventar link.
+          observation: {
+            intent: candidate.capability_description,
+            detail: candidate.contexto,
+            conversa_id: 'conversa_id' in event ? event.conversa_id : null,
+          },
         });
         gapPersisted = true;
       } catch (err) {

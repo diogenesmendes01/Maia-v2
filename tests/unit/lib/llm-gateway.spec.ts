@@ -57,6 +57,9 @@ vi.mock('@/lib/cost-ledger.js', () => ({ recordLLMCost: recordCostMock }));
 vi.mock('@/lib/metrics.js', () => ({
   incCounter: incCounterMock,
   observeHistogram: observeHistogramMock,
+  // O disjuntor (issue #534) registra `maia_llm_circuit_state` por
+  // `(provider, workload)` na primeira chamada de cada combinação.
+  setGaugeProvider: vi.fn(),
 }));
 
 vi.mock('@/config/env.js', async () => {
@@ -78,6 +81,7 @@ vi.mock('@/config/env.js', async () => {
 });
 
 import { executeLLM as executeLLMRaw } from '@/lib/llm/gateway.js';
+import { _internal as circuitInternal } from '@/lib/llm/circuit-breaker.js';
 import { invalidateModelCache } from '@/lib/llm/model-resolver.js';
 import { LLMGatewayError, parseRetryAfterMs, redactErrorText } from '@/lib/llm/errors.js';
 import { workloadPolicy } from '@/lib/llm/workloads.js';
@@ -147,6 +151,11 @@ beforeEach(() => {
     fast: { value: FAST_MODEL, source: 'global' },
   });
   invalidateModelCache();
+  // O disjuntor é estado de PROCESSO por `(provider, workload)`: sem zerar
+  // entre casos, as falhas simuladas de um teste vazariam para a janela do
+  // seguinte. O comportamento do disjuntor tem spec próprio
+  // (`llm-circuit-breaker.spec.ts`); aqui ele precisa ficar fora do caminho.
+  circuitInternal.reset();
 });
 
 async function withTenant<T>(fn: () => Promise<T>): Promise<T> {

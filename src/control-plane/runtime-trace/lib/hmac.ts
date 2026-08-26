@@ -24,7 +24,10 @@
  * insertion order, so a re-signed payload always produces the same HMAC.
  */
 import { createHmac, hkdfSync } from 'node:crypto';
-import { config } from '@/config/env.js';
+// Módulo COMPARTILHADO por mais de um container (runtime e admin-ui): lê o
+// contrato sob demanda em vez de arrastar o boot do subset `runtime` para
+// dentro do console. Ver src/config/contract-env.ts (issue #596).
+import { contractEnv as config } from '@/config/contract-env.js';
 
 const KEY_CACHE = new Map<string, Buffer>();
 
@@ -170,6 +173,25 @@ function masterSecretForVersion(version: number): Buffer {
       `Add previous master secrets to RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS ` +
       `as "${version}=<secret>" to keep old audit rows verifiable through the retention window.`,
   );
+}
+
+/**
+ * The versioned keyring, exposed for OTHER holders of long-lived evidence
+ * signed with this same master material (issue #536, round-2 review of PR
+ * #541: `src/ops/backup/manifest-keyring.ts`).
+ *
+ * Additive only — `masterSecretForVersion` is unchanged and `deriveTenantKey`
+ * still calls it directly, so runtime-trace behaviour (including the fail-
+ * closed throw for an unknown version) is byte-for-byte what it was. Exporting
+ * the resolver rather than copying the env parsing is the point: two parsers
+ * for `RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS` would drift, and a drifted
+ * keyring is an unrestorable backup.
+ *
+ * Throws for a version this deployment does not hold — callers that need a
+ * verdict rather than an exception wrap it.
+ */
+export function hmacMasterSecretForVersion(version: number): Buffer {
+  return masterSecretForVersion(version);
 }
 
 /**

@@ -13,3 +13,29 @@
  */
 export * from './contract.js';
 export * from './lifecycle.js';
+// #504 — contexto de execução AMBIENTE da tentativa (posse propagada aos
+// limites de efeito). Exportado aqui porque `core.ts`, o dispatcher e o
+// outbound o consomem, e a regra da fachada é "importe sempre daqui".
+export * from './execution-context.js';
+// #505 — identidade de STREAM do ingresso. `stream-key` é a derivação PURA
+// (versionada, sem I/O); `stream-ingress` é a fronteira fail-closed que audita,
+// mede e recusa. O gateway consome `isStreamIdentityUnresolved` para derrubar o
+// ingresso com trilha em vez de deixá-lo virar erro opaco de listener.
+export * from './stream-key.js';
+export * from './stream-ingress.js';
+// #627 — a PROMOÇÃO do sucessor: o sinal (BullMQ), a métrica e a auditoria de
+// quem avança quando o head termina. Fica na fachada porque o varredor de
+// recovery (`src/workers/message-recovery.ts`) é consumidor de primeira classe
+// da reconciliação, e a regra do barril é "importe sempre daqui".
+export * from './stream-promotion.js';
+// #628 — o FECHAMENTO do batch de debounce: a métrica, a auditoria
+// `stream_batch_closed` e o wake-up do head. Fica na fachada porque o varredor
+// (`src/workers/stream-debounce-closer.ts`) e o boot da observabilidade são
+// consumidores de primeira classe, e a regra do barril é "importe sempre daqui".
+export * from './stream-debounce.js';
+// #629 — a POLÍTICA de poison/DLQ. Vocabulário e classificação PUROS, e a
+// fachada os exporta porque o consumidor não é só `lifecycle.ts`: quem lê a
+// configuração e quem AUDITA a interdição precisam das mesmas categorias, e a
+// operação de desbloqueio (`src/ops/stream-unblock.ts`) fala do mesmo
+// vocabulário. A regra do barril é "importe sempre daqui".
+export * from './poison-policy.js';

@@ -18,6 +18,20 @@ import type { AgentTurn, Conversa, Mensagem, PendingQuestion } from '../schema.j
 // Issue #503 — ingresso atômico (mensagem + turno na mesma transação). Import
 // unidirecional: `turn-repos` NÃO importa este módulo, então não há ciclo.
 import { agentTurnsRepo } from './turn-repos.js';
+// Issue #505 — a guarda FAIL-CLOSED da identidade de stream.
+//
+// `requireStreamIdentity` é PURO (só `node:crypto`), e isso é estrutural, não
+// estilístico: este arquivo é COMPARTILHADO entre o container `app` e o console
+// `admin-ui`, e `tests/unit/config/admin-import-boundary.spec.ts` proíbe que ele
+// alcance `src/config/env.ts` — alcançá-lo faria o console validar o subset
+// `runtime` no boot e exigir dele as seis `BACKUP_*` num processo que nunca roda
+// backup (issue #596). Pela mesma razão a flag é lida por `contractEnv` (uma
+// variável, sob demanda, sem validar subset de ninguém) e a OBSERVABILIDADE da
+// recusa — métrica, `audit_log`, log — mora no gateway, em
+// `src/runtime/turns/stream-ingress.ts`.
+import { contractEnv } from '@/config/contract-env.js';
+import { requireStreamIdentity } from '@/runtime/turns/stream-key.js';
+import type { ResolvedStream, StreamKeyInput } from '@/runtime/turns/stream-key.js';
 
 export const conversasRepo = {
   /**
@@ -345,13 +359,82 @@ export const conversasRepo = {
   },
 };
 
+/**
+ * #505 — o canal do ingresso.
+ *
+ * Literal e não derivado porque `mensagens` não guarda o TIPO do canal, só o
+ * `channel_id` da linha, e WhatsApp é o único canal habilitado no runtime
+ * (ARCHITECTURE.md §1). Quando um segundo canal entrar, este valor passa a vir
+ * de `channels.tipo` — e a assinatura de `requireStreamIdentity` já o exige como
+ * componente, então a mudança é uma linha aqui, não uma reescrita do material
+ * canônico.
+ */
+const INGRESS_CHANNEL_KIND = 'whatsapp';
+
+/**
+ * O protocolo de stream (#505, shadow) está ligado?
+ *
+ * Lido por `contractEnv` (o MESMO schema do contrato, uma variável, na LEITURA)
+ * e não por `config` de `@/config/env.js` — ver o bloco de imports.
+ */
+function streamShadowEnabled(): boolean {
+  return contractEnv.FEATURE_TURN_STREAM_KEY;
+}
+
+/**
+ * Extrai do inbound os componentes da identidade de stream.
+ *
+ * `tenant_id`/`agent_id` vêm do ALS (a mesma fonte que `applyTenantGuard` usa
+ * no INSERT — ler de outro lugar abriria a possibilidade de a chave descrever
+ * um escopo e a row estar em outro).
+ *
+ * A identidade remota é `metadata.telefone`: é o E.164 que o ingresso JÁ
+ * resolveu, com a precedência `senderPn` -> resolver -> local-part do JID
+ * (`src/gateway/baileys.ts`). Preferi-lo ao `remote_jid` cru é deliberado — o
+ * mesmo interlocutor chega ora como `55…@s.whatsapp.net`, ora como `…@lid`, e
+ * usar o JID daria DUAS streams para uma conversa. `remote_jid` é o fallback
+ * para chamadores que não carimbam telefone; ambos passam pela mesma
+ * normalização.
+ */
+function streamInputFor(input: MensagemInsertInput): StreamKeyInput {
+  const metadata = (input.metadata ?? null) as Record<string, unknown> | null;
+  const telefone = typeof metadata?.['telefone'] === 'string' ? metadata['telefone'] : null;
+  const remote_jid = typeof metadata?.['remote_jid'] === 'string' ? metadata['remote_jid'] : null;
+  return {
+    tenant_id: getCurrentTenant(),
+    agent_id: getCurrentAgent(),
+    channel_kind: INGRESS_CHANNEL_KIND,
+    channel_id: input.channel_id ?? null,
+    remote_identity: telefone ?? remote_jid,
+  };
+}
+
 // 090 — `channel_id` (linha) é opcional na escrita: rows novas do caminho
 // resolvido DEVEM passá-lo (dedup por canal); legado/proativo sem canal grava
 // NULL (coberto pela partial unique legada por tenant+agent).
+// #505 — as três colunas de stream saem do INPUT de propósito. Elas são
+// DERIVADAS aqui dentro (`streamInputFor` + `requireStreamIdentity` + a alocação
+// transacional) e nunca fornecidas pelo chamador: um caller capaz de passar
+// `stream_key` seria um caller capaz de escolher a fila de outra conversa, e a
+// própria assinatura é o que torna isso inexprimível.
+// #635 — `outbound_id` sai do tipo base e volta OPCIONAL pela mesma razão que
+// `channel_id`: só o histórico de SAÍDA ancorado num artefato do outbox o
+// carimba, e todo o ingresso (que é a maioria absoluta dos call sites) não tem
+// o que dizer sobre ele. Torná-lo obrigatório faria cada chamada de ingresso
+// escrever `outbound_id: null` — ruído que ensina a passar `null` por reflexo,
+// que é exatamente como uma saída deixaria de ser ancorada sem ninguém notar.
 type MensagemInsertInput = Omit<
   Mensagem,
-  'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'channel_id'
-> & { channel_id?: string | null };
+  | 'id'
+  | 'tenant_id'
+  | 'agent_id'
+  | 'created_at'
+  | 'channel_id'
+  | 'stream_key'
+  | 'stream_key_version'
+  | 'ingress_seq'
+  | 'outbound_id'
+> & { channel_id?: string | null; outbound_id?: string | null };
 
 export const mensagensRepo = {
   async create(input: MensagemInsertInput): Promise<Mensagem> {
@@ -366,6 +449,32 @@ export const mensagensRepo = {
    * idêntico ao anterior: só a row de mensagem. O caminho de dedup (pre-check +
    * retry no 23505) é o mesmo nos dois modos — uma duplicata nunca chega a
    * abrir transação, então nunca cria turno órfão.
+   *
+   * ─── Issue #505 (fases 1–2, shadow) — a PORTA ÚNICA da identidade de stream ─
+   *
+   * Este é o único ponto de produção por onde um inbound entra no banco, e é
+   * por isso que a derivação da `stream_key` mora AQUI e não no gateway: um
+   * segundo caminho de ingresso escrito amanhã herda a fronteira em vez de
+   * precisar lembrar dela.
+   *
+   * A ORDEM importa e é a que a issue exige (§Implementation Notes:
+   * "Deduplicação do ingresso deve acontecer antes da alocação de nova
+   * sequência"):
+   *
+   *   1. pre-check de duplicata por `whatsapp_id` — uma reentrega comum devolve
+   *      a row original, COM a sequência que ela já tinha, sem abrir transação
+   *      e sem tocar o contador;
+   *   2. resolução FAIL-CLOSED da stream (`requireStreamIdentity`) — identidade
+   *      irresolúvel lança `StreamIdentityUnresolvedError` e o inbound NÃO é
+   *      persistido. Nunca cai em stream genérica. Quem MEDE e AUDITA a recusa
+   *      é o gateway, no `catch` — o repositório é compartilhado com o console
+   *      e não pode importar a camada de métrica (issue #596);
+   *   3. alocação da sequência DENTRO da mesma transação do INSERT, para que a
+   *      corrida que escapou do pre-check aborte as duas coisas juntas.
+   *
+   * O `catch` de 23505 abaixo cobre exatamente a corrida do passo 3: a
+   * transação inteira (contador incluído) já reverteu quando chegamos lá, então
+   * relemos a row vencedora com a sequência dela.
    */
   async createInbound(
     input: MensagemInsertInput,
@@ -383,13 +492,34 @@ export const mensagensRepo = {
     };
     const preExisting = await findExisting();
     if (preExisting) return { row: preExisting, duplicate: true };
+
+    // #505 — FAIL-CLOSED. Lança `StreamIdentityUnresolvedError` quando a
+    // identidade não é derivável; nunca devolve stream genérica. A recusa
+    // acontece AQUI, antes de qualquer escrita — quem a MEDE e AUDITA é o
+    // gateway, no `catch` (ver `src/runtime/turns/stream-ingress.ts`).
+    const stream: ResolvedStream | null = streamShadowEnabled()
+      ? requireStreamIdentity(streamInputFor(input))
+      : null;
+
     try {
       if (opts?.withTurn) {
         const created = await agentTurnsRepo.createReceivedTurnTx({
           mensagem: { ...input, channel_id: input.channel_id ?? null },
           channel_id: input.channel_id ?? null,
+          stream,
         });
         return { row: created.mensagem, duplicate: false, turn: created.turn };
+      }
+      if (stream) {
+        // Máquina de estados OFF, protocolo de stream ON: a ordem continua
+        // sendo capturada. Os dois rollouts são independentes de propósito —
+        // o kill switch de um não pode apagar a evidência do outro.
+        const created = await agentTurnsRepo.createSequencedInboundTx({
+          mensagem: { ...input, channel_id: input.channel_id ?? null },
+          channel_id: input.channel_id ?? null,
+          stream,
+        });
+        return { row: created.mensagem, duplicate: false };
       }
       const guarded = applyTenantGuard({ ...input, channel_id: input.channel_id ?? null });
       const rows = await db.insert(mensagens).values(guarded).returning();

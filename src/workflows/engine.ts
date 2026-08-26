@@ -8,6 +8,7 @@ import { audit } from '@/governance/audit.js';
 import { expireDueDualApprovals } from './dual-approval.js';
 import { expireDueApprovals } from '@/governance/approval-requests.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 
 export async function tickEngine(): Promise<{ processed: number; expired: number }> {
   // Fase 0 cap. 2/3 — expira requests do store backend (approval_requests),
@@ -16,7 +17,9 @@ export async function tickEngine(): Promise<{ processed: number; expired: number
   // isolamento (#345) é o UPDATE de workflows como última mutação do tick.
   const notify = async (jid: string, text: string): Promise<unknown> => {
     const line = await forCurrentAgentChannel(null);
-    return line.sendText(jid, text);
+    // #634 — exceção INVENTARIADA (`workflows.engine`): aviso de EXPIRAÇÃO,
+    // emitido no tick do engine, fora de qualquer turno.
+    return withDeclaredEgressException('workflows.engine', () => line.sendText(jid, text));
   };
   const expiredApprovals = await expireDueApprovals(notify).catch((err) => {
     logger.warn({ err: (err as Error).message }, 'engine.approval_expiry_failed');

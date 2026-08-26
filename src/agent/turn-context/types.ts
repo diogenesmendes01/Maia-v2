@@ -84,10 +84,109 @@ export const SECTION_BUDGETS = {
   hints: { max_items: 20, max_bytes: 4_000 },
   capabilities: { max_items: 5, max_bytes: 2_000 },
   gaps: { max_items: 5, max_bytes: 2_000 },
+  // #638 (fatia C da épica #471) — o aviso "isto você JÁ consegue", para os
+  // gaps que fecharam porque a ferramenta pedida passou a existir e a estar
+  // concedida. Orçamento pequeno de propósito: é notícia, não estado — três
+  // itens e 1 KB bastam para dizer o fato, e o teto impede que uma leva de
+  // ferramentas novas coma o contexto do turno.
+  capacidades_novas: { max_items: 3, max_bytes: 1_000 },
   entity_states: { max_items: 100, max_bytes: 8_000 },
 } as const satisfies Record<string, SectionBudget>;
 
 export type BudgetedSection = keyof typeof SECTION_BUDGETS;
+
+/**
+ * Issue #525 — the TURN's round-trip ceiling, counted at the repository
+ * boundary for a typical turn (one entity in scope, no active procedure).
+ *
+ * This constant is the budget, and `tests/unit/turn-context-round-trips.spec.ts`
+ * is its enforcement: the spec asserts the EXACT count for each path and fails
+ * the build the moment a new read pushes past this number. A budget nothing
+ * fails on is a wish, and the whole point of #511/#525 is that the turn's cost
+ * stops being a wish.
+ *
+ * "Whole turn" means `resolveScope` (2) + `buildPrompt`. It deliberately counts
+ * the procedure-execution lookup even though `core.ts` normally supplies it —
+ * the read happens once per turn either way, and moving a query to a different
+ * caller is not an optimisation.
+ *
+ * Current composition (legacy `self_state` path, the most expensive one):
+ *
+ *   resolveScope: permissoesRepo.forPessoa, profilesRepo.byIds           2
+ *   identity: operationalProfileVersionsRepo.getActive                   1
+ *   identity: selfStateRepo.getActive (fallback branch only)             1
+ *   mensagensRepo.recentInConversation                                   1
+ *   entidadesRepo.byIdsWithState (entities ⋈ states, one statement)      1
+ *   factsRepo.listMentionableForScopes                                   1
+ *   rulesRepo.listActive                                                 1
+ *   memoryEntryRepo.findRelevant                                         1
+ *   behavioralHintRepo.findActiveForScopes                               1
+ *   capabilitiesSkillRepo.listAll                                        1
+ *   capabilityGapsRepo.listByLevels (serves BOTH gap blocks)             1
+ *   procedureExecutionsRepo.findActiveForConversa                        1
+ *                                                                       --
+ *                                                                       13
+ *
+ * Every one of these is independent of scope size: the slope is zero, so an
+ * "elephant" tenant's turn costs the same as anyone else's.
+ *
+ * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
+ * `src/db/client.ts` — a bounded read set issued all at once still empties the
+ * pool. That is a separate ceiling, `TURN_CONTEXT_MAX_CONCURRENT_READS` below.
+ */
+export const TURN_ROUND_TRIP_BUDGET = 13;
+
+/**
+ * Issue #525 (PR #541 review, finding 1) — how many of those round-trips ONE
+ * turn may have in flight at the same instant.
+ *
+ * The round-trip budget above bounds the turn's TOTAL cost; it says nothing
+ * about how much of the shared pool a single turn may hold while paying it.
+ * Those are different failure modes, and #525 fixed the first while opening the
+ * second: the critical group (5) and the optional group (5) are both started
+ * before either is awaited, so a cold-cache turn with an active procedure issued
+ * up to TEN statements in one tick against `max: 10` in `src/db/client.ts`. One
+ * turn could hold every connection in the process, and every other turn — of
+ * every other tenant — queued behind it. A latency win for one turn paid for by
+ * p95 tail for all of them is not a win.
+ *
+ * Six is not a new number: it is the ceiling the pre-#525 code enforced and
+ * documented ("six concurrent reads against a 10-connection pool is a
+ * deliberate ceiling — enough to collapse the waterfall, not enough for one
+ * turn to starve the pool for everyone else"). #525 removed it without
+ * replacing it; this restores it as a SHARED gate over critical + optional,
+ * which is strictly stronger than the old per-group version.
+ *
+ * Why 6 of 10 specifically:
+ *   - it is a strict majority, so a single turn still collapses the waterfall
+ *     essentially completely — the read set is 10 tasks, so the turn pays about
+ *     two waves rather than ten sequential round-trips;
+ *   - it leaves 4 connections for everything else in the process (a second
+ *     turn's critical group, the readiness probe, a worker), so no turn can
+ *     starve the pool on its own;
+ *   - it is enforced per TURN, not per process: bounding one turn's blast
+ *     radius is the point, and a process-wide gate would just move the queue
+ *     from the pool (which has `connectionTimeoutMillis`) into the app (which
+ *     would not).
+ *
+ * Changing this number without changing `max` in `src/db/client.ts` changes how
+ * much of the pool one tenant can take, so the two belong in the same review.
+ * `tests/integration/turn-context-pool-fairness.spec.ts` measures the real peak
+ * against a real pool and fails if the ceiling stops holding.
+ */
+export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
+
+/**
+ * The goal issue #525 sets. NOT yet met — see `docs/architecture/modules/
+ * agent.md` for the remaining merges, what each is worth, and why they were not
+ * taken in this change (each one needs a cross-table statement that cannot be
+ * verified without a live Postgres).
+ *
+ * Kept in code rather than only in the issue so the gap is greppable from the
+ * budget it belongs to, and so closing it is a one-line edit here plus the
+ * counts in the spec.
+ */
+export const TURN_ROUND_TRIP_TARGET = 8;
 
 /**
  * Item cap for the gap list inside the self-awareness ("## Autoconhecimento")
@@ -100,6 +199,23 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * item cap, because "5 skills" and "3 gaps" are independent editorial choices.
  */
 export const SELF_AWARENESS_GAP_MAX_ITEMS = 3;
+
+/**
+ * #638 — por quantos dias um gap FECHADO continua sendo anunciado ao agente
+ * como capacidade recém-adquirida.
+ *
+ * Existe uma janela porque o aviso é NOTÍCIA, não estado permanente: passado
+ * esse prazo a ferramenta é só mais uma tool na caixa do agente, e repetir o
+ * anúncio para sempre gastaria contexto em todo turno para sempre. Sete dias é
+ * a folga entre um deploy e o primeiro turno em que o assunto volte a aparecer
+ * numa conversa real — curto o bastante para não virar mobília, longo o
+ * bastante para um agente pouco usado receber o aviso pelo menos uma vez.
+ *
+ * A janela também é o que permite a leitura ÚNICA do turno: os gaps abertos e
+ * os recém-fechados saem do mesmo `SELECT` (`capabilityGapsRepo.listParaOTurno`),
+ * sem custar uma segunda ida ao banco no caminho mais quente do sistema.
+ */
+export const JANELA_DE_AVISO_DE_CAPACIDADE_DIAS = 7;
 
 /** Roll-up published once per turn, and logged with the trace id. */
 export type TurnContextDiagnostics = {

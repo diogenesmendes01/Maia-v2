@@ -2,7 +2,7 @@
 
 **Path:** `src/admin-ui/`
 
-**Purpose** — Next.js 14 + tRPC + NextAuth + Drizzle governance console. The owner-facing surface where capability/skill/procedure proposals are approved, drift alerts are triaged, knowledge state transitions are reviewed, audit/trace events are explored, and per-tenant settings are managed. Runs as a separate process on port 4000.
+**Purpose** — Next.js 16 + React 19 + tRPC + NextAuth + Drizzle governance console. The owner-facing surface where capability/skill/procedure proposals are approved, drift alerts are triaged, knowledge state transitions are reviewed, audit/trace events are explored, and per-tenant settings are managed. Runs as a separate process on port 4000.
 
 ## Key files
 

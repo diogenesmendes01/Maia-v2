@@ -109,7 +109,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 
 | Path | Role | Module doc |
 |---|---|---|
-| `src/admin-ui/` | Next.js 14 + tRPC + NextAuth governance console (16 routers) | [admin-ui.md](docs/architecture/modules/admin-ui.md) |
+| `src/admin-ui/` | Next.js 16 + React 19 + tRPC + NextAuth governance console (16 routers) | [admin-ui.md](docs/architecture/modules/admin-ui.md) |
 | `src/agent/` | Prompt builder + ReAct loop entry | [agent.md](docs/architecture/modules/agent.md) |
 | `src/cognition/` | Reflector, classifier, self-model, capability/skill proposers, drift detector, gap-escalation, procedure/role selectors, step-evaluator | [cognition.md](docs/architecture/modules/cognition.md) |
 | `src/cognitive-graph/` | Orchestrator, pre/post-turn graphs, node registry, latency budget | [cognitive-graph.md](docs/architecture/modules/cognitive-graph.md) |
@@ -123,7 +123,8 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 | `src/lib/` | **LLM Gateway** (`src/lib/llm/` — fronteira única de chat/classificação/visão) + wrappers: Whisper, Redis, alerts, holidays, decimal | [lib.md](docs/architecture/modules/lib.md) |
 | `src/memory/` | 5 layers (working / episodic / semantic / procedural / vector) over Postgres + Redis | [memory.md](docs/architecture/modules/memory.md) |
 | `src/objectives/` | Work loop: registry de kinds (perceptores/executores) de objetivos | [objectives.md](docs/architecture/modules/objectives.md) |
-| `src/ops/` | Verifiable backup (lifecycle, signed manifest, envelope encryption, RPO/RTO) + data lifecycle (retention matrix, legal hold, tombstones) | [ops.md](docs/architecture/modules/ops.md) |
+| `src/onboarding/` | Saga durável de provisionamento (tenant → agente → governança → ativação) + **readiness canônico por `tenant_id + agent_id`** | [onboarding.md](docs/architecture/modules/onboarding.md) |
+| `src/ops/` | Verifiable backup (lifecycle, signed manifest, envelope encryption, RPO/RTO) + data lifecycle (retention matrix, legal hold, tombstones) + LGPD subject requests and post-restore tombstone re-application | [ops.md](docs/architecture/modules/ops.md) |
 | `src/procedures/` | Engine, test runner, event-sourced execution | [procedures.md](docs/architecture/modules/procedures.md) |
 | `src/runtime/` | Decision engine, action-decider, agent-selector, channel-resolver, builders, context | [runtime.md](docs/architecture/modules/runtime.md) |
 | `src/scheduling/` | Series → occurrences → tasks → outbox, recurring workflows | [scheduling.md](docs/architecture/modules/scheduling.md) |

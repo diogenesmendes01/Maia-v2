@@ -30,13 +30,21 @@ import { logger } from '@/lib/logger.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
 import { startBaileys } from '@/gateway/baileys.js';
 import { startAgentWorker } from '@/gateway/queue.js';
-import { runAgentForMensagem } from '@/agent/core.js';
+import { runAgentTurnJob } from '@/runtime/turns/job-consumer.js';
 import { startServer } from '@/server.js';
 import { audit } from '@/governance/audit.js';
 import { probeDb } from '@/db/client.js';
 import { startWorkers } from '@/workers/index.js';
 import { lifecycle, StartupAbortedError } from '@/runtime/lifecycle/controller.js';
-import { checkSchemaVersion } from '@/runtime/lifecycle/schema-version.js';
+import {
+  checkSchemaReadiness,
+  describeSchemaReadiness,
+} from '@/runtime/lifecycle/schema-readiness.js';
+import {
+  bootExitCode,
+  describeSchemaBootFailure,
+  SchemaBootAbortError,
+} from '@/runtime/lifecycle/schema-boot-gate.js';
 import { roleOwns, roleRequires } from '@/runtime/lifecycle/roles.js';
 import {
   installSignalHandlers,
@@ -94,19 +102,52 @@ async function main() {
   });
 
   // ── 3. schema / migration version ──────────────────────────────────────
+  // Issue #516, decisão do owner (ADR 0004): o boot consulta o VEREDITO
+  // CANÔNICO (`getSchemaReadiness()`, aqui pelo adaptador cacheado que o
+  // `/readyz` também usa) e DECIDE. Dirty state, checksum divergente,
+  // migration ausente e schema incompatível encerram o processo com exit code
+  // != 0 e específico da invariante — ver `schema-boot-gate.ts`.
+  //
+  // O check anterior (`checkSchemaVersion()`, removido) comparava o id mais
+  // novo do ledger com o arquivo mais novo em disco e não via nada disso.
+  //
+  // Quem impede que isto aconteça no caminho normal é o gate de migration (o
+  // job one-shot do Compose, `npm run release:migrate` fora dele). Se o boot
+  // recusa, uma invariante quebrou — e o crash loop é o sinal.
   await lifecycle.runStartupStep('schema', async () => {
     if (!config.READINESS_SCHEMA_CHECK) {
+      // Política explícita e declarada no contrato (#515), RECUSADA no profile
+      // production (`lifecycle/schema-check-disabled`, src/config/rules.ts).
+      // Fora de production é o que mantém dev/test vivos quando código e
+      // schema são publicados fora de banda de propósito.
       lifecycle.setComponent('schema', 'ready', 'schema check disabled by config');
+      logger.warn('schema.boot_gate_disabled — READINESS_SCHEMA_CHECK=false');
       return;
     }
-    const schema = await checkSchemaVersion();
-    if (schema.status !== 'ok') {
-      lifecycle.setComponent('schema', 'failed', schema.detail);
-      throw new Error(
-        `schema version incompatible (expected ${schema.expected ?? '?'}, applied ${schema.applied ?? 'none'}) — run npm run db:migrate`,
+    const verdict = await checkSchemaReadiness();
+    const failure = describeSchemaBootFailure(verdict);
+    if (failure) {
+      lifecycle.setComponent('schema', 'failed', describeSchemaReadiness(verdict));
+      // A mensagem de morte, ESTRUTURADA: sem ela o crash loop é pior que o
+      // 503 que ele substitui. Só literais nossos — nunca SQL, driver ou DSN.
+      logger.error(
+        {
+          exit_code: failure.exit_code,
+          blocker: failure.kind,
+          blockers: failure.blocker_kinds,
+          verdict: failure.state,
+          migration_id: failure.migration_id,
+          expected_checksum: failure.expected_checksum,
+          found_checksum: failure.found_checksum,
+          expected_head: failure.expected_head,
+          applied_head: failure.applied_head,
+          remediation: failure.remediation,
+        },
+        'maia.schema_boot_refused',
       );
+      throw new SchemaBootAbortError(failure);
     }
-    lifecycle.setComponent('schema', 'ready', `applied ${schema.applied}`);
+    lifecycle.setComponent('schema', 'ready', `head ${verdict.applied_head ?? 'none'}`);
   });
 
   // ── 4. Redis (MANDATORY — fail-closed) ─────────────────────────────────
@@ -211,8 +252,13 @@ async function main() {
     const ownsWorker = roleOwns(role, 'agent_worker');
     if (ownsWorker) {
       lifecycle.setComponent('agent_worker', 'starting');
-      startAgentWorker(async (job) => {
-        await runAgentForMensagem(job.data.mensagem_id);
+      // Issue #504 §Contrato do job — o worker recebe o payload JÁ classificado
+      // (`parsed`) pela leitura dual do `queue.ts` e despacha por
+      // `runAgentTurnJob`: V1 chama `runAgentForMensagem` como sempre, V2
+      // resolve o escopo cross-tenant antes de qualquer trabalho de domínio.
+      // Ver `src/runtime/turns/job-consumer.ts`.
+      startAgentWorker(async (_job, parsed, facts) => {
+        await runAgentTurnJob(parsed, facts);
       });
       // Spec roteamento v4 §1.4 — worker de replay do staging (job só carrega o
       // id; o payload cifrado vive no Postgres). Ativo em qualquer modo: rows só
@@ -223,6 +269,23 @@ async function main() {
       startUnroutedReplayWorker(async (job) => {
         await processUnroutedReplay(job.data.unrouted_id);
       });
+      // Issue #633 (fatia D da #506) — o CONSUMIDOR da fila de entrega do
+      // outbox durável. Registrado só com a flag ligada, e a flag NASCE OFF:
+      // o consumidor precede o produtor (a varredura de recuperação, gated por
+      // `FEATURE_OUTBOUND_RECOVERY`), e o contrato de config recusa a ordem
+      // inversa (`outbound-recovery/requires-delivery-worker`).
+      //
+      // Sem a flag, nada é construído: um `Worker` da BullMQ abre conexão e
+      // consome assim que existe, então "registrar e não usar" não é opção.
+      if (config.FEATURE_OUTBOUND_DELIVERY_WORKER) {
+        const { startOutboundDeliveryWorker } = await import('@/gateway/queue.js');
+        const { consumeOutboundDeliveryJob } = await import(
+          '@/runtime/outbound/delivery-consumer.js'
+        );
+        startOutboundDeliveryWorker(async (outbound_id) => {
+          await consumeOutboundDeliveryJob(outbound_id);
+        });
+      }
     }
     // Constructing a Queue/Worker does NOT mean it can consume — the BullMQ
     // connection is lazy. Wait for a live connection before claiming ready, or
@@ -329,5 +392,9 @@ main().catch(async (err) => {
     },
   }).catch(() => undefined);
   await lifecycle.shutdown({ reason: 'startup_failed' }).catch(() => undefined);
-  process.exit(1);
+  // Issue #516: o exit code DISTINGUE a invariante quebrada. `1` continua
+  // sendo qualquer outra falha de boot; o gate de schema devolve 90-98 (ver
+  // `schema-boot-gate.ts` e docs/runbooks/operational.md §8.1), para que
+  // `docker inspect --format '{{.State.ExitCode}}'` já diga o que houve.
+  process.exit(bootExitCode(err));
 });

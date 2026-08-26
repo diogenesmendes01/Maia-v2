@@ -1,6 +1,7 @@
 import { listOwners } from '@/governance/permissions.js';
 import { entidadesRepo, contasRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
@@ -102,8 +103,10 @@ async function sendToOwners(text: string): Promise<void> {
   const owners = await listOwners();
   for (const o of owners) {
     const jid = o.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-    await line.sendText(jid, text).catch((err) =>
-      logger.warn({ err, pessoa_id: o.id }, 'briefing.send_failed'),
+    // #634 — exceção INVENTARIADA (`workers.briefings`): proativo periódico, sem
+    // turno e sem conversa de origem.
+    await withDeclaredEgressException('workers.briefings', () => line.sendText(jid, text)).catch(
+      (err) => logger.warn({ err, pessoa_id: o.id }, 'briefing.send_failed'),
     );
   }
 }

@@ -4,8 +4,10 @@ import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
+  notePromotionReconciled,
   noteTurnQueued,
   reportLegacyProjectionDivergence,
+  reportStreamFifoViolation,
   turnStateAuthoritative,
   turnStateMachineEnabled,
 } from '@/runtime/turns/index.js';
@@ -168,11 +170,21 @@ export async function runMessageRecovery(): Promise<void> {
 async function runTurnRecoveryInner(): Promise<void> {
   const candidates = await agentTurnsRepo.findRecoverableTurns(STUCK_AFTER_MS, MAX_PER_RUN);
   if (candidates.length === 0) return;
+  await auditarFifoDoRecovery(candidates.map(({ turn }) => turn.id));
   let requeued = 0;
   for (const { turn, reason } of candidates) {
     incCounter('maia_turn_recovery_candidates_total', { reason });
     try {
-      await enqueueAgent({ mensagem_id: turn.representative_message_id });
+      // #504 — o `turn_id` faz o `jobId` ser determinístico. Duas instâncias
+      // do recovery varrendo o mesmo par (tenant, agent) ao mesmo tempo — ou o
+      // recovery e o ingresso — armam o MESMO job em vez de dois, e a BullMQ
+      // ignora o segundo `add`. É esta linha que fecha "várias instâncias do
+      // recovery não geram execução duplicada" no transporte; o claim atômico
+      // fecha o mesmo no banco, e as duas camadas são independentes.
+      await enqueueAgent({
+        mensagem_id: turn.representative_message_id,
+        turn_id: turn.id,
+      });
       // Só `received` e `retryable` têm aresta para `queued`. Um turno já em
       // `queued` (job perdido) ou em `claimed`/`running` com lease vencida é
       // rearmado na FILA sem mexer no estado — tentar transicionar aqui só
@@ -185,6 +197,28 @@ async function runTurnRecoveryInner(): Promise<void> {
           state_version: Number(turn.state_version),
           attempt_count: turn.attempt_count,
           conversa_id: turn.conversa_id,
+        });
+      }
+      // #627 (fatia D da #505) — A RECONCILIAÇÃO DE "COMMIT FEITO, ENQUEUE NÃO
+      // FEITO".
+      //
+      // `promoted_at` preenchido significa que a plataforma ELEGEU este turno
+      // para avançar e ainda ninguém o acordou: o claim zera a coluna quando a
+      // dívida é paga (ver `claimNextEligibleTurn`). Chegar aqui nesse estado é
+      // exatamente o caso que a issue manda o recovery cobrir — o processo caiu
+      // entre o commit da promoção e o `enqueueAgent`, e o turno existe no
+      // banco e não existe na fila.
+      //
+      // O `enqueueAgent` acima JÁ o rearmou; o que falta é dizer que isso
+      // aconteceu. Sem esta linha a recuperação é indistinguível de um rearme
+      // rotineiro de turno esquecido, e `enqueue_failed` (que a promoção conta
+      // do outro lado) ficaria sem par — impossível saber se o buraco foi
+      // fechado ou se o varredor parou.
+      if (turn.promoted_at) {
+        await notePromotionReconciled({
+          turn_id: turn.id,
+          conversa_id: turn.conversa_id,
+          status: turn.status,
         });
       }
       requeued++;
@@ -203,6 +237,37 @@ async function runTurnRecoveryInner(): Promise<void> {
     }
   }
   logger.info({ requeued, scanned: candidates.length }, 'turn_recovery.done');
+}
+
+/**
+ * Issue #626 — o CANÁRIO de `maia_stream_fifo_violation_total{stage="recovery"}`.
+ *
+ * `findRecoverableTurns` já elege só o head-of-line de cada stream, pela MESMA
+ * função que o claim usa. Esta checagem pergunta de novo, por um caminho
+ * diferente (uma consulta sobre os ids devolvidos, em vez do predicado no
+ * `WHERE` daquela consulta), e o resultado esperado é sempre vazio.
+ *
+ * Ela existe porque a issue nomeia este ponto como o lugar onde a divergência
+ * aparece: "duas cópias da regra de elegibilidade divergem, e a divergência só
+ * aparece durante um recovery". Se alguém remover a regra do filtro, este
+ * canário acusa ANTES de o job acordar e ser recusado pelo claim — a diferença
+ * entre um alerta e uma investigação de por que a fila cresce sem nada executar.
+ *
+ * NUNCA lança: um canário que derruba o varredor transformaria uma anomalia de
+ * observabilidade numa parada de recuperação.
+ */
+async function auditarFifoDoRecovery(turn_ids: readonly string[]): Promise<void> {
+  try {
+    const foraDeOrdem = await agentTurnsRepo.listNonHeadTurns(turn_ids);
+    for (const { turn_id, earlier_live } of foraDeOrdem) {
+      await reportStreamFifoViolation(turn_id, { stage: 'recovery', earlier_live });
+    }
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error).message },
+      'turn_recovery.fifo_canary_failed',
+    );
+  }
 }
 
 async function runMessageRecoveryInner(): Promise<void> {

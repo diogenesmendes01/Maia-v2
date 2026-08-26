@@ -1,0 +1,128 @@
+/**
+ * Issue #516 — public surface of the migration subsystem.
+ *
+ * Três audiências:
+ *
+ *   - **Writers** (`scripts/migrate.ts`, the compose init job): `runMigrations`,
+ *     `repairMigration`. They take the global advisory lock and are the ONLY
+ *     things allowed to change the schema.
+ *   - **Readers** (`maia doctor` #517, `/readyz`, `migrate plan|status`):
+ *     `getSchemaReadiness`, `getMigrationStatus`. Read-only, never throwing,
+ *     fail-closed.
+ *   - **Gate fora do Compose** (`scripts/release-migrate.ts`, issue #565):
+ *     `runReleaseGate`. Não toca no banco — filtra o ambiente e propaga o
+ *     exit code do writer acima para um orquestrador que não tem
+ *     `service_completed_successfully`.
+ *
+ * Down migrations are NOT here, by design: rollback stays manual
+ * (`docs/runbooks/migrations.md`). Nothing in this module can execute a
+ * `_down.sql`.
+ */
+export {
+  analyzeTransactionEnvelope,
+  buildMigrationArtifact,
+  compareMigrationIds,
+  discoverMigrations,
+  downSiblingOf,
+  hasOwnTransactionControl,
+  isForwardMigration,
+  prefixOf,
+  splitNoTxStatements,
+  splitTopLevelStatements,
+  statementTimeoutOf,
+  NO_TX_MARKER,
+  STATEMENT_TIMEOUT_MARKER,
+  type EnvelopeAnalysis,
+  type EnvelopeDefect,
+  type MigrationSource,
+} from './discover.js';
+
+export {
+  canonicalizeMigrationSql,
+  migrationChecksum,
+  shortChecksum,
+  SHORT_CHECKSUM_LENGTH,
+} from './checksum.js';
+
+export {
+  computeMigrationStatus,
+  defaultCompatibilityManifest,
+  evaluateSchemaReadiness,
+  unknownReadiness,
+  type ComputeStatusOptions,
+  type ReadinessOptions,
+} from './status.js';
+
+export {
+  acquireMigrationLock,
+  withMigrationLock,
+  DEFAULT_LOCK_POLL_MS,
+  DEFAULT_LOCK_WAIT_MS,
+  MIGRATION_LOCK_KEY,
+  MIGRATION_LOCK_NAMESPACE,
+  type LockAcquisition,
+  type LockOptions,
+  type MigrationLock,
+} from './lock.js';
+
+export {
+  describeLedger,
+  ensureLedgerSchema,
+  readLedger,
+  LEDGER_TABLE,
+  LEDGER_V2_COLUMNS,
+  LEDGER_V2_DDL,
+  type LedgerClient,
+  type LedgerShape,
+} from './ledger.js';
+
+export {
+  describeInvalidIndex,
+  invalidIndexBlockers,
+  invalidIndexKey,
+  readInvalidIndexes,
+  INVALID_INDEX_QUERY,
+} from './invalid-indexes.js';
+
+export {
+  repairAppliedRefusal,
+  repairMigration,
+  runMigrations,
+  terminalLedgerStatusFor,
+  InvalidIndexAfterMigrationError,
+  DEFAULT_STATEMENT_LOCK_TIMEOUT_MS,
+  INVALID_INDEX_ERROR_CODE,
+  RUNNER_VERSION,
+  type MigrationEventSink,
+  type MigrationRunResult,
+  type RepairRefusalRule,
+  type RepairRequest,
+  type RepairResult,
+  type RunnerDeps,
+  type RunOptions,
+  type RunOutcome,
+} from './runner.js';
+
+export {
+  normalizeExitCode,
+  runReleaseGate,
+  scrubToMigratorSubset,
+  MIGRATE_COMMAND,
+  PROCESS_PASSTHROUGH,
+  type MigratorOutcome,
+  type ReleaseGateDeps,
+  type ScrubReport,
+} from './release-gate.js';
+
+export {
+  getMigrationStatus,
+  getSchemaReadiness,
+  // Exported for `/readyz` (issue #516): the readiness gate binds the
+  // application's own `pg` pool to `getSchemaReadiness()` and needs the pool
+  // shape to type that adapter. See src/runtime/lifecycle/schema-readiness.ts.
+  type ReadOnlyPool,
+  type ReadOnlyPoolClient,
+  type SchemaInspectionDeps,
+} from './readiness.js';
+
+export type * from './types.js';

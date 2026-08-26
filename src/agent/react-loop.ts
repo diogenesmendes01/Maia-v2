@@ -1,3 +1,4 @@
+import { pgErrorCode } from '@/db/client.js';
 import { mensagensRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
@@ -7,6 +8,7 @@ import { logger } from '@/lib/logger.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { REGISTRY } from '@/tools/_registry.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressExceptionSync } from '@/runtime/outbound/egress-guard.js';
 import { uuid } from '@/lib/utils.js';
 import { safeDispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
 import { detectGap } from './gap-detector.js';
@@ -16,15 +18,76 @@ import { persistCandidate } from '@/cognition/persister.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { buildToolSummary, type ToolExecutionSummary } from './tool-execution-summary.js';
+import {
+  assertTurnOwnership,
+  getTurnExecutionContext,
+  TurnOwnershipLostError,
+} from '@/runtime/turns/execution-context.js';
 
 /**
  * Codex C1 (PR #74): when the ReAct loop exits without dispatching outbound
  * (iteration cap, empty final text, or outbound failure) but tools ran,
  * persist the tool summaries via a placeholder "event-only" mensagem so
  * the next turn's prompt-builder can still surface them in the
- * "## Eventos confirmados pelo backend" block. Best-effort: if persistence
- * fails, the next turn loses its anchor — that's the soft failure mode.
+ * "## Eventos confirmados pelo backend" block.
+ *
+ * Issue #577 — `tipo: 'evento'` só passou a caber no CHECK de `mensagens.tipo`
+ * em `migrations/116_mensagens_tipo_evento.sql`. Antes disso TODO INSERT daqui
+ * violava `mensagens_tipo_check`, o catch abaixo engolia, e o helper era código
+ * morto: o rastro de ferramentas de qualquer turno sem outbound sumia do
+ * histórico deixando só um `warn`.
+ *
+ * ─── Por que continua best-effort ──────────────────────────────────────────
+ *
+ * Porque falhar o turno aqui é ESTRITAMENTE PIOR, e a razão está escrita no
+ * caller: em `src/agent/core.ts` ("`iteration_cap` NÃO é retryable: tools já
+ * rodaram, reexecutar duplicaria efeito colateral"). Este flush só roda nos
+ * caminhos SEM outbound — exatamente aqueles em que as tools já rodaram e
+ * `sideEffectsCommitted` pode estar marcado. Um throw daqui subiria como erro
+ * genérico, o turno viraria falha e o recovery reexecutaria o ReAct do zero:
+ * trocaríamos a perda de UM anchor de prompt pela duplicação de um efeito
+ * externo irreversível (um boleto emitido duas vezes).
+ *
+ * E o invariante de auditoria da §4 não depende desta row: o laço já escreveu
+ * um `audit()` em `audit_log` por tool-use, ANTES de chegar aqui. Esta row é o
+ * anchor anti-anchoring do turno SEGUINTE, não o livro-razão.
+ *
+ * ─── O log tem de ser distinguível ─────────────────────────────────────────
+ *
+ * O que não pode voltar a acontecer é o modo de falha desta issue: um defeito
+ * PERMANENTE de esquema/código indistinguível de um soluço de banco. Por isso
+ * classificamos pelo SQLSTATE — classe 22 (data exception) e 23 (integrity
+ * constraint violation) são determinísticas: vão falhar de novo, idênticas, em
+ * toda tentativa. Essas saem em `error` com `failure_kind: 'permanent'` e o
+ * nome da constraint; o resto (conexão caída, deadlock, timeout) segue em
+ * `warn` como `'transient'`.
  */
+function classifyFlushFailure(err: unknown): {
+  failure_kind: 'permanent' | 'transient';
+  pg_code: string | undefined;
+  pg_constraint: string | undefined;
+} {
+  const pg_code = pgErrorCode(err);
+  // 22xxx data exception, 23xxx integrity constraint violation — nenhuma delas
+  // muda de resultado na próxima tentativa: é esquema ou código, não infra.
+  const permanent =
+    typeof pg_code === 'string' && (pg_code.startsWith('22') || pg_code.startsWith('23'));
+  let constraint: unknown;
+  for (let cur: unknown = err, depth = 0; cur != null && depth < 8; depth++) {
+    const c = (cur as { constraint?: unknown }).constraint;
+    if (typeof c === 'string' && c.length > 0) {
+      constraint = c;
+      break;
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return {
+    failure_kind: permanent ? 'permanent' : 'transient',
+    pg_code,
+    pg_constraint: typeof constraint === 'string' ? constraint : undefined,
+  };
+}
+
 async function flushUnconfirmedToolSummaries(
   conversa_id: string,
   inbound_id: string,
@@ -53,10 +116,26 @@ async function flushUnconfirmedToolSummaries(
       'agent.tool_summaries_flushed_no_outbound',
     );
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, conversa_id, reason },
-      'agent.tool_summaries_flush_failed',
-    );
+    const { failure_kind, pg_code, pg_constraint } = classifyFlushFailure(err);
+    // `err` do Drizzle traz a query e os PARÂMETROS inteiros na mensagem — ou
+    // seja, o conteúdo das ferramentas — então nunca o repassamos cru.
+    const fields = {
+      conversa_id,
+      inbound_id,
+      reason,
+      count: toolSummaries.length,
+      failure_kind,
+      pg_code: pg_code ?? null,
+      pg_constraint: pg_constraint ?? null,
+      err: (err as Error).name,
+    };
+    if (failure_kind === 'permanent') {
+      // Defeito nosso: o mesmo INSERT vai falhar igual na próxima vez. Some o
+      // rastro de ferramentas de TODO turno sem outbound até alguém consertar.
+      logger.error(fields, 'agent.tool_summaries_flush_rejected');
+    } else {
+      logger.warn(fields, 'agent.tool_summaries_flush_failed');
+    }
   }
 }
 
@@ -175,8 +254,29 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
   // Enquanto false, um retry é seguro; a partir de true, não é.
   let sideEffectsCommitted = false;
+  // Issue #507 — o sinal da tentativa, lido UMA vez. O `TurnExecutionContext`
+  // é estável durante todo o turno (o ALS não muda de store no meio), e ler
+  // fora do laço deixa explícito que é o mesmo orçamento de cancelamento em
+  // todas as iterações. `undefined` fora de um turno reivindicado: workers de
+  // agenda, playground e testes seguem com o comportamento anterior.
+  const turnSignal = getTurnExecutionContext()?.signal;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+    // Issue #504 §Fencing — LIMITE DE EFEITO, no topo de cada iteração.
+    //
+    // O dispatcher e o outbound já recusam individualmente; este guard existe
+    // porque a review apontou o custo ANTES deles: "o worker antigo pode
+    // continuar chamando LLM". Uma iteração de ReAct é um round-trip pago ao
+    // provedor e mais uma volta de raciocínio em nome de um turno que não é
+    // mais nosso. Perguntar aqui é a diferença entre parar e apenas ser
+    // barrado.
+    //
+    // Lança em vez de sair do laço com um `exitReason`: sair devolveria um
+    // resultado que `decideTurnAction` traduziria em conclusão ou retry — duas
+    // escritas de estado que esta tentativa não tem mais autoridade para fazer.
+    // Quem tem a lease decide o desfecho. `core.ts` captura este erro e retorna
+    // sem concluir.
+    assertTurnOwnership('react_iteration');
     const reasonerResult = await runCognitiveModule(
       {
         name: 'reasoner',
@@ -185,8 +285,17 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         timeoutMs: 30000,
         conversa_id: c.id,
         turno_id: inbound.id,
+        // Issue #507 — o sinal da TENTATIVA entra no runner.
+        //
+        // O guard acima recusa uma iteração NOVA. Ele não alcança a chamada JÁ
+        // EM VOO: perdida a lease no meio do round-trip do reasoner — que é o
+        // trecho mais longo do turno, logo o instante mais provável — o
+        // provedor seguia gerando e sendo cobrado até o fim, e o
+        // `cognitive_module_log` registrava `success` para um turno que já não
+        // era nosso. O sinal aqui é o que transforma isso em cancelamento.
+        signal: turnSignal,
       },
-      () =>
+      (signal) =>
         callLLM({
           // Issue #508: workload declarado → o backend decide tier, política
           // de retry e se fallback é permitido (src/lib/llm/workloads.ts).
@@ -196,8 +305,31 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           tools,
           max_tokens: 1024,
           pessoa_id: pessoa.id,
+          // Issue #507 — sem ESTA linha o resto é decoração: o gateway já
+          // cancela provider, retry, backoff e fallback quando recebe o sinal
+          // (`src/lib/llm/gateway.ts`), e o runner já compõe o sinal — mas o
+          // `Promise.race` sozinho apenas devolve ao caller enquanto a
+          // requisição HTTP continua viva.
+          signal,
         }),
     );
+
+    // Issue #507 — CANCELAMENTO NÃO É FALHA DE RACIOCÍNIO.
+    //
+    // Sem este ramo, `output: null` cairia no `if (!res)` abaixo e o turno
+    // sairia como `reasoner_failed` — que `core.ts` traduz em RETRY. Reenfileirar
+    // um turno cuja lease pertence a outro worker é exatamente a gravação que a
+    // #504 proíbe, agora escrita por engano de vocabulário.
+    //
+    // Lança pelo mesmo motivo do guard do topo: quem tem a lease decide o
+    // desfecho, e `core.ts:1526` sai sem concluir, sem retry e sem carimbar
+    // `processada_em`. Se o sinal tiver vindo de outra fonte que não a perda de
+    // posse, `assertTurnOwnership` não lança e o fluxo segue para o tratamento
+    // de `!res` — conservador de propósito.
+    if (reasonerResult.status === 'cancelled') {
+      assertTurnOwnership('react_reasoner');
+    }
+
     const res = reasonerResult.output;
     if (!res) {
       // Reasoner falhou (timeout/erro) — encerra loop com resposta vazia.
@@ -327,6 +459,30 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       });
       const isError = typeof out === 'object' && out !== null && 'error' in out;
 
+      // Issue #504 §Fencing — a RECUSA POR POSSE ENCERRA A TENTATIVA.
+      //
+      // O dispatcher recusa devolvendo `{ error }` (o contrato dele; um throw
+      // seria lido pelo caller como quebra de plataforma). O efeito colateral
+      // disso era o ReAct tratar a perda da lease como erro comum de tool:
+      // seguia montando resumo, auditava a chamada e, sem outbound, o
+      // `flushUnconfirmedToolSummaries()` do fim do laço criava uma row nova em
+      // `mensagens`. Três gravações depois de o turno já não ser nosso — o
+      // oposto de "perda de lease impede gravações posteriores".
+      //
+      // Traduzimos a recusa para o vocabulário que o CORE já entende: o catch
+      // dedicado de `src/agent/core.ts:1496` sai sem concluir, sem retry e sem
+      // carimbar `processada_em`. Quem tem a lease decide o desfecho.
+      //
+      // ANTES de `sideEffectsCommitted`, de `toolsCalled`, do `audit()` e do
+      // `results.push` de propósito: cada um deles é estado ou gravação desta
+      // tentativa, e nenhum lhe pertence mais.
+      if (isError && (out as { error: unknown }).error === 'turn_ownership_lost') {
+        throw new TurnOwnershipLostError(
+          'react_tool_refused',
+          getTurnExecutionContext()?.turn_id ?? null,
+        );
+      }
+
       // Issue #503 — RASTREIO DE EFEITO IRREVERSÍVEL. Uma tool `write` ou
       // `communication` pode ter alterado estado externo (transação criada,
       // mensagem enviada). Se o turno falhar DEPOIS disso, reexecutar o ReAct
@@ -429,8 +585,17 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
               ? '❌'
               : null;
           if (emoji) {
+            // #634 — exceção INVENTARIADA (`agent.react_loop_tool_reaction`):
+            // sinal EFÊMERO sobre a mensagem de ENTRADA. A primitiva do Baileys
+            // devolve `void`, então um artefato durável para ela nasceria em
+            // `delivery_unknown` e alimentaria a reconciliação humana de #633
+            // com ruído. Ver `send-paths.ts`.
             await forCurrentAgentChannel(c.channel_id)
-              .then((line) => line.sendReaction(jid, wid, emoji))
+              .then((line) =>
+                withDeclaredEgressExceptionSync('agent.react_loop_tool_reaction', () =>
+                  line.sendReaction(jid, wid, emoji),
+                ),
+              )
               .catch((err) =>
                 logger.debug(
                   { err: (err as Error).message },

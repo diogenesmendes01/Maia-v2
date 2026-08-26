@@ -57,6 +57,7 @@ export type ConfigGroup =
   | 'whatsapp'
   | 'owner'
   | 'governance'
+  | 'onboarding'
   | 'routing'
   | 'alerts'
   | 'backup'
@@ -69,6 +70,7 @@ export type ConfigGroup =
   | 'performance'
   | 'lifecycle'
   | 'setup'
+  | 'tool-requests'
   | 'admin-ui';
 
 /** Section order + human title for every group, used by the generators. */
@@ -82,6 +84,13 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
   { group: 'whatsapp', title: 'WhatsApp / Baileys' },
   { group: 'owner', title: 'Owner' },
   { group: 'governance', title: 'Governança (limites financeiros e TTLs)' },
+  // Decisão 13 (#519). As alavancas da saga de onboarding e do worker
+  // `onboarding_expirer` moravam em `governance`, entre TTLs de aprovação
+  // dupla e limites financeiros — grupos são o índice do operador, e ali a
+  // resposta a "onde configuro o onboarding" ficava numa seção de outro
+  // domínio. Logo depois de `governance` de propósito: é de onde as chaves
+  // saíram, então a seção nova nasce onde o leitor já procurava.
+  { group: 'onboarding', title: 'Onboarding (saga e expirer)' },
   { group: 'routing', title: 'Roteamento multi-linha' },
   { group: 'alerts', title: 'Observabilidade / alertas' },
   { group: 'backup', title: 'Backup / restore' },
@@ -94,6 +103,11 @@ export const GROUP_ORDER: readonly { group: ConfigGroup; title: string }[] = [
   { group: 'performance', title: 'Performance / caches' },
   { group: 'lifecycle', title: 'Lifecycle do processo (readiness e shutdown)' },
   { group: 'setup', title: 'Bootstrap / setup' },
+  // #638 (fatia C da épica #471). O destino e a credencial das issues geradas
+  // pela triagem de pedidos de ferramenta. Grupo próprio, e não `governance`,
+  // porque a pergunta do operador é "para onde vão as issues do backlog do
+  // agente?" — e a resposta não pertence à seção de limites financeiros.
+  { group: 'tool-requests', title: 'Pedidos de ferramenta (issues da triagem)' },
   { group: 'admin-ui', title: 'Admin UI (container Next.js separado)' },
 ];
 
@@ -349,6 +363,26 @@ export interface ConfigProblem {
   readonly rule: string;
   readonly message: string;
   readonly remediation: string;
+  /**
+   * EVERY variable this finding is about, when the rule that produced it knows
+   * more than `variable` can say (issue #602).
+   *
+   * `variable` holds ONE name — a Zod issue path, or the single key a rule
+   * files itself under — and that is not enough for the cross-field rules:
+   * `backup/encryption-key` fires for the PAIR
+   * `BACKUP_ENCRYPTION_KEYRING` + `BACKUP_ENCRYPTION_ACTIVE_KEY_ID` and files
+   * itself under the first, and the boot-scope rules that preserve the
+   * historical `<root>` Zod path carry `variable: null` while naming a real
+   * variable (`llm/provider-key` → `ANTHROPIC_API_KEY`). A consumer listing
+   * "which variables does this problem involve?" by `variable` alone omits the
+   * second key, or every key.
+   *
+   * Populated from `CrossFieldFinding.covers` by `validateConfig()`. ABSENT —
+   * not empty — when the finding is about exactly the variable in `variable`,
+   * so the serialized shape of every other problem is unchanged. Read it as
+   * `p.covers ?? (p.variable ? [p.variable] : [])`.
+   */
+  readonly covers?: readonly string[];
 }
 
 /**

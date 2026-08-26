@@ -33,6 +33,11 @@ import { mcpCallTool } from '@/lib/mcp-client.js';
 import { constitutionalCheck } from '@/governance/rules.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
+import {
+  turnOwnershipLost,
+  reportBlockedEffect,
+  getTurnExecutionContext,
+} from '@/runtime/turns/execution-context.js';
 
 /**
  * Fase 0 cap. 5 — contexto completo da chamada MCP. Estruturalmente
@@ -55,6 +60,17 @@ const MAX_DESCRIPTION_CHARS = 400;
 // console possa importá-la sem o grafo do hot path — issue #481 item 3. O
 // re-export mantém a API pública deste módulo (usada por `_dispatcher.ts`).
 export { isMcpToolName, mcpToolName, parseMcpToolName };
+
+/**
+ * Issue #535 §2 — o vocabulário de recusa DESTE bridge, exportado para que a
+ * observabilidade classifique `mcp_tool_not_executable` (governança negando,
+ * como projetado) separado de `mcp_call_failed` (o servidor externo quebrou).
+ * Antes os dois caíam no mesmo balde `error` do SLI operacional.
+ */
+export {
+  MCP_BRIDGE_ERROR_CODES,
+  type McpBridgeErrorCode,
+} from './_dispatch-error-codes.js';
 
 /** Packs `mcp.<server>` presentes no grant do agente corrente (ALS). */
 async function grantedMcpServerNames(): Promise<Set<string>> {
@@ -228,6 +244,26 @@ export async function dispatchMcpTool(input: {
     return { error: 'invalid_args', details: { tool: input.tool, reason: invalid } };
   }
 
+  // (3b) Issue #504 §Fencing — FENCE NO LIMITE DO EFEITO.
+  //
+  // O dispatcher já perguntou na entrada, mas o desvio para cá acontece antes
+  // dos awaits DESTE módulo: grant do agente, catálogo de tools executáveis e
+  // regras constitucionais são todas idas ao banco. A lease pode morrer em
+  // qualquer uma delas, e a linha seguinte é uma chamada HTTP a um servidor
+  // EXTERNO — irreversível do nosso lado. A pergunta é refeita aqui.
+  //
+  // Vocabulário: o bridge devolve `{ error }` como o dispatcher, nunca lança.
+  if (turnOwnershipLost()) {
+    reportBlockedEffect('mcp_tool_call');
+    await audit({
+      acao: 'mcp_tool_call',
+      ...auditCtx,
+      alvo_id: input.tool,
+      metadata: { request_id: input.request_id, outcome: 'denied_turn_ownership_lost' },
+    });
+    return { error: 'turn_ownership_lost', details: { tool: input.tool } };
+  }
+
   // (4) Chamada com timeout + cap + audit (sucesso E falha).
   try {
     const raw = await mcpCallTool({
@@ -236,6 +272,11 @@ export async function dispatchMcpTool(input: {
       serverName: tool.server_name,
       tool: tool.tool_name,
       toolArgs: input.args as Record<string, unknown>,
+      // O turno continua vivo agora, mas a chamada pode durar: o signal aborta
+      // o HTTP se a posse acabar DURANTE ela.
+      ...(getTurnExecutionContext()?.signal
+        ? { signal: getTurnExecutionContext()!.signal }
+        : {}),
     });
     const { text, truncated, bytes } = truncateResult(raw);
     await audit({

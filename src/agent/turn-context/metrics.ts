@@ -26,9 +26,13 @@ import { incCounter, observeHistogram } from '@/lib/metrics.js';
  *    Engine gate. A failure here is fail-closed.
  *  - `optional`: reasoner context, loaded only for turns the gate allowed.
  *  - `legacy`: the pre-#511 prompt-builder waterfall, kept as the baseline the
- *    optimisation is measured against.
+ *    optimisation is measured against. No longer emitted after #525 — a replica
+ *    still reporting it has not been rolled.
+ *  - `loader`: the integrated `TurnContextLoader` + pure renderer (#525). This
+ *    is the label a healthy deploy emits, and the one whose
+ *    `maia_turn_context_db_queries` sample the round-trip budget watches.
  */
-export type TurnContextPhase = 'critical' | 'optional' | 'legacy';
+export type TurnContextPhase = 'critical' | 'optional' | 'legacy' | 'loader';
 
 export type TurnContextResult = 'ok' | 'degraded' | 'error';
 
@@ -47,6 +51,12 @@ export type TurnContextSection =
   | 'hints'
   | 'capabilities'
   | 'gaps'
+  // #638 (fatia C da épica #471) — o aviso de capacidade recém-adquirida. NÃO
+  // é uma seção carregada: ela sai da MESMA leitura de `gaps`. O rótulo existe
+  // porque o corte do orçamento é reportado por seção, e um corte aqui
+  // atribuído a `gaps` faria o painel dizer que limitações foram descartadas
+  // quando o que foi cortado é o oposto.
+  | 'capacidades_novas'
   | 'role'
   | 'procedure';
 

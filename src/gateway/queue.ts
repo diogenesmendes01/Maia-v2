@@ -16,16 +16,68 @@ import {
   runWithCorrelation,
 } from '@/observability/correlation.js';
 import { counter, histogram } from '@/observability/metrics.js';
-import { METRIC } from '@/observability/taxonomy.js';
+import {
+  METRIC,
+  SPAN,
+  TURN_JOB_VERSION_VALUES,
+  closedVocabulary,
+} from '@/observability/taxonomy.js';
+import {
+  recordElapsedSpan,
+  withSpan,
+  type SpanAttribution,
+} from '@/observability/tracer.js';
+import {
+  agentTurnJobId,
+  jobVersionLabel,
+  parseAgentTurnJob,
+  type AgentTurnJobV2,
+  type ParsedAgentTurnJob,
+} from '@/runtime/turns/job.js';
+import type { AgentJobFacts } from '@/runtime/turns/job-consumer.js';
+import {
+  buildOutboundDeliveryJob,
+  outboundDeliveryJobId,
+  parseOutboundDeliveryJob,
+  type OutboundDeliveryJob,
+} from '@/runtime/outbound/delivery-job.js';
 import { withCorrelation } from './job-correlation.js';
 import type { AgentJob } from './types.js';
+
+/**
+ * Issue #504 §Contrato do job — o que uma row da fila `agent` pode conter
+ * DURANTE a janela de compatibilidade.
+ *
+ * A união é temporária por contrato: o produtor emite V2 quando
+ * `FEATURE_TURN_JOB_V2` está ligada e o turno é conhecido, e V1 no resto dos
+ * casos. Quem decide qual dos dois chegou é `parseAgentTurnJob`, uma vez só, no
+ * topo do worker — nunca um `'mensagem_id' in job.data` espalhado.
+ */
+export type AgentQueuePayload = AgentJob | AgentTurnJobV2;
+
+/**
+ * O processor recebe o payload JÁ classificado. Passar `parsed` em vez de
+ * deixar o consumidor reparsear é o que garante que a métrica de versão e a
+ * decisão de despacho falem do MESMO parse: duas leituras independentes do
+ * mesmo buffer são duas verdades que podem divergir sem que ninguém perceba.
+ */
+export type AgentJobProcessor = (
+  job: Job<AgentQueuePayload>,
+  parsed: ParsedAgentTurnJob,
+  facts: AgentJobFacts,
+) => Promise<void>;
+
+/** Os campos que só existem no payload V1. `null` quando o job é V2/inválido. */
+function legacyFields(parsed: ParsedAgentTurnJob, data: AgentQueuePayload): AgentJob | null {
+  return parsed.kind === 'v1' ? (data as AgentJob) : null;
+}
 
 const connection = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,
   lazyConnect: true,
 });
 
-export const agentQueue = new Queue<AgentJob>('agent', { connection });
+export const agentQueue = new Queue<AgentQueuePayload>('agent', { connection });
 
 /**
  * How long a job deferred by the drain guard waits before becoming eligible
@@ -53,7 +105,7 @@ const DRAIN_REQUEUE_DELAY_MS = 5_000;
 async function deferIfNotAcceptingWork(
   job: Job<unknown>,
   token: string | undefined,
-  queue: 'agent' | 'unrouted-replay',
+  queue: 'agent' | 'unrouted-replay' | 'outbound-delivery',
 ): Promise<void> {
   if (lifecycle.isAcceptingWork()) return;
   await job.moveToDelayed(Date.now() + DRAIN_REQUEUE_DELAY_MS, token);
@@ -65,11 +117,11 @@ async function deferIfNotAcceptingWork(
   throw new DelayedError();
 }
 
-let worker: Worker<AgentJob> | null = null;
+let worker: Worker<AgentQueuePayload> | null = null;
 
-export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void>): Worker<AgentJob> {
+export function startAgentWorker(processor: AgentJobProcessor): Worker<AgentQueuePayload> {
   if (worker) return worker;
-  worker = new Worker<AgentJob>(
+  worker = new Worker<AgentQueuePayload>(
     'agent',
     async (job, token) => {
       // Drain guard FIRST — before any side effect, before ANY context, and
@@ -90,23 +142,80 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
       // the attempt, which is exactly the "recovery preserves root trace, new
       // attempt id" contract. Falling back to `deriveTraceId(mensagem_id)`
       // makes jobs armed before this deploy correlate identically.
-      const trace_id = job.data.trace_id ?? deriveTraceId(job.data.mensagem_id);
+
+      // Issue #504 §Contrato do job — a LEITURA DUAL, no caminho real do
+      // worker. Um parse só, no topo, ANTES de qualquer decisão: é ele que
+      // classifica o payload, alimenta a métrica de versão e é entregue ao
+      // processor. Fazê-lo aqui (e não dentro do consumidor) é o que mantém a
+      // série `maia_turn_job_version_total` honesta mesmo quando o payload é
+      // irreconhecível — nesse caso o consumidor lança, e uma métrica emitida
+      // lá dentro nunca sairia.
+      const parsed = parseAgentTurnJob(job.data);
+      // Pela camada de POLÍTICA (`observability/metrics.ts::counter`), nunca
+      // por `incCounter` cru — foi o que a #601 estabeleceu. A atribuição sai
+      // `system` POR CONSTRUÇÃO: nada resolveu o tenant ainda, exatamente como
+      // em `maia_queue_wait_ms` logo abaixo.
+      counter(METRIC.TURN_JOB_VERSION, {
+        version: closedVocabulary(jobVersionLabel(parsed), TURN_JOB_VERSION_VALUES),
+      });
+      const legacy = legacyFields(parsed, job.data);
+      // Semente do `trace_id`: no V1 continua sendo o `mensagem_id` (byte a
+      // byte o comportamento anterior). No V2 não há mensagem conhecida aqui,
+      // então a janela pré-resolução usa o `turn_id` — e o consumidor
+      // REANCORA a correlação no `mensagem_id` assim que o resolvedor a
+      // devolve (`runtime/turns/job-consumer.ts`), para que o turno inteiro
+      // fique num único trace.
+      const seed =
+        parsed.kind === 'v1'
+          ? parsed.mensagem_id
+          : parsed.kind === 'v2'
+            ? parsed.turn_id
+            : (job.id ?? 'unknown-job');
+      const trace_id = legacy?.trace_id ?? deriveTraceId(seed);
       const attempt = (job.attemptsMade ?? 0) + 1;
+      // Ver `AgentJobFacts`: o consumidor preenche `received_at_ms` no V2, e o
+      // `recordTurnOutcome` abaixo o lê tanto no sucesso quanto no throw.
+      const facts: AgentJobFacts = { received_at_ms: legacy?.received_at_ms ?? null };
       await runWithCorrelation(
         {
           trace_id,
-          turn_id: job.data.mensagem_id,
+          turn_id: parsed.kind === 'v2' ? parsed.turn_id : (legacy?.mensagem_id ?? null),
           attempt,
           origin: 'queue',
-          received_at_ms: job.data.received_at_ms ?? null,
-          enqueued_at_ms: job.data.enqueued_at_ms ?? null,
+          received_at_ms: legacy?.received_at_ms ?? null,
+          enqueued_at_ms: legacy?.enqueued_at_ms ?? null,
         },
         async () => {
           // queue.wait — measured from the persisted arm timestamp, not from a
           // process-local clock, so it survives a worker restart.
-          if (typeof job.data.enqueued_at_ms === 'number') {
-            const waited = Date.now() - job.data.enqueued_at_ms;
-            if (waited >= 0) histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
+          //
+          // The HISTOGRAM is recorded here, immediately: it is the queue-wait
+          // SLI and it must survive a turn that never finishes. Its ALS
+          // attribution is `system` by construction (nothing has resolved the
+          // tenant yet) — see `docs/runbooks/observability-slo.md` §9.6.
+          //
+          // The SPAN is not. `enqueued_at_ms` describes a window that closed
+          // before this worker existed, so there is no scope to read a tenant
+          // from, and a span nobody can filter by tenant is the defect the
+          // owner's review of PR #541 opened. It is therefore DEFERRED to the
+          // `finally` below and stamped with the tuple the root `turn` span
+          // actually resolved to. Deferring costs nothing structurally: the
+          // start/end instants are explicit, and the span stays a SIBLING of
+          // the turn (it is emitted with no span open, so `parent_span_id`
+          // is null either way) because the waiting happened BEFORE the turn
+          // started running.
+          //
+          // V2 não carrega `enqueued_at_ms` (o contrato do payload proíbe), e
+          // por isso a amostra da espera é emitida pelo CONSUMIDOR a partir de
+          // `agent_turns.queued_at` — já atribuída ao dono, que o worker aqui
+          // não conhece.
+          let queueWaitMs: number | null = null;
+          if (typeof legacy?.enqueued_at_ms === 'number') {
+            const waited = Date.now() - legacy.enqueued_at_ms;
+            if (waited >= 0) {
+              histogram(METRIC.QUEUE_WAIT_MS, waited, { queue: 'agent' });
+              queueWaitMs = waited;
+            }
           }
           counter(METRIC.QUEUE_JOB_ATTEMPTS, {
             queue: 'agent',
@@ -115,7 +224,12 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
             phase: attempt === 1 ? 'first' : 'retry',
           });
           logger.debug(
-            { job_id: job.id, mensagem_id: job.data.mensagem_id, ...correlationLogFields() },
+            {
+              job_id: job.id,
+              job_version: jobVersionLabel(parsed),
+              ...(legacy ? { mensagem_id: legacy.mensagem_id } : {}),
+              ...correlationLogFields(),
+            },
             'agent.job.start',
           );
           counter(METRIC.TURN_STARTED, { origin: attempt === 1 ? 'queue' : 'recovery' });
@@ -144,16 +258,56 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
           // the ones that die before the core's own bookkeeping; (b) it keeps
           // the instrumentation off the files #503 is rewriting.
           const t0 = Date.now();
+          // Filled at the root span's close with the tuple the turn RESOLVED
+          // to — never with the pre-resolution payload, which knows no tenant.
+          // A plain box (not a bare `let`) so the closure write is visible to
+          // the reader as the whole point of the variable. It is per-JOB: two
+          // jobs of different tenants processing concurrently each get their
+          // own, which is what keeps one tenant's tuple off another's span.
+          const rootAttribution: { value: SpanAttribution | null } = { value: null };
           try {
-            await runWithSystemContext(() => processor(job));
-            recordTurnOutcome(job, 'completed', t0);
+            // Issue #535 — the ROOT operational span. It wraps the same scope
+            // the turn metrics already measure, so span duration and
+            // `maia_turn_duration_ms` can never disagree, and every span opened
+            // deeper in the call stack (tool dispatch today, more later) lands
+            // under it via ALS without threading a context object through the
+            // hot path.
+            await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job, parsed, facts)), {
+              attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
+              onAttribution: (attribution) => {
+                rootAttribution.value = attribution;
+              },
+            });
+            recordTurnOutcome(job, 'completed', t0, facts);
           } catch (err) {
             // A turn that throws with retries left is RETRYABLE, not failed —
             // conflating the two would make the failure-rate SLI count every
             // transient blip as a lost turn.
             const exhausted = (job.attemptsMade ?? 0) + 1 >= (job.opts.attempts ?? 3);
-            recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0);
+            recordTurnOutcome(job, exhausted ? 'failed' : 'retryable', t0, facts);
             throw err;
+          } finally {
+            // The deferred `queue.wait` span (see above). Emitted on the throw
+            // path too: a turn that failed still waited, and a backlog that
+            // only shows up for successful turns understates itself exactly
+            // when the queue is in trouble. `tenant_id`/`agent_id` are passed
+            // EXPLICITLY because at this point the tenant scope has unwound —
+            // caller-supplied attributes win over the tracer's own read.
+            //
+            // #504: `queueWaitMs` só é preenchido no ramo V1 (o payload V2 não
+            // carrega `enqueued_at_ms`), então a guarda de tipo abaixo lê o
+            // payload legado — no V2 o span simplesmente não é emitido, pela
+            // mesma razão pela qual a histograma da espera migra para o
+            // consumidor: aqui não existe instante de armação a reportar.
+            const armedAtMs = legacy?.enqueued_at_ms;
+            if (queueWaitMs !== null && typeof armedAtMs === 'number') {
+              recordElapsedSpan(
+                SPAN.QUEUE_WAIT,
+                armedAtMs,
+                armedAtMs + queueWaitMs,
+                { queue: 'agent', ...(rootAttribution.value ?? {}) },
+              );
+            }
           }
         },
       );
@@ -213,15 +367,65 @@ export function startAgentWorker(processor: (job: Job<AgentJob>) => Promise<void
  * and it survives a worker restart, a debounce reset and a recovery re-arm.
  */
 function recordTurnOutcome(
-  job: Job<AgentJob>,
+  job: Job<AgentQueuePayload>,
   outcome: 'completed' | 'retryable' | 'failed',
   startedAtMs: number,
+  facts: AgentJobFacts,
 ): void {
   counter(METRIC.TURN_COMPLETED, { outcome, queue: 'agent' });
   histogram(METRIC.TURN_DURATION_MS, Date.now() - startedAtMs, { outcome });
-  if (typeof job.data.received_at_ms === 'number') {
-    const e2e = Date.now() - job.data.received_at_ms;
+  // #504: no V1 o relógio vem do payload; no V2 o consumidor o recompõe de
+  // `mensagens.created_at` e o deposita em `facts` assim que resolve o escopo.
+  // A caixa vence o payload porque um job V2 simplesmente não tem o campo — e
+  // ler `job.data.received_at_ms` num payload V2 devolveria `undefined`,
+  // apagando em silêncio o SLI ponta-a-ponta do caminho novo.
+  const received_at_ms =
+    facts.received_at_ms ?? ((job.data as AgentJob).received_at_ms ?? null);
+  if (typeof received_at_ms === 'number') {
+    const e2e = Date.now() - received_at_ms;
     if (e2e >= 0) histogram(METRIC.TURN_E2E_LATENCY_MS, e2e, { outcome });
+  }
+}
+
+/**
+ * Issue #504 — o preço do `jobId` determinístico, e como ele é pago.
+ *
+ * A BullMQ ignora `add` quando já existe um job com aquele id, e a retenção
+ * desta fila mantém jobs `completed` por 24h e `failed` por 7 dias. Isso é o
+ * que se quer enquanto o job está VIVO (waiting/active/delayed = "já tem
+ * alguém cuidando disto"), e é um bloqueio ilegítimo depois que ele terminou:
+ * um turno que voltou a ser elegível — retry com backoff vencido, replay manual
+ * de dead letter, takeover de lease — não conseguiria ser rearmado até a
+ * retenção expirar. É o risco que a própria issue lista ("Retenção da BullMQ
+ * pode conflitar com jobId determinístico").
+ *
+ * A resolução é assimétrica de propósito:
+ *   - job em estado TERMINAL (`completed`/`failed`): removido, o rearme segue;
+ *   - job VIVO: intocado, e o `add` seguinte é ignorado pela BullMQ — que é
+ *     exatamente a deduplicação desejada.
+ *
+ * Quem decide se o trabalho ainda vale continua sendo o PostgreSQL: aqui só se
+ * remove o CADÁVER de um job para que o transporte não vete uma decisão que já
+ * foi tomada no banco.
+ *
+ * Nunca lança: se a inspeção falhar, seguimos para o `add`. No pior caso o
+ * `add` é ignorado e o sweep tenta de novo no próximo tick — perde-se latência
+ * de recuperação, nunca correção.
+ */
+async function clearRetainedTurnJob(jobId: string): Promise<void> {
+  try {
+    const existing = await agentQueue.getJob(jobId);
+    if (!existing) return;
+    const state = await existing.getState();
+    if (state !== 'completed' && state !== 'failed') return;
+    await existing.remove();
+    incCounter('maia_turn_job_retained_cleared_total', { state });
+    logger.info({ job_id: jobId, state }, 'queue.turn_job_retained_cleared');
+  } catch (err) {
+    logger.warn(
+      { job_id: jobId, err: (err as Error).message },
+      'queue.turn_job_retained_clear_failed',
+    );
   }
 }
 
@@ -272,12 +476,35 @@ export class QueueRedisUnavailableError extends Error {
  */
 export async function enqueueAgent(data: AgentJob): Promise<void> {
   try {
+    // Issue #504 — `jobId` DETERMINÍSTICO quando o produtor conhece o turno.
+    // Dois enfileiramentos do mesmo turno (ingresso + recovery, ou duas
+    // réplicas do recovery) colidem no mesmo id e a BullMQ cria UM job.
+    const jobId = data.turn_id ? agentTurnJobId(data.turn_id) : undefined;
+    if (jobId) await clearRetainedTurnJob(jobId);
+    // Issue #504 §Contrato do job, passo 5 do rollout — o PRODUTOR V2.
+    //
+    // Só quando a flag está ligada E o turno é conhecido. As duas condições são
+    // necessárias: sem `turn_id` não há identidade durável a transportar, e um
+    // V2 armado antes de todas as réplicas de consumo entenderem V2 seria um
+    // job que nenhum worker antigo consegue processar (ele procuraria
+    // `mensagem_id` e falharia). É por isso que a flag existe e nasce OFF — o
+    // consumidor precede o produtor, sempre.
+    //
+    // O payload é EXATAMENTE `{version, turn_id}`. Nada de tenant, nada de
+    // correlação, nada de conteúdo: o worker redescobre tudo no PostgreSQL,
+    // depois de reconciliar o escopo. Carregar tenant aqui seria aceitar um
+    // escopo que ninguém verificou contra a linha persistida.
     // Issue #514 §1 — stamp the correlation fields onto the payload. An
     // explicit `trace_id` from the caller always wins (the recovery sweep and
     // the unrouted replay both re-enqueue an existing turn); otherwise the id
     // is DERIVED from `mensagem_id`, so re-enqueueing the same row always
     // lands on the same root trace.
-    await agentQueue.add('process-message', withCorrelation(data), {
+    const payload: AgentQueuePayload =
+      config.FEATURE_TURN_JOB_V2 && data.turn_id
+        ? { version: 2, turn_id: data.turn_id.toLowerCase() }
+        : withCorrelation(data);
+    await agentQueue.add('process-message', payload, {
+      ...(jobId ? { jobId } : {}),
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },
     });
@@ -373,6 +600,141 @@ export async function enqueueUnroutedReplay(args: {
   );
 }
 
+// ─── #633 (fatia D da épica #506) — a fila de ENTREGA do outbox durável ────
+//
+// O que ela transporta é UM `outbound_id` (`OutboundDeliveryJobSchema`, #632).
+// Nada de tenant, telefone, texto ou canal: o consumidor redescobre tudo no
+// PostgreSQL depois de reivindicar a linha. Carregar tenant no payload seria
+// aceitar um escopo que ninguém reconciliou com a row persistida — e aqui seria
+// pior que na fila `agent`, porque o payload atravessa o Redis.
+//
+// O `jobId` é DETERMINÍSTICO por `outbound_id` (`outboundDeliveryJobId`), então
+// commit, varredura de recuperação e rearmamento manual COLIDEM num job só. A
+// colisão não é a garantia sozinha — jobs armados antes deste deploy, ou um job
+// já removido e re-adicionado, ainda produzem concorrência real. O que fecha é
+// o claim atômico com lease de #632. As duas camadas são independentes de
+// propósito.
+//
+// Retenção: `removeOnFail: { count: 0 }`, o mesmo desenho de `unrouted-replay`
+// e pela mesma razão — a ROW do outbox é o registro durável, e um job `failed`
+// RETIDO com o mesmo id bloquearia o `add` do próximo tick da varredura. É
+// exatamente o risco "job retido bloqueia rearmamento legítimo" que #504
+// documentou; aqui ele é resolvido nas DUAS pontas (retenção curta + limpeza
+// explícita em `enqueueOutboundDelivery`).
+
+export const outboundDeliveryQueue = new Queue<OutboundDeliveryJob>('outbound-delivery', {
+  connection,
+});
+
+let outboundDeliveryWorker: Worker<OutboundDeliveryJob> | null = null;
+
+/**
+ * Registra o CONSUMIDOR da fila de entrega. Idempotente.
+ *
+ * O processor recebe o `outbound_id` já validado — um payload irreconhecível
+ * NÃO derruba o worker nem chega ao consumidor: vira métrica e job descartado,
+ * pela mesma razão de #504 (um job envenenado não pode parar a fila inteira).
+ *
+ * `concurrency` vem do chamador porque o custo de uma entrega é uma chamada de
+ * rede ao provedor, não CPU; o teto real é a sessão do WhatsApp, que é
+ * compartilhada.
+ */
+export function startOutboundDeliveryWorker(
+  processor: (outbound_id: string, job: Job<OutboundDeliveryJob>) => Promise<void>,
+  opts?: { concurrency?: number },
+): Worker<OutboundDeliveryJob> {
+  if (outboundDeliveryWorker) return outboundDeliveryWorker;
+  outboundDeliveryWorker = new Worker<OutboundDeliveryJob>(
+    'outbound-delivery',
+    async (job, token) => {
+      await deferIfNotAcceptingWork(job, token, 'outbound-delivery');
+      const parsed = parseOutboundDeliveryJob(job.data);
+      if (parsed.kind === 'invalid') {
+        // A mensagem carrega o CAMINHO do campo, nunca o valor: o payload de um
+        // job malformado pode conter qualquer coisa que alguém tenha enfiado
+        // nele, inclusive conteúdo de conversa.
+        counter(METRIC.OUTBOUND_DELIVERY_CLAIM, { result: 'not_found' });
+        logger.error(
+          { job_id: job.id, issue: parsed.issue, ops_alert: true },
+          'outbound_delivery.job_payload_invalid',
+        );
+        return;
+      }
+      // `runWithSystemContext` pelo mesmo motivo do worker `agent` (#369): a
+      // janela ANTES da resolução do escopo nunca roda sem contexto. O escopo
+      // real é aberto pelo consumidor, a partir da row.
+      await runWithSystemContext(() => processor(parsed.outbound_id, job));
+    },
+    {
+      connection,
+      concurrency: opts?.concurrency ?? 4,
+      removeOnComplete: { age: 86_400 },
+      removeOnFail: { count: 0 },
+    },
+  );
+  outboundDeliveryWorker.on('failed', (job, err) => {
+    logger.warn(
+      { job_id: job?.id, err: err?.message },
+      'outbound_delivery.job_failed_will_be_rearmed_by_sweep',
+    );
+  });
+  return outboundDeliveryWorker;
+}
+
+/**
+ * Arma (ou re-arma) o job de entrega de UMA linha do outbox. Idempotente pelo
+ * `jobId` determinístico.
+ *
+ * ─── Por que a limpeza do job retido vem ANTES do `add` ─────────────────────
+ *
+ * A BullMQ ignora o `add` quando já existe job com aquele id — inclusive um
+ * job já `completed` ou `failed` que a retenção ainda não removeu. Sem a
+ * limpeza, uma linha cuja primeira entrega falhou ficaria com o cadáver do job
+ * ocupando o id e NENHUM tick da varredura conseguiria rearmá-la: a linha
+ * ficaria `retryable` para sempre, sem ninguém a consumir.
+ *
+ * Quem decide se o trabalho ainda vale continua sendo o PostgreSQL — aqui só se
+ * remove o cadáver para que o transporte não vete uma decisão já tomada no
+ * banco. É o mesmo movimento de `clearRetainedTurnJob` (#504), e a razão de ele
+ * existir nos dois lugares é a mesma.
+ *
+ * Um job em `waiting`/`active`/`delayed` NÃO é removido: ele é trabalho vivo, e
+ * removê-lo para "rearmar" seria cancelar uma entrega possivelmente em voo.
+ * Nesse caso o `add` é ignorado — que é exatamente o comportamento desejado.
+ *
+ * Nunca lança por falha de inspeção: no pior caso o `add` é ignorado e o
+ * próximo tick tenta de novo. Perde-se latência de recuperação, nunca correção.
+ */
+export async function enqueueOutboundDelivery(outbound_id: string): Promise<void> {
+  const jobId = outboundDeliveryJobId(outbound_id);
+  await clearRetainedOutboundJob(jobId);
+  await outboundDeliveryQueue.add('deliver', buildOutboundDeliveryJob(outbound_id), {
+    jobId,
+    // Poucas tentativas de TRANSPORTE de propósito: o retry que importa é o do
+    // PostgreSQL (`next_attempt_at` + `attempt`), que sobrevive ao processo e
+    // ao Redis. Três tentativas cobrem um blip; o resto é da varredura.
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5_000 },
+  });
+}
+
+async function clearRetainedOutboundJob(jobId: string): Promise<void> {
+  try {
+    const existing = await outboundDeliveryQueue.getJob(jobId);
+    if (!existing) return;
+    const state = await existing.getState();
+    if (state !== 'completed' && state !== 'failed') return;
+    await existing.remove();
+    incCounter('maia_outbound_job_retained_cleared_total', { state });
+    logger.info({ job_id: jobId, state }, 'outbound_delivery.job_retained_cleared');
+  } catch (err) {
+    logger.warn(
+      { job_id: jobId, err: (err as Error).message },
+      'outbound_delivery.job_retained_clear_failed',
+    );
+  }
+}
+
 /**
  * Stop CONSUMING, immediately — issue #512 review round 1 (P1 on
  * `src/index.ts:260`). This is the first atomic move of the shutdown, well
@@ -389,8 +751,13 @@ export async function enqueueUnroutedReplay(args: {
 export async function pauseQueueWorkers(): Promise<void> {
   await worker?.pause(true);
   await unroutedWorker?.pause(true);
+  await outboundDeliveryWorker?.pause(true);
   logger.info(
-    { agent_paused: worker?.isPaused() ?? null, unrouted_paused: unroutedWorker?.isPaused() ?? null },
+    {
+      agent_paused: worker?.isPaused() ?? null,
+      unrouted_paused: unroutedWorker?.isPaused() ?? null,
+      outbound_delivery_paused: outboundDeliveryWorker?.isPaused() ?? null,
+    },
     'queue.workers_paused',
   );
 }
@@ -411,9 +778,11 @@ export async function pauseQueueWorkers(): Promise<void> {
 export async function awaitQueueReady(opts?: { includeWorkers?: boolean }): Promise<void> {
   await agentQueue.waitUntilReady();
   await unroutedQueue.waitUntilReady();
+  await outboundDeliveryQueue.waitUntilReady();
   if (opts?.includeWorkers === false) return;
   await worker?.waitUntilReady();
   await unroutedWorker?.waitUntilReady();
+  await outboundDeliveryWorker?.waitUntilReady();
 }
 
 /**
@@ -432,9 +801,12 @@ export async function awaitQueueReady(opts?: { includeWorkers?: boolean }): Prom
 export async function shutdownQueue(): Promise<void> {
   await worker?.close();
   await unroutedWorker?.close();
+  await outboundDeliveryWorker?.close();
   worker = null;
   unroutedWorker = null;
+  outboundDeliveryWorker = null;
   await agentQueue.close().catch(() => undefined);
   await unroutedQueue.close().catch(() => undefined);
+  await outboundDeliveryQueue.close().catch(() => undefined);
   if (connection.status !== 'end') await connection.quit().catch(() => undefined);
 }

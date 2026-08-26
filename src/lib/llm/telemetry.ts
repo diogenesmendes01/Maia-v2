@@ -22,6 +22,7 @@ import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import { logger } from '@/lib/logger.js';
 import { recordLLMCost } from '@/lib/cost-ledger.js';
 import { tryGetCurrentContext } from '@/db/tenant-context.js';
+import { recordLlmRequestSpan } from '@/observability/instrumentation.js';
 import type { LLMErrorKind } from './errors.js';
 import type { LLMTier, LLMUsage, LLMWorkload } from './types.js';
 
@@ -31,7 +32,13 @@ export type LLMCallStatus =
   | 'timeout'
   | 'rate_limit'
   | 'cancelled'
-  | 'budget_exhausted';
+  | 'budget_exhausted'
+  /**
+   * Recusa do disjuntor (issue #534). Status próprio para que carga
+   * DERRUBADA por nós não se confunda com erro do provider no dashboard: a
+   * primeira é a proteção funcionando, a segunda é o incidente.
+   */
+  | 'circuit_open';
 
 /** Mapeia o kind do erro para o status observável (label Prometheus). */
 export function statusForKind(kind: LLMErrorKind): LLMCallStatus {
@@ -44,6 +51,8 @@ export function statusForKind(kind: LLMErrorKind): LLMCallStatus {
       return 'rate_limit';
     case 'budget_exhausted':
       return 'budget_exhausted';
+    case 'circuit_open':
+      return 'circuit_open';
     default:
       return 'error';
   }
@@ -82,6 +91,8 @@ export function currentScope(): LLMScope {
  * issue: "falha de telemetria não pode esconder a chamada").
  */
 export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<void> {
+  const observedAt = Date.now();
+
   // Issue #508 (review rodada 1): o escopo entra em TODAS as emissões
   // tenant-aware, não só em `requests_total`. Antes, duração, timeout,
   // cancelamento, fallback, tokens e attempts agregavam tenants — um tenant
@@ -164,6 +175,30 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
     incCounter('maia_llm_telemetry_failures_total', { stage: 'metrics' });
     logger.warn({ err: (err as Error).message }, 'llm_gateway.metrics_failed');
   }
+
+  // Issue #535 §1 — o span `llm.request`, no MESMO ponto único de emissão.
+  //
+  // Fica aqui e não em `executeLLM` porque é aqui que a invariante "todo
+  // desfecho passa por um ponto só" já existe (issue #508): amarrar o span aos
+  // seis `return`/`throw` do gateway seria reabrir exatamente a lacuna que
+  // aquela issue fechou para as métricas — e o próximo desfecho a ser
+  // adicionado nasceria sem span.
+  //
+  // SEM try/catch por decisão: `recordElapsedSpan` já é fail-soft por contrato
+  // (todo o corpo roda dentro de `safely()`), e o ÚNICO caminho em que ele
+  // lança é `MAIA_STRICT_METRIC_LABELS=true`, que só a suíte liga justamente
+  // para que uma regressão de PII reprove um teste em vez de vazar. Uma rede
+  // aqui engoliria esse sinal e deixaria o portão de atributo sem dente.
+  recordLlmRequestSpan({
+    duration_ms: event.duration_ms,
+    status: event.status,
+    provider: event.provider,
+    model: event.model,
+    tier: event.tier,
+    workload: event.workload,
+    attempts: event.attempts,
+    observed_at_ms: observedAt,
+  });
 
   // Log estruturado — SEM prompt, SEM resposta, SEM chave. É a evidência que
   // a #514 vai correlacionar com o trace do turno.

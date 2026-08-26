@@ -29,12 +29,46 @@ import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
+import type { LeaseLossReason, StreamBlockRecord } from './claim.js';
 import {
   COMPLETED_WITHOUT_REPLY_OUTCOMES,
   sanitizeTurnError,
   type TurnOutcome,
   type TurnStatus,
 } from './contract.js';
+import {
+  acquireTurnLease,
+  reportFenceRejection,
+  turnClaimEnabled,
+  type TurnLease,
+} from './lease.js';
+
+// #626 — a fachada reexporta o relator de violação de FIFO porque quem o chama
+// não é só o claim: o varredor de recovery (`src/workers/message-recovery.ts`)
+// tem um canário próprio, e a regra da fachada é "importe sempre de
+// `@/runtime/turns/index.js`".
+export { reportStreamFifoViolation } from './lease.js';
+// #627 (fatia D da #505) — o SINAL da promoção. Módulo à parte porque ele é
+// quem alcança a BullMQ (por `await import`, para não arrastar a conexão Redis
+// de `@/gateway/queue.js` para dentro de todo processo que carrega a máquina de
+// estados); ver o cabeçalho de `stream-promotion.ts`.
+import {
+  noteNoSuccessor,
+  reportPromotionFenceRejected,
+  signalStreamPromotion,
+} from './stream-promotion.js';
+// #629 (fatia F da #505) — a POLÍTICA de poison/DLQ. Módulo PURO: a decisão
+// ("bloquear ou liberar") é uma função de (código, outcome, conjunto
+// configurado), e o conjunto entra como parâmetro. Quem LÊ a configuração é
+// esta fachada, porque é aqui que `@/config/env.js` já mora — o repositório,
+// que EXECUTA o bloqueio, continua sem alcançá-lo (#596).
+import {
+  classifyPoison,
+  parsePoisonBlockCategories,
+  poisonDisposition,
+  type PoisonCategory,
+} from './poison-policy.js';
+import { recordPoisonDecision } from './stream-metrics.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -43,7 +77,135 @@ export type TurnHandle = {
   state_version: number;
   attempt_count: number;
   conversa_id: string | null;
+  /**
+   * #504 — a POSSE desta tentativa, quando `FEATURE_TURN_CLAIM` está ligada.
+   *
+   * Vive no handle, e não numa variável de `core.ts`, porque o handle já é o
+   * objeto que atravessa todo o turno: pendurar a lease nele é o que permite
+   * que CADA transição terminal encontre o token sem que ninguém precise
+   * lembrar de passá-lo adiante. `null` no caminho legado, e `null` quando o
+   * claim não foi concedido (aí o turno não deve nem começar).
+   */
+  lease?: TurnLease | null;
 };
+
+/**
+ * A POSSE de um turno tem TRÊS estados, não dois — e confundir dois deles é o
+ * que transforma o fail-closed em fail-open.
+ *
+ *   `unfenced` — não há lease nenhuma. É o regime de #503
+ *     (`FEATURE_TURN_CLAIM` OFF) ou um handle que nunca passou pelo claim. Não
+ *     há token a exigir, e as gravações seguem sem `expected_claim_token`
+ *     exatamente como antes desta issue. É o que faz a flag ser um kill switch
+ *     de verdade.
+ *
+ *   `fenced` — a lease existe e está VIVA até onde este processo sabe. Toda
+ *     gravação leva o `claim_token` no WHERE.
+ *
+ *   `lost` — a lease EXISTIU e não está mais viva: `markLost()` (heartbeat
+ *     morto, fence recusado) ou `release()` (shutdown gracioso). Este é o
+ *     estado que a versão anterior colapsava com `unfenced`, porque
+ *     `lease.token` devolve `null` depois da perda e o `fenceToken()` anterior
+ *     traduzia `null` para `{}`.
+ *
+ * O colapso não era cosmético. Sem `expected_claim_token`, `transitionTurn`
+ * não aplica predicado nenhum de posse: sobra o CAS por `state_version`. Basta
+ * o `state_version` não ter andado — o banco voltou depois de um blip de
+ * heartbeat, ou alguém concluiu depois de `release()` — para o worker que JÁ
+ * SABE que perdeu a posse gravar assim mesmo, e gravar como se fosse dono.
+ * Ou seja: o caminho que detecta a perda era o mesmo que a tornava inofensiva.
+ *
+ * Aqui `lost` é um estado próprio, e quem o recebe NÃO escreve.
+ */
+type TurnFence =
+  | { kind: 'unfenced' }
+  | { kind: 'fenced'; expected_claim_token: string }
+  | { kind: 'lost'; reason: LeaseLossReason };
+
+function resolveFence(handle: TurnHandle): TurnFence {
+  const lease = handle.lease;
+  // Sem lease: feature desligada, ou handle que nunca reivindicou. Regime #503.
+  if (!lease) return { kind: 'unfenced' };
+  const token = lease.token;
+  // `token === null` <=> `!lease.alive` (ver `TurnLease.token`). Lemos os dois
+  // porque é o par que dá a RAZÃO, e a razão vai para a métrica e a auditoria.
+  if (token === null) return { kind: 'lost', reason: lease.lostReason ?? 'expired' };
+  return { kind: 'fenced', expected_claim_token: token };
+}
+
+/** Argumento de fence para o repositório. Só o estado `fenced` produz token. */
+function fenceArgs(fence: TurnFence): { expected_claim_token?: string } {
+  return fence.kind === 'fenced' ? { expected_claim_token: fence.expected_claim_token } : {};
+}
+
+/**
+ * A tentativa local perdeu a posse ANTES de tentar gravar — cancelamento local,
+ * sem ida ao banco.
+ *
+ * É deliberadamente o MESMO desfecho de uma rejeição vinda do banco
+ * (`handleStaleClaim`): mesma métrica, mesmo log, mesma auditoria. Um operador
+ * que investiga "por que este turno não concluiu" não deveria precisar saber se
+ * quem recusou foi o predicado SQL ou o guard em memória — o fato é o mesmo, e
+ * o fato é "uma escrita desta tentativa foi recusada pelo fence".
+ *
+ * A alternativa — deixar passar sem fence — é o defeito. A outra alternativa —
+ * gravar COM o token morto e deixar o banco recusar — funcionaria hoje, mas
+ * depende de a lease do sucessor já estar registrada; entre a perda e o
+ * takeover existe uma janela em que o token antigo ainda é o vigente no banco,
+ * e nela a escrita passaria.
+ */
+async function refuseLostOwnership(
+  handle: TurnHandle,
+  operation: string,
+  reason: LeaseLossReason,
+): Promise<void> {
+  logger.warn(
+    {
+      turn_id: handle.turn_id,
+      operation,
+      attempt: handle.attempt_count,
+      from_status: handle.status,
+      reason,
+    },
+    'turn.write_refused_lease_not_alive',
+  );
+  await reportFenceRejection({
+    turn_id: handle.turn_id,
+    operation,
+    attempt: handle.attempt_count,
+    current_status: handle.status,
+  });
+}
+
+/**
+ * Reage a uma transição recusada pelo FENCE.
+ *
+ * Uma única porta para os cinco pontos de conclusão do turno. A reação é sempre
+ * a mesma e é sempre TERMINAR a tentativa local: cancelamos a lease (para que o
+ * heartbeat pare de renovar algo que não é mais nosso) e registramos a
+ * rejeição. Deliberadamente NÃO tentamos "consertar" reescrevendo sem o fence —
+ * a issue proíbe, e com razão: sobrescrever o ownership atual é reintroduzir a
+ * execução dupla no exato caminho que a detectou.
+ */
+async function handleStaleClaim(
+  handle: TurnHandle,
+  result: TurnTransitionResult,
+  operation: string,
+): Promise<boolean> {
+  if (result.ok || result.conflict !== 'stale_claim') return false;
+  // CANCELA a tentativa local, não apenas o timer: o banco acabou de responder
+  // que não somos mais donos, então o `AbortSignal` tem de disparar AGORA. Só
+  // parar o heartbeat deixaria o pipeline seguir trabalhando — chamando LLM,
+  // executando tool — em nome de uma posse que já acabou.
+  handle.lease?.markLost('token_mismatch');
+  await reportFenceRejection({
+    turn_id: handle.turn_id,
+    operation,
+    attempt: handle.attempt_count,
+    current_status: result.current_status,
+  });
+  return true;
+}
 
 /** Dual-write ligado? (escrita da máquina de estados) */
 export function turnStateMachineEnabled(): boolean {
@@ -212,20 +374,74 @@ export async function noteTurnEnqueueFailed(
   logger.warn({ turn_id: handle.turn_id, error_code: code }, 'turn.enqueue_failed');
 }
 
+/** Por que a execução não pôde começar. `started: true` é a única autorização. */
+export type TurnExecutionStart =
+  | { started: true }
+  /** Outro worker tem a posse (ou o turno não está elegível). NÃO é erro. */
+  | { started: false; reason: 'not_claimed' }
+  /**
+   * #625 — a STREAM está ocupada por outro turno ativo. O banco recusou o
+   * segundo claim.
+   *
+   * Separado de `not_claimed` porque o diagnóstico é outro: `not_claimed` diz
+   * "este turno não é meu", `stream_busy` diz "esta CONVERSA está ocupada".
+   * Colapsar os dois apagaria justamente o sinal que a issue-mãe manda vigiar
+   * durante o rollout — uma stream que serializa aparece como `stream_busy` em
+   * massa, e como nada em particular se o motivo virasse `not_claimed`.
+   */
+  | { started: false; reason: 'stream_busy' }
+  /**
+   * #626 — a conversa tem FILA: existe turno anterior não terminal na mesma
+   * stream. Distinto de `stream_busy` (a conversa está OCUPADA por um turno com
+   * lease viva) e de `not_claimed` (o TURNO não está elegível) — as três param
+   * a execução, e só a leitura difere: `not_head` é normal e some quando o
+   * anterior avança.
+   */
+  | { started: false; reason: 'not_head' }
+  /**
+   * #626 — o turno anterior está em `outbound_pending` e NENHUM claim o move.
+   * Quem destrava é o delivery worker do outbox (#506); esperar não resolve, e
+   * é por isso que ele não é `not_head`.
+   */
+  | { started: false; reason: 'stream_blocked' }
+  /**
+   * #629 — a CONVERSA está interditada por política de poison, e nenhum
+   * mecanismo automático a destrava: nem o varredor, nem a promoção, nem o
+   * tempo. Só `npm run dlq -- unblock`, que é operação auditada.
+   *
+   * É a recusa que mais precisa de nome próprio: `not_head` e `stream_busy`
+   * somem sozinhos quando o head anda, e esta não some nunca sem um humano.
+   */
+  | { started: false; reason: 'stream_poisoned' }
+  /** Perdemos a posse entre o claim e o `running`. */
+  | { started: false; reason: 'stale_claim' }
+  /** O estado andou por baixo de nós — alguém concluiu, absorveu ou matou o turno. */
+  | { started: false; reason: 'state_conflict' };
+
 /**
- * Marca o início da execução (`-> claimed -> running`).
+ * Toma a POSSE do turno e marca o início da execução.
  *
- * NÃO é um claim distribuído: nesta issue a máquina de estados registra que a
- * execução começou, mas NÃO decide quem executa — dois workers ainda podem
- * entrar no mesmo turno. O claim atômico com lease e fencing é #504, que
- * substitui o miolo daqui preservando esta assinatura. Por isso um conflito
- * aqui NUNCA aborta o turno: seria uma falsa sensação de exclusão mútua.
+ * Dois regimes, escolhidos por `FEATURE_TURN_CLAIM`:
+ *
+ * **ON (#504).** `claimNextEligibleTurn` é a autoridade: uma declaração SQL atômica
+ * decide o dono, incrementa a tentativa canônica, gera o `claim_token` e abre a
+ * lease. `started: false` significa **não processe** — e é a primeira vez nesta
+ * máquina de estados em que um "não" aqui de fato barra a execução. Note que o
+ * claim aceita `retryable` diretamente: o passo `retryable -> queued` do regime
+ * legado existia só para satisfazer a tabela de transições, e o claim tem
+ * predicado próprio (ver `src/runtime/turns/claim.ts`).
+ *
+ * **OFF (#503).** Comportamento preservado byte a byte: registra que a execução
+ * começou e nunca barra ninguém. Não é exclusão mútua e nunca foi — por isso um
+ * conflito aqui continua não abortando o turno, o que seria falsa sensação de
+ * segurança.
  */
 export async function beginTurnExecution(
   handle: TurnHandle | null,
   args: { conversa_id?: string | null; channel_id?: string | null } = {},
-): Promise<void> {
-  if (!handle || !turnStateMachineEnabled()) return;
+): Promise<TurnExecutionStart> {
+  if (!handle || !turnStateMachineEnabled()) return { started: true };
+  if (turnClaimEnabled()) return beginClaimedExecution(handle, args);
   await guarded('begin_execution', async () => {
     // Reentrada de um turno em RETRY. O recovery normalmente já fez
     // `retryable -> queued` ao rearmar, mas um retry do próprio BullMQ chega
@@ -264,6 +480,97 @@ export async function beginTurnExecution(
       );
     }
   });
+  return { started: true };
+}
+
+/**
+ * O caminho de #504: claim atômico + lease + `running` já fenced.
+ *
+ * A ordem é a que importa e não é intercambiável:
+ *   1. **claim** — só depois de vencer a corrida no PostgreSQL existe uma
+ *      tentativa autorizada. Todo o resto pende disto;
+ *   2. **lease** — o heartbeat começa imediatamente, ANTES de `running`, para
+ *      que nem essa janela fique sem renovação;
+ *   3. **running fenced** — a primeira gravação da tentativa já exige o token.
+ *      Se ela for recusada aqui, perdemos a posse em milissegundos (takeover
+ *      por lease de uma encarnação anterior, tipicamente) e paramos antes de
+ *      qualquer efeito.
+ *
+ * `guarded` NÃO envolve o claim: a política de falha de #503 (fail-soft em
+ * shadow) diria "siga em frente" a um claim que não pôde ser lido, e seguir em
+ * frente sem posse é precisamente o defeito. Uma falha de infraestrutura aqui
+ * vira `not_claimed`, e o turno continua elegível para o próximo tick.
+ */
+async function beginClaimedExecution(
+  handle: TurnHandle,
+  args: { conversa_id?: string | null; channel_id?: string | null },
+): Promise<TurnExecutionStart> {
+  let acquired: Awaited<ReturnType<typeof acquireTurnLease>>;
+  try {
+    acquired = await acquireTurnLease(handle.turn_id);
+  } catch (err) {
+    const { code } = sanitizeTurnError({ error: err });
+    incCounter('maia_turn_state_errors_total', { op: 'claim', error_code: code });
+    logger.error({ turn_id: handle.turn_id, error_code: code }, 'turn.claim_failed');
+    return { started: false, reason: 'not_claimed' };
+  }
+  if (!acquired.lease) {
+    // As recusas por STREAM chegam ao caller com o nome delas. Colapsá-las em
+    // `not_claimed` apagaria, no log de `src/agent/core.ts`, a diferença entre
+    // "outro worker pegou este turno" e "esta conversa tem fila" — e é a
+    // segunda que explica por que uma conversa inteira parou.
+    // #629 acrescentou `stream_poisoned`, e ele é o que MAIS precisa chegar
+    // ao caller: `not_head` e `stream_busy` somem sozinhos quando o head anda,
+    // e `stream_poisoned` não some nunca sem um humano. Colapsá-lo em
+    // `not_claimed` faria a única recusa que exige operação parecer a mais
+    // rotineira de todas.
+    const streamReasons = [
+      'stream_busy',
+      'not_head',
+      'stream_blocked',
+      'stream_poisoned',
+    ] as const;
+    const rejeicao = acquired.result.ok === false ? acquired.result.reason : null;
+    const porStream = streamReasons.find((r) => r === rejeicao);
+    return { started: false, reason: porStream ?? 'not_claimed' };
+  }
+
+  const lease = acquired.lease;
+  handle.lease = lease;
+  handle.status = lease.claim.status;
+  handle.state_version = lease.claim.state_version;
+  handle.attempt_count = lease.claim.attempt;
+
+  // A lease acabou de nascer, então o normal aqui é `fenced`. `lost` é possível
+  // e não é teórico: o primeiro heartbeat pode bater entre o claim e esta linha
+  // e descobrir que uma encarnação anterior nossa já foi substituída. Nesse caso
+  // NÃO gravamos — nem com fence, nem sem.
+  const fence = resolveFence(handle);
+  if (fence.kind === 'lost') {
+    await refuseLostOwnership(handle, 'mark_running', fence.reason);
+    return { started: false, reason: 'stale_claim' };
+  }
+  const result = await agentTurnsRepo.markRunning({
+    turn_id: handle.turn_id,
+    expected_version: handle.state_version,
+    // A tentativa canônica JÁ foi contada pelo claim. Contar de novo aqui
+    // esgotaria `MAX_TURN_ATTEMPTS` na metade das tentativas reais.
+    bump_attempt: false,
+    ...fenceArgs(fence),
+    ...(args.conversa_id !== undefined ? { conversa_id: args.conversa_id } : {}),
+    ...(args.channel_id !== undefined ? { channel_id: args.channel_id } : {}),
+  });
+  if (await handleStaleClaim(handle, result, 'mark_running')) {
+    return { started: false, reason: 'stale_claim' };
+  }
+  if (!applyResult(handle, result)) {
+    // Não é perda de posse: o estado andou por baixo de nós (absorvido pelo
+    // debounce, cancelado por operador). Devolvemos a posse já, para não
+    // segurar por um TTL um turno que não vamos executar.
+    await lease.release();
+    return { started: false, reason: 'state_conflict' };
+  }
+  return { started: true };
 }
 
 /**
@@ -284,6 +591,28 @@ export async function beginTurnExecution(
  * A associação DEFINITIVA (um turno por rajada, decidido no ingresso) é
  * fechada em #505 — aqui o objetivo é que a rajada produza UM turno executável
  * e nenhum turno órfão executável.
+ *
+ * ─── O FENCE PERTENCE A QUEM ABSORVE (#504, decisão do dono) ────────────────
+ *
+ * Absorver é uma gravação com DUAS linhas: a que muda (o irmão) e a que
+ * autoriza (este turno). A posse exigida é a DESTE turno — o irmão
+ * normalmente nunca foi reivindicado, porque quem foi reivindicado foi o
+ * executor da rajada, e exigir claim dele tornaria a absorção legítima
+ * impossível no caso comum.
+ *
+ * Duas camadas, e as duas são necessárias:
+ *
+ *  1. AQUI, em memória: se esta tentativa já SABE que perdeu a lease
+ *     (heartbeat morto, `release()` do shutdown), não escrevemos nada — nem a
+ *     supersessão do irmão, nem o `attachInputTx` das irmãs sem turno. Entre a
+ *     perda e o takeover existe uma janela em que o token antigo ainda é o
+ *     vigente no banco, e nela o predicado SQL sozinho aprovaria a escrita.
+ *  2. NO BANCO, via `absorber_claim_token`: um zumbi que ainda NÃO percebeu a
+ *     perda passa pelo guard local e é recusado pelo `EXISTS` que exige token
+ *     vigente E `lease_expires_at > now()` deste turno.
+ *
+ * A posse é reavaliada a CADA irmã: a rajada pode ser longa e a lease pode
+ * morrer no meio dela.
  */
 export async function absorbDebounceInputs(
   handle: TurnHandle | null,
@@ -293,6 +622,11 @@ export async function absorbDebounceInputs(
   await guarded('absorb_inputs', async () => {
     let seq = 1;
     for (const mensagem_id of mensagem_ids) {
+      const fence = resolveFence(handle);
+      if (fence.kind === 'lost') {
+        await refuseLostOwnership(handle, 'absorb_inputs', fence.reason);
+        return;
+      }
       const sibling = await agentTurnsRepo.findTurnByMessage(mensagem_id);
       if (!sibling) {
         await agentTurnsRepo.attachInputTx({
@@ -303,18 +637,82 @@ export async function absorbDebounceInputs(
         continue;
       }
       if (sibling.id === handle.turn_id) continue;
-      const result = await agentTurnsRepo.markSuperseded({
+      const result = await agentTurnsRepo.markSupersededByAbsorber({
         turn_id: sibling.id,
         absorbed_by_turn_id: handle.turn_id,
+        // O CAS do IRMÃO: é ele que decide a corrida entre duas absorções
+        // concorrentes. O fence acima diz "posso absorver"; este diz "este
+        // irmão ainda está no estado que eu li".
         expected_version: Number(sibling.state_version),
+        ...(fence.kind === 'fenced'
+          ? { absorber_claim_token: fence.expected_claim_token }
+          : {}),
       });
+      // `stale_claim` aqui significa que a posse DESTE turno acabou — não que o
+      // irmão andou. Parar a rajada inteira é a única reação correta: as
+      // próximas absorções seriam recusadas pelo mesmo motivo, e insistir é o
+      // comportamento de zumbi que o fence existe para impedir.
+      if (await handleStaleClaim(handle, result, 'absorb_inputs')) return;
       if (result.ok) {
         logger.debug(
           { turn_id: sibling.id, to_status: 'superseded', absorbed_by: handle.turn_id },
           'turn.transitioned',
         );
+        // #627 — `superseded` também é TERMINAL, então a transação do irmão
+        // pode ter promovido alguém. No caminho NORMAL não promove: o
+        // absorvedor está `running` e é ele o head, então a eleição não acha
+        // sucessor elegível. Só sinaliza quando houve promoção de verdade — e
+        // NÃO conta `no_successor` por irmão absorvido, que encheria o
+        // denominador da métrica com eventos de debounce e faria a razão
+        // `promoted/(promoted+no_successor)` medir rajada em vez de fila.
+        if (result.promotion) {
+          await signalStreamPromotion(result.promotion, {
+            source: 'terminal',
+            promoted_by_turn_id: sibling.id,
+          });
+        }
       }
     }
+    // #505 — o turno agregado passa a declarar o INTERVALO de ingressos que
+    // consumiu, não só o da mensagem representativa. Roda DEPOIS da absorção
+    // para que a fronteira reflita o batch já fechado. Só estende (LEAST/
+    // GREATEST) e só com ingressos da MESMA stream — ver
+    // `extendTurnStreamBoundaryTx`.
+    const extended = await agentTurnsRepo.extendTurnStreamBoundaryTx({
+      turn_id: handle.turn_id,
+      mensagem_ids,
+    });
+    if (extended) {
+      logger.debug(
+        { turn_id: handle.turn_id, absorbed: mensagem_ids.length },
+        'stream.turn_boundary_extended',
+      );
+    }
+  });
+}
+
+/**
+ * #627 — o turno acabou de chegar a TERMINAL. Sinaliza o sucessor que a
+ * transação já promoveu, ou registra que não havia quem promover.
+ *
+ * Roda DEPOIS de `applyResult`, isto é, depois de a transação ter comitado. A
+ * ordem é a exigência literal da issue ("persistir a decisão antes de sinalizar
+ * a BullMQ") e ela não depende de disciplina: `result.promotion` só existe
+ * porque o UPDATE da promoção já casou dentro da transação do CAS terminal —
+ * não há como chamar isto antes.
+ *
+ * NUNCA lança: ver `signalStreamPromotion`. Uma conclusão bem-sucedida não pode
+ * virar falha porque o Redis piscou.
+ */
+async function notePromotion(result: TurnTransitionResult): Promise<void> {
+  if (!result.ok) return;
+  if (!result.promotion) {
+    noteNoSuccessor();
+    return;
+  }
+  await signalStreamPromotion(result.promotion, {
+    source: 'terminal',
+    promoted_by_turn_id: result.turn.id,
   });
 }
 
@@ -334,24 +732,76 @@ export async function concludeTurn(
   if (!handle || !turnStateMachineEnabled()) return;
   await guarded('conclude', async () => {
     const from = handle.status;
+    // A lease morreu antes da conclusão (heartbeat perdido, `release()` do
+    // shutdown, ou um fence anterior desta mesma tentativa). Concluir agora é
+    // gravar sem posse — e é exatamente o cenário do worker lento que a issue
+    // fecha.
+    //
+    // `merged_into_turn` NÃO é exceção, e já foi. Aqui o turno declara a SI
+    // MESMO absorvido, então a gravação pertence a esta tentativa como
+    // qualquer outra e leva o fence do PRÓPRIO turno
+    // (`markSupersededSelf`). A absorção de um IRMÃO — onde o fence é do
+    // absorvedor e o irmão não precisa de claim — é outra operação, e mora em
+    // `absorbDebounceInputs`. Enquanto as duas eram a mesma chamada sem fence,
+    // esta porta era a única transição terminal que um worker sem posse
+    // conseguia atravessar, e `superseded` é terminal: o sucessor perdia o
+    // turno sem que nada aparecesse como conflito.
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      await refuseLostOwnership(handle, `conclude_${outcome}`, fence.reason);
+      // #627 — a conclusão recusada é uma PROMOÇÃO que deixou de acontecer, e
+      // esse é o fato que a issue manda auditar ("claim stale tentando promover
+      // sucessor é rejeitado, e a rejeição é auditada"). Sem esta linha, um
+      // zumbi barrado e uma stream sem sucessor produziriam o mesmo silêncio.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     const result =
       outcome === 'merged_into_turn'
-        ? await agentTurnsRepo.markSuperseded({
+        ? await agentTurnsRepo.markSupersededSelf({
             turn_id: handle.turn_id,
             expected_version: handle.state_version,
+            ...fenceArgs(fence),
           })
         : IGNORED_OUTCOMES.has(outcome)
           ? await agentTurnsRepo.markIgnored({
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fenceArgs(fence),
             })
           : await agentTurnsRepo.completeTurnTx({
               turn_id: handle.turn_id,
               outcome,
               expected_version: handle.state_version,
+              ...fenceArgs(fence),
             });
+    // O FENCE na conclusão é o ponto central da issue: um worker lento que
+    // perdeu a lease chega aqui com trabalho pronto e é RECUSADO. Sem isto ele
+    // marcaria `completed` por cima da tentativa do sucessor, e o usuário
+    // receberia duas respostas com o turno registrado como concluído uma vez.
+    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) {
+      // #627 — mesma leitura do ramo `lost` acima, com a recusa vindo do banco
+      // em vez do guard em memória. O fato operacional é o mesmo: a fila não
+      // andou porque quem tentou concluir já não era o dono.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
+    // Concluído: a posse morreu com o CAS (`clearClaim`), só resta o timer.
+    handle.lease?.stop();
+    // #627 — A FILA ANDA. A transação que concluiu este turno já elegeu e
+    // promoveu o sucessor; aqui só resta bater na BullMQ. DEPOIS do commit,
+    // nunca antes.
+    await notePromotion(result);
 
     if (IGNORED_OUTCOMES.has(outcome)) {
       await audit({
@@ -385,12 +835,57 @@ const IGNORED_OUTCOMES: ReadonlySet<TurnOutcome> = new Set<TurnOutcome>([
   'quarantined',
   'rate_limited_silent',
   'operator_cancelled',
+  'pending_race_lost',
 ]);
 
-/** Backoff exponencial com teto, em ms — 30s, 60s, 120s, … até 15min. */
+/** Teto do backoff, em ms. O crescimento exponencial para aqui. */
+export const RETRY_BACKOFF_CEILING_MS = 15 * 60_000;
+
+/**
+ * Amplitude do jitter, como fração do atraso base. ±20%.
+ *
+ * "Jitter LIMITADO" (issue #504 §Retry, recovery e DLQ) e não jitter total: o
+ * atraso continua previsível dentro de uma janela que o operador consegue
+ * declarar num runbook, o que um `random(0, base)` destrói. 20% é largo o
+ * bastante para desmanchar a sincronização e estreito o bastante para que a
+ * tentativa 3 continue sendo reconhecivelmente "dois minutos".
+ */
+export const RETRY_JITTER_RATIO = 0.2;
+
+/**
+ * Backoff exponencial com teto E JITTER, em ms — ~30s, ~60s, ~120s, … até 15min.
+ *
+ * ─── Por que o jitter não é cosmético aqui ──────────────────────────────────
+ *
+ * `next_attempt_at` é PERSISTIDO, e o recovery varre por `next_attempt_at <=
+ * now()`. Sem jitter, N turnos que falharam pelo mesmo motivo no mesmo instante
+ * — que é o caso NORMAL, porque a causa costuma ser compartilhada (LLM fora do
+ * ar, banco lento, deploy) — recebem o MESMO `next_attempt_at` ao milissegundo
+ * e voltam todos juntos, contra a mesma dependência que acabou de cair. O
+ * backoff exponencial sozinho não resolve isso: ele afasta as tentativas do
+ * MESMO turno, e mantém alinhadas as de turnos DIFERENTES.
+ *
+ * ─── Onde o teto é aplicado, e por quê ──────────────────────────────────────
+ *
+ * O teto limita a BASE, e o resultado final é reclampado em `[0, teto]`. Duas
+ * consequências deliberadas:
+ *   - o teto continua sendo um teto de verdade: nenhum atraso passa de 15min,
+ *     que é o número que o runbook promete;
+ *   - no teto a janela vira `[12min, 15min]` em vez de `[12min, 18min]`. Ainda
+ *     é espalhamento — que é a única coisa que importa ali — e é o lado do
+ *     trade-off que não quebra a promessa documentada.
+ *
+ * `Math.random` é lido diretamente, sem injeção de dependência: um parâmetro
+ * `rand` faria todo teste de jitter medir a função que o próprio teste passou.
+ * A suíte espia `Math.random` no ponto de produção.
+ */
 export function retryDelayMs(attempt: number): number {
-  const base = 30_000 * Math.pow(2, Math.max(0, attempt - 1));
-  return Math.min(base, 15 * 60_000);
+  const base = Math.min(
+    30_000 * Math.pow(2, Math.max(0, attempt - 1)),
+    RETRY_BACKOFF_CEILING_MS,
+  );
+  const jitter = base * RETRY_JITTER_RATIO * (Math.random() * 2 - 1);
+  return Math.min(RETRY_BACKOFF_CEILING_MS, Math.max(0, Math.round(base + jitter)));
 }
 
 /** Tentativas antes do dead letter (espelha `attempts: 3` do BullMQ). */
@@ -417,6 +912,14 @@ export async function failTurnRetryable(
     return;
   }
   await guarded('fail_retryable', async () => {
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      // Nem sequer agendar retry: `next_attempt_at`/`last_error_code` são
+      // campos DO TURNO, e o turno é de outra tentativa. Quem tem a posse
+      // decide o desfecho — inclusive se houve falha.
+      await refuseLostOwnership(handle, 'fail_retryable', fence.reason);
+      return;
+    }
     const next = new Date(Date.now() + retryDelayMs(handle.attempt_count + 1));
     const from = handle.status;
     const result = await agentTurnsRepo.markRetryable({
@@ -425,8 +928,11 @@ export async function failTurnRetryable(
       error_code: code,
       error_summary: summary,
       expected_version: handle.state_version,
+      ...fenceArgs(fence),
     });
+    if (await handleStaleClaim(handle, result, 'fail_retryable')) return;
     if (!applyResult(handle, result)) return;
+    handle.lease?.stop();
     incCounter('maia_turn_retries_total', { error_code: code });
     logger.info(
       {
@@ -439,6 +945,32 @@ export async function failTurnRetryable(
       'turn.retry_scheduled',
     );
   });
+}
+
+/**
+ * #629 — o conjunto de categorias que BLOQUEIAM, memoizado por valor bruto.
+ *
+ * O memo é sobre a STRING da env, não sobre "já li uma vez": `config` é um
+ * singleton, mas uma spec que recarrega o módulo com outro valor precisa ver o
+ * novo — e um memo booleano faria o segundo caso da suíte medir a configuração
+ * do primeiro. Reparsear a cada dead letter também serviria (é uma string
+ * curta), mas dead letter acontece em rajada quando uma dependência cai, e
+ * lançar dentro de `guarded` por categoria inválida numa rajada seria trocar um
+ * erro de configuração por uma tempestade de erros de transição.
+ */
+let poisonBlockCache: { raw: string; set: Set<PoisonCategory> } | null = null;
+
+function poisonBlockCategories(): Set<PoisonCategory> {
+  const raw = config.TURN_POISON_BLOCK_CATEGORIES ?? '';
+  if (poisonBlockCache?.raw === raw) return poisonBlockCache.set;
+  const set = parsePoisonBlockCategories(raw);
+  poisonBlockCache = { raw, set };
+  return set;
+}
+
+/** Só para teste: força a releitura da política na próxima decisão. */
+export function _resetPoisonPolicyCacheForTests(): void {
+  poisonBlockCache = null;
 }
 
 /** Terminal por esgotamento/intervenção. Sempre auditado. */
@@ -457,15 +989,67 @@ export async function deadLetterTurn(
       ? { code: args.code, summary: args.summary }
       : sanitizeTurnError({ code: args.code, error: args.error });
   await guarded('dead_letter', async () => {
+    const fence = resolveFence(handle);
+    if (fence.kind === 'lost') {
+      await refuseLostOwnership(handle, 'dead_letter', fence.reason);
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     const from = handle.status;
+    // #629 (fatia F) — A ESCOLHA, e ela é tomada ANTES da escrita.
+    //
+    // A issue-mãe exige que a política escolha CONSCIENTEMENTE entre liberar a
+    // conversa e interditá-la, e que a escolha seja configurável por categoria
+    // de erro. Classificar aqui — e não dentro da transação — é o que mantém a
+    // decisão TESTÁVEL sem banco e o repositório sem `@/config/env.js`: o que
+    // desce é o veredito, não a política.
+    const outcome = args.outcome ?? 'retry_exhausted';
+    const category = classifyPoison({ error_code: sanitized.code, outcome });
+    const disposition = poisonDisposition(category, poisonBlockCategories());
     const result = await agentTurnsRepo.markDeadLetter({
       turn_id: handle.turn_id,
-      outcome: args.outcome ?? 'retry_exhausted',
+      outcome,
       error_code: sanitized.code,
       error_summary: sanitized.summary,
       expected_version: handle.state_version,
+      ...(disposition === 'block_stream'
+        ? { block_stream: { category, reason: 'poison' as const } }
+        : {}),
+      ...fenceArgs(fence),
     });
+    if (await handleStaleClaim(handle, result, 'dead_letter')) {
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
+    handle.lease?.stop();
+    // A DECISÃO é contada DEPOIS do CAS ter vencido, e não antes de escrever.
+    // Um zumbi cujo `dead_letter` é recusado pelo fence não tomou decisão
+    // nenhuma — contá-lo faria `maia_stream_poison_total` medir TENTATIVAS de
+    // decidir, e a razão `block_stream/(block_stream+release)` deixaria de ser
+    // a política e passaria a ser a política mais a taxa de zumbis.
+    recordPoisonDecision(category, disposition);
+    // #627 — `dead_letter` é TERMINAL, e a issue-mãe é explícita sobre o que
+    // isso significa para a fila: a política de DLQ "libera o próximo turno".
+    // Um turno envenenado que ficasse segurando a conversa para sempre é a
+    // falha nº 5 da issue-mãe.
+    //
+    // #629 — e agora esse "libera" é uma DECISÃO, não um efeito colateral da
+    // máquina de estados. Quando a política mandou bloquear, a mesma transação
+    // já inseriu a interdição e `promoteStreamSuccessor` NÃO elegeu ninguém (a
+    // eleição carrega `streamNotPoisoned`), então `notePromotion` conta
+    // `no_successor` — que é a verdade: não havia sucessor a promover, porque a
+    // conversa está interditada.
+    if (result.ok && result.stream_block) await reportStreamBlockedByPoison(result.stream_block);
+    await notePromotion(result);
     logger.error(
       {
         turn_id: handle.turn_id,
@@ -493,6 +1077,47 @@ export async function deadLetterTurn(
 }
 
 /**
+ * #629 — a INTERDIÇÃO da conversa, relatada.
+ *
+ * Os três fatos num lugar só — métrica já contada em `recordPoisonDecision`,
+ * log estruturado e `audit_log` —, pela mesma regra de `signalStreamPromotion`
+ * e `reportFenceRejection`: três callers fazendo isso à mão é como um deles
+ * acaba sem auditoria, e o que falta é sempre o do caminho raro.
+ *
+ * `ops_alert: true` e nível `error`, e aqui isso é honesto ao contrário de
+ * `stream.turn_promotion_enqueue_failed` (que é `warn` porque o varredor
+ * conserta sozinho): NADA conserta isto sozinho. Uma conversa interditada
+ * continua interditada até um humano rodar `npm run dlq -- unblock`. Um alerta
+ * que exige intervenção é exatamente o que deve acordar o plantão.
+ */
+async function reportStreamBlockedByPoison(block: StreamBlockRecord): Promise<void> {
+  logger.error(
+    {
+      turn_id: block.blocked_turn_id,
+      block_id: block.block_id,
+      category: block.category,
+      reason: block.reason,
+      error_code: block.error_code,
+      ops_alert: true,
+    },
+    'stream.poisoned',
+  );
+  await audit({
+    acao: 'stream_poisoned',
+    ...(block.conversa_id ? { conversa_id: block.conversa_id } : {}),
+    alvo_id: block.blocked_turn_id,
+    metadata: {
+      block_id: block.block_id,
+      category: block.category,
+      reason: block.reason,
+      disposition: 'block_stream',
+      blocked_by_turn_id: block.blocked_turn_id,
+      error_code: block.error_code,
+    },
+  });
+}
+
+/**
  * Replay MANUAL de dead letter — operação de operador, explícita e auditada,
  * que gera nova tentativa. NÃO é chamada por nenhum caminho automático.
  */
@@ -500,19 +1125,61 @@ export async function replayDeadLetteredTurn(args: {
   turn_id: string;
   actor: string;
   reason: string;
-}): Promise<{ replayed: boolean }> {
+  /**
+   * #629 — MODO DE RECONCILIAÇÃO. Sem ele, o replay é RECUSADO quando a ordem
+   * da conversa já foi comprometida (existe turno posterior já terminal). Ver
+   * `agentTurnsRepo.replayDeadLetterTx`.
+   */
+  reconcile?: boolean;
+}): Promise<ReplayOutcome> {
   const turn = await agentTurnsRepo.findById(args.turn_id);
-  if (!turn) return { replayed: false };
+  if (!turn) return { replayed: false, reason: 'not_dead_lettered' };
   const result = await agentTurnsRepo.replayDeadLetterTx({
     turn_id: args.turn_id,
     expected_version: Number(turn.state_version),
+    ...(args.reconcile === true ? { reconcile: true } : {}),
   });
   if (!result.ok) {
     logger.warn(
       { turn_id: args.turn_id, to_status: 'queued', conflict: result.conflict },
       'turn.transition_conflict',
     );
-    return { replayed: false };
+    // #629 — A RECUSA POR ORDEM COMPROMETIDA É AUDITADA, e as outras não.
+    //
+    // `state_mismatch` e `not_found` são erro de operador (turno vivo, id
+    // errado) e já vivem no log. `order_committed` é diferente em espécie: é a
+    // plataforma HONRANDO uma invariante contra uma ordem humana explícita, e
+    // esse é exatamente o tipo de evento que a issue-mãe manda auditar. Sem a
+    // row, a pergunta "por que este turno nunca voltou?" não tem resposta
+    // durável — só um exit code que ninguém guardou.
+    if (result.conflict === 'order_committed') {
+      logger.warn(
+        {
+          turn_id: args.turn_id,
+          actor: args.actor,
+          committed_after: result.committed_after,
+          ops_alert: true,
+        },
+        'stream.manual_replay_refused',
+      );
+      await audit({
+        acao: 'turn_replay_refused',
+        ...(turn.conversa_id ? { conversa_id: turn.conversa_id } : {}),
+        alvo_id: args.turn_id,
+        metadata: {
+          reason: 'order_committed',
+          committed_after: result.committed_after,
+          actor: args.actor,
+          operator_reason: args.reason,
+        },
+      });
+      return {
+        replayed: false,
+        reason: 'order_committed',
+        committed_after: result.committed_after,
+      };
+    }
+    return { replayed: false, reason: 'not_dead_lettered' };
   }
   await audit({
     acao: 'turn_replayed',
@@ -524,10 +1191,45 @@ export async function replayDeadLetteredTurn(args: {
       attempt: result.turn.attempt_count,
       actor: args.actor,
       reason: args.reason,
+      // #629 — o MODO fica na row de rotina também. Ler `turn_replayed` sem
+      // saber se foi reconciliação obrigaria a cruzar com a row de
+      // `turn_replay_reconciled` para saber o que aconteceu, e a auditoria de
+      // um replay tem de ser legível numa linha.
+      mode: args.reconcile === true ? 'reconcile' : 'ordered',
     },
   });
+  if (args.reconcile === true) {
+    // A row que separa "replay normal" de "o operador ATRAVESSOU a ordem". É a
+    // única evidência de que a plataforma processou algo fora da ordem que já
+    // havia entregue, e por isso ela é sua própria ação — não um campo de
+    // metadata que uma consulta de rotina filtraria fora sem querer.
+    logger.warn(
+      { turn_id: args.turn_id, actor: args.actor, ops_alert: true },
+      'stream.manual_replay_reconciled',
+    );
+    await audit({
+      acao: 'turn_replay_reconciled',
+      ...(result.turn.conversa_id ? { conversa_id: result.turn.conversa_id } : {}),
+      alvo_id: args.turn_id,
+      metadata: { actor: args.actor, operator_reason: args.reason },
+    });
+  }
   return { replayed: true };
 }
+
+/**
+ * #629 — o desfecho TIPADO de um replay manual.
+ *
+ * `not_dead_lettered` e `order_committed` são recusas com remediações opostas,
+ * e é por isso que não são um booleano: a primeira quer dizer "você errou o
+ * turno" (releia o id, ele não está morto) e a segunda quer dizer "você acertou
+ * o turno e a plataforma não vai fazer isso sem você declarar que sabe" — cuja
+ * remediação é `--reconcile`, não uma correção.
+ */
+export type ReplayOutcome =
+  | { replayed: true }
+  | { replayed: false; reason: 'not_dead_lettered' }
+  | { replayed: false; reason: 'order_committed'; committed_after: number };
 
 /**
  * Shadow-read (issue §6, passo 6 do rollout): mede a divergência entre a

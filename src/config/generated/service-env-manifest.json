@@ -195,6 +195,13 @@
           "restartRequired": true
         },
         {
+          "name": "LLM_CIRCUIT_MODE",
+          "secret": false,
+          "required": false,
+          "group": "llm",
+          "restartRequired": true
+        },
+        {
           "name": "DECISION_ENGINE_BUDGET_MS",
           "secret": false,
           "required": false,
@@ -366,6 +373,13 @@
           "restartRequired": true
         },
         {
+          "name": "ONBOARDING_EXPIRER_BATCH_LIMIT",
+          "secret": false,
+          "required": false,
+          "group": "onboarding",
+          "restartRequired": true
+        },
+        {
           "name": "MAIA_MULTI_LINE",
           "secret": false,
           "required": false,
@@ -457,6 +471,34 @@
         },
         {
           "name": "DLQ_ALERT_THRESHOLD",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_ENDPOINT",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_TRACES_HEADERS",
+          "secret": true,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SAMPLE_RATIO",
+          "secret": false,
+          "required": false,
+          "group": "alerts",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_OTLP_SERVICE_NAME",
           "secret": false,
           "required": false,
           "group": "alerts",
@@ -628,6 +670,20 @@
           "restartRequired": true
         },
         {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -726,6 +782,27 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_OUTBOUND_DURABLE_COMMIT",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OUTBOUND_DELIVERY_WORKER",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_OUTBOUND_RECOVERY",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_MESSAGE_DEBOUNCE",
           "secret": false,
           "required": false,
@@ -747,7 +824,49 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_TURN_STREAM_KEY",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_HEAD_OF_LINE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STREAM_PROMOTION",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STREAM_DEBOUNCE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_STRICT_TOOL_SCHEMAS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_CLAIM",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_JOB_V2",
           "secret": false,
           "required": false,
           "group": "feature-flags",
@@ -871,6 +990,13 @@
           "required": false,
           "group": "runtime-trace",
           "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": false
         },
         {
           "name": "RUNTIME_TRACE_DEBUG_S3_BUCKET",
@@ -1084,6 +1210,34 @@
           "restartRequired": true
         },
         {
+          "name": "TURN_LEASE_TTL_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_LEASE_HEARTBEAT_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_POISON_BLOCK_CATEGORIES",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_STREAM_STARVATION_AFTER_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
           "name": "TURN_CONTEXT_CACHE_TTL_MS",
           "secret": false,
           "required": false,
@@ -1194,6 +1348,21 @@
           "required": false,
           "group": "setup",
           "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_GITHUB_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true,
+          "requiredWhen": "MAIA_TOOL_REQUEST_ISSUE_REPO está definida"
         }
       ],
       "secrets": [
@@ -1208,13 +1377,15 @@
         "MAIA_STAGING_KEYRING",
         "SMTP_PASS",
         "TELEGRAM_BOT_TOKEN",
+        "MAIA_OTLP_TRACES_HEADERS",
         "BACKUP_S3_ACCESS_KEY",
         "BACKUP_S3_SECRET_KEY",
         "BACKUP_ENCRYPTION_KEYRING",
         "RUNTIME_TRACE_HMAC_MASTER_SECRET",
         "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "RUNTIME_TRACE_DEBUG_AES_KEY",
-        "SETUP_TOKEN_OVERRIDE"
+        "SETUP_TOKEN_OVERRIDE",
+        "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
       ],
       "by_profile": {
         "development": {
@@ -1251,6 +1422,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1272,6 +1444,7 @@
             "PENDING_ACTION_TTL_HOURS",
             "RATE_LIMIT_MSGS_PER_HOUR",
             "WHATSAPP_RECONNECT_ALERT_MIN",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "MAIA_MULTI_LINE",
             "MAIA_CHANNEL_ROUTING_MODE",
             "MAIA_STAGING_KEYRING",
@@ -1285,6 +1458,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",
@@ -1308,6 +1485,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1322,10 +1501,19 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
+            "FEATURE_OUTBOUND_DELIVERY_WORKER",
+            "FEATURE_OUTBOUND_RECOVERY",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_CLAIM",
+            "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1343,6 +1531,7 @@
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1373,6 +1562,10 @@
             "POLICY_RESOLVER_CACHE_TTL_MS",
             "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
             "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1388,7 +1581,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "staging": {
@@ -1427,6 +1622,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1448,6 +1644,7 @@
             "PENDING_ACTION_TTL_HOURS",
             "RATE_LIMIT_MSGS_PER_HOUR",
             "WHATSAPP_RECONNECT_ALERT_MIN",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "MAIA_MULTI_LINE",
             "MAIA_CHANNEL_ROUTING_MODE",
             "MAIA_STAGING_KEYRING",
@@ -1461,6 +1658,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",
@@ -1483,6 +1684,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1497,10 +1700,19 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
+            "FEATURE_OUTBOUND_DELIVERY_WORKER",
+            "FEATURE_OUTBOUND_RECOVERY",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_CLAIM",
+            "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1517,6 +1729,7 @@
             "MAIA_STRICT_METRIC_LABELS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1547,6 +1760,10 @@
             "POLICY_RESOLVER_CACHE_TTL_MS",
             "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
             "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1562,7 +1779,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "production": {
@@ -1601,6 +1820,7 @@
             "CLAUDE_TIMEOUT_MS",
             "LLM_TURN_DEADLINE_MS",
             "LLM_DAILY_BUDGET_USD",
+            "LLM_CIRCUIT_MODE",
             "DECISION_ENGINE_BUDGET_MS",
             "OPENAI_API_KEY",
             "WHISPER_PROVIDER",
@@ -1622,6 +1842,7 @@
             "PENDING_ACTION_TTL_HOURS",
             "RATE_LIMIT_MSGS_PER_HOUR",
             "WHATSAPP_RECONNECT_ALERT_MIN",
+            "ONBOARDING_EXPIRER_BATCH_LIMIT",
             "MAIA_MULTI_LINE",
             "MAIA_CHANNEL_ROUTING_MODE",
             "MAIA_STAGING_KEYRING",
@@ -1635,6 +1856,10 @@
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "DLQ_ALERT_THRESHOLD",
+            "MAIA_OTLP_TRACES_ENDPOINT",
+            "MAIA_OTLP_TRACES_HEADERS",
+            "MAIA_OTLP_SAMPLE_RATIO",
+            "MAIA_OTLP_SERVICE_NAME",
             "BACKUP_DIR",
             "BACKUP_RETENTION_LOCAL_DAYS",
             "BACKUP_RETENTION_CLOUD_DAYS",
@@ -1657,6 +1882,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1671,10 +1898,19 @@
             "FEATURE_PDF_REPORTS",
             "FEATURE_OUTBOUND_VOICE",
             "FEATURE_OUTBOUND_DEDUP",
+            "FEATURE_OUTBOUND_DURABLE_COMMIT",
+            "FEATURE_OUTBOUND_DELIVERY_WORKER",
+            "FEATURE_OUTBOUND_RECOVERY",
             "FEATURE_MESSAGE_DEBOUNCE",
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
+            "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
+            "FEATURE_TURN_CLAIM",
+            "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1691,6 +1927,7 @@
             "MAIA_STRICT_METRIC_LABELS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "RUNTIME_TRACE_ACCEPT_SIGNATURE_V1",
             "RUNTIME_TRACE_DEBUG_S3_BUCKET",
             "RUNTIME_TRACE_DEBUG_AES_KEY",
             "RUNTIME_TRACE_BODY_ORPHAN_SEC",
@@ -1721,6 +1958,10 @@
             "POLICY_RESOLVER_CACHE_TTL_MS",
             "POLICY_RESOLVER_CACHE_MAX_ENTRIES",
             "FEATURE_TURN_CONTEXT_CACHE",
+            "TURN_LEASE_TTL_MS",
+            "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1736,7 +1977,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         }
       }
@@ -1797,6 +2040,41 @@
           "secret": false,
           "required": false,
           "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_PDF_REPORTS",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_KEY_VERSION",
+          "secret": false,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+          "secret": true,
+          "required": true,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+          "secret": true,
+          "required": false,
+          "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
           "restartRequired": true
         },
         {
@@ -1908,6 +2186,8 @@
       ],
       "secrets": [
         "DATABASE_URL",
+        "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+        "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "NEXTAUTH_SECRET",
         "ADMIN_UI_DEV_LOGIN_TOKEN",
         "OIDC_CLIENT_SECRET"
@@ -1925,6 +2205,11 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "NEXTAUTH_SECRET",
@@ -1946,6 +2231,7 @@
           "required": [
             "MAIA_ENV",
             "DATABASE_URL",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "NEXTAUTH_SECRET",
             "OIDC_ISSUER",
             "OIDC_CLIENT_ID",
@@ -1959,6 +2245,10 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",
@@ -1975,6 +2265,7 @@
           "required": [
             "MAIA_ENV",
             "DATABASE_URL",
+            "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "NEXTAUTH_SECRET",
             "OIDC_ISSUER",
             "OIDC_CLIENT_ID",
@@ -1988,6 +2279,10 @@
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
             "FEATURE_MCP_TOOLS",
+            "FEATURE_PDF_REPORTS",
+            "RUNTIME_TRACE_HMAC_KEY_VERSION",
+            "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",
@@ -2080,6 +2375,34 @@
           "required": false,
           "group": "database",
           "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_WAIT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_POLL_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_LOCK_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
+          "name": "MIGRATION_STATEMENT_TIMEOUT_MS",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2101,7 +2424,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         },
         "staging": {
@@ -2118,7 +2445,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         },
         "production": {
@@ -2135,7 +2466,11 @@
             "TZ",
             "LOG_LEVEL",
             "MAIA_CONFIG_STRICT_BOOT",
-            "POSTGRES_PORT"
+            "POSTGRES_PORT",
+            "MIGRATION_LOCK_WAIT_MS",
+            "MIGRATION_LOCK_POLL_MS",
+            "MIGRATION_LOCK_TIMEOUT_MS",
+            "MIGRATION_STATEMENT_TIMEOUT_MS"
           ]
         }
       }
@@ -2443,6 +2778,20 @@
           "required": false,
           "group": "backup",
           "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
         }
       ],
       "secrets": [
@@ -2500,7 +2849,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         },
         "staging": {
@@ -2548,7 +2899,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         },
         "production": {
@@ -2596,7 +2949,9 @@
             "BACKUP_RTO_TARGET_MINUTES",
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
-            "RETENTION_POLICY"
+            "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN"
           ]
         }
       }
@@ -3030,6 +3385,20 @@
           "restartRequired": true
         },
         {
+          "name": "PRIVACY_EXPORT_TTL_DAYS",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
+          "name": "PRIVACY_EXPORT_SWEEP_DRY_RUN",
+          "secret": false,
+          "required": false,
+          "group": "backup",
+          "restartRequired": true
+        },
+        {
           "name": "DAILY_LLM_USD_THRESHOLD",
           "secret": false,
           "required": false,
@@ -3123,6 +3492,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3190,6 +3561,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]
@@ -3257,6 +3630,8 @@
             "BACKUP_RESTORE_DRILL_INTERVAL_HOURS",
             "RETENTION_DRY_RUN",
             "RETENTION_POLICY",
+            "PRIVACY_EXPORT_TTL_DAYS",
+            "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
             "FEATURE_OFX_IMPORT"
           ]

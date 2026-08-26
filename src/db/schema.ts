@@ -403,6 +403,21 @@ export const mensagens = pgTable('mensagens', {
   processada_em: timestamp('processada_em', { withTimezone: true }),
   ferramentas_chamadas: jsonb('ferramentas_chamadas').notNull().default(sql`'[]'::jsonb`),
   tokens_usados: integer('tokens_usados'),
+  // 118 (#505, shadow) — identidade da STREAM de ordenação e a posição deste
+  // ingresso dentro dela. NULL = row anterior ao protocolo, ou outbound (que
+  // nunca recebe stream). NÃO confundir `ingress_seq` com o homônimo de
+  // `agent_turn_inputs`: aquele é a posição DENTRO DO TURNO (começa em 0), este
+  // é a posição DENTRO DA STREAM (começa em 1) — ver migrations/118.
+  stream_key: text('stream_key'),
+  stream_key_version: smallint('stream_key_version'),
+  ingress_seq: bigint('ingress_seq', { mode: 'number' }),
+  // 135 (#635) — o ARTEFATO do outbox que esta row de histórico registra.
+  // É a CHAVE IDEMPOTENTE do histórico de saída: unique PARCIAL
+  // (tenant_id, agent_id, outbound_id) WHERE outbound_id IS NOT NULL. NULL =
+  // ingresso, histórico anterior a esta fatia, ou saída sem linha durável.
+  // Referência SOFT (sem FK) porque `outbound_messages` está sob retenção — ver
+  // migrations/135.
+  outbound_id: uuid('outbound_id'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -874,6 +889,47 @@ export const outbound_messages = pgTable(
     error: text('error'),
     sent_at: timestamp('sent_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+
+    // ---------------------------------------------------------------
+    // Issue #630 (fatia A de #506) — evolução para OUTBOX DURÁVEL.
+    // Migração 121. Todas as colunas abaixo são NULLABLE porque a row
+    // LEGADA (anterior ao outbox) não as tem; o CHECK
+    // `outbound_messages_durable_row_complete_check` é que exige o tuplo
+    // INTEIRO quando `turn_id IS NOT NULL`. Ou seja: "nullable no tipo,
+    // obrigatório na row nova" — a nulabilidade serve à coexistência com o
+    // legado, nunca a um fallback.
+    // O vocabulário (payload types, status, delivery outcomes) vive em
+    // src/runtime/outbound/contract.ts; aqui só a forma da tabela.
+    // ---------------------------------------------------------------
+    /** Turno dono da saída (#503). FK COMPOSTA (tenant, agent, turn_id) na 121. */
+    turn_id: uuid('turn_id'),
+    /** Posição da saída no turno (0-based). Eixo de ordenação do multipart (#635). */
+    sequence_in_turn: integer('sequence_in_turn'),
+    /** Versão da união Zod + da serialização canônica (OUTBOUND_PAYLOAD_VERSION). */
+    payload_version: integer('payload_version'),
+    /** Discriminante da união. Sem `image`/`video`: LineOutput não tem primitiva. */
+    payload_type: text('payload_type'),
+    /** Payload validado. Mídia por REFERÊNCIA — o contrato TS não tem variante que aceite URL. */
+    payload_json: jsonb('payload_json'),
+    /** sha256 hex da serialização canônica versionada. Entra na derivação das duas chaves. */
+    payload_hash: text('payload_hash'),
+    /** Identidade da saída lógica DENTRO da Maia. UNIQUE parcial por (tenant, agent, key). */
+    logical_dedupe_key: text('logical_dedupe_key'),
+    /** Chave estável entregue ao ADAPTADOR. Mesmo material, domínio de hash DIFERENTE. */
+    provider_idempotency_key: text('provider_idempotency_key'),
+    /** Tentativas de entrega. MUTÁVEL — por isso nunca entra na derivação das chaves. */
+    attempt: integer('attempt').notNull().default(0),
+    claimed_by: text('claimed_by'),
+    /** Token de FENCING do delivery worker (#632). Mesmo vocabulário de agent_turns. */
+    claim_token: uuid('claim_token'),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    /** Gate de backoff. Relógio do BANCO (now()), nunca do processo. */
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }),
+    provider_timestamp: timestamp('provider_timestamp', { withTimezone: true }),
+    /** Código de baixa cardinalidade e sanitizado (≤64 chars por CHECK). */
+    last_error_code: text('last_error_code'),
+    /** Resultado NORMALIZADO do provedor: separa "aceitou" de "usuário recebeu". */
+    delivery_outcome: text('delivery_outcome'),
   },
   (t) => ({
     byTenantCreated: index('idx_outbound_messages_tenant_created').on(
@@ -900,6 +956,29 @@ export const outbound_messages = pgTable(
       t.agent_id,
       t.idempotency_key,
     ),
+    // #630 — identidade lógica da saída. UNIQUE PARCIAL de propósito: o
+    // predicado `IS NOT NULL` é o que torna a criação do índice IMUNE a
+    // duplicata histórica (nenhuma row legada satisfaz o predicado, logo
+    // nenhuma entra no índice, logo nenhuma pode colidir). Ver o bloco
+    // "O RISCO DECLARADO NA MÃE" no topo da migração 121.
+    logicalDedupeUq: uniqueIndex('outbound_messages_logical_dedupe_uq')
+      .on(t.tenant_id, t.agent_id, t.logical_dedupe_key)
+      .where(sql`logical_dedupe_key IS NOT NULL`),
+    // #630 — rede INDEPENDENTE da anterior: aquela impede "mesmo conteúdo
+    // duas vezes"; esta impede "mesma posição do turno com conteúdo
+    // diferente", que a outra deixaria passar (payload_hash entra na
+    // derivação, então conteúdo diferente gera chave diferente).
+    turnSequenceUq: uniqueIndex('outbound_messages_turn_sequence_uq')
+      .on(t.tenant_id, t.agent_id, t.turn_id, t.sequence_in_turn)
+      .where(sql`turn_id IS NOT NULL`),
+    // #630 — seleção do delivery worker (#632). O status vai no PREDICADO
+    // parcial e não na chave: são exatamente dois valores, então o índice
+    // fica menor e não indexa row terminal (a maioria, sob retenção de 30d).
+    // A lista espelha OUTBOUND_SELECTABLE_STATUSES em
+    // src/runtime/outbound/contract.ts.
+    readyIdx: index('idx_outbound_messages_ready')
+      .on(t.tenant_id, t.agent_id, t.next_attempt_at)
+      .where(sql`status IN ('pending', 'retryable')`),
   }),
 );
 
@@ -1384,9 +1463,290 @@ export const agent_capability_gaps = pgTable(
       .notNull()
       .defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // #638 (fatia C da épica #471) — o gap FECHA a partir do estado real da
+    // capability, nunca de uma marcação no console. O único escritor de
+    // produção é `src/cognition/tool-request/closure.ts`, e ele só escreve
+    // quando a tool existe no registro committado E está concedida a este
+    // tenant+agent. `resolved_reason` é NOT NULL exatamente quando
+    // `resolved_at` é (CHECK da migração 132): fechar sem motivo registrado é
+    // fechar por ninguém.
+    //
+    // O nível NÃO é usado para fechar: um gap resolvido rebaixado para
+    // 'silent' seria indistinguível de um que nunca subiu, e apagaria a
+    // história da escalada — a evidência que justificou o pedido.
+    resolved_at: timestamp('resolved_at', { withTimezone: true }),
+    resolved_reason: text('resolved_reason'),
+    resolved_tool_name: text('resolved_tool_name'),
   },
   (t) => ({
     levelIdx: index('caps_gaps_level_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    // Índices PARCIAIS na DB (WHERE resolved_at IS NULL / IS NOT NULL);
+    // Drizzle não expressa o WHERE, então aqui eles aparecem como comuns.
+    abertosIdx: index('caps_gaps_abertos_idx').on(t.tenant_id, t.agent_id, t.current_level),
+    resolvidosIdx: index('caps_gaps_resolvidos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.resolved_at,
+    ),
+  }),
+);
+
+// #636 (fatia A da épica #471) — `agent_capability_gap_observations`: o LEDGER
+// de ocorrências do gap, uma linha por vez em que o agente esbarrou nele.
+//
+// Por que existe, dado que `agent_capability_gaps.frequency_score` já conta:
+// um contador responde "quantas vezes" e NADA mais. O pedido de ferramenta
+// precisa de "em que JANELA" e "em QUAIS situações reais" — e as duas só saem
+// de linhas com timestamp e com o link do turno (`root_trace_id`, o mesmo id
+// que `runtime_trace_envelopes` agrupa por tentativa). Um contador não guarda
+// nem uma nem outra.
+//
+// `attempted_args`/`expected_output` são a EVIDÊNCIA de onde o rascunho de
+// contrato Zod deriva seus inputs/outputs. `{}` significa "não observado", e o
+// rascunho declara isso (`completeness:'name_only'`) em vez de imaginar campos.
+//
+// Sem FK para `runtime_trace_envelopes` de propósito — ver o cabeçalho da
+// migração 125: o envelope é sujeito a retenção e some antes da observação. A
+// integridade é verificada na LEITURA, escopada por tenant+agent.
+export const agent_capability_gap_observations = pgTable(
+  'agent_capability_gap_observations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    intent: text('intent').notNull(),
+    detail: text('detail'),
+    conversa_id: uuid('conversa_id'),
+    root_trace_id: uuid('root_trace_id'),
+    trace_id: uuid('trace_id'),
+    attempted_args: jsonb('attempted_args').notNull().default(sql`'{}'::jsonb`),
+    expected_output: jsonb('expected_output').notNull().default(sql`'{}'::jsonb`),
+    observed_at: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeGapIdx: index('gap_observations_scope_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+      t.observed_at,
+    ),
+    // Índice PARCIAL na DB (WHERE root_trace_id IS NOT NULL); Drizzle não
+    // expressa o WHERE, então aqui ele aparece como índice comum — mesma
+    // ressalva do `agent_drift_unresolved_idx`.
+    rootTraceIdx: index('gap_observations_root_trace_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.root_trace_id,
+    ),
+  }),
+);
+
+// #637 (fatia B da épica #471) — `tool_request_aggregates`: N pedidos de
+// ferramenta parecidos, vistos como UM pedido com contador.
+//
+// O escopo é `tenant_id` + `agent_id`, sem exceção e sem contador global — a
+// justificativa está no cabeçalho da migração 129 e em
+// `src/cognition/tool-request/aggregation.ts`.
+//
+// `metrica`, `limiar` e `assinatura_version` moram na LINHA porque um
+// agrupamento é uma decisão automática sobre dado de governança: sem o número
+// que a justificou, ninguém consegue dizer depois se ela era certa sob a regra
+// vigente na época.
+export const tool_request_aggregates = pgTable(
+  'tool_request_aggregates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    representative_proposal_id: uuid('representative_proposal_id').notNull(),
+    representative_gap_id: uuid('representative_gap_id').notNull(),
+    proposed_tool_name: text('proposed_tool_name').notNull(),
+    nomes_propostos: jsonb('nomes_propostos').notNull().default(sql`'[]'::jsonb`),
+    member_count: integer('member_count').notNull().default(0),
+    total_occurrences: integer('total_occurrences').notNull().default(0),
+    // 'single' | 'consistent' | 'divergent' — ver `draft-merge.ts`.
+    contract_state: text('contract_state').notNull(),
+    // NULO exatamente quando `contract_state = 'divergent'`; o CHECK
+    // `tool_request_aggregates_divergent_has_no_draft` (migração 129) impede
+    // que os dois se separem.
+    merged_contract_draft: jsonb('merged_contract_draft'),
+    contract_conflicts: jsonb('contract_conflicts').notNull().default(sql`'[]'::jsonb`),
+    first_member_at: timestamp('first_member_at', { withTimezone: true }).notNull().defaultNow(),
+    last_member_at: timestamp('last_member_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    demandaIdx: index('tool_request_aggregates_scope_demand_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.member_count,
+      t.last_member_at,
+    ),
+    assinaturaIdx: index('tool_request_aggregates_scope_signature_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.assinatura_version,
+    ),
+    representanteUnico: unique('tool_request_aggregates_representative_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.representative_proposal_id,
+    ),
+  }),
+);
+
+// #637 — `tool_request_aggregate_members`: o ledger APPEND-ONLY do agrupamento.
+//
+// `proposal_id` é NULO para todo membro que não é o representante: ele nunca
+// gerou linha em `capability_proposals`, e é isso que faz N pedidos virarem 1.
+// A evidência dele não se perde — `original_spec` guarda o `proposed_spec`
+// INTEIRO como ele entrou (situações com link de trace, janela de frequência e
+// o rascunho de contrato original).
+//
+// Sair do agregado é `detached_at`, NUNCA `DELETE`: é assim que a fusão é
+// reversível sem apagar a evidência do pedido original.
+export const tool_request_aggregate_members = pgTable(
+  'tool_request_aggregate_members',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    proposal_id: uuid('proposal_id'),
+    is_representative: boolean('is_representative').notNull().default(false),
+    assinatura: text('assinatura').notNull(),
+    assinatura_version: integer('assinatura_version').notNull(),
+    metrica: text('metrica').notNull(),
+    limiar: numeric('limiar', { precision: 5, scale: 4 }).notNull(),
+    similaridade: numeric('similaridade', { precision: 5, scale: 4 }).notNull(),
+    intent: text('intent').notNull(),
+    occurrences: integer('occurrences').notNull().default(0),
+    original_spec: jsonb('original_spec').notNull(),
+    joined_at: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
+    detached_at: timestamp('detached_at', { withTimezone: true }),
+    detached_reason: text('detached_reason'),
+    detached_by: text('detached_by'),
+  },
+  (t) => ({
+    // Índice PARCIAL na DB (WHERE detached_at IS NULL); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `gap_observations_root_trace_idx`.
+    ativosIdx: index('tool_request_aggregate_members_ativos_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.joined_at,
+    ),
+    gapIdx: index('tool_request_aggregate_members_gap_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+    ),
+    gapUnico: unique('tool_request_aggregate_members_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+      t.gap_id,
+    ),
+  }),
+);
+
+// #638 (fatia C da épica #471) — `tool_request_issues`: a RESERVA que torna o
+// aceite idempotente ANTES de a chamada externa sair.
+//
+// Abrir issue no GitHub é irreversível do lado de fora. Por isso o aceite não
+// começa pela chamada: ele começa por esta linha, cuja UNIQUE
+// (tenant_id, agent_id, aggregate_id) faz o segundo clique perder a corrida NO
+// BANCO. `idempotency_key` é determinística, viaja no CORPO da issue como
+// marcador, e é o que permite ADOTAR uma issue já aberta quando o processo
+// morreu entre a chamada e o registro do resultado.
+//
+// NENHUMA coluna de credencial, de propósito: o token do GitHub existe só na
+// configuração do serviço `runtime`, e o `admin-ui` — que serve o botão
+// "aceitar" — não tem essa variável no seu subset.
+export const tool_request_issues = pgTable(
+  'tool_request_issues',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    aggregate_id: uuid('aggregate_id').notNull(),
+    idempotency_key: text('idempotency_key').notNull(),
+    repo_slug: text('repo_slug').notNull(),
+    // 'pending' | 'created' | 'failed'
+    status: text('status').notNull().default('pending'),
+    title: text('title').notNull(),
+    /** O corpo COMO O DONO ACEITOU. O relayer envia isto, não uma remontagem. */
+    body: text('body').notNull(),
+    issue_number: integer('issue_number'),
+    issue_url: text('issue_url'),
+    adopted: boolean('adopted').notNull().default(false),
+    accepted_by: text('accepted_by').notNull(),
+    accepted_at: timestamp('accepted_at', { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer('attempts').notNull().default(0),
+    last_attempt_at: timestamp('last_attempt_at', { withTimezone: true }),
+    last_error: text('last_error'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_issues_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.accepted_at,
+    ),
+    // Índice PARCIAL na DB (WHERE status = 'pending'); Drizzle não expressa o
+    // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
+    // `tool_request_aggregate_members_ativos_idx`.
+    pendentesIdx: index('tool_request_issues_pendentes_idx').on(t.status, t.last_attempt_at),
+    agregadoUnico: unique('tool_request_issues_aggregate_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.aggregate_id,
+    ),
+    chaveUnica: unique('tool_request_issues_key_unique').on(t.idempotency_key),
+  }),
+);
+
+// #638 — `tool_request_notifications`: o aviso ao agente guardado como FATO.
+//
+// "O agente é notificado" precisa ser verificável depois do turno em que
+// aconteceu. Esta linha é o registro: qual tool, por causa de qual gap e de
+// qual agregado, com que evidência de disponibilidade, e quando. A UNIQUE por
+// gap existe porque o monitor roda em cron — sem ela, cada passada reavisaria.
+export const tool_request_notifications = pgTable(
+  'tool_request_notifications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    gap_id: uuid('gap_id').notNull(),
+    /** NULO quando o pedido nunca teve agregado (`sem_assinatura`, fatia B). */
+    aggregate_id: uuid('aggregate_id'),
+    tool_name: text('tool_name').notNull(),
+    evidencia: jsonb('evidencia').notNull().default(sql`'{}'::jsonb`),
+    notified_at: timestamp('notified_at', { withTimezone: true }).notNull().defaultNow(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    escopoIdx: index('tool_request_notifications_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.notified_at,
+    ),
+    gapUnico: unique('tool_request_notifications_gap_unique').on(
+      t.tenant_id,
+      t.agent_id,
+      t.gap_id,
+    ),
   }),
 );
 
@@ -2326,7 +2686,9 @@ export const runtime_trace_envelopes = pgTable(
     turno_id: uuid('turno_id'),
     // Issue #514 (migration 107): attempt grouping. `root_trace_id` equals
     // `trace_id` on attempt 1; retries get a derived id and point back here.
-    // NOT covered by `envelope_hmac` — see the migration for why.
+    // Issue #535 (migration 119): BOTH are now covered by `envelope_hmac` —
+    // under signature v2. v1 rows keep them unsigned; see
+    // `src/control-plane/runtime-trace/lib/signature.ts`.
     root_trace_id: uuid('root_trace_id'),
     attempt: integer('attempt').notNull().default(1),
     policy_id: uuid('policy_id'),
@@ -2335,6 +2697,11 @@ export const runtime_trace_envelopes = pgTable(
     redaction_class: text('redaction_class').notNull().default('standard'),
     envelope_hmac: text('envelope_hmac').notNull(),
     hmac_key_version: integer('hmac_key_version').notNull(),
+    // Issue #535 (migration 119): which canonical material `envelope_hmac`
+    // covers. DEFAULT 1 because every row that predates the column was signed
+    // with the v1 field set. Production writes 2 and nothing else; the verifier
+    // still reads 1 so fixtures and old environments keep a real verdict.
+    signature_version: integer('signature_version').notNull().default(1),
     body_status: text('body_status').notNull().default('pending'),
     body_persisted_at: timestamp('body_persisted_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -2465,6 +2832,19 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
+export type AgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferSelect;
+export type NewAgentCapabilityGapObservation =
+  typeof agent_capability_gap_observations.$inferInsert;
+export type ToolRequestAggregate = typeof tool_request_aggregates.$inferSelect;
+export type NewToolRequestAggregate = typeof tool_request_aggregates.$inferInsert;
+export type ToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferSelect;
+export type NewToolRequestAggregateMember =
+  typeof tool_request_aggregate_members.$inferInsert;
+export type ToolRequestIssue = typeof tool_request_issues.$inferSelect;
+export type NewToolRequestIssue = typeof tool_request_issues.$inferInsert;
+export type ToolRequestNotification = typeof tool_request_notifications.$inferSelect;
+export type NewToolRequestNotification = typeof tool_request_notifications.$inferInsert;
 export type ProcedureDefinition = typeof procedure_definitions.$inferSelect;
 export type ProcedureAssignment = typeof procedure_assignments.$inferSelect;
 export type ProcedureExecution = typeof procedure_executions.$inferSelect;
@@ -3103,14 +3483,54 @@ export const agent_turns = pgTable(
     // Sanitizados por `sanitizeTurnError` — nunca payload/prompt/PII.
     last_error_code: text('last_error_code'),
     last_error_summary: text('last_error_summary'),
-    // Reservados para #504 (claim/lease/fencing).
+    // #504 (claim atômico / lease / fencing). `claim_token` é o FENCE: toda
+    // gravação da tentativa exige o token vigente no WHERE, então um worker que
+    // perdeu o lease não consegue escrever mesmo estando vivo.
     claimed_by: text('claimed_by'),
     claim_token: uuid('claim_token'),
     lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    /** #504 — último heartbeat do dono. NULL = nunca houve dono com lease. */
+    heartbeat_at: timestamp('heartbeat_at', { withTimezone: true }),
     // Reservado para #507 (deadline/cancelamento).
     deadline_at: timestamp('deadline_at', { withTimezone: true }),
     // Reservado para #506 (outbox durável).
     outbound_message_id: uuid('outbound_message_id'),
+    // 118 (#505, shadow) — a STREAM a que o turno pertence e as FRONTEIRAS de
+    // sequência que ele consumiu. Turno simples: `first === last`. Turno
+    // agregado pelo debounce: o intervalo fechado dos ingressos absorvidos.
+    // NULL = turno anterior ao protocolo (sem backfill).
+    stream_key: text('stream_key'),
+    stream_key_version: smallint('stream_key_version'),
+    first_ingress_seq: bigint('first_ingress_seq', { mode: 'number' }),
+    last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }),
+    // 127 (#627, fatia D) — a DECISÃO de promoção, persistida ANTES do sinal da
+    // BullMQ. `promoted_at` marca "este turno foi eleito para avançar e alguém
+    // deve um wake-up a ele"; é o que permite ao varredor reconciliar o caso
+    // "commit feito, enqueue não feito" (a fila é wake-up, não fonte de
+    // verdade). `promoted_by_turn_id` é o predecessor TERMINAL que promoveu —
+    // NULL quando o re-arme veio da recuperação de claim expirado da própria
+    // stream, onde não existe promotor. Deliberadamente NÃO reescrevem
+    // `queued_at`: a idade do head mede a espera real, não a última promoção.
+    promoted_at: timestamp('promoted_at', { withTimezone: true }),
+    promoted_by_turn_id: uuid('promoted_by_turn_id'),
+    // 130 (#628, fatia E) — a JANELA DE DEBOUNCE, como DADO. Antes daqui ela
+    // era um `setTimeout` da BullMQ mais uma chave no Redis, e por isso duas
+    // réplicas podiam fechar batches sobrepostos e um reinício perdia a janela
+    // inteira. As quatro colunas moram no turno-CABEÇA da stream porque a
+    // janela e o head-of-line são a mesma entidade: quem executa a rajada é o
+    // turno de menor `first_ingress_seq`, e é ele que absorve os irmãos.
+    //   * `debounce_window_opened_at` — âncora do teto `MESSAGE_DEBOUNCE_MAX_MS`;
+    //   * `debounce_deadline_at` — o RELÓGIO PERSISTENTE: fechar exige
+    //     `debounce_deadline_at <= now()` avaliado NO BANCO;
+    //   * `debounce_closed_at` — o fechamento ÚNICO, por compare-and-swap
+    //     (`WHERE debounce_closed_at IS NULL`);
+    //   * `debounce_batch_size` — a evidência forense da composição do batch.
+    // NULL em `debounce_deadline_at` = turno SEM janela (anterior à fatia,
+    // mídia, ou flag desligada).
+    debounce_window_opened_at: timestamp('debounce_window_opened_at', { withTimezone: true }),
+    debounce_deadline_at: timestamp('debounce_deadline_at', { withTimezone: true }),
+    debounce_closed_at: timestamp('debounce_closed_at', { withTimezone: true }),
+    debounce_batch_size: integer('debounce_batch_size'),
     queued_at: timestamp('queued_at', { withTimezone: true }),
     claimed_at: timestamp('claimed_at', { withTimezone: true }),
     started_at: timestamp('started_at', { withTimezone: true }),
@@ -3140,6 +3560,42 @@ export const agent_turns = pgTable(
     leaseIdx: index('agent_turns_lease_idx')
       .on(t.tenant_id, t.agent_id, t.lease_expires_at)
       .where(sql`status IN ('claimed', 'running')`),
+    // #504 (migration 114): mesma pergunta, SEM tenant no prefixo — é o
+    // dispatcher cross-tenant do recovery que a faz.
+    leaseExpiryIdx: index('agent_turns_lease_expiry_idx')
+      .on(t.lease_expires_at)
+      .where(sql`status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL`),
+    // #505 (migration 119): "existe turno ANTERIOR não terminal nesta stream?"
+    // — o predicado do head-of-line das fases 5–6. Criado já na fase shadow
+    // para que a ativação do enforcement não some uma construção de índice a
+    // uma mudança de comportamento na mesma janela.
+    streamHeadIdx: index('agent_turns_stream_head_idx')
+      .on(t.tenant_id, t.agent_id, t.stream_key, t.first_ingress_seq, t.status)
+      .where(sql`stream_key IS NOT NULL`),
+    // #626 (migration 126): o MESMO prefixo, mas com os terminais fora do
+    // ÍNDICE em vez de fora do resultado. No índice acima `status` vem DEPOIS
+    // de `first_ingress_seq`, então `status NOT IN (<terminais>)` é filtro, não
+    // busca: o `NOT EXISTS` do head-of-line percorre todas as entradas
+    // anteriores da stream — o histórico inteiro de uma conversa quente, a cada
+    // claim. Aqui o predicado tira os terminais do índice, e a sonda passa a
+    // custar o BACKLOG da conversa (0–2 linhas) em vez do tráfego acumulado.
+    // Os literais precisam casar TEXTUALMENTE com os da consulta
+    // (`src/db/repositories/stream-head-sql.ts`) para o Postgres provar a
+    // implicação e escolher o índice parcial.
+    streamHeadLiveIdx: index('agent_turns_stream_head_live_idx')
+      .on(t.tenant_id, t.agent_id, t.stream_key, t.first_ingress_seq)
+      .where(
+        sql`stream_key IS NOT NULL AND status NOT IN ('completed', 'ignored', 'superseded', 'dead_letter')`,
+      ),
+    // #628 (migration 130): "quais streams têm janela de debounce VENCIDA?" —
+    // a pergunta do varredor, feita FORA de contexto de tenant (ele é um
+    // dispatcher: descobre os pares com trabalho ANTES de abrir contexto). Sem
+    // `tenant_id` no prefixo pela mesma razão de `leaseExpiryIdx`. O predicado
+    // deixa no índice só as janelas ABERTAS, que são dezenas — ele ENCOLHE
+    // quando o batch fecha, em vez de crescer com o tráfego.
+    debounceDueIdx: index('agent_turns_debounce_due_idx')
+      .on(t.debounce_deadline_at)
+      .where(sql`debounce_deadline_at IS NOT NULL AND debounce_closed_at IS NULL`),
     supersededByIdx: index('agent_turns_superseded_by_idx')
       .on(t.tenant_id, t.agent_id, t.superseded_by_turn_id)
       .where(sql`superseded_by_turn_id IS NOT NULL`),
@@ -3178,10 +3634,79 @@ export const agent_turn_inputs = pgTable(
   }),
 );
 
+// Issue #505 (migration 118) — contador TRANSACIONAL de ingresso por stream.
+//
+// Uma linha por (tenant, agent, stream_key). O incremento é uma única
+// declaração `INSERT … ON CONFLICT DO UPDATE … RETURNING`, atômica e monotônica
+// sob múltiplos produtores: o lock da linha serializa APENAS a stream em
+// questão, e streams distintas não se veem (é isso que dá paralelismo entre
+// conversas sem lock global).
+//
+// A PK inclui tenant e agent mesmo com a `stream_key` já embutindo os dois no
+// material canônico: embutir não é escopar. Com o par na chave, uma stream_key
+// forjada ou colidida não consegue nem ENDEREÇAR o contador de outro tenant.
+export const agent_stream_sequences = pgTable(
+  'agent_stream_sequences',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    stream_key: text('stream_key').notNull(),
+    /** Versão do algoritmo que MINTOU a stream — não muda no incremento. */
+    stream_key_version: smallint('stream_key_version').notNull(),
+    /** Última sequência ENTREGUE. 0 = linha nova; a 1ª alocação devolve 1. */
+    last_ingress_seq: bigint('last_ingress_seq', { mode: 'number' }).notNull().default(0),
+    first_seen_at: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'agent_stream_sequences_pk',
+      columns: [t.tenant_id, t.agent_id, t.stream_key],
+    }),
+  }),
+);
+
+// Issue #629 (fatia F da #505, migration 133) — a STREAM BLOQUEADA para
+// intervenção, como dado.
+//
+// É a segunda saída da política de poison/DLQ que a issue-mãe exige escolher
+// CONSCIENTEMENTE (a primeira é `dead_letter` que libera o sucessor). Uma linha
+// ATIVA — `unblocked_at IS NULL` — faz o claim recusar todo turno da conversa
+// com `stream_poisoned`, até um operador desbloquear pela porta auditada.
+//
+// Tabela, e não coluna em `agent_turns`, porque o bloqueio é da STREAM: um
+// marcador no turno exigiria varrer o histórico da conversa a cada claim (a
+// mesma varredura que a migration 126 existe para eliminar), e o ciclo de vida
+// do bloqueio — quem bloqueou, quem desbloqueou, com que justificativa — não é
+// o ciclo de vida do turno.
+export const agent_stream_blocks = pgTable('agent_stream_blocks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  tenant_id: text('tenant_id').notNull(),
+  agent_id: text('agent_id').notNull(),
+  stream_key: text('stream_key').notNull(),
+  /** Vocabulário fechado — `STREAM_BLOCK_REASONS` de `poison-policy.ts`. */
+  reason: text('reason').notNull(),
+  /** A categoria de erro (`POISON_CATEGORIES`) que DECIDIU o bloqueio. */
+  category: text('category').notNull(),
+  /** O turno envenenado. Sem FK — coluna forense, como `promoted_by_turn_id`. */
+  blocked_by_turn_id: uuid('blocked_by_turn_id').notNull(),
+  /** `last_error_code` já sanitizado. NUNCA o resumo (pode conter conteúdo). */
+  error_code: text('error_code'),
+  blocked_at: timestamp('blocked_at', { withTimezone: true }).notNull().defaultNow(),
+  /** `NULL` = bloqueio ATIVO. É o predicado do índice único parcial. */
+  unblocked_at: timestamp('unblocked_at', { withTimezone: true }),
+  unblocked_by: text('unblocked_by'),
+  unblock_reason: text('unblock_reason'),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type AgentTurn = typeof agent_turns.$inferSelect;
 export type NewAgentTurn = typeof agent_turns.$inferInsert;
 export type AgentTurnInput = typeof agent_turn_inputs.$inferSelect;
 export type NewAgentTurnInput = typeof agent_turn_inputs.$inferInsert;
+export type AgentStreamSequence = typeof agent_stream_sequences.$inferSelect;
+export type AgentStreamBlock = typeof agent_stream_blocks.$inferSelect;
 
 // ---------------------------------------------------------------------------
 // Issue #520 — evidência de backup/restore (migration 101) e ciclo de vida de
@@ -3286,11 +3811,24 @@ export const restore_drills = pgTable(
     probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
     tombstones_pending: integer('tombstones_pending'),
     failure_code: text('failure_code'),
+    /**
+     * Estado do HOST depois do teardown (migration 112): `clean` = banco
+     * efêmero e arquivos estagiados provadamente removidos; `unsafe` = alguma
+     * cópia da produção ficou (ou não se pôde provar que não ficou);
+     * `unknown` = o processo morreu antes de conferir. Eixo INDEPENDENTE de
+     * `failure_code`, para que falha de probe e falha de teardown não se
+     * mascarem.
+     */
+    cleanup_status: text('cleanup_status').notNull().default('unknown'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     recent_idx: index('restore_drills_recent_idx').on(t.status, t.started_at),
     run_idx: index('restore_drills_run_idx').on(t.backup_run_id),
+    /** Parcial: o que se consulta em incidente é "há resíduo?" (migration 112). */
+    unsafe_idx: index('restore_drills_unsafe_idx')
+      .on(t.started_at)
+      .where(sql`cleanup_status = 'unsafe'`),
   }),
 );
 
@@ -3356,6 +3894,19 @@ export const privacy_requests = pgTable(
     export_locator: text('export_locator'),
     export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
     export_downloaded_at: timestamp('export_downloaded_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o varredor de TTL COMEÇOU neste pedido. Não autoriza
+     * nada e não tira o pedido da fila; existe para que um passe interrompido
+     * seja visível (started sem purged) em vez de ter que ser deduzido de log.
+     */
+    export_purge_started_at: timestamp('export_purge_started_at', { withTimezone: true }),
+    /**
+     * Migration 118 — o `.enc` foi removido e a ausência foi PROVADA. É a
+     * condição (`IS NULL`) que torna a marcação uma transição de vencedor
+     * único: quem não ganha não audita, e é assim que a segunda execução do
+     * varredor não duplica auditoria.
+     */
+    export_purged_at: timestamp('export_purged_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -3451,3 +4002,119 @@ export type DataTombstone = typeof data_tombstones.$inferSelect;
 export type NewDataTombstone = typeof data_tombstones.$inferInsert;
 export type RetentionRun = typeof retention_runs.$inferSelect;
 export type NewRetentionRun = typeof retention_runs.$inferInsert;
+
+// ── 108 (issue #519) — saga durável de onboarding ────────────────────────────
+// A migration 108 é a fonte de verdade das CHECKs (estados válidos, rejeição
+// dos literais 'default'/'system', escopo obrigatório por kind). Aqui
+// declaramos apenas os tipos que o Drizzle precisa.
+//
+// `version` é o token de optimistic concurrency: todo comando informa a versão
+// que leu e o UPDATE só casa com ela — dois operadores no mesmo passo produzem
+// UM avanço e um `version_conflict`.
+export const onboarding_runs = pgTable(
+  'onboarding_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    kind: text('kind').notNull(),
+    // NULL só enquanto o recurso ainda não existe (bootstrap global antes de
+    // resolver o tenant; qualquer run antes de criar o agente).
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    state: text('state').notNull().default('created'),
+    current_step: text('current_step'),
+    version: integer('version').notNull().default(1),
+    created_by: text('created_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completed_at: timestamp('completed_at', { withTimezone: true }),
+    cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    last_error_code: text('last_error_code'),
+    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    configuration_contract_version: text('configuration_contract_version').notNull(),
+    schema_version: text('schema_version').notNull(),
+    // migration 113 — a criação da run é um COMANDO MUTÁVEL e portanto
+    // idempotente: o ledger de criação vive na própria run (não há tabela
+    // filha onde guardá-lo antes de a run existir). Unicidade em
+    // `onboarding_runs_creation_key_uq` por (kind, tenant, hash).
+    creation_idempotency_key_hash: text('creation_idempotency_key_hash'),
+    creation_payload_hash: text('creation_payload_hash'),
+    // migration 113 — ponto de retomada de `failed_retryable`. Sem eles o
+    // estado autorizava QUALQUER passo anterior; com eles a máquina de estados
+    // só admite o retry do passo que falhou e as remediações declaradas.
+    failed_step: text('failed_step'),
+    resume_state: text('resume_state'),
+  },
+  (t) => ({
+    tenantStateIdx: index('onboarding_runs_tenant_state_idx').on(
+      t.tenant_id,
+      t.state,
+      t.created_at,
+    ),
+  }),
+);
+
+// Append-only. Sustenta reconstrução e diagnóstico do workflow; NÃO substitui
+// `audit_log` (governança). `summary` é sanitizado no código — nada de segredo,
+// telefone, e-mail ou QR entra aqui.
+export const onboarding_events = pgTable(
+  'onboarding_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    agent_id: text('agent_id'),
+    step: text('step').notNull(),
+    event_type: text('event_type').notNull(),
+    actor_id: text('actor_id').notNull(),
+    correlation_id: text('correlation_id'),
+    idempotency_key_hash: text('idempotency_key_hash'),
+    from_state: text('from_state'),
+    to_state: text('to_state'),
+    summary: jsonb('summary').notNull().default(sql`'{}'::jsonb`),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    runIdx: index('onboarding_events_run_idx').on(t.run_id, t.created_at),
+    tenantIdx: index('onboarding_events_tenant_idx').on(t.tenant_id, t.created_at),
+  }),
+);
+
+// Ledger de idempotência: o resultado persistido de cada comando concluído.
+// UNIQUE (run_id, step, idempotency_key_hash) — mesma chave devolve o mesmo
+// resultado; chave igual com payload divergente é conflito.
+export const onboarding_step_results = pgTable(
+  'onboarding_step_results',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    run_id: uuid('run_id').notNull(),
+    tenant_id: text('tenant_id'),
+    step: text('step').notNull(),
+    idempotency_key_hash: text('idempotency_key_hash').notNull(),
+    payload_hash: text('payload_hash').notNull(),
+    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    // migration 113 — o ledger guarda RESULTADOS CONCLUSIVOS TIPADOS, não só
+    // sucessos: uma negativa de governança e um cancelamento também são
+    // conclusões, e sem elas o retry da mesma chave devolvia `version_conflict`
+    // / `run_terminal` em vez da resposta anterior.
+    outcome_kind: text('outcome_kind').notNull().default('success'),
+    outcome_code: text('outcome_code'),
+    outcome_message: text('outcome_message'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    keyUq: uniqueIndex('onboarding_step_results_key_uq').on(
+      t.run_id,
+      t.step,
+      t.idempotency_key_hash,
+    ),
+    runIdx: index('onboarding_step_results_run_idx').on(t.run_id, t.created_at),
+  }),
+);
+
+export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+export type NewOnboardingRunRow = typeof onboarding_runs.$inferInsert;
+export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
+export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
+export type OnboardingStepResultRow = typeof onboarding_step_results.$inferSelect;
+export type NewOnboardingStepResultRow = typeof onboarding_step_results.$inferInsert;

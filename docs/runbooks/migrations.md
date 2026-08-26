@@ -1,11 +1,21 @@
 # Migrations runbook
 
 This runbook explains how to apply and (manually) revert SQL migrations
-in `migrations/`. The current setup uses a minimal viable layout: each
-migration `NNN_<name>.sql` ships with a sibling `NNN_<name>_down.sql` for
-rollback. Forward migrations are applied automatically; rollbacks are
-manual for now (a `--down` flag in `scripts/migrate.ts` is a future
-evolution).
+in `migrations/`. Each migration `NNN_<name>.sql` ships with a sibling
+`NNN_<name>_down.sql` for rollback. Forward migrations are applied by the
+runner; rollbacks stay manual by design — nothing in the runner can
+execute a `_down.sql`.
+
+> **Issue #516 changed how migrations are applied.** The logic moved out
+> of `scripts/migrate.ts` into `src/migrations/` (see
+> [`docs/architecture/modules/migrations.md`](../architecture/modules/migrations.md)),
+> and the runner now: serialises concurrent migrators with a global
+> advisory lock; records a **checksum** per applied migration and refuses
+> to proceed when a merged file changed; represents a partially-applied
+> no-transaction migration as **dirty** and blocks on it; and exposes a
+> read-only **schema readiness** verdict. `scripts/migrate.ts` is now a
+> CLI with subcommands — `up` (the default, what `npm run db:migrate`
+> runs), `plan`, `status` and `repair`.
 
 ## File layout
 
@@ -23,17 +33,22 @@ migrations/
   005_audit_mensagem_idx_down.sql
 ```
 
-`scripts/migrate.ts` discovers and applies every `NNN_*.sql` that does
-not end in `_down.sql`, in **lexical filename order** (a plain
-`Array.prototype.sort()` over the filename — not a numeric parse). Files
-containing the marker `-- maia:no-transaction` on the first line (e.g.
-005) are applied outside a `BEGIN/COMMIT` envelope so they can use
+The runner (`src/migrations/`, driven by `scripts/migrate.ts`) discovers
+and applies every `NNN_*.sql` that does not end in `_down.sql`, in
+**lexical filename order** (plain code-unit comparison — not a numeric
+parse, and not `localeCompare`, which would be locale-dependent). Files
+containing the marker `-- maia:no-transaction` on its own line (e.g. 005)
+are applied outside a `BEGIN/COMMIT` envelope so they can use
 `CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`.
 
+A file may also declare `-- maia:statement-timeout=<ms>` to raise the
+per-statement ceiling for a long backfill. The override lives in the
+migration, where a reviewer sees it — not in an operator's shell.
+
 Note: this is **not** Drizzle. `drizzle-orm` is used only as a query
-builder; the migration runner is the hand-rolled `scripts/migrate.ts`,
-which records applied migrations by **full filename** in a
-`schema_migrations (id TEXT PRIMARY KEY)` table.
+builder; the migration runner is hand-rolled, and records applied
+migrations by **full filename** in `schema_migrations` — which since #516
+also carries the checksum, lifecycle status, timings and repair trail.
 
 ### Duplicate migration numbers (and why you must NOT rename to "fix" them)
 
@@ -60,15 +75,441 @@ is grandfathered in
 CI if a NEW duplicate number is introduced** (the actual fix: don't add
 new collisions — see "Adding a new migration" below).
 
+## Inspecting before applying (read-only)
+
+```bash
+tsx scripts/migrate.ts status   # full ledger vs packaged artifact
+tsx scripts/migrate.ts plan     # just: what would `up` apply?
+```
+
+Both are **read-only**: no DDL, no ledger writes, no advisory lock. Safe
+against production, and safe to run while a migrator is working. They
+exit non-zero only when something is actually broken (dirty row, checksum
+mismatch, a migration the build does not ship, or no ledger at all) —
+pending work alone is not an error, that is what `up` is for.
+
 ## Applying migrations (up)
 
 ```bash
-npm run db:migrate
+npm run db:migrate              # = tsx scripts/migrate.ts up
 ```
 
-Applies every pending forward migration in order. Idempotent: each
-migration is recorded in the migrations bookkeeping table and is not
-re-run if already applied.
+Applies every pending forward migration in order, under a global advisory
+lock, recording a checksum per migration. Idempotent: an already-applied
+migration is skipped.
+
+Before applying anything it **refuses** (exit 1, nothing executed) when:
+
+- a migration is `dirty` — a no-transaction run failed midway;
+- a `running` row exists while no migrator holds the lock — a crashed
+  run; it is promoted to `dirty` and then blocks;
+- an applied migration's file no longer matches its recorded checksum;
+- an applied migration has no recorded checksum and no packaged file to
+  adopt one from;
+- the database ran a migration this build does not ship;
+- a forward migration on disk has no `_down.sql` sibling;
+- a migration that manages its own transaction is **not** one complete
+  `BEGIN; … COMMIT;` envelope — a statement outside it, two envelopes,
+  or an envelope that is never closed. See
+  [Fixing `unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope).
+
+A second migrator started concurrently **waits** for the first (30s by
+default) and then exits cleanly with `lock_unavailable` — it never
+applies anything unguarded.
+
+### Os quatro tetos, e onde mexer neles
+
+Todos vêm do contrato de configuração (#515) e só o serviço `migrator` os
+recebe. Os defaults são os valores que antes eram constantes de módulo, então
+não mexer em nada preserva o comportamento anterior.
+
+| Variável | Default | O que limita |
+|---|---:|---|
+| `MIGRATION_LOCK_WAIT_MS` | `30000` | Quanto um segundo migrator espera pelo advisory lock antes de sair com `lock_unavailable`. |
+| `MIGRATION_LOCK_POLL_MS` | `500` | Intervalo entre tentativas de `pg_try_advisory_lock` durante essa espera. |
+| `MIGRATION_LOCK_TIMEOUT_MS` | `10000` | `SET lock_timeout` da sessão que aplica cada migration. `0` desliga (fail-OPEN). |
+| `MIGRATION_STATEMENT_TIMEOUT_MS` | `0` (sem teto) | `SET statement_timeout` da mesma sessão. Uma migration específica sobe o próprio teto com `-- maia:statement-timeout=<ms>`. |
+
+Quando o `up` falha com erro de lock numa tabela quente, o teto que você quer
+é `MIGRATION_LOCK_TIMEOUT_MS` — e a resposta certa quase nunca é subi-lo:
+falhar em 10s é recuperável, segurar `ACCESS EXCLUSIVE` por minutos derruba
+toda query que encostar na tabela. `MIGRATION_STATEMENT_TIMEOUT_MS` continua
+sem teto por default de propósito: matar uma migration `-- maia:no-transaction`
+no meio **fabrica** o dirty state que este runbook existe para evitar.
+
+### No deploy, quem roda isto é o Compose (issue #516)
+
+`docker-compose.yml` e `compose.prod.yml` têm um job one-shot `migrate`
+entre "postgres healthy" e a subida de `app`/`admin-ui`, que dependem
+dele com `service_completed_successfully`. Ou seja: **não há mais passo
+manual de migration no deploy** — o `docker compose up` aplica e só então
+sobe a aplicação.
+
+```
+postgres healthy → migrate (`npm run db:migrate`, exit 0) → app + admin-ui
+```
+
+Consequência operacional que importa: **um blocker segura o deploy
+inteiro**. Se o `up` falhar com `service "migrate" didn't complete
+successfully`, `app` e `admin-ui` ficam em `created` e nunca sobem. Isso
+é intencional (fail-closed).
+
+**Este job é o que impede o crash loop.** Desde a ADR 0004 o `app` não fica de
+pé respondendo 503 sobre um schema que não consegue verificar: ele **morre** no
+boot, com exit code 90-98 nomeando a invariante (ver
+[`operational.md`](operational.md) §8.1). Se o app entrou em crash loop por
+schema, a primeira pergunta não é sobre o banco — é **o gate rodou?** No
+Compose ele é o `depends_on: service_completed_successfully`; fora do Compose é
+`npm run release:migrate` no comando de pré-deploy (#565).
+
+```bash
+C="docker compose --env-file .env.infra -f compose.prod.yml"   # prod
+$C logs migrate            # eventos JSON: migration.applied / failed / dirty / blocked
+$C run --rm migrate npm run db:migrate -- status   # read-only, sem lock
+```
+
+Depois de diagnosticar (e, se for o caso, `repair` — abaixo), repita o
+`up`: o job roda de novo, e `migrate up` é idempotente.
+
+O job roda **apenas** forward. Ele não executa nenhum `_down.sql`, não
+substitui o backup exigido antes de uma migration destrutiva, e não muda
+nada do procedimento manual descrito no resto deste runbook.
+
+### Fora do Compose: o recurso de migration é SEPARADO (issue #565)
+
+A infraestrutura real (Coolify) **não roda o `compose.prod.yml`**: ela tem um
+recurso próprio, só de migration, ao lado dos recursos `app` e `admin-ui`. Ele
+roda o mesmo comando (`npm run db:migrate`), a partir da mesma imagem, e
+recebe **apenas o subset `migrator` do contrato** — o arquivo versionado é
+[`.env.migrator.prod.example`](../../.env.migrator.prod.example), e o passo a
+passo está em [`deploy-prod.md` §7.5](deploy-prod.md#75-o-recurso-de-migration-separado--a-topologia-adotada).
+
+O que isso significa aqui, para quem opera migrations:
+
+- **o container de migration não tem os segredos da aplicação.** Nenhuma
+  `WHATSAPP_*`/`BAILEYS_*`, nenhuma `OWNER_*`, nenhuma chave de LLM, nenhuma
+  `VOYAGE_API_KEY`, nenhuma `BACKUP_S3_*`, nenhum `NEXTAUTH_SECRET`, nenhuma
+  `OIDC_*`. Num incidente em que se pergunta "o que esse container podia
+  vazar?", a resposta é: a credencial do banco que ele estava migrando, e mais
+  nada;
+- **o boot dele valida esse subset e só ele.** `scripts/migrate.ts` chama
+  `loadMigrationConfig()` → `loadServiceConfig('migrator')`. Um migrator que
+  morresse cobrando `WHATSAPP_*` seria o defeito da #596 do outro lado, e
+  `tests/unit/scripts/migrate-subset-boot.spec.ts` roda a CLI de verdade com o
+  `.env.migrator.prod.example` para que isso não volte em silêncio;
+- **o teto do subset é travado por categoria, não por lista de nomes.**
+  [`src/config/migrator-subset.ts`](../../src/config/migrator-subset.ts) mede a
+  ORIGEM de cada chave (grupo do contrato, namespace, segredo-só-de-banco).
+  Acrescentar uma chave de aplicação ao subset `migrator` não aumenta o raio de
+  explosão do deploy: faz o migrator **recusar rodar**, com exit 2 e a
+  variável nomeada. O guard de CI é
+  `tests/unit/config/migrator-subset.spec.ts`;
+- **a ordem do deploy vira disciplina.** `service_completed_successfully` é
+  primitiva do Compose e não existe no painel. Deploy o recurso de migration
+  primeiro e só siga se ele sair 0 — ver `deploy-prod.md` §7.5.
+
+O `docker compose` continua sendo o caminho do bring-up local e do compose de
+produção versionado aqui; o recurso separado é o que roda na infraestrutura
+real. Os dois executam o MESMO comando, de propósito.
+
+### Checksums on migrations that predate them
+
+The first `up` after this change adopts the packaged checksum for every
+already-applied migration that has none, marking it
+`checksum_source = 'backfilled'`. No historical file is renamed, edited
+or re-applied. Adoption trusts the artifact present at that moment, so do
+it in staging first and compare `tsx scripts/migrate.ts status` output
+between staging and production before rolling forward. After adoption,
+any divergence is a hard blocker.
+
+### Fixing `unverifiable_transaction_envelope`
+
+This blocker is about the **repository**, not the database: nothing was
+applied and nothing needs repairing. The migration wraps itself in
+`BEGIN; … COMMIT;` but does not keep all of its SQL inside that one
+envelope, so a failure in the part left outside would leave a durably
+committed half — and the runner would have no way to tell that apart
+from a clean rollback.
+
+The blocker names the exact defect (`statement_after_commit`,
+`multiple_envelopes`, `unterminated_envelope`, `statement_before_begin`,
+`unbalanced_control`, `self_rollback`). Two ways to fix the file, both
+in the PR that introduced it — never by editing a migration that has
+already been applied anywhere:
+
+1. Move every statement inside the single `BEGIN; … COMMIT;`; or
+2. **delete** the `BEGIN;`/`COMMIT;` lines and let the runner own the
+   transaction. This is the better default: the runner then commits the
+   ledger row in the *same* transaction as the schema change, which is
+   the only mode in this system where "applied" and "recorded" are
+   genuinely atomic.
+
+A migration that truly cannot run inside a transaction (`CREATE INDEX
+CONCURRENTLY`) takes neither route — it declares
+`-- maia:no-transaction` and omits the transaction block entirely.
+
+## Recovering a dirty migration
+
+`dirty` means a migration failed partway with no rollback to fall back
+on — normally a `-- maia:no-transaction` file, so some statements may
+have taken effect and others may not. It is never auto-retried and never
+treated as success. (A self-transactional migration whose envelope could
+not be proven complete is classified the same way, but in practice it is
+refused as an artifact problem before it can run.)
+
+1. **Read the ledger row** — it names the migration and the error class:
+
+   ```bash
+   tsx scripts/migrate.ts status
+   ```
+
+2. **Inspect the schema by hand** and decide which is true:
+   - the migration's effects ARE fully in place, or
+   - they are not, and you have undone the partial ones.
+
+   For a partially-created `CREATE INDEX CONCURRENTLY`, Postgres leaves
+   an INVALID index behind. Desde a #658 o runner **recusa** aplicar
+   qualquer coisa enquanto ele existir, e `repair --as pending` NÃO
+   destrava — o remédio completo (e a ordem certa) está em
+   [§Índice inválido deixado por DDL `CONCURRENTLY`](#índice-inválido-deixado-por-ddl-concurrently):
+
+   ```sql
+   SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE NOT i.indisvalid;
+   ```
+
+3. **Record the decision, with a reason that is persisted on the row:**
+
+   ```bash
+   # (a) verified fully applied
+   tsx scripts/migrate.ts repair --id 066_x.sql --as applied \
+     --reason "conferido: os 8 indices existem e sao validos"
+
+   # (b) partial effects undone; let it run again from scratch
+   tsx scripts/migrate.ts repair --id 066_x.sql --as pending \
+     --reason "indice invalido dropado; reaplicar"
+   ```
+
+`repair` takes the same global lock, refuses an empty reason, and refuses
+to touch a healthy `applied` row. **Never "clear the flag" without
+verifying the schema** — the reason field exists precisely so the next
+operator can tell what was checked.
+
+### Dirty on `115_agent_turns_pending_race_lost.sql` (troca de CHECK em fases)
+
+A 115 é `-- maia:no-transaction` por um motivo diferente do usual: ela
+não roda `CONCURRENTLY`, ela precisa que a varredura do
+`VALIDATE CONSTRAINT` aconteça numa transação **separada** do
+`DROP`/`ADD`, senão a validação inteira corre sob o ACCESS EXCLUSIVE
+desses e bloqueia escrita em `agent_turns` (tabela quente). Por isso ela
+tem cinco statements e quatro estados intermediários possíveis. Descubra
+em qual você está:
+
+```sql
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'agent_turns'::regclass AND conname LIKE '%status_outcome%';
+```
+
+| O que você vê | Onde a 115 parou | O que fazer |
+|---|---|---|
+| só `agent_turns_status_outcome_chk`, `convalidated = t`, sem `pending_race_lost` na definição | antes da fase 1 | `repair --as pending` e reaplicar |
+| `…_chk` + `…_chk_v115` com `convalidated = f` | depois da fase 1 | `repair --as pending` e reaplicar |
+| `…_chk` + `…_chk_v115`, ambas `convalidated = t` | depois da fase 2 | `repair --as pending` e reaplicar |
+| **só** `…_chk_v115`, `convalidated = t` | entre os dois statements da fase 3 | **não reaplique o arquivo** — ver abaixo |
+
+Nos três primeiros a tabela ainda tem a constraint canônica de pé, então
+reaplicar o arquivo inteiro é seguro: o `DROP … IF EXISTS` da fase 1 só
+derruba o nome temporário. No quarto a canônica já caiu, e reaplicar
+deixaria a tabela sem NENHUMA constraint entre dois statements. Ali a
+remediação é um statement só, e então marcar como aplicada:
+
+```sql
+ALTER TABLE agent_turns
+  RENAME CONSTRAINT agent_turns_status_outcome_chk_v115
+                 TO agent_turns_status_outcome_chk;
+```
+
+```bash
+tsx scripts/migrate.ts repair --id 115_agent_turns_pending_race_lost.sql --as applied \
+  --reason "crash entre os dois statements da fase 3; rename manual conferido"
+```
+
+Rodar o `_down` da 115 também sai desse estado (ele derruba o nome
+temporário junto), mas isso é reverter, não reparar — e ele **recusa** se
+já houver turno com `outcome = 'pending_race_lost'`.
+
+### Dirty on `116_mensagens_tipo_evento.sql` (troca de CHECK em fases)
+
+Mesmo desenho da 115, em `mensagens` — a tabela de entrada/saída, onde
+segurar ACCESS EXCLUSIVE pela varredura bloqueia inbound e outbound do
+produto inteiro. Cinco statements, quatro estados intermediários:
+
+```sql
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'mensagens'::regclass AND conname LIKE '%tipo_check%';
+```
+
+| O que você vê | Onde a 116 parou | O que fazer |
+|---|---|---|
+| só `mensagens_tipo_check`, `convalidated = t`, sem `evento` na definição | antes da fase 1 | `repair --as pending` e reaplicar |
+| `…_tipo_check` + `…_tipo_check_v116` com `convalidated = f` | depois da fase 1 | `repair --as pending` e reaplicar |
+| `…_tipo_check` + `…_tipo_check_v116`, ambas `convalidated = t` | depois da fase 2 | `repair --as pending` e reaplicar |
+| **só** `…_tipo_check_v116`, `convalidated = t` | entre os dois statements da fase 3 | **não reaplique o arquivo** — ver abaixo |
+
+Nos três primeiros a canônica ainda está de pé e reaplicar o arquivo é
+seguro. No quarto ela já caiu, e reaplicar deixaria `mensagens` sem
+NENHUMA constraint de `tipo` entre dois statements. Ali a remediação é um
+statement só, e então marcar como aplicada:
+
+```sql
+ALTER TABLE mensagens
+  RENAME CONSTRAINT mensagens_tipo_check_v116 TO mensagens_tipo_check;
+```
+
+```bash
+tsx scripts/migrate.ts repair --id 116_mensagens_tipo_evento.sql --as applied \
+  --reason "crash entre os dois statements da fase 3; rename manual conferido"
+```
+
+O `_down` da 116 também sai desse estado (derruba o nome temporário
+junto), mas isso é reverter, não reparar. Ele apaga **só** o formato
+completo que `flushUnconfirmedToolSummaries()` produz (`direcao='out'`,
+`conteudo=''`, `midia_url IS NULL`, `metadata.event_only=true`,
+`metadata.in_reply_to` presente, `metadata.flush_reason` no vocabulário de
+`ReActExitReason`, `ferramentas_chamadas` não vazio) e **recusa**, com o
+`ADD CONSTRAINT` abortando em 23514, se sobrar qualquer outra row
+`tipo='evento'` — a recusa é atômica (`BEGIN`/`COMMIT`), então nem as rows
+nem a constraint se movem. Para ver o que sobrou antes de decidir:
+
+```sql
+SELECT id, direcao, conteudo IS NULL AS conteudo_null,
+       metadata->>'event_only'   AS event_only,
+       metadata->>'flush_reason' AS flush_reason,
+       jsonb_array_length(ferramentas_chamadas) AS n_tools
+  FROM mensagens WHERE tipo = 'evento';
+```
+
+### When `repair --as applied` refuses
+
+`--as applied` records the **packaged** checksum for the id. If this build
+does not ship that migration there is nothing to record, so the command
+refuses instead of flipping the row and reporting success:
+
+```
+$ tsx scripts/migrate.ts repair --id 099_ghost.sql --as applied --reason "..."
+repair refused: repair --as applied refused for "099_ghost.sql": it would report
+success without repairing readiness.
+  - 099_ghost.sql [repair/artifact_missing]: this build does not package
+    migrations/099_ghost.sql, so there is no checksum to record and the row
+    would stay missing_file.
+      → Marking it applied here writes checksum_source='backfilled' with nothing
+        verified, and the next `migrate status`/`migrate up` blocks again on
+        missing_file — repaired in name only.
+      → Run the repair from a build that ships 099_ghost.sql, so the packaged
+        checksum can be adopted.
+      → Or, if 099_ghost.sql must not stand in this schema: undo its effects by
+        hand, then `migrate repair --id 099_ghost.sql --as pending --reason
+        "<why>"` — that DELETES the ledger row so the migration is applied again
+        from scratch, instead of certifying a schema nobody can verify.
+```
+
+Exit code **1**, nothing written: no lock is taken, no DDL is issued, and
+the ledger row is left exactly as it was (`status`, `checksum_sha256`,
+`checksum_source`, `repaired_at`, `repair_reason` all unchanged). Before
+this refusal existed the command answered `repaired 099_ghost.sql ->
+applied` and exited 0, and then the very next `status` blocked again on
+the same id — the worst possible answer from the tool you reach for
+during an incident.
+
+You will see this in exactly two situations, and they have different fixes:
+
+| Situation | Fix |
+|---|---|
+| You are on an **older image** than the database (rollback, reverted branch, canary running behind) | Repair from the build that ships the migration. The running image genuinely cannot verify a file it does not have. |
+| The migration **should not be in this schema at all** (manual rollback, abandoned branch) | Undo its effects, then `--as pending` — it deletes the row, so nothing is certified. |
+
+## Checksum mismatch
+
+`up`, `status` and readiness all fail when an applied migration's file
+changed. That is the append-only rule being enforced (AGENTS.md §4 rule
+6), not a glitch. The fix is almost always to **revert the edit** and put
+the change in a NEW migration. The only legitimate exception — the file
+was corrupted in transit, not edited — is handled by verifying the schema
+by hand and then `repair --as applied --reason "..."`, which re-adopts
+the packaged checksum and leaves an audit trail.
+
+## Índice inválido deixado por DDL `CONCURRENTLY`
+
+**Sintoma.** `migrate up` responde `blocked` com um blocker
+`invalid_index`, ou o app morre no boot com **exit 98**. A linha nomeia
+o índice: `index "public.<indice>" on table "<tabela>" is INVALID`.
+
+**O que aconteceu.** Um `CREATE INDEX CONCURRENTLY` reprovou — duplicata
+pré-existente, deadlock, cancelamento ou `statement_timeout`. O índice
+**não desaparece**: fica no catálogo com `pg_index.indisvalid = false`.
+Um índice inválido não é consultado pelo planejador e, se for `UNIQUE`,
+**não impõe nada** — a exclusão que ele deveria garantir simplesmente
+não existe.
+
+**Por que o runner recusa em vez de só avisar.** Reaplicar o arquivo
+devolveria SUCESSO sem criar índice nenhum: o `IF NOT EXISTS` enxerga o
+índice inválido, pula a criação e responde `CREATE INDEX` com exit 0.
+Sem esta guarda, o ledger passaria a dizer `applied` com a invariante de
+exclusão ausente e nenhum sinal (issue #658). Por isso a recusa
+sobrevive inclusive a um `repair --as pending`: **limpar a linha do
+ledger não conserta o catálogo**.
+
+### Remédio
+
+1. **Liste os índices inválidos** (mesma consulta que o runner usa,
+   `src/migrations/invalid-indexes.ts`):
+
+   ```sql
+   SELECT n.nspname, c.relname, i.indisready, i.indislive
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indexrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE NOT i.indisvalid
+      AND n.nspname = ANY (current_schemas(false));
+   ```
+
+   `indisready = false` = construção concorrente reprovou;
+   `indislive = false` = `DROP INDEX CONCURRENTLY` interrompido.
+
+2. **Descubra POR QUE reprovou** — em geral a duplicata que o índice
+   único ia proibir. Para um índice único parcial, rode o `GROUP BY …
+   HAVING count(*) > 1` correspondente às colunas e ao `WHERE` dele.
+   **Isto é o passo que importa**: os dados são o defeito, o índice é só
+   o mensageiro.
+
+3. **Remova o índice inválido.** Fora de transação — `CONCURRENTLY` é
+   recusado dentro de `BEGIN`:
+
+   ```sql
+   DROP INDEX CONCURRENTLY <schema>.<indice>;
+   ```
+
+4. **Resolva a duplicata** (mescle, arquive ou apague as linhas
+   excedentes, conforme o significado da tabela). Registre o que foi
+   feito — esta parte não tem trilha automática.
+
+5. **Reaplique a migration.** Se a linha do ledger ficou `dirty`, repare
+   primeiro, na ordem: `repair --as pending --reason "indice invalido
+   dropado; duplicata resolvida"`, e só então `npm run db:migrate`.
+
+6. **Confirme.** A consulta do passo 1 tem de voltar vazia e
+   `tsx scripts/migrate.ts status` tem de sair limpo. O boot só volta a
+   subir quando o veredito é `ready`.
+
+### Escopo da varredura
+
+A checagem cobre os schemas que a conexão do migrator realmente resolve
+(`current_schemas(false)` — o `search_path`, sem o `pg_catalog`
+implícito). Um índice criado explicitamente num schema fora do
+`search_path` não é visto; nenhuma migration deste repositório faz isso.
+Ampliar para "todo schema não-sistema" faria qualquer schema descartável
+de teste ou de ferramenta externa bloquear o migrator e o boot de
+produção.
 
 ## Reverting a migration (down) — manual procedure
 
@@ -101,10 +542,18 @@ in reverse order — never skip an intermediate step.
      a transaction block. `psql -f` honors that automatically — do not
      wrap them with `psql -1` or a manual `BEGIN`.
 
-4. **Manually mark the migration as un-applied** in whatever table
-   `scripts/migrate.ts` uses for bookkeeping (check the script for the
-   exact table name). Otherwise the runner will treat the migration as
-   already applied and the next `npm run db:migrate` will skip it.
+4. **Mark the migration as un-applied** so the runner will re-apply it:
+
+   ```bash
+   tsx scripts/migrate.ts repair --id NNN_name.sql --as pending \
+     --reason "rollback manual via NNN_name_down.sql em <data>"
+   ```
+
+   This deletes the ledger row and records why. (Deleting the row with
+   raw SQL also works, but leaves no trail — prefer `repair`.) The
+   bookkeeping table is `schema_migrations`; since #516 it also carries
+   the checksum, status and repair columns described in
+   [`docs/architecture/modules/migrations.md`](../architecture/modules/migrations.md).
 
 5. **Verify the rollback** with a smoke query (table missing, column
    gone, index dropped) before rerunning the application.
@@ -141,6 +590,22 @@ time. The two are reviewed together.
    numbers, append a lowercase letter to sequence it (`038b`, `038c`) —
    that token is distinct and sorts after the bare number.
 2. Create `migrations/NNN_<short_name>.sql` with the forward changes.
+   Prefer **no transaction control at all** in the file: the runner then
+   wraps the whole migration and its ledger row in one transaction,
+   which is the only genuinely atomic mode. If you do write your own
+   `BEGIN; … COMMIT;`, every executable statement must sit inside that
+   single envelope — `migrate up` refuses the file otherwise
+   ([`unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope)).
+   A migration that cannot run in a transaction declares
+   `-- maia:no-transaction` and omits the block. So does one that **must
+   not** run in a single transaction: swapping a CHECK/FK on a hot table
+   with `ADD … NOT VALID` + `VALIDATE CONSTRAINT` only avoids a long
+   ACCESS EXCLUSIVE if the validation commits separately from the
+   `DROP`/`ADD` — inside one transaction the strong lock is held across
+   the whole scan and the pair buys nothing. Such a file owes the reader
+   its crash matrix in the header (see
+   `115_agent_turns_pending_race_lost.sql` and
+   [the recovery section](#dirty-on-115_agent_turns_pending_race_lostsql-troca-de-check-em-fases)).
 3. Create `migrations/NNN_<short_name>_down.sql` that reverses them
    coherently:
    - Header:
@@ -158,10 +623,114 @@ time. The two are reviewed together.
 5. Open a PR with both files. Reviewer checks that the down truly
    reverses the up.
 
-## Future work
+## Deploy ordering (expand/contract)
 
-- Teach `scripts/migrate.ts` to discover `_down.sql` siblings and add a
-  `--down=NNN` flag that applies the corresponding down file and
-  removes the bookkeeping row.
-- Optional: rename existing `NNN_<name>.sql` to `NNN_<name>_up.sql` for
-  symmetry. Out of scope for the current minimal-viable change.
+The runner decides schema compatibility; the operator does not. A build
+declares the range it supports (`min_supported_migration` /
+`max_supported_migration` — see the module doc) and
+`getSchemaReadiness()` blocks when the database is outside it.
+
+Two rules follow, and they are the operator's responsibility:
+
+- **A destructive migration must not ship in the same release that
+  removes compatibility with the old schema.** Expand in release N (add
+  the new column, keep the old one), contract in release N+1 (drop the
+  old one) — otherwise a rollback of the application has no schema to
+  roll back to.
+- **Reverting a deploy never runs a down migration.** Rollback of code is
+  not rollback of schema. If a domain migration must actually be undone,
+  take a backup first and follow the manual procedure above.
+
+## Métricas do schema (Prometheus)
+
+O veredito canônico (`getSchemaReadiness()`) é publicado como série no
+`/metrics` do runtime — `src/observability/migration-collector.ts`, fiado
+no boot por `registerRuntimeObservability()`. As quatro famílias são
+lidas **no scrape**, do mesmo adaptador cacheado que o `/readyz` consome,
+então a métrica e o gate não podem divergir:
+
+| Série | O que é |
+|---|---|
+| `maia_schema_migration_head{kind="expected"}` | Posição (1-based) do head desta build na lista ordenada de migrations conhecidas. |
+| `maia_schema_migration_head{kind="applied"}` | Idem para o head aplicado no banco. `0` = banco virgem. |
+| `maia_schema_migrations_pending` | Migrations que faltam aplicar (inclui as `failed`, retentáveis). |
+| `maia_schema_migrations_dirty` | Migrations em `dirty`. `> 0` é intervenção humana pendente. |
+| `maia_schema_migration_last_duration_ms` | `execution_ms` da migration aplicada mais recentemente pelo relógio. |
+
+Duas leituras que valem escrever no alerta:
+
+- **`expected - applied`** é quantas migrations o banco está atrás, sem o
+  alerta precisar conhecer o head da release.
+- **`NaN` não é `0`.** `0` pendente e `0` dirty são a leitura saudável, então
+  uma leitura que falha **não pode** produzir 0: todas as séries viram `NaN`
+  quando o veredito não pôde ser lido (banco fora do ar, ledger ilegível,
+  estado `unknown`). Alerta escrito sobre `> 0` continua correto; alerta que
+  precisa distinguir "verificado saudável" de "não olhei" tem de testar
+  `absent()`/`NaN` explicitamente.
+
+Posição ordinal, e não o número do arquivo, porque o número **não é único**
+neste repositório (issue #308 — doze números compartilhados), então `063` não
+identifica um head.
+
+**O tempo esperando o lock não é uma série, de propósito.** Ele é conhecido só
+dentro do processo que migrou (`MigrationRunResult.lock_waited_ms`), e esse
+processo é o job one-shot `migrate`, que sai e morre — ninguém o raspa. Um
+gauge publicado por ele congelaria sem medição nenhuma, que é pior que
+ausência porque parece um sinal. O valor continua nos eventos estruturados
+`migration.lock_wait` / `migration.lock_acquired` que a CLI imprime (`docker
+compose logs migrate`), e a consequência de alguém segurar o lock demais
+aparece em `maia_schema_migrations_pending` que não cai.
+
+## Future work (issue #516 remainder)
+
+O escopo da #516 foi reduzido formalmente pelo dono em 2026-08-15: o
+`maia doctor` migrou para a #517 e o material de Coolify/K8s para a #565.
+O que sobra está abaixo.
+
+### Entregue (não refazer)
+
+- `/readyz` consome `getSchemaReadiness()`. O componente `schema` passa por
+  `src/runtime/lifecycle/schema-readiness.ts`, então checksum divergente,
+  linha `dirty` ou `running` órfã, arquivo de migration que esta build não
+  empacota, head incompatível e banco ilegível respondem **503** cada um.
+  `READINESS_SCHEMA_CHECK=false` é recusado no boot no profile `production`.
+  Detalhe operacional (inclusive o cache de 10s do veredito) em
+  [`operational.md`](operational.md) §8.1.
+- Job one-shot `migrate` no Compose (PR #563): `docker-compose.yml:125` e
+  `compose.prod.yml:168`, com `app` e `admin-ui` dependendo dele por
+  `service_completed_successfully`. Ver
+  [§ No deploy, quem roda isto é o Compose](#no-deploy-quem-roda-isto-é-o-compose-issue-516).
+- `maia doctor` consumindo o veredito (PR #598): o check
+  `postgres.schema_readiness` (`src/ops/doctor/checks/postgres.ts`) chama
+  `getSchemaReadiness()` pelo seam read-only de `src/ops/doctor/schema.ts` —
+  `BEGIN READ ONLY`, `SET LOCAL statement_timeout` e o `AbortSignal` do check.
+  O doctor **não** re-deriva estado de schema; ele pergunta.
+- Tetos de lock/statement no contrato de configuração (#515):
+  `MIGRATION_LOCK_WAIT_MS`, `MIGRATION_LOCK_POLL_MS`,
+  `MIGRATION_LOCK_TIMEOUT_MS` e `MIGRATION_STATEMENT_TIMEOUT_MS`, só no
+  serviço `migrator`, com os defaults iguais aos valores que eram constantes
+  de módulo (30000 / 500 / 10000 / sem teto). `src/migrations/` continua sem
+  ler `process.env`: quem injeta é `scripts/migrate.ts`, via
+  `migrationRunOptions()`.
+- Métricas de migration no `/metrics` — ver a seção acima.
+- **O BOOT decide pelo mesmo veredito e MATA o processo** (decisão do dono,
+  [ADR 0004](../architecture/decisions/0004-boot-fails-closed-on-the-canonical-schema-verdict.md)).
+  `src/index.ts` (etapa `schema`) chama `checkSchemaReadiness()` e encerra o
+  processo com exit code **90-98**, um por invariante: 90 dirty/`running`
+  órfão · 91 checksum divergente · 92 checksum ausente · 93 migration que este
+  build não empacota · 94 migration obrigatória ausente · 95 schema acima do
+  máximo · 96 `running` em voo · 97 veredito `unknown` · 98 índice
+  `indisvalid = false` (#658). `checkSchemaVersion()`
+  foi REMOVIDO — não há mais um segundo veredito de schema. A mensagem de
+  morte (`maia.schema_boot_refused`) nomeia migration, checksum esperado vs.
+  encontrado e o comando de remediação. Árvore de decisão do operador (exit
+  code vs. `/readyz`) em [`operational.md`](operational.md) §8.1.
+
+### Aberto
+
+- **Drill em staging.** Nada aqui foi exercitado contra um banco de staging
+  real: subir uma réplica atrás do head, ver o container MORRER com exit code
+  94 (e o `/readyz` de uma réplica já no ar recusar), rodar o job, ver a
+  rotação voltar. Depende do ambiente do dono, não de código.
+- Um flag `--down=NNN` continua deliberadamente não construído: rollback de
+  migration é manual e revisado.

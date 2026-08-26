@@ -8,6 +8,29 @@
 
 Single-tenant runtime today (`tenant_id='default'`, `agent_id='default'` seeded by migration P0) does not relax the invariant — it makes it *latent*. Provisioning a second tenant must be a configuration change, never a code change.
 
+### 1.1 The one bounded exception: `system` operational state
+
+The invariant governs **data**. It does not govern the health of a shared external dependency, which belongs to nobody. That category — `system` operational state — is the single sanctioned exception, defined in [ADR 0002](../decisions/0002-external-dependency-health-is-system-state.md).
+
+It is narrow on purpose. State qualifies only when **all four** hold:
+
+1. it is not derived from tenant data;
+2. the thing it measures is genuinely shared — every tenant reaches the same instance, with the same credentials, endpoint and quota;
+3. only failures attributable to the dependency feed it, so no caller can move it with input it controls;
+4. every individual decision made from it is still attributed with `tenant_id + agent_id`.
+
+Conditions 3 and 4 are what make a global aggregate legitimate instead of merely convenient: no tenant can *cause* another's outcome, and every outcome remains traceable to who received it.
+
+**Current members of this category — the complete list:**
+
+| State | Where | Why it qualifies |
+|---|---|---|
+| LLM circuit-breaker state per `(provider, workload)` | `src/lib/llm/circuit-breaker.ts` | Health of a third-party API shared by all tenants. Only `provider_5xx`/`network`/`timeout` feed it; every refusal emits `maia_llm_requests_total{status="circuit_open"}` with tenant and agent. |
+
+Adding to this table requires an ADR entry arguing the candidate against all four conditions. A code comment is **not** sufficient to except this invariant — if the only justification lives next to the code, a reviewer reading this document is right to treat the divergence as a bug.
+
+**This exception is not a fairness mechanism.** If one tenant's traffic degrades another's while the dependency is healthy, that is noisy-neighbour, and the answer is a per-tenant bulkhead or rate limit — never fragmenting a shared-health control, which would break condition 2 and destroy its sample.
+
 ## 2. Why it matters
 
 The platform's value proposition is *"agents learn from experience, but only evolve inside governance, scope, and evidence"* — and scope is enforced here. A single cross-tenant leak invalidates the entire learning system: a fact learned about tenant A could be recalled while answering tenant B, and the agent has no way to detect the contamination. Governance audits can't catch what isolation didn't separate in the first place.
@@ -45,6 +68,7 @@ Every request entry-point (`src/gateway/baileys.ts`, every worker in `src/worker
 | Audit log | `audit_logs.tenant_id + agent_id` + metric labels | `src/governance/audit.ts` (see §4) |
 | Outbox | `outbox.tenant_id + agent_id` | `src/scheduling/repos.ts` |
 | Policy pubsub | Per-tenant Redis channel | `src/control-plane/policy/policy-cache.ts` |
+| Stream de ordenação do turno (#505) | `tenant_id + agent_id` são componentes OBRIGATÓRIOS do material canônico da `stream_key` **e** as duas primeiras colunas da PK de `agent_stream_sequences` — embutir na chave não é escopar, e é a PK que impede uma `stream_key` forjada de endereçar o contador de outro tenant | `src/runtime/turns/stream-key.ts`, `src/db/repositories/turn-repos.ts` |
 
 ## 4. Patterns
 
@@ -53,6 +77,30 @@ Every request entry-point (`src/gateway/baileys.ts`, every worker in `src/worker
 `runWithTenantContext({ tenant_id, agent_id }, async () => { ... })` at the top of every request handler, worker iteration, and script entry. Downstream code reads via `tryGetCurrentContext()` or `getCurrentContext()` — the ALS does the propagation.
 
 This pattern keeps function signatures clean (no `(tenant_id, agent_id, ...realArgs)` everywhere) while making the context impossible to lose silently — `getCurrentContext()` throws if called outside ALS.
+
+### 4.1.1 Sanctioned cross-tenant readers at entry points (and their price)
+
+An entry point that *discovers* which tenant owns the work cannot already be
+scoped by that tenant. Three readers bypass `applyTenantGuard` for exactly that
+reason, and they are the complete list:
+
+| Reader | Entry point |
+|---|---|
+| `channelsRepo.findByExternalCrossTenant` | Baileys ingress — resolves the channel that owns an inbound JID |
+| `mensagensRepo.findOwnerByIdCrossTenant` / `adoptToResolvedTenantCrossTenant` / `findByWhatsappIdCrossTenant` | `agent/core.ts` adoption + `messages.update` |
+| `agentTurnsRepo.findJobScopeByIdCrossTenant` | #504 — the queue consumer, translating a V2 job's `turn_id` into `(tenant_id, agent_id, representative_message_id)` |
+
+The bypass is not what makes these safe; the predicates around them are. For the
+third one — the newest — the guarantees are enumerated in
+[`src/runtime/turns/scope-resolver.ts`](../../../src/runtime/turns/scope-resolver.ts)
+and summarised in [`modules/runtime.md`](../modules/runtime.md): the payload
+cannot carry scope (the V2 schema is `.strict()`), the projection carries no
+content columns, the turn→message pointer is **reconciled** rather than trusted
+(`agent_turns.representative_message_id` has no foreign key), every non-resolution
+fails closed including the `default`/`system` sentinels, and every refusal is
+audited (`turn_job_scope_rejected`) and metered with a closed-vocabulary reason.
+
+Adding a fourth reader to this table is a reviewed decision with the same bar.
 
 ### 4.2 Synthetic `system` context for legitimately tenant-less paths
 
@@ -94,6 +142,12 @@ Whitespace-only `tenant_id` / `agent_id` are also rejected (`src/db/tenant-conte
 | `tests/unit/control-plane/knowledge-state-machine/ksm-rules-cross-tenant.spec.ts` | KSM transitions scoped |
 | `tests/property/knowledge-state-machine.spec.ts` | Property-based KSM invariants |
 | `tests/integration/p10a-knowledge-lifecycle.spec.ts` | KSM lifecycle stays scoped |
+| `tests/integration/turn-job-v2-scope-real-db.spec.ts` | #504 — a fronteira do payload V2: um job apontando para um turno cuja mensagem representativa pertence a OUTRO `(tenant_id, agent_id)` é recusado (`scope_mismatch`) antes de qualquer trabalho de domínio, e a mensagem da vítima não é tocada. O caso de CONTROLE prova que o mesmo harness executa com o ponteiro íntegro |
+| `tests/integration/onboarding-leak.spec.ts` | Saga de onboarding (#519): leitura, escrita, retomada, cancelamento e ativação escopadas; CHECK contra `'default'`/`'system'`. **Ainda não está no script `test:leak`** |
+| `tests/unit/onboarding/readiness-facts-scope.spec.ts` | DB-free: o loader de readiness compila `tenant_id + agent_id` em cada `WHERE` |
+| `tests/unit/onboarding/readiness.spec.ts` | Readiness nunca compõe profile de um agente com canal de outro (nem entre tenants) |
+| `tests/integration/tool-request-aggregation-real-db.spec.ts` | #637 — a agregação de pedidos de ferramenta COMPARA o texto do pedido de um cliente com o de outro, então o escopo aqui não é formalidade: dois tenants com pedidos **byte a byte iguais** produzem dois agregados de 1, nunca um de 2; e o repositório não devolve o agregado do outro tenant nem com o `id` na mão (`id` não é fronteira de isolamento — #367/#368). **Está no script `test:leak`** |
+| `tests/integration/tool-request-triagem-console-real-db.spec.ts` | #638 — a TRIAGEM no console, com pedidos **idênticos** em dois tenants E em dois agentes do MESMO tenant. Os dois eixos são testados de propósito: como `agents.id` é único globalmente, um filtro que só olhasse `agent_id` continuaria separando tenants — é o par de agentes do mesmo tenant que faz a asserção morder. Aceitar o pedido de um escopo "de dentro" de outro é `NOT_FOUND` e **não cria linha** em `tool_request_issues`. **Está no script `test:leak`** |
 
 There is a dedicated npm script `npm run test:leak` that runs the leak suite — invoke it on any change that touches state or context.
 

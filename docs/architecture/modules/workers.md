@@ -45,6 +45,7 @@ Per-worker gauges: `maia_worker_active_jobs{worker}`,
 | **Conversation** | `conversation-summarizer.ts`, `inactivity-sweep.ts`, `message-recovery.ts` |
 | **Briefings** | `briefings.ts` |
 | **Governance** | `audit-mode-expirer.ts`, `audit-watcher.ts`, `idempotency-cleanup.ts` |
+| **Onboarding (#519)** | `onboarding-expirer.ts` — varredura GLOBAL sob contexto `system` (a run vencida pode ainda não ter tenant), em lotes de `ONBOARDING_EXPIRER_BATCH_LIMIT`. A série de cancelamento é atribuída ao `tenant_id + agent_id` de cada run; o backlog é lido no scrape (`observability/onboarding-expiry-collector.ts`), não publicado pelo worker. Ver o cabeçalho do arquivo |
 | **Operational** | `health-monitor.ts`, `cost-monitor.ts`, `dlq-monitor.ts`, `backup.ts`, `backup-s3.ts` |
 
 ## Patterns it follows

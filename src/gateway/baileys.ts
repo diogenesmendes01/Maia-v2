@@ -44,6 +44,11 @@ import {
   noteTurnQueued,
   noteTurnEnqueueFailed,
   turnStateMachineEnabled,
+  isStreamIdentityUnresolved,
+  noteIngressSequenced,
+  reportStreamIngressRejected,
+  reportStreamIngressResolved,
+  transactionalDebounceEnabled,
   type TurnStatus,
 } from '@/runtime/turns/index.js';
 import { checkBotAndMaybeBlock } from './bot-detection.js';
@@ -966,6 +971,14 @@ async function resolveTenantCtxForUpsert(
   }
 }
 
+/**
+ * #505 — o TIPO de canal deste gateway. Literal porque `mensagens` guarda só o
+ * `channel_id` da linha, não o tipo, e WhatsApp é o único canal habilitado no
+ * runtime (ARCHITECTURE.md §1). É o rótulo (de vocabulário fechado) das séries
+ * `maia_stream_ingress_*`.
+ */
+const INGRESS_CHANNEL_KIND = 'whatsapp';
+
 async function handleIncoming(
   msg: proto.IWebMessageInfo,
   // [Issue #290] Optional channel_id resolved at the upsert listener. Kept
@@ -1073,52 +1086,91 @@ async function handleIncoming(
   // transação. Se o processo morrer entre o commit e o enqueue, o recovery
   // reencontra o turno em `received` (a ordem persistir-antes-de-enfileirar já
   // era a fundação correta; o turno só a torna diagnosticável).
-  const {
-    row: stored,
-    duplicate,
-    turn,
-  } = await mensagensRepo.createInbound(
-    {
-      conversa_id: null,
-      // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
-      // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
-      // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
-      // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
-      // cai na partial unique legada por (tenant, agent, whatsapp_id).
-      channel_id: _resolvedChannelId,
-      direcao: 'in',
-      tipo: type,
-      conteudo: content,
-      midia_url: mediaPath,
-      metadata: {
-        whatsapp_id,
-        remote_jid,
-        telefone: tel,
-        pushname: msg.pushName ?? null,
-        timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
-        media_mime: mediaMime,
-        media_sha256: mediaSha256,
-        // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
-        // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
-        // processes; only the media fields are withheld.
-        media_rejected: mediaRejected,
-        // [Issue #290] Channel resolved at the ingress. In single-tenant this is
-        // the seeded default channel id (#411 catch-all); null only when the
-        // resolver path didn't surface a channel_id (e.g., tests driving
-        // handleIncoming directly). Persisted for triage and as defense-in-depth
-        // — the worker's adoption probe is unaffected by this field.
-        ingress_channel_id: _resolvedChannelId,
-        // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
-        // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
-        // exact-match por linha nos modos shadow/exact_first/strict.
-        bot_line_external_id: _botLine,
+  //
+  // Issue #505 — o `createInbound` passou a ser FAIL-CLOSED quanto à identidade
+  // de stream: um ingresso cuja conversa não pode ser derivada com segurança
+  // lança em vez de ser persistido. O `catch` abaixo converte isso no MESMO
+  // desfecho que este arquivo já dá a toda falha de resolução — audita e
+  // derruba a mensagem — em vez de deixá-lo escapar como `baileys.handle_failed`
+  // opaco, que perderia o motivo tipado.
+  let ingress: Awaited<ReturnType<typeof mensagensRepo.createInbound>>;
+  try {
+    ingress = await mensagensRepo.createInbound(
+      {
+        conversa_id: null,
+        // 090 (spec roteamento v4 §1.7): canal resolvido NO ingresso, carimbado na
+        // PERSISTÊNCIA — o dedup de rows novas é por (channel_id, whatsapp_id), de
+        // modo que o mesmo whatsapp_id em duas linhas persiste DUAS vezes e um
+        // retry na MESMA linha persiste UMA. Null (testes/entradas sem resolução)
+        // cai na partial unique legada por (tenant, agent, whatsapp_id).
+        channel_id: _resolvedChannelId,
+        direcao: 'in',
+        tipo: type,
+        conteudo: content,
+        midia_url: mediaPath,
+        metadata: {
+          whatsapp_id,
+          remote_jid,
+          telefone: tel,
+          pushname: msg.pushName ?? null,
+          timestamp_ms: Number(msg.messageTimestamp ?? 0) * 1000,
+          media_mime: mediaMime,
+          media_sha256: mediaSha256,
+          // P0 audit ch. 4 — why the media was refused ('too_large_declared' |
+          // 'too_large' | 'bad_magic'), null when accepted/absent. The turn still
+          // processes; only the media fields are withheld.
+          media_rejected: mediaRejected,
+          // [Issue #290] Channel resolved at the ingress. In single-tenant this is
+          // the seeded default channel id (#411 catch-all); null only when the
+          // resolver path didn't surface a channel_id (e.g., tests driving
+          // handleIncoming directly). Persisted for triage and as defense-in-depth
+          // — the worker's adoption probe is unaffected by this field.
+          ingress_channel_id: _resolvedChannelId,
+          // §1.1 (spec roteamento v4) — a LINHA que RECEBEU esta mensagem. O
+          // probe do worker (`probeMessageForChannel`) repassa ao resolver para o
+          // exact-match por linha nos modos shadow/exact_first/strict.
+          bot_line_external_id: _botLine,
+        },
+        processada_em: null,
+        ferramentas_chamadas: [],
+        tokens_usados: null,
       },
-      processada_em: null,
-      ferramentas_chamadas: [],
-      tokens_usados: null,
-    },
-    { withTurn: turnStateMachineEnabled() },
-  );
+      { withTurn: turnStateMachineEnabled() },
+    );
+  } catch (err) {
+    if (!isStreamIdentityUnresolved(err)) throw err;
+    // O repositório RECUSOU e não persistiu nada. Aqui é onde a recusa vira
+    // evidência: métrica (`maia_stream_ingress_total{result="rejected"}` +
+    // `maia_stream_ingress_rejected_total{reason}`), `audit_log` e log
+    // estruturado. A observabilidade mora nesta camada — e não no repositório —
+    // porque `src/db/repositories/` é compartilhado com o console `admin-ui`,
+    // que não pode alcançar `src/config/env.js` (issue #596).
+    await reportStreamIngressRejected({
+      reason: err.reason,
+      channel_kind: INGRESS_CHANNEL_KIND,
+      whatsapp_id,
+    });
+    logger.warn(
+      { whatsapp_id, reason: err.reason },
+      'baileys.stream_identity_unresolved_drop',
+    );
+    return;
+  }
+  const { row: stored, duplicate, turn } = ingress;
+  // #505 — o ingresso foi atribuído a uma stream e recebeu sua posição nela.
+  // `duplicate` fica de fora de propósito: uma reentrega NÃO recebe sequência
+  // nova (ela reusa a da row original), então registrá-la aqui contaria a mesma
+  // posição duas vezes na trilha.
+  if (!duplicate && stored.stream_key && stored.ingress_seq !== null) {
+    reportStreamIngressResolved(INGRESS_CHANNEL_KIND);
+    await noteIngressSequenced({
+      stream_key: stored.stream_key,
+      stream_key_version: stored.stream_key_version ?? 0,
+      ingress_seq: Number(stored.ingress_seq),
+      mensagem_id: stored.id,
+      channel_kind: INGRESS_CHANNEL_KIND,
+    });
+  }
   // Handle do turno recém-criado (null quando a flag está OFF). Só transições
   // de ESTADO passam por ele — nenhum dado da mensagem.
   const turnHandle = turn
@@ -1163,6 +1215,31 @@ async function handleIncoming(
   //   The metric / log here is the signal an operator uses to surface
   //   the outage.
   if (config.FEATURE_MESSAGE_DEBOUNCE && type === 'texto') {
+    // #628 (fatia E da #505) — O DEBOUNCE TRANSACIONAL SUBSTITUI ESTE BLOCO.
+    //
+    // Com a flag ligada, a janela desta rajada JÁ FOI aberta (ou estendida) na
+    // MESMA transação que persistiu a mensagem, alguns statements atrás, dentro
+    // de `createReceivedTurnTx`. Não há nada a armar aqui, e armar seria pior
+    // que redundante: o job atrasado da BullMQ voltaria a ser um segundo prazo,
+    // com relógio próprio, competindo com o do banco pelo mesmo batch — que é
+    // exatamente a borda mal definida que a fatia existe para eliminar.
+    //
+    // O turno fica em `received` DE PROPÓSITO. `queued` significa "existe
+    // wake-up para este turno", e ainda não existe: quem o cria é o fechamento
+    // do batch, quando o prazo vencer. Carimbar `queued` aqui faria o varredor
+    // de recovery enxergar um turno enfileirado sem job e rearmá-lo por conta
+    // própria — furando a janela de debounce que acabou de ser aberta.
+    //
+    // E o caminho fica SEM REDIS. É a metade da issue que nenhum teste de
+    // concorrência prova sozinho: um reinício entre a persistência e o `add`
+    // não pode perder a janela se não existe `add`.
+    if (transactionalDebounceEnabled()) {
+      logger.info(
+        { mensagem_id: stored.id, tel: '[REDACTED]', debounce: 'window_armed' },
+        'baileys.message.debounce_window_armed',
+      );
+      return;
+    }
     try {
       // `phone` (the user's tel) feeds the tenant-scoped debounce identity.
       // The composite key (`${tenant_id}:${agent_id}:${phone}`) is derived
@@ -1237,8 +1314,12 @@ async function handleIncoming(
     // Issue #514 §5 — carry the PERSISTED inbound timestamp so the E2E latency
     // SLI is measured from when the message actually arrived, not from when a
     // worker happened to pick it up.
+    // #504 — o `turn_id` dá ao job identidade DURÁVEL e, com ela, um `jobId`
+    // determinístico. Sem isto o ingresso e o sweep de recovery armavam dois
+    // jobs distintos para o mesmo turno; agora colidem num só.
     await enqueueAgent({
       mensagem_id: stored.id,
+      ...(turnHandle ? { turn_id: turnHandle.turn_id } : {}),
       received_at_ms: stored.created_at?.getTime(),
     });
   } catch (err) {

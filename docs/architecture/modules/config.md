@@ -17,9 +17,11 @@
 | `src/config/services.ts` | Minimum configuration per service; `manifestForService`, `assertServiceMayRead` |
 | `src/config/load.ts` | `loadServiceConfig()` + `ConfigValidationError` + `bootSummary()` |
 | `src/config/migration-config.ts` · `admin-config.ts` · `backup-config.ts` | Named loaders for the migration runner (#516), the Admin UI and backup/restore |
+| `src/config/migrator-subset.ts` | The `migrator` subset's **ceiling and floor**, expressed by the ORIGIN of each key — contract `group` (only `core` + `database`), Maia namespace (only `MAIA_`), secrets-must-be-database — plus the floor (`DATABASE_URL`, required in every profile). Called by `loadMigrationConfig()`, so a subset that gained an application key makes the migrator refuse to run (#565) |
 | `src/config/generate.ts` | Deterministic generators for every artifact |
 | `src/config/env-file.ts` | `parseEnvFile()` — delegates to `dotenv.parse`, the same parser the boot uses, so CLI and runtime cannot disagree about a `.env` line |
-| `src/config/env.ts` | **Thin** boot loader: `dotenv/config` + the runtime schema from the contract; exports the `config` singleton |
+| `src/config/env.ts` | **Thin** boot loader: `dotenv/config` + the runtime schema from the contract; exports the `config` singleton. Importing it costs the WHOLE `runtime` subset validation — which is why only runtime processes may reach it |
+| `src/config/contract-env.ts` | `contractEnv` — the contract's parse of ONE variable, on read, with **no** service-subset boot (#596). For modules more than one container loads (`db/client.ts`, `lib/logger.ts`, `lib/llm-settings.ts`, `governance/idempotency.ts`, `control-plane/runtime-trace/lib/hmac.ts`, `gateway/staging-crypto.ts`, `config/feature-flags.ts`) |
 | `src/config/feature-flags.ts` | Runtime feature-flag overrides / kill switches on top of the env defaults |
 | `src/config/generated/` | Generated artifacts (JSON Schema, service manifest, per-profile fixtures) |
 
@@ -63,7 +65,18 @@ import { loadMigrationConfig } from '@/config/migration-config.js';
 
 // Runtime singleton (has import-time side effects, by design)
 import { config } from '@/config/env.js';
+
+// Shared by more than one container: one variable, parsed on read, no service boot
+import { contractEnv } from '@/config/contract-env.js';
 ```
+
+**Which of the two.** A module that belongs to ONE service reads through that
+service's loader (or, for the runtime, the `config` singleton). A module that
+MORE THAN ONE container loads reads `contractEnv`: importing `@/config/env.js`
+there would drag the `runtime` boot into every process that loads it — which is
+how the Admin UI ended up demanding the six `BACKUP_*`, S3 credentials included,
+in a container that never runs a backup (issue #596). The boundary is enforced
+by `tests/unit/config/admin-import-boundary.spec.ts`.
 
 Direct `process.env.X` reads outside `src/config/` are an anti-pattern, enforced by the `no-restricted-properties` rule in `eslint.config.js` with an explicit, shrinking allow-list.
 
@@ -101,12 +114,18 @@ fixture files themselves, accepts them. `--allow-placeholders` (used for
 | `tests/unit/config/required-when.spec.ts` | Every `requiredWhen` in the contract, both branches; the case list is asserted to equal the contract's |
 | `tests/unit/config/init-template.spec.ts` | `config init` emits a template (never a fixture), it fails until filled and passes once filled; fixture-as-environment is rejected |
 | `tests/unit/config/boot-fail-closed.spec.ts` | The real loader aborts on tombstone / unknown key / profile contradiction in every profile, and the `MAIA_CONFIG_STRICT_BOOT=false` rollback behaves as documented |
+| `tests/unit/config/contract-env.spec.ts` | `contractEnv` yields the same value as the service schema, variable by variable, and reading one does not require another service's subset |
+| `tests/unit/config/admin-import-boundary.spec.ts` | No import path from `src/admin-ui/**` reaches `src/config/env.ts`, and the runtime entrypoints that still do are pinned by name |
+| `tests/admin-ui/unit/admin-boot-config.spec.ts` | The Next.js `register()` hook validates the `admin-ui` subset: boots with zero runtime-only variables, refuses the four missing `OIDC_*` and `OIDC_TENANT_SLUGS=default` |
+| `tests/unit/config/migrator-subset.spec.ts` | The `migrator` subset's invariant by CATEGORY over the real contract (no application domain, no foreign Maia namespace, no non-database secret, floor intact), the guard's own canaries, and `.env.migrator.prod.example` read from disk |
+| `tests/unit/scripts/migrate-subset-boot.spec.ts` | The real CLI (`tsx scripts/migrate.ts`) boots in a separate process with `.env.migrator.prod.example` and nothing else — it must not demand the application contract |
 
 ## In-flight changes
 
 Issue #515 landed the contract, the generators, the validation and the fail-closed boot (rollout step 8, brought forward by the owner during PR #522 review). Still open, by design:
 
 - migrating the remaining direct `process.env` readers listed in the ESLint allow-list;
+- two DYNAMIC imports still reach `src/config/env.ts` from the console at request time — the best-effort cache-invalidation publishes in `src/lib/llm-settings.ts` and `src/db/repositories/profile-repos.ts`. Both swallow their own failure, so the console degrades to the cache TTL instead of failing a request; converting `src/lib/llm/cache-invalidation.ts` and `src/agent/turn-context/cache.ts` (plus their subtrees) is the remaining slice of #596;
 - `maia doctor` (#517) and the migration runner (#516) consuming the loaders;
 - boot observability (emit profile / contract version / config hash / warning count as a metric — `bootSummary()` already produces the payload, nothing publishes it yet).
 

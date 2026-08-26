@@ -143,8 +143,19 @@ export async function renderPdfToBuffer(docDefinition: unknown): Promise<Buffer>
   // We must use require() here because the module's `main` is a CommonJS file
   // that uses `module.exports = new pdfmake()`, which dynamic import() wraps
   // differently across bundlers. Using createRequire keeps the instance stable.
-  const { createRequire } = await import('node:module');
-  const req = createRequire(import.meta.url);
+  // `(await import('node:module')).default` em vez do destructuring nomeado, e a
+  // razão não é estética: o `src/admin-ui` fixa `@types/node` em 22.9.0 enquanto
+  // a raiz está em 25.x, e este arquivo entra no programa do `tsc` do admin por
+  // import transitivo. Sob os typings 22.9.0 o namespace de `node:module` não
+  // expõe `createRequire` como named export, e `npm run admin:typecheck`
+  // reprovava com TS2339 — um comando que o `AGENTS.md` manda rodar, quebrado no
+  // `main`. Ir pelo `default` compila sob os DOIS conjuntos de typings.
+  //
+  // Isto é a correção cirúrgica; a divergência de `@types/node` continua aberta
+  // na issue #550. Alinhar o admin ao 25.x não é óbvio: o runtime mínimo do
+  // projeto é Node 22, e typings mais novos liberam APIs que não existem nele.
+  const Module = (await import('node:module')).default;
+  const req = Module.createRequire(import.meta.url);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pdfmakeInstance = req('pdfmake') as any;
 
