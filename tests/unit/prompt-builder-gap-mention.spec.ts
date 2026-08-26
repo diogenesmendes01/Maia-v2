@@ -44,7 +44,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: capabilitiesSkillListAll },
   capabilityGapsRepo: {
     listByLevel: capabilityGapsListByLevel,
-    listByLevels: capabilityGapsListByLevels,
+    listParaOTurno: capabilityGapsListByLevels,
   },
   procedureExecutionsRepo: { findActiveForConversa: procedureExecutionsFindActiveForConversa },
   procedureDefinitionsRepo: { findById: procedureDefinitionsFindById },
@@ -88,6 +88,9 @@ function makeGap(
     last_observed: now,
     last_level_change_at: now,
     created_at: now,
+    resolved_at: null,
+    resolved_reason: null,
+    resolved_tool_name: null,
     ...overrides,
   } as AgentCapabilityGap;
 }
@@ -173,8 +176,8 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
     );
   });
 
-  it('5. Flag ON + apenas silent/dashboard → seção ausente (listByLevels retorna [])', async () => {
-    // O contrato do repo: listByLevels(['mentionable','proposed']) filtra esses
+  it('5. Flag ON + apenas silent/dashboard → seção ausente (listParaOTurno retorna [])', async () => {
+    // O contrato do repo: listParaOTurno(['mentionable','proposed']) filtra esses
     // níveis. Gaps em silent/dashboard nem chegam aqui — simulamos retorno [].
     capabilityGapsListByLevels.mockResolvedValue([]);
 
@@ -183,11 +186,98 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
 
     expect(system).not.toContain('## Limitações conhecidas');
     // E confirma que a query passou apenas mentionable+proposed (gate #7
-    // implícito: silent NUNCA aparece como argumento do listByLevels aqui).
+    // implícito: silent NUNCA aparece como argumento do listParaOTurno aqui).
     expect(capabilityGapsListByLevels).toHaveBeenCalledTimes(1);
     const [levelsArg] = capabilityGapsListByLevels.mock.calls[0]!;
     expect(levelsArg).toEqual(['mentionable', 'proposed']);
     expect(levelsArg).not.toContain('silent');
     expect(levelsArg).not.toContain('dashboard');
+  });
+});
+
+/**
+ * #638 (fatia C da épica #471) — o AVISO ao agente, que é a metade que fecha o
+ * laço da épica: "a ferramenta que você pediu agora existe".
+ *
+ * A entrega é o prompt do turno seguinte. Estes casos exercem o `buildPrompt`
+ * de produção contra as linhas que o monitor de fechamento grava — nada de
+ * inspeção visual.
+ */
+describe('#638 — "Capacidades novas": o agente é avisado no prompt', () => {
+  const fechado = (descricao: string, tool: string, quando = new Date()) =>
+    makeGap('proposed', descricao, {
+      resolved_at: quando,
+      resolved_reason: `tool '${tool}' existe e está concedida`,
+      resolved_tool_name: tool,
+    });
+
+  it('um gap FECHADO some das limitações e vira aviso de capacidade nova', async () => {
+    capabilityGapsListByLevels.mockResolvedValue([
+      fechado('emitir guia de recolhimento no portal municipal', 'emitir_guia_municipal'),
+    ]);
+
+    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
+    const { system } = await buildPrompt(ctx);
+
+    // A metade NEGATIVA: ele para de anunciar como limitação a ferramenta que
+    // acabou de ganhar. Sem este filtro, o ciclo fecharia de cabeça para baixo.
+    expect(system).not.toContain('## Limitações conhecidas');
+    // A metade POSITIVA: ele é avisado, com o nome da tool.
+    expect(system).toContain('## Capacidades novas (o que você pediu e agora existe)');
+    expect(system).toContain('emitir guia de recolhimento no portal municipal');
+    expect(system).toContain('`emitir_guia_municipal`');
+  });
+
+  it('abertos e fechados convivem: cada um no seu bloco, de UMA leitura só', async () => {
+    capabilityGapsListByLevels.mockResolvedValue([
+      makeGap('mentionable', 'ainda nao consigo conciliar extrato bancario'),
+      fechado('emitir guia de recolhimento', 'emitir_guia_municipal'),
+    ]);
+
+    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
+    const { system } = await buildPrompt(ctx);
+
+    expect(system).toContain('## Limitações conhecidas');
+    expect(system).toContain('ainda nao consigo conciliar extrato bancario');
+    expect(system).toContain('## Capacidades novas');
+    expect(system).toContain('`emitir_guia_municipal`');
+    // O bloco de limitações NÃO lista o que já fechou.
+    const limitacoes = system.slice(
+      system.indexOf('## Limitações conhecidas'),
+      system.indexOf('## Capacidades novas'),
+    );
+    expect(limitacoes).not.toContain('emitir_guia_municipal');
+    // E tudo isso saiu de UMA ida ao banco.
+    expect(capabilityGapsListByLevels).toHaveBeenCalledTimes(1);
+  });
+
+  it('um gap fechado SEM nome de tool não vira aviso — o aviso precisa dizer o quê', async () => {
+    // Defesa contra dado meio-escrito: `resolved_at` sem `resolved_tool_name`
+    // produziria "use a ferramenta ``", que é ruído com cara de instrução.
+    capabilityGapsListByLevels.mockResolvedValue([
+      makeGap('proposed', 'algo que fechou sem nome', {
+        resolved_at: new Date(),
+        resolved_reason: 'motivo',
+        resolved_tool_name: null,
+      }),
+    ]);
+
+    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
+    const { system } = await buildPrompt(ctx);
+
+    expect(system).not.toContain('## Capacidades novas');
+    // E também NÃO volta a ser anunciado como limitação: ele está fechado.
+    expect(system).not.toContain('## Limitações conhecidas');
+  });
+
+  it('a JANELA é do repositório, e o prompt pede a leitura com ela', async () => {
+    const { JANELA_DE_AVISO_DE_CAPACIDADE_DIAS } = await import(
+      '../../src/agent/turn-context/types.js'
+    );
+    capabilityGapsListByLevels.mockResolvedValue([]);
+    const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
+    await buildPrompt(ctx);
+    const [, janela] = capabilityGapsListByLevels.mock.calls[0]!;
+    expect(janela).toBe(JANELA_DE_AVISO_DE_CAPACIDADE_DIAS);
   });
 });

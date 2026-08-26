@@ -171,6 +171,85 @@ describe('defaultCompatibilityManifest', () => {
   });
 });
 
+/**
+ * Issue #658 — um índice `indisvalid = false` é um blocker de schema tão real
+ * quanto um `dirty`, e nenhuma linha do ledger o revela.
+ *
+ * Aqui prova-se a REGRA (pura). Que o Postgres realmente deixa o índice
+ * inválido para trás, e que o `IF NOT EXISTS` seguinte devolve sucesso sobre
+ * ele, está em `tests/integration/migrations-runner-real-db.spec.ts`.
+ */
+describe('índice inválido no veredito de schema (#658)', () => {
+  const invalid = {
+    schema: 'public',
+    index: 'agent_turns_stream_active_uq',
+    table: 'agent_turns',
+    ready: false,
+    live: true,
+  } as const;
+
+  it('o relatório carrega o catálogo — e `[]` significa "não consultado", não "limpo"', () => {
+    const consulted = computeMigrationStatus(artifact(), [appliedA, appliedB], {
+      invalidIndexes: [invalid],
+    });
+    expect(consulted.invalid_indexes).toEqual([invalid]);
+    // Chamador puro que não consultou nada: a lista nasce vazia, e é a camada
+    // de I/O (`readiness.ts` / `runner.ts`) que tem o dever de preenchê-la.
+    expect(computeMigrationStatus(artifact(), [appliedA, appliedB]).invalid_indexes).toEqual([]);
+  });
+
+  it('um schema PERFEITO no ledger não é `ready` com um índice inválido no catálogo', () => {
+    const status = computeMigrationStatus(artifact(), [appliedA, appliedB], {
+      invalidIndexes: [invalid],
+    });
+    // Sem o índice inválido este mesmo ledger é `ready` — é o contraste que
+    // torna a asserção sobre o índice a única variável.
+    expect(
+      evaluateSchemaReadiness(
+        computeMigrationStatus(artifact(), [appliedA, appliedB]),
+        defaultCompatibilityManifest(artifact()),
+        { now },
+      ).ready,
+    ).toBe(true);
+
+    const readiness = evaluateSchemaReadiness(status, defaultCompatibilityManifest(artifact()), {
+      now,
+    });
+    expect(readiness.ready).toBe(false);
+    expect(readiness.state).toBe('blocked');
+    expect(readiness.blockers.map((b) => b.kind)).toEqual(['invalid_index']);
+    expect(readiness.reason).toContain('agent_turns_stream_active_uq');
+    // O texto carrega o remédio, não só o diagnóstico.
+    expect(readiness.reason).toContain('DROP INDEX CONCURRENTLY');
+    // E nunca um id de migration: o índice pode não ter migration culpada.
+    expect(readiness.blockers[0]!.id).toBeUndefined();
+  });
+
+  it('vem ANTES do `dirty` na lista — é a causa, não a consequência', () => {
+    const status = computeMigrationStatus(
+      artifact(),
+      [appliedA, row('002_b.sql', { status: 'dirty' })],
+      { invalidIndexes: [invalid] },
+    );
+    const readiness = evaluateSchemaReadiness(status, defaultCompatibilityManifest(artifact()), {
+      now,
+    });
+    expect(readiness.blockers.map((b) => b.kind)).toEqual(['invalid_index', 'dirty_migration']);
+    expect(readiness.reason).toContain('agent_turns_stream_active_uq');
+  });
+
+  it('um índice inválido por `DROP INDEX CONCURRENTLY` interrompido é nomeado como tal', () => {
+    const dropped = { ...invalid, ready: true, live: false };
+    const readiness = evaluateSchemaReadiness(
+      computeMigrationStatus(artifact(), [appliedA, appliedB], { invalidIndexes: [dropped] }),
+      defaultCompatibilityManifest(artifact()),
+      { now },
+    );
+    expect(readiness.reason).toContain('DROP INDEX CONCURRENTLY');
+    expect(readiness.reason).toContain('interrupted');
+  });
+});
+
 describe('evaluateSchemaReadiness — fail-closed', () => {
   const manifest = defaultCompatibilityManifest(artifact());
 

@@ -7,6 +7,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { isBaileysConnected } from '@/gateway/baileys.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { audit } from '@/governance/audit.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import {
@@ -250,7 +251,11 @@ async function processOne(row: Row): Promise<void> {
     // Fase 0 (spec roteamento v4 §1.6): lembrete sai pela fronteira única, no
     // canal da conversa do pending (NULL legado ⇒ canal único do agente).
     const line = await forCurrentAgentChannel(row.channel_id ?? null);
-    await line.sendText(jid, 'Lembra dessa? Tô aguardando.', { quoted });
+    // #634 — exceção INVENTARIADA (`workers.pending_reminder`): varredura
+    // proativa; o CAS de `reminder_count` já aconteceu antes do envio.
+    await withDeclaredEgressException('workers.pending_reminder', () =>
+      line.sendText(jid, 'Lembra dessa? Tô aguardando.', { quoted }),
+    );
     await audit({
       acao: 'pending_reminder_sent',
       alvo_id: row.id,

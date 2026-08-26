@@ -8,6 +8,7 @@
  *     transição de health + alerta na transição, cleanup só no sucesso, judge.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { withOutboxEgress } from '@/runtime/outbound/egress-guard.js';
 
 // Mock das primitivas de envio ANTES de importar line-output (para provar que o
 // sink não as chama). `vi.hoisted` porque a factory do vi.mock é içada ao topo.
@@ -72,11 +73,20 @@ describe('outbound sink (buildOutput) — flag-independente (P1-C)', () => {
     _setSyntheticChannelIdsForTests([]);
   });
 
+  /**
+   * #634 — a fronteira única recusa qualquer `send*` fora de um escopo de
+   * egresso declarado (`src/runtime/outbound/egress-guard.ts`). Estes casos são
+   * sobre o ROTEAMENTO (sink sintético × transporte real), não sobre a trava, e
+   * em produção quem chama já está dentro do escopo do outbox. Envolver aqui
+   * mantém os casos medindo o que sempre mediram.
+   */
+  const noOutbox = <T>(fn: () => Promise<T>): Promise<T> => withOutboxEgress('sonda', fn);
+
   it('canal is_synthetic (no conjunto) ⇒ sink: wid sintético, NENHUMA primitiva', async () => {
     _setSyntheticChannelIdsForTests([PROBE_CHANNEL_ID]);
     expect(isSyntheticChannel(PROBE_CHANNEL_ID)).toBe(true);
     const out = _buildOutputForTests({ ...PROBE_SCOPE });
-    const wid = await out.sendText('jid', 'oi');
+    const wid = await noOutbox(() => out.sendText('jid', 'oi'));
     expect(wid).toMatch(/^synthetic-/);
     expect(out.isConnected()).toBe(true);
     expect(h.sendOutboundText).not.toHaveBeenCalled();
@@ -85,7 +95,7 @@ describe('outbound sink (buildOutput) — flag-independente (P1-C)', () => {
   it('canal NÃO-sintético ⇒ caminho normal (primitiva chamada)', async () => {
     _setSyntheticChannelIdsForTests([PROBE_CHANNEL_ID]);
     const out = _buildOutputForTests({ tenant_id: 'primary', agent_id: 'primary', channel_id: 'c-real' });
-    const wid = await out.sendText('jid', 'oi');
+    const wid = await noOutbox(() => out.sendText('jid', 'oi'));
     expect(wid).toBe('real-text-wid');
     expect(h.sendOutboundText).toHaveBeenCalledOnce();
   });
@@ -93,7 +103,7 @@ describe('outbound sink (buildOutput) — flag-independente (P1-C)', () => {
   it('conjunto vazio (sink não carregado) ⇒ mesmo o canal de sonda vai ao caminho normal', async () => {
     _setSyntheticChannelIdsForTests([]);
     const out = _buildOutputForTests({ ...PROBE_SCOPE });
-    const wid = await out.sendText('jid', 'oi');
+    const wid = await noOutbox(() => out.sendText('jid', 'oi'));
     expect(wid).toBe('real-text-wid');
     expect(h.sendOutboundText).toHaveBeenCalledOnce();
   });

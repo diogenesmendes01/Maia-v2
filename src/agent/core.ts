@@ -1,4 +1,5 @@
 import {
+  agentTurnsRepo,
   mensagensRepo,
   conversasRepo,
   procedureExecutionsRepo,
@@ -65,6 +66,7 @@ import {
   getTurnExecutionContext,
   assertTurnOwnership,
   reportBlockedEffect,
+  transactionalDebounceEnabled,
   TurnOwnershipLostError,
   type TurnHandle,
 } from '@/runtime/turns/index.js';
@@ -146,18 +148,64 @@ const AGGREGATE_SEPARATOR = '\n';
  * Only `tipo = 'texto'` is merged. Media bypasses the debouncer
  * upstream (see `baileys.handleIncoming`).
  */
-async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
+async function aggregateUnprocessedTexts(
+  target: Mensagem,
+  turn: TurnHandle | null,
+): Promise<{
   text: string;
   merged_ids: string[];
+  /**
+   * #628 — o batch veio FECHADO do banco, e portanto os irmãos JÁ são inputs
+   * deste turno. O caller usa isto para NÃO chamar `absorbDebounceInputs`: a
+   * absorção já aconteceu, dentro da transação de fechamento, e reexecutá-la
+   * tentaria transicionar irmãos que já são `superseded` — um conflito de CAS
+   * ruidoso descrevendo trabalho que não existe.
+   */
+  preclosed: boolean;
 }> {
   const targetText = target.conteudo ?? '';
 
   // Gate 1: off-flag → no aggregation. Each inbound is its own turn.
-  if (!config.FEATURE_MESSAGE_DEBOUNCE) return { text: targetText, merged_ids: [] };
+  if (!config.FEATURE_MESSAGE_DEBOUNCE) {
+    return { text: targetText, merged_ids: [], preclosed: false };
+  }
+
+  // #628 (fatia E da #505) — O BATCH VEM DO BANCO, NÃO É RECALCULADO AQUI.
+  //
+  // Com o debounce transacional ligado, a composição da rajada já foi decidida
+  // e COMITADA pelo fechamento (`closeDueDebounceBatch`): os irmãos são inputs
+  // deste turno e seus turnos próprios são `superseded`. Ler a composição em
+  // vez de redescobri-la por telefone/`processada_em` é o que impede a segunda
+  // definição de batch — a que varreria uma mensagem chegada DEPOIS do
+  // fechamento e faria esta rodada responder por algo que pertence à próxima,
+  // furando a fronteira que o fechamento acabou de declarar.
+  //
+  // Um turno sem batch fechado (mídia, turno anterior à fatia, janela ainda
+  // aberta que o recovery rearmou por estado) cai no caminho de baixo — o
+  // legado —, que continua correto: ele agrega o que ainda não foi processado.
+  if (turn && transactionalDebounceEnabled()) {
+    const batch = await agentTurnsRepo.listClosedDebounceBatch(turn.turn_id);
+    if (batch.length > 0) {
+      const irmaos = batch.filter((b) => b.mensagem_id !== target.id);
+      // A ORDEM é a do banco (`ingress_seq`), e o alvo entra NA POSIÇÃO DELE —
+      // não colado no fim como no caminho legado. Num batch fechado o alvo é a
+      // mensagem representativa, isto é, a PRIMEIRA; concatenar por cima
+      // inverteria a rajada inteira.
+      const texto = batch
+        .map((b) => b.conteudo ?? '')
+        .filter((s) => s.length > 0)
+        .join(AGGREGATE_SEPARATOR);
+      return {
+        text: texto.length > 0 ? texto : targetText,
+        merged_ids: irmaos.map((b) => b.mensagem_id),
+        preclosed: true,
+      };
+    }
+  }
 
   const tel = (target.metadata as Record<string, unknown> | null)?.['telefone'];
   if (typeof tel !== 'string' || tel.length === 0) {
-    return { text: targetText, merged_ids: [] };
+    return { text: targetText, merged_ids: [], preclosed: false };
   }
 
   const siblings = await mensagensRepo.listUnprocessedByTelefone(tel, {
@@ -177,12 +225,12 @@ async function aggregateUnprocessedTexts(target: Mensagem): Promise<{
       (m.created_at?.getTime() ?? 0) <= targetMs &&
       (m.conversa_id === null || m.conversa_id === target.conversa_id),
   );
-  if (textSiblings.length === 0) return { text: targetText, merged_ids: [] };
+  if (textSiblings.length === 0) return { text: targetText, merged_ids: [], preclosed: false };
 
   // Chronological order: oldest sibling first, target last.
   const parts = textSiblings.map((m) => m.conteudo ?? '');
   const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
-  return { text: merged, merged_ids: textSiblings.map((m) => m.id) };
+  return { text: merged, merged_ids: textSiblings.map((m) => m.id), preclosed: false };
 }
 
 /**
@@ -782,14 +830,14 @@ async function runAgentTurnPipeline(params: {
   // adopted into the target's conversa (so history queries + recovery
   // sweeps see the right linkage) and marked processed at the end.
   const aggregated = inbound.conteudo
-    ? await aggregateUnprocessedTexts(inbound).catch((err) => {
+    ? await aggregateUnprocessedTexts(inbound, turn).catch((err) => {
         logger.warn(
           { err: (err as Error).message, mensagem_id: inbound.id },
           'agent.aggregate_failed_continuing_solo',
         );
-        return { text: inbound.conteudo ?? '', merged_ids: [] as string[] };
+        return { text: inbound.conteudo ?? '', merged_ids: [] as string[], preclosed: false };
       })
-    : { text: '', merged_ids: [] as string[] };
+    : { text: '', merged_ids: [] as string[], preclosed: false };
   if (aggregated.merged_ids.length > 0) {
     inbound.conteudo = aggregated.text;
     // Adopt orphans (conversa_id NULL) into the target's conversation.
@@ -818,7 +866,16 @@ async function runAgentTurnPipeline(params: {
   // #503 — a rajada do debounce produz UM turno executável: as irmãs viram
   // inputs deste turno (ou têm seu próprio turno marcado `superseded`). A
   // associação definitiva no ingresso é fechada em #505.
-  await absorbDebounceInputs(turn, aggregated.merged_ids);
+  //
+  // #628 — quando o batch veio FECHADO do banco (`preclosed`), a absorção já
+  // aconteceu DENTRO da transação de fechamento, e ela é a mesma coisa que esta
+  // linha faria: irmãos `superseded`/`merged_into_turn` apontando para este
+  // turno, inputs reancorados, fronteira estendida. Reexecutá-la aqui só
+  // conseguiria conflitar — os irmãos já são terminais, e um CAS sobre eles
+  // devolveria `state_mismatch` ruidoso descrevendo trabalho que não existe.
+  if (!aggregated.preclosed) {
+    await absorbDebounceInputs(turn, aggregated.merged_ids);
+  }
   const markAllProcessed = async (tokens: number | null): Promise<void> => {
     // Per-row update keeps the existing repo contract (single-id) and
     // mirrors the audit semantics: each row gets its own processada_em.
@@ -857,8 +914,15 @@ async function runAgentTurnPipeline(params: {
         metadata: { count: decision.count, threshold: decision.threshold },
       });
       const reply = formatPoliteReply(decision.threshold);
+      // #634 — esta é uma RECUSA POR POLÍTICA visível ao usuário, não a
+      // resposta do agente. `fallback_reason` muda o `payload_type` do artefato
+      // durável de `text` para `status_fallback`, que é o tipo que #506 exige
+      // para "fallback/timeout também usam outbox". Sem ele o outbox registrava
+      // a recusa como se fosse conteúdo do agente, e nenhuma consulta
+      // conseguia separar as duas.
       await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
         channel_id: c.channel_id,
+        fallback_reason: 'policy_refusal',
       }).catch((err) =>
         logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
       );
@@ -1308,8 +1372,10 @@ async function runAgentTurnPipeline(params: {
         // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
         // Never expose internal policy text (effect.message) to the user.
         const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — recusa por política do Decision Engine.
         await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
         );
@@ -1332,8 +1398,10 @@ async function runAgentTurnPipeline(params: {
       if (packet.action_mode === 'escalate') {
         const escalateMsg =
           'Esta ação requer aprovação adicional antes de prosseguir.';
+        // #634 — escalada para aprovação também é recusa por política.
         await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'policy_refusal',
         }).catch((err) =>
           logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
         );
@@ -1557,8 +1625,11 @@ async function runAgentTurnPipeline(params: {
       //     envio, ou persistência falhou): NUNCA reenviar.
       let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
       try {
+        // #634 — o fail-closed do Decision Engine é ERRO INTERNO exposto ao
+        // usuário, o caso canônico de `status_fallback`.
         await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
           channel_id: c.channel_id,
+          fallback_reason: 'internal_error',
         });
       } catch (e) {
         fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';

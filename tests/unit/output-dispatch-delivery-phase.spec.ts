@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 /**
  * Codex #216 review HIGH-1 — delivery-phase tagging of `dispatchOutput`.
  *
@@ -72,12 +75,46 @@ vi.mock('@/db/repositories.js', () => ({
 vi.mock('@/governance/audit.js', () => ({ audit: m.audit }));
 vi.mock('@/config/env.js', () => ({ config: cfg }));
 vi.mock('@/lib/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+/**
+ * #634 — `putOutboundMedia` endereça o objeto por `<tenant>/<agent>/<pessoa>`,
+ * então exige escopo ALS. Em produção `dispatchOutput` sempre roda dentro dele;
+ * esta spec chama a função direto, 40 vezes, e envolver cada chamada num
+ * `runWithTenantContext` só para satisfazer o store esconderia o assunto do
+ * arquivo (fase de entrega) atrás de ruído. Mock PARCIAL: só as duas leituras
+ * de escopo mudam; todo o resto de `tenant-context` continua real.
+ */
+vi.mock('@/db/tenant-context.js', async (original) => ({
+  ...(await original<typeof import('@/db/tenant-context.js')>()),
+  getCurrentTenant: () => 't',
+  getCurrentAgent: () => 'a',
 }));
 vi.mock('@/lib/tts.js', () => ({
   synthesizeSpeech: m.synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS: 300,
+  // #634 — o artefato durável de `audio` persiste o mimetype REAL da síntese.
+  OUTBOUND_VOICE_MIMETYPE: 'audio/ogg; codecs=opus',
 }));
+// #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
+// resolve a raiz por `MEDIA_ROOT`. Sem ela o ramo falha ANTES do canal (o
+// fail-closed correto em produção, falso vermelho aqui).
+vi.mock('@/gateway/baileys.js', () => ({
+  MEDIA_ROOT: mkdtempSync(join(tmpdir(), 'maia-media-phase-')),
+  isBaileysConnected: () => true,
+}));
+
+/**
+ * #634 — o PDF do relatório precisa EXISTIR no disco.
+ *
+ * Antes desta fatia o caminho podia ser fantasma (`/tmp/report.pdf`): quem lia
+ * o arquivo era o gateway, e o gateway está mockado aqui. Agora
+ * `output-dispatch` copia os bytes para o store durável ANTES do commit, então
+ * um caminho inexistente falha pré-envio — que é o comportamento certo em
+ * produção e tornaria estes casos (que são sobre o TRANSPORTE) falsos vermelhos.
+ */
+const PDF_REAL = join(mkdtempSync(join(tmpdir(), 'maia-pdf-phase-')), 'report.pdf');
+writeFileSync(PDF_REAL, Buffer.from('%PDF-1.4 fixture da spec de fase'));
 // Só quotedReplyContext ainda é importado de presence pelo output-dispatch;
 // sendPoll agora sai exclusivamente pela LineOutput (mock acima) — mantê-lo
 // aqui mascararia uma regressão de volta à primitiva antiga.
@@ -237,7 +274,7 @@ describe('dispatchOutput — delivery-phase tagging (HIGH-1)', () => {
     m.sendOutboundDocument.mockResolvedValue(null);
     const ctx = mkCtx({
       latestReportPdf: {
-        path: '/tmp/report.pdf',
+        path: PDF_REAL,
         fileName: 'report.pdf',
         mimetype: 'application/pdf',
         tipo: 'extrato',
@@ -293,7 +330,7 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
   const pdfCtx = () =>
     mkCtx({
       latestReportPdf: {
-        path: '/tmp/report.pdf',
+        path: PDF_REAL,
         fileName: 'report.pdf',
         mimetype: 'application/pdf',
         tipo: 'extrato',
@@ -565,7 +602,7 @@ describe('dispatchOutput — document discriminator (#227 DOC_READ_FAILED)', () 
   const pdfCtx = () =>
     mkCtx({
       latestReportPdf: {
-        path: '/tmp/report.pdf',
+        path: PDF_REAL,
         fileName: 'report.pdf',
         mimetype: 'application/pdf',
         tipo: 'extrato',

@@ -21,7 +21,7 @@
  * que faria o pedido se declarar cumprido sem ter apagado nada.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { sql } from 'drizzle-orm';
 import { config } from '@/config/env.js';
@@ -220,6 +220,45 @@ async function purgeClass(
            AND pessoa_id = ANY(${people}::uuid[])
       `);
       return res.rowCount ?? 0;
+    }
+    case 'media.outbound_artifacts': {
+      // #634 — o store de mídia de SAÍDA. O layout
+      // `<MEDIA_ROOT>/outbound/<tenant>/<agent>/<pessoa_id>/<sha>.<ext>` foi
+      // escolhido para que esta purga fosse expressável: o diretório do titular
+      // É a unidade de apagamento, e `outboundMediaSubjectDir` é a MESMA função
+      // que o escritor usa — nunca uma cópia do layout, que é como as duas
+      // metades divergem em silêncio.
+      //
+      // Import dinâmico: `media-store.ts` resolve `MEDIA_ROOT` a partir de
+      // `@/gateway/baileys.js`, que é sensível a efeito de import (ver
+      // `tests/unit/baileys-no-import-side-effects.spec.ts`). O adapter de
+      // privacidade não pode arrastar o gateway para o grafo de quem só faz
+      // SQL.
+      const { outboundMediaSubjectDir } = await import('@/runtime/outbound/media-store.js');
+      let removed = 0;
+      for (const pessoa_id of people) {
+        const dir = await outboundMediaSubjectDir({
+          tenant_id: job.scope.tenant_id,
+          agent_id: job.scope.agent_id,
+          pessoa_id,
+        });
+        // Conta ANTES de apagar: `rm -r` não informa quantos arquivos levou, e
+        // um pedido que dissesse "0 objetos" tendo apagado dez seria evidência
+        // errada — o oposto do que este módulo existe para produzir.
+        let files: string[];
+        try {
+          files = await readdir(dir);
+        } catch {
+          // Diretório inexistente é o caso NORMAL (o titular pode nunca ter
+          // recebido mídia). Zero é a resposta honesta, e ela não é "purgado
+          // com zero linhas" indevido: a classe É suportada e a varredura
+          // aconteceu.
+          continue;
+        }
+        await rm(dir, { recursive: true, force: true });
+        removed += files.length;
+      }
+      return removed;
     }
     case 'postgres.people': {
       // ANONIMIZAR, não apagar: a linha é referenciada por transações que a

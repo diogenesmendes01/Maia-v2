@@ -271,7 +271,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // catches regressions in feature flag, conversa guard, separator,
       // and merged_ids that a re-implementation would not.
       const { _internal } = core();
-      const out = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!));
+      const out = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!, null));
       expect(out.text).toBe('Oi,\ncomo vai\na finança?');
       expect(out.merged_ids).toEqual(expect.arrayContaining([id1, id2]));
       expect(out.merged_ids).not.toContain(id3); // target is excluded
@@ -279,7 +279,7 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // Process id2 to simulate a partial run; the next aggregator call
       // should drop it from the merge.
       await withPrimaryTenant(() => mensagensRepo.markProcessed(id2, 0));
-      const after = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!));
+      const after = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!, null));
       expect(after.text).toBe('Oi,\na finança?');
       expect(after.merged_ids).toEqual([id1]);
     } finally {

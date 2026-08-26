@@ -5,6 +5,7 @@ import type { Pessoa } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { listOwners } from '@/governance/permissions.js';
 
 /**
@@ -14,7 +15,9 @@ import { listOwners } from '@/governance/permissions.js';
  */
 async function sendViaLine(jid: string, text: string): Promise<string | null> {
   const line = await forCurrentAgentChannel(null);
-  return line.sendText(jid, text);
+  // #634 — exceção INVENTARIADA (`workflows.dual_approval`): destinatários são os
+  // APROVADORES, não o interlocutor do turno; o workflow persistido é a verdade.
+  return withDeclaredEgressException('workflows.dual_approval', () => line.sendText(jid, text));
 }
 
 export const DualApprovalContext = z.object({

@@ -59,6 +59,7 @@ import {
   type OutboundDeliveryClaim,
 } from './delivery-contract.js';
 import { sendPayloadToProvider, type ProviderCallTarget } from './provider-adapter.js';
+import { withOutboxEgress } from './egress-guard.js';
 import { buildHistoricoFromArtifact } from './historico.js';
 
 /**
@@ -328,8 +329,13 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
     provider_idempotency_key: row.provider_idempotency_key,
     ...(signal ? { signal } : {}),
   };
+  // #634 — ESCOPO DE EGRESSO DO OUTBOX. A fronteira única (`line-output.ts`)
+  // recusa qualquer `send*` que não esteja dentro de um escopo declarado; este
+  // é o escopo do caminho legítimo. Ele envolve SÓ a chamada ao adaptador, não
+  // o ciclo inteiro: autorizar `deliverOutbound` de ponta a ponta autorizaria,
+  // de quebra, qualquer envio que outro módulo fizesse durante a entrega.
   const observation = await withDeliveryHeartbeat(claim, lease_ms, () =>
-    sendPayloadToProvider(payload, target),
+    withOutboxEgress(claim.outbound_id, () => sendPayloadToProvider(payload, target)),
   );
   const outcome = normalizeProviderOutcome(observation);
 
@@ -684,4 +690,61 @@ async function withDeliveryHeartbeat<T>(
  */
 function backoffSeconds(attempt: number): number {
   return Math.min(3600, 2 ** Math.max(0, Math.min(attempt, 12)) * 5);
+}
+
+/**
+ * O que vai para o histórico da conversa.
+ *
+ * Deriva do ARTEFATO — o mesmo texto que foi enviado, nunca uma nova
+ * renderização. `midia_url` fica de fora: a referência de mídia de #630 é
+ * `local_path`/`storage_object` e não uma URL, e persistir um caminho de
+ * arquivo temporário no histórico seria um link morto no dia seguinte.
+ */
+function buildHistorico(
+  payload: OutboundPayload,
+  ctx: { provider_message_id: string | null; jid: string; in_reply_to: string },
+): { tipo: string; conteudo: string; metadata: Record<string, unknown> } {
+  const metadata: Record<string, unknown> = {
+    whatsapp_id: ctx.provider_message_id,
+    remote_jid: ctx.jid,
+    in_reply_to: ctx.in_reply_to,
+    outbound_payload_type: payload.type,
+  };
+  switch (payload.type) {
+    case 'text':
+      return { tipo: 'texto', conteudo: payload.text, metadata };
+    case 'status_fallback':
+      return {
+        tipo: 'texto',
+        conteudo: payload.text,
+        metadata: { ...metadata, fallback_reason: payload.reason },
+      };
+    case 'audio':
+      // `source_text` e não o áudio: é o texto que gerou a voz, persistido em
+      // #630 exatamente para que o histórico e o fallback tivessem o conteúdo.
+      return { tipo: 'audio', conteudo: payload.source_text, metadata };
+    case 'document':
+      return {
+        tipo: 'documento',
+        conteudo: payload.caption ?? '',
+        metadata: { ...metadata, file_name: payload.file_name },
+      };
+    case 'reaction':
+      return {
+        tipo: 'evento',
+        conteudo: payload.emoji,
+        metadata: { ...metadata, target_provider_message_id: payload.target_provider_message_id },
+      };
+    case 'interactive_poll':
+      return {
+        tipo: 'texto',
+        conteudo: payload.question,
+        metadata: { ...metadata, poll_options: payload.options },
+      };
+    default: {
+      const _never: never = payload;
+      void _never;
+      throw new TypeError('buildHistorico: payload fora do contrato de #630');
+    }
+  }
 }

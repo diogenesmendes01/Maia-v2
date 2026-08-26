@@ -11,6 +11,7 @@ import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 
 const SIDE_EFFECT_ACTIONS = new Set([
   'transaction_created',
@@ -238,7 +239,12 @@ async function notifyOwnerOfEditReview(input: {
   const jid = input.owner.telefone_whatsapp.replace(/^\+/, '') + '@s.whatsapp.net';
   try {
     const line = await forCurrentAgentChannel(input.ownerChannelId);
-    const wid = await line.sendText(jid, input.pergunta);
+    // #634 — exceção INVENTARIADA (`agent.message_update_owner_review`): esta
+    // saída é dirigida ao DONO, em outra conversa, e não à saída lógica do
+    // turno. O motivo e o que segura o risco estão em `send-paths.ts`.
+    const wid = await withDeclaredEgressException('agent.message_update_owner_review', () =>
+      line.sendText(jid, input.pergunta),
+    );
     await mensagensRepo.create({
       conversa_id: input.ownerConversaId,
       channel_id: line.scope.channel_id,
