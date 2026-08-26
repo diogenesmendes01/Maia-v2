@@ -97,6 +97,30 @@ carrega tenant: no V1 quem resolve é o resolver de canal dentro de
 `agent/core.ts`; no V2, o resolvedor de escopo de
 [`runtime.md`](runtime.md), antes de qualquer trabalho de domínio.
 
+**A terceira fila: `outbound-delivery` (#633).** Ela transporta um
+`outbound_id` e mais nada (`{version: 1, outbound_id}`, schema `.strict()`), com
+`jobId` DETERMINÍSTICO por `outbound_id` — `outbound-<uuid>`, namespace disjunto
+de `turn-*` e de `debounce:*`. Commit, varredura de recuperação e rearmamento
+manual colidem num job só.
+
+A colisão do `jobId` não é a garantia sozinha: jobs armados antes do deploy, ou
+um job já removido e re-adicionado, ainda produzem concorrência real. O que
+fecha é o claim atômico com lease de #632, e as duas camadas são independentes
+de propósito. Isso é verificável — a sonda de Redis real mostra que remover o
+`jobId` do produtor faz a primeira camada ficar vermelha e a segunda continuar
+verde.
+
+`enqueueOutboundDelivery` limpa o job RETIDO em `completed`/`failed` com o mesmo
+id ANTES do `add`, pela mesma razão de `clearRetainedTurnJob` (#504): sem isso a
+BullMQ ignoraria o `add` e a linha ficaria `retryable` para sempre, sem
+consumidor. Um job em `waiting`/`active`/`delayed` NÃO é removido — é trabalho
+vivo, e removê-lo para "rearmar" cancelaria uma entrega possivelmente em voo.
+
+O consumidor é registrado só com `FEATURE_OUTBOUND_DELIVERY_WORKER` ligada (um
+`Worker` da BullMQ consome assim que existe, então "registrar e não usar" não é
+opção), e a flag nasce OFF: o consumidor precede o produtor. Ver
+[`docs/runbooks/outbound-recovery.md`](../../runbooks/outbound-recovery.md).
+
 ## How to extend
 
 | Need | Where |

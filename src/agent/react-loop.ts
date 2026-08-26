@@ -8,6 +8,7 @@ import { logger } from '@/lib/logger.js';
 import { dispatchTool } from '@/tools/_dispatcher.js';
 import { REGISTRY } from '@/tools/_registry.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressExceptionSync } from '@/runtime/outbound/egress-guard.js';
 import { uuid } from '@/lib/utils.js';
 import { safeDispatchOutput, type LatestPending, type LatestReportPdf } from './output-dispatch.js';
 import { detectGap } from './gap-detector.js';
@@ -584,8 +585,17 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
               ? '❌'
               : null;
           if (emoji) {
+            // #634 — exceção INVENTARIADA (`agent.react_loop_tool_reaction`):
+            // sinal EFÊMERO sobre a mensagem de ENTRADA. A primitiva do Baileys
+            // devolve `void`, então um artefato durável para ela nasceria em
+            // `delivery_unknown` e alimentaria a reconciliação humana de #633
+            // com ruído. Ver `send-paths.ts`.
             await forCurrentAgentChannel(c.channel_id)
-              .then((line) => line.sendReaction(jid, wid, emoji))
+              .then((line) =>
+                withDeclaredEgressExceptionSync('agent.react_loop_tool_reaction', () =>
+                  line.sendReaction(jid, wid, emoji),
+                ),
+              )
               .catch((err) =>
                 logger.debug(
                   { err: (err as Error).message },

@@ -51,7 +51,7 @@ Decisão do dono, registrada na #516:
 Três compromissos vêm junto, e nenhum é opcional:
 
 1. **Exit codes distinguíveis.** `1` continua sendo "outra falha de boot". O
-   gate de schema usa a faixa **90-97**, uma por invariante — tabela em
+   gate de schema usa a faixa **90-98**, uma por invariante — tabela em
    `src/runtime/lifecycle/schema-boot-gate.ts` e em
    [`docs/runbooks/operational.md`](../../runbooks/operational.md) §8.1. A faixa
    foi escolhida para não colidir com o que já significa outra coisa: 0/1/2 do
@@ -115,7 +115,7 @@ já existe e o veredito só muda a rotação.
 
 | Situação | Sinal que o operador lê |
 |---|---|
-| processo não sobe (crash loop) | **exit code** (90-97 = schema) + `maia.schema_boot_refused` |
+| processo não sobe (crash loop) | **exit code** (90-98 = schema) + `maia.schema_boot_refused` |
 | processo no ar, schema mudou debaixo dele | **`/readyz` 503** com `checks[].component == "schema"` |
 | "qual componente está ruim?" | `/health` — diagnóstico, 200 sempre (ADR 0003) |
 

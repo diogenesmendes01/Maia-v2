@@ -1,28 +1,54 @@
 /**
- * Issue #518 — E2E da tela de LINHAS (Setup → Canais).
+ * Jornada — PAREAMENTO DE LINHA WHATSAPP (issue #518).
  *
- * Cobre a jornada que a issue exige que exista sem shell nem curl:
- * declarar → parear (QR ou código) → acompanhar → cancelar → re-parear, e o
- * invariante de segurança central: NENHUM bootstrap token aparece em URL,
- * em request ou no HTML do console.
+ * ─────────────────────────────────────────────────────────────────────────
+ * POR QUE ESTA JORNADA CONTINUA EM QUARENTENA (#623)
+ * ─────────────────────────────────────────────────────────────────────────
+ * As outras nove jornadas saíram: a causa delas era sessão e fixture, e as
+ * duas o job resolve. Esta tem outra causa, e ela não é do console.
  *
- * Pré-requisitos do ambiente (docker-compose de e2e):
- *   - console em http://localhost:4000 com sessão owner/founder;
- *   - runtime com adapter Baileys FALSO (nunca uma linha real — a issue
- *     proíbe enviar mensagem de verdade no CI);
- *   - `MAIA_STAGING_KEYRING` configurado nos dois processos.
+ * MEDIDO no código, não suposto: `trpc/routers/channelLines.ts` NÃO gera QR
+ * nem código. `startPairing` grava um COMANDO em `channel_line_state`
+ * (`requestCommandWithAudit`) e devolve; quem conecta no WhatsApp, produz o
+ * QR e cifra o material com `MAIA_STAGING_KEYRING` é o worker
+ * `channel_pairing` do RUNTIME. O console só decifra o envelope que o runtime
+ * gravou (`openPairingMaterial`, `src/setup/pairing-material.ts`), e
+ * `getPairingStatus` responde `pairing_available: false` quando o keyring não
+ * está configurado.
+ *
+ * O job `build + e2e do console (admin-ui)` sobe UM processo: o artefato
+ * standalone do console. Não há runtime, e portanto não há QR, não há código
+ * de 8 dígitos e não há transição para `pareando` — quatro dos seis casos
+ * deste arquivo esperam exatamente isso. Fazê-los passar exigiria (a) subir o
+ * runtime no job com um adapter Baileys FALSO (a própria #518 proíbe linha
+ * real no CI) e (b) compartilhar `MAIA_STAGING_KEYRING` entre os dois
+ * processos. Isso é um job novo, não um ajuste de spec — e inventar um mock
+ * do runtime dentro do teste mediria o mock.
+ *
+ * CRITÉRIO OBJETIVO PARA SAIR DAQUI (o que precisa existir, não "quando der"):
+ *   1. o CI subir, no mesmo job, um runtime Maia com adapter de canal FALSO,
+ *      compartilhando `DATABASE_URL`, `REDIS_URL` e `MAIA_STAGING_KEYRING`
+ *      com o console; e
+ *   2. `channelLines.getPairingStatus` responder `pairing_available: true`
+ *      nesse ambiente.
+ * Com esses dois fatos, tirar a tag daqui é um diff de uma linha.
+ *
+ * Rastreamento: os dois fatos acima são o critério; enquanto não existir
+ * issue própria para subir o runtime no job, este cabeçalho e a lista fixa de
+ * `tests/unit/ci/admin-ui-e2e-gate.spec.ts` são o registro — a quarentena não
+ * pode crescer sem passar por eles.
+ *
+ * Os dois casos que NÃO dependem do runtime (a linha declarada aparecer na
+ * listagem e o viewer não enxergar a tela) ficam junto de propósito: partir o
+ * arquivo deixaria uma "jornada de pareamento" que não pareia, e é essa
+ * meia-verdade que a #623 está desfazendo no resto da suíte.
  */
 import { test, expect } from '@playwright/test';
 
 const CONSOLE = 'http://localhost:4000';
 const CHANNELS = `${CONSOLE}/setup/channels`;
 
-// `@pendente-472`: fora do gate de CI (projeto `jornadas-pendentes` do
-// playwright.config.ts). Esta spec exige sessão autenticada e fixtures que
-// `scripts/seed-proposals-fixtures.ts` ainda não cria — ligá-la é a #472. A
-// lista de arquivos em quarentena é fixada em
-// `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair dela é um diff visível.
-test.describe('Setup → Canais: linhas WhatsApp @pendente-472', () => {
+test.describe('Setup → Canais: linhas WhatsApp @pendente-runtime', () => {
   test('canal WhatsApp recém-criado (inativo) PERMANECE visível com estado "declarada"', async ({
     page,
   }) => {

@@ -878,7 +878,16 @@ jobs:
         # responder (e reprova com o log dele se não responder), roda o projeto
         # `smoke` e depois exige, por `scripts/check-playwright-run.ts`, que a
         # rodada tenha executado pelo menos `TEST_ADMIN_UI_MIN_TESTS` testes e
-        # NENHUM pulado. O Playwright sai com código 0 quando não encontra
+        # NENHUM pulado.
+        #
+        # Desde a #623 o script também SEMEIA as fixtures das jornadas
+        # (`scripts/seed-admin-ui-e2e-fixtures.ts`) antes de subir o servidor —
+        # é o que faz o projeto `smoke` incluir as jornadas autenticadas do
+        # operador, e não só o boot. A sessão delas é montada no teste
+        # (`tests/admin-ui/e2e/_apoio/sessao.ts`) com o MESMO `NEXTAUTH_SECRET`
+        # deste bloco: nenhum provider novo é registrado no console, e o
+        # middleware, o `auth()`, o `assertRole` e os gates de papel continuam
+        # sendo exercitados de verdade. O Playwright sai com código 0 quando não encontra
         # teste nenhum — sem esse piso, "Running 0 tests" seria um check verde.
         #
         # `AUTH_TRUST_HOST=true` é o mesmo valor de `compose.prod.yml`: sem
@@ -984,22 +993,33 @@ jobs:
           OIDC_TENANT_SLUGS: primary
           # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
           # `scripts/admin-ui-e2e.sh`.
-          TEST_ADMIN_UI_MIN_TESTS: '5'
+          #
+          # 27 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
+          # #623 (inbox, detalhe de proposta, aprovação simples e dupla,
+          # rejeição, trava de arquitetura, trilha de auditoria, drift, traces
+          # e versões). O piso não é cosmético: sem ele, um `grep` que deixasse
+          # de casar faria a rodada executar só o boot e o job continuaria
+          # verde — que é exatamente como a quarentena passou despercebida.
+          # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este número
+          # contra a contagem de casos das specs FORA da quarentena.
+          TEST_ADMIN_UI_MIN_TESTS: '27'
         run: npm run test:admin-ui:e2e:ci
 
       - name: Quarentena da suíte e2e (o que NÃO foi medido)
-        # Nunca reprova: é legibilidade. As specs `@pendente-472` estão fora do
-        # gate porque exigem sessão autenticada e fixtures que
-        # `scripts/seed-proposals-fixtures.ts` ainda não cria. A lista é fixada
-        # em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode
-        # crescer em silêncio.
+        # Nunca reprova: é legibilidade. Depois da #623 sobrou UMA spec fora do
+        # gate, e não por sessão nem por fixture: o QR e o código de pareamento
+        # são produzidos pelo worker `channel_pairing` do RUNTIME, e este job
+        # sobe só o console. O cabeçalho de `channel-lines-pairing.spec.ts` tem
+        # a medição e o critério objetivo de saída; a lista é fixada em
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode crescer
+        # em silêncio.
         if: always()
         continue-on-error: true
         run: |
-          echo "specs fora do gate (@pendente-472, issue #472):"
+          echo "specs fora do gate (@pendente-runtime — dependem de um runtime Maia no job):"
           # Casa a TAG no título do describe (o que o grep do Playwright vê),
           # não uma menção ao identificador em comentário.
-          grep -lE '^test\.describe\(.*@pendente-472' tests/admin-ui/e2e/*.spec.ts
+          grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts
 
       - name: Relatório do Playwright (só quando reprova)
         if: failure()

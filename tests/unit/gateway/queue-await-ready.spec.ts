@@ -70,6 +70,7 @@ import {
   awaitQueueReady,
   startAgentWorker,
   startUnroutedReplayWorker,
+  startOutboundDeliveryWorker,
   shutdownQueue,
 } from '../../../src/gateway/queue.js';
 
@@ -104,11 +105,17 @@ describe('awaitQueueReady', () => {
     expect(resolved).toBe(true);
   });
 
-  it('waits for BOTH queues and BOTH workers', async () => {
+  it('waits for TODAS as filas e TODOS os workers construídos', async () => {
     startAgentWorker(vi.fn(async () => undefined));
     startUnroutedReplayWorker(vi.fn(async () => undefined));
+    // Issue #633 — a terceira fila. Ela é construída SEMPRE (o `new Queue` é o
+    // produtor, e o dispatcher/varredura enfileira mesmo num processo que não
+    // consome); o WORKER dela é opcional e gated por
+    // `FEATURE_OUTBOUND_DELIVERY_WORKER`. A distinção importa e é a razão de
+    // este caso não iniciar `startOutboundDeliveryWorker`: uma readiness que
+    // esperasse por um worker que o papel não registrou nunca resolveria.
     const p = awaitQueueReady();
-    // Resolve them one at a time; the names prove all four were awaited.
+    // Resolve them one at a time; the names prove all of them were awaited.
     const names: string[] = [];
     while (deferreds.length > 0) {
       const d = deferreds.shift()!;
@@ -120,8 +127,32 @@ describe('awaitQueueReady', () => {
     expect(names).toEqual([
       'queue:agent',
       'queue:unrouted-replay',
+      'queue:outbound-delivery',
       'worker:agent',
       'worker:unrouted-replay',
+    ]);
+  });
+
+  it('espera também pelo worker de entrega quando ELE foi registrado (#633)', async () => {
+    startAgentWorker(vi.fn(async () => undefined));
+    startUnroutedReplayWorker(vi.fn(async () => undefined));
+    startOutboundDeliveryWorker(vi.fn(async () => undefined));
+    const p = awaitQueueReady();
+    const names: string[] = [];
+    while (deferreds.length > 0) {
+      const d = deferreds.shift()!;
+      names.push(d.name);
+      d.resolve();
+      await settled();
+    }
+    await p;
+    expect(names).toEqual([
+      'queue:agent',
+      'queue:unrouted-replay',
+      'queue:outbound-delivery',
+      'worker:agent',
+      'worker:unrouted-replay',
+      'worker:outbound-delivery',
     ]);
   });
 
@@ -136,7 +167,11 @@ describe('awaitQueueReady', () => {
       await settled();
     }
     await p;
-    expect(names).toEqual(['queue:agent', 'queue:unrouted-replay']);
+    expect(names).toEqual([
+      'queue:agent',
+      'queue:unrouted-replay',
+      'queue:outbound-delivery',
+    ]);
   });
 
   it('REJECTS when the connection cannot be established, so the boot fails closed', async () => {

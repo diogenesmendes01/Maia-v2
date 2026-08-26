@@ -104,7 +104,15 @@ function fakeDb(
         if (options.connectError) throw options.connectError;
         const client: ReadOnlyPoolClient = {
           query: <R,>(text: string): Promise<{ rows: R[] }> => {
-            const out = text.includes('information_schema.columns')
+            // #658 — a sonda de `pg_index`. Reconhecida explicitamente: sem
+            // isto o `else` devolveria as linhas do LEDGER para a consulta de
+            // catálogo, e todo veredito nasceria com um índice inválido
+            // fantasma. Este fake nunca tem índice inválido; o caso positivo
+            // vive em `tests/unit/runtime/schema-boot-gate.spec.ts` e, contra
+            // o Postgres real, em `migrations-runner-real-db.spec.ts`.
+            const out = text.includes('NOT i.indisvalid')
+              ? []
+              : text.includes('information_schema.columns')
               ? columns.map((column_name) => ({ column_name }))
               : rows.map((r) => ({
                   applied_at: '2026-01-01T00:00:00.000Z',
