@@ -41,8 +41,10 @@ import { incCounter } from '@/lib/metrics.js';
 import {
   STREAM_BLOCKED_REASONS,
   STREAM_FIFO_VIOLATION_STAGES,
+  STREAM_PROMOTION_RESULTS,
   type StreamBlockedReason,
   type StreamFifoViolationStage,
+  type StreamPromotionResult,
 } from './claim.js';
 
 /**
@@ -59,6 +61,18 @@ export const STREAM_FIFO_VIOLATION_METRIC = 'maia_stream_fifo_violation_total';
  * `not_head` que cresce sem `eligible` correspondente é uma stream que parou.
  */
 export const STREAM_BLOCKED_METRIC = 'maia_stream_blocked_total';
+
+/**
+ * #627 — desfechos da promoção do sucessor. A issue-mãe a lista entre as séries
+ * sugeridas (`maia_stream_promotion_total{result}`) e a #627 a exige cobrindo
+ * "promoção, rejeição por fence e recuperação".
+ *
+ * Semeada em zero como as demais, e aqui isso importa mais do que nas outras:
+ * `fence_rejected` e `recovered` são séries que, numa instalação saudável,
+ * podem passar semanas em zero — e uma série ausente é indistinguível de
+ * "nunca aconteceu" para todo alerta escrito contra ela.
+ */
+export const STREAM_PROMOTION_METRIC = 'maia_stream_promotion_total';
 
 let semeado = false;
 
@@ -79,6 +93,9 @@ export function registrarSeriesDeStream(): void {
   }
   for (const reason of STREAM_BLOCKED_REASONS) {
     incCounter(STREAM_BLOCKED_METRIC, { reason }, 0);
+  }
+  for (const result of STREAM_PROMOTION_RESULTS) {
+    incCounter(STREAM_PROMOTION_METRIC, { result }, 0);
   }
 }
 
@@ -104,4 +121,17 @@ export function recordStreamFifoViolation(stage: StreamFifoViolationStage): void
 export function recordStreamBlocked(reason: StreamBlockedReason): void {
   registrarSeriesDeStream();
   incCounter(STREAM_BLOCKED_METRIC, { reason });
+}
+
+/**
+ * Um desfecho de PROMOÇÃO foi observado (#627).
+ *
+ * Sem `stream_key`, `turn_id` nem conteúdo como label — a issue-mãe proíbe, e
+ * `turn_id` derrubaria a cardinalidade do Prometheus antes de dizer qualquer
+ * coisa. QUEM foi promovido (e por quem) vive na `audit_log` `turn_promoted` e
+ * no log estruturado, onde a cardinalidade não custa.
+ */
+export function recordStreamPromotion(result: StreamPromotionResult): void {
+  registrarSeriesDeStream();
+  incCounter(STREAM_PROMOTION_METRIC, { result });
 }

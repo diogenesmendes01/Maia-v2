@@ -101,13 +101,14 @@ export const STREAM_HEAD_OF_LINE_INDEX = 'agent_turns_stream_head_live_idx';
  * | `not_head` | `claimNextEligibleTurn` (recusa) | existe turno ANTERIOR não terminal na mesma stream, e ele avança sozinho |
  * | `stream_blocked` | `claimNextEligibleTurn` (recusa) | o anterior está em `outbound_pending`: NENHUM claim o move, quem o move é o delivery worker (#506) |
  * | `stream_busy` | o índice `agent_turns_stream_active_uq` (#625) | outro turno da stream já está ATIVO com lease viva |
- * | `promoted` | **ninguém ainda** — #627 | o sucessor foi promovido/enfileirado quando o head chegou a terminal |
+ * | `promoted` | `promoteStreamSuccessor` (#627), na transação do CAS terminal | o sucessor foi eleito e enfileirado quando o head chegou a terminal |
  *
- * `promoted` entra agora, sem produtor, deliberadamente. A alternativa era a
- * #627 acrescentar um sexto rótulo a uma série de métrica já em uso — e
- * mudar o domínio de um label depois que ele está num dashboard é a forma mais
- * fácil de quebrar um alerta sem ninguém perceber. Uma série que existe em
- * zero é barata; um vocabulário que muda debaixo do painel, não.
+ * `promoted` entrou na #626 SEM produtor, deliberadamente, e a #627 o produz.
+ * A alternativa era esta fatia acrescentar um sexto rótulo a uma série de
+ * métrica já em uso — e mudar o domínio de um label depois que ele está num
+ * dashboard é a forma mais fácil de quebrar um alerta sem ninguém perceber. Uma
+ * série que existe em zero é barata; um vocabulário que muda debaixo do painel,
+ * não.
  */
 export const STREAM_SCHEDULING_RESULTS = [
   'eligible',
@@ -132,6 +133,47 @@ export const STREAM_BLOCKED_REASONS = ['not_head', 'stream_blocked', 'stream_bus
 export type StreamBlockedReason = (typeof STREAM_BLOCKED_REASONS)[number];
 
 /**
+ * #627 (fatia D) — os desfechos de uma PROMOÇÃO, e o domínio de
+ * `maia_stream_promotion_total{result}`.
+ *
+ * A issue pede que a métrica "cubra promoção, rejeição por fence e
+ * recuperação". Os cinco abaixo são esses três mais os dois que, sem estarem
+ * nomeados, tornariam os outros ilegíveis:
+ *
+ *  - `promoted` — o sucessor foi eleito, a decisão foi COMITADA e a BullMQ foi
+ *    sinalizada. É o código do vocabulário central (`STREAM_SCHEDULING_RESULTS`)
+ *    e o único que os dois conjuntos compartilham — de propósito: uma promoção
+ *    é um resultado de escalonamento, e ter dois nomes para o mesmo fato é
+ *    exatamente a divergência que a #626 fechou na outra dimensão;
+ *  - `no_successor` — o predecessor terminou e não havia quem promover (a
+ *    conversa acabou, ou o próximo está `outbound_pending`/já reivindicado).
+ *    É o caso NORMAL e majoritário. Sem ele, `promoted` sozinho não diz se as
+ *    conclusões estão liberando fila ou se a promoção parou de rodar — a razão
+ *    `promoted/(promoted+no_successor)` é o sinal, e ela precisa do denominador;
+ *  - `fence_rejected` — uma tentativa STALE tentou concluir o turno e, com
+ *    isso, liberar o sucessor. Recusada. É a falha nº 9 da issue-mãe
+ *    ("takeover após lease expirado permite ao worker antigo liberar o
+ *    sucessor") vista como número;
+ *  - `enqueue_failed` — a decisão COMITOU e o sinal da BullMQ falhou. NÃO é
+ *    perda: é exatamente o estado que o recovery reconcilia, e por isso ele
+ *    tem nome próprio em vez de virar um log solto. `enqueue_failed` subindo
+ *    com `recovered` acompanhando é o sistema funcionando; `enqueue_failed`
+ *    sem `recovered` é o varredor parado;
+ *  - `recovered` — o varredor encontrou um turno PROMOVIDO e não enfileirado e
+ *    fechou o buraco. É a prova de que "a fila é wake-up, não fonte de verdade"
+ *    é verdade na operação, e não só na doc.
+ */
+export const STREAM_PROMOTION_RESULTS = [
+  'promoted',
+  'no_successor',
+  'fence_rejected',
+  'enqueue_failed',
+  'recovered',
+] as const;
+
+export type StreamPromotionResult = (typeof STREAM_PROMOTION_RESULTS)[number];
+
+/**
  * #626 — onde uma violação de FIFO pode ser DETECTADA.
  *
  * `maia_stream_fifo_violation_total{stage}` é, pela issue, "sempre zero" — e um
@@ -152,6 +194,29 @@ export const STREAM_FIFO_VIOLATION_STAGES = ['claim', 'recovery'] as const;
 export type StreamFifoViolationStage = (typeof STREAM_FIFO_VIOLATION_STAGES)[number];
 
 /**
+ * #627 — um turno que a plataforma elegeu para AVANÇAR e a quem, portanto, ela
+ * deve um wake-up.
+ *
+ * O tipo mora aqui, no vocabulário PURO, e não em `turn-repos.ts`, porque ele é
+ * a moeda entre TRÊS camadas que não podem se importar em cadeia: o repositório
+ * o produz (na transação), `src/runtime/turns/stream-promotion.ts` o consome
+ * (para sinalizar a BullMQ) e `src/runtime/turns/lease.ts` o audita. Declará-lo
+ * no repositório obrigaria o módulo que fala com a fila a importar o módulo que
+ * fala com o banco só para ter um tipo.
+ *
+ * `representative_message_id` é o que o payload do job carrega; `conversa_id`
+ * vai para a auditoria (a `audit_log` tem coluna própria). Nenhum dos dois é
+ * label de métrica.
+ */
+export type StreamClaimRecovery = {
+  turn_id: string;
+  representative_message_id: string;
+  conversa_id: string | null;
+  status_before: TurnStatus;
+  status_after: TurnStatus;
+};
+
+/**
  * Resultado TIPADO de uma tentativa de claim. `not_claimed` NÃO é erro: é a
  * resposta correta para "outro worker chegou primeiro" e para "ainda não está
  * elegível". O que ele nunca é: autorização para processar.
@@ -161,12 +226,22 @@ export type StreamFifoViolationStage = (typeof STREAM_FIFO_VIOLATION_STAGES)[num
  * de propósito: a recuperação acontece antes de sabermos se venceremos a
  * corrida, e quem perdeu ainda precisa relatar que desbloqueou a stream. Vazio
  * é o caso normal.
+ *
+ * #627 mudou o CONTEÚDO desse campo de `string[]` para o mesmo objeto da
+ * promoção por conclusão, e a razão é operacional: um turno recuperado perdeu o
+ * único wake-up que tinha (o job do dono morto), então ele PRECISA ser
+ * re-enfileirado — e para armar o job é preciso o `representative_message_id`,
+ * que só existe na linha recuperada. Buscá-lo numa segunda consulta abriria a
+ * janela em que o turno muda entre as duas leituras, e o sinal descreveria um
+ * estado que já não existe. O tipo é `StreamPromotion` porque o FATO é o mesmo
+ * — "este turno é quem deve avançar, e alguém lhe deve um sinal" —, contraído
+ * por outro caminho.
  */
 export type ClaimResult =
   | {
       ok: true;
       claim: TurnClaim;
-      recovered_stream_claims?: readonly string[];
+      recovered_stream_claims?: readonly StreamClaimRecovery[];
       /**
        * #626 — o CANÁRIO disparou: o claim foi concedido e, ainda assim, havia
        * turno anterior não terminal na stream. Presente só na anomalia.
@@ -181,7 +256,7 @@ export type ClaimResult =
   | {
       ok: false;
       reason: ClaimRejection;
-      recovered_stream_claims?: readonly string[];
+      recovered_stream_claims?: readonly StreamClaimRecovery[];
       /**
        * #626 — QUEM está na frente, quando a recusa é `not_head` ou
        * `stream_blocked`. Diagnóstico, nunca instrução: esta fatia NÃO

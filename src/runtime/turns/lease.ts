@@ -23,10 +23,12 @@ import {
   type ClaimResult,
   type LeaseLossReason,
   type StreamBlockedReason,
+  type StreamClaimRecovery,
   type StreamFifoViolationStage,
   type TurnClaim,
   type TurnExecutionContext,
 } from './claim.js';
+import { signalStreamPromotion } from './stream-promotion.js';
 import { recordStreamFifoViolation } from './stream-metrics.js';
 
 /** Claim com lease ligado? (kill switch da issue) */
@@ -436,20 +438,41 @@ export async function reportStreamFifoViolation(
  */
 async function reportStreamClaimsRecovered(
   turn_id: string,
-  recovered: readonly string[] | undefined,
+  recovered: readonly StreamClaimRecovery[] | undefined,
 ): Promise<void> {
   if (!recovered || recovered.length === 0) return;
+  const ids = recovered.map((r) => r.turn_id);
   logger.warn(
-    { turn_id, recovered_turn_ids: recovered, count: recovered.length, ops_alert: true },
+    { turn_id, recovered_turn_ids: ids, count: ids.length, ops_alert: true },
     'turn.stream_claims_recovered',
   );
   await audit({
     acao: 'turn_stream_claim_recovered',
     alvo_id: turn_id,
-    metadata: { recovered: [...recovered], count: recovered.length },
+    metadata: { recovered: ids, count: ids.length },
   }).catch((err) =>
     logger.warn({ err: (err as Error).message }, 'turn.stream_claims_recovered_audit_failed'),
   );
+
+  // ─── #627 (fatia D) — A JANELA DE LATÊNCIA DA FATIA C, FECHADA ──────────
+  //
+  // O turno recuperado voltou a `retryable` com `next_attempt_at = now()`: ele
+  // é reivindicável AGORA, e é o head da stream (quem tentou reivindicar está
+  // atrás dele — senão não haveria claim expirado a recuperar). O que ele NÃO
+  // tem é wake-up: o único job que existia era o do worker que morreu.
+  //
+  // Antes desta fatia, o desfecho documentado no runbook §11.5 era: a stream
+  // destrava, o sucessor é recusado com `not_head`, e quem avança é o head — na
+  // vez dele, quando o varredor o rearmar, o que leva até `STUCK_AFTER_MS`
+  // (2 min). Ordem comprada com latência. Aqui a dívida é paga na hora.
+  //
+  // Roda DEPOIS de a transação do claim ter comitado (o `await` do repositório
+  // já retornou), então a regra da issue vale igual: a decisão está no banco
+  // (`promoted_at`, carimbado por `recoverExpiredStreamClaims`) antes de
+  // qualquer sinal. Se este processo morrer aqui, o varredor reconcilia.
+  for (const promocao of recovered) {
+    await signalStreamPromotion(promocao, { source: 'stream_claim_recovery' });
+  }
 }
 
 /**

@@ -4,6 +4,7 @@ import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import {
+  notePromotionReconciled,
   noteTurnQueued,
   reportLegacyProjectionDivergence,
   reportStreamFifoViolation,
@@ -196,6 +197,28 @@ async function runTurnRecoveryInner(): Promise<void> {
           state_version: Number(turn.state_version),
           attempt_count: turn.attempt_count,
           conversa_id: turn.conversa_id,
+        });
+      }
+      // #627 (fatia D da #505) — A RECONCILIAÇÃO DE "COMMIT FEITO, ENQUEUE NÃO
+      // FEITO".
+      //
+      // `promoted_at` preenchido significa que a plataforma ELEGEU este turno
+      // para avançar e ainda ninguém o acordou: o claim zera a coluna quando a
+      // dívida é paga (ver `claimNextEligibleTurn`). Chegar aqui nesse estado é
+      // exatamente o caso que a issue manda o recovery cobrir — o processo caiu
+      // entre o commit da promoção e o `enqueueAgent`, e o turno existe no
+      // banco e não existe na fila.
+      //
+      // O `enqueueAgent` acima JÁ o rearmou; o que falta é dizer que isso
+      // aconteceu. Sem esta linha a recuperação é indistinguível de um rearme
+      // rotineiro de turno esquecido, e `enqueue_failed` (que a promoção conta
+      // do outro lado) ficaria sem par — impossível saber se o buraco foi
+      // fechado ou se o varredor parou.
+      if (turn.promoted_at) {
+        await notePromotionReconciled({
+          turn_id: turn.id,
+          conversa_id: turn.conversa_id,
+          status: turn.status,
         });
       }
       requeued++;

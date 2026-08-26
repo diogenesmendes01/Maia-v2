@@ -4,6 +4,73 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Promoção do sucessor: o head que termina destrava a conversa ([#627](https://github.com/diogenesmendes01/Maia-v2/issues/627), fatia D de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
+
+> **AÇÃO DO OPERADOR: aplique a migration `127` ANTES de subir o código.** Ela é
+> um `ALTER TABLE ... ADD COLUMN` nullable (metadata-only, sem reescrita de
+> tabela e sem `CONCURRENTLY`), então não herda a armadilha de índice inválido
+> da `124`/`126`. Subir o código antes dela quebra toda conclusão de turno: a
+> promoção escreve colunas que ainda não existem.
+
+**O problema, que a fatia anterior criou de propósito.** Com o head-of-line
+ligado (#626), um turno só é reivindicável se for o primeiro vivo da conversa —
+e ninguém acordava o primeiro quando o anterior terminava. O sucessor até estava
+`queued` desde o ingresso, mas o job dele já tinha sido consumido: acordou, o
+claim recusou com `not_head`, o job terminou. Quem avançava era o head, na vez
+dele, **quando o varredor o rearmasse — até 2 minutos** ([runbook
+§11.5](docs/runbooks/turn-state-machine.md)). Ordem comprada com latência.
+
+**A promoção.** A MESMA transação que conclui um turno elege o próximo turno
+elegível da stream, carimba a decisão (`promoted_at`, `promoted_by_turn_id`) e
+só **depois do commit** sinaliza a BullMQ. Vale para todo terminal — inclusive
+`dead_letter`, que é o que impede um turno envenenado de prender a conversa para
+sempre (falha nº 5 da issue-mãe). O re-arme do turno cujo claim expirado é
+recuperado dentro da transação do claim (#625) entra pela mesma porta: ele
+perdeu o único wake-up que tinha, o job do dono morto.
+
+**Latência medida contra PostgreSQL real:** 8ms na promoção por conclusão e 13ms
+no re-arme por claim expirado, contra os 120000ms da janela documentada.
+
+**O fence, de graça e exato.** A issue exige validar o `claim_token` do turno
+que está terminando — *"uma tentativa stale não pode liberar o sucessor"*, a
+falha nº 9 da issue-mãe. A promoção roda DENTRO da transação do CAS terminal,
+cujo `WHERE` já carrega token + lease viva: um worker zumbi não chega à
+promoção, porque o CAS dele devolve zero linhas. Uma validação separada seria
+uma segunda cópia da regra de fence, com o mesmo modo de falha que a fatia C
+eliminou na regra de ordem. A recusa é contada
+(`maia_stream_promotion_total{result="fence_rejected"}`) e auditada
+(`turn_promotion_rejected`).
+
+**A fila é wake-up, não fonte de verdade.** Se o processo cai entre o commit e o
+`enqueueAgent`, o turno promovido existe no banco e não existe na fila. É
+`promoted_at` que permite ao varredor reconciliar, e a reconciliação é contada
+(`result="recovered"`) — o par a vigiar é `enqueue_failed` **sem** `recovered`
+acompanhando, que significa varredor parado, não promoção quebrada. O claim zera
+`promoted_at` quando a dívida é paga, para que o caminho feliz não seja medido
+como recuperação de falha.
+
+**`promoted` ganhou produtor.** O código que a #626 reservou deliberadamente sem
+produtor — para não mudar o domínio de um label depois que ele estivesse num
+dashboard — é produzido por esta fatia, com o mesmo nome.
+
+**Uma única definição, agora com cinco consumidores.** A eleição do sucessor
+mora em [`stream-head-sql.ts`](src/db/repositories/stream-head-sql.ts), o dono
+da ordem, e o UPDATE da promoção carrega `streamHeadOfLineNotExists` — a MESMA
+função do claim, do recovery, do dispatcher e do canário. O teste de contrato
+conta as chamadas.
+
+**Kill switch:** `FEATURE_TURN_STREAM_PROMOTION=false` + restart. Com ela OFF a
+ordem continua correta (o head-of-line não depende da promoção) e a conversa
+volta à cadência do varredor: latência, não inversão. Sem
+`FEATURE_TURN_HEAD_OF_LINE` a flag é inerte de propósito — naquele regime nenhum
+job é recusado por posição, logo não há fila a destravar.
+
+**Decisão que merece ser contestada:** um sucessor `retryable` com backoff em
+aberto **não** é promovido, e a conversa espera o varredor rearmá-lo quando o
+backoff vencer. É a cláusula literal da issue-mãe (*"backoff não autoriza
+ultrapassagem silenciosa"*) e o preço é latência num caminho de falha — a
+alternativa seria apagar o backoff de um turno que acabou de falhar.
+
 ### Ordenação: só o HEAD-OF-LINE da conversa é reivindicável ([#626](https://github.com/diogenesmendes01/Maia-v2/issues/626), fatia C de [#505](https://github.com/diogenesmendes01/Maia-v2/issues/505), fase 6 de 9)
 
 > **AÇÃO DO OPERADOR: aplique a migration `126` ANTES de subir o código, e

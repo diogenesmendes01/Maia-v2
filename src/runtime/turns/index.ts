@@ -23,3 +23,8 @@ export * from './execution-context.js';
 // ingresso com trilha em vez de deixá-lo virar erro opaco de listener.
 export * from './stream-key.js';
 export * from './stream-ingress.js';
+// #627 — a PROMOÇÃO do sucessor: o sinal (BullMQ), a métrica e a auditoria de
+// quem avança quando o head termina. Fica na fachada porque o varredor de
+// recovery (`src/workers/message-recovery.ts`) é consumidor de primeira classe
+// da reconciliação, e a regra do barril é "importe sempre daqui".
+export * from './stream-promotion.js';

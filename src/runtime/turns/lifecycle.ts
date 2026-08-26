@@ -48,6 +48,15 @@ import {
 // tem um canário próprio, e a regra da fachada é "importe sempre de
 // `@/runtime/turns/index.js`".
 export { reportStreamFifoViolation } from './lease.js';
+// #627 (fatia D da #505) — o SINAL da promoção. Módulo à parte porque ele é
+// quem alcança a BullMQ (por `await import`, para não arrastar a conexão Redis
+// de `@/gateway/queue.js` para dentro de todo processo que carrega a máquina de
+// estados); ver o cabeçalho de `stream-promotion.ts`.
+import {
+  noteNoSuccessor,
+  reportPromotionFenceRejected,
+  signalStreamPromotion,
+} from './stream-promotion.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -618,6 +627,19 @@ export async function absorbDebounceInputs(
           { turn_id: sibling.id, to_status: 'superseded', absorbed_by: handle.turn_id },
           'turn.transitioned',
         );
+        // #627 — `superseded` também é TERMINAL, então a transação do irmão
+        // pode ter promovido alguém. No caminho NORMAL não promove: o
+        // absorvedor está `running` e é ele o head, então a eleição não acha
+        // sucessor elegível. Só sinaliza quando houve promoção de verdade — e
+        // NÃO conta `no_successor` por irmão absorvido, que encheria o
+        // denominador da métrica com eventos de debounce e faria a razão
+        // `promoted/(promoted+no_successor)` medir rajada em vez de fila.
+        if (result.promotion) {
+          await signalStreamPromotion(result.promotion, {
+            source: 'terminal',
+            promoted_by_turn_id: sibling.id,
+          });
+        }
       }
     }
     // #505 — o turno agregado passa a declarar o INTERVALO de ingressos que
@@ -635,6 +657,31 @@ export async function absorbDebounceInputs(
         'stream.turn_boundary_extended',
       );
     }
+  });
+}
+
+/**
+ * #627 — o turno acabou de chegar a TERMINAL. Sinaliza o sucessor que a
+ * transação já promoveu, ou registra que não havia quem promover.
+ *
+ * Roda DEPOIS de `applyResult`, isto é, depois de a transação ter comitado. A
+ * ordem é a exigência literal da issue ("persistir a decisão antes de sinalizar
+ * a BullMQ") e ela não depende de disciplina: `result.promotion` só existe
+ * porque o UPDATE da promoção já casou dentro da transação do CAS terminal —
+ * não há como chamar isto antes.
+ *
+ * NUNCA lança: ver `signalStreamPromotion`. Uma conclusão bem-sucedida não pode
+ * virar falha porque o Redis piscou.
+ */
+async function notePromotion(result: TurnTransitionResult): Promise<void> {
+  if (!result.ok) return;
+  if (!result.promotion) {
+    noteNoSuccessor();
+    return;
+  }
+  await signalStreamPromotion(result.promotion, {
+    source: 'terminal',
+    promoted_by_turn_id: result.turn.id,
   });
 }
 
@@ -671,6 +718,15 @@ export async function concludeTurn(
     const fence = resolveFence(handle);
     if (fence.kind === 'lost') {
       await refuseLostOwnership(handle, `conclude_${outcome}`, fence.reason);
+      // #627 — a conclusão recusada é uma PROMOÇÃO que deixou de acontecer, e
+      // esse é o fato que a issue manda auditar ("claim stale tentando promover
+      // sucessor é rejeitado, e a rejeição é auditada"). Sem esta linha, um
+      // zumbi barrado e uma stream sem sucessor produziriam o mesmo silêncio.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
       return;
     }
     const result =
@@ -697,10 +753,24 @@ export async function concludeTurn(
     // perdeu a lease chega aqui com trabalho pronto e é RECUSADO. Sem isto ele
     // marcaria `completed` por cima da tentativa do sucessor, e o usuário
     // receberia duas respostas com o turno registrado como concluído uma vez.
-    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) return;
+    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) {
+      // #627 — mesma leitura do ramo `lost` acima, com a recusa vindo do banco
+      // em vez do guard em memória. O fato operacional é o mesmo: a fila não
+      // andou porque quem tentou concluir já não era o dono.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
     // Concluído: a posse morreu com o CAS (`clearClaim`), só resta o timer.
     handle.lease?.stop();
+    // #627 — A FILA ANDA. A transação que concluiu este turno já elegeu e
+    // promoveu o sucessor; aqui só resta bater na BullMQ. DEPOIS do commit,
+    // nunca antes.
+    await notePromotion(result);
 
     if (IGNORED_OUTCOMES.has(outcome)) {
       await audit({
@@ -865,6 +935,11 @@ export async function deadLetterTurn(
     const fence = resolveFence(handle);
     if (fence.kind === 'lost') {
       await refuseLostOwnership(handle, 'dead_letter', fence.reason);
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
       return;
     }
     const from = handle.status;
@@ -876,9 +951,21 @@ export async function deadLetterTurn(
       expected_version: handle.state_version,
       ...fenceArgs(fence),
     });
-    if (await handleStaleClaim(handle, result, 'dead_letter')) return;
+    if (await handleStaleClaim(handle, result, 'dead_letter')) {
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
     handle.lease?.stop();
+    // #627 — `dead_letter` é TERMINAL, e a issue-mãe é explícita sobre o que
+    // isso significa para a fila: a política de DLQ "libera o próximo turno".
+    // Um turno envenenado que ficasse segurando a conversa para sempre é a
+    // falha nº 5 da issue-mãe.
+    await notePromotion(result);
     logger.error(
       {
         turn_id: handle.turn_id,

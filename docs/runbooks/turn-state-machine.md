@@ -735,7 +735,8 @@ turno anterior não terminal na mesma stream** — "anterior" medido por
 Isso fecha as falhas nº 1 e nº 3 da issue-mãe (*M1 e M2 chegam nessa ordem, mas
 M2 termina antes de M1*; *um retry antigo reaparece depois de um turno mais
 novo*). O que ela **não** faz: promover o sucessor quando o head termina — isso
-é a #627, e a consequência está na §11.5.
+é a #627, documentada na **§12**, e a janela de latência que ela fecha está
+descrita na §11.5.
 
 ### 11.1 As duas condições, e onde cada uma mora
 
@@ -854,15 +855,25 @@ o head sem avançar. Rode a consulta da §11.3 e leia a PRIMEIRA linha:
 | `outbound_pending` | outbox travado | runbook do outbox (#506). O código de recusa é `stream_blocked`, não `not_head`. |
 | `received`/`queued` há muito tempo | o job do head sumiu da fila | recovery (§3) — e ele já elege o head, pela mesma função do claim. |
 
-**A janela de latência que esta fatia introduz, e que a #627 fecha.** Antes, um
-head que morria com a lease vencida era destravado pelo SUCESSOR: ele
+**A janela de latência que esta fatia introduziu — FECHADA pela #627.** Antes da
+fatia C, um head que morria com a lease vencida era destravado pelo SUCESSOR: ele
 reivindicava, a transação recuperava o morto e a conversa andava na hora — fora
-de ordem. Agora a recuperação continua acontecendo (é o que devolve o head a
-`retryable`), mas o sucessor é recusado como `not_head`. Quem avança é o head, na
-vez dele — e ele só volta à fila quando o varredor de recovery o rearma, o que
-leva até `STUCK_AFTER_MS` (2 min). É ordem comprada com latência no caminho de
-crash. A promoção idempotente do sucessor (#627) é o que devolve a latência sem
-devolver a inversão.
+de ordem. Com o head-of-line, a recuperação continua acontecendo (é o que devolve
+o head a `retryable`), mas o sucessor é recusado como `not_head`. Quem avança é o
+head, na vez dele — e, **até a #627**, ele só voltava à fila quando o varredor de
+recovery o rearmasse, o que levava até `STUCK_AFTER_MS` (2 min).
+
+Desde a fatia D (§12) essa espera não existe mais, nos dois caminhos:
+
+| Evento | Antes (#626) | Agora (#627) |
+|---|---|---|
+| head chega a estado TERMINAL | o sucessor esperava o varredor: **até 120000ms** | promovido e acordado na transação da conclusão: **8ms medidos** |
+| claim expirado do head recuperado na transação do claim | o head voltava a `retryable` sem wake-up e esperava o varredor: **até 120000ms** | re-armado no mesmo instante: **13ms medidos** |
+
+Os números são de `tests/integration/turn-stream-promotion-real-db.spec.ts`,
+contra PostgreSQL real, e a spec os imprime a cada rodada. O varredor continua
+existindo e continua sendo a rede: ele é quem reconcilia o caso em que o processo
+morre entre o commit da promoção e o `enqueueAgent` (§12.3).
 
 **Nunca** conserte com `UPDATE agent_turns SET status = ...` à mão: isso pula o
 `state_version`, o fence e a trilha. Um turno que "não devia estar na frente"
@@ -904,3 +915,121 @@ propósito durante um incidente.
 
 Ordem no rollback COMPLETO do protocolo de stream: `126` → `124` → `122` →
 `120`.
+
+## 12. Promoção do sucessor (#627, fatia D da #505)
+
+Fase 6 do rollout da #505, e a fatia que devolve a latência que a §11 comprou. A
+regra em uma frase: **quando um turno chega a estado terminal, a MESMA transação
+elege o próximo turno elegível da conversa, persiste a decisão e — só depois do
+commit — sinaliza a fila.**
+
+### 12.1 Por que a promoção mora dentro da transação da conclusão
+
+Não é elegância, é a única posição em que as três exigências da issue são
+estruturais em vez de convencionais:
+
+| Exigência | Como a posição a garante |
+|---|---|
+| "validar o `claim_token` do turno que está terminando" | quem chega à promoção já passou pelo `WHERE` do CAS terminal, que carrega `claim_token = <o meu>` **e** `lease_expires_at > now()`. Um zumbi não chega: o CAS dele devolve zero linhas |
+| "persistir a decisão ANTES de sinalizar a BullMQ" | o objeto da promoção só existe no retorno da transação. Não há caminho de código em que o sinal preceda o commit |
+| "promover de forma idempotente" | a eleição é `ORDER BY first_ingress_seq LIMIT 1 FOR UPDATE`: duas conclusões simultâneas da mesma stream serializam no lock de linha, e a segunda re-avalia o `WHERE` contra a linha nova e não casa |
+
+E a razão que não está na issue e é a mais prática: uma promoção em transação
+SEPARADA teria um estado intermediário — conclusão comitada, promoção não — cuja
+única saída seria o varredor. Isto é, a janela de 2 minutos que a fatia existe
+para fechar.
+
+### 12.2 O que é promovido, e o que não é
+
+O sucessor eleito é o **menor `first_ingress_seq` não terminal da stream** (o
+novo head), e ele só é promovido se estiver reivindicável AGORA:
+
+| Estado do sucessor | Promovido? | Por quê |
+|---|---|---|
+| `received` | sim (vira `queued`) | nunca teve wake-up |
+| `queued` | **sim**, re-armado | é o caso NORMAL: o job dele já acordou, foi recusado com `not_head` e terminou. O wake-up foi CONSUMIDO |
+| `retryable` com backoff vencido | sim (vira `queued`) | trabalho legítimo |
+| `retryable` com backoff em ABERTO | não | *"backoff não autoriza ultrapassagem silenciosa"* — a conversa espera o varredor |
+| `claimed` / `running` | não | já tem dono vivo |
+| `outbound_pending` | não | nenhum claim o move; quem o move é o delivery worker (#506) |
+| stream sem sucessor | não | `result="no_successor"`, o caso majoritário |
+
+`queued_at` **não** é reescrito pela promoção: ele mede quando a espera começou.
+Reescrevê-lo faria uma conversa presa há uma hora parecer recém-chegada para
+`maia_stream_head_age_seconds`.
+
+### 12.3 "Commit feito, enqueue não feito"
+
+A fila é **wake-up, não fonte de verdade**. Se o processo morre entre o commit e
+o `enqueueAgent`, o turno promovido existe no banco e não existe na fila.
+
+Quem fecha o buraco é o varredor de recovery, e o que ele lê é `promoted_at`:
+
+```sql
+SELECT id, status, promoted_at, promoted_by_turn_id, queued_at
+  FROM agent_turns
+ WHERE tenant_id = $1 AND agent_id = $2
+   AND promoted_at IS NOT NULL
+ ORDER BY promoted_at;
+```
+
+`promoted_at IS NOT NULL` significa *"este turno foi eleito para avançar e ainda
+ninguém o acordou"* — **o claim zera a coluna quando a dívida é paga**. Uma linha
+com `promoted_at` antigo é um wake-up que se perdeu; várias, com `promoted_at`
+crescendo, é o varredor parado.
+
+### 12.4 O que olhar
+
+| Sinal | Onde | Leitura |
+|---|---|---|
+| `maia_stream_promotion_total{result="promoted"}` | `/metrics` | rotina. A razão `promoted/(promoted+no_successor)` é a fração de conclusões que destravaram fila; ela cai a zero quando alguém desliga a flag sem querer |
+| `{result="no_successor"}` | `/metrics` | rotina, e é o DENOMINADOR — sem ele `promoted` sozinho não distingue "as conversas acabaram" de "a promoção parou" |
+| `{result="fence_rejected"}` | `/metrics` | um worker ZUMBI tentou concluir (e liberar o sucessor) e foi barrado. Não deveria ser rotina: sustentado, procure lease curta demais ou GC longo — ver §6.1 |
+| `{result="enqueue_failed"}` | `/metrics` | a decisão comitou e o Redis falhou. **Só é problema sem `recovered` acompanhando** |
+| `{result="recovered"}` | `/metrics` | o varredor reconciliou. Ver §12.3 |
+| `turn_promoted` | `audit_log` | `metadata.source` distingue `terminal` (rotina), `stream_claim_recovery` (um worker morreu) e `recovery_reconciliation` (um sinal se perdeu). `metadata.promoted_by_turn_id` reconstrói a fila sem recorrer à `stream_key` |
+| `turn_promotion_rejected` | `audit_log` | a falha nº 9 da issue-mãe registrada no momento em que ela NÃO acontece |
+| `stream.turn_promoted` / `stream.turn_promotion_enqueue_failed` | log estruturado | o segundo é `warn`, não `error`: o varredor conserta sozinho, e alerta que se resolve sozinho é como se ensina o plantão a ignorar alerta |
+
+### 12.5 Conversa que não anda depois de uma conclusão
+
+Rode a consulta da §11.3 e leia a PRIMEIRA linha:
+
+| Head | Causa | Remediação |
+|---|---|---|
+| `queued` com `promoted_at` preenchido e antigo | o wake-up se perdeu e o varredor não passou | §12.3. Cheque se o worker de recovery está vivo; `maia_stream_promotion_total{result="enqueue_failed"}` sem `recovered` confirma |
+| `retryable` com `next_attempt_at` no futuro | backoff em aberto | **nada.** É a §11.5, e é deliberado |
+| `outbound_pending` | outbox travado | runbook do outbox (#506). A promoção não o move |
+| terminal, e o sucessor sem `promoted_at` | a promoção não rodou | confirme `FEATURE_TURN_STREAM_PROMOTION` e `FEATURE_TURN_HEAD_OF_LINE` (a primeira é inerte sem a segunda) e a migration `127` |
+
+**Nunca** conserte com `UPDATE agent_turns SET status = ...` à mão — vale aqui o
+mesmo da §11.5: isso pula o `state_version`, o fence e a trilha.
+
+### 12.6 Rollout e rollback
+
+Ordem obrigatória do deploy:
+
+1. `npm run db:migrate` (aplica a `127` — `ADD COLUMN` nullable, metadata-only,
+   sem `CONCURRENTLY` e portanto sem a armadilha de índice inválido da §10.4);
+2. suba o código com `FEATURE_TURN_STREAM_PROMOTION=true` (o default).
+
+Subir o código antes da migration **não** é seguro nesta fatia (ao contrário da
+`126`): a promoção escreve `promoted_at`/`promoted_by_turn_id`, e sem as colunas
+toda transição terminal falha.
+
+O kill switch é a flag:
+
+```
+FEATURE_TURN_STREAM_PROMOTION=false   # + restart
+```
+
+Com ela OFF a **ordem continua correta** — o head-of-line não depende da promoção
+— e a conversa volta a andar na cadência do varredor: latência, não inversão. É
+por isso que o rollback desta fatia é barato e o da #626 não é.
+
+O `_down` da `127` derruba as COLUNAS, e por isso a ordem num rollback de verdade
+é: desligue a flag primeiro, confirme que as réplicas recarregaram, e só então
+rode o `_down`. Na ordem inversa a aplicação escreve numa coluna que não existe.
+
+Ordem no rollback COMPLETO do protocolo de stream: `127` → `126` → `124` →
+`122` → `120`.
