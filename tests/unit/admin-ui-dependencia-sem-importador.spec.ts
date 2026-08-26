@@ -69,20 +69,15 @@ const SEM_IMPORTADOR_JUSTIFICADO: Readonly<Record<string, string>> = {
     'no SSR). É peer obrigatório de `next` e de `react` — sem ele declarado, o ' +
     '`npm ci` do Dockerfile do admin-ui não instala o renderizador e o build morre.',
 
-  '@tanstack/react-table':
-    'DÍVIDA CONHECIDA, mesmo defeito do `recharts`: entrou no scaffold do P8.5 ' +
-    '(e23c8523) e nunca foi ligada. As tabelas do console usam ' +
-    '`components/ui/table.tsx`, escrito à mão. Fora do escopo da #605, que é ' +
-    'sobre gráficos; fica aqui para PARAR DE SER INVISÍVEL.',
-
   'react-hook-form':
-    'DÍVIDA CONHECIDA, mesma origem. Os formulários do console usam ' +
-    '`React.useState` + `components/ui/field.tsx`. Ver a nota do ' +
-    '`@tanstack/react-table`.',
+    'DÍVIDA CONHECIDA: entrou no scaffold do P8.5 (e23c8523) e nunca foi ' +
+    'ligada. Os formulários do console usam `React.useState` + ' +
+    '`components/ui/field.tsx`. Fica aqui para PARAR DE SER INVISÍVEL.',
 
   'react-diff-viewer-continued':
-    'DÍVIDA CONHECIDA, mesma origem. A tela de versões/propostas mostra diff ' +
-    'como texto. Ver a nota do `@tanstack/react-table`.',
+    'DÍVIDA CONHECIDA: entrou no scaffold do P8.5 (e23c8523) e nunca foi ' +
+    'ligada. A tela de versões/propostas mostra diff como texto. Fica aqui ' +
+    'para PARAR DE SER INVISÍVEL.',
 };
 
 /**
