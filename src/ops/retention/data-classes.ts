@@ -217,6 +217,37 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
       'whether media is durable data requiring its own backup, or ephemeral/recreatable and purgeable — and its retention if durable',
   }),
   cls({
+    // Issue #634 (fatia E da #506) — a mídia de SAÍDA ganhou um lugar durável
+    // para morar (`<MEDIA_ROOT>/outbound/`, ver
+    // `src/runtime/outbound/media-store.ts`), e um lugar onde dado do
+    // interlocutor passa a morar TEM de entrar neste inventário. Um objeto que
+    // sobrevive a um pedido de exclusão é incidente, não dívida.
+    //
+    // Classe SEPARADA de `media.blobs` de propósito, e a separação é o que
+    // torna o mecanismo implementável: `media.blobs` é a mídia de ENTRADA,
+    // endereçada por `<tenant>/<mês>/<sha>` — sem ligação com o titular, que é
+    // por isso que ela está em `UNSUPPORTED_CLASSES` com
+    // `mechanism_not_implemented`. O store de saída é endereçado por
+    // `<tenant>/<agent>/<pessoa_id>/<sha>`, então "quais objetos são deste
+    // titular" TEM resposta: é um diretório. Fundir as duas classes teria
+    // arrastado a de saída para a exceção da de entrada.
+    id: 'media.outbound_artifacts',
+    data_owner: 'platform_ops',
+    purpose:
+      'voice notes synthesised and documents generated for a reply, staged durably so a later delivery attempt sends the same bytes',
+    sensitivity: 'sensitive_personal',
+    scope: 'tenant_agent',
+    source_of_truth: 'filesystem:MEDIA_ROOT/outbound',
+    purge_mechanism: 'delete',
+    // Mesmo volume de `media.blobs`: o `pg_dump` não o captura.
+    backup_behavior: 'excluded_volume',
+    legal_hold_applicable: true,
+    reversible: false,
+    audit_event: 'retention_run_completed',
+    dpo_open_question:
+      'how long an outbound media object whose delivery ended uncertain or terminal may be kept so reconciliation and manual re-arm can still send the SAME bytes — deleting it earlier turns a recoverable delivery into a permanent media_ref_unresolved',
+  }),
+  cls({
     id: 'gateway.baileys_session',
     data_owner: 'platform_ops',
     purpose: 'WhatsApp session credentials for the bot line',

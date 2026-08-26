@@ -59,6 +59,7 @@ import {
   type OutboundDeliveryClaim,
 } from './delivery-contract.js';
 import { sendPayloadToProvider, type ProviderCallTarget } from './provider-adapter.js';
+import { withOutboxEgress } from './egress-guard.js';
 
 /**
  * O canal de egresso desta fatia. Fechado em `whatsapp` porque
@@ -271,8 +272,13 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
     provider_idempotency_key: row.provider_idempotency_key,
     ...(signal ? { signal } : {}),
   };
+  // #634 — ESCOPO DE EGRESSO DO OUTBOX. A fronteira única (`line-output.ts`)
+  // recusa qualquer `send*` que não esteja dentro de um escopo declarado; este
+  // é o escopo do caminho legítimo. Ele envolve SÓ a chamada ao adaptador, não
+  // o ciclo inteiro: autorizar `deliverOutbound` de ponta a ponta autorizaria,
+  // de quebra, qualquer envio que outro módulo fizesse durante a entrega.
   const observation = await withDeliveryHeartbeat(claim, lease_ms, () =>
-    sendPayloadToProvider(payload, target),
+    withOutboxEgress(claim.outbound_id, () => sendPayloadToProvider(payload, target)),
   );
   const outcome = normalizeProviderOutcome(observation);
 

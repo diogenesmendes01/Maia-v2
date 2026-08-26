@@ -173,6 +173,12 @@ const PURGE_ORDER: readonly string[] = Object.freeze([
   'postgres.memory',
   'postgres.audit',
   'media.blobs',
+  // #634 — depois das classes do PostgreSQL e ANTES de `postgres.people`: o
+  // diretório do titular é derivado do `pessoa_id`, e `postgres.people`
+  // ANONIMIZA a linha (não a apaga), então a ordem relativa a ela não muda o
+  // resultado. Vem depois de `media.blobs` só para manter as duas classes de
+  // filesystem adjacentes na evidência do pedido.
+  'media.outbound_artifacts',
   'privacy.export',
   'postgres.people',
 ]);

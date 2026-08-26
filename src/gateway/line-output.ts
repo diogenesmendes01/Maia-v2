@@ -39,6 +39,7 @@ import {
 } from './presence.js';
 import type { WAQuotedContext } from './types.js';
 import { getLineSessionManager } from './line-session-manager.js';
+import { assertEgressAuthorized } from '../runtime/outbound/egress-guard.js';
 import { randomUUID } from 'node:crypto';
 import { isSyntheticChannel } from '../probe/sink-guard.js';
 
@@ -176,6 +177,59 @@ function buildSyntheticSink(scope: ChannelScope): LineOutput {
   };
 }
 
+/**
+ * Issue #634 — A TRAVA DE ENVIO DIRETO, aplicada ao objeto que sai daqui.
+ *
+ * Envolve as CINCO primitivas de mensagem (`sendText`, `sendDocument`,
+ * `sendVoice`, `sendPoll`, `sendReaction`) com `assertEgressAuthorized`, que
+ * recusa a chamada quando ela não está dentro de um escopo de egresso — o do
+ * outbox durável ou o de uma exceção INVENTARIADA em
+ * `src/runtime/outbound/send-paths.ts`.
+ *
+ * `startTyping` e `markRead` NÃO são envolvidos: são sinais de presença,
+ * efêmeros, sem artefato e sem histórico. Cobri-los transformaria o typing
+ * debounce de `agent/core.ts` numa "violação" e diluiria uma métrica cujo valor
+ * esperado é zero absoluto.
+ *
+ * POR QUE AQUI E NÃO NO TRANSPORTE. `buildOutput` é o ponto por onde TODOS os
+ * `LineOutput` de produção nascem — inclusive o sink sintético, que é
+ * envolvido pelo mesmo wrapper de propósito: uma sonda que enviasse fora do
+ * outbox seria uma sonda que não exercita o caminho real. Descer a trava para
+ * `baileys.ts`/`presence.ts` a colocaria abaixo do sink e do
+ * LineSessionManager, e a fatia perderia justamente o caminho que a fase 0 do
+ * roteamento definiu como fronteira.
+ */
+function guarded(output: LineOutput): LineOutput {
+  return {
+    ...output,
+    scope: output.scope,
+    async sendText(jid, text, opts) {
+      assertEgressAuthorized('sendText');
+      return output.sendText(jid, text, opts);
+    },
+    async sendDocument(jid, path, opts) {
+      assertEgressAuthorized('sendDocument');
+      return output.sendDocument(jid, path, opts);
+    },
+    async sendVoice(jid, buf, opts) {
+      assertEgressAuthorized('sendVoice');
+      return output.sendVoice(jid, buf, opts);
+    },
+    // `async` de propósito, e não um repasse síncrono: a assinatura devolve
+    // uma `Promise`, então um `throw` síncrono aqui escaparia de todo call site
+    // que trata a falha com `.catch(...)` em vez de `try`. A recusa tem de
+    // chegar pelo mesmo canal por onde a falha de envio chegaria.
+    async sendPoll(jid, question, options) {
+      assertEgressAuthorized('sendPoll');
+      return output.sendPoll(jid, question, options);
+    },
+    sendReaction(jid, whatsappId, emoji) {
+      assertEgressAuthorized('sendReaction');
+      output.sendReaction(jid, whatsappId, emoji);
+    },
+  };
+}
+
 function buildOutput(scope: ChannelScope): LineOutput {
   // §1.3 / review P1-C — o sink intercepta QUALQUER envio a um canal
   // `is_synthetic` (conjunto carregado no boot), INDEPENDENTE da flag da sonda.
@@ -183,11 +237,11 @@ function buildOutput(scope: ChannelScope): LineOutput {
   // a um job antigo na fila. Keying por channel_id (portador do marcador
   // imutável) não tem blast radius — só o canal sintético exato é neutralizado.
   if (isSyntheticChannel(scope.channel_id)) {
-    return buildSyntheticSink(scope);
+    return guarded(buildSyntheticSink(scope));
   }
   const manager = getLineSessionManager();
   const viaManager = manager.isEnabled();
-  return {
+  return guarded({
     scope,
     async sendText(jid, text, opts) {
       if (viaManager) return manager.transportFor(scope.channel_id).sendText(jid, text, opts);
@@ -227,7 +281,7 @@ function buildOutput(scope: ChannelScope): LineOutput {
       if (viaManager) return manager.isLineConnected(scope.channel_id);
       return isBaileysConnected();
     },
-  };
+  });
 }
 
 /** Test-only: exercita o roteamento de `buildOutput` (inclui o sink de sonda). */

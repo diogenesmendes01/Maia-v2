@@ -408,7 +408,7 @@ teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
 `agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
 encerrado por um turno TERMINAL".
 
-### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatias A (#630), B (#631) e C (#632)
+### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatias A (#630), B (#631), C (#632), D (#633) e E (#634)
 
 | File | Role |
 |---|---|
@@ -487,13 +487,11 @@ Decisões que parecem detalhe e não são:
   predicado de `idx_outbound_messages_ready` (migração 121). Um crash entre o
   commit e o enqueue deixa trabalho visível sem que nada consulte a BullMQ.
 
-**Exceção declarada:** o ramo de **voz** de `dispatchOutput` não commita
-artefato durável. O payload `audio` exige um `MediaRef` (`local_path` /
-`storage_object`) e `synthesizeSpeech` devolve um Buffer **em memória** — não há
-arquivo nem objeto a referenciar. `FEATURE_OUTBOUND_VOICE` tem default `false`
-(não é caminho de produção hoje); decidir onde o áudio sintetizado passa a morar
-é #634. O ramo de **documento** commita com `local_path`, válido enquanto quem
-entrega é o mesmo processo — a migração para `storage_object` é da mesma fatia.
+**A exceção de voz foi FECHADA em #634.** O ramo de voz de `dispatchOutput`
+commita artefato durável como qualquer outro: os bytes da síntese vão para o
+store de `src/runtime/outbound/media-store.ts` **antes** do commit e o payload
+`audio` referencia um `storage_object`. O ramo de **documento** também deixou de
+usar `local_path`. Ver "Onde a mídia de saída mora (#634)" abaixo.
 
 #### O ciclo de entrega (#632) — "aceito" não é "recebido"
 
@@ -614,9 +612,12 @@ pode entrar ali: ela FECHA uma janela em vez de abrir (sem ela a linha fica
 - **`sendReaction` devolve `void`.** Sem identificador e sem confirmação, o
   melhor desfecho honesto é `accepted_unconfirmed` — uma reação termina em
   `delivery_unknown`. Fingir `accepted_confirmed` seria inventar confirmação.
-- **`storage_object` não é resolvível ainda.** O worker lê `local_path` do
-  disco; uma referência de storage é recusada como `rejected_terminal`
-  (`media_ref_unresolved`) em vez de enviar outra coisa. O resolvedor é #634.
+- ~~**`storage_object` não é resolvível ainda.**~~ **Resolvido em #634**:
+  `resolveOutboundMediaPath` (`media-store.ts`) devolve o caminho real,
+  fail-closed em bucket, forma da chave, ESCOPO (tenant/agent) e contenção. Uma
+  referência que não resolve continua terminando em `rejected_terminal`
+  (`media_ref_unresolved`) — mas isso agora significa "o objeto sumiu", não "o
+  worker não sabe ler".
 - **Janela entre `delivered` e `completed`.** Um crash ali deixa a linha com
   claim vivo e lease vencendo, e ela **não** volta a ser reivindicável — o que é
   correto (a mensagem chegou; reenviar duplicaria). O histórico faltante é
@@ -731,14 +732,16 @@ ledger novo, em silêncio. Todas as consultas daquele worker agora filtram
   #635.
 - **Não há retenção para a linha DURÁVEL.** O sweeper legado agora a ignora, e
   a retenção do outbox durável (#506 §Retenção) não tem dono. A tabela cresce.
-- **`storage_object` continua irresolúvel** (dívida de #632, é #634).
+- ~~**`storage_object` continua irresolúvel**~~ — resolvido em #634.
 - **Os limites de política são constantes, não env vars** —
   `OUTBOUND_MAX_DELIVERY_ATTEMPTS`, `RECONCILIATION_GRACE_MS`,
   `RECONCILIATION_DEADLINE_MS`. Uma env var aqui seria a alavanca com que
   alguém, no meio de um incidente, silencia o alarme subindo o teto.
 - **Nada enfileira no caminho QUENTE.** O commit de #631 continua sem
   `enqueueOutboundDelivery`; quem arma é a varredura (até 1 min de latência) ou o
-  operador. Ligar o commit à fila é #634.
+  operador. #634 **não** fechou esta: o texto da issue não a pede, e ligar o
+  enqueue ao commit reabriria o `await` entre o commit e o `send*` que #631
+  fechou deliberadamente. Continua sem dono nomeado.
 
 #### A flag, e por que ela não pode ser desligada em produção
 
@@ -796,6 +799,92 @@ injetivo para qualquer string, inclusive uma que contenha o separador ou NUL.
 Não reusa o separador NUL de `deriveProviderDedupKey`
 (`src/governance/idempotency-effects.ts`) porque aquilo depende de "nenhum
 componente contém NUL" — outra suposição sobre dado de terceiro.
+
+#### Onde a mídia de saída mora, e a trava do envio direto (#634)
+
+**O store.** `src/runtime/outbound/media-store.ts`. A mídia de saída vive em
+`<MEDIA_ROOT>/outbound/<tenant_id>/<agent_id>/<pessoa_id>/<sha256>.<ext>` e o
+artefato persiste `{kind:'storage_object', bucket:'maia-outbound-media',
+object_key}` — sem caminho, sem URL, sem credencial.
+
+Por que `MEDIA_ROOT` e não um bucket novo: o projeto não tem object storage, e
+`MEDIA_ROOT` já é o volume que a plataforma declara como o lugar durável da
+mídia (`media.blobs`, `backup_behavior: excluded_volume`, volume próprio no
+`docker-compose.yml`). Trocar o backend por S3 é trocar esse módulo, e só ele.
+
+Por que isso **não** é `local_path` com outro nome — a diferença é o dono do
+ciclo de vida:
+
+| | quem apaga | o que a 2ª tentativa encontra |
+|---|---|---|
+| `local_path` (#631) | o `finally` do próprio envio | ENOENT, com certeza |
+| `storage_object` (#634) | o GC, só após entrega CONFIRMADA | os mesmos bytes |
+
+Cada segmento da chave tem função verificável: `tenant_id`/`agent_id` são
+comparados com o escopo ALS no resolvedor (é essa comparação, e não a contenção
+de `media-guard`, que carrega o isolamento — todos os objetos moram sob a mesma
+raiz); `pessoa_id` é o que torna o apagamento por titular expressável; `sha256`
+torna a escrita idempotente.
+
+**GC.** O objeto é descartado quando a entrega é **confirmada**. Desfecho
+incerto, recusa transitória ou terminal **preserva** o objeto: a reconciliação
+de #633 e o rearmamento de `src/ops/outbound-rearm.ts` precisam dos bytes, e
+apagá-los transformaria uma entrega recuperável num `media_ref_unresolved`
+permanente. O que sobra é responsabilidade do ciclo de retenção.
+
+**Retenção/LGPD.** Classe própria `media.outbound_artifacts`
+(`src/ops/retention/data-classes.ts`), `sensitive_personal`, escopo
+`tenant_agent`, `purge_mechanism: delete`. Ela **não** está em
+`UNSUPPORTED_CLASSES`: o adapter de privacidade (`src/ops/privacy/adapters.ts`)
+implementa a purga por titular removendo o diretório do `pessoa_id`. Mecanismo
+**ligado**; política (o prazo) continua `pending_dpo` como as demais treze —
+`resolveRetention` devolve `purgeable:false` para todas.
+
+Isso é o contrário de `media.blobs` (mídia de ENTRADA), que continua com
+`mechanism_not_implemented` porque o layout dela (`<tenant>/<mês>/<sha>`) não
+tem ligação com o titular. As classes ficaram separadas exatamente por isso.
+
+**A trava de envio direto.** Duas camadas, e cada uma pega o que a outra não
+pega:
+
+1. **Runtime** — `src/runtime/outbound/egress-guard.ts`. Um ALS carrega a
+   autorização de egresso; `src/gateway/line-output.ts` envolve as CINCO
+   primitivas de mensagem com `assertEgressAuthorized`. Fora de escopo: emite
+   `maia_outbound_direct_send_violation_total{kind}` e **lança**. Sem flag — uma
+   trava cujo default fosse "só contar" é o fail-open que #506 lista como risco.
+   `startTyping`/`markRead` ficam de fora: são presença, não saída lógica.
+2. **Estático** — `tests/unit/runtime/outbound-trava-envio-direto.spec.ts` varre
+   `src/` (removendo comentários antes de casar) e reprova um `LineOutput.send*`
+   num módulo ausente do inventário, ou um módulo cujo inventário não declare a
+   primitiva que ele chama.
+
+**O inventário.** `src/runtime/outbound/send-paths.ts`, em código e não em
+markdown, para que o teste possa lê-lo. Três estados: `outbox`,
+`declared_exception` (com `reason` **e** `containment` obrigatórios) e
+`infrastructure`. Estado hoje:
+
+| Estado | Caminhos |
+|---|---|
+| `outbox` | `agent/output-dispatch.ts` (texto, `status_fallback`, documento, voz, enquete), `runtime/outbound/delivery.ts` |
+| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `tools/_dispatcher.ts`, `workers/briefings.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` |
+| `infrastructure` | `gateway/line-output.ts`, `gateway/line-sessions.ts`, `runtime/outbound/provider-adapter.ts` |
+
+A issue pede o inventário de exceções "idealmente vazio"; ele não está, e o
+denominador comum das dez é literal: **nenhuma tem `turn_id`**. O outbox exige
+`turn_id NOT NULL` (migração 121) e o commit faz fence do `claim_token` do
+turno — não há turno a cercar num briefing das 7h nem numa expiração de
+workflow. Duas delas (`scheduling.outbox_drain`, `workers.idempotency_relayer`)
+já são outboxes duráveis próprios; migrá-las é fundir dois ledgers, trabalho que
+a issue-mãe não pede.
+
+**Fallback e timeout.** `sendOutbound` já aceitava `fallback_reason` desde #631,
+mas nenhum call site o passava — todo fallback nascia como `payload_type:'text'`
+e era indistinguível de conteúdo do agente. #634 ligou os quatro call sites reais
+de `src/agent/core.ts`: rate limit (`policy_refusal`), bloqueio do Decision
+Engine (`policy_refusal`), escalada para aprovação (`policy_refusal`) e
+fail-closed do Decision Engine (`internal_error`). Não há caminho de TIMEOUT
+visível ao usuário hoje — ele é de #507, e o `reason` `timeout` já existe no
+contrato esperando por ele.
 
 #### Tipos de payload — o que foi verificado, não presumido
 

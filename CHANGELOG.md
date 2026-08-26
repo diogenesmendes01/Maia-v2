@@ -4,6 +4,92 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a mídia de saída passa a ser durável, e o envio direto ao canal passa a ser RECUSADO ([#634](https://github.com/diogenesmendes01/Maia-v2/issues/634), fatia E de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** três coisas.
+>
+> **(1) `LineOutput.send*` fora do outbox agora LANÇA.** As cinco primitivas de
+> mensagem (`sendText`, `sendDocument`, `sendVoice`, `sendPoll`, `sendReaction`)
+> só executam dentro de um escopo de egresso declarado: o do outbox durável, ou
+> o de uma exceção **inventariada** em `src/runtime/outbound/send-paths.ts`.
+> Qualquer outro chamador recebe `outbound_direct_send_violation` e a série
+> `maia_outbound_direct_send_violation_total` sobe. **Não há env var para
+> desligar** — uma trava desligável em produção é o fail-open que a épica lista
+> como risco. Código novo que precise enviar tem duas opções e só duas: passar
+> pelo outbox, ou entrar no inventário com motivo e contenção escritos.
+> `startTyping`/`markRead` continuam livres (são presença, não mensagem).
+>
+> **(2) Áudio e documento passam a MORAR em `<MEDIA_ROOT>/outbound/`.** O ramo
+> de voz, que #631 deixou explicitamente sem artefato durável, agora commita
+> como qualquer outro. O ramo de documento deixou de commitar `local_path`
+> (apontando para um PDF que o `finally` apagava em seguida) e passou a commitar
+> `storage_object`. **Se o seu deploy roda backend e delivery worker em réplicas
+> com volumes `MEDIA_ROOT` diferentes, a entrega de mídia falha** com
+> `media_ref_unresolved` — recusa terminal e observável, nunca "envia outra
+> coisa". Ver §7.5 do runbook.
+>
+> **(3) A mídia de saída entrou no ciclo de LGPD, com mecanismo LIGADO.** Classe
+> nova `media.outbound_artifacts` (a 14ª), `sensitive_personal`, e o adapter de
+> privacidade **implementa** a purga por titular. Diferente de `media.blobs` (a
+> mídia de ENTRADA), que continua `mechanism_not_implemented` porque o layout
+> dela não tem ligação com o titular. A POLÍTICA (o prazo) continua
+> `pending_dpo`, como as outras treze.
+>
+> **Sem migração.** O prefixo 134 foi reservado para esta fatia e **não foi
+> usado**: nada aqui muda schema. Mesma situação da 128 (reservada por #632 e
+> não usada).
+
+**O PORQUÊ.** Três fatias seguidas empurraram a mesma decisão para cá, cada uma
+deixando o motivo escrito no código: o ramo de VOZ não commitava porque
+`synthesizeSpeech` devolve um Buffer em memória e não havia objeto a referenciar
+(#631); o ramo de DOCUMENTO commitava um `local_path` que o próprio envio
+apagava, válido só enquanto quem entrega é o mesmo processo (#631); e
+`storage_object` não era resolvível, então um artefato durável terminava em
+`rejected_terminal` (#632). As três são a mesma pergunta — **onde a mídia
+mora** — e ela não tinha resposta.
+
+E a issue pede, além disso, a trava: *"nenhum caminho de produção pode chamar o
+adaptador diretamente fora do outbox, salvo exceção documentada, fail-closed e
+testada"*. Um inventário em markdown envelhece em silêncio; um teste que só varre
+texto não vê chamada indireta. Por isso são duas camadas.
+
+**O que esta fatia acrescenta:**
+
+- `src/runtime/outbound/media-store.ts` — o store. Chave
+  `<tenant>/<agent>/<pessoa_id>/<sha256>.<ext>`: `tenant`/`agent` são comparados
+  com o escopo ALS no resolvedor (é essa comparação, e não a contenção de
+  `media-guard`, que carrega o isolamento — todos os objetos moram sob a mesma
+  raiz); `pessoa_id` é o que torna o apagamento por titular expressável;
+  `sha256` torna a escrita idempotente. Escrita atômica (tmp + `rename`).
+- `src/runtime/outbound/egress-guard.ts` — a trava de runtime (ALS + métrica +
+  throw), ligada em `src/gateway/line-output.ts`.
+- `src/runtime/outbound/send-paths.ts` — o inventário, em código: 15 caminhos,
+  3 de infraestrutura, 2 migrados, 10 exceções declaradas. Toda exceção carrega
+  `reason` **e** `containment`, e o teste reprova texto vazio.
+- `maia_outbound_direct_send_violation_total{kind}` — a métrica que #506
+  §Observabilidade nomeia. Valor esperado: **zero absoluto**.
+- `media.outbound_artifacts` no inventário de retenção + a purga no adapter de
+  privacidade.
+- `fallback_reason` ligado nos quatro call sites reais de `src/agent/core.ts`.
+  A opção existia desde #631 e **nenhum** call site a passava: todo fallback
+  nascia como `payload_type:'text'`, indistinguível de conteúdo do agente.
+- GC do objeto **só** na entrega confirmada — desfecho incerto ou terminal
+  preserva os bytes, porque a reconciliação de #633 e o rearmamento manual
+  precisam deles.
+
+**O que esta fatia NÃO faz, e por quê:**
+
+- **Não migra as 10 exceções.** O denominador comum é literal: nenhuma tem
+  `turn_id`, e o outbox o exige `NOT NULL` com fence do `claim_token` do turno.
+  Não há turno a cercar num briefing das 7h. Duas delas já são outboxes duráveis
+  próprios; migrá-las é fundir dois ledgers.
+- **Não liga o commit à fila.** O texto da #634 não pede, e fazê-lo reabriria o
+  `await` entre o commit e o `send*` que #631 fechou deliberadamente. Quem arma
+  continua sendo a varredura (até 1 min) ou o operador.
+- **Não ativa política de retenção.** Mecanismo ligado, política `pending_dpo` —
+  a decisão é do DPO, e codificar um prazo aqui seria a suposição jurídica que
+  #520 proíbe.
+
 ### ⚠️ MUDANÇA DE COMPORTAMENTO — o outbox ganhou consumidor, reconciliação e DLQ ([#633](https://github.com/diogenesmendes01/Maia-v2/issues/633), fatia D de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 > **O que muda no seu dia:** duas coisas.

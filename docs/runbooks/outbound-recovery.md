@@ -115,6 +115,7 @@ automática — uma linha que falhe fica parada até rearmamento manual.
 | `maia_outbound_delivery_unknown_total` | `channel` | (#632) A fila de entrada da reconciliação |
 | `maia_outbound_lease_lost_total` | `reason` | (#632) `lease_expired` alto = leases curtas para a latência real do provedor |
 | `maia_outbound_rearm_total` | `origin` | `recovery` × `replay` — quanto vem da varredura e quanto de operador |
+| `maia_outbound_direct_send_violation_total` | `kind` (a primitiva) | (#634) **Zero absoluto.** Qualquer ponto é um caminho de produção falando com o canal fora do outbox e fora do inventário — o critério de ABORTAR "qualquer envio sem ledger" da issue-mãe. Alerta é `> 0`, não um limiar |
 
 `maia_outbound_pending_age_seconds` é medida uma vez por tick e publicada por um
 provider que lê o último valor. Ela é, no pior caso, um minuto velha — para uma
@@ -312,6 +313,75 @@ NÃO detecta índice inválido (issue #658):
 ```sql
 SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
 ```
+
+## 7.5 Mídia de saída durável (#634)
+
+### Onde ela está
+
+`<MEDIA_ROOT>/outbound/<tenant_id>/<agent_id>/<pessoa_id>/<sha256>.<ext>`.
+O artefato do outbox carrega só `{bucket, object_key}` — nunca caminho, URL ou
+credencial. Para achar o objeto de uma linha:
+
+```sql
+SELECT id, status, payload_type, payload_json->'media' AS media
+  FROM outbound_messages
+ WHERE id = '<outbound_id>';
+```
+
+O caminho no disco é `MEDIA_ROOT + '/outbound/' + (payload_json->'media'->>'object_key')`.
+
+### `media_ref_unresolved` — o que ele significa AGORA
+
+Antes de #634 esse `last_error_code` significava "o worker não sabe resolver
+`storage_object`". Depois de #634 significa **"o objeto não está legível neste
+volume"**, e as causas são outras:
+
+| Causa | Como confirmar | O que fazer |
+|---|---|---|
+| A réplica não monta o mesmo volume `MEDIA_ROOT` | `ls <MEDIA_ROOT>/outbound` na réplica que falhou × na que commitou | **Corrigir o deploy.** Rearmar não resolve: a próxima tentativa cai na mesma réplica-classe |
+| O objeto foi apagado por um pedido de exclusão do titular (LGPD) | `data_tombstones` com `data_class='media.outbound_artifacts'` e o `subject_ref` daquele titular | **Não rearme.** Cancele a linha: reenviar mídia de um titular que pediu exclusão é o incidente, não a entrega |
+| GC apagou depois de uma entrega confirmada e a linha foi rearmada | `status` da linha era `delivered`/`completed` antes do rearme | Não rearme. A mensagem já chegou |
+| Chave de outro escopo (row adulterada) | o `object_key` começa com um `tenant_id` diferente do da row | Incidente de segurança. Preserve a row e escale |
+
+`media_ref_unresolved` é sempre `rejected_terminal` — recusa DEFINITIVA. Um
+`rejected_retryable` faria a linha girar no backoff para sempre contra um objeto
+que não vai reaparecer.
+
+### Crescimento do volume
+
+O objeto é descartado **na entrega confirmada**. O que fica são os objetos de
+linhas que terminaram incertas ou terminais — de propósito: a reconciliação e o
+rearmamento manual precisam dos bytes. Para medir:
+
+```bash
+du -sh "$MEDIA_ROOT/outbound"
+find "$MEDIA_ROOT/outbound" -type f -mtime +30 | wc -l
+```
+
+**Não existe varredor de TTL, e a ausência é declarada.** O prazo é decisão do
+DPO: a classe `media.outbound_artifacts` nasce `pending_dpo` como as outras
+treze, e `resolveRetention` devolve `purgeable:false` para todas. O mecanismo
+está ligado (o apagamento por titular funciona hoje); a política não. Enquanto
+ela não chega, o crescimento é bounded pelo número de entregas que terminaram
+mal — se `du` crescer sem que `maia_outbound_dead_letter_total` e
+`maia_outbound_delivery_unknown_total` cresçam junto, há órfão de GC e vale
+abrir issue.
+
+### A trava de envio direto
+
+Se `maia_outbound_direct_send_violation_total` sair de zero:
+
+1. o log estruturado `outbound.direct_send_violation` (com `ops_alert`) diz qual
+   primitiva;
+2. a chamada **já foi recusada** — nenhuma mensagem saiu sem ledger. O incidente
+   é o caminho existir, não uma mensagem duplicada;
+3. o caminho novo tem de escolher: passar pelo outbox, ou entrar em
+   `src/runtime/outbound/send-paths.ts` como `declared_exception` com `reason` e
+   `containment` escritos. Não há terceira opção, e o teste estático
+   (`tests/unit/runtime/outbound-trava-envio-direto.spec.ts`) recusa a terceira.
+
+Não existe env var para desligar a trava, e a ausência é a decisão: uma trava
+desligável em produção é o fail-open que a épica lista como risco.
 
 ## 8. O risco residual que esta fatia ADMINISTRA e não resolve
 

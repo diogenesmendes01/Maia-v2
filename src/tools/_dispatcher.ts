@@ -483,8 +483,16 @@ async function dispatchToolInner(input: {
       // request precisa de fato notificar humanos.
       const notify = async (jid: string, text: string): Promise<unknown> => {
         const { forCurrentAgentChannel } = await import('@/gateway/line-output.js');
+        const { withDeclaredEgressException } = await import(
+          '@/runtime/outbound/egress-guard.js'
+        );
         const line = await forCurrentAgentChannel(null);
-        return line.sendText(jid, text);
+        // #634 — exceção INVENTARIADA (`tools.approval_notification`): o
+        // destinatário é o APROVADOR, não o interlocutor do turno; o
+        // `approval_requests` persistido é a fonte de verdade.
+        return withDeclaredEgressException('tools.approval_notification', () =>
+          line.sendText(jid, text),
+        );
       };
       const ensured = await ensureApprovalRequest({
         tenant_id: getCurrentTenant(),
