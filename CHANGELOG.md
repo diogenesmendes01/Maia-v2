@@ -4,6 +4,80 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a entrega tem dono, e "o provedor aceitou" deixou de ser "o usuário recebeu" ([#632](https://github.com/diogenesmendes01/Maia-v2/issues/632), fatia C de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** uma resposta cujo envio retorna **sem
+> identificador do provedor** (o caso `sendText → null` com a linha conectada)
+> deixa de ser registrada como `delivered` e passa a ser `delivery_unknown`.
+> Isso NÃO é uma regressão de entrega — a mensagem provavelmente chegou. É a
+> plataforma parando de afirmar o que não sabe: `delivered` sai do radar da
+> reconciliação, então marcar assim uma resposta não confirmada a deixaria
+> "entregue" para sempre, inclusive quando ela nunca chegou.
+>
+> As séries novas a observar são `maia_outbound_delivery_unknown_total{channel}`
+> e `maia_outbound_lease_lost_total{reason}`. A primeira é a fila de entrada da
+> reconciliação (#633) e mede o custo real de **não** reenviar às cegas; um pico
+> na segunda significa leases curtas demais para a latência do provedor, que é a
+> causa mais comum de takeover falso.
+
+**O PORQUÊ.** #631 deixou a resposta durável antes do canal, mas quem entregava
+não tinha posse: o registro do desfecho era um `UPDATE ... WHERE status =
+'pending'` sem claim, sem lease e sem fence, declarado provisório e emprestado
+desta fatia. Ele tinha um buraco concreto — um crash **entre** a chamada ao
+provedor e a gravação do resultado deixava a linha em `pending`, indistinguível
+de "nunca tentada", e o primeiro worker de entrega a varrê-la **reenviaria uma
+mensagem que o usuário já tinha recebido**.
+
+O ciclo de entrega agora é:
+
+```
+carregar por ID → claim atômico (lease + fence) → validar tenant/agent/canal
+  → deadline → `sending` COM FENCE → adaptador (idempotency key + AbortSignal)
+  → resultado normalizado → `delivered` → histórico → `completed`
+```
+
+**As três decisões que carregam a fatia:**
+
+- **`sending` existe para tornar o crash diagnosticável.** Uma linha em
+  `sending` com lease morta significa "a chamada foi iniciada e o desfecho nunca
+  foi registrado" — a mensagem pode estar no telefone do usuário. Sem essa
+  escrita, o crash pré-envio e o pós-envio deixam a linha idêntica em `claimed`.
+- **O takeover de `sending` não devolve a linha para `claimed`.** O `SET` do
+  claim é `CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END`, e
+  `markSending` exige `status = 'claimed'`. O sucessor de uma chamada em voo é
+  **estruturalmente incapaz** de enviar; ele registra
+  `cancelled_after_send_unknown`. A garantia não depende de um `if`.
+- **Sete categorias de desfecho, não duas.** `accepted_confirmed`,
+  `accepted_unconfirmed`, `rejected_retryable`, `rejected_terminal`,
+  `timeout_unknown`, `cancelled_before_send`, `cancelled_after_send_unknown` —
+  e o reenvio automático só é permitido para as duas cujas semânticas **excluem**
+  entrega anterior, ou quando o provedor honra a chave idempotente **para aquele
+  tipo de payload**.
+
+**A limitação do Baileys, encapsulada em vez de fingida.** `LineOutput` declara
+`messageId` em `sendText` e em mais nada; `sendDocument`, `sendVoice`,
+`sendPoll` e `sendReaction` geram id aleatório a cada chamada. Isso virou uma
+capability explícita (`providerIdempotencySupport(channel, payload_type)`) com
+`satisfies`, então um tipo novo sem entrada é erro de compilação — e não um
+default `native` silencioso, que autorizaria reenviar um áudio já ouvido.
+
+**Removido:** `outboundOutboxRepo.recordInlineDeliveryOutcome`. O caminho
+síncrono de `src/agent/output-dispatch.ts` passa a reivindicar a linha e marcá-la
+`sending` antes de cada chamada ao canal, e a gravar o desfecho com o fence. Isso
+acrescenta **um** `await` entre o commit de #631 e o canal — a única coisa que
+pode entrar ali, porque ela fecha uma janela em vez de abrir e falha fechado.
+
+**Sem migration.** A 121 (#630) já traz `claim_token`, `lease_expires_at`,
+`next_attempt_at`, `attempt`, `delivery_outcome` e os estados do ciclo. O
+histórico é idempotente **pelo estado**: `delivered → completed` e o `INSERT` em
+`mensagens` acontecem na mesma transação, e `completed` não é reivindicável —
+nenhuma chave de dedupe nova foi inventada.
+
+**Ainda não ligado a uma fila.** `deliverOutbound` é a responsabilidade isolada
+e `outboundDeliveryJobId(outbound_id)` é determinístico, mas quem enfileira e
+quem consome é #633/#634.
+
+
 ### ⚠️ MUDANÇA DE COMPORTAMENTO — a resposta do turno é COMMITADA antes de chegar ao canal ([#631](https://github.com/diogenesmendes01/Maia-v2/issues/631), fatia B de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 > **O que muda no seu dia:** até este release, uma falha do banco no caminho de

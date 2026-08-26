@@ -20,8 +20,17 @@ import type { ToolExecutionSummary } from './tool-execution-summary.js';
 import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
 import { commitOutboundIntent, type OutboundCommitOutcome } from '@/runtime/outbound/commit.js';
-import type { OutboundPayload } from '@/runtime/outbound/contract.js';
-import { outboundOutboxRepo } from '@/db/repositories/outbound-outbox-repo.js';
+import type { OutboundPayload, OutboundPayloadType } from '@/runtime/outbound/contract.js';
+// #632 — a POSSE da linha do outbox. `beginInlineDelivery` reivindica com
+// lease e move para `sending` ANTES do canal; `recordInlineDelivery` grava o
+// desfecho normalizado COM FENCE. Substituem o `recordInlineDeliveryOutcome`
+// sem claim que #631 tomou emprestado desta fatia.
+import {
+  beginInlineDelivery,
+  recordInlineDelivery,
+  type InlineDeliveryHandle,
+} from '@/runtime/outbound/delivery.js';
+import { DeliveryFenceError } from '@/runtime/outbound/delivery-contract.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -371,60 +380,84 @@ function saidaLogicaJaTentada(commit: OutboundCommitOutcome): boolean {
 }
 
 /**
- * Fecha a linha durável com o desfecho da tentativa feita por ESTE processo.
+ * Reivindica a POSSE da linha durável e a move para `sending`, imediatamente
+ * ANTES da chamada ao canal.
  *
- * Provisório e declarado como tal: o delivery worker com claim/lease é a #632.
- * Enquanto ele não existe, quem entrega é o mesmo processo que commitou, e sem
- * este registro TODA linha entregue ficaria `pending` para sempre — de modo que
- * a #632, ao subir, varreria e reenviaria mensagens que o usuário já recebeu.
+ * ─── O que mudou em relação a #631, e por quê ───────────────────────────────
  *
- * Nunca lança: quando roda, o efeito externo JÁ ocorreu. Uma exceção aqui não
- * desfaz o envio; ela só trocaria uma linha desatualizada por um turno
- * abortado. Falhar deixa a linha `pending`, que é exatamente o estado que a
- * reconciliação de #633 existe para resolver.
+ * #631 commitava a linha e chamava o canal em seguida, sem posse: o registro
+ * do desfecho era `recordInlineDeliveryOutcome`, um `UPDATE ... WHERE status =
+ * 'pending'` sem claim, sem lease e sem fence. Aquilo era escopo emprestado
+ * desta issue, e tinha um buraco concreto: um crash entre o `send*` e o
+ * registro deixava a linha em `pending` — indistinguível de "nunca tentada" —
+ * e o delivery worker a reenviaria.
+ *
+ * Agora a linha entra em `sending` ANTES do efeito. `sending` é o estado que
+ * diz "a chamada foi iniciada e o desfecho é desconhecido"; um sucessor que a
+ * tome por lease vencida NÃO consegue enviar (o `markSending` do repositório
+ * exige `status = 'claimed'`) e a manda para `delivery_unknown`.
+ *
+ * Custa UM round trip a mais entre o commit e o envio. A regra de #631 —
+ * "nenhum trabalho entre o commit e o canal" — existia para não abrir janela em
+ * que a resposta está comprometida e algo falha; esta gravação é o oposto
+ * disso: ela é o que torna a janela DIAGNOSTICÁVEL. E se ela falhar, o envio
+ * não acontece, que é o mesmo fail-closed do commit.
+ *
+ * `beginInlineDelivery` LANÇA quando a posse é negada — outro worker tem a
+ * linha. O chamador converte em `OutboundDeliveryError(false, ...)`: nada foi
+ * enviado, e quem tem a lease vigente é quem deve enviar.
+ */
+async function claimInlineDeliveryOrRefuse(
+  commit: OutboundCommitOutcome,
+): Promise<InlineDeliveryHandle> {
+  const outbound_id = commit.committed ? commit.outbound_id : null;
+  try {
+    return await beginInlineDelivery(outbound_id);
+  } catch (err) {
+    if (err instanceof DeliveryFenceError) {
+      logger.warn(
+        { outbound_id, reason: err.reason, ops_alert: true },
+        'outbound.inline_delivery_claim_refused',
+      );
+      throw new OutboundDeliveryError(false, 'outbound_delivery_claim_refused');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Fecha a linha durável com o desfecho NORMALIZADO da tentativa deste processo,
+ * COM FENCE.
+ *
+ * O estado de destino NÃO é escolhido aqui: `recordInlineDelivery` o obtém de
+ * `statusForOutcome` (`delivery-contract.ts`), a tabela única de #632. É o que
+ * impede que este call site decida, sozinho, chamar `accepted_unconfirmed` de
+ * `delivered` — o mapeamento honesto manda essa categoria para
+ * `delivery_unknown`, porque "o provedor aceitou" não é "o usuário recebeu".
+ *
+ * Nunca lança: quando roda, o efeito externo JÁ ocorreu.
  */
 async function recordCommittedDelivery(
-  commit: OutboundCommitOutcome,
+  handle: InlineDeliveryHandle,
+  payload_type: OutboundPayloadType,
   outcome:
     | { kind: 'delivered'; provider_message_id: string | null; confirmed: boolean }
     | { kind: 'unknown'; error_code: string }
     | { kind: 'retryable'; error_code: string },
 ): Promise<void> {
-  if (!commit.committed) return;
-  try {
-    await outboundOutboxRepo.recordInlineDeliveryOutcome({
-      outbound_id: commit.outbound_id,
-      ...(outcome.kind === 'delivered'
-        ? {
-            status: 'delivered' as const,
-            delivery_outcome: outcome.confirmed
-              ? ('accepted_confirmed' as const)
-              : ('accepted_unconfirmed' as const),
-            provider_message_id: outcome.provider_message_id,
-          }
-        : outcome.kind === 'unknown'
-          ? {
-              status: 'delivery_unknown' as const,
-              delivery_outcome: 'timeout_unknown' as const,
-              last_error_code: outcome.error_code,
-            }
-          : {
-              status: 'retryable' as const,
-              delivery_outcome: 'rejected_retryable' as const,
-              last_error_code: outcome.error_code,
-            }),
-    });
-  } catch (err) {
-    logger.error(
-      {
-        err: (err as Error).message,
-        outbound_id: commit.outbound_id,
-        outcome: outcome.kind,
-        ops_alert: true,
-      },
-      'outbound.inline_outcome_record_failed',
-    );
-  }
+  await recordInlineDelivery(handle, {
+    payload_type,
+    ...(outcome.kind === 'delivered'
+      ? {
+          outcome: outcome.confirmed
+            ? ('accepted_confirmed' as const)
+            : ('accepted_unconfirmed' as const),
+          provider_message_id: outcome.provider_message_id,
+        }
+      : outcome.kind === 'unknown'
+        ? { outcome: 'timeout_unknown' as const, last_error_code: outcome.error_code }
+        : { outcome: 'rejected_retryable' as const, last_error_code: outcome.error_code }),
+  });
 }
 
 /**
@@ -545,6 +578,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         );
         return;
       }
+      // #632 — POSSE antes do efeito. A linha vai para `sending`, então um
+      // crash a partir daqui é diagnosticável e NÃO vira reenvio.
+      const entrega = await claimInlineDeliveryOrRefuse(commit);
       let wid: string | null;
       try {
         wid = await line.sendDocument(jid, pdf.path, {
@@ -572,7 +608,8 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         const ambiguous = classifyDocumentThrow(e);
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
         await recordCommittedDelivery(
-          commit,
+          entrega,
+          'document',
           ambiguous
             ? { kind: 'unknown', error_code: outboundErrorCode('document_transport_throw') }
             : { kind: 'retryable', error_code: outboundErrorCode('document_read_failed') },
@@ -586,7 +623,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // `finally` below either way.
         if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
-          await recordCommittedDelivery(commit, {
+          await recordCommittedDelivery(entrega, 'document', {
             kind: 'delivered',
             provider_message_id: null,
             confirmed: false,
@@ -594,7 +631,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           throw new OutboundDeliveryError(true, 'document_channel_sent_without_id');
         }
         await recordLedgerFailed(c.id, inbound.id, 'document_channel_disconnected', false);
-        await recordCommittedDelivery(commit, {
+        await recordCommittedDelivery(entrega, 'document', {
           kind: 'retryable',
           error_code: outboundErrorCode('document_channel_disconnected'),
         });
@@ -603,7 +640,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // Document acked — record 'sent' BEFORE the persist block so a persist
       // throw doesn't leave the ledger 'pending' while the user has the file.
       await recordLedgerSent(c.id, inbound.id, wid);
-      await recordCommittedDelivery(commit, {
+      await recordCommittedDelivery(entrega, 'document', {
         kind: 'delivered',
         provider_message_id: wid,
         confirmed: true,
@@ -1046,10 +1083,16 @@ export async function sendOutbound(
   // do Decision Engine e o fallback de TTS.
   //
   // A posição é literal e é o contrato: entre esta linha e `line.sendText`
-  // abaixo NÃO EXISTE `await`. Todo trabalho que podia falhar — resolver a
-  // linha, achar a pessoa, resolver o JID — já aconteceu. Inserir qualquer
-  // coisa aqui, ou mover o `sendText` para cima desta chamada, é reabrir a
-  // janela em que uma mensagem chega ao usuário sem que o banco saiba.
+  // abaixo só existe UM `await`, e ele é o claim de entrega de #632
+  // (`claimInlineDeliveryOrRefuse`). Todo trabalho que podia falhar — resolver
+  // a linha, achar a pessoa, resolver o JID — já aconteceu. Mover o `sendText`
+  // para cima desta chamada reabre a janela em que uma mensagem chega ao
+  // usuário sem que o banco saiba.
+  //
+  // O claim é a ÚNICA coisa que pode entrar aqui, e entra porque ela fecha uma
+  // janela em vez de abrir: sem ele a linha fica em `pending` durante o envio,
+  // e um crash a seguir é indistinguível de "nunca tentada" — o recovery
+  // reenviaria. Ele também FALHA FECHADO: sem posse não há `sendText`.
   //
   // `commitOutboundOrRefuse` LANÇA se a transação falhar: o `sendText` abaixo
   // não é alcançado, e o erro sobe classificado como `delivered:false`.
@@ -1073,6 +1116,13 @@ export async function sendOutbound(
     );
     return commit.committed ? commit.row.provider_message_id : null;
   }
+  // #632 — POSSE antes do efeito. A linha vai para `sending`, então um crash a
+  // partir daqui é diagnosticável e NÃO vira reenvio.
+  const entrega = await claimInlineDeliveryOrRefuse(commit);
+  // O tipo do artefato que ACABOU de ser commitado — `status_fallback` é uma
+  // saída própria em #630, não "texto com um motivo", e o rótulo de métrica
+  // tem de dizer a verdade sobre qual das duas saiu.
+  const tipoDeSaida: OutboundPayloadType = opts?.fallback_reason ? 'status_fallback' : 'text';
   // Delivery happens in two phases: send to the channel, THEN persist. Tag
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
@@ -1094,7 +1144,7 @@ export async function sendOutbound(
     );
   } catch (e) {
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'unknown',
       error_code: outboundErrorCode('text_transport_throw'),
     });
@@ -1108,7 +1158,7 @@ export async function sendOutbound(
   if (wid === null) {
     if (line.isConnected()) {
       await recordLedgerSent(conversa_id, in_reply_to, null);
-      await recordCommittedDelivery(commit, {
+      await recordCommittedDelivery(entrega, tipoDeSaida, {
         kind: 'delivered',
         provider_message_id: null,
         confirmed: false,
@@ -1116,7 +1166,7 @@ export async function sendOutbound(
       throw new OutboundDeliveryError(true, 'channel_sent_without_id');
     }
     await recordLedgerFailed(conversa_id, in_reply_to, 'channel_disconnected', false);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'retryable',
       error_code: outboundErrorCode('channel_disconnected'),
     });
@@ -1125,7 +1175,7 @@ export async function sendOutbound(
   // Channel acked — record 'sent' BEFORE the persist so a later persist throw
   // doesn't leave the ledger 'pending' while the user already has the message.
   await recordLedgerSent(conversa_id, in_reply_to, wid);
-  await recordCommittedDelivery(commit, {
+  await recordCommittedDelivery(entrega, tipoDeSaida, {
     kind: 'delivered',
     provider_message_id: wid,
     confirmed: true,
@@ -1214,6 +1264,9 @@ export async function sendOutboundPoll(
     );
     return { fell_back: false };
   }
+  // #632 — POSSE antes do efeito. A linha vai para `sending`, então um crash a
+  // partir daqui é diagnosticável e NÃO vira reenvio.
+  const entrega = await claimInlineDeliveryOrRefuse(commit);
   let sent: Awaited<ReturnType<LineOutput['sendPoll']>>;
   try {
     sent = await line.sendPoll(jid, text, pending.opcoes_validas);
@@ -1226,7 +1279,7 @@ export async function sendOutboundPoll(
     // ReAct turn whose own dispatch would be blocked anyway. No double-send
     // risk: the row is 'unknown'.
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, 'interactive_poll', {
       kind: 'unknown',
       error_code: outboundErrorCode('poll_transport_throw'),
     });
@@ -1254,7 +1307,7 @@ export async function sendOutboundPoll(
     // incompleta, nada foi ao canal) para que o recovery de #633 não a leia
     // como trabalho pendente e a reenvie depois — o duplo envio pela porta dos
     // fundos.
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, 'interactive_poll', {
       kind: 'retryable',
       error_code: outboundErrorCode('poll_missing_secrets'),
     });
@@ -1274,7 +1327,7 @@ export async function sendOutboundPoll(
   // Poll acked — record 'sent' BEFORE persist so a persist throw doesn't leave
   // the ledger 'pending' while the user already sees the poll.
   await recordLedgerSent(conversa_id, in_reply_to, sent.whatsapp_id);
-  await recordCommittedDelivery(commit, {
+  await recordCommittedDelivery(entrega, 'interactive_poll', {
     kind: 'delivered',
     provider_message_id: sent.whatsapp_id,
     confirmed: true,

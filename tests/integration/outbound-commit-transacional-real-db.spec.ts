@@ -531,28 +531,44 @@ d('#631 — commit transacional da resposta (Postgres real)', () => {
   // RECUPERAÇÃO — crash depois do commit e antes do enqueue.
   // ═══════════════════════════════════════════════════════════════════════
 
-  it('no instante seguinte ao commit, a linha já é SELECIONÁVEL pelo recovery — sem BullMQ', async () => {
+  it('no instante do envio a linha já é VISÍVEL ao recovery sem BullMQ — e em `sending`, não `pending`', async () => {
     // "Crash depois do commit e antes do enqueue" é, observacionalmente, o
     // estado que existe NO INSTANTE em que o canal é chamado: o commit já
     // aconteceu e nada depois dele rodou. Um processo morto ali deixa
     // exatamente isto no banco. Por isso a leitura acontece DENTRO do double —
     // ler depois do dispatch mediria o estado pós-bookkeeping, que é outro
     // instante e não responde a pergunta da issue.
-    let selecionaveis = -1;
+    //
+    // ─── O QUE MUDOU COM A #632, E POR QUE ISTO É A CORREÇÃO ────────────────
+    //
+    // Este caso afirmava `status IN ('pending','retryable')` neste instante.
+    // Aquilo era a #631 tratando DOIS pontos de crash diferentes como um só:
+    //
+    //   crash ANTES de a chamada ao canal começar  ⇒ nada saiu, reenviar é seguro
+    //   crash COM a chamada em voo                 ⇒ pode ter saído, reenviar DUPLICA
+    //
+    // Em `pending` os dois são indistinguíveis, e o recovery reenviaria os
+    // dois. A #632 separa: `beginInlineDelivery` reivindica a linha e a move
+    // para `sending` ANTES do canal, então um crash a partir daqui deixa
+    // `sending` — o estado que diz "a chamada foi iniciada e o desfecho é
+    // desconhecido". O primeiro ponto de crash continua deixando `pending`
+    // (a falha acontece antes do claim) e continua sendo reenviável.
+    //
+    // A propriedade que a #631 realmente comprou — trabalho VISÍVEL ao recovery
+    // sem consultar a BullMQ — continua valendo, e é o que este caso afirma
+    // agora: a linha é reivindicável por takeover assim que a lease morre,
+    // e nada disso passa por uma fila.
+    let estadoNoEnvio: { status: string; lease_viva: boolean } | null = null;
     canal.sendText.mockImplementation(async () => {
-      // O MESMO predicado do índice de trabalho da 121
-      // (`idx_outbound_messages_ready`), que é o que a varredura de #633 vai
-      // percorrer. Nenhuma parte dele olha para a BullMQ: o enqueue é wake-up,
-      // não fonte de verdade.
       const { rows } = await pool.query(
-        `SELECT id FROM outbound_messages
-          WHERE tenant_id = $1 AND agent_id = $2
-            AND status IN ('pending', 'retryable')
-            AND next_attempt_at <= now()
-            AND turn_id = $3`,
+        `SELECT status, (lease_expires_at > now()) AS lease_viva
+           FROM outbound_messages
+          WHERE tenant_id = $1 AND agent_id = $2 AND turn_id = $3`,
         [TENANT, AGENT, turnId],
       );
-      selecionaveis = rows.length;
+      estadoNoEnvio = rows[0]
+        ? { status: rows[0].status as string, lease_viva: rows[0].lease_viva === true }
+        : null;
       throw Object.assign(new Error('processo morreu no meio do envio'), { code: 'ECONNRESET' });
     });
 
@@ -563,7 +579,20 @@ d('#631 — commit transacional da resposta (Postgres real)', () => {
       }).catch(() => null),
     );
 
-    expect(selecionaveis).toBe(1);
+    // A linha tem DONO e está em `sending` no instante exato do efeito.
+    expect(estadoNoEnvio).toEqual({ status: 'sending', lease_viva: true });
+
+    // Ela NÃO está no estado "nunca tentada", que é o ponto: em `pending` o
+    // recovery reenviaria, e aqui a chamada ao provedor já tinha começado.
+    expect(estadoNoEnvio!.status).not.toBe('pending');
+    // A visibilidade para o recovery vem do predicado de TAKEOVER de #632
+    // (`claimed`/`sending` com lease vencida) e não da BullMQ. Que esse
+    // predicado de fato recupera a linha — e a manda para `delivery_unknown`
+    // em vez de reenviá-la — é o que
+    // `tests/integration/outbound-delivery-claim-lease-fence-real-db.spec.ts`
+    // prova com o ciclo de produção inteiro; aqui só se afirma que o estado
+    // deixado no instante do efeito é o que aquele predicado alcança.
+
     // O turno está `outbound_pending`: o ReAct NÃO pode ser reexecutado (a
     // resposta já foi comprometida) e `RECOVERABLE_TURN_STATUSES` o exclui de
     // propósito — quem finaliza é o outbox, nunca uma nova execução do
