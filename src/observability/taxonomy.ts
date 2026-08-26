@@ -642,6 +642,24 @@ export const METRIC = {
    * fronteiras de #631/#632 — não é ruído esperado.
    */
   OUTBOUND_TURN_INCONSISTENCY: 'maia_outbound_turn_inconsistency_total',
+  /**
+   * Issue #634 — uma primitiva de MENSAGEM da fronteira única
+   * (`LineOutput.send*`) foi chamada FORA de qualquer escopo de egresso
+   * declarado. `kind` é a primitiva (`EGRESS_PRIMITIVES`, cinco valores).
+   *
+   * A métrica que #506 §Observabilidade nomeia, e a única desta lista cujo
+   * valor esperado em regime é ZERO ABSOLUTO. Qualquer ponto aqui é um caminho
+   * de produção que fala com o canal sem artefato durável e sem constar do
+   * inventário de `src/runtime/outbound/send-paths.ts` — ou seja, exatamente o
+   * "envio sem ledger" que a issue-mãe lista como critério de ABORTAR do
+   * rollout.
+   *
+   * Ela é emitida ANTES do throw de `assertEgressAuthorized`, de propósito: um
+   * chamador que capture a recusa e a transforme em `logger.warn` não pode
+   * apagar o número. E é a razão de o alerta poder ser escrito como
+   * `> 0` em vez de um limiar — não há taxa aceitável.
+   */
+  OUTBOUND_DIRECT_SEND_VIOLATION: 'maia_outbound_direct_send_violation_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
   /**

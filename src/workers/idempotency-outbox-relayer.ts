@@ -70,6 +70,7 @@ import {
   type OutboxRowIdentity,
 } from '@/governance/idempotency-effects.js';
 import { forCurrentAgentChannel } from '@/gateway/line-output.js';
+import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { incCounter } from '@/lib/metrics.js';
@@ -186,9 +187,15 @@ async function dispatchEffect(
       // do tuple da row. O effect não carrega canal (legado) ⇒ canal único
       // ativo do agente; ambiguidade lança → retry/DLQ da própria row.
       const line = await forCurrentAgentChannel(null);
-      const providerRef = await line.sendText(effect.jid, effect.text, {
-        ...(dedupKey ? { messageId: dedupKey } : {}),
-      });
+      // #634 — exceção INVENTARIADA (`workers.idempotency_relayer`): este é um
+      // SEGUNDO outbox durável, sem `turn_id`, e já com chave determinística.
+      const providerRef = await withDeclaredEgressException(
+        'workers.idempotency_relayer',
+        () =>
+          line.sendText(effect.jid, effect.text, {
+            ...(dedupKey ? { messageId: dedupKey } : {}),
+          }),
+      );
       if (providerRef === null) {
         // Gateway not connected — transient. Throw so the row is retried.
         throw new Error('gateway_not_connected');
