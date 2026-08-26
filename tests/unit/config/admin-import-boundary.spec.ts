@@ -226,6 +226,13 @@ describe('o runtime CONTINUA alcançando src/config/env.ts (o contrapeso)', () =
     'scripts/privacy-export.ts',
     'scripts/privacy-request.ts',
     'scripts/restore-test.ts',
+    // Issue #623. Entra por VONTADE, como os dois de cima: o script semeia as
+    // fixtures das jornadas E2E no banco que `DATABASE_URL` aponta e ASSINA um
+    // trace com `RUNTIME_TRACE_HMAC_MASTER_SECRET`. As duas variáveis erradas
+    // falham em silêncio da pior forma — semeando na base errada, ou gravando
+    // um envelope cuja assinatura o console vai ler como adulterada. Boot
+    // fail-closed é a hora barata de descobrir.
+    'scripts/seed-admin-ui-e2e-fixtures.ts',
     'scripts/seed-holidays.ts',
     'scripts/seed-proposals-fixtures.ts',
     'scripts/setup.ts',
