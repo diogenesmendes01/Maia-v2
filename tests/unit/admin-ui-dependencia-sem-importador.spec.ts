@@ -63,21 +63,16 @@ const RAIZ_VARREDURA = join(process.cwd(), 'src');
  * autoriza nada, e o spec abaixo reprova motivo vazio.
  */
 const SEM_IMPORTADOR_JUSTIFICADO: Readonly<Record<string, string>> = {
+  // Única entrada que sobrou, e a única legítima: react-dom NÃO é peso morto —
+  // quem o carrega é o runtime do Next, não um import nosso. As três dívidas do
+  // scaffold do P8.5 (@tanstack/react-table, react-hook-form e
+  // react-diff-viewer-continued) foram REMOVIDAS do console; o alvo desta
+  // allowlist é ficar exatamente assim: sem dívida, só o irredutível.
   'react-dom':
     'Renderizador do React para o DOM. Nenhum arquivo do console o nomeia: ' +
     'quem o carrega é o runtime do Next (bundle de cliente e `react-dom/server` ' +
     'no SSR). É peer obrigatório de `next` e de `react` — sem ele declarado, o ' +
     '`npm ci` do Dockerfile do admin-ui não instala o renderizador e o build morre.',
-
-  'react-hook-form':
-    'DÍVIDA CONHECIDA: entrou no scaffold do P8.5 (e23c8523) e nunca foi ' +
-    'ligada. Os formulários do console usam `React.useState` + ' +
-    '`components/ui/field.tsx`. Fica aqui para PARAR DE SER INVISÍVEL.',
-
-  'react-diff-viewer-continued':
-    'DÍVIDA CONHECIDA: entrou no scaffold do P8.5 (e23c8523) e nunca foi ' +
-    'ligada. A tela de versões/propostas mostra diff como texto. Fica aqui ' +
-    'para PARAR DE SER INVISÍVEL.',
 };
 
 /**

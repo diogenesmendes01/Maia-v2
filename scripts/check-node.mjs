@@ -92,6 +92,19 @@
 var MINIMUM_VERSION = '22.13.0';
 var MINIMUM_PARTS = [22, 13, 0];
 
+/**
+ * Teto da linha suportada (EXCLUSIVO): o repo roda `node:22-alpine` em
+ * producao (Dockerfile), `.nvmrc` fixa 22 e o CI exercita 22.18 e 22.x. Sem
+ * teto, `engines` dizia ">=22.13.0" e aceitava calado um Node 24, 26 ou 28 que
+ * NENHUM job deste repo exercita — foi assim que `@types/node` chegou a ^25.9.2
+ * tipando contra uma linha que o `.github/dependabot.yml` bloqueia de proposito
+ * (25 e' impar, entrou em EOL sem nunca ter sido LTS).
+ *
+ * Subir a linha suportada e' mudar Dockerfile, .nvmrc, esta constante e a
+ * matriz do CI no MESMO PR. O teste de paridade cobra os quatro juntos.
+ */
+var MAXIMUM_MAJOR_EXCLUSIVE = 23;
+
 var raw = process.versions && process.versions.node ? String(process.versions.node) : '';
 var parsed = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(raw);
 
@@ -134,6 +147,25 @@ if (major !== MINIMUM_PARTS[0]) {
   tooOld = patch < MINIMUM_PARTS[2];
 } else {
   tooOld = Boolean(prerelease);
+}
+
+if (major >= MAXIMUM_MAJOR_EXCLUSIVE) {
+  console.error(
+    '\n\u2716 Node ' +
+      raw +
+      ' is above the line this repo supports (requires Node >=' +
+      MINIMUM_VERSION +
+      ' <' +
+      MAXIMUM_MAJOR_EXCLUSIVE +
+      ').\n' +
+      '  Production runs node:22-alpine (Dockerfile) and .nvmrc pins 22; no job\n' +
+      '  in this repo exercises a newer major, so installing on one would ship\n' +
+      '  types and behaviour nothing here tests.\n' +
+      '  Fix: nvm install && nvm use   (Node 22 from .nvmrc)\n' +
+      '  Raising the line means changing Dockerfile, .nvmrc, scripts/check-node.mjs\n' +
+      '  and the CI matrix in the SAME PR.\n'
+  );
+  process.exit(1);
 }
 
 if (tooOld) {

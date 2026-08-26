@@ -8,8 +8,12 @@ import { Alert } from '../../../../components/ui/states.js';
 /**
  * Renderizador de diff por tipo de proposta (ver proposal-type-registry.ts).
  * A lógica por tipo permanece a do P8.5 v1.0: corpo bruto em JSON formatado;
- * o diff JSON detalhado chega no P8.5 v1.1 (react-diff-viewer-continued já
- * está disponível para essa evolução).
+ * o diff JSON detalhado chega no P8.5 v1.1.
+ *
+ * A dependência `react-diff-viewer-continued` foi REMOVIDA do console. Ela
+ * entrou no scaffold do P8.5 (e23c8523, 2026-05-15) e nunca foi importada por
+ * arquivo nenhum — virou alvo de PR de major do Dependabot por código que não
+ * existe. Quem implementar a v1.1 declara a lib no mesmo PR que a usa.
  */
 const SECTIONS: Record<ProposalTypeId, { title: string; description: string }> = {
   policy_rule: {

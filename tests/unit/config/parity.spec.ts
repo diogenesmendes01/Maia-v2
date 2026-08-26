@@ -118,7 +118,13 @@ describe('Node/npm version parity (#515)', () => {
     // 22.13.0, por causa do eslint) e pelo npm pinado. Quem deriva e cobra
     // esse número é tests/unit/scripts/check-node.spec.ts — repeti-lo aqui
     // criaria um segundo número para envelhecer sozinho.
-    expect(pkg.engines.node).toMatch(new RegExp(`^>=${NODE_MAJOR}\\.\\d+\\.\\d+$`));
+    // O TETO e' parte do contrato, nao enfeite: sem `<23` o `engines` aceitava
+    // calado qualquer major novo, e foi assim que `@types/node` chegou a ^25.9.2
+    // tipando contra uma linha que o repo se recusa a rodar. A regex cobra os
+    // dois lados; apagar o teto reprova aqui.
+    expect(pkg.engines.node).toMatch(
+      new RegExp(`^>=${NODE_MAJOR}\\.\\d+\\.\\d+ <${Number(NODE_MAJOR) + 1}$`),
+    );
     expect(pkg.packageManager).toMatch(/^npm@11\./);
     expect(pkg.engines.npm).toContain('11.5.2');
   });

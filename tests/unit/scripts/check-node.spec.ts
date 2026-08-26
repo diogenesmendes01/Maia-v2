@@ -190,12 +190,28 @@ describe('fronteiras de versão — comparação por versão completa, não por 
     ['22.13.1', 'patch acima do piso'],
     ['22.18.0', 'o que as lanes de CI pinam'],
     ['22.22.2', 'o runtime desta máquina'],
-    ['24.4.1', 'major acima'],
-    ['26.0.0', 'o major da imagem de produção'],
   ])('aceita Node %s (%s)', (version) => {
     const r = runCheckerPretendingNodeIs(version);
     expect(`${r.stderr}`).toBe('');
     expect(r.status).toBe(0);
+  });
+
+  /**
+   * O TETO. Antes destes casos, 24 e 26 eram ACEITOS — o teste declarava
+   * 26 como "o major da imagem de produção", o que deixou de ser verdade
+   * quando o Dockerfile desceu para `node:22-alpine`. Sem teto, `engines`
+   * aceitava calado um major que nenhum job deste repo exercita; foi assim
+   * que `@types/node` chegou a ^25.9.2, tipando contra uma linha que o
+   * `.github/dependabot.yml` bloqueia de propósito.
+   */
+  it.each([
+    ['23.0.0', 'primeiro major acima da linha suportada'],
+    ['24.4.1', 'LTS seguinte, ainda não exercitada por nenhum job'],
+    ['26.0.0', 'o major que o comentário antigo do CI dizia ser produção'],
+  ])('RECUSA Node %s (%s)', (version) => {
+    const r = runCheckerPretendingNodeIs(version);
+    expect(`${r.stderr}`).toContain('above the line this repo supports');
+    expect(r.status).toBe(1);
   });
 
   // Precedência SemVer pura: o core `22.10.0` já é maior que `22.9.0`, então o
@@ -267,7 +283,13 @@ describe('fronteiras de versão — comparação por versão completa, não por 
     // passaria sem olhar nada. Este lockfile tem centenas.
     expect(scanned, 'nenhum engines.node no lockfile — varredura quebrada').toBeGreaterThan(50);
 
-    const declared = readPkg().engines.node.replace(/^>=/, '').split('.').map(Number);
+    // `engines.node` agora carrega teto (">=22.13.0 <23"): o piso é o primeiro
+    // termo. Sem este split o parser lia "0 <23" e produzia NaN.
+    const declared = readPkg()
+      .engines.node.replace(/^>=/, '')
+      .split(' ')[0]
+      .split('.')
+      .map(Number);
     expect(declared[0]).toBe(MAJOR);
     const declaredOk =
       declared[1] > required[0] || (declared[1] === required[0] && declared[2] >= required[1]);
@@ -284,8 +306,11 @@ describe('fronteiras de versão — comparação por versão completa, não por 
     const declared = /MINIMUM_VERSION\s*=\s*'([^']+)'/.exec(src);
     expect(declared, 'MINIMUM_VERSION não encontrado no guard').not.toBeNull();
     const pkg = readPkg();
-    expect(pkg.engines.node).toBe(`>=${declared?.[1]}`);
-    expect(pkg.devEngines?.runtime?.version).toBe(`>=${declared?.[1]}`);
+    const teto = /MAXIMUM_MAJOR_EXCLUSIVE\s*=\s*(\d+)/.exec(src);
+    expect(teto, 'MAXIMUM_MAJOR_EXCLUSIVE não encontrado no guard').not.toBeNull();
+    const faixa = `>=${declared?.[1]} <${teto?.[1]}`;
+    expect(pkg.engines.node).toBe(faixa);
+    expect(pkg.devEngines?.runtime?.version).toBe(faixa);
   });
 });
 
@@ -415,7 +440,7 @@ describe('devEngines.runtime é o gate que roda ANTES da instalação', () => {
     const pkg = readPkg();
     expect(pkg.devEngines?.runtime?.name).toBe('node');
     expect(pkg.devEngines?.runtime?.onFail).toBe('error');
-    expect(pkg.devEngines?.runtime?.version).toMatch(/^>=\d+\.\d+\.\d+$/);
+    expect(pkg.devEngines?.runtime?.version).toMatch(/^>=\d+\.\d+\.\d+ <\d+$/);
   });
 });
 
