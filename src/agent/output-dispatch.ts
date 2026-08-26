@@ -1,4 +1,4 @@
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import {
   mensagensRepo,
   pessoasRepo,
@@ -11,7 +11,11 @@ import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
-import { synthesizeSpeech, OUTBOUND_VOICE_MAX_CHARS } from '@/lib/tts.js';
+import {
+  synthesizeSpeech,
+  OUTBOUND_VOICE_MAX_CHARS,
+  OUTBOUND_VOICE_MIMETYPE,
+} from '@/lib/tts.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
 import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
@@ -20,8 +24,26 @@ import type { ToolExecutionSummary } from './tool-execution-summary.js';
 import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
 import { commitOutboundIntent, type OutboundCommitOutcome } from '@/runtime/outbound/commit.js';
-import type { OutboundPayload } from '@/runtime/outbound/contract.js';
-import { outboundOutboxRepo } from '@/db/repositories/outbound-outbox-repo.js';
+import type { OutboundPayload, OutboundPayloadType } from '@/runtime/outbound/contract.js';
+// #632 — a POSSE da linha do outbox. `beginInlineDelivery` reivindica com
+// lease e move para `sending` ANTES do canal; `recordInlineDelivery` grava o
+// desfecho normalizado COM FENCE. Substituem o `recordInlineDeliveryOutcome`
+// sem claim que #631 tomou emprestado desta fatia.
+import {
+  beginInlineDelivery,
+  recordInlineDelivery,
+  type InlineDeliveryHandle,
+} from '@/runtime/outbound/delivery.js';
+import { DeliveryFenceError } from '@/runtime/outbound/delivery-contract.js';
+// #634 — a mídia de saída passa a MORAR num store durável, e a trava de egresso
+// exige que todo `LineOutput.send*` aconteça dentro de um escopo declarado.
+import {
+  discardOutboundMedia,
+  putOutboundMedia,
+  safeOutboundExtension,
+} from '@/runtime/outbound/media-store.js';
+import { withOutboxEgress } from '@/runtime/outbound/egress-guard.js';
+import type { MediaRef } from '@/runtime/outbound/contract.js';
 
 /**
  * Returns the JID the outbound reply should target. Looks up the inbound
@@ -371,59 +393,169 @@ function saidaLogicaJaTentada(commit: OutboundCommitOutcome): boolean {
 }
 
 /**
- * Fecha a linha durável com o desfecho da tentativa feita por ESTE processo.
+ * Reivindica a POSSE da linha durável e a move para `sending`, imediatamente
+ * ANTES da chamada ao canal.
  *
- * Provisório e declarado como tal: o delivery worker com claim/lease é a #632.
- * Enquanto ele não existe, quem entrega é o mesmo processo que commitou, e sem
- * este registro TODA linha entregue ficaria `pending` para sempre — de modo que
- * a #632, ao subir, varreria e reenviaria mensagens que o usuário já recebeu.
+ * ─── O que mudou em relação a #631, e por quê ───────────────────────────────
  *
- * Nunca lança: quando roda, o efeito externo JÁ ocorreu. Uma exceção aqui não
- * desfaz o envio; ela só trocaria uma linha desatualizada por um turno
- * abortado. Falhar deixa a linha `pending`, que é exatamente o estado que a
- * reconciliação de #633 existe para resolver.
+ * #631 commitava a linha e chamava o canal em seguida, sem posse: o registro
+ * do desfecho era `recordInlineDeliveryOutcome`, um `UPDATE ... WHERE status =
+ * 'pending'` sem claim, sem lease e sem fence. Aquilo era escopo emprestado
+ * desta issue, e tinha um buraco concreto: um crash entre o `send*` e o
+ * registro deixava a linha em `pending` — indistinguível de "nunca tentada" —
+ * e o delivery worker a reenviaria.
+ *
+ * Agora a linha entra em `sending` ANTES do efeito. `sending` é o estado que
+ * diz "a chamada foi iniciada e o desfecho é desconhecido"; um sucessor que a
+ * tome por lease vencida NÃO consegue enviar (o `markSending` do repositório
+ * exige `status = 'claimed'`) e a manda para `delivery_unknown`.
+ *
+ * Custa UM round trip a mais entre o commit e o envio. A regra de #631 —
+ * "nenhum trabalho entre o commit e o canal" — existia para não abrir janela em
+ * que a resposta está comprometida e algo falha; esta gravação é o oposto
+ * disso: ela é o que torna a janela DIAGNOSTICÁVEL. E se ela falhar, o envio
+ * não acontece, que é o mesmo fail-closed do commit.
+ *
+ * `beginInlineDelivery` LANÇA quando a posse é negada — outro worker tem a
+ * linha. O chamador converte em `OutboundDeliveryError(false, ...)`: nada foi
+ * enviado, e quem tem a lease vigente é quem deve enviar.
+ */
+async function claimInlineDeliveryOrRefuse(
+  commit: OutboundCommitOutcome,
+): Promise<InlineDeliveryHandle> {
+  const outbound_id = commit.committed ? commit.outbound_id : null;
+  try {
+    return await beginInlineDelivery(outbound_id);
+  } catch (err) {
+    if (err instanceof DeliveryFenceError) {
+      logger.warn(
+        { outbound_id, reason: err.reason, ops_alert: true },
+        'outbound.inline_delivery_claim_refused',
+      );
+      throw new OutboundDeliveryError(false, 'outbound_delivery_claim_refused');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Issue #635 — a ÂNCORA do histórico: qual artefato do outbox esta row de
+ * `mensagens` registra.
+ *
+ * É o que torna a gravação do histórico IDEMPOTENTE por chave, e não só por
+ * ordem de execução: `mensagens.outbound_id` é coberto pela unique parcial
+ * `mensagens_outbound_history_uq` (migração 135), então uma segunda gravação da
+ * mesma saída lógica — por retry deste caminho ou pela reconciliação de #633,
+ * que a partir da #635 FABRICA o histórico perdido — colide em vez de duplicar
+ * a resposta na conversa do usuário.
+ *
+ * `null` é legítimo e nomeado: é o caminho sem linha durável (regime de
+ * rollback de #631, worker sem turno, e a voz sintetizada que continua sendo a
+ * exceção declarada de #634). Uma row com âncora `null` fica fora do índice
+ * parcial e continua se comportando como antes desta fatia.
+ */
+function historyAnchor(handle: InlineDeliveryHandle): string | null {
+  return handle.claim?.outbound_id ?? null;
+}
+
+/**
+ * Fecha a linha durável com o desfecho NORMALIZADO da tentativa deste processo,
+ * COM FENCE.
+ *
+ * O estado de destino NÃO é escolhido aqui: `recordInlineDelivery` o obtém de
+ * `statusForOutcome` (`delivery-contract.ts`), a tabela única de #632. É o que
+ * impede que este call site decida, sozinho, chamar `accepted_unconfirmed` de
+ * `delivered` — o mapeamento honesto manda essa categoria para
+ * `delivery_unknown`, porque "o provedor aceitou" não é "o usuário recebeu".
+ *
+ * Nunca lança: quando roda, o efeito externo JÁ ocorreu.
  */
 async function recordCommittedDelivery(
-  commit: OutboundCommitOutcome,
+  handle: InlineDeliveryHandle,
+  payload_type: OutboundPayloadType,
   outcome:
     | { kind: 'delivered'; provider_message_id: string | null; confirmed: boolean }
     | { kind: 'unknown'; error_code: string }
-    | { kind: 'retryable'; error_code: string },
+    | { kind: 'retryable'; error_code: string }
+    /**
+     * Issue #635 — a saída "SEM ENVIO": o artefato foi commitado, NADA foi ao
+     * canal, e nada será. Estado próprio (`cancelled`), nenhum `delivered`
+     * falso — e, o que importa mais aqui, nenhum `retryable` falso.
+     *
+     * ─── O defeito que esta categoria corrige ──────────────────────────────
+     *
+     * O fallback enquete→texto commitava a enquete na posição 0, descobria que
+     * o provedor não devolveu os segredos, e fechava aquela linha como
+     * `{ kind: 'retryable' }` — com este comentário: *"para que o recovery de
+     * #633 não a leia como trabalho pendente e a reenvie depois"*. A intenção
+     * estava certa e o estado escolhido fazia o oposto EXATO dela:
+     * `rejected_retryable` mapeia para `retryable`, que é justamente o estado
+     * que `listDeliverable` seleciona. Cinco segundos de backoff depois, a
+     * varredura rearmava o job e o delivery worker enviava a ENQUETE — o
+     * usuário recebia o texto do fallback e, em seguida, a enquete que o
+     * fallback existia para substituir.
+     *
+     * `cancelled_before_send` é terminal, não é reivindicável e não é
+     * entregável. Também é o único desfecho honesto: nada saiu, e a semântica
+     * do desfecho EXCLUI entrega anterior.
+     */
+    | { kind: 'no_send'; error_code: string },
 ): Promise<void> {
-  if (!commit.committed) return;
-  try {
-    await outboundOutboxRepo.recordInlineDeliveryOutcome({
-      outbound_id: commit.outbound_id,
-      ...(outcome.kind === 'delivered'
-        ? {
-            status: 'delivered' as const,
-            delivery_outcome: outcome.confirmed
-              ? ('accepted_confirmed' as const)
-              : ('accepted_unconfirmed' as const),
-            provider_message_id: outcome.provider_message_id,
-          }
-        : outcome.kind === 'unknown'
-          ? {
-              status: 'delivery_unknown' as const,
-              delivery_outcome: 'timeout_unknown' as const,
-              last_error_code: outcome.error_code,
-            }
-          : {
-              status: 'retryable' as const,
-              delivery_outcome: 'rejected_retryable' as const,
-              last_error_code: outcome.error_code,
-            }),
-    });
-  } catch (err) {
-    logger.error(
-      {
-        err: (err as Error).message,
-        outbound_id: commit.outbound_id,
-        outcome: outcome.kind,
-        ops_alert: true,
-      },
-      'outbound.inline_outcome_record_failed',
-    );
+  await recordInlineDelivery(handle, {
+    payload_type,
+    ...(outcome.kind === 'delivered'
+      ? {
+          outcome: outcome.confirmed
+            ? ('accepted_confirmed' as const)
+            : ('accepted_unconfirmed' as const),
+          provider_message_id: outcome.provider_message_id,
+        }
+      : outcome.kind === 'unknown'
+        ? { outcome: 'timeout_unknown' as const, last_error_code: outcome.error_code }
+        : outcome.kind === 'no_send'
+          ? { outcome: 'cancelled_before_send' as const, last_error_code: outcome.error_code }
+          : { outcome: 'rejected_retryable' as const, last_error_code: outcome.error_code }),
+  });
+}
+
+/**
+ * Executa a chamada ao canal DENTRO do escopo de egresso do outbox (#634).
+ *
+ * A fronteira única (`src/gateway/line-output.ts`) recusa qualquer `send*` que
+ * não esteja num escopo declarado. Este é o escopo do caminho síncrono: a
+ * linha do outbox JÁ foi commitada e JÁ foi reivindicada com lease, então o
+ * envio tem artefato durável por trás — que é literalmente o que a trava
+ * verifica.
+ *
+ * O escopo envolve SÓ a chamada, e isso é o contrato: envolver o ramo inteiro
+ * autorizaria, de quebra, qualquer outro envio que acontecesse durante a
+ * persistência do histórico.
+ */
+function enviarPeloOutbox<T>(entrega: InlineDeliveryHandle, fn: () => Promise<T>): Promise<T> {
+  return withOutboxEgress(entrega.claim ? entrega.claim.outbound_id : null, fn);
+}
+
+/**
+ * Descarta o objeto de mídia durável DEPOIS de uma entrega CONFIRMADA.
+ *
+ * Só na confirmação, e a restrição é deliberada. Um desfecho incerto
+ * (`accepted_unconfirmed`, `timeout_unknown`) ou uma recusa transitória deixam
+ * a linha viva para a reconciliação de #633 e para o rearmamento manual de
+ * `src/ops/outbound-rearm.ts` — e as duas coisas precisam dos BYTES. Apagar o
+ * objeto ali transformaria uma entrega recuperável num `media_ref_unresolved`
+ * permanente, que é exatamente a falha que esta fatia veio remover.
+ *
+ * Objetos de linhas que terminaram mal ficam para o ciclo de retenção/LGPD
+ * (classe `media.outbound_artifacts`), que é onde a decisão de prazo pertence.
+ *
+ * Best-effort: uma falha aqui deixa um objeto órfão (desperdício de disco), e
+ * lançar transformaria desperdício em falha de entrega de uma mensagem que o
+ * usuário JÁ recebeu.
+ */
+async function descartarMidiaEntregue(media: MediaRef): Promise<void> {
+  const removido = await discardOutboundMedia(media).catch(() => false);
+  if (!removido) {
+    logger.debug({ kind: media.kind }, 'outbound.durable_media_discard_skipped');
   }
 }
 
@@ -514,21 +646,56 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'document');
       if (ledger.skip) return;
       const captionText = text.slice(0, 1024);
-      // #631 — COMMIT antes do canal. A mídia entra por REFERÊNCIA
-      // (`local_path`), nunca embutida: o contrato de #630 não tem variante que
-      // aceite bytes nem URL assinada, e o teto de 256 KiB do
-      // `payload_json_size_check` existe para que ninguém tente.
+      // ─── #634 — A MÍDIA PASSA A SER DURÁVEL ────────────────────────────
       //
-      // LIMITE CONHECIDO, e declarado: este `path` é o PDF temporário desta
-      // tentativa, removido no `finally` logo abaixo. Para o caminho de hoje
-      // (commita, envia em seguida, no mesmo processo) a referência é válida
-      // durante toda a vida útil dela. Para o delivery worker de #632, que pode
-      // entregar minutos depois e de outra réplica, ela NÃO é — a migração para
-      // `storage_object` é parte da #634, junto com o inventário dos caminhos.
+      // #631 commitava `{kind:'local_path', path: pdf.path}` e declarou o
+      // limite: o PDF é o temporário DESTA tentativa e o `finally` logo abaixo
+      // o remove. A referência já nascia morta para qualquer segunda tentativa
+      // — o delivery worker de #632 e o rearmamento de #633 encontrariam ENOENT
+      // com CERTEZA.
+      //
+      // Agora os bytes são copiados para o store durável ANTES do commit, e o
+      // artefato referencia o OBJETO. O `finally` continua removendo o
+      // temporário (ele é lixo desta tentativa); o objeto sobrevive até a
+      // entrega ser CONFIRMADA.
+      //
+      // A leitura é pré-envio por construção: se ela falhar, nada foi ao canal
+      // e `commitOutboundOrRefuse` nem é alcançado.
+      let midia: { ref: MediaRef; path: string };
+      try {
+        const bytes = await readFile(pdf.path);
+        midia = await putOutboundMedia({
+          bytes,
+          ext: safeOutboundExtension(pdf.fileName, 'pdf'),
+          pessoa_id: pessoa.id,
+        });
+      } catch (e) {
+        // Pré-envio inequívoco: o arquivo não foi lido, o objeto não foi
+        // escrito, e NADA tocou o canal. `delivered:false` é a verdade literal.
+        //
+        // O ledger legado de #227 JÁ foi reivindicado acima (`ledger`), então a
+        // linha está em `pending`. Fechá-la como `failed`/não-ambígua é
+        // obrigatório: deixada em `pending`, o sweeper de #292 a promoveria a
+        // `unknown` e BLOQUEARIA um retry que é comprovadamente seguro — o
+        // silent-drop que #216 fechou para documentos, reintroduzido pela porta
+        // dos fundos. Antes desta fatia a leitura acontecia dentro do gateway e
+        // essa mesma gravação era feita no `catch` do `sendDocument`.
+        await recordLedgerFailed(
+          c.id,
+          inbound.id,
+          `document_read_failed:${(e as Error).message}`,
+          false,
+        );
+        throw new OutboundDeliveryError(false, `document_read_failed:${(e as Error).message}`);
+      }
+      // #631 — COMMIT antes do canal. A mídia entra por REFERÊNCIA
+      // (`storage_object`), nunca embutida: o contrato de #630 não tem variante
+      // que aceite bytes nem URL assinada, e o teto de 256 KiB do
+      // `payload_json_size_check` existe para que ninguém tente.
       const commit = await commitOutboundOrRefuse({
         payload: {
           type: 'document',
-          media: { kind: 'local_path', path: pdf.path },
+          media: midia.ref,
           mimetype: pdf.mimetype,
           file_name: pdf.fileName,
           ...(captionText ? { caption: captionText } : {}),
@@ -545,14 +712,22 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         );
         return;
       }
+      // #632 — POSSE antes do efeito. A linha vai para `sending`, então um
+      // crash a partir daqui é diagnosticável e NÃO vira reenvio.
+      const entrega = await claimInlineDeliveryOrRefuse(commit);
       let wid: string | null;
       try {
-        wid = await line.sendDocument(jid, pdf.path, {
-          mimetype: pdf.mimetype,
-          fileName: pdf.fileName,
-          caption: captionText,
-          quoted: quotedContext,
-        });
+        // Envia do OBJETO durável, não do temporário: os bytes enviados são,
+        // byte a byte, os que o artefato referencia. Enviar do temporário
+        // deixaria a row descrevendo um arquivo que ninguém verificou.
+        wid = await enviarPeloOutbox(entrega, () =>
+          line.sendDocument(jid, midia.path, {
+            mimetype: pdf.mimetype,
+            fileName: pdf.fileName,
+            caption: captionText,
+            quoted: quotedContext,
+          }),
+        );
       } catch (e) {
         // sendOutboundDocument throws on either readFile failure (definitely
         // pre-send → 'failed', retryable) or socket.sendMessage failure
@@ -572,7 +747,8 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         const ambiguous = classifyDocumentThrow(e);
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
         await recordCommittedDelivery(
-          commit,
+          entrega,
+          'document',
           ambiguous
             ? { kind: 'unknown', error_code: outboundErrorCode('document_transport_throw') }
             : { kind: 'retryable', error_code: outboundErrorCode('document_read_failed') },
@@ -586,7 +762,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // `finally` below either way.
         if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
-          await recordCommittedDelivery(commit, {
+          await recordCommittedDelivery(entrega, 'document', {
             kind: 'delivered',
             provider_message_id: null,
             confirmed: false,
@@ -594,7 +770,7 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           throw new OutboundDeliveryError(true, 'document_channel_sent_without_id');
         }
         await recordLedgerFailed(c.id, inbound.id, 'document_channel_disconnected', false);
-        await recordCommittedDelivery(commit, {
+        await recordCommittedDelivery(entrega, 'document', {
           kind: 'retryable',
           error_code: outboundErrorCode('document_channel_disconnected'),
         });
@@ -603,11 +779,13 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // Document acked — record 'sent' BEFORE the persist block so a persist
       // throw doesn't leave the ledger 'pending' while the user has the file.
       await recordLedgerSent(c.id, inbound.id, wid);
-      await recordCommittedDelivery(commit, {
+      await recordCommittedDelivery(entrega, 'document', {
         kind: 'delivered',
         provider_message_id: wid,
         confirmed: true,
       });
+      // #634 — entrega CONFIRMADA: o objeto durável já cumpriu o papel dele.
+      await descartarMidiaEntregue(midia.ref);
       try {
         const file_size_bytes = await stat(pdf.path)
           .then((s) => s.size)
@@ -636,6 +814,8 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           tipo: 'documento',
           conteudo: captionText,
           midia_url: null,
+          // #635 — a âncora idempotente. Ver `historyAnchor`.
+          outbound_id: historyAnchor(entrega),
           metadata: {
             whatsapp_id: wid,
             in_reply_to: inbound.id,
@@ -682,33 +862,72 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // é uma chamada de rede: a posse pode ter acabado exatamente durante ela.
       assertOutboundOwnership('outbound_voice');
       // ─────────────────────────────────────────────────────────────────────
-      // EXCEÇÃO DECLARADA de #631: este ramo NÃO commita artefato durável.
+      // #634 — A EXCEÇÃO DE #631 ESTÁ FECHADA.
       //
-      // Não é esquecimento e não é preguiça — é o único ramo cujo payload não é
-      // EXPRESSÁVEL hoje. `audio` exige um `MediaRef` (`local_path` ou
-      // `storage_object`, nunca bytes: o contrato de #630 não tem variante que
-      // os aceite, e o teto de 256 KiB da 121 existe para que ninguém tente).
-      // `synthesizeSpeech` devolve um Buffer EM MEMÓRIA — não há arquivo nem
-      // objeto a referenciar. Inventar um aqui significaria criar um artefato
-      // temporário novo, com ciclo de vida e limpeza próprios, dentro de uma
-      // fatia cujo escopo é o commit transacional.
+      // #631 deixou este ramo SEM artefato durável, e o motivo era literal:
+      // `audio` exige um `MediaRef`, `synthesizeSpeech` devolve um Buffer EM
+      // MEMÓRIA, e não havia arquivo nem objeto a referenciar. A fatia declarou
+      // a exceção e empurrou a decisão — "onde o áudio sintetizado passa a
+      // MORAR" — para cá.
       //
-      // O risco disto ficar aberto é limitado e verificável: `FEATURE_OUTBOUND_VOICE`
-      // tem default `false` (src/config/contract.ts), ou seja, não é caminho de
-      // produção hoje. A resolução — decidir onde o áudio sintetizado passa a
-      // MORAR para que uma tentativa posterior o encontre — é a #634
-      // (inventário e migração de TODOS os caminhos de envio), que é onde a
-      // decisão pertence.
+      // A resposta é `src/runtime/outbound/media-store.ts`: os bytes vão para
+      // `<MEDIA_ROOT>/outbound/<tenant>/<agent>/<pessoa>/<sha>.ogg` ANTES do
+      // commit, e o artefato carrega um `storage_object`. A partir daqui a voz
+      // tem exatamente a mesma disciplina do texto: commit transacional, claim
+      // com lease, desfecho normalizado com fence.
       // ─────────────────────────────────────────────────────────────────────
+      let midiaVoz: { ref: MediaRef; path: string };
+      try {
+        midiaVoz = await putOutboundMedia({
+          bytes: voiceBuf,
+          // `synthesizeSpeech` pede `response_format: 'opus'` e o gateway envia
+          // com `mimetype: 'audio/ogg; codecs=opus'` (src/gateway/baileys.ts).
+          ext: 'ogg',
+          pessoa_id: pessoa.id,
+        });
+      } catch (e) {
+        // Pré-envio inequívoco: o objeto não foi escrito e NADA tocou o canal.
+        throw new OutboundDeliveryError(
+          false,
+          `outbound_media_store_failed:${(e as Error).message}`,
+        );
+      }
       // #227: claim the turn before the voice send (no-op when flag off,
       // fail-open on DB throws — see claimOutboundLedgerOrFailOpen).
       const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'voice');
       if (ledger.skip) return; // already attempted; do NOT re-send
+      // #631 — COMMIT antes do canal, agora TAMBÉM para voz. `source_text` é o
+      // texto que gerou o áudio: #630 o persiste exatamente para que um retry
+      // não re-sintetize outro conteúdo e para que o histórico e o fallback
+      // tenham o material.
+      const commitVoz = await commitOutboundOrRefuse({
+        payload: {
+          type: 'audio',
+          media: midiaVoz.ref,
+          mimetype: OUTBOUND_VOICE_MIMETYPE,
+          source_text: text,
+        },
+        sequence_in_turn: OUTBOUND_PRIMARY_SEQUENCE,
+        conversa_id: c.id,
+        in_reply_to: inbound.id,
+        pessoa_id: pessoa.id,
+      });
+      if (saidaLogicaJaTentada(commitVoz)) {
+        logger.warn(
+          { conversa_id: c.id, outbound_id: commitVoz.committed ? commitVoz.outbound_id : null },
+          'outbound.logical_output_already_attempted_skipping_send',
+        );
+        return;
+      }
+      // #632 — POSSE antes do efeito.
+      const entregaVoz = await claimInlineDeliveryOrRefuse(commitVoz);
       let wid: string | null;
       try {
-        wid = await line.sendVoice(jid, voiceBuf, {
-          quoted: quotedContext,
-        });
+        wid = await enviarPeloOutbox(entregaVoz, () =>
+          line.sendVoice(jid, voiceBuf, {
+            quoted: quotedContext,
+          }),
+        );
       } catch (e) {
         // Transport throw is ambiguous (could be delivered-but-threw) →
         // ledger 'unknown' blocks any re-attempt.
@@ -719,6 +938,10 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // (whose own dispatch would be blocked by the boundary guard
         // anyway). No double-send risk: the row is 'unknown'.
         await recordLedgerFailed(c.id, inbound.id, (e as Error).message, true);
+        await recordCommittedDelivery(entregaVoz, 'audio', {
+          kind: 'unknown',
+          error_code: outboundErrorCode('voice_transport_throw'),
+        });
         throw new OutboundDeliveryError(true, (e as Error).message);
       }
       // null ⇒ disconnected (not sent → ledger 'failed') OR sent-without-id
@@ -727,14 +950,30 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       if (!wid) {
         if (line.isConnected()) {
           await recordLedgerSent(c.id, inbound.id, null);
+          await recordCommittedDelivery(entregaVoz, 'audio', {
+            kind: 'delivered',
+            provider_message_id: null,
+            confirmed: false,
+          });
           throw new OutboundDeliveryError(true, 'voice_channel_sent_without_id');
         }
         await recordLedgerFailed(c.id, inbound.id, 'voice_channel_disconnected', false);
+        await recordCommittedDelivery(entregaVoz, 'audio', {
+          kind: 'retryable',
+          error_code: outboundErrorCode('voice_channel_disconnected'),
+        });
         throw new OutboundDeliveryError(false, 'voice_channel_disconnected');
       }
       // Voice acked — record 'sent' BEFORE persist so a persist throw can't
       // leave the ledger 'pending' while the user already heard the note.
       await recordLedgerSent(c.id, inbound.id, wid);
+      await recordCommittedDelivery(entregaVoz, 'audio', {
+        kind: 'delivered',
+        provider_message_id: wid,
+        confirmed: true,
+      });
+      // #634 — entrega CONFIRMADA: o objeto durável já cumpriu o papel dele.
+      await descartarMidiaEntregue(midiaVoz.ref);
       try {
         await audit({
           acao: 'outbound_sent_voice',
@@ -1046,10 +1285,16 @@ export async function sendOutbound(
   // do Decision Engine e o fallback de TTS.
   //
   // A posição é literal e é o contrato: entre esta linha e `line.sendText`
-  // abaixo NÃO EXISTE `await`. Todo trabalho que podia falhar — resolver a
-  // linha, achar a pessoa, resolver o JID — já aconteceu. Inserir qualquer
-  // coisa aqui, ou mover o `sendText` para cima desta chamada, é reabrir a
-  // janela em que uma mensagem chega ao usuário sem que o banco saiba.
+  // abaixo só existe UM `await`, e ele é o claim de entrega de #632
+  // (`claimInlineDeliveryOrRefuse`). Todo trabalho que podia falhar — resolver
+  // a linha, achar a pessoa, resolver o JID — já aconteceu. Mover o `sendText`
+  // para cima desta chamada reabre a janela em que uma mensagem chega ao
+  // usuário sem que o banco saiba.
+  //
+  // O claim é a ÚNICA coisa que pode entrar aqui, e entra porque ela fecha uma
+  // janela em vez de abrir: sem ele a linha fica em `pending` durante o envio,
+  // e um crash a seguir é indistinguível de "nunca tentada" — o recovery
+  // reenviaria. Ele também FALHA FECHADO: sem posse não há `sendText`.
   //
   // `commitOutboundOrRefuse` LANÇA se a transação falhar: o `sendText` abaixo
   // não é alcançado, e o erro sobe classificado como `delivered:false`.
@@ -1073,6 +1318,13 @@ export async function sendOutbound(
     );
     return commit.committed ? commit.row.provider_message_id : null;
   }
+  // #632 — POSSE antes do efeito. A linha vai para `sending`, então um crash a
+  // partir daqui é diagnosticável e NÃO vira reenvio.
+  const entrega = await claimInlineDeliveryOrRefuse(commit);
+  // O tipo do artefato que ACABOU de ser commitado — `status_fallback` é uma
+  // saída própria em #630, não "texto com um motivo", e o rótulo de métrica
+  // tem de dizer a verdade sobre qual das duas saiu.
+  const tipoDeSaida: OutboundPayloadType = opts?.fallback_reason ? 'status_fallback' : 'text';
   // Delivery happens in two phases: send to the channel, THEN persist. Tag
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
@@ -1087,14 +1339,12 @@ export async function sendOutbound(
   // double-send risk: the row is 'unknown'.
   let wid: string | null;
   try {
-    wid = await line.sendText(
-      jid,
-      text,
-      Object.keys(sendOpts).length ? sendOpts : undefined,
+    wid = await enviarPeloOutbox(entrega, () =>
+      line.sendText(jid, text, Object.keys(sendOpts).length ? sendOpts : undefined),
     );
   } catch (e) {
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'unknown',
       error_code: outboundErrorCode('text_transport_throw'),
     });
@@ -1108,7 +1358,7 @@ export async function sendOutbound(
   if (wid === null) {
     if (line.isConnected()) {
       await recordLedgerSent(conversa_id, in_reply_to, null);
-      await recordCommittedDelivery(commit, {
+      await recordCommittedDelivery(entrega, tipoDeSaida, {
         kind: 'delivered',
         provider_message_id: null,
         confirmed: false,
@@ -1116,7 +1366,7 @@ export async function sendOutbound(
       throw new OutboundDeliveryError(true, 'channel_sent_without_id');
     }
     await recordLedgerFailed(conversa_id, in_reply_to, 'channel_disconnected', false);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'retryable',
       error_code: outboundErrorCode('channel_disconnected'),
     });
@@ -1125,7 +1375,7 @@ export async function sendOutbound(
   // Channel acked — record 'sent' BEFORE the persist so a later persist throw
   // doesn't leave the ledger 'pending' while the user already has the message.
   await recordLedgerSent(conversa_id, in_reply_to, wid);
-  await recordCommittedDelivery(commit, {
+  await recordCommittedDelivery(entrega, tipoDeSaida, {
     kind: 'delivered',
     provider_message_id: wid,
     confirmed: true,
@@ -1141,6 +1391,8 @@ export async function sendOutbound(
       tipo: 'texto',
       conteudo: text,
       midia_url: null,
+      // #635 — a âncora idempotente. Ver `historyAnchor`.
+      outbound_id: historyAnchor(entrega),
       metadata,
       processada_em: new Date(),
       ferramentas_chamadas: opts?.tool_summaries ?? [],
@@ -1214,9 +1466,14 @@ export async function sendOutboundPoll(
     );
     return { fell_back: false };
   }
+  // #632 — POSSE antes do efeito. A linha vai para `sending`, então um crash a
+  // partir daqui é diagnosticável e NÃO vira reenvio.
+  const entrega = await claimInlineDeliveryOrRefuse(commit);
   let sent: Awaited<ReturnType<LineOutput['sendPoll']>>;
   try {
-    sent = await line.sendPoll(jid, text, pending.opcoes_validas);
+    sent = await enviarPeloOutbox(entrega, () =>
+      line.sendPoll(jid, text, pending.opcoes_validas),
+    );
   } catch (e) {
     // Transport throw is ambiguous (could be delivered-but-threw) → 'unknown'.
     //
@@ -1226,7 +1483,7 @@ export async function sendOutboundPoll(
     // ReAct turn whose own dispatch would be blocked anyway. No double-send
     // risk: the row is 'unknown'.
     await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
-    await recordCommittedDelivery(commit, {
+    await recordCommittedDelivery(entrega, 'interactive_poll', {
       kind: 'unknown',
       error_code: outboundErrorCode('poll_transport_throw'),
     });
@@ -1250,13 +1507,22 @@ export async function sendOutboundPoll(
       false,
     );
     // #631 — a enquete já foi COMMITADA na posição 0 e não vai ser entregue.
-    // Fecha aquela linha como `retryable`/`rejected_retryable` (configuração
-    // incompleta, nada foi ao canal) para que o recovery de #633 não a leia
-    // como trabalho pendente e a reenvie depois — o duplo envio pela porta dos
-    // fundos.
-    await recordCommittedDelivery(commit, {
-      kind: 'retryable',
-      error_code: outboundErrorCode('poll_missing_secrets'),
+    // #635 — e o estado que diz isso é `cancelled`, não `retryable`.
+    //
+    // A #631 escolheu `rejected_retryable` "para que o recovery de #633 não a
+    // leia como trabalho pendente". Fazia exatamente o contrário:
+    // `rejected_retryable` mapeia para `retryable`, que é o estado que
+    // `listDeliverable` SELECIONA. Cinco segundos de backoff depois, a
+    // varredura rearmava o job e o delivery worker mandava a enquete — o
+    // usuário recebia o texto do fallback E a enquete que ele substituía. Era o
+    // duplo envio pela porta dos fundos, criado pela linha escrita para
+    // impedi-lo.
+    //
+    // `no_send` ⇒ `cancelled_before_send` ⇒ `cancelled`: terminal, não
+    // reivindicável, não entregável. Nada saiu ao canal e nada sairá.
+    await recordCommittedDelivery(entrega, 'interactive_poll', {
+      kind: 'no_send',
+      error_code: outboundErrorCode('superseded_by_text_fallback'),
     });
     const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
     await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
@@ -1274,7 +1540,7 @@ export async function sendOutboundPoll(
   // Poll acked — record 'sent' BEFORE persist so a persist throw doesn't leave
   // the ledger 'pending' while the user already sees the poll.
   await recordLedgerSent(conversa_id, in_reply_to, sent.whatsapp_id);
-  await recordCommittedDelivery(commit, {
+  await recordCommittedDelivery(entrega, 'interactive_poll', {
     kind: 'delivered',
     provider_message_id: sent.whatsapp_id,
     confirmed: true,
@@ -1287,6 +1553,8 @@ export async function sendOutboundPoll(
       tipo: 'texto',
       conteudo: text,
       midia_url: null,
+      // #635 — a âncora idempotente. Ver `historyAnchor`.
+      outbound_id: historyAnchor(entrega),
       metadata: {
         whatsapp_id: sent.whatsapp_id,
         remote_jid: jid,

@@ -9,6 +9,17 @@ import { logger } from '@/lib/logger.js';
 export const OUTBOUND_VOICE_MAX_CHARS = 400;
 
 /**
+ * O mimetype REAL do que `synthesizeSpeech` devolve — `response_format:'opus'`
+ * empacotado em Ogg, exatamente o que `src/gateway/baileys.ts` declara ao
+ * enviar (`mimetype: 'audio/ogg; codecs=opus'`, `ptt: true`).
+ *
+ * Exportado em #634 porque o artefato durável de `audio` (#630) persiste o
+ * mimetype, e ele TEM de ser o mesmo que o transporte usa: duas cópias do
+ * literal é como uma delas fica para trás quando o formato mudar.
+ */
+export const OUTBOUND_VOICE_MIMETYPE = 'audio/ogg; codecs=opus';
+
+/**
  * Synthesize Brazilian-Portuguese speech via OpenAI TTS. Returns OGG-Opus
  * binary as a Buffer. The output format is exactly what WhatsApp/Baileys
  * expects for voice notes (`ptt: true` + `mimetype: 'audio/ogg; codecs=opus'`),

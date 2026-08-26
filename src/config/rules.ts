@@ -826,6 +826,58 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     }
   }
 
+  // Issue #633 (fatia D da #506) — as duas flags da recuperação do outbox.
+  //
+  // A ordem de rollout NÃO é simétrica, e é isso que as duas regras abaixo
+  // codificam: o CONSUMIDOR precede o PRODUTOR, sempre (mesmo princípio de
+  // FEATURE_TURN_JOB_V2 em #504).
+  //
+  //  (a) VARREDURA SEM CONSUMIDOR — `FEATURE_OUTBOUND_RECOVERY` ligada com
+  //      `FEATURE_OUTBOUND_DELIVERY_WORKER` desligada faz o sweeper ENFILEIRAR
+  //      um job por linha entregável a cada minuto, sem ninguém para consumir.
+  //      Os jobs se acumulam no Redis (que tem teto de memória e derruba a fila
+  //      `agent` junto quando estoura), a linha nunca é entregue, e o operador
+  //      vê "a recuperação está ligada" enquanto nada se recupera. É `error`, e
+  //      não `warning`, porque o modo degradado é indistinguível do saudável
+  //      pelo lado de fora.
+  //
+  //  (b) CONSUMIDOR SEM COMMIT DURÁVEL — `FEATURE_OUTBOUND_DELIVERY_WORKER`
+  //      ligada com `FEATURE_OUTBOUND_DURABLE_COMMIT` desligada é INERTE:
+  //      #631 é quem cria a linha do outbox, e sem ela não existe `outbound_id`
+  //      a entregar. O worker sobe, conecta no Redis e nunca recebe trabalho.
+  //      Mesmo formato das regras de #503/#504/#631 acima — silêncio aqui faria
+  //      o operador acreditar que ligou a entrega assíncrona.
+  //
+  // Nenhuma das duas é regra de `boot`/production-required: ao contrário de
+  // FEATURE_OUTBOUND_DURABLE_COMMIT, desligar estas NÃO restaura fail-open.
+  // Com as duas OFF o caminho síncrono de #631/#632 continua sendo o que
+  // entrega, com posse e fence — o que se perde é a RECUPERAÇÃO automática, e
+  // o rearmamento manual (`npm run dlq outbound-rearm`) continua existindo.
+  if (bool(c.FEATURE_OUTBOUND_RECOVERY) && !bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_RECOVERY',
+      rule: 'outbound-recovery/requires-delivery-worker',
+      message:
+        'FEATURE_OUTBOUND_RECOVERY=true com FEATURE_OUTBOUND_DELIVERY_WORKER=false enfileira jobs de entrega que NENHUM processo consome: a fila `outbound-delivery` cresce no Redis a cada tick, as linhas do outbox continuam sem ser entregues, e a varredura parece saudável de fora.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DELIVERY_WORKER primeiro (o consumidor precede o produtor), confirme que a fila drena, e só então mantenha FEATURE_OUTBOUND_RECOVERY ligada. Ver docs/runbooks/outbound-recovery.md.',
+    });
+  }
+  if (bool(c.FEATURE_OUTBOUND_DELIVERY_WORKER) && !bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DELIVERY_WORKER',
+      rule: 'outbound-recovery/requires-durable-commit',
+      message:
+        'FEATURE_OUTBOUND_DELIVERY_WORKER=true com FEATURE_OUTBOUND_DURABLE_COMMIT=false é inerte: sem o commit transacional de #631 nenhuma linha do outbox durável é criada, então não existe outbound_id a entregar e o worker nunca recebe trabalho.',
+      remediation:
+        'Ligue FEATURE_OUTBOUND_DURABLE_COMMIT (migrations 121 e 131 aplicadas), ou desligue FEATURE_OUTBOUND_DELIVERY_WORKER. Ver docs/runbooks/outbound-recovery.md.',
+    });
+  }
+
   // Janelas/limites que precisam estar em ordem.
   const orderPairs: readonly [string, string, string][] = [
     ['MESSAGE_DEBOUNCE_MS', 'MESSAGE_DEBOUNCE_MAX_MS', 'debounce'],

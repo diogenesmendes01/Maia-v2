@@ -269,6 +269,23 @@ async function main() {
       startUnroutedReplayWorker(async (job) => {
         await processUnroutedReplay(job.data.unrouted_id);
       });
+      // Issue #633 (fatia D da #506) — o CONSUMIDOR da fila de entrega do
+      // outbox durável. Registrado só com a flag ligada, e a flag NASCE OFF:
+      // o consumidor precede o produtor (a varredura de recuperação, gated por
+      // `FEATURE_OUTBOUND_RECOVERY`), e o contrato de config recusa a ordem
+      // inversa (`outbound-recovery/requires-delivery-worker`).
+      //
+      // Sem a flag, nada é construído: um `Worker` da BullMQ abre conexão e
+      // consome assim que existe, então "registrar e não usar" não é opção.
+      if (config.FEATURE_OUTBOUND_DELIVERY_WORKER) {
+        const { startOutboundDeliveryWorker } = await import('@/gateway/queue.js');
+        const { consumeOutboundDeliveryJob } = await import(
+          '@/runtime/outbound/delivery-consumer.js'
+        );
+        startOutboundDeliveryWorker(async (outbound_id) => {
+          await consumeOutboundDeliveryJob(outbound_id);
+        });
+      }
     }
     // Constructing a Queue/Worker does NOT mean it can consume — the BullMQ
     // connection is lazy. Wait for a live connection before claiming ready, or

@@ -10,6 +10,7 @@
  *     linha e NUNCA caem para outra linha quando a sessão não existe.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { withOutboxEgress } from '@/runtime/outbound/egress-guard.js';
 
 const {
   channelBelongsToScopeActive,
@@ -153,12 +154,22 @@ describe('forCurrentAgentChannel — resolução do canal único (legado/proativ
 });
 
 describe('fase 0 — classificação de transporte inalterada', () => {
+  /**
+   * #634 — a fronteira única recusa `send*` fora de um escopo de egresso
+   * declarado (`src/runtime/outbound/egress-guard.ts`). Estes casos são sobre a
+   * ESCOLHA DE TRANSPORTE (global × sessão da linha × falha fechada), não sobre
+   * a trava; em produção quem chega aqui já está dentro do escopo do outbox ou
+   * de uma exceção inventariada. A trava tem sonda própria em
+   * `tests/unit/runtime/outbound-trava-envio-direto.spec.ts`.
+   */
+  const noOutbox = <T>(fn: () => Promise<T>): Promise<T> => withOutboxEgress('sonda', fn);
+
   it('manager DESLIGADO: sends delegam nas primitivas globais (paridade)', async () => {
     channelBelongsToScopeActive.mockResolvedValue(true);
     const line = await forChannel(SCOPE);
-    await line.sendText('jid', 'oi', { view_once: true });
+    await noOutbox(() => line.sendText('jid', 'oi', { view_once: true }));
     expect(sendOutboundText).toHaveBeenCalledWith('jid', 'oi', { view_once: true });
-    await line.sendPoll('jid', 'q', [{ key: 'a', label: 'A' }]);
+    await noOutbox(() => line.sendPoll('jid', 'q', [{ key: 'a', label: 'A' }]));
     expect(presenceSendPoll).toHaveBeenCalled();
     line.markRead('jid', 'wid');
     expect(presenceMarkRead).toHaveBeenCalledWith('jid', 'wid');
@@ -172,7 +183,7 @@ describe('fase 0 — classificação de transporte inalterada', () => {
     const transport = { sendText: vi.fn(async () => 'wid-line') };
     manager.transportFor.mockReturnValue(transport);
     const line = await forChannel(SCOPE);
-    await expect(line.sendText('jid', 'oi')).resolves.toBe('wid-line');
+    await expect(noOutbox(() => line.sendText('jid', 'oi'))).resolves.toBe('wid-line');
     expect(transport.sendText).toHaveBeenCalledWith('jid', 'oi', undefined);
     expect(sendOutboundText).not.toHaveBeenCalled();
   });
@@ -186,7 +197,7 @@ describe('fase 0 — classificação de transporte inalterada', () => {
       });
     });
     const line = await forChannel(SCOPE);
-    await expect(line.sendText('jid', 'oi')).rejects.toMatchObject({
+    await expect(noOutbox(() => line.sendText('jid', 'oi'))).rejects.toMatchObject({
       code: 'line_session_unavailable',
     });
     expect(sendOutboundText).not.toHaveBeenCalled();

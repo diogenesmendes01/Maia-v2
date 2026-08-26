@@ -65,6 +65,342 @@ true`.
 `tests/unit/ci/admin-ui-e2e-gate.spec.ts` passa a conferir esse piso contra a
 contagem de casos das specs fora da quarentena — um piso que não acompanha a
 suíte deixaria apagar as jornadas do checkout sem ficar vermelho.
+### ⚠️ MUDANÇA DE COMPORTAMENTO — histórico idempotente, multipart ordenado e a saída "sem envio" ([#635](https://github.com/diogenesmendes01/Maia-v2/issues/635), fatia F de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** três coisas, e a segunda é um bug que já estava em
+> produção esperando a hora.
+>
+> **(1) A reconciliação passou a FABRICAR o histórico perdido.** Uma linha
+> `delivered` sem histórico — o crash na janela `delivered -> completed` que a
+> #632 declarou e a #633 recusou fechar — agora vira `completed` COM a resposta
+> registrada na conversa, projetada do artefato imutável. **Nada é reenviado ao
+> provedor.** A série nova é
+> `maia_outbound_reconciliation_total{result="history_fabricated"}`, e ela é o
+> alarme certo para "o worker de entrega está morrendo no meio".
+>
+> **(2) A enquete que virou texto deixou de ser reenviada.** No fallback
+> enquete→texto, a linha da enquete era fechada como `rejected_retryable` —
+> literalmente com o comentário "para que o recovery não a reenvie". Só que
+> `rejected_retryable` mapeia para `retryable`, que é EXATAMENTE o estado que a
+> varredura de recuperação seleciona: cinco segundos de backoff depois, o job
+> era rearmado e o usuário recebia o texto do fallback **e** a enquete que o
+> fallback existia para substituir. Agora ela é fechada como
+> `cancelled_before_send` ⇒ `cancelled` — terminal, não entregável, honesto.
+> **Se você rodou #631/#633 com o worker de entrega ligado, inventarie:**
+> `SELECT count(*) FROM outbound_messages WHERE turn_id IS NOT NULL AND payload_type = 'interactive_poll' AND last_error_code = 'poll_missing_secrets';`
+>
+> **(3) `mensagens` ganhou `outbound_id`** (migração 135) com unique parcial por
+> `(tenant_id, agent_id, outbound_id)`. É a chave idempotente do histórico de
+> saída. `NULL` continua legítimo — ingresso, histórico antigo, e as saídas sem
+> linha durável (regime de rollback de #631, voz sintetizada, que é a exceção
+> declarada de #634).
+
+**O PORQUÊ.** A #506 pede, textualmente, que a gravação do histórico use
+`outbound_id` como chave idempotente. Até aqui a idempotência era inteiramente
+**de estado**: `completeDeliveryTx` fazia `delivered -> completed` e o INSERT na
+mesma transação, então "uma linha `completed` tem histórico" era verdade por
+construção. Essa garantia é real e continua valendo — mas ela tem exatamente UM
+escritor, e esta fatia acrescenta o segundo. A partir de dois escritores a
+unicidade não pode mais ser efeito colateral de uma máquina de estados; precisa
+ser uma declaração do banco.
+
+**A objeção da #633, e por que ela não bloqueia.** A fatia D recusou fabricar o
+histórico com esta justificativa: *"o texto teria de ser re-renderizado a partir
+do payload, duplicando `buildHistorico`"*. A regra que ela protegia é a da épica
+— o texto final vem do ARTEFATO, nunca de uma nova passada de cognição — e
+continua valendo integralmente. O que esta fatia faz não é re-renderizar: é
+**projetar**. `buildHistoricoFromArtifact`
+(`src/runtime/outbound/historico.ts`) é pura, total, sem LLM, template, locale,
+relógio ou configuração, sobre um `payload_json` imutável desde o commit de #631
+e coberto por `payload_hash`. Existe **uma** definição, importada pelos dois
+caminhos — e é justamente DUPLICÁ-LA que criaria a divergência que a #633
+temia. A prova de não-divergência não é circular: a sonda compara o `conteudo`
+recuperado com a string exata que o adaptador entregou ao provedor, capturada
+por um `LineOutput` fake.
+
+**Também nesta fatia:**
+
+- **O predicado de "já tem histórico?" deixou de ser uma heurística.** A #633
+  perguntava por `metadata->>'in_reply_to'`, que não é uma chave e ERRAVA em
+  multipart: os dois artefatos do turno respondem ao mesmo ingresso, então o
+  histórico do artefato 0 fazia a leitura responder "já existe" para o artefato
+  1 — e o artefato 1 era concluído SEM histórico, com a linha em `completed`
+  mentindo. Agora a pergunta é pela âncora; a perna legada (`outbound_id IS NULL`)
+  fica só para rows anteriores à migração, e é conservadora de propósito.
+- **A ordem do multipart virou regra do ciclo de entrega.** `deliverOutbound`
+  recusa um artefato enquanto existir artefato de `sequence_in_turn` menor do
+  mesmo turno que não se resolveu (`awaiting_earlier_artifact`), ANTES do claim
+  para não consumir orçamento de tentativas. `delivery_unknown` e `reconciling`
+  BLOQUEIAM: a mensagem pode ter chegado e pode ainda ser reenviada, e liberar o
+  seguinte ali faria o usuário ler a resposta fora de ordem.
+- **Retenção estrutural.** A projeção monta o `metadata` campo a campo e nunca
+  espalha o payload, e `midia_url` é `null` literal em quem insere. Nenhuma
+  referência de mídia (`local_path`, `storage_object`) entra no histórico — a
+  sonda de unidade percorre `OUTBOUND_PAYLOAD_TYPES` inteiro exigindo ausência,
+  então um tipo novo sem tratamento quebra a suíte em vez de vazar.
+- **A política de multipart está ESCRITA**: `docs/runbooks/outbound-recovery.md`
+  §9 (ordenação, o que resolve um artefato, falha parcial, retomada,
+  cancelamento) e §10 (a chave do histórico).
+
+**O que esta fatia NÃO fez**, e por quê: o turno continua sendo concluído pelo
+processo que despachou, sem esperar que TODOS os artefatos cheguem a `completed`.
+Fazer o `concludeTurn` esperar exigiria mover a conclusão do turno para o
+delivery worker, que é uma reorganização do ciclo do turno inteiro e não cabe
+nesta fatia. A consequência é observável e já tem série
+(`maia_outbound_turn_inconsistency_total{kind="outbound_without_live_turn"}`),
+não silenciosa.
+
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a mídia de saída passa a ser durável, e o envio direto ao canal passa a ser RECUSADO ([#634](https://github.com/diogenesmendes01/Maia-v2/issues/634), fatia E de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** três coisas.
+>
+> **(1) `LineOutput.send*` fora do outbox agora LANÇA.** As cinco primitivas de
+> mensagem (`sendText`, `sendDocument`, `sendVoice`, `sendPoll`, `sendReaction`)
+> só executam dentro de um escopo de egresso declarado: o do outbox durável, ou
+> o de uma exceção **inventariada** em `src/runtime/outbound/send-paths.ts`.
+> Qualquer outro chamador recebe `outbound_direct_send_violation` e a série
+> `maia_outbound_direct_send_violation_total` sobe. **Não há env var para
+> desligar** — uma trava desligável em produção é o fail-open que a épica lista
+> como risco. Código novo que precise enviar tem duas opções e só duas: passar
+> pelo outbox, ou entrar no inventário com motivo e contenção escritos.
+> `startTyping`/`markRead` continuam livres (são presença, não mensagem).
+>
+> **(2) Áudio e documento passam a MORAR em `<MEDIA_ROOT>/outbound/`.** O ramo
+> de voz, que #631 deixou explicitamente sem artefato durável, agora commita
+> como qualquer outro. O ramo de documento deixou de commitar `local_path`
+> (apontando para um PDF que o `finally` apagava em seguida) e passou a commitar
+> `storage_object`. **Se o seu deploy roda backend e delivery worker em réplicas
+> com volumes `MEDIA_ROOT` diferentes, a entrega de mídia falha** com
+> `media_ref_unresolved` — recusa terminal e observável, nunca "envia outra
+> coisa". Ver §7.5 do runbook.
+>
+> **(3) A mídia de saída entrou no ciclo de LGPD, com mecanismo LIGADO.** Classe
+> nova `media.outbound_artifacts` (a 14ª), `sensitive_personal`, e o adapter de
+> privacidade **implementa** a purga por titular. Diferente de `media.blobs` (a
+> mídia de ENTRADA), que continua `mechanism_not_implemented` porque o layout
+> dela não tem ligação com o titular. A POLÍTICA (o prazo) continua
+> `pending_dpo`, como as outras treze.
+>
+> **Sem migração.** O prefixo 134 foi reservado para esta fatia e **não foi
+> usado**: nada aqui muda schema. Mesma situação da 128 (reservada por #632 e
+> não usada).
+
+**O PORQUÊ.** Três fatias seguidas empurraram a mesma decisão para cá, cada uma
+deixando o motivo escrito no código: o ramo de VOZ não commitava porque
+`synthesizeSpeech` devolve um Buffer em memória e não havia objeto a referenciar
+(#631); o ramo de DOCUMENTO commitava um `local_path` que o próprio envio
+apagava, válido só enquanto quem entrega é o mesmo processo (#631); e
+`storage_object` não era resolvível, então um artefato durável terminava em
+`rejected_terminal` (#632). As três são a mesma pergunta — **onde a mídia
+mora** — e ela não tinha resposta.
+
+E a issue pede, além disso, a trava: *"nenhum caminho de produção pode chamar o
+adaptador diretamente fora do outbox, salvo exceção documentada, fail-closed e
+testada"*. Um inventário em markdown envelhece em silêncio; um teste que só varre
+texto não vê chamada indireta. Por isso são duas camadas.
+
+**O que esta fatia acrescenta:**
+
+- `src/runtime/outbound/media-store.ts` — o store. Chave
+  `<tenant>/<agent>/<pessoa_id>/<sha256>.<ext>`: `tenant`/`agent` são comparados
+  com o escopo ALS no resolvedor (é essa comparação, e não a contenção de
+  `media-guard`, que carrega o isolamento — todos os objetos moram sob a mesma
+  raiz); `pessoa_id` é o que torna o apagamento por titular expressável;
+  `sha256` torna a escrita idempotente. Escrita atômica (tmp + `rename`).
+- `src/runtime/outbound/egress-guard.ts` — a trava de runtime (ALS + métrica +
+  throw), ligada em `src/gateway/line-output.ts`.
+- `src/runtime/outbound/send-paths.ts` — o inventário, em código: 15 caminhos,
+  3 de infraestrutura, 2 migrados, 10 exceções declaradas. Toda exceção carrega
+  `reason` **e** `containment`, e o teste reprova texto vazio.
+- `maia_outbound_direct_send_violation_total{kind}` — a métrica que #506
+  §Observabilidade nomeia. Valor esperado: **zero absoluto**.
+- `media.outbound_artifacts` no inventário de retenção + a purga no adapter de
+  privacidade.
+- `fallback_reason` ligado nos quatro call sites reais de `src/agent/core.ts`.
+  A opção existia desde #631 e **nenhum** call site a passava: todo fallback
+  nascia como `payload_type:'text'`, indistinguível de conteúdo do agente.
+- GC do objeto **só** na entrega confirmada — desfecho incerto ou terminal
+  preserva os bytes, porque a reconciliação de #633 e o rearmamento manual
+  precisam deles.
+
+**O que esta fatia NÃO faz, e por quê:**
+
+- **Não migra as 10 exceções.** O denominador comum é literal: nenhuma tem
+  `turn_id`, e o outbox o exige `NOT NULL` com fence do `claim_token` do turno.
+  Não há turno a cercar num briefing das 7h. Duas delas já são outboxes duráveis
+  próprios; migrá-las é fundir dois ledgers.
+- **Não liga o commit à fila.** O texto da #634 não pede, e fazê-lo reabriria o
+  `await` entre o commit e o `send*` que #631 fechou deliberadamente. Quem arma
+  continua sendo a varredura (até 1 min) ou o operador.
+- **Não ativa política de retenção.** Mecanismo ligado, política `pending_dpo` —
+  a decisão é do DPO, e codificar um prazo aqui seria a suposição jurídica que
+  #520 proíbe.
+
+### ⚠️ MUDANÇA DE COMPORTAMENTO — o outbox ganhou consumidor, reconciliação e DLQ ([#633](https://github.com/diogenesmendes01/Maia-v2/issues/633), fatia D de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** duas coisas.
+>
+> **(1) O sweeper legado deixou de tocar a linha durável.**
+> `outbound_messages_sweeper` (#292) promovia a `unknown` toda row `pending`
+> mais velha que `OUTBOUND_SWEEPER_STALE_PENDING_SEC` (300s por default). Depois
+> da #630 essa tabela passou a hospedar TAMBÉM o outbox durável, cuja row nasce
+> em `pending` esperando o worker de entrega — e `unknown` é TERMINAL para o
+> claim. O sweeper legado estava, portanto, a caminho de virar uma máquina de
+> perder respostas cinco minutos depois de elas serem commitadas. Todas as suas
+> consultas agora filtram `turn_id IS NULL`. **Se você rodou #630/#631 em algum
+> ambiente por mais de cinco minutos com o sweeper ligado, inventarie:**
+> `SELECT count(*) FROM outbound_messages WHERE turn_id IS NOT NULL AND status = 'unknown';`
+>
+> **(2) `outbound_messages.status` admite `dead_letter`.** É a DLQ do outbox, e
+> ela é DISTINTA de `failed_terminal`: aquela é a recusa DEFINITIVA do provedor
+> (rearmar é pedir a mesma recusa), esta é a plataforma DESISTINDO (teto de
+> tentativas, ou incerteza que atravessou 24h) — e daí rearmar é legítimo. Um
+> `_down` que encontre rows em `dead_letter` **aborta**, de propósito.
+>
+> Nada disso liga sozinho: as duas flags novas nascem **OFF**.
+
+**O PORQUÊ.** A #632 entregou o ciclo de entrega e declarou cinco dívidas, e
+quatro delas eram a mesma frase dita de ângulos diferentes: *ninguém consome*.
+`outboundDeliveryJobId` existia e era testado, mas nada enfileirava nem
+consumia; `renewDeliveryLease` existia, mas nada a chamava em laço;
+`delivery_unknown` passou a ser PRODUZIDO em volume (`accepted_unconfirmed`
+deixou de virar `delivered`) e nada o consumia; e a varredura de takeover não
+tinha índice próprio. Uma resposta que falhasse a primeira entrega ficava parada
+para sempre, sem alarme.
+
+**O que esta fatia acrescenta:**
+
+- **Consumidor de fila.** `outbound-delivery` (BullMQ) com `jobId`
+  determinístico por `outbound_id`, payload `{version, outbound_id}` `.strict()`
+  e nada mais — nem tenant, nem telefone, nem texto. O escopo é redescoberto no
+  PostgreSQL por uma fronteira de confiança cross-tenant
+  (`src/runtime/outbound/delivery-scope.ts`), irmã da de #504.
+- **Heartbeat ligado.** A lease é renovada a cada terço do TTL **enquanto a
+  chamada ao provedor está em voo**. Sem ele, uma chamada mais longa que
+  `TURN_LEASE_TTL_MS` perdia a posse com o desfecho já conhecido — e trocava
+  informação por incerteza.
+- **Reconciliação.** A fila `delivery_unknown` finalmente tem consumidor, e a
+  decisão está num lugar só e é pura (`reconciliationDisposition`): carência →
+  `resend_idempotent` **apenas** quando o provedor honra a chave para aquele
+  `payload_type` → `escalate_manual` em todo o resto → `dead_letter` no prazo.
+  Não existe `resend_blind` no vocabulário: o **tipo** não consegue expressá-lo.
+- **Rearmamento manual com confirmação de risco.** `npm run dlq outbound-show` /
+  `outbound-rearm`. Quando o estado é incerto E o provedor não deduplica aquele
+  tipo, o comando **recusa** sem reconhecimento explícito, e o reconhecimento vai
+  para a auditoria junto com o `--reason` obrigatório. É a falha #12 da épica,
+  virada tipo.
+- **Divergência turno↔outbound nos dois sentidos**, como OBSERVAÇÃO. Corrigir
+  automaticamente significaria inventar uma resposta (sentido 1) ou cancelar uma
+  entrega em voo (sentido 2).
+
+**Migração 131** (`migrations/131_outbound_recovery_dlq.sql`): o estado
+`dead_letter` e dois índices parciais — `idx_outbound_messages_expired_claims`
+(varredura de takeover; `lease_expires_at` na FRENTE, como a 114 fez para
+`agent_turns`, porque o dispatcher cross-tenant não tem igualdade em `tenant_id`
+para ancorar a sondagem) e `idx_outbound_messages_reconcile`.
+
+**MEDIDO, e ao contrário do que se poderia supor:** sem
+`idx_outbound_messages_expired_claims` o planejador **não** cai em Seq Scan —
+cai em `idx_outbound_messages_tenant_agent_status_created` (a 067) com
+`lease_expires_at` como filtro, exatamente como a #632 previu. O ganho do índice
+novo é SELETIVIDADE, não evitar varredura: a 067 indexa toda row, inclusive as
+terminais que sob retenção de 30 dias são a maioria, então o custo cresce com o
+HISTÓRICO; o índice parcial cresce com o trabalho EM VOO. A sonda de EXPLAIN
+exige o índice NOMEADO por isso — só "sem Seq Scan" ficaria verde sem ele.
+
+**Séries novas:** `maia_outbound_pending_age_seconds{tenant_id,agent_id}` (a do
+alarme — idade da resposta não entregue mais antiga),
+`maia_outbound_reconciliation_total{result}`,
+`maia_outbound_dead_letter_total{reason}`,
+`maia_outbound_turn_inconsistency_total{kind}` e
+`maia_outbound_rearm_total{origin}`.
+
+**Flags novas, ambas OFF, e a ORDEM importa:**
+`FEATURE_OUTBOUND_DELIVERY_WORKER` (consumidor) **antes** de
+`FEATURE_OUTBOUND_RECOVERY` (produtor). A ordem inversa acumula jobs que ninguém
+consome, e o contrato de config a recusa
+(`outbound-recovery/requires-delivery-worker`).
+
+**O risco residual, declarado:** sem confirmação e idempotência confiáveis do
+provedor, a janela *"o provedor recebeu, o processo não confirmou"* é impossível
+de fechar. Esta fatia a ADMINISTRA — estado incerto + reconciliação — e não a
+resolve. Ver [`docs/runbooks/outbound-recovery.md`](docs/runbooks/outbound-recovery.md).
+
+
+### ⚠️ MUDANÇA DE COMPORTAMENTO — a entrega tem dono, e "o provedor aceitou" deixou de ser "o usuário recebeu" ([#632](https://github.com/diogenesmendes01/Maia-v2/issues/632), fatia C de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
+
+> **O que muda no seu dia:** uma resposta cujo envio retorna **sem
+> identificador do provedor** (o caso `sendText → null` com a linha conectada)
+> deixa de ser registrada como `delivered` e passa a ser `delivery_unknown`.
+> Isso NÃO é uma regressão de entrega — a mensagem provavelmente chegou. É a
+> plataforma parando de afirmar o que não sabe: `delivered` sai do radar da
+> reconciliação, então marcar assim uma resposta não confirmada a deixaria
+> "entregue" para sempre, inclusive quando ela nunca chegou.
+>
+> As séries novas a observar são `maia_outbound_delivery_unknown_total{channel}`
+> e `maia_outbound_lease_lost_total{reason}`. A primeira é a fila de entrada da
+> reconciliação (#633) e mede o custo real de **não** reenviar às cegas; um pico
+> na segunda significa leases curtas demais para a latência do provedor, que é a
+> causa mais comum de takeover falso.
+
+**O PORQUÊ.** #631 deixou a resposta durável antes do canal, mas quem entregava
+não tinha posse: o registro do desfecho era um `UPDATE ... WHERE status =
+'pending'` sem claim, sem lease e sem fence, declarado provisório e emprestado
+desta fatia. Ele tinha um buraco concreto — um crash **entre** a chamada ao
+provedor e a gravação do resultado deixava a linha em `pending`, indistinguível
+de "nunca tentada", e o primeiro worker de entrega a varrê-la **reenviaria uma
+mensagem que o usuário já tinha recebido**.
+
+O ciclo de entrega agora é:
+
+```
+carregar por ID → claim atômico (lease + fence) → validar tenant/agent/canal
+  → deadline → `sending` COM FENCE → adaptador (idempotency key + AbortSignal)
+  → resultado normalizado → `delivered` → histórico → `completed`
+```
+
+**As três decisões que carregam a fatia:**
+
+- **`sending` existe para tornar o crash diagnosticável.** Uma linha em
+  `sending` com lease morta significa "a chamada foi iniciada e o desfecho nunca
+  foi registrado" — a mensagem pode estar no telefone do usuário. Sem essa
+  escrita, o crash pré-envio e o pós-envio deixam a linha idêntica em `claimed`.
+- **O takeover de `sending` não devolve a linha para `claimed`.** O `SET` do
+  claim é `CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END`, e
+  `markSending` exige `status = 'claimed'`. O sucessor de uma chamada em voo é
+  **estruturalmente incapaz** de enviar; ele registra
+  `cancelled_after_send_unknown`. A garantia não depende de um `if`.
+- **Sete categorias de desfecho, não duas.** `accepted_confirmed`,
+  `accepted_unconfirmed`, `rejected_retryable`, `rejected_terminal`,
+  `timeout_unknown`, `cancelled_before_send`, `cancelled_after_send_unknown` —
+  e o reenvio automático só é permitido para as duas cujas semânticas **excluem**
+  entrega anterior, ou quando o provedor honra a chave idempotente **para aquele
+  tipo de payload**.
+
+**A limitação do Baileys, encapsulada em vez de fingida.** `LineOutput` declara
+`messageId` em `sendText` e em mais nada; `sendDocument`, `sendVoice`,
+`sendPoll` e `sendReaction` geram id aleatório a cada chamada. Isso virou uma
+capability explícita (`providerIdempotencySupport(channel, payload_type)`) com
+`satisfies`, então um tipo novo sem entrada é erro de compilação — e não um
+default `native` silencioso, que autorizaria reenviar um áudio já ouvido.
+
+**Removido:** `outboundOutboxRepo.recordInlineDeliveryOutcome`. O caminho
+síncrono de `src/agent/output-dispatch.ts` passa a reivindicar a linha e marcá-la
+`sending` antes de cada chamada ao canal, e a gravar o desfecho com o fence. Isso
+acrescenta **um** `await` entre o commit de #631 e o canal — a única coisa que
+pode entrar ali, porque ela fecha uma janela em vez de abrir e falha fechado.
+
+**Sem migration.** A 121 (#630) já traz `claim_token`, `lease_expires_at`,
+`next_attempt_at`, `attempt`, `delivery_outcome` e os estados do ciclo. O
+histórico é idempotente **pelo estado**: `delivered → completed` e o `INSERT` em
+`mensagens` acontecem na mesma transação, e `completed` não é reivindicável —
+nenhuma chave de dedupe nova foi inventada.
+
+**Ainda não ligado a uma fila.** `deliverOutbound` é a responsabilidade isolada
+e `outboundDeliveryJobId(outbound_id)` é determinístico, mas quem enfileira e
+quem consome é #633/#634.
+
+
 ### ⚠️ MUDANÇA DE COMPORTAMENTO — a resposta do turno é COMMITADA antes de chegar ao canal ([#631](https://github.com/diogenesmendes01/Maia-v2/issues/631), fatia B de [#506](https://github.com/diogenesmendes01/Maia-v2/issues/506))
 
 > **O que muda no seu dia:** até este release, uma falha do banco no caminho de

@@ -23,8 +23,13 @@ const dispatchTool = vi.fn();
 const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 
+// #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
+// resolve a raiz por `MEDIA_ROOT`. O double precisa fornecê-la: sem ela o ramo
+// falha ANTES do canal (pré-envio, fail-closed), que é o comportamento certo em
+// produção e um falso vermelho aqui.
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, isBaileysConnected: () => true,
+  MEDIA_ROOT: SANDBOX,
 }));
 // Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
 // sai pela fronteira única LineOutput. A linha mockada roteia para os MESMOS
@@ -188,7 +193,14 @@ describe('agent loop — PDF flow (B3b)', () => {
     expect(sendOutboundDocument).toHaveBeenCalledTimes(1);
     const [jid, path, opts] = sendOutboundDocument.mock.calls[0]!;
     expect(jid).toMatch(/@s\.whatsapp\.net$/);
-    expect(path).toBe(pdfPath);
+    // #634 — o que vai ao canal é o OBJETO DURÁVEL, não o PDF temporário desta
+    // tentativa. A troca é o ponto da fatia: o temporário morre no `finally`,
+    // então enviar dele deixava a row do outbox descrevendo um arquivo que
+    // nenhuma segunda tentativa encontraria. O objeto vive sob
+    // `<MEDIA_ROOT>/outbound/<tenant>/<agent>/<pessoa>/<sha>.pdf`.
+    expect(path).not.toBe(pdfPath);
+    expect(path).toContain(join(SANDBOX, 'outbound'));
+    expect(path).toMatch(/\/[0-9a-f]{64}\.pdf$/);
     expect(opts).toMatchObject({
       mimetype: 'application/pdf',
       fileName: 'extrato-empresa-x-2026-04.pdf',

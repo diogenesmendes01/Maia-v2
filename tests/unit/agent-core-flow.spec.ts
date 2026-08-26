@@ -43,9 +43,15 @@ const synthesizeSpeech = vi.fn();
 // prompt" case can drive the engine to a block.
 const runDecisionEngineForTurn = vi.fn();
 
+// #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
+// resolve a raiz por `MEDIA_ROOT`. O double precisa fornecê-la: sem ela os
+// ramos de documento e voz falham ANTES do canal (fail-closed correto em
+// produção, falso vermelho aqui). `SANDBOX` é a mesma raiz onde a spec escreve
+// o PDF de fixture.
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, sendOutboundVoice,
   isBaileysConnected: () => true,
+  MEDIA_ROOT: SANDBOX,
 }));
 // Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
 // passa pela fronteira única `LineOutput` resolvida via forCurrentAgentChannel.
@@ -75,6 +81,8 @@ vi.mock('../../src/runtime/decision/integration.js', () => ({
 vi.mock('../../src/lib/tts.js', () => ({
   synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS: 400,
+  // #634 — o artefato durável de `audio` persiste o mimetype REAL da síntese.
+  OUTBOUND_VOICE_MIMETYPE: 'audio/ogg; codecs=opus',
 }));
 vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },

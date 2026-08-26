@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
 
@@ -26,9 +29,14 @@ const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 const synthesizeSpeech = vi.fn();
 
+// #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
+// resolve a raiz por `MEDIA_ROOT`. O double precisa fornecê-la: sem ela o ramo
+// falha ANTES do canal (pré-envio, fail-closed), que é o comportamento certo em
+// produção e um falso vermelho aqui.
 vi.mock('../../src/gateway/baileys.js', () => ({
   sendOutboundText, sendOutboundDocument, sendOutboundVoice,
   isBaileysConnected: () => true,
+  MEDIA_ROOT: mkdtempSync(join(tmpdir(), 'maia-media-spec-')),
 }));
 // Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
 // sai pela fronteira única LineOutput. A linha mockada roteia para os MESMOS
@@ -57,6 +65,10 @@ vi.mock('../../src/runtime/decision/integration.js', () => ({
 vi.mock('../../src/lib/tts.js', () => ({
   synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS: 400,
+  // #634 — o artefato durável de `audio` persiste o mimetype REAL do que a
+  // síntese devolve, e ele vem daqui (uma constante só, ao lado do
+  // `response_format` que a produz).
+  OUTBOUND_VOICE_MIMETYPE: 'audio/ogg; codecs=opus',
 }));
 vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },
