@@ -110,6 +110,7 @@ import { readCached } from './cache.js';
 import { createReadGate, type ReadGate } from './concurrency.js';
 import { recordSectionStatus, type TurnContextSection } from './metrics.js';
 import {
+  JANELA_DE_AVISO_DE_CAPACIDADE_DIAS,
   SECTION_BUDGETS,
   TURN_CONTEXT_MAX_CONCURRENT_READS,
   degraded,
@@ -495,8 +496,17 @@ async function loadTurnContextInner(req: TurnContextRequest): Promise<TurnContex
     optional(
       'gaps',
       [] as AgentCapabilityGap[],
+      // #638 (fatia C da épica #471): UMA leitura, TRÊS blocos do prompt. Os
+      // gaps ABERTOS em mentionable/proposed servem "## Limitações conhecidas"
+      // e a cláusula "Ainda não tem:" do autoconhecimento; os RECÉM-FECHADOS
+      // servem o aviso "isto você já consegue". Buscar a segunda metade num
+      // `SELECT` próprio custaria uma ida a mais no caminho mais quente do
+      // sistema — ver o orçamento em `tests/unit/turn-context-round-trips.spec.ts`.
       async () =>
-        (await capabilityGapsRepo?.listByLevels?.([GapLevel.MENTIONABLE, GapLevel.PROPOSED])) ?? [],
+        (await capabilityGapsRepo?.listParaOTurno?.(
+          [GapLevel.MENTIONABLE, GapLevel.PROPOSED],
+          JANELA_DE_AVISO_DE_CAPACIDADE_DIAS,
+        )) ?? [],
       (v) => v.length === 0,
       degradedSections,
       gate,

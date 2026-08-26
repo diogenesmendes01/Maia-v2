@@ -95,7 +95,7 @@ vi.mock('../../src/db/repositories.js', () => ({
     listByLevel: vi.fn(async () =>
       hugeRows(50, () => ({ capability_description: HUGE, current_level: 'mentionable' })),
     ),
-    listByLevels: vi.fn(async () =>
+    listParaOTurno: vi.fn(async () =>
       hugeRows(50, () => ({ capability_description: HUGE, current_level: 'mentionable' })),
     ),
   },

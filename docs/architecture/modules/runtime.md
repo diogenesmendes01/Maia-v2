@@ -60,9 +60,11 @@ do ciclo de vida; Redis/BullMQ são só wake-up e distribuição. Um turno é
 | File | Role |
 |---|---|
 | `contract.ts` | Vocabulário PURO: estados, outcomes, tabela de transições, compatibilidade estado/outcome, sanitização do erro persistido. Sem I/O — unit-testável sem Postgres. |
-| `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. |
+| `claim.ts` | Vocabulário PURO do claim (#504): elegibilidade, resultados tipados, identidade do worker, aritmética do lease. Sem I/O. Desde #625 também guarda a exclusão POR STREAM: `STREAM_OCCUPYING_STATUSES` (o predicado do índice `agent_turns_stream_active_uq` escrito em TypeScript), `STREAM_EXCLUSION_CONSTRAINT` (o nome que o `23505` precisa carregar para virar `stream_busy`) e o próprio motivo `stream_busy`. Desde #626 é também o VOCABULÁRIO ÚNICO do escalonamento por stream: `STREAM_SCHEDULING_RESULTS` (os cinco códigos que a issue manda centralizar — `eligible`, `not_head`, `stream_blocked`, `stream_busy`, `promoted`), `STREAM_BLOCKED_REASONS` (o subconjunto que vira label de `maia_stream_blocked_total`), `STREAM_FIFO_VIOLATION_STAGES` e `STREAM_HEAD_OF_LINE_INDEX`. `promoted` entra sem produtor de propósito: a #627 acrescentar um sexto rótulo a uma série já em uso quebraria alertas em silêncio. Desde #629 há um SEXTO código, `stream_poisoned` — a conversa está interditada por política de poison —, e ele é ACRESCENTADO, não redefinido: nenhuma série existente muda de significado. Reusar `stream_blocked` não era opção: as duas param a conversa e as remediações são opostas ("vá ao runbook do outbox e espere" contra "nada acontece sem um humano"). Também o tipo `StreamBlockRecord`, a moeda entre o repositório que PRODUZ a interdição, a fachada que a AUDITA e a operação que a resolve. |
 | `job.ts` | Identidade determinística do job na BullMQ (#504): `agentTurnJobId(turn_id)` e a leitura dual do payload V1/V2. Puro — não importa `bullmq`. |
-| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. |
+| `lease.ts` | POSSE viva (#504): o único módulo com TEMPO — heartbeat, perda, cancelamento e liberação. Dono do contador `maia_turn_fence_rejected_total`. Desde #625 também AUDITA a exclusão por stream: `turn_stream_busy` (o banco recusou um segundo turno ativo) e `turn_stream_claim_recovered` (um claim expirado foi recuperado dentro da transação do claim). O repositório continua puro-DB e não audita. Desde #626, também `turn_stream_blocked` (a conversa tem fila) e `turn_stream_fifo_violation` (o canário disparou) — e é ele que SEMEIA `maia_stream_fifo_violation_total`/`maia_stream_blocked_total` em zero no import, para que "sempre zero" seja uma afirmação medida em vez de uma série ausente. |
+| `stream-metrics.ts` | #626 — as séries do escalonamento por stream (`maia_stream_fifo_violation_total{stage}`, `maia_stream_blocked_total{reason}`) e o SEMEADOR que as publica em ZERO. Existe porque quem DETECTA a violação é o repositório (o canário roda no `RETURNING` do claim), e `turn-repos.ts` é compartilhado com o console — não pode alcançar `src/config/env.ts` (#596). Importa só `@/lib/metrics.js` e o vocabulário puro de `claim.ts`. Desde #629 também `maia_stream_poison_total{category,disposition}` (a DECISÃO da política, semeada nas 12 combinações) e os BALDES em segundos de `maia_stream_turn_wait_seconds` — declarados por `declararBaldesDeEspera()`, que é chamada TAMBÉM no ponto de observação (`lease.ts`) e não só no boot: `src/lib/metrics.ts` congela os baldes de uma série na PRIMEIRA amostra, então um processo que só roda workers nasceria com os baldes de milissegundos e ficaria assim para sempre. |
+| `poison-policy.ts` | #629 (fatia F da #505) — a POLÍTICA de poison/DLQ, PURA (sem `db`, sem ALS, sem `@/config/env.js`, sem métricas). `classifyPoison` mapeia `(código de erro, outcome)` em seis categorias de cardinalidade FECHADA (`effect_committed`, `model`, `transport`, `infrastructure`, `operator`, `unknown`) e `poisonDisposition` decide entre `release` e `block_stream` contra um conjunto que entra como PARÂMETRO — ler a env aqui faria todo teste de política medir `process.env` em vez da regra. O `outcome` DOMINA o código: `unsafe_to_retry` é produzido por `decideTurnAction` exatamente quando uma tool irreversível já rodou, e o código que o acompanha é o motivo da saída do ReAct, isto é, sintoma. `parsePoisonBlockCategories` falha FECHADA numa categoria desconhecida — silenciá-la produziria um dashboard sem bloqueio nenhum, e a leitura natural seria "não aconteceu nenhum caso" em vez de "a política está desligada". |
 | `execution-context.ts` | Contexto AMBIENTE da tentativa (#504), por AsyncLocalStorage: propaga posse/sinal/deadline aos limites de efeito sem passar por assinatura. Mesmo padrão de `src/db/tenant-context.ts`. |
 | `stream-key.ts` | Derivação CANÔNICA da `stream_key` (#505) **e a guarda fail-closed** (`requireStreamIdentity`, `StreamIdentityUnresolvedError`). PURO — só `node:crypto`: material comprimento-prefixado (netstring) sobre `tenant_id + agent_id + canal + linha + identidade remota normalizada`. Nenhum caminho devolve chave "genérica". A pureza é **estrutural**: quem chama a guarda é o repositório, que é compartilhado com o console e não pode alcançar `src/config/env.ts` (#596). |
 | `stream-ingress.ts` | O RELATO da decisão (#505): métrica, `audit_log` e log estruturado. Consumido pelo **gateway**, que já paga por `@/config/env.js`. Dono de `maia_stream_ingress_total` e `maia_stream_ingress_rejected_total`. |
@@ -271,7 +273,17 @@ para o escopo interno.
 |---|---|
 | `maia_turn_job_version_total` | `version` = `v1` / `v2` / `invalid` (vocabulário FECHADO `TURN_JOB_VERSION_VALUES`). Emitida no PARSE, em `startAgentWorker` — atribuição `system` por construção (nada resolveu o tenant ainda), pela camada de política de [`src/observability/metrics.ts`](../../../src/observability/metrics.ts). É o critério MENSURÁVEL de remoção do caminho V1: zero `v1` por uma janela definida. |
 | `maia_turn_scope_rejected_total` | `reason` = `malformed_turn_id` / `turn_not_found` / `scope_unusable` / `representative_missing` / `scope_mismatch`. Nenhum é normal; `scope_mismatch` é incidente de isolamento. |
-| `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` |
+| `maia_turn_claim_total` | `result` = `acquired` / `not_eligible` / `not_found` / `stream_busy` (#625) / `not_head` / `stream_blocked` (#626) / `stream_poisoned` (#629). `stream_busy` fala da STREAM (a conversa está ocupada), `not_eligible` fala do TURNO — colapsar os dois apagaria o único sinal de uma conversa serializando, que é o risco que a #505 manda vigiar no rollout. Depois de #626 `stream_busy` deve CAIR quase a zero: o head-of-line recusa antes, e o que sobra para o índice são turnos sem `first_ingress_seq` e sequências empatadas. |
+| `maia_stream_blocked_total` | `reason` = `not_head` / `stream_blocked` / `stream_busy` (#626) / `stream_poisoned` (#629 — sobe e NÃO volta sozinha: cada ponto é uma tentativa contra uma conversa que nenhum worker vai destravar). `not_head` é ROTINA — cada mensagem que chega enquanto a anterior roda conta um ponto. O que se vigia é a FORMA: `not_head` crescendo sem `acquired` correspondente é conversa parada. |
+| `maia_stream_fifo_violation_total` | `stage` = `claim` / `recovery` (#626). **Sempre zero** — a issue-mãe lista `> 0` entre os critérios de ABORTAR o rollout. Publicada em ZERO no import de `lease.ts`: um contador que nasce na primeira violação satisfaria "sempre zero" por AUSÊNCIA, e nenhum alerta escrito contra ele dispararia. |
+| `maia_stream_head_age_seconds` / `maia_stream_head_age_p95_seconds` | Sem labels (#629). Idade do head MAIS VELHO e o p95, lidos no SCRAPE do banco por `src/observability/stream-fairness-collector.ts`. O MÁXIMO e não a média: fairness é uma pergunta sobre o PIOR caso, e uma média com 10 mil conversas instantâneas e uma parada há duas horas fica excelente escondendo o usuário abandonado. Sem o p95, "uma conversa presa" e "a plataforma toda atrasada" produzem o mesmo máximo. |
+| `maia_stream_turn_wait_seconds` | Histograma sem labels (#629), baldes em SEGUNDOS com cortes nos marcos REAIS do sistema (120s = `STUCK_AFTER_MS`, 300s = starvation, 900s = teto do backoff). Observado no CLAIM, a partir de `now() - COALESCE(queued_at, created_at)` medido pelo relógio do BANCO — com `Date.now()` a série mediria skew de NTP junto com a espera. Par de `head_age`: esta mede quem JÁ COMEÇOU, aquela mede quem AINDA NÃO — e medir só a primeira é a forma clássica de não ver starvation. |
+| `maia_stream_active_total` / `maia_stream_live_total` | Sem labels (#629). Conversas com turno ATIVO agora, e conversas com qualquer turno vivo. Com head-of-line cada stream ocupa no máximo UMA vaga, então `active_total` é literalmente "quantas conversas distintas estão sendo atendidas em paralelo"; preso em 1 com `live_total` alto é serialização. |
+| `maia_stream_backlog_max` | Sem labels (#629). Maior backlog de uma ÚNICA conversa. É a MEDIÇÃO do que a issue-mãe chama de "limites de backlog por stream"; o limite NÃO é aplicado, porque a única pressão possível no ingresso seria recusar mensagem de usuário — perda de dado. Ver runbook §14.5. |
+| `maia_stream_starvation_total` | Sem labels (#629). EPISÓDIOS de head parado além de `TURN_STREAM_STARVATION_AFTER_MS`, deduplicados por token opaco (`md5(tenant:agent:stream_key)`) em memória — sem a deduplicação a série mediria a frequência do Prometheus, não a saúde da plataforma. O token nunca vira label nem log. |
+| `maia_stream_poisoned_streams` | Sem labels (#629). Conversas INTERDITADAS agora. Cada ponto é uma conversa que nenhum mecanismo automático destrava; não voltar a zero é trabalho de operador acumulando. |
+| `maia_stream_poison_total` | `category` × `disposition` (#629). As DUAS dimensões, e nenhuma é redundante: a pergunta operacional é o cruzamento. `{category="effect_committed",disposition="release"}` crescendo significa que alguém tirou a categoria da lista e a plataforma segue conversas por cima de efeitos irreversíveis pela metade. |
+| `maia_turn_stream_claim_recovered_total` | `from` = `claimed` / `running` (#625). Quantos claims EXPIRADOS a transação de claim devolveu à fila. Em operação saudável é ZERO — cada ponto é um worker que morreu segurando uma conversa. |
 | `maia_turn_claim_latency_ms` | `result` |
 | `maia_turn_lease_heartbeat_total` | `result` = `renewed` / `token_mismatch` / `error` |
 | `maia_turn_lease_lost_total` | `reason` = `token_mismatch` / `heartbeat_failed` / `expired` |
@@ -290,8 +302,56 @@ limite recusou, não só que alguém recusou. `react_tool_refused` pertence ao
 vocabulário do ERRO (`TurnOwnershipLostError`) e NÃO à série: a recusa que o
 ReAct traduz já foi contada como `tool_dispatch`/`tool_handler`.
 
-Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`). Claim e
-heartbeat rotineiros ficam em métrica — auditá-los seria uma row por batida.
+Auditoria: só as ANOMALIAS (`turn_lease_lost`, `turn_fence_rejected`, e desde
+#625 `turn_stream_busy` e `turn_stream_claim_recovered`). Claim e heartbeat
+rotineiros ficam em métrica — auditá-los seria uma row por batida.
+
+**Exclusão por stream (#625, fatia B da #505).** A invariante é "no máximo um
+turno ativo por stream", e ela vive em DUAS metades que só funcionam juntas:
+
+1. **estrutural** — o índice único parcial `agent_turns_stream_active_uq`
+   (migration 124) sobre `(tenant_id, agent_id, stream_key)` onde
+   `status IN ('claimed','running')`. É ele que DECIDE: um segundo claim na
+   mesma stream levanta `23505` e vira `stream_busy`. O escopo faz parte da
+   chave — sem `tenant_id`/`agent_id` nela, duas tenants com a mesma
+   `stream_key` passariam a competir;
+2. **temporal** — a recuperação de claims EXPIRADOS dentro da MESMA transação
+   do claim (`agentTurnsRepo.tryClaimTurn`). Sem ela, o primeiro crash de worker
+   deixa uma linha `claimed` com lease vencida ocupando a chave e a stream fica
+   bloqueada para sempre: o índice deixa de ser proteção e vira o defeito.
+
+`outbound_pending` está deliberadamente FORA do predicado — a resposta já está
+comprometida no outbox (#506) e quem finaliza é o delivery worker, que não
+disputa posse. Incluí-lo prenderia a conversa pela latência do provedor de
+saída. Consequência honesta: entre `outbound_pending` e o terminal a stream
+aceita um novo claim. Isso não é reordenação — QUEM pode ser reivindicado é o
+head-of-line (#626), que é outra fatia; esta decide QUANTOS podem estar ativos.
+
+**Head-of-line (#626, fatia C da #505).** A pergunta desta fatia é a outra:
+**quem** pode ser reivindicado. A resposta é "o de menor `first_ingress_seq`
+entre os não terminais da stream", e ela é um `NOT EXISTS` no `WHERE` do claim
+— [`src/db/repositories/stream-head-sql.ts`](../../../src/db/repositories/stream-head-sql.ts),
+um módulo PURO com QUATRO consumidores e nenhuma segunda cópia.
+
+Três consequências que não são óbvias:
+
+1. **`outbound_pending` bloqueia a ORDEM, mesmo não ocupando a stream.** As duas
+   afirmações convivem porque respondem a perguntas diferentes. O efeito
+   prático é que uma indisponibilidade do outbox para a CONVERSA (não o tenant,
+   não a fila), com o código `stream_blocked` — distinto de `not_head`
+   justamente porque esperar não resolve. É o preço de FIFO, e a alavanca para
+   não pagá-lo é a flag, não o predicado.
+2. **O recovery usa a MESMA função.** `findRecoverableTurns` e o dispatcher
+   cross-tenant filtram pelo mesmo `streamHeadOfLineNotExists`. Sem isso o
+   varredor rearmaria turnos que o claim vai recusar: a fila cresce, a métrica
+   de recovery diz que houve trabalho, e a conversa não anda.
+3. **A recuperação de claim expirado deixou de beneficiar o sucessor.** Antes,
+   o sucessor reivindicava e a transação destravava o head morto — a conversa
+   andava na hora, fora de ordem. Agora o head volta a `retryable` e o sucessor
+   é recusado; quem avança é o head, na vez dele, quando o recovery o rearmar
+   (até `STUCK_AFTER_MS`). Ordem comprada com latência no caminho de crash; a
+   promoção idempotente do sucessor (#627) devolve a latência sem devolver a
+   inversão.
 
 **Rollout** — duas flags, registradas em `ENV_CONTRACT`
 ([`src/config/contract.ts`](../../../src/config/contract.ts)) e documentadas em
@@ -881,7 +941,7 @@ through `/livez`, `/startupz` and `/readyz`.
 | `shutdown-sequence.ts` | The ordered steps and the signal handlers. Order is the contract: stop accepting work → drain crons → drain BullMQ → drain background tasks → close the turn-context subscriber (#511, its own ioredis connection) → close sessions → HTTP → audit → pools |
 | `readiness.ts` | Composite, role-aware `/readyz` + `/startupz` evaluation. Read-only, per-component timeout, memoized, sanitized output |
 | `schema-readiness.ts` | **The `/readyz` schema gate** (#516): cached, single-flight adapter over `getSchemaReadiness()`. Dirty state, checksum divergence, a migration file this build does not ship, an incompatible head and an unreadable database all keep the instance at 503. Verdict cached for `SCHEMA_READINESS_TTL_MS` (10s) so an LB poll is not a load generator |
-| `schema-boot-gate.ts` | **The BOOT decision** over that verdict (#516, ADR 0004): blocker kind ⇒ exit code (90-97), precedence between simultaneous blockers, and the actionable death message. PURE — no I/O; `src/index.ts` is the only caller and the only place that calls `process.exit()`. Replaced `schema-version.ts`, the pre-#516 comparison, which was deleted |
+| `schema-boot-gate.ts` | **The BOOT decision** over that verdict (#516, ADR 0004): blocker kind ⇒ exit code (90-98), precedence between simultaneous blockers, and the actionable death message. PURE — no I/O; `src/index.ts` is the only caller and the only place that calls `process.exit()`. Replaced `schema-version.ts`, the pre-#516 comparison, which was deleted |
 | `index.ts` | Public barrel (import the role contract from here) |
 
 Rules this module enforces:
@@ -954,6 +1014,12 @@ Rules this module enforces:
 | `tests/unit/decision-engine-trace-ownership-boundary.spec.ts` | A janela entre o guard de posse do Decision Engine e o CONSUMO do pacote: com `traceTurnDecision` DEFERIDO, a lease cai enquanto o envelope durável está em voo e o teste exige `TurnOwnershipLostError` — e nenhum efeito posterior — tanto no resolve quanto no reject |
 | `tests/integration/turn-job-id-real-redis.spec.ts` | Redis real: colisão do `jobId`, job retido `completed`/`failed` não bloqueia rearme, job vivo é respeitado |
 | `tests/unit/runtime/outbound-contract.spec.ts` | #630: união Zod por tipo, canonicalização (ordem de chave não move o hash; ordem das opções da enquete move), e as quatro propriedades das chaves — estabilidade no retry sob campos mutáveis, isolamento entre tenants, não-colisão sob ambiguidade de separador, e payload distinto não reutiliza chave. **Nenhuma cópia da fórmula**: tudo é relação entre saídas da função real |
+| `tests/unit/runtime/stream-head-of-line-contract.spec.ts` | #626: compila a regra FIFO com `PgDialect` (sem banco) e amarra os quatro textos que precisam concordar — o predicado da migration 126, os terminais do contrato, o vocabulário dos cinco códigos e a ESTRUTURA ("uma única função"): conta as chamadas de `streamHeadOfLineNotExists` no repositório e proíbe uma segunda cópia escrita à mão |
+| `tests/integration/turn-head-of-line-real-db.spec.ts` | #626 com Postgres real: só o menor `first_ingress_seq` avança (M1/M2/M3 tentados em ordem INVERTIDA — um teste que tentasse M1 primeiro passaria com a regra removida), `retryable` não é ultrapassado, terminal não bloqueia, `outbound_pending` anterior devolve `stream_blocked`, 12 conversas em pontos DIFERENTES do próprio contador seguem em paralelo (fica vermelho sob serialização global), o recovery devolve só heads pela mesma função, e `maia_stream_fifo_violation_total` publicada em zero continua zero sob rajada legítima |
+| `tests/unit/runtime/poison-policy-contract.spec.ts` | #629: a classificação é TOTAL e o `outcome` domina o código; a leitura da config falha FECHADA numa categoria desconhecida; o contrato de env e o vocabulário do módulo puro listam as MESMAS categorias (`src/config/contract.ts` não pode importar o módulo — regra de pureza —, então a lista está escrita duas vezes por necessidade e é aqui que as duas cópias são amarradas); o predicado casa TEXTUALMENTE com o índice parcial da 133; e o repositório tem exatamente QUATRO chamadas de `streamNotPoisoned` e nenhuma cópia escrita à mão |
+| `tests/unit/observability/stream-fairness-metrics.spec.ts` | #629: `starvation_total` conta EPISÓDIOS (a mesma conversa faminta não recontada por scrape; uma que sai e volta conta de novo); uma falha da fonte devolve o ÚLTIMO valor conhecido e não zero (um head age que despenca durante uma indisponibilidade do banco é a leitura mais enganosa possível); NENHUMA série de stream carrega label de alta cardinalidade; e o coletor é fiado a partir de `registerRuntimeObservability` |
+| `tests/integration/turn-poison-dlq-real-db.spec.ts` | #629 com Postgres real: os DOIS modos da política pela porta real (`unsafe_to_retry` bloqueia, `reasoner_failed` libera — sem mexer em `process.env`, porque `config` é singleton e o classificador de produção ficaria de fora); ATOMICIDADE com a falha caindo ENTRE as duas escritas (gatilho no `INSERT` do bloqueio: o turno NÃO pode ficar `dead_letter` com a conversa livre); idempotência do bloqueio; o varredor não churna numa conversa interditada; desbloqueio audita, re-arma o head e deixa o morto morto; ISOLAMENTO com a colisão FORÇADA nos dois eixos (mesma `stream_key` literal em dois tenants E dois agents do mesmo tenant); replay recusado por ordem comprometida e atravessado com `--reconcile`; e retry antigo com backoff em aberto bloqueando o turno novo |
+| `tests/integration/turn-stream-fairness-real-db.spec.ts` | #629 com Postgres real: uma SIMULAÇÃO do pool de workers (4 vagas puxando da mesma fila, entrando por `beginTurnExecution` e concluindo por `concludeTurn`, com a promoção devolvendo o job do sucessor). Prova que uma conversa lenta com o head segurado não impede as outras 30 de terminarem INTEIRAS; que uma conversa quente de 25 turnos nunca ocupa mais de UMA vaga e as pequenas saem com mediana de posição 11 de 45; que `maia_stream_turn_wait_seconds` recebe uma amostra por turno atendido com os baldes de SEGUNDOS; e que `starvation_total` não reconta por scrape |
 | `tests/integration/outbound-durable-outbox-schema-real-db.spec.ts` | #630 com Postgres real: row legada continua inserível, uniques PARCIAIS recusam a segunda saída e ignoram o legado, CHECK de completude impede meia-row, FK composta impede apontar para turno de outro tenant |
 | `tests/integration/outbound-commit-transacional-real-db.spec.ts` | #631 com Postgres real, entrando por `dispatchOutput`/`sendOutbound` (o call site de produção, não um harness): o double do canal **consulta o banco por conexão própria no instante do envio**, de modo que "nada vai ao canal antes do banco" vira afirmação verificável. Cobre também worker sem posse, CAS de versão, rollback total quando a falha acontece ENTRE as duas escritas, idempotência da saída lógica (uma linha **e** um envio), `delivery_unknown` em vez de `delivered` fingido, e a linha selecionável pelo recovery no instante seguinte ao commit |
 | `tests/unit/config/outbound-durable-commit-rule.spec.ts` | #631: a flag não pode ser fail-open — default ON, `false` em production é erro de escopo `boot` (sobrevive a `MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e inerte sem a máquina de estados é erro |
