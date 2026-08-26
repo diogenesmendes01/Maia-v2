@@ -14,6 +14,7 @@ import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
 import { registerMigrationGauges } from './migration-collector.js';
 import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
+import { registrarSeriesDeStream } from '@/runtime/turns/stream-metrics.js';
 import {
   registerDbPoolGauges,
   registerSchedulerLagGauges,
@@ -95,6 +96,21 @@ export async function registerRuntimeObservability(): Promise<void> {
   }
 
   registerSchedulerLagGauges(schedulerLagSnapshot);
+
+  // Issue #626 (fatia C da #505) — PUBLICA em zero as séries do escalonamento
+  // por stream. Não é um coletor: é uma semeadura, e ela existe porque
+  // `src/lib/metrics.ts` cria a série na PRIMEIRA incrementação. Uma métrica
+  // que (corretamente) nunca é incrementada não aparece em `/metrics`, e o
+  // critério de pronto da issue — "`maia_stream_fifo_violation_total` existe e
+  // é sempre zero" — seria satisfeito por uma AUSÊNCIA, contra a qual nenhum
+  // alerta dispara nunca. É a forma mais silenciosa de um alerta falhar, e ela
+  // se parece exatamente com sucesso.
+  //
+  // Aqui, e não no import de `stream-metrics.ts`: aquele módulo é alcançado por
+  // `turn-repos.ts`, e um efeito de topo num módulo de repositório roda dentro
+  // do `import` de qualquer spec que mocke `@/lib/metrics.js` — o arquivo
+  // inteiro deixa de carregar, com um erro que não aponta para a causa.
+  registrarSeriesDeStream();
 
   // Issue #536 — the restore-drill gate. `maia_restore_drill_check_level` goes
   // to 2 when the newest drill in `restore_drills` is older than

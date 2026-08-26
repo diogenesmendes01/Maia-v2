@@ -723,6 +723,28 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #626 (fatia C da #505) — o head-of-line depende da IDENTIDADE de
+  // stream, não da máquina de estados em geral. A regra é "não existe turno
+  // anterior não terminal na MESMA stream", e ela é medida por `stream_key` +
+  // `first_ingress_seq`. Com `FEATURE_TURN_STREAM_KEY=false` esses campos ficam
+  // NULL em todo turno novo, e o predicado devolve TRUE para todos —
+  // exatamente o comportamento de antes da fatia. A flag ligada seria uma
+  // promessa que o código não cumpre, e o modo de falha é o pior possível: o
+  // operador acredita ter ligado o FIFO e a plataforma continua podendo
+  // responder M2 antes de M1, sem nenhum sinal.
+  if (bool(c.FEATURE_TURN_HEAD_OF_LINE) && !bool(c.FEATURE_TURN_STREAM_KEY)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_TURN_HEAD_OF_LINE',
+      rule: 'turn-head-of-line/requires-stream-key',
+      message:
+        'FEATURE_TURN_HEAD_OF_LINE=true com FEATURE_TURN_STREAM_KEY=false é inerte: sem stream_key e first_ingress_seq gravados não existe ordem a impor, e todo turno passa no predicado de head-of-line.',
+      remediation:
+        'Ligue FEATURE_TURN_STREAM_KEY (migrations 120/122/126 aplicadas), ou desligue FEATURE_TURN_HEAD_OF_LINE. As duas vêm ON por default — um rollback que desliga só FEATURE_TURN_STREAM_KEY cai aqui. Ver docs/runbooks/turn-state-machine.md §11.',
+    });
+  }
+
   // Issue #504 §Contrato do job — o PRODUTOR V2 depende da máquina de estados
   // pela mesma razão que o claim: sem `agent_turns` não existe `turn_id`
   // durável, e `enqueueAgent` cairia de volta no V1 em todo enfileiramento. A

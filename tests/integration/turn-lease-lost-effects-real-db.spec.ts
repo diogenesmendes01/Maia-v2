@@ -20,7 +20,7 @@
  * que forçasse `lease.markLost()` à mão provaria só que o guard lê um booleano.
  * Aqui a perda é PRODUZIDA pelo mecanismo real:
  *
- *   1. o dono legítimo reivindica com `agentTurnsRepo.tryClaimTurn` (SQL real);
+ *   1. o dono legítimo reivindica com `agentTurnsRepo.claimNextEligibleTurn` (SQL real);
  *   2. a lease vence no banco (é a única condição de takeover — ver
  *      `LEASE_TAKEOVER_STATUSES`);
  *   3. OUTRO worker reivindica de verdade, pela mesma porta;
@@ -170,7 +170,7 @@ async function claimWithLease(mensagem_id: string) {
     conversa_id: conversa.id,
     channel_id: null,
   });
-  const claimed = await agentTurnsRepo.tryClaimTurn({
+  const claimed = await agentTurnsRepo.claimNextEligibleTurn({
     turn_id: turn.id,
     worker_id: `dono-${randomUUID().slice(0, 8)}`,
     lease_ms: TTL_MS,
@@ -200,7 +200,7 @@ async function loseOwnershipForReal(
     `UPDATE agent_turns SET lease_expires_at = now() - interval '1 second' WHERE id = $1`,
     [turn_id],
   );
-  const successor = await agentTurnsRepo.tryClaimTurn({
+  const successor = await agentTurnsRepo.claimNextEligibleTurn({
     turn_id,
     worker_id: `sucessor-${randomUUID().slice(0, 8)}`,
     lease_ms: 60_000,
