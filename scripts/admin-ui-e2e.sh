@@ -33,6 +33,7 @@
 #   - sem build em src/admin-ui/.next        -> falha
 #   - sem artefato standalone / sem estático -> falha
 #   - sem DATABASE_URL / REDIS_URL           -> falha
+#   - fixtures das jornadas não semeiam      -> falha
 #   - servidor não responde no prazo         -> falha, com o log do servidor
 #   - Playwright reprova                     -> falha
 #   - Playwright executou 0 teste ou pulou   -> falha (check-playwright-run.ts)
@@ -102,6 +103,19 @@ echo "▸ montando o artefato standalone (.next/static -> $ESTATICO_DESTINO)"
 rm -rf "$ESTATICO_DESTINO"
 mkdir -p "$(dirname "$ESTATICO_DESTINO")"
 cp -R "src/admin-ui/.next/static" "$ESTATICO_DESTINO"
+
+# ─── fixtures das jornadas ─────────────────────────────────────────────────
+# Antes do servidor de propósito: se a semeadura falhar, o job reprova aqui —
+# com a mensagem do seed — em vez de reprovar dez jornadas com "elemento não
+# encontrado" e deixar a causa para quem lê o log.
+#
+# É a semeadura que torna as jornadas DETERMINÍSTICAS: ela apaga e regrava as
+# próprias linhas (por id), então toda execução começa do mesmo estado. As
+# jornadas que MUTAM restauram a sua fixture de novo antes de cada caso
+# (`tests/admin-ui/e2e/_apoio/fixtures.ts`) — sem isso a segunda TENTATIVA do
+# Playwright herdaria a mutação da primeira.
+echo "▸ semeando as fixtures das jornadas (#623)"
+npx tsx scripts/seed-admin-ui-e2e-fixtures.ts
 
 # ─── servidor ──────────────────────────────────────────────────────────────
 echo "▸ subindo o artefato standalone em http://localhost:${PORTA} (log: ${LOG_SERVIDOR})"

@@ -1,6 +1,21 @@
 /**
  * Issue #481 item 4 — contrato de CÓPIA entre as specs Playwright e o console.
  *
+ * Atualizado na #623, quando as jornadas passaram a rodar no CI. Duas
+ * mudanças, e as duas ampliam o alcance em vez de afrouxar:
+ *
+ *   1. `getByText('…')` entrou na varredura. Era o seletor de texto mais usado
+ *      pelas jornadas novas e o único que escapava — um rótulo renomeado no
+ *      console passaria por aqui sem falar nada.
+ *   2. O feno inclui `scripts/seed-admin-ui-e2e-fixtures.ts`. Parte do texto
+ *      que as jornadas procuram é DADO (o título de uma proposta semeada), não
+ *      cópia do console — e ele tem exatamente o mesmo modo de falha: renomear
+ *      a fixture sem renomear o seletor. Somar o seed ao feno mantém a
+ *      pergunta ("esta string ainda existe na fonte que a produz?") em vez de
+ *      abrir exceção caso a caso.
+ */
+/**
+ *
  * As specs de `tests/admin-ui/e2e/` foram traduzidas para pt-BR mas nunca
  * executadas: a suíte Playwright depende do dev server + fixtures e a
  * execução em CI é o #472 (parte A). Enquanto isso, um seletor que aponta
@@ -26,6 +41,8 @@ import { join, resolve, extname } from 'node:path';
 const REPO_ROOT = resolve(__dirname, '../../..');
 const E2E_DIR = join(REPO_ROOT, 'tests/admin-ui/e2e');
 const ADMIN_UI_SRC = join(REPO_ROOT, 'src/admin-ui');
+/** Fonte do texto que é DADO de fixture, não cópia do console (#623). */
+const SEED_E2E = join(REPO_ROOT, 'scripts/seed-admin-ui-e2e-fixtures.ts');
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx']);
 const SKIP_DIRS = new Set(['node_modules', '.next', 'dist', '.turbo']);
@@ -38,6 +55,14 @@ const SKIP_DIRS = new Set(['node_modules', '.next', 'dist', '.turbo']);
 const COMPOSED_AT_RUNTIME: Record<string, string> = {
   // `{proposal.approvals.length} de {proposal.required_roles.length} aprovações`
   '1 de 2 aprovações': 'src/admin-ui/app/proposals/[id]/page.tsx',
+  // `Rejeitar ${ids.length} proposta(s) em massa?`
+  'Rejeitar 3 proposta(s) em massa?':
+    'src/admin-ui/app/inbox/_components/bulk-reject-modal.tsx',
+  // `Selecionar ${p.descriptor}` — o descritor é o título da proposta semeada.
+  'Selecionar Jornada E2E — proposta simples':
+    'src/admin-ui/app/inbox/_components/inbox-table.tsx',
+  // `Selecionar todas` existe no fonte; este é o único rótulo de checkbox
+  // que NÃO é composto — fica de fora do allowlist de propósito.
 };
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {
@@ -60,6 +85,8 @@ function extractCopySelectors(source: string): string[] {
     /name:\s*['"]([^'"]+)['"]/g,
     // expect(...).toContainText('...')
     /toContainText\(\s*['"]([^'"]+)['"]/g,
+    // page.getByText('...') — o seletor mais usado pelas jornadas (#623)
+    /getByText\(\s*['"]([^'"]+)['"]/g,
   ];
   for (const re of patterns) {
     for (const m of source.matchAll(re)) {
@@ -75,9 +102,10 @@ const specFiles = readdirSync(E2E_DIR).filter((f) => f.endsWith('.spec.ts'));
 // Um único haystack: a pergunta é "esta cópia ainda existe no console?", não
 // "em qual arquivo?" — o segundo é ruído (um mesmo rótulo aparece no botão,
 // no modal e no aria-label).
-const adminUiSource = listSourceFiles(ADMIN_UI_SRC)
-  .map((f) => readFileSync(f, 'utf8'))
-  .join('\n');
+const adminUiSource = [
+  ...listSourceFiles(ADMIN_UI_SRC).map((f) => readFileSync(f, 'utf8')),
+  readFileSync(SEED_E2E, 'utf8'),
+].join('\n');
 
 describe('contrato de cópia entre specs e2e e o console (#481)', () => {
   it('encontra specs e2e para inspecionar (guarda contra o teste virar no-op)', () => {

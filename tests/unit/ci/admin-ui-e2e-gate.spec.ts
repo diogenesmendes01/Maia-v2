@@ -13,7 +13,7 @@
  *     separam, e o CI passa a construir num ambiente que a imagem de produção
  *     não tem (foi assim que o bloco do Dockerfile ficou desatualizado a ponto
  *     de o build da imagem do console estar QUEBRADO sem ninguém notar);
- *   - a quarentena `@pendente-472` cresce em silêncio até o gate medir nada;
+ *   - a quarentena (`@pendente-runtime`) cresce em silêncio até o gate medir nada;
  *   - o typecheck volta para ANTES do build, e os tipos que o `next build`
  *     GERA (`.next/types/**`, o contrato de rota do Next 16) deixam de ser
  *     checados sem que nada fique vermelho;
@@ -55,7 +55,7 @@ const TSCONFIG_ADMIN = join(REPO_ROOT, 'src/admin-ui/tsconfig.json');
 const E2E_DIR = join(REPO_ROOT, 'tests/admin-ui/e2e');
 
 /** A tag como o Playwright a vê: dentro do título de um `test.describe`. */
-const TAG_NO_DESCRIBE = /^test\.describe\(.*@pendente-472/m;
+const TAG_NO_DESCRIBE = /^test\.describe\(.*@pendente-runtime/m;
 
 const ci = readFileSync(CI_YML, 'utf8');
 const dockerfile = readFileSync(DOCKERFILE, 'utf8');
@@ -75,28 +75,22 @@ const PASSO_BUILD = 'Build do console (next build)';
 const PASSO_ARTEFATO = 'Artefato do build existe';
 const PASSO_TYPECHECK = 'Typecheck do console PÓS-BUILD (tsc --noEmit)';
 const PASSO_E2E = 'E2E do console (Playwright, projeto `smoke`)';
+const PASSO_QUARENTENA = 'Quarentena da suíte e2e (o que NÃO foi medido)';
 
 /**
- * Specs e2e que estão FORA do gate. Elas exigem sessão autenticada (o
- * `middleware.ts` redireciona toda rota protegida para /auth/signin) e
- * fixtures que `scripts/seed-proposals-fixtures.ts` não cria — ligá-las é o
- * corpo da issue #472, não este pré-requisito.
+ * Specs e2e que estão FORA do gate.
+ *
+ * Depois da #623 sobrou UMA, e por um motivo que não é sessão nem fixture: o
+ * QR e o código de pareamento são produzidos pelo worker `channel_pairing` do
+ * RUNTIME, e o job `admin-ui` sobe só o console. O cabeçalho do arquivo traz a
+ * medição (o router só grava um COMANDO em `channel_line_state`) e o critério
+ * objetivo de saída. A tag também mudou — `@pendente-472` virou
+ * `@pendente-runtime`, porque a #472 fechou e o motivo que resta é outro.
  *
  * A lista é FIXA de propósito: entrar ou sair dela tem de ser um diff que
  * alguém lê, não um efeito colateral de marcar mais um `describe`.
  */
-const QUARENTENA_472 = [
-  'architecture-lock.spec.ts',
-  'audit-log.spec.ts',
-  'channel-lines-pairing.spec.ts',
-  'drift-incidents.spec.ts',
-  'inbox.spec.ts',
-  'proposal-approval-dual.spec.ts',
-  'proposal-approval.spec.ts',
-  'proposal-rejection.spec.ts',
-  'trace-explorer.spec.ts',
-  'versions-rollback.spec.ts',
-] as const;
+const QUARENTENA = ['channel-lines-pairing.spec.ts'] as const;
 
 // ---------------------------------------------------------------------------
 // Leitura do workflow — PARSE de verdade, não reconstrução
@@ -251,6 +245,49 @@ describe('[declaração] o job `admin-ui` do CI existe e é bloqueante', () => {
       'TEST_ADMIN_UI_MIN_TESTS ausente ou <= 0: sem piso, "Running 0 tests" ' +
         'sai com código 0 e o gate fica verde sem medir nada',
     ).toBe(true);
+  });
+
+  it('o piso cobre TODOS os casos que estão fora da quarentena (#623)', () => {
+    // Um piso que não acompanha a suíte é um piso que não protege nada: com
+    // `TEST_ADMIN_UI_MIN_TESTS=5` e vinte e dois casos novos, apagar as
+    // jornadas do checkout continuaria verde. A contagem é ESTÁTICA (as
+    // chamadas `test(` das specs fora da quarentena) e a comparação é `>=`
+    // porque o piso é piso: adicionar caso não obriga a mexer no workflow,
+    // mas PERDER casos passa a reprovar.
+    const minimo = Number.parseInt(envDoPasso(PASSO_E2E).TEST_ADMIN_UI_MIN_TESTS ?? '', 10);
+    const casos = readdirSync(E2E_DIR)
+      .filter((f) => f.endsWith('.spec.ts'))
+      .filter((f) => !QUARENTENA.includes(f as never))
+      .reduce((total, f) => {
+        const fonte = readFileSync(join(E2E_DIR, f), 'utf8');
+        return total + (fonte.match(/^\s+test\(/gm) ?? []).length;
+      }, 0);
+    expect(casos, 'nenhum caso encontrado — a contagem virou no-op').toBeGreaterThan(0);
+    expect(
+      minimo,
+      `TEST_ADMIN_UI_MIN_TESTS=${minimo} não cobre os ${casos} casos fora da ` +
+        `quarentena. Se a suíte encolheu de propósito, o número no workflow ` +
+        `desce junto — num diff que alguém lê.`,
+    ).toBeGreaterThanOrEqual(casos);
+  });
+
+  it('o script SEMEIA as fixtures das jornadas antes de medir (#623)', () => {
+    // Sem semeadura as jornadas autenticadas medem telas vazias e reprovam com
+    // "elemento não encontrado" — a causa três camadas depois do efeito. O
+    // passo é parte do script, não do workflow, para valer igual na máquina de
+    // quem desenvolve.
+    expect(
+      scriptE2eExecutavel,
+      'scripts/admin-ui-e2e.sh parou de semear as fixtures das jornadas',
+    ).toContain('scripts/seed-admin-ui-e2e-fixtures.ts');
+  });
+
+  it('a quarentena que sobrou aparece no log do job', () => {
+    // O passo é de LEGIBILIDADE (continue-on-error), mas se ele procurar uma
+    // tag que não existe mais o log fica mudo justamente sobre o que não foi
+    // medido.
+    const run = passo(PASSO_QUARENTENA).run ?? '';
+    expect(run).toContain('@pendente-runtime');
   });
 
   it('nenhuma variável do job usa um namespace reservado da Maia por engano', async () => {
@@ -485,11 +522,11 @@ describe('[declaração] o env do E2E boota o console SOB O ARTEFATO STANDALONE'
   });
 });
 
-describe('[declaração] a quarentena `@pendente-472` não cresce em silêncio', () => {
+describe('[declaração] a quarentena `@pendente-runtime` não cresce em silêncio', () => {
   const arquivos = readdirSync(E2E_DIR).filter((f) => f.endsWith('.spec.ts'));
 
   it('encontra specs para inspecionar (anti-vacuidade)', () => {
-    expect(arquivos.length).toBeGreaterThan(QUARENTENA_472.length);
+    expect(arquivos.length).toBeGreaterThan(QUARENTENA.length);
   });
 
   it('a lista de arquivos em quarentena é exatamente a declarada', () => {
@@ -503,11 +540,11 @@ describe('[declaração] a quarentena `@pendente-472` não cresce em silêncio',
       marcados,
       'entrar ou sair da quarentena tem de ser um diff visível nesta lista, ' +
         'não um efeito colateral de marcar/desmarcar um describe',
-    ).toEqual([...QUARENTENA_472].sort());
+    ).toEqual([...QUARENTENA].sort());
   });
 
   it('sobra pelo menos uma spec DENTRO do gate (senão o gate não mede nada)', () => {
-    const noGate = arquivos.filter((f) => !QUARENTENA_472.includes(f as never));
+    const noGate = arquivos.filter((f) => !QUARENTENA.includes(f as never));
     expect(
       noGate,
       'toda spec e2e ficou em quarentena — o projeto `smoke` rodaria vazio',
