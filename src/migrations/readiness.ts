@@ -27,6 +27,7 @@
  */
 import { discoverMigrations } from './discover.js';
 import { describeLedger, readLedger, type LedgerClient } from './ledger.js';
+import { readInvalidIndexes } from './invalid-indexes.js';
 import {
   computeMigrationStatus,
   defaultCompatibilityManifest,
@@ -74,12 +75,16 @@ export async function getMigrationStatus(
   try {
     const shape = await describeLedger(client);
     const ledger = await readLedger(client, shape);
+    // #658: o catálogo é a única testemunha de um índice inválido — o ledger
+    // pode dizer `applied` para a migration que deveria tê-lo criado.
+    const invalidIndexes = await readInvalidIndexes(client);
     return computeMigrationStatus(artifact, ledger, {
       ledgerPresent: shape.present,
       ledgerVersion: shape.version,
       // Read-only callers do NOT hold the migration lock, so a `running` row
       // stays ambiguous (in-flight or crashed) and blocks either way.
       lockHeld: false,
+      invalidIndexes,
     });
   } finally {
     client.release();
@@ -105,10 +110,14 @@ export async function getSchemaReadiness(
     try {
       const shape = await describeLedger(client);
       const ledger = await readLedger(client, shape);
+      // #658: um índice `indisvalid = false` é um blocker de schema tão real
+      // quanto um `dirty`, e nenhuma linha do ledger o revela.
+      const invalidIndexes = await readInvalidIndexes(client);
       const status = computeMigrationStatus(artifact, ledger, {
         ledgerPresent: shape.present,
         ledgerVersion: shape.version,
         lockHeld: false,
+        invalidIndexes,
       });
       return evaluateSchemaReadiness(status, manifest, now ? { now } : {});
     } finally {

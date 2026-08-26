@@ -3,7 +3,8 @@
 import * as React from 'react';
 import { trpc } from '../../../trpc/client.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
-import { Badge, StatusBadge } from '../../../components/ui/badge.js';
+import { Badge } from '../../../components/ui/badge.js';
+import { Button } from '../../../components/ui/button.js';
 import {
   Alert,
   EmptyState,
@@ -13,81 +14,179 @@ import {
 import { IconWrench } from '../../../components/ui/icons.js';
 
 /**
- * Pedidos de ferramenta (issue #471 — v1, fatia de console).
+ * Pedidos de ferramenta — a TRIAGEM do dono (issue #638, fatia C da épica #471).
  *
- * O agente já registra lacunas `tipo='tool'` em agent_capability_gaps
- * (aquisição dialógica, escalação silent→dashboard→mentionable→proposed,
- * frequency_score como contador de recorrência). Esta visão transforma
- * essas lacunas em backlog acionável: o owner triagia e gera uma issue de
- * GitHub pré-preenchida — com contexto, frequência e o esqueleto do
- * contrato Zod — para o time de desenvolvimento.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * O QUE MUDOU EM RELAÇÃO À v1 (#476), E POR QUÊ
+ * ─────────────────────────────────────────────────────────────────────────────
+ * A v1 desta tela lia `agent_capability_gaps` cru e montava, NO NAVEGADOR, o
+ * `title`, o `body` e o esqueleto do contrato Zod de uma issue — depois abria
+ * `github.com/.../issues/new?...` num link. Três consequências, todas ruins:
  *
- * Guardrail (spec da visão §2.2): o agente ESPECIFICA; humano implementa e
- * instala. O fechamento automático do ciclo (aceite → issue via API → gap
- * fecha quando a tool é registrada) é a v2 da issue #471.
+ *   · o console DUPLICAVA lógica de backend (o nome da tool era derivado por um
+ *     `slugify` próprio, que não é o `esbocarNomeDeTool` que a fatia A usa para
+ *     de fato nomear o pedido — dois nomes para a mesma coisa);
+ *   · não havia idempotência nenhuma: dois cliques abriam duas abas de "nova
+ *     issue", e nada no sistema sabia que o pedido tinha sido aceito;
+ *   · o pedido mostrado era o GAP, não o PEDIDO AGRUPADO — cinco lacunas
+ *     parecidas apareciam como cinco itens de duas ocorrências, em vez de um de
+ *     dez, que é justamente o que a fatia B existe para corrigir.
+ *
+ * Esta versão lê `toolRequests.list`: agregado, contador, estado do contrato e
+ * estado do aceite vêm PRONTOS do backend. Nada aqui recalcula similaridade,
+ * re-deriva rascunho de contrato ou monta corpo de issue.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * O GUARDRAIL, NA TELA
+ * ─────────────────────────────────────────────────────────────────────────────
+ * **O agente especifica; humano implementa e instala.** Não existe botão
+ * "aprovar e instalar", e não pode passar a existir. "Aceitar" abre UMA issue —
+ * duas vezes o mesmo pedido não abre duas — e nada mais: nenhuma tool é
+ * registrada, nenhuma capability é concedida. O gap fecha sozinho, mais tarde,
+ * quando o backend constatar que a ferramenta existe E está concedida a este
+ * agente. Não há caixinha aqui que feche gap nenhum.
  */
 
-// Repositório alvo das issues geradas. Constante deliberada: o console é
-// single-repo hoje; quando houver multi-repo, isto vira configuração.
-const GITHUB_NEW_ISSUE_URL = 'https://github.com/diogenesmendes01/Maia-v2/issues/new';
-
-const LEVEL_ORDER: Record<string, number> = {
-  proposed: 0,
-  mentionable: 1,
-  dashboard: 2,
-  silent: 3,
+/** Rótulos do estado da fusão. O estado vem do backend; aqui só se traduz. */
+const CONTRATO_ROTULO: Record<string, { texto: string; tom: 'neutral' | 'warning' | 'success' }> = {
+  single: { texto: 'contrato de um pedido', tom: 'neutral' },
+  consistent: { texto: 'contratos compatíveis (união)', tom: 'success' },
+  divergent: { texto: 'contratos em conflito', tom: 'warning' },
 };
 
-function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 40);
+function EstadoDoAceite({
+  aceite,
+}: {
+  aceite: {
+    status: string;
+    issue_number: number | null;
+    issue_url: string | null;
+    repo_slug: string;
+    adopted: boolean;
+    last_error: string | null;
+    attempts: number;
+  };
+}) {
+  if (aceite.status === 'created' && aceite.issue_number !== null) {
+    return (
+      <span className="flex flex-wrap items-center gap-1.5">
+        <Badge tone="success">issue #{aceite.issue_number}</Badge>
+        {aceite.adopted ? (
+          // "Readotada" é um fato distinto de "criada agora": o relayer
+          // reconheceu, pelo marcador, uma issue que ele já tinha aberto antes
+          // de um crash. Esconder a distinção apagaria a única pista de que a
+          // janela de crash foi exercitada.
+          <Badge tone="neutral">readotada</Badge>
+        ) : null}
+        {aceite.issue_url ? (
+          <a
+            className="text-xs font-medium text-brand-700 underline"
+            href={aceite.issue_url}
+            target="_blank"
+            rel="noreferrer"
+          >
+            abrir no GitHub
+          </a>
+        ) : null}
+      </span>
+    );
+  }
+  if (aceite.status === 'failed') {
+    return (
+      <span className="flex flex-wrap items-center gap-1.5">
+        <Badge tone="danger">falha ao abrir a issue</Badge>
+        <span className="text-xs text-zinc-500">{aceite.last_error ?? 'sem detalhe'}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="flex flex-wrap items-center gap-1.5">
+      <Badge tone="warning">aceito — issue em fila</Badge>
+      <span className="text-xs text-zinc-500">
+        o runtime abre em {aceite.repo_slug}
+        {aceite.attempts > 0 ? ` (${aceite.attempts} tentativa(s))` : ''}
+      </span>
+    </span>
+  );
 }
 
-function buildIssueUrl(gap: {
-  capability_description: string;
-  contexto: string | null;
-  frequency_score: number;
-  severity_score: number;
-  agent_id?: string;
-}): string {
-  const toolName = slugify(gap.capability_description) || 'nova_ferramenta';
-  const title = `feat(tools): ${gap.capability_description.slice(0, 80)} (pedido do agente)`;
-  const body = [
-    '## Pedido de ferramenta (originado pelo agente)',
-    '',
-    `**Capacidade que faltou:** ${gap.capability_description}`,
-    `**Frequência observada:** ${gap.frequency_score}x · severidade ${gap.severity_score}`,
-    gap.contexto ? `**Contexto registrado:** ${gap.contexto}` : '',
-    '',
-    '## Esqueleto do contrato (preencher na implementação)',
-    '',
-    '```ts',
-    `export const ${toolName}Tool: Tool<typeof inputSchema, typeof outputSchema> = {`,
-    `  name: '${toolName}',`,
-    `  // TODO: inputSchema/outputSchema Zod; classe de risco; idempotência;`,
-    `  // pack de destino (grant-math.ts) — nunca baseline.`,
-    `  handler: async (args) => { /* ... */ },`,
-    '};',
-    '```',
-    '',
-    '## Checklist de governança',
-    '',
-    '- [ ] Contrato Zod + chave de idempotência',
-    '- [ ] Classe de risco definida (capability-risk)',
-    '- [ ] Adicionada a um pack de domínio (não à baseline)',
-    '- [ ] Registrada no tool registry + testes',
-    '',
-    '_Gerado pela visão "Pedidos de ferramenta" do console (issue #471 v1)._',
-  ]
-    .filter((l) => l !== '')
-    .join('\n');
-  const params = new URLSearchParams({ title, body, labels: 'enhancement,tools' });
-  return `${GITHUB_NEW_ISSUE_URL}?${params.toString()}`;
+/**
+ * A EVIDÊNCIA de um pedido, sob demanda: os membros ativos com a intenção que
+ * cada um registrou, e a ação de triagem REVERSÍVEL (desagrupar).
+ *
+ * O texto das situações mora aqui e NÃO no corpo da issue: esta tela está atrás
+ * de autenticação, uma issue pode ser pública.
+ *
+ * Desagrupar não apaga nada — `detached_at` + motivo + autor, e o `original_spec`
+ * do membro continua legível. O REPRESENTANTE não pode ser destacado (ele ancora
+ * o agregado), e o backend recusa com erro explícito em vez de um clique sem
+ * efeito.
+ */
+function Evidencia({
+  tenantId,
+  agentId,
+  aggregateId,
+}: {
+  tenantId: string;
+  agentId: string;
+  aggregateId: string;
+}) {
+  const utils = trpc.useUtils();
+  const detalhe = trpc.toolRequests.detail.useQuery({ tenantId, agentId, aggregateId });
+  const [erro, setErro] = React.useState<string | null>(null);
+  const desagrupar = trpc.toolRequests.desagrupar.useMutation({
+    onSuccess: async () => {
+      setErro(null);
+      await utils.toolRequests.list.invalidate();
+      await utils.toolRequests.detail.invalidate({ tenantId, agentId, aggregateId });
+    },
+    onError: (e) => setErro(e.message),
+  });
+
+  if (detalhe.isLoading) return <LoadingState label="Carregando evidência…" />;
+  if (detalhe.error) return <ErrorState message={detalhe.error.message} />;
+
+  return (
+    <div className="space-y-2 border-t border-zinc-200 pt-3">
+      {erro ? <Alert tone="danger">{erro}</Alert> : null}
+      <ul className="space-y-1.5">
+        {(detalhe.data?.membros ?? []).map((m) => (
+          <li key={m.member_id} className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs text-zinc-700">
+              {m.is_representative ? <Badge tone="brand">representante</Badge> : null}{' '}
+              {m.intent} · {m.occurrences} ocorrência(s) · similaridade {m.similaridade}
+            </span>
+            {m.is_representative ? null : (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  desagrupar.mutate({
+                    tenantId,
+                    agentId,
+                    memberId: m.member_id,
+                    motivo: 'triagem: pedidos diferentes apesar da redação parecida',
+                  })
+                }
+              >
+                Desagrupar
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {(detalhe.data?.avisos ?? []).map((a) => (
+        <p key={a.tool_name} className="text-xs text-emerald-700">
+          {/* `String(...)` e não `new Date(...)`: o tipo do router diz `Date`, mas
+              o que chega pelo transporte tRPC é a string ISO — e o construtor
+              de `Date` não aceita `Date` na tipagem padrão. */}
+          O agente foi avisado em {new Date(String(a.notified_at)).toLocaleString('pt-BR')} de que{' '}
+          <code>{a.tool_name}</code> passou a existir — a lacuna fechou porque a ferramenta
+          está registrada <strong>e</strong> concedida a este agente.
+        </p>
+      ))}
+    </div>
+  );
 }
 
 export default function ToolRequests({
@@ -97,76 +196,144 @@ export default function ToolRequests({
   tenantId: string;
   agentId: string;
 }) {
-  const gapsQuery = trpc.capabilities.listGaps.useQuery(
-    {
-      tenantId,
-      agentId,
-      levels: ['silent', 'dashboard', 'mentionable', 'proposed'],
-    },
+  const utils = trpc.useUtils();
+  const query = trpc.toolRequests.list.useQuery(
+    { tenantId, agentId },
     { enabled: tenantId !== '' && agentId !== '' },
   );
+  const [erroDoAceite, setErroDoAceite] = React.useState<string | null>(null);
+  const [emVoo, setEmVoo] = React.useState<string | null>(null);
+  const [aberto, setAberto] = React.useState<string | null>(null);
 
-  if (gapsQuery.isLoading) return <LoadingState label="Carregando pedidos…" />;
-  if (gapsQuery.error)
-    return (
-      <ErrorState
-        message={gapsQuery.error.message}
-        onRetry={() => void gapsQuery.refetch()}
-      />
-    );
+  const aceitar = trpc.toolRequests.aceitar.useMutation({
+    onSuccess: async () => {
+      setErroDoAceite(null);
+      await utils.toolRequests.list.invalidate();
+    },
+    onError: (e) => setErroDoAceite(e.message),
+    onSettled: () => setEmVoo(null),
+  });
 
-  const toolGaps = (gapsQuery.data?.items ?? [])
-    .filter((g) => g.tipo === 'tool')
-    .sort(
-      (a, b) =>
-        b.frequency_score - a.frequency_score ||
-        (LEVEL_ORDER[a.current_level] ?? 9) - (LEVEL_ORDER[b.current_level] ?? 9),
-    );
+  if (query.isLoading) return <LoadingState label="Carregando pedidos…" />;
+  if (query.error)
+    return <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />;
+
+  const items = query.data?.items ?? [];
+  const repoSlug = query.data?.repo_slug ?? null;
 
   return (
     <div className="space-y-4">
       <Alert tone="info">
-        Quando o agente percebe que precisaria de uma ferramenta que não existe,
-        a lacuna fica registrada aqui com a frequência de recorrência. Triagie e{' '}
-        <strong>gere a issue</strong> para o time de desenvolvimento — o agente
-        especifica, humanos implementam e instalam (toda tool nova passa por
-        contrato Zod, classe de risco e revisão).
+        Quando o agente esbarra numa ferramenta que <strong>não existe</strong>, o
+        pedido chega aqui — já agrupado com os pedidos parecidos e com o contador
+        de demanda que o backend calculou. <strong>Aceitar</strong> abre uma issue
+        para o time de desenvolvimento e <strong>nada mais</strong>: nenhuma tool é
+        registrada, nenhuma capability é concedida. O agente especifica; humanos
+        implementam e instalam. A lacuna fecha sozinha quando a ferramenta
+        realmente existir e estiver concedida a este agente — e o agente é avisado.
       </Alert>
 
-      {toolGaps.length === 0 ? (
+      {repoSlug === null ? (
+        <Alert tone="warning">
+          <code>MAIA_TOOL_REQUEST_ISSUE_REPO</code> não está configurado. Sem
+          destino explícito nenhuma issue é aberta — efeito externo não tem
+          destino implícito.
+        </Alert>
+      ) : null}
+
+      {erroDoAceite ? <Alert tone="danger">{erroDoAceite}</Alert> : null}
+
+      {items.length === 0 ? (
         <EmptyState
           icon={<IconWrench size={32} />}
           title="Nenhum pedido de ferramenta"
-          description="O agente ainda não registrou lacunas do tipo 'tool'. Elas aparecem aqui conforme ele esbarra em limites durante conversas reais."
+          description="O agente ainda não pediu uma ferramenta que não existe. Os pedidos aparecem aqui conforme ele esbarra em limites durante conversas reais."
         />
       ) : (
         <div className="grid gap-3 lg:grid-cols-2">
-          {toolGaps.map((gap) => (
-            <Card key={gap.id}>
-              <CardHeader
-                title={gap.capability_description}
-                description={gap.contexto ?? undefined}
-                actions={<StatusBadge status={gap.current_level} />}
-              />
-              <CardBody className="flex flex-wrap items-center justify-between gap-3">
-                <span className="flex items-center gap-1.5">
-                  <Badge tone={gap.frequency_score >= 5 ? 'warning' : 'neutral'}>
-                    {gap.frequency_score}x observado
-                  </Badge>
-                  <Badge tone="neutral">severidade {gap.severity_score}</Badge>
-                </span>
-                <a
-                  href={buildIssueUrl(gap)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-brand-600 px-3 text-xs font-medium text-white shadow-sm transition-colors hover:bg-brand-700"
-                >
-                  <IconWrench size={13} />
-                  Gerar issue no GitHub
-                </a>
-              </CardBody>
-            </Card>
-          ))}
+          {items.map((item) => {
+            const contrato = CONTRATO_ROTULO[item.contract_state] ?? {
+              texto: item.contract_state,
+              tom: 'neutral' as const,
+            };
+            const jaAceito = item.aceite !== null;
+            return (
+              <Card key={item.aggregate_id}>
+                <CardHeader
+                  title={item.proposed_tool_name}
+                  description={`nome proposto pelo agente · agrupamento ${item.metrica} @ ${item.limiar} (assinatura v${item.assinatura_version})`}
+                  actions={<Badge tone={contrato.tom}>{contrato.texto}</Badge>}
+                />
+                <CardBody className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {/* O CONTADOR vem do backend (`member_count` /
+                        `total_occurrences`, recalculados a partir dos membros
+                        ativos). O front não soma nada. */}
+                    <Badge tone={item.member_count >= 3 ? 'warning' : 'neutral'}>
+                      {item.member_count} pedido(s) agrupado(s)
+                    </Badge>
+                    <Badge tone="neutral">{item.total_occurrences} ocorrência(s)</Badge>
+                    {item.nomes_propostos.length > 1 ? (
+                      <Badge tone="neutral">
+                        {item.nomes_propostos.length} nomes propostos
+                      </Badge>
+                    ) : null}
+                  </div>
+
+                  {item.contract_state === 'divergent' ? (
+                    <p className="text-xs text-zinc-600">
+                      Os pedidos agrupados discordam sobre o contrato. Nenhum
+                      rascunho venceu e <strong>não há contrato fundido</strong> —
+                      os conflitos vão nomeados no corpo da issue, e a decisão é
+                      do dev.
+                    </p>
+                  ) : null}
+
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-brand-700 underline"
+                      onClick={() =>
+                        setAberto(aberto === item.aggregate_id ? null : item.aggregate_id)
+                      }
+                    >
+                      {aberto === item.aggregate_id ? 'Ocultar evidência' : 'Ver evidência'}
+                    </button>
+                    {jaAceito ? (
+                      <EstadoDoAceite aceite={item.aceite!} />
+                    ) : (
+                      <span className="text-xs text-zinc-500">ainda não triado</span>
+                    )}
+                    <Button
+                      size="sm"
+                      variant={jaAceito ? 'secondary' : 'primary'}
+                      disabled={jaAceito || repoSlug === null}
+                      loading={emVoo === item.aggregate_id}
+                      onClick={() => {
+                        setEmVoo(item.aggregate_id);
+                        aceitar.mutate({
+                          tenantId,
+                          agentId,
+                          aggregateId: item.aggregate_id,
+                        });
+                      }}
+                    >
+                      <IconWrench size={13} />
+                      {jaAceito ? 'Já aceito' : 'Aceitar e abrir issue'}
+                    </Button>
+                  </div>
+
+                  {aberto === item.aggregate_id ? (
+                    <Evidencia
+                      tenantId={tenantId}
+                      agentId={agentId}
+                      aggregateId={item.aggregate_id}
+                    />
+                  ) : null}
+                </CardBody>
+              </Card>
+            );
+          })}
         </div>
       )}
     </div>

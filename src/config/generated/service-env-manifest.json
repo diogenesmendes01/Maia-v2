@@ -817,6 +817,27 @@
           "restartRequired": true
         },
         {
+          "name": "FEATURE_TURN_HEAD_OF_LINE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STREAM_PROMOTION",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
+          "name": "FEATURE_TURN_STREAM_DEBOUNCE",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "FEATURE_STRICT_TOOL_SCHEMAS",
           "secret": false,
           "required": false,
@@ -1189,6 +1210,20 @@
           "restartRequired": true
         },
         {
+          "name": "TURN_POISON_BLOCK_CATEGORIES",
+          "secret": false,
+          "required": false,
+          "group": "governance",
+          "restartRequired": true
+        },
+        {
+          "name": "TURN_STREAM_STARVATION_AFTER_MS",
+          "secret": false,
+          "required": false,
+          "group": "performance",
+          "restartRequired": true
+        },
+        {
           "name": "TURN_CONTEXT_CACHE_TTL_MS",
           "secret": false,
           "required": false,
@@ -1299,6 +1334,21 @@
           "required": false,
           "group": "setup",
           "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_GITHUB_TOKEN",
+          "secret": true,
+          "required": false,
+          "group": "tool-requests",
+          "restartRequired": true,
+          "requiredWhen": "MAIA_TOOL_REQUEST_ISSUE_REPO está definida"
         }
       ],
       "secrets": [
@@ -1320,7 +1370,8 @@
         "RUNTIME_TRACE_HMAC_MASTER_SECRET",
         "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
         "RUNTIME_TRACE_DEBUG_AES_KEY",
-        "SETUP_TOKEN_OVERRIDE"
+        "SETUP_TOKEN_OVERRIDE",
+        "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
       ],
       "by_profile": {
         "development": {
@@ -1441,6 +1492,9 @@
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
@@ -1494,6 +1548,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1509,7 +1565,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "staging": {
@@ -1631,6 +1689,9 @@
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
@@ -1683,6 +1744,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1698,7 +1761,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         },
         "production": {
@@ -1820,6 +1885,9 @@
             "FEATURE_PROCEDURE_RUNTIME",
             "FEATURE_TURN_STATE_MACHINE",
             "FEATURE_TURN_STREAM_KEY",
+            "FEATURE_TURN_HEAD_OF_LINE",
+            "FEATURE_TURN_STREAM_PROMOTION",
+            "FEATURE_TURN_STREAM_DEBOUNCE",
             "FEATURE_STRICT_TOOL_SCHEMAS",
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
@@ -1872,6 +1940,8 @@
             "FEATURE_TURN_CONTEXT_CACHE",
             "TURN_LEASE_TTL_MS",
             "TURN_LEASE_HEARTBEAT_MS",
+            "TURN_POISON_BLOCK_CATEGORIES",
+            "TURN_STREAM_STARVATION_AFTER_MS",
             "TURN_CONTEXT_CACHE_TTL_MS",
             "TURN_CONTEXT_CACHE_NEGATIVE_TTL_MS",
             "TURN_CONTEXT_CACHE_MAX_ENTRIES",
@@ -1887,7 +1957,9 @@
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
-            "SETUP_TOKEN_OVERRIDE"
+            "SETUP_TOKEN_OVERRIDE",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
+            "MAIA_TOOL_REQUEST_GITHUB_TOKEN"
           ]
         }
       }
@@ -1976,6 +2048,13 @@
           "secret": true,
           "required": false,
           "group": "runtime-trace",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_TOOL_REQUEST_ISSUE_REPO",
+          "secret": false,
+          "required": false,
+          "group": "tool-requests",
           "restartRequired": true
         },
         {
@@ -2110,6 +2189,7 @@
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_MASTER_SECRET",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "NEXTAUTH_SECRET",
@@ -2148,6 +2228,7 @@
             "FEATURE_PDF_REPORTS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",
@@ -2181,6 +2262,7 @@
             "FEATURE_PDF_REPORTS",
             "RUNTIME_TRACE_HMAC_KEY_VERSION",
             "RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS",
+            "MAIA_TOOL_REQUEST_ISSUE_REPO",
             "ADMIN_UI_PORT",
             "NEXTAUTH_URL",
             "AUTH_TRUST_HOST",

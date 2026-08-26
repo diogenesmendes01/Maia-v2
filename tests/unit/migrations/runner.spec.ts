@@ -23,6 +23,7 @@ import {
   repairMigration,
   repairAppliedRefusal,
   terminalLedgerStatusFor,
+  INVALID_INDEX_ERROR_CODE,
   RUNNER_VERSION,
 } from '@/migrations/runner.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
@@ -317,6 +318,83 @@ describe('runMigrations — fail-closed gates', () => {
     expect(result.outcome).toBe('lock_unavailable');
     expect(db.executedSql).toEqual([]);
     expect(events.map((e) => e.event)).toContain('migration.lock_unavailable');
+  });
+});
+
+/**
+ * Issue #658 — a ORDEM DAS OPERAÇÕES da invariante "nenhum índice inválido no
+ * escopo". O que estes casos provam é que o runner CONSULTA o catálogo nos dois
+ * pontos certos e recusa quando a resposta não é vazia.
+ *
+ * O que eles NÃO provam, e não podem: que um `CREATE UNIQUE INDEX CONCURRENTLY`
+ * que reprova realmente deixa `indisvalid = false` para trás, e que o
+ * `IF NOT EXISTS` seguinte devolve sucesso sobre ele. Isso é comportamento do
+ * Postgres, e um fake que o simulasse não provaria nada — está em
+ * `tests/integration/migrations-runner-real-db.spec.ts`, contra o servidor.
+ */
+describe('runMigrations — índice inválido (#658)', () => {
+  const INVALID = {
+    schema: 'public',
+    index: 'a_id_uq',
+    table: 'a',
+    ready: false,
+    live: true,
+  } as const;
+
+  it('recusa ANTES de qualquer DDL quando o escopo já carrega um índice inválido', async () => {
+    await write('001_a.sql', TX_A);
+    const events: { event: string; detail: Record<string, unknown> }[] = [];
+    const db = new FakeDb({ invalidIndexes: [INVALID] });
+
+    const result = await runMigrations(deps(db, events));
+
+    expect(result.outcome).toBe('blocked');
+    // Primeiro na lista: quando coexiste com outros blockers, é a causa.
+    expect(result.blockers[0]!.kind).toBe('invalid_index');
+    expect(result.blockers[0]!.detail).toContain('public.a_id_uq');
+    // Nada foi executado, e nada foi escrito no ledger.
+    expect(db.executedSql).toEqual([]);
+    expect(db.ledger.size).toBe(0);
+    expect(events.map((e) => e.event)).toContain('migration.invalid_index');
+    expect(db.unlocks).toBe(1);
+  });
+
+  it('recusa marcar `applied` quando o índice fica inválido DURANTE a migration', async () => {
+    await write('001_a.sql', TX_A);
+    await write('002_idx.sql', NO_TX);
+    // A DDL da 002 roda; no meio dela o catálogo passa a carregar um índice
+    // inválido (um operador rodando DDL concorrente à mão numa sessão
+    // paralela). O pré-voo já passou — só a reasserção enxerga isso.
+    const db = new FakeDb({
+      failOnSql: (sql) => {
+        if (sql.includes('i2')) db.invalidIndexes = [INVALID];
+      },
+    });
+
+    const result = await runMigrations(deps(db));
+
+    expect(result.outcome).toBe('failed');
+    expect(result.failure).toEqual({
+      id: '002_idx.sql',
+      error_class: INVALID_INDEX_ERROR_CODE,
+      ledger_status: 'dirty',
+    });
+    // A 001, que rodou ANTES do índice existir, permanece aplicada.
+    expect(db.ledger.get('001_a.sql')!.status).toBe('applied');
+    // A 002 NÃO foi certificada, apesar de nenhuma statement ter levantado.
+    expect(db.ledger.get('002_idx.sql')!.status).toBe('dirty');
+    expect(db.ledger.get('002_idx.sql')!.error_class).toBe(INVALID_INDEX_ERROR_CODE);
+    expect(db.ledger.get('002_idx.sql')!.applied_at).toBeNull();
+    expect(result.blockers[0]!.kind).toBe('invalid_index');
+  });
+
+  it('consulta o catálogo mesmo no caminho feliz — a reasserção não é opcional', async () => {
+    await write('001_idx.sql', NO_TX);
+    const db = new FakeDb();
+    const result = await runMigrations(deps(db));
+    expect(result.outcome).toBe('applied');
+    // Uma no pré-voo, uma antes de `applied`, uma no `status` final.
+    expect(db.invalidIndexReads).toBeGreaterThanOrEqual(2);
   });
 });
 

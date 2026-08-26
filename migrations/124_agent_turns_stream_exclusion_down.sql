@@ -1,0 +1,49 @@
+-- maia:no-transaction
+-- Rollback da 124 (issue #625, fatia B da #505).
+--
+-- ─── ESTE É O ROLLBACK DA FATIA INTEIRA ───────────────────────────────────
+--
+-- A issue-mãe escolheu esta fatia justamente porque o rollback dela é barato:
+-- "Se a coorte apresentar problema, o rollback é derrubar um índice, não
+-- reverter o escalonador." Este arquivo é essa frase.
+--
+-- Derrubar o índice desliga a metade ESTRUTURAL da exclusão. A metade
+-- TEMPORAL — a recuperação de claims expirados dentro da transação de claim —
+-- continua rodando, e continua sendo correta sem o índice: ela apenas devolve à
+-- fila turnos cuja lease venceu, que é o que o recovery já fazia antes desta
+-- fatia. Nenhuma linha muda de estado por causa deste DROP, nenhum turno é
+-- perdido, e o claim volta ao comportamento de #504 (exclusão por TURNO, não
+-- por stream) na primeira tentativa após o DROP.
+--
+-- Ordem obrigatória no rollback COMPLETO do protocolo de stream: a 124 cai
+-- ANTES da 122, e a 122 antes da 120 — cada uma depende dos objetos da
+-- anterior. A 124 sozinha, porém, é independente: ela pode ser derrubada e
+-- reaplicada sem tocar nas outras duas, e é isso que a torna o kill switch.
+--
+-- ─── POR QUE NÃO HÁ ENVELOPE `BEGIN`/`COMMIT` ─────────────────────────────
+--
+-- A regra geral do repositório é que todo `_down` traga o envelope, porque o
+-- runner aplica com `psql -v ON_ERROR_STOP=1 -f`, que é autocommit por
+-- statement — um arquivo sem envelope pode parar no meio e deixar o schema
+-- pela metade. Aqui o envelope é IMPOSSÍVEL: `DROP INDEX CONCURRENTLY` é
+-- recusado pelo PostgreSQL dentro de um bloco de transação.
+--
+-- Trocar por um `DROP INDEX` simples para poder envelopar seria pior, e a
+-- troca é exatamente a que o `_down` da 122 recusa pela mesma razão: o DROP
+-- comum toma `ACCESS EXCLUSIVE` sobre `agent_turns` e bloqueia claim, transição
+-- e conclusão enquanto dura. Um rollback é, por definição, o pior momento para
+-- bloquear o runtime.
+--
+-- O que compensa a falta do envelope: este arquivo tem UM único statement, e
+-- ele é idempotente (`IF EXISTS`). Não existe estado intermediário — ou o
+-- índice caiu, ou não caiu. Reexecutar é seguro e é o remédio.
+--
+-- NOTA OPERACIONAL: um `DROP INDEX CONCURRENTLY` cancelado no meio deixa o
+-- índice em estado INVÁLIDO (`pg_index.indisvalid = false`). Ele para de ser
+-- usado em leitura mas continua sendo mantido na escrita, e não some sozinho.
+-- Reexecutar este arquivo o remove. Ver docs/runbooks/turn-state-machine.md
+-- §10.4.
+--
+-- Nunca rodar automaticamente durante incidente — ver docs/runbooks/migrations.md.
+
+DROP INDEX CONCURRENTLY IF EXISTS agent_turns_stream_active_uq;
