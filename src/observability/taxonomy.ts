@@ -1287,6 +1287,15 @@ export const ONBOARDING_REASONS: readonly string[] = Object.freeze([
   'readiness_blocked',
   'activation_precondition_failed',
   'kind_not_implemented',
+  // bootstrap global (#519) — todos fail-closed; entram aqui porque o guard
+  // `metrics-taxonomy.spec.ts` exige espelho EXATO de ONBOARDING_ERROR_CODES.
+  'bootstrap_already_completed',
+  'bootstrap_not_allowed',
+  'bootstrap_credential_exists',
+  'bootstrap_credential_invalid',
+  'bootstrap_credential_expired',
+  'bootstrap_credential_consumed',
+  'bootstrap_locked_out',
   'internal_error',
   // recusas da fila de comandos de #518
   'pairing_in_progress',
