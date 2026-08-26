@@ -29,7 +29,7 @@ import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
-import type { LeaseLossReason } from './claim.js';
+import type { LeaseLossReason, StreamBlockRecord } from './claim.js';
 import {
   COMPLETED_WITHOUT_REPLY_OUTCOMES,
   sanitizeTurnError,
@@ -42,6 +42,33 @@ import {
   turnClaimEnabled,
   type TurnLease,
 } from './lease.js';
+
+// #626 — a fachada reexporta o relator de violação de FIFO porque quem o chama
+// não é só o claim: o varredor de recovery (`src/workers/message-recovery.ts`)
+// tem um canário próprio, e a regra da fachada é "importe sempre de
+// `@/runtime/turns/index.js`".
+export { reportStreamFifoViolation } from './lease.js';
+// #627 (fatia D da #505) — o SINAL da promoção. Módulo à parte porque ele é
+// quem alcança a BullMQ (por `await import`, para não arrastar a conexão Redis
+// de `@/gateway/queue.js` para dentro de todo processo que carrega a máquina de
+// estados); ver o cabeçalho de `stream-promotion.ts`.
+import {
+  noteNoSuccessor,
+  reportPromotionFenceRejected,
+  signalStreamPromotion,
+} from './stream-promotion.js';
+// #629 (fatia F da #505) — a POLÍTICA de poison/DLQ. Módulo PURO: a decisão
+// ("bloquear ou liberar") é uma função de (código, outcome, conjunto
+// configurado), e o conjunto entra como parâmetro. Quem LÊ a configuração é
+// esta fachada, porque é aqui que `@/config/env.js` já mora — o repositório,
+// que EXECUTA o bloqueio, continua sem alcançá-lo (#596).
+import {
+  classifyPoison,
+  parsePoisonBlockCategories,
+  poisonDisposition,
+  type PoisonCategory,
+} from './poison-policy.js';
+import { recordPoisonDecision } from './stream-metrics.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -352,6 +379,40 @@ export type TurnExecutionStart =
   | { started: true }
   /** Outro worker tem a posse (ou o turno não está elegível). NÃO é erro. */
   | { started: false; reason: 'not_claimed' }
+  /**
+   * #625 — a STREAM está ocupada por outro turno ativo. O banco recusou o
+   * segundo claim.
+   *
+   * Separado de `not_claimed` porque o diagnóstico é outro: `not_claimed` diz
+   * "este turno não é meu", `stream_busy` diz "esta CONVERSA está ocupada".
+   * Colapsar os dois apagaria justamente o sinal que a issue-mãe manda vigiar
+   * durante o rollout — uma stream que serializa aparece como `stream_busy` em
+   * massa, e como nada em particular se o motivo virasse `not_claimed`.
+   */
+  | { started: false; reason: 'stream_busy' }
+  /**
+   * #626 — a conversa tem FILA: existe turno anterior não terminal na mesma
+   * stream. Distinto de `stream_busy` (a conversa está OCUPADA por um turno com
+   * lease viva) e de `not_claimed` (o TURNO não está elegível) — as três param
+   * a execução, e só a leitura difere: `not_head` é normal e some quando o
+   * anterior avança.
+   */
+  | { started: false; reason: 'not_head' }
+  /**
+   * #626 — o turno anterior está em `outbound_pending` e NENHUM claim o move.
+   * Quem destrava é o delivery worker do outbox (#506); esperar não resolve, e
+   * é por isso que ele não é `not_head`.
+   */
+  | { started: false; reason: 'stream_blocked' }
+  /**
+   * #629 — a CONVERSA está interditada por política de poison, e nenhum
+   * mecanismo automático a destrava: nem o varredor, nem a promoção, nem o
+   * tempo. Só `npm run dlq -- unblock`, que é operação auditada.
+   *
+   * É a recusa que mais precisa de nome próprio: `not_head` e `stream_busy`
+   * somem sozinhos quando o head anda, e esta não some nunca sem um humano.
+   */
+  | { started: false; reason: 'stream_poisoned' }
   /** Perdemos a posse entre o claim e o `running`. */
   | { started: false; reason: 'stale_claim' }
   /** O estado andou por baixo de nós — alguém concluiu, absorveu ou matou o turno. */
@@ -362,7 +423,7 @@ export type TurnExecutionStart =
  *
  * Dois regimes, escolhidos por `FEATURE_TURN_CLAIM`:
  *
- * **ON (#504).** `tryClaimTurn` é a autoridade: uma declaração SQL atômica
+ * **ON (#504).** `claimNextEligibleTurn` é a autoridade: uma declaração SQL atômica
  * decide o dono, incrementa a tentativa canônica, gera o `claim_token` e abre a
  * lease. `started: false` significa **não processe** — e é a primeira vez nesta
  * máquina de estados em que um "não" aqui de fato barra a execução. Note que o
@@ -453,7 +514,26 @@ async function beginClaimedExecution(
     logger.error({ turn_id: handle.turn_id, error_code: code }, 'turn.claim_failed');
     return { started: false, reason: 'not_claimed' };
   }
-  if (!acquired.lease) return { started: false, reason: 'not_claimed' };
+  if (!acquired.lease) {
+    // As recusas por STREAM chegam ao caller com o nome delas. Colapsá-las em
+    // `not_claimed` apagaria, no log de `src/agent/core.ts`, a diferença entre
+    // "outro worker pegou este turno" e "esta conversa tem fila" — e é a
+    // segunda que explica por que uma conversa inteira parou.
+    // #629 acrescentou `stream_poisoned`, e ele é o que MAIS precisa chegar
+    // ao caller: `not_head` e `stream_busy` somem sozinhos quando o head anda,
+    // e `stream_poisoned` não some nunca sem um humano. Colapsá-lo em
+    // `not_claimed` faria a única recusa que exige operação parecer a mais
+    // rotineira de todas.
+    const streamReasons = [
+      'stream_busy',
+      'not_head',
+      'stream_blocked',
+      'stream_poisoned',
+    ] as const;
+    const rejeicao = acquired.result.ok === false ? acquired.result.reason : null;
+    const porStream = streamReasons.find((r) => r === rejeicao);
+    return { started: false, reason: porStream ?? 'not_claimed' };
+  }
 
   const lease = acquired.lease;
   handle.lease = lease;
@@ -578,6 +658,19 @@ export async function absorbDebounceInputs(
           { turn_id: sibling.id, to_status: 'superseded', absorbed_by: handle.turn_id },
           'turn.transitioned',
         );
+        // #627 — `superseded` também é TERMINAL, então a transação do irmão
+        // pode ter promovido alguém. No caminho NORMAL não promove: o
+        // absorvedor está `running` e é ele o head, então a eleição não acha
+        // sucessor elegível. Só sinaliza quando houve promoção de verdade — e
+        // NÃO conta `no_successor` por irmão absorvido, que encheria o
+        // denominador da métrica com eventos de debounce e faria a razão
+        // `promoted/(promoted+no_successor)` medir rajada em vez de fila.
+        if (result.promotion) {
+          await signalStreamPromotion(result.promotion, {
+            source: 'terminal',
+            promoted_by_turn_id: sibling.id,
+          });
+        }
       }
     }
     // #505 — o turno agregado passa a declarar o INTERVALO de ingressos que
@@ -595,6 +688,31 @@ export async function absorbDebounceInputs(
         'stream.turn_boundary_extended',
       );
     }
+  });
+}
+
+/**
+ * #627 — o turno acabou de chegar a TERMINAL. Sinaliza o sucessor que a
+ * transação já promoveu, ou registra que não havia quem promover.
+ *
+ * Roda DEPOIS de `applyResult`, isto é, depois de a transação ter comitado. A
+ * ordem é a exigência literal da issue ("persistir a decisão antes de sinalizar
+ * a BullMQ") e ela não depende de disciplina: `result.promotion` só existe
+ * porque o UPDATE da promoção já casou dentro da transação do CAS terminal —
+ * não há como chamar isto antes.
+ *
+ * NUNCA lança: ver `signalStreamPromotion`. Uma conclusão bem-sucedida não pode
+ * virar falha porque o Redis piscou.
+ */
+async function notePromotion(result: TurnTransitionResult): Promise<void> {
+  if (!result.ok) return;
+  if (!result.promotion) {
+    noteNoSuccessor();
+    return;
+  }
+  await signalStreamPromotion(result.promotion, {
+    source: 'terminal',
+    promoted_by_turn_id: result.turn.id,
   });
 }
 
@@ -631,6 +749,15 @@ export async function concludeTurn(
     const fence = resolveFence(handle);
     if (fence.kind === 'lost') {
       await refuseLostOwnership(handle, `conclude_${outcome}`, fence.reason);
+      // #627 — a conclusão recusada é uma PROMOÇÃO que deixou de acontecer, e
+      // esse é o fato que a issue manda auditar ("claim stale tentando promover
+      // sucessor é rejeitado, e a rejeição é auditada"). Sem esta linha, um
+      // zumbi barrado e uma stream sem sucessor produziriam o mesmo silêncio.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
       return;
     }
     const result =
@@ -657,10 +784,24 @@ export async function concludeTurn(
     // perdeu a lease chega aqui com trabalho pronto e é RECUSADO. Sem isto ele
     // marcaria `completed` por cima da tentativa do sucessor, e o usuário
     // receberia duas respostas com o turno registrado como concluído uma vez.
-    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) return;
+    if (await handleStaleClaim(handle, result, `conclude_${outcome}`)) {
+      // #627 — mesma leitura do ramo `lost` acima, com a recusa vindo do banco
+      // em vez do guard em memória. O fato operacional é o mesmo: a fila não
+      // andou porque quem tentou concluir já não era o dono.
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: `conclude_${outcome}`,
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
     // Concluído: a posse morreu com o CAS (`clearClaim`), só resta o timer.
     handle.lease?.stop();
+    // #627 — A FILA ANDA. A transação que concluiu este turno já elegeu e
+    // promoveu o sucessor; aqui só resta bater na BullMQ. DEPOIS do commit,
+    // nunca antes.
+    await notePromotion(result);
 
     if (IGNORED_OUTCOMES.has(outcome)) {
       await audit({
@@ -806,6 +947,32 @@ export async function failTurnRetryable(
   });
 }
 
+/**
+ * #629 — o conjunto de categorias que BLOQUEIAM, memoizado por valor bruto.
+ *
+ * O memo é sobre a STRING da env, não sobre "já li uma vez": `config` é um
+ * singleton, mas uma spec que recarrega o módulo com outro valor precisa ver o
+ * novo — e um memo booleano faria o segundo caso da suíte medir a configuração
+ * do primeiro. Reparsear a cada dead letter também serviria (é uma string
+ * curta), mas dead letter acontece em rajada quando uma dependência cai, e
+ * lançar dentro de `guarded` por categoria inválida numa rajada seria trocar um
+ * erro de configuração por uma tempestade de erros de transição.
+ */
+let poisonBlockCache: { raw: string; set: Set<PoisonCategory> } | null = null;
+
+function poisonBlockCategories(): Set<PoisonCategory> {
+  const raw = config.TURN_POISON_BLOCK_CATEGORIES ?? '';
+  if (poisonBlockCache?.raw === raw) return poisonBlockCache.set;
+  const set = parsePoisonBlockCategories(raw);
+  poisonBlockCache = { raw, set };
+  return set;
+}
+
+/** Só para teste: força a releitura da política na próxima decisão. */
+export function _resetPoisonPolicyCacheForTests(): void {
+  poisonBlockCache = null;
+}
+
 /** Terminal por esgotamento/intervenção. Sempre auditado. */
 export async function deadLetterTurn(
   handle: TurnHandle | null,
@@ -825,20 +992,64 @@ export async function deadLetterTurn(
     const fence = resolveFence(handle);
     if (fence.kind === 'lost') {
       await refuseLostOwnership(handle, 'dead_letter', fence.reason);
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
       return;
     }
     const from = handle.status;
+    // #629 (fatia F) — A ESCOLHA, e ela é tomada ANTES da escrita.
+    //
+    // A issue-mãe exige que a política escolha CONSCIENTEMENTE entre liberar a
+    // conversa e interditá-la, e que a escolha seja configurável por categoria
+    // de erro. Classificar aqui — e não dentro da transação — é o que mantém a
+    // decisão TESTÁVEL sem banco e o repositório sem `@/config/env.js`: o que
+    // desce é o veredito, não a política.
+    const outcome = args.outcome ?? 'retry_exhausted';
+    const category = classifyPoison({ error_code: sanitized.code, outcome });
+    const disposition = poisonDisposition(category, poisonBlockCategories());
     const result = await agentTurnsRepo.markDeadLetter({
       turn_id: handle.turn_id,
-      outcome: args.outcome ?? 'retry_exhausted',
+      outcome,
       error_code: sanitized.code,
       error_summary: sanitized.summary,
       expected_version: handle.state_version,
+      ...(disposition === 'block_stream'
+        ? { block_stream: { category, reason: 'poison' as const } }
+        : {}),
       ...fenceArgs(fence),
     });
-    if (await handleStaleClaim(handle, result, 'dead_letter')) return;
+    if (await handleStaleClaim(handle, result, 'dead_letter')) {
+      await reportPromotionFenceRejected({
+        turn_id: handle.turn_id,
+        operation: 'dead_letter',
+        attempt: handle.attempt_count,
+      });
+      return;
+    }
     if (!applyResult(handle, result)) return;
     handle.lease?.stop();
+    // A DECISÃO é contada DEPOIS do CAS ter vencido, e não antes de escrever.
+    // Um zumbi cujo `dead_letter` é recusado pelo fence não tomou decisão
+    // nenhuma — contá-lo faria `maia_stream_poison_total` medir TENTATIVAS de
+    // decidir, e a razão `block_stream/(block_stream+release)` deixaria de ser
+    // a política e passaria a ser a política mais a taxa de zumbis.
+    recordPoisonDecision(category, disposition);
+    // #627 — `dead_letter` é TERMINAL, e a issue-mãe é explícita sobre o que
+    // isso significa para a fila: a política de DLQ "libera o próximo turno".
+    // Um turno envenenado que ficasse segurando a conversa para sempre é a
+    // falha nº 5 da issue-mãe.
+    //
+    // #629 — e agora esse "libera" é uma DECISÃO, não um efeito colateral da
+    // máquina de estados. Quando a política mandou bloquear, a mesma transação
+    // já inseriu a interdição e `promoteStreamSuccessor` NÃO elegeu ninguém (a
+    // eleição carrega `streamNotPoisoned`), então `notePromotion` conta
+    // `no_successor` — que é a verdade: não havia sucessor a promover, porque a
+    // conversa está interditada.
+    if (result.ok && result.stream_block) await reportStreamBlockedByPoison(result.stream_block);
+    await notePromotion(result);
     logger.error(
       {
         turn_id: handle.turn_id,
@@ -866,6 +1077,47 @@ export async function deadLetterTurn(
 }
 
 /**
+ * #629 — a INTERDIÇÃO da conversa, relatada.
+ *
+ * Os três fatos num lugar só — métrica já contada em `recordPoisonDecision`,
+ * log estruturado e `audit_log` —, pela mesma regra de `signalStreamPromotion`
+ * e `reportFenceRejection`: três callers fazendo isso à mão é como um deles
+ * acaba sem auditoria, e o que falta é sempre o do caminho raro.
+ *
+ * `ops_alert: true` e nível `error`, e aqui isso é honesto ao contrário de
+ * `stream.turn_promotion_enqueue_failed` (que é `warn` porque o varredor
+ * conserta sozinho): NADA conserta isto sozinho. Uma conversa interditada
+ * continua interditada até um humano rodar `npm run dlq -- unblock`. Um alerta
+ * que exige intervenção é exatamente o que deve acordar o plantão.
+ */
+async function reportStreamBlockedByPoison(block: StreamBlockRecord): Promise<void> {
+  logger.error(
+    {
+      turn_id: block.blocked_turn_id,
+      block_id: block.block_id,
+      category: block.category,
+      reason: block.reason,
+      error_code: block.error_code,
+      ops_alert: true,
+    },
+    'stream.poisoned',
+  );
+  await audit({
+    acao: 'stream_poisoned',
+    ...(block.conversa_id ? { conversa_id: block.conversa_id } : {}),
+    alvo_id: block.blocked_turn_id,
+    metadata: {
+      block_id: block.block_id,
+      category: block.category,
+      reason: block.reason,
+      disposition: 'block_stream',
+      blocked_by_turn_id: block.blocked_turn_id,
+      error_code: block.error_code,
+    },
+  });
+}
+
+/**
  * Replay MANUAL de dead letter — operação de operador, explícita e auditada,
  * que gera nova tentativa. NÃO é chamada por nenhum caminho automático.
  */
@@ -873,19 +1125,61 @@ export async function replayDeadLetteredTurn(args: {
   turn_id: string;
   actor: string;
   reason: string;
-}): Promise<{ replayed: boolean }> {
+  /**
+   * #629 — MODO DE RECONCILIAÇÃO. Sem ele, o replay é RECUSADO quando a ordem
+   * da conversa já foi comprometida (existe turno posterior já terminal). Ver
+   * `agentTurnsRepo.replayDeadLetterTx`.
+   */
+  reconcile?: boolean;
+}): Promise<ReplayOutcome> {
   const turn = await agentTurnsRepo.findById(args.turn_id);
-  if (!turn) return { replayed: false };
+  if (!turn) return { replayed: false, reason: 'not_dead_lettered' };
   const result = await agentTurnsRepo.replayDeadLetterTx({
     turn_id: args.turn_id,
     expected_version: Number(turn.state_version),
+    ...(args.reconcile === true ? { reconcile: true } : {}),
   });
   if (!result.ok) {
     logger.warn(
       { turn_id: args.turn_id, to_status: 'queued', conflict: result.conflict },
       'turn.transition_conflict',
     );
-    return { replayed: false };
+    // #629 — A RECUSA POR ORDEM COMPROMETIDA É AUDITADA, e as outras não.
+    //
+    // `state_mismatch` e `not_found` são erro de operador (turno vivo, id
+    // errado) e já vivem no log. `order_committed` é diferente em espécie: é a
+    // plataforma HONRANDO uma invariante contra uma ordem humana explícita, e
+    // esse é exatamente o tipo de evento que a issue-mãe manda auditar. Sem a
+    // row, a pergunta "por que este turno nunca voltou?" não tem resposta
+    // durável — só um exit code que ninguém guardou.
+    if (result.conflict === 'order_committed') {
+      logger.warn(
+        {
+          turn_id: args.turn_id,
+          actor: args.actor,
+          committed_after: result.committed_after,
+          ops_alert: true,
+        },
+        'stream.manual_replay_refused',
+      );
+      await audit({
+        acao: 'turn_replay_refused',
+        ...(turn.conversa_id ? { conversa_id: turn.conversa_id } : {}),
+        alvo_id: args.turn_id,
+        metadata: {
+          reason: 'order_committed',
+          committed_after: result.committed_after,
+          actor: args.actor,
+          operator_reason: args.reason,
+        },
+      });
+      return {
+        replayed: false,
+        reason: 'order_committed',
+        committed_after: result.committed_after,
+      };
+    }
+    return { replayed: false, reason: 'not_dead_lettered' };
   }
   await audit({
     acao: 'turn_replayed',
@@ -897,10 +1191,45 @@ export async function replayDeadLetteredTurn(args: {
       attempt: result.turn.attempt_count,
       actor: args.actor,
       reason: args.reason,
+      // #629 — o MODO fica na row de rotina também. Ler `turn_replayed` sem
+      // saber se foi reconciliação obrigaria a cruzar com a row de
+      // `turn_replay_reconciled` para saber o que aconteceu, e a auditoria de
+      // um replay tem de ser legível numa linha.
+      mode: args.reconcile === true ? 'reconcile' : 'ordered',
     },
   });
+  if (args.reconcile === true) {
+    // A row que separa "replay normal" de "o operador ATRAVESSOU a ordem". É a
+    // única evidência de que a plataforma processou algo fora da ordem que já
+    // havia entregue, e por isso ela é sua própria ação — não um campo de
+    // metadata que uma consulta de rotina filtraria fora sem querer.
+    logger.warn(
+      { turn_id: args.turn_id, actor: args.actor, ops_alert: true },
+      'stream.manual_replay_reconciled',
+    );
+    await audit({
+      acao: 'turn_replay_reconciled',
+      ...(result.turn.conversa_id ? { conversa_id: result.turn.conversa_id } : {}),
+      alvo_id: args.turn_id,
+      metadata: { actor: args.actor, operator_reason: args.reason },
+    });
+  }
   return { replayed: true };
 }
+
+/**
+ * #629 — o desfecho TIPADO de um replay manual.
+ *
+ * `not_dead_lettered` e `order_committed` são recusas com remediações opostas,
+ * e é por isso que não são um booleano: a primeira quer dizer "você errou o
+ * turno" (releia o id, ele não está morto) e a segunda quer dizer "você acertou
+ * o turno e a plataforma não vai fazer isso sem você declarar que sabe" — cuja
+ * remediação é `--reconcile`, não uma correção.
+ */
+export type ReplayOutcome =
+  | { replayed: true }
+  | { replayed: false; reason: 'not_dead_lettered' }
+  | { replayed: false; reason: 'order_committed'; committed_after: number };
 
 /**
  * Shadow-read (issue §6, passo 6 do rollout): mede a divergência entre a

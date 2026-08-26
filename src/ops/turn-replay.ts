@@ -43,7 +43,23 @@ import { resolveTurnJobScope, type TurnJobScope } from '@/runtime/turns/scope-re
 export type TurnReplayOutcome =
   | { replayed: true; scope: TurnJobScope }
   /** O CAS recusou: o turno não estava em `dead_letter`. NADA foi rearmado. */
-  | { replayed: false; scope: TurnJobScope; reason: 'not_dead_lettered' };
+  | { replayed: false; scope: TurnJobScope; reason: 'not_dead_lettered' }
+  /**
+   * #629 — a ORDEM DA CONVERSA JÁ ESTÁ COMPROMETIDA: existe turno POSTERIOR
+   * na mesma stream que já chegou a estado terminal, e devolver este à fila o
+   * executaria depois de algo que o usuário já viu.
+   *
+   * NADA foi rearmado. A remediação NÃO é tentar de novo — a recusa é
+   * permanente até alguém decidir o contrário —, é `--reconcile`, que é a porta
+   * explícita e auditada da issue-mãe ("exige modo de replay/reconciliação
+   * explícito").
+   */
+  | {
+      replayed: false;
+      scope: TurnJobScope;
+      reason: 'order_committed';
+      committed_after: number;
+    };
 
 /**
  * Executa o replay manual de um turno. Propaga `TurnScopeUnresolvedError`
@@ -60,6 +76,14 @@ export async function replayTurnByOperator(args: {
   actor: string;
   reason: string;
   rearm?: boolean;
+  /**
+   * #629 — MODO DE RECONCILIAÇÃO. Atravessa a recusa por ordem comprometida, e
+   * a atravessia é auditada como `turn_replay_reconciled`. Sem ele o replay de
+   * um turno cuja conversa já andou é RECUSADO — que é o comportamento que a
+   * issue-mãe exige ("rearmamento manual não pode violar a ordem já
+   * comprometida").
+   */
+  reconcile?: boolean;
 }): Promise<TurnReplayOutcome> {
   const scope = await resolveTurnJobScope(args.turn_id);
 
@@ -70,13 +94,25 @@ export async function replayTurnByOperator(args: {
         turn_id: scope.turn_id,
         actor: args.actor,
         reason: args.reason,
+        ...(args.reconcile === true ? { reconcile: true } : {}),
       });
       if (!result.replayed) {
         logger.warn(
-          { turn_id: scope.turn_id, actor: args.actor },
+          { turn_id: scope.turn_id, actor: args.actor, reason: result.reason },
           'turn.manual_replay_refused',
         );
-        return { replayed: false, scope, reason: 'not_dead_lettered' };
+        // #629 — a recusa por ordem comprometida NÃO é rearmada e NÃO é
+        // colapsada com `not_dead_lettered`: a primeira pede `--reconcile`, a
+        // segunda pede outro `turn_id`. Um único código mandaria o operador
+        // procurar o erro no lugar errado.
+        return result.reason === 'order_committed'
+          ? {
+              replayed: false,
+              scope,
+              reason: 'order_committed',
+              committed_after: result.committed_after,
+            }
+          : { replayed: false, scope, reason: 'not_dead_lettered' };
       }
       if (args.rearm !== false) {
         await enqueueAgent({
@@ -92,6 +128,7 @@ export async function replayTurnByOperator(args: {
           agent_id: scope.agent_id,
           actor: args.actor,
           rearmed: args.rearm !== false,
+          reconcile: args.reconcile === true,
         },
         'turn.manual_replay_done',
       );

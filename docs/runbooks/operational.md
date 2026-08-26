@@ -1035,10 +1035,11 @@ O exit code diz **qual invariante quebrou**, antes de qualquer log ser lido:
 | `95` | schema **acima** do máximo suportado por este build | Publique a release nova; não sirva tráfego desta |
 | `96` | migration `running` — migrator em voo, ou morto | Aguarde o job; se não há migrator, é entulho (`migrate status`) |
 | `97` | veredito `unknown` — ledger ausente/ilegível, banco fora do ar | `npm run doctor -- --online`; confirme DSN e permissões |
+| `98` | **índice `indisvalid = false`** — DDL `CONCURRENTLY` reprovou, e um índice único inválido **não impõe nada** | `DROP INDEX CONCURRENTLY <schema>.<indice>`, resolva a duplicata, reaplique. NÃO reaplique antes de dropar: o `IF NOT EXISTS` devolve sucesso sobre o índice inválido ([runbook de migrations](migrations.md#índice-inválido-deixado-por-ddl-concurrently)) |
 | `1` | qualquer OUTRA falha de boot (Redis, keyring, config…) | Ver `maia.fatal` no log |
 
 ```bash
-docker inspect --format '{{.State.ExitCode}}' <container>   # 90-97 ⇒ é schema
+docker inspect --format '{{.State.ExitCode}}' <container>   # 90-98 ⇒ é schema
 docker logs <container> 2>&1 | grep maia.schema_boot_refused
 ```
 
@@ -1059,7 +1060,7 @@ processo pode nem chegar a escutar HTTP.
 ```text
 O container está de pé?
 ├─ NÃO (crash loop)  → o sinal é o EXIT CODE. /readyz nunca respondeu.
-│                      90-97 ⇒ schema (tabela acima). 1 ⇒ outra dependência.
+│                      90-98 ⇒ schema (tabela acima). 1 ⇒ outra dependência.
 │                      Log: maia.schema_boot_refused → maia.fatal.
 │                      NÃO existe instância para inspecionar: leia o log do
 │                      container morto, não o endpoint.

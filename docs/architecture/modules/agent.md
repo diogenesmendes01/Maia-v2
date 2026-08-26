@@ -12,7 +12,7 @@
 | `src/agent/react-loop.ts` | ReAct loop for tool-using turns |
 | `src/agent/prompt-builder.ts` | **Pure renderer**: turns a `TurnContextSnapshot` into the system + user prompt. Imports no repository |
 | `src/agent/sanitize.ts` | Sanitizes LLM output (wraps untrusted blocks in delimiters; see prompt-injection mitigation) |
-| `src/agent/output-dispatch.ts` | Dispatches outbound (text / voice / PDF / view-once) |
+| `src/agent/output-dispatch.ts` | Dispatches outbound (text / voice / PDF / poll / view-once). Desde #631, **commita a intenção de resposta no outbox durável ANTES de qualquer chamada ao canal**; desde #634 isso vale para TODOS os ramos (voz incluída) e a mídia entra por `storage_object` — ver abaixo |
 | `src/agent/pending-gate.ts` | Gates execution while a pending question is open |
 | `src/agent/pending-resolver.ts` | Resolves user input against active pending question |
 | `src/agent/gap-detector.ts` | Detects gaps in agent capability mid-turn |
@@ -496,6 +496,48 @@ com `outcome = pending_race_lost`) diz que o turno foi descartado por causa
 disso. Ver [`runtime.md`](runtime.md) e o runbook
 [`turn-state-machine.md`](../../runbooks/turn-state-machine.md).
 
+## Saída: o commit vem antes do canal (issue #631, fatia B da #506)
+
+`output-dispatch.ts` era o arquivo que a auditoria da #506 nomeou: o ledger em
+caminho **opcional e fail-open** (`claimOutboundLedgerOrFailOpen` — *"log the
+issue and proceed as if there's no prior row"*), e enviar e persistir separados
+por uma janela de crash. Desde #631 a ordem de **todo** ramo é fixa:
+
+```
+assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT durável  →  canal
+```
+
+- **"Antes" é literal.** Entre `commitOutboundOrRefuse(...)` e a chamada ao
+  canal não existe nenhum `await`. Cada await ali seria uma janela nova com a
+  resposta já comprometida.
+- **O ledger legado vem primeiro de propósito.** Ele responde "alguém já
+  respondeu este turno?", e um `skip` significa que não vamos enviar —
+  commitar antes deixaria o turno em `outbound_pending` com uma linha durável
+  que ninguém pretende entregar.
+- **A falha do commit é relançada, nunca engolida**, e reclassificada como
+  `OutboundDeliveryError(delivered: false)`: nada foi ao canal, então o caller
+  recebe `not_sent` (retry seguro) em vez do conservador `sent_no_persist`.
+- **`recordCommittedDelivery` é provisório e declarado como tal.** Enquanto o
+  delivery worker de #632 não existe, quem entrega é o mesmo processo, e sem
+  fechar a linha toda saída entregue ficaria `pending` — de modo que a #632, ao
+  subir, varreria e **reenviaria** mensagens já recebidas. Ele nunca lança: o
+  efeito externo já ocorreu, e uma exceção ali só trocaria uma linha
+  desatualizada por um turno abortado.
+
+Desde #634 **todo** ramo commita — inclusive voz, que #631 deixou como exceção
+declarada — e a chamada ao canal acontece dentro do escopo de egresso do outbox
+(`withOutboxEgress`). Fora dele a fronteira única RECUSA o envio; ver
+[`runtime.md` § Onde a mídia de saída mora, e a trava do envio direto](runtime.md).
+
+A mídia de documento e de voz entra por `storage_object`
+(`src/runtime/outbound/media-store.ts`), não mais por `local_path`: o objeto é
+escrito antes do commit e só é descartado quando a entrega é confirmada, de modo
+que uma segunda tentativa encontra os MESMOS bytes.
+
+Onde a mecânica mora: [`runtime.md` § Outbox de saída](runtime.md) (o contrato,
+a transação e a flag) e `src/db/repositories/outbound-outbox-repo.ts` (a
+transação única).
+
 ## Patterns it follows
 
 - [Action layer](../concerns/action-layer.md) — LLM proposes, backend disposes
@@ -508,7 +550,7 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 |---|---|
 | Add a new per-turn step | New file under `src/agent/`; wire into `core.ts` |
 | Add a new pending-question type | Extend `pending-questions.ts` (under `src/workflows/`); resolver in `pending-resolver.ts` |
-| Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
+| Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121) + o inventário de [`src/runtime/outbound/send-paths.ts`](../../../src/runtime/outbound/send-paths.ts), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
 | Change prompt structure | Edit `prompt-builder.ts`; keep `<user_message>` / `<ocr>` / `<audio_transcript>` delimiters for injection safety |
 | Add data to the prompt | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise |
 

@@ -156,20 +156,36 @@ npm run admin:dev
 ```bash
 npm run test:admin-ui:unit          # Vitest (58+ testes)
 npm run test:admin-ui:e2e           # Playwright, projeto `smoke` (exige console no ar)
-npm run test:admin-ui:e2e:ci        # o que o CI roda: `admin:build` -> sobe o
-                                    # console construído -> smoke -> derruba
+npm run test:admin-ui:e2e:ci        # o que o CI roda: `admin:build` -> semeia as
+                                    # fixtures -> sobe o console construído ->
+                                    # smoke (boot + jornadas) -> derruba
 npm run admin:acceptance            # 11 gates (skip-e2e por padrão)
 ```
 
 O job `admin-ui` do CI é o gate: `next build` e o projeto `smoke` do Playwright
-reprovam a PR. As specs marcadas `@pendente-472` em `tests/admin-ui/e2e/` estão
-FORA do gate — elas exigem sessão autenticada e fixtures que
-`scripts/seed-proposals-fixtures.ts` ainda não cria (issue #472). A lista de
-arquivos em quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`,
-então sair dela é um diff visível.
+reprovam a PR. Desde a **#623** o `smoke` inclui as JORNADAS autenticadas do
+operador (inbox, detalhe de proposta, aprovação simples e dupla, rejeição,
+trava de arquitetura, trilha de auditoria, drift, traces e versões). Duas peças
+sustentam isso, e nenhuma toca código de produção:
+
+- **sessão** — `tests/admin-ui/e2e/_apoio/sessao.ts` MINTA o cookie de sessão
+  com o `encode()` do próprio Auth.js e o `NEXTAUTH_SECRET` do processo. O
+  middleware, o `auth()`, o `assertRole` e os gates de papel continuam
+  valendo; o que o teste pula é o handshake com o IdP;
+- **fixtures** — `scripts/seed-admin-ui-e2e-fixtures.ts` (o `admin-ui-e2e.sh`
+  o chama sozinho) semeia usuários por papel, propostas com risco/trava
+  DERIVADOS do spec, duas versões de perfil e um trace assinado pelo escritor
+  de produção.
+
+Fora do gate sobrou uma spec, `channel-lines-pairing.spec.ts`, marcada
+`@pendente-runtime`: o QR e o código de pareamento são produzidos pelo worker
+`channel_pairing` do RUNTIME, e este job sobe só o console — o cabeçalho do
+arquivo traz a medição e o critério objetivo de saída. A lista de arquivos em
+quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair
+dela é um diff visível.
 
 ```bash
-npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha hoje, por desenho)
+npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha sem um runtime no ar)
 ```
 
 ### Feature flags

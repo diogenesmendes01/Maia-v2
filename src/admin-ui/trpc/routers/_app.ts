@@ -22,6 +22,7 @@ import { skillsRouter } from './skills.js';
 import { playgroundRouter } from './playground.js';
 import { objectivesRouter } from './objectives.js';
 import { mcpRouter } from './mcp.js';
+import { toolRequestsRouter } from './tool-requests.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -44,6 +45,12 @@ export const appRouter = router({
   playground: playgroundRouter,
   objectives: objectivesRouter,
   mcp: mcpRouter,
+  // #638 (fatia C da épica #471) — a triagem de pedidos de ferramenta. Router
+  // PRÓPRIO, e não mais um método em `capabilities`, porque ele é a superfície
+  // que o teste arquitetural varre a partir de UM ponto de entrada: misturá-lo
+  // com rotas que legitimamente editam grants (`agents`, `mcp`) tornaria a
+  // varredura vermelha por motivos que não têm nada a ver com este guardrail.
+  toolRequests: toolRequestsRouter,
 });
 
 export type AppRouter = typeof appRouter;

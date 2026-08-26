@@ -106,7 +106,7 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
 
     const turn_id = await mkTurn();
     const claimed = await inT(() =>
-      agentTurnsRepo.tryClaimTurn({
+      agentTurnsRepo.claimNextEligibleTurn({
         turn_id,
         worker_id: `hb-${randomUUID().slice(0, 8)}`,
         lease_ms: TTL_MS,
@@ -179,7 +179,7 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
 
     const turn_id = await mkTurn();
     const claimed = await inT(() =>
-      agentTurnsRepo.tryClaimTurn({
+      agentTurnsRepo.claimNextEligibleTurn({
         turn_id,
         worker_id: `hb-exp-${randomUUID().slice(0, 8)}`,
         lease_ms: TTL_MS,

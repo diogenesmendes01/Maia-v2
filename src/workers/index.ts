@@ -12,6 +12,7 @@ import { runConversationSummarizer } from './conversation-summarizer.js';
 import { runReflectionBatch } from './reflection-batch.js';
 import { runPatternDetector } from './pattern-detector.js';
 import { runMessageRecovery } from './message-recovery.js';
+import { runStreamDebounceCloser } from './stream-debounce-closer.js';
 import { runPendingReminder } from './pending-reminder.js';
 import { runScheduling } from './scheduling-tick.js';
 import { runOutboxDrainWorker } from './outbox-drain-worker.js';
@@ -30,11 +31,16 @@ import { runProcedureExecutionReaper } from './procedure-execution-reaper.js';
 import { runProcedureMetricsRefresh } from './procedure-metrics-refresh.js';
 import { runDriftMonitor } from './drift-monitor.js';
 import { runGapEscalationMonitor } from './gap-escalation-monitor.js';
+import {
+  runToolRequestIssueRelayer,
+  runToolRequestClosureMonitor,
+} from './tool-request-triage.js';
 import { runTraceBodyWriter } from './trace-body-writer.js';
 import { runTraceBodyRecoverer } from './trace-body-recoverer.js';
 import { runTraceMatviewRefresh } from './trace-matview-refresh.js';
 import { runKnowledgeStatePromoter } from './knowledge-state-promoter.js';
 import { runOutboundMessagesSweeper } from './outbound-messages-sweeper.js';
+import { runOutboundRecovery } from './outbound-recovery.js';
 import { runIdempotencyOutboxRelayer } from './idempotency-outbox-relayer.js';
 import { runWorkflowEngineTick } from './workflow-engine-tick.js';
 import { runPlaygroundTurnWorker } from './playground-turn-worker.js';
@@ -55,6 +61,15 @@ export const JOBS: Job[] = [
   { name: 'audit_watcher', cron: '*/1 * * * *', fn: runAuditWatcher, phase: 1 },
   { name: 'pending_expirer', cron: '*/1 * * * *', fn: runPendingExpirer, phase: 1 },
   { name: 'message_recovery', cron: '*/2 * * * *', fn: runMessageRecovery, phase: 1 },
+  // Issue #628 (fatia E da #505) — o RELÓGIO DE PAREDE do debounce
+  // transacional. O cron é 1/min, mas o tick DRENA por ~50s sondando a cada
+  // 500ms, porque uma janela de debounce é de segundos e fechar só no tick
+  // acrescentaria até 60s à resposta. FASE 1: com a flag ligada, este worker é
+  // o único caminho pelo qual uma rajada de texto vira turno executável — se
+  // ele não roda, a conversa espera o recovery por estado (STUCK_AFTER_MS).
+  // No-op barato com FEATURE_TURN_STREAM_DEBOUNCE (ou FEATURE_MESSAGE_DEBOUNCE)
+  // desligada: nem consulta o banco.
+  { name: 'stream_debounce_closer', cron: '* * * * *', fn: runStreamDebounceCloser, phase: 1 },
   { name: 'pending_reminder', cron: '*/30 * * * *', fn: runPendingReminder, phase: 1 },
   // Spec 18 §10 — three scheduling workers:
   //  - scheduling_tick: every minute, claims due occurrences and advances
@@ -132,6 +147,16 @@ export const JOBS: Job[] = [
   // Dispatcher per-tenant via runWithTenantContext (espelha reflection-batch
   // #240/#251) — NÃO usa sentinela 'default'.
   { name: 'outbound_messages_sweeper', cron: '*/5 * * * *', fn: runOutboundMessagesSweeper, phase: 1 },
+  // Issue #633 (fatia D da #506) — varredura de recuperação do OUTBOX DURÁVEL.
+  // Distinto de `outbound_messages_sweeper` acima, que é o housekeeping do
+  // ledger LEGADO (rows sem `turn_id`) e agora as ignora explicitamente.
+  //
+  // Cadência de 1 min e não de 5: aqui o que se recupera é uma RESPOSTA ao
+  // usuário, e o SLI é a latência percebida. PHASE 1 de propósito —
+  // `startWorkers(1)` ignora phase>1, então em phase 2 o worker nunca rodaria.
+  // A FLAG é o gate real: com FEATURE_OUTBOUND_RECOVERY off ele é no-op na
+  // PRIMEIRA linha, sem tocar o banco.
+  { name: 'outbound_recovery', cron: '* * * * *', fn: runOutboundRecovery, phase: 1 },
   // Issue #316 — transactional effect outbox relayer. Dispatches NON-IDEMPOTENT
   // external effects (e.g. WhatsApp sends) recorded atomically with the winning
   // idempotency reservation, EXACTLY ONCE, with retry/backoff. Every minute so
@@ -194,6 +219,27 @@ export const JOBS: Job[] = [
   { name: 'drift_monitor', cron: '0 3 * * 0', fn: runDriftMonitor, phase: 4 },
   // P5 Task 9 — gap escalation monitor (a cada 30min).
   { name: 'gap_escalation_monitor', cron: '*/30 * * * *', fn: runGapEscalationMonitor, phase: 5 },
+  // #638 (fatia C da épica #471) — a metade de backend da triagem de pedidos de
+  // ferramenta. O relayer roda de 5 em 5 minutos porque ele é o que o dono está
+  // esperando depois de clicar em "aceitar"; o monitor de fechamento roda de
+  // hora em hora porque o fato que ele observa (uma tool nova concedida a um
+  // agente) muda em escala de deploy, não de segundo.
+  {
+    name: 'tool_request_issue_relayer',
+    cron: '*/5 * * * *',
+    fn: async () => {
+      await runToolRequestIssueRelayer();
+    },
+    phase: 5,
+  },
+  {
+    name: 'tool_request_closure_monitor',
+    cron: '7 * * * *',
+    fn: async () => {
+      await runToolRequestClosureMonitor();
+    },
+    phase: 5,
+  },
   // P10a — knowledge state auto-promoter (hourly; matures ephemeral→observed→
   // reinforced→verified→active by evidence_count + age, and expires stale
   // rows to deprecated).

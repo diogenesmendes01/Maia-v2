@@ -271,7 +271,7 @@ d('#504 — o core OBEDECE a barreira do claim (DB real)', () => {
         [turn_id],
       );
       const sucessor = await inPrimary(() =>
-        agentTurnsRepo.tryClaimTurn({
+        agentTurnsRepo.claimNextEligibleTurn({
           turn_id,
           worker_id: 'sucessor-no-meio-do-turno',
           lease_ms: 60_000,
@@ -337,7 +337,7 @@ d('#504 — o core OBEDECE a barreira do claim (DB real)', () => {
     // OUTRO worker toma a posse de verdade, com lease viva. Nenhum mock: é o
     // mesmo caminho que uma segunda réplica usaria.
     const dono = await inPrimary(() =>
-      agentTurnsRepo.tryClaimTurn({
+      agentTurnsRepo.claimNextEligibleTurn({
         turn_id,
         worker_id: 'outro-worker-vivo',
         lease_ms: 60_000,
