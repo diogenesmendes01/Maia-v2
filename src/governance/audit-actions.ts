@@ -390,6 +390,13 @@ export const AUDIT_ACTIONS = [
   'outbound_sent_document',
   'outbound_sent_voice',
   'outbound_dispatch_failed',
+  /**
+   * Issue #631 — a INTENÇÃO de resposta foi comprometida no outbox durável, na
+   * MESMA transação que moveu o turno para `outbound_pending`. É o
+   * `outbound.created` de #506 §Auditoria mínima, e é gravado por `auditTx`:
+   * se esta linha não entrar, a transação inteira reverte e NADA é enviado.
+   */
+  'outbound_committed',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',

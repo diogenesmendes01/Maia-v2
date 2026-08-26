@@ -637,7 +637,33 @@ export const METRIC = {
   TOOL_DURATION_MS: 'maia_tool_duration_ms',
 
   // --- whatsapp / outbound -------------------------------------------------
+  /**
+   * A INTENÇÃO de resposta foi comprometida no outbox durável, na mesma
+   * transação que moveu o turno para `outbound_pending` (issue #631, fatia B da
+   * #506). Declarada por #514 e sem emissor até a #631 — o commit transacional
+   * é o fato que ela sempre quis medir, e antes dele não existia.
+   *
+   * `kind` é o `payload_type` (vocabulário FECHADO de `OUTBOUND_PAYLOAD_TYPES`,
+   * seis valores). #506 §Observabilidade sugere a dimensão como `type`; ela
+   * anda em `kind` porque `type` não está — e não deve entrar sem decisão
+   * própria — em `ALLOWED_LABEL_KEYS`.
+   */
   OUTBOUND_COMMITTED: 'maia_outbound_committed_total',
+  /**
+   * Issue #631 — o commit transacional foi RECUSADO e, por consequência,
+   * NENHUMA mensagem foi ao canal. `reason` ∈ `turn_not_found` | `stale_claim`
+   * | `state_mismatch` | `ownership_lost` | `db_error`.
+   *
+   * É a série que responde "o fail-open sumiu de verdade?". Antes desta fatia
+   * uma falha de ledger era um `logger.warn` e o envio seguia, então não havia
+   * número nenhum a observar. Um pico aqui é resposta NÃO entregue — o que é
+   * ruim, e é honesto, e é preferível à alternativa de entregar sem registro.
+   *
+   * A distância entre esta série e `OUTBOUND_COMMITTED` é o custo real de
+   * liveness que a fatia cobra; é ela que um operador olha para decidir se o
+   * banco é o gargalo.
+   */
+  OUTBOUND_COMMIT_REJECTED: 'maia_outbound_commit_rejected_total',
   OUTBOUND_SEND: 'maia_outbound_send_total',
   OUTBOUND_SEND_MS: 'maia_outbound_send_ms',
   /**

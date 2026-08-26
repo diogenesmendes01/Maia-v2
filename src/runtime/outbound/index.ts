@@ -8,9 +8,18 @@
  * Importe SEMPRE daqui — `contract.js` é detalhe interno de organização, do
  * mesmo jeito que em `src/runtime/turns/`.
  *
- * Nesta fatia existe UMA camada só: o contrato puro (vocabulário, união Zod,
- * serialização canônica, as duas chaves). Não há fachada, repositório nem
- * worker — de propósito: a fatia é aditiva e NADA passa a ser enviado por
- * caminho novo.
+ * Camadas, na ordem em que as fatias as acrescentaram:
+ *
+ *   `contract.ts`   — #630: o contrato PURO (vocabulário, união Zod,
+ *                     serialização canônica, as duas chaves). Sem `db`, sem
+ *                     I/O, sem ALS, sem relógio.
+ *   `turn-scope.ts` — #631: o `TurnHandle` visível para os limites de saída.
+ *   `commit.ts`     — #631: a fronteira que o dispatcher atravessa antes de
+ *                     qualquer chamada ao canal. É a única camada com efeito.
+ *
+ * O delivery worker (#632), o recovery/DLQ (#633), a migração dos call sites
+ * (#634) e o multipart (#635) ainda não existem.
  */
 export * from './contract.js';
+export * from './turn-scope.js';
+export * from './commit.js';

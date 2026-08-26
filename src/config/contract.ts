@@ -1581,6 +1581,29 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  FEATURE_OUTBOUND_DURABLE_COMMIT: {
+    name: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+    description:
+      'Commit TRANSACIONAL da resposta do turno (issue #631, fatia B da #506). Default ON. ' +
+      'ON: ao concluir a cognição, uma ÚNICA transação valida o claim_token do turno, insere o ' +
+      'artefato outbound com a logical_dedupe_key, move o turno para outbound_pending e grava a ' +
+      'auditoria — e SÓ DEPOIS do commit alguma coisa vai ao canal. Falha da transação IMPEDE o ' +
+      'envio, com erro observável (maia_outbound_commit_rejected_total). EXIGE a migration 121 ' +
+      'aplicada e FEATURE_TURN_STATE_MACHINE ligada (sem turno durável não há turn_id, e a FK ' +
+      'composta da 121 torna a row inexprimível). ' +
+      'OFF NÃO É CONFIGURAÇÃO SUPORTADA EM PRODUÇÃO — o boot é RECUSADO no profile production, ' +
+      'porque desligar aqui restaura exatamente o caminho fail-open que a #506 documentou: envio ' +
+      'ao canal sem registro durável. Fora de produção é a alavanca de rollback declarada. ' +
+      'Ver docs/runbooks/turn-state-machine.md.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('true'),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MESSAGE_DEBOUNCE: {
     name: 'FEATURE_MESSAGE_DEBOUNCE',
     description:

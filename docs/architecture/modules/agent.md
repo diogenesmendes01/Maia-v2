@@ -12,7 +12,7 @@
 | `src/agent/react-loop.ts` | ReAct loop for tool-using turns |
 | `src/agent/prompt-builder.ts` | **Pure renderer**: turns a `TurnContextSnapshot` into the system + user prompt. Imports no repository |
 | `src/agent/sanitize.ts` | Sanitizes LLM output (wraps untrusted blocks in delimiters; see prompt-injection mitigation) |
-| `src/agent/output-dispatch.ts` | Dispatches outbound (text / voice / PDF / view-once) |
+| `src/agent/output-dispatch.ts` | Dispatches outbound (text / voice / PDF / poll / view-once). Desde #631, **commita a intenção de resposta no outbox durável ANTES de qualquer chamada ao canal** — ver abaixo |
 | `src/agent/pending-gate.ts` | Gates execution while a pending question is open |
 | `src/agent/pending-resolver.ts` | Resolves user input against active pending question |
 | `src/agent/gap-detector.ts` | Detects gaps in agent capability mid-turn |
@@ -495,6 +495,38 @@ lock) diz que a corrida foi perdida; `turn_ignored_by_policy` (de `concludeTurn`
 com `outcome = pending_race_lost`) diz que o turno foi descartado por causa
 disso. Ver [`runtime.md`](runtime.md) e o runbook
 [`turn-state-machine.md`](../../runbooks/turn-state-machine.md).
+
+## Saída: o commit vem antes do canal (issue #631, fatia B da #506)
+
+`output-dispatch.ts` era o arquivo que a auditoria da #506 nomeou: o ledger em
+caminho **opcional e fail-open** (`claimOutboundLedgerOrFailOpen` — *"log the
+issue and proceed as if there's no prior row"*), e enviar e persistir separados
+por uma janela de crash. Desde #631 a ordem de **todo** ramo é fixa:
+
+```
+assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT durável  →  canal
+```
+
+- **"Antes" é literal.** Entre `commitOutboundOrRefuse(...)` e a chamada ao
+  canal não existe nenhum `await`. Cada await ali seria uma janela nova com a
+  resposta já comprometida.
+- **O ledger legado vem primeiro de propósito.** Ele responde "alguém já
+  respondeu este turno?", e um `skip` significa que não vamos enviar —
+  commitar antes deixaria o turno em `outbound_pending` com uma linha durável
+  que ninguém pretende entregar.
+- **A falha do commit é relançada, nunca engolida**, e reclassificada como
+  `OutboundDeliveryError(delivered: false)`: nada foi ao canal, então o caller
+  recebe `not_sent` (retry seguro) em vez do conservador `sent_no_persist`.
+- **`recordCommittedDelivery` é provisório e declarado como tal.** Enquanto o
+  delivery worker de #632 não existe, quem entrega é o mesmo processo, e sem
+  fechar a linha toda saída entregue ficaria `pending` — de modo que a #632, ao
+  subir, varreria e **reenviaria** mensagens já recebidas. Ele nunca lança: o
+  efeito externo já ocorreu, e uma exceção ali só trocaria uma linha
+  desatualizada por um turno abortado.
+
+Onde a mecânica mora: [`runtime.md` § Outbox de saída](runtime.md) (o contrato,
+a transação e a flag) e `src/db/repositories/outbound-outbox-repo.ts` (a
+transação única).
 
 ## Patterns it follows
 

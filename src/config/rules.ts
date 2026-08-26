@@ -763,6 +763,69 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
+  // Issue #631 (fatia B da #506) §Escopo de flag — "uma garantia de durabilidade
+  // não pode ficar desligada em produção sem falha explícita".
+  //
+  // As duas regras abaixo são de naturezas DIFERENTES e nenhuma substitui a
+  // outra:
+  //
+  //  (a) INERTE — a flag ligada sem `FEATURE_TURN_STATE_MACHINE` não commita
+  //      nada: sem `agent_turns` não existe `turn_id`, e a FK composta da
+  //      migração 121 torna a row durável inexprimível. Mesmo raciocínio (e
+  //      mesmo formato) das regras de #503/#504 logo acima: silêncio aqui faria
+  //      o operador acreditar que ligou a durabilidade sem ter ligado.
+  //
+  //  (b) FAIL-OPEN EM PRODUÇÃO — a flag DESLIGADA restaura o caminho que a
+  //      auditoria da #506 descreveu: `src/agent/output-dispatch.ts` volta a
+  //      enviar ao canal com o registro durável tratado como opcional. Isso é
+  //      escopo `boot` e severidade `error`, e o escopo é deliberado: a regra
+  //      tem de valer TAMBÉM no caminho de rollback `MAIA_CONFIG_STRICT_BOOT=false`,
+  //      senão a alavanca de emergência do contrato viraria, sem querer, a
+  //      alavanca para desligar a durabilidade do outbound. É o mesmo desenho
+  //      de `lifecycle/schema-check-disabled` (#516/ADR 0004).
+  //
+  //      Fora de produção continua permitido — é a alavanca de rollback
+  //      declarada, e em dev/staging existem fluxos legítimos (bisect,
+  //      reprodução de bug do caminho legado) que precisam dela. Em staging
+  //      AVISA, para que o valor não atravesse a promoção despercebido.
+  if (bool(c.FEATURE_OUTBOUND_DURABLE_COMMIT) && !bool(c.FEATURE_TURN_STATE_MACHINE)) {
+    push({
+      scope: 'contract',
+      severity: 'error',
+      variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+      rule: 'outbound-commit/requires-state-machine',
+      message:
+        'FEATURE_OUTBOUND_DURABLE_COMMIT=true com FEATURE_TURN_STATE_MACHINE=false é inerte: sem a máquina de estados não existe turn_id durável, a FK composta da migração 121 torna a row do outbox inexprimível, e todo envio volta a ocorrer sem commit transacional.',
+      remediation:
+        'Ligue FEATURE_TURN_STATE_MACHINE (migrations 096/097/114/121 aplicadas), ou desligue FEATURE_OUTBOUND_DURABLE_COMMIT — ciente de que em production desligá-la é recusado no boot. Ver docs/runbooks/turn-state-machine.md.',
+    });
+  }
+  if (c.FEATURE_OUTBOUND_DURABLE_COMMIT === false) {
+    if (profile === 'production') {
+      push({
+        scope: 'boot',
+        severity: 'error',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false não é permitido no profile production: a intenção de resposta deixaria de ser commitada antes da chamada ao canal, e o registro durável do outbound voltaria a ser opcional/fail-open — ou seja, uma mensagem pode chegar ao usuário sem que o PostgreSQL saiba que ela existiria (issue #506).',
+        remediation:
+          'Remova FEATURE_OUTBOUND_DURABLE_COMMIT=false (o default é true) e garanta a migration 121 aplicada. Se o objetivo é reproduzir o caminho legado, faça isso em staging/development — em production a durabilidade do outbound é obrigatória.',
+      });
+    } else if (profile !== 'development') {
+      push({
+        scope: 'contract',
+        severity: 'warning',
+        variable: 'FEATURE_OUTBOUND_DURABLE_COMMIT',
+        rule: 'outbound-commit/production-required',
+        message:
+          'FEATURE_OUTBOUND_DURABLE_COMMIT=false: o envio volta a ocorrer sem commit transacional prévio, e uma falha do ledger deixa de impedir a entrega. Em production este valor é recusado no boot.',
+        remediation:
+          'Deixe FEATURE_OUTBOUND_DURABLE_COMMIT=true, a menos que este ambiente exista de propósito para exercitar o caminho legado.',
+      });
+    }
+  }
+
   // Janelas/limites que precisam estar em ordem.
   const orderPairs: readonly [string, string, string][] = [
     ['MESSAGE_DEBOUNCE_MS', 'MESSAGE_DEBOUNCE_MAX_MS', 'debounce'],

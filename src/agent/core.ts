@@ -70,6 +70,8 @@ import {
   TurnOwnershipLostError,
   type TurnHandle,
 } from '@/runtime/turns/index.js';
+// #631 — o escopo de SAÍDA do turno (ver a chamada, mais abaixo).
+import { runWithOutboundTurnScope } from '@/runtime/outbound/turn-scope.js';
 import {
   runWithTenantContext,
   getCurrentTenant,
@@ -649,10 +651,36 @@ async function runAgentForMensagemInner(
    * transição nossa seria recusada pelo fence, e um RETRY seria a gravação em
    * turno alheio que a #504 proíbe.
    */
+  /**
+   * Issue #631 (fatia B da #506) — o TURNO também precisa ser visível para os
+   * limites de SAÍDA, e não só o `AbortSignal` da tentativa.
+   *
+   * `dispatchOutput`/`sendOutbound` (`src/agent/output-dispatch.ts`) não
+   * recebem o handle por parâmetro — a fronteira pública deles é chamada de
+   * skills, do ReAct, do fallback do Decision Engine e do fallback de TTS, e um
+   * parâmetro obrigatório em todos significaria um call site esquecido, que é
+   * um limite de efeito SEM commit transacional. O escopo abre AQUI, no mesmo
+   * ponto de `runWithTurnExecution`, para que "tem posse" e "tem turno para
+   * commitar" sejam a mesma região por construção. Ver
+   * `src/runtime/outbound/turn-scope.ts`.
+   *
+   * Sem turno (`turn === null`: máquina de estados desligada, caminho legado) o
+   * escopo não abre e `commitOutboundIntent` devolve `no_turn_scope` — o mesmo
+   * regime de no-op que todo guard de #504 já tem.
+   */
+  const comEscopoDeSaida = <T>(fn: () => Promise<T>): Promise<T> =>
+    turn ? runWithOutboundTurnScope(turn, fn) : fn();
+
   try {
-    if (!execCtx) return await runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+    if (!execCtx) {
+      return await comEscopoDeSaida(() =>
+        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+      );
+    }
     return await runWithTurnExecution(execCtx, () =>
-      runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+      comEscopoDeSaida(() =>
+        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
+      ),
     );
   } catch (err) {
     if (err instanceof TurnOwnershipLostError) {

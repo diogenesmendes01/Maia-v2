@@ -408,17 +408,101 @@ teste, query de suporte ou painel: o fim de um turno lê-se em `agent_turns`
 `agent_turn_inputs`; `processada_em` responde apenas "este inbound já foi
 encerrado por um turno TERMINAL".
 
-### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatia A (#630)
+### Outbox de saída (`src/runtime/outbound/`) — issue #506, fatias A (#630) e B (#631)
 
 | File | Role |
 |---|---|
-| `contract.ts` | Vocabulário puro do outbox de saída: união Zod dos payloads, serialização canônica versionada, `payload_hash` e as DUAS identidades |
+| `contract.ts` | Vocabulário puro do outbox de saída: união Zod dos payloads, serialização canônica versionada, `payload_hash`, as DUAS identidades e a ponte com a coluna legada `channel` |
+| `commit.ts` | **#631** — a fronteira que o dispatcher de saída atravessa antes de qualquer chamada ao canal. Constrói o artefato, chama a transação única e **lança** se ela falhar |
+| `turn-scope.ts` | **#631** — o `TurnHandle` visível para os limites de saída, por AsyncLocalStorage (aberto em `src/agent/core.ts`, junto de `runWithTurnExecution`) |
 | `index.ts` | Fachada — importe sempre daqui |
 
-Módulo **puro**, na mesma natureza de `src/runtime/turns/contract.ts`: sem
-`db`, sem I/O, sem ALS, sem relógio. A fatia A é **aditiva** — nada envia,
-nada persiste. As fatias irmãs (#631 commit transacional, #632 delivery
-worker, #633 recovery/DLQ, #634 call sites, #635 multipart) ligam a máquina.
+`contract.ts` é **puro**, na mesma natureza de `src/runtime/turns/contract.ts`:
+sem `db`, sem I/O, sem ALS, sem relógio. As fatias irmãs que ainda faltam são
+#632 (delivery worker com claim/lease), #633 (recovery/reconciliação/DLQ),
+#634 (inventário e migração de TODOS os caminhos de envio) e #635 (histórico
+idempotente e multipart).
+
+#### O commit transacional (#631) — "nada vai ao canal antes do banco"
+
+O defeito que a fatia B corrige, textualmente da auditoria da #506: o ledger era
+tratado em caminho **opcional e fail-open** (`claimOutboundLedgerOrFailOpen` em
+`src/agent/output-dispatch.ts` — *"log the issue and proceed as if there's no
+prior row"*), e enviar e persistir ficavam separados por uma janela de crash. As
+duas coisas têm a mesma consequência: existe estado do mundo — uma mensagem no
+telefone de alguém — que o PostgreSQL nunca soube que ia existir.
+
+A ordem de todo ramo de saída passa a ser, **sem exceção**:
+
+```
+assertOutboundOwnership  →  ledger legado (#227)  →  COMMIT  →  canal
+```
+
+`commitOutboundIntent` abre **uma** transação
+(`src/db/repositories/outbound-outbox-repo.ts::commitTurnOutboundTx`) que faz,
+na mesma conexão:
+
+1. `running | outbound_pending -> outbound_pending` com o **fence** da tentativa
+   (`claim_token` vigente **e** `lease_expires_at > now()`) mais o CAS por
+   `state_version`;
+2. `INSERT` do artefato com a `logical_dedupe_key` (`ON CONFLICT DO NOTHING`);
+3. o ponteiro `agent_turns.outbound_message_id` (via `coalesce`, então multipart
+   não sobrescreve o elo da primeira parte);
+4. a auditoria `outbound_committed` por `auditTx` — que **não** engole erro;
+5. commit.
+
+Qualquer falha faz ROLLBACK e **lança**. Não há retorno "deu ruim, siga em
+frente"; não há `catch` que registre e prossiga. O erro sobe reclassificado como
+`OutboundDeliveryError(delivered: false)` — a verdade literal (nada foi ao
+canal), e o que faz o caller devolver `not_sent` em vez de `sent_no_persist`.
+
+Decisões que parecem detalhe e não são:
+
+- **`sequence_in_turn` é determinística por call site**, nunca "a próxima
+  livre". A posição entra no material da chave: alocá-la dinamicamente faria o
+  retry da mesma resposta derivar outra `logical_dedupe_key` e nascer como uma
+  SEGUNDA linha — o duplo envio criado pelo mecanismo que existe para
+  impedi-lo. Resposta principal = 0; o fallback poll→texto = 1.
+- **`idempotency_key` da row durável recebe a `logical_dedupe_key`.** A coluna é
+  `NOT NULL` desde a 063 e carrega o unique TOTAL `(tenant, agent,
+  idempotency_key)`, enquanto o unique de #630 é PARCIAL — usar a mesma chave
+  faz as duas constraints afirmarem a mesma coisa. O prefixo `mol1_` mantém a
+  chave fora do espaço de nomes legado (`<conversa_uuid>:<mensagem_uuid>`).
+- **O `WHERE` do fence não é reescrito**: vem de `turnWriteConditions()`
+  (`src/db/repositories/turn-fence-sql.ts`), a mesma fonte única de
+  `runTransition`. `agentTurnsRepo.markOutboundCommittedTx` **não** pode ser
+  usada aqui porque ela abre a própria transação (`runTransition` chama
+  `withTx`) — duas conexões, dois commits, e exatamente a janela que a fatia
+  fecha.
+- **O escopo do turno guarda o handle POR REFERÊNCIA.** `concludeTurn` grava com
+  `expected_version: handle.state_version`; sem avançar o handle no commit, o
+  CAS seguinte usaria a versão anterior, seria recusado como `state_mismatch`, e
+  o turno ficaria preso em `outbound_pending` — resposta entregue, turno
+  eternamente aberto.
+- **Enqueue é wake-up, não fonte de verdade.** No instante do commit a row já
+  está `pending` com `next_attempt_at = now()`, ou seja, já é selecionável pelo
+  predicado de `idx_outbound_messages_ready` (migração 121). Um crash entre o
+  commit e o enqueue deixa trabalho visível sem que nada consulte a BullMQ.
+
+**Exceção declarada:** o ramo de **voz** de `dispatchOutput` não commita
+artefato durável. O payload `audio` exige um `MediaRef` (`local_path` /
+`storage_object`) e `synthesizeSpeech` devolve um Buffer **em memória** — não há
+arquivo nem objeto a referenciar. `FEATURE_OUTBOUND_VOICE` tem default `false`
+(não é caminho de produção hoje); decidir onde o áudio sintetizado passa a morar
+é #634. O ramo de **documento** commita com `local_path`, válido enquanto quem
+entrega é o mesmo processo — a migração para `storage_object` é da mesma fatia.
+
+#### A flag, e por que ela não pode ser desligada em produção
+
+`FEATURE_OUTBOUND_DURABLE_COMMIT` (default ON) é a alavanca de rollback. Uma
+garantia de durabilidade que possa ser desligada em produção **não é** um kill
+switch — é o caminho fail-open com outro nome. Por isso duas regras cross-field
+(`src/config/rules.ts`):
+
+| Regra | Efeito |
+|---|---|
+| `outbound-commit/production-required` | `false` no profile `production` ⇒ **erro de BOOT**. Escopo `boot` de propósito: a regra vale também sob `MAIA_CONFIG_STRICT_BOOT=false`, senão a alavanca de emergência do contrato viraria a alavanca para desligar a durabilidade. Em staging avisa; em development é silencioso |
+| `outbound-commit/requires-state-machine` | `true` com `FEATURE_TURN_STATE_MACHINE=false` é INERTE (sem `turn_id` a FK composta da 121 torna a row inexprimível) ⇒ erro de contrato |
 
 #### As duas identidades, e por que são duas
 
@@ -594,6 +678,8 @@ Rules this module enforces:
 | `tests/integration/turn-poison-dlq-real-db.spec.ts` | #629 com Postgres real: os DOIS modos da política pela porta real (`unsafe_to_retry` bloqueia, `reasoner_failed` libera — sem mexer em `process.env`, porque `config` é singleton e o classificador de produção ficaria de fora); ATOMICIDADE com a falha caindo ENTRE as duas escritas (gatilho no `INSERT` do bloqueio: o turno NÃO pode ficar `dead_letter` com a conversa livre); idempotência do bloqueio; o varredor não churna numa conversa interditada; desbloqueio audita, re-arma o head e deixa o morto morto; ISOLAMENTO com a colisão FORÇADA nos dois eixos (mesma `stream_key` literal em dois tenants E dois agents do mesmo tenant); replay recusado por ordem comprometida e atravessado com `--reconcile`; e retry antigo com backoff em aberto bloqueando o turno novo |
 | `tests/integration/turn-stream-fairness-real-db.spec.ts` | #629 com Postgres real: uma SIMULAÇÃO do pool de workers (4 vagas puxando da mesma fila, entrando por `beginTurnExecution` e concluindo por `concludeTurn`, com a promoção devolvendo o job do sucessor). Prova que uma conversa lenta com o head segurado não impede as outras 30 de terminarem INTEIRAS; que uma conversa quente de 25 turnos nunca ocupa mais de UMA vaga e as pequenas saem com mediana de posição 11 de 45; que `maia_stream_turn_wait_seconds` recebe uma amostra por turno atendido com os baldes de SEGUNDOS; e que `starvation_total` não reconta por scrape |
 | `tests/integration/outbound-durable-outbox-schema-real-db.spec.ts` | #630 com Postgres real: row legada continua inserível, uniques PARCIAIS recusam a segunda saída e ignoram o legado, CHECK de completude impede meia-row, FK composta impede apontar para turno de outro tenant |
+| `tests/integration/outbound-commit-transacional-real-db.spec.ts` | #631 com Postgres real, entrando por `dispatchOutput`/`sendOutbound` (o call site de produção, não um harness): o double do canal **consulta o banco por conexão própria no instante do envio**, de modo que "nada vai ao canal antes do banco" vira afirmação verificável. Cobre também worker sem posse, CAS de versão, rollback total quando a falha acontece ENTRE as duas escritas, idempotência da saída lógica (uma linha **e** um envio), `delivery_unknown` em vez de `delivered` fingido, e a linha selecionável pelo recovery no instante seguinte ao commit |
+| `tests/unit/config/outbound-durable-commit-rule.spec.ts` | #631: a flag não pode ser fail-open — default ON, `false` em production é erro de escopo `boot` (sobrevive a `MAIA_CONFIG_STRICT_BOOT=false`), aviso em staging, silêncio em development, e inerte sem a máquina de estados é erro |
 
 ## In-flight changes
 
