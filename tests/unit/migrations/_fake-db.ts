@@ -13,7 +13,7 @@
  * The real SQL is still exercised end-to-end in
  * `tests/integration/migrations-runner-real-db.spec.ts`.
  */
-import type { LedgerEntry, LedgerStatus } from '@/migrations/types.js';
+import type { InvalidIndex, LedgerEntry, LedgerStatus } from '@/migrations/types.js';
 
 export interface FakeRow {
   id: string;
@@ -39,6 +39,17 @@ export interface FakeDbOptions {
   readonly failOnSql?: (sql: string) => void;
   /** Make `pool.connect()` reject. */
   readonly connectFails?: boolean;
+  /**
+   * Índices `indisvalid = false` que o catálogo falso reporta (#658).
+   *
+   * O fake NÃO simula `pg_index`: ele apenas devolve a lista que o teste
+   * declarou. É o suficiente para provar a ORDEM DAS OPERAÇÕES do runner (que
+   * ele consulta o catálogo antes de escrever `applied`, e que recusa quando a
+   * lista não é vazia) e NADA sobre `indisvalid` em si — essa parte só um
+   * Postgres real prova, e está em
+   * `tests/integration/migrations-runner-real-db.spec.ts`.
+   */
+  readonly invalidIndexes?: readonly InvalidIndex[];
 }
 
 function blankRow(id: string): FakeRow {
@@ -67,6 +78,14 @@ export class FakeDb {
   releases = 0;
   unlocks = 0;
   connects = 0;
+  /**
+   * Mutável de propósito: um teste pode inserir um índice inválido no meio do
+   * run (via `failOnSql`, que roda no momento em que a DDL da migration é
+   * enviada) para exercitar a reasserção que acontece ANTES de `markApplied`.
+   */
+  invalidIndexes: InvalidIndex[] = [];
+  /** Quantas vezes o catálogo de índices inválidos foi consultado. */
+  invalidIndexReads = 0;
 
   private snapshot: Map<string, FakeRow> | null = null;
   private lockHeld = false;
@@ -76,6 +95,7 @@ export class FakeDb {
       const id = seed.id!;
       this.ledger.set(id, { ...blankRow(id), ...seed });
     }
+    this.invalidIndexes = [...(options.invalidIndexes ?? [])];
   }
 
   get lockAvailable(): boolean {
@@ -129,6 +149,21 @@ export class FakeDb {
     }
     if (t.startsWith('SELECT column_name FROM information_schema.columns')) {
       return { rows: this.informationSchemaRows() };
+    }
+    // #658 — a sonda de índices inválidos. Reconhecida ANTES do fallthrough,
+    // que trataria a consulta como corpo de migration e faria a spec "recusa
+    // antes de qualquer DDL" acusar uma DDL que nunca existiu.
+    if (t.includes('NOT i.indisvalid')) {
+      this.invalidIndexReads += 1;
+      return {
+        rows: this.invalidIndexes.map((i) => ({
+          schema_name: i.schema,
+          index_name: i.index,
+          table_name: i.table,
+          is_ready: i.ready,
+          is_live: i.live,
+        })),
+      };
     }
     if (
       t.startsWith('CREATE TABLE IF NOT EXISTS schema_migrations') ||

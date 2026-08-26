@@ -47,7 +47,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   capabilitiesSkillRepo: { listAll: h.boom('capabilitiesSkillRepo.listAll') },
   capabilityGapsRepo: {
     listByLevel: h.boom('capabilityGapsRepo.listByLevel'),
-    listByLevels: h.boom('capabilityGapsRepo.listByLevels'),
+    listParaOTurno: h.boom('capabilityGapsRepo.listParaOTurno'),
   },
   procedureExecutionsRepo: { findActiveForConversa: h.boom('procedureExecutionsRepo.findActiveForConversa') },
   procedureDefinitionsRepo: { findById: h.boom('procedureDefinitionsRepo.findById') },

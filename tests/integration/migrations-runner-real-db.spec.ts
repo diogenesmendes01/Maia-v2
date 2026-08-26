@@ -31,7 +31,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
-import { runMigrations, repairMigration, repairAppliedRefusal } from '@/migrations/runner.js';
+import {
+  runMigrations,
+  repairMigration,
+  repairAppliedRefusal,
+  INVALID_INDEX_ERROR_CODE,
+} from '@/migrations/runner.js';
 import { main as migrateCli } from '../../scripts/migrate.js';
 import { getMigrationStatus, getSchemaReadiness } from '@/migrations/readiness.js';
 import { migrationChecksum } from '@/migrations/checksum.js';
@@ -56,6 +61,20 @@ const SELF_TX = 'BEGIN;\nCREATE TABLE t_self (id TEXT PRIMARY KEY);\nCOMMIT;\n';
 const NO_TX =
   '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS t_plain_idx ON t_plain (id);\n';
 
+/**
+ * Issue #658 — a duplicata que faz um `CREATE UNIQUE INDEX CONCURRENTLY`
+ * reprovar. É a forma exata do defeito que a épica #505 existe para eliminar
+ * (dois turnos ativos na mesma stream), reduzida ao mínimo.
+ */
+const DUP_TABLE =
+  'CREATE TABLE t_dup (id INT PRIMARY KEY, k TEXT NOT NULL);\n' +
+  "INSERT INTO t_dup (id, k) VALUES (1, 'a'), (2, 'a');\n";
+
+/** O índice de EXCLUSÃO que a duplicata acima impede de existir. */
+const DUP_UNIQUE_IDX =
+  '-- maia:no-transaction\n' +
+  'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS t_dup_k_uq ON t_dup (k);\n';
+
 let pool: pg.Pool;
 let admin: pg.Pool;
 let dir: string;
@@ -63,6 +82,38 @@ let dir: string;
 async function write(name: string, contents: string): Promise<void> {
   await writeFile(join(dir, name), contents, 'utf8');
   await writeFile(join(dir, name.replace(/\.sql$/, '_down.sql')), '-- down\nSELECT 1;\n', 'utf8');
+}
+
+/**
+ * Estado do catálogo para UM índice, no schema descartável desta suíte.
+ *
+ * Invariante ABSOLUTA, nunca delta: `vitest.config.ts` roda com `retry: 1`, e
+ * uma asserção sobre "o que mudou desde antes" é lavada pela segunda tentativa,
+ * que parte de um estado diferente. `{ present, valid }` é verdade sobre o
+ * catálogo agora, independentemente de quantas vezes o teste rodou.
+ */
+async function indexState(
+  name: string,
+): Promise<{ present: boolean; valid: boolean | null }> {
+  const { rows } = await pool.query<{ indisvalid: boolean }>(
+    `SELECT i.indisvalid
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indexrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1 AND n.nspname = $2`,
+    [name, SCHEMA],
+  );
+  if (rows.length === 0) return { present: false, valid: null };
+  return { present: true, valid: rows[0]!.indisvalid === true };
+}
+
+/** Quantas linhas do ledger existem para `id` no estado `status`. Absoluta. */
+async function ledgerRows(id: string, status: string): Promise<number> {
+  const { rows } = await pool.query<{ n: string }>(
+    'SELECT count(*) AS n FROM schema_migrations WHERE id = $1 AND status = $2',
+    [id, status],
+  );
+  return Number(rows[0]!.n);
 }
 
 function deps(overrides: Record<string, unknown> = {}) {
@@ -583,6 +634,174 @@ d('migration runner — real Postgres (#516)', () => {
     expect(describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })))
       .toMatchObject({ exit_code: 97, state: 'unknown' });
   }, 60_000);
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Issue #658 — DDL `CONCURRENTLY` que reprova deixa um índice
+  // `indisvalid = false` no catálogo, e o `IF NOT EXISTS` da tentativa
+  // seguinte o enxerga, pula a criação e devolve SUCESSO. O runner lia exit 0
+  // e marcava a migration como aplicada com a invariante de exclusão
+  // inexistente.
+  //
+  // Nada aqui é simulado: a duplicata é real, a reprovação do
+  // `CREATE UNIQUE INDEX CONCURRENTLY` é real, e o índice inválido é o que o
+  // Postgres 16 realmente deixa para trás. Um fake do catálogo não provaria
+  // nada sobre `indisvalid`.
+  // ──────────────────────────────────────────────────────────────────────
+  it('um índice CONCURRENTLY inválido impede a migration de ser marcada como aplicada — inclusive na REAPLICAÇÃO', async () => {
+    await write('001_dup.sql', DUP_TABLE);
+    await write('002_uq.sql', DUP_UNIQUE_IDX);
+    await write('003_later.sql', 'CREATE TABLE t_later (id TEXT);\n');
+
+    // ── (a) primeira tentativa: o índice único reprova na duplicata ──────
+    const first = await runMigrations(deps());
+    expect(first.outcome).toBe('failed');
+    expect(first.failure).toMatchObject({ id: '002_uq.sql', ledger_status: 'dirty' });
+
+    // O índice EXISTE e é INVÁLIDO — a pegadinha inteira em duas linhas.
+    expect(await indexState('t_dup_k_uq')).toEqual({ present: true, valid: false });
+    // E o relatório devolvido com a falha já carrega o catálogo, não só o ledger.
+    expect(first.status!.invalid_indexes.map((i) => i.index)).toEqual(['t_dup_k_uq']);
+
+    // ── (b) reaplicar SEM tratar o índice: o defeito original ────────────
+    // Um `psql -f` do mesmo arquivo devolveria exit 0 aqui (NOTICE: relation
+    // "t_dup_k_uq" already exists, skipping / CREATE INDEX). O runner recusa
+    // ANTES de mandar qualquer DDL.
+    const again = await runMigrations(deps());
+    expect(again.outcome).toBe('blocked');
+    expect(again.blockers[0]!.kind).toBe('invalid_index');
+    expect(again.blockers[0]!.detail).toContain('t_dup_k_uq');
+    expect(again.blockers.map((b) => b.kind)).toContain('dirty_migration');
+
+    // ── (c) o operador "limpa a flag" e reaplica — o erro humano que a
+    //        issue existe para eliminar. A recusa TEM de sobreviver a isso.
+    const repaired = await repairMigration(deps(), {
+      id: '002_uq.sql',
+      outcome: 'pending',
+      reason: 'efeitos parciais desfeitos (mas o indice invalido ficou)',
+    });
+    expect(repaired.ok).toBe(true);
+
+    const reapplied = await runMigrations(deps());
+    expect(reapplied.outcome).toBe('blocked');
+    expect(reapplied.blockers.map((b) => b.kind)).toContain('invalid_index');
+    expect(reapplied.applied).toEqual([]);
+
+    // Invariantes ABSOLUTAS sobre o estado, não sobre o delta do run:
+    expect(await ledgerRows('002_uq.sql', 'applied')).toBe(0);
+    expect(await indexState('t_dup_k_uq')).toEqual({ present: true, valid: false });
+    // E nada depois dela foi sequer tentado.
+    const later = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_later`,
+    ]);
+    expect(later.rows[0]).toEqual({ present: false });
+
+    // ── (d) o veredito de schema enxerga isso, não só os logs do runner ──
+    const readiness = await getSchemaReadiness({ pool, migrationsDir: dir });
+    expect(readiness.ready).toBe(false);
+    expect(readiness.state).toBe('blocked');
+    expect(readiness.blockers.map((b) => b.kind)).toContain('invalid_index');
+    expect(readiness.status!.invalid_indexes.map((i) => i.index)).toEqual(['t_dup_k_uq']);
+
+    // ── (e) e o BOOT morre com um código dedicado à invariante ───────────
+    const failure = describeSchemaBootFailure(readiness);
+    expect(failure).toMatchObject({ exit_code: 98, kind: 'invalid_index' });
+    expect(failure!.message).toContain('t_dup_k_uq');
+    expect(failure!.remediation).toContain('DROP INDEX CONCURRENTLY');
+
+    // ── (f) o remédio do runbook, executado literalmente, destrava tudo ──
+    await pool.query('DROP INDEX CONCURRENTLY t_dup_k_uq');
+    await pool.query('DELETE FROM t_dup WHERE id = 2');
+    const fixed = await runMigrations(deps());
+    expect(fixed.outcome).toBe('applied');
+    expect(fixed.applied).toEqual(['002_uq.sql', '003_later.sql']);
+    expect(await indexState('t_dup_k_uq')).toEqual({ present: true, valid: true });
+    expect(await ledgerRows('002_uq.sql', 'applied')).toBe(1);
+    expect((await getSchemaReadiness({ pool, migrationsDir: dir })).ready).toBe(true);
+  }, 120_000);
+
+  /**
+   * O segundo braço da invariante: a reasserção NO MOMENTO de escrever
+   * `applied`.
+   *
+   * O pré-voo de (b) acima cobre "o índice já estava inválido quando o run
+   * começou". Este cobre o outro lado: o índice ficou inválido DURANTE o run,
+   * e a migration terminou sem levantar erro nenhum. É o que acontece quando
+   * um operador roda a DDL concorrente à mão numa sessão paralela enquanto o
+   * job de migration está em voo — o pré-voo já passou, e sem esta reasserção
+   * o runner escreveria `applied`.
+   *
+   * A injeção entra pelo `RunnerDeps.pool`, que é a costura de injeção do
+   * próprio runner de PRODUÇÃO: `runMigrations` é o real, o arquivo de
+   * migration é real, e o índice inválido é produzido por um
+   * `CREATE UNIQUE INDEX CONCURRENTLY` real que reprova numa duplicata real.
+   * Só o INSTANTE da injeção é determinístico — e é isso que a torna um teste
+   * em vez de uma corrida.
+   */
+  it('recusa marcar como aplicada uma migration que terminou SEM ERRO com um índice inválido no schema', async () => {
+    await write('001_dup.sql', DUP_TABLE);
+    await write(
+      '002_touch.sql',
+      '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS t_dup_id_idx ON t_dup (id);\n',
+    );
+    await write('003_later.sql', 'CREATE TABLE t_later (id TEXT);\n');
+
+    let injected = false;
+    const injectingPool = {
+      connect: async () => {
+        const client = await pool.connect();
+        return {
+          query: async (text: string, values?: unknown[]) => {
+            const result = await client.query(text, values as never);
+            // Assim que a DDL da 002 volta, e ANTES da reasserção do runner,
+            // outra sessão deixa um índice inválido no mesmo schema.
+            if (!injected && text.includes('t_dup_id_idx')) {
+              injected = true;
+              await pool
+                .query('CREATE UNIQUE INDEX CONCURRENTLY t_dup_k_uq ON t_dup (k)')
+                .then(
+                  () => {
+                    throw new Error('a duplicata deveria ter reprovado a construcao do indice');
+                  },
+                  () => undefined,
+                );
+            }
+            return result;
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+
+    const result = await runMigrations(deps({ pool: injectingPool }));
+    expect(injected).toBe(true);
+
+    // A migration não levantou erro — e mesmo assim NÃO foi certificada.
+    expect(result.outcome).toBe('failed');
+    expect(result.failure).toMatchObject({
+      id: '002_touch.sql',
+      ledger_status: 'dirty',
+      error_class: INVALID_INDEX_ERROR_CODE,
+    });
+    expect(result.blockers[0]!.kind).toBe('invalid_index');
+    expect(result.blockers[0]!.detail).toContain('t_dup_k_uq');
+
+    // Invariantes ABSOLUTAS sobre o catálogo e o ledger:
+    expect(await indexState('t_dup_k_uq')).toEqual({ present: true, valid: false });
+    // O trabalho da própria migration é durável — por isso `dirty`, não `failed`.
+    expect(await indexState('t_dup_id_idx')).toEqual({ present: true, valid: true });
+    expect(await ledgerRows('002_touch.sql', 'applied')).toBe(0);
+    expect(await ledgerRows('002_touch.sql', 'dirty')).toBe(1);
+    const errorClass = await pool.query<{ error_class: string }>(
+      'SELECT error_class FROM schema_migrations WHERE id = $1',
+      ['002_touch.sql'],
+    );
+    expect(errorClass.rows[0]!.error_class).toBe(INVALID_INDEX_ERROR_CODE);
+    // A 003 nunca foi tentada.
+    const later = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_later`,
+    ]);
+    expect(later.rows[0]).toEqual({ present: false });
+  }, 120_000);
 
   it('readiness on a database with no ledger at all is unknown, never ready', async () => {
     await write('001_plain.sql', PLAIN);
