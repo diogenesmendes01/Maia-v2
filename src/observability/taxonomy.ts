@@ -848,6 +848,15 @@ export const METRIC = {
   ONBOARDING_IDEMPOTENCY_REPLAY: 'maia_onboarding_idempotency_replay_total',
   /** Duração de um passo da saga. */
   ONBOARDING_STEP_DURATION_MS: 'maia_onboarding_step_duration_ms',
+  /**
+   * Tentativas de bootstrap global (#519), por `result`.
+   *
+   * Cardinalidade: `result` vem de `BOOTSTRAP_RESULTS`, fechado. NUNCA o
+   * segredo, o id da credencial ou o tenant — o bootstrap acontece ANTES de
+   * existir tenant, e um id de credencial como label seria alta cardinalidade
+   * sobre um objeto de uso unico.
+   */
+  BOOTSTRAP_ATTEMPT: 'maia_bootstrap_attempt_total',
   /** Checks BLOQUEANTES reprovados, por `check_code`. */
   AGENT_READINESS_FAILED: 'maia_agent_readiness_failed_total',
   /**
@@ -1261,6 +1270,32 @@ export const ONBOARDING_STEP_VALUES: readonly string[] = Object.freeze([
  * coisa fora desta lista vira `CLOSED_VOCABULARY_FALLBACK`, e o texto original
  * fica só em `onboarding_runs.last_error_code`, no evento e na auditoria.
  */
+/**
+ * Valores admitidos no label `result` de `maia_bootstrap_attempt_total` (#519).
+ *
+ * Fechado de proposito: `result` responde "o bootstrap foi concedido, e se nao,
+ * por que" — e um vocabulario aberto aqui viraria texto de chamador numa serie.
+ * O detalhe fica na auditoria, nao no label.
+ */
+export const BOOTSTRAP_RESULTS: readonly string[] = Object.freeze([
+  /** Credencial emitida. */
+  'issued',
+  /** Credencial validada e CONSUMIDA — o unico caminho que concede. */
+  'redeemed',
+  /** Segredo nao confere, ausente ou fora de formato. */
+  'invalid',
+  /** `expires_at <= now()`. */
+  'expired',
+  /** Perdeu o compare-and-swap, ou ja' tinha sido usada. */
+  'consumed',
+  /** `locked_until > now()` — rate limit estourado. */
+  'locked_out',
+  /** Ja' existe a linha em `bootstrap_completions`. Recusa DEFINITIVA. */
+  'already_completed',
+  /** Ja' existe credencial viva (unique parcial). */
+  'credential_exists',
+]);
+
 export const ONBOARDING_REASONS: readonly string[] = Object.freeze([
   // erros tipados da saga
   'invalid_scope',
