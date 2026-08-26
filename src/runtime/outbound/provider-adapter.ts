@@ -41,16 +41,30 @@
  *   `accepted_unconfirmed` e depois `delivery_unknown`. Não é pessimismo — é o
  *   que a primitiva realmente informa.
  * - `sendVoice` precisa dos BYTES do áudio, e o artefato guarda uma
- *   REFERÊNCIA. A resolução de `storage_object` para bytes não existe ainda
- *   (é #634, junto com a migração dos call sites), então `audio` com
- *   referência de storage é recusado como `rejected_permanent` em vez de
- *   enviar outra coisa. `local_path` é lido do disco — e a limitação de que um
- *   `local_path` não sobrevive entre processos já está declarada no contrato
- *   de #630.
+ *   REFERÊNCIA.
+ *
+ * ─── #634 — `storage_object` PASSA A RESOLVER ───────────────────────────────
+ *
+ * A dívida que #632 declarou aqui ("a resolução de `storage_object` para bytes
+ * não existe ainda") está paga: `resolveOutboundMediaPath`
+ * (`media-store.ts`) devolve o caminho real do objeto, fail-closed em bucket,
+ * forma da chave, ESCOPO (tenant/agent) e contenção.
+ *
+ * `local_path` continua sendo lido do disco — e continua com a limitação
+ * declarada em #630 de não sobreviver entre processos. Ele não foi removido do
+ * contrato porque nenhum call site de produção o emite mais (o inventário de
+ * `send-paths.ts` é a evidência) e porque rows legadas ainda podem carregá-lo:
+ * ler o que existe é melhor que recusar o que já foi commitado.
+ *
+ * Uma referência que NÃO resolve continua terminando em `rejected_permanent`
+ * com `media_ref_unresolved` — recusa DEFINITIVA e observável em vez de
+ * "enviar outra coisa". A diferença é que agora isso significa "o objeto
+ * sumiu", não "o worker não sabe ler".
  */
 import { readFile } from 'node:fs/promises';
 import type { LineOutput } from '@/gateway/line-output.js';
-import type { OutboundPayload, OutboundProviderChannel } from './contract.js';
+import type { MediaRef, OutboundPayload, OutboundProviderChannel } from './contract.js';
+import { resolveOutboundMediaPath } from './media-store.js';
 import {
   shouldPassIdempotencyKey,
   type ProviderAttemptObservation,
@@ -131,7 +145,7 @@ async function callPrimitive(
       return acceptance(wid, line);
     }
     case 'document': {
-      const path = localPathOf(payload.media);
+      const path = await mediaPathOf(payload.media);
       if (!path) return unresolvedMedia();
       const wid = await line.sendDocument(jid, path, {
         mimetype: payload.mimetype,
@@ -141,7 +155,7 @@ async function callPrimitive(
       return acceptance(wid, line);
     }
     case 'audio': {
-      const path = localPathOf(payload.media);
+      const path = await mediaPathOf(payload.media);
       if (!path) return unresolvedMedia();
       // `readFile` pode lançar; o catch de `sendPayloadToProvider` classifica
       // como pré-envio só quando o erro carrega o tag. Um ENOENT cru é
@@ -208,18 +222,35 @@ function acceptance(
 }
 
 /**
- * Referência de mídia que este worker ainda não sabe resolver.
+ * Referência de mídia que não resolve para bytes legíveis.
  *
- * `storage_object` é a forma DURÁVEL de #630 e a que o delivery worker
- * precisará quando entregar minutos depois e de outra réplica — mas o
- * resolvedor (credencial de runtime, download) é #634. Até lá, recusar
- * DEFINITIVAMENTE é o desfecho honesto: um `rejected_retryable` faria a linha
- * girar no backoff para sempre, e enviar "o que der" é o que a issue proíbe.
+ * Recusar DEFINITIVAMENTE continua sendo o desfecho honesto: um
+ * `rejected_retryable` faria a linha girar no backoff para sempre contra um
+ * objeto que não vai reaparecer, e enviar "o que der" é o que a issue proíbe.
+ *
+ * #634 mudou o SIGNIFICADO desta recusa, não a recusa. Antes ela dizia "este
+ * worker não sabe resolver `storage_object`" — um limite do código. Agora diz
+ * "o objeto referenciado não está legível neste volume" — um fato sobre o
+ * mundo. O runbook de recuperação trata os dois casos de forma oposta, então a
+ * distinção precisa existir na documentação mesmo que o código emita o mesmo
+ * `error_code`.
  */
 function unresolvedMedia(): ProviderAttemptObservation {
   return { kind: 'rejected_permanent', error_code: 'media_ref_unresolved' };
 }
 
-function localPathOf(media: { kind: string; path?: string }): string | null {
-  return media.kind === 'local_path' ? (media.path ?? null) : null;
+/**
+ * Caminho legível para as DUAS formas do `MediaRef` de #630.
+ *
+ * `null` (e não um throw) quando não resolve: quem chama transforma em
+ * `rejected_permanent`, que é a classificação certa e não pode ser confundida
+ * com o throw AMBÍGUO do transporte.
+ */
+async function mediaPathOf(media: MediaRef): Promise<string | null> {
+  if (media.kind === 'local_path') return media.path ?? null;
+  try {
+    return await resolveOutboundMediaPath(media);
+  } catch {
+    return null;
+  }
 }
