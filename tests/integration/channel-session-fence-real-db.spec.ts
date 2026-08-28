@@ -1,8 +1,8 @@
 /**
- * #513 (fatia A) — a POSSE de uma sessão de canal contra Postgres real.
+ * #513 (fatia A) — o FENCE da posse de sessão de canal contra Postgres real.
  *
  * Por que só um banco de verdade prova isto. As garantias aqui NÃO estão no
- * código TypeScript: estão na PK de `channel_session_leases`, no `WHERE` do
+ * código TypeScript: estão na PK de `channel_line_state`, no `WHERE` do
  * `ON CONFLICT DO UPDATE` e no `now()` do PostgreSQL. Um mock devolveria
  * exatamente o que eu mandasse devolver, e a pergunta que importa — "duas
  * réplicas de verdade, disputando de verdade, produzem UM dono?" — não seria
@@ -41,9 +41,8 @@ async function seedChannel(linha: string): Promise<string> {
 /** Força o vencimento pelo BANCO — o mesmo efeito que esperar o prazo. */
 async function vencerLease(channelId: string): Promise<void> {
   await pool.query(
-    `UPDATE channel_session_leases
-        SET lease_expires_at = now() - interval '1 second',
-            acquired_at = now() - interval '1 hour'
+    `UPDATE channel_line_state
+        SET session_owner_lease_expires_at = now() - interval '1 second'
       WHERE channel_id = $1`,
     [channelId],
   );
@@ -51,13 +50,29 @@ async function vencerLease(channelId: string): Promise<void> {
 
 const tokenNoBanco = async (channelId: string): Promise<number> => {
   const r = await pool.query<{ t: string }>(
-    'SELECT fencing_token::text AS t FROM channel_session_leases WHERE channel_id = $1',
+    'SELECT session_fencing_token::text AS t FROM channel_line_state WHERE channel_id = $1',
     [channelId],
   );
   return Number(r.rows[0]!.t);
 };
 
-d('#513 — channel_session_leases (Postgres real)', () => {
+const donoNoBanco = async (channelId: string): Promise<string | null> => {
+  const r = await pool.query<{ o: string | null }>(
+    'SELECT session_owner_instance AS o FROM channel_line_state WHERE channel_id = $1',
+    [channelId],
+  );
+  return r.rows[0]?.o ?? null;
+};
+
+const prazoNoBanco = async (channelId: string): Promise<number> => {
+  const r = await pool.query<{ e: Date }>(
+    'SELECT session_owner_lease_expires_at AS e FROM channel_line_state WHERE channel_id = $1',
+    [channelId],
+  );
+  return r.rows[0]!.e.getTime();
+};
+
+d('#513 — fence da posse de sessão (Postgres real)', () => {
   let canal: string;
 
   beforeAll(async () => {
@@ -73,12 +88,13 @@ d('#513 — channel_session_leases (Postgres real)', () => {
   });
 
   afterAll(async () => {
+    await pool?.query('DELETE FROM channel_line_state WHERE tenant_id = $1', [T]);
     await pool?.query('DELETE FROM channels WHERE tenant_id = $1', [T]);
     await pool?.end();
   });
 
   beforeEach(async () => {
-    // `channel_session_leases` some junto pelo ON DELETE CASCADE da FK.
+    await pool.query('DELETE FROM channel_line_state WHERE tenant_id = $1', [T]);
     await pool.query('DELETE FROM channels WHERE tenant_id = $1', [T]);
     canal = await seedChannel(`5511${Date.now() % 100000000}`);
   });
@@ -106,14 +122,14 @@ d('#513 — channel_session_leases (Postgres real)', () => {
 
     // E o banco concorda com quem ganhou — a posse não é uma opinião do
     // processo, é a linha gravada.
-    const dono = await pool.query<{ owner_instance_id: string }>(
-      'SELECT owner_instance_id FROM channel_session_leases WHERE channel_id = $1',
+    const linhas = await pool.query(
+      'SELECT 1 FROM channel_line_state WHERE channel_id = $1',
       [canal],
     );
-    expect(dono.rowCount, 'o banco guardou mais de uma posse para o mesmo canal').toBe(1);
+    expect(linhas.rowCount, 'o banco guardou mais de uma posse para o mesmo canal').toBe(1);
     const vencedora = donas[0]!;
     expect(vencedora.held).toBe(true);
-    expect(dono.rows[0]!.owner_instance_id).toBe(
+    expect(await donoNoBanco(canal)).toBe(
       (vencedora as { owner_instance_id: string }).owner_instance_id,
     );
   });
@@ -155,10 +171,7 @@ d('#513 — channel_session_leases (Postgres real)', () => {
     const segunda = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_2 });
     expect(segunda.held).toBe(true);
 
-    const prazoDoNovo = await pool.query<{ e: Date }>(
-      'SELECT lease_expires_at AS e FROM channel_session_leases WHERE channel_id = $1',
-      [canal],
-    );
+    const prazoDoNovo = await prazoNoBanco(canal);
 
     // A réplica 1 ainda acha que é dona e bate o heartbeat com o token velho.
     const r = await mod.heartbeatChannelLease(escopo(), tokenAntigo, {
@@ -169,11 +182,7 @@ d('#513 — channel_session_leases (Postgres real)', () => {
 
     // E a batida do zumbi NÃO pode ter mexido no prazo do dono legítimo — um
     // heartbeat alheio que estende a lease é pior que um que falha.
-    const depois = await pool.query<{ e: Date }>(
-      'SELECT lease_expires_at AS e FROM channel_session_leases WHERE channel_id = $1',
-      [canal],
-    );
-    expect(depois.rows[0]!.e.getTime()).toBe(prazoDoNovo.rows[0]!.e.getTime());
+    expect(await prazoNoBanco(canal)).toBe(prazoDoNovo);
   });
 
   it('o MESMO dono com um fence VELHO é recusado — o token, não só a identidade', async () => {
@@ -271,6 +280,36 @@ d('#513 — channel_session_leases (Postgres real)', () => {
     );
   });
 
+  it('o heartbeat do worker de pairing não rouba o registro de um dono VIVO', async () => {
+    // Este é o caso que motivou pôr o fence em `channel_line_state` em vez de
+    // numa tabela nova. `renewSessionLeases` era last-writer-wins declarado, e
+    // é o que endereça `disable`/`repair` à réplica que segura o socket: com
+    // duas réplicas, a segunda a bater se carimbava como dona e o comando
+    // passava a ser entregue a quem NÃO tem o socket.
+    const primeira = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });
+    expect(primeira.held).toBe(true);
+
+    const { channelLineStateRepo } = await import(
+      '../../src/db/repositories/channel-line-state-repos.js'
+    );
+    await channelLineStateRepo.renewSessionLeases(REPLICA_2, [
+      { channel_id: canal, tenant_id: T, agent_id: A },
+    ]);
+
+    expect(
+      await donoNoBanco(canal),
+      'o heartbeat da réplica 2 roubou o registro de posse da réplica 1',
+    ).toBe(REPLICA_1);
+
+    // E, depois que a posse VENCE, o mesmo heartbeat pode assumir — a guarda é
+    // sobre dono vivo, não um bloqueio permanente.
+    await vencerLease(canal);
+    await channelLineStateRepo.renewSessionLeases(REPLICA_2, [
+      { channel_id: canal, tenant_id: T, agent_id: A },
+    ]);
+    expect(await donoNoBanco(canal)).toBe(REPLICA_2);
+  });
+
   it('a varredura cross-tenant enxerga a linha órfã, e só ela', async () => {
     const outroCanal = await seedChannel('5511000000001');
     await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });
@@ -280,7 +319,7 @@ d('#513 — channel_session_leases (Postgres real)', () => {
     );
     await vencerLease(canal);
 
-    const orfas = await mod.listarLeasesOrfas(50);
+    const orfas = await mod.listarPossesOrfas(50);
     const meus = orfas.filter((o) => o.tenant_id === T);
     expect(meus.map((o) => o.channel_id)).toEqual([canal]);
     // Cada órfã carrega o próprio escopo — quem agir sobre ela reentra no
@@ -289,7 +328,8 @@ d('#513 — channel_session_leases (Postgres real)', () => {
     expect(meus[0]!.agent_id).toBe(A);
   });
 
-  it('o literal `default` nunca é dono de linha — nem pelo guard, nem pelo banco', async () => {
+  it('a posse registrada nunca fica sem prazo nem sem fence', async () => {
+    // O literal reservado nunca é dono de linha.
     await expect(
       mod.acquireChannelLease(
         { tenant_id: 'default', agent_id: A, channel_id: canal },
@@ -297,14 +337,15 @@ d('#513 — channel_session_leases (Postgres real)', () => {
       ),
     ).rejects.toThrow(/default/);
 
-    // E, se alguém contornasse o guard, o CHECK da migration 137 recusa.
+    // E, se alguém contornasse o guard, o CHECK de coerência da 137 recusa uma
+    // posse sem prazo e sem fence — dono registrado sem lease é dono eterno.
     await expect(
       pool.query(
-        `INSERT INTO channel_session_leases
-           (channel_id, tenant_id, agent_id, owner_instance_id, lease_expires_at)
-         VALUES ($1, 'default', $2, $3, now() + interval '30 seconds')`,
-        [canal, A, REPLICA_1],
+        `INSERT INTO channel_line_state
+           (channel_id, tenant_id, agent_id, session_owner_instance)
+         VALUES ($1, $2, $3, $4)`,
+        [canal, T, A, REPLICA_1],
       ),
-    ).rejects.toThrow(/channel_session_leases_sem_default_chk/);
+    ).rejects.toThrow(/channel_line_state_session_fence_chk/);
   });
 });
