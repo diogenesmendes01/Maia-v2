@@ -747,11 +747,10 @@ export const AUDIT_ACTIONS = [
    * O `metadata.reason` carrega o codigo tipado; o segredo NUNCA entra.
    */
   'onboarding_step_denied',
-  /**
-   * A primeira identidade administrativa global foi criada. Acontece no maximo
-   * UMA vez na vida do sistema — `bootstrap_completions.singleton` garante.
-   */
-  'bootstrap_initial_admin_created',
+  // `bootstrap_initial_admin_created` NAO entra aqui ainda, de proposito: a
+  // fatia que a EMITE (criacao do founder) ainda nao existe, e declarar uma
+  // acao sem emissor e' justamente a divida que a #535 registra em 19 spans.
+  // Ela entra no mesmo PR que a emite.
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
