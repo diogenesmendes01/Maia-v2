@@ -310,6 +310,31 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     expect(await donoNoBanco(canal)).toBe(REPLICA_2);
   });
 
+  it('a posse adquirida com a identidade PADRÃO é reconhecida pelo release já existente', async () => {
+    // O acoplamento que este teste prende: `acquireChannelLease` sem
+    // `ownerInstanceId` tem que gravar a MESMA identidade que
+    // `releaseSessionOwnership(runtimeInstanceId(), ...)` procura. Uma
+    // identidade própria do módulo passaria em todos os outros testes deste
+    // arquivo (que passam o dono explicitamente) e quebraria só o shutdown
+    // ordenado em produção — deixando toda linha presa até a lease vencer.
+    const { runtimeInstanceId } = await import('../../src/runtime/instance-identity.js');
+    const { channelLineStateRepo } = await import(
+      '../../src/db/repositories/channel-line-state-repos.js'
+    );
+
+    const posse = await mod.acquireChannelLease(escopo());
+    expect(posse.held).toBe(true);
+
+    // Âncora anti-vacuidade: a posse existe mesmo, e está no nome esperado.
+    expect(await donoNoBanco(canal)).toBe(runtimeInstanceId());
+
+    const liberadas = await channelLineStateRepo.releaseSessionOwnership(runtimeInstanceId(), [
+      canal,
+    ]);
+    expect(liberadas, 'o release existente não reconheceu a posse recém-adquirida').toBe(1);
+    expect(await donoNoBanco(canal)).toBeNull();
+  });
+
   it('a varredura cross-tenant enxerga a linha órfã, e só ela', async () => {
     const outroCanal = await seedChannel('5511000000001');
     await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });

@@ -48,8 +48,6 @@
  * ao perder a posse, e não apenas conferir o token depois de enviar.
  */
 import { sql } from 'drizzle-orm';
-import { hostname } from 'node:os';
-import { randomUUID } from 'node:crypto';
 import { db } from '@/db/client.js';
 import {
   fenceOnUpsert,
@@ -58,6 +56,7 @@ import {
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
 import { METRIC } from '@/observability/taxonomy.js';
+import { runtimeInstanceId } from '@/runtime/instance-identity.js';
 
 // ── Vocabulário ──────────────────────────────────────────────────────────────
 
@@ -99,22 +98,21 @@ export type ChannelFenceOperation = (typeof CHANNEL_FENCE_OPERATIONS)[number];
 export const CHANNEL_LEASE_TTL_MS = 30_000;
 
 /**
- * Identidade DESTE processo como dono. Sorteada uma vez por processo, e não
- * derivada só do host: duas réplicas no mesmo host são dois donos distintos, e
- * um `hostname` compartilhado faria uma renovar a lease da outra.
+ * Identidade DESTE processo como dono.
  *
- * O `hostname` entra como prefixo porque é o que o operador reconhece ao ler a
- * tabela às três da manhã; o uuid é o que garante a distinção.
+ * É `runtimeInstanceId()` — `<hostname>:<pid>` —, a MESMA que o resto da casa
+ * já usa para posse, e não uma identidade nova. Isso não é economia de código:
+ * uma segunda identidade faria `acquireChannelLease` gravar um dono que
+ * `releaseSessionOwnership(runtimeInstanceId(), ...)` nunca reconheceria, e o
+ * shutdown ordenado passaria a deixar TODAS as linhas presas até a lease
+ * vencer. Duas representações do mesmo fato divergem; aqui o fato é "qual
+ * processo é este".
+ *
+ * Ela muda a cada restart de propósito (o pid muda), que é exatamente como uma
+ * posse órfã se torna reconhecível.
  */
-let instanciaCorrente: string | null = null;
 export function channelOwnerInstanceId(): string {
-  instanciaCorrente ??= `${hostname()}:${randomUUID()}`;
-  return instanciaCorrente;
-}
-
-/** Só para teste: força uma identidade, simulando outra réplica. */
-export function __setChannelOwnerInstanceIdForTest(id: string | null): void {
-  instanciaCorrente = id;
+  return runtimeInstanceId();
 }
 
 // ── Tipos de retorno ─────────────────────────────────────────────────────────
