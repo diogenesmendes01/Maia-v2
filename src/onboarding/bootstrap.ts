@@ -245,6 +245,37 @@ export async function redeemBootstrapCredential(input: {
 }
 
 /**
+ * Grava o marcador DENTRO de uma transacao ja' aberta.
+ *
+ * Esta variante existe porque o marcador e a criacao do founder TEM de ser
+ * atomicos entre si. Se fossem duas transacoes, um crash entre elas deixaria
+ * o sistema num de dois estados incoerentes: founder criado sem marcador (o
+ * bloqueio definitivo nunca engata, e uma segunda credencial pode ser
+ * emitida), ou marcador sem founder (o bootstrap fica bloqueado para sempre
+ * sem nunca ter produzido identidade administrativa).
+ */
+export async function markBootstrapCompletedTx(
+  tx: Parameters<Parameters<typeof withTx>[0]>[0],
+  input: { credential_id: string; tenant_id: string; founder_user_id: string },
+): Promise<void> {
+  try {
+    await tx.insert(bootstrap_completions).values({
+      credential_id: input.credential_id,
+      tenant_id: input.tenant_id,
+      founder_user_id: input.founder_user_id,
+    });
+  } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      throw new OnboardingError(
+        'bootstrap_already_completed',
+        'bootstrap global já foi concluído neste sistema',
+      );
+    }
+    throw err;
+  }
+}
+
+/**
  * Grava o marcador monotonico de bootstrap concluido. Um segundo bootstrap
  * viola a PK de `singleton` — e' o banco recusando, nao esta funcao.
  */

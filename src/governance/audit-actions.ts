@@ -747,10 +747,14 @@ export const AUDIT_ACTIONS = [
    * O `metadata.reason` carrega o codigo tipado; o segredo NUNCA entra.
    */
   'onboarding_step_denied',
-  // `bootstrap_initial_admin_created` NAO entra aqui ainda, de proposito: a
-  // fatia que a EMITE (criacao do founder) ainda nao existe, e declarar uma
-  // acao sem emissor e' justamente a divida que a #535 registra em 19 spans.
-  // Ela entra no mesmo PR que a emite.
+  /**
+   * A primeira identidade administrativa global foi criada. Acontece no maximo
+   * UMA vez na vida do sistema — a PK de `bootstrap_completions.singleton`
+   * garante, e o marcador e' gravado na MESMA transacao que cria o founder.
+   *
+   * Emitida em `applyProvisionAdmin` quando `run.kind === 'global_bootstrap'`.
+   */
+  'bootstrap_initial_admin_created',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
