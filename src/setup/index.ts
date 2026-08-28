@@ -225,6 +225,86 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     return reply.type('application/json').send({ ok: true });
   });
 
+  /**
+   * Bootstrap global (#519) — cria a PRIMEIRA identidade administrativa.
+   *
+   * Substitui o `INSERT INTO app_users ... VALUES (..., 'default', ...)` que
+   * `docs/admin-ui-deploy.md` documentava, e que violava o invariante de
+   * nenhum fallback `default` em path dinâmico.
+   *
+   * POR QUE NÃO USA A SESSÃO DE SETUP. O token de `/setup/session` é o portão
+   * do pareamento de LINHA. Aceitá-lo aqui faria dele, na prática, uma
+   * autorização para cunhar identidade administrativa global — dois níveis de
+   * privilégio muito diferentes atrás da mesma chave. Quem autoriza aqui é a
+   * credencial de bootstrap, e só ela.
+   *
+   * O SEGREDO VAI NO CORPO, nunca em query string: a issue exige, e o motivo é
+   * que URL vaza em log de proxy, em Referer e no histórico do navegador.
+   *
+   * Depois do primeiro bootstrap a rota responde 409 para sempre — o veredito
+   * vem de `bootstrap_completions`, cuja PK torna o bloqueio um fato do banco
+   * e não uma checagem que a próxima réplica poderia perder.
+   */
+  app.post('/setup/bootstrap', async (req, reply) => {
+    applyHeaders(reply);
+    const body = (req.body ?? {}) as {
+      secret?: string;
+      tenant_id?: string;
+      tenant_nome?: string;
+      email?: string;
+      nome?: string;
+      idempotency_key?: string;
+    };
+
+    const { isBootstrapCompleted } = await import('@/onboarding/bootstrap.js');
+    if (await isBootstrapCompleted()) {
+      // 409, não 403: o pedido está bem formado e autenticado ou não — o que
+      // impede é o ESTADO do sistema, e essa distinção importa para quem opera.
+      return reply
+        .code(409)
+        .type('application/json')
+        .send({ error: 'bootstrap_already_completed' });
+    }
+
+    const obrigatorios = ['secret', 'tenant_id', 'tenant_nome', 'email', 'idempotency_key'] as const;
+    for (const campo of obrigatorios) {
+      if (typeof body[campo] !== 'string' || (body[campo] as string).length === 0) {
+        return reply.code(400).type('application/json').send({ error: 'campo_obrigatorio', campo });
+      }
+    }
+
+    const { runGlobalBootstrap } = await import('@/onboarding/wizard.js');
+    const { OnboardingError } = await import('@/onboarding/errors.js');
+
+    try {
+      // O ciclo INTEIRO vive no módulo de onboarding, não aqui: os passos
+      // exigem um ator com papel `founder`, e essa rota não pode segurá-lo.
+      const out = await runGlobalBootstrap({
+        presented_secret: body.secret as string,
+        tenant_id: body.tenant_id as string,
+        tenant_nome: body.tenant_nome as string,
+        email: body.email as string,
+        nome: body.nome,
+        idempotency_key: body.idempotency_key as string,
+      });
+      // A resposta NUNCA ecoa o segredo nem o e-mail.
+      return reply.type('application/json').send({
+        ok: true,
+        run_id: out.run_id,
+        tenant_id: out.tenant_id,
+        founder_user_id: out.founder_user_id,
+      });
+    } catch (err) {
+      if (err instanceof OnboardingError) {
+        // Toda recusa da credencial já foi auditada e contada em
+        // `startGlobalBootstrapRun`. Aqui só se traduz para HTTP.
+        const status = err.code === 'bootstrap_locked_out' ? 429 : 403;
+        return reply.code(status).type('application/json').send({ error: err.code });
+      }
+      throw err;
+    }
+  });
+
   app.get('/setup', async (req, reply) => {
     applyHeaders(reply);
     // Sem sessão o operador recebe o PORTÃO (formulário), não um 403 seco:

@@ -176,24 +176,66 @@ first prod sign-in attempt.
 
 ## Seeding the first owner
 
-After the admin-ui container is up, you still need at least one
-`app_users` row that matches an IdP email, or the SSO sign-in will hit
-`AccessDenied`. From `psql` against the shared Postgres:
+The admin-ui resolves authorization against `app_users`: without a row whose
+email matches the IdP claim, SSO sign-in returns `AccessDenied`.
 
-```sql
-INSERT INTO app_users (id, tenant_id, email, name, role, email_verified)
-VALUES (
-  gen_random_uuid()::text,
-  'default',
-  'you@example.com',
-  'Your Name',
-  'founder',
-  now()
-);
+**Do NOT create that row with `psql`.** The manual `INSERT` this section used
+to document is gone on purpose (issue #519). It had two problems: it needed
+database credentials to install the product, and it hardcoded
+`tenant_id = 'default'` — a literal the platform forbids in dynamic paths, and
+which every scope guard in the codebase now rejects.
+
+### 1. Issue the bootstrap credential
+
+The credential is single-use and lives in `bootstrap_credentials`, which stores
+**only its hash** — the secret is returned once, at creation, and never exists
+anywhere in the system again. A dump of that table does not let anyone
+bootstrap.
+
+Issue it from a process that already has database access (the migrate job, a
+maintenance shell). It expires, it locks out after repeated wrong attempts, and
+the partial unique index allows **at most one live credential at a time**.
+
+### 2. Redeem it
+
+```bash
+curl -sS -X POST http://localhost:3000/setup/bootstrap \
+  -H 'content-type: application/json' \
+  -d '{
+        "secret": "<the 32-hex secret, shown once>",
+        "tenant_id": "acme",
+        "tenant_nome": "ACME Ltda",
+        "email": "you@example.com",
+        "nome": "Your Name",
+        "idempotency_key": "<any opaque string, >=8 chars>"
+      }'
 ```
 
-The IdP email claim must equal `app_users.email` (case-insensitive). The
-tenant_id must appear in `OIDC_TENANT_SLUGS`.
+The secret travels in the **body**, never in the URL: a query string leaks into
+proxy logs, `Referer` headers and browser history.
+
+This one call provisions the tenant and creates the first administrator with
+role `founder` — the role is imposed by the backend, not read from the request,
+because `ADMIN_ROLES` deliberately excludes `founder` so that onboarding a
+regular tenant can never mint a global identity.
+
+Repeating the call with the same `idempotency_key` after a timeout converges to
+the same result instead of creating a second tenant or user.
+
+### 3. It only works once
+
+On success the run writes `bootstrap_completions`, whose primary key makes the
+block a **fact of the database** rather than an application check a second
+replica could miss. Every later call returns `409 bootstrap_already_completed`,
+forever.
+
+Other responses: `403` with the typed reason (invalid, expired, consumed
+credential), and `429` when the lockout is active.
+
+### Still required
+
+The IdP email claim must equal `app_users.email` (case-insensitive), and the
+`tenant_id` you pass must appear in `OIDC_TENANT_SLUGS`.
 
 ## Smoke-testing locally (single host)
 
