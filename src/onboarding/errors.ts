@@ -44,6 +44,24 @@ export const ONBOARDING_ERROR_CODES = [
   'activation_precondition_failed',
   // Kind ainda não implementado nesta fatia
   'kind_not_implemented',
+
+  // Issue #519 — bootstrap global. Todos fail-closed: nenhum deles tem
+  // caminho de degradacao, porque a alternativa a recusar e' conceder
+  // identidade administrativa global.
+  /** Ja' existe a linha em `bootstrap_completions`. Recusa DEFINITIVA. */
+  'bootstrap_already_completed',
+  /** O sistema ja' tem identidade administrativa global; nao cabe bootstrap. */
+  'bootstrap_not_allowed',
+  /** Ja' existe credencial viva (unique parcial `..._unconsumed_uq`). */
+  'bootstrap_credential_exists',
+  /** Segredo nao confere. Mensagem NUNCA diz o que estava errado. */
+  'bootstrap_credential_invalid',
+  /** `expires_at <= now()` pelo relogio do BANCO. */
+  'bootstrap_credential_expired',
+  /** `consumed_at IS NOT NULL` — perdeu o compare-and-swap ou ja' foi usada. */
+  'bootstrap_credential_consumed',
+  /** `locked_until > now()` — rate limit estourado. */
+  'bootstrap_locked_out',
 ] as const;
 
 export type OnboardingErrorCode = (typeof ONBOARDING_ERROR_CODES)[number];

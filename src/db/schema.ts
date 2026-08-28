@@ -4113,6 +4113,65 @@ export const onboarding_step_results = pgTable(
 );
 
 export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// Issue #519 — bootstrap global (migration 136).
+//
+// Espelha `migrations/136_bootstrap_credentials.sql`. As duas tabelas são
+// DB-wide por natureza: existem para criar o PRIMEIRO tenant, então não podem
+// ser escopadas por um tenant que ainda não existe. É a mesma situação das
+// tabelas de backup da migration 101, e pelo mesmo motivo.
+
+/**
+ * A credencial de primeiro bootstrap. Guarda SÓ o hash — o segredo de 128 bits
+ * é devolvido uma única vez, na criação, e nunca mais existe no sistema; um
+ * dump desta tabela não permite bootstrap.
+ *
+ * Difere de `src/setup/token.ts` de propósito: aquele guarda o token em claro
+ * num arquivo 0600 porque o operador precisa LÊ-LO para parear a linha. Aqui o
+ * segredo é entregue na resposta da criação e some.
+ */
+export const bootstrap_credentials = pgTable('bootstrap_credentials', {
+  id: text('id').primaryKey(),
+  /** sha256 do segredo. NUNCA o segredo. */
+  secret_hash: text('secret_hash').notNull(),
+  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  created_by: text('created_by').notNull(),
+  /** Relógio do BANCO, nunca `Date.now()` de réplica. */
+  expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+  /** Rate limit: tentativas com segredo errado. */
+  failed_attempts: integer('failed_attempts').notNull().default(0),
+  /** Lockout temporal, avaliado contra `now()` do banco. */
+  locked_until: timestamp('locked_until', { withTimezone: true }),
+  /**
+   * `NULL` = viva. É o predicado do único parcial E o alvo do
+   * compare-and-swap: `UPDATE ... WHERE consumed_at IS NULL` faz duas
+   * tentativas simultâneas produzirem UM consumo e zero.
+   */
+  consumed_at: timestamp('consumed_at', { withTimezone: true }),
+});
+
+/**
+ * O bloqueio definitivo pós-bootstrap, como fato do banco.
+ *
+ * `singleton` é PK com CHECK `= true`: um segundo bootstrap viola a chave
+ * primária, não uma condição de corrida que a aplicação poderia perder entre
+ * a leitura e o commit da outra réplica.
+ */
+export const bootstrap_completions = pgTable('bootstrap_completions', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  completed_at: timestamp('completed_at', { withTimezone: true }).notNull().defaultNow(),
+  credential_id: text('credential_id')
+    .notNull()
+    .references(() => bootstrap_credentials.id),
+  /** CHECK no banco recusa o literal `default` e string vazia. */
+  tenant_id: text('tenant_id').notNull(),
+  founder_user_id: text('founder_user_id').notNull(),
+});
+
+export type BootstrapCredentialRow = typeof bootstrap_credentials.$inferSelect;
+export type NewBootstrapCredential = typeof bootstrap_credentials.$inferInsert;
+export type BootstrapCompletionRow = typeof bootstrap_completions.$inferSelect;
 export type NewOnboardingRunRow = typeof onboarding_runs.$inferInsert;
 export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
 export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
