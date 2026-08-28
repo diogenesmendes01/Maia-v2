@@ -4114,6 +4114,42 @@ export const onboarding_step_results = pgTable(
 
 export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
 
+/**
+ * #513 — posse EXCLUSIVA de uma sessão de canal (migration 137).
+ *
+ * `channel_id` é a PK de propósito: "no máximo um dono por linha" é uma
+ * constraint do banco, não uma convenção. `fencing_token` é `bigint` e não
+ * `uuid` (o vocabulário do resto da casa) porque um fence precisa ser
+ * COMPARÁVEL — a issue exige que ele aumente a cada takeover, e uuid não
+ * ordena.
+ *
+ * `mode: 'number'` é seguro aqui: o token conta TAKEOVERS de um canal, então
+ * estourar `Number.MAX_SAFE_INTEGER` exigiria 9 quatrilhões de trocas de dono
+ * na mesma linha. Não é o caso de `bigint` que carrega id de linha externa.
+ */
+export const channel_session_leases = pgTable(
+  'channel_session_leases',
+  {
+    channel_id: uuid('channel_id').primaryKey(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    owner_instance_id: text('owner_instance_id').notNull(),
+    fencing_token: bigint('fencing_token', { mode: 'number' }).notNull().default(1),
+    acquired_at: timestamp('acquired_at', { withTimezone: true }).notNull().defaultNow(),
+    heartbeat_at: timestamp('heartbeat_at', { withTimezone: true }).notNull().defaultNow(),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }).notNull(),
+    status: text('status').notNull().default('active'),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    vencidasIdx: index('channel_session_leases_vencidas_idx').on(t.lease_expires_at),
+    donoIdx: index('channel_session_leases_dono_idx').on(t.owner_instance_id),
+    tenantAgenteIdx: index('channel_session_leases_tenant_agente_idx').on(t.tenant_id, t.agent_id),
+  }),
+);
+
+export type ChannelSessionLeaseRow = typeof channel_session_leases.$inferSelect;
+
 // ---------------------------------------------------------------------------
 // Issue #519 — bootstrap global (migration 136).
 //
