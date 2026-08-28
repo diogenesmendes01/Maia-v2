@@ -271,6 +271,25 @@ export async function applyProvisionAdmin(
   payload: StepPayload<'provision_admin'>,
 ): Promise<StepApplication> {
   const tenant_id = requireTenant(run);
+  const ehBootstrap = run.kind === 'global_bootstrap';
+
+  // O PAPEL do primeiro administrador é decidido pelo BACKEND, não proposto
+  // pelo chamador.
+  //
+  // `ADMIN_ROLES` exclui `founder` DE PROPÓSITO: é essa exclusão que impede o
+  // onboarding de um tenant qualquer de cunhar uma identidade administrativa
+  // GLOBAL. O banco aceita o papel (CHECK da migration 045); quem o proíbe é
+  // o vocabulário do payload.
+  //
+  // No bootstrap a necessidade é a oposta: sem um founder, o sistema fica sem
+  // identidade global e a pré-condição do próprio bootstrap ("não existe
+  // identidade administrativa global") continuaria verdadeira para sempre —
+  // seria possível emitir credencial de novo, indefinidamente.
+  //
+  // A saída é FORÇAR aqui, em vez de admitir `founder` no enum. Assim o
+  // onboarding de tenant continua incapaz de produzi-lo por construção, e o
+  // bootstrap sempre o produz sem depender do que o chamador mandou.
+  const papel = ehBootstrap ? 'founder' : payload.role;
 
   await tx
     .insert(app_users)
@@ -279,7 +298,7 @@ export async function applyProvisionAdmin(
       tenant_id,
       email: payload.email,
       name: payload.name ?? null,
-      role: payload.role,
+      role: papel,
     })
     .onConflictDoNothing();
 
@@ -296,12 +315,47 @@ export async function applyProvisionAdmin(
     );
   }
 
+  // O MARCADOR, na MESMA transação que criou o founder.
+  //
+  // Sem isto o "bloqueio definitivo" da migration 136 nunca engatava:
+  // `isBootstrapCompleted()` responderia `false` para sempre e uma segunda
+  // credencial poderia ser emitida depois de um bootstrap bem-sucedido. Duas
+  // transações separadas também não serviriam — um crash entre elas deixaria
+  // founder sem marcador (bloqueio nunca engata) ou marcador sem founder
+  // (bootstrap travado sem nunca ter produzido identidade).
+  if (ehBootstrap) {
+    const { markBootstrapCompletedTx } = await import('./bootstrap.js');
+    // `actor_id` da run é `bootstrap:<credential_id>` — quem o montou foi
+    // `startGlobalBootstrapRun`, DEPOIS de resgatar a credencial.
+    const credential_id = run.created_by.startsWith('bootstrap:')
+      ? run.created_by.slice('bootstrap:'.length)
+      : null;
+    if (credential_id === null) {
+      // Uma run `global_bootstrap` cujo criador não veio do resgate não
+      // deveria existir — a fronteira de `openRun` impede. Falha fechado em
+      // vez de gravar um marcador sem procedência.
+      throw new OnboardingError(
+        'bootstrap_not_allowed',
+        'run de bootstrap sem credencial de origem rastreável',
+      );
+    }
+    await markBootstrapCompletedTx(tx, {
+      credential_id,
+      tenant_id,
+      founder_user_id: user.id,
+    });
+  }
+
   // `email` NUNCA entra em result/summary — a denylist de `sanitize.ts` já o
   // redigiria, mas não o mandamos de todo modo.
   return {
     result: { user_id: user.id, role: user.role },
     summary: { user_id: user.id, role: user.role },
-    audit: { action: 'onboarding_admin_provisioned', resource_type: 'app_user', resource_id: user.id },
+    audit: {
+      action: ehBootstrap ? 'bootstrap_initial_admin_created' : 'onboarding_admin_provisioned',
+      resource_type: 'app_user',
+      resource_id: user.id,
+    },
   };
 }
 
