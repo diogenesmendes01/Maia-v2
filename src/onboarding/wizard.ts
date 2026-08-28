@@ -660,7 +660,12 @@ export async function runGlobalBootstrap(
     payload: {
       user_id: randomUUID(),
       email: input.email,
-      name: input.nome ?? null,
+      // `name` é `.optional()` no schema do passo, e `.optional()` do Zod aceita
+      // AUSENTE, não `null`. Mandar `null` quando o operador não informou o nome
+      // reprovava o payload inteiro com `invalid_scope` — ou seja, o bootstrap
+      // só funcionava se o nome viesse preenchido. Omitir a chave é o que o
+      // contrato pede.
+      ...(input.nome === undefined ? {} : { name: input.nome }),
       // `role` é IGNORADO no bootstrap: `applyProvisionAdmin` força `founder`.
       // Mandamos o default do contrato só para satisfazer o schema do payload.
       role: 'owner',
