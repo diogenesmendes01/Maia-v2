@@ -738,6 +738,19 @@ export const AUDIT_ACTIONS = [
   'agent_readiness_evaluated',
   'agent_activation_approved',
   'agent_activation_denied',
+
+  // Bootstrap global (#519). Duas acoes, e as duas sao NEGACAO ou CRIACAO de
+  // identidade — as unicas coisas que acontecem antes de existir tenant.
+  /**
+   * Um passo da saga foi RECUSADO. No bootstrap, e' a recusa da credencial:
+   * segredo errado, expirada, ja' consumida, lockout, ou bootstrap ja' feito.
+   * O `metadata.reason` carrega o codigo tipado; o segredo NUNCA entra.
+   */
+  'onboarding_step_denied',
+  // `bootstrap_initial_admin_created` NAO entra aqui ainda, de proposito: a
+  // fatia que a EMITE (criacao do founder) ainda nao existe, e declarar uma
+  // acao sem emissor e' justamente a divida que a #535 registra em 19 spans.
+  // Ela entra no mesmo PR que a emite.
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

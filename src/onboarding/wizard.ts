@@ -45,6 +45,7 @@ import {
   ONBOARDING_STEP_VALUES,
   READINESS_CHECK_CODE_VALUES,
   closedVocabulary,
+  BOOTSTRAP_RESULTS,
 } from '@/observability/taxonomy.js';
 import { logger } from '@/lib/logger.js';
 import {
@@ -492,16 +493,125 @@ export async function startOnboardingRun(input: StartRunInput): Promise<StartRun
   }
 }
 
+/** O que a superfície entrega para abrir o bootstrap global. */
+export type StartGlobalBootstrapInput = {
+  /**
+   * O segredo EM CLARO, vindo de header ou corpo — NUNCA de query string.
+   *
+   * Deliberadamente FORA de `StartRunInput`: aquele tipo é projetado para
+   * `metadata` persistida (`projectRunMetadata`), e um segredo num tipo que
+   * viaja para o banco é um vazamento esperando o próximo campo novo.
+   */
+  presented_secret: string;
+  idempotency_key: string;
+  correlation_id?: string;
+  ttl_ms?: number;
+};
+
+/**
+ * Abre a saga de bootstrap global — o ÚNICO caminho que o faz.
+ *
+ * A credencial é a autorização. Ela é resgatada ANTES de qualquer coisa, e o
+ * resgate é atômico: `redeemBootstrapCredential()` valida e consome no mesmo
+ * compare-and-swap, então duas chamadas simultâneas com o segredo certo
+ * produzem uma run e uma recusa.
+ *
+ * O ator é SINTÉTICO e só existe depois do resgate. Ele carrega o id da
+ * credencial no `actor_id` para que a auditoria diga QUAL credencial abriu a
+ * run — não um `system` genérico que não se pode rastrear.
+ */
+export async function startGlobalBootstrapRun(
+  input: StartGlobalBootstrapInput,
+): Promise<StartRunOutcome> {
+  const { redeemBootstrapCredential } = await import('./bootstrap.js');
+
+  /** Mapeia o código de recusa para o label fechado de `result`. */
+  const rotuloDe = (codigo: string): string => {
+    const mapa: Record<string, string> = {
+      bootstrap_already_completed: 'already_completed',
+      bootstrap_credential_invalid: 'invalid',
+      bootstrap_credential_expired: 'expired',
+      bootstrap_credential_consumed: 'consumed',
+      bootstrap_locked_out: 'locked_out',
+      bootstrap_credential_exists: 'credential_exists',
+    };
+    const rotulo = mapa[codigo];
+    // Vocabulário FECHADO: um código novo que ninguém mapeou não vira label
+    // livre. Cai em `invalid`, e o código exato fica na auditoria.
+    return rotulo !== undefined && BOOTSTRAP_RESULTS.includes(rotulo) ? rotulo : 'invalid';
+  };
+
+  let credential_id: string;
+  try {
+    ({ credential_id } = await redeemBootstrapCredential({
+      presented_secret: input.presented_secret,
+    }));
+  } catch (err) {
+    const codigo = err instanceof OnboardingError ? err.code : 'bootstrap_credential_invalid';
+    counter(METRIC.BOOTSTRAP_ATTEMPT, {
+      result: rotuloDe(codigo),
+      // Sem tenant nem agent: o bootstrap acontece ANTES de existir tenant.
+      // `UNRESOLVED_SCOPE` é o bucket sancionado para trabalho sem dono.
+      ...attribution(UNRESOLVED_SCOPE),
+    });
+    // Auditoria da NEGAÇÃO. Sem tenant (não existe ainda) e sem o segredo —
+    // só o código do motivo, que é o que um operador precisa para entender por
+    // que o bootstrap não passou.
+    await audit({
+      acao: 'onboarding_step_denied',
+      entidade_alvo: 'bootstrap_credential',
+      metadata: { step: 'global_bootstrap', reason: codigo },
+    });
+    throw err;
+  }
+
+  counter(METRIC.BOOTSTRAP_ATTEMPT, { result: 'redeemed', ...attribution(UNRESOLVED_SCOPE) });
+
+  // O ator sintético, construído SÓ depois do resgate.
+  const actor: OnboardingActor = {
+    actor_id: `bootstrap:${credential_id}`,
+    actor_role: 'founder',
+    tenant_id: null,
+  };
+
+  return openRunChecked({
+    kind: 'global_bootstrap',
+    tenant_id: null,
+    actor,
+    idempotency_key: input.idempotency_key,
+    correlation_id: input.correlation_id,
+    ttl_ms: input.ttl_ms,
+  });
+}
+
 async function openRun(input: StartRunInput): Promise<StartRunOutcome> {
   if (input.kind === 'global_bootstrap') {
-    // O bootstrap global exige uma credencial de uso único e um endpoint
-    // restrito, que NÃO fazem parte desta fatia. Recusar explicitamente é
-    // melhor do que aceitar uma run que nenhum comando saberia avançar.
+    // O caminho GENÉRICO nunca abre bootstrap global, e isto não é uma
+    // limitação temporária: é a fronteira.
+    //
+    // Uma run `global_bootstrap` nasce sem tenant e cria a PRIMEIRA identidade
+    // administrativa. Autorizá-la por `actor` seria circular — o ator que
+    // poderia autorizá-la é justamente o que ela existe para criar. Quem
+    // autoriza é a CREDENCIAL, e só `startGlobalBootstrapRun()` a resgata.
+    //
+    // Deixar esta recusa aqui é o que impede um chamador de montar o ator
+    // sintético por conta própria e pular o resgate.
     throw new OnboardingError(
-      'kind_not_implemented',
-      'bootstrap global ainda não implementado nesta fatia — use `tenant_onboarding`',
+      'bootstrap_not_allowed',
+      'bootstrap global só é aberto por `startGlobalBootstrapRun()`, com credencial de uso único',
     );
   }
+  return openRunChecked(input);
+}
+
+/**
+ * O corpo de `openRun` DEPOIS da fronteira de autorização.
+ *
+ * Separado para que `startGlobalBootstrapRun()` — que já resgatou a credencial
+ * — possa abrir a run sem reabrir o caminho genérico. Não é exportado: quem
+ * chega aqui, ou passou por `openRun`, ou passou pelo resgate.
+ */
+async function openRunChecked(input: StartRunInput): Promise<StartRunOutcome> {
   assertMayMutate(input.actor, input.tenant_id);
   if (input.tenant_id !== null) assertTenantScope(input.tenant_id);
   if (typeof input.idempotency_key !== 'string' || input.idempotency_key.length < 8) {
