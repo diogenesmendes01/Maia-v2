@@ -738,6 +738,20 @@ export const AUDIT_ACTIONS = [
   'agent_readiness_evaluated',
   'agent_activation_approved',
   'agent_activation_denied',
+
+  // Bootstrap global (#519). Duas acoes, e as duas sao NEGACAO ou CRIACAO de
+  // identidade — as unicas coisas que acontecem antes de existir tenant.
+  /**
+   * Um passo da saga foi RECUSADO. No bootstrap, e' a recusa da credencial:
+   * segredo errado, expirada, ja' consumida, lockout, ou bootstrap ja' feito.
+   * O `metadata.reason` carrega o codigo tipado; o segredo NUNCA entra.
+   */
+  'onboarding_step_denied',
+  /**
+   * A primeira identidade administrativa global foi criada. Acontece no maximo
+   * UMA vez na vida do sistema — `bootstrap_completions.singleton` garante.
+   */
+  'bootstrap_initial_admin_created',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
