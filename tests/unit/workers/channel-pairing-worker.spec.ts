@@ -24,6 +24,7 @@ const {
   abortPairingMock,
   triggerRecoveryMock,
   stopLineSessionMock,
+  heartbeatMock,
   listLocalSessionsMock,
   readinessMock,
   activateVerifiedMock,
@@ -34,7 +35,6 @@ const {
     claimNextCommand: vi.fn(),
     completeCommand: vi.fn(async () => true),
     renewOwnerLeases: vi.fn(async () => 0),
-    renewSessionLeases: vi.fn(async () => 0),
     putPairingMaterial: vi.fn(async () => true),
     transition: vi.fn(async () => true),
     failStalePairings: vi.fn(async () => []),
@@ -50,6 +50,7 @@ const {
   abortPairingMock: vi.fn(async () => undefined),
   triggerRecoveryMock: vi.fn(async () => undefined),
   stopLineSessionMock: vi.fn(() => true),
+  heartbeatMock: vi.fn(async () => 'renewed' as const),
   listLocalSessionsMock: vi.fn((): Array<{ channel_id: string; tenant_id: string; agent_id: string }> => []),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
@@ -77,6 +78,9 @@ vi.mock('../../../src/gateway/line-sessions.js', () => ({
   stopLineSession: stopLineSessionMock,
   listLocalLineSessions: listLocalSessionsMock,
   _internal: { startLineSession: vi.fn(async () => undefined) },
+}));
+vi.mock('../../../src/gateway/channel-lease.js', () => ({
+  heartbeatChannelLease: heartbeatMock,
 }));
 vi.mock('../../../src/setup/line-readiness.js', () => ({
   evaluateLineReadiness: readinessMock,
@@ -142,7 +146,6 @@ beforeEach(() => {
   repoMock.releaseStaleAborts.mockResolvedValue([]);
   repoMock.listVerifiedAwaitingActivation.mockResolvedValue([]);
   repoMock.renewOwnerLeases.mockResolvedValue(0);
-  repoMock.renewSessionLeases.mockResolvedValue(0);
   listLocalSessionsMock.mockReturnValue([]);
   readinessMock.mockResolvedValue({ ready: true });
   activateVerifiedMock.mockResolvedValue({ ok: true });
@@ -151,6 +154,7 @@ beforeEach(() => {
   repoMock.transition.mockResolvedValue(true);
   startPairingMock.mockResolvedValue({ ok: true });
   stopLineSessionMock.mockReturnValue(true);
+  heartbeatMock.mockResolvedValue('renewed');
   triggerRecoveryMock.mockResolvedValue(undefined);
   sealMock.mockReturnValue({ envelope: Buffer.from('SEALED'), key_id: 'k1' });
   qrPngMock.mockResolvedValue(Buffer.from('PNGBYTES'));
@@ -435,27 +439,61 @@ describe('abort e repair', () => {
     );
   });
 
-  it('o tick PUBLICA quais linhas têm socket nesta réplica (roteamento do stop)', async () => {
+  it('o tick RENOVA a posse de cada linha desta réplica, sob fence', async () => {
     const local = [
-      { channel_id: 'ch-local-1', tenant_id: 'tenant-A', agent_id: 'agent-a' },
-      { channel_id: 'ch-local-2', tenant_id: 'tenant-A', agent_id: 'agent-a' },
+      { channel_id: 'ch-local-1', tenant_id: 'tenant-A', agent_id: 'agent-a', fencing_token: 7 },
+      { channel_id: 'ch-local-2', tenant_id: 'tenant-A', agent_id: 'agent-a', fencing_token: 9 },
     ];
     listLocalSessionsMock.mockReturnValue(local);
     claimOnce(null);
     await runChannelPairingWorker();
 
-    // Sem esta publicação, `disable` não teria como endereçar o comando à
+    // Sem esta renovação, `disable` não teria como endereçar o comando à
     // réplica dona e a linha continuaria respondendo (review PR #528 rodada 2).
-    // O TRIPLETE viaja junto porque a row de estado pode ainda não existir e
-    // precisa ser criada com escopo (falha de CI da rodada 2).
-    expect(repoMock.renewSessionLeases).toHaveBeenCalledWith(_internal.OWNER_INSTANCE, local);
+    //
+    // #513 — o tick deixou de apenas PUBLICAR a posse (last-writer-wins) e
+    // passou a RENOVÁ-LA apresentando o fence de cada linha. É o token que
+    // prova que quem renova é o dono corrente, e não uma réplica que já foi
+    // substituída.
+    expect(heartbeatMock).toHaveBeenCalledTimes(2);
+    expect(heartbeatMock).toHaveBeenCalledWith(
+      { tenant_id: 'tenant-A', agent_id: 'agent-a', channel_id: 'ch-local-1' },
+      7,
+      { ownerInstanceId: _internal.OWNER_INSTANCE },
+    );
+    expect(heartbeatMock).toHaveBeenCalledWith(
+      { tenant_id: 'tenant-A', agent_id: 'agent-a', channel_id: 'ch-local-2' },
+      9,
+      { ownerInstanceId: _internal.OWNER_INSTANCE },
+    );
+    // Posse renovada: nada é fechado.
+    expect(stopLineSessionMock).not.toHaveBeenCalled();
   });
 
-  it('sem sessão local, o tick não escreve posse alguma', async () => {
+  it('perder a posse de uma linha FECHA o socket dela, e só dela', async () => {
+    const local = [
+      { channel_id: 'ch-viva', tenant_id: 'tenant-A', agent_id: 'agent-a', fencing_token: 1 },
+      { channel_id: 'ch-perdida', tenant_id: 'tenant-A', agent_id: 'agent-a', fencing_token: 2 },
+    ];
+    listLocalSessionsMock.mockReturnValue(local);
+    heartbeatMock.mockImplementation(async (escopo: { channel_id: string }) =>
+      escopo.channel_id === 'ch-perdida' ? 'fence_rejected' : 'renewed',
+    );
+    claimOnce(null);
+    await runChannelPairingWorker();
+
+    // O fence do banco recusa as gravações do dono antigo, mas o WhatsApp não
+    // conhece fencing token: o socket aberto continuaria recebendo e podendo
+    // enviar. Fechar é o que fecha a janela.
+    expect(stopLineSessionMock).toHaveBeenCalledTimes(1);
+    expect(stopLineSessionMock).toHaveBeenCalledWith('ch-perdida');
+  });
+
+  it('sem sessão local, o tick não toca na posse de ninguém', async () => {
     listLocalSessionsMock.mockReturnValue([]);
     claimOnce(null);
     await runChannelPairingWorker();
-    expect(repoMock.renewSessionLeases).not.toHaveBeenCalled();
+    expect(heartbeatMock).not.toHaveBeenCalled();
   });
 
   it('stop_line que falha NÃO marca a linha como failed (ela está disabled)', async () => {

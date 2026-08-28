@@ -62,6 +62,13 @@ let tickCount = 0;
 /** Test-only: reseta o guard de reentrância entre casos. */
 export const _internal = {
   OWNER_INSTANCE,
+  /**
+   * #513 — o heartbeat da posse, exposto para que o teste exercite ESTE
+   * caminho e não uma reimplementação dele. É aqui que "perdi a posse" vira
+   * "fechei o socket", e um teste que chamasse `heartbeatChannelLease`
+   * diretamente provaria o fence, nunca o fechamento.
+   */
+  publishLocalSessionOwnership: (): Promise<void> => publishLocalSessionOwnership(),
   reset(): void {
     running = false;
     tickCount = 0;
@@ -295,16 +302,47 @@ async function executeStopLine(row: {
 }
 
 /**
- * Publica a posse das sessões que vivem NESTE processo. Best-effort: uma
- * falha aqui só atrasa o endereçamento até o próximo tick (≤5s), e a lease
- * vencida do alvo já é o escape que impede um comando de ficar pendurado.
+ * O HEARTBEAT da posse das sessões que vivem NESTE processo (#513).
+ *
+ * Antes isto só PUBLICAVA a posse, para que `disable`/`repair` soubessem a que
+ * réplica endereçar o comando. Agora ele também a RENOVA sob fence — e, quando
+ * a renovação falha, FECHA O SOCKET.
+ *
+ * Esse fechamento é o ponto inteiro da fatia. O fence do banco recusa as
+ * gravações do dono antigo, mas o WhatsApp não conhece fencing token: um
+ * socket que continua aberto continua recebendo e podendo enviar. A issue #513
+ * é explícita sobre isso — "o processo antigo deve parar envios quando perder
+ * DB/lease; não é suficiente conferir o token após enviar". Quem estreita a
+ * janela é o fence; quem a fecha é este `stopLineSession`.
+ *
+ * Fail-closed em todas as saídas de `heartbeatChannelLease`: `fence_rejected`,
+ * `expired`, `not_owner` e `db_error` são todos "não sou mais o dono". O
+ * último inclusive — não conseguir CONFIRMAR a posse é perdê-la, porque o
+ * outro lado da partição pode já ter assumido a linha.
  */
 async function publishLocalSessionOwnership(): Promise<void> {
   try {
-    const { listLocalLineSessions } = await import('@/gateway/line-sessions.js');
+    const { listLocalLineSessions, stopLineSession } = await import(
+      '@/gateway/line-sessions.js'
+    );
+    const { heartbeatChannelLease } = await import('@/gateway/channel-lease.js');
     const lines = listLocalLineSessions();
     if (lines.length === 0) return;
-    await channelLineStateRepo.renewSessionLeases(OWNER_INSTANCE, lines);
+
+    for (const line of lines) {
+      const resultado = await heartbeatChannelLease(
+        { tenant_id: line.tenant_id, agent_id: line.agent_id, channel_id: line.channel_id },
+        line.fencing_token,
+        { ownerInstanceId: OWNER_INSTANCE },
+      );
+      if (resultado === 'renewed') continue;
+
+      logger.error(
+        { channel_id: line.channel_id, motivo: resultado },
+        'channel_pairing.session_ownership_lost_closing_socket',
+      );
+      stopLineSession(line.channel_id);
+    }
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },

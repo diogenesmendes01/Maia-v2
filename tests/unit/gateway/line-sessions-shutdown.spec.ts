@@ -63,6 +63,22 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 }));
 // #518 — a transição de sessão passa a PERSISTIR o estado da linha (103).
 // É best-effort e fail-isolated; aqui basta stubar para o teste não tocar o DB.
+vi.mock('../../../src/gateway/channel-lease.js', () => ({
+  // #513 — este spec é sobre listeners/shutdown da sessão, não sobre POSSE.
+  // A posse tem cobertura própria contra Postgres real
+  // (`channel-session-fence-real-db` e `channel-session-takeover-fecha-socket-real-db`);
+  // aqui ela é concedida para que o caminho sob teste chegue a rodar.
+  acquireChannelLease: vi.fn(async () => ({
+    held: true as const,
+    result: 'acquired' as const,
+    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'c' },
+    owner_instance_id: 'teste',
+    fencing_token: 1,
+    lease_expires_at: new Date(Date.now() + 30_000),
+  })),
+  releaseChannelLease: vi.fn(async () => true),
+  heartbeatChannelLease: vi.fn(async () => 'renewed' as const),
+}));
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
   channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
 }));

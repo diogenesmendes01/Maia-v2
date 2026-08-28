@@ -14,10 +14,11 @@
  * `session_owner_lease_expires_at`, com um escritor vivo (o worker de pairing)
  * e um consumidor vivo (o endereçamento de `disable`/`repair` à réplica que
  * segura o socket). Uma tabela nova daria DOIS donos declarados do mesmo fato,
- * e eles divergiriam: `renewSessionLeases` era last-writer-wins por desenho
- * declarado ("Não usa CAS por dono"), então a réplica B se carimbaria como
- * dona enquanto A segurasse a lease — e o comando de `disable` voltaria a ser
- * consumido pela réplica ERRADA, que é o P1 que a review da PR #528 fechou.
+ * e eles divergiriam: o registro de posse anterior (`renewSessionLeases`) era
+ * last-writer-wins por desenho declarado ("Não usa CAS por dono"), então a
+ * réplica B se carimbaria como dona enquanto A segurasse a lease — e o comando
+ * de `disable` voltaria a ser consumido pela réplica ERRADA, que é o P1 que a
+ * review da PR #528 fechou. Hoje este módulo é o ÚNICO caminho de posse.
  *
  * O que faltava não era uma tabela: era o FENCE.
  *
@@ -50,6 +51,7 @@
 import { sql } from 'drizzle-orm';
 import { db } from '@/db/client.js';
 import {
+  SESSION_LEASE_MS,
   fenceOnUpsert,
   sessionOwnershipClaimable,
 } from '@/db/repositories/channel-line-state-repos.js';
@@ -94,8 +96,14 @@ export type ChannelLeaseTakeoverReason = (typeof CHANNEL_LEASE_TAKEOVER_REASONS)
 export const CHANNEL_FENCE_OPERATIONS = ['heartbeat', 'release', 'send'] as const;
 export type ChannelFenceOperation = (typeof CHANNEL_FENCE_OPERATIONS)[number];
 
-/** Prazo default de uma lease. Ver `assertChannelLeaseTtl` para a faixa. */
-export const CHANNEL_LEASE_TTL_MS = 30_000;
+/**
+ * Prazo default de uma posse. IMPORTADO, não declarado aqui: a definição vive
+ * junto da coluna que ele governa (`SESSION_LEASE_MS` em
+ * `channel-line-state-repos.ts`), e dois números para o mesmo prazo brigariam —
+ * um caminho renovaria para 30s, o outro para 60s, e qual vale dependeria de
+ * quem escreveu por último.
+ */
+export const CHANNEL_LEASE_TTL_MS = SESSION_LEASE_MS;
 
 /**
  * Identidade DESTE processo como dono.
@@ -227,9 +235,11 @@ function assertEscopo(scope: ChannelLeaseScope): void {
  * renovar não é uma nova posse, e incrementar ali invalidaria o token que o
  * próprio dono está usando para enviar naquele instante.
  *
- * O UPSERT (e não UPDATE) é herdado de `renewSessionLeases`, pelo mesmo motivo
- * que ela documenta: a row de estado pode ainda não existir — um canal ativado
- * fora do fluxo do console nunca passou por `requestCommand`.
+ * O UPSERT (e não UPDATE) é deliberado, e herdado do registro de posse que
+ * existia antes: a row de estado pode ainda não existir — um canal ativado
+ * fora do fluxo do console nunca passou por `requestCommand`. Como UPDATE
+ * puro, a escrita não pegaria nada, a posse ficaria NULL em silêncio, e o
+ * `disable` voltaria a ser endereçado à réplica errada.
  */
 export async function acquireChannelLease(
   scope: ChannelLeaseScope,

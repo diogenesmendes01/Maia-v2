@@ -71,6 +71,22 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
   channelsRepo: { listActiveWhatsappLinesCrossTenant: vi.fn(async () => []) },
 }));
 // #518 — ver nota em line-sessions-shutdown.spec.ts.
+vi.mock('../../../src/gateway/channel-lease.js', () => ({
+  // #513 — este spec é sobre listeners/shutdown da sessão, não sobre POSSE.
+  // A posse tem cobertura própria contra Postgres real
+  // (`channel-session-fence-real-db` e `channel-session-takeover-fecha-socket-real-db`);
+  // aqui ela é concedida para que o caminho sob teste chegue a rodar.
+  acquireChannelLease: vi.fn(async () => ({
+    held: true as const,
+    result: 'acquired' as const,
+    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'c' },
+    owner_instance_id: 'teste',
+    fencing_token: 1,
+    lease_expires_at: new Date(Date.now() + 30_000),
+  })),
+  releaseChannelLease: vi.fn(async () => true),
+  heartbeatChannelLease: vi.fn(async () => 'renewed' as const),
+}));
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
   channelLineStateRepo: { upsertTransition: persistMock },
 }));
@@ -240,7 +256,7 @@ describe('stopLineSession — derruba a sessão de VERDADE', () => {
  * posse precisa ser publicada; esta lista é a fonte do heartbeat.
  */
 describe('listLocalLineSessions — tabela de roteamento do stop', () => {
-  it('lista o TRIPLETE das linhas cujo socket vive NESTE processo', async () => {
+  it('lista o TRIPLETE e o FENCE das linhas cujo socket vive NESTE processo', async () => {
     const { listLocalLineSessions } = await import('../../../src/gateway/line-sessions.js');
     expect(listLocalLineSessions()).toEqual([]);
 
@@ -248,8 +264,18 @@ describe('listLocalLineSessions — tabela de roteamento do stop', () => {
     // Só o id não basta: registrar a posse pode ter que CRIAR a row de
     // estado, e `channel_line_state` exige tenant/agent (falha de CI da
     // rodada 2).
+    //
+    // #513 — e o `fencing_token` entra porque o tick deixou de PUBLICAR posse
+    // e passou a RENOVÁ-LA sob fence. Sem o token aqui, o heartbeat não teria
+    // o que apresentar ao banco e nenhuma linha seria renovada — todas
+    // venceriam em silêncio e cada réplica fecharia os próprios sockets.
     expect(listLocalLineSessions()).toEqual([
-      { channel_id: CHANNEL.id, tenant_id: CHANNEL.tenant_id, agent_id: CHANNEL.agent_id },
+      {
+        channel_id: CHANNEL.id,
+        tenant_id: CHANNEL.tenant_id,
+        agent_id: CHANNEL.agent_id,
+        fencing_token: 1,
+      },
     ]);
   });
 
