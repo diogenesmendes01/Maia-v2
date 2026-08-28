@@ -56,6 +56,7 @@ import {
 } from './line-session-manager.js';
 import { triggerRecovery } from '../setup/recovery.js';
 import { runtimeInstanceId } from '../runtime/instance-identity.js';
+import { acquireChannelLease, releaseChannelLease } from './channel-lease.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -87,6 +88,16 @@ type LineSessionState = {
    * shutdown e reabria o socket com um estado novo (`stopped=false`).
    */
   reconnectTimer: NodeJS.Timeout | null;
+  /**
+   * #513 — o fence da POSSE desta linha, devolvido pelo `acquireChannelLease`
+   * que autorizou a abertura do socket.
+   *
+   * `null` só existe entre a criação do estado e a aquisição; um socket aberto
+   * sempre tem token. É ele que o heartbeat apresenta a cada tick e o que o
+   * `release` do shutdown apresenta para provar que a posse é mesmo desta
+   * réplica.
+   */
+  fencingToken: number | null;
 };
 
 const sessions = new Map<string, LineSessionState>();
@@ -252,6 +263,34 @@ async function startLineSession(channel: LineChannel): Promise<void> {
     return;
   }
 
+  // #513 — A POSSE VEM ANTES DO SOCKET.
+  //
+  // Até aqui `startAdditionalLineSessions()` enumerava todas as linhas ativas e
+  // abria cada uma, sem perguntar a ninguém: com duas réplicas, as duas abriam
+  // o mesmo socket e escreviam no mesmo auth state. Agora o socket só existe
+  // depois de o PostgreSQL dizer que esta réplica é a dona.
+  //
+  // Fail-closed: posse negada (outra réplica a tem, ou o banco não respondeu)
+  // NÃO abre socket. Uma linha parada é recuperável no próximo tick; duas
+  // réplicas enviando pela mesma linha, não.
+  const posse = await acquireChannelLease({
+    tenant_id: channel.tenant_id,
+    agent_id: channel.agent_id,
+    channel_id: channel.id,
+  });
+  if (!posse.held) {
+    logger.warn(
+      {
+        channel_id: channel.id,
+        line: channel.external_id,
+        result: posse.result,
+        held_by: posse.held_by,
+      },
+      'line_session.ownership_denied',
+    );
+    return;
+  }
+
   const state: LineSessionState = sessions.get(channel.id) ?? {
     channel,
     sock: null,
@@ -259,7 +298,9 @@ async function startLineSession(channel: LineChannel): Promise<void> {
     reconnectAttempts: 0,
     stopped: false,
     reconnectTimer: null,
+    fencingToken: null,
   };
+  state.fencingToken = posse.fencing_token;
   sessions.set(channel.id, state);
 
   const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
@@ -425,14 +466,23 @@ export function listLocalLineSessions(): Array<{
   channel_id: string;
   tenant_id: string;
   agent_id: string;
+  fencing_token: number;
 }> {
-  return [...sessions.values()]
-    .filter((s) => !s.stopped)
-    .map((s) => ({
-      channel_id: s.channel.id,
-      tenant_id: s.channel.tenant_id,
-      agent_id: s.channel.agent_id,
-    }));
+  return (
+    [...sessions.values()]
+      .filter((s) => !s.stopped)
+      // #513 — sem token não há o que renovar: o heartbeat é uma gravação
+      // FENCED, e apresentar `null` seria pedir ao banco que confiasse na
+      // palavra do processo. Uma sessão sem token é uma que ainda não terminou
+      // de adquirir a posse, e o próximo tick a pega.
+      .filter((s): s is typeof s & { fencingToken: number } => s.fencingToken !== null)
+      .map((s) => ({
+        channel_id: s.channel.id,
+        tenant_id: s.channel.tenant_id,
+        agent_id: s.channel.agent_id,
+        fencing_token: s.fencingToken,
+      }))
+  );
 }
 
 export function stopLineSession(channelId: string): boolean {
@@ -442,6 +492,28 @@ export function stopLineSession(channelId: string): boolean {
   getLineSessionManager().markState(channelId, 'closed');
   if (!state) return false;
   state.stopped = true;
+  // #513 — devolver a posse aqui, e não esperar a lease vencer, deixa outra
+  // réplica assumir a linha na hora. Best-effort e DEPOIS de `stopped = true`:
+  // o socket já está condenado, e uma falha do banco não pode impedir o
+  // fechamento — o pior caso vira uma linha que espera o prazo, nunca uma que
+  // continua aberta.
+  //
+  // Quando o motivo da parada foi a PERDA da posse, o fence já não é nosso e o
+  // release devolve `false` sem gravar nada: é o comportamento certo, porque a
+  // posse agora é do sucessor e devolvê-la seria apagar a dele.
+  const fence = state.fencingToken;
+  if (fence !== null) {
+    void releaseChannelLease(
+      {
+        tenant_id: state.channel.tenant_id,
+        agent_id: state.channel.agent_id,
+        channel_id: state.channel.id,
+      },
+      fence,
+    ).catch(() => {
+      /* já logado no módulo de posse */
+    });
+  }
   if (state.reconnectTimer) {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
@@ -484,6 +556,12 @@ export async function shutdownLineSessions(): Promise<void> {
   // sessões aqui, em vez de deixar a lease vencer, permite que outra réplica
   // assuma as linhas imediatamente após o shutdown. Best-effort — o banco já
   // pode estar indo embora no passo `pools`, e a lease cobre esse caso.
+  //
+  // #513 — o release em LOTE continua sendo o certo aqui, e não precisa do
+  // fence: ele casa por `session_owner_instance`, então uma linha que já foi
+  // TOMADA por outra réplica não bate no `WHERE` e não é apagada. O fence
+  // acrescentaria só o caso "mesmo dono, token velho", que não existe neste
+  // caminho — o estado local carrega sempre o token da posse corrente.
   if (owned.length > 0) {
     try {
       const { channelLineStateRepo } = await import(

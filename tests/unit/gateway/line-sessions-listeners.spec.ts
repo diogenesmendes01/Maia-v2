@@ -55,6 +55,22 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
   channelsRepo: { listActiveWhatsappLinesCrossTenant: vi.fn(async () => []) },
 }));
 // #518 — ver nota em line-sessions-shutdown.spec.ts.
+vi.mock('../../../src/gateway/channel-lease.js', () => ({
+  // #513 — este spec é sobre listeners/shutdown da sessão, não sobre POSSE.
+  // A posse tem cobertura própria contra Postgres real
+  // (`channel-session-fence-real-db` e `channel-session-takeover-fecha-socket-real-db`);
+  // aqui ela é concedida para que o caminho sob teste chegue a rodar.
+  acquireChannelLease: vi.fn(async () => ({
+    held: true as const,
+    result: 'acquired' as const,
+    scope: { tenant_id: 't', agent_id: 'a', channel_id: 'c' },
+    owner_instance_id: 'teste',
+    fencing_token: 1,
+    lease_expires_at: new Date(Date.now() + 30_000),
+  })),
+  releaseChannelLease: vi.fn(async () => true),
+  heartbeatChannelLease: vi.fn(async () => 'renewed' as const),
+}));
 vi.mock('../../../src/db/repositories/channel-line-state-repos.js', () => ({
   channelLineStateRepo: { upsertTransition: vi.fn(async () => undefined) },
 }));

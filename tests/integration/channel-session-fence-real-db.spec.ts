@@ -280,33 +280,31 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     );
   });
 
-  it('o heartbeat do worker de pairing não rouba o registro de um dono VIVO', async () => {
-    // Este é o caso que motivou pôr o fence em `channel_line_state` em vez de
-    // numa tabela nova. `renewSessionLeases` era last-writer-wins declarado, e
-    // é o que endereça `disable`/`repair` à réplica que segura o socket: com
-    // duas réplicas, a segunda a bater se carimbava como dona e o comando
-    // passava a ser entregue a quem NÃO tem o socket.
+  it('o registro de posse de uma linha VIVA não é sobrescrito por outra réplica', async () => {
+    // Este caso nasceu apontando para `renewSessionLeases`, o publicador de
+    // posse last-writer-wins do worker de pairing. Ele deixou de existir na
+    // fatia B: o tick passou a RENOVAR sob fence (`heartbeatChannelLease`), e
+    // uma função de repo viva só para testes seria dívida.
+    //
+    // A garantia, porém, é a mesma e continua valendo — agora exercitada pelo
+    // único caminho que grava posse. É o P1 da review da PR #528: se a réplica
+    // 2 se carimbasse como dona enquanto a 1 segura a linha, o `disable`
+    // passaria a ser entregue a quem NÃO tem o socket.
     const primeira = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });
     expect(primeira.held).toBe(true);
 
-    const { channelLineStateRepo } = await import(
-      '../../src/db/repositories/channel-line-state-repos.js'
-    );
-    await channelLineStateRepo.renewSessionLeases(REPLICA_2, [
-      { channel_id: canal, tenant_id: T, agent_id: A },
-    ]);
-
+    const invasora = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_2 });
+    expect(invasora.held).toBe(false);
     expect(
       await donoNoBanco(canal),
-      'o heartbeat da réplica 2 roubou o registro de posse da réplica 1',
+      'a réplica 2 roubou o registro de posse da réplica 1',
     ).toBe(REPLICA_1);
 
-    // E, depois que a posse VENCE, o mesmo heartbeat pode assumir — a guarda é
+    // E, depois que a posse VENCE, a mesma réplica 2 pode assumir — a guarda é
     // sobre dono vivo, não um bloqueio permanente.
     await vencerLease(canal);
-    await channelLineStateRepo.renewSessionLeases(REPLICA_2, [
-      { channel_id: canal, tenant_id: T, agent_id: A },
-    ]);
+    const depois = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_2 });
+    expect(depois.held).toBe(true);
     expect(await donoNoBanco(canal)).toBe(REPLICA_2);
   });
 
