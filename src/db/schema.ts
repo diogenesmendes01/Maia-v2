@@ -2296,6 +2296,20 @@ export const channel_line_state = pgTable(
     session_owner_lease_expires_at: timestamp('session_owner_lease_expires_at', {
       withTimezone: true,
     }),
+    /**
+     * #513 — o FENCE da posse da sessão (migration 137). Monotônico por canal:
+     * incrementado a cada posse NOVA, preservado na renovação, e nunca zerado
+     * pelo `release` — se fosse, um dono antigo voltando de uma partição
+     * reapresentaria um token que voltou a valer. `bigint` e não `uuid` porque
+     * um fence precisa ser COMPARÁVEL, não apenas distinguível.
+     *
+     * `mode: 'number'` é seguro: o token conta TAKEOVERS de uma linha, então
+     * estourar `Number.MAX_SAFE_INTEGER` exigiria 9 quatrilhões de trocas de
+     * dono na mesma linha.
+     */
+    session_fencing_token: bigint('session_fencing_token', { mode: 'number' })
+      .notNull()
+      .default(0),
     actor_id: text('actor_id'),
     actor_role: text('actor_role'),
     correlation_id: text('correlation_id'),
@@ -4113,6 +4127,7 @@ export const onboarding_step_results = pgTable(
 );
 
 export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
+
 
 // ---------------------------------------------------------------------------
 // Issue #519 — bootstrap global (migration 136).

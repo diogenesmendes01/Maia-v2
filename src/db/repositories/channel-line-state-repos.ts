@@ -20,7 +20,7 @@
  * Material de pareamento (QR/código) só entra aqui CIFRADO — ver
  * `src/setup/pairing-material.ts`. Este repo nunca loga o envelope.
  */
-import { and, eq, inArray, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, lt, sql, type SQL } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { channels, channel_line_state, admin_audit_log } from '../schema.js';
 import type { ChannelLineStateRow } from '../schema.js';
@@ -427,6 +427,44 @@ async function appendLineAudit(
   });
 }
 
+/**
+ * #513 — A REGRA ÚNICA de quem pode tomar a posse de uma sessão de canal.
+ *
+ * Declarada uma vez e usada por TODOS os caminhos que gravam posse
+ * (`renewSessionLeases` aqui, `acquireChannelLease` em
+ * `src/gateway/channel-lease.ts`). Duas cópias desta condição divergiriam na
+ * primeira vez que alguém ajustasse uma delas, e o sintoma seria duas réplicas
+ * donas da mesma linha — o pior lugar possível para uma divergência silenciosa.
+ *
+ * A posse é tomável em exatamente três situações: está LIVRE, VENCEU, ou já é
+ * minha (renovação). O relógio é o do BANCO — uma réplica adiantada não pode
+ * declarar vencida uma lease viva.
+ */
+export function sessionOwnershipClaimable(owner_instance: string): SQL {
+  return sql`(${channel_line_state.session_owner_instance} IS NULL
+           OR ${channel_line_state.session_owner_lease_expires_at} <= now()
+           OR ${channel_line_state.session_owner_instance} = ${owner_instance})`;
+}
+
+/**
+ * #513 — A REGRA ÚNICA de como o fence evolui numa gravação de posse.
+ *
+ * Renovar preserva o token; toda posse NOVA incrementa. A distinção não é
+ * cosmética: incrementar numa renovação invalidaria o token que o próprio dono
+ * está usando para enviar naquele instante.
+ *
+ * Só faz sentido sob um `setWhere` de `sessionOwnershipClaimable` — sozinha,
+ * ela incrementaria o fence de um dono vivo alheio.
+ */
+export function fenceOnUpsert(owner_instance: string): SQL<number> {
+  return sql<number>`CASE
+    WHEN ${channel_line_state.session_owner_instance} = ${owner_instance}
+     AND ${channel_line_state.session_owner_lease_expires_at} > now()
+    THEN ${channel_line_state.session_fencing_token}
+    ELSE ${channel_line_state.session_fencing_token} + 1
+  END`;
+}
+
 export const channelLineStateRepo = {
   /**
    * Listagem do console: TODOS os canais do (tenant, agent) — ativos E
@@ -798,9 +836,23 @@ export const channelLineStateRepo = {
    * auto-corretiva: se o registro inicial falhar, o próximo tick (≤5s) a
    * grava. Lista vazia é no-op barato.
    *
-   * Não usa CAS por dono: exatamente uma réplica pode ter a sessão viva (o
-   * CAS de `activateVerified` elege quem sobe), então o último escritor é o
-   * dono corrente por construção.
+   * FENCE (#513). A versão anterior era last-writer-wins declarada — "não usa
+   * CAS por dono: exatamente uma réplica pode ter a sessão viva (o CAS de
+   * `activateVerified` elege quem sobe), então o último escritor é o dono
+   * corrente por construção". Essa premissa vale para UMA réplica e é
+   * exatamente o que a issue #513 derruba: `startAdditionalLineSessions()`
+   * enumera todas as linhas ativas e as abre localmente, sem reivindicar nada,
+   * então duas réplicas chegam aqui as duas achando que são donas — e a
+   * segunda a escrever roubava o registro da primeira. O comando de `disable`
+   * passava então a ser endereçado à réplica ERRADA: o P1 que a review da PR
+   * #528 fechou, reaberto pela topologia.
+   *
+   * Agora o `setWhere` exige que a posse esteja LIVRE, VENCIDA ou já seja
+   * minha. Com uma réplica o comportamento é idêntico (só existe um escritor);
+   * com duas, quem chegou depois não rouba o registro de um dono vivo.
+   *
+   * Devolve só as linhas que a réplica de fato possui — quem chamou usa isso
+   * para saber de quais linhas perdeu a posse.
    */
   async renewSessionLeases(
     owner_instance: string,
@@ -830,6 +882,15 @@ export const channelLineStateRepo = {
           agent_id: l.agent_id,
           session_owner_instance: owner_instance,
           session_owner_lease_expires_at: expires,
+          // #513 — o CHECK `channel_line_state_session_fence_chk` exige que
+          // TODO registro de posse carregue um fence. Numa row NOVA o valor é
+          // 1: é a primeira posse conhecida daquela linha, e não há de quem
+          // tomá-la. Isto NÃO é o caminho de claim (esse é
+          // `acquireChannelLease`), e mesmo assim é seguro: sob concorrência a
+          // PK arbitra o INSERT, e quem perde cai no `setWhere` abaixo, que
+          // recusa roubar um dono vivo. Na row já existente o token não é
+          // tocado — um heartbeat nunca inventa uma posse nova.
+          session_fencing_token: 1,
         })),
       )
       .onConflictDoUpdate({
@@ -837,11 +898,23 @@ export const channelLineStateRepo = {
         set: {
           session_owner_instance: owner_instance,
           session_owner_lease_expires_at: expires,
+          // O fence tem que ser escrito AQUI também. A row já pode existir com
+          // `session_fencing_token = 0` (o pairing a cria antes de haver
+          // socket), e gravar dono sem fence viola
+          // `channel_line_state_session_fence_chk` — de propósito: a CHECK
+          // existe justamente para que nenhum caminho registre posse sem fence.
+          session_fencing_token: fenceOnUpsert(owner_instance),
           updated_at: now,
         },
-        // SEM `setWhere`: a posse é ortogonal ao estado. Uma linha `disabled`
-        // que ainda tem socket PRECISA continuar endereçável, senão o
-        // `stop_line` nunca alcança quem o segura.
+        // O `setWhere` guarda a POSSE, não o ESTADO. Continua sem filtrar por
+        // `state`, pelo motivo original: uma linha `disabled` que ainda tem
+        // socket PRECISA continuar endereçável, senão o `stop_line` nunca
+        // alcança quem o segura. O que ele passa a exigir é que ninguém VIVO e
+        // DIFERENTE de mim esteja com a linha.
+        //
+        // O relógio é o do BANCO (`now()`), não o `now` do processo usado no
+        // payload: é a réplica adiantada que declararia vencida uma lease viva.
+        setWhere: sessionOwnershipClaimable(owner_instance),
       })
       .returning({ channel_id: channel_line_state.channel_id });
     return rows.length;

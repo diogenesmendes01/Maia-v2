@@ -693,6 +693,68 @@ export const METRIC = {
    * estruturado, que tem política de retenção própria.
    */
   OUTBOUND_LEASE_LOST: 'maia_outbound_lease_lost_total',
+
+  // --- posse de sessão de canal (issue #513) --------------------------------
+  /**
+   * Issue #513 — tentativa de ADQUIRIR a posse de uma linha. `result` ∈
+   * `acquired` | `renewed` | `taken_over` | `held_by_other` | `db_error`
+   * (`CHANNEL_LEASE_ACQUIRE_RESULTS`).
+   *
+   * `held_by_other` é o caso SAUDÁVEL numa frota com duas réplicas: a que
+   * perdeu a disputa registra a perda e não abre socket. É por isso que a
+   * série não é um contador de erro — um `held_by_other` constante e um
+   * `acquired` constante no mesmo canal, ao contrário, são takeover em
+   * pingue-pongue e merecem alarme.
+   *
+   * `taken_over` separa "peguei uma linha livre" de "peguei uma linha cujo
+   * dono anterior sumiu". Colapsar os dois em `acquired` esconderia
+   * exatamente o evento que o operador precisa ver.
+   */
+  CHANNEL_LEASE_ACQUIRE: 'maia_channel_lease_acquire_total',
+  /**
+   * Issue #513 — renovação da posse. `result` ∈ `renewed` | `fence_rejected` |
+   * `expired` | `not_owner` | `db_error` (`CHANNEL_LEASE_HEARTBEAT_RESULTS`).
+   *
+   * Qualquer coisa diferente de `renewed` significa que este processo NÃO é
+   * mais o dono e tem que fechar o socket. A série existe para que essa
+   * transição seja visível de fora: um dono zumbi que para de conseguir
+   * renovar é o sintoma precoce de partição de rede entre a réplica e o banco.
+   */
+  CHANNEL_LEASE_HEARTBEAT: 'maia_channel_lease_heartbeat_total',
+  /**
+   * Issue #513 — a posse MUDOU de dono. `reason` ∈ `lease_expired` |
+   * `released_by_owner` (`CHANNEL_LEASE_TAKEOVER_REASONS`).
+   *
+   * `released_by_owner` é o deploy ordenado (o dono devolveu a linha antes de
+   * sair); `lease_expired` é a queda. Um deploy que produz `lease_expired` em
+   * vez de `released_by_owner` tem shutdown quebrado — e a diferença entre os
+   * dois é a diferença entre uma linha indisponível por milissegundos e uma
+   * indisponível pelo prazo inteiro da lease.
+   */
+  CHANNEL_LEASE_TAKEOVER: 'maia_channel_lease_takeover_total',
+  /**
+   * Issue #513 — uma operação foi RECUSADA porque o fence apresentado não é
+   * mais o corrente. `operation` ∈ `heartbeat` | `release` | `send`
+   * (`CHANNEL_FENCE_OPERATIONS`).
+   *
+   * É a prova de que o dono ANTIGO não conseguiu agir. Sem esta série, um
+   * takeover correto e um takeover que deixou o zumbi enviando são
+   * indistinguíveis de fora: nos dois casos o novo dono funciona.
+   */
+  CHANNEL_FENCE_REJECTED: 'maia_channel_fence_rejected_total',
+  /**
+   * Issue #513 — quantas sessões ESTE processo possui agora.
+   *
+   * Deliberadamente SEM `channel_id` como label. A issue pede
+   * `maia_channel_lease_state{channel_id,state}` e ela própria ressalva: "Se
+   * `channel_id` gerar cardinalidade excessiva, mantê-lo em logs/traces e
+   * agregar métricas por tenant/estado". Gera: `channel_id` é um uuid por
+   * linha de WhatsApp, sem teto, e `ALLOWED_LABEL_KEYS` nem o aceitaria. A
+   * correlação por canal vive no log estruturado da transição de posse, que
+   * tem retenção própria; aqui fica o AGREGADO, que é o que responde "esta
+   * réplica está com o número de linhas que eu esperava?".
+   */
+  CHANNEL_SESSIONS_OWNED: 'maia_whatsapp_sessions_owned',
   /**
    * Issue #632 — a entrega terminou em estado DESCONHECIDO, por `channel`.
    *
