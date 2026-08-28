@@ -584,6 +584,102 @@ export async function startGlobalBootstrapRun(
   });
 }
 
+/** O que a superfície entrega para executar o bootstrap inteiro. */
+export type RunGlobalBootstrapInput = {
+  presented_secret: string;
+  tenant_id: string;
+  tenant_nome: string;
+  email: string;
+  nome?: string;
+  idempotency_key: string;
+};
+
+export type RunGlobalBootstrapOutcome = {
+  run_id: string;
+  tenant_id: string;
+  founder_user_id: string;
+};
+
+/**
+ * Executa o bootstrap global de ponta a ponta: resgata a credencial, abre a
+ * run, provisiona o tenant e cria o founder.
+ *
+ * POR QUE O CICLO INTEIRO VIVE AQUI, e não na rota.
+ *
+ * Os passos exigem um `OnboardingActor`, e o do bootstrap tem papel `founder`
+ * — o privilégio máximo do sistema. Se `startGlobalBootstrapRun` devolvesse
+ * esse ator para quem chamou, a superfície passaria a segurar uma credencial
+ * de founder e poderia usá-la para QUALQUER comando da saga, não só para os
+ * dois passos do bootstrap. O ator sintético não sai deste módulo.
+ *
+ * Cada passo é idempotente por `idempotency_key` derivada da chave do
+ * chamador, então repetir a chamada depois de um timeout não duplica tenant
+ * nem usuário — converge para o mesmo resultado.
+ */
+export async function runGlobalBootstrap(
+  input: RunGlobalBootstrapInput,
+): Promise<RunGlobalBootstrapOutcome> {
+  const aberta = await startGlobalBootstrapRun({
+    presented_secret: input.presented_secret,
+    idempotency_key: input.idempotency_key,
+  });
+  if (aberta.status !== 'started') {
+    throw new OnboardingError(
+      'bootstrap_not_allowed',
+      `não foi possível abrir a run de bootstrap (status: ${aberta.status})`,
+    );
+  }
+  const run = aberta.run;
+
+  // O ator sintético é reconstruído AQUI, a partir do que a run gravou. Ele
+  // nunca atravessa a fronteira do módulo.
+  const actor: OnboardingActor = {
+    actor_id: run.id.startsWith('bootstrap:') ? run.id : `bootstrap-run:${run.id}`,
+    actor_role: 'founder',
+    tenant_id: null,
+  };
+
+  const tenantOut = await executeOnboardingStep({
+    run_id: run.id,
+    step: 'provision_tenant',
+    payload: { tenant_id: input.tenant_id, nome: input.tenant_nome },
+    idempotency_key: `${input.idempotency_key}:provision_tenant`,
+    expected_version: run.version,
+    actor,
+  });
+  if (tenantOut.status !== 'completed') {
+    throw new OnboardingError(
+      'activation_precondition_failed',
+      `provision_tenant não concluiu (status: ${tenantOut.status})`,
+    );
+  }
+
+  const adminOut = await executeOnboardingStep({
+    run_id: run.id,
+    step: 'provision_admin',
+    payload: {
+      user_id: randomUUID(),
+      email: input.email,
+      name: input.nome ?? null,
+      // `role` é IGNORADO no bootstrap: `applyProvisionAdmin` força `founder`.
+      // Mandamos o default do contrato só para satisfazer o schema do payload.
+      role: 'owner',
+    },
+    idempotency_key: `${input.idempotency_key}:provision_admin`,
+    expected_version: tenantOut.run.version,
+    actor,
+  });
+  if (adminOut.status !== 'completed') {
+    throw new OnboardingError(
+      'activation_precondition_failed',
+      `provision_admin não concluiu (status: ${adminOut.status})`,
+    );
+  }
+
+  const founder_user_id = (adminOut.result as { user_id?: string }).user_id ?? '';
+  return { run_id: run.id, tenant_id: input.tenant_id, founder_user_id };
+}
+
 async function openRun(input: StartRunInput): Promise<StartRunOutcome> {
   if (input.kind === 'global_bootstrap') {
     // O caminho GENÉRICO nunca abre bootstrap global, e isto não é uma
