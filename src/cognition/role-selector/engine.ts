@@ -25,6 +25,7 @@ import { SuggestedBy, RoleDecisionAction } from '@/types/enums.js';
 import type { RoleSelectorInput, RoleCandidate } from './types.js';
 import type { Role } from '@/db/schema.js';
 import { assertTurnOwnership } from '@/runtime/turns/execution-context.js';
+import { instrumentRoleSelect } from '@/observability/instrumentation.js';
 
 export type RoleSelectorResult = {
   decided_role: Role;
@@ -32,7 +33,22 @@ export type RoleSelectorResult = {
   decision_id: string;
 };
 
-export async function selectRole(input: RoleSelectorInput): Promise<RoleSelectorResult> {
+/**
+ * Issue #535 — span `role.select`, o outro filho de `preturn.graph`.
+ *
+ * Envelope no motor, não no node do grafo: o node é uma das formas de chegar
+ * aqui, e um span preso à montagem do grafo mediria a montagem, não a seleção.
+ *
+ * O atributo é `action` (`RoleDecisionAction`: `keep_current|switch|handoff|
+ * fallback`). O id do role decidido fica de fora pelo mesmo motivo dos ids de
+ * procedimento: é dado de tenant sem teto, e `decision_id` na linha persistida
+ * é o join.
+ */
+export function selectRole(input: RoleSelectorInput): Promise<RoleSelectorResult> {
+  return instrumentRoleSelect(() => selectRoleInner(input));
+}
+
+async function selectRoleInner(input: RoleSelectorInput): Promise<RoleSelectorResult> {
   // Run both suggesters in parallel
   const [detResult, llmResult] = await Promise.all([
     deterministicSuggester.suggest(input),

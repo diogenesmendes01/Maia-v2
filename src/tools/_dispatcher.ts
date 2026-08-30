@@ -27,7 +27,13 @@ import { logger } from '@/lib/logger.js';
 import type { ActionKey } from '@/governance/audit-actions.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { incCounter } from '@/lib/metrics.js';
-import { instrumentToolDispatch } from '@/observability/instrumentation.js';
+import {
+  instrumentConstitutionalCheck,
+  instrumentHandlerExecute,
+  instrumentIdempotencyClaim,
+  instrumentPermissionCheck,
+  instrumentToolDispatch,
+} from '@/observability/instrumentation.js';
 import { config } from '@/config/env.js';
 import {
   turnOwnershipLost,
@@ -394,12 +400,23 @@ async function dispatchToolInner(input: {
   // foi removido. Uma violação `limit_exceeded` agora vira uma EXIGÊNCIA de
   // aprovação resolvida adiante contra o store backend (approval_requests) —
   // o modelo nunca atesta a própria aprovação.
-  const violation = constitutionalCheck({
-    intent: { tool: tool.name, args },
-    pessoa: input.ctx.pessoa,
-    resolved: resolved ?? null,
-    scope: { entidades: input.ctx.scope.entidades },
-  });
+  //
+  // Issue #535 — span `constitutional.check`, o primeiro dos quatro portões
+  // que este dispatcher roda. É síncrono, então o wrapper grava a janela que
+  // acabou de fechar em vez de exigir que o portão vire async: observabilidade
+  // não reescreve fluxo de controle.
+  const violation = instrumentConstitutionalCheck(
+    tool.name,
+    () =>
+      constitutionalCheck({
+        intent: { tool: tool.name, args },
+        pessoa: input.ctx.pessoa,
+        resolved: resolved ?? null,
+        scope: { entidades: input.ctx.scope.entidades },
+      }),
+    (v) =>
+      v === null ? 'ok' : v.kind === 'forbidden' ? 'forbidden' : 'requires_approval',
+  );
   if (violation && violation.kind === 'forbidden') {
     await audit({
       acao: 'unauthorized_access_attempt',
@@ -411,25 +428,41 @@ async function dispatchToolInner(input: {
     return { error: 'forbidden', details: { rule_id: violation.rule_id, reason: violation.reason } };
   }
 
-  for (const action of tool.required_actions as ActionKey[]) {
-    const allow = canAct({
-      pessoa: input.ctx.pessoa,
-      resolved: resolved ?? null,
-      action,
-      valor,
-      natureza,
-      categoria_id,
+  // Issue #535 — span `permission.check`, o segundo portão. UM span para o laço
+  // inteiro: o laço é uma conjunção (qualquer recusa encerra o dispatch), então
+  // N spans renderizariam N-1 linhas `allowed` idênticas para uma decisão só.
+  //
+  // O `audit` da recusa fica FORA do span porque ele não é a checagem: é a
+  // consequência dela, e é `await` — mantê-lo dentro faria a duração do portão
+  // incluir uma escrita no banco e mediria a coisa errada.
+  const denial = instrumentPermissionCheck(
+    tool.name,
+    tool.required_actions.length,
+    (): { action: ActionKey; reason: string } | null => {
+      for (const action of tool.required_actions as ActionKey[]) {
+        const allow = canAct({
+          pessoa: input.ctx.pessoa,
+          resolved: resolved ?? null,
+          action,
+          valor,
+          natureza,
+          categoria_id,
+        });
+        if (!allow.allowed) return { action, reason: allow.reason };
+      }
+      return null;
+    },
+    (d) => (d === null ? 'allowed' : 'denied'),
+  );
+  if (denial) {
+    await audit({
+      acao: 'unauthorized_access_attempt',
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      metadata: { tool: tool.name, action: denial.action, reason: denial.reason },
     });
-    if (!allow.allowed) {
-      await audit({
-        acao: 'unauthorized_access_attempt',
-        pessoa_id: input.ctx.pessoa.id,
-        conversa_id: input.ctx.conversa.id,
-        mensagem_id: input.ctx.mensagem_id,
-        metadata: { tool: tool.name, action, reason: allow.reason },
-      });
-      return { error: 'forbidden', details: { reason: allow.reason } };
-    }
+    return { error: 'forbidden', details: { reason: denial.reason } };
   }
 
   // Redis check ANTES do claim de aprovação: um claim seguido de bloqueio de
@@ -633,20 +666,30 @@ async function dispatchToolInner(input: {
   const RESERVATION_TTL_SECONDS = 30;
   const WAIT_TIMEOUT_MS = RESERVATION_TTL_SECONDS * 1000;
 
-  const reservation = await idempotencyRepo.tryReserve({
-    key: idempotency_key,
-    tool_name: tool.name,
-    operation_type: tool.operation_type,
-    pessoa_id: input.ctx.pessoa.id,
-    entity_id,
-    // #299: store/compare the REAL payload fingerprint (was incorrectly
-    // `idempotency_key` before, which made the collision check a tautology
-    // — the key always matches itself). `tryReserve` echoes this hash into
-    // the reserved row and revalidates it on a `completed` hit.
-    payload_hash,
-    file_sha256,
-    ttl_seconds: RESERVATION_TTL_SECONDS,
-  });
+  // Issue #535 — span `idempotency.claim`, o terceiro portão. Cobre só o
+  // `tryReserve`: é o INSERT … ON CONFLICT que decide se ESTE chamador executa
+  // o handler, e o `state` que ele devolve é o que explica um turno parado —
+  // `in_progress` é um chamador esperando a reserva de outro worker, o que não
+  // se parece nada com banco lento até você conseguir ver.
+  const reservation = await instrumentIdempotencyClaim(
+    tool.name,
+    () =>
+      idempotencyRepo.tryReserve({
+        key: idempotency_key,
+        tool_name: tool.name,
+        operation_type: tool.operation_type,
+        pessoa_id: input.ctx.pessoa.id,
+        entity_id,
+        // #299: store/compare the REAL payload fingerprint (was incorrectly
+        // `idempotency_key` before, which made the collision check a tautology
+        // — the key always matches itself). `tryReserve` echoes this hash into
+        // the reserved row and revalidates it on a `completed` hit.
+        payload_hash,
+        file_sha256,
+        ttl_seconds: RESERVATION_TTL_SECONDS,
+      }),
+    (r) => (r.was_inserted ? 'reserved' : r.state),
+  );
 
   // Fase 0 cap. 3 — caminhos em que o handler NÃO roda neste caller devolvem
   // a evidência (claimed → approved) em vez de deixá-la presa em 'claimed'.
@@ -948,7 +991,14 @@ async function dispatchToolInner(input: {
 
   let result: unknown;
   try {
-    result = await tool.handler(args, {
+    // Issue #535 — span `handler.execute`, o quarto portão e a ÚNICA linha
+    // deste dispatcher que produz efeito. Separá-lo do `tool.dispatch` que o
+    // envolve é o ponto: o pai mede o dispatch INTEIRO — portões, ida e volta
+    // da aprovação, espera pela reserva — e essas partes rotineiramente
+    // dominam. Sem este span, "a tool está lenta" não se distingue de "a tool
+    // esperou", e as duas têm correções opostas.
+    result = await instrumentHandlerExecute(tool.name, () =>
+      tool.handler(args, {
       pessoa: input.ctx.pessoa,
       scope: input.ctx.scope,
       conversa: input.ctx.conversa,
@@ -963,7 +1013,8 @@ async function dispatchToolInner(input: {
       // turno reivindicado (flag OFF, worker de agenda, playground), que é o
       // mesmo regime no-op dos guards.
       turn: turnHandlerContext(),
-    });
+      }),
+    );
   } catch (err) {
     // Issue #507 — a tentativa foi cancelada DURANTE o handler. A exceção pode
     // ser a própria cooperação com o abort (uma requisição HTTP interrompida) ou

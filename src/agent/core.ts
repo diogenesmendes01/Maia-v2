@@ -95,6 +95,11 @@ import {
 import { MandatoryTraceEnvelopeError } from '@/observability/turn-trace.js';
 import { publishSpanAttribution } from '@/observability/tracer.js';
 import {
+  instrumentAudienceResolve,
+  instrumentPreturnGraph,
+  type AudienceResolveOutcome,
+} from '@/observability/instrumentation.js';
+import {
   buildBaseContextPacketFromTurn,
   applyToolReductions,
 } from '@/runtime/decision/build-base-context.js';
@@ -1088,20 +1093,42 @@ async function runAgentTurnPipeline(params: {
   // the runner gate 4.6 (also audience-gated) is skipped too, so the turn is NOT
   // broken by a transient audience-store hiccup; the conservative defaults still
   // apply once an audience is present.
-  let audienceContext: AudienceContext | null = null;
-  try {
-    const audienceProfile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
-    audienceContext = buildAudienceContext({
-      pessoa,
-      profile: audienceProfile,
-      allowed_entity_ids: scope.entidades ?? [],
-    });
-  } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, pessoa_id: pessoa.id },
-      'agent.audience_resolution_failed_proceeding',
-    );
-  }
+  //
+  // Issue #535 — span `audience.resolve`. Ele cobre a busca do perfil E o
+  // `buildAudienceContext` porque só o PAR é uma fronteira: a busca é o
+  // round-trip ao banco, e a derivação é o que decide se o turno termina com
+  // audiência. Cronometrar só a query esconderia justamente o caso que importa
+  // — um turno rodando com `audienceContext === null`, que silenciosamente pula
+  // dois portões de política.
+  //
+  // `failed` é membro do vocabulário e não status de erro: o `catch` aqui é
+  // fail-soft de propósito (um soluço da audience-store não pode derrubar o
+  // turno), então do ponto de vista do span a etapa COMPLETOU — só completou
+  // sem audiência, e é isso que `result` diz.
+  const audienceResolution = await instrumentAudienceResolve(
+    async (): Promise<{
+      context: AudienceContext | null;
+      outcome: AudienceResolveOutcome;
+    }> => {
+      try {
+        const audienceProfile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
+        const context = buildAudienceContext({
+          pessoa,
+          profile: audienceProfile,
+          allowed_entity_ids: scope.entidades ?? [],
+        });
+        return { context, outcome: context ? 'resolved' : 'absent' };
+      } catch (err) {
+        logger.warn(
+          { err: (err as Error).message, pessoa_id: pessoa.id },
+          'agent.audience_resolution_failed_proceeding',
+        );
+        return { context: null, outcome: 'failed' };
+      }
+    },
+    (r) => r.outcome,
+  );
+  const audienceContext: AudienceContext | null = audienceResolution.context;
 
   // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
   // resolve procedure-selector + role-selector (role-selector runs whenever a
@@ -1150,7 +1177,13 @@ async function runAgentTurnPipeline(params: {
       // reasoner (`procedure-selector`, `role-selector`).
       ...(turnSignal ? { signal: turnSignal } : {}),
     };
-    const result = await runNodes(nodes, ctx);
+    // Issue #535 — span `preturn.graph`. É ele que faz `role.select` e
+    // `procedure.select` ANINHAREM em vez de flutuarem: os dois nodes rodam
+    // dentro de `runNodes`, então abrir este escopo aqui é o que lhes dá o pai
+    // que `SPAN_PARENT` declara. Sem ele os dois se penduravam em `turn` e a
+    // waterfall não mostrava que rodam em PARALELO — que é a única coisa sobre
+    // esta etapa que um operador lendo um turno lento precisa saber.
+    const result = await instrumentPreturnGraph(nodes.length, () => runNodes(nodes, ctx));
 
     // Issue #507 (achado 2 da revisão do dono) — GUARD DE BOUNDARY, antes de
     // CONSUMIR o resultado. Tudo o que vem abaixo é write:

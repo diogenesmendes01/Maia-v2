@@ -35,8 +35,9 @@ nome que não está na taxonomia não deveria existir.
 
 Desde a #535 a taxonomia também declara, por span, se ele é **emitido** ou
 apenas **declarado** (`SPAN_EMISSION`), com teste que falha se a marca divergir
-do código. Leia essa tabela antes de procurar um span no collector: se estiver
-`declared`, ele não existe, e a ausência não é um bug do collector.
+do código. Hoje o conjunto `declared` está vazio — ver §9.4 para o que isso
+significa na prática e para os três nomes que saíram da taxonomia em vez de
+ganhar emissor.
 
 ## 3. SLOs iniciais
 
@@ -604,9 +605,34 @@ o mesmo `mensagem_id` amostra de novo.
 
 `SPAN_EMISSION` em `src/observability/taxonomy.ts` é a fonte de verdade e é
 verificada por teste — a taxonomia não consegue mais superestimar a cobertura.
-Emitidos hoje: `turn`, `queue.wait`, `tool.dispatch`, `context.load` e
-`llm.request`. Todo o resto está **declarado, não emitido**; o span não vai
-aparecer no waterfall.
+
+**Desde a #535, TODOS os spans da taxonomia são emitidos.** A decisão do dono
+foi que um span que só existe na declaração é dívida, não observabilidade: cada
+um dos dezenove nomes sem emissor ou ganhou um no caminho de produção ou saiu da
+taxonomia com justificativa escrita. Um caso do `tracer.spec.ts` afirma que o
+conjunto `declared` está VAZIO, então "fiamos depois" não volta pela tabela.
+
+Saíram três, e o motivo de cada está em `SPANS_REMOVED_IN_535` (mesmo arquivo).
+Os três compartilham a mesma forma, e ela é estrutural: a árvore os declarava
+como filhos de `turn`, e em nenhum dos três o `turn` os contém no tempo.
+
+| Span removido | Por quê |
+|---|---|
+| `ingress.normalize` | Roda no processo do GATEWAY, antes do job entrar na fila. O `turn` só abre quando o worker PEGA o job — o pai começaria depois de o filho terminar. E não há trace id ainda: ele é derivado do `mensagens.id`, que ainda não existe. Taxa e falhas já saem em `maia_inbound_received_total` / `maia_inbound_rejected_total`. |
+| `ingress.persist` | Mesma impossibilidade de parentesco, mais uma versão pior do problema do id: este É o INSERT que cunha o `mensagens.id`, a chave do trace inteiro. Um span não pode carregar o id que a própria conclusão dele cria. Coberto por `maia_inbound_persisted_total` e pelos gauges do pool. |
+| `whatsapp.send` | Desde #316/#630 a chamada ao provedor roda no delivery worker, da fila DELE, depois de retries e possivelmente minutos depois. O `turn` fechou faz tempo e o delivery worker não abre escopo de correlação, então o span sairia com trace id aleatório e não juntaria com nada. A fronteira que ESTÁ dentro do turno é `outbound.commit`, e essa tem emissor. A entrega em si é medida por `maia_outbound_send_total` / `maia_outbound_send_ms`. |
+
+Onde cada span nasce está listado no comentário de `SPAN_EMISSION`. Três pais
+declarados foram CORRIGIDOS junto, porque descreviam um aninhamento que o código
+não tem — `context.load` sob `prompt.render`, `outbound.commit` sob
+`react.iteration`, `risk.classify` sob `decision.evaluate`.
+
+**O que um turno de verdade abre, e o que não abre.** Um turno só de texto não
+passa por `tool.dispatch` nem pelos quatro portões abaixo dele
+(`constitutional.check`, `permission.check`, `idempotency.claim`,
+`handler.execute`) — eles saem quando há tool. `queue.wait` só existe quando o
+job veio pela fila. Ausência desses num waterfall específico é normal; ausência
+dos demais não é.
 
 `llm.request` sai de `emitUsage` (`src/lib/llm/telemetry.ts`), **não** dos seis
 pontos de saída do `executeLLM`. O motivo é a mesma invariante que a #508 criou

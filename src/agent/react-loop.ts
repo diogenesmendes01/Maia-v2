@@ -18,6 +18,7 @@ import { persistCandidate } from '@/cognition/persister.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import { CognitiveEventType } from '@/types/enums.js';
 import { buildToolSummary, type ToolExecutionSummary } from './tool-execution-summary.js';
+import { instrumentReactIteration } from '@/observability/instrumentation.js';
 import {
   assertTurnOwnership,
   getTurnExecutionContext,
@@ -261,7 +262,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // agenda, playground e testes seguem com o comportamento anterior.
   const turnSignal = getTurnExecutionContext()?.signal;
 
-  for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+  /**
+   * Issue #535 — o corpo de UMA iteração, extraído para que o span
+   * `react.iteration` possa envolvê-lo.
+   *
+   * Extraído, e não envolvido no lugar, porque `withSpan` recebe um callback e
+   * `break` não atravessa fronteira de função: o corpo devolve `'stop'` onde
+   * antes dava `break`, e o laço abaixo lê esse valor. A indentação do corpo é
+   * a mesma de antes — o `diff` desta mudança é a primeira linha, a última, e
+   * os três `break`.
+   *
+   * Uma arrow function que fecha sobre os acumuladores do turno
+   * (`conversation`, `toolSummaries`, `exitReason`, …) em vez de recebê-los:
+   * são os mesmos objetos de antes, no mesmo escopo de antes.
+   */
+  const runIteration = async (i: number): Promise<'stop' | 'continue'> => {
     // Issue #504 §Fencing — LIMITE DE EFEITO, no topo de cada iteração.
     //
     // O dispatcher e o outbound já recusam individualmente; este guard existe
@@ -341,7 +356,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       // #503 cenário A: o turno NÃO está concluído — nada foi produzido nem
       // entregue. O caller agenda retry em vez de marcar `completed`.
       exitReason = 'reasoner_failed';
-      break;
+      return 'stop';
     }
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
 
@@ -379,7 +394,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
             'react_loop.outbound_not_delivered',
           );
           exitReason = 'outbound_failure';
-          break;
+          return 'stop';
         }
         if (outcome.status === 'sent_no_persist') {
           // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
@@ -424,7 +439,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           })();
         }
       }
-      break;
+      return 'stop';
     }
 
     // Append assistant turn with tool uses
@@ -643,6 +658,19 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     if (i === MAX_REACT_ITERATIONS - 1) {
       exitReason = 'iteration_cap';
     }
+    return 'continue';
+  };
+
+  // Issue #535 — UM span por iteração, e ele é o pai declarado de
+  // `llm.request` e de `tool.dispatch`. Até aqui esses dois — os únicos spans
+  // que já saíam desta região — se penduravam direto em `turn`: um turno com
+  // três iterações e cinco tools virava uma fileira plana de oito irmãos, sem
+  // nada dizendo qual chamada ao modelo levou a quais tools. Com este escopo
+  // aberto no ALS eles aninham, e "o segundo round-trip é o lento" passa a ser
+  // legível na waterfall em vez de inferível pelos timestamps.
+  for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+    const step = await instrumentReactIteration(i + 1, () => runIteration(i));
+    if (step === 'stop') break;
   }
 
   // Codex C1 (PR #74): when no outbound was dispatched but tools ran, persist

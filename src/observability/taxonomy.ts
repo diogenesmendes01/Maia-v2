@@ -34,8 +34,6 @@
  */
 export const SPAN = {
   TURN: 'turn',
-  INGRESS_NORMALIZE: 'ingress.normalize',
-  INGRESS_PERSIST: 'ingress.persist',
   QUEUE_WAIT: 'queue.wait',
   IDENTITY_RESOLVE: 'identity.resolve',
   AUDIENCE_RESOLVE: 'audience.resolve',
@@ -54,7 +52,6 @@ export const SPAN = {
   IDEMPOTENCY_CLAIM: 'idempotency.claim',
   HANDLER_EXECUTE: 'handler.execute',
   OUTBOUND_COMMIT: 'outbound.commit',
-  WHATSAPP_SEND: 'whatsapp.send',
   TURN_COMPLETE: 'turn.complete',
 } as const;
 
@@ -66,18 +63,16 @@ export type SpanName = (typeof SPAN)[keyof typeof SPAN];
  */
 export const SPAN_PARENT: Readonly<Record<SpanName, SpanName | null>> = Object.freeze({
   [SPAN.TURN]: null,
-  [SPAN.INGRESS_NORMALIZE]: SPAN.TURN,
-  [SPAN.INGRESS_PERSIST]: SPAN.TURN,
   [SPAN.QUEUE_WAIT]: SPAN.TURN,
   [SPAN.IDENTITY_RESOLVE]: SPAN.TURN,
   [SPAN.AUDIENCE_RESOLVE]: SPAN.TURN,
   [SPAN.PRETURN_GRAPH]: SPAN.TURN,
   [SPAN.ROLE_SELECT]: SPAN.PRETURN_GRAPH,
   [SPAN.PROCEDURE_SELECT]: SPAN.PRETURN_GRAPH,
-  [SPAN.RISK_CLASSIFY]: SPAN.PRETURN_GRAPH,
   [SPAN.DECISION_EVALUATE]: SPAN.TURN,
-  [SPAN.CONTEXT_LOAD]: SPAN.TURN,
+  [SPAN.RISK_CLASSIFY]: SPAN.DECISION_EVALUATE,
   [SPAN.PROMPT_RENDER]: SPAN.TURN,
+  [SPAN.CONTEXT_LOAD]: SPAN.PROMPT_RENDER,
   [SPAN.REACT_ITERATION]: SPAN.TURN,
   [SPAN.LLM_REQUEST]: SPAN.REACT_ITERATION,
   [SPAN.TOOL_DISPATCH]: SPAN.REACT_ITERATION,
@@ -85,8 +80,7 @@ export const SPAN_PARENT: Readonly<Record<SpanName, SpanName | null>> = Object.f
   [SPAN.CONSTITUTIONAL_CHECK]: SPAN.TOOL_DISPATCH,
   [SPAN.IDEMPOTENCY_CLAIM]: SPAN.TOOL_DISPATCH,
   [SPAN.HANDLER_EXECUTE]: SPAN.TOOL_DISPATCH,
-  [SPAN.OUTBOUND_COMMIT]: SPAN.TURN,
-  [SPAN.WHATSAPP_SEND]: SPAN.TURN,
+  [SPAN.OUTBOUND_COMMIT]: SPAN.REACT_ITERATION,
   [SPAN.TURN_COMPLETE]: SPAN.TURN,
 });
 
@@ -102,26 +96,10 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  *
  * The whole complaint the issue opens with is that "quem ler
  * `src/observability/taxonomy.ts` pode concluir que a cobertura é maior do que
- * é". A declaration that nothing emits reads exactly like coverage. Rather
- * than deleting the roadmap (the tree IS the target shape, and every name in
- * it is referenced by the SLI narrative), the gap is made MACHINE-CHECKABLE:
- * each span declares whether PRODUCTION REACHES IT, and
- * `tests/unit/observability/tracer.spec.ts` pins the `emitted` set exactly.
- *
- * So the file can no longer overstate coverage: adding a name here without a
- * production-reachable emitter fails a test, and shipping a reachable emitter
- * without flipping the flag fails the same test.
- *
- * Current emitters:
- *   - `turn`, `queue.wait` → `src/gateway/queue.ts` (BullMQ agent worker)
- *   - `tool.dispatch`      → `src/tools/_dispatcher.ts` via
- *                            `observability/instrumentation.ts`
- *   - `context.load`       → `src/agent/turn-context/loader.ts`
- *                            (`loadTurnContext`) via the same wrapper
- *   - `llm.request`        → `src/lib/llm/telemetry.ts` (`emitUsage`), the
- *                            single emission point every terminal path of
- *                            `executeLLM` already passes through (#508), via
- *                            `recordLlmRequestSpan` in the same wrapper file
+ * é". A declaration that nothing emits reads exactly like coverage. So the gap
+ * was made MACHINE-CHECKABLE: each span declares whether PRODUCTION REACHES
+ * IT, and `tests/unit/observability/tracer.spec.ts` pins the `emitted` set
+ * exactly.
  *
  * `emitted` means "production reaches this span", NOT "an instrumentation site
  * exists in the tree". The two came apart on `context.load` and the review of
@@ -132,47 +110,144 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  * "a site exists" — that reading is what let the table claim coverage for a
  * span no turn could open.
  *
- * `context.load` is the case that forced the definition, and it is now
- * `emitted` under it. The #535 gate-6 site sat on `buildContextPacket`, the
- * P8a assembly orchestrator, whose hot path PR #406 deleted
- * (`FEATURE_CONTEXT_PACKET_V1`): no turn reached it. The wrapper moved to the
- * carga de contexto the turn actually runs — `loadTurnContext`
- * (`src/agent/turn-context/loader.ts`, issue #525), reached from
- * `buildPrompt` → `src/agent/core.ts` → the BullMQ agent worker — and
- * `tests/integration/context-load-span-hot-path.spec.ts` drives the REAL turn
- * entry point (`runAgentForMensagem`) to prove the span appears. The span is
- * the only thing that wrapper emits: duration and round-trips for this same
- * operation are already published by `recordTurnContextLoad`
- * (`maia_turn_context_load_duration_ms` / `maia_turn_context_db_queries`), and
- * two metric families measuring one operation is the drift this taxonomy
- * exists to prevent.
+ * ## Every span in this file is now emitted, and that is the point
+ *
+ * The owner's ruling on #535 was that a span living only in the declaration is
+ * DEBT, not observability: each declared name either gets a real emitter on the
+ * production path, or leaves with an individual technical justification.
+ * Eighteen names arrived at that ruling with nothing behind them; fifteen got an
+ * emitter and three left (see `SPANS_REMOVED_IN_535` below). The emitter of each
+ * is named here so the file answers "where does this come from?" without a grep:
+ *
+ *   - `turn`, `queue.wait`       → `src/gateway/queue.ts` (BullMQ agent worker)
+ *   - `identity.resolve`         → `src/identity/resolver.ts` (`resolveIdentity`)
+ *   - `audience.resolve`         → `src/agent/core.ts`, the audience-profile
+ *                                  lookup + `buildAudienceContext`
+ *   - `preturn.graph`            → `src/agent/core.ts`, the `runNodes` call of
+ *                                  the pre-turn graph
+ *   - `procedure.select`         → `src/cognition/procedure-selector.ts`
+ *   - `role.select`              → `src/cognition/role-selector/engine.ts`
+ *   - `decision.evaluate`        → `src/runtime/decision/decision-engine.ts`
+ *                                  (`DecisionEngine.decide`), always-on since P11
+ *   - `risk.classify`            → the `risk` step INSIDE that same engine
+ *   - `prompt.render`            → `src/agent/prompt-builder.ts` (`buildPrompt`)
+ *   - `context.load`             → `src/agent/turn-context/loader.ts`
+ *                                  (`loadTurnContext`), called by `buildPrompt`
+ *   - `react.iteration`          → `src/agent/react-loop.ts`, one span per
+ *                                  iteration of the ReAct loop
+ *   - `llm.request`              → `src/lib/llm/telemetry.ts` (`emitUsage`), the
+ *                                  single emission point every terminal path of
+ *                                  `executeLLM` already passes through (#508)
+ *   - `tool.dispatch`            → `src/tools/_dispatcher.ts` via
+ *                                  `observability/instrumentation.ts`
+ *   - `constitutional.check`,
+ *     `permission.check`,
+ *     `idempotency.claim`,
+ *     `handler.execute`          → the four gates inside `dispatchToolInner`
+ *                                  (`src/tools/_dispatcher.ts`), in the order the
+ *                                  dispatcher runs them
+ *   - `outbound.commit`          → `src/runtime/outbound/commit.ts`
+ *                                  (`commitOutboundIntent`)
+ *   - `turn.complete`            → `src/runtime/turns/lifecycle.ts`
+ *                                  (`concludeTurn`), the single terminal
+ *                                  transition every outcome of a turn passes
+ *                                  through
+ *
+ * ## Three parents were CORRECTED, not invented
+ *
+ * `SPAN_PARENT` is the target tree, but three entries described a nesting the
+ * code does not have, and "parentesco correto" is an acceptance criterion.
+ * `isDeclaredAncestor()` would have rejected the real runtime parent in all
+ * three cases, so the declaration was the thing that was wrong:
+ *
+ *   - `context.load` was declared under `turn`. Its emitter is `loadTurnContext`,
+ *     which `buildPrompt` calls — so its real parent is `prompt.render`.
+ *   - `outbound.commit` was declared under `turn`. `commitOutboundIntent` is
+ *     reached from `safeDispatchOutput` INSIDE the ReAct loop
+ *     (`src/agent/react-loop.ts`) — so its real parent is `react.iteration`.
+ *     `turn` stays a declared ANCESTOR, which is what the paths that dispatch
+ *     outside the loop need.
+ *   - `risk.classify` was declared under `preturn.graph`. The pre-turn graph has
+ *     exactly two nodes (`procedure-selector`, `role-selector` —
+ *     `src/cognitive-graph/preturn-graph.ts`); risk is scored in step 3 of the
+ *     Decision Engine. Its real parent is `decision.evaluate`.
  */
 export type SpanEmission = 'emitted' | 'declared';
 
 export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.freeze({
   [SPAN.TURN]: 'emitted',
-  [SPAN.INGRESS_NORMALIZE]: 'declared',
-  [SPAN.INGRESS_PERSIST]: 'declared',
   [SPAN.QUEUE_WAIT]: 'emitted',
-  [SPAN.IDENTITY_RESOLVE]: 'declared',
-  [SPAN.AUDIENCE_RESOLVE]: 'declared',
-  [SPAN.PRETURN_GRAPH]: 'declared',
-  [SPAN.ROLE_SELECT]: 'declared',
-  [SPAN.PROCEDURE_SELECT]: 'declared',
-  [SPAN.RISK_CLASSIFY]: 'declared',
-  [SPAN.DECISION_EVALUATE]: 'declared',
+  [SPAN.IDENTITY_RESOLVE]: 'emitted',
+  [SPAN.AUDIENCE_RESOLVE]: 'emitted',
+  [SPAN.PRETURN_GRAPH]: 'emitted',
+  [SPAN.ROLE_SELECT]: 'emitted',
+  [SPAN.PROCEDURE_SELECT]: 'emitted',
+  [SPAN.RISK_CLASSIFY]: 'emitted',
+  [SPAN.DECISION_EVALUATE]: 'emitted',
   [SPAN.CONTEXT_LOAD]: 'emitted',
-  [SPAN.PROMPT_RENDER]: 'declared',
-  [SPAN.REACT_ITERATION]: 'declared',
+  [SPAN.PROMPT_RENDER]: 'emitted',
+  [SPAN.REACT_ITERATION]: 'emitted',
   [SPAN.LLM_REQUEST]: 'emitted',
   [SPAN.TOOL_DISPATCH]: 'emitted',
-  [SPAN.PERMISSION_CHECK]: 'declared',
-  [SPAN.CONSTITUTIONAL_CHECK]: 'declared',
-  [SPAN.IDEMPOTENCY_CLAIM]: 'declared',
-  [SPAN.HANDLER_EXECUTE]: 'declared',
-  [SPAN.OUTBOUND_COMMIT]: 'declared',
-  [SPAN.WHATSAPP_SEND]: 'declared',
-  [SPAN.TURN_COMPLETE]: 'declared',
+  [SPAN.PERMISSION_CHECK]: 'emitted',
+  [SPAN.CONSTITUTIONAL_CHECK]: 'emitted',
+  [SPAN.IDEMPOTENCY_CLAIM]: 'emitted',
+  [SPAN.HANDLER_EXECUTE]: 'emitted',
+  [SPAN.OUTBOUND_COMMIT]: 'emitted',
+  [SPAN.TURN_COMPLETE]: 'emitted',
+});
+
+/**
+ * The three names #535 REMOVED, and the individual technical reason for each.
+ *
+ * The owner's ruling allows removal only with a justification written per span,
+ * so the justifications live here rather than in a PR body nobody greps. All
+ * three share one shape, and it is structural rather than "we ran out of time":
+ * the tree declared them as children of `turn`, and in each case the `turn` span
+ * does not overlap the work in time. A parent that starts after its child ends —
+ * or ends before it starts — is not a parent, and a span emitted anyway would be
+ * the root of its own orphan trace. `tracer.ts` design note 2 is explicit that a
+ * half-trace is worse than none: the missing half reads as "that stage never
+ * ran".
+ *
+ * They are listed rather than deleted silently so a future reader who wants one
+ * back has to answer the objection instead of rediscovering it.
+ */
+export const SPANS_REMOVED_IN_535: Readonly<Record<string, string>> = Object.freeze({
+  /**
+   * Normalising a Baileys `WebMessageInfo` into Maia's inbound shape happens in
+   * the GATEWAY process, before the job is enqueued. The `turn` span is opened
+   * by the BullMQ worker (`src/gateway/queue.ts`) when it PICKS UP that job, so
+   * the declared parent begins strictly after this child has ended. There is
+   * also no trace id to hang it on yet: `deriveTraceId()` derives from the
+   * persisted `mensagens.id`, which does not exist until `ingress.persist`
+   * completes. Rate and failures of this stage are already published by
+   * `maia_inbound_received_total` / `maia_inbound_rejected_total`.
+   */
+  'ingress.normalize':
+    'gateway-side; it ends before the declared parent `turn` begins, and it runs before the trace id it would need exists',
+  /**
+   * Same impossible parentage, plus a sharper form of the id problem: this is
+   * the INSERT that mints `mensagens.id`, the value the whole trace is keyed on.
+   * A span cannot carry the trace id its own completion creates. The duration
+   * and outcome of the write are already covered by
+   * `maia_inbound_persisted_total` and the DB-pool gauges.
+   */
+  'ingress.persist':
+    'the operation that MINTS the trace id cannot be a span inside that trace, and it too ends before `turn` begins',
+  /**
+   * The physical provider call moved to the durable outbox (#316/#630): it runs
+   * in the delivery worker, off its own BullMQ queue, after retries and possibly
+   * minutes later. The `turn` span has long since closed, and the delivery
+   * worker establishes no correlation scope, so the span would carry a random
+   * trace id and join nothing. The boundary that IS inside the turn — the
+   * transactional commit that makes the send durable — is `outbound.commit`, and
+   * that one has a real emitter. Delivery itself is measured by
+   * `maia_outbound_send_total` / `maia_outbound_send_ms`; giving it a trace of
+   * its own, linked by trace id, is a separate design, not this span.
+   */
+  'whatsapp.send':
+    'the send now happens in the delivery worker after `turn` has closed, so the declared parent cannot contain it',
 });
 
 /**

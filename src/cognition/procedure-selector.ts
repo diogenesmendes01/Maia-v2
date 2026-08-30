@@ -5,6 +5,7 @@ import { runCognitiveModule } from './runner.js';
 import { procedureAssignmentsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
 import { getCurrentAgent } from '@/db/tenant-context.js';
 import { config } from '@/config/env.js';
+import { instrumentProcedureSelect } from '@/observability/instrumentation.js';
 
 const MatchResponseSchema = z.object({
   matches: z.boolean(),
@@ -26,7 +27,29 @@ export type SelectorDecision = {
   reason: string;
 };
 
-export async function selectProcedure(input: {
+/**
+ * Issue #535 — span `procedure.select`, filho de `preturn.graph`.
+ *
+ * Envelope sobre o corpo inteiro (`dispatchTool`/`dispatchToolInner` de novo)
+ * porque este selector é um LAÇO de chamadas de LLM, uma por procedimento
+ * atribuído: sem o span, o custo dele aparece diluído no `preturn.graph` e a
+ * pergunta "por que o pré-turno demorou?" não tem resposta na waterfall.
+ *
+ * O atributo é `decision`, a união de cinco membros do próprio selector. Os ids
+ * dos procedimentos candidatos ficam de fora de propósito: são dados de tenant
+ * sem teto, e a linha em `procedure_selector_decisions` — joinável pelo
+ * `trace_id` que todo span carrega — é onde o detalhe já mora.
+ */
+export function selectProcedure(input: {
+  conversa_id: string;
+  current_message: string;
+  current_execution: { id: string; definition_id: string; status: string } | null;
+  signal?: AbortSignal;
+}): Promise<SelectorDecision> {
+  return instrumentProcedureSelect(() => selectProcedureInner(input));
+}
+
+async function selectProcedureInner(input: {
   conversa_id: string;
   current_message: string;
   current_execution: { id: string; definition_id: string; status: string } | null;
