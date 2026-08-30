@@ -259,6 +259,18 @@ services:
       # o `.env.app.prod.example` manda explicitamente NÃO defini-la ali, para
       # que não existam duas fontes que possam divergir do migrator.
       MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
+      # Issue #513 — o papel deste container. Default `all`: o monólito de
+      # hoje, que serve HTTP, drena a fila, agenda os crons e possui as
+      # sessões.
+      #
+      # AO LIGAR o profile `split-roles` (serviços `scheduler` e `worker`
+      # abaixo), declare `MAIA_PROCESS_ROLE=api` no `.env.infra`. Se esquecer,
+      # o `app` continua em `all` e você fica com DOIS schedulers e DOIS
+      # consumidores da fila — que é exatamente o modo de falha que a #513
+      # existe para eliminar, agora com o rótulo de "topologia nova". O boot
+      # de cada container imprime o próprio papel em `maia.starting`; é assim
+      # que se confere em 10 segundos.
+      MAIA_PROCESS_ROLE: ${MAIA_PROCESS_ROLE:-all}
       # DATABASE_URL/REDIS_URL compostas das MESMAS vars obrigatórias com que
       # os datastores sobem — sem fallback e sem drift entre serviço e URL.
       # NOTA: a senha entra numa URL — use senha URL-safe (ex.:
@@ -304,6 +316,145 @@ services:
       retries: 5
       # Startup: `/startupz` só vira 200 quando o lifecycle chega em `ready`.
       start_period: 30s
+
+  # =====================================================================
+  # SEPARAÇÃO DE ROLES (issue #513) — profile `split-roles`, OPT-IN.
+  #
+  #   docker compose --env-file .env.infra -f compose.prod.yml \
+  #     --profile split-roles up -d
+  #
+  # Sem `--profile split-roles`, NADA aqui sobe e o deployment continua sendo
+  # o `app` monolítico (`MAIA_PROCESS_ROLE=all`) — que é o alvo de rollback
+  # declarado da issue. É por isso que estes serviços nascem atrás de profile
+  # e não como dependência: o rollback tem que ser tirar uma flag do comando,
+  # não editar YAML sob incidente.
+  #
+  # ATENÇÃO — o que este profile AINDA NÃO faz, e por quê:
+  #
+  #   1. Ele NÃO reduz o env file. Os três serviços dividem `.env.app`. O
+  #      subset por papel está declarado e testado em
+  #      `src/runtime/lifecycle/role-config.ts`, mas `src/config/env.ts`
+  #      valida o schema do runtime INTEIRO no boot: um `.env.scheduler` sem
+  #      `ANTHROPIC_API_KEY` reprova em `requiredWhen: LLM_PROVIDER=anthropic`
+  #      e o processo não sobe. Tornar o LOADER consciente do papel é o passo
+  #      que falta para §10 sair do papel — está nomeado na PR de #513 fatia E
+  #      como follow-up, e é pequeno, mas mexe no gate de config (#515).
+  #
+  #   2. Ele NÃO sobe uma segunda réplica de `app` nem de `session-owner`. A
+  #      posse exclusiva por canal (lease + fencing token, #513 fatias A–D)
+  #      é o que autoriza isso, e o rollout da issue manda fazê-lo em canário,
+  #      depois — não junto com a separação de processo.
+  #
+  # O que ele JÁ entrega, e é o ponto: reiniciar a API deixa de reiniciar os
+  # crons, e escalar worker deixa de multiplicar scheduler.
+  # =====================================================================
+
+  # scheduler — SOMENTE os jobs de cron. Não escuta porta, não consome a fila
+  # do agente, não abre socket. `MAIA_SCHEDULER_GROUPS` é o inventário
+  # EXPLÍCITO do que ele roda (issue #513 §5); o default reproduz exatamente o
+  # que o monólito agenda hoje.
+  #
+  # UMA RÉPLICA. Vários jobs ainda duplicam efeito com duas — o processo
+  # imprime a lista deles no boot (`scheduler.unguarded_jobs_enabled`), e o
+  # inventário congelado está em `src/workers/index.ts`.
+  scheduler:
+    profiles: ["split-roles"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    user: "1001:1001"
+    env_file:
+      - .env.app
+    environment:
+      NODE_ENV: production
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging)}
+      MAIA_PROCESS_ROLE: scheduler
+      # Explícito de propósito, mesmo sendo o default: o inventário do que
+      # roda em produção pertence ao manifesto, não a um default no código.
+      MAIA_SCHEDULER_GROUPS: turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      TZ: America/Sao_Paulo
+    networks:
+      - data
+    volumes:
+      # `pending_reminder`, o tick de workflows e o drain do outbox ainda
+      # ENVIAM direto pelo transporte (ver JOB_GROUP_CONFIG em
+      # role-config.ts). Enquanto o outbound durável de §7 não for o único
+      # caminho de saída, o scheduler precisa do auth state — montado RO
+      # porque ele nunca pareia, só usa a sessão que o owner escreveu.
+      - maia_baileys_auth:/app/.baileys-auth:ro
+      - maia_media:/app/media
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    # O drain de cron do #512 cabe aqui: `SHUTDOWN_GRACE_MS` + fechamento.
+    stop_grace_period: 40s
+
+  # worker — SOMENTE o consumo da fila do agente (cognition + tools). Escalar
+  # ESTE serviço é o objetivo da issue: mais throughput sem mais socket e sem
+  # mais cron. Sem porta e sem healthcheck HTTP (o role `worker` não sobe
+  # Fastify — a readiness dele é o `/readyz` que o role não expõe; supervisão
+  # é pelo processo).
+  worker:
+    profiles: ["split-roles"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maia-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    user: "1001:1001"
+    env_file:
+      - .env.app
+    environment:
+      NODE_ENV: production
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging)}
+      MAIA_PROCESS_ROLE: worker
+      DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      TZ: America/Sao_Paulo
+    networks:
+      - data
+    volumes:
+      # SEM `maia_baileys_auth`: "agent worker não recebe auth state do
+      # WhatsApp" (#513 §10). A resposta dele é COMMIT, não send.
+      - maia_media:/app/media
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    stop_grace_period: 40s
 
   # admin-ui (Next.js) — container separado; o proxy roteia
   # `admin.${DOMAIN}` → admin-ui:4000 pela rede `web`.
