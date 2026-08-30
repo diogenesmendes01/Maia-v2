@@ -376,7 +376,7 @@ services:
       - .env.app
     environment:
       NODE_ENV: production
-      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging)}
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       MAIA_PROCESS_ROLE: scheduler
       # Explícito de propósito, mesmo sendo o default: o inventário do que
       # roda em produção pertence ao manifesto, não a um default no código.
@@ -432,7 +432,7 @@ services:
       - .env.app
     environment:
       NODE_ENV: production
-      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging)}
+      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
       MAIA_PROCESS_ROLE: worker
       DATABASE_URL: postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:?}
       REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
