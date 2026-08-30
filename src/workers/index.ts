@@ -612,7 +612,7 @@ export const JOBS: Job[] = [
     guard: {
       kind: 'row-claim',
       claim:
-        'claim de `objective_tasks` com FOR UPDATE SKIP LOCKED; falha de executor vira `failed` com detalhe, nunca `running` preso',
+        'claim de `objective_tasks` com FOR UPDATE SKIP LOCKED, carimbando lease (`claimed_by`/`lease_expires_at`) e `claim_token`; a transição EXIGE o token, então o dono de lease vencida não sobrescreve quem assumiu depois, e o reaper do início do tick devolve para `pending` a tarefa cujo processo morreu (migração 138)',
       tables: ['objective_tasks'],
     },
     module: 'objective-execute-worker.ts',
