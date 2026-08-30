@@ -3,8 +3,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter, setGaugeProvider, _internal as metricsInternal } from '@/lib/metrics.js';
 import {
-  DEFAULT_JOB_GROUPS,
-  describeJob,
+  classifyJob,
   getJobGroupSpec,
   JOB_GROUPS,
   parseJobGroups,
@@ -1021,7 +1020,18 @@ export function startWorkers(opts: StartWorkersOptions = {}): SchedulerInventory
     registerWorkerGauges(job.name);
     scheduled.push(job.name);
     if (job.unguarded) unguarded_enabled.push(job.name);
-    logger.info({ job: job.name, cron: job.cron, group: job.group }, 'worker.scheduled');
+    logger.info(
+      {
+        job: job.name,
+        cron: job.cron,
+        group: job.group,
+        // A classe de concorrência no log de agendamento: quem investiga um
+        // efeito duplicado quer saber, ali mesmo, se aquele job tinha claim —
+        // sem abrir o registro.
+        classe: classifyJob(job.effect, job.guard),
+      },
+      'worker.scheduled',
+    );
   }
 
   const inventory: SchedulerInventory = {
@@ -1032,12 +1042,15 @@ export function startWorkers(opts: StartWorkersOptions = {}): SchedulerInventory
     unguarded_enabled,
   };
 
+  const porGrupo = jobCountByGroup();
   logger.info(
     {
       groups_enabled: inventory.groups_enabled,
-      groups_disabled: inventory.groups_disabled.map(
-        (g) => `${g} (${JOBS.filter((j) => j.group === g).length} jobs)`,
-      ),
+      // COM A CONTAGEM: "console" sozinho não diz nada; "console (3 jobs)" diz
+      // que existem três coisas paradas ali. Um grupo desligado tem que custar
+      // uma linha visível, senão continua sendo o `continue` invisível que a
+      // `phase` era.
+      groups_disabled: inventory.groups_disabled.map((g) => `${g} (${porGrupo[g]} jobs)`),
       jobs_scheduled: scheduled.length,
       jobs_skipped: skipped.length,
       jobs: scheduled,
@@ -1058,13 +1071,7 @@ export function startWorkers(opts: StartWorkersOptions = {}): SchedulerInventory
   return inventory;
 }
 
-/** Uma linha por job habilitado — para runbook, `--dry-run` e docs. */
-export function describeScheduledJobs(groups: readonly JobGroup[] = DEFAULT_JOB_GROUPS): string[] {
-  const set = new Set(groups);
-  return JOBS.filter((j) => set.has(j.group)).map(describeJob);
-}
-
-/** Quantos jobs cada grupo tem — usado pelo inventário e pelos docs. */
+/** Quantos jobs cada grupo tem — usado pelo inventário de boot. */
 export function jobCountByGroup(): Record<JobGroup, number> {
   const out = {} as Record<JobGroup, number>;
   for (const g of JOB_GROUPS) {

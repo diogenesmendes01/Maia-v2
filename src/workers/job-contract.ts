@@ -484,14 +484,3 @@ export function validateJobRegistry(jobs: readonly JobContract[]): JobContractVi
 
   return violations;
 }
-
-/** Uma linha por job, para o inventário de boot e para os docs. */
-export function describeJob(job: JobContract): string {
-  const guard =
-    job.guard.kind === 'none'
-      ? 'sem lock'
-      : job.guard.kind === 'row-claim'
-        ? `row-claim(${job.guard.tables.join(',')})`
-        : `${job.guard.kind}(${job.guard.lock})`;
-  return `${job.name} [${job.group}] ${job.cron} — ${classifyJob(job.effect, job.guard)}; ${guard}`;
-}
