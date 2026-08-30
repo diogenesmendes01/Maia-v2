@@ -56,7 +56,11 @@ import {
 } from './line-session-manager.js';
 import { triggerRecovery } from '../setup/recovery.js';
 import { runtimeInstanceId } from '../runtime/instance-identity.js';
-import { acquireChannelLease, releaseChannelLease } from './channel-lease.js';
+import {
+  acquireChannelLease,
+  assertChannelFence,
+  releaseChannelLease,
+} from './channel-lease.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -483,6 +487,38 @@ export function listLocalLineSessions(): Array<{
         fencing_token: s.fencingToken,
       }))
   );
+}
+
+/**
+ * #513 (fatia C) — "ESTE processo pode enviar por esta linha, AGORA?"
+ *
+ * A pergunta é feita imediatamente antes do efeito, e é diferente das duas que
+ * o outbox já faz:
+ *   - `claim_token` (121/#632) responde "sou o worker dono desta LINHA DO
+ *     OUTBOX?";
+ *   - esta responde "sou a réplica dona deste CANAL?".
+ * Um worker pode legitimamente possuir a linha do outbox enquanto OUTRA réplica
+ * possui o socket do canal, e nesse caso o envio sairia pela sessão errada.
+ *
+ * Por que ela ainda é necessária depois da fatia B. O heartbeat fecha o socket
+ * ao perder a posse, mas só no próximo tick (≤5s). Nessa janela o transporte
+ * local ainda existe e um envio passaria. Aqui a janela fecha: a confirmação
+ * vem do banco, no instante do envio.
+ *
+ * Duas etapas, e a ordem importa:
+ *   1. o token da sessão LOCAL — se este processo não tem sessão para o canal,
+ *      ele não é o dono e a resposta é não, sem tocar no banco;
+ *   2. o fence no BANCO com aquele token — porque ter a sessão em memória não
+ *      prova posse: é exatamente isso que um zumbi tem.
+ */
+export async function podeEnviarPorEstaLinha(scope: {
+  tenant_id: string;
+  agent_id: string;
+  channel_id: string;
+}): Promise<boolean> {
+  const state = sessions.get(scope.channel_id);
+  if (!state || state.stopped || state.fencingToken === null) return false;
+  return assertChannelFence(scope, state.fencingToken, 'send');
 }
 
 export function stopLineSession(channelId: string): boolean {

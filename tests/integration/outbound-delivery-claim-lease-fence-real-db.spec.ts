@@ -510,6 +510,150 @@ d('#632 — claim/lease/fence da entrega (Postgres real)', () => {
   // embora.
   // ═══════════════════════════════════════════════════════════════════════
 
+  /**
+   * #513 (fatia C) — o fence do CANAL, que é outra posse e outra pergunta.
+   *
+   * O fence do claim (acima) responde "sou o worker dono desta LINHA DO
+   * OUTBOX?". Este responde "sou a réplica dona deste CANAL?". Um worker pode
+   * legitimamente possuir a linha do outbox enquanto OUTRA réplica possui o
+   * socket — e aí o envio sairia pela sessão errada.
+   *
+   * A fatia B fecha o socket ao perder a posse, mas só no próximo tick (≤5s).
+   * Estes casos cobrem essa janela.
+   */
+  describe('#513 — fence do CANAL antes do envio', () => {
+    let canalId: string;
+    let sessions: Map<string, unknown>;
+
+    beforeEach(async () => {
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, active)
+         VALUES ($1, $2, 'whatsapp', $3, true) RETURNING id`,
+        [TENANT, AGENT, `5511${Date.now() % 100000000}`],
+      );
+      canalId = rows[0]!.id;
+      const mod = await import('@/gateway/line-sessions.js');
+      sessions = mod._internal.sessions as Map<string, unknown>;
+      sessions.clear();
+      // O roteamento por linha LIGADO — sem isso não existe posse por canal e
+      // o fence não se aplica (é a topologia de linha única de hoje).
+      const manager = await import('@/gateway/line-session-manager.js');
+      vi.spyOn(manager.getLineSessionManager(), 'isEnabled').mockReturnValue(true);
+    });
+
+    afterEach(async () => {
+      vi.restoreAllMocks();
+      sessions.clear();
+      await pool.query('DELETE FROM channel_line_state WHERE channel_id = $1', [canalId]);
+      // As mensagens de saída referenciam o canal (`mensagens_channel_scope_fk`),
+      // então elas saem primeiro — apagar o canal antes viola a FK.
+      await pool.query('DELETE FROM mensagens WHERE channel_id = $1', [canalId]);
+      await pool.query('DELETE FROM channels WHERE id = $1', [canalId]);
+    });
+
+    const linhaDoCanal = (p: Provedor): LineOutput => {
+      const l = fakeLine(p);
+      (l as { scope: { channel_id: string } }).scope.channel_id = canalId;
+      return l;
+    };
+
+    it('sem posse do canal, NADA é enviado — nem uma vez', async () => {
+      // Este processo não tem sessão para o canal: outra réplica é a dona.
+      const p = novoProvedor();
+
+      const resultado = await comoEscopo(() =>
+        deliverOutbound({ outbound_id: outboundId, jid: JID, line: linhaDoCanal(p) }),
+      );
+
+      expect(resultado.delivered).toBe(false);
+      // A asserção que importa: o PROVEDOR não foi tocado. Recusar depois de
+      // enviar não recusa nada — a mensagem duplicada já saiu.
+      expect(p.chamadas, 'enviou por uma linha que não é desta réplica').toBe(0);
+
+      // `cancelled_before_send`: nada saiu e a linha segue entregável pelo
+      // sucessor. Marcar falha gastaria uma tentativa do orçamento da DLQ por
+      // um evento que não é falha.
+      const { rows: desfecho } = await pool.query<{
+        delivery_outcome: string | null;
+        last_error_code: string | null;
+      }>(
+        `SELECT delivery_outcome, last_error_code FROM outbound_messages WHERE id = $1`,
+        [outboundId],
+      );
+      expect(desfecho[0]!.delivery_outcome).toBe('cancelled_before_send');
+      expect(desfecho[0]!.last_error_code).toBe('channel_ownership_lost');
+
+      const { rows: hist } = await pool.query(
+        `SELECT 1 FROM mensagens WHERE conversa_id = $1 AND direcao = 'out'`,
+        [conversaId],
+      );
+      expect(hist, 'gravou histórico de uma mensagem que nunca saiu').toHaveLength(0);
+    });
+
+    it('CONTROLE: com a posse do canal VIVA, o mesmo envio passa', async () => {
+      // Sem este caso o anterior passaria com um `return false` fixo.
+      const { acquireChannelLease } = await import('@/gateway/channel-lease.js');
+      const posse = await acquireChannelLease({
+        tenant_id: TENANT,
+        agent_id: AGENT,
+        channel_id: canalId,
+      });
+      expect(posse.held).toBe(true);
+      sessions.set(canalId, {
+        channel: { id: canalId, tenant_id: TENANT, agent_id: AGENT, external_id: '5511900000513' },
+        sock: { end: () => undefined },
+        connected: true,
+        reconnectAttempts: 0,
+        stopped: false,
+        reconnectTimer: null,
+        fencingToken: (posse as { fencing_token: number }).fencing_token,
+      });
+
+      const p = novoProvedor();
+      const resultado = await comoEscopo(() =>
+        deliverOutbound({ outbound_id: outboundId, jid: JID, line: linhaDoCanal(p) }),
+      );
+
+      expect(resultado.delivered).toBe(true);
+      expect(p.chamadas).toBe(1);
+      expect((await linha()).status).toBe('completed');
+    });
+
+    it('posse VENCIDA no banco recusa, mesmo com a sessão viva em memória', async () => {
+      // O zumbi: o socket local existe e o processo acha que é dono. Quem
+      // decide é o banco, e é por isso que a checagem não pode ser só local.
+      const { acquireChannelLease } = await import('@/gateway/channel-lease.js');
+      const posse = await acquireChannelLease({
+        tenant_id: TENANT,
+        agent_id: AGENT,
+        channel_id: canalId,
+      });
+      sessions.set(canalId, {
+        channel: { id: canalId, tenant_id: TENANT, agent_id: AGENT, external_id: '5511900000513' },
+        sock: { end: () => undefined },
+        connected: true,
+        reconnectAttempts: 0,
+        stopped: false,
+        reconnectTimer: null,
+        fencingToken: (posse as { fencing_token: number }).fencing_token,
+      });
+      await pool.query(
+        `UPDATE channel_line_state
+            SET session_owner_lease_expires_at = now() - interval '1 second'
+          WHERE channel_id = $1`,
+        [canalId],
+      );
+
+      const p = novoProvedor();
+      const resultado = await comoEscopo(() =>
+        deliverOutbound({ outbound_id: outboundId, jid: JID, line: linhaDoCanal(p) }),
+      );
+
+      expect(resultado.delivered).toBe(false);
+      expect(p.chamadas, 'a sessão em memória autorizou um envio sem posse no banco').toBe(0);
+    });
+  });
+
   it('a ponte síncrona marca sending antes do envio e SOLTA a posse ao terminar', async () => {
     const handle = await comoEscopo(() => beginInlineDelivery(outboundId, 60_000));
     // `sending` ANTES do canal: é isto que torna o crash pós-envio

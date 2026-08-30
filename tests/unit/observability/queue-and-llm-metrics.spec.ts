@@ -18,7 +18,6 @@ function fakeQueue(over: Partial<Record<string, unknown>> = {}): Queue {
       active: 1,
       delayed: 3,
       failed: 0,
-      paused: 0,
     }),
     getJobs: vi.fn().mockResolvedValue([{ timestamp: Date.now() - 4000 }]),
     ...over,
@@ -41,7 +40,24 @@ describe('issue #514 §5 — queue gauges', () => {
   });
 
   it('covers exactly the states the SLO alerts reference', () => {
-    expect([..._TRACKED_STATES]).toEqual(['waiting', 'active', 'delayed', 'failed', 'paused']);
+    expect([..._TRACKED_STATES]).toEqual(['waiting', 'active', 'delayed', 'failed']);
+  });
+
+  it('NÃO expõe state="paused" — na BullMQ 6 ela seria um zero permanente', async () => {
+    // Regressão que este caso existe para pegar: alguém reintroduzir o label
+    // com um cast para calar o `TS2345` da 6.x. `Queue.pause()` na 6.x grava um
+    // campo no hash `meta` e deixa os jobs em `wait`; `getJobCounts('paused')`
+    // não lança, devolve 0 lendo uma chave que ninguém mais escreve. A série
+    // voltaria como um zero CONFIANTE e permanente — o oposto exato da postura
+    // de falha do módulo ("métrica ausente não é interpretada como zero
+    // saudável"). O backlog de uma fila pausada agora está em `waiting`.
+    registerQueueGauges(
+      fakeQueue({ getJobCounts: vi.fn().mockResolvedValue({ waiting: 12, paused: 0 }) }),
+      'agent',
+    );
+    const out = await renderPrometheus();
+    expect(out).toContain('maia_queue_depth{queue="agent",state="waiting"} 12');
+    expect(out).not.toContain('state="paused"');
   });
 
   it('exposes the oldest WAITING job age', async () => {

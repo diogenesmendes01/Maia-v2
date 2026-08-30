@@ -232,11 +232,11 @@ function ChangeValue({ entry }: { entry: ProfileChangeEntry }) {
     return (
       <span>
         {before !== undefined && (
-          <span className="mr-2 rounded bg-red-50 px-1.5 py-0.5 text-xs text-red-700 line-through decoration-red-300">
+          <span className="mr-2 rounded-sm bg-red-50 px-1.5 py-0.5 text-xs text-red-700 line-through decoration-red-300">
             {fmtScalar(path, before)}
           </span>
         )}
-        <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-800">
+        <span className="rounded-sm bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-800">
           {fmtScalar(path, after)}
         </span>
       </span>
@@ -246,11 +246,11 @@ function ChangeValue({ entry }: { entry: ProfileChangeEntry }) {
   return (
     <div className="space-y-1">
       {before !== undefined && (
-        <pre className="scroll-thin max-h-40 overflow-auto rounded bg-red-50 p-2 font-mono text-2xs leading-relaxed text-red-800">
+        <pre className="scroll-thin max-h-40 overflow-auto rounded-sm bg-red-50 p-2 font-mono text-2xs leading-relaxed text-red-800">
           {JSON.stringify(before, null, 2)}
         </pre>
       )}
-      <pre className="scroll-thin max-h-40 overflow-auto rounded bg-emerald-50 p-2 font-mono text-2xs leading-relaxed text-emerald-900">
+      <pre className="scroll-thin max-h-40 overflow-auto rounded-sm bg-emerald-50 p-2 font-mono text-2xs leading-relaxed text-emerald-900">
         {after === undefined ? '(removido)' : JSON.stringify(after, null, 2)}
       </pre>
     </div>
@@ -259,7 +259,7 @@ function ChangeValue({ entry }: { entry: ProfileChangeEntry }) {
 
 function UnknownFieldEntry({ entry }: { entry: ProfileChangeEntry }) {
   return (
-    <div className="rounded border border-red-100">
+    <div className="rounded-sm border border-red-100">
       <p className="border-b border-red-100 px-2 py-1 font-mono text-2xs text-red-700">
         {entry.path}
       </p>
