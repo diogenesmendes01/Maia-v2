@@ -155,7 +155,7 @@ export default function ProposalDetailPage({
             <ul className="mt-1 list-inside list-disc">
               {locks.map((lock) => (
                 <li key={lock}>
-                  <code className="rounded bg-white/70 px-1 font-mono">{lock}</code>
+                  <code className="rounded-sm bg-white/70 px-1 font-mono">{lock}</code>
                 </li>
               ))}
             </ul>
@@ -203,7 +203,7 @@ export default function ProposalDetailPage({
                   <li key={a.id} className="border-l-2 border-brand-200 pl-3 text-sm">
                     <span className="flex flex-wrap items-center gap-2">
                       <StatusBadge status={a.decision} />
-                      <code className="rounded bg-zinc-100 px-1 font-mono text-xs">
+                      <code className="rounded-sm bg-zinc-100 px-1 font-mono text-xs">
                         {a.approver_role}
                       </code>
                       <span className="text-xs text-zinc-500">
@@ -230,7 +230,7 @@ export default function ProposalDetailPage({
           <CardBody>
             <p className="text-sm text-zinc-500">
               Classe de aprovação:{' '}
-              <code className="rounded bg-zinc-100 px-1 font-mono text-xs">
+              <code className="rounded-sm bg-zinc-100 px-1 font-mono text-xs">
                 {proposal.approval_class}
               </code>
             </p>

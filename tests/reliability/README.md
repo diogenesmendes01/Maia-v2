@@ -131,6 +131,33 @@ Que a prova mais perigosa (a tranca da faxina) rode **sem** infraestrutura é
 deliberado: ela é uma função pura sobre a URL e o prefixo, e assim é verificada
 em todo PR, não só no job que tem banco.
 
+## O primeiro consumidor fora dos self-tests (#513, fatia D)
+
+`tests/integration/channel-session-sigkill-duas-replicas-real-db.spec.ts` usa
+`ProcessSupervisor`, `eventually`/`estavelDurante` e o `ArtifactCollector` para
+provar a posse de linha da #513 com duas réplicas de **processo** e um `SIGKILL`
+de verdade. O filho é `tests/reliability/fixtures/replica-de-canal.ts`, e ele
+importa `@/gateway/channel-lease.js` — reescrever o SQL no fixture deixaria a
+suíte verde com o `WHERE` de produção apagado.
+
+Duas armadilhas encontradas ali, que valem para todo cenário futuro:
+
+**1. Não suba o filho pelo CLI do `tsx`.** `node node_modules/tsx/dist/cli.mjs
+filho.ts` **spawna um neto** para aplicar os flags do loader. O PID que o
+`ProcessSupervisor` registra passa a ser o do invólucro, e o `hardKill` mata o
+invólucro enquanto o processo que segura a lease continua batendo heartbeat —
+um teste de `SIGKILL` que não mata o processo certo. Use
+`NODE_OPTIONS='--import tsx'` com o `.ts` como `script`: o loader entra no
+MESMO processo. E afirme `carga.pid === filho.pid` no handshake, para que a
+premissa seja cobrada em vez de assumida.
+
+**2. Cuidado com o nome do campo no probe.** `sanitizarValor()` redige por
+substring do nome, e `token` está na lista. Um probe de `estavelDurante` com um
+campo `…token…` compara `[REDACTED]` com `[REDACTED]` e passa **sempre**.
+`claim_token` (#504) e `fencing_token`/`session_fencing_token` (#513) estão nas
+exceções explícitas do sanitizador por causa disso; um nome novo dessa família
+precisa entrar lá — ou o probe precisa de outro nome.
+
 ## Limites declarados dos fakes
 
 **`FakeChannelProvider` é MAIS FORTE que o WhatsApp real:** honra a chave de

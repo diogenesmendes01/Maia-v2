@@ -119,6 +119,11 @@ describe('#510 harness — o sanitizador remove telefone, segredo e conteúdo', 
     expect(chaveSensivel('attempt_count')).toBe(false);
     expect(chaveSensivel('claim_token')).toBe(false);
     expect(chaveSensivel('outcome')).toBe(false);
+    // #513 (fatia D): o fence da posse de linha é contagem, não segredo. Se ele
+    // for redigido, um probe de `estavelDurante` sobre a posse compara
+    // `[REDACTED]` com `[REDACTED]` e passa sempre — vácuo, não prova.
+    expect(chaveSensivel('fencing_token')).toBe(false);
+    expect(chaveSensivel('session_fencing_token')).toBe(false);
   });
 
   it('sobrevive a ciclo, profundidade e Error sem perder a redação', () => {

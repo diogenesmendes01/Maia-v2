@@ -31,6 +31,20 @@
  * ele limparia a fila inteira e apagaria os jobs das vizinhas no meio da
  * asserção delas.
  *
+ * ─── BullMQ 6: por que `'paused'` saiu das consultas ────────────────────────
+ *
+ * As três consultas abaixo pediam `['waiting', 'delayed', 'paused', 'active']`.
+ * Na 5.x isso fazia sentido: `Queue.pause()` renomeava `bull:agent:wait` para
+ * `bull:agent:paused` e um job represado mudava de lista. Na 6.x pausar grava
+ * um campo no hash `bull:agent:meta` e os jobs FICAM em `wait` — `'paused'`
+ * deixou de ser estado de job (saiu de `JobType`) e virou uma chave que ninguém
+ * escreve. `getJobs(['paused'])` na 6.x não lança: devolve `[]`, sempre.
+ *
+ * Ou seja: manter o nome não protegeria nada e esconderia a mudança. Tirá-lo
+ * não afrouxa a suíte — `'waiting'` agora cobre o caso que `'paused'` cobria, e
+ * NENHUMA asserção mudou. A regra 1 acima continua valendo pelo mesmo motivo de
+ * antes (o `pause` é global e escrito no Redis), só que agora ele mexe no meta.
+ *
  * Skipped sem TEST_DB_URL (o job de CI que a define é o mesmo que sobe o Redis).
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -106,7 +120,7 @@ d('#504 — jobId determinístico do turno (Redis real)', () => {
     await arm({ mensagem_id: randomUUID(), turn_id });
     await arm({ mensagem_id: randomUUID(), turn_id });
 
-    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'active']);
     const mine = jobs.filter((j) => j.data.turn_id === turn_id);
     expect(mine, 'dois add do mesmo turno deveriam produzir UM job').toHaveLength(1);
     expect(mine[0]!.id).toBe(agentTurnJobId(turn_id));
@@ -118,7 +132,7 @@ d('#504 — jobId determinístico do turno (Redis real)', () => {
     const b = randomUUID();
     await arm({ mensagem_id: randomUUID(), turn_id: a });
     await arm({ mensagem_id: randomUUID(), turn_id: b });
-    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'active']);
     const mine = jobs.filter((j) => [a, b].includes(j.data.turn_id!));
     expect(new Set(mine.map((j) => j.id)).size).toBe(2);
     for (const j of mine) await j.remove().catch(() => undefined);
@@ -128,7 +142,7 @@ d('#504 — jobId determinístico do turno (Redis real)', () => {
     const mensagem_id = randomUUID();
     await arm({ mensagem_id });
     await arm({ mensagem_id });
-    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'paused', 'active']);
+    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'active']);
     const mine = jobs.filter((j) => j.data.mensagem_id === mensagem_id);
     // Dois jobs: é o comportamento ANTERIOR, preservado durante a janela de
     // compatibilidade em que nem todo produtor conhece o turno.
