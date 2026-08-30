@@ -22,8 +22,43 @@ import type { Queue } from 'bullmq';
 import { gauge } from './metrics.js';
 import { METRIC } from './taxonomy.js';
 
-/** States we expose. Bounded, enumerated — safe as a label. */
-const TRACKED_STATES = ['waiting', 'active', 'delayed', 'failed', 'paused'] as const;
+/**
+ * States we expose. Bounded, enumerated — safe as a label.
+ *
+ * ─── Por que `paused` saiu na migração para a BullMQ 6 ──────────────────────
+ *
+ * Até a 5.x, `paused` era um ESTADO DE JOB: `Queue.pause()` renomeava a lista
+ * `bull:<fila>:wait` para `bull:<fila>:paused` e o backlog inteiro mudava de
+ * série. Na 6.x isso acabou — pausar grava um campo `paused` no hash
+ * `bull:<fila>:meta` e os jobs FICAM em `wait`. Por isso a 6.x removeu
+ * `'paused'` de `JobType`, e é esse o único erro de compilação que a PR
+ * automática #649 produziu (`queue-metrics.ts:52`).
+ *
+ * Medido nesta máquina, fila pausada com 2 jobs (`scratchpad/paused-probe`):
+ *
+ *   bullmq 5.78.0 → getJobCounts(...) = { waiting: 0, paused: 2 }, chave `paused`
+ *   bullmq 6.2.0  → getJobCounts(...) = { waiting: 2 },            chave `wait`
+ *
+ * O CONSERTO ERRADO seria um cast que mantivesse o label: na 6.x
+ * `getJobCounts('paused')` não lança — devolve `0`, sempre, porque lê uma chave
+ * que ninguém mais escreve. A série viraria um zero confiante e permanente, que
+ * é exatamente o que a "postura de falha" acima proíbe ("métrica ausente não é
+ * interpretada como zero saudável"). Um label morto mente melhor que um gap.
+ *
+ * O sinal não se perdeu, MELHOROU: o backlog de uma fila pausada agora aparece
+ * em `state="waiting"` em vez de sumir dela. Na 5.x, pausar a fila `agent`
+ * zerava `maia_queue_depth{state="waiting"}` com jobs represados atrás —
+ * um ponto cego para `MaiaQueueOldestJobAge`/`maia:queue_depth:max`
+ * (`monitoring/alerts/slo.rules.yml`). Nenhuma regra e nenhum painel
+ * referenciam `state="paused"` (conferido em `monitoring/`), então a série sai
+ * sem quebrar alerta nem legenda.
+ *
+ * O que a 6.x oferece no lugar, se algum dia se quiser o sinal de "esta fila
+ * está pausada", é `Queue.isPaused()` (booleano por fila, lido do meta) — uma
+ * métrica NOVA, não um estado de profundidade. Fica fora desta PR de propósito:
+ * é decisão de taxonomia, não de migração.
+ */
+const TRACKED_STATES = ['waiting', 'active', 'delayed', 'failed'] as const;
 type TrackedState = (typeof TRACKED_STATES)[number];
 
 /**
