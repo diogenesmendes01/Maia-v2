@@ -59,6 +59,11 @@ export const scheduleReminderTool: Tool<typeof inputSchema, typeof outputSchema>
   output_schema: outputSchema,
   required_actions: ['schedule_reminder'],
   side_effect: 'write',
+  // Issue #507 — a série criada é um efeito com relógio próprio (dispara sem
+  // nós). Cancelar no meio deixa incerto se ela existe; `cancel_reminder` é a
+  // compensação declarada.
+  effect_class: 'compensatable',
+  compensated_by: 'cancel_reminder',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'series_created',

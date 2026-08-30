@@ -33,6 +33,7 @@ export const rejectCapabilityProposalTool: Tool<typeof inputSchema, typeof outpu
   output_schema: outputSchema,
   required_actions: ['manage_capabilities'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'update_meta',
   audit_action: 'capability_proposal_rejected',

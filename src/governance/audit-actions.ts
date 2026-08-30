@@ -750,6 +750,15 @@ export const AUDIT_ACTIONS = [
   // human-permission/constitutional refusal) so the audit trail tells "the
   // agent never had this tool" apart from "the person can't do this".
   'tool_not_granted',
+  // Issue #507 — EFEITO INCERTO. Emitida pelo dispatcher (`src/tools/_dispatcher.ts`)
+  // quando o cancelamento da tentativa chega DEPOIS de o handler poder ter
+  // causado efeito e a ferramenta não é `abort_safe`. Não é sinônimo de falha:
+  // a plataforma está declarando que NÃO SABE se o efeito aconteceu, e a linha
+  // é a unidade de trabalho da reconciliação — carrega `effect_class`,
+  // `reconciliation` (replay da chave / compensar / humano), `retryable: false`,
+  // a chave de idempotência e o turno/tentativa. É esta linha que o runbook
+  // consulta; sem ela, um efeito possivelmente consumado ficaria sem rastro.
+  'tool_effect_unknown',
   // Issue #409 — SkillUsagePolicy admission decisions (the FIRST runtime audit
   // of a skill DECISION, aligned with invariant #4 — audit every decision).
   // Emitted at BOTH enforcement points: the candidate filter (skill-selector,

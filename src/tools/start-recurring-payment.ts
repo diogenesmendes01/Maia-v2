@@ -50,6 +50,7 @@ export const startRecurringPaymentTool: Tool<typeof inputSchema, typeof outputSc
   output_schema: outputSchema,
   required_actions: ['create_transaction'],
   side_effect: 'write',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'series_created',

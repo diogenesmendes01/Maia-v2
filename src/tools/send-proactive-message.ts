@@ -32,6 +32,7 @@ export const sendProactiveMessageTool: Tool<typeof inputSchema, typeof outputSch
   output_schema: outputSchema,
   required_actions: ['send_proactive_message'],
   side_effect: 'communication',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'communicate',
   audit_action: 'proactive_message_sent' as never,

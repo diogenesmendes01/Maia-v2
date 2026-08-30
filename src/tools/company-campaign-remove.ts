@@ -68,6 +68,7 @@ export const companyCampaignRemoveTool: Tool<typeof inputSchema, typeof outputSc
   output_schema: outputSchema,
   required_actions: ['remove_company_campaign'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'update_meta',
   audit_action: 'company_campaign_removed',

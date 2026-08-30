@@ -85,6 +85,13 @@ import { operationalTicketCreateTool } from './operational-ticket-create.js';
 import { riskSignalClassifyTool } from './risk-signal-classify.js';
 import { conversationSummaryComposeTool } from './conversation-summary-compose.js';
 import { conversationStateUpdateTool } from './conversation-state-update.js';
+// Issue #507 — classificação de efeito. O vocabulário e o validador que RECUSA
+// uma definição incompleta vivem num módulo folha (sem imports), porque é este
+// arquivo que o chama.
+import {
+  assertToolDefinitionsComplete,
+  type ToolEffectClass,
+} from './effect-class.js';
 
 /**
  * Issue #504 §Fencing — a TENTATIVA do turno, entregue ao handler.
@@ -126,6 +133,26 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   output_schema: O;
   required_actions: ReadonlyArray<ActionKey>;
   side_effect: 'none' | 'read' | 'write' | 'communication';
+  /**
+   * Issue #507 §Tools — a SEMÂNTICA DE CANCELAMENTO desta ferramenta. Campo
+   * OBRIGATÓRIO: sem ele o dispatcher não tem como responder honestamente a um
+   * cancelamento que chegou depois de o handler poder ter causado efeito, e o
+   * padrão seria um palpite (ou "cancelado", que afirma ausência de efeito, ou
+   * "erro", que convida a um retry duplicador).
+   *
+   * O que cada classe significa, e por que a escolha não é derivável do
+   * `side_effect`, está em `src/tools/effect-class.ts`. Quem checa é
+   * `assertToolDefinitionsComplete`, no carregamento deste módulo: uma
+   * ferramenta sem classificação NÃO SOBE.
+   */
+  effect_class: ToolEffectClass;
+  /**
+   * Issue #507 — a ferramenta que DESFAZ esta. Obrigatório quando
+   * `effect_class: 'compensatable'`, proibido nos outros casos, e o nome tem de
+   * existir no `REGISTRY` — uma compensação declarada sem compensador seria
+   * exatamente a promessa vazia que a classificação existe para impedir.
+   */
+  compensated_by?: string;
   redis_required: boolean;
   operation_type: 'create' | 'correct' | 'cancel' | 'update_meta' | 'parse_only' | 'read' | 'communicate';
   audit_action: AuditAction;
@@ -320,6 +347,34 @@ const CONFIG_GATED_TOOLS: ReadonlyArray<{
     enabled: config.FEATURE_PDF_REPORTS,
   },
 ];
+
+/**
+ * Issue #507 §Tools — O PORTÃO DA CLASSIFICAÇÃO, executado no carregamento
+ * deste módulo.
+ *
+ * Não é lint e não é aviso: uma ferramenta sem `effect_class` (ou com uma
+ * classificação que contradiz o próprio `side_effect`, ou `compensatable` sem
+ * compensador que exista) faz o import deste módulo LANÇAR — e como o registro
+ * é importado por todo caminho que despacha tool, o processo não sobe. É isso
+ * que garante que a próxima ferramenta, escrita daqui a meses por quem nunca
+ * leu a #507, não nasça sem classificação.
+ *
+ * O universo validado inclui os tools GATED POR CONFIG (`CONFIG_GATED_TOOLS`),
+ * que somem do `REGISTRY` quando o flag está desligado: uma ferramenta não pode
+ * escapar da checagem por estar desligada hoje — ela liga amanhã.
+ *
+ * O conjunto de nomes conhecidos (para validar `compensated_by`) é o mesmo
+ * universo, pela mesma razão.
+ */
+const ALL_DEFINED_TOOLS: readonly AnyTool[] = [
+  ...Object.values(REGISTRY),
+  ...CONFIG_GATED_TOOLS.map((e) => e.tool),
+];
+
+assertToolDefinitionsComplete(
+  ALL_DEFINED_TOOLS,
+  new Set(ALL_DEFINED_TOOLS.map((t) => t.name)),
+);
 
 /**
  * Runtime-flag check used by both the schema exposure path

@@ -107,6 +107,7 @@ export const riskSignalClassifyTool: Tool<typeof inputSchema, typeof outputSchem
   output_schema: outputSchema,
   required_actions: [],
   side_effect: 'none',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'parse_only',
   audit_action: 'risk_signal_classified',
