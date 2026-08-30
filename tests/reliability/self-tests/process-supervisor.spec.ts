@@ -31,7 +31,7 @@ import {
   SaidaInesperadaError,
 } from '../harness/process-supervisor.js';
 import { ArtifactCollector } from '../harness/artifacts.js';
-import { eventually } from '../harness/eventually.js';
+import { estavelDurante, eventually } from '../harness/eventually.js';
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(AQUI, '..', 'fixtures');
@@ -39,6 +39,7 @@ const VIVO = join(FIXTURES, 'filho-vivo.mjs');
 const MORRE = join(FIXTURES, 'filho-morre.mjs');
 const MUDO = join(FIXTURES, 'filho-mudo.mjs');
 const TEIMOSO = join(FIXTURES, 'filho-teimoso.mjs');
+const PULSANTE = join(FIXTURES, 'filho-pulsante.mjs');
 
 const supervisores: ProcessSupervisor[] = [];
 function novoSupervisor(artefatos?: ArtifactCollector): ProcessSupervisor {
@@ -232,6 +233,98 @@ describe('#510 harness — hard kill NUNCA atinge processo alheio', () => {
     expect(() => sup.hardKill(pid)).toThrow(/reatribuído/);
     expect(sup.pidsSobPosse()).not.toContain(pid);
   });
+});
+
+describe('#510 harness (fatia B) — congelar/descongelar: o zumbi que o SIGKILL não modela', () => {
+  /** Quantos pulsos o filho já imprimiu. */
+  function pulsos(saida: string): number {
+    return saida.split('\n').filter((l) => l.trim().startsWith('##fi-pulso##')).length;
+  }
+
+  it('a plataforma precisa DECLARAR que congela — não se assume', () => {
+    expect(ProcessSupervisor.suportaCongelamento('linux')).toBe(true);
+    expect(ProcessSupervisor.suportaCongelamento('darwin')).toBe(true);
+    // No Windows o Node aceita o sinal e o sistema não o implementa. Um cenário
+    // que dependesse de congelamento ali passaria VACUAMENTE — nada congela, a
+    // lease nunca vence, e o teste "não observa violação".
+    expect(ProcessSupervisor.suportaCongelamento('win32')).toBe(false);
+  });
+
+  it('`SIGSTOP` PARA o filho e `SIGCONT` o devolve — vivo o tempo todo', async () => {
+    if (!ProcessSupervisor.suportaCongelamento()) return;
+    const sup = novoSupervisor();
+    const filho = sup.spawn({ label: 'pulsante', script: PULSANTE });
+    await filho.esperarPronto(10_000);
+
+    // CONTROLE: ele pulsa antes.
+    await eventually(() => pulsos(filho.stdout) >= 3, {
+      label: 'o filho pulsa antes de ser congelado',
+      timeoutMs: 5_000,
+    });
+
+    sup.congelar(filho);
+    // A invariante é NEGATIVA ("parou de pulsar"), e por isso a janela é o
+    // único instrumento — ela reprova no instante do primeiro pulso a mais.
+    const congelado = await estavelDurante(() => pulsos(filho.stdout), {
+      label: 'o filho congelado não pulsa',
+      janelaMs: 600,
+      intervalMs: 50,
+      justificativa:
+        'não existe evento de "pulso que não aconteceu"; a única prova é observar a janela',
+    });
+    // E ele NÃO morreu — é isso que separa congelar de matar.
+    expect(filho.vivo).toBe(true);
+    expect(pidVivo(filho.pid)).toBe(true);
+
+    sup.descongelar(filho);
+    await eventually(() => pulsos(filho.stdout) > congelado, {
+      label: 'o filho descongelado volta a pulsar',
+      timeoutMs: 5_000,
+      describeState: () => ({ congelado, agora: pulsos(filho.stdout) }),
+    });
+  }, 30_000);
+
+  it('congelar um PID alheio é RECUSADO, e o processo alheio segue rodando', async () => {
+    // A mesma tranca de `hardKill`, e ela importa MAIS aqui: um processo
+    // congelado por engano não some da lista de ninguém — ele só para de
+    // responder, e quem o operava não tem como saber por quê.
+    const alheio = spawn(process.execPath, [VIVO], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const pidAlheio = alheio.pid;
+    if (typeof pidAlheio !== 'number') throw new Error('o processo alheio não subiu');
+    try {
+      await eventually(() => pidVivo(pidAlheio), {
+        label: 'processo alheio está vivo antes da tentativa',
+        timeoutMs: 5_000,
+      });
+      const sup = novoSupervisor();
+      const proprio = sup.spawn({ label: 'proprio', script: PULSANTE });
+      await proprio.esperarPronto(10_000);
+
+      const forjado = { pid: pidAlheio, label: 'nao-e-meu' } as unknown as Parameters<
+        ProcessSupervisor['congelar']
+      >[0];
+      expect(() => sup.congelar(forjado)).toThrow(ForeignPidError);
+      expect(pidVivo(pidAlheio)).toBe(true);
+
+      // E o supervisor continua capaz de congelar o que é DELE — senão a
+      // recusa teria sido "não congela nada", que passaria por engano.
+      sup.congelar(proprio);
+      expect(proprio.vivo).toBe(true);
+      sup.descongelar(proprio);
+    } finally {
+      alheio.kill('SIGKILL');
+    }
+  }, 30_000);
+
+  it('congelar um filho JÁ ENCERRADO é recusado — a tranca contra reuso de PID', async () => {
+    const sup = novoSupervisor();
+    const filho = sup.spawn({ label: 'efemero', script: PULSANTE });
+    await filho.esperarPronto(10_000);
+    sup.hardKill(filho);
+    await filho.esperarSaida(5_000);
+    expect(() => sup.congelar(filho)).toThrow(/já encerrou/);
+    expect(() => sup.descongelar(filho)).toThrow(/reatribuído/);
+  }, 30_000);
 });
 
 describe('#510 harness — teardown idempotente', () => {

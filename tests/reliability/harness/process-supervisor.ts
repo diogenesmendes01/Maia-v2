@@ -383,6 +383,74 @@ export class ProcessSupervisor {
   }
 
   /**
+   * CONGELA o filho (`SIGSTOP`) — a falha que o `SIGKILL` não consegue modelar.
+   *
+   * ─── Por que ela é necessária, e por que não dá para simular ─────────────
+   *
+   * Um `SIGKILL` mata o processo, e com ele morre o heartbeat. Isso cobre
+   * "o dono sumiu". O que ele NÃO cobre é o caso mais perigoso do fencing:
+   * o dono continua VIVO, apenas parou de bater — pausa longa de GC,
+   * suspensão da VM, um `fsync` que travou. A lease vence, um sucessor
+   * assume, e então o dono antigo VOLTA e tenta gravar com um token que já
+   * não vale. Sem congelar não há como produzir esse zumbi: um processo vivo
+   * bate o heartbeat, e um processo morto não volta.
+   *
+   * `SIGSTOP` é o único sinal que produz exatamente isso — o processo para de
+   * ser escalonado, os timers não disparam, e `SIGCONT` o devolve com todo o
+   * estado intacto, inclusive o `claim_token` que ele guardou.
+   *
+   * ─── A mesma tranca de `hardKill`, e pela mesma razão ────────────────────
+   *
+   * PID do registro, e vivo. `SIGSTOP` num PID reatribuído congelaria um
+   * processo alheio — e um processo congelado é pior que um morto, porque
+   * ninguém percebe: ele não some da lista, ele só para de responder.
+   *
+   * ─── Portabilidade ──────────────────────────────────────────────────────
+   *
+   * `SIGSTOP`/`SIGCONT` são POSIX. No Windows o Node os aceita mas o sistema
+   * não os implementa — por isso quem usa isto declara a dependência
+   * (`suportaCongelamento()`) em vez de descobrir com um cenário que passa
+   * vacuamente porque nada congelou.
+   */
+  congelar(alvo: SupervisedChild | string): void {
+    const filho = this.exigirVivo(alvo, 'congelar');
+    this.artefatos?.evento('process.sigstop', { label: filho.label, pid: filho.pid });
+    process.kill(filho.pid, 'SIGSTOP');
+  }
+
+  /** DESCONGELA (`SIGCONT`). O filho volta com o estado que tinha. */
+  descongelar(alvo: SupervisedChild | string): void {
+    const filho = this.exigirVivo(alvo, 'descongelar');
+    this.artefatos?.evento('process.sigcont', { label: filho.label, pid: filho.pid });
+    process.kill(filho.pid, 'SIGCONT');
+  }
+
+  /**
+   * `SIGSTOP` faz o que promete nesta plataforma?
+   *
+   * Um cenário que dependa de congelamento precisa PERGUNTAR, e falhar com
+   * "esta plataforma não congela" — nunca rodar assim mesmo e reportar verde
+   * porque a lease nunca venceu.
+   */
+  static suportaCongelamento(plataforma: NodeJS.Platform = process.platform): boolean {
+    return plataforma !== 'win32';
+  }
+
+  /** As duas trancas de `hardKill`, reaproveitadas por quem sinaliza por label. */
+  private exigirVivo(alvo: SupervisedChild | string, operacao: string): SupervisedChild {
+    const filho = typeof alvo === 'string' ? this.porLabelOuFalha(alvo) : alvo;
+    if (!this.porPid.has(filho.pid)) throw new ForeignPidError(filho.pid, [...this.porPid.keys()]);
+    if (!filho.vivo) {
+      throw new Error(
+        `Recusado: "${operacao}" sobre o filho "${filho.label}" (pid ${filho.pid}) que já encerrou ` +
+          `(code=${String(filho.encerramento?.code)}, signal=${String(filho.encerramento?.signal)}). ` +
+          'O sistema operacional pode ter reatribuído esse PID.',
+      );
+    }
+    return filho;
+  }
+
+  /**
    * Encerramento GRACIOSO: `SIGTERM`, espera `graceMs`, e só então `SIGKILL`
    * — pelo mesmo caminho guardado acima.
    */

@@ -32,6 +32,25 @@ export {
 } from './failpoints.js';
 export type { ArmedGate, FailpointAction, FailpointName, ReachedEvent } from './failpoints.js';
 
+export {
+  FailpointServer,
+  FailpointServerError,
+  HEADER_TOKEN,
+  RESPOSTAS_DE_FAILPOINT,
+  ROTA_BARREIRA,
+  ROTA_REACHED,
+} from './failpoint-transport.js';
+export type { AnuncioPendente, RespostaDeFailpoint } from './failpoint-transport.js';
+
+export {
+  FailpointInjectedError,
+  FailpointTransportError,
+  alcancar,
+  barreira,
+  injecaoLigada,
+} from './failpoint-client.js';
+export type { AcaoLocal, OpcoesDeAlcance } from './failpoint-client.js';
+
 export { EventuallyTimeoutError, estavelDurante, eventually } from './eventually.js';
 export type { EventuallyOptions } from './eventually.js';
 

@@ -1,9 +1,11 @@
 # Harness de fault injection para turnos (issue #510)
 
-> **Estado desta entrega:** passos 1–4 do rollout da issue — primitives, fakes e
-> self-tests. **Nenhum cenário FI-01..FI-25 está implementado.** O
-> `InvariantOracle`, os perfis `reliability:pr`/`full`/`soak` e qualquer gate
-> blocking ficaram FORA. A issue #510 continua aberta.
+> **Estado desta entrega (fatia B):** passos 1–4 do rollout continuam valendo, e
+> agora existem também o **transporte de failpoint** (o lado do processo filho),
+> o **`InvariantOracle`** e os **quatro primeiros cenários da matriz — FI-04,
+> FI-05, FI-06 e FI-07**. Os outros 21 cenários, os perfis
+> `reliability:full`/`soak` e o gate blocking de CI continuam FORA. A issue #510
+> segue aberta.
 
 ## Por que este harness existe
 
@@ -84,6 +86,11 @@ todos os motivos acumulados numa mensagem só.
 | Seed reproduzível | `harness/seeded-faults.ts` | xorshift128 semeado por string; `--seed=` reproduz a ordem dos kills |
 | `FakeLlmServer` | `fakes/fake-llm-server.ts` | Roteiro de respostas, delay, stream parcial, erro, rate limit, **aborto observável** |
 | `FakeChannelProvider` | `fakes/fake-channel-provider.ts` + `-server.mjs` | Processo separado, ledger com `physical_call_count` × `logical_effect_count` |
+| **`FailpointServer`** | `harness/failpoint-transport.ts` | HTTP em loopback com porta efêmera e token por rodada; resposta DIFERIDA (é o handshake) e **barreira** de largada |
+| **`alcancar` / `barreira`** | `harness/failpoint-client.ts` | O lado do FILHO: custo zero com a injeção off, `error`/`disconnect`/`kill` quando on |
+| **`congelar` / `descongelar`** | `harness/process-supervisor.ts` | `SIGSTOP`/`SIGCONT` por PID exato — a falha que o `SIGKILL` não modela |
+| **`InvariantOracle`** | `oracles/invariant-oracle.ts` | Foto durável (turno, outbound, audit) + checagens PURAS por família |
+| **Cenários FI-04/05/06/07** | `scenarios/fi-claim-crash-fence.spec.ts` | Réplicas de PROCESSO contra Postgres real, com barreira, `SIGKILL` e `SIGSTOP` |
 
 ## Como os failpoints são impossíveis de habilitar em produção
 
@@ -116,15 +123,23 @@ ser feita para elas.**
 
 ## Como rodar os self-tests
 
-Eles rodam na lane padrão, sem infraestrutura:
+A lane inteira (self-tests + cenários), com `--retry=0` para que nenhum flake
+seja absorvido em silêncio:
+
+```bash
+npm run test:reliability
+```
+
+Só os self-tests, na lane padrão e sem infraestrutura:
 
 ```bash
 npx vitest run tests/reliability/self-tests --no-coverage
 ```
 
-O único caso que exige Postgres + Redis é o ciclo de vida completo do
-`ReliabilityEnvironment` (`environment.spec.ts`), que faz `describe.skip` sem
-`TEST_DB_URL`. **`pulado` não é `passou`** — o bloco de diagnóstico impresso ao
+Os casos que exigem Postgres + Redis são o ciclo de vida completo do
+`ReliabilityEnvironment` (`environment.spec.ts`), o coletor do
+`InvariantOracle` e **todos os cenários FI** — os três fazem `describe.skip`
+sem `TEST_DB_URL`. **`pulado` não é `passou`** — o bloco de diagnóstico impresso ao
 fim de toda rodada traz os três números.
 
 Que a prova mais perigosa (a tranca da faxina) rode **sem** infraestrutura é
@@ -171,12 +186,66 @@ reordenação de ACK entre dispositivos, nem os erros de mídia do upload real.
 **`FakeLlmServer` nunca chama a internet** — não há caminho de saída no módulo,
 e `self-tests/fake-llm-server.spec.ts` afirma isso lendo o próprio fonte.
 
+## Fatia B — o que a injeção passou a saber fazer, e o que ela PROVA
+
+Um harness de fault injection é fácil de fazer vácuo: injeta a falha, nada
+quebra, e o teste passa afirmando nada. A regra desta fatia, e a que todo
+cenário novo tem de seguir: **para cada falha injetada, a reação do sistema é
+observada positivamente, e existe um caso de controle em que ela não deveria
+acontecer.**
+
+| Falha que o harness injeta | Como | Reação PROVADA | Onde |
+|---|---|---|---|
+| duas réplicas disputam o mesmo turno | barreira solta as duas juntas | o `UPDATE` atômico do claim concede a UMA: um `acquired`, um recusado com motivo, `attempt_count = 1` | FI-04 |
+| morte abrupta do dono, num ponto EXATO | gate `pause` + `SIGKILL` por PID | a lease vence e o sucessor assume (`attempt_count = 2`, token novo); **antes** do prazo ele é recusado | FI-05 |
+| heartbeat interrompido com o processo VIVO | `SIGSTOP` | a lease vence pelo relógio do banco mesmo com o dono vivo, e o sucessor assume | FI-06 |
+| o dono deposto volta e tenta gravar | `SIGCONT` + gate liberado | `WHERE claim_token = …` recusa com `conflict: 'stale_claim'`; a linha não se move | FI-07 |
+| falha sintética no meio do caminho | gate `error` | `FailpointInjectedError` chega ao call site | self-test |
+| desconexão cooperativa | gate `disconnect` | o call site recebe a ação e decide o que derrubar | self-test |
+| suicídio no failpoint | gate `kill` (`SIGKILL` no próprio pid) | nenhum `finally` roda — a linha seguinte e a do `finally` NUNCA aparecem | self-test |
+
+### E como se sabe que os cenários não são vácuo
+
+Cada um foi verificado com uma **sonda vermelha no call site de PRODUÇÃO**: o
+defeito é reintroduzido, o vermelho é observado, o defeito é revertido. As três
+sondas e o que cada uma derruba estão no corpo da PR da fatia B; em resumo:
+
+- apagar a condição `lease_expires_at <= now()` do takeover ⇒ **FI-04 e FI-05
+  vermelhos** (duas réplicas ganham; o sucessor entra na primeira tentativa);
+- apagar o ramo de takeover inteiro ⇒ **FI-05 e FI-06/07 vermelhos** (ninguém
+  jamais assume);
+- apagar `claim_token` do fence em `turn-fence-sql.ts` ⇒ **FI-06/07 vermelho**
+  (a gravação do zumbi passa: `ok: true, conflict: null`).
+
+O oracle e o transporte têm sondas equivalentes sobre si próprios.
+
+### A barreira NÃO é um failpoint
+
+`ROTA_BARREIRA` existe porque a issue exige que corridas sejam liberadas "por
+barrier/gate, não por sleep". Duas réplicas que só sobem e tentam produzem um
+vencedor por ordem de boot — quem terminou de importar o grafo de módulos
+primeiro —, e isso não é corrida, é sorteio de tempo de import. Ela fica FORA do
+catálogo de failpoints de propósito: o catálogo é a lista fechada dos pontos que
+a PRODUÇÃO tem, e uma barreira não é um deles.
+
+### Por que o cliente devolve `kill`, mas o cenário prefere `hardKill`
+
+Um `SIGKILL` que o próprio filho dispara em `process.pid` é, por construção, o
+próprio PID — não há risco de acertar processo alheio. Ele é útil quando a morte
+precisa acontecer com janela zero. Nos cenários, porém, o padrão é `pause` +
+`ProcessSupervisor.hardKill`: o filho fica PARADO no failpoint (bloqueado no
+`await fetch`), então a morte é igualmente exata e ainda passa pelas duas
+trancas do supervisor — PID do registro e filho vivo. O cenário precisa chamar
+`autorizarSaida()` antes, senão o supervisor trata a morte que ele mesmo pediu
+como saída inesperada, que é o comportamento certo.
+
 ## O que falta para fechar a #510
 
-1. `InvariantOracle` (turno, FIFO, outbound, segurança, operação);
-2. `FailpointController` do lado do processo filho (o `FailpointGateRegistry`
-   já é o lado do cenário; falta o transporte e os pontos de injeção);
-3. `TurnDriver`;
-4. FI-01 a FI-25;
-5. perfis `reliability:pr` / `full` / `soak` e o gate blocking;
-6. runbook de reprodução por FI-ID/seed e o template de cenário novo.
+1. `TurnDriver` (injetar inbound de verdade e acompanhar IDs pelo pipeline);
+2. os failpoints do caminho de OUTBOUND e de TOOL — hoje o único ponto de
+   injeção com call site real é `after_turn_claim_before_running`, alcançado
+   pelo fixture; os outros 15 nomes do catálogo continuam sem call site;
+3. FI-01/02/03, FI-08 a FI-25;
+4. perfis `reliability:full` / `soak` e o gate blocking de CI (o script
+   `npm run test:reliability` existe e roda a lane inteira com `--retry=0`);
+5. runbook de reprodução por FI-ID/seed e o template de cenário novo.

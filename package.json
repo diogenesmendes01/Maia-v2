@@ -65,6 +65,7 @@
     "test:integration": "tsx scripts/test-integration.ts",
     "test:integration:real-db": "vitest run tests/integration/**/*real-db*.spec.ts --no-coverage",
     "test:e2e": "vitest run tests/e2e",
+    "test:reliability": "vitest run tests/reliability --no-coverage --retry=0",
     "lint": "eslint src tests scripts",
     "format": "prettier --write src",
     "typecheck": "tsc --noEmit",
