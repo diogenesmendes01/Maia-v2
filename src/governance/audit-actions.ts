@@ -438,6 +438,105 @@ export const AUDIT_ACTIONS = [
    * uma entrega possivelmente em voo.
    */
   'outbound_turn_inconsistency_detected',
+  /**
+   * Issue #506 §Auditoria mínima — as SEIS linhas que faltavam.
+   *
+   * A auditoria de fechamento da épica registrou o buraco textualmente: dos
+   * onze eventos que a issue lista, cinco existiam (`outbound_committed`,
+   * `outbound_delivery_completed`, `outbound_dead_lettered`,
+   * `outbound_manual_rearm`, `outbound_turn_inconsistency_detected`) e SEIS só
+   * existiam como métrica e log estruturado. Métrica responde "quantos"; log
+   * responde "o que aconteceu enquanto o arquivo de log existir". Nenhum dos
+   * dois responde "reconstrua o ciclo desta linha", que é o que uma trilha por
+   * linha em `audit_logs` faz.
+   *
+   * ─── A decisão que estava por tomar: volume ────────────────────────────────
+   *
+   * Uma row por claim e por tentativa É volume — e a decisão foi tomada a
+   * favor da trilha, com duas contenções que a tornam sustentável:
+   *
+   *  1. as seis são emitidas nas TRANSIÇÕES DE ESTADO, dentro do CAS que já
+   *     acontece. Um sweeper concorrente que perde o CAS não grava auditoria
+   *     nenhuma — o teto de linhas é o número de transições reais, não o
+   *     número de tentativas de transição;
+   *  2. `outbound_claimed` e `outbound_send_started` nascem uma vez por
+   *     TENTATIVA concedida, e o teto de tentativas é
+   *     `OUTBOUND_MAX_DELIVERY_ATTEMPTS` (12). Uma linha do outbox produz, no
+   *     pior caso, 12 claims + 12 send_started + 12 desfechos.
+   *
+   * ─── Todas as seis são TRANSACIONAIS ───────────────────────────────────────
+   *
+   * Gravadas por `auditTx`, no MESMO `tx` da transição que descrevem. Uma
+   * auditoria que falha em silêncio é pior que auditoria ausente: ela cria a
+   * impressão de rastro. Aqui, se a linha de auditoria não entra, a transição
+   * de estado também não — e a próxima varredura reencontra a linha no estado
+   * anterior, que é o desfecho honesto.
+   */
+  /**
+   * A POSSE da entrega foi concedida: `pending`/`retryable` -> `claimed`, ou o
+   * takeover de uma lease morta. `attempt` no metadata é o valor DEPOIS do
+   * incremento — é a tentativa que esta posse autoriza, e é o número que a DLQ
+   * compara com o teto.
+   *
+   * `status_after_claim: 'sending'` no metadata NÃO é anomalia: é o takeover de
+   * uma chamada em voo, que o claim mantém em `sending` de propósito para que o
+   * sucessor seja estruturalmente incapaz de reenviar.
+   */
+  'outbound_claimed',
+  /**
+   * `claimed -> sending`: a última escrita ANTES de o adaptador ser tocado.
+   *
+   * É a linha da trilha que separa "o processo morreu antes de enviar" de "o
+   * processo morreu com a chamada em voo" — a distinção da qual depende a
+   * decisão inteira de reenviar ou reconciliar. Sem ela na trilha, os dois
+   * crashes são indistinguíveis depois do fato.
+   */
+  'outbound_send_started',
+  /**
+   * O desfecho da tentativa caiu na família DESCONHECIDA
+   * (`accepted_unconfirmed`, `timeout_unknown`, `cancelled_after_send_unknown`):
+   * pode ter chegado ao usuário, e a plataforma não sabe.
+   *
+   * É o evento que a issue-mãe trata como central — "estados incertos não são
+   * reenviados cegamente" — e o que ele registra é justamente a INCERTEZA, não
+   * uma falha. Uma linha aqui é o começo do relógio de `RECONCILIATION_DEADLINE_MS`.
+   */
+  'outbound_delivery_unknown',
+  /**
+   * O desfecho admite nova tentativa e o backoff foi carimbado em
+   * `next_attempt_at` pelo relógio do BANCO. `retry_in_seconds` no metadata é o
+   * intervalo pedido, e o par (attempt, retry_in_seconds) é o que torna
+   * auditável a afirmação "o backoff é exponencial e tem teto".
+   */
+  'outbound_retry_scheduled',
+  /**
+   * `delivery_unknown -> reconciling`: a linha incerta saiu do automático e
+   * entrou na fila HUMANA, porque o provedor não deduplica este `payload_type`
+   * e reenviar duplicaria a mensagem no telefone do usuário.
+   *
+   * Distinta de `outbound_delivery_unknown`: aquela diz "não se sabe"; esta diz
+   * "não se sabe, a carência passou, e a plataforma decidiu que sozinha não
+   * resolve".
+   */
+  'outbound_reconciliation_started',
+  /**
+   * A reconciliação RESOLVEU a linha, e o `result` no metadata diz como —
+   * vocabulário fechado de `RECONCILIATION_RESULTS`:
+   *
+   *   `resend_idempotent`  — devolvida a `retryable` com a MESMA
+   *                          `provider_idempotency_key`, porque o provedor
+   *                          honra a chave para este tipo;
+   *   `history_recovered`  — o histórico já existia e só o estado ficou para
+   *                          trás;
+   *   `history_fabricated` — o processo morreu na janela `delivered ->
+   *                          completed` e o histórico foi PROJETADO do artefato
+   *                          imutável. Nenhuma mensagem foi reenviada.
+   *
+   * `dead_letter` NÃO aparece aqui: ele tem ação própria
+   * (`outbound_dead_lettered`), e colapsar desistência em "reconciliado" seria
+   * a trilha mentindo sobre o desfecho.
+   */
+  'outbound_reconciled',
   'pairing_qr_displayed',
   'pairing_code_requested',
   'pairing_completed',
