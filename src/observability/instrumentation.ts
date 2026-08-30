@@ -307,7 +307,7 @@ export function recordLlmRequestSpan(input: LlmRequestSpanInput): void {
 /**
  * The rest of this file is the emitter set the owner's ruling on #535 asked
  * for: "um span que só existe na declaração é dívida, não observabilidade".
- * `taxonomy.ts` had nineteen names with nothing behind them; each of the ones
+ * `taxonomy.ts` had eighteen names with nothing behind them; each of the ones
  * that survived that ruling gets a wrapper HERE, for the reason the header
  * already gives — the privacy and cardinality decisions of the whole span
  * surface stay reviewable in ONE file, and the edit each production call site
@@ -317,7 +317,7 @@ export function recordLlmRequestSpan(input: LlmRequestSpanInput): void {
  *
  * Every wrapper added here emits a span and nothing else, and that is the same
  * decision `instrumentContextLoad` and `recordLlmRequestSpan` already argue
- * above, applied fourteen more times. Two consequences worth stating plainly,
+ * above, applied fifteen more times. Two consequences worth stating plainly,
  * because they are what makes this change cheap:
  *
  *   - **Cardinality is unchanged.** A span attribute lives on one exported

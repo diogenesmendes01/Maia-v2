@@ -305,10 +305,10 @@ describe('issue #535 — tracer', () => {
       // `tests/unit/observability/llm-request-span.spec.ts` drives the real
       // `executeLLM` — not a stand-in — to prove a turn's model call opens it.
       //
-      // Since the #535 ruling the answer is "all of them": the nineteen names
-      // that had no emitter either got one (fourteen of them, plus the parent
+      // Since the #535 ruling the answer is "all of them": the eighteen names
+      // that had no emitter either got one (fifteen of them, plus the parent
       // corrections that made three of those nestable) or left the taxonomy
-      // with a written reason (`SPANS_REMOVED_IN_535`). This list is therefore
+      // with a written reason (`SPANS_REMOVED_IN_535`, three). This list is
       // the whole span vocabulary — which is the state the issue asked for, and
       // the state the case above keeps.
       expect([...EMITTED_SPANS].sort()).toEqual([...SPAN_NAMES].sort());

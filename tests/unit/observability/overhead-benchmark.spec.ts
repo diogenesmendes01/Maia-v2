@@ -563,10 +563,10 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
     expect(lines, `500 turns produced ${lines} series`).toBeLessThan(40);
   });
 
-  it('os catorze emissores novos da #535 não criam UMA série sequer', async () => {
+  it('os quinze emissores novos da #535 não criam UMA série sequer', async () => {
     // O orçamento de cardinalidade desta entrega, medido em vez de afirmado.
     //
-    // A #535 fechou a lacuna "declarado mas nunca emitido" adicionando catorze
+    // A #535 fechou a lacuna "declarado mas nunca emitido" adicionando quinze
     // emissores no caminho quente. A pergunta que decide se isso é barato não é
     // "quanto custa um span" (o caso acima já responde: zero com tracing OFF) —
     // é se algum deles carrega uma dimensão nova para a superfície do
@@ -590,6 +590,7 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
       instrumentHandlerExecute,
       instrumentIdempotencyClaim,
       instrumentIdentityResolve,
+      instrumentOutboundCommit,
       instrumentPermissionCheck,
       instrumentPreturnGraph,
       instrumentProcedureSelect,
@@ -623,16 +624,22 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
       instrumentPermissionCheck('listar', 1, () => null, () => 'allowed');
       await instrumentIdempotencyClaim('listar', async () => ({}), () => 'reserved');
       await instrumentHandlerExecute('listar', async () => null);
+      await instrumentOutboundCommit(
+        async () => ({ committed: true }),
+        () => 'committed',
+      );
       await instrumentTurnComplete('reply_delivered', async () => undefined);
     }
 
     // Os spans SAÍRAM — senão isto mediria a ausência de instrumentação, que é
-    // trivialmente barata e não é o que se quer afirmar.
-    expect(spans, 'nenhum span foi emitido; o caso não mediria nada').toBe(14 * 100);
+    // trivialmente barata e não é o que se quer afirmar. E são os QUINZE: um
+    // wrapper esquecido nesta lista sairia do orçamento sem ninguém notar, que
+    // é a forma silenciosa deste caso falhar.
+    expect(spans, 'nenhum span foi emitido; o caso não mediria nada').toBe(15 * 100);
     const depois = (await renderPrometheus()).split('\n').filter(Boolean).length;
     expect(
       depois - antes,
-      `1400 spans dos emissores novos criaram ${depois - antes} séries novas`,
+      `1500 spans dos emissores novos criaram ${depois - antes} séries novas`,
     ).toBe(0);
   }, 60_000);
 });

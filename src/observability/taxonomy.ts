@@ -114,10 +114,10 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  *
  * The owner's ruling on #535 was that a span living only in the declaration is
  * DEBT, not observability: each declared name either gets a real emitter on the
- * production path, or leaves with an individual technical justification. Three
- * left; see `SPANS_REMOVED_IN_535` below. The rest are wired, and the emitter of
- * each is named here so the file answers "where does this come from?" without a
- * grep:
+ * production path, or leaves with an individual technical justification.
+ * Eighteen names arrived at that ruling with nothing behind them; fifteen got an
+ * emitter and three left (see `SPANS_REMOVED_IN_535` below). The emitter of each
+ * is named here so the file answers "where does this come from?" without a grep:
  *
  *   - `turn`, `queue.wait`       → `src/gateway/queue.ts` (BullMQ agent worker)
  *   - `identity.resolve`         → `src/identity/resolver.ts` (`resolveIdentity`)
