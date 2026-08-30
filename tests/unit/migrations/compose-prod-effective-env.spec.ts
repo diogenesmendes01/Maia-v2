@@ -108,6 +108,13 @@ const INFRA = {
 const SERVICES: readonly { compose: string; contracts: readonly MaiaService[] }[] = [
   { compose: 'migrate', contracts: ['migrator'] },
   { compose: 'app', contracts: ['runtime'] },
+  // Issue #513 — os dois papéis do profile `split-roles`. Eles rodam a MESMA
+  // imagem e o MESMO loader do `app` (`validateConfig({ service: 'runtime' })`)
+  // e dividem `.env.app`, então o ambiente efetivo deles tem que ser medido
+  // aqui junto: um `.env.app` que só reprovasse no `scheduler` seria
+  // descoberto no boot dele, e não no bring-up.
+  { compose: 'scheduler', contracts: ['runtime'] },
+  { compose: 'worker', contracts: ['runtime'] },
   // A LISTA fica; o CONTEÚDO dela encolheu na issue #596. Entre a #572 e a
   // #596 o console avaliava os DOIS subsets no boot, porque importava
   // `src/config/env.ts` (direto em `src/admin-ui/trpc/tool-enablement.ts` e
@@ -189,18 +196,29 @@ const OPERATOR_FILLS: Readonly<Record<string, string>> = {
  * segundo caso; uma chave que o contrato passe a exigir e o exemplo não traga
  * reprova o primeiro caso desta lista e o "sem reprovas" logo abaixo.
  */
+const APP_FECHARAM_O_GAP: readonly string[] = [
+  'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
+  'BACKUP_ENCRYPTION_KEYRING',
+  'BACKUP_ENCRYPTION_MODE',
+  'BACKUP_S3_ACCESS_KEY',
+  'BACKUP_S3_BUCKET',
+  'BACKUP_S3_SECRET_KEY',
+];
+
 const FECHARAM_O_GAP: Readonly<Record<string, readonly string[]>> = {
   // O migrator não tem env_file: tudo que ele recebe está no compose, e o
   // subset `migrator` do contrato já era satisfeito por ele (issue #516).
   migrate: [],
-  app: [
-    'BACKUP_ENCRYPTION_ACTIVE_KEY_ID',
-    'BACKUP_ENCRYPTION_KEYRING',
-    'BACKUP_ENCRYPTION_MODE',
-    'BACKUP_S3_ACCESS_KEY',
-    'BACKUP_S3_BUCKET',
-    'BACKUP_S3_SECRET_KEY',
-  ],
+  app: [...APP_FECHARAM_O_GAP],
+  // Issue #513 — `scheduler` e `worker` dividem `.env.app` com o `app` e rodam
+  // o MESMO loader, então a lista é literalmente a mesma. Que ela seja a mesma
+  // é o sintoma honesto do least privilege que ainda falta: o subset por papel
+  // está declarado em `src/runtime/lifecycle/role-config.ts`, mas enquanto
+  // `src/config/env.ts` validar o schema do runtime INTEIRO, um
+  // `.env.scheduler` reduzido não sobe. Quando o loader ficar consciente do
+  // papel, estas duas linhas divergem — e é aqui que se vai ver.
+  scheduler: [...APP_FECHARAM_O_GAP],
+  worker: [...APP_FECHARAM_O_GAP],
   // As seis BACKUP_* estiveram aqui entre a review de PR #595 e a issue #596,
   // pelo mesmo motivo das seis do `app` e um nível acima: o container do
   // console validava o subset `runtime` no boot, então `BACKUP_S3_BUCKET`
@@ -380,7 +398,7 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
   it('um MAIA_ENV=staging no .env.infra chega igual nos três', () => {
     const staging = { ...INFRA, MAIA_ENV: 'staging' };
     const got = SERVICES.map(({ compose: name }) => environmentOf(compose(), name, staging).MAIA_ENV);
-    expect(got).toEqual(['staging', 'staging', 'staging']);
+    expect(got).toEqual(SERVICES.map(() => 'staging'));
   });
 
   it('OPERATOR_FILLS cobre exatamente o que os exemplos deixam em branco', () => {
@@ -403,7 +421,7 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
   });
 });
 
-describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #572)', () => {
+describe('o ambiente do runbook satisfaz o loader de TODOS os serviços (issue #572)', () => {
   it('o preflight cobre exatamente os serviços deste spec, com o mesmo loader dono', () => {
     // Sem isto, um serviço novo no compose sairia do preflight em silêncio e
     // este arquivo continuaria verde medindo três dos quatro consumidores.
@@ -415,7 +433,7 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
     );
   });
 
-  it('o `up` do runbook NÃO tem reprova de configuração em nenhum dos três', () => {
+  it('o `up` do runbook NÃO tem reprova de configuração em nenhum deles', () => {
     // Lido do loader REAL sobre os artefatos REAIS, sem nenhum completamento.
     // É o que o operador vê no primeiro `docker compose up -d` depois de
     // seguir `docs/runbooks/deploy-prod.md` §1 ao pé da letra — e é a
@@ -430,7 +448,7 @@ describe('o ambiente do runbook satisfaz o loader dos TRÊS serviços (issue #57
       'Se isto ficou vermelho, o bring-up documentado voltou a não subir: o contrato passou a ' +
         'exigir algo que os .prod.example não entregam. Atualize os exemplos, FECHARAM_O_GAP e ' +
         'docs/runbooks/deploy-prod.md §1 juntos.',
-    ).toEqual({ migrate: [], app: [], 'admin-ui': [] });
+    ).toEqual({ migrate: [], app: [], scheduler: [], worker: [], 'admin-ui': [] });
   });
 
   it.each(SERVICES)(
