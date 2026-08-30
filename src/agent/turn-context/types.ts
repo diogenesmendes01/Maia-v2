@@ -198,13 +198,16 @@ export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
  *     então o turno paga o MÁXIMO do conjunto, não a soma. Reduzir a CONTAGEM
  *     abaixo do teto de concorrência não encurta o caminho crítico;
  *  3. um `UNION ALL` de dois ramos custa mais para PLANEJAR que qualquer um
- *     deles sozinho (2,85 ms contra 0,36 ms, medido com `EXPLAIN`), então a
- *     fusão alonga justamente o `max()` que define a latência do turno.
+ *     deles sozinho — cerca de 4× o pior ramo, medido com `EXPLAIN` em
+ *     `tests/integration/turn-context-custo-de-fundir-real-db.spec.ts`, que
+ *     reprova se a conta se inverter —, então a fusão alonga justamente o
+ *     `max()` que define a latência do turno.
  *
  * A única fusão que sobreviveu é a do `resolveScope`, e ela sobreviveu porque
  * aquelas duas leituras eram SEQUENCIAIS (a segunda precisava dos `profile_id`
  * da primeira): trocar duas idas em série por uma ida só encurta o caminho
- * crítico de verdade — 1,36 ms → 0,96 ms de p50 com uma entidade em escopo.
+ * crítico de verdade — 1,46 ms → 0,97 ms de p50 com uma entidade em escopo
+ * (`tests/integration/turn-context-escopo-real-db.spec.ts`).
  *
  * Ou seja: a contagem de round-trips deixou de medir o que ela media quando a
  * #511 a escolheu. Enquanto as leituras eram SEQUENCIAIS, contagem e latência
