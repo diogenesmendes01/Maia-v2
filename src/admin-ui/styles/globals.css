@@ -1,6 +1,116 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* ==========================================================================
+ * Folha raiz do console — Tailwind 4.
+ *
+ * O que mudou em relação ao 3.4 e POR QUÊ cada linha está escrita assim:
+ *
+ * 1. `@import "tailwindcss"` no lugar das três diretivas `@tailwind
+ *    base/components/utilities`. No 4 elas não existem mais.
+ *
+ * 2. `source(none)` + `@source` explícitos no lugar do array `content` do
+ *    antigo `tailwind.config.ts`. Sem `source(none)` o Tailwind 4 DESCOBRE os
+ *    arquivos sozinho, subindo até a raiz do repositório — e a raiz aqui é o
+ *    monorepo inteiro da Maia. Isso arrastaria para a varredura, entre outros,
+ *    `src/setup/templates.ts`, que embute uma página HTML com classes do
+ *    Tailwind servidas pelo CDN do 3.x: classes de OUTRO projeto entrariam no
+ *    CSS do console. Os dois `@source` abaixo são a tradução 1:1 do `content`
+ *    que existia antes, e mantêm a varredura no território do console.
+ *    Caminhos relativos A ESTE arquivo.
+ *
+ * 3. O tema deixou de morar em JS. `tailwind.config.ts` foi APAGADO e os
+ *    tokens dele viraram as variáveis de `@theme` abaixo — mesmos valores,
+ *    mesmos nomes de utility (`bg-brand-600`, `shadow-card`, `text-2xs`,
+ *    `animate-fade-in-up`, ...). `@theme` soma ao tema padrão, que é a
+ *    semântica que o bloco `theme.extend` tinha.
+ * ========================================================================== */
+
+@import 'tailwindcss' source(none);
+
+@source '../app';
+@source '../components';
+
+@theme {
+  /* Brand accent — used for primary actions, active nav, focus rings. */
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-300: #a5b4fc;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+  --color-brand-800: #3730a3;
+  --color-brand-900: #312e81;
+  --color-brand-950: #1e1b4b;
+
+  /* Sidebar / chrome surfaces. `--color-ink` é o antigo `ink.DEFAULT`: no 4 a
+   * chave `DEFAULT` some e o token sem sufixo ocupa o lugar dela, então
+   * `bg-ink` continua resolvendo o mesmo #09090b. */
+  --color-ink: #09090b;
+  --color-ink-soft: #18181b;
+  --color-ink-line: #27272a;
+
+  --color-risk-low: #22c55e;
+  --color-risk-medium: #eab308;
+  --color-risk-high: #f97316;
+  --color-risk-critical: #ef4444;
+
+  --shadow-card:
+    0 1px 2px 0 rgb(0 0 0 / 0.04), 0 1px 4px -1px rgb(0 0 0 / 0.06);
+  --shadow-overlay:
+    0 10px 38px -10px rgb(0 0 0 / 0.35), 0 10px 20px -15px rgb(0 0 0 / 0.2);
+
+  /* Sobrescreve o `xl` padrão (0.75rem), igual ao `borderRadius.xl` do
+   * config antigo. */
+  --radius-xl: 0.875rem;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+
+  --animate-fade-in-up: fade-in-up 160ms ease-out;
+  --animate-fade-in: fade-in 120ms ease-out;
+
+  @keyframes fade-in-up {
+    0% {
+      opacity: 0;
+      transform: translateY(6px) scale(0.99);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes fade-in {
+    0% {
+      opacity: 0;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Compatibilidade de preflight com o 3.4 (mudança de comportamento, não de
+ * classe — nenhum codemod a pega).
+ *
+ * O preflight do Tailwind 4 passou `button` e `[role="button"]` de
+ * `cursor: pointer` para `cursor: default`, que é o default do navegador. O
+ * console é feito de botões (`components/ui/button.tsx` e ~16 `<button>` soltos)
+ * e nenhum deles declara `cursor-pointer` — perder o cursor de mão em todos
+ * seria uma regressão de affordance que NENHUM teste desta entrega pega:
+ * o build não olha CSS computado e o Playwright não assere cursor.
+ *
+ * Esta regra é a que o guia oficial de upgrade indica para preservar o
+ * comportamento do 3. `:not(:disabled)` porque botão desabilitado já não
+ * deveria oferecer a mão.
+ * -------------------------------------------------------------------------- */
+@layer base {
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
 
 :root {
   color-scheme: light;
@@ -28,10 +138,12 @@ pre,
     'Courier New', monospace;
 }
 
-/* Thin, unobtrusive scrollbars inside panels. */
+/* Thin, unobtrusive scrollbars inside panels.
+ * `theme('colors.zinc.300')` saiu: no 4 todo token do tema É uma custom
+ * property, e `var(--color-zinc-300)` é a forma canônica de lê-lo. */
 .scroll-thin {
   scrollbar-width: thin;
-  scrollbar-color: theme('colors.zinc.300') transparent;
+  scrollbar-color: var(--color-zinc-300) transparent;
 }
 .scroll-thin::-webkit-scrollbar {
   width: 6px;
@@ -43,14 +155,14 @@ pre,
 
 /* Legacy risk helpers (kept for capability-risk surfaces). */
 .risk-low {
-  color: theme('colors.risk.low');
+  color: var(--color-risk-low);
 }
 .risk-medium {
-  color: theme('colors.risk.medium');
+  color: var(--color-risk-medium);
 }
 .risk-high {
-  color: theme('colors.risk.high');
+  color: var(--color-risk-high);
 }
 .risk-critical {
-  color: theme('colors.risk.critical');
+  color: var(--color-risk-critical);
 }

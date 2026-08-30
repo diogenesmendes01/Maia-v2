@@ -6,14 +6,14 @@ type Size = 'sm' | 'md' | 'lg';
 
 const VARIANT: Record<Variant, string> = {
   primary:
-    'bg-brand-600 text-white hover:bg-brand-700 focus-visible:ring-brand-500 shadow-sm',
+    'bg-brand-600 text-white hover:bg-brand-700 focus-visible:ring-brand-500 shadow-xs',
   secondary:
-    'bg-white text-zinc-800 border border-zinc-300 hover:bg-zinc-50 focus-visible:ring-brand-500 shadow-sm',
+    'bg-white text-zinc-800 border border-zinc-300 hover:bg-zinc-50 focus-visible:ring-brand-500 shadow-xs',
   ghost: 'text-zinc-700 hover:bg-zinc-100 focus-visible:ring-brand-500',
   danger:
-    'bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500 shadow-sm',
+    'bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500 shadow-xs',
   success:
-    'bg-emerald-600 text-white hover:bg-emerald-700 focus-visible:ring-emerald-500 shadow-sm',
+    'bg-emerald-600 text-white hover:bg-emerald-700 focus-visible:ring-emerald-500 shadow-xs',
 };
 
 const SIZE: Record<Size, string> = {
@@ -40,7 +40,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
         disabled={disabled || loading}
         className={cn(
           'inline-flex items-center justify-center rounded-lg font-medium transition-colors',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2',
+          'focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-offset-2',
           'disabled:pointer-events-none disabled:opacity-50',
           VARIANT[variant],
           SIZE[size],
