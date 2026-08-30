@@ -345,7 +345,7 @@ export function SkillForm({
                     checked={allowedTools.includes(t.name)}
                     disabled={!t.enabled}
                     onChange={() => toggleTool(t.name)}
-                    className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                    className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                   />
                   <code className="font-mono text-xs">{t.name}</code>
                   {!t.enabled && (
