@@ -64,6 +64,23 @@ export type RecoveryCandidate = {
   age_ms: number;
 };
 
+/**
+ * #506 §Auditoria mínima — a correlação devolvida pelos CAS da reconciliação.
+ *
+ * Vem do PRÓPRIO `UPDATE ... RETURNING` e nunca de uma leitura posterior: entre
+ * a leitura e a escrita a linha pode mudar de dono, e a trilha descreveria um
+ * estado que não coexistiu com a transição que ela documenta.
+ */
+type ReconciledRow = {
+  id: string;
+  turn_id: string | null;
+  payload_type: string | null;
+  conversa_id: string;
+  in_reply_to: string;
+  attempt: number;
+  delivery_outcome: string | null;
+};
+
 /** Uma divergência turno↔outbound, já classificada. */
 export type TurnOutboundDivergence = {
   turn_pending_without_outbound: number;
@@ -159,18 +176,57 @@ export const outboundRecoveryRepo = {
   }): Promise<{ promoted: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const result = await db.execute(sql`
-      UPDATE ${outbound_messages}
-         SET status          = 'retryable',
-             next_attempt_at = now(),
-             last_error_code = 'reconciled_idempotent_resend'
-       WHERE tenant_id = ${tenant_id}
-         AND agent_id  = ${agent_id}
-         AND id        = ${input.outbound_id}::uuid
-         AND status    = 'delivery_unknown'
-      RETURNING id
-    `);
-    return { promoted: result.rows.length > 0 };
+    // #506 §Auditoria mínima — `outbound.reconciled`, resultado
+    // `resend_idempotent`, na MESMA transação do CAS.
+    //
+    // Esta é a ÚNICA escrita da recuperação que autoriza um efeito externo
+    // repetido, e é por isso que ela é a que menos pode acontecer sem trilha:
+    // depois do fato, "por que esta mensagem foi enviada duas vezes?" só tem
+    // resposta se existir a linha que diz quem autorizou e com que fundamento.
+    // Auditoria que falha reverte a promoção — a linha continua
+    // `delivery_unknown` e o próximo tick decide de novo, o que é seguro
+    // justamente porque nada saiu.
+    return withTx(async (tx) => {
+      const result = await tx.execute<ReconciledRow>(sql`
+        UPDATE ${outbound_messages}
+           SET status          = 'retryable',
+               next_attempt_at = now(),
+               last_error_code = 'reconciled_idempotent_resend'
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND id        = ${input.outbound_id}::uuid
+           AND status    = 'delivery_unknown'
+        RETURNING id, turn_id, payload_type, conversa_id, in_reply_to, attempt,
+                  delivery_outcome
+      `);
+      const row = (result.rows as unknown as ReconciledRow[])[0];
+      if (!row) return { promoted: false };
+      await auditTx(tx, {
+        acao: 'outbound_reconciled',
+        conversa_id: row.conversa_id,
+        mensagem_id: row.in_reply_to,
+        alvo_id: row.id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: row.id,
+          turn_id: row.turn_id,
+          payload_type: row.payload_type,
+          attempt: Number(row.attempt),
+          // Vocabulário FECHADO de `RECONCILIATION_RESULTS`.
+          result: 'resend_idempotent',
+          from_status: 'delivery_unknown',
+          to_status: 'retryable',
+          // O desfecho incerto que motivou a reconciliação. Sem ele a trilha
+          // diria "reenviou" sem dizer de que incerteza se estava saindo.
+          delivery_outcome: row.delivery_outcome,
+          // A afirmação que torna o reenvio defensável, escrita na trilha e não
+          // só no código: a MESMA chave vai ao provedor, então uma eventual
+          // primeira entrega e esta colidem no cliente do destinatário.
+          reuses_provider_idempotency_key: true,
+        },
+      });
+      return { promoted: true };
+    });
   },
 
   /**
@@ -185,16 +241,47 @@ export const outboundRecoveryRepo = {
   async markReconciling(input: { outbound_id: string }): Promise<{ marked: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const result = await db.execute(sql`
-      UPDATE ${outbound_messages}
-         SET status = 'reconciling'
-       WHERE tenant_id = ${tenant_id}
-         AND agent_id  = ${agent_id}
-         AND id        = ${input.outbound_id}::uuid
-         AND status    = 'delivery_unknown'
-      RETURNING id
-    `);
-    return { marked: result.rows.length > 0 };
+    // #506 §Auditoria mínima — `outbound.reconciliation_started`, na MESMA
+    // transação do CAS.
+    //
+    // O CAS `status = 'delivery_unknown'` é o que impede a linha duplicada: uma
+    // linha já em `reconciling` volta zero e NÃO grava auditoria de novo, então
+    // a trilha tem uma entrada por ESCALADA e não uma por tick da varredura.
+    return withTx(async (tx) => {
+      const result = await tx.execute<ReconciledRow>(sql`
+        UPDATE ${outbound_messages}
+           SET status = 'reconciling'
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND id        = ${input.outbound_id}::uuid
+           AND status    = 'delivery_unknown'
+        RETURNING id, turn_id, payload_type, conversa_id, in_reply_to, attempt,
+                  delivery_outcome
+      `);
+      const row = (result.rows as unknown as ReconciledRow[])[0];
+      if (!row) return { marked: false };
+      await auditTx(tx, {
+        acao: 'outbound_reconciliation_started',
+        conversa_id: row.conversa_id,
+        mensagem_id: row.in_reply_to,
+        alvo_id: row.id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: row.id,
+          turn_id: row.turn_id,
+          payload_type: row.payload_type,
+          attempt: Number(row.attempt),
+          delivery_outcome: row.delivery_outcome,
+          from_status: 'delivery_unknown',
+          to_status: 'reconciling',
+          // Por que a plataforma parou: o provedor não deduplica este
+          // `payload_type`, então reenviar produziria uma SEGUNDA mensagem.
+          // É o fundamento da espera humana, e ele pertence à trilha.
+          escalation_reason: 'provider_idempotency_unavailable_for_payload_type',
+        },
+      });
+      return { marked: true };
+    });
   },
 
   /**
@@ -535,6 +622,31 @@ export const outboundRecoveryRepo = {
           history_fabricated: history_message_id !== null,
         },
       });
+      // #506 §Auditoria mínima — `outbound.reconciled`.
+      //
+      // Linha SEPARADA de `outbound_delivery_completed`, e a separação é o
+      // ponto: aquela diz "o ciclo desta saída fechou"; esta diz "quem fechou
+      // foi a RECONCILIAÇÃO, e o histórico que existe agora foi projetado do
+      // artefato porque o processo que enviou morreu na janela". Colapsar as
+      // duas apagaria a proveniência — e a pergunta que se faz depois de um
+      // incidente é exatamente essa.
+      await auditTx(tx, {
+        acao: 'outbound_reconciled',
+        conversa_id: input.conversa_id,
+        mensagem_id: input.in_reply_to,
+        alvo_id: input.outbound_id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: input.outbound_id,
+          result: 'history_fabricated',
+          from_status: 'delivered',
+          to_status: 'completed',
+          history_message_id,
+          // A afirmação que o operador precisa ler sem abrir o código: a
+          // reconciliação NÃO tocou o provedor. Nada foi reenviado.
+          provider_contacted: false,
+        },
+      });
 
       return { completed: true, history_message_id };
     });
@@ -583,6 +695,26 @@ export const outboundRecoveryRepo = {
           from_status: 'delivered',
           to_status: 'completed',
           recovered_by: 'reconciliation',
+        },
+      });
+      // #506 §Auditoria mínima — `outbound.reconciled`, resultado
+      // `history_recovered`: o histórico JÁ estava lá (o caminho síncrono o
+      // gravou) e só o estado ficou para trás. Nada foi inserido e nada foi
+      // enviado; a série `history_recovered` mede ruído de concorrência, e a
+      // `history_fabricated` mede crash — conflatá-las na trilha esconderia a
+      // segunda dentro do volume da primeira.
+      await auditTx(tx, {
+        acao: 'outbound_reconciled',
+        conversa_id: input.conversa_id,
+        mensagem_id: input.in_reply_to,
+        alvo_id: input.outbound_id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: input.outbound_id,
+          result: 'history_recovered',
+          from_status: 'delivered',
+          to_status: 'completed',
+          provider_contacted: false,
         },
       });
       return { completed: true };

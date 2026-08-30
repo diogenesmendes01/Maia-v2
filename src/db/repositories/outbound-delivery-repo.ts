@@ -57,6 +57,42 @@ type ClaimRow = {
   claimed_by: string;
   lease_expires_at: string;
   status: string;
+  /**
+   * #506 §Auditoria mínima. Correlação da trilha, devolvida pelo MESMO UPDATE
+   * que concede a posse — e não por uma leitura depois. Uma segunda consulta
+   * poderia enxergar uma linha já alterada por outro worker, e a trilha
+   * descreveria um estado que nunca coexistiu com aquele claim.
+   */
+  turn_id: string | null;
+  payload_type: string | null;
+  conversa_id: string;
+  in_reply_to: string;
+};
+
+/**
+ * #506 §Auditoria mínima — a correlação devolvida pelo UPDATE de
+ * `claimed -> sending`. Mesma razão de `ClaimRow`: ler depois enxergaria uma
+ * linha possivelmente já tomada por outro worker.
+ */
+/** #506 §Auditoria mínima — correlação devolvida pelo UPDATE do desfecho. */
+type OutcomeRow = {
+  id: string;
+  turn_id: string | null;
+  payload_type: string | null;
+  conversa_id: string;
+  in_reply_to: string;
+  attempt: number;
+  next_attempt_at: string | null;
+};
+
+type SendStartedRow = {
+  id: string;
+  turn_id: string | null;
+  payload_type: string | null;
+  conversa_id: string;
+  in_reply_to: string;
+  attempt: number;
+  claimed_by: string | null;
 };
 
 /**
@@ -135,32 +171,66 @@ export const outboundDeliveryRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const leaseSeconds = input.lease_ms / 1000;
-    const result = await db.execute<ClaimRow>(sql`
-      UPDATE ${outbound_messages}
-         SET status           = CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END,
-             claimed_by       = ${input.worker_id},
-             claim_token      = gen_random_uuid(),
-             lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
-             attempt          = attempt + 1
-       WHERE tenant_id = ${tenant_id}
-         AND agent_id  = ${agent_id}
-         AND id        = ${input.outbound_id}::uuid
-         AND turn_id IS NOT NULL
-         AND (
-               (status IN (${statusList(DELIVERY_CLAIMABLE_STATUSES)})
-                 AND (next_attempt_at IS NULL OR next_attempt_at <= now()))
-            OR (status IN (${statusList(DELIVERY_TAKEOVER_STATUSES)})
-                 AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at <= now())
-         )
-      -- O status devolvido aqui e o valor NOVO, e e justamente ele que carrega
-      -- a disposicao: claimed = ninguem tocou o adaptador, pode enviar;
-      -- sending = a chamada anterior ficou em voo, NAO pode.
-      RETURNING id, tenant_id, agent_id, attempt, claim_token, claimed_by,
-                lease_expires_at, status
-    `);
-    const row = (result.rows as unknown as ClaimRow[])[0];
-    if (!row) {
+    // #506 §Auditoria mínima — `outbound.claimed`.
+    //
+    // O UPDATE e a linha de auditoria vivem na MESMA transação. Se a auditoria
+    // não entrar, a POSSE não é concedida: `attempt` não avança, o
+    // `claim_token` novo não sobrevive, e a linha continua exatamente como
+    // estava para o próximo tick. É a leitura fail-CLOSED da exigência "falha
+    // transacional de auditoria reverte a mutação" — e neste ponto ela é a
+    // versão barata da atomicidade, porque nada foi enviado ainda.
+    const claimed = await withTx(async (tx) => {
+      const result = await tx.execute<ClaimRow>(sql`
+        UPDATE ${outbound_messages}
+           SET status           = CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END,
+               claimed_by       = ${input.worker_id},
+               claim_token      = gen_random_uuid(),
+               lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
+               attempt          = attempt + 1
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND id        = ${input.outbound_id}::uuid
+           AND turn_id IS NOT NULL
+           AND (
+                 (status IN (${statusList(DELIVERY_CLAIMABLE_STATUSES)})
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= now()))
+              OR (status IN (${statusList(DELIVERY_TAKEOVER_STATUSES)})
+                   AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at <= now())
+           )
+        -- O status devolvido aqui e o valor NOVO, e e justamente ele que carrega
+        -- a disposicao: claimed = ninguem tocou o adaptador, pode enviar;
+        -- sending = a chamada anterior ficou em voo, NAO pode.
+        RETURNING id, tenant_id, agent_id, attempt, claim_token, claimed_by,
+                  lease_expires_at, status, turn_id, payload_type, conversa_id, in_reply_to
+      `);
+      const row = (result.rows as unknown as ClaimRow[])[0];
+      if (!row) return null;
+      await auditTx(tx, {
+        acao: 'outbound_claimed',
+        conversa_id: row.conversa_id,
+        mensagem_id: row.in_reply_to,
+        alvo_id: row.id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: row.id,
+          turn_id: row.turn_id,
+          payload_type: row.payload_type,
+          // `attempt` DEPOIS do incremento: é a tentativa que esta posse
+          // autoriza, e é o número que o teto da DLQ compara.
+          attempt: Number(row.attempt),
+          worker_id: row.claimed_by,
+          lease_expires_at: row.lease_expires_at,
+          // `sending` aqui é TAKEOVER de chamada em voo, não anomalia: o claim
+          // mantém a linha em `sending` de propósito, e é o que torna o
+          // sucessor incapaz de reenviar. Registrar a distinção é o que
+          // permite reconstruir, depois, por que aquela tentativa não enviou.
+          status_after_claim: row.status,
+        },
+      });
+      return row;
+    });
+    if (!claimed) {
       // Distinguir os três fracassos custa UMA leitura escopada, feita só no
       // caminho de fracasso. Sem ela, "linha de outro tenant", "corrida
       // perdida" e "linha já terminal" seriam o mesmo ponto na métrica — e as
@@ -187,14 +257,14 @@ export const outboundDeliveryRepo = {
     return {
       ok: true,
       claim: {
-        outbound_id: row.id,
-        tenant_id: row.tenant_id,
-        agent_id: row.agent_id,
-        attempt: Number(row.attempt),
-        claim_token: row.claim_token,
-        worker_id: row.claimed_by,
-        lease_expires_at: new Date(row.lease_expires_at),
-        status_after_claim: row.status,
+        outbound_id: claimed.id,
+        tenant_id: claimed.tenant_id,
+        agent_id: claimed.agent_id,
+        attempt: Number(claimed.attempt),
+        claim_token: claimed.claim_token,
+        worker_id: claimed.claimed_by,
+        lease_expires_at: new Date(claimed.lease_expires_at),
+        status_after_claim: claimed.status,
       },
     };
   },
@@ -251,18 +321,48 @@ export const outboundDeliveryRepo = {
   async markSending(input: { outbound_id: string; claim_token: string }): Promise<void> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const result = await db.execute(sql`
-      UPDATE ${outbound_messages}
-         SET status = 'sending'
-       WHERE tenant_id   = ${tenant_id}
-         AND agent_id    = ${agent_id}
-         AND id          = ${input.outbound_id}::uuid
-         AND claim_token = ${input.claim_token}::uuid
-         AND status      = 'claimed'
-         AND lease_expires_at > now()
-      RETURNING id
-    `);
-    if (result.rows.length === 0) {
+    // #506 §Auditoria mínima — `outbound.send_started`, na MESMA transação da
+    // transição que ela descreve.
+    //
+    // É a linha da trilha mais barata de justificar: sem ela, um crash antes do
+    // adaptador e um crash com a chamada em voo deixam a mesma evidência depois
+    // do fato, e a decisão inteira de "reenviar ou reconciliar" depende de
+    // distingui-los. A auditoria que falha REVERTE a transição — a linha
+    // continua `claimed`, que é o estado de "nada saiu", e é o desfecho
+    // honesto: preferimos não enviar a enviar sem trilha.
+    const marked = await withTx(async (tx) => {
+      const result = await tx.execute<SendStartedRow>(sql`
+        UPDATE ${outbound_messages}
+           SET status = 'sending'
+         WHERE tenant_id   = ${tenant_id}
+           AND agent_id    = ${agent_id}
+           AND id          = ${input.outbound_id}::uuid
+           AND claim_token = ${input.claim_token}::uuid
+           AND status      = 'claimed'
+           AND lease_expires_at > now()
+        RETURNING id, turn_id, payload_type, conversa_id, in_reply_to, attempt, claimed_by
+      `);
+      const row = (result.rows as unknown as SendStartedRow[])[0];
+      if (!row) return false;
+      await auditTx(tx, {
+        acao: 'outbound_send_started',
+        conversa_id: row.conversa_id,
+        mensagem_id: row.in_reply_to,
+        alvo_id: row.id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: row.id,
+          turn_id: row.turn_id,
+          payload_type: row.payload_type,
+          attempt: Number(row.attempt),
+          worker_id: row.claimed_by,
+          from_status: 'claimed',
+          to_status: 'sending',
+        },
+      });
+      return true;
+    });
+    if (!marked) {
       throw new DeliveryFenceError({
         outbound_id: input.outbound_id,
         operation: 'mark_sending',
@@ -351,28 +451,82 @@ export const outboundDeliveryRepo = {
     const retryable = status === 'retryable';
     const mantemPosse = confirmed && input.continues_to_completed === true;
     const retrySeconds = input.retry_in_seconds ?? 0;
-    const result = await db.execute(sql`
-      UPDATE ${outbound_messages}
-         SET status              = ${status},
-             delivery_outcome    = ${input.outcome},
-             provider_message_id = ${input.provider_message_id ?? null},
-             last_error_code     = ${input.last_error_code ?? null},
-             sent_at             = ${confirmed ? sql`now()` : sql`sent_at`},
-             provider_timestamp  = ${confirmed ? sql`now()` : sql`provider_timestamp`},
-             next_attempt_at     = ${
-               retryable ? sql`now() + make_interval(secs => ${retrySeconds})` : sql`next_attempt_at`
-             },
-             claimed_by          = ${mantemPosse ? sql`claimed_by` : sql`NULL`},
-             claim_token         = ${mantemPosse ? sql`claim_token` : sql`NULL`},
-             lease_expires_at    = ${mantemPosse ? sql`lease_expires_at` : sql`NULL`}
-       WHERE tenant_id   = ${tenant_id}
-         AND agent_id    = ${agent_id}
-         AND id          = ${input.outbound_id}::uuid
-         AND claim_token = ${input.claim_token}::uuid
-         AND status      IN ('claimed', 'sending')
-      RETURNING id
-    `);
-    if (result.rows.length === 0) {
+    // #506 §Auditoria mínima — `outbound.delivery_unknown` e
+    // `outbound.retry_scheduled`, os dois derivados do MESMO desfecho e
+    // gravados na MESMA transação que o registra.
+    //
+    // Quais das duas (ou nenhuma) sai daqui é decidido por `statusForOutcome`,
+    // e não por um `if` do chamador — a mesma tabela única que decide o estado
+    // decide a trilha, então não existe caminho em que o estado diga
+    // `delivery_unknown` e a trilha diga outra coisa.
+    //
+    // O `delivered` NÃO audita aqui: ele tem `outbound_delivery_completed`, que
+    // é gravado com o histórico em `completeDeliveryTx`. Auditar duas vezes o
+    // mesmo fato faria a contagem da trilha divergir do número de saídas.
+    //
+    // Se a auditoria falhar, a transação inteira reverte e a linha permanece em
+    // `sending` — o estado que diz "a chamada foi iniciada, o desfecho é
+    // desconhecido". É pior que registrar o desfecho e melhor que registrá-lo
+    // sem trilha: a reconciliação de #633 pega a linha e NÃO reenvia.
+    const outcomeRow = await withTx(async (tx) => {
+      const result = await tx.execute<OutcomeRow>(sql`
+        UPDATE ${outbound_messages}
+           SET status              = ${status},
+               delivery_outcome    = ${input.outcome},
+               provider_message_id = ${input.provider_message_id ?? null},
+               last_error_code     = ${input.last_error_code ?? null},
+               sent_at             = ${confirmed ? sql`now()` : sql`sent_at`},
+               provider_timestamp  = ${confirmed ? sql`now()` : sql`provider_timestamp`},
+               next_attempt_at     = ${
+                 retryable ? sql`now() + make_interval(secs => ${retrySeconds})` : sql`next_attempt_at`
+               },
+               claimed_by          = ${mantemPosse ? sql`claimed_by` : sql`NULL`},
+               claim_token         = ${mantemPosse ? sql`claim_token` : sql`NULL`},
+               lease_expires_at    = ${mantemPosse ? sql`lease_expires_at` : sql`NULL`}
+         WHERE tenant_id   = ${tenant_id}
+           AND agent_id    = ${agent_id}
+           AND id          = ${input.outbound_id}::uuid
+           AND claim_token = ${input.claim_token}::uuid
+           AND status      IN ('claimed', 'sending')
+        RETURNING id, turn_id, payload_type, conversa_id, in_reply_to, attempt,
+                  next_attempt_at
+      `);
+      const row = (result.rows as unknown as OutcomeRow[])[0];
+      if (!row) return null;
+      const trilha = {
+        conversa_id: row.conversa_id,
+        mensagem_id: row.in_reply_to,
+        alvo_id: row.id,
+        entidade_alvo: 'outbound_messages',
+        metadata: {
+          outbound_id: row.id,
+          turn_id: row.turn_id,
+          payload_type: row.payload_type,
+          attempt: Number(row.attempt),
+          outcome: input.outcome,
+          status: status,
+          last_error_code: input.last_error_code ?? null,
+        },
+      } as const;
+      if (status === 'delivery_unknown') {
+        await auditTx(tx, { ...trilha, acao: 'outbound_delivery_unknown' });
+      } else if (retryable) {
+        await auditTx(tx, {
+          ...trilha,
+          acao: 'outbound_retry_scheduled',
+          metadata: {
+            ...trilha.metadata,
+            retry_in_seconds: retrySeconds,
+            // O instante vem do BANCO (`now() + interval`), devolvido pelo
+            // próprio UPDATE. Recalculá-lo em JS gravaria na trilha um horário
+            // que o gate de `next_attempt_at` não usa.
+            next_attempt_at: row.next_attempt_at,
+          },
+        });
+      }
+      return row;
+    });
+    if (!outcomeRow) {
       // Sem `lease_expires_at > now()` no WHERE, de propósito e ao contrário de
       // `markSending`: aqui o efeito externo JÁ ocorreu, e recusar a gravação
       // porque a lease venceu DURANTE a chamada ao provedor deixaria a linha em
