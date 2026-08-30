@@ -866,16 +866,39 @@ markdown, para que o teste possa lê-lo. Três estados: `outbox`,
 | Estado | Caminhos |
 |---|---|
 | `outbox` | `agent/output-dispatch.ts` (texto, `status_fallback`, documento, voz, enquete), `runtime/outbound/delivery.ts` |
-| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `tools/_dispatcher.ts`, `workers/briefings.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` |
+| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts` |
 | `infrastructure` | `gateway/line-output.ts`, `gateway/line-sessions.ts`, `runtime/outbound/provider-adapter.ts` |
 
-A issue pede o inventário de exceções "idealmente vazio"; ele não está, e o
-denominador comum das dez é literal: **nenhuma tem `turn_id`**. O outbox exige
-`turn_id NOT NULL` (migração 121) e o commit faz fence do `claim_token` do
-turno — não há turno a cercar num briefing das 7h nem numa expiração de
-workflow. Duas delas (`scheduling.outbox_drain`, `workers.idempotency_relayer`)
-já são outboxes duráveis próprios; migrá-las é fundir dois ledgers, trabalho que
-a issue-mãe não pede.
+**De dez para seis (#506).** Quatro entradas saíram porque os módulos pararam de
+falar com o canal: `workers/briefings.ts`, `workflows/dual-approval.ts`,
+`workflows/engine.ts` e `tools/_dispatcher.ts` comprometem o aviso em
+`outbox_messages` via `src/runtime/outbound/proactive-notice.ts`, e o drain de
+agendamento entrega com claim, backoff e DLQ. Não é o outbox do TURNO — é o
+ledger durável que já existia —, e o inventário diz isso com todas as letras. O
+que os quatro ganharam é a propriedade que a épica exige e que eles não tinham:
+**persistir antes de enviar**. O que a fatia comprou de quebra é que a fusão dos
+ledgers passou a ter um ponto de aplicação (`scheduling/outbox-drain.ts`) em vez
+de cinco.
+
+A catraca vive em `tests/unit/runtime/outbound-trava-envio-direto.spec.ts`: a
+lista de seis ids é literal (o número **só desce**), os quatro ids aposentados
+são recusados pela trava de runtime, e uma entrada cujo módulo deixou de enviar
+reprova como "exceção fantasma".
+
+**CORREÇÃO DE FATO.** A versão anterior desta seção dizia que o denominador
+comum das dez era "nenhuma tem `turn_id`", porque "o outbox exige `turn_id NOT
+NULL` (migração 121)". **A coluna é NULLABLE** — a 121 a cria com
+`ADD COLUMN IF NOT EXISTS turn_id uuid`, o CHECK de completude é
+`CASE WHEN turn_id IS NULL THEN true ELSE (...) END`, a FK composta é MATCH
+SIMPLE (inerte com NULL) e o UNIQUE da chave lógica não menciona `turn_id`. Nem
+o destinatário é amarrado ao turno: `resolveOutboundDeliveryScope` resolve o JID
+pela `conversa_id` da própria row. O que bloqueia é CÓDIGO —
+`commitOutboundIntent` exige `getOutboundTurnScope()`, e `deliverOutbound`
+recusa row sem `turn_id` na entrada — e mudar isso é mudar o MODELO do outbox.
+A proposta escrita está em
+[`decisions/0005-outbox-sem-turno.md`](../decisions/0005-outbox-sem-turno.md),
+com migração, guarda, ordem de coortes e o que a reconciliação passa a
+distinguir. Ela aguarda decisão humana; nenhuma parte dela foi implementada.
 
 **Fallback e timeout.** `sendOutbound` já aceitava `fallback_reason` desde #631,
 mas nenhum call site o passava — todo fallback nascia como `payload_type:'text'`

@@ -452,6 +452,16 @@ Se `maia_outbound_direct_send_violation_total` sair de zero:
    `containment` escritos. Não há terceira opção, e o teste estático
    (`tests/unit/runtime/outbound-trava-envio-direto.spec.ts`) recusa a terceira.
 
+   **Acrescentar uma exceção não é mais um caminho aberto (#506).** Aquele mesmo
+   teste fixa a lista de seis ids, e o número **só desce**: incluir um sétimo
+   reprova o CI e é decisão humana, não escolha de quem está implementando. Para
+   um aviso PROATIVO — sem turno, para dono/aprovador/requester — o caminho já
+   existe e não é exceção nenhuma: `enqueueProactiveNotice`
+   (`src/runtime/outbound/proactive-notice.ts`) compromete a saída no ledger de
+   agendamento com chave de idempotência, e o `outbox_drain` entrega. É o que
+   `workers/briefings.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` e
+   `tools/_dispatcher.ts` passaram a fazer.
+
 Não existe env var para desligar a trava, e a ausência é a decisão: uma trava
 desligável em produção é o fail-open que a épica lista como risco.
 
