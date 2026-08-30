@@ -13,7 +13,7 @@
  */
 
 import { sql, eq, and, inArray, desc } from 'drizzle-orm';
-import { db, withTx } from '@/db/client.js';
+import { db, withTx, pgErrorCode, pgErrorConstraint } from '@/db/client.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import {
   series as seriesTable,
@@ -396,7 +396,24 @@ export const seriesRepo = {
       } catch (err) {
         // UNIQUE (series_id, scheduled_for) collision — another worker beat
         // us to it. Idempotent: return null and let the loser drop the work.
-        if (/duplicate key|unique constraint/i.test((err as Error).message)) {
+        //
+        // O que chega neste `catch` NÃO é o erro do `pg`. O driver do Drizzle
+        // embrulha a falha num erro cuja `message` é
+        // `Failed query: insert into "occurrences" ...` e pendura o erro
+        // original em `cause`. Casar uma regex contra `.message` — como esta
+        // linha fazia — nunca dava verdadeiro: o perdedor da corrida
+        // ESTOURAVA em vez de desistir em silêncio, e a materialização da
+        // próxima ocorrência falhava sempre que dois workers a disputavam.
+        //
+        // A leitura certa é o SQLSTATE descendo a cadeia de `cause`, e a
+        // NARROW por nome de constraint: `23505` só diz "algum unique foi
+        // violado", e `occurrences` tem mais de um. Engolir qualquer 23505
+        // aqui esconderia uma violação de chave primária — defeito de
+        // verdade, não corrida rotineira.
+        if (
+          pgErrorCode(err) === '23505' &&
+          pgErrorConstraint(err) === 'occurrences_series_id_scheduled_for_key'
+        ) {
           return { occurrence: null, tasks: [] };
         }
         throw err;
@@ -609,7 +626,14 @@ function txRepos(tx: Tx): TxScopedRepos {
             .returning();
           return rows[0] ?? null;
         } catch (err) {
-          if (/duplicate key|unique constraint/i.test((err as Error).message)) return null;
+          // Mesma correção do `outboxRepo.enqueue` não transacional: a regex
+          // contra `.message` nunca casava, porque o Drizzle embrulha o erro
+          // do `pg`. `idx_outbox_dedup` é o índice parcial cuja violação
+          // significa "o chamador já enfileirou isto"; qualquer outro 23505
+          // desta tabela sobe.
+          if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
+            return null;
+          }
           throw err;
         }
       },
@@ -1100,7 +1124,13 @@ export const outboxRepo = {
       return rows[0] ?? null;
     } catch (err) {
       // Dedup collision is idempotent success — caller already enqueued.
-      if (/duplicate key|unique constraint/i.test((err as Error).message)) return null;
+      //
+      // `idx_outbox_dedup` é o índice parcial (`WHERE dedup_key IS NOT NULL`)
+      // cuja violação significa exatamente isso. Qualquer outro `23505` desta
+      // tabela — a chave primária, por exemplo — é defeito e sobe.
+      if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
+        return null;
+      }
       throw err;
     }
   },
