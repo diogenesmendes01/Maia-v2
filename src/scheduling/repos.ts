@@ -396,7 +396,24 @@ export const seriesRepo = {
       } catch (err) {
         // UNIQUE (series_id, scheduled_for) collision — another worker beat
         // us to it. Idempotent: return null and let the loser drop the work.
-        if (/duplicate key|unique constraint/i.test((err as Error).message)) {
+        //
+        // O que chega neste `catch` NÃO é o erro do `pg`. O driver do Drizzle
+        // embrulha a falha num erro cuja `message` é
+        // `Failed query: insert into "occurrences" ...` e pendura o erro
+        // original em `cause`. Casar uma regex contra `.message` — como esta
+        // linha fazia — nunca dava verdadeiro: o perdedor da corrida
+        // ESTOURAVA em vez de desistir em silêncio, e a materialização da
+        // próxima ocorrência falhava sempre que dois workers a disputavam.
+        //
+        // A leitura certa é o SQLSTATE descendo a cadeia de `cause`, e a
+        // NARROW por nome de constraint: `23505` só diz "algum unique foi
+        // violado", e `occurrences` tem mais de um. Engolir qualquer 23505
+        // aqui esconderia uma violação de chave primária — defeito de
+        // verdade, não corrida rotineira.
+        if (
+          pgErrorCode(err) === '23505' &&
+          pgErrorConstraint(err) === 'occurrences_series_id_scheduled_for_key'
+        ) {
           return { occurrence: null, tasks: [] };
         }
         throw err;
@@ -609,7 +626,14 @@ function txRepos(tx: Tx): TxScopedRepos {
             .returning();
           return rows[0] ?? null;
         } catch (err) {
-          if (/duplicate key|unique constraint/i.test((err as Error).message)) return null;
+          // Mesma correção do `outboxRepo.enqueue` não transacional: a regex
+          // contra `.message` nunca casava, porque o Drizzle embrulha o erro
+          // do `pg`. `idx_outbox_dedup` é o índice parcial cuja violação
+          // significa "o chamador já enfileirou isto"; qualquer outro 23505
+          // desta tabela sobe.
+          if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
+            return null;
+          }
           throw err;
         }
       },
@@ -1120,6 +1144,9 @@ export const outboxRepo = {
       // uma corrida rotineira. `idx_outbox_dedup` é o índice parcial da
       // migração 007, e é o único cuja violação significa "o chamador já
       // enfileirou isto".
+      //
+      // O `idx_outbox_dedup` é PARCIAL (`WHERE dedup_key IS NOT NULL`), então
+      // uma row sem `dedup_key` nunca colide por ele.
       if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
         return null;
       }
