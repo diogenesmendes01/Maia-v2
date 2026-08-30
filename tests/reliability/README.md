@@ -239,13 +239,48 @@ trancas do supervisor — PID do registro e filho vivo. O cenário precisa chama
 `autorizarSaida()` antes, senão o supervisor trata a morte que ele mesmo pediu
 como saída inesperada, que é o comportamento certo.
 
+## As DUAS formas de duplicação, e por que o harness precisa distinguir
+
+Uma correção de rota que vale registrar, porque ela muda quais cenários valem a
+pena escrever a seguir.
+
+O contrato de concorrência de schedulers (#513, `src/workers/job-contract.ts`)
+declara lacunas em `unguarded` — jobs com efeito externo não idempotente e sem
+claim. É tentador tratar toda lacuna declarada como alvo de fault injection.
+Não é: **cinco delas já foram fechadas e a declaração ficou para trás**
+(`pending_expirer` e `workflow_engine_tick` ganharam compare-and-swap na #691;
+os três `briefing_*` passaram a comprometer o aviso em `outbox_messages` sob
+`dedupe_key` na #692). Injetar concorrência nesses cinco mediria uma proteção
+que já existe achando que expõe um buraco — vácuo com sinal trocado. Se forem
+cobertos, que seja pela afirmação certa: **dois disparos concorrentes produzem
+UM efeito**.
+
+As que continuam abertas de verdade são nove: `conversation_summarizer`,
+`pattern_detector`, `legacy_memory_reclassifier`, `procedure_candidate_consumer`,
+`knowledge_state_promoter`, `drift_monitor`, `gap_escalation_monitor`,
+`tool_request_issue_relayer` e `tool_request_closure_monitor`. A mais cara é
+`tool_request_issue_relayer`: o efeito duplicado dela é **abrir duas issues no
+GitHub**.
+
+E há uma distinção que o harness ainda não sabe fazer, e precisa:
+
+- **duplicação entre RÉPLICAS** — dois processos rodando o mesmo tick. É a forma
+  que FI-04..FI-07 já injetam. Hoje ela é LATENTE, não atual: produção roda um
+  processo só (`MAIA_PROCESS_ROLE=all`; o split `scheduler`/`worker` está atrás
+  do perfil `split-roles`, desligado).
+- **duplicação entre JOBS DISTINTOS no mesmo processo** que compartilham um
+  efeito. É a que acontece HOJE — foi exatamente a forma do bug de dual approval
+  que a #691 fechou. O harness não tem cenário para ela, e ela não se reduz à
+  primeira: matar réplica não a reproduz, porque não há réplica envolvida.
+
 ## O que falta para fechar a #510
 
 1. `TurnDriver` (injetar inbound de verdade e acompanhar IDs pelo pipeline);
 2. os failpoints do caminho de OUTBOUND e de TOOL — hoje o único ponto de
    injeção com call site real é `after_turn_claim_before_running`, alcançado
    pelo fixture; os outros 15 nomes do catálogo continuam sem call site;
-3. FI-01/02/03, FI-08 a FI-25;
+3. FI-01/02/03, FI-08 a FI-25 — e, fora da matriz nominal, um cenário para a
+   duplicação ENTRE JOBS no mesmo processo (ver a seção acima);
 4. perfis `reliability:full` / `soak` e o gate blocking de CI (o script
    `npm run test:reliability` existe e roda a lane inteira com `--retry=0`);
 5. runbook de reprodução por FI-ID/seed e o template de cenário novo.
