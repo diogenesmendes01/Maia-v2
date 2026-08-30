@@ -133,6 +133,11 @@ const EXPECTED: Readonly<Record<ToolErrorCode, ToolDispatchOutcome>> = {
   // funcionando, não a plataforma quebrando. O evento já paga o seu alerta em
   // `maia_turn_lease_lost_total` e `maia_turn_effect_blocked_total`.
   turn_ownership_lost: 'blocked',
+  // #507 — o ORÇAMENTO do turno acabou e a ferramenta não começou. Mesma
+  // família do anterior: nada rodou, nada ficou pela metade, e a recusa é a
+  // feature. O que ela mede é dimensionamento de prazo, não outage — somá-la ao
+  // error rate faria um deadline apertado parecer a plataforma quebrando.
+  turn_deadline_exceeded: 'blocked',
   // --- the call was malformed: model/prompt quality ------------------------
   invalid_args: 'invalid',
   unknown_tool: 'invalid',
@@ -144,6 +149,12 @@ const EXPECTED: Readonly<Record<ToolErrorCode, ToolDispatchOutcome>> = {
   idempotency_owner_failed: 'error',
   idempotency_wait_timeout: 'error',
   idempotency_completion_fenced: 'error',
+  // #507 — a plataforma NÃO SABE se o efeito aconteceu. É o único código deste
+  // bloco que não descreve uma quebra, e ainda assim pertence a ele: cada ponto
+  // é uma reconciliação PENDENTE (uma linha `tool_effect_unknown` em
+  // `audit_logs`). Classificá-lo como refusal esconderia dívida real atrás de
+  // "governança funcionando".
+  effect_unknown: 'error',
 };
 
 describe('issue #535 — every code the tool boundary can return is classified', () => {
