@@ -45,7 +45,7 @@ import {
   describeSchemaBootFailure,
   SchemaBootAbortError,
 } from '@/runtime/lifecycle/schema-boot-gate.js';
-import { roleOwns, roleRequires } from '@/runtime/lifecycle/roles.js';
+import { getRoleContract, roleOwns, roleRequires } from '@/runtime/lifecycle/roles.js';
 import {
   installSignalHandlers,
   registerShutdownSequence,
@@ -54,11 +54,22 @@ import {
 
 async function main() {
   const role = lifecycle.setRole(config.MAIA_PROCESS_ROLE);
+  // Issue #513 — "o boot lista role e componentes/jobs ativos".
+  //
+  // A primeira linha do processo diz QUEM ele é: o papel, o que ele vai
+  // INICIAR e o que o `/readyz` vai EXIGIR dele. Sem isso, descobrir por que
+  // uma réplica não abriu socket (ou por que outra abriu) era ler
+  // `roles.ts` de cabeça contra uma variável de ambiente. O inventário dos
+  // JOBS sai depois, no passo 8, porque só ali se sabe quais grupos entraram.
+  const contract = getRoleContract(role);
   logger.info(
     {
       env: config.NODE_ENV,
       port: config.APP_PORT,
       role,
+      role_description: contract.description,
+      owns: contract.owns,
+      requires: contract.requires,
       instance_id: lifecycle.instanceId,
       grace_ms: config.SHUTDOWN_GRACE_MS,
     },
@@ -300,10 +311,24 @@ async function main() {
   });
 
   // ── 8. cron scheduler ──────────────────────────────────────────────────
+  // Issue #513 §5 — `startWorkers(1)` virou `startWorkers()`.
+  //
+  // O argumento `1` era o mecanismo operacional inteiro: todo job com
+  // `phase > 1` (16 deles) era descartado silenciosamente, e a única forma de
+  // saber disso era ler o `continue` dentro do laço. O que decide agora é uma
+  // lista de GRUPOS declarada em `MAIA_SCHEDULER_GROUPS` — cujo default
+  // reproduz exatamente o conjunto que `phase <= 1` agendava, para que a troca
+  // de mecanismo não ligue nada por acidente — e o inventário do que subiu (e
+  // do que ficou de fora, e de quais jobs habilitados duplicam efeito com mais
+  // de uma réplica) sai no log do boot.
   await lifecycle.runStartupStep('cron_scheduler', async () => {
     if (!roleOwns(role, 'cron_scheduler')) return;
-    startWorkers(1);
-    lifecycle.setComponent('cron_scheduler', 'ready');
+    const inventory = startWorkers();
+    lifecycle.setComponent(
+      'cron_scheduler',
+      'ready',
+      `${inventory.scheduled.length} jobs em ${inventory.groups_enabled.length} grupos`,
+    );
   });
 
   // ── 9. WhatsApp sessions ───────────────────────────────────────────────

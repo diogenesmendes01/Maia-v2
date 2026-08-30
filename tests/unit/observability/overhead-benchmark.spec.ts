@@ -562,4 +562,84 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
     // 2 counters + 2 histograms (9 bucket lines + sum + count each) = 24.
     expect(lines, `500 turns produced ${lines} series`).toBeLessThan(40);
   });
+
+  it('os quinze emissores novos da #535 não criam UMA série sequer', async () => {
+    // O orçamento de cardinalidade desta entrega, medido em vez de afirmado.
+    //
+    // A #535 fechou a lacuna "declarado mas nunca emitido" adicionando quinze
+    // emissores no caminho quente. A pergunta que decide se isso é barato não é
+    // "quanto custa um span" (o caso acima já responde: zero com tracing OFF) —
+    // é se algum deles carrega uma dimensão nova para a superfície do
+    // Prometheus. Nenhum carrega, e a razão é estrutural: TODOS emitem só span.
+    // Atributo de span vive num span exportado e não cria série temporal
+    // (`taxonomy.ts` §4), então `LABEL_CARDINALITY_BUDGET` fica intocado.
+    //
+    // A verificação é sobre o que SOBRA no registry: cem passagens por cada
+    // wrapper, com tracing LIGADO e o sink contando, e o `/metrics` continua
+    // exatamente do tamanho que estava.
+    cfg.endpoint = 'http://127.0.0.1:1/v1/traces';
+    let spans = 0;
+    setSpanSink(() => {
+      spans++;
+    });
+    const antes = (await renderPrometheus()).split('\n').filter(Boolean).length;
+    const {
+      instrumentAudienceResolve,
+      instrumentConstitutionalCheck,
+      instrumentDecisionEvaluate,
+      instrumentHandlerExecute,
+      instrumentIdempotencyClaim,
+      instrumentIdentityResolve,
+      instrumentOutboundCommit,
+      instrumentPermissionCheck,
+      instrumentPreturnGraph,
+      instrumentProcedureSelect,
+      instrumentPromptRender,
+      instrumentReactIteration,
+      instrumentRiskClassify,
+      instrumentRoleSelect,
+      instrumentTurnComplete,
+    } = await import('@/observability/instrumentation.js');
+
+    for (let i = 0; i < 100; i++) {
+      await instrumentIdentityResolve(async () => ({ kind: 'resolved' }));
+      await instrumentAudienceResolve(
+        async () => ({ ok: true }),
+        () => 'resolved' as const,
+      );
+      await instrumentPreturnGraph(2, async () => null);
+      await instrumentProcedureSelect(async () => ({ decision: 'none' }));
+      await instrumentRoleSelect(async () => ({ action: 'keep_current' }));
+      await instrumentDecisionEvaluate(
+        async () => ({ mode: 'act' }),
+        (v) => ({ decision: v.mode, blocked: false }),
+      );
+      await instrumentRiskClassify(async () => ({
+        level: 'low',
+        requires_human_review: false,
+      }));
+      await instrumentPromptRender(async () => ({ messages: [1, 2, 3] }));
+      await instrumentReactIteration(1, async () => null);
+      instrumentConstitutionalCheck('listar', () => null, () => 'ok');
+      instrumentPermissionCheck('listar', 1, () => null, () => 'allowed');
+      await instrumentIdempotencyClaim('listar', async () => ({}), () => 'reserved');
+      await instrumentHandlerExecute('listar', async () => null);
+      await instrumentOutboundCommit(
+        async () => ({ committed: true }),
+        () => 'committed',
+      );
+      await instrumentTurnComplete('reply_delivered', async () => undefined);
+    }
+
+    // Os spans SAÍRAM — senão isto mediria a ausência de instrumentação, que é
+    // trivialmente barata e não é o que se quer afirmar. E são os QUINZE: um
+    // wrapper esquecido nesta lista sairia do orçamento sem ninguém notar, que
+    // é a forma silenciosa deste caso falhar.
+    expect(spans, 'nenhum span foi emitido; o caso não mediria nada').toBe(15 * 100);
+    const depois = (await renderPrometheus()).split('\n').filter(Boolean).length;
+    expect(
+      depois - antes,
+      `1500 spans dos emissores novos criaram ${depois - antes} séries novas`,
+    ).toBe(0);
+  }, 60_000);
 });

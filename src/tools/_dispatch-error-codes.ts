@@ -58,6 +58,15 @@ export const DISPATCHER_ERROR_CODES = [
   'idempotency_wait_timeout',
   'idempotency_completion_fenced',
   'turn_ownership_lost',
+  // Issue #507 — o orçamento do turno acabou ANTES de a ferramenta começar.
+  // Distinto de `turn_ownership_lost` de propósito: ali a tentativa deixou de
+  // ser nossa, aqui ela ainda é — o que acabou foi o tempo. As triagens são
+  // diferentes (takeover versus orçamento mal dimensionado), e um código só
+  // apagaria a diferença justo no incidente em que ela importa.
+  'turn_deadline_exceeded',
+  // Issue #507 — o cancelamento chegou DEPOIS de o handler poder ter causado
+  // efeito, e a ferramenta não é `abort_safe`. A resposta honesta é "não sei".
+  'effect_unknown',
   'execution_failed',
 ] as const;
 
@@ -113,6 +122,11 @@ export const TOOL_REFUSAL_CODES: readonly ToolErrorCode[] = Object.freeze([
   // `MaiaToolErrorRateHigh` faria um evento paginar duas vezes e tornaria o
   // error rate de tools ilegível durante um takeover legítimo.
   'turn_ownership_lost',
+  // #507 — o prazo do turno acabou e a ferramenta NÃO COMEÇOU. Mesma família
+  // do `turn_ownership_lost`: é o orçamento funcionando, nada rodou e nada
+  // ficou pela metade. Um orçamento apertado demais aparece como um pico aqui,
+  // e o lugar de olhar é o dimensionamento do deadline — não o error rate.
+  'turn_deadline_exceeded',
 ]);
 
 /**
@@ -142,6 +156,13 @@ export const TOOL_FAILURE_CODES: readonly ToolErrorCode[] = Object.freeze([
   'idempotency_owner_failed',
   'idempotency_wait_timeout',
   'idempotency_completion_fenced',
+  // #507 — a plataforma NÃO SABE se o efeito aconteceu. Vai para o error SLI de
+  // propósito, e é o único código aqui que não descreve uma quebra: descreve
+  // uma DÍVIDA. Cada ponto desta série é uma reconciliação pendente — uma linha
+  // `tool_effect_unknown` em `audit_logs` esperando alguém descobrir o que de
+  // fato aconteceu. Contá-lo como refusal esconderia exatamente o que precisa
+  // ser visto; contá-lo como sucesso seria a mentira que a #507 fecha.
+  'effect_unknown',
 ]);
 
 /**

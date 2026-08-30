@@ -322,6 +322,7 @@ export function rowMatches(row: StoreRow, terms: Term[], now: Date): boolean {
  *   - `expira_em < now()`                               (pending_questions)
  *   - `<col> < now() - interval 'N days'`               (conversas staleness)
  *   - `status IN ('a','b',...)`                         (workflows listPending — #345 Batch D)
+ *   - `<col> <= now()`                                  (workflows expireIfDue — CAS de vencimento)
  * Throws on anything else so a future predicate change can't silently pass.
  */
 function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
@@ -329,6 +330,14 @@ function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
   if (due) {
     const exp = toDate(row.expira_em);
     return !!exp && exp.getTime() < now.getTime();
+  }
+  // `<col> <= now()` — o CAS de vencimento de dual approval
+  // (`workflowsRepo.expireIfDue`). O `<=` é deliberado e diferente do `<`
+  // acima: o prazo que cai exatamente em `now()` JÁ venceu.
+  const dueLe = /^(\w+)\s*<=\s*now\(\)$/i.exec(text);
+  if (dueLe) {
+    const v = toDate(row[dueLe[1]!] as unknown);
+    return !!v && v.getTime() <= now.getTime();
   }
   const stale = /^(\w+)\s*<\s*now\(\)\s*-\s*interval\s*'(\d+)\s*days?'$/i.exec(text);
   if (stale) {

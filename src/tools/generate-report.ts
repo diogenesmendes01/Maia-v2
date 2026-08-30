@@ -59,6 +59,7 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
   // to be authorized for either path. (Single-user Maia: owner has both.)
   required_actions: ['read_transactions', 'read_reports'],
   side_effect: 'read',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'read',
   audit_action: 'classification_suggested', // generic read action; the actual send is audited separately as `outbound_sent_document`

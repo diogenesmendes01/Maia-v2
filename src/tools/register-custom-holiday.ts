@@ -38,6 +38,7 @@ export const registerCustomHolidayTool: Tool<typeof inputSchema, typeof outputSc
   output_schema: outputSchema,
   required_actions: ['manage_calendar'],
   side_effect: 'write',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'manage_calendar',

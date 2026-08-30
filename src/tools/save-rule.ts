@@ -39,6 +39,7 @@ export const saveRuleTool: Tool<typeof inputSchema, typeof outputSchema> = {
   output_schema: outputSchema,
   required_actions: ['read_balance'],
   side_effect: 'write',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'rule_learned',

@@ -2692,6 +2692,20 @@ export const ENV_CONTRACT = {
     fixture: 'all',
     restartRequired: true,
   },
+  // Issue #513 §5 — o que SUBSTITUI `phase: number` como mecanismo.
+  MAIA_SCHEDULER_GROUPS: {
+    name: 'MAIA_SCHEDULER_GROUPS',
+    description:
+      'Grupos de jobs de cron que ESTE processo agenda, separados por vírgula, ou `all` para todos. Vazio = o conjunto default, que reproduz exatamente o comportamento do antigo `startWorkers(1)`: turn-pipeline, outbound, scheduling, channel, monitoring, housekeeping, ops-backup. Os grupos console, cognition, procedures, proactive e governance nascem DESLIGADOS — eram os jobs que `phase > 1` descartava em silêncio, e ligá-los é uma decisão de operação (proactive, em particular, ESCREVE para o usuário). Nome desconhecido é ERRO de boot, nunca um grupo ignorado. Inventário completo e classificação de concorrência de cada job: src/workers/job-contract.ts e docs/architecture/modules/workers.md.',
+    group: 'lifecycle',
+    secret: false,
+    services: ['runtime'],
+    schema: z.string().default(''),
+    example: 'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
+    fixture: 'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   SHUTDOWN_GRACE_MS: {
     name: 'SHUTDOWN_GRACE_MS',
     description:

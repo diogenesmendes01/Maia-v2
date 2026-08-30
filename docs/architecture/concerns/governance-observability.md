@@ -298,8 +298,14 @@ the id makes every process reach the same verdict with nothing to propagate.
 
 The taxonomy can no longer overstate coverage: `SPAN_EMISSION` marks each span
 `emitted` or `declared`, and `tests/unit/observability/tracer.spec.ts` fails if
-the two drift. Today `turn`, `queue.wait`, `tool.dispatch` and `context.load`
-are emitted; the other 19 are declared.
+the two drift. **Every span in the taxonomy is now `emitted`** — the owner's
+ruling on #535 was that a span living only in the declaration is debt, so the
+nineteen names that had none either got a real emitter on the production path or
+left the taxonomy with an individual written reason
+(`SPANS_REMOVED_IN_535`: `ingress.normalize`, `ingress.persist`,
+`whatsapp.send`, all three removed because the `turn` span they were declared
+under does not overlap them in time). A separate case asserts the `declared` set
+is empty, so "we will wire it later" cannot re-enter through the table.
 
 `emitted` means **production reaches this span** — not "an instrumentation site
 exists in the tree". The review of PR #554 settled that reading and it is the
@@ -455,10 +461,24 @@ Issue #514 landed the foundation; issue #535 landed the exporter, four of the
 five missing metric families and the dashboards. Still open — do **not** assume
 coverage that does not exist:
 
-- **Span emission is partial.** `turn`, `queue.wait`, `tool.dispatch`,
-  `context.load` and `llm.request` have emitters production reaches; the other
-  18 taxonomy entries are marked `declared` in `SPAN_EMISSION` and produce
-  nothing. The marking is test-enforced, so this list cannot silently go stale.
+- **Span emission is complete, and three names left to make it true.** Every
+  entry in `SPAN_EMISSION` is `emitted`, each with a wiring test that enters
+  through a production entry point — `tests/integration/turn-span-tree-hot-path.spec.ts`
+  drives `runAgentForMensagem` for the turn tree,
+  `tests/unit/tools/dispatcher-gate-spans.spec.ts` drives `dispatchTool` for the
+  four gates. What is NOT covered by a turn is stated in that spec rather than
+  implied: a text-only turn opens no `tool.dispatch`, and `queue.wait` needs a
+  BullMQ job. `ingress.normalize`, `ingress.persist` and `whatsapp.send` were
+  removed with per-span reasons in `SPANS_REMOVED_IN_535` — all three sit
+  outside the `turn` span's lifetime (the two ingress ones end before it starts;
+  the send happens in the delivery worker after it closes), so the parentage the
+  tree declared for them is impossible, not merely unimplemented.
+- **Three declared parents were corrected to match the code**: `context.load`
+  now hangs under `prompt.render` (its emitter is called by `buildPrompt`),
+  `outbound.commit` under `react.iteration` (reached from `safeDispatchOutput`
+  inside the loop), and `risk.classify` under `decision.evaluate` (the pre-turn
+  graph has exactly two nodes, neither of them risk). `isDeclaredAncestor()`
+  would have rejected the real runtime parent in all three cases.
 - **`llm.request` is emitted from `emitUsage`, not from `executeLLM`.** The
   gateway has six terminal paths and issue #508 already collapsed all of them
   onto one telemetry emission point precisely because per-path emission had let
