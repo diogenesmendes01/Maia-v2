@@ -57,16 +57,17 @@ Loading itself is two phases, and that split is a cost decision:
 ### Round-trip cost
 
 Counted at the repository boundary for a typical turn (no active procedure);
-`resolveScope`'s two queries are included, because a turn pays them.
+`resolveScope`'s query is included, because a turn pays it.
 
 | entities | 1 | 10 | 100 |
 |---|---|---|---|
 | before #511 | 17 | 35 | 215 |
 | after #511/#524, cold, legacy `self_state` | 15 | 15 | 15 |
 | after #511/#524, cold, operational profile v2 | 14 | 14 | 14 |
-| **after #525, cold, legacy `self_state`** | **13** | **13** | **13** |
-| **after #525, cold, operational profile v2** | **12** | **12** | **12** |
-| after #525, warm cache, operational profile v2 | 11 | 11 | 11 |
+| after #525 rodada 1, cold, legacy `self_state` | 13 | 13 | 13 |
+| **after #525 + JOIN do escopo, cold, legacy `self_state`** | **12** | **12** | **12** |
+| **after #525 + JOIN do escopo, cold, operational profile v2** | **11** | **11** | **11** |
+| after #525 + JOIN do escopo, warm cache, operational profile v2 | 10 | 10 | 10 |
 
 The slope is zero — scope size does not multiply round-trips against the fixed
 10-connection pool in `src/db/client.ts`. That, not the cache, is where the win
@@ -158,8 +159,8 @@ on purpose: a span around `buildPrompt` would also cover the render and would
 contain `prompt.render`, which `SPAN_PARENT` declares a SIBLING of
 `context.load` under `turn`.
 
-**What #525 removed, and why it was removable.** Both cuts are duplication, not
-behaviour:
+**What #525 removed, and why it was removable.** Three cuts. As duas primeiras
+são duplicação; a terceira é ESPERA:
 
 - the gap catalogue was read twice — `listByLevel('mentionable')` for the
   self-awareness clause and `listByLevels([mentionable, proposed])` for the
@@ -168,7 +169,28 @@ behaviour:
 - entity NAMES and entity STATES were two reads of the same entity set joined on
   `entity_states.entidade_id = entidades.id`. `entidadesRepo.byIdsWithState` is
   that LEFT JOIN. The same change bound `(tenant_id, agent_id)` on
-  `entidadesRepo.byIds`, which had been matching on id alone.
+  `entidadesRepo.byIds`, which had been matching on id alone;
+- `resolveScope` lia `permissoes` e **depois** `permission_profiles`, com os
+  `profile_id` colhidos da primeira leitura. Duas idas em SÉRIE: a segunda não
+  podia começar antes de a primeira voltar. `permissoesRepo.forPessoaComProfile`
+  é o `INNER JOIN` que faz as duas de uma vez. Medido, uma entidade em escopo:
+  **1,46 ms → 0,97 ms de p50** (`tests/integration/turn-context-escopo-real-db.spec.ts`).
+
+  Este é o CAMINHO DE AUTORIZAÇÃO, então o que a fusão não pode fazer é pular
+  checagem para economizar ida ao banco. Não pula: o `INNER` é literalmente o
+  `if (!profile) continue` (sem profile, sem grant), o `ON` liga
+  `(tenant_id, agent_id)` dos DOIS lados — a proteção que a #511 trouxe ao
+  trocar `byId` por `byIds`, agora expressa no SQL —, e `mergeLimits` continua
+  sendo aplicado por permissão, então um `limites` explícito continua ganhando
+  do `limite_default` do profile.
+
+  O que MUDA: o teto de 500 profiles distintos do `profilesRepo.byIds` não se
+  aplica ao join. Aquele teto não era regra de autorização, era corte de
+  recurso — e o efeito dele era NEGAR um grant real cujo profile caísse fora do
+  recorte por ordem de id. O join resolve todos. Isso não alarga autorização
+  nenhuma (cada linha continua exigindo permissão ATIVA da pessoa e profile do
+  MESMO tenant/agent); o statement continua limitado pelo número de permissões
+  da pessoa, que é o que `forPessoa` já lia sem teto.
 
 The two halves of that JOIN have **different cardinality**, and the first cut
 got it wrong (PR #541 review, finding 2): it applied one `LIMIT 500` to the
@@ -185,33 +207,68 @@ with no state row already had. Still one statement.
 `tests/integration/turn-context-scope-cardinality.spec.ts` holds it with 501
 entities on one profile.
 
-**The ≤8 target of issue #525 is NOT met** (`TURN_ROUND_TRIP_TARGET`). Every
-remaining read is a different table, so closing the gap needs cross-table
-statements rather than de-duplication. The candidates, with what each is worth:
+**The ≤8 target of issue #525 is NOT met** (`TURN_ROUND_TRIP_TARGET`), e a
+razão deixou de ser "ainda não tentamos": foi tentada, ficou correta, e foi
+DESFEITA porque o benchmark reprovou. Esta seção é o registro dessa medição.
 
-| merge | saves | why not yet |
-|---|---|---|
-| `permissoes ⋈ permission_profiles` in `resolveScope` | 1 | authorization path; changing it is out of scope for a performance change |
-| `agent_capabilities_skill ∪ agent_capability_gaps` | 1 | needs a `UNION ALL` over a projected common shape |
-| `agent_facts ∪ learned_rules` | 1 | same, and `learned_rules.confianca` is `numeric` — a jsonb round-trip renders `0.8` where the prompt says `0.80`, changing the bytes |
-| `memory_entry ∪ behavioral_hint` | 1 | the memory read carries a `LIMIT`, so its union branch needs a subquery |
-| `operational_profile_versions ∪ self_state` | 1 (legacy path only) | would read `self_state` unconditionally, on every turn |
+### O que custa um round-trip, e o que custa fundir dois
 
-None of these is expressible as a plain drizzle join, and none can be verified
-without a live Postgres, so they belong in a change that can run the integration
-suite while making them.
+As quatro idas que separam 12 de 8 só saem fundindo tabelas DIFERENTES num
+statement só. Isso foi implementado por inteiro — `agent_facts ∪ learned_rules`,
+`memory_entry ∪ behavioral_hint`, `agent_capabilities_skill ∪
+agent_capability_gaps` e `operational_profile_versions ∪ self_state`, como
+`UNION ALL` de colunas reais com os buracos preenchidos por `NULL::<tipo>` (não
+por `jsonb`, que normalizaria `numeric` e mudaria os bytes do prompt). O
+resultado passou em tudo o que se pede de correção: **oito statements exatos**,
+**prompt byte-idêntico** ao golden, escopo por `tenant_id + agent_id` em cada
+metade de cada fusão, teto de seis leituras concorrentes preservado.
 
-**And they would buy almost nothing.** That is now measured rather than argued —
-see "The performance gate" below. The `warm` arm already runs the turn with
-**nine** reads instead of ten (the identity read is served from the process
-cache), and its p95 does not improve: 60.1 ms cold against 66.5 ms warm on the
-same run, i.e. one fewer round-trip is inside the run-to-run noise. Replaying
-each measured turn's read latencies through the same 6-permit gate with the two
-`UNION ALL` merges applied models a saving of **1.9 ms (3.2 % of p95) cold** and
-**4.4 ms (6.7 %) warm**. Ten tasks against six permits is two waves; eight tasks
-against six permits is still two waves, so the merges shorten the second wave
-instead of removing it. Whether 13 stays the budget is the owner's call, but the
-number that call would be made on is no longer a guess.
+E foi desfeito, porque o p95 da carga de contexto TRIPLICOU. Medido com
+`npm run turn:bench` (50 pares, concorrência 20, 45 s sustentados, identidade
+`legacy`), duas corridas com a ordem dos braços invertida entre elas:
+
+| corrida | leituras/turno | p50 | p95 | p99 | turnos na janela |
+|---|---|---|---|---|---|
+| sem as fusões | 11 | 18,6 ms | 73,5 ms | 157,2 ms | 5030 |
+| com as fusões (8 statements) | 7 | 164,8 ms | 300,8 ms | 470,1 ms | 2616 |
+| sem as fusões (ordem invertida) | 11 | 22,5 ms | 72,2 ms | 123,7 ms | 4920 |
+| com as fusões (ordem invertida) | 7 | 129,4 ms | 228,5 ms | 271,5 ms | 3008 |
+
+O mecanismo, em três medidas — as duas primeiras estão travadas em
+`tests/integration/turn-context-custo-de-fundir-real-db.spec.ts`, que fica
+VERMELHO se algum dia deixarem de valer:
+
+1. **A ida ao banco é a menor parte do preço de uma leitura.** Um round-trip
+   vazio custa ~0,15 ms; a leitura mais barata do turno custa ~0,42 ms. "Menos
+   round-trips" só é sinônimo de "mais rápido" quando o round-trip domina o
+   preço, e ele não domina.
+2. **Fundir dois ramos custa mais para PLANEJAR que qualquer um deles sozinho** —
+   4× o pior ramo, medido; e o planejamento domina a execução em ~4× neste
+   volume de dados. Um `UNION ALL` com padding tipado é uma consulta larga com
+   dois `WindowAgg`, um `Append` e um `Sort`; planejar isso não é de graça.
+3. **As leituras do turno já são CONCORRENTES** (seis permissões, ver
+   "Concurrency ceiling" acima), então o turno paga o **máximo** do conjunto, e
+   não a soma. Trocar duas leituras concorrentes por uma leitura mais lenta
+   alonga justamente esse máximo.
+
+A conclusão que interessa a quem herdar isto: **a contagem de round-trips deixou
+de medir o que media quando a #511 a escolheu.** Enquanto as leituras eram
+sequenciais — um `profilesRepo.byId` por permissão, um `entityStatesRepo.byId`
+por entidade —, contagem e latência andavam juntas, e cortar a contagem cortava
+o relógio. Desde que passaram a sair concorrentes e limitadas por um portão, a
+contagem virou proxy de nada: dá para baixá-la de 12 para 8 e ficar três vezes
+mais lento.
+
+Isso também explica por que o JOIN do `resolveScope` VALE e as quatro fusões
+não: aquelas duas leituras eram SEQUENCIAIS (a segunda esperava os `profile_id`
+da primeira), então juntá-las encurta o caminho crítico de verdade. O critério
+não é "quantas leituras", é "quantas ESPERAS em série".
+
+O que ainda poderia mudar essa conta, e por que não foi tentado aqui:
+`PREPARE`/plan cache tiraria o planejamento da conta — mas ele barateia
+igualmente as leituras NÃO fundidas, então a fusão continuaria perdendo para o
+`max()`; e adotar prepared statements nomeados sobre um pool (e sob pgbouncer)
+é uma mudança de infraestrutura com revisão própria, não um detalhe desta issue.
 
 ### The performance gate (`npm run turn:bench`)
 
@@ -552,7 +609,8 @@ transação única).
 | Add a new pending-question type | Extend `pending-questions.ts` (under `src/workflows/`); resolver in `pending-resolver.ts` |
 | Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121) + o inventário de [`src/runtime/outbound/send-paths.ts`](../../../src/runtime/outbound/send-paths.ts), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
 | Change prompt structure | Edit `prompt-builder.ts`; keep `<user_message>` / `<ocr>` / `<audio_transcript>` delimiters for injection safety |
-| Add data to the prompt | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise |
+| Add data to the prompt | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise. Subir o orçamento também aumenta a DISTÂNCIA até `TURN_ROUND_TRIP_TARGET`, que a mesma spec afirma exatamente: a conta não passa despercebida |
+| Cortar uma leitura do turno | Primeiro pergunte se as duas leituras são SEQUENCIAIS. Se forem (uma espera a outra), juntá-las encurta o caminho crítico e vale. Se já saem concorrentes sob o portão de 6, juntá-las alonga o `max()` que define a latência do turno — medido em `tests/integration/turn-context-custo-de-fundir-real-db.spec.ts`. Contagem de round-trips não é latência desde a #525 |
 
 ## Public surface
 
@@ -566,7 +624,10 @@ transação única).
 | Test path | What it covers |
 |---|---|
 | `tests/unit/turn-context-round-trips.spec.ts` | The round-trip budget: exact counts, the named read set, and that the renderer costs zero |
-| `tests/unit/turn-context-statement-count.spec.ts` | The same budget counted in SQL STATEMENTS (real repos + real drizzle, only `pg` faked), plus tenant+agent scoping on every statement |
+| `tests/unit/turn-context-statement-count.spec.ts` | The same budget counted in SQL STATEMENTS (real repos + real drizzle, only `pg` faked), plus tenant+agent scoping em cada TABELA lida — por tabela, não por statement, porque um statement que lê duas (o JOIN do escopo, o `NOT EXISTS` dos fatos) passaria com só uma das metades escopada |
+| `tests/integration/turn-context-prompt-bytes-real-db.spec.ts` | O prompt inteiro, byte a byte, contra goldens capturados ANTES da mudança — três turnos, com as armadilhas de tipo (`numeric` renderizado, `timestamptz` com `.getTime()`, `jsonb` aninhado). Mede também a contagem de statements na MESMA execução |
+| `tests/integration/turn-context-escopo-real-db.spec.ts` | O JOIN do `resolveScope`: um statement, fail-closed sem profile, nenhum profile de outro tenant, precedência de limites, e o ganho medido contra as duas leituras em série |
+| `tests/integration/turn-context-custo-de-fundir-real-db.spec.ts` | Por que a meta de ≤8 foi recusada, em forma executável: round-trip vazio contra leitura, e planejamento de um `UNION ALL` contra o de cada ramo. Fica vermelho se a conta se inverter |
 | `tests/unit/turn-context-renderer-purity.spec.ts` | The renderer runs with every repository rigged to throw |
 | `tests/unit/turn-context-baseline.spec.ts` | Zero slope + `resolveScope` batching and its cross-tenant counterfactual |
 | `tests/unit/turn-context-read-gate.spec.ts` | The semaphore's contract: ceiling, FIFO order, permit released on rejection |
@@ -588,13 +649,17 @@ At last verification (2026-05-28):
 
 - Skill execution via `runSkill` from decision engine (#216 — merged)
 - AbortSignal plumbed from skill runner to LLM call (#221 — merged)
-- Turn-context loader integrated + pure renderer (#525 — this change). Still
-  open in #525: the ≤8 round-trip target, and returning `capabilities`/`gaps`
-  to the cache (decision to keep them out is recorded above).
+- Turn-context loader integrated + pure renderer (#525). Still open in #525:
+  returning `capabilities`/`gaps` to the cache (decision to keep them out is
+  recorded above).
+- **A meta de ≤8 da #525 foi implementada e MEDIDA, e o resultado foi recusado**
+  — ver "O que custa um round-trip, e o que custa fundir dois" acima. O
+  orçamento é 12; a distância até a meta é 4, e está afirmada por teste para não
+  ser arredondada. A decisão de manter ou retirar a meta de ≤8 é do dono; o que
+  esta mudança acrescenta é que ela deixou de ser uma escolha entre um número
+  atingido e um não atingido: ir de 12 a 8 é possível e triplica o p95.
 - Performance gate for #525 (`npm run turn:bench`, `scripts/turn-context-benchmark.ts`).
-  The measured run is green on every criterion; whether 13 becomes the definitive
-  budget or the ≤8 target stays open is an **owner decision** and this change does
-  not take it — it supplies the numbers the decision needs.
+  The measured run is green on every criterion.
 - PR #541 review follow-up: the shared read gate (finding 1) and the JOIN's
   entity-side cardinality (finding 2), both described above.
 
