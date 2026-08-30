@@ -81,6 +81,12 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
   output_schema: outputSchema,
   required_actions: ['create_transaction'],
   side_effect: 'write',
+  // Issue #507 — cancelar depois que o handler começou deixa `effect_unknown`:
+  // pode existir uma linha no razão. A compensação é EXPLÍCITA e existe no
+  // registro (`cancel_transaction`), então a reconciliação é procedimento, não
+  // improviso — por isso `compensatable` e não `non_interruptible`.
+  effect_class: 'compensatable',
+  compensated_by: 'cancel_transaction',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'transaction_created',

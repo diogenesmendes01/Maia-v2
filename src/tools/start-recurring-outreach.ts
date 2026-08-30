@@ -53,6 +53,7 @@ export const startRecurringOutreachTool: Tool<typeof inputSchema, typeof outputS
   output_schema: outputSchema,
   required_actions: ['send_proactive_message'],
   side_effect: 'communication',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'series_created',

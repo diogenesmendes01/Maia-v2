@@ -45,6 +45,11 @@ export const handoffToOwnerTool: Tool<typeof inputSchema, typeof outputSchema> =
   output_schema: outputSchema,
   required_actions: ['escalate_to_owner'],
   side_effect: 'communication',
+  // Issue #507 — `communication` no `side_effect` descreve a INTENÇÃO (o turno
+  // vai escalar), mas o handler é um ato de fala puro: devolve um status e não
+  // envia nada. Quem envia é o outbound do turno, que tem o próprio limite de
+  // efeito. Cancelar aqui não deixa nada para reconciliar.
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'communicate',
   audit_action: 'owner_handoff_requested',
