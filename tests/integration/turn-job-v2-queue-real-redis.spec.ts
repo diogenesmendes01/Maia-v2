@@ -108,10 +108,13 @@ d('#504 — o produtor emite o payload V2 (Redis real)', () => {
     // fila — e a fila é COMPARTILHADA: o worker de outra suíte pode ter
     // consumido este job antes desta linha, movendo-o para `completed`. A
     // propriedade sob teste é a FORMA do payload, não em que estado ele está.
+    // `'paused'` saiu da lista na migração para a BullMQ 6: lá pausar a fila
+    // grava um campo no hash `meta` e deixa os jobs em `wait`, então `'paused'`
+    // não é mais estado de job (saiu de `JobType`) e a consulta por esse nome
+    // devolve `[]` sempre. `'waiting'` cobre o caso que ele cobria.
     const jobs = await agentQueue.getJobs([
       'waiting',
       'delayed',
-      'paused',
       'active',
       'completed',
       'failed',
