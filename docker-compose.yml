@@ -173,6 +173,18 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-maia}:${POSTGRES_PASSWORD:-maia}@postgres:5432/${POSTGRES_DB:-maia}
       REDIS_URL: redis://redis:6379
       TZ: America/Sao_Paulo
+    # Issue #513 — este compose de DEV é monolítico de propósito: um processo,
+    # `MAIA_PROCESS_ROLE=all` (o default). A separação de papéis
+    # (`scheduler`/`worker` em serviços próprios) vive em `compose.prod.yml`,
+    # atrás do profile `split-roles`, porque o que ela entrega — reiniciar a
+    # API sem derrubar os crons, escalar worker sem multiplicar scheduler — não
+    # tem análogo numa máquina de dev.
+    #
+    # O que É útil aqui: `MAIA_SCHEDULER_GROUPS` no seu `.env`, para ligar um
+    # grupo de jobs que nasce desligado (`cognition`, `console`, `proactive`,
+    # `procedures`, `governance`) e ver o inventário no boot. A tabela dos
+    # grupos está em docs/architecture/modules/workers.md; o procedimento, em
+    # docs/runbooks/process-roles.md §2.
     ports:
       - "${APP_PORT:-3000}:3000"
     volumes:
