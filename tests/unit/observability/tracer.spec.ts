@@ -272,6 +272,18 @@ describe('issue #535 — tracer', () => {
       }
     });
 
+    it('no span is merely DECLARED — the whole point of the #535 ruling', () => {
+      // The owner's criterion, as a test: "zero span apenas `declared`". A span
+      // that exists only in the declaration reads as coverage and delivers
+      // none. Adding a name here without an emitter now fails HERE, before the
+      // more detailed pin below, with the reason spelled out.
+      const declared = SPAN_NAMES.filter((s) => SPAN_EMISSION[s] === 'declared');
+      expect(
+        declared,
+        'every span must have a production emitter, or leave with a justification in SPANS_REMOVED_IN_535',
+      ).toEqual([]);
+    });
+
     it('the emitted set is exactly what production reaches', () => {
       // Update BOTH sides together. Adding a name to SPAN_EMISSION that no
       // production path reaches is precisely the "declared reads as covered"
@@ -292,24 +304,47 @@ describe('issue #535 — tracer', () => {
       // `executeLLM` already passes through, and
       // `tests/unit/observability/llm-request-span.spec.ts` drives the real
       // `executeLLM` — not a stand-in — to prove a turn's model call opens it.
-      expect([...EMITTED_SPANS].sort()).toEqual(
-        [
-          SPAN.CONTEXT_LOAD,
-          SPAN.LLM_REQUEST,
-          SPAN.QUEUE_WAIT,
-          SPAN.TOOL_DISPATCH,
-          SPAN.TURN,
-        ].sort(),
-      );
+      //
+      // Since the #535 ruling the answer is "all of them": the nineteen names
+      // that had no emitter either got one (fourteen of them, plus the parent
+      // corrections that made three of those nestable) or left the taxonomy
+      // with a written reason (`SPANS_REMOVED_IN_535`). This list is therefore
+      // the whole span vocabulary — which is the state the issue asked for, and
+      // the state the case above keeps.
+      expect([...EMITTED_SPANS].sort()).toEqual([...SPAN_NAMES].sort());
     });
 
-    it('the runtime parent of an emitted span is a DECLARED ancestor', async () => {
-      // `tool.dispatch` declares `react.iteration` as its parent, which has no
-      // emitter, so at runtime it attaches to `turn`. That is correct — but it
-      // must still be an ancestor, not an arbitrary span.
+    it('the runtime parent of an emitted span is a DECLARED ancestor', () => {
+      // `tool.dispatch` declares `react.iteration` as its parent. Until #535
+      // that parent had no emitter, so at runtime the dispatch attached to
+      // `turn` — correct, but flat. Now `react.iteration` IS emitted
+      // (`src/agent/react-loop.ts`), so the declared parent is also the runtime
+      // one; `turn` stays an ancestor either way, which is what keeps the
+      // relation true for the paths that dispatch outside the loop.
       expect(SPAN_PARENT[SPAN.TOOL_DISPATCH]).toBe(SPAN.REACT_ITERATION);
       expect(isDeclaredAncestor(SPAN.TOOL_DISPATCH, SPAN.TURN)).toBe(true);
       expect(isDeclaredAncestor(SPAN.TURN, SPAN.TOOL_DISPATCH)).toBe(false);
+    });
+
+    it('the three CORRECTED parents match where the emitter actually runs', () => {
+      // The corrections are load-bearing, not cosmetic: with the old values
+      // `isDeclaredAncestor` would reject the real runtime parent of each of
+      // these, which is the check that catches instrumentation nested under the
+      // wrong span. Pinned so a revert has to argue with the code.
+      //
+      // `context.load` is emitted by `loadTurnContext`, called from
+      // `buildPrompt` — so its parent is `prompt.render`, not `turn`.
+      expect(SPAN_PARENT[SPAN.CONTEXT_LOAD]).toBe(SPAN.PROMPT_RENDER);
+      expect(isDeclaredAncestor(SPAN.CONTEXT_LOAD, SPAN.TURN)).toBe(true);
+      // `outbound.commit` is reached from `safeDispatchOutput` inside the ReAct
+      // loop — so its parent is `react.iteration`, with `turn` still above it
+      // for the paths that dispatch outside the loop.
+      expect(SPAN_PARENT[SPAN.OUTBOUND_COMMIT]).toBe(SPAN.REACT_ITERATION);
+      expect(isDeclaredAncestor(SPAN.OUTBOUND_COMMIT, SPAN.TURN)).toBe(true);
+      // `risk.classify` is step 3 of the Decision Engine, not a node of the
+      // pre-turn graph (which has exactly two, neither of them risk).
+      expect(SPAN_PARENT[SPAN.RISK_CLASSIFY]).toBe(SPAN.DECISION_EVALUATE);
+      expect(isDeclaredAncestor(SPAN.RISK_CLASSIFY, SPAN.PRETURN_GRAPH)).toBe(false);
     });
   });
 });

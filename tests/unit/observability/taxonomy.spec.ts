@@ -3,6 +3,7 @@ import {
   SPAN,
   SPAN_NAMES,
   SPAN_PARENT,
+  SPANS_REMOVED_IN_535,
   METRIC,
   METRIC_NAMES,
   ALLOWED_LABEL_KEYS,
@@ -48,7 +49,47 @@ describe('issue #514 — observability taxonomy', () => {
     it('covers the minimum stages the issue requires', () => {
       // Issue #514 §2 — the literal tree. If a stage is dropped from the
       // taxonomy, the SLI it feeds silently disappears; this is the guard.
+      //
+      // Issue #535 removed THREE of the names #514 drew — `ingress.normalize`,
+      // `ingress.persist` and `whatsapp.send` — under the owner's rule that a
+      // span living only in the declaration is debt. They are not silently
+      // absent from this list: `SPANS_REMOVED_IN_535` in the taxonomy carries
+      // the individual technical reason for each, and the case below asserts
+      // that this list and that record partition the #514 tree exactly, so a
+      // fourth name cannot quietly disappear from either side.
       for (const required of [
+        'turn',
+        'queue.wait',
+        'identity.resolve',
+        'audience.resolve',
+        'preturn.graph',
+        'role.select',
+        'procedure.select',
+        'risk.classify',
+        'decision.evaluate',
+        'context.load',
+        'prompt.render',
+        'react.iteration',
+        'llm.request',
+        'tool.dispatch',
+        'permission.check',
+        'constitutional.check',
+        'idempotency.claim',
+        'handler.execute',
+        'outbound.commit',
+        'turn.complete',
+      ]) {
+        expect(SPAN_NAMES).toContain(required);
+      }
+    });
+
+    it('every name #514 drew is either still a span or has a written removal reason', () => {
+      // The guard on the removal record itself. Without it, dropping a fourth
+      // name would only mean deleting a line from the list above — which is the
+      // silent shrink the `SPANS_REMOVED_IN_535` doc exists to prevent. Here the
+      // #514 tree is pinned once, and every member must be accounted for on
+      // exactly one side of the split.
+      const DECLARED_BY_514 = [
         'turn',
         'ingress.normalize',
         'ingress.persist',
@@ -72,8 +113,22 @@ describe('issue #514 — observability taxonomy', () => {
         'outbound.commit',
         'whatsapp.send',
         'turn.complete',
-      ]) {
-        expect(SPAN_NAMES).toContain(required);
+      ];
+      const removed = Object.keys(SPANS_REMOVED_IN_535);
+      for (const name of DECLARED_BY_514) {
+        const isSpan = (SPAN_NAMES as readonly string[]).includes(name);
+        const isRemoved = removed.includes(name);
+        expect(
+          isSpan !== isRemoved,
+          `${name} must be either an emitted span OR carry a removal reason, never both and never neither`,
+        ).toBe(true);
+      }
+      // And nothing may be "removed" that was never in the tree — a stale entry
+      // reads as a decision that was made about a name nobody ever declared.
+      for (const name of removed) expect(DECLARED_BY_514).toContain(name);
+      // The reason must be a real sentence, not an empty placeholder.
+      for (const [name, reason] of Object.entries(SPANS_REMOVED_IN_535)) {
+        expect(reason.length, `${name} has no removal justification`).toBeGreaterThan(40);
       }
     });
   });

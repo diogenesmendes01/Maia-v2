@@ -255,12 +255,21 @@ d('review da PR #554 — um turno real abre o span context.load', () => {
     expect(loads[0]!.attributes.tenant_id).toBe(TENANT);
     expect(loads[0]!.attributes.agent_id).toBe(AGENT);
 
-    // E ele se encaixa no lugar declarado da árvore. `SPAN_PARENT` diz `turn`;
-    // a waterfall exportada tem que concordar, senão "o turno foi lento AQUI"
-    // aponta para lugar nenhum.
+    // E ele se encaixa no lugar declarado da árvore. A waterfall exportada tem
+    // que concordar com `SPAN_PARENT`, senão "o turno foi lento AQUI" aponta
+    // para lugar nenhum.
+    //
+    // Desde a #535 esse lugar é `prompt.render`, e a correção é o que este
+    // arquivo mede: o pai declarado ERA `turn`, mas quem chama `loadTurnContext`
+    // é `buildPrompt` — então na waterfall real a carga sempre esteve dentro da
+    // montagem do prompt, e a árvore é que estava errada. O par é o que separa
+    // "gastamos o tempo LENDO estado" de "gastamos MONTANDO o prompt".
     const turn = captured.find((s) => s.name === SPAN.TURN);
-    expect(SPAN_PARENT[SPAN.CONTEXT_LOAD]).toBe(SPAN.TURN);
-    expect(loads[0]!.parent_span_id).toBe(turn!.span_id);
+    const render = captured.find((s) => s.name === SPAN.PROMPT_RENDER);
+    expect(render, 'o turno não abriu prompt.render').toBeDefined();
+    expect(SPAN_PARENT[SPAN.CONTEXT_LOAD]).toBe(SPAN.PROMPT_RENDER);
+    expect(loads[0]!.parent_span_id).toBe(render!.span_id);
+    expect(render!.parent_span_id).toBe(turn!.span_id);
     expect(loads[0]!.trace_id).toBe(turn!.trace_id);
   });
 

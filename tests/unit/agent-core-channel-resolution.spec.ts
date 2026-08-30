@@ -95,8 +95,21 @@ vi.mock('@/config/feature-flags.js', () => ({
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
 vi.mock('@/lib/logger.js', () => ({ logger: loggerMock }));
 
+/**
+ * O dublê do tracer precisa cobrir `withSpan` e `recordElapsedSpan` além de
+ * `publishSpanAttribution` desde a #535: `agent/core.ts` passou a envelopar a
+ * resolução de audiência e o grafo de pré-turno em spans
+ * (`observability/instrumentation.ts`), e um dublê parcial deste módulo faz o
+ * arquivo inteiro morrer no import com "No export is defined on the mock".
+ *
+ * Os dois são PASSA-ADIANTE: este arquivo mede roteamento de canal, não spans —
+ * quem prova a fiação dos spans é
+ * `tests/integration/turn-span-tree-hot-path.spec.ts`, por um turno real.
+ */
 vi.mock('@/observability/tracer.js', () => ({
   publishSpanAttribution: publishSpanAttributionMock,
+  withSpan: <T,>(_name: string, fn: () => Promise<T>) => fn(),
+  recordElapsedSpan: vi.fn(),
 }));
 
 vi.mock('@/db/tenant-context.js', () => ({

@@ -24,6 +24,10 @@
 import { BudgetTracker } from './budget-tracker.js';
 import { PepAudit } from './pep-audit.js';
 import {
+  instrumentDecisionEvaluate,
+  instrumentRiskClassify,
+} from '@/observability/instrumentation.js';
+import {
   BudgetExhaustedError,
   type ActionDecider,
   type ActionMode,
@@ -171,7 +175,34 @@ function withDeadline<T>(
 export class DecisionEngine {
   constructor(private deps: DecisionEngineDeps) {}
 
-  async run(input: DecisionEngineInput): Promise<DecisionEngineResult> {
+  /**
+   * Issue #535 — span `decision.evaluate`.
+   *
+   * Preso ao MOTOR e não a `runDecisionEngineForTurn`
+   * (`src/runtime/decision/integration.ts`). Os dois são entradas de produção
+   * para o mesmo motor, e o shim é o que varia — `runDecisionEngineIfEnabled`
+   * existe ao lado dele para chamadores que montam as próprias dependências.
+   * Amarrar o span ao motor faz com que toda rota até aqui fique coberta, que é
+   * o mesmo argumento que pôs `llm.request` em `emitUsage` em vez de nas seis
+   * saídas do `executeLLM`.
+   *
+   * É também o que dá pai a `risk.classify`: o passo 3 roda DENTRO deste
+   * escopo, então o ALS aberto aqui já está ativo quando ele dispara.
+   *
+   * Atributos: `decision` (o `action_mode` resultante, união fechada) e
+   * `result` (`ok` | `blocked`, se um PEP curto-circuitou). O `DecisionPacket`
+   * inteiro fica de fora — ele carrega ids de skill e razões de política, que é
+   * exatamente a forma que a deny list de atributos existe para manter longe de
+   * um collector de terceiro.
+   */
+  run(input: DecisionEngineInput): Promise<DecisionEngineResult> {
+    return instrumentDecisionEvaluate(
+      () => this.runInner(input),
+      (r) => ({ decision: r.packet.action_mode, blocked: r.block !== undefined }),
+    );
+  }
+
+  private async runInner(input: DecisionEngineInput): Promise<DecisionEngineResult> {
     const clock = this.deps.clock ?? (() => Date.now());
     const tracker = new BudgetTracker(this.deps.budget_ms ?? TOTAL_BUDGET_MS, clock);
     const audit = new PepAudit();
@@ -253,8 +284,15 @@ export class DecisionEngine {
 
       // --- Step 3: risk scorer (prod: P9c TurnRiskScorer via prod-env
       // adapter; deterministic stub only as test-harness default, #377). ---
-      const risk = await runStep('risk', () =>
-        this.deps.riskScorer.score({ intent, base: input.base }, { signal }),
+      //
+      // Issue #535 — span `risk.classify`, filho de `decision.evaluate`. O pai
+      // declarado era `preturn.graph`, e era errado: aquele grafo tem
+      // exatamente dois nodes (`procedure-selector`, `role-selector`), e risco
+      // é pontuado AQUI. Ver a nota de parentesco em `taxonomy.ts`.
+      const risk = await instrumentRiskClassify(() =>
+        runStep('risk', () =>
+          this.deps.riskScorer.score({ intent, base: input.base }, { signal }),
+        ),
       );
 
       // --- Step 4: workflow selector. ---
