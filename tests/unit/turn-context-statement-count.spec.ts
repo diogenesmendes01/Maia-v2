@@ -75,13 +75,31 @@ vi.mock('pg', () => {
    * changes.
    */
   function project(text: string): unknown[][] {
-    const table = /from "([a-z_]+)"/.exec(text)?.[1];
-    const canned = table ? h.rows[table] : undefined;
-    const fromAt = text.indexOf(' from "');
-    if (!canned || canned.length === 0 || fromAt < 0) return [];
-    const selectList = text.slice(0, fromAt);
-    const columns = [...selectList.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-    return canned.map((row) => columns.map((c) => row[c] ?? null));
+    const fromAt = text.indexOf(' from ');
+    if (fromAt < 0) return [];
+    // O drizzle sempre qualifica: cada campo do select sai como
+    // `"tabela"."coluna"`. Ler o PAR (e não só o identificador entre aspas) é
+    // o que mantém o dublê alinhado quando a consulta tem mais de uma tabela —
+    // um JOIN, que é a forma da leitura de escopo desde que `resolveScope`
+    // deixou de fazer duas idas em série.
+    const campos = [...text.slice(0, fromAt).matchAll(/"([a-z_]+)"\."([a-z_]+)"/g)].map((m) => ({
+      tabela: m[1]!,
+      coluna: m[2]!,
+    }));
+    if (campos.length === 0) return [];
+    const principal = campos[0]!.tabela;
+    const linhas = h.rows[principal];
+    if (!linhas || linhas.length === 0) return [];
+    return linhas.map((linha) =>
+      campos.map((c) => {
+        // Do lado JUNTADO o dublê pareia com a PRIMEIRA linha canned da tabela —
+        // suficiente para o número de statements, que é a única coisa que este
+        // arquivo afirma. Se o JOIN casa as linhas CERTAS é provado contra um
+        // Postgres de verdade em `tests/integration/turn-context-escopo-real-db.spec.ts`.
+        const fonte = c.tabela === principal ? linha : h.rows[c.tabela]?.[0];
+        return fonte?.[c.coluna] ?? null;
+      }),
+    );
   }
 
   class FakePgClient {
@@ -171,16 +189,45 @@ function seedScopeRows(n: number): void {
 }
 
 /**
- * Table each statement reads, in issue order — the readable form of the log.
+ * As tabelas que cada statement lê, com o APELIDO de cada uma quando há um.
  *
- * Case-insensitive and quote-optional because not every read is a drizzle query
- * builder: `factsRepo.listMentionableForScopes` is hand-written SQL
- * (`FROM agent_facts af`), and a parser that only understood drizzle's
- * lower-cased, quoted output would silently bucket it as unknown — which is how
- * a duplicated raw-SQL read would slip past the check below.
+ * Case-insensitive e com aspas opcionais porque nem toda leitura é um query
+ * builder do drizzle: `factsRepo.listMentionableForScopes` é SQL escrito à mão
+ * (`FROM agent_facts af`, e um `NOT EXISTS` sobre `memory_entry me`). Um parser
+ * que só entendesse a saída minúscula e entre aspas do drizzle jogaria essas
+ * leituras no balde de "não parseado" — que é exatamente como uma leitura crua
+ * duplicada ou sem escopo passaria despercebida pela checagem abaixo.
  */
+type FonteLida = { tabela: string; apelido: string | null };
+
+const PALAVRAS_DE_SINTAXE = new Set([
+  'where',
+  'on',
+  'left',
+  'inner',
+  'union',
+  'order',
+  'limit',
+  'group',
+  'having',
+]);
+
+function fontesDe(sql: string): FonteLida[] {
+  const fontes: FonteLida[] = [];
+  const re = /\b(?:from|join)\s+"?([a-z_]+)"?(?:\s+(?:as\s+)?"?([a-z_]+)"?)?/gi;
+  for (const m of sql.matchAll(re)) {
+    const seguinte = (m[2] ?? '').toLowerCase();
+    fontes.push({
+      tabela: m[1]!.toLowerCase(),
+      apelido: seguinte && !PALAVRAS_DE_SINTAXE.has(seguinte) ? seguinte : null,
+    });
+  }
+  return fontes;
+}
+
+/** A tabela que cada statement lê primeiro — a forma legível do log. */
 function tablesRead(): string[] {
-  return h.statements.map((s) => /\bfrom\s+"?([a-z_]+)"?/i.exec(s)?.[1] ?? '<unparsed>');
+  return h.statements.map((s) => fontesDe(s)[0]?.tabela ?? '<unparsed>');
 }
 
 /**
@@ -231,13 +278,17 @@ describe('#525 turn round-trips, counted as SQL statements', () => {
   });
 
   it('agrees with the repository-call count in turn-context-round-trips.spec.ts', async () => {
-    // The sibling spec asserts 2 (`resolveScope`) + 11 (`buildPrompt`) = 13
-    // repository CALLS. If any repository method ever issues two statements for
+    // A spec irmã afirma 1 (`resolveScope`) + 11 (`buildPrompt`) = 12 CHAMADAS
+    // de repositório. If any repository method ever issues two statements for
     // one call, that spec stays green and this one goes red — which is the
     // whole reason this file exists. One statement per read, no chunking, no
     // hidden pre-flight query.
     const { counted } = await measureTurn(1);
-    expect(counted).toBe(13);
+    expect(counted).toBe(12);
+    // Doze statements, doze tabelas DIRIGENTES distintas — nenhum statement se
+    // repete. O JOIN do escopo TOCA duas tabelas, então o total de tabelas
+    // lidas é maior que doze; o que este `Set` afirma é a ausência de leitura
+    // repetida, não o número de tabelas.
     expect(new Set(tablesRead()).size).toBe(counted);
   });
 
@@ -264,7 +315,7 @@ describe('#525 turn round-trips, counted as SQL statements', () => {
     }
     // Zero slope measured in statements: an "elephant" tenant's turn costs the
     // same as anyone else's against the fixed 10-connection pool.
-    expect(measured).toEqual([13, 13, 13]);
+    expect(measured).toEqual([12, 12, 12]);
   });
 
   it('rendering is worth zero statements', async () => {
@@ -311,32 +362,54 @@ describe('#525 turn round-trips, counted as SQL statements', () => {
    * fails in the unit lane, on every push, the moment a turn read is added
    * without scoping.
    */
-  it('every statement of the turn is scoped by tenant_id AND agent_id', async () => {
+  it('every table read by the turn is scoped by tenant_id AND agent_id', async () => {
     await measureTurn(1);
-    expect(h.statements).toHaveLength(13);
+    expect(h.statements).toHaveLength(12);
 
-    const unscoped = h.statements
-      .map((s) => ({
-        table: /\bfrom\s+"?([a-z_]+)"?/i.exec(s)?.[1] ?? '<unparsed>',
-        tenant: /tenant_id"?\s*=/i.test(s),
-        agent: /agent_id"?\s*=/i.test(s),
-      }))
-      .filter((s) => !s.tenant || !s.agent)
-      .map((s) => s.table);
+    // POR TABELA, não por statement. Um statement que lê duas tabelas — o JOIN
+    // do escopo, e o `NOT EXISTS` dos fatos — passaria com folga numa checagem
+    // por statement: bastava UMA das metades carregar o predicado. Aqui cada
+    // tabela que aparece num FROM/JOIN precisa do próprio par, pelo nome ou
+    // pelo apelido com que a consulta a chama.
+    const semEscopo: string[] = [];
+    for (const sql of h.statements) {
+      for (const { tabela, apelido } of fontesDe(sql)) {
+        const nomes = [`"${tabela}"\\."`, apelido ? `\\b${apelido}\\.` : null].filter(
+          (n): n is string => n !== null,
+        );
+        const tem = (coluna: string): boolean =>
+          nomes.some((n) => new RegExp(`${n}${coluna}"?\\s*=`, 'i').test(sql));
+        if (!tem('tenant_id') || !tem('agent_id')) semEscopo.push(tabela);
+      }
+    }
 
-    expect(unscoped).toEqual([]);
+    expect(semEscopo).toEqual([]);
+    expect(tablesRead()).not.toContain('<unparsed>');
+
+    // …e o exame realmente alcança as tabelas que NÃO dirigem o statement. Sem
+    // esta asserção, alguém poderia afrouxar `fontesDe` para achar só a
+    // primeira tabela e o teste acima continuaria verde enquanto metade do
+    // conjunto de leituras saía do exame.
+    const tabelas = h.statements.flatMap((sql) => fontesDe(sql).map((f) => f.tabela));
+    expect(tabelas.length).toBeGreaterThan(h.statements.length);
+    expect(new Set(tabelas)).toContain('permission_profiles');
+    expect(new Set(tabelas)).toContain('entity_states');
+    expect(new Set(tabelas)).toContain('memory_entry');
   });
 
   it('the ≤8 target of #525 is still open, and the gap is honest', async () => {
     const { TURN_ROUND_TRIP_BUDGET, TURN_ROUND_TRIP_TARGET } = await import(
       '../../src/agent/turn-context/types.js'
     );
-    const { counted } = await measureTurn(1);
-    // Measured, not estimated: the turn really costs 13 statements, the goal is
-    // 8, and the five remaining merges are listed in
-    // docs/architecture/modules/agent.md. Asserting the real distance keeps the
-    // open goal from being quietly rounded down to "close enough".
+    const { counted, logged } = await measureTurn(1);
+    // Medido, não estimado: o turno custa doze statements e a meta é oito.
+    // As duas contagens precisam concordar, senão a instrumentação parou de ver
+    // um statement e o "doze" seria contagem de outra coisa.
+    expect(counted).toBe(logged);
     expect(counted).toBe(TURN_ROUND_TRIP_BUDGET);
-    expect(counted - TURN_ROUND_TRIP_TARGET).toBe(5);
+    // As quatro que faltam foram implementadas e medidas: fundir leituras que
+    // já são CONCORRENTES triplica o p95 (ver `types.ts` e o doc do módulo).
+    // Afirmar a distância exata é o que impede a meta de ser arredondada.
+    expect(counted - TURN_ROUND_TRIP_TARGET).toBe(4);
   });
 });

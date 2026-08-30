@@ -25,9 +25,10 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *
  *   before #511      17
  *   after  #511/#524 15
- *   after  #525      13   ← asserted below
+ *   after  #525      13
+ *   + o JOIN do escopo 12   ← asserted below
  *
- * The two round-trips #525 removed, and why they were removable at all:
+ * The three round-trips #525 removed, and why they were removable at all:
  *
  *   - the gap catalogue was read TWICE, once as `listByLevel('mentionable')`
  *     for the self-awareness clause and once as
@@ -36,10 +37,20 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *   - entity NAMES and entity STATES were two reads of the same entity set,
  *     joined on `entity_states.entidade_id = entidades.id`. That is a LEFT
  *     JOIN, and now it is one (`entidadesRepo.byIdsWithState`).
+ *   - `resolveScope` lia `permissoes` e DEPOIS `permission_profiles` com os
+ *     `profile_id` colhidos: duas idas em SÉRIE, a segunda esperando a
+ *     primeira. Um `INNER JOIN` faz as duas (`forPessoaComProfile`), e o
+ *     `INNER` é literalmente o `if (!profile) continue` que a resolução em JS
+ *     fazia — nenhuma checagem de autorização foi pulada.
  *
- * Neither changes what the prompt says; both are pure duplication removal.
- * `TURN_ROUND_TRIP_TARGET` (8) is NOT met — the remaining reads are all
- * distinct tables whose merge needs a cross-table statement. See the module doc.
+ * Nenhuma das três muda o que o prompt diz; as três são duplicação ou espera.
+ *
+ * `TURN_ROUND_TRIP_TARGET` (8) NÃO foi atingida, e a última asserção deste
+ * arquivo afirma a distância exata. O motivo está medido em
+ * `src/agent/turn-context/types.ts` e em `docs/architecture/modules/agent.md`:
+ * as 4 idas que faltam só saem fundindo tabelas num `UNION ALL`, e fundir
+ * leituras que já são CONCORRENTES alonga o `max()` que define a latência do
+ * turno em vez de encurtá-lo — medido, com o p95 triplicando.
  */
 
 type Counters = Record<string, number>;
@@ -120,7 +131,18 @@ vi.mock('../../src/db/repositories.js', () => ({
     findActiveForConversa: failable('procedureExecutionsRepo.findActiveForConversa', async () => null),
   },
   procedureDefinitionsRepo: { findById: failable('procedureDefinitionsRepo.findById', async () => null) },
-  permissoesRepo: { forPessoa: failable('permissoesRepo.forPessoa', async () => permissoesFixture) },
+  permissoesRepo: {
+    forPessoa: failable('permissoesRepo.forPessoa', async () => permissoesFixture),
+    // #525: a leitura do escopo é UMA — `permissoes` já com o profile de cada
+    // linha. O dublê reproduz o `INNER JOIN`: a permissão sem profile
+    // resolvível não sai do join, que é o mesmo `if (!profile) continue` que a
+    // resolução em JS fazia.
+    forPessoaComProfile: failable('permissoesRepo.forPessoaComProfile', async () =>
+      permissoesFixture
+        .filter((p) => p.entidade_id && p.profile_id)
+        .map((permissao) => ({ permissao, profile: mkProfile(permissao.profile_id!) })),
+    ),
+  },
   profilesRepo: {
     byId: failable('profilesRepo.byId', async (id: string) => mkProfile(id)),
     byIds: failable('profilesRepo.byIds', async (ids: string[]) => ids.map(mkProfile)),
@@ -264,7 +286,7 @@ describe('#525 turn round-trip budget', () => {
   });
 
   describe('exact counts', () => {
-    it.each([1, 10, 100])('the whole turn costs 13 round-trips for %i entities', async (n) => {
+    it.each([1, 10, 100])('the whole turn costs 12 round-trips for %i entities', async (n) => {
       permissoesFixture = entityIds(n).map(
         (id) =>
           ({
@@ -284,12 +306,16 @@ describe('#525 turn round-trip budget', () => {
         inbound: mkInbound(),
       });
 
-      expect(totalCalls()).toBe(13);
+      expect(totalCalls()).toBe(12);
       // The ceiling, and the reason this file exists: a new read fails here.
       expect(totalCalls()).toBeLessThanOrEqual(TURN_ROUND_TRIP_BUDGET);
+      // …e o escopo inteiro custou UM statement, com profiles incluídos.
+      expect(h.calls['permissoesRepo.forPessoaComProfile']).toBe(1);
+      expect(h.calls['permissoesRepo.forPessoa']).toBeUndefined();
+      expect(h.calls['profilesRepo.byIds']).toBeUndefined();
     });
 
-    it('costs 12 with an active operational profile v2 (no self_state fallback)', async () => {
+    it('costs 11 with an active operational profile v2 (no self_state fallback)', async () => {
       h.activeProfile = { version: 7, status: 'active', profile_body: {} };
       permissoesFixture = [
         {
@@ -310,7 +336,7 @@ describe('#525 turn round-trip budget', () => {
       });
 
       expect(h.calls['selfStateRepo.getActive']).toBeUndefined();
-      expect(totalCalls()).toBe(12);
+      expect(totalCalls()).toBe(11);
     });
 
     it('costs one less when core.ts already resolved the active procedure', async () => {
@@ -404,6 +430,7 @@ describe('#525 turn round-trip budget', () => {
       h.failing.add('memoryEntryRepo.findRelevant');
       const { system } = await buildPrompt(mkCtx(1));
       expect(totalCalls()).toBe(11);
+      // (11 = as 11 leituras do `buildPrompt`; a do escopo não entra aqui.)
       expect(system).not.toContain('## Memória relevante');
       // …and the neighbouring optional sections still ran.
       expect(h.calls['behavioralHintRepo.findActiveForScopes']).toBe(1);
@@ -426,12 +453,17 @@ describe('#525 turn round-trip budget', () => {
   });
 
   it('the declared budget is above the goal issue #525 still targets', () => {
-    // Honest bookkeeping rather than a green tick on a goal that is not met:
-    // the ceiling this suite enforces is 13, the goal is 8, and the gap is
-    // documented in docs/architecture/modules/agent.md with the merge each
-    // remaining round-trip would need.
-    expect(TURN_ROUND_TRIP_BUDGET).toBe(13);
+    // Contabilidade honesta, e não um tique verde numa meta não cumprida: o
+    // teto que esta suíte impõe é 12, a meta é 8, e a distância é QUATRO. As
+    // quatro fusões que faltam foram implementadas e MEDIDAS — elas triplicam o
+    // p95, porque fundem leituras que já eram concorrentes. O porquê está em
+    // `src/agent/turn-context/types.ts` e em `docs/architecture/modules/agent.md`.
+    //
+    // Afirmar a distância EXATA (e não `>`) é o que impede as duas saídas
+    // fáceis: arredondar a meta para "perto o bastante", e acomodar uma leitura
+    // nova subindo o orçamento sem que ninguém repare que a distância cresceu.
+    expect(TURN_ROUND_TRIP_BUDGET).toBe(12);
     expect(TURN_ROUND_TRIP_TARGET).toBe(8);
-    expect(TURN_ROUND_TRIP_BUDGET).toBeGreaterThan(TURN_ROUND_TRIP_TARGET);
+    expect(TURN_ROUND_TRIP_BUDGET - TURN_ROUND_TRIP_TARGET).toBe(4);
   });
 });

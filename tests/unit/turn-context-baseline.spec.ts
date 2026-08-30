@@ -35,10 +35,15 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *   entities |  1  |  10  |  100  | vs baseline
  *   ---------+-----+------+-------+------------
  *   prompt   | 12  |  12  |   12  |
- *   scope    |  2  |   2  |    2  |
- *   turn     | 14  |  14  |   14  | -18% / -60% / -93%
+ *   scope    |  1  |   1  |    1  |
+ *   turn     | 13  |  13  |   13  | -24% / -63% / -94%
  *
- * With the batched entity read wired (production), the same turn is 13.
+ * O escopo caiu de 2 para 1 porque `resolveScope` passou a ler `permissoes` já
+ * com o profile de cada linha (`forPessoaComProfile`, um `INNER JOIN`): as duas
+ * leituras eram SEQUENCIAIS — a segunda esperava os `profile_id` da primeira —,
+ * e é por isso que fundi-las encurta o caminho crítico de verdade.
+ *
+ * With the batched entity read wired (production), the same turn is 12.
  *
  * The slope is now ZERO — the property that actually matters, because it is
  * what stops one "elephant" tenant from monopolising the fixed 10-connection
@@ -143,6 +148,19 @@ vi.mock('../../src/db/repositories.js', () => ({
   // --- permissions (resolveScope) --------------------------------------
   permissoesRepo: {
     forPessoa: h.count('permissoesRepo.forPessoa', async () => permissoesFixture),
+    /**
+     * #525 — a leitura de escopo virou UMA: `permissoes` já com o profile.
+     *
+     * O dublê reproduz o `INNER JOIN` do repositório: a permissão cujo profile
+     * NÃO resolve (outro tenant, id órfão) simplesmente não sai do join, que é
+     * o mesmo `if (!profile) continue` que a resolução em JS fazia. É por isso
+     * que `missingProfiles` continua sendo o botão que produz esse caso.
+     */
+    forPessoaComProfile: h.count('permissoesRepo.forPessoaComProfile', async () =>
+      permissoesFixture
+        .filter((p) => p.entidade_id && !h.missingProfiles.has(p.profile_id!))
+        .map((permissao) => ({ permissao, profile: mkProfile(permissao.profile_id!) })),
+    ),
   },
   profilesRepo: {
     byId: h.count('profilesRepo.byId', async (id: string) => mkProfile(id)),
@@ -308,7 +326,7 @@ describe('#511 baseline — turn-context query cost', () => {
   });
 
   describe('resolveScope', () => {
-    it.each([1, 10, 100])('costs 2 queries for %i permissions', async (n) => {
+    it.each([1, 10, 100])('costs ONE query for %i permissions', async (n) => {
       permissoesFixture = entityIds(n).map(
         (id) =>
           ({
@@ -324,10 +342,11 @@ describe('#511 baseline — turn-context query cost', () => {
 
       // Same resolved scope as the per-permission loop produced, at constant cost.
       expect(resolved.entidades).toHaveLength(n);
-      expect(h.calls['permissoesRepo.forPessoa']).toBe(1);
+      expect(h.calls['permissoesRepo.forPessoaComProfile']).toBe(1);
+      expect(h.calls['permissoesRepo.forPessoa']).toBeUndefined();
       expect(h.calls['profilesRepo.byId']).toBeUndefined();
-      expect(h.calls['profilesRepo.byIds']).toBe(1);
-      expect(totalCalls()).toBe(2);
+      expect(h.calls['profilesRepo.byIds']).toBeUndefined();
+      expect(totalCalls()).toBe(1);
     });
 
     it('skips a permission whose profile does not resolve (fail-closed)', async () => {
@@ -342,7 +361,7 @@ describe('#511 baseline — turn-context query cost', () => {
         {
           id: 'perm-orphan',
           entidade_id: 'ent-orphan',
-          // Not returned by the batch read — e.g. it belongs to another tenant.
+          // Não sai do join — p.ex. o profile pertence a outro tenant.
           profile_id: 'profile-missing',
           status: 'ativa',
           limites: {},
@@ -404,9 +423,9 @@ describe('#511 baseline — turn-context query cost', () => {
 
   describe('whole turn', () => {
     it.each([
-      [1, 14],
-      [10, 14],
-      [100, 14],
+      [1, 13],
+      [10, 13],
+      [100, 13],
     ])('for %i entities the turn costs %i queries', async (n, expected) => {
       permissoesFixture = entityIds(n).map(
         (id) =>

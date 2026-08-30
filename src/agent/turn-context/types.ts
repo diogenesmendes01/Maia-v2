@@ -96,23 +96,24 @@ export const SECTION_BUDGETS = {
 export type BudgetedSection = keyof typeof SECTION_BUDGETS;
 
 /**
- * Issue #525 — the TURN's round-trip ceiling, counted at the repository
- * boundary for a typical turn (one entity in scope, no active procedure).
+ * Issue #525 — the TURN's round-trip ceiling, counted in SQL STATEMENTS for a
+ * typical turn (one entity in scope, no active procedure).
  *
- * This constant is the budget, and `tests/unit/turn-context-round-trips.spec.ts`
- * is its enforcement: the spec asserts the EXACT count for each path and fails
- * the build the moment a new read pushes past this number. A budget nothing
- * fails on is a wish, and the whole point of #511/#525 is that the turn's cost
- * stops being a wish.
+ * This constant is the budget, and two specs enforce it:
+ * `tests/unit/turn-context-round-trips.spec.ts` counts repository CALLS and
+ * names the read set; `tests/unit/turn-context-statement-count.spec.ts` counts
+ * the STATEMENTS that would have gone down a real socket (only `pg` is faked).
+ * A budget nothing fails on is a wish, and the whole point of #511/#525 is that
+ * the turn's cost stops being a wish.
  *
- * "Whole turn" means `resolveScope` (2) + `buildPrompt`. It deliberately counts
- * the procedure-execution lookup even though `core.ts` normally supplies it —
- * the read happens once per turn either way, and moving a query to a different
+ * "Whole turn" means `resolveScope` + `buildPrompt`. It deliberately counts the
+ * procedure-execution lookup even though `core.ts` normally supplies it — the
+ * read happens once per turn either way, and moving a query to a different
  * caller is not an optimisation.
  *
  * Current composition (legacy `self_state` path, the most expensive one):
  *
- *   resolveScope: permissoesRepo.forPessoa, profilesRepo.byIds           2
+ *   resolveScope: permissoes ⋈ permission_profiles (um JOIN)             1
  *   identity: operationalProfileVersionsRepo.getActive                   1
  *   identity: selfStateRepo.getActive (fallback branch only)             1
  *   mensagensRepo.recentInConversation                                   1
@@ -122,10 +123,10 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  *   memoryEntryRepo.findRelevant                                         1
  *   behavioralHintRepo.findActiveForScopes                               1
  *   capabilitiesSkillRepo.listAll                                        1
- *   capabilityGapsRepo.listByLevels (serves BOTH gap blocks)             1
+ *   capabilityGapsRepo.listParaOTurno (serves BOTH gap blocks)           1
  *   procedureExecutionsRepo.findActiveForConversa                        1
  *                                                                       --
- *                                                                       13
+ *                                                                       12
  *
  * Every one of these is independent of scope size: the slope is zero, so an
  * "elephant" tenant's turn costs the same as anyone else's.
@@ -134,7 +135,7 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * `src/db/client.ts` — a bounded read set issued all at once still empties the
  * pool. That is a separate ceiling, `TURN_CONTEXT_MAX_CONCURRENT_READS` below.
  */
-export const TURN_ROUND_TRIP_BUDGET = 13;
+export const TURN_ROUND_TRIP_BUDGET = 12;
 
 /**
  * Issue #525 (PR #541 review, finding 1) — how many of those round-trips ONE
@@ -177,14 +178,43 @@ export const TURN_ROUND_TRIP_BUDGET = 13;
 export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
 
 /**
- * The goal issue #525 sets. NOT yet met — see `docs/architecture/modules/
- * agent.md` for the remaining merges, what each is worth, and why they were not
- * taken in this change (each one needs a cross-table statement that cannot be
- * verified without a live Postgres).
+ * A meta que a issue #525 estabelece: ≤8. **NÃO atingida, e a razão foi MEDIDA,
+ * não estimada.**
  *
- * Kept in code rather than only in the issue so the gap is greppable from the
- * budget it belongs to, and so closing it is a one-line edit here plus the
- * counts in the spec.
+ * Chegar a 8 é possível e foi implementado: as cinco fusões que faltavam
+ * (`permissoes ⋈ permission_profiles`, `operational_profile_versions ∪
+ * self_state`, `agent_facts ∪ learned_rules`, `memory_entry ∪ behavioral_hint`,
+ * `agent_capabilities_skill ∪ agent_capability_gaps`) produzem exatamente oito
+ * statements, com o prompt byte-idêntico e o escopo por tenant+agent intacto.
+ * Quatro delas foram DESFEITAS porque o benchmark reprovou o resultado: o p95 da
+ * carga de contexto TRIPLICOU.
+ *
+ * O mecanismo, medido em `docs/architecture/modules/agent.md` § "O que custa um
+ * round-trip, e o que custa fundir dois":
+ *
+ *  1. um round-trip vazio custa ~0,15 ms; um statement do turno custa
+ *     0,4–1,2 ms. A ida ao banco é a menor parte do preço de uma leitura;
+ *  2. desde a #525 as leituras saem CONCORRENTES sob o portão de 6 permissões,
+ *     então o turno paga o MÁXIMO do conjunto, não a soma. Reduzir a CONTAGEM
+ *     abaixo do teto de concorrência não encurta o caminho crítico;
+ *  3. um `UNION ALL` de dois ramos custa mais para PLANEJAR que qualquer um
+ *     deles sozinho (2,85 ms contra 0,36 ms, medido com `EXPLAIN`), então a
+ *     fusão alonga justamente o `max()` que define a latência do turno.
+ *
+ * A única fusão que sobreviveu é a do `resolveScope`, e ela sobreviveu porque
+ * aquelas duas leituras eram SEQUENCIAIS (a segunda precisava dos `profile_id`
+ * da primeira): trocar duas idas em série por uma ida só encurta o caminho
+ * crítico de verdade — 1,36 ms → 0,96 ms de p50 com uma entidade em escopo.
+ *
+ * Ou seja: a contagem de round-trips deixou de medir o que ela media quando a
+ * #511 a escolheu. Enquanto as leituras eram SEQUENCIAIS, contagem e latência
+ * andavam juntas; desde que passaram a ser concorrentes e limitadas, a contagem
+ * virou proxy de nada. Baixar de 12 para 8 é possível e é pior.
+ *
+ * Mantida como constante (e não apagada) porque a meta é do dono, não do código:
+ * `tests/unit/turn-context-round-trips.spec.ts` afirma a DISTÂNCIA exata entre o
+ * orçamento e a meta, para que ela não seja arredondada para "perto o bastante"
+ * nem em silêncio declarada cumprida.
  */
 export const TURN_ROUND_TRIP_TARGET = 8;
 

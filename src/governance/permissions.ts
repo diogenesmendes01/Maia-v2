@@ -1,4 +1,4 @@
-import { permissoesRepo, profilesRepo, pessoasRepo } from '@/db/repositories.js';
+import { permissoesRepo, pessoasRepo } from '@/db/repositories.js';
 import type { Permissao, PermissionProfile, Pessoa } from '@/db/schema.js';
 import type { ActionKey } from './audit-actions.js';
 // Import circular benigno: financial-authorization importa `profileAllows`
@@ -45,26 +45,39 @@ export type ResolvedPermission = {
  * `byId` it replaces matched on the profile id alone — a `permissoes` row
  * pointing at a foreign profile id used to resolve to that other tenant's
  * action list and spend limit.
+ *
+ * Issue #525 — as duas leituras viraram UMA (`forPessoaComProfile`), e a
+ * resolução continua a mesma. Este é o CAMINHO DE AUTORIZAÇÃO, então o que a
+ * fusão não pode fazer é pular checagem para economizar ida ao banco. Não pula:
+ *
+ *   - o `INNER JOIN` é o `if (!profile) continue` — permissão cujo profile não
+ *     resolve continua não virando grant (fail-closed: sem profile, sem grant);
+ *   - o `ON` do join liga `(tenant_id, agent_id)` dos DOIS lados, então um
+ *     `permissoes` apontando para o profile de outro tenant continua sem
+ *     resolver — a proteção que a #511 trouxe segue de pé, agora no SQL;
+ *   - `mergeLimits` continua sendo aplicado por permissão, então um `limites`
+ *     explícito continua ganhando do `limite_default` do profile;
+ *   - a iteração continua na ordem de `permissoes` (o lado que dirige o join),
+ *     então `entidades`, o bloco "## Escopo desta conversa" e o `hashScope`
+ *     ficam byte-idênticos — o que `tests/integration/turn-context-prompt-bytes-real-db.spec.ts`
+ *     prova contra um Postgres real.
+ *
+ * O `status !== 'ativa'` da PESSOA continua sendo avaliado ANTES de qualquer
+ * leitura: uma pessoa inativa custa zero statements e resolve para escopo
+ * vazio, como antes.
  */
 export async function resolveScope(
   pessoa: Pessoa,
 ): Promise<{ entidades: string[]; byEntity: Map<string, ResolvedPermission> }> {
   if (pessoa.status !== 'ativa') return { entidades: [], byEntity: new Map() };
-  const perms = await permissoesRepo.forPessoa(pessoa.id);
-  const withEntity = perms.filter((p) => p.entidade_id);
-  if (withEntity.length === 0) return { entidades: [], byEntity: new Map() };
-
-  const profiles = await profilesRepo.byIds(withEntity.map((p) => p.profile_id));
-  const byProfileId = new Map(profiles.map((pr) => [pr.id, pr]));
+  const resolvidas = await permissoesRepo.forPessoaComProfile(pessoa.id);
 
   const byEntity = new Map<string, ResolvedPermission>();
   const entidades: string[] = [];
-  for (const p of withEntity) {
-    const profile = byProfileId.get(p.profile_id);
-    if (!profile) continue;
-    const effective_limits = mergeLimits(p, profile);
-    byEntity.set(p.entidade_id!, { permissao: p, profile, effective_limits });
-    entidades.push(p.entidade_id!);
+  for (const { permissao, profile } of resolvidas) {
+    const effective_limits = mergeLimits(permissao, profile);
+    byEntity.set(permissao.entidade_id!, { permissao, profile, effective_limits });
+    entidades.push(permissao.entidade_id!);
   }
   return { entidades, byEntity };
 }

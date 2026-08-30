@@ -1,4 +1,4 @@
-import { eq, and, sql, inArray, asc } from 'drizzle-orm';
+import { eq, and, sql, inArray, asc, isNotNull } from 'drizzle-orm';
 import { db, withTx, pgErrorCode } from '../client.js';
 import {
   pessoas,
@@ -489,6 +489,61 @@ export const permissoesRepo = {
         eq(permissoes.pessoa_id, pessoa_id),
         eq(permissoes.status, 'ativa'),
       ));
+  },
+  /**
+   * Issue #525 — as permissões da pessoa JÁ com o profile de cada uma, em UM
+   * statement.
+   *
+   * `resolveScope` custava duas idas ao banco: `forPessoa` e depois
+   * `profilesRepo.byIds` sobre os `profile_id` colhidos. As duas são leituras
+   * do CAMINHO DE AUTORIZAÇÃO, e é por isso que a fusão é feita como um JOIN
+   * que reproduz a resolução linha a linha — e não pulando nenhuma checagem:
+   *
+   *  - `INNER JOIN` é exatamente o `if (!profile) continue` que a resolução em
+   *    JS fazia. Permissão cujo profile não resolve continua NÃO virando grant.
+   *    Fail-closed preservado: sem profile, sem permissão.
+   *  - o `ON` liga `(tenant_id, agent_id)` DOS DOIS LADOS, além do id. Um
+   *    `permissoes` apontando para o profile de outro tenant não resolve — a
+   *    mesma proteção que `profilesRepo.byIds` (escopado) trouxe quando
+   *    substituiu o `byId` (que casava só por id).
+   *  - a ordem das linhas é a ordem de `permissoes`, que é a ordem em que a
+   *    resolução iterava — e ela CHEGA AO PROMPT (o bloco "## Escopo desta
+   *    conversa" e o `hashScope`). O `permissoes` é o lado que dirige o join.
+   *
+   * O que muda de verdade: `profilesRepo.byIds` tinha um teto de 500 profiles
+   * DISTINTOS, e uma permissão cujo profile caísse fora desse recorte era
+   * silenciosamente descartada — um grant real perdido por causa da ordenação
+   * por id, não por decisão de autorização. O JOIN não tem esse recorte. Isso
+   * não alarga autorização nenhuma: cada linha continua exigindo uma permissão
+   * ATIVA da pessoa e um profile do MESMO tenant/agent; o que some é um corte
+   * de recurso que negava acesso concedido. O statement continua limitado pelo
+   * número de permissões da pessoa, que é o que `forPessoa` já lia sem teto.
+   */
+  async forPessoaComProfile(
+    pessoa_id: string,
+  ): Promise<Array<{ permissao: Permissao; profile: PermissionProfile }>> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    return db
+      .select({ permissao: permissoes, profile: permission_profiles })
+      .from(permissoes)
+      .innerJoin(
+        permission_profiles,
+        and(
+          eq(permission_profiles.id, permissoes.profile_id),
+          eq(permission_profiles.tenant_id, permissoes.tenant_id),
+          eq(permission_profiles.agent_id, permissoes.agent_id),
+        ),
+      )
+      .where(
+        and(
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.agent_id, agent_id),
+          eq(permissoes.pessoa_id, pessoa_id),
+          eq(permissoes.status, 'ativa'),
+          isNotNull(permissoes.entidade_id),
+        ),
+      );
   },
   async byKey(pessoa_id: string, entidade_id: string): Promise<Permissao | null> {
     const tenant_id = getCurrentTenant();

@@ -50,6 +50,7 @@ import path from 'node:path';
 import pg from 'pg';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { runWithQueryCounter } from '@/db/query-counter.js';
+import { TURN_ROUND_TRIP_BUDGET } from '@/agent/turn-context/types.js';
 import type { Conversa, Mensagem, Pessoa, Role } from '@/db/schema.js';
 
 const SHOULD_RUN =
@@ -237,12 +238,6 @@ async function seed(): Promise<void> {
                '[{"id":"c1","type":"checklist"}]'::jsonb,'ensino')`,
       [ID.procDef, T.tenant_id, T.agent_id],
     );
-    await c.query(
-      `INSERT INTO procedure_executions(id, tenant_id, agent_id, conversa_id, definition_id,
-                                        definition_version, status, current_step_id, execution_state)
-       VALUES ($1,$2,$3,$4,$5,2,'in_progress','coletar','{"arquivos":1}'::jsonb)`,
-      [ID.procExec, T.tenant_id, T.agent_id, ID.conversa, ID.procDef],
-    );
   } finally {
     c.release();
   }
@@ -341,23 +336,50 @@ type Caso = {
   nome: string;
   conversa: string;
   role?: Role;
-  activeExecution?: null;
   perfilV2?: boolean;
+  procedimentoAtivo?: boolean;
 };
 
 const CASOS: Caso[] = [
-  // The hot path as production runs it: legacy `self_state` identity, every
-  // optional section populated, `core.ts` already resolved the procedure.
-  { nome: 'rico-self-state', conversa: 'conversa', activeExecution: null },
+  // O turno TÍPICO da #525, e o que define o orçamento: identidade legada
+  // `self_state`, uma entidade em escopo, toda seção opcional populada, nenhum
+  // procedimento em execução, e o loader resolvendo o procedimento por conta
+  // própria (o pior caso, já que `core.ts` normalmente o entrega pronto).
+  { nome: 'rico-self-state', conversa: 'conversa' },
   // Everything the renderer can be handed as absent, in one prompt: no
   // history, no entity in scope, no procedure. The blocks that must still
   // appear ("(sem entidades acessíveis)", "(vazio)") are the ones a merge that
   // silently dropped a branch would erase.
-  { nome: 'vazio', conversa: 'conversaVazia', activeExecution: null },
+  { nome: 'vazio', conversa: 'conversaVazia' },
   // The other identity branch, plus the two blocks the first case does not
   // reach: the role section and the running procedure.
-  { nome: 'perfil-v2-com-procedimento', conversa: 'conversa', role: ROLE, perfilV2: true },
+  {
+    nome: 'perfil-v2-com-procedimento',
+    conversa: 'conversa',
+    role: ROLE,
+    perfilV2: true,
+    procedimentoAtivo: true,
+  },
 ];
+
+/**
+ * Quantos statements cada caso deve custar, contra o Postgres real — e por quê.
+ *
+ * `rico-self-state` é o turno que o orçamento descreve, e custa exatamente o
+ * orçamento. Os outros dois divergem por razões declaradas, não por sorte:
+ *
+ *  - `vazio`: a pessoa não tem permissão nenhuma, o escopo resolve vazio, e
+ *    `entidades ⋈ entity_states` não é lida (não há id para ler). 12 − 1 = 11.
+ *  - `perfil-v2-com-procedimento`: o perfil v2 ATIVO dispensa a leitura do
+ *    `self_state` (−1), e a execução ATIVA de procedimento faz o turno pagar
+ *    também a DEFINIÇÃO dela (+1). Esse "+1" não é novo: o orçamento sempre
+ *    descreveu o turno SEM procedimento em execução. 12 − 1 + 1 = 12.
+ */
+function esperadoDeStatements(caso: Caso): number {
+  if (caso.nome === 'vazio') return TURN_ROUND_TRIP_BUDGET - 1;
+  if (caso.procedimentoAtivo) return TURN_ROUND_TRIP_BUDGET - 1 + 1;
+  return TURN_ROUND_TRIP_BUDGET;
+}
 
 d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
   beforeAll(async () => {
@@ -381,6 +403,14 @@ d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
       try {
         // The v2 branch is created and dropped inside the case so the two
         // identity paths are both exercised against the same fixture.
+        if (caso.procedimentoAtivo) {
+          await c.query(
+            `INSERT INTO procedure_executions(id, tenant_id, agent_id, conversa_id, definition_id,
+                                              definition_version, status, current_step_id, execution_state)
+             VALUES ($1,$2,$3,$4,$5,2,'in_progress','coletar','{"arquivos":1}'::jsonb)`,
+            [ID.procExec, T.tenant_id, T.agent_id, ID.conversa, ID.procDef],
+          );
+        }
         if (caso.perfilV2) {
           await c.query(
             `INSERT INTO agent_operational_profile_versions
@@ -402,10 +432,11 @@ d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
             ? ({ ...mkPessoa(), id: '00000000-0000-4000-8000-0000000000ff' } as Pessoa)
             : mkPessoa();
 
+        let statements = -1;
         const built = await runWithTenantContext(T, async () =>
-          runWithQueryCounter(async () => {
+          runWithQueryCounter(async (counter) => {
             const scope = await resolveScope(pessoa);
-            return buildPrompt({
+            const saida = await buildPrompt({
               pessoa,
               conversa: mkConversa(ID[caso.conversa as keyof typeof ID]),
               scope,
@@ -415,8 +446,9 @@ d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
                   : mkInbound(),
               activeRole: caso.role,
               current_role_id: caso.role?.id,
-              activeExecution: caso.activeExecution,
             });
+            statements = counter.count;
+            return saida;
           }),
         );
 
@@ -435,12 +467,26 @@ d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
         expect(actual).toBe(expected);
         // Bytes, not code points — the assertion the criterion is written in.
         expect(Buffer.byteLength(actual, 'utf8')).toBe(Buffer.byteLength(expected, 'utf8'));
+
+        // …e os MESMOS bytes por NÃO MAIS que o orçamento de statements, contra
+        // o Postgres de verdade. Os dois lados do critério da #525 medidos na
+        // mesma execução: se alguém reintroduzir uma leitura para "consertar"
+        // uma diferença de bytes, este número sobe e o caso fica vermelho aqui,
+        // não só na lane unitária.
+        expect(statements).toBe(esperadoDeStatements(caso));
+        expect(statements).toBeLessThanOrEqual(TURN_ROUND_TRIP_BUDGET);
       } finally {
         if (caso.perfilV2) {
           await c.query(
             `DELETE FROM agent_operational_profile_versions WHERE tenant_id=$1 AND agent_id=$2`,
             [T.tenant_id, T.agent_id],
           );
+        }
+        if (caso.procedimentoAtivo) {
+          await c.query(`DELETE FROM procedure_executions WHERE tenant_id=$1 AND agent_id=$2`, [
+            T.tenant_id,
+            T.agent_id,
+          ]);
         }
         c.release();
       }
