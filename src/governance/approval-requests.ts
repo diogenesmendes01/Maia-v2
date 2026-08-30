@@ -100,6 +100,29 @@ export type EnsureApprovalResult = {
 };
 
 /**
+ * Como este módulo pede que um aviso de aprovação seja emitido.
+ *
+ * Issue #506 — a assinatura era `(jid, text) => Promise<unknown>` e passou a
+ * carregar `dedupe_key` porque o emissor deixou de ser uma chamada ao canal e
+ * passou a ser uma linha de ledger durável
+ * (`src/runtime/outbound/proactive-notice.ts`). A chave NÃO podia ser derivada
+ * dentro do emissor: só AQUI se conhece a row que justifica o aviso
+ * (`approval_requests.id`) e quem é o destinatário — e é o par dos dois que
+ * define "este aviso já foi comprometido". Um emissor que inventasse a chave a
+ * partir do texto reenviaria o mesmo aviso a cada mudança de redação e deixaria
+ * de reenviar quando duas pessoas diferentes recebessem o mesmo texto.
+ *
+ * O contrato continua sendo uma FUNÇÃO e não uma importação direta do
+ * emissor: `_dispatcher.ts` injeta a implementação por import dinâmico para não
+ * arrastar o grafo do gateway, e os testes injetam um duplo.
+ */
+export type ApprovalNotify = (input: {
+  jid: string;
+  text: string;
+  dedupe_key: string;
+}) => Promise<unknown>;
+
+/**
  * Garante um request aberto para o intent (idempotente por fingerprint).
  * Quando cria: audita, auto-registra a assinatura do requester quando a
  * classe conta com ela, e notifica os aprovadores fora da fronteira LLM.
@@ -117,7 +140,7 @@ export async function ensureApprovalRequest(input: {
   args: unknown;
   approval_class: ApprovalClass;
   reason: string;
-  notify: (jid: string, text: string) => Promise<unknown>;
+  notify: ApprovalNotify;
 }): Promise<EnsureApprovalResult> {
   const intent_hash = computeIntentHash({
     tenant_id: input.tenant_id,
@@ -213,14 +236,18 @@ async function notifyForRequest(input: {
   request: ApprovalRequest;
   requester: Pessoa;
   reason: string;
-  notify: (jid: string, text: string) => Promise<unknown>;
+  notify: ApprovalNotify;
 }): Promise<void> {
   const ref = approvalRef(input.request);
   if (input.request.approval_class === 'single_confirmation') {
     const text =
       `Confirmação necessária (${ref}): ${input.reason}\n` +
       `Responda 'aprova ${ref}' para confirmar, ou 'recusa ${ref}' para cancelar.`;
-    await input.notify(jidOf(input.requester), text);
+    await input.notify({
+      jid: jidOf(input.requester),
+      text,
+      dedupe_key: `approval_request:${input.request.id}:notify:${input.requester.id}`,
+    });
     return;
   }
   const owners = await listOwners();
@@ -234,9 +261,15 @@ async function notifyForRequest(input: {
     ) {
       continue; // já assinou na criação — notificar só quem falta decidir
     }
-    await input.notify(jidOf(o), text).catch((err) =>
-      logger.warn({ err: (err as Error).message, pessoa_id: o.id }, 'approval.notify_failed'),
-    );
+    await input
+      .notify({
+        jid: jidOf(o),
+        text,
+        dedupe_key: `approval_request:${input.request.id}:notify:${o.id}`,
+      })
+      .catch((err) =>
+        logger.warn({ err: (err as Error).message, pessoa_id: o.id }, 'approval.notify_failed'),
+      );
   }
 }
 
@@ -513,9 +546,7 @@ export async function failClaimedApproval(input: {
  * Varredura de expiração (chamada pelo engine tick sob ALS). Audita cada
  * request expirado e notifica o requester best-effort.
  */
-export async function expireDueApprovals(
-  notify: (jid: string, text: string) => Promise<unknown>,
-): Promise<number> {
+export async function expireDueApprovals(notify: ApprovalNotify): Promise<number> {
   const expired = await approvalRequestsRepo.expireDue();
   for (const request of expired) {
     await audit({
@@ -526,10 +557,11 @@ export async function expireDueApprovals(
     });
     const requester = await pessoasRepo.findById(request.requester_pessoa_id);
     if (requester) {
-      await notify(
-        jidOf(requester),
-        `Solicitação ${approvalRef(request)} expirou (${config.DUAL_APPROVAL_TIMEOUT_HOURS}h sem aprovação). Repita a operação se ainda for necessária.`,
-      ).catch(() => undefined);
+      await notify({
+        jid: jidOf(requester),
+        text: `Solicitação ${approvalRef(request)} expirou (${config.DUAL_APPROVAL_TIMEOUT_HOURS}h sem aprovação). Repita a operação se ainda for necessária.`,
+        dedupe_key: `approval_request:${request.id}:expired`,
+      }).catch(() => undefined);
     }
   }
   return expired.length;
