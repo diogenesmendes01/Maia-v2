@@ -64,7 +64,7 @@ export function ListEditor({
                   type="button"
                   onClick={() => remove(idx)}
                   aria-label={`Remover "${item}"`}
-                  className="shrink-0 rounded p-0.5 text-zinc-400 opacity-60 transition-opacity hover:bg-white hover:text-red-600 group-hover:opacity-100"
+                  className="shrink-0 rounded-sm p-0.5 text-zinc-400 opacity-60 transition-opacity hover:bg-white hover:text-red-600 group-hover:opacity-100"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                     <path d="M18 6 6 18M6 6l12 12" />
@@ -92,7 +92,7 @@ export function ListEditor({
             type="button"
             onClick={add}
             disabled={draft.trim().length === 0}
-            className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 text-xs font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 disabled:opacity-50"
+            className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 text-xs font-medium text-zinc-700 shadow-xs transition-colors hover:bg-zinc-50 disabled:opacity-50"
           >
             {addLabel}
           </button>
