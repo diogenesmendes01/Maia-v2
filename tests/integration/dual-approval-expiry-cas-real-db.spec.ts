@@ -12,7 +12,7 @@
  * Este spec é sobre o efeito EXTERNO. A asserção que importa não é o status no
  * banco (esse convergiria de qualquer jeito): é quantas mensagens saíram.
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 
 const SHOULD_RUN =
@@ -23,19 +23,24 @@ const T = 'idual-tenant';
 const A = 'idual-agent';
 
 /**
- * A fronteira de saída, falsificada para CONTAR. É o único mock: tudo mais —
- * o CAS, o relógio do banco, a leitura de pendentes — é real.
+ * A fronteira de saída MUDOU, e a asserção acompanhou.
+ *
+ * Quando este spec nasceu, a expiração chamava `sendViaLine` e o jeito de
+ * contar o efeito era falsificar `@/gateway/line-output.js`. A #506 moveu esse
+ * aviso para o ledger durável: hoje `expireDueDualApprovals` chama
+ * `enqueueProactiveNotice`, que grava uma row em `outbox_messages` com
+ * `dedup_key = dual_approval:<id>:expired`, e o drain de agendamento entrega.
+ *
+ * Contar rows do ledger é melhor que contar chamadas de um dublê — é o
+ * artefato de produção. Mas muda o que cada asserção prova, e isso importa:
+ *
+ *   - a CONTAGEM DE AVISOS passou a ter DUAS proteções: o CAS daqui e o
+ *     `idx_outbox_dedup` do ledger. Ela documenta defesa em profundidade, e
+ *     sozinha não distingue mais qual das duas está funcionando;
+ *   - a CONTAGEM DE AUDITORIA continua protegida SÓ pelo CAS — `audit_log` não
+ *     tem chave de deduplicação. É ela a asserção que fica vermelha quando o
+ *     compare-and-swap sai daqui, e é por isso que ela não é decorativa.
  */
-const enviadas: string[] = [];
-vi.mock('@/gateway/line-output.js', () => ({
-  forCurrentAgentChannel: vi.fn(async () => ({
-    scope: { tenant_id: T, agent_id: A, channel_id: 'c' },
-    sendText: vi.fn(async (_jid: string, texto: string) => {
-      enviadas.push(texto);
-      return 'msg-id';
-    }),
-  })),
-}));
 
 let pool: pg.Pool;
 
@@ -54,6 +59,8 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
   });
 
   afterAll(async () => {
+    await pool?.query('DELETE FROM outbox_messages WHERE tenant_id = $1', [T]);
+    await pool?.query('DELETE FROM channels WHERE tenant_id = $1', [T]);
     await pool?.query('DELETE FROM audit_log WHERE tenant_id = $1', [T]);
     await pool?.query('DELETE FROM workflows WHERE tenant_id = $1', [T]);
     await pool?.query('DELETE FROM pessoas WHERE tenant_id = $1', [T]);
@@ -61,7 +68,8 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
   });
 
   beforeEach(async () => {
-    enviadas.length = 0;
+    await pool.query('DELETE FROM outbox_messages WHERE tenant_id = $1', [T]);
+    await pool.query('DELETE FROM channels WHERE tenant_id = $1', [T]);
     await pool.query('DELETE FROM audit_log WHERE tenant_id = $1', [T]);
     await pool.query('DELETE FROM workflows WHERE tenant_id = $1', [T]);
     await pool.query('DELETE FROM pessoas WHERE tenant_id = $1', [T]);
@@ -71,6 +79,13 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
       [T, A],
     );
     pessoaId = p.rows[0]!.id;
+    // UM canal ativo. `enqueueProactiveNotice` resolve o canal do agente e é
+    // FAIL-CLOSED em ambiguidade — zero ou dois canais lançam `channel_ambiguous`.
+    await pool.query(
+      `INSERT INTO channels(tenant_id, agent_id, external_id, channel_type, active)
+       VALUES ($1, $2, 'idual-canal', 'whatsapp', true)`,
+      [T, A],
+    );
   });
 
   /**
@@ -93,6 +108,15 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
     return w.rows[0]!.id;
   };
 
+  /** Quantos avisos de expiração deste workflow existem no ledger durável. */
+  const avisosNoLedger = async (workflowId: string): Promise<number> => {
+    const r = await pool.query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM outbox_messages WHERE tenant_id = $1 AND dedup_key = $2',
+      [T, `dual_approval:${workflowId}:expired`],
+    );
+    return Number(r.rows[0]!.n);
+  };
+
   const rodarDoisTicks = async (): Promise<void> => {
     const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
     const { expireDueDualApprovals } = await import('../../src/workflows/dual-approval.js');
@@ -104,30 +128,47 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
     ]);
   };
 
-  it('dois ticks concorrentes cancelam UMA vez e avisam o solicitante UMA vez', async () => {
-    const id = await semearVencido();
+  it('dois ticks concorrentes vencem cada workflow UMA vez', async () => {
+    // POR QUE QUINZE E NÃO UM.
+    //
+    // Com um workflow só, este caso era RACY na direção que importa: sem o CAS
+    // ele ficava vermelho na primeira tentativa e VERDE na segunda, porque às
+    // vezes o `listPending` do segundo tick já enxergava `cancelado` e pulava.
+    // Um teste que só às vezes pega o defeito não é uma trava — e o banner da
+    // suíte diz, com todas as letras, que "recuperado pela segunda tentativa"
+    // não é verde.
+    //
+    // Com quinze, os dois ticks leem a lista inteira antes que qualquer um
+    // termine de escrever: para o caso passar sem o CAS, TODOS os quinze
+    // teriam de serializar na ordem exata, o que não acontece. A afirmação
+    // continua sendo a mesma — cada workflow vence uma vez só.
+    const ids: string[] = [];
+    for (let k = 0; k < 15; k++) ids.push(await semearVencido());
 
     await rodarDoisTicks();
 
-    // A asserção que importa: o usuário recebeu UMA mensagem, não duas.
-    expect(
-      enviadas.length,
-      `o solicitante recebeu ${enviadas.length} mensagens de expiração`,
-    ).toBe(1);
+    // Defesa em profundidade no aviso: o CAS daqui MAIS o `idx_outbox_dedup`
+    // do ledger. Um aviso por workflow.
+    for (const id of ids) {
+      const avisos = await avisosNoLedger(id);
+      expect(avisos, `o solicitante teria recebido ${avisos} avisos de DA-${id.slice(0, 8)}`).toBe(1);
+    }
 
-    const st = await pool.query<{ status: string }>(
-      'SELECT status FROM workflows WHERE id = $1',
-      [id],
+    const st = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM workflows WHERE tenant_id = $1 AND status = 'cancelado'",
+      [T],
     );
-    expect(st.rows[0]!.status).toBe('cancelado');
+    expect(Number(st.rows[0]!.n)).toBe(15);
 
-    // E a trilha também é única — auditoria dupla inventa dois fatos de um só.
+    // ESTA é a asserção que o CAS sozinho sustenta: `audit_log` não tem chave
+    // de deduplicação, então dois ticks que ambos vencessem a mesma row
+    // gravariam duas linhas. Auditoria dupla inventa dois fatos de um só.
     const au = await pool.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM audit_log
-        WHERE tenant_id = $1 AND acao = 'dual_approval_timeout' AND alvo_id = $2`,
-      [T, id],
+        WHERE tenant_id = $1 AND acao = 'dual_approval_timeout'`,
+      [T],
     );
-    expect(Number(au.rows[0]!.n), 'a expiração foi auditada mais de uma vez').toBe(1);
+    expect(Number(au.rows[0]!.n), 'houve expiração auditada mais de uma vez').toBe(15);
   });
 
   it('CONTROLE: um workflow que AINDA NÃO venceu não é cancelado nem avisado', async () => {
@@ -142,7 +183,7 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
 
     await rodarDoisTicks();
 
-    expect(enviadas.length).toBe(0);
+    expect(await avisosNoLedger(w.rows[0]!.id)).toBe(0);
     const st = await pool.query<{ status: string }>(
       'SELECT status FROM workflows WHERE id = $1',
       [w.rows[0]!.id],

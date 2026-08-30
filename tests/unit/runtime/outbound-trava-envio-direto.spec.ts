@@ -133,6 +133,58 @@ describe('#634 — trava arquitetural do envio direto', () => {
     }
   });
 
+  /**
+   * Issue #506 — A CATRACA DO NÚMERO.
+   *
+   * O critério do dono é literal: "eliminar as dez exceções; zero exceção
+   * meramente inventariada". Um teste que só exige texto em `reason` fica verde
+   * enquanto o inventário CRESCE — basta escrever bem. Este fixa o número, e o
+   * número SÓ DIMINUI.
+   *
+   * Quando uma exceção for eliminada de verdade, este literal desce junto, no
+   * MESMO commit. Um commit que remove a entrada e deixa o teto para trás
+   * afrouxa a guarda em silêncio, que é a forma mais barata de perder um
+   * invariante.
+   */
+  it('o inventário tem exatamente SEIS exceções — o teto só desce', () => {
+    const excecoes = declaredExceptions();
+    expect(
+      excecoes.map((e) => e.id).sort(),
+      'inventário de exceções mudou: se você ELIMINOU uma, baixe o número aqui no mesmo commit; ' +
+        'se você ACRESCENTOU uma, a épica #506 anda para trás e isso precisa de decisão humana',
+    ).toEqual(
+      [
+        'agent.message_update_owner_review',
+        'agent.react_loop_tool_reaction',
+        'identity.quarantine',
+        'scheduling.outbox_drain',
+        'workers.idempotency_relayer',
+        'workers.pending_reminder',
+      ].sort(),
+    );
+  });
+
+  /**
+   * Issue #506 — NENHUMA ENTRADA MERAMENTE INVENTARIADA.
+   *
+   * A varredura acima prova a direção fácil: um módulo que envia PRECISA estar
+   * no inventário. Esta prova a direção que faltava, e é a que o critério do
+   * dono cobra: uma entrada cujo módulo NÃO envia mais nada é exceção só no
+   * papel. Sem este teste, migrar um call site e esquecer de apagar a linha
+   * deixaria o inventário maior do que a realidade — e o próximo agente leria
+   * dez exceções onde existem seis.
+   */
+  it('nenhuma exceção declarada sobrevive ao módulo parar de enviar', () => {
+    const achados = varredura();
+    const fantasmas = declaredExceptions()
+      .filter((e) => !achados.has(e.module))
+      .map((e) => e.id);
+    expect(
+      fantasmas,
+      'estas entradas descrevem módulos que não chamam mais primitiva nenhuma — apague-as do inventário',
+    ).toEqual([]);
+  });
+
   it('ids do inventário são únicos', () => {
     const ids = OUTBOUND_SEND_PATHS.map((p) => p.id);
     expect(new Set(ids).size).toBe(ids.length);
@@ -166,12 +218,41 @@ describe('#634 — trava arquitetural do envio direto', () => {
   });
 
   it('dentro de uma exceção INVENTARIADA o envio é autorizado', async () => {
-    await withDeclaredEgressException('workers.briefings', async () => {
+    await withDeclaredEgressException('identity.quarantine', async () => {
       expect(assertEgressAuthorized('sendText')).toEqual({
         via: 'exception',
-        path_id: 'workers.briefings',
+        path_id: 'identity.quarantine',
       });
     });
+  });
+
+  /**
+   * Issue #506 — A EXCEÇÃO APOSENTADA NÃO VOLTA.
+   *
+   * A varredura estática pega o envio direto ESCRITO no módulo. Ela não pega
+   * o envio por referência indireta — uma função que recebe o `LineOutput` de
+   * fora, um `const send = line.sendText.bind(line)`, um módulo novo que
+   * reabre o id antigo "porque já existia". A trava de RUNTIME pega, e este
+   * caso prova que ela pega para os quatro ids que esta fatia aposentou.
+   *
+   * Por que os ids literais e não `declaredExceptions()`: a lista de exceções
+   * vivas responde "o que ainda é permitido". Esta responde outra pergunta —
+   * "o que já foi eliminado e não pode ser ressuscitado" — e ela precisa de
+   * memória própria, porque a lista viva esqueceu esses nomes de propósito.
+   */
+  it.each([
+    'workers.briefings',
+    'workflows.dual_approval',
+    'workflows.engine',
+    'tools.approval_notification',
+  ])('a exceção aposentada `%s` não pode ser reaberta em runtime', (id) => {
+    expect(() => withDeclaredEgressException(id, async () => undefined)).toThrow(
+      /not declared in the outbound send-path inventory/,
+    );
+    expect(() => withDeclaredEgressExceptionSync(id, () => undefined)).toThrow(
+      /not declared in the outbound send-path inventory/,
+    );
+    expect(isDeclaredEgressException(id)).toBe(false);
   });
 
   it('um id de exceção DESCONHECIDO é recusado — não dá para abrir exceção sem inventariar', () => {
@@ -271,26 +352,31 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
     // `blocked_by` é o campo que separa "decisão técnica" de "adiamento bem
     // escrito". Sem ele, a entrada é o que o dono chamou de exceção meramente
     // inventariada.
-    const semImpedimento = {
-      ...OUTBOUND_SEND_PATHS.find((p) => p.id === 'workers.briefings')!,
-      blocked_by: undefined,
-    };
+    // A cobaia é uma exceção VIVA. Este caso nasceu apontando para
+    // `workers.briefings`, que esta fatia eliminou: o `find` passava a devolver
+    // `undefined`, o spread virava um objeto sem `state`, a catraca o ignorava
+    // e o teste passava a afirmar nada. Daí o `expect(...).toBeDefined()`
+    // abaixo — ele transforma "a cobaia sumiu" em falha nomeada, e não em
+    // verde vazio.
+    const cobaia = OUTBOUND_SEND_PATHS.find((p) => p.id === 'identity.quarantine');
+    expect(cobaia, 'a cobaia saiu do inventário — escolha outra exceção viva').toBeDefined();
+    const semImpedimento = { ...cobaia!, blocked_by: undefined };
     expect(() =>
       assertRatifiedInventory([
-        ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'workers.briefings'),
+        ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'identity.quarantine'),
         semImpedimento,
       ]),
     ).toThrow(/sem 'blocked_by'/);
   });
 
   it('uma exceção SEM remediação é recusada — toda exceção diz o que a apaga', () => {
-    const semRemediacao = {
-      ...OUTBOUND_SEND_PATHS.find((p) => p.id === 'workflows.engine')!,
-      remediation: '   ',
-    };
+    // Mesma troca de cobaia, e pela mesma razão, do caso acima.
+    const cobaia = OUTBOUND_SEND_PATHS.find((p) => p.id === 'workers.pending_reminder');
+    expect(cobaia, 'a cobaia saiu do inventário — escolha outra exceção viva').toBeDefined();
+    const semRemediacao = { ...cobaia!, remediation: '   ' };
     expect(() =>
       assertRatifiedInventory([
-        ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'workflows.engine'),
+        ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'workers.pending_reminder'),
         semRemediacao,
       ]),
     ).toThrow(/sem 'remediation'/);

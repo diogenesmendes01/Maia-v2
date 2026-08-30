@@ -874,18 +874,49 @@ markdown, para que o teste possa lê-lo. Três estados: `outbox`,
 | Estado | Caminhos |
 |---|---|
 | `outbox` | `agent/output-dispatch.ts` (texto, `status_fallback`, documento, voz, enquete), `runtime/outbound/delivery.ts` |
-| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `tools/_dispatcher.ts`, `workers/briefings.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` |
+| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts` |
 | `infrastructure` | `gateway/line-output.ts`, `gateway/line-sessions.ts`, `runtime/outbound/provider-adapter.ts` |
 
-**Por que as dez continuam.** A #634 as justificou com um denominador comum
-("nenhuma tem `turn_id`"), e a auditoria de fechamento de #506 chamou isso pelo
-nome: denominador comum não é justificativa individual. Cada exceção passou a
-declarar um impedimento TIPADO, de vocabulário fechado sem membro genérico:
+**De dez para seis (#506).** Quatro entradas saíram porque os módulos pararam de
+falar com o canal: `workers/briefings.ts`, `workflows/dual-approval.ts`,
+`workflows/engine.ts` e `tools/_dispatcher.ts` comprometem o aviso em
+`outbox_messages` via `src/runtime/outbound/proactive-notice.ts`, e o drain de
+agendamento entrega com claim, backoff e DLQ. Não é o outbox do TURNO — é o
+ledger durável que já existia —, e o inventário diz isso com todas as letras. O
+que os quatro ganharam é a propriedade que a épica exige e que eles não tinham:
+**persistir antes de enviar**. O que a fatia comprou de quebra é que a fusão dos
+ledgers passou a ter um ponto de aplicação (`scheduling/outbox-drain.ts`) em vez
+de cinco.
+
+A catraca vive em `tests/unit/runtime/outbound-trava-envio-direto.spec.ts`: a
+lista de seis ids é literal (o número **só desce**), os quatro ids aposentados
+são recusados pela trava de runtime, e uma entrada cujo módulo deixou de enviar
+reprova como "exceção fantasma".
+
+**CORREÇÃO DE FATO.** A versão anterior desta seção dizia que o denominador
+comum das dez era "nenhuma tem `turn_id`", porque "o outbox exige `turn_id NOT
+NULL` (migração 121)". **A coluna é NULLABLE** — a 121 a cria com
+`ADD COLUMN IF NOT EXISTS turn_id uuid`, o CHECK de completude é
+`CASE WHEN turn_id IS NULL THEN true ELSE (...) END`, a FK composta é MATCH
+SIMPLE (inerte com NULL) e o UNIQUE da chave lógica não menciona `turn_id`. Nem
+o destinatário é amarrado ao turno: `resolveOutboundDeliveryScope` resolve o JID
+pela `conversa_id` da própria row. O que bloqueia é CÓDIGO —
+`commitOutboundIntent` exige `getOutboundTurnScope()`, e `deliverOutbound`
+recusa row sem `turn_id` na entrada — e mudar isso é mudar o MODELO do outbox.
+A proposta escrita está em
+[`decisions/0005-outbox-sem-turno.md`](../decisions/0005-outbox-sem-turno.md),
+com migração, guarda, ordem de coortes e o que a reconciliação passa a
+distinguir. Ela aguarda decisão humana; nenhuma parte dela foi implementada.
+
+**O impedimento de cada uma das seis, tipado.** A #634 as justificava com um
+denominador comum ("nenhuma tem `turn_id`"), e a auditoria de fechamento chamou
+isso pelo nome: denominador comum não é justificativa individual. O vocabulário
+é fechado, sem membro genérico.
 
 | `blocked_by` | Quantas | O que desbloqueia |
 |---|---|---|
-| `no_turn_to_anchor` | 4 (`identity/quarantine`, `workers/briefings`, `workers/pending-reminder`, `workflows/engine`) | Uma âncora durável para saída SEM turno, com entrega própria. `outbound_messages.turn_id` é `NOT NULL` (121), a FK é composta contra `agent_turns`, e `deliverOutbound` recusa row sem `turn_id` |
-| `foreign_recipient` | 3 (`agent/message-update`, `tools/_dispatcher`, `workflows/dual-approval`) | Uma identidade lógica de saída dirigida a TERCEIRO — o JID hoje é resolvido no ingresso do job pela `conversa_id` da row. As duas de aprovação acrescem fan-out para N aprovadores |
+| `no_turn_to_anchor` | 2 (`identity/quarantine`, `workers/pending-reminder`) | Uma âncora durável para saída SEM turno, com entrega própria. O bloqueio é de CÓDIGO, não de schema — ver a correção acima |
+| `foreign_recipient` | 1 (`agent/message-update`) | Uma identidade lógica de saída dirigida a TERCEIRO — o JID hoje é resolvido no ingresso do job pela `conversa_id` da row |
 | `competing_durable_ledger` | 2 (`scheduling/outbox-drain`, `workers/idempotency-outbox-relayer`) | A FUSÃO dos ledgers. Ligar o drain ao outbox do turno criaria dois senders autoritativos — o que a §Rollback da issue proíbe nominalmente |
 | `ephemeral_signal_without_provider_id` | 1 (`agent/react-loop`) | Uma capability de provedor que confirme reação. Hoje `sendReaction` devolve `void`, o adaptador só pode dizer `accepted_without_id`, e toda reação migrada nasceria `delivery_unknown` → `escalate_manual`: uma linha de trabalho HUMANO por reação |
 

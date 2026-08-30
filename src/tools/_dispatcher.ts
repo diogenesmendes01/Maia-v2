@@ -13,6 +13,7 @@ import {
   releaseClaimedApproval,
   dualClassFor,
 } from '@/governance/approval-requests.js';
+import type { ApprovalNotify } from '@/governance/approval-requests.js';
 import type { ApprovalClass } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { REGISTRY, isToolEnabled, type AnyTool, type ToolTurnContext } from './_registry.js';
@@ -597,21 +598,28 @@ async function dispatchToolInner(input: {
         },
       };
     } else {
-      // Import dinâmico: mantém o grafo de módulos do dispatcher leve (o
-      // gateway puxa Baileys) e só resolve a fronteira de saída quando um
-      // request precisa de fato notificar humanos.
-      const notify = async (jid: string, text: string): Promise<unknown> => {
-        const { forCurrentAgentChannel } = await import('@/gateway/line-output.js');
-        const { withDeclaredEgressException } = await import(
-          '@/runtime/outbound/egress-guard.js'
+      // Issue #506 — o aviso ao aprovador vira LINHA DE LEDGER.
+      //
+      // O que havia aqui: `forCurrentAgentChannel(null)` + `line.sendText(...)`
+      // sob exceção de egresso declarada. O aviso é o ÚNICO evento que faz um
+      // aprovador olhar para um pedido: o `approval_requests` persistido é
+      // verdade sobre o pedido, mas ninguém consulta a tabela. Perder o aviso
+      // era perder a aprovação por inanição — o request ficava aberto até
+      // expirar, e o usuário do turno ficava esperando algo que não ia chegar.
+      //
+      // Agora o aviso é comprometido em `outbox_messages` antes de qualquer
+      // chamada ao canal, com retry e DLQ, e a chave de dedupe
+      // (`approval_request:<id>:notify:<pessoa>`) garante exatamente um aviso
+      // por aprovador por pedido.
+      //
+      // Import dinâmico mantido: o emissor puxa o repositório de agendamento, e
+      // o dispatcher só o resolve quando um request precisa de fato notificar
+      // humanos.
+      const notify: ApprovalNotify = async (input) => {
+        const { enqueueProactiveNotice } = await import(
+          '@/runtime/outbound/proactive-notice.js'
         );
-        const line = await forCurrentAgentChannel(null);
-        // #634 — exceção INVENTARIADA (`tools.approval_notification`): o
-        // destinatário é o APROVADOR, não o interlocutor do turno; o
-        // `approval_requests` persistido é a fonte de verdade.
-        return withDeclaredEgressException('tools.approval_notification', () =>
-          line.sendText(jid, text),
-        );
+        return enqueueProactiveNotice(input);
       };
       const ensured = await ensureApprovalRequest({
         tenant_id: getCurrentTenant(),

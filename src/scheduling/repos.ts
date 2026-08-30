@@ -1125,9 +1125,28 @@ export const outboxRepo = {
     } catch (err) {
       // Dedup collision is idempotent success — caller already enqueued.
       //
-      // `idx_outbox_dedup` é o índice parcial (`WHERE dedup_key IS NOT NULL`)
-      // cuja violação significa exatamente isso. Qualquer outro `23505` desta
-      // tabela — a chave primária, por exemplo — é defeito e sobe.
+      // Issue #506 — ISTO ESTAVA QUEBRADO, e o defeito era invisível.
+      //
+      // A versão anterior casava `/duplicate key|unique constraint/i` contra
+      // `(err as Error).message`. O que chega aqui NÃO é o erro do `pg`: o
+      // driver do Drizzle embrulha a falha num erro cuja mensagem é
+      // `Failed query: insert into "outbox_messages" ...` e pendura o erro
+      // original em `cause`. A regex nunca casava, então a colisão de
+      // `dedup_key` — o mecanismo de idempotência INTEIRO deste ledger —
+      // subia como exceção para o chamador, em vez de virar o `null` que o
+      // contrato promete.
+      //
+      // A leitura certa é o SQLSTATE percorrendo a cadeia de `cause`, que é o
+      // que `pgErrorCode` faz, e a NARROW por nome de constraint, que é o que
+      // `pgErrorConstraint` existe para permitir: `23505` só quer dizer "algum
+      // unique foi violado", e engolir qualquer 23505 desta tabela esconderia
+      // uma colisão de chave primária — que seria um defeito de verdade, não
+      // uma corrida rotineira. `idx_outbox_dedup` é o índice parcial da
+      // migração 007, e é o único cuja violação significa "o chamador já
+      // enfileirou isto".
+      //
+      // O `idx_outbox_dedup` é PARCIAL (`WHERE dedup_key IS NOT NULL`), então
+      // uma row sem `dedup_key` nunca colide por ele.
       if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
         return null;
       }

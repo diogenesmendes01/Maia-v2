@@ -16,7 +16,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 
 const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
-const { sendTextMock } = vi.hoisted(() => ({ sendTextMock: vi.fn(async () => 'msg-1') }));
+const { sendTextMock, enqueueNoticeMock } = vi.hoisted(() => ({
+  sendTextMock: vi.fn(async () => 'msg-1'),
+  enqueueNoticeMock: vi.fn(async () => 'enqueued' as const),
+}));
 const { handlerMock } = vi.hoisted(() => ({
   handlerMock: vi.fn(async () => ({ ok: true })),
 }));
@@ -190,8 +193,16 @@ vi.mock('@/lib/redis.js', () => ({ isRedisConnected: vi.fn(() => true) }));
 vi.mock('@/lib/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+// Issue #506 — o aviso ao aprovador deixou de ser `line.sendText` e virou uma
+// linha do ledger durável de agendamento. O mock da fronteira de saída fica
+// como TRIPWIRE: se o dispatcher voltar a falar direto com o canal,
+// `sendTextMock` registra a chamada e a asserção de "zero envio direto" abaixo
+// fica vermelha.
 vi.mock('@/gateway/line-output.js', () => ({
   forCurrentAgentChannel: vi.fn(async () => ({ sendText: sendTextMock })),
+}));
+vi.mock('@/runtime/outbound/proactive-notice.js', () => ({
+  enqueueProactiveNotice: enqueueNoticeMock,
 }));
 
 // Tool fake de ESCRITA sensível: entra no catálogo crítico via nome
@@ -268,6 +279,7 @@ beforeEach(() => {
   store.reset();
   handlerMock.mockClear();
   sendTextMock.mockClear();
+  enqueueNoticeMock.mockClear();
   auditMock.mockClear();
 });
 
@@ -282,8 +294,20 @@ describe('dispatcher — aprovação backend (Fase 0 cap. 3)', () => {
     // requester é dono → classe requester_plus_one_owner, assina na criação
     expect(row.approval_class).toBe('requester_plus_one_owner');
     expect(store.decisions).toHaveLength(1);
-    // notificação saiu para o outro owner (não para o requester)
-    expect(sendTextMock).toHaveBeenCalledTimes(1);
+    // Issue #506 — a notificação ao outro owner (não ao requester) é
+    // COMPROMETIDA no ledger durável antes de virar mensagem, e nunca sai por
+    // chamada direta ao canal.
+    expect(sendTextMock).not.toHaveBeenCalled();
+    expect(enqueueNoticeMock).toHaveBeenCalledTimes(1);
+    const notice = enqueueNoticeMock.mock.calls[0]![0] as unknown as {
+      jid: string;
+      text: string;
+      dedupe_key: string;
+    };
+    // A chave amarra o aviso à row durável que o justifica E ao destinatário:
+    // é o par que torna "este aviso já foi comprometido" uma pergunta
+    // respondível pelo unique do banco, e não pelo texto da mensagem.
+    expect(notice.dedupe_key).toBe(`approval_request:${row.id}:notify:owner-2`);
   });
 
   it('(2) dual_approval_granted nos args do LLM é inerte', async () => {
