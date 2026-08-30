@@ -144,7 +144,20 @@ export async function expireDueDualApprovals(): Promise<number> {
     if (wf.tipo !== 'dual_approval') continue;
     if (!wf.proxima_acao_em) continue;
     if (new Date(wf.proxima_acao_em) > new Date()) continue;
-    await workflowsRepo.setStatus(wf.id, 'cancelado');
+    // O cancelamento é um COMPARE-AND-SWAP, e o que vem depois dele só roda se
+    // esta chamada tiver sido a vencedora.
+    //
+    // Motivo: `expireDueDualApprovals()` tem DOIS disparadores — o job
+    // `pending_expirer` e o `workflow_engine_tick`. Com o `setStatus`
+    // incondicional que havia aqui, os dois venciam o mesmo workflow, auditavam
+    // duas vezes e mandavam ao solicitante a mensagem de expiração DUAS VEZES.
+    // Não era um risco de duas réplicas: acontecia dentro de um processo só.
+    //
+    // A checagem de prazo em JavaScript acima continua, mas só como filtro
+    // barato: quem decide é o `proxima_acao_em <= now()` DENTRO do CAS, com o
+    // relógio do banco.
+    const venceu = await workflowsRepo.expireIfDue(wf.id);
+    if (!venceu) continue;
     await audit({ acao: 'dual_approval_timeout', alvo_id: wf.id });
     const ctx = wf.contexto as DualApprovalCtx;
     const requester = await pessoasRepo.findById(ctx.requester_pessoa_id);
