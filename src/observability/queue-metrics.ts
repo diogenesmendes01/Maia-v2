@@ -34,7 +34,8 @@ import { METRIC } from './taxonomy.js';
  * `'paused'` de `JobType`, e é esse o único erro de compilação que a PR
  * automática #649 produziu (`queue-metrics.ts:52`).
  *
- * Medido nesta máquina, fila pausada com 2 jobs (`scratchpad/paused-probe`):
+ * Medido contra Redis real nas duas versões (fila pausada, 2 jobs; para repetir:
+ * `queue.pause()`, dois `add`, e então `getJobCounts` + `KEYS bull:<fila>:*`):
  *
  *   bullmq 5.78.0 → getJobCounts(...) = { waiting: 0, paused: 2 }, chave `paused`
  *   bullmq 6.2.0  → getJobCounts(...) = { waiting: 2 },            chave `wait`
