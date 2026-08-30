@@ -156,7 +156,7 @@ export default function ToolsCatalogPage() {
                   type="checkbox"
                   checked={enabledOnly}
                   onChange={(e) => setEnabledOnly(e.target.checked)}
-                  className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                  className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                 />
                 Somente habilitadas
               </label>
@@ -165,7 +165,7 @@ export default function ToolsCatalogPage() {
                   type="checkbox"
                   checked={sensitiveOnly}
                   onChange={(e) => setSensitiveOnly(e.target.checked)}
-                  className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                  className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                 />
                 Somente sensíveis
               </label>

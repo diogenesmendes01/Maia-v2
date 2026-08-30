@@ -46,6 +46,7 @@ export const rememberSafeFactTool: Tool<typeof inputSchema, typeof outputSchema>
   output_schema: outputSchema,
   required_actions: ['save_safe_fact'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'safe_fact_remembered',

@@ -18,6 +18,10 @@ import type { AgentTurn, Conversa, Mensagem, PendingQuestion } from '../schema.j
 // Issue #503 — ingresso atômico (mensagem + turno na mesma transação). Import
 // unidirecional: `turn-repos` NÃO importa este módulo, então não há ciclo.
 import { agentTurnsRepo } from './turn-repos.js';
+// O conjunto de status abertos de workflow mora em UM lugar (governance-repos);
+// esta era a quinta cópia literal dele. `governance-repos` não importa este
+// módulo, então a aresta é unidirecional.
+import { workflowOpenStatusesAny } from './governance-repos.js';
 // Issue #505 — a guarda FAIL-CLOSED da identidade de stream.
 //
 // `requireStreamIdentity` é PURO (só `node:crypto`), e isso é estrutural, não
@@ -1139,7 +1143,7 @@ export const pendingQuestionsRepo = {
         WHERE tenant_id IS NOT NULL
           AND agent_id IS NOT NULL
           AND tipo = 'dual_approval'
-          AND status IN ('pendente', 'em_andamento', 'aguardando_humano', 'aguardando_terceiro')
+          AND status = ${workflowOpenStatusesAny()}
           AND proxima_acao_em IS NOT NULL
           AND proxima_acao_em < now()
     `);

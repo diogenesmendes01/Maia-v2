@@ -39,6 +39,8 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { counter, METRIC } from '@/observability/metrics.js';
 import { forChannel, forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
+import { getLineSessionManager } from '@/gateway/line-session-manager.js';
+import { podeEnviarPorEstaLinha } from '@/gateway/line-sessions.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { outboundDeliveryRepo } from '@/db/repositories/outbound-delivery-repo.js';
 import { getTurnExecutionContext } from '@/runtime/turns/execution-context.js';
@@ -298,6 +300,50 @@ export async function deliverOutbound(input: DeliverOutboundInput): Promise<Deli
     (input.channel_id
       ? await forChannel({ tenant_id, agent_id, channel_id: input.channel_id })
       : await forCurrentAgentChannel(null));
+
+  // ── (7b) FENCE DO CANAL. #513 — outra posse, outra pergunta. ────────────
+  //
+  // O fence de (8) é o do OUTBOX: "sou o worker dono desta linha do outbox?".
+  // Este é o do CANAL: "sou a réplica dona deste socket?". Um worker pode
+  // legitimamente possuir a linha do outbox enquanto OUTRA réplica possui a
+  // sessão — e aí o envio sairia pela sessão errada, que é o que a #513
+  // existe para impedir.
+  //
+  // A fatia B fecha o socket ao perder a posse, mas só no próximo tick (≤5s).
+  // Nessa janela o transporte local ainda existe e o envio passaria. Aqui a
+  // janela fecha, com a confirmação vindo do banco no instante do envio.
+  //
+  // SÓ quando o roteamento por linha está ligado. Com `MAIA_MULTI_LINE=false`
+  // não há posse por canal: o envio sai pelo transporte global, e exigir um
+  // fence que ninguém adquire recusaria todo envio da topologia de hoje.
+  //
+  // O custo é uma consulta por MENSAGEM (não por primitiva), num caminho que já
+  // faz `findById`, o claim e o `markSending` — e é o preço de não mandar a
+  // mesma mensagem por duas sessões.
+  if (getLineSessionManager().isEnabled()) {
+    const dono = await podeEnviarPorEstaLinha({
+      tenant_id,
+      agent_id,
+      channel_id: line.scope.channel_id,
+    });
+    if (!dono) {
+      // `cancelled_before_send` e não `failed`: nada saiu, e a linha continua
+      // entregável — pelo sucessor, que é quem tem a posse. Marcar falha aqui
+      // gastaria uma tentativa do orçamento que leva à DLQ por um evento que
+      // não é falha nenhuma.
+      counter(METRIC.OUTBOUND_LEASE_LOST, { reason: 'fence_rejected' });
+      logger.warn(
+        { outbound_id: claim.outbound_id, channel_id: line.scope.channel_id, ops_alert: true },
+        'outbound.channel_ownership_lost_before_send',
+      );
+      await finalizeOutcome(claim, {
+        outcome: 'cancelled_before_send',
+        last_error_code: 'channel_ownership_lost',
+        payload_type: payload.type,
+      });
+      return { delivered: false, outbound_id: input.outbound_id, reason: 'claim_not_acquired' };
+    }
+  }
 
   // ── (8) `sending` COM FENCE. O último passo antes do efeito. ─────────────
   //

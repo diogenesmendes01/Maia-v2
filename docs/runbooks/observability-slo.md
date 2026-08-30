@@ -178,6 +178,15 @@ O diagnóstico é uma subtração:
    Concorrência do agent worker é 1 por design.
 3. `state="failed"` crescendo ⇒ veja §4.8.
 
+**Fila pausada, a partir da BullMQ 6.** Não existe mais `state="paused"`. Até a
+5.x, `Queue.pause()` renomeava a lista `wait` para `paused` e o backlog inteiro
+saía de `state="waiting"` — pausar a fila **zerava** a série que este alerta
+manda você olhar, com jobs represados atrás. Na 6.x pausar grava um campo no
+hash `bull:<fila>:meta` e os jobs ficam em `wait`, então `state="waiting"` conta
+o backlog de uma fila pausada e o ponto cego fechou. Para saber se a fila
+está pausada (e não só cheia), a 6.x expõe `Queue.isPaused()` — hoje sem
+métrica dedicada. Ver `src/observability/queue-metrics.ts`.
+
 ### 4.7 `MaiaQueueMetricsAbsent`
 
 Gauge em `NaN` ou série ausente. **Não interprete como fila vazia.** Significa

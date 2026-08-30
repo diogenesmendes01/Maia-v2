@@ -70,6 +70,7 @@ export const conversationSummaryGenerateTool: Tool<typeof inputSchema, typeof ou
   output_schema: outputSchema,
   required_actions: [],
   side_effect: 'none',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'read',
   audit_action: 'conversation_summary_generated',

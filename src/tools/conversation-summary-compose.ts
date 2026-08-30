@@ -69,6 +69,7 @@ export const conversationSummaryComposeTool: Tool<typeof inputSchema, typeof out
   output_schema: outputSchema,
   required_actions: [],
   side_effect: 'none',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'parse_only',
   audit_action: 'conversation_summary_composed',

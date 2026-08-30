@@ -69,6 +69,7 @@ export const boletoCancelTool: Tool<typeof inputSchema, typeof outputSchema> = {
   output_schema: outputSchema,
   required_actions: ['cancel_boleto'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'cancel',
   audit_action: 'boleto_cancelled',

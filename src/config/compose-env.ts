@@ -583,6 +583,20 @@ export function composeEnvFileInterpolationRefs(
 export const COMPOSE_SERVICE_CONTRACT: Readonly<Record<string, readonly MaiaService[]>> = {
   migrate: ['migrator'],
   app: ['runtime'],
+  // Issue #513 — os dois papéis separados do profile `split-roles`. Eles
+  // rodam a MESMA imagem e o MESMO loader do `app` (`src/config/env.ts`
+  // chama `validateConfig({ service: 'runtime' })`), então o subset avaliado
+  // é `runtime` nos três, e é por isso que os três dividem `.env.app`.
+  //
+  // Isto NÃO é o least privilege da #513 §10 — é a descrição honesta do que o
+  // container valida hoje. O subset POR PAPEL está declarado em
+  // `src/runtime/lifecycle/role-config.ts`; para ele virar env file próprio, o
+  // loader precisa antes aceitar validar um subconjunto do runtime (hoje um
+  // `.env.scheduler` sem `ANTHROPIC_API_KEY` reprova em `requiredWhen`), e é
+  // esse o follow-up nomeado na PR. Declarar `['runtime']` aqui é o que impede
+  // o falso verde: o preflight cobra dos três exatamente o que o boot cobra.
+  scheduler: ['runtime'],
+  worker: ['runtime'],
   // UM subset, e é o do próprio serviço — desde a issue #596.
   //
   // Esta entrada foi `['runtime', 'admin-ui']` entre a #572 e a #596, e a lista

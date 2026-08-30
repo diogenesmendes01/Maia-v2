@@ -45,6 +45,7 @@ export const askPendingQuestionTool: Tool<typeof inputSchema, typeof outputSchem
   // dispatched, not when the question is asked.
   required_actions: [],
   side_effect: 'communication',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'pending_created',

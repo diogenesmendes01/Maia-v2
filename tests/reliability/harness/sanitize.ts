@@ -67,6 +67,12 @@ const CHAVES_PROIBIDAS = [
  *    a chave primária da invariante de idempotência outbound;
  *  - `claim_token` — o token de fencing da #504. É o discriminador de "quem é
  *    o dono do turno"; sem ele no artefato, a prova de stale-write some;
+ *  - `fencing_token` / `session_fencing_token` — o MESMO argumento, para a
+ *    posse de linha da #513: é o contador monotônico que separa o dono atual do
+ *    dono que voltou de uma partição. Além de apagar a prova no artefato, a
+ *    redação tem aqui um efeito pior: um probe de `estavelDurante` com esse
+ *    campo compararia `[REDACTED]` com `[REDACTED]` e passaria SEMPRE. É
+ *    contagem, não segredo;
  *  - `input_tokens` / `output_tokens` / `token_count` — contagens numéricas de
  *    telemetria, sem nenhum texto dentro.
  *
@@ -83,6 +89,10 @@ const CHAVES_LIBERADAS = new Set([
   'idempotencykey',
   'claim_token',
   'claimtoken',
+  'fencing_token',
+  'fencingtoken',
+  'session_fencing_token',
+  'sessionfencingtoken',
   'input_tokens',
   'inputtokens',
   'output_tokens',

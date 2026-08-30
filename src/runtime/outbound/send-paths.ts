@@ -29,22 +29,35 @@
  *                 Não é um "caminho de envio": é o cano por onde os outros
  *                 passam.
  *
- * ─── Por que as exceções não foram migradas nesta fatia ─────────────────────
+ * ─── O que a auditoria de fechamento da #506 mudou aqui ─────────────────────
  *
- * A issue é explícita sobre a SEQUÊNCIA: "migrar por coorte: texto primeiro,
- * depois fallbacks, depois as demais variantes", e "remoção do código legado em
- * PR separada, depois de janela estável". As dez exceções abaixo têm um
- * denominador comum que as separa da coorte do turno: **nenhuma delas tem um
- * `turn_id`**. O outbox de #631 exige `turn_id` NOT NULL (migração 121) e o
- * commit é uma transação que faz o FENCE do `claim_token` do turno — não existe
- * turno para cercar num briefing das 7h, num lembrete de pendência ou numa
- * expiração de workflow. Migrá-las exige decidir o que é "a saída lógica" de um
- * proativo, o que é escopo de outra fatia e não desta.
+ * A #634 deixou dez exceções com `reason` e `containment` escritos, e a
+ * auditoria de fechamento chamou isso pelo nome: *"o inventário de caminhos de
+ * envio não está vazio"*, e o denominador comum das dez era um só — nenhuma tem
+ * `turn_id`. Um denominador comum não é justificativa individual; é um
+ * adiamento coletivo com dez redações.
  *
- * Duas delas (`scheduling.outbox_drain` e `workers.idempotency_relayer`) já são
- * outboxes duráveis próprios, com claim, retry e DLQ. Migrá-las para o outbox do
- * turno seria colocar um outbox dentro de outro; o trabalho real ali é a fusão
- * dos dois ledgers, que a issue-mãe não pede.
+ * Duas coisas mudaram, e nenhuma delas é redação:
+ *
+ *  1. **Cada exceção passou a declarar um IMPEDIMENTO TIPADO** (`blocked_by`,
+ *     de `OUTBOUND_EXCEPTION_BLOCKERS` — vocabulário FECHADO, sem membro
+ *     genérico) e a **remediação concreta** que a apaga. As dez deixaram de
+ *     compartilhar "não tem turno": quatro são `no_turn_to_anchor`, três são
+ *     `foreign_recipient`, duas são `competing_durable_ledger` e uma é
+ *     `ephemeral_signal_without_provider_id`. São quatro trabalhos diferentes,
+ *     e agora o inventário diz qual é qual.
+ *  2. **O conjunto FECHOU.** `RATIFIED_EXCEPTION_IDS` +
+ *     `MAX_DECLARED_EXCEPTIONS` + `assertRatifiedInventory` formam uma catraca
+ *     que roda no CARREGAMENTO do módulo: uma exceção não ratificada derruba o
+ *     import — e como `egress-guard.ts` importa daqui e `line-output.ts` importa
+ *     dele, a rota paralela nova não chega a enviar nada. A lista só encolhe.
+ *
+ * O que NÃO mudou, e é a parte honesta: nenhuma das dez foi migrada. As quatro
+ * `no_turn_to_anchor` e as três `foreign_recipient` esbarram no mesmo ponto
+ * concreto — `outbound_messages.turn_id` é `NOT NULL` na migração 121, a FK é
+ * composta contra `agent_turns`, e `deliverOutbound` recusa explicitamente uma
+ * row sem `turn_id`. Migrá-las é uma âncora durável nova mais a entrega dela,
+ * não um wrapper diferente no call site.
  */
 
 /** Categorias que a issue-mãe #506 enumera. Lista FECHADA. */
@@ -64,6 +77,75 @@ export type OutboundPathCategory = (typeof OUTBOUND_PATH_CATEGORIES)[number];
 
 export type OutboundPathState = 'outbox' | 'declared_exception' | 'infrastructure';
 
+/**
+ * Issue #506 (auditoria de fechamento) — POR QUE esta rota não passa pelo
+ * outbox, como TIPO e não como redação.
+ *
+ * O dono da épica foi literal: *"zero exceção meramente inventariada"*. Uma
+ * exceção com um parágrafo bem escrito continua sendo um item de inventário se
+ * o parágrafo puder dizer qualquer coisa. O que separa "justificativa técnica
+ * individual" de "texto" é o vocabulário ser FECHADO: um bloqueio novo exige
+ * acrescentar um MEMBRO a esta lista, e um membro novo é uma afirmação de
+ * arquitetura que aparece no diff.
+ *
+ * Não existe membro genérico (`other`, `legacy`, `todo`) de propósito. A
+ * ausência é o mecanismo: quem não conseguir encaixar a rota em um dos quatro
+ * está descobrindo que a rota não tem impedimento técnico — só não foi migrada.
+ */
+export const OUTBOUND_EXCEPTION_BLOCKERS = [
+  /**
+   * O envio acontece FORA de qualquer turno.
+   *
+   * Não é uma preferência de escopo: `outbound_messages.turn_id` é `NOT NULL`
+   * para toda row durável (migração 121, CHECK
+   * `outbound_messages_durable_row_complete_check`), a FK é composta
+   * `(tenant_id, agent_id, turn_id) -> agent_turns`, e `commitTurnOutboundTx`
+   * faz FENCE do `claim_token` do turno dentro da transação. Sem turno, a row
+   * durável é literalmente inexprimível — não há o que cercar nem a que
+   * ancorar.
+   *
+   * O que desbloqueia está escrito em `remediation` de cada entrada, e é sempre
+   * a mesma família de trabalho: uma âncora durável para saída SEM turno, com
+   * entrega própria. É trabalho de fatia, não de call site.
+   */
+  'no_turn_to_anchor',
+  /**
+   * O destinatário NÃO é o interlocutor do turno.
+   *
+   * A saída lógica do outbox é chaveada por `(turn_id, sequence_in_turn)` e o
+   * turno aponta para ela; o JID de destino é resolvido no ingresso do job de
+   * entrega a partir da `conversa_id` da row. Uma saída do MESMO turno para
+   * OUTRA conversa ou outra pessoa produziria um artefato cujo destinatário
+   * diverge do turno que o ancora — e a divergência só apareceria na entrega.
+   */
+  'foreign_recipient',
+  /**
+   * A rota JÁ É um outbox durável próprio, com persistência antes do envio,
+   * claim, retry e DLQ.
+   *
+   * Migrá-la para o outbox do turno colocaria um outbox dentro de outro: duas
+   * autoridades sobre a mesma saída, que é exatamente o que a §Rollback da
+   * issue proíbe ("nunca habilitar simultaneamente dois senders autoritativos").
+   * O trabalho real é a FUSÃO dos ledgers, e ele tem dono próprio.
+   */
+  'competing_durable_ledger',
+  /**
+   * A primitiva do provedor não devolve identificador nem confirmação, e o
+   * sinal é EFÊMERO.
+   *
+   * `sendReaction` devolve `void`: `provider-adapter.ts` classifica o desfecho
+   * como `accepted_without_id`, que `statusForOutcome` mapeia para
+   * `delivery_unknown`. Uma reação migrada nasceria incerta em 100% dos casos e,
+   * como o Baileys não honra chave idempotente para `reaction`,
+   * `reconciliationDisposition` a mandaria para `escalate_manual` — a fila
+   * HUMANA de #633. O outbox passaria a produzir trabalho de operador para um
+   * sinal que não é mensagem nenhuma para o usuário.
+   */
+  'ephemeral_signal_without_provider_id',
+] as const;
+
+export type OutboundExceptionBlocker = (typeof OUTBOUND_EXCEPTION_BLOCKERS)[number];
+
 export interface OutboundSendPath {
   /** Id estável. É o valor passado a `withDeclaredEgressException`. */
   id: string;
@@ -79,6 +161,17 @@ export interface OutboundSendPath {
   reason?: string;
   /** Obrigatório em `declared_exception`: o que segura o risco hoje. */
   containment?: string;
+  /**
+   * Obrigatório em `declared_exception`: o IMPEDIMENTO técnico, do vocabulário
+   * fechado. É o campo que torna a exceção uma decisão e não um adiamento.
+   */
+  blocked_by?: OutboundExceptionBlocker;
+  /**
+   * Obrigatório em `declared_exception`: o que, concretamente, precisa existir
+   * para que esta rota passe pelo outbox. Escrito como trabalho, não como
+   * desejo — é o que alguém executaria para APAGAR esta entrada.
+   */
+  remediation?: string;
 }
 
 export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
@@ -164,6 +257,13 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
       'Best-effort e idempotente pelo lado do dono: a pendência de revisão já ' +
       'existe no banco antes do envio, então uma mensagem perdida vira lembrete, ' +
       'nunca decisão perdida.',
+    blocked_by: 'foreign_recipient',
+    remediation:
+      'Definir no contrato de #630 o que é a saída lógica de um turno dirigida a ' +
+      'TERCEIRO: ou uma faixa reservada de `sequence_in_turn` com o destinatário no ' +
+      'artefato (hoje o JID vem do ingresso do job, por `conversa_id`), ou uma âncora ' +
+      'durável própria. Enquanto o destinatário for derivado da conversa da row, o ' +
+      'artefato e o turno que o cerca discordariam sobre para quem a mensagem vai.',
   },
   {
     id: 'agent.react_loop_tool_reaction',
@@ -182,6 +282,14 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'Best-effort com `.catch` que só suprime a reação; a resposta do turno é ' +
       'independente. Uma reação perdida não é uma resposta perdida.',
+    blocked_by: 'ephemeral_signal_without_provider_id',
+    remediation:
+      'Duas coisas, nesta ordem. (a) Uma capability de provedor que confirme reação — ' +
+      'hoje `sendReaction` devolve `void` e `provider-adapter.ts:189` só pode ' +
+      'classificar `accepted_without_id`; (b) enquanto ela não existir, um desfecho ' +
+      'TERMINAL honesto para saídas sem confirmação possível, para que a reação não ' +
+      'entre na fila humana de #633. Sem (a) ou (b), migrar troca "reação perdida em ' +
+      'silêncio" por "uma linha de trabalho de operador por reação".',
   },
   {
     id: 'identity.quarantine',
@@ -197,6 +305,12 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'Estado da quarentena é durável em `pessoas.status` + pendência; a mensagem é ' +
       'um aviso sobre esse estado, e o estado sobrevive à perda do aviso.',
+    blocked_by: 'no_turn_to_anchor',
+    remediation:
+      'A quarentena roda ANTES da criação do turno — ela decide se a mensagem entra no ' +
+      'runtime. Só desbloqueia com âncora durável para saída sem turno; um turno ' +
+      'sintético só para carregar o aviso inverteria a decisão que a quarentena existe ' +
+      'para tomar.',
   },
   {
     id: 'scheduling.outbox_drain',
@@ -213,6 +327,12 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'Persistência antes do envio, claim com lease e DLQ — as mesmas propriedades ' +
       'que a épica exige, num ledger separado.',
+    blocked_by: 'competing_durable_ledger',
+    remediation:
+      'Fundir `scheduling_outbox` e `outbound_messages` num ledger só, com migração de ' +
+      'dados e UMA autoridade de envio. Enquanto os dois existirem, ligar o drain ao ' +
+      'outbox do turno criaria dois senders autoritativos para a mesma linha — o ' +
+      'cenário que a §Rollback da issue proíbe nominalmente.',
   },
   {
     id: 'tools.approval_notification',
@@ -228,6 +348,12 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       '`approval_requests` (migração 095) é durável e tem expiração própria; um ' +
       'aviso perdido não perde a aprovação, e o pedido expira com auditoria.',
+    blocked_by: 'foreign_recipient',
+    remediation:
+      'Mesma dependência da revisão de edição: uma identidade lógica de saída dirigida a ' +
+      'terceiro. Acresce um agravante próprio — os aprovadores são N pessoas, então a ' +
+      'saída é um FAN-OUT, e o outbox de #631 chaveia uma saída por ' +
+      '(turn_id, sequence_in_turn) para um destinatário.',
   },
   {
     id: 'workers.briefings',
@@ -240,6 +366,11 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'Best-effort por dono, com `logger.warn` por falha. Um briefing perdido é ' +
       'reposto pelo próximo ciclo; não há decisão do usuário pendurada nele.',
+    blocked_by: 'no_turn_to_anchor',
+    remediation:
+      'Âncora durável para saída proativa. Note que o valor seria BAIXO: um briefing ' +
+      'atrasado é substituído pelo do ciclo seguinte, então entrega garantida de um ' +
+      'briefing velho é pior produto do que perdê-lo.',
   },
   {
     id: 'workers.idempotency_relayer',
@@ -255,6 +386,11 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'Chave de dedupe do provedor derivada da identidade da row; retry e DLQ ' +
       'próprios.',
+    blocked_by: 'competing_durable_ledger',
+    remediation:
+      'Mesma fusão de ledgers do `scheduling.outbox_drain`. É a rota com MENOS a ganhar ' +
+      'da migração: ela já passa `messageId` determinístico ao Baileys, que é ' +
+      'exatamente a propriedade que `provider_idempotency_key` existe para dar.',
   },
   {
     id: 'workers.pending_reminder',
@@ -269,6 +405,10 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       '`reminder_count` é incrementado com CAS ANTES do envio, então uma falha de ' +
       'envio não gera dois lembretes; o teto limita o total.',
+    blocked_by: 'no_turn_to_anchor',
+    remediation:
+      'Âncora durável para saída proativa. O CAS de `reminder_count` já dá a ' +
+      'idempotência lógica — o que falta é o artefato durável e a entrega com lease.',
   },
   {
     id: 'workflows.dual_approval',
@@ -279,6 +419,10 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     what: 'Notificações 4-eyes: pedido, aprovação, recusa e expiração.',
     reason: 'Destinatários são os aprovadores; sem turno. Mesma razão da notificação de tool.',
     containment: 'O workflow persistido é a fonte de verdade; a notificação é aviso sobre ele.',
+    blocked_by: 'foreign_recipient',
+    remediation:
+      'Mesma identidade lógica de saída para terceiro da notificação de tool, e o mesmo ' +
+      'fan-out para N aprovadores. As duas rotas desbloqueiam juntas ou nenhuma.',
   },
   {
     id: 'workflows.engine',
@@ -291,10 +435,137 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     containment:
       'A expiração é gravada e auditada ANTES do aviso; o `catch` do tick impede que ' +
       'uma notificação perdida trave a varredura.',
+    blocked_by: 'no_turn_to_anchor',
+    remediation:
+      'Âncora durável para saída proativa. O tick do engine não tem turno e não pode ' +
+      'ter: ele varre expirações de N workflows de uma vez.',
   },
 ]);
 
 export type OutboundSendPathId = string;
+
+// =====================================================================
+// A CATRACA — o mecanismo que impede a décima primeira exceção
+// =====================================================================
+
+/**
+ * Issue #506 (auditoria de fechamento) — *"teste arquitetural impedindo novas
+ * rotas paralelas"*.
+ *
+ * ─── O buraco que esta lista fecha ──────────────────────────────────────────
+ *
+ * A #634 entregou duas travas, e as duas param o mesmo caso:
+ *
+ *   - a varredura estática de `outbound-trava-envio-direto.spec.ts` reprova um
+ *     `line.sendText(` num módulo que o inventário não conhece;
+ *   - `withDeclaredEgressException` recusa, em runtime, um `path_id` que não
+ *     esteja aqui.
+ *
+ * As duas dizem *"inventarie antes de enviar"*. Nenhuma diz *"pare de
+ * inventariar"* — e a décima primeira exceção nasce exatamente por onde as
+ * duas mandam: acrescenta-se uma entrada com `state:'declared_exception'`, o
+ * `reason` e o `containment` são preenchidos de boa-fé, tudo fica verde, e o
+ * inventário cresce. Foi assim que dez chegaram a dez.
+ *
+ * ─── O que a catraca faz ────────────────────────────────────────────────────
+ *
+ * Esta lista é o conjunto RATIFICADO de exceções. `assertRatifiedInventory`
+ * roda no CARREGAMENTO deste módulo: uma exceção declarada cujo id não esteja
+ * aqui derruba o import — não o teste, o import. Como `egress-guard.ts` importa
+ * daqui e `line-output.ts` importa dele, uma rota paralela nova não chega a
+ * enviar nada em lugar nenhum; o processo não sobe.
+ *
+ * ─── APPEND É PROIBIDO. Esta lista SÓ ENCOLHE. ──────────────────────────────
+ *
+ * Acrescentar um id aqui não é "registrar uma exceção": é revogar a decisão do
+ * dono da épica de que o inventário fecha em zero. Quem migrar uma rota REMOVE
+ * a entrada do inventário e o id daqui, na mesma PR, e o número abaixo cai
+ * junto.
+ *
+ * A catraca não é inviolável — nada em código é, contra quem edita o código. O
+ * que ela garante é que a violação não pode ser distraída: exige três edições
+ * coordenadas (a entrada, este id e o teto) em duas camadas, e cada uma delas é
+ * uma linha vermelha num diff.
+ */
+export const RATIFIED_EXCEPTION_IDS = Object.freeze([
+  'agent.message_update_owner_review',
+  'agent.react_loop_tool_reaction',
+  'identity.quarantine',
+  'scheduling.outbox_drain',
+  'tools.approval_notification',
+  'workers.briefings',
+  'workers.idempotency_relayer',
+  'workers.pending_reminder',
+  'workflows.dual_approval',
+  'workflows.engine',
+] as const);
+
+/**
+ * O TETO de exceções declaradas. Redundante com a lista acima por construção — e
+ * é a redundância que interessa.
+ *
+ * A lista responde *"esta rota específica foi ratificada?"*; o teto responde
+ * *"quantas existem?"*, e é a pergunta que aparece num code review de uma linha.
+ * Um número literal que precisa subir é a coisa mais difícil de justificar num
+ * diff, que é exatamente a fricção que se quer.
+ *
+ * SÓ DIMINUI.
+ */
+export const MAX_DECLARED_EXCEPTIONS = 10;
+
+/**
+ * A catraca, como função pura — para que o teste possa alimentá-la com um
+ * inventário FALSO (uma rota paralela de mentira) e ver a recusa, sem mexer no
+ * array congelado da produção.
+ *
+ * Lança na primeira violação. Todas as quatro condições são erro de
+ * PROGRAMAÇÃO, não desfecho de execução: não há caminho em que a resposta certa
+ * seja registrar e seguir.
+ */
+export function assertRatifiedInventory(paths: readonly OutboundSendPath[]): void {
+  const ratificados = new Set<string>(RATIFIED_EXCEPTION_IDS);
+  const excecoes = paths.filter((p) => p.state === 'declared_exception');
+
+  for (const e of excecoes) {
+    if (!ratificados.has(e.id)) {
+      throw new Error(
+        `outbound send-path inventory: '${e.id}' é uma exceção NÃO RATIFICADA. ` +
+          `A épica #506 fechou o inventário: uma rota nova passa pelo outbox durável ` +
+          `(commitTurnOutboundTx), não por uma exceção nova. Se você acredita que esta ` +
+          `rota tem impedimento técnico, ele precisa ser ratificado em ` +
+          `RATIFIED_EXCEPTION_IDS — e essa lista só encolhe.`,
+      );
+    }
+    // Sem impedimento tipado, a exceção é adiamento com redação — que é
+    // literalmente o que o dono chamou de "exceção meramente inventariada".
+    if (!e.blocked_by) {
+      throw new Error(
+        `outbound send-path inventory: exceção '${e.id}' sem 'blocked_by'. ` +
+          `Toda exceção declara o IMPEDIMENTO técnico, do vocabulário fechado ` +
+          `OUTBOUND_EXCEPTION_BLOCKERS.`,
+      );
+    }
+    if (!e.remediation || e.remediation.trim().length === 0) {
+      throw new Error(
+        `outbound send-path inventory: exceção '${e.id}' sem 'remediation'. ` +
+          `Toda exceção descreve o trabalho concreto que a APAGA.`,
+      );
+    }
+  }
+
+  if (excecoes.length > MAX_DECLARED_EXCEPTIONS) {
+    throw new Error(
+      `outbound send-path inventory: ${excecoes.length} exceções declaradas, teto ` +
+        `MAX_DECLARED_EXCEPTIONS=${MAX_DECLARED_EXCEPTIONS}. O teto SÓ DIMINUI.`,
+    );
+  }
+}
+
+// Fail-closed no CARREGAMENTO do módulo, e não só no teste. `egress-guard.ts`
+// importa daqui e `src/gateway/line-output.ts` importa dele: um inventário
+// inválido derruba o processo antes de qualquer envio, em vez de esperar a
+// suíte rodar.
+assertRatifiedInventory(OUTBOUND_SEND_PATHS);
 
 const BY_ID = new Map(OUTBOUND_SEND_PATHS.map((p) => [p.id, p]));
 

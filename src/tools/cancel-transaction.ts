@@ -50,6 +50,7 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
   output_schema: outputSchema,
   required_actions: ['cancel_transaction'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'cancel',
   audit_action: 'transaction_cancelled',

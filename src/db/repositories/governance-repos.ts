@@ -1,4 +1,5 @@
 import { eq, and, inArray, desc, sql } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   audit_log,
@@ -15,6 +16,41 @@ import {
   SYSTEM_AGENT_ID,
 } from '../tenant-context.js';
 import type { AuditEntry, Workflow, WorkflowStep } from '../schema.js';
+
+/**
+ * Os status em que um workflow ainda está ABERTO — a única definição desse
+ * conjunto no projeto.
+ *
+ * Existia em quatro cópias literais aqui e numa quinta em
+ * `conversation-repos.ts`, cada uma com um comentário mandando "manter em
+ * lock-step" com as outras. Manter à mão é o que falha: `expireIfDue` nasceu
+ * com `status = 'pendente'` sozinho e teria desligado a expiração de TODO dual
+ * approval real — que vive em `aguardando_terceiro`, não em `pendente`
+ * (`requestDualApproval` o cria assim).
+ *
+ * Quem enumera os tuplos para o tick, quem lista os pendentes e quem fecha por
+ * vencimento têm de concordar sobre "aberto", senão o dispatcher sub-enumera e
+ * um tenant com workflow vencido nunca recebe tick.
+ */
+export const WORKFLOW_OPEN_STATUSES = [
+  'pendente',
+  'em_andamento',
+  'aguardando_humano',
+  'aguardando_terceiro',
+] as const;
+
+/**
+ * O mesmo conjunto para os `db.execute` crus, como PARÂMETRO (`= ANY($n)`) e
+ * não como fragmento montado.
+ *
+ * É uma função, não uma constante de módulo: montar SQL no topo do arquivo faz
+ * o `import` do módulo executar helpers do drizzle, e vários specs unitários
+ * substituem `drizzle-orm` por um dublê que só implementa a tag `sql`. Avaliar
+ * na hora da consulta mantém esses specs carregando.
+ */
+export function workflowOpenStatusesAny(): SQL {
+  return sql`ANY(${[...WORKFLOW_OPEN_STATUSES]})`;
+}
 
 export const auditRepo = {
   async write(input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<void> {
@@ -138,6 +174,43 @@ export const workflowsRepo = {
         eq(workflows.agent_id, agent_id),
       ));
   },
+  /**
+   * Cancela um workflow VENCIDO por compare-and-swap, e diz se ESTA chamada foi
+   * a que cancelou.
+   *
+   * Existe porque `setStatus` é incondicional, e o vencimento de dual approval
+   * tem DOIS disparadores hoje: `pending_expirer` e `workflow_engine_tick`
+   * chamam ambos `expireDueDualApprovals()`. Com `setStatus`, os dois ticks
+   * venciam o mesmo workflow, auditavam duas vezes e — o que o usuário vê —
+   * mandavam a mensagem de expiração DUAS VEZES. O efeito duplicado não exigia
+   * duas réplicas: acontecia dentro de um processo só.
+   *
+   * Duas condições, e as duas no `WHERE`:
+   *   - `status IN (abertos)` — o CAS. Quem chega depois encontra `cancelado`,
+   *     que não está no conjunto, e recebe `false`: não audita e não manda
+   *     nada. O conjunto é `WORKFLOW_OPEN_STATUSES`, o MESMO que `listPending`
+   *     usa para trazer a row até aqui — um dual approval à espera da segunda
+   *     assinatura vive em `aguardando_terceiro`, não em `pendente`.
+   *   - `proxima_acao_em <= now()` — o RELÓGIO É O DO BANCO. A checagem de
+   *     prazo em JavaScript comparava `new Date()` do processo; duas réplicas
+   *     com relógios distintos discordariam sobre o que já venceu.
+   */
+  async expireIfDue(id: string): Promise<boolean> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .update(workflows)
+      .set({ status: 'cancelado' })
+      .where(and(
+        eq(workflows.id, id),
+        eq(workflows.tenant_id, tenant_id),
+        eq(workflows.agent_id, agent_id),
+        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
+        sql`${workflows.proxima_acao_em} <= now()`,
+      ))
+      .returning({ id: workflows.id });
+    return rows.length > 0;
+  },
   async listPending(): Promise<Workflow[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -147,7 +220,7 @@ export const workflowsRepo = {
       .where(and(
         eq(workflows.tenant_id, tenant_id),
         eq(workflows.agent_id, agent_id),
-        sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
+        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
       ));
   },
   /**
@@ -171,7 +244,7 @@ export const workflowsRepo = {
         eq(workflows.tenant_id, tenant_id),
         eq(workflows.agent_id, agent_id),
         inArray(workflows.entidade_id, entidades),
-        sql`status IN ('pendente','em_andamento','aguardando_humano','aguardando_terceiro')`,
+        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
       ))
       .orderBy(desc(workflows.iniciado_em))
       .limit(limit);
@@ -197,7 +270,7 @@ export const workflowsRepo = {
       FROM ${workflows}
       WHERE tenant_id IS NOT NULL
         AND agent_id IS NOT NULL
-        AND status IN ('pendente', 'em_andamento', 'aguardando_humano', 'aguardando_terceiro')
+        AND status = ${workflowOpenStatusesAny()}
     `);
     return Array.from(
       result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
