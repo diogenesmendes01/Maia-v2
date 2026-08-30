@@ -2939,6 +2939,21 @@
         "all"
       ]
     },
+    "MAIA_SCHEDULER_GROUPS": {
+      "type": "string",
+      "description": "Grupos de jobs de cron que ESTE processo agenda, separados por vírgula, ou `all` para todos. Vazio = o conjunto default, que reproduz exatamente o comportamento do antigo `startWorkers(1)`: turn-pipeline, outbound, scheduling, channel, monitoring, housekeeping, ops-backup. Os grupos console, cognition, procedures, proactive e governance nascem DESLIGADOS — eram os jobs que `phase > 1` descartava em silêncio, e ligá-los é uma decisão de operação (proactive, em particular, ESCREVE para o usuário). Nome desconhecido é ERRO de boot, nunca um grupo ignorado. Inventário completo e classificação de concorrência de cada job: src/workers/job-contract.ts e docs/architecture/modules/workers.md.",
+      "x-maia-type": "string",
+      "x-maia-group": "lifecycle",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "",
+      "examples": [
+        "turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup"
+      ]
+    },
     "SHUTDOWN_GRACE_MS": {
       "type": "string",
       "description": "Orçamento TOTAL do drain depois do SIGTERM: ticks de cron em execução, jobs BullMQ ativos e tarefas de background rastreadas. Precisa ser MENOR que o timeout de kill do supervisor (systemd TimeoutStopSec / compose stop_grace_period, hoje 40s), senão o SIGKILL corta o drain no meio.",

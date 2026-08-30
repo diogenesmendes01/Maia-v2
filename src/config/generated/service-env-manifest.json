@@ -1280,6 +1280,13 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_SCHEDULER_GROUPS",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
           "name": "SHUTDOWN_GRACE_MS",
           "secret": false,
           "required": false,
@@ -1572,6 +1579,7 @@
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
             "MAIA_PROCESS_ROLE",
+            "MAIA_SCHEDULER_GROUPS",
             "SHUTDOWN_GRACE_MS",
             "SHUTDOWN_STEP_TIMEOUT_MS",
             "SHUTDOWN_EXIT_TIMEOUT_MS",
@@ -1770,6 +1778,7 @@
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
             "MAIA_PROCESS_ROLE",
+            "MAIA_SCHEDULER_GROUPS",
             "SHUTDOWN_GRACE_MS",
             "SHUTDOWN_STEP_TIMEOUT_MS",
             "SHUTDOWN_EXIT_TIMEOUT_MS",
@@ -1968,6 +1977,7 @@
             "SYNC_LATENCY_P95_BASELINE_MS",
             "SYNC_LATENCY_P95_BUDGET_PERCENT",
             "MAIA_PROCESS_ROLE",
+            "MAIA_SCHEDULER_GROUPS",
             "SHUTDOWN_GRACE_MS",
             "SHUTDOWN_STEP_TIMEOUT_MS",
             "SHUTDOWN_EXIT_TIMEOUT_MS",

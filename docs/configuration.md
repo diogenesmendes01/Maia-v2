@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 192 | 20 |
+| `runtime` | 193 | 20 |
 | `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -347,6 +347,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
 | `MAIA_PROCESS_ROLE` | `all` \| `api` \| `worker` \| `scheduler` \| `session-owner` | `all` | não | `runtime` | sim | Qual fatia da topologia ESTE processo executa: all \| api \| worker \| scheduler \| session-owner. O papel decide o que o boot INICIA e o que o /readyz EXIGE, então um processo worker nunca fica fora de rotação por causa do WhatsApp, e um api-only nunca anuncia readiness por conseguir falar com o Redis. `all` é o modo compatível de processo único que roda hoje; os demais existem para a separação de topologia (issue #513). Contrato em src/runtime/lifecycle/roles.ts. |
+| `MAIA_SCHEDULER_GROUPS` | string | `` | não | `runtime` | sim | Grupos de jobs de cron que ESTE processo agenda, separados por vírgula, ou `all` para todos. Vazio = o conjunto default, que reproduz exatamente o comportamento do antigo `startWorkers(1)`: turn-pipeline, outbound, scheduling, channel, monitoring, housekeeping, ops-backup. Os grupos console, cognition, procedures, proactive e governance nascem DESLIGADOS — eram os jobs que `phase > 1` descartava em silêncio, e ligá-los é uma decisão de operação (proactive, em particular, ESCREVE para o usuário). Nome desconhecido é ERRO de boot, nunca um grupo ignorado. Inventário completo e classificação de concorrência de cada job: src/workers/job-contract.ts e docs/architecture/modules/workers.md. |
 | `SHUTDOWN_GRACE_MS` | number | `25000` | não | `runtime` | sim | Orçamento TOTAL do drain depois do SIGTERM: ticks de cron em execução, jobs BullMQ ativos e tarefas de background rastreadas. Precisa ser MENOR que o timeout de kill do supervisor (systemd TimeoutStopSec / compose stop_grace_period, hoje 40s), senão o SIGKILL corta o drain no meio. |
 | `SHUTDOWN_STEP_TIMEOUT_MS` | number | `10000` | não | `runtime` | sim | Teto por PASSO do shutdown, para que um componente travado (um socket que não fecha) não consuma o orçamento inteiro. Também limita a espera pela fase de boot em voo; se essa espera estoura, o drain é marcado incompleto e o processo sai forçado. |
 | `SHUTDOWN_EXIT_TIMEOUT_MS` | number | `5000` | não | `runtime` | sim | Rede de segurança APÓS um drain limpo. O processo sai naturalmente quando o event loop esvazia; este timer (unref) só dispara se algum handle vazado mantiver o loop vivo. Não é um process.exit prematuro — a saída natural sempre vence a corrida. |
