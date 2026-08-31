@@ -18,6 +18,8 @@ function makeCtx(
     agent?: { id: string; tenant_id: string } | null;
     objective?: { id: string; status: string; kind: string } | null;
     task?: { id: string; status: string } | null;
+    /** #469 fatia A: simula o CAS de `transitionTask` perdendo a corrida. */
+    transitionApplied?: boolean;
   },
 ) {
   const audit: Array<Record<string, unknown>> = [];
@@ -73,6 +75,10 @@ function makeCtx(
         },
         async transitionTask(args: Record<string, unknown>) {
           transitions.push(args);
+          // A fatia A de #469 fez `transitionTask` devolver se a linha mudou
+          // (predicado de tenant + CAS). O dublê precisa devolver `true`,
+          // senão o router lança CONFLICT.
+          return opts?.transitionApplied ?? true;
         },
         async listExceptionsByTenant() {
           return [];
@@ -180,8 +186,39 @@ describe('objectives.resolveTask', () => {
       note: 'Autorizei o desconto solicitado.',
     });
     expect(res.ok).toBe(true);
-    expect(transitions[0]).toMatchObject({ task_id: TASK_UUID, status: 'done' });
+    // #469 fatia A: a escrita do console também é escopada (invariante 1) e
+    // faz CAS sobre o status LIDO — sem o predicado, duas abas resolvendo a
+    // mesma exceção sobrescrevem uma à outra.
+    expect(transitions[0]).toMatchObject({
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-a',
+      task_id: TASK_UUID,
+      status: 'done',
+      expect_status: 'waiting_human',
+    });
     expect(audit[0]).toMatchObject({ action: 'objective_task_resolved' });
+  });
+
+  it('CONFLICT quando o CAS perde a corrida (o UPDATE não casou linha)', async () => {
+    // A leitura passou (a tarefa ESTAVA em waiting_human), mas entre a leitura
+    // e a escrita alguém resolveu antes. O router precisa recusar em vez de
+    // reportar sucesso sobre uma escrita que não aconteceu.
+    const { ctx, audit } = makeCtx('owner', { transitionApplied: false });
+    const caller = objectivesRouter.createCaller(ctx);
+    let thrown: unknown;
+    try {
+      await caller.resolveTask({
+        agentId: 'agent-a',
+        taskId: TASK_UUID,
+        resolution: 'done',
+        note: 'perdi a corrida',
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as TRPCError).code).toBe('CONFLICT');
+    // E não audita uma resolução que não existiu.
+    expect(audit).toHaveLength(0);
   });
 
   it('CONFLICT when the task is not waiting_human anymore', async () => {

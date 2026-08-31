@@ -187,11 +187,20 @@ export const JOBS: Job[] = [
     fn: runPendingExpirer,
     group: 'turn-pipeline',
     effect: 'side-effectful',
-    guard: { kind: 'none', why: '' },
-    unguarded: {
-      tracked_in: '#513',
-      duplicates:
-        '`expireDueDualApprovals()` faz `setStatus(id, "cancelado")` SEM compare-and-swap sobre o status anterior e, logo depois, MANDA WhatsApp ao solicitante. Duas réplicas de scheduler cancelam a mesma aprovação e enviam dois avisos de expiração. Fechar isto é o CAS no `setStatus` (ou single-flight por tenant) — fatia própria, porque muda `src/workflows/dual-approval.ts` e os specs de isolamento que o cercam.',
+    guard: {
+      kind: 'row-claim',
+      // LACUNA FECHADA (era `none` + `unguarded`, rastreada em #513).
+      //
+      // Os DOIS efeitos deste job passaram a ser reivindicados por linha:
+      //   - `expireAll()` → `pendingQuestionsRepo.expireDue()` já era CAS
+      //     (`status='aberta' AND expira_em < now()` com `RETURNING`): só quem
+      //     muda a linha recebe a row de volta;
+      //   - `expireDueDualApprovals()` ganhou CAS na #691
+      //     (`workflowsRepo.expireIfDue`), e a auditoria e o aviso passaram a
+      //     depender dele. O aviso ainda vai pelo ledger durável, com
+      //     `dedup_key` único (#506), que é uma segunda barreira.
+      claim: "CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não age",
+      tables: ['pending_questions', 'workflows'],
     },
     module: 'pending-expirer.ts',
     phase: 1,
@@ -272,11 +281,21 @@ export const JOBS: Job[] = [
     fn: runWorkflowEngineTick,
     group: 'turn-pipeline',
     effect: 'side-effectful',
-    guard: { kind: 'none', why: '' },
-    unguarded: {
-      tracked_in: '#513',
-      duplicates:
-        '`tickEngine()` expira aprovações e NOTIFICA o solicitante por WhatsApp; a expiração legada compartilha `expireDueDualApprovals()` com `pending_expirer`, sem CAS. Duas réplicas — ou até este job e o `pending_expirer` no mesmo processo — produzem dois avisos de expiração para a mesma aprovação.',
+    guard: {
+      kind: 'row-claim',
+      // LACUNA FECHADA (era `none` + `unguarded`, rastreada em #513).
+      //
+      // Era a lacuna que mais doía, porque a duplicação NÃO exigia duas
+      // réplicas: este job e o `pending_expirer` chamam o mesmo
+      // `expireDueDualApprovals()`, e dois jobs no mesmo processo bastavam.
+      // Hoje os dois ramos reivindicam a linha:
+      //   - `expireDueApprovals` → `approvalRequestsRepo.expireDue()` é CAS
+      //     (`status='pending' AND expires_at < now()` com `RETURNING`);
+      //   - o ramo legado usa o `expireIfDue` da #691.
+      // Os avisos ao requester vão pelo ledger com `dedup_key` derivada do id
+      // do request (#506) — uma expiração, um aviso.
+      claim: "CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não notifica",
+      tables: ['approval_requests', 'workflows'],
     },
     module: 'workflow-engine-tick.ts',
     phase: 1,
@@ -612,7 +631,7 @@ export const JOBS: Job[] = [
     guard: {
       kind: 'row-claim',
       claim:
-        'claim de `objective_tasks` com FOR UPDATE SKIP LOCKED; falha de executor vira `failed` com detalhe, nunca `running` preso',
+        'claim de `objective_tasks` com FOR UPDATE SKIP LOCKED, carimbando lease (`claimed_by`/`lease_expires_at`) e `claim_token`; a transição EXIGE o token, então o dono de lease vencida não sobrescreve quem assumiu depois, e o reaper do início do tick devolve para `pending` a tarefa cujo processo morreu (migração 138)',
       tables: ['objective_tasks'],
     },
     module: 'objective-execute-worker.ts',
@@ -759,11 +778,19 @@ export const JOBS: Job[] = [
     fn: runMorningBriefing,
     group: 'proactive',
     effect: 'side-effectful',
-    guard: { kind: 'none', why: '' },
-    unguarded: {
-      tracked_in: '#513',
-      duplicates:
-        'MANDA WhatsApp para todos os donos do tenant, sem claim e sem marca de "já enviei hoje". Duas réplicas de scheduler mandam dois bom-dia. É o caso mais visível da lacuna, e o motivo de o grupo `proactive` nascer desligado.',
+    guard: {
+      kind: 'row-claim',
+      // LACUNA FECHADA (era `none` + `unguarded`, rastreada em #513).
+      //
+      // A #506 tirou o `sendText` direto daqui: cada dono ganha uma linha em
+      // `outbox_messages` com `dedup_key = briefing:<período>:<dia>:<pessoa>`,
+      // e o drain de agendamento entrega. A chave cai sobre o índice único
+      // parcial `idx_outbox_dedup`, então duas execuções — de duas réplicas ou
+      // de dois disparos do cron — colidem e só a primeira grava. O período
+      // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
+      // no MESMO horário toda segunda-feira.
+      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
     phase: 4,
@@ -774,10 +801,19 @@ export const JOBS: Job[] = [
     fn: runEveningBriefing,
     group: 'proactive',
     effect: 'side-effectful',
-    guard: { kind: 'none', why: '' },
-    unguarded: {
-      tracked_in: '#513',
-      duplicates: 'idem `briefing_morning`: envio proativo ao dono sem claim nem marca de envio.',
+    guard: {
+      kind: 'row-claim',
+      // LACUNA FECHADA (era `none` + `unguarded`, rastreada em #513).
+      //
+      // A #506 tirou o `sendText` direto daqui: cada dono ganha uma linha em
+      // `outbox_messages` com `dedup_key = briefing:<período>:<dia>:<pessoa>`,
+      // e o drain de agendamento entrega. A chave cai sobre o índice único
+      // parcial `idx_outbox_dedup`, então duas execuções — de duas réplicas ou
+      // de dois disparos do cron — colidem e só a primeira grava. O período
+      // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
+      // no MESMO horário toda segunda-feira.
+      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
     phase: 4,
@@ -788,10 +824,19 @@ export const JOBS: Job[] = [
     fn: runWeeklyBriefing,
     group: 'proactive',
     effect: 'side-effectful',
-    guard: { kind: 'none', why: '' },
-    unguarded: {
-      tracked_in: '#513',
-      duplicates: 'idem `briefing_morning`: envio proativo ao dono sem claim nem marca de envio.',
+    guard: {
+      kind: 'row-claim',
+      // LACUNA FECHADA (era `none` + `unguarded`, rastreada em #513).
+      //
+      // A #506 tirou o `sendText` direto daqui: cada dono ganha uma linha em
+      // `outbox_messages` com `dedup_key = briefing:<período>:<dia>:<pessoa>`,
+      // e o drain de agendamento entrega. A chave cai sobre o índice único
+      // parcial `idx_outbox_dedup`, então duas execuções — de duas réplicas ou
+      // de dois disparos do cron — colidem e só a primeira grava. O período
+      // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
+      // no MESMO horário toda segunda-feira.
+      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
     phase: 4,

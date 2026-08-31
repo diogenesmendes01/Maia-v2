@@ -39,6 +39,18 @@
  *    (workers, /metrics, gateway) impõe ao mesmo pool. Os números daqui são o
  *    PISO: em produção a mesma carga custa mais. É por isso que o veredicto
  *    contra o baseline é relativo (+20%) e não só absoluto.
+ *  - **NÃO mede o turno inteiro: `resolveScope` fica de FORA.** O orçamento da
+ *    #525 (`src/agent/turn-context/types.ts`) define "turno inteiro" como
+ *    `resolveScope` + `buildPrompt`, e conta o JOIN `permissoes ⋈
+ *    permission_profiles` do `resolveScope` como uma das queries. Este harness
+ *    mede só `buildPrompt`: `buildContext` (abaixo) FABRICA o escopo em
+ *    memória — monta `byEntity` no processo e nunca chama `resolveScope` — e a
+ *    massa não semeia `permissoes` nem `permission_profiles`. Logo o gate
+ *    afere um ORÇAMENTO PARCIAL. Um relatório deste harness NÃO é validação do
+ *    custo completo do turno, e não deve ser apresentado como tal: uma
+ *    regressão que more no `resolveScope` passa por ele sem ser vista. Enquanto
+ *    o instrumento não incluir o `resolveScope`, qualquer decisão que dependa
+ *    do custo total precisa de uma medição dirigida à parte.
  *
  * Quem citar um número deste harness, cite junto o braço (`cold`/`warm`), a
  * cardinalidade e o host.
@@ -317,6 +329,51 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  * | `timeout_ms` | classifica o que conta como timeout; não move a latência medida |
  * | `sample_ms` | é o período de observação do POOL; não entra no p95 do turno |
  */
+/**
+ * A FRONTEIRA do que este harness mede — e a razão de ela estar aqui, e não
+ * só num comentário.
+ *
+ * O orçamento do turno (`src/agent/turn-context/types.ts`) é
+ * `resolveScope` + `buildPrompt`. Este harness mede só `buildPrompt`:
+ * `buildContext` fabrica o escopo em memória e a massa não semeia
+ * `permissoes` nem `permission_profiles`. Enquanto isso for verdade, NENHUMA
+ * corrida deste script pode produzir a aprovação do orçamento COMPLETO — nem
+ * por exit code, nem por linha de relatório.
+ *
+ * A contenção é estrutural, em três pontos que se sustentam:
+ *
+ *  1. `evaluateGate` emite o critério do aceite completo como NÃO AVALIADO
+ *     (`skipped: true`). Pela invariante do `Verdict`, não avaliado implica
+ *     não aprovado, e em modo `gate` isso REPROVA a corrida. Um gate que não
+ *     pode demonstrar o que promete não deve sair 0;
+ *  2. `cobertura` entra no `RunFingerprint`, então um baseline gravado sob
+ *     uma cobertura é RECUSADO para comparação sob outra. É o que mantém os
+ *     números antigos identificados pela cobertura que os produziu, em vez de
+ *     deixá-los circular como se medissem o turno inteiro;
+ *  3. o relatório carrega o rótulo em todo modo, inclusive `measure`.
+ *
+ * Quando o `resolveScope` entrar na medição (issue #700), `resolve_scope_medido`
+ * vira `true` e o `rotulo` muda — e a mudança do rótulo é justamente o que
+ * invalida, de forma automática, todo baseline da cobertura anterior. Virar a
+ * flag SEM incluir a medição é o defeito que a sonda vermelha da #700 tem de
+ * pegar.
+ */
+export const COBERTURA_DA_MEDICAO = {
+  /**
+   * `false` enquanto `buildContext` fabricar o escopo em memória em vez de
+   * chamar `resolveScope`. Ver issue #700.
+   */
+  resolve_scope_medido: false,
+  rotulo: 'buildPrompt-sem-resolveScope',
+} as const;
+
+/** O rótulo da cobertura da corrida atual — carimbado no baseline e no relatório. */
+export function coberturaAtual(): string {
+  return COBERTURA_DA_MEDICAO.resolve_scope_medido
+    ? 'resolveScope+buildPrompt'
+    : COBERTURA_DA_MEDICAO.rotulo;
+}
+
 export type RunFingerprint = {
   pairs: number;
   concurrency: number;
@@ -327,6 +384,14 @@ export type RunFingerprint = {
   max_concurrent_reads: number;
   turns: number;
   sustain_s: number;
+  /**
+   * O que a corrida EXERCITOU. Comparado como qualquer outro campo: um
+   * baseline de `buildPrompt-sem-resolveScope` não serve de referência para
+   * uma corrida que passe a medir `resolveScope+buildPrompt`, e vice-versa —
+   * os dois números medem coisas diferentes e compará-los produziria um
+   * delta que não é regressão nem melhoria, e sim mudança de régua.
+   */
+  cobertura: string;
 };
 
 /**
@@ -335,7 +400,11 @@ export type RunFingerprint = {
  * comparação é recusada em vez de assumida. Aceitar o formato antigo em
  * silêncio reabriria exatamente o buraco que o fingerprint fecha.
  */
-export const BASELINE_SCHEMA_VERSION = 2;
+// v3: o fingerprint passou a carimbar `cobertura`. Um baseline v2 não diz o
+// que mediu, então não dá para saber se ele inclui o `resolveScope` — e um
+// número cuja fronteira é desconhecida não é referência. Recusado, não
+// assumido. Regravar é uma linha de comando; assumir seria uma conclusão.
+export const BASELINE_SCHEMA_VERSION = 3;
 
 export type BaselineFile = {
   schema_version: number;
@@ -380,6 +449,7 @@ export function runFingerprint(
     max_concurrent_reads: maxConcurrentReads,
     turns: o.turns,
     sustain_s: o.sustain_s,
+    cobertura: coberturaAtual(),
   };
 }
 
@@ -432,6 +502,7 @@ export function checkBaselineCompatibility(
   cmp('max_concurrent_reads');
   cmp('turns');
   cmp('sustain_s');
+  cmp('cobertura');
   return diffs.length ? { status: 'incompatible', diffs } : { status: 'ok', diffs: [] };
 }
 
@@ -925,6 +996,31 @@ export function evaluateGate(
 ): Verdict[] {
   const out: Verdict[] = [];
   const compat = checkBaselineCompatibility(baseline, ctx.fingerprint);
+
+  // ── O aceite COMPLETO, e por que ele vem PRIMEIRO ────────────────────
+  // O orçamento do turno é `resolveScope` + `buildPrompt`. Enquanto o harness
+  // fabricar o escopo em memória, este critério NÃO PODE ser avaliado — e
+  // "não avaliado" não é "aprovado" (ver a invariante do `Verdict`).
+  //
+  // Ele encabeça a lista de propósito: quem lê a tabela de cima para baixo
+  // encontra a fronteira ANTES dos números, e não depois de já ter formado
+  // uma opinião sobre eles. Em modo `gate` isso reprova a corrida — é a
+  // consequência pretendida: o gate não pode sair 0 sobre uma garantia que
+  // não demonstra. Os critérios PARCIAIS abaixo continuam sendo avaliados e
+  // continuam valendo para o trecho que exercitam.
+  if (!COBERTURA_DA_MEDICAO.resolve_scope_medido) {
+    out.push({
+      label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
+      passed: false,
+      skipped: true,
+      detail:
+        `NÃO AVALIADO — a medição exclui o \`resolveScope\` (JOIN ` +
+        `\`permissoes ⋈ permission_profiles\`): \`buildContext\` fabrica o escopo ` +
+        `em memória e a massa não semeia essas tabelas. Cobertura desta ` +
+        `corrida: \`${coberturaAtual()}\`. Os critérios abaixo valem para o ` +
+        `trecho exercitado e NÃO para o custo completo do turno. Issue #700.`,
+    });
+  }
 
   for (const a of arms) {
     out.push({
@@ -1614,6 +1710,10 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
  * mediria o harness. `byEntity` é o que o renderer percorre para escrever o
  * bloco "## Escopo desta conversa" — sem ele o turno renderiza um escopo vazio
  * e a cardinalidade deixa de custar o que custa em produção.
+ *
+ * É AQUI que o `resolveScope` sai da medição: o escopo nasce pronto, em
+ * memória, e o custo real de resolvê-lo no Postgres nunca entra no relógio.
+ * Ver a seção "o que ele NÃO mede" no topo do arquivo.
  */
 function buildContext(pair: Pair, entities: number): unknown {
   const ids = pair.entidade_ids.slice(0, entities);
@@ -2031,7 +2131,18 @@ function modeBanner(mode: RunMode, injected: string[]): string {
       `> informativos. O gate é \`npm run turn:bench -- --sustain-s 60\` (modo \`gate\`, o default).\n\n`
     );
   }
-  return `> **MODO GATE.** Todo critério obrigatório precisa ter sido AVALIADO: um critério\n> \`n/a\` reprova a corrida, porque um gate sem a evidência não é um gate.\n\n`;
+  return (
+    `> **MODO GATE.** Todo critério obrigatório precisa ter sido AVALIADO: um critério\n` +
+    `> \`n/a\` reprova a corrida, porque um gate sem a evidência não é um gate.\n` +
+    (COBERTURA_DA_MEDICAO.resolve_scope_medido
+      ? ''
+      : `>\n> **E hoje um critério obrigatório É \`n/a\`: o aceite completo do orçamento do\n` +
+        `> turno.** Enquanto o \`resolveScope\` estiver fora da medição, esta corrida NÃO\n` +
+        `> pode sair 0 — e o exit code 1 significa "não demonstrado", não "regrediu".\n` +
+        `> Leia os critérios parciais na tabela: eles foram avaliados e valem para o\n` +
+        `> trecho que exercitam. Issue #700.\n`) +
+    `\n`
+  );
 }
 
 function renderReport(
@@ -2051,7 +2162,16 @@ function renderReport(
     ` · entidades ${CARDINALITIES.join('/')} · identidade \`${opts.identity}\`\n` +
     `Pool: \`max=${arms[0]?.pool_max ?? 10}\` (\`src/db/client.ts\`) · ` +
     `teto de leituras por turno: ${opts.thresholds.max_peak_reads} ` +
-    `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n`;
+    `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n\n` +
+    `> **Cobertura desta corrida: \`${coberturaAtual()}\`.**\n` +
+    `> **Escopo do que foi medido — orçamento PARCIAL.** Este gate mede ` +
+    `\`buildPrompt\`; o \`resolveScope\` (JOIN \`permissoes ⋈ ` +
+    `permission_profiles\`) fica de FORA: o escopo é fabricado em memória ` +
+    `pelo harness e a massa não semeia essas tabelas. Os números abaixo NÃO ` +
+    `validam o custo completo do turno como definido em ` +
+    `\`src/agent/turn-context/types.ts\`, e não devem ser apresentados como ` +
+    `tal. Uma regressão que more no \`resolveScope\` passa por este gate sem ` +
+    `ser vista.\n`;
 
   const rows: string[][] = [
     ['Métrica', ...arms.map((a) => `\`${a.arm}\``)],
