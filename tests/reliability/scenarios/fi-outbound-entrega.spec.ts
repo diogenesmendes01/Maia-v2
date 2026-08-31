@@ -348,6 +348,10 @@ d('#510 FI-17/FI-18 — claim de entrega e efeito não repetido, com réplicas d
 
       // Solta o vencedor. Ele chama o provider e para no gate 2.
       servidor.arm('after_provider_accept_before_delivery_persist', 'pause');
+      // Esperar o vencedor estar PARADO no gate 1 antes de soltá-lo. A
+      // prontidão diz que ele reportou; o gate diz que ele chegou. São coisas
+      // diferentes, e soltar um gate vazio devolve 0.
+      await servidor.esperarParadoEm('after_outbound_claim_before_send', 1, 30_000);
       expect(servidor.liberar('after_outbound_claim_before_send')).toBe(1);
 
       await eventually(
@@ -356,6 +360,13 @@ d('#510 FI-17/FI-18 — claim de entrega e efeito não repetido, com réplicas d
       );
 
       // Solta o gate 2: o desfecho é gravado.
+      //
+      // O `eventually` acima observa o LEDGER DO PROVIDER — um sinal indireto.
+      // O filho registra o efeito lá e só DEPOIS estaciona neste gate; soltar
+      // com base no ledger é apostar que ele já chegou. Foi essa aposta que
+      // reprovou este cenário no CI (`liberar` devolveu 0). Esperar o filho
+      // parado AQUI é esperar o sinal certo.
+      await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
       expect(servidor.liberar('after_provider_accept_before_delivery_persist')).toBe(1);
 
       await eventually(

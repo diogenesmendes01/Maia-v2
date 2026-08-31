@@ -195,6 +195,46 @@ describe('#510 harness — transporte de failpoint', () => {
     await chamada;
   });
 
+  it('esperarParadoEm fecha a janela entre "chegou" e "estacionou" — a corrida que reprovou a FI-17', async () => {
+    // O DEFEITO, reproduzido de forma determinística: um cenário que decide
+    // soltar o gate com base num sinal INDIRETO pode soltá-lo antes de o filho
+    // estacionar. `liberar` devolve 0, e a asserção `.toBe(1)` reprova — foi
+    // literalmente isto no CI, na main:
+    //
+    //     ❯ fi-outbound-entrega.spec.ts:359
+    //       expect(servidor.liberar('after_provider_accept_before_delivery_persist'))
+    //       - 1
+    //       + 0
+    //
+    // Aqui o "sinal indireto" é o instante ANTES de o filho subir. Não é
+    // preciso um runner lento para provar: basta soltar cedo.
+    servidor.arm('after_running_before_llm', 'pause');
+    expect(
+      servidor.liberar('after_running_before_llm'),
+      'soltar um gate vazio devolve 0 — é o modo de falha que o primitivo fecha',
+    ).toBe(0);
+
+    const chamada = alcancar('after_running_before_llm', {}, { env: envDeFilho() });
+
+    // E o CONTROLE: com o primitivo, a mesma solta acontece depois de o filho
+    // estacionar, e devolve 1. Sem este par, "reprova sempre" também passaria
+    // no caso acima.
+    await servidor.esperarParadoEm('after_running_before_llm', 1, 10_000);
+    expect(servidor.paradosEm('after_running_before_llm')).toBe(1);
+    expect(servidor.liberar('after_running_before_llm')).toBe(1);
+    await expect(chamada).resolves.toBe('release');
+  });
+
+  it('esperarParadoEm estoura dizendo QUANTOS chegaram, não só que estourou', async () => {
+    // "Ninguém chegou" e "chegou um de dois" pedem investigações opostas: a
+    // primeira é o filho que não subiu, a segunda é a réplica que travou antes
+    // do ponto. Um estouro mudo obrigaria a rodar de novo para descobrir qual.
+    servidor.arm('before_successor_promotion', 'pause');
+    await expect(
+      servidor.esperarParadoEm('before_successor_promotion', 2, 120),
+    ).rejects.toThrow(/esperei 2 filho\(s\) PARADO\(s\) em 120ms e chegaram 0/);
+  });
+
   it('a barreira solta N réplicas de uma vez só', async () => {
     const tres = [1, 2, 3].map(() => barreira('largada', { env: envDeFilho() }));
     await servidor.esperarNaBarreira('largada', 3, 5_000);
