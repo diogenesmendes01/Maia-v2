@@ -42,6 +42,9 @@
  * `UPDATE_PROMPT_GOLDEN=1 npm run test:integration -- <this file>` rewrites the
  * files. Doing that is a declaration that the prompt SHOULD change; the diff
  * belongs in the PR body.
+ *
+ * A golden que FALTA é falha, nunca regeneração automática: sem essa regra o
+ * teste escreveria o próprio gabarito e passaria comparando-o consigo mesmo.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
@@ -459,8 +462,24 @@ d('#525 — o prompt do turno é byte-idêntico (Postgres real)', () => {
           '\n';
 
         const file = path.join(GOLDEN_DIR.pathname, `prompt-${caso.nome}.golden.txt`);
-        if (UPDATE || !existsSync(file)) {
+        // O `!existsSync(file)` que existia aqui, junto com o `UPDATE`, fazia o
+        // teste ESCREVER a saída atual como golden e em seguida compará-la com
+        // ela mesma — uma asserção que não pode falhar. Com os três arquivos
+        // commitados isso não aparecia; some um deles (rebase malfeito, faxina
+        // de fixture) e os três passariam a re-baselinar em silêncio,
+        // exatamente na prova que esta PR usa para afirmar "byte-idêntico".
+        //
+        // Regenerar continua sendo possível, e continua sendo uma DECLARAÇÃO
+        // explícita: `UPDATE_PROMPT_GOLDEN=1`. Golden ausente sem essa
+        // declaração é falha, com a instrução no texto do erro.
+        if (UPDATE) {
           await writeFile(file, actual, 'utf8');
+        } else if (!existsSync(file)) {
+          throw new Error(
+            `golden ausente: ${path.basename(file)}. Um golden que se escreve sozinho não ` +
+              `prova nada. Se o prompt MUDOU de propósito, regenere com ` +
+              `UPDATE_PROMPT_GOLDEN=1 e ponha o diff no corpo da PR.`,
+          );
         }
         const expected = await readFile(file, 'utf8');
 
