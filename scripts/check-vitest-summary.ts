@@ -25,12 +25,20 @@
  *   3. o arquivo não existe ou não casa o formato esperado — some quando o
  *      runner morreu antes de escrever, que é justamente o caso a denunciar.
  *
- * `pulados` NÃO reprova por si só: as specs de integração fazem
- * `describe.skip` legítimo sem `TEST_DB_URL`, e um piso de zero pulados aqui
- * quebraria o uso local. O piso que importa é o de EXECUTADOS.
+ * `pulados` NÃO reprova por padrão: as specs de integração fazem
+ * `describe.skip` legítimo sem `TEST_DB_URL`, e um piso de zero pulados na
+ * suíte inteira quebraria o uso local. O piso que importa por padrão é o de
+ * EXECUTADOS.
+ *
+ * Mas há lanes em que NENHUM skip é legítimo — a de fault injection da #510 é
+ * o caso: ali um `describe.skip` significa que a infraestrutura obrigatória
+ * (Postgres, Redis) não estava lá, e o job tem de FALHAR, não pular. Para
+ * essas, `--max-pulados 0`. É a mesma regra que
+ * `scripts/check-playwright-run.ts` já aplica ao E2E do console.
  *
  * Uso:
  *   node scripts/check-vitest-summary.ts <resumo.txt> [--min N] [--rotulo X]
+ *                                        [--max-pulados N]
  *
  * Escrito só com sintaxe TS apagável e invocado com `node` direto — como
  * `scripts/check-playwright-run.ts` e `scripts/check-audit-exceptions.ts` —
@@ -46,6 +54,8 @@ interface Args {
   file: string;
   min: number;
   rotulo: string;
+  /** `null` = sem teto (o default). `0` = nenhum skip é aceitável. */
+  maxPulados: number | null;
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -63,11 +73,21 @@ function parseArgs(argv: readonly string[]): Args {
   }
   const iRot = argv.indexOf('--rotulo');
   const rotulo = iRot === -1 ? file : (argv[iRot + 1] ?? file);
-  return { file, min, rotulo };
+  const iMax = argv.indexOf('--max-pulados');
+  let maxPulados: number | null = null;
+  if (iMax !== -1) {
+    maxPulados = Number.parseInt(argv[iMax + 1] ?? '', 10);
+    if (!Number.isInteger(maxPulados) || maxPulados < 0) {
+      throw new Error(
+        `--max-pulados precisa ser um inteiro >= 0 (recebido: ${String(argv[iMax + 1])})`,
+      );
+    }
+  }
+  return { file, min, rotulo, maxPulados };
 }
 
 function main(argv: readonly string[]): void {
-  const { file, min, rotulo } = parseArgs(argv);
+  const { file, min, rotulo, maxPulados } = parseArgs(argv);
 
   let texto: string;
   try {
@@ -106,6 +126,14 @@ function main(argv: readonly string[]): void {
         `tudo certo. ${pulados} caso(s) pulado(s) nesta rodada — pulado não é passou.`,
     );
   }
+  if (maxPulados !== null && pulados > maxPulados) {
+    problemas.push(
+      `${pulados} caso(s) PULADO(s), máximo tolerado ${maxPulados}. ` +
+        `Nesta lane o skip não é legítimo: ele significa que a ` +
+        `infraestrutura obrigatória não estava presente — e um gate que ` +
+        `pula quando o banco falta é o verde vazio que ele deveria impedir.`,
+    );
+  }
   if (RE_NAO_CARREGARAM.test(texto)) {
     problemas.push(
       `o resumo traz a seção ARQUIVOS QUE NÃO CARREGARAM / ERROS FORA DE ` +
@@ -116,7 +144,7 @@ function main(argv: readonly string[]): void {
 
   const resumo =
     `${rotulo}: ${executados} executado(s), ${falharam} falha(s), ${pulados} pulado(s) ` +
-    `(piso ${min}).`;
+    `(piso ${min}${maxPulados === null ? '' : `, teto de pulados ${maxPulados}`}).`;
 
   if (problemas.length > 0) {
     console.error(`✖ ${resumo}`);

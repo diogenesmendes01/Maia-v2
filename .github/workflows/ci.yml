@@ -501,6 +501,143 @@ jobs:
           done
 
   # ---------------------------------------------------------------------
+  # Fault injection (#510) — a lane que, até este job existir, não protegia
+  # NADA.
+  #
+  # `grep -rn "reliability" .github/workflows/` não retornava uma linha: o
+  # harness da #510, os cenários FI-04..FI-07 (fatia B) e FI-17/FI-18 (fatia C)
+  # rodavam só na máquina de quem os escreveu. Um harness de injeção de falha
+  # que não roda no CI não impede regressão nenhuma — ele só documenta que
+  # alguém, um dia, conseguiu quebrar o código de propósito.
+  #
+  # POR QUE UM JOB PRÓPRIO, e não um passo do `integration`:
+  #
+  #  - a lane sobe RÉPLICAS DE PROCESSO e as mata com `SIGKILL`. Misturar isso
+  #    com a suíte de integração no mesmo runner faz um crash proposital
+  #    disputar o mesmo Postgres de specs que não esperam por ele;
+  #  - o tempo é dominado por PRAZO, não por CPU: FI-18 leva ~17 s porque
+  #    espera o TTL de 6 s da lease vencer. Em matriz de dois Nodes isso é
+  #    tempo de fila desperdiçado — este job roda em UM Node só, o piso
+  #    (22.18), que é o que a imagem de produção resolve;
+  #  - quando a matriz FI-01..FI-25 crescer, este job cresce sozinho, sem
+  #    empurrar o caminho crítico de toda PR.
+  #
+  # O PISO É O QUE TORNA ESTE JOB UM GATE. Sem `TEST_DB_URL` (ou com
+  # `DATABASE_URL` divergente dela) TODA a lane faz `describe.skip` e reporta
+  # `executados=0 pulados=N` com exit 0 — exatamente o verde vazio que a #510
+  # existe para eliminar. Por isso o passo do guard vem depois e usa
+  # `--max-pulados 0`: nesta lane NENHUM skip é legítimo.
+  reliability:
+    name: fault injection (#510)
+    runs-on: ubuntu-latest
+    # Generoso de propósito: os cenários esperam prazos de lease de verdade, e
+    # um timeout apertado transformaria "a lease demorou" em falha de CI.
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      # `DATABASE_URL` e `TEST_DB_URL` precisam ser IGUAIS: os cenários exigem
+      # `process.env.DATABASE_URL === process.env.TEST_DB_URL` antes de rodar
+      # (ver `fi-outbound-entrega.spec.ts`). Divergir aqui não quebra o job —
+      # ele PULA tudo, e é o guard no fim que transforma isso em vermelho.
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      TEST_DB_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      POSTGRES_USER: maia_test
+      POSTGRES_PASSWORD: test1234
+      POSTGRES_DB: maia_test
+      REDIS_URL: redis://localhost:6379
+      ANTHROPIC_API_KEY: sk-ant-test-placeholder
+      OPENROUTER_API_KEY: sk-or-test-placeholder
+      WHATSAPP_NUMBER_MAIA: '+5500000000000'
+      OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+      OWNER_NOME: Test Owner
+      VOYAGE_API_KEY: test-voyage-key
+      ALERT_CHANNELS: log
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # UM Node só, o piso. Ver o comentário do job sobre por que a matriz
+          # não vale aqui.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply migrations
+        # O harness cria e migra o banco DELE a partir desta base; as
+        # migrations aqui garantem que a base existe e está no schema atual
+        # antes de qualquer cenário.
+        run: npm run db:migrate
+
+      - name: Lane de fault injection (#510)
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/reliability.txt
+        # `--retry=0` já está no script: um cenário de corrida que "passa na
+        # segunda tentativa" é precisamente o defeito que ele deveria denunciar.
+        run: npm run test:reliability
+
+      - name: Piso de volume da lane de fault injection
+        # BLOQUEANTE, e aqui ele é a diferença entre um gate e um teatro:
+        # a lane inteira faz `describe.skip` sem banco e sai 0. `--max-pulados 0`
+        # porque nesta lane não existe skip legítimo — se a infraestrutura
+        # obrigatória faltou, o job tem de FALHAR, não pular.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/reliability.txt --min 1 --max-pulados 0 --rotulo "fault injection (#510)"
+
+      - name: Artefatos do harness (só quando reprova)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-artifacts
+          path: tests/reliability/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Resumo dos testes
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
+
+  # ---------------------------------------------------------------------
   # Gate permanente de release do job `migrate` (#516). Job NOVO, isolado e
   # apendado de propósito: ele não compartilha nada com os jobs acima
   # (sem `npm ci`, sem service containers, sem matriz), então uma edição
