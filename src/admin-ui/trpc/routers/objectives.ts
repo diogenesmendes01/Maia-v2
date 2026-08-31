@@ -212,11 +212,26 @@ export const objectivesRouter = router({
         message: `Task is '${task.status}', not waiting_human — refresh and retry.`,
       });
     }
-    await ctx.repos.objectivesRepo.transitionTask({
+    // CAS sobre o status lido acima: sem o predicado, duas abas resolvendo a
+    // mesma exceção (ou uma aba e o reaper) sobrescrevem uma à outra, porque
+    // o `findTaskById` acima é uma leitura solta. `expect_claim_token` NÃO
+    // entra aqui de propósito: `waiting_human` não tem claim vivo (o worker
+    // libera o lease ao sair de `running`), então exigir token recusaria
+    // TODA resolução humana.
+    const applied = await ctx.repos.objectivesRepo.transitionTask({
+      tenant_id: tenantId,
+      agent_id: input.agentId,
       task_id: task.id,
       status: input.resolution,
+      expect_status: 'waiting_human',
       outcome: { resolved_by: ctx.userId, note: input.note },
     });
+    if (!applied) {
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message: 'Task changed state concurrently — refresh and retry.',
+      });
+    }
     await ctx.repos.adminAuditLogRepo.append({
       tenant_id: tenantId,
       actor_id: ctx.userId,

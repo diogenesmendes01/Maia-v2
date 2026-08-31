@@ -38,28 +38,46 @@ const registro = moduloDeProducao(() => import('../../../src/workers/index.js'))
  * Jobs que HOJE têm efeito não idempotente sem single-flight nem row claim.
  *
  * Esta lista é uma CATRACA, não uma permissão. Ela existe porque o baseline
- * chegou aqui com essas lacunas — `pending_expirer` cancela uma aprovação e
- * manda WhatsApp sem CAS, e roda de minuto em minuto — e um contrato que
- * reprovasse tudo no primeiro commit seria desligado no segundo.
+ * chegou aqui com essas lacunas, e um contrato que reprovasse tudo no primeiro
+ * commit seria desligado no segundo.
  *
  * O que o congelamento garante: um job NOVO não entra nesta lista sem alguém
  * editar este arquivo e explicar por quê. Para tudo que nasce daqui em diante,
  * "não idempotente sem guard" é reprovação.
  *
  * Quando uma lacuna for fechada (CAS no repo, advisory lock por tenant), o
- * nome SAI daqui e o teste passa a exigir que ele não volte.
+ * nome SAI daqui e o teste passa a exigir que ele não volte. **A lista SÓ
+ * ENCOLHE.**
+ *
+ * ─── De catorze para nove ────────────────────────────────────────────────────
+ *
+ * Cinco nomes saíram, e nenhum por reescrita de texto — em cada um o efeito
+ * passou a ser reivindicado por linha:
+ *
+ *   `pending_expirer` e `workflow_engine_tick` — os dois compartilhavam
+ *   `expireDueDualApprovals()`, que cancelava com `setStatus` incondicional e
+ *   mandava WhatsApp. Essa era a lacuna que NÃO precisava de duas réplicas:
+ *   dois jobs distintos no mesmo processo bastavam, e o solicitante recebia
+ *   dois avisos. A #691 pôs um CAS (`workflowsRepo.expireIfDue`) e amarrou a
+ *   auditoria e o envio a ele. Os outros ramos dos dois jobs — `expireDue` de
+ *   `pending_questions` e de `approval_requests` — já eram CAS antes.
+ *
+ *   `briefing_morning`, `briefing_evening` e `briefing_weekly` — a #506 tirou
+ *   o `sendText` direto e passou a comprometer cada aviso em `outbox_messages`
+ *   com `dedup_key` por período/dia/pessoa, sobre o índice único parcial
+ *   `idx_outbox_dedup`. Duas execuções colidem na chave; uma grava.
+ *
+ * O comentário anterior deste bloco citava o `pending_expirer` como o exemplo
+ * da lacuna. Citava certo na época e passou a mentir depois da #691 — por isso
+ * o exemplo saiu daqui: um texto que nomeia um caso concreto envelhece junto
+ * com ele.
  */
 const LACUNAS_CONGELADAS = [
-  'pending_expirer',
-  'workflow_engine_tick',
   'conversation_summarizer',
   'pattern_detector',
   'legacy_memory_reclassifier',
   'procedure_candidate_consumer',
   'knowledge_state_promoter',
-  'briefing_morning',
-  'briefing_evening',
-  'briefing_weekly',
   'drift_monitor',
   'gap_escalation_monitor',
   'tool_request_issue_relayer',
@@ -198,11 +216,17 @@ describe('grupos substituem phase sem mudar o que roda (#513 §5)', () => {
     mod._resetWorkerStateForTests();
     try {
       const inv = mod.startWorkers({ groups: ['proactive'] });
-      // Os quatro jobs proativos são exatamente lacunas conhecidas — é por
-      // isso que o grupo nasce desligado, e é isso que o boot precisa dizer.
-      expect(inv.unguarded_enabled.sort()).toEqual(
-        ['briefing_evening', 'briefing_morning', 'briefing_weekly', 'drift_monitor'].sort(),
-      );
+      // Sobrou UM. Os três briefings saíram da lista porque a #506 passou a
+      // comprometê-los em `outbox_messages` com `dedup_key` por
+      // período/dia/pessoa: a colisão na chave é o claim deles. O
+      // `drift_monitor` continua aplicando decisão de drift sem lock por
+      // (tenant, agent), e é o único do grupo que o boot ainda precisa
+      // denunciar.
+      //
+      // Este caso é o que impede a lista de encolher por descuido: se alguém
+      // marcar um job como guardado sem guardá-lo de fato, o nome some daqui
+      // e o teste fica vermelho pedindo explicação.
+      expect(inv.unguarded_enabled.sort()).toEqual(['drift_monitor']);
     } finally {
       mod._resetWorkerStateForTests();
     }

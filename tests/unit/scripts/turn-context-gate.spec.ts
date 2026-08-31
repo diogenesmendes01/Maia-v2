@@ -43,6 +43,8 @@ import {
   createPoolSaturationTracker,
   evaluateGate,
   gateExitCode,
+  coberturaAtual,
+  COBERTURA_DA_MEDICAO,
   gateMakespan,
   isDirectInvocation,
   mergeTwoPairs,
@@ -83,6 +85,7 @@ const FP: RunFingerprint = {
   max_concurrent_reads: 6,
   turns: 600,
   sustain_s: 60,
+  cobertura: coberturaAtual(),
 };
 
 /**
@@ -121,6 +124,9 @@ function armsWith(inject: Record<string, number>): ArmResult[] {
   return arms;
 }
 
+/** O rótulo do critério de contenção — ver `COBERTURA_DA_MEDICAO` no harness. */
+const CONTENCAO = 'aceite completo do orçamento do turno';
+
 function run(
   inject: Record<string, number>,
   baseline: BaselineFile | null = BASELINE_FOLGADO,
@@ -128,18 +134,114 @@ function run(
 ) {
   const arms = armsWith(inject);
   const verdicts = evaluateGate(arms, TH, baseline, { mode, fingerprint: FP });
+  const parciais = verdicts.filter((v) => !v.label.includes(CONTENCAO));
   return {
     verdicts,
+    /**
+     * O exit code REAL. Enquanto o `resolveScope` estiver fora da medição ele
+     * é 1 em modo `gate` mesmo numa corrida perfeita — é a contenção, não uma
+     * regressão. Os testes que falam dos CRITÉRIOS usam `codeParcial`.
+     */
     code: gateExitCode(verdicts, mode),
-    failed: verdicts.filter((v) => !v.passed),
+    /**
+     * O exit code que os critérios PARCIAIS produziriam sozinhos. É o que
+     * responde "o gate reprovaria esta corrida pelo que ele DE FATO mede?" —
+     * a pergunta que cada teste de critério faz.
+     */
+    codeParcial: gateExitCode(parciais, mode),
+    /** Reprovações entre os critérios parciais (a contenção não entra). */
+    failed: parciais.filter((v) => !v.passed),
+    /** A contenção em si, para os testes que falam DELA. */
+    contencao: verdicts.find((v) => v.label.includes(CONTENCAO)),
   };
 }
 
 describe('#525 — o gate do benchmark de carga de contexto', () => {
-  it('aprova uma corrida saudável, e o exit code é 0', () => {
-    const { code, failed } = run({});
+  it('nenhum critério PARCIAL reprova uma corrida saudável — mas o gate não sai 0', () => {
+    const { code, codeParcial, failed } = run({});
+    // Pelo que o harness DE FATO mede, a corrida é limpa.
     expect(failed).toEqual([]);
-    expect(code).toBe(0);
+    expect(codeParcial).toBe(0);
+    // E ainda assim o gate reprova, porque o aceite COMPLETO não foi avaliado:
+    // o `resolveScope` está fora da medição. Exit 1 aqui significa "não
+    // demonstrado", não "regrediu" — e é essa distinção que a contenção
+    // preserva. Ver `COBERTURA_DA_MEDICAO` e a issue #700.
+    expect(code).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // A CONTENÇÃO: o aceite completo não pode ser aprovado enquanto o
+  // `resolveScope` estiver fora da medição
+  // -------------------------------------------------------------------------
+
+  describe('contenção do orçamento completo (resolveScope fora da medição)', () => {
+    it('emite o aceite completo como NÃO AVALIADO, e por isso o gate não sai 0 nem numa corrida perfeita', () => {
+      const { code, contencao, failed } = run({});
+
+      expect(contencao, 'o critério de contenção sumiu da lista').toBeDefined();
+      // `skipped` implica `passed === false` — é a invariante do `Verdict`, e
+      // é ela que impede "não avaliado" de virar "aprovado".
+      expect(contencao?.skipped).toBe(true);
+      expect(contencao?.passed).toBe(false);
+      // O detalhe tem de NOMEAR o que ficou de fora. Um "não avaliado" sem
+      // dizer o quê manda o leitor adivinhar.
+      expect(contencao?.detail).toContain('resolveScope');
+      expect(contencao?.detail).toContain('#700');
+
+      // Nada nos critérios parciais reprova esta corrida...
+      expect(failed).toEqual([]);
+      // ...e mesmo assim o gate reprova. É o ponto.
+      expect(code).toBe(1);
+    });
+
+    it('o critério da contenção vem PRIMEIRO — a fronteira antes dos números', () => {
+      // Quem lê a tabela de cima para baixo encontra a fronteira antes de já
+      // ter formado opinião sobre os p95. Ordem é conteúdo aqui.
+      const { verdicts } = run({});
+      expect(verdicts[0]?.label).toContain(CONTENCAO);
+    });
+
+    it('em modo `measure` o exit code segue 0 — mas o critério continua marcado como não avaliado', () => {
+      // O opt-out explícito não pode virar uma porta para declarar aprovação:
+      // `measure` não emite veredicto de gate, e o relatório dele diz isso em
+      // caixa alta. O que NÃO pode acontecer é o critério sumir.
+      const { code, contencao } = run({}, BASELINE_FOLGADO, 'measure');
+      expect(code).toBe(0);
+      expect(contencao?.skipped).toBe(true);
+    });
+
+    it('a cobertura entra no fingerprint: baseline de outra cobertura é RECUSADO (com controle)', () => {
+      // É isto que mantém os números antigos identificados pela cobertura que
+      // os produziu, em vez de deixá-los circular como se medissem o turno
+      // inteiro.
+      const outraCobertura = baselineWith(1_000, {
+        ...FP,
+        cobertura: 'resolveScope+buildPrompt',
+      });
+      const recusa = checkBaselineCompatibility(outraCobertura, FP);
+      expect(recusa.status).toBe('incompatible');
+      expect(recusa.diffs.join(' ')).toContain('cobertura');
+
+      // CONTROLE: mesma cobertura, mesma corrida — a comparação acontece.
+      expect(checkBaselineCompatibility(baselineWith(1_000, FP), FP).status).toBe('ok');
+    });
+
+    it('um baseline do schema anterior é recusado — ele não diz o que mediu', () => {
+      expect(BASELINE_SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
+      const antigo = { ...baselineWith(1_000), schema_version: 2 };
+      expect(checkBaselineCompatibility(antigo, FP).status).toBe('legacy_schema');
+    });
+
+    it('o rótulo da cobertura MUDA quando a flag muda — é o que invalida os baselines antigos', () => {
+      // Se os dois estados produzissem o mesmo rótulo, virar a flag não
+      // invalidaria baseline nenhum e a comparação silenciosamente misturaria
+      // duas réguas. Este teste é o que impede essa regressão.
+      const rotuloSemResolveScope = COBERTURA_DA_MEDICAO.rotulo;
+      expect(coberturaAtual()).toBe(
+        COBERTURA_DA_MEDICAO.resolve_scope_medido ? 'resolveScope+buildPrompt' : rotuloSemResolveScope,
+      );
+      expect(rotuloSemResolveScope).not.toBe('resolveScope+buildPrompt');
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -257,7 +359,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // Este é o caso que saía vermelho sem significar regressão: com 20 turnos
       // repostos continuamente contra um pool de 10, a fila não PODE esvaziar
       // durante a carga. O critério do perfil é outro.
-      const { code, verdicts } = run({
+      const { codeParcial, verdicts } = run({
         ...SATURADO_NA_CARGA,
         pool_drain_samples: 20,
         pool_drain_saturated_samples: 0,
@@ -269,7 +371,10 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // E o critério do perfil normal NÃO é emitido: é um veredicto por braço,
       // escolhido pelo perfil, não os dois somados.
       expect(verdicts.some((x) => x.label.includes('nunca fica saturado por 60 s'))).toBe(false);
-      expect(code).toBe(0);
+      // `codeParcial` e não `code`: o gate reprova hoje pela contenção do
+      // `resolveScope`, e o que este teste afirma é sobre o critério de
+      // saturação — não sobre a fronteira da medição.
+      expect(codeParcial).toBe(0);
     });
 
     it('REPROVA quando a fila NÃO escoa depois que o produtor para', () => {
@@ -446,7 +551,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     it('aprova exatamente no teto de +20% e REPROVA um passo acima', () => {
       // p95 sintético = 40 ms. Baseline 100/3 ⇒ teto = 40 exatos.
       const noLimite = run({}, baseline(40 / 1.2));
-      expect(noLimite.code).toBe(0);
+      expect(noLimite.codeParcial).toBe(0);
 
       // O MESMO p95 contra um baseline 1% menor já estoura.
       const acima = run({}, baseline(40 / 1.2 / 1.01));
@@ -525,7 +630,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         mode: 'gate',
       };
       expect(checkBaselineCompatibility(mesmoNumeroOutroContexto, FP).status).toBe('ok');
-      expect(run({}, mesmoNumeroOutroContexto).code).toBe(0);
+      expect(run({}, mesmoNumeroOutroContexto).codeParcial).toBe(0);
     });
 
     it('RECUSA um baseline no formato antigo, que não prova com que carga foi medido', () => {

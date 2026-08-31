@@ -1362,6 +1362,30 @@ pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades
 braços `cold` e `warm`. Ele **exercita `buildPrompt`** — o call site de produção,
 que é quem publica `maia_turn_context_load_duration_ms{phase="loader"}`.
 
+> ### ⚠ O gate mede um orçamento PARCIAL — e hoje ele NÃO SAI 0
+>
+> O orçamento do turno (`src/agent/turn-context/types.ts`) é
+> **`resolveScope` + `buildPrompt`**. Este harness mede só o `buildPrompt`:
+> `buildContext` fabrica o escopo em memória e a massa não semeia `permissoes`
+> nem `permission_profiles`. Uma regressão que more no `resolveScope` passa
+> pelo gate sem ser vista.
+>
+> Enquanto isso for verdade, a corrida em modo `gate` emite o critério
+> **"aceite completo do orçamento do turno"** como `n/a`, e — pela regra do
+> próprio gate, em que não avaliado reprova — **sai 1 mesmo numa corrida
+> perfeita**. Nessa situação `exit 1` significa **"não demonstrado"**, não
+> "regrediu": leia os critérios PARCIAIS na tabela, que continuam avaliados e
+> continuam valendo para o trecho que exercitam.
+>
+> Um relatório deste harness **não é validação do custo completo do turno** e
+> não deve ser apresentado como tal. Correção do instrumento: **issue #700**
+> (inclui o `resolveScope` na medição, exige sonda vermelha que detecte sua
+> exclusão e novas rodadas de baseline/candidato).
+>
+> Os baselines gravados antes disso ficam **identificados pela cobertura que os
+> produziu** (`cobertura: buildPrompt-sem-resolveScope` no fingerprint) — e a
+> comparação entre coberturas diferentes é RECUSADA, não estimada.
+
 Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
 escreve ~13 mil linhas de massa e devolve o veredicto por **exit code**.
 
@@ -1401,6 +1425,10 @@ pelo critério relativo. Se você quer medir sem ter a evidência completa, o mo
 npm run turn:bench -- --sustain-s 60
 
 echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
+#
+# HOJE: 1 é o resultado esperado até a #700 — o critério do aceite completo
+# sai `n/a` porque o `resolveScope` está fora da medição. Veja o aviso no topo
+# desta seção antes de ler o exit code como regressão.
 ```
 
 Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
