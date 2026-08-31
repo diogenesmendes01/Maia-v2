@@ -177,12 +177,24 @@ sustentam isso, e nenhuma toca código de produção:
   DERIVADOS do spec, duas versões de perfil e um trace assinado pelo escritor
   de produção.
 
+Desde a **#623 (segunda parte)** o `smoke` também inclui a jornada de LINHAS de
+canal (`channel-lines.spec.ts`): a linha declarada permanece visível com o seu
+estado, o papel `viewer` não enxerga a tela (com caso de controle para `owner`,
+senão "viewer não vê" ficaria verde também com a rota quebrada) e, sem keyring,
+o console declara o pareamento indisponível e DESABILITA o CTA. Esse último é a
+premissa da quarentena virada asserção: no dia em que o runtime subir no job,
+ele fica vermelho e obriga a revisitar o que continua marcado.
+
 Fora do gate sobrou uma spec, `channel-lines-pairing.spec.ts`, marcada
-`@pendente-runtime`: o QR e o código de pareamento são produzidos pelo worker
-`channel_pairing` do RUNTIME, e este job sobe só o console — o cabeçalho do
-arquivo traz a medição e o critério objetivo de saída. A lista de arquivos em
-quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair
-dela é um diff visível.
+`@pendente-runtime` — e apenas os **quatro casos que precisam de um segundo
+processo**: o QR e o código de pareamento são produzidos pelo worker
+`channel_pairing` do RUNTIME, e este job sobe só o console. Cada um traz o
+motivo DELE no cabeçalho do arquivo, numa linha `FORA DO GATE: <título do
+test>`; "o arquivo depende do runtime" não vale mais como motivo coletivo, e foi
+esse denominador comum que manteve dois casos de listagem fora do gate. Três
+travas em `tests/unit/ci/admin-ui-e2e-gate.spec.ts` seguram a contabilidade: a
+lista de ARQUIVOS em quarentena, a contagem de CASOS dela e a conferência de que
+cada título tem justificativa — entrar ou sair é sempre um diff que alguém lê.
 
 ```bash
 npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha sem um runtime no ar)

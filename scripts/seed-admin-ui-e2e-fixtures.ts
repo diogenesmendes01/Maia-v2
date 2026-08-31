@@ -40,6 +40,8 @@ import {
   admin_audit_log,
   agent_operational_profile_versions,
   capability_proposals,
+  channel_line_state,
+  channels,
   proposal_approvals,
 } from '@/db/schema.js';
 import { writeEnvelope } from '@/control-plane/runtime-trace/envelope-writer.js';
@@ -90,6 +92,28 @@ const VERSOES_PERFIL = [
   { id: 'e2e30000-0000-4000-8000-000000000001', version: 1, status: 'frozen' },
   { id: 'e2e30000-0000-4000-8000-000000000002', version: 2, status: 'active' },
 ] as const;
+
+/**
+ * Linha WhatsApp DECLARADA — jornada `channel-lines.spec.ts`.
+ *
+ * `channels.active = false` + `channel_line_state.state = 'declared'` é o
+ * estado em que uma linha NASCE (#518): número registrado, posse não provada,
+ * não roteia. Era exatamente esse par que sumia da tela antes da #518, e é o
+ * único estado que a listagem consegue exibir sem runtime — QR, código e a
+ * transição para `pareando` vêm do worker `channel_pairing`, que este job não
+ * sobe (ver o cabeçalho de `channel-lines-pairing.spec.ts`).
+ *
+ * `external_id` PRÓPRIO e não o `default-channel` das migrations: aquele nasce
+ * `active = true` / `verified_offline`, ou seja, descreve o estado OPOSTO — e
+ * a jornada mediria a linha errada. O número é fictício (faixa +5511 9900000xx)
+ * e o índice único é `(tenant_id, channel_type, external_id)`, então ele não
+ * colide com o canal semeado pela migration.
+ */
+const LINHA_DECLARADA = {
+  channel_id: 'e2e40000-0000-4000-8000-000000000001',
+  external_id: '+5511990000001',
+  display_name: 'Linha comercial E2E',
+} as const;
 
 interface Fixture {
   id: string;
@@ -176,6 +200,12 @@ async function limpar(): Promise<void> {
     .delete(admin_audit_log)
     .where(and(eq(admin_audit_log.tenant_id, TENANT), inArray(admin_audit_log.resource_id, ids)));
   await db.delete(capability_proposals).where(inArray(capability_proposals.id, ids));
+  // A linha primeiro, o canal depois: `channel_line_state.channel_id` referencia
+  // `channels.id`.
+  await db
+    .delete(channel_line_state)
+    .where(eq(channel_line_state.channel_id, LINHA_DECLARADA.channel_id));
+  await db.delete(channels).where(eq(channels.id, LINHA_DECLARADA.channel_id));
 }
 
 async function semearUsuarios(): Promise<void> {
@@ -281,16 +311,38 @@ async function semearVersoesDePerfil(): Promise<void> {
   }
 }
 
+/**
+ * A linha entra por SQL direto porque o caminho de produção para CRIAR um
+ * canal é a própria tela (`channelLines`/`channelPolicies`), e passar por ele
+ * aqui faria a jornada de listagem depender da jornada de criação — além de
+ * deixar trilha em `admin_audit_log`, que a jornada de auditoria conta.
+ */
+async function semearLinhaDeclarada(): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO channels (id, tenant_id, agent_id, external_id, channel_type, display_name, active)
+    VALUES (
+      ${LINHA_DECLARADA.channel_id}::uuid, ${TENANT}, ${AGENTE},
+      ${LINHA_DECLARADA.external_id}, 'whatsapp', ${LINHA_DECLARADA.display_name}, false
+    )
+  `);
+  await db.execute(sql`
+    INSERT INTO channel_line_state (channel_id, tenant_id, agent_id, state)
+    VALUES (${LINHA_DECLARADA.channel_id}::uuid, ${TENANT}, ${AGENTE}, 'declared')
+  `);
+}
+
 async function main(): Promise<void> {
   await limpar();
   await semearUsuarios();
   await semearPropostas();
   await semearVersoesDePerfil();
   await semearTrace();
+  await semearLinhaDeclarada();
   // eslint-disable-next-line no-console
   console.log(
     `fixtures e2e do console: ${USUARIOS.length} usuários, ${FIXTURES.length} propostas, ` +
-      `${VERSOES_PERFIL.length} versões de perfil e 1 trace no tenant ${TENANT}.`,
+      `${VERSOES_PERFIL.length} versões de perfil, 1 trace e 1 linha whatsapp ` +
+      `declarada (${LINHA_DECLARADA.external_id}) no tenant ${TENANT}.`,
   );
 }
 

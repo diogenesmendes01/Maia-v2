@@ -65,6 +65,17 @@ export const PROPOSTAS_DO_LOTE = [
 /** Trace semeado pelo escritor de produção (envelope + corpo assinados). */
 export const TRACE_E2E = 'e2e20000-0000-4000-8000-000000000001';
 
+/**
+ * Linha WhatsApp DECLARADA (inativa) — o estado em que uma linha nasce (#518)
+ * e o único que a listagem consegue exibir sem o worker `channel_pairing` do
+ * runtime. Semeada por `scripts/seed-admin-ui-e2e-fixtures.ts`; o
+ * `external_id` é o texto que a jornada procura na tabela.
+ */
+export const LINHA_DECLARADA_E2E = {
+  channelId: 'e2e40000-0000-4000-8000-000000000001',
+  externalId: '+5511990000001',
+} as const;
+
 function urlDoBanco(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
