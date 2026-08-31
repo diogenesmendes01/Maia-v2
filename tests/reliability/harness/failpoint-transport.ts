@@ -264,6 +264,51 @@ export class FailpointServer {
     return liberados;
   }
 
+  /** Quantos filhos estão PARADOS neste failpoint AGORA. */
+  paradosEm(failpoint: string): number {
+    const nome = parseFailpointName(failpoint);
+    return this.parados.filter((p) => p.failpoint === nome).length;
+  }
+
+  /**
+   * Espera `quantos` filhos ESTACIONAREM no failpoint antes de soltá-lo.
+   *
+   * Existe porque `liberar()` sobre um gate vazio devolve 0 — e um cenário que
+   * chama `liberar()` logo depois de observar um sinal INDIRETO está apostando
+   * que o filho já chegou. Foi exatamente isso que reprovou a FI-17 no CI:
+   *
+   *     ❯ fi-outbound-entrega.spec.ts:359
+   *       expect(servidor.liberar('after_provider_accept_before_delivery_persist'))
+   *       - 1
+   *       + 0
+   *
+   * O cenário esperava o ledger do provider marcar o efeito lógico e SOLTAVA o
+   * gate seguinte. Só que o filho registra o efeito no provider e SÓ DEPOIS
+   * estaciona no gate: entre uma coisa e outra há uma janela, invisível numa
+   * máquina ociosa e real num runner carregado. Esperar o sinal certo — o filho
+   * parado ALI — fecha a janela em vez de estreitá-la.
+   *
+   * Mesmo contrato do `esperarNaBarreira`: sem `sleep` cego, e o estouro diz
+   * quantos chegaram, porque "ninguém chegou" e "chegou um só" pedem
+   * investigações diferentes.
+   */
+  async esperarParadoEm(failpoint: string, quantos = 1, timeoutMs = 30_000): Promise<void> {
+    const nome = parseFailpointName(failpoint);
+    const limite = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.paradosEm(nome) >= quantos) return;
+      if (Date.now() > limite) {
+        throw new FailpointServerError(
+          `failpoint "${nome}": esperei ${quantos} filho(s) PARADO(s) em ${timeoutMs}ms e ` +
+            `chegaram ${this.paradosEm(nome)}. Parados agora: ` +
+            `${JSON.stringify(this.pendentes())}. Soltar um gate vazio devolve 0 e faz o ` +
+            'cenário seguir esperando por um filho que nunca chegou ao ponto.',
+        );
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
   /** Quantas réplicas estão paradas nesta barreira AGORA. */
   naBarreiraContagem(nome: string): number {
     return (this.naBarreira.get(nome) ?? []).length;
