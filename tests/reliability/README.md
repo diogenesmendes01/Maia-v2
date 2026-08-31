@@ -1,11 +1,12 @@
 # Harness de fault injection para turnos (issue #510)
 
-> **Estado desta entrega (fatia B):** passos 1–4 do rollout continuam valendo, e
-> agora existem também o **transporte de failpoint** (o lado do processo filho),
-> o **`InvariantOracle`** e os **quatro primeiros cenários da matriz — FI-04,
-> FI-05, FI-06 e FI-07**. Os outros 21 cenários, os perfis
-> `reliability:full`/`soak` e o gate blocking de CI continuam FORA. A issue #510
-> segue aberta.
+> **Estado desta entrega (fatia C):** além de tudo o que a fatia B trouxe
+> (transporte de failpoint, `InvariantOracle`, FI-04/05/06/07), existem agora os
+> **dois cenários da família de SAÍDA — FI-17 e FI-18**, com o fake de provider
+> num processo que SOBREVIVE ao `SIGKILL` do worker. **6 dos 25 cenários estão
+> implementados.** Os perfis `reliability:full`/`soak` e o gate blocking de CI
+> continuam FORA. A issue #510 segue aberta — o inventário abaixo é o mapa
+> honesto do que falta.
 
 ## Por que este harness existe
 
@@ -73,6 +74,62 @@ marcador `_fi_` no nome do banco e prefixo `fi_<slug>` na fila — quatro
 condições independentes, avaliadas **antes** de qualquer comando destrutivo, com
 todos os motivos acumulados numa mensagem só.
 
+## Inventário FI-01..FI-25 — o estado de cada cenário da matriz
+
+A issue #510 exige 25 cenários nominais. Esta tabela é a fonte de verdade sobre
+quais existem, e é atualizada a cada fatia. **`documentado` não é `implementado`:**
+vários IDs aparecem em comentários e nos self-tests dos fakes sem que exista um
+cenário que os execute — eles contam como FALTA aqui.
+
+| ID | Falha injetada | Estado | Onde está / o que bloqueia |
+|---|---|---|---|
+| FI-01 | redelivery inbound | **falta** | exige `TurnDriver` (ingresso real) e BullMQ no cenário |
+| FI-02 | crash pós-persist/pre-enqueue | **falta** | `after_inbound_persist_before_enqueue` sem call site |
+| FI-03 | enqueue duplicado | **falta** | exige BullMQ real e `jobId` determinístico no cenário |
+| FI-04 | corrida de claim | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
+| FI-05 | crash pós-claim | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
+| FI-06 | heartbeat interrompido | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
+| FI-07 | stale completion | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
+| FI-08 | recovery concorrente | **falta** | exige dois sweepers de processo sobre o mesmo lote |
+| FI-09 | job failed retido | **falta** | exige BullMQ real |
+| FI-10 | FIFO mesma stream | **falta** | exige `TurnDriver` + promoção de stream |
+| FI-11 | paralelismo entre streams | **falta** | idem FI-10 |
+| FI-12 | debounce concorrente | **falta** | exige dois closers de `stream-debounce` |
+| FI-13 | retry head-of-line | **falta** | idem FI-10 |
+| FI-14 | poison/DLQ | **falta** | `poison-policy.ts` existe; falta cenário de processo |
+| FI-15 | crash antes do outbox commit | **falta** | `after_response_built_before_outbox_commit` sem call site |
+| FI-16 | crash pós-outbox/pre-enqueue | **falta** | exige o sweeper de `outbound-recovery-repo` no cenário |
+| FI-17 | dois delivery workers | **feito** (fatia C) | `scenarios/fi-outbound-entrega.spec.ts` |
+| FI-18 | provider aceita, ACK perdido | **feito** (fatia C) | `scenarios/fi-outbound-entrega.spec.ts` |
+| FI-19 | crash pós-delivery persist | **falta** | exige o elo entrega→`completed` do turno |
+| FI-20 | payload/key collision | **parcial** | o FAKE já recusa chave igual/hash diferente (`self-tests/fake-channel-provider.spec.ts`); falta exercer a `logical_dedupe_key` de PRODUÇÃO |
+| FI-21 | deadline durante LLM | **parcial** | `FakeLlmServer` já observa `AbortSignal`; falta o cenário com o turno real |
+| FI-22 | deadline antes da tool | **falta** | `after_llm_before_tool` sem call site |
+| FI-23 | deadline após efeito possível | **falta** | `after_tool_effect_before_result_persist` sem call site |
+| FI-24 | shutdown gracioso | **falta** | `ProcessSupervisor` já faz SIGTERM; falta o cenário com turnos ativos |
+| FI-25 | isolamento adversarial | **falta** | o oracle já checa `tenant_id + agent_id`; falta o cenário de dois tenants |
+
+**Resumo: 6 implementados, 2 parciais (infra pronta, cenário ausente), 17 sem
+começar.** Fora da matriz nominal, continua faltando o cenário de duplicação
+**entre JOBS no mesmo processo** (ver a seção sobre as duas formas de duplicação).
+
+### O que REALMENTE bloqueia os 19 restantes
+
+Não é volume de cenário — é que **15 dos 16 failpoints do catálogo não têm call
+site**. O único ponto alcançável hoje por um caminho de produção é
+`after_turn_claim_before_running`, mais os dois que a fatia C passou a alcançar
+(`after_outbound_claim_before_send` e
+`after_provider_accept_before_delivery_persist`). Um cenário novo só é honesto
+quando existe um SEAM de produção onde o gate cabe entre duas chamadas reais —
+foi assim que FI-04..07 usaram `acquireTurnLease` + `markRunning`, e FI-17/18
+usam `beginInlineDelivery` + `recordInlineDelivery`.
+
+Onde não há seam (`during_llm_request`, `after_response_built_before_outbox_commit`
+— pontos DENTRO de uma função ou de uma transação), o cenário exige antes uma
+mudança de desenho no código de produção, e essa mudança é uma decisão de dono,
+não de teste. É a razão pela qual as fatias avançam por FAMÍLIA DE SEAM e não
+por ordem numérica de FI-ID.
+
 ## O que está entregue
 
 | Componente | Arquivo | O que faz |
@@ -91,6 +148,8 @@ todos os motivos acumulados numa mensagem só.
 | **`congelar` / `descongelar`** | `harness/process-supervisor.ts` | `SIGSTOP`/`SIGCONT` por PID exato — a falha que o `SIGKILL` não modela |
 | **`InvariantOracle`** | `oracles/invariant-oracle.ts` | Foto durável (turno, outbound, audit) + checagens PURAS por família |
 | **Cenários FI-04/05/06/07** | `scenarios/fi-claim-crash-fence.spec.ts` | Réplicas de PROCESSO contra Postgres real, com barreira, `SIGKILL` e `SIGSTOP` |
+| **Cenários FI-17/FI-18** | `scenarios/fi-outbound-entrega.spec.ts` | Claim de ENTREGA disputado por processos, e o efeito não repetido através de um `SIGKILL` |
+| **`replica-de-entrega.ts`** | `fixtures/replica-de-entrega.ts` | O filho que chama `beginInlineDelivery`/`recordInlineDelivery` REAIS e fala com o provider por HTTP |
 
 ## Como os failpoints são impossíveis de habilitar em produção
 
@@ -239,6 +298,75 @@ trancas do supervisor — PID do registro e filho vivo. O cenário precisa chama
 `autorizarSaida()` antes, senão o supervisor trata a morte que ele mesmo pediu
 como saída inesperada, que é o comportamento certo.
 
+## Fatia C — a família de SAÍDA, e o contador que sobrevive ao crash
+
+A fatia B provou a posse do TURNO. A fatia C prova a da ENTREGA, que é onde o
+erro custa caro: um turno reivindicado duas vezes gasta CPU, mas uma entrega
+enviada duas vezes **chega duas vezes ao destinatário**.
+
+| Falha que o harness injeta | Como | Reação PROVADA | Onde |
+|---|---|---|---|
+| dois delivery workers na mesma linha | barreira solta os dois juntos | o `UPDATE` atômico de `tryClaimDelivery` concede a UM; o outro leva `DeliveryFenceError`; `attempt = 1` | FI-17 |
+| provider aceita, conexão cai, worker MORRE | `accept_then_drop` + `SIGKILL` no gate 2 | a linha fica em `sending`; o sucessor é ESTRUTURALMENTE incapaz de reenviar e grava `cancelled_after_send_unknown` | FI-18 |
+
+### Por que o provider precisa viver FORA do processo
+
+Esta é a razão de a fatia existir, e não é estilo. A suíte in-process que já
+existe (`tests/integration/outbound-delivery-claim-lease-fence-real-db.spec.ts`)
+é boa, mas três coisas nela são simuladas:
+
+1. o "crash" é apenas **parar de chamar funções** — o processo nunca morre, e
+   todo `finally`, pool e timer continuam intactos;
+2. o vencimento da lease é **forçado** por
+   `UPDATE … lease_expires_at = now() - interval '1 second'`;
+3. o contador de chamadas do provider vive **no mesmo processo do worker**.
+
+O item 3 é o fatal. Quando a pergunta é "o worker morreu com a chamada em voo;
+o sucessor reenviou?", um contador in-process **deixa de existir exatamente no
+instante que interessa**. O ledger de `fake-channel-provider-server.mjs` roda
+noutro PID e sobrevive ao `SIGKILL`, então `physical_call_count` continua
+legível depois da morte — e é ele que responde à pergunta.
+
+### Como se sabe que FI-17 e FI-18 não são vácuo
+
+Duas **sondas vermelhas no call site de produção**
+(`src/db/repositories/outbound-delivery-repo.ts`), cada uma revertida e o verde
+reconfirmado:
+
+**Sonda 1 — apagar a trava estrutural do `sending`.** Trocar
+`status = CASE WHEN status = 'sending' THEN 'sending' ELSE 'claimed' END` por
+`status = 'claimed'` faz **FI-18 ficar vermelho**, e o vermelho é literalmente o
+dano:
+
+```
+estavelDurante("o sucessor NÃO chama o provider uma segunda vez") observou
+MUDANÇA dentro da janela de 3000ms. Antes: 1. Depois: 2.
+```
+
+`Antes: 1. Depois: 2.` é o destinatário recebendo a mensagem duas vezes.
+
+**Sonda 2 — apagar a exclusão do claim.** Trocar o bloco
+`AND (status IN (…claimable…) … OR status IN (…takeover…) AND lease_expires_at <= now())`
+por `AND (true)` faz **FI-17 ficar vermelho** em `attempt`:
+
+```
+AssertionError: expected 2 to be 1
+  ❯ expect(linha.attempt).toBe(1)
+```
+
+E o diagnóstico do filho mostra o mecanismo: **as duas réplicas reivindicaram**
+(`attempt` foi a 2), e a que perdeu só foi barrada mais adiante, pelo fence do
+`markSending`. Ou seja, a sonda revelou que há **duas camadas independentes** de
+defesa nesse caminho, e que FI-17 detecta a perda da PRIMEIRA mesmo quando a
+segunda ainda segura. Um cenário que só olhasse "quantos enviaram?" teria ficado
+verde e escondido a regressão.
+
+### O que estes dois cenários NÃO provam
+
+`FakeChannelProvider` honra a chave idempotente **para sempre**, e o WhatsApp
+real não. FI-18 prova que o SUT não reenvia por conta própria; ele não prova
+exactly-once contra o Baileys. Ver "Limites declarados dos fakes".
+
 ## As DUAS formas de duplicação, e por que o harness precisa distinguir
 
 Uma correção de rota que vale registrar, porque ela muda quais cenários valem a
@@ -275,12 +403,17 @@ E há uma distinção que o harness ainda não sabe fazer, e precisa:
 
 ## O que falta para fechar a #510
 
-1. `TurnDriver` (injetar inbound de verdade e acompanhar IDs pelo pipeline);
-2. os failpoints do caminho de OUTBOUND e de TOOL — hoje o único ponto de
-   injeção com call site real é `after_turn_claim_before_running`, alcançado
-   pelo fixture; os outros 15 nomes do catálogo continuam sem call site;
-3. FI-01/02/03, FI-08 a FI-25 — e, fora da matriz nominal, um cenário para a
-   duplicação ENTRE JOBS no mesmo processo (ver a seção acima);
+Ver o **Inventário FI-01..FI-25** no topo deste arquivo para o estado de cada
+cenário. Em resumo, o que ainda falta:
+
+1. `TurnDriver` (injetar inbound de verdade e acompanhar IDs pelo pipeline) —
+   é o que destrava a família FIFO inteira (FI-10..FI-13) e FI-01/02/03;
+2. os failpoints de TOOL e do commit de outbox continuam sem call site; a fatia
+   C acrescentou dois pontos alcançáveis (`after_outbound_claim_before_send` e
+   `after_provider_accept_before_delivery_persist`), então são 13 os que faltam,
+   não 15;
+3. os 19 cenários restantes da matriz — e, fora dela, a duplicação ENTRE JOBS no
+   mesmo processo (ver a seção sobre as duas formas de duplicação);
 4. perfis `reliability:full` / `soak` e o gate blocking de CI (o script
    `npm run test:reliability` existe e roda a lane inteira com `--retry=0`);
 5. runbook de reprodução por FI-ID/seed e o template de cenário novo.
