@@ -198,6 +198,31 @@ d('#633 — job de entrega determinístico (Redis + Postgres reais)', () => {
   });
 
   afterAll(async () => {
+    // ORDEM IMPORTA, e a inversão custou um vermelho de CI.
+    //
+    // Este arquivo roda um worker BullMQ DE VERDADE. Enquanto ele estiver
+    // vivo, o caminho de entrega continua gravando em `audit_log` — com
+    // `mensagem_id` preenchido. Se a limpeza começar antes de o worker parar,
+    // uma linha de auditoria nova pode aterrissar ENTRE o
+    // `DELETE FROM audit_log` e o `DELETE FROM mensagens`, e o segundo estoura:
+    //
+    //     update or delete on table "mensagens" violates foreign key
+    //     constraint "audit_log_mensagem_id_fkey" on table "audit_log"
+    //
+    // O arquivo inteiro é reportado como NÃO CARREGADO (o erro é de hook, não
+    // de caso), e o resumo mostra `falharam=0` sobre 1207 casos — verde no
+    // contador, vermelho na rodada. Observado no CI em node 22.18 enquanto o
+    // 22.22 do MESMO commit passou: é corrida, e corrida não se conserta
+    // repetindo a rodada.
+    //
+    // Fechar a fila PRIMEIRO torna a corrida não-representável: sem worker
+    // vivo, não há escrita concorrente com a limpeza.
+    for (const id of armados) {
+      await outboundDeliveryQueue.getJob(id).then((j) => j?.remove()).catch(() => undefined);
+    }
+    const { shutdownQueue } = await import('@/gateway/queue.js');
+    await shutdownQueue();
+
     const c = await pool.connect();
     try {
       await c.query(`DELETE FROM audit_log WHERE tenant_id = $1`, [TENANT]);
@@ -212,11 +237,6 @@ d('#633 — job de entrega determinístico (Redis + Postgres reais)', () => {
     } finally {
       c.release();
     }
-    for (const id of armados) {
-      await outboundDeliveryQueue.getJob(id).then((j) => j?.remove()).catch(() => undefined);
-    }
-    const { shutdownQueue } = await import('@/gateway/queue.js');
-    await shutdownQueue();
     await pool.end();
   });
 
