@@ -3375,6 +3375,17 @@ export const objective_tasks = pgTable(
     pending_question_id: uuid('pending_question_id'),
     outcome: jsonb('outcome'),
     error_detail: text('error_detail'),
+    // Lease + fencing do claim (migração 138, issue #469 fatia A). `running`
+    // sem estas quatro colunas era uma tarefa sem dono e sem prazo: um
+    // SIGKILL entre o claim e a transição a prendia para sempre. O
+    // `claim_token` é o que impede o worker de lease vencida de sobrescrever
+    // a decisão de quem assumiu a tarefa depois.
+    claimed_by: text('claimed_by'),
+    claimed_at: timestamp('claimed_at', { withTimezone: true }),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    claim_token: text('claim_token'),
+    /** Teto contra poison task: o reaper não reanima para sempre. */
+    claim_attempts: integer('claim_attempts').notNull().default(0),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     completed_at: timestamp('completed_at', { withTimezone: true }),
   },
