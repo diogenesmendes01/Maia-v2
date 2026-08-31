@@ -318,7 +318,7 @@ jobs:
         run: node scripts/check-audit-exceptions.ts
 
   integration:
-    name: integration + e2e (node ${{ matrix.node }})
+    name: integration (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -468,10 +468,25 @@ jobs:
           VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 
-      - name: Run e2e tests
-        env:
-          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
-        run: npm run test:e2e
+      - name: Piso de volume da rodada de integração
+        # BLOQUEANTE, e o motivo é concreto: até esta mudança existia aqui um
+        # passo `Run e2e tests` que rodava `vitest run tests/e2e` contra um
+        # ÚNICO arquivo cujo `describe` estava com `.skip` HARDCODED e cujos
+        # três corpos eram comentários. O vitest sai 0 quando não acha teste,
+        # então o job ficava verde sobre zero asserção — e o nome do job
+        # (`integration + e2e`) anunciava uma cobertura que não existia.
+        #
+        # O passo vazio saiu. Este piso entra no lugar, sobre a integração que
+        # de fato roda: `executados=0` passa a REPROVAR, e a seção ARQUIVOS QUE
+        # NÃO CARREGARAM do resumo também — um arquivo que não coletou não tem
+        # caso contado em `executados`, então `falharam=0` sobre o resto seria
+        # leitura falsa.
+        #
+        # Mesmo raciocínio do `scripts/check-playwright-run.ts` no E2E do
+        # console: um gate que fica verde por ausência de trabalho não é gate.
+        # Quando o e2e de backend voltar, ele nasce com este piso e com sonda
+        # vermelha — não antes.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --rotulo "integração (node ${{ matrix.node }})"
 
       - name: Resumo dos testes
         # Mesma razão do job `validate` — e aqui o problema é pior, porque este
