@@ -39,6 +39,18 @@
  *    (workers, /metrics, gateway) impõe ao mesmo pool. Os números daqui são o
  *    PISO: em produção a mesma carga custa mais. É por isso que o veredicto
  *    contra o baseline é relativo (+20%) e não só absoluto.
+ *  - **NÃO mede o turno inteiro: `resolveScope` fica de FORA.** O orçamento da
+ *    #525 (`src/agent/turn-context/types.ts`) define "turno inteiro" como
+ *    `resolveScope` + `buildPrompt`, e conta o JOIN `permissoes ⋈
+ *    permission_profiles` do `resolveScope` como uma das queries. Este harness
+ *    mede só `buildPrompt`: `buildContext` (abaixo) FABRICA o escopo em
+ *    memória — monta `byEntity` no processo e nunca chama `resolveScope` — e a
+ *    massa não semeia `permissoes` nem `permission_profiles`. Logo o gate
+ *    afere um ORÇAMENTO PARCIAL. Um relatório deste harness NÃO é validação do
+ *    custo completo do turno, e não deve ser apresentado como tal: uma
+ *    regressão que more no `resolveScope` passa por ele sem ser vista. Enquanto
+ *    o instrumento não incluir o `resolveScope`, qualquer decisão que dependa
+ *    do custo total precisa de uma medição dirigida à parte.
  *
  * Quem citar um número deste harness, cite junto o braço (`cold`/`warm`), a
  * cardinalidade e o host.
@@ -1614,6 +1626,10 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
  * mediria o harness. `byEntity` é o que o renderer percorre para escrever o
  * bloco "## Escopo desta conversa" — sem ele o turno renderiza um escopo vazio
  * e a cardinalidade deixa de custar o que custa em produção.
+ *
+ * É AQUI que o `resolveScope` sai da medição: o escopo nasce pronto, em
+ * memória, e o custo real de resolvê-lo no Postgres nunca entra no relógio.
+ * Ver a seção "o que ele NÃO mede" no topo do arquivo.
  */
 function buildContext(pair: Pair, entities: number): unknown {
   const ids = pair.entidade_ids.slice(0, entities);
@@ -2051,7 +2067,15 @@ function renderReport(
     ` · entidades ${CARDINALITIES.join('/')} · identidade \`${opts.identity}\`\n` +
     `Pool: \`max=${arms[0]?.pool_max ?? 10}\` (\`src/db/client.ts\`) · ` +
     `teto de leituras por turno: ${opts.thresholds.max_peak_reads} ` +
-    `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n`;
+    `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n\n` +
+    `> **Escopo do que foi medido — orçamento PARCIAL.** Este gate mede ` +
+    `\`buildPrompt\`; o \`resolveScope\` (JOIN \`permissoes ⋈ ` +
+    `permission_profiles\`) fica de FORA: o escopo é fabricado em memória ` +
+    `pelo harness e a massa não semeia essas tabelas. Os números abaixo NÃO ` +
+    `validam o custo completo do turno como definido em ` +
+    `\`src/agent/turn-context/types.ts\`, e não devem ser apresentados como ` +
+    `tal. Uma regressão que more no \`resolveScope\` passa por este gate sem ` +
+    `ser vista.\n`;
 
   const rows: string[][] = [
     ['Métrica', ...arms.map((a) => `\`${a.arm}\``)],
