@@ -64,7 +64,6 @@
     "test:integration:teardown": "tsx scripts/test-infra.ts down",
     "test:integration": "tsx scripts/test-integration.ts",
     "test:integration:real-db": "vitest run tests/integration/**/*real-db*.spec.ts --no-coverage",
-    "test:e2e": "vitest run tests/e2e",
     "lint": "eslint src tests scripts",
     "format": "prettier --write src",
     "typecheck": "tsc --noEmit",

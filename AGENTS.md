@@ -118,7 +118,6 @@ npm run dev
 npm test                          # unit (vitest run)
 npm run test:watch                # unit, watch mode
 npm run test:integration          # integration (needs Postgres + Redis)
-npm run test:e2e                  # e2e
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
