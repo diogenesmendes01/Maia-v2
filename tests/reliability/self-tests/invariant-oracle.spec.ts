@@ -224,6 +224,52 @@ describe('#510 oracle — turno e FIFO', () => {
     ).toContain('turno.claim_completo');
   });
 
+  /**
+   * #510 (fatia F) — a outra metade da regra de posse, encontrada por FI-14.
+   *
+   * A conclusão terminal LIBERA `claim_token`/`lease_expires_at` e PRESERVA
+   * `claimed_by` para a forense (`clearClaim`, `turn-repos.ts`). Enquanto
+   * nenhum cenário desta lane levava um turno até um estado terminal, o oracle
+   * cobrava o tuplo completo também no terminal — e FI-14, o primeiro a
+   * dead-letterar, mostrou que isso acusaria TODO turno concluído. A regra que
+   * vale ali é mais forte que o tuplo: nenhuma POSSE VIVA sobrevive ao fim.
+   */
+  it('ACEITA turno TERMINAL com `claimed_by` preservado e a posse liberada', () => {
+    expect(
+      nomes(
+        foto({
+          turnos: [
+            turnoBase({
+              status: 'dead_letter',
+              outcome: 'retry_exhausted',
+              claimed_by: 'vm:1:turn:abc',
+              claim_token: null,
+              lease_expires_at: null,
+            }),
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('DETECTA turno TERMINAL que ficou com posse viva', () => {
+    expect(
+      nomes(
+        foto({
+          turnos: [
+            turnoBase({
+              status: 'completed',
+              outcome: 'reply_delivered',
+              claimed_by: 'vm:1:turn:abc',
+              claim_token: randomUUID(),
+              lease_expires_at: new Date(Date.now() + 60_000).toISOString(),
+            }),
+          ],
+        }),
+      ),
+    ).toContain('turno.posse_liberada_no_terminal');
+  });
+
   it('DETECTA dois turnos ATIVOS na mesma stream', () => {
     const violacoes = verificarInvariantes(
       foto({
