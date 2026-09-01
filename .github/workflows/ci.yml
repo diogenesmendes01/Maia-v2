@@ -484,9 +484,54 @@ jobs:
         #
         # Mesmo raciocínio do `scripts/check-playwright-run.ts` no E2E do
         # console: um gate que fica verde por ausência de trabalho não é gate.
-        # Quando o e2e de backend voltar, ele nasce com este piso e com sonda
-        # vermelha — não antes.
+        #
+        # #703 — o e2e de backend VOLTOU, e voltou como a issue exigia: com
+        # conteúdo (`tests/e2e/jornadas-backend.spec.ts`), com piso próprio
+        # (`--min 3 --max-pulados 0`, nos dois passos logo abaixo) e com uma
+        # sonda vermelha por jornada registrada no corpo da PR.
         run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --rotulo "integração (node ${{ matrix.node }})"
+
+      - name: Jornadas e2e de backend (#703)
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
+        # A lane que a #703 devolve ao CI: as TRÊS jornadas de negócio ponta a
+        # ponta (`tests/e2e/jornadas-backend.spec.ts`).
+        #
+        # POR QUE UM PASSO DESTE JOB, e não um job novo: um job novo só vira
+        # gate quando entra na PROTEÇÃO DE BRANCH, e um check obrigatório com
+        # nome errado nunca reporta (aceite 4 da #703). Este job JÁ é
+        # obrigatório, JÁ tem Postgres e Redis, e JÁ aplicou as migrations —
+        # a lane herda tudo isso sem depender de uma mudança de configuração
+        # fora do repositório. O NOME do job (`integration (node …)`) fica
+        # INTACTO de propósito: renomeá-lo trocaria o nome do check obrigatório
+        # e a proteção passaria a esperar um check que ninguém mais publica.
+        #
+        # RESUMO PRÓPRIO (`e2e.txt`, e não o da integração): um piso de 3 lido
+        # contra o resumo da integração enxergaria os ~1100 casos dela e
+        # aprovaria uma lane e2e VAZIA — o defeito de novo, uma casa adiante.
+        #
+        # `--retry=0` está no script `test:e2e`: uma jornada que "passa na
+        # segunda tentativa" é exatamente o flake que este gate deveria
+        # denunciar, não absorver.
+        run: npm run test:e2e
+
+      - name: Piso de volume das jornadas e2e (#703)
+        # BLOQUEANTE, e este é o passo que impede a #703 de acontecer de novo.
+        #
+        # `--min 3`: são TRÊS jornadas nominais (os três nomes do arquivo
+        # removido pela #701 — R$ 50, R$ 25k, quarentena). O piso é o número de
+        # casos, não uma folga: apagar qualquer um deles reprova o job em vez
+        # de reduzir silenciosamente a cobertura. Ele NÃO impede acrescentar
+        # jornadas — só impede remover.
+        #
+        # `--max-pulados 0`: nesta lane não existe skip legítimo. O ÚNICO skip
+        # possível é o `describe.skip` condicionado a `TEST_DB_URL`
+        # (`SHOULD_RUN` na spec), e neste job Postgres e Redis são
+        # obrigatórios — um skip aqui significa "a infraestrutura obrigatória
+        # não estava presente", que é falha de job, não ausência de trabalho.
+        # É a mesma regra que `scripts/check-playwright-run.ts` aplica ao E2E
+        # do console e que a lane de fault injection (#510) já aplica abaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/e2e.txt --min 3 --max-pulados 0 --rotulo "jornadas e2e (#703, node ${{ matrix.node }})"
 
       - name: Resumo dos testes
         # Mesma razão do job `validate` — e aqui o problema é pior, porque este
