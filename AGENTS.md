@@ -169,7 +169,21 @@ npm run doctor                    # diagnóstico READ-ONLY do ambiente (#517) �
 npm run doctor -- --online        # + liveness de Postgres/Redis; --format json, --strict, --only
 npm run dlq                       # dead-letter queue inspection
 npm run embeddings:rebuild        # regenerate vector embeddings
-npm run import:ofx                # OFX file import flow
+                                  # exige --tenant e --agent (#239)
+
+# Importação de extrato (OFX/CSV) — escopo DECLARADO e VERIFICADO (#720).
+# `--tenant` e `--agent` são OBRIGATÓRIOS e não têm default: ausentes → exit 2.
+# A conta e a pessoa são resolvidas DENTRO do escopo declarado; se não
+# pertencerem a ele, a CLI recusa (exit 3) sem escrever nada. Runs de outro
+# escopo não são visíveis nem aplicáveis. Ver o cabeçalho de
+# `scripts/import-ofx.ts` para a decisão de desenho por trás disso.
+npm run import:ofx   -- --tenant=<id> --agent=<id> --pessoa=<id|apelido> \
+                        --conta=<id|apelido> --file=extrato.ofx
+npm run import:list  -- --tenant=<id> --agent=<id>
+npm run import:show  -- --tenant=<id> --agent=<id> --run=<id>
+npm run import:apply -- --tenant=<id> --agent=<id> --run=<id> \
+                        [--candidates=accept|reject]
+
 npm run backup                    # DB backup
 ```
 
