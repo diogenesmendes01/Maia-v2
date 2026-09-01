@@ -434,6 +434,10 @@ d('#510 FI-17/FI-18 — claim de entrega e efeito não repetido, com réplicas d
       expect(linhaAntes.status).toBe('sending');
       expect(linhaAntes.delivery_outcome).toBeNull();
 
+      // O `SIGKILL` precisa acertar o filho PARADO no gate 2, não em algum
+      // lugar por ali: o ledger já provou que o efeito aconteceu, mas só isto
+      // prova que ele está bloqueado esperando decisão do cenário.
+      await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
       sup.hardKill(morto);
       const enc = await morto.esperarSaida(10_000);
       expect(enc.signal).toBe('SIGKILL');
