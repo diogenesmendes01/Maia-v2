@@ -20,6 +20,27 @@
  *
  * Topologia v1: in-process (N sockets). O corte para processo-por-linha é
  * esta interface — `transportFor` — nada fora dela conhece sockets.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * A COSTURA do adapter de canal (issue #623) — e por que ela NÃO é config
+ * ─────────────────────────────────────────────────────────────────────────
+ * `startPairingSession` falava com o Baileys direto: `useMultiFileAuthState`
+ * + `fetchLatestBaileysVersion` + `makeWASocket`, sem ponto de injeção. Medir
+ * o pareamento num job de CI exige um adapter FALSO — a própria #518 proíbe
+ * linha real ali —, e o adapter passou a ser um parâmetro de CONSTRUÇÃO do
+ * manager (`PairingChannelAdapter`), com o adapter Baileys como default.
+ *
+ * A escolha é por CONSTRUÇÃO e nunca por chave de configuração, e a razão é
+ * de segurança, não de estilo: o pareamento é o momento em que provar posse
+ * da linha AUTORIZA essa linha a rotear. "Pareamento provado por socket
+ * falso" é fail-open exatamente aí. Como chave de contrato — uma
+ * `MAIA_*` qualquer — isso viraria configuração DOCUMENTADA do produto: um
+ * interruptor que desliga a prova de posse, alcançável por env var num
+ * container de produção. Como fábrica injetada por um entrypoint que só o
+ * teste executa, não existe caminho de produção até ela: nenhuma variável do
+ * contrato é lida aqui para escolher adapter, e
+ * `tests/unit/gateway/pairing-adapter-seam.spec.ts` prova essa propriedade
+ * (com o contrafactual que a torna não-vácua).
  */
 import {
   default as makeWASocket,
@@ -110,13 +131,62 @@ type PairingEntry = {
   settle: ((r: PairingResult) => void) | null;
 };
 
+/**
+ * O que a PairingSession precisa do mundo externo: o auth state em disco, a
+ * versão do protocolo e o socket. Tudo o que fala WhatsApp de verdade está
+ * DESTE lado da fronteira; nada mais no manager toca o Baileys.
+ *
+ * É deliberadamente a operação INTEIRA (`open`), e não só `makeWASocket`: com
+ * a fábrica cobrindo apenas o construtor, um adapter falso ainda arrastaria
+ * `fetchLatestBaileysVersion()` — uma chamada de REDE sem timeout — para
+ * dentro de um job que não deve tocar a rede do WhatsApp. Um seam que deixa
+ * rede real do outro lado não é um seam.
+ */
+export interface PairingChannelAdapter {
+  open(args: {
+    channel_id: string;
+    /** Diretório de auth JÁ criado pelo manager. */
+    auth_dir: string;
+    declared_line: string;
+  }): Promise<{ sock: WASocket; saveCreds: () => Promise<void> }>;
+}
+
+/** O adapter de PRODUÇÃO: Baileys, e só ele. */
+const baileysPairingAdapter: PairingChannelAdapter = {
+  async open({ auth_dir }) {
+    const { state, saveCreds } = await useMultiFileAuthState(auth_dir);
+    let version: [number, number, number] | undefined;
+    try {
+      version = (await fetchLatestBaileysVersion()).version;
+    } catch {
+      /* fallback para a versão da lib */
+    }
+    return {
+      sock: makeWASocket({ auth: state, version, printQRInTerminal: false }),
+      saveCreds,
+    };
+  },
+};
+
 class LineSessionManager {
   private transports = new Map<string, LineTransport>();
   private info = new Map<string, LineSessionInfo>();
   private pairingSockets = new Map<string, PairingEntry>();
 
+  /**
+   * O adapter chega por CONSTRUÇÃO — nunca por configuração. Ver o cabeçalho
+   * deste arquivo: o default é o Baileys, e trocá-lo exige construir o
+   * manager com outro objeto, coisa que só um entrypoint faz.
+   */
+  constructor(private readonly adapter: PairingChannelAdapter = baileysPairingAdapter) {}
+
   isEnabled(): boolean {
     return config.MAIA_MULTI_LINE;
+  }
+
+  /** Test-only: qual adapter este manager recebeu na construção. */
+  _adapterForTests(): PairingChannelAdapter {
+    return this.adapter;
   }
 
   /**
@@ -209,15 +279,13 @@ class LineSessionManager {
     try {
       dir = pairingAuthDir(args.channel_id);
       mkdirSync(dir, { recursive: true });
-      const { state, saveCreds } = await useMultiFileAuthState(dir);
-      let version: [number, number, number] | undefined;
-      try {
-        version = (await fetchLatestBaileysVersion()).version;
-      } catch {
-        /* fallback para a versão da lib */
-      }
-      sock = makeWASocket({ auth: state, version, printQRInTerminal: false });
-      sock.ev.on('creds.update', saveCreds);
+      const opened = await this.adapter.open({
+        channel_id: args.channel_id,
+        auth_dir: dir,
+        declared_line: args.declared_line,
+      });
+      sock = opened.sock;
+      sock.ev.on('creds.update', opened.saveCreds);
     } catch (err) {
       // Setup falhou antes do socket existir — libera a reserva e propaga
       // (o chamador encerra o pairing com `failed`; nada fica pendente).
@@ -341,8 +409,51 @@ class LineSessionManager {
 }
 
 let managerSingleton: LineSessionManager | null = null;
+let adapterInstalado: PairingChannelAdapter | null = null;
+
+/**
+ * Instala o adapter com que o singleton será CONSTRUÍDO.
+ *
+ * Existe um único chamador legítimo, e ele não é código de produção: o
+ * entrypoint `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts`, que o
+ * job do console executa para ter um runtime Maia sem linha WhatsApp real.
+ * Nenhuma variável do contrato chega até aqui — trocar o adapter exige
+ * EXECUTAR OUTRO ENTRYPOINT, não setar uma env var.
+ *
+ * Fail-closed nas duas bordas: instalar depois de o manager existir seria
+ * silenciosamente ineficaz (o pareamento seguiria no Baileys), e instalar
+ * duas vezes esconderia qual dos dois venceu.
+ */
+export function installPairingChannelAdapter(adapter: PairingChannelAdapter): void {
+  if (managerSingleton !== null) {
+    throw new TypedError(
+      'pairing_adapter_installed_too_late',
+      'o LineSessionManager já foi construído — o adapter tem de ser instalado ANTES do primeiro getLineSessionManager()',
+      {},
+    );
+  }
+  if (adapterInstalado !== null) {
+    throw new TypedError(
+      'pairing_adapter_already_installed',
+      'um adapter de canal já foi instalado neste processo',
+      {},
+    );
+  }
+  adapterInstalado = adapter;
+}
 
 export function getLineSessionManager(): LineSessionManager {
-  if (!managerSingleton) managerSingleton = new LineSessionManager();
+  if (!managerSingleton) {
+    managerSingleton =
+      adapterInstalado === null
+        ? new LineSessionManager()
+        : new LineSessionManager(adapterInstalado);
+  }
   return managerSingleton;
+}
+
+/** Test-only: desfaz singleton e instalação entre casos. */
+export function _resetLineSessionManagerForTests(): void {
+  managerSingleton = null;
+  adapterInstalado = null;
 }
