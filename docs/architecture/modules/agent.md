@@ -243,7 +243,11 @@ would have silently changed what the rest of the benchmark measures.
 
 The two scope reads are sequential and run *before* the `ReadGate`, so they add
 2 to **reads per turn** and nothing to **peak concurrent reads**, which stays at
-6. `COBERTURA_DA_MEDICAO.resolve_scope_medido` is a label carried into the
+6. The turn's stopwatch opens before `resolveScope` and closes after
+`buildPrompt`, and that boundary is computed in exactly one place
+(`measureTurn`) precisely so it can be asserted rather than merely arranged:
+subtracting the stage from the turn's clock would restore the old coverage while
+leaving the counters, the flag and the cardinality untouched. `COBERTURA_DA_MEDICAO.resolve_scope_medido` is a label carried into the
 fingerprint (so a baseline from the old coverage is refused), never the proof:
 the "whole turn budget" criterion reads the measured numbers, so flipping the
 flag without the measurement produces an evaluated, failing criterion.
@@ -600,7 +604,7 @@ transação única).
 | `tests/integration/turn-context-pool-fairness.spec.ts` | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness |
 | `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
 | `tests/unit/scripts/turn-context-gate.spec.ts` | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1 |
-| `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` | That the gate MEASURES the `resolveScope` stage (#700): a real turn through the production `resolveScope`, counted by the harness's own per-turn instrument, red when the scope goes back to being fabricated in memory |
+| `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` | That the gate MEASURES the `resolveScope` stage (#700): a real turn through the production `resolveScope`, counted by the harness's own per-turn instrument, red when the scope goes back to being fabricated in memory — and that the stage is inside the turn's CLOCK (`measureTurn` is the single place the turn's duration is computed; the spec pins the arithmetic with an injected clock and with a real one) |
 | `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm, `resolveScope` + `buildPrompt`. See the gate section above |
 | `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
 | `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |

@@ -49,6 +49,7 @@ import {
   evaluateGate,
   gateExitCode,
   instrumentAll,
+  measureTurn,
   newTurnFrame,
   runInTurnFrame,
   runTurnOnce,
@@ -77,17 +78,28 @@ const banco = {
   chamadas: { forPessoa: 0, byIds: 0 },
   /** O maior lote que o `profilesRepo.byIds` recebeu — o JOIN em batch. */
   maiorLoteDeProfiles: 0,
+  /**
+   * Atraso por leitura, em ms. Serve a um caso só: fazer o estágio do escopo
+   * DOMINAR o relógio do turno, para que a fronteira do cronômetro possa ser
+   * afirmada com relógio real, sem dublê de tempo.
+   */
+  atraso_ms: 0,
 };
+
+const dormir = (ms: number): Promise<void> =>
+  ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve();
 
 const permissoesRepo = {
   async forPessoa(_pessoa_id: string): Promise<Linha[]> {
     banco.chamadas.forPessoa++;
+    await dormir(banco.atraso_ms);
     return banco.permissoes;
   },
 };
 const profilesRepo = {
   async byIds(ids: string[], limit = 500): Promise<Linha[]> {
     banco.chamadas.byIds++;
+    await dormir(banco.atraso_ms);
     const distintos = Array.from(new Set(ids));
     banco.maiorLoteDeProfiles = Math.max(banco.maiorLoteDeProfiles, distintos.length);
     return banco.profiles.filter((p) => distintos.includes(p.id as string)).slice(0, limit);
@@ -181,6 +193,7 @@ beforeAll(() => {
 beforeEach(() => {
   banco.chamadas = { forPessoa: 0, byIds: 0 };
   banco.maiorLoteDeProfiles = 0;
+  banco.atraso_ms = 0;
 });
 
 /** Um turno medido: o frame REAL do harness, do jeito que `runArm` o abre. */
@@ -426,5 +439,140 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     );
     expect(frame.reads).toHaveLength(SCOPE_READS_PER_TURN);
     expect(frame.peak).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // A FRONTEIRA DO RELÓGIO
+  //
+  // Achado da review da #721: os casos acima provam que o `resolveScope` é
+  // EXECUTADO e CONTADO — e nenhum deles prova que ele está DENTRO do
+  // cronômetro. A mutação
+  //
+  //     const ms = now() - t0;   →   const ms = now() - t0 - stage.scope_ms;
+  //
+  // restaura a cobertura antiga (`buildPrompt-sem-resolveScope`) em silêncio:
+  // flag `true`, duas leituras contadas, cardinalidade batendo, `scope_p95_ms`
+  // reportado — e o número que o gate JULGA volta a medir meio orçamento. A
+  // suíte inteira passava, e o `--self-test` saía 0.
+  //
+  // Uma fronteira defendida só pela ESTRUTURA do código já falhou uma vez
+  // aqui: é o defeito que a #700 corrige. Estes casos a defendem por
+  // ARITMÉTICA, sobre `measureTurn` — que passou a ser o único lugar do
+  // harness onde a duração do turno é calculada.
+  // -------------------------------------------------------------------------
+
+  describe('o relógio do turno CONTÉM o estágio do escopo', () => {
+    it('com relógio injetado, a aritmética é exata: turno = escopo + prompt', async () => {
+      semear(10);
+      // Um relógio determinístico: cada etapa avança um número conhecido, então
+      // não há aproximação nem folga onde uma subtração possa se esconder.
+      let agora = 1_000;
+      const person = pessoaDe(10);
+      const frame = newTurnFrame(0, 'bench525-t0', 10);
+
+      const sample = await measureTurn(
+        parDe(person),
+        10,
+        frame,
+        {
+          resolveScope: async (pessoa) => {
+            agora += 50; // o estágio custa 50
+            return permissions().resolveScope(
+              pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+            ) as Promise<ResolvedScope>;
+          },
+          buildPrompt: async () => {
+            agora += 5; // o prompt custa 5
+            return undefined;
+          },
+          runWithTenantContext: (_t, fn) => fn(),
+        },
+        () => agora,
+      );
+
+      expect(sample.scope_ms).toBe(50);
+      // O NÚMERO QUE O GATE JULGA. 55 = 50 do escopo + 5 do prompt. Com a
+      // subtração do estágio ele seria 5 — a cobertura antiga de volta.
+      expect(sample.ms).toBe(55);
+      expect(sample.ms - sample.scope_ms).toBe(5);
+    });
+
+    it('com relógio REAL, o turno não pode ser menor que o estágio que ele contém', async () => {
+      // O mesmo, sem dublê de tempo: o estágio DOMINA o turno (duas leituras de
+      // 30 ms; o `buildPrompt` é imediato). Se o relógio do turno excluísse o
+      // estágio, `ms` cairia para perto de zero enquanto `scope_ms` ficaria em
+      // ~60 — e a relação `ms ≥ scope_ms` se inverte.
+      semear(10);
+      banco.atraso_ms = 30;
+      const person = pessoaDe(10);
+      const frame = newTurnFrame(0, 'bench525-t0', 10);
+
+      const sample = await measureTurn(parDe(person), 10, frame, {
+        resolveScope: (pessoa) =>
+          permissions().resolveScope(
+            pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+          ) as Promise<ResolvedScope>,
+        buildPrompt: async () => undefined,
+        runWithTenantContext: (_t, fn) => fn(),
+      });
+
+      // As duas leituras do escopo, sequenciais, custaram ~60 ms.
+      expect(sample.scope_ms).toBeGreaterThanOrEqual(50);
+      // …e o relógio do turno as CONTÉM.
+      expect(sample.ms).toBeGreaterThanOrEqual(sample.scope_ms);
+      expect(sample.ms).toBeGreaterThanOrEqual(50);
+
+      // CONTROLE, no mesmo caso: sem atraso, o mesmo caminho mede um turno
+      // barato — a asserção acima não passou por o número ser grande sempre.
+      banco.atraso_ms = 0;
+      const rapido = await measureTurn(
+        parDe(person),
+        10,
+        newTurnFrame(1, 'bench525-t0', 10),
+        {
+          resolveScope: (pessoa) =>
+            permissions().resolveScope(
+              pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+            ) as Promise<ResolvedScope>,
+          buildPrompt: async () => undefined,
+          runWithTenantContext: (_t, fn) => fn(),
+        },
+      );
+      expect(rapido.ms).toBeLessThan(50);
+      expect(rapido.ms).toBeGreaterThanOrEqual(rapido.scope_ms);
+    });
+
+    it('a amostra que o braço arquiva é a que `measureTurn` devolveu — com as duas leituras dentro', async () => {
+      // Fecha a volta: a MESMA amostra que carrega o relógio do turno é a que
+      // alimenta `scopeMetricsFromSamples` e, dali, o veredicto. Não há um
+      // segundo lugar onde `ms` seja recalculado.
+      const medidos = [];
+      // Um atraso pequeno por leitura faz o estágio DOMINAR o turno também
+      // aqui: sem ele, `ms` e `scope_ms` são ambos ruído de sub-milissegundo e
+      // a asserção `ms ≥ scope_ms` deixaria de ser um detector confiável da
+      // subtração — passaria ou falharia por acaso.
+      banco.atraso_ms = 10;
+      for (const n of CARDINALITIES) {
+        semear(n);
+        medidos.push(await measureTurn(parDe(pessoaDe(n)), n, newTurnFrame(0, 'bench525-t0', n), {
+          resolveScope: (pessoa) =>
+            permissions().resolveScope(
+              pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+            ) as Promise<ResolvedScope>,
+          buildPrompt: async () => undefined,
+          runWithTenantContext: (_t, fn) => fn(),
+        }));
+      }
+      for (const m of medidos) {
+        expect(countScopeReads(m.reads)).toBe(SCOPE_READS_PER_TURN);
+        expect(m.scope_ms).toBeGreaterThanOrEqual(15);
+        expect(m.ms).toBeGreaterThanOrEqual(m.scope_ms);
+      }
+      const metrics = scopeMetricsFromSamples(medidos);
+      expect(metrics.scope_reads_per_turn_min).toBe(SCOPE_READS_PER_TURN);
+      expect(metrics.scope_cardinality_mismatches).toBe(0);
+      const verdicts = evaluateGate(bracoCom(metrics), TH, null, { mode: 'gate', fingerprint: FP });
+      expect(verdicts.find((v) => v.label.includes('aceite completo'))!.passed).toBe(true);
+    });
   });
 });

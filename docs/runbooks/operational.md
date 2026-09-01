@@ -1626,6 +1626,15 @@ alimenta o veredicto com o que o contador produziu. Fica vermelha se o escopo
 voltar a ser fabricado em memória, se as leituras saírem do `instrumentAll`, ou
 se o escopo resolvido deixar de ter a cardinalidade semeada.
 
+Ela também defende a **fronteira do cronômetro**, que é outra coisa: o
+`resolveScope` pode estar sendo executado e contado e ainda assim ficar FORA do
+número que o gate julga. A duração do turno é calculada num lugar só
+(`measureTurn`, no próprio harness), e a sonda cobra a aritmética — com relógio
+injetado (`turno = escopo + prompt`, valores exatos) e com relógio real (o
+estágio domina o turno; `ms ≥ scope_ms`). Subtrair o estágio do relógio do turno
+restauraria a cobertura antiga sem mexer em contador, flag ou cardinalidade — e
+é exatamente isso que esses casos pegam.
+
 ### Massa e limpeza
 
 Tudo que o harness cria usa `tenant_id` com prefixo `bench525-` e é removido no

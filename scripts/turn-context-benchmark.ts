@@ -2143,19 +2143,23 @@ export type TurnStageDeps = {
  *
  * As dependências são injetadas para que a sonda vermelha da #700 possa provar,
  * sem Postgres, que este caminho REALMENTE resolve o escopo — e fique vermelha
- * no dia em que alguém voltar a fabricá-lo em memória.
+ * no dia em que alguém voltar a fabricá-lo em memória. `now` existe pela mesma
+ * razão, um nível abaixo: `measureTurn` desce o relógio DELE para cá, de modo
+ * que o intervalo do turno e o do estágio saiam da mesma régua e a relação
+ * entre os dois possa ser afirmada com valores exatos.
  */
 export async function runTurnOnce(
   pair: Pair,
   person: PairPerson,
   deps: TurnStageDeps,
+  now: () => number = () => performance.now(),
 ): Promise<TurnStageSample> {
   return deps.runWithTenantContext(
     { tenant_id: pair.tenant_id, agent_id: pair.agent_id },
     async () => {
-      const t0 = performance.now();
+      const t0 = now();
       const scope = await deps.resolveScope(person.pessoa);
-      const scope_ms = performance.now() - t0;
+      const scope_ms = now() - t0;
       await deps.buildPrompt(buildContext(person, scope));
       return { scope_ms, scope_entities: scope.entidades.length };
     },
@@ -2340,7 +2344,12 @@ function isTimeoutError(message: string): boolean {
   return /timeout|timed out|ETIMEDOUT/i.test(message);
 }
 
-type TurnSample = {
+export type TurnSample = {
+  /**
+   * O RELÓGIO DO TURNO: `resolveScope` + `buildPrompt`. É este número que vira
+   * `p95_ms`, que o gate compara com os 600 ms e com o baseline. Ele CONTÉM
+   * `scope_ms` — ver `measureTurn`, que é o único lugar onde ele é calculado.
+   */
   ms: number;
   /** A cardinalidade PEDIDA a este turno (1/10/100). */
   entities: number;
@@ -2364,6 +2373,63 @@ function loaderReads(
 ): Array<{ section: string; ms: number }> {
   const secoes: string[] = [SCOPE_SECTIONS.permissoes, SCOPE_SECTIONS.profiles];
   return reads.filter((r) => !secoes.includes(r.section)).map((r) => ({ ...r }));
+}
+
+/**
+ * Cronometra UM turno e monta a amostra — **o único lugar do harness onde a
+ * duração do turno é calculada** (issue #700).
+ *
+ * ## Por que isto é uma função, e exportada
+ *
+ * A fronteira do relógio é o que faz o `p95_ms` significar "o orçamento do
+ * turno" em vez de "metade dele": o cronômetro abre ANTES do `resolveScope` e
+ * fecha DEPOIS do `buildPrompt`. Essa fronteira estava defendida apenas pela
+ * ESTRUTURA do código — um `t0` no lugar certo dentro do laço do `runArm` —, e
+ * uma fronteira defendida só por estrutura já falhou uma vez aqui: é
+ * literalmente o defeito que a #700 corrige.
+ *
+ * Trocar
+ *
+ *     const ms = now() - t0;                     por
+ *     const ms = now() - t0 - stage.scope_ms;
+ *
+ * restaura a cobertura ANTIGA (`buildPrompt-sem-resolveScope`) em silêncio: a
+ * flag continua `true`, os contadores de leitura continuam registrando as duas
+ * leituras, a cardinalidade continua batendo e o `scope_p95_ms` continua sendo
+ * reportado — só o número que o gate JULGA volta a medir meio orçamento.
+ *
+ * Com o cálculo aqui, e só aqui, essa mutação é uma asserção falha:
+ * `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` cronometra
+ * este caminho com um relógio injetado e com relógio real, e exige que o
+ * intervalo do turno CONTENHA o do estágio.
+ *
+ * `now` é injetável pelo mesmo motivo pelo qual `startPoolSampler` aceita
+ * `startedAtMs`: para que a aritmética seja verificável com valores exatos, em
+ * vez de por aproximação sobre o relógio da máquina.
+ */
+export async function measureTurn(
+  pair: Pair,
+  entities: number,
+  frame: TurnFrame,
+  deps: TurnStageDeps,
+  now: () => number = () => performance.now(),
+): Promise<TurnSample> {
+  const t0 = now();
+  // O MESMO `now` desce para o estágio: os dois intervalos têm que sair do
+  // mesmo relógio para que "o turno contém o escopo" seja uma aritmética
+  // verificável, e não uma comparação entre duas réguas.
+  const stage = await runInTurnFrame(frame, () =>
+    runTurnOnce(pair, personFor(pair, entities), deps, now),
+  );
+  const ms = now() - t0;
+  return {
+    ms,
+    entities,
+    scope_entities: stage.scope_entities,
+    scope_ms: stage.scope_ms,
+    peak: frame.peak,
+    reads: frame.reads,
+  };
 }
 
 async function runArm(
@@ -2390,16 +2456,12 @@ async function runArm(
     buildPrompt: (ctx) => deps.buildPrompt(ctx as Parameters<Deps['buildPrompt']>[0]),
     runWithTenantContext: deps.runWithTenantContext,
   };
-  const runTurn = (pairIndex: number, entities: number): Promise<TurnStageSample> => {
-    const pair = pairs[pairIndex]!;
-    return runTurnOnce(pair, personFor(pair, entities), stageDeps);
-  };
-
   if (arm === 'warm') {
     // Pré-aquecimento: uma passada por par para popular o cache de identidade.
     // Sem isto o braço "warm" mediria 50 misses no meio da carga e a diferença
-    // entre os braços viraria ruído.
-    for (let i = 0; i < pairs.length; i++) await runTurn(i, 1);
+    // entre os braços viraria ruído. Fora do relógio e fora de frame: não é
+    // amostra, é aquecimento.
+    for (const pair of pairs) await runTurnOnce(pair, personFor(pair, 1), stageDeps);
     deps.resetMetrics();
   }
 
@@ -2430,19 +2492,13 @@ async function runArm(
       if (inFlightTenants.size > maxConcurrentTenants) maxConcurrentTenants = inFlightTenants.size;
 
       const frame = newTurnFrame(index, pair.tenant_id, entities);
-      const t0 = performance.now();
       try {
-        const stage = await runInTurnFrame(frame, () => runTurn(pairIndex, entities));
-        const ms = performance.now() - t0;
-        samples.push({
-          ms,
-          entities,
-          scope_entities: stage.scope_entities,
-          scope_ms: stage.scope_ms,
-          peak: frame.peak,
-          reads: frame.reads,
-        });
-        if (ms > opts.timeout_ms) timeouts++;
+        // A amostra sai PRONTA de `measureTurn` e entra sem ser recalculada: a
+        // aritmética do relógio do turno tem um único dono, e é lá que a sonda
+        // da #700 a cobra.
+        const sample = await measureTurn(pair, entities, frame, stageDeps);
+        samples.push(sample);
+        if (sample.ms > opts.timeout_ms) timeouts++;
       } catch (err) {
         errors++;
         const message = (err as Error)?.message ?? String(err);
