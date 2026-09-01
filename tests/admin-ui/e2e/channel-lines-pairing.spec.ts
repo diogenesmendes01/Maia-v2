@@ -2,10 +2,32 @@
  * Jornada — PAREAMENTO DE LINHA WHATSAPP (issue #518).
  *
  * ─────────────────────────────────────────────────────────────────────────
- * POR QUE ESTA JORNADA CONTINUA EM QUARENTENA (#623)
+ * POR QUE ESTE ARQUIVO CONTINUA EM QUARENTENA — caso a caso
  * ─────────────────────────────────────────────────────────────────────────
- * As outras nove jornadas saíram: a causa delas era sessão e fixture, e as
- * duas o job resolve. Esta tem outra causa, e ela não é do console.
+ * A #623 tirou nove jornadas da quarentena; a décima ficou inteira, com um
+ * argumento de denominador comum ("quatro dos seis casos precisam do runtime,
+ * logo os seis ficam fora"). Os dois que NÃO precisavam saíram daqui para
+ * `channel-lines.spec.ts` e hoje são gate bloqueante: a listagem da linha
+ * declarada e a recusa ao papel `viewer`. O que sobrou tem motivo próprio,
+ * um por caso — e o título é o do `test()`, conferido por
+ * `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, para que "o arquivo depende do
+ * runtime" não volte a valer como motivo coletivo:
+ *
+ *   FORA DO GATE: pareamento por QR: modal autenticado, QR inline, countdown e cancelamento
+ *     o QR é PRODUZIDO pelo worker `channel_pairing` do runtime; sem ele não
+ *     existe material nenhum para a tela mostrar.
+ *   FORA DO GATE: pareamento por código mostra os 8 dígitos formatados
+ *     idem, para o código de 8 dígitos — quem o pede ao WhatsApp é a
+ *     PairingSession, não o console.
+ *   FORA DO GATE: CANÁRIO: nenhum bootstrap token em URL, request ou HTML do console
+ *     precisa chegar até o QR VISÍVEL para ter o que canariar; sem material,
+ *     "não há token em lugar nenhum" passaria por vacuidade — e um canário
+ *     vacuamente verde é pior que canário nenhum.
+ *   FORA DO GATE: acessibilidade: o modal é um dialog e o estado é uma live region
+ *     este NÃO depende do runtime, e sim do KEYRING: o CTA "Parear" é
+ *     `disabled={!pairingAvailable}` e `pairing_available` é
+ *     `isPairingMaterialConfigured()`. Ver abaixo por que o keyring sozinho
+ *     não resolve — e por que ele não deve vir antes do runtime.
  *
  * MEDIDO no código, não suposto: `trpc/routers/channelLines.ts` NÃO gera QR
  * nem código. `startPairing` grava um COMANDO em `channel_line_state`
@@ -18,12 +40,23 @@
  *
  * O job `build + e2e do console (admin-ui)` sobe UM processo: o artefato
  * standalone do console. Não há runtime, e portanto não há QR, não há código
- * de 8 dígitos e não há transição para `pareando` — quatro dos seis casos
- * deste arquivo esperam exatamente isso. Fazê-los passar exigiria (a) subir o
- * runtime no job com um adapter Baileys FALSO (a própria #518 proíbe linha
- * real no CI) e (b) compartilhar `MAIA_STAGING_KEYRING` entre os dois
- * processos. Isso é um job novo, não um ajuste de spec — e inventar um mock
- * do runtime dentro do teste mediria o mock.
+ * de 8 dígitos e não há transição para `pareando`. Fazê-los passar exigiria
+ * (a) subir o runtime no job com um adapter Baileys FALSO (a própria #518
+ * proíbe linha real no CI) e (b) compartilhar `MAIA_STAGING_KEYRING` entre os
+ * dois processos. Isso é um job novo, não um ajuste de spec — e inventar um
+ * mock do runtime dentro do teste mediria o mock.
+ *
+ * POR QUE NÃO BASTA (E NÃO SE DEVE) SÓ PÔR O KEYRING NO JOB, pelo caso 4:
+ *   - com keyring e sem runtime, `pairing_available` vira `true`, o CTA
+ *     habilita e os casos 1–3 deixam de falhar por "botão desabilitado" para
+ *     falhar por TIMEOUT de 15s esperando um material que ninguém escreve —
+ *     mais lento e menos legível, sem medir nada a mais;
+ *   - e o caso `sem keyring o console declara o pareamento indisponível e
+ *     desabilita o CTA`, em `channel-lines.spec.ts`, ficaria VERMELHO: ele é
+ *     justamente a premissa desta quarentena virada asserção;
+ *   - o keyring é material de chave. O bloco `env:` do workflow entra na
+ *     HISTÓRIA do repositório, e é a história que o gitleaks varre.
+ *   Ou seja: o keyring entra JUNTO com o runtime, nunca antes.
  *
  * CRITÉRIO OBJETIVO PARA SAIR DAQUI (o que precisa existir, não "quando der"):
  *   1. o CI subir, no mesmo job, um runtime Maia com adapter de canal FALSO,
@@ -31,41 +64,48 @@
  *      com o console; e
  *   2. `channelLines.getPairingStatus` responder `pairing_available: true`
  *      nesse ambiente.
- * Com esses dois fatos, tirar a tag daqui é um diff de uma linha.
+ * Com esses dois fatos, tirar a tag daqui é um diff de uma linha — e o caso da
+ * degradação honesta em `channel-lines.spec.ts` fica vermelho no mesmo commit,
+ * avisando que a premissa mudou.
  *
- * Rastreamento: os dois fatos acima são o critério; enquanto não existir
- * issue própria para subir o runtime no job, este cabeçalho e a lista fixa de
- * `tests/unit/ci/admin-ui-e2e-gate.spec.ts` são o registro — a quarentena não
- * pode crescer sem passar por eles.
+ * Rastreamento: issue própria — "subir um runtime Maia com adapter de canal
+ * falso no job do console" —, mais a lista fixa de
+ * `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, que impede a quarentena de
+ * crescer em silêncio.
  *
- * Os dois casos que NÃO dependem do runtime (a linha declarada aparecer na
- * listagem e o viewer não enxergar a tela) ficam junto de propósito: partir o
- * arquivo deixaria uma "jornada de pareamento" que não pareia, e é essa
- * meia-verdade que a #623 está desfazendo no resto da suíte.
+ * ESTADO DOS CASOS ABAIXO: eles usam `baseURL` (relativo) e a sessão
+ * sintética das outras jornadas, como todo o resto da suíte — não porque
+ * rodem, mas para que, quando rodarem, a primeira falha seja a AUSÊNCIA DO
+ * RUNTIME e não um `http://localhost:4000` fixo ou a tela de login. Medido
+ * com o console no ar e sem runtime: os quatro reprovam no CTA desabilitado,
+ * que é a causa certa.
  */
 import { test, expect } from '@playwright/test';
+import { autenticarComo, AGENTE_E2E } from './_apoio/sessao.js';
+import { LINHA_DECLARADA_E2E } from './_apoio/fixtures.js';
 
-const CONSOLE = 'http://localhost:4000';
-const CHANNELS = `${CONSOLE}/setup/channels`;
+const CANAIS = '/setup/channels';
 
-test.describe('Setup → Canais: linhas WhatsApp @pendente-runtime', () => {
-  test('canal WhatsApp recém-criado (inativo) PERMANECE visível com estado "declarada"', async ({
-    page,
-  }) => {
-    await page.goto(CHANNELS);
-    // Antes de #518 a listagem usava `listActive` e o canal sumia logo após
-    // ser criado — o operador não tinha por onde pareá-lo.
-    const row = page.getByRole('row').filter({ hasText: '+55' }).first();
-    await expect(row).toBeVisible();
-    await expect(row.getByText('declarada')).toBeVisible();
-    await expect(row.getByText('não roteia')).toBeVisible();
+/** A tabela só existe depois que um agente está escolhido — ver `channel-lines.spec.ts`. */
+async function abrirPareamento(page: import('@playwright/test').Page): Promise<void> {
+  await page.goto(CANAIS);
+  await page.getByLabel('Agente').selectOption(AGENTE_E2E);
+  await page
+    .getByRole('row')
+    .filter({ hasText: LINHA_DECLARADA_E2E.externalId })
+    .getByRole('button', { name: 'Parear' })
+    .click();
+}
+
+test.describe('Setup → Canais: pareamento de linha WhatsApp @pendente-runtime', () => {
+  test.beforeEach(async ({ context }) => {
+    await autenticarComo(context, 'owner');
   });
 
   test('pareamento por QR: modal autenticado, QR inline, countdown e cancelamento', async ({
     page,
   }) => {
-    await page.goto(CHANNELS);
-    await page.getByRole('button', { name: 'Parear' }).first().click();
+    await abrirPareamento(page);
 
     await page.getByRole('button', { name: 'QR Code' }).click();
     await page.fill('textarea', 'Parear a linha comercial declarada no teste E2E.');
@@ -87,8 +127,7 @@ test.describe('Setup → Canais: linhas WhatsApp @pendente-runtime', () => {
   });
 
   test('pareamento por código mostra os 8 dígitos formatados', async ({ page }) => {
-    await page.goto(CHANNELS);
-    await page.getByRole('button', { name: 'Parear' }).first().click();
+    await abrirPareamento(page);
     await page.getByRole('button', { name: 'Código de 8 dígitos' }).click();
     await page.fill('textarea', 'Parear por código no teste E2E da issue 518.');
     await page.getByRole('button', { name: 'Iniciar pareamento' }).click();
@@ -111,8 +150,7 @@ test.describe('Setup → Canais: linhas WhatsApp @pendente-runtime', () => {
       }
     });
 
-    await page.goto(CHANNELS);
-    await page.getByRole('button', { name: 'Parear' }).first().click();
+    await abrirPareamento(page);
     await page.getByRole('button', { name: 'QR Code' }).click();
     await page.fill('textarea', 'Verificação de canário do token no teste E2E.');
     await page.getByRole('button', { name: 'Iniciar pareamento' }).click();
@@ -126,15 +164,8 @@ test.describe('Setup → Canais: linhas WhatsApp @pendente-runtime', () => {
     expect(html).not.toMatch(/[?&]token=/);
   });
 
-  test('viewer não enxerga a tela de linhas', async ({ page }) => {
-    // Sessão viewer (fixture do compose de e2e).
-    await page.goto(`${CHANNELS}?as=viewer`);
-    await expect(page.getByText('Acesso restrito')).toBeVisible();
-  });
-
   test('acessibilidade: o modal é um dialog e o estado é uma live region', async ({ page }) => {
-    await page.goto(CHANNELS);
-    await page.getByRole('button', { name: 'Parear' }).first().click();
+    await abrirPareamento(page);
     const dialog = page.getByRole('dialog');
     await expect(dialog).toBeVisible();
     await expect(page.getByTestId('line-pairing-state')).toHaveAttribute('aria-live', 'polite');

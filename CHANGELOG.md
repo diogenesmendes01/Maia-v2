@@ -4,6 +4,49 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Console: a décima jornada, medida caso a caso ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), segunda parte)
+
+**O que estava acontecendo.** A primeira parte da #623 tirou nove jornadas da
+quarentena e deixou a décima — `channel-lines-pairing.spec.ts` — inteira fora do
+gate, com um argumento de **denominador comum**: "quatro dos seis casos precisam
+do worker `channel_pairing` do runtime, logo os seis ficam fora". Medido: dois
+daqueles seis não dependiam de runtime nenhum. Dependiam de uma FIXTURE e de uma
+SESSÃO, que é exatamente o que as outras nove ganharam ao sair. Um deles cobria a
+regressão que originou a #518 — a linha WhatsApp DECLARADA (inativa) sumia da
+listagem, e o operador ficava sem por onde pareá-la. Ele estava fora do gate
+desde então.
+
+**O que muda.** Os casos que o console resolve sozinho saíram para
+`channel-lines.spec.ts` e hoje são **bloqueantes**: a linha declarada permanece
+visível com `declarada`/`não roteia`; o papel `viewer` recebe "Acesso restrito"
+(com caso de CONTROLE para `owner`, senão a recusa ficaria verde também com a
+rota quebrada para todo mundo); e, sem `MAIA_STAGING_KEYRING`, o console declara
+o pareamento indisponível e DESABILITA o CTA. Esse último é a premissa da
+quarentena virada asserção: no dia em que o runtime subir no job, ele fica
+VERMELHO e obriga a revisitar o que continua marcado — um comentário não faria
+isso. A fixture entra por `scripts/seed-admin-ui-e2e-fixtures.ts` com
+`external_id` próprio, e não o `default-channel` das migrations, que nasce
+ativo/`verified_offline` e descreve o estado OPOSTO.
+
+O caso `viewer` também deixou de mentir: ele navegava para `?as=viewer`, um
+parâmetro que **não existe em lugar nenhum do console** — resíduo de um harness
+de compose que a suíte nunca teve. Agora usa a sessão real das outras jornadas.
+
+**O que continua fora, e por quê.** Quatro casos, todos precisando de um SEGUNDO
+PROCESSO: o QR e o código de 8 dígitos são produzidos pelo worker
+`channel_pairing` do RUNTIME, e o job sobe só o console. Cada um passa a carregar
+o motivo DELE no cabeçalho, numa linha `FORA DO GATE: <título do test>` —
+"o arquivo depende do runtime" não é mais aceito como justificativa coletiva.
+Medido com o console no ar e sem runtime: os quatro reprovam no CTA
+desabilitado, que é a causa certa.
+
+**Gate.** `TEST_ADMIN_UI_MIN_TESTS` sobe de `27` para `31`.
+`tests/unit/ci/admin-ui-e2e-gate.spec.ts` ganha duas travas além da lista de
+arquivos: a **contagem de casos** da quarentena (um caso novo dentro do arquivo
+marcado nascia fora do gate sem aparecer em diff nenhum — foi assim que o
+denominador comum se sustentou) e a conferência de que cada título tem
+justificativa escrita.
+
 ### Console: as dez jornadas saem da quarentena e viram gate ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), continuação da [#472](https://github.com/diogenesmendes01/Maia-v2/issues/472))
 
 **O que estava acontecendo.** O job `build + e2e do console (admin-ui)` media

@@ -13,7 +13,9 @@
  *     separam, e o CI passa a construir num ambiente que a imagem de produção
  *     não tem (foi assim que o bloco do Dockerfile ficou desatualizado a ponto
  *     de o build da imagem do console estar QUEBRADO sem ninguém notar);
- *   - a quarentena (`@pendente-runtime`) cresce em silêncio até o gate medir nada;
+ *   - a quarentena (`@pendente-runtime`) cresce em silêncio até o gate medir
+ *     nada — ou um arquivo inteiro fica marcado por causa de UM caso que
+ *     precisa de infra, levando junto os que não precisavam;
  *   - o typecheck volta para ANTES do build, e os tipos que o `next build`
  *     GERA (`.next/types/**`, o contrato de rota do Next 16) deixam de ser
  *     checados sem que nada fique vermelho;
@@ -80,17 +82,40 @@ const PASSO_QUARENTENA = 'Quarentena da suíte e2e (o que NÃO foi medido)';
 /**
  * Specs e2e que estão FORA do gate.
  *
- * Depois da #623 sobrou UMA, e por um motivo que não é sessão nem fixture: o
- * QR e o código de pareamento são produzidos pelo worker `channel_pairing` do
- * RUNTIME, e o job `admin-ui` sobe só o console. O cabeçalho do arquivo traz a
- * medição (o router só grava um COMANDO em `channel_line_state`) e o critério
- * objetivo de saída. A tag também mudou — `@pendente-472` virou
+ * Sobrou UMA, e por um motivo que não é sessão nem fixture: o QR e o código de
+ * pareamento são produzidos pelo worker `channel_pairing` do RUNTIME, e o job
+ * `admin-ui` sobe só o console. O cabeçalho do arquivo traz a medição (o
+ * router só grava um COMANDO em `channel_line_state`) e o critério objetivo de
+ * saída, CASO A CASO. A tag também mudou — `@pendente-472` virou
  * `@pendente-runtime`, porque a #472 fechou e o motivo que resta é outro.
+ *
+ * O que a #623 tinha deixado aqui por DENOMINADOR COMUM — a listagem da linha
+ * declarada e a recusa ao papel `viewer`, que não dependem de runtime nenhum —
+ * saiu para `channel-lines.spec.ts` e hoje é bloqueante. Esta contabilidade é
+ * por ARQUIVO (a lista abaixo, a contagem do piso e o `grep -l` do job), então
+ * medir "parte de um arquivo" só é representável separando os arquivos.
  *
  * A lista é FIXA de propósito: entrar ou sair dela tem de ser um diff que
  * alguém lê, não um efeito colateral de marcar mais um `describe`.
  */
 const QUARENTENA = ['channel-lines-pairing.spec.ts'] as const;
+
+/**
+ * Quantos CASOS a quarentena inteira contém hoje.
+ *
+ * A lista acima é por arquivo, e por arquivo ela só impede que a quarentena
+ * ganhe um ARQUIVO novo em silêncio. Foi exatamente por dentro de um arquivo
+ * já marcado que a décima jornada perdeu dois casos que não precisavam de
+ * infra nenhuma: o denominador comum não aparece num diff de lista.
+ *
+ * Este número fecha esse buraco. Acrescentar um caso ao arquivo marcado passa
+ * a reprovar aqui, e a correção é uma das duas — ou o caso não depende do
+ * runtime e vai para `channel-lines.spec.ts` (bloqueante), ou ele depende, o
+ * cabeçalho ganha o motivo DELE e este número sobe num diff que alguém lê.
+ * Descer o número é o caminho normal: é o que acontece quando o runtime com
+ * adapter de canal falso subir no job e a quarentena esvaziar.
+ */
+const QUARENTENA_CASOS = 4;
 
 // ---------------------------------------------------------------------------
 // Leitura do workflow — PARSE de verdade, não reconstrução
@@ -249,7 +274,7 @@ describe('[declaração] o job `admin-ui` do CI existe e é bloqueante', () => {
 
   it('o piso cobre TODOS os casos que estão fora da quarentena (#623)', () => {
     // Um piso que não acompanha a suíte é um piso que não protege nada: com
-    // `TEST_ADMIN_UI_MIN_TESTS=5` e vinte e dois casos novos, apagar as
+    // `TEST_ADMIN_UI_MIN_TESTS=5` e vinte e seis casos novos, apagar as
     // jornadas do checkout continuaria verde. A contagem é ESTÁTICA (as
     // chamadas `test(` das specs fora da quarentena) e a comparação é `>=`
     // porque o piso é piso: adicionar caso não obriga a mexer no workflow,
@@ -541,6 +566,52 @@ describe('[declaração] a quarentena `@pendente-runtime` não cresce em silênc
       'entrar ou sair da quarentena tem de ser um diff visível nesta lista, ' +
         'não um efeito colateral de marcar/desmarcar um describe',
     ).toEqual([...QUARENTENA].sort());
+  });
+
+  it('a quarentena não cresce POR DENTRO de um arquivo já marcado (#623)', () => {
+    // O caso que a contabilidade por arquivo não pega. Enquanto a lista acima
+    // só olha nomes de arquivo, um caso novo dentro do arquivo marcado nasce
+    // fora do gate sem aparecer em diff nenhum — que é exatamente como dois
+    // casos que só precisavam de sessão e fixture ficaram anos sem rodar,
+    // carregados pelo denominador comum dos que precisavam do runtime.
+    const casos = QUARENTENA.reduce((total, f) => {
+      const fonte = readFileSync(join(E2E_DIR, f), 'utf8');
+      return total + (fonte.match(/^\s+test\(/gm) ?? []).length;
+    }, 0);
+    expect(
+      casos,
+      `a quarentena tem ${casos} casos e QUARENTENA_CASOS declara ` +
+        `${QUARENTENA_CASOS}. Caso novo aqui só é legítimo com o motivo DELE ` +
+        `escrito no cabeçalho do arquivo; caso que não depende do runtime vai ` +
+        `para uma spec bloqueante. Nos dois desfechos este número muda num ` +
+        `diff que alguém lê.`,
+    ).toBe(QUARENTENA_CASOS);
+  });
+
+  it('cada caso em quarentena tem o motivo DELE escrito no cabeçalho (#623)', () => {
+    // Anti-denominador-comum, do lado da prosa — e conferido pelo TÍTULO, não
+    // pela contagem. "Este arquivo depende do runtime" é a frase que manteve
+    // dois casos fora do gate sem que ninguém conseguisse checar se ela valia
+    // para todos; renomear um caso sem revisitar o motivo dele reproduziria a
+    // mesma meia-verdade, e é isso que a comparação de títulos impede.
+    for (const f of QUARENTENA) {
+      const fonte = readFileSync(join(E2E_DIR, f), 'utf8');
+      const cabecalho = fonte.split('*/')[0] ?? '';
+      const declarados = [...cabecalho.matchAll(/^ \* {3}FORA DO GATE: (.+)$/gm)]
+        .map((m) => m[1]!.trim())
+        .sort();
+      const reais = [...fonte.matchAll(/^\s+test\(\s*'([^']+)'/gm)]
+        .map((m) => m[1]!)
+        .sort();
+      expect(reais.length, `${f}: nenhum \`test(\` encontrado — a checagem virou no-op`)
+        .toBeGreaterThan(0);
+      expect(
+        declarados,
+        `${f}: o cabeçalho justifica [${declarados.join(' | ')}] mas o arquivo ` +
+          `tem [${reais.join(' | ')}]. Cada caso fora do gate carrega o motivo ` +
+          `DELE numa linha \`FORA DO GATE: <título do test>\`.`,
+      ).toEqual(reais);
+    }
   });
 
   it('sobra pelo menos uma spec DENTRO do gate (senão o gate não mede nada)', () => {

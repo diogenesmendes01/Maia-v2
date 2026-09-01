@@ -26,20 +26,23 @@ import { defineConfig, devices } from '@playwright/test';
  *   middleware, route handlers, render de servidor e hidratação do cliente,
  *   e — desde a #623 — as JORNADAS autenticadas do operador (inbox, detalhe
  *   de proposta, aprovação simples e dupla, rejeição, trava de arquitetura,
- *   trilha de auditoria, drift, traces e versões). A sessão é montada em
- *   `tests/admin-ui/e2e/_apoio/sessao.ts` e as fixtures em
- *   `scripts/seed-admin-ui-e2e-fixtures.ts`, que `scripts/admin-ui-e2e.sh`
- *   executa antes da suíte.
+ *   trilha de auditoria, drift, traces, versões e a listagem de linhas de
+ *   canal). A sessão é montada em `tests/admin-ui/e2e/_apoio/sessao.ts` e as
+ *   fixtures em `scripts/seed-admin-ui-e2e-fixtures.ts`, que
+ *   `scripts/admin-ui-e2e.sh` executa antes da suíte.
  *
- * `jornadas-pendentes` — o que sobrou da quarentena. Depois da #623 é UM
- *   arquivo: `channel-lines-pairing.spec.ts`. A causa dele não é sessão nem
- *   fixture — é que o QR e o código de pareamento são produzidos pelo WORKER
- *   DO RUNTIME (`channel_pairing`), e este job sobe só o console. O cabeçalho
- *   daquele arquivo traz a medição e o critério objetivo de saída; a tag
- *   mudou de `@pendente-472` para `@pendente-runtime` porque a #472 fechou e
- *   o motivo que resta é outro. `tests/unit/ci/admin-ui-e2e-gate.spec.ts`
- *   continua fixando a lista exata, então entrar ou sair dela é um diff
- *   visível — não um `skip` condicional que ninguém lê.
+ * `jornadas-pendentes` — o que sobrou da quarentena: UM arquivo,
+ *   `channel-lines-pairing.spec.ts`, e nele só os casos que precisam de um
+ *   SEGUNDO PROCESSO. A causa não é sessão nem fixture — é que o QR e o código
+ *   de pareamento são produzidos pelo WORKER DO RUNTIME (`channel_pairing`), e
+ *   este job sobe só o console. O que dependia apenas de sessão e fixture
+ *   estava ali por denominador comum e saiu para `channel-lines.spec.ts`, que
+ *   é bloqueante. O cabeçalho do arquivo marcado traz a medição e o critério
+ *   objetivo de saída, caso a caso; a tag mudou de `@pendente-472` para
+ *   `@pendente-runtime` porque a #472 fechou e o motivo que resta é outro.
+ *   `tests/unit/ci/admin-ui-e2e-gate.spec.ts` continua fixando a lista exata,
+ *   então entrar ou sair dela é um diff visível — não um `skip` condicional
+ *   que ninguém lê.
  *
  * Spec NOVA entra em `smoke` por construção (a quarentena é opt-in por tag).
  */

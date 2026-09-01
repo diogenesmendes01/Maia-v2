@@ -1148,23 +1148,28 @@ jobs:
           # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
           # `scripts/admin-ui-e2e.sh`.
           #
-          # 27 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
+          # 31 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
           # #623 (inbox, detalhe de proposta, aprovação simples e dupla,
           # rejeição, trava de arquitetura, trilha de auditoria, drift, traces
-          # e versões). O piso não é cosmético: sem ele, um `grep` que deixasse
-          # de casar faria a rodada executar só o boot e o job continuaria
-          # verde — que é exatamente como a quarentena passou despercebida.
-          # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este número
-          # contra a contagem de casos das specs FORA da quarentena.
-          TEST_ADMIN_UI_MIN_TESTS: '27'
+          # e versões) + os 4 de `channel-lines.spec.ts`, a parte da décima
+          # jornada que NÃO depende do runtime (listagem da linha declarada,
+          # recusa ao papel `viewer` com o seu caso de controle, e a
+          # degradação honesta sem keyring). O piso não é cosmético: sem ele,
+          # um `grep` que deixasse de casar faria a rodada executar só o boot e
+          # o job continuaria verde — que é exatamente como a quarentena passou
+          # despercebida. `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este
+          # número contra a contagem de casos das specs FORA da quarentena.
+          TEST_ADMIN_UI_MIN_TESTS: '31'
         run: npm run test:admin-ui:e2e:ci
 
       - name: Quarentena da suíte e2e (o que NÃO foi medido)
-        # Nunca reprova: é legibilidade. Depois da #623 sobrou UMA spec fora do
-        # gate, e não por sessão nem por fixture: o QR e o código de pareamento
-        # são produzidos pelo worker `channel_pairing` do RUNTIME, e este job
-        # sobe só o console. O cabeçalho de `channel-lines-pairing.spec.ts` tem
-        # a medição e o critério objetivo de saída; a lista é fixada em
+        # Nunca reprova: é legibilidade. Sobrou UMA spec fora do gate, e agora
+        # só com os casos que realmente exigem um segundo processo: o QR e o
+        # código de pareamento são produzidos pelo worker `channel_pairing` do
+        # RUNTIME, e este job sobe só o console. O que dependia apenas de
+        # sessão e fixture saiu para `channel-lines.spec.ts` e é bloqueante. O
+        # cabeçalho de `channel-lines-pairing.spec.ts` tem a medição e o
+        # critério objetivo de saída, caso a caso; a lista é fixada em
         # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode crescer
         # em silêncio.
         if: always()
