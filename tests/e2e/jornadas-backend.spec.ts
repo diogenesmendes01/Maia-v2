@@ -517,7 +517,7 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
     // R$ 25.000 > `VALOR_DUAL_APPROVAL` (20.000, default do contrato) e
     // <= `VALOR_LIMITE_DURO` (50.000).
     //
-    // ═══ O QUE ESTE CASO NÃO CONSEGUE DISTINGUIR, medido com sonda ═══════
+    // ═══ O QUE ESTE CASO NÃO CONSEGUE DISTINGUIR, medido em TRÊS sondas ══
     //
     // DUAS regras de produção INDEPENDENTES classificam este valor como dual,
     // e a primeira curto-circuita a segunda em `src/tools/_dispatcher.ts:524`:
@@ -529,15 +529,32 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
     //      (`src/governance/financial-authorization.ts:252`), que só é
     //      consultado quando (1) NÃO exigiu dual.
     //
-    // Sonda rodada nesta entrega: rebaixar (2) de `require_dual_approval` para
-    // `require_single_confirmation` deixou este caso VERDE, porque (1) já
-    // tinha decidido. Ou seja: este caso prova que a exigência de aprovação
-    // dupla EXISTE e é OBEDECIDA, mas não isola QUAL das duas regras a
-    // produziu — uma regressão em só uma delas não aparece aqui. A sonda que
-    // o deixa vermelho é a que quebra a CONSEQUÊNCIA (o `if
-    // (approvalRequirement !== 'none')` do dispatcher), e é ela que está no
-    // corpo da PR. Isolar as duas regras é trabalho de teste unitário de
-    // governança, não desta jornada.
+    // A cegueira é SIMÉTRICA, e as três sondas juntas é que mostram isso —
+    // uma sozinha descreveria metade do buraco:
+    //
+    //   · rebaixar (2) para `require_single_confirmation`, com (1) intacta
+    //     → VERDE (o catálogo já tinha decidido);
+    //   · matar (1) por inteiro (`return { required: false }`), com (2)
+    //     intacta → VERDE (o avaliador assume e chega ao mesmo veredito);
+    //   · quebrar AS DUAS juntas → VERMELHO:
+    //         AssertionError: expected 'single_confirmation'
+    //                         to be 'requester_plus_one_owner'
+    //
+    // Então o enunciado correto — e o que quem ler isto precisa saber — é:
+    // este caso prova que a exigência de aprovação dupla EXISTE e é OBEDECIDA
+    // ponta a ponta, e detecta a perda TOTAL da garantia; ele NÃO detecta a
+    // perda de nenhuma das duas metades sozinha. As duas regras se cobrem
+    // mutuamente, e o teste não distingue qual delas está viva.
+    //
+    // A sonda que deixa este caso vermelho sem tocar em nenhuma das duas
+    // regras é a da CONSEQUÊNCIA — neutralizar o `if (approvalRequirement !==
+    // 'none')` do dispatcher, o cadeado saindo da porta —, e é ela que está
+    // no corpo da PR.
+    //
+    // Isolar as duas regras uma da outra é trabalho de teste unitário de
+    // governança, não desta jornada: fazer a jornada crescer para isso
+    // acoplaria um teste de ponta a ponta ao arranjo interno de duas camadas
+    // que hoje se defendem em profundidade.
     llm.roteiro = [
       () =>
         propoeRegistro({
