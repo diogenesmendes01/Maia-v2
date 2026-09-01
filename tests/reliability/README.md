@@ -1,13 +1,16 @@
 # Harness de fault injection para turnos (issue #510)
 
-> **Estado desta entrega (fatia E):** além de tudo o que as fatias B e C
+> **Estado desta entrega (fatias E + F):** além do que as fatias B e C
 > trouxeram (transporte de failpoint, `InvariantOracle`, FI-04/05/06/07 e
 > FI-17/FI-18), existe agora o **`TurnDriver`** — o componente que injeta um
 > inbound de VERDADE pela porta de produção e acompanha
 > `mensagem_id`/`turn_id`/`conversa_id`/job da BullMQ — e com ele os **três
-> cenários da família de ENTRADA: FI-01, FI-02 e FI-03**. **9 dos 25 cenários
-> estão implementados.** Os perfis `reliability:full`/`soak` continuam FORA. A
-> issue #510 segue aberta — o inventário abaixo é o mapa honesto do que falta.
+> cenários da família de ENTRADA (FI-01, FI-02 e FI-03)**, mais os **cinco da
+> fatia F — FI-08, FI-09, FI-14, FI-15 e FI-16** — que cobrem a RECUPERAÇÃO
+> (varredura concorrente, job retido), a POLÍTICA de poison/DLQ e as duas
+> janelas de crash em volta do COMMIT DO OUTBOX. **14 dos 25 cenários estão
+> implementados.** Os perfis `reliability:full`/`soak` continuam FORA. A issue
+> #510 segue aberta — o inventário abaixo é o mapa honesto do que falta.
 
 ## Por que este harness existe
 
@@ -91,15 +94,15 @@ cenário que os execute — eles contam como FALTA aqui.
 | FI-05 | crash pós-claim | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-06 | heartbeat interrompido | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-07 | stale completion | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
-| FI-08 | recovery concorrente | **falta** | o `TurnDriver` já sobe `runMessageRecovery()` num processo; falta soltar DOIS pela mesma barreira sobre o mesmo lote |
-| FI-09 | job failed retido | **falta** | exige um worker de PROCESSO que reprove o job (`clearRetainedTurnJob` é o alvo) |
+| FI-08 | recovery concorrente | **feito** (fatia F) | `scenarios/fi-recuperacao-concorrente.spec.ts` |
+| FI-09 | job failed retido | **feito** (fatia F) | `scenarios/fi-recuperacao-concorrente.spec.ts` |
 | FI-10 | FIFO mesma stream | **falta** | o `TurnDriver` já injeta dois ingressos na MESMA stream; falta o cenário de promoção (`stream-promotion`) |
 | FI-11 | paralelismo entre streams | **falta** | idem FI-10, com `criarAlvo()` distinto por stream |
 | FI-12 | debounce concorrente | **falta** | exige `FEATURE_MESSAGE_DEBOUNCE` ligada no filho e dois closers de `stream-debounce` |
 | FI-13 | retry head-of-line | **falta** | idem FI-10 |
-| FI-14 | poison/DLQ | **falta** | `poison-policy.ts` existe; falta cenário de processo |
-| FI-15 | crash antes do outbox commit | **falta** | `after_response_built_before_outbox_commit` sem call site |
-| FI-16 | crash pós-outbox/pre-enqueue | **falta** | exige o sweeper de `outbound-recovery-repo` no cenário |
+| FI-14 | poison/DLQ | **feito** (fatia F) | `scenarios/fi-poison-dlq.spec.ts` |
+| FI-15 | crash antes do outbox commit | **feito** (fatia F) | `scenarios/fi-outbox-commit-recuperacao.spec.ts` |
+| FI-16 | crash pós-outbox/pre-enqueue | **feito** (fatia F) | `scenarios/fi-outbox-commit-recuperacao.spec.ts` |
 | FI-17 | dois delivery workers | **feito** (fatia C) | `scenarios/fi-outbound-entrega.spec.ts` |
 | FI-18 | provider aceita, ACK perdido | **feito** (fatia C) | `scenarios/fi-outbound-entrega.spec.ts` |
 | FI-19 | crash pós-delivery persist | **falta** | exige o elo entrega→`completed` do turno |
@@ -110,21 +113,24 @@ cenário que os execute — eles contam como FALTA aqui.
 | FI-24 | shutdown gracioso | **falta** | `ProcessSupervisor` já faz SIGTERM; falta o cenário com turnos ativos |
 | FI-25 | isolamento adversarial | **falta** | o oracle já checa `tenant_id + agent_id`; falta o cenário de dois tenants |
 
-**Resumo: 9 implementados, 2 parciais (infra pronta, cenário ausente), 14 sem
+**Resumo: 14 implementados, 2 parciais (infra pronta, cenário ausente), 9 sem
 começar.** Fora da matriz nominal, continua faltando o cenário de duplicação
 **entre JOBS no mesmo processo** (ver a seção sobre as duas formas de duplicação).
 
-### O que REALMENTE bloqueia os 16 restantes
+### O que REALMENTE bloqueia os 11 restantes
 
-Não é volume de cenário — é que **12 dos 16 failpoints do catálogo não têm
-SEAM**. Os quatro pontos alcançáveis hoje por um caminho de produção são
-`after_turn_claim_before_running` (fatia B), `after_outbound_claim_before_send` e
-`after_provider_accept_before_delivery_persist` (fatia C) e
-`after_inbound_persist_before_enqueue` (fatia E). Um cenário novo só é honesto
-quando existe um SEAM de produção onde o gate cabe entre duas chamadas reais —
-foi assim que FI-04..07 usaram `acquireTurnLease` + `markRunning`, FI-17/18 usam
-`beginInlineDelivery` + `recordInlineDelivery`, e FI-02 usa
-`mensagensRepo.createInbound` + `enqueueAgent`.
+Não é volume de cenário — é que **10 dos 16 failpoints do catálogo não têm
+SEAM**. Os seis pontos alcançáveis hoje por um caminho de produção são
+`after_turn_claim_before_running` (fatia B), `after_outbound_claim_before_send`
+e `after_provider_accept_before_delivery_persist` (fatia C),
+`after_inbound_persist_before_enqueue` (fatia E), e
+`after_response_built_before_outbox_commit` e
+`after_outbox_commit_before_delivery_enqueue` (fatia F). Um cenário novo só é
+honesto quando existe um SEAM de produção onde o gate cabe entre duas chamadas
+reais — foi assim que FI-04..07 usaram `acquireTurnLease` + `markRunning`,
+FI-17/18 usam `beginInlineDelivery` + `recordInlineDelivery`, FI-02 usa
+`mensagensRepo.createInbound` + `enqueueAgent`, e FI-15/16 usam a construção da
+resposta + `commitOutboundIntent`.
 
 **O que é um SEAM, exatamente.** Não é um call site em `src/`: o catálogo mora
 em `tests/` e o teste arquitetural proíbe que qualquer um dos 16 nomes apareça
@@ -136,11 +142,20 @@ virou alcançável sem nenhuma mudança em `src/` justamente porque
 a que `createReceivedTurnTx` documenta ("o Postgres grava `received`, o caller
 tenta o enqueue").
 
-Onde não há seam (`during_llm_request`, `after_response_built_before_outbox_commit`
-— pontos DENTRO de uma função ou de uma transação), o cenário exige antes uma
-mudança de desenho no código de produção, e essa mudança é uma decisão de dono,
-não de teste. É a razão pela qual as fatias avançam por FAMÍLIA DE SEAM e não
-por ordem numérica de FI-ID.
+**Uma correção de rota da fatia F.** Este arquivo dizia que
+`after_response_built_before_outbox_commit` seria um ponto "DENTRO de uma
+transação" e portanto inalcançável. Isso vale para o nome lido ao pé da letra
+("dentro de `commitTurnOutboundTx`") e é falso para o ponto que a matriz
+descreve: a resposta é CONSTRUÍDA pelo chamador e só então entregue a
+`commitOutboundIntent` — `src/agent/output-dispatch.ts` faz exatamente isso em
+cada limite de efeito. O intervalo entre as duas chamadas é um seam de produção
+como qualquer outro. O mesmo vale para
+`after_outbox_commit_before_delivery_enqueue`, entre o commit e o transporte.
+
+Onde de fato não há seam (`during_llm_request`, os failpoints de TOOL — pontos
+DENTRO de uma função), o cenário exige antes uma mudança de desenho no código
+de produção, e essa mudança é uma decisão de dono, não de teste. É a razão pela
+qual as fatias avançam por FAMÍLIA DE SEAM e não por ordem numérica de FI-ID.
 
 ## O que está entregue
 
@@ -166,6 +181,12 @@ por ordem numérica de FI-ID.
 | **`esperarParadoEm`** | `harness/failpoint-transport.ts` | Espera o filho ESTACIONAR no gate antes de qualquer `liberar`/`hardKill` — "chegou" e "estacionou" são fatos diferentes, e soltar um gate vazio devolve 0 (#707) |
 | **`motor-de-turno.ts`** | `fixtures/motor-de-turno.ts` | O filho que chama `createInbound`, `enqueueAgent` e `runMessageRecovery` REAIS |
 | **Cenários FI-01/02/03** | `scenarios/fi-ingresso-enfileiramento.spec.ts` | Reentrega do mesmo evento, `SIGKILL` entre o commit e o enqueue, e o mesmo `turn_id` enfileirado por 4 processos |
+| **Cenários FI-15/FI-16** | `scenarios/fi-outbox-commit-recuperacao.spec.ts` | As duas janelas de crash em volta do commit do outbox, e a varredura que recupera o artefato órfão |
+| **Cenários FI-08/FI-09** | `scenarios/fi-recuperacao-concorrente.spec.ts` | Dois sweepers de PROCESSO sobre o mesmo lote, e o job determinístico retido em `failed` |
+| **Cenário FI-14** | `scenarios/fi-poison-dlq.spec.ts` | A política de poison decidindo entre LIBERAR e INTERDITAR a conversa, com as duas pontas no mesmo caso |
+| **`replica-de-commit.ts`** | `fixtures/replica-de-commit.ts` | O filho que reivindica o turno e chama `commitOutboundIntent` REAL, com gate antes e depois |
+| **`replica-de-varredura.ts`** | `fixtures/replica-de-varredura.ts` | O filho que roda `runOutboundRecoveryForScope` REAL e ANUNCIA o lote que leu |
+| **`replica-de-veneno.ts`** | `fixtures/replica-de-veneno.ts` | O filho que esgota as tentativas por `failTurnRetryable` REAL e deixa a política decidir |
 
 ## Como os failpoints são impossíveis de habilitar em produção
 
@@ -534,16 +555,121 @@ PAYLOAD em vez de perguntar `getJob(agentTurnJobId(turn_id))`: com o id
 determinístico apagado, o `getJob` não acharia nenhum dos oito e o vermelho
 seria "0 to be 1" — verdadeiro, e mudo sobre a causa.
 
+## Fatia F — a RECUPERAÇÃO, a POLÍTICA e as duas janelas do commit
+
+As fatias B e C provaram a POSSE (do turno e da entrega). A fatia F prova o que
+acontece quando a posse não basta: quando o processo morre **fora** de uma
+janela protegida por lease, quando **dois** processos de recuperação decidem
+sobre a mesma linha, quando o **transporte** está entupido, e quando a
+plataforma tem de **escolher** entre liberar a conversa e interditá-la.
+
+| Falha que o harness injeta | Como | Reação PROVADA | Onde |
+|---|---|---|---|
+| dois sweepers sobre o mesmo lote | barreira solta os dois juntos, e os dois ANUNCIAM o lote que leram | uma decisão por linha: `dead_lettered` somado entre as duas réplicas é 2 para 2 linhas, UMA `audit_log` por linha, UM job por linha rearmada | FI-08 |
+| job determinístico retido em `failed` | o job é criado pela BullMQ e movido para `failed` pelas chaves | `enqueueOutboundDelivery` remove o cadáver e rearma — e NÃO toca no job `waiting` | FI-09 |
+| M1 esgota as tentativas | `failTurnRetryable` com `attempt_count` no teto, duas vezes, com códigos de erro de categorias diferentes | a política DECIDE: `effect_committed` interdita a conversa (linha em `agent_stream_blocks`, `stream_poisoned` na auditoria, claim seguinte recusado com `stream_poisoned`); `model` libera (nada disso, e o claim seguinte passa) | FI-14 |
+| `SIGKILL` com a resposta pronta e o outbox vazio | gate `after_response_built_before_outbox_commit` + `hardKill` | nenhuma linha do outbox nasce; o sucessor assume depois do prazo e commita UMA, e o segundo commit da MESMA saída lógica devolve `inserted: false` | FI-15 |
+| `SIGKILL` depois do commit e antes do transporte | gate `after_outbox_commit_before_delivery_enqueue` + `hardKill` | a linha fica `pending` e sem job; a varredura de produção a rearma num job de id determinístico; o ciclo de entrega real produz UM efeito no ledger — e a varredura seguinte não produz um segundo | FI-16 |
+
+### Como se sabe que os cinco não são vácuo
+
+Cinco **sondas vermelhas em call site de PRODUÇÃO**, cada uma aplicada,
+observada, revertida (`git diff -- src/` vazio) e com o verde reconfirmado:
+
+| Cenário | Defeito reintroduzido em `src/` | Vermelho LITERAL |
+|---|---|---|
+| FI-08 | `deadLetterTx`: `AND status IN (…)` → `AND true` (`outbound-recovery-repo.ts`) | `dead letter aconteceu 4 vezes para 2 linhas … expected 4 to be 2` |
+| FI-09 | `enqueueOutboundDelivery`: `clearRetainedOutboundJob(jobId)` apagado (`gateway/queue.ts`) | `o job continua RETIDO em failed — nenhum tick da varredura consegue rearmar esta linha: expected 'failed' to be 'waiting'` |
+| FI-14 | `deadLetterTurn`: `poisonDisposition(...)` → `'release'` fixo (`turns/lifecycle.ts`) | `a conversa do efeito irreversível NÃO foi interditada: expected [] to have a length of 1 but got +0` |
+| FI-15 | `commitTurnOutboundTx`: `.onConflictDoNothing()` apagado (`outbound-outbox-repo.ts`) | `eventually("o sucessor commita a mesma saída lógica duas vezes") estourou em 30000ms` — e o stdout do filho traz o `##harness-fatal##` com a violação de unique |
+| FI-16 | `sweepDeliverable`: `await enqueueOutboundDelivery(...)` apagado, `stats.rearmed += 1` MANTIDO (`workers/outbound-recovery.ts`) | `expected { existe: false, naFila: +0 } to deeply equal { existe: true, naFila: 1 }` |
+
+A sonda de FI-16 é deliberadamente a mais má: ela deixa a varredura CONTINUAR
+reportando `rearmed: 1` e só remove o efeito. Um cenário que confiasse no
+número que o próprio sweeper devolve ficaria verde; o que olha a fila fica
+vermelho. É a mesma régua da fatia C — medir o EFEITO, não o relato.
+
+A sonda de FI-15 revelou uma segunda camada, como a sonda 2 da fatia C: sem a
+idempotência da `logical_dedupe_key`, a segunda tentativa não cria uma linha
+duplicada em silêncio — ela ESTOURA no unique `outbound_messages_turn_sequence_uq`
+(migração 121), e o commit falha fechado. As duas defesas são independentes, e
+FI-15 detecta a perda da primeira mesmo com a segunda ainda de pé.
+
+### O que a fatia F mudou no harness, e por quê
+
+**`esperarParadoEm` é usado em todo gate novo.** O primitivo é da #707 (que o
+criou depois de a FI-17 reprovar no CI: `liberar()` sobre gate vazio devolve
+`0`, e o cenário passava a esperar por um efeito que ninguém ia produzir).
+FI-15 e FI-16 param processos em gates e usam `esperarParadoEm` antes de
+qualquer `hardKill` ou `liberar` — a regra desta lane passa a ser: **nunca aja
+sobre um gate sem antes provar que existe alguém parado nele.**
+
+**A regra de posse do oracle, no TERMINAL.** `turno.claim_completo` cobrava o
+tuplo `(claim_token, claimed_by, lease_expires_at)` completo ou vazio. A
+conclusão terminal de produção libera token e lease e PRESERVA `claimed_by`
+("a posse morre com a tentativa; `claimed_by` fica para a forense",
+`turn-repos.ts`), então a regra acusaria TODO turno concluído — e FI-14, o
+primeiro cenário desta lane a levar um turno até `dead_letter`, encontrou isso.
+No terminal vale a invariante mais forte: `turno.posse_liberada_no_terminal` —
+nenhuma posse VIVA sobrevive ao fim do turno. Os dois casos estão nos
+self-tests do oracle.
+
+**A ordem "sucessor antes do crash" (FI-05 e FI-15).** Um controle de takeover
+("antes do prazo ele é RECUSADO") que sobe o sucessor DEPOIS do `SIGKILL`
+depende de o import a frio do grafo de produção caber dentro do TTL da lease —
+1.9s–6.8s de import contra 6s de TTL. Em cinco rodadas seguidas da lane, a
+FI-15 escrita assim reprovou em QUATRO, e a FI-05 (fatia B, mesma construção)
+reprovou em uma: o sucessor terminava de importar depois do vencimento e
+entrava na PRIMEIRA tentativa, sem nunca ter sido barrado — o controle sumia
+sem que ninguém tivesse mexido em produção. Os dois cenários passaram a subir o
+sucessor ANTES do crash e a observar as recusas com o dono PROVADAMENTE vivo. O
+controle fica mais forte, não mais frouxo: "recusado enquanto o dono vive" é
+uma afirmação melhor que "recusado antes de um prazo".
+
+### Isolamento de FILA, e o que ele NÃO é
+
+As filas de produção (`src/gateway/queue.ts`) são construídas no import com o
+prefixo `bull` padrão; não existe env que troque o prefixo sem mexer em `src/`.
+O que isola FI-08/FI-09/FI-16 é (a) o **db lógico do Redis exclusivo da
+worktree** (#571) e (b) o **`jobId`**, que é
+`outboundDeliveryJobId(<uuid da rodada>)` — um valor que nenhuma outra árvore
+pode produzir. Toda leitura e toda limpeza destes cenários miram ids da própria
+rodada. **Nenhuma varre prefixo de fila**, e isso é regra: uma varredura por
+prefixo num Redis compartilhado por dezenas de árvores é dano cruzado, não
+faxina.
+
+O limite declarado: se a alocação de slots do Redis (#571) reciclar o db desta
+árvore no meio de uma rodada, um consumidor alheio poderia drenar um job destes
+cenários. O sintoma seria FI-09/FI-16 vermelhos com o job sumido — e a resposta
+é olhar a alocação de slots, não afrouxar a asserção.
+
+### O que estes cinco cenários NÃO provam
+
+- **FI-16 não roda o CONSUMIDOR da fila.** Ele prova que a varredura arma UM
+  job com o id determinístico e que o ciclo de entrega REAL, sobre aquela
+  linha, produz UM efeito. Quem tira o job da fila e chama o ciclo é o worker
+  de `FEATURE_OUTBOUND_DELIVERY_WORKER`, e ele fica fora do cenário — subir um
+  worker BullMQ aqui consumiria a fila de qualquer outra árvore que
+  compartilhasse o db lógico.
+- **FI-15 prova que nenhum envio era POSSÍVEL**, não que um envio foi impedido:
+  sem linha durável não existe nada que o ciclo de entrega possa reivindicar. A
+  afirmação sobre um provider que sobrevive ao crash é de FI-16 e FI-18.
+- **FI-08 prova a exclusão entre RÉPLICAS do sweeper.** A duplicação entre JOBS
+  DISTINTOS no mesmo processo continua sem cenário (ver a seção sobre as duas
+  formas de duplicação).
+- **FI-14 usa a política DEFAULT** (`TURN_POISON_BLOCK_CATEGORIES=effect_committed`),
+  declarada pelo cenário em vez de herdada. Ele não varre as seis categorias —
+  isso é papel dos testes unitários de `poison-policy.ts`.
+
 ## O que falta para fechar a #510
 
 Ver o **Inventário FI-01..FI-25** no topo deste arquivo para o estado de cada
 cenário. Em resumo, o que ainda falta:
 
-1. os failpoints de TOOL e do commit de outbox continuam sem SEAM; as fatias C e
-   E acrescentaram três pontos alcançáveis
-   (`after_outbound_claim_before_send`, `after_provider_accept_before_delivery_persist`
-   e `after_inbound_persist_before_enqueue`), então são 12 os que faltam;
-2. os 16 cenários restantes da matriz — e, fora dela, a duplicação ENTRE JOBS no
+1. os failpoints de TOOL e os de dentro do LLM continuam sem SEAM; com os dois
+   que a fatia C alcançou, o que a fatia E alcançou e os dois da fatia F, são
+   **10** os que faltam;
+2. os 11 cenários restantes da matriz — e, fora dela, a duplicação ENTRE JOBS no
    mesmo processo (ver a seção sobre as duas formas de duplicação);
 3. a família FIFO (FI-10..FI-13) deixou de estar bloqueada pelo `TurnDriver`: o
    que falta nela agora é o cenário de PROMOÇÃO de stream e o closer de debounce
