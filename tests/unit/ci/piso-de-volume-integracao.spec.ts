@@ -30,6 +30,32 @@
  *      `scripts/check-vitest-summary.ts`, que reprova `executados=0`.
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * A segunda metade, #703 — o e2e de backend VOLTOU, e o guard mudou de forma
+ * ─────────────────────────────────────────────────────────────────────────
+ *
+ * A #701 removeu o alvo vazio; a #703 devolveu o alvo COM CONTEÚDO: três
+ * jornadas de negócio ponta a ponta em `tests/e2e/jornadas-backend.spec.ts`,
+ * o script `test:e2e` e um piso PRÓPRIO (`--min 3 --max-pulados 0`) no mesmo
+ * job de integração.
+ *
+ * Isso reescreve o que este arquivo protege, e a mudança é deliberada. Antes
+ * ele exigia a AUSÊNCIA de `test:e2e` e de `tests/e2e/` — a única defesa
+ * possível enquanto não havia nada a rodar. Exigir ausência nunca foi o
+ * objetivo: o defeito nunca foi "existe uma lane e2e", foi "existe uma lane
+ * e2e que não executa nada e sai 0". Agora que a lane executa, o guard passa
+ * a exigir as CONDIÇÕES que tornam a volta segura, que são mais fortes que a
+ * ausência:
+ *
+ *   a. a lane está fiada no job (`npm run test:e2e`) e grava resumo próprio;
+ *   b. o piso dela é BLOQUEANTE, lê ESSE resumo, exige `--min >= 3` (uma
+ *      jornada por cenário nominal da #703) e `--max-pulados 0`;
+ *   c. nenhum arquivo de `tests/e2e/` tem `describe.skip` INCONDICIONAL — a
+ *      forma exata do defeito original.
+ *
+ * (c) é o que impede a regressão literal: um `describe.skip('…')` no topo
+ * reprova este arquivo, e o piso reprova o job.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
  * Anti-espelho
  * ─────────────────────────────────────────────────────────────────────────
  * Nada aqui é reconstruído a partir de uma cópia do que se espera. O workflow
@@ -39,7 +65,7 @@
  * parar de reprovar, este arquivo fica vermelho.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -176,18 +202,66 @@ describe('piso de volume da rodada de integração', () => {
   });
 
   describe('a fiação no `.github/workflows/ci.yml`', () => {
-    it('o job de integração NÃO tem mais passo de e2e de backend', () => {
+    it('#703 — o job de integração roda a lane de jornadas e2e, e ela grava resumo PRÓPRIO', () => {
       const job = workflow().jobs?.['integration'];
       expect(job, 'job `integration` sumiu do workflow').toBeDefined();
-      const runs = (job?.steps ?? []).map((p) => p.run ?? '').join('\n');
-      expect(runs).not.toMatch(/npm run test:e2e/);
-      expect(runs).not.toMatch(/vitest run tests\/e2e/);
+      const passos = job?.steps ?? [];
+      const lane = passos.find((p) => (p.run ?? '').includes('npm run test:e2e'));
+      expect(lane, 'a lane de jornadas e2e (#703) sumiu do job de integração').toBeDefined();
+
+      // Um gate não pode ser aviso.
+      expect(lane?.['continue-on-error']).toBeUndefined();
+
+      // Resumo PRÓPRIO: se a lane escrevesse no mesmo arquivo da integração,
+      // o piso de 3 leria os ~1100 casos dela e aprovaria uma lane e2e vazia.
+      const destino = (lane as { env?: Record<string, string> } | undefined)?.env?.[
+        'VITEST_SUMMARY_FILE'
+      ];
+      expect(destino, 'a lane e2e não declara VITEST_SUMMARY_FILE').toBeTruthy();
+      const integracao = passos.find((p) => (p.run ?? '').includes('npm run test:integration'));
+      const destinoIntegracao = (integracao as { env?: Record<string, string> } | undefined)?.env?.[
+        'VITEST_SUMMARY_FILE'
+      ];
+      expect(destino).not.toBe(destinoIntegracao);
     });
 
-    it('o NOME do job não promete e2e que ele não roda', () => {
-      // O nome é o que aparece na lista de checks da PR e na proteção de
-      // branch. Um nome que promete cobertura inexistente é a parte do
-      // defeito que mais longe chega.
+    it('#703 — a lane e2e tem piso PRÓPRIO, bloqueante, com --min >= 3 e --max-pulados 0', () => {
+      const passos = workflow().jobs?.['integration']?.steps ?? [];
+      const lane = passos.find((p) => (p.run ?? '').includes('npm run test:e2e'));
+      const destino = (lane as { env?: Record<string, string> } | undefined)?.env?.[
+        'VITEST_SUMMARY_FILE'
+      ] as string;
+      const piso = passos.find(
+        (p) => (p.run ?? '').includes('check-vitest-summary.ts') && (p.run ?? '').includes(destino),
+      );
+      expect(piso, 'a lane e2e não tem passo de piso apontando para o resumo dela').toBeDefined();
+      expect(piso?.['continue-on-error']).toBeUndefined();
+
+      // `--min 3`: um por cenário nominal da #703 (R$ 50, R$ 25k, quarentena).
+      // Apagar uma jornada tem de reprovar o job, não reduzir a cobertura em
+      // silêncio.
+      const min = /--min\s+(\d+)/.exec(piso?.run ?? '');
+      expect(min, 'o piso da lane e2e não declara --min').not.toBeNull();
+      expect(Number.parseInt(min?.[1] ?? '0', 10)).toBeGreaterThanOrEqual(3);
+
+      // `--max-pulados 0`: nesta lane o ÚNICO skip possível é o
+      // `describe.skip` condicionado a `TEST_DB_URL`, e neste job Postgres e
+      // Redis são obrigatórios. Skip aqui = infraestrutura ausente = falha.
+      const max = /--max-pulados\s+(\d+)/.exec(piso?.run ?? '');
+      expect(max, 'o piso da lane e2e não declara --max-pulados').not.toBeNull();
+      expect(Number.parseInt(max?.[1] ?? '-1', 10)).toBe(0);
+    });
+
+    it('o NOME do job continua `integration (node X)` — e a razão mudou de lado', () => {
+      // Antes da #703 o nome tinha de perder o `+ e2e` porque PROMETIA uma
+      // cobertura inexistente. Agora a cobertura existe e o nome fica igual
+      // por outro motivo, mais duro: o nome do job É o nome do check
+      // obrigatório na proteção de branch. Renomeá-lo faria a proteção
+      // esperar um check que ninguém publica — exatamente o aceite 4 da #703
+      // ("um check obrigatório com nome errado nunca reporta").
+      //
+      // Prometer menos do que se entrega nunca foi o defeito; prometer mais
+      // era. A asserção segue a mesma, a justificativa é que inverteu.
       const nome = workflow().jobs?.['integration']?.name ?? '';
       expect(nome).toMatch(/^integration \(node /);
       expect(nome).not.toMatch(/e2e/i);
@@ -228,16 +302,43 @@ describe('piso de volume da rodada de integração', () => {
     });
   });
 
-  describe('o que sobrou no repositório', () => {
-    it('não há mais script `test:e2e` nem `tests/e2e/` — um alvo vazio é um convite a recriar o verde falso', () => {
+  describe('o alvo `tests/e2e/` — #703', () => {
+    it('o script `test:e2e` existe, aponta para `tests/e2e` e roda com --retry=0', () => {
       const pkg = JSON.parse(readFileSync(join(RAIZ, 'package.json'), 'utf8')) as {
         scripts?: Record<string, string>;
       };
-      expect(pkg.scripts?.['test:e2e']).toBeUndefined();
+      const script = pkg.scripts?.['test:e2e'];
+      expect(script, 'o script `test:e2e` sumiu — a lane da #703 ficaria sem alvo').toBeTruthy();
+      expect(script).toContain('tests/e2e');
+      // Uma jornada que "passa na segunda tentativa" é o flake que esta lane
+      // deveria denunciar. Mesma regra de `test:reliability`.
+      expect(script).toContain('--retry=0');
 
       // O E2E do console tem script próprio e continua lá — o controle que
       // impede esta asserção de virar "nenhum e2e no repo".
       expect(pkg.scripts?.['test:admin-ui:e2e:ci']).toBeDefined();
+    });
+
+    it('NÃO existe `describe.skip` incondicional em `tests/e2e/` — a forma exata do defeito', () => {
+      const dir = join(RAIZ, 'tests/e2e');
+      const arquivos = readdirSync(dir).filter((f) => f.endsWith('.spec.ts'));
+      expect(
+        arquivos.length,
+        '`tests/e2e/` sem nenhuma spec é o alvo vazio que a #701 removeu',
+      ).toBeGreaterThan(0);
+
+      for (const f of arquivos) {
+        const texto = readFileSync(join(dir, f), 'utf8');
+        // Só a forma CONDICIONAL é aceitável — `SHOULD_RUN ? describe :
+        // describe.skip`, que reage a `TEST_DB_URL` ausente e que o
+        // `--max-pulados 0` do CI transforma em vermelho. Um `describe.skip(`
+        // literal (aberto parêntese logo depois) é o defeito de #438.
+        const semComentarios = texto.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+        expect(
+          /describe\.skip\s*\(/.test(semComentarios),
+          `${f} tem \`describe.skip(\` INCONDICIONAL — é literalmente o defeito da #703`,
+        ).toBe(false);
+      }
     });
   });
 });

@@ -118,6 +118,10 @@ npm run dev
 npm test                          # unit (vitest run)
 npm run test:watch                # unit, watch mode
 npm run test:integration          # integration (needs Postgres + Redis)
+npm run test:e2e                  # jornadas de negócio ponta a ponta (#703) —
+                                  # mesmas exigências da integração; --retry=0
+                                  # embutido (jornada que passa na 2ª tentativa
+                                  # é flake, não verde)
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
