@@ -1,13 +1,16 @@
 # Harness de fault injection para turnos (issue #510)
 
-> **Estado desta entrega (fatia F):** além do que as fatias B e C trouxeram
-> (transporte de failpoint, `InvariantOracle`, FI-04/05/06/07 e FI-17/FI-18),
-> existem agora **cinco cenários novos — FI-08, FI-09, FI-14, FI-15 e FI-16** —
-> que cobrem a RECUPERAÇÃO (varredura concorrente, job retido), a POLÍTICA de
-> poison/DLQ e as duas janelas de crash em volta do COMMIT DO OUTBOX. **11 dos
-> 25 cenários estão implementados.** Os perfis `reliability:full`/`soak` e o
-> gate blocking de CI continuam FORA. A issue #510 segue aberta — o inventário
-> abaixo é o mapa honesto do que falta.
+> **Estado desta entrega (fatias E + F):** além do que as fatias B e C
+> trouxeram (transporte de failpoint, `InvariantOracle`, FI-04/05/06/07 e
+> FI-17/FI-18), existe agora o **`TurnDriver`** — o componente que injeta um
+> inbound de VERDADE pela porta de produção e acompanha
+> `mensagem_id`/`turn_id`/`conversa_id`/job da BullMQ — e com ele os **três
+> cenários da família de ENTRADA (FI-01, FI-02 e FI-03)**, mais os **cinco da
+> fatia F — FI-08, FI-09, FI-14, FI-15 e FI-16** — que cobrem a RECUPERAÇÃO
+> (varredura concorrente, job retido), a POLÍTICA de poison/DLQ e as duas
+> janelas de crash em volta do COMMIT DO OUTBOX. **14 dos 25 cenários estão
+> implementados.** Os perfis `reliability:full`/`soak` continuam FORA. A issue
+> #510 segue aberta — o inventário abaixo é o mapa honesto do que falta.
 
 ## Por que este harness existe
 
@@ -84,18 +87,18 @@ cenário que os execute — eles contam como FALTA aqui.
 
 | ID | Falha injetada | Estado | Onde está / o que bloqueia |
 |---|---|---|---|
-| FI-01 | redelivery inbound | **falta** | exige `TurnDriver` (ingresso real) e BullMQ no cenário |
-| FI-02 | crash pós-persist/pre-enqueue | **falta** | `after_inbound_persist_before_enqueue` sem call site |
-| FI-03 | enqueue duplicado | **falta** | exige BullMQ real e `jobId` determinístico no cenário |
+| FI-01 | redelivery inbound | **feito** (fatia E) | `scenarios/fi-ingresso-enfileiramento.spec.ts` |
+| FI-02 | crash pós-persist/pre-enqueue | **feito** (fatia E) | `scenarios/fi-ingresso-enfileiramento.spec.ts` |
+| FI-03 | enqueue duplicado | **feito** (fatia E) | `scenarios/fi-ingresso-enfileiramento.spec.ts` |
 | FI-04 | corrida de claim | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-05 | crash pós-claim | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-06 | heartbeat interrompido | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-07 | stale completion | **feito** (fatia B) | `scenarios/fi-claim-crash-fence.spec.ts` |
 | FI-08 | recovery concorrente | **feito** (fatia F) | `scenarios/fi-recuperacao-concorrente.spec.ts` |
 | FI-09 | job failed retido | **feito** (fatia F) | `scenarios/fi-recuperacao-concorrente.spec.ts` |
-| FI-10 | FIFO mesma stream | **falta** | exige `TurnDriver` + promoção de stream |
-| FI-11 | paralelismo entre streams | **falta** | idem FI-10 |
-| FI-12 | debounce concorrente | **falta** | exige dois closers de `stream-debounce` |
+| FI-10 | FIFO mesma stream | **falta** | o `TurnDriver` já injeta dois ingressos na MESMA stream; falta o cenário de promoção (`stream-promotion`) |
+| FI-11 | paralelismo entre streams | **falta** | idem FI-10, com `criarAlvo()` distinto por stream |
+| FI-12 | debounce concorrente | **falta** | exige `FEATURE_MESSAGE_DEBOUNCE` ligada no filho e dois closers de `stream-debounce` |
 | FI-13 | retry head-of-line | **falta** | idem FI-10 |
 | FI-14 | poison/DLQ | **feito** (fatia F) | `scenarios/fi-poison-dlq.spec.ts` |
 | FI-15 | crash antes do outbox commit | **feito** (fatia F) | `scenarios/fi-outbox-commit-recuperacao.spec.ts` |
@@ -110,22 +113,34 @@ cenário que os execute — eles contam como FALTA aqui.
 | FI-24 | shutdown gracioso | **falta** | `ProcessSupervisor` já faz SIGTERM; falta o cenário com turnos ativos |
 | FI-25 | isolamento adversarial | **falta** | o oracle já checa `tenant_id + agent_id`; falta o cenário de dois tenants |
 
-**Resumo: 11 implementados, 2 parciais (infra pronta, cenário ausente), 12 sem
+**Resumo: 14 implementados, 2 parciais (infra pronta, cenário ausente), 9 sem
 começar.** Fora da matriz nominal, continua faltando o cenário de duplicação
 **entre JOBS no mesmo processo** (ver a seção sobre as duas formas de duplicação).
 
-### O que REALMENTE bloqueia os 14 restantes
+### O que REALMENTE bloqueia os 11 restantes
 
-Não é volume de cenário — é que a maioria dos failpoints do catálogo não tem
-call site. Os alcançáveis hoje por um caminho de produção são **cinco**:
+Não é volume de cenário — é que **10 dos 16 failpoints do catálogo não têm
+SEAM**. Os seis pontos alcançáveis hoje por um caminho de produção são
 `after_turn_claim_before_running` (fatia B), `after_outbound_claim_before_send`
-e `after_provider_accept_before_delivery_persist` (fatia C), e
+e `after_provider_accept_before_delivery_persist` (fatia C),
+`after_inbound_persist_before_enqueue` (fatia E), e
 `after_response_built_before_outbox_commit` e
 `after_outbox_commit_before_delivery_enqueue` (fatia F). Um cenário novo só é
 honesto quando existe um SEAM de produção onde o gate cabe entre duas chamadas
 reais — foi assim que FI-04..07 usaram `acquireTurnLease` + `markRunning`,
-FI-17/18 usam `beginInlineDelivery` + `recordInlineDelivery`, e FI-15/16 usam a
-construção da resposta + `commitOutboundIntent`.
+FI-17/18 usam `beginInlineDelivery` + `recordInlineDelivery`, FI-02 usa
+`mensagensRepo.createInbound` + `enqueueAgent`, e FI-15/16 usam a construção da
+resposta + `commitOutboundIntent`.
+
+**O que é um SEAM, exatamente.** Não é um call site em `src/`: o catálogo mora
+em `tests/` e o teste arquitetural proíbe que qualquer um dos 16 nomes apareça
+em `src/`. É a existência, no caminho de produção, de duas chamadas SEPARADAS e
+SEQUENCIAIS entre as quais o gate cabe — de modo que o fixture as componha na
+mesma ordem em que a produção as compõe. `after_inbound_persist_before_enqueue`
+virou alcançável sem nenhuma mudança em `src/` justamente porque
+`src/gateway/baileys.ts` já chama as duas em sequência, e a janela entre elas é
+a que `createReceivedTurnTx` documenta ("o Postgres grava `received`, o caller
+tenta o enqueue").
 
 **Uma correção de rota da fatia F.** Este arquivo dizia que
 `after_response_built_before_outbox_commit` seria um ponto "DENTRO de uma
@@ -162,6 +177,10 @@ qual as fatias avançam por FAMÍLIA DE SEAM e não por ordem numérica de FI-ID
 | **Cenários FI-04/05/06/07** | `scenarios/fi-claim-crash-fence.spec.ts` | Réplicas de PROCESSO contra Postgres real, com barreira, `SIGKILL` e `SIGSTOP` |
 | **Cenários FI-17/FI-18** | `scenarios/fi-outbound-entrega.spec.ts` | Claim de ENTREGA disputado por processos, e o efeito não repetido através de um `SIGKILL` |
 | **`replica-de-entrega.ts`** | `fixtures/replica-de-entrega.ts` | O filho que chama `beginInlineDelivery`/`recordInlineDelivery` REAIS e fala com o provider por HTTP |
+| **`TurnDriver`** | `harness/turn-driver.ts` | Injeta inbound pela porta de produção, semeia linha/pessoa/conversa, acompanha `mensagem_id`/`turn_id`/`conversa_id`/job da BullMQ e espera estado terminal com `eventually` |
+| **`esperarParadoEm`** | `harness/failpoint-transport.ts` | Espera o filho ESTACIONAR no gate antes de qualquer `liberar`/`hardKill` — "chegou" e "estacionou" são fatos diferentes, e soltar um gate vazio devolve 0 (#707) |
+| **`motor-de-turno.ts`** | `fixtures/motor-de-turno.ts` | O filho que chama `createInbound`, `enqueueAgent` e `runMessageRecovery` REAIS |
+| **Cenários FI-01/02/03** | `scenarios/fi-ingresso-enfileiramento.spec.ts` | Reentrega do mesmo evento, `SIGKILL` entre o commit e o enqueue, e o mesmo `turn_id` enfileirado por 4 processos |
 | **Cenários FI-15/FI-16** | `scenarios/fi-outbox-commit-recuperacao.spec.ts` | As duas janelas de crash em volta do commit do outbox, e a varredura que recupera o artefato órfão |
 | **Cenários FI-08/FI-09** | `scenarios/fi-recuperacao-concorrente.spec.ts` | Dois sweepers de PROCESSO sobre o mesmo lote, e o job determinístico retido em `failed` |
 | **Cenário FI-14** | `scenarios/fi-poison-dlq.spec.ts` | A política de poison decidindo entre LIBERAR e INTERDITAR a conversa, com as duas pontas no mesmo caso |
@@ -419,6 +438,123 @@ E há uma distinção que o harness ainda não sabe fazer, e precisa:
   que a #691 fechou. O harness não tem cenário para ela, e ela não se reduz à
   primeira: matar réplica não a reproduz, porque não há réplica envolvida.
 
+## Fatia E — a família de ENTRADA, e o driver que faltava
+
+A fatia B provou a posse do TURNO; a fatia C, a da ENTREGA. A fatia E prova o
+que vem ANTES das duas: que a mensagem entra UMA vez, que ela não se perde num
+crash entre o commit e o enqueue, e que N enfileiramentos do mesmo trabalho
+viram um job só.
+
+| Falha que o harness injeta | Como | Reação PROVADA | Onde |
+|---|---|---|---|
+| o MESMO evento chega a duas réplicas de processo | barreira solta as duas juntas, com o mesmo `whatsapp_id` | `createInbound` persiste UM ingresso e cria UM turno; a perdedora recebe a MESMA `mensagem_id` com `duplicate: true` e NENHUM turno | FI-01 |
+| morte abrupta entre o commit e o `enqueueAgent` | gate `after_inbound_persist_before_enqueue` + `SIGKILL` por PID | o turno fica em `received`, a mensagem não processada, zero jobs; `runMessageRecovery()` rearma EXATAMENTE UM | FI-02 |
+| o mesmo `turn_id` enfileirado 8 vezes por 4 processos | barreira solta os quatro juntos | a fila fica com UM job (`turn-<uuid>`), e ele é claimável uma vez só (`attempt_count = 1`) | FI-03 |
+
+### Por que o `TurnDriver` existe, e o que ele NÃO faz
+
+Os cenários das fatias B e C começam do MEIO: `turnoNovo()` e `saidaNova()` são
+`INSERT`s diretos, e podem ser, porque o que estava sob prova era o CLAIM.
+FI-01/02/03 não podem — o que está sob prova é a FRONTEIRA DE ENTRADA, e um
+`INSERT` fabricado responderia sobre o `INSERT` do teste.
+
+O driver **observa**; quem **executa** é sempre um processo filho. A razão é
+específica desta fatia: `ReliabilityEnvironment` cria um banco exclusivo da
+suíte, e o processo do vitest continua apontando para o banco da worktree. Um
+driver que chamasse `mensagensRepo.createInbound` dentro do runner escreveria no
+banco ERRADO e o cenário afirmaria sobre linhas que ninguém leu.
+
+O que o driver faz no processo do teste é ler — um `pg.Pool` no banco da suíte e
+a fila `agent` REAL —, e as duas leituras usam vocabulário de PRODUÇÃO
+(`parseAgentTurnJob`, `isTerminalTurnStatus`), porque uma cópia dessas listas
+continuaria verde depois de a produção mudar.
+
+### A flake que esta fatia expôs na FI-05, e a correção
+
+Acrescentar um terceiro arquivo de cenário à lane aumenta o paralelismo, e isso
+tornou visível uma corrida LATENTE na FI-05 (fatia B), reproduzida em 2 de 7
+rodadas:
+
+```
+AssertionError: o sucessor entrou na PRIMEIRA tentativa — a lease do morto não
+barrou nada: [{"tentativa":1,"result":"acquired","attempt":2,…}]:
+expected 0 to be greater than or equal to 2
+```
+
+Nada da produção mudou. O que mudou foi o TEMPO: o sucessor era spawnado DEPOIS
+do `SIGKILL`, então o import a frio do grafo de produção sob `tsx` (2s a 7s,
+§7.1 do `AGENTS.md`) corria contra o TTL de 6s da suíte. Numa máquina carregada a
+lease vencia antes de o sucessor terminar de importar, ele entrava na primeira
+tentativa, e o CONTROLE das recusas ficava vermelho medindo o import em vez da
+lease.
+
+A correção é subir o sucessor ANTES da morte e segurá-lo numa BARREIRA: o import
+é pago enquanto o dono ainda está vivo e parado no gate, e a primeira tentativa
+acontece milissegundos depois do `SIGKILL`. Não é afrouxar o cenário — a sonda
+vermelha da fatia B continua valendo: apagar `lease_expires_at <= now()` do
+takeover deixa **FI-04 e FI-05 vermelhos**, e o vermelho de FI-05 continua sendo
+literalmente `o sucessor entrou na PRIMEIRA tentativa`.
+
+### O único relógio fabricado desta fatia, e o controle que o torna honesto
+
+`TurnDriver.envelhecerTurno` faz um `UPDATE` no `created_at` do turno.
+`STUCK_AFTER_MS` (`src/workers/message-recovery.ts`) é 2 minutos e não tem env
+que a parametrize; esperá-los de verdade transformaria a lane num soak.
+
+O que o `UPDATE` fabrica é a IDADE da linha, e só ela: estado, regra de
+elegibilidade (`findRecoverableTurns`) e produtor do job (`enqueueAgent`)
+continuam sendo os de produção. E o cenário não pede que se acredite nisso —
+**FI-02 roda o varredor ANTES do envelhecimento e afirma que ele não rearma
+nada**. É essa asserção que separa "envelheci a linha" de "desliguei a checagem".
+
+### Como se sabe que FI-01, FI-02 e FI-03 não são vácuo
+
+Três **sondas vermelhas no call site de produção**, cada uma revertida e o verde
+reconfirmado (`git diff src/` vazio depois de cada uma):
+
+**Sonda 1 — desligar a dedup de ingresso.** Fazer o `findExisting` de
+`mensagensRepo.createInbound` devolver `null` sempre deixa só a unique do banco
+de pé, e ela vira CRASH em vez de dedup. **FI-01 vermelho:**
+
+```
+Error: o motor "ingresso-b" falhou antes de terminar a ação: Error: duplicate key
+value violates unique constraint "uniq_mensagens_channel_whatsapp"
+```
+
+**Sonda 2 — apagar o ramo `received`/`queued` do filtro de recovery.** Trocar
+`and(inArray(status, ['received','queued']), lte(created_at, cutoff))` por
+`sql\`false\`` em `findRecoverableTurns` faz o varredor enumerar o par e não achar
+nada. **FI-02 vermelho:**
+
+```
+EventuallyTimeoutError: eventually("o varredor de produção rearma UM job para o
+turno órfão") estourou em 30000ms após 298 tentativa(s) em 30078ms. Último valor
+observado: undefined. Estado no momento da falha: [].
+```
+
+**Sonda 3 — apagar o `jobId` determinístico.** Trocar
+`const jobId = data.turn_id ? agentTurnJobId(data.turn_id) : undefined` por
+`undefined` em `enqueueAgent` faz **FI-03 E FI-02 ficarem vermelhos**, e o
+vermelho de FI-03 é literalmente o dano — oito jobs para um turno:
+
+```
+EventuallyTimeoutError: eventually("8 enfileiramentos do mesmo turno colidem num
+job") estourou em 30000ms … Estado no momento da falha: [{"id":"9",…},{"id":"8",…},
+{"id":"7",…},{"id":"6",…},{"id":"5",…},{"id":"4",…},{"id":"3",…},{"id":"2",…}]
+```
+
+E o de FI-02 mostra a segunda face do mesmo defeito — o job rearmado deixa de
+ser o do turno:
+
+```
+AssertionError: expected '1' to be 'turn-758b8b7d-c395-4b5c-9433-44dbeb36…'
+```
+
+A sonda 3 é a razão de `TurnDriver.jobsDoTurno` varrer a fila e classificar o
+PAYLOAD em vez de perguntar `getJob(agentTurnJobId(turn_id))`: com o id
+determinístico apagado, o `getJob` não acharia nenhum dos oito e o vermelho
+seria "0 to be 1" — verdadeiro, e mudo sobre a causa.
+
 ## Fatia F — a RECUPERAÇÃO, a POLÍTICA e as duas janelas do commit
 
 As fatias B e C provaram a POSSE (do turno e da entrega). A fatia F prova o que
@@ -530,13 +666,15 @@ cenários. O sintoma seria FI-09/FI-16 vermelhos com o job sumido — e a respos
 Ver o **Inventário FI-01..FI-25** no topo deste arquivo para o estado de cada
 cenário. Em resumo, o que ainda falta:
 
-1. `TurnDriver` (injetar inbound de verdade e acompanhar IDs pelo pipeline) —
-   é o que destrava a família FIFO inteira (FI-10..FI-13) e FI-01/02/03;
-2. os failpoints de TOOL e os de dentro do LLM continuam sem call site; com os
-   dois que a fatia C alcançou e os dois que a fatia F alcançou, são 11 os que
-   faltam, não 15;
-3. os 14 cenários restantes da matriz — e, fora dela, a duplicação ENTRE JOBS no
+1. os failpoints de TOOL e os de dentro do LLM continuam sem SEAM; com os dois
+   que a fatia C alcançou, o que a fatia E alcançou e os dois da fatia F, são
+   **10** os que faltam;
+2. os 11 cenários restantes da matriz — e, fora dela, a duplicação ENTRE JOBS no
    mesmo processo (ver a seção sobre as duas formas de duplicação);
-4. perfis `reliability:full` / `soak` e o gate blocking de CI (o script
-   `npm run test:reliability` existe e roda a lane inteira com `--retry=0`);
+3. a família FIFO (FI-10..FI-13) deixou de estar bloqueada pelo `TurnDriver`: o
+   que falta nela agora é o cenário de PROMOÇÃO de stream e o closer de debounce
+   em processos separados;
+4. perfis `reliability:full` / `soak` (o script `npm run test:reliability` existe
+   e roda a lane inteira com `--retry=0`, e o job `fault injection (#510)` do CI
+   já é blocking com piso `--min 1 --max-pulados 0`);
 5. runbook de reprodução por FI-ID/seed e o template de cenário novo.
