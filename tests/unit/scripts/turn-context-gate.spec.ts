@@ -54,6 +54,8 @@ import {
   runFingerprint,
   startPoolSampler,
   syntheticPassingArm,
+  SCOPE_READS_PER_TURN,
+  SCOPE_SECTIONS,
   type ArmResult,
   type BaselineFile,
   type RunFingerprint,
@@ -124,7 +126,10 @@ function armsWith(inject: Record<string, number>): ArmResult[] {
   return arms;
 }
 
-/** O rótulo do critério de contenção — ver `COBERTURA_DA_MEDICAO` no harness. */
+/**
+ * O rótulo do critério do orçamento COMPLETO — o agregado que a #700 passou a
+ * avaliar (antes dela ele saía `n/a` e reprovava por contenção).
+ */
 const CONTENCAO = 'aceite completo do orçamento do turno';
 
 function run(
@@ -137,90 +142,128 @@ function run(
   const parciais = verdicts.filter((v) => !v.label.includes(CONTENCAO));
   return {
     verdicts,
-    /**
-     * O exit code REAL. Enquanto o `resolveScope` estiver fora da medição ele
-     * é 1 em modo `gate` mesmo numa corrida perfeita — é a contenção, não uma
-     * regressão. Os testes que falam dos CRITÉRIOS usam `codeParcial`.
-     */
+    /** O exit code REAL da corrida, com TODOS os critérios. */
     code: gateExitCode(verdicts, mode),
     /**
-     * O exit code que os critérios PARCIAIS produziriam sozinhos. É o que
-     * responde "o gate reprovaria esta corrida pelo que ele DE FATO mede?" —
-     * a pergunta que cada teste de critério faz.
+     * O exit code SEM o critério agregado do orçamento completo. Os testes de
+     * um critério específico usam este para dizer "foi ESTE critério que
+     * derrubou a corrida", sem que o agregado (que também reprova quando a
+     * evidência do escopo some) apareça como segundo culpado.
      */
     codeParcial: gateExitCode(parciais, mode),
-    /** Reprovações entre os critérios parciais (a contenção não entra). */
+    /** Reprovações entre os critérios individuais (o agregado não entra). */
     failed: parciais.filter((v) => !v.passed),
-    /** A contenção em si, para os testes que falam DELA. */
+    /** O critério agregado do orçamento completo, para os testes que falam DELE. */
     contencao: verdicts.find((v) => v.label.includes(CONTENCAO)),
+    /** Todas as reprovações, agregado incluído. */
+    todasAsFalhas: verdicts.filter((v) => !v.passed),
   };
 }
 
 describe('#525 — o gate do benchmark de carga de contexto', () => {
-  it('nenhum critério PARCIAL reprova uma corrida saudável — mas o gate não sai 0', () => {
-    const { code, codeParcial, failed } = run({});
-    // Pelo que o harness DE FATO mede, a corrida é limpa.
+  it('nenhum critério reprova uma corrida saudável — e o gate SAI 0', () => {
+    const { code, codeParcial, failed, todasAsFalhas } = run({});
     expect(failed).toEqual([]);
     expect(codeParcial).toBe(0);
-    // E ainda assim o gate reprova, porque o aceite COMPLETO não foi avaliado:
-    // o `resolveScope` está fora da medição. Exit 1 aqui significa "não
-    // demonstrado", não "regrediu" — e é essa distinção que a contenção
-    // preserva. Ver `COBERTURA_DA_MEDICAO` e a issue #700.
-    expect(code).toBe(1);
+    // Antes da #700 esta linha era `expect(code).toBe(1)`: o aceite completo
+    // saía `n/a` porque o `resolveScope` estava fora da medição, e não
+    // avaliado reprova. Com o `resolveScope` DENTRO do relógio e a evidência
+    // nos números, o critério passa a ser avaliado — e uma corrida saudável
+    // sai 0. A contenção saiu porque a premissa dela deixou de valer.
+    expect(todasAsFalhas).toEqual([]);
+    expect(code).toBe(0);
   });
 
   // -------------------------------------------------------------------------
-  // A CONTENÇÃO: o aceite completo não pode ser aprovado enquanto o
-  // `resolveScope` estiver fora da medição
+  // #700 — o aceite COMPLETO do orçamento do turno (resolveScope + buildPrompt)
+  //
+  // A flag `COBERTURA_DA_MEDICAO.resolve_scope_medido` é um RÓTULO. O que
+  // aprova este critério é a EVIDÊNCIA MEDIDA: as duas leituras do escopo em
+  // todo turno, a cardinalidade resolvida batendo com a semeada, e turnos > 0.
+  // Virar a flag sem incluir a medição tem de REPROVAR — é o defeito que esta
+  // bateria existe para pegar.
   // -------------------------------------------------------------------------
 
-  describe('contenção do orçamento completo (resolveScope fora da medição)', () => {
-    it('emite o aceite completo como NÃO AVALIADO, e por isso o gate não sai 0 nem numa corrida perfeita', () => {
-      const { code, contencao, failed } = run({});
-
-      expect(contencao, 'o critério de contenção sumiu da lista').toBeDefined();
-      // `skipped` implica `passed === false` — é a invariante do `Verdict`, e
-      // é ela que impede "não avaliado" de virar "aprovado".
-      expect(contencao?.skipped).toBe(true);
-      expect(contencao?.passed).toBe(false);
-      // O detalhe tem de NOMEAR o que ficou de fora. Um "não avaliado" sem
-      // dizer o quê manda o leitor adivinhar.
+  describe('aceite completo do orçamento do turno (#700)', () => {
+    it('APROVA quando a evidência do resolveScope está nos números medidos', () => {
+      const { contencao, code } = run({});
+      expect(contencao, 'o critério do orçamento completo sumiu da lista').toBeDefined();
+      expect(contencao?.skipped).toBeFalsy();
+      expect(contencao?.passed).toBe(true);
       expect(contencao?.detail).toContain('resolveScope');
-      expect(contencao?.detail).toContain('#700');
-
-      // Nada nos critérios parciais reprova esta corrida...
-      expect(failed).toEqual([]);
-      // ...e mesmo assim o gate reprova. É o ponto.
-      expect(code).toBe(1);
+      expect(code).toBe(0);
     });
 
-    it('o critério da contenção vem PRIMEIRO — a fronteira antes dos números', () => {
+    it('REPROVA quando a flag diz que mede e os NÚMEROS dizem que não — a flag não prova a si mesma', () => {
+      // O defeito que a #700 nomeia: alguém vira `resolve_scope_medido` para
+      // `true` sem incluir a medição. Sem as leituras do escopo no contador
+      // por turno, o critério é AVALIADO e REPROVADO — não aprovado por
+      // decreto, e não `n/a`.
+      expect(COBERTURA_DA_MEDICAO.resolve_scope_medido).toBe(true);
+      const { contencao, code } = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
+      expect(contencao?.passed).toBe(false);
+      expect(contencao?.skipped).toBeFalsy();
+      expect(contencao?.detail).toContain('A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO');
+      expect(contencao?.detail).toContain('leituras do escopo por turno=0–0');
+      expect(code).toBe(1);
+
+      // CONTROLE, no mesmo `it`: com as duas leituras de volta, o MESMO
+      // critério aprova. Sem isto o teste passaria por qualquer motivo.
+      expect(run({}).contencao?.passed).toBe(true);
+    });
+
+    it('REPROVA quando o escopo resolvido não bate com a massa semeada (com controle)', () => {
+      // "As duas leituras aconteceram" não basta: elas podem ter devolvido
+      // vazio — massa sem `permissoes`/`permission_profiles`, ou permissão
+      // descartada pelo teto de 500 do `profilesRepo.byIds`.
+      const semMassa = run({ scope_entities_min: 0, scope_entities_max: 0 });
+      expect(semMassa.contencao?.passed).toBe(false);
+      expect(semMassa.code).toBe(1);
+
+      const divergente = run({ scope_cardinality_mismatches: 1 });
+      expect(divergente.contencao?.passed).toBe(false);
+      expect(divergente.code).toBe(1);
+
+      // CONTROLE: cardinalidades 1–100 e zero divergências ⇒ aprova.
+      expect(run({}).contencao?.passed).toBe(true);
+    });
+
+    it('o critério do orçamento completo vem PRIMEIRO — a fronteira antes dos números', () => {
       // Quem lê a tabela de cima para baixo encontra a fronteira antes de já
       // ter formado opinião sobre os p95. Ordem é conteúdo aqui.
       const { verdicts } = run({});
       expect(verdicts[0]?.label).toContain(CONTENCAO);
     });
 
-    it('em modo `measure` o exit code segue 0 — mas o critério continua marcado como não avaliado', () => {
+    it('em modo `measure` o exit code segue 0 — mas o critério continua sendo emitido', () => {
       // O opt-out explícito não pode virar uma porta para declarar aprovação:
       // `measure` não emite veredicto de gate, e o relatório dele diz isso em
       // caixa alta. O que NÃO pode acontecer é o critério sumir.
-      const { code, contencao } = run({}, BASELINE_FOLGADO, 'measure');
+      const { code, contencao } = run({ scope_reads_per_turn_min: 0 }, BASELINE_FOLGADO, 'measure');
       expect(code).toBe(0);
-      expect(contencao?.skipped).toBe(true);
+      expect(contencao?.passed).toBe(false);
     });
 
-    it('a cobertura entra no fingerprint: baseline de outra cobertura é RECUSADO (com controle)', () => {
-      // É isto que mantém os números antigos identificados pela cobertura que
-      // os produziu, em vez de deixá-los circular como se medissem o turno
-      // inteiro.
-      const outraCobertura = baselineWith(1_000, {
+    it('a cobertura entra no fingerprint: baseline da cobertura ANTERIOR é RECUSADO (com controle)', () => {
+      // É isto que impede um número medido sob `buildPrompt-sem-resolveScope`
+      // de ser reapresentado como medição do turno completo. Vale nos dois
+      // sentidos, e é testável sem medir nada — que é o que o aceite 3 da #700
+      // pede enquanto os baselines novos não existem.
+      const coberturaAntiga = baselineWith(1_000, {
         ...FP,
-        cobertura: 'resolveScope+buildPrompt',
+        cobertura: COBERTURA_DA_MEDICAO.rotulo,
       });
-      const recusa = checkBaselineCompatibility(outraCobertura, FP);
+      const recusa = checkBaselineCompatibility(coberturaAntiga, FP);
       expect(recusa.status).toBe('incompatible');
       expect(recusa.diffs.join(' ')).toContain('cobertura');
+      expect(recusa.diffs.join(' ')).toContain('buildPrompt-sem-resolveScope');
+      // E o efeito é REPROVAR o critério relativo, não decorar o relatório.
+      const { code, verdicts } = run({}, coberturaAntiga);
+      const rel = verdicts.find((x) => x.label.includes('p95 ≤ baseline'))!;
+      expect(rel.skipped).toBe(true);
+      expect(rel.passed).toBe(false);
+      expect(rel.detail).toContain('BASELINE MEDIDO COM OUTRA CARGA');
+      expect(code).toBe(1);
 
       // CONTROLE: mesma cobertura, mesma corrida — a comparação acontece.
       expect(checkBaselineCompatibility(baselineWith(1_000, FP), FP).status).toBe('ok');
@@ -241,6 +284,86 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         COBERTURA_DA_MEDICAO.resolve_scope_medido ? 'resolveScope+buildPrompt' : rotuloSemResolveScope,
       );
       expect(rotuloSemResolveScope).not.toBe('resolveScope+buildPrompt');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #700 — os três critérios do ESTÁGIO `resolveScope`, um por regressão
+  // -------------------------------------------------------------------------
+
+  describe('o estágio resolveScope', () => {
+    const EXERCITADO = 'foi EXERCITADO';
+    const DO_BANCO = 'veio do BANCO';
+    const P95_ESTAGIO = 'p95 do estágio';
+
+    it('REPROVA quando as leituras do escopo somem — o escopo voltou a ser fabricado em memória', () => {
+      const { code, failed } = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
+      expect(code).toBe(1);
+      const v = failed.filter((x) => x.label.includes(EXERCITADO));
+      expect(v.map((x) => x.label)).toEqual([
+        expect.stringContaining('[cold]'),
+        expect.stringContaining('[warm]'),
+      ]);
+      expect(v[0]!.detail).toContain('leituras do escopo por turno=0–0 (esperado 2)');
+
+      // CONTROLE: com as duas leituras, o mesmo critério aprova.
+      expect(run({}).failed.some((x) => x.label.includes(EXERCITADO))).toBe(false);
+    });
+
+    it('REPROVA um N+1 no caminho do escopo — mais leituras também é regressão', () => {
+      // O `byId` por permissão que a #511 removeu: 1 + 100 leituras em vez de
+      // 2. Um critério que só cobrasse "≥ 2" não veria isto.
+      const { code, failed } = run({ scope_reads_per_turn_max: 101 });
+      expect(code).toBe(1);
+      expect(failed.some((v) => v.label.includes(EXERCITADO))).toBe(true);
+
+      // CONTROLE: exatamente 2 aprova.
+      expect(run({}).failed.some((v) => v.label.includes(EXERCITADO))).toBe(false);
+    });
+
+    it('REPROVA quando o escopo resolvido não tem a cardinalidade semeada (com controle)', () => {
+      const vazio = run({ scope_entities_min: 0, scope_entities_max: 0 });
+      expect(vazio.code).toBe(1);
+      expect(vazio.failed.some((v) => v.label.includes(DO_BANCO))).toBe(true);
+
+      const divergente = run({ scope_cardinality_mismatches: 3 });
+      expect(divergente.code).toBe(1);
+      const v = divergente.failed.find((x) => x.label.includes(DO_BANCO))!;
+      expect(v.detail).toContain('divergências de cardinalidade=3');
+
+      // CONTROLE: 1–100 entidades e zero divergências.
+      expect(run({}).failed.some((x) => x.label.includes(DO_BANCO))).toBe(false);
+    });
+
+    it('REPROVA uma degradação de latência DENTRO do resolveScope (com controle)', () => {
+      // A demonstração que o aceite 2 da #700 exige: uma degradação que more
+      // no estágio do escopo — um plano perdido, um índice caído — derruba o
+      // gate por um critério que NOMEIA o estágio.
+      const { code, failed } = run({ scope_p95_ms: 900 });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes(P95_ESTAGIO))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('900.0 ms');
+
+      // CONTROLE: o p95 sintético do estágio (6 ms) passa.
+      expect(run({}).failed.some((x) => x.label.includes(P95_ESTAGIO))).toBe(false);
+    });
+
+    it('a degradação no estágio também é vista pelo p95 do TURNO — o estágio está dentro do relógio', () => {
+      // O estágio não é medido "ao lado": ele entra no p95 do turno, e por
+      // isso o critério absoluto e a comparação relativa contra o baseline
+      // também reagem. Aqui isso é afirmado sobre o número, não sobre a
+      // intenção: um turno de 40 ms cujo estágio custa 900 ms é impossível.
+      const arm = syntheticPassingArm('cold', TH);
+      expect(arm.scope_p95_ms).toBeLessThanOrEqual(arm.p95_ms);
+      expect(arm.reads_per_turn_min).toBe(10 + SCOPE_READS_PER_TURN);
+    });
+
+    it('o número de leituras do escopo vem do ORÇAMENTO da #525, não de um literal do gate', () => {
+      // `resolveScope` = `permissoesRepo.forPessoa` + `profilesRepo.byIds`:
+      // 2 das 13 queries que `src/agent/turn-context/types.ts` orça.
+      expect(SCOPE_READS_PER_TURN).toBe(2);
+      expect(Object.values(SCOPE_SECTIONS)).toEqual(['scope_permissoes', 'scope_profiles']);
     });
   });
 

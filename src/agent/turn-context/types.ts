@@ -130,6 +130,14 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * Every one of these is independent of scope size: the slope is zero, so an
  * "elephant" tenant's turn costs the same as anyone else's.
  *
+ * Issue #700 — the performance gate (`npm run turn:bench`) measures this whole
+ * boundary, not half of it. Until #700 the harness fabricated the scope in
+ * memory and seeded neither `permissoes` nor `permission_profiles`, so the two
+ * `resolveScope` round-trips counted above were budgeted here and measured
+ * nowhere; the gate now resolves the scope in Postgres inside the turn's clock
+ * and fails when those two reads are missing, duplicated (N+1) or return a
+ * scope that does not match the seeded cardinality.
+ *
  * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
  * `src/db/client.ts` — a bounded read set issued all at once still empties the
  * pool. That is a separate ceiling, `TURN_CONTEXT_MAX_CONCURRENT_READS` below.
