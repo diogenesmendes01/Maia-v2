@@ -155,10 +155,14 @@ npm run admin:typecheck
 npm run test:admin-ui:unit
 npm run test:admin-ui:e2e         # Playwright, projeto `smoke` (exige console no ar)
 npm run test:admin-ui:e2e:ci      # semeia as fixtures das jornadas, monta o artefato
-                                  # standalone (o mesmo do Dockerfile), sobe
-                                  # `node src/admin-ui/server.js`, roda o smoke e derruba
-npm run test:admin-ui:e2e:pendentes  # quarentena que sobrou (#623): só o pareamento de
-                                  # linha, que precisa de um runtime Maia no ar
+                                  # standalone (o mesmo do Dockerfile), sobe DOIS
+                                  # processos — `node src/admin-ui/server.js` e um
+                                  # runtime `scheduler`/grupo `channel` com adapter de
+                                  # canal FALSO —, roda o smoke e derruba. Exige
+                                  # MAIA_STAGING_KEYRING (efêmero) nos dois.
+npm run test:admin-ui:e2e:pendentes  # quarentena (#623): hoje VAZIA — 0 testes. O
+                                  # projeto continua armado para o dia em que algo
+                                  # precise voltar para lá, num diff visível.
 
 # Operational
 npm run doctor                    # diagnóstico READ-ONLY do ambiente (#517) — offline por default

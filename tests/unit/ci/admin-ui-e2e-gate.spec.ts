@@ -82,23 +82,24 @@ const PASSO_QUARENTENA = 'Quarentena da suíte e2e (o que NÃO foi medido)';
 /**
  * Specs e2e que estão FORA do gate.
  *
- * Sobrou UMA, e por um motivo que não é sessão nem fixture: o QR e o código de
- * pareamento são produzidos pelo worker `channel_pairing` do RUNTIME, e o job
- * `admin-ui` sobe só o console. O cabeçalho do arquivo traz a medição (o
- * router só grava um COMANDO em `channel_line_state`) e o critério objetivo de
- * saída, CASO A CASO. A tag também mudou — `@pendente-472` virou
- * `@pendente-runtime`, porque a #472 fechou e o motivo que resta é outro.
+ * VAZIA. As dez jornadas do console são gate bloqueante — pareamento incluído.
  *
- * O que a #623 tinha deixado aqui por DENOMINADOR COMUM — a listagem da linha
- * declarada e a recusa ao papel `viewer`, que não dependem de runtime nenhum —
- * saiu para `channel-lines.spec.ts` e hoje é bloqueante. Esta contabilidade é
- * por ARQUIVO (a lista abaixo, a contagem do piso e o `grep -l` do job), então
- * medir "parte de um arquivo" só é representável separando os arquivos.
+ * A última que restava era `channel-lines-pairing.spec.ts`, e o motivo dela
+ * não era sessão nem fixture: o QR e o código de pareamento são produzidos
+ * pelo worker `channel_pairing` do RUNTIME, e o job `admin-ui` subia só o
+ * console. O critério objetivo de saída que aquele cabeçalho escreveu foi
+ * cumprido — o passo de E2E agora sobe um SEGUNDO processo
+ * (`tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts`, papel
+ * `scheduler` + grupo `channel`) com um adapter de canal FALSO injetado na
+ * construção do `LineSessionManager`, e gera um `MAIA_STAGING_KEYRING`
+ * efêmero compartilhado pelos dois. As duas afirmações têm caso próprio mais
+ * abaixo, contra o workflow e o script lidos do disco.
  *
- * A lista é FIXA de propósito: entrar ou sair dela tem de ser um diff que
- * alguém lê, não um efeito colateral de marcar mais um `describe`.
+ * A lista continua existindo, e vazia ela é MAIS forte, não menos: qualquer
+ * `describe` que volte a carregar a tag reprova a comparação abaixo. Entrar na
+ * quarentena tem de ser um diff que alguém lê.
  */
-const QUARENTENA = ['channel-lines-pairing.spec.ts'] as const;
+const QUARENTENA = [] as const;
 
 /**
  * Quantos CASOS a quarentena inteira contém hoje.
@@ -108,14 +109,13 @@ const QUARENTENA = ['channel-lines-pairing.spec.ts'] as const;
  * já marcado que a décima jornada perdeu dois casos que não precisavam de
  * infra nenhuma: o denominador comum não aparece num diff de lista.
  *
- * Este número fecha esse buraco. Acrescentar um caso ao arquivo marcado passa
- * a reprovar aqui, e a correção é uma das duas — ou o caso não depende do
- * runtime e vai para `channel-lines.spec.ts` (bloqueante), ou ele depende, o
- * cabeçalho ganha o motivo DELE e este número sobe num diff que alguém lê.
- * Descer o número é o caminho normal: é o que acontece quando o runtime com
- * adapter de canal falso subir no job e a quarentena esvaziar.
+ * Zero, e o zero é conferido: um `test(` novo dentro de um arquivo marcado
+ * reprova aqui, e a correção é uma das duas — ou o caso não depende de infra
+ * ausente e nasce bloqueante, ou ele depende, o cabeçalho do arquivo ganha o
+ * motivo DELE numa linha `FORA DO GATE: <título>` e este número sobe num diff
+ * que alguém lê.
  */
-const QUARENTENA_CASOS = 4;
+const QUARENTENA_CASOS = 0;
 
 // ---------------------------------------------------------------------------
 // Leitura do workflow — PARSE de verdade, não reconstrução
@@ -339,6 +339,114 @@ describe('[declaração] o job `admin-ui` do CI existe e é bloqueante', () => {
       `chaves sob namespace da Maia que o contrato não conhece (o boot reprova ` +
         `com contract/unknown): ${desconhecidas.join(', ')}`,
     ).toEqual([]);
+  });
+});
+
+/**
+ * O SEGUNDO PROCESSO e o KEYRING — issue #623.
+ *
+ * Os dois fatos que tiraram a jornada de pareamento da quarentena, cada um com
+ * o seu modo de falha silenciosa:
+ *
+ *   - o runtime some do script e as quatro jornadas passam a reprovar em
+ *     timeout esperando um QR que ninguém produz (ou, pior, alguém "conserta"
+ *     mandando-as de volta para a quarentena);
+ *   - o keyring vira literal no bloco `env:` do workflow. Isso não é estilo:
+ *     `env:` entra na HISTÓRIA do repositório, e é a história que o gitleaks
+ *     varre. Material de chave commitado não sai mais de lá nem revertendo o
+ *     commit.
+ */
+describe('[declaração] o passo de E2E sobe DOIS processos e GERA o keyring (#623)', () => {
+  it('nenhum bloco `env:` do workflow carrega material de chave de pareamento', () => {
+    // O workflow INTEIRO, não só o job `admin-ui`: um `env:` de job ou de
+    // workflow alcança todo processo, e a proibição vale igual.
+    const wf = parseYaml(ci) as {
+      env?: Record<string, unknown>;
+      jobs?: Record<string, { env?: Record<string, unknown>; steps?: PassoDoWorkflow[] }>;
+    };
+    const blocos: Array<Record<string, unknown>> = [];
+    if (wf.env) blocos.push(wf.env);
+    for (const job of Object.values(wf.jobs ?? {})) {
+      if (job.env) blocos.push(job.env);
+      for (const p of job.steps ?? []) if (p.env) blocos.push(p.env);
+    }
+    expect(blocos.length, 'nenhum bloco env: encontrado — a varredura virou no-op').toBeGreaterThan(
+      5,
+    );
+    const chaves = blocos.flatMap((b) => Object.keys(b));
+    expect(
+      chaves.filter((k) => k === 'MAIA_STAGING_KEYRING'),
+      'MAIA_STAGING_KEYRING apareceu num bloco `env:`. Ela é material de chave: ' +
+        'o gitleaks varre a HISTÓRIA do repositório, e um segredo commitado ' +
+        'não é removível por revert. Gere-a no `run:` do passo (openssl rand) ' +
+        'e exporte para os dois processos.',
+    ).toEqual([]);
+  });
+
+  it('o passo de E2E GERA o keyring e o exporta para os dois processos', () => {
+    const run = passo(PASSO_E2E).run ?? '';
+    expect(
+      run,
+      'o passo deixou de gerar o keyring. Sem ele `isPairingMaterialConfigured()` ' +
+        'devolve false, o console desabilita o CTA "Parear" e as quatro ' +
+        'jornadas de pareamento reprovam em "botão desabilitado".',
+    ).toMatch(/openssl\s+rand/);
+    expect(run).toMatch(/export\s+[^\n]*MAIA_STAGING_KEYRING/);
+    expect(run).toMatch(/MAIA_STAGING_ACTIVE_KEY_ID/);
+    // O valor gerado nunca deve aparecer cru no log do job.
+    expect(run, 'o keyring gerado não está mascarado no log').toContain('::add-mask::');
+  });
+
+  it('o script exige o keyring — não degrada para "pareamento indisponível" em silêncio', () => {
+    expect(
+      scriptE2eExecutavel,
+      'scripts/admin-ui-e2e.sh parou de exigir MAIA_STAGING_KEYRING. Sem a ' +
+        'exigência, um job sem keyring rodaria a suíte inteira e reprovaria ' +
+        'nas jornadas de pareamento com a mensagem errada.',
+    ).toMatch(/MAIA_STAGING_KEYRING/);
+  });
+
+  it('o script EXECUTA o runtime com o grupo de jobs `channel` e o papel `scheduler`', () => {
+    expect(
+      varDoScript('RUNTIME_ENTRYPOINT'),
+      'scripts/admin-ui-e2e.sh perdeu o entrypoint do segundo processo — o ' +
+        'worker `channel_pairing` é quem produz o QR e o código',
+    ).toBe('tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts');
+    // EXECUTA, e não apenas declara. MEDIDO: trocando só a linha do `exec` por
+    // um `sleep`, a asserção anterior (que olhava o texto do script) seguia
+    // verde e o runtime nunca subia — o mesmo formato do caso que já cobre
+    // `exec node "$SERVIDOR_REL"` para o console.
+    expect(
+      scriptE2eExecutavel,
+      'o script declara o entrypoint do runtime mas não o executa',
+    ).toMatch(/exec node --import tsx "\$RUNTIME_ENTRYPOINT"/);
+    // `node --import tsx` e NÃO `npx tsx`: o wrapper spawna um segundo
+    // processo, e o `kill` do trap alcança só o pai. MEDIDO: com `npx tsx`,
+    // cada execução deixava um runtime órfão vivo reivindicando comandos com
+    // o keyring da rodada anterior.
+    expect(
+      scriptE2eExecutavel,
+      'o runtime voltou a subir por `npx tsx` — o trap não consegue encerrar o ' +
+        'processo neto, e o órfão continua reivindicando comandos da fila',
+    ).not.toMatch(/npx\s+tsx\s+"\$RUNTIME_ENTRYPOINT"/);
+    expect(scriptE2eExecutavel).toMatch(/MAIA_SCHEDULER_GROUPS=channel/);
+    expect(scriptE2eExecutavel).toMatch(/MAIA_PROCESS_ROLE=scheduler/);
+    // Esperar a PRONTIDÃO, e não dormir: a suíte não pode começar numa janela
+    // em que o cron de canal ainda não existe.
+    expect(
+      scriptE2eExecutavel,
+      'o script não espera o runtime ficar pronto — a primeira jornada mediria ' +
+        'uma fila que ninguém drena',
+    ).toContain('maia.ready');
+  });
+
+  it('o entrypoint do runtime do job fica FORA do que a imagem copia', () => {
+    // O adapter de canal falso é "prova de posse fabricada": ele não pode
+    // existir no artefato de produção. O Dockerfile da raiz copia dist/,
+    // migrations/, scripts/ e src/ — `tests/` não entra, e é por isso que o
+    // entrypoint mora lá. A checagem completa (grafo de imports + Dockerfile)
+    // está em `tests/unit/gateway/pairing-adapter-seam.spec.ts`.
+    expect(varDoScript('RUNTIME_ENTRYPOINT')).toMatch(/^tests\//);
   });
 });
 
@@ -594,6 +702,23 @@ describe('[declaração] a quarentena `@pendente-runtime` não cresce em silênc
     // dois casos fora do gate sem que ninguém conseguisse checar se ela valia
     // para todos; renomear um caso sem revisitar o motivo dele reproduziria a
     // mesma meia-verdade, e é isso que a comparação de títulos impede.
+    if (QUARENTENA.length === 0) {
+      // A quarentena vazia não torna este caso decorativo: ela move a
+      // afirmação para "não há motivo a justificar PORQUE não há caso fora do
+      // gate". As duas metades precisam concordar — uma lista vazia com
+      // `QUARENTENA_CASOS > 0` seria contabilidade quebrada.
+      expect(QUARENTENA_CASOS).toBe(0);
+      const comMotivo = arquivos.filter((f) =>
+        /^ \* {3}FORA DO GATE: /m.test(readFileSync(join(E2E_DIR, f), 'utf8')),
+      );
+      expect(
+        comMotivo,
+        'um arquivo ainda declara motivo de quarentena, mas a quarentena está ' +
+          'vazia. Ou o motivo sobrou de um estado antigo (apague-o), ou o ' +
+          'arquivo devia estar marcado e não está.',
+      ).toEqual([]);
+      return;
+    }
     for (const f of QUARENTENA) {
       const fonte = readFileSync(join(E2E_DIR, f), 'utf8');
       const cabecalho = fonte.split('*/')[0] ?? '';

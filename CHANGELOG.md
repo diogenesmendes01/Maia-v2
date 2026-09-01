@@ -4,6 +4,66 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Console: o pareamento sai da quarentena — um segundo processo no job ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), terceira parte)
+
+**O que estava acontecendo.** Sobravam quatro casos fora do gate, e o motivo era
+real: o QR e o código de 8 dígitos não são produzidos pelo console.
+`channelLines.startPairing` grava um COMANDO em `channel_line_state` e devolve;
+quem abre a sessão, produz o material e o cifra com `MAIA_STAGING_KEYRING` é o
+worker `channel_pairing` do RUNTIME — e o job subia **um processo só**.
+
+**O que muda.** `scripts/admin-ui-e2e.sh` passa a subir **dois**: o artefato
+standalone do console e um runtime Maia (`src/index.ts`, papel `scheduler`,
+`MAIA_SCHEDULER_GROUPS=channel`), compartilhando `DATABASE_URL`, `REDIS_URL` e um
+`MAIA_STAGING_KEYRING` **efêmero**. É a partilha do keyring que faz o envelope
+selado pelo runtime ABRIR no console — chaves diferentes produziriam
+`material: null` com um countdown correndo na tela. A quarentena fica **vazia**:
+`QUARENTENA_CASOS` vai de `4` para `0` e `TEST_ADMIN_UI_MIN_TESTS` de `31` para
+`35`.
+
+**A costura, e por que ela não é uma chave de configuração.**
+`LineSessionManager.startPairingSession` chamava `makeWASocket` direto. Agora o
+adapter de canal (`PairingChannelAdapter`: auth state + versão + socket) é
+parâmetro de **construção**, com o Baileys como default, e o adapter FALSO é
+injetado pelo entrypoint `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts`.
+Não é estilo: provar posse da linha é o que AUTORIZA essa linha a rotear, e
+"pareamento provado por socket falso" é fail-open exatamente aí. Como chave de
+contrato viraria configuração documentada do produto — um interruptor que desliga
+a prova de posse, alcançável por env var num container. Como fábrica injetada num
+entrypoint que só o teste executa, não há caminho de produção até ela.
+`tests/unit/gateway/pairing-adapter-seam.spec.ts` guarda a propriedade em cinco
+camadas: com TODA variável do contrato ligada o manager continua abrindo pelo
+Baileys; o contrafactual mostra que o adapter instalado É usado (sem ele o
+primeiro caso seria vácuo); o código-fonte do manager lê exatamente
+`MAIA_MULTI_LINE` e `BAILEYS_AUTH_DIR` e nada mais; nada em `src/` ou `scripts/`
+alcança o adapter falso nem chama o instalador; e o `Dockerfile`, lido do disco,
+não copia `tests/` para a imagem.
+
+**O keyring é GERADO no passo, nunca literal.** `MAIA_STAGING_KEYRING` é material
+de chave, e um bloco `env:` entra na HISTÓRIA do repositório — que é o que o
+gitleaks varre, e de onde um segredo não sai nem revertendo o commit. O passo o
+cria com `openssl rand -base64 32`, mascara o valor com `::add-mask::` e o
+exporta para os dois processos. O guard do gate reprova qualquer
+`MAIA_STAGING_KEYRING` em `env:`, em qualquer job do workflow.
+
+**O caso da degradação honesta foi REESCRITO, não apagado.** Ele afirmava "sem
+keyring o console declara o pareamento indisponível e DESABILITA o CTA" — a
+premissa da quarentena virada asserção, desenhada para ficar vermelha no dia em
+que o keyring entrasse no job. Esse dia é este commit. A propriedade que ele
+guardava continua valendo, e o que mudou foi onde a falta pode ser produzida com
+um console só no ar: antes era a chave AUSENTE, agora é o envelope que a chave
+presente NÃO ABRE (`staging_key_unavailable` — chave rotacionada e removida com
+rows ainda referenciando-a). A tela degrada FECHADO: nem QR, nem código, nem
+conteúdo parcial. A anti-vacuidade é o número de BYTES de material que a fixture
+deixou na tabela — o console TINHA material e RECUSOU.
+
+**Um defeito que a sonda encontrou no próprio harness.** Com `npx tsx`, o runtime
+subia como PROCESSO NETO e o `kill` do trap alcançava só o pai: cada execução
+deixava um órfão vivo, reivindicando comandos da fila com o keyring da execução
+ANTERIOR. O sintoma era a jornada do código de 8 dígitos reprovando com
+`material: null` e um countdown correndo. Agora é `node --import tsx` — um
+processo só —, e o guard do gate recusa a volta do `npx tsx`.
+
 ### Console: a décima jornada, medida caso a caso ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), segunda parte)
 
 **O que estava acontecendo.** A primeira parte da #623 tirou nove jornadas da

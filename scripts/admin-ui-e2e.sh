@@ -33,7 +33,9 @@
 #   - sem build em src/admin-ui/.next        -> falha
 #   - sem artefato standalone / sem estático -> falha
 #   - sem DATABASE_URL / REDIS_URL           -> falha
+#   - sem MAIA_STAGING_KEYRING               -> falha
 #   - fixtures das jornadas não semeiam      -> falha
+#   - runtime não fica pronto no prazo       -> falha, com o log do runtime
 #   - servidor não responde no prazo         -> falha, com o log do servidor
 #   - Playwright reprova                     -> falha
 #   - Playwright executou 0 teste ou pulou   -> falha (check-playwright-run.ts)
@@ -44,6 +46,28 @@
 # O env do console vem de QUEM CHAMA (o job do CI define o bloco no passo, não
 # no job — uma variável no `env:` de um job alcança todo processo dele, e
 # `src/config/validate.ts` reprova chave desconhecida sob prefixo da Maia).
+#
+# ─────────────────────────────────────────────────────────────────────────
+# DOIS processos, e por quê (issue #623)
+# ─────────────────────────────────────────────────────────────────────────
+# O console não gera QR nem código de pareamento: `channelLines.startPairing`
+# grava um COMANDO em `channel_line_state` e devolve. Quem abre a sessão,
+# produz o material e o CIFRA é o worker `channel_pairing`, que vive no
+# RUNTIME. Com um processo só, quatro casos da jornada de pareamento ficavam
+# fora do gate — era a última quarentena da #623.
+#
+# Este script sobe os DOIS, compartilhando `DATABASE_URL`, `REDIS_URL` e
+# `MAIA_STAGING_KEYRING` (é a partilha do keyring que faz o envelope selado
+# pelo runtime ABRIR no console). O runtime entra no papel `scheduler` com o
+# grupo de jobs `channel`: nada de HTTP, nada de fila BullMQ, nada de socket
+# primário — só os crons de canal, que é o que o pareamento precisa.
+#
+# O adapter de canal é FALSO, e não por configuração: o entrypoint
+# `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts` o injeta na
+# CONSTRUÇÃO do LineSessionManager. Ver o cabeçalho daquele arquivo e
+# `tests/unit/gateway/pairing-adapter-seam.spec.ts` — "pareamento provado por
+# socket falso" alcançável por env var seria fail-open no ponto exato em que
+# provar posse AUTORIZA uma linha a rotear.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -62,6 +86,12 @@ ESPERA_S="${TEST_ADMIN_UI_BOOT_TIMEOUT_S:-120}"
 MINIMO="${TEST_ADMIN_UI_MIN_TESTS:-1}"
 RELATORIO=".playwright-report/admin-ui.json"
 LOG_SERVIDOR="$(mktemp -t admin-ui-e2e-XXXXXX.log)"
+LOG_RUNTIME="$(mktemp -t admin-ui-e2e-runtime-XXXXXX.log)"
+ESPERA_RUNTIME_S="${TEST_ADMIN_UI_RUNTIME_TIMEOUT_S:-180}"
+# O entrypoint do SEGUNDO processo. Fica sob `tests/` de propósito: o
+# Dockerfile copia dist/, migrations/, scripts/ e src/ — `tests/` não entra,
+# então o adapter de canal falso não existe na imagem de produção.
+RUNTIME_ENTRYPOINT="tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts"
 
 # Raiz do artefato standalone: é o `/app` do container (o Dockerfile faz
 # `COPY --from=build /app/src/admin-ui/.next/standalone ./`).
@@ -94,6 +124,22 @@ for var in DATABASE_URL REDIS_URL NEXTAUTH_SECRET; do
     exit 1
   fi
 done
+# O keyring é PRÉ-REQUISITO, não opcional: sem ele `isPairingMaterialConfigured()`
+# devolve false, o console DESABILITA o CTA e as quatro jornadas de pareamento
+# reprovariam em "botão desabilitado" — a mensagem errada para a causa certa.
+# Ele nunca é literal no workflow (o gitleaks varre a HISTÓRIA do repositório,
+# e material de chave commitado não sai mais de lá): quem o gera é o passo do
+# job, com `openssl rand`, e exporta para os dois processos.
+for var in MAIA_STAGING_KEYRING MAIA_STAGING_ACTIVE_KEY_ID; do
+  if [ -z "${!var:-}" ]; then
+    echo "::error::$var não está definida. O QR e o código de pareamento só trafegam CIFRADOS: o runtime sela o envelope e o console o abre com a MESMA chave. Gere um keyring EFÊMERO antes de chamar este script (openssl rand -base64 32) e exporte as duas variáveis." >&2
+    exit 1
+  fi
+done
+if [ ! -f "$RUNTIME_ENTRYPOINT" ]; then
+  echo "::error::sem $RUNTIME_ENTRYPOINT — é o entrypoint do runtime com adapter de canal falso; sem ele ninguém produz QR nem código e as jornadas de pareamento mediriam uma tela vazia." >&2
+  exit 1
+fi
 
 # ─── montagem do artefato (os dois COPY do Dockerfile) ─────────────────────
 # O `next build` NÃO põe o estático dentro do standalone: quem faz isso é a
@@ -117,6 +163,71 @@ cp -R "src/admin-ui/.next/static" "$ESTATICO_DESTINO"
 echo "▸ semeando as fixtures das jornadas (#623)"
 npx tsx scripts/seed-admin-ui-e2e-fixtures.ts
 
+# ─── runtime (segundo processo) ────────────────────────────────────────────
+# Papel `scheduler` + grupo `channel`: o inventário exato de que o pareamento
+# precisa. Os outros dois jobs do grupo (`mcp_sync`, `synthetic_probe`) são
+# no-op na primeira linha — as flags deles nascem OFF.
+#
+# As duas `MAIA_*` são exportadas DENTRO do subshell, e não no ambiente do
+# script: `MAIA_PROCESS_ROLE`/`MAIA_SCHEDULER_GROUPS` descrevem ESTE processo,
+# e vazá-las para o console faria o artefato standalone bootar com um papel
+# que ele não tem.
+#
+# `node --import tsx` e NÃO `npx tsx`: o wrapper `npx tsx` é um processo que
+# SPAWNA outro (`node --require .../preflight.cjs --import .../loader.mjs`), e
+# o `kill` do trap alcança só o pai. MEDIDO nesta árvore: com `npx tsx`, cada
+# execução deixava um runtime ÓRFÃO vivo, e o órfão continuava reivindicando
+# comandos de `channel_line_state` — com o keyring da execução ANTERIOR. O
+# material selado por ele não abria no console da execução nova, e a jornada do
+# código de 8 dígitos reprovava com `material: null` e um countdown correndo na
+# tela. Um processo só, e o trap o encerra de verdade.
+echo "▸ subindo o runtime (papel scheduler, grupo channel, adapter de canal FALSO) — log: ${LOG_RUNTIME}"
+(
+  export MAIA_PROCESS_ROLE=scheduler
+  export MAIA_SCHEDULER_GROUPS=channel
+  exec node --import tsx "$RUNTIME_ENTRYPOINT"
+) >"$LOG_RUNTIME" 2>&1 &
+PID_RUNTIME=$!
+
+encerrar_runtime() {
+  if kill -0 "$PID_RUNTIME" 2>/dev/null; then
+    # SIGTERM e não SIGKILL: o runtime tem sequência de drain própria
+    # (`installSignalHandlers`), e matá-lo à força deixaria a lease de posse
+    # das linhas viva no Postgres até vencer — a próxima execução veria um
+    # canal "ocupado" por uma instância que já morreu.
+    kill "$PID_RUNTIME" 2>/dev/null || true
+    wait "$PID_RUNTIME" 2>/dev/null || true
+  fi
+}
+trap encerrar_runtime EXIT INT TERM
+
+runtime_pronto=0
+for _ in $(seq 1 "$ESPERA_RUNTIME_S"); do
+  if ! kill -0 "$PID_RUNTIME" 2>/dev/null; then
+    echo "::error::o runtime morreu durante o boot. Log:" >&2
+    cat "$LOG_RUNTIME" >&2
+    exit 1
+  fi
+  # `maia.ready` é a transição de lifecycle que só acontece DEPOIS de config,
+  # banco, schema, Redis e o agendador de crons estarem prontos
+  # (`src/index.ts`, passo 10). Esperar por ela — e não por um `sleep` — é o
+  # que impede a suíte de medir uma janela em que o worker `channel_pairing`
+  # ainda não existe: o operador clicaria "Iniciar pareamento" e o comando
+  # ficaria na fila até o timeout de 15s do teste.
+  if grep -q '"msg":"maia.ready"' "$LOG_RUNTIME" 2>/dev/null; then
+    runtime_pronto=1
+    break
+  fi
+  sleep 1
+done
+
+if [ "$runtime_pronto" -ne 1 ]; then
+  echo "::error::o runtime não ficou pronto em ${ESPERA_RUNTIME_S}s. Log:" >&2
+  cat "$LOG_RUNTIME" >&2
+  exit 1
+fi
+echo "▸ runtime pronto"
+
 # ─── servidor ──────────────────────────────────────────────────────────────
 echo "▸ subindo o artefato standalone em http://localhost:${PORTA} (log: ${LOG_SERVIDOR})"
 (
@@ -132,11 +243,14 @@ echo "▸ subindo o artefato standalone em http://localhost:${PORTA} (log: ${LOG
 ) >"$LOG_SERVIDOR" 2>&1 &
 PID_SERVIDOR=$!
 
+# UM trap para os DOIS processos: `trap` SUBSTITUI o handler anterior, então
+# registrar um por processo deixaria o runtime órfão a cada saída.
 encerrar() {
   if kill -0 "$PID_SERVIDOR" 2>/dev/null; then
     kill "$PID_SERVIDOR" 2>/dev/null || true
     wait "$PID_SERVIDOR" 2>/dev/null || true
   fi
+  encerrar_runtime
 }
 trap encerrar EXIT INT TERM
 
@@ -177,6 +291,8 @@ PLAYWRIGHT_BASE_URL="http://localhost:${PORTA}" \
 
 echo "▸ log do console durante a suíte:"
 cat "$LOG_SERVIDOR"
+echo "▸ log do runtime durante a suíte:"
+cat "$LOG_RUNTIME"
 
 # O guard de volume roda MESMO com o Playwright reprovando: "0 executados" e
 # "3 reprovados" são diagnósticos diferentes e os dois precisam aparecer.
