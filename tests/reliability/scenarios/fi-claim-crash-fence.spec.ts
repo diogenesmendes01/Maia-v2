@@ -20,9 +20,12 @@
  *   FI-05 — falha: `SIGKILL` no dono, parado num failpoint exato.
  *           reação provada: a lease vence e o SUCESSOR assume, com
  *           `attempt_count = 2` e token novo.
- *           controle: ANTES do vencimento o sucessor é RECUSADO, várias vezes,
- *           e as recusas estão no stdout dele. Sem isso, "o sucessor assumiu"
- *           também passaria num sistema sem lease nenhuma.
+ *           controle: o sucessor sobe ANTES do crash e é RECUSADO várias vezes
+ *           com o dono PROVADAMENTE vivo; as recusas estão no stdout dele. Sem
+ *           isso, "o sucessor assumiu" também passaria num sistema sem lease
+ *           nenhuma. (A ordem — sucessor antes do `SIGKILL` — é da fatia F:
+ *           subi-lo depois fazia o controle depender de o import a frio caber
+ *           no TTL, e isso flocava.)
  *
  *   FI-06 — falha: o heartbeat do dono para, mas o processo NÃO morre
  *           (`SIGSTOP`).
@@ -366,6 +369,36 @@ d('#510 FI-04/05/06/07 — claim, crash e fence com réplicas de PROCESSO', () =
       const antesDoCrash = await oracle.coletar();
       const linhaAntes = await linhaDoTurno(turn_id);
 
+      // ── O SUCESSOR SOBE ANTES DO CRASH, e a ordem é o que torna o controle
+      //    DETERMINÍSTICO (#510, fatia F).
+      //
+      // A ordem anterior — matar e só então subir o sucessor — fazia o controle
+      // ("antes do prazo ele é RECUSADO") depender de o import a frio do grafo
+      // de produção caber dentro do TTL da lease. O import custa de 1.9s a 6.8s
+      // (`AGENTS.md` §7.1) e o TTL aqui é 6s: numa rodada lenta o sucessor
+      // terminava de importar DEPOIS do vencimento e entrava na primeira
+      // tentativa, sem nunca ter sido barrado — flake observado em rodadas
+      // seguidas da lane. Subir antes tira o relógio do caminho, e o controle
+      // fica mais forte: as recusas são observadas com o dono PROVADAMENTE
+      // vivo, e não só "antes do prazo".
+      const b = subirReplica('sucessor', turn_id, {
+        TEST_FI_TENTATIVAS: '200',
+        TEST_FI_INTERVALO_MS: '250',
+      });
+      const recusasAntesDoCrash = await eventually(
+        () => {
+          const t = linhasDe(b, '##fi-claim##').filter((x) => x.result !== 'acquired');
+          return t.length >= 2 ? t : undefined;
+        },
+        {
+          label: 'o sucessor é RECUSADO enquanto o dono VIVO segura a lease',
+          timeoutMs: 60_000,
+          abortSignal: sup.sinalDeFalha,
+          describeState: () => ({ stdout: b.stdout.split('\n').slice(-6) }),
+        },
+      );
+      for (const r of recusasAntesDoCrash) expect(r.result).toBe('not_eligible');
+
       // A FALHA: `SIGKILL` num processo PARADO num ponto exato do caminho.
       sup.hardKill(a);
       const enc = await a.esperarSaida(10_000);
@@ -380,19 +413,16 @@ d('#510 FI-04/05/06/07 — claim, crash e fence com réplicas de PROCESSO', () =
       expect(logoApos.attempt_count).toBe(1);
       expect(await jaVenceu(logoApos.lease_expires_at)).toBe(false);
 
-      // O SUCESSOR. Ele insiste; o banco decide quando ele entra.
-      const b = subirReplica('sucessor', turn_id, {
-        TEST_FI_TENTATIVAS: '80',
-        TEST_FI_INTERVALO_MS: '250',
-      });
-      // O gate já foi consumido pelo dono morto (`remaining: 1`), então o
-      // sucessor passa direto por ele.
+      // O SUCESSOR — já vivo e insistindo desde antes do crash — assume quando o
+      // BANCO deixa. O gate já foi consumido pelo dono morto (`remaining: 1`),
+      // então ele passa direto por ele.
       const pb = await prontidaoDe(b);
       expect(pb.acquired, `o sucessor nunca assumiu: ${JSON.stringify(pb)}`).toBe(true);
 
-      // O CONTROLE que impede o vácuo: ANTES do vencimento ele foi RECUSADO,
-      // e as recusas estão no stdout dele. Sem elas, "o sucessor assumiu"
-      // também passaria num sistema que nunca teve lease nenhuma.
+      // O CONTROLE que impede o vácuo, agora contado sobre a corrida inteira:
+      // ele foi RECUSADO várias vezes antes de entrar, e todas as recusas têm
+      // o mesmo motivo. Sem elas, "o sucessor assumiu" também passaria num
+      // sistema que nunca teve lease nenhuma.
       const tentativas = linhasDe(b, '##fi-claim##');
       const recusas = tentativas.filter((t) => t.result !== 'acquired');
       expect(
