@@ -85,3 +85,16 @@ export {
 export type { AlvoDestrutivo, EstadoDoAmbiente, OpcoesDoAmbiente, SeedDeTenant } from './environment.js';
 
 export { SEED_ENV, SeededRandom, ordemDeFaults, seedDaRodada } from './seeded-faults.js';
+
+// #510 (fatia E) — o INGRESSO real: injeta um inbound pela porta de produção e
+// acompanha `mensagem_id`/`turn_id`/`conversa_id`/job da BullMQ até o estado
+// terminal. É o que destrava FI-01/02/03 e a família FIFO.
+export { FIXTURE_DO_MOTOR, TurnDriver } from './turn-driver.js';
+export type {
+  AlvoDeIngresso,
+  EnvDoMotor,
+  IdsDoTurno,
+  JobObservado,
+  LinhaDoTurno,
+  OpcoesDoTurnDriver,
+} from './turn-driver.js';
