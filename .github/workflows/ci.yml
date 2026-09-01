@@ -486,7 +486,37 @@ jobs:
         # console: um gate que fica verde por ausência de trabalho não é gate.
         # Quando o e2e de backend voltar, ele nasce com este piso e com sonda
         # vermelha — não antes.
-        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --rotulo "integração (node ${{ matrix.node }})"
+        #
+        # ── E por que o teto de pulados é ZERO nesta lane ────────────────────
+        #
+        # `--min 1` sozinho reprova a rodada VAZIA e nada mais. Ele não vê
+        # cento e vinte casos rodarem enquanto dez somem: `executados` continua
+        # muito acima do piso, e o gate aprova sorrindo. É o modo de falha que
+        # esta lane tem de temer, porque aqui `describe.skip` NÃO é uma escolha
+        # do autor do teste — é o que 121 arquivos fazem quando falta
+        # infraestrutura. O padrão é sempre a mesma expressão:
+        #
+        #     const SHOULD_RUN = !!process.env.TEST_DB_URL
+        #       && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+        #     const d = SHOULD_RUN ? describe : describe.skip;
+        #
+        # Some uma das duas variáveis do bloco `env:` deste job, ou o serviço
+        # do Postgres muda de porta, ou o runtime de container que os specs de
+        # `testcontainers` procuram deixa de existir — e a lane inteira vira
+        # `describe.skip` sem que uma linha vermelha apareça. Um gate que passa
+        # quando o banco falta é exatamente o verde vazio que ele deveria
+        # impedir.
+        #
+        # ZERO não é uma meta: é o número que esta lane JÁ tem. A rodada de
+        # `b79d4d93` deu `executados=1207  falharam=0  pulados=0` nas duas
+        # pernas da matriz. O teto não aperta nada hoje; ele impede que a
+        # perda seja silenciosa amanhã.
+        #
+        # Se algum dia um skip legítimo aparecer aqui, o caminho é subir o teto
+        # NESTA linha, com o motivo escrito ao lado — uma decisão visível no
+        # diff, como a catraca de exceções de egresso da #506. O que não pode
+        # é a lane perder cobertura sem ninguém assinar embaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --max-pulados 0 --rotulo "integração (node ${{ matrix.node }})"
 
       - name: Resumo dos testes
         # Mesma razão do job `validate` — e aqui o problema é pior, porque este
