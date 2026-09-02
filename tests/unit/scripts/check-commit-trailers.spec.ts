@@ -185,6 +185,79 @@ describe('mensagensDaPr lê os commits do intervalo sem partir a mensagem', () =
     }
   });
 
+  it('um base.sha DESATUALIZADO não faz o guard julgar a história já mergeada da main', () => {
+    // O cenário real que este caso congela: a `main` deste repositório carrega
+    // ~194 trailers de IA da regra antiga do AGENTS.md. Depois de um "update
+    // branch", o head da PR contém commits da main — e o `base.sha` do payload
+    // do GitHub pode vir velho. Se o guard usasse esse sha, ele reprovaria a
+    // PR mandando reescrever commits que não são dela. O que o salva é
+    // preferir o tip ATUAL de `refs/remotes/origin/<base.ref>`.
+    const dir = mkdtempSync(join(tmpdir(), 'trailers-stale-'));
+    const git = (...args: string[]) =>
+      execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
+    try {
+      git('init', '--quiet', '--initial-branch=main');
+      git('config', 'user.email', 'teste@exemplo.invalid');
+      git('config', 'user.name', 'Teste');
+      git('config', 'commit.gpgsign', 'false');
+
+      writeFileSync(join(dir, 'f'), 'a\n');
+      git('add', '.');
+      git('commit', '--quiet', '-m', 'c0');
+      const baseVelha = git('rev-parse', 'HEAD');
+
+      git('checkout', '--quiet', '-b', 'feature');
+      writeFileSync(join(dir, 'f'), 'b\n');
+      git('add', '.');
+      git('commit', '--quiet', '-m', 'feat: commit limpo da PR');
+
+      git('checkout', '--quiet', 'main');
+      writeFileSync(join(dir, 'g'), 'c\n');
+      git('add', '.');
+      // O commit "antigo da main", com o trailer da regra antiga.
+      git(
+        'commit',
+        '--quiet',
+        '-m',
+        'feat: já mergeado (#600)\n\nCo-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>',
+      );
+      const mainAtual = git('rev-parse', 'HEAD');
+
+      git('checkout', '--quiet', 'feature');
+      git('merge', '--quiet', '--no-edit', 'main');
+      const head = git('rev-parse', 'HEAD');
+
+      // O payload mente (base.sha = c0, velho); o clone sabe a verdade.
+      git('update-ref', 'refs/remotes/origin/main', mainAtual);
+      const evento = join(dir, 'evento.json');
+      writeFileSync(
+        evento,
+        JSON.stringify({
+          pull_request: { base: { sha: baseVelha, ref: 'main' }, head: { sha: head } },
+        }),
+      );
+      const require_ = createRequire(import.meta.url);
+      const tsx = join(dirname(require_.resolve('tsx/package.json')), 'dist/cli.mjs');
+      const script = join(import.meta.dirname, '../../../scripts/check-commit-trailers.ts');
+      const r = spawnSync(process.execPath, [tsx, script], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: { ...process.env, GITHUB_EVENT_PATH: evento, VITEST: undefined },
+      });
+      const saida = `${r.stdout}${r.stderr}`;
+
+      expect(
+        r.status,
+        `o guard julgou história já mergeada da main — exatamente o que ele promete não fazer. Saída:\n${saida}`,
+      ).toBe(0);
+      // Anti-vacuidade do próprio caso: ele passou porque olhou SÓ o commit da
+      // PR, não porque não olhou nada.
+      expect(saida).toContain('1 de 2 commit(s) do intervalo inspecionado(s)');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('acha o trailer no fim de uma mensagem de vários parágrafos, e só os commits do intervalo', () => {
     const repo = repoTemporario();
     try {

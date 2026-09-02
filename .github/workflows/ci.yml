@@ -191,7 +191,10 @@ jobs:
       # defeito da mudança, não um detalhe de estilo, e não deve custar oito
       # minutos de build para aparecer.
       #
-      # O `fetch` existe porque o checkout de PR vem com profundidade 1: sem
+      # O fetch busca o REF de base (tip atual), não o `base.sha` do payload:
+      # o sha do evento pode vir desatualizado e faria o guard julgar commits
+      # que já estão na main — que carrega ~194 trailers da regra antiga.
+      # O `fetch` também existe porque o checkout de PR vem com profundidade 1: sem
       # ele, `git log base..head` não resolve e o script REPROVA em vez de
       # passar vazio. Profundidade fixa (não `--unshallow`) para não pagar o
       # clone inteiro num job que roda em toda PR.
@@ -199,7 +202,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags --quiet --depth=100 origin \
-            '${{ github.event.pull_request.base.sha }}' \
+            '+refs/heads/${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}' \
             '${{ github.event.pull_request.head.sha }}'
           npm run commit:trailers:check
 

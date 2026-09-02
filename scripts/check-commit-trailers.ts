@@ -51,7 +51,7 @@
  * cujo dia de serem fechadas será o dia em que aparecerem.
  */
 import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 /** Endereços que não pertencem a pessoa nenhuma. Sozinhos já reprovam. */
 const EMAILS_DE_ASSISTENTE = new Set([
@@ -140,8 +140,16 @@ export function mensagensDaPr(base: string, head: string): { sha: string; mensag
 }
 
 type EventoDePr = {
-  pull_request?: { base?: { sha?: string }; head?: { sha?: string } } | null;
+  pull_request?: { base?: { sha?: string; ref?: string }; head?: { sha?: string } } | null;
 };
+
+/** `git rev-parse --verify` silencioso: o rev existe neste clone? */
+export function revExiste(rev: string): boolean {
+  const r = spawnSync('git', ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], {
+    encoding: 'utf8',
+  });
+  return r.status === 0;
+}
 
 function main(): void {
   const eventPath = process.env.GITHUB_EVENT_PATH;
@@ -159,15 +167,29 @@ function main(): void {
     return;
   }
 
+  // O lado esquerdo do intervalo é o TIP ATUAL do branch de base, não o
+  // `base.sha` do payload. O payload pode vir desatualizado (documentado e
+  // observado, tipicamente logo depois de um update branch), e aí `base..head`
+  // passa a incluir commits da própria `main` trazidos pelo merge — história
+  // já mergeada, que este guard promete não julgar. Não é hipótese: a `main`
+  // deste repositório carrega ~194 trailers de IA da regra antiga do
+  // AGENTS.md, então um `base.sha` velho faria o guard reprovar uma PR
+  // inocente mandando reescrever commits que não são dela. O passo do CI
+  // busca `refs/remotes/origin/<base.ref>` exatamente para isto; o `base.sha`
+  // fica como fallback para quem roda o script fora do CI.
+  const baseRef = evento.pull_request?.base?.ref;
+  const refRemoto = baseRef ? `refs/remotes/origin/${baseRef}` : '';
+  const ladoEsquerdo = refRemoto && revExiste(refRemoto) ? refRemoto : base;
+
   let commits: { sha: string; mensagem: string }[];
   try {
-    commits = mensagensDaPr(base, head);
+    commits = mensagensDaPr(ladoEsquerdo, head);
   } catch (err) {
     // Reprovar é o comportamento certo aqui. Um `git log` que não resolve
     // `base..head` é um guard que não olhou para nada — e um guard que não
     // olha para nada não pode reportar "passou".
     console.error(
-      `commit:trailers:check falhou: não consegui listar os commits de ${base.slice(0, 8)}..` +
+      `commit:trailers:check falhou: não consegui listar os commits de ${ladoEsquerdo}..` +
         `${head.slice(0, 8)}. O passo do CI precisa buscar os dois SHAs antes de chamar este ` +
         `script (o checkout de PR vem com profundidade 1). Erro do git: ${String(err)}`,
     );
@@ -187,12 +209,12 @@ function main(): void {
   // em voz alta; se não há commit nenhum entre base e head, o intervalo está
   // errado e o guard reprova em vez de passar mudo.
   const totalNoIntervalo = Number(
-    execFileSync('git', ['rev-list', '--count', `${base}..${head}`], { encoding: 'utf8' }).trim(),
+    execFileSync('git', ['rev-list', '--count', `${ladoEsquerdo}..${head}`], { encoding: 'utf8' }).trim(),
   );
 
   if (totalNoIntervalo === 0) {
     console.error(
-      `commit:trailers:check falhou: o intervalo ${base.slice(0, 8)}..${head.slice(0, 8)} não ` +
+      `commit:trailers:check falhou: o intervalo ${ladoEsquerdo}..${head.slice(0, 8)} não ` +
         'tem commit nenhum. Uma PR sempre tem pelo menos um; um intervalo vazio significa que o ' +
         'guard não olhou para a mudança, e passar assim seria verde sem ter lido nada.',
     );
@@ -219,7 +241,7 @@ function main(): void {
         '`Task Context` ou `Reviewer Notes` da PR.\n\n' +
         'Para corrigir sem reescrever nada já mergeado:\n' +
         '  git rebase -i ' +
-        base.slice(0, 8) +
+        ladoEsquerdo +
         '   # ou `git commit --amend` se for só o último\n' +
         '  # remova a(s) linha(s) acima da mensagem e faça push --force-with-lease\n\n' +
         'Se a instrução veio da configuração da sua sessão de agente, ela contraria o manual\n' +
