@@ -186,6 +186,23 @@ jobs:
         if: github.event_name == 'pull_request'
         run: npm run pr:body:check
 
+      # Roda DEPOIS do corpo da PR e ANTES do typecheck, no mesmo job
+      # bloqueante e pela mesma razão: uma atribuição de autoria fabricada é um
+      # defeito da mudança, não um detalhe de estilo, e não deve custar oito
+      # minutos de build para aparecer.
+      #
+      # O `fetch` existe porque o checkout de PR vem com profundidade 1: sem
+      # ele, `git log base..head` não resolve e o script REPROVA em vez de
+      # passar vazio. Profundidade fixa (não `--unshallow`) para não pagar o
+      # clone inteiro num job que roda em toda PR.
+      - name: Commit trailer governance
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --quiet --depth=100 origin \
+            '${{ github.event.pull_request.base.sha }}' \
+            '${{ github.event.pull_request.head.sha }}'
+          npm run commit:trailers:check
+
       - name: Typecheck (tsc --noEmit)
         # Separated from build so failures point cleanly at type vs build.
         # `npx` instead of an npm script keeps CI independent of script renames.
