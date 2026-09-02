@@ -174,6 +174,31 @@ function main(): void {
     process.exit(1);
   }
 
+  // Anti-vacuidade. Sem isto o guard tem um caminho verde em que ele não olhou
+  // para commit nenhum — e "0 commit(s) inspecionado(s)" sai com exit 0,
+  // indistinguível de "inspecionei e está limpo" para quem só vê a bolinha
+  // verde do check. Foi exatamente essa a dúvida que ficou na primeira rodada
+  // deste guard no CI: o passo ficou verde e não deu para provar, do lado de
+  // fora, que ele tinha lido alguma coisa.
+  //
+  // `--no-merges` pode legitimamente devolver lista vazia numa PR composta só
+  // de merges, então quem decide é a contagem TOTAL do intervalo: se há
+  // commits e nenhum sobrou para inspecionar, são todos merges e isso é dito
+  // em voz alta; se não há commit nenhum entre base e head, o intervalo está
+  // errado e o guard reprova em vez de passar mudo.
+  const totalNoIntervalo = Number(
+    execFileSync('git', ['rev-list', '--count', `${base}..${head}`], { encoding: 'utf8' }).trim(),
+  );
+
+  if (totalNoIntervalo === 0) {
+    console.error(
+      `commit:trailers:check falhou: o intervalo ${base.slice(0, 8)}..${head.slice(0, 8)} não ` +
+        'tem commit nenhum. Uma PR sempre tem pelo menos um; um intervalo vazio significa que o ' +
+        'guard não olhou para a mudança, e passar assim seria verde sem ter lido nada.',
+    );
+    process.exit(1);
+  }
+
   const recusados: { c: Coautor; motivo: string }[] = [];
   for (const { sha, mensagem } of commits) {
     for (const c of coautoresDe(sha, mensagem)) {
@@ -203,9 +228,10 @@ function main(): void {
     process.exit(1);
   }
 
+  const soMerges = commits.length === 0 ? ' (todos são merges, que este guard não julga)' : '';
   console.log(
-    `commit:trailers:check passou: ${commits.length} commit(s) inspecionado(s), ` +
-      'nenhum `Co-Authored-By:` de assistente de IA.',
+    `commit:trailers:check passou: ${commits.length} de ${totalNoIntervalo} commit(s) do ` +
+      `intervalo inspecionado(s)${soMerges}, nenhum \`Co-Authored-By:\` de assistente de IA.`,
   );
 }
 

@@ -15,10 +15,11 @@
  * está aqui: um grep por nome de modelo reprovaria essa pessoa.
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { createRequire } from 'node:module';
 
 import {
   coautoresDe,
@@ -133,6 +134,56 @@ describe('mensagensDaPr lê os commits do intervalo sem partir a mensagem', () =
 
     return { dir, base, head, limpar: () => rmSync(dir, { recursive: true, force: true }) };
   }
+
+  /**
+   * Roda o SCRIPT como o CI roda: processo próprio, `GITHUB_EVENT_PATH`
+   * apontando para um payload de evento. É o único jeito de exercer `main()` —
+   * e é onde mora a asserção anti-vacuidade, que nenhuma função pura alcança.
+   */
+  function rodarScript(dir: string, base: string, head: string): { code: number; saida: string } {
+    const evento = join(dir, 'evento.json');
+    writeFileSync(evento, JSON.stringify({ pull_request: { base: { sha: base }, head: { sha: head } } }));
+    const script = join(import.meta.dirname, '../../../scripts/check-commit-trailers.ts');
+    // Caminho ABSOLUTO do CLI do tsx: o `cwd` do subprocesso é o repositório
+    // temporário (o script lê o git do diretório corrente), e de lá um
+    // especificador nu como `tsx` não resolve.
+    const require_ = createRequire(import.meta.url);
+    const tsx = join(dirname(require_.resolve('tsx/package.json')), 'dist/cli.mjs');
+    const r = spawnSync(process.execPath, [tsx, script], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { ...process.env, GITHUB_EVENT_PATH: evento, VITEST: undefined },
+    });
+    return { code: r.status ?? -1, saida: `${r.stdout}${r.stderr}` };
+  }
+
+  it('REPROVA quando o intervalo não tem commit nenhum — verde vazio é pior que vermelho', () => {
+    const repo = repoTemporario();
+    try {
+      // base === head: o guard não teria olhado para mudança nenhuma.
+      const { code, saida } = rodarScript(repo.dir, repo.head, repo.head);
+      expect(code, `esperava exit 1, veio ${code}. Saída:\n${saida}`).toBe(1);
+      expect(saida).toContain('não tem commit nenhum');
+    } finally {
+      repo.limpar();
+    }
+  });
+
+  it('quando passa, diz QUANTOS commits inspecionou — a bolinha verde sozinha não prova leitura', () => {
+    const repo = repoTemporario();
+    try {
+      // O commit do meio tem o trailer, então este intervalo só pode ser o
+      // último commit — que está limpo.
+      const anterior = execFileSync('git', ['-C', repo.dir, 'rev-parse', 'HEAD~1'], {
+        encoding: 'utf8',
+      }).trim();
+      const { code, saida } = rodarScript(repo.dir, anterior, repo.head);
+      expect(code, `esperava exit 0. Saída:\n${saida}`).toBe(0);
+      expect(saida).toContain('1 de 1 commit(s) do intervalo inspecionado(s)');
+    } finally {
+      repo.limpar();
+    }
+  });
 
   it('acha o trailer no fim de uma mensagem de vários parágrafos, e só os commits do intervalo', () => {
     const repo = repoTemporario();
