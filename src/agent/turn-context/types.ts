@@ -134,9 +134,14 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * boundary, not half of it. Until #700 the harness fabricated the scope in
  * memory and seeded neither `permissoes` nor `permission_profiles`, so the two
  * `resolveScope` round-trips counted above were budgeted here and measured
- * nowhere; the gate now resolves the scope in Postgres inside the turn's clock
- * and fails when those two reads are missing, duplicated (N+1) or return a
- * scope that does not match the seeded cardinality.
+ * nowhere; the gate now resolves the scope in Postgres inside the turn's clock.
+ * Since the #525 owner decision (2026-09-02) the gate's evidence is the
+ * PROPERTY, not the count: it fails when no scope read reaches the per-turn
+ * counter (fabricated scope), when the resolved scope does not match the
+ * seeded cardinality, or when the per-turn statement count GROWS with
+ * cardinality (the O(1) guardrail — which is what catches an N+1, in the
+ * scope stage or anywhere else in the turn). The number of scope reads itself
+ * (2 here; 1 once the reads are fused) is measured and reported, not fixed.
  *
  * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
  * `src/db/client.ts` — a bounded read set issued all at once still empties the
@@ -184,17 +189,28 @@ export const TURN_ROUND_TRIP_BUDGET = 13;
  */
 export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
 
-/**
- * The goal issue #525 sets. NOT yet met — see `docs/architecture/modules/
- * agent.md` for the remaining merges, what each is worth, and why they were not
- * taken in this change (each one needs a cross-table statement that cannot be
- * verified without a live Postgres).
+/*
+ * `TURN_ROUND_TRIP_TARGET` (a meta de ≤8 round-trips) morava aqui. Ela foi
+ * REMOVIDA pela decisão do dono na issue #525 (2026-09-02):
  *
- * Kept in code rather than only in the issue so the gap is greppable from the
- * budget it belongs to, and so closing it is a one-line edit here plus the
- * counts in the spec.
+ * > "escolho reescrever a meta em termos de latência. Não vamos pagar cerca
+ * > de 3× no p95 apenas para atingir ≤8. A contagem continua como guardrail,
+ * > com crescimento O(1); p95, p99, throughput e erros passam a ser os
+ * > critérios principais."
+ *
+ * O que ficou no lugar dela:
+ *
+ *  - a META agora é latência, e vive no gate (`scripts/turn-context-
+ *    benchmark.ts`): p95/p99/throughput/erros por braço e cardinalidade,
+ *    relativos ao baseline com margem nomeada (`MARGEM_RELATIVA_DEFAULT`);
+ *  - a CONTAGEM continua como guardrail de CRESCIMENTO: statements por turno
+ *    O(1) na cardinalidade — `TURN_ROUND_TRIP_BUDGET` acima segue sendo o
+ *    número medido e cobrado exato pela spec de round-trips (é o que impede
+ *    um N+1 de voltar em silêncio), e o gate reprova qualquer contagem que
+ *    cresça de N=1 para N=100;
+ *  - o teto ABSOLUTO é linha de relatório, não critério de aceite: reduzir
+ *    statements só é aceito se p95/p99/throughput não pagarem por isso.
  */
-export const TURN_ROUND_TRIP_TARGET = 8;
 
 /**
  * Item cap for the gap list inside the self-awareness ("## Autoconhecimento")

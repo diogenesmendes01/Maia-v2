@@ -1,11 +1,44 @@
 /**
  * Gate de desempenho da carga de contexto do turno — issue #525.
  *
+ * ## A decisão do dono (2026-09-02): a meta é LATÊNCIA, não contagem
+ *
+ * > "#525: escolho reescrever a meta em termos de latência. Não vamos pagar
+ * > cerca de 3× no p95 apenas para atingir ≤8. A contagem continua como
+ * > guardrail, com crescimento O(1); p95, p99, throughput e erros passam a ser
+ * > os critérios principais. Antes de aceitar a #693, rodem baseline e
+ * > candidato pelo gate corrigido, na mesma janela e condições."
+ *
+ * O que isso muda neste gate, critério a critério:
+ *
+ *  - **CRITÉRIOS PRINCIPAIS** por braço (cold/warm) e por cardinalidade:
+ *    p95 e p99 de latência do turno, throughput (turnos/s) e taxa de erros
+ *    (zero). O veredicto candidato-vs-baseline é RELATIVO, com margem
+ *    explícita e nomeada (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`).
+ *  - **GUARDRAIL de contagem**: statements por turno com crescimento O(1) na
+ *    cardinalidade — a contagem em N=100 tem que ser IGUAL à contagem em N=1,
+ *    tolerância zero. O TETO ABSOLUTO (13, 12, o que for) virou linha de
+ *    relatório, não critério: um turno de 12 statements que custa 3× no p95
+ *    reprova; um turno de 13 statements dentro da latência aprova.
+ *  - **O MODELO DE EVIDÊNCIA do estágio `resolveScope` deixou de fixar "2
+ *    leituras"**. O número de leituras do escopo é DADO MEDIDO e reportado;
+ *    a evidência de que o escopo veio do Postgres, dentro do relógio, passou
+ *    a ser: (a) pelo menos UMA leitura de escopo por turno no contador
+ *    (`SCOPE_READS_PER_TURN_MIN`), (b) cardinalidade do escopo resolvido ==
+ *    semeada, (c) o estágio não engole sozinho o orçamento do turno. Um N+1
+ *    no caminho do escopo não escapa por isso: ele cresce com N, e o
+ *    guardrail O(1) o reprova — em qualquer estágio do turno, não só no
+ *    escopo, o que é estritamente mais forte que o critério "exatamente 2"
+ *    que ele substitui. A fusão das duas leituras em uma (`permissoesRepo.
+ *    forPessoaComProfile`, PR #693) é contada como leitura de escopo
+ *    (`scope_permissoes_com_profile`) e satisfaz (a) — o gate afirma a
+ *    propriedade, não a implementação.
+ *
  * ## O que este arquivo é
  *
- * A #525 fechou com o orçamento de round-trips em **13** e a meta em **8**
- * (`TURN_ROUND_TRIP_TARGET`), e o dono condicionou o aceite a uma MEDIÇÃO, não
- * a uma opinião:
+ * A #525 fechou com o orçamento de round-trips em **13** — hoje um GUARDRAIL
+ * de crescimento, não uma meta — e o dono condicionou o aceite a uma MEDIÇÃO,
+ * não a uma opinião:
  *
  * > "Para #525, 13 ainda não vira orçamento definitivo. O gate deve usar
  * > Postgres real, pool 10, pelo menos 10 tenants concorrentes, braços
@@ -178,11 +211,17 @@
  *   npm run turn:bench -- --sustain-s 60 --json
  *   npm run turn:bench -- --self-test --inject p95_ms=900   # prova que o gate reprova
  *   npm run turn:bench -- --self-test --self-test-baseline missing   # idem, sem baseline
- *   # As quatro provas do estágio `resolveScope` (#700) — todas saem 1:
+ *   # As provas do estágio `resolveScope` (#700, reescritas pela decisão da #525):
  *   npm run turn:bench -- --self-test --inject scope_reads_per_turn_min=0   # escopo fabricado em memória
- *   npm run turn:bench -- --self-test --inject scope_reads_per_turn_max=101 # N+1 no caminho do escopo
  *   npm run turn:bench -- --self-test --inject scope_cardinality_mismatches=1 # escopo ≠ massa semeada
  *   npm run turn:bench -- --self-test --inject cold.scope_p95_ms=900        # degradação NO resolveScope
+ *   # O guardrail O(1): contagem que CRESCE com a cardinalidade reprova (o N+1
+ *   # que o critério "exatamente 2 leituras" pegava agora cai aqui, junto com
+ *   # qualquer outro N+1 do turno):
+ *   npm run turn:bench -- --self-test --inject card100.reads_per_turn_max=113
+ *   # Os critérios relativos principais:
+ *   npm run turn:bench -- --self-test --inject cold.p95_ms=50               # acima do baseline × (1+margem)
+ *   npm run turn:bench -- --self-test --inject cold.throughput_turns_per_s=1 # vazão abaixo do baseline × (1−margem)
  *   npm run turn:bench -- --cleanup-only     # remove massa órfã de uma corrida abortada
  *
  * | Flag | Default | O que faz |
@@ -198,8 +237,8 @@
  * | `--sample-ms` | `100` | Período de amostragem do pool. Validado contra a janela que precisa resolver |
  * | `--sample-gap-factor` | `10` | Maior lacuna cega tolerada na amostragem, em múltiplos de `--sample-ms` |
  * | `--drain-window-ms` | `2000` | Quanto observar o pool DEPOIS que o produtor para. É a única evidência do critério do perfil de saturação |
- * | `--p95-ms` / `--p99-ms` | `600` / `1000` | Limites do gate |
- * | `--baseline-tolerance` | `0.20` | Folga sobre o p95 do baseline |
+ * | `--p95-ms` / `--p99-ms` | `600` / `1000` | Limites ABSOLUTOS do gate (pisos de sanidade) |
+ * | `--relative-margin` | `0.10` | A margem dos critérios relativos (`MARGEM_RELATIVA_DEFAULT`) — p95/p99 ≤ baseline × (1+m), throughput ≥ baseline × (1−m) |
  * | `--mode` | `gate` | `gate` · `measure` · `self-test` — ver acima |
  * | `--write-baseline` | — | Grava o p95 medido como novo baseline. **Exige `--mode measure`** |
  * | `--self-test` | — | Apelido de `--mode self-test`. Não toca no banco |
@@ -210,6 +249,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { loadavg } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -253,24 +293,56 @@ const ALL_ARMS: ArmName[] = ['cold', 'warm'];
 export const CARDINALITIES = [1, 10, 100] as const;
 
 /**
- * As duas leituras do `resolveScope` (`src/governance/permissions.ts`), com o
- * nome de seção que o contador por turno usa. São as seções que o gate exige
- * ver em TODO turno desde a #700 — a evidência de que o escopo veio do
+ * As leituras que o contador por turno atribui ao estágio `resolveScope`
+ * (`src/governance/permissions.ts`) — a evidência de que o escopo veio do
  * Postgres e não de um `Map` montado no processo.
+ *
+ * Há TRÊS seções porque há duas implementações legítimas do estágio:
+ * `forPessoa` + `byIds` (duas leituras, a composição da `main`) e
+ * `forPessoaComProfile` (o JOIN fundido numa leitura, PR #693). O gate afirma
+ * a PROPRIEDADE — o escopo foi resolvido no banco, dentro do relógio — e não a
+ * implementação; qualquer uma destas seções no contador conta como leitura de
+ * escopo.
  */
 export const SCOPE_SECTIONS = {
   permissoes: 'scope_permissoes',
   profiles: 'scope_profiles',
+  /** A leitura FUNDIDA (`permissoesRepo.forPessoaComProfile`, PR #693). */
+  permissoes_com_profile: 'scope_permissoes_com_profile',
 } as const;
 
 /**
- * Quantas leituras o `resolveScope` faz por turno. NÃO é uma escolha deste
- * harness: é o orçamento da #525 (`src/agent/turn-context/types.ts`), que conta
- * `permissoesRepo.forPessoa` + `profilesRepo.byIds` como 2 das 13 queries do
- * turno. O gate cobra o número EXATO nos dois sentidos — menos significa escopo
- * fabricado (ou massa ausente), mais significa N+1 no caminho do escopo.
+ * O piso de evidência do estágio `resolveScope`: pelo menos UMA leitura de
+ * escopo por turno no contador.
+ *
+ * Era `SCOPE_READS_PER_TURN = 2`, exigido EXATO nos dois sentidos. A decisão
+ * do dono na #525 (2026-09-02) removeu o número fixo: a contagem de leituras
+ * do escopo é DADO MEDIDO e reportado, não critério. O que este piso ainda
+ * pega é a regressão original da #700 — escopo fabricado em memória (zero
+ * leituras no contador). O outro lado do critério antigo (o N+1 que "mais que
+ * 2" denunciava) não ficou descoberto: um N+1 cresce com a cardinalidade e o
+ * guardrail O(1) da contagem por turno o reprova — em qualquer estágio do
+ * turno, não só no escopo.
  */
-export const SCOPE_READS_PER_TURN = 2;
+export const SCOPE_READS_PER_TURN_MIN = 1;
+
+/**
+ * A margem dos critérios RELATIVOS candidato-vs-baseline: p95 e p99 ≤
+ * baseline × (1 + margem); throughput ≥ baseline × (1 − margem).
+ *
+ * Por que 10%, e não os 20% da versão anterior: os +20% existiam para
+ * comparar contra um baseline ARQUIVADO, medido noutro dia — e entre
+ * contêineres este host já mediu o mesmo código a 67,0 ms e 135,5 ms de p95.
+ * O protocolo da decisão da #525 exclui essa fonte de variância: baseline e
+ * candidato rodam na MESMA janela, na mesma máquina, com a mesma massa, em
+ * corridas consecutivas imediatas e com o load average registrado. O que
+ * sobra é ruído de escalonador de uma corrida para a seguinte, e 10% cobre
+ * esse ruído com folga enquanto continua rejeitando com margem enorme a
+ * regressão que motivou a decisão (~3× no p95). Quem comparar através de
+ * janelas diferentes não deve afrouxar a margem: deve re-medir o baseline na
+ * janela nova (`--mode measure --write-baseline`).
+ */
+export const MARGEM_RELATIVA_DEFAULT = 0.1;
 
 export type Thresholds = {
   p95_ms: number;
@@ -280,7 +352,12 @@ export type Thresholds = {
   min_concurrent_tenants: number;
   /** Saturação contínua do pool que reprova, em ms. */
   saturation_ms: number;
-  baseline_tolerance: number;
+  /**
+   * A margem dos critérios relativos candidato-vs-baseline (p95, p99,
+   * throughput, latência por cardinalidade). Nomeada e justificada em
+   * `MARGEM_RELATIVA_DEFAULT`; sobreposta por `--relative-margin`.
+   */
+  relative_margin: number;
   pairs: number;
   concurrency: number;
   /**
@@ -445,7 +522,10 @@ export type RunFingerprint = {
 // que mediu, então não dá para saber se ele inclui o `resolveScope` — e um
 // número cuja fronteira é desconhecida não é referência. Recusado, não
 // assumido. Regravar é uma linha de comando; assumir seria uma conclusão.
-export const BASELINE_SCHEMA_VERSION = 3;
+// v4: a decisão da #525 (meta em latência) fez os critérios relativos
+// principais precisarem de throughput e de latência POR CARDINALIDADE — um
+// baseline v3 não os gravou, então não serve de referência para eles.
+export const BASELINE_SCHEMA_VERSION = 4;
 
 export type BaselineFile = {
   schema_version: number;
@@ -464,7 +544,21 @@ export type BaselineFile = {
     platform: string;
     mode: RunMode;
   };
-  arms: Record<string, { p95_ms: number; p99_ms: number; turns: number; wall_ms: number }>;
+  arms: Record<string, BaselineArm>;
+};
+
+/**
+ * O que o baseline guarda por braço — exatamente os números que os critérios
+ * RELATIVOS principais comparam: p95/p99 do braço, throughput, e p95/p99 por
+ * cardinalidade. `turns`/`wall_ms` documentam a corrida.
+ */
+export type BaselineArm = {
+  p95_ms: number;
+  p99_ms: number;
+  throughput_turns_per_s: number;
+  turns: number;
+  wall_ms: number;
+  by_cardinality: Array<{ entities: number; p95_ms: number; p99_ms: number }>;
 };
 
 /** O fingerprint da corrida ATUAL. `pool_max` vem do pool de verdade, não de um literal. */
@@ -684,7 +778,7 @@ export function parseArgs(argv: string[], maxPeakReads: number): Options {
       max_peak_reads: maxPeakReads,
       min_concurrent_tenants: num('min-tenants', 10),
       saturation_ms,
-      baseline_tolerance: num('baseline-tolerance', 0.2),
+      relative_margin: num('relative-margin', MARGEM_RELATIVA_DEFAULT),
       sample_gap_factor: num('sample-gap-factor', 10),
       // A FORMA da carga exigida vem do enunciado do dono, NÃO de `--pairs` /
       // `--concurrency`. Derivá-la das flags tornaria o critério circular:
@@ -983,6 +1077,13 @@ export type CardinalityStats = {
   p95_ms: number;
   p99_ms: number;
   max_ms: number;
+  /**
+   * Leituras por turno NESTA cardinalidade (mín–máx). É a evidência do
+   * guardrail O(1): a contagem em N=100 tem que ser IGUAL à de N=1. O valor
+   * absoluto é linha de relatório; o CRESCIMENTO é o critério.
+   */
+  reads_per_turn_min: number;
+  reads_per_turn_max: number;
 };
 
 export type SectionLatency = {
@@ -1006,6 +1107,22 @@ export type ArmResult = {
   max_ms: number;
   /** p95 estimado pelos buckets do histograma — o que o Grafana vai mostrar. */
   p95_from_histogram_ms: number;
+  /**
+   * Turnos por segundo durante a fase de CARGA (turnos medidos / wall da
+   * carga). Critério principal desde a decisão da #525: uma "otimização" que
+   * derruba a vazão paga o p95 com fila, e só o par latência+vazão fecha essa
+   * porta.
+   */
+  throughput_turns_per_s: number;
+  /**
+   * Load average (1 min) do host, lido IMEDIATAMENTE antes e depois do braço.
+   * Linha de relatório, não critério: é a evidência de "mesma janela e
+   * condições" que a decisão da #525 exige para comparar baseline e
+   * candidato. Num host de 4 CPUs, medir com load > 4 é medir a fila dos
+   * outros processos.
+   */
+  load_avg_before: number;
+  load_avg_after: number;
   errors: number;
   timeouts: number;
   error_samples: string[];
@@ -1100,12 +1217,40 @@ export type GateContext = {
   fingerprint: RunFingerprint;
 };
 
-/** As duas leituras do escopo aconteceram em TODO turno deste braço? */
+/**
+ * O escopo foi resolvido no BANCO em todo turno deste braço? A evidência é o
+ * piso: pelo menos uma leitura de escopo por turno no contador. O NÚMERO de
+ * leituras (2 na `main`, 1 com a fusão da #693) é dado medido e reportado —
+ * ver `SCOPE_READS_PER_TURN_MIN` para o porquê do piso e para onde foi o
+ * teto (guardrail O(1)).
+ */
 export function scopeReadsExercised(a: ArmResult): boolean {
-  return (
-    a.scope_reads_per_turn_min === SCOPE_READS_PER_TURN &&
-    a.scope_reads_per_turn_max === SCOPE_READS_PER_TURN
+  return a.scope_reads_per_turn_min >= SCOPE_READS_PER_TURN_MIN;
+}
+
+/**
+ * O guardrail O(1) da contagem: statements por turno NÃO crescem com a
+ * cardinalidade do escopo — o envelope (mín–máx) de leituras por turno em
+ * N=100 é IGUAL ao de N=1, tolerância zero.
+ *
+ * `ok: null` = não avaliável (menos de duas cardinalidades medidas): sem dois
+ * pontos não há inclinação para afirmar, e "não avaliado" não é "aprovado".
+ */
+export function contagemO1(
+  by_cardinality: ReadonlyArray<CardinalityStats>,
+): { ok: boolean | null; detail: string } {
+  const medidas = by_cardinality.filter((c) => c.turns > 0);
+  const detail = medidas
+    .map((c) => `N=${c.entities}: ${c.reads_per_turn_min}–${c.reads_per_turn_max}`)
+    .join(' · ');
+  if (medidas.length < 2) {
+    return { ok: null, detail: `${detail || 'nenhuma cardinalidade medida'} — menos de duas cardinalidades medidas, inclinação não avaliável` };
+  }
+  const ref = medidas[0]!;
+  const ok = medidas.every(
+    (c) => c.reads_per_turn_min === ref.reads_per_turn_min && c.reads_per_turn_max === ref.reads_per_turn_max,
   );
+  return { ok, detail };
 }
 
 /** O escopo RESOLVIDO bateu com a cardinalidade semeada, em todo turno? */
@@ -1121,7 +1266,8 @@ export function scopeCardinalityMatches(a: ArmResult): boolean {
 function scopeEvidenceDetail(a: ArmResult): string {
   return (
     `leituras do escopo por turno=${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max} ` +
-    `(esperado ${SCOPE_READS_PER_TURN}) · escopo resolvido=${a.scope_entities_min}–${a.scope_entities_max} ` +
+    `(piso ${SCOPE_READS_PER_TURN_MIN}; a contagem é dado medido, não critério) · ` +
+    `escopo resolvido=${a.scope_entities_min}–${a.scope_entities_max} ` +
     `entidades (esperado ${Math.min(...CARDINALITIES)}–${Math.max(...CARDINALITIES)}) · ` +
     `divergências de cardinalidade=${a.scope_cardinality_mismatches} de ${a.turns} turnos`
   );
@@ -1179,9 +1325,10 @@ export function evaluateGate(
       label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
       passed: evidenciaCompleta,
       detail: evidenciaCompleta
-        ? `o turno medido inclui o \`resolveScope\`: ${SCOPE_READS_PER_TURN} leituras ` +
-          `(\`permissoes ⋈ permission_profiles\`) em TODO turno de todo braço, ` +
-          `escopo resolvido de ${Math.min(...CARDINALITIES)} a ${Math.max(...CARDINALITIES)} ` +
+        ? `o turno medido inclui o \`resolveScope\`: pelo menos ${SCOPE_READS_PER_TURN_MIN} ` +
+          `leitura de escopo no contador em TODO turno de todo braço (contagem medida: ` +
+          arms.map((a) => `${a.arm}=${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}`).join(' · ') +
+          `), escopo resolvido de ${Math.min(...CARDINALITIES)} a ${Math.max(...CARDINALITIES)} ` +
           `entidades e zero divergências de cardinalidade. Cobertura: \`${coberturaAtual()}\``
         : `A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO — ` +
           scopeEvidence.map((e) => `[${e.arm.arm}] ${scopeEvidenceDetail(e.arm)}`).join(' · ') +
@@ -1207,23 +1354,25 @@ export function evaluateGate(
         `erros=${a.errors} · timeouts=${a.timeouts} (orçamento por turno)` +
         (a.error_samples.length ? ` · ex.: ${a.error_samples.slice(0, 2).join(' | ')}` : ''),
     });
-    // ── O ESTÁGIO `resolveScope` (issue #700) ─────────────────────────
+    // ── O ESTÁGIO `resolveScope` (issue #700, evidência reescrita pela
+    // decisão da #525) ─────────────────────────────────────────────────
     // Três critérios, e cada um pega uma regressão diferente:
     //
-    //  1. as duas leituras aconteceram em TODO turno — 0 é escopo fabricado em
-    //     memória ou massa sem `permissoes`/`permission_profiles`; >2 é N+1 no
-    //     caminho do escopo (o `byId` por permissão que a #511 removeu);
+    //  1. pelo menos UMA leitura de escopo aconteceu em TODO turno — 0 é
+    //     escopo fabricado em memória ou massa sem as tabelas do escopo. O
+    //     NÚMERO de leituras é dado medido (2 na `main`, 1 com a fusão da
+    //     #693), não critério; o N+1 que o "exatamente 2" antigo pegava cai
+    //     no guardrail O(1) abaixo, que cobre o turno inteiro;
     //  2. o escopo RESOLVIDO tem o tamanho que a massa semeou — é o que impede
-    //     "duas leituras aconteceram, mas devolveram vazio" de passar por
-    //     medição, e o que denuncia uma permissão descartada pelo teto de 500
-    //     do `profilesRepo.byIds`;
+    //     "a leitura aconteceu, mas devolveu vazio" de passar por medição, e o
+    //     que denuncia uma permissão descartada por um teto de lote;
     //  3. o estágio não come sozinho o orçamento do turno. O limite é o MESMO
-    //     p95 do turno inteiro, de propósito conservador: o `resolveScope` são
-    //     2 das 13 queries do orçamento, então gastar o turno inteiro nelas já
-    //     é patológico. A defesa fina continua sendo o p95 total (que agora
-    //     INCLUI este estágio) e a comparação relativa contra o baseline.
+    //     p95 do turno inteiro, de propósito conservador: gastar o turno
+    //     inteiro no escopo já é patológico. A defesa fina continua sendo o
+    //     p95 total (que INCLUI este estágio) e a comparação relativa contra
+    //     o baseline.
     out.push({
-      label: `[${a.arm}] o \`resolveScope\` foi EXERCITADO: ${SCOPE_READS_PER_TURN} leituras (\`permissoes ⋈ permission_profiles\`) por turno`,
+      label: `[${a.arm}] o \`resolveScope\` foi EXERCITADO: ≥${SCOPE_READS_PER_TURN_MIN} leitura de escopo no Postgres por turno`,
       passed: scopeReadsExercised(a) && a.turns > 0,
       detail: scopeEvidenceDetail(a),
     });
@@ -1238,6 +1387,23 @@ export function evaluateGate(
       detail:
         `p95=${a.scope_p95_ms.toFixed(1)} ms · p50=${a.scope_p50_ms.toFixed(1)} ms ` +
         `(de um p95 de turno de ${a.p95_ms.toFixed(1)} ms, que já o inclui)`,
+    });
+
+    // ── GUARDRAIL O(1) da contagem (decisão da #525) ───────────────────
+    // A contagem de statements por turno não pode CRESCER com a cardinalidade:
+    // o envelope em N=100 tem que ser igual ao de N=1, tolerância zero. É o
+    // que resta do critério de contagem depois da decisão do dono — o teto
+    // absoluto (12, 13) virou linha de relatório; a INCLINAÇÃO continua
+    // reprovando, porque é ela que protege o pool de um tenant "elefante" e
+    // é ela que um N+1 (no escopo ou em qualquer outro estágio) viola.
+    const o1 = contagemO1(a.by_cardinality);
+    out.push({
+      label: `[${a.arm}] contagem de statements por turno com crescimento O(1) na cardinalidade (N=100 == N=1)`,
+      passed: o1.ok === true,
+      skipped: o1.ok === null,
+      detail:
+        `${o1.detail} · total por turno=${a.reads_per_turn_min}–${a.reads_per_turn_max} ` +
+        `(teto absoluto é linha de relatório, não critério)`,
     });
 
     out.push({
@@ -1371,38 +1537,93 @@ export function evaluateGate(
       detail: `count=${a.metric_count} · turnos=${a.turns} · p95 pelos buckets≈${a.p95_from_histogram_ms.toFixed(0)} ms`,
     });
 
-    // O critério relativo só é avaliado contra um baseline COMPARÁVEL. Faltando
-    // baseline, ou tendo sido ele medido com outra carga, o critério fica
-    // `skipped` — e `skipped` não é aprovado: em modo `gate` isso derruba o
-    // exit code. Um checkout limpo passou a dizer "não tenho a evidência" em
-    // vez de sair 0.
+    // ── Os CRITÉRIOS PRINCIPAIS relativos (decisão da #525) ────────────
+    // p95, p99, throughput e latência por cardinalidade, todos contra o
+    // baseline com a margem nomeada. Só são avaliados contra um baseline
+    // COMPARÁVEL: faltando baseline, ou tendo sido ele medido com outra
+    // carga, cada um fica `skipped` — e `skipped` não é aprovado: em modo
+    // `gate` isso derruba o exit code. Um checkout limpo diz "não tenho a
+    // evidência" em vez de sair 0.
+    const sobe = (1 + th.relative_margin).toFixed(2);
+    const desce = (1 - th.relative_margin).toFixed(2);
     const base = compat.status === 'ok' ? baseline?.arms[a.arm] : undefined;
+    const relLabels = [
+      `[${a.arm}] p95 ≤ baseline × ${sobe}`,
+      `[${a.arm}] p99 ≤ baseline × ${sobe}`,
+      `[${a.arm}] throughput ≥ baseline × ${desce}`,
+      `[${a.arm}] latência por cardinalidade ≤ baseline × ${sobe} (p95 e p99 em N=${CARDINALITIES.join('/')})`,
+    ] as const;
     if (!base) {
       const why =
         compat.status === 'missing'
           ? 'NÃO HÁ BASELINE REGISTRADO para este braço'
           : compat.status === 'legacy_schema'
-            ? `BASELINE EM FORMATO ANTIGO — sem fingerprint da carga, a comparação seria uma suposição (${compat.diffs.join(' · ')})`
+            ? `BASELINE EM FORMATO ANTIGO — sem fingerprint da carga (ou sem os campos v${BASELINE_SCHEMA_VERSION}), a comparação seria uma suposição (${compat.diffs.join(' · ')})`
             : compat.status === 'incompatible'
               ? `BASELINE MEDIDO COM OUTRA CARGA — comparação RECUSADA (${compat.diffs.join(' · ')})`
               : `o baseline não tem o braço \`${a.arm}\``;
-      out.push({
-        label: `[${a.arm}] p95 ≤ baseline + ${(th.baseline_tolerance * 100).toFixed(0)}%`,
-        passed: false,
-        skipped: true,
-        detail:
-          `NÃO AVALIADO — ${why}. ` +
-          'Grave um baseline com esta MESMA forma de carga: ' +
-          'npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline',
-      });
+      for (const label of relLabels) {
+        out.push({
+          label,
+          passed: false,
+          skipped: true,
+          detail:
+            `NÃO AVALIADO — ${why}. ` +
+            'Grave um baseline com esta MESMA forma de carga: ' +
+            'npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline',
+        });
+      }
     } else {
-      const ceiling = base.p95_ms * (1 + th.baseline_tolerance);
+      const delta = (agora: number, ref: number): string =>
+        ref > 0 ? `${(((agora - ref) / ref) * 100).toFixed(1)}%` : 'n/a';
+      const p95Ceiling = base.p95_ms * (1 + th.relative_margin);
       out.push({
-        label: `[${a.arm}] p95 ≤ baseline + ${(th.baseline_tolerance * 100).toFixed(0)}%`,
-        passed: a.p95_ms <= ceiling,
+        label: relLabels[0],
+        passed: a.p95_ms <= p95Ceiling,
         detail:
           `p95=${a.p95_ms.toFixed(1)} ms · baseline=${base.p95_ms.toFixed(1)} ms · ` +
-          `teto=${ceiling.toFixed(1)} ms · delta=${(((a.p95_ms - base.p95_ms) / base.p95_ms) * 100).toFixed(1)}%`,
+          `teto=${p95Ceiling.toFixed(1)} ms · delta=${delta(a.p95_ms, base.p95_ms)}`,
+      });
+      const p99Ceiling = base.p99_ms * (1 + th.relative_margin);
+      out.push({
+        label: relLabels[1],
+        passed: a.p99_ms <= p99Ceiling,
+        detail:
+          `p99=${a.p99_ms.toFixed(1)} ms · baseline=${base.p99_ms.toFixed(1)} ms · ` +
+          `teto=${p99Ceiling.toFixed(1)} ms · delta=${delta(a.p99_ms, base.p99_ms)}`,
+      });
+      const floor = base.throughput_turns_per_s * (1 - th.relative_margin);
+      out.push({
+        label: relLabels[2],
+        passed: a.throughput_turns_per_s >= floor,
+        detail:
+          `throughput=${a.throughput_turns_per_s.toFixed(1)} turnos/s · ` +
+          `baseline=${base.throughput_turns_per_s.toFixed(1)} · piso=${floor.toFixed(1)} · ` +
+          `delta=${delta(a.throughput_turns_per_s, base.throughput_turns_per_s)}`,
+      });
+      // Por cardinalidade: UM veredicto por braço, com o detalhe listando cada
+      // N — o critério é "nenhuma cardinalidade regrediu além da margem", e
+      // doze linhas de veredicto diriam menos que uma linha com os três N.
+      const porCard = a.by_cardinality
+        .filter((c) => c.turns > 0)
+        .map((c) => {
+          const ref = base.by_cardinality?.find((b) => b.entities === c.entities);
+          if (!ref) return { c, ok: false, txt: `N=${c.entities}: SEM REFERÊNCIA no baseline` };
+          const ok =
+            c.p95_ms <= ref.p95_ms * (1 + th.relative_margin) &&
+            c.p99_ms <= ref.p99_ms * (1 + th.relative_margin);
+          return {
+            c,
+            ok,
+            txt:
+              `N=${c.entities}: p95=${c.p95_ms.toFixed(1)}/${ref.p95_ms.toFixed(1)} ms ` +
+              `p99=${c.p99_ms.toFixed(1)}/${ref.p99_ms.toFixed(1)} ms (medido/baseline)${ok ? '' : ' ✗'}`,
+          };
+        });
+      out.push({
+        label: relLabels[3],
+        passed: porCard.length > 0 && porCard.every((x) => x.ok),
+        detail: porCard.map((x) => x.txt).join(' · ') || 'nenhuma cardinalidade medida',
       });
     }
   }
@@ -1451,9 +1672,23 @@ export function gateExitCode(verdicts: Verdict[], mode: RunMode = 'gate'): numbe
  * Aplica `--inject` sobre os resultados ANTES da avaliação. Só existe para o
  * `--self-test`: é assim que se demonstra que o gate reprova sem esperar uma
  * degradação real acontecer.
+ *
+ * Formato da chave: `[braço.][cardN.]campo` — `cold.p95_ms=900` injeta num
+ * braço, `card100.reads_per_turn_max=113` injeta na entrada de cardinalidade
+ * 100 de todos os braços (é a prova do guardrail O(1): contagem que cresce
+ * com N), e `cold.card100.p95_ms=999` combina os dois filtros.
  */
 export function applyInjection(arms: ArmResult[], inject: Record<string, number>): string[] {
   const applied: string[] = [];
+  const CARD_FIELDS = new Set([
+    'reads_per_turn_min',
+    'reads_per_turn_max',
+    'p50_ms',
+    'p95_ms',
+    'p99_ms',
+    'max_ms',
+    'turns',
+  ]);
   const FIELDS = new Set([
     'p95_ms',
     'p99_ms',
@@ -1477,12 +1712,15 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'wall_ms',
     'metric_count',
     'pairs_exercised',
+    'reads_per_turn_min',
     'reads_per_turn_max',
-    // O estágio `resolveScope` (#700). Estes cinco existem para PROVAR pela
-    // CLI que o gate vê uma regressão que more no escopo: `=0` é o escopo
-    // fabricado em memória de volta, `=101` é o N+1 que a #511 removeu,
-    // `scope_cardinality_mismatches=1` é o escopo que não bate com a massa e
-    // `scope_p95_ms=900` é a degradação de latência do próprio estágio.
+    'throughput_turns_per_s',
+    // O estágio `resolveScope` (#700). Estes existem para PROVAR pela CLI que
+    // o gate vê uma regressão que more no escopo: `scope_reads_per_turn_min=0`
+    // é o escopo fabricado em memória de volta, `scope_cardinality_mismatches=1`
+    // é o escopo que não bate com a massa e `scope_p95_ms=900` é a degradação
+    // de latência do próprio estágio. O N+1 é provado por `cardN.*` (guardrail
+    // O(1)), não por um teto fixo de leituras do escopo.
     'scope_reads_per_turn_min',
     'scope_reads_per_turn_max',
     'scope_cardinality_mismatches',
@@ -1492,9 +1730,41 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'scope_p95_ms',
   ]);
   for (const [rawKey, value] of Object.entries(inject)) {
-    const dot = rawKey.indexOf('.');
-    const armFilter = dot === -1 ? null : rawKey.slice(0, dot);
-    const field = dot === -1 ? rawKey : rawKey.slice(dot + 1);
+    const segs = rawKey.split('.');
+    // `[braço.][cardN.]campo`: o prefixo de braço é qualquer primeiro segmento
+    // que não seja `cardN` — inclusive um braço inexistente, que erra adiante
+    // com "nenhum braço casa" (o mesmo contrato de antes).
+    const armFilter = segs.length > 1 && !/^card\d+$/.test(segs[0]!) ? segs.shift()! : null;
+    const cardMatch = segs.length > 1 ? /^card(\d+)$/.exec(segs[0]!) : null;
+    const cardFilter = cardMatch ? Number(cardMatch[1]) : null;
+    if (cardMatch) segs.shift();
+    const field = segs.join('.');
+
+    if (cardFilter !== null) {
+      if (!CARD_FIELDS.has(field)) {
+        throw new Error(
+          `--inject: campo de cardinalidade desconhecido "${field}" (conhecidos: ${[...CARD_FIELDS].join(', ')})`,
+        );
+      }
+      let armHit = 0;
+      let cardHit = 0;
+      for (const a of arms) {
+        if (armFilter && a.arm !== armFilter) continue;
+        armHit++;
+        for (const c of a.by_cardinality) {
+          if (c.entities !== cardFilter) continue;
+          (c as unknown as Record<string, number>)[field] = value;
+          cardHit++;
+        }
+      }
+      if (armHit === 0) throw new Error(`--inject: nenhum braço casa com "${armFilter ?? ''}"`);
+      if (cardHit === 0) {
+        throw new Error(`--inject: nenhuma cardinalidade casa com card${cardFilter} (conhecidas: ${CARDINALITIES.join(', ')})`);
+      }
+      applied.push(`${armFilter ?? '*'}.card${cardFilter}.${field}=${value}`);
+      continue;
+    }
+
     if (!FIELDS.has(field)) {
       throw new Error(`--inject: campo desconhecido "${field}" (conhecidos: ${[...FIELDS].join(', ')})`);
     }
@@ -1524,15 +1794,21 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
     p99_ms: 70,
     max_ms: 120,
     p95_from_histogram_ms: 50,
+    // 600 turnos em 61 s de carga — coerente com `turns`/`wall_ms` acima.
+    throughput_turns_per_s: 600 / 61,
+    load_avg_before: 0.5,
+    load_avg_after: 1.5,
     errors: 0,
     timeouts: 0,
     error_samples: [],
     peak_reads_per_turn: th.max_peak_reads,
-    // 12 = as 10 leituras do `buildPrompt` + as 2 do `resolveScope` (#700).
-    reads_per_turn_min: 10 + SCOPE_READS_PER_TURN,
-    reads_per_turn_max: 10 + SCOPE_READS_PER_TURN,
-    scope_reads_per_turn_min: SCOPE_READS_PER_TURN,
-    scope_reads_per_turn_max: SCOPE_READS_PER_TURN,
+    // 12 = as 10 leituras do `buildPrompt` + as 2 do `resolveScope` da `main`
+    // (#700). O braço sintético representa a composição da `main`; a contagem
+    // é dado medido — o gate não a fixa (decisão da #525).
+    reads_per_turn_min: 12,
+    reads_per_turn_max: 12,
+    scope_reads_per_turn_min: 2,
+    scope_reads_per_turn_max: 2,
     scope_cardinality_mismatches: 0,
     scope_entities_min: Math.min(...CARDINALITIES),
     scope_entities_max: Math.max(...CARDINALITIES),
@@ -1564,6 +1840,9 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
       p95_ms: 40,
       p99_ms: 70,
       max_ms: 120,
+      // O(1): o MESMO envelope em toda cardinalidade — o guardrail da contagem.
+      reads_per_turn_min: 12,
+      reads_per_turn_max: 12,
     })),
     by_section: [],
     modelled_makespan_p95_now_ms: 30,
@@ -1604,9 +1883,23 @@ export function syntheticBaseline(
       platform: process.platform,
       mode: 'self-test',
     },
-    arms: Object.fromEntries(
-      arms.map((a) => [a.arm, { p95_ms: a.p95_ms, p99_ms: a.p99_ms, turns: a.turns, wall_ms: a.wall_ms }]),
-    ),
+    arms: Object.fromEntries(arms.map((a) => [a.arm, baselineArmFrom(a)])),
+  };
+}
+
+/** A projeção de um braço medido para o que o baseline v4 grava dele. */
+export function baselineArmFrom(a: ArmResult): BaselineArm {
+  return {
+    p95_ms: a.p95_ms,
+    p99_ms: a.p99_ms,
+    throughput_turns_per_s: a.throughput_turns_per_s,
+    turns: a.turns,
+    wall_ms: a.wall_ms,
+    by_cardinality: a.by_cardinality.map((c) => ({
+      entities: c.entities,
+      p95_ms: c.p95_ms,
+      p99_ms: c.p99_ms,
+    })),
   };
 }
 
@@ -2225,8 +2518,15 @@ async function loadDeps() {
  */
 type ReadFn = (...args: never[]) => Promise<unknown>;
 export type InstrumentableRepos = {
-  permissoesRepo: { forPessoa: ReadFn };
-  profilesRepo: { byIds: ReadFn };
+  /**
+   * As duas FORMAS do estágio de escopo: a composição da `main`
+   * (`forPessoa` + `byIds`) e a leitura fundida da #693
+   * (`forPessoaComProfile`). Opcionais porque este harness também mede a
+   * árvore do CANDIDATO — `instrument` ignora método ausente, e o que o gate
+   * cobra é a evidência (≥1 leitura de escopo no contador), não a forma.
+   */
+  permissoesRepo: { forPessoa?: ReadFn; forPessoaComProfile?: ReadFn };
+  profilesRepo: { byIds?: ReadFn };
   operationalProfileVersionsRepo: { getActive: ReadFn };
   selfStateRepo: { getActive: ReadFn };
   mensagensRepo: { recentInConversation: ReadFn };
@@ -2243,10 +2543,13 @@ export type InstrumentableRepos = {
 };
 
 export function instrumentAll(repos: InstrumentableRepos): void {
-  // As DUAS leituras do `resolveScope` (#700). Elas encabeçam a lista porque
-  // são as primeiras do turno: sem elas no contador, "leituras por turno" mede
-  // meio orçamento.
+  // As leituras do `resolveScope` (#700). Elas encabeçam a lista porque são
+  // as primeiras do turno: sem elas no contador, "leituras por turno" mede
+  // meio orçamento. As três seções cobrem as duas formas do estágio (a
+  // composição da `main` e a leitura fundida da #693); `instrument` ignora
+  // método ausente, então instrumentar as três é seguro em qualquer árvore.
   instrument(repos.permissoesRepo, 'forPessoa', SCOPE_SECTIONS.permissoes);
+  instrument(repos.permissoesRepo, 'forPessoaComProfile', SCOPE_SECTIONS.permissoes_com_profile);
   instrument(repos.profilesRepo, 'byIds', SCOPE_SECTIONS.profiles);
   instrument(repos.operationalProfileVersionsRepo, 'getActive', 'identity');
   instrument(repos.selfStateRepo, 'getActive', 'identity_self_state');
@@ -2361,9 +2664,12 @@ export type TurnSample = {
   reads: Array<{ section: string; ms: number }>;
 };
 
-/** Quantas leituras deste turno foram do estágio `resolveScope`. */
+/**
+ * Quantas leituras deste turno foram do estágio `resolveScope` — em qualquer
+ * das suas formas (as duas leituras da `main` ou a fundida da #693).
+ */
 export function countScopeReads(reads: ReadonlyArray<{ section: string }>): number {
-  const secoes: string[] = [SCOPE_SECTIONS.permissoes, SCOPE_SECTIONS.profiles];
+  const secoes: string[] = Object.values(SCOPE_SECTIONS);
   return reads.filter((r) => secoes.includes(r.section)).length;
 }
 
@@ -2371,7 +2677,7 @@ export function countScopeReads(reads: ReadonlyArray<{ section: string }>): numb
 function loaderReads(
   reads: ReadonlyArray<{ section: string; ms: number }>,
 ): Array<{ section: string; ms: number }> {
-  const secoes: string[] = [SCOPE_SECTIONS.permissoes, SCOPE_SECTIONS.profiles];
+  const secoes: string[] = Object.values(SCOPE_SECTIONS);
   return reads.filter((r) => !secoes.includes(r.section)).map((r) => ({ ...r }));
 }
 
@@ -2474,6 +2780,10 @@ async function runArm(
   const inFlightTenants = new Map<string, number>();
   const exercisedPairs = new Set<string>();
 
+  // O load average ANTES do braço — a evidência de "mesma janela e condições"
+  // que a decisão da #525 exige no relatório. Lido aqui, e não no início do
+  // processo, porque cada braço é uma medição.
+  const load_avg_before = loadavg()[0]!;
   const startedAt = performance.now();
   const sampler = startPoolSampler(deps.pool, opts.sample_ms, startedAt);
   const sustainMs = opts.sustain_s * 1000;
@@ -2530,13 +2840,17 @@ async function runArm(
   const wall_ms = producerStoppedAt - startedAt;
   await sleep(opts.drain_window_ms);
   const endedAt = performance.now();
+  const load_avg_after = loadavg()[0]!;
   const pool = poolMetricsFromSummary(sampler.stop(endedAt), opts.sample_ms);
 
   const all = samples.map((s) => s.ms).sort((a, b) => a - b);
   const hist = await readLoaderHistogram(deps.renderPrometheus);
 
   const by_cardinality: CardinalityStats[] = CARDINALITIES.map((entities) => {
-    const arr = samples.filter((s) => s.entities === entities).map((s) => s.ms).sort((a, b) => a - b);
+    const daCard = samples.filter((s) => s.entities === entities);
+    const arr = daCard.map((s) => s.ms).sort((a, b) => a - b);
+    // A evidência do guardrail O(1): leituras por turno POR CARDINALIDADE.
+    const reads = daCard.map((s) => s.reads.length);
     return {
       entities,
       turns: arr.length,
@@ -2544,6 +2858,8 @@ async function runArm(
       p95_ms: percentile(arr, 95),
       p99_ms: percentile(arr, 99),
       max_ms: arr.length ? arr[arr.length - 1]! : 0,
+      reads_per_turn_min: reads.length ? Math.min(...reads) : 0,
+      reads_per_turn_max: reads.length ? Math.max(...reads) : 0,
     };
   });
 
@@ -2588,6 +2904,9 @@ async function runArm(
     p99_ms: percentile(all, 99),
     max_ms: all.length ? all[all.length - 1]! : 0,
     p95_from_histogram_ms: hist.p95,
+    throughput_turns_per_s: wall_ms > 0 ? samples.length / (wall_ms / 1000) : 0,
+    load_avg_before,
+    load_avg_after,
     errors,
     timeouts,
     error_samples: errorSamples,
@@ -2687,8 +3006,9 @@ function renderReport(
     `> **Cobertura desta corrida: \`${coberturaAtual()}\`.**\n` +
     (COBERTURA_DA_MEDICAO.resolve_scope_medido
       ? `> **Escopo do que foi medido — o TURNO INTEIRO.** Cada turno resolve o ` +
-        `escopo no Postgres (\`resolveScope\`: \`permissoes\` + ` +
-        `\`permission_profiles\`, ${SCOPE_READS_PER_TURN} leituras) e só então ` +
+        `escopo no Postgres (\`resolveScope\` — as tabelas de permissões, numa ` +
+        `ou em duas leituras conforme a árvore medida; a contagem é dado ` +
+        `MEDIDO e sai na tabela) e só então ` +
         `chama \`buildPrompt\`, os dois dentro do mesmo relógio — o orçamento ` +
         `como \`src/agent/turn-context/types.ts\` o define. As linhas ` +
         `"leituras do escopo por turno" e "p95 do estágio resolveScope" abaixo ` +
@@ -2715,17 +3035,18 @@ function renderReport(
     ['**p99 (ms)**', ...arms.map((a) => `**${fmt(a.p99_ms)}**`)],
     ['máx (ms)', ...arms.map((a) => fmt(a.max_ms))],
     ['p95 pelos buckets do histograma (ms)', ...arms.map((a) => fmt(a.p95_from_histogram_ms, 0))],
+    ['**throughput (turnos/s)**', ...arms.map((a) => `**${fmt(a.throughput_turns_per_s)}**`)],
+    [
+      'load average (1 min) antes → depois do braço',
+      ...arms.map((a) => `${fmt(a.load_avg_before, 2)} → ${fmt(a.load_avg_after, 2)}`),
+    ],
     ['erros', ...arms.map((a) => String(a.errors))],
     ['timeouts', ...arms.map((a) => String(a.timeouts))],
     ['**pico de leituras simultâneas por turno**', ...arms.map((a) => `**${a.peak_reads_per_turn}**`)],
     ['leituras por turno (mín–máx)', ...arms.map((a) => `${a.reads_per_turn_min}–${a.reads_per_turn_max}`)],
     [
-      '**leituras do `resolveScope` por turno**',
-      ...arms.map(
-        (a) =>
-          `**${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}**` +
-          ` (esperado ${SCOPE_READS_PER_TURN})`,
-      ),
+      '**leituras do `resolveScope` por turno** (dado medido; piso ≥1)',
+      ...arms.map((a) => `**${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}**`),
     ],
     [
       '**p95 do estágio `resolveScope` (ms)**',
@@ -2790,12 +3111,14 @@ function renderReport(
 
   const cardinality = [
     '\n#### Por cardinalidade de escopo\n',
-    `| braço | entidades | turnos | p50 | p95 | p99 | máx |`,
-    `| --- | --- | --- | --- | --- | --- | --- |`,
+    'A coluna "leituras/turno" é a evidência do guardrail O(1): a contagem em',
+    'N=100 tem que ser IGUAL à de N=1 (o valor absoluto é relatório, não critério).\n',
+    `| braço | entidades | turnos | p50 | p95 | p99 | máx | leituras/turno |`,
+    `| --- | --- | --- | --- | --- | --- | --- | --- |`,
     ...arms.flatMap((a) =>
       a.by_cardinality.map(
         (c) =>
-          `| \`${a.arm}\` | ${c.entities} | ${c.turns} | ${fmt(c.p50_ms)} | ${fmt(c.p95_ms)} | ${fmt(c.p99_ms)} | ${fmt(c.max_ms)} |`,
+          `| \`${a.arm}\` | ${c.entities} | ${c.turns} | ${fmt(c.p50_ms)} | ${fmt(c.p95_ms)} | ${fmt(c.p99_ms)} | ${fmt(c.max_ms)} | ${c.reads_per_turn_min}–${c.reads_per_turn_max} |`,
       ),
     ),
   ].join('\n');
@@ -2849,9 +3172,12 @@ function renderReport(
     baseline && compat.status === 'ok'
       ? `\n#### Baseline\n\nRegistrado em ${baseline.recorded_at} por \`${baseline.recorded_by}\` (${baseline.host}).\n` +
         `${baseline.note}\n\n` +
-        `| braço | p95 do baseline (ms) | p99 do baseline (ms) |\n| --- | --- | --- |\n` +
+        `| braço | p95 do baseline (ms) | p99 do baseline (ms) | throughput (turnos/s) |\n| --- | --- | --- | --- |\n` +
         Object.entries(baseline.arms)
-          .map(([k, v]) => `| \`${k}\` | ${fmt(v.p95_ms)} | ${fmt(v.p99_ms)} |`)
+          .map(
+            (entry) =>
+              `| \`${entry[0]}\` | ${fmt(entry[1].p95_ms)} | ${fmt(entry[1].p99_ms)} | ${fmt(entry[1].throughput_turns_per_s)} |`,
+          )
           .join('\n') +
         fingerprintRows
       : baseline
@@ -2864,8 +3190,9 @@ function renderReport(
           `\`npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline\`.` +
           fingerprintRows
         : `\n#### Baseline\n\n**NÃO HÁ BASELINE REGISTRADO.** Nenhum \`${BASELINE_PATH}\` foi encontrado, ` +
-          `então o critério "p95 ≤ baseline + ${(opts.thresholds.baseline_tolerance * 100).toFixed(0)}%" ` +
-          `NÃO FOI AVALIADO nesta corrida — ele aparece como \`n/a\` na lista de veredictos, e ` +
+          `então os critérios RELATIVOS (p95/p99 ≤ baseline × ${(1 + opts.thresholds.relative_margin).toFixed(2)}, ` +
+          `throughput ≥ baseline × ${(1 - opts.thresholds.relative_margin).toFixed(2)}, latência por cardinalidade) ` +
+          `NÃO FORAM AVALIADOS nesta corrida — eles aparecem como \`n/a\` na lista de veredictos, e ` +
           `${opts.mode === 'gate' ? '**em modo `gate` isso REPROVA a corrida**' : 'em modo `measure` isso é apenas informativo'}. ` +
           `Para gravar um baseline inicial: ` +
           `\`npm run turn:bench -- --mode measure --sustain-s 60 --write-baseline\`. ` +
@@ -2925,12 +3252,7 @@ function writeBaseline(
       platform: process.platform,
       mode: opts.mode,
     },
-    arms: Object.fromEntries(
-      arms.map((a) => [
-        a.arm,
-        { p95_ms: a.p95_ms, p99_ms: a.p99_ms, turns: a.turns, wall_ms: a.wall_ms },
-      ]),
-    ),
+    arms: Object.fromEntries(arms.map((a) => [a.arm, baselineArmFrom(a)])),
   };
   writeFileSync(BASELINE_PATH, `${JSON.stringify(file, null, 2)}\n`);
 }
