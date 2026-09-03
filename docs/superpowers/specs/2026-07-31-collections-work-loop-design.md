@@ -1,7 +1,7 @@
 # Work Loop v2 — Objetivo `cobranca_amigavel`: régua de cobrança em piloto — Design Spec
 
 **Date:** 2026-07-31 (draft original) · **revisada em 2026-09-01 contra `origin/main@c1ebc755`**
-**Status:** **Draft v2 — NÃO APROVADA. Spec e decision log apenas; nenhuma linha de produção depende dela.** A v1 do work loop (entidade Objetivo, registry de kinds, workers perceive/execute, fila de exceções no console) está em `main` — ver `docs/superpowers/specs/2026-06-10-agent-work-loop-design.md` e `migrations/088_agent_objectives.sql`. A **fatia 1** (lease, fencing, reaper, predicado de tenant) também está em `main` — #696, `migrations/138_objective_tasks_lease_fencing.sql`. **Nada de cobrança está em `main`**: o único kind do registry é `manual` (`src/objectives/kinds.ts:40`), e não existem `objective_contact_slots`, holdout nem cadência.
+**Status:** **Draft v2 — NÃO APROVADA. Spec e decision log apenas; nenhuma linha de produção depende dela.** A v1 do work loop (entidade Objetivo, registry de kinds, workers perceive/execute, exceções listadas por `objectives.listExceptions`) está em `main` — ver `docs/superpowers/specs/2026-06-10-agent-work-loop-design.md` e `migrations/088_agent_objectives.sql`. A **fatia 1** (lease, fencing, reaper, predicado de tenant) também está em `main` — #696, `migrations/138_objective_tasks_lease_fencing.sql`. **Nada de cobrança está em `main`**: o único kind do registry é `manual` (`src/objectives/kinds.ts:40`), e não existem `objective_contact_slots`, holdout nem cadência.
 **Scope:** O primeiro objetivo com efeito colateral real — **régua de cobrança amigável de inadimplentes**, em **piloto com UM tenant e UMA carteira enumerada**. Define onde vive a fronteira "backend decide / agente propõe" quando o agente acorda sozinho, como a lista de proibições vira mecanismo, como a frequência resiste a retry/réplica, como a exceção humana destrava a tarefa, o que a métrica de saída consegue e **o que ela não consegue** provar, e como desligar depressa.
 **Master refs:** `2026-06-10-learnable-workforce-vision.md` §2.3 (work loop) e §4 (fase 2 — critério de saída "um trabalho inteiro provado com cliente real, medido em R$"); `ARCHITECTURE.md` invariantes 1–6; `docs/architecture/concerns/action-layer.md`; `docs/architecture/concerns/capability-taxonomy.md`; `docs/architecture/concerns/governance-observability.md`.
 **Decision log:** [`docs/architecture/decisions/0006-cobranca-piloto-perguntas-em-aberto.md`](../../architecture/decisions/0006-cobranca-piloto-perguntas-em-aberto.md) — estado, dono, consequência e evidência de repositório de cada uma das doze perguntas. **A §12 desta spec é o resumo; o decision log é o registro.**
@@ -21,7 +21,7 @@ A draft anterior foi escrita contra o HEAD `7b34e7e0`, ficou 120 commits atrás 
 | 2 | o teto de frequência resolvia "no máximo N contatos por devedor" | O unique proposto é `(objective_id, carteira_item_id, step)` — teto **por dívida**, não por destinatário | §7.1b |
 | 3 | holdout sorteado por item torna a métrica atribuível | A randomização por item **contamina**: uma pessoa com duas pendências cai em tratamento e controle ao mesmo tempo | §9.2 |
 | 4 | "R$ líquido recuperado" é reproduzível sobre `transacoes` + slots | `transacoes` é atualizada **in-place**, sem ledger imutável das liquidações; o custo de LLM é agregado por dia/pessoa em USD, não por objetivo/slot | §9.1b |
-| 5 | §8.2 ("o agente nunca responde ao devedor") **e** Q10 ("ele responde de madrugada?") | Contradição interna da própria spec. Uma das duas regras precisa prevalecer explicitamente | §8.2, §12.Q10 |
+| 5 | §8.2 afirmava silêncio total do agente **e** a Q10 perguntava o oposto | Contradição interna da própria spec. **Nenhuma das duas está decidida**: as duas viraram opções da mesma decisão aberta, e a spec não escolhe | §8.2, DA-09 |
 | 6 | Q4/Q5 eram questões de **política** | São também de **dado e mecanismo**: não há campo autoritativo para disputa, prescrição, acordo, falecimento ou menor; o opt-out não tem registro operacional durável | §12.Q4/Q5 |
 
 E duas correções de **estado**, não de conteúdo:
@@ -44,7 +44,7 @@ O work loop não tem nada disso. Ele acorda por cron. Não há mensagem, não h�
 Três problemas concretos que caem dessa pergunta:
 
 1. `constitutionalCheck` C-003/C-007 (`src/governance/rules.ts:41`, `:73`) exige 4-eyes **incondicionalmente** para `send_proactive_message` e `start_recurring_outreach`, e desde #521 a evidência só pode vir de `approval_requests`. Uma régua de cobrança faz N envios. Ou o mandato pré-satisfaz a exigência de forma auditável, ou cada mensagem precisa de duas assinaturas humanas e a autonomia é ficção.
-2. Não existe **teto de frequência por destinatário**, nem janela de silêncio. O que existe é *vazão*: `tryAcquireSendSlot` (`src/scheduling/backpressure.ts:71`) impõe 2s entre mensagens ao mesmo JID e baldes global — o suficiente para não tomar ban do WhatsApp, longe do suficiente para "no máximo 3 contatos por devedor". **E o desenho proposto nesta spec também não entrega isso** (§7.1b). Essa é a correção 2, e ela é uma lacuna, não um detalhe.
+2. Não existe **teto de frequência por destinatário**, nem janela de silêncio. O que existe é *vazão*: `tryAcquireSendSlot` (`src/scheduling/backpressure.ts:71`) impõe 2s entre mensagens ao mesmo JID e baldes global — o suficiente para não tomar ban do WhatsApp, longe do suficiente para um teto do tipo "no máximo N contatos por devedor" — e o N não está decidido (DA-04/DA-05). **E o desenho proposto nesta spec também não entrega isso** (§7.1b). Essa é a correção 2, e ela é uma lacuna, não um detalhe.
 3. O ciclo de tarefa era frágil — sem lease, sem reaper, sem predicado de tenant. **Resolvido pela #696**; ver §4.4.
 
 **Não-objetivos** (§2.2): conversar livremente com o devedor; qualquer negociação; integração bancária nova; generalizar o kind; substituir o time de cobrança.
@@ -58,7 +58,7 @@ Três problemas concretos que caem dessa pergunta:
 - Kind `cobranca_amigavel` no registry (`src/objectives/kinds.ts`) com `perceive` + `execute`.
 - **Mandato** hash-pinado como fronteira de decisão (§5) e sua materialização em **slots de contato** consumíveis uma única vez (§7).
 - Catálogo de **templates aprovados com slots tipados** — o agente não redige texto livre para devedor (§6.3).
-- Fila de exceções no console, com retomada da tarefa pelo humano e expiração fail-closed (§8).
+- Fila de exceções com retomada da tarefa pelo humano e expiração fail-closed (§8). **Em que superfície o humano atende essa fila é decisão aberta** — §8.4, DA-07.
 - Ledger auditável de contato + desfecho, e uma métrica de saída **com as limitações declaradas em §9.1b** — não a promessa de "R$ recuperado reproduzível" que a draft fazia.
 - O que resta do endurecimento genérico do caminho v1: dispatcher por tenant no perceptor e lote limitado (**fatia 2**, §4.4).
 - Plano de piloto (um tenant, uma carteira enumerada) e quatro níveis de desligamento (§11).
@@ -67,7 +67,7 @@ Três problemas concretos que caem dessa pergunta:
 
 | Fora | Por quê |
 |---|---|
-| Resposta livre ao devedor pelo agente | Texto livre para terceiro sobre dívida é superfície de risco jurídica, não técnica. Inbound do devedor **sai** do loop: vira exceção humana (§8.2). |
+| Resposta **livre** ao devedor pelo agente | Texto livre para terceiro sobre dívida é superfície de risco jurídica, não técnica — e a §6.3 fecha esse caminho por construção. **O que acontece com o inbound do devedor** (silêncio, acuse automático, resposta tipada, e em que horário) **não está decidido** — §8.2, DA-09. |
 | Negociar, parcelar, descontar, dar baixa, alterar saldo | Proibição do owner; mecanizada em §6 por ausência de grant + `denied_tools` + `valor_max=0`. |
 | Integração bancária / conciliação de pagamento nova | Fora do escopo desta spec **e é o maior risco do piloto** — §12.Q1. |
 | Consertar as CLIs de import | §12.Q2c mostra que `import:ofx` está morta desde a 083. **O conserto tem issue própria** e não entra nesta PR nem nas fatias 3–5. |
@@ -147,7 +147,7 @@ Migração nova, portanto, justificada — `_up` + `_down`, prefixo reservado vi
 
 `objective_tasks` — uma linha por *contato planejado*. `natural_key = 'cob:v1:{slot_id}'` (o slot é a identidade). `payload` = `{ slot_id, template_id, devedor_pessoa_id, carteira_item_id, step }`. `pending_question_id` — coluna que a 088 criou e ninguém usa — **continua NULL nesta versão** (§8.4). As colunas de lease/fencing da 138 são usadas como estão; a cobrança não as altera.
 
-`approval_requests` — **uma** linha por mandato, `approval_class='two_distinct_owners'`, `tool='objective_mandate'`, `intent_payload` = o envelope canônico, `intent_hash` via `computeIntentHash`, `expires_at` obrigatório (é o fim do piloto).
+`approval_requests` — **uma** linha por mandato, com a `approval_class` que a DA-10 fixar, `tool='objective_mandate'`, `intent_payload` = o envelope canônico, `intent_hash` via `computeIntentHash`, `expires_at` obrigatório (é o fim do piloto).
 
 ### §4.2 Novo: `objective_contact_slots`
 
@@ -207,8 +207,8 @@ Três propriedades que fazem o desenho funcionar, e **uma que ele não tem**:
 ### §4.3 Ativação (uma vez, humano no comando)
 
 1. Owner cria o objetivo no console. Router força `status='paused'` para este kind. Nada acontece.
-2. Owner submete o **envelope** (§5.2). O backend valida: cada item da carteira resolve para um recebível em aberto **e** para uma pessoa contatável (§5.2b); todo `template_id` está na allowlist; a janela de contato é bem-formada; o teto de passos respeita o máximo do kind. Então calcula `computeIntentHash` e chama `ensureApprovalRequest` com `approval_class='two_distinct_owners'`.
-3. **Dois owners distintos aprovam** no console. `approval_decisions` registra cada assinatura (única por `(request, principal)`).
+2. Owner submete o **envelope** (§5.2). O backend valida: cada item da carteira resolve para um recebível em aberto **e** para uma pessoa contatável (§5.2b); todo `template_id` está na allowlist; a janela de contato é bem-formada; o teto de passos respeita o máximo do kind. Então calcula `computeIntentHash` e chama `ensureApprovalRequest` com a classe de aprovação que a DA-10 fixar.
+3. **Os aprovadores exigidos pela classe da DA-10 assinam.** `approval_decisions` registra cada assinatura (única por `(request, principal)`). Em que canal a assinatura acontece também é DA-10.
 4. Na transição do request para `approved`, o backend **materializa os slots** numa transação: sorteia holdout ou tratamento **pela unidade experimental aprovada** (§9.2), com semente fixa derivada do `intent_hash`, e insere `step=1..N` com as janelas derivadas da RRULE do envelope. Auditado (`objective_mandate_materialized`, com contagens).
 5. Owner faz `setStatus('active')`. O router recusa se não houver mandato `approved` cujo hash case com os `params` atuais.
 
@@ -284,24 +284,108 @@ Conteúdo canônico de `intent_payload` (a ordem é fixada pelo `computeIntentHa
   "carteira": [                             // ENUMERADA. Nunca uma query. Ver §5.2b
     { "item_id": "...", "transacao_id": "...", "devedor_pessoa_id": "...", "valor_centavos": 0 }
   ],
-  "holdout_fraction": 0.2,                  // grupo de controle (§9.2)
-  "holdout_unit": "devedor_pessoa_id",      // DECISÃO EM ABERTO — §9.2 / Q6
-  "steps": [ { "step": 1, "template_id": "cob.lembrete_cordial.v1", "offset_days": 0 },
-             { "step": 2, "template_id": "cob.followup_1.v1",       "offset_days": 7 } ],
-  "max_steps_per_item": 3,
-  "contact_window": { "tz": "America/Sao_Paulo", "inicio": "09:00", "fim": "18:00",
-                      "dias": ["MO","TU","WE","TH","FR"], "respeita_feriados": true },
+  "holdout_fraction": "<DA-01>",            // grupo de controle (§9.2)
+  "holdout_unit": "<DA-02>",                // unidade do sorteio (§9.2)
+  "steps": "<DA-03>",                       // quais passos, com que intervalo
+  "max_steps_per_item": "<DA-05>",          // teto de passos por item
+  "contact_window": "<DA-04>",              // horário, dias, feriados, fuso
   "valor_max_centavos": 0,                  // o agente não move dinheiro (§6.2)
-  "attribution_window_days": 14,            // fixado ANTES de medir (§9.1)
-  "expires_at": "2026-..."
+  "attribution_window_days": "<DA-06>",     // fixado ANTES de medir (§9.1)
+  "expires_at": "<fim do piloto>"
 }
 ```
+
+**Os `<DA-nn>` não são reticências de rascunho: são campos que ninguém decidiu.** Cada um deles é uma decisão de dono nomeado, e um valor "de exemplo" ali — inclusive dentro deste bloco de código — vira default de fato na terceira vez que alguém o lê. O registro completo (dono, evidência, consequência) está no [ADR 0006](../../architecture/decisions/0006-cobranca-piloto-perguntas-em-aberto.md); o que segue é a forma curta, com o mesmo marcador usado nos dois documentos.
+
+> **DECISÃO ABERTA — DA-01 · fração do holdout** — Q6(a) do ADR 0006
+>
+> Que fatia da carteira fica sem ser cobrada durante o piloto. Opções (a ordem não é ranking):
+>
+> - **(a)** nenhuma — piloto sem grupo de controle;
+> - **(b)** uma fração fixa, a definir pelo dono do produto;
+> - **(c)** uma fração dimensionada por poder estatístico, a partir do tamanho da carteira;
+> - **(d)** holdout só na primeira janela, com a carteira inteira tratada depois.
+>
+> **O que muda.** Com (a), "R$ recuperado" mede sobretudo quem pagaria de qualquer forma e o critério de saída da fase 2 fica sem contrafactual (§9.2). (b) e (c) custam recuperação real durante o piloto; (c) exige um cálculo de poder que ninguém fez. (d) mede só efeito de curto prazo. Seja qual for, o valor entra no envelope e portanto no hash — mudá-lo depois invalida o mandato (§5.3).
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-02 · unidade experimental do holdout** — Q6(b) do ADR 0006
+>
+> O que é sorteado entre tratamento e controle. Opções (a ordem não é ranking):
+>
+> - **(a)** o item de carteira (uma dívida);
+> - **(b)** o devedor (`devedor_pessoa_id`);
+> - **(c)** o documento (CPF/CNPJ), agrupando homônimos e duplicatas de `pessoas`;
+> - **(d)** o grupo econômico.
+>
+> **O que muda.** Com (a), uma pessoa com duas pendências cai em tratamento por um item e em controle por outro: recebe a régua e é contada no grupo que não recebeu nada — *spillover*, que faz a diferença tratamento × controle **subestimar** o efeito, e cuja contaminação é maior justamente onde há mais dados, porque devedores com múltiplas pendências são os mais frequentes. (b) fecha isso dentro de uma carteira, não entre carteiras. (c) e (d) fecham mais e exigem um agrupador que **não existe no schema** — não há documento normalizado com deduplicação nem noção de grupo econômico. Nenhuma das quatro elimina a interferência fora do canal: o time humano de cobrança continua trabalhando a carteira, e isso não é resolvível por schema.
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-03 · cadência (quais passos, com que intervalo)** — Q8 do ADR 0006
+>
+> O conteúdo de `steps`: quantos passos, qual `template_id` em cada um, e o `offset_days` entre eles. Opções (a ordem não é ranking):
+>
+> - **(a)** passo único, sem follow-up;
+> - **(b)** uma régua curta, com intervalo fixo entre passos;
+> - **(c)** uma régua com intervalos crescentes;
+> - **(d)** cadência derivada do atraso do item (quanto mais vencido, mais espaçado — ou o contrário).
+>
+> **O que muda.** Volume do piloto, custo por item e a leitura da métrica: passos demais fazem o efeito medido incluir fadiga, passos de menos deixam o piloto sem sinal. A cadência também interage com DA-04 (a janela empurra passos para o próximo dia útil) e com um eventual teto por destinatário (§7.1b), que hoje **não existe como mecanismo**.
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-04 · janela de contato (horário, dias, feriados, fuso)** — Q5 e Q8 do ADR 0006
+>
+> O conteúdo de `contact_window`. Opções (a ordem não é ranking):
+>
+> - **(a)** a janela mínima que o jurídico apontar como exigida pela normativa aplicável;
+> - **(b)** uma janela mais estreita que a exigida, por política do tenant;
+> - **(c)** janela por fuso do devedor, em vez de um fuso único do tenant;
+> - **(d)** janela por dia da semana, com regra própria para sábado e véspera de feriado.
+>
+> **O que muda.** A janela é o único gate de horário que existiria neste caminho: §6.2b mostra que **não há gate de horário sobre mensagem de saída** hoje, e que `horario_permitido` é gate financeiro por pessoa, não permissão de envio. Uma janela por fuso do devedor (c) exige um dado de fuso por pessoa que o schema não tem. Os números são jurídicos (Q5) antes de serem operacionais.
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-05 · máximo de passos por item** — Q8 do ADR 0006
+>
+> O `max_steps_per_item`, que é o teto físico de linhas materializadas por item. Opções (a ordem não é ranking):
+>
+> - **(a)** um teto pequeno e fixo, igual para toda a carteira;
+> - **(b)** teto por faixa de valor ou de atraso;
+> - **(c)** teto igual ao número de passos de `steps` (DA-03), sem folga;
+> - **(d)** teto derivado de um limite jurídico por destinatário, se a Q5 fixar um.
+>
+> **O que muda.** É a contagem física de slots (§7.1): não há caminho pelo qual o loop envie mais do que os slots materializados **para aquele item**. Mas o teto é **por dívida, não por destinatário** (§7.1b) — com (d), o mecanismo descrito nesta spec é insuficiente e precisa de escopo `(tenant, agent, devedor, janela)` atravessando objetivos, que não existe.
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-06 · janela de atribuição da métrica** — Q7 e §9.1 do ADR 0006
+>
+> O `attribution_window_days`: quanto tempo depois de um contato um pagamento ainda conta como relacionado a ele. Opções (a ordem não é ranking):
+>
+> - **(a)** uma janela fixa em dias, igual para todos os passos;
+> - **(b)** uma janela por passo (o último contato "vale" menos tempo);
+> - **(c)** janela até o próximo contato do mesmo item, sem sobreposição;
+> - **(d)** sem janela: compara-se só o estado final de tratamento × controle no fim do piloto.
+>
+> **O que muda.** A janela é o que separa "o contato teve efeito" de "a pessoa ia pagar mesmo". Estar dentro do hash é o que impede ajustá-la depois de ver o resultado (§9.1) — por isso ela precisa ser escolhida **antes** do primeiro envio, e por isso um valor de exemplo aqui é pior que campo vazio.
+>
+> - `decided_by:`
+> - `decided_at:`
 
 **A carteira é uma lista, não um filtro.** Essa é a resposta à exigência "limitar a uma carteira sem gambiarra": um item que não está na lista não pode ser contatado, porque não existe slot para ele. Não há flag para afrouxar, nem `WHERE` para alargar. Ampliar a carteira significa novo envelope, novo hash, nova aprovação de dois owners.
 
 `attribution_window_days` estar dentro do hash é intencional: fixa a régua de medição **antes** de existir resultado, para que ninguém a ajuste depois para melhorar o número (§9.1).
 
-`holdout_unit` está no envelope **porque a unidade experimental é uma decisão, não um detalhe de implementação** — e portanto precisa estar hash-pinada como todo o resto. §9.2.
+`holdout_unit` está no envelope **porque a unidade sorteada faz parte do desenho experimental pré-registrado, não do sorteador** — e desenho pré-registrado precisa estar hash-pinado como todo o resto. Qual unidade: DA-02, §9.2.
 
 ### §5.2b O item da carteira carrega o vínculo devedor→WhatsApp, porque o schema não carrega
 
@@ -334,9 +418,21 @@ Os dois vocabulários de "approval class" do repo não são o mesmo, e é fácil
 - As classes de `approval_requests` (`single_confirmation` / `requester_plus_one_owner` / `two_distinct_owners`) são, por desenho de #521, **decididas por WhatsApp**: `notifyForRequest` avisa os owners e `parseApprovalReply` intercepta a resposta **antes do LLM**. Expiram em `DUAL_APPROVAL_TIMEOUT_HOURS` (default **6h**).
 - As classes de `src/admin-ui/lib/approval-matrix.ts` são governança de proposta e **exclusivas do console**.
 
-Ativar uma régua autônoma é mudança de comportamento, e o blueprint mantém dual-approval no console. Mas o mecanismo que dá a evidência imutável (`approval_requests`) é WhatsApp-nativo. A spec **propõe**: decisão no console, com `approval_requests` como registro de evidência, e a notificação por WhatsApp servindo de aviso, não de canal de assinatura. Isso exige que `recordApprovalDecision` aceite `channel: 'console'`.
+Ativar uma régua autônoma é mudança de comportamento, e o blueprint mantém dual-approval no console. Mas o mecanismo que dá a evidência imutável (`approval_requests`) é WhatsApp-nativo. Os dois fatos não se encaixam sozinhos, e a spec **não escolhe o encaixe**:
 
-6h de TTL é curto para uma aprovação que exige dois owners no console. O TTL do mandato provavelmente precisa ser próprio — §12.Q9.
+> **DECISÃO ABERTA — DA-10 · classe de aprovação, canal e TTL do mandato** — Q9 do ADR 0006
+>
+> Quem assina o mandato, por onde, e por quanto tempo a assinatura fica aberta. Opções (a ordem não é ranking):
+>
+> - **(a)** `two_distinct_owners` assinado no console, com `approval_requests` só como evidência — exige que `recordApprovalDecision` aceite `channel: 'console'`;
+> - **(b)** `two_distinct_owners` assinado por WhatsApp, no mecanismo nativo de #521, sem código novo de canal;
+> - **(c)** `requester_plus_one_owner`, se o tenant do piloto não tiver dois owners distintos e ativos;
+> - **(d)** classe nova, específica de mandato, com TTL próprio maior que `DUAL_APPROVAL_TIMEOUT_HOURS`.
+>
+> **O que muda.** Baixar a classe (c) enfraquece o argumento central da §5.1 — aprovar o envelope equivale a aprovar cada envio **porque** dois humanos assinaram. (a) e (d) são código novo. (b) contraria o blueprint, que mantém dual-approval no console. E o TTL global de `DUAL_APPROVAL_TIMEOUT_HOURS` (**6h**, fato do repo) é curto para juntar dois owners no console, o que empurra para (d) ou para um mandato que expira antes de ser assinado.
+>
+> - `decided_by:`
+> - `decided_at:`
 
 ---
 
@@ -355,7 +451,7 @@ A lista do owner, traduzida uma a uma. Nenhuma linha depende de prompt.
 | Decidir sobre dívida contestada | `legal_intent_detect` (determinístico) positivo ⇒ transição obrigatória para `waiting_human` e `revoked` em todos os slots restantes daquele item | §8.1. **Mas "contestada" não é um estado do banco** — §12.Q4 |
 | Exceder a frequência **por dívida** | Slot consumível uma única vez + unique `(objective_id, carteira_item_id, step)` | §7 |
 | Exceder a frequência **por destinatário** | **Nada.** Não há mecanismo | §7.1b — decisão em aberto |
-| Contatar fora de hora | `window_start`/`window_end` do slot (derivados da janela do envelope + `computeNextWithBusinessDays` para feriados) — §6.2b | perceptor não cria tarefa; executor recusa slot fora da janela |
+| Contatar fora de hora | `window_start`/`window_end` do slot (derivados da janela do envelope + `computeNextWithBusinessDays` para feriados) — §6.2b. **Os valores da janela são DA-04** | perceptor não cria tarefa; executor recusa slot fora da janela |
 
 ### §6.2 Sobre `valor_max = 0`
 
@@ -459,29 +555,41 @@ Esta spec deliberadamente **não** cria um rate limit de saída novo. Se um kind
 Quatro gatilhos, todos **determinísticos e avaliados pelo backend**:
 
 1. `legal_intent_detect` positivo em qualquer mensagem do devedor (léxico PT-BR determinístico — `src/tools/legal-intent-detect.ts`).
-2. Devedor responde qualquer coisa que não case com uma classificação tipada estreita (§8.2).
+2. Devedor responde. **O que dispara exceção aqui — toda resposta, ou só a que não casa com uma classificação tipada estreita — depende da DA-09** (§8.2).
 3. Divergência de estado: o item aparece pago no meio da régua, ou o valor mudou, ou o devedor não tem canal válido.
 4. Falha repetida de entrega para o mesmo item.
 
 Nos casos 1 e 3, além da exceção, **todos os slots restantes daquele item vão para `revoked`**. Parar é decisão do backend, tomada no perceptor; o modelo não participa.
 
-### §8.2 Inbound do devedor sai do loop — e esta é a regra que PREVALECE
+### §8.2 Inbound do devedor — a decisão que a draft tomou sozinha
 
-Quando o devedor responde, a mensagem entra pelo caminho normal de turno (gateway → decision engine). Para o piloto:
+Quando o devedor responde, a mensagem entra pelo caminho normal de turno (gateway → decision engine). O que acontece a partir daí **não está decidido**, e a draft escondia isso ao afirmar uma regra num parágrafo e perguntar o oposto na Q10.
 
-- Uma classificação tipada estreita, com limiar de backend, reconhece apenas **promessa de pagamento com data** e **alegação de já ter pago**. Ambas apenas registram o desfecho no slot e escalam.
-- **Qualquer outra coisa** — incluindo silêncio ambíguo — vira exceção humana.
+Dois fatos de repositório emolduram a decisão, e nenhum dos dois a toma:
 
-**O agente NÃO responde ao devedor de forma autônoma no piloto, em nenhum horário.** A draft contradizia a si mesma: este parágrafo dizia "nunca responde" e a Q10 perguntava se ele responderia de madrugada. A contradição está resolvida assim, e a resolução é uma **proposta ao dono do produto**, registrada como tal:
+- **Não existe gate de horário sobre mensagem de saída** (§6.2b): `horario_permitido` é gate financeiro por pessoa (`src/governance/financial-authorization.ts:172`), `no_action_outside_business_hours_high_risk` referencia `context.is_business_hours`, campo inexistente no código (`migrations/037`), e `business-day-rrule.ts` dá dia útil, não hora. Qualquer opção que envolva "responder só dentro da janela" precisa de mecanismo novo.
+- **Texto livre para terceiro sobre dívida é a superfície que a §6.3 fecha por construção.** Nenhuma opção abaixo reabre essa porta: todas passam por template aprovado.
 
-> **Proposta:** a regra do §8.2 prevalece sobre a Q10. Não existe resposta autônoma ao devedor — logo a pergunta "responde fora da janela?" não tem objeto no piloto. Um eventual acuse de recebimento automático (por exemplo "recebemos sua mensagem, um humano responde no horário comercial") seria um **envio novo, com template próprio, dentro do mesmo mecanismo de slot e janela** — e portanto uma decisão separada, não uma exceção ao §8.2.
+> **DECISÃO ABERTA — DA-09 · resposta ao inbound do devedor (inclusive fora da janela)** — Q10 do ADR 0006
+>
+> O que o loop faz quando o devedor responde. Opções (a ordem não é ranking):
+>
+> - **(a)** silêncio: toda resposta do devedor vira exceção humana, sem nenhum envio de volta, em qualquer horário;
+> - **(b)** acuse de recebimento automático por template próprio, dentro do mesmo mecanismo de slot e janela — logo, silêncio fora da janela e acuse quando ela abrir;
+> - **(c)** acuse de recebimento automático em qualquer horário, fora do mecanismo de slot;
+> - **(d)** resposta por template para uma classificação tipada estreita (promessa de pagamento com data, alegação de já ter pago), com tudo o mais virando exceção humana.
+>
+> **O que muda.** (a) é a mais restritiva e a que menos exige código; deixa o devedor sem retorno até um humano abrir a fila (DA-07). (b) exige mecanismo de janela para inbound, que não existe. (c) contorna a janela e é a que mais expõe o piloto a "cobrança fora de hora" caso a Q5 fixe um horário. (d) muda a natureza do risco jurídico e enfraquece o argumento da §6.3, porque o agente passa a emitir mensagem **em reação ao conteúdo** do devedor — ainda que por template. A escolha também determina o gatilho 2 da §8.1 e o critério de aceite 18 da §14, que hoje **não existe** justamente por depender dela.
+>
+> - `decided_by:`
+> - `decided_at:`
 
-Isto é restritivo de propósito. É o ponto onde o texto livre entraria, e texto livre para terceiro sobre dívida é a superfície que a §6.3 existe para fechar. Ver §12.Q10 e o decision log.
+Enquanto DA-09 estiver sem assinatura, esta spec **não afirma** comportamento nenhum para inbound de devedor — nem silêncio, nem acuse. Ver ADR 0006, Q10.
 
 ### §8.3 Travar e destravar
 
 - Executor retorna `{ transition: 'waiting_human' }`; a tarefa aparece em `objectives.listExceptions` e na aba Objetivos — **isto já existe e funciona** (v1).
-- O humano resolve no console. Hoje `resolveTask` aceita apenas `done|failed` (`src/admin-ui/trpc/routers/objectives.ts:64`) e não consegue devolver a tarefa ao loop. **Precisa passar a aceitar `resume`**, que transiciona `waiting_human → pending` com a resposta no `payload`. Router + repo, sem migração. A #696 já deu a esse caminho escopo por tenant e CAS sobre `waiting_human`; `resume` entra no mesmo desenho.
+- O humano resolve a exceção — em que superfície é DA-07. Hoje `resolveTask` aceita apenas `done|failed` (`src/admin-ui/trpc/routers/objectives.ts:64`) e não consegue devolver a tarefa ao loop. **Precisa passar a aceitar `resume`**, que transiciona `waiting_human → pending` com a resposta no `payload`. Router + repo, sem migração. A #696 já deu a esse caminho escopo por tenant e CAS sobre `waiting_human`; `resume` entra no mesmo desenho.
 - **Expiração é fail-closed**: exceção não resolvida dentro do TTL **não** retoma sozinha. A tarefa vai para `failed` e os slots restantes do item para `revoked`. O default do silêncio é parar de cobrar, nunca continuar. Isto é um sweeper novo sobre `objective_tasks` (§8.4), não o `pending-expirer`.
 
 ### §8.4 O que a v1 documentou como existente e não existe
@@ -492,9 +600,21 @@ A spec v1 diz: *"A resposta do owner (WhatsApp ou console) destrava a procedure 
 2. **`pending_questions` não tem nenhuma superfície de console.** Nenhum router do admin-ui lê ou escreve a tabela. É WhatsApp-only.
 3. **`uniq_pending_questions_active_per_conversa`** (`migrations/004`) permite **uma** pending question aberta por conversa. Se as exceções da régua virassem pending questions na conversa do owner, elas **serializariam**: a segunda cancelaria a primeira.
 
-O ponto 3 é decisivo. Uma régua com dezenas de itens gera exceções em paralelo; um canal que só comporta uma pergunta aberta por vez não é fila, é funil. **Por isso a fila de exceções do piloto é a do console** (`objective_tasks.status='waiting_human'` + `resolveTask`), e `objective_tasks.pending_question_id` fica NULL nesta versão.
+O ponto 3 é o que restringe as opções: uma régua com dezenas de itens gera exceções em paralelo, e um canal que só comporta uma pergunta aberta por conversa serializa os casos. Restringe — não decide.
 
-Notificação por WhatsApp de que *há* exceções é um resumo agregado ("3 casos aguardam você"), não uma pergunta por caso. Aprovar caso a caso pelo WhatsApp fica para depois de o ponto 3 ser resolvido em trabalho próprio — §12.Q11.
+> **DECISÃO ABERTA — DA-07 · superfície em que o humano atende a fila de exceções** — Q11 do ADR 0006
+>
+> Onde o owner destrava uma tarefa em `waiting_human`. Opções (a ordem não é ranking):
+>
+> - **(a)** só no console (`objective_tasks.status='waiting_human'` + `resolveTask`), com `objective_tasks.pending_question_id` NULL;
+> - **(b)** só no WhatsApp, caso a caso — exige resolver antes a limitação de `uniq_pending_questions_active_per_conversa` (`migrations/004`), em trabalho próprio;
+> - **(c)** console para atender, mais notificação agregada por WhatsApp ("N casos aguardam você"), que não é pergunta por caso e não esbarra no índice;
+> - **(d)** as duas superfícies com paridade, o que exige (b) mais reconciliação entre elas.
+>
+> **O que muda.** (a) obriga o owner a abrir o console para destravar — não resolve pelo celular. (b) e (d) mudam a **ordem das fatias**: o índice da `004` vira pré-requisito da fatia 4, e isso é trabalho que não está nesta spec. (c) é o meio-termo e ainda exige um agregador que não existe. Em qualquer opção, `resolveTask` precisa passar a aceitar `resume` (§8.3) — essa parte não depende da superfície.
+>
+> - `decided_by:`
+> - `decided_at:`
 
 ---
 
@@ -522,16 +642,28 @@ A draft afirmava que a reprodutibilidade "vem de calcular sobre `objective_conta
 | Componente | Estado |
 |---|---|
 | O que a Maia fez (contatos, quando, para qual item) | **Reproduzível** a partir de `objective_contact_slots` |
-| Quantos itens liquidaram na janela | **Observável, não reproduzível** — depende do estado atual de `transacoes`, que é sobrescrito. Um snapshot por ciclo é evidência, não prova |
+| Quantos itens liquidaram na janela | **Observável, não reproduzível** — depende do estado atual de `transacoes`, que é sobrescrito. Como (e se) recuperar a série temporal perdida é DA-08 |
 | Custo de máquina do piloto | **Não atribuível** hoje sem rateio arbitrário |
 | Custo humano | **Sem fonte** |
 | "R$ líquido recuperado" | **Não computável com rigor** enquanto os três acima estiverem abertos |
 
-O que tornaria isso reproduzível é uma decisão de dado, não de código do work loop: um **ledger append-only de liquidação** (ou, no mínimo, um snapshot imutável e datado do estado dos itens da carteira a cada ciclo, gravado pelo próprio worker de métrica) e **atribuição de custo por objetivo**. Nenhum dos dois existe. Ver §12.Q1 e §12.Q7.
+O que tornaria isso reproduzível é uma decisão de dado, não de código do work loop: um **ledger append-only de liquidação** — ou algum substituto mais barato, que é DA-08 — e **atribuição de custo por objetivo**. Nenhum dos dois existe. Ver §12.Q1 e §12.Q7.
 
-Um snapshot datado por ciclo é o mitigador barato e honesto: ele não torna o passado imutável retroativamente, mas cria a série temporal que faltava a partir do dia em que o piloto começa. É a proposta desta spec para a fatia 4.
+> **DECISÃO ABERTA — DA-08 · como a métrica recupera a série temporal que `transacoes` não guarda** — Q1 e Q7 do ADR 0006
+>
+> `transacoes` é sobrescrita in-place e não há ledger de liquidação. Opções (a ordem não é ranking):
+>
+> - **(a)** nada: a métrica declara-se observável e não reproduzível, e o relatório diz isso;
+> - **(b)** ledger append-only de liquidação, com migração própria — resolve o problema na raiz e é trabalho fora desta spec;
+> - **(c)** cópia imutável e datada do estado dos itens da carteira, gravada a cada ciclo pelo worker de métrica;
+> - **(d)** (c) restrita aos itens da carteira do piloto, descartada no fim dele.
+>
+> **O que muda.** (a) é honesta e não custa nada, e o critério de saída da fase 2 fica sem número reproduzível. (b) é a única que torna o passado auditável de verdade, e é a mais cara. (c) e (d) não tornam o passado imutável retroativamente — criam a série a partir do dia em que o piloto começa — e são dado novo sob uma matriz de retenção que segue `DRAFT — NOT APPROVED` (Q5), então passam pelo DPO. Nenhuma das quatro conserta a atribuição de custo, que é Q7.
+>
+> - `decided_by:`
+> - `decided_at:`
 
-### §9.2 Grupo de controle — e a CORREÇÃO da unidade experimental
+### §9.2 Grupo de controle — e a unidade que a draft escolheu sem perguntar
 
 Sem holdout, "R$ recuperado" mede sobretudo **as pessoas que teriam pagado de qualquer forma**. Uma régua sobre uma carteira de inadimplentes recentes exibe recuperação alta mesmo sem enviar nada. Por isso o envelope carrega `holdout_fraction`, e a divisão é sorteada na materialização com semente derivada do `intent_hash` (reprodutível, fixada antes de qualquer resultado).
 
@@ -539,19 +671,17 @@ Sem holdout, "R$ recuperado" mede sobretudo **as pessoas que teriam pagado de qu
 
 Uma pessoa com duas pendências pode cair simultaneamente em tratamento (item A) e em controle (item B). Ela **recebe** a régua e ao mesmo tempo é contada no grupo que supostamente não recebeu nada. O efeito medido no controle passa a incluir o efeito do tratamento — o clássico *spillover* —, e a diferença tratamento × controle **subestima** o efeito real por construção. Pior: a contaminação é maior justamente onde o piloto tem mais dados, porque devedores com múltiplas pendências são os que mais aparecem.
 
-**Correção:** a **unidade experimental precisa ser o devedor** (ou outro cluster aprovado, por exemplo o grupo econômico), não o item. Todos os itens de um mesmo devedor caem no mesmo braço. É por isso que `holdout_unit` entra no envelope (§5.2) e portanto no hash — a unidade é parte do desenho experimental pré-registrado, não um detalhe do sorteador.
+Esse é um achado sobre o sorteio por item — não uma escolha de substituto. **Qual unidade passa a valer é decisão do dono do produto com o dono dos dados** (DA-02, §5.2), e é por isso que `holdout_unit` entra no envelope e portanto no hash: a unidade é parte do desenho pré-registrado, não um detalhe do sorteador. A fração sorteada é DA-01.
 
-**Isto é decisão, não implementação.** Quem define a unidade aprovada (devedor? CPF/CNPJ? grupo econômico? e o que fazer com homônimos e duplicatas em `pessoas`) é o dono do produto com o dono dos dados — §12.Q6. A spec **propõe** `devedor_pessoa_id` como unidade e registra que qualquer unidade menor que o devedor é experimentalmente inválida.
-
-Nota de honestidade: mesmo com clusterização por devedor, o holdout continua sujeito a interferência fora do canal (o time de cobrança humano continua trabalhando a carteira). Isso não é resolvível por schema; é uma limitação a declarar no relatório da fatia 5, não a esconder.
+Nota de honestidade, válida para **qualquer** opção da DA-02: o holdout continua sujeito a interferência fora do canal (o time de cobrança humano continua trabalhando a carteira). Isso não é resolvível por schema; é uma limitação a declarar no relatório da fatia 5, não a esconder.
 
 ### §9.3 O que se mede
 
 | Métrica | Fonte | Observação |
 |---|---|---|
 | Contatos efetivados por item/passo | `objective_contact_slots` | reproduzível |
-| Itens liquidados na janela (tratamento × controle) | snapshot datado por ciclo + `transacoes` | **observável, não reproduzível** — §9.1b |
-| R$ "líquido" | acima − custo LLM − custo de mensagem − tempo humano | **incompleto** — §9.1b, §12.Q7 |
+| Itens liquidados na janela (tratamento × controle) | `transacoes` + o que a DA-08 decidir | **observável, não reproduzível** — §9.1b |
+| R$ "líquido" | o que entra na conta é Q7; a janela de atribuição é DA-06 | **incompleto e ainda indefinido** — §9.1b, §12.Q7 |
 | Taxa de contato | `consumed` / `available+consumed` | |
 | Intervenção humana | tarefas que passaram por `waiting_human` / total | é a métrica de autonomia real |
 | Reclamações / bloqueios | sinal jurídico, opt-out, falha de entrega por bloqueio | **é breaker, não painel** (§11.3). O opt-out não tem registro durável — §12.Q5 |
@@ -655,18 +785,18 @@ CDC art. 42 e a normativa aplicável a cobrança por mensagem: horário permitid
 - **A matriz de retenção segue `DRAFT — NOT APPROVED`** (`docs/architecture/concerns/data-retention-matrix.md`, linha 3), pendente do DPO. O registro de contato de cobrança é dado novo sob essa matriz.
 
 **Q6 — CORRIGIDA: grupo de controle é aceitável, e qual é a unidade?**
-Duas perguntas, não uma. (a) O owner aceita não cobrar uma fatia da carteira durante o piloto? (b) Qual é a **unidade experimental**? A draft sorteava por item, o que contamina o experimento (§9.2). A spec propõe `devedor_pessoa_id`. Qualquer unidade menor que o devedor é experimentalmente inválida; qualquer unidade maior (grupo econômico) precisa de um agrupador que hoje não existe no schema.
+Duas perguntas, não uma. (a) O owner aceita não cobrar uma fatia da carteira durante o piloto, e qual fatia — **DA-01**? (b) O que é sorteado — **DA-02**? A draft sorteava por item, o que contamina o experimento (§9.2); as opções e o que muda em cada uma estão nos dois blocos da §5.2. Agrupar por documento ou por grupo econômico exige um agrupador que hoje não existe no schema.
 
 **Q7 — O que entra em "líquido"?** Custo de mensagem é mensurável. Custo de LLM existe, mas agregado por dia e por dia+pessoa em USD (`src/lib/cost-ledger.ts:94`, `:102`) — **não por objetivo nem por slot** —, e não há política cambial para trazê-lo a BRL. Tempo humano em exceções não tem fonte. Estimar por contagem de exceções × constante, ou declarar "recuperado bruto menos custo de mensagem" e parar de chamar de líquido? Ver §9.1b.
 
-**Q8 — Quantos passos, com que intervalo, e quando parar?** `max_steps_per_item`, `offset_days` e o critério de desistência são política de cobrança do tenant. **Inclui a política de parada quando um teto por destinatário for definido (Q5)**: suprimir o slot, revogar a régua ou escalar.
+**Q8 — Quantos passos, com que intervalo, e quando parar?** `max_steps_per_item` (**DA-05**), `steps`/`offset_days` (**DA-03**) e o critério de desistência são política de cobrança do tenant. **Inclui a política de parada quando um teto por destinatário for definido (Q5)**: suprimir o slot, revogar a régua ou escalar. Nenhum dos três tem valor nesta spec, nem como exemplo.
 
-**Q9 — Quem assina o mandato, e por quanto tempo a assinatura fica aberta?** `two_distinct_owners` exige dois owners distintos e ativos. O tenant do piloto tem dois? Se não, `requester_plus_one_owner` é aceitável para um mandato desta natureza? E o TTL: `DUAL_APPROVAL_TIMEOUT_HOURS` é 6h global — curto para juntar dois owners no console (§5.5). Mandato ganha TTL próprio?
+**Q9 — Quem assina o mandato, e por quanto tempo a assinatura fica aberta? (DA-10)** A classe `two_distinct_owners` exige dois owners distintos e ativos. O tenant do piloto tem dois? Se não, `requester_plus_one_owner` é aceitável para um mandato desta natureza? E o TTL: `DUAL_APPROVAL_TIMEOUT_HOURS` é 6h global — curto para juntar dois owners no console (§5.5). Mandato ganha TTL próprio?
 
-**Q10 — RESOLVIDA COMO PROPOSTA: o que acontece quando o devedor responde no meio da noite?**
-A draft se contradizia: §8.2 dizia que o agente nunca responde autonomamente ao devedor no piloto, e a Q10 perguntava se ele responderia de madrugada. **A proposta é que o §8.2 prevaleça**: sem resposta autônoma em nenhum horário; toda resposta do devedor vira exceção humana. Um acuse de recebimento automático, se o dono o quiser, é um envio novo com template próprio dentro do mesmo mecanismo de slot e janela — decisão separada. **Confirmação do dono do produto necessária**; enquanto ela não vier, a regra vigente da spec é a do §8.2.
+**Q10 — EM ABERTO (DA-09): o que acontece quando o devedor responde no meio da noite?**
+A draft se contradizia — o §8.2 afirmava uma coisa e a própria Q10 perguntava o oposto — e a v2 anterior "resolveu" a contradição escolhendo um dos lados sem assinatura, o que é a mesma falha em outra forma. As quatro opções (silêncio; acuse dentro da janela; acuse a qualquer hora; resposta tipada) e o que muda em cada uma estão no bloco **DA-09** da §8.2. Esta spec **não afirma** nenhuma delas, e o critério de aceite correspondente só existe depois da assinatura. Contexto que restringe as opções: não há gate de horário sobre mensagem de saída (§6.2b).
 
-**Q11 — Onde o owner atende as exceções?** A spec põe a fila no console (§8.4), porque uma pending question por conversa serializaria os casos. Isso significa que o owner precisa abrir o console para destravar. Aceitável para o piloto, ou destravar pelo celular é requisito? Se for requisito, a limitação de `uniq_pending_questions_active_per_conversa` precisa ser resolvida antes, em trabalho próprio.
+**Q11 — Onde o owner atende as exceções? (DA-07)** Uma pending question por conversa serializaria os casos (`migrations/004`), o que restringe as opções sem escolher entre elas — as quatro estão no bloco **DA-07** da §8.4. Se destravar pelo celular for requisito, a limitação do índice precisa ser resolvida **antes**, em trabalho próprio, e isso muda a ordem das fatias.
 
 **Q12 — Vale ligar o work loop a procedures algum dia?** §3.3 mostra que hoje não dá. Consertar isso é investimento real. **Não deve ser falsamente resolvida dentro do piloto**: vira ADR próprio depois da fatia 5, ou o executor-em-código por kind é declarado o desenho definitivo.
 
@@ -679,9 +809,11 @@ Cada linha é uma pré-condição, não uma sugestão. Nenhuma fatia começa ant
 | Antes de | Condição |
 |---|---|
 | **Fatia 3** (mandato, slots, kind sem envio) | Spec atualizada para a `main`, **PR de spec aceita**, Q1/Q2b/Q3 assinadas, e as seis correções da §0 resolvidas — não apenas lidas |
-| **Fatia 4 — shadow** | Q2/Q2c/Q4/Q10 fechadas; ingestão tenant-safe testada; carteira com **100%** dos vínculos válidos (§5.2b) |
-| **Fatia 5 — envio real** | Q5–Q11 aprovadas pelos respectivos donos; **DPO e jurídico assinam**; desenho experimental e métrica **pré-fixados** (§9.1b, §9.2); shadow aprovado |
+| **Fatia 4 — shadow** | **Q1, Q2b e Q3 assinadas** (as três bloqueantes valem para 3, 4 e 5 — não é herança implícita da linha acima); Q2/Q2c/Q4/Q10 fechadas; ingestão tenant-safe testada; carteira com **100%** dos vínculos válidos (§5.2b) |
+| **Fatia 5 — envio real** | **Q1, Q2b e Q3 assinadas** (idem: as três valem aqui também); Q5–Q11 aprovadas pelos respectivos donos; **DPO e jurídico assinam**; **todo bloco DECISÃO ABERTA com `decided_by`/`decided_at` preenchidos e o valor promovido**; shadow aprovado |
 | **Pós-piloto** | Q12 pode virar ADR próprio. **Não deve ser falsamente resolvida dentro do piloto** |
+
+**Nenhuma fatia de 3 a 5 tem critério de entrada que passe por cima de Q1, Q2b e Q3.** As três aparecem nomeadas em cada uma das três linhas de propósito: uma cadeia implícita ("a linha acima já cobria") é exatamente como um gate some.
 
 **A fatia 2 fica fora desta cadeia.** Por ser endurecimento genérico e inerte (§4.6), ela não depende de nenhuma pergunta em aberto e permanece separável: pode ser feita e mergeada em paralelo, em PR própria.
 
@@ -690,6 +822,8 @@ Cada linha é uma pré-condição, não uma sugestão. Nenhuma fatia começa ant
 ## §14. Critérios de aceite
 
 Verificáveis. Cada um é um teste, não uma opinião. Eles valem para as fatias 3–5, **não para esta PR**, que é só spec.
+
+**Nenhum critério aqui pode depender de uma DECISÃO ABERTA.** Um critério de aceite sobre decisão não assinada é a decisão entrando pela porta dos fundos: quem escreve o teste fixa o valor. Os dois que faziam isso (resposta ao devedor, unidade do holdout) foram removidos e só voltam quando DA-09 e DA-02 forem assinadas.
 
 **Fronteira de decisão**
 1. Objetivo do kind nasce `paused`; `setStatus('active')` sem mandato `approved` é recusado.
@@ -715,11 +849,11 @@ Verificáveis. Cada um é um teste, não uma opinião. Eles valem para as fatias
 15. `legal_intent_detect` positivo ⇒ tarefa `waiting_human`, slots restantes do item `revoked`, exceção listada.
 16. Resposta humana devolve a tarefa a `pending` (`resolveTask` com `resume`) e o executor a retoma com a resposta no payload.
 17. Exceção expirada ⇒ `failed` + slots `revoked`; **nunca** retomada automática.
-18. Resposta do devedor ⇒ **zero** envio autônomo de volta, em qualquer horário (§8.2).
+18. **VAGO até DA-09 ser assinada.** O critério sobre o que o loop faz com a resposta do devedor depende de qual das quatro opções da DA-09 valer; escrevê-lo agora seria decidir a Q10 dentro de um checklist. O número fica reservado de propósito — some-lo daria a impressão de que o assunto foi coberto.
 
 **Métricas**
 19. Holdout e tratamento são reportados separadamente; a métrica de saída é a diferença.
-20. **Todos os itens de um mesmo devedor caem no mesmo braço** (§9.2). Um devedor em tratamento e controle simultaneamente é falha de teste.
+20. **Todos os itens de uma mesma unidade sorteada caem no mesmo braço.** Qual é a unidade vem da DA-02 — o teste lê `holdout_unit` do envelope em vez de fixar a unidade no código, e falha se alguma unidade aparecer nos dois braços.
 21. O relatório declara explicitamente o que **não** é reproduzível (§9.1b) em vez de apresentar um número liso.
 
 **Isolamento**
@@ -758,7 +892,7 @@ A fatia 4 é a que não deve ser pulada: é a única em que um erro de perceptor
 | Cobrar quem já pagou | revalidação em duas etapas (§4.4/§4.5) + fatia 4 | **Alto enquanto Q1 estiver aberta.** É o risco que decide o piloto |
 | Exceder um teto jurídico por destinatário | nenhuma | **Alto e NÃO mitigado** — §7.1b. É lacuna de mecanismo, não de configuração |
 | Métrica de saída interpretada como prova | §9.1b declara o que não é reproduzível | **Médio** — depende de o relatório repetir a declaração |
-| Holdout contaminado | unidade experimental por devedor (§9.2) | Médio — interferência do time humano de cobrança permanece |
+| Holdout contaminado | **nenhuma até DA-02 ser assinada** — o sorteio por item contamina, e a spec não escolheu substituto | **Alto enquanto DA-02 estiver aberta**; mesmo depois, a interferência do time humano de cobrança permanece |
 | Mensagem entregue após decisão de parar | janela curta de slot; níveis 0–3 | Baixo, irreversível por natureza |
 | Principal de serviço vira porta larga | `valor_max=0`, grants mínimos, `denied_tools` | **Médio-alto até Q3 ser respondida** — e Q3 é trabalho novo, não herdado de #521 |
 | Template cordial soa mal em contexto real | revisão humana na aprovação + fatia 4 | Médio — é julgamento, não teste |
@@ -771,3 +905,4 @@ A fatia 4 é a que não deve ser pulada: é a única em que um erro de perceptor
 - **Nenhum dado de tenant real foi inspecionado.** Tudo o que a Q1 pergunta sobre população e frescor de `transacoes` continua sem resposta empírica aqui.
 - **Nenhuma execução de worker.** `objective_perceive`/`objective_execute` nunca rodaram em produção (o grupo `console` nasce desligado); esta revisão leu o código, não o observou rodando.
 - **Nenhuma consulta jurídica.** Todos os números da Q5 permanecem em branco de propósito.
+- **Nenhuma das dez DECISÕES ABERTAS foi decidida aqui, e nenhuma delas tem valor de exemplo neste documento.** Um "por exemplo, 20%" repetido três vezes vira default sem que ninguém tenha escolhido — foi assim que a draft chegou a uma fração de holdout, uma cadência, uma janela e um teto de passos que nenhum dono assinou. O guard `tests/unit/docs/decisoes-abertas-cobranca.spec.ts` reprova se qualquer um desses valores reaparecer fora de um bloco `DECISÃO ABERTA`, e reprova também se um bloco for assinado sem o valor ser promovido.
