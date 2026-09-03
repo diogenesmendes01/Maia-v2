@@ -60,12 +60,41 @@
  * reprova (passo 2 sem o passo 1). Não há caminho que promova um valor sem que
  * um humano edite ESTE arquivo — e essa edição é a evidência.
  *
+ * ## O alcance de cada item, e por que ele não é uniforme
+ *
+ * Um valor pode voltar como campo (`"holdout_fraction": 0.2`) ou como prosa
+ * ("cerca de 20% dos devedores como grupo de controle"). A forma de campo é
+ * fácil; a de prosa exige cobrir a FAMÍLIA da frase, não a frase. Onde a
+ * família está fechada, está anotado no item. Hoje:
+ *
+ * - **DA-01** e **DA-02** cobrem campo **e** prosa. Para a fração: percentual
+ *   (com `%` ou "por cento"), decimal e fração em palavras, na vizinhança de
+ *   holdout/controle/tratamento, nos dois sentidos de leitura. Para a unidade:
+ *   a afirmação no MODO ASSERTIVO — verbo de ligação, futuro ou dever entre o
+ *   sorteio e a unidade — e o enquadramento exclusivo ("nunca por item").
+ * - **DA-03 a DA-10** cobrem com segurança a forma de campo e as formas de
+ *   prosa que a draft de fato usou. Outra redação pode escapar.
+ *
+ * A distinção que sustenta a DA-02 é de **modo verbal, não de vocabulário**:
+ * "o sorteio por item contamina" é o diagnóstico e precisa continuar dizível;
+ * "o sorteio é por item" é a regra e reprova. Por isso o imperfeito ("a draft
+ * sorteava por item") fica de fora de propósito.
+ *
+ * ### Uma armadilha que custou dois padrões mortos
+ *
+ * `\b` do JavaScript é ASCII-only. `/\bé\b/u.test("holdout é por devedor")` é
+ * **false**, porque "é" não é caractere de palavra para ele — e o mesmo vale
+ * para `será`, `são`, `vão`. Um verbo acentuado cercado de `\b` é um padrão
+ * que nunca dispara e que parece cobertura em code review. Onde a borda cai
+ * sobre acento, use lookaround Unicode: `(?<![\p{L}])…(?![\p{L}])`.
+ *
  * ## O que esta suíte NÃO afirma
  *
  * Que a decisão está certa, que o dono correto assinou, ou que o valor promovido
  * é o que ele disse. Nada disso é verificável a partir do texto. O que ela
  * afirma é que nenhum valor entra nos dois documentos sem passar pelo ato
- * explícito acima.
+ * explícito acima. Também não é prova de impossibilidade: é um ratchet por
+ * padrão textual, com o alcance declarado por item logo acima.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -155,10 +184,44 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     da: 'DA-01',
     rotulo: 'fração do holdout (o "20% de holdout")',
     pergunta: 'Q6(a)',
+    // A fração não precisa da palavra "holdout" para ser a fração: "20% dos
+    // devedores como grupo de controle" é o mesmo valor com outro vocabulário.
+    // Por isso a vizinhança inclui controle/tratamento, e as formas cobertas
+    // são percentual, decimal e fração em palavras — nos dois sentidos de
+    // leitura, porque o número tanto precede quanto segue o substantivo.
     padroes: [
       { re: /holdout_fraction\s*"?\s*[:=]\s*"?\d/u, porque: 'campo do envelope com valor numérico' },
-      { re: /\bholdout\b[^.\n]{0,60}\d{1,3}\s*%/iu, porque: 'percentual de holdout em prosa' },
-      { re: /\d{1,3}\s*%[^.\n]{0,60}\bholdout\b/iu, porque: 'percentual de holdout em prosa' },
+      {
+        re: /\b\d{1,3}(?:[.,]\d+)?\s*(?:%|por cento)[^.\n]{0,70}\b(?:holdout|controle|tratamento)\b/iu,
+        porque: 'percentual na vizinhança de holdout/controle/tratamento',
+      },
+      {
+        re: /\b(?:holdout|grupo de controle|bra[çc]o de controle|grupo de tratamento)\b[^.\n]{0,70}\d{1,3}(?:[.,]\d+)?\s*(?:%|por cento)/iu,
+        porque: 'percentual na vizinhança de holdout/controle/tratamento',
+      },
+      {
+        // A quantidade tem de PARECER quantidade. Um `\d` solto aqui lia
+        // "§5.2" como número e reprovava a própria tabela de índice do ADR —
+        // o mesmo tropeço que a DA-06 já tinha tido.
+        re: /\bfra[çc][ãa]o\b[^.\n]{0,30}\b(?:do holdout|de holdout|de controle|do grupo de controle)\b[^.\n]{0,30}(?:\d{1,3}\s*%|0[.,]\d+|\d{1,3}\s+por cento|\d{1,2}\s+em\s+\d{1,2})/iu,
+        porque: 'fração do holdout com quantidade concreta',
+      },
+      {
+        re: /\b0[.,]\d+\b[^.\n]{0,50}\b(?:holdout|grupo de controle)\b/iu,
+        porque: 'fração decimal na vizinhança de holdout/controle',
+      },
+      {
+        re: /\b(?:holdout|grupo de controle)\b[^.\n]{0,50}\b0[.,]\d+\b/iu,
+        porque: 'fração decimal na vizinhança de holdout/controle',
+      },
+      {
+        re: /\b(?:d[ée]cimo|quinto|quarto|ter[çc]o|metade)\b[^.\n]{0,50}\b(?:holdout|controle|tratamento)\b/iu,
+        porque: 'fração em palavras na vizinhança de holdout/controle',
+      },
+      {
+        re: /\b(?:holdout|grupo de controle)\b[^.\n]{0,50}\b(?:d[ée]cimo|quinto|quarto|ter[çc]o|metade)\b/iu,
+        porque: 'fração em palavras na vizinhança de holdout/controle',
+      },
     ],
   },
   {
@@ -168,7 +231,8 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     padroes: [
       { re: /holdout_unit\s*"?\s*[:=]\s*"?[A-Za-z_]/u, porque: 'campo do envelope com unidade concreta' },
       {
-        re: /\bunidade experimental\b[^.\n]{0,30}\b(?:[ée]|precisa ser|deve ser|ser[áa]|passa a ser)\b/iu,
+        // Bordas Unicode, não `\b`: ver o comentário em VERBOS_ASSERTIVOS abaixo.
+        re: /\bunidade experimental\b[^.\n]{0,30}(?<![\p{L}])(?:é|precisa ser|deve ser|será|passa a ser)(?![\p{L}])/iu,
         porque: 'unidade afirmada no indicativo',
       },
       { re: /\bunidade experimental por devedor\b/iu, porque: 'unidade afirmada como mitigação vigente' },
@@ -178,6 +242,35 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
         porque: 'critério de aceite que fixa a unidade',
       },
       { re: /\bsorte(?:ia|ado|ada)\s+por devedor\b/iu, porque: 'unidade afirmada no indicativo' },
+      // O que denuncia a unidade não é a palavra "sorteio" perto de "por
+      // item" — essa combinação é o DIAGNÓSTICO da draft, e ele precisa
+      // continuar dizível ("a randomização por item contamina", "o sorteio por
+      // item"). O que denuncia é a unidade dita no modo ASSERTIVO: um verbo de
+      // ligação, de futuro ou de dever entre o sorteio e a unidade, ou o
+      // enquadramento exclusivo ("nunca por item", "em vez de por devedor").
+      // A distinção é de modo verbal, não de vocabulário, e é por isso que
+      // ela sobrevive a reformulação.
+      {
+        // ATENÇÃO à borda: `\b` do JS é ASCII-only, então /\bé\b/ NUNCA casa —
+        // "é" não é caractere de palavra para ele. Um verbo acentuado entre
+        // `\b` é um padrão morto, e foi exatamente isso que deixou passar
+        // "O sorteio do holdout é por devedor." e "A randomização será por
+        // documento.". As bordas aqui são lookarounds Unicode.
+        re: /\b(?:sorteio|sorte(?:ia|iam|ado|ada|ados|adas)|randomiza(?:ção|cao|do|da)|aleatoriza(?:ção|cao|do|da)|holdout|grupo de controle|bra[çc]o)(?![\p{L}])[^.\n]{0,60}(?<![\p{L}])(?:é|são|fica|ficam|sai|saem|roda|opera|vai|vão|será|serão|passa a ser|passam a ser|deve ser|devem ser|precisa ser|precisam ser|acontece|se dá|agrupa|agrupado|agrupada|clusteriza|clusterizado)(?![\p{L}])[^.\n]{0,24}\bpor\s+(?:devedor|item|pessoa|documento|CPF|CNPJ|contraparte|grupo econ[ôo]mico)\b/iu,
+        porque: 'unidade do sorteio afirmada no modo assertivo',
+      },
+      {
+        re: /\b(?:nunca|sempre|jamais|e n[ãa]o|em vez de|ao inv[ée]s de)\s+por\s+(?:devedor|item|pessoa|documento|CPF|CNPJ|grupo econ[ôo]mico)\b/iu,
+        porque: 'unidade afirmada por exclusão ("nunca por item")',
+      },
+      {
+        re: /\bunidade\b[^.\n]{0,40}(?<![\p{L}])(?:é|será|passa a ser|vai ser|deve ser|precisa ser)\s+(?:o\s+|a\s+)?(?:devedor|item|documento|CPF|CNPJ|pessoa|grupo econ[ôo]mico)\b/iu,
+        porque: 'unidade afirmada no indicativo',
+      },
+      {
+        re: /\bholdout_unit\b[^.\n]{0,20}(?<![\p{L}])(?:é|será|vai ser)\s+`?(?:devedor|item|documento|CPF|CNPJ)/iu,
+        porque: 'unidade afirmada no indicativo',
+      },
     ],
   },
   {
