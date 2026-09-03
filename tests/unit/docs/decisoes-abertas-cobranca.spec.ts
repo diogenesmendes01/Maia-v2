@@ -60,41 +60,81 @@
  * reprova (passo 2 sem o passo 1). Não há caminho que promova um valor sem que
  * um humano edite ESTE arquivo — e essa edição é a evidência.
  *
- * ## O alcance de cada item, e por que ele não é uniforme
+ * ## O alcance: uma lista de FORMAS CONHECIDAS, não uma cobertura de prosa
  *
- * Um valor pode voltar como campo (`"holdout_fraction": 0.2`) ou como prosa
- * ("cerca de 20% dos devedores como grupo de controle"). A forma de campo é
- * fácil; a de prosa exige cobrir a FAMÍLIA da frase, não a frase. Onde a
- * família está fechada, está anotado no item. Hoje:
+ * Leia esta seção antes de confiar no guard, e antes de editar a lista.
  *
- * - **DA-01** e **DA-02** cobrem campo **e** prosa. Para a fração: percentual
- *   (com `%` ou "por cento"), decimal e fração em palavras, na vizinhança de
- *   holdout/controle/tratamento, nos dois sentidos de leitura. Para a unidade:
- *   a afirmação no MODO ASSERTIVO — verbo de ligação, futuro ou dever entre o
- *   sorteio e a unidade — e o enquadramento exclusivo ("nunca por item").
- * - **DA-03 a DA-10** cobrem com segurança a forma de campo e as formas de
- *   prosa que a draft de fato usou. Outra redação pode escapar.
+ * **Nenhum item cobre prosa arbitrária. Nenhum.** Um valor pode voltar como
+ * campo (`"holdout_fraction": 0.2`) ou como prosa ("cerca de 20% dos devedores
+ * como grupo de controle"). A forma de campo é fechada. A de prosa não é
+ * fechável por regex: o que existe, por item, é uma **lista enumerada de formas
+ * conhecidas** — as que a draft de fato usou, mais as que revisões encontraram.
+ * Essa lista é o contrato, e ela é finita por construção.
+ *
+ * DA-01 e DA-02 têm a lista mais longa (percentual com `%` ou "por cento",
+ * decimal, fração em palavras, vizinhança de holdout/controle/tratamento; e a
+ * unidade no modo assertivo ou por exclusão). Isso as torna mais difíceis de
+ * reincidir — **não** cobertas.
+ *
+ * ### Formas conhecidamente NÃO cobertas
+ *
+ * Estas atravessam hoje. Estão aqui porque quem edita a lista precisa saber que
+ * a classe existe, e qual é:
+ *
+ * | frase | por que atravessa |
+ * |---|---|
+ * | `A alocação entre braços acontece no nível do devedor.` | diz a unidade sem nenhum verbo assertivo mapeado — "no nível do" no lugar de "por" |
+ * | `Reservamos uma em cada cinco carteiras para comparação.` | fração em razão ("uma em cada cinco"), forma não prevista; e "comparação" está fora do vocabulário de vizinhança |
+ * | `O braço sem contato representa 20 por cento do total.` | "braço sem contato" é sinônimo de holdout fora do vocabulário (holdout/controle/tratamento) |
+ *
+ * Contraste com `Um quinto dos inadimplentes permanece sem tratamento durante o
+ * piloto.`, que **reprova** — a mesma ideia, mas com "tratamento" na vizinhança
+ * e a fração numa forma prevista. A diferença entre as duas é vocabulário, não
+ * substância: é exatamente a fronteira do que um guard textual alcança.
+ *
+ * Apertar mais fecha algumas formas e deixa outras, com retorno decrescente e
+ * risco crescente de falso positivo. A escolha registrada é parar aqui e
+ * **declarar**, em vez de perseguir cobertura que não existe.
+ *
+ * ### Então onde mora a defesa de verdade
+ *
+ * Não no regex. A defesa é o procedimento: a lista é curta e legível, promover
+ * um valor exige os **quatro passos no mesmo PR**, e o quarto passo é editar
+ * ESTE arquivo — o que põe a promoção na frente de um revisor humano. O guard é
+ * um **ratchet contra reincidência das formas que a draft usou**, não uma prova
+ * de impossibilidade. Quem quiser burlar consegue; o ponto é que não consegue
+ * por descuido, que é como as dez decisões viraram default da primeira vez.
  *
  * A distinção que sustenta a DA-02 é de **modo verbal, não de vocabulário**:
  * "o sorteio por item contamina" é o diagnóstico e precisa continuar dizível;
  * "o sorteio é por item" é a regra e reprova. Por isso o imperfeito ("a draft
  * sorteava por item") fica de fora de propósito.
  *
- * ### Uma armadilha que custou dois padrões mortos
+ * ## ARMADILHA DA LINGUAGEM: `\b` do JavaScript é ASCII-only
  *
- * `\b` do JavaScript é ASCII-only. `/\bé\b/u.test("holdout é por devedor")` é
- * **false**, porque "é" não é caractere de palavra para ele — e o mesmo vale
- * para `será`, `são`, `vão`. Um verbo acentuado cercado de `\b` é um padrão
- * que nunca dispara e que parece cobertura em code review. Onde a borda cai
- * sobre acento, use lookaround Unicode: `(?<![\p{L}])…(?![\p{L}])`.
+ * Isto não é uma nota sobre a DA-02. Vale para **qualquer guard textual em
+ * português neste repositório**, e é a razão de esta seção estar em caixa alta.
+ *
+ *     /\bé\b/u.test('holdout é por devedor')        // false
+ *     /\bserá\b/u.test('randomização será por doc')  // false
+ *
+ * `é`, `á`, `ã`, `ç`, `õ` não são caracteres de palavra para o `\b`, nem com a
+ * flag `u`. Um padrão como `\b(?:[ée]|ser[áa])\b` **nunca dispara** — e passa
+ * em code review parecendo cobertura, porque a lista de alternativas está lá e
+ * ninguém executa a regex mentalmente. Duas versões deste próprio arquivo
+ * foram entregues com padrões mortos por isso.
+ *
+ * Onde a borda cai sobre caractere acentuado, use lookaround Unicode:
+ * `(?<![\p{L}])…(?![\p{L}])`. Onde cai sobre ASCII (`\bunidade\b`), `\b` está
+ * correto e é mais legível — não troque por ritual.
  *
  * ## O que esta suíte NÃO afirma
  *
  * Que a decisão está certa, que o dono correto assinou, ou que o valor promovido
- * é o que ele disse. Nada disso é verificável a partir do texto. O que ela
- * afirma é que nenhum valor entra nos dois documentos sem passar pelo ato
- * explícito acima. Também não é prova de impossibilidade: é um ratchet por
- * padrão textual, com o alcance declarado por item logo acima.
+ * é o que ele disse. Nada disso é verificável a partir do texto. E, depois da
+ * seção de alcance acima: **não afirma que um valor não pode voltar em prosa.**
+ * O que ela afirma é que nenhum valor volta nas formas enumeradas nesta lista
+ * sem que um humano edite este arquivo.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
