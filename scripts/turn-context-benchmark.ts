@@ -330,17 +330,23 @@ export const SCOPE_READS_PER_TURN_MIN = 1;
  * A margem dos critérios RELATIVOS candidato-vs-baseline: p95 e p99 ≤
  * baseline × (1 + margem); throughput ≥ baseline × (1 − margem).
  *
- * Por que 10%, e não os 20% da versão anterior: os +20% existiam para
- * comparar contra um baseline ARQUIVADO, medido noutro dia — e entre
- * contêineres este host já mediu o mesmo código a 67,0 ms e 135,5 ms de p95.
- * O protocolo da decisão da #525 exclui essa fonte de variância: baseline e
+ * **A margem é ORÇAMENTO DE REGRESSÃO, não medida de ruído** — enquadramento
+ * ratificado pelo dono em 2026-09-03. Ela responde a uma pergunta de
+ * negócio: quanto de p95/p99/throughput estamos dispostos a PAGAR por um
+ * candidato que traz outra coisa em troca. 10% é esse preço máximo; a
+ * regressão que motivou a decisão da #525 (~3× no p95) passa longe dele.
+ *
+ * O ruído NÃO é problema da margem — é problema do protocolo. Baseline e
  * candidato rodam na MESMA janela, na mesma máquina, com a mesma massa, em
- * corridas consecutivas imediatas e com o load average registrado. O que
- * sobra é ruído de escalonador de uma corrida para a seguinte, e 10% cobre
- * esse ruído com folga enquanto continua rejeitando com margem enorme a
- * regressão que motivou a decisão (~3× no p95). Quem comparar através de
- * janelas diferentes não deve afrouxar a margem: deve re-medir o baseline na
- * janela nova (`--mode measure --write-baseline`).
+ * corridas consecutivas imediatas e com o load average registrado; entre
+ * contêineres este host já mediu o mesmo código a 67,0 ms e 135,5 ms de p95,
+ * e é o protocolo que exclui essa variância, não a folga do número. Se o
+ * ruído da janela chegar perto de 10%, a resposta é medir de novo numa
+ * janela mais quieta (o controle re-medindo o próprio baseline diz quanto é
+ * ruído) — nunca afrouxar a margem, porque cada ponto de folga dado ao ruído
+ * é um ponto de regressão real que passa a entrar sem ser visto. Quem
+ * comparar através de janelas diferentes deve re-medir o baseline na janela
+ * nova (`--mode measure --write-baseline`).
  */
 export const MARGEM_RELATIVA_DEFAULT = 0.1;
 
