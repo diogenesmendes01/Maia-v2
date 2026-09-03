@@ -70,6 +70,27 @@ function semComentarios(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 }
 
+/**
+ * Constrói uma entrada de inventário DELIBERADAMENTE quebrada, para exercitar
+ * a catraca de RUNTIME.
+ *
+ * A ratificação de #506 tornou `OutboundDeclaredException` uma união
+ * discriminada com os oito campos obrigatórios: uma exceção sem `blocked_by`,
+ * sem `owner` ou sem condição de remoção **não compila**. Essa é a metade NOVA
+ * da defesa, e ela não pode ser testada — código que não compila não roda.
+ *
+ * A metade antiga continua tendo de funcionar, porque é a única que pega o que
+ * atravessa um `as`: uma entrada montada em runtime, um JSON, um cast de quem
+ * estava com pressa. Este helper é o `as`, isolado num lugar só e nomeado pelo
+ * que faz — para que ninguém o use por engano num caso que deveria compilar.
+ */
+function comCampoQuebrado(
+  base: OutboundSendPath,
+  campos: Record<string, unknown>,
+): OutboundSendPath {
+  return { ...base, ...campos } as unknown as OutboundSendPath;
+}
+
 function arquivosTs(dir: string, acc: string[] = []): string[] {
   for (const nome of readdirSync(dir)) {
     const p = join(dir, nome);
@@ -331,6 +352,12 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
     // "certinho" — motivo escrito, contenção escrita, categoria válida. É o
     // formato EXATO em que as dez exceções de hoje entraram, e a única coisa
     // que a distingue delas é não estar ratificada.
+    //
+    // A ratificação de #506 acrescentou três campos, e a rota de mentira os
+    // preenche TAMBÉM — com dono real, prazo válido e condição de remoção com
+    // sonda. É de propósito: se os campos novos bastassem para barrá-la, o
+    // caso passaria a testar a validação de forma, e não a catraca. O que a
+    // recusa continua sendo uma coisa só — o id não está ratificado.
     const rotaDeMentira: OutboundSendPath = {
       id: 'workers.novo_disparador_paralelo',
       module: 'src/workers/novo-disparador-paralelo.ts',
@@ -342,6 +369,13 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
       containment: 'Best-effort, com log de falha. Também impecável.',
       blocked_by: 'no_turn_to_anchor',
       remediation: 'Âncora durável para saída proativa.',
+      owner: 'diogenesmendes01',
+      deadline: { kind: 'prazo', expires: '2099-12-31' },
+      removal: {
+        when: '`commitStandaloneOutbound` existir em `src/runtime/outbound/commit.ts`.',
+        why_sufficient: 'Impecável também. E irrelevante: a rota não foi ratificada.',
+        probes: [{ module: 'src/runtime/outbound/commit.ts', symbol: 'commitStandaloneOutbound' }],
+      },
     };
     expect(() => assertRatifiedInventory([...OUTBOUND_SEND_PATHS, rotaDeMentira])).toThrow(
       /NÃO RATIFICADA/,
@@ -360,7 +394,7 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
     // verde vazio.
     const cobaia = OUTBOUND_SEND_PATHS.find((p) => p.id === 'identity.quarantine');
     expect(cobaia, 'a cobaia saiu do inventário — escolha outra exceção viva').toBeDefined();
-    const semImpedimento = { ...cobaia!, blocked_by: undefined };
+    const semImpedimento = comCampoQuebrado(cobaia!, { blocked_by: undefined });
     expect(() =>
       assertRatifiedInventory([
         ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'identity.quarantine'),
@@ -373,7 +407,7 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
     // Mesma troca de cobaia, e pela mesma razão, do caso acima.
     const cobaia = OUTBOUND_SEND_PATHS.find((p) => p.id === 'workers.pending_reminder');
     expect(cobaia, 'a cobaia saiu do inventário — escolha outra exceção viva').toBeDefined();
-    const semRemediacao = { ...cobaia!, remediation: '   ' };
+    const semRemediacao = comCampoQuebrado(cobaia!, { remediation: '   ' });
     expect(() =>
       assertRatifiedInventory([
         ...OUTBOUND_SEND_PATHS.filter((p) => p.id !== 'workers.pending_reminder'),
