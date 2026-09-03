@@ -509,7 +509,39 @@ jobs:
         # conteúdo (`tests/e2e/jornadas-backend.spec.ts`), com piso próprio
         # (`--min 3 --max-pulados 0`, nos dois passos logo abaixo) e com uma
         # sonda vermelha por jornada registrada no corpo da PR.
-        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --rotulo "integração (node ${{ matrix.node }})"
+        #
+        # ── E por que o teto de pulados desta lane também é ZERO ─────────────
+        #
+        # `--min 1` sozinho reprova a rodada VAZIA e nada mais. Ele não vê mil
+        # e duzentos casos rodarem enquanto dez somem: `executados` continua
+        # muito acima do piso, e o gate aprova sorrindo. É o modo de falha que
+        # esta lane tem de temer, porque aqui `describe.skip` NÃO é uma escolha
+        # do autor do teste — é o que 121 arquivos de `tests/integration/`
+        # fazem quando falta infraestrutura. O padrão é sempre a mesma
+        # expressão:
+        #
+        #     const SHOULD_RUN = !!process.env.TEST_DB_URL
+        #       && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+        #     const d = SHOULD_RUN ? describe : describe.skip;
+        #
+        # Some uma das duas variáveis do bloco `env:` deste job, ou o serviço
+        # do Postgres muda de porta, ou o runtime de container que os specs de
+        # `testcontainers` procuram deixa de existir — e a lane inteira vira
+        # `describe.skip` sem que uma linha vermelha apareça. Um gate que passa
+        # quando o banco falta é exatamente o verde vazio que ele deveria
+        # impedir. É a MESMA regra que a lane e2e logo abaixo aplica a si
+        # mesma, e pelo mesmo motivo.
+        #
+        # ZERO não é uma meta: é o número que esta lane JÁ tem. A rodada de
+        # `b79d4d93` deu `executados=1207  falharam=0  pulados=0` nas duas
+        # pernas da matriz. O teto não aperta nada hoje; ele impede que a
+        # perda seja silenciosa amanhã.
+        #
+        # Se algum dia um skip legítimo aparecer aqui, o caminho é subir o teto
+        # NESTA linha, com o motivo escrito ao lado — uma decisão visível no
+        # diff, como a catraca de exceções de egresso da #506. O que não pode
+        # é a lane perder cobertura sem ninguém assinar embaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --max-pulados 0 --rotulo "integração (node ${{ matrix.node }})"
 
       - name: Jornadas e2e de backend (#703)
         env:
