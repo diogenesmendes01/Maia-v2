@@ -90,7 +90,6 @@
  *     `isDirectInvocation` que este arquivo segue em vez de inventar outro
  */
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1020,9 +1019,4 @@ if (isDirectInvocation(process.argv[1], import.meta.url) && !process.env.DRILL_7
       process.exitCode = 1;
     },
   );
-}
-
-/** Exportado só para o teste de isolamento — `existsSync` sem `import` extra lá. */
-export function fixtureExisteEm(dir: string, nome: string): boolean {
-  return existsSync(join(dir, nome));
 }
