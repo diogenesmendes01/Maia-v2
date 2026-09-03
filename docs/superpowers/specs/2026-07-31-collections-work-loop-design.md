@@ -74,7 +74,7 @@ Três problemas concretos que caem dessa pergunta:
 | Teto de contatos por DESTINATÁRIO | §7.1b: o mecanismo proposto não implementa isso. É decisão em aberto (Q5/Q8), não item de escopo. |
 | Segundo kind / generalização | v3. Generalizar a partir de um caso é como se inventa abstração errada. |
 | Cobrança de dívida contestada, negativada, prescrita ou judicializada | Decisão de negócio/jurídica **e lacuna de dado** — §12.Q4/Q5. |
-| Aprovação de mandato via WhatsApp | Dual-approval e travas de arquitetura permanecem exclusivos do console. |
+| Mecanismo novo de aprovação fora do que a DA-10 pedir | Classe, canal e TTL da assinatura do mandato são **decisão aberta** (DA-10, §5.5). O blueprint (`2026-06-10-learnable-workforce-vision.md` §2.4) mantém dual-approval exclusivo do console, e o encaixe disso com o mecanismo WhatsApp-nativo de #521 é exatamente o que a DA-10 registra — esta spec não constrói canal de aprovação antes dessa assinatura. |
 
 ---
 
@@ -261,7 +261,7 @@ A fatia 2 é, portanto: enumerar tuplas `(tenant_id, agent_id)` com trabalho e u
 
 ### §5.1 O argumento
 
-O gate não pode ser a mensagem do usuário, porque não há mensagem. Também não pode ser "o LLM foi instruído", porque isso não é gate. A resposta desta spec é que o gate **muda de lugar no tempo**: sai do instante da ação e vai para um ato humano anterior, durável, assinado por dois, com hash e validade.
+O gate não pode ser a mensagem do usuário, porque não há mensagem. Também não pode ser "o LLM foi instruído", porque isso não é gate. A resposta desta spec é que o gate **muda de lugar no tempo**: sai do instante da ação e vai para um ato humano anterior, durável, assinado na classe de aprovação que a DA-10 fixar (§5.5), com hash e validade.
 
 Isso só é legítimo sob uma condição, e vale enunciá-la porque é a espinha do desenho:
 
@@ -381,7 +381,7 @@ Conteúdo canônico de `intent_payload` (a ordem é fixada pelo `computeIntentHa
 > - `decided_by:`
 > - `decided_at:`
 
-**A carteira é uma lista, não um filtro.** Essa é a resposta à exigência "limitar a uma carteira sem gambiarra": um item que não está na lista não pode ser contatado, porque não existe slot para ele. Não há flag para afrouxar, nem `WHERE` para alargar. Ampliar a carteira significa novo envelope, novo hash, nova aprovação de dois owners.
+**A carteira é uma lista, não um filtro.** Essa é a resposta à exigência "limitar a uma carteira sem gambiarra": um item que não está na lista não pode ser contatado, porque não existe slot para ele. Não há flag para afrouxar, nem `WHERE` para alargar. Ampliar a carteira significa novo envelope, novo hash, nova aprovação na classe que a DA-10 fixar.
 
 `attribution_window_days` estar dentro do hash é intencional: fixa a régua de medição **antes** de existir resultado, para que ninguém a ajuste depois para melhorar o número (§9.1).
 
@@ -622,7 +622,7 @@ O ponto 3 é o que restringe as opções: uma régua com dezenas de itens gera e
 
 ### §9.1 O critério de saída, e por que ele é difícil
 
-"Valor líquido recuperado" é o critério de saída da fase 2. Para ser um número e não uma narrativa, precisa de três propriedades: ser **reproduzível** (recalculável do zero a partir de linhas imutáveis), ser **atribuível** (dá para dizer que o pagamento tem relação com o contato) e ser **líquido** (desconta custo).
+"Valor líquido recuperado" é o critério de saída da fase 2. Para ser um número e não uma narrativa, precisa de três propriedades: ser **reproduzível** (recalculável do zero a partir de linhas imutáveis), ser **atribuível** (dá para dizer que o pagamento tem relação com o contato) e ser **líquido** — e a composição desse "líquido" (quais custos entram na conta, medidos como, em que moeda, e se o número ainda pode chamar-se líquido) **é decisão aberta**: DA-11, §9.1b.
 
 O consumo de slot dá metade da primeira: `objective_contact_slots` seria append-com-CAS, com timestamp por transição, e portanto um registro fiel de **o que a Maia fez**. O problema é o outro lado da conta.
 
@@ -645,9 +645,23 @@ A draft afirmava que a reprodutibilidade "vem de calcular sobre `objective_conta
 | Quantos itens liquidaram na janela | **Observável, não reproduzível** — depende do estado atual de `transacoes`, que é sobrescrito. Como (e se) recuperar a série temporal perdida é DA-08 |
 | Custo de máquina do piloto | **Não atribuível** hoje sem rateio arbitrário |
 | Custo humano | **Sem fonte** |
-| "R$ líquido recuperado" | **Não computável com rigor** enquanto os três acima estiverem abertos |
+| "R$ líquido recuperado" | **Não computável com rigor** enquanto os três acima estiverem abertos — e **a própria composição da conta é DA-11** |
 
-O que tornaria isso reproduzível é uma decisão de dado, não de código do work loop: um **ledger append-only de liquidação** — ou algum substituto mais barato, que é DA-08 — e **atribuição de custo por objetivo**. Nenhum dos dois existe. Ver §12.Q1 e §12.Q7.
+O que tornaria isso reproduzível é uma decisão de dado, não de código do work loop: um **ledger append-only de liquidação** — ou algum substituto mais barato, que é DA-08 — e **atribuição de custo por objetivo**. Nenhum dos dois existe. Ver §12.Q1 e §12.Q7. E mesmo com os dois resolvidos, **o que entra na conta** continua sendo uma escolha do dono, não uma consequência técnica:
+
+> **DECISÃO ABERTA — DA-11 · composição do "R$ líquido" (o que entra na conta, e o nome honesto do número)** — Q7 do ADR 0006
+>
+> Quais custos o "líquido" desconta do recuperado bruto, medidos como — e se o resultado ainda pode chamar-se "líquido". Opções (a ordem não é ranking):
+>
+> - **(a)** só o custo de mensagem — e o número passa a chamar-se "recuperado bruto menos custo de mensagem", nunca "líquido";
+> - **(b)** custo de mensagem mais custo de LLM rateado ao piloto por um critério declarado no relatório, com a conversão USD→BRL por uma política cambial igualmente declarada — ambos inexistentes hoje (`src/lib/cost-ledger.ts:94`, `:102`; nenhuma conversão cambial no repositório);
+> - **(c)** (b) mais o custo humano das exceções, estimado por contagem de exceções × constante declarada pelo dono;
+> - **(d)** nenhum desconto: reportar recuperado bruto e cada custo separadamente, sem subtração, e aposentar a palavra "líquido" no relatório do piloto.
+>
+> **O que muda.** O nome do critério de saída da fase 2 — e a honestidade dele. (a) e (d) são computáveis hoje e abandonam a promessa da palavra "líquido"; (b) exige atribuição de custo por objetivo e política cambial, que **não existem** (§9.1b), e todo rateio é uma escolha que muda o número; (c) soma uma constante que ninguém mediu. Seja qual for, o relatório da fatia 5 declara a composição escolhida junto do número — um "líquido" sem a conta aberta é narrativa, não métrica. Interage com DA-06 (janela de atribuição) e DA-08 (série temporal da receita).
+>
+> - `decided_by:`
+> - `decided_at:`
 
 > **DECISÃO ABERTA — DA-08 · como a métrica recupera a série temporal que `transacoes` não guarda** — Q1 e Q7 do ADR 0006
 >
@@ -681,10 +695,10 @@ Nota de honestidade, válida para **qualquer** opção da DA-02: o holdout conti
 |---|---|---|
 | Contatos efetivados por item/passo | `objective_contact_slots` | reproduzível |
 | Itens liquidados na janela (tratamento × controle) | `transacoes` + o que a DA-08 decidir | **observável, não reproduzível** — §9.1b |
-| R$ "líquido" | o que entra na conta é Q7; a janela de atribuição é DA-06 | **incompleto e ainda indefinido** — §9.1b, §12.Q7 |
+| R$ "líquido" | o que entra na conta é DA-11; a janela de atribuição é DA-06 | **incompleto e ainda indefinido** — §9.1b, §12.Q7 |
 | Taxa de contato | `consumed` / `available+consumed` | |
 | Intervenção humana | tarefas que passaram por `waiting_human` / total | é a métrica de autonomia real |
-| Reclamações / bloqueios | sinal jurídico, opt-out, falha de entrega por bloqueio | **é breaker, não painel** (§11.3). O opt-out não tem registro durável — §12.Q5 |
+| Reclamações / bloqueios | sinal jurídico, opt-out, falha de entrega por bloqueio | **é breaker, não painel** (§11.3) — e o limiar que o dispara é DA-12. O opt-out não tem registro durável — §12.Q5 |
 | Falsos positivos | slots `revoked` por "já estava pago" / total | mede a qualidade do perceptor; é o indicador de dano ao cliente |
 
 ### §9.4 Instrumentação
@@ -731,12 +745,28 @@ Resolvido em §5.2 pela carteira enumerada e hash-pinada. **Não existe filtro p
 
 | Nível | Ação | Efeito | Latência |
 |---|---|---|---|
-| 0 | **Breaker automático** | reclamação/bloqueio acima do limiar ⇒ objetivo `paused` + exceção aberta. **Nunca se re-arma sozinho** | segundos |
+| 0 | **Breaker automático** | reclamação/bloqueio acima do limiar **que a DA-12 fixar** ⇒ objetivo `paused` + exceção aberta. **Nunca se re-arma sozinho** | segundos |
 | 1 | `objectives.setStatus('paused')` | perceptor para; claim cancela órfãs | próximo tick |
 | 2 | Revogar o mandato | slots `available`/`claimed` → `revoked` | imediato |
 | 3 | Grupo `console` fora de `MAIA_SCHEDULER_GROUPS` / `lockdown` | para o loop / o sistema | imediato |
 
 O que **não** se desfaz: mensagem já entregue pelo relayer. Está declarado aqui em vez de escondido — é a razão de a janela do slot ser curta.
+
+O nível 0 é desenho: pausa automática, exceção aberta, sem re-arme. **O que ninguém decidiu é o gatilho** — quanto sinal, de que tipo, em que janela de contagem:
+
+> **DECISÃO ABERTA — DA-12 · limiar do breaker automático (nível 0)** — Q8 e Q5 do ADR 0006
+>
+> Quanto sinal dispara o breaker, contado como, sobre que janela — e onde o valor vive. Opções (a ordem não é ranking):
+>
+> - **(a)** qualquer ocorrência única — o primeiro sinal jurídico, opt-out ou bloqueio de entrega pausa o objetivo;
+> - **(b)** um teto absoluto por objetivo, fixado pelo dono no envelope (e portanto no hash do mandato);
+> - **(c)** um teto proporcional ao volume de envios ou ao tamanho da carteira, com o denominador declarado;
+> - **(d)** limiar por tipo de sinal — sinal jurídico dispara sozinho; falha de entrega e opt-out acumulam até um teto próprio.
+>
+> **O que muda.** (a) é a mais conservadora e a única sem número a escolher — e transforma um falso positivo isolado em parada do piloto inteiro. (b) põe o valor sob a mesma assinatura do mandato; mudá-lo re-materializa a régua (§5.3). (c) exige definir denominador e janela, que são duas decisões a mais, não menos. (d) reconhece que os sinais têm gravidade diferente — e o que conta como "reclamação" esbarra na Q5: **o opt-out não tem registro operacional durável hoje** (§12.Q5), então um limiar sobre sinal que o sistema não registra é decorativo. Em qualquer opção, o critério de aceite 27 (§14) só é escrevível depois da assinatura.
+>
+> - `decided_by:`
+> - `decided_at:`
 
 `expires_at` do mandato é o desligamento que não depende de ninguém lembrar: o piloto termina sozinho.
 
@@ -787,9 +817,9 @@ CDC art. 42 e a normativa aplicável a cobrança por mensagem: horário permitid
 **Q6 — CORRIGIDA: grupo de controle é aceitável, e qual é a unidade?**
 Duas perguntas, não uma. (a) O owner aceita não cobrar uma fatia da carteira durante o piloto, e qual fatia — **DA-01**? (b) O que é sorteado — **DA-02**? A draft sorteava por item, o que contamina o experimento (§9.2); as opções e o que muda em cada uma estão nos dois blocos da §5.2. Agrupar por documento ou por grupo econômico exige um agrupador que hoje não existe no schema.
 
-**Q7 — O que entra em "líquido"?** Custo de mensagem é mensurável. Custo de LLM existe, mas agregado por dia e por dia+pessoa em USD (`src/lib/cost-ledger.ts:94`, `:102`) — **não por objetivo nem por slot** —, e não há política cambial para trazê-lo a BRL. Tempo humano em exceções não tem fonte. Estimar por contagem de exceções × constante, ou declarar "recuperado bruto menos custo de mensagem" e parar de chamar de líquido? Ver §9.1b.
+**Q7 — O que entra em "líquido"? (DA-11)** Custo de mensagem é mensurável. Custo de LLM existe, mas agregado por dia e por dia+pessoa em USD (`src/lib/cost-ledger.ts:94`, `:102`) — **não por objetivo nem por slot** —, e não há política cambial para trazê-lo a BRL. Tempo humano em exceções não tem fonte. As quatro composições possíveis — e o nome honesto do número em cada uma — estão lado a lado no bloco **DA-11** da §9.1b; esta spec não escolhe nenhuma.
 
-**Q8 — Quantos passos, com que intervalo, e quando parar?** `max_steps_per_item` (**DA-05**), `steps`/`offset_days` (**DA-03**) e o critério de desistência são política de cobrança do tenant. **Inclui a política de parada quando um teto por destinatário for definido (Q5)**: suprimir o slot, revogar a régua ou escalar. Nenhum dos três tem valor nesta spec, nem como exemplo.
+**Q8 — Quantos passos, com que intervalo, e quando parar?** `max_steps_per_item` (**DA-05**), `steps`/`offset_days` (**DA-03**) e o critério de desistência são política de cobrança do tenant. **Inclui a política de parada quando um teto por destinatário for definido (Q5)**: suprimir o slot, revogar a régua ou escalar. E inclui o outro "quando parar": **o limiar do breaker automático do nível 0 (§11.3) é DA-12** — o mecanismo é desenho, o gatilho é decisão. Nenhum desses valores está nesta spec, nem como exemplo.
 
 **Q9 — Quem assina o mandato, e por quanto tempo a assinatura fica aberta? (DA-10)** A classe `two_distinct_owners` exige dois owners distintos e ativos. O tenant do piloto tem dois? Se não, `requester_plus_one_owner` é aceitável para um mandato desta natureza? E o TTL: `DUAL_APPROVAL_TIMEOUT_HOURS` é 6h global — curto para juntar dois owners no console (§5.5). Mandato ganha TTL próprio?
 
@@ -823,7 +853,7 @@ Cada linha é uma pré-condição, não uma sugestão. Nenhuma fatia começa ant
 
 Verificáveis. Cada um é um teste, não uma opinião. Eles valem para as fatias 3–5, **não para esta PR**, que é só spec.
 
-**Nenhum critério aqui pode depender de uma DECISÃO ABERTA.** Um critério de aceite sobre decisão não assinada é a decisão entrando pela porta dos fundos: quem escreve o teste fixa o valor. Os dois que faziam isso (resposta ao devedor, unidade do holdout) foram removidos e só voltam quando DA-09 e DA-02 forem assinadas.
+**Nenhum critério aqui pode depender de uma DECISÃO ABERTA.** Um critério de aceite sobre decisão não assinada é a decisão entrando pela porta dos fundos: quem escreve o teste fixa o valor. Os que faziam isso — unidade do holdout, resposta ao devedor e, nesta revisão, o limiar do breaker — foram esvaziados e só voltam quando DA-02, DA-09 e DA-12 forem assinadas.
 
 **Fronteira de decisão**
 1. Objetivo do kind nasce `paused`; `setStatus('active')` sem mandato `approved` é recusado.
@@ -864,7 +894,7 @@ Verificáveis. Cada um é um teste, não uma opinião. Eles valem para as fatias
 24. `MAIA_COBRANCA_PILOT_TENANTS` vazio ⇒ kind inerte mesmo com objetivo `active` e mandato válido.
 25. Grupo `console` fora de `MAIA_SCHEDULER_GROUPS` ⇒ nenhum tick.
 26. Item fora da carteira nunca recebe slot nem contato.
-27. Breaker: reclamações acima do limiar ⇒ objetivo `paused` automaticamente, sem re-arme.
+27. **VAGO até DA-12 ser assinada.** O que é testável já — e não depende da decisão — é o comportamento: disparado o breaker, o objetivo vai a `paused` automaticamente e **não** se re-arma sozinho (§11.3, nível 0). O que dispara — quanto sinal, de que tipo, em que janela — é a DA-12; escrever esse gatilho aqui agora fixaria o limiar dentro de um checklist. O número fica reservado de propósito.
 
 ---
 
@@ -905,4 +935,4 @@ A fatia 4 é a que não deve ser pulada: é a única em que um erro de perceptor
 - **Nenhum dado de tenant real foi inspecionado.** Tudo o que a Q1 pergunta sobre população e frescor de `transacoes` continua sem resposta empírica aqui.
 - **Nenhuma execução de worker.** `objective_perceive`/`objective_execute` nunca rodaram em produção (o grupo `console` nasce desligado); esta revisão leu o código, não o observou rodando.
 - **Nenhuma consulta jurídica.** Todos os números da Q5 permanecem em branco de propósito.
-- **Nenhuma das dez DECISÕES ABERTAS foi decidida aqui, e nenhuma delas tem valor de exemplo neste documento.** Um "por exemplo, X%" repetido três vezes vira default sem que ninguém tenha escolhido — foi assim que a draft chegou a uma fração, uma cadência, uma janela e um teto de passos que nenhum dono assinou. O guard `tests/unit/docs/decisoes-abertas-cobranca.spec.ts` reprova esses valores nas formas enumeradas na lista dele, e reprova também um bloco assinado sem o valor promovido. **Ele NÃO cobre prosa arbitrária** — o cabeçalho do teste lista as formas que sabidamente atravessam, e o que impede a reincidência de verdade é o procedimento de promoção, não a regex.
+- **Nenhuma das doze DECISÕES ABERTAS foi decidida aqui, e nenhuma delas tem valor de exemplo neste documento.** Um "por exemplo, X%" repetido três vezes vira default sem que ninguém tenha escolhido — foi assim que a draft chegou a uma fração, uma cadência, uma janela e um teto de passos que nenhum dono assinou. O guard `tests/unit/docs/decisoes-abertas-cobranca.spec.ts` reprova esses valores nas formas enumeradas na lista dele, e reprova também um bloco assinado sem o valor promovido. **Ele NÃO cobre prosa arbitrária** — o cabeçalho do teste lista as formas que sabidamente atravessam, e o que impede a reincidência de verdade é o procedimento de promoção, não a regex.

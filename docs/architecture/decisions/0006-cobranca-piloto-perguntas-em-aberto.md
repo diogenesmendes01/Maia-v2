@@ -73,6 +73,8 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 | **DA-08** — série temporal da métrica (snapshot × ledger) | spec §9.1b, e Q7 aqui | Q1 / Q7 |
 | **DA-09** — resposta ao inbound do devedor | spec §8.2, e Q10 aqui | Q10 |
 | **DA-10** — classe, canal e TTL do mandato | spec §5.5, e Q9 aqui | Q9 |
+| **DA-11** — composição do "R$ líquido" | spec §9.1b, e Q7 aqui | Q7 |
+| **DA-12** — limiar do breaker automático | spec §11.3, e Q8 aqui | Q8 / Q5 |
 
 ---
 
@@ -308,7 +310,7 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 | **Decide** | Dono do produto |
 | **Bloqueia** | Fatia 5 |
 
-**Enunciado.** "R$ líquido recuperado" precisa descontar custo. Quais custos, medidos como?
+**Enunciado.** "R$ líquido recuperado" promete um desconto de custo embutido no nome. Quais custos entram, medidos como — e o número ainda pode chamar-se "líquido"? (**DA-11**)
 
 **Evidência.**
 
@@ -319,7 +321,21 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 | Política cambial USD → BRL | **não existe** — busca por `cambio`/`exchange_rate`/`ptax`: zero ocorrências | `src/` |
 | Tempo humano em exceções | **sem fonte** — não há cronômetro nem campo de esforço em `objective_tasks` | `src/db/schema.ts` |
 
-**O que muda.** Se o dono aceitar rateio, é preciso escolher o critério e declará-lo. Se não aceitar, o número honesto passa a ser "recuperado bruto menos custo de mensagem" e **não deve ser chamado de líquido**. Ver também a Q1: sem ledger imutável de liquidação, nem o lado da receita é plenamente reproduzível (spec §9.1b).
+**O que muda.** O que entra na conta — o critério de rateio, a política cambial, o custo humano, e o nome honesto do número — é a **DA-11** abaixo; a revisão anterior deste ADR respondia isso em prosa ("aceitar rateio ou parar de chamar de líquido"), que é escolher sem assinar. Ver também a Q1: sem ledger imutável de liquidação, nem o lado da receita é plenamente reproduzível (spec §9.1b).
+
+> **DECISÃO ABERTA — DA-11 · composição do "R$ líquido" (o que entra na conta, e o nome honesto do número)** — Q7
+>
+> Quais custos o "líquido" desconta do recuperado bruto, medidos como — e se o resultado ainda pode chamar-se "líquido". Opções (a ordem não é ranking):
+>
+> - **(a)** só o custo de mensagem — e o número passa a chamar-se "recuperado bruto menos custo de mensagem", nunca "líquido";
+> - **(b)** custo de mensagem mais custo de LLM rateado ao piloto por um critério declarado no relatório, com conversão USD→BRL por política cambial igualmente declarada — ambos inexistentes hoje (`src/lib/cost-ledger.ts:94`, `:102`; nenhuma conversão cambial no repositório);
+> - **(c)** (b) mais o custo humano das exceções, estimado por contagem de exceções × constante declarada pelo dono;
+> - **(d)** nenhum desconto: reportar recuperado bruto e cada custo separadamente, sem subtração, e aposentar a palavra "líquido" no relatório do piloto.
+>
+> **O que muda.** O nome do critério de saída da fase 2 — e a honestidade dele. (a) e (d) são computáveis hoje e abandonam a promessa da palavra "líquido"; (b) exige atribuição de custo por objetivo e política cambial, que **não existem**, e todo rateio é uma escolha que muda o número; (c) soma uma constante que ninguém mediu. Seja qual for, o relatório da fatia 5 declara a composição escolhida junto do número. Interage com DA-06 (janela de atribuição) e DA-08 (série temporal da receita).
+>
+> - `decided_by:`
+> - `decided_at:`
 
 > **DECISÃO ABERTA — DA-06 · janela de atribuição da métrica** — Q7 e spec §9.1
 >
@@ -359,7 +375,7 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 | **Decide** | Dono do produto (política de cobrança do tenant) |
 | **Bloqueia** | Fatia 5 |
 
-**Enunciado.** `max_steps_per_item`, `offset_days` e o critério de desistência. **Inclui, por causa da Q5, a política de parada quando um teto por destinatário for definido**: suprimir o slot, revogar a régua daquele devedor, ou escalar para humano. As três produzem comportamentos diferentes e nenhuma é default óbvio.
+**Enunciado.** `max_steps_per_item`, `offset_days` e o critério de desistência. **Inclui, por causa da Q5, a política de parada quando um teto por destinatário for definido**: suprimir o slot, revogar a régua daquele devedor, ou escalar para humano. As três produzem comportamentos diferentes e nenhuma é default óbvio. E inclui o outro "quando parar": o breaker automático do nível 0 (spec §11.3) tem o **mecanismo** desenhado — pausa, exceção, sem re-arme — e o **gatilho** por decidir (**DA-12**, abaixo).
 
 **Evidência.** Os campos existem no envelope proposto (spec §5.2) e entram no hash do mandato; o que falta são os valores. Não há valor default no repositório — o kind não existe.
 
@@ -389,6 +405,20 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 > - **(d)** teto derivado de um limite jurídico por destinatário, se a Q5 fixar um.
 >
 > **O que muda.** É a contagem física de slots: não há caminho pelo qual o loop envie mais do que os slots materializados **para aquele item**. Mas o teto é **por dívida, não por destinatário** — com (d), o mecanismo descrito na spec é insuficiente e precisa de escopo `(tenant, agent, devedor, janela)` atravessando objetivos e mandatos, que não existe.
+>
+> - `decided_by:`
+> - `decided_at:`
+
+> **DECISÃO ABERTA — DA-12 · limiar do breaker automático (nível 0)** — Q8 e Q5
+>
+> Quanto sinal dispara o breaker do nível 0 (spec §11.3), contado como, sobre que janela — e onde o valor vive. Opções (a ordem não é ranking):
+>
+> - **(a)** qualquer ocorrência única — o primeiro sinal jurídico, opt-out ou bloqueio de entrega pausa o objetivo;
+> - **(b)** um teto absoluto por objetivo, fixado pelo dono no envelope (e portanto no hash do mandato);
+> - **(c)** um teto proporcional ao volume de envios ou ao tamanho da carteira, com o denominador declarado;
+> - **(d)** limiar por tipo de sinal — sinal jurídico dispara sozinho; falha de entrega e opt-out acumulam até um teto próprio.
+>
+> **O que muda.** (a) é a mais conservadora e a única sem número a escolher — e transforma um falso positivo isolado em parada do piloto inteiro. (b) põe o valor sob a mesma assinatura do mandato; mudá-lo re-materializa a régua (spec §5.3). (c) exige definir denominador e janela, que são duas decisões a mais, não menos. (d) reconhece que os sinais têm gravidade diferente — e o que conta como "reclamação" esbarra na Q5: **o opt-out não tem registro operacional durável hoje**, então um limiar sobre sinal que o sistema não registra é decorativo. Em qualquer opção, o critério de aceite 27 da spec §14 só é escrevível depois da assinatura.
 >
 > - `decided_by:`
 > - `decided_at:`
@@ -524,7 +554,7 @@ Os dois campos ficam **presentes e vazios**. O campo vazio é o que torna a aus�
 - Cada afirmação de estado do repositório tem caminho e linha, então envelhece de forma **detectável**: quando a linha mudar, a citação fica errada e alguém percebe.
 - A correção da Q2c fica registrada onde importa — "existe e está quebrado" é um achado operacional que vale além da cobrança.
 - As lacunas de **mecanismo** (teto por destinatário, opt-out, ledger de liquidação, atribuição de custo) deixam de ser confundidas com lacunas de **política**.
-- Dez decisões que estavam dentro da spec como valor, regra ou critério de aceite passam a estar como **opções com dono e campo de assinatura vazio**, e um teste mecânico impede que voltem a entrar sem assinatura.
+- Doze decisões que estavam dentro da spec como valor, regra ou critério de aceite passam a estar como **opções com dono e campo de assinatura vazio**, e um teste mecânico impede que voltem a entrar sem assinatura. (Dez vieram da primeira varredura; a composição do "líquido" — DA-11 — e o limiar do breaker — DA-12 — vieram da releitura do dono em 2026-09-03.)
 
 **Negativas**
 

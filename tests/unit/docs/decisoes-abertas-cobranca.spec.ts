@@ -424,6 +424,69 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
       },
     ],
   },
+  {
+    da: 'DA-11',
+    rotulo: 'composição do "R$ líquido" (o que entra na conta, e o nome do número)',
+    pergunta: 'Q7',
+    // A composição não precisa de número para virar default: "o líquido
+    // desconta o custo de LLM rateado" fixa a conta inteira sem um dígito.
+    // As formas aqui são as que a revisão anterior de fato usou (a fórmula
+    // "bruto menos custo de mensagem" em prosa) mais as assertivas óbvias.
+    padroes: [
+      {
+        re: /(?<![\p{L}])l[íi]quido(?![\p{L}])["”]?\s*=/iu,
+        porque: 'fórmula da composição afirmada como decidida',
+      },
+      { re: /\brecuperado bruto menos\b/iu, porque: 'composição concreta afirmada fora de bloco' },
+      {
+        re: /\b(?:entra|entram|n[ãa]o entra|n[ãa]o entram)\s+n[oa]\s+(?:conta do\s+)?["“]?l[íi]quido\b/iu,
+        porque: 'componente afirmado dentro/fora da conta do líquido',
+      },
+      {
+        re: /(?<![\p{L}])l[íi]quido(?![\p{L}])["”]?\s+desconta\s+/iu,
+        porque: 'composição concreta no indicativo',
+      },
+      {
+        re: /\brateio\s+(?:por|proporcional ao?)\s+(?:slot|contato|envio|objetivo|item|mensagem|r[ée]gua)\b/iu,
+        porque: 'critério de rateio afirmado como decidido',
+      },
+      {
+        re: /\bconvertid[oa]s?\s+(?:a|para)\s+BRL\s+(?:pela|pelo|por|na|com)\b/iu,
+        porque: 'política cambial afirmada como decidida',
+      },
+    ],
+  },
+  {
+    da: 'DA-12',
+    rotulo: 'limiar do breaker automático (nível 0 da §11.3)',
+    pergunta: 'Q8 / Q5',
+    // O mecanismo (pausa + sem re-arme) é desenho e continua dizível; o que
+    // reprova é o GATILHO concreto — em campo, em número ou em palavras
+    // ("a primeira reclamação pausa" é limiar 1 sem nenhum dígito).
+    padroes: [
+      { re: /breaker_threshold\s*"?\s*[:=]\s*"?\d/u, porque: 'limiar concreto em campo' },
+      {
+        re: /\b(?:limiar|threshold)\b[^.\n]{0,40}\b\d+\s*(?:reclama[çc][õo]|bloqueio|sinai|ocorr[êe]ncia)/iu,
+        porque: 'limiar concreto em prosa',
+      },
+      {
+        re: /\b\d+\s*(?:reclama[çc][õo]es?|bloqueios?|opt-outs?|sinais)\b[^.\n]{0,60}\b(?:pausa|abre|dispara|breaker|disjuntor)\b/iu,
+        porque: 'limiar concreto em prosa',
+      },
+      {
+        re: /\b(?:breaker|disjuntor)\b[^.\n]{0,60}\b(?:a partir de|acima de|com mais de)\s+\d/iu,
+        porque: 'limiar concreto em prosa',
+      },
+      {
+        re: /\b(?:primeir[ao]|segund[ao]|terceir[ao])\s+(?:reclama[çc][ãa]o|bloqueio|sinal|ocorr[êe]ncia|opt-out)\b[^.\n]{0,40}\b(?:pausa|abre|dispara|derruba|para)(?![\p{L}])/iu,
+        porque: 'limiar em palavras ("a primeira reclamação pausa") afirmado como regra',
+      },
+      {
+        re: /\blimiar do breaker\b[^.\n]{0,30}(?<![\p{L}])(?:é|será|fica em|passa a ser)(?![\p{L}])[^.\n]{0,12}\d/iu,
+        porque: 'limiar afirmado no indicativo',
+      },
+    ],
+  },
 ];
 
 // Os artifícios retóricos que transformaram decisões abertas em defaults de fato
