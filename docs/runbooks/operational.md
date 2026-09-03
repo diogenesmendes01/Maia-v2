@@ -1448,7 +1448,9 @@ echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
 
 Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
 Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
-comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+comportamento correto: o gate promete os critérios relativos (p95/p99 ≤
+baseline × 1.10, throughput ≥ baseline × 0.90 — margem nomeada em
+`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`) e não pode carimbar
 o que não mediu. Para medir sem baseline, use `--mode measure`.
 
 Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
@@ -1461,9 +1463,10 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
 | `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
-| `o resolveScope foi EXERCITADO: 2 leituras por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem `permissoes`/`permission_profiles`, ou as duas leituras fora do `instrumentAll`) ou apareceu um **N+1** no escopo (>2) | leia o número no detalhe. `0–0` é medição ausente, não desempenho; `2–101` é o `byId` por permissão que a #511 removeu |
+| `o resolveScope foi EXERCITADO: ≥1 leitura de escopo por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem as tabelas do escopo, ou as leituras fora do `instrumentAll`) | leia o número no detalhe. `0–0` é medição ausente, não desempenho. O número em si é dado medido (2 na `main`, 1 com a fusão da #693) — decisão da #525 |
+| `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N. `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu. O teto absoluto é linha de relatório, não critério |
 | `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada pelo teto de 500 do `profilesRepo.byIds` |
-| `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` na tabela "latência por leitura": elas dizem qual das duas cresceu |
+| `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` (ou `scope_permissoes_com_profile`, na árvore da #693) na tabela "latência por leitura" |
 | `aceite completo do orçamento do turno` **vermelho** | a flag de cobertura diz que mede e os números dizem que não | é o caso "a flag não prova a si mesma": o detalhe traz os três números medidos. Não vire a flag — conserte a medição |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
@@ -1471,8 +1474,10 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
 | `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
 | `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
-| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
-| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
+| `p95 ≤ baseline × 1.10` / `p99 ≤ baseline × 1.10` **vermelho** | regressão relativa de latência — o critério PRINCIPAL desde a decisão da #525 | ver "baseline" abaixo antes de culpar o código |
+| `throughput ≥ baseline × 0.90` **vermelho** | a vazão caiu além da margem — latência paga com fila | compare a linha `throughput (turnos/s)` dos dois relatórios |
+| `latência por cardinalidade ≤ baseline × 1.10` **vermelho** | a regressão mora numa cardinalidade só (tenant "elefante") | o detalhe diz qual N regrediu; olhe a tabela por cardinalidade |
+| critérios relativos **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga (ou formato < v4, sem throughput/cardinalidade) | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
 | `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
 
 ### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
