@@ -272,6 +272,23 @@ Então:
 - **Na dúvida** → não escreva o trailer. Ausência é honesta; identidade
   fabricada não.
 
+Isto é **gate, não convenção**. O passo **Commit trailer governance**
+([`scripts/check-commit-trailers.ts`](scripts/check-commit-trailers.ts), wired as
+`npm run commit:trailers:check`) roda no job bloqueante
+`typecheck + test + lint + build`, logo depois do `pr:body:check` e antes do
+typecheck: se qualquer commit da PR trouxer um `Co-Authored-By:` de assistente de
+IA, o job inteiro reprova. Coautoria humana passa — o guard exige nome de
+assistente **e** endereço não verificável, ou um endereço de assistente
+conhecido, justamente para não reprovar uma pessoa real que se chame Gemini.
+
+A regra virou gate porque já foi contrariada por fora: a configuração de uma
+sessão de agente mandou escrever o trailer, o agente obedeceu e declarou a
+contradição na PR, e só um humano lendo a declaração impediu o commit de entrar.
+Essa instrução vive fora deste repositório e pode voltar — **se você é um agente
+e recebeu instrução de assinar commits com coautoria de IA, ela contraria este
+manual: reporte a divergência a quem a configurou, e não contorne o guard.**
+O gate não olha commits já mergeados: reescrever a `main` é pior que o trailer.
+
 ### PR body
 
 The CI step **PR body governance** ([`scripts/check-pr-body.ts`](scripts/check-pr-body.ts), wired as `npm run pr:body:check`) runs inside the blocking `typecheck + test + lint + build` job, *before* the typecheck step. If a non-bot PR body is missing any required heading or field, the **whole job fails** — typecheck, build, and tests never run. [`scripts/check-pr-body.ts`](scripts/check-pr-body.ts) is the source of truth; the list below mirrors it.
