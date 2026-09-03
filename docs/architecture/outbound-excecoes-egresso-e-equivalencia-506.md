@@ -9,10 +9,39 @@
 > > substituição apenas com **equivalência cenário a cenário e oracle a
 > > oracle**; o que não estiver coberto continua pendente."
 >
-> **O que ele NÃO é.** Não é uma decisão. Não ratifica nada, não remove nenhuma
-> exceção, não muda o comportamento do egress guard e não mexe no teto
-> `MAX_DECLARED_EXCEPTIONS = 6`. É o material sobre o qual a decisão é tomada, e
-> ele diz explicitamente onde não tem resposta.
+> **O que ele NÃO é.** Não remove nenhuma exceção, não muda o comportamento do
+> egress guard e não mexe no teto `MAX_DECLARED_EXCEPTIONS = 6`.
+>
+> **A decisão veio em 2026-09-03**, sobre a Parte 1, e está transcrita abaixo —
+> as células de owner/prazo desta tabela deixaram de ser lacunas e passaram a
+> ser o registro dela.
+
+## A decisão do dono (2026-09-03), textual
+
+> "#731: aceito individualmente as seis exceções, com estes registros:
+> - `agent.message_update_owner_review`, `identity.quarantine`,
+>   `scheduling.outbox_drain`, `workers.idempotency_relayer` e
+>   `workers.pending_reminder`: temporárias, owner `diogenesmendes01`, prazo
+>   `2026-12-31`.
+> - `agent.react_loop_tool_reaction`: carve-out best-effort, owner
+>   `diogenesmendes01`, revisão em `2027-03-31`.
+>
+> Antes do merge, corrija `removal.when`: a condição precisa provar que cada
+> callsite foi efetivamente migrado e o sender direto removido, não apenas que
+> a infraestrutura standalone passou a existir. Para a reação, cubra capability
+> nativa ou desfecho terminal sem reconciliação humana. O `pending_reminder` é
+> o prioritário. Isso não ratifica o ADR 0005 como desenho definitivo."
+
+Três consequências que este documento reflete: (1) as colunas Owner e Prazo
+estão preenchidas com a decisão, e `PENDING_OWNER_DECISION_IDS` esvaziou;
+(2) o carve-out da reação é modelado como `revisao_de_carve_out` — 2027-03-31
+é data de **revisão da decisão**, não de expiração da exceção, e o atraso da
+revisão reprova o CI com mensagem própria (`carveOutReviewsDue()`); (3) toda
+condição de remoção foi reescrita para provar o **callsite migrado e o sender
+direto removido** (sondas de duas direções: `surge`/`some`), e não a mera
+existência da infraestrutura standalone. **A aceitação não ratifica o ADR 0005
+como desenho definitivo** — as condições o citam como desenho *proposto* das
+coortes.
 
 **Fonte de verdade.** A Parte 1 é uma renderização de
 [`src/runtime/outbound/send-paths.ts`](../../src/runtime/outbound/send-paths.ts) —
@@ -28,12 +57,12 @@ envelhecer, o código não pode. Quando os dois divergirem, o código ganha.
 
 | # | Exceção | Callsite | Justificativa (resumo) | Controle fail-closed | Owner | Prazo | Condição de remoção (resumo) |
 |---|---|---|---|---|---|---|---|
-| 1 | `agent.message_update_owner_review` | [`src/agent/message-update.ts:245`](../../src/agent/message-update.ts) — `sendText` | O call site usa o **id do provedor devolvido pelo envio** para gravar a pergunta em `mensagens` (`metadata.whatsapp_id`); o ledger de agendamento devolve "comprometido", não "enviado" | Pendência de revisão já existe no banco **antes** do envio: mensagem perdida vira lembrete, nunca decisão perdida | ⛔ **pendente do dono** | ⛔ **pendente do dono** | `commitStandaloneOutbound` existir + `deliverOutbound` aceitar `anchor_kind` (coorte 3 do ADR 0005) |
-| 2 | `agent.react_loop_tool_reaction` | [`src/agent/react-loop.ts:610`](../../src/agent/react-loop.ts) — `sendReaction` | `sendReaction` devolve `void`: um artefato durável nasceria `delivery_unknown` em 100% dos casos e alimentaria a fila **humana** de #633 com ruído | `.catch` que suprime só a reação; a resposta do turno é independente, e uma reação não carrega informação que a resposta já não carregue | ⛔ **pendente do dono** | ⛔ **pendente do dono** | `reaction` deixar de ser `PROVIDER_IDEMPOTENCY_NONE` em `delivery-contract.ts` |
-| 3 | `identity.quarantine` | [`src/identity/quarantine.ts:24`](../../src/identity/quarantine.ts) — `sendText` | Roda **antes** de existir turno (decide se a mensagem entra no runtime); e é a resposta **síncrona** a uma mensagem que a pessoa acabou de mandar | Estado da quarentena é durável em `pessoas.status` + pendência; o aviso é sobre esse estado, e o estado sobrevive à perda do aviso | ⛔ **pendente do dono** | ⛔ **pendente do dono** | `commitStandaloneOutbound` existir + `deliverOutbound` aceitar `anchor_kind` (coorte 1 do ADR 0005) |
-| 4 | `scheduling.outbox_drain` | [`src/scheduling/outbox-drain.ts:310`](../../src/scheduling/outbox-drain.ts) — `sendText` | **Já é** um outbox durável com claim, retry e DLQ. Migrar o call site aninharia dois senders autoritativos — o que a §Rollback da issue proíbe nominalmente | Persistência antes do envio, claim com lease e DLQ — as mesmas propriedades que a épica exige, num ledger separado | ⛔ **pendente do dono** | ⛔ **pendente do dono** | `commitStandaloneOutbound` existir + `deliverOutbound` aceitar `anchor_kind` (coorte 4 do ADR 0005) |
-| 5 | `workers.idempotency_relayer` | [`src/workers/idempotency-outbox-relayer.ts:192`](../../src/workers/idempotency-outbox-relayer.ts) — `sendText` | Segundo outbox durável, e o **único** cuja idempotência é honrada pelo PROVEDOR (`messageId` determinístico). Migração parcial trocaria garantia forte por fraca | Chave de dedupe do provedor derivada da identidade da row; retry e DLQ próprios | ⛔ **pendente do dono** | ⛔ **pendente do dono** | `commitStandaloneOutbound` existir + `deliverOutbound` aceitar `anchor_kind` (coorte 5 do ADR 0005) |
-| 6 | `workers.pending_reminder` | [`src/workers/pending-reminder.ts:256`](../../src/workers/pending-reminder.ts) — `sendText` com `{ quoted }` | O lembrete **cita** a pergunta original; `WhatsappTextPayload` (`src/scheduling/types.ts:105`) só carrega `{ jid, text }`. Enfileirar hoje entregaria um "Lembra dessa?" solto | `reminder_count` incrementado com CAS **antes** do envio: falha de envio não gera dois lembretes; o teto limita o total | ⛔ **pendente do dono** | ⛔ **pendente do dono** | as duas acima **+** o payload de texto de #630 carregar a CHAVE da mensagem citada (coorte 2 do ADR 0005) |
+| 1 | `agent.message_update_owner_review` | [`src/agent/message-update.ts:246`](../../src/agent/message-update.ts) — `sendText` | O call site usa o **id do provedor devolvido pelo envio** para gravar a pergunta em `mensagens` (`metadata.whatsapp_id`); o ledger de agendamento devolve "comprometido", não "enviado" | Pendência de revisão já existe no banco **antes** do envio: mensagem perdida vira lembrete, nunca decisão perdida | `diogenesmendes01` | temporária — **2026-12-31** | `commitStandaloneOutbound` surgir **no próprio** `message-update.ts` + `sendText(` sumir dele (coorte 3 do ADR 0005, desenho proposto) |
+| 2 | `agent.react_loop_tool_reaction` | [`src/agent/react-loop.ts:611`](../../src/agent/react-loop.ts) — `sendReaction` | `sendReaction` devolve `void`: um artefato durável nasceria `delivery_unknown` em 100% dos casos e alimentaria a fila **humana** de #633 com ruído | `.catch` que suprime só a reação; a resposta do turno é independente, e uma reação não carrega informação que a resposta já não carregue | `diogenesmendes01` | **carve-out best-effort** — revisão em **2027-03-31** | `sendReaction(` sumir de `react-loop.ts` — por capability nativa (`reaction` virar `PROVIDER_IDEMPOTENCY_NATIVE`) **ou** desfecho terminal sem reconciliação humana |
+| 3 | `identity.quarantine` | [`src/identity/quarantine.ts:24`](../../src/identity/quarantine.ts) — `sendText` | Roda **antes** de existir turno (decide se a mensagem entra no runtime); e é a resposta **síncrona** a uma mensagem que a pessoa acabou de mandar | Estado da quarentena é durável em `pessoas.status` + pendência; o aviso é sobre esse estado, e o estado sobrevive à perda do aviso | `diogenesmendes01` | temporária — **2026-12-31** | `commitStandaloneOutbound` surgir **no próprio** `quarantine.ts` + `sendText(` sumir dele (coorte 1 do ADR 0005, desenho proposto) |
+| 4 | `scheduling.outbox_drain` | [`src/scheduling/outbox-drain.ts:311`](../../src/scheduling/outbox-drain.ts) — `sendText` | **Já é** um outbox durável com claim, retry e DLQ. Migrar o call site aninharia dois senders autoritativos — o que a §Rollback da issue proíbe nominalmente | Persistência antes do envio, claim com lease e DLQ — as mesmas propriedades que a épica exige, num ledger separado | `diogenesmendes01` | temporária — **2026-12-31** | `commitStandaloneOutbound` surgir **no próprio** `outbox-drain.ts` + `sendText(` sumir dele, no mesmo commit (coorte 4 do ADR 0005, desenho proposto) |
+| 5 | `workers.idempotency_relayer` | [`src/workers/idempotency-outbox-relayer.ts:195`](../../src/workers/idempotency-outbox-relayer.ts) — `sendText` | Segundo outbox durável, e o **único** cuja idempotência é honrada pelo PROVEDOR (`messageId` determinístico). Migração parcial trocaria garantia forte por fraca | Chave de dedupe do provedor derivada da identidade da row; retry e DLQ próprios | `diogenesmendes01` | temporária — **2026-12-31** | `commitStandaloneOutbound` surgir **no próprio** `idempotency-outbox-relayer.ts` + `sendText(` sumir dele (coorte 5 do ADR 0005, desenho proposto) |
+| 6 | `workers.pending_reminder` | [`src/workers/pending-reminder.ts:257`](../../src/workers/pending-reminder.ts) — `sendText` com `{ quoted }` | O lembrete **cita** a pergunta original; `WhatsappTextPayload` (`src/scheduling/types.ts:105`) só carrega `{ jid, text }`. Enfileirar hoje entregaria um "Lembra dessa?" solto | `reminder_count` incrementado com CAS **antes** do envio: falha de envio não gera dois lembretes; o teto limita o total | `diogenesmendes01` | temporária — **2026-12-31** · **PRIORITÁRIA** (migra primeiro) | `commitStandaloneOutbound` surgir **no próprio** `pending-reminder.ts` + `sendText(` sumir dele **+** o payload de texto de #630 carregar a CHAVE da mensagem citada (coorte 2 do ADR 0005, desenho proposto) |
 
 **Controle fail-closed comum às seis, além do que está na coluna.** Nenhuma
 delas consegue enviar por acidente: a fronteira única
@@ -43,86 +72,84 @@ e o único jeito de autorizar é abrir escopo com `withDeclaredEgressException(i
 ([`egress-guard.ts:108`](../../src/runtime/outbound/egress-guard.ts)). Uma
 violação incrementa `maia_outbound_direct_send_violation_total{kind}`.
 
-### 1.2 Onde o repositório **não** conseguiu responder: `owner` e `prazo`
+### 1.2 `owner` e `prazo`: da lacuna declarada ao registro da decisão
 
-**As doze células de `owner` e `prazo` estão vazias, e isso é um achado, não uma
-omissão.** Nada no repositório designa uma pessoa a nenhuma das seis exceções,
-nem escreve uma data para nenhuma delas. O que foi procurado, e o que foi
-encontrado:
+As doze células de `owner` e `prazo` nasceram **declaradamente vazias** — o
+repositório não tinha base para preenchê-las (nada em `src/`, no ADR 0005, no
+`CODEOWNERS`, no ledger de #526 ou no `git log` designava pessoa ou data;
+`Owner: Maia maintainers` era o único texto de dono, e é o dono coletivo que a
+recusa mirava) — e ficaram ratchetadas em `PENDING_OWNER_DECISION_IDS` até a
+decisão chegar. **Em 2026-09-03 ela chegou** (transcrição no topo deste
+documento), e as células foram preenchidas com o registro dela, não com chute:
 
-| Onde se procurou | O que existe |
-|---|---|
-| As entradas do inventário (`send-paths.ts`) | `reason`, `containment`, `blocked_by`, `remediation`. Nenhum nome, nenhuma data. |
-| `docs/architecture/decisions/0005-outbox-sem-turno.md` | `Owner: Maia maintainers` no cabeçalho, e `Status: Proposed — aguardando decisão humana`. Sem data-alvo. |
-| `.github/CODEOWNERS` | Só os *Architecture Locks* da máquina de estados de conhecimento (`@diogenes-mendes`). Nenhum caminho de egresso. |
-| `security/audit-exceptions.json` (o ledger de #526) | Hoje **vazio**. O histórico mostra o formato do campo (`"owner": "diogenesmendes01"`) — foi de lá que veio o vocabulário desta tabela. |
-| `git log` das fatias da épica | Descreve o trabalho; não atribui as exceções. |
+- **cinco temporárias** — `owner: 'diogenesmendes01'`,
+  `deadline: { kind: 'prazo', expires: '2026-12-31' }`. `expiredExceptions()`
+  reprova o CI a partir de 2027-01-01 para qualquer uma que ainda exista.
+- **um carve-out best-effort** (`agent.react_loop_tool_reaction`) —
+  `owner: 'diogenesmendes01'`,
+  `deadline: { kind: 'revisao_de_carve_out', review_on: '2027-03-31' }`. A
+  exceção **não é temporária e não expira**; o que tem data é a **revisão da
+  decisão**, e `carveOutReviewsDue()` reprova o CI a partir de 2027-04-01 se
+  ela não tiver sido re-revisada — com mensagem própria, porque "a exceção
+  venceu" e "a revisão atrasou" pedem ações diferentes. Espremer isso em
+  `prazo` mentiria nas duas direções.
 
-`Owner: Maia maintainers` é precisamente o dono coletivo que a recusa mira:
-quando um prazo vence, um time não recebe e-mail. Preencher as seis linhas com
-`diogenesmendes01` produziria uma tabela que **parece** completa e não é —
-seria um chute sobre atribuição de responsabilidade, disfarçado de dado.
-
-Então as duas colunas ficam declaradamente vazias, e a lacuna é **mecânica**, não
-editorial:
-
-- o valor `pendente-do-dono` pertence ao vocabulário fechado
-  `OUTBOUND_EXCEPTION_OWNERS` e é marcado no tipo como **não sendo um dono**;
-- os seis ids estão em `PENDING_OWNER_DECISION_IDS`
-  ([`send-paths.ts:847`](../../src/runtime/outbound/send-paths.ts)), que **só
-  encolhe**: quando o dono designar `owner` (e, querendo, `prazo`) para uma
-  entrada, o id sai dali na mesma PR;
-- uma exceção que fique pendente **sem** estar naquela lista **derruba o import
-  do módulo** — a sétima lacuna não entra em silêncio.
-
-**Como preencher uma linha** (é uma edição de três campos, e o CI cobra o resto):
-
-```ts
-owner: 'diogenesmendes01',
-deadline: { kind: 'prazo', expires: '2026-12-31' },
-```
-
-…e remover o id de `PENDING_OWNER_DECISION_IDS`. A partir daí,
-`expiredExceptions()` reprova o CI no dia seguinte ao vencimento. Um dono novo
-que não seja `diogenesmendes01` exige acrescentar um **membro** a
+`PENDING_OWNER_DECISION_IDS` **esvaziou na mesma PR**, como o contrato dela
+sempre mandou — e o mecanismo continua armado: uma exceção que volte a ficar
+pendente sem estar declarada ali **derruba o import do módulo**. Um dono novo
+que não seja `diogenesmendes01` continua exigindo um **membro** novo em
 `OUTBOUND_EXCEPTION_OWNERS` — uma linha visível no diff, de propósito.
 
-> **Por que o vencimento reprova o CI e não derruba o processo.** O resto do
-> inventário é cobrado no *import* (fail-closed: um inventário inválido não sobe
-> o runtime). O prazo não: pendurar a queda do runtime numa data faria uma
-> exceção vencida **derrubar a produção num domingo** — trocaria um problema de
-> governança por uma indisponibilidade. É o mesmo desenho do ledger de
-> `npm audit` (#526/#574), e pela mesma razão.
+> **Por que o vencimento (e a revisão atrasada) reprovam o CI e não derrubam o
+> processo.** O resto do inventário é cobrado no *import* (fail-closed: um
+> inventário inválido não sobe o runtime). As datas não: pendurar a queda do
+> runtime numa data faria uma exceção vencida **derrubar a produção num
+> domingo** — trocaria um problema de governança por uma indisponibilidade. É o
+> mesmo desenho do ledger de `npm audit` (#526/#574), e pela mesma razão.
 
 ### 1.3 As condições de remoção, e o que elas revelam
 
 Uma condição de remoção só vale se for um **fato verificável**. Cada uma carrega
 `when` (o fato), `why_sufficient` (por que aquele fato basta para apagar *esta*
-entrada) e **sondas** — pares `(módulo, símbolo)` que a suíte confere.
+entrada) e **sondas** — triplas `(módulo, símbolo, sentido)` que a suíte
+confere.
 
-A sonda tem duas pontas. `tests/unit/runtime/outbound-excecoes-dono-prazo-remocao.spec.ts`
-exige que a condição seja **falsa hoje**; no dia em que o símbolo aparecer, o
-teste fica **vermelho** dizendo que a condição passou a valer e a exceção deve
-sair do inventário. É a diferença entre uma condição e uma promessa: a promessa
-envelhece calada.
+**A forma foi corrigida pelo dono (2026-09-03).** A versão anterior das
+condições provava que a **infraestrutura** standalone passou a existir
+(`commitStandaloneOutbound` em `commit.ts`, `anchor_kind` em `delivery.ts`) —
+um fato verdadeiro que não diz nada sobre *esta* rota. A forma atual prova a
+**migração do callsite**: o commit standalone `surge` no próprio módulo da
+exceção **e** a chamada direta `some` dele. As sondas ganharam sentido:
+`surge` acende quando o símbolo aparece; `some`, quando desaparece (e a suíte
+exige que todo `some` aponte para um símbolo **vivo hoje** — uma sonda que
+nasce acesa é uma sonda escrita errada).
 
-| # | Exceção | Sondas (`módulo` → `símbolo`) | Estado hoje |
+A tripwire continua de duas pontas:
+`tests/unit/runtime/outbound-excecoes-dono-prazo-remocao.spec.ts` exige que a
+condição seja **falsa hoje**; no dia em que todas as sondas de uma entrada
+acenderem, o teste fica **vermelho** dizendo que a condição passou a valer e a
+exceção deve sair do inventário. É a diferença entre uma condição e uma
+promessa: a promessa envelhece calada.
+
+| # | Exceção | Sondas (`módulo` → `símbolo` · sentido) | Estado hoje |
 |---|---|---|---|
-| 1 | `agent.message_update_owner_review` | `commit.ts` → `commitStandaloneOutbound`; `delivery.ts` → `anchor_kind` | ausentes |
-| 2 | `agent.react_loop_tool_reaction` | `delivery-contract.ts` → `reaction: PROVIDER_IDEMPOTENCY_NATIVE` | ausente (hoje `…_NONE`) |
-| 3 | `identity.quarantine` | `commit.ts` → `commitStandaloneOutbound`; `delivery.ts` → `anchor_kind` | ausentes |
-| 4 | `scheduling.outbox_drain` | idem | ausentes |
-| 5 | `workers.idempotency_relayer` | idem | ausentes |
-| 6 | `workers.pending_reminder` | idem **+** `contract.ts` → `quoted` | ausentes |
+| 1 | `agent.message_update_owner_review` | `message-update.ts` → `commitStandaloneOutbound` · surge; `message-update.ts` → `sendText(` · some | apagadas |
+| 2 | `agent.react_loop_tool_reaction` | `react-loop.ts` → `sendReaction(` · some | apagada |
+| 3 | `identity.quarantine` | `quarantine.ts` → `commitStandaloneOutbound` · surge; `quarantine.ts` → `sendText(` · some | apagadas |
+| 4 | `scheduling.outbox_drain` | `outbox-drain.ts` → `commitStandaloneOutbound` · surge; `outbox-drain.ts` → `sendText(` · some | apagadas |
+| 5 | `workers.idempotency_relayer` | `idempotency-outbox-relayer.ts` → `commitStandaloneOutbound` · surge; `idempotency-outbox-relayer.ts` → `sendText(` · some | apagadas |
+| 6 | `workers.pending_reminder` | `pending-reminder.ts` → `commitStandaloneOutbound` · surge; `pending-reminder.ts` → `sendText(` · some **+** `contract.ts` → `quoted` · surge | apagadas |
 
-#### O achado: cinco das seis condições são **o mesmo fato**
+#### O achado continua de pé: cinco migrações destravam com **uma decisão de modelo**
 
-Cinco das seis exceções desbloqueiam com **uma decisão só** — aceitar o ADR 0005
-e existir `commitStandaloneOutbound` com `deliverOutbound` aceitando a família
-`anchor_kind`. Isso muda o que está sobre a mesa: não são cinco trabalhos
-independentes com cinco donos, é **uma decisão de modelo** seguida de cinco
-coortes de migração que o próprio ADR já ordena (§5), cada uma trocando um
-emissor por outro no mesmo commit.
+As cinco temporárias continuam dependendo da mesma âncora sem turno — as
+coortes 1–5 da §5 do ADR 0005, que segue **proposto, não ratificado** (a
+aceitação de 2026-09-03 diz isso com todas as letras). O que mudou é o que as
+condições **provam**: antes, a decisão de modelo sozinha acenderia as cinco;
+agora cada linha só sai quando a SUA migração acontecer — o commit standalone
+no callsite dela e o sender direto removido dela. A ordem também deixou de ser
+só a do ADR: **`workers.pending_reminder` migra primeiro, por decisão do
+dono.**
 
 O que sobra por cima do fato comum é pequeno e específico:
 
@@ -142,25 +169,28 @@ O que sobra por cima do fato comum é pequeno e específico:
   ([`historico.ts:132`](../../src/runtime/outbound/historico.ts)), que é o
   retorno que o call site hoje captura à mão.
 
-#### A sexta é diferente, e provavelmente é permanente
+#### A sexta é diferente — e o dono a declarou **carve-out best-effort**
 
-`agent.react_loop_tool_reaction` **não entra em coorte nenhuma** — o ADR 0005 diz
-isso com todas as letras. A condição escrita é verificável (`reaction` virar
-`PROVIDER_IDEMPOTENCY_NATIVE`), mas o fato que a torna verdadeira **não está
-neste repositório**: depende de o Baileys/WhatsApp passar a confirmar reação com
-identificador. Hoje `LineOutput.sendReaction` devolve `void`
-([`line-output.ts:74`](../../src/gateway/line-output.ts)).
+`agent.react_loop_tool_reaction` **não entra em coorte nenhuma** — o ADR 0005
+diz isso com todas as letras, e a recomendação deste documento (a exceção era
+candidata a permanente, porque o fato que a apagaria dependia de terceiro) foi
+**aceita em 2026-09-03**: carve-out best-effort, owner `diogenesmendes01`,
+**revisão em 2027-03-31** — data de revisão da decisão, não de expiração da
+exceção.
 
-**Recomendação ao dono, escrita como pergunta e não como decisão tomada:** esta
-exceção é candidata a ser declarada **permanente** em vez de temporária. Não
-porque falte trabalho, mas porque o trabalho é de terceiro e pode nunca
-acontecer — e uma exceção temporária que depende de terceiro é uma exceção
-permanente com um rótulo errado. A `remediation` da entrada já registra um
-caminho alternativo, que é nosso: **(b)** um desfecho terminal honesto para
-saídas sem confirmação possível, para que a reação não entre na fila humana de
-#633. Se o dono escolher (b), a condição de remoção desta linha **precisa ser
-reescrita** — a sonda atual não acende com ela, e isso está anotado no próprio
-`why_sufficient`.
+A condição de remoção foi reescrita junto, como o dono exigiu, para cobrir os
+**dois** desfechos que ele aceita: (a) **capability nativa** — o provedor passa
+a confirmar reação com identificador (`reaction` vira
+`PROVIDER_IDEMPOTENCY_NATIVE` em `delivery-contract.ts`; hoje
+`LineOutput.sendReaction` devolve `void`) e a reação migra para o outbox como
+qualquer payload; **ou** (b) um **desfecho terminal sem reconciliação humana**
+para saída sem confirmação possível — a reação passa pelo outbox nascendo
+nesse desfecho e nunca entra na fila humana de #633. A sonda é deliberadamente
+**uma só, no callsite** (`sendReaction(` sumir de `react-loop.ts`): os dois
+desfechos passam por esse mesmo fato, e uma sonda no contrato faria de (a)
+condição *necessária* quando o dono aceitou (a) **ou** (b). Quando a sonda
+acender, a revisão confere qual desfecho a acendeu — e, se foi (b), prova que
+reação nenhuma termina em `escalate_manual`.
 
 ---
 
@@ -245,7 +275,7 @@ serem equivalentes. É o mesmo bloqueio quatro vezes, e é ele que o `FakeLlmSer
 
 | Camada | Onde | O que reprova |
 |---|---|---|
-| Compilador | `OutboundDeclaredException` ([`send-paths.ts:374`](../../src/runtime/outbound/send-paths.ts)) | Exceção sem `reason`, `containment`, `blocked_by`, `remediation`, `owner`, `deadline` ou `removal` — **não compila** |
-| Import do módulo | `assertRatifiedInventory` ([`send-paths.ts:927`](../../src/runtime/outbound/send-paths.ts)) | Exceção não ratificada, owner fora do vocabulário, prazo que não é data, prazo sem dono, pendência não declarada, condição de remoção vazia ou sem sonda, teto estourado. **Derruba o processo**, e `egress-guard.ts` importa daqui |
+| Compilador | `OutboundDeclaredException` ([`send-paths.ts:444`](../../src/runtime/outbound/send-paths.ts)) | Exceção sem `reason`, `containment`, `blocked_by`, `remediation`, `owner`, `deadline` ou `removal` — **não compila** |
+| Import do módulo | `assertRatifiedInventory` ([`send-paths.ts:1043`](../../src/runtime/outbound/send-paths.ts)) | Exceção não ratificada, owner fora do vocabulário, prazo (ou revisão de carve-out) que não é data ou sem dono, pendência não declarada, condição de remoção vazia, sem sonda ou com sonda de sentido inválido, teto estourado. **Derruba o processo**, e `egress-guard.ts` importa daqui |
 | Suíte (varredura) | `tests/unit/runtime/outbound-trava-envio-direto.spec.ts` | Módulo que envia fora do inventário; entrada fantasma; teto ≠ número real; alegação `no_turn_to_anchor` falsa |
-| Suíte (governança) | `tests/unit/runtime/outbound-excecoes-dono-prazo-remocao.spec.ts` | **Prazo vencido**; pendências ≠ lista declarada; módulo de sonda inexistente; **condição de remoção que passou a valer** |
+| Suíte (governança) | `tests/unit/runtime/outbound-excecoes-dono-prazo-remocao.spec.ts` | **Prazo vencido**; **revisão de carve-out atrasada**; registros ≠ decisão de 2026-09-03; pendências ≠ lista declarada; módulo de sonda inexistente; sonda `some` apontando para símbolo já ausente; **condição de remoção que passou a valer** |

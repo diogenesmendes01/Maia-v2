@@ -372,9 +372,13 @@ describe('#506 — a catraca: o inventário de exceções não cresce', () => {
       owner: 'diogenesmendes01',
       deadline: { kind: 'prazo', expires: '2099-12-31' },
       removal: {
-        when: '`commitStandaloneOutbound` existir em `src/runtime/outbound/commit.ts`.',
+        when:
+          'O callsite migrar e `sendText(` sumir de `src/workers/novo-disparador-paralelo.ts` — ' +
+          'na forma que o dono exigiu em 2026-09-03.',
         why_sufficient: 'Impecável também. E irrelevante: a rota não foi ratificada.',
-        probes: [{ module: 'src/runtime/outbound/commit.ts', symbol: 'commitStandaloneOutbound' }],
+        probes: [
+          { module: 'src/workers/novo-disparador-paralelo.ts', symbol: 'sendText(', kind: 'some' },
+        ],
       },
     };
     expect(() => assertRatifiedInventory([...OUTBOUND_SEND_PATHS, rotaDeMentira])).toThrow(
