@@ -10,6 +10,7 @@ import {
   classesExcludedFromDump,
   classesIncludedInDump,
   openDpoQuestions,
+  ownerRatifiedClasses,
 } from '../../../src/ops/retention/data-classes.js';
 
 /**
@@ -62,22 +63,69 @@ describe('the inventory covers every class the issue enumerates', () => {
 });
 
 describe('no legal deadline is hardcoded (DPO approval pending)', () => {
-  it('ships every class with a null retention and pending approval', () => {
+  it('ships every class with a null retention', () => {
+    for (const c of DATA_CLASSES) expect(c.retention_days).toBeNull();
+  });
+
+  it('leaves every class pending except the one the platform owner ratified', () => {
     for (const c of DATA_CLASSES) {
-      expect(c.retention_days).toBeNull();
-      expect(c.approval_state).toBe('pending_dpo');
+      const expected = c.id === 'privacy.tombstone' ? 'ratified_by_owner' : 'pending_dpo';
+      expect(c.approval_state, `approval_state de ${c.id}`).toBe(expected);
     }
   });
 
-  it('records an explicit open question for the DPO on every class', () => {
+  it('records, for every class, either an open DPO question or an owner ratification', () => {
+    // Anti-vacuidade: os dois lados são contados e a soma fecha o inventário,
+    // então uma classe sem pergunta E sem ratificação não passa despercebida.
     const questions = openDpoQuestions();
-    expect(questions).toHaveLength(DATA_CLASSES.length);
+    const ratified = ownerRatifiedClasses();
+    expect(questions.length).toBeGreaterThan(0);
+    expect(questions.length + ratified.length).toBe(DATA_CLASSES.length);
     for (const q of questions) expect(q.question.length).toBeGreaterThan(10);
   });
 
   it('the default policy in force is the UNAPPROVED one', () => {
     expect(UNAPPROVED_POLICY.approved).toBe(false);
     expect(UNAPPROVED_POLICY.version).toBe(UNAPPROVED_POLICY_VERSION);
+  });
+});
+
+describe('privacy.tombstone — ratificada pelo dono da plataforma, não é pergunta ao DPO (issue #536)', () => {
+  it('não aparece mais na lista de perguntas ao DPO', () => {
+    const dpo = openDpoQuestions().map((q) => q.data_class);
+    expect(dpo).not.toContain('privacy.tombstone');
+    // Anti-vacuidade: a lista continua existindo e continua listando o que
+    // ainda é do DPO — a correção removeu UMA entrada, não a lista.
+    expect(dpo).toContain('postgres.messages');
+    expect(dpo).toHaveLength(DATA_CLASSES.length - 1);
+  });
+
+  it('registra a ratificação do dono, com a decisão e o argumento', () => {
+    const ratified = ownerRatifiedClasses();
+    expect(ratified.map((r) => r.data_class)).toEqual(['privacy.tombstone']);
+    const record = ratified[0]!.ratification;
+    expect(record.ratified_by).toBe('platform_owner');
+    expect(record.ratified_in).toContain('2026-09-02');
+    expect(record.ratified_in).toContain('2026-09-03');
+    expect(record.decision).toContain('not_purgeable');
+    // O argumento, não uma reafirmação: um prazo mínimo teria de superar a
+    // maior retenção de artefato de backup, e não-purgável elimina a conta.
+    expect(record.rationale).toContain('MINIMUM');
+    expect(record.rationale).toContain('backup');
+  });
+
+  it('o approval_state deriva da ratificação e não pode divergir dela', () => {
+    for (const c of DATA_CLASSES) {
+      expect(c.approval_state).toBe(
+        c.owner_ratification !== null ? 'ratified_by_owner' : 'pending_dpo',
+      );
+      // Exatamente um dos dois campos é nulo — nunca ambos, nunca nenhum.
+      expect(c.dpo_open_question === null).toBe(c.owner_ratification !== null);
+    }
+  });
+
+  it('é estruturalmente não-purgável, que é o que sustenta a ratificação', () => {
+    expect(getDataClass('privacy.tombstone').purge_mechanism).toBe('not_purgeable');
   });
 });
 
