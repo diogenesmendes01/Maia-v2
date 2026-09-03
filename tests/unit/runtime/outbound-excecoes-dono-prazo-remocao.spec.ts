@@ -484,4 +484,48 @@ describe('#506 — o inventário de PRODUÇÃO, linha a linha', () => {
         'escrita está errada e precisa ser reescrita — não relaxada.',
     ).toEqual([]);
   });
+
+  it('a prova de migração ANCORA no callsite da exceção — infra existir não satisfaz (correção do dono, 2026-09-03)', () => {
+    // O buraco que este caso fecha foi encontrado por sonda de revisão: mover
+    // a probe `surge commitStandaloneOutbound` do módulo do callsite para
+    // `src/runtime/outbound/commit.ts` deixava as 24 asserções deste arquivo
+    // VERDES — a regra "a infraestrutura existir NÃO satisfaz esta condição"
+    // vivia só em prosa. Duas invariantes estruturais, cada uma com o seu
+    // porquê:
+    //
+    //  1. Toda exceção declarada tem pelo menos UMA probe no próprio módulo
+    //     do callsite — a condição de remoção fala do lugar onde o defeito
+    //     mora, não de um lugar onde algo novo apareceu.
+    //  2. Toda probe `surge` de `commitStandaloneOutbound` aponta para o
+    //     callsite da SUA exceção — nunca para a infra de outbound. O símbolo
+    //     surgindo em `commit.ts` é a infraestrutura existindo, que é
+    //     exatamente o que o dono recusou como prova.
+    const semAncora: string[] = [];
+    const surgeForaDoCallsite: string[] = [];
+    for (const exc of declaredExceptions()) {
+      const probes: readonly OutboundRemovalProbe[] = exc.removal.probes;
+      if (!probes.some((pr) => pr.module === exc.module)) {
+        semAncora.push(`${exc.id} (callsite ${exc.module})`);
+      }
+      for (const pr of probes) {
+        if (pr.symbol === 'commitStandaloneOutbound' && pr.kind === 'surge' && pr.module !== exc.module) {
+          surgeForaDoCallsite.push(`${exc.id}: surge de commitStandaloneOutbound em ${pr.module}`);
+        }
+      }
+    }
+    // Anti-vacuidade: se `declaredExceptions()` voltar vazio, este caso não
+    // olhou para nada — e o inventário diz que são seis.
+    expect(declaredExceptions().length).toBeGreaterThan(0);
+    expect(
+      semAncora,
+      'exceção sem NENHUMA probe no próprio callsite: a condição de remoção não fala do lugar ' +
+        'onde o sender direto vive, e a migração poderia ser "provada" sem tocar nele.',
+    ).toEqual([]);
+    expect(
+      surgeForaDoCallsite,
+      'probe de migração apontando para fora do callsite: "commitStandaloneOutbound surge na ' +
+        'infra" é a infraestrutura existindo, não o callsite migrado — a forma exata que o dono ' +
+        'recusou em 2026-09-03.',
+    ).toEqual([]);
+  });
 });
