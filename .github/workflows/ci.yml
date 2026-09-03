@@ -484,9 +484,54 @@ jobs:
         #
         # Mesmo raciocínio do `scripts/check-playwright-run.ts` no E2E do
         # console: um gate que fica verde por ausência de trabalho não é gate.
-        # Quando o e2e de backend voltar, ele nasce com este piso e com sonda
-        # vermelha — não antes.
+        #
+        # #703 — o e2e de backend VOLTOU, e voltou como a issue exigia: com
+        # conteúdo (`tests/e2e/jornadas-backend.spec.ts`), com piso próprio
+        # (`--min 3 --max-pulados 0`, nos dois passos logo abaixo) e com uma
+        # sonda vermelha por jornada registrada no corpo da PR.
         run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --rotulo "integração (node ${{ matrix.node }})"
+
+      - name: Jornadas e2e de backend (#703)
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
+        # A lane que a #703 devolve ao CI: as TRÊS jornadas de negócio ponta a
+        # ponta (`tests/e2e/jornadas-backend.spec.ts`).
+        #
+        # POR QUE UM PASSO DESTE JOB, e não um job novo: um job novo só vira
+        # gate quando entra na PROTEÇÃO DE BRANCH, e um check obrigatório com
+        # nome errado nunca reporta (aceite 4 da #703). Este job JÁ é
+        # obrigatório, JÁ tem Postgres e Redis, e JÁ aplicou as migrations —
+        # a lane herda tudo isso sem depender de uma mudança de configuração
+        # fora do repositório. O NOME do job (`integration (node …)`) fica
+        # INTACTO de propósito: renomeá-lo trocaria o nome do check obrigatório
+        # e a proteção passaria a esperar um check que ninguém mais publica.
+        #
+        # RESUMO PRÓPRIO (`e2e.txt`, e não o da integração): um piso de 3 lido
+        # contra o resumo da integração enxergaria os ~1100 casos dela e
+        # aprovaria uma lane e2e VAZIA — o defeito de novo, uma casa adiante.
+        #
+        # `--retry=0` está no script `test:e2e`: uma jornada que "passa na
+        # segunda tentativa" é exatamente o flake que este gate deveria
+        # denunciar, não absorver.
+        run: npm run test:e2e
+
+      - name: Piso de volume das jornadas e2e (#703)
+        # BLOQUEANTE, e este é o passo que impede a #703 de acontecer de novo.
+        #
+        # `--min 3`: são TRÊS jornadas nominais (os três nomes do arquivo
+        # removido pela #701 — R$ 50, R$ 25k, quarentena). O piso é o número de
+        # casos, não uma folga: apagar qualquer um deles reprova o job em vez
+        # de reduzir silenciosamente a cobertura. Ele NÃO impede acrescentar
+        # jornadas — só impede remover.
+        #
+        # `--max-pulados 0`: nesta lane não existe skip legítimo. O ÚNICO skip
+        # possível é o `describe.skip` condicionado a `TEST_DB_URL`
+        # (`SHOULD_RUN` na spec), e neste job Postgres e Redis são
+        # obrigatórios — um skip aqui significa "a infraestrutura obrigatória
+        # não estava presente", que é falha de job, não ausência de trabalho.
+        # É a mesma regra que `scripts/check-playwright-run.ts` aplica ao E2E
+        # do console e que a lane de fault injection (#510) já aplica abaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/e2e.txt --min 3 --max-pulados 0 --rotulo "jornadas e2e (#703, node ${{ matrix.node }})"
 
       - name: Resumo dos testes
         # Mesma razão do job `validate` — e aqui o problema é pior, porque este
@@ -1034,6 +1079,20 @@ jobs:
         # rodada tenha executado pelo menos `TEST_ADMIN_UI_MIN_TESTS` testes e
         # NENHUM pulado.
         #
+        # O script sobe DOIS processos. O console não gera QR nem código de
+        # pareamento — `channelLines.startPairing` grava um COMANDO em
+        # `channel_line_state` e devolve; quem abre a sessão e produz o
+        # material é o worker `channel_pairing`, que vive no RUNTIME. Enquanto
+        # o job subia um processo só, quatro casos da jornada de pareamento
+        # ficavam fora do gate. Agora `scripts/admin-ui-e2e.sh` também sobe
+        # `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts`
+        # (`MAIA_PROCESS_ROLE=scheduler`, `MAIA_SCHEDULER_GROUPS=channel`),
+        # compartilhando `DATABASE_URL`, `REDIS_URL` e o keyring gerado
+        # abaixo. O adapter de canal é FALSO — a #518 proíbe linha WhatsApp
+        # real no CI — e ele é injetado na CONSTRUÇÃO do LineSessionManager
+        # por aquele entrypoint, NUNCA por chave de configuração: ver
+        # `tests/unit/gateway/pairing-adapter-seam.spec.ts`.
+        #
         # Desde a #623 o script também SEMEIA as fixtures das jornadas
         # (`scripts/seed-admin-ui-e2e-fixtures.ts`) antes de subir o servidor —
         # é o que faz o projeto `smoke` incluir as jornadas autenticadas do
@@ -1148,37 +1207,69 @@ jobs:
           # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
           # `scripts/admin-ui-e2e.sh`.
           #
-          # 31 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
+          # 35 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
           # #623 (inbox, detalhe de proposta, aprovação simples e dupla,
           # rejeição, trava de arquitetura, trilha de auditoria, drift, traces
-          # e versões) + os 4 de `channel-lines.spec.ts`, a parte da décima
-          # jornada que NÃO depende do runtime (listagem da linha declarada,
-          # recusa ao papel `viewer` com o seu caso de controle, e a
-          # degradação honesta sem keyring). O piso não é cosmético: sem ele,
-          # um `grep` que deixasse de casar faria a rodada executar só o boot e
-          # o job continuaria verde — que é exatamente como a quarentena passou
+          # e versões) + os 4 de `channel-lines.spec.ts` (listagem da linha
+          # declarada, recusa ao papel `viewer` com o seu caso de controle, e a
+          # degradação fechada diante de material ilegível) + os 4 de
+          # `channel-lines-pairing.spec.ts`, que SAÍRAM da quarentena quando
+          # este passo passou a subir um runtime com adapter de canal falso. A
+          # quarentena está VAZIA. O piso não é cosmético: sem ele, um `grep`
+          # que deixasse de casar faria a rodada executar só o boot e o job
+          # continuaria verde — que é exatamente como a quarentena passou
           # despercebida. `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este
           # número contra a contagem de casos das specs FORA da quarentena.
-          TEST_ADMIN_UI_MIN_TESTS: '31'
-        run: npm run test:admin-ui:e2e:ci
+          TEST_ADMIN_UI_MIN_TESTS: '35'
+        # ─────────────────────────────────────────────────────────────────
+        # O KEYRING É GERADO AQUI — nunca literal no bloco `env:` acima
+        # ─────────────────────────────────────────────────────────────────
+        # `MAIA_STAGING_KEYRING` é MATERIAL DE CHAVE. O bloco `env:` de um
+        # workflow entra na HISTÓRIA do repositório, e é a história que o
+        # gitleaks varre: uma chave commitada aqui não sai mais de lá nem
+        # revertendo o commit. Por isso ela nasce no passo, efêmera, e morre
+        # com o runner.
+        #
+        # Ela precisa existir porque o pareamento atravessa DOIS processos: o
+        # worker `channel_pairing` do runtime SELA o QR/código com esta chave
+        # (`sealPairingMaterial`) e o console o ABRE com ela
+        # (`openPairingMaterial`). Chaves diferentes = envelope que não abre =
+        # `material: null` na tela. `export` (e não `env:`) é o que faz
+        # `scripts/admin-ui-e2e.sh` repassá-la aos dois filhos.
+        #
+        # `add-mask` é rede de segurança, não a proteção: se qualquer processo
+        # imprimir o valor, o log do job sai redigido.
+        run: |
+          MAIA_STAGING_ACTIVE_KEY_ID=e2e
+          CHAVE_E2E="$(openssl rand -base64 32)"
+          echo "::add-mask::$CHAVE_E2E"
+          MAIA_STAGING_KEYRING="{\"e2e\":\"$CHAVE_E2E\"}"
+          export MAIA_STAGING_ACTIVE_KEY_ID MAIA_STAGING_KEYRING
+          npm run test:admin-ui:e2e:ci
 
       - name: Quarentena da suíte e2e (o que NÃO foi medido)
-        # Nunca reprova: é legibilidade. Sobrou UMA spec fora do gate, e agora
-        # só com os casos que realmente exigem um segundo processo: o QR e o
-        # código de pareamento são produzidos pelo worker `channel_pairing` do
-        # RUNTIME, e este job sobe só o console. O que dependia apenas de
-        # sessão e fixture saiu para `channel-lines.spec.ts` e é bloqueante. O
-        # cabeçalho de `channel-lines-pairing.spec.ts` tem a medição e o
-        # critério objetivo de saída, caso a caso; a lista é fixada em
-        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode crescer
-        # em silêncio.
+        # Nunca reprova: é legibilidade. Desde que este job passou a subir um
+        # runtime com adapter de canal falso, a quarentena está VAZIA — as dez
+        # jornadas do console são gate bloqueante, pareamento incluído.
+        #
+        # O passo CONTINUA existindo, e o mecanismo também (a tag, o
+        # `grepInvert` do projeto `smoke`, a lista de
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`): "não há nada em
+        # quarentena hoje" é uma afirmação que precisa ser reconferida a cada
+        # execução, e um passo apagado não reconfere nada. Marcar um `describe`
+        # de novo volta a aparecer aqui e reprova o guard.
         if: always()
         continue-on-error: true
         run: |
-          echo "specs fora do gate (@pendente-runtime — dependem de um runtime Maia no job):"
+          echo "specs fora do gate (@pendente-runtime — dependeriam de infra que este job não tem):"
           # Casa a TAG no título do describe (o que o grep do Playwright vê),
-          # não uma menção ao identificador em comentário.
-          grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts
+          # não uma menção ao identificador em comentário. `grep -l` sai 1
+          # quando não acha nada, e é esse o caso ESPERADO hoje.
+          if grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts; then
+            echo "^^ acima: specs que o gate NÃO mediu."
+          else
+            echo "(nenhuma — a quarentena está vazia)"
+          fi
 
       - name: Relatório do Playwright (só quando reprova)
         if: failure()

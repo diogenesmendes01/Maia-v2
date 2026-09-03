@@ -118,6 +118,10 @@ npm run dev
 npm test                          # unit (vitest run)
 npm run test:watch                # unit, watch mode
 npm run test:integration          # integration (needs Postgres + Redis)
+npm run test:e2e                  # jornadas de negócio ponta a ponta (#703) —
+                                  # mesmas exigências da integração; --retry=0
+                                  # embutido (jornada que passa na 2ª tentativa
+                                  # é flake, não verde)
 npm run test:leak                 # cross-tenant leak suite (critical, run before any tenant-related change)
 
 # Static checks (run before every commit)
@@ -155,17 +159,35 @@ npm run admin:typecheck
 npm run test:admin-ui:unit
 npm run test:admin-ui:e2e         # Playwright, projeto `smoke` (exige console no ar)
 npm run test:admin-ui:e2e:ci      # semeia as fixtures das jornadas, monta o artefato
-                                  # standalone (o mesmo do Dockerfile), sobe
-                                  # `node src/admin-ui/server.js`, roda o smoke e derruba
-npm run test:admin-ui:e2e:pendentes  # quarentena que sobrou (#623): só o pareamento de
-                                  # linha, que precisa de um runtime Maia no ar
+                                  # standalone (o mesmo do Dockerfile), sobe DOIS
+                                  # processos — `node src/admin-ui/server.js` e um
+                                  # runtime `scheduler`/grupo `channel` com adapter de
+                                  # canal FALSO —, roda o smoke e derruba. Exige
+                                  # MAIA_STAGING_KEYRING (efêmero) nos dois.
+npm run test:admin-ui:e2e:pendentes  # quarentena (#623): hoje VAZIA — 0 testes. O
+                                  # projeto continua armado para o dia em que algo
+                                  # precise voltar para lá, num diff visível.
 
 # Operational
 npm run doctor                    # diagnóstico READ-ONLY do ambiente (#517) — offline por default
 npm run doctor -- --online        # + liveness de Postgres/Redis; --format json, --strict, --only
 npm run dlq                       # dead-letter queue inspection
 npm run embeddings:rebuild        # regenerate vector embeddings
-npm run import:ofx                # OFX file import flow
+                                  # exige --tenant e --agent (#239)
+
+# Importação de extrato (OFX/CSV) — escopo DECLARADO e VERIFICADO (#720).
+# `--tenant` e `--agent` são OBRIGATÓRIOS e não têm default: ausentes → exit 2.
+# A conta e a pessoa são resolvidas DENTRO do escopo declarado; se não
+# pertencerem a ele, a CLI recusa (exit 3) sem escrever nada. Runs de outro
+# escopo não são visíveis nem aplicáveis. Ver o cabeçalho de
+# `scripts/import-ofx.ts` para a decisão de desenho por trás disso.
+npm run import:ofx   -- --tenant=<id> --agent=<id> --pessoa=<id|apelido> \
+                        --conta=<id|apelido> --file=extrato.ofx
+npm run import:list  -- --tenant=<id> --agent=<id>
+npm run import:show  -- --tenant=<id> --agent=<id> --run=<id>
+npm run import:apply -- --tenant=<id> --agent=<id> --run=<id> \
+                        [--candidates=accept|reject]
+
 npm run backup                    # DB backup
 ```
 

@@ -216,15 +216,41 @@ number that call would be made on is no longer a guess.
 ### The performance gate (`npm run turn:bench`)
 
 `scripts/turn-context-benchmark.ts` is the executable form of the acceptance
-criteria for #525. It drives `buildPrompt` — the production call site, which is
-what publishes `maia_turn_context_load_duration_ms{phase="loader"}` — against a
-**real Postgres** through the real `max: 10` pool, with 50 tenant/agent pairs,
+criteria for #525. It drives the **whole turn** — `resolveScope`
+(`src/governance/permissions.ts`) followed by `buildPrompt`, the production call
+site that publishes `maia_turn_context_load_duration_ms{phase="loader"}` — against
+a **real Postgres** through the real `max: 10` pool, with 50 tenant/agent pairs,
 concurrency 20, scopes of 1/10/100 entities, and two arms:
 
 | arm | `FEATURE_TURN_CONTEXT_CACHE` | identity | reads per turn |
 |---|---|---|---|
-| `cold` | off (the production default in every generated fixture) | read from Postgres every turn | 10 |
-| `warm` | on, pre-warmed per pair | served from process memory | 9 |
+| `cold` | off (the production default in every generated fixture) | read from Postgres every turn | 10 + 2 (`resolveScope`) |
+| `warm` | on, pre-warmed per pair | served from process memory | 9 + 2 (`resolveScope`) |
+
+**Issue #700 — the boundary the harness measures.** Until #700 it measured
+`buildPrompt` only: `buildContext` fabricated the scope in memory and the
+fixture seeded neither `permissoes` nor `permission_profiles`, so a regression
+living in `resolveScope` passed the gate unseen and the "whole turn budget"
+criterion was emitted as `n/a` (which fails in `gate` mode — the containment).
+The scope is now resolved **in Postgres, inside the turn's clock**, by the same
+`resolveScope` `core.ts` calls. Because `resolveScope(pessoa)` returns *all* of
+that person's permissions and takes no cardinality argument, the 1/10/100 scale
+IS the resolved scope size: the fixture seeds **three people per pair**, with 1,
+10 and 100 `permissoes` rows each pointing at a distinct `permission_profiles`
+row (100 per pair, under the 500-row cap `profilesRepo.byIds` enforces). The
+interlocutor/conversation fixture is seeded for all three — seeding it for one
+would have silently changed what the rest of the benchmark measures.
+
+The two scope reads are sequential and run *before* the `ReadGate`, so they add
+2 to **reads per turn** and nothing to **peak concurrent reads**, which stays at
+6. The turn's stopwatch opens before `resolveScope` and closes after
+`buildPrompt`, and that boundary is computed in exactly one place
+(`measureTurn`) precisely so it can be asserted rather than merely arranged:
+subtracting the stage from the turn's clock would restore the old coverage while
+leaving the counters, the flag and the cardinality untouched. `COBERTURA_DA_MEDICAO.resolve_scope_medido` is a label carried into the
+fingerprint (so a baseline from the old coverage is refused), never the proof:
+the "whole turn budget" criterion reads the measured numbers, so flipping the
+flag without the measurement produces an evaluated, failing criterion.
 
 Repositories are **wrapped, not mocked**: the real query runs, and the wrapper
 only stamps start/end so every read can be attributed to its turn. That is what
@@ -252,6 +278,10 @@ What the gate decides (exit code 0/1), and why each one is there:
 | errors, timeouts | 0 | a fast turn that fails is not a fast turn |
 | peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
 | peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
+| `resolveScope` reads per turn | = 2 | #700. 0 means the scope was fabricated in memory (or the fixture lost the tables); more than 2 means an N+1 in the scope path. The count comes from the same per-turn instrument as peak reads, so it asserts what *ran* |
+| resolved scope size | 1–100, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; this also catches a permission dropped by the 500-profile cap |
+| p95 of the `resolveScope` stage | ≤ 600 ms | deliberately conservative — the stage is 2 of 13 queries, so eating the whole turn budget alone is pathological. The sharp defence is the total p95, which now includes the stage |
+| whole-turn budget (`resolveScope` + `buildPrompt`) | the three rows above, on every arm | the aggregate #700 names. It reads the measured numbers, not the coverage flag |
 | distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
 | pool sampling actually observed the run | samples > 0, blind gap ≤ 10× `--sample-ms` | the criterion below is worthless without it — see the trap |
 | pool drains (**normal profile**, paced) | during load, never saturated 60 s straight | see the trap below |
@@ -287,7 +317,8 @@ emitting `pool_samples: 0` with the spec green and the real run still lying.
 **The baseline fingerprint.** The file records the *shape* of the run that
 produced the number, and an incompatible shape makes the comparison **refused**,
 not merely flagged: `pairs`, `concurrency`, `think_ms`, `identity`,
-`cardinalities`, `pool_max`, `max_concurrent_reads`, `turns`, `sustain_s`.
+`cardinalities`, `pool_max`, `max_concurrent_reads`, `turns`, `sustain_s`,
+`cobertura`.
 `think_ms` alone moves p95 from 28.8 ms to 187.7 ms on this host, and run length
 moves it just as hard — 600 turns (5.7 s) measured p95 118.6 ms where 60 s
 sustained (7 389 turns) measured 22.4 ms, same host and code minutes apart,
@@ -573,7 +604,8 @@ transação única).
 | `tests/integration/turn-context-pool-fairness.spec.ts` | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness |
 | `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
 | `tests/unit/scripts/turn-context-gate.spec.ts` | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1 |
-| `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm. See the gate section above |
+| `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` | That the gate MEASURES the `resolveScope` stage (#700): a real turn through the production `resolveScope`, counted by the harness's own per-turn instrument, red when the scope goes back to being fabricated in memory — and that the stage is inside the turn's CLOCK (`measureTurn` is the single place the turn's duration is computed; the spec pins the arithmetic with an injected clock and with a real one) |
+| `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm, `resolveScope` + `buildPrompt`. See the gate section above |
 | `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
 | `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |
 | `tests/integration/pending-race-lost-terminal.spec.ts` | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta |

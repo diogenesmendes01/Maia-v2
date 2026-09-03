@@ -39,18 +39,28 @@
  *    (workers, /metrics, gateway) impõe ao mesmo pool. Os números daqui são o
  *    PISO: em produção a mesma carga custa mais. É por isso que o veredicto
  *    contra o baseline é relativo (+20%) e não só absoluto.
- *  - **NÃO mede o turno inteiro: `resolveScope` fica de FORA.** O orçamento da
- *    #525 (`src/agent/turn-context/types.ts`) define "turno inteiro" como
- *    `resolveScope` + `buildPrompt`, e conta o JOIN `permissoes ⋈
- *    permission_profiles` do `resolveScope` como uma das queries. Este harness
- *    mede só `buildPrompt`: `buildContext` (abaixo) FABRICA o escopo em
- *    memória — monta `byEntity` no processo e nunca chama `resolveScope` — e a
- *    massa não semeia `permissoes` nem `permission_profiles`. Logo o gate
- *    afere um ORÇAMENTO PARCIAL. Um relatório deste harness NÃO é validação do
- *    custo completo do turno, e não deve ser apresentado como tal: uma
- *    regressão que more no `resolveScope` passa por ele sem ser vista. Enquanto
- *    o instrumento não incluir o `resolveScope`, qualquer decisão que dependa
- *    do custo total precisa de uma medição dirigida à parte.
+ *  - **Mede o TURNO INTEIRO: `resolveScope` + `buildPrompt`** (issue #700).
+ *    O orçamento da #525 (`src/agent/turn-context/types.ts`) define "turno
+ *    inteiro" como `resolveScope` + `buildPrompt`, e conta o JOIN
+ *    `permissoes ⋈ permission_profiles` do `resolveScope` como duas das
+ *    queries. Até a #700 este harness media só `buildPrompt` — `buildContext`
+ *    FABRICAVA o escopo em memória e a massa não semeava aquelas duas tabelas,
+ *    de modo que uma regressão morando no `resolveScope` passava sem ser
+ *    vista. Hoje o escopo é RESOLVIDO no Postgres, dentro do relógio do turno,
+ *    pelo mesmo `resolveScope` de produção (`src/governance/permissions.ts`),
+ *    e as duas leituras dele entram no contador por turno (`instrument`) como
+ *    `scope_permissoes` e `scope_profiles`. O gate afere isso: três critérios
+ *    por braço exigem que as DUAS leituras tenham acontecido em todo turno,
+ *    que o escopo resolvido tenha a cardinalidade semeada e que o estágio não
+ *    coma sozinho o orçamento do turno. Virar a flag
+ *    `COBERTURA_DA_MEDICAO.resolve_scope_medido` sem a medição NÃO aprova
+ *    nada: o critério do aceite completo lê os números medidos, não a flag.
+ *  - **A série do Prometheus continua cobrindo só o `buildPrompt`.**
+ *    `maia_turn_context_load_duration_ms{phase="loader"}` é publicada DENTRO
+ *    de `buildPrompt` (`src/agent/prompt-builder.ts`), então ela não inclui o
+ *    estágio do `resolveScope`. O p95 deste harness (que inclui) é, por
+ *    construção, maior que o p95 dos buckets — as duas linhas do relatório
+ *    medem fronteiras diferentes e estão rotuladas como tais.
  *
  * Quem citar um número deste harness, cite junto o braço (`cold`/`warm`), a
  * cardinalidade e o host.
@@ -168,6 +178,11 @@
  *   npm run turn:bench -- --sustain-s 60 --json
  *   npm run turn:bench -- --self-test --inject p95_ms=900   # prova que o gate reprova
  *   npm run turn:bench -- --self-test --self-test-baseline missing   # idem, sem baseline
+ *   # As quatro provas do estágio `resolveScope` (#700) — todas saem 1:
+ *   npm run turn:bench -- --self-test --inject scope_reads_per_turn_min=0   # escopo fabricado em memória
+ *   npm run turn:bench -- --self-test --inject scope_reads_per_turn_max=101 # N+1 no caminho do escopo
+ *   npm run turn:bench -- --self-test --inject scope_cardinality_mismatches=1 # escopo ≠ massa semeada
+ *   npm run turn:bench -- --self-test --inject cold.scope_p95_ms=900        # degradação NO resolveScope
  *   npm run turn:bench -- --cleanup-only     # remove massa órfã de uma corrida abortada
  *
  * | Flag | Default | O que faz |
@@ -236,6 +251,26 @@ const ALL_ARMS: ArmName[] = ['cold', 'warm'];
 
 /** Cardinalidades de escopo que o enunciado do dono fixa. */
 export const CARDINALITIES = [1, 10, 100] as const;
+
+/**
+ * As duas leituras do `resolveScope` (`src/governance/permissions.ts`), com o
+ * nome de seção que o contador por turno usa. São as seções que o gate exige
+ * ver em TODO turno desde a #700 — a evidência de que o escopo veio do
+ * Postgres e não de um `Map` montado no processo.
+ */
+export const SCOPE_SECTIONS = {
+  permissoes: 'scope_permissoes',
+  profiles: 'scope_profiles',
+} as const;
+
+/**
+ * Quantas leituras o `resolveScope` faz por turno. NÃO é uma escolha deste
+ * harness: é o orçamento da #525 (`src/agent/turn-context/types.ts`), que conta
+ * `permissoesRepo.forPessoa` + `profilesRepo.byIds` como 2 das 13 queries do
+ * turno. O gate cobra o número EXATO nos dois sentidos — menos significa escopo
+ * fabricado (ou massa ausente), mais significa N+1 no caminho do escopo.
+ */
+export const SCOPE_READS_PER_TURN = 2;
 
 export type Thresholds = {
   p95_ms: number;
@@ -334,36 +369,42 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  * só num comentário.
  *
  * O orçamento do turno (`src/agent/turn-context/types.ts`) é
- * `resolveScope` + `buildPrompt`. Este harness mede só `buildPrompt`:
- * `buildContext` fabrica o escopo em memória e a massa não semeia
- * `permissoes` nem `permission_profiles`. Enquanto isso for verdade, NENHUMA
- * corrida deste script pode produzir a aprovação do orçamento COMPLETO — nem
- * por exit code, nem por linha de relatório.
+ * `resolveScope` + `buildPrompt`. Desde a #700 as duas pontas estão dentro da
+ * medição: o escopo é resolvido no Postgres, dentro do relógio do turno, pelo
+ * `resolveScope` de produção, e a massa semeia `permissoes` e
+ * `permission_profiles` nas cardinalidades 1/10/100.
  *
- * A contenção é estrutural, em três pontos que se sustentam:
+ * A flag abaixo é um RÓTULO, não uma prova. Ela existe por dois motivos, e
+ * nenhum deles é "declarar que a medição acontece":
  *
- *  1. `evaluateGate` emite o critério do aceite completo como NÃO AVALIADO
- *     (`skipped: true`). Pela invariante do `Verdict`, não avaliado implica
- *     não aprovado, e em modo `gate` isso REPROVA a corrida. Um gate que não
- *     pode demonstrar o que promete não deve sair 0;
- *  2. `cobertura` entra no `RunFingerprint`, então um baseline gravado sob
- *     uma cobertura é RECUSADO para comparação sob outra. É o que mantém os
- *     números antigos identificados pela cobertura que os produziu, em vez de
- *     deixá-los circular como se medissem o turno inteiro;
- *  3. o relatório carrega o rótulo em todo modo, inclusive `measure`.
+ *  1. `cobertura` entra no `RunFingerprint`, então um baseline gravado sob uma
+ *     cobertura é RECUSADO para comparação sob outra. É o que mantém os
+ *     números da cobertura anterior (`buildPrompt-sem-resolveScope`)
+ *     identificados pelo que os produziu, em vez de deixá-los circular como se
+ *     medissem o turno inteiro. Todo baseline gravado antes da #700 fica
+ *     automaticamente inválido — não por decreto, por divergência de campo;
+ *  2. o relatório carrega o rótulo em todo modo, inclusive `measure`, para que
+ *     um relatório não possa ser lido fora do seu escopo.
  *
- * Quando o `resolveScope` entrar na medição (issue #700), `resolve_scope_medido`
- * vira `true` e o `rotulo` muda — e a mudança do rótulo é justamente o que
- * invalida, de forma automática, todo baseline da cobertura anterior. Virar a
- * flag SEM incluir a medição é o defeito que a sonda vermelha da #700 tem de
- * pegar.
+ * O que APROVA o aceite completo é outra coisa: `evaluateGate` lê os números
+ * MEDIDOS de cada braço — as duas leituras do escopo em todo turno
+ * (`scope_reads_per_turn_min/max`), a cardinalidade resolvida batendo com a
+ * semeada (`scope_cardinality_mismatches`) e o p95 do estágio. Virar esta flag
+ * sem incluir a medição não produz aprovação nenhuma: produz um critério
+ * AVALIADO e REPROVADO, com os zeros à vista. A flag não é prova de si mesma —
+ * quem sustenta essa afirmação são as duas sondas da #700:
+ * `tests/unit/scripts/turn-context-gate.spec.ts` (o avaliador reprova a flag
+ * sem números) e `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts`
+ * (a MEDIÇÃO: um turno de verdade, contado pelo instrumento de verdade).
  */
 export const COBERTURA_DA_MEDICAO = {
   /**
-   * `false` enquanto `buildContext` fabricar o escopo em memória em vez de
-   * chamar `resolveScope`. Ver issue #700.
+   * `true` desde a #700: `runTurnOnce` chama `resolveScope` dentro do relógio
+   * e a massa semeia `permissoes` + `permission_profiles`. Não é o que aprova
+   * o critério do aceite completo — ver o bloco acima.
    */
-  resolve_scope_medido: false,
+  resolve_scope_medido: true,
+  /** O rótulo da cobertura ANTERIOR — o que carimba os baselines de antes da #700. */
   rotulo: 'buildPrompt-sem-resolveScope',
 } as const;
 
@@ -883,6 +924,54 @@ export function poolMetricsFromSummary(summary: PoolSamplingSummary, sampleMs: n
   };
 }
 
+/**
+ * A fatia de `ArmResult` que descreve o estágio `resolveScope` (#700).
+ *
+ * Existe como fronteira própria pelo MESMO motivo de `poolMetricsFromSummary`:
+ * corrigir só o avaliador não conserta nada. Se `runArm` publicasse
+ * `scope_reads_per_turn_min: 2` sem que leitura nenhuma tivesse acontecido, o
+ * spec do gate passaria e a corrida real seguiria mentindo. Toda a tradução
+ * "o que o contador do turno registrou" → `ArmResult` mora aqui, e é isto que
+ * a sonda vermelha alimenta com frames REAIS.
+ */
+export type ScopeMetrics = Pick<
+  ArmResult,
+  | 'scope_reads_per_turn_min'
+  | 'scope_reads_per_turn_max'
+  | 'scope_cardinality_mismatches'
+  | 'scope_entities_min'
+  | 'scope_entities_max'
+  | 'scope_p50_ms'
+  | 'scope_p95_ms'
+>;
+
+/** O que os turnos MEDIDOS dizem sobre o estágio `resolveScope`. */
+export function scopeMetricsFromSamples(
+  samples: ReadonlyArray<{
+    /** A cardinalidade pedida ao turno. */
+    entities: number;
+    /** A cardinalidade que o `resolveScope` devolveu. */
+    scope_entities: number;
+    scope_ms: number;
+    reads: ReadonlyArray<{ section: string }>;
+  }>,
+): ScopeMetrics {
+  const porTurno = samples.map((s) => countScopeReads(s.reads));
+  const entidades = samples.map((s) => s.scope_entities);
+  const duracoes = samples.map((s) => s.scope_ms).sort((a, b) => a - b);
+  return {
+    scope_reads_per_turn_min: porTurno.length ? Math.min(...porTurno) : 0,
+    scope_reads_per_turn_max: porTurno.length ? Math.max(...porTurno) : 0,
+    // A cardinalidade PEDIDA contra a RESOLVIDA, turno a turno. É a asserção
+    // que separa "o escopo veio do banco" de "o escopo veio de algum lugar".
+    scope_cardinality_mismatches: samples.filter((s) => s.scope_entities !== s.entities).length,
+    scope_entities_min: entidades.length ? Math.min(...entidades) : 0,
+    scope_entities_max: entidades.length ? Math.max(...entidades) : 0,
+    scope_p50_ms: percentile(duracoes, 50),
+    scope_p95_ms: percentile(duracoes, 95),
+  };
+}
+
 // ============================================================================
 // Resultado de um braço + veredictos (PUROS — testáveis sem Postgres)
 // ============================================================================
@@ -924,6 +1013,34 @@ export type ArmResult = {
   peak_reads_per_turn: number;
   reads_per_turn_min: number;
   reads_per_turn_max: number;
+  /**
+   * O ESTÁGIO `resolveScope` do turno (issue #700). Estes campos são a
+   * evidência de que ele foi EXECUTADO, e não declarado: saem do contador de
+   * leituras por turno (`instrument`), do mesmo jeito que `peak_reads_per_turn`
+   * — não de uma flag nem de uma linha de relatório.
+   *
+   * `scope_reads_per_turn_*` conta as leituras das seções `scope_permissoes` e
+   * `scope_profiles`. O orçamento da #525 fixa esse número em EXATAMENTE 2 por
+   * turno: 0 significa escopo fabricado em memória (ou massa sem as tabelas),
+   * e um número maior significa N+1 no caminho do escopo — as duas regressões
+   * que a #700 exige que o gate veja.
+   */
+  scope_reads_per_turn_min: number;
+  scope_reads_per_turn_max: number;
+  /**
+   * Turnos em que o escopo RESOLVIDO não teve o tamanho da cardinalidade
+   * pedida. Zero é a única leitura aceitável: qualquer outro valor diz que o
+   * banco devolveu um escopo diferente do que a massa semeou — massa faltando,
+   * permissão descartada pelo teto de 500 do `profilesRepo.byIds`, ou escopo
+   * vindo de outro lugar que não o `resolveScope`.
+   */
+  scope_cardinality_mismatches: number;
+  /** Menor e maior escopo resolvido na corrida — esperado: 1 e 100. */
+  scope_entities_min: number;
+  scope_entities_max: number;
+  /** Latência do estágio `resolveScope` isolado (dentro do relógio do turno). */
+  scope_p50_ms: number;
+  scope_p95_ms: number;
   pool_max: number;
   pool_saturation_max_streak_ms: number;
   pool_saturated_samples: number;
@@ -983,6 +1100,33 @@ export type GateContext = {
   fingerprint: RunFingerprint;
 };
 
+/** As duas leituras do escopo aconteceram em TODO turno deste braço? */
+export function scopeReadsExercised(a: ArmResult): boolean {
+  return (
+    a.scope_reads_per_turn_min === SCOPE_READS_PER_TURN &&
+    a.scope_reads_per_turn_max === SCOPE_READS_PER_TURN
+  );
+}
+
+/** O escopo RESOLVIDO bateu com a cardinalidade semeada, em todo turno? */
+export function scopeCardinalityMatches(a: ArmResult): boolean {
+  return (
+    a.scope_cardinality_mismatches === 0 &&
+    a.scope_entities_min === Math.min(...CARDINALITIES) &&
+    a.scope_entities_max === Math.max(...CARDINALITIES)
+  );
+}
+
+/** A evidência do estágio, em uma linha — usada nos detalhes dos veredictos. */
+function scopeEvidenceDetail(a: ArmResult): string {
+  return (
+    `leituras do escopo por turno=${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max} ` +
+    `(esperado ${SCOPE_READS_PER_TURN}) · escopo resolvido=${a.scope_entities_min}–${a.scope_entities_max} ` +
+    `entidades (esperado ${Math.min(...CARDINALITIES)}–${Math.max(...CARDINALITIES)}) · ` +
+    `divergências de cardinalidade=${a.scope_cardinality_mismatches} de ${a.turns} turnos`
+  );
+}
+
 /**
  * O gate. Função PURA sobre os resultados dos braços — é isto que
  * `tests/unit/turn-context-gate.spec.ts` alimenta com valores sintéticos para
@@ -998,27 +1142,50 @@ export function evaluateGate(
   const compat = checkBaselineCompatibility(baseline, ctx.fingerprint);
 
   // ── O aceite COMPLETO, e por que ele vem PRIMEIRO ────────────────────
-  // O orçamento do turno é `resolveScope` + `buildPrompt`. Enquanto o harness
-  // fabricar o escopo em memória, este critério NÃO PODE ser avaliado — e
-  // "não avaliado" não é "aprovado" (ver a invariante do `Verdict`).
+  // O orçamento do turno é `resolveScope` + `buildPrompt`. Este critério
+  // encabeça a lista de propósito: quem lê a tabela de cima para baixo
+  // encontra a FRONTEIRA DA MEDIÇÃO antes dos números, e não depois de já ter
+  // formado uma opinião sobre eles.
   //
-  // Ele encabeça a lista de propósito: quem lê a tabela de cima para baixo
-  // encontra a fronteira ANTES dos números, e não depois de já ter formado
-  // uma opinião sobre eles. Em modo `gate` isso reprova a corrida — é a
-  // consequência pretendida: o gate não pode sair 0 sobre uma garantia que
-  // não demonstra. Os critérios PARCIAIS abaixo continuam sendo avaliados e
-  // continuam valendo para o trecho que exercitam.
+  // Ele NÃO lê a flag `COBERTURA_DA_MEDICAO.resolve_scope_medido` para
+  // aprovar: lê os NÚMEROS MEDIDOS de cada braço. Virar a flag sem incluir a
+  // medição produz aqui um critério avaliado e REPROVADO — com os zeros à
+  // vista — em vez de uma aprovação. A flag serve para carimbar a cobertura no
+  // fingerprint e no relatório; a prova é a evidência.
+  //
+  // Com a flag em `false` (alguém desligou a medição) o critério volta a ser
+  // NÃO AVALIADO, e "não avaliado" não é "aprovado" (invariante do `Verdict`):
+  // em modo `gate` isso reprova. Os dois caminhos reprovam; o que muda é o
+  // diagnóstico.
+  const scopeEvidence = arms.map((a) => ({
+    arm: a,
+    ok: scopeReadsExercised(a) && scopeCardinalityMatches(a) && a.turns > 0,
+  }));
+  const evidenciaCompleta = scopeEvidence.length > 0 && scopeEvidence.every((e) => e.ok);
   if (!COBERTURA_DA_MEDICAO.resolve_scope_medido) {
     out.push({
       label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
       passed: false,
       skipped: true,
       detail:
-        `NÃO AVALIADO — a medição exclui o \`resolveScope\` (JOIN ` +
-        `\`permissoes ⋈ permission_profiles\`): \`buildContext\` fabrica o escopo ` +
-        `em memória e a massa não semeia essas tabelas. Cobertura desta ` +
-        `corrida: \`${coberturaAtual()}\`. Os critérios abaixo valem para o ` +
-        `trecho exercitado e NÃO para o custo completo do turno. Issue #700.`,
+        `NÃO AVALIADO — \`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está ` +
+        `\`false\`: a corrida declara não medir o \`resolveScope\` (JOIN ` +
+        `\`permissoes ⋈ permission_profiles\`). Cobertura desta corrida: ` +
+        `\`${coberturaAtual()}\`. Os critérios abaixo valem para o trecho ` +
+        `exercitado e NÃO para o custo completo do turno. Issue #700.`,
+    });
+  } else {
+    out.push({
+      label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
+      passed: evidenciaCompleta,
+      detail: evidenciaCompleta
+        ? `o turno medido inclui o \`resolveScope\`: ${SCOPE_READS_PER_TURN} leituras ` +
+          `(\`permissoes ⋈ permission_profiles\`) em TODO turno de todo braço, ` +
+          `escopo resolvido de ${Math.min(...CARDINALITIES)} a ${Math.max(...CARDINALITIES)} ` +
+          `entidades e zero divergências de cardinalidade. Cobertura: \`${coberturaAtual()}\``
+        : `A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO — ` +
+          scopeEvidence.map((e) => `[${e.arm.arm}] ${scopeEvidenceDetail(e.arm)}`).join(' · ') +
+          `. Cobertura declarada: \`${coberturaAtual()}\`. Issue #700.`,
     });
   }
 
@@ -1040,6 +1207,39 @@ export function evaluateGate(
         `erros=${a.errors} · timeouts=${a.timeouts} (orçamento por turno)` +
         (a.error_samples.length ? ` · ex.: ${a.error_samples.slice(0, 2).join(' | ')}` : ''),
     });
+    // ── O ESTÁGIO `resolveScope` (issue #700) ─────────────────────────
+    // Três critérios, e cada um pega uma regressão diferente:
+    //
+    //  1. as duas leituras aconteceram em TODO turno — 0 é escopo fabricado em
+    //     memória ou massa sem `permissoes`/`permission_profiles`; >2 é N+1 no
+    //     caminho do escopo (o `byId` por permissão que a #511 removeu);
+    //  2. o escopo RESOLVIDO tem o tamanho que a massa semeou — é o que impede
+    //     "duas leituras aconteceram, mas devolveram vazio" de passar por
+    //     medição, e o que denuncia uma permissão descartada pelo teto de 500
+    //     do `profilesRepo.byIds`;
+    //  3. o estágio não come sozinho o orçamento do turno. O limite é o MESMO
+    //     p95 do turno inteiro, de propósito conservador: o `resolveScope` são
+    //     2 das 13 queries do orçamento, então gastar o turno inteiro nelas já
+    //     é patológico. A defesa fina continua sendo o p95 total (que agora
+    //     INCLUI este estágio) e a comparação relativa contra o baseline.
+    out.push({
+      label: `[${a.arm}] o \`resolveScope\` foi EXERCITADO: ${SCOPE_READS_PER_TURN} leituras (\`permissoes ⋈ permission_profiles\`) por turno`,
+      passed: scopeReadsExercised(a) && a.turns > 0,
+      detail: scopeEvidenceDetail(a),
+    });
+    out.push({
+      label: `[${a.arm}] o escopo do turno veio do BANCO, nas cardinalidades ${CARDINALITIES.join('/')}`,
+      passed: scopeCardinalityMatches(a) && a.turns > 0,
+      detail: scopeEvidenceDetail(a),
+    });
+    out.push({
+      label: `[${a.arm}] p95 do estágio \`resolveScope\` ≤ ${th.p95_ms} ms`,
+      passed: a.scope_p95_ms <= th.p95_ms,
+      detail:
+        `p95=${a.scope_p95_ms.toFixed(1)} ms · p50=${a.scope_p50_ms.toFixed(1)} ms ` +
+        `(de um p95 de turno de ${a.p95_ms.toFixed(1)} ms, que já o inclui)`,
+    });
+
     out.push({
       label: `[${a.arm}] pico de leituras simultâneas por turno ≤ ${th.max_peak_reads}`,
       passed: a.peak_reads_per_turn <= th.max_peak_reads,
@@ -1278,6 +1478,18 @@ export function applyInjection(arms: ArmResult[], inject: Record<string, number>
     'metric_count',
     'pairs_exercised',
     'reads_per_turn_max',
+    // O estágio `resolveScope` (#700). Estes cinco existem para PROVAR pela
+    // CLI que o gate vê uma regressão que more no escopo: `=0` é o escopo
+    // fabricado em memória de volta, `=101` é o N+1 que a #511 removeu,
+    // `scope_cardinality_mismatches=1` é o escopo que não bate com a massa e
+    // `scope_p95_ms=900` é a degradação de latência do próprio estágio.
+    'scope_reads_per_turn_min',
+    'scope_reads_per_turn_max',
+    'scope_cardinality_mismatches',
+    'scope_entities_min',
+    'scope_entities_max',
+    'scope_p50_ms',
+    'scope_p95_ms',
   ]);
   for (const [rawKey, value] of Object.entries(inject)) {
     const dot = rawKey.indexOf('.');
@@ -1316,8 +1528,16 @@ export function syntheticPassingArm(arm: ArmName, th: Thresholds): ArmResult {
     timeouts: 0,
     error_samples: [],
     peak_reads_per_turn: th.max_peak_reads,
-    reads_per_turn_min: 10,
-    reads_per_turn_max: 10,
+    // 12 = as 10 leituras do `buildPrompt` + as 2 do `resolveScope` (#700).
+    reads_per_turn_min: 10 + SCOPE_READS_PER_TURN,
+    reads_per_turn_max: 10 + SCOPE_READS_PER_TURN,
+    scope_reads_per_turn_min: SCOPE_READS_PER_TURN,
+    scope_reads_per_turn_max: SCOPE_READS_PER_TURN,
+    scope_cardinality_mismatches: 0,
+    scope_entities_min: Math.min(...CARDINALITIES),
+    scope_entities_max: Math.max(...CARDINALITIES),
+    scope_p50_ms: 2,
+    scope_p95_ms: 6,
     pool_max: 10,
     pool_saturation_max_streak_ms: 0,
     pool_saturated_samples: 0,
@@ -1394,7 +1614,7 @@ export function syntheticBaseline(
 // Instrumentação: quem leu, quando, por qual turno
 // ============================================================================
 
-type TurnFrame = {
+export type TurnFrame = {
   id: number;
   tenant: string;
   entities: number;
@@ -1404,6 +1624,21 @@ type TurnFrame = {
 };
 
 const turnALS = new AsyncLocalStorage<TurnFrame>();
+
+/** O frame de contagem de UM turno. */
+export function newTurnFrame(id: number, tenant: string, entities: number): TurnFrame {
+  return { id, tenant, entities, inflight: 0, peak: 0, reads: [] };
+}
+
+/**
+ * Roda `fn` DENTRO do frame — é assim que cada leitura sabe a que turno
+ * pertence. Exportado para que a sonda vermelha da #700 possa exercitar o
+ * mesmo caminho de contagem que `runArm` usa: uma sonda que montasse o próprio
+ * contador provaria o contador da sonda.
+ */
+export function runInTurnFrame<T>(frame: TurnFrame, fn: () => Promise<T>): Promise<T> {
+  return turnALS.run(frame, fn);
+}
 
 /**
  * Envolve UM método de repositório mantendo a implementação real.
@@ -1448,12 +1683,26 @@ function instrument<T extends object>(obj: T, key: keyof T & string, section: st
 /** Prefixo de TUDO que este harness cria. `--cleanup-only` apaga por ele. */
 const PREFIX = 'bench525';
 
-type Pair = {
-  tenant_id: string;
-  agent_id: string;
+/**
+ * UMA pessoa do par, e a cardinalidade de escopo que ela carrega.
+ *
+ * Existe porque o `resolveScope` não aceita parâmetro de cardinalidade: ele
+ * devolve TODAS as permissões daquela pessoa. Como a escala 1/10/100 do
+ * enunciado É o tamanho do escopo resolvido, a única forma de resolvê-lo no
+ * banco em três tamanhos é ter TRÊS PESSOAS por par — uma com 1 linha em
+ * `permissoes`, outra com 10, outra com 100.
+ *
+ * As três recebem a MESMA massa de interlocutor e de conversa (mensagens,
+ * fatos de pessoa, memórias e hints de `interlocutor`/`conversation`). Semear
+ * essa massa para uma só faria o loader ler menos linhas nos outros dois
+ * terços dos turnos e mudaria, em silêncio, o que o resto do benchmark mede —
+ * trocaria um viés por outro.
+ */
+export type PairPerson = {
+  /** Cardinalidade do escopo desta pessoa: linhas em `permissoes`. */
+  entities: number;
   pessoa_id: string;
   conversa_id: string;
-  entidade_ids: string[];
   /** Linhas REAIS, lidas de volta do banco — o `PromptContext` do turno usa
    *  exatamente o que `core.ts` teria em mãos, não um literal inventado. */
   pessoa: Record<string, unknown>;
@@ -1461,7 +1710,37 @@ type Pair = {
   inbound: Record<string, unknown>;
 };
 
+export type Pair = {
+  tenant_id: string;
+  agent_id: string;
+  entidade_ids: string[];
+  /** Perfis de permissão do par — o alvo do `profilesRepo.byIds`. */
+  profile_ids: string[];
+  /** Uma pessoa por cardinalidade, na ordem de `CARDINALITIES`. */
+  people: PairPerson[];
+};
+
+/** A pessoa do par que carrega esta cardinalidade. */
+export function personFor(pair: Pair, entities: number): PairPerson {
+  const person = pair.people.find((p) => p.entities === entities);
+  if (!person) throw new Error(`par ${pair.tenant_id} sem pessoa de cardinalidade ${entities}`);
+  return person;
+}
+
 const ENTITIES_PER_PAIR = Math.max(...CARDINALITIES);
+
+/**
+ * Perfis de permissão distintos por par — um por entidade, então a pessoa de
+ * cardinalidade 100 resolve 100 perfis DISTINTOS num único `profilesRepo.byIds`.
+ *
+ * É o pior caso sob o teto de 500 que a #525 estabeleceu (`byIds(ids, limit =
+ * 500)`, `src/db/repositories/pessoa-repos.ts`): 100 < 500, então nenhuma
+ * permissão é descartada pelo `LIMIT` — e é justamente o critério de
+ * cardinalidade do gate que prova isso, porque uma permissão descartada
+ * apareceria como escopo menor que o semeado. Apontar as 100 permissões para
+ * um perfil só mediria um `IN` de um elemento e esconderia o custo do lote.
+ */
+const PROFILES_PER_PAIR = ENTITIES_PER_PAIR;
 
 /**
  * Tabelas que o harness escreve, na ORDEM DE REMOÇÃO (filhas antes de pais).
@@ -1481,6 +1760,12 @@ const SEEDED_TABLES = [
   'agent_operational_profile_versions',
   'self_state',
   'entity_states',
+  // `permissoes` antes de `permission_profiles`: a FK entre elas não é
+  // `ON DELETE CASCADE`, então apagar o perfil primeiro falha. E as duas antes
+  // de `entidades`/`pessoas`, cujo cascade as levaria junto — a remoção
+  // explícita é o que torna a limpeza independente do `ON DELETE` (#700).
+  'permissoes',
+  'permission_profiles',
   'entidades',
   'conversas',
   'pessoas',
@@ -1522,13 +1807,6 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
     [agent_id, tenant_id],
   );
 
-  const pessoa = await c.query<{ id: string }>(
-    `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo)
-     VALUES ($1, $2, $3, $4, 'dono') RETURNING id`,
-    [tenant_id, agent_id, `${PREFIX} Owner ${index}`, `+5511${String(900000000 + index)}`],
-  );
-  const pessoa_id = pessoa.rows[0]!.id;
-
   const ents = await c.query<{ id: string }>(
     `INSERT INTO entidades(tenant_id, agent_id, nome, tipo)
      SELECT $1, $2, '${PREFIX}-ent-' || lpad(g::text, 4, '0'), 'pj'
@@ -1547,40 +1825,32 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
     [entidade_ids.slice(0, Math.ceil(ENTITIES_PER_PAIR / 5)), tenant_id, agent_id],
   );
 
-  const conversa = await c.query<{ id: string }>(
-    `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades)
-     VALUES ($1, $2, $3, $4::uuid[]) RETURNING id`,
-    [tenant_id, agent_id, pessoa_id, entidade_ids],
+  // Perfis de permissão do par — o lado direito do JOIN que o `resolveScope`
+  // faz (`profilesRepo.byIds`). `permission_profiles.id` é PK **GLOBAL** (TEXT,
+  // não escopada por tenant), então o id carrega o tenant no nome: dois pares
+  // do mesmo benchmark colidiriam sem isso.
+  const profiles = await c.query<{ id: string }>(
+    `INSERT INTO permission_profiles(id, tenant_id, agent_id, nome, acoes, limite_default, descricao)
+     SELECT $1 || '-prof-' || lpad(g::text, 4, '0'), $1, $2,
+            '${PREFIX} profile ' || g,
+            ARRAY['read_balance','read_transactions','create_transaction'],
+            200.00,
+            '${PREFIX} profile de benchmark'
+     FROM generate_series(1, $3) g
+     RETURNING id`,
+    [tenant_id, agent_id, PROFILES_PER_PAIR],
   );
-  const conversa_id = conversa.rows[0]!.id;
+  const profile_ids = profiles.rows.map((r) => r.id);
 
-  // 24 mensagens contra um `SECTION_BUDGETS.history.max_items` de 10: o
-  // `ORDER BY created_at DESC LIMIT 10` precisa ter o que descartar.
-  await c.query(
-    `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, created_at)
-     SELECT $1, $2, $3,
-            CASE WHEN g % 2 = 0 THEN 'in' ELSE 'out' END,
-            'texto',
-            '${PREFIX} mensagem de histórico número ' || g || ' com corpo suficiente para o orçamento de bytes da seção de histórico não ser trivial.',
-            now() - (g || ' minutes')::interval
-     FROM generate_series(1, 24) g`,
-    [tenant_id, agent_id, conversa_id],
-  );
-
-  // Fatos nos TRÊS escopos que o loader monta: global, pessoa e entidade.
+  // Fatos nos TRÊS escopos que o loader monta: global, pessoa e entidade. Os de
+  // PESSOA saem em `seedPerson` — são por interlocutor, e desde a #700 há três
+  // por par.
   await c.query(
     `INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)
      SELECT $1, $2, 'global', '${PREFIX}-fato-global-' || g,
             jsonb_build_object('content', '${PREFIX} fato global ' || g), 0.9, 'aprendido'
      FROM generate_series(1, 12) g`,
     [tenant_id, agent_id],
-  );
-  await c.query(
-    `INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)
-     SELECT $1, $2, 'pessoa:' || $3, '${PREFIX}-fato-pessoa-' || g,
-            jsonb_build_object('content', '${PREFIX} fato de pessoa ' || g), 0.9, 'aprendido'
-     FROM generate_series(1, 12) g`,
-    [tenant_id, agent_id, pessoa_id],
   );
   await c.query(
     `INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)
@@ -1605,37 +1875,10 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
     [tenant_id, agent_id],
   );
   await c.query(
-    `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
-                              sensitivity, proactive_use, mention_allowed)
-     SELECT $1, $2, '${PREFIX} memória de interlocutor ' || g, 'preference', 'interlocutor', $3, 'low', true, true
-     FROM generate_series(1, 15) g`,
-    [tenant_id, agent_id, pessoa_id],
-  );
-  await c.query(
-    `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
-                              sensitivity, proactive_use, mention_allowed)
-     SELECT $1, $2, '${PREFIX} memória de conversa ' || g, 'preference', 'conversation', $3, 'low', true, true
-     FROM generate_series(1, 15) g`,
-    [tenant_id, agent_id, conversa_id],
-  );
-
-  await c.query(
     `INSERT INTO behavioral_hint(tenant_id, agent_id, scope_type, subject_id, hint_text, derived_sensitivity)
      SELECT $1, $2, 'agent', NULL, '${PREFIX} hint de agente ' || g, 'low'
      FROM generate_series(1, 15) g`,
     [tenant_id, agent_id],
-  );
-  await c.query(
-    `INSERT INTO behavioral_hint(tenant_id, agent_id, scope_type, subject_id, hint_text, derived_sensitivity)
-     SELECT $1, $2, 'interlocutor', $3, '${PREFIX} hint de interlocutor ' || g, 'low'
-     FROM generate_series(1, 10) g`,
-    [tenant_id, agent_id, pessoa_id],
-  );
-  await c.query(
-    `INSERT INTO behavioral_hint(tenant_id, agent_id, scope_type, subject_id, hint_text, derived_sensitivity)
-     SELECT $1, $2, 'conversation', $3, '${PREFIX} hint de conversa ' || g, 'low'
-     FROM generate_series(1, 10) g`,
-    [tenant_id, agent_id, conversa_id],
   );
 
   await c.query(
@@ -1682,6 +1925,128 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
     );
   }
 
+  const people: PairPerson[] = [];
+  for (let k = 0; k < CARDINALITIES.length; k++) {
+    people.push(
+      await seedPerson(c, {
+        tenant_id,
+        agent_id,
+        pair_index: index,
+        person_index: k,
+        entities: CARDINALITIES[k]!,
+        entidade_ids,
+        profile_ids,
+      }),
+    );
+  }
+
+  return { tenant_id, agent_id, entidade_ids, profile_ids, people };
+}
+
+/**
+ * Semeia UMA pessoa do par: a massa de interlocutor/conversa E as `permissoes`
+ * que dão a ela EXATAMENTE `entities` entidades no escopo.
+ *
+ * As permissões apontam para `entidade_ids.slice(0, entities)` — as mesmas
+ * entidades que o harness fatiava em memória antes da #700, para que a
+ * cardinalidade continue significando a mesma coisa (inclusive quais delas têm
+ * `entity_states`, semeados para o primeiro quinto).
+ *
+ * Cada permissão aponta para um perfil DISTINTO, então o `profilesRepo.byIds`
+ * do turno da pessoa de 100 entidades resolve um lote de 100 ids — e não um
+ * `IN` de um elemento repetido 100 vezes, que mediria outra coisa.
+ */
+async function seedPerson(
+  c: PgClient,
+  o: {
+    tenant_id: string;
+    agent_id: string;
+    pair_index: number;
+    person_index: number;
+    entities: number;
+    entidade_ids: string[];
+    profile_ids: string[];
+  },
+): Promise<PairPerson> {
+  const { tenant_id, agent_id, entities } = o;
+  const telefone = `+5511${String(900000000 + o.pair_index * CARDINALITIES.length + o.person_index)}`;
+  const pessoa = await c.query<{ id: string }>(
+    `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo)
+     VALUES ($1, $2, $3, $4, 'dono') RETURNING id`,
+    [tenant_id, agent_id, `${PREFIX} Owner ${o.pair_index}/${entities}`, telefone],
+  );
+  const pessoa_id = pessoa.rows[0]!.id;
+
+  const escopo = o.entidade_ids.slice(0, entities);
+  const perfis = o.profile_ids.slice(0, entities);
+  // As DUAS tabelas que faltavam à massa até a #700. Sem elas o `resolveScope`
+  // devolve escopo vazio e o turno renderiza um "## Escopo desta conversa" que
+  // não custa o que custa em produção.
+  await c.query(
+    `INSERT INTO permissoes(tenant_id, agent_id, pessoa_id, entidade_id, papel, profile_id,
+                            acoes_permitidas, limites, status)
+     SELECT $1, $2, $3, e.id, 'operador', p.id, ARRAY[]::text[], '{}'::jsonb, 'ativa'
+     FROM unnest($4::uuid[]) WITH ORDINALITY AS e(id, ord)
+     JOIN unnest($5::text[]) WITH ORDINALITY AS p(id, ord) USING (ord)`,
+    [tenant_id, agent_id, pessoa_id, escopo, perfis],
+  );
+
+  const conversa = await c.query<{ id: string }>(
+    `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades)
+     VALUES ($1, $2, $3, $4::uuid[]) RETURNING id`,
+    [tenant_id, agent_id, pessoa_id, escopo],
+  );
+  const conversa_id = conversa.rows[0]!.id;
+
+  // 24 mensagens contra um `SECTION_BUDGETS.history.max_items` de 10: o
+  // `ORDER BY created_at DESC LIMIT 10` precisa ter o que descartar.
+  await c.query(
+    `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, created_at)
+     SELECT $1, $2, $3,
+            CASE WHEN g % 2 = 0 THEN 'in' ELSE 'out' END,
+            'texto',
+            '${PREFIX} mensagem de histórico número ' || g || ' com corpo suficiente para o orçamento de bytes da seção de histórico não ser trivial.',
+            now() - (g || ' minutes')::interval
+     FROM generate_series(1, 24) g`,
+    [tenant_id, agent_id, conversa_id],
+  );
+
+  await c.query(
+    `INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)
+     SELECT $1, $2, 'pessoa:' || $3, '${PREFIX}-fato-pessoa-' || g,
+            jsonb_build_object('content', '${PREFIX} fato de pessoa ' || g), 0.9, 'aprendido'
+     FROM generate_series(1, 12) g`,
+    [tenant_id, agent_id, pessoa_id],
+  );
+
+  await c.query(
+    `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
+                              sensitivity, proactive_use, mention_allowed)
+     SELECT $1, $2, '${PREFIX} memória de interlocutor ' || g, 'preference', 'interlocutor', $3, 'low', true, true
+     FROM generate_series(1, 15) g`,
+    [tenant_id, agent_id, pessoa_id],
+  );
+  await c.query(
+    `INSERT INTO memory_entry(tenant_id, agent_id, content, memory_type, scope_type, subject_id,
+                              sensitivity, proactive_use, mention_allowed)
+     SELECT $1, $2, '${PREFIX} memória de conversa ' || g, 'preference', 'conversation', $3, 'low', true, true
+     FROM generate_series(1, 15) g`,
+    [tenant_id, agent_id, conversa_id],
+  );
+
+  await c.query(
+    `INSERT INTO behavioral_hint(tenant_id, agent_id, scope_type, subject_id, hint_text, derived_sensitivity)
+     SELECT $1, $2, 'interlocutor', $3, '${PREFIX} hint de interlocutor ' || g, 'low'
+     FROM generate_series(1, 10) g`,
+    [tenant_id, agent_id, pessoa_id],
+  );
+  await c.query(
+    `INSERT INTO behavioral_hint(tenant_id, agent_id, scope_type, subject_id, hint_text, derived_sensitivity)
+     SELECT $1, $2, 'conversation', $3, '${PREFIX} hint de conversa ' || g, 'low'
+     FROM generate_series(1, 10) g`,
+    [tenant_id, agent_id, conversa_id],
+  );
+
   const pessoaRow = await c.query(`SELECT * FROM pessoas WHERE id = $1`, [pessoa_id]);
   const conversaRow = await c.query(`SELECT * FROM conversas WHERE id = $1`, [conversa_id]);
   const inboundRow = await c.query(
@@ -1691,11 +2056,9 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
   );
 
   return {
-    tenant_id,
-    agent_id,
+    entities,
     pessoa_id,
     conversa_id,
-    entidade_ids,
     pessoa: pessoaRow.rows[0] as Record<string, unknown>,
     conversa: conversaRow.rows[0] as Record<string, unknown>,
     inbound: inboundRow.rows[0] as Record<string, unknown>,
@@ -1703,38 +2066,38 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
 }
 
 /**
+ * O escopo resolvido do turno — a forma que `resolveScope` devolve e que o
+ * `PromptContext` consome. Tipado aqui (e não importado) porque este arquivo
+ * carrega todo módulo de produção por `import()` dinâmico, depois dos defaults
+ * de ambiente.
+ */
+export type ResolvedScope = { entidades: string[]; byEntity: Map<string, unknown> };
+
+/**
  * O `PromptContext` do turno.
  *
- * Montado UMA vez por (par, cardinalidade) e reusado: o que está sendo medido é
- * a carga de contexto, e construir o mapa de permissões dentro do relógio
- * mediria o harness. `byEntity` é o que o renderer percorre para escrever o
- * bloco "## Escopo desta conversa" — sem ele o turno renderiza um escopo vazio
- * e a cardinalidade deixa de custar o que custa em produção.
+ * Montado DENTRO do relógio, a cada turno, porque o `scope` que ele carrega
+ * vem do `resolveScope` — que é justamente o que a #700 pôs sob medição. Até
+ * então o contexto era pré-montado fora do relógio DE PROPÓSITO: o escopo era
+ * fabricado em memória e cronometrar essa fabricação mediria o harness, não o
+ * turno. Esse propósito MUDOU: o escopo agora custa duas leituras no Postgres,
+ * e esse custo é o objetivo da medição.
  *
- * É AQUI que o `resolveScope` sai da medição: o escopo nasce pronto, em
- * memória, e o custo real de resolvê-lo no Postgres nunca entra no relógio.
- * Ver a seção "o que ele NÃO mede" no topo do arquivo.
+ * O que sobrou fora do relógio são as linhas `pessoa`/`conversa`/`inbound`,
+ * lidas uma vez na semeadura: elas são o que `core.ts` já tem em mãos quando
+ * chama o turno, e relê-las por turno mediria um round-trip que produção não
+ * paga aqui.
+ *
+ * `byEntity` é o que o renderer percorre para escrever o bloco "## Escopo desta
+ * conversa"; ele vem inteiro do `resolveScope`, com `permissao` e `profile`
+ * REAIS — as linhas de `permissoes` e `permission_profiles` que a massa semeia.
  */
-function buildContext(pair: Pair, entities: number): unknown {
-  const ids = pair.entidade_ids.slice(0, entities);
-  const byEntity = new Map<string, unknown>();
-  for (const id of ids) {
-    byEntity.set(id, {
-      permissao: { id: `${PREFIX}-perm-${id}`, entidade_id: id },
-      profile: {
-        id: `${PREFIX}-profile`,
-        nome: `${PREFIX}-profile`,
-        acoes: ['registrar_transacao'],
-        limite_default: '100',
-      },
-      effective_limits: { valor_max: 100 },
-    });
-  }
+function buildContext(person: PairPerson, scope: ResolvedScope): unknown {
   return {
-    pessoa: pair.pessoa,
-    conversa: pair.conversa,
-    scope: { entidades: ids, byEntity },
-    inbound: pair.inbound,
+    pessoa: person.pessoa,
+    conversa: person.conversa,
+    scope,
+    inbound: person.inbound,
     activeRole: null,
     current_role_id: null,
     current_channel_id: null,
@@ -1744,6 +2107,63 @@ function buildContext(pair: Pair, entities: number): unknown {
     // número em vez de medi-lo.
     activeExecution: undefined,
   };
+}
+
+/** O que um turno medido devolve, além do relógio de parede que o chamador tira. */
+export type TurnStageSample = {
+  /** Latência do estágio `resolveScope` isolado, dentro do relógio do turno. */
+  scope_ms: number;
+  /** Tamanho do escopo que o BANCO devolveu (não o que o harness pediu). */
+  scope_entities: number;
+};
+
+/** Os dois call sites de produção que compõem o turno. */
+export type TurnStageDeps = {
+  resolveScope: (pessoa: unknown) => Promise<ResolvedScope>;
+  buildPrompt: (ctx: unknown) => Promise<unknown>;
+  runWithTenantContext: <T>(
+    ctx: { tenant_id: string; agent_id: string },
+    fn: () => Promise<T>,
+  ) => Promise<T>;
+};
+
+/**
+ * UM turno, inteiro: `resolveScope` + `buildPrompt`, nesta ordem, dentro do
+ * mesmo frame de tenant e do mesmo relógio.
+ *
+ * É o call site de PRODUÇÃO das duas pontas — `resolveScope`
+ * (`src/governance/permissions.ts`, o mesmo que `core.ts:1086` chama antes do
+ * turno) e `buildPrompt` (`src/agent/prompt-builder.ts`, que abre o frame do
+ * contador de queries, chama `loadTurnContext` e publica
+ * `maia_turn_context_load_duration_ms{phase="loader"}`). Medir por aqui, e não
+ * chamando o loader direto, é o que faz o número deste harness ser a MESMA
+ * grandeza que o orçamento nomeia: um harness que chamasse o loader e emitisse
+ * a métrica por conta própria continuaria verde no dia em que `buildPrompt`
+ * parasse de chamá-lo.
+ *
+ * As dependências são injetadas para que a sonda vermelha da #700 possa provar,
+ * sem Postgres, que este caminho REALMENTE resolve o escopo — e fique vermelha
+ * no dia em que alguém voltar a fabricá-lo em memória. `now` existe pela mesma
+ * razão, um nível abaixo: `measureTurn` desce o relógio DELE para cá, de modo
+ * que o intervalo do turno e o do estágio saiam da mesma régua e a relação
+ * entre os dois possa ser afirmada com valores exatos.
+ */
+export async function runTurnOnce(
+  pair: Pair,
+  person: PairPerson,
+  deps: TurnStageDeps,
+  now: () => number = () => performance.now(),
+): Promise<TurnStageSample> {
+  return deps.runWithTenantContext(
+    { tenant_id: pair.tenant_id, agent_id: pair.agent_id },
+    async () => {
+      const t0 = now();
+      const scope = await deps.resolveScope(person.pessoa);
+      const scope_ms = now() - t0;
+      await deps.buildPrompt(buildContext(person, scope));
+      return { scope_ms, scope_entities: scope.entidades.length };
+    },
+  );
 }
 
 // ============================================================================
@@ -1763,6 +2183,7 @@ async function loadDeps() {
     cacheMod,
     reposMod,
     configMod,
+    permissionsMod,
   ] = await Promise.all([
     import('@/db/client.js'),
     import('@/agent/turn-context/loader.js'),
@@ -1773,15 +2194,18 @@ async function loadDeps() {
     import('@/agent/turn-context/cache.js'),
     import('@/db/repositories.js'),
     import('@/config/env.js'),
+    import('@/governance/permissions.js'),
   ]);
   return {
     pool: clientMod.pool,
-    // Não é o call site do turno (quem mede é `buildPrompt`), mas é importado
-    // para o pré-aquecimento e para deixar explícito qual módulo está sob
-    // medição.
+    // Não é o call site do turno (quem mede são `resolveScope` e `buildPrompt`),
+    // mas é importado para o pré-aquecimento e para deixar explícito qual
+    // módulo está sob medição.
     loadTurnContext: loaderMod.loadTurnContext,
     MAX_CONCURRENT_READS: typesMod.TURN_CONTEXT_MAX_CONCURRENT_READS,
     buildPrompt: promptMod.buildPrompt,
+    /** A primeira metade do orçamento do turno (#700) — o call site de produção. */
+    resolveScope: permissionsMod.resolveScope,
     runWithTenantContext: tenantMod.runWithTenantContext,
     renderPrometheus: metricsMod.renderPrometheus,
     resetMetrics: metricsMod._resetForTests,
@@ -1793,7 +2217,37 @@ async function loadDeps() {
   };
 }
 
-function instrumentAll(repos: Deps['repos']): void {
+/**
+ * Os repositórios que o harness envolve com o contador. Tipado estruturalmente
+ * (e não como o namespace do módulo) para que a sonda vermelha da #700 possa
+ * chamar `instrumentAll` com dublês e provar que as leituras do escopo entram
+ * no contador — sem Postgres e sem carregar o grafo de produção inteiro.
+ */
+type ReadFn = (...args: never[]) => Promise<unknown>;
+export type InstrumentableRepos = {
+  permissoesRepo: { forPessoa: ReadFn };
+  profilesRepo: { byIds: ReadFn };
+  operationalProfileVersionsRepo: { getActive: ReadFn };
+  selfStateRepo: { getActive: ReadFn };
+  mensagensRepo: { recentInConversation: ReadFn };
+  entidadesRepo: { byIdsWithState: ReadFn };
+  entityStatesRepo: { byIds: ReadFn };
+  factsRepo: { listMentionableForScopes: ReadFn };
+  rulesRepo: { listActive: ReadFn };
+  memoryEntryRepo: { findRelevant: ReadFn };
+  behavioralHintRepo: { findActiveForScopes: ReadFn };
+  capabilitiesSkillRepo: { listAll: ReadFn };
+  capabilityGapsRepo: { listByLevels: ReadFn };
+  procedureExecutionsRepo: { findActiveForConversa: ReadFn };
+  procedureDefinitionsRepo: { findById: ReadFn };
+};
+
+export function instrumentAll(repos: InstrumentableRepos): void {
+  // As DUAS leituras do `resolveScope` (#700). Elas encabeçam a lista porque
+  // são as primeiras do turno: sem elas no contador, "leituras por turno" mede
+  // meio orçamento.
+  instrument(repos.permissoesRepo, 'forPessoa', SCOPE_SECTIONS.permissoes);
+  instrument(repos.profilesRepo, 'byIds', SCOPE_SECTIONS.profiles);
   instrument(repos.operationalProfileVersionsRepo, 'getActive', 'identity');
   instrument(repos.selfStateRepo, 'getActive', 'identity_self_state');
   instrument(repos.mensagensRepo, 'recentInConversation', 'history');
@@ -1890,12 +2344,93 @@ function isTimeoutError(message: string): boolean {
   return /timeout|timed out|ETIMEDOUT/i.test(message);
 }
 
-type TurnSample = {
+export type TurnSample = {
+  /**
+   * O RELÓGIO DO TURNO: `resolveScope` + `buildPrompt`. É este número que vira
+   * `p95_ms`, que o gate compara com os 600 ms e com o baseline. Ele CONTÉM
+   * `scope_ms` — ver `measureTurn`, que é o único lugar onde ele é calculado.
+   */
   ms: number;
+  /** A cardinalidade PEDIDA a este turno (1/10/100). */
   entities: number;
+  /** A cardinalidade que o `resolveScope` DEVOLVEU. Divergir é o achado. */
+  scope_entities: number;
+  /** Latência do estágio `resolveScope`, dentro do relógio do turno. */
+  scope_ms: number;
   peak: number;
   reads: Array<{ section: string; ms: number }>;
 };
+
+/** Quantas leituras deste turno foram do estágio `resolveScope`. */
+export function countScopeReads(reads: ReadonlyArray<{ section: string }>): number {
+  const secoes: string[] = [SCOPE_SECTIONS.permissoes, SCOPE_SECTIONS.profiles];
+  return reads.filter((r) => secoes.includes(r.section)).length;
+}
+
+/** As leituras que o `ReadGate` escalona — o modelo de makespan é sobre ELAS. */
+function loaderReads(
+  reads: ReadonlyArray<{ section: string; ms: number }>,
+): Array<{ section: string; ms: number }> {
+  const secoes: string[] = [SCOPE_SECTIONS.permissoes, SCOPE_SECTIONS.profiles];
+  return reads.filter((r) => !secoes.includes(r.section)).map((r) => ({ ...r }));
+}
+
+/**
+ * Cronometra UM turno e monta a amostra — **o único lugar do harness onde a
+ * duração do turno é calculada** (issue #700).
+ *
+ * ## Por que isto é uma função, e exportada
+ *
+ * A fronteira do relógio é o que faz o `p95_ms` significar "o orçamento do
+ * turno" em vez de "metade dele": o cronômetro abre ANTES do `resolveScope` e
+ * fecha DEPOIS do `buildPrompt`. Essa fronteira estava defendida apenas pela
+ * ESTRUTURA do código — um `t0` no lugar certo dentro do laço do `runArm` —, e
+ * uma fronteira defendida só por estrutura já falhou uma vez aqui: é
+ * literalmente o defeito que a #700 corrige.
+ *
+ * Trocar
+ *
+ *     const ms = now() - t0;                     por
+ *     const ms = now() - t0 - stage.scope_ms;
+ *
+ * restaura a cobertura ANTIGA (`buildPrompt-sem-resolveScope`) em silêncio: a
+ * flag continua `true`, os contadores de leitura continuam registrando as duas
+ * leituras, a cardinalidade continua batendo e o `scope_p95_ms` continua sendo
+ * reportado — só o número que o gate JULGA volta a medir meio orçamento.
+ *
+ * Com o cálculo aqui, e só aqui, essa mutação é uma asserção falha:
+ * `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` cronometra
+ * este caminho com um relógio injetado e com relógio real, e exige que o
+ * intervalo do turno CONTENHA o do estágio.
+ *
+ * `now` é injetável pelo mesmo motivo pelo qual `startPoolSampler` aceita
+ * `startedAtMs`: para que a aritmética seja verificável com valores exatos, em
+ * vez de por aproximação sobre o relógio da máquina.
+ */
+export async function measureTurn(
+  pair: Pair,
+  entities: number,
+  frame: TurnFrame,
+  deps: TurnStageDeps,
+  now: () => number = () => performance.now(),
+): Promise<TurnSample> {
+  const t0 = now();
+  // O MESMO `now` desce para o estágio: os dois intervalos têm que sair do
+  // mesmo relógio para que "o turno contém o escopo" seja uma aritmética
+  // verificável, e não uma comparação entre duas réguas.
+  const stage = await runInTurnFrame(frame, () =>
+    runTurnOnce(pair, personFor(pair, entities), deps, now),
+  );
+  const ms = now() - t0;
+  return {
+    ms,
+    entities,
+    scope_entities: stage.scope_entities,
+    scope_ms: stage.scope_ms,
+    peak: frame.peak,
+    reads: frame.reads,
+  };
+}
 
 async function runArm(
   arm: ArmName,
@@ -1911,35 +2446,22 @@ async function runArm(
   deps.turnContextCache.resetForTests();
   deps.resetMetrics();
 
-  // Um `PromptContext` por (par, cardinalidade), pronto antes do relógio.
-  const contexts = new Map<string, unknown>();
-  for (let i = 0; i < pairs.length; i++) {
-    for (const n of CARDINALITIES) contexts.set(`${i}:${n}`, buildContext(pairs[i]!, n));
-  }
-
   /**
-   * UM turno. Chama `buildPrompt` — o call site de PRODUÇÃO (`src/agent/
-   * prompt-builder.ts`), que abre o frame do contador de queries, chama
-   * `loadTurnContext` e publica `maia_turn_context_load_duration_ms
-   * {phase="loader"}`. Medir por aqui, e não chamando o loader direto, é o que
-   * faz o número deste harness ser a MESMA grandeza que o gate nomeia: um
-   * harness que chamasse o loader e emitisse a métrica por conta própria
-   * continuaria verde no dia em que `buildPrompt` parasse de chamar o loader.
+   * UM turno inteiro: `resolveScope` + `buildPrompt` (#700), os dois dentro do
+   * relógio. Ver `runTurnOnce` para o porquê de cada ponta.
    */
-  const runTurn = (pairIndex: number, entities: number): Promise<unknown> => {
-    const pair = pairs[pairIndex]!;
-    const ctx = contexts.get(`${pairIndex}:${entities}`);
-    return deps.runWithTenantContext(
-      { tenant_id: pair.tenant_id, agent_id: pair.agent_id },
-      () => deps.buildPrompt(ctx as Parameters<Deps['buildPrompt']>[0]),
-    );
+  const stageDeps: TurnStageDeps = {
+    resolveScope: (pessoa) =>
+      deps.resolveScope(pessoa as Parameters<Deps['resolveScope']>[0]) as Promise<ResolvedScope>,
+    buildPrompt: (ctx) => deps.buildPrompt(ctx as Parameters<Deps['buildPrompt']>[0]),
+    runWithTenantContext: deps.runWithTenantContext,
   };
-
   if (arm === 'warm') {
     // Pré-aquecimento: uma passada por par para popular o cache de identidade.
     // Sem isto o braço "warm" mediria 50 misses no meio da carga e a diferença
-    // entre os braços viraria ruído.
-    for (let i = 0; i < pairs.length; i++) await runTurn(i, 1);
+    // entre os braços viraria ruído. Fora do relógio e fora de frame: não é
+    // amostra, é aquecimento.
+    for (const pair of pairs) await runTurnOnce(pair, personFor(pair, 1), stageDeps);
     deps.resetMetrics();
   }
 
@@ -1969,20 +2491,14 @@ async function runArm(
       inFlightTenants.set(pair.tenant_id, (inFlightTenants.get(pair.tenant_id) ?? 0) + 1);
       if (inFlightTenants.size > maxConcurrentTenants) maxConcurrentTenants = inFlightTenants.size;
 
-      const frame: TurnFrame = {
-        id: index,
-        tenant: pair.tenant_id,
-        entities,
-        inflight: 0,
-        peak: 0,
-        reads: [],
-      };
-      const t0 = performance.now();
+      const frame = newTurnFrame(index, pair.tenant_id, entities);
       try {
-        await turnALS.run(frame, () => runTurn(pairIndex, entities));
-        const ms = performance.now() - t0;
-        samples.push({ ms, entities, peak: frame.peak, reads: frame.reads });
-        if (ms > opts.timeout_ms) timeouts++;
+        // A amostra sai PRONTA de `measureTurn` e entra sem ser recalculada: a
+        // aritmética do relógio do turno tem um único dono, e é lá que a sonda
+        // da #700 a cobra.
+        const sample = await measureTurn(pair, entities, frame, stageDeps);
+        samples.push(sample);
+        if (sample.ms > opts.timeout_ms) timeouts++;
       } catch (err) {
         errors++;
         const message = (err as Error)?.message ?? String(err);
@@ -2046,14 +2562,18 @@ async function runArm(
     })
     .sort((a, b) => b.p95_ms - a.p95_ms);
 
+  // O modelo de ≤8 round-trips é sobre as leituras que o `ReadGate` escalona.
+  // As duas do `resolveScope` acontecem ANTES dele, em sequência, e jogá-las
+  // no semáforo faria o modelo responder a outra pergunta (#700).
   const makespanNow = samples
-    .map((s) => gateMakespan(s.reads.map((r) => r.ms), 6))
+    .map((s) => gateMakespan(loaderReads(s.reads).map((r) => r.ms), 6))
     .sort((a, b) => a - b);
   const makespanAt8 = samples
-    .map((s) => gateMakespan(mergeTwoPairs(s.reads), 6))
+    .map((s) => gateMakespan(mergeTwoPairs(loaderReads(s.reads)), 6))
     .sort((a, b) => a - b);
 
   const readsPerTurn = samples.map((s) => s.reads.length);
+  const scope = scopeMetricsFromSamples(samples);
   const identity_cache = await readCacheOutcomes(deps.renderPrometheus);
 
   return {
@@ -2074,6 +2594,7 @@ async function runArm(
     peak_reads_per_turn: samples.reduce((m, s) => Math.max(m, s.peak), 0),
     reads_per_turn_min: readsPerTurn.length ? Math.min(...readsPerTurn) : 0,
     reads_per_turn_max: readsPerTurn.length ? Math.max(...readsPerTurn) : 0,
+    ...scope,
     pool_max: deps.pool.options.max ?? 10,
     ...pool,
     pool_drain_window_ms: opts.drain_window_ms,
@@ -2136,11 +2657,11 @@ function modeBanner(mode: RunMode, injected: string[]): string {
     `> \`n/a\` reprova a corrida, porque um gate sem a evidência não é um gate.\n` +
     (COBERTURA_DA_MEDICAO.resolve_scope_medido
       ? ''
-      : `>\n> **E hoje um critério obrigatório É \`n/a\`: o aceite completo do orçamento do\n` +
-        `> turno.** Enquanto o \`resolveScope\` estiver fora da medição, esta corrida NÃO\n` +
-        `> pode sair 0 — e o exit code 1 significa "não demonstrado", não "regrediu".\n` +
-        `> Leia os critérios parciais na tabela: eles foram avaliados e valem para o\n` +
-        `> trecho que exercitam. Issue #700.\n`) +
+      : `>\n> **E um critério obrigatório está \`n/a\`: o aceite completo do orçamento do\n` +
+        `> turno.** \`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está \`false\`, então esta\n` +
+        `> corrida NÃO pode sair 0 — e o exit code 1 significa "não demonstrado", não\n` +
+        `> "regrediu". Leia os critérios parciais na tabela: eles foram avaliados e\n` +
+        `> valem para o trecho que exercitam. Issue #700.\n`) +
     `\n`
   );
 }
@@ -2164,14 +2685,25 @@ function renderReport(
     `teto de leituras por turno: ${opts.thresholds.max_peak_reads} ` +
     `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n\n` +
     `> **Cobertura desta corrida: \`${coberturaAtual()}\`.**\n` +
-    `> **Escopo do que foi medido — orçamento PARCIAL.** Este gate mede ` +
-    `\`buildPrompt\`; o \`resolveScope\` (JOIN \`permissoes ⋈ ` +
-    `permission_profiles\`) fica de FORA: o escopo é fabricado em memória ` +
-    `pelo harness e a massa não semeia essas tabelas. Os números abaixo NÃO ` +
-    `validam o custo completo do turno como definido em ` +
-    `\`src/agent/turn-context/types.ts\`, e não devem ser apresentados como ` +
-    `tal. Uma regressão que more no \`resolveScope\` passa por este gate sem ` +
-    `ser vista.\n`;
+    (COBERTURA_DA_MEDICAO.resolve_scope_medido
+      ? `> **Escopo do que foi medido — o TURNO INTEIRO.** Cada turno resolve o ` +
+        `escopo no Postgres (\`resolveScope\`: \`permissoes\` + ` +
+        `\`permission_profiles\`, ${SCOPE_READS_PER_TURN} leituras) e só então ` +
+        `chama \`buildPrompt\`, os dois dentro do mesmo relógio — o orçamento ` +
+        `como \`src/agent/turn-context/types.ts\` o define. As linhas ` +
+        `"leituras do escopo por turno" e "p95 do estágio resolveScope" abaixo ` +
+        `são a EVIDÊNCIA de que isso aconteceu; os critérios homônimos ` +
+        `reprovam a corrida se elas sumirem (issue #700).\n` +
+        `> A série \`maia_turn_context_load_duration_ms{phase="loader"}\` ` +
+        `continua cobrindo só o \`buildPrompt\` — por isso o "p95 pelos buckets ` +
+        `do histograma" é MENOR que o p95 do turno, e as duas linhas não são ` +
+        `comparáveis entre si.\n`
+      : `> **Escopo do que foi medido — orçamento PARCIAL.** ` +
+        `\`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está \`false\`: esta ` +
+        `corrida declara não medir o \`resolveScope\` (JOIN \`permissoes ⋈ ` +
+        `permission_profiles\`). Os números abaixo NÃO validam o custo completo ` +
+        `do turno como definido em \`src/agent/turn-context/types.ts\`, e não ` +
+        `devem ser apresentados como tal. Issue #700.\n`);
 
   const rows: string[][] = [
     ['Métrica', ...arms.map((a) => `\`${a.arm}\``)],
@@ -2187,6 +2719,26 @@ function renderReport(
     ['timeouts', ...arms.map((a) => String(a.timeouts))],
     ['**pico de leituras simultâneas por turno**', ...arms.map((a) => `**${a.peak_reads_per_turn}**`)],
     ['leituras por turno (mín–máx)', ...arms.map((a) => `${a.reads_per_turn_min}–${a.reads_per_turn_max}`)],
+    [
+      '**leituras do `resolveScope` por turno**',
+      ...arms.map(
+        (a) =>
+          `**${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}**` +
+          ` (esperado ${SCOPE_READS_PER_TURN})`,
+      ),
+    ],
+    [
+      '**p95 do estágio `resolveScope` (ms)**',
+      ...arms.map((a) => `**${fmt(a.scope_p95_ms)}** (p50 ${fmt(a.scope_p50_ms)})`),
+    ],
+    [
+      'escopo resolvido pelo banco (entidades)',
+      ...arms.map(
+        (a) =>
+          `${a.scope_entities_min}–${a.scope_entities_max} · ` +
+          `${a.scope_cardinality_mismatches} divergência(s) de cardinalidade`,
+      ),
+    ],
     ['tenants concorrentes (máx.)', ...arms.map((a) => String(a.max_concurrent_tenants))],
     ['pares exercitados', ...arms.map((a) => String(a.pairs_exercised))],
     [

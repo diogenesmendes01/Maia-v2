@@ -366,6 +366,29 @@ d('#510 FI-04/05/06/07 — claim, crash e fence com réplicas de PROCESSO', () =
       const antesDoCrash = await oracle.coletar();
       const linhaAntes = await linhaDoTurno(turn_id);
 
+      // ── O SUCESSOR SOBE ANTES DA MORTE, e PARA na barreira.
+      //
+      // Não é ordem estética: é o que impede o cenário de medir o tempo de
+      // IMPORT em vez da lease. O filho paga de 2s a 7s para carregar a frio o
+      // grafo de produção sob `tsx` (§7.1 do AGENTS.md), e o TTL desta suíte é
+      // de 6s. Subindo o sucessor DEPOIS do `hardKill`, esse import corre
+      // contra o prazo: numa máquina carregada a lease vence enquanto ele ainda
+      // está importando, ele entra na PRIMEIRA tentativa e o controle das
+      // recusas fica vermelho sem que nada da produção tenha mudado — foi
+      // exatamente o que a lane produziu quando a fatia E acrescentou um
+      // terceiro arquivo de cenário rodando em paralelo.
+      //
+      // Com a barreira, o import é pago enquanto o dono ainda está VIVO e
+      // parado no gate, e a primeira tentativa do sucessor acontece
+      // milissegundos depois do `SIGKILL` — que é o instante que o cenário diz
+      // estar observando. O relógio da lease continua sendo o do BANCO.
+      const b = subirReplica('sucessor', turn_id, {
+        TEST_FI_TENTATIVAS: '80',
+        TEST_FI_INTERVALO_MS: '250',
+        TEST_FI_BARREIRA: 'sucessor',
+      });
+      await servidor.esperarNaBarreira('sucessor', 1, 60_000);
+
       // A FALHA: `SIGKILL` num processo PARADO num ponto exato do caminho.
       sup.hardKill(a);
       const enc = await a.esperarSaida(10_000);
@@ -380,11 +403,9 @@ d('#510 FI-04/05/06/07 — claim, crash e fence com réplicas de PROCESSO', () =
       expect(logoApos.attempt_count).toBe(1);
       expect(await jaVenceu(logoApos.lease_expires_at)).toBe(false);
 
-      // O SUCESSOR. Ele insiste; o banco decide quando ele entra.
-      const b = subirReplica('sucessor', turn_id, {
-        TEST_FI_TENTATIVAS: '80',
-        TEST_FI_INTERVALO_MS: '250',
-      });
+      // A LARGADA do sucessor, com a lease do morto ainda VIVA. Ele insiste; o
+      // banco decide quando ele entra.
+      expect(servidor.abrirBarreira('sucessor')).toBe(1);
       // O gate já foi consumido pelo dono morto (`remaining: 1`), então o
       // sucessor passa direto por ele.
       const pb = await prontidaoDe(b);

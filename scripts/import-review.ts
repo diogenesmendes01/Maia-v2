@@ -1,13 +1,64 @@
 /**
- * Spec 13 reconciliation UX (CLI). After `npm run import:ofx` creates an
- * import_run with status='pending_review', this script lists pending runs
- * and applies them.
+ * Spec 13 reconciliation UX (CLI). Depois que `npm run import:ofx` cria uma
+ * `import_run` com `status='pending_review'`, este script lista, detalha e
+ * aplica essas runs.
  *
- *   npm run import:list                 # list pending runs
- *   npm run import:show -- --run=<id>   # detail: per-entry status
- *   npm run import:apply -- --run=<id>  # auto-apply matched + create new
- *                                       # candidates remain pending unless
- *                                       # --candidates=accept|reject is passed
+ *   npm run import:list  -- --tenant=<id> --agent=<id>
+ *   npm run import:show  -- --tenant=<id> --agent=<id> --run=<id>
+ *   npm run import:apply -- --tenant=<id> --agent=<id> --run=<id>
+ *                           [--candidates=accept|reject]
+ *
+ * ---------------------------------------------------------------------------
+ * ISSUE #720 — este script era INALCANÇÁVEL (nenhuma run era criada, porque
+ * `import:ofx` morria antes), e por isso o defeito abaixo nunca tinha sido
+ * exercido. No minuto em que a ingestão voltou a funcionar ele passou a ser
+ * alcançável, então os dois foram consertados juntos: consertar só o `ofx`
+ * entregaria uma CLI que funciona e escreve sem escopo — pior do que estava.
+ *
+ * O QUE ESTAVA ERRADO AQUI:
+ *
+ *   1. `INSERT INTO transacoes` sem `tenant_id`/`agent_id`. Ambas NOT NULL sem
+ *      default desde `migrations/083_drop_default_column_default.sql` → o
+ *      apply morreria com SQLSTATE 23502 no primeiro lançamento novo.
+ *   2. TODOS os `UPDATE` eram `WHERE id = $1`, sem predicado de escopo:
+ *      `transacoes`, `import_entries` e `import_runs`. Num sistema
+ *      multi-tenant esse é exatamente o defeito que #504/#571 existem para
+ *      impedir — `import_entries.matched_transacao_id` é um uuid vindo de uma
+ *      LINHA DE DADOS, e `transacoes.id` é PK GLOBAL (não escopada por
+ *      tenant). Um ponteiro para a transação de outro tenant, gravado por
+ *      qualquer caminho, faria este apply sobrescrever `status`,
+ *      `data_pagamento`, `confirmada_em` e `metadata` DAQUELA linha.
+ *   3. Nenhum caminho entrava em `runWithTenantContext` — `applyTenantGuard`
+ *      é opt-in por chamador, não um interceptador global, então "está no
+ *      schema" não protegia nada.
+ *
+ * O CONSERTO:
+ *
+ *   - `--tenant`/`--agent` obrigatórios, sem default (mesma decisão de desenho
+ *     de `scripts/import-ofx.ts`, argumentada lá no topo do arquivo). Todo o
+ *     trabalho roda dentro de `runWithTenantContext`.
+ *   - TODA leitura pina `tenant_id`+`agent_id`. Uma run de outro tenant
+ *     simplesmente "não existe" para esta CLI (fail-closed, e a mensagem não
+ *     revela o dono real).
+ *   - TODO `UPDATE` pina `id` **E** `tenant_id` **E** `agent_id`, com
+ *     `.returning()` e contagem verificada.
+ *   - `INSERT INTO transacoes` passa por `applyTenantGuard` — a tupla vem do
+ *     ALS, e um `tenant_id` explícito divergente é rejeitado.
+ *
+ * POR QUE FAIL-LOUD (throw) EM VEZ DE PULAR, quando o UPDATE casa 0 linhas:
+ * o mesmo raciocínio de `contasRepo.addToBalance`
+ * (`src/db/repositories/finance-repos.ts`). O `WHERE id` sozinho SEMPRE casava;
+ * 0 linhas sob o novo predicado só pode significar que a linha alvo não é do
+ * escopo em execução — um ponteiro cross-tenant. Engolir isso deixaria a
+ * `import_entry` marcada como resolvida com a transação NUNCA confirmada: a
+ * run fecharia como `aplicado` mentindo sobre o que aplicou. O throw aborta a
+ * transação inteira (`db.transaction`), então nada é escrito e a run continua
+ * `pending_review` para o operador investigar.
+ *
+ * Provado por `tests/integration/import-cli-tenant-scope-real-db.spec.ts`
+ * (Postgres real, CLI executada como processo filho) e pela sonda de forma
+ * `tests/unit/scripts/import-cli-escrita-escopada.spec.ts`, que fica
+ * VERMELHA se um `UPDATE ... WHERE id = $1` sem escopo for reintroduzido.
  */
 // Boot fail-closed do subset `runtime`, EXPLÍCITO (issue #596).
 //
@@ -21,78 +72,187 @@
 // processos que precisam dela.
 import '@/config/env.js';
 
+import { pathToFileURL } from 'node:url';
 import { db } from '@/db/client.js';
 import { import_runs, import_entries, transacoes } from '@/db/schema.js';
 import { eq, and, isNull, sql } from 'drizzle-orm';
 import { audit } from '@/governance/audit.js';
-import type { ImportEntry } from '@/db/schema.js';
+import { applyTenantGuard } from '@/db/tenant-guard.js';
+import { runWithTenantContext } from '@/db/tenant-context.js';
+import type { ImportEntry, ImportRun } from '@/db/schema.js';
 
-function arg(name: string): string | undefined {
+export function arg(argv: string[], name: string): string | undefined {
   const flag = `--${name}=`;
-  for (const a of process.argv) if (a.startsWith(flag)) return a.slice(flag.length);
+  for (const a of argv) if (a.startsWith(flag)) return a.slice(flag.length);
   return undefined;
 }
 
-function flag(name: string): boolean {
-  return process.argv.includes(`--${name}`);
+function flag(argv: string[], name: string): boolean {
+  return argv.includes(`--${name}`);
 }
 
-async function listRuns(): Promise<void> {
+/** Ver `scripts/import-ofx.ts` — mesma forma, mesmo `code`, mesmo exit 2. */
+export class RequiredArgsError extends Error {
+  readonly code = 'MISSING_REQUIRED_ARGS';
+  constructor(missing: string[]) {
+    super(
+      `import-review: faltam argumentos obrigatórios: ${missing.join(', ')}. ` +
+        'uso: npm run import:list|import:show|import:apply -- --tenant=<id> --agent=<id> [--run=<id>]',
+    );
+    this.name = 'RequiredArgsError';
+  }
+}
+
+/**
+ * A run pedida não existe SOB O ESCOPO DECLARADO. Fail-closed e sem revelar o
+ * dono real — a busca já foi feita escopada, então esta CLI nunca leu a linha
+ * de outro tenant.
+ */
+export class RunNotInScopeError extends Error {
+  readonly code = 'IMPORT_RUN_NOT_IN_SCOPE';
+  constructor(run_id: string, tenant_id: string, agent_id: string) {
+    super(
+      `import-review: run "${run_id}" não existe sob o escopo declarado ` +
+        `tenant_id=${tenant_id} agent_id=${agent_id} — recusando.`,
+    );
+    this.name = 'RunNotInScopeError';
+  }
+}
+
+/**
+ * Um UPDATE escopado casou um número de linhas diferente do esperado. Ver o
+ * bloco "POR QUE FAIL-LOUD" no topo do arquivo: sob `WHERE id` sozinho isto
+ * nunca acontecia, então só pode ser ponteiro para fora do escopo.
+ */
+export class CrossScopeWriteError extends Error {
+  readonly code = 'IMPORT_CROSS_SCOPE_WRITE';
+  constructor(what: string, id: string, matched: number, tenant_id: string, agent_id: string) {
+    super(
+      `import-review: UPDATE em ${what} id=${id} casou ${matched} linha(s) sob ` +
+        `tenant_id=${tenant_id} agent_id=${agent_id} — esperava 1. A linha alvo não ` +
+        'pertence ao escopo em execução (ponteiro cross-tenant). Abortando a ' +
+        'transação inteira: nada foi aplicado e a run continua pending_review.',
+    );
+    this.name = 'CrossScopeWriteError';
+  }
+}
+
+export interface Scope {
+  tenant_id: string;
+  agent_id: string;
+}
+
+/** `--tenant`/`--tenant_id` e `--agent`/`--agent_id`, sem default. */
+export function parseScope(argv: string[]): Scope {
+  const tenant_id = arg(argv, 'tenant_id') ?? arg(argv, 'tenant');
+  const agent_id = arg(argv, 'agent_id') ?? arg(argv, 'agent');
+  const missing: string[] = [];
+  if (!tenant_id) missing.push('--tenant (ou --tenant_id)');
+  if (!agent_id) missing.push('--agent (ou --agent_id)');
+  if (missing.length > 0) throw new RequiredArgsError(missing);
+  return { tenant_id: tenant_id as string, agent_id: agent_id as string };
+}
+
+/** Predicado de escopo reutilizado por TODA leitura/escrita de `import_runs`. */
+function runScope(scope: Scope) {
+  return and(eq(import_runs.tenant_id, scope.tenant_id), eq(import_runs.agent_id, scope.agent_id));
+}
+
+/** Idem para `import_entries`. */
+function entryScope(scope: Scope) {
+  return and(
+    eq(import_entries.tenant_id, scope.tenant_id),
+    eq(import_entries.agent_id, scope.agent_id),
+  );
+}
+
+export async function listRuns(scope: Scope, log: (m: string) => void): Promise<ImportRun[]> {
   const rows = await db
     .select()
     .from(import_runs)
-    .where(eq(import_runs.status, 'pending_review'))
+    .where(and(runScope(scope), eq(import_runs.status, 'pending_review')))
     .orderBy(import_runs.created_at);
   if (rows.length === 0) {
-    console.log('no pending runs');
-    return;
+    log('no pending runs');
+    return rows;
   }
-  console.log('pending import runs:');
+  log('pending import runs:');
   for (const r of rows) {
-    console.log(
+    log(
       `  ${r.id}  ${r.fonte}  ${r.arquivo_nome ?? '?'}  total=${r.total_lancamentos} matched=${r.matched} cand=${r.candidates} new=${r.novos}`,
     );
   }
+  return rows;
 }
 
-async function showRun(run_id: string): Promise<void> {
-  const run = (await db.select().from(import_runs).where(eq(import_runs.id, run_id)).limit(1))[0];
-  if (!run) {
-    console.error(`run ${run_id} not found`);
-    process.exit(1);
-  }
-  console.log(`run ${run.id} — status=${run.status}`);
-  console.log(`  conta=${run.conta_id} entidade=${run.entidade_id}`);
-  console.log(`  total=${run.total_lancamentos} matched=${run.matched} cand=${run.candidates} new=${run.novos}`);
+/** Leitura escopada da run — a única porta de entrada por id neste arquivo. */
+async function loadRunInScope(scope: Scope, run_id: string): Promise<ImportRun> {
+  const rows = await db
+    .select()
+    .from(import_runs)
+    .where(and(eq(import_runs.id, run_id), runScope(scope)))
+    .limit(1);
+  const run = rows[0];
+  if (!run) throw new RunNotInScopeError(run_id, scope.tenant_id, scope.agent_id);
+  return run;
+}
+
+export async function showRun(
+  scope: Scope,
+  run_id: string,
+  log: (m: string) => void,
+): Promise<void> {
+  const run = await loadRunInScope(scope, run_id);
+  log(`run ${run.id} — status=${run.status}`);
+  log(`  conta=${run.conta_id} entidade=${run.entidade_id}`);
+  log(
+    `  total=${run.total_lancamentos} matched=${run.matched} cand=${run.candidates} new=${run.novos}`,
+  );
   const entries = await db
     .select()
     .from(import_entries)
-    .where(eq(import_entries.import_run_id, run.id))
+    .where(and(eq(import_entries.import_run_id, run.id), entryScope(scope)))
     .orderBy(import_entries.ordem);
-  console.log(`entries (${entries.length}):`);
+  log(`entries (${entries.length}):`);
   for (const e of entries) {
     const tag = e.status.padEnd(10);
     const sign = e.tipo_oper === 'credit' ? '+' : '-';
-    console.log(
+    log(
       `  #${String(e.ordem).padStart(3)} ${tag} ${e.data_oper} ${sign}R$ ${e.valor}  ${e.memo ?? e.contraparte_raw ?? ''}`,
     );
   }
 }
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type ApplyTotals = { confirmed: number; created: number; candidatesSettled: number; skipped: number };
+export type ApplyTotals = {
+  confirmed: number;
+  created: number;
+  candidatesSettled: number;
+  skipped: number;
+};
 
+/**
+ * Confirma uma `transacao` existente a partir de um lançamento do extrato.
+ *
+ * Per spec 13: sobrescreve `data_pagamento` com a data do banco, leva o status
+ * ao valor terminal e funde o FITID no metadata para dedup futura.
+ *
+ * O WHERE pina `id` **E** `tenant_id` **E** `agent_id` (#720). `transacao_id`
+ * vem de `import_entries.matched_transacao_id` — um uuid armazenado em uma
+ * LINHA DE DADOS, apontando para uma PK GLOBAL. Sem os dois predicados de
+ * escopo, um ponteiro para a transação de outro tenant sobrescreveria aquela
+ * linha. `.returning()` + contagem verificada tornam a recusa observável em vez
+ * de um no-op silencioso — ver "POR QUE FAIL-LOUD" no topo.
+ */
 async function applyMatchedTo(
   tx: Tx,
+  scope: Scope,
   e: ImportEntry,
   transacao_id: string,
   run_id: string,
 ): Promise<void> {
-  // Per spec 13: when a bank statement entry confirms an existing transacao,
-  // overwrite data_pagamento with the bank's date, set status to its terminal
-  // value, and merge the FITID into metadata so future imports can dedup.
   const status = e.tipo_oper === 'credit' ? 'recebida' : 'paga';
-  await tx
+  const rows = await tx
     .update(transacoes)
     .set({
       data_pagamento: e.data_oper,
@@ -104,32 +264,69 @@ async function applyMatchedTo(
         import_run_id: run_id,
       })}::jsonb`,
     })
-    .where(eq(transacoes.id, transacao_id));
+    .where(
+      and(
+        eq(transacoes.id, transacao_id),
+        eq(transacoes.tenant_id, scope.tenant_id),
+        eq(transacoes.agent_id, scope.agent_id),
+      ),
+    )
+    .returning({ id: transacoes.id });
+  if (rows.length !== 1) {
+    throw new CrossScopeWriteError(
+      'transacoes',
+      transacao_id,
+      rows.length,
+      scope.tenant_id,
+      scope.agent_id,
+    );
+  }
 }
 
-async function applyRun(
+/** UPDATE escopado + fail-loud de uma `import_entry`. */
+async function updateEntryInScope(
+  tx: Tx,
+  scope: Scope,
+  entry_id: string,
+  patch: Partial<typeof import_entries.$inferInsert>,
+): Promise<void> {
+  const rows = await tx
+    .update(import_entries)
+    .set(patch)
+    .where(and(eq(import_entries.id, entry_id), entryScope(scope)))
+    .returning({ id: import_entries.id });
+  if (rows.length !== 1) {
+    throw new CrossScopeWriteError(
+      'import_entries',
+      entry_id,
+      rows.length,
+      scope.tenant_id,
+      scope.agent_id,
+    );
+  }
+}
+
+export async function applyRun(
+  scope: Scope,
   run_id: string,
   candidatesPolicy: 'accept' | 'reject' | 'skip',
-): Promise<void> {
-  const run = (await db.select().from(import_runs).where(eq(import_runs.id, run_id)).limit(1))[0];
-  if (!run) {
-    console.error(`run ${run_id} not found`);
-    process.exit(1);
-  }
+  log: (m: string) => void,
+): Promise<ApplyTotals> {
+  const run = await loadRunInScope(scope, run_id);
   if (run.status !== 'pending_review') {
-    console.error(`run is ${run.status}, cannot apply`);
-    process.exit(1);
+    throw new Error(`import-review: run está ${run.status}, não dá para aplicar`);
   }
 
   // Wrap the entire apply in a single DB transaction so a partial failure
   // doesn't leave entries half-applied (e.g., a transacao inserted but
   // import_entries.resolved_at not set, which would cause the next run to
-  // duplicate it).
+  // duplicate it). Desde #720 isso também é o que torna o fail-loud seguro:
+  // um ponteiro cross-tenant aborta TUDO.
   const totals: ApplyTotals = await db.transaction(async (tx) => {
     const entries = await tx
       .select()
       .from(import_entries)
-      .where(eq(import_entries.import_run_id, run.id));
+      .where(and(eq(import_entries.import_run_id, run.id), entryScope(scope)));
 
     const t: ApplyTotals = { confirmed: 0, created: 0, candidatesSettled: 0, skipped: 0 };
 
@@ -145,11 +342,8 @@ async function applyRun(
           t.skipped++;
           continue;
         }
-        await applyMatchedTo(tx, e, e.matched_transacao_id, run.id);
-        await tx
-          .update(import_entries)
-          .set({ resolved_at: new Date() })
-          .where(eq(import_entries.id, e.id));
+        await applyMatchedTo(tx, scope, e, e.matched_transacao_id, run.id);
+        await updateEntryInScope(tx, scope, e.id, { resolved_at: new Date() });
         t.confirmed++;
         continue;
       }
@@ -158,30 +352,31 @@ async function applyRun(
         const status = e.tipo_oper === 'credit' ? 'recebida' : 'paga';
         const inserted = await tx
           .insert(transacoes)
-          .values({
-            entidade_id: run.entidade_id,
-            conta_id: run.conta_id,
-            natureza: e.tipo_oper === 'credit' ? 'receita' : 'despesa',
-            valor: e.valor,
-            data_competencia: e.data_oper,
-            data_pagamento: e.data_oper,
-            status,
-            descricao: e.memo ?? e.contraparte_raw ?? 'extrato',
-            contraparte: e.contraparte_raw,
-            origem: 'extrato',
-            registrado_por: run.pessoa_id,
-            metadata: { import_run_id: run.id, fitid: e.fitid ?? null },
-            confirmada_em: new Date(),
-          })
+          .values(
+            // `applyTenantGuard` estampa a tupla do ALS (#720): antes o INSERT
+            // omitia tenant_id/agent_id, ambas NOT NULL desde a migration 083.
+            applyTenantGuard({
+              entidade_id: run.entidade_id,
+              conta_id: run.conta_id,
+              natureza: e.tipo_oper === 'credit' ? 'receita' : 'despesa',
+              valor: e.valor,
+              data_competencia: e.data_oper,
+              data_pagamento: e.data_oper,
+              status,
+              descricao: e.memo ?? e.contraparte_raw ?? 'extrato',
+              contraparte: e.contraparte_raw,
+              origem: 'extrato',
+              registrado_por: run.pessoa_id,
+              metadata: { import_run_id: run.id, fitid: e.fitid ?? null },
+              confirmada_em: new Date(),
+            }),
+          )
           .returning({ id: transacoes.id });
-        await tx
-          .update(import_entries)
-          .set({
-            resolved_at: new Date(),
-            matched_transacao_id: inserted[0]!.id,
-            status: 'matched',
-          })
-          .where(eq(import_entries.id, e.id));
+        await updateEntryInScope(tx, scope, e.id, {
+          resolved_at: new Date(),
+          matched_transacao_id: inserted[0]!.id,
+          status: 'matched',
+        });
         t.created++;
         continue;
       }
@@ -193,21 +388,18 @@ async function applyRun(
             t.skipped++;
             continue;
           }
-          await applyMatchedTo(tx, e, top.transacao_id, run.id);
-          await tx
-            .update(import_entries)
-            .set({
-              status: 'matched',
-              matched_transacao_id: top.transacao_id,
-              resolved_at: new Date(),
-            })
-            .where(eq(import_entries.id, e.id));
+          await applyMatchedTo(tx, scope, e, top.transacao_id, run.id);
+          await updateEntryInScope(tx, scope, e.id, {
+            status: 'matched',
+            matched_transacao_id: top.transacao_id,
+            resolved_at: new Date(),
+          });
           t.candidatesSettled++;
         } else if (candidatesPolicy === 'reject') {
-          await tx
-            .update(import_entries)
-            .set({ status: 'rejected', resolved_at: new Date() })
-            .where(eq(import_entries.id, e.id));
+          await updateEntryInScope(tx, scope, e.id, {
+            status: 'rejected',
+            resolved_at: new Date(),
+          });
           t.candidatesSettled++;
         } else {
           t.skipped++;
@@ -226,17 +418,36 @@ async function applyRun(
     const unresolved = await tx
       .select({ id: import_entries.id })
       .from(import_entries)
-      .where(and(eq(import_entries.import_run_id, run.id), isNull(import_entries.resolved_at)));
+      .where(
+        and(
+          eq(import_entries.import_run_id, run.id),
+          entryScope(scope),
+          isNull(import_entries.resolved_at),
+        ),
+      );
 
     const newStatus = unresolved.length === 0 ? 'aplicado' : 'pending_review';
-    await tx
+    const updatedRuns = await tx
       .update(import_runs)
       .set({ status: newStatus, updated_at: new Date() })
-      .where(eq(import_runs.id, run.id));
+      .where(and(eq(import_runs.id, run.id), runScope(scope)))
+      .returning({ id: import_runs.id });
+    if (updatedRuns.length !== 1) {
+      throw new CrossScopeWriteError(
+        'import_runs',
+        run.id,
+        updatedRuns.length,
+        scope.tenant_id,
+        scope.agent_id,
+      );
+    }
 
     return t;
   });
 
+  // Roda dentro de `runWithTenantContext` (ver `main`), então a row de auditoria
+  // aterrissa no tenant certo em vez do bucket `system` — `audit()` só cai no
+  // `system` quando NÃO há contexto ativo (`src/governance/audit.ts`).
   await audit({
     acao: 'transaction_created',
     pessoa_id: run.pessoa_id,
@@ -251,41 +462,99 @@ async function applyRun(
   });
 
   // Re-read final status for the log line — the transaction has committed.
-  const after = (await db.select().from(import_runs).where(eq(import_runs.id, run.id)).limit(1))[0];
-  console.log(
-    `applied run ${run.id}: confirmed=${totals.confirmed} created=${totals.created} candidates=${totals.candidatesSettled} skipped=${totals.skipped} status=${after?.status ?? '?'}`,
+  const after = await loadRunInScope(scope, run.id);
+  log(
+    `applied run ${run.id}: confirmed=${totals.confirmed} created=${totals.created} candidates=${totals.candidatesSettled} skipped=${totals.skipped} status=${after.status}`,
   );
+  return totals;
+}
+
+function printUsage(extra?: string): void {
+  if (extra) console.error(extra);
+  console.error(
+    'uso: npm run import:list  -- --tenant=<id> --agent=<id>\n' +
+      '     npm run import:show  -- --tenant=<id> --agent=<id> --run=<id>\n' +
+      '     npm run import:apply -- --tenant=<id> --agent=<id> --run=<id> [--candidates=accept|reject]',
+  );
+  console.error('  --tenant e --agent são obrigatórios e não têm default.');
+  console.error('  Runs de outro escopo não são visíveis nem aplicáveis por esta CLI.');
 }
 
 async function main(): Promise<void> {
-  const cmd = process.argv[2];
-  if (cmd === 'list' || flag('list')) {
-    await listRuns();
-    process.exit(0);
-  }
-  const run_id = arg('run');
-  if (!run_id) {
-    console.error('usage: npm run import:list | import:show -- --run=<id> | import:apply -- --run=<id> [--candidates=accept|reject]');
-    process.exit(2);
-  }
-  if (cmd === 'show' || flag('show')) {
-    await showRun(run_id);
-    process.exit(0);
-  }
-  if (cmd === 'apply' || flag('apply')) {
-    const policy = (arg('candidates') ?? 'skip') as 'accept' | 'reject' | 'skip';
-    if (!['accept', 'reject', 'skip'].includes(policy)) {
-      console.error(`invalid --candidates: ${policy}`);
+  const argv = process.argv;
+  const cmd = argv[2];
+
+  let scope: Scope;
+  try {
+    scope = parseScope(argv);
+  } catch (err) {
+    if (err instanceof RequiredArgsError) {
+      printUsage(`erro: ${err.message}`);
       process.exit(2);
     }
-    await applyRun(run_id, policy);
-    process.exit(0);
+    throw err;
   }
-  console.error('unknown command');
-  process.exit(2);
+
+  const isList = cmd === 'list' || flag(argv, 'list');
+  const isShow = cmd === 'show' || flag(argv, 'show');
+  const isApply = cmd === 'apply' || flag(argv, 'apply');
+
+  if (!isList && !isShow && !isApply) {
+    printUsage('erro: comando desconhecido');
+    process.exit(2);
+    return;
+  }
+
+  let run_id: string | undefined;
+  if (!isList) {
+    run_id = arg(argv, 'run');
+    if (!run_id) {
+      printUsage('erro: --run=<id> é obrigatório para show/apply');
+      process.exit(2);
+      return;
+    }
+  }
+
+  let policy: 'accept' | 'reject' | 'skip' = 'skip';
+  if (isApply) {
+    policy = (arg(argv, 'candidates') ?? 'skip') as 'accept' | 'reject' | 'skip';
+    if (!['accept', 'reject', 'skip'].includes(policy)) {
+      printUsage(`erro: --candidates inválido: ${policy}`);
+      process.exit(2);
+      return;
+    }
+  }
+
+  try {
+    await runWithTenantContext(scope, async () => {
+      if (isList) return listRuns(scope, (m) => console.log(m));
+      if (isShow) return showRun(scope, run_id as string, (m) => console.log(m));
+      return applyRun(scope, run_id as string, policy, (m) => console.log(m));
+    });
+  } catch (err) {
+    if (err instanceof RunNotInScopeError || err instanceof CrossScopeWriteError) {
+      console.error(err.message);
+      process.exit(3);
+      return;
+    }
+    throw err;
+  }
+  process.exit(0);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/** Ver `scripts/import-ofx.ts` — um `import` de teste não pode disparar main(). */
+export function isDirectInvocation(entry: string | undefined, metaUrl: string): boolean {
+  if (!entry) return false;
+  try {
+    return pathToFileURL(entry).href === metaUrl;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation(process.argv[1], import.meta.url) && !process.env.IMPORT_REVIEW_NO_MAIN) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

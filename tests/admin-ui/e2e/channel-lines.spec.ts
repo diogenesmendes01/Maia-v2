@@ -7,24 +7,26 @@
  * A #623 deixou a décima jornada inteira em quarentena com um argumento de
  * DENOMINADOR COMUM: quatro dos seis casos dependem do worker `channel_pairing`
  * do runtime, logo os seis ficam fora. Só que os outros dois não dependem de
- * runtime nenhum — dependem de uma FIXTURE e de uma SESSÃO, que é exatamente o
- * que as outras nove jornadas ganharam quando saíram da quarentena.
+ * runtime nenhum — dependem de uma FIXTURE e de uma SESSÃO. A contabilidade da
+ * quarentena era por ARQUIVO, então "medir os dois que dá para medir" só era
+ * representável separando os arquivos. Daí esta divisão.
  *
- * A contabilidade da quarentena é por ARQUIVO — a lista `QUARENTENA` de
- * `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, a contagem que sustenta
- * `TEST_ADMIN_UI_MIN_TESTS` e o `grep -l` do passo de legibilidade do job. Com
- * os seis casos num arquivo só, "medir os dois que dá para medir" é
- * irrepresentável. Daí a separação: este arquivo cobre o que o CONSOLE faz
- * sozinho, e `channel-lines-pairing.spec.ts` continua marcado, com os quatro
- * casos que precisam de um segundo processo.
- *
- * O nome também deixou de mentir: uma "jornada de pareamento" que não pareia
- * era a meia-verdade; esta é a jornada de LINHAS — listar, autorizar e dizer o
- * que não dá para fazer.
+ * A quarentena hoje está VAZIA: o job passou a subir também um runtime com
+ * adapter de canal falso, e `channel-lines-pairing.spec.ts` é gate bloqueante
+ * como este. A separação PERMANECE porque ela deixou de ser sobre quarentena e
+ * passou a ser sobre assunto: aqui é a jornada de LINHAS — listar, autorizar e
+ * dizer o que não dá para fazer —, lá é a jornada de PAREAMENTO, que atravessa
+ * dois processos. Juntar os dois arquivos de volta faria um deles depender da
+ * infra do outro sem que o nome dissesse.
  */
 import { test, expect } from '@playwright/test';
 import { autenticarComo, AGENTE_E2E } from './_apoio/sessao.js';
-import { LINHA_DECLARADA_E2E } from './_apoio/fixtures.js';
+import {
+  LINHA_DECLARADA_E2E,
+  LINHA_MATERIAL_ILEGIVEL_E2E,
+  armarMaterialIlegivel,
+  bytesDeMaterialDaLinha,
+} from './_apoio/fixtures.js';
 
 const CANAIS = '/setup/channels';
 
@@ -88,32 +90,70 @@ test.describe('Setup → Canais: linhas do agente', () => {
   });
 
   /**
-   * A PREMISSA DA QUARENTENA, como asserção.
+   * DEGRADAR FECHADO diante de material que não abre.
    *
-   * `channelLines.list` devolve `pairing_available: isPairingMaterialConfigured()`
-   * (`src/setup/pairing-material.ts`), e este job não configura
-   * `MAIA_STAGING_KEYRING` — o material de pareamento só trafega cifrado e
-   * quem o produz é o worker `channel_pairing` do runtime, que o job não sobe.
-   * A tela então degrada de forma honesta: explica o que falta e DESABILITA o
-   * CTA, em vez de oferecer um botão que só devolve erro.
+   * ── Por que este caso foi REESCRITO, e não apagado ────────────────────
+   * Até a #623 fechar a quarentena, este caso afirmava outra coisa: "sem
+   * keyring o console declara o pareamento indisponível e DESABILITA o CTA".
+   * Ele foi escrito como ALARME — a premissa da quarentena virada asserção —,
+   * para ficar vermelho no dia em que o job passasse a configurar
+   * `MAIA_STAGING_KEYRING`. Esse dia é este commit: o job agora gera um
+   * keyring efêmero e o compartilha entre o console e o runtime, então
+   * `pairing_available` é `true` e aquele caso seria vermelho por construção.
    *
-   * Manter isto verde é o que impede a quarentena de virar folclore: no dia em
-   * que alguém subir o runtime e o keyring neste job — o critério de saída
-   * escrito no cabeçalho de `channel-lines-pairing.spec.ts` —, este caso fica
-   * VERMELHO e obriga a revisitar o que continua marcado. Um comentário não
-   * faria isso.
+   * A PROPRIEDADE que ele guardava continua valendo e continua precisando de
+   * cobertura: falta material ⇒ a tela degrada FECHADO, nunca mostra conteúdo
+   * parcial nem um artefato inventado. O que mudou foi só onde a falta pode
+   * ser produzida com um único console no ar. Antes era a chave AUSENTE; agora
+   * é o envelope que a chave presente NÃO ABRE — o cenário real de uma chave
+   * rotacionada e removida com rows ainda referenciando-a
+   * (`staging_key_unavailable`, `src/gateway/staging-crypto.ts`). O caminho
+   * exercitado é o mesmo `catch` de `channelLines.getPairingStatus`, que
+   * devolve `material: null` "jamais conteúdo parcial".
+   *
+   * ── Anti-vacuidade ───────────────────────────────────────────────────
+   * "A tela não mostra QR" também seria verde se a semeadura tivesse falhado e
+   * não houvesse material nenhum. Por isso `armarMaterialIlegivel` devolve
+   * quantos BYTES ficaram na tabela, e o caso afirma que eles existem: o
+   * console TINHA material e RECUSOU. E a linha está em `pareando` — a tela
+   * chegou ao ramo que desenha material e escolheu não desenhar nenhum.
+   *
+   * ── O controle ───────────────────────────────────────────────────────
+   * O controle deste caso é `channel-lines-pairing.spec.ts`, no mesmo projeto
+   * bloqueante: lá o envelope é selado pelo runtime com a chave que o console
+   * tem, e o QR APARECE. Sem ele, "nunca aparece QR" passaria também com a
+   * renderização quebrada para todo mundo.
    */
-  test('sem keyring o console declara o pareamento indisponível e desabilita o CTA', async ({
+  test('material de pareamento que não abre: a tela degrada FECHADO', async ({
     page,
     context,
   }) => {
+    const bytes = await armarMaterialIlegivel(LINHA_MATERIAL_ILEGIVEL_E2E.channelId);
+    expect(
+      bytes,
+      'a fixture não deixou material na tabela — o caso mediria a ausência, ' +
+        'não a recusa',
+    ).toBeGreaterThan(0);
+
     await autenticarComo(context, 'owner');
     await escolherAgente(page);
 
-    await expect(page.getByText('Pareamento pelo console indisponível')).toBeVisible();
     const linha = page
       .getByRole('row')
-      .filter({ hasText: LINHA_DECLARADA_E2E.externalId });
-    await expect(linha.getByRole('button', { name: 'Parear' })).toBeDisabled();
+      .filter({ hasText: LINHA_MATERIAL_ILEGIVEL_E2E.externalId });
+    await expect(linha).toBeVisible();
+    await linha.getByRole('button', { name: 'Acompanhar pareamento' }).click();
+
+    // A tela chegou ao ramo de material: estado `pareando`, modal aberto.
+    await expect(page.getByTestId('line-pairing-state')).toContainText('pareando');
+    // E não desenhou nada: nem QR, nem código, nem um placeholder com bytes
+    // crus. O que aparece é a espera honesta.
+    await expect(page.getByAltText('QR Code de pareamento')).toBeHidden();
+    await expect(page.getByTestId('pairing-code')).toBeHidden();
+    await expect(page.getByText(/Preparando o QR/)).toBeVisible();
+
+    // E o material continua lá, ilegível: a recusa é do console, não uma
+    // limpeza silenciosa da fixture pelo caminho.
+    expect(await bytesDeMaterialDaLinha(LINHA_MATERIAL_ILEGIVEL_E2E.channelId)).toBe(bytes);
   });
 });

@@ -231,17 +231,47 @@ function checarTurno(foto: FotoDuravel): ViolacaoDeInvariante[] {
     // O claim é um TUPLO: quem, com que token, até quando. Uma row com parte
     // dele é um claim gravado pela metade — e um claim pela metade é
     // exatamente o rastro que um `UPDATE` não atômico deixaria.
-    const partes = [t.claim_token, t.claimed_by, t.lease_expires_at];
-    const presentes = partes.filter((p) => p !== null).length;
-    if (presentes !== 0 && presentes !== partes.length) {
-      out.push(
-        violacao('turno', 'turno.claim_completo', 'claim gravado pela metade (token/dono/lease)', {
-          turn_id: t.id,
-          claim_token: t.claim_token,
-          claimed_by: t.claimed_by,
-          lease_expires_at: t.lease_expires_at,
-        }),
-      );
+    //
+    // ─── Por que a regra do tuplo vale só ENQUANTO o turno está vivo ───────
+    //
+    // A conclusão terminal LIBERA a posse e PRESERVA `claimed_by`, de
+    // propósito: `clearClaim` (`src/db/repositories/turn-repos.ts`) anula
+    // `claim_token` e `lease_expires_at` e deixa o dono gravado — "a posse
+    // morre com a tentativa; `claimed_by` fica para a forense". Cobrar o tuplo
+    // completo num turno terminal acusaria TODO turno concluído, e um oracle
+    // que grita em toda rodada normal é um oracle que ninguém lê. (Foi FI-14,
+    // o primeiro cenário desta lane a levar um turno até `dead_letter`, que
+    // encontrou isso.)
+    //
+    // A invariante que vale no terminal é a outra metade, e ela é mais forte
+    // que o tuplo: NENHUMA posse viva sobrevive ao fim do turno. Um
+    // `claim_token` ou uma `lease_expires_at` em turno terminal é um dono para
+    // trabalho que já acabou — e é o que faria a varredura de lease vencida
+    // "recuperar" um turno concluído quando o prazo passasse.
+    if (isTerminalTurnStatus(t.status)) {
+      if (t.claim_token !== null || t.lease_expires_at !== null) {
+        out.push(
+          violacao('turno', 'turno.posse_liberada_no_terminal', 'turno TERMINAL com posse viva', {
+            turn_id: t.id,
+            status: t.status,
+            claim_token: t.claim_token,
+            lease_expires_at: t.lease_expires_at,
+          }),
+        );
+      }
+    } else {
+      const partes = [t.claim_token, t.claimed_by, t.lease_expires_at];
+      const presentes = partes.filter((p) => p !== null).length;
+      if (presentes !== 0 && presentes !== partes.length) {
+        out.push(
+          violacao('turno', 'turno.claim_completo', 'claim gravado pela metade (token/dono/lease)', {
+            turn_id: t.id,
+            claim_token: t.claim_token,
+            claimed_by: t.claimed_by,
+            lease_expires_at: t.lease_expires_at,
+          }),
+        );
+      }
     }
 
     if (t.status === 'superseded' && t.superseded_by_turn_id === null) {
