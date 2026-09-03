@@ -447,6 +447,11 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
         porque: 'composição concreta no indicativo',
       },
       {
+        re: /(?<![\p{L}])l[íi]quido(?![\p{L}])[^.\n]{0,60}(?<!\bque )\b(?:considera|inclui|abate|subtrai)\b[^.\n]{0,40}\bcusto/iu,
+        porque:
+          'composição concreta com outro verbo ("considera o custo…") — forma achada em sonda de revisão; "que subtrai" (oração relativa em constatação de fato) fica de fora de propósito',
+      },
+      {
         re: /\brateio\s+(?:por|proporcional ao?)\s+(?:slot|contato|envio|objetivo|item|mensagem|r[ée]gua)\b/iu,
         porque: 'critério de rateio afirmado como decidido',
       },
@@ -472,6 +477,10 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
       {
         re: /\b\d+\s*(?:reclama[çc][õo]es?|bloqueios?|opt-outs?|sinais)\b[^.\n]{0,60}\b(?:pausa|abre|dispara|breaker|disjuntor)\b/iu,
         porque: 'limiar concreto em prosa',
+      },
+      {
+        re: /\b(?:breaker|disjuntor)\b[^.\n]{0,60}\b(?:a partir de|acima de|com mais de|com)\s+\d+\s*falhas?/iu,
+        porque: 'limiar concreto em prosa ("abre com N falhas") — forma achada em sonda de revisão',
       },
       {
         re: /\b(?:breaker|disjuntor)\b[^.\n]{0,60}\b(?:a partir de|acima de|com mais de)\s+\d/iu,
