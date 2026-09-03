@@ -131,6 +131,19 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * Every one of these is independent of scope size: the slope is zero, so an
  * "elephant" tenant's turn costs the same as anyone else's.
  *
+ * Issue #700 — the performance gate (`npm run turn:bench`) measures this whole
+ * boundary, not half of it. Until #700 the harness fabricated the scope in
+ * memory and seeded neither `permissoes` nor `permission_profiles`, so the two
+ * `resolveScope` round-trips counted above were budgeted here and measured
+ * nowhere; the gate now resolves the scope in Postgres inside the turn's clock.
+ * Since the #525 owner decision (2026-09-02) the gate's evidence is the
+ * PROPERTY, not the count: it fails when no scope read reaches the per-turn
+ * counter (fabricated scope), when the resolved scope does not match the
+ * seeded cardinality, or when the per-turn statement count GROWS with
+ * cardinality (the O(1) guardrail — which is what catches an N+1, in the
+ * scope stage or anywhere else in the turn). The number of scope reads itself
+ * (2 here; 1 once the reads are fused) is measured and reported, not fixed.
+ *
  * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
  * `src/db/client.ts` — a bounded read set issued all at once still empties the
  * pool. That is a separate ceiling, `TURN_CONTEXT_MAX_CONCURRENT_READS` below.
@@ -177,49 +190,28 @@ export const TURN_ROUND_TRIP_BUDGET = 12;
  */
 export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
 
-/**
- * A meta que a issue #525 estabelece: ≤8. **NÃO atingida, e a razão foi MEDIDA,
- * não estimada.**
+/*
+ * `TURN_ROUND_TRIP_TARGET` (a meta de ≤8 round-trips) morava aqui. Ela foi
+ * REMOVIDA pela decisão do dono na issue #525 (2026-09-02):
  *
- * Chegar a 8 é possível e foi implementado: as cinco fusões que faltavam
- * (`permissoes ⋈ permission_profiles`, `operational_profile_versions ∪
- * self_state`, `agent_facts ∪ learned_rules`, `memory_entry ∪ behavioral_hint`,
- * `agent_capabilities_skill ∪ agent_capability_gaps`) produzem exatamente oito
- * statements, com o prompt byte-idêntico e o escopo por tenant+agent intacto.
- * Quatro delas foram DESFEITAS porque o benchmark reprovou o resultado: o p95 da
- * carga de contexto TRIPLICOU.
+ * > "escolho reescrever a meta em termos de latência. Não vamos pagar cerca
+ * > de 3× no p95 apenas para atingir ≤8. A contagem continua como guardrail,
+ * > com crescimento O(1); p95, p99, throughput e erros passam a ser os
+ * > critérios principais."
  *
- * O mecanismo, medido em `docs/architecture/modules/agent.md` § "O que custa um
- * round-trip, e o que custa fundir dois":
+ * O que ficou no lugar dela:
  *
- *  1. um round-trip vazio custa ~0,15 ms; um statement do turno custa
- *     0,4–1,2 ms. A ida ao banco é a menor parte do preço de uma leitura;
- *  2. desde a #525 as leituras saem CONCORRENTES sob o portão de 6 permissões,
- *     então o turno paga o MÁXIMO do conjunto, não a soma. Reduzir a CONTAGEM
- *     abaixo do teto de concorrência não encurta o caminho crítico;
- *  3. um `UNION ALL` de dois ramos custa mais para PLANEJAR que qualquer um
- *     deles sozinho — cerca de 4× o pior ramo, medido com `EXPLAIN` em
- *     `tests/integration/turn-context-custo-de-fundir-real-db.spec.ts`, que
- *     reprova se a conta se inverter —, então a fusão alonga justamente o
- *     `max()` que define a latência do turno.
- *
- * A única fusão que sobreviveu é a do `resolveScope`, e ela sobreviveu porque
- * aquelas duas leituras eram SEQUENCIAIS (a segunda precisava dos `profile_id`
- * da primeira): trocar duas idas em série por uma ida só encurta o caminho
- * crítico de verdade — 1,46 ms → 0,97 ms de p50 com uma entidade em escopo
- * (`tests/integration/turn-context-escopo-real-db.spec.ts`).
- *
- * Ou seja: a contagem de round-trips deixou de medir o que ela media quando a
- * #511 a escolheu. Enquanto as leituras eram SEQUENCIAIS, contagem e latência
- * andavam juntas; desde que passaram a ser concorrentes e limitadas, a contagem
- * virou proxy de nada. Baixar de 12 para 8 é possível e é pior.
- *
- * Mantida como constante (e não apagada) porque a meta é do dono, não do código:
- * `tests/unit/turn-context-round-trips.spec.ts` afirma a DISTÂNCIA exata entre o
- * orçamento e a meta, para que ela não seja arredondada para "perto o bastante"
- * nem em silêncio declarada cumprida.
+ *  - a META agora é latência, e vive no gate (`scripts/turn-context-
+ *    benchmark.ts`): p95/p99/throughput/erros por braço e cardinalidade,
+ *    relativos ao baseline com margem nomeada (`MARGEM_RELATIVA_DEFAULT`);
+ *  - a CONTAGEM continua como guardrail de CRESCIMENTO: statements por turno
+ *    O(1) na cardinalidade — `TURN_ROUND_TRIP_BUDGET` acima segue sendo o
+ *    número medido e cobrado exato pela spec de round-trips (é o que impede
+ *    um N+1 de voltar em silêncio), e o gate reprova qualquer contagem que
+ *    cresça de N=1 para N=100;
+ *  - o teto ABSOLUTO é linha de relatório, não critério de aceite: reduzir
+ *    statements só é aceito se p95/p99/throughput não pagarem por isso.
  */
-export const TURN_ROUND_TRIP_TARGET = 8;
 
 /**
  * Item cap for the gap list inside the self-awareness ("## Autoconhecimento")

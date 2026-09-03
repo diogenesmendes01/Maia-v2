@@ -53,6 +53,7 @@ export const boletoSearchTool: Tool<typeof inputSchema, typeof outputSchema> = {
   output_schema: outputSchema,
   required_actions: [],
   side_effect: 'read',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'read',
   audit_action: 'boleto_searched',

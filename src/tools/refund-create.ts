@@ -83,6 +83,7 @@ export const refundCreateTool: Tool<typeof inputSchema, typeof outputSchema> = {
   output_schema: outputSchema,
   required_actions: ['create_refund'],
   side_effect: 'write',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'refund_created',

@@ -24,6 +24,7 @@ export const calendarAddBusinessDaysTool: Tool<typeof inputSchema, typeof output
   output_schema: outputSchema,
   required_actions: [],
   side_effect: 'read',
+  effect_class: 'abort_safe',
   redis_required: false,
   operation_type: 'read',
   audit_action: 'calendar_query',

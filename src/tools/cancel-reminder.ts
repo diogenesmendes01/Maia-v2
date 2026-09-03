@@ -32,6 +32,7 @@ export const cancelReminderTool: Tool<typeof inputSchema, typeof outputSchema> =
   output_schema: outputSchema,
   required_actions: ['schedule_reminder'],
   side_effect: 'write',
+  effect_class: 'idempotent',
   redis_required: false,
   operation_type: 'cancel',
   audit_action: 'series_cancelled',

@@ -136,31 +136,42 @@ vi.mock('@/db/repositories.js', async (importOriginal) => {
   };
 });
 
-// Capture outbound sends to assert the recipient (and prove cross-tenant
-// non-delivery). Resolves so `sendToOwners` never logs a failure.
+// Captura o COMPROMISSO de saída para provar destinatário e não-entrega
+// cruzada. Resolve sempre — estes specs provam isolamento por tupla, não
+// resolução de canal.
 //
-// Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): `sendToOwners` agora
-// sai pela FRONTEIRA ÚNICA — `forCurrentAgentChannel(null)` (proativo sem
-// conversa → canal único ativo do agente) e `line.sendText(jid, text)` por
-// owner. O mock resolve SEMPRE (estes specs provam isolamento por tupla, não a
-// resolução de canal) e captura no MESMO `sentMessages`, preservando todas as
-// asserções de destinatário/corpo.
-const sentMessages: Array<{ jid: string; text: string }> = [];
+// Issue #506: `sendToOwners` NÃO chama mais o canal. Ela compromete o briefing
+// no ledger durável de agendamento (`enqueueProactiveNotice` →
+// `outboxRepo.enqueue`), e o drain de agendamento entrega depois. Então o ponto
+// de captura desceu do `line.sendText` para o ENQUEUE — que é o instante em que
+// o briefing passa a existir para o PostgreSQL, e é sob a ALS da tupla que ele
+// é gravado. Todas as asserções de destinatário/corpo valem igual.
+const sentMessages: Array<{ jid: string; text: string; dedupe_key: string }> = [];
+const enqueueProactiveNoticeMock = vi.fn(
+  async (input: { jid: string; text: string; dedupe_key: string }) => {
+    sentMessages.push({ jid: input.jid, text: input.text, dedupe_key: input.dedupe_key });
+    return 'enqueued' as const;
+  },
+);
+vi.mock('@/runtime/outbound/proactive-notice.js', () => ({
+  enqueueProactiveNotice: enqueueProactiveNoticeMock,
+}));
+// Tripwire DUPLO: nada neste worker deve tocar a fronteira de saída nem a
+// primitiva crua do gateway. Se algum caminho voltar a enviar direto, a captura
+// abaixo entra no MESMO `sentMessages` e as asserções de contagem flagram o
+// desvio — e a trava arquitetural de #634 reprova o módulo em paralelo.
 const forCurrentAgentChannelMock = vi.fn(async () => ({
   sendText: async (jid: string, text: string) => {
-    sentMessages.push({ jid, text });
+    sentMessages.push({ jid, text, dedupe_key: 'DESVIO:envio_direto' });
     return null;
   },
 }));
 vi.mock('@/gateway/line-output.js', () => ({
   forCurrentAgentChannel: forCurrentAgentChannelMock,
 }));
-// Tripwire: nada neste worker deve mais tocar a primitiva crua do gateway; se
-// algum caminho voltar a enviar por `sendOutboundText` direto, a captura abaixo
-// faz as asserções de destinatário/contagem flagrarem o desvio.
 vi.mock('@/gateway/baileys.js', () => ({
   sendOutboundText: vi.fn(async (jid: string, text: string) => {
-    sentMessages.push({ jid, text });
+    sentMessages.push({ jid, text, dedupe_key: 'DESVIO:envio_direto' });
     return undefined;
   }),
 }));
@@ -186,6 +197,7 @@ beforeEach(() => {
   throwForTuple = new Set();
   listActiveOwnerPairsMock.mockClear();
   forCurrentAgentChannelMock.mockClear();
+  enqueueProactiveNoticeMock.mockClear();
   store.select.mockClear();
   // DISPATCH tests run with an EMPTY store (inner reads → []); the ISOLATION
   // block seeds it in its own beforeEach.
@@ -351,6 +363,11 @@ describe('Issue #345 — morning briefing reads + sends for ONLY the current ten
     expect(sentMessages).toHaveLength(1);
     const msg = sentMessages[0]!;
     expect(msg.jid).toBe('5511111@s.whatsapp.net');
+    // Issue #506 — o briefing virou LINHA DE LEDGER, e a chave de dedupe prova
+    // as três dimensões da idempotência: período, dia e dono. Uma segunda
+    // execução do cron no mesmo dia colide na chave e NÃO manda o briefing de
+    // novo — o que o `line.sendText` anterior não conseguia oferecer.
+    expect(msg.dedupe_key).toMatch(/^briefing:morning:\d{4}-\d{2}-\d{2}:/);
     // Tenant-B's owner jid was never contacted.
     expect(sentMessages.some((m) => m.jid === '5522222@s.whatsapp.net')).toBe(false);
 
@@ -367,11 +384,11 @@ describe('Issue #345 — morning briefing reads + sends for ONLY the current ten
     expect(contextsSeen.length).toBeGreaterThan(0);
     for (const c of contextsSeen) expect(c).toEqual(A);
 
-    // Fase 0: a linha foi resolvida pela fronteira única EXATAMENTE uma vez
-    // (uma por tupla), com channel_id NULL (proativo sem conversa → canal
-    // único ativo do agente).
-    expect(forCurrentAgentChannelMock).toHaveBeenCalledTimes(1);
-    expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
+    // Issue #506: a fronteira de saída não é mais tocada por este worker. A
+    // linha é resolvida DEPOIS, pelo drain de agendamento, a partir da row
+    // comprometida — então zero chamadas aqui é a asserção certa, e ela é o
+    // tripwire que pega uma reintrodução de envio direto.
+    expect(forCurrentAgentChannelMock).not.toHaveBeenCalled();
   });
 
   it('a tuple with active owners but no entities still sends an (empty-body) briefing — no under-delivery', async () => {

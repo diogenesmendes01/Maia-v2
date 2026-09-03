@@ -844,8 +844,8 @@ Isso é o contrário de `media.blobs` (mídia de ENTRADA), que continua com
 `mechanism_not_implemented` porque o layout dela (`<tenant>/<mês>/<sha>`) não
 tem ligação com o titular. As classes ficaram separadas exatamente por isso.
 
-**A trava de envio direto.** Duas camadas, e cada uma pega o que a outra não
-pega:
+**A trava de envio direto.** TRÊS camadas, e cada uma pega o que as outras não
+pegam:
 
 1. **Runtime** — `src/runtime/outbound/egress-guard.ts`. Um ALS carrega a
    autorização de egresso; `src/gateway/line-output.ts` envolve as CINCO
@@ -857,25 +857,71 @@ pega:
    `src/` (removendo comentários antes de casar) e reprova um `LineOutput.send*`
    num módulo ausente do inventário, ou um módulo cujo inventário não declare a
    primitiva que ele chama.
+3. **Catraca** (#506, auditoria de fechamento) — `assertRatifiedInventory`, em
+   `send-paths.ts`, roda no **carregamento do módulo**. As camadas 1 e 2 dizem
+   *"inventarie antes de enviar"*; nenhuma dizia *"pare de inventariar"*, e a
+   décima primeira exceção nasce exatamente por onde elas mandam. A catraca
+   recusa uma exceção cujo id não esteja em `RATIFIED_EXCEPTION_IDS`, uma sem
+   `blocked_by`/`remediation`, e um conjunto acima de
+   `MAX_DECLARED_EXCEPTIONS`. Como `egress-guard.ts` importa daqui e
+   `line-output.ts` importa dele, uma rota paralela nova **não sobe**.
 
 **O inventário.** `src/runtime/outbound/send-paths.ts`, em código e não em
 markdown, para que o teste possa lê-lo. Três estados: `outbox`,
-`declared_exception` (com `reason` **e** `containment` obrigatórios) e
-`infrastructure`. Estado hoje:
+`declared_exception` (com `reason`, `containment`, `blocked_by` **e**
+`remediation` obrigatórios) e `infrastructure`. Estado hoje:
 
 | Estado | Caminhos |
 |---|---|
 | `outbox` | `agent/output-dispatch.ts` (texto, `status_fallback`, documento, voz, enquete), `runtime/outbound/delivery.ts` |
-| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `tools/_dispatcher.ts`, `workers/briefings.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` |
+| `declared_exception` | `agent/message-update.ts`, `agent/react-loop.ts` (reação), `identity/quarantine.ts`, `scheduling/outbox-drain.ts`, `workers/idempotency-outbox-relayer.ts`, `workers/pending-reminder.ts` |
 | `infrastructure` | `gateway/line-output.ts`, `gateway/line-sessions.ts`, `runtime/outbound/provider-adapter.ts` |
 
-A issue pede o inventário de exceções "idealmente vazio"; ele não está, e o
-denominador comum das dez é literal: **nenhuma tem `turn_id`**. O outbox exige
-`turn_id NOT NULL` (migração 121) e o commit faz fence do `claim_token` do
-turno — não há turno a cercar num briefing das 7h nem numa expiração de
-workflow. Duas delas (`scheduling.outbox_drain`, `workers.idempotency_relayer`)
-já são outboxes duráveis próprios; migrá-las é fundir dois ledgers, trabalho que
-a issue-mãe não pede.
+**De dez para seis (#506).** Quatro entradas saíram porque os módulos pararam de
+falar com o canal: `workers/briefings.ts`, `workflows/dual-approval.ts`,
+`workflows/engine.ts` e `tools/_dispatcher.ts` comprometem o aviso em
+`outbox_messages` via `src/runtime/outbound/proactive-notice.ts`, e o drain de
+agendamento entrega com claim, backoff e DLQ. Não é o outbox do TURNO — é o
+ledger durável que já existia —, e o inventário diz isso com todas as letras. O
+que os quatro ganharam é a propriedade que a épica exige e que eles não tinham:
+**persistir antes de enviar**. O que a fatia comprou de quebra é que a fusão dos
+ledgers passou a ter um ponto de aplicação (`scheduling/outbox-drain.ts`) em vez
+de cinco.
+
+A catraca vive em `tests/unit/runtime/outbound-trava-envio-direto.spec.ts`: a
+lista de seis ids é literal (o número **só desce**), os quatro ids aposentados
+são recusados pela trava de runtime, e uma entrada cujo módulo deixou de enviar
+reprova como "exceção fantasma".
+
+**CORREÇÃO DE FATO.** A versão anterior desta seção dizia que o denominador
+comum das dez era "nenhuma tem `turn_id`", porque "o outbox exige `turn_id NOT
+NULL` (migração 121)". **A coluna é NULLABLE** — a 121 a cria com
+`ADD COLUMN IF NOT EXISTS turn_id uuid`, o CHECK de completude é
+`CASE WHEN turn_id IS NULL THEN true ELSE (...) END`, a FK composta é MATCH
+SIMPLE (inerte com NULL) e o UNIQUE da chave lógica não menciona `turn_id`. Nem
+o destinatário é amarrado ao turno: `resolveOutboundDeliveryScope` resolve o JID
+pela `conversa_id` da própria row. O que bloqueia é CÓDIGO —
+`commitOutboundIntent` exige `getOutboundTurnScope()`, e `deliverOutbound`
+recusa row sem `turn_id` na entrada — e mudar isso é mudar o MODELO do outbox.
+A proposta escrita está em
+[`decisions/0005-outbox-sem-turno.md`](../decisions/0005-outbox-sem-turno.md),
+com migração, guarda, ordem de coortes e o que a reconciliação passa a
+distinguir. Ela aguarda decisão humana; nenhuma parte dela foi implementada.
+
+**O impedimento de cada uma das seis, tipado.** A #634 as justificava com um
+denominador comum ("nenhuma tem `turn_id`"), e a auditoria de fechamento chamou
+isso pelo nome: denominador comum não é justificativa individual. O vocabulário
+é fechado, sem membro genérico.
+
+| `blocked_by` | Quantas | O que desbloqueia |
+|---|---|---|
+| `no_turn_to_anchor` | 2 (`identity/quarantine`, `workers/pending-reminder`) | Uma âncora durável para saída SEM turno, com entrega própria. O bloqueio é de CÓDIGO, não de schema — ver a correção acima |
+| `foreign_recipient` | 1 (`agent/message-update`) | Uma identidade lógica de saída dirigida a TERCEIRO — o JID hoje é resolvido no ingresso do job pela `conversa_id` da row |
+| `competing_durable_ledger` | 2 (`scheduling/outbox-drain`, `workers/idempotency-outbox-relayer`) | A FUSÃO dos ledgers. Ligar o drain ao outbox do turno criaria dois senders autoritativos — o que a §Rollback da issue proíbe nominalmente |
+| `ephemeral_signal_without_provider_id` | 1 (`agent/react-loop`) | Uma capability de provedor que confirme reação. Hoje `sendReaction` devolve `void`, o adaptador só pode dizer `accepted_without_id`, e toda reação migrada nasceria `delivery_unknown` → `escalate_manual`: uma linha de trabalho HUMANO por reação |
+
+São quatro trabalhos diferentes, e nenhum deles é um wrapper diferente no call
+site.
 
 **Fallback e timeout.** `sendOutbound` já aceitava `fallback_reason` desde #631,
 mas nenhum call site o passava — todo fallback nascia como `payload_type:'text'`

@@ -172,6 +172,9 @@ const { fakeTool, registryMockState } = vi.hoisted(() => {
   const tool = {
     name: 'fake_tool',
     operation_type: 'create',
+    // #507 — ver a nota gêmea em idempotency-outbox-dispatcher.spec.ts.
+    side_effect: 'write',
+    effect_class: 'non_interruptible',
     required_actions: [],
     audit_action: 'fake_action',
     input_schema: {

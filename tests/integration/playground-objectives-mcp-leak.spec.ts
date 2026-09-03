@@ -406,7 +406,12 @@ dRepo('leak 088 — objectivesRepo (#481)', () => {
       payload: { valor: 1234 },
     });
     expect(task).not.toBeNull();
-    await objectivesRepo.transitionTask({ task_id: task!.id, status: 'waiting_human' });
+    await objectivesRepo.transitionTask({
+      tenant_id: tA,
+      agent_id: `${tA}-agent`,
+      task_id: task!.id,
+      status: 'waiting_human',
+    });
 
     expect(
       await objectivesRepo.findTaskById({

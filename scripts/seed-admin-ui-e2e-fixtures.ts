@@ -40,6 +40,8 @@ import {
   admin_audit_log,
   agent_operational_profile_versions,
   capability_proposals,
+  channel_line_state,
+  channels,
   proposal_approvals,
 } from '@/db/schema.js';
 import { writeEnvelope } from '@/control-plane/runtime-trace/envelope-writer.js';
@@ -90,6 +92,43 @@ const VERSOES_PERFIL = [
   { id: 'e2e30000-0000-4000-8000-000000000001', version: 1, status: 'frozen' },
   { id: 'e2e30000-0000-4000-8000-000000000002', version: 2, status: 'active' },
 ] as const;
+
+/**
+ * Linhas WhatsApp DECLARADAS — jornadas `channel-lines.spec.ts` e
+ * `channel-lines-pairing.spec.ts`.
+ *
+ * `channels.active = false` + `channel_line_state.state = 'declared'` é o
+ * estado em que uma linha NASCE (#518): número registrado, posse não provada,
+ * não roteia. Era exatamente esse par que sumia da tela antes da #518. Desde
+ * que o job passou a subir também um runtime com adapter de canal falso
+ * (`scripts/admin-ui-e2e.sh`), é daqui que a jornada de pareamento parte para
+ * chegar ao QR e ao código de 8 dígitos.
+ *
+ * `external_id` PRÓPRIO e não o `default-channel` das migrations: aquele nasce
+ * `active = true` / `verified_offline`, ou seja, descreve o estado OPOSTO — e
+ * a jornada mediria a linha errada. Os números são fictícios (faixa
+ * +5511 9900000xx) e o índice único é `(tenant_id, channel_type,
+ * external_id)`, então eles não colidem com o canal semeado pela migration.
+ *
+ * São DUAS porque as jornadas as levam a estados incompatíveis: a de
+ * pareamento deixa a primeira em `pareando` com sessão viva; a de degradação
+ * fechada precisa da segunda em `pareando` com material ILEGÍVEL e sem sessão
+ * nenhuma. Uma linha só faria uma jornada herdar o estado da outra.
+ */
+const LINHA_DECLARADA = {
+  channel_id: 'e2e40000-0000-4000-8000-000000000001',
+  external_id: '+5511990000001',
+  display_name: 'Linha comercial E2E',
+} as const;
+
+/** Espelha `LINHA_MATERIAL_ILEGIVEL_E2E` de `tests/admin-ui/e2e/_apoio/fixtures.ts`. */
+const LINHA_MATERIAL_ILEGIVEL = {
+  channel_id: 'e2e40000-0000-4000-8000-000000000002',
+  external_id: '+5511990000002',
+  display_name: 'Linha E2E de material ilegível',
+} as const;
+
+const LINHAS_DECLARADAS = [LINHA_DECLARADA, LINHA_MATERIAL_ILEGIVEL] as const;
 
 interface Fixture {
   id: string;
@@ -176,6 +215,13 @@ async function limpar(): Promise<void> {
     .delete(admin_audit_log)
     .where(and(eq(admin_audit_log.tenant_id, TENANT), inArray(admin_audit_log.resource_id, ids)));
   await db.delete(capability_proposals).where(inArray(capability_proposals.id, ids));
+  // A linha primeiro, o canal depois: `channel_line_state.channel_id` referencia
+  // `channels.id`.
+  const canaisSemeados = LINHAS_DECLARADAS.map((l) => l.channel_id);
+  await db
+    .delete(channel_line_state)
+    .where(inArray(channel_line_state.channel_id, canaisSemeados));
+  await db.delete(channels).where(inArray(channels.id, canaisSemeados));
 }
 
 async function semearUsuarios(): Promise<void> {
@@ -281,16 +327,46 @@ async function semearVersoesDePerfil(): Promise<void> {
   }
 }
 
+/**
+ * As linhas entram por SQL direto porque o caminho de produção para CRIAR um
+ * canal é a própria tela (`channelLines`/`channelPolicies`), e passar por ele
+ * aqui faria a jornada de listagem depender da jornada de criação — além de
+ * deixar trilha em `admin_audit_log`, que a jornada de auditoria conta.
+ *
+ * As duas nascem `declared`: é o estado inicial de TODA execução. Quem as leva
+ * ao estado que a sua jornada precisa é a própria jornada, no `beforeEach`
+ * (`restaurarLinhaParaDeclarada`, `armarMaterialIlegivel`) — assim a segunda
+ * TENTATIVA de um caso também começa do mesmo lugar.
+ */
+async function semearLinhasDeclaradas(): Promise<void> {
+  for (const linha of LINHAS_DECLARADAS) {
+    await db.execute(sql`
+      INSERT INTO channels (id, tenant_id, agent_id, external_id, channel_type, display_name, active)
+      VALUES (
+        ${linha.channel_id}::uuid, ${TENANT}, ${AGENTE},
+        ${linha.external_id}, 'whatsapp', ${linha.display_name}, false
+      )
+    `);
+    await db.execute(sql`
+      INSERT INTO channel_line_state (channel_id, tenant_id, agent_id, state)
+      VALUES (${linha.channel_id}::uuid, ${TENANT}, ${AGENTE}, 'declared')
+    `);
+  }
+}
+
 async function main(): Promise<void> {
   await limpar();
   await semearUsuarios();
   await semearPropostas();
   await semearVersoesDePerfil();
   await semearTrace();
+  await semearLinhasDeclaradas();
   // eslint-disable-next-line no-console
   console.log(
     `fixtures e2e do console: ${USUARIOS.length} usuários, ${FIXTURES.length} propostas, ` +
-      `${VERSOES_PERFIL.length} versões de perfil e 1 trace no tenant ${TENANT}.`,
+      `${VERSOES_PERFIL.length} versões de perfil, 1 trace e ` +
+      `${LINHAS_DECLARADAS.length} linhas whatsapp declaradas ` +
+      `(${LINHAS_DECLARADAS.map((l) => l.external_id).join(', ')}) no tenant ${TENANT}.`,
   );
 }
 

@@ -64,7 +64,7 @@ export default function InboxTable({
               checked={allSelected}
               onChange={toggleAll}
               aria-label="Selecionar todas"
-              className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+              className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
             />
             Selecionar todas
           </label>
@@ -84,7 +84,7 @@ export default function InboxTable({
                     onChange={() => toggleOne(p.id)}
                     onClick={(e) => e.stopPropagation()}
                     aria-label={`Selecionar ${p.descriptor}`}
-                    className="mt-0.5 h-4 w-4 shrink-0 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                    className="mt-0.5 h-4 w-4 shrink-0 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                   />
                 )}
                 <div className="min-w-0 grow">
@@ -121,7 +121,7 @@ export default function InboxTable({
                   checked={allSelected}
                   onChange={toggleAll}
                   aria-label="Selecionar todas"
-                  className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                  className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                 />
               </Th>
             )}
@@ -148,7 +148,7 @@ export default function InboxTable({
                       checked={selectedIds.includes(p.id)}
                       onChange={() => toggleOne(p.id)}
                       aria-label={`Selecionar ${p.descriptor}`}
-                      className="h-4 w-4 rounded border-zinc-300 text-brand-600 focus:ring-brand-500"
+                      className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                     />
                   </Td>
                 )}

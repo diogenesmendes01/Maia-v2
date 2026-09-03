@@ -69,6 +69,7 @@ import {
   type PoisonCategory,
 } from './poison-policy.js';
 import { recordPoisonDecision } from './stream-metrics.js';
+import { instrumentTurnComplete } from '@/observability/instrumentation.js';
 
 /** Referência viva a um turno em execução. `state_version` é o token do CAS. */
 export type TurnHandle = {
@@ -724,7 +725,33 @@ async function notePromotion(result: TurnTransitionResult): Promise<void> {
  * nunca escolhe o estado — é assim que "nenhum turno é concluído simplesmente
  * porque uma função retornou" fica garantido.
  */
-export async function concludeTurn(
+/**
+ * Issue #535 — span `turn.complete`.
+ *
+ * UM site cobre TODOS os desfechos porque `concludeTurn` É a transição
+ * terminal: `agent/core.ts` chega aqui de umas vinte posições (identidade
+ * desconhecida, rate limit, bloqueado por política, resposta entregue …) e cada
+ * uma passa o seu `TurnOutcome`. Instrumentar os chamadores seriam vinte edições
+ * e um convite permanente a esquecer a vigésima primeira.
+ *
+ * `outcome` é `TurnOutcome`: dezesseis membros, congelados em
+ * `src/runtime/turns/contract.ts` — é isso que o torna seguro como atributo. O
+ * span é o que FECHA a waterfall: um trace cuja última linha é
+ * `turn.complete{outcome="reply_delivered"}` é um turno que terminou de
+ * propósito, e um sem ela é um turno que morreu mais acima.
+ *
+ * O guard de regime fica DENTRO do envelope: quando a máquina de estados está
+ * desligada não há conclusão a observar, e `withSpan` já é no-op sem tracing.
+ */
+export function concludeTurn(
+  handle: TurnHandle | null,
+  outcome: TurnOutcome,
+  ctx: { pessoa_id?: string | null; mensagem_id?: string | null } = {},
+): Promise<void> {
+  return instrumentTurnComplete(outcome, () => concludeTurnInner(handle, outcome, ctx));
+}
+
+async function concludeTurnInner(
   handle: TurnHandle | null,
   outcome: TurnOutcome,
   ctx: { pessoa_id?: string | null; mensagem_id?: string | null } = {},

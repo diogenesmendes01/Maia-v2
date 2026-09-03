@@ -1,7 +1,6 @@
 import { listOwners } from '@/governance/permissions.js';
 import { entidadesRepo, contasRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
-import { forCurrentAgentChannel } from '@/gateway/line-output.js';
-import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
+import { enqueueProactiveNotice } from '@/runtime/outbound/proactive-notice.js';
 import { fmtBR } from '@/lib/brazilian.js';
 import { logger } from '@/lib/logger.js';
 import { fmtBRL, sumDecimal } from '@/lib/decimal.js';
@@ -38,6 +37,9 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  */
 
 type Pair = { tenant_id: string; agent_id: string };
+
+/** Períodos do briefing. Entra na chave de idempotência do ledger. */
+type BriefingPeriod = 'morning' | 'evening' | 'weekly';
 
 async function buildOwnerBriefing(): Promise<string> {
   const ents = await entidadesRepo.list();
@@ -90,25 +92,52 @@ async function buildWeeklyBriefing(): Promise<string> {
   return [`Resumo semanal — ${fmtBR(new Date())}`, '', 'Últimos 7 dias:', ...lines].join('\n');
 }
 
-async function sendToOwners(text: string): Promise<void> {
-  // `listOwners()` → `pessoasRepo.list()` is scoped to the CURRENT ALS
-  // (tenant_id, agent_id), so under a per-tuple briefing run this resolves ONLY
-  // the running tuple's active owners — the briefing can never be addressed to
-  // another tenant's owner.
-  //
-  // Fase 0 (spec roteamento v4 §1.6): proativo sem conversa — resolve o canal
-  // único ativo do agente (fail-closed em ambiguidade; o throw sobe para o
-  // dispatcher per-tuple, que registra `briefing.*.agent_failed`).
-  const line = await forCurrentAgentChannel(null);
+/**
+ * Issue #506 — o briefing vira uma LINHA DE LEDGER antes de virar mensagem.
+ *
+ * O que havia aqui: `forCurrentAgentChannel(null)` + `line.sendText(...)` sob
+ * exceção de egresso declarada, com `.catch` que registrava `briefing.send_failed`
+ * e seguia para o próximo dono. Três defeitos numa linha só:
+ *
+ *  1. **não havia registro nenhum** de que o briefing ia existir. Um processo
+ *     derrubado no meio do laço não deixava rastro, e o dono simplesmente ficava
+ *     sem briefing naquele dia — sem fila, sem retry, sem DLQ, sem alerta;
+ *  2. **não havia idempotência**: dois disparos do cron mandavam dois briefings;
+ *  3. o `warn` fazia a perda parecer tratada.
+ *
+ * Agora cada dono ganha uma row em `outbox_messages`, chaveada por
+ * `briefing:<período>:<dia>:<pessoa>`, e o drain de agendamento a leva ao
+ * telefone com claim, backoff e DLQ auditada. A latência sobe do imediato para
+ * ≤1 minuto (cadência do `outbox_drain`), que é irrelevante para uma mensagem
+ * periódica e é o preço de ela não sumir.
+ *
+ * `listOwners()` → `pessoasRepo.list()` continua escopado à ALS
+ * (tenant_id, agent_id) corrente, e `outboxRepo.enqueue` grava a row sob a MESMA
+ * ALS — o briefing de um tenant não tem como ser endereçado ao dono de outro.
+ */
+async function sendToOwners(text: string, period: BriefingPeriod): Promise<void> {
+  // O DIA entra na chave (e não o instante) porque a unidade de idempotência é
+  // "um briefing deste período por dono por dia". Data local do processo, que é
+  // a mesma referência que o cron usa para disparar.
+  const dia = fmtISODate(new Date());
   const owners = await listOwners();
   for (const o of owners) {
     const jid = o.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-    // #634 — exceção INVENTARIADA (`workers.briefings`): proativo periódico, sem
-    // turno e sem conversa de origem.
-    await withDeclaredEgressException('workers.briefings', () => line.sendText(jid, text)).catch(
-      (err) => logger.warn({ err, pessoa_id: o.id }, 'briefing.send_failed'),
-    );
+    // Best-effort POR DONO, como antes: um telefone inválido ou um canal
+    // ambíguo não pode impedir que os outros donos sejam briefados. O que mudou
+    // é o que a falha significa — antes era "a mensagem se perdeu", agora é "a
+    // mensagem não chegou a ser comprometida", e as duas ficam distinguíveis no
+    // log pelo nome do evento.
+    await enqueueProactiveNotice({
+      jid,
+      text,
+      dedupe_key: `briefing:${period}:${dia}:${o.id}`,
+    }).catch((err) => logger.warn({ err, pessoa_id: o.id }, 'briefing.enqueue_failed'));
   }
+}
+
+function fmtISODate(d: Date): string {
+  return d.toISOString().slice(0, 10);
 }
 
 /**
@@ -119,7 +148,7 @@ async function sendToOwners(text: string): Promise<void> {
  * tuple; the `period` label keys the per-period idle/done logs.
  */
 async function dispatchBriefing(
-  period: 'morning' | 'evening' | 'weekly',
+  period: BriefingPeriod,
   inner: () => Promise<void>,
 ): Promise<void> {
   const tuples: Pair[] = await pessoasRepo.listTenantAgentPairsWithActiveOwner();
@@ -160,19 +189,19 @@ async function dispatchBriefing(
 
 async function runMorningBriefingInner(): Promise<void> {
   const text = await buildOwnerBriefing();
-  await sendToOwners(text);
+  await sendToOwners(text, 'morning');
   logger.info('briefing.morning.sent');
 }
 
 async function runEveningBriefingInner(): Promise<void> {
   const text = await buildEveningBriefing();
-  await sendToOwners(text);
+  await sendToOwners(text, 'evening');
   logger.info('briefing.evening.sent');
 }
 
 async function runWeeklyBriefingInner(): Promise<void> {
   const text = await buildWeeklyBriefing();
-  await sendToOwners(text);
+  await sendToOwners(text, 'weekly');
   logger.info('briefing.weekly.sent');
 }
 

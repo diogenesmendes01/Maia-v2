@@ -39,6 +39,7 @@ import {
 } from '@/db/repositories/outbound-outbox-repo.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { turnStateMachineEnabled } from '@/runtime/turns/lifecycle.js';
+import { instrumentOutboundCommit } from '@/observability/instrumentation.js';
 import type { TurnHandle } from '@/runtime/turns/lifecycle.js';
 import { getOutboundTurnScope } from './turn-scope.js';
 import {
@@ -131,7 +132,27 @@ export type CommitOutboundIntentInput = {
  * entre o commit e o envio é trabalho que pode falhar com a resposta já
  * comprometida, e cada await ali é uma janela nova.
  */
-export async function commitOutboundIntent(
+export function commitOutboundIntent(
+  input: CommitOutboundIntentInput,
+): Promise<OutboundCommitOutcome> {
+  // Issue #535 — span `outbound.commit`. É a fronteira de saída que SOBREVIVEU
+  // à migração para o outbox: desde #316/#630 o envio físico acontece no
+  // delivery worker, a um processo e vários minutos de distância, então o span
+  // que pertence ao TURNO é este — a transação que torna a resposta durável e
+  // que, por #631, precisa ter sucesso antes de qualquer coisa chegar ao canal.
+  // É também por isso que `whatsapp.send` saiu da taxonomia em vez de ganhar
+  // emissor; ver `SPANS_REMOVED_IN_535`.
+  //
+  // O envelope inclui os três `return` de regime de propósito: "não commitou
+  // porque a flag está desligada" é um desfecho tão observável quanto o commit,
+  // e é o que distingue escopo declarado de buraco.
+  return instrumentOutboundCommit(
+    () => commitOutboundIntentInner(input),
+    (o) => (o.committed ? 'committed' : o.reason),
+  );
+}
+
+async function commitOutboundIntentInner(
   input: CommitOutboundIntentInput,
 ): Promise<OutboundCommitOutcome> {
   // ── Regime. As três razões de NÃO commitar, todas nomeadas. ─────────────

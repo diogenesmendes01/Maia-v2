@@ -186,6 +186,26 @@ jobs:
         if: github.event_name == 'pull_request'
         run: npm run pr:body:check
 
+      # Roda DEPOIS do corpo da PR e ANTES do typecheck, no mesmo job
+      # bloqueante e pela mesma razão: uma atribuição de autoria fabricada é um
+      # defeito da mudança, não um detalhe de estilo, e não deve custar oito
+      # minutos de build para aparecer.
+      #
+      # O fetch busca o REF de base (tip atual), não o `base.sha` do payload:
+      # o sha do evento pode vir desatualizado e faria o guard julgar commits
+      # que já estão na main — que carrega ~194 trailers da regra antiga.
+      # O `fetch` também existe porque o checkout de PR vem com profundidade 1: sem
+      # ele, `git log base..head` não resolve e o script REPROVA em vez de
+      # passar vazio. Profundidade fixa (não `--unshallow`) para não pagar o
+      # clone inteiro num job que roda em toda PR.
+      - name: Commit trailer governance
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --quiet --depth=100 origin \
+            '+refs/heads/${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}' \
+            '${{ github.event.pull_request.head.sha }}'
+          npm run commit:trailers:check
+
       - name: Typecheck (tsc --noEmit)
         # Separated from build so failures point cleanly at type vs build.
         # `npx` instead of an npm script keeps CI independent of script renames.
@@ -318,7 +338,7 @@ jobs:
         run: node scripts/check-audit-exceptions.ts
 
   integration:
-    name: integration + e2e (node ${{ matrix.node }})
+    name: integration (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -468,14 +488,243 @@ jobs:
           VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 
-      - name: Run e2e tests
+      - name: Piso de volume da rodada de integração
+        # BLOQUEANTE, e o motivo é concreto: até esta mudança existia aqui um
+        # passo `Run e2e tests` que rodava `vitest run tests/e2e` contra um
+        # ÚNICO arquivo cujo `describe` estava com `.skip` HARDCODED e cujos
+        # três corpos eram comentários. O vitest sai 0 quando não acha teste,
+        # então o job ficava verde sobre zero asserção — e o nome do job
+        # (`integration + e2e`) anunciava uma cobertura que não existia.
+        #
+        # O passo vazio saiu. Este piso entra no lugar, sobre a integração que
+        # de fato roda: `executados=0` passa a REPROVAR, e a seção ARQUIVOS QUE
+        # NÃO CARREGARAM do resumo também — um arquivo que não coletou não tem
+        # caso contado em `executados`, então `falharam=0` sobre o resto seria
+        # leitura falsa.
+        #
+        # Mesmo raciocínio do `scripts/check-playwright-run.ts` no E2E do
+        # console: um gate que fica verde por ausência de trabalho não é gate.
+        #
+        # #703 — o e2e de backend VOLTOU, e voltou como a issue exigia: com
+        # conteúdo (`tests/e2e/jornadas-backend.spec.ts`), com piso próprio
+        # (`--min 3 --max-pulados 0`, nos dois passos logo abaixo) e com uma
+        # sonda vermelha por jornada registrada no corpo da PR.
+        #
+        # ── E por que o teto de pulados desta lane também é ZERO ─────────────
+        #
+        # `--min 1` sozinho reprova a rodada VAZIA e nada mais. Ele não vê mil
+        # e duzentos casos rodarem enquanto dez somem: `executados` continua
+        # muito acima do piso, e o gate aprova sorrindo. É o modo de falha que
+        # esta lane tem de temer, porque aqui `describe.skip` NÃO é uma escolha
+        # do autor do teste — é o que 121 arquivos de `tests/integration/`
+        # fazem quando falta infraestrutura. O padrão é sempre a mesma
+        # expressão:
+        #
+        #     const SHOULD_RUN = !!process.env.TEST_DB_URL
+        #       && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+        #     const d = SHOULD_RUN ? describe : describe.skip;
+        #
+        # Some uma das duas variáveis do bloco `env:` deste job, ou o serviço
+        # do Postgres muda de porta, ou o runtime de container que os specs de
+        # `testcontainers` procuram deixa de existir — e a lane inteira vira
+        # `describe.skip` sem que uma linha vermelha apareça. Um gate que passa
+        # quando o banco falta é exatamente o verde vazio que ele deveria
+        # impedir. É a MESMA regra que a lane e2e logo abaixo aplica a si
+        # mesma, e pelo mesmo motivo.
+        #
+        # ZERO não é uma meta: é o número que esta lane JÁ tem. A rodada de
+        # `b79d4d93` deu `executados=1207  falharam=0  pulados=0` nas duas
+        # pernas da matriz. O teto não aperta nada hoje; ele impede que a
+        # perda seja silenciosa amanhã.
+        #
+        # Se algum dia um skip legítimo aparecer aqui, o caminho é subir o teto
+        # NESTA linha, com o motivo escrito ao lado — uma decisão visível no
+        # diff, como a catraca de exceções de egresso da #506. O que não pode
+        # é a lane perder cobertura sem ninguém assinar embaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/integration.txt --min 1 --max-pulados 0 --rotulo "integração (node ${{ matrix.node }})"
+
+      - name: Jornadas e2e de backend (#703)
         env:
           VITEST_SUMMARY_FILE: .ci-test-summary/e2e.txt
+        # A lane que a #703 devolve ao CI: as TRÊS jornadas de negócio ponta a
+        # ponta (`tests/e2e/jornadas-backend.spec.ts`).
+        #
+        # POR QUE UM PASSO DESTE JOB, e não um job novo: um job novo só vira
+        # gate quando entra na PROTEÇÃO DE BRANCH, e um check obrigatório com
+        # nome errado nunca reporta (aceite 4 da #703). Este job JÁ é
+        # obrigatório, JÁ tem Postgres e Redis, e JÁ aplicou as migrations —
+        # a lane herda tudo isso sem depender de uma mudança de configuração
+        # fora do repositório. O NOME do job (`integration (node …)`) fica
+        # INTACTO de propósito: renomeá-lo trocaria o nome do check obrigatório
+        # e a proteção passaria a esperar um check que ninguém mais publica.
+        #
+        # RESUMO PRÓPRIO (`e2e.txt`, e não o da integração): um piso de 3 lido
+        # contra o resumo da integração enxergaria os ~1100 casos dela e
+        # aprovaria uma lane e2e VAZIA — o defeito de novo, uma casa adiante.
+        #
+        # `--retry=0` está no script `test:e2e`: uma jornada que "passa na
+        # segunda tentativa" é exatamente o flake que este gate deveria
+        # denunciar, não absorver.
         run: npm run test:e2e
+
+      - name: Piso de volume das jornadas e2e (#703)
+        # BLOQUEANTE, e este é o passo que impede a #703 de acontecer de novo.
+        #
+        # `--min 3`: são TRÊS jornadas nominais (os três nomes do arquivo
+        # removido pela #701 — R$ 50, R$ 25k, quarentena). O piso é o número de
+        # casos, não uma folga: apagar qualquer um deles reprova o job em vez
+        # de reduzir silenciosamente a cobertura. Ele NÃO impede acrescentar
+        # jornadas — só impede remover.
+        #
+        # `--max-pulados 0`: nesta lane não existe skip legítimo. O ÚNICO skip
+        # possível é o `describe.skip` condicionado a `TEST_DB_URL`
+        # (`SHOULD_RUN` na spec), e neste job Postgres e Redis são
+        # obrigatórios — um skip aqui significa "a infraestrutura obrigatória
+        # não estava presente", que é falha de job, não ausência de trabalho.
+        # É a mesma regra que `scripts/check-playwright-run.ts` aplica ao E2E
+        # do console e que a lane de fault injection (#510) já aplica abaixo.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/e2e.txt --min 3 --max-pulados 0 --rotulo "jornadas e2e (#703, node ${{ matrix.node }})"
 
       - name: Resumo dos testes
         # Mesma razão do job `validate` — e aqui o problema é pior, porque este
         # job tem DOIS service containers dumpando no fim. Ver #545.
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in .ci-test-summary/*.txt; do
+            [ -f "$f" ] || continue
+            echo "══════════ $f ══════════"
+            cat "$f"
+          done
+
+  # ---------------------------------------------------------------------
+  # Fault injection (#510) — a lane que, até este job existir, não protegia
+  # NADA.
+  #
+  # `grep -rn "reliability" .github/workflows/` não retornava uma linha: o
+  # harness da #510, os cenários FI-04..FI-07 (fatia B) e FI-17/FI-18 (fatia C)
+  # rodavam só na máquina de quem os escreveu. Um harness de injeção de falha
+  # que não roda no CI não impede regressão nenhuma — ele só documenta que
+  # alguém, um dia, conseguiu quebrar o código de propósito.
+  #
+  # POR QUE UM JOB PRÓPRIO, e não um passo do `integration`:
+  #
+  #  - a lane sobe RÉPLICAS DE PROCESSO e as mata com `SIGKILL`. Misturar isso
+  #    com a suíte de integração no mesmo runner faz um crash proposital
+  #    disputar o mesmo Postgres de specs que não esperam por ele;
+  #  - o tempo é dominado por PRAZO, não por CPU: FI-18 leva ~17 s porque
+  #    espera o TTL de 6 s da lease vencer. Em matriz de dois Nodes isso é
+  #    tempo de fila desperdiçado — este job roda em UM Node só, o piso
+  #    (22.18), que é o que a imagem de produção resolve;
+  #  - quando a matriz FI-01..FI-25 crescer, este job cresce sozinho, sem
+  #    empurrar o caminho crítico de toda PR.
+  #
+  # O PISO É O QUE TORNA ESTE JOB UM GATE. Sem `TEST_DB_URL` (ou com
+  # `DATABASE_URL` divergente dela) TODA a lane faz `describe.skip` e reporta
+  # `executados=0 pulados=N` com exit 0 — exatamente o verde vazio que a #510
+  # existe para eliminar. Por isso o passo do guard vem depois e usa
+  # `--max-pulados 0`: nesta lane NENHUM skip é legítimo.
+  reliability:
+    name: fault injection (#510)
+    runs-on: ubuntu-latest
+    # Generoso de propósito: os cenários esperam prazos de lease de verdade, e
+    # um timeout apertado transformaria "a lease demorou" em falha de CI.
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: maia_test
+          POSTGRES_PASSWORD: test1234
+          POSTGRES_DB: maia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U maia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      # `DATABASE_URL` e `TEST_DB_URL` precisam ser IGUAIS: os cenários exigem
+      # `process.env.DATABASE_URL === process.env.TEST_DB_URL` antes de rodar
+      # (ver `fi-outbound-entrega.spec.ts`). Divergir aqui não quebra o job —
+      # ele PULA tudo, e é o guard no fim que transforma isso em vermelho.
+      DATABASE_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      TEST_DB_URL: postgres://maia_test:test1234@localhost:5432/maia_test
+      POSTGRES_USER: maia_test
+      POSTGRES_PASSWORD: test1234
+      POSTGRES_DB: maia_test
+      REDIS_URL: redis://localhost:6379
+      ANTHROPIC_API_KEY: sk-ant-test-placeholder
+      OPENROUTER_API_KEY: sk-or-test-placeholder
+      WHATSAPP_NUMBER_MAIA: '+5500000000000'
+      OWNER_TELEFONE_WHATSAPP: '+5511111111111'
+      OWNER_NOME: Test Owner
+      VOYAGE_API_KEY: test-voyage-key
+      ALERT_CHANNELS: log
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # UM Node só, o piso. Ver o comentário do job sobre por que a matriz
+          # não vale aqui.
+          node-version: '22.18'
+          cache: 'npm'
+
+      - name: Pin npm to 11.5.2
+        run: npm install -g npm@11.5.2
+
+      - name: Assert npm version
+        run: test "$(npm --version)" = "11.5.2"
+
+      - name: Node version guard (readable message)
+        run: node scripts/check-node.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply migrations
+        # O harness cria e migra o banco DELE a partir desta base; as
+        # migrations aqui garantem que a base existe e está no schema atual
+        # antes de qualquer cenário.
+        run: npm run db:migrate
+
+      - name: Lane de fault injection (#510)
+        env:
+          VITEST_SUMMARY_FILE: .ci-test-summary/reliability.txt
+        # `--retry=0` já está no script: um cenário de corrida que "passa na
+        # segunda tentativa" é precisamente o defeito que ele deveria denunciar.
+        run: npm run test:reliability
+
+      - name: Piso de volume da lane de fault injection
+        # BLOQUEANTE, e aqui ele é a diferença entre um gate e um teatro:
+        # a lane inteira faz `describe.skip` sem banco e sai 0. `--max-pulados 0`
+        # porque nesta lane não existe skip legítimo — se a infraestrutura
+        # obrigatória faltou, o job tem de FALHAR, não pular.
+        run: node scripts/check-vitest-summary.ts .ci-test-summary/reliability.txt --min 1 --max-pulados 0 --rotulo "fault injection (#510)"
+
+      - name: Artefatos do harness (só quando reprova)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-artifacts
+          path: tests/reliability/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Resumo dos testes
         if: always()
         continue-on-error: true
         run: |
@@ -882,6 +1131,20 @@ jobs:
         # rodada tenha executado pelo menos `TEST_ADMIN_UI_MIN_TESTS` testes e
         # NENHUM pulado.
         #
+        # O script sobe DOIS processos. O console não gera QR nem código de
+        # pareamento — `channelLines.startPairing` grava um COMANDO em
+        # `channel_line_state` e devolve; quem abre a sessão e produz o
+        # material é o worker `channel_pairing`, que vive no RUNTIME. Enquanto
+        # o job subia um processo só, quatro casos da jornada de pareamento
+        # ficavam fora do gate. Agora `scripts/admin-ui-e2e.sh` também sobe
+        # `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts`
+        # (`MAIA_PROCESS_ROLE=scheduler`, `MAIA_SCHEDULER_GROUPS=channel`),
+        # compartilhando `DATABASE_URL`, `REDIS_URL` e o keyring gerado
+        # abaixo. O adapter de canal é FALSO — a #518 proíbe linha WhatsApp
+        # real no CI — e ele é injetado na CONSTRUÇÃO do LineSessionManager
+        # por aquele entrypoint, NUNCA por chave de configuração: ver
+        # `tests/unit/gateway/pairing-adapter-seam.spec.ts`.
+        #
         # Desde a #623 o script também SEMEIA as fixtures das jornadas
         # (`scripts/seed-admin-ui-e2e-fixtures.ts`) antes de subir o servidor —
         # é o que faz o projeto `smoke` incluir as jornadas autenticadas do
@@ -996,32 +1259,69 @@ jobs:
           # Prefixo `TEST_` de propósito — ver o comentário no topo do job e
           # `scripts/admin-ui-e2e.sh`.
           #
-          # 27 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
+          # 35 = os 5 do boot + as 22 das JORNADAS que saíram da quarentena na
           # #623 (inbox, detalhe de proposta, aprovação simples e dupla,
           # rejeição, trava de arquitetura, trilha de auditoria, drift, traces
-          # e versões). O piso não é cosmético: sem ele, um `grep` que deixasse
-          # de casar faria a rodada executar só o boot e o job continuaria
-          # verde — que é exatamente como a quarentena passou despercebida.
-          # `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este número
-          # contra a contagem de casos das specs FORA da quarentena.
-          TEST_ADMIN_UI_MIN_TESTS: '27'
-        run: npm run test:admin-ui:e2e:ci
+          # e versões) + os 4 de `channel-lines.spec.ts` (listagem da linha
+          # declarada, recusa ao papel `viewer` com o seu caso de controle, e a
+          # degradação fechada diante de material ilegível) + os 4 de
+          # `channel-lines-pairing.spec.ts`, que SAÍRAM da quarentena quando
+          # este passo passou a subir um runtime com adapter de canal falso. A
+          # quarentena está VAZIA. O piso não é cosmético: sem ele, um `grep`
+          # que deixasse de casar faria a rodada executar só o boot e o job
+          # continuaria verde — que é exatamente como a quarentena passou
+          # despercebida. `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este
+          # número contra a contagem de casos das specs FORA da quarentena.
+          TEST_ADMIN_UI_MIN_TESTS: '35'
+        # ─────────────────────────────────────────────────────────────────
+        # O KEYRING É GERADO AQUI — nunca literal no bloco `env:` acima
+        # ─────────────────────────────────────────────────────────────────
+        # `MAIA_STAGING_KEYRING` é MATERIAL DE CHAVE. O bloco `env:` de um
+        # workflow entra na HISTÓRIA do repositório, e é a história que o
+        # gitleaks varre: uma chave commitada aqui não sai mais de lá nem
+        # revertendo o commit. Por isso ela nasce no passo, efêmera, e morre
+        # com o runner.
+        #
+        # Ela precisa existir porque o pareamento atravessa DOIS processos: o
+        # worker `channel_pairing` do runtime SELA o QR/código com esta chave
+        # (`sealPairingMaterial`) e o console o ABRE com ela
+        # (`openPairingMaterial`). Chaves diferentes = envelope que não abre =
+        # `material: null` na tela. `export` (e não `env:`) é o que faz
+        # `scripts/admin-ui-e2e.sh` repassá-la aos dois filhos.
+        #
+        # `add-mask` é rede de segurança, não a proteção: se qualquer processo
+        # imprimir o valor, o log do job sai redigido.
+        run: |
+          MAIA_STAGING_ACTIVE_KEY_ID=e2e
+          CHAVE_E2E="$(openssl rand -base64 32)"
+          echo "::add-mask::$CHAVE_E2E"
+          MAIA_STAGING_KEYRING="{\"e2e\":\"$CHAVE_E2E\"}"
+          export MAIA_STAGING_ACTIVE_KEY_ID MAIA_STAGING_KEYRING
+          npm run test:admin-ui:e2e:ci
 
       - name: Quarentena da suíte e2e (o que NÃO foi medido)
-        # Nunca reprova: é legibilidade. Depois da #623 sobrou UMA spec fora do
-        # gate, e não por sessão nem por fixture: o QR e o código de pareamento
-        # são produzidos pelo worker `channel_pairing` do RUNTIME, e este job
-        # sobe só o console. O cabeçalho de `channel-lines-pairing.spec.ts` tem
-        # a medição e o critério objetivo de saída; a lista é fixada em
-        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então ela não pode crescer
-        # em silêncio.
+        # Nunca reprova: é legibilidade. Desde que este job passou a subir um
+        # runtime com adapter de canal falso, a quarentena está VAZIA — as dez
+        # jornadas do console são gate bloqueante, pareamento incluído.
+        #
+        # O passo CONTINUA existindo, e o mecanismo também (a tag, o
+        # `grepInvert` do projeto `smoke`, a lista de
+        # `tests/unit/ci/admin-ui-e2e-gate.spec.ts`): "não há nada em
+        # quarentena hoje" é uma afirmação que precisa ser reconferida a cada
+        # execução, e um passo apagado não reconfere nada. Marcar um `describe`
+        # de novo volta a aparecer aqui e reprova o guard.
         if: always()
         continue-on-error: true
         run: |
-          echo "specs fora do gate (@pendente-runtime — dependem de um runtime Maia no job):"
+          echo "specs fora do gate (@pendente-runtime — dependeriam de infra que este job não tem):"
           # Casa a TAG no título do describe (o que o grep do Playwright vê),
-          # não uma menção ao identificador em comentário.
-          grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts
+          # não uma menção ao identificador em comentário. `grep -l` sai 1
+          # quando não acha nada, e é esse o caso ESPERADO hoje.
+          if grep -lE '^test\.describe\(.*@pendente-runtime' tests/admin-ui/e2e/*.spec.ts; then
+            echo "^^ acima: specs que o gate NÃO mediu."
+          else
+            echo "(nenhuma — a quarentena está vazia)"
+          fi
 
       - name: Relatório do Playwright (só quando reprova)
         if: failure()

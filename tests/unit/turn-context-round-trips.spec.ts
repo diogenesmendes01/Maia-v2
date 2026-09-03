@@ -43,14 +43,11 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *     `INNER` é literalmente o `if (!profile) continue` que a resolução em JS
  *     fazia — nenhuma checagem de autorização foi pulada.
  *
- * Nenhuma das três muda o que o prompt diz; as três são duplicação ou espera.
- *
- * `TURN_ROUND_TRIP_TARGET` (8) NÃO foi atingida, e a última asserção deste
- * arquivo afirma a distância exata. O motivo está medido em
- * `src/agent/turn-context/types.ts` e em `docs/architecture/modules/agent.md`:
- * as 4 idas que faltam só saem fundindo tabelas num `UNION ALL`, e fundir
- * leituras que já são CONCORRENTES alonga o `max()` que define a latência do
- * turno em vez de encurtá-lo — medido, com o p95 triplicando.
+ * Neither changes what the prompt says; both are pure duplication removal.
+ * The old ≤8 goal (`TURN_ROUND_TRIP_TARGET`) was RETIRED by the #525 owner
+ * decision (2026-09-02): the goal is latency now, and the count survives only
+ * as the O(1)-growth guardrail this file (and the gate) enforce. See the
+ * module doc and `src/agent/turn-context/types.ts`.
  */
 
 type Counters = Record<string, number>;
@@ -157,10 +154,7 @@ vi.mock('../../src/lib/logger.js', () => ({
 
 import { buildPrompt, renderTurnPrompt, type PromptContext } from '../../src/agent/prompt-builder.js';
 import { loadTurnContext } from '../../src/agent/turn-context/loader.js';
-import {
-  TURN_ROUND_TRIP_BUDGET,
-  TURN_ROUND_TRIP_TARGET,
-} from '../../src/agent/turn-context/types.js';
+import { TURN_ROUND_TRIP_BUDGET } from '../../src/agent/turn-context/types.js';
 import { resolveScope, type ResolvedPermission } from '../../src/governance/permissions.js';
 
 let permissoesFixture: Permissao[] = [];
@@ -452,18 +446,19 @@ describe('#525 turn round-trip budget', () => {
     });
   });
 
-  it('the declared budget is above the goal issue #525 still targets', () => {
-    // Contabilidade honesta, e não um tique verde numa meta não cumprida: o
-    // teto que esta suíte impõe é 12, a meta é 8, e a distância é QUATRO. As
-    // quatro fusões que faltam foram implementadas e MEDIDAS — elas triplicam o
-    // p95, porque fundem leituras que já eram concorrentes. O porquê está em
-    // `src/agent/turn-context/types.ts` e em `docs/architecture/modules/agent.md`.
-    //
-    // Afirmar a distância EXATA (e não `>`) é o que impede as duas saídas
-    // fáceis: arredondar a meta para "perto o bastante", e acomodar uma leitura
-    // nova subindo o orçamento sem que ninguém repare que a distância cresceu.
+  it('the declared budget is the measured count, and the ≤8 goal stays retired', async () => {
+    // Honest bookkeeping, after the #525 owner decision (2026-09-02): the
+    // budget is the MEASURED count this suite enforces exactly (the O(1)
+    // guardrail against a silent N+1), not a goal. The old ≤8 target
+    // (`TURN_ROUND_TRIP_TARGET`) was retired — the acceptance criterion is
+    // latency, judged by the gate (`npm run turn:bench`). If someone
+    // re-exports the constant, this test is the place that must be argued
+    // with first. This change fuses the two scope reads into one
+    // (`forPessoaComProfile`), so the measured count drops 13 -> 12; the
+    // number here moves ONLY together with a measured change, in the same
+    // diff — that is the whole point of the guardrail.
     expect(TURN_ROUND_TRIP_BUDGET).toBe(12);
-    expect(TURN_ROUND_TRIP_TARGET).toBe(8);
-    expect(TURN_ROUND_TRIP_BUDGET - TURN_ROUND_TRIP_TARGET).toBe(4);
+    const types = await import('../../src/agent/turn-context/types.js');
+    expect('TURN_ROUND_TRIP_TARGET' in types).toBe(false);
   });
 });

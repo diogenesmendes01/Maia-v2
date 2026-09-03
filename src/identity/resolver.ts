@@ -11,6 +11,7 @@ import {
   buildAudienceContext,
   type AudienceContext,
 } from '@/identity/audience-context.js';
+import { instrumentIdentityResolve } from '@/observability/instrumentation.js';
 
 export type ResolvedIdentity = {
   kind: 'resolved';
@@ -33,7 +34,28 @@ export type ResolveResult =
   | { kind: 'blocked'; pessoa: Pessoa; reason: string }
   | { kind: 'quarantined'; pessoa: Pessoa };
 
-export async function resolveIdentity(input: {
+/**
+ * Issue #535 — span `identity.resolve`.
+ *
+ * Envelopado AQUI, e não no call site de `agent/core.ts`, porque o resolver tem
+ * mais de um chamador de produção (a entrada do turno e os fluxos de
+ * quarentena). Instrumentar os chamadores seria a mesma cópia-que-diverge que
+ * os códigos de erro do dispatcher deixaram de ser — e o span que faltasse num
+ * deles apareceria como "essa etapa não rodou".
+ *
+ * Mesmo desenho de `dispatchTool`/`dispatchToolInner`: a função exportada é o
+ * envelope, o corpo fica intacto. O telefone que ela recebe NUNCA vira atributo
+ * — está na deny list de span e é o valor mais sensível deste caminho; o que
+ * sai é o `kind` do desfecho, quatro membros.
+ */
+export function resolveIdentity(input: {
+  telefone_whatsapp: string;
+  channel_id?: string | null;
+}): Promise<ResolveResult> {
+  return instrumentIdentityResolve(() => resolveIdentityInner(input));
+}
+
+async function resolveIdentityInner(input: {
   telefone_whatsapp: string;
   /**
    * Fase 0 (spec roteamento v4 §1.6): canal (linha) que recebeu o inbound. A

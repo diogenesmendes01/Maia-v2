@@ -4,20 +4,29 @@ import { workflowsRepo, workflowStepsRepo, pessoasRepo } from '@/db/repositories
 import type { Pessoa } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
-import { forCurrentAgentChannel } from '@/gateway/line-output.js';
-import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
+import { enqueueProactiveNotice } from '@/runtime/outbound/proactive-notice.js';
 import { listOwners } from '@/governance/permissions.js';
 
 /**
- * Fase 0 (spec roteamento v4 §1.6) — notificações 4-eyes saem pela fronteira
- * única. Proativo sem conversa: resolve o canal único ativo do agente
- * (fail-closed em ambiguidade; os catch dos call sites mantêm o best-effort).
+ * Issue #506 — a notificação 4-eyes vira LINHA DE LEDGER.
+ *
+ * O que havia aqui: `forCurrentAgentChannel(null)` + `line.sendText(...)` sob
+ * exceção de egresso declarada. O `containment` inventariado dizia a verdade
+ * sobre a metade fácil ("o workflow persistido é a fonte de verdade") e nada
+ * sobre a difícil: **um aprovador que não recebe o aviso não sabe que existe
+ * algo a aprovar.** O workflow ficava pendurado até expirar, e o expirado é a
+ * única evidência que sobrava — bem depois de o pedido ter deixado de importar.
+ *
+ * Agora o aviso é comprometido em `outbox_messages` ANTES de qualquer chamada
+ * ao canal, com claim/backoff/DLQ do drain de agendamento, e a chave de dedupe
+ * derivada do UUID do workflow garante um aviso por aprovador — para sempre.
+ *
+ * `enqueueProactiveNotice` deixa o canal implícito (canal ÚNICO ativo do agente,
+ * fail-closed em ambiguidade), que é exatamente o que `forCurrentAgentChannel(null)`
+ * fazia. Os `catch` dos call sites continuam mantendo o best-effort.
  */
-async function sendViaLine(jid: string, text: string): Promise<string | null> {
-  const line = await forCurrentAgentChannel(null);
-  // #634 — exceção INVENTARIADA (`workflows.dual_approval`): destinatários são os
-  // APROVADORES, não o interlocutor do turno; o workflow persistido é a verdade.
-  return withDeclaredEgressException('workflows.dual_approval', () => line.sendText(jid, text));
+async function enqueueNotice(jid: string, text: string, dedupe_key: string): Promise<void> {
+  await enqueueProactiveNotice({ jid, text, dedupe_key });
 }
 
 export const DualApprovalContext = z.object({
@@ -97,8 +106,8 @@ async function notifyApprovers(input: {
   const text = `Solicitação 4-eyes (DA-${input.workflow_id.slice(0, 8)}): ${input.reason}\nResponda 'aprova DA-${input.workflow_id.slice(0, 8)}' para confirmar, ou 'recusa DA-${input.workflow_id.slice(0, 8)}' para rejeitar.`;
   for (const o of owners) {
     const jid = o.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-    await sendViaLine(jid, text).catch((err) =>
-      logger.warn({ err, pessoa_id: o.id }, 'dual_approval.notify_failed'),
+    await enqueueNotice(jid, text, `dual_approval:${input.workflow_id}:notify:${o.id}`).catch(
+      (err) => logger.warn({ err, pessoa_id: o.id }, 'dual_approval.notify_failed'),
     );
   }
 }
@@ -144,15 +153,29 @@ export async function expireDueDualApprovals(): Promise<number> {
     if (wf.tipo !== 'dual_approval') continue;
     if (!wf.proxima_acao_em) continue;
     if (new Date(wf.proxima_acao_em) > new Date()) continue;
-    await workflowsRepo.setStatus(wf.id, 'cancelado');
+    // O cancelamento é um COMPARE-AND-SWAP, e o que vem depois dele só roda se
+    // esta chamada tiver sido a vencedora.
+    //
+    // Motivo: `expireDueDualApprovals()` tem DOIS disparadores — o job
+    // `pending_expirer` e o `workflow_engine_tick`. Com o `setStatus`
+    // incondicional que havia aqui, os dois venciam o mesmo workflow, auditavam
+    // duas vezes e mandavam ao solicitante a mensagem de expiração DUAS VEZES.
+    // Não era um risco de duas réplicas: acontecia dentro de um processo só.
+    //
+    // A checagem de prazo em JavaScript acima continua, mas só como filtro
+    // barato: quem decide é o `proxima_acao_em <= now()` DENTRO do CAS, com o
+    // relógio do banco.
+    const venceu = await workflowsRepo.expireIfDue(wf.id);
+    if (!venceu) continue;
     await audit({ acao: 'dual_approval_timeout', alvo_id: wf.id });
     const ctx = wf.contexto as DualApprovalCtx;
     const requester = await pessoasRepo.findById(ctx.requester_pessoa_id);
     if (requester) {
       const jid = requester.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-      await sendViaLine(
+      await enqueueNotice(
         jid,
         `Solicitação DA-${wf.id.slice(0, 8)} expirou (${config.DUAL_APPROVAL_TIMEOUT_HOURS}h sem segunda confirmação). Tente novamente.`,
+        `dual_approval:${wf.id}:expired`,
       ).catch(() => undefined);
     }
     count++;

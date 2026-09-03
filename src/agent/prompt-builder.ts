@@ -41,6 +41,7 @@ import { sanitizeBlock } from './sanitize.js';
 import { hashScope } from './scope-hash.js';
 import { applyBudget, truncateUtf8, utf8Bytes } from './turn-context/budget.js';
 import { loadTurnContext, type TurnContextSnapshot } from './turn-context/loader.js';
+import { instrumentPromptRender } from '@/observability/instrumentation.js';
 import {
   recordSectionStatus,
   recordTurnContextLoad,
@@ -710,7 +711,27 @@ function buildCapacidadeAdquiridaSection(
  * frame, and the count is reported from `finally` so a throwing build still
  * publishes what it spent before failing.
  */
+/**
+ * Issue #535 — span `prompt.render`.
+ *
+ * É também o span que finalmente dá um pai REAL a `context.load`:
+ * `loadTurnContext` é chamado logo abaixo, então `SPAN_PARENT[CONTEXT_LOAD]`
+ * foi corrigido de `turn` para `prompt.render` na mesma mudança. O par é a
+ * coisa mais útil da waterfall num turno lento — ele separa "gastamos o tempo
+ * LENDO estado" de "gastamos MONTANDO o prompt", que têm correções opostas.
+ *
+ * O envelope é o mais externo de propósito: `runWithQueryCounter` e o
+ * `recordTurnContextLoad` do `finally` fazem parte da montagem, e deixá-los
+ * fora do span faria a duração mentir para menos.
+ *
+ * `item_count` é o número de mensagens renderizadas. Um NÚMERO — não pode
+ * carregar conteúdo, e é limitado pela janela de histórico.
+ */
 export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
+  return instrumentPromptRender(() => buildPromptInner(ctx));
+}
+
+async function buildPromptInner(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
   const started_at = Date.now();
   return runWithQueryCounter(async (counter) => {
     let result: TurnContextResult = 'ok';

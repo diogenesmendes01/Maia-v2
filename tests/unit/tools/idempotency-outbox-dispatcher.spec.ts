@@ -108,6 +108,11 @@ const { effectTool, plainTool, toolState } = vi.hoisted(() => {
   const mkTool = (name: string, withEffect: boolean) => ({
     name,
     operation_type: withEffect ? 'communicate' : 'create',
+    // #507 — o dispatcher consulta a classe de efeito para decidir o que dizer
+    // sobre um cancelamento tardio. A tool sintética declara a sua como
+    // qualquer tool real declara; o registro real recusa quem não declara.
+    side_effect: withEffect ? 'communication' : 'write',
+    effect_class: 'non_interruptible',
     required_actions: [],
     audit_action: 'fake_action',
     input_schema: { safeParse: (v: unknown) => ({ success: true as const, data: v }) },

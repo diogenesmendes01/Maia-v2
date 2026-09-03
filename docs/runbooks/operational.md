@@ -1359,11 +1359,49 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 
 `npm run turn:bench` roda o gate que o dono fixou para a #525: Postgres real,
 pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades,
-braços `cold` e `warm`. Ele **exercita `buildPrompt`** — o call site de produção,
-que é quem publica `maia_turn_context_load_duration_ms{phase="loader"}`.
+braços `cold` e `warm`. Ele exercita o **turno inteiro** — `resolveScope`
+(`src/governance/permissions.ts`) seguido de `buildPrompt`
+(`src/agent/prompt-builder.ts`, quem publica
+`maia_turn_context_load_duration_ms{phase="loader"}`) —, os dois call sites de
+produção, dentro do mesmo relógio.
+
+> ### O que a #700 mudou (e o que continua valendo)
+>
+> Até a #700 este gate media um orçamento **PARCIAL**: `buildContext` fabricava
+> o escopo em memória e a massa não semeava `permissoes` nem
+> `permission_profiles`, então uma regressão que morasse no `resolveScope`
+> passava sem ser vista. O critério "aceite completo do orçamento do turno"
+> saía `n/a` e a corrida reprovava por contenção — `exit 1` significava "não
+> demonstrado".
+>
+> **Agora o escopo é resolvido no Postgres, dentro do relógio.** A massa semeia
+> TRÊS pessoas por par — uma com 1, outra com 10, outra com 100 linhas em
+> `permissoes`, cada permissão apontando para um `permission_profiles`
+> distinto (100 por par, sob o teto de 500 do `profilesRepo.byIds`). A
+> cardinalidade 1/10/100 do enunciado passou a ser o tamanho do escopo
+> RESOLVIDO, não uma fatia em memória.
+>
+> Três critérios por braço são a evidência disso, e reprovam a corrida se ela
+> sumir: as **2 leituras** do escopo em todo turno, o **escopo resolvido**
+> batendo com a massa (1–100), e o **p95 do estágio**. O critério agregado
+> ("aceite completo do orçamento do turno") lê esses NÚMEROS — virar a flag
+> `COBERTURA_DA_MEDICAO.resolve_scope_medido` sem a medição produz um critério
+> avaliado e **reprovado**, não uma aprovação.
+>
+> **Os números anteriores continuam identificados pela cobertura que os
+> produziu.** O fingerprint carimba `cobertura`, então um baseline gravado como
+> `buildPrompt-sem-resolveScope` é **RECUSADO** para comparação com uma corrida
+> `resolveScope+buildPrompt` — não estimado, não convertido. Na prática: **todo
+> baseline anterior à #700 precisa ser re-gravado** (`--mode measure
+> --sustain-s 60 --write-baseline`), e até lá o critério relativo sai `n/a` e o
+> gate reprova dizendo exatamente isso.
+>
+> Um número medido sob a cobertura antiga **não pode** ser reapresentado como
+> medição do turno completo — nem em PR, nem aqui, nem em relatório arquivado.
 
 Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
-escreve ~13 mil linhas de massa e devolve o veredicto por **exit code**.
+escreve ~40 mil linhas de massa (a massa por pessoa triplicou na #700, mais
+`permissoes` e `permission_profiles`) e devolve o veredicto por **exit code**.
 
 ### Pré-requisitos
 
@@ -1401,11 +1439,18 @@ pelo critério relativo. Se você quer medir sem ter a evidência completa, o mo
 npm run turn:bench -- --sustain-s 60
 
 echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
+#
+# Numa máquina sem baseline da cobertura ATUAL (`resolveScope+buildPrompt`), 1
+# é o resultado esperado: o critério relativo sai `n/a` e não avaliado reprova.
+# Grave o baseline com o MESMO comando (--mode measure --write-baseline) antes
+# de ler o exit code como regressão.
 ```
 
 Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
 Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
-comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+comportamento correto: o gate promete os critérios relativos (p95/p99 ≤
+baseline × 1.10, throughput ≥ baseline × 0.90 — margem nomeada em
+`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`) e não pode carimbar
 o que não mediu. Para medir sem baseline, use `--mode measure`.
 
 Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
@@ -1418,14 +1463,21 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
 | `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
+| `o resolveScope foi EXERCITADO: ≥1 leitura de escopo por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem as tabelas do escopo, ou as leituras fora do `instrumentAll`) | leia o número no detalhe. `0–0` é medição ausente, não desempenho. O número em si é dado medido (2 na `main`, 1 com a fusão da #693) — decisão da #525 |
+| `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N. `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu. O teto absoluto é linha de relatório, não critério |
+| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada pelo teto de 500 do `profilesRepo.byIds` |
+| `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` (ou `scope_permissoes_com_profile`, na árvore da #693) na tabela "latência por leitura" |
+| `aceite completo do orçamento do turno` **vermelho** | a flag de cobertura diz que mede e os números dizem que não | é o caso "a flag não prova a si mesma": o detalhe traz os três números medidos. Não vire a flag — conserte a medição |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
 | `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
 | `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
 | `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
 | `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
-| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
-| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
+| `p95 ≤ baseline × 1.10` / `p99 ≤ baseline × 1.10` **vermelho** | regressão relativa de latência — o critério PRINCIPAL desde a decisão da #525 | ver "baseline" abaixo antes de culpar o código |
+| `throughput ≥ baseline × 0.90` **vermelho** | a vazão caiu além da margem — latência paga com fila | compare a linha `throughput (turnos/s)` dos dois relatórios |
+| `latência por cardinalidade ≤ baseline × 1.10` **vermelho** | a regressão mora numa cardinalidade só (tenant "elefante") | o detalhe diz qual N regrediu; olhe a tabela por cardinalidade |
+| critérios relativos **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga (ou formato < v4, sem throughput/cardinalidade) | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
 | `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
 
 ### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
@@ -1523,6 +1575,7 @@ O baseline grava a FORMA da corrida que o produziu, e a comparação é **recusa
 | `pool_max` | o denominador da saturação. Pool 10 e pool 20 são dois sistemas |
 | `max_concurrent_reads` | `TURN_CONTEXT_MAX_CONCURRENT_READS`, lido do código |
 | `turns` · `sustain_s` | a duração amortiza o transiente de aquecimento. Mesmo host, mesmo código, minutos de intervalo: 600 turnos (5,7 s) → p95 **118,6 ms**; 60 s sustentados (7 389 turnos) → p95 **22,4 ms**. 5× de diferença por duração de corrida |
+| `cobertura` | **a FRONTEIRA medida** (#700). `buildPrompt-sem-resolveScope` e `resolveScope+buildPrompt` medem coisas diferentes; o delta entre eles não é regressão nem melhoria, é troca de régua. Todo baseline anterior à #700 é recusado por este campo |
 
 Registrados mas **não** comparados, de propósito — um fingerprint que invalida o
 baseline a cada corrida vira ruído que o operador aprende a ignorar: `host` e
@@ -1555,6 +1608,12 @@ npm run turn:bench -- --self-test --inject cold.errors=1           # exit 1
 npm run turn:bench -- --self-test --inject pool_samples=0          # exit 1 — zero amostras não é "drenou"
 npm run turn:bench -- --self-test --self-test-baseline missing     # exit 1 — sem baseline não há gate
 npm run turn:bench -- --self-test --self-test-baseline incompatible # exit 1 — baseline de outra carga
+
+# O estágio `resolveScope` (#700) — as quatro regressões que o gate tem que ver:
+npm run turn:bench -- --self-test --inject scope_reads_per_turn_min=0     # exit 1 — escopo fabricado em memória
+npm run turn:bench -- --self-test --inject scope_reads_per_turn_max=101   # exit 1 — N+1 no caminho do escopo
+npm run turn:bench -- --self-test --inject scope_cardinality_mismatches=1 # exit 1 — escopo ≠ massa semeada
+npm run turn:bench -- --self-test --inject cold.scope_p95_ms=900          # exit 1 — degradação NO resolveScope
 ```
 
 `--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
@@ -1564,10 +1623,29 @@ host não prova nada. A bateria completa (todos os critérios, incluindo pico ba
 demais, pool que nunca drena, amostragem cega e baseline incompatível) vive em
 `tests/unit/scripts/turn-context-gate.spec.ts` e roda na suíte normal.
 
+A sonda que prova a MEDIÇÃO — e não o avaliador — é
+`tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts`: ela roda um
+turno de verdade (`runTurnOnce`) contra o `resolveScope` de produção com os
+repositórios dublados, conta as leituras pelo MESMO frame que `runArm` usa e
+alimenta o veredicto com o que o contador produziu. Fica vermelha se o escopo
+voltar a ser fabricado em memória, se as leituras saírem do `instrumentAll`, ou
+se o escopo resolvido deixar de ter a cardinalidade semeada.
+
+Ela também defende a **fronteira do cronômetro**, que é outra coisa: o
+`resolveScope` pode estar sendo executado e contado e ainda assim ficar FORA do
+número que o gate julga. A duração do turno é calculada num lugar só
+(`measureTurn`, no próprio harness), e a sonda cobra a aritmética — com relógio
+injetado (`turno = escopo + prompt`, valores exatos) e com relógio real (o
+estágio domina o turno; `ms ≥ scope_ms`). Subtrair o estágio do relógio do turno
+restauraria a cobertura antiga sem mexer em contador, flag ou cardinalidade — e
+é exatamente isso que esses casos pegam.
+
 ### Massa e limpeza
 
 Tudo que o harness cria usa `tenant_id` com prefixo `bench525-` e é removido no
-`finally` e também em `SIGINT`/`SIGTERM`. Se uma corrida morreu de um jeito que
+`finally` e também em `SIGINT`/`SIGTERM`. Desde a #700 isso inclui `permissoes`
+e `permission_profiles` — a segunda é removida DEPOIS da primeira, porque a FK
+entre elas não é `ON DELETE CASCADE`. Se uma corrida morreu de um jeito que
 não deixou nada rodar:
 
 ```bash

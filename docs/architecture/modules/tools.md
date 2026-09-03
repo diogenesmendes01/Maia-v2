@@ -10,6 +10,7 @@
 |---|---|
 | `src/tools/_registry.ts` | Aggregated tool registry — every callable surface |
 | `src/tools/_dispatcher.ts` | Routes typed intent → tool handler |
+| `src/tools/effect-class.ts` | Semântica de cancelamento por ferramenta + o validador que RECUSA definição incompleta (#507) |
 | `src/tools/schema-json.ts` | Canonical Zod → JSON Schema converter for LLM exposure (#509) |
 | `src/lib/tool-schema-provider.ts` | Per-provider envelope + strict-mode capability matrix (#509) |
 | `src/tools/_vision-cache.ts` | Per-tenant vision-result cache |
@@ -146,6 +147,69 @@ model-facing payload only. Zod validation, every gate, the schema generation and
 the CI lint stay active in both positions. The flag is temporary — remove it
 with the `LEGACY_GENERIC_INPUT_SCHEMA` branch in `_registry.ts`.
 
+## Classificação de efeito e cancelamento honesto (issue #507)
+
+Toda ferramenta declara **uma** classe de efeito. O campo é obrigatório no tipo
+`Tool<I,O>` e revalidado no carregamento de `_registry.ts`: uma ferramenta sem
+classificação **derruba o processo**, não emite um aviso. Isso é o que garante
+que a próxima ferramenta, escrita por quem nunca leu esta issue, não nasça sem
+classificação.
+
+| Classe | Significa | Cancelamento tardio produz | Reconciliação |
+|---|---|---|---|
+| `abort_safe` | cancelar não deixa nada para reconciliar (leituras, parses, atos de fala) | `turn_ownership_lost` | nenhuma |
+| `idempotent` | o efeito PRÓPRIO converge — repetir leva ao mesmo estado | `effect_unknown` | `replay_idempotency_key` |
+| `compensatable` | pode ficar incerta, mas há compensação nomeada em `compensated_by` | `effect_unknown` | `compensate` |
+| `non_interruptible` | uma vez iniciada, o resultado pode ficar incerto, sem repetição segura | `effect_unknown` | `manual_reconciliation` |
+
+O que o registro RECUSA (`assertToolDefinitionsComplete`):
+
+- `effect_class` ausente ou fora do conjunto fechado;
+- `side_effect: 'write'` declarado junto com `abort_safe` — contradição interna;
+- `compensatable` sem `compensated_by`, ou apontando para uma ferramenta que não
+  existe no registro — compensação sem compensador é dívida declarada;
+- `compensated_by` em quem não é `compensatable` — campo que ninguém lê envelhece
+  mentindo.
+
+### `effect_unknown` nunca nasce `retryable`
+
+Retry de um efeito que talvez tenha acontecido é duplicata. A regra é do tipo,
+não da convenção: `ToolCancellationVerdict` só admite `retryable: true` no ramo
+`cancelled`. No ledger ela vira comportamento — a reserva de idempotência é
+marcada `failed`, então a MESMA chave falha rápido em vez de reexecutar sozinha.
+
+O contraste com `abort_safe` é o que faz a classificação classificar alguma
+coisa: ali a reserva é ABANDONADA (row apagada), porque marcá-la terminal negaria
+serviço ao worker que TEM a posse por uma execução que não deixou nada.
+
+### Os dois pontos de checagem
+
+O sinal e o orçamento são conferidos **antes da autorização** (assim que a
+ferramenta é resolvida, antes de grant, regras constitucionais, `canAct` e claim
+de aprovação) e **imediatamente antes do handler**. Uma checagem só na entrada
+seria uma fotografia: entre os dois pontos o dispatcher espera por grant, cache,
+aprovação e reserva atômica, e tanto a posse quanto o relógio podem mudar em
+qualquer uma dessas janelas.
+
+O orçamento mínimo depende da classe: quem pode deixar efeito precisa também da
+folga para PERSISTIR que ele aconteceu (completar a reserva, gravar o outbox,
+auditar). Começar um efeito sem esse tempo é fabricar `effect_unknown` de
+propósito. A recusa por prazo tem vocabulário próprio (`turn_deadline_exceeded`)
+e não se confunde com `turn_ownership_lost`: ali a tentativa deixou de ser nossa,
+aqui ela ainda é — o que acabou foi o tempo.
+
+### Ferramentas MCP
+
+São dinâmicas (vêm do banco) e por isso não declaram nada num arquivo. A classe
+delas é `MCP_TOOL_EFFECT_CLASS = 'abort_safe'`, e não por otimismo:
+`listExecutable` só devolve tool aprovada e read-only (fase v1 da #478). Quando
+a fase de escrita chegar, a classe precisa virar um campo por tool no catálogo.
+
+### Operação
+
+`docs/runbooks/tool-effect-unknown.md` — como reconciliar, o que o sistema já fez
+sozinho, e o que não fazer (spoiler: não reexecutar em massa).
+
 ## The capability chain (issues #410 + #408)
 
 The LLM-visible tool set is the product of a six-link chain. Each link is an
@@ -236,6 +300,9 @@ pack `risk_level` and the resolved `AudienceContext` (#407). `DataScope` in
 | `tests/unit/tools/tool-schema-exposure.spec.ts` | Payload of the three exposure surfaces + rollback flag (#509) |
 | `tests/unit/tools/tool-schema-provider.spec.ts` | Anthropic/OpenAI envelopes + strict-mode matrix (#509) |
 | `tests/unit/tools/tool-schema-dispatch-contract.spec.ts` | Provider-shaped args at the dispatch boundary (#509) |
+| `tests/unit/tools/effect-class-registry.spec.ts` | Vocabulário fechado, matriz de cancelamento e a SONDA que prova o registro recusando uma tool sem classificação (#507) |
+| `tests/unit/tools/dispatcher-effect-unknown.spec.ts` | Cancelamento tardio, resultado descartado, orçamento por classe (#507) |
+| `tests/integration/turn-effect-unknown-real-db.spec.ts` | Takeover REAL depois de a tool gravar: efeito existe, reserva fica `failed`, dívida auditada (#507) |
 | `tests/integration/tools/` | Tools that touch real Postgres / Redis |
 
 ## In-flight changes

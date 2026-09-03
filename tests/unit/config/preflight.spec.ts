@@ -105,7 +105,7 @@ function operatorOwnedKeys(composeService: string): Set<string> {
 }
 
 describe('config preflight — os .prod.example não escondem nenhuma chave (issue #572)', () => {
-  it('cobre os três serviços do compose, com TODOS os loaders que cada um avalia', () => {
+  it('cobre os CINCO serviços do compose, com TODOS os loaders que cada um avalia', () => {
     const report = preflightSobreOsExemplos();
     expect(
       report.services.map((s) => ({
@@ -117,6 +117,19 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
     ).toEqual([
       { compose: 'migrate', contracts: ['migrator'], envFiles: [], adminBootGates: false },
       { compose: 'app', contracts: ['runtime'], envFiles: ['.env.app'], adminBootGates: false },
+      // Issue #513 — os dois papéis do profile `split-roles`. Eles entram no
+      // preflight porque rodam a MESMA imagem e o MESMO loader do `app`: um
+      // `.env.app` que reprovasse só neles seria descoberto no boot, que é o
+      // modo de falha que um gate de bring-up não pode ter. Estarem aqui
+      // também é o que impede a lista de serviços do compose de crescer sem
+      // dono — `preflightTargets` LANÇA para serviço não declarado.
+      {
+        compose: 'scheduler',
+        contracts: ['runtime'],
+        envFiles: ['.env.app'],
+        adminBootGates: false,
+      },
+      { compose: 'worker', contracts: ['runtime'], envFiles: ['.env.app'], adminBootGates: false },
       // UM subset, e é o do próprio serviço — issue #596. Entre a #572 e a
       // #596 esta lista era `['runtime', 'admin-ui']`, porque o console
       // importava `@/config/env.js` e validava `runtime` no boot. Hoje não
@@ -170,7 +183,7 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
     expect(errosDeContrato(s).map((e) => e.rule)).toContain('admin-ui/tenant-slugs-default-literal');
   });
 
-  it('um .env.infra sem MAIA_ENV falha ANTES da validação, nos três serviços', () => {
+  it('um .env.infra sem MAIA_ENV falha ANTES da validação, nos cinco serviços', () => {
     // Mesmo ponto em que o `docker compose up` aborta, e pelo mesmo motivo:
     // `${MAIA_ENV:?…}` não tem default.
     const report = runPreflight({
@@ -180,7 +193,13 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
       readEnvFile: readExampleFor,
     });
     expect(report.ok).toBe(false);
-    expect(report.services.map((s) => s.failure !== undefined)).toEqual([true, true, true]);
+    expect(report.services.map((s) => s.failure !== undefined)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
     expect(report.services[0]!.failure).toMatch(/MAIA_ENV is required/);
   });
 

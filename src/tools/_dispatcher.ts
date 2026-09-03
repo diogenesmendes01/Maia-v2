@@ -13,6 +13,7 @@ import {
   releaseClaimedApproval,
   dualClassFor,
 } from '@/governance/approval-requests.js';
+import type { ApprovalNotify } from '@/governance/approval-requests.js';
 import type { ApprovalClass } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { REGISTRY, isToolEnabled, type AnyTool, type ToolTurnContext } from './_registry.js';
@@ -27,7 +28,13 @@ import { logger } from '@/lib/logger.js';
 import type { ActionKey } from '@/governance/audit-actions.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { incCounter } from '@/lib/metrics.js';
-import { instrumentToolDispatch } from '@/observability/instrumentation.js';
+import {
+  instrumentConstitutionalCheck,
+  instrumentHandlerExecute,
+  instrumentIdempotencyClaim,
+  instrumentPermissionCheck,
+  instrumentToolDispatch,
+} from '@/observability/instrumentation.js';
 import { config } from '@/config/env.js';
 import {
   turnOwnershipLost,
@@ -35,6 +42,7 @@ import {
   getTurnExecutionContext,
 } from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
+import { classifyToolCancellation, minimumBudgetMs } from './effect-class.js';
 
 /**
  * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
@@ -123,6 +131,75 @@ function turnOwnershipLostResult(tool: string, boundary: EffectBoundary): Dispat
   return { error: 'turn_ownership_lost', details: { tool } };
 }
 
+/**
+ * Issue #507 §Tools — ORÇAMENTO RESTANTE da tentativa, em milissegundos.
+ *
+ * `null` FORA de um turno reivindicado (`FEATURE_TURN_CLAIM` OFF, worker de
+ * agenda, playground, testes): o mesmo regime no-op dos guards de posse. Um
+ * guard que barrasse por ausência de contexto derrubaria meio runtime sem
+ * provar nada.
+ */
+function remainingTurnBudgetMs(): number | null {
+  const ctx = getTurnExecutionContext();
+  if (!ctx) return null;
+  return ctx.deadline.getTime() - Date.now();
+}
+
+/**
+ * Issue #507 §Tools — "nenhuma tool não idempotente começa sem tempo para
+ * persistir o resultado".
+ *
+ * A pergunta não é "o prazo venceu?", é "sobra prazo suficiente para ESTA
+ * classe de ferramenta?". Uma leitura precisa de pouco; qualquer coisa com
+ * efeito possível precisa também da folga para completar a reserva de
+ * idempotência, gravar o outbox na mesma transação e auditar — começar um
+ * efeito sem tempo de registrar que ele aconteceu é fabricar `effect_unknown`
+ * de propósito. Os números e o porquê estão em `effect-class.ts`.
+ *
+ * Devolve `null` quando há orçamento (ou quando não há turno).
+ */
+function turnBudgetExhausted(tool: AnyTool): { remaining_ms: number; required_ms: number } | null {
+  const remaining_ms = remainingTurnBudgetMs();
+  if (remaining_ms === null) return null;
+  const required_ms = minimumBudgetMs(tool.effect_class);
+  return remaining_ms < required_ms ? { remaining_ms, required_ms } : null;
+}
+
+/**
+ * A RECUSA por prazo. Vocabulário próprio (`turn_deadline_exceeded`) e não
+ * `turn_ownership_lost`: a posse continua nossa — o que acabou foi o tempo. São
+ * fatos diferentes, com triagens diferentes (um é takeover, o outro é orçamento
+ * mal dimensionado ou etapa anterior lenta), e colapsá-los num código só
+ * apagaria a distinção justamente no incidente em que ela importa.
+ *
+ * Classificado como REFUSAL: nada rodou, nada ficou pela metade.
+ */
+function turnDeadlineExceededResult(
+  tool: AnyTool,
+  boundary: EffectBoundary,
+  budget: { remaining_ms: number; required_ms: number },
+): DispatchResult {
+  incCounter('maia_tool_deadline_exceeded_total', {
+    tool: tool.name,
+    effect_class: tool.effect_class,
+    boundary,
+  });
+  logger.warn(
+    {
+      tool: tool.name,
+      effect_class: tool.effect_class,
+      boundary,
+      remaining_ms: budget.remaining_ms,
+      required_ms: budget.required_ms,
+    },
+    'tool.turn_deadline_exceeded',
+  );
+  return {
+    error: 'turn_deadline_exceeded',
+    details: { tool: tool.name, effect_class: tool.effect_class, ...budget },
+  };
+}
+
 export async function dispatchTool(input: {
   tool: string;
   args: unknown;
@@ -203,6 +280,22 @@ async function dispatchToolInner(input: {
       details: { tool: input.tool, reason: 'feature_flag_off' },
     };
   }
+
+  // Issue #507 §Tools — ORÇAMENTO CHECADO ANTES DA AUTORIZAÇÃO.
+  //
+  // Este é o primeiro ponto em que a checagem é POSSÍVEL: o orçamento mínimo
+  // depende da classe de efeito da ferramenta, e só aqui `tool` existe. E é
+  // o ponto CERTO: tudo o que vem a seguir — grant do agente, regras
+  // constitucionais, `canAct`, claim de aprovação (que pode notificar humanos)
+  // — custa idas ao banco e, no caso da aprovação, produz efeito de governança.
+  // Gastar isso para depois descobrir que não havia tempo de executar é pior
+  // que recusar aqui: deixaria evidência de aprovação criada por um turno que
+  // nunca agiria.
+  //
+  // O guard de POSSE já foi feito na primeira linha; este é o outro eixo do
+  // mesmo cancelamento.
+  const budgetAtEntry = turnBudgetExhausted(tool);
+  if (budgetAtEntry) return turnDeadlineExceededResult(tool, 'tool_dispatch', budgetAtEntry);
 
   // Issue #408 — `tool_not_granted` guard. The AGENT-grant filter, revalidated
   // SERVER-SIDE before the permission/`canAct` guard. The Runtime Tool Filter
@@ -308,12 +401,23 @@ async function dispatchToolInner(input: {
   // foi removido. Uma violação `limit_exceeded` agora vira uma EXIGÊNCIA de
   // aprovação resolvida adiante contra o store backend (approval_requests) —
   // o modelo nunca atesta a própria aprovação.
-  const violation = constitutionalCheck({
-    intent: { tool: tool.name, args },
-    pessoa: input.ctx.pessoa,
-    resolved: resolved ?? null,
-    scope: { entidades: input.ctx.scope.entidades },
-  });
+  //
+  // Issue #535 — span `constitutional.check`, o primeiro dos quatro portões
+  // que este dispatcher roda. É síncrono, então o wrapper grava a janela que
+  // acabou de fechar em vez de exigir que o portão vire async: observabilidade
+  // não reescreve fluxo de controle.
+  const violation = instrumentConstitutionalCheck(
+    tool.name,
+    () =>
+      constitutionalCheck({
+        intent: { tool: tool.name, args },
+        pessoa: input.ctx.pessoa,
+        resolved: resolved ?? null,
+        scope: { entidades: input.ctx.scope.entidades },
+      }),
+    (v) =>
+      v === null ? 'ok' : v.kind === 'forbidden' ? 'forbidden' : 'requires_approval',
+  );
   if (violation && violation.kind === 'forbidden') {
     await audit({
       acao: 'unauthorized_access_attempt',
@@ -325,25 +429,41 @@ async function dispatchToolInner(input: {
     return { error: 'forbidden', details: { rule_id: violation.rule_id, reason: violation.reason } };
   }
 
-  for (const action of tool.required_actions as ActionKey[]) {
-    const allow = canAct({
-      pessoa: input.ctx.pessoa,
-      resolved: resolved ?? null,
-      action,
-      valor,
-      natureza,
-      categoria_id,
+  // Issue #535 — span `permission.check`, o segundo portão. UM span para o laço
+  // inteiro: o laço é uma conjunção (qualquer recusa encerra o dispatch), então
+  // N spans renderizariam N-1 linhas `allowed` idênticas para uma decisão só.
+  //
+  // O `audit` da recusa fica FORA do span porque ele não é a checagem: é a
+  // consequência dela, e é `await` — mantê-lo dentro faria a duração do portão
+  // incluir uma escrita no banco e mediria a coisa errada.
+  const denial = instrumentPermissionCheck(
+    tool.name,
+    tool.required_actions.length,
+    (): { action: ActionKey; reason: string } | null => {
+      for (const action of tool.required_actions as ActionKey[]) {
+        const allow = canAct({
+          pessoa: input.ctx.pessoa,
+          resolved: resolved ?? null,
+          action,
+          valor,
+          natureza,
+          categoria_id,
+        });
+        if (!allow.allowed) return { action, reason: allow.reason };
+      }
+      return null;
+    },
+    (d) => (d === null ? 'allowed' : 'denied'),
+  );
+  if (denial) {
+    await audit({
+      acao: 'unauthorized_access_attempt',
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      metadata: { tool: tool.name, action: denial.action, reason: denial.reason },
     });
-    if (!allow.allowed) {
-      await audit({
-        acao: 'unauthorized_access_attempt',
-        pessoa_id: input.ctx.pessoa.id,
-        conversa_id: input.ctx.conversa.id,
-        mensagem_id: input.ctx.mensagem_id,
-        metadata: { tool: tool.name, action, reason: allow.reason },
-      });
-      return { error: 'forbidden', details: { reason: allow.reason } };
-    }
+    return { error: 'forbidden', details: { reason: denial.reason } };
   }
 
   // Redis check ANTES do claim de aprovação: um claim seguido de bloqueio de
@@ -478,21 +598,28 @@ async function dispatchToolInner(input: {
         },
       };
     } else {
-      // Import dinâmico: mantém o grafo de módulos do dispatcher leve (o
-      // gateway puxa Baileys) e só resolve a fronteira de saída quando um
-      // request precisa de fato notificar humanos.
-      const notify = async (jid: string, text: string): Promise<unknown> => {
-        const { forCurrentAgentChannel } = await import('@/gateway/line-output.js');
-        const { withDeclaredEgressException } = await import(
-          '@/runtime/outbound/egress-guard.js'
+      // Issue #506 — o aviso ao aprovador vira LINHA DE LEDGER.
+      //
+      // O que havia aqui: `forCurrentAgentChannel(null)` + `line.sendText(...)`
+      // sob exceção de egresso declarada. O aviso é o ÚNICO evento que faz um
+      // aprovador olhar para um pedido: o `approval_requests` persistido é
+      // verdade sobre o pedido, mas ninguém consulta a tabela. Perder o aviso
+      // era perder a aprovação por inanição — o request ficava aberto até
+      // expirar, e o usuário do turno ficava esperando algo que não ia chegar.
+      //
+      // Agora o aviso é comprometido em `outbox_messages` antes de qualquer
+      // chamada ao canal, com retry e DLQ, e a chave de dedupe
+      // (`approval_request:<id>:notify:<pessoa>`) garante exatamente um aviso
+      // por aprovador por pedido.
+      //
+      // Import dinâmico mantido: o emissor puxa o repositório de agendamento, e
+      // o dispatcher só o resolve quando um request precisa de fato notificar
+      // humanos.
+      const notify: ApprovalNotify = async (input) => {
+        const { enqueueProactiveNotice } = await import(
+          '@/runtime/outbound/proactive-notice.js'
         );
-        const line = await forCurrentAgentChannel(null);
-        // #634 — exceção INVENTARIADA (`tools.approval_notification`): o
-        // destinatário é o APROVADOR, não o interlocutor do turno; o
-        // `approval_requests` persistido é a fonte de verdade.
-        return withDeclaredEgressException('tools.approval_notification', () =>
-          line.sendText(jid, text),
-        );
+        return enqueueProactiveNotice(input);
       };
       const ensured = await ensureApprovalRequest({
         tenant_id: getCurrentTenant(),
@@ -547,20 +674,30 @@ async function dispatchToolInner(input: {
   const RESERVATION_TTL_SECONDS = 30;
   const WAIT_TIMEOUT_MS = RESERVATION_TTL_SECONDS * 1000;
 
-  const reservation = await idempotencyRepo.tryReserve({
-    key: idempotency_key,
-    tool_name: tool.name,
-    operation_type: tool.operation_type,
-    pessoa_id: input.ctx.pessoa.id,
-    entity_id,
-    // #299: store/compare the REAL payload fingerprint (was incorrectly
-    // `idempotency_key` before, which made the collision check a tautology
-    // — the key always matches itself). `tryReserve` echoes this hash into
-    // the reserved row and revalidates it on a `completed` hit.
-    payload_hash,
-    file_sha256,
-    ttl_seconds: RESERVATION_TTL_SECONDS,
-  });
+  // Issue #535 — span `idempotency.claim`, o terceiro portão. Cobre só o
+  // `tryReserve`: é o INSERT … ON CONFLICT que decide se ESTE chamador executa
+  // o handler, e o `state` que ele devolve é o que explica um turno parado —
+  // `in_progress` é um chamador esperando a reserva de outro worker, o que não
+  // se parece nada com banco lento até você conseguir ver.
+  const reservation = await instrumentIdempotencyClaim(
+    tool.name,
+    () =>
+      idempotencyRepo.tryReserve({
+        key: idempotency_key,
+        tool_name: tool.name,
+        operation_type: tool.operation_type,
+        pessoa_id: input.ctx.pessoa.id,
+        entity_id,
+        // #299: store/compare the REAL payload fingerprint (was incorrectly
+        // `idempotency_key` before, which made the collision check a tautology
+        // — the key always matches itself). `tryReserve` echoes this hash into
+        // the reserved row and revalidates it on a `completed` hit.
+        payload_hash,
+        file_sha256,
+        ttl_seconds: RESERVATION_TTL_SECONDS,
+      }),
+    (r) => (r.was_inserted ? 'reserved' : r.state),
+  );
 
   // Fase 0 cap. 3 — caminhos em que o handler NÃO roda neste caller devolvem
   // a evidência (claimed → approved) em vez de deixá-la presa em 'claimed'.
@@ -721,7 +858,7 @@ async function dispatchToolInner(input: {
   //     `idempotency_prior_failed` por uma execução que não existiu.
   //   * a evidência de aprovação volta de 'claimed' para 'approved', senão o
   //     humano teria de aprovar de novo por causa da nossa desistência.
-  if (turnOwnershipLost()) {
+  const abandonReservationQuietly = async (): Promise<void> => {
     await idempotencyRepo
       .abandonReservation({ key: idempotency_key, reservation_token })
       .catch((abandon_err) => {
@@ -730,13 +867,146 @@ async function dispatchToolInner(input: {
           'tool.reservation_abandon_failed',
         );
       });
+  };
+  const failReservationQuietly = async (): Promise<void> => {
+    await idempotencyRepo
+      .releaseReservation({ key: idempotency_key, reservation_token })
+      .catch((release_err) => {
+        logger.error(
+          { release_err, tool: tool.name, idempotency_key },
+          'tool.reservation_release_failed',
+        );
+      });
+  };
+
+  if (turnOwnershipLost()) {
+    await abandonReservationQuietly();
     await releaseClaimIfHeld();
     return turnOwnershipLostResult(tool.name, 'tool_handler');
   }
 
+  // Issue #507 §Tools — o SEGUNDO ponto do orçamento: imediatamente antes do
+  // handler, e pela mesma razão pela qual a posse é reconferida aqui.
+  //
+  // Entre a checagem da entrada e esta linha o dispatcher esperou por grant,
+  // cache, claim de aprovação e a reserva atômica. Cada um desses awaits gasta
+  // prazo. Uma checagem só na entrada seria a fotografia que a #504 já recusou
+  // no eixo da posse — e no eixo do tempo ela é ainda mais fácil de furar,
+  // porque o relógio anda mesmo quando nada dá errado.
+  const budgetBeforeHandler = turnBudgetExhausted(tool);
+  if (budgetBeforeHandler) {
+    await abandonReservationQuietly();
+    await releaseClaimIfHeld();
+    return turnDeadlineExceededResult(tool, 'tool_handler', budgetBeforeHandler);
+  }
+
+  /**
+   * Issue #507 §Tools — O CANCELAMENTO QUE CHEGOU TARDE DEMAIS.
+   *
+   * Daqui para baixo o handler ou já rodou, ou está rodando. Se o sinal da
+   * tentativa aborta agora, a pergunta "houve efeito?" não tem resposta neste
+   * processo — e é justamente aí que o vocabulário costuma mentir: `cancelled`
+   * afirma que nada aconteceu, `error` convida a um retry que duplicaria o que
+   * talvez tenha acontecido.
+   *
+   * Quem decide é a CLASSE DECLARADA da ferramenta (`effect-class.ts`):
+   *
+   *   `abort_safe` → a declaração é que não há efeito a reconciliar. Então
+   *   `cancelled` é verdade, e a reserva é ABANDONADA (row apagada) — marcá-la
+   *   'failed' negaria serviço ao worker que TEM a posse por causa de uma
+   *   execução que não deixou nada.
+   *
+   *   qualquer outra → `effect_unknown`. A reserva vira 'failed', que é o
+   *   estado que faz a MESMA chave falhar rápido em vez de reexecutar sozinha:
+   *   é assim que "nunca automaticamente retryable" deixa de ser texto e vira
+   *   comportamento do ledger. A evidência de aprovação também vira terminal —
+   *   um efeito que talvez tenha acontecido já consumiu o "sim" do humano.
+   *
+   * O resultado do handler é DESCARTADO nos dois casos: um turno que não é mais
+   * nosso não incorpora resposta, não completa reserva e não dispara outbound.
+   */
+  const settleCancelledAfterStart = async (
+    cause: 'signal_aborted' | 'late_result_discarded',
+  ): Promise<DispatchResult> => {
+    const verdict = classifyToolCancellation(tool.effect_class);
+    if (verdict.outcome === 'cancelled') {
+      await abandonReservationQuietly();
+      await releaseClaimIfHeld();
+      return turnOwnershipLostResult(tool.name, 'tool_handler');
+    }
+    await failReservationQuietly();
+    if (claimedApproval) {
+      await failClaimedApproval({
+        request: claimedApproval.request,
+        claim_token: claimedApproval.claim_token,
+        cause: 'effect_unknown',
+      }).catch((fail_err) =>
+        logger.error(
+          { fail_err, request_id: claimedApproval?.request.id },
+          'tool.approval_fail_mark_failed',
+        ),
+      );
+    }
+    incCounter('maia_tool_effect_unknown_total', {
+      tool: tool.name,
+      effect_class: tool.effect_class,
+      reconciliation: verdict.reconciliation,
+    });
+    const turn = getTurnExecutionContext();
+    await audit({
+      acao: 'tool_effect_unknown',
+      pessoa_id: input.ctx.pessoa.id,
+      conversa_id: input.ctx.conversa.id,
+      mensagem_id: input.ctx.mensagem_id,
+      entidade_alvo: entity_id,
+      metadata: {
+        tool: tool.name,
+        effect_class: tool.effect_class,
+        reconciliation: verdict.reconciliation,
+        retryable: verdict.retryable,
+        cause,
+        idempotency_key,
+        turn_id: turn?.turn_id ?? null,
+        attempt: turn?.attempt ?? null,
+        ...(tool.compensated_by ? { compensated_by: tool.compensated_by } : {}),
+      },
+    });
+    logger.error(
+      {
+        tool: tool.name,
+        effect_class: tool.effect_class,
+        reconciliation: verdict.reconciliation,
+        cause,
+        idempotency_key,
+        turn_id: turn?.turn_id ?? null,
+        attempt: turn?.attempt ?? null,
+        ops_alert: true,
+      },
+      'tool.effect_unknown',
+    );
+    return {
+      error: 'effect_unknown',
+      details: {
+        tool: tool.name,
+        effect_class: tool.effect_class,
+        retryable: verdict.retryable,
+        reconciliation: verdict.reconciliation,
+        idempotency_key,
+        ...(tool.compensated_by ? { compensated_by: tool.compensated_by } : {}),
+      },
+    };
+  };
+
   let result: unknown;
   try {
-    result = await tool.handler(args, {
+    // Issue #535 — span `handler.execute`, o quarto portão e a ÚNICA linha
+    // deste dispatcher que produz efeito. Separá-lo do `tool.dispatch` que o
+    // envolve é o ponto: o pai mede o dispatch INTEIRO — portões, ida e volta
+    // da aprovação, espera pela reserva — e essas partes rotineiramente
+    // dominam. Sem este span, "a tool está lenta" não se distingue de "a tool
+    // esperou", e as duas têm correções opostas.
+    result = await instrumentHandlerExecute(tool.name, () =>
+      tool.handler(args, {
       pessoa: input.ctx.pessoa,
       scope: input.ctx.scope,
       conversa: input.ctx.conversa,
@@ -751,19 +1021,21 @@ async function dispatchToolInner(input: {
       // turno reivindicado (flag OFF, worker de agenda, playground), que é o
       // mesmo regime no-op dos guards.
       turn: turnHandlerContext(),
-    });
+      }),
+    );
   } catch (err) {
+    // Issue #507 — a tentativa foi cancelada DURANTE o handler. A exceção pode
+    // ser a própria cooperação com o abort (uma requisição HTTP interrompida) ou
+    // uma falha qualquer que aconteceu depois de o sinal cair; nos dois casos a
+    // pergunta relevante deixou de ser "por que falhou?" e passou a ser "houve
+    // efeito?". Tratar isto como `execution_failed` genérico apagaria a única
+    // distinção que importa e ainda contaria um cancelamento deliberado no
+    // numerador do error rate.
+    if (turnOwnershipLost()) return await settleCancelledAfterStart('signal_aborted');
     // Mark the reservation 'failed' (B3) so a higher-level retry doesn't
     // get stuck waiting, and the same key isn't silently re-run while the
     // failed marker stands.
-    await idempotencyRepo
-      .releaseReservation({ key: idempotency_key, reservation_token })
-      .catch((release_err) => {
-        logger.error(
-          { release_err, tool: tool.name, idempotency_key },
-          'tool.reservation_release_failed',
-        );
-      });
+    await failReservationQuietly();
     // Fase 0 cap. 3 — handler rodou e falhou com side effect DESCONHECIDO:
     // a evidência vira terminal (execution_failed, fail-closed). Retry exige
     // NOVA aprovação humana; nunca reexecuta sozinho sobre a mesma evidência.
@@ -782,6 +1054,14 @@ async function dispatchToolInner(input: {
     logger.error({ err, tool: tool.name }, 'tool.execution_failed');
     return { error: 'execution_failed', details: { cause: (err as Error).message } };
   }
+
+  // Issue #507 — RESULTADO TARDIO. O handler resolveu, mas o sinal da tentativa
+  // já tinha caído enquanto ele rodava. O trabalho foi feito (e pago); o que não
+  // pode acontecer é ele ser adotado: sem esta linha o dispatcher completaria a
+  // reserva, gravaria o outbox, auditaria como sucesso e devolveria o resultado
+  // ao ReAct — ou seja, um turno que já não é nosso mutando estado e podendo
+  // disparar outbound. A #504 barra a PRÓXIMA iteração; esta barra ESTA.
+  if (turnOwnershipLost()) return await settleCancelledAfterStart('late_result_discarded');
 
   const out = tool.output_schema.safeParse(result);
   if (!out.success) {
@@ -860,6 +1140,39 @@ async function dispatchToolInner(input: {
       { tool: tool.name, idempotency_key },
       'tool.idempotency_completion_fenced',
     );
+    // Issue #507 — este caminho TAMBÉM é efeito incerto, e a diferença com o
+    // cancelamento cooperativo é só quem descobriu primeiro: aqui o handler
+    // rodou inteiro e a reserva foi tomada por outro dono no meio, então
+    // "houve efeito?" continua sem resposta neste processo. O CÓDIGO devolvido
+    // segue sendo `idempotency_completion_fenced` — ele é mais específico e já
+    // tem classificação —, mas o rastro de reconciliação é o mesmo, senão um
+    // efeito possivelmente consumado ficaria sem linha para reconciliar.
+    const fencedVerdict = classifyToolCancellation(tool.effect_class);
+    if (fencedVerdict.outcome === 'effect_unknown') {
+      const fencedTurn = getTurnExecutionContext();
+      incCounter('maia_tool_effect_unknown_total', {
+        tool: tool.name,
+        effect_class: tool.effect_class,
+        reconciliation: fencedVerdict.reconciliation,
+      });
+      await audit({
+        acao: 'tool_effect_unknown',
+        pessoa_id: input.ctx.pessoa.id,
+        conversa_id: input.ctx.conversa.id,
+        mensagem_id: input.ctx.mensagem_id,
+        entidade_alvo: entity_id,
+        metadata: {
+          tool: tool.name,
+          effect_class: tool.effect_class,
+          reconciliation: fencedVerdict.reconciliation,
+          retryable: fencedVerdict.retryable,
+          cause: 'completion_fenced',
+          idempotency_key,
+          turn_id: fencedTurn?.turn_id ?? null,
+          attempt: fencedTurn?.attempt ?? null,
+        },
+      });
+    }
     // Fase 0 cap. 3 — o handler DESTE caller executou (side effect real),
     // mesmo que o resultado não tenha virado o cache autoritativo. A
     // evidência é consumida: uma execução aconteceu sob esta aprovação.

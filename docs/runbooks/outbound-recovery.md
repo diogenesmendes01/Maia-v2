@@ -447,13 +447,63 @@ Se `maia_outbound_direct_send_violation_total` sair de zero:
    primitiva;
 2. a chamada **já foi recusada** — nenhuma mensagem saiu sem ledger. O incidente
    é o caminho existir, não uma mensagem duplicada;
-3. o caminho novo tem de escolher: passar pelo outbox, ou entrar em
-   `src/runtime/outbound/send-paths.ts` como `declared_exception` com `reason` e
-   `containment` escritos. Não há terceira opção, e o teste estático
-   (`tests/unit/runtime/outbound-trava-envio-direto.spec.ts`) recusa a terceira.
+3. o caminho novo tem de **passar pelo outbox**. Desde a auditoria de fechamento
+   de #506 a segunda opção (entrar no inventário como `declared_exception`) está
+   FECHADA: `assertRatifiedInventory` recusa, no carregamento do módulo,
+   qualquer exceção fora de `RATIFIED_EXCEPTION_IDS`, e o conjunto só encolhe.
+   Uma rota paralela nova não sobe o processo.
+
+   **Acrescentar uma exceção não é mais um caminho aberto (#506).** Aquele mesmo
+   teste fixa a lista de seis ids, e o número **só desce**: incluir um sétimo
+   reprova o CI e é decisão humana, não escolha de quem está implementando. Para
+   um aviso PROATIVO — sem turno, para dono/aprovador/requester — o caminho já
+   existe e não é exceção nenhuma: `enqueueProactiveNotice`
+   (`src/runtime/outbound/proactive-notice.ts`) compromete a saída no ledger de
+   agendamento com chave de idempotência, e o `outbox_drain` entrega. É o que
+   `workers/briefings.ts`, `workflows/dual-approval.ts`, `workflows/engine.ts` e
+   `tools/_dispatcher.ts` passaram a fazer.
 
 Não existe env var para desligar a trava, e a ausência é a decisão: uma trava
 desligável em produção é o fail-open que a épica lista como risco.
+
+### A trilha de auditoria do ciclo (#506 §Auditoria mínima)
+
+Onze ações em `audit_log`, todas escopadas por `(tenant_id, agent_id)`, todas
+com `alvo_id = outbound_id` e `entidade_alvo = 'outbound_messages'`. Para
+reconstruir o ciclo de UMA linha:
+
+```sql
+SELECT created_at, acao, metadata
+  FROM audit_log
+ WHERE tenant_id = :t AND agent_id = :a AND alvo_id = :outbound_id
+ ORDER BY created_at;
+```
+
+| Ação | Quando | Metadata que importa |
+|---|---|---|
+| `outbound_committed` | a intenção foi commitada com o turno | `payload_hash`, `idempotent_reuse` |
+| `outbound_claimed` | posse concedida (ou takeover) | `attempt`, `worker_id`, `status_after_claim` |
+| `outbound_send_started` | `claimed -> sending`, antes do adaptador | `attempt` |
+| `outbound_delivery_unknown` | desfecho da família desconhecida | `outcome`, `last_error_code` |
+| `outbound_retry_scheduled` | desfecho retentável | `retry_in_seconds`, `next_attempt_at` |
+| `outbound_delivery_completed` | histórico gravado, `-> completed` | `history_message_id`, `recovered_by` |
+| `outbound_reconciliation_started` | `delivery_unknown -> reconciling` | `escalation_reason` |
+| `outbound_reconciled` | a reconciliação resolveu | `result` (`resend_idempotent` \| `history_recovered` \| `history_fabricated`) |
+| `outbound_dead_lettered` | a plataforma desistiu | `reason`, `attempt` |
+| `outbound_manual_rearm` | operador devolveu ao ciclo | `actor`, `reason`, `acknowledged_duplicate_risk` |
+| `outbound_turn_inconsistency_detected` | divergência turno↔outbound | as duas contagens |
+
+**Todas são TRANSACIONAIS** (`auditTx`, no mesmo `tx` da transição). Uma
+consequência operacional que vale saber antes de estranhá-la: se a mensagem de
+`in_reply_to` for apagada (retenção), a FK `audit_log.mensagem_id -> mensagens`
+passa a barrar a auditoria, e com ela a transição — a linha do outbox **para**
+onde está em vez de avançar sem trilha. O sintoma é `pending`/`claimed`/`sending`
+que não anda, com erro de FK no log. Isso é o fail-closed funcionando: a saída de
+uma linha nesse estado é o rearmamento manual auditado, não relaxar a trilha.
+
+**Ausência de linha é sinal.** Uma linha em `sending` sem `outbound_send_started`
+é impossível pelo caminho de produção; se aparecer, alguém escreveu no banco por
+fora.
 
 ## 8. O risco residual que esta fatia ADMINISTRA e não resolve
 

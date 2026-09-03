@@ -38,11 +38,15 @@ import {
   BASELINE_SCHEMA_VERSION,
   NEVER_DRAINED,
   CARDINALITIES,
+  MARGEM_RELATIVA_DEFAULT,
   applyInjection,
   checkBaselineCompatibility,
+  contagemO1,
   createPoolSaturationTracker,
   evaluateGate,
   gateExitCode,
+  coberturaAtual,
+  COBERTURA_DA_MEDICAO,
   gateMakespan,
   isDirectInvocation,
   mergeTwoPairs,
@@ -52,6 +56,8 @@ import {
   runFingerprint,
   startPoolSampler,
   syntheticPassingArm,
+  SCOPE_READS_PER_TURN_MIN,
+  SCOPE_SECTIONS,
   type ArmResult,
   type BaselineFile,
   type RunFingerprint,
@@ -59,14 +65,18 @@ import {
   type Thresholds,
 } from '../../../scripts/turn-context-benchmark.js';
 
-/** Os limites do aceite, escritos aqui como o dono os escreveu. */
+/**
+ * Os limites do aceite, como a decisão do dono na #525 (2026-09-02) os
+ * reescreveu: latência absoluta como piso de sanidade, margem RELATIVA
+ * nomeada para os critérios principais.
+ */
 const TH: Thresholds = {
   p95_ms: 600,
   p99_ms: 1_000,
   max_peak_reads: 6,
   min_concurrent_tenants: 10,
   saturation_ms: 60_000,
-  baseline_tolerance: 0.2,
+  relative_margin: MARGEM_RELATIVA_DEFAULT,
   pairs: 50,
   concurrency: 20,
   sample_gap_factor: 10,
@@ -83,6 +93,7 @@ const FP: RunFingerprint = {
   max_concurrent_reads: 6,
   turns: 600,
   sustain_s: 60,
+  cobertura: coberturaAtual(),
 };
 
 /**
@@ -91,6 +102,22 @@ const FP: RunFingerprint = {
  * o seu.
  */
 function baselineWith(p95: number, fingerprint: RunFingerprint = FP): BaselineFile {
+  // O braço do baseline em v4: p95/p99 do braço, throughput e latência por
+  // cardinalidade — os números que os critérios relativos principais leem.
+  // Throughput e by_cardinality iguais aos do braço sintético, para que os
+  // testes de OUTROS critérios não reprovem pelos relativos.
+  const arm = (): BaselineFile['arms'][string] => ({
+    p95_ms: p95,
+    p99_ms: p95 * 2,
+    throughput_turns_per_s: 600 / 61,
+    turns: 600,
+    wall_ms: 61_000,
+    by_cardinality: [...CARDINALITIES].map((entities) => ({
+      entities,
+      p95_ms: p95,
+      p99_ms: p95 * 2,
+    })),
+  });
   return {
     schema_version: BASELINE_SCHEMA_VERSION,
     recorded_at: '2026-08-10T00:00:00.000Z',
@@ -105,10 +132,7 @@ function baselineWith(p95: number, fingerprint: RunFingerprint = FP): BaselineFi
       platform: 'linux',
       mode: 'measure',
     },
-    arms: {
-      cold: { p95_ms: p95, p99_ms: p95 * 2, turns: 600, wall_ms: 61_000 },
-      warm: { p95_ms: p95, p99_ms: p95 * 2, turns: 600, wall_ms: 61_000 },
-    },
+    arms: { cold: arm(), warm: arm() },
   };
 }
 
@@ -121,6 +145,12 @@ function armsWith(inject: Record<string, number>): ArmResult[] {
   return arms;
 }
 
+/**
+ * O rótulo do critério do orçamento COMPLETO — o agregado que a #700 passou a
+ * avaliar (antes dela ele saía `n/a` e reprovava por contenção).
+ */
+const CONTENCAO = 'aceite completo do orçamento do turno';
+
 function run(
   inject: Record<string, number>,
   baseline: BaselineFile | null = BASELINE_FOLGADO,
@@ -128,18 +158,331 @@ function run(
 ) {
   const arms = armsWith(inject);
   const verdicts = evaluateGate(arms, TH, baseline, { mode, fingerprint: FP });
+  const parciais = verdicts.filter((v) => !v.label.includes(CONTENCAO));
   return {
     verdicts,
+    /** O exit code REAL da corrida, com TODOS os critérios. */
     code: gateExitCode(verdicts, mode),
-    failed: verdicts.filter((v) => !v.passed),
+    /**
+     * O exit code SEM o critério agregado do orçamento completo. Os testes de
+     * um critério específico usam este para dizer "foi ESTE critério que
+     * derrubou a corrida", sem que o agregado (que também reprova quando a
+     * evidência do escopo some) apareça como segundo culpado.
+     */
+    codeParcial: gateExitCode(parciais, mode),
+    /** Reprovações entre os critérios individuais (o agregado não entra). */
+    failed: parciais.filter((v) => !v.passed),
+    /** O critério agregado do orçamento completo, para os testes que falam DELE. */
+    contencao: verdicts.find((v) => v.label.includes(CONTENCAO)),
+    /** Todas as reprovações, agregado incluído. */
+    todasAsFalhas: verdicts.filter((v) => !v.passed),
   };
 }
 
 describe('#525 — o gate do benchmark de carga de contexto', () => {
-  it('aprova uma corrida saudável, e o exit code é 0', () => {
-    const { code, failed } = run({});
+  it('nenhum critério reprova uma corrida saudável — e o gate SAI 0', () => {
+    const { code, codeParcial, failed, todasAsFalhas } = run({});
     expect(failed).toEqual([]);
+    expect(codeParcial).toBe(0);
+    // Antes da #700 esta linha era `expect(code).toBe(1)`: o aceite completo
+    // saía `n/a` porque o `resolveScope` estava fora da medição, e não
+    // avaliado reprova. Com o `resolveScope` DENTRO do relógio e a evidência
+    // nos números, o critério passa a ser avaliado — e uma corrida saudável
+    // sai 0. A contenção saiu porque a premissa dela deixou de valer.
+    expect(todasAsFalhas).toEqual([]);
     expect(code).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // #700 — o aceite COMPLETO do orçamento do turno (resolveScope + buildPrompt)
+  //
+  // A flag `COBERTURA_DA_MEDICAO.resolve_scope_medido` é um RÓTULO. O que
+  // aprova este critério é a EVIDÊNCIA MEDIDA: as duas leituras do escopo em
+  // todo turno, a cardinalidade resolvida batendo com a semeada, e turnos > 0.
+  // Virar a flag sem incluir a medição tem de REPROVAR — é o defeito que esta
+  // bateria existe para pegar.
+  // -------------------------------------------------------------------------
+
+  describe('aceite completo do orçamento do turno (#700)', () => {
+    it('APROVA quando a evidência do resolveScope está nos números medidos', () => {
+      const { contencao, code } = run({});
+      expect(contencao, 'o critério do orçamento completo sumiu da lista').toBeDefined();
+      expect(contencao?.skipped).toBeFalsy();
+      expect(contencao?.passed).toBe(true);
+      expect(contencao?.detail).toContain('resolveScope');
+      expect(code).toBe(0);
+    });
+
+    it('REPROVA quando a flag diz que mede e os NÚMEROS dizem que não — a flag não prova a si mesma', () => {
+      // O defeito que a #700 nomeia: alguém vira `resolve_scope_medido` para
+      // `true` sem incluir a medição. Sem as leituras do escopo no contador
+      // por turno, o critério é AVALIADO e REPROVADO — não aprovado por
+      // decreto, e não `n/a`.
+      expect(COBERTURA_DA_MEDICAO.resolve_scope_medido).toBe(true);
+      const { contencao, code } = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
+      expect(contencao?.passed).toBe(false);
+      expect(contencao?.skipped).toBeFalsy();
+      expect(contencao?.detail).toContain('A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO');
+      expect(contencao?.detail).toContain('leituras do escopo por turno=0–0');
+      expect(code).toBe(1);
+
+      // CONTROLE, no mesmo `it`: com as duas leituras de volta, o MESMO
+      // critério aprova. Sem isto o teste passaria por qualquer motivo.
+      expect(run({}).contencao?.passed).toBe(true);
+    });
+
+    it('REPROVA quando o escopo resolvido não bate com a massa semeada (com controle)', () => {
+      // "As duas leituras aconteceram" não basta: elas podem ter devolvido
+      // vazio — massa sem `permissoes`/`permission_profiles`, ou permissão
+      // descartada pelo teto de 500 do `profilesRepo.byIds`.
+      const semMassa = run({ scope_entities_min: 0, scope_entities_max: 0 });
+      expect(semMassa.contencao?.passed).toBe(false);
+      expect(semMassa.code).toBe(1);
+
+      const divergente = run({ scope_cardinality_mismatches: 1 });
+      expect(divergente.contencao?.passed).toBe(false);
+      expect(divergente.code).toBe(1);
+
+      // CONTROLE: cardinalidades 1–100 e zero divergências ⇒ aprova.
+      expect(run({}).contencao?.passed).toBe(true);
+    });
+
+    it('o critério do orçamento completo vem PRIMEIRO — a fronteira antes dos números', () => {
+      // Quem lê a tabela de cima para baixo encontra a fronteira antes de já
+      // ter formado opinião sobre os p95. Ordem é conteúdo aqui.
+      const { verdicts } = run({});
+      expect(verdicts[0]?.label).toContain(CONTENCAO);
+    });
+
+    it('em modo `measure` o exit code segue 0 — mas o critério continua sendo emitido', () => {
+      // O opt-out explícito não pode virar uma porta para declarar aprovação:
+      // `measure` não emite veredicto de gate, e o relatório dele diz isso em
+      // caixa alta. O que NÃO pode acontecer é o critério sumir.
+      const { code, contencao } = run({ scope_reads_per_turn_min: 0 }, BASELINE_FOLGADO, 'measure');
+      expect(code).toBe(0);
+      expect(contencao?.passed).toBe(false);
+    });
+
+    it('a cobertura entra no fingerprint: baseline da cobertura ANTERIOR é RECUSADO (com controle)', () => {
+      // É isto que impede um número medido sob `buildPrompt-sem-resolveScope`
+      // de ser reapresentado como medição do turno completo. Vale nos dois
+      // sentidos, e é testável sem medir nada — que é o que o aceite 3 da #700
+      // pede enquanto os baselines novos não existem.
+      const coberturaAntiga = baselineWith(1_000, {
+        ...FP,
+        cobertura: COBERTURA_DA_MEDICAO.rotulo,
+      });
+      const recusa = checkBaselineCompatibility(coberturaAntiga, FP);
+      expect(recusa.status).toBe('incompatible');
+      expect(recusa.diffs.join(' ')).toContain('cobertura');
+      expect(recusa.diffs.join(' ')).toContain('buildPrompt-sem-resolveScope');
+      // E o efeito é REPROVAR o critério relativo, não decorar o relatório.
+      const { code, verdicts } = run({}, coberturaAntiga);
+      const rel = verdicts.find((x) => x.label.includes('p95 ≤ baseline'))!;
+      expect(rel.skipped).toBe(true);
+      expect(rel.passed).toBe(false);
+      expect(rel.detail).toContain('BASELINE MEDIDO COM OUTRA CARGA');
+      expect(code).toBe(1);
+
+      // CONTROLE: mesma cobertura, mesma corrida — a comparação acontece.
+      expect(checkBaselineCompatibility(baselineWith(1_000, FP), FP).status).toBe('ok');
+    });
+
+    it('um baseline do schema anterior é recusado — ele não diz o que mediu', () => {
+      expect(BASELINE_SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
+      const antigo = { ...baselineWith(1_000), schema_version: 2 };
+      expect(checkBaselineCompatibility(antigo, FP).status).toBe('legacy_schema');
+    });
+
+    it('o rótulo da cobertura MUDA quando a flag muda — é o que invalida os baselines antigos', () => {
+      // Se os dois estados produzissem o mesmo rótulo, virar a flag não
+      // invalidaria baseline nenhum e a comparação silenciosamente misturaria
+      // duas réguas. Este teste é o que impede essa regressão.
+      const rotuloSemResolveScope = COBERTURA_DA_MEDICAO.rotulo;
+      expect(coberturaAtual()).toBe(
+        COBERTURA_DA_MEDICAO.resolve_scope_medido ? 'resolveScope+buildPrompt' : rotuloSemResolveScope,
+      );
+      expect(rotuloSemResolveScope).not.toBe('resolveScope+buildPrompt');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #700 — os três critérios do ESTÁGIO `resolveScope`, um por regressão
+  // -------------------------------------------------------------------------
+
+  describe('o estágio resolveScope', () => {
+    const EXERCITADO = 'foi EXERCITADO';
+    const DO_BANCO = 'veio do BANCO';
+    const P95_ESTAGIO = 'p95 do estágio';
+
+    it('REPROVA quando as leituras do escopo somem — o escopo voltou a ser fabricado em memória', () => {
+      const { code, failed } = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
+      expect(code).toBe(1);
+      const v = failed.filter((x) => x.label.includes(EXERCITADO));
+      expect(v.map((x) => x.label)).toEqual([
+        expect.stringContaining('[cold]'),
+        expect.stringContaining('[warm]'),
+      ]);
+      expect(v[0]!.detail).toContain('leituras do escopo por turno=0–0 (piso 1');
+
+      // CONTROLE: com as leituras de volta, o mesmo critério aprova.
+      expect(run({}).failed.some((x) => x.label.includes(EXERCITADO))).toBe(false);
+    });
+
+    it('a leitura FUNDIDA da #693 (1 por turno) SATISFAZ a evidência — o gate afirma a propriedade, não a implementação', () => {
+      // A decisão da #525: o número de leituras do escopo é dado medido, não
+      // critério. Um candidato que funde `permissoes ⋈ permission_profiles`
+      // numa leitura (`forPessoaComProfile`) resolve o escopo no banco do
+      // mesmo jeito — e o critério antigo ("exatamente 2") o reprovaria POR
+      // CONSTRUÇÃO. O corrigido aceita 1 e continua reprovando 0.
+      const fundida = run({ scope_reads_per_turn_min: 1, scope_reads_per_turn_max: 1 });
+      expect(fundida.failed.some((v) => v.label.includes(EXERCITADO))).toBe(false);
+      expect(fundida.contencao?.passed).toBe(true);
+      expect(fundida.code).toBe(0);
+
+      // CONTROLE NEGATIVO no mesmo `it`: zero leituras continua reprovando —
+      // a evidência não foi afrouxada até a vacuidade.
+      const zero = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
+      expect(zero.failed.some((v) => v.label.includes(EXERCITADO))).toBe(true);
+      expect(zero.code).toBe(1);
+    });
+
+    it('REPROVA um N+1 no caminho do escopo — pelo guardrail O(1), que o vê em QUALQUER estágio', () => {
+      // O `byId` por permissão que a #511 removeu: 1 + N leituras em vez de 2.
+      // O critério "exatamente 2" que pegava isso saiu (decisão da #525); quem
+      // pega agora é o guardrail O(1): a contagem por turno em N=100 CRESCE em
+      // relação a N=1, e crescer reprova — tolerância zero.
+      const { code, failed } = run({ 'card100.reads_per_turn_max': 113 });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes('crescimento O(1)'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('N=100: 12–113');
+
+      // CONTROLE: contagem constante nas três cardinalidades aprova.
+      expect(run({}).failed.some((v2) => v2.label.includes('crescimento O(1)'))).toBe(false);
+    });
+
+    it('REPROVA quando o escopo resolvido não tem a cardinalidade semeada (com controle)', () => {
+      const vazio = run({ scope_entities_min: 0, scope_entities_max: 0 });
+      expect(vazio.code).toBe(1);
+      expect(vazio.failed.some((v) => v.label.includes(DO_BANCO))).toBe(true);
+
+      const divergente = run({ scope_cardinality_mismatches: 3 });
+      expect(divergente.code).toBe(1);
+      const v = divergente.failed.find((x) => x.label.includes(DO_BANCO))!;
+      expect(v.detail).toContain('divergências de cardinalidade=3');
+
+      // CONTROLE: 1–100 entidades e zero divergências.
+      expect(run({}).failed.some((x) => x.label.includes(DO_BANCO))).toBe(false);
+    });
+
+    it('REPROVA uma degradação de latência DENTRO do resolveScope (com controle)', () => {
+      // A demonstração que o aceite 2 da #700 exige: uma degradação que more
+      // no estágio do escopo — um plano perdido, um índice caído — derruba o
+      // gate por um critério que NOMEIA o estágio.
+      const { code, failed } = run({ scope_p95_ms: 900 });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes(P95_ESTAGIO))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('900.0 ms');
+
+      // CONTROLE: o p95 sintético do estágio (6 ms) passa.
+      expect(run({}).failed.some((x) => x.label.includes(P95_ESTAGIO))).toBe(false);
+    });
+
+    it('a degradação no estágio também é vista pelo p95 do TURNO — o estágio está dentro do relógio', () => {
+      // O estágio não é medido "ao lado": ele entra no p95 do turno, e por
+      // isso o critério absoluto e a comparação relativa contra o baseline
+      // também reagem. Aqui isso é afirmado sobre o número, não sobre a
+      // intenção: um turno de 40 ms cujo estágio custa 900 ms é impossível.
+      const arm = syntheticPassingArm('cold', TH);
+      expect(arm.scope_p95_ms).toBeLessThanOrEqual(arm.p95_ms);
+      // A composição da `main`: 10 leituras do `buildPrompt` + 2 do
+      // `resolveScope`. É um FATO MEDIDO do braço sintético, não um critério.
+      expect(arm.reads_per_turn_min).toBe(12);
+    });
+
+    it('o modelo de evidência: piso de 1 leitura, e as TRÊS formas de leitura de escopo são contadas', () => {
+      // A decisão da #525: o piso é 1 (o número é dado medido), e o contador
+      // reconhece tanto a composição da `main` (`forPessoa` + `byIds`) quanto
+      // a leitura fundida da #693 (`forPessoaComProfile`).
+      expect(SCOPE_READS_PER_TURN_MIN).toBe(1);
+      expect(Object.values(SCOPE_SECTIONS)).toEqual([
+        'scope_permissoes',
+        'scope_profiles',
+        'scope_permissoes_com_profile',
+      ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // O guardrail O(1) da contagem (decisão da #525): crescimento reprova,
+  // teto absoluto é relatório
+  // -------------------------------------------------------------------------
+
+  describe('guardrail O(1) da contagem de statements', () => {
+    const O1 = 'crescimento O(1)';
+
+    it('REPROVA quando a contagem em N=100 difere da de N=1 — tolerância zero (com controle)', () => {
+      // Crescer UM statement já reprova: O(1) é igualdade, não "quase igual".
+      const cresceu = run({ 'card100.reads_per_turn_max': 13, 'card100.reads_per_turn_min': 13 });
+      expect(cresceu.code).toBe(1);
+      const v = cresceu.failed.find((x) => x.label.includes(O1))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('N=1: 12–12');
+      expect(v.detail).toContain('N=100: 13–13');
+
+      // CONTROLE: envelopes idênticos aprovam.
+      expect(run({}).failed.some((x) => x.label.includes(O1))).toBe(false);
+    });
+
+    it('o TETO ABSOLUTO virou linha de relatório: uma contagem alta mas CONSTANTE não reprova por contagem', () => {
+      // 20 statements por turno em TODA cardinalidade: mais que os 13 do
+      // orçamento da `main` — e nenhum critério de contagem reprova, porque a
+      // decisão do dono tirou o teto do aceite. O que protegeria contra isso é
+      // a latência (os critérios principais), não um número de queries.
+      const alto = run({
+        reads_per_turn_min: 20,
+        reads_per_turn_max: 20,
+        'card1.reads_per_turn_min': 20,
+        'card1.reads_per_turn_max': 20,
+        'card10.reads_per_turn_min': 20,
+        'card10.reads_per_turn_max': 20,
+        'card100.reads_per_turn_min': 20,
+        'card100.reads_per_turn_max': 20,
+      });
+      expect(alto.failed).toEqual([]);
+      expect(alto.code).toBe(0);
+      const v = alto.verdicts.find((x) => x.label.includes(O1))!;
+      expect(v.passed).toBe(true);
+      expect(v.detail).toContain('teto absoluto é linha de relatório');
+    });
+
+    it('com menos de duas cardinalidades medidas, a inclinação sai NÃO AVALIADA — e em modo gate isso REPROVA', () => {
+      // Sem dois pontos não há inclinação; "não avaliado" não é "aprovado".
+      const { code, verdicts } = run({ 'card10.turns': 0, 'card100.turns': 0 });
+      const v = verdicts.find((x) => x.label.includes(O1))!;
+      expect(v.skipped).toBe(true);
+      expect(v.passed).toBe(false);
+      expect(code).toBe(1);
+    });
+
+    it('contagemO1 é a fronteira pura que o veredicto lê', () => {
+      const card = (entities: number, min: number, max: number, turns = 100) => ({
+        entities,
+        turns,
+        p50_ms: 1,
+        p95_ms: 2,
+        p99_ms: 3,
+        max_ms: 4,
+        reads_per_turn_min: min,
+        reads_per_turn_max: max,
+      });
+      expect(contagemO1([card(1, 12, 12), card(100, 12, 12)]).ok).toBe(true);
+      expect(contagemO1([card(1, 12, 12), card(100, 12, 112)]).ok).toBe(false);
+      expect(contagemO1([card(1, 12, 12), card(100, 12, 12, 0)]).ok).toBe(null);
+      expect(contagemO1([]).ok).toBe(null);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -257,7 +600,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // Este é o caso que saía vermelho sem significar regressão: com 20 turnos
       // repostos continuamente contra um pool de 10, a fila não PODE esvaziar
       // durante a carga. O critério do perfil é outro.
-      const { code, verdicts } = run({
+      const { codeParcial, verdicts } = run({
         ...SATURADO_NA_CARGA,
         pool_drain_samples: 20,
         pool_drain_saturated_samples: 0,
@@ -269,7 +612,10 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // E o critério do perfil normal NÃO é emitido: é um veredicto por braço,
       // escolhido pelo perfil, não os dois somados.
       expect(verdicts.some((x) => x.label.includes('nunca fica saturado por 60 s'))).toBe(false);
-      expect(code).toBe(0);
+      // `codeParcial` e não `code`: o gate reprova hoje pela contenção do
+      // `resolveScope`, e o que este teste afirma é sobre o critério de
+      // saturação — não sobre a fronteira da medição.
+      expect(codeParcial).toBe(0);
     });
 
     it('REPROVA quando a fila NÃO escoa depois que o produtor para', () => {
@@ -417,10 +763,19 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(v.detail).toContain('--mode measure');
       expect(v.detail).toContain('--write-baseline');
       expect(code).toBe(1);
-      expect(failed.map((x) => x.label)).toEqual([
-        expect.stringContaining('[cold] p95 ≤ baseline + 20%'),
-        expect.stringContaining('[warm] p95 ≤ baseline + 20%'),
-      ]);
+      // TODOS os critérios relativos principais ficam n/a — p95, p99,
+      // throughput e por-cardinalidade, nos dois braços — e nada mais falha.
+      expect(failed).toHaveLength(8);
+      for (const arm of ['cold', 'warm']) {
+        expect(failed.map((x) => x.label)).toEqual(
+          expect.arrayContaining([
+            expect.stringContaining(`[${arm}] p95 ≤ baseline × 1.10`),
+            expect.stringContaining(`[${arm}] p99 ≤ baseline × 1.10`),
+            expect.stringContaining(`[${arm}] throughput ≥ baseline × 0.90`),
+            expect.stringContaining(`[${arm}] latência por cardinalidade ≤ baseline × 1.10`),
+          ]),
+        );
+      }
     });
 
     it('SEM baseline, o modo measure não reprova — mas também não se apresenta como gate', () => {
@@ -443,22 +798,88 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(code).toBe(0);
     });
 
-    it('aprova exatamente no teto de +20% e REPROVA um passo acima', () => {
-      // p95 sintético = 40 ms. Baseline 100/3 ⇒ teto = 40 exatos.
-      const noLimite = run({}, baseline(40 / 1.2));
-      expect(noLimite.code).toBe(0);
+    it('aprova exatamente no teto da margem (×1.10) e REPROVA um passo acima', () => {
+      // p95 sintético = 40 ms. Baseline 40/1.1 ⇒ teto = 40 exatos.
+      const noLimite = run({}, baseline(40 / 1.1));
+      expect(noLimite.codeParcial).toBe(0);
 
       // O MESMO p95 contra um baseline 1% menor já estoura.
-      const acima = run({}, baseline(40 / 1.2 / 1.01));
+      const acima = run({}, baseline(40 / 1.1 / 1.01));
       expect(acima.code).toBe(1);
-      const v = acima.failed.find((x) => x.label.includes('baseline'))!;
+      const v = acima.failed.find((x) => x.label.includes('p95 ≤ baseline'))!;
       expect(v.detail).toMatch(/delta=\d+\.\d%/);
     });
 
     it('REPROVA uma regressão de 50% sobre o baseline', () => {
       const { code, failed } = run({ p95_ms: 60 }, baseline(40));
       expect(code).toBe(1);
+      expect(failed.length).toBeGreaterThan(0);
       expect(failed.every((v) => v.label.includes('baseline'))).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // Os critérios PRINCIPAIS da decisão da #525 — cada um com prova vermelha
+    // e controle verde
+    // -----------------------------------------------------------------------
+
+    it('um candidato com p95 ACIMA da margem REPROVA — mesmo confortável no limite absoluto (com controle)', () => {
+      // Baseline 40 ms ⇒ teto relativo 44 ms. 45 ms está muitíssimo abaixo dos
+      // 600 ms absolutos — e reprova MESMO ASSIM: é o critério que fecha a
+      // porta pela qual a #693 teria pago ~3× de p95 "dentro dos 600 ms".
+      const regride = run({ p95_ms: 45 }, baseline(40));
+      expect(regride.code).toBe(1);
+      const v = regride.failed.find((x) => x.label.includes('p95 ≤ baseline × 1.10'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('teto=44.0 ms');
+      // …e o critério ABSOLUTO continua verde: são dois critérios distintos.
+      expect(regride.verdicts.find((x) => x.label.includes('p95 da carga de contexto ≤ 600 ms'))!.passed).toBe(true);
+
+      // CONTROLE: exatamente no teto aprova.
+      expect(run({ p95_ms: 44 }, baseline(40)).codeParcial).toBe(0);
+    });
+
+    it('p99 tem o MESMO veredicto relativo — a cauda longa não passa escondida atrás do p95 (com controle)', () => {
+      // Baseline p99 = 80 ms (fixture: 2×p95) ⇒ teto 88 ms.
+      const cauda = run({ p99_ms: 89 }, baseline(40));
+      expect(cauda.code).toBe(1);
+      expect(cauda.failed.some((x) => x.label.includes('p99 ≤ baseline × 1.10'))).toBe(true);
+      expect(run({ p99_ms: 88 }, baseline(40)).codeParcial).toBe(0);
+    });
+
+    it('queda de THROUGHPUT além da margem REPROVA (com controle)', () => {
+      // Baseline ≈ 9.84 turnos/s ⇒ piso ≈ 8.85. Uma "otimização" que derruba a
+      // vazão está pagando a latência com fila — o par latência+vazão fecha
+      // essa porta.
+      const lento = run({ throughput_turns_per_s: 8 });
+      expect(lento.code).toBe(1);
+      const v = lento.failed.find((x) => x.label.includes('throughput ≥ baseline × 0.90'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('piso=8.9');
+
+      // CONTROLE: acima do piso aprova.
+      expect(run({ throughput_turns_per_s: 9 }).codeParcial).toBe(0);
+    });
+
+    it('uma regressão SÓ na cardinalidade 100 REPROVA — o p95 agregado não a esconde (com controle)', () => {
+      // O agregado mistura N=1/10/100; um turno 2× mais caro só em N=100 pode
+      // sumir no p95 do braço. O critério por cardinalidade é o que obriga o
+      // "tenant elefante" a continuar barato.
+      const elefante = run({ 'card100.p95_ms': 100 }, baseline(40));
+      expect(elefante.code).toBe(1);
+      const v = elefante.failed.find((x) => x.label.includes('latência por cardinalidade'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain('N=100: p95=100.0/40.0 ms');
+      // …e o critério do BRAÇO continua verde (p95 agregado injetado é 40):
+      expect(elefante.verdicts.find((x) => x.label.includes('p95 ≤ baseline × 1.10'))!.passed).toBe(true);
+
+      // CONTROLE: sem a regressão pontual, aprova.
+      expect(run({}, baseline(40)).codeParcial).toBe(0);
+    });
+
+    it('a margem é um parâmetro NOMEADO, com o default justificado no código', () => {
+      expect(MARGEM_RELATIVA_DEFAULT).toBe(0.1);
+      expect(parseArgs([], 6).thresholds.relative_margin).toBe(MARGEM_RELATIVA_DEFAULT);
+      expect(parseArgs(['--relative-margin', '0.25'], 6).thresholds.relative_margin).toBe(0.25);
     });
   });
 
@@ -525,7 +946,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         mode: 'gate',
       };
       expect(checkBaselineCompatibility(mesmoNumeroOutroContexto, FP).status).toBe('ok');
-      expect(run({}, mesmoNumeroOutroContexto).code).toBe(0);
+      expect(run({}, mesmoNumeroOutroContexto).codeParcial).toBe(0);
     });
 
     it('RECUSA um baseline no formato antigo, que não prova com que carga foi medido', () => {

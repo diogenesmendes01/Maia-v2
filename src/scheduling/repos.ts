@@ -13,7 +13,7 @@
  */
 
 import { sql, eq, and, inArray, desc } from 'drizzle-orm';
-import { db, withTx } from '@/db/client.js';
+import { db, withTx, pgErrorCode, pgErrorConstraint } from '@/db/client.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import {
   series as seriesTable,
@@ -396,7 +396,24 @@ export const seriesRepo = {
       } catch (err) {
         // UNIQUE (series_id, scheduled_for) collision — another worker beat
         // us to it. Idempotent: return null and let the loser drop the work.
-        if (/duplicate key|unique constraint/i.test((err as Error).message)) {
+        //
+        // O que chega neste `catch` NÃO é o erro do `pg`. O driver do Drizzle
+        // embrulha a falha num erro cuja `message` é
+        // `Failed query: insert into "occurrences" ...` e pendura o erro
+        // original em `cause`. Casar uma regex contra `.message` — como esta
+        // linha fazia — nunca dava verdadeiro: o perdedor da corrida
+        // ESTOURAVA em vez de desistir em silêncio, e a materialização da
+        // próxima ocorrência falhava sempre que dois workers a disputavam.
+        //
+        // A leitura certa é o SQLSTATE descendo a cadeia de `cause`, e a
+        // NARROW por nome de constraint: `23505` só diz "algum unique foi
+        // violado", e `occurrences` tem mais de um. Engolir qualquer 23505
+        // aqui esconderia uma violação de chave primária — defeito de
+        // verdade, não corrida rotineira.
+        if (
+          pgErrorCode(err) === '23505' &&
+          pgErrorConstraint(err) === 'occurrences_series_id_scheduled_for_key'
+        ) {
           return { occurrence: null, tasks: [] };
         }
         throw err;
@@ -609,7 +626,14 @@ function txRepos(tx: Tx): TxScopedRepos {
             .returning();
           return rows[0] ?? null;
         } catch (err) {
-          if (/duplicate key|unique constraint/i.test((err as Error).message)) return null;
+          // Mesma correção do `outboxRepo.enqueue` não transacional: a regex
+          // contra `.message` nunca casava, porque o Drizzle embrulha o erro
+          // do `pg`. `idx_outbox_dedup` é o índice parcial cuja violação
+          // significa "o chamador já enfileirou isto"; qualquer outro 23505
+          // desta tabela sobe.
+          if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
+            return null;
+          }
           throw err;
         }
       },
@@ -1100,7 +1124,32 @@ export const outboxRepo = {
       return rows[0] ?? null;
     } catch (err) {
       // Dedup collision is idempotent success — caller already enqueued.
-      if (/duplicate key|unique constraint/i.test((err as Error).message)) return null;
+      //
+      // Issue #506 — ISTO ESTAVA QUEBRADO, e o defeito era invisível.
+      //
+      // A versão anterior casava `/duplicate key|unique constraint/i` contra
+      // `(err as Error).message`. O que chega aqui NÃO é o erro do `pg`: o
+      // driver do Drizzle embrulha a falha num erro cuja mensagem é
+      // `Failed query: insert into "outbox_messages" ...` e pendura o erro
+      // original em `cause`. A regex nunca casava, então a colisão de
+      // `dedup_key` — o mecanismo de idempotência INTEIRO deste ledger —
+      // subia como exceção para o chamador, em vez de virar o `null` que o
+      // contrato promete.
+      //
+      // A leitura certa é o SQLSTATE percorrendo a cadeia de `cause`, que é o
+      // que `pgErrorCode` faz, e a NARROW por nome de constraint, que é o que
+      // `pgErrorConstraint` existe para permitir: `23505` só quer dizer "algum
+      // unique foi violado", e engolir qualquer 23505 desta tabela esconderia
+      // uma colisão de chave primária — que seria um defeito de verdade, não
+      // uma corrida rotineira. `idx_outbox_dedup` é o índice parcial da
+      // migração 007, e é o único cuja violação significa "o chamador já
+      // enfileirou isto".
+      //
+      // O `idx_outbox_dedup` é PARCIAL (`WHERE dedup_key IS NOT NULL`), então
+      // uma row sem `dedup_key` nunca colide por ele.
+      if (pgErrorCode(err) === '23505' && pgErrorConstraint(err) === 'idx_outbox_dedup') {
+        return null;
+      }
       throw err;
     }
   },

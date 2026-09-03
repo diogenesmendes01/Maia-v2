@@ -243,7 +243,10 @@ d('SKIP LOCKED — objectivesRepo.claimNextPendingTask (#481)', () => {
     }
 
     const { delivered } = await drain(async () => {
-      const claimed = await objectivesRepo.claimNextPendingTask();
+      const claimed = await objectivesRepo.claimNextPendingTask({
+        worker_id: `skip-locked-spec-${RUN}`,
+        lease_seconds: 300,
+      });
       return claimed?.task.id ?? null;
     }, mine);
 
@@ -297,7 +300,10 @@ d('SKIP LOCKED — objectivesRepo.claimNextPendingTask (#481)', () => {
     // frente na ordem por `created_at` e consomem iterações.
     let sawTask = false;
     for (let i = 0; i < MAX_CLAIMS; i += 1) {
-      const claimed = await objectivesRepo.claimNextPendingTask();
+      const claimed = await objectivesRepo.claimNextPendingTask({
+        worker_id: `skip-locked-spec-${RUN}`,
+        lease_seconds: 300,
+      });
       if (claimed?.task.id === task!.id) sawTask = true;
       const row = await objectivesRepo.findTaskById({
         tenant_id: tenant,

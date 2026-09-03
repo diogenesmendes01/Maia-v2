@@ -42,6 +42,7 @@ export const startWorkflowTool: Tool<typeof inputSchema, typeof outputSchema> = 
   output_schema: outputSchema,
   required_actions: ['schedule_reminder'],
   side_effect: 'write',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'create',
   audit_action: 'reminder_scheduled',

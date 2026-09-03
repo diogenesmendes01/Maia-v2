@@ -177,15 +177,47 @@ sustentam isso, e nenhuma toca código de produção:
   DERIVADOS do spec, duas versões de perfil e um trace assinado pelo escritor
   de produção.
 
-Fora do gate sobrou uma spec, `channel-lines-pairing.spec.ts`, marcada
-`@pendente-runtime`: o QR e o código de pareamento são produzidos pelo worker
-`channel_pairing` do RUNTIME, e este job sobe só o console — o cabeçalho do
-arquivo traz a medição e o critério objetivo de saída. A lista de arquivos em
-quarentena é fixada em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`, então sair
-dela é um diff visível.
+Desde a **#623 (segunda parte)** o `smoke` também inclui a jornada de LINHAS de
+canal (`channel-lines.spec.ts`): a linha declarada permanece visível com o seu
+estado, o papel `viewer` não enxerga a tela (com caso de controle para `owner`,
+senão "viewer não vê" ficaria verde também com a rota quebrada) e um material de
+pareamento que **não abre** degrada FECHADO — nem QR, nem código, nem conteúdo
+parcial.
+
+Desde a **#623 (terceira parte)** a quarentena está **vazia**, e a jornada de
+PAREAMENTO (`channel-lines-pairing.spec.ts`) é gate bloqueante. Ela só era
+impossível de medir porque o QR e o código são produzidos pelo worker
+`channel_pairing` do **runtime**, e o job subia um processo só. Agora
+`scripts/admin-ui-e2e.sh` sobe **dois**:
+
+| processo | o que é | como sobe |
+|---|---|---|
+| console | o artefato `.next/standalone`, o mesmo do Dockerfile | `node src/admin-ui/server.js` |
+| runtime | `src/index.ts` no papel `scheduler`, grupo de jobs `channel` | `tests/admin-ui/e2e/_runtime/runtime-com-canal-falso.ts` |
+
+Os dois compartilham `DATABASE_URL`, `REDIS_URL` e um `MAIA_STAGING_KEYRING`
+**efêmero** — é a partilha do keyring que faz o envelope selado pelo runtime
+abrir no console. Esse keyring é **gerado no passo do job** (`openssl rand`) e
+nunca aparece num bloco `env:`: `env:` entra na história do repositório, e é a
+história que o gitleaks varre.
+
+O adapter de canal do runtime do job é **falso** (a #518 proíbe linha WhatsApp
+real no CI) e ele é injetado na **construção** do `LineSessionManager` por
+aquele entrypoint — **nunca por chave de configuração**. Provar posse da linha é
+o que autoriza a linha a rotear; uma env var capaz de trocar o adapter seria um
+interruptor documentado para desligar a prova de posse.
+`tests/unit/gateway/pairing-adapter-seam.spec.ts` guarda a propriedade (com o
+contrafactual que a torna não-vácua), e o adapter falso vive sob `tests/`, que a
+imagem de produção não copia.
+
+As travas de contabilidade em `tests/unit/ci/admin-ui-e2e-gate.spec.ts`
+permanecem armadas: a lista de ARQUIVOS em quarentena (hoje `[]`), a contagem de
+CASOS dela (hoje `0`) e a exigência de que cada caso fora do gate traga o motivo
+DELE no cabeçalho, numa linha `FORA DO GATE: <título do test>`. Entrar na
+quarentena é sempre um diff que alguém lê.
 
 ```bash
-npm run test:admin-ui:e2e:pendentes # roda a quarentena (vermelha sem um runtime no ar)
+npm run test:admin-ui:e2e:pendentes # a quarentena — hoje 0 testes, o projeto fica armado
 ```
 
 ### Feature flags

@@ -7,20 +7,29 @@ import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { expireDueDualApprovals } from './dual-approval.js';
 import { expireDueApprovals } from '@/governance/approval-requests.js';
-import { forCurrentAgentChannel } from '@/gateway/line-output.js';
-import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
+import { enqueueProactiveNotice } from '@/runtime/outbound/proactive-notice.js';
 
 export async function tickEngine(): Promise<{ processed: number; expired: number }> {
   // Fase 0 cap. 2/3 — expira requests do store backend (approval_requests),
   // com audit + notificação best-effort ao requester. Roda ANTES da varredura
   // legada: as duas são independentes e o contrato observado pelos testes de
   // isolamento (#345) é o UPDATE de workflows como última mutação do tick.
-  const notify = async (jid: string, text: string): Promise<unknown> => {
-    const line = await forCurrentAgentChannel(null);
-    // #634 — exceção INVENTARIADA (`workflows.engine`): aviso de EXPIRAÇÃO,
-    // emitido no tick do engine, fora de qualquer turno.
-    return withDeclaredEgressException('workflows.engine', () => line.sendText(jid, text));
-  };
+  // Issue #506 — o aviso de expiração vira LINHA DE LEDGER.
+  //
+  // O que havia aqui era `forCurrentAgentChannel(null)` + `line.sendText(...)`
+  // sob exceção de egresso declarada. O tick do engine é o pior lugar possível
+  // para um envio best-effort sem registro: ele roda a cada minuto, marca o
+  // request como expirado no MESMO tick, e a expiração é irreversível. Se o
+  // envio falhasse, o requester nunca saberia que o pedido morreu — e não havia
+  // segunda chance, porque o request já não estava mais na varredura.
+  //
+  // Agora o aviso é comprometido em `outbox_messages` (chave derivada do UUID
+  // do request, uma expiração = um aviso) e o drain o entrega com retry e DLQ.
+  const notify = async (input: {
+    jid: string;
+    text: string;
+    dedupe_key: string;
+  }): Promise<unknown> => enqueueProactiveNotice(input);
   const expiredApprovals = await expireDueApprovals(notify).catch((err) => {
     logger.warn({ err: (err as Error).message }, 'engine.approval_expiry_failed');
     return 0;

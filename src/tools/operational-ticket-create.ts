@@ -55,6 +55,7 @@ export const operationalTicketCreateTool: Tool<typeof inputSchema, typeof output
   output_schema: outputSchema,
   required_actions: ['create_ticket'],
   side_effect: 'communication',
+  effect_class: 'non_interruptible',
   redis_required: false,
   operation_type: 'communicate',
   audit_action: 'operational_ticket_created',

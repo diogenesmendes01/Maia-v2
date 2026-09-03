@@ -102,6 +102,10 @@ export class TurnLease {
 
   /** Contexto de execução propagável (issue §Fencing). */
   context(deadline?: Date): TurnExecutionContext {
+    // Arrow (e não `const self = this`): ela captura o `this` da lease
+    // lexicamente, e o getter do objeto literal — que tem `this` próprio — só
+    // precisa chamá-la.
+    const horizonte = (): Date => deadline ?? this.#leaseExpiresAt;
     return {
       tenant_id: this.claim.tenant_id,
       agent_id: this.claim.agent_id,
@@ -112,7 +116,18 @@ export class TurnLease {
       // Sem deadline do caller, o horizonte é o vencimento da lease: para além
       // dele não temos autoridade para escrever, então prometer trabalho é
       // mentira. O orçamento GLOBAL do turno é #507 e entra por aqui.
-      deadline: deadline ?? this.#leaseExpiresAt,
+      //
+      // Issue #507 — GETTER, e não o valor congelado na criação do contexto.
+      // `context()` é chamado UMA vez, no início da tentativa, e o objeto vive
+      // no ALS pelo turno inteiro; o heartbeat, porém, EMPURRA o horizonte a
+      // cada renovação. Com um `Date` capturado, um turno mais longo que o TTL
+      // inicial (60 s por padrão) passaria a ver prazo negativo enquanto a lease
+      // estava viva e renovada — e o guard de orçamento do dispatcher recusaria
+      // ferramentas por um prazo que não venceu. Falso `turn_deadline_exceeded`
+      // é o mesmo tipo de mentira que a issue fecha, só que na outra direção.
+      get deadline(): Date {
+        return horizonte();
+      },
       signal: this.signal,
     };
   }

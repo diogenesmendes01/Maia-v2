@@ -37,10 +37,18 @@ const txMock = {
 };
 const withTxMock = vi.fn(async (fn: (tx: typeof txMock) => unknown) => fn(txMock));
 
-vi.mock('../../src/db/client.js', () => ({
-  db: { select: txMock.select, insert: txMock.insert, update: txMock.update },
-  withTx: withTxMock,
-}));
+vi.mock('../../src/db/client.js', async (importOriginal) => {
+  // `pgErrorCode`/`pgErrorConstraint` vêm do módulo DE VERDADE: são funções
+  // puras que só descem a cadeia de `cause`, e é exatamente a leitura delas
+  // que este spec precisa exercitar. Um dublê aqui reproduziria o erro que
+  // ele existe para pegar.
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    db: { select: txMock.select, insert: txMock.insert, update: txMock.update },
+    withTx: withTxMock,
+  };
+});
 
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() },
@@ -115,9 +123,22 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
 
   it('returns null when UNIQUE (series_id, scheduled_for) conflicts (idempotent dedup)', async () => {
     txSelectChain.limit.mockResolvedValue([{ id: 'series-1', status: 'active', version: 1 }]);
-    txInsertChain.returning.mockRejectedValueOnce(
-      new Error('duplicate key value violates unique constraint'),
+    // A FORMA REAL do erro, e não uma inventada.
+    //
+    // Este mock rejeitava com `new Error('duplicate key value violates unique
+    // constraint')` — uma `message` que casava a regex que o repo usava. Só
+    // que o driver do Drizzle NUNCA produz essa forma: ele embrulha a falha
+    // num erro cuja `message` é `Failed query: insert into "..."` e pendura o
+    // erro do `pg` (com `code` e `constraint`) em `cause`. O teste afirmava um
+    // formato que produção não gera, então o ramo idempotente passou anos
+    // verde sendo código morto. Medido contra Postgres real em
+    // `tests/integration/scheduling-dedup-idempotente-real-db.spec.ts`.
+    const embrulhado = new Error('Failed query: insert into "occurrences" ...');
+    (embrulhado as Error & { cause: unknown }).cause = Object.assign(
+      new Error('duplicate key value violates unique constraint "occurrences_series_id_scheduled_for_key"'),
+      { code: '23505', constraint: 'occurrences_series_id_scheduled_for_key' },
     );
+    txInsertChain.returning.mockRejectedValueOnce(embrulhado);
     const { seriesRepo } = await import('../../src/scheduling/repos.js');
     const result = await runWithTenantContext(TENANT, () =>
       seriesRepo.insertNextOccurrenceIfActive({
