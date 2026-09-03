@@ -49,8 +49,8 @@ import {
 const RAIZ = process.cwd();
 
 /** Um DSN que PARECE staging. Sintético — não aponta para nada que exista. */
-const DSN_REMOTO = 'postgres://operador:trocar-isto@db.staging.invalido:5432/maia';
-const DSN_LOCAL = 'postgres://maia:trocar-isto@127.0.0.1:5432/maia_drill';
+const DSN_REMOTO = 'postgres://usuario-de-teste:SENHA-FALSA-DO-TESTE@db.staging.invalido:5432/maia';
+const DSN_LOCAL = 'postgres://usuario-de-teste:SENHA-FALSA-DO-TESTE@127.0.0.1:5432/maia_drill';
 
 interface Bancada {
   readonly deps: DrillDeps;
@@ -287,7 +287,7 @@ describe('drill #705 — controle positivo e sigilo do alvo', () => {
     await main(['--fase=roteiro', '--alvo=staging', '--dsn-env=DRILL_705_DSN'], b.deps);
     await main(['--fase=quebrar', '--alvo=staging', '--dsn-env=DRILL_705_DSN'], b.deps);
     const tudo = [...b.saida, ...b.erros].join('\n');
-    expect(tudo).not.toContain('trocar-isto');
+    expect(tudo).not.toContain('SENHA-FALSA-DO-TESTE');
     expect(tudo).not.toContain(DSN_REMOTO);
     // o NOME da variável pode (e deve) aparecer; é o valor que não pode
     expect(tudo).toContain('DRILL_705_DSN');
@@ -296,7 +296,7 @@ describe('drill #705 — controle positivo e sigilo do alvo', () => {
   it('o roteiro é texto, não execução: nada nele resolve o DSN', () => {
     const args = parseDrillArgs(['--fase=roteiro', '--alvo=staging', '--dsn-env=DRILL_705_DSN']);
     const linhas = textoDoRoteiro(args).join('\n');
-    expect(linhas).not.toContain('trocar-isto');
+    expect(linhas).not.toContain('SENHA-FALSA-DO-TESTE');
     expect(linhas).toContain('--alvo=staging');
     expect(linhas).toContain('--dsn-env=DRILL_705_DSN');
   });
