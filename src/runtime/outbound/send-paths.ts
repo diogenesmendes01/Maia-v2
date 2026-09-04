@@ -42,9 +42,10 @@
  *  1. **Cada exceção passou a declarar um IMPEDIMENTO TIPADO** (`blocked_by`,
  *     de `OUTBOUND_EXCEPTION_BLOCKERS` — vocabulário FECHADO, sem membro
  *     genérico) e a **remediação concreta** que a apaga. As dez deixaram de
- *     compartilhar "não tem turno": quatro são `no_turn_to_anchor`, três são
- *     `foreign_recipient`, duas são `competing_durable_ledger` e uma é
- *     `ephemeral_signal_without_provider_id`. São quatro trabalhos diferentes,
+ *     compartilhar "não tem turno": hoje duas são `no_turn_to_anchor`, uma é
+ *     `send_result_dependency` (o antigo `foreign_recipient`, corrigido em
+ *     2026-09-04 para o impedimento real), duas são `competing_durable_ledger`
+ *     e uma é `ephemeral_signal_without_provider_id`. São quatro trabalhos diferentes,
  *     e agora o inventário diz qual é qual.
  *  2. **O conjunto FECHOU.** `RATIFIED_EXCEPTION_IDS` +
  *     `MAX_DECLARED_EXCEPTIONS` + `assertRatifiedInventory` formam uma catraca
@@ -241,13 +242,16 @@ export const OUTBOUND_EXCEPTION_BLOCKERS = [
   /**
    * O envio acontece FORA de qualquer turno.
    *
-   * Não é uma preferência de escopo: `outbound_messages.turn_id` é `NOT NULL`
-   * para toda row durável (migração 121, CHECK
-   * `outbound_messages_durable_row_complete_check`), a FK é composta
-   * `(tenant_id, agent_id, turn_id) -> agent_turns`, e `commitTurnOutboundTx`
-   * faz FENCE do `claim_token` do turno dentro da transação. Sem turno, a row
-   * durável é literalmente inexprimível — não há o que cercar nem a que
-   * ancorar.
+   * O bloqueio é de CÓDIGO, não de schema — e o cabeçalho deste arquivo
+   * registra que a versão anterior errava exatamente aqui. A migração 121 cria
+   * `outbound_messages.turn_id` NULLABLE ("NULL = row legada anterior ao outbox
+   * durável"); o CHECK `outbound_messages_durable_row_complete_check` só exige
+   * o tuplo durável QUANDO há turno; a FK composta `(tenant_id, agent_id,
+   * turn_id) -> agent_turns` é MATCH SIMPLE e passa trivialmente com NULL. Uma
+   * row sem turno é exprimível. O que não existe é quem a CERQUE e a ENTREGUE:
+   * `commitTurnOutboundTx` faz FENCE do `claim_token` do turno dentro da
+   * transação, e sem turno não há claim a cercar nem job de entrega que a
+   * reclame.
    *
    * O que desbloqueia está escrito em `remediation` de cada entrada, e é sempre
    * a mesma família de trabalho: uma âncora durável para saída SEM turno, com
@@ -255,15 +259,22 @@ export const OUTBOUND_EXCEPTION_BLOCKERS = [
    */
   'no_turn_to_anchor',
   /**
-   * O destinatário NÃO é o interlocutor do turno.
+   * O call site CONSOME o resultado do envio direto.
    *
-   * A saída lógica do outbox é chaveada por `(turn_id, sequence_in_turn)` e o
-   * turno aponta para ela; o JID de destino é resolvido no ingresso do job de
-   * entrega a partir da `conversa_id` da row. Uma saída do MESMO turno para
-   * OUTRA conversa ou outra pessoa produziria um artefato cujo destinatário
-   * diverge do turno que o ancora — e a divergência só apareceria na entrega.
+   * Não é o destinatário — `resolveOutboundDeliveryScope` resolve o JID pela
+   * `conversa_id` da própria row, então "saída para terceiro" nunca foi o
+   * impedimento (a versão anterior deste vocabulário o chamava de
+   * `foreign_recipient`, e a correção de fato no cabeçalho explica por que isso
+   * estava errado). O que prende a rota é o RETORNO: o call site usa o id do
+   * provedor devolvido por `sendText` para gravar a mensagem em `mensagens`
+   * (`metadata.whatsapp_id`) e ligar a pergunta à `pending_question`.
+   * `enqueueProactiveNotice` devolve "comprometido", não "enviado", e o call
+   * site migrado deixaria de receber esse id no ato. O que desbloqueia é o
+   * ledger ser a fonte do id — `src/runtime/outbound/historico.ts` já grava
+   * `whatsapp_id: ctx.provider_message_id` do lado da entrega — e o call site
+   * passar a ler de lá em vez de do valor de retorno do envio.
    */
-  'foreign_recipient',
+  'send_result_dependency',
   /**
    * A rota JÁ É um outbox durável próprio, com persistência antes do envio,
    * claim, retry e DLQ.
@@ -558,13 +569,15 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
       'Best-effort e idempotente pelo lado do dono: a pendência de revisão já ' +
       'existe no banco antes do envio, então uma mensagem perdida vira lembrete, ' +
       'nunca decisão perdida.',
-    blocked_by: 'foreign_recipient',
+    blocked_by: 'send_result_dependency',
     remediation:
-      'Definir no contrato de #630 o que é a saída lógica de um turno dirigida a ' +
-      'TERCEIRO: ou uma faixa reservada de `sequence_in_turn` com o destinatário no ' +
-      'artefato (hoje o JID vem do ingresso do job, por `conversa_id`), ou uma âncora ' +
-      'durável própria. Enquanto o destinatário for derivado da conversa da row, o ' +
-      'artefato e o turno que o cerca discordariam sobre para quem a mensagem vai.',
+      'Tirar do call site a dependência do valor de retorno do envio: a gravação em ' +
+      '`mensagens` (`metadata.whatsapp_id`) e o vínculo com a `pending_question` passam ' +
+      'a ser alimentados pelo ledger — `src/runtime/outbound/historico.ts:132` já persiste ' +
+      '`whatsapp_id: ctx.provider_message_id` do lado da entrega — e o call site commita ' +
+      'pela âncora standalone (coorte 3 da §5 do ADR 0005) sem esperar id síncrono. ' +
+      'Alinhado ao impedimento real (correção do dono, 2026-09-04): a versão anterior ' +
+      'desta remediação falava de destinatário terceiro, que nunca foi o bloqueio.',
     owner: 'diogenesmendes01',
     deadline: { kind: 'prazo', expires: '2026-12-31' },
     removal: {
