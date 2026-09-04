@@ -277,15 +277,19 @@ export function percentile(sorted: number[], p: number): number {
 }
 
 /**
- * Ruído determinístico em `[0,1)`, função pura do ÍNDICE — a mesma técnica de
- * `scripts/llm-benchmark.ts`: o n-ésimo batch do braço `on-slow` recebe a
- * mesma sorte em toda rodada, então os braços são comparáveis entre rodadas.
+ * O collector `on-slow` recusa EXATAMENTE a fração pedida dos batches, por
+ * cota (Bresenham) e a partir do PRIMEIRO batch de cada braço — não por
+ * sorteio. A primeira versão sorteava por hash do índice e, numa corrida curta
+ * de 4 batches, recusou zero: o critério "collector degradado de fato" ficou
+ * vermelho por sorte, não por defeito. Com cota, `ceil(batches × ratio)`
+ * batches são recusados em qualquer tamanho de corrida, e o n-ésimo batch tem
+ * o mesmo destino em toda rodada.
  */
-export function hashUnit(index: number, salt: number): number {
-  let h = (index ^ salt) >>> 0;
-  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
-  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
-  return ((h ^ (h >>> 16)) >>> 0) / 0x1_0000_0000;
+export function shouldRejectBatch(index: number, ratio: number): boolean {
+  if (ratio <= 0) return false;
+  if (ratio >= 1) return true;
+  const phase = 1 - ratio;
+  return Math.floor((index + 1) * ratio + phase) > Math.floor(index * ratio + phase);
 }
 
 /** Linhas não vazias da exposição — cada uma é UMA série (ou bucket). */
@@ -941,7 +945,7 @@ export async function startCollector(): Promise<Collector> {
       } catch {
         counters.parse_errors++;
       }
-      const reject = mode.fail_ratio > 0 && hashUnit(index, 0x5eed) < mode.fail_ratio;
+      const reject = shouldRejectBatch(index, mode.fail_ratio);
       const respond = (): void => {
         if (reject) {
           counters.rejected_requests++;
@@ -970,6 +974,7 @@ export async function startCollector(): Promise<Collector> {
     },
     reset: () => {
       counters = emptyCounters();
+      requestIndex = 0;
     },
     snapshot: () => ({ ...counters }),
     close: () =>

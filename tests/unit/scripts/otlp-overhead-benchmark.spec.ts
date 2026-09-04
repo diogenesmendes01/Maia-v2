@@ -37,6 +37,7 @@ import {
   percentile,
   renderReport,
   seriesPorFamilia,
+  shouldRejectBatch,
   syntheticArms,
   type ArmResult,
   type Report,
@@ -348,6 +349,17 @@ describe('otlp-overhead-benchmark — leitores da exposição e agregação', ()
     expect(agg.export_max_ms).toBe(400);
     expect(agg.metrics_lines_before).toBe(10);
     expect(agg.metrics_lines_after).toBe(12);
+  });
+
+  it('shouldRejectBatch recusa EXATAMENTE a cota, a partir do primeiro batch — sem sorte', () => {
+    const rejected = (n: number, ratio: number): number[] =>
+      Array.from({ length: n }, (_, i) => i).filter((i) => shouldRejectBatch(i, ratio));
+    expect(rejected(10, 0.2)).toEqual([0, 5]);
+    expect(rejected(4, 0.2)).toEqual([0]);
+    expect(rejected(100, 0.2)).toHaveLength(20);
+    expect(rejected(7, 0.5)).toEqual([0, 2, 4, 6]);
+    expect(rejected(10, 0)).toEqual([]);
+    expect(rejected(3, 1)).toEqual([0, 1, 2]);
   });
 
   it('isDirectInvocation só é verdadeiro para o próprio entrypoint', () => {
