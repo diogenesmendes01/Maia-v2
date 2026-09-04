@@ -1553,12 +1553,18 @@ primeira corrida. Três regras:
    a 130 % acima do número gravado, sem que nenhum limite absoluto do gate
    (600 ms / 1 s) chegasse perto de cair. Versionar esse arquivo entregaria um
    gate vermelho na chegada para todo mundo que não fosse a máquina que o gravou.
-2. **A variação entre corridas iguais na mesma sessão é de ~10–15 %**; a folga de
-   +20 % é dimensionada para isso. Ela NÃO absorve troca de máquina, de contêiner
-   nem host ocupado — nesses casos re-grave, não discuta o delta.
-3. **Re-gravar é uma decisão de revisão.** A folga existe para absorver ruído, não
-   regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
-   aceitou o motivo — não numa corrida solta.
+2. **A margem relativa é de 10 %** (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`;
+   ratificada pelo dono em 2026-09-03) — e ela é **orçamento de regressão, não
+   medida de ruído**: responde quanto de p95/p99/throughput aceitamos PAGAR por um
+   candidato, não quanto o host oscila. O ruído é problema do PROTOCOLO: baseline
+   e candidato na mesma janela, na mesma máquina, com o controle (a própria base
+   re-medida contra o próprio baseline) dizendo quanto é ruído. Se o controle
+   estourar a margem, a janela não sustenta veredicto — re-meça numa janela mais
+   quieta, com medições alternadas; **nunca afrouxe o número**, porque cada ponto
+   dado ao ruído é um ponto de regressão real que entra sem ser visto. Troca de
+   máquina, de contêiner ou host ocupado: re-grave o baseline, não discuta o delta.
+3. **Re-gravar é uma decisão de revisão.** Se o p95 subiu por um motivo aceito,
+   re-grave no MESMO PR que aceitou o motivo — não numa corrida solta.
 
 #### O fingerprint: comparar dois p95 medidos com cargas diferentes não é comparar
 
