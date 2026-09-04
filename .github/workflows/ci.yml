@@ -717,7 +717,7 @@ jobs:
       - name: Artefatos do harness (só quando reprova)
         if: failure()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reliability-artifacts
           path: tests/reliability/artifacts/
@@ -1325,7 +1325,7 @@ jobs:
 
       - name: Relatório do Playwright (só quando reprova)
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-admin-ui
           path: |
