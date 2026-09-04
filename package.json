@@ -47,6 +47,7 @@
     "gen:tool-catalog": "tsx scripts/gen-tool-catalog.ts",
     "llm:bench": "tsx scripts/llm-benchmark.ts",
     "turn:bench": "tsx scripts/turn-context-benchmark.ts",
+    "otlp:bench": "tsx scripts/otlp-overhead-benchmark.ts",
     "config:generate": "tsx scripts/config.ts generate",
     "config:check": "tsx scripts/config.ts check",
     "config:check:drift": "tsx scripts/config.ts generate --check",
