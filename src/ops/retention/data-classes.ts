@@ -13,11 +13,17 @@
  * aprovação do responsável jurídico/DPO; a implementação não deve codificar
  * suposições jurídicas como fatos universais."
  *
- * So every class ships with `retention_days: null` and
- * `approval_state: 'pending_dpo'`, and `resolveRetention` reports
- * `purgeable: false` for all of them. The MECHANISM is complete and tested;
- * the POLICY arrives as configuration (`RETENTION_POLICY`, a signed-off JSON
- * carrying a version + approver + per-class day counts).
+ * So every class ships with `retention_days: null`, and `resolveRetention`
+ * reports `purgeable: false` for all of them. The MECHANISM is complete and
+ * tested; the POLICY arrives as configuration (`RETENTION_POLICY`, a
+ * signed-off JSON carrying a version + approver + per-class day counts).
+ *
+ * ONE class is no longer a question to the DPO: `privacy.tombstone`. The
+ * platform owner corrected the premise ("minimum retention" was the wrong
+ * question — the class is structurally non-purgeable, which is stronger) and
+ * RATIFIED that design (issue #536, 2026-09-02; reaffirmed 2026-09-03 in the
+ * review of PR #732). Its `approval_state` is `'ratified_by_owner'` and it
+ * carries an `owner_ratification` record instead of a `dpo_open_question`.
  *
  * The conservative default is deliberately "do not delete": deletion is
  * irreversible, so the failure mode of an unapproved policy must be keeping
@@ -75,15 +81,60 @@ export interface DataClass {
    * Populated at runtime from the DPO-approved `RETENTION_POLICY`.
    */
   retention_days: null;
-  approval_state: 'pending_dpo';
-  /** What the DPO still has to decide for this class. */
-  dpo_open_question: string;
+  /**
+   * DERIVED by `cls()` from which of the two fields below is present — never
+   * written by hand, so the pair can never disagree. `'pending_dpo'` for every
+   * class still waiting on the DPO; `'ratified_by_owner'` for a class whose
+   * design the platform owner has ratified (today: `privacy.tombstone` only).
+   */
+  approval_state: 'pending_dpo' | 'ratified_by_owner';
+  /**
+   * What the DPO still has to decide for this class — `null` exactly when the
+   * platform owner ratified the design (`approval_state: 'ratified_by_owner'`).
+   */
+  dpo_open_question: string | null;
+  /**
+   * The ratification record — non-null exactly when `approval_state` is
+   * `'ratified_by_owner'`. `cls()`'s input type makes the two states mutually
+   * exclusive, so a class cannot carry both a question and a ratification,
+   * nor neither.
+   */
+  owner_ratification: OwnerRatification | null;
 }
 
-function cls(
-  d: Omit<DataClass, 'retention_days' | 'approval_state'>,
-): DataClass {
-  return { ...d, retention_days: null, approval_state: 'pending_dpo' };
+/**
+ * A design decision the PLATFORM OWNER ratified — a different authority from
+ * the DPO, and labelled as such wherever it surfaces. A ratified class is
+ * absent from `openDpoQuestions()`: printing a taken decision as an open
+ * question is exactly the defect issue #536 asked to fix.
+ */
+export interface OwnerRatification {
+  readonly ratified_by: 'platform_owner';
+  /** When and where the ratification was received, as it was received. */
+  readonly ratified_in: string;
+  /** The design that was ratified. */
+  readonly decision: string;
+  /** Why it is the decision — the argument, not a restatement. */
+  readonly rationale: string;
+}
+
+type ClsInput = Omit<
+  DataClass,
+  'retention_days' | 'approval_state' | 'dpo_open_question' | 'owner_ratification'
+> &
+  (
+    | { dpo_open_question: string; owner_ratification?: never }
+    | { owner_ratification: OwnerRatification; dpo_open_question?: never }
+  );
+
+function cls(d: ClsInput): DataClass {
+  return {
+    ...d,
+    retention_days: null,
+    dpo_open_question: d.dpo_open_question ?? null,
+    owner_ratification: d.owner_ratification ?? null,
+    approval_state: d.owner_ratification ? 'ratified_by_owner' : 'pending_dpo',
+  };
 }
 
 /**
@@ -338,8 +389,20 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: false,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'the MINIMUM retention for tombstones (must exceed the longest backup retention, or resurrection becomes possible again)',
+    // ERA uma pergunta ao DPO ("qual é a retenção MÍNIMA de tombstone?") e a
+    // pergunta estava mal posta. O dono da plataforma corrigiu a premissa e
+    // ratificou o desenho que já está na `main`: a classe é `not_purgeable`,
+    // o que é MAIS FORTE que qualquer prazo mínimo. O campo deixou de ser uma
+    // pergunta e passou a ser a decisão registrada.
+    owner_ratification: {
+      ratified_by: 'platform_owner',
+      ratified_in:
+        'issue #536 — ratificação recebida por escrito na direção da tarefa (2026-09-02) e reafirmada na decisão do dono sobre a PR #732 (2026-09-03)',
+      decision:
+        "tombstones are structurally non-purgeable: `purge_mechanism: 'not_purgeable'` here, `parseRetentionPolicy` drops any policy entry for the class, and `resolveRetention` returns `class_not_purgeable` BEFORE it consults the policy at all",
+      rationale:
+        'a MINIMUM tombstone retention would have to exceed the LONGEST backup-artifact retention at all times — a period that has not even been decided yet — or restoring an old artifact resurrects data that should already be gone, the exact scenario tombstones exist to cover. Non-purgeable removes the arithmetic entirely: there is no period left to get wrong',
+    },
   }),
 ]);
 
@@ -502,7 +565,27 @@ export function resolveRetention(classId: string, policy: RetentionPolicy): Rete
   };
 }
 
-/** Every question still owed to the DPO, for the runbook and `maia doctor`. */
+/**
+ * Every question still owed to the DPO, for the runbook and `maia doctor`.
+ * A class the platform owner ratified is ABSENT — its decision is taken, and
+ * printing it as an open question would present a different authority's
+ * decision as still pending (issue #536).
+ */
 export function openDpoQuestions(): { data_class: string; question: string }[] {
-  return DATA_CLASSES.map((c) => ({ data_class: c.id, question: c.dpo_open_question }));
+  const out: { data_class: string; question: string }[] = [];
+  for (const c of DATA_CLASSES) {
+    if (c.dpo_open_question === null) continue;
+    out.push({ data_class: c.id, question: c.dpo_open_question });
+  }
+  return out;
+}
+
+/** The classes whose design the platform owner has ratified, for the same readers. */
+export function ownerRatifiedClasses(): { data_class: string; ratification: OwnerRatification }[] {
+  const out: { data_class: string; ratification: OwnerRatification }[] = [];
+  for (const c of DATA_CLASSES) {
+    if (c.owner_ratification === null) continue;
+    out.push({ data_class: c.id, ratification: c.owner_ratification });
+  }
+  return out;
 }

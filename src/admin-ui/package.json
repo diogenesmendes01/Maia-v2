@@ -13,7 +13,7 @@
     "next": "16.3.2",
     "next-auth": "5.0.0-beta.32",
     "react": "^19.2.8",
-    "react-dom": "^19.2.7",
+    "react-dom": "^19.2.8",
     "@trpc/server": "11.0.0-rc.682",
     "@trpc/client": "11.0.0-rc.682",
     "@trpc/react-query": "11.0.0-rc.682",
@@ -25,14 +25,14 @@
   "devDependencies": {
     "@types/node": "22.20.1",
     "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.3",
+    "@types/react-dom": "^19.2.5",
     "@types/pg": "8.11.10",
     "typescript": "5.9.3",
     "tailwindcss": "4.3.3",
     "@tailwindcss/postcss": "4.3.3",
     "postcss": "^8.5.23",
-    "eslint": "^10.8.1",
-    "eslint-config-next": "16.3.2",
+    "eslint": "^10.9.1",
+    "eslint-config-next": "16.3.3",
     "@playwright/test": "^1.51.1"
   },
   "overrides": {

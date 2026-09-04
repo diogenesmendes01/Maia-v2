@@ -34,16 +34,17 @@ Não há `heartbeat_at`: esta fatia não renova lease, e uma coluna assim afirma
 
 - [Tenant isolation](../concerns/tenant-isolation.md) — repos com tenant+agent explícitos; execução sob `runWithTenantContext` derivado da row
 - [Action layer](../concerns/action-layer.md) — executores só usam caminhos existentes (procedures/tools/scheduling); guardrails na spec §7
-- Spec canônica: [`docs/superpowers/specs/2026-06-10-agent-work-loop-design.md`](../../superpowers/specs/2026-06-10-agent-work-loop-design.md)
+- Spec canônica (v1): [`docs/superpowers/specs/2026-06-10-agent-work-loop-design.md`](../../superpowers/specs/2026-06-10-agent-work-loop-design.md)
+- Spec da v2 — **Draft, NÃO aprovada**, nada dela está implementado: [`docs/superpowers/specs/2026-07-31-collections-work-loop-design.md`](../../superpowers/specs/2026-07-31-collections-work-loop-design.md), com as doze perguntas em aberto (três bloqueantes — Q1, Q2b e Q3, que bloqueiam as fatias 3, 4 **e** 5) registradas em [ADR 0006](../decisions/0006-cobranca-piloto-perguntas-em-aberto.md). Os valores ainda não decididos (fração e unidade do holdout, cadência, janela de contato, teto de passos, janela de atribuição, superfície da fila, série temporal da métrica, resposta ao inbound, classe do mandato, composição do "R$ líquido", limiar do breaker) vivem em blocos `DECISÃO ABERTA` com `decided_by`/`decided_at` vazios, travados — nas formas enumeradas na lista dele, não em prosa arbitrária — por [`tests/unit/docs/decisoes-abertas-cobranca.spec.ts`](../../../tests/unit/docs/decisoes-abertas-cobranca.spec.ts)
 - Lease/reaper: mesmo padrão de `occurrencesRepo.reclaimExpiredLeases` (`src/scheduling/repos.ts`)
 
 ## How to extend
 
 | Need | Where |
 |---|---|
-| Novo kind (ex.: `cobranca_amigavel`, v2) | Declarar em `kinds.ts` com perceive/execute; tarefas via `objectivesRepo.upsertTask` (idempotência por `natural_key`) |
+| Novo kind (ex.: `cobranca_amigavel`, v2) | Declarar em `kinds.ts` com perceive/execute; tarefas via `objectivesRepo.upsertTask` (idempotência por `natural_key`). Para `cobranca_amigavel` especificamente: a spec v2 está em **Draft não aprovado** e três perguntas bloqueantes (Q1/Q2b/Q3 do [ADR 0006](../decisions/0006-cobranca-piloto-perguntas-em-aberto.md)) precisam de assinatura antes de qualquer código |
 | Índice único novo em `objective_tasks` | `upsertTask` já declara alvo explícito no `ON CONFLICT` — mantenha-o. Sem alvo, o `DO NOTHING` engole a violação do índice NOVO e devolve `null`, que o chamador lê como "já existia" |
-| Exceção humana | Retornar `{ transition: 'waiting_human' }`; resolução via `objectives.resolveTask` (v2 vincula pending questions) |
+| Exceção humana | Retornar `{ transition: 'waiting_human' }`; resolução via `objectives.resolveTask`. **Em que superfície o humano atende a fila, e se `pending_questions` entra nisso, é decisão em aberto** — bloco `DECISÃO ABERTA — DA-07` da spec v2 §8.4 e Q11 do [ADR 0006](../decisions/0006-cobranca-piloto-perguntas-em-aberto.md) |
 
 ## Tests
 
@@ -53,5 +54,5 @@ Não há `heartbeat_at`: esta fatia não renova lease, e uma coluna assim afirma
 
 | | |
 |---|---|
-| Last verified | 2026-08-30 |
+| Last verified | 2026-09-02 |
 | Re-verify when | novo kind no registry, mudança nas tabelas 088/138, decisão de ligar o grupo `console`, ou mudança na spec do work loop |
