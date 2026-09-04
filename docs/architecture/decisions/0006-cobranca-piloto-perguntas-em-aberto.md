@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Proposed — aguardando decisão humana.** Este ADR não decide nenhuma das doze perguntas; ele decide **como elas ficam registradas e quem responde cada uma** |
+| Status | **Accepted como framework (dono, 2026-09-04) — implementação bloqueada.** Aceito como registro das doze decisões abertas e do procedimento de promoção, **não** como aprovação da política do piloto: DA-01 a DA-12 seguem sem assinatura e as fatias 3–5 seguem bloqueadas por Q1, Q2b e Q3. Este ADR não decide nenhuma das doze perguntas; ele decide **como elas ficam registradas e quem responde cada uma** |
 | Date | 2026-09-01 |
 | Owner | Maia maintainers (dono do produto, dono da segurança, jurídico, DPO — nomeados por pergunta abaixo) |
 | Related issue | [#469](https://github.com/diogenesmendes01/Maia-v2/issues/469) |
