@@ -754,17 +754,26 @@ Não presuma cobertura que não existe:
   parâmetro é tipado (`ContextLoadStage`), então o compilador recusa qualquer
   outro; ampliar é edição deliberada em `CONTEXT_LOAD_STAGE`
   (`src/observability/taxonomy.ts`);
-- **benchmark de overhead é micro, não sob carga** —
-  `tests/unit/observability/overhead-benchmark.spec.ts` mede o custo por
-  emissão e o teto TEÓRICO de séries a partir dos orçamentos de cardinalidade.
-  Cardinalidade REAL sob tráfego continua sem medição. Desde a issue #600 o
-  custo do span é afirmado em dois eixos: TRABALHO CONTADO por span (duas
-  chamadas a `randomBytes`, 24 bytes, zero digests, zero serializações, uma
-  emissão) — que não usa relógio e portanto não depende do runner nem da versão
-  de Node — e TEMPO como razão contra o trabalho irredutível do próprio span
-  (mintar os dois ids + passar os atributos pelo portão), medido nas mesmas
-  rodadas intercaladas. A razão contra a rota DESLIGADA, de ~0,4µs, foi
-  removida: ela reprovava PRs alheias em lanes diferentes de Node;
+- **benchmark de overhead: micro E sob carga; cardinalidade sob tráfego REAL
+  continua pós-canário** — `tests/unit/observability/overhead-benchmark.spec.ts`
+  segue medindo o custo por emissão (TRABALHO CONTADO por span — duas chamadas
+  a `randomBytes`, 24 bytes, zero digests, zero serializações, uma emissão —
+  e TEMPO como razão contra o trabalho irredutível do próprio span, #600) e o
+  teto TEÓRICO de séries a partir dos orçamentos de cardinalidade. O que o
+  critério 4 da #535 acrescentou é `scripts/otlp-overhead-benchmark.ts`
+  (`npm run otlp:bench`): A/B com OTLP **ligado** sob carga — turnos REAIS
+  pelo entry point do worker contra Postgres, três braços alternados no MESMO
+  processo (`off`; `on-local`, exporter de produção contra um collector que
+  responde 200; `on-slow`, o mesmo collector com 200 ms de atraso e 20 % de
+  503), `MAIA_OTLP_SAMPLE_RATIO=1` (pior caso), gate de **10 % relativo** em
+  p95/p99/throughput (margem ratificada na #736), zero erros novos, perda
+  CONTADA por `reason` (nenhum span sem destino conhecido), fila ≤ 2048 e o
+  delta REAL de séries em `/metrics` por família. Provider de LLM e canal são
+  sintéticos, o collector roda em-processo: **piso, não produção**. O que
+  CONTINUA sem medição é a cardinalidade sob tráfego REAL de produção — por
+  decisão do dono (2026-09-03), tráfego real é gatilho de validação de
+  cardinalidade pós-canário, não substituto da prova pré-canário. Ver
+  `docs/runbooks/operational.md` §12;
 - **fault injection e teste de carga** (issue #510) não entraram.
 
 ---

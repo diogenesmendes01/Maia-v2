@@ -1657,6 +1657,115 @@ O harness **nunca roda `ANALYZE`** — num banco compartilhado com a suíte,
 
 ---
 
+## 12. A/B de overhead do trace OTLP ligado sob carga (issue #535, critério 4)
+
+`npm run otlp:bench` é a resposta à decisão do dono de 2026-09-03 — "o
+micro-benchmark atual não fecha o critério de overhead; preciso de A/B com OTLP
+ligado, cobrindo serialização, batching, collector/rede e hot path sob carga".
+Ele dirige turnos **reais** pelo entry point do worker (`runAgentForMensagem`,
+nas mesmas três camadas de `src/gateway/queue.ts`) contra um Postgres real, e
+compara três braços no **mesmo processo, mesma massa, mesma janela,
+alternados** por rodada (quadrado latino — cada rodada começa por um braço
+diferente):
+
+| braço | o que é |
+|---|---|
+| `off` | O caminho de produção de hoje (`tracingEnabled() === false`). O harness **prova** o curto-circuito com duas medições: `tracingEnabled()` lido durante o braço e zero bytes no collector. "Zero spans no sink" não é medido — o sink é `null` por construção, e instalar um contador para medi-lo viraria o próprio boolean |
+| `on-local` | O `OtlpSpanExporter` de produção (fila 2048, batch 256, tick 5 s) com `MAIA_OTLP_SAMPLE_RATIO=1` — pior caso; produção é 0,05 — contra um collector HTTP local que aceita `/v1/traces`, conta spans/bytes/batches e responde 200 |
+| `on-slow` | O mesmo collector com 200 ms de atraso (`--collector-delay-ms`) e 20 % dos batches recusados com 503 (`--collector-fail-ratio`): collector lento/caído NÃO pode tocar o hot path |
+
+O que é sintético — e por isso os números são **piso, não produção**: o
+provider de LLM (`_injectProviderForTests`, o mesmo seam de `llm:bench`),
+que responde em 0 ms e torna o turno o mais sensível possível ao custo da
+instrumentação; o canal, semeado `is_synthetic = true` para que a fronteira
+única de saída o roteie ao sink inerte da plataforma; e o collector, que roda
+em-processo (viés conservador: disputa o event loop com os turnos).
+
+### O comando
+
+```bash
+DATABASE_URL=postgres://maia_test:test1234@localhost:5432/maia_test \
+  npm run otlp:bench                              # gate: 3 rodadas × 200 turnos por braço
+npm run otlp:bench -- --mode measure --rounds 5 --turns 400
+npm run otlp:bench -- --scenario tool            # cobre tool.dispatch e os quatro portões
+npm run otlp:bench -- --json
+```
+
+Pré-requisitos: banco migrado (o seed cria pessoa `dono`, canal sintético,
+política de canal, entidade e permissão por slot de concorrência, e apaga tudo
+no fim) e Redis. Sem `MAIA_OTLP_TRACES_ENDPOINT` no ambiente — o harness
+aponta o endpoint para o collector dele ANTES de importar o projeto e confere
+que `config` congelou com esse valor.
+
+### Os critérios (cada um nomeado no relatório, com o número e o limiar)
+
+| critério | limiar | por quê |
+|---|---|---|
+| `[off]` curto-circuito provado | `tracingEnabled=false` e collector 0 bytes (medidos); sink=null por construção (guarda: o harness não pode ter instalado sink no `off`) | Sem isso o braço de referência não é o caminho de produção |
+| `[on-local]`/`[on-slow]` p95 e p99 do turno | ≤ `off` × 1,10 | Margem ratificada (#736): orçamento de regressão, não medida do ruído |
+| `[on-local]`/`[on-slow]` throughput | ≥ `off` × 0,90 | idem |
+| erros novos | 0 (erros ≤ erros do `off`) | Observabilidade nunca é participante do fluxo de controle |
+| cada turno alcançou o modelo | chamadas ao provider ≥ turnos | Anti-vacuidade: um turno que morreu cedo não abre span e reduziria o custo aparente |
+| `not_sampled = 0` | — | Prova que o pior caso (ratio 1) foi o que rodou |
+| `[on-local]` recebidos = emitidos − not_sampled; descartes = 0 | — | Collector saudável ⇒ sem perda; a métrica `maia_otlp_spans_exported_total` tem de bater com o que o collector contou |
+| `[on-slow]` perda contabilizada | emitidos = recebidos + descartados por `reason`; `http_5xx` = recusados pelo collector | Nenhum span sem destino conhecido — a perda é contada, não zero |
+| `[on-slow]` fila ≤ 2048 | `--queue-size` | O teto de memória vale sob collector lento |
+| `[on-slow]` collector degradado de fato | export p50 ≥ atraso; batches recusados > 0 | Anti-vacuidade: o braço tem de ter sido lento MESMO |
+
+`skipped ⇒ passed=false`: um braço que não rodou reprova o gate em vez de
+sumir do veredicto. `--mode measure` mede, imprime os mesmos critérios como
+informação e sai 0 dizendo em caixa alta que não houve veredicto.
+
+### Cardinalidade real
+
+O relatório traz o delta de linhas em `/metrics` antes e depois de **cada**
+braço e as séries `maia_*` por família. O que o tráfego deste harness cunha
+no caminho ligado são as séries do próprio exporter (`maia_otlp_export_duration_ms`,
+`maia_otlp_spans_exported_total`, `maia_otlp_spans_dropped_total{reason}`,
+`maia_otlp_queue_depth`) — uma vez por processo, nunca por turno. O que
+CONTINUA sem medição é a cardinalidade sob tráfego REAL de produção: por
+decisão do dono, tráfego real é gatilho de validação pós-canário, não
+substituto desta prova.
+
+### Provar que o gate reprova
+
+```bash
+npm run otlp:bench -- --self-test                                   # exit 0 sobre números sintéticos saudáveis
+npm run otlp:bench -- --self-test --inject on-local.p95_ms=900      # exit 1: p95 acima de off × 1,10
+npm run otlp:bench -- --self-test --inject on-local.spans_received=10   # exit 1: perda com collector saudável
+npm run otlp:bench -- --self-test --inject on-slow.queue_depth_max=4096 # exit 1: fila acima do teto
+npm run otlp:bench -- --self-test --inject off.sink_calls=1            # exit 1: um sink instalado no `off`
+```
+
+`--inject` só existe junto de `--self-test`; numa corrida medida ele é
+recusado. A sonda no harness REAL — a que prova que o veredicto está ligado
+aos números MEDIDOS e não a um carimbo — é injetar custo no hot path e ver o
+gate reprovar: um busy-wait de 2 ms por span no sink do harness
+(`setupArm`, `scripts/otlp-overhead-benchmark.ts`) põe ~30 ms em cada turno
+ligado e deixa `[on-local]`/`[on-slow] p95` vermelhos; desfaça, `git diff`
+limpo, verde de novo. `--relative-margin 0` é a sonda barata, mas só fica
+vermelha quando o custo medido é positivo — num host quieto o braço ligado
+pode ficar ABAIXO do `off` por ruído, e isso não é defeito do gate. O spec
+unitário `tests/unit/scripts/otlp-overhead-benchmark.spec.ts` prova cada
+critério por injeção, sem banco.
+
+### Lendo o vermelho
+
+- **`on-local` reprova por pouco e SÓ na primeira rodada em que rodou**: é
+  aquecimento assimétrico, não overhead — a primeira corrida deste harness
+  aqueceu só o `off` e o `on-local` estreou o caminho de export (JIT de
+  `encodeSpans`/`JSON.stringify`, primeira conexão do `fetch`) dentro do
+  relógio. Desde então o aquecimento percorre todos os braços
+  (`--warmup-turns` é POR braço). A margem não se mexe.
+- **`on-slow` reprova em latência**: o collector lento chegou ao hot path.
+  Olhe `fila max` (o exporter está bloqueando?) e `export p95` — o transporte
+  é assíncrono por construção, então isso é bug do exporter, não do collector.
+- **perda não contabilizada**: `emitidos ≠ recebidos + descartados`. Ou o
+  exporter perdeu span sem contar (bug) ou o collector contou errado — o
+  `parse_errors` do collector separa os dois.
+
+---
+
 ## Apêndice — referências cruzadas
 
 - **`docs/runbooks/redis.md`** — política de memória multi-tenant, sizing, sinais de pressão. Leia ANTES de mexer em `maxmemory*` no compose ou no Redis gerenciado.
