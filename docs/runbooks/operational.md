@@ -1670,7 +1670,7 @@ diferente):
 
 | braço | o que é |
 |---|---|
-| `off` | O caminho de produção de hoje (`tracingEnabled() === false`). O harness **prova** o curto-circuito: `tracingEnabled()` lido durante o braço, zero spans no sink, zero bytes no collector |
+| `off` | O caminho de produção de hoje (`tracingEnabled() === false`). O harness **prova** o curto-circuito com duas medições: `tracingEnabled()` lido durante o braço e zero bytes no collector. "Zero spans no sink" não é medido — o sink é `null` por construção, e instalar um contador para medi-lo viraria o próprio boolean |
 | `on-local` | O `OtlpSpanExporter` de produção (fila 2048, batch 256, tick 5 s) com `MAIA_OTLP_SAMPLE_RATIO=1` — pior caso; produção é 0,05 — contra um collector HTTP local que aceita `/v1/traces`, conta spans/bytes/batches e responde 200 |
 | `on-slow` | O mesmo collector com 200 ms de atraso (`--collector-delay-ms`) e 20 % dos batches recusados com 503 (`--collector-fail-ratio`): collector lento/caído NÃO pode tocar o hot path |
 
@@ -1701,7 +1701,7 @@ que `config` congelou com esse valor.
 
 | critério | limiar | por quê |
 |---|---|---|
-| `[off]` curto-circuito provado | `tracingEnabled=false`, sink 0, collector 0 bytes | Sem isso o braço de referência não é o caminho de produção |
+| `[off]` curto-circuito provado | `tracingEnabled=false` e collector 0 bytes (medidos); sink=null por construção (guarda: o harness não pode ter instalado sink no `off`) | Sem isso o braço de referência não é o caminho de produção |
 | `[on-local]`/`[on-slow]` p95 e p99 do turno | ≤ `off` × 1,10 | Margem ratificada (#736): orçamento de regressão, não medida do ruído |
 | `[on-local]`/`[on-slow]` throughput | ≥ `off` × 0,90 | idem |
 | erros novos | 0 (erros ≤ erros do `off`) | Observabilidade nunca é participante do fluxo de controle |
@@ -1734,7 +1734,7 @@ npm run otlp:bench -- --self-test                                   # exit 0 sob
 npm run otlp:bench -- --self-test --inject on-local.p95_ms=900      # exit 1: p95 acima de off × 1,10
 npm run otlp:bench -- --self-test --inject on-local.spans_received=10   # exit 1: perda com collector saudável
 npm run otlp:bench -- --self-test --inject on-slow.queue_depth_max=4096 # exit 1: fila acima do teto
-npm run otlp:bench -- --self-test --inject off.sink_calls=1            # exit 1: `off` deixou de curto-circuitar
+npm run otlp:bench -- --self-test --inject off.sink_calls=1            # exit 1: um sink instalado no `off`
 ```
 
 `--inject` só existe junto de `--self-test`; numa corrida medida ele é

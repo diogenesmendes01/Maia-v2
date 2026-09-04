@@ -127,7 +127,7 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
     ['fila acima do teto', { 'on-slow.queue_depth_max': 4096 }, /fila nunca acima de 2048/],
     ['collector que não foi lento de fato', { 'on-slow.export_p50_ms': 1 }, /collector degradado de fato/],
     ['collector que não recusou nada com fail-ratio > 0', { 'on-slow.spans_rejected': 0 }, /collector degradado de fato/],
-    ['off que deixou de curto-circuitar (span no sink)', { 'off.sink_calls': 1 }, /\[off\] curto-circuito provado/],
+    ['off com um sink instalado (o harness contou span onde não devia existir sink)', { 'off.sink_calls': 1 }, /\[off\] curto-circuito provado/],
     ['off com tracing ligado', { 'off.tracing_enabled': 1 }, /\[off\] curto-circuito provado/],
     ['off com bytes no collector', { 'off.bytes': 10 }, /\[off\] curto-circuito provado/],
     ['erro no braço off', { 'off.errors': 2 }, /\[off\] erros = 0/],

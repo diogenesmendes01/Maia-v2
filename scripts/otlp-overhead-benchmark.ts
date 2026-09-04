@@ -29,9 +29,13 @@
  * diferente, então nenhum braço paga sempre o custo de "ir primeiro"):
  *
  *  - **`off`** — o caminho de produção de hoje: `tracingEnabled() === false`.
- *    O harness PROVA o curto-circuito em vez de presumi-lo: durante o braço,
- *    `tracingEnabled()` é lido e tem que ser `false`, o sink recebe zero spans
- *    e o collector recebe zero bytes (critério nomeado no veredicto).
+ *    O harness PROVA o curto-circuito em vez de presumi-lo, e a prova são DUAS
+ *    medições: `tracingEnabled()` lido durante o braço tem que ser `false`, e o
+ *    collector tem que receber zero bytes. "Zero spans no sink" NÃO é medição
+ *    neste braço — o sink é `null` por construção (`setSpanSink(null)`), então
+ *    não há o que contar; instalar um contador para medir isso viraria o
+ *    próprio boolean que se quer provar. O critério diz isso com essas
+ *    palavras.
  *  - **`on-local`** — exporter OTLP real (`OtlpSpanExporter`, o de produção,
  *    com os MESMOS limites: fila 2048, batch 256, tick 5 s) apontando para um
  *    collector HTTP que aceita `/v1/traces`, conta spans/bytes/batches e
@@ -117,7 +121,7 @@
  *   npm run otlp:bench -- --self-test --inject on-local.p95_ms=900        # prova que o gate reprova
  *   npm run otlp:bench -- --self-test --inject on-local.spans_received=10 # perda com collector saudável
  *   npm run otlp:bench -- --self-test --inject on-slow.queue_depth_max=4096
- *   npm run otlp:bench -- --self-test --inject off.sink_calls=1           # `off` deixou de curto-circuitar
+ *   npm run otlp:bench -- --self-test --inject off.sink_calls=1           # um sink instalado no `off`
  *   npm run otlp:bench -- --json
  *
  * | Flag | Default | O que faz |
@@ -448,14 +452,23 @@ export function evaluateGate(arms: readonly ArmResult[], t: Thresholds): Verdict
     v.push(skipped('[off] curto-circuito provado', 'o braço `off` não rodou'));
     v.push(skipped('[off] erros = 0', 'o braço `off` não rodou'));
   } else {
+    // Duas MEDIÇÕES (`tracingEnabled()` lido no braço; bytes no collector) e
+    // uma guarda: `sink_calls` no `off` é zero por construção — o sink é
+    // `null`, nada é instalado, nada há para contar —, então um valor > 0 só
+    // pode significar que o harness instalou um sink no braço errado. Não é
+    // "0 spans medidos"; é "nenhum sink existiu".
     const ok =
       !off.tracing_enabled && off.sink_calls === 0 && off.spans_received === 0 && off.bytes === 0;
     v.push({
-      label: '[off] curto-circuito provado (tracingEnabled=false, 0 spans no sink, 0 bytes no collector)',
+      label:
+        '[off] curto-circuito provado (tracingEnabled=false e 0 bytes no collector; sink=null por construção)',
       passed: ok,
       detail:
-        `tracingEnabled=${off.tracing_enabled} · sink=${off.sink_calls} · ` +
-        `collector=${off.spans_received} spans/${off.bytes} bytes${ok ? '' : ' ✗'}`,
+        `tracingEnabled=${off.tracing_enabled} · collector=${off.spans_received} spans/${off.bytes} bytes · ` +
+        (off.sink_calls === 0
+          ? 'sink=null por construção (nada a contar)'
+          : `sink instalado no off: ${off.sink_calls} spans contados`) +
+        (ok ? '' : ' ✗'),
     });
     v.push({
       label: '[off] erros = 0',
@@ -1294,7 +1307,10 @@ function setupArm(deps: Deps, arm: ArmName, opts: Options, collector: Collector)
   collector.reset();
   if (arm === 'off') {
     // O caminho de produção sem endpoint: `tracingEnabled()` curto-circuita no
-    // `sink !== null`. Nada é alocado por span.
+    // `sink !== null`. Nada é alocado por span. Os contadores devolvidos no
+    // teardown são ZERO POR CONSTRUÇÃO, não medidos — não há sink instalado,
+    // logo não há o que contar; a prova do braço é `tracingEnabled()===false`
+    // + 0 bytes no collector (ver `evaluateGate`).
     deps.setSpanSink(null);
     collector.setMode({ delay_ms: 0, fail_ratio: 0 });
     return {
