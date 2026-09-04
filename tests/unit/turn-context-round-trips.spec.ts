@@ -38,8 +38,10 @@ import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '.
  *     JOIN, and now it is one (`entidadesRepo.byIdsWithState`).
  *
  * Neither changes what the prompt says; both are pure duplication removal.
- * `TURN_ROUND_TRIP_TARGET` (8) is NOT met — the remaining reads are all
- * distinct tables whose merge needs a cross-table statement. See the module doc.
+ * The old ≤8 goal (`TURN_ROUND_TRIP_TARGET`) was RETIRED by the #525 owner
+ * decision (2026-09-02): the goal is latency now, and the count survives only
+ * as the O(1)-growth guardrail this file (and the gate) enforce. See the
+ * module doc and `src/agent/turn-context/types.ts`.
  */
 
 type Counters = Record<string, number>;
@@ -135,10 +137,7 @@ vi.mock('../../src/lib/logger.js', () => ({
 
 import { buildPrompt, renderTurnPrompt, type PromptContext } from '../../src/agent/prompt-builder.js';
 import { loadTurnContext } from '../../src/agent/turn-context/loader.js';
-import {
-  TURN_ROUND_TRIP_BUDGET,
-  TURN_ROUND_TRIP_TARGET,
-} from '../../src/agent/turn-context/types.js';
+import { TURN_ROUND_TRIP_BUDGET } from '../../src/agent/turn-context/types.js';
 import { resolveScope, type ResolvedPermission } from '../../src/governance/permissions.js';
 
 let permissoesFixture: Permissao[] = [];
@@ -425,13 +424,16 @@ describe('#525 turn round-trip budget', () => {
     });
   });
 
-  it('the declared budget is above the goal issue #525 still targets', () => {
-    // Honest bookkeeping rather than a green tick on a goal that is not met:
-    // the ceiling this suite enforces is 13, the goal is 8, and the gap is
-    // documented in docs/architecture/modules/agent.md with the merge each
-    // remaining round-trip would need.
+  it('the declared budget is the measured count, and the ≤8 goal stays retired', async () => {
+    // Honest bookkeeping, after the #525 owner decision (2026-09-02): the
+    // budget is the MEASURED count this suite enforces exactly (the O(1)
+    // guardrail against a silent N+1), not a goal. The old ≤8 target
+    // (`TURN_ROUND_TRIP_TARGET`) was retired — the acceptance criterion is
+    // latency, judged by the gate (`npm run turn:bench`). If someone
+    // re-exports the constant, this test is the place that must be argued
+    // with first.
     expect(TURN_ROUND_TRIP_BUDGET).toBe(13);
-    expect(TURN_ROUND_TRIP_TARGET).toBe(8);
-    expect(TURN_ROUND_TRIP_BUDGET).toBeGreaterThan(TURN_ROUND_TRIP_TARGET);
+    const types = await import('../../src/agent/turn-context/types.js');
+    expect('TURN_ROUND_TRIP_TARGET' in types).toBe(false);
   });
 });
