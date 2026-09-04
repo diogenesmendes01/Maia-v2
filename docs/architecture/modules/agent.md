@@ -185,9 +185,20 @@ with no state row already had. Still one statement.
 `tests/integration/turn-context-scope-cardinality.spec.ts` holds it with 501
 entities on one profile.
 
-**The ≤8 target of issue #525 is NOT met** (`TURN_ROUND_TRIP_TARGET`). Every
-remaining read is a different table, so closing the gap needs cross-table
-statements rather than de-duplication. The candidates, with what each is worth:
+**The ≤8 target of issue #525 was RETIRED by owner decision (2026-09-02)** —
+`TURN_ROUND_TRIP_TARGET` no longer exists in the code:
+
+> "#525: escolho reescrever a meta em termos de latência. Não vamos pagar cerca
+> de 3× no p95 apenas para atingir ≤8. A contagem continua como guardrail, com
+> crescimento O(1); p95, p99, throughput e erros passam a ser os critérios
+> principais."
+
+The acceptance criterion is latency now, judged by the gate; the statement
+count survives as an **O(1)-growth guardrail** (count at N=100 must equal count
+at N=1, zero tolerance — enforced both by the round-trips spec and by the gate
+on measured turns), and the absolute ceiling is a report line. For the record,
+the merge candidates that the retired target pointed at, with what each was
+worth:
 
 | merge | saves | why not yet |
 |---|---|---|
@@ -278,16 +289,20 @@ What the gate decides (exit code 0/1), and why each one is there:
 | errors, timeouts | 0 | a fast turn that fails is not a fast turn |
 | peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
 | peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
-| `resolveScope` reads per turn | = 2 | #700. 0 means the scope was fabricated in memory (or the fixture lost the tables); more than 2 means an N+1 in the scope path. The count comes from the same per-turn instrument as peak reads, so it asserts what *ran* |
-| resolved scope size | 1–100, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; this also catches a permission dropped by the 500-profile cap |
-| p95 of the `resolveScope` stage | ≤ 600 ms | deliberately conservative — the stage is 2 of 13 queries, so eating the whole turn budget alone is pathological. The sharp defence is the total p95, which now includes the stage |
-| whole-turn budget (`resolveScope` + `buildPrompt`) | the three rows above, on every arm | the aggregate #700 names. It reads the measured numbers, not the coverage flag |
+| `resolveScope` reads per turn | ≥ 1 (the count itself is measured and REPORTED, not fixed) | #700, rewritten by the #525 owner decision. 0 means the scope was fabricated in memory (or the fixture lost the tables). The old `= 2` upper bound would have failed the #693 fusion (`forPessoaComProfile`, one read) *by construction*; the N+1 it caught now falls to the O(1) row below, which sees an N+1 in **any** stage, not just the scope. The count comes from the same per-turn instrument as peak reads, so it asserts what *ran* |
+| statements per turn are O(1) in cardinality | count envelope at N=100 **equals** N=1, zero tolerance | the guardrail the owner kept when retiring the ≤8 target. The absolute ceiling (12, 13…) is a report line, not a criterion |
+| resolved scope size | 1–100, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; this also catches a permission dropped by a batch cap |
+| p95 of the `resolveScope` stage | ≤ 600 ms | deliberately conservative — eating the whole turn budget in the scope stage alone is pathological. The sharp defence is the total p95, which now includes the stage |
+| whole-turn budget (`resolveScope` + `buildPrompt`) | the scope-evidence rows above, on every arm | the aggregate #700 names. It reads the measured numbers, not the coverage flag |
 | distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
 | pool sampling actually observed the run | samples > 0, blind gap ≤ 10× `--sample-ms` | the criterion below is worthless without it — see the trap |
 | pool drains (**normal profile**, paced) | during load, never saturated 60 s straight | see the trap below |
 | pool drains (**saturation profile**, `--think-ms 0`) | after the producer stops | demanding it *during* load is arithmetically impossible — the owner's ruling |
 | `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
-| p95 vs baseline | ≤ baseline + 20 %, **same fingerprint** | absolute ceilings do not catch a slow drift; a baseline from another load is not a baseline |
+| p95 and p99 vs baseline | ≤ baseline × 1.10, **same fingerprint** | the MAIN criteria since the #525 decision. The margin is a named parameter (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`); 10 % because baseline and candidate are measured in the same window — the cross-day variance that justified the old +20 % is excluded by protocol |
+| throughput vs baseline | ≥ baseline × 0.90 | a "faster" turn that pays its p95 with queueing shows up here |
+| per-cardinality p95/p99 vs baseline | ≤ baseline × 1.10 at each of N=1/10/100 | a regression that lives only in the N=100 turns must not hide inside the arm aggregate |
+| load average around each arm | recorded before/after (report line) | the "same window and conditions" evidence the owner's protocol requires; on a 4-CPU host, load > 4 means do not measure |
 | load shape | 50 pairs, concurrency 20, 1/10/100 | a gate run on 4 tenants is not this gate |
 
 **The saturation trap.** Comparing "longest saturated streak < 60 s" and nothing
@@ -359,15 +374,16 @@ the stress profile, where the drain criterion is red by construction.
 the host it was measured on, and a note saying whether it is a first measurement
 or a re-record. **It is not checked in**, and `.gitignore` keeps it that way. A
 baseline is a measurement of one machine at one moment, and shipping one file as
-if it were a shared reference makes the +20 % criterion red on arrival for
+if it were a shared reference makes the relative criteria red on arrival for
 everybody else: a baseline recorded here at p95 67.0 ms (`cold`) / 75.9 ms
 (`warm`) was replayed on the same 4-vCPU host in a later container and measured
 135.5 / 118.5 ms and then 154.1 / 114.9 ms — the same code, +56 % to +130 % over
 the recorded number, with the gate's own ceilings (600 ms / 1 s) never
 threatened. So each host and each CI lane records its own on first run with
 `--mode measure --write-baseline`, and without one the harness reports the
-relative criterion as `n/a` — **which fails the gate**, because the gate promises
-`p95 ≤ baseline + 20 %` and cannot stamp what it never measured. A gate run never
+relative criteria as `n/a` — **which fails the gate**, because the gate promises
+`p95/p99 ≤ baseline × 1.10` (and `throughput ≥ baseline × 0.90`) and cannot
+stamp what it never measured. A gate run never
 writes a baseline as a side effect, and `--write-baseline` outside `--mode
 measure` is refused with exit 2. Not versioning the file was right; letting the
 resulting no-baseline state exit 0 turned "exceptional state that warns" into the
@@ -621,12 +637,15 @@ At last verification (2026-05-28):
 - Skill execution via `runSkill` from decision engine (#216 — merged)
 - AbortSignal plumbed from skill runner to LLM call (#221 — merged)
 - Turn-context loader integrated + pure renderer (#525 — this change). Still
-  open in #525: the ≤8 round-trip target, and returning `capabilities`/`gaps`
-  to the cache (decision to keep them out is recorded above).
-- Performance gate for #525 (`npm run turn:bench`, `scripts/turn-context-benchmark.ts`).
-  The measured run is green on every criterion; whether 13 becomes the definitive
-  budget or the ≤8 target stays open is an **owner decision** and this change does
-  not take it — it supplies the numbers the decision needs.
+  open in #525: returning `capabilities`/`gaps` to the cache (decision to keep
+  them out is recorded above). The ≤8 round-trip target is **closed by owner
+  decision (2026-09-02)**: the goal was rewritten in terms of latency, the
+  count stays as the O(1)-growth guardrail, and the absolute ceiling is a
+  report line.
+- Performance gate for #525 (`npm run turn:bench`, `scripts/turn-context-benchmark.ts`),
+  corrected to the latency-first criteria above. Candidate PR #693 (fusing the
+  two scope reads into one) is judged by this corrected gate: baseline and
+  candidate in the same window, relative margins, O(1) count guardrail.
 - PR #541 review follow-up: the shared read gate (finding 1) and the JOIN's
   entity-side cardinality (finding 2), both described above.
 
