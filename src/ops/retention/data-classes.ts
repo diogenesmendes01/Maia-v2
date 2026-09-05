@@ -15,15 +15,14 @@
  *
  * So every class ships with `retention_days: null`, and `resolveRetention`
  * reports `purgeable: false` for all of them. The MECHANISM is complete and
- * tested; the POLICY arrives as configuration (`RETENTION_POLICY`, a
- * signed-off JSON carrying a version + approver + per-class day counts).
+ * tested; the POLICY arrives as configuration (`RETENTION_POLICY`, a signed-off
+ * JSON carrying a version + approver + per-class day counts).
  *
- * ONE class is no longer a question to the DPO: `privacy.tombstone`. The
- * platform owner corrected the premise ("minimum retention" was the wrong
- * question — the class is structurally non-purgeable, which is stronger) and
- * RATIFIED that design (issue #536, 2026-09-02; reaffirmed 2026-09-03 in the
- * review of PR #732). Its `approval_state` is `'ratified_by_owner'` and it
- * carries an `owner_ratification` record instead of a `dpo_open_question`.
+ * Issue #536 split the "still open" side of that: each class now carries a
+ * `decision` that names WHO owes the answer (`DecisionOwner`) — Legal/DPO, Ops
+ * or Security — or records a decision already ratified by the platform owner.
+ * `approval_state` is derived from it and is `'pending_dpo'` for every class
+ * except `privacy.tombstone`, which is ratified.
  *
  * The conservative default is deliberately "do not delete": deletion is
  * irreversible, so the failure mode of an unapproved policy must be keeping
@@ -82,58 +81,69 @@ export interface DataClass {
    */
   retention_days: null;
   /**
-   * DERIVED by `cls()` from which of the two fields below is present — never
-   * written by hand, so the pair can never disagree. `'pending_dpo'` for every
-   * class still waiting on the DPO; `'ratified_by_owner'` for a class whose
-   * design the platform owner has ratified (today: `privacy.tombstone` only).
+   * DERIVED from `decision` by `cls()` — never written by hand, so the pair can
+   * never disagree. `'pending_dpo'` is kept as the wire value for the classes
+   * that are still open, because that is what every reader of this field means
+   * by it; a class the platform owner has ratified reports
+   * `'ratified_by_owner'`.
    */
   approval_state: 'pending_dpo' | 'ratified_by_owner';
   /**
-   * What the DPO still has to decide for this class — `null` exactly when the
-   * platform owner ratified the design (`approval_state: 'ratified_by_owner'`).
+   * What is still owed on this class and WHO owes it — or the decision already
+   * taken. Required and a union on purpose: there is no way to add a class
+   * without saying which of the two it is (issue #536).
    */
-  dpo_open_question: string | null;
-  /**
-   * The ratification record — non-null exactly when `approval_state` is
-   * `'ratified_by_owner'`. `cls()`'s input type makes the two states mutually
-   * exclusive, so a class cannot carry both a question and a ratification,
-   * nor neither.
-   */
-  owner_ratification: OwnerRatification | null;
+  decision: ClassDecision;
 }
 
 /**
- * A design decision the PLATFORM OWNER ratified — a different authority from
- * the DPO, and labelled as such wherever it surfaces. A ratified class is
- * absent from `openDpoQuestions()`: printing a taken decision as an open
- * question is exactly the defect issue #536 asked to fix.
+ * Who is accountable for the decision a class is still waiting on.
+ *
+ * Before issue #536 every open item was carried in a field literally called
+ * `dpo_open_question` and printed by `openDpoQuestions()` — including
+ * `queue.redis` ("ops owns the TTLs") and `gateway.baileys_session` ("the
+ * security owner must approve"). A single list addressed to one role is a list
+ * nobody can be held to: the DPO reads items that are not theirs, and the
+ * items that ARE ops's or security's are invisible to them.
+ *
+ * `'unassigned'` is a real, printable value and NOT a default — a class lands
+ * there only when the content genuinely does not say who decides, and it is
+ * listed as such so the gap is visible instead of parked under whoever the
+ * list happened to be addressed to.
  */
-export interface OwnerRatification {
-  readonly ratified_by: 'platform_owner';
-  /** When and where the ratification was received, as it was received. */
-  readonly ratified_in: string;
-  /** The design that was ratified. */
-  readonly decision: string;
-  /** Why it is the decision — the argument, not a restatement. */
-  readonly rationale: string;
-}
+export type DecisionOwner = 'legal_dpo' | 'ops' | 'security' | 'unassigned';
 
-type ClsInput = Omit<
-  DataClass,
-  'retention_days' | 'approval_state' | 'dpo_open_question' | 'owner_ratification'
-> &
-  (
-    | { dpo_open_question: string; owner_ratification?: never }
-    | { owner_ratification: OwnerRatification; dpo_open_question?: never }
-  );
+/**
+ * A class's decision state. Discriminated union: a ratified class cannot be
+ * written without its decision text, and an open one cannot be written without
+ * an owner. Omitting either half is a type error, not a silent default.
+ */
+export type ClassDecision =
+  | {
+      readonly state: 'open';
+      /** Who has to answer `question`. */
+      readonly owner: DecisionOwner;
+      readonly question: string;
+    }
+  | {
+      readonly state: 'ratified_by_owner';
+      /** Where the ratification came from, as it was received. */
+      readonly ratified_in: string;
+      /** The design that was ratified. */
+      readonly decision: string;
+      /** Why it is the decision — the argument, not a restatement. */
+      readonly rationale: string;
+      /** Anything still owed after the ratification, or `null`. */
+      readonly still_owed: { readonly owner: DecisionOwner; readonly question: string } | null;
+    };
 
-function cls(d: ClsInput): DataClass {
+function cls(
+  d: Omit<DataClass, 'retention_days' | 'approval_state'>,
+): DataClass {
   return {
     ...d,
     retention_days: null,
-    dpo_open_question: d.dpo_open_question ?? null,
-    owner_ratification: d.owner_ratification ?? null,
-    approval_state: d.owner_ratification ? 'ratified_by_owner' : 'pending_dpo',
+    approval_state: d.decision.state === 'ratified_by_owner' ? 'ratified_by_owner' : 'pending_dpo',
   };
 }
 
@@ -155,8 +165,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'retention period for inbound/outbound message bodies, and whether transcripts of audio require a shorter one',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'retention period for inbound/outbound message bodies, and whether transcripts of audio require a shorter one',
+    },
   }),
   cls({
     id: 'postgres.conversations',
@@ -170,7 +184,11 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question: 'whether a conversation shell may outlive its messages for statistics',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question: 'whether a conversation shell may outlive its messages for statistics',
+    },
   }),
   cls({
     id: 'postgres.people',
@@ -186,8 +204,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'which identifiers must be anonymised vs deleted, and the accounting retention that overrides an erasure request',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'which identifiers must be anonymised vs deleted, and the accounting retention that overrides an erasure request',
+    },
   }),
   cls({
     id: 'postgres.memory',
@@ -201,8 +223,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'whether derived memory inherits the retention of its source message or has its own',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'whether derived memory inherits the retention of its source message or has its own',
+    },
   }),
   cls({
     id: 'postgres.financial',
@@ -217,8 +243,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'the statutory accounting retention that overrides an erasure request, and its legal basis',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'the statutory accounting retention that overrides an erasure request, and its legal basis',
+    },
   }),
   cls({
     id: 'postgres.audit',
@@ -233,8 +263,20 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'how long the audit trail is retained, and which fields may be redacted without destroying its evidential value ("auditabilidade não justifica conservar conteúdo bruto indefinidamente")',
+    // O DONO desta decisão fica `'unassigned'` DE PROPÓSITO, e é o único caso.
+    // A pergunta abaixo está CONGELADA (nenhuma mudança campo a campo sem a
+    // decisão acordada) e ela junta duas metades com donos diferentes: o PRAZO
+    // do rastro (Legal/DPO) e QUAIS CAMPOS podem ser redigidos sem destruir o
+    // valor probatório (Security). Atribuir a um dos dois exigiria separar a
+    // pergunta — exatamente a edição que o congelamento reserva. Então o item
+    // vai para a lista "dono a definir", visível, em vez de ser empurrado para
+    // quem por acaso encabeçava a lista antiga. O texto não foi tocado.
+    decision: {
+      state: 'open',
+      owner: 'unassigned',
+      question:
+        'how long the audit trail is retained, and which fields may be redacted without destroying its evidential value ("auditabilidade não justifica conservar conteúdo bruto indefinidamente")',
+    },
   }),
   cls({
     id: 'postgres.traces',
@@ -248,7 +290,11 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: false,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question: 'debug trace retention (bodies contain raw prompts and replies)',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question: 'debug trace retention (bodies contain raw prompts and replies)',
+    },
   }),
   cls({
     id: 'media.blobs',
@@ -264,8 +310,17 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'whether media is durable data requiring its own backup, or ephemeral/recreatable and purgeable — and its retention if durable',
+    // Ops antes do DPO, e a ordem é a razão da atribuição: enquanto não se
+    // decidir se a mídia é durável (backup próprio, checksum, hold) ou
+    // recriável, não há prazo a decidir. Se a resposta for "durável", a metade
+    // do PRAZO volta para Legal/DPO — está escrito em `still_owed` do dia em
+    // que a primeira metade for respondida, não hoje.
+    decision: {
+      state: 'open',
+      owner: 'ops',
+      question:
+        'whether media is durable data requiring its own backup, or ephemeral/recreatable and purgeable — and its retention if durable',
+    },
   }),
   cls({
     // Issue #634 (fatia E da #506) — a mídia de SAÍDA ganhou um lugar durável
@@ -295,8 +350,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'how long an outbound media object whose delivery ended uncertain or terminal may be kept so reconciliation and manual re-arm can still send the SAME bytes — deleting it earlier turns a recoverable delivery into a permanent media_ref_unresolved',
+    decision: {
+      state: 'open',
+      owner: 'ops',
+      question:
+        'how long an outbound media object whose delivery ended uncertain or terminal may be kept so reconciliation and manual re-arm can still send the SAME bytes — deleting it earlier turns a recoverable delivery into a permanent media_ref_unresolved',
+    },
   }),
   cls({
     id: 'gateway.baileys_session',
@@ -312,8 +371,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: false,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question:
-      'none (operational secret, not personal data) — but the security owner must approve the re-pair vs encrypted-backup decision',
+    decision: {
+      state: 'open',
+      owner: 'security',
+      question:
+        'none (operational secret, not personal data) — but the security owner must approve the re-pair vs encrypted-backup decision',
+    },
   }),
   cls({
     id: 'queue.redis',
@@ -329,7 +392,11 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: false,
     reversible: false,
     audit_event: 'retention_run_completed',
-    dpo_open_question: 'none (no independent personal data) — ops owns the TTLs',
+    decision: {
+      state: 'open',
+      owner: 'ops',
+      question: 'none (no independent personal data) — ops owns the TTLs',
+    },
   }),
   cls({
     id: 'backup.artifact',
@@ -343,8 +410,16 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     legal_hold_applicable: true,
     reversible: false,
     audit_event: 'backup_artifact_deleted',
-    dpo_open_question:
-      'how long artifacts are kept locally vs off-site, and the maximum window a deleted subject may still exist inside a retained artifact',
+    // Legal/DPO, e não Ops, porque o número que MANDA aqui é a janela máxima
+    // em que um titular já apagado ainda existe dentro de um artefato retido —
+    // uma consequência de privacidade. Onde o artefato mora (local vs off-site)
+    // é proposta de Ops feita DEBAIXO desse teto, não uma decisão paralela.
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'how long artifacts are kept locally vs off-site, and the maximum window a deleted subject may still exist inside a retained artifact',
+    },
   }),
   cls({
     id: 'privacy.export',
@@ -372,8 +447,12 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     // Sete dias é a POLÍTICA INICIAL decidida pelo dono (issue #536) e vive em
     // `PRIVACY_EXPORT_TTL_DAYS`, não numa constante. O que continua com o DPO é
     // confirmar (ou mudar) o número.
-    dpo_open_question:
-      'confirm or replace the initial 7-day export package lifetime (PRIVACY_EXPORT_TTL_DAYS); the mechanism that enforces it is live',
+    decision: {
+      state: 'open',
+      owner: 'legal_dpo',
+      question:
+        'confirm or replace the initial 7-day export package lifetime (PRIVACY_EXPORT_TTL_DAYS); the mechanism that enforces it is LIVE and sweeping hourly TODAY — this is a confirmation owed on running behaviour, not on a proposal',
+    },
   }),
   cls({
     id: 'privacy.tombstone',
@@ -390,18 +469,19 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
     reversible: false,
     audit_event: 'retention_run_completed',
     // ERA uma pergunta ao DPO ("qual é a retenção MÍNIMA de tombstone?") e a
-    // pergunta estava mal posta. O dono da plataforma corrigiu a premissa e
-    // ratificou o desenho que já está na `main`: a classe é `not_purgeable`,
-    // o que é MAIS FORTE que qualquer prazo mínimo. O campo deixou de ser uma
-    // pergunta e passou a ser a decisão registrada.
-    owner_ratification: {
-      ratified_by: 'platform_owner',
+    // pergunta estava mal posta. O dono corrigiu a premissa e ratificou o
+    // desenho que já está na `main`: a classe é `not_purgeable`, e isso é MAIS
+    // FORTE que qualquer prazo mínimo. Ver `ClassDecision` acima — o campo
+    // deixou de ser uma pergunta e passou a ser uma decisão registrada.
+    decision: {
+      state: 'ratified_by_owner',
       ratified_in:
-        'issue #536 — ratificação recebida por escrito na direção da tarefa (2026-09-02) e reafirmada na decisão do dono sobre a PR #732 (2026-09-03)',
+        'issue #536 — ratificação do dono da plataforma, recebida por escrito na direção da tarefa (2026-09-02) e reafirmada na decisão do dono sobre a PR #732 (2026-09-03)',
       decision:
-        "tombstones are structurally non-purgeable: `purge_mechanism: 'not_purgeable'` here, `parseRetentionPolicy` drops any policy entry for the class, and `resolveRetention` returns `class_not_purgeable` BEFORE it consults the policy at all",
+        'tombstones are structurally non-purgeable: `purge_mechanism: \'not_purgeable\'` here, `parseRetentionPolicy` drops any policy entry for the class, and `resolveRetention` returns `purgeable: false` with `class_not_purgeable` BEFORE it ever looks at the policy',
       rationale:
-        'a MINIMUM tombstone retention would have to exceed the LONGEST backup-artifact retention at all times — a period that has not even been decided yet — or restoring an old artifact resurrects data that should already be gone, the exact scenario tombstones exist to cover. Non-purgeable removes the arithmetic entirely: there is no period left to get wrong',
+        'a MINIMUM tombstone retention would have to exceed the LONGEST backup-artifact retention at all times, or restoring an old artifact resurrects data that should already be gone — the exact scenario tombstones exist to cover. Non-purgeable removes the arithmetic entirely: there is no period left to get wrong, and no future `RETENTION_POLICY` can shorten it',
+      still_owed: null,
     },
   }),
 ]);
@@ -565,27 +645,57 @@ export function resolveRetention(classId: string, policy: RetentionPolicy): Rete
   };
 }
 
+export interface OpenDecision {
+  data_class: string;
+  owner: DecisionOwner;
+  question: string;
+}
+
 /**
- * Every question still owed to the DPO, for the runbook and `maia doctor`.
- * A class the platform owner ratified is ABSENT — its decision is taken, and
- * printing it as an open question would present a different authority's
- * decision as still pending (issue #536).
+ * Every decision still open, with its owner. Ratified classes are absent —
+ * a ratified decision is not a question, and printing it as one is the exact
+ * defect issue #536 asked to fix.
  */
-export function openDpoQuestions(): { data_class: string; question: string }[] {
-  const out: { data_class: string; question: string }[] = [];
+export function openDecisions(): OpenDecision[] {
+  const out: OpenDecision[] = [];
   for (const c of DATA_CLASSES) {
-    if (c.dpo_open_question === null) continue;
-    out.push({ data_class: c.id, question: c.dpo_open_question });
+    if (c.decision.state !== 'open') continue;
+    out.push({ data_class: c.id, owner: c.decision.owner, question: c.decision.question });
   }
   return out;
 }
 
-/** The classes whose design the platform owner has ratified, for the same readers. */
-export function ownerRatifiedClasses(): { data_class: string; ratification: OwnerRatification }[] {
-  const out: { data_class: string; ratification: OwnerRatification }[] = [];
-  for (const c of DATA_CLASSES) {
-    if (c.owner_ratification === null) continue;
-    out.push({ data_class: c.id, ratification: c.owner_ratification });
-  }
-  return out;
+/**
+ * The same list, split by who is going to be asked for it — including the
+ * `unassigned` bucket, which is printed like any other instead of being hidden
+ * inside somebody else's.
+ */
+export function openDecisionsByOwner(): Record<DecisionOwner, OpenDecision[]> {
+  const grouped: Record<DecisionOwner, OpenDecision[]> = {
+    legal_dpo: [],
+    ops: [],
+    security: [],
+    unassigned: [],
+  };
+  for (const d of openDecisions()) grouped[d.owner].push(d);
+  return grouped;
+}
+
+/**
+ * Every question still owed TO THE DPO — and only those, now that the list is
+ * split. `queue.redis` and `gateway.baileys_session` used to show up here and
+ * were never the DPO's to answer.
+ */
+export function openDpoQuestions(): { data_class: string; question: string }[] {
+  return openDecisions()
+    .filter((d) => d.owner === 'legal_dpo')
+    .map((d) => ({ data_class: d.data_class, question: d.question }));
+}
+
+/** Decisions the platform owner has ratified, for the same readers. */
+export function ratifiedDecisions(): { data_class: string; decision: ClassDecision }[] {
+  return DATA_CLASSES.filter((c) => c.decision.state === 'ratified_by_owner').map((c) => ({
+    data_class: c.id,
+    decision: c.decision,
+  }));
 }

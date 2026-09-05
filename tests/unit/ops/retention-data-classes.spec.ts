@@ -10,7 +10,9 @@ import {
   classesExcludedFromDump,
   classesIncludedInDump,
   openDpoQuestions,
-  ownerRatifiedClasses,
+  openDecisions,
+  openDecisionsByOwner,
+  ratifiedDecisions,
 } from '../../../src/ops/retention/data-classes.js';
 
 /**
@@ -74,14 +76,14 @@ describe('no legal deadline is hardcoded (DPO approval pending)', () => {
     }
   });
 
-  it('records, for every class, either an open DPO question or an owner ratification', () => {
-    // Anti-vacuidade: os dois lados são contados e a soma fecha o inventário,
-    // então uma classe sem pergunta E sem ratificação não passa despercebida.
-    const questions = openDpoQuestions();
-    const ratified = ownerRatifiedClasses();
-    expect(questions.length).toBeGreaterThan(0);
-    expect(questions.length + ratified.length).toBe(DATA_CLASSES.length);
-    for (const q of questions) expect(q.question.length).toBeGreaterThan(10);
+  it('records, for every class, either an open decision WITH AN OWNER or a ratification', () => {
+    // Issue #536: a lista deixou de ser um balaio endereçado ao DPO. Cada item
+    // aberto tem dono; cada item fechado tem decisão. Nada fica no meio.
+    expect(openDecisions().length + ratifiedDecisions().length).toBe(DATA_CLASSES.length);
+    for (const d of openDecisions()) {
+      expect(d.question.length).toBeGreaterThan(10);
+      expect(['legal_dpo', 'ops', 'security', 'unassigned']).toContain(d.owner);
+    }
   });
 
   it('the default policy in force is the UNAPPROVED one', () => {
@@ -90,41 +92,73 @@ describe('no legal deadline is hardcoded (DPO approval pending)', () => {
   });
 });
 
-describe('privacy.tombstone — ratificada pelo dono da plataforma, não é pergunta ao DPO (issue #536)', () => {
-  it('não aparece mais na lista de perguntas ao DPO', () => {
+describe('the remaining decisions are split by owner (issue #536)', () => {
+  it('stops printing ops and security items as questions owed to the DPO', () => {
     const dpo = openDpoQuestions().map((q) => q.data_class);
-    expect(dpo).not.toContain('privacy.tombstone');
-    // Anti-vacuidade: a lista continua existindo e continua listando o que
-    // ainda é do DPO — a correção removeu UMA entrada, não a lista.
+    // `queue.redis` ("ops owns the TTLs") e `gateway.baileys_session` ("the
+    // security owner must approve") estavam nesta lista e nunca foram do DPO.
+    expect(dpo).not.toContain('queue.redis');
+    expect(dpo).not.toContain('gateway.baileys_session');
     expect(dpo).toContain('postgres.messages');
-    expect(dpo).toHaveLength(DATA_CLASSES.length - 1);
   });
 
-  it('registra a ratificação do dono, com a decisão e o argumento', () => {
-    const ratified = ownerRatifiedClasses();
+  it('routes each class to the role that can actually answer it', () => {
+    const by = openDecisionsByOwner();
+    const ids = (owner: keyof typeof by) => by[owner].map((d) => d.data_class);
+    expect(ids('ops')).toEqual(
+      expect.arrayContaining(['queue.redis', 'media.blobs', 'media.outbound_artifacts']),
+    );
+    expect(ids('security')).toEqual(['gateway.baileys_session']);
+    expect(ids('legal_dpo')).toEqual(
+      expect.arrayContaining([
+        'postgres.messages',
+        'postgres.people',
+        'postgres.financial',
+        'backup.artifact',
+        'privacy.export',
+      ]),
+    );
+  });
+
+  it('keeps the unassigned bucket EXPLICIT instead of parking it under someone else', () => {
+    // `postgres.audit` está congelada (nenhuma mudança campo a campo sem a
+    // decisão acordada) e a pergunta congelada junta prazo (Legal/DPO) e valor
+    // probatório da redação (Security). Separar seria editá-la. Então ela fica
+    // visível como "dono a definir" — que é diferente de estar escondida na
+    // lista do DPO.
+    expect(openDecisionsByOwner().unassigned.map((d) => d.data_class)).toEqual([
+      'postgres.audit',
+    ]);
+  });
+
+  it('every class appears in exactly one bucket', () => {
+    const by = openDecisionsByOwner();
+    const all = [...by.legal_dpo, ...by.ops, ...by.security, ...by.unassigned];
+    expect(all).toHaveLength(openDecisions().length);
+    expect(new Set(all.map((d) => d.data_class)).size).toBe(all.length);
+  });
+});
+
+describe('privacy.tombstone — ratified by the platform owner, not a DPO question', () => {
+  it('no longer appears as a question owed to anyone', () => {
+    expect(openDecisions().map((d) => d.data_class)).not.toContain('privacy.tombstone');
+    expect(openDpoQuestions().map((q) => q.data_class)).not.toContain('privacy.tombstone');
+  });
+
+  it('records the ratified design and the argument behind it', () => {
+    const ratified = ratifiedDecisions();
     expect(ratified.map((r) => r.data_class)).toEqual(['privacy.tombstone']);
-    const record = ratified[0]!.ratification;
-    expect(record.ratified_by).toBe('platform_owner');
-    expect(record.ratified_in).toContain('2026-09-02');
-    expect(record.ratified_in).toContain('2026-09-03');
-    expect(record.decision).toContain('not_purgeable');
+    const decision = ratified[0]?.decision;
+    if (decision?.state !== 'ratified_by_owner') throw new Error('shape');
+    expect(decision.decision).toContain('not_purgeable');
     // O argumento, não uma reafirmação: um prazo mínimo teria de superar a
     // maior retenção de artefato de backup, e não-purgável elimina a conta.
-    expect(record.rationale).toContain('MINIMUM');
-    expect(record.rationale).toContain('backup');
+    expect(decision.rationale).toContain('MINIMUM');
+    expect(decision.rationale).toContain('backup');
+    expect(decision.still_owed).toBeNull();
   });
 
-  it('o approval_state deriva da ratificação e não pode divergir dela', () => {
-    for (const c of DATA_CLASSES) {
-      expect(c.approval_state).toBe(
-        c.owner_ratification !== null ? 'ratified_by_owner' : 'pending_dpo',
-      );
-      // Exatamente um dos dois campos é nulo — nunca ambos, nunca nenhum.
-      expect(c.dpo_open_question === null).toBe(c.owner_ratification !== null);
-    }
-  });
-
-  it('é estruturalmente não-purgável, que é o que sustenta a ratificação', () => {
+  it('is structurally non-purgeable, which is what makes the ratification hold', () => {
     expect(getDataClass('privacy.tombstone').purge_mechanism).toBe('not_purgeable');
   });
 });
