@@ -3,6 +3,8 @@
 > **Status: DRAFT — NOT APPROVED.** Every retention period, legal basis and exception in this document is an OPEN QUESTION for the responsible legal owner / DPO. Nothing here is legal advice, and the platform does not act on any of it until an approved policy is configured.
 >
 > Issue #520: *"prazos, bases legais e exceções precisam de aprovação do responsável jurídico/DPO; a implementação não deve codificar suposições jurídicas como fatos universais."*
+>
+> **One item in this document is NOT an open question:** `privacy.tombstone` carries a design **ratified by the platform owner** (2026-09-02, reaffirmed 2026-09-03) — non-purgeable, which is stronger than any minimum period. That is a different authority from the DPO and is labelled as such wherever it appears. [Full record below.](#privacytombstone--ratified-by-the-platform-owner-issue-536)
 
 ## What is implemented, and what is not
 
@@ -14,7 +16,7 @@
 
 The two rows are different levers and only the first two are live. A **subject** asking for erasure is a legal obligation with a named requester, and it executes today (behind a recorded human approval). A **period-based** sweep deletes on the platform's own initiative, and it deletes nothing until the DPO approves a policy.
 
-The executable mirror of this document is [`src/ops/retention/data-classes.ts`](../../../src/ops/retention/data-classes.ts). Every class there ships with `retention_days: null` and `approval_state: 'pending_dpo'`, and `resolveRetention()` returns `purgeable: false` for all of them. **Today the retention executor deletes nothing.**
+The executable mirror of this document is [`src/ops/retention/data-classes.ts`](../../../src/ops/retention/data-classes.ts). Every class there ships with `retention_days: null`, and `resolveRetention()` returns `purgeable: false` for all of them. **Today the retention executor deletes nothing.** `approval_state` is `'pending_dpo'` for every class except `privacy.tombstone`, whose design the platform owner ratified: that one is `'ratified_by_owner'`, and the value is **derived** inside `cls()` from whether the class carries a `dpo_open_question` or an `owner_ratification` — never written by hand, so the pair cannot disagree.
 
 The default is deliberately "do not delete". Deletion is irreversible, so the failure mode of an unapproved policy must be keeping data too long — recoverable, and visible as a backlog metric — never deleting it too early.
 
@@ -66,7 +68,7 @@ The default is deliberately "do not delete". Deletion is irreversible, so the fa
 
 ## Open questions for the DPO
 
-Each of these is carried in code as `DataClass.dpo_open_question` and is printed by `openDpoQuestions()`.
+Each of these is carried in code as `DataClass.dpo_open_question` and is printed by `openDpoQuestions()`. A class the platform owner has ratified carries an `owner_ratification` record instead (`dpo_open_question: null`), is absent from `openDpoQuestions()`, and is printed by `ownerRatifiedClasses()` — a taken decision must not be presented as a pending one.
 
 | Class | Question |
 |---|---|
@@ -82,7 +84,12 @@ Each of these is carried in code as `DataClass.dpo_open_question` and is printed
 | `queue.redis` | None — ops owns the TTLs. |
 | `backup.artifact` | Local vs off-site retention, and the maximum window during which a deleted subject may still exist inside a retained artifact. |
 | `privacy.export` | ~~Export package lifetime before it must expire.~~ **INITIAL POLICY SET — seven days, awaiting DPO confirmation.** See below. |
-| `privacy.tombstone` | ~~The MINIMUM tombstone retention.~~ **ANSWERED — technical, not legal.** See below. |
+
+### Ratified — no longer a question
+
+| Class | Decision | Ratified by |
+|---|---|---|
+| `privacy.tombstone` | Structurally non-purgeable. [Full record below.](#privacytombstone--ratified-by-the-platform-owner-issue-536) | Platform owner (2026-09-02, reaffirmed 2026-09-03) |
 
 ### `privacy.export` — an initial policy, and a mechanism that enforces it (issue #536)
 
@@ -96,17 +103,25 @@ Why this class could be decided ahead of the others: the conservative direction 
 
 **Still open, and deliberately separate:** whether a *deletion* request from one subject should also destroy the export artifacts of that same subject. That is a different question from the TTL, and `privacy.export` remains in `UNSUPPORTED_CLASSES` until it is answered.
 
-### `privacy.tombstone` — answered (issue #536)
+### `privacy.tombstone` — ratified by the platform owner (issue #536)
 
-Issue #536 flagged this one as *"técnica e não jurídica, e vale resolver antes das outras"*. It is answered, and the answer needed no new code — only the statement of why the existing structure already satisfies it.
+**This is not an open question and must not be presented as one.** It was carried as *"the MINIMUM retention for tombstones"* addressed to the DPO. The platform owner corrected the premise and ratified the design that the default branch already implements:
 
-**The requirement**: the minimum tombstone retention must exceed the longest backup retention. Otherwise restoring an old artifact resurrects data that should already be gone, and the ledger has no way to stop it — the exact scenario tombstones exist to cover.
+> *"Há uma correção: a `main` já torna `privacy.tombstone` **não-purgável**, o que é mais forte que escolher um prazo mínimo. **Ratifico esse desenho.**"*
 
-**The answer**: tombstones are never purged, so they outlive any backup retention by construction, whatever period the DPO later sets for `backup.artifact`. This is not a default that could drift:
+**Recorded as received.** The ratification arrived in writing as the direction for the task on issue #536 (2026-09-02) and was reaffirmed in the owner's decision on PR #732 (2026-09-03). In code: the class carries `owner_ratification` (the decision, the argument, when it was received) instead of a `dpo_open_question`; `approval_state` derives to `'ratified_by_owner'`; and the class no longer appears in `openDpoQuestions()`.
+
+**Why non-purgeable is stronger than a minimum period.** A minimum tombstone retention would have to exceed the LONGEST backup-artifact retention *at all times* — including after someone raises `backup.artifact`'s period, a decision that has not even been made yet. Get that inequality wrong by a day and restoring an old artifact resurrects data that should already be gone, which is the exact scenario tombstones exist to cover. Non-purgeable removes the arithmetic entirely: **there is no period left to get wrong.**
+
+**How the design holds — and how far the guard actually reaches.** Tombstones are never purged, so they outlive any backup retention by construction, whatever period the DPO later sets for `backup.artifact`. This is not a default that could drift, and each layer below is exercised by [`tests/unit/ops/retention-tombstone-guard.spec.ts`](../../../tests/unit/ops/retention-tombstone-guard.spec.ts) on every unit pass:
 
 - `privacy.tombstone` is declared `purge_mechanism: 'not_purgeable'` in [`data-classes.ts`](../../../src/ops/retention/data-classes.ts);
-- `parseRetentionPolicy` **drops** any policy entry for a structurally non-purgeable class, so a future `RETENTION_POLICY` cannot make tombstones expire even if it asks (`tests/unit/ops/retention-data-classes.spec.ts`);
-- `resolveRetention('privacy.tombstone', …)` returns `purgeable: false` with `reason: 'class_not_purgeable'` for every policy, approved or not.
+- `parseRetentionPolicy` **drops** any policy entry for a structurally non-purgeable class (`tests/unit/ops/retention-data-classes.spec.ts`), and `resolveRetention('privacy.tombstone', …)` returns `purgeable: false` / `class_not_purgeable` in its **first** branch — the guard proves this even for a policy object that smuggles the class past the parser;
+- the **real call site** refuses: `executePrivacyRequest` never emits a purge job for the class — the guard runs the executor and asserts the refusal *and* that other classes were purged in the same run, so the test cannot pass vacuously;
+- **no periodic policy in the repository references the class**: the guard reads the worker registry (`src/workers/index.ts`) and the configuration contract (`src/config/contract.ts`) and asserts no tombstone sweep job and no tombstone TTL/sweep key exist — while asserting the known sweepers and keys ARE there;
+- the contract's **effective defaults** keep period-based purging inert: `RETENTION_DRY_RUN` parses to `true` and `RETENTION_POLICY` is absent, both read from the real contract, not a hand copy.
+
+**Declared limit of the guard.** A deployed environment can override any contract default (`RETENTION_DRY_RUN=false`, a real `RETENTION_POLICY`), and no unit test sees a live database. CI has no such infrastructure, so the guard proves the repository *contains no path* that purges tombstones and that the default configuration creates none — it does **not** prove anything about a running environment. What reaches the effective environment is `npm run config:preflight` / `npm run doctor` and environment review; this boundary is stated in the spec header rather than papered over.
 
 **What this does NOT settle**: how long a *retained backup artifact* may keep a deleted subject's data inside it. That stays open under `backup.artifact` and is a different question — it bounds the window in which a restore still needs reconciliation, not the life of the ledger. The mechanism for that window is [§3.6 of the runbook](../../runbooks/backup-restore.md): the reconciliation job re-applies every tombstone newer than the artifact's watermark before traffic is released.
 
@@ -139,6 +154,6 @@ The ledger stores **pseudonyms** (keyed HMAC), never raw identifiers — a tombs
 
 | | |
 |---|---|
-| Last updated | 2026-08-24 (issue #536 — subject-request execution, encrypted export, tombstone re-application job, the `privacy.tombstone` question answered on technical grounds, and the `privacy.export` TTL given an **initial policy of seven days with a live executor**, pending DPO confirmation; **no other period was decided**) |
-| Approved by legal/DPO | **No — draft** |
+| Last updated | 2026-09-03 (issue #536 / PR #732 — the platform owner corrected the premise on `privacy.tombstone` and **ratified the non-purgeable design** (2026-09-02, reaffirmed 2026-09-03), so it stopped being a question to the DPO: `approval_state` now derives to `'ratified_by_owner'` for that class, and the guard on the design was extended to the real purge call site, the worker registry and the configuration contract's defaults — with its limit declared. **No period was decided, and nothing new purges anything.** The owner-split of the remaining decisions and the written-homologation lock were separated out for their own review) |
+| Approved by legal/DPO | **No — draft.** One item is ratified by the **platform owner** (`privacy.tombstone`), which is a different authority and is labelled as such wherever it appears |
 | Re-review when | A class is added, a period is approved, or the media/Redis decisions land |
