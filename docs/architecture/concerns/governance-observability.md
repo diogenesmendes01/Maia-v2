@@ -437,6 +437,8 @@ Agent-generated proposals (`capability_proposals`, `skill_proposals`) are owner-
 | `tests/unit/observability/llm-request-span.spec.ts` | `llm.request` reaches the OTLP wire from the real `executeLLM`, on every outcome |
 | `tests/unit/observability/dashboards.spec.ts` | Dashboards ↔ emitted metrics / recording rules drift guard |
 | `tests/unit/observability/overhead-benchmark.spec.ts` | Per-emission cost + cardinality budget actually bounds series |
+| `tests/unit/scripts/otlp-overhead-benchmark.spec.ts` | The OTLP-on A/B gate REFUSES: every named criterion goes red under injection, `skipped ⇒ passed=false`, report encoding (issue #535 §4) |
+| `scripts/otlp-overhead-benchmark.ts` (`npm run otlp:bench`) | Not a spec — the measurement itself. **Real Postgres**, real turns through the worker entry point, arms `off` / `on-local` / `on-slow` alternated in one process, `MAIA_OTLP_SAMPLE_RATIO=1`; 10 % relative gate on p95/p99/throughput, counted loss, bounded queue, real `/metrics` series delta. Floor, not production (synthetic LLM + channel) |
 | `tests/admin-ui/unit/traces-router.spec.ts` | Trace Explorer tenant scoping + NOT_FOUND (not FORBIDDEN) |
 | `tests/integration/observability-hot-path-trace.spec.ts` | Hot-path trace through the real HMAC/redaction writers |
 | `tests/integration/llm-circuit-audit-real-db.spec.ts` | **Real Postgres** — a circuit transition LANDS a row in `audit_log` under `system`, `alvo_id` stays null, and the `llm_circuit_long_open` watcher rule finds the open/closed pair and the stuck case |
@@ -517,9 +519,17 @@ coverage that does not exist:
   boundary (`react.iteration` — so `llm.request` and `tool.dispatch` currently
   attach to `turn` and a multi-iteration turn shows a flat list of model calls
   and tool calls rather than one group per iteration).
-- **The overhead benchmark is micro, not under load.** Real cardinality under
-  production traffic is still unmeasured; the budget is proven to BOUND the
-  series count, not sized against observed traffic.
+- **Overhead is now measured both micro and under load; cardinality under
+  REAL production traffic is still not.** `overhead-benchmark.spec.ts` proves
+  the per-emission cost and that the budget BOUNDS the series count;
+  `scripts/otlp-overhead-benchmark.ts` (`npm run otlp:bench`, issue #535 §4)
+  drives real turns with the OTLP exporter ON against a local collector
+  (healthy and degraded) and gates the hot path at 10 % relative to `off`,
+  reporting the real series delta that THIS traffic mints. By owner decision
+  (2026-09-03) real traffic is the post-canary trigger for cardinality
+  validation, not a substitute for that pre-canary proof — so the series count
+  under production traffic remains an observation to make, not a number this
+  repo claims.
 - **v1 envelopes remain readable, and on them `root_trace_id`/`attempt` are
   still unsigned** (issue #535, §4.4a). Production writes only v2, so this is
   bounded to fixtures and to environments that already hold v1 rows — but the
