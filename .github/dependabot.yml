@@ -10,6 +10,24 @@ updates:
         patterns: ["@types/*"]
       eslint:
         patterns: ["eslint*", "@typescript-eslint/*"]
+    # Majors que NÃO são bump, são migração (decisão do dono, 2026-09-07):
+    #
+    #  - `@types/node`: fica em 22.x. Tipos de Node 26 não podem representar um
+    #    runtime, CI e Docker que rodam Node 22 (`engines.node` ">=22.13.0 <23",
+    #    `node:22-alpine`, matriz `['22.18', '22.22']`). A subida é a issue #743
+    #    e acontece quando Node 26 virar LTS, num PR que mexe Dockerfile,
+    #    .nvmrc, engines, scripts/check-node.mjs e a matriz juntos.
+    #  - `typescript`: a major (7) falha já no `npm ci` pela incompatibilidade
+    #    do `@typescript-eslint/*`. A subida é a issue #745 e exige suporte
+    #    direto da cadeia ou uma PR explícita com TS6 e TS7 lado a lado.
+    #
+    # Só a MAJOR é ignorada: minors e patches das duas continuam chegando.
+    # O bloco do admin-ui repete estas regras — a política é uma só.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   # O admin-ui é um projeto npm SEPARADO (`src/admin-ui/package.json` +
   # lockfile próprio), e o bloco acima, ancorado em "/", nunca o enxergou. Foi
   # exatamente por isso que um `critical` do Next viveu meses sem PR automática
@@ -34,6 +52,13 @@ updates:
         patterns: ["@types/*"]
       eslint:
         patterns: ["eslint*", "@typescript-eslint/*"]
+    # Mesma política de majors do bloco da raiz (issues #743 e #745): a linha
+    # de Node e a de TypeScript são decididas por migração, não por bump.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
