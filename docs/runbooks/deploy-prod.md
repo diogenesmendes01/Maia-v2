@@ -99,7 +99,17 @@ Maia config preflight — compose.prod.yml (interpolação: .env.infra)
 ```
 
 Sai **0** quando os três ambientes efetivos satisfazem o contrato, e **1** com
-a lista completa de problemas quando não. Rode-o depois de preencher os
+a lista completa de problemas quando não.
+
+Para cada subset que executa política periódica (`runtime`, `backup`,
+`maintenance`) o preflight imprime também a linha **`· trava de homologação`**
+(issue #536, PR #737): é o MESMO avaliador que o boot roda em `src/index.ts`
+antes de iniciar qualquer worker, aplicado ao ambiente efetivo do container.
+Um `.env.app` com `RETENTION_DRY_RUN=false` sem homologação escrita do passe
+de artefatos — ou com uma `RETENTION_POLICY` real e o dry-run desligado —
+**reprova aqui**, nomeando a variável e a política (nunca o valor), em vez de
+subir um container que o boot mataria. `MAIA_CONFIG_STRICT_BOOT=false` não
+destrava isso — ver [`config-contract.md` §4.1](config-contract.md). Rode-o depois de preencher os
 `__SET_ME__` e **antes** do `up`: é a diferença entre corrigir um `.env` na sua
 frente e descobrir a falta no boot de um container, depois de o `migrate` já ter
 saído com sucesso e o gate `service_completed_successfully` ter liberado a

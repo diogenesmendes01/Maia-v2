@@ -504,3 +504,153 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
     ).toThrow(/relatorios/);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #536 / PR #737 — a trava de homologação alcança a configuração
+// EFETIVA que cada container receberia, ANTES do `up`.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// O MESMO avaliador que o boot roda em `src/index.ts`
+// (`evaluatePeriodicPolicyActivation`) roda aqui sobre os `values` que o
+// contrato parseou para cada subset que declara as variáveis decisórias.
+// Duas propriedades, medidas por dois lados:
+//
+//   1. sobre os `.prod.example` REAIS: os três containers `runtime` têm um
+//      veredito (e ele é limpo — os exemplos não ativam política nenhuma), e
+//      `migrate`/`admin-ui` não têm veredito, porque aqueles processos não
+//      executam política periódica;
+//   2. sobre uma fixture MÍNIMA e VERDE: ligar `RETENTION_DRY_RUN=false` é a
+//      ÚNICA mudança, o contrato continua aceitando (é `warning`, não erro) e
+//      o relatório inteiro passa a reprovar — pela trava, nomeando variável e
+//      política, sem valor. Sem a fixture verde não haveria como provar que a
+//      trava sozinha vira o `ok`: os exemplos crus já reprovam por `__SET_ME__`.
+describe('config preflight — a trava de homologação sobre a configuração efetiva (#536/#737)', () => {
+  const CANARIO_POLITICA = 'CANARIO-preflight-dpo-7b2e';
+
+  /** Compose de UM serviço `runtime`, no mesmo formato subset que o parser aceita. */
+  const COMPOSE_MINIMO = [
+    'services:',
+    '  app:',
+    '    env_file:',
+    '      - .env.app',
+    '    environment:',
+    '      MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required}',
+    '',
+  ].join('\n');
+
+  /** O mínimo que o subset `runtime` aceita limpo no profile `development`. */
+  const ENV_APP_MINIMO: Readonly<Record<string, string>> = {
+    NODE_ENV: 'development',
+    DATABASE_URL: 'postgres://maia_pf:preflight1234@localhost:5432/maia_pf',
+    POSTGRES_USER: 'maia_pf',
+    POSTGRES_PASSWORD: 'preflight1234',
+    POSTGRES_DB: 'maia_pf',
+    REDIS_URL: 'redis://localhost:6379',
+    ANTHROPIC_API_KEY: 'sk-ant-preflight-spec-key',
+    VOYAGE_API_KEY: 'voyage-preflight-spec-key',
+    WHATSAPP_NUMBER_MAIA: '+5500000000000',
+    OWNER_TELEFONE_WHATSAPP: '+5511111111111',
+    OWNER_NOME: 'Preflight Spec Owner',
+    ALERT_CHANNELS: 'log',
+  };
+
+  function preflightMinimo(overrides: Readonly<Record<string, string>> = {}) {
+    const env = { ...ENV_APP_MINIMO, ...overrides };
+    return runPreflight({
+      composeText: COMPOSE_MINIMO,
+      composeLabel: 'compose.minimo.yml',
+      infraText: 'MAIA_ENV=development\n',
+      profile: 'development',
+      readEnvFile: () =>
+        Object.entries(env)
+          .map(([k, v]) => `${k}=${v}`)
+          .join('\n') + '\n',
+    });
+  }
+
+  function politicaAprovada(): string {
+    return JSON.stringify({
+      version: 'v1-dpo-2026-07',
+      approved_by: CANARIO_POLITICA,
+      approved_at: '2026-07-01T00:00:00.000Z',
+      classes: { 'postgres.traces': { retention_days: 30 } },
+    });
+  }
+
+  it('sobre os .prod.example: os três containers `runtime` têm veredito limpo; migrate e admin-ui não têm veredito', () => {
+    const report = preflightSobreOsExemplos();
+    for (const name of ['app', 'scheduler', 'worker']) {
+      const s = servico(report, name);
+      const runtime = s.contracts.find((c) => c.contract === 'runtime')!;
+      expect(runtime.homologation, `${name}: subset runtime sem veredito`).not.toBeNull();
+      expect(runtime.homologation?.ok).toBe(true);
+      expect(runtime.homologation?.violations).toEqual([]);
+      // O TTL do export aparece ATIVO e AUTORIZADO — o veredito não é vazio.
+      const ttl = runtime.homologation?.policies.find((p) => p.id === 'privacy.export.ttl_sweep');
+      expect(ttl).toMatchObject({ active_effective: true, authorised: true });
+    }
+    expect(servico(report, 'migrate').contracts.map((c) => c.homologation)).toEqual([null]);
+    expect(servico(report, 'admin-ui').contracts.map((c) => c.homologation)).toEqual([null]);
+  });
+
+  it('a fixture mínima é VERDE — sem isso os casos abaixo não provariam nada', () => {
+    const report = preflightMinimo();
+    const app = servico(report, 'app');
+    expect(app.failure).toBeUndefined();
+    expect(errosDeContrato(app)).toEqual([]);
+    expect(app.contracts[0]?.homologation?.ok).toBe(true);
+    expect(report.ok).toBe(true);
+  });
+
+  it('RETENTION_DRY_RUN=false: o CONTRATO aceita, a TRAVA reprova, e o relatório inteiro cai', () => {
+    const report = preflightMinimo({ RETENTION_DRY_RUN: 'false' });
+    const runtime = servico(report, 'app').contracts[0]!;
+    // A metade que dá o nome ao caso: para o contrato isso é só um aviso.
+    expect(runtime.result.ok).toBe(true);
+    expect(runtime.result.warnings.map((w) => w.rule)).toContain('retention/dry-run-disabled');
+    // E o preflight reprova assim mesmo — pela trava, nomeando variável e política.
+    expect(runtime.homologation?.ok).toBe(false);
+    const v = runtime.homologation!.violations;
+    expect(v.map((x) => x.policy_id)).toEqual(['backup.artifact.retention_sweep']);
+    expect(v.map((x) => [...x.variables])).toEqual([['RETENTION_DRY_RUN']]);
+    expect(v[0]?.rule).toBe('homologation/active-without-written-homologation');
+    expect(v[0]?.message).toContain('RETENTION_DRY_RUN');
+    expect(v[0]?.message).toContain('backup.artifact.retention_sweep');
+    expect(report.ok).toBe(false);
+  });
+
+  it('RETENTION_POLICY real + dry-run desligado: as duas políticas reprovam, e o valor da política NÃO aparece', () => {
+    const report = preflightMinimo({
+      RETENTION_DRY_RUN: 'false',
+      RETENTION_POLICY: politicaAprovada(),
+    });
+    const runtime = servico(report, 'app').contracts[0]!;
+    expect(runtime.homologation?.violations.map((x) => x.policy_id).sort()).toEqual([
+      'backup.artifact.retention_sweep',
+      'retention.class_purge',
+    ]);
+    // O veredito inteiro, serializado como o `--json` faria: só nomes.
+    const serializado = JSON.stringify(runtime.homologation);
+    expect(serializado).toContain('RETENTION_POLICY');
+    expect(serializado).not.toContain(CANARIO_POLITICA);
+    expect(serializado).not.toContain('v1-dpo-2026-07');
+    expect(report.ok).toBe(false);
+  });
+
+  it('RETENTION_POLICY real COM dry-run ligado não é violação — a trava é sobre destruir, não sobre configurar', () => {
+    const report = preflightMinimo({ RETENTION_POLICY: politicaAprovada() });
+    const runtime = servico(report, 'app').contracts[0]!;
+    expect(runtime.homologation?.ok).toBe(true);
+    expect(report.ok).toBe(true);
+  });
+
+  it('o preflight usa o MESMO avaliador do boot — não uma cópia', () => {
+    // Uma segunda leitura do que é "ativa" é como as duas camadas divergiriam
+    // em silêncio. O import é o vínculo; o comportamento acima é a prova.
+    const source = readFileSync(resolve(REPO_ROOT, 'src/config/preflight.ts'), 'utf8');
+    expect(source).toMatch(/evaluatePeriodicPolicyActivation/);
+    expect(source).toMatch(/from '@\/ops\/privacy\/homologation\.js'/);
+    const boot = readFileSync(resolve(REPO_ROOT, 'src/index.ts'), 'utf8');
+    expect(boot).toMatch(/evaluatePeriodicPolicyActivation\(config\)/);
+  });
+});

@@ -33,18 +33,32 @@ import { findSpec } from '../../../src/config/contract.js';
  * só é verde nunca provou que sabe ficar vermelho.
  *
  * ─────────────────────────────────────────────────────────────────────────
- * LIMITE DECLARADO — o que este guard NÃO alcança, e por quê.
+ * O QUE CADA CAMADA DA TRAVA ALCANÇA (PR #737, decisão do dono de 2026-09-07).
  *
- * O guard alcança o estado DECLARADO no código e os DEFAULTS do contrato de
- * configuração (`ENV_CONTRACT`, lido de verdade via `findSpec`, nunca uma
- * cópia à mão). Ele NÃO alcança a configuração efetiva de um ambiente
- * implantado: um operador que exporte `RETENTION_DRY_RUN=false` ou instale
- * uma `RETENTION_POLICY` real ativa uma política sem que nenhum teste
- * unitário veja — o CI deste repositório não tem banco nem o ambiente vivo.
- * O que alcança o ambiente efetivo é `npm run config:preflight` /
- * `npm run doctor` e a revisão de ambiente. Esta fronteira fica escrita aqui
- * (e na matriz) em vez de fingida: um guard que afirmasse cobrir o ambiente
- * estaria mentindo sobre o próprio alcance.
+ * ESTE GUARD alcança o estado DECLARADO no código e os DEFAULTS do contrato
+ * de configuração (`ENV_CONTRACT`, lido de verdade via `findSpec`, nunca uma
+ * cópia à mão). Roda no CI, sem ambiente: pega uma política nova que entre
+ * ativa, um default invertido, uma classe congelada promovida. Ele NÃO vê a
+ * configuração efetiva de um ambiente implantado — um `RETENTION_DRY_RUN=false`
+ * exportado à mão não passa por aqui, e este arquivo não finge o contrário.
+ *
+ * A CONFIGURAÇÃO EFETIVA é alcançada por UM avaliador puro,
+ * `evaluatePeriodicPolicyActivation(cfg)` (mesmo módulo), chamado em dois
+ * lugares com a configuração JÁ PARSEADA:
+ *   - `npm run config:preflight` (`src/config/preflight.ts`) — sobre o
+ *     ambiente que cada serviço do compose receberia, ANTES do `up`;
+ *   - o boot (`src/index.ts`, passo `config`) — sobre o ambiente que o
+ *     processo REALMENTE recebeu, ANTES de banco, filas e `startWorkers()`.
+ *   Política destrutiva ativa sem homologação ⇒ preflight reprova e o boot
+ *   morre sem iniciar worker. `MAIA_CONFIG_STRICT_BOOT=false` NÃO desliga
+ *   isso: aquele interruptor governa a validação de contrato e o avaliador
+ *   não o lê. Specs: `retention-homologation-effective-config.spec.ts`
+ *   (avaliador), `tests/unit/config/preflight.spec.ts` (preflight) e
+ *   `tests/unit/runtime/homologation-boot-gate.spec.ts` (boot).
+ *
+ * O que continua FORA das três camadas: um ambiente vivo cuja configuração
+ * mude depois do boot sem restart (as variáveis têm `restartRequired: true`),
+ * e a revisão humana de que a homologação escrita registrada é verdadeira.
  * ─────────────────────────────────────────────────────────────────────────
  */
 
@@ -80,6 +94,7 @@ const NEW_ACTIVE_POLICY: PeriodicPolicy = {
   destroys: 'corpos de trace com prompts e respostas cruas',
   active_by_default: true,
   dry_run_var: null,
+  policy_var: null,
   authorisation: { kind: 'none', why: 'ninguém homologou nada — é o ponto do teste' },
 };
 

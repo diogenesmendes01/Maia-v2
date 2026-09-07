@@ -272,6 +272,11 @@ function cmdPreflight(args: Map<string, string | true>): number {
                     config_hash: c.result.configHash,
                     errors: c.result.errors,
                     warnings: c.result.warnings,
+                    // A trava de homologação (#536/#737) sobre a configuração
+                    // efetiva deste subset — só nomes de variável, regra e
+                    // política; nenhum valor. `null` = subset sem política
+                    // periódica para avaliar.
+                    homologation: c.homologation,
                   })),
                   boot_gate_problems: s.bootGateProblems,
                 }),
@@ -317,6 +322,22 @@ function cmdPreflight(args: Map<string, string | true>): number {
     for (const c of s.contracts) {
       console.log(`  · subset ${c.contract}`);
       console.log(`    ${formatHuman(c.result)}`.replace(/\n/g, '\n    '));
+      if (c.homologation === null) continue;
+      // A trava de homologação (issue #536, PR #737) sobre a configuração
+      // EFETIVA deste subset — o mesmo avaliador que o boot roda antes de
+      // iniciar qualquer worker. Nome de variável, regra e política; nunca o
+      // valor.
+      console.log('  · trava de homologação (src/ops/privacy/homologation.ts)');
+      if (c.homologation.ok) {
+        console.log(
+          '    OK: nenhuma política periódica destrutiva ativa sem homologação escrita.',
+        );
+        continue;
+      }
+      for (const v of c.homologation.violations) {
+        console.log(`    ${v.variables.join(' + ')} [${v.rule}] política '${v.policy_id}': ${v.message}`);
+        console.log(`      → ${v.remediation}`);
+      }
     }
     if (s.target.adminBootGates) {
       console.log('  · gates de boot do admin-ui (src/admin-ui/lib/auth-gating.ts)');

@@ -167,7 +167,26 @@ boot legadas**, com as mensagens históricas preservadas.
 - as regras de boot legadas — chave do provider LLM/embeddings, canal de alerta
   sem credencial, ordem dos três limites financeiros, segredo HMAC em produção,
   `FEATURE_MCP_TOOLS` em produção, `BAILEYS_AUTH_DIR` inseguro,
-  `FEATURE_CONTEXT_PACKET_V1`.
+  `FEATURE_CONTEXT_PACKET_V1`;
+- **a trava de homologação das políticas periódicas** (issue #536, PR #737).
+  Depois que `loadConfig()` devolve o `config`, o passo `config` de
+  `src/index.ts` chama `evaluatePeriodicPolicyActivation(config)`
+  (`src/ops/privacy/homologation.ts`) — ANTES de Postgres, Redis, filas e
+  `startWorkers()`. Uma política periódica destrutiva ATIVA na configuração
+  efetiva sem homologação escrita (`RETENTION_DRY_RUN=false` sem homologação do
+  passe de artefatos; `RETENTION_POLICY` real com dry-run desligado) mata o
+  boot com `HOMOLOGATION BOOT REFUSED` / `maia.homologation_boot_refused`,
+  exit 1, nenhum worker iniciado. **Esta alavanca não chega lá**: o avaliador é
+  puro, não lê `process.env`, não recebe o valor de `MAIA_CONFIG_STRICT_BOOT` e
+  não tem interruptor próprio — a alavanca governa a validação de CONTRATO, e
+  ligar uma política destrutiva sem homologação não é uma inconsistência de
+  contrato a destravar num incidente. A saída nomeia variável, regra e
+  política, nunca o valor. O `npm run config:preflight` roda o MESMO avaliador
+  sobre o ambiente efetivo de cada serviço do compose, então o operador vê a
+  recusa antes do `up`. Remediação: volte `RETENTION_DRY_RUN=true` (ou remova
+  a `RETENTION_POLICY`) até a homologação escrita existir e estar registrada em
+  `authorisation` da política — ver a seção "The lock" da
+  [matriz de retenção](../architecture/concerns/data-retention-matrix.md).
 
 O boot degradado **loga um aviso alto a cada start** — um escape hatch
 silencioso é um que ninguém lembra de fechar:
