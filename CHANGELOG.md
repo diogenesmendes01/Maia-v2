@@ -4,6 +4,28 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### `resolveScope` deixa de descartar grants acima de 500 profiles distintos ([#738](https://github.com/diogenesmendes01/Maia-v2/issues/738))
+
+**O defeito.** A leitura de perfis do `resolveScope` era `profilesRepo.byIds(ids,
+limit = 500)`: dedup por `Set`, `ORDER BY id`, `LIMIT 500`. Acima de 500 profiles
+**distintos** (não de permissões — 501 permissões sobre 3 profiles não
+reproduzem) os excedentes eram cortados pela ordem dos ids e as permissões que
+apontavam para eles caíam como "irresolúveis": grants reais descartados em
+silêncio, sem erro e sem log, com o escopo do turno menor do que o banco concede.
+
+**O que muda.** A leitura de autorização passa a ser
+`profilesRepo.forAuthorization(ids)` (`src/db/repositories/pessoa-repos.ts`):
+escopada por `tenant_id + agent_id` via ALS, `inArray` sobre ids distintos,
+`ORDER BY id`, **sem `LIMIT`** — um teto de recurso não pode decidir acesso; se um
+dia houver limite de grants por pessoa, ele é validação fail-closed na concessão,
+não corte na leitura. `resolveScope` continua em exatamente **duas**
+round-trips (`forPessoa` + `forAuthorization`): sem JOIN (a forma da #693,
+fechada) e sem paginação. `byIds` sai — não tinha outro chamador. Testes:
+unitário com 501 profiles distintos e contrafactual da leitura com teto
+(`tests/unit/governance/resolve-scope-501-profiles.spec.ts`); integração em
+Postgres real com 501 profiles, contagem das duas leituras e isolamento entre
+tenants homônimos (`tests/integration/resolve-scope-501-profiles-real-db.spec.ts`).
+
 ### Console: o pareamento sai da quarentena — um segundo processo no job ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), terceira parte)
 
 **O que estava acontecendo.** Sobravam quatro casos fora do gate, e o motivo era

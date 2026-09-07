@@ -99,8 +99,10 @@ export const entidadesRepo = {
    *     `entityStatesRepo.byIds(ids, 500)` (limited). Only the STATE read was
    *     capped;
    *   - a scope can hold more than 500 entities — a tenant whose entities share
-   *     permission profiles passes `profilesRepo.byIds`'s own 500 cap on
-   *     distinct PROFILES while carrying thousands of entities;
+   *     permission profiles carries thousands of entities on a handful of
+   *     profiles (and since #738 the profile read, `profilesRepo.forAuthorization`,
+   *     has no cap of its own either: an authorization read is bound by the
+   *     person's grants, not by a `LIMIT`);
    *   - past row 500 the entity simply vanished from the result, so
    *     `prompt-builder.ts`'s `ent?.nome ?? eid` fell through to the id and the
    *     scope/permission block printed a raw UUID where a name belongs. That

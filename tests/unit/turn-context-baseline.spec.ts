@@ -146,7 +146,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   },
   profilesRepo: {
     byId: h.count('profilesRepo.byId', async (id: string) => mkProfile(id)),
-    byIds: h.count('profilesRepo.byIds', async (ids: string[]) =>
+    forAuthorization: h.count('profilesRepo.forAuthorization', async (ids: string[]) =>
       ids.filter((id) => !h.missingProfiles.has(id)).map(mkProfile),
     ),
   },
@@ -326,7 +326,7 @@ describe('#511 baseline — turn-context query cost', () => {
       expect(resolved.entidades).toHaveLength(n);
       expect(h.calls['permissoesRepo.forPessoa']).toBe(1);
       expect(h.calls['profilesRepo.byId']).toBeUndefined();
-      expect(h.calls['profilesRepo.byIds']).toBe(1);
+      expect(h.calls['profilesRepo.forAuthorization']).toBe(1);
       expect(totalCalls()).toBe(2);
     });
 
@@ -374,7 +374,7 @@ describe('#511 baseline — turn-context query cost', () => {
      * ⇒ it passes. The assertion discriminates.
      *
      * What this does NOT prove is that the SQL predicate in
-     * `profilesRepo.byIds` really excludes the other tenant's row — that needs
+     * `profilesRepo.forAuthorization` really excludes the other tenant's row — that needs
      * a real Postgres and is the integration test's own job in CI.
      */
     it('COUNTERFACTUAL: an unscoped profile lookup WOULD have granted the foreign profile', async () => {

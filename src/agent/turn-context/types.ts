@@ -112,7 +112,7 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  *
  * Current composition (legacy `self_state` path, the most expensive one):
  *
- *   resolveScope: permissoesRepo.forPessoa, profilesRepo.byIds           2
+ *   resolveScope: permissoesRepo.forPessoa, profilesRepo.forAuthorization 2
  *   identity: operationalProfileVersionsRepo.getActive                   1
  *   identity: selfStateRepo.getActive (fallback branch only)             1
  *   mensagensRepo.recentInConversation                                   1

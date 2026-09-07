@@ -125,7 +125,9 @@ vi.mock('../../src/db/repositories.js', () => ({
   permissoesRepo: { forPessoa: failable('permissoesRepo.forPessoa', async () => permissoesFixture) },
   profilesRepo: {
     byId: failable('profilesRepo.byId', async (id: string) => mkProfile(id)),
-    byIds: failable('profilesRepo.byIds', async (ids: string[]) => ids.map(mkProfile)),
+    forAuthorization: failable('profilesRepo.forAuthorization', async (ids: string[]) =>
+      ids.map(mkProfile),
+    ),
   },
   pessoasRepo: { list: failable('pessoasRepo.list', async () => []) },
 }));

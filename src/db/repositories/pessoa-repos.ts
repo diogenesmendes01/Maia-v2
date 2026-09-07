@@ -574,8 +574,10 @@ export const profilesRepo = {
     return rows[0] ?? null;
   },
   /**
-   * Issue #511 — batch sibling of `byId`, replacing the per-permission lookup
-   * loop in `resolveScope` (`src/governance/permissions.ts`).
+   * THE AUTHORIZATION READ — the profile side of `resolveScope`
+   * (`src/governance/permissions.ts`). Issue #511 introduced it as `byIds`,
+   * the batch sibling of `byId` that replaced the per-permission lookup loop;
+   * issue #738 renamed it and removed its row cap.
    *
    * TENANT-SCOPED, unlike `byId`. `permission_profiles` carries NOT NULL
    * `tenant_id` + `agent_id` (schema `src/db/schema.ts` `permission_profiles`),
@@ -584,17 +586,34 @@ export const profilesRepo = {
    * foreign profile id resolve to that other tenant's action list. `byId` is
    * left unscoped for now (its only remaining caller is the interactive
    * `scripts/pessoa-add.ts`, which runs outside a tenant frame); the hot path
-   * moves here, so the turn now resolves scope under an exact tenant predicate.
+   * lives here, so the turn resolves scope under an exact tenant predicate.
    *
    * Missing ids are simply absent from the result — the caller decides what an
    * unresolvable profile means. `resolveScope` skips the permission entirely,
    * which is the fail-closed reading: no profile, no grant.
    *
-   * Deterministic ordering by id (the same permission set must render the same
-   * prompt every turn) and an explicit row cap so one tenant cannot make a
-   * single statement unbounded.
+   * ## No `LIMIT`, on purpose (issue #738)
+   *
+   * `byIds` carried `limit = 500` "so one tenant cannot make a single statement
+   * unbounded". On an authorization read that cap is not a resource bound, it
+   * is an access decision made by a resource bound: past 500 DISTINCT profile
+   * ids (the `Set` below dedups, so 501 permissions on 3 profiles never hit it)
+   * the rows were cut by `ORDER BY id`, `resolveScope` saw no profile for the
+   * surviving permissions and dropped them as "unresolvable" — REAL grants
+   * discarded in silence, chosen by id ordering, with no error and no log. A
+   * cap cannot decide access; if the number of profiles a person may hold ever
+   * needs a ceiling, it belongs at GRANT time as an explicit, fail-closed
+   * validation, never as a silent cut at READ time.
+   *
+   * The statement is still bound: by `ids.length`, which the caller derives
+   * from that person's own `permissoes` rows (already tenant-scoped by
+   * `permissoesRepo.forPessoa`), and by the tenant predicate. Deterministic
+   * ordering by id stays — the same permission set must render the same prompt
+   * every turn. Still ONE round-trip: the owner decision on #738 keeps
+   * `resolveScope` at exactly two reads (`forPessoa` + this), no JOIN (that was
+   * #693, closed) and no batching loop.
    */
-  async byIds(ids: string[], limit = 500): Promise<PermissionProfile[]> {
+  async forAuthorization(ids: string[]): Promise<PermissionProfile[]> {
     if (ids.length === 0) return [];
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -608,8 +627,7 @@ export const profilesRepo = {
           inArray(permission_profiles.id, Array.from(new Set(ids))),
         ),
       )
-      .orderBy(asc(permission_profiles.id))
-      .limit(limit);
+      .orderBy(asc(permission_profiles.id));
   },
   async list(): Promise<PermissionProfile[]> {
     return db.select().from(permission_profiles);
