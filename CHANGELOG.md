@@ -23,8 +23,11 @@ round-trips (`forPessoa` + `forAuthorization`): sem JOIN (a forma da #693,
 fechada) e sem paginação. `byIds` sai — não tinha outro chamador. Testes:
 unitário com 501 profiles distintos e contrafactual da leitura com teto
 (`tests/unit/governance/resolve-scope-501-profiles.spec.ts`); integração em
-Postgres real com 501 profiles, contagem das duas leituras e isolamento entre
-tenants homônimos (`tests/integration/resolve-scope-501-profiles-real-db.spec.ts`).
+Postgres real com 501 profiles, contagem das duas leituras e isolamento com cada
+predicado pinado separadamente — outro tenant, outro agent do MESMO tenant, e a
+linha inconsistente `tenant_id = B, agent_id = A` que as FKs separadas de
+`permission_profiles` aceitam
+(`tests/integration/resolve-scope-501-profiles-real-db.spec.ts`).
 
 ### Console: o pareamento sai da quarentena — um segundo processo no job ([#623](https://github.com/diogenesmendes01/Maia-v2/issues/623), terceira parte)
 
