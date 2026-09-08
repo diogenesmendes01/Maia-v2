@@ -26,6 +26,10 @@
  * rotation".
  */
 import { config } from '@/config/env.js';
+import {
+  HomologationBootRefusedError,
+  evaluatePeriodicPolicyActivation,
+} from '@/ops/privacy/homologation.js';
 import { logger } from '@/lib/logger.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
 import { startBaileys } from '@/gateway/baileys.js';
@@ -99,6 +103,41 @@ async function main() {
       const { parseKeyring } = await import('@/gateway/staging-crypto.js');
       parseKeyring();
       logger.info('routing.strict_keyring_validated');
+    }
+
+    // Issue #536 / PR #737 — a TRAVA DE HOMOLOGAÇÃO sobre a configuração
+    // EFETIVA deste processo: nenhuma política periódica destrutiva ativa sem
+    // homologação escrita. `config` já está parseado; o MESMO avaliador puro
+    // roda no `npm run config:preflight` sobre os env files, e aqui sobre o
+    // ambiente que o processo REALMENTE recebeu.
+    //
+    // ANTES de banco, Redis, filas e `startWorkers()` de propósito: o critério
+    // mínimo é que nenhum worker inicie, e um processo que já abriu fila com
+    // uma política destrutiva não homologada já está errado antes do cron.
+    //
+    // SEM BYPASS. `MAIA_CONFIG_STRICT_BOOT=false` governa a validação de
+    // CONTRATO em `loadConfig()` (src/config/env.ts) e só ela; o avaliador não
+    // lê essa variável, não a recebe e não tem interruptor. Ligar uma política
+    // destrutiva sem homologação não é uma inconsistência de contrato a
+    // destravar num incidente — é a coisa que a direção do dono proíbe.
+    // Runbook: docs/runbooks/config-contract.md §4.1.
+    const homologation = evaluatePeriodicPolicyActivation(config);
+    if (!homologation.ok) {
+      lifecycle.setComponent('config', 'failed', 'periodic policy active without homologation');
+      // Estruturado e SEM VALOR: só nome de variável, regra e política.
+      logger.error(
+        {
+          violations: homologation.violations.map((v) => ({
+            policy_id: v.policy_id,
+            data_class: v.data_class,
+            variables: v.variables,
+            rule: v.rule,
+            code: v.code,
+          })),
+        },
+        'maia.homologation_boot_refused',
+      );
+      throw new HomologationBootRefusedError(homologation.violations);
     }
     lifecycle.setComponent('config', 'ready');
   });

@@ -94,9 +94,15 @@ import {
   type ComposeNode,
   type PreflightTarget,
 } from '@/config/compose-env.js';
+import { entriesForService } from '@/config/contract.js';
 import { parseEnvFile } from '@/config/env-file.js';
 import type { MaiaProfile, MaiaService } from '@/config/metadata.js';
 import { validateConfig, type ValidateConfigResult } from '@/config/validate.js';
+import {
+  evaluatePeriodicPolicyActivation,
+  periodicPolicyDecidingVariables,
+  type HomologationVerdict,
+} from '@/ops/privacy/homologation.js';
 
 export interface PreflightInput {
   /** Conteúdo do arquivo de Compose. */
@@ -133,6 +139,16 @@ export interface ShellDivergence {
 export interface PreflightContractReport {
   readonly contract: MaiaService;
   readonly result: ValidateConfigResult;
+  /**
+   * A trava de homologação (issue #536, PR #737) sobre a configuração EFETIVA
+   * deste subset: nenhuma política periódica destrutiva ativa sem homologação
+   * escrita. É o MESMO avaliador que o boot roda em `src/index.ts`
+   * (`evaluatePeriodicPolicyActivation`), sobre os `values` que o contrato
+   * parseou para este serviço. `null` quando o subset não declara as variáveis
+   * que decidem a ativação (`migrator`, `admin-ui`): aquele processo não
+   * executa política periódica nenhuma, e um "OK" ali seria vazio.
+   */
+  readonly homologation: HomologationVerdict | null;
 }
 
 export interface PreflightServiceReport {
@@ -198,10 +214,10 @@ export function runPreflight(input: PreflightInput): PreflightReport {
     }
     services.push({
       target,
-      contracts: target.contracts.map((contract) => ({
-        contract,
-        result: validateConfig({ env, service: contract, profile: input.profile }),
-      })),
+      contracts: target.contracts.map((contract) => {
+        const result = validateConfig({ env, service: contract, profile: input.profile });
+        return { contract, result, homologation: homologationFor(contract, result) };
+      }),
       bootGateProblems: target.adminBootGates ? adminBootGateProblems(env) : [],
     });
   }
@@ -214,11 +230,34 @@ export function runPreflight(input: PreflightInput): PreflightReport {
           s.failure === undefined &&
           s.bootGateProblems.length === 0 &&
           s.contracts.length > 0 &&
-          s.contracts.every((c) => c.result.ok),
+          s.contracts.every(
+            (c) => c.result.ok && (c.homologation === null || c.homologation.ok),
+          ),
       ),
     services,
     shellDivergence,
   };
+}
+
+/**
+ * A trava de homologação sobre a configuração EFETIVA de um subset — o mesmo
+ * avaliador do boot, sobre os valores que o contrato parseou aqui.
+ *
+ * Só para subsets que declaram TODAS as variáveis decisórias: é isso que
+ * separa "este processo não executa política periódica" (`null`, nada a
+ * dizer) de "este processo executa e a configuração o proíbe de provar que
+ * está inativo" (`activation_undeterminable`, reprova). Um subset que declare
+ * a variável e não a tenha em `values` é um subset cujo parse falhou — e a
+ * violação aparece ao lado do erro de contrato, não no lugar dele.
+ */
+function homologationFor(
+  contract: MaiaService,
+  result: ValidateConfigResult,
+): HomologationVerdict | null {
+  const declared = new Set(entriesForService(contract).map((e) => e.name));
+  const deciding = periodicPolicyDecidingVariables();
+  if (!deciding.every((name) => declared.has(name))) return null;
+  return evaluatePeriodicPolicyActivation(result.values);
 }
 
 /**
