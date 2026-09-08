@@ -4,6 +4,41 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Dependabot desligado: `.github/dependabot.yml` removido
+
+**A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo
+`.github/dependabot.yml` (quatro blocos: npm na raiz, npm em `src/admin-ui`,
+`github-actions`, `docker`) sai do repo, e com ele `tests/unit/dependabot-admin-ui.spec.ts`,
+que só existia para trancar o conteúdo desse arquivo (bloco do admin-ui
+espelhando o da raiz; majors de `@types/node` e `typescript` ignoradas). Sem o
+arquivo o teste não tem sujeito — não foi pulado nem enfraquecido, foi removido
+junto com o que testava.
+
+**O que muda na prática.**
+
+- Nenhuma PR de *version update* passa a ser aberta automaticamente, em nenhum
+  dos quatro ecossistemas. Bumps de dependência viram PRs próprias, como as
+  migrações já registradas: Node 22→26 ([#743](https://github.com/diogenesmendes01/Maia-v2/issues/743))
+  e TypeScript 7 ([#745](https://github.com/diogenesmendes01/Maia-v2/issues/745)).
+  A política "só a major dessas duas é migração" continua valendo; ela deixa de
+  estar num arquivo de configuração e passa a estar aqui e no `CONTRIBUTING.md`.
+- O ledger de exceções do `npm audit` (#526) e o job `dependency-audit` (#521)
+  **continuam**: um advisory novo em qualquer dos dois lockfiles segue reprovando
+  o CI. O que deixa de existir é a outra metade que o `dependabot.yml`
+  descrevia — "o ledger avisa, o Dependabot propõe a correção". A partir daqui
+  a correção é aberta à mão por quem vir o CI vermelho.
+- *Dependabot security updates* e *Dependabot alerts* são configuração do
+  repositório no GitHub (Settings → Code security), não deste arquivo; este
+  commit não os toca. Se estiverem ligados, PRs de segurança ainda podem
+  aparecer.
+
+**Referências ajustadas.** `CONTRIBUTING.md` § Toolchain deixa de dizer que o
+Dependabot ignora a major de `@types/node`; os comentários de
+`scripts/check-node.mjs`, `tests/unit/scripts/check-node.spec.ts` e
+`tests/unit/admin-ui-dependencia-sem-importador.spec.ts` deixam de apontar para
+o arquivo removido. Entradas antigas deste CHANGELOG e `docs/audit-fix-spec.md`
+são registro histórico e ficam como estão.
+
 ### `resolveScope` deixa de descartar grants acima de 500 profiles distintos ([#738](https://github.com/diogenesmendes01/Maia-v2/issues/738))
 
 **O defeito.** A leitura de perfis do `resolveScope` era `profilesRepo.byIds(ids,
