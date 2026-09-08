@@ -103,7 +103,17 @@ export type ArtifactProblemKind =
    * committed schema that the runner cannot distinguish from a clean rollback,
    * so the file is refused before it can reach a database.
    */
-  | 'unverifiable_transaction_envelope';
+  | 'unverifiable_transaction_envelope'
+  /**
+   * A `-- maia:no-transaction` migration whose SQL the parser-free splitter
+   * (`splitNoTxStatements`) cannot divide safely: a dollar-quoted body, a
+   * string literal containing `;`, or any other shape on which `split(';')`
+   * and the lexical tokeniser disagree. Sent as-is, Postgres would receive a
+   * fragment and the ledger would record `42601` as `dirty` — so the file is
+   * refused at discovery, before any connection, with the cause named
+   * (issue #733).
+   */
+  | 'no_transaction_unsplittable';
 
 export interface ArtifactProblem {
   readonly kind: ArtifactProblemKind;

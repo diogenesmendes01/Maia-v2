@@ -9,6 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  analyzeNoTxSplittability,
   analyzeTransactionEnvelope,
   buildMigrationArtifact,
   compareMigrationIds,
@@ -315,6 +316,141 @@ describe('buildMigrationArtifact — the envelope guardrail', () => {
   });
 });
 
+/**
+ * Issue #733 — the no-transaction splitter's constraint is IMPOSED, not asked.
+ *
+ * `splitNoTxStatements()` is a parser-free `split(';')` by design. Its docstring
+ * forbade dollar-quoted bodies and `;`-bearing literals under the marker, but
+ * nothing enforced that: the split cut inside the body, Postgres received a
+ * fragment, the ledger recorded `42601` and went `dirty`, and the message
+ * pointed at "syntax error" in a file whose SQL was correct. The guard below
+ * refuses such a file AT DISCOVERY — before any connection — and names both
+ * the cause and the way out.
+ */
+describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', () => {
+  const DOLLAR_BODY_UNDER_MARKER = [
+    '-- maia:no-transaction',
+    'DO $meu_bloco$',
+    'BEGIN',
+    "  RAISE EXCEPTION 'algo';",
+    'END',
+    '$meu_bloco$;',
+    '',
+  ].join('\n');
+
+  const LITERAL_WITH_SEMICOLON_UNDER_MARKER = [
+    '-- maia:no-transaction',
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON t (x) WHERE note <> 'a; b';",
+    '',
+  ].join('\n');
+
+  /** The same file with the marker line removed — the control fixture. */
+  function withoutMarker(sql: string): string {
+    const stripped = sql.replace(/^[ \t]*--[ \t]*maia:no-transaction\b[^\n]*\n/m, '');
+    expect(NO_TX_MARKER.test(stripped)).toBe(false);
+    return stripped;
+  }
+
+  it('refuses a dollar-quoted body under the marker — and accepts the SAME file without it', () => {
+    // The finding, exactly (issue #733 "Como isso falha na prática").
+    const refused = buildMigrationArtifact([src('001_a.sql', DOLLAR_BODY_UNDER_MARKER)], ['001_a_down.sql']);
+    expect(refused.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
+    expect(refused.problems[0]!.id).toBe('001_a.sql');
+    // The message names the cause — the marker AND the dollar quote …
+    expect(refused.problems[0]!.detail).toContain('maia:no-transaction');
+    expect(refused.problems[0]!.detail).toContain('$meu_bloco$');
+    expect(refused.problems[0]!.detail).toContain('dollar_quoted_body');
+    // … and the way out: drop the marker and run inside a transaction.
+    expect(refused.problems[0]!.detail).toMatch(/drop|remove/i);
+    expect(refused.problems[0]!.detail).toMatch(/transaction/);
+    // The migration is still discovered (reported, not dropped), like every
+    // other artifact problem.
+    expect(refused.byId.get('001_a.sql')?.noTransaction).toBe(true);
+
+    // CONTROL, same `it`: the identical SQL without the marker is a perfectly
+    // good transactional migration and passes discovery clean. Without this
+    // half, a guard that "refuses everything" would also pass.
+    const accepted = buildMigrationArtifact(
+      [src('001_a.sql', withoutMarker(DOLLAR_BODY_UNDER_MARKER))],
+      ['001_a_down.sql'],
+    );
+    expect(accepted.problems).toEqual([]);
+    expect(accepted.byId.get('001_a.sql')?.noTransaction).toBe(false);
+    expect(accepted.byId.get('001_a.sql')?.transactionMode).toBe('runner');
+  });
+
+  it('refuses a string literal containing ";" under the marker — same control', () => {
+    const refused = buildMigrationArtifact(
+      [src('001_a.sql', LITERAL_WITH_SEMICOLON_UNDER_MARKER)],
+      ['001_a_down.sql'],
+    );
+    expect(refused.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
+    expect(refused.problems[0]!.detail).toContain('maia:no-transaction');
+    expect(refused.problems[0]!.detail).toContain('semicolon_in_string_literal');
+    expect(refused.problems[0]!.detail).toMatch(/transaction/);
+
+    const accepted = buildMigrationArtifact(
+      [src('001_a.sql', withoutMarker(LITERAL_WITH_SEMICOLON_UNDER_MARKER))],
+      ['001_a_down.sql'],
+    );
+    expect(accepted.problems).toEqual([]);
+  });
+
+  it('is NOT fooled by "$$" or ";" that live only in comments (the 096/122 shape)', () => {
+    // 096 and 122 explain the rule in their header comments — "sem `DO $$`,
+    // sem literal com `;`" — and the line stripper removes those before the
+    // split, so they are not hazards. A guard that flagged them would refuse
+    // two migrations that have run in production. (Only `--` comments get
+    // this pass: the splitter strips those and nothing else — a `;` inside a
+    // `/* … */` IS a hazard, pinned below.)
+    const sql = [
+      '-- maia:no-transaction',
+      '-- Regras: statements simples terminados por `;` (sem `DO $$`, sem literal com `;`).',
+      "-- nem aqui: DO $$ BEGIN RAISE 'x; y'; END $$;",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON t (x) WHERE kind = 'note'; -- ok; really",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS j ON t (y) WHERE kind <> 'it''s';",
+      '',
+    ].join('\n');
+    expect(analyzeNoTxSplittability(sql)).toEqual({ hazard: null, detail: null });
+    const artifact = buildMigrationArtifact([src('001_a.sql', sql)], ['001_a_down.sql']);
+    expect(artifact.problems).toEqual([]);
+    expect(splitNoTxStatements(sql)).toHaveLength(2);
+  });
+
+  it('names the shape it found, with the line, for each hazard', () => {
+    expect(analyzeNoTxSplittability('SELECT 1;\nDO $$ BEGIN NULL; END $$;\n')).toEqual({
+      hazard: 'dollar_quoted_body',
+      detail: 'contains a dollar-quoted body opened by "$$" (line 2)',
+    });
+    expect(analyzeNoTxSplittability("SELECT 1;\nSELECT 'a;b';\n")).toEqual({
+      hazard: 'semicolon_in_string_literal',
+      detail: 'contains a string literal with a ";" inside it (line 2)',
+    });
+    // The differential net: a `;` the split cannot see, hidden where the
+    // named checks do not look.
+    const quotedIdentifier = analyzeNoTxSplittability('CREATE INDEX CONCURRENTLY "i;x" ON t (a);\n');
+    expect(quotedIdentifier.hazard).toBe('naive_split_disagrees');
+    expect(quotedIdentifier.detail).toContain('yields 2 statement(s)');
+    expect(quotedIdentifier.detail).toContain('tokeniser finds 1');
+    const blockComment = analyzeNoTxSplittability('CREATE INDEX CONCURRENTLY i ON t (a); /* x; y */\n');
+    expect(blockComment.hazard).toBe('naive_split_disagrees');
+    // A `--` inside a literal: the stripper would eat the closing quote and
+    // the `;` after it.
+    const dashInLiteral = analyzeNoTxSplittability("SELECT 'a--b';\nSELECT 2;\n");
+    expect(dashInLiteral.hazard).toBe('naive_split_disagrees');
+  });
+
+  it('does not mistake a $1 bind placeholder or an escaped quote for a hazard', () => {
+    expect(analyzeNoTxSplittability('SELECT $1;\n').hazard).toBeNull();
+    expect(analyzeNoTxSplittability("SELECT 'it''s';\n").hazard).toBeNull();
+    // A dollar-quoted body WITHOUT a `;` inside would survive the split by
+    // luck; the docstring forbids the shape, not the luck, so it is refused too.
+    expect(analyzeNoTxSplittability('CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n').hazard).toBe(
+      'dollar_quoted_body',
+    );
+  });
+});
+
 describe('the real migrations/ directory', () => {
   it('discovers every forward migration, each with a down sibling', async () => {
     const artifact = await discoverMigrations(join(process.cwd(), 'migrations'));
@@ -351,6 +487,22 @@ describe('the real migrations/ directory', () => {
       const expected = m.noTransaction ? 'none' : legacy ? 'self' : 'runner';
       expect(m.transactionMode, m.id).toBe(expected);
     }
+  });
+
+  it('every no-transaction migration on disk passes the splitter guard (#733)', async () => {
+    // The control that keeps the guard honest in the other direction: it must
+    // not be so strict that a file which has already run in production is
+    // refused. Every marked file is checked ONE BY ONE, so a regression names
+    // the file rather than surfacing as a bare `problems.length`.
+    const artifact = await discoverMigrations(join(process.cwd(), 'migrations'));
+    const marked = artifact.migrations.filter((m) => m.noTransaction);
+    // 15 of the 145 forward files carried the marker when this guard landed;
+    // the count can only grow (migrations are append-only).
+    expect(marked.length).toBeGreaterThanOrEqual(15);
+    for (const m of marked) {
+      expect(analyzeNoTxSplittability(m.sql), m.id).toEqual({ hazard: null, detail: null });
+    }
+    expect(artifact.problems.filter((p) => p.kind === 'no_transaction_unsplittable')).toEqual([]);
   });
 
   it('ships the ledger v2 migration as the head', async () => {

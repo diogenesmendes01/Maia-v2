@@ -324,6 +324,16 @@ export const PREFIX_SHAPE = /^[0-9]+[a-z]?$/;
  * anything that complex can and should run inside a transaction (i.e. without
  * the marker), where the whole file is sent as one query. This keeps the
  * splitter dependency-free and safe.
+ *
+ * The constraint is IMPOSED, not merely asked (issue #733): `buildMigrationArtifact`
+ * runs `analyzeNoTxSplittability` over every marked file and reports a
+ * `no_transaction_unsplittable` artifact problem — which blocks `migrate up`
+ * before any DDL and before any connection is needed — when the file has a
+ * shape this splitter would cut in the wrong place. So by the time SQL reaches
+ * this function, `split(';')` is known to agree with the lexical tokeniser
+ * (`splitTopLevelStatements`) on where the statements end. Do NOT teach this
+ * function to parse; if the guard is too strict for a legitimate file, the
+ * answer is to drop the marker and run it in a transaction.
  */
 export function splitNoTxStatements(sql: string): string[] {
   return sql
@@ -333,6 +343,138 @@ export function splitNoTxStatements(sql: string): string[] {
     .split(';')
     .map((stmt) => stmt.trim())
     .filter((stmt) => stmt.length > 0);
+}
+
+/**
+ * Why a `-- maia:no-transaction` file cannot be handed to `splitNoTxStatements`.
+ * Each value names the lexical shape that hides a `;` from — or shows a false
+ * `;` to — a parser-free `split(';')`.
+ */
+export type NoTxSplitHazard =
+  /** A dollar-quoted body (`DO $$ … $$`, `$tag$ … $tag$`): the split cuts inside it. */
+  | 'dollar_quoted_body'
+  /** A single-quoted string literal with a `;` inside it. */
+  | 'semicolon_in_string_literal'
+  /**
+   * Any other shape on which `split(';')` and the lexical tokeniser disagree
+   * about how many statements there are — a `;` inside a block comment or a
+   * quoted identifier, or a `--` inside a literal (the line-comment stripper
+   * would eat the rest of the line).
+   */
+  | 'naive_split_disagrees';
+
+export interface NoTxSplitAnalysis {
+  readonly hazard: NoTxSplitHazard | null;
+  /** Operator-facing explanation. Names the offending token and line; never quotes the SQL. */
+  readonly detail: string | null;
+}
+
+const NO_TX_SPLIT_OK: NoTxSplitAnalysis = { hazard: null, detail: null };
+
+/** 1-based line of `offset` in `sql`, for the operator-facing detail. */
+function lineOf(sql: string, offset: number): number {
+  let line = 1;
+  for (let i = 0; i < offset; i += 1) if (sql.charCodeAt(i) === 10) line += 1;
+  return line;
+}
+
+/**
+ * The guard behind `splitNoTxStatements` (issue #733).
+ *
+ * Walks the SQL with the SAME lexical rules `splitTopLevelStatements` honours —
+ * `--` and `/* … *\/` comments are skipped, quoted literals and identifiers are
+ * consumed whole, a dollar quote is recognised by `DOLLAR_QUOTE_TAG` — but
+ * uses them only to REFUSE, never to split. That is deliberate: the
+ * no-transaction path stays a parser-free `split(';')`, and this function is
+ * what makes that decision safe by rejecting, at discovery, the file the
+ * split would cut in the wrong place.
+ *
+ * Two hazards are named directly because they are the ones the docstring
+ * forbids and the ones people actually write (`DO $$ … $$;` with `;` inside,
+ * a `WHERE col = 'a; b'`). Everything else falls through to a differential
+ * check: if the naive split and the tokeniser disagree on the statement count,
+ * a `;` is hidden somewhere the split cannot see (block comment, quoted
+ * identifier, `--` inside a literal) and the file is refused too.
+ *
+ * `$$` and `;` that live only inside comments are NOT hazards — the line
+ * stripper removes them before the split, and migrations 096/122 mention
+ * `DO $$` in their header comments precisely to explain this rule.
+ */
+export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
+  const n = sql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sql[i]!;
+
+    if (ch === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i);
+      i = nl === -1 ? n : nl + 1;
+      continue;
+    }
+
+    if (ch === '/' && sql[i + 1] === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') {
+          depth += 1;
+          i += 2;
+        } else if (sql[i] === '*' && sql[i + 1] === '/') {
+          depth -= 1;
+          i += 2;
+        } else {
+          i += 1;
+        }
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      const start = i;
+      i += 1;
+      while (i < n) {
+        if (sql[i] === ch) {
+          if (sql[i + 1] === ch) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      if (ch === "'" && sql.slice(start, i).includes(';')) {
+        return {
+          hazard: 'semicolon_in_string_literal',
+          detail: `contains a string literal with a ";" inside it (line ${lineOf(sql, start)})`,
+        };
+      }
+      continue;
+    }
+
+    if (ch === '$') {
+      const tag = DOLLAR_QUOTE_TAG.exec(sql.slice(i));
+      if (tag) {
+        return {
+          hazard: 'dollar_quoted_body',
+          detail: `contains a dollar-quoted body opened by "${tag[0]}" (line ${lineOf(sql, i)})`,
+        };
+      }
+    }
+
+    i += 1;
+  }
+
+  const naive = splitNoTxStatements(sql).length;
+  const lexical = splitTopLevelStatements(sql).length;
+  if (naive !== lexical) {
+    return {
+      hazard: 'naive_split_disagrees',
+      detail: `hides a ";" where the parser-free splitter cannot see it — splitting on ";" yields ${naive} statement(s) but the lexical tokeniser finds ${lexical} (a ";" inside a block comment or a quoted identifier, or a "--" inside a literal)`,
+    };
+  }
+  return NO_TX_SPLIT_OK;
 }
 
 /** `true` for a forward migration filename (excludes `_down.sql`). */
@@ -436,6 +578,22 @@ export function buildMigrationArtifact(
         id,
         detail: `"${id}" manages its own transaction but ${analysis.detail} [${analysis.defect}]. Wrap the whole file in ONE "BEGIN; … COMMIT;", or drop the transaction control and let the runner own it (then the ledger row commits atomically with the schema change).`,
       });
+    }
+    // Issue #733. The no-transaction runner splits the file on `;` with no
+    // parser (`splitNoTxStatements`) — a deliberate choice that is only safe
+    // when the file has nothing a `split(';')` would cut in the wrong place.
+    // Refuse the file that breaks that premise HERE, with the cause named,
+    // instead of letting Postgres receive a fragment and the ledger record a
+    // `42601` that points at "syntax error" in a file whose SQL is correct.
+    if (noTransaction) {
+      const split = analyzeNoTxSplittability(source.contents);
+      if (split.hazard !== null) {
+        problems.push({
+          kind: 'no_transaction_unsplittable',
+          id,
+          detail: `"${id}" carries the "-- maia:no-transaction" marker but ${split.detail} [${split.hazard}]. The no-transaction runner splits the file on every ";" without a parser (splitNoTxStatements), so Postgres would receive a fragment and the ledger would record 42601 (syntax_error) as "dirty". Drop the marker and let the file run inside a transaction, where it is sent as ONE query; keep the marker only for simple ";"-terminated statements such as CREATE INDEX CONCURRENTLY.`,
+        });
+      }
     }
     const migration: DiscoveredMigration = {
       id,

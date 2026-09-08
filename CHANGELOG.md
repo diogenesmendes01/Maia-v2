@@ -4,6 +4,43 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Migrations `-- maia:no-transaction`: a restrição do splitter passa a ser imposta na descoberta ([#733](https://github.com/diogenesmendes01/Maia-v2/issues/733))
+
+**O defeito.** O caminho no-transaction do runner envia um statement por vez
+e encontra as fronteiras com um `split(';')` deliberadamente sem parser
+(`splitNoTxStatements`, `src/migrations/discover.ts`). O docstring proibia
+corpo dollar-quoted (`DO $$ … $$`) e literal de string com `;` sob o marcador,
+mas nada impunha isso: o split cortava dentro do corpo, o Postgres recebia um
+fragmento, o ledger registrava `error_class = 42601` como `dirty`, e a mensagem
+apontava "erro de sintaxe" numa migration cujo SQL estava correto. Observado no
+ensaio do drill da #705.
+
+**O conserto.** A restrição vira guard, sem ensinar o splitter a parsear —
+a decisão "splitter sem parser" é preservada e torna-se exigível:
+
+- `analyzeNoTxSplittability()` percorre cada arquivo marcado com as mesmas
+  regras léxicas do tokenizer (`splitTopLevelStatements`, que não mudou) e as
+  usa só para RECUSAR: corpo dollar-quoted (`dollar_quoted_body`), literal com
+  `;` (`semicolon_in_string_literal`) ou qualquer forma em que o split
+  ingênuo e o tokenizer discordem na contagem de statements
+  (`naive_split_disagrees` — `;` em comentário de bloco ou identificador
+  entre aspas, `--` dentro de literal).
+- `buildMigrationArtifact()` reporta o novo problema de artefato
+  `no_transaction_unsplittable`, com o marcador, o token ofensor e a linha
+  na mensagem, e o caminho certo: tirar o marcador e rodar em transação.
+- `scripts/migrate.ts up` lê e julga o artefato ANTES de qualquer conexão
+  (pré-voo): com problema, imprime `BLOCKED artifact_integrity: …` e sai 1
+  sem chamar o runner nem o lock. O runner continua conferindo sob o lock
+  (segunda linha, contrato do #516 inalterado).
+- `$$` e `;` que só aparecem em comentários `--` não são hazard — as
+  migrations 096 e 122 citam `DO $$` no cabeçalho por isso. As 145 migrations
+  forward atuais (15 delas marcadas) continuam passando pela descoberta.
+
+**Docs.** `docs/runbooks/migrations.md` ganha a seção "Fixing
+`no_transaction_unsplittable`" e a regra nos pontos que descrevem o marcador;
+`docs/architecture/modules/migrations.md` descreve o guard ao lado do de
+envelope. O docstring de `splitNoTxStatements()` aponta para o guard.
+
 ### Dependabot desligado: `.github/dependabot.yml` removido
 
 **A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo
