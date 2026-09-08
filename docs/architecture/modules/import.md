@@ -58,15 +58,17 @@ A decisão de desenho, com as alternativas descartadas, está no cabeçalho de
 |---|---|
 | `tests/unit/ofx-parser.spec.ts` | OFX parsing fixtures |
 | `tests/unit/import-schema.spec.ts` | `import_runs` / `import_entries` no schema Drizzle |
-| `tests/integration/import-cli-tenant-scope-real-db.spec.ts` | #720 — as duas CLIs contra Postgres real, como processo filho: ingestão viva, recusa de escopo com controle no mesmo `it`, `import:apply` ponta a ponta e o `UPDATE` cross-tenant recusado |
+| `tests/integration/import-cli-tenant-scope-real-db.spec.ts` | #720 — as duas CLIs contra Postgres real, como processo filho: ingestão viva, recusa de escopo com controle no mesmo `it`, `import:apply` ponta a ponta, o `UPDATE` cross-tenant recusado e (caso 5) a **reconciliação** lendo escopada — uma transação-isca do tenant B com FITID idêntico e a `entidade_id` do tenant A NÃO é casada nem listada como candidata, enquanto a do próprio tenant sai `matched` (controle positivo no mesmo `it`) |
 | `tests/unit/scripts/import-cli-escrita-escopada.spec.ts` | #720 — sonda de forma: fica vermelha se um `UPDATE ... WHERE id = $1` sem escopo (ou um `INSERT` sem `applyTenantGuard`) voltar |
 
 ## In-flight changes
 
-At last verification (2026-05-28): none specifically scoped to `src/import/`.
-Issue #720 (em voo) conserta as CLIs em `scripts/`, não `src/import/` — o
-`reconciler` já lia escopado via `transacoesRepo.byScope`; o que faltava era a
-CLI abrir o contexto.
+At last verification (2026-09-08): none specifically scoped to `src/import/`.
+Issue #720 (mergeada em #728; fechada pela PR que acrescentou o caso 5 acima)
+consertou as CLIs em `scripts/`, não `src/import/` — o `reconciler` já lia
+escopado via `transacoesRepo.byScope`; o que faltava era a CLI abrir o
+contexto. O caso 5 é o que segura esse predicado: tirar `tenant_id`/`agent_id`
+do `byScope` deixa SÓ ele vermelho.
 
 Verify: `gh pr list --state open --search "import OR ofx OR csv"`.
 

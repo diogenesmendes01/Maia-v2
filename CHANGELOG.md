@@ -4,6 +4,35 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### #720 fechada: a reconciliação da `import:ofx` provada escopada por tenant, com controle positivo
+
+**Contexto.** O conserto de produção da issue
+[#720](https://github.com/diogenesmendes01/Maia-v2/issues/720) — `import:ofx`
+morta desde a migration 083 (insert em `import_runs` sem `tenant_id`/`agent_id`)
+e as duas CLIs sem contexto de tenant — já estava na `main` pela PR #728, mas o
+corpo dela não trazia `Fixes #720` e a issue ficou aberta. Ao reauditar o
+aceite contra o que foi mergeado, sobrou UM item sem prova: o aceite 4 pelo
+lado da **leitura** ("import do tenant A não lê nem casa linha do tenant B",
+com controle positivo). Os quatro casos de
+`tests/integration/import-cli-tenant-scope-real-db.spec.ts` provam escrita e
+recusa, mas nenhum produz um `matched` por `reconcile()` — as runs nasciam com
+tudo `new` ou com o ponteiro plantado à mão. Verificado: tirar
+`tenant_id`/`agent_id` do WHERE de `transacoesRepo.byScope` deixava os quatro
+casos VERDES.
+
+**O que entra.** Caso (5) na mesma spec, contra Postgres real e executando a
+CLI como processo filho: uma `transacao` do tenant B que é o par perfeito de um
+lançamento do extrato (mesmo FITID → score 1.0, e a `entidade_id` do tenant A,
+porque `entidades.id` é PK global e o único predicado que a segura fora é o de
+tenant+agent) NÃO é casada nem listada como candidata; no MESMO `it`, a
+`transacao` do próprio tenant A sai `matched` com `matched_transacao_id`
+apontando para ela. Sonda: sem os dois predicados no `byScope`, SÓ o caso (5)
+fica vermelho (`expected '<uuid da transação de B>' not to be ...`). Nenhuma
+linha de produção muda — o que muda é que a regra passa a ter teste.
+
+**Docs.** `docs/architecture/modules/import.md`: a tabela de testes ganha o caso
+5 e a nota "Issue #720 (em voo)" deixa de estar desatualizada.
+
 ### Dependabot desligado: `.github/dependabot.yml` removido
 
 **A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo
