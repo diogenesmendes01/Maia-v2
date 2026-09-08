@@ -57,6 +57,42 @@ ser AVALIADO aparece como tick reprovado (`maia_scheduler_job_total{result="fail
 compilado e tipado isso é um efeito de topo que lança — já era defeito; agora
 é defeito visível por métrica, não por processo morto.
 
+### #720 fechada: a reconciliação da `import:ofx` provada escopada por tenant, com controle positivo
+
+**Contexto.** O conserto de produção da issue
+[#720](https://github.com/diogenesmendes01/Maia-v2/issues/720) — `import:ofx`
+morta desde a migration 083 (insert em `import_runs` sem `tenant_id`/`agent_id`)
+e as duas CLIs sem contexto de tenant — já estava na `main` pela PR #728, mas o
+corpo dela não trazia `Fixes #720` e a issue ficou aberta. Ao reauditar o
+aceite contra o que foi mergeado, sobrou UM item sem prova: o aceite 4 pelo
+lado da **leitura** ("import do tenant A não lê nem casa linha do tenant B",
+com controle positivo). Os quatro casos de
+`tests/integration/import-cli-tenant-scope-real-db.spec.ts` provam escrita e
+recusa, mas nenhum produz um `matched` por `reconcile()` — as runs nasciam com
+tudo `new` ou com o ponteiro plantado à mão. Verificado: tirar
+`tenant_id`/`agent_id` do WHERE de `transacoesRepo.byScope` deixava os quatro
+casos VERDES.
+
+**O que entra.** Casos (5), (6) e (7) na mesma spec, contra Postgres real e
+executando a CLI como processo filho. Em cada um, uma `transacao`-isca que é o
+par perfeito de um lançamento do extrato (mesmo FITID → score 1.0, e a
+`entidade_id` do tenant A, porque `entidades.id` é PK global) NÃO é casada nem
+listada como candidata, e no MESMO `it` a `transacao` de (A, agA) sai `matched`
+com `matched_transacao_id` apontando para ela. O que muda entre os três é a
+tupla da isca — e é ela que decide QUAL predicado do `byScope` o caso pina
+(lição da revisão da #744: uma isca de outro tenant COM outro agent é excluída
+por qualquer predicado sozinho, então prova a conjunção e não cada um):
+(5) isca de (B, agB), caso ordinário; (6) isca de (A, agA2), um SEGUNDO agent
+do MESMO tenant — só `agent_id` a segura; (7) a linha INCONSISTENTE (B, agA),
+que o banco aceita porque `transacoes` tem FKs separadas por coluna, sem
+composta — só `tenant_id` a segura. Sondas, uma remoção por vez em
+`transacoesRepo.byScope`: sem `agent_id`, SÓ o (6) fica vermelho; sem
+`tenant_id`, SÓ o (7). Nenhuma linha de produção muda — o que muda é que
+cada predicado passa a ter teste próprio.
+
+**Docs.** `docs/architecture/modules/import.md`: a tabela de testes ganha o caso
+5 e a nota "Issue #720 (em voo)" deixa de estar desatualizada.
+
 ### Dependabot desligado: `.github/dependabot.yml` removido
 
 **A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo
