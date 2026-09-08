@@ -61,12 +61,22 @@ import { triggerRecovery } from '@/setup/recovery.js';
 import { resolveScopeForJid } from './jid-tenant-resolver.js';
 import { normalizeLineE164 } from './channel-resolver.js';
 import { getLineSessionManager } from './line-session-manager.js';
+import {
+  isBaileysConnected,
+  getLastDisconnectAt,
+  _setBaileysConnected,
+  _markBaileysDisconnected,
+} from './baileys-connection-state.js';
 import { channelsRepo } from '@/db/repositories/channel-repos.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
 
+export { isBaileysConnected, getLastDisconnectAt };
+
 let socket: WASocket | null = null;
-let connected = false;
-let lastDisconnectAt: Date | null = null;
+// Issue #726: o estado de conexão vive em `./baileys-connection-state.ts`, um
+// módulo sem dependências, para que quem só precisa de "está conectado?"
+// (`observability/register.ts`) não arraste este grafo inteiro. Este arquivo
+// continua sendo o único que ESCREVE nele.
 /**
  * Pending auto-reconnect timer (issue #512). Tracked so `shutdownBaileys()`
  * can cancel it — a reconnect that fires after the socket closed reopens the
@@ -111,7 +121,7 @@ function buildPrimaryLineTransport(): LineTransport {
     sendReaction: (jid, wid, emoji) => presenceSendReaction(jid, wid, emoji),
     startTyping: (jid, mid) => presenceStartTyping(jid, mid),
     markRead: (jid, wid) => markRead(jid, wid),
-    isConnected: () => connected,
+    isConnected: () => isBaileysConnected(),
   };
 }
 
@@ -210,9 +220,9 @@ export function ensureMediaDirs(): void {
   mkdirSync(join(MEDIA_ROOT, 'tmp'), { recursive: true });
 }
 
-export function isBaileysConnected(): boolean {
-  return connected;
-}
+// `isBaileysConnected` / `getLastDisconnectAt` são reexportados de
+// `./baileys-connection-state.ts` (ver o import no topo) — mesma assinatura,
+// mesmos chamadores.
 
 /**
  * SETUP: request an 8-digit pairing code from WhatsApp. Used when the
@@ -293,7 +303,7 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     qrcodeTerminal.generate(qr, { small: true }); // keep stdout for dev/log spelunking
   }
   if (conn === 'open') {
-    connected = true;
+    _setBaileysConnected(true);
     reconnectAttempts = 0;
     // Issue #512 review round 1 (P1 on `src/index.ts:189`): the lifecycle
     // component reaches `ready` HERE, on the first real `open` — not when
@@ -325,8 +335,7 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
       await audit({ acao: 'pairing_completed' });
     }
   } else if (conn === 'close') {
-    connected = false;
-    lastDisconnectAt = new Date();
+    _markBaileysDisconnected();
     const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
     logger.warn({ reason }, 'baileys.connection_closed');
     // Issue #512: a `loggedOut` close means the pairing is GONE — the session
@@ -1460,7 +1469,7 @@ export async function sendOutboundText(
   text: string,
   opts?: { quoted?: WAQuotedContext; view_once?: boolean; messageId?: string },
 ): Promise<string | null> {
-  if (!socket || !connected) {
+  if (!socket || !isBaileysConnected()) {
     logger.warn('baileys.not_connected — cannot send');
     return null;
   }
@@ -1510,7 +1519,7 @@ export async function sendOutboundDocument(
     quoted?: WAQuotedContext;
   },
 ): Promise<string | null> {
-  if (!socket || !connected) {
+  if (!socket || !isBaileysConnected()) {
     logger.warn('baileys.not_connected — cannot send document');
     return null;
   }
@@ -1578,7 +1587,7 @@ export async function sendOutboundVoice(
   buf: Buffer,
   opts?: { quoted?: WAQuotedContext },
 ): Promise<string | null> {
-  if (!socket || !connected) {
+  if (!socket || !isBaileysConnected()) {
     logger.warn('baileys.not_connected — cannot send voice');
     return null;
   }
@@ -1614,16 +1623,12 @@ export async function shutdownBaileys(): Promise<void> {
   }
 }
 
-export function getLastDisconnectAt(): Date | null {
-  return lastDisconnectAt;
-}
-
 // Test-only seam. Production code never calls this. Lets unit tests inject a
 // mock socket without booting the full WA pairing flow.
 export const _internal = {
   _setSocketForTests(s: WASocket | null, isConnected: boolean): void {
     socket = s;
-    connected = isConnected;
+    _setBaileysConnected(isConnected);
   },
   _handleConnectionUpdate: handleConnectionUpdate,
   _resetReconnectAttempts(): void {

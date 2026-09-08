@@ -1,91 +1,105 @@
 import { describe, it, expect, vi } from 'vitest';
 
-// Minimal mocks: workers/index.ts pulls a wide tree of job functions, and
-// each of those in turn imports config/redis/db. Stub everything to a
-// no-op resolved promise — the registry test only cares about the JOBS
-// array shape, not the underlying behaviour.
+/**
+ * Issue #726 — o registro de workers não pode custar o grafo de produção.
+ *
+ * Antes, este arquivo mockava 20 dos 43 módulos de worker com no-ops e
+ * `import('../../src/workers/index.js')` carregava os outros 23 de verdade —
+ * e, por eles, 407 arquivos de `src/` (4,9 MB de TS): repositórios, agente,
+ * cognição, gateway. Medido: 4,4 s isolado com cache quente, 10,7 s a frio,
+ * 13–21 s na suíte completa sob carga — o primeiro caso deste arquivo estourava
+ * os 20 s e era "recuperado pela segunda tentativa".
+ *
+ * Agora `JOBS` declara cada handler com `lazy(() => import('./x.js'), ...)`
+ * (ver `src/workers/index.ts`): o módulo só é avaliado no primeiro tick. Os
+ * mocks abaixo NÃO são no-ops — são SENTINELAS. O factory de cada um anota o
+ * nome do módulo em `avaliados`, e o vitest só executa o factory quando alguém
+ * importa o módulo. Logo:
+ *
+ *   - se importar o registro voltar a avaliar qualquer módulo de worker, o
+ *     caso "as sentinelas ficam caladas" reprova com o nome do módulo — é a
+ *     sonda de regressão do custo de boot;
+ *   - o caso de CONTROLE no fim chama `job.fn()` de verdade e exige que a
+ *     sentinela de `backup.js` tenha disparado: prova que ela está armada,
+ *     senão "nenhum módulo carregou" passaria também com mocks que nunca
+ *     rodam.
+ *
+ * O que continua real: o array `JOBS` de produção, com nome, cadência, grupo,
+ * fase e a forma do handler. Nada aqui monta um registro paralelo.
+ *
+ * `config` NÃO é mockada — `tests/setup.ts` popula `process.env` e o registro
+ * lê `config.FEATURE_*` no carregamento para o `featureFlag` de alguns jobs.
+ */
 
-// Note: config is NOT mocked here — the vitest setup.ts populates process.env
-// with all required fields. The workers/index.ts reads config.FEATURE_RUNTIME_TRACE_V1
-// at module-load time; in tests this evaluates to the env default (false) unless
-// overridden. The registry tests check JOBS array shape, not runtime feature gate.
-// The featureFlag property just needs to be a boolean (true/false/undefined).
-
-// vi.hoisted: noopAsync, noopWorkers, and mockSchedule must be declared here
-// so they are available inside vi.mock() factories (vitest 4 hoists vi.mock()
-// before top-level statements).
-const { noopAsync, noopWorkers, mockSchedule } = vi.hoisted(() => {
-  const noopAsync = vi.fn(async () => undefined);
-  const noopWorkers = {
-    runHealthMonitor: noopAsync,
-    runPendingExpirer: noopAsync,
-    runIdempotencyCleanup: noopAsync,
-    runAuditModeExpirer: noopAsync,
-    runInactivitySweep: noopAsync,
-    runConversationSummarizer: noopAsync,
-    runReflectionBatch: noopAsync,
-    runMessageRecovery: noopAsync,
-    runPendingReminder: noopAsync,
-    runNightlyBackup: noopAsync,
-    runCloudBackupRotation: noopAsync,
-    runCostMonitor: noopAsync,
-    runAuditWatcher: noopAsync,
-    runDlqMonitor: noopAsync,
-    runMorningBriefing: noopAsync,
-    runEveningBriefing: noopAsync,
-    runWeeklyBriefing: noopAsync,
-    runTraceBodyWriter: noopAsync,
-    runTraceBodyRecoverer: noopAsync,
-    runTraceMatviewRefresh: noopAsync,
-    runOutboundMessagesSweeper: noopAsync,
-    runIdempotencyOutboxRelayer: noopAsync,
-    runWorkflowEngineTick: noopAsync,
-  };
+const { mockSchedule, sentinela, avaliados } = vi.hoisted(() => {
   const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
-  return { noopAsync, noopWorkers, mockSchedule };
+  /** Módulos de worker cujo factory de mock rodou — isto é, que foram importados. */
+  const avaliados: string[] = [];
+  const sentinela = (modulo: string) => () => {
+    avaliados.push(modulo);
+    // Sem exports de propósito: um handler chamado a partir daqui falha com
+    // "No export is defined on the mock", que é o suficiente para o controle.
+    return {};
+  };
+  return { mockSchedule, sentinela, avaliados };
 });
 
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock('../../src/workers/health-monitor.js', () => noopWorkers);
-vi.mock('../../src/workers/pending-expirer.js', () => noopWorkers);
-vi.mock('../../src/workers/idempotency-cleanup.js', () => noopWorkers);
-vi.mock('../../src/workers/audit-mode-expirer.js', () => noopWorkers);
-vi.mock('../../src/workers/inactivity-sweep.js', () => noopWorkers);
-vi.mock('../../src/workers/conversation-summarizer.js', () => noopWorkers);
-vi.mock('../../src/workers/reflection-batch.js', () => noopWorkers);
-vi.mock('../../src/workers/message-recovery.js', () => noopWorkers);
-vi.mock('../../src/workers/pending-reminder.js', () => noopWorkers);
-vi.mock('../../src/workers/backup.js', () => ({
-  runNightlyBackup: noopAsync,
-  // Renamed from `runCloudBackupRotation` in the #520 round-1 fix.
-  runBackupRetention: noopAsync,
-  // Issue #536 — o tick do gate do drill de restore. O comportamento dele é
-  // provado em tests/unit/workers/restore-drill-scheduler.spec.ts, contra o
-  // JOBS real e o adapter real; aqui basta o stub para o registry carregar.
-  runScheduledRestoreDrill: noopAsync,
-}));
-vi.mock('../../src/workers/cost-monitor.js', () => noopWorkers);
-vi.mock('../../src/workers/audit-watcher.js', () => noopWorkers);
-vi.mock('../../src/workers/dlq-monitor.js', () => noopWorkers);
-vi.mock('../../src/workers/briefings.js', () => noopWorkers);
-vi.mock('../../src/workers/trace-body-writer.js', () => noopWorkers);
-vi.mock('../../src/workers/trace-body-recoverer.js', () => noopWorkers);
-vi.mock('../../src/workers/trace-matview-refresh.js', () => noopWorkers);
-vi.mock('../../src/workers/outbound-messages-sweeper.js', () => noopWorkers);
-vi.mock('../../src/workers/idempotency-outbox-relayer.js', () => noopWorkers);
-// Issue #345 Batch D: `workflow_engine_tick` is now backed by the extracted
-// `workflow-engine-tick.ts` dispatcher (registered by reference in index.ts).
-// Stub it like every other worker — the registry test only asserts JOBS shape.
-vi.mock('../../src/workers/workflow-engine-tick.js', () => noopWorkers);
-vi.mock('../../src/workflows/engine.js', () => ({ tickEngine: noopAsync }));
-
 // node-cron v4: ScheduledTask is an interface with stop() / start() / etc.
 vi.mock('node-cron', () => ({
   default: { schedule: mockSchedule },
 }));
+
+// Os 43 módulos que `src/workers/index.ts` referencia em `JOBS`. A lista é
+// fechada de propósito: um worker novo que nasça com import estático no
+// registro não é pego por ela — é pego pelo custo, na lista de mais lentos
+// do reporter. O que ela trava é o REGRESSO dos que já são lazy.
+vi.mock('../../src/workers/audit-mode-expirer.js', sentinela('audit-mode-expirer.js'));
+vi.mock('../../src/workers/audit-watcher.js', sentinela('audit-watcher.js'));
+vi.mock('../../src/workers/backup.js', sentinela('backup.js'));
+vi.mock('../../src/workers/briefings.js', sentinela('briefings.js'));
+vi.mock('../../src/workers/channel-pairing-worker.js', sentinela('channel-pairing-worker.js'));
+vi.mock('../../src/workers/confidence-recompute.js', sentinela('confidence-recompute.js'));
+vi.mock('../../src/workers/conversation-summarizer.js', sentinela('conversation-summarizer.js'));
+vi.mock('../../src/workers/cost-monitor.js', sentinela('cost-monitor.js'));
+vi.mock('../../src/workers/dlq-monitor.js', sentinela('dlq-monitor.js'));
+vi.mock('../../src/workers/drift-monitor.js', sentinela('drift-monitor.js'));
+vi.mock('../../src/workers/gap-escalation-monitor.js', sentinela('gap-escalation-monitor.js'));
+vi.mock('../../src/workers/health-monitor.js', sentinela('health-monitor.js'));
+vi.mock('../../src/workers/idempotency-cleanup.js', sentinela('idempotency-cleanup.js'));
+vi.mock('../../src/workers/idempotency-outbox-relayer.js', sentinela('idempotency-outbox-relayer.js'));
+vi.mock('../../src/workers/inactivity-sweep.js', sentinela('inactivity-sweep.js'));
+vi.mock('../../src/workers/knowledge-state-promoter.js', sentinela('knowledge-state-promoter.js'));
+vi.mock('../../src/workers/legacy-memory-reclassifier.js', sentinela('legacy-memory-reclassifier.js'));
+vi.mock('../../src/workers/mcp-sync-worker.js', sentinela('mcp-sync-worker.js'));
+vi.mock('../../src/workers/message-recovery.js', sentinela('message-recovery.js'));
+vi.mock('../../src/workers/objective-execute-worker.js', sentinela('objective-execute-worker.js'));
+vi.mock('../../src/workers/onboarding-expirer.js', sentinela('onboarding-expirer.js'));
+vi.mock('../../src/workers/outbound-messages-sweeper.js', sentinela('outbound-messages-sweeper.js'));
+vi.mock('../../src/workers/outbound-recovery.js', sentinela('outbound-recovery.js'));
+vi.mock('../../src/workers/outbox-drain-worker.js', sentinela('outbox-drain-worker.js'));
+vi.mock('../../src/workers/pattern-detector.js', sentinela('pattern-detector.js'));
+vi.mock('../../src/workers/pending-expirer.js', sentinela('pending-expirer.js'));
+vi.mock('../../src/workers/pending-reminder.js', sentinela('pending-reminder.js'));
+vi.mock('../../src/workers/playground-turn-worker.js', sentinela('playground-turn-worker.js'));
+vi.mock('../../src/workers/privacy.js', sentinela('privacy.js'));
+vi.mock('../../src/workers/procedure-candidate-consumer.js', sentinela('procedure-candidate-consumer.js'));
+vi.mock('../../src/workers/procedure-execution-reaper.js', sentinela('procedure-execution-reaper.js'));
+vi.mock('../../src/workers/procedure-metrics-refresh.js', sentinela('procedure-metrics-refresh.js'));
+vi.mock('../../src/workers/reflection-batch.js', sentinela('reflection-batch.js'));
+vi.mock('../../src/workers/scheduling-tick.js', sentinela('scheduling-tick.js'));
+vi.mock('../../src/workers/series-next-scheduler.js', sentinela('series-next-scheduler.js'));
+vi.mock('../../src/workers/stream-debounce-closer.js', sentinela('stream-debounce-closer.js'));
+vi.mock('../../src/workers/synthetic-probe.js', sentinela('synthetic-probe.js'));
+vi.mock('../../src/workers/tool-request-triage.js', sentinela('tool-request-triage.js'));
+vi.mock('../../src/workers/trace-body-recoverer.js', sentinela('trace-body-recoverer.js'));
+vi.mock('../../src/workers/trace-body-writer.js', sentinela('trace-body-writer.js'));
+vi.mock('../../src/workers/trace-matview-refresh.js', sentinela('trace-matview-refresh.js'));
+vi.mock('../../src/workers/unrouted-recovery.js', sentinela('unrouted-recovery.js'));
+vi.mock('../../src/workers/workflow-engine-tick.js', sentinela('workflow-engine-tick.js'));
 
 describe('workers registry', () => {
   // Renamed from `cloud_backup_rotation` in the #520 round-1 fix: it is no
@@ -192,6 +206,30 @@ describe('workers registry', () => {
       // No featureFlag — it's the ONLY dispatch path for these effects once
       // merged (the tool no longer sends inline), so it must always run.
       expect(job!.featureFlag).toBeUndefined();
+    });
+  });
+
+  // Issue #726 — o custo de boot do registro.
+  describe('custo de boot (issue #726)', () => {
+    it('importar o registro não avalia nenhum módulo de worker (as sentinelas ficam caladas)', async () => {
+      // Se qualquer `fn: runX` voltar a ser import estático, o nome do módulo
+      // aparece em `avaliados` já no import do registro.
+      const { JOBS } = await import('../../src/workers/index.js');
+      expect(JOBS.length).toBeGreaterThanOrEqual(43);
+      for (const job of JOBS) expect(typeof job.fn).toBe('function');
+      expect(avaliados).toEqual([]);
+    });
+
+    it('CONTROLE: a sentinela está armada — o primeiro tick de um job avalia o módulo dele', async () => {
+      // Anti-vacuidade: o caso acima só significa algo se um módulo de
+      // worker REALMENTE dispara a sentinela quando é carregado. Chamar o
+      // handler é o que carrega. O mock não tem `runBackupRetention`, então a
+      // chamada rejeita — o que importa é a anotação, não a rejeição.
+      const { JOBS } = await import('../../src/workers/index.js');
+      const job = JOBS.find((j) => j.name === 'backup_retention')!;
+      expect(avaliados).not.toContain('backup.js');
+      await job.fn().catch(() => undefined);
+      expect(avaliados).toContain('backup.js');
     });
   });
 });

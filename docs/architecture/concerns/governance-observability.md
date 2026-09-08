@@ -76,7 +76,7 @@ Observability with tenant attribution is the operational corollary: a dashboard 
 | `src/observability/otlp-exporter.ts` | **#535** — dependency-free OTLP/HTTP JSON exporter: bounded queue, batching, counted loss |
 | `src/observability/instrumentation.ts` | **#535** — `instrumentToolDispatch` / `instrumentContextLoad` wrappers |
 | `src/observability/runtime-collectors.ts` | **#535** — pg pool, WhatsApp session, scheduler-lag gauges |
-| `src/observability/register.ts` | **#535** — single wiring point, called once from `src/server.ts` |
+| `src/observability/register.ts` | **#535** — single wiring point, called once from `src/server.ts`. **#726**: tudo o que ele espera no boot é barato — o estado do WhatsApp vem de `gateway/baileys-connection-state.ts` e a semeadura do debounce de `runtime/turns/stream-debounce-series.ts`, dois módulos sem dependências; as fontes pesadas (repositórios, banco) ficam em `import()` no scrape |
 | `src/observability/turn-trace.ts` | Adapter connecting the durable P10b `trace()` to the hot path |
 | `src/observability/queue-metrics.ts` | Queue depth + oldest-job-age gauges |
 | `src/observability/turn-state-collector.ts` | Live turn count + per-state age gauges (#503) |

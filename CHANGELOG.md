@@ -4,6 +4,59 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### #726 — o registro de workers e o boot da observabilidade deixam de custar o grafo de produção
+
+**O sintoma.** `tests/unit/workers-registry.spec.ts > registers backup_retention …`
+levava 13–21 s (`testTimeout` 20 s) e caía em "recuperados pela segunda
+tentativa"; cinco casos de `tests/unit/observability/*` que passam por
+`registerRuntimeObservability()` ficavam em 8–12 s.
+
+**A causa, medida.** Não há espera de rede nem de timer: é CPU — o Vite
+transforma (esbuild, no processo principal, serializado) e o worker avalia o
+grafo TypeScript de produção, e na suíte completa os 4 workers disputam esse
+transform. `import('@/gateway/baileys.js')` sozinho custa 3,85 s com cache
+quente (257 arquivos de `src/`); os pacotes npm são baratos (baileys 228 ms,
+pg+drizzle+ioredis+bullmq 325 ms). Três arestas pagavam esse grafo sem precisar:
+
+- `src/workers/index.ts` importava os 47 handlers estaticamente para montar
+  `JOBS` — 407 arquivos de `src/` (4,9 MB de TS) só para saber nome, cadência e
+  fase de cada job: 4,4 s isolado com cache quente, 10,7 s a frio.
+- `src/observability/register.ts` fazia `await import('@/gateway/baileys.js')`
+  DENTRO de `registerRuntimeObservability()` para ler dois getters de estado —
+  "lazy" só no sentido de não ser import de topo: a função esperava, então todo
+  teste da fiação do boot pagava o gateway inteiro.
+- O mesmo `register.ts` importava `registrarSeriesDeDebounce` de
+  `runtime/turns/stream-debounce.ts`, que arrasta `governance/audit.ts` e o
+  barrel `@/db/repositories.js` (84 arquivos, 1 419 ms) — para uma semeadura
+  de métricas sem I/O.
+
+**O conserto, no código.** (1) `JOBS` declara cada handler com
+`lazy(() => import('./x.js'), (m) => m.runX)`: o módulo é avaliado no primeiro
+tick, uma vez por processo, e o TypeScript continua checando módulo e export;
+o import do registro cai de 407 para 19 arquivos. (2) O estado de conexão do
+Baileys vive em `src/gateway/baileys-connection-state.ts` (sem dependências);
+`baileys.ts` escreve nele e reexporta os getters. (3) A semeadura do debounce
+vive em `src/runtime/turns/stream-debounce-series.ts`; `stream-debounce.ts`
+a reexporta. Nenhum chamador existente muda; nenhum timeout muda.
+
+**Depois (isolado, cache quente, máquina com outros agentes):** o caso da issue
+passa de 4 388–10 757 ms para 284–472 ms; os cinco casos do grupo
+`registerRuntimeObservability` de 3 403–3 896 ms para 1 167–1 617 ms (o que
+sobra é o núcleo da observabilidade — `runtime-collectors`/`metrics`/`taxonomy` —
+e o scrape real, que é o assunto desses testes). Três rodadas completas de
+`tests/unit --retry=0`: `recuperados pela segunda tentativa: nenhum`.
+
+**Guarda de regressão.** `workers-registry.spec.ts` mocka os 43 módulos de
+worker com SENTINELAS que anotam quando são avaliados: importar o registro tem
+de deixar a lista vazia, e um caso de CONTROLE chama `job.fn()` e exige a
+anotação — senão "nenhum módulo carregou" passaria com mocks que nunca rodam.
+
+**O que muda em produção, e é deliberado.** Um módulo de worker que lançar ao
+ser AVALIADO aparece como tick reprovado (`maia_scheduler_job_total{result="failed"}`
++ `worker.tick_failed` a cada tick) em vez de derrubar o boot. Para um grafo
+compilado e tipado isso é um efeito de topo que lança — já era defeito; agora
+é defeito visível por métrica, não por processo morto.
+
 ### Dependabot desligado: `.github/dependabot.yml` removido
 
 **A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo

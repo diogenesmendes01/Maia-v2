@@ -9,6 +9,7 @@
 | File | Role |
 |---|---|
 | `src/gateway/baileys.ts` | WhatsApp connection lifecycle + in/out via Baileys |
+| `src/gateway/baileys-connection-state.ts` | **#726** — `isBaileysConnected` / `getLastDisconnectAt` num módulo sem dependências. `baileys.ts` é o único que escreve nele e reexporta os getters; quem só precisa do estado (o boot da observabilidade) importa daqui e não arrasta o grafo do gateway (253 arquivos de `src/`) |
 | `src/gateway/jid-tenant-resolver.ts` | Parses the inbound WhatsApp JID (`@s.whatsapp.net`/`@c.us`/`@lid`) → E.164 phone, then delegates to `channel-resolver`. `@lid` recovery order: `senderPn`/`participantPn` key hints → injected LID→PN mapping-store lookup → fail-closed `lid_unmapped` (dropped, audited as `channel_resolution_skipped_lid_unmapped`, distinct from a real `channel_resolution_failed`) |
 | `src/gateway/channel-resolver.ts` | Resolves `(channel_id, agent_id, role)` from inbound metadata; fails loud |
 | `src/gateway/rate-limit.ts` | Per-channel rate-limit (Redis, tenant-prefixed keys) |
