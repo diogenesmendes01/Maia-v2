@@ -37,6 +37,7 @@ import { describe, it, expect } from 'vitest';
 import {
   BASELINE_SCHEMA_VERSION,
   NEVER_DRAINED,
+  ACIMA_DO_TETO_ANTIGO,
   CARDINALITIES,
   MARGEM_RELATIVA_DEFAULT,
   applyInjection,
@@ -88,7 +89,7 @@ const FP: RunFingerprint = {
   concurrency: 20,
   think_ms: 150,
   identity: 'profile',
-  cardinalities: [1, 10, 100],
+  cardinalities: [...CARDINALITIES],
   pool_max: 10,
   max_concurrent_reads: 6,
   turns: 600,
@@ -196,11 +197,13 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
   // -------------------------------------------------------------------------
   // #700 — o aceite COMPLETO do orçamento do turno (resolveScope + buildPrompt)
   //
-  // A flag `COBERTURA_DA_MEDICAO.resolve_scope_medido` é um RÓTULO. O que
-  // aprova este critério é a EVIDÊNCIA MEDIDA: as duas leituras do escopo em
-  // todo turno, a cardinalidade resolvida batendo com a semeada, e turnos > 0.
-  // Virar a flag sem incluir a medição tem de REPROVAR — é o defeito que esta
-  // bateria existe para pegar.
+  // `COBERTURA_DA_MEDICAO` é um par de RÓTULOS (atual/anterior), não uma
+  // flag — a flag `resolve_scope_medido` da contenção (#702) saiu com ela. O
+  // que aprova este critério é a EVIDÊNCIA MEDIDA: pelo menos uma leitura do
+  // escopo em todo turno, a cardinalidade resolvida batendo com a semeada em
+  // TODAS as cardinalidades (inclusive a acima do teto antigo de 500), e
+  // turnos > 0. Um rótulo que diga "mede" sobre números zerados tem de
+  // REPROVAR — é o defeito que esta bateria existe para pegar.
   // -------------------------------------------------------------------------
 
   describe('aceite completo do orçamento do turno (#700)', () => {
@@ -213,16 +216,17 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(code).toBe(0);
     });
 
-    it('REPROVA quando a flag diz que mede e os NÚMEROS dizem que não — a flag não prova a si mesma', () => {
-      // O defeito que a #700 nomeia: alguém vira `resolve_scope_medido` para
-      // `true` sem incluir a medição. Sem as leituras do escopo no contador
-      // por turno, o critério é AVALIADO e REPROVADO — não aprovado por
-      // decreto, e não `n/a`.
-      expect(COBERTURA_DA_MEDICAO.resolve_scope_medido).toBe(true);
+    it('REPROVA quando o rótulo diz que mede e os NÚMEROS dizem que não — o rótulo não prova a si mesmo', () => {
+      // O defeito que a #700 nomeia: uma cobertura DECLARADA sem a medição
+      // por trás. O rótulo da corrida é o atual (`resolveScope+buildPrompt`),
+      // e ainda assim, sem as leituras do escopo no contador por turno, o
+      // critério é AVALIADO e REPROVADO — não aprovado por decreto, e não
+      // `n/a` (o caminho `n/a` da contenção da #702 não existe mais).
+      expect(coberturaAtual()).toBe(COBERTURA_DA_MEDICAO.atual);
       const { contencao, code } = run({ scope_reads_per_turn_min: 0, scope_reads_per_turn_max: 0 });
       expect(contencao?.passed).toBe(false);
       expect(contencao?.skipped).toBeFalsy();
-      expect(contencao?.detail).toContain('A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO');
+      expect(contencao?.detail).toContain('O RÓTULO DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO');
       expect(contencao?.detail).toContain('leituras do escopo por turno=0–0');
       expect(code).toBe(1);
 
@@ -244,7 +248,26 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(divergente.contencao?.passed).toBe(false);
       expect(divergente.code).toBe(1);
 
-      // CONTROLE: cardinalidades 1–100 e zero divergências ⇒ aprova.
+      // CONTROLE: cardinalidades 1–501 e zero divergências ⇒ aprova.
+      expect(run({}).contencao?.passed).toBe(true);
+    });
+
+    it('REPROVA quando o escopo resolvido para em 500 — o teto antigo de profiles distintos voltou (com controle)', () => {
+      // A cardinalidade acima do teto antigo (#738/#744) existe para isto: um
+      // `.limit(500)` reintroduzido em `profilesRepo.forAuthorization` deixa a
+      // pessoa de 501 permissões com 500 profiles resolvidos, a permissão
+      // excedente cai como "irresolúvel" e o escopo sai com 500 — o maior
+      // escopo medido deixa de bater com o maior semeado.
+      expect(Math.max(...CARDINALITIES)).toBeGreaterThan(500);
+      const teto = run({ scope_entities_max: 500, scope_cardinality_mismatches: 150 });
+      expect(teto.contencao?.passed).toBe(false);
+      expect(teto.code).toBe(1);
+      const v = teto.failed.find((x) => x.label.includes('veio do BANCO'))!;
+      expect(v).toBeDefined();
+      expect(v.detail).toContain(`escopo resolvido=1–500 entidades (esperado 1–${Math.max(...CARDINALITIES)})`);
+
+      // CONTROLE: com o maior escopo resolvido igual ao semeado, aprova.
+      expect(run({}).failed.some((x) => x.label.includes('veio do BANCO'))).toBe(false);
       expect(run({}).contencao?.passed).toBe(true);
     });
 
@@ -271,7 +294,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // pede enquanto os baselines novos não existem.
       const coberturaAntiga = baselineWith(1_000, {
         ...FP,
-        cobertura: COBERTURA_DA_MEDICAO.rotulo,
+        cobertura: COBERTURA_DA_MEDICAO.anterior,
       });
       const recusa = checkBaselineCompatibility(coberturaAntiga, FP);
       expect(recusa.status).toBe('incompatible');
@@ -295,15 +318,18 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(checkBaselineCompatibility(antigo, FP).status).toBe('legacy_schema');
     });
 
-    it('o rótulo da cobertura MUDA quando a flag muda — é o que invalida os baselines antigos', () => {
-      // Se os dois estados produzissem o mesmo rótulo, virar a flag não
-      // invalidaria baseline nenhum e a comparação silenciosamente misturaria
-      // duas réguas. Este teste é o que impede essa regressão.
-      const rotuloSemResolveScope = COBERTURA_DA_MEDICAO.rotulo;
-      expect(coberturaAtual()).toBe(
-        COBERTURA_DA_MEDICAO.resolve_scope_medido ? 'resolveScope+buildPrompt' : rotuloSemResolveScope,
-      );
-      expect(rotuloSemResolveScope).not.toBe('resolveScope+buildPrompt');
+    it('o rótulo da cobertura atual DIFERE do anterior — é o que invalida os baselines antigos', () => {
+      // Se as duas coberturas produzissem o mesmo rótulo, nenhum baseline de
+      // antes da #700 seria invalidado e a comparação silenciosamente
+      // misturaria duas réguas. Este teste é o que impede essa regressão —
+      // inclusive a de "simplificar" `coberturaAtual()` para devolver o rótulo
+      // errado.
+      expect(coberturaAtual()).toBe('resolveScope+buildPrompt');
+      expect(COBERTURA_DA_MEDICAO.anterior).toBe('buildPrompt-sem-resolveScope');
+      expect(COBERTURA_DA_MEDICAO.anterior).not.toBe(coberturaAtual());
+      // E não há mais flag: a cobertura não é DECLARADA em lugar nenhum do
+      // harness — só medida (o critério agregado) e carimbada (o fingerprint).
+      expect('resolve_scope_medido' in COBERTURA_DA_MEDICAO).toBe(false);
     });
   });
 
@@ -359,7 +385,22 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(v).toBeDefined();
       expect(v.detail).toContain('N=100: 12–113');
 
-      // CONTROLE: contagem constante nas três cardinalidades aprova.
+      // CONTROLE: contagem constante em todas as cardinalidades aprova.
+      expect(run({}).failed.some((v2) => v2.label.includes('crescimento O(1)'))).toBe(false);
+    });
+
+    it('o guardrail O(1) também cobre a cardinalidade ACIMA DO TETO ANTIGO — um N+1 só em N=501 reprova (com controle)', () => {
+      // O braço de 501 não é decoração: uma contagem que cresce só ali (um
+      // lote que virou laço acima de 500, por exemplo) tem de reprovar pelo
+      // mesmo guardrail, e o rótulo do critério nomeia N=501 como o ponto de
+      // comparação com N=1.
+      const N = Math.max(...CARDINALITIES);
+      const { code, failed } = run({ [`card${N}.reads_per_turn_max`]: 13 });
+      expect(code).toBe(1);
+      const v = failed.find((x) => x.label.includes('crescimento O(1)'))!;
+      expect(v).toBeDefined();
+      expect(v.label).toContain(`(N=${N} == N=1)`);
+      expect(v.detail).toContain(`N=${N}: 12–13`);
       expect(run({}).failed.some((v2) => v2.label.includes('crescimento O(1)'))).toBe(false);
     });
 
@@ -373,7 +414,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       const v = divergente.failed.find((x) => x.label.includes(DO_BANCO))!;
       expect(v.detail).toContain('divergências de cardinalidade=3');
 
-      // CONTROLE: 1–100 entidades e zero divergências.
+      // CONTROLE: 1–501 entidades e zero divergências.
       expect(run({}).failed.some((x) => x.label.includes(DO_BANCO))).toBe(false);
     });
 
@@ -442,15 +483,17 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // orçamento da `main` — e nenhum critério de contagem reprova, porque a
       // decisão do dono tirou o teto do aceite. O que protegeria contra isso é
       // a latência (os critérios principais), não um número de queries.
+      // Em TODA cardinalidade — inclusive a acima do teto antigo (501): uma
+      // que ficasse de fora seria inclinação, e inclinação reprova.
       const alto = run({
         reads_per_turn_min: 20,
         reads_per_turn_max: 20,
-        'card1.reads_per_turn_min': 20,
-        'card1.reads_per_turn_max': 20,
-        'card10.reads_per_turn_min': 20,
-        'card10.reads_per_turn_max': 20,
-        'card100.reads_per_turn_min': 20,
-        'card100.reads_per_turn_max': 20,
+        ...Object.fromEntries(
+          CARDINALITIES.flatMap((n) => [
+            [`card${n}.reads_per_turn_min`, 20],
+            [`card${n}.reads_per_turn_max`, 20],
+          ]),
+        ),
       });
       expect(alto.failed).toEqual([]);
       expect(alto.code).toBe(0);
@@ -461,7 +504,10 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
 
     it('com menos de duas cardinalidades medidas, a inclinação sai NÃO AVALIADA — e em modo gate isso REPROVA', () => {
       // Sem dois pontos não há inclinação; "não avaliado" não é "aprovado".
-      const { code, verdicts } = run({ 'card10.turns': 0, 'card100.turns': 0 });
+      // Zera os turnos de TODAS as cardinalidades menos N=1.
+      const { code, verdicts } = run(
+        Object.fromEntries(CARDINALITIES.filter((n) => n !== 1).map((n) => [`card${n}.turns`, 0])),
+      );
       const v = verdicts.find((x) => x.label.includes(O1))!;
       expect(v.skipped).toBe(true);
       expect(v.passed).toBe(false);
@@ -1345,8 +1391,15 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     expect(percentile([], 95)).toBe(0);
   });
 
-  it('as cardinalidades são as do enunciado', () => {
-    expect([...CARDINALITIES]).toEqual([1, 10, 100]);
+  it('as cardinalidades são as do enunciado — mais uma ACIMA DO TETO ANTIGO de 500 profiles distintos', () => {
+    // 1/10/100 vêm do enunciado do dono (#525). A quarta é a #700 lendo a
+    // #738/#744: o teto de 500 profiles distintos que `profilesRepo.byIds`
+    // impunha à leitura de autorização foi REMOVIDO, e o gate mede a ausência
+    // dele em vez de afirmá-la. Baixar este número para ≤ 500 devolveria o
+    // harness ao estado em que nunca exercitou o teto.
+    expect([...CARDINALITIES]).toEqual([1, 10, 100, ACIMA_DO_TETO_ANTIGO]);
+    expect(ACIMA_DO_TETO_ANTIGO).toBe(501);
+    expect(Math.max(...CARDINALITIES)).toBeGreaterThan(500);
   });
 
   it('importar o script NÃO roda main() (guarda de entrypoint)', () => {

@@ -4,6 +4,53 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Gate do turno: o `resolveScope` medido até acima do teto antigo, e a contenção da #702 retirada ([#700](https://github.com/diogenesmendes01/Maia-v2/issues/700))
+
+**O que faltava.** A #721 pôs o `resolveScope` dentro do relógio do gate
+(`npm run turn:bench`) e semeou `permissoes`/`permission_profiles` em 1/10/100.
+Ficaram três pontas soltas, e esta entrada fecha as três:
+
+- **Uma cardinalidade acima do teto antigo.** A issue citava "o teto de 500
+  profiles"; a #738/#744 o removeu (`profilesRepo.byIds(ids, limit = 500)` →
+  `profilesRepo.forAuthorization`, sem `LIMIT`). O gate passa a medir a
+  ausência do teto em vez de afirmá-la: `CARDINALITIES` ganha `501`
+  (`ACIMA_DO_TETO_ANTIGO`), a massa semeia 501 entidades e 501 profiles
+  distintos por par e uma quarta pessoa com 501 `permissoes`. Um `.limit(500)`
+  reintroduzido aparece como escopo resolvido de 500 contra 501 semeados —
+  divergência de cardinalidade, que reprova. O guardrail O(1) compara N=501
+  com N=1. O campo `cardinalities` do fingerprint muda, então **todo baseline
+  local anterior é recusado** e precisa ser re-gravado (`--mode measure
+  --sustain-s 60 --write-baseline`).
+- **A contenção da PR #702 saiu por inteiro.** Não há mais flag
+  `COBERTURA_DA_MEDICAO.resolve_scope_medido` nem o caminho que emitia o
+  aceite completo como `n/a`, a nota do banner do modo gate e a nota do
+  relatório; `COBERTURA_DA_MEDICAO` é só o par de rótulos `atual`/`anterior`
+  que o fingerprint carimba. O critério agregado é sempre AVALIADO sobre os
+  números medidos — um rótulo sem medição por trás reprova com os zeros à
+  vista (`O RÓTULO DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO`).
+- **A sonda da massa, em Postgres real.**
+  `tests/integration/turn-context-bench-massa-real-db.spec.ts` semeia um par
+  com o `seedPair` do próprio harness (exportado para isto, junto com
+  `cleanup`) e resolve cada pessoa com o `resolveScope` de produção sob o
+  contador de produção: 1, 10, 100 e 501 entidades, N profiles distintos, duas
+  round-trips. Fica vermelha se a massa deixar de semear as tabelas; o controle
+  apaga as permissões de uma pessoa e mostra o escopo esvaziar. A sonda
+  unitária (`turn-context-resolve-scope-medido.spec.ts`) ganha o contrafactual
+  do teto: 501 semeados, `LIMIT 500` encenado na leitura de perfis, 500
+  resolvidos, gate vermelho.
+
+**Rodadas sob a cobertura nova.** Baseline e candidato foram medidos na bancada
+local (Postgres 16 em `127.0.0.1:5441`, banco próprio, 4 vCPU, com outros
+agentes rodando na mesma máquina); os números e as condições estão na PR. A
+comparação com o baseline real da cobertura anterior (gravado pelo harness da
+#702, schema 3, `buildPrompt-sem-resolveScope`) foi **recusada** pelo
+fingerprint, e a recusa literal está na PR. Nenhum número local certifica
+produção; os números medidos sob a cobertura anterior continuam identificados
+por ela e não são reapresentados como turno completo.
+
+Docs: `docs/runbooks/operational.md` §11, `docs/architecture/modules/agent.md`,
+`src/agent/turn-context/types.ts`.
+
 ### Dependabot desligado: `.github/dependabot.yml` removido
 
 **A decisão.** Pedido do dono (2026-09-08): remover o Dependabot. O arquivo

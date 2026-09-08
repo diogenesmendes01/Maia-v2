@@ -1358,7 +1358,8 @@ Restart preserva: sessão Baileys (`.baileys-auth/`), backups, audit log, jobs
 ## 11. Gate de desempenho da carga de contexto do turno (issue #525)
 
 `npm run turn:bench` roda o gate que o dono fixou para a #525: Postgres real,
-pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades,
+pool 10, 50 pares tenant/agente, concorrência 20, escopos de 1/10/100 entidades
+— mais um de **501**, acima do teto antigo de profiles distintos (ver abaixo) —,
 braços `cold` e `warm`. Ele exercita o **turno inteiro** — `resolveScope`
 (`src/governance/permissions.ts`) seguido de `buildPrompt`
 (`src/agent/prompt-builder.ts`, quem publica
@@ -1370,40 +1371,53 @@ produção, dentro do mesmo relógio.
 > Até a #700 este gate media um orçamento **PARCIAL**: `buildContext` fabricava
 > o escopo em memória e a massa não semeava `permissoes` nem
 > `permission_profiles`, então uma regressão que morasse no `resolveScope`
-> passava sem ser vista. O critério "aceite completo do orçamento do turno"
-> saía `n/a` e a corrida reprovava por contenção — `exit 1` significava "não
-> demonstrado".
+> passava sem ser vista. A contenção da PR #702 fazia o critério "aceite
+> completo do orçamento do turno" sair `n/a` e a corrida reprovar — `exit 1`
+> significava "não demonstrado". **Essa contenção não existe mais**: o
+> critério é sempre avaliado, e não há flag de cobertura para virar.
 >
-> **Agora o escopo é resolvido no Postgres, dentro do relógio.** A massa semeia
-> TRÊS pessoas por par — uma com 1, outra com 10, outra com 100 linhas em
+> **O escopo é resolvido no Postgres, dentro do relógio.** A massa semeia UMA
+> pessoa por cardinalidade em cada par — com 1, 10, 100 e **501** linhas em
 > `permissoes`, cada permissão apontando para um `permission_profiles`
-> distinto (100 por par — aquém do teto de 500 que o `profilesRepo.byIds` tinha
-> à época; a #738 removeu o teto da leitura de autorização, hoje
-> `profilesRepo.forAuthorization`). A
-> cardinalidade 1/10/100 do enunciado passou a ser o tamanho do escopo
-> RESOLVIDO, não uma fatia em memória.
+> distinto (501 por par). A cardinalidade do enunciado passou a ser o tamanho
+> do escopo RESOLVIDO, não uma fatia em memória.
+>
+> **Sobre o 501.** A issue #700 citava "o teto de 500 profiles". Esse teto era
+> o `LIMIT 500` de `profilesRepo.byIds`, que descartava em silêncio os grants
+> acima de 500 profiles DISTINTOS; a **#738/#744 o removeu** (a leitura de
+> autorização hoje é `profilesRepo.forAuthorization`, escopada por
+> tenant/agent, sem `LIMIT`). O gate não afirma isso — mede: a pessoa de 501
+> permissões tem de resolver 501 no banco, e um `.limit()` reintroduzido
+> aparece como escopo de 500 contra 501 semeados (divergência de
+> cardinalidade, que reprova).
 >
 > Três critérios por braço são a evidência disso, e reprovam a corrida se ela
-> sumir: as **2 leituras** do escopo em todo turno, o **escopo resolvido**
-> batendo com a massa (1–100), e o **p95 do estágio**. O critério agregado
-> ("aceite completo do orçamento do turno") lê esses NÚMEROS — virar a flag
-> `COBERTURA_DA_MEDICAO.resolve_scope_medido` sem a medição produz um critério
-> avaliado e **reprovado**, não uma aprovação.
+> sumir: **≥1 leitura** do escopo em todo turno (a contagem é dado medido: 2 na
+> `main`), o **escopo resolvido** batendo com a massa (1–501, zero
+> divergências), e o **p95 do estágio**. O critério agregado ("aceite completo
+> do orçamento do turno") lê esses NÚMEROS — um rótulo de cobertura sem a
+> medição por trás produz um critério avaliado e **reprovado**, não uma
+> aprovação.
 >
 > **Os números anteriores continuam identificados pela cobertura que os
 > produziu.** O fingerprint carimba `cobertura`, então um baseline gravado como
 > `buildPrompt-sem-resolveScope` é **RECUSADO** para comparação com uma corrida
-> `resolveScope+buildPrompt` — não estimado, não convertido. Na prática: **todo
-> baseline anterior à #700 precisa ser re-gravado** (`--mode measure
+> `resolveScope+buildPrompt` — não estimado, não convertido. O mesmo vale para
+> o campo `cardinalities`: um baseline de `1/10/100` (gravado entre a #721 e o
+> braço de 501) é recusado por divergência de forma. Na prática: **todo
+> baseline anterior a esta versão precisa ser re-gravado** (`--mode measure
 > --sustain-s 60 --write-baseline`), e até lá o critério relativo sai `n/a` e o
 > gate reprova dizendo exatamente isso.
 >
 > Um número medido sob a cobertura antiga **não pode** ser reapresentado como
 > medição do turno completo — nem em PR, nem aqui, nem em relatório arquivado.
+> E um número medido nesta bancada local **não certifica produção**: é o piso
+> de um host só, com Postgres local e sem a carga do resto do processo.
 
 Não é um teste de unidade nem roda na suíte padrão: pede um Postgres migrado,
-escreve ~40 mil linhas de massa (a massa por pessoa triplicou na #700, mais
-`permissoes` e `permission_profiles`) e devolve o veredicto por **exit code**.
+escreve ~110 mil linhas de massa (501 entidades e 501 profiles por par, quatro
+pessoas por par com `permissoes` próprias) e devolve o veredicto por **exit
+code**.
 
 ### Pré-requisitos
 
@@ -1466,10 +1480,10 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
 | `o resolveScope foi EXERCITADO: ≥1 leitura de escopo por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem as tabelas do escopo, ou as leituras fora do `instrumentAll`) | leia o número no detalhe. `0–0` é medição ausente, não desempenho. O número em si é dado medido (2 na `main`, 1 com a fusão da #693) — decisão da #525 |
-| `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N. `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu. O teto absoluto é linha de relatório, não critério |
-| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada na leitura de perfis (`profilesRepo.forAuthorization` não tem `LIMIT` desde a #738 — se divergir, procure um `.limit()` reintroduzido ou um profile de outro tenant) |
+| `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N (1/10/100/501). `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu; crescimento só em `N=501` é um lote que virou laço acima de 500. O teto absoluto é linha de relatório, não critério |
+| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100/501` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; `escopo resolvido=1–500` com divergências ⇒ o teto de 500 profiles distintos voltou à leitura de perfis (`profilesRepo.forAuthorization` não tem `LIMIT` desde a #738/#744 — procure um `.limit()` reintroduzido); divergência com outro tamanho ⇒ profile de outro tenant ou permissão descartada |
 | `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` (ou `scope_permissoes_com_profile`, na árvore da #693) na tabela "latência por leitura" |
-| `aceite completo do orçamento do turno` **vermelho** | a flag de cobertura diz que mede e os números dizem que não | é o caso "a flag não prova a si mesma": o detalhe traz os três números medidos. Não vire a flag — conserte a medição |
+| `aceite completo do orçamento do turno` **vermelho** | o rótulo de cobertura diz que mede e os números dizem que não | é o caso "o rótulo não prova a si mesmo": o detalhe traz os três números medidos por braço. Não há flag para virar — conserte a medição (o caminho, em `runTurnOnce`/`instrumentAll`, ou a massa, em `seedPerson`) |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
 | `a amostragem do pool observou a corrida` | o amostrador não olhou (zero amostras, ou uma lacuna cega maior que 10× `--sample-ms`) | `--sample-ms` maior que a corrida, ou o event loop travado. **Não é veredicto sobre o pool: é ausência de evidência sobre ele** |
@@ -1617,12 +1631,18 @@ npm run turn:bench -- --self-test --inject pool_samples=0          # exit 1 — 
 npm run turn:bench -- --self-test --self-test-baseline missing     # exit 1 — sem baseline não há gate
 npm run turn:bench -- --self-test --self-test-baseline incompatible # exit 1 — baseline de outra carga
 
-# O estágio `resolveScope` (#700) — as quatro regressões que o gate tem que ver:
+# O estágio `resolveScope` (#700) — as regressões que o gate tem que ver:
 npm run turn:bench -- --self-test --inject scope_reads_per_turn_min=0     # exit 1 — escopo fabricado em memória
-npm run turn:bench -- --self-test --inject scope_reads_per_turn_max=101   # exit 1 — N+1 no caminho do escopo
+npm run turn:bench -- --self-test --inject card100.reads_per_turn_max=113 # exit 1 — N+1 no caminho do escopo (guardrail O(1))
+npm run turn:bench -- --self-test --inject card501.reads_per_turn_max=13  # exit 1 — idem, só no braço acima do teto antigo
 npm run turn:bench -- --self-test --inject scope_cardinality_mismatches=1 # exit 1 — escopo ≠ massa semeada
+npm run turn:bench -- --self-test --inject scope_entities_max=500         # exit 1 — o teto de 500 profiles voltou (501 semeados)
 npm run turn:bench -- --self-test --inject cold.scope_p95_ms=900          # exit 1 — degradação NO resolveScope
 ```
+
+(`scope_reads_per_turn_max=101` sozinho NÃO reprova desde a decisão da #525: a
+contagem de leituras do escopo é dado medido, e o N+1 é pego pelo guardrail
+O(1) da contagem por cardinalidade.)
 
 `--inject` é **recusado** sem `--self-test`, para que não vire a porta dos
 fundos que faz qualquer regressão passar. O autoteste usa um baseline SINTÉTICO,
@@ -1637,7 +1657,18 @@ turno de verdade (`runTurnOnce`) contra o `resolveScope` de produção com os
 repositórios dublados, conta as leituras pelo MESMO frame que `runArm` usa e
 alimenta o veredicto com o que o contador produziu. Fica vermelha se o escopo
 voltar a ser fabricado em memória, se as leituras saírem do `instrumentAll`, ou
-se o escopo resolvido deixar de ter a cardinalidade semeada.
+se o escopo resolvido deixar de ter a cardinalidade semeada — inclusive se a
+leitura de perfis voltar a ter o teto de 500 (o contrafactual está no spec:
+501 semeados, 500 resolvidos, gate vermelho).
+
+A sonda que prova a MASSA — as linhas, não o caminho — é
+`tests/integration/turn-context-bench-massa-real-db.spec.ts` (precisa de
+`TEST_DB_URL`, como toda spec de integração): ela semeia um par com o
+`seedPair` do próprio harness num Postgres real e resolve cada pessoa com o
+`resolveScope` de produção, sob o contador de produção — 1, 10, 100 e 501
+entidades, N profiles distintos, duas round-trips. Fica vermelha se
+`seedPerson` deixar de semear `permissoes`/`permission_profiles`; o controle
+dela apaga as permissões de uma pessoa e mostra o escopo esvaziar.
 
 Ela também defende a **fronteira do cronômetro**, que é outra coisa: o
 `resolveScope` pode estar sendo executado e contado e ainda assim ficar FORA do
@@ -1645,8 +1676,8 @@ número que o gate julga. A duração do turno é calculada num lugar só
 (`measureTurn`, no próprio harness), e a sonda cobra a aritmética — com relógio
 injetado (`turno = escopo + prompt`, valores exatos) e com relógio real (o
 estágio domina o turno; `ms ≥ scope_ms`). Subtrair o estágio do relógio do turno
-restauraria a cobertura antiga sem mexer em contador, flag ou cardinalidade — e
-é exatamente isso que esses casos pegam.
+restauraria a cobertura antiga sem mexer em contador, rótulo ou cardinalidade —
+e é exatamente isso que esses casos pegam.
 
 ### Massa e limpeza
 
