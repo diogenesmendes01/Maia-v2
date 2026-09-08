@@ -57,6 +57,47 @@ ser AVALIADO aparece como tick reprovado (`maia_scheduler_job_total{result="fail
 compilado e tipado isso é um efeito de topo que lança — já era defeito; agora
 é defeito visível por métrica, não por processo morto.
 
+### Migrations `-- maia:no-transaction`: a restrição do splitter passa a ser imposta na descoberta ([#733](https://github.com/diogenesmendes01/Maia-v2/issues/733))
+
+**O defeito.** O caminho no-transaction do runner envia um statement por vez
+e encontra as fronteiras com um `split(';')` deliberadamente sem parser
+(`splitNoTxStatements`, `src/migrations/discover.ts`). O docstring proibia
+corpo dollar-quoted (`DO $$ … $$`) e literal de string com `;` sob o marcador,
+mas nada impunha isso: o split cortava dentro do corpo, o Postgres recebia um
+fragmento, o ledger registrava `error_class = 42601` como `dirty`, e a mensagem
+apontava "erro de sintaxe" numa migration cujo SQL estava correto. Observado no
+ensaio do drill da #705.
+
+**O conserto.** A restrição vira guard, sem ensinar o splitter a parsear —
+a decisão "splitter sem parser" é preservada e torna-se exigível:
+
+- `analyzeNoTxSplittability()` percorre cada arquivo marcado com as mesmas
+  regras léxicas do tokenizer (`splitTopLevelStatements`, que não mudou) —
+  mais os escapes de barra invertida de `E'…'`, que o tokenizer não lê — e as
+  usa só para RECUSAR, token a token: corpo dollar-quoted
+  (`dollar_quoted_body`); `;` dentro de literal, inclusive `E'a\';b\'c'`
+  (`semicolon_in_string_literal`); `;` dentro de identificador entre aspas
+  ou comentário de bloco (`hidden_semicolon`); `--` dentro de literal,
+  identificador ou comentário de bloco (`line_comment_inside_token` — o
+  stripper de linha roda antes do split e truncaria o token, sem que a
+  contagem de statements mude quando o ferido é o último). A prova é direta
+  por token, nunca uma comparação de contagens (achados da revisão da PR).
+- `buildMigrationArtifact()` reporta o novo problema de artefato
+  `no_transaction_unsplittable`, com o marcador, o token ofensor e a linha
+  na mensagem, e o caminho certo: tirar o marcador e rodar em transação.
+- `scripts/migrate.ts up` lê e julga o artefato ANTES de qualquer conexão
+  (pré-voo): com problema, imprime `BLOCKED artifact_integrity: …` e sai 1
+  sem chamar o runner nem o lock. O runner continua conferindo sob o lock
+  (segunda linha, contrato do #516 inalterado).
+- `$$` e `;` que só aparecem em comentários `--` não são hazard — as
+  migrations 096 e 122 citam `DO $$` no cabeçalho por isso. As 145 migrations
+  forward atuais (15 delas marcadas) continuam passando pela descoberta.
+
+**Docs.** `docs/runbooks/migrations.md` ganha a seção "Fixing
+`no_transaction_unsplittable`" e a regra nos pontos que descrevem o marcador;
+`docs/architecture/modules/migrations.md` descreve o guard ao lado do de
+envelope. O docstring de `splitNoTxStatements()` aponta para o guard.
+
 ### #720 fechada: a reconciliação da `import:ofx` provada escopada por tenant, com controle positivo
 
 **Contexto.** O conserto de produção da issue

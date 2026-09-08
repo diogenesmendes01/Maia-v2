@@ -27,6 +27,7 @@ import {
   splitNoTxStatements,
   isDirectInvocation,
 } from '../../../scripts/migrate.js';
+import { buildMigrationArtifact } from '@/migrations/discover.js';
 
 const MIG_DIR = join(process.cwd(), 'migrations');
 
@@ -89,6 +90,39 @@ describe('PR #310 — no-tx migration statement splitter', () => {
       'CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t (x)',
       'CREATE INDEX CONCURRENTLY IF NOT EXISTS b ON t (y)',
     ]);
+  });
+
+  it('cuts a dollar-quoted body in the wrong place — which is exactly why discovery refuses it (#733)', () => {
+    // The splitter is a parser-free `split(';')` BY DESIGN. This case pins the
+    // consequence the docstring warned about and nothing enforced until #733:
+    // the `DO $$ … $$;` block from the issue comes out as fragments, not as
+    // one statement. Sent to Postgres, the first fragment is a 42601.
+    const sql = [
+      '-- maia:no-transaction',
+      'DO $meu_bloco$',
+      'BEGIN',
+      "  RAISE EXCEPTION 'algo';",
+      'END',
+      '$meu_bloco$;',
+    ].join('\n');
+    const fragments = splitNoTxStatements(sql);
+    expect(fragments).toHaveLength(2);
+    expect(fragments[0]).toBe("DO $meu_bloco$\nBEGIN\n  RAISE EXCEPTION 'algo'");
+    expect(fragments[1]).toBe('END\n$meu_bloco$');
+
+    // So the file never reaches the splitter: `buildMigrationArtifact` refuses
+    // it at discovery, naming the marker, the `$meu_bloco$` and the way out.
+    const artifact = buildMigrationArtifact([{ filename: '001_a.sql', contents: sql }], ['001_a_down.sql']);
+    expect(artifact.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
+    expect(artifact.problems[0]!.detail).toContain('$meu_bloco$');
+
+    // CONTROL: the same file WITHOUT the marker is a normal transactional
+    // migration; discovery accepts it and the splitter is never consulted.
+    const control = sql.split('\n').slice(1).join('\n');
+    expect(NO_TX_MARKER.test(control)).toBe(false);
+    expect(
+      buildMigrationArtifact([{ filename: '001_a.sql', contents: control }], ['001_a_down.sql']).problems,
+    ).toEqual([]);
   });
 
   it('importing scripts/migrate.js does not run main() (entrypoint guard)', () => {

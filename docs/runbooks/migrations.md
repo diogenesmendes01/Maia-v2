@@ -39,7 +39,11 @@ and applies every `NNN_*.sql` that does not end in `_down.sql`, in
 parse, and not `localeCompare`, which would be locale-dependent). Files
 containing the marker `-- maia:no-transaction` on its own line (e.g. 005)
 are applied outside a `BEGIN/COMMIT` envelope so they can use
-`CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`.
+`CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY`. Such a file is
+sent one statement at a time, split on `;` **without a parser**, so it
+may contain only simple `;`-terminated statements — no `DO $$ … $$`, no
+string literal with a `;` inside. Discovery refuses anything else
+([`no_transaction_unsplittable`](#fixing-no_transaction_unsplittable)).
 
 A file may also declare `-- maia:statement-timeout=<ms>` to raise the
 per-statement ceiling for a long backfill. The override lives in the
@@ -111,7 +115,18 @@ Before applying anything it **refuses** (exit 1, nothing executed) when:
 - a migration that manages its own transaction is **not** one complete
   `BEGIN; … COMMIT;` envelope — a statement outside it, two envelopes,
   or an envelope that is never closed. See
-  [Fixing `unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope).
+  [Fixing `unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope);
+- a `-- maia:no-transaction` migration contains something the
+  parser-free statement splitter would cut in the wrong place — a
+  dollar-quoted body (`DO $$ … $$`), a string literal containing `;`, a
+  `;` hidden in a block comment or quoted identifier, or a `--` inside
+  any of those (the line stripper would truncate the token). See
+  [Fixing `no_transaction_unsplittable`](#fixing-no_transaction_unsplittable).
+
+The last two are defects of the **repository**, not of the database:
+`up` checks the artifact before it opens any connection and refuses on
+the spot (`BLOCKED artifact_integrity: …`), so a broken file never
+costs a lock, a ledger read or a fragment sent to Postgres.
 
 A second migrator started concurrently **waits** for the first (30s by
 default) and then exits cleanly with `lock_unavailable` — it never
@@ -247,6 +262,58 @@ already been applied anywhere:
 A migration that truly cannot run inside a transaction (`CREATE INDEX
 CONCURRENTLY`) takes neither route — it declares
 `-- maia:no-transaction` and omits the transaction block entirely.
+
+### Fixing `no_transaction_unsplittable`
+
+Also a blocker about the **repository**: nothing was applied and
+nothing needs repairing. The migration carries `-- maia:no-transaction`
+but contains something the no-transaction runner cannot split safely.
+
+Why there is a rule at all: on that path the runner must send each
+statement to Postgres **on its own** (node-postgres wraps a
+multi-statement query in an implicit transaction, which `CONCURRENTLY`
+rejects), and it finds the statement boundaries with a deliberately
+parser-free `split(';')` — `splitNoTxStatements` in
+`src/migrations/discover.ts`. That is only safe for simple
+`;`-terminated statements. Before issue #733 the rule lived in a
+docstring and nothing enforced it: a `DO $$ … $$;` block under the
+marker was cut inside its body, Postgres received a fragment, and the
+ledger recorded `error_class = 42601` (`syntax_error`) as `dirty` — for
+a file whose SQL was correct. The guard now refuses the file at
+discovery, with the cause named.
+
+The blocker says which shape it found and on which line:
+
+| `[…]` in the message | What is in the file |
+|---|---|
+| `dollar_quoted_body` | `DO $$ … $$`, `$tag$ … $tag$`, `CREATE FUNCTION … AS $$ … $$` |
+| `semicolon_in_string_literal` | `'… ; …'` — including `E'a\';b\'c'`, whose backslash-escaped quotes the guard reads the way Postgres does |
+| `hidden_semicolon` | a `;` inside `/* … */` or a `"quoted;identifier"` — the split cuts there |
+| `line_comment_inside_token` | a `--` inside a literal, a quoted identifier or a block comment — the line stripper runs before the split and deletes the rest of that line, closing quote / `*/` and any `;` after it included. Detected on the token itself: when the wounded statement is the last one the statement count does not even change |
+
+Two ways to fix the file, both in the PR that introduced it — never by
+editing a migration that has already been applied anywhere:
+
+1. **Drop the marker** and let the file run inside a transaction. This
+   is the right answer for almost everything: the whole file is sent as
+   one query, dollar-quoting and `;` in literals are simply SQL, and the
+   ledger row commits atomically with the schema change. If the file
+   also contains `CREATE INDEX CONCURRENTLY`, split it: the
+   `CONCURRENTLY` DDL stays in a `-- maia:no-transaction` file of its
+   own, the rest moves to a transactional sibling.
+2. Rewrite the statement without the shape — e.g. replace a `DO $$ …
+   RAISE … $$` with a plain statement that fails the same way (the drill
+   fixture `scripts/drill/705-gate-de-migration/fixtures/900_drill705_falha_deliberada.sql`
+   does exactly this and explains why). Only when the file genuinely
+   needs the marker.
+
+What is **not** an option: teaching the splitter to parse. The decision
+to keep it parser-free is explicit; the guard is what makes that
+decision safe. `$$`, `;` and `--` that appear only in `--` comments are
+fine — the splitter strips those lines first, which is its job — and
+migrations 096 and 122 mention `DO $$` in their headers for precisely
+this reason. A `--` *inside* a literal (`'a--b'`) is not a comment to
+Postgres but is one to the stripper, so it is refused.
 
 ## Recovering a dirty migration
 
@@ -597,8 +664,11 @@ time. The two are reviewed together.
    single envelope — `migrate up` refuses the file otherwise
    ([`unverifiable_transaction_envelope`](#fixing-unverifiable_transaction_envelope)).
    A migration that cannot run in a transaction declares
-   `-- maia:no-transaction` and omits the block. So does one that **must
-   not** run in a single transaction: swapping a CHECK/FK on a hot table
+   `-- maia:no-transaction` and omits the block — and then keeps to
+   simple `;`-terminated statements: no `DO $$ … $$`, no literal with a
+   `;` inside, or `migrate up` refuses it
+   ([`no_transaction_unsplittable`](#fixing-no_transaction_unsplittable)).
+   So does one that **must not** run in a single transaction: swapping a CHECK/FK on a hot table
    with `ADD … NOT VALID` + `VALIDATE CONSTRAINT` only avoids a long
    ACCESS EXCLUSIVE if the validation commits separately from the
    `DROP`/`ADD` — inside one transaction the strong lock is held across
