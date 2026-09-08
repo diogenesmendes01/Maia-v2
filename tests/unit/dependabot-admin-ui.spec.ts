@@ -225,3 +225,42 @@ describe('dependabot cobre os DOIS projetos npm (item 9)', () => {
     expect(admin!.groups, 'agrupamentos divergentes da raiz').toEqual(raiz!.groups);
   });
 });
+
+/**
+ * Decisão do dono (2026-09-07): as majors de `@types/node` e de `typescript`
+ * NÃO são bump, são migração (issues #743 e #745). Enquanto as migrações não
+ * existirem, o Dependabot ignora a major das duas — em AMBOS os blocos npm,
+ * porque a política do repo é uma só. Só a major: minors e patches seguem.
+ *
+ * Âncora anti-vacuidade: o bloco da raiz é afirmado literalmente; o do
+ * admin-ui é comparado com ele. Um parser que devolvesse `undefined` dos dois
+ * lados reprovaria na âncora antes de a igualdade passar em silêncio.
+ */
+describe('dependabot ignora as majors que são migração própria (#743, #745)', () => {
+  const MAJOR = ['version-update:semver-major'];
+
+  it('o bloco da raiz ignora a major de @types/node e de typescript — e SÓ a major', () => {
+    const raiz = npmBlock('/');
+    expect(raiz).toBeDefined();
+    expect(raiz!.ignore).toEqual([
+      { 'dependency-name': '@types/node', 'update-types': MAJOR },
+      { 'dependency-name': 'typescript', 'update-types': MAJOR },
+    ]);
+  });
+
+  it('o bloco do admin-ui repete a mesma lista de ignore', () => {
+    const raiz = npmBlock('/');
+    const admin = npmBlock('/src/admin-ui');
+    expect(admin, 'bloco npm do admin-ui ausente').toBeDefined();
+    expect(admin!.ignore, 'política de ignore divergente da raiz').toEqual(raiz!.ignore);
+  });
+
+  it('nenhum ignore bloqueia minor ou patch (a linha 22 e o TS 5.x continuam recebendo correção)', () => {
+    for (const dir of ['/', '/src/admin-ui']) {
+      const block = npmBlock(dir)!;
+      for (const rule of block.ignore as Record<string, Node>[]) {
+        expect(rule['update-types'], `${dir}: ${String(rule['dependency-name'])}`).toEqual(MAJOR);
+      }
+    }
+  });
+});
