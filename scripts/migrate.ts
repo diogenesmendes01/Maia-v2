@@ -32,6 +32,7 @@ import { loadMigrationConfig, migrationRunOptions } from '@/config/migration-con
 import { ConfigValidationError } from '@/config/load.js';
 import { MigratorSubsetError } from '@/config/migrator-subset.js';
 import {
+  discoverMigrations,
   getSchemaReadiness,
   repairMigration,
   runMigrations,
@@ -172,6 +173,37 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       }
 
       case 'up': {
+        // Issue #733: o artefato é lido do disco e julgado ANTES de qualquer
+        // conexão. A descoberta é pura, e um problema de artefato
+        // (`no_transaction_unsplittable`, `unverifiable_transaction_envelope`,
+        // `_down` ausente) é defeito do REPOSITÓRIO — recusá-lo não precisa de
+        // banco, lock nem ledger. O runner confere os mesmos problemas de novo
+        // sob o lock (`applyUnderLock`): aqui é a porta, lá é a segunda linha.
+        const artifact = await discoverMigrations(MIGRATIONS_DIR);
+        if (artifact.problems.length > 0) {
+          const blockers = artifact.problems.map((problem) => ({
+            kind: 'artifact_integrity' as const,
+            id: problem.id,
+            detail: problem.detail,
+          }));
+          emit('migration.blocked', {
+            blockers: blockers.length,
+            first_kind: blockers[0]!.kind,
+            first_migration_id: blockers[0]!.id,
+            phase: 'preflight',
+          });
+          printRunResult({
+            ok: false,
+            outcome: 'blocked',
+            applied: [],
+            backfilled: [],
+            orphaned: [],
+            blockers,
+            status: null,
+            lock_waited_ms: 0,
+          });
+          return 1;
+        }
         // Os tetos de lock/statement vêm do CONTRATO (#515/#516), não de
         // constante de módulo: `src/migrations/` nunca lê `process.env`, então
         // é aqui — o adaptador — que ambiente vira opção. Os defaults do
