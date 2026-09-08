@@ -81,13 +81,18 @@
  *    de modo que uma regressão morando no `resolveScope` passava sem ser
  *    vista. Hoje o escopo é RESOLVIDO no Postgres, dentro do relógio do turno,
  *    pelo mesmo `resolveScope` de produção (`src/governance/permissions.ts`),
- *    e as duas leituras dele entram no contador por turno (`instrument`) como
+ *    e as leituras dele entram no contador por turno (`instrument`) como
  *    `scope_permissoes` e `scope_profiles`. O gate afere isso: três critérios
- *    por braço exigem que as DUAS leituras tenham acontecido em todo turno,
- *    que o escopo resolvido tenha a cardinalidade semeada e que o estágio não
- *    coma sozinho o orçamento do turno. Virar a flag
- *    `COBERTURA_DA_MEDICAO.resolve_scope_medido` sem a medição NÃO aprova
- *    nada: o critério do aceite completo lê os números medidos, não a flag.
+ *    por braço exigem que pelo menos uma leitura de escopo tenha acontecido em
+ *    todo turno, que o escopo resolvido tenha a cardinalidade semeada — em
+ *    1/10/100 entidades E numa cardinalidade ACIMA DO TETO ANTIGO de 500
+ *    profiles distintos (`ACIMA_DO_TETO_ANTIGO`; o teto foi removido pela
+ *    #738/#744, e o braço existe para que a leitura sem teto seja medida, não
+ *    só afirmada) — e que o estágio não coma sozinho o orçamento do turno.
+ *    Não há flag que declare a cobertura: `COBERTURA_DA_MEDICAO` é só o par de
+ *    rótulos (atual/anterior) que o fingerprint carimba, e o critério do
+ *    aceite completo lê os números medidos. A contenção da PR #702 (critério
+ *    `n/a`, aviso do runbook, nota do relatório) saiu quando a medição entrou.
  *  - **A série do Prometheus continua cobrindo só o `buildPrompt`.**
  *    `maia_turn_context_load_duration_ms{phase="loader"}` é publicada DENTRO
  *    de `buildPrompt` (`src/agent/prompt-builder.ts`), então ela não inclui o
@@ -219,6 +224,7 @@
  *   # que o critério "exatamente 2 leituras" pegava agora cai aqui, junto com
  *   # qualquer outro N+1 do turno):
  *   npm run turn:bench -- --self-test --inject card100.reads_per_turn_max=113
+ *   npm run turn:bench -- --self-test --inject card501.reads_per_turn_max=13  # idem, no braço acima do teto antigo
  *   # Os critérios relativos principais:
  *   npm run turn:bench -- --self-test --inject cold.p95_ms=50               # acima do baseline × (1+margem)
  *   npm run turn:bench -- --self-test --inject cold.throughput_turns_per_s=1 # vazão abaixo do baseline × (1−margem)
@@ -289,8 +295,31 @@ for (const [k, v] of Object.entries(ENV_DEFAULTS)) process.env[k] ??= v;
 export type ArmName = 'cold' | 'warm';
 const ALL_ARMS: ArmName[] = ['cold', 'warm'];
 
-/** Cardinalidades de escopo que o enunciado do dono fixa. */
-export const CARDINALITIES = [1, 10, 100] as const;
+/**
+ * A cardinalidade ACIMA DO TETO ANTIGO (#700, aceite 1; #738/#744).
+ *
+ * A issue #700 pedia a escala 1/10/100 "e o teto de 500 profiles que a #525
+ * estabeleceu". Esse teto NÃO EXISTE MAIS: `profilesRepo.byIds(ids, limit =
+ * 500)` cortava a leitura de autorização em 500 profiles DISTINTOS e descartava
+ * em silêncio os grants excedentes; a #744 a trocou por
+ * `profilesRepo.forAuthorization(ids)` — escopada por tenant/agent, sem
+ * `LIMIT`. O que sobrou para o gate medir é a ausência do teto: uma pessoa com
+ * 501 permissões sobre 501 profiles distintos tem de resolver 501 no banco,
+ * dentro do relógio do turno. É "501" e não "500" porque 500 ficava DENTRO do
+ * teto antigo e não o exercitaria; é um só acima porque o objetivo é provar a
+ * fronteira, não medir um tenant de milhares de entidades.
+ *
+ * Um `.limit(500)` reintroduzido nessa leitura aparece aqui como escopo
+ * resolvido de 500 contra 501 semeados — divergência de cardinalidade, que
+ * reprova o critério "o escopo do turno veio do BANCO" e o aceite completo.
+ */
+export const ACIMA_DO_TETO_ANTIGO = 501;
+
+/**
+ * Cardinalidades de escopo do gate: as três que o enunciado do dono fixa
+ * (1/10/100) e a que fica acima do teto antigo de profiles distintos.
+ */
+export const CARDINALITIES = [1, 10, 100, ACIMA_DO_TETO_ANTIGO] as const;
 
 /**
  * As leituras que o contador por turno atribui ao estágio `resolveScope`
@@ -455,9 +484,9 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  * `resolveScope` + `buildPrompt`. Desde a #700 as duas pontas estão dentro da
  * medição: o escopo é resolvido no Postgres, dentro do relógio do turno, pelo
  * `resolveScope` de produção, e a massa semeia `permissoes` e
- * `permission_profiles` nas cardinalidades 1/10/100.
+ * `permission_profiles` em todas as `CARDINALITIES`.
  *
- * A flag abaixo é um RÓTULO, não uma prova. Ela existe por dois motivos, e
+ * Os dois rótulos abaixo são RÓTULOS, não prova. Existem por dois motivos, e
  * nenhum deles é "declarar que a medição acontece":
  *
  *  1. `cobertura` entra no `RunFingerprint`, então um baseline gravado sob uma
@@ -469,33 +498,36 @@ export const BASELINE_PATH = join(HERE, 'turn-context-baseline.json');
  *  2. o relatório carrega o rótulo em todo modo, inclusive `measure`, para que
  *     um relatório não possa ser lido fora do seu escopo.
  *
- * O que APROVA o aceite completo é outra coisa: `evaluateGate` lê os números
- * MEDIDOS de cada braço — as duas leituras do escopo em todo turno
+ * Até esta versão havia aqui uma flag booleana (`resolve_scope_medido`) — a
+ * contenção da PR #702 a lia para emitir o aceite completo como `n/a`. A flag
+ * saiu junto com a contenção: uma flag que "declara medir" é exatamente o
+ * defeito que a #700 nomeia (virá-la sem incluir a medição), e não há mais
+ * caminho de código em que a cobertura seja declarada em vez de medida.
+ *
+ * O que APROVA o aceite completo é `evaluateGate` lendo os números MEDIDOS de
+ * cada braço — pelo menos uma leitura de escopo em todo turno
  * (`scope_reads_per_turn_min/max`), a cardinalidade resolvida batendo com a
- * semeada (`scope_cardinality_mismatches`) e o p95 do estágio. Virar esta flag
- * sem incluir a medição não produz aprovação nenhuma: produz um critério
- * AVALIADO e REPROVADO, com os zeros à vista. A flag não é prova de si mesma —
- * quem sustenta essa afirmação são as duas sondas da #700:
- * `tests/unit/scripts/turn-context-gate.spec.ts` (o avaliador reprova a flag
+ * semeada (`scope_cardinality_mismatches`, `scope_entities_min/max`) e o p95
+ * do estágio. Um rótulo que dissesse "mede" sobre números zerados produz um
+ * critério AVALIADO e REPROVADO, com os zeros à vista. Quem sustenta essa
+ * afirmação são as duas sondas da #700:
+ * `tests/unit/scripts/turn-context-gate.spec.ts` (o avaliador reprova o rótulo
  * sem números) e `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts`
- * (a MEDIÇÃO: um turno de verdade, contado pelo instrumento de verdade).
+ * (a MEDIÇÃO: um turno de verdade, contado pelo instrumento de verdade), mais
+ * `tests/integration/turn-context-bench-massa-real-db.spec.ts` (a MASSA: as
+ * duas tabelas semeadas de verdade, resolvidas pelo `resolveScope` de
+ * produção em todas as cardinalidades, inclusive acima do teto antigo).
  */
 export const COBERTURA_DA_MEDICAO = {
-  /**
-   * `true` desde a #700: `runTurnOnce` chama `resolveScope` dentro do relógio
-   * e a massa semeia `permissoes` + `permission_profiles`. Não é o que aprova
-   * o critério do aceite completo — ver o bloco acima.
-   */
-  resolve_scope_medido: true,
+  /** O rótulo desta cobertura: o turno inteiro, `resolveScope` + `buildPrompt`. */
+  atual: 'resolveScope+buildPrompt',
   /** O rótulo da cobertura ANTERIOR — o que carimba os baselines de antes da #700. */
-  rotulo: 'buildPrompt-sem-resolveScope',
+  anterior: 'buildPrompt-sem-resolveScope',
 } as const;
 
 /** O rótulo da cobertura da corrida atual — carimbado no baseline e no relatório. */
 export function coberturaAtual(): string {
-  return COBERTURA_DA_MEDICAO.resolve_scope_medido
-    ? 'resolveScope+buildPrompt'
-    : COBERTURA_DA_MEDICAO.rotulo;
+  return COBERTURA_DA_MEDICAO.atual;
 }
 
 export type RunFingerprint = {
@@ -1142,11 +1174,12 @@ export type ArmResult = {
    * leituras por turno (`instrument`), do mesmo jeito que `peak_reads_per_turn`
    * — não de uma flag nem de uma linha de relatório.
    *
-   * `scope_reads_per_turn_*` conta as leituras das seções `scope_permissoes` e
-   * `scope_profiles`. O orçamento da #525 fixa esse número em EXATAMENTE 2 por
-   * turno: 0 significa escopo fabricado em memória (ou massa sem as tabelas),
-   * e um número maior significa N+1 no caminho do escopo — as duas regressões
-   * que a #700 exige que o gate veja.
+   * `scope_reads_per_turn_*` conta as leituras das seções `scope_permissoes`,
+   * `scope_profiles` e `scope_permissoes_com_profile`. O número é DADO MEDIDO
+   * (decisão da #525): 0 significa escopo fabricado em memória (ou massa sem as
+   * tabelas) e reprova; um N+1 no caminho do escopo cresce com a cardinalidade
+   * e cai no guardrail O(1) — as duas regressões que a #700 exige que o gate
+   * veja.
    */
   scope_reads_per_turn_min: number;
   scope_reads_per_turn_max: number;
@@ -1154,12 +1187,13 @@ export type ArmResult = {
    * Turnos em que o escopo RESOLVIDO não teve o tamanho da cardinalidade
    * pedida. Zero é a única leitura aceitável: qualquer outro valor diz que o
    * banco devolveu um escopo diferente do que a massa semeou — massa faltando,
-   * permissão descartada na leitura de perfis (o teto de 500 que
-   * `profilesRepo.byIds` tinha antes da #738), ou escopo vindo de outro lugar
-   * que não o `resolveScope`.
+   * permissão descartada na leitura de perfis (o teto de 500 profiles
+   * distintos que `profilesRepo.byIds` tinha antes da #738/#744 — e que a
+   * cardinalidade `ACIMA_DO_TETO_ANTIGO` existe para pegar de volta), ou
+   * escopo vindo de outro lugar que não o `resolveScope`.
    */
   scope_cardinality_mismatches: number;
-  /** Menor e maior escopo resolvido na corrida — esperado: 1 e 100. */
+  /** Menor e maior escopo resolvido na corrida — esperado: `min(CARDINALITIES)` e `max(CARDINALITIES)`. */
   scope_entities_min: number;
   scope_entities_max: number;
   /** Latência do estágio `resolveScope` isolado (dentro do relógio do turno). */
@@ -1238,7 +1272,8 @@ export function scopeReadsExercised(a: ArmResult): boolean {
 /**
  * O guardrail O(1) da contagem: statements por turno NÃO crescem com a
  * cardinalidade do escopo — o envelope (mín–máx) de leituras por turno em
- * N=100 é IGUAL ao de N=1, tolerância zero.
+ * TODA cardinalidade (até `max(CARDINALITIES)`, o braço acima do teto antigo)
+ * é IGUAL ao de N=1, tolerância zero.
  *
  * `ok: null` = não avaliável (menos de duas cardinalidades medidas): sem dois
  * pontos não há inclinação para afirmar, e "não avaliado" não é "aprovado".
@@ -1300,48 +1335,34 @@ export function evaluateGate(
   // encontra a FRONTEIRA DA MEDIÇÃO antes dos números, e não depois de já ter
   // formado uma opinião sobre eles.
   //
-  // Ele NÃO lê a flag `COBERTURA_DA_MEDICAO.resolve_scope_medido` para
-  // aprovar: lê os NÚMEROS MEDIDOS de cada braço. Virar a flag sem incluir a
-  // medição produz aqui um critério avaliado e REPROVADO — com os zeros à
-  // vista — em vez de uma aprovação. A flag serve para carimbar a cobertura no
-  // fingerprint e no relatório; a prova é a evidência.
+  // Ele NÃO lê rótulo nenhum para aprovar: lê os NÚMEROS MEDIDOS de cada
+  // braço. Um rótulo de cobertura sem a medição por trás produz aqui um
+  // critério avaliado e REPROVADO — com os zeros à vista — em vez de uma
+  // aprovação. O rótulo (`coberturaAtual()`) serve para carimbar a cobertura
+  // no fingerprint e no relatório; a prova é a evidência.
   //
-  // Com a flag em `false` (alguém desligou a medição) o critério volta a ser
-  // NÃO AVALIADO, e "não avaliado" não é "aprovado" (invariante do `Verdict`):
-  // em modo `gate` isso reprova. Os dois caminhos reprovam; o que muda é o
-  // diagnóstico.
+  // Não existe mais o caminho "NÃO AVALIADO por contenção" da PR #702: ele
+  // dependia de uma flag que declarava a cobertura, e a flag saiu junto com a
+  // contenção (#700, aceite 5). O critério é sempre avaliado.
   const scopeEvidence = arms.map((a) => ({
     arm: a,
     ok: scopeReadsExercised(a) && scopeCardinalityMatches(a) && a.turns > 0,
   }));
   const evidenciaCompleta = scopeEvidence.length > 0 && scopeEvidence.every((e) => e.ok);
-  if (!COBERTURA_DA_MEDICAO.resolve_scope_medido) {
-    out.push({
-      label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
-      passed: false,
-      skipped: true,
-      detail:
-        `NÃO AVALIADO — \`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está ` +
-        `\`false\`: a corrida declara não medir o \`resolveScope\` (JOIN ` +
-        `\`permissoes ⋈ permission_profiles\`). Cobertura desta corrida: ` +
-        `\`${coberturaAtual()}\`. Os critérios abaixo valem para o trecho ` +
-        `exercitado e NÃO para o custo completo do turno. Issue #700.`,
-    });
-  } else {
-    out.push({
-      label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
-      passed: evidenciaCompleta,
-      detail: evidenciaCompleta
-        ? `o turno medido inclui o \`resolveScope\`: pelo menos ${SCOPE_READS_PER_TURN_MIN} ` +
-          `leitura de escopo no contador em TODO turno de todo braço (contagem medida: ` +
-          arms.map((a) => `${a.arm}=${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}`).join(' · ') +
-          `), escopo resolvido de ${Math.min(...CARDINALITIES)} a ${Math.max(...CARDINALITIES)} ` +
-          `entidades e zero divergências de cardinalidade. Cobertura: \`${coberturaAtual()}\``
-        : `A FLAG DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO — ` +
-          scopeEvidence.map((e) => `[${e.arm.arm}] ${scopeEvidenceDetail(e.arm)}`).join(' · ') +
-          `. Cobertura declarada: \`${coberturaAtual()}\`. Issue #700.`,
-    });
-  }
+  out.push({
+    label: 'aceite completo do orçamento do turno (resolveScope + buildPrompt)',
+    passed: evidenciaCompleta,
+    detail: evidenciaCompleta
+      ? `o turno medido inclui o \`resolveScope\`: pelo menos ${SCOPE_READS_PER_TURN_MIN} ` +
+        `leitura de escopo no contador em TODO turno de todo braço (contagem medida: ` +
+        arms.map((a) => `${a.arm}=${a.scope_reads_per_turn_min}–${a.scope_reads_per_turn_max}`).join(' · ') +
+        `), escopo resolvido de ${Math.min(...CARDINALITIES)} a ${Math.max(...CARDINALITIES)} ` +
+        `entidades (inclusive acima do teto antigo de 500 profiles distintos) e zero ` +
+        `divergências de cardinalidade. Cobertura: \`${coberturaAtual()}\``
+      : `O RÓTULO DIZ QUE MEDE, OS NÚMEROS DIZEM QUE NÃO — ` +
+        scopeEvidence.map((e) => `[${e.arm.arm}] ${scopeEvidenceDetail(e.arm)}`).join(' · ') +
+        `. Cobertura declarada: \`${coberturaAtual()}\`. Issue #700.`,
+  });
 
   for (const a of arms) {
     out.push({
@@ -1398,14 +1419,15 @@ export function evaluateGate(
 
     // ── GUARDRAIL O(1) da contagem (decisão da #525) ───────────────────
     // A contagem de statements por turno não pode CRESCER com a cardinalidade:
-    // o envelope em N=100 tem que ser igual ao de N=1, tolerância zero. É o
+    // o envelope em N=max (501, acima do teto antigo) tem que ser igual ao de
+    // N=1, tolerância zero. É o
     // que resta do critério de contagem depois da decisão do dono — o teto
     // absoluto (12, 13) virou linha de relatório; a INCLINAÇÃO continua
     // reprovando, porque é ela que protege o pool de um tenant "elefante" e
     // é ela que um N+1 (no escopo ou em qualquer outro estágio) viola.
     const o1 = contagemO1(a.by_cardinality);
     out.push({
-      label: `[${a.arm}] contagem de statements por turno com crescimento O(1) na cardinalidade (N=100 == N=1)`,
+      label: `[${a.arm}] contagem de statements por turno com crescimento O(1) na cardinalidade (N=${Math.max(...CARDINALITIES)} == N=1)`,
       passed: o1.ok === true,
       skipped: o1.ok === null,
       detail:
@@ -1987,16 +2009,17 @@ const PREFIX = 'bench525';
  * UMA pessoa do par, e a cardinalidade de escopo que ela carrega.
  *
  * Existe porque o `resolveScope` não aceita parâmetro de cardinalidade: ele
- * devolve TODAS as permissões daquela pessoa. Como a escala 1/10/100 do
- * enunciado É o tamanho do escopo resolvido, a única forma de resolvê-lo no
- * banco em três tamanhos é ter TRÊS PESSOAS por par — uma com 1 linha em
- * `permissoes`, outra com 10, outra com 100.
+ * devolve TODAS as permissões daquela pessoa. Como a escala de `CARDINALITIES`
+ * É o tamanho do escopo resolvido, a única forma de resolvê-lo no banco em
+ * cada tamanho é ter UMA PESSOA POR CARDINALIDADE em cada par — uma com 1
+ * linha em `permissoes`, outra com 10, outra com 100, outra com 501 (acima do
+ * teto antigo de profiles distintos, `ACIMA_DO_TETO_ANTIGO`).
  *
- * As três recebem a MESMA massa de interlocutor e de conversa (mensagens,
- * fatos de pessoa, memórias e hints de `interlocutor`/`conversation`). Semear
- * essa massa para uma só faria o loader ler menos linhas nos outros dois
- * terços dos turnos e mudaria, em silêncio, o que o resto do benchmark mede —
- * trocaria um viés por outro.
+ * Todas recebem a MESMA massa de interlocutor e de conversa (mensagens, fatos
+ * de pessoa, memórias e hints de `interlocutor`/`conversation`). Semear essa
+ * massa para uma só faria o loader ler menos linhas nos turnos das outras e
+ * mudaria, em silêncio, o que o resto do benchmark mede — trocaria um viés por
+ * outro.
  */
 export type PairPerson = {
   /** Cardinalidade do escopo desta pessoa: linhas em `permissoes`. */
@@ -2031,16 +2054,17 @@ const ENTITIES_PER_PAIR = Math.max(...CARDINALITIES);
 
 /**
  * Perfis de permissão distintos por par — um por entidade, então a pessoa de
- * cardinalidade 100 resolve 100 perfis DISTINTOS num único
- * `profilesRepo.forAuthorization`.
+ * cardinalidade N resolve N perfis DISTINTOS num único
+ * `profilesRepo.forAuthorization`; na maior cardinalidade são 501, um acima do
+ * teto que a leitura antiga tinha.
  *
- * Até a #738 essa leitura tinha um teto de 500 (`byIds(ids, limit = 500)`), e
- * 100 < 500 ficava aquém dele — o que também quer dizer que este harness NUNCA
- * exercitou o teto (issue #738); a leitura de autorização hoje não tem `LIMIT`,
- * e é o critério de cardinalidade do gate que continua a provar que nenhuma
- * permissão se perde, porque uma permissão descartada apareceria como escopo
- * menor que o semeado. Apontar as 100 permissões para um perfil só mediria um
- * `IN` de um elemento e esconderia o custo do lote.
+ * Até a #738/#744 essa leitura tinha um teto de 500 (`byIds(ids, limit = 500)`)
+ * e este harness só ia a 100 — NUNCA exercitou o teto. Hoje a leitura de
+ * autorização não tem `LIMIT`, e a cardinalidade `ACIMA_DO_TETO_ANTIGO` é o que
+ * faz o gate MEDIR essa ausência em vez de afirmá-la: um `.limit(500)`
+ * reintroduzido apareceria como escopo de 500 contra 501 semeados, e o
+ * critério de cardinalidade reprova. Apontar as N permissões para um perfil só
+ * mediria um `IN` de um elemento e esconderia o custo do lote.
  */
 const PROFILES_PER_PAIR = ENTITIES_PER_PAIR;
 
@@ -2077,7 +2101,15 @@ const SEEDED_TABLES = [
 type PgPool = import('pg').Pool;
 type PgClient = import('pg').PoolClient;
 
-async function cleanup(c: PgClient): Promise<number> {
+/**
+ * Exportada (junto com `seedPair`) para a sonda de MASSA da #700,
+ * `tests/integration/turn-context-bench-massa-real-db.spec.ts`: ela semeia um
+ * par com este mesmo código contra um Postgres real e resolve cada pessoa com
+ * o `resolveScope` de produção. É o teste que fica vermelho se a massa deixar
+ * de semear `permissoes`/`permission_profiles` — a sonda unitária prova o
+ * CAMINHO com dublês; esta prova as LINHAS.
+ */
+export async function cleanup(c: PgClient): Promise<number> {
   let removed = 0;
   for (const table of SEEDED_TABLES) {
     const r = await c.query(`DELETE FROM ${table} WHERE tenant_id LIKE $1`, [`${PREFIX}-%`]);
@@ -2100,7 +2132,7 @@ async function cleanup(c: PgClient): Promise<number> {
  * `ANALYZE` não é desfeito por `ROLLBACK` — reescrever as estatísticas de
  * `entidades` aqui envenenaria o plano de todos os outros specs.
  */
-async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legacy'): Promise<Pair> {
+export async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legacy'): Promise<Pair> {
   const tenant_id = `${PREFIX}-t${index}`;
   const agent_id = `${PREFIX}-a${index}`;
   await c.query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [tenant_id]);
@@ -2145,8 +2177,8 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
   const profile_ids = profiles.rows.map((r) => r.id);
 
   // Fatos nos TRÊS escopos que o loader monta: global, pessoa e entidade. Os de
-  // PESSOA saem em `seedPerson` — são por interlocutor, e desde a #700 há três
-  // por par.
+  // PESSOA saem em `seedPerson` — são por interlocutor, e desde a #700 há uma
+  // pessoa por cardinalidade em cada par.
   await c.query(
     `INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)
      SELECT $1, $2, 'global', '${PREFIX}-fato-global-' || g,
@@ -2255,9 +2287,9 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
  * `entity_states`, semeados para o primeiro quinto).
  *
  * Cada permissão aponta para um perfil DISTINTO, então o
- * `profilesRepo.forAuthorization` do turno da pessoa de 100 entidades resolve
- * um lote de 100 ids — e não um
- * `IN` de um elemento repetido 100 vezes, que mediria outra coisa.
+ * `profilesRepo.forAuthorization` do turno da pessoa de N entidades resolve um
+ * lote de N ids (501 na maior cardinalidade) — e não um `IN` de um elemento
+ * repetido N vezes, que mediria outra coisa.
  */
 async function seedPerson(
   c: PgClient,
@@ -2669,7 +2701,7 @@ export type TurnSample = {
    * `scope_ms` — ver `measureTurn`, que é o único lugar onde ele é calculado.
    */
   ms: number;
-  /** A cardinalidade PEDIDA a este turno (1/10/100). */
+  /** A cardinalidade PEDIDA a este turno (uma de `CARDINALITIES`). */
   entities: number;
   /** A cardinalidade que o `resolveScope` DEVOLVEU. Divergir é o achado. */
   scope_entities: number;
@@ -2989,13 +3021,6 @@ function modeBanner(mode: RunMode, injected: string[]): string {
   return (
     `> **MODO GATE.** Todo critério obrigatório precisa ter sido AVALIADO: um critério\n` +
     `> \`n/a\` reprova a corrida, porque um gate sem a evidência não é um gate.\n` +
-    (COBERTURA_DA_MEDICAO.resolve_scope_medido
-      ? ''
-      : `>\n> **E um critério obrigatório está \`n/a\`: o aceite completo do orçamento do\n` +
-        `> turno.** \`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está \`false\`, então esta\n` +
-        `> corrida NÃO pode sair 0 — e o exit code 1 significa "não demonstrado", não\n` +
-        `> "regrediu". Leia os critérios parciais na tabela: eles foram avaliados e\n` +
-        `> valem para o trecho que exercitam. Issue #700.\n`) +
     `\n`
   );
 }
@@ -3019,26 +3044,21 @@ function renderReport(
     `teto de leituras por turno: ${opts.thresholds.max_peak_reads} ` +
     `(\`TURN_CONTEXT_MAX_CONCURRENT_READS\`)\n\n` +
     `> **Cobertura desta corrida: \`${coberturaAtual()}\`.**\n` +
-    (COBERTURA_DA_MEDICAO.resolve_scope_medido
-      ? `> **Escopo do que foi medido — o TURNO INTEIRO.** Cada turno resolve o ` +
-        `escopo no Postgres (\`resolveScope\` — as tabelas de permissões, numa ` +
-        `ou em duas leituras conforme a árvore medida; a contagem é dado ` +
-        `MEDIDO e sai na tabela) e só então ` +
-        `chama \`buildPrompt\`, os dois dentro do mesmo relógio — o orçamento ` +
-        `como \`src/agent/turn-context/types.ts\` o define. As linhas ` +
-        `"leituras do escopo por turno" e "p95 do estágio resolveScope" abaixo ` +
-        `são a EVIDÊNCIA de que isso aconteceu; os critérios homônimos ` +
-        `reprovam a corrida se elas sumirem (issue #700).\n` +
-        `> A série \`maia_turn_context_load_duration_ms{phase="loader"}\` ` +
-        `continua cobrindo só o \`buildPrompt\` — por isso o "p95 pelos buckets ` +
-        `do histograma" é MENOR que o p95 do turno, e as duas linhas não são ` +
-        `comparáveis entre si.\n`
-      : `> **Escopo do que foi medido — orçamento PARCIAL.** ` +
-        `\`COBERTURA_DA_MEDICAO.resolve_scope_medido\` está \`false\`: esta ` +
-        `corrida declara não medir o \`resolveScope\` (JOIN \`permissoes ⋈ ` +
-        `permission_profiles\`). Os números abaixo NÃO validam o custo completo ` +
-        `do turno como definido em \`src/agent/turn-context/types.ts\`, e não ` +
-        `devem ser apresentados como tal. Issue #700.\n`);
+    `> **Escopo do que foi medido — o TURNO INTEIRO.** Cada turno resolve o ` +
+    `escopo no Postgres (\`resolveScope\` — as tabelas de permissões, numa ` +
+    `ou em duas leituras conforme a árvore medida; a contagem é dado ` +
+    `MEDIDO e sai na tabela) e só então ` +
+    `chama \`buildPrompt\`, os dois dentro do mesmo relógio — o orçamento ` +
+    `como \`src/agent/turn-context/types.ts\` o define. As linhas ` +
+    `"leituras do escopo por turno", "escopo resolvido pelo banco" (até ` +
+    `${Math.max(...CARDINALITIES)} entidades — acima do teto antigo de 500 profiles ` +
+    `distintos, removido pela #738/#744) e "p95 do estágio resolveScope" abaixo ` +
+    `são a EVIDÊNCIA de que isso aconteceu; os critérios homônimos ` +
+    `reprovam a corrida se elas sumirem (issue #700).\n` +
+    `> A série \`maia_turn_context_load_duration_ms{phase="loader"}\` ` +
+    `continua cobrindo só o \`buildPrompt\` — por isso o "p95 pelos buckets ` +
+    `do histograma" é MENOR que o p95 do turno, e as duas linhas não são ` +
+    `comparáveis entre si.\n`;
 
   const rows: string[][] = [
     ['Métrica', ...arms.map((a) => `\`${a.arm}\``)],
@@ -3127,7 +3147,7 @@ function renderReport(
   const cardinality = [
     '\n#### Por cardinalidade de escopo\n',
     'A coluna "leituras/turno" é a evidência do guardrail O(1): a contagem em',
-    'N=100 tem que ser IGUAL à de N=1 (o valor absoluto é relatório, não critério).\n',
+    `N=${Math.max(...CARDINALITIES)} tem que ser IGUAL à de N=1 (o valor absoluto é relatório, não critério).\n`,
     `| braço | entidades | turnos | p50 | p95 | p99 | máx | leituras/turno |`,
     `| --- | --- | --- | --- | --- | --- | --- | --- |`,
     ...arms.flatMap((a) =>

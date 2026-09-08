@@ -198,7 +198,7 @@ entities on one profile.
 > principais."
 
 The acceptance criterion is latency now, judged by the gate; the statement
-count survives as an **O(1)-growth guardrail** (count at N=100 must equal count
+count survives as an **O(1)-growth guardrail** (count at N=501 must equal count
 at N=1, zero tolerance — enforced both by the round-trips spec and by the gate
 on measured turns), and the absolute ceiling is a report line. For the record,
 the merge candidates that the retired target pointed at, with what each was
@@ -235,7 +235,8 @@ criteria for #525. It drives the **whole turn** — `resolveScope`
 (`src/governance/permissions.ts`) followed by `buildPrompt`, the production call
 site that publishes `maia_turn_context_load_duration_ms{phase="loader"}` — against
 a **real Postgres** through the real `max: 10` pool, with 50 tenant/agent pairs,
-concurrency 20, scopes of 1/10/100 entities, and two arms:
+concurrency 20, scopes of 1/10/100 entities plus one of 501 (above the old
+distinct-profile cap — see below), and two arms:
 
 | arm | `FEATURE_TURN_CONTEXT_CACHE` | identity | reads per turn |
 |---|---|---|---|
@@ -245,16 +246,23 @@ concurrency 20, scopes of 1/10/100 entities, and two arms:
 **Issue #700 — the boundary the harness measures.** Until #700 it measured
 `buildPrompt` only: `buildContext` fabricated the scope in memory and the
 fixture seeded neither `permissoes` nor `permission_profiles`, so a regression
-living in `resolveScope` passed the gate unseen and the "whole turn budget"
-criterion was emitted as `n/a` (which fails in `gate` mode — the containment).
-The scope is now resolved **in Postgres, inside the turn's clock**, by the same
-`resolveScope` `core.ts` calls. Because `resolveScope(pessoa)` returns *all* of
-that person's permissions and takes no cardinality argument, the 1/10/100 scale
-IS the resolved scope size: the fixture seeds **three people per pair**, with 1,
-10 and 100 `permissoes` rows each pointing at a distinct `permission_profiles`
-row (100 per pair — under the 500-row cap `profilesRepo.byIds` enforced at the
-time, which is why the bench never exercised it; #738 removed that cap). The
-interlocutor/conversation fixture is seeded for all three — seeding it for one
+living in `resolveScope` passed the gate unseen; PR #702 contained that by
+emitting the "whole turn budget" criterion as `n/a` (which fails in `gate`
+mode). That containment is gone — the criterion is always evaluated, and there
+is no coverage flag left to flip. The scope is now resolved **in Postgres,
+inside the turn's clock**, by the same `resolveScope` `core.ts` calls. Because
+`resolveScope(pessoa)` returns *all* of that person's permissions and takes no
+cardinality argument, the cardinality scale IS the resolved scope size: the
+fixture seeds **one person per cardinality in each pair**, with 1, 10, 100 and
+**501** `permissoes` rows each pointing at a distinct `permission_profiles` row
+(501 per pair). The 501 exists because of #738/#744: the authorization read
+used to be `profilesRepo.byIds(ids, limit = 500)`, which silently dropped
+grants past 500 *distinct* profiles, and the bench never went above 100, so it
+never exercised the cap. The cap was removed (`profilesRepo.forAuthorization`,
+tenant/agent-scoped, no `LIMIT`); the gate now measures its absence instead of
+asserting it — a reintroduced `.limit(500)` shows up as a resolved scope of 500
+against 501 seeded, a cardinality mismatch that fails the run. The
+interlocutor/conversation fixture is seeded for all four — seeding it for one
 would have silently changed what the rest of the benchmark measures.
 
 The two scope reads are sequential and run *before* the `ReadGate`, so they add
@@ -263,10 +271,14 @@ The two scope reads are sequential and run *before* the `ReadGate`, so they add
 `buildPrompt`, and that boundary is computed in exactly one place
 (`measureTurn`) precisely so it can be asserted rather than merely arranged:
 subtracting the stage from the turn's clock would restore the old coverage while
-leaving the counters, the flag and the cardinality untouched. `COBERTURA_DA_MEDICAO.resolve_scope_medido` is a label carried into the
-fingerprint (so a baseline from the old coverage is refused), never the proof:
-the "whole turn budget" criterion reads the measured numbers, so flipping the
-flag without the measurement produces an evaluated, failing criterion.
+leaving the counters, the label and the cardinality untouched.
+`COBERTURA_DA_MEDICAO` is a pair of labels (`atual` / `anterior`) carried into
+the fingerprint (so a baseline from the old coverage is refused), never the
+proof: the "whole turn budget" criterion reads the measured numbers, so a label
+that claims coverage without the measurement behind it produces an evaluated,
+failing criterion. The fixture side has its own probe against a real Postgres,
+`tests/integration/turn-context-bench-massa-real-db.spec.ts`: the harness's own
+`seedPair`, resolved by the production `resolveScope` at every cardinality.
 
 Repositories are **wrapped, not mocked**: the real query runs, and the wrapper
 only stamps start/end so every read can be attributed to its turn. That is what
@@ -295,8 +307,8 @@ What the gate decides (exit code 0/1), and why each one is there:
 | peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
 | peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
 | `resolveScope` reads per turn | ≥ 1 (the count itself is measured and REPORTED, not fixed) | #700, rewritten by the #525 owner decision. 0 means the scope was fabricated in memory (or the fixture lost the tables). The old `= 2` upper bound would have failed the #693 fusion (`forPessoaComProfile`, one read) *by construction*; the N+1 it caught now falls to the O(1) row below, which sees an N+1 in **any** stage, not just the scope. The count comes from the same per-turn instrument as peak reads, so it asserts what *ran* |
-| statements per turn are O(1) in cardinality | count envelope at N=100 **equals** N=1, zero tolerance | the guardrail the owner kept when retiring the ≤8 target. The absolute ceiling (12, 13…) is a report line, not a criterion |
-| resolved scope size | 1–100, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; this also catches a permission dropped by a batch cap |
+| statements per turn are O(1) in cardinality | count envelope at N=501 **equals** N=1, zero tolerance | the guardrail the owner kept when retiring the ≤8 target. The absolute ceiling (12, 13…) is a report line, not a criterion |
+| resolved scope size | 1–501, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; the 501 is one past the distinct-profile cap #738/#744 removed, so a permission dropped by a reintroduced batch cap shows up here as 500 ≠ 501 |
 | p95 of the `resolveScope` stage | ≤ 600 ms | deliberately conservative — eating the whole turn budget in the scope stage alone is pathological. The sharp defence is the total p95, which now includes the stage |
 | whole-turn budget (`resolveScope` + `buildPrompt`) | the scope-evidence rows above, on every arm | the aggregate #700 names. It reads the measured numbers, not the coverage flag |
 | distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
@@ -306,9 +318,9 @@ What the gate decides (exit code 0/1), and why each one is there:
 | `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
 | p95 and p99 vs baseline | ≤ baseline × 1.10, **same fingerprint** | the MAIN criteria since the #525 decision. The margin is a named parameter (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`); 10 % because baseline and candidate are measured in the same window — the cross-day variance that justified the old +20 % is excluded by protocol |
 | throughput vs baseline | ≥ baseline × 0.90 | a "faster" turn that pays its p95 with queueing shows up here |
-| per-cardinality p95/p99 vs baseline | ≤ baseline × 1.10 at each of N=1/10/100 | a regression that lives only in the N=100 turns must not hide inside the arm aggregate |
+| per-cardinality p95/p99 vs baseline | ≤ baseline × 1.10 at each of N=1/10/100/501 | a regression that lives only in the N=501 turns must not hide inside the arm aggregate |
 | load average around each arm | recorded before/after (report line) | the "same window and conditions" evidence the owner's protocol requires; on a 4-CPU host, load > 4 means do not measure |
-| load shape | 50 pairs, concurrency 20, 1/10/100 | a gate run on 4 tenants is not this gate |
+| load shape | 50 pairs, concurrency 20, 1/10/100/501 | a gate run on 4 tenants is not this gate |
 
 **The saturation trap.** Comparing "longest saturated streak < 60 s" and nothing
 else is a false green, and the first cut of this harness produced one: a 60.1 s

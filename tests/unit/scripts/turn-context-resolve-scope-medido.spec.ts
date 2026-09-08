@@ -29,9 +29,12 @@
  * ## O que ele NÃO prova
  *
  * Que a MASSA do harness semeia as duas tabelas: isso é SQL contra Postgres, e
- * quem prova é a corrida (`npm run turn:bench`), cujo critério
- * "o escopo do turno veio do BANCO, nas cardinalidades 1/10/100" fica vermelho
- * com escopo vazio. Aqui o banco é um dublê — o que se prova é o CAMINHO.
+ * quem prova é `tests/integration/turn-context-bench-massa-real-db.spec.ts`
+ * (o `seedPair` de verdade, resolvido pelo `resolveScope` de produção em
+ * todas as cardinalidades) e a própria corrida (`npm run turn:bench`), cujo
+ * critério "o escopo do turno veio do BANCO, nas cardinalidades 1/10/100/501"
+ * fica vermelho com escopo vazio. Aqui o banco é um dublê — o que se prova é
+ * o CAMINHO.
  *
  * ## Por que os repositórios são dublês
  *
@@ -42,6 +45,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { moduloDeProducao } from '../../helpers/modulo-de-producao.js';
 import {
+  ACIMA_DO_TETO_ANTIGO,
   CARDINALITIES,
   SCOPE_READS_PER_TURN_MIN,
   SCOPE_SECTIONS,
@@ -84,6 +88,8 @@ const banco = {
    * afirmada com relógio real, sem dublê de tempo.
    */
   atraso_ms: 0,
+  /** `null` = sem teto (produção desde a #738/#744); um número encena o `LIMIT` antigo. */
+  teto: null as number | null,
 };
 
 const dormir = (ms: number): Promise<void> =>
@@ -97,13 +103,16 @@ const permissoesRepo = {
   },
 };
 const profilesRepo = {
-  // A leitura de autorização da #738: sem teto, como a de produção.
+  // A leitura de autorização da #738: sem teto, como a de produção. O `teto`
+  // só existe para o CONTRAFACTUAL de um caso: encenar o `LIMIT 500` antigo e
+  // provar que o gate o veria de volta.
   async forAuthorization(ids: string[]): Promise<Linha[]> {
     banco.chamadas.forAuthorization++;
     await dormir(banco.atraso_ms);
     const distintos = Array.from(new Set(ids));
     banco.maiorLoteDeProfiles = Math.max(banco.maiorLoteDeProfiles, distintos.length);
-    return banco.profiles.filter((p) => distintos.includes(p.id as string));
+    const linhas = banco.profiles.filter((p) => distintos.includes(p.id as string));
+    return banco.teto === null ? linhas : linhas.slice(0, banco.teto);
   },
 };
 
@@ -195,6 +204,7 @@ beforeEach(() => {
   banco.chamadas = { forPessoa: 0, forAuthorization: 0 };
   banco.maiorLoteDeProfiles = 0;
   banco.atraso_ms = 0;
+  banco.teto = null;
 });
 
 /** Um turno medido: o frame REAL do harness, do jeito que `runArm` o abre. */
@@ -300,16 +310,67 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     expect(resolvido.profile.id).toBe('prof-0000');
   });
 
-  it('a cardinalidade do turno É o tamanho do escopo resolvido — 1, 10 e 100', async () => {
+  it('a cardinalidade do turno É o tamanho do escopo resolvido — 1, 10, 100 e 501', async () => {
     // A armadilha da #700: `resolveScope(pessoa)` devolve TODAS as permissões
     // daquela pessoa, e não aceita parâmetro de cardinalidade. É por isso que
-    // o harness semeia TRÊS pessoas por par, uma por cardinalidade.
+    // o harness semeia UMA pessoa por cardinalidade em cada par.
     for (const n of CARDINALITIES) {
       semear(n);
       const { amostra } = await turnoMedido(pessoaDe(n));
       expect({ n, resolvido: amostra.scope_entities }).toEqual({ n, resolvido: n });
       expect(scopeMetricsFromSamples([amostra]).scope_cardinality_mismatches).toBe(0);
     }
+  });
+
+  it('ACIMA DO TETO ANTIGO: 501 profiles DISTINTOS resolvidos num lote só — e o contrafactual com `LIMIT 500` fica VERMELHO', async () => {
+    // O teto de 500 profiles distintos que `profilesRepo.byIds` impunha à
+    // leitura de autorização foi removido pela #738/#744. O gate não pode só
+    // AFIRMAR isso: a cardinalidade `ACIMA_DO_TETO_ANTIGO` faz o turno da
+    // pessoa de 501 permissões pedir 501 profiles distintos num único
+    // `forAuthorization` — e o escopo resolvido tem de ter 501.
+    expect(ACIMA_DO_TETO_ANTIGO).toBeGreaterThan(500);
+    semear(ACIMA_DO_TETO_ANTIGO);
+    const semTeto = await turnoMedido(pessoaDe(ACIMA_DO_TETO_ANTIGO));
+    expect(banco.maiorLoteDeProfiles).toBe(ACIMA_DO_TETO_ANTIGO);
+    expect(semTeto.amostra.scope_entities).toBe(ACIMA_DO_TETO_ANTIGO);
+    expect(semTeto.ctx!.scope.byEntity.size).toBe(ACIMA_DO_TETO_ANTIGO);
+    expect(countScopeReads(semTeto.reads)).toBe(2);
+
+    // CONTRAFACTUAL, no mesmo caso: a leitura de perfis volta a ter o teto de
+    // 500. O `resolveScope` de produção descarta a permissão cujo profile não
+    // veio (fail-closed), o escopo sai com 500, e — alimentado com o que foi
+    // MEDIDO — o gate reprova o critério de cardinalidade e o aceite completo.
+    banco.teto = 500;
+    banco.chamadas = { forPessoa: 0, forAuthorization: 0 };
+    const comTeto = await turnoMedido(pessoaDe(ACIMA_DO_TETO_ANTIGO));
+    expect(banco.chamadas).toEqual({ forPessoa: 1, forAuthorization: 1 });
+    expect(comTeto.amostra.scope_entities).toBe(500);
+
+    const amostras = [];
+    for (const n of CARDINALITIES) {
+      if (n === ACIMA_DO_TETO_ANTIGO) continue;
+      semear(n);
+      amostras.push((await turnoMedido(pessoaDe(n))).amostra);
+    }
+    const metricsComTeto = scopeMetricsFromSamples([...amostras, comTeto.amostra]);
+    expect(metricsComTeto.scope_entities_max).toBe(500);
+    expect(metricsComTeto.scope_cardinality_mismatches).toBe(1);
+    const ruins = evaluateGate(bracoCom(metricsComTeto), TH, null, { mode: 'gate', fingerprint: FP });
+    expect(gateExitCode(ruins, 'gate')).toBe(1);
+    expect(ruins.find((v) => v.label.includes('veio do BANCO'))!.passed).toBe(false);
+    expect(ruins.find((v) => v.label.includes('aceite completo'))!.passed).toBe(false);
+
+    // CONTROLE: sem o teto, as mesmas quatro cardinalidades aprovam os dois.
+    banco.teto = null;
+    semear(ACIMA_DO_TETO_ANTIGO);
+    const metricsSemTeto = scopeMetricsFromSamples([
+      ...amostras,
+      (await turnoMedido(pessoaDe(ACIMA_DO_TETO_ANTIGO))).amostra,
+    ]);
+    expect(metricsSemTeto.scope_entities_max).toBe(ACIMA_DO_TETO_ANTIGO);
+    const bons = evaluateGate(bracoCom(metricsSemTeto), TH, null, { mode: 'gate', fingerprint: FP });
+    expect(bons.find((v) => v.label.includes('veio do BANCO'))!.passed).toBe(true);
+    expect(bons.find((v) => v.label.includes('aceite completo'))!.passed).toBe(true);
   });
 
   it('VERMELHO se o escopo voltar a ser fabricado em memória: o contador zera e o gate REPROVA', async () => {
@@ -353,7 +414,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const metricsBons = scopeMetricsFromSamples(medidos);
     expect(metricsBons.scope_reads_per_turn_min).toBe(2);
     expect(metricsBons.scope_entities_min).toBe(1);
-    expect(metricsBons.scope_entities_max).toBe(100);
+    expect(metricsBons.scope_entities_max).toBe(Math.max(...CARDINALITIES));
     const bons = evaluateGate(bracoCom(metricsBons), TH, null, { mode: 'gate', fingerprint: FP });
     const falhasDoEscopo = bons
       .filter((v) => !v.passed)
