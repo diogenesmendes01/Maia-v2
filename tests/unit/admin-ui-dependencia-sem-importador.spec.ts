@@ -15,9 +15,10 @@
  * Uma dependência fantasma dessas não é inerte. Ela:
  *   - entra no `npm audit` e no ledger de exceções (#526), então um advisory
  *     dela REPROVA o CI por causa de código que não existe;
- *   - vira PR do Dependabot (o bloco `/src/admin-ui` que
- *     `tests/unit/dependabot-admin-ui.spec.ts` tranca), e alguém gasta uma
- *     revisão de major — foi exatamente a #587, fechada em favor da #605;
+ *   - virava PR de major do Dependabot enquanto ele cobria o `/src/admin-ui`
+ *     (foi exatamente a #587, fechada em favor da #605), e alguém gastava
+ *     uma revisão nela; hoje, sem atualização automática, ela só sobe se
+ *     alguém abrir a PR à mão — trabalho igualmente perdido;
  *   - e é INVISÍVEL: nada no CI compara o manifesto com os imports.
  *
  * `recharts` arrastava 34 pacotes (todo o `d3-*` via `victory-vendor`) para
