@@ -134,14 +134,20 @@ export type BudgetedSection = keyof typeof SECTION_BUDGETS;
  * boundary, not half of it. Until #700 the harness fabricated the scope in
  * memory and seeded neither `permissoes` nor `permission_profiles`, so the two
  * `resolveScope` round-trips counted above were budgeted here and measured
- * nowhere; the gate now resolves the scope in Postgres inside the turn's clock.
- * Since the #525 owner decision (2026-09-02) the gate's evidence is the
- * PROPERTY, not the count: it fails when no scope read reaches the per-turn
- * counter (fabricated scope), when the resolved scope does not match the
- * seeded cardinality, or when the per-turn statement count GROWS with
+ * nowhere; the gate now resolves the scope in Postgres inside the turn's clock,
+ * at scope sizes 1/10/100 and 501 — the last one deliberately one past the
+ * 500-distinct-profile cap the authorization read used to carry
+ * (`profilesRepo.byIds`, removed by #738/#744), so the absence of that cap is
+ * measured rather than assumed. Since the #525 owner decision (2026-09-02)
+ * the gate's evidence is the PROPERTY, not the count: it fails when no scope
+ * read reaches the per-turn counter (fabricated scope), when the resolved
+ * scope does not match the seeded cardinality (including 500 ≠ 501, a
+ * reintroduced cap), or when the per-turn statement count GROWS with
  * cardinality (the O(1) guardrail — which is what catches an N+1, in the
  * scope stage or anywhere else in the turn). The number of scope reads itself
  * (2 here; 1 once the reads are fused) is measured and reported, not fixed.
+ * The PR #702 containment (an `n/a` "whole turn budget" criterion, a coverage
+ * flag) is gone: there is no flag that declares coverage, only measurement.
  *
  * Zero slope is NOT, on its own, what protects the fixed 10-connection pool in
  * `src/db/client.ts` — a bounded read set issued all at once still empties the
@@ -207,7 +213,7 @@ export const TURN_CONTEXT_MAX_CONCURRENT_READS = 6;
  *    O(1) na cardinalidade — `TURN_ROUND_TRIP_BUDGET` acima segue sendo o
  *    número medido e cobrado exato pela spec de round-trips (é o que impede
  *    um N+1 de voltar em silêncio), e o gate reprova qualquer contagem que
- *    cresça de N=1 para N=100;
+ *    cresça de N=1 para N=501 (a maior cardinalidade medida, #700);
  *  - o teto ABSOLUTO é linha de relatório, não critério de aceite: reduzir
  *    statements só é aceito se p95/p99/throughput não pagarem por isso.
  */
