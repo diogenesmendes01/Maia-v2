@@ -8,7 +8,7 @@
 
 | File | Role |
 |---|---|
-| `src/workers/index.ts` | Worker registry, startup orchestration and the cron **drain** (`stopWorkers`) |
+| `src/workers/index.ts` | Worker registry, startup orchestration and the cron **drain** (`stopWorkers`). **#726**: cada entrada de `JOBS` declara o handler com `lazy(() => import('./x.js'), (m) => m.runX)` — o módulo do worker é avaliado no PRIMEIRO tick, não no import do registro (que passou de 407 para 19 arquivos de `src/`) |
 | `src/workers/job-contract.ts` | **Contrato de concorrência** (#513 §9): grupos, classificação, `validateJobRegistry` |
 
 ### Contrato de concorrência dos jobs (issue #513 §9)
