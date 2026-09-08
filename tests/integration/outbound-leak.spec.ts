@@ -53,7 +53,8 @@ import { outboundRecoveryRepo } from '@/db/repositories/outbound-recovery-repo.j
 import { buildOutboundArtifact } from '@/runtime/outbound/contract.js';
 
 const SHOULD_RUN =
-  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+  !!process.env.TEST_DB_URL &&
+  process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Ids NAMESPACED — `agents.id` é PK global.
@@ -81,10 +82,14 @@ const inB = <T>(fn: () => Promise<T>): Promise<T> =>
 const inA2 = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: T_A, agent_id: A_A2 }, fn);
 
-async function ensureTenantAgent(tenant: string, agent: string): Promise<string> {
-  await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING`, [
-    tenant,
-  ]);
+async function ensureTenantAgent(
+  tenant: string,
+  agent: string,
+): Promise<string> {
+  await pool.query(
+    `INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING`,
+    [tenant],
+  );
   await pool.query(
     `INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,$1) ON CONFLICT (id) DO NOTHING`,
     [agent, tenant],
@@ -92,7 +97,13 @@ async function ensureTenantAgent(tenant: string, agent: string): Promise<string>
   const p = await pool.query<{ id: string }>(
     `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
      VALUES ($1,$2,'leak',$3,'dono','ativa') RETURNING id`,
-    [tenant, agent, `+5511${Math.floor(Math.random() * 1e9).toString().padStart(9, '0')}`],
+    [
+      tenant,
+      agent,
+      `+5511${Math.floor(Math.random() * 1e9)
+        .toString()
+        .padStart(9, '0')}`,
+    ],
   );
   const conv = await pool.query<{ id: string }>(
     `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, status)
@@ -194,9 +205,15 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
     // `mensagens` de B e a FK `mensagens_agent_id_fkey` recusaria a limpeza.
     for (const tenant of [T_A, T_B]) {
       await pool.query(`DELETE FROM audit_log WHERE tenant_id = $1`, [tenant]);
-      await pool.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [tenant]);
-      await pool.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [tenant]);
-      await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1`, [tenant]);
+      await pool.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [
+        tenant,
+      ]);
+      await pool.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [
+        tenant,
+      ]);
+      await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1`, [
+        tenant,
+      ]);
       await pool.query(`DELETE FROM mensagens WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM conversas WHERE tenant_id = $1`, [tenant]);
       await pool.query(`DELETE FROM pessoas WHERE tenant_id = $1`, [tenant]);
@@ -276,8 +293,12 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
       texto: 'segredo do vizinho',
       status: 'pending',
     });
-    expect(await inA(() => outboundDeliveryRepo.findById(b.outbound_id))).toBeNull();
-    expect(await inB(() => outboundDeliveryRepo.findById(b.outbound_id))).not.toBeNull();
+    expect(
+      await inA(() => outboundDeliveryRepo.findById(b.outbound_id)),
+    ).toBeNull();
+    expect(
+      await inB(() => outboundDeliveryRepo.findById(b.outbound_id)),
+    ).not.toBeNull();
   });
 
   it('`tryClaimDelivery` não reivindica a linha do vizinho', async () => {
@@ -297,10 +318,12 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
     );
     expect(recusado.ok).toBe(false);
     // E a linha do vizinho continua intocada — sem dono.
-    const { rows } = await pool.query<{ claim_token: string | null; status: string }>(
-      `SELECT claim_token, status FROM outbound_messages WHERE id = $1`,
-      [b.outbound_id],
-    );
+    const { rows } = await pool.query<{
+      claim_token: string | null;
+      status: string;
+    }>(`SELECT claim_token, status FROM outbound_messages WHERE id = $1`, [
+      b.outbound_id,
+    ]);
     expect(rows[0]!.claim_token).toBeNull();
     expect(rows[0]!.status).toBe('pending');
   });
@@ -354,7 +377,10 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
         sequence_in_turn: 1,
       }),
     );
-    expect(bloqueioB).toMatchObject({ sequence_in_turn: 0, status: 'delivery_unknown' });
+    expect(bloqueioB).toMatchObject({
+      sequence_in_turn: 0,
+      status: 'delivery_unknown',
+    });
   });
 
   it('`hasHistoryFor` não vê o histórico do vizinho — outbound_id COLIDIDO', async () => {
@@ -489,13 +515,19 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
       status: 'delivered',
       delivery_outcome: 'accepted_confirmed',
     });
-    expect(await inA(() => outboundRecoveryRepo.artifactForHistoryRecovery(b.outbound_id))).toBeNull();
     expect(
-      await inB(() => outboundRecoveryRepo.artifactForHistoryRecovery(b.outbound_id)),
+      await inA(() =>
+        outboundRecoveryRepo.artifactForHistoryRecovery(b.outbound_id),
+      ),
+    ).toBeNull();
+    expect(
+      await inB(() =>
+        outboundRecoveryRepo.artifactForHistoryRecovery(b.outbound_id),
+      ),
     ).not.toBeNull();
   });
 
-  it('as varreduras (`listDeliverable`, `listReconciliation`) não enumeram o vizinho', async () => {
+  it('as varreduras, inclusive finalização de turno, não enumeram o vizinho', async () => {
     const b1 = await mkOutbound({
       tenant: T_B,
       agent: A_B,
@@ -511,16 +543,59 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
       status: 'delivery_unknown',
       delivery_outcome: 'timeout_unknown',
     });
-    const entregaveis = await inA(() => outboundRecoveryRepo.listDeliverable(500));
-    const reconciliaveis = await inA(() => outboundRecoveryRepo.listReconciliation(500));
+    const b3 = await mkOutbound({
+      tenant: T_B,
+      agent: A_B,
+      conversa_id: conversaB,
+      texto: 'concluído do vizinho',
+      status: 'completed',
+      delivery_outcome: 'accepted_confirmed',
+    });
+    await pool.query(
+      `UPDATE agent_turns
+          SET claimed_by = 'worker-b', claim_token = $2,
+              lease_expires_at = now() - interval '1 minute'
+        WHERE id = $1`,
+      [b3.turn_id, randomUUID()],
+    );
+    const entregaveis = await inA(() =>
+      outboundRecoveryRepo.listDeliverable(500),
+    );
+    const reconciliaveis = await inA(() =>
+      outboundRecoveryRepo.listReconciliation(500),
+    );
+    const finalizaveis = await inA(() =>
+      outboundRecoveryRepo.listFinalizableTurns(500),
+    );
     expect(entregaveis.map((r) => r.outbound_id)).not.toContain(b1.outbound_id);
-    expect(reconciliaveis.map((r) => r.outbound_id)).not.toContain(b2.outbound_id);
+    expect(reconciliaveis.map((r) => r.outbound_id)).not.toContain(
+      b2.outbound_id,
+    );
+    expect(finalizaveis.map((r) => r.turn_id)).not.toContain(b3.turn_id);
+    expect(
+      await inA(() => outboundRecoveryRepo.finalizeResolvedTurnTx(b3.turn_id)),
+    ).toEqual({
+      finalized: false,
+      reason: 'not_eligible',
+    });
     // Controle: em B eles APARECEM. Sem isto, uma varredura quebrada que
     // devolvesse lista vazia passaria nas duas asserções acima.
-    const entregaveisB = await inB(() => outboundRecoveryRepo.listDeliverable(500));
-    const reconciliaveisB = await inB(() => outboundRecoveryRepo.listReconciliation(500));
+    const entregaveisB = await inB(() =>
+      outboundRecoveryRepo.listDeliverable(500),
+    );
+    const reconciliaveisB = await inB(() =>
+      outboundRecoveryRepo.listReconciliation(500),
+    );
+    const finalizaveisB = await inB(() =>
+      outboundRecoveryRepo.listFinalizableTurns(500),
+    );
     expect(entregaveisB.map((r) => r.outbound_id)).toContain(b1.outbound_id);
     expect(reconciliaveisB.map((r) => r.outbound_id)).toContain(b2.outbound_id);
+    expect(finalizaveisB.map((r) => r.turn_id)).toContain(b3.turn_id);
+    expect(
+      (await inB(() => outboundRecoveryRepo.finalizeResolvedTurnTx(b3.turn_id)))
+        .finalized,
+    ).toBe(true);
   });
 
   it('`countTurnOutboundDivergence` conta só o próprio par', async () => {
@@ -537,7 +612,9 @@ d('outbound (#635) — leak suite cross-tenant do outbox durável', () => {
         WHERE tenant_id = $1 AND id = $2`,
       [T_B, b.turn_id],
     );
-    const emB = await inB(() => outboundRecoveryRepo.countTurnOutboundDivergence());
+    const emB = await inB(() =>
+      outboundRecoveryRepo.countTurnOutboundDivergence(),
+    );
     expect(emB.outbound_without_live_turn).toBeGreaterThanOrEqual(1);
   });
 });

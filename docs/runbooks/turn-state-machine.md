@@ -170,7 +170,7 @@ ORDER BY 1,2,3;
 | Pilha de `received` antigos | enqueue falhando (Redis OOM/queda) | Ver [`redis.md`](redis.md). O sweep rearma sozinho quando o Redis voltar. |
 | Pilha de `queued` antigos | worker parado ou job perdido | Checar o worker `agent`; o sweep rearma. |
 | `claimed`/`running` parados | worker morreu no meio | Até #504 (lease) **não** rearme automaticamente. Investigue antes: reexecutar um turno que já chamou tool duplica efeito colateral. |
-| `outbound_pending` parado | resposta comprometida, entrega travada | **Nunca** rearmar via recovery. É o delivery worker (#506) que finaliza. |
+| `outbound_pending` parado | resposta comprometida, entrega ou convergência travada | **Nunca** reexecutar o reasoner. O ciclo de delivery/recovery (#506) entrega os artefatos e o recovery terminaliza o turno após a lease expirar. |
 | Crescimento de `retryable` | reasoner ou envio falhando | `SELECT last_error_code, count(*) FROM agent_turns WHERE status='retryable' GROUP BY 1;` |
 | `dead_letter` com `unsafe_to_retry` | a tentativa falhou DEPOIS de uma tool com efeito externo | **Não replaye às cegas.** Confira o efeito (`outbound_message_id`, trilha de tools) antes de decidir — replayar pode duplicar cobrança/envio. |
 
@@ -564,10 +564,12 @@ quando o pod morreu?") e **sem** gastar tentativa (o crash de um worker não pod
 mandar um turno inocente para a DLQ). O varredor de recovery já procura
 exatamente por esse estado.
 
-`outbound_pending` **não** ocupa a stream, de propósito: a resposta já está
-comprometida no outbox e quem finaliza é o delivery worker (#506). Prender a
-conversa ali faria uma indisponibilidade do provedor de saída parar a stream
-inteira.
+`outbound_pending` não ocupa o mutex parcial de execução (`claimed`/`running`),
+mas continua sendo o **head lógico** da stream: a resposta já está comprometida
+no outbox, e nenhum reasoner pode ultrapassá-la. O ciclo de delivery/recovery
+(#506) converge os artefatos; depois da lease do produtor expirar, o recovery
+terminaliza o turno e promove o sucessor. Assim, indisponibilidade do provedor
+preserva a ordem em vez de liberar respostas posteriores antes da pendente.
 
 ### 10.2 Ordem obrigatória do deploy (e a pré-checagem que não é opcional)
 
@@ -951,7 +953,7 @@ novo head), e ele só é promovido se estiver reivindicável AGORA:
 | `retryable` com backoff vencido | sim (vira `queued`) | trabalho legítimo |
 | `retryable` com backoff em ABERTO | não | *"backoff não autoriza ultrapassagem silenciosa"* — a conversa espera o varredor |
 | `claimed` / `running` | não | já tem dono vivo |
-| `outbound_pending` | não | nenhum claim o move; quem o move é o delivery worker (#506) |
+| `outbound_pending` | não | nenhum claim de reasoner o move; o ciclo de delivery/recovery (#506) terminaliza após os artefatos convergirem e a lease expirar |
 | stream sem sucessor | não | `result="no_successor"`, o caso majoritário |
 
 `queued_at` **não** é reescrito pela promoção: ele mede quando a espera começou.
@@ -987,7 +989,7 @@ crescendo, é o varredor parado.
 | `{result="fence_rejected"}` | `/metrics` | um worker ZUMBI tentou concluir (e liberar o sucessor) e foi barrado. Não deveria ser rotina: sustentado, procure lease curta demais ou GC longo — ver §6.1 |
 | `{result="enqueue_failed"}` | `/metrics` | a decisão comitou e o Redis falhou. **Só é problema sem `recovered` acompanhando** |
 | `{result="recovered"}` | `/metrics` | o varredor reconciliou. Ver §12.3 |
-| `turn_promoted` | `audit_log` | `metadata.source` distingue `terminal` (rotina), `stream_claim_recovery` (um worker morreu) e `recovery_reconciliation` (um sinal se perdeu). `metadata.promoted_by_turn_id` reconstrói a fila sem recorrer à `stream_key` |
+| `turn_promoted` | `audit_log` | `metadata.source` distingue `terminal` (rotina), `stream_claim_recovery` (um worker morreu), `outbound_recovery` (outbox e turno convergiram) e `recovery_reconciliation` (um sinal se perdeu). `metadata.promoted_by_turn_id` reconstrói a fila sem recorrer à `stream_key` |
 | `turn_promotion_rejected` | `audit_log` | a falha nº 9 da issue-mãe registrada no momento em que ela NÃO acontece |
 | `stream.turn_promoted` / `stream.turn_promotion_enqueue_failed` | log estruturado | o segundo é `warn`, não `error`: o varredor conserta sozinho, e alerta que se resolve sozinho é como se ensina o plantão a ignorar alerta |
 

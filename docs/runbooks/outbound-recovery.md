@@ -2,7 +2,8 @@
 
 > Issue #633 (fatia D da épica #506). Companheiro de
 > [`turn-state-machine.md`](turn-state-machine.md): aquele cobre o TURNO, este
-> cobre a RESPOSTA depois de o turno ter terminado.
+> cobre a RESPOSTA desde o commit, enquanto o turno permanece
+> `outbound_pending`, até a convergência conjunta do artefato e do turno.
 
 ## 0. A regra que este runbook existe para proteger
 
@@ -19,19 +20,19 @@ Isso vale para o worker e vale para você às 3h da manhã.
 
 ## 1. Os estados, e o que cada um significa
 
-| Estado | O que aconteceu | Quem age |
-|---|---|---|
-| `pending` | A resposta foi commitada (#631) e ninguém a reivindicou ainda | worker de entrega |
-| `retryable` | Uma tentativa falhou de forma TRANSITÓRIA. Nada saiu | worker, após `next_attempt_at` |
-| `claimed` | Alguém tem a posse; o adaptador ainda não foi tocado | o dono, ou o takeover se a lease vencer |
-| `sending` | A chamada ao provedor foi INICIADA. O desfecho é desconhecido | **nunca reenviar** — takeover vira `delivery_unknown` |
-| `delivered` | O provedor devolveu identificador. A mensagem CHEGOU | falta só o histórico — a reconciliação o PROJETA do artefato (#635) |
-| `completed` | Chegou E o histórico da conversa registrou | ninguém |
-| `delivery_unknown` | Pode ter chegado. Ninguém confirmou | reconciliação |
-| `reconciling` | Incerta e triada: o provedor NÃO deduplica este tipo | **um humano** |
-| `failed_terminal` | O provedor recusou DEFINITIVAMENTE | ninguém — rearmar é pedir a mesma recusa |
-| `cancelled` | **Saída SEM ENVIO.** Abortada antes do canal, ou superada por outra saída do mesmo turno. Nada saiu e nada sairá | ninguém — é terminal para o ciclo de entrega |
-| `dead_letter` | **Nós** desistimos: teto de tentativas ou prazo de reconciliação | um humano, com confirmação de risco |
+| Estado             | O que aconteceu                                                                                                  | Quem age                                                            |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `pending`          | A resposta foi commitada (#631) e ninguém a reivindicou ainda                                                    | worker de entrega                                                   |
+| `retryable`        | Uma tentativa falhou de forma TRANSITÓRIA. Nada saiu                                                             | worker, após `next_attempt_at`                                      |
+| `claimed`          | Alguém tem a posse; o adaptador ainda não foi tocado                                                             | o dono, ou o takeover se a lease vencer                             |
+| `sending`          | A chamada ao provedor foi INICIADA. O desfecho é desconhecido                                                    | **nunca reenviar** — takeover vira `delivery_unknown`               |
+| `delivered`        | O provedor devolveu identificador. A mensagem CHEGOU                                                             | falta só o histórico — a reconciliação o PROJETA do artefato (#635) |
+| `completed`        | Chegou E o histórico da conversa registrou                                                                       | ninguém                                                             |
+| `delivery_unknown` | Pode ter chegado. Ninguém confirmou                                                                              | reconciliação                                                       |
+| `reconciling`      | Incerta e triada: o provedor NÃO deduplica este tipo                                                             | **um humano**                                                       |
+| `failed_terminal`  | O provedor recusou DEFINITIVAMENTE                                                                               | ninguém — rearmar é pedir a mesma recusa                            |
+| `cancelled`        | **Saída SEM ENVIO.** Abortada antes do canal, ou superada por outra saída do mesmo turno. Nada saiu e nada sairá | ninguém — é terminal para o ciclo de entrega                        |
+| `dead_letter`      | **Nós** desistimos: teto de tentativas ou prazo de reconciliação                                                 | um humano, com confirmação de risco                                 |
 
 `cancelled` é **terminal para a entrega** apesar de a semântica do desfecho
 (`cancelled_before_send`) admitir reenvio: o estado não está em
@@ -92,10 +93,10 @@ deliberado: apagar o rastro forense seria a segunda perda.
 
 ## 3. As duas flags, e a ORDEM de ligá-las
 
-| Flag | Default | O que liga |
-|---|---|---|
-| `FEATURE_OUTBOUND_DELIVERY_WORKER` | `false` | O CONSUMIDOR da fila BullMQ `outbound-delivery` |
-| `FEATURE_OUTBOUND_RECOVERY` | `false` | A VARREDURA (`outbound_recovery`, 1 min) que enfileira, reconcilia e manda para a DLQ |
+| Flag                               | Default | O que liga                                                                                                            |
+| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `FEATURE_OUTBOUND_DELIVERY_WORKER` | `false` | O CONSUMIDOR da fila BullMQ `outbound-delivery`                                                                       |
+| `FEATURE_OUTBOUND_RECOVERY`        | `false` | A VARREDURA (`outbound_recovery`, 1 min) que enfileira, reconcilia, manda para a DLQ e terminaliza turnos convergidos |
 
 **O consumidor precede o produtor, sempre.** Ligue
 `FEATURE_OUTBOUND_DELIVERY_WORKER`, confirme que a fila drena, e só então ligue
@@ -112,21 +113,24 @@ automática — uma linha que falhe fica parada até rearmamento manual.
 
 ## 4. Os números que o alarme lê
 
-| Série | Rótulos | O que um pico significa |
-|---|---|---|
-| `maia_outbound_pending_age_seconds` | `tenant_id`, `agent_id` | **A série do alarme.** Idade da resposta não entregue mais antiga. Crescente = algo parou |
-| `maia_outbound_reconciliation_total` | `result` | `escalate_manual` crescendo = fila HUMANA acumulando; `await_grace` alto e constante = carência longa demais; **`history_fabricated` ≠ 0 = o delivery worker está MORRENDO na janela `delivered -> completed`** |
-| `maia_outbound_dead_letter_total` | `reason` | `attempt_limit` = falha persistente de entrega; `reconciliation_timeout` = incerteza que ninguém resolveu em 24h |
-| `maia_outbound_turn_inconsistency_total` | `kind` | **Qualquer valor ≠ 0 é bug**, não ruído esperado |
-| `maia_outbound_delivery_unknown_total` | `channel` | (#632) A fila de entrada da reconciliação |
-| `maia_outbound_lease_lost_total` | `reason` | (#632) `lease_expired` alto = leases curtas para a latência real do provedor |
-| `maia_outbound_rearm_total` | `origin` | `recovery` × `replay` — quanto vem da varredura e quanto de operador |
-| `maia_outbound_direct_send_violation_total` | `kind` (a primitiva) | (#634) **Zero absoluto.** Qualquer ponto é um caminho de produção falando com o canal fora do outbox e fora do inventário — o critério de ABORTAR "qualquer envio sem ledger" da issue-mãe. Alerta é `> 0`, não um limiar |
+| Série                                       | Rótulos                 | O que um pico significa                                                                                                                                                                                                                        |
+| ------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maia_outbound_pending_age_seconds`         | `tenant_id`, `agent_id` | **A série do alarme.** Idade do ciclo de resposta não concluído mais antigo, inclusive artefato final cujo pai segue `outbound_pending`. Crescente = algo parou                                                                               |
+| `maia_outbound_turn_no_success_pending`     | `tenant_id`, `agent_id` | **Estado atual.** Quantos turnos têm todas as partes finais, lease vencida e nenhuma entrega comprovada. Valor `> 0` por 5 minutos dispara `MaiaOutboundTurnNoSuccessPending`; exige decisão humana                                                    |
+| `maia_outbound_reconciliation_total`        | `result`                | `escalate_manual` crescendo = fila HUMANA; `history_fabricated` = crash em `delivered -> completed`; `turn_finalized` = turno convergido                                                                                                      |
+| `maia_outbound_dead_letter_total`           | `reason`                | `attempt_limit` = falha persistente de entrega; `reconciliation_timeout` = incerteza que ninguém resolveu em 24h                                                                                                                               |
+| `maia_outbound_turn_inconsistency_total`    | `kind`                  | **Qualquer valor ≠ 0 é bug**, não ruído esperado                                                                                                                                                                                               |
+| `maia_outbound_delivery_unknown_total`      | `channel`               | (#632) A fila de entrada da reconciliação                                                                                                                                                                                                      |
+| `maia_outbound_lease_lost_total`            | `reason`                | (#632) `lease_expired` alto = leases curtas para a latência real do provedor                                                                                                                                                                   |
+| `maia_outbound_rearm_total`                 | `origin`                | `recovery` × `replay` — quanto vem da varredura e quanto de operador                                                                                                                                                                           |
+| `maia_outbound_direct_send_violation_total` | `kind` (a primitiva)    | (#634) **Zero absoluto.** Qualquer ponto é um caminho de produção falando com o canal fora do outbox e fora do inventário — o critério de ABORTAR "qualquer envio sem ledger" da issue-mãe. Alerta é `> 0`, não um limiar                      |
 
-`maia_outbound_pending_age_seconds` é medida uma vez por tick e publicada por um
-provider que lê o último valor. Ela é, no pior caso, um minuto velha — para uma
-série cujo alerta dispara em minutos, isso é irrelevante; o que se ganha é não
-transformar a frequência de scrape em carga de Postgres.
+`maia_outbound_pending_age_seconds` e
+`maia_outbound_turn_no_success_pending` são medidas uma vez por tick e
+publicadas por providers que leem o último valor. Elas são, no pior caso, um
+minuto velhas — para séries cujos alertas disparam em minutos, isso é
+irrelevante; o que se ganha é não transformar a frequência de scrape em carga
+de Postgres.
 
 ## 5. Diagnóstico por sintoma
 
@@ -241,8 +245,15 @@ política de PII de #630): ele é lido do INGRESSO, nunca derivado do telefone.
 A trilha distingue as duas origens: a auditoria `outbound_delivery_completed`
 carrega `recovered_by: "reconciliation"` e `history_fabricated: true`.
 
+A conclusão `delivered -> completed` acima fecha primeiro o **artefato**. A fase
+seguinte do mesmo worker fecha o **turno** em outra transação, depois de exigir
+lease expirada e reler todas as partes sob lock. Um crash entre essas duas
+transações deixa `agent_turns.status = 'outbound_pending'`, mas a descoberta por
+turno o reencontra no próximo tick elegível, depois de a lease expirar; o
+sucessor FIFO não é promovido antes do segundo commit.
+
 **O que investigar quando `history_fabricated` ≠ 0**: não é o histórico — ele foi
-recuperado. É *por que o processo morreu ali*. Comece pelos reinícios do worker
+recuperado. É _por que o processo morreu ali_. Comece pelos reinícios do worker
 de entrega na mesma janela de tempo.
 
 #### 5.4.1 `history_unrecoverable_invalid_payload` — o fail-closed
@@ -286,7 +297,39 @@ A linha fica em `delivered`, portanto continua contando em
 `maia_outbound_pending_age_seconds` e continua visível a cada tick. Isso é
 intencional — sair do radar seria pior que envelhecer nele.
 
-### 5.5 Divergência turno ↔ outbound
+### 5.5 Outbox final, turno ainda `outbound_pending`
+
+```sql
+SELECT t.id, t.claim_token, t.lease_expires_at,
+       count(*) FILTER (WHERE o.status = 'completed') AS successful,
+       array_agg(o.status ORDER BY o.sequence_in_turn) AS artifact_statuses
+  FROM agent_turns t
+  JOIN outbound_messages o
+    ON o.tenant_id = t.tenant_id
+   AND o.agent_id = t.agent_id
+   AND o.turn_id = t.id
+ WHERE t.tenant_id = :t AND t.agent_id = :a
+   AND t.status = 'outbound_pending'
+ GROUP BY t.id;
+```
+
+- **lease viva** — aguarde; o produtor ainda pode acrescentar uma parte;
+- **lease expirada + ao menos um `completed` + todas as partes finais** — deve
+  fechar em até um tick do recovery;
+- **claim ou lease nulos** — a finalização falha fechado. É típico de estado
+  legado ou de falha pós-commit com `FEATURE_TURN_CLAIM=false`;
+- **zero `completed`** — não entra no `LIMIT` da eleição finalizável, porque não
+  existe transição legítima a executar. Uma consulta agregada separada publica
+  `maia_outbound_turn_no_success_pending`; o alerta dispara se o estado persistir
+  por 5 minutos, e o pai permanece `outbound_pending`. A API transacional ainda
+  devolve `no_success` quando chamada diretamente como defesa. Não marque
+  `reply_delivered`; nenhuma entrega foi comprovada.
+
+Para concluir o turno, a lista final é fechada:
+`completed | failed_terminal | cancelled | dead_letter`. `delivered` não entra:
+ele libera a ordem multipart, mas ainda exige convergência do histórico.
+
+### 5.6 Divergência turno ↔ outbound
 
 `maia_outbound_turn_inconsistency_total{kind}` ≠ 0. Os dois sentidos têm causas
 OPOSTAS:
@@ -313,6 +356,10 @@ SELECT o.id, o.status, t.status AS turn_status
 **Nenhum dos dois é corrigido automaticamente**, e a assimetria é deliberada:
 consertar o primeiro seria INVENTAR uma resposta que a cognição nunca produziu;
 consertar o segundo seria CANCELAR uma entrega possivelmente em voo.
+
+O estado da §5.5 é uma terceira situação e não entra nessas duas contagens: há
+outbox e ele já está final. Esse caso é corrigido automaticamente pelo finalizer
+quando claim, lease e sucesso comprovado satisfazem as guardas.
 
 Como #631 move o turno e insere a linha na MESMA transação, o sentido 1 não pode
 nascer do commit. Se aparecer, procure escrita fora das fronteiras: migração de
@@ -351,6 +398,13 @@ O que o comando faz, nesta ordem, e por que a ordem é a garantia:
 4. transiciona por CAS auditado (`outbound_manual_rearm`, com `actor`, `reason`,
    `duplicate_risk` e `acknowledged_duplicate_risk`) e **só então** rearma o job.
 
+O CAS exige que o estado continue exatamente igual ao observado pelo comando;
+se outra reconciliação o mover enquanto o operador decide, o rearme é recusado
+e deve ser repetido sobre o estado novo. Em linhas ligadas a um turno, o comando
+também bloqueia primeiro o pai e só aceita o status `outbound_pending`. Um turno
+já terminal nunca é reaberto: isso impediria que uma parte atrasada saísse
+depois de o sucessor FIFO já ter avançado.
+
 `--reason` é obrigatório sempre. Ele vai para a auditoria, e uma intervenção sem
 motivo registrado é uma intervenção que ninguém consegue reconstruir depois.
 
@@ -367,7 +421,9 @@ laço no shell — e leia cada `outbound-show`.
 
 ## 7. Rollback
 
-1. Desligue `FEATURE_OUTBOUND_RECOVERY` (para de enfileirar e de reconciliar).
+1. Desligue `FEATURE_OUTBOUND_RECOVERY` (para de enfileirar, reconciliar e
+   terminalizar turnos). Turnos já `outbound_pending` podem manter a stream
+   bloqueada até a flag voltar ou haver intervenção controlada.
 2. Desligue `FEATURE_OUTBOUND_DELIVERY_WORKER` (para de consumir). Nesta ordem —
    a inversa deixa jobs armados sem consumidor.
 3. O caminho síncrono de #631/#632 continua entregando. Linhas em `retryable` e
@@ -408,12 +464,12 @@ Antes de #634 esse `last_error_code` significava "o worker não sabe resolver
 `storage_object`". Depois de #634 significa **"o objeto não está legível neste
 volume"**, e as causas são outras:
 
-| Causa | Como confirmar | O que fazer |
-|---|---|---|
-| A réplica não monta o mesmo volume `MEDIA_ROOT` | `ls <MEDIA_ROOT>/outbound` na réplica que falhou × na que commitou | **Corrigir o deploy.** Rearmar não resolve: a próxima tentativa cai na mesma réplica-classe |
-| O objeto foi apagado por um pedido de exclusão do titular (LGPD) | `data_tombstones` com `data_class='media.outbound_artifacts'` e o `subject_ref` daquele titular | **Não rearme.** Cancele a linha: reenviar mídia de um titular que pediu exclusão é o incidente, não a entrega |
-| GC apagou depois de uma entrega confirmada e a linha foi rearmada | `status` da linha era `delivered`/`completed` antes do rearme | Não rearme. A mensagem já chegou |
-| Chave de outro escopo (row adulterada) | o `object_key` começa com um `tenant_id` diferente do da row | Incidente de segurança. Preserve a row e escale |
+| Causa                                                             | Como confirmar                                                                                  | O que fazer                                                                                                   |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| A réplica não monta o mesmo volume `MEDIA_ROOT`                   | `ls <MEDIA_ROOT>/outbound` na réplica que falhou × na que commitou                              | **Corrigir o deploy.** Rearmar não resolve: a próxima tentativa cai na mesma réplica-classe                   |
+| O objeto foi apagado por um pedido de exclusão do titular (LGPD)  | `data_tombstones` com `data_class='media.outbound_artifacts'` e o `subject_ref` daquele titular | **Não rearme.** Cancele a linha: reenviar mídia de um titular que pediu exclusão é o incidente, não a entrega |
+| GC apagou depois de uma entrega confirmada e a linha foi rearmada | `status` da linha era `delivered`/`completed` antes do rearme                                   | Não rearme. A mensagem já chegou                                                                              |
+| Chave de outro escopo (row adulterada)                            | o `object_key` começa com um `tenant_id` diferente do da row                                    | Incidente de segurança. Preserve a row e escale                                                               |
 
 `media_ref_unresolved` é sempre `rejected_terminal` — recusa DEFINITIVA. Um
 `rejected_retryable` faria a linha girar no backoff para sempre contra um objeto
@@ -468,9 +524,12 @@ desligável em produção é o fail-open que a épica lista como risco.
 
 ### A trilha de auditoria do ciclo (#506 §Auditoria mínima)
 
-Onze ações em `audit_log`, todas escopadas por `(tenant_id, agent_id)`, todas
-com `alvo_id = outbound_id` e `entidade_alvo = 'outbound_messages'`. Para
-reconstruir o ciclo de UMA linha:
+Doze ações em `audit_log`, todas escopadas por `(tenant_id, agent_id)`. Dez usam
+`alvo_id = outbound_id` e `entidade_alvo = 'outbound_messages'`; a observação
+agregada de divergência não tem alvo, e a conclusão do turno usa o próprio
+`turn_id` com `entidade_alvo = 'agent_turns'`. A consulta abaixo reconstrói as
+dez ações ligadas a UMA linha; consulte o `turn_id` separadamente para incluir a
+finalização do turno:
 
 ```sql
 SELECT created_at, acao, metadata
@@ -479,27 +538,30 @@ SELECT created_at, acao, metadata
  ORDER BY created_at;
 ```
 
-| Ação | Quando | Metadata que importa |
-|---|---|---|
-| `outbound_committed` | a intenção foi commitada com o turno | `payload_hash`, `idempotent_reuse` |
-| `outbound_claimed` | posse concedida (ou takeover) | `attempt`, `worker_id`, `status_after_claim` |
-| `outbound_send_started` | `claimed -> sending`, antes do adaptador | `attempt` |
-| `outbound_delivery_unknown` | desfecho da família desconhecida | `outcome`, `last_error_code` |
-| `outbound_retry_scheduled` | desfecho retentável | `retry_in_seconds`, `next_attempt_at` |
-| `outbound_delivery_completed` | histórico gravado, `-> completed` | `history_message_id`, `recovered_by` |
-| `outbound_reconciliation_started` | `delivery_unknown -> reconciling` | `escalation_reason` |
-| `outbound_reconciled` | a reconciliação resolveu | `result` (`resend_idempotent` \| `history_recovered` \| `history_fabricated`) |
-| `outbound_dead_lettered` | a plataforma desistiu | `reason`, `attempt` |
-| `outbound_manual_rearm` | operador devolveu ao ciclo | `actor`, `reason`, `acknowledged_duplicate_risk` |
-| `outbound_turn_inconsistency_detected` | divergência turno↔outbound | as duas contagens |
+| Ação                                   | Quando                                   | Metadata que importa                                                          |
+| -------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------- |
+| `outbound_committed`                   | a intenção foi commitada com o turno     | `payload_hash`, `idempotent_reuse`                                            |
+| `outbound_claimed`                     | posse concedida (ou takeover)            | `attempt`, `worker_id`, `status_after_claim`                                  |
+| `outbound_send_started`                | `claimed -> sending`, antes do adaptador | `attempt`                                                                     |
+| `outbound_delivery_unknown`            | desfecho da família desconhecida         | `outcome`, `last_error_code`                                                  |
+| `outbound_retry_scheduled`             | desfecho retentável                      | `retry_in_seconds`, `next_attempt_at`                                         |
+| `outbound_delivery_completed`          | histórico gravado, `-> completed`        | `history_message_id`, `recovered_by`                                          |
+| `outbound_reconciliation_started`      | `delivery_unknown -> reconciling`        | `escalation_reason`                                                           |
+| `outbound_reconciled`                  | a reconciliação resolveu                 | `result` (`resend_idempotent` \| `history_recovered` \| `history_fabricated`) |
+| `outbound_dead_lettered`               | a plataforma desistiu                    | `reason`, `attempt`                                                           |
+| `outbound_manual_rearm`                | operador devolveu ao ciclo               | `actor`, `reason`, `acknowledged_duplicate_risk`                              |
+| `outbound_turn_inconsistency_detected` | divergência turno↔outbound               | as duas contagens                                                             |
+| `outbound_turn_finalized`              | turno convergido após lease expirada     | `outcome`, contagens, `partial_delivery`, estados das partes                  |
 
-**Todas são TRANSACIONAIS** (`auditTx`, no mesmo `tx` da transição). Uma
+Toda ação que acompanha uma mutação usa `auditTx` no mesmo `tx` da transição. A
+divergência é uma observação agregada e usa `audit()` sem mutação associada. Uma
 consequência operacional que vale saber antes de estranhá-la: se a mensagem de
 `in_reply_to` for apagada (retenção), a FK `audit_log.mensagem_id -> mensagens`
-passa a barrar a auditoria, e com ela a transição — a linha do outbox **para**
-onde está em vez de avançar sem trilha. O sintoma é `pending`/`claimed`/`sending`
-que não anda, com erro de FK no log. Isso é o fail-closed funcionando: a saída de
-uma linha nesse estado é o rearmamento manual auditado, não relaxar a trilha.
+passa a barrar uma auditoria transacional, e com ela a transição — a linha do
+outbox **para** onde está em vez de avançar sem trilha. O sintoma é
+`pending`/`claimed`/`sending` que não anda, com erro de FK no log. Isso é o
+fail-closed funcionando: a saída de uma linha nesse estado é o rearmamento
+manual auditado, não relaxar a trilha.
 
 **Ausência de linha é sinal.** Uma linha em `sending` sem `outbound_send_started`
 é impossível pelo caminho de produção; se aparecer, alguém escreveu no banco por
@@ -507,8 +569,8 @@ fora.
 
 ## 8. O risco residual que esta fatia ADMINISTRA e não resolve
 
-Sem confirmação e idempotência confiáveis do provedor, a janela *"o provedor
-recebeu, o processo não confirmou"* é **impossível de fechar**. Nenhuma
+Sem confirmação e idempotência confiáveis do provedor, a janela _"o provedor
+recebeu, o processo não confirmou"_ é **impossível de fechar**. Nenhuma
 quantidade de reconciliação a fecha: o Baileys não oferece uma consulta de
 status por `messageId` que permita perguntar "esta mensagem chegou?".
 
@@ -555,6 +617,22 @@ fora de ordem. Preferimos parar o turno e deixar a incerteza visível.
 
 É uma lista de INCLUSÃO: um estado novo no vocabulário de #630 é BLOQUEANTE até
 alguém decidir o contrário.
+
+Fechar o **turno** usa uma lista mais estrita,
+`OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES`
+(`src/runtime/outbound/recovery-contract.ts`): `completed`, `failed_terminal`,
+`cancelled`, `dead_letter`. Ela exclui `delivered` porque o histórico ainda pode
+estar pendente e exige pelo menos um `completed` para terminalizar. Todas as
+partes finais sem sucesso são contadas fora da janela de finalização, para nunca
+causarem starvation dos turnos que podem progredir. A API devolve `no_success`,
+a idade continua subindo e o gauge
+`maia_outbound_turn_no_success_pending` mantém o incidente visível sem inflar um
+counter a cada tick.
+
+O outcome do turno considera apenas os sucessos comprovados: se todos os
+artefatos `completed` forem `status_fallback`, usa `fallback_delivered`; se
+qualquer sucesso tiver outro tipo, usa `reply_delivered`. Irmãos finais sem
+sucesso tornam a entrega parcial, mas não mudam essa regra.
 
 ### 9.3 Falha parcial
 

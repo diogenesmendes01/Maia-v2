@@ -6,33 +6,33 @@
 
 ## Key files
 
-| File | Role |
-|---|---|
-| `src/agent/core.ts` | Per-turn entry; orchestrates pre-turn, LLM call, post-turn |
-| `src/agent/react-loop.ts` | ReAct loop for tool-using turns |
-| `src/agent/prompt-builder.ts` | **Pure renderer**: turns a `TurnContextSnapshot` into the system + user prompt. Imports no repository |
-| `src/agent/sanitize.ts` | Sanitizes LLM output (wraps untrusted blocks in delimiters; see prompt-injection mitigation) |
-| `src/agent/output-dispatch.ts` | Dispatches outbound (text / voice / PDF / poll / view-once). Desde #631, **commita a intenção de resposta no outbox durável ANTES de qualquer chamada ao canal**; desde #634 isso vale para TODOS os ramos (voz incluída) e a mídia entra por `storage_object` — ver abaixo |
-| `src/agent/pending-gate.ts` | Gates execution while a pending question is open |
-| `src/agent/pending-resolver.ts` | Resolves user input against active pending question |
-| `src/agent/gap-detector.ts` | Detects gaps in agent capability mid-turn |
-| `src/agent/success-detector.ts` | Detects success signals at end of turn |
-| `src/agent/reflection.ts` | Triggers reflection candidates |
-| `src/agent/reflection-clustering.ts` | Clusters reflections for batch processing |
-| `src/agent/execute-skill.ts` | Invokes `runSkill()` from the decision engine output |
-| `src/agent/tool-execution-summary.ts` | Summarizes tool calls for the LLM follow-up |
-| `src/agent/capability-revert.ts` | Reverts a capability when revocation flows fire |
-| `src/agent/one-tap.ts` | One-tap response shortcut handling |
-| `src/agent/pdf-cleanup.ts` | Cleans up generated PDFs after dispatch |
-| `src/agent/message-update.ts` | Updates outbound message state |
-| `src/agent/notification-adapter.ts` | Adapter to notification channels |
-| `src/agent/scope-hash.ts` | Computes scope hash for memoization |
-| `src/agent/turn-context/loader.ts` | `TurnContextLoader` — the ONLY place a turn reads the database |
-| `src/agent/turn-context/metrics.ts` | `maia_turn_context_*` metrics (closed label vocabulary) |
-| `src/agent/turn-context/types.ts` | `LoadedSection` contract + per-section budgets |
-| `src/agent/turn-context/budget.ts` | Deterministic, metered truncation |
-| `src/agent/turn-context/concurrency.ts` | `createReadGate` — the FIFO semaphore that caps how much of the pool one turn may hold |
-| `src/agent/turn-context/cache.ts` | Versioned tenant+agent cache for the static context, with cross-replica invalidation |
+| File                                    | Role                                                                                                                                                                                                                                                                        |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/agent/core.ts`                     | Per-turn entry; orchestrates pre-turn, LLM call, post-turn                                                                                                                                                                                                                  |
+| `src/agent/react-loop.ts`               | ReAct loop for tool-using turns                                                                                                                                                                                                                                             |
+| `src/agent/prompt-builder.ts`           | **Pure renderer**: turns a `TurnContextSnapshot` into the system + user prompt. Imports no repository                                                                                                                                                                       |
+| `src/agent/sanitize.ts`                 | Sanitizes LLM output (wraps untrusted blocks in delimiters; see prompt-injection mitigation)                                                                                                                                                                                |
+| `src/agent/output-dispatch.ts`          | Dispatches outbound (text / voice / PDF / poll / view-once). Desde #631, **commita a intenção de resposta no outbox durável ANTES de qualquer chamada ao canal**; desde #634 isso vale para TODOS os ramos (voz incluída) e a mídia entra por `storage_object` — ver abaixo |
+| `src/agent/pending-gate.ts`             | Gates execution while a pending question is open                                                                                                                                                                                                                            |
+| `src/agent/pending-resolver.ts`         | Resolves user input against active pending question                                                                                                                                                                                                                         |
+| `src/agent/gap-detector.ts`             | Detects gaps in agent capability mid-turn                                                                                                                                                                                                                                   |
+| `src/agent/success-detector.ts`         | Detects success signals at end of turn                                                                                                                                                                                                                                      |
+| `src/agent/reflection.ts`               | Triggers reflection candidates                                                                                                                                                                                                                                              |
+| `src/agent/reflection-clustering.ts`    | Clusters reflections for batch processing                                                                                                                                                                                                                                   |
+| `src/agent/execute-skill.ts`            | Invokes `runSkill()` from the decision engine output                                                                                                                                                                                                                        |
+| `src/agent/tool-execution-summary.ts`   | Summarizes tool calls for the LLM follow-up                                                                                                                                                                                                                                 |
+| `src/agent/capability-revert.ts`        | Reverts a capability when revocation flows fire                                                                                                                                                                                                                             |
+| `src/agent/one-tap.ts`                  | One-tap response shortcut handling                                                                                                                                                                                                                                          |
+| `src/agent/pdf-cleanup.ts`              | Cleans up generated PDFs after dispatch                                                                                                                                                                                                                                     |
+| `src/agent/message-update.ts`           | Updates outbound message state                                                                                                                                                                                                                                              |
+| `src/agent/notification-adapter.ts`     | Adapter to notification channels                                                                                                                                                                                                                                            |
+| `src/agent/scope-hash.ts`               | Computes scope hash for memoization                                                                                                                                                                                                                                         |
+| `src/agent/turn-context/loader.ts`      | `TurnContextLoader` — the ONLY place a turn reads the database                                                                                                                                                                                                              |
+| `src/agent/turn-context/metrics.ts`     | `maia_turn_context_*` metrics (closed label vocabulary)                                                                                                                                                                                                                     |
+| `src/agent/turn-context/types.ts`       | `LoadedSection` contract + per-section budgets                                                                                                                                                                                                                              |
+| `src/agent/turn-context/budget.ts`      | Deterministic, metered truncation                                                                                                                                                                                                                                           |
+| `src/agent/turn-context/concurrency.ts` | `createReadGate` — the FIFO semaphore that caps how much of the pool one turn may hold                                                                                                                                                                                      |
+| `src/agent/turn-context/cache.ts`       | Versioned tenant+agent cache for the static context, with cross-replica invalidation                                                                                                                                                                                        |
 
 ## Turn-context loading (issues #511, #525)
 
@@ -47,26 +47,58 @@ split is load-bearing, not cosmetic:
   rendering" is enforced by `tsc` rather than by review. `buildPrompt()` is now
   exactly `load` then `render`.
 
-Loading itself is two phases, and that split is a cost decision:
+Authorization and loading are ordered in three phases, and that split is both
+a security and a cost decision:
 
-1. **Cheap gate first.** `core.ts` runs the Decision Engine BEFORE `buildPrompt`.
+1. **Governance gates first.** Existing conversations revalidate that the
+   pessoa is active, the per-agent audience profile is active, the resolver,
+   inbound row, and conversation channel bindings do not diverge, and the
+   channel policy has an active default role present in the policy-filtered
+   active-role set. An empty
+   `allowed_role_ids` means all active roles; a non-empty list is an allowlist
+   and must include the default role. A deterministic miss is audited
+   and terminates without business hooks; a repository failure is retryable and
+   leaves the inbound unprocessed.
+2. **Cheap decision gate.** `core.ts` runs the Decision Engine BEFORE `buildPrompt`.
    A turn that is blocked or escalated never hydrates a prompt.
-2. **Reasoner context second.** Only allowed turns hydrate history, entities and
+3. **Reasoner context last.** Only allowed turns hydrate history, entities and
    states, facts, rules, memories, hints, capabilities, gaps and the procedure.
+
+The production Decision Engine contract is packet-or-throw; an absent packet is
+treated as a retryable wiring failure rather than permission to bypass policy.
+Its catch covers only packet construction and engine execution.
+Packet consumption is outside it because it may commit an outbound or execute a
+skill: a failure after either decision must propagate and can never become
+permission to fall through to ReAct. A visible block/escalation is persisted as
+a `status_fallback` and audited as `decision_engine_policy_refused`; its terminal
+turn outcome is `fallback_delivered` because the durable commit first moves the
+turn to `outbound_pending`, from which `ignored/blocked_by_policy` is not a valid
+transition. After a durable outbox commit, delivery failure keeps the turn at
+`outbound_pending` so FIFO remains closed while recovery/reconciliation owns the
+artifact.
+
+The same barrier applies to the rate-limit warning and `execute_skill` paths.
+Rate-limit success finishes as `fallback_delivered`; a definite failure before
+commit remains `rate_limited_silent`; an ambiguous pre-commit delivery uses
+`reply_delivery_unknown`; and any failure after commit preserves
+`outbound_pending`. For skills, `safeDispatchOutput.not_sent` describes only the
+physical send. `core.ts` combines it with the live `TurnHandle`, so neither a
+`not_sent` nor a `sent_no_persist` result can fall through or terminalize while
+durable recovery owns the committed artifact.
 
 ### Round-trip cost
 
 Counted at the repository boundary for a typical turn (no active procedure);
 `resolveScope`'s two queries are included, because a turn pays them.
 
-| entities | 1 | 10 | 100 |
-|---|---|---|---|
-| before #511 | 17 | 35 | 215 |
-| after #511/#524, cold, legacy `self_state` | 15 | 15 | 15 |
-| after #511/#524, cold, operational profile v2 | 14 | 14 | 14 |
-| **after #525, cold, legacy `self_state`** | **13** | **13** | **13** |
-| **after #525, cold, operational profile v2** | **12** | **12** | **12** |
-| after #525, warm cache, operational profile v2 | 11 | 11 | 11 |
+| entities                                       | 1      | 10     | 100    |
+| ---------------------------------------------- | ------ | ------ | ------ |
+| before #511                                    | 17     | 35     | 215    |
+| after #511/#524, cold, legacy `self_state`     | 15     | 15     | 15     |
+| after #511/#524, cold, operational profile v2  | 14     | 14     | 14     |
+| **after #525, cold, legacy `self_state`**      | **13** | **13** | **13** |
+| **after #525, cold, operational profile v2**   | **12** | **12** | **12** |
+| after #525, warm cache, operational profile v2 | 11     | 11     | 11     |
 
 The slope is zero — scope size does not multiply round-trips against the fixed
 10-connection pool in `src/db/client.ts`. That, not the cache, is where the win
@@ -91,11 +123,11 @@ together. Six is not a new number: it is the ceiling the pre-#525 code enforced
 and documented, and the shared version is strictly stronger than the per-group
 one it restores.
 
-| | |
-|---|---|
+|                           |                         |
+| ------------------------- | ----------------------- |
 | Pool (`src/db/client.ts`) | `max: 10`, process-wide |
-| One turn's ceiling | 6 statements in flight |
-| Left for everyone else | ≥ 4 connections, always |
+| One turn's ceiling        | 6 statements in flight  |
+| Left for everyone else    | ≥ 4 connections, always |
 
 A semaphore rather than a phase split, because running the groups in sequence
 would cap concurrency at 5 but reintroduce half the waterfall #525 removed —
@@ -204,13 +236,13 @@ on measured turns), and the absolute ceiling is a report line. For the record,
 the merge candidates that the retired target pointed at, with what each was
 worth:
 
-| merge | saves | why not yet |
-|---|---|---|
-| `permissoes ⋈ permission_profiles` in `resolveScope` | 1 | authorization path; changing it is out of scope for a performance change |
-| `agent_capabilities_skill ∪ agent_capability_gaps` | 1 | needs a `UNION ALL` over a projected common shape |
-| `agent_facts ∪ learned_rules` | 1 | same, and `learned_rules.confianca` is `numeric` — a jsonb round-trip renders `0.8` where the prompt says `0.80`, changing the bytes |
-| `memory_entry ∪ behavioral_hint` | 1 | the memory read carries a `LIMIT`, so its union branch needs a subquery |
-| `operational_profile_versions ∪ self_state` | 1 (legacy path only) | would read `self_state` unconditionally, on every turn |
+| merge                                                | saves                | why not yet                                                                                                                          |
+| ---------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `permissoes ⋈ permission_profiles` in `resolveScope` | 1                    | authorization path; changing it is out of scope for a performance change                                                             |
+| `agent_capabilities_skill ∪ agent_capability_gaps`   | 1                    | needs a `UNION ALL` over a projected common shape                                                                                    |
+| `agent_facts ∪ learned_rules`                        | 1                    | same, and `learned_rules.confianca` is `numeric` — a jsonb round-trip renders `0.8` where the prompt says `0.80`, changing the bytes |
+| `memory_entry ∪ behavioral_hint`                     | 1                    | the memory read carries a `LIMIT`, so its union branch needs a subquery                                                              |
+| `operational_profile_versions ∪ self_state`          | 1 (legacy path only) | would read `self_state` unconditionally, on every turn                                                                               |
 
 None of these is expressible as a plain drizzle join, and none can be verified
 without a live Postgres, so they belong in a change that can run the integration
@@ -238,10 +270,10 @@ a **real Postgres** through the real `max: 10` pool, with 50 tenant/agent pairs,
 concurrency 20, scopes of 1/10/100 entities plus one of 501 (above the old
 distinct-profile cap — see below), and two arms:
 
-| arm | `FEATURE_TURN_CONTEXT_CACHE` | identity | reads per turn |
-|---|---|---|---|
+| arm    | `FEATURE_TURN_CONTEXT_CACHE`                            | identity                      | reads per turn          |
+| ------ | ------------------------------------------------------- | ----------------------------- | ----------------------- |
 | `cold` | off (the production default in every generated fixture) | read from Postgres every turn | 10 + 2 (`resolveScope`) |
-| `warm` | on, pre-warmed per pair | served from process memory | 9 + 2 (`resolveScope`) |
+| `warm` | on, pre-warmed per pair                                 | served from process memory    | 9 + 2 (`resolveScope`)  |
 
 **Issue #700 — the boundary the harness measures.** Until #700 it measured
 `buildPrompt` only: `buildContext` fabricated the scope in memory and the
@@ -251,13 +283,13 @@ emitting the "whole turn budget" criterion as `n/a` (which fails in `gate`
 mode). That containment is gone — the criterion is always evaluated, and there
 is no coverage flag left to flip. The scope is now resolved **in Postgres,
 inside the turn's clock**, by the same `resolveScope` `core.ts` calls. Because
-`resolveScope(pessoa)` returns *all* of that person's permissions and takes no
+`resolveScope(pessoa)` returns _all_ of that person's permissions and takes no
 cardinality argument, the cardinality scale IS the resolved scope size: the
 fixture seeds **one person per cardinality in each pair**, with 1, 10, 100 and
 **501** `permissoes` rows each pointing at a distinct `permission_profiles` row
 (501 per pair). The 501 exists because of #738/#744: the authorization read
 used to be `profilesRepo.byIds(ids, limit = 500)`, which silently dropped
-grants past 500 *distinct* profiles, and the bench never went above 100, so it
+grants past 500 _distinct_ profiles, and the bench never went above 100, so it
 never exercised the cap. The cap was removed (`profilesRepo.forAuthorization`,
 tenant/agent-scoped, no `LIMIT`); the gate now measures its absence instead of
 asserting it — a reintroduced `.limit(500)` shows up as a resolved scope of 500
@@ -265,9 +297,8 @@ against 501 seeded, a cardinality mismatch that fails the run. The
 interlocutor/conversation fixture is seeded for all four — seeding it for one
 would have silently changed what the rest of the benchmark measures.
 
-The two scope reads are sequential and run *before* the `ReadGate`, so they add
-2 to **reads per turn** and nothing to **peak concurrent reads**, which stays at
-6. The turn's stopwatch opens before `resolveScope` and closes after
+The two scope reads are sequential and run _before_ the `ReadGate`, so they add
+2 to **reads per turn** and nothing to **peak concurrent reads**, which stays at 6. The turn's stopwatch opens before `resolveScope` and closes after
 `buildPrompt`, and that boundary is computed in exactly one place
 (`measureTurn`) precisely so it can be asserted rather than merely arranged:
 subtracting the stage from the turn's clock would restore the old coverage while
@@ -299,28 +330,28 @@ will later be judged against.
 
 What the gate decides (exit code 0/1), and why each one is there:
 
-| criterion | limit | why |
-|---|---|---|
-| p95 of context load | ≤ 600 ms | the owner's ceiling |
-| p99 of context load | ≤ 1 s | ditto |
-| errors, timeouts | 0 | a fast turn that fails is not a fast turn |
-| peak concurrent reads **per turn** | ≤ 6 | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate |
-| peak concurrent reads **reaches** 6 | = 6 | otherwise "fixed by serialising" would pass the row above |
-| `resolveScope` reads per turn | ≥ 1 (the count itself is measured and REPORTED, not fixed) | #700, rewritten by the #525 owner decision. 0 means the scope was fabricated in memory (or the fixture lost the tables). The old `= 2` upper bound would have failed the #693 fusion (`forPessoaComProfile`, one read) *by construction*; the N+1 it caught now falls to the O(1) row below, which sees an N+1 in **any** stage, not just the scope. The count comes from the same per-turn instrument as peak reads, so it asserts what *ran* |
-| statements per turn are O(1) in cardinality | count envelope at N=501 **equals** N=1, zero tolerance | the guardrail the owner kept when retiring the ≤8 target. The absolute ceiling (12, 13…) is a report line, not a criterion |
-| resolved scope size | 1–501, zero mismatches against the seeded cardinality | reads that happened and returned nothing are not a measurement; the 501 is one past the distinct-profile cap #738/#744 removed, so a permission dropped by a reintroduced batch cap shows up here as 500 ≠ 501 |
-| p95 of the `resolveScope` stage | ≤ 600 ms | deliberately conservative — eating the whole turn budget in the scope stage alone is pathological. The sharp defence is the total p95, which now includes the stage |
-| whole-turn budget (`resolveScope` + `buildPrompt`) | the scope-evidence rows above, on every arm | the aggregate #700 names. It reads the measured numbers, not the coverage flag |
-| distinct tenants concurrently in flight | ≥ 10 | the load must really be multi-tenant |
-| pool sampling actually observed the run | samples > 0, blind gap ≤ 10× `--sample-ms` | the criterion below is worthless without it — see the trap |
-| pool drains (**normal profile**, paced) | during load, never saturated 60 s straight | see the trap below |
-| pool drains (**saturation profile**, `--think-ms 0`) | after the producer stops | demanding it *during* load is arithmetically impossible — the owner's ruling |
-| `…load_duration_ms{phase="loader"}` observed every turn | count = turns | the gate defends the series the operator's alert reads |
-| p95 and p99 vs baseline | ≤ baseline × 1.10, **same fingerprint** | the MAIN criteria since the #525 decision. The margin is a named parameter (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`); 10 % because baseline and candidate are measured in the same window — the cross-day variance that justified the old +20 % is excluded by protocol |
-| throughput vs baseline | ≥ baseline × 0.90 | a "faster" turn that pays its p95 with queueing shows up here |
-| per-cardinality p95/p99 vs baseline | ≤ baseline × 1.10 at each of N=1/10/100/501 | a regression that lives only in the N=501 turns must not hide inside the arm aggregate |
-| load average around each arm | recorded before/after (report line) | the "same window and conditions" evidence the owner's protocol requires; on a 4-CPU host, load > 4 means do not measure |
-| load shape | 50 pairs, concurrency 20, 1/10/100/501 | a gate run on 4 tenants is not this gate |
+| criterion                                               | limit                                                      | why                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| p95 of context load                                     | ≤ 600 ms                                                   | the owner's ceiling                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| p99 of context load                                     | ≤ 1 s                                                      | ditto                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| errors, timeouts                                        | 0                                                          | a fast turn that fails is not a fast turn                                                                                                                                                                                                                                                                                                                                                                                                      |
+| peak concurrent reads **per turn**                      | ≤ 6                                                        | `TURN_CONTEXT_MAX_CONCURRENT_READS`, read from the code, never typed into the gate                                                                                                                                                                                                                                                                                                                                                             |
+| peak concurrent reads **reaches** 6                     | = 6                                                        | otherwise "fixed by serialising" would pass the row above                                                                                                                                                                                                                                                                                                                                                                                      |
+| `resolveScope` reads per turn                           | ≥ 1 (the count itself is measured and REPORTED, not fixed) | #700, rewritten by the #525 owner decision. 0 means the scope was fabricated in memory (or the fixture lost the tables). The old `= 2` upper bound would have failed the #693 fusion (`forPessoaComProfile`, one read) _by construction_; the N+1 it caught now falls to the O(1) row below, which sees an N+1 in **any** stage, not just the scope. The count comes from the same per-turn instrument as peak reads, so it asserts what _ran_ |
+| statements per turn are O(1) in cardinality             | count envelope at N=501 **equals** N=1, zero tolerance     | the guardrail the owner kept when retiring the ≤8 target. The absolute ceiling (12, 13…) is a report line, not a criterion                                                                                                                                                                                                                                                                                                                     |
+| resolved scope size                                     | 1–501, zero mismatches against the seeded cardinality      | reads that happened and returned nothing are not a measurement; the 501 is one past the distinct-profile cap #738/#744 removed, so a permission dropped by a reintroduced batch cap shows up here as 500 ≠ 501                                                                                                                                                                                                                                 |
+| p95 of the `resolveScope` stage                         | ≤ 600 ms                                                   | deliberately conservative — eating the whole turn budget in the scope stage alone is pathological. The sharp defence is the total p95, which now includes the stage                                                                                                                                                                                                                                                                            |
+| whole-turn budget (`resolveScope` + `buildPrompt`)      | the scope-evidence rows above, on every arm                | the aggregate #700 names. It reads the measured numbers, not the coverage flag                                                                                                                                                                                                                                                                                                                                                                 |
+| distinct tenants concurrently in flight                 | ≥ 10                                                       | the load must really be multi-tenant                                                                                                                                                                                                                                                                                                                                                                                                           |
+| pool sampling actually observed the run                 | samples > 0, blind gap ≤ 10× `--sample-ms`                 | the criterion below is worthless without it — see the trap                                                                                                                                                                                                                                                                                                                                                                                     |
+| pool drains (**normal profile**, paced)                 | during load, never saturated 60 s straight                 | see the trap below                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| pool drains (**saturation profile**, `--think-ms 0`)    | after the producer stops                                   | demanding it _during_ load is arithmetically impossible — the owner's ruling                                                                                                                                                                                                                                                                                                                                                                   |
+| `…load_duration_ms{phase="loader"}` observed every turn | count = turns                                              | the gate defends the series the operator's alert reads                                                                                                                                                                                                                                                                                                                                                                                         |
+| p95 and p99 vs baseline                                 | ≤ baseline × 1.10, **same fingerprint**                    | the MAIN criteria since the #525 decision. The margin is a named parameter (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`); 10 % because baseline and candidate are measured in the same window — the cross-day variance that justified the old +20 % is excluded by protocol                                                                                                                                                                 |
+| throughput vs baseline                                  | ≥ baseline × 0.90                                          | a "faster" turn that pays its p95 with queueing shows up here                                                                                                                                                                                                                                                                                                                                                                                  |
+| per-cardinality p95/p99 vs baseline                     | ≤ baseline × 1.10 at each of N=1/10/100/501                | a regression that lives only in the N=501 turns must not hide inside the arm aggregate                                                                                                                                                                                                                                                                                                                                                         |
+| load average around each arm                            | recorded before/after (report line)                        | the "same window and conditions" evidence the owner's protocol requires; on a 4-CPU host, load > 4 means do not measure                                                                                                                                                                                                                                                                                                                        |
+| load shape                                              | 50 pairs, concurrency 20, 1/10/100/501                     | a gate run on 4 tenants is not this gate                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 **The saturation trap.** Comparing "longest saturated streak < 60 s" and nothing
 else is a false green, and the first cut of this harness produced one: a 60.1 s
@@ -328,7 +359,7 @@ run reported 572 of 572 samples saturated — 100 % of the time — with a longe
 streak of 57.2 s, therefore "< 60 s", therefore green. The streak is bounded by
 the run's own length, so on its own that test only asks whether the run was
 short. The criterion is now what the sentence means: the pool must **drain** —
-`saturated_samples < samples`, an exact count — *and* never stay saturated for
+`saturated_samples < samples`, an exact count — _and_ never stay saturated for
 60 s straight.
 
 That exact count had its own hole: `samples === 0` was read as "drained". A run
@@ -338,7 +369,7 @@ with no observation at all. Observation is now a criterion of its own — zero
 samples fails, and so does a blind gap wider than 10× the requested period, ends
 included — and `--sample-ms` is validated against the window it has to resolve.
 The saturated streak is measured from **timestamps**, not by accumulating the
-requested period: `streak += periodMs` counts periods *asked for*, so a starved
+requested period: `streak += periodMs` counts periods _asked for_, so a starved
 sampler under-reports without bound, and it starves exactly when the machine is
 under the load worth measuring. Ten samples spread over 61 s used to read as
 "1 s saturated". The accounting lives in `createPoolSaturationTracker` +
@@ -346,7 +377,7 @@ under the load worth measuring. Ten samples spread over 61 s used to read as
 sampler to verdict is testable — fixing only the evaluator would leave `runArm`
 emitting `pool_samples: 0` with the spec green and the real run still lying.
 
-**The baseline fingerprint.** The file records the *shape* of the run that
+**The baseline fingerprint.** The file records the _shape_ of the run that
 produced the number, and an incompatible shape makes the comparison **refused**,
 not merely flagged: `pairs`, `concurrency`, `think_ms`, `identity`,
 `cardinalities`, `pool_max`, `max_concurrent_reads`, `turns`, `sustain_s`,
@@ -355,7 +386,7 @@ not merely flagged: `pairs`, `concurrency`, `think_ms`, `identity`,
 moves it just as hard — 600 turns (5.7 s) measured p95 118.6 ms where 60 s
 sustained (7 389 turns) measured 22.4 ms, same host and code minutes apart,
 because the warm-up transient is amortised over 12× more turns. Comparing across
-either manufactures a false green or a false red out of a change in *load*, not
+either manufactures a false green or a false red out of a change in _load_, not
 code. Host, Node version, `timeout_ms` and `sample_ms` are recorded but not
 compared — a fingerprint that invalidates the baseline every run is noise the
 operator learns to ignore. A pre-fingerprint file is refused too: it cannot prove
@@ -365,7 +396,7 @@ same command the gate runs**.
 **Two profiles, two drain criteria.** The owner settled the closed-loop
 arithmetic by splitting what each profile measures: the normal profile paces the
 load (`--think-ms 150`) and keeps the drain criterion as it was; the un-paced
-profile (`--think-ms 0`) becomes a *saturation test*, where zero errors/timeouts
+profile (`--think-ms 0`) becomes a _saturation test_, where zero errors/timeouts
 still holds but drainage is required **after the producer stops**, not while
 twenty turns are continuously replaced. So every run now has two phases — load
 and drain (`--drain-window-ms`, default 2 s) — with the boundary marked by
@@ -415,7 +446,7 @@ first when a run is red.
 Proving a gate is proving that it **rejects**.
 `tests/unit/scripts/turn-context-gate.spec.ts` feeds synthetic arm results into
 the pure `evaluateGate` and asserts a non-zero exit for each criterion —
-including the two that are easy to get backwards (a peak that is too *low*, and
+including the two that are easy to get backwards (a peak that is too _low_, and
 a pool that never drains inside a sub-60 s run). `--inject` is refused unless
 `--self-test` is also passed, so it cannot become a back door that turns the
 gate into a rubber stamp.
@@ -490,13 +521,13 @@ column, never a dropped tenant predicate.
 uma instrução diferente para `core.ts` — colapsar dois deles no mesmo valor é o
 defeito que a issue #545 destravou:
 
-| `kind` | O que aconteceu | O que `core.ts` faz |
-|---|---|---|
-| `no_pending` | não havia pendência aberta, ou a flag está desligada | turno normal (ReAct) |
-| `resolved` | esta mensagem resolveu a pendência; `resolveAndDispatch` já executou e auditou a ação | conclui: `completed` / `pending_action_resolved` |
-| `race_lost` | a mensagem foi classificada como RESPOSTA à pendência e **perdeu** a corrida para outra resposta | conclui: `ignored` / `pending_race_lost` — **sem ReAct** |
-| `cancelled` | a TENTATIVA perdeu a posse do turno (lease vencida / takeover) enquanto o gate rodava | lança `TurnOwnershipLostError('pending_gate')` — sai **sem concluir, sem retry, sem `processada_em`** |
-| `unresolved` | havia pendência, mas esta mensagem não a resolveu (`low_confidence`, `topic_change`) | turno normal (ReAct) |
+| `kind`       | O que aconteceu                                                                                  | O que `core.ts` faz                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `no_pending` | não havia pendência aberta, ou a flag está desligada                                             | turno normal (ReAct)                                                                                  |
+| `resolved`   | esta mensagem resolveu a pendência; `resolveAndDispatch` já executou e auditou a ação            | conclui: `completed` / `pending_action_resolved`                                                      |
+| `race_lost`  | a mensagem foi classificada como RESPOSTA à pendência e **perdeu** a corrida para outra resposta | conclui: `ignored` / `pending_race_lost` — **sem ReAct**                                              |
+| `cancelled`  | a TENTATIVA perdeu a posse do turno (lease vencida / takeover) enquanto o gate rodava            | lança `TurnOwnershipLostError('pending_gate')` — sai **sem concluir, sem retry, sem `processada_em`** |
+| `unresolved` | havia pendência, mas esta mensagem não a resolveu (`low_confidence`, `topic_change`)             | turno normal (ReAct)                                                                                  |
 
 **Por que `cancelled` é um `kind` e não um `unresolved`** (issue #507, revisão da
 PR #599). Ele não fala sobre a pendência: fala sobre a POSSE. Colapsá-lo em
@@ -563,8 +594,8 @@ disso. Ver [`runtime.md`](runtime.md) e o runbook
 ## Saída: o commit vem antes do canal (issue #631, fatia B da #506)
 
 `output-dispatch.ts` era o arquivo que a auditoria da #506 nomeou: o ledger em
-caminho **opcional e fail-open** (`claimOutboundLedgerOrFailOpen` — *"log the
-issue and proceed as if there's no prior row"*), e enviar e persistir separados
+caminho **opcional e fail-open** (`claimOutboundLedgerOrFailOpen` — _"log the
+issue and proceed as if there's no prior row"_), e enviar e persistir separados
 por uma janela de crash. Desde #631 a ordem de **todo** ramo é fixa:
 
 ```
@@ -610,42 +641,42 @@ transação única).
 
 ## How to extend
 
-| Need | Where |
-|---|---|
-| Add a new per-turn step | New file under `src/agent/`; wire into `core.ts` |
-| Add a new pending-question type | Extend `pending-questions.ts` (under `src/workflows/`); resolver in `pending-resolver.ts` |
-| Add a new outbound media type | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121) + o inventário de [`src/runtime/outbound/send-paths.ts`](../../../src/runtime/outbound/send-paths.ts), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
-| Change prompt structure | Edit `prompt-builder.ts`; keep `<user_message>` / `<ocr>` / `<audio_transcript>` delimiters for injection safety |
-| Add data to the prompt | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise |
+| Need                            | Where                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Add a new per-turn step         | New file under `src/agent/`; wire into `core.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Add a new pending-question type | Extend `pending-questions.ts` (under `src/workflows/`); resolver in `pending-resolver.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Add a new outbound media type   | Extend `output-dispatch.ts` + corresponding `lib/` adapter — **e** a união de payload em [`src/runtime/outbound/contract.ts`](../../../src/runtime/outbound/contract.ts) + o CHECK `outbound_messages_payload_type_check` (migração 121) + o inventário de [`src/runtime/outbound/send-paths.ts`](../../../src/runtime/outbound/send-paths.ts), na mesma PR. Um tipo que existe só no schema é row que nenhum worker entrega: `pending` eterno. A união só admite o que `LineOutput` (`src/gateway/line-output.ts`) declara como primitiva — por isso não há `image` nem `video` hoje |
+| Change prompt structure         | Edit `prompt-builder.ts`; keep `<user_message>` / `<ocr>` / `<audio_transcript>` delimiters for injection safety                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Add data to the prompt          | Load it in `turn-context/loader.ts` (never from a render helper), add it to `TurnContextSnapshot`, then render it. Bump `TURN_ROUND_TRIP_BUDGET` and the counts in `turn-context-round-trips.spec.ts` — a new read must be a reviewed increase, not a surprise                                                                                                                                                                                                                                                                                                                        |
 
 ## Public surface
 
-| Consumed by | What |
-|---|---|
+| Consumed by    | What                                                                |
+| -------------- | ------------------------------------------------------------------- |
 | `src/gateway/` | `src/gateway/queue.ts` workers invoke `core.ts` per inbound message |
-| `src/workers/` | Some workers re-enter the agent for proactive turns |
+| `src/workers/` | Some workers re-enter the agent for proactive turns                 |
 
 ## Tests
 
-| Test path | What it covers |
-|---|---|
-| `tests/unit/turn-context-round-trips.spec.ts` | The round-trip budget: exact counts, the named read set, and that the renderer costs zero |
-| `tests/unit/turn-context-statement-count.spec.ts` | The same budget counted in SQL STATEMENTS (real repos + real drizzle, only `pg` faked), plus tenant+agent scoping on every statement |
-| `tests/unit/turn-context-renderer-purity.spec.ts` | The renderer runs with every repository rigged to throw |
-| `tests/unit/turn-context-baseline.spec.ts` | Zero slope + `resolveScope` batching and its cross-tenant counterfactual |
-| `tests/unit/turn-context-read-gate.spec.ts` | The semaphore's contract: ceiling, FIFO order, permit released on rejection |
-| `tests/integration/turn-context-pool-fairness.spec.ts` | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness |
-| `tests/integration/turn-context-scope-cardinality.spec.ts` | 501 entities on one profile: every name rendered, no UUID in the prompt |
-| `tests/unit/scripts/turn-context-gate.spec.ts` | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1 |
-| `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts` | That the gate MEASURES the `resolveScope` stage (#700): a real turn through the production `resolveScope`, counted by the harness's own per-turn instrument, red when the scope goes back to being fabricated in memory — and that the stage is inside the turn's CLOCK (`measureTurn` is the single place the turn's duration is computed; the spec pins the arithmetic with an injected clock and with a real one) |
-| `scripts/turn-context-benchmark.ts` (`npm run turn:bench`) | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm, `resolveScope` + `buildPrompt`. See the gate section above |
-| `tests/unit/pending-gate.spec.ts` | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado |
-| `tests/integration/pending-gate-concurrency.spec.ts` | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562) |
-| `tests/integration/pending-race-lost-terminal.spec.ts` | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta |
+| Test path                                                         | What it covers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/unit/turn-context-round-trips.spec.ts`                     | The round-trip budget: exact counts, the named read set, and that the renderer costs zero                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `tests/unit/turn-context-statement-count.spec.ts`                 | The same budget counted in SQL STATEMENTS (real repos + real drizzle, only `pg` faked), plus tenant+agent scoping on every statement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `tests/unit/turn-context-renderer-purity.spec.ts`                 | The renderer runs with every repository rigged to throw                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `tests/unit/turn-context-baseline.spec.ts`                        | Zero slope + `resolveScope` batching and its cross-tenant counterfactual                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `tests/unit/turn-context-read-gate.spec.ts`                       | The semaphore's contract: ceiling, FIFO order, permit released on rejection                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `tests/integration/turn-context-pool-fairness.spec.ts`            | Two concurrent turns on the real pool: peak ≤ 6, peak = 6, fairness                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `tests/integration/turn-context-scope-cardinality.spec.ts`        | 501 entities on one profile: every name rendered, no UUID in the prompt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `tests/unit/scripts/turn-context-gate.spec.ts`                    | That the performance gate REJECTS: one injected value per acceptance criterion, each asserted to produce exit 1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tests/unit/scripts/turn-context-resolve-scope-medido.spec.ts`    | That the gate MEASURES the `resolveScope` stage (#700): a real turn through the production `resolveScope`, counted by the harness's own per-turn instrument, red when the scope goes back to being fabricated in memory — and that the stage is inside the turn's CLOCK (`measureTurn` is the single place the turn's duration is computed; the spec pins the arithmetic with an injected clock and with a real one)                                                                                                                                                                                                                                                                                                      |
+| `scripts/turn-context-benchmark.ts` (`npm run turn:bench`)        | Not a spec — the measurement itself. Real Postgres, 50 pairs, concurrency 20, cold/warm, `resolveScope` + `buildPrompt`. See the gate section above                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `tests/unit/pending-gate.spec.ts`                                 | Cada desfecho do `GateResult`, inclusive as três races (resolução, cancelamento, topic change) e o `stage` auditado                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `tests/integration/pending-gate-concurrency.spec.ts`              | Duas resoluções paralelas contra a MESMA pendência: exatamente um despacho e exatamente um `pending_race_lost`, lidos no banco (#545 / PR #562)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `tests/integration/pending-race-lost-terminal.spec.ts`            | O DESTINO da perna perdedora: `runAgentForMensagem` real termina em `ignored`/`pending_race_lost`, sem ReAct e sem resposta                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `tests/integration/turn-lease-lost-turn-pipeline-real-db.spec.ts` | O desfecho `cancelled` e os guards a jusante: perda de posse real (claim SQL → takeover → heartbeat → `AbortSignal`) no gate, no hook de scheduling, no grafo pre-turn (inclusive entre a decisão do selector e o `startExecution`) e no Decision Engine, provando ausência de mutação e de resposta em cada um — e QUAL limite recusou, via `maia_turn_effect_blocked_total{boundary}`. O DESFECHO do turno é lido em `agent_turns` + `agent_turn_inputs` (não em `processada_em`, que sob o regime autoritativo só existe em turno terminal): o CONTROLE exige que o DONO tenha fechado a tentativa, e cada barreira exige que a última gravação da linha seja a do SUCESSOR — `state_version` intacta desde o takeover |
-| `tests/unit/prompt-injection.spec.ts` | Sanitization wraps user content in delimiters |
-| `tests/unit/agent/` | Per-step contracts |
-| `tests/integration/turn-flow.spec.ts` (if present) | End-to-end turn |
+| `tests/unit/prompt-injection.spec.ts`                             | Sanitization wraps user content in delimiters                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `tests/unit/agent/`                                               | Per-step contracts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `tests/integration/turn-flow.spec.ts` (if present)                | End-to-end turn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## In-flight changes
 
@@ -670,7 +701,7 @@ Verify: `gh pr list --state open --search "agent OR react OR turn"`.
 
 ---
 
-| | |
-|---|---|
-| Last verified | 2026-08-24 |
+|                     |            |
+| ------------------- | ---------- |
+| Last verified       | 2026-08-24 |
 | Against `main` HEAD | `c49c3855` |

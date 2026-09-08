@@ -53,6 +53,12 @@ export interface RunDecisionEngineResult {
   skip_reason?: 'engine_error';
 }
 
+/** Production wrapper contract: the always-on engine either returns a packet or throws. */
+export type RunDecisionEngineForTurnResult = {
+  engine_ran: true;
+  result: DecisionEngineResult;
+};
+
 /**
  * Thrown by `runDecisionEngineForTurn` when the engine errors. The engine is
  * always-on with no legacy fallback, so an engine error fails closed: callers
@@ -168,7 +174,7 @@ export function _overrideDecisionEngineSingleton(
  */
 export async function runDecisionEngineForTurn(
   base: BaseContextPacket,
-): Promise<RunDecisionEngineResult> {
+): Promise<RunDecisionEngineForTurnResult> {
   const t0 = Date.now();
   let result: DecisionEngineResult;
   /**

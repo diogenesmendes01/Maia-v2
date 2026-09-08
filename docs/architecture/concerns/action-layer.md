@@ -15,7 +15,7 @@ Every side-effect in the system passes through this layer. There is no shortcut.
 
 ## 2. Why it matters
 
-This is what makes the system **auditable across operational roles**. *"The model decided"* is never a defensible audit trail; *"the rule in `governance/rules.ts:42` was applied to typed payload X by skill Y under policy Z"* is. The action layer turns LLM nondeterminism into governed, replayable, typed execution whether the agent is handling finance, sales, support, backoffice, or another tenant-defined role.
+This is what makes the system **auditable across operational roles**. _"The model decided"_ is never a defensible audit trail; _"the rule in `governance/rules.ts:42` was applied to typed payload X by skill Y under policy Z"_ is. The action layer turns LLM nondeterminism into governed, replayable, typed execution whether the agent is handling finance, sales, support, backoffice, or another tenant-defined role.
 
 It is also where idempotency lives. Tools carry idempotency keys; the engine deduplicates by key before executing. A network retry, a worker re-delivery, or an LLM hallucinating the same tool call twice all converge to one execution.
 
@@ -23,44 +23,44 @@ It is also where idempotency lives. Tools carry idempotency keys; the engine ded
 
 ### Decision engine (`src/runtime/decision/`)
 
-| File | Role |
-|---|---|
-| `src/runtime/decision/decision-engine.ts` | Engine entry — orchestrates selection + execution |
-| `src/runtime/decision/action-decider.ts` | Routes turns to skill / tool / procedure / fallback |
-| `src/runtime/decision/skill-selector.ts` | Selects the candidate skill for a turn |
-| `src/runtime/decision/skill-match.ts` | Strict match scoring (threshold `>`, not `>=`) |
-| `src/runtime/decision/agent-selector.ts` | Selects which agent answers (single-agent today via channel policy; `MULTI_AGENT_SELECTOR_V2` flag reserved) |
-| `src/runtime/decision/workflow-selector.ts` | Routes to workflows (dual-approval, pending questions) |
-| `src/runtime/decision/intent-classifier.ts` | Intent classification step |
-| `src/runtime/decision/turn-risk-scorer.ts` | Pre-execution risk score for the turn |
-| `src/runtime/decision/risk-scorer.ts` | Generic risk-scoring primitives |
-| `src/runtime/decision/early-pep.ts` / `mid-pep.ts` | Policy enforcement points (PEP) before / mid execution |
-| `src/runtime/decision/pep-audit.ts` | Per-PEP audit emission |
-| `src/runtime/decision/integration.ts` | Wires engine into agent loop |
-| `src/runtime/decision/types.ts` | Shared types for engine input/output |
+| File                                               | Role                                                                                                         |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `src/runtime/decision/decision-engine.ts`          | Engine entry — orchestrates selection + execution                                                            |
+| `src/runtime/decision/action-decider.ts`           | Routes turns to skill / tool / procedure / fallback                                                          |
+| `src/runtime/decision/skill-selector.ts`           | Selects the candidate skill for a turn                                                                       |
+| `src/runtime/decision/skill-match.ts`              | Strict match scoring (threshold `>`, not `>=`)                                                               |
+| `src/runtime/decision/agent-selector.ts`           | Selects which agent answers (single-agent today via channel policy; `MULTI_AGENT_SELECTOR_V2` flag reserved) |
+| `src/runtime/decision/workflow-selector.ts`        | Routes to workflows (dual-approval, pending questions)                                                       |
+| `src/runtime/decision/intent-classifier.ts`        | Intent classification step                                                                                   |
+| `src/runtime/decision/turn-risk-scorer.ts`         | Pre-execution risk score for the turn                                                                        |
+| `src/runtime/decision/risk-scorer.ts`              | Generic risk-scoring primitives                                                                              |
+| `src/runtime/decision/early-pep.ts` / `mid-pep.ts` | Policy enforcement points (PEP) before / mid execution                                                       |
+| `src/runtime/decision/pep-audit.ts`                | Per-PEP audit emission                                                                                       |
+| `src/runtime/decision/integration.ts`              | Wires engine into agent loop                                                                                 |
+| `src/runtime/decision/types.ts`                    | Shared types for engine input/output                                                                         |
 
 ### Context packet (`src/runtime/context-packet/`, `src/runtime/context-assembly/`)
 
-| File | Role |
-|---|---|
-| `src/runtime/context-packet/build-context-packet.ts` | Assembles context packet from slices |
-| `src/runtime/context-packet/base-context-builder.ts` | Base context builder |
-| `src/runtime/context-packet/production-builder-set.ts` | Production wiring with real `OperationalProfilePort` |
-| `src/runtime/context-assembly/slice-builders/*.ts` | One builder per slice: identity, knowledge, policy, skill, soul, tool, user |
-| `src/runtime/context-packet/cache/slice-cache.ts` | Per-slice cache with tenant-scoped keys |
+| File                                                   | Role                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `src/runtime/context-packet/build-context-packet.ts`   | Assembles context packet from slices                                        |
+| `src/runtime/context-packet/base-context-builder.ts`   | Base context builder                                                        |
+| `src/runtime/context-packet/production-builder-set.ts` | Production wiring with real `OperationalProfilePort`                        |
+| `src/runtime/context-assembly/slice-builders/*.ts`     | One builder per slice: identity, knowledge, policy, skill, soul, tool, user |
+| `src/runtime/context-packet/cache/slice-cache.ts`      | Per-slice cache with tenant-scoped keys                                     |
 
 ### Skills (`src/skills/`)
 
-| File | Role |
-|---|---|
-| `src/skills/skill-runner.ts` | `runSkill()` — universal skill execution entry |
-| `src/skills/skill-slice-builder.ts` | Builds the skill's runtime slice from definition |
-| `src/skills/cache.ts` | Skill result caching |
-| `src/skills/modes/prompt-only.ts` | Mode: LLM-only execution (no external tools) |
-| `src/skills/modes/evaluator.ts` | Mode: LLM-as-judge evaluation |
-| `src/skills/modes/tool-mediated.ts` | Mode: skill invokes tools through the registry |
-| `src/skills/modes/procedure-adapter.ts` | Mode: skill drives a procedure execution |
-| `src/skills/index.ts` | Public surface |
+| File                                    | Role                                             |
+| --------------------------------------- | ------------------------------------------------ |
+| `src/skills/skill-runner.ts`            | `runSkill()` — universal skill execution entry   |
+| `src/skills/skill-slice-builder.ts`     | Builds the skill's runtime slice from definition |
+| `src/skills/cache.ts`                   | Skill result caching                             |
+| `src/skills/modes/prompt-only.ts`       | Mode: LLM-only execution (no external tools)     |
+| `src/skills/modes/evaluator.ts`         | Mode: LLM-as-judge evaluation                    |
+| `src/skills/modes/tool-mediated.ts`     | Mode: skill invokes tools through the registry   |
+| `src/skills/modes/procedure-adapter.ts` | Mode: skill drives a procedure execution         |
+| `src/skills/index.ts`                   | Public surface                                   |
 
 ### Tools (`src/tools/`)
 
@@ -68,16 +68,16 @@ Tools are Zod-typed functions registered via `src/tools/_registry.ts`. Each tool
 
 ### Procedures (`src/procedures/`)
 
-| File | Role |
-|---|---|
-| `src/procedures/engine.ts` | Stateful procedure execution engine |
-| `src/procedures/test-runner.ts` | Test runner for procedure definitions |
-| `src/procedures/` (other) | Event-sourced state machines with success criteria |
+| File                            | Role                                               |
+| ------------------------------- | -------------------------------------------------- |
+| `src/procedures/engine.ts`      | Stateful procedure execution engine                |
+| `src/procedures/test-runner.ts` | Test runner for procedure definitions              |
+| `src/procedures/` (other)       | Event-sourced state machines with success criteria |
 
 ### Guardrails (`src/runtime/guardrails/`)
 
-| File | Role |
-|---|---|
+| File                                 | Role                                            |
+| ------------------------------------ | ----------------------------------------------- |
 | `src/runtime/guardrails/late-pep.ts` | Late policy enforcement (post-execution checks) |
 
 ## 4. Patterns
@@ -92,11 +92,11 @@ Selected skill then runs via `runSkill()` in `skill-runner.ts` — uniform entry
 
 Risk and policy are checked at three points:
 
-| PEP | When | Job |
-|---|---|---|
-| **Early PEP** | Before skill selection | Reject turns that hit hard limits (rate, scope, lockdown) |
-| **Mid PEP** | After selection, before execution | Validate the selected skill is allowed for this `(agent, role, channel)` |
-| **Late PEP** | After execution | Validate the outcome doesn't violate post-conditions |
+| PEP           | When                              | Job                                                                      |
+| ------------- | --------------------------------- | ------------------------------------------------------------------------ |
+| **Early PEP** | Before skill selection            | Reject turns that hit hard limits (rate, scope, lockdown)                |
+| **Mid PEP**   | After selection, before execution | Validate the selected skill is allowed for this `(agent, role, channel)` |
+| **Late PEP**  | After execution                   | Validate the outcome doesn't violate post-conditions                     |
 
 Each PEP emits its own audit row via `pep-audit.ts`. A turn that succeeds touches three audit rows minimum.
 
@@ -117,32 +117,49 @@ Tools carry an `idempotency_key`. The governance idempotency cache (`src/governa
 
 This handles: network retry, BullMQ re-delivery, LLM emitting the same call twice in one turn, user repeating an action.
 
-### 4.5 Slice-builders for context
+### 4.5 Durable outbound barrier
+
+Once the live `TurnHandle` moves to `outbound_pending`, durable state outranks
+the physical error classification. `not_sent` means only that the channel call
+was classified as pre-send; it does not prove that the outbound artifact was
+never committed. In that state, rate-limit and `execute_skill` paths must not
+terminalize with an incompatible outcome or fall through to ReAct. The error
+propagates and the worker releases its lease. When outbound recovery and turn
+claims are enabled and the row has a claim/lease, recovery takes over after the
+lease expires; otherwise the turn remains `outbound_pending` fail-closed for
+operator diagnosis.
+
+This distinction matters because `safeDispatchOutput` intentionally describes
+transport/persistence, while the turn handle describes authority. Both are
+needed to decide whether another model response is safe.
+
+### 4.6 Slice-builders for context
 
 The context packet (`src/runtime/context-packet/`) is assembled from independent slices (`identity`, `knowledge`, `policy`, `skill`, `soul`, `tool`, `user`). Each slice has its own builder and its own cache. A slice can be invalidated (via `invalidation-bus.ts`) without rebuilding the entire packet. This keeps the per-turn cost bounded as the system's persistent state grows.
 
 ## 5. Anti-patterns
 
-| Pattern | Why it's wrong |
-|---|---|
-| Tool that does a side-effect without idempotency key | Re-deliveries cause double-execution. Every side-effecting tool needs a key. |
-| LLM returning the "final" response that contains numbers/decisions | Decisions are backend; the LLM formats from backend results. Never lets the LLM decide an amount, account, party, or status. |
-| Skill bypassing PEP because "I know it's safe" | Late PEP exists for outcomes you can't predict at selection time. Always emit. |
-| Tool registered outside `_registry.ts` | The registry is the single source of truth for callable surface. Off-registry tools are not auditable. |
-| Procedure step that mutates state outside the engine | The engine's event-sourcing is what makes procedures replayable. Side-channel mutation breaks replay. |
-| Match threshold of `>=` instead of `>` | Allows LLM intents that score exactly at the gate to execute. Use `>` (strict). See `skill-match.ts`. |
-| Skill returning data the LLM uses to make a follow-up decision | The skill returns to the LLM the *result*; the LLM formats. If the LLM is going to make another decision from the result, that's another turn through the engine. |
+| Pattern                                                                                  | Why it's wrong                                                                                                                                                         |
+| ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tool that does a side-effect without idempotency key                                     | Re-deliveries cause double-execution. Every side-effecting tool needs a key.                                                                                           |
+| LLM returning the "final" response that contains numbers/decisions                       | Decisions are backend; the LLM formats from backend results. Never lets the LLM decide an amount, account, party, or status.                                           |
+| Skill bypassing PEP because "I know it's safe"                                           | Late PEP exists for outcomes you can't predict at selection time. Always emit.                                                                                         |
+| Tool registered outside `_registry.ts`                                                   | The registry is the single source of truth for callable surface. Off-registry tools are not auditable.                                                                 |
+| Procedure step that mutates state outside the engine                                     | The engine's event-sourcing is what makes procedures replayable. Side-channel mutation breaks replay.                                                                  |
+| Match threshold of `>=` instead of `>`                                                   | Allows LLM intents that score exactly at the gate to execute. Use `>` (strict). See `skill-match.ts`.                                                                  |
+| Skill returning data the LLM uses to make a follow-up decision                           | The skill returns to the LLM the _result_; the LLM formats. If the LLM is going to make another decision from the result, that's another turn through the engine.      |
+| Falling through to ReAct after a dispatch failure without checking the live `TurnHandle` | A first reply may already be committed in the outbox even when the physical send is classified `not_sent`; a second response would violate the durable commit barrier. |
 
 ## 6. Tests
 
-| Test path | What it proves |
-|---|---|
-| `tests/unit/skills/` | Per-mode skill runner contracts |
-| `tests/integration/skill-execution.spec.ts` (if present) | End-to-end skill execution |
-| `tests/unit/decision/skill-match.spec.ts` | Strict `>` threshold |
-| `tests/unit/action-decider/` | Routing decisions |
-| `tests/unit/governance/idempotency.spec.ts` | Idempotency cache behavior |
-| `tests/unit/skills-repo-cross-tenant.spec.ts` | Skill catalog stays tenant-scoped |
+| Test path                                                | What it proves                    |
+| -------------------------------------------------------- | --------------------------------- |
+| `tests/unit/skills/`                                     | Per-mode skill runner contracts   |
+| `tests/integration/skill-execution.spec.ts` (if present) | End-to-end skill execution        |
+| `tests/unit/decision/skill-match.spec.ts`                | Strict `>` threshold              |
+| `tests/unit/action-decider/`                             | Routing decisions                 |
+| `tests/unit/governance/idempotency.spec.ts`              | Idempotency cache behavior        |
+| `tests/unit/skills-repo-cross-tenant.spec.ts`            | Skill catalog stays tenant-scoped |
 
 ## 7. Known gaps
 
@@ -182,8 +199,8 @@ Verify with `gh pr list --state open --search "skill OR decision OR action"`.
 
 ---
 
-| | |
-|---|---|
-| Last verified | 2026-05-28 |
-| Against `main` HEAD | `c49c3855` |
-| Re-verify when | Older than 30 days; OR a new skill mode is added under `src/skills/modes/`; OR `decision-engine.ts` changes its PEP order; OR `_registry.ts` changes the tool contract |
+|                     |                                                                                                                                                                        |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Last verified       | 2026-05-28                                                                                                                                                             |
+| Against `main` HEAD | `c49c3855`                                                                                                                                                             |
+| Re-verify when      | Older than 30 days; OR a new skill mode is added under `src/skills/modes/`; OR `decision-engine.ts` changes its PEP order; OR `_registry.ts` changes the tool contract |

@@ -2,7 +2,7 @@
  * Issue #633 (fatia D da épica #506) — a VARREDURA de recuperação do outbox
  * durável.
  *
- * Quatro operações por tick, por (tenant, agent):
+ * Cinco operações por tick, por (tenant, agent):
  *
  *  (A) REARMAR o trabalho entregável — `pending`/`retryable` com o gate de
  *      backoff vencido, e `claimed`/`sending` com lease morta (takeover). O job
@@ -12,7 +12,9 @@
  *      `delivered -> completed` que a #632 declarou. É o produto principal da
  *      fatia, e não um caso de borda.
  *  (C) DLQ — teto de tentativas e prazo de reconciliação vencido, auditados.
- *  (D) DIVERGÊNCIA turno↔outbound, nos DOIS sentidos. Observação, nunca
+ *  (D) CONVERGIR `agent_turns` quando a lease morreu e TODAS as partes do
+ *      outbox chegaram a estado final, com ao menos uma entrega concluída.
+ *  (E) DIVERGÊNCIA turno↔outbound, nos DOIS sentidos. Observação, nunca
  *      correção.
  *
  * ─── Por que múltiplos sweepers concorrentes não duplicam ───────────────────
@@ -70,6 +72,10 @@ import {
   type OutboundProviderChannel,
 } from '@/runtime/outbound/contract.js';
 import { buildHistoricoFromArtifact } from '@/runtime/outbound/historico.js';
+import {
+  noteNoSuccessor,
+  signalStreamPromotion,
+} from '@/runtime/turns/stream-promotion.js';
 
 /** O canal de egresso desta fatia — fechado, como em `delivery.ts`. */
 const EGRESS_CHANNEL: OutboundProviderChannel = 'whatsapp';
@@ -103,6 +109,8 @@ const SWEEP_LIMIT_PER_SCOPE = 200;
  */
 const lastPendingAge = new Map<string, number>();
 const registeredGauges = new Set<string>();
+const lastNoSuccessPending = new Map<string, number>();
+const registeredNoSuccessGauges = new Set<string>();
 
 function scopeKey(s: RecoveryScope): string {
   // Enquadramento por prefixo de comprimento, e nao um separador solto:
@@ -117,22 +125,44 @@ function publishPendingAge(scope: RecoveryScope, seconds: number): void {
   lastPendingAge.set(key, seconds);
   if (registeredGauges.has(key)) return;
   registeredGauges.add(key);
-  gauge(METRIC.OUTBOUND_PENDING_AGE_SECONDS, () => lastPendingAge.get(key) ?? 0, {
-    tenant_id: scope.tenant_id,
-    agent_id: scope.agent_id,
-  });
+  gauge(
+    METRIC.OUTBOUND_PENDING_AGE_SECONDS,
+    () => lastPendingAge.get(key) ?? 0,
+    {
+      tenant_id: scope.tenant_id,
+      agent_id: scope.agent_id,
+    },
+  );
+}
+
+function publishNoSuccessPending(scope: RecoveryScope, pending: number): void {
+  const key = scopeKey(scope);
+  lastNoSuccessPending.set(key, pending);
+  if (registeredNoSuccessGauges.has(key)) return;
+  registeredNoSuccessGauges.add(key);
+  gauge(
+    METRIC.OUTBOUND_TURN_NO_SUCCESS_PENDING,
+    () => lastNoSuccessPending.get(key) ?? 0,
+    {
+      tenant_id: scope.tenant_id,
+      agent_id: scope.agent_id,
+    },
+  );
 }
 
 /** Só para teste: esquece as séries registradas entre casos. */
 export function __resetOutboundRecoveryGaugesForTest(): void {
   lastPendingAge.clear();
   registeredGauges.clear();
+  lastNoSuccessPending.clear();
+  registeredNoSuccessGauges.clear();
 }
 
 type SweepStats = {
   rearmed: number;
   reconciled: Record<ReconciliationResult, number>;
   dead_lettered: number;
+  no_success_pending: number;
 };
 
 function emptyReconciled(): Record<ReconciliationResult, number> {
@@ -144,6 +174,7 @@ function emptyReconciled(): Record<ReconciliationResult, number> {
     noop: 0,
     history_recovered: 0,
     history_fabricated: 0,
+    turn_finalized: 0,
   };
 }
 
@@ -178,7 +209,9 @@ function recordReconciliation(
  * chega à DLQ dizendo a verdade sobre si.
  */
 async function sweepDeliverable(stats: SweepStats): Promise<void> {
-  const candidates = await outboundRecoveryRepo.listDeliverable(SWEEP_LIMIT_PER_SCOPE);
+  const candidates = await outboundRecoveryRepo.listDeliverable(
+    SWEEP_LIMIT_PER_SCOPE,
+  );
   for (const row of candidates) {
     if (attemptBudgetExhausted(row.attempt) && row.status !== 'sending') {
       await deadLetter(row, 'attempt_limit', stats);
@@ -191,7 +224,7 @@ async function sweepDeliverable(stats: SweepStats): Promise<void> {
     } catch (err) {
       // Redis fora do ar não perde trabalho: a ROW continua elegível e o
       // próximo tick tenta de novo. Falhar o tick inteiro por causa de uma
-      // linha faria as outras três operações pararem junto.
+      // linha faria as outras quatro operações pararem junto.
       logger.warn(
         { outbound_id: row.outbound_id, err: (err as Error).message },
         'outbound_recovery.rearm_failed',
@@ -208,7 +241,9 @@ async function sweepDeliverable(stats: SweepStats): Promise<void> {
  * histórico, e recuperá-lo é uma leitura + uma transição, sem tocar o provedor.
  */
 async function sweepReconciliation(stats: SweepStats): Promise<void> {
-  const candidates = await outboundRecoveryRepo.listReconciliation(SWEEP_LIMIT_PER_SCOPE);
+  const candidates = await outboundRecoveryRepo.listReconciliation(
+    SWEEP_LIMIT_PER_SCOPE,
+  );
   for (const row of candidates) {
     if (row.status === 'delivered') {
       await reconcileDelivered(row, stats);
@@ -293,7 +328,9 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
         // "ficou incerta por 24h" (olhe o provedor).
         await deadLetter(
           row,
-          attemptBudgetExhausted(row.attempt) ? 'attempt_limit' : 'reconciliation_timeout',
+          attemptBudgetExhausted(row.attempt)
+            ? 'attempt_limit'
+            : 'reconciliation_timeout',
           stats,
         );
         break;
@@ -303,6 +340,46 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
         break;
       }
     }
+  }
+}
+
+/**
+ * (D) CONVERGIR o turno depois que TODAS as partes do outbox fecharam.
+ *
+ * Esta fase é separada da reconciliação por artefato para preservar multipart:
+ * concluir ao fechar a posição 0 poderia impedir o produtor vivo de commitar a
+ * posição 1. O repositório exige lease do turno expirada, bloqueia o turno e
+ * relê todas as partes antes de terminalizar.
+ */
+async function sweepTurnFinalization(stats: SweepStats): Promise<void> {
+  const candidates = await outboundRecoveryRepo.listFinalizableTurns(
+    SWEEP_LIMIT_PER_SCOPE,
+  );
+  for (const candidate of candidates) {
+    const finalized = await outboundRecoveryRepo.finalizeResolvedTurnTx(
+      candidate.turn_id,
+    );
+    if (!finalized.finalized) continue;
+
+    recordReconciliation(stats, 'turn_finalized');
+    if (!finalized.transition.promotion) {
+      noteNoSuccessor();
+      continue;
+    }
+    await signalStreamPromotion(finalized.transition.promotion, {
+      source: 'outbound_recovery',
+      promoted_by_turn_id: finalized.transition.turn.id,
+    });
+  }
+
+  stats.no_success_pending =
+    await outboundRecoveryRepo.countFinalTurnsWithoutSuccess();
+  if (stats.no_success_pending > 0) {
+    logger.warn(
+      { pending_turns: stats.no_success_pending },
+      'outbound_recovery.turns_final_without_success — estado agregado; ' +
+        'nenhuma entrega foi comprovada e os turnos permanecem outbound_pending',
+    );
   }
 }
 
@@ -354,7 +431,9 @@ async function reconcileDelivered(
     recordReconciliation(stats, 'await_grace');
     return;
   }
-  const artefato = await outboundRecoveryRepo.artifactForHistoryRecovery(row.outbound_id);
+  const artefato = await outboundRecoveryRepo.artifactForHistoryRecovery(
+    row.outbound_id,
+  );
   if (!artefato) {
     recordReconciliation(stats, 'noop');
     return;
@@ -370,11 +449,16 @@ async function reconcileDelivered(
   if (hasHistory) {
     // O histórico está lá (caminho síncrono, ou uma tentativa anterior desta
     // mesma reconciliação). Só o ESTADO ficou para trás.
-    const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx({
-      outbound_id: row.outbound_id,
-      ...correlation,
-    });
-    recordReconciliation(stats, completed.completed ? 'history_recovered' : 'noop');
+    const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx(
+      {
+        outbound_id: row.outbound_id,
+        ...correlation,
+      },
+    );
+    recordReconciliation(
+      stats,
+      completed.completed ? 'history_recovered' : 'noop',
+    );
     return;
   }
 
@@ -388,7 +472,11 @@ async function reconcileDelivered(
     // exatamente o que a épica proíbe. A linha fica `delivered` e visível.
     recordReconciliation(stats, 'escalate_manual');
     logger.error(
-      { outbound_id: row.outbound_id, payload_type: row.payload_type, ops_alert: true },
+      {
+        outbound_id: row.outbound_id,
+        payload_type: row.payload_type,
+        ops_alert: true,
+      },
       'outbound_recovery.history_unrecoverable_invalid_payload — o payload persistido não ' +
         'satisfaz mais a união de #630; o histórico NÃO pode ser projetado. NÃO reenviar. ' +
         'Ver docs/runbooks/outbound-recovery.md',
@@ -460,7 +548,11 @@ async function deadLetter(
     // `attempt_limit` nasce nos dois (na varredura entregável e na
     // reconciliação), e `sending` não está em nenhuma das duas — ver a exceção
     // documentada em `sweepDeliverable`.
-    from_statuses: DEAD_LETTER_SOURCES[row.status] ?? ['pending', 'retryable', 'claimed'],
+    from_statuses: DEAD_LETTER_SOURCES[row.status] ?? [
+      'pending',
+      'retryable',
+      'claimed',
+    ],
     reason,
     attempt: row.attempt,
     delivery_outcome: row.delivery_outcome,
@@ -486,7 +578,7 @@ async function deadLetter(
 }
 
 /**
- * (D) DIVERGÊNCIA turno↔outbound, nos dois sentidos.
+ * (E) DIVERGÊNCIA turno↔outbound, nos dois sentidos.
  *
  * OBSERVAÇÃO, nunca correção — e a razão é assimétrica:
  *
@@ -540,11 +632,21 @@ async function sweepDivergence(scope: RecoveryScope): Promise<void> {
 export async function runOutboundRecoveryForScope(
   scope: RecoveryScope,
 ): Promise<SweepStats> {
-  const stats: SweepStats = { rearmed: 0, reconciled: emptyReconciled(), dead_lettered: 0 };
+  const stats: SweepStats = {
+    rearmed: 0,
+    reconciled: emptyReconciled(),
+    dead_lettered: 0,
+    no_success_pending: 0,
+  };
   await sweepDeliverable(stats);
   await sweepReconciliation(stats);
+  await sweepTurnFinalization(stats);
+  publishNoSuccessPending(scope, stats.no_success_pending);
   await sweepDivergence(scope);
-  publishPendingAge(scope, await outboundRecoveryRepo.oldestPendingAgeSeconds());
+  publishPendingAge(
+    scope,
+    await outboundRecoveryRepo.oldestPendingAgeSeconds(),
+  );
   return stats;
 }
 
@@ -570,6 +672,7 @@ export async function runOutboundRecovery(): Promise<void> {
 
   let rearmed = 0;
   let deadLettered = 0;
+  let noSuccessPending = 0;
   const reconciled = emptyReconciled();
   let scopesProcessed = 0;
   let scopesFailed = 0;
@@ -581,6 +684,7 @@ export async function runOutboundRecovery(): Promise<void> {
       );
       rearmed += stats.rearmed;
       deadLettered += stats.dead_lettered;
+      noSuccessPending += stats.no_success_pending;
       for (const k of Object.keys(reconciled) as ReconciliationResult[]) {
         reconciled[k] += stats.reconciled[k];
       }
@@ -601,6 +705,7 @@ export async function runOutboundRecovery(): Promise<void> {
       scopes_failed: scopesFailed,
       rearmed,
       dead_lettered: deadLettered,
+      no_success_pending: noSuccessPending,
       ...reconciled,
     },
     'outbound_recovery.done',

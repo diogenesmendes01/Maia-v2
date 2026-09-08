@@ -28,6 +28,10 @@ const dispatchTool = vi.fn();
 const callLLM = vi.fn();
 const buildPrompt = vi.fn();
 const synthesizeSpeech = vi.fn();
+const findAudienceProfile = vi.fn();
+const getChannelPolicy = vi.fn();
+const listActiveRoles = vi.fn();
+const getRoleById = vi.fn();
 
 // #634 — a mídia de saída passa por `src/runtime/outbound/media-store.ts`, que
 // resolve a raiz por `MEDIA_ROOT`. O double precisa fornecê-la: sem ela o ramo
@@ -56,10 +60,21 @@ vi.mock('../../src/gateway/line-output.js', () => ({
   })),
 }));
 // P11: the Decision Engine is always-on and would otherwise hit real prod
-// adapters (DB/Redis) here. Mock it to a no-op pass-through (engine_ran:false →
-// agent/core.ts proceeds straight to the LLM path).
+// adapters (DB/Redis) here. Return an explicit allow packet so the production
+// contract (packet-or-throw) remains exercised by this harness.
 vi.mock('../../src/runtime/decision/integration.js', () => ({
-  runDecisionEngineForTurn: vi.fn().mockResolvedValue({ engine_ran: false }),
+  runDecisionEngineForTurn: vi.fn().mockResolvedValue({
+    engine_ran: true,
+    result: {
+      block: false,
+      packet: {
+        action_mode: 'respond',
+        tool_permissions: { allowed_tools: [], blocked_tools: [], requires_confirmation: [] },
+        risk_profile: { level: 'low', reasons: [], requires_human_review: false },
+        routing: { agent_id: 'a', candidate_skill_ids: [] },
+      },
+    },
+  }),
   DecisionEngineFailClosedError: class DecisionEngineFailClosedError extends Error {},
 }));
 vi.mock('../../src/lib/tts.js', () => ({
@@ -77,7 +92,26 @@ vi.mock('../../src/db/repositories.js', () => ({
     recentInConversation, setConversaId: vi.fn(), createInbound: vi.fn(),
   },
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
-  conversasRepo: { touch: vi.fn() },
+  conversasRepo: {
+    byIdWithPessoa: vi.fn(async () => {
+      const row = dbState.conversaResult[0] as
+        | { conversas: unknown; pessoas: unknown }
+        | undefined;
+      return row ? { conversa: row.conversas, pessoa: row.pessoas } : null;
+    }),
+    touch: vi.fn(),
+    mergeMetadata: vi.fn(),
+  },
+  agentAudienceProfilesRepo: { findByPessoa: findAudienceProfile },
+  channelPoliciesRepo: { getByChannelId: getChannelPolicy },
+  rolesRepo: { listActive: listActiveRoles, getById: getRoleById },
+  procedureExecutionsRepo: {
+    findActiveForConversa: vi.fn().mockResolvedValue(null),
+  },
+  procedureDefinitionsRepo: { findById: vi.fn().mockResolvedValue(null) },
+  procedureSelectorDecisionsRepo: {
+    record: vi.fn().mockResolvedValue(undefined),
+  },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
   factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
@@ -129,8 +163,11 @@ vi.mock('../../src/identity/quarantine.js', () => ({
 vi.mock('../../src/governance/permissions.js', () => ({
   resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
 }));
-vi.mock('../../src/gateway/rate-limit.js', () => ({
-  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
+vi.mock("../../src/cognitive-graph/orchestrator.js", () => ({
+  runNodes: vi.fn().mockResolvedValue({ nodes: {} }),
+}));
+vi.mock("../../src/gateway/rate-limit.js", () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: "allow" }),
   formatPoliteReply: vi.fn(),
 }));
 vi.mock('../../src/gateway/presence.js', () => ({
@@ -146,10 +183,57 @@ vi.mock('../../src/agent/reflection.js', () => ({
 }));
 
 const PESSOA = {
-  id: 'p1', telefone_whatsapp: '+5511888888888', nome: 'Owner',
-  tipo: 'owner', preferencias: {},
+  id: "p1",
+  telefone_whatsapp: "+5511888888888",
+  nome: "Owner",
+  tenant_id: "primary",
+  agent_id: "primary",
+  tipo: "owner",
+  status: "ativa",
+  preferencias: {},
 } as never;
-const CONVERSA = { id: 'c1', pessoa_id: 'p1', status: 'ativa' } as never;
+const CONVERSA = {
+  id: "c1",
+  pessoa_id: "p1",
+  status: "ativa",
+  channel_id: "ch-1",
+} as never;
+const AUDIENCE_PROFILE = {
+  id: "aud-1",
+  tenant_id: "primary",
+  agent_id: "primary",
+  pessoa_id: "p1",
+  audience_type: "owner",
+  trust_level: "trusted_internal",
+  status: "active",
+  permission_profile_ids: [],
+  labels: [],
+  metadata: {},
+} as never;
+const DEFAULT_ROLE = {
+  id: "role-default",
+  tenant_id: "primary",
+  agent_id: "primary",
+  role_key: "default",
+  display_name: "Default",
+  description: null,
+  prompt_addendum: null,
+  granted_packs: [],
+  active: true,
+  is_default: true,
+  metadata: {},
+} as never;
+const CHANNEL_POLICY = {
+  id: "policy-1",
+  tenant_id: "primary",
+  agent_id: "primary",
+  channel_id: "ch-1",
+  default_role_id: "role-default",
+  switch_behavior: "fixed",
+  announce_mode: "never",
+  by_context_guards: {},
+  allowed_role_ids: [],
+} as never;
 const VOICE_INBOUND = {
   id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'audio' as const,
   conteudo: '[transcribed: registra cinco reais do café]',
@@ -183,7 +267,11 @@ describe('agent loop — B4 voice flow', () => {
     markProcessed.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
     synthesizeSpeech.mockReset();
-    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
+    findAudienceProfile.mockReset().mockResolvedValue(AUDIENCE_PROFILE);
+    getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
+    listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);
+    getRoleById.mockReset().mockResolvedValue(DEFAULT_ROLE);
+    buildPrompt.mockResolvedValue({ system: "s", messages: [] });
     findById.mockResolvedValue(PESSOA);
     sendOutboundVoice.mockResolvedValue('WAID-OUT-VOICE');
     sendOutboundText.mockResolvedValue('WAID-OUT-TEXT');

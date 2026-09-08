@@ -91,9 +91,9 @@ describe('issue #601 — `boundary` é um vocabulário FECHADO espelhado do cód
     for (const rel of arquivos) {
       const src = await readFile(new URL(`../../../${rel}`, import.meta.url), 'utf8');
       const re =
-        /(?:assertTurnOwnership|reportBlockedEffect|assertOutboundOwnership|new TurnOwnershipLostError)\(\s*'([a-z_]+)'/g;
+        /(?:assertTurnOwnership|reportBlockedEffect|assertOutboundOwnership|new TurnOwnershipLostError)\(\s*['"]([a-z_]+)['"]/g;
       for (const m of src.matchAll(re)) encontrados.add(m[1]!);
-      const reDispatcher = /turnOwnershipLostResult\([^,]+,\s*'([a-z_]+)'\)/g;
+      const reDispatcher = /turnOwnershipLostResult\([^,]+,\s*['"]([a-z_]+)['"]\)/g;
       for (const m of src.matchAll(reDispatcher)) encontrados.add(m[1]!);
     }
     return [...encontrados].sort();

@@ -428,13 +428,14 @@ export type AudienceResolveOutcome = 'resolved' | 'absent' | 'failed';
  * The span covers BOTH because only the pair is a boundary: the lookup is the
  * DB round trip, and `buildAudienceContext` is the pure derivation that decides
  * whether the turn ends up with an audience at all. Timing only the query would
- * hide the case the operator actually cares about — a turn running with
- * `audienceContext === null`, which silently skips two policy gates.
+ * hide the case the operator actually cares about — an absent audience that
+ * must terminate before any business hook, LLM, tool or outbound.
  *
- * `failed` is a real member and not an error status: the call site catches the
- * lookup error on purpose (a transient audience-store hiccup must not break the
- * turn), so from the span's point of view the stage completed — it just
- * completed without an audience, and that is what `result` says.
+ * `failed` is a bounded business result rather than a span exception because
+ * the callback classifies the lookup failure first. The caller then fails the
+ * turn retryably and rethrows the original error; it never proceeds without an
+ * audience. This keeps the span vocabulary bounded without making the runtime
+ * fail-open.
  */
 export function instrumentAudienceResolve<T>(
   fn: () => Promise<T>,

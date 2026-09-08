@@ -25,9 +25,15 @@ import type { SkillExecutionOutput } from '@/skills/types.js';
 
 const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999' } as Pessoa;
 const conversa = { id: 'c_1' } as Conversa;
-const inbound = { id: 'msg_1', conteudo: 'oi', metadata: null } as unknown as Mensagem;
+const inbound = {
+  id: 'msg_1',
+  conteudo: 'oi',
+  metadata: null,
+} as unknown as Mensagem;
 
-function mkPinned(overrides?: Partial<PinnedSkillIdentity>): PinnedSkillIdentity {
+function mkPinned(
+  overrides?: Partial<PinnedSkillIdentity>,
+): PinnedSkillIdentity {
   return {
     selected_skill_descriptor: 'faq.answer',
     selected_skill_version: 3,
@@ -36,7 +42,9 @@ function mkPinned(overrides?: Partial<PinnedSkillIdentity>): PinnedSkillIdentity
   };
 }
 
-function mkDeps(overrides?: Partial<ExecuteSelectedSkillDeps>): ExecuteSelectedSkillDeps {
+function mkDeps(
+  overrides?: Partial<ExecuteSelectedSkillDeps>,
+): ExecuteSelectedSkillDeps {
   return {
     resolveActiveSkill: vi
       .fn()
@@ -83,7 +91,11 @@ describe('F1 Phase 1 — buildSkillReply', () => {
       resolved_policies: [],
       trace: { mode: 'prompt_only', skill_version: 1, skill_id: 's' },
     });
-    expect(r).toEqual({ text: 'olá', turnHasSensitive: false, sensitiveTools: [] });
+    expect(r).toEqual({
+      text: 'olá',
+      turnHasSensitive: false,
+      sensitiveTools: [],
+    });
   });
 
   it('marks sensitive output so view-once is applied downstream', () => {
@@ -144,7 +156,8 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     expect(deps.runSkill).toHaveBeenCalledOnce();
     expect(deps.safeDispatchOutput).toHaveBeenCalledOnce();
     // The reply went through safeDispatchOutput with the skill text + channel ctx.
-    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0];
     expect(ctx.text).toBe('Aqui está sua resposta.');
     expect(ctx.pessoa).toBe(pessoa);
     expect(ctx.conversa).toBe(conversa);
@@ -175,7 +188,9 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
   it('identity mismatch (version bumped between select and execute) ⇒ fall through, runSkill NOT called', async () => {
     const deps = mkDeps({
       // The active row was re-activated at a higher version after selection.
-      resolveActiveSkill: vi.fn().mockResolvedValue({ id: 'skill_faq', version: 4 }),
+      resolveActiveSkill: vi
+        .fn()
+        .mockResolvedValue({ id: 'skill_faq', version: 4 }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
@@ -280,13 +295,18 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     // (no fall-through) — report handled and log the inconsistency at error level
     // with an ops_alert flag for reconciliation.
     const deps = mkDeps({
-      safeDispatchOutput: vi
-        .fn()
-        .mockResolvedValue({ status: 'sent_no_persist', error: 'db_commit_failed' }),
+      safeDispatchOutput: vi.fn().mockResolvedValue({
+        status: 'sent_no_persist',
+        error: 'db_commit_failed',
+      }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
-    expect(outcome).toEqual({ handled: true });
+    expect(outcome).toEqual({
+      handled: true,
+      recovery_pending: true,
+      error: 'db_commit_failed',
+    });
     expect(deps.runSkill).toHaveBeenCalledOnce();
     expect(deps.safeDispatchOutput).toHaveBeenCalledOnce(); // no second (fallback) send
     expect(deps.logger.error).toHaveBeenCalledWith(
@@ -300,13 +320,18 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     // the reply. We must NOT re-send (a fall-through to ReAct would double-send a
     // financial message) — report handled and log the inconsistency for ops.
     const deps = mkDeps({
-      safeDispatchOutput: vi
-        .fn()
-        .mockResolvedValue({ status: 'sent_no_persist', error: 'persist_failed' }),
+      safeDispatchOutput: vi.fn().mockResolvedValue({
+        status: 'sent_no_persist',
+        error: 'persist_failed',
+      }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
-    expect(outcome).toEqual({ handled: true });
+    expect(outcome).toEqual({
+      handled: true,
+      recovery_pending: true,
+      error: 'persist_failed',
+    });
     expect(deps.safeDispatchOutput).toHaveBeenCalledOnce(); // never re-dispatch
     expect(deps.logger.error).toHaveBeenCalledWith(
       expect.objectContaining({ ops_alert: true, err: 'persist_failed' }),
@@ -314,15 +339,16 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     );
   });
 
-  it('safeDispatchOutput reports not_sent (pre-send / disconnected gateway) ⇒ fall through to ReAct (handled:false), no second send (HIGH-1)', async () => {
-    // NOTHING reached the user (pre-send failure / disconnected gateway / channel
-    // threw). LLM-first: fall through to the normal ReAct turn so the agent still
-    // answers with a real, adaptive reply — not a canned message. Safe: nothing
-    // was sent (no double-send), and we never re-dispatch from here.
+  it('safeDispatchOutput reports not_sent ⇒ delegates the commit-aware fallthrough decision to core (HIGH-1)', async () => {
+    // `not_sent` classifies the physical send only. The caller must also inspect
+    // the live TurnHandle: before commit it may fall through to ReAct; after a
+    // durable commit (`outbound_pending`) recovery owns delivery and ReAct is
+    // forbidden. This unit proves only the local classification.
     const deps = mkDeps({
-      safeDispatchOutput: vi
-        .fn()
-        .mockResolvedValue({ status: 'not_sent', error: 'channel_disconnected' }),
+      safeDispatchOutput: vi.fn().mockResolvedValue({
+        status: 'not_sent',
+        error: 'channel_disconnected',
+      }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
@@ -341,7 +367,11 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const deps = mkDeps({
       runSkill: vi.fn().mockResolvedValue({
         ok: true,
-        output: { reply: 'Sua solicitação foi aprovada.', verdict: 'pass', score: 0.92 },
+        output: {
+          reply: 'Sua solicitação foi aprovada.',
+          verdict: 'pass',
+          score: 0.92,
+        },
         latency_ms: 8,
         resolved_policies: [],
         trace: { mode: 'evaluator', skill_version: 3, skill_id: 'skill_faq' },
@@ -350,7 +380,8 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
     expect(outcome).toEqual({ handled: true });
-    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0];
     expect(ctx.text).toBe('Sua solicitação foi aprovada.');
   });
 });
@@ -369,7 +400,8 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
 describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
   const origFlag = config.FEATURE_OUTBOUND_DEDUP;
   beforeAll(() => {
-    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = true;
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
+      true;
   });
   afterAll(() => {
     (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
@@ -409,7 +441,11 @@ describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
       findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('unknown')),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
-    expect(outcome).toEqual({ handled: true });
+    expect(outcome).toEqual({
+      handled: true,
+      recovery_pending: true,
+      error: 'prior_outbound_ledger_unknown',
+    });
     expect(deps.runSkill).not.toHaveBeenCalled();
   });
 
@@ -418,7 +454,11 @@ describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
       findOutboundLedgerForTurn: vi.fn().mockResolvedValue(row('pending')),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
-    expect(outcome).toEqual({ handled: true });
+    expect(outcome).toEqual({
+      handled: true,
+      recovery_pending: true,
+      error: 'prior_outbound_ledger_pending',
+    });
     expect(deps.runSkill).not.toHaveBeenCalled();
   });
 

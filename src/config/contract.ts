@@ -76,7 +76,9 @@ export const ENV_CONTRACT = {
     group: 'core',
     secret: false,
     services: ALL,
-    schema: z.enum(['development', 'test', 'production']).default('development'),
+    schema: z
+      .enum(['development', 'test', 'production'])
+      .default('development'),
     example: 'development',
     fixture: 'development',
     fixtureByProfile: { staging: 'production', production: 'production' },
@@ -357,7 +359,8 @@ export const ENV_CONTRACT = {
   // ---- llm --------------------------------------------------------------
   LLM_PROVIDER: {
     name: 'LLM_PROVIDER',
-    description: 'Provider do LLM principal: anthropic (direto) ou openrouter (gateway).',
+    description:
+      'Provider do LLM principal: anthropic (direto) ou openrouter (gateway).',
     group: 'llm',
     secret: false,
     services: ['runtime', 'maintenance'],
@@ -517,7 +520,8 @@ export const ENV_CONTRACT = {
   },
   OPENAI_API_KEY: {
     name: 'OPENAI_API_KEY',
-    description: 'Chave OpenAI (Whisper, TTS e embeddings openai). Prefixo `sk-`.',
+    description:
+      'Chave OpenAI (Whisper, TTS e embeddings openai). Prefixo `sk-`.',
     group: 'speech',
     secret: true,
     services: ['runtime', 'maintenance'],
@@ -657,7 +661,8 @@ export const ENV_CONTRACT = {
   // ---- owner ------------------------------------------------------------
   OWNER_TELEFONE_WHATSAPP: {
     name: 'OWNER_TELEFONE_WHATSAPP',
-    description: 'Número E.164 do owner. Precisa ser diferente de WHATSAPP_NUMBER_MAIA.',
+    description:
+      'Número E.164 do owner. Precisa ser diferente de WHATSAPP_NUMBER_MAIA.',
     group: 'owner',
     secret: false,
     services: ['runtime'],
@@ -695,7 +700,8 @@ export const ENV_CONTRACT = {
   },
   VALOR_DUAL_APPROVAL: {
     name: 'VALOR_DUAL_APPROVAL',
-    description: 'Acima deste valor (BRL) a operação exige aprovação dupla (4-eyes).',
+    description:
+      'Acima deste valor (BRL) a operação exige aprovação dupla (4-eyes).',
     group: 'governance',
     secret: false,
     services: ['runtime'],
@@ -1093,7 +1099,8 @@ export const ENV_CONTRACT = {
   },
   BACKUP_S3_BUCKET: {
     name: 'BACKUP_S3_BUCKET',
-    description: 'Bucket de destino do backup remoto. Sem ele, o backup é só local.',
+    description:
+      'Bucket de destino do backup remoto. Sem ele, o backup é só local.',
     group: 'backup',
     secret: false,
     services: ['runtime', 'backup', 'maintenance'],
@@ -1198,7 +1205,9 @@ export const ENV_CONTRACT = {
     schema: z
       .enum(['true', 'false', '1', '0'])
       .optional()
-      .transform((s) => (s === undefined ? undefined : s === 'true' || s === '1')),
+      .transform((s) =>
+        s === undefined ? undefined : s === 'true' || s === '1',
+      ),
     example: 'true',
     fixture: 'true',
     restartRequired: true,
@@ -1231,7 +1240,10 @@ export const ENV_CONTRACT = {
     // Sintética e inconfundível (mesma forma de MAIA_STAGING_KEYRING):
     // base64 de 32 bytes zerados, que não decifra nada de verdade.
     fixture: '{"k1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}',
-    requiredWhen: { var: 'BACKUP_ENCRYPTION_MODE', equals: 'envelope_aes256_gcm' },
+    requiredWhen: {
+      var: 'BACKUP_ENCRYPTION_MODE',
+      equals: 'envelope_aes256_gcm',
+    },
     restartRequired: true,
     commentedInExample: true,
   },
@@ -1245,13 +1257,17 @@ export const ENV_CONTRACT = {
     schema: z.string().optional(),
     example: 'k1',
     fixture: 'k1',
-    requiredWhen: { var: 'BACKUP_ENCRYPTION_MODE', equals: 'envelope_aes256_gcm' },
+    requiredWhen: {
+      var: 'BACKUP_ENCRYPTION_MODE',
+      equals: 'envelope_aes256_gcm',
+    },
     restartRequired: true,
     commentedInExample: true,
   },
   BACKUP_DUMP_TIMEOUT_MS: {
     name: 'BACKUP_DUMP_TIMEOUT_MS',
-    description: 'Orçamento do pg_dump. Estourado, o processo é morto e a run falha.',
+    description:
+      'Orçamento do pg_dump. Estourado, o processo é morto e a run falha.',
     group: 'backup',
     secret: false,
     services: ['runtime', 'backup', 'maintenance'],
@@ -1313,7 +1329,8 @@ export const ENV_CONTRACT = {
   },
   BACKUP_RTO_TARGET_MINUTES: {
     name: 'BACKUP_RTO_TARGET_MINUTES',
-    description: 'Objetivo de tempo de recuperação, comparado à duração medida do último drill.',
+    description:
+      'Objetivo de tempo de recuperação, comparado à duração medida do último drill.',
     group: 'backup',
     secret: false,
     services: ['runtime', 'backup', 'maintenance'],
@@ -1547,7 +1564,8 @@ export const ENV_CONTRACT = {
   },
   FEATURE_PDF_REPORTS: {
     name: 'FEATURE_PDF_REPORTS',
-    description: 'Relatórios PDF (extrato/comparativo) enviados como documento.',
+    description:
+      'Relatórios PDF (extrato/comparativo) enviados como documento.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime', 'admin-ui'],
@@ -1633,9 +1651,11 @@ export const ENV_CONTRACT = {
       'ON: a cada minuto o worker `outbound_recovery` rearma o trabalho entregavel (pending/' +
       'retryable vencidos e claims com lease morta), reconcilia o incerto (delivery_unknown, ' +
       'reconciling e a janela delivered->completed), manda para dead_letter o que estourou o teto ' +
-      'de tentativas ou o prazo de reconciliacao, e detecta divergencia turno<->outbound nos dois ' +
-      'sentidos. Publica maia_outbound_pending_age_seconds, ' +
-      'maia_outbound_reconciliation_total{result} e maia_outbound_turn_inconsistency_total{kind}. ' +
+      'de tentativas ou o prazo de reconciliacao, terminaliza agent_turns outbound_pending cujo ' +
+      'conjunto de artefatos convergiu e cuja lease expirou, promove o sucessor FIFO, e detecta ' +
+      'divergencia turno<->outbound nos dois sentidos. Publica maia_outbound_pending_age_seconds, ' +
+      'maia_outbound_turn_no_success_pending, maia_outbound_reconciliation_total{result} e ' +
+      'maia_outbound_turn_inconsistency_total{kind}. ' +
       'OFF: o worker e NO-OP na primeira linha (nenhuma consulta ao banco) — e nada rearma o ' +
       'outbox, entao uma linha que falhe a entrega fica parada ate intervencao manual ' +
       '(`npm run dlq outbound-rearm`). ' +
@@ -1920,7 +1940,8 @@ export const ENV_CONTRACT = {
   },
   MAIA_PROBE_LLM_JUDGE: {
     name: 'MAIA_PROBE_LLM_JUDGE',
-    description: 'Asserção secundária por LLM-as-judge na sonda (custo/ruído: off por default).',
+    description:
+      'Asserção secundária por LLM-as-judge na sonda (custo/ruído: off por default).',
     group: 'probe',
     secret: false,
     services: ['runtime'],
@@ -1944,7 +1965,8 @@ export const ENV_CONTRACT = {
   },
   MAIA_PROBE_SLO_MS: {
     name: 'MAIA_PROBE_SLO_MS',
-    description: 'Deadline (ms) do efeito colateral. Sem efeito no SLO ⇒ silent.',
+    description:
+      'Deadline (ms) do efeito colateral. Sem efeito no SLO ⇒ silent.',
     group: 'probe',
     secret: false,
     services: ['runtime'],
@@ -1968,7 +1990,8 @@ export const ENV_CONTRACT = {
   },
   MAIA_PROBE_ALERT_AFTER_K: {
     name: 'MAIA_PROBE_ALERT_AFTER_K',
-    description: 'K falhas consecutivas para transicionar saudável→degradado e alertar.',
+    description:
+      'K falhas consecutivas para transicionar saudável→degradado e alertar.',
     group: 'probe',
     secret: false,
     services: ['runtime'],
@@ -1980,7 +2003,8 @@ export const ENV_CONTRACT = {
   },
   MAIA_PROBE_AUTOSILENCE_AFTER_N: {
     name: 'MAIA_PROBE_AUTOSILENCE_AFTER_N',
-    description: 'N falhas consecutivas ativam o auto-silêncio (para de gastar LLM em loop).',
+    description:
+      'N falhas consecutivas ativam o auto-silêncio (para de gastar LLM em loop).',
     group: 'probe',
     secret: false,
     services: ['runtime'],
@@ -1992,7 +2016,8 @@ export const ENV_CONTRACT = {
   },
   MAIA_PROBE_SILENCED_BACKOFF_MS: {
     name: 'MAIA_PROBE_SILENCED_BACKOFF_MS',
-    description: 'Intervalo (ms) de sondagem de recuperação durante o auto-silêncio.',
+    description:
+      'Intervalo (ms) de sondagem de recuperação durante o auto-silêncio.',
     group: 'probe',
     secret: false,
     services: ['runtime'],
@@ -2146,7 +2171,8 @@ export const ENV_CONTRACT = {
   },
   RUNTIME_TRACE_BODY_ORPHAN_SEC: {
     name: 'RUNTIME_TRACE_BODY_ORPHAN_SEC',
-    description: 'Idade máxima (s) de um envelope pendente antes do alerta do recoverer.',
+    description:
+      'Idade máxima (s) de um envelope pendente antes do alerta do recoverer.',
     group: 'runtime-trace',
     secret: false,
     services: ['runtime'],
@@ -2172,7 +2198,8 @@ export const ENV_CONTRACT = {
   // ---- outbox / sweeper -------------------------------------------------
   OUTBOUND_SWEEPER_STALE_PENDING_SEC: {
     name: 'OUTBOUND_SWEEPER_STALE_PENDING_SEC',
-    description: "Rows 'pending' mais antigas que isso são promovidas a 'unknown' (terminal).",
+    description:
+      "Rows 'pending' mais antigas que isso são promovidas a 'unknown' (terminal).",
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2196,7 +2223,8 @@ export const ENV_CONTRACT = {
   },
   OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE: {
     name: 'OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE',
-    description: 'Tamanho do chunk do DELETE de retenção (evita lock de tabela inteira).',
+    description:
+      'Tamanho do chunk do DELETE de retenção (evita lock de tabela inteira).',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2208,7 +2236,8 @@ export const ENV_CONTRACT = {
   },
   OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT: {
     name: 'OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT',
-    description: 'Teto de promoções stale-pending por tenant por passe (fairness).',
+    description:
+      'Teto de promoções stale-pending por tenant por passe (fairness).',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2280,7 +2309,8 @@ export const ENV_CONTRACT = {
   },
   OUTBOX_MAX_PER_SECOND: {
     name: 'OUTBOX_MAX_PER_SECOND',
-    description: 'Backpressure de saída: envios por segundo por instância de agente.',
+    description:
+      'Backpressure de saída: envios por segundo por instância de agente.',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2292,7 +2322,8 @@ export const ENV_CONTRACT = {
   },
   OUTBOX_MAX_PER_HOUR: {
     name: 'OUTBOX_MAX_PER_HOUR',
-    description: 'Backpressure de saída: envios por hora por instância de agente.',
+    description:
+      'Backpressure de saída: envios por hora por instância de agente.',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2304,7 +2335,8 @@ export const ENV_CONTRACT = {
   },
   OCCURRENCE_LEASE_TTL_SECONDS: {
     name: 'OCCURRENCE_LEASE_TTL_SECONDS',
-    description: 'TTL (s) do lease de uma ocorrência antes de outro worker reclamar.',
+    description:
+      'TTL (s) do lease de uma ocorrência antes de outro worker reclamar.',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2364,7 +2396,8 @@ export const ENV_CONTRACT = {
   },
   MESSAGE_DEBOUNCE_MS: {
     name: 'MESSAGE_DEBOUNCE_MS',
-    description: 'Janela (ms) do debounce de mensagens; cada texto novo reinicia o timer.',
+    description:
+      'Janela (ms) do debounce de mensagens; cada texto novo reinicia o timer.',
     group: 'outbox',
     secret: false,
     services: ['runtime'],
@@ -2403,7 +2436,8 @@ export const ENV_CONTRACT = {
   },
   PROCEDURE_TTL_DAYS: {
     name: 'PROCEDURE_TTL_DAYS',
-    description: "Dias de inatividade após os quais o reaper marca a execução como 'abandoned'.",
+    description:
+      "Dias de inatividade após os quais o reaper marca a execução como 'abandoned'.",
     group: 'procedures',
     secret: false,
     services: ['runtime'],
@@ -2415,7 +2449,8 @@ export const ENV_CONTRACT = {
   },
   REAPER_BATCH_SIZE: {
     name: 'REAPER_BATCH_SIZE',
-    description: 'Teto de leitura por tupla (tenant, agent) por tick do reaper.',
+    description:
+      'Teto de leitura por tupla (tenant, agent) por tick do reaper.',
     group: 'procedures',
     secret: false,
     services: ['runtime'],
@@ -2427,7 +2462,8 @@ export const ENV_CONTRACT = {
   },
   REAPER_GLOBAL_BUDGET: {
     name: 'REAPER_GLOBAL_BUDGET',
-    description: 'Orçamento GLOBAL de execuções ceifadas por tick, somando todas as tuplas.',
+    description:
+      'Orçamento GLOBAL de execuções ceifadas por tick, somando todas as tuplas.',
     group: 'procedures',
     secret: false,
     services: ['runtime'],
@@ -2439,7 +2475,8 @@ export const ENV_CONTRACT = {
   },
   CONTRADICTION_OVERLAY_TTL_HOURS: {
     name: 'CONTRADICTION_OVERLAY_TTL_HOURS',
-    description: 'Janela (h) em que uma contradição resolvida ainda aparece no prompt.',
+    description:
+      'Janela (h) em que uma contradição resolvida ainda aparece no prompt.',
     group: 'procedures',
     secret: false,
     services: ['runtime'],
@@ -2654,7 +2691,8 @@ export const ENV_CONTRACT = {
   },
   SYNC_LATENCY_P95_BASELINE_MS: {
     name: 'SYNC_LATENCY_P95_BASELINE_MS',
-    description: 'Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado.',
+    description:
+      'Baseline (ms) do p95 do caminho síncrono. Ausente ⇒ o gate é pulado.',
     group: 'performance',
     secret: false,
     services: ['runtime'],
@@ -2687,7 +2725,9 @@ export const ENV_CONTRACT = {
     services: ['runtime'],
     // Fail-closed por construção: valor fora do enum é erro de schema e aborta
     // o boot — nunca cai num default permissivo.
-    schema: z.enum(['all', 'api', 'worker', 'scheduler', 'session-owner']).default('all'),
+    schema: z
+      .enum(['all', 'api', 'worker', 'scheduler', 'session-owner'])
+      .default('all'),
     example: 'all',
     fixture: 'all',
     restartRequired: true,
@@ -2701,8 +2741,10 @@ export const ENV_CONTRACT = {
     secret: false,
     services: ['runtime'],
     schema: z.string().default(''),
-    example: 'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
-    fixture: 'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
+    example:
+      'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
+    fixture:
+      'turn-pipeline,outbound,scheduling,channel,monitoring,housekeeping,ops-backup',
     restartRequired: true,
     commentedInExample: true,
   },
@@ -2862,7 +2904,10 @@ export const ENV_CONTRACT = {
     services: ['runtime', 'admin-ui'],
     schema: z
       .string()
-      .regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/, 'formato esperado: owner/repo')
+      .regex(
+        /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/,
+        'formato esperado: owner/repo',
+      )
       .optional(),
     example: 'minha-org/meu-repo',
     fixture: 'maia-fixture/maia-fixture',
@@ -2898,7 +2943,8 @@ export const ENV_CONTRACT = {
   },
   NEXTAUTH_URL: {
     name: 'NEXTAUTH_URL',
-    description: 'URL pública do Admin UI. Precisa ser https fora de development.',
+    description:
+      'URL pública do Admin UI. Precisa ser https fora de development.',
     group: 'admin-ui',
     secret: false,
     services: ['admin-ui'],
@@ -2938,7 +2984,8 @@ export const ENV_CONTRACT = {
   },
   NEXT_PUBLIC_API_URL: {
     name: 'NEXT_PUBLIC_API_URL',
-    description: 'URL do runtime Fastify consumida pelo Admin UI. Precisa ser https fora de development.',
+    description:
+      'URL do runtime Fastify consumida pelo Admin UI. Precisa ser https fora de development.',
     group: 'admin-ui',
     secret: false,
     services: ['admin-ui'],
@@ -3016,7 +3063,8 @@ export const ENV_CONTRACT = {
   },
   ADMIN_UI_DEV_LOGIN_TOKEN: {
     name: 'ADMIN_UI_DEV_LOGIN_TOKEN',
-    description: 'Token compartilhado do login de desenvolvimento (mínimo 16 caracteres).',
+    description:
+      'Token compartilhado do login de desenvolvimento (mínimo 16 caracteres).',
     group: 'admin-ui',
     secret: true,
     services: ['admin-ui'],
@@ -3156,7 +3204,11 @@ export function findTombstone(name: string): Tombstone | undefined {
 
 /** True when the name is neither a live variable nor a tombstone. */
 export function isUnknownMaiaKey(name: string): boolean {
-  return isMaiaNamespacedKey(name) && !BY_NAME.has(name) && !TOMBSTONE_BY_NAME.has(name);
+  return (
+    isMaiaNamespacedKey(name) &&
+    !BY_NAME.has(name) &&
+    !TOMBSTONE_BY_NAME.has(name)
+  );
 }
 
 /** Entries a given service is allowed to read, in declaration order. */
@@ -3204,7 +3256,9 @@ export function syntheticFixtureValuesFor(name: string): readonly string[] {
   const spec = findSpec(name);
   if (!spec?.secret) return [];
   const values = [spec.fixture, ...Object.values(spec.fixtureByProfile ?? {})];
-  return values.filter((v): v is string => typeof v === 'string' && v.length > 0);
+  return values.filter(
+    (v): v is string => typeof v === 'string' && v.length > 0,
+  );
 }
 
 /**
@@ -3222,7 +3276,9 @@ export function isSyntheticFixtureValue(name: string, value: string): boolean {
 
 /** Contract keys whose `services` include `S`. */
 export type KeysForService<S extends MaiaService> = {
-  [K in ContractKey]: S extends (typeof ENV_CONTRACT)[K]['services'][number] ? K : never;
+  [K in ContractKey]: S extends (typeof ENV_CONTRACT)[K]['services'][number]
+    ? K
+    : never;
 }[ContractKey];
 
 /**
