@@ -58,7 +58,7 @@ A decisão de desenho, com as alternativas descartadas, está no cabeçalho de
 |---|---|
 | `tests/unit/ofx-parser.spec.ts` | OFX parsing fixtures |
 | `tests/unit/import-schema.spec.ts` | `import_runs` / `import_entries` no schema Drizzle |
-| `tests/integration/import-cli-tenant-scope-real-db.spec.ts` | #720 — as duas CLIs contra Postgres real, como processo filho: ingestão viva, recusa de escopo com controle no mesmo `it`, `import:apply` ponta a ponta, o `UPDATE` cross-tenant recusado e (caso 5) a **reconciliação** lendo escopada — uma transação-isca do tenant B com FITID idêntico e a `entidade_id` do tenant A NÃO é casada nem listada como candidata, enquanto a do próprio tenant sai `matched` (controle positivo no mesmo `it`) |
+| `tests/integration/import-cli-tenant-scope-real-db.spec.ts` | #720 — as duas CLIs contra Postgres real, como processo filho: ingestão viva, recusa de escopo com controle no mesmo `it`, `import:apply` ponta a ponta, o `UPDATE` cross-tenant recusado e (casos 5–7) a **reconciliação** lendo escopada, **um predicado por vez**: uma transação-isca com FITID idêntico e a `entidade_id` do tenant A NÃO é casada nem listada como candidata quando é de (B, agB) [caso 5, conjunção], de outro agent do MESMO tenant (A, agA2) [caso 6, pina `agent_id`] ou da linha inconsistente (B, agA) que as FKs separadas de `transacoes` aceitam [caso 7, pina `tenant_id`]; em cada `it` a transação de (A, agA) sai `matched` (controle positivo) |
 | `tests/unit/scripts/import-cli-escrita-escopada.spec.ts` | #720 — sonda de forma: fica vermelha se um `UPDATE ... WHERE id = $1` sem escopo (ou um `INSERT` sem `applyTenantGuard`) voltar |
 
 ## In-flight changes
@@ -67,8 +67,10 @@ At last verification (2026-09-08): none specifically scoped to `src/import/`.
 Issue #720 (mergeada em #728; fechada pela PR que acrescentou o caso 5 acima)
 consertou as CLIs em `scripts/`, não `src/import/` — o `reconciler` já lia
 escopado via `transacoesRepo.byScope`; o que faltava era a CLI abrir o
-contexto. O caso 5 é o que segura esse predicado: tirar `tenant_id`/`agent_id`
-do `byScope` deixa SÓ ele vermelho.
+contexto. Os casos 6 e 7 são o que segura cada predicado do `byScope`
+separadamente: tirar só `agent_id` deixa SÓ o 6 vermelho; tirar só
+`tenant_id` deixa SÓ o 7 vermelho (o caso 5, com isca de outro tenant E outro
+agent, fica verde nas duas remoções — pina a conjunção, não cada predicado).
 
 Verify: `gh pr list --state open --search "import OR ofx OR csv"`.
 

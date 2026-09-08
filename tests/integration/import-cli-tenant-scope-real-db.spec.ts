@@ -38,10 +38,31 @@
  *     POSITIVO no MESMO `it`: uma `transacao` do PRÓPRIO tenant A, com o FITID
  *     do outro lançamento, TEM de sair `matched` com `matched_transacao_id`
  *     apontando para ela — sem isso, um `reconcile` que nunca lesse nada
- *     também passaria. Sonda: tirar `tenant_id`/`agent_id` do WHERE de
+ *     também passaria. Sonda: tirar `tenant_id` E `agent_id` do WHERE de
  *     `transacoesRepo.byScope` (`src/db/repositories/finance-repos.ts`) faz
- *     SÓ este caso ficar vermelho — os outros quatro continuam verdes, o que
+ *     este caso ficar vermelho — os casos (1)–(4) continuam verdes, o que
  *     mostra que a regra que ele segura não estava coberta.
+ *  6. **Um predicado por vez** (revisão da PR #758 — mesma lição da #744 em
+ *     `resolve-scope-501-profiles-real-db.spec.ts`). A isca do caso (5) é do
+ *     tenant B COM o agent B, então QUALQUER um dos dois predicados sozinho já
+ *     a exclui: removendo só `tenant_id`, o de `agent_id` segura; removendo só
+ *     `agent_id`, o de `tenant_id` segura — e o caso (5) fica VERDE nas duas
+ *     sondas. Ele pina a CONJUNÇÃO, não cada predicado. Por isso:
+ *       - caso (6) pina o predicado de AGENT: a isca é de um SEGUNDO agent do
+ *         MESMO tenant A (`agents.id` é PK global; `imp720cli-agent-a2`).
+ *         Mesmo tenant ⇒ só `agent_id` a mantém fora. Sonda: remover SÓ
+ *         `eq(transacoes.agent_id, agent_id)` ⇒ SÓ este caso vermelho.
+ *       - caso (7) pina o predicado de TENANT: um agent legítimo nunca
+ *         pertence a dois tenants, então a única linha que SÓ o predicado de
+ *         tenant exclui é a INCONSISTENTE `transacoes(tenant_id = B,
+ *         agent_id = A, entidade_id de A)`, inserida direto. Verificado no
+ *         banco migrado: `transacoes` tem FKs SEPARADAS (`tenant_id →
+ *         tenants`, `agent_id → agents`), sem FK composta nem CHECK — o banco
+ *         ACEITA a linha, e é isto que faz do predicado de tenant defesa em
+ *         profundidade, não redundância. Sonda: remover SÓ
+ *         `eq(transacoes.tenant_id, tenant_id)` ⇒ SÓ este caso vermelho.
+ *     Os três casos carregam o MESMO controle positivo (transação de (A, A)
+ *     com o FITID do outro lançamento TEM de sair `matched`).
  *
  * ## Por que processo FILHO e não a função exportada
  *
@@ -95,6 +116,8 @@ const TENANT_A = 'imp720cli-tenant-a';
 const AGENT_A = 'imp720cli-agent-a';
 const TENANT_B = 'imp720cli-tenant-b';
 const AGENT_B = 'imp720cli-agent-b';
+/** SEGUNDO agent do MESMO tenant A — pina o predicado de agent_id (caso 6). */
+const AGENT_A2 = 'imp720cli-agent-a2';
 
 const RAIZ = resolve(__dirname, '../..');
 const TSX = arquivoDoPacote('tsx', 'dist/cli.mjs', import.meta.url);
@@ -320,6 +343,7 @@ d('#720 — CLIs de importação sob escopo de tenant (Postgres real)', () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
     await ensureTenantAgent(TENANT_A, AGENT_A);
     await ensureTenantAgent(TENANT_B, AGENT_B);
+    await ensureTenantAgent(TENANT_A, AGENT_A2);
     await limpar();
 
     const ent = await pool.query<{ id: string; tenant_id: string }>(
@@ -355,7 +379,9 @@ d('#720 — CLIs de importação sob escopo de tenant (Postgres real)', () => {
   afterAll(async () => {
     if (pool) {
       await limpar();
-      await pool.query('DELETE FROM agents WHERE id = ANY($1::text[])', [[AGENT_A, AGENT_B]]);
+      await pool.query('DELETE FROM agents WHERE id = ANY($1::text[])', [
+        [AGENT_A, AGENT_B, AGENT_A2],
+      ]);
       await pool.query('DELETE FROM tenants WHERE id = ANY($1::text[])', [[TENANT_A, TENANT_B]]);
       await pool.end();
     }
@@ -575,86 +601,152 @@ d('#720 — CLIs de importação sob escopo de tenant (Postgres real)', () => {
     PRAZO_MS,
   );
 
+  /**
+   * Corpo comum dos casos (5), (6) e (7): a reconciliação sob (A, agA) com
+   * uma transação-ISCA plantada na tupla `isca` e uma transação PRÓPRIA de
+   * (A, agA) — só a tupla da isca muda entre os três, e é a tupla que decide
+   * QUAL predicado do `byScope` está sendo pinado.
+   *
+   * Dois lançamentos no extrato do tenant A. Para cada um existe UMA transação
+   * que é o par perfeito (FITID igual → score 1.0):
+   *   - `proprio` → transação de (A, agA) (CONTROLE POSITIVO: tem de casar)
+   *   - `isca`    → transação da tupla `isca` (SONDA: NÃO pode casar)
+   * A isca carrega a `entidade_id` do tenant A de propósito: `reconcile()`
+   * filtra por `entidades: [contaRow.entidade_id]`, então uma isca com a
+   * entidade de B nunca entraria na janela e o caso passaria mesmo sem
+   * predicado de tenant — controle vazio. Com a entidade de A, o que a mantém
+   * fora é SÓ a tupla do ALS em `transacoesRepo.byScope`.
+   *
+   * `dia` põe cada caso numa JANELA DE DATAS PRÓPRIA. `reconcile()` busca
+   * candidatos em [data − 7, data + 2] dias; com os casos em 05, 15 e 25 de
+   * janeiro nenhuma janela alcança o resíduo do caso anterior. Sem isso, a
+   * sonda "remover só `agent_id`" derrubava TAMBÉM o caso (7): a isca de
+   * (A, agA2) do caso (6), com o mesmo valor e memo parecido, entrava na
+   * janela do (7) como `candidate` — vazamento real, mas do caso errado. Uma
+   * remoção tem de acender UM caso.
+   */
+  async function provarReconciliacaoEscopada(
+    marca: string,
+    isca: { tenant: string; agent: string; conta: string },
+    dia: number,
+  ): Promise<void> {
+    const dd = (n: number) => `2026-01-${String(n).padStart(2, '0')}`;
+    const lProprio: Lancamento = {
+      fitid: `${marca}-proprio`,
+      memo: `ALUGUEL ${marca}`,
+      valor: '101.00',
+      data: dd(dia),
+    };
+    const lIsca: Lancamento = {
+      fitid: `${marca}-isca`,
+      memo: `SUPERMERCADO ${marca}`,
+      valor: '250.00',
+      data: dd(dia + 1),
+    };
+    const alvoProprio = await seedTransacaoCasavel(TENANT_A, AGENT_A, entidadeA, contaA, lProprio);
+    const alvoIsca = await seedTransacaoCasavel(
+      isca.tenant,
+      isca.agent,
+      entidadeA,
+      isca.conta,
+      lIsca,
+    );
+
+    const file = await arquivoOfxCom(marca, [lProprio, lIsca]);
+    const r = await rodarCli(SCRIPT_OFX, [
+      `--tenant=${TENANT_A}`,
+      `--agent=${AGENT_A}`,
+      `--pessoa=${pessoaA}`,
+      `--conta=${contaA}`,
+      `--file=${file}`,
+    ]);
+    expect(`${r.code} ${r.stderr}`).toBe('0 ');
+    const run_id = /imported run=([0-9a-f-]{36})/.exec(r.stdout)![1]!;
+
+    const entries = await pool.query<{
+      fitid: string;
+      status: string;
+      matched_transacao_id: string | null;
+      candidates: Array<{ transacao_id: string }> | null;
+    }>(
+      `SELECT fitid, status, matched_transacao_id, candidates
+         FROM import_entries WHERE import_run_id = $1 ORDER BY ordem`,
+      [run_id],
+    );
+    expect(entries.rows.map((e) => e.fitid)).toEqual([lProprio.fitid, lIsca.fitid]);
+    const [eProprio, eIsca] = entries.rows as [
+      (typeof entries.rows)[number],
+      (typeof entries.rows)[number],
+    ];
+
+    // ── SONDA (a asserção do VAZAMENTO vem primeiro, como no caso 4): a isca
+    //    não foi casada nem listada como candidata. Sem o predicado que a
+    //    tupla dela pina, o FITID igual dá score 1.0 e esta linha sai
+    //    `matched` apontando para a isca.
+    expect(eIsca.matched_transacao_id).not.toBe(alvoIsca);
+    expect(eIsca.status).toBe('new');
+    expect(eIsca.matched_transacao_id).toBeNull();
+    const ponteiros = entries.rows.flatMap((e) => [
+      e.matched_transacao_id,
+      ...(e.candidates ?? []).map((c) => c.transacao_id),
+    ]);
+    expect(ponteiros).not.toContain(alvoIsca);
+
+    // ── CONTROLE POSITIVO: dentro da mesma tupla ele casa o que deve. Sem
+    //    isto, um `reconcile` que não lesse NADA também passaria na sonda.
+    expect(eProprio.status).toBe('matched');
+    expect(eProprio.matched_transacao_id).toBe(alvoProprio);
+
+    // E os contadores da run refletem exatamente isso.
+    expect(r.stdout).toMatch(/total=2, matched=1, candidates=0, new=1/);
+    const run = await pool.query<{ matched: number; novos: number; candidates: number }>(
+      'SELECT matched, novos, candidates FROM import_runs WHERE id = $1',
+      [run_id],
+    );
+    expect(run.rows[0]).toEqual({ matched: 1, novos: 1, candidates: 0 });
+  }
+
   it(
-    '(5) a reconciliação lê escopada — o import do tenant A NÃO casa a transação-isca do tenant B, e casa a do próprio tenant, no MESMO it',
+    '(5) a reconciliação lê escopada — o import de (A, agA) NÃO casa a isca de (B, agB), e casa a própria, no MESMO it',
     async () => {
-      // Dois lançamentos no extrato do tenant A. Para cada um existe UMA
-      // transação que é o par perfeito (FITID igual → score 1.0):
-      //   - `proprio`  → transação do tenant A (CONTROLE POSITIVO: tem de casar)
-      //   - `isca`     → transação do tenant B (SONDA: NÃO pode casar)
-      // A isca carrega a `entidade_id` do tenant A de propósito: `reconcile()`
-      // filtra por `entidades: [contaRow.entidade_id]`, então uma isca com a
-      // entidade de B nunca entraria na janela e o caso passaria mesmo sem
-      // predicado de tenant — controle vazio. Com a entidade de A, a ÚNICA
-      // coisa que a mantém fora é o `tenant_id`+`agent_id` do ALS em
-      // `transacoesRepo.byScope`.
-      const proprio: Lancamento = {
-        fitid: 'caso5-proprio',
-        memo: 'ALUGUEL caso5',
-        valor: '101.00',
-        data: '2026-01-05',
-      };
-      const isca: Lancamento = {
-        fitid: 'caso5-isca',
-        memo: 'SUPERMERCADO caso5',
-        valor: '250.00',
-        data: '2026-01-06',
-      };
-      const alvoProprio = await seedTransacaoCasavel(TENANT_A, AGENT_A, entidadeA, contaA, proprio);
-      const alvoIsca = await seedTransacaoCasavel(TENANT_B, AGENT_B, entidadeA, contaB, isca);
+      // Caso ORDINÁRIO: outro tenant com o seu próprio agent. Pina a
+      // conjunção — qualquer um dos dois predicados sozinho já exclui esta
+      // isca; os casos (6) e (7) pinam cada predicado separadamente.
+      await provarReconciliacaoEscopada('caso5', { tenant: TENANT_B, agent: AGENT_B, conta: contaB }, 5);
+    },
+    PRAZO_MS,
+  );
 
-      const file = await arquivoOfxCom('caso5', [proprio, isca]);
-      const r = await rodarCli(SCRIPT_OFX, [
-        `--tenant=${TENANT_A}`,
-        `--agent=${AGENT_A}`,
-        `--pessoa=${pessoaA}`,
-        `--conta=${contaA}`,
-        `--file=${file}`,
-      ]);
-      expect(`${r.code} ${r.stderr}`).toBe('0 ');
-      const run_id = /imported run=([0-9a-f-]{36})/.exec(r.stdout)![1]!;
-
-      const entries = await pool.query<{
-        fitid: string;
-        status: string;
-        matched_transacao_id: string | null;
-        candidates: Array<{ transacao_id: string }> | null;
-      }>(
-        `SELECT fitid, status, matched_transacao_id, candidates
-           FROM import_entries WHERE import_run_id = $1 ORDER BY ordem`,
-        [run_id],
+  it(
+    '(6) pina o predicado de AGENT: a isca de OUTRO agent do MESMO tenant A NÃO é casada, e a própria é, no MESMO it',
+    async () => {
+      // (A, agA2): mesmo tenant_id. O predicado de tenant NÃO separa esta isca
+      // de (A, agA) — só o de agent_id. Sonda: remover só
+      // `eq(transacoes.agent_id, agent_id)` do `byScope` ⇒ este caso vermelho.
+      await provarReconciliacaoEscopada(
+        'caso6',
+        { tenant: TENANT_A, agent: AGENT_A2, conta: contaA },
+        15,
       );
-      expect(entries.rows.map((e) => e.fitid)).toEqual([proprio.fitid, isca.fitid]);
-      const [eProprio, eIsca] = entries.rows as [
-        (typeof entries.rows)[number],
-        (typeof entries.rows)[number],
-      ];
+    },
+    PRAZO_MS,
+  );
 
-      // ── SONDA (a asserção do VAZAMENTO vem primeiro, como no caso 4): a isca
-      //    do tenant B não foi casada nem listada como candidata. Sem
-      //    `tenant_id`/`agent_id` no `byScope`, o FITID igual dá score 1.0 e
-      //    esta linha sai `matched` apontando para a transação de B.
-      expect(eIsca.matched_transacao_id).not.toBe(alvoIsca);
-      expect(eIsca.status).toBe('new');
-      expect(eIsca.matched_transacao_id).toBeNull();
-      const ponteirosParaB = entries.rows.flatMap((e) => [
-        e.matched_transacao_id,
-        ...(e.candidates ?? []).map((c) => c.transacao_id),
-      ]);
-      expect(ponteirosParaB).not.toContain(alvoIsca);
-
-      // ── CONTROLE POSITIVO: dentro do mesmo tenant ele casa o que deve. Sem
-      //    isto, um `reconcile` que não lesse NADA também passaria na sonda.
-      expect(eProprio.status).toBe('matched');
-      expect(eProprio.matched_transacao_id).toBe(alvoProprio);
-
-      // E os contadores da run refletem exatamente isso.
-      expect(r.stdout).toMatch(/total=2, matched=1, candidates=0, new=1/);
-      const run = await pool.query<{ matched: number; novos: number; candidates: number }>(
-        'SELECT matched, novos, candidates FROM import_runs WHERE id = $1',
-        [run_id],
+  it(
+    '(7) pina o predicado de TENANT: a linha INCONSISTENTE (tenant B, agent de A) NÃO é casada, e a própria é, no MESMO it',
+    async () => {
+      // (B, agA): mesmo agent_id. Um agent legítimo nunca pertence a dois
+      // tenants, então esta é a ÚNICA linha que SÓ o predicado de tenant
+      // exclui. O banco a aceita — `transacoes` tem FK separada por coluna
+      // (`tenant_id → tenants`, `agent_id → agents`), nenhuma composta —, e é
+      // por isso que o predicado é defesa em profundidade e não redundância.
+      // Sonda: remover só `eq(transacoes.tenant_id, tenant_id)` do `byScope`
+      // ⇒ este caso vermelho.
+      await provarReconciliacaoEscopada(
+        'caso7',
+        { tenant: TENANT_B, agent: AGENT_A, conta: contaB },
+        25,
       );
-      expect(run.rows[0]).toEqual({ matched: 1, novos: 1, candidates: 0 });
     },
     PRAZO_MS,
   );
