@@ -1,6 +1,8 @@
 # Maia — o que existe hoje no código
 
-> Análise de produto feita por leitura do código em `main` (HEAD `9dc7ef7`, 2026-09-08).
+> Análise de produto feita por leitura do código em `main` (HEAD `9dc7ef7`, 2026-09-08),
+> com as contagens reverificadas em `44ee2da` — o commit #761 tocou
+> `src/workers/index.ts` sem mudar o conjunto de jobs nem a divisão dos grupos.
 > Método: 14 mapeadores leram um subsistema cada, verificadores adversariais tentaram
 > refutar as afirmações mais consequentes, e as contagens foram reconferidas à mão.
 > **Código é a fonte da verdade aqui. Onde doc e código divergem, o código venceu** —
