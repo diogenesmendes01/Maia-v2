@@ -201,8 +201,8 @@ describe('fronteiras de versão — comparação por versão completa, não por 
    * 26 como "o major da imagem de produção", o que deixou de ser verdade
    * quando o Dockerfile desceu para `node:22-alpine`. Sem teto, `engines`
    * aceitava calado um major que nenhum job deste repo exercita; foi assim
-   * que `@types/node` chegou a ^25.9.2, tipando contra uma linha que o
-   * `.github/dependabot.yml` bloqueia de propósito.
+   * que `@types/node` chegou a ^25.9.2, tipando contra uma linha que o repo
+   * nunca suportou (25 é ímpar, entrou em EOL sem nunca ter sido LTS).
    */
   it.each([
     ['23.0.0', 'primeiro major acima da linha suportada'],

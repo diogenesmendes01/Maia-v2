@@ -97,8 +97,8 @@ var MINIMUM_PARTS = [22, 13, 0];
  * producao (Dockerfile), `.nvmrc` fixa 22 e o CI exercita 22.18 e 22.x. Sem
  * teto, `engines` dizia ">=22.13.0" e aceitava calado um Node 24, 26 ou 28 que
  * NENHUM job deste repo exercita — foi assim que `@types/node` chegou a ^25.9.2
- * tipando contra uma linha que o `.github/dependabot.yml` bloqueia de proposito
- * (25 e' impar, entrou em EOL sem nunca ter sido LTS).
+ * tipando contra uma linha que o repo nunca suportou (25 e' impar, entrou em
+ * EOL sem nunca ter sido LTS).
  *
  * Subir a linha suportada e' mudar Dockerfile, .nvmrc, esta constante e a
  * matriz do CI no MESMO PR. O teste de paridade cobra os quatro juntos.

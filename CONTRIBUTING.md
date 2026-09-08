@@ -18,9 +18,10 @@ verdade**:
   divergir dentro da linha 22 — `.nvmrc` dá o 22.x corrente, o CI dá 22.18 e
   22.22 — mas **só** dentro da linha 22: produção, CI e dev rodam o mesmo
   major. Não há perna 26; Node 26 é migração própria (issue #743), quando
-  virar LTS, e o Dependabot ignora a major de `@types/node` até lá
-  (`.github/dependabot.yml`). O que impede a divergência de virar bug é o
-  piso comum (`engines.node`), não um arquivo compartilhado.
+  virar LTS, e a major de `@types/node` só sobe nessa migração. Não há
+  atualização automática de dependências: o Dependabot foi desligado (ver
+  CHANGELOG), e bumps são PRs próprias. O que impede a divergência de virar
+  bug é o piso comum (`engines.node`), não um arquivo compartilhado.
   `tests/unit/scripts/check-node.spec.ts` percorre `.github/workflows/**` e
   reprova qualquer lane da linha 22 sem minor pinado.
 - **npm:** `npm@11.5.2`, declarado em `package.json` (`packageManager` +
