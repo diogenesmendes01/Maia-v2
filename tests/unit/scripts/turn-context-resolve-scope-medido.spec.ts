@@ -43,7 +43,7 @@ import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { moduloDeProducao } from '../../helpers/modulo-de-producao.js';
 import {
   CARDINALITIES,
-  SCOPE_READS_PER_TURN,
+  SCOPE_READS_PER_TURN_MIN,
   SCOPE_SECTIONS,
   countScopeReads,
   evaluateGate,
@@ -75,8 +75,8 @@ type Linha = Record<string, unknown>;
 const banco = {
   permissoes: [] as Linha[],
   profiles: [] as Linha[],
-  chamadas: { forPessoa: 0, byIds: 0 },
-  /** O maior lote que o `profilesRepo.byIds` recebeu — o JOIN em batch. */
+  chamadas: { forPessoa: 0, forAuthorization: 0 },
+  /** O maior lote que o `profilesRepo.forAuthorization` recebeu — o JOIN em batch. */
   maiorLoteDeProfiles: 0,
   /**
    * Atraso por leitura, em ms. Serve a um caso só: fazer o estágio do escopo
@@ -97,12 +97,13 @@ const permissoesRepo = {
   },
 };
 const profilesRepo = {
-  async byIds(ids: string[], limit = 500): Promise<Linha[]> {
-    banco.chamadas.byIds++;
+  // A leitura de autorização da #738: sem teto, como a de produção.
+  async forAuthorization(ids: string[]): Promise<Linha[]> {
+    banco.chamadas.forAuthorization++;
     await dormir(banco.atraso_ms);
     const distintos = Array.from(new Set(ids));
     banco.maiorLoteDeProfiles = Math.max(banco.maiorLoteDeProfiles, distintos.length);
-    return banco.profiles.filter((p) => distintos.includes(p.id as string)).slice(0, limit);
+    return banco.profiles.filter((p) => distintos.includes(p.id as string));
   },
 };
 
@@ -191,7 +192,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  banco.chamadas = { forPessoa: 0, byIds: 0 };
+  banco.chamadas = { forPessoa: 0, forAuthorization: 0 };
   banco.maiorLoteDeProfiles = 0;
   banco.atraso_ms = 0;
 });
@@ -240,7 +241,7 @@ const TH: Thresholds = {
   max_peak_reads: 6,
   min_concurrent_tenants: 10,
   saturation_ms: 60_000,
-  baseline_tolerance: 0.2,
+  relative_margin: 0.1,
   pairs: 50,
   concurrency: 20,
   sample_gap_factor: 10,
@@ -271,16 +272,19 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     semear(100);
     const { reads, amostra, ctx } = await turnoMedido(pessoaDe(100));
 
-    // 1. As leituras aconteceram, na ordem em que o turno as faz, e são as
-    //    duas seções que o gate cobra.
-    expect(countScopeReads(reads)).toBe(SCOPE_READS_PER_TURN);
+    // 1. As leituras aconteceram, na ordem em que o turno as faz. DUAS é a
+    //    composição MEDIDA do `resolveScope` da `main` (`forPessoa` + `forAuthorization`)
+    //    — um fato desta árvore, não um critério do gate: desde a decisão da
+    //    #525 o gate cobra o piso (≥1) e reporta a contagem.
+    expect(countScopeReads(reads)).toBe(2);
+    expect(countScopeReads(reads)).toBeGreaterThanOrEqual(SCOPE_READS_PER_TURN_MIN);
     expect(reads.map((r) => r.section)).toEqual([
       SCOPE_SECTIONS.permissoes,
       SCOPE_SECTIONS.profiles,
     ]);
-    expect(banco.chamadas).toEqual({ forPessoa: 1, byIds: 1 });
+    expect(banco.chamadas).toEqual({ forPessoa: 1, forAuthorization: 1 });
 
-    // 2. O `byIds` recebeu o LOTE inteiro: 100 perfis distintos num round-trip
+    // 2. O `forAuthorization` recebeu o LOTE inteiro: 100 perfis distintos num round-trip
     //    só. Um N+1 apareceria como 100 chamadas de lote 1.
     expect(banco.maiorLoteDeProfiles).toBe(100);
 
@@ -320,7 +324,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const regressao = await turnoMedido(pessoaDe(1), { resolveScope: async () => fabricado });
 
     expect(countScopeReads(regressao.reads)).toBe(0);
-    expect(banco.chamadas).toEqual({ forPessoa: 0, byIds: 0 });
+    expect(banco.chamadas).toEqual({ forPessoa: 0, forAuthorization: 0 });
 
     const metricsRuins = scopeMetricsFromSamples([regressao.amostra]);
     expect(metricsRuins.scope_reads_per_turn_min).toBe(0);
@@ -347,7 +351,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
       medidos.push((await turnoMedido(pessoaDe(n))).amostra);
     }
     const metricsBons = scopeMetricsFromSamples(medidos);
-    expect(metricsBons.scope_reads_per_turn_min).toBe(SCOPE_READS_PER_TURN);
+    expect(metricsBons.scope_reads_per_turn_min).toBe(2);
     expect(metricsBons.scope_entities_min).toBe(1);
     expect(metricsBons.scope_entities_max).toBe(100);
     const bons = evaluateGate(bracoCom(metricsBons), TH, null, { mode: 'gate', fingerprint: FP });
@@ -422,9 +426,85 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     expect(instrumentado.reads.map((r) => r.section)).toEqual([SCOPE_SECTIONS.permissoes]);
   });
 
+  it('a leitura FUNDIDA da #693 conta como leitura de escopo — o harness mede as duas formas do estágio', async () => {
+    // A decisão da #525 exige que o gate afirme a PROPRIEDADE ("o escopo foi
+    // resolvido no banco, dentro do relógio") sem fixar a implementação. A
+    // prova: um repositório com `forPessoaComProfile` (a fusão da #693),
+    // envolvido pelo MESMO `instrumentAll`, aparece no contador como leitura
+    // de escopo — e a evidência resultante SATISFAZ o gate com 1 leitura por
+    // turno.
+    semear(10);
+    // Objetos NOVOS de ponta a ponta: `reposDoHarness()` reutiliza os
+    // `permissoesRepo`/`profilesRepo` compartilhados do arquivo, e
+    // instrumentá-los de novo empilharia wrapper sobre wrapper — cada leitura
+    // contaria duas vezes nos outros testes.
+    const vazio = async (): Promise<unknown> => undefined;
+    const fundido = {
+      permissoesRepo: {
+        forPessoaComProfile: async (): Promise<unknown> =>
+          banco.permissoes.map((p, i) => ({ permissao: p, profile: banco.profiles[i] })),
+      },
+      profilesRepo: {},
+      operationalProfileVersionsRepo: { getActive: vazio },
+      selfStateRepo: { getActive: vazio },
+      mensagensRepo: { recentInConversation: vazio },
+      entidadesRepo: { byIdsWithState: vazio },
+      entityStatesRepo: { byIds: vazio },
+      factsRepo: { listMentionableForScopes: vazio },
+      rulesRepo: { listActive: vazio },
+      memoryEntryRepo: { findRelevant: vazio },
+      behavioralHintRepo: { findActiveForScopes: vazio },
+      capabilitiesSkillRepo: { listAll: vazio },
+      capabilityGapsRepo: { listByLevels: vazio },
+      procedureExecutionsRepo: { findActiveForConversa: vazio },
+      procedureDefinitionsRepo: { findById: vazio },
+    } as unknown as InstrumentableRepos;
+    instrumentAll(fundido);
+
+    const frame = newTurnFrame(0, 'bench525-t0', 10);
+    await runInTurnFrame(frame, async () => {
+      await (
+        fundido.permissoesRepo as unknown as { forPessoaComProfile: (id: string) => Promise<unknown> }
+      ).forPessoaComProfile('p0');
+    });
+    expect(frame.reads.map((r) => r.section)).toEqual([SCOPE_SECTIONS.permissoes_com_profile]);
+    expect(countScopeReads(frame.reads)).toBe(1);
+
+    // …e o veredicto aceita a forma fundida: 1 leitura por turno, cardinalidade
+    // batendo — nenhum critério do escopo reprova.
+    const amostras = [...CARDINALITIES].map((n) => ({
+      entities: n,
+      scope_entities: n,
+      scope_ms: 1,
+      reads: [{ section: SCOPE_SECTIONS.permissoes_com_profile }],
+    }));
+    const metrics = scopeMetricsFromSamples(amostras);
+    expect(metrics.scope_reads_per_turn_min).toBe(1);
+    expect(metrics.scope_reads_per_turn_max).toBe(1);
+    const verdicts = evaluateGate(bracoCom(metrics), TH, null, { mode: 'gate', fingerprint: FP });
+    const falhasDoEscopo = verdicts
+      .filter((v) => !v.passed)
+      .filter(
+        (v) =>
+          v.label.includes('foi EXERCITADO') ||
+          v.label.includes('veio do BANCO') ||
+          v.label.includes('aceite completo'),
+      );
+    expect(falhasDoEscopo).toEqual([]);
+
+    // CONTROLE NEGATIVO no mesmo `it`: sem leitura nenhuma o mesmo veredicto
+    // reprova — a aceitação da forma fundida não abriu a porta da vacuidade.
+    const vazias = amostras.map((a) => ({ ...a, reads: [] }));
+    const ruins = evaluateGate(bracoCom(scopeMetricsFromSamples(vazias)), TH, null, {
+      mode: 'gate',
+      fingerprint: FP,
+    });
+    expect(ruins.some((v) => !v.passed && v.label.includes('foi EXERCITADO'))).toBe(true);
+  });
+
   it('as leituras do escopo NÃO inflam o pico de leituras simultâneas — elas são sequenciais', async () => {
     // O `resolveScope` roda ANTES do `ReadGate`, e suas duas leituras são
-    // sequenciais entre si (`byIds` depende do resultado de `forPessoa`).
+    // sequenciais entre si (`forAuthorization` depende do resultado de `forPessoa`).
     // Logo elas somam 2 às LEITURAS POR TURNO e nada ao PICO — que é o que o
     // teto de 6 (`TURN_CONTEXT_MAX_CONCURRENT_READS`) mede.
     semear(100);
@@ -437,7 +517,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
         runWithTenantContext: (_t, fn) => fn(),
       }),
     );
-    expect(frame.reads).toHaveLength(SCOPE_READS_PER_TURN);
+    expect(frame.reads).toHaveLength(2);
     expect(frame.peak).toBe(1);
   });
 
@@ -564,12 +644,12 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
         }));
       }
       for (const m of medidos) {
-        expect(countScopeReads(m.reads)).toBe(SCOPE_READS_PER_TURN);
+        expect(countScopeReads(m.reads)).toBe(2);
         expect(m.scope_ms).toBeGreaterThanOrEqual(15);
         expect(m.ms).toBeGreaterThanOrEqual(m.scope_ms);
       }
       const metrics = scopeMetricsFromSamples(medidos);
-      expect(metrics.scope_reads_per_turn_min).toBe(SCOPE_READS_PER_TURN);
+      expect(metrics.scope_reads_per_turn_min).toBe(2);
       expect(metrics.scope_cardinality_mismatches).toBe(0);
       const verdicts = evaluateGate(bracoCom(metrics), TH, null, { mode: 'gate', fingerprint: FP });
       expect(verdicts.find((v) => v.label.includes('aceite completo'))!.passed).toBe(true);

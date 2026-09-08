@@ -916,7 +916,7 @@ isso pelo nome: denominador comum não é justificativa individual. O vocabulár
 | `blocked_by` | Quantas | O que desbloqueia |
 |---|---|---|
 | `no_turn_to_anchor` | 2 (`identity/quarantine`, `workers/pending-reminder`) | Uma âncora durável para saída SEM turno, com entrega própria. O bloqueio é de CÓDIGO, não de schema — ver a correção acima |
-| `foreign_recipient` | 1 (`agent/message-update`) | Uma identidade lógica de saída dirigida a TERCEIRO — o JID hoje é resolvido no ingresso do job pela `conversa_id` da row |
+| `send_result_dependency` | 1 (`agent/message-update`) | O call site deixar de depender do id do provedor devolvido pelo envio direto: o ledger já persiste `whatsapp_id` (`historico.ts`), então a gravação em `mensagens` e o vínculo com a `pending_question` passam a ler de lá. (Era `foreign_recipient`; destinatário terceiro nunca foi o impedimento — corrigido em 2026-09-04) |
 | `competing_durable_ledger` | 2 (`scheduling/outbox-drain`, `workers/idempotency-outbox-relayer`) | A FUSÃO dos ledgers. Ligar o drain ao outbox do turno criaria dois senders autoritativos — o que a §Rollback da issue proíbe nominalmente |
 | `ephemeral_signal_without_provider_id` | 1 (`agent/react-loop`) | Uma capability de provedor que confirme reação. Hoje `sendReaction` devolve `void`, o adaptador só pode dizer `accepted_without_id`, e toda reação migrada nasceria `delivery_unknown` → `escalate_manual`: uma linha de trabalho HUMANO por reação |
 

@@ -193,11 +193,29 @@ describe('piso de volume da rodada de integração', () => {
       expect(invalido.saida).toMatch(/--min precisa ser um inteiro/);
     });
 
-    it('NÃO reprova por pulados sozinhos — o skip de integração sem TEST_DB_URL é legítimo', () => {
-      // Um piso de zero pulados aqui quebraria o uso local e seria desligado
-      // na primeira semana. O piso que importa é o de EXECUTADOS.
+    it('SEM `--max-pulados`, não reprova por pulados sozinhos — o default serve à rodada local', () => {
+      // Sem banco, na máquina de quem desenvolve, a integração pula por
+      // desenho. Um default de zero pulados quebraria o uso local e seria
+      // desligado na primeira semana. Por isso o teto é OPCIONAL no guard e
+      // ligado só onde a lane promete zero — ver o caso da fiação do CI.
       const r = comArquivo(resumo(1131, 0, 69), (f) => rodarGuard([f]));
       expect(r.code).toBe(0);
+    });
+
+    it('COM `--max-pulados 0`, a mesma rodada REPROVA — e a rodada sem pulados passa (controle)', () => {
+      // O par que dá sentido ao caso acima: o mesmo resumo, a mesma
+      // ferramenta, e o veredicto mudando só por causa do teto. Sem o
+      // controle, "reprova sempre" também passaria neste `it`.
+      const comPulados = comArquivo(resumo(1131, 0, 69), (f) =>
+        rodarGuard([f, '--max-pulados', '0']),
+      );
+      expect(comPulados.code).toBe(1);
+      expect(comPulados.saida).toMatch(/69 caso\(s\) PULADO\(s\)/);
+
+      const semPulados = comArquivo(resumo(1207, 0, 0), (f) =>
+        rodarGuard([f, '--max-pulados', '0']),
+      );
+      expect(semPulados.code).toBe(0);
     });
   });
 
@@ -288,6 +306,40 @@ describe('piso de volume da rodada de integração', () => {
       const m = /--min\s+(\d+)/.exec(piso?.run ?? '');
       expect(m, 'o passo do piso não declara --min').not.toBeNull();
       expect(Number.parseInt(m?.[1] ?? '0', 10)).toBeGreaterThanOrEqual(1);
+    });
+
+    it('o teto de pulados da lane de integração é ZERO — `--min` sozinho não vê cobertura sumir', () => {
+      // `--min 1` reprova a rodada VAZIA e nada mais. Ele não vê mil e
+      // duzentos casos rodarem enquanto dez somem — `executados` continua
+      // muito acima do piso e o gate aprova. Nesta lane o skip não é escolha
+      // do autor do teste: é o que 121 arquivos fazem quando `TEST_DB_URL` e
+      // `DATABASE_URL` deixam de bater, ou quando o runtime de container
+      // some. Perder a lane inteira para `describe.skip` sem uma linha
+      // vermelha é o verde vazio que este piso existe para impedir.
+      //
+      // Zero não é meta: é o número que a lane JÁ tem (`executados=1207
+      // falharam=0 pulados=0` nas duas pernas da matriz). O teto não aperta
+      // nada hoje; impede que a perda seja silenciosa amanhã.
+      const passos = workflow().jobs?.['integration']?.steps ?? [];
+      const piso = passos.find((p) => (p.run ?? '').includes('check-vitest-summary.ts'));
+      const teto = /--max-pulados\s+(\d+)/.exec(piso?.run ?? '');
+      expect(
+        teto,
+        'o piso da integração voltou a aceitar qualquer número de pulados: ' +
+          'uma lane que pula quando o banco falta passa a aprovar em silêncio',
+      ).not.toBeNull();
+      expect(Number.parseInt(teto?.[1] ?? '-1', 10)).toBe(0);
+    });
+
+    it('a lane de fault injection continua com o MESMO teto — o controle que impede regressão de um lado só', () => {
+      // As duas lanes dependem da mesma infraestrutura obrigatória. Endurecer
+      // uma e deixar a outra afrouxar seria trocar um buraco de lugar.
+      const passos = workflow().jobs?.['reliability']?.steps ?? [];
+      const piso = passos.find((p) => (p.run ?? '').includes('check-vitest-summary.ts'));
+      expect(piso, 'o piso de volume sumiu da lane de fault injection').toBeDefined();
+      const teto = /--max-pulados\s+(\d+)/.exec(piso?.run ?? '');
+      expect(teto, 'a lane de fault injection perdeu o teto de pulados').not.toBeNull();
+      expect(Number.parseInt(teto?.[1] ?? '-1', 10)).toBe(0);
     });
 
     it('o E2E do console segue intacto — a correção é do e2e de BACKEND', () => {

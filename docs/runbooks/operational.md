@@ -1377,7 +1377,9 @@ produção, dentro do mesmo relógio.
 > **Agora o escopo é resolvido no Postgres, dentro do relógio.** A massa semeia
 > TRÊS pessoas por par — uma com 1, outra com 10, outra com 100 linhas em
 > `permissoes`, cada permissão apontando para um `permission_profiles`
-> distinto (100 por par, sob o teto de 500 do `profilesRepo.byIds`). A
+> distinto (100 por par — aquém do teto de 500 que o `profilesRepo.byIds` tinha
+> à época; a #738 removeu o teto da leitura de autorização, hoje
+> `profilesRepo.forAuthorization`). A
 > cardinalidade 1/10/100 do enunciado passou a ser o tamanho do escopo
 > RESOLVIDO, não uma fatia em memória.
 >
@@ -1448,7 +1450,9 @@ echo $?     # 0 = gate passou · 1 = reprovou · 2 = erro de uso/infra
 
 Este comando exige um baseline compatível registrado (ver "Baseline" abaixo).
 Numa máquina nova ele reprova dizendo que não tem a referência — e isso é o
-comportamento correto: o gate promete `p95 ≤ baseline + 20%` e não pode carimbar
+comportamento correto: o gate promete os critérios relativos (p95/p99 ≤
+baseline × 1.10, throughput ≥ baseline × 0.90 — margem nomeada em
+`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`) e não pode carimbar
 o que não mediu. Para medir sem baseline, use `--mode measure`.
 
 Saída em JSON para uma esteira: `npm run turn:bench -- --sustain-s 60 --json`.
@@ -1461,9 +1465,10 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `p95 ≤ 600 ms` / `p99 ≤ 1 s` | a carga de contexto passou do orçamento | olhe a tabela "latência por leitura" na própria saída — ela diz QUAL leitura cresceu |
 | `zero erros e zero timeouts` | um turno falhou ou passou de `--timeout-ms` (default 5 s, o mesmo `connectionTimeoutMillis` do pool) | a saída traz as duas primeiras mensagens de erro |
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
-| `o resolveScope foi EXERCITADO: 2 leituras por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem `permissoes`/`permission_profiles`, ou as duas leituras fora do `instrumentAll`) ou apareceu um **N+1** no escopo (>2) | leia o número no detalhe. `0–0` é medição ausente, não desempenho; `2–101` é o `byId` por permissão que a #511 removeu |
-| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada pelo teto de 500 do `profilesRepo.byIds` |
-| `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` na tabela "latência por leitura": elas dizem qual das duas cresceu |
+| `o resolveScope foi EXERCITADO: ≥1 leitura de escopo por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem as tabelas do escopo, ou as leituras fora do `instrumentAll`) | leia o número no detalhe. `0–0` é medição ausente, não desempenho. O número em si é dado medido (2 na `main`, 1 com a fusão da #693) — decisão da #525 |
+| `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N. `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu. O teto absoluto é linha de relatório, não critério |
+| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada na leitura de perfis (`profilesRepo.forAuthorization` não tem `LIMIT` desde a #738 — se divergir, procure um `.limit()` reintroduzido ou um profile de outro tenant) |
+| `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` (ou `scope_permissoes_com_profile`, na árvore da #693) na tabela "latência por leitura" |
 | `aceite completo do orçamento do turno` **vermelho** | a flag de cobertura diz que mede e os números dizem que não | é o caso "a flag não prova a si mesma": o detalhe traz os três números medidos. Não vire a flag — conserte a medição |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |
 | `≥ 10 tenants concorrentes` | a corrida não foi multi-tenant de verdade | rodou com `--pairs`/`--concurrency` menores que o enunciado |
@@ -1471,8 +1476,10 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `o pool drena` (perfil normal) | a fila do pool nunca esvaziou durante a carga | ver "ritmo" abaixo — quase sempre é a carga oferecida, não o código |
 | `perfil de SATURAÇÃO: o pool drena depois que o produtor para` | a fila continuou cheia com ninguém pedindo nada | isso é conexão vazando, não carga: procure quem não devolveu o client ao pool |
 | `…{phase="loader"} observou todos os turnos` | a métrica do aceite parou de sair | `buildPrompt` deixou de publicar, ou deixou de chamar o loader |
-| `p95 ≤ baseline + 20%` **vermelho** | regressão relativa | ver "baseline" abaixo antes de culpar o código |
-| `p95 ≤ baseline + 20%` **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
+| `p95 ≤ baseline × 1.10` / `p99 ≤ baseline × 1.10` **vermelho** | regressão relativa de latência — o critério PRINCIPAL desde a decisão da #525 | ver "baseline" abaixo antes de culpar o código |
+| `throughput ≥ baseline × 0.90` **vermelho** | a vazão caiu além da margem — latência paga com fila | compare a linha `throughput (turnos/s)` dos dois relatórios |
+| `latência por cardinalidade ≤ baseline × 1.10` **vermelho** | a regressão mora numa cardinalidade só (tenant "elefante") | o detalhe diz qual N regrediu; olhe a tabela por cardinalidade |
+| critérios relativos **`n/a`** | não há baseline, ou o que há foi medido com OUTRA carga (ou formato < v4, sem throughput/cardinalidade) | a saída lista campo a campo o que divergiu. Re-grave com a forma desta corrida |
 | `carga conforme o enunciado` | a corrida não tem a forma do gate | use o comando canônico acima |
 
 ### Ritmo da carga (`--think-ms`) — leia antes de abrir bug de pool
@@ -1548,12 +1555,18 @@ primeira corrida. Três regras:
    a 130 % acima do número gravado, sem que nenhum limite absoluto do gate
    (600 ms / 1 s) chegasse perto de cair. Versionar esse arquivo entregaria um
    gate vermelho na chegada para todo mundo que não fosse a máquina que o gravou.
-2. **A variação entre corridas iguais na mesma sessão é de ~10–15 %**; a folga de
-   +20 % é dimensionada para isso. Ela NÃO absorve troca de máquina, de contêiner
-   nem host ocupado — nesses casos re-grave, não discuta o delta.
-3. **Re-gravar é uma decisão de revisão.** A folga existe para absorver ruído, não
-   regressão. Se o p95 subiu por um motivo aceito, re-grave no MESMO PR que
-   aceitou o motivo — não numa corrida solta.
+2. **A margem relativa é de 10 %** (`MARGEM_RELATIVA_DEFAULT`, `--relative-margin`;
+   ratificada pelo dono em 2026-09-03) — e ela é **orçamento de regressão, não
+   medida de ruído**: responde quanto de p95/p99/throughput aceitamos PAGAR por um
+   candidato, não quanto o host oscila. O ruído é problema do PROTOCOLO: baseline
+   e candidato na mesma janela, na mesma máquina, com o controle (a própria base
+   re-medida contra o próprio baseline) dizendo quanto é ruído. Se o controle
+   estourar a margem, a janela não sustenta veredicto — re-meça numa janela mais
+   quieta, com medições alternadas; **nunca afrouxe o número**, porque cada ponto
+   dado ao ruído é um ponto de regressão real que entra sem ser visto. Troca de
+   máquina, de contêiner ou host ocupado: re-grave o baseline, não discuta o delta.
+3. **Re-gravar é uma decisão de revisão.** Se o p95 subiu por um motivo aceito,
+   re-grave no MESMO PR que aceitou o motivo — não numa corrida solta.
 
 #### O fingerprint: comparar dois p95 medidos com cargas diferentes não é comparar
 
@@ -1649,6 +1662,115 @@ npm run turn:bench -- --cleanup-only
 
 O harness **nunca roda `ANALYZE`** — num banco compartilhado com a suíte,
 `ANALYZE` não é desfeito por `ROLLBACK` e envenenaria o plano dos outros specs.
+
+---
+
+## 12. A/B de overhead do trace OTLP ligado sob carga (issue #535, critério 4)
+
+`npm run otlp:bench` é a resposta à decisão do dono de 2026-09-03 — "o
+micro-benchmark atual não fecha o critério de overhead; preciso de A/B com OTLP
+ligado, cobrindo serialização, batching, collector/rede e hot path sob carga".
+Ele dirige turnos **reais** pelo entry point do worker (`runAgentForMensagem`,
+nas mesmas três camadas de `src/gateway/queue.ts`) contra um Postgres real, e
+compara três braços no **mesmo processo, mesma massa, mesma janela,
+alternados** por rodada (quadrado latino — cada rodada começa por um braço
+diferente):
+
+| braço | o que é |
+|---|---|
+| `off` | O caminho de produção de hoje (`tracingEnabled() === false`). O harness **prova** o curto-circuito com duas medições: `tracingEnabled()` lido durante o braço e zero bytes no collector. "Zero spans no sink" não é medido — o sink é `null` por construção, e instalar um contador para medi-lo viraria o próprio boolean |
+| `on-local` | O `OtlpSpanExporter` de produção (fila 2048, batch 256, tick 5 s) com `MAIA_OTLP_SAMPLE_RATIO=1` — pior caso; produção é 0,05 — contra um collector HTTP local que aceita `/v1/traces`, conta spans/bytes/batches e responde 200 |
+| `on-slow` | O mesmo collector com 200 ms de atraso (`--collector-delay-ms`) e 20 % dos batches recusados com 503 (`--collector-fail-ratio`): collector lento/caído NÃO pode tocar o hot path |
+
+O que é sintético — e por isso os números são **piso, não produção**: o
+provider de LLM (`_injectProviderForTests`, o mesmo seam de `llm:bench`),
+que responde em 0 ms e torna o turno o mais sensível possível ao custo da
+instrumentação; o canal, semeado `is_synthetic = true` para que a fronteira
+única de saída o roteie ao sink inerte da plataforma; e o collector, que roda
+em-processo (viés conservador: disputa o event loop com os turnos).
+
+### O comando
+
+```bash
+DATABASE_URL=postgres://maia_test:test1234@localhost:5432/maia_test \
+  npm run otlp:bench                              # gate: 3 rodadas × 200 turnos por braço
+npm run otlp:bench -- --mode measure --rounds 5 --turns 400
+npm run otlp:bench -- --scenario tool            # cobre tool.dispatch e os quatro portões
+npm run otlp:bench -- --json
+```
+
+Pré-requisitos: banco migrado (o seed cria pessoa `dono`, canal sintético,
+política de canal, entidade e permissão por slot de concorrência, e apaga tudo
+no fim) e Redis. Sem `MAIA_OTLP_TRACES_ENDPOINT` no ambiente — o harness
+aponta o endpoint para o collector dele ANTES de importar o projeto e confere
+que `config` congelou com esse valor.
+
+### Os critérios (cada um nomeado no relatório, com o número e o limiar)
+
+| critério | limiar | por quê |
+|---|---|---|
+| `[off]` curto-circuito provado | `tracingEnabled=false` e collector 0 bytes (medidos); sink=null por construção (guarda: o harness não pode ter instalado sink no `off`) | Sem isso o braço de referência não é o caminho de produção |
+| `[on-local]`/`[on-slow]` p95 e p99 do turno | ≤ `off` × 1,10 | Margem ratificada (#736): orçamento de regressão, não medida do ruído |
+| `[on-local]`/`[on-slow]` throughput | ≥ `off` × 0,90 | idem |
+| erros novos | 0 (erros ≤ erros do `off`) | Observabilidade nunca é participante do fluxo de controle |
+| cada turno alcançou o modelo | chamadas ao provider ≥ turnos | Anti-vacuidade: um turno que morreu cedo não abre span e reduziria o custo aparente |
+| `not_sampled = 0` | — | Prova que o pior caso (ratio 1) foi o que rodou |
+| `[on-local]` recebidos = emitidos − not_sampled; descartes = 0 | — | Collector saudável ⇒ sem perda; a métrica `maia_otlp_spans_exported_total` tem de bater com o que o collector contou |
+| `[on-slow]` perda contabilizada | emitidos = recebidos + descartados por `reason`; `http_5xx` = recusados pelo collector | Nenhum span sem destino conhecido — a perda é contada, não zero |
+| `[on-slow]` fila ≤ 2048 | `--queue-size` | O teto de memória vale sob collector lento |
+| `[on-slow]` collector degradado de fato | export p50 ≥ atraso; batches recusados > 0 | Anti-vacuidade: o braço tem de ter sido lento MESMO |
+
+`skipped ⇒ passed=false`: um braço que não rodou reprova o gate em vez de
+sumir do veredicto. `--mode measure` mede, imprime os mesmos critérios como
+informação e sai 0 dizendo em caixa alta que não houve veredicto.
+
+### Cardinalidade real
+
+O relatório traz o delta de linhas em `/metrics` antes e depois de **cada**
+braço e as séries `maia_*` por família. O que o tráfego deste harness cunha
+no caminho ligado são as séries do próprio exporter (`maia_otlp_export_duration_ms`,
+`maia_otlp_spans_exported_total`, `maia_otlp_spans_dropped_total{reason}`,
+`maia_otlp_queue_depth`) — uma vez por processo, nunca por turno. O que
+CONTINUA sem medição é a cardinalidade sob tráfego REAL de produção: por
+decisão do dono, tráfego real é gatilho de validação pós-canário, não
+substituto desta prova.
+
+### Provar que o gate reprova
+
+```bash
+npm run otlp:bench -- --self-test                                   # exit 0 sobre números sintéticos saudáveis
+npm run otlp:bench -- --self-test --inject on-local.p95_ms=900      # exit 1: p95 acima de off × 1,10
+npm run otlp:bench -- --self-test --inject on-local.spans_received=10   # exit 1: perda com collector saudável
+npm run otlp:bench -- --self-test --inject on-slow.queue_depth_max=4096 # exit 1: fila acima do teto
+npm run otlp:bench -- --self-test --inject off.sink_calls=1            # exit 1: um sink instalado no `off`
+```
+
+`--inject` só existe junto de `--self-test`; numa corrida medida ele é
+recusado. A sonda no harness REAL — a que prova que o veredicto está ligado
+aos números MEDIDOS e não a um carimbo — é injetar custo no hot path e ver o
+gate reprovar: um busy-wait de 2 ms por span no sink do harness
+(`setupArm`, `scripts/otlp-overhead-benchmark.ts`) põe ~30 ms em cada turno
+ligado e deixa `[on-local]`/`[on-slow] p95` vermelhos; desfaça, `git diff`
+limpo, verde de novo. `--relative-margin 0` é a sonda barata, mas só fica
+vermelha quando o custo medido é positivo — num host quieto o braço ligado
+pode ficar ABAIXO do `off` por ruído, e isso não é defeito do gate. O spec
+unitário `tests/unit/scripts/otlp-overhead-benchmark.spec.ts` prova cada
+critério por injeção, sem banco.
+
+### Lendo o vermelho
+
+- **`on-local` reprova por pouco e SÓ na primeira rodada em que rodou**: é
+  aquecimento assimétrico, não overhead — a primeira corrida deste harness
+  aqueceu só o `off` e o `on-local` estreou o caminho de export (JIT de
+  `encodeSpans`/`JSON.stringify`, primeira conexão do `fetch`) dentro do
+  relógio. Desde então o aquecimento percorre todos os braços
+  (`--warmup-turns` é POR braço). A margem não se mexe.
+- **`on-slow` reprova em latência**: o collector lento chegou ao hot path.
+  Olhe `fila max` (o exporter está bloqueando?) e `export p95` — o transporte
+  é assíncrono por construção, então isso é bug do exporter, não do collector.
+- **perda não contabilizada**: `emitidos ≠ recebidos + descartados`. Ou o
+  exporter perdeu span sem contar (bug) ou o collector contou errado — o
+  `parse_errors` do collector separa os dois.
 
 ---
 

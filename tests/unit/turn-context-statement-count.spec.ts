@@ -327,16 +327,14 @@ describe('#525 turn round-trips, counted as SQL statements', () => {
     expect(unscoped).toEqual([]);
   });
 
-  it('the ≤8 target of #525 is still open, and the gap is honest', async () => {
-    const { TURN_ROUND_TRIP_BUDGET, TURN_ROUND_TRIP_TARGET } = await import(
-      '../../src/agent/turn-context/types.js'
-    );
+  it('the measured count IS the declared budget — the count survives as guardrail, not goal', async () => {
+    const { TURN_ROUND_TRIP_BUDGET } = await import('../../src/agent/turn-context/types.js');
     const { counted } = await measureTurn(1);
-    // Measured, not estimated: the turn really costs 13 statements, the goal is
-    // 8, and the five remaining merges are listed in
-    // docs/architecture/modules/agent.md. Asserting the real distance keeps the
-    // open goal from being quietly rounded down to "close enough".
+    // Measured, not estimated: the turn really costs 13 statements. Since the
+    // #525 owner decision (2026-09-02) this number is a GUARDRAIL against
+    // silent growth (a new read must change the budget in the same diff), not
+    // a distance to a ≤8 goal — that goal was retired; the acceptance
+    // criterion is latency, judged by the gate (`npm run turn:bench`).
     expect(counted).toBe(TURN_ROUND_TRIP_BUDGET);
-    expect(counted - TURN_ROUND_TRIP_TARGET).toBe(5);
   });
 });

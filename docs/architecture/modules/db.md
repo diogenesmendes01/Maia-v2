@@ -70,6 +70,19 @@ Two rules follow, and both are asserted in
    purpose. Silently dropping rows that feed it is a governance failure wearing
    a performance costume.
 
+A third rule follows from issue #738, asserted in
+`tests/integration/resolve-scope-501-profiles-real-db.spec.ts`:
+
+3. **A read that decides access has no `LIMIT`.** `profilesRepo.byIds(ids,
+   limit = 500)` fed `resolveScope`; past 500 *distinct* profile ids the surplus
+   was cut by id order and the permissions pointing at them were dropped as
+   "unresolvable" — real grants lost in silence. It is now
+   `profilesRepo.forAuthorization(ids)`: tenant-scoped, `inArray` over the
+   distinct ids, `ORDER BY id`, no cap — bound by the person's own `permissoes`
+   rows. Still two round-trips in `resolveScope` (no JOIN, no batching loop). A
+   ceiling on how many grants a person may hold, if ever wanted, is a fail-closed
+   validation at grant time, never a cut at read time.
+
 Tenant predicates survive both rules: on a LEFT JOIN the `(tenant_id, agent_id)`
 predicate for the joined table belongs in the **JOIN condition**, never the
 `WHERE`. `entity_states`'s PK is `entidade_id` alone, so a foreign state row
