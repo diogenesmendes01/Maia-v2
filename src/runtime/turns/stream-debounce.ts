@@ -50,7 +50,7 @@
  */
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
-import { incCounter, observeHistogram, registerHistogramBuckets } from '@/lib/metrics.js';
+import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import {
   METRIC,
   STREAM_DEBOUNCE_CLOSE_RESULTS,
@@ -58,6 +58,7 @@ import {
 } from '@/observability/taxonomy.js';
 import type { DebounceCloseResult } from '@/db/repositories/turn-repos.js';
 import { contractEnv } from '@/config/contract-env.js';
+import { registrarSeriesDeDebounce, _resetSeedForTests } from './stream-debounce-series.js';
 
 /**
  * O debounce TRANSACIONAL está ligado?
@@ -88,50 +89,12 @@ export function transactionalDebounceEnabled(): boolean {
   );
 }
 
-/**
- * Os baldes de `maia_stream_debounce_batch_size`.
- *
- * Um batch tem entre 1 e uma dezena de mensagens. Os baldes padrão de
- * `src/lib/metrics.ts` são de MILISSEGUNDOS (50, 100, 250, …), então sem esta
- * declaração toda amostra cairia em `le="50"` e a série pareceria uma
- * distribuição sem separar nada — um `histogram_quantile()` devolveria um
- * número que parece medido e não é.
- *
- * O `1` como primeiro balde não é decoração: `le="1"` sobre o total é a fração
- * de rodadas em que o debounce NÃO agrupou nada, que é a única leitura que
- * responde "esta fatia está pagando por si?".
- */
-const BALDES_DO_BATCH: readonly number[] = [1, 2, 3, 5, 10, 25, 50];
-
-let semeado = false;
-
-/**
- * Semeia as séries em zero e declara os baldes. Idempotente e sem I/O.
- *
- * Pela mesma razão de `registrarSeriesDeStream` (#626): `src/lib/metrics.ts`
- * cria a série na PRIMEIRA incrementação, então uma métrica que ainda não
- * aconteceu simplesmente não aparece em `/metrics` — e um alerta escrito contra
- * ela nunca dispara, não por estar tudo bem, mas por não haver série. É a forma
- * mais silenciosa de um alerta falhar, e ela se parece exatamente com sucesso.
- *
- * Exportada (e não um efeito de topo) porque `_resetForTests()` apaga o mapa
- * inteiro: uma spec que reseta e depois afirma "a série existe" precisa semear
- * de novo. E porque um módulo alcançado pelo grafo do repositório não pode ter
- * efeito no import — foi o que quebrou três specs alheias em #626.
- */
-export function registrarSeriesDeDebounce(): void {
-  registerHistogramBuckets(METRIC.STREAM_DEBOUNCE_BATCH_SIZE, BALDES_DO_BATCH);
-  if (semeado) return;
-  semeado = true;
-  for (const result of STREAM_DEBOUNCE_CLOSE_RESULTS) {
-    incCounter(METRIC.STREAM_DEBOUNCE_CLOSE, { result }, 0);
-  }
-}
-
-/** Só para teste: permite semear de novo depois de `_resetForTests()`. */
-export function _resetSeedForTests(): void {
-  semeado = false;
-}
+// Issue #726: a semeadura das séries (`registrarSeriesDeDebounce`, os baldes
+// de `maia_stream_debounce_batch_size` e `_resetSeedForTests`) vive em
+// `./stream-debounce-series.ts`, sem dependências, para que o boot da
+// observabilidade não arraste este grafo. Reexportada daqui pelos chamadores
+// que já existiam (o import está no bloco do topo).
+export { registrarSeriesDeDebounce, _resetSeedForTests };
 
 /**
  * Registra o desfecho de UMA tentativa de fechamento e, quando fechou,

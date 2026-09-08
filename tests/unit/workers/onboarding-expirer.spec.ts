@@ -88,7 +88,6 @@ import {
   _resetWorkerStateForTests,
   activeWorkerJobs,
 } from '@/workers/index.js';
-import { runOnboardingExpirer } from '@/workers/onboarding-expirer.js';
 
 function registryJob() {
   return JOBS.find((j) => j.name === 'onboarding_expirer');
@@ -111,7 +110,13 @@ describe('worker onboarding_expirer (issue #519)', () => {
       expect(job!.cron).toBe('*/5 * * * *');
       // startWorkers(1) ignora phase > 1 — fase 2+ nunca rodaria em produção.
       expect(job!.phase).toBe(1);
-      expect(job!.fn).toBe(runOnboardingExpirer);
+      // Issue #726: o registro carrega o handler no primeiro tick
+      // (`lazy(() => import('./onboarding-expirer.js'), ...)`), então `job.fn`
+      // é o invólucro, não `runOnboardingExpirer` por identidade. Que o
+      // invólucro chega em `runOnboardingExpirer` — e não num stub — é o que o
+      // caso seguinte prova, chamando-o e observando `expireStale`; a
+      // identidade por referência deixou de ser o que liga a entrada ao código.
+      expect(typeof job!.fn).toBe('function');
     });
 
     it('a fn registrada é a que chama expireStale (não um stub)', async () => {

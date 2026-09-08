@@ -5,18 +5,22 @@
  * de-facto observability bootstrap. Rather than add four more calls there,
  * everything #535 introduces is wired from HERE and `server.ts` gains a single
  * line. The practical payoff: the sources these collectors read (`pg.Pool`,
- * the Baileys socket, the scheduler tables) are imported lazily inside this
+ * the scheduler tables, the repositories) are imported lazily inside this
  * module, so importing the taxonomy or the label gate still does not drag the
- * driver, the WhatsApp stack or the DB client into a unit test.
+ * driver or the DB client into a unit test. The WhatsApp session state is the
+ * exception that proves the rule (#726): it comes from
+ * `@/gateway/baileys-connection-state.js`, a dependency-free module, because a
+ * lazy `import()` that this function AWAITS is not lazy for whoever calls it.
  */
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
+import { isBaileysConnected, getLastDisconnectAt } from '@/gateway/baileys-connection-state.js';
 import { registerBackupReadinessGauges } from './backup-readiness-collector.js';
 import { registerMigrationGauges } from './migration-collector.js';
 import { registerOnboardingExpiryGauges } from './onboarding-expiry-collector.js';
 import { startOtlpExporter } from './otlp-exporter.js';
 import { registrarSeriesDeStream } from '@/runtime/turns/stream-metrics.js';
-import { registrarSeriesDeDebounce } from '@/runtime/turns/stream-debounce.js';
+import { registrarSeriesDeDebounce } from '@/runtime/turns/stream-debounce-series.js';
 import { registerStreamFairnessGauges } from './stream-fairness-collector.js';
 import {
   registerDbPoolGauges,
@@ -88,15 +92,16 @@ export async function registerRuntimeObservability(): Promise<void> {
     logger.debug({ err }, 'observability.db_pool_gauges_failed');
   }
 
-  try {
-    const { isBaileysConnected, getLastDisconnectAt } = await import('@/gateway/baileys.js');
-    registerWhatsAppSessionGauges({
-      connected: isBaileysConnected,
-      lastDisconnectAt: getLastDisconnectAt,
-    });
-  } catch (err) {
-    logger.debug({ err }, 'observability.whatsapp_session_gauges_failed');
-  }
+  // Issue #726: o estado da sessão vem de `baileys-connection-state.ts`, um
+  // módulo sem dependências que `baileys.ts` escreve. Antes era
+  // `await import('@/gateway/baileys.js')` aqui dentro — "lazy" só no sentido
+  // de não ser import de topo: esta função o ESPERAVA, então todo teste da
+  // fiação do boot pagava o grafo inteiro do gateway (257 arquivos de `src/`,
+  // 3,4 MB de TS; 3,4–3,9 s isolado). Ler o estado não precisa do gateway.
+  registerWhatsAppSessionGauges({
+    connected: isBaileysConnected,
+    lastDisconnectAt: getLastDisconnectAt,
+  });
 
   registerSchedulerLagGauges(schedulerLagSnapshot);
 
