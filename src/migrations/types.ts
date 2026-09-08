@@ -107,8 +107,9 @@ export type ArtifactProblemKind =
   /**
    * A `-- maia:no-transaction` migration whose SQL the parser-free splitter
    * (`splitNoTxStatements`) cannot divide safely: a dollar-quoted body, a
-   * string literal containing `;`, or any other shape on which `split(';')`
-   * and the lexical tokeniser disagree. Sent as-is, Postgres would receive a
+   * `;` inside a string literal (`E'…'` escapes included), a quoted
+   * identifier or a block comment, or a `--` inside any of those (the line
+   * stripper would truncate the token). Sent as-is, Postgres would receive a
    * fragment and the ledger would record `42601` as `dirty` — so the file is
    * refused at discovery, before any connection, with the cause named
    * (issue #733).

@@ -353,15 +353,19 @@ export function splitNoTxStatements(sql: string): string[] {
 export type NoTxSplitHazard =
   /** A dollar-quoted body (`DO $$ … $$`, `$tag$ … $tag$`): the split cuts inside it. */
   | 'dollar_quoted_body'
-  /** A single-quoted string literal with a `;` inside it. */
+  /** A string literal (`'…'`, or `E'…'` with its backslash escapes honoured) with a `;` inside it. */
   | 'semicolon_in_string_literal'
+  /** A `;` inside a quoted identifier or a block comment — the split cuts there too. */
+  | 'hidden_semicolon'
   /**
-   * Any other shape on which `split(';')` and the lexical tokeniser disagree
-   * about how many statements there are — a `;` inside a block comment or a
-   * quoted identifier, or a `--` inside a literal (the line-comment stripper
-   * would eat the rest of the line).
+   * A `--` inside a string literal, a quoted identifier or a block comment.
+   * The line-comment stripper runs BEFORE the split and does not know it is
+   * inside a token: it deletes from the `--` to the end of the line, taking
+   * the closing quote / `*\/` — and any `;` after them — with it. The
+   * statement COUNT may not change (when the wounded statement is the last
+   * one), so this is detected directly, never inferred from a count.
    */
-  | 'naive_split_disagrees';
+  | 'line_comment_inside_token';
 
 export interface NoTxSplitAnalysis {
   readonly hazard: NoTxSplitHazard | null;
@@ -378,27 +382,59 @@ function lineOf(sql: string, offset: number): number {
   return line;
 }
 
+/** A character that can continue an identifier — used to tell `E'…'` from `LIKE'…'`. */
+const IDENTIFIER_CHAR = /[A-Za-z0-9_\u0080-\uFFFF]/;
+
+type NoTxToken = 'string literal' | 'quoted identifier' | 'block comment';
+
+/**
+ * What `splitNoTxStatements` would do to ONE token it cannot see. `body` is
+ * the token's full source text (delimiters included), `start` its offset.
+ */
+function tokenHazard(kind: NoTxToken, body: string, sql: string, start: number): NoTxSplitAnalysis | null {
+  const where = `(line ${lineOf(sql, start)})`;
+  if (body.includes(';')) {
+    return kind === 'string literal'
+      ? { hazard: 'semicolon_in_string_literal', detail: `contains a string literal with a ";" inside it ${where}` }
+      : {
+          hazard: 'hidden_semicolon',
+          detail: `contains a ${kind} with a ";" inside it ${where} — the splitter would cut the statement there`,
+        };
+  }
+  if (body.includes('--')) {
+    return {
+      hazard: 'line_comment_inside_token',
+      detail: `contains a ${kind} with a "--" inside it ${where} — the line-comment stripper would delete the rest of that line, ${kind === 'block comment' ? 'closing "*/"' : 'closing quote'} included, before the split`,
+    };
+  }
+  return null;
+}
+
 /**
  * The guard behind `splitNoTxStatements` (issue #733).
  *
  * Walks the SQL with the SAME lexical rules `splitTopLevelStatements` honours —
- * `--` and `/* … *\/` comments are skipped, quoted literals and identifiers are
- * consumed whole, a dollar quote is recognised by `DOLLAR_QUOTE_TAG` — but
- * uses them only to REFUSE, never to split. That is deliberate: the
+ * `--` and `/* … *\/` comments, quoted literals and identifiers consumed
+ * whole, a dollar quote recognised by `DOLLAR_QUOTE_TAG` — plus one the
+ * tokeniser does not: the backslash escapes of an `E'…'` string (Postgres
+ * lexical rules §4.1.2.2), so `E'a\';b\'c'` is read as the ONE literal it is.
+ * The rules are used only to REFUSE, never to split. That is deliberate: the
  * no-transaction path stays a parser-free `split(';')`, and this function is
  * what makes that decision safe by rejecting, at discovery, the file the
  * split would cut in the wrong place.
  *
- * Two hazards are named directly because they are the ones the docstring
- * forbids and the ones people actually write (`DO $$ … $$;` with `;` inside,
- * a `WHERE col = 'a; b'`). Everything else falls through to a differential
- * check: if the naive split and the tokeniser disagree on the statement count,
- * a `;` is hidden somewhere the split cannot see (block comment, quoted
- * identifier, `--` inside a literal) and the file is refused too.
+ * The proof is DIRECT, per token, not a comparison of statement counts.
+ * `splitNoTxStatements` does exactly two things — delete `--…` to end of
+ * line, then split on `;` — so it agrees with the lexical structure iff no
+ * token it cannot see contains a `;` (it would split there) or a `--` (the
+ * stripper would truncate the token, and the count need not change when the
+ * wounded statement is the last one). A dollar-quoted body is refused
+ * outright — the docstring forbids the shape, not merely the `;` inside it.
  *
- * `$$` and `;` that live only inside comments are NOT hazards — the line
- * stripper removes them before the split, and migrations 096/122 mention
- * `DO $$` in their header comments precisely to explain this rule.
+ * `$$`, `;` and `--` that live only inside `--` comments are NOT hazards —
+ * the stripper removes those lines whole, which is its job — and migrations
+ * 096/122 mention `DO $$` in their header comments precisely to explain this
+ * rule.
  */
 export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
   const n = sql.length;
@@ -414,6 +450,7 @@ export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
     }
 
     if (ch === '/' && sql[i + 1] === '*') {
+      const start = i;
       let depth = 1;
       i += 2;
       while (i < n && depth > 0) {
@@ -427,13 +464,26 @@ export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
           i += 1;
         }
       }
+      const found = tokenHazard('block comment', sql.slice(start, i), sql, start);
+      if (found) return found;
       continue;
     }
 
     if (ch === "'" || ch === '"') {
       const start = i;
+      // `E'…'` (any case) honours `\'` and `\\`; a plain `'…'` does not
+      // (standard_conforming_strings, the default since 9.1). The `E` must be
+      // its own token: `LIKE'a'` is a keyword followed by a plain literal.
+      const escapes =
+        ch === "'" &&
+        (sql[i - 1] === 'E' || sql[i - 1] === 'e') &&
+        !(i >= 2 && IDENTIFIER_CHAR.test(sql[i - 2]!));
       i += 1;
       while (i < n) {
+        if (escapes && sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] === ch) {
           if (sql[i + 1] === ch) {
             i += 2;
@@ -444,12 +494,13 @@ export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
         }
         i += 1;
       }
-      if (ch === "'" && sql.slice(start, i).includes(';')) {
-        return {
-          hazard: 'semicolon_in_string_literal',
-          detail: `contains a string literal with a ";" inside it (line ${lineOf(sql, start)})`,
-        };
-      }
+      const found = tokenHazard(
+        ch === "'" ? 'string literal' : 'quoted identifier',
+        sql.slice(start, i),
+        sql,
+        start,
+      );
+      if (found) return found;
       continue;
     }
 
@@ -466,14 +517,6 @@ export function analyzeNoTxSplittability(sql: string): NoTxSplitAnalysis {
     i += 1;
   }
 
-  const naive = splitNoTxStatements(sql).length;
-  const lexical = splitTopLevelStatements(sql).length;
-  if (naive !== lexical) {
-    return {
-      hazard: 'naive_split_disagrees',
-      detail: `hides a ";" where the parser-free splitter cannot see it — splitting on ";" yields ${naive} statement(s) but the lexical tokeniser finds ${lexical} (a ";" inside a block comment or a quoted identifier, or a "--" inside a literal)`,
-    };
-  }
   return NO_TX_SPLIT_OK;
 }
 

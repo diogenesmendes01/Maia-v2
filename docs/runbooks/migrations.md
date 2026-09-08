@@ -119,7 +119,8 @@ Before applying anything it **refuses** (exit 1, nothing executed) when:
 - a `-- maia:no-transaction` migration contains something the
   parser-free statement splitter would cut in the wrong place — a
   dollar-quoted body (`DO $$ … $$`), a string literal containing `;`, a
-  `;` hidden in a block comment or quoted identifier. See
+  `;` hidden in a block comment or quoted identifier, or a `--` inside
+  any of those (the line stripper would truncate the token). See
   [Fixing `no_transaction_unsplittable`](#fixing-no_transaction_unsplittable).
 
 The last two are defects of the **repository**, not of the database:
@@ -286,8 +287,9 @@ The blocker says which shape it found and on which line:
 | `[…]` in the message | What is in the file |
 |---|---|
 | `dollar_quoted_body` | `DO $$ … $$`, `$tag$ … $tag$`, `CREATE FUNCTION … AS $$ … $$` |
-| `semicolon_in_string_literal` | `'… ; …'` |
-| `naive_split_disagrees` | a `;` inside `/* … */` or a `"quoted;identifier"`, or a `--` inside a literal — anything on which `split(';')` and the lexical tokeniser count statements differently |
+| `semicolon_in_string_literal` | `'… ; …'` — including `E'a\';b\'c'`, whose backslash-escaped quotes the guard reads the way Postgres does |
+| `hidden_semicolon` | a `;` inside `/* … */` or a `"quoted;identifier"` — the split cuts there |
+| `line_comment_inside_token` | a `--` inside a literal, a quoted identifier or a block comment — the line stripper runs before the split and deletes the rest of that line, closing quote / `*/` and any `;` after it included. Detected on the token itself: when the wounded statement is the last one the statement count does not even change |
 
 Two ways to fix the file, both in the PR that introduced it — never by
 editing a migration that has already been applied anywhere:
@@ -307,9 +309,11 @@ editing a migration that has already been applied anywhere:
 
 What is **not** an option: teaching the splitter to parse. The decision
 to keep it parser-free is explicit; the guard is what makes that
-decision safe. `$$` and `;` that appear only in `--` comments are fine —
-the splitter strips those lines first — and migrations 096 and 122
-mention `DO $$` in their headers for precisely this reason.
+decision safe. `$$`, `;` and `--` that appear only in `--` comments are
+fine — the splitter strips those lines first, which is its job — and
+migrations 096 and 122 mention `DO $$` in their headers for precisely
+this reason. A `--` *inside* a literal (`'a--b'`) is not a comment to
+Postgres but is one to the stripper, so it is refused.
 
 ## Recovering a dirty migration
 

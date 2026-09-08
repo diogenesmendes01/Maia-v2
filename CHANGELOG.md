@@ -19,12 +19,16 @@ ensaio do drill da #705.
 a decisão "splitter sem parser" é preservada e torna-se exigível:
 
 - `analyzeNoTxSplittability()` percorre cada arquivo marcado com as mesmas
-  regras léxicas do tokenizer (`splitTopLevelStatements`, que não mudou) e as
-  usa só para RECUSAR: corpo dollar-quoted (`dollar_quoted_body`), literal com
-  `;` (`semicolon_in_string_literal`) ou qualquer forma em que o split
-  ingênuo e o tokenizer discordem na contagem de statements
-  (`naive_split_disagrees` — `;` em comentário de bloco ou identificador
-  entre aspas, `--` dentro de literal).
+  regras léxicas do tokenizer (`splitTopLevelStatements`, que não mudou) —
+  mais os escapes de barra invertida de `E'…'`, que o tokenizer não lê — e as
+  usa só para RECUSAR, token a token: corpo dollar-quoted
+  (`dollar_quoted_body`); `;` dentro de literal, inclusive `E'a\';b\'c'`
+  (`semicolon_in_string_literal`); `;` dentro de identificador entre aspas
+  ou comentário de bloco (`hidden_semicolon`); `--` dentro de literal,
+  identificador ou comentário de bloco (`line_comment_inside_token` — o
+  stripper de linha roda antes do split e truncaria o token, sem que a
+  contagem de statements mude quando o ferido é o último). A prova é direta
+  por token, nunca uma comparação de contagens (achados da revisão da PR).
 - `buildMigrationArtifact()` reporta o novo problema de artefato
   `no_transaction_unsplittable`, com o marcador, o token ofensor e a linha
   na mensagem, e o caminho certo: tirar o marcador e rodar em transação.
