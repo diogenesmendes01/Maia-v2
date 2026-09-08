@@ -39,13 +39,27 @@ export type Job = JobContract & {
  * derrubar o boot — para um grafo compilado e tipado esse caso é um efeito de
  * topo que lança, e ele já era um defeito antes; agora é um defeito visível
  * por métrica.
+ *
+ * O invólucro é TRANSPARENTE aos argumentos (`...args`), e isso não é
+ * generalidade gratuita. O scheduler chama `job.fn()` sem argumento — mas a
+ * suíte de integração chama a `fn` REGISTRADA com opções
+ * (`tickWithLimit(limit)` em `tests/integration/onboarding-expirer-worker.spec.ts`
+ * passa `{ limit }` para exercitar o corte de lote pelo caminho de produção).
+ * A primeira versão deste helper fazia `pick(m)()` e descartava o que
+ * recebia: o worker caía no `ONBOARDING_EXPIRER_BATCH_LIMIT` do contrato e
+ * três casos de integração ficaram vermelhos no CI da PR #761. O caso
+ * "o handler lazy REPASSA os argumentos" em `tests/unit/workers-registry.spec.ts`
+ * trava isso.
  */
-function lazy<M>(load: () => Promise<M>, pick: (m: M) => () => Promise<unknown>): () => Promise<void> {
-  return async () => {
+function lazy<M, A extends unknown[]>(
+  load: () => Promise<M>,
+  pick: (m: M) => (...args: A) => Promise<unknown>,
+): (...args: A) => Promise<void> {
+  return async (...args: A) => {
     const m = await load();
     // O resultado do handler (alguns devolvem um resumo da corrida) é
     // descartado aqui, como já era: `Job.fn` é `Promise<void>` de contrato.
-    await pick(m)();
+    await pick(m)(...args);
   };
 }
 

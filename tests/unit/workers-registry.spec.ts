@@ -31,18 +31,35 @@ import { describe, it, expect, vi } from 'vitest';
  * lê `config.FEATURE_*` no carregamento para o `featureFlag` de alguns jobs.
  */
 
-const { mockSchedule, sentinela, avaliados } = vi.hoisted(() => {
-  const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
-  /** Módulos de worker cujo factory de mock rodou — isto é, que foram importados. */
-  const avaliados: string[] = [];
-  const sentinela = (modulo: string) => () => {
-    avaliados.push(modulo);
-    // Sem exports de propósito: um handler chamado a partir daqui falha com
-    // "No export is defined on the mock", que é o suficiente para o controle.
-    return {};
-  };
-  return { mockSchedule, sentinela, avaliados };
-});
+const { mockSchedule, sentinela, sentinelaComHandler, avaliados, argumentosRecebidos } = vi.hoisted(
+  () => {
+    const mockSchedule = vi.fn(() => ({ stop: vi.fn(), start: vi.fn() }));
+    /** Módulos de worker cujo factory de mock rodou — isto é, que foram importados. */
+    const avaliados: string[] = [];
+    const sentinela = (modulo: string) => () => {
+      avaliados.push(modulo);
+      // Sem exports de propósito: um handler chamado a partir daqui falha com
+      // "No export is defined on the mock", que é o suficiente para o controle.
+      return {};
+    };
+    /**
+     * Os argumentos com que cada handler foi chamado, por nome do export.
+     * Regressão da PR #761 (CI de integração): `tickWithLimit()` em
+     * `tests/integration/onboarding-expirer-worker.spec.ts` chama a `fn`
+     * REGISTRADA com `{ limit }`, e o primeiro `lazy` descartava os argumentos.
+     */
+    const argumentosRecebidos: Record<string, unknown[][]> = {};
+    const sentinelaComHandler = (modulo: string, handler: string) => () => {
+      avaliados.push(modulo);
+      return {
+        [handler]: async (...args: unknown[]) => {
+          (argumentosRecebidos[handler] ??= []).push(args);
+        },
+      };
+    };
+    return { mockSchedule, sentinela, sentinelaComHandler, avaliados, argumentosRecebidos };
+  },
+);
 
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
@@ -77,7 +94,12 @@ vi.mock('../../src/workers/legacy-memory-reclassifier.js', sentinela('legacy-mem
 vi.mock('../../src/workers/mcp-sync-worker.js', sentinela('mcp-sync-worker.js'));
 vi.mock('../../src/workers/message-recovery.js', sentinela('message-recovery.js'));
 vi.mock('../../src/workers/objective-execute-worker.js', sentinela('objective-execute-worker.js'));
-vi.mock('../../src/workers/onboarding-expirer.js', sentinela('onboarding-expirer.js'));
+// Este tem handler de verdade (que só anota os argumentos) para o caso de
+// repasse de argumentos abaixo. Continua sentinela: anota quando é avaliado.
+vi.mock(
+  '../../src/workers/onboarding-expirer.js',
+  sentinelaComHandler('onboarding-expirer.js', 'runOnboardingExpirer'),
+);
 vi.mock('../../src/workers/outbound-messages-sweeper.js', sentinela('outbound-messages-sweeper.js'));
 vi.mock('../../src/workers/outbound-recovery.js', sentinela('outbound-recovery.js'));
 vi.mock('../../src/workers/outbox-drain-worker.js', sentinela('outbox-drain-worker.js'));
@@ -230,6 +252,19 @@ describe('workers registry', () => {
       expect(avaliados).not.toContain('backup.js');
       await job.fn().catch(() => undefined);
       expect(avaliados).toContain('backup.js');
+    });
+
+    it('o handler lazy REPASSA os argumentos da chamada (contrato de tickWithLimit da suíte de integração)', async () => {
+      // O scheduler chama `job.fn()` sem argumento, mas
+      // `tests/integration/onboarding-expirer-worker.spec.ts` chama a fn
+      // REGISTRADA com `{ limit }` para exercitar o corte de lote pelo caminho
+      // de produção. O primeiro `lazy` (PR #761) descartava os argumentos e o
+      // worker caía no `ONBOARDING_EXPIRER_BATCH_LIMIT` do contrato — três
+      // casos de integração vermelhos no CI. O invólucro tem de ser transparente.
+      const { JOBS } = await import('../../src/workers/index.js');
+      const job = JOBS.find((j) => j.name === 'onboarding_expirer')!;
+      await (job.fn as (opts?: { limit?: number }) => Promise<void>)({ limit: 2 });
+      expect(argumentosRecebidos.runOnboardingExpirer).toEqual([[{ limit: 2 }]]);
     });
   });
 });
