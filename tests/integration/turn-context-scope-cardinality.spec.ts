@@ -23,10 +23,11 @@
  * ## Why 501 entities on ONE profile
  *
  * A scope that big is reachable in production precisely because entities SHARE
- * permission profiles: `profilesRepo.byIds`'s own 500 cap is on distinct
- * PROFILES, so a tenant with one profile and thousands of entities sails past
- * it and lands on this one. The fixture reproduces that shape rather than an
- * artificial one.
+ * permission profiles: a tenant with one profile and thousands of entities
+ * lands on this one. (The profile read used to carry its own 500 cap on
+ * distinct PROFILES — `profilesRepo.byIds` — which #738 removed: the
+ * authorization read is now `profilesRepo.forAuthorization`, with no `LIMIT`.)
+ * The fixture reproduces that shape rather than an artificial one.
  *
  * Skipped without TEST_DB_URL — the bug lives in SQL, so a mocked repository
  * would not have it.

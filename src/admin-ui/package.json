@@ -18,14 +18,14 @@
     "@trpc/client": "11.0.0-rc.682",
     "@trpc/react-query": "11.0.0-rc.682",
     "@tanstack/react-query": "5.102.8",
-    "zod": "3.23.8",
+    "zod": "4.5.4",
     "drizzle-orm": "0.45.2",
     "pg": "8.13.0"
   },
   "devDependencies": {
     "@types/node": "22.20.1",
     "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.5",
+    "@types/react-dom": "^19.2.7",
     "@types/pg": "8.11.10",
     "typescript": "5.9.3",
     "tailwindcss": "4.3.3",

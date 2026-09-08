@@ -41,10 +41,20 @@ export type ResolvedPermission = {
  *     and the rendered scope block stay byte-identical to before.
  *
  * The batch read is ALSO strictly safer than the loop it replaces:
- * `profilesRepo.byIds` binds (tenant_id, agent_id) from ALS, while the
- * `byId` it replaces matched on the profile id alone — a `permissoes` row
+ * `profilesRepo.forAuthorization` binds (tenant_id, agent_id) from ALS, while
+ * the `byId` it replaces matched on the profile id alone — a `permissoes` row
  * pointing at a foreign profile id used to resolve to that other tenant's
  * action list and spend limit.
+ *
+ * Issue #738 — the profile read has NO row cap. Its predecessor
+ * (`profilesRepo.byIds(ids, limit = 500)`) cut the result at 500 DISTINCT
+ * profile ids by id order, so a person whose grants spanned more than 500
+ * profiles had the surplus permissions dropped here as "unresolvable" — real
+ * grants discarded in silence by a resource bound. An authorization read is
+ * bound by the person's own `permissoes` rows, never by a `LIMIT`; a ceiling on
+ * grants, if the product ever wants one, is a fail-closed validation at grant
+ * time. Still exactly two round-trips (`forPessoa` + `forAuthorization`):
+ * no JOIN (that was #693, closed) and no batching loop.
  */
 export async function resolveScope(
   pessoa: Pessoa,
@@ -54,7 +64,7 @@ export async function resolveScope(
   const withEntity = perms.filter((p) => p.entidade_id);
   if (withEntity.length === 0) return { entidades: [], byEntity: new Map() };
 
-  const profiles = await profilesRepo.byIds(withEntity.map((p) => p.profile_id));
+  const profiles = await profilesRepo.forAuthorization(withEntity.map((p) => p.profile_id));
   const byProfileId = new Map(profiles.map((pr) => [pr.id, pr]));
 
   const byEntity = new Map<string, ResolvedPermission>();

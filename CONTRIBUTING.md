@@ -12,10 +12,14 @@ verdade**:
 
 - **Node:** `.nvmrc` (`22`) fixa o toolchain **local**. O CI **não** usa
   `node-version-file`: os jobs de `ci.yml` rodam uma matriz
-  `node: ['22.18', 26]` e as lanes não-matriciais pinam `node-version: '22.18'`
-  explicitamente. Ou seja, local e CI **podem** divergir dentro da linha 22 —
-  `.nvmrc` dá o 22.x corrente, o CI dá 22.18 — e a perna 26 cobre de propósito
-  o major da imagem de produção. O que impede a divergência de virar bug é o
+  `node: ['22.18', '22.22']` (o piso suportado e o 22.x corrente, que é o que
+  `node:22-alpine` resolve em produção) e as lanes não-matriciais pinam
+  `node-version: '22.18'` explicitamente. Ou seja, local e CI **podem**
+  divergir dentro da linha 22 — `.nvmrc` dá o 22.x corrente, o CI dá 22.18 e
+  22.22 — mas **só** dentro da linha 22: produção, CI e dev rodam o mesmo
+  major. Não há perna 26; Node 26 é migração própria (issue #743), quando
+  virar LTS, e o Dependabot ignora a major de `@types/node` até lá
+  (`.github/dependabot.yml`). O que impede a divergência de virar bug é o
   piso comum (`engines.node`), não um arquivo compartilhado.
   `tests/unit/scripts/check-node.spec.ts` percorre `.github/workflows/**` e
   reprova qualquer lane da linha 22 sem minor pinado.

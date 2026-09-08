@@ -177,8 +177,12 @@ joined row set, but the pair it replaced capped only the STATE read —
 renderer's `ent?.nome ?? eid` fell through, and the scope/permissions block
 printed a raw UUID instead of a name — in a block that has no `SECTION_BUDGETS`
 entry precisely because it is never truncatable. A scope can exceed 500 entities
-whenever they share permission profiles, since `profilesRepo.byIds`'s own cap is
-on distinct PROFILES. The entity side is now unbounded (bounded only by
+whenever they share permission profiles. (The profile read had its own 500 cap
+on distinct PROFILES — `profilesRepo.byIds` — until issue #738 removed it: the
+authorization read is now `profilesRepo.forAuthorization`, with no `LIMIT`,
+because a resource cap on the read that decides access silently discards real
+grants; `resolveScope` still costs exactly two round-trips.) The entity side is
+now unbounded (bounded only by
 `ids.length`, which the caller controls); `stateLimit` caps the state projection
 alone, and a capped row comes back as `state: null` — the same shape an entity
 with no state row already had. Still one statement.
@@ -248,7 +252,8 @@ The scope is now resolved **in Postgres, inside the turn's clock**, by the same
 that person's permissions and takes no cardinality argument, the 1/10/100 scale
 IS the resolved scope size: the fixture seeds **three people per pair**, with 1,
 10 and 100 `permissoes` rows each pointing at a distinct `permission_profiles`
-row (100 per pair, under the 500-row cap `profilesRepo.byIds` enforces). The
+row (100 per pair — under the 500-row cap `profilesRepo.byIds` enforced at the
+time, which is why the bench never exercised it; #738 removed that cap). The
 interlocutor/conversation fixture is seeded for all three — seeding it for one
 would have silently changed what the rest of the benchmark measures.
 

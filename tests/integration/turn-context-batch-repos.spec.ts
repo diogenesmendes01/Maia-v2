@@ -384,7 +384,9 @@ d('#511 batch repos — isolation and constant cost', () => {
     });
   });
 
-  describe('profilesRepo.byIds', () => {
+  // `profilesRepo.byIds` until #738, which renamed the authorization read and
+  // dropped its `LIMIT`; the isolation contract asserted here is unchanged.
+  describe('profilesRepo.forAuthorization', () => {
     it('never returns another tenant/agent profile', async () => {
       const c = await pool.connect();
       const tk = newTracker();
@@ -394,7 +396,7 @@ d('#511 batch repos — isolation and constant cost', () => {
 
         const { profilesRepo } = await loadRepos();
         const rows = await runWithTenantContext(A, () =>
-          profilesRepo.byIds(['i511-profile-a', 'i511-profile-b']),
+          profilesRepo.forAuthorization(['i511-profile-a', 'i511-profile-b']),
         );
 
         expect(rows.map((r) => r.id)).toEqual(['i511-profile-a']);

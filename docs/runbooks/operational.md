@@ -1377,7 +1377,9 @@ produção, dentro do mesmo relógio.
 > **Agora o escopo é resolvido no Postgres, dentro do relógio.** A massa semeia
 > TRÊS pessoas por par — uma com 1, outra com 10, outra com 100 linhas em
 > `permissoes`, cada permissão apontando para um `permission_profiles`
-> distinto (100 por par, sob o teto de 500 do `profilesRepo.byIds`). A
+> distinto (100 por par — aquém do teto de 500 que o `profilesRepo.byIds` tinha
+> à época; a #738 removeu o teto da leitura de autorização, hoje
+> `profilesRepo.forAuthorization`). A
 > cardinalidade 1/10/100 do enunciado passou a ser o tamanho do escopo
 > RESOLVIDO, não uma fatia em memória.
 >
@@ -1465,7 +1467,7 @@ O JSON carrega `mode`, `fingerprint` e `gate_evaluated`.
 | `pico de leituras por turno ≤ 6` | um turno passou a segurar mais que sua parte do pool | alguém mexeu em `TURN_CONTEXT_MAX_CONCURRENT_READS` ou tirou uma leitura de dentro do `ReadGate` (`src/agent/turn-context/concurrency.ts`) |
 | `o resolveScope foi EXERCITADO: ≥1 leitura de escopo por turno` | **o instrumento voltou a ser cego** (0 leituras: escopo fabricado em memória, massa sem as tabelas do escopo, ou as leituras fora do `instrumentAll`) | leia o número no detalhe. `0–0` é medição ausente, não desempenho. O número em si é dado medido (2 na `main`, 1 com a fusão da #693) — decisão da #525 |
 | `contagem de statements por turno com crescimento O(1)` | a contagem por turno CRESCE com a cardinalidade — um N+1 voltou, no escopo ou em qualquer estágio | o detalhe lista o envelope por N. `N=1: 12–12 · N=100: 12–112` é o `byId` por item que a #511 removeu. O teto absoluto é linha de relatório, não critério |
-| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada pelo teto de 500 do `profilesRepo.byIds` |
+| `o escopo do turno veio do BANCO, nas cardinalidades 1/10/100` | as leituras aconteceram e devolveram outra coisa: escopo vazio (massa faltando) ou tamanho diferente do semeado | `escopo resolvido=0–0` ⇒ a massa não tem `permissoes`; divergência com escopo cheio ⇒ permissão descartada na leitura de perfis (`profilesRepo.forAuthorization` não tem `LIMIT` desde a #738 — se divergir, procure um `.limit()` reintroduzido ou um profile de outro tenant) |
 | `p95 do estágio resolveScope ≤ 600 ms` | a degradação mora no escopo, não no loader | olhe as linhas `scope_permissoes`/`scope_profiles` (ou `scope_permissoes_com_profile`, na árvore da #693) na tabela "latência por leitura" |
 | `aceite completo do orçamento do turno` **vermelho** | a flag de cobertura diz que mede e os números dizem que não | é o caso "a flag não prova a si mesma": o detalhe traz os três números medidos. Não vire a flag — conserte a medição |
 | `o gate satura (pico alcança 6)` | o oposto: alguém "consertou" a concorrência serializando | procure um `await` que virou sequencial dentro de `loadTurnContext` |

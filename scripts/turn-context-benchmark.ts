@@ -1154,8 +1154,9 @@ export type ArmResult = {
    * Turnos em que o escopo RESOLVIDO não teve o tamanho da cardinalidade
    * pedida. Zero é a única leitura aceitável: qualquer outro valor diz que o
    * banco devolveu um escopo diferente do que a massa semeou — massa faltando,
-   * permissão descartada pelo teto de 500 do `profilesRepo.byIds`, ou escopo
-   * vindo de outro lugar que não o `resolveScope`.
+   * permissão descartada na leitura de perfis (o teto de 500 que
+   * `profilesRepo.byIds` tinha antes da #738), ou escopo vindo de outro lugar
+   * que não o `resolveScope`.
    */
   scope_cardinality_mismatches: number;
   /** Menor e maior escopo resolvido na corrida — esperado: 1 e 100. */
@@ -2013,7 +2014,7 @@ export type Pair = {
   tenant_id: string;
   agent_id: string;
   entidade_ids: string[];
-  /** Perfis de permissão do par — o alvo do `profilesRepo.byIds`. */
+  /** Perfis de permissão do par — o alvo do `profilesRepo.forAuthorization`. */
   profile_ids: string[];
   /** Uma pessoa por cardinalidade, na ordem de `CARDINALITIES`. */
   people: PairPerson[];
@@ -2030,14 +2031,16 @@ const ENTITIES_PER_PAIR = Math.max(...CARDINALITIES);
 
 /**
  * Perfis de permissão distintos por par — um por entidade, então a pessoa de
- * cardinalidade 100 resolve 100 perfis DISTINTOS num único `profilesRepo.byIds`.
+ * cardinalidade 100 resolve 100 perfis DISTINTOS num único
+ * `profilesRepo.forAuthorization`.
  *
- * É o pior caso sob o teto de 500 que a #525 estabeleceu (`byIds(ids, limit =
- * 500)`, `src/db/repositories/pessoa-repos.ts`): 100 < 500, então nenhuma
- * permissão é descartada pelo `LIMIT` — e é justamente o critério de
- * cardinalidade do gate que prova isso, porque uma permissão descartada
- * apareceria como escopo menor que o semeado. Apontar as 100 permissões para
- * um perfil só mediria um `IN` de um elemento e esconderia o custo do lote.
+ * Até a #738 essa leitura tinha um teto de 500 (`byIds(ids, limit = 500)`), e
+ * 100 < 500 ficava aquém dele — o que também quer dizer que este harness NUNCA
+ * exercitou o teto (issue #738); a leitura de autorização hoje não tem `LIMIT`,
+ * e é o critério de cardinalidade do gate que continua a provar que nenhuma
+ * permissão se perde, porque uma permissão descartada apareceria como escopo
+ * menor que o semeado. Apontar as 100 permissões para um perfil só mediria um
+ * `IN` de um elemento e esconderia o custo do lote.
  */
 const PROFILES_PER_PAIR = ENTITIES_PER_PAIR;
 
@@ -2125,7 +2128,7 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
   );
 
   // Perfis de permissão do par — o lado direito do JOIN que o `resolveScope`
-  // faz (`profilesRepo.byIds`). `permission_profiles.id` é PK **GLOBAL** (TEXT,
+  // faz (`profilesRepo.forAuthorization`). `permission_profiles.id` é PK **GLOBAL** (TEXT,
   // não escopada por tenant), então o id carrega o tenant no nome: dois pares
   // do mesmo benchmark colidiriam sem isso.
   const profiles = await c.query<{ id: string }>(
@@ -2251,8 +2254,9 @@ async function seedPair(c: PgClient, index: number, identity: 'profile' | 'legac
  * cardinalidade continue significando a mesma coisa (inclusive quais delas têm
  * `entity_states`, semeados para o primeiro quinto).
  *
- * Cada permissão aponta para um perfil DISTINTO, então o `profilesRepo.byIds`
- * do turno da pessoa de 100 entidades resolve um lote de 100 ids — e não um
+ * Cada permissão aponta para um perfil DISTINTO, então o
+ * `profilesRepo.forAuthorization` do turno da pessoa de 100 entidades resolve
+ * um lote de 100 ids — e não um
  * `IN` de um elemento repetido 100 vezes, que mediria outra coisa.
  */
 async function seedPerson(
@@ -2525,14 +2529,15 @@ async function loadDeps() {
 type ReadFn = (...args: never[]) => Promise<unknown>;
 export type InstrumentableRepos = {
   /**
-   * As duas FORMAS do estágio de escopo: a composição da `main`
-   * (`forPessoa` + `byIds`) e a leitura fundida da #693
+   * As FORMAS do estágio de escopo: a composição da `main` (`forPessoa` +
+   * `forAuthorization`, a leitura de autorização sem teto da #738; antes dela,
+   * `byIds`, com `LIMIT 500`) e a leitura fundida da #693
    * (`forPessoaComProfile`). Opcionais porque este harness também mede a
    * árvore do CANDIDATO — `instrument` ignora método ausente, e o que o gate
    * cobra é a evidência (≥1 leitura de escopo no contador), não a forma.
    */
   permissoesRepo: { forPessoa?: ReadFn; forPessoaComProfile?: ReadFn };
-  profilesRepo: { byIds?: ReadFn };
+  profilesRepo: { forAuthorization?: ReadFn; byIds?: ReadFn };
   operationalProfileVersionsRepo: { getActive: ReadFn };
   selfStateRepo: { getActive: ReadFn };
   mensagensRepo: { recentInConversation: ReadFn };
@@ -2553,9 +2558,13 @@ export function instrumentAll(repos: InstrumentableRepos): void {
   // as primeiras do turno: sem elas no contador, "leituras por turno" mede
   // meio orçamento. As três seções cobrem as duas formas do estágio (a
   // composição da `main` e a leitura fundida da #693); `instrument` ignora
-  // método ausente, então instrumentar as três é seguro em qualquer árvore.
+  // método ausente, então instrumentar todas é seguro em qualquer árvore. A
+  // seção `scope_profiles` aceita os dois nomes da leitura de perfis: o atual
+  // (`forAuthorization`, #738) e o anterior (`byIds`), para que uma árvore
+  // candidata anterior à #738 continue medível.
   instrument(repos.permissoesRepo, 'forPessoa', SCOPE_SECTIONS.permissoes);
   instrument(repos.permissoesRepo, 'forPessoaComProfile', SCOPE_SECTIONS.permissoes_com_profile);
+  instrument(repos.profilesRepo, 'forAuthorization', SCOPE_SECTIONS.profiles);
   instrument(repos.profilesRepo, 'byIds', SCOPE_SECTIONS.profiles);
   instrument(repos.operationalProfileVersionsRepo, 'getActive', 'identity');
   instrument(repos.selfStateRepo, 'getActive', 'identity_self_state');
