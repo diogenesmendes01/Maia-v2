@@ -52,7 +52,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   procedureExecutionsRepo: { findActiveForConversa: h.boom('procedureExecutionsRepo.findActiveForConversa') },
   procedureDefinitionsRepo: { findById: h.boom('procedureDefinitionsRepo.findById') },
   permissoesRepo: { forPessoa: h.boom('permissoesRepo.forPessoa') },
-  profilesRepo: { byIds: h.boom('profilesRepo.byIds') },
+  profilesRepo: { forAuthorization: h.boom('profilesRepo.forAuthorization') },
   pessoasRepo: { list: h.boom('pessoasRepo.list') },
 }));
 

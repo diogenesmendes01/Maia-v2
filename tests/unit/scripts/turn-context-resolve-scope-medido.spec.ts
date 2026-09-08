@@ -75,8 +75,8 @@ type Linha = Record<string, unknown>;
 const banco = {
   permissoes: [] as Linha[],
   profiles: [] as Linha[],
-  chamadas: { forPessoa: 0, byIds: 0 },
-  /** O maior lote que o `profilesRepo.byIds` recebeu — o JOIN em batch. */
+  chamadas: { forPessoa: 0, forAuthorization: 0 },
+  /** O maior lote que o `profilesRepo.forAuthorization` recebeu — o JOIN em batch. */
   maiorLoteDeProfiles: 0,
   /**
    * Atraso por leitura, em ms. Serve a um caso só: fazer o estágio do escopo
@@ -97,12 +97,13 @@ const permissoesRepo = {
   },
 };
 const profilesRepo = {
-  async byIds(ids: string[], limit = 500): Promise<Linha[]> {
-    banco.chamadas.byIds++;
+  // A leitura de autorização da #738: sem teto, como a de produção.
+  async forAuthorization(ids: string[]): Promise<Linha[]> {
+    banco.chamadas.forAuthorization++;
     await dormir(banco.atraso_ms);
     const distintos = Array.from(new Set(ids));
     banco.maiorLoteDeProfiles = Math.max(banco.maiorLoteDeProfiles, distintos.length);
-    return banco.profiles.filter((p) => distintos.includes(p.id as string)).slice(0, limit);
+    return banco.profiles.filter((p) => distintos.includes(p.id as string));
   },
 };
 
@@ -191,7 +192,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  banco.chamadas = { forPessoa: 0, byIds: 0 };
+  banco.chamadas = { forPessoa: 0, forAuthorization: 0 };
   banco.maiorLoteDeProfiles = 0;
   banco.atraso_ms = 0;
 });
@@ -272,7 +273,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const { reads, amostra, ctx } = await turnoMedido(pessoaDe(100));
 
     // 1. As leituras aconteceram, na ordem em que o turno as faz. DUAS é a
-    //    composição MEDIDA do `resolveScope` da `main` (`forPessoa` + `byIds`)
+    //    composição MEDIDA do `resolveScope` da `main` (`forPessoa` + `forAuthorization`)
     //    — um fato desta árvore, não um critério do gate: desde a decisão da
     //    #525 o gate cobra o piso (≥1) e reporta a contagem.
     expect(countScopeReads(reads)).toBe(2);
@@ -281,9 +282,9 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
       SCOPE_SECTIONS.permissoes,
       SCOPE_SECTIONS.profiles,
     ]);
-    expect(banco.chamadas).toEqual({ forPessoa: 1, byIds: 1 });
+    expect(banco.chamadas).toEqual({ forPessoa: 1, forAuthorization: 1 });
 
-    // 2. O `byIds` recebeu o LOTE inteiro: 100 perfis distintos num round-trip
+    // 2. O `forAuthorization` recebeu o LOTE inteiro: 100 perfis distintos num round-trip
     //    só. Um N+1 apareceria como 100 chamadas de lote 1.
     expect(banco.maiorLoteDeProfiles).toBe(100);
 
@@ -323,7 +324,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const regressao = await turnoMedido(pessoaDe(1), { resolveScope: async () => fabricado });
 
     expect(countScopeReads(regressao.reads)).toBe(0);
-    expect(banco.chamadas).toEqual({ forPessoa: 0, byIds: 0 });
+    expect(banco.chamadas).toEqual({ forPessoa: 0, forAuthorization: 0 });
 
     const metricsRuins = scopeMetricsFromSamples([regressao.amostra]);
     expect(metricsRuins.scope_reads_per_turn_min).toBe(0);
@@ -503,7 +504,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
 
   it('as leituras do escopo NÃO inflam o pico de leituras simultâneas — elas são sequenciais', async () => {
     // O `resolveScope` roda ANTES do `ReadGate`, e suas duas leituras são
-    // sequenciais entre si (`byIds` depende do resultado de `forPessoa`).
+    // sequenciais entre si (`forAuthorization` depende do resultado de `forPessoa`).
     // Logo elas somam 2 às LEITURAS POR TURNO e nada ao PICO — que é o que o
     // teto de 6 (`TURN_CONTEXT_MAX_CONCURRENT_READS`) mede.
     semear(100);

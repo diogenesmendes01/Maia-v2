@@ -234,7 +234,8 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     it('REPROVA quando o escopo resolvido não bate com a massa semeada (com controle)', () => {
       // "As duas leituras aconteceram" não basta: elas podem ter devolvido
       // vazio — massa sem `permissoes`/`permission_profiles`, ou permissão
-      // descartada pelo teto de 500 do `profilesRepo.byIds`.
+      // descartada na leitura de perfis (o teto de 500 que `profilesRepo.byIds`
+      // tinha antes da #738 — a leitura de autorização hoje não tem `LIMIT`).
       const semMassa = run({ scope_entities_min: 0, scope_entities_max: 0 });
       expect(semMassa.contencao?.passed).toBe(false);
       expect(semMassa.code).toBe(1);
@@ -404,7 +405,7 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
 
     it('o modelo de evidência: piso de 1 leitura, e as TRÊS formas de leitura de escopo são contadas', () => {
       // A decisão da #525: o piso é 1 (o número é dado medido), e o contador
-      // reconhece tanto a composição da `main` (`forPessoa` + `byIds`) quanto
+      // reconhece tanto a composição da `main` (`forPessoa` + `forAuthorization`) quanto
       // a leitura fundida da #693 (`forPessoaComProfile`).
       expect(SCOPE_READS_PER_TURN_MIN).toBe(1);
       expect(Object.values(SCOPE_SECTIONS)).toEqual([
