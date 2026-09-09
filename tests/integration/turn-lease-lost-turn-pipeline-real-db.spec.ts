@@ -96,6 +96,7 @@ const A = 'll507pg-agent';
  * escopada por tenant (ALS), então o número não colide com outras worktrees.
  */
 const OWNER_PHONE = '+5511111111111';
+const channelFixture = vi.hoisted(() => ({ id: null as string | null }));
 
 vi.mock('@/lib/redis.js', () => ({
   redis: {},
@@ -125,7 +126,7 @@ vi.mock('@/gateway/baileys.js', () => ({
 // não contaminar as outras worktrees que compartilham este Postgres.
 vi.mock('@/gateway/channel-resolver.js', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
-  resolveChannel: async () => ({ tenant_id: T, agent_id: A, channel_id: null }),
+  resolveChannel: async () => ({ tenant_id: T, agent_id: A, channel_id: channelFixture.id }),
 }));
 
 /**
@@ -531,6 +532,36 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     );
     pessoa_id = p.rows[0]!.id;
 
+    // O hot path de produção bloqueia uma pessoa sem perfil de audiência
+    // ativo. A fixture explicita a autorização em vez de afrouxar o gate.
+    await pool.query(
+      `INSERT INTO agent_audience_profiles(tenant_id, agent_id, pessoa_id, audience_type, trust_level, status)
+       VALUES ($1,$2,$3,'owner','trusted_internal','active')`,
+      [T, A, pessoa_id],
+    );
+
+    // Este tenant é exclusivo do teste, portanto precisa do próprio role,
+    // canal e política; não há seed global que possa ser reutilizado com
+    // segurança sem cruzar escopos.
+    const role = await pool.query<{ id: string }>(
+      `INSERT INTO roles(tenant_id, agent_id, role_key, display_name, is_default, active)
+       VALUES ($1,$2,'default','LL507 Default',true,true) RETURNING id`,
+      [T, A],
+    );
+    // O resolver é mockado e usa este id para selecionar a policy. O canal
+    // permanece inativo para preservar a falha pré-commit provada pelo controle.
+    const channel = await pool.query<{ id: string }>(
+      `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'LL507 Line',false,false) RETURNING id`,
+      [T, A, OWNER_PHONE],
+    );
+    channelFixture.id = channel.rows[0]!.id;
+    await pool.query(
+      `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+       VALUES ($1,$2,$3,$4,'free_with_trigger')`,
+      [T, A, channelFixture.id, role.rows[0]!.id],
+    );
+
     // Um procedimento ATIVO e ATRIBUÍDO ao agente: é ele que faz o grafo
     // pre-turn chamar LLM e gravar. Sem isto o `procedure-selector` retorna
     // antes de qualquer chamada e o CONTROLE não teria o que exigir.
@@ -580,6 +611,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     }
     await pool.query(`DELETE FROM agents WHERE tenant_id = $1`, [T]).catch(() => {});
     await pool.query(`DELETE FROM tenants WHERE id = $1`, [T]).catch(() => {});
+    channelFixture.id = null;
 
     for (const [k, v] of Object.entries(envAnterior)) {
       if (v === undefined) delete process.env[k];

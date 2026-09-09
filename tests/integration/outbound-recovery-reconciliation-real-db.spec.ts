@@ -1288,7 +1288,12 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   it('a idade do pendente mais antigo ignora o que já foi concluído', async () => {
-    await criarLinha({ status: 'completed', idade_s: 10_000 });
+    await criarLinha({
+      status: 'completed',
+      idade_s: 10_000,
+      turn_status: 'completed',
+      turn_outcome: 'reply_delivered',
+    });
     await criarLinha({ status: 'retryable', idade_s: 600 });
     const idade = await comoEscopo(() =>
       outboundRecoveryRepo.oldestPendingAgeSeconds(),
@@ -1299,7 +1304,13 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
   });
 
   it('a idade do pendente mais antigo inclui `dead_letter`? NÃO — é decisão terminal', async () => {
-    await criarLinha({ status: 'dead_letter', idade_s: 10_000, attempt: 12 });
+    await criarLinha({
+      status: 'dead_letter',
+      idade_s: 10_000,
+      attempt: 12,
+      turn_status: 'dead_letter',
+      turn_outcome: 'retry_exhausted',
+    });
     const idade = await comoEscopo(() =>
       outboundRecoveryRepo.oldestPendingAgeSeconds(),
     );

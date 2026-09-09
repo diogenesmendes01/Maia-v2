@@ -103,7 +103,7 @@ type Evidence = {
 
 let pool: pg.Pool;
 let ev: Evidence;
-const ids = { pessoa: '', conversa: '', mensagem: '', pending: '' };
+const ids = { pessoa: '', conversa: '', mensagem: '', pending: '', channel: '' };
 
 function fmt(e: Evidence): string {
   return JSON.stringify(
@@ -251,6 +251,15 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
       );
       ids.pessoa = pessoa.rows[0]!.id;
 
+      // A resolução de audiência é fail-closed; pessoa ativa sem perfil ativo
+      // deve ser bloqueada em produção e, portanto, não serve como fixture.
+      await c.query(
+        `INSERT INTO agent_audience_profiles(tenant_id, agent_id, pessoa_id, audience_type, trust_level, status)
+         VALUES ($1, $2, $3, 'owner', 'trusted_internal', 'active')
+         ON CONFLICT DO NOTHING`,
+        [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, ids.pessoa],
+      );
+
       const conv = await c.query<{ id: string }>(
         `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, escopo_entidades)
          VALUES ($1, $2, $3, '{}') RETURNING id`,
@@ -258,9 +267,31 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
       );
       ids.conversa = conv.rows[0]!.id;
 
-      // Sem `metadata.telefone`: `probeMessageForChannel` devolve null, o
-      // resolver de canal não é acionado e o turno roda sob primary/primary —
-      // o caminho single-tenant do runtime.
+      // Canal próprio e inativo: o vínculo persistido na conversa alimenta o
+      // gate de policy sem adicionar outro catch-all ativo ao banco compartilhado.
+      const channel = await c.query<{ id: string }>(
+        `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+         VALUES ($1, $2, 'whatsapp', $3, 'Race lost line', false, false) RETURNING id`,
+        [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, TELEFONE],
+      );
+      ids.channel = channel.rows[0]!.id;
+      await c.query(`UPDATE conversas SET channel_id = $2 WHERE id = $1`, [ids.conversa, ids.channel]);
+
+      const role = await c.query<{ id: string }>(
+        `SELECT id FROM roles WHERE tenant_id = $1 AND agent_id = $2 AND active LIMIT 1`,
+        [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id],
+      );
+      if (role.rows.length === 0) {
+        throw new Error('nenhum role ativo semeado — seed do banco mudou');
+      }
+      await c.query(
+        `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+         VALUES ($1, $2, $3, $4, 'free_with_trigger')`,
+        [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, ids.channel, role.rows[0]!.id],
+      );
+
+      // Sem metadata de telefone, o outer preserva `primary/primary`; o inner
+      // usa o `channel_id` já vinculado à conversa.
       const msg = await c.query<{ id: string }>(
         `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo)
          VALUES ($1, $2, $3, 'in', 'texto', 'sim') RETURNING id`,
@@ -383,16 +414,32 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
     try {
       if (ids.conversa) {
         await c.query('DELETE FROM audit_log WHERE conversa_id = $1', [ids.conversa]);
-        await c.query('DELETE FROM agent_turn_inputs WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversa_id = $1)', [ids.conversa]);
-        await c.query('DELETE FROM agent_turns WHERE conversa_id = $1', [ids.conversa]);
+        if (ids.channel) {
+          await c.query(
+            'DELETE FROM role_selector_decisions WHERE conversa_id = $1 OR channel_id = $2',
+            [ids.conversa, ids.channel],
+          );
+        }
+        await c.query('DELETE FROM outbound_messages WHERE conversa_id = $1', [ids.conversa]);
+        await c.query(
+          'DELETE FROM agent_turn_inputs WHERE turn_id IN (SELECT id FROM agent_turns WHERE conversa_id = $1)',
+          [ids.conversa],
+        );
         await c.query('DELETE FROM pending_questions WHERE conversa_id = $1', [ids.conversa]);
-        await c.query('DELETE FROM agent_turns WHERE representative_message_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)', [ids.conversa]);
+        await c.query('DELETE FROM agent_turns WHERE conversa_id = $1', [ids.conversa]);
         await c.query('DELETE FROM mensagens WHERE conversa_id = $1', [ids.conversa]);
         await c.query('DELETE FROM conversas WHERE id = $1', [ids.conversa]);
       }
       if (ids.pessoa) {
         await c.query('DELETE FROM audit_log WHERE pessoa_id = $1', [ids.pessoa]);
+        await c.query('DELETE FROM permissoes WHERE pessoa_id = $1', [ids.pessoa]);
+        await c.query('DELETE FROM agent_audience_profiles WHERE pessoa_id = $1', [ids.pessoa]);
         await c.query('DELETE FROM pessoas WHERE id = $1', [ids.pessoa]);
+      }
+      if (ids.channel) {
+        await c.query('DELETE FROM role_selector_decisions WHERE channel_id = $1', [ids.channel]);
+        await c.query('DELETE FROM channel_policies WHERE channel_id = $1', [ids.channel]);
+        await c.query('DELETE FROM channels WHERE id = $1', [ids.channel]);
       }
     } finally {
       c.release();
