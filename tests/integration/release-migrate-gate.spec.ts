@@ -125,13 +125,16 @@ const RAW = ['npm', 'run', 'db:migrate'] as const;
 
 d('release gate (#565) — executado contra um Postgres real', () => {
   let admin: pg.Pool;
-  let disposable: pg.Pool | null = null;
+  // Há uma única conexão de asserção. `Client.end()` espera o socket fechar;
+  // `Pool.end()` pode resolver antes e disputar com o terminate abaixo.
+  let disposable: pg.Client | null = null;
   let markerDir = '';
 
   beforeAll(async () => {
     admin = new pg.Pool({ connectionString: ADMIN_URL });
     await admin.query(`CREATE DATABASE "${DISPOSABLE_DB}"`);
-    disposable = new pg.Pool({ connectionString: disposableUrl() });
+    disposable = new pg.Client({ connectionString: disposableUrl() });
+    await disposable.connect();
     markerDir = mkdtempSync(join(tmpdir(), 'maia-relgate-'));
   });
 
@@ -148,7 +151,7 @@ d('release gate (#565) — executado contra um Postgres real', () => {
   });
 
   async function ledgerCount(status: string): Promise<number> {
-    const r = await (disposable as pg.Pool).query<{ n: string }>(
+    const r = await (disposable as pg.Client).query<{ n: string }>(
       `SELECT count(*)::text AS n FROM schema_migrations WHERE status = $1`,
       [status],
     );
@@ -209,12 +212,15 @@ d('release gate (#565) — executado contra um Postgres real', () => {
   it(
     'um migrate que FALHA sai != 0 (ledger sujo, o blocker que a #516 desenhou)',
     async () => {
-      const head = await (disposable as pg.Pool).query<{ id: string }>(
+      const head = await (disposable as pg.Client).query<{ id: string }>(
         `SELECT id FROM schema_migrations ORDER BY id DESC LIMIT 1`,
       );
       const id = head.rows[0]?.id;
       expect(id, 'o caminho feliz precisa ter rodado antes deste caso').toBeTruthy();
-      await (disposable as pg.Pool).query(`UPDATE schema_migrations SET status = 'dirty' WHERE id = $1`, [id]);
+      await (disposable as pg.Client).query(
+        `UPDATE schema_migrations SET status = 'dirty' WHERE id = $1`,
+        [id],
+      );
 
       const ran = run(GATE[0], GATE.slice(1), orchestratorEnv());
       expect(ran.status, `um ledger sujo tem de bloquear:\n${ran.output}`).not.toBe(0);
@@ -255,7 +261,9 @@ d('release gate (#565) — executado contra um Postgres real', () => {
     async () => {
       // A outra metade: um teste que só mostra o consumidor parado não
       // distingue "o gate bloqueou" de "o encadeamento nunca funciona".
-      await (disposable as pg.Pool).query(`UPDATE schema_migrations SET status = 'applied' WHERE status = 'dirty'`);
+      await (disposable as pg.Client).query(
+        `UPDATE schema_migrations SET status = 'applied' WHERE status = 'dirty'`,
+      );
       const marker = join(markerDir, 'consumer-started-ok');
 
       const ran = run('sh', ['-c', `${GATE.join(' ')} && printf started > "$MAIA_TEST_MARKER"`], {
