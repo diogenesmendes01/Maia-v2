@@ -728,12 +728,12 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
       'e o procedimento selecionado tem de ter iniciado uma execução',
     ).toBeGreaterThan(0);
     // A SEQUÊNCIA COMPLETA do que roda depois do gate, na ordem do pipeline:
-    // o reasoner do grafo pre-turn, o classificador de risco do Decision Engine
-    // e o reasoner do ReAct. São os três pontos do achado 2 do dono.
+    // o seletor governado de role, o reasoner do grafo pre-turn, o classificador
+    // de risco do Decision Engine e o reasoner do ReAct.
     expect(
       llm.workloads,
       'o pipeline pós-gate inteiro tem de ter sido alcançado',
-    ).toEqual(['procedure_selector', 'risk_classifier', 'reasoner']);
+    ).toEqual(['role_selector', 'procedure_selector', 'risk_classifier', 'reasoner']);
     // O DESFECHO, escrito pelo DONO na fonte de verdade.
     //
     // Aqui o ReAct produz resposta e o ENVIO falha — o Baileys é dublê e o par
@@ -846,10 +846,17 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
       perderEm: 'procedure_selector',
     });
 
-    // 1. A PROPAGAÇÃO, medida na entrada. `undefined` aqui é o denunciador
-    //    exato de um `runOne` que voltou a chamar `n.run(ctx)` sem sinal.
+    // 1. A PROPAGAÇÃO, medida na entrada do node correto. O role-selector
+    //    governado roda antes dele, então não podemos presumir índice zero.
+    //    `undefined` aqui é o denunciador exato de um `runOne` que voltou a
+    //    chamar `n.run(ctx)` sem sinal.
+    const procedureSelectorIndex = llm.workloads.indexOf('procedure_selector');
     expect(
-      llm.signals[0],
+      procedureSelectorIndex,
+      'o procedure-selector tem de ter sido alcançado',
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      llm.signals[procedureSelectorIndex],
       'o node do grafo tem de receber o AbortSignal da tentativa',
     ).toBeInstanceOf(AbortSignal);
 
@@ -860,6 +867,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
 
     // 3. E NADA depois dela: nem outro reasoner, nem as gravações pós-grafo.
     expect(llm.workloads, 'o pipeline não pode continuar sem posse').toEqual([
+      'role_selector',
       'procedure_selector',
     ]);
     expect(await selectorLogRows(desde), 'uma row por chamada — só a cancelada').toBe(1);
@@ -960,6 +968,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
 
     // O turno parou aqui: o Decision Engine e o ReAct nunca foram alcançados.
     expect(llm.workloads, 'nenhum reasoner posterior ao grafo pode rodar').toEqual([
+      'role_selector',
       'procedure_selector',
     ]);
     expect(await outboundRows(conversa_id), 'o turno perdido respondeu ao usuário').toBe(0);
