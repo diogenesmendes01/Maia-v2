@@ -26,11 +26,14 @@
 #   The standalone bundle uses `outputFileTracingRoot` (in next.config.mjs)
 #   to follow imports across both trees so they land inside the final image.
 
-# ─── stage: root-deps ───────────────────────────────────────────────────
-# Install the REPO's runtime deps. Required because the admin-ui pulls
-# `src/db/client.ts` → `@/config/env.ts` → `dotenv`, plus indirect deps via
-# `src/db/schema.ts`, `src/lib/*`, etc.
-FROM node:22-alpine AS root-deps
+# ─── stage: root-build-deps ─────────────────────────────────────────────
+# Install the REPO's complete BUILD dependency graph. The admin-ui pulls
+# shared root sources (`src/db/`, `src/lib/`, `src/gateway/`, ...), and
+# `next build` type-checks those files. Their declaration packages live in the
+# root devDependencies, so `--omit=dev` makes the production image fail even
+# though the JavaScript runtime dependencies are present. The final image stays
+# minimal because it copies only Next's standalone traced output.
+FROM node:22-alpine AS root-build-deps
 WORKDIR /app
 # O preinstall guard do package.json RAIZ exige npm >=11.5.2 <12 (pin do
 # lockfile — ver CONTRIBUTING.md); node:22-alpine embarca npm 10.x.
@@ -50,8 +53,9 @@ COPY scripts/check-node.mjs ./scripts/check-node.mjs
 # MENSAGEM legível por construção. Coberto por
 # tests/unit/scripts/check-node.spec.ts.
 RUN node scripts/check-node.mjs
-# `npm ci`: instala exatamente o lockfile, falha em drift.
-RUN npm ci --omit=dev --no-audit --no-fund
+# `npm ci`: instala exatamente o lockfile, falha em drift. Dev dependencies are
+# intentionally present in this build-only stage for TypeScript declarations.
+RUN npm ci --no-audit --no-fund
 
 # ─── stage: admin-deps ──────────────────────────────────────────────────
 # Install the admin-ui's local node_modules (next, next-auth, @trpc/*,
@@ -119,7 +123,7 @@ ENV BACKUP_S3_BUCKET=build-bucket
 ENV BACKUP_S3_ACCESS_KEY=build
 ENV BACKUP_S3_SECRET_KEY=build
 
-COPY --from=root-deps  /app/node_modules ./node_modules
+COPY --from=root-build-deps /app/node_modules ./node_modules
 COPY --from=admin-deps /app/node_modules ./src/admin-ui/node_modules
 COPY . .
 RUN cd src/admin-ui && npm run build
