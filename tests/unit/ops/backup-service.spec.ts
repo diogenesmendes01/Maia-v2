@@ -382,6 +382,21 @@ describe('encryption', () => {
     expect(h.promoted).toHaveLength(0);
   });
 
+  it('records no artifact encryption when a failure happens before encryption', async () => {
+    const h = harness({
+      ensureBackupDir: async () => {
+        throw new Error('EACCES');
+      },
+    });
+    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(encCfg));
+    expect(res.outcome).toBe('failed');
+    expect(lastRun(h)).toMatchObject({
+      state: 'failed',
+      encryption_mode: 'none',
+      encryption_key_id: null,
+    });
+  });
+
   it('keeps the plaintext digest in the manifest and the ciphertext digest beside it', async () => {
     const h = harness();
     await runVerifiedBackup(h.ports, resolveBackupProfile(encCfg));

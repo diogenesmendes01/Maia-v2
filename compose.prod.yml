@@ -287,11 +287,13 @@ services:
       - data
       - web
     volumes:
-      # Estado persistente: sessão Baileys + mídia. Devem ser graváveis pelo
-      # uid 1001 — volumes novos herdam o chown feito no Dockerfile; volumes
-      # de um deployment root-era precisam de chown único (ver runbook).
+      # Estado persistente: sessão Baileys + mídia + backups locais. Devem ser
+      # graváveis pelo uid 1001 — volumes novos herdam o chown feito no
+      # Dockerfile; volumes de um deployment root-era precisam de chown único
+      # (ver runbook).
       - maia_baileys_auth:/app/.baileys-auth
       - maia_media:/app/media
+      - maia_backups:/app/backups
     read_only: true
     tmpfs:
       - /tmp
@@ -545,3 +547,4 @@ volumes:
   maia_redis_data:
   maia_baileys_auth:
   maia_media:
+  maia_backups:
