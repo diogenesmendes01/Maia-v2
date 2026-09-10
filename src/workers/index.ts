@@ -454,7 +454,12 @@ export const JOBS: Job[] = [
       kind: 'row-claim',
       claim:
         'toda mutação é `UPDATE ... WHERE status = <origem esperada>` (CAS) e o rearme usa `jobId` determinístico; a entrega é protegida pelo claim com lease de #632 — DELIBERADAMENTE sem lock global, que custaria disponibilidade justo à recuperação',
-      tables: ['outbound_messages'],
+      tables: [
+        'outbound_messages',
+        'agent_turns',
+        'agent_turn_inputs',
+        'mensagens',
+      ],
     },
     module: 'outbound-recovery.ts',
     phase: 1,

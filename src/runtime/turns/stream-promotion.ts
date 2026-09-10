@@ -45,10 +45,13 @@ import { recordStreamPromotion } from './stream-metrics.js';
  *  - `recovery_reconciliation` — o varredor encontrou um turno PROMOVIDO cujo
  *    sinal não chegou à fila e o re-armou. É a reconciliação de "commit feito,
  *    enqueue não feito".
+ *  - `outbound_recovery` — o outbox convergiu depois que o dono do turno
+ *    morreu; a conclusão recuperada elegeu o sucessor na mesma transação.
  */
 export type StreamPromotionSource =
   | 'terminal'
   | 'stream_claim_recovery'
+  | 'outbound_recovery'
   | 'recovery_reconciliation';
 
 /**
@@ -84,10 +87,15 @@ export async function signalStreamPromotion(
       source: args.source,
       status_before: promotion.status_before,
       status_after: promotion.status_after,
-      ...(args.promoted_by_turn_id ? { promoted_by_turn_id: args.promoted_by_turn_id } : {}),
+      ...(args.promoted_by_turn_id
+        ? { promoted_by_turn_id: args.promoted_by_turn_id }
+        : {}),
     },
   }).catch((err) =>
-    logger.warn({ err: (err as Error).message }, 'stream.turn_promoted_audit_failed'),
+    logger.warn(
+      { err: (err as Error).message },
+      'stream.turn_promoted_audit_failed',
+    ),
   );
 
   try {
@@ -102,7 +110,9 @@ export async function signalStreamPromotion(
       mensagem_id: promotion.representative_message_id,
       turn_id: promotion.turn_id,
     });
-    recordStreamPromotion(args.source === 'recovery_reconciliation' ? 'recovered' : 'promoted');
+    recordStreamPromotion(
+      args.source === 'recovery_reconciliation' ? 'recovered' : 'promoted',
+    );
     logger.info(
       {
         turn_id: promotion.turn_id,
@@ -178,7 +188,11 @@ export async function notePromotionReconciled(args: {
 }): Promise<void> {
   recordStreamPromotion('recovered');
   logger.warn(
-    { turn_id: args.turn_id, status: args.status, source: 'recovery_reconciliation' },
+    {
+      turn_id: args.turn_id,
+      status: args.status,
+      source: 'recovery_reconciliation',
+    },
     'stream.turn_promotion_reconciled',
   );
   await audit({
@@ -191,7 +205,10 @@ export async function notePromotionReconciled(args: {
       status_after: args.status,
     },
   }).catch((err) =>
-    logger.warn({ err: (err as Error).message }, 'stream.turn_promoted_audit_failed'),
+    logger.warn(
+      { err: (err as Error).message },
+      'stream.turn_promoted_audit_failed',
+    ),
   );
 }
 
@@ -230,8 +247,15 @@ export async function reportPromotionFenceRejected(args: {
   await audit({
     acao: 'turn_promotion_rejected',
     alvo_id: args.turn_id,
-    metadata: { operation: args.operation, attempt: args.attempt, reason: 'stale_claim' },
+    metadata: {
+      operation: args.operation,
+      attempt: args.attempt,
+      reason: 'stale_claim',
+    },
   }).catch((err) =>
-    logger.warn({ err: (err as Error).message }, 'stream.turn_promotion_rejected_audit_failed'),
+    logger.warn(
+      { err: (err as Error).message },
+      'stream.turn_promotion_rejected_audit_failed',
+    ),
   );
 }

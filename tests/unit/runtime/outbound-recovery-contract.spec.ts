@@ -18,6 +18,7 @@ import {
   RECONCILIATION_DISPOSITIONS,
   RECONCILIATION_GRACE_MS,
   RECONCILIATION_RESULTS,
+  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES,
   attemptBudgetExhausted,
   manualRearmDuplicateRisk,
   manualRearmRefusal,
@@ -45,7 +46,12 @@ describe('#633 — a disposição da reconciliação', () => {
 
   it('nenhum tipo SEM chave nativa recebe `resend_idempotent`, em nenhum desfecho incerto', () => {
     const semChave = OUTBOUND_PAYLOAD_TYPES.filter(
-      (t) => !autoResendAllowed({ outcome: 'timeout_unknown', channel: CANAL, payload_type: t }),
+      (t) =>
+        !autoResendAllowed({
+          outcome: 'timeout_unknown',
+          channel: CANAL,
+          payload_type: t,
+        }),
     );
     // A lista não é escrita à mão aqui: ela vem da capability de #632. Se
     // alguém declarar `native` para um tipo novo, este teste passa a cobri-lo
@@ -69,9 +75,15 @@ describe('#633 — a disposição da reconciliação', () => {
 
   it('os tipos COM chave nativa recebem `resend_idempotent` — o reenvio é do provedor, não nosso', () => {
     const comChave = OUTBOUND_PAYLOAD_TYPES.filter((t) =>
-      autoResendAllowed({ outcome: 'timeout_unknown', channel: CANAL, payload_type: t }),
+      autoResendAllowed({
+        outcome: 'timeout_unknown',
+        channel: CANAL,
+        payload_type: t,
+      }),
     );
-    expect(comChave).toEqual(expect.arrayContaining(['text', 'status_fallback']));
+    expect(comChave).toEqual(
+      expect.arrayContaining(['text', 'status_fallback']),
+    );
     for (const payload_type of comChave) {
       for (const outcome of DELIVERY_UNKNOWN_OUTCOMES) {
         expect(
@@ -90,7 +102,11 @@ describe('#633 — a disposição da reconciliação', () => {
   it('a disposição NUNCA discorda de `autoResendAllowed` — a política tem um dono só', () => {
     for (const payload_type of OUTBOUND_PAYLOAD_TYPES) {
       for (const outcome of DELIVERY_UNKNOWN_OUTCOMES) {
-        const permite = autoResendAllowed({ outcome, channel: CANAL, payload_type });
+        const permite = autoResendAllowed({
+          outcome,
+          channel: CANAL,
+          payload_type,
+        });
         const d = reconciliationDisposition({
           outcome,
           channel: CANAL,
@@ -167,12 +183,31 @@ describe('#633 — a disposição da reconciliação', () => {
       'escalate_manual',
       'dead_letter',
     ]);
-    expect(RECONCILIATION_RESULTS).toContain('noop');
-    expect(RECONCILIATION_RESULTS).toContain('history_recovered');
+    expect([...RECONCILIATION_RESULTS]).toEqual([
+      'await_grace',
+      'resend_idempotent',
+      'escalate_manual',
+      'dead_letter',
+      'noop',
+      'history_recovered',
+      'history_fabricated',
+      'turn_finalized',
+    ]);
+  });
+
+  it('o turno só fecha com artefatos finais; `delivered` ainda bloqueia', () => {
+    expect([...OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES].sort()).toEqual(
+      ['completed', 'failed_terminal', 'cancelled', 'dead_letter'].sort(),
+    );
+    expect(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES).not.toContain(
+      'delivered' as never,
+    );
   });
 
   it('o orçamento de tentativas fecha no teto, não depois dele', () => {
-    expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS - 1)).toBe(false);
+    expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS - 1)).toBe(
+      false,
+    );
     expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS)).toBe(true);
   });
 });
@@ -205,30 +240,50 @@ describe('#633 — o rearmamento manual (falha #12 da épica)', () => {
     ).toBe(false);
     // Nunca houve desfecho = nada saiu.
     expect(
-      manualRearmDuplicateRisk({ outcome: null, channel: CANAL, payload_type: 'audio' }),
+      manualRearmDuplicateRisk({
+        outcome: null,
+        channel: CANAL,
+        payload_type: 'audio',
+      }),
     ).toBe(false);
   });
 
   it('a confirmação é FAIL-CLOSED: ausente e `false` são recusa, só `true` passa', () => {
-    const base = { status: 'dead_letter', reason: 'o cliente reclamou', duplicate_risk: true };
+    const base = {
+      status: 'dead_letter',
+      reason: 'o cliente reclamou',
+      duplicate_risk: true,
+    };
     expect(manualRearmRefusal(base)).toBe('duplicate_risk_unacknowledged');
-    expect(manualRearmRefusal({ ...base, acknowledge_duplicate_risk: false })).toBe(
-      'duplicate_risk_unacknowledged',
-    );
+    expect(
+      manualRearmRefusal({ ...base, acknowledge_duplicate_risk: false }),
+    ).toBe('duplicate_risk_unacknowledged');
     expect(
       manualRearmRefusal({ ...base, acknowledge_duplicate_risk: undefined }),
     ).toBe('duplicate_risk_unacknowledged');
-    expect(manualRearmRefusal({ ...base, acknowledge_duplicate_risk: true })).toBeNull();
+    expect(
+      manualRearmRefusal({ ...base, acknowledge_duplicate_risk: true }),
+    ).toBeNull();
   });
 
   it('`reason` em branco é recusa — a auditoria é o ponto da operação', () => {
     expect(
-      manualRearmRefusal({ status: 'dead_letter', reason: '   ', duplicate_risk: false }),
+      manualRearmRefusal({
+        status: 'dead_letter',
+        reason: '   ',
+        duplicate_risk: false,
+      }),
     ).toBe('reason_missing');
   });
 
   it('`failed_terminal` e os estados concluídos não são rearmáveis', () => {
-    for (const status of ['failed_terminal', 'completed', 'delivered', 'sent', 'sending']) {
+    for (const status of [
+      'failed_terminal',
+      'completed',
+      'delivered',
+      'sent',
+      'sending',
+    ]) {
       expect(
         manualRearmRefusal({ status, reason: 'x', duplicate_risk: false }),
       ).toBe('status_not_rearmable');

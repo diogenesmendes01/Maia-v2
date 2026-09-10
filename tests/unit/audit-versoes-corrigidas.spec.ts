@@ -3,16 +3,16 @@
  *
  * O defeito que originou este guard
  * ---------------------------------
- * Dez advisories (`fastify` x2, `qs` x2, `fast-uri` x4, `browserslist` x2)
- * reprovaram o job `npm audit` em toda PR aberta. Nenhum deles precisou de
- * exceção: os quatro pacotes tinham correção DENTRO do range que os manifestos
- * já declaravam, e a correção foi um bump de lockfile — `fastify` 5.8.5 →
- * 5.12.1, `qs` 6.15.2 → 6.16.0 (transitivo do `express`, que vem do
- * `@modelcontextprotocol/sdk`), `fast-uri` 3.1.5 → 3.1.7 (transitivo do `ajv` e
- * do `fast-json-stringify`) e `browserslist` 4.28.2 → 4.28.8 no console.
+ * O primeiro conjunto tinha dez advisories (`fastify` x2, `qs` x2,
+ * `fast-uri` x4, `browserslist` x2). Depois, novos advisories publicados sobre
+ * versões que já estavam na `main` exigiram pisos também para `hono`,
+ * `nodemailer`, `sharp`, `next`, `vitest` e `@vitest/mocker`. Nenhum deles
+ * precisou de exceção: havia versão corrigida alcançável, por bump do lockfile
+ * dentro do range existente ou, no pin exato do Next, por bump explícito do
+ * manifesto.
  *
  * O problema de uma correção que vive SÓ no lockfile é que ela não está
- * declarada em lugar nenhum. Como os três estão dentro de um range `^`/`>=`
+ * declarada em lugar nenhum. Como vários deles estão dentro de um range `^`/`>=`
  * que a versão VULNERÁVEL também satisfazia, qualquer regeneração de lockfile
  * a partir do manifesto (um `rm package-lock.json && npm install` de alguém
  * destravando um conflito, um merge resolvido pelo lado errado) pode
@@ -31,8 +31,8 @@
  * Aquele guard é a autoridade sobre o risco: ele consulta o registro de
  * advisories AO VIVO e enxerga o que ainda não sabemos. Mas ele depende de
  * rede e do estado do registro — se a advisory for retirada, reclassificada ou
- * o job rodar sem acesso ao registry, ele deixa de falar sobre estes seis
- * casos. Este spec é offline, determinístico e afirma a decisão que foi tomada
+ * o job rodar sem acesso ao registry, ele deixa de falar sobre estes casos.
+ * Este spec é offline, determinístico e afirma a decisão que foi tomada
  * aqui, com os GHSA escritos por extenso. Os dois cobrem coisas diferentes: um
  * pergunta "há advisory novo?", o outro "a correção que já fizemos continua no
  * lugar?".
@@ -101,6 +101,61 @@ const PISOS: readonly PisoCorrigido[] = [
       'que o piso, satisfaz a mesma asserção sem precisar de caso especial',
   },
   {
+    projeto: '.',
+    pkg: 'hono',
+    piso: '4.13.5',
+    advisories: [
+      'GHSA-gqvv-2mrq-wpjv',
+      'GHSA-g6gw-c38x-mqfc',
+      'GHSA-crvj-82cr-hjcx',
+    ],
+    porque:
+      'transitivo de `@modelcontextprotocol/sdk` e `@hono/node-server`, que aceitam ' +
+      '`hono@^4`; 4.13.5 fecha traversal em `toSSG()`, exaustão no `parseBody()` e ' +
+      'divergência de interpretação da query após fragmento',
+  },
+  {
+    projeto: '.',
+    pkg: 'nodemailer',
+    piso: '9.1.1',
+    advisories: [
+      'GHSA-8m3c-c648-2xjj',
+      'GHSA-wmmp-3585-3rmp',
+      'GHSA-2x7j-588g-ccc2',
+      'GHSA-cc9r-2j5m-2m83',
+    ],
+    porque:
+      'dependência direta em `^9.0.5`; três correções chegaram em 9.1.0, mas o bypass ' +
+      'de `disableFileAccess`/`disableUrlAccess` cobre também 9.1.0 e exige 9.1.1',
+  },
+  {
+    projeto: '.',
+    pkg: 'sharp',
+    piso: '0.35.4',
+    advisories: ['GHSA-rgj7-g3m4-5g8c'],
+    porque:
+      'dependência direta em `^0.35.3` e também transitiva do Baileys; 0.35.4 traz a ' +
+      'libheif corrigida para processamento de imagens não confiáveis',
+  },
+  {
+    projeto: '.',
+    pkg: 'vitest',
+    piso: '4.1.11',
+    advisories: ['GHSA-82fw-gwwq-j7x9'],
+    porque:
+      'dependência de desenvolvimento direta em `^4.1.8`; 4.1.11 valida redirects de ' +
+      'mocks contra a allowlist de arquivos do servidor Vite',
+  },
+  {
+    projeto: '.',
+    pkg: '@vitest/mocker',
+    piso: '4.1.11',
+    advisories: ['GHSA-82fw-gwwq-j7x9'],
+    porque:
+      'dependência interna de `vitest`, pinada na mesma versão do runner; o bump do pacote ' +
+      'pai para 4.1.11 traz o mocker com a validação de caminho corrigida',
+  },
+  {
     projeto: 'src/admin-ui',
     pkg: 'browserslist',
     piso: '4.28.7',
@@ -108,6 +163,24 @@ const PISOS: readonly PisoCorrigido[] = [
     porque:
       'transitivo de `@babel/helper-compilation-targets` e `update-browserslist-db`, que ' +
       'pedem `^4.24.0` e `>= 4.21.0`; 4.28.7 é a primeira acima do range vulnerável `<=4.28.6`',
+  },
+  {
+    projeto: 'src/admin-ui',
+    pkg: 'next',
+    piso: '16.3.3',
+    advisories: ['GHSA-2xp9-vwfh-vxw4', 'GHSA-p293-qw3h-jr36'],
+    porque:
+      'dependência direta com pin exato; o manifesto foi movido de 16.3.2 para 16.3.3, ' +
+      'primeira versão 16.x corrigida para as duas variantes de execução remota de código',
+  },
+  {
+    projeto: 'src/admin-ui',
+    pkg: 'sharp',
+    piso: '0.35.4',
+    advisories: ['GHSA-rgj7-g3m4-5g8c'],
+    porque:
+      'dependência transitiva do Next fixada por `overrides.sharp` em `^0.35.3`; 0.35.4 ' +
+      'traz a libheif corrigida usada pelo pipeline de otimização de imagens do console',
   },
 ];
 
@@ -171,7 +244,7 @@ describe('advisories corrigidos no lockfile não regridem abaixo do piso', () =>
     });
   }
 
-  it('o ledger de exceções não aceita nenhum destes dez — eles foram CORRIGIDOS', () => {
+  it('o ledger de exceções não aceita nenhum destes advisories — eles foram CORRIGIDOS', () => {
     const ledger = JSON.parse(
       readFileSync(join(process.cwd(), 'security/audit-exceptions.json'), 'utf8'),
     ) as { advisory?: string }[];

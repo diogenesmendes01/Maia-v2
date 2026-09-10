@@ -17,11 +17,10 @@
  *     through `dispatchOutput` (view-once for sensitive, outbound audit,
  *     pending-question + media handling), NEVER raw `sendOutbound`. If the skill
  *     produced no `reply` string we fall through rather than fabricate text.
- *  3. Fall-through on failure: `prompt_only`/`evaluator` have NO side effects,
- *     so any `!result.ok` is safe to degrade to the normal LLM/ReAct turn (no
- *     double-action risk). We log `skill.execution_failed{reason}` and fall
- *     through. (The reason-restriction in spec §4.2 only bites once Phase 2
- *     adds side-effecting modes.)
+ *  3. Fall-through on failure: `prompt_only`/`evaluator` have NO business side
+ *     effects, so `!result.ok` before dispatch is safe to degrade to the normal
+ *     LLM/ReAct turn. Dispatch is different: once the durable outbound barrier
+ *     was crossed, `core.ts` must stop instead of producing a second reply.
  *
  * This module is deliberately dependency-injected (runSkill / resolveActiveSkill
  * / dispatchOutput / logger) so the HIGH-risk decision logic is unit-testable
@@ -51,14 +50,17 @@ export interface PinnedSkillIdentity {
 
 /**
  * Outcome of an execute_skill attempt.
- *  - `handled: true`  — the skill ran and its reply was dispatched; core.ts
- *    MUST run the terminal-path invariants (touch + markAllProcessed +
- *    clearDebounceState) and `return` (no LLM turn).
- *  - `handled: false` — fall through to the normal LLM/ReAct turn. `reason`
- *    is for logging/metrics only.
+ *  - `handled: true` — no LLM turn. Normally core may terminalize immediately;
+ *    `recovery_pending: true` means delivery was not confirmed. Core combines
+ *    that signal with the live turn: durable `outbound_pending` is preserved
+ *    for recovery; without that barrier it records `reply_delivery_unknown`.
+ *  - `handled: false` — core may fall through only while the live TurnHandle
+ *    has not crossed the durable outbound barrier. `reason` lets it enforce
+ *    that distinction for a dispatch failure.
  */
 export type ExecuteSkillOutcome =
-  | { handled: true }
+  | { handled: true; recovery_pending?: false }
+  | { handled: true; recovery_pending: true; error: string }
   | {
       handled: false;
       reason:
@@ -200,12 +202,12 @@ export function buildSkillReply(result: SkillExecutionOutput): {
 
 /**
  * Execute the skill the Decision Engine selected, enforcing the safety
- * contracts above. Returns an outcome the caller uses to decide whether to run
- * the terminal-path invariants + `return`, or fall through to the normal turn.
+ * contracts above. Returns an outcome the caller combines with the live turn
+ * state to decide between terminalization, recovery ownership, or fall-through.
  *
- * The caller (core.ts) is responsible for `conversasRepo.touch` /
- * `markAllProcessed` / `clearDebounceState` on `{ handled: true }` — they need
- * the caller's turn-scoped closures and are asserted by tests at that layer.
+ * The caller (core.ts) owns `conversasRepo.touch` / `markAllProcessed` /
+ * `clearDebounceState` after a converged `{ handled: true }`. It must not run
+ * them for `{ recovery_pending: true }` while the turn is `outbound_pending`.
  */
 export async function executeSelectedSkill(
   args: ExecuteSelectedSkillArgs,
@@ -271,11 +273,11 @@ export async function executeSelectedSkill(
         prior.status === 'unknown' ||
         prior.status === 'pending')
     ) {
-      // BLOCK the skill run. `handled: true` signals core.ts that this turn
-      // is terminal (touch / markAllProcessed / clearDebounceState run, no
-      // LLM turn). No double-send risk — the prior attempt already produced
-      // the user-facing artefact (mensagens row for 'sent', breadcrumb for
-      // 'unknown'/'pending'). Saves the LLM call + skill tool dispatch.
+      // BLOCK the skill run. A prior `sent` proves delivery; `unknown` and
+      // `pending` prove only that re-execution is unsafe. Core must preserve a
+      // durable outbox barrier when one exists, or terminalize truthfully as
+      // `reply_delivery_unknown` when it does not. In all three cases there is
+      // no LLM turn or second skill dispatch.
       deps.logger.warn(
         {
           conversa_id: conversa.id,
@@ -287,7 +289,13 @@ export async function executeSelectedSkill(
         },
         'skill.outbound_ledger_blocked_pre_skill',
       );
-      return { handled: true };
+      return prior.status === 'sent'
+        ? { handled: true }
+        : {
+            handled: true,
+            recovery_pending: true,
+            error: `prior_outbound_ledger_${prior.status}`,
+          };
     }
   }
 
@@ -405,20 +413,18 @@ export async function executeSelectedSkill(
   // Contract 2: deliver through the shared pipeline (view-once / audit /
   // pending / media) — never raw sendOutbound. `safeDispatchOutput` centralises
   // the EXACTLY-ONCE phase handling (Codex #216 HIGH-1) and never throws:
-  //   - not_sent (pre-send / disconnected gateway / channel threw — NOTHING
-  //     reached the user) → fall through to the normal ReAct turn so the agent
-  //     still answers adaptively. Safe: nothing was sent, so no double-send.
+  //   - not_sent means only that the PHYSICAL send was classified pre-send.
+  //     The caller must also inspect the live TurnHandle: a durable outbound
+  //     commit may already have happened before this classification, and in
+  //     that case falling through to ReAct would violate the commit barrier.
   //   - sent_no_persist (sent but persist failed, or an ambiguous error) →
   //     report handled WITHOUT re-sending (a fall-through would double-send a
   //     financial message) and log the inconsistency loudly for ops.
   // A canned fallback is reserved for Phase-2 "last resort" cases; Phase 1 only
   // runs side-effect-free prompt_only/evaluator, so ReAct recovery is best.
-  // CAVEAT (#227): the transport does NOT guarantee throw ⇒ not-delivered; a
-  // post-relay timeout could be tagged not_sent after delivery → a 2nd ReAct
-  // send would double-send. The outbound idempotency ledger that closes this
-  // (transport throws record as 'unknown' so the boundary guard blocks the
-  // re-attempt) lands in #227 and is active when FEATURE_OUTBOUND_DEDUP is on;
-  // with the flag off this caveat still applies (low-harm for Phase-1 read-only).
+  // CAVEAT (#227): transport classification and durable turn state answer
+  // different questions. This layer reports the former; `core.ts` combines it
+  // with the latter before deciding whether ReAct recovery is permitted.
   const outcome = await deps.safeDispatchOutput({
     pessoa,
     conversa,
@@ -454,7 +460,7 @@ export async function executeSelectedSkill(
       },
       'skill.dispatch_failed_after_send_inconsistency',
     );
-    return { handled: true };
+    return { handled: true, recovery_pending: true, error: outcome.error };
   }
 
   deps.logger.info(

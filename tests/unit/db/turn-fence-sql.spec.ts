@@ -53,7 +53,11 @@ describe('#504 — fence de ABSORÇÃO: a autoridade é do absorvedor', () => {
       turnWriteConditions({
         ...BASE,
         expected_version: 7,
-        fence: { kind: 'absorber', absorber_turn_id: ABSORBER, claim_token: TOKEN },
+        fence: {
+          kind: 'absorber',
+          absorber_turn_id: ABSORBER,
+          claim_token: TOKEN,
+        },
       }),
     );
 
@@ -168,13 +172,34 @@ describe('#504 — fence PRÓPRIO (auto-supersessão e demais transições)', ()
 describe('#504 — sem fence: o regime de #503 (`FEATURE_TURN_CLAIM` OFF)', () => {
   it('nenhuma condição de posse, mas o CAS e o escopo continuam', () => {
     const { sql } = compile(
-      turnWriteConditions({ ...BASE, expected_version: 1, fence: { kind: 'none' } }),
+      turnWriteConditions({
+        ...BASE,
+        expected_version: 1,
+        fence: { kind: 'none' },
+      }),
     );
     expect(sql).not.toContain('claim_token');
     expect(sql).not.toContain('lease_expires_at');
     expect(sql).not.toContain('EXISTS');
     expect(sql).toContain('"agent_turns"."state_version" = $');
     expect(sql).toContain('"agent_turns"."tenant_id" = $');
+  });
+});
+
+describe('P1 — autoridade do recovery pós-outbound', () => {
+  it('exige claim real E lease expirada pelo relógio do PostgreSQL', () => {
+    const { sql } = compile(
+      turnWriteConditions({
+        ...BASE,
+        sources: ['outbound_pending'],
+        expected_version: 9,
+        fence: { kind: 'recovery_expired' },
+      }),
+    );
+    expect(sql).toContain('"agent_turns"."claim_token" IS NOT NULL');
+    expect(sql).toContain('"agent_turns"."lease_expires_at" IS NOT NULL');
+    expect(sql).toContain('"agent_turns"."lease_expires_at" <= now()');
+    expect(sql).toContain('"agent_turns"."state_version" = $');
   });
 });
 

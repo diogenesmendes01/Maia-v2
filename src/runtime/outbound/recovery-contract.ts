@@ -97,6 +97,21 @@ export const RECONCILIATION_DEADLINE_MS = 24 * 60 * 60_000;
  */
 export const DELIVERED_WITHOUT_HISTORY_GRACE_MS = 60_000;
 
+/**
+ * Estados de artefato que permitem ao recovery fechar o TURNO.
+ *
+ * É deliberadamente mais estrito que `MULTIPART_RESOLVED_STATUSES`:
+ * `delivered` libera a próxima parte, mas ainda não fechou o histórico e por
+ * isso não prova convergência. Lista de inclusão: estado novo bloqueia por
+ * default até receber decisão explícita.
+ */
+export const OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES = [
+  'completed',
+  'failed_terminal',
+  'cancelled',
+  'dead_letter',
+] as const;
+
 // =====================================================================
 // 2. A DECISÃO — o que fazer com uma linha incerta
 // =====================================================================
@@ -131,16 +146,17 @@ export const RECONCILIATION_DISPOSITIONS = [
   'dead_letter',
 ] as const;
 
-export type ReconciliationDisposition = (typeof RECONCILIATION_DISPOSITIONS)[number];
+export type ReconciliationDisposition =
+  (typeof RECONCILIATION_DISPOSITIONS)[number];
 
 /**
  * Rótulos de `maia_outbound_reconciliation_total{result}`.
  *
- * São as quatro disposições MAIS `noop` — a linha foi examinada e nada nela
- * pedia ação (por exemplo, uma `delivered` que ganhou histórico entre a leitura
- * e a escrita). Um `result` que só existisse quando algo acontece deixaria
- * "a reconciliação rodou e não achou trabalho" indistinguível de "a
- * reconciliação não rodou", que são incidentes opostos.
+ * Começam nas quatro disposições e acrescentam os resultados das fases de
+ * convergência: `noop`, recuperação/projeção de histórico e finalização do
+ * turno. Um `result` que só existisse quando algo acontece deixaria "a
+ * reconciliação rodou e não achou trabalho" indistinguível de "a reconciliação
+ * não rodou", que são incidentes opostos.
  */
 export const RECONCILIATION_RESULTS = [
   ...RECONCILIATION_DISPOSITIONS,
@@ -162,6 +178,11 @@ export const RECONCILIATION_RESULTS = [
    * do delivery worker por dentro.
    */
   'history_fabricated',
+  /**
+   * Todos os artefatos do turno convergiram e o recovery moveu o próprio
+   * `agent_turn` de `outbound_pending` para `completed`.
+   */
+  'turn_finalized',
 ] as const;
 
 export type ReconciliationResult = (typeof RECONCILIATION_RESULTS)[number];
@@ -250,7 +271,8 @@ export const OUTBOUND_DEAD_LETTER_REASONS = [
   'reconciliation_timeout',
 ] as const;
 
-export type OutboundDeadLetterReason = (typeof OUTBOUND_DEAD_LETTER_REASONS)[number];
+export type OutboundDeadLetterReason =
+  (typeof OUTBOUND_DEAD_LETTER_REASONS)[number];
 
 // =====================================================================
 // 4. REARMAMENTO MANUAL — a falha #12 da issue-mãe, como tipo
@@ -269,7 +291,8 @@ export const MANUAL_REARM_SOURCE_STATUSES = [
   'delivery_unknown',
 ] as const;
 
-export type ManualRearmSourceStatus = (typeof MANUAL_REARM_SOURCE_STATUSES)[number];
+export type ManualRearmSourceStatus =
+  (typeof MANUAL_REARM_SOURCE_STATUSES)[number];
 
 /** Por que um rearmamento manual foi recusado. Fechado. */
 export const MANUAL_REARM_REFUSALS = [
@@ -341,7 +364,9 @@ export function manualRearmRefusal(input: {
   acknowledge_duplicate_risk?: boolean;
   duplicate_risk: boolean;
 }): ManualRearmRefusal | null {
-  if (!(MANUAL_REARM_SOURCE_STATUSES as readonly string[]).includes(input.status)) {
+  if (
+    !(MANUAL_REARM_SOURCE_STATUSES as readonly string[]).includes(input.status)
+  ) {
     return 'status_not_rearmable';
   }
   if (input.reason.trim().length === 0) return 'reason_missing';

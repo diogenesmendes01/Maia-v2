@@ -195,6 +195,10 @@ export const AUDIT_ACTIONS = [
   // acrescentar decisão governável. NENHUM desses registros carrega texto,
   // prompt, telefone ou JID.
   'turn_ignored_by_policy',
+  // Decision Engine block/escalate is a policy decision even when the visible
+  // refusal must terminate as `fallback_delivered` after the outbox commit
+  // (`outbound_pending -> ignored` is not a valid state transition).
+  'decision_engine_policy_refused',
   'turn_dead_lettered',
   'turn_replayed',
   'turn_completed_without_reply',
@@ -283,11 +287,10 @@ export const AUDIT_ACTIONS = [
   //     issue-mãe. Ela existe porque a decisão vive no BANCO e o sinal vive no
   //     Redis: sem a row, um job que aparece na fila não tem procedência, e
   //     "quem mandou este turno rodar?" só teria como resposta uma inferência.
-  //     `metadata.source` separa os três produtores — conclusão terminal do
-  //     predecessor, recuperação de claim expirado da stream, e reconciliação
-  //     do varredor —, que têm leituras operacionais diferentes: o primeiro é
-  //     rotina, o segundo diz que um worker morreu, o terceiro diz que um sinal
-  //     se perdeu. `metadata.promoted_by_turn_id` reconstrói a fila sem
+  //     `metadata.source` separa os quatro produtores — conclusão terminal do
+  //     predecessor, recuperação de claim expirado da stream, conclusão pelo
+  //     recovery do outbox e reconciliação do sinal perdido —, que têm leituras
+  //     operacionais diferentes. `metadata.promoted_by_turn_id` reconstrói a fila sem
   //     recorrer à `stream_key`.
   //   - `turn_promotion_rejected`: uma tentativa STALE tentou concluir o turno
   //     e, com isso, liberar o sucessor — e foi recusada pelo fence. É a falha
@@ -439,6 +442,12 @@ export const AUDIT_ACTIONS = [
    */
   'outbound_turn_inconsistency_detected',
   /**
+   * O recovery comprovou, sob lock do turno e de todas as partes, que a lease
+   * expirou e o outbox convergiu; então terminalizou `agent_turns` na mesma
+   * transação desta trilha. O metadata carrega outcome e contagens das partes.
+   */
+  'outbound_turn_finalized',
+  /**
    * Issue #506 §Auditoria mínima — as SEIS linhas que faltavam.
    *
    * A auditoria de fechamento da épica registrou o buraco textualmente: dos
@@ -520,8 +529,9 @@ export const AUDIT_ACTIONS = [
    */
   'outbound_reconciliation_started',
   /**
-   * A reconciliação RESOLVEU a linha, e o `result` no metadata diz como —
-   * vocabulário fechado de `RECONCILIATION_RESULTS`:
+   * A reconciliação RESOLVEU a linha, e o `result` no metadata diz como. Este
+   * evento usa o subconjunto abaixo do vocabulário fechado de
+   * `RECONCILIATION_RESULTS`:
    *
    *   `resend_idempotent`  — devolvida a `retryable` com a MESMA
    *                          `provider_idempotency_key`, porque o provedor
@@ -534,7 +544,9 @@ export const AUDIT_ACTIONS = [
    *
    * `dead_letter` NÃO aparece aqui: ele tem ação própria
    * (`outbound_dead_lettered`), e colapsar desistência em "reconciliado" seria
-   * a trilha mentindo sobre o desfecho.
+   * a trilha mentindo sobre o desfecho. `turn_finalized` também usa ação própria
+   * (`outbound_turn_finalized`), porque o alvo é `agent_turns`, não a linha do
+   * outbox.
    */
   'outbound_reconciled',
   'pairing_qr_displayed',
@@ -628,6 +640,9 @@ export const AUDIT_ACTIONS = [
   // fails (legacy fallback removed). Surfaces previously-masked failures and
   // prevents cross-tenant rate-limit bucket collapse via default/default.
   'channel_resolution_failed',
+  // The pre-turn graph is allowed to degrade to the channel policy's validated
+  // default role, but that routing decision must remain reconstructable.
+  'role_selector_defaulted',
   // `@lid` ingress fix — emitted by the Baileys ingress when a WhatsApp `@lid`
   // (Linked ID) event cannot be mapped to a real phone: `senderPn`/
   // `participantPn` were absent AND the signal LID mapping store missed. Split
@@ -717,6 +732,10 @@ export const AUDIT_ACTIONS = [
   'audience_blocked_no_profile',
   'audience_ambiguous',
   'audience_quarantined',
+  // Existing conversations do not traverse `resolveIdentity`; the per-turn
+  // guard emits this when a previously active pessoa is now inactive,
+  // blocked, or quarantined and the message is discarded before cognition.
+  'identity_status_blocked',
   // Issue #410 — baseline.core tools. Conservative capabilities every runtime
   // agent gets by default (no domain side effects). Each baseline tool audits
   // its own action label so the decision trail (invariant #4) records that the

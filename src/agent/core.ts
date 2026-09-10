@@ -21,14 +21,22 @@ import {
 } from '@/governance/approval-requests.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
-import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
+import {
+  handleQuarantineFirstContact,
+  handleOwnerIdentityReply,
+} from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
 import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
 import { TypedError } from '@/lib/utils.js';
-import type { Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
+import type {
+  AgentAudienceProfile,
+  Mensagem,
+  ProcedureExecution,
+  Role,
+} from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
@@ -44,7 +52,11 @@ import type { TypingHandle } from '@/gateway/presence.js';
 // procedure-selector node output below).
 import { type SelectorDecision } from '@/cognition/procedure-selector.js';
 import * as procedureEngine from '@/procedures/engine.js';
-import { sendOutbound, safeDispatchOutput, OutboundDeliveryError } from './output-dispatch.js';
+import {
+  sendOutbound,
+  safeDispatchOutput,
+  OutboundDeliveryError,
+} from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
@@ -84,7 +96,10 @@ import { db } from '@/db/client.js';
 import { mensagens } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { runNodes } from '@/cognitive-graph/orchestrator.js';
-import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
+import {
+  buildPreturnNodes,
+  type PreturnContext,
+} from '@/cognitive-graph/preturn-graph.js';
 import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
 // P9b — Decision Engine hot-path wiring
 import {
@@ -97,7 +112,6 @@ import { publishSpanAttribution } from '@/observability/tracer.js';
 import {
   instrumentAudienceResolve,
   instrumentPreturnGraph,
-  type AudienceResolveOutcome,
 } from '@/observability/instrumentation.js';
 import {
   buildBaseContextPacketFromTurn,
@@ -105,6 +119,33 @@ import {
 } from '@/runtime/decision/build-base-context.js';
 
 const TYPING_DEBOUNCE_MS = 1500;
+
+type TurnScope = Awaited<ReturnType<typeof resolveScope>>;
+
+type AudienceResolution =
+  | {
+      outcome: 'resolved';
+      context: AudienceContext;
+      profile: AgentAudienceProfile;
+      scope: TurnScope;
+    }
+  | { outcome: 'absent'; context: null; profile: AgentAudienceProfile | null }
+  | { outcome: 'failed'; context: null; error: unknown };
+
+type RoleInputs = NonNullable<PreturnContext['role_inputs']>;
+type RoleInputsBlockReason =
+  | 'channel_unresolved'
+  | 'channel_policy_missing'
+  | 'channel_default_role_missing'
+  | 'channel_default_role_inactive'
+  | 'channel_role_allowlist_invalid'
+  | 'channel_default_role_not_allowed'
+  | 'channel_roles_unavailable'
+  | 'channel_default_role_not_active';
+
+type RoleInputsResolution =
+  | { kind: 'ready'; inputs: RoleInputs }
+  | { kind: 'blocked'; reason: RoleInputsBlockReason };
 
 /** Separator between aggregated chunks. Plain newline keeps the LLM's
  * tokenizer happy while letting it see the chunk boundaries the user
@@ -230,12 +271,19 @@ async function aggregateUnprocessedTexts(
       (m.created_at?.getTime() ?? 0) <= targetMs &&
       (m.conversa_id === null || m.conversa_id === target.conversa_id),
   );
-  if (textSiblings.length === 0) return { text: targetText, merged_ids: [], preclosed: false };
+  if (textSiblings.length === 0)
+    return { text: targetText, merged_ids: [], preclosed: false };
 
   // Chronological order: oldest sibling first, target last.
   const parts = textSiblings.map((m) => m.conteudo ?? '');
-  const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
-  return { text: merged, merged_ids: textSiblings.map((m) => m.id), preclosed: false };
+  const merged = [...parts, targetText]
+    .filter((s) => s.length > 0)
+    .join(AGGREGATE_SEPARATOR);
+  return {
+    text: merged,
+    merged_ids: textSiblings.map((m) => m.id),
+    preclosed: false,
+  };
 }
 
 /**
@@ -261,7 +309,10 @@ function scheduleTypingDebounce(
         handle = line.startTyping(jid, mensagem_id);
       })
       .catch((err) =>
-        logger.debug({ err: (err as Error).message }, 'agent.typing_line_unresolved'),
+        logger.debug(
+          { err: (err as Error).message },
+          'agent.typing_line_unresolved',
+        ),
       );
   }, TYPING_DEBOUNCE_MS);
   return () => {
@@ -271,7 +322,11 @@ function scheduleTypingDebounce(
   };
 }
 
-export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnprocessedTexts };
+export const _internal = {
+  scheduleTypingDebounce,
+  sendOutbound,
+  aggregateUnprocessedTexts,
+};
 
 /**
  * Probe-only cross-tenant read of `mensagens.metadata` for the channel resolver.
@@ -298,9 +353,7 @@ export const _internal = { scheduleTypingDebounce, sendOutbound, aggregateUnproc
  * `TypedError('channel_probe_failed')`: o caller audita `channel_resolution_failed`
  * e re-lança → BullMQ aplica retry/DLQ (fail-closed).
  */
-async function probeMessageForChannel(
-  mensagem_id: string,
-): Promise<{
+async function probeMessageForChannel(mensagem_id: string): Promise<{
   channel_type: 'whatsapp';
   external_id: string;
   bot_line_external_id: string | null;
@@ -329,7 +382,8 @@ async function probeMessageForChannel(
   // to resolve" → caller keeps legacy default/default (inner returns early).
   if (rows.length === 0) return null;
   const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
-  const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+  const tel =
+    typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
   if (!tel) return null;
   // §1.1 (spec roteamento v4) — a LINHA que recebeu (carimbada pelo ingress).
   // Rows antigas não a têm ⇒ null ⇒ resolução legada (shadow sem comparação).
@@ -337,7 +391,11 @@ async function probeMessageForChannel(
     typeof md['bot_line_external_id'] === 'string'
       ? (md['bot_line_external_id'] as string)
       : null;
-  return { channel_type: 'whatsapp', external_id: tel, bot_line_external_id: botLine };
+  return {
+    channel_type: 'whatsapp',
+    external_id: tel,
+    bot_line_external_id: botLine,
+  };
 }
 
 /**
@@ -398,7 +456,11 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   //     channel_probe_failed) → re-lança → BullMQ retry/DLQ (fail-closed). Antes
   //     deste fix uma falha transitória de DB no probe virava `null` e roteava
   //     uma mensagem possivelmente multi-tenant para o bucket default/default.
-  let resolved: { tenant_id: string; agent_id: string; channel_id: string | null } = {
+  let resolved: {
+    tenant_id: string;
+    agent_id: string;
+    channel_id: string | null;
+  } = {
     tenant_id: PRIMARY_TENANT_ID,
     agent_id: PRIMARY_AGENT_ID,
     channel_id: null,
@@ -513,10 +575,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
               owner_present: owner !== null,
             },
           });
-          logger.error(
-            { mensagem_id },
-            'agent.cross_tenant_adoption_conflict',
-          );
+          logger.error({ mensagem_id }, 'agent.cross_tenant_adoption_conflict');
           throw new TypedError(
             'channel_resolution_failed',
             'cross_tenant_adoption_conflict',
@@ -524,10 +583,7 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
           );
         }
         // owner == resolved → idempotent re-run (we adopted it earlier).
-        logger.debug(
-          { mensagem_id },
-          'agent.adoption_noop_already_owned',
-        );
+        logger.debug({ mensagem_id }, 'agent.adoption_noop_already_owned');
       }
     }
   }
@@ -549,7 +605,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
   // `publishSpanAttribution` é write-once com a primeira tupla real e ignora
   // `system`; sem tracing ligado é um no-op. Nunca participa do fluxo de
   // controle do turno.
-  publishSpanAttribution({ tenant_id: resolved.tenant_id, agent_id: resolved.agent_id });
+  publishSpanAttribution({
+    tenant_id: resolved.tenant_id,
+    agent_id: resolved.agent_id,
+  });
 
   await runWithTenantContext(
     { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
@@ -582,16 +641,22 @@ async function runAgentForMensagemInner(
   //
   // Autoritativo: só estado TERMINAL encerra. `outbound_pending` também para,
   // por motivo oposto — a resposta já está comprometida e quem finaliza é o
-  // delivery worker (#506); reexecutar o ReAct duplicaria a resposta.
+  // ciclo de delivery/recovery (#506); reexecutar o ReAct duplicaria a resposta.
   // Sem turno (falha de escrita em shadow) cai no critério legado — fail-closed
   // contra reprocessamento.
   if (turnStateAuthoritative() && turn) {
     if (isTerminalTurnStatus(turn.status)) {
-      logger.debug({ mensagem_id, turn_id: turn.turn_id, status: turn.status }, 'agent.turn_terminal');
+      logger.debug(
+        { mensagem_id, turn_id: turn.turn_id, status: turn.status },
+        'agent.turn_terminal',
+      );
       return;
     }
     if (turn.status === 'outbound_pending') {
-      logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_outbound_pending_skip');
+      logger.debug(
+        { mensagem_id, turn_id: turn.turn_id },
+        'agent.turn_outbound_pending_skip',
+      );
       return;
     }
   } else if (inbound.processada_em) {
@@ -699,6 +764,13 @@ async function runAgentForMensagemInner(
       );
       return;
     }
+    // A post-commit failure must leave `outbound_pending` authoritative, but
+    // it must not keep renewing this worker's lease forever. Releasing only the
+    // lease makes the recovery finalizer eligible without reopening the turn
+    // for another hot-path execution (`outbound_pending` is not claimable).
+    if (turn?.status === 'outbound_pending') {
+      await turn.lease?.release();
+    }
     throw err;
   }
 }
@@ -732,7 +804,10 @@ async function runAgentTurnPipeline(params: {
    *
    * Fora de um turno reivindicado é no-op e o comportamento é o de #503.
    */
-  const stampProcessed = async (id: string, tokens: number | null): Promise<void> => {
+  const stampProcessed = async (
+    id: string,
+    tokens: number | null,
+  ): Promise<void> => {
     if (turnOwnershipLost()) {
       logger.warn(
         { mensagem_id: id, turn_id: turn?.turn_id ?? null },
@@ -744,7 +819,9 @@ async function runAgentTurnPipeline(params: {
   };
 
   if (!inbound.conversa_id) {
-    const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
+    const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as
+      | string
+      | undefined;
     if (!tel) {
       // #503 — sem telefone não há identidade a resolver: o inbound é
       // inaproveitável. Antes esta saída era um `return` mudo e o turno ficava
@@ -762,7 +839,10 @@ async function runAgentTurnPipeline(params: {
     }
     // Fase 0 (spec roteamento v4 §1.6): a identidade da conversa inclui o
     // canal — o resolver casa/cria a conversa DO canal que recebeu o inbound.
-    const resolved = await resolveIdentity({ telefone_whatsapp: tel, channel_id });
+    const resolved = await resolveIdentity({
+      telefone_whatsapp: tel,
+      channel_id,
+    });
     if (resolved.kind === 'unknown') {
       // Mark processed so the recovery worker doesn't requeue forever.
       // #503: descarte INTENCIONAL por regra explícita → `ignored`, com outcome
@@ -772,7 +852,10 @@ async function runAgentTurnPipeline(params: {
       return;
     }
     if (resolved.kind === 'blocked') {
-      logger.info({ pessoa_id: resolved.pessoa.id, reason: resolved.reason }, 'agent.blocked_drop');
+      logger.info(
+        { pessoa_id: resolved.pessoa.id, reason: resolved.reason },
+        'agent.blocked_drop',
+      );
       await concludeTurn(turn, 'identity_blocked', {
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
@@ -813,14 +896,17 @@ async function runAgentTurnPipeline(params: {
     inbound.conversa_id = resolved.conversa.id;
   }
 
-  const conv = await loadConversaWithPessoa(inbound.conversa_id!);
+  const conv = await conversasRepo.byIdWithPessoa(inbound.conversa_id!);
   if (!conv) {
     logger.warn({ mensagem_id }, 'agent.conversa_missing');
     // #503 — a conversa acabou de ser resolvida/criada; não a encontrar aqui é
     // inconsistência TRANSITÓRIA (replica lag, conversa encerrada em corrida),
     // não uma decisão de negócio. Nenhuma tool rodou, então retry é seguro.
     // Antes era `return` mudo e o turno ficava `running` órfão.
-    await failTurnRetryable(turn, { code: 'conversa_missing', mensagem_id: inbound.id });
+    await failTurnRetryable(turn, {
+      code: 'conversa_missing',
+      mensagem_id: inbound.id,
+    });
     return;
   }
   const { conversa: c, pessoa } = conv;
@@ -840,7 +926,11 @@ async function runAgentTurnPipeline(params: {
           { err: (err as Error).message, mensagem_id: inbound.id },
           'agent.aggregate_failed_continuing_solo',
         );
-        return { text: inbound.conteudo ?? '', merged_ids: [] as string[], preclosed: false };
+        return {
+          text: inbound.conteudo ?? '',
+          merged_ids: [] as string[],
+          preclosed: false,
+        };
       })
     : { text: '', merged_ids: [] as string[], preclosed: false };
   if (aggregated.merged_ids.length > 0) {
@@ -898,6 +988,211 @@ async function runAgentTurnPipeline(params: {
     }
   };
 
+  // Governance gates belong before every business hook below (rate limiting,
+  // pending actions, scheduling, cognitive graph, Decision Engine and ReAct).
+  // Existing conversations bypass `resolveIdentity`, so the active audience
+  // relation and channel policy must be revalidated on every turn.
+  const channelBindings = [
+    { source: 'resolver', channel_id },
+    { source: 'inbound', channel_id: inbound.channel_id ?? null },
+    { source: 'conversation', channel_id: c.channel_id ?? null },
+  ].filter(
+    (binding): binding is { source: string; channel_id: string } =>
+      typeof binding.channel_id === 'string' && binding.channel_id.length > 0,
+  );
+  const effectiveChannelId =
+    channel_id ?? inbound.channel_id ?? c.channel_id ?? null;
+
+  if (pessoa.status !== 'ativa') {
+    const outcome =
+      pessoa.status === 'quarentena' ? 'quarantined' : 'identity_blocked';
+    logger.info(
+      { pessoa_id: pessoa.id, pessoa_status: pessoa.status },
+      'agent.existing_identity_blocked',
+    );
+    await audit({
+      acao: 'identity_status_blocked',
+      pessoa_id: pessoa.id,
+      conversa_id: c.id,
+      mensagem_id: inbound.id,
+      metadata: { pessoa_status: pessoa.status },
+    });
+    await concludeTurn(turn, outcome, {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
+
+  if (new Set(channelBindings.map((binding) => binding.channel_id)).size > 1) {
+    await audit({
+      acao: 'channel_resolution_failed',
+      mensagem_id: inbound.id,
+      metadata: {
+        error_code: 'channel_scope_mismatch',
+        channel_bindings: Object.fromEntries(
+          channelBindings.map((binding) => [
+            binding.source,
+            binding.channel_id,
+          ]),
+        ),
+        resolver_path: 'turn_policy_gate',
+      },
+    });
+    await concludeTurn(turn, 'blocked_by_policy', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
+
+  // A legacy conversation may still have channel_id=NULL while the resolver or
+  // inbound row identifies a unique line. Carry that governed binding through
+  // the in-memory conversation so every downstream outbound (ReAct, skill,
+  // reaction and media dispatch) uses the same policy-approved channel.
+  if (!c.channel_id && effectiveChannelId) c.channel_id = effectiveChannelId;
+
+  const audienceResolution = await instrumentAudienceResolve(
+    async (): Promise<AudienceResolution> => {
+      try {
+        const profile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
+        if (!profile || profile.status !== 'active') {
+          return { context: null, outcome: 'absent', profile };
+        }
+
+        const resolvedScope = await resolveScope(pessoa);
+        const context = buildAudienceContext({
+          pessoa,
+          profile,
+          allowed_entity_ids: resolvedScope.entidades ?? [],
+          channel_id: effectiveChannelId,
+        });
+        if (!context) return { context: null, outcome: 'absent', profile };
+        return { context, outcome: 'resolved', profile, scope: resolvedScope };
+      } catch (error) {
+        return { context: null, outcome: 'failed', error };
+      }
+    },
+    (result) => result.outcome,
+  );
+
+  if (audienceResolution.outcome === 'failed') {
+    logger.error(
+      {
+        err: (audienceResolution.error as Error).message,
+        pessoa_id: pessoa.id,
+      },
+      'agent.audience_resolution_failed_closed',
+    );
+    await failTurnRetryable(turn, {
+      code: 'audience_context_resolution_failed',
+      error: audienceResolution.error,
+      mensagem_id: inbound.id,
+    });
+    throw audienceResolution.error;
+  }
+
+  if (audienceResolution.outcome === 'absent') {
+    if (audienceResolution.profile === null) {
+      await audit({
+        acao: 'audience_blocked_no_profile',
+        pessoa_id: pessoa.id,
+        metadata: { tenant_id: pessoa.tenant_id, agent_id: pessoa.agent_id },
+      });
+    } else {
+      await audit({
+        acao: 'audience_quarantined',
+        pessoa_id: pessoa.id,
+        metadata: {
+          tenant_id: pessoa.tenant_id,
+          agent_id: pessoa.agent_id,
+          audience_profile_id: audienceResolution.profile.id,
+          profile_status: audienceResolution.profile.status,
+        },
+      });
+    }
+    await concludeTurn(turn, 'quarantined', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
+
+  const { context: audienceContext, scope } = audienceResolution;
+
+  await audit({
+    acao: 'audience_resolved',
+    pessoa_id: pessoa.id,
+    conversa_id: c.id,
+    mensagem_id: inbound.id,
+    metadata: {
+      audience_profile_id: audienceContext.audience_profile_id,
+      audience_type: audienceContext.audience_type,
+      trust_level: audienceContext.trust_level,
+    },
+  });
+
+  let roleInputsResolution: RoleInputsResolution;
+  try {
+    roleInputsResolution = await resolveRoleInputs(effectiveChannelId);
+  } catch (error) {
+    logger.error(
+      { err: (error as Error).message, channel_id: effectiveChannelId },
+      'agent.channel_policy_resolution_failed_closed',
+    );
+    await audit({
+      acao: 'channel_resolution_failed',
+      mensagem_id: inbound.id,
+      metadata: {
+        error_code: 'channel_policy_lookup_failed',
+        channel_id: effectiveChannelId,
+        resolver_path: 'turn_policy_gate',
+      },
+    }).catch((auditError) =>
+      logger.error(
+        { err: (auditError as Error).message, channel_id: effectiveChannelId },
+        'agent.channel_policy_failure_audit_failed',
+      ),
+    );
+    await failTurnRetryable(turn, {
+      code: 'channel_policy_resolution_failed',
+      error,
+      mensagem_id: inbound.id,
+    });
+    throw error;
+  }
+
+  if (roleInputsResolution.kind === 'blocked') {
+    await audit({
+      acao: 'channel_resolution_failed',
+      mensagem_id: inbound.id,
+      metadata: {
+        error_code: roleInputsResolution.reason,
+        channel_id: effectiveChannelId,
+        resolver_path: 'turn_policy_gate',
+      },
+    });
+    await concludeTurn(turn, 'blocked_by_policy', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+    return;
+  }
+
+  const role_inputs = roleInputsResolution.inputs;
+
   // P1 reflection trigger: success detection now runs exclusively in the
   // post-turn `success-reflection` graph node (fire-and-forget, ASYNC layer).
   // The pre-turn imperative trigger was removed with FEATURE_COGNITIVE_GRAPH
@@ -910,6 +1205,10 @@ async function runAgentTurnPipeline(params: {
   // polite reply per hour, then 60s of silence after each warning.
   const decision = await checkRateLimit(pessoa);
   if (decision.kind !== 'allow') {
+    let rateLimitOutcome:
+      | 'fallback_delivered'
+      | 'reply_delivery_unknown'
+      | 'rate_limited_silent' = 'rate_limited_silent';
     if (decision.kind === 'warn') {
       await audit({
         acao: 'rate_limit_exceeded',
@@ -925,14 +1224,57 @@ async function runAgentTurnPipeline(params: {
       // para "fallback/timeout também usam outbox". Sem ele o outbox registrava
       // a recusa como se fosse conteúdo do agente, e nenhuma consulta
       // conseguia separar as duas.
-      await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
-        channel_id: c.channel_id,
-        fallback_reason: 'policy_refusal',
-      }).catch((err) =>
-        logger.warn({ err: (err as Error).message }, 'agent.rate_limit_reply_failed'),
-      );
+      try {
+        const providerMessageId = await sendOutbound(
+          pessoa.id,
+          c.id,
+          reply,
+          inbound.id,
+          {
+            channel_id: effectiveChannelId,
+            fallback_reason: 'policy_refusal',
+          },
+        );
+        if (providerMessageId === null) {
+          // A resolução sem id ocorre nos atalhos de dedupe/artefato já
+          // tentado. Ela impede um novo envio, mas não confirma entrega. Se o
+          // commit durável já moveu o turno, recovery continua sendo o dono;
+          // sem essa barreira, terminalizamos com a ambiguidade explícita.
+          if (turn?.status === 'outbound_pending') {
+            throw new OutboundDeliveryError(
+              true,
+              'rate_limit_delivery_unconfirmed_after_commit',
+            );
+          }
+          rateLimitOutcome = 'reply_delivery_unknown';
+        } else {
+          rateLimitOutcome = 'fallback_delivered';
+        }
+      } catch (err) {
+        const committed = turn?.status === 'outbound_pending';
+        const deliveryUnknown =
+          err instanceof OutboundDeliveryError && err.delivered;
+        logger.warn(
+          {
+            err: (err as Error).message,
+            committed,
+            delivery_unknown: deliveryUnknown,
+          },
+          'agent.rate_limit_reply_failed',
+        );
+
+        // Once the durable outbound barrier moved the turn to
+        // `outbound_pending`, no hot-path terminalization may race recovery or
+        // permit another response. Let the error escape with the durable state
+        // intact. A pre-commit ambiguous delivery is terminalized explicitly;
+        // a definite pre-send failure remains the already-recorded rate-limit
+        // silence because retrying would consume the Redis warning window and
+        // still not re-send the warning.
+        if (committed) throw err;
+        if (deliveryUnknown) rateLimitOutcome = 'reply_delivery_unknown';
+      }
     }
-    await concludeTurn(turn, 'rate_limited_silent', {
+    await concludeTurn(turn, rateLimitOutcome, {
       pessoa_id: pessoa.id,
       mensagem_id: inbound.id,
     });
@@ -954,10 +1296,19 @@ async function runAgentTurnPipeline(params: {
         approver: pessoa,
         decision: approvalReply.decision,
       });
-      await sendOutbound(pessoa.id, c.id, formatDecisionOutcome(outcome), inbound.id, {
-        channel_id: c.channel_id,
-      }).catch((err) =>
-        logger.warn({ err: (err as Error).message }, 'agent.approval_reply_send_failed'),
+      await sendOutbound(
+        pessoa.id,
+        c.id,
+        formatDecisionOutcome(outcome),
+        inbound.id,
+        {
+          channel_id: effectiveChannelId,
+        },
+      ).catch((err) =>
+        logger.warn(
+          { err: (err as Error).message },
+          'agent.approval_reply_send_failed',
+        ),
       );
       await concludeTurn(turn, 'pending_action_resolved', {
         pessoa_id: pessoa.id,
@@ -1054,9 +1405,12 @@ async function runAgentTurnPipeline(params: {
   assertTurnOwnership('scheduling_inbound_hook');
   if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
-      const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
+      const { captureInboundForOutreach } =
+        await import('@/scheduling/disambiguation.js');
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;
-      const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
+      const owner = await (
+        await import('@/db/repositories.js')
+      ).pessoasRepo.findByPhone(ownerId);
       if (owner) {
         // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard acima roda
         // ANTES de dois `import()` dinâmicos e de um round-trip ao banco
@@ -1083,53 +1437,6 @@ async function runAgentTurnPipeline(params: {
     }
   }
 
-  const scope = await resolveScope(pessoa);
-
-  // Issue #407/#409 — resolve the per-agent AudienceContext for this turn so the
-  // SkillUsagePolicy gates (SkillSelector candidate filter + SkillRunner gate
-  // 4.6) can admit/remove skills by audience. Governance-derived (invariant #3),
-  // never LLM-declared. Best-effort: a lookup failure leaves `audienceContext`
-  // null — the early filter is then skipped (no audience to admit against) and
-  // the runner gate 4.6 (also audience-gated) is skipped too, so the turn is NOT
-  // broken by a transient audience-store hiccup; the conservative defaults still
-  // apply once an audience is present.
-  //
-  // Issue #535 — span `audience.resolve`. Ele cobre a busca do perfil E o
-  // `buildAudienceContext` porque só o PAR é uma fronteira: a busca é o
-  // round-trip ao banco, e a derivação é o que decide se o turno termina com
-  // audiência. Cronometrar só a query esconderia justamente o caso que importa
-  // — um turno rodando com `audienceContext === null`, que silenciosamente pula
-  // dois portões de política.
-  //
-  // `failed` é membro do vocabulário e não status de erro: o `catch` aqui é
-  // fail-soft de propósito (um soluço da audience-store não pode derrubar o
-  // turno), então do ponto de vista do span a etapa COMPLETOU — só completou
-  // sem audiência, e é isso que `result` diz.
-  const audienceResolution = await instrumentAudienceResolve(
-    async (): Promise<{
-      context: AudienceContext | null;
-      outcome: AudienceResolveOutcome;
-    }> => {
-      try {
-        const audienceProfile = await agentAudienceProfilesRepo.findByPessoa(pessoa.id);
-        const context = buildAudienceContext({
-          pessoa,
-          profile: audienceProfile,
-          allowed_entity_ids: scope.entidades ?? [],
-        });
-        return { context, outcome: context ? 'resolved' : 'absent' };
-      } catch (err) {
-        logger.warn(
-          { err: (err as Error).message, pessoa_id: pessoa.id },
-          'agent.audience_resolution_failed_proceeding',
-        );
-        return { context: null, outcome: 'failed' };
-      }
-    },
-    (r) => r.outcome,
-  );
-  const audienceContext: AudienceContext | null = audienceResolution.context;
-
   // P3b Task 9 / P6 Task 9 / P7 Task 8 — PRE-TURN cognitive modules:
   // resolve procedure-selector + role-selector (role-selector runs whenever a
   // channel_id is present — MULTI_CHANNEL removed / always on after #411).
@@ -1140,25 +1447,30 @@ async function runAgentTurnPipeline(params: {
   // APÓS o grafo retornar, lendo `result.nodes[name].output` — mantém paridade
   // byte-por-byte com o path imperativo legacy pré-#412.
   //
-  // Procedure runtime nunca pode derrubar o baseline ReAct turn. Failures
-  // só deixam `activeExecution=null` / `activeRole=null`.
+  // Procedure/selector runtime may fail soft only AFTER the governed default
+  // role has been resolved. A selector failure keeps that explicit default;
+  // it never turns a governed channel into a role-less turn.
   let activeExecution: ProcedureExecution | null = null;
-  let activeRole: Role | null = null;
+  let activeRole: Role | null = role_inputs.current_role;
+  let roleDefaultAudit:
+    | {
+        reason: 'role_selector_no_result';
+        node_status: string;
+        fallback_triggered: boolean;
+      }
+    | { reason: 'preturn_graph_failed' }
+    | null = null;
   // [P88-C4] Mensagem opcional anunciando troca de role (lida pela react-loop
   // como outboundPrefix). Permanece null quando não há troca ou quando a
   // policy do canal pede silêncio (announce_mode=never). Populada abaixo a
   // partir do output do node role-selector (só roda sob MULTI_CHANNEL).
   let roleAnnouncement: string | null = null;
 
-  // #411 (MULTI_CHANNEL removed / always on): `multi_channel_on` é passado como
-  // `true`; o node role-selector é gated downstream por `ctx.role_inputs !==
-  // undefined` (que por sua vez exige channel_id resolvido + policy), então
-  // passar true aqui apenas mantém o node disponível e deixa `buildRoleInputs`
-  // decidir por turno.
+  // #411 (MULTI_CHANNEL removed / always on): policy + roles were validated by
+  // the fail-closed gate above, before any business side effect.
   const turnSignal = getTurnExecutionContext()?.signal;
   try {
     activeExecution = await procedureExecutionsRepo.findActiveForConversa(c.id);
-    const role_inputs = await buildRoleInputs(channel_id);
     const nodes = buildPreturnNodes({ multi_channel_on: true });
     const ctx: PreturnContext = {
       conversa_id: c.id,
@@ -1171,7 +1483,7 @@ async function runAgentTurnPipeline(params: {
             status: activeExecution.status,
           }
         : null,
-      ...(role_inputs ? { role_inputs } : {}),
+      role_inputs,
       // Issue #507 (achado 2) — o sinal da TENTATIVA entra no grafo. Daqui ele
       // desce por `runOne` → `runCognitiveModule` → `n.run` → `callLLM` de cada
       // reasoner (`procedure-selector`, `role-selector`).
@@ -1183,7 +1495,9 @@ async function runAgentTurnPipeline(params: {
     // que `SPAN_PARENT` declara. Sem ele os dois se penduravam em `turn` e a
     // waterfall não mostrava que rodam em PARALELO — que é a única coisa sobre
     // esta etapa que um operador lendo um turno lento precisa saber.
-    const result = await instrumentPreturnGraph(nodes.length, () => runNodes(nodes, ctx));
+    const result = await instrumentPreturnGraph(nodes.length, () =>
+      runNodes(nodes, ctx),
+    );
 
     // Issue #507 (achado 2 da revisão do dono) — GUARD DE BOUNDARY, antes de
     // CONSUMIR o resultado. Tudo o que vem abaixo é write:
@@ -1194,9 +1508,8 @@ async function runAgentTurnPipeline(params: {
     assertTurnOwnership('preturn_graph');
 
     // Side effects POST-graph — procedure-selector decision + start/switch.
-    const selectorOutput = result.nodes['procedure-selector']?.output as
-      | SelectorDecision
-      | null;
+    const selectorOutput = result.nodes['procedure-selector']
+      ?.output as SelectorDecision | null;
     if (selectorOutput) {
       await procedureSelectorDecisionsRepo
         .record({
@@ -1244,12 +1557,14 @@ async function runAgentTurnPipeline(params: {
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
             assertTurnOwnership('preturn_graph');
-            const { execution: started } = await procedureEngine.startExecution({
-              definition_id: def.id,
-              definition_version: def.version_number,
-              conversa_id: c.id,
-              first_step_id: steps[0]?.id ?? null,
-            });
+            const { execution: started } = await procedureEngine.startExecution(
+              {
+                definition_id: def.id,
+                definition_version: def.version_number,
+                conversa_id: c.id,
+                first_step_id: steps[0]?.id ?? null,
+              },
+            );
             activeExecution = started;
           }
         } else if (
@@ -1268,12 +1583,14 @@ async function runAgentTurnPipeline(params: {
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
             assertTurnOwnership('preturn_graph');
-            const { execution: started } = await procedureEngine.startExecution({
-              definition_id: def.id,
-              definition_version: def.version_number,
-              conversa_id: c.id,
-              first_step_id: steps[0]?.id ?? null,
-            });
+            const { execution: started } = await procedureEngine.startExecution(
+              {
+                definition_id: def.id,
+                definition_version: def.version_number,
+                conversa_id: c.id,
+                first_step_id: steps[0]?.id ?? null,
+              },
+            );
             activeExecution = started;
           }
         }
@@ -1292,10 +1609,11 @@ async function runAgentTurnPipeline(params: {
     // Role-selector output (só presente quando MULTI_CHANNEL on E role_inputs
     // existe — ver buildPreturnNodes/buildRoleInputs). Mirror do path legacy:
     // seta activeRole e computa o anúncio de troca quando a policy pede.
-    const roleResult = result.nodes['role-selector']?.output as
+    const roleNode = result.nodes['role-selector'];
+    const roleResult = roleNode?.output as
       | import('@/cognition/role-selector/engine.js').RoleSelectorResult
       | null;
-    if (roleResult && role_inputs) {
+    if (roleResult) {
       activeRole = roleResult.decided_role;
       // [P88-C4] Compute the optional switch announcement. Only emit when the
       // policy says so AND the role actually changed AND the new role brings a
@@ -1306,7 +1624,8 @@ async function runAgentTurnPipeline(params: {
       ) {
         const announceMode = role_inputs.policy.announce_mode;
         const affectsUser =
-          roleResult.decided_role.display_name !== role_inputs.current_role.display_name &&
+          roleResult.decided_role.display_name !==
+            role_inputs.current_role.display_name &&
           !!(roleResult.decided_role.prompt_addendum ?? '').trim();
         const shouldAnnounce =
           announceMode === 'always' ||
@@ -1315,6 +1634,12 @@ async function runAgentTurnPipeline(params: {
           roleAnnouncement = `_(Mudando para o modo ${roleResult.decided_role.display_name}.)_`;
         }
       }
+    } else {
+      roleDefaultAudit = {
+        reason: 'role_selector_no_result',
+        node_status: roleNode?.status ?? 'missing',
+        fallback_triggered: roleNode?.fallback_triggered ?? false,
+      };
     }
   } catch (err) {
     // Issue #507 — a recusa por perda de posse ATRAVESSA este catch. Ele é
@@ -1326,6 +1651,22 @@ async function runAgentTurnPipeline(params: {
       { err: (err as Error).message, conversa_id: c.id },
       'preturn.graph_failed',
     );
+    roleDefaultAudit = { reason: 'preturn_graph_failed' };
+  }
+
+  if (roleDefaultAudit) {
+    await audit({
+      acao: 'role_selector_defaulted',
+      pessoa_id: pessoa.id,
+      conversa_id: c.id,
+      mensagem_id: inbound.id,
+      metadata: {
+        role_id: role_inputs.current_role.id,
+        role_key: role_inputs.current_role.role_key,
+        channel_id: effectiveChannelId,
+        ...roleDefaultAudit,
+      },
+    });
   }
 
   const tenantId = getCurrentTenant();
@@ -1344,7 +1685,11 @@ async function runAgentTurnPipeline(params: {
     // (capability-taxonomy §2 step 7: agent grant ∩ active-role packs ∩ skill
     // scope). Absent ⇒ no role narrowing (role-agnostic / legacy turn).
     ...(activeRole ? { activeRoleKey: activeRole.role_key } : {}),
-    audit_context: { pessoa_id: pessoa.id, conversa_id: c.id, mensagem_id: inbound.id },
+    audit_context: {
+      pessoa_id: pessoa.id,
+      conversa_id: c.id,
+      mensagem_id: inbound.id,
+    },
   });
   let tools = visibility.tools;
 
@@ -1370,14 +1715,82 @@ async function runAgentTurnPipeline(params: {
   // tenant/agent, channel, active role, active execution and audience — every
   // one of them already resolved above. What DOES depend on the gate is the
   // tool set (`applyToolReductions`), so tool visibility stays above it.
+  let baseCtx: ReturnType<typeof buildBaseContextPacketFromTurn>;
+  let deResult: Awaited<ReturnType<typeof runDecisionEngineForTurn>>;
+
+  const finishStatusFallback = async (input: {
+    message: string;
+    reason: 'internal_error' | 'policy_refusal';
+    retry_code:
+      | 'decision_engine_fallback_not_committed'
+      | 'decision_engine_policy_refusal_not_committed';
+    failure_log: string;
+  }): Promise<void> => {
+    try {
+      await sendOutbound(pessoa.id, c.id, input.message, inbound.id, {
+        channel_id: effectiveChannelId,
+        fallback_reason: input.reason,
+      });
+    } catch (deliveryError) {
+      const committed = turn?.status === 'outbound_pending';
+      const deliveryUnknown =
+        deliveryError instanceof OutboundDeliveryError &&
+        deliveryError.delivered;
+      logger.warn(
+        {
+          err: (deliveryError as Error).message,
+          committed,
+          delivery_unknown: deliveryUnknown,
+        },
+        input.failure_log,
+      );
+
+      // Once committed, keep the turn at `outbound_pending`: that state is the
+      // FIFO barrier while outbox recovery owns the artifact. Completing here
+      // would let the next turn overtake a response that is still retryable or
+      // under reconciliation. The pending-age/divergence monitors surface a
+      // recovery path that fails to converge.
+      if (committed) throw deliveryError;
+
+      // Rollback/shadow modes may have no durable outbox. Preserve the
+      // ambiguity guard there: if the channel may already have received the
+      // message, terminate without retrying and risking a duplicate.
+      if (deliveryUnknown) {
+        await concludeTurn(turn, 'reply_delivery_unknown', {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
+        await markAllProcessed(0);
+        await conversasRepo.touch(c.id);
+        await clearDebounceState(pessoa.telefone_whatsapp);
+        return;
+      }
+
+      await failTurnRetryable(turn, {
+        code: input.retry_code,
+        error: deliveryError,
+        mensagem_id: inbound.id,
+      });
+      throw deliveryError;
+    }
+
+    await concludeTurn(turn, 'fallback_delivered', {
+      pessoa_id: pessoa.id,
+      mensagem_id: inbound.id,
+    });
+    await markAllProcessed(0);
+    await conversasRepo.touch(c.id);
+    await clearDebounceState(pessoa.telefone_whatsapp);
+  };
+
   try {
-    const baseCtx = buildBaseContextPacketFromTurn({
+    baseCtx = buildBaseContextPacketFromTurn({
       inbound,
       conversa: c,
       pessoa,
       tenant_id: tenantId,
       agent_id: getCurrentAgent(),
-      channel_id,
+      channel_id: effectiveChannelId,
       active_procedure_execution_id: activeExecution?.id ?? null,
       // Issue #415/#416 — thread the resolved active operational role key
       // (`decided_role.role_key`, set above from the role-selector chain) so the
@@ -1396,210 +1809,22 @@ async function runAgentTurnPipeline(params: {
           }
         : {}),
     });
-    const deResult = await runDecisionEngineForTurn(baseCtx);
-    if (deResult.engine_ran && deResult.result) {
-      const { packet, block } = deResult.result;
-
-      // Honor decision outcome: block and approval flows short-circuit the turn.
-      if (block) {
-        // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
-        // Never expose internal policy text (effect.message) to the user.
-        const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
-        // #634 — recusa por política do Decision Engine.
-        await sendOutbound(pessoa.id, c.id, blockMsg, inbound.id, {
-          channel_id: c.channel_id,
-          fallback_reason: 'policy_refusal',
-        }).catch((err) =>
-          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.blocked_reply_failed'),
-        );
-        await concludeTurn(turn, 'blocked_by_policy', {
-          pessoa_id: pessoa.id,
-          mensagem_id: inbound.id,
-        });
-        await markAllProcessed(0);
-        await conversasRepo.touch(c.id);
-        await clearDebounceState(pessoa.telefone_whatsapp);
-        return;
-      }
-
-      // action_mode='escalate' without a hard block → still escalate (dual-approval path)
-      // Fase 0 cap. 3 — o texto NÃO promete notificação: este caminho apenas
-      // bloqueia o turno; o request de aprovação persistido (com notificação
-      // real aos aprovadores) é criado pelo dispatcher quando a tool é
-      // efetivamente proposta. Prometer "o responsável será notificado" aqui
-      // era mentira operacional (audit P0 cap. 3).
-      if (packet.action_mode === 'escalate') {
-        const escalateMsg =
-          'Esta ação requer aprovação adicional antes de prosseguir.';
-        // #634 — escalada para aprovação também é recusa por política.
-        await sendOutbound(pessoa.id, c.id, escalateMsg, inbound.id, {
-          channel_id: c.channel_id,
-          fallback_reason: 'policy_refusal',
-        }).catch((err) =>
-          logger.warn({ err: (err as Error).message }, 'agent.decision_engine.escalate_reply_failed'),
-        );
-        await concludeTurn(turn, 'blocked_by_policy', {
-          pessoa_id: pessoa.id,
-          mensagem_id: inbound.id,
-        });
-        await markAllProcessed(0);
-        await conversasRepo.touch(c.id);
-        await clearDebounceState(pessoa.telefone_whatsapp);
-        return;
-      }
-
-      // action_mode='ask_clarification' → fall through to the LLM so casual
-      // conversation is not hijacked by a canned reply. The LLM produces the
-      // clarifying question (or a free-form answer) from the full prompt context.
-
-      // action_mode='execute_skill' (F1 Phase 1) → run the selected
-      // prompt_only/evaluator skill via runSkill and deliver its reply through
-      // dispatchOutput. The execution_mode gate lives in ActionDecider; here we
-      // enforce the immutable-identity assert (re-resolve by descriptor under
-      // the routed agent; pinned id+version must still match) and the safe
-      // fall-through contract — a !ok / identity-mismatch / no-reply skill
-      // degrades to the normal LLM/ReAct turn (prompt_only/evaluator have no
-      // side effects, so this can't double-act).
-      if (packet.action_mode === 'execute_skill') {
-        const replyJid =
-          typeof (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'] === 'string' &&
-          ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string).length > 0
-            ? ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
-            : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-        const routedAgentId = packet.routing.agent_id;
-        const pinned =
-          packet.routing.selected_skill_descriptor !== undefined &&
-          packet.routing.selected_skill_version !== undefined &&
-          packet.routing.selected_skill_id !== undefined
-            ? {
-                selected_skill_descriptor: packet.routing.selected_skill_descriptor,
-                selected_skill_version: packet.routing.selected_skill_version,
-                selected_skill_id: packet.routing.selected_skill_id,
-              }
-            : null;
-        const outcome = await executeSelectedSkill(
-          {
-            pinned,
-            routedAgentId,
-            pessoa,
-            conversa: c,
-            inbound,
-            jid: replyJid,
-            aggregatedText: inbound.conteudo ?? '',
-            // Issue #409 — forward the resolved audience + channel + scored risk
-            // so the SkillRunner gate 4.6 re-evaluates the skill's usage_policy
-            // at execution time (fail-closed TOCTOU re-check). Built from the
-            // SAME AudienceContext the early candidate filter used.
-            ...(audienceContext
-              ? {
-                  audience: {
-                    audience_type: audienceContext.audience_type,
-                    trust_level: audienceContext.trust_level,
-                    channel_type: baseCtx.channel.kind,
-                    allowed_data_scope: allowedDataScopesForAudience(
-                      audienceContext.audience_type,
-                      audienceContext.trust_level,
-                    ),
-                    risk_level: packet.risk_profile.level,
-                  },
-                }
-              : {}),
-          },
-          {
-            resolveActiveSkill: async (descriptor, agent_id) => {
-              try {
-                // findActive throws agent_scope_violation when the routed agent
-                // differs from the current tenant-context agent — treat that
-                // (and any lookup error) as "not the pinned skill" so we fall
-                // through safely rather than executing a divergent row.
-                const row = await skillsRepo.findActive(descriptor, agent_id);
-                if (row) return { id: row.id, version: row.version };
-                // Q3-A (Codex #216 review item 5): a tenant-wide skill
-                // (agent_id IS NULL) can be SELECTED (selection unions IS NULL)
-                // but is intentionally NOT executable yet — this re-resolution
-                // scopes to the EXACT routed agent, which never matches IS NULL.
-                // Probe explicitly so the block is a VISIBLE "deferred pending
-                // #218 (tenant-wide isolation proof)" rather than a silent
-                // fall-through. We still return null (do NOT execute it).
-                const tenantWide = await skillsRepo.findActive(descriptor, null);
-                if (tenantWide) {
-                  logger.warn(
-                    { skill_descriptor: descriptor, agent_id },
-                    'skill.tenant_wide_not_executable_pending_218',
-                  );
-                }
-                return null;
-              } catch (e) {
-                logger.warn(
-                  { err: (e as Error).message, skill_descriptor: descriptor, agent_id },
-                  'skill.identity_resolve_failed',
-                );
-                return null;
-              }
-            },
-            runSkill,
-            safeDispatchOutput,
-            // #227 per-turn guard (Improvement 2). Thin wrapper over
-            // outboundMessagesRepo.findByKey using the turn-scoped key the
-            // ledger keys off. Tenant + agent are resolved from the current
-            // context inside findByKey (no need to thread them here). The
-            // skill-side guard fail-opens on throw, so we don't try/catch
-            // here.
-            findOutboundLedgerForTurn: ({ conversa_id, in_reply_to }) =>
-              outboundMessagesRepo.findByKey(`${conversa_id}:${in_reply_to}`),
-            logger,
-          },
-        );
-        if (outcome.handled) {
-          // A skill entregou a resposta pelo dispatchOutput — turno concluído
-          // COM resposta.
-          await concludeTurn(turn, 'reply_delivered', {
-            pessoa_id: pessoa.id,
-            mensagem_id: inbound.id,
-          });
-          await markAllProcessed(0);
-          await conversasRepo.touch(c.id);
-          await clearDebounceState(pessoa.telefone_whatsapp);
-          return;
-        }
-        // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
-        // identity mismatch / !ok / no reply (no side effects ran), OR
-        // dispatch_send_failed — a send was ATTEMPTED but threw pre-delivery
-        // (delivered:false), so nothing reached the user and ReAct can safely
-        // answer without a double-send (Codex #216 HIGH-1).
-      }
-
-      // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with
-      // possibly-reduced toolSet.
-      if (packet.tool_permissions.blocked_tools.length > 0) {
-        tools = applyToolReductions(tools, packet.tool_permissions);
-      }
+    deResult = await runDecisionEngineForTurn(baseCtx);
+    if (!deResult.engine_ran || !deResult.result) {
+      throw new TypedError(
+        'decision_engine_result_invalid',
+        'production Decision Engine returned without an authoritative packet',
+        {
+          engine_ran: deResult.engine_ran,
+          has_result: deResult.result !== undefined,
+        },
+      );
     }
   } catch (err) {
-    // Issue #514 review round 2 [P1]: a MANDATORY runtime-trace envelope that
-    // could not be written is NOT the same class of failure as an engine
-    // crash, and must NOT be handled the same way.
-    //
-    // Round 1 stopped the turn reaching ReAct — that closed the side-effect
-    // hole. But it then took the engine's path: reply to the user, mark the
-    // inbound processed, return. The job COMPLETED, so the turn was silently
-    // lost: no retry, no dead-letter, and a `processada_em` stamp that stops
-    // `runMessageRecovery` from ever picking it up again. A failure to write
-    // authoritative evidence has to PROPAGATE.
-    //
-    // So: audit it (the audit log is the only durable record left — the trace
-    // write is precisely what failed), leave the inbound UNPROCESSED, and
-    // rethrow. BullMQ then retries per the job policy and dead-letters on
-    // exhaustion, which is where the operator alert already fires.
-    //
-    // No user-facing reply here on purpose: a retry may well succeed, and
-    // "Sistema indisponível" followed by a real answer is worse than a
-    // slightly slower answer. If every attempt fails the DLQ alert is the
-    // signal, and the inbound stays recoverable.
-    //
-    // #503 is merged, so the turn is ALSO marked through the durable state
-    // machine below (`failTurnRetryable`) — the job failing and the turn row
-    // agreeing are two halves of the same contract.
+    // Ownership loss is a fencing decision, never an engine failure to retry or
+    // explain to the user from this stale attempt.
+    if (err instanceof TurnOwnershipLostError) throw err;
+
     if (err instanceof MandatoryTraceEnvelopeError) {
       logger.error(
         {
@@ -1616,97 +1841,269 @@ async function runAgentTurnPipeline(params: {
         metadata: {
           side_effect_level: err.side_effect_level,
           conversa_id: c.id,
-          // Enumerated/structural only — no message content.
           reason: 'mandatory_envelope_write_failed',
         },
-      }).catch((e) =>
+      }).catch((auditError) =>
         logger.error(
-          { err: (e as Error).message },
+          { err: (auditError as Error).message },
           'agent.runtime_trace.blocked_turn_audit_failed',
         ),
       );
-      // #503 (now merged) — mark the turn through the durable state machine
-      // instead of relying on BullMQ's job state alone. `failTurnRetryable`
-      // owns the retry-vs-dead-letter decision (`MAX_TURN_ATTEMPTS`), so this
-      // does NOT introduce a parallel retry mechanism: the envelope failure is
-      // just another pre-side-effect failure, which is exactly the case that
-      // facade exists for.
       await failTurnRetryable(turn, {
         code: 'runtime_trace_envelope_failed',
         error: err.cause_error,
         mensagem_id: inbound.id,
       });
-      // Deliberately NOT marking processed: the row must stay pending so the
-      // recovery sweep can re-enqueue it if the job itself is lost.
       throw err;
     }
 
     if (err instanceof DecisionEngineFailClosedError) {
-      // fail-closed: block the turn, reply to user, skip LLM (there is no
-      // legacy fallback path anymore)
-      const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
-      // #503 — o resultado do envio DECIDE o outcome. Antes o `.catch` engolia
-      // a falha e o turno era concluído como `fallback_delivered` mesmo quando
-      // nada chegou ao usuário, violando o critério da issue de que falha
-      // pre-send não resulta em `completed`.
-      //
-      // `sendOutbound` lança `OutboundDeliveryError` com o flag `delivered`,
-      // que distingue as duas situações que não podem ser confundidas:
-      //   delivered=false → PRE-SEND (canal desconectado, pessoa/JID não
-      //     resolvidos): nada chegou, retry é seguro;
-      //   delivered=true  → enviado mas ambíguo (transporte lançou depois do
-      //     envio, ou persistência falhou): NUNCA reenviar.
-      let fallback: 'sent' | 'ambiguous' | 'not_sent' = 'sent';
-      try {
-        // #634 — o fail-closed do Decision Engine é ERRO INTERNO exposto ao
-        // usuário, o caso canônico de `status_fallback`.
-        await sendOutbound(pessoa.id, c.id, failMsg, inbound.id, {
-          channel_id: c.channel_id,
-          fallback_reason: 'internal_error',
-        });
-      } catch (e) {
-        fallback = e instanceof OutboundDeliveryError && e.delivered ? 'ambiguous' : 'not_sent';
-        logger.warn(
-          { err: (e as Error).message, fallback },
-          'agent.decision_engine.fail_closed_reply_failed',
-        );
-      }
-
-      if (fallback === 'not_sent') {
-        // Nada foi entregue e o ReAct nem chegou a rodar — nenhuma tool, logo
-        // nenhum efeito irreversível. Retry é seguro e é o único desfecho
-        // honesto.
-        await failTurnRetryable(turn, {
-          code: 'decision_engine_fallback_not_sent',
-          mensagem_id: inbound.id,
-        });
-      } else {
-        await concludeTurn(
-          turn,
-          fallback === 'ambiguous' ? 'reply_delivery_unknown' : 'fallback_delivered',
-          { pessoa_id: pessoa.id, mensagem_id: inbound.id },
-        );
-      }
-
-      // Mesma regra de projeção da conclusão do ReAct: turno não-terminal em
-      // modo autoritativo NÃO carimba `processada_em`, senão o recovery
-      // reenfileira e a reentrada morre no early-return legado.
-      if (!turnStateAuthoritative() || fallback !== 'not_sent') {
-        await markAllProcessed(0);
-      }
-      await conversasRepo.touch(c.id);
-      await clearDebounceState(pessoa.telefone_whatsapp);
+      const failMsg =
+        'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
+      await finishStatusFallback({
+        message: failMsg,
+        reason: 'internal_error',
+        retry_code: 'decision_engine_fallback_not_committed',
+        failure_log: 'agent.decision_engine.fail_closed_reply_failed',
+      });
       return;
     }
-    // Issue #507 (achado 2) — perda de posse não é "erro de wiring". O ramo
-    // abaixo CONTINUA o turno; deixar a recusa cair nele faria a tentativa
-    // seguir para prompt, ReAct e outbound sem posse alguma.
-    if (err instanceof TurnOwnershipLostError) throw err;
-    // Unexpected error from the wiring itself (not the engine) → warn and continue
-    logger.warn(
-      { err: (err as Error).message },
-      'agent.decision_engine.wiring_error_continuing',
+
+    logger.error(
+      { err: (err as Error).message, mensagem_id: inbound.id },
+      'agent.decision_engine.wiring_failed_closed',
     );
+    await failTurnRetryable(turn, {
+      code: 'decision_engine_wiring_failed',
+      error: err,
+      mensagem_id: inbound.id,
+    });
+    throw err;
+  }
+
+  // Packet consumption can commit output or execute a skill. It deliberately
+  // lives outside the boundary catch: a post-decision error must propagate,
+  // never become permission to run the ReAct fallback.
+  if (deResult.engine_ran && deResult.result) {
+    const { packet, block } = deResult.result;
+
+    // Honor decision outcome: block and approval flows short-circuit the turn.
+    if (block) {
+      // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
+      // Never expose internal policy text (effect.message) to the user.
+      const blockMsg =
+        'Esta ação requer aprovação adicional antes de prosseguir.';
+      await audit({
+        acao: 'decision_engine_policy_refused',
+        pessoa_id: pessoa.id,
+        conversa_id: c.id,
+        mensagem_id: inbound.id,
+        metadata: { decision: 'block', action_mode: packet.action_mode },
+      });
+      await finishStatusFallback({
+        message: blockMsg,
+        reason: 'policy_refusal',
+        retry_code: 'decision_engine_policy_refusal_not_committed',
+        failure_log: 'agent.decision_engine.policy_refusal_delivery_failed',
+      });
+      return;
+    }
+
+    // action_mode='escalate' without a hard block → still escalate (dual-approval path)
+    // Fase 0 cap. 3 — o texto NÃO promete notificação: este caminho apenas
+    // bloqueia o turno; o request de aprovação persistido (com notificação
+    // real aos aprovadores) é criado pelo dispatcher quando a tool é
+    // efetivamente proposta. Prometer "o responsável será notificado" aqui
+    // era mentira operacional (audit P0 cap. 3).
+    if (packet.action_mode === 'escalate') {
+      const escalateMsg =
+        'Esta ação requer aprovação adicional antes de prosseguir.';
+      await audit({
+        acao: 'decision_engine_policy_refused',
+        pessoa_id: pessoa.id,
+        conversa_id: c.id,
+        mensagem_id: inbound.id,
+        metadata: { decision: 'escalate', action_mode: packet.action_mode },
+      });
+      await finishStatusFallback({
+        message: escalateMsg,
+        reason: 'policy_refusal',
+        retry_code: 'decision_engine_policy_refusal_not_committed',
+        failure_log: 'agent.decision_engine.policy_refusal_delivery_failed',
+      });
+      return;
+    }
+
+    // action_mode='ask_clarification' → fall through to the LLM so casual
+    // conversation is not hijacked by a canned reply. The LLM produces the
+    // clarifying question (or a free-form answer) from the full prompt context.
+
+    // action_mode='execute_skill' (F1 Phase 1) → run the selected
+    // prompt_only/evaluator skill via runSkill and deliver its reply through
+    // dispatchOutput. The execution_mode gate lives in ActionDecider; here we
+    // enforce the immutable-identity assert (re-resolve by descriptor under
+    // the routed agent; pinned id+version must still match) and the guarded
+    // fall-through contract. A !ok / identity-mismatch / no-reply skill may
+    // degrade to the normal LLM/ReAct turn, but a dispatch result may do so
+    // only before the live handle crosses the durable outbound barrier.
+    if (packet.action_mode === 'execute_skill') {
+      const replyJid =
+        typeof (inbound.metadata as Record<string, unknown> | null)?.[
+          'remote_jid'
+        ] === 'string' &&
+        ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
+          .length > 0
+          ? ((inbound.metadata as Record<string, unknown>)[
+              'remote_jid'
+            ] as string)
+          : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
+      const routedAgentId = packet.routing.agent_id;
+      const pinned =
+        packet.routing.selected_skill_descriptor !== undefined &&
+        packet.routing.selected_skill_version !== undefined &&
+        packet.routing.selected_skill_id !== undefined
+          ? {
+              selected_skill_descriptor:
+                packet.routing.selected_skill_descriptor,
+              selected_skill_version: packet.routing.selected_skill_version,
+              selected_skill_id: packet.routing.selected_skill_id,
+            }
+          : null;
+      const outcome = await executeSelectedSkill(
+        {
+          pinned,
+          routedAgentId,
+          pessoa,
+          conversa: c,
+          inbound,
+          jid: replyJid,
+          aggregatedText: inbound.conteudo ?? '',
+          // Issue #409 — forward the resolved audience + channel + scored risk
+          // so the SkillRunner gate 4.6 re-evaluates the skill's usage_policy
+          // at execution time (fail-closed TOCTOU re-check). Built from the
+          // SAME AudienceContext the early candidate filter used.
+          ...(audienceContext
+            ? {
+                audience: {
+                  audience_type: audienceContext.audience_type,
+                  trust_level: audienceContext.trust_level,
+                  channel_type: baseCtx.channel.kind,
+                  allowed_data_scope: allowedDataScopesForAudience(
+                    audienceContext.audience_type,
+                    audienceContext.trust_level,
+                  ),
+                  risk_level: packet.risk_profile.level,
+                },
+              }
+            : {}),
+        },
+        {
+          resolveActiveSkill: async (descriptor, agent_id) => {
+            try {
+              // findActive throws agent_scope_violation when the routed agent
+              // differs from the current tenant-context agent — treat that
+              // (and any lookup error) as "not the pinned skill" so we fall
+              // through safely rather than executing a divergent row.
+              const row = await skillsRepo.findActive(descriptor, agent_id);
+              if (row) return { id: row.id, version: row.version };
+              // Q3-A (Codex #216 review item 5): a tenant-wide skill
+              // (agent_id IS NULL) can be SELECTED (selection unions IS NULL)
+              // but is intentionally NOT executable yet — this re-resolution
+              // scopes to the EXACT routed agent, which never matches IS NULL.
+              // Probe explicitly so the block is a VISIBLE "deferred pending
+              // #218 (tenant-wide isolation proof)" rather than a silent
+              // fall-through. We still return null (do NOT execute it).
+              const tenantWide = await skillsRepo.findActive(descriptor, null);
+              if (tenantWide) {
+                logger.warn(
+                  { skill_descriptor: descriptor, agent_id },
+                  'skill.tenant_wide_not_executable_pending_218',
+                );
+              }
+              return null;
+            } catch (e) {
+              logger.warn(
+                {
+                  err: (e as Error).message,
+                  skill_descriptor: descriptor,
+                  agent_id,
+                },
+                'skill.identity_resolve_failed',
+              );
+              return null;
+            }
+          },
+          runSkill,
+          safeDispatchOutput,
+          // #227 per-turn guard (Improvement 2). Thin wrapper over
+          // outboundMessagesRepo.findByKey using the turn-scoped key the
+          // ledger keys off. Tenant + agent are resolved from the current
+          // context inside findByKey (no need to thread them here). The
+          // skill-side guard fail-opens on throw, so we don't try/catch
+          // here.
+          findOutboundLedgerForTurn: ({ conversa_id, in_reply_to }) =>
+            outboundMessagesRepo.findByKey(`${conversa_id}:${in_reply_to}`),
+          logger,
+        },
+      );
+      if (outcome.handled) {
+        if (outcome.recovery_pending && turn?.status === 'outbound_pending') {
+          logger.error(
+            {
+              turn_id: turn.turn_id,
+              mensagem_id: inbound.id,
+              err: outcome.error,
+              ops_alert: true,
+            },
+            'skill.dispatch_unconverged_after_commit_deferred_to_recovery',
+          );
+          throw new OutboundDeliveryError(true, outcome.error);
+        }
+        // Sem barreira durável, uma entrega ambígua continua terminal para não
+        // reenviar, mas não pode ser promovida a confirmação. O outcome deixa
+        // essa diferença auditável.
+        const skillOutcome = outcome.recovery_pending
+          ? 'reply_delivery_unknown'
+          : 'reply_delivered';
+        await concludeTurn(turn, skillOutcome, {
+          pessoa_id: pessoa.id,
+          mensagem_id: inbound.id,
+        });
+        await markAllProcessed(0);
+        await conversasRepo.touch(c.id);
+        await clearDebounceState(pessoa.telefone_whatsapp);
+        return;
+      }
+      if (
+        outcome.reason === 'dispatch_send_failed' &&
+        turn?.status === 'outbound_pending'
+      ) {
+        logger.error(
+          {
+            turn_id: turn.turn_id,
+            mensagem_id: inbound.id,
+            ops_alert: true,
+          },
+          'skill.dispatch_failed_after_commit_stopping_fallthrough',
+        );
+        throw new OutboundDeliveryError(
+          false,
+          'skill_dispatch_failed_after_outbound_commit',
+        );
+      }
+      // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
+      // identity mismatch / !ok / no reply (no side effects ran), OR
+      // dispatch_send_failed before the durable outbound barrier. The physical
+      // `not_sent` classification is insufficient on its own: if the live turn
+      // handle already says `outbound_pending`, the branch above stops instead
+      // of allowing a second ReAct response.
+    }
+
+    // 'respond', 'call_tool', 'continue_workflow' → proceed to LLM with
+    // possibly-reduced toolSet.
+    if (packet.tool_permissions.blocked_tools.length > 0) {
+      tools = applyToolReductions(tools, packet.tool_permissions);
+    }
   }
 
   // Prompt assembly via the prompt-builder. The FEATURE_CONTEXT_PACKET_V1
@@ -1729,12 +2126,18 @@ async function runAgentTurnPipeline(params: {
   // Use the JID the inbound message arrived on so replies stay on the same
   // thread — critical when WhatsApp routes via `@lid` (privacy IDs) instead
   // of the raw `phone@s.whatsapp.net` form. Falls back to phone-derived JID.
-  const inboundRemoteJid = (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'];
+  const inboundRemoteJid = (
+    inbound.metadata as Record<string, unknown> | null
+  )?.['remote_jid'];
   const jid =
     typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0
       ? inboundRemoteJid
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const stopTyping = scheduleTypingDebounce(jid, inbound.id, c.channel_id);
+  const stopTyping = scheduleTypingDebounce(
+    jid,
+    inbound.id,
+    effectiveChannelId,
+  );
   let totalTokens: number;
   let reactOutboundText: string;
   let reactToolsCalled: Array<{ name: string; result: unknown }>;
@@ -1798,7 +2201,10 @@ async function runAgentTurnPipeline(params: {
       mensagem_id: inbound.id,
     });
   } else if (action.kind === 'retry') {
-    await failTurnRetryable(turn, { code: action.code, mensagem_id: inbound.id });
+    await failTurnRetryable(turn, {
+      code: action.code,
+      mensagem_id: inbound.id,
+    });
   } else {
     logger.error(
       {
@@ -1830,7 +2236,11 @@ async function runAgentTurnPipeline(params: {
     await markAllProcessed(totalTokens);
   } else {
     logger.info(
-      { turn_id: turn?.turn_id, to_status: turn?.status, mensagem_id: inbound.id },
+      {
+        turn_id: turn?.turn_id,
+        to_status: turn?.status,
+        mensagem_id: inbound.id,
+      },
       'agent.legacy_projection_skipped_non_terminal',
     );
   }
@@ -1887,47 +2297,63 @@ async function runAgentTurnPipeline(params: {
     }),
   );
 }
-/**
- * P7 Task 8 — helper file-local para montar `role_inputs` do PreturnContext.
- *
- * Mirror do bloco legacy de role-selection: só retorna inputs quando
- * channel_id presente E policy + roles disponíveis (MULTI_CHANNEL removido /
- * sempre on após #411). Caso contrário retorna undefined, e o node
- * role-selector é skipado via `runWhen=ctx.role_inputs !== undefined`.
- */
-async function buildRoleInputs(
+/** Resolve the governed channel role without collapsing policy failures. */
+async function resolveRoleInputs(
   channel_id: string | null,
-): Promise<PreturnContext['role_inputs']> {
-  if (!channel_id) return undefined;
-  try {
-    const policy = await channelPoliciesRepo.getByChannelId(channel_id);
-    if (!policy) return undefined;
-    const [availableRoles, currentRole] = await Promise.all([
-      rolesRepo.listActive(),
-      rolesRepo.getById(policy.default_role_id),
-    ]);
-    if (!currentRole || availableRoles.length === 0) return undefined;
-    return { current_role: currentRole, available_roles: availableRoles, policy, channel_id };
-  } catch (err) {
-    logger.warn(
-      { channel_id, err: (err as Error).message },
-      'preturn.role_inputs_build_failed',
-    );
-    return undefined;
-  }
-}
+): Promise<RoleInputsResolution> {
+  if (!channel_id) return { kind: 'blocked', reason: 'channel_unresolved' };
 
-async function loadConversaWithPessoa(conversa_id: string) {
-  const all = await import('@/db/client.js').then((m) => m.db);
-  const { conversas, pessoas } = await import('@/db/schema.js');
-  const { eq } = await import('drizzle-orm');
-  const rows = await all
-    .select()
-    .from(conversas)
-    .innerJoin(pessoas, eq(conversas.pessoa_id, pessoas.id))
-    .where(eq(conversas.id, conversa_id))
-    .limit(1);
-  const r = rows[0];
-  if (!r) return null;
-  return { conversa: r.conversas, pessoa: r.pessoas };
+  // Repository errors intentionally escape. The caller distinguishes an
+  // infrastructure failure (retryable) from an authoritative policy miss
+  // (terminal `blocked_by_policy`).
+  const policy = await channelPoliciesRepo.getByChannelId(channel_id);
+  if (!policy) return { kind: 'blocked', reason: 'channel_policy_missing' };
+
+  const [allActiveRoles, currentRole] = await Promise.all([
+    rolesRepo.listActive(),
+    rolesRepo.getById(policy.default_role_id),
+  ]);
+  if (!currentRole)
+    return { kind: 'blocked', reason: 'channel_default_role_missing' };
+  if (!currentRole.active) {
+    return { kind: 'blocked', reason: 'channel_default_role_inactive' };
+  }
+  if (allActiveRoles.length === 0) {
+    return { kind: 'blocked', reason: 'channel_roles_unavailable' };
+  }
+
+  const configuredRoleIds = policy.allowed_role_ids;
+  if (
+    !Array.isArray(configuredRoleIds) ||
+    configuredRoleIds.some((roleId) => typeof roleId !== 'string')
+  ) {
+    return { kind: 'blocked', reason: 'channel_role_allowlist_invalid' };
+  }
+  if (
+    configuredRoleIds.length > 0 &&
+    !configuredRoleIds.includes(currentRole.id)
+  ) {
+    return { kind: 'blocked', reason: 'channel_default_role_not_allowed' };
+  }
+
+  const availableRoles =
+    configuredRoleIds.length === 0
+      ? allActiveRoles
+      : allActiveRoles.filter((role) => configuredRoleIds.includes(role.id));
+  if (availableRoles.length === 0) {
+    return { kind: 'blocked', reason: 'channel_roles_unavailable' };
+  }
+  if (!availableRoles.some((role) => role.id === currentRole.id)) {
+    return { kind: 'blocked', reason: 'channel_default_role_not_active' };
+  }
+
+  return {
+    kind: 'ready',
+    inputs: {
+      current_role: currentRole,
+      available_roles: availableRoles,
+      policy,
+      channel_id,
+    },
+  };
 }

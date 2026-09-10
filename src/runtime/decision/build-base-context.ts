@@ -22,7 +22,7 @@ export interface BuildBaseContextInput {
   pessoa: Pessoa;
   tenant_id: string;
   agent_id: string;
-  /** Channel id resolved by P6 channel-resolver. null means whatsapp default. */
+  /** Channel id resolved by P6. The agent hot path rejects null before this helper. */
   channel_id: string | null;
   /** Active procedure execution id, if any. */
   active_procedure_execution_id: string | null;
@@ -31,8 +31,9 @@ export interface BuildBaseContextInput {
    * (governance-derived, invariant #3). When provided, it populates
    * `actor.audience_type` / `actor.trust_level` so the Decision Engine's
    * SkillSelector candidate filter (#409) can admit/remove skills by audience.
-   * Absent ⇒ left undefined (the early filter is skipped; the runner gate 4.6
-   * remains the fail-closed backstop).
+   * Absent ⇒ left undefined for lower-level/legacy callers only. The agent
+   * orchestrator must reject an absent/inactive audience before constructing
+   * this packet; undefined here is never an authorization signal.
    */
   audience?: { audience_type: AudienceType; trust_level: TrustLevel } | null;
   /**

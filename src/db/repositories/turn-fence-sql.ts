@@ -16,7 +16,7 @@
  * linha da lease daqui, a produção fica insegura E o teste fica vermelho, que é
  * a única relação que faz um teste valer alguma coisa.
  *
- * ─── As DUAS formas de fence, e por que são diferentes ──────────────────────
+ * ─── As TRÊS formas de fence, e por que são diferentes ─────────────────────
  *
  * `self` — a gravação pertence à tentativa DO PRÓPRIO turno que está mudando.
  *   Fence: `claim_token` da linha que muda + lease viva. É o caso de
@@ -38,6 +38,10 @@
  *   apagando trabalho que pertence ao sucessor.
  *
  *   O FENCE PERTENCE A QUEM ABSORVE.
+ *
+ * `recovery_expired` — a tentativa original já perdeu a lease e o recovery
+ *   assume a autoridade apenas para convergir `outbound_pending`. Exige claim
+ *   real + lease vencida; sem ambos não há selo de quiescência multipart.
  */
 import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { agent_turns } from '../schema.js';
@@ -61,12 +65,14 @@ export function statusList(statuses: readonly string[]) {
   );
 }
 
-/** O fence de uma gravação: sobre a própria linha, ou sobre o absorvedor. */
+/** O fence de uma gravação: linha própria, absorvedor, ou recovery expirado. */
 export type TurnWriteFence =
   /** Sem posse a exigir — regime de #503 (`FEATURE_TURN_CLAIM` OFF). */
   | { kind: 'none' }
   /** A tentativa é do próprio turno que está mudando. */
   | { kind: 'self'; claim_token: string }
+  /** Recovery pós-outbound: claim existente, mas lease já vencida. */
+  | { kind: 'recovery_expired' }
   /**
    * A autoridade é de OUTRO turno (o absorvedor do debounce). O turno que muda
    * NÃO precisa — e normalmente não tem — claim próprio.
@@ -141,6 +147,11 @@ export function turnWriteConditions(input: {
     conditions.push(eq(agent_turns.claim_token, input.fence.claim_token));
     conditions.push(sql`${agent_turns.lease_expires_at} > now()`);
   }
+  if (input.fence.kind === 'recovery_expired') {
+    conditions.push(sql`${agent_turns.claim_token} IS NOT NULL`);
+    conditions.push(sql`${agent_turns.lease_expires_at} IS NOT NULL`);
+    conditions.push(sql`${agent_turns.lease_expires_at} <= now()`);
+  }
   if (input.fence.kind === 'absorber') {
     // NENHUMA condição sobre `agent_turns.claim_token` da linha que muda: o
     // irmão absorvido não tem claim, e exigi-lo tornaria a absorção legítima
@@ -158,6 +169,8 @@ export function turnWriteConditions(input: {
 }
 
 /** Conveniência: o `and(...)` já montado, para quem só quer a condição única. */
-export function turnWriteWhere(input: Parameters<typeof turnWriteConditions>[0]): SQL {
+export function turnWriteWhere(
+  input: Parameters<typeof turnWriteConditions>[0],
+): SQL {
   return and(...turnWriteConditions(input)) as SQL;
 }

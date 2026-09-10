@@ -10,7 +10,10 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import { forCurrentAgentChannel, type LineOutput } from '@/gateway/line-output.js';
+import {
+  forCurrentAgentChannel,
+  type LineOutput,
+} from '@/gateway/line-output.js';
 import {
   synthesizeSpeech,
   OUTBOUND_VOICE_MAX_CHARS,
@@ -21,10 +24,19 @@ import type { WAQuotedContext } from '@/gateway/presence.js';
 import { detectCorrection } from './reflection.js';
 import { cleanupPDF } from './pdf-cleanup.js';
 import type { ToolExecutionSummary } from './tool-execution-summary.js';
-import { turnOwnershipLost, reportBlockedEffect } from '@/runtime/turns/execution-context.js';
+import {
+  turnOwnershipLost,
+  reportBlockedEffect,
+} from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
-import { commitOutboundIntent, type OutboundCommitOutcome } from '@/runtime/outbound/commit.js';
-import type { OutboundPayload, OutboundPayloadType } from '@/runtime/outbound/contract.js';
+import {
+  commitOutboundIntent,
+  type OutboundCommitOutcome,
+} from '@/runtime/outbound/commit.js';
+import type {
+  OutboundPayload,
+  OutboundPayloadType,
+} from '@/runtime/outbound/contract.js';
 // #632 — a POSSE da linha do outbox. `beginInlineDelivery` reivindica com
 // lease e move para `sending` ANTES do canal; `recordInlineDelivery` grava o
 // desfecho normalizado COM FENCE. Substituem o `recordInlineDeliveryOutcome`
@@ -52,10 +64,15 @@ import type { MediaRef } from '@/runtime/outbound/contract.js';
  * back to building the JID from the pessoa's phone — the legacy behaviour
  * for cases where the inbound row is missing or doesn't have `remote_jid`.
  */
-async function resolveOutboundJid(pessoa: Pessoa, in_reply_to: string): Promise<string> {
+async function resolveOutboundJid(
+  pessoa: Pessoa,
+  in_reply_to: string,
+): Promise<string> {
   try {
     const inbound = await mensagensRepo.findById(in_reply_to);
-    const inboundRemoteJid = (inbound?.metadata as Record<string, unknown> | null)?.['remote_jid'];
+    const inboundRemoteJid = (
+      inbound?.metadata as Record<string, unknown> | null
+    )?.['remote_jid'];
     if (typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0) {
       return inboundRemoteJid;
     }
@@ -156,7 +173,10 @@ export class OutboundDeliveryError extends Error {
 //     but-threw; record 'unknown' so the boundary guard blocks any re-attempt
 //     (the crux trade: a sliver of silence risk for zero double-send).
 // ---------------------------------------------------------------------------
-function outboundIdempotencyKey(conversa_id: string, in_reply_to: string): string {
+function outboundIdempotencyKey(
+  conversa_id: string,
+  in_reply_to: string,
+): string {
   return `${conversa_id}:${in_reply_to}`;
 }
 
@@ -355,7 +375,10 @@ async function commitOutboundOrRefuse(input: {
       ...(input.pessoa_id !== undefined ? { pessoa_id: input.pessoa_id } : {}),
     });
   } catch (e) {
-    throw new OutboundDeliveryError(false, `outbound_commit_failed:${(e as Error).message}`);
+    throw new OutboundDeliveryError(
+      false,
+      `outbound_commit_failed:${(e as Error).message}`,
+    );
   }
 }
 
@@ -474,7 +497,11 @@ async function recordCommittedDelivery(
   handle: InlineDeliveryHandle,
   payload_type: OutboundPayloadType,
   outcome:
-    | { kind: 'delivered'; provider_message_id: string | null; confirmed: boolean }
+    | {
+        kind: 'delivered';
+        provider_message_id: string | null;
+        confirmed: boolean;
+      }
     | { kind: 'unknown'; error_code: string }
     | { kind: 'retryable'; error_code: string }
     /**
@@ -511,10 +538,19 @@ async function recordCommittedDelivery(
           provider_message_id: outcome.provider_message_id,
         }
       : outcome.kind === 'unknown'
-        ? { outcome: 'timeout_unknown' as const, last_error_code: outcome.error_code }
+        ? {
+            outcome: 'timeout_unknown' as const,
+            last_error_code: outcome.error_code,
+          }
         : outcome.kind === 'no_send'
-          ? { outcome: 'cancelled_before_send' as const, last_error_code: outcome.error_code }
-          : { outcome: 'rejected_retryable' as const, last_error_code: outcome.error_code }),
+          ? {
+              outcome: 'cancelled_before_send' as const,
+              last_error_code: outcome.error_code,
+            }
+          : {
+              outcome: 'rejected_retryable' as const,
+              last_error_code: outcome.error_code,
+            }),
   });
 }
 
@@ -531,7 +567,10 @@ async function recordCommittedDelivery(
  * autorizaria, de quebra, qualquer outro envio que acontecesse durante a
  * persistência do histórico.
  */
-function enviarPeloOutbox<T>(entrega: InlineDeliveryHandle, fn: () => Promise<T>): Promise<T> {
+function enviarPeloOutbox<T>(
+  entrega: InlineDeliveryHandle,
+  fn: () => Promise<T>,
+): Promise<T> {
   return withOutboxEgress(entrega.claim ? entrega.claim.outbound_id : null, fn);
 }
 
@@ -555,7 +594,10 @@ function enviarPeloOutbox<T>(entrega: InlineDeliveryHandle, fn: () => Promise<T>
 async function descartarMidiaEntregue(media: MediaRef): Promise<void> {
   const removido = await discardOutboundMedia(media).catch(() => false);
   if (!removido) {
-    logger.debug({ kind: media.kind }, 'outbound.durable_media_discard_skipped');
+    logger.debug(
+      { kind: media.kind },
+      'outbound.durable_media_discard_skipped',
+    );
   }
 }
 
@@ -572,7 +614,17 @@ function outboundErrorCode(kind: string): string {
 }
 
 export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
-  const { pessoa, conversa: c, inbound, jid, text, latestPending, latestReportPdf, turnHasSensitive, sensitiveTools } = ctx;
+  const {
+    pessoa,
+    conversa: c,
+    inbound,
+    jid,
+    text,
+    latestPending,
+    latestReportPdf,
+    turnHasSensitive,
+    sensitiveTools,
+  } = ctx;
   const toolSummaries = ctx.toolSummaries ?? [];
 
   // Issue #504 §Fencing — FRONTEIRA COMUM. O guard vivia só dentro de
@@ -643,7 +695,11 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       // #227: claim the turn before the send (no-op when flag off, fail-open on
       // DB throws — see claimOutboundLedgerOrFailOpen). cleanupPDF still runs
       // in the `finally` even when we short-circuit on skip.
-      const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'document');
+      const ledger = await claimOutboundLedgerOrFailOpen(
+        c.id,
+        inbound.id,
+        'document',
+      );
       if (ledger.skip) return;
       const captionText = text.slice(0, 1024);
       // ─── #634 — A MÍDIA PASSA A SER DURÁVEL ────────────────────────────
@@ -686,7 +742,10 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
           `document_read_failed:${(e as Error).message}`,
           false,
         );
-        throw new OutboundDeliveryError(false, `document_read_failed:${(e as Error).message}`);
+        throw new OutboundDeliveryError(
+          false,
+          `document_read_failed:${(e as Error).message}`,
+        );
       }
       // #631 — COMMIT antes do canal. A mídia entra por REFERÊNCIA
       // (`storage_object`), nunca embutida: o contrato de #630 não tem variante
@@ -707,7 +766,10 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       });
       if (saidaLogicaJaTentada(commit)) {
         logger.warn(
-          { conversa_id: c.id, outbound_id: commit.committed ? commit.outbound_id : null },
+          {
+            conversa_id: c.id,
+            outbound_id: commit.committed ? commit.outbound_id : null,
+          },
           'outbound.logical_output_already_attempted_skipping_send',
         );
         return;
@@ -745,13 +807,24 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
         // boundary guard anyway. DOC_READ_FAILED (ambiguous=false) stays
         // delivered:false — genuine pre-send, ReAct retry is safe.
         const ambiguous = classifyDocumentThrow(e);
-        await recordLedgerFailed(c.id, inbound.id, (e as Error).message, ambiguous);
+        await recordLedgerFailed(
+          c.id,
+          inbound.id,
+          (e as Error).message,
+          ambiguous,
+        );
         await recordCommittedDelivery(
           entrega,
           'document',
           ambiguous
-            ? { kind: 'unknown', error_code: outboundErrorCode('document_transport_throw') }
-            : { kind: 'retryable', error_code: outboundErrorCode('document_read_failed') },
+            ? {
+                kind: 'unknown',
+                error_code: outboundErrorCode('document_transport_throw'),
+              }
+            : {
+                kind: 'retryable',
+                error_code: outboundErrorCode('document_read_failed'),
+              },
         );
         throw new OutboundDeliveryError(ambiguous, (e as Error).message);
       }
@@ -767,9 +840,17 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
             provider_message_id: null,
             confirmed: false,
           });
-          throw new OutboundDeliveryError(true, 'document_channel_sent_without_id');
+          throw new OutboundDeliveryError(
+            true,
+            'document_channel_sent_without_id',
+          );
         }
-        await recordLedgerFailed(c.id, inbound.id, 'document_channel_disconnected', false);
+        await recordLedgerFailed(
+          c.id,
+          inbound.id,
+          'document_channel_disconnected',
+          false,
+        );
         await recordCommittedDelivery(entrega, 'document', {
           kind: 'retryable',
           error_code: outboundErrorCode('document_channel_disconnected'),
@@ -894,7 +975,11 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       }
       // #227: claim the turn before the voice send (no-op when flag off,
       // fail-open on DB throws — see claimOutboundLedgerOrFailOpen).
-      const ledger = await claimOutboundLedgerOrFailOpen(c.id, inbound.id, 'voice');
+      const ledger = await claimOutboundLedgerOrFailOpen(
+        c.id,
+        inbound.id,
+        'voice',
+      );
       if (ledger.skip) return; // already attempted; do NOT re-send
       // #631 — COMMIT antes do canal, agora TAMBÉM para voz. `source_text` é o
       // texto que gerou o áudio: #630 o persiste exatamente para que um retry
@@ -914,7 +999,10 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
       });
       if (saidaLogicaJaTentada(commitVoz)) {
         logger.warn(
-          { conversa_id: c.id, outbound_id: commitVoz.committed ? commitVoz.outbound_id : null },
+          {
+            conversa_id: c.id,
+            outbound_id: commitVoz.committed ? commitVoz.outbound_id : null,
+          },
           'outbound.logical_output_already_attempted_skipping_send',
         );
         return;
@@ -955,9 +1043,17 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
             provider_message_id: null,
             confirmed: false,
           });
-          throw new OutboundDeliveryError(true, 'voice_channel_sent_without_id');
+          throw new OutboundDeliveryError(
+            true,
+            'voice_channel_sent_without_id',
+          );
         }
-        await recordLedgerFailed(c.id, inbound.id, 'voice_channel_disconnected', false);
+        await recordLedgerFailed(
+          c.id,
+          inbound.id,
+          'voice_channel_disconnected',
+          false,
+        );
         await recordCommittedDelivery(entregaVoz, 'audio', {
           kind: 'retryable',
           error_code: outboundErrorCode('voice_channel_disconnected'),
@@ -1068,9 +1164,9 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
  * Outcome of a `safeDispatchOutput` call. Lets the caller pick its own recovery
  * WITHOUT having to know the `OutboundDeliveryError` phase taxonomy:
  *   - `delivered`       — sent AND persisted. Caller: done.
- *   - `not_sent`        — NOTHING reached the user (pre-send / disconnected
- *                         gateway / channel threw). Caller MAY recover (fall
- *                         through to ReAct, retry) — no double-send risk.
+ *   - `not_sent`        — physical transport was classified pre-send. A caller
+ *                         MAY recover only if its durable turn state has not
+ *                         crossed the outbound commit barrier.
  *   - `sent_no_persist` — the message reached the user but a later step failed
  *                         (DB persist), OR an untyped error left delivery
  *                         ambiguous. Caller must NOT re-send (double-send risk).
@@ -1087,7 +1183,9 @@ export type DispatchOutcome =
  * NEVER throws — so every caller (skill execution, ReAct loop) is guaranteed a
  * decision and the user is never silently dropped.
  */
-export async function safeDispatchOutput(ctx: DispatchOutputCtx): Promise<DispatchOutcome> {
+export async function safeDispatchOutput(
+  ctx: DispatchOutputCtx,
+): Promise<DispatchOutcome> {
   // #227 boundary guard: if the ledger already records this turn as 'sent' or
   // 'unknown', a prior attempt (this skill caller's first try, or a previous
   // dispatch that fell through to ReAct) either delivered or might have
@@ -1145,9 +1243,14 @@ async function handleDispatchError(
   e: unknown,
   ctx: DispatchOutputCtx,
 ): Promise<DispatchOutcome> {
-  const delivered = e instanceof OutboundDeliveryError ? e.delivered : undefined;
+  const delivered =
+    e instanceof OutboundDeliveryError ? e.delivered : undefined;
   const phase: 'pre_send' | 'post_send' | 'unknown' =
-    delivered === false ? 'pre_send' : delivered === true ? 'post_send' : 'unknown';
+    delivered === false
+      ? 'pre_send'
+      : delivered === true
+        ? 'post_send'
+        : 'unknown';
   const error = (e as Error).message;
   await recordOutboundAttempt(ctx, phase, error);
   return phase === 'pre_send'
@@ -1226,7 +1329,11 @@ export async function sendOutbound(
      * de cardinalidade BAIXA e fechada, nunca a mensagem crua do erro — é o
      * vetor por onde conteúdo vazaria para a trilha durável.
      */
-    fallback_reason?: 'timeout' | 'deadline_exceeded' | 'internal_error' | 'policy_refusal';
+    fallback_reason?:
+      | 'timeout'
+      | 'deadline_exceeded'
+      | 'internal_error'
+      | 'policy_refusal';
   },
 ): Promise<string | null> {
   // Issue #504 §Fencing — LIMITE DE EFEITO. O outbound é o efeito MENOS
@@ -1249,7 +1356,11 @@ export async function sendOutbound(
   // short-circuit (the user got — or might have got — that reply; do NOT
   // re-send). No-op when the flag is off. Fail-open on DB throws so a DB
   // hiccup never blocks a legitimate send (liveness > strict dedupe).
-  const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'text');
+  const ledger = await claimOutboundLedgerOrFailOpen(
+    conversa_id,
+    in_reply_to,
+    'text',
+  );
   if (ledger.skip) return ledger.existing_provider_message_id;
 
   // PRE-SEND (recipient + JID resolution + line da fronteira única). If any of
@@ -1324,7 +1435,9 @@ export async function sendOutbound(
   // O tipo do artefato que ACABOU de ser commitado — `status_fallback` é uma
   // saída própria em #630, não "texto com um motivo", e o rótulo de métrica
   // tem de dizer a verdade sobre qual das duas saiu.
-  const tipoDeSaida: OutboundPayloadType = opts?.fallback_reason ? 'status_fallback' : 'text';
+  const tipoDeSaida: OutboundPayloadType = opts?.fallback_reason
+    ? 'status_fallback'
+    : 'text';
   // Delivery happens in two phases: send to the channel, THEN persist. Tag
   // failures by phase so callers can tell "nothing sent" from "sent but not
   // persisted" (Codex #216 HIGH-A). Ledger: a TRANSPORT throw is ambiguous —
@@ -1340,10 +1453,19 @@ export async function sendOutbound(
   let wid: string | null;
   try {
     wid = await enviarPeloOutbox(entrega, () =>
-      line.sendText(jid, text, Object.keys(sendOpts).length ? sendOpts : undefined),
+      line.sendText(
+        jid,
+        text,
+        Object.keys(sendOpts).length ? sendOpts : undefined,
+      ),
     );
   } catch (e) {
-    await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
+    await recordLedgerFailed(
+      conversa_id,
+      in_reply_to,
+      (e as Error).message,
+      true,
+    );
     await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'unknown',
       error_code: outboundErrorCode('text_transport_throw'),
@@ -1365,7 +1487,12 @@ export async function sendOutbound(
       });
       throw new OutboundDeliveryError(true, 'channel_sent_without_id');
     }
-    await recordLedgerFailed(conversa_id, in_reply_to, 'channel_disconnected', false);
+    await recordLedgerFailed(
+      conversa_id,
+      in_reply_to,
+      'channel_disconnected',
+      false,
+    );
     await recordCommittedDelivery(entrega, tipoDeSaida, {
       kind: 'retryable',
       error_code: outboundErrorCode('channel_disconnected'),
@@ -1380,8 +1507,13 @@ export async function sendOutbound(
     provider_message_id: wid,
     confirmed: true,
   });
-  const metadata: Record<string, unknown> = { whatsapp_id: wid, remote_jid: jid, in_reply_to };
-  if (opts?.pending_question_id) metadata.pending_question_id = opts.pending_question_id;
+  const metadata: Record<string, unknown> = {
+    whatsapp_id: wid,
+    remote_jid: jid,
+    in_reply_to,
+  };
+  if (opts?.pending_question_id)
+    metadata.pending_question_id = opts.pending_question_id;
   if (opts?.view_once) metadata.view_once = true;
   try {
     await mensagensRepo.create({
@@ -1410,8 +1542,14 @@ export async function sendOutboundPoll(
   conversa_id: string,
   text: string,
   in_reply_to: string,
-  pending: { id: string; opcoes_validas: Array<{ key: string; label: string }> },
-  opts?: { tool_summaries?: ToolExecutionSummary[]; channel_id?: string | null },
+  pending: {
+    id: string;
+    opcoes_validas: Array<{ key: string; label: string }>;
+  },
+  opts?: {
+    tool_summaries?: ToolExecutionSummary[];
+    channel_id?: string | null;
+  },
 ): Promise<{ fell_back: boolean }> {
   // Issue #504 §Fencing — LIMITE DE EFEITO. Exportada, e chamada tanto pelo ramo
   // de poll de `dispatchOutput` quanto direto por callers externos: o guard tem
@@ -1422,7 +1560,11 @@ export async function sendOutboundPoll(
   // #227: claim the turn before any work (no-op when flag off, fail-open on
   // DB throws). The same-row reclaim during a poll→text fallback (below) is
   // handled by markFailed-then-claim — see the fallback comment.
-  const ledger = await claimOutboundLedgerOrFailOpen(conversa_id, in_reply_to, 'poll');
+  const ledger = await claimOutboundLedgerOrFailOpen(
+    conversa_id,
+    in_reply_to,
+    'poll',
+  );
   if (ledger.skip) return { fell_back: false };
 
   // PRE-SEND (recipient + JID + line): a throw or missing recipient means
@@ -1461,7 +1603,10 @@ export async function sendOutboundPoll(
   });
   if (saidaLogicaJaTentada(commit)) {
     logger.warn(
-      { conversa_id, outbound_id: commit.committed ? commit.outbound_id : null },
+      {
+        conversa_id,
+        outbound_id: commit.committed ? commit.outbound_id : null,
+      },
       'outbound.logical_output_already_attempted_skipping_send',
     );
     return { fell_back: false };
@@ -1482,7 +1627,12 @@ export async function sendOutboundPoll(
     // (`sent_no_persist` → caller `handled:true`) so we skip the wasted
     // ReAct turn whose own dispatch would be blocked anyway. No double-send
     // risk: the row is 'unknown'.
-    await recordLedgerFailed(conversa_id, in_reply_to, (e as Error).message, true);
+    await recordLedgerFailed(
+      conversa_id,
+      in_reply_to,
+      (e as Error).message,
+      true,
+    );
     await recordCommittedDelivery(entrega, 'interactive_poll', {
       kind: 'unknown',
       error_code: outboundErrorCode('poll_transport_throw'),
@@ -1524,17 +1674,25 @@ export async function sendOutboundPoll(
       kind: 'no_send',
       error_code: outboundErrorCode('superseded_by_text_fallback'),
     });
-    const numbered = pending.opcoes_validas.map((o, i) => `${i + 1}. ${o.label}`).join('\n');
-    await sendOutbound(pessoa_id, conversa_id, `${text}\n\n${numbered}`, in_reply_to, {
-      pending_question_id: pending.id,
-      tool_summaries: opts?.tool_summaries,
-      channel_id: opts?.channel_id,
-      // A saída de texto é a SEGUNDA saída lógica deste turno — a posição 0 é
-      // da enquete. Fixa e não "a próxima livre": um retry deste mesmo fallback
-      // tem de recalcular exatamente esta chave e reencontrar a linha, não
-      // criar outra.
-      outbound_sequence: OUTBOUND_POLL_FALLBACK_SEQUENCE,
-    });
+    const numbered = pending.opcoes_validas
+      .map((o, i) => `${i + 1}. ${o.label}`)
+      .join('\n');
+    await sendOutbound(
+      pessoa_id,
+      conversa_id,
+      `${text}\n\n${numbered}`,
+      in_reply_to,
+      {
+        pending_question_id: pending.id,
+        tool_summaries: opts?.tool_summaries,
+        channel_id: opts?.channel_id,
+        // A saída de texto é a SEGUNDA saída lógica deste turno — a posição 0 é
+        // da enquete. Fixa e não "a próxima livre": um retry deste mesmo fallback
+        // tem de recalcular exatamente esta chave e reencontrar a linha, não
+        // criar outra.
+        outbound_sequence: OUTBOUND_POLL_FALLBACK_SEQUENCE,
+      },
+    );
     return { fell_back: true };
   }
   // Poll acked — record 'sent' BEFORE persist so a persist throw doesn't leave

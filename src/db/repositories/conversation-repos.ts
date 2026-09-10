@@ -2,6 +2,7 @@ import { eq, and, inArray, desc, isNull, sql } from 'drizzle-orm';
 import { db, withTx, pgErrorCode } from '../client.js';
 import {
   conversas,
+  pessoas,
   mensagens,
   pending_questions,
   outbound_messages,
@@ -14,7 +15,7 @@ import {
   PRIMARY_TENANT_ID,
   PRIMARY_AGENT_ID,
 } from '../tenant-context.js';
-import type { AgentTurn, Conversa, Mensagem, PendingQuestion } from '../schema.js';
+import type { AgentTurn, Conversa, Mensagem, PendingQuestion, Pessoa } from '../schema.js';
 // Issue #503 — ingresso atômico (mensagem + turno na mesma transação). Import
 // unidirecional: `turn-repos` NÃO importa este módulo, então não há ciclo.
 import { agentTurnsRepo } from './turn-repos.js';
@@ -81,6 +82,40 @@ export const conversasRepo = {
           eq(conversas.tenant_id, tenant_id),
           eq(conversas.agent_id, agent_id),
           eq(conversas.id, id),
+        ),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  },
+  /**
+   * Hot-path read for an inbound turn.
+   *
+   * Scope BOTH sides of the join. The current schema still has a simple
+   * `conversas.pessoa_id -> pessoas.id` FK, so malformed cross-agent links are
+   * physically representable; scoping only the conversation would expose the
+   * foreign person row to prompt/tool policy assembly.
+   */
+  async byIdWithPessoa(
+    id: string,
+  ): Promise<{ conversa: Conversa; pessoa: Pessoa } | null> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+    const rows = await db
+      .select({ conversa: conversas, pessoa: pessoas })
+      .from(conversas)
+      .innerJoin(
+        pessoas,
+        and(
+          eq(pessoas.id, conversas.pessoa_id),
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+        ),
+      )
+      .where(
+        and(
+          eq(conversas.id, id),
+          eq(conversas.tenant_id, tenant_id),
+          eq(conversas.agent_id, agent_id),
         ),
       )
       .limit(1);

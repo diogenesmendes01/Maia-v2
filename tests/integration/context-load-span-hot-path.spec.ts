@@ -108,11 +108,10 @@ const SHOULD_RUN =
 const d = SHOULD_RUN ? describe : describe.skip;
 
 /**
- * O turno roda sob o tenant catch-all `primary/primary`, que é o que o
- * resolver devolve no runtime single-tenant. Não é um atalho do teste: é a
- * tupla que `runAgentForMensagem` resolve quando a sonda de canal não encontra
- * telefone no `metadata` (o inbound já chega com `conversa_id`, então a
- * identidade não precisa ser resolvida de novo).
+ * O fixture pertence a `primary/primary`, mas usa um vínculo de canal próprio
+ * já persistido na conversa e uma política explícita. Assim o hot path não
+ * depende do catch-all global nem muda de comportamento conforme a ordem da
+ * suíte.
  */
 const TENANT = 'primary';
 const AGENT = 'primary';
@@ -122,6 +121,7 @@ const TRACE_ID = '9f8e7d6c-5b4a-4938-8271-0a1b2c3d4e5f';
 let pool: pg.Pool;
 let pessoaId: string;
 let conversaId: string;
+let channelId: string;
 let captured: EndedSpan[] = [];
 
 async function seedTurn(): Promise<string> {
@@ -132,13 +132,23 @@ async function seedTurn(): Promise<string> {
     // carga de contexto. O owner é isento por design, então o turno depende de
     // Postgres e de mais nada — sem isso o caso ficaria verde ou vermelho
     // conforme o estado do Redis da máquina, que é ruído, não sinal.
+    const telefone = `+55119${Date.now().toString().slice(-8)}`;
     const p = await c.query<{ id: string }>(
       `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
        VALUES ($1, $2, 'PR554 Dono', $3, 'dono', 'ativa')
        RETURNING id`,
-      [TENANT, AGENT, `+55119${Date.now().toString().slice(-8)}`],
+      [TENANT, AGENT, telefone],
     );
     pessoaId = p.rows[0]!.id;
+
+    // `resolveAudience` é fail-closed: a pessoa existir não basta. O perfil
+    // ativo é a autorização explícita para o turno alcançar o hot path medido.
+    await c.query(
+      `INSERT INTO agent_audience_profiles(tenant_id, agent_id, pessoa_id, audience_type, trust_level, status)
+       VALUES ($1, $2, $3, 'owner', 'trusted_internal', 'active')
+       ON CONFLICT DO NOTHING`,
+      [TENANT, AGENT, pessoaId],
+    );
 
     const conv = await c.query<{ id: string }>(
       `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, status)
@@ -147,9 +157,30 @@ async function seedTurn(): Promise<string> {
     );
     conversaId = conv.rows[0]!.id;
 
-    // `metadata` deliberadamente SEM `telefone`: a sonda de canal devolve null,
-    // a tupla catch-all é mantida e o inner segue pelo `conversa_id` já
-    // resolvido. É o caminho de produção para um inbound já vinculado.
+    // Canal próprio e inativo: o vínculo persistido abaixo alimenta o gate de
+    // policy sem adicionar outro catch-all ativo ao Postgres compartilhado.
+    const ch = await c.query<{ id: string }>(
+      `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1, $2, 'whatsapp', $3, 'Linha PR554', false, false) RETURNING id`,
+      [TENANT, AGENT, telefone],
+    );
+    channelId = ch.rows[0]!.id;
+    await c.query(`UPDATE conversas SET channel_id = $2 WHERE id = $1`, [conversaId, channelId]);
+
+    // O role-selector também falha fechado sem política e papel default ativo.
+    const role = await c.query<{ id: string }>(
+      `SELECT id FROM roles WHERE tenant_id = $1 AND agent_id = $2 AND active LIMIT 1`,
+      [TENANT, AGENT],
+    );
+    if (role.rows.length === 0) throw new Error('nenhum role ativo semeado — seed do banco mudou');
+    await c.query(
+      `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+       VALUES ($1, $2, $3, $4, 'free_with_trigger')`,
+      [TENANT, AGENT, channelId, role.rows[0]!.id],
+    );
+
+    // Sem telefone no metadata, o outer preserva `primary/primary`; o inner
+    // usa o `channel_id` já vinculado à conversa, como numa row persistida.
     const m = await c.query<{ id: string }>(
       `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata)
        VALUES ($1, $2, $3, 'in', 'texto', 'quanto eu gastei esse mês?', '{}'::jsonb)
@@ -175,27 +206,42 @@ async function seedTurn(): Promise<string> {
  * ANTES do turno, e o `RESTRICT` faz este arquivo reprovar caso alguém inverta.
  */
 async function cleanup(): Promise<void> {
-  if (!conversaId) return;
+  if (!pessoaId && !channelId) return;
   const c = await pool.connect();
   try {
-    await c.query(
-      `DELETE FROM audit_log WHERE conversa_id = $1
-          OR mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
-      [conversaId],
-    );
-    await c.query(
-      `DELETE FROM agent_turn_inputs
-        WHERE mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
-      [conversaId],
-    );
-    await c.query(`DELETE FROM outbound_messages WHERE conversa_id = $1`, [conversaId]);
-    await c.query(`DELETE FROM agent_turns WHERE conversa_id = $1`, [conversaId]);
-    await c.query(`DELETE FROM mensagens WHERE conversa_id = $1`, [conversaId]);
-    await c.query(`DELETE FROM pending_questions WHERE conversa_id = $1`, [conversaId]);
-    await c.query(`DELETE FROM conversas WHERE id = $1`, [conversaId]);
-    await c.query(`DELETE FROM permissoes WHERE pessoa_id = $1`, [pessoaId]);
-    await c.query(`DELETE FROM agent_audience_profiles WHERE pessoa_id = $1`, [pessoaId]);
-    await c.query(`DELETE FROM pessoas WHERE id = $1`, [pessoaId]);
+    if (conversaId) {
+      await c.query(
+        `DELETE FROM audit_log WHERE conversa_id = $1
+            OR mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
+        [conversaId],
+      );
+      if (channelId) {
+        await c.query(
+          `DELETE FROM role_selector_decisions WHERE conversa_id = $1 OR channel_id = $2`,
+          [conversaId, channelId],
+        );
+      }
+      await c.query(
+        `DELETE FROM agent_turn_inputs
+          WHERE mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id = $1)`,
+        [conversaId],
+      );
+      await c.query(`DELETE FROM outbound_messages WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM agent_turns WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM mensagens WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM pending_questions WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM conversas WHERE id = $1`, [conversaId]);
+    }
+    if (pessoaId) {
+      await c.query(`DELETE FROM permissoes WHERE pessoa_id = $1`, [pessoaId]);
+      await c.query(`DELETE FROM agent_audience_profiles WHERE pessoa_id = $1`, [pessoaId]);
+      await c.query(`DELETE FROM pessoas WHERE id = $1`, [pessoaId]);
+    }
+    if (channelId) {
+      await c.query(`DELETE FROM role_selector_decisions WHERE channel_id = $1`, [channelId]);
+      await c.query(`DELETE FROM channel_policies WHERE channel_id = $1`, [channelId]);
+      await c.query(`DELETE FROM channels WHERE id = $1`, [channelId]);
+    }
   } finally {
     c.release();
   }
@@ -223,6 +269,9 @@ d('review da PR #554 — um turno real abre o span context.load', () => {
   });
 
   beforeEach(() => {
+    pessoaId = '';
+    conversaId = '';
+    channelId = '';
     captured = [];
     _resetForTests();
     cfg.endpoint = 'http://collector:4318/v1/traces';

@@ -243,6 +243,19 @@ groups:
           description: |
             Runbook: docs/runbooks/observability-slo.md §4.4
 
+      - alert: MaiaOutboundTurnNoSuccessPending
+        # Estado, não evento: o gauge não infla o mesmo incidente por tick.
+        expr: max by (tenant_id, agent_id) (maia_outbound_turn_no_success_pending) > 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Turno outbound sem nenhuma entrega comprovada bloqueia a stream"
+          description: |
+            Não declare entrega nem rearme cegamente. Escolha a política terminal.
+            Runbook: docs/runbooks/outbound-recovery.md §5.5
+
       - alert: MaiaTurnLatencyP95High
         # SLO (sem debounce): p95 inbound → resposta <= 5s.
         expr: maia:turn_e2e_latency_ms:p95 > 5000

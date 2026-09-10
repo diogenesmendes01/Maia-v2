@@ -153,6 +153,20 @@ correspondente. Ver `docs/architecture/concerns/tenant-isolation.md`.
 > A latência (`maia:turn_e2e_latency_ms:p95/p99`) conta só `completed`: turno
 > que falhou nunca respondeu, e tentativa `retryable` é tentativa PARCIAL.
 
+### 4.4.1 `MaiaOutboundTurnNoSuccessPending`
+
+O turno tem todas as partes outbound em estado final, a lease venceu e nenhuma
+entrega foi comprovada. Não marque `reply_delivered` e não rearme as partes às
+cegas: ambos fabricariam um desfecho que o ledger não sustenta.
+
+1. Quebre o gauge `maia_outbound_turn_no_success_pending` por `tenant_id` e
+   `agent_id`; ele representa o estoque atual, não eventos repetidos por tick.
+2. Siga `docs/runbooks/outbound-recovery.md` §5.5 para inspecionar turno,
+   claim/lease e estados dos artefatos.
+3. Escolha explicitamente a política terminal com o owner. Até lá, mantenha o
+   pai `outbound_pending`; turnos com sucesso posterior continuam finalizáveis,
+   porque este backlog não participa do `LIMIT` da eleição.
+
 ### 4.5 `MaiaTurnLatencyP95High` / `MaiaTurnLatencyP99High`
 
 O diagnóstico é uma subtração:

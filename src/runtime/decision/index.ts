@@ -136,6 +136,7 @@ export {
   _overrideDecisionEngineSingleton,
   DecisionEngineFailClosedError,
   type RunDecisionEngineResult,
+  type RunDecisionEngineForTurnResult,
 } from './integration.js';
 
 export * from './types.js';

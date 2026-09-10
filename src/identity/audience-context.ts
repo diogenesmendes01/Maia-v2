@@ -15,7 +15,7 @@
  *      governed profile, never from the LLM.
  *   #5 fail-closed — a pessoa with NO active audience profile does NOT get an
  *      AudienceContext; the resolver treats it as quarantined (see
- *      `resolveAudienceContext`).
+ *      `resolveIdentity` and the existing-conversation gate in `agent/core`).
  *
  * The enum literals are the single source of truth in `src/shared/audience.ts`
  * — reused unchanged by the downstream skill-by-audience policy (#409).

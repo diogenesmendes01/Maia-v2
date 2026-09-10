@@ -22,7 +22,17 @@
  * produção — manter `audit()` fora daqui também evita o ciclo de import
  * governance/audit -> repositories -> turn-repos.
  */
-import { and, asc, eq, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNull,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
 import {
   agent_stream_blocks,
@@ -57,7 +67,10 @@ import {
   type StreamClaimRecovery,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
-import { recordStreamBlocked, recordStreamFifoViolation } from '@/runtime/turns/stream-metrics.js';
+import {
+  recordStreamBlocked,
+  recordStreamFifoViolation,
+} from '@/runtime/turns/stream-metrics.js';
 import {
   statusList,
   turnWriteConditions,
@@ -254,7 +267,12 @@ export type TurnTransitionResult =
    * concluídos" e "atrás de 1" são decisões de gravidade diferente, e é esse
    * número que entra na `audit_log` quando o operador decide atravessar.
    */
-  | { ok: false; conflict: 'order_committed'; to: TurnStatus; committed_after: number }
+  | {
+      ok: false;
+      conflict: 'order_committed';
+      to: TurnStatus;
+      committed_after: number;
+    }
   | {
       ok: false;
       conflict: 'state_mismatch';
@@ -342,7 +360,21 @@ export type TurnTransitionPatch = {
   clearClaim?: boolean;
 };
 
-type Executor = typeof db;
+export type TurnTransitionExecutor = typeof db;
+type Executor = TurnTransitionExecutor;
+
+type RunTransitionArgs = {
+  turn_id: string;
+  to: TurnStatus;
+  outcome: TurnOutcome | null;
+  sources: readonly TurnStatus[];
+  expected_version?: number;
+  expected_claim_token?: string;
+  absorber_fence?: { turn_id: string; claim_token: string };
+  patch: TurnTransitionPatch;
+  block_stream?: { category: string; reason: string };
+  guard_committed_order?: boolean;
+};
 
 function scope(): { tenant_id: string; agent_id: string } {
   return { tenant_id: getCurrentTenant(), agent_id: getCurrentAgent() };
@@ -387,7 +419,11 @@ export const agentTurnsRepo = {
      * protocolo de stream está desligado; nunca uma stream inventada aqui.
      */
     stream?: { stream_key: string; stream_key_version: number } | null;
-  }): Promise<{ mensagem: Mensagem; turn: AgentTurn; ingress_seq: number | null }> {
+  }): Promise<{
+    mensagem: Mensagem;
+    turn: AgentTurn;
+    ingress_seq: number | null;
+  }> {
     return withTx(async (tx) => {
       // ORDEM DELIBERADA: a sequência é alocada ANTES do INSERT da mensagem,
       // e as duas coisas estão na MESMA transação.
@@ -411,7 +447,10 @@ export const agentTurnsRepo = {
 
       const guardedMensagem = applyTenantGuard({
         ...input.mensagem,
-        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
+        channel_id:
+          input.channel_id ??
+          (input.mensagem['channel_id'] as string | null) ??
+          null,
         stream_key: input.stream?.stream_key ?? null,
         stream_key_version: input.stream?.stream_key_version ?? null,
         ingress_seq,
@@ -453,7 +492,11 @@ export const agentTurnsRepo = {
           });
         }
       }
-      incCounter('maia_turn_transitions_total', { from: 'none', to: 'received', outcome: 'none' });
+      incCounter('maia_turn_transitions_total', {
+        from: 'none',
+        to: 'received',
+        outcome: 'none',
+      });
       return { mensagem: row, turn, ingress_seq };
     });
   },
@@ -475,7 +518,10 @@ export const agentTurnsRepo = {
       const ingress_seq = await allocateIngressSeq(tx, input.stream);
       const guardedMensagem = applyTenantGuard({
         ...input.mensagem,
-        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
+        channel_id:
+          input.channel_id ??
+          (input.mensagem['channel_id'] as string | null) ??
+          null,
         stream_key: input.stream.stream_key,
         stream_key_version: input.stream.stream_key_version,
         ingress_seq,
@@ -497,11 +543,17 @@ export const agentTurnsRepo = {
    * devolve o turno existente sem criar outro.
    */
   async ensureTurnForMessage(
-    mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>,
+    mensagem: Pick<
+      Mensagem,
+      'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'
+    >,
     opts: { deadline_at?: Date | null } = {},
   ): Promise<AgentTurn> {
     return withTx((tx) =>
-      createTurnForMessage(tx, { mensagem, deadline_at: opts.deadline_at ?? null }),
+      createTurnForMessage(tx, {
+        mensagem,
+        deadline_at: opts.deadline_at ?? null,
+      }),
     );
   },
 
@@ -528,7 +580,9 @@ export const agentTurnsRepo = {
       .values(guarded)
       .onConflictDoNothing()
       .returning({ id: agent_turn_inputs.id });
-    return rows.length === 1 ? { attached: true } : { attached: false, reason: 'already_attached' };
+    return rows.length === 1
+      ? { attached: true }
+      : { attached: false, reason: 'already_attached' };
   },
 
   /**
@@ -600,7 +654,9 @@ export const agentTurnsRepo = {
         AND ${agent_turns}.first_ingress_seq IS NOT NULL
       RETURNING ${agent_turns}.id
     `);
-    return Array.from(result.rows as unknown as Array<{ id: string }>).length === 1;
+    return (
+      Array.from(result.rows as unknown as Array<{ id: string }>).length === 1
+    );
   },
 
   /**
@@ -646,21 +702,28 @@ export const agentTurnsRepo = {
     /** #629 — ver `runTransition`. Recusa com `order_committed`. */
     guard_committed_order?: boolean;
   }): Promise<TurnTransitionResult> {
-    if (input.expected_claim_token !== undefined && input.absorber_fence !== undefined) {
+    if (
+      input.expected_claim_token !== undefined &&
+      input.absorber_fence !== undefined
+    ) {
       throw new Error(
         'transitionTurn: expected_claim_token e absorber_fence são mutuamente exclusivos — ' +
           'uma gravação tem UMA autoridade (a própria tentativa OU o turno absorvedor).',
       );
     }
     const outcome = input.outcome ?? null;
-    const allowedSources = sourceStatusesFor(input.to, { manual: input.manual === true });
+    const allowedSources = sourceStatusesFor(input.to, {
+      manual: input.manual === true,
+    });
     const sources = input.expected_statuses
       ? input.expected_statuses.filter((s) => allowedSources.includes(s))
       : allowedSources;
 
     // Valida cada origem admitida — qualquer par proibido é erro de programação.
     for (const from of sources) {
-      assertTurnTransition(from, input.to, outcome, { manual: input.manual === true });
+      assertTurnTransition(from, input.to, outcome, {
+        manual: input.manual === true,
+      });
     }
     if (sources.length === 0) {
       // `expected_statuses` não intersecta o contrato: também é bug, e falhar
@@ -688,8 +751,12 @@ export const agentTurnsRepo = {
       ...(input.absorber_fence !== undefined
         ? { absorber_fence: input.absorber_fence }
         : {}),
-      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
-      ...(input.guard_committed_order === true ? { guard_committed_order: true } : {}),
+      ...(input.block_stream !== undefined
+        ? { block_stream: input.block_stream }
+        : {}),
+      ...(input.guard_committed_order === true
+        ? { guard_committed_order: true }
+        : {}),
       patch: input.patch ?? {},
     });
   },
@@ -867,7 +934,9 @@ export const agentTurnsRepo = {
    * o lock de linha de `agent_stream_sequences` só vale até o COMMIT, e é ele
    * que exclui o ingresso concorrente.
    */
-  async closeDueDebounceBatch(input: { stream_key: string }): Promise<DebounceCloseResult> {
+  async closeDueDebounceBatch(input: {
+    stream_key: string;
+  }): Promise<DebounceCloseResult> {
     return withTx((tx) => closeDueDebounceBatchTx(tx, input));
   },
 
@@ -942,7 +1011,10 @@ export const agentTurnsRepo = {
     turn_id: string,
   ): Promise<Array<{ mensagem_id: string; conteudo: string | null }>> {
     const { tenant_id, agent_id } = scope();
-    const result = await db.execute<{ mensagem_id: string; conteudo: string | null }>(sql`
+    const result = await db.execute<{
+      mensagem_id: string;
+      conteudo: string | null;
+    }>(sql`
       SELECT i.mensagem_id, m.conteudo
         FROM ${agent_turn_inputs} i
         JOIN ${agent_turns} t
@@ -960,7 +1032,10 @@ export const agentTurnsRepo = {
        ORDER BY m.ingress_seq NULLS LAST
     `);
     return Array.from(
-      result.rows as unknown as Array<{ mensagem_id: string; conteudo: string | null }>,
+      result.rows as unknown as Array<{
+        mensagem_id: string;
+        conteudo: string | null;
+      }>,
     );
   },
 
@@ -971,7 +1046,10 @@ export const agentTurnsRepo = {
   }): Promise<LeaseRenewalResult> {
     const { tenant_id, agent_id } = scope();
     const leaseSeconds = input.lease_ms / 1000;
-    const result = await db.execute<{ lease_expires_at: string; heartbeat_at: string }>(sql`
+    const result = await db.execute<{
+      lease_expires_at: string;
+      heartbeat_at: string;
+    }>(sql`
       UPDATE ${agent_turns}
          SET lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
              heartbeat_at     = now(),
@@ -985,10 +1063,15 @@ export const agentTurnsRepo = {
       RETURNING lease_expires_at, heartbeat_at
     `);
     const row = (
-      result.rows as unknown as Array<{ lease_expires_at: string; heartbeat_at: string }>
+      result.rows as unknown as Array<{
+        lease_expires_at: string;
+        heartbeat_at: string;
+      }>
     )[0];
     if (!row) {
-      incCounter('maia_turn_lease_heartbeat_total', { result: 'token_mismatch' });
+      incCounter('maia_turn_lease_heartbeat_total', {
+        result: 'token_mismatch',
+      });
       return { ok: false, reason: 'token_mismatch' };
     }
     incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
@@ -1106,17 +1189,22 @@ export const agentTurnsRepo = {
         : {}),
       patch: {
         bumpAttempt: input.bump_attempt ?? true,
-        ...(input.conversa_id !== undefined ? { conversa_id: input.conversa_id } : {}),
-        ...(input.channel_id !== undefined ? { channel_id: input.channel_id } : {}),
+        ...(input.conversa_id !== undefined
+          ? { conversa_id: input.conversa_id }
+          : {}),
+        ...(input.channel_id !== undefined
+          ? { channel_id: input.channel_id }
+          : {}),
       },
     });
   },
 
   /**
    * `running -> outbound_pending`. A partir daqui o ReAct e as tools NÃO podem
-   * ser reexecutados: a resposta está comprometida e só o delivery worker
-   * finaliza (#506). Por isso `expected_statuses` é fixo em `running` e a
-   * tabela de transições não tem aresta de volta.
+   * ser reexecutados: a resposta está comprometida e só o ciclo de delivery
+   * pode finalizar — no hot path ou, após lease expirada, no recovery (#506).
+   * Por isso `expected_statuses` é fixo em `running` e a tabela de transições
+   * não tem aresta de volta.
    */
   async markOutboundCommittedTx(input: {
     turn_id: string;
@@ -1331,7 +1419,10 @@ export const agentTurnsRepo = {
   /** Tentativas esgotadas ou estado que exige intervenção humana. TERMINAL. */
   async markDeadLetter(input: {
     turn_id: string;
-    outcome: Extract<TurnOutcome, 'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry'>;
+    outcome: Extract<
+      TurnOutcome,
+      'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry'
+    >;
     error_code: string;
     error_summary: string | null;
     expected_version?: number;
@@ -1348,7 +1439,9 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'dead_letter',
       outcome: input.outcome,
-      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
+      ...(input.block_stream !== undefined
+        ? { block_stream: input.block_stream }
+        : {}),
       ...(input.expected_version !== undefined
         ? { expected_version: input.expected_version }
         : {}),
@@ -1434,7 +1527,9 @@ export const agentTurnsRepo = {
    * indistinguível de um turno inexistente, e os dois pedem reações diferentes
    * (o primeiro é corrupção de dado, o segundo é payload forjado ou retenção).
    */
-  async findJobScopeByIdCrossTenant(turn_id: string): Promise<TurnJobScopeRow | null> {
+  async findJobScopeByIdCrossTenant(
+    turn_id: string,
+  ): Promise<TurnJobScopeRow | null> {
     const result = await db.execute<TurnJobScopeRow>(sql`
       SELECT
         t.tenant_id                  AS turn_tenant_id,
@@ -1506,7 +1601,10 @@ export const agentTurnsRepo = {
           eq(agent_turn_inputs.turn_id, turn_id),
         ),
       )
-      .orderBy(asc(agent_turn_inputs.ingress_seq), asc(agent_turn_inputs.created_at));
+      .orderBy(
+        asc(agent_turn_inputs.ingress_seq),
+        asc(agent_turn_inputs.created_at),
+      );
   },
 
   /**
@@ -1548,7 +1646,10 @@ export const agentTurnsRepo = {
    * destravar. É FIFO correto — e é observável por
    * `maia_stream_blocked_total{reason="stream_blocked"}`, que o claim emite.
    */
-  async findRecoverableTurns(stale_ms: number, limit = 200): Promise<RecoverableTurn[]> {
+  async findRecoverableTurns(
+    stale_ms: number,
+    limit = 200,
+  ): Promise<RecoverableTurn[]> {
     const { tenant_id, agent_id } = scope();
     const cutoff = new Date(Date.now() - stale_ms);
     const rows = await db
@@ -1616,7 +1717,10 @@ export const agentTurnsRepo = {
     const { tenant_id, agent_id } = scope();
     const escopo = escopoSql(tenant_id, agent_id);
     const rows = await db
-      .select({ id: agent_turns.id, earlier_live: earlierLiveTurnCount(escopo) })
+      .select({
+        id: agent_turns.id,
+        earlier_live: earlierLiveTurnCount(escopo),
+      })
       .from(agent_turns)
       .where(
         and(
@@ -1626,7 +1730,10 @@ export const agentTurnsRepo = {
           sql`NOT ${streamHeadOfLineNotExists(escopo)}`,
         ),
       );
-    return rows.map((r) => ({ turn_id: r.id, earlier_live: Number(r.earlier_live) }));
+    return rows.map((r) => ({
+      turn_id: r.id,
+      earlier_live: Number(r.earlier_live),
+    }));
   },
 
   /**
@@ -1643,7 +1750,10 @@ export const agentTurnsRepo = {
     stale_ms: number,
   ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
     const cutoff = new Date(Date.now() - stale_ms);
-    const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
+    const result = await db.execute<{
+      tenant_id: string;
+      agent_id: string;
+    }>(sql`
       SELECT DISTINCT tenant_id, agent_id
       FROM ${agent_turns}
       WHERE tenant_id IS NOT NULL
@@ -1720,7 +1830,9 @@ export const agentTurnsRepo = {
    * é medida desde `COALESCE(queued_at, created_at)` — a PRIMEIRA entrada na
    * fila, que a promoção (#627) preserva de propósito.
    */
-  async snapshotStreamScheduling(starvation_after_ms: number): Promise<StreamSchedulingSnapshot> {
+  async snapshotStreamScheduling(
+    starvation_after_ms: number,
+  ): Promise<StreamSchedulingSnapshot> {
     const result = await db.execute<{
       live_streams: string;
       active_streams: string;
@@ -1857,8 +1969,14 @@ export const agentTurnsRepo = {
       WHERE kind IS NOT NULL
       GROUP BY kind
     `);
-    const out = { terminal_without_projection: 0, projection_without_terminal: 0 };
-    for (const row of result.rows as unknown as Array<{ kind: string; total: string }>) {
+    const out = {
+      terminal_without_projection: 0,
+      projection_without_terminal: 0,
+    };
+    for (const row of result.rows as unknown as Array<{
+      kind: string;
+      total: string;
+    }>) {
       if (row.kind === 'terminal_without_projection') {
         out.terminal_without_projection = Number(row.total);
       } else if (row.kind === 'projection_without_terminal') {
@@ -2043,7 +2161,11 @@ export const agentTurnsRepo = {
   async listTenantAgentPairsPendingBackfill(): Promise<
     Array<{ tenant_id: string; agent_id: string; pending: number }>
   > {
-    const result = await db.execute<{ tenant_id: string; agent_id: string; pending: string }>(sql`
+    const result = await db.execute<{
+      tenant_id: string;
+      agent_id: string;
+      pending: string;
+    }>(sql`
       SELECT m.tenant_id, m.agent_id, count(*)::text AS pending
       FROM ${mensagens} m
       WHERE m.tenant_id IS NOT NULL
@@ -2058,7 +2180,11 @@ export const agentTurnsRepo = {
         agent_id: string;
         pending: string;
       }>,
-    ).map((r) => ({ tenant_id: r.tenant_id, agent_id: r.agent_id, pending: Number(r.pending) }));
+    ).map((r) => ({
+      tenant_id: r.tenant_id,
+      agent_id: r.agent_id,
+      pending: Number(r.pending),
+    }));
   },
 };
 
@@ -2178,7 +2304,9 @@ async function recoverExpiredStreamClaims(
     }>,
   );
   for (const row of rows) {
-    incCounter('maia_turn_stream_claim_recovered_total', { from: row.previous_status });
+    incCounter('maia_turn_stream_claim_recovered_total', {
+      from: row.previous_status,
+    });
   }
   // #627 — devolve o mesmo formato da promoção por conclusão, e não só os ids:
   // o caller precisa do `representative_message_id` para armar o wake-up, e uma
@@ -2270,8 +2398,9 @@ async function recoverExpiredStreamClaims(
  * O `WHERE` admite só `CLAIMABLE_STATUSES` com o backoff vencido. Fora ficam:
  *   - `claimed`/`running`: já têm dono vivo. Enfileirar seria pedir um segundo
  *     executor para um turno que está sendo executado;
- *   - `outbound_pending`: nenhum claim o move — quem o move é o delivery worker
- *     (#506). Promovê-lo produziria um job que só pode ser recusado;
+ *   - `outbound_pending`: nenhum claim o move — quem o move é o ciclo de
+ *     delivery, no hot path ou no recovery após lease expirada (#506).
+ *     Promovê-lo produziria um job que só pode ser recusado;
  *   - `retryable` com `next_attempt_at` no FUTURO: a issue-mãe é literal —
  *     "backoff não autoriza ultrapassagem silenciosa". A conversa espera, e
  *     quem a acorda é o varredor quando o backoff vencer.
@@ -2732,7 +2861,9 @@ async function closeDueDebounceBatchTx(
       RETURNING u.id
     `);
     absorvidos.push(
-      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map((r) => r.id),
+      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map(
+        (r) => r.id,
+      ),
     );
 
     if (absorvidos.length > 0) {
@@ -2765,9 +2896,9 @@ async function closeDueDebounceBatchTx(
         RETURNING i.mensagem_id
       `);
       mensagensAbsorvidas.push(
-        ...Array.from(repontados.rows as unknown as Array<{ mensagem_id: string }>).map(
-          (r) => r.mensagem_id,
-        ),
+        ...Array.from(
+          repontados.rows as unknown as Array<{ mensagem_id: string }>,
+        ).map((r) => r.mensagem_id),
       );
     }
   }
@@ -2788,8 +2919,15 @@ async function closeDueDebounceBatchTx(
 }
 
 /** O escopo corrente como FRAGMENTOS, que é o que `stream-head-sql` consome. */
-function escopoSql(tenant_id: string, agent_id: string): { tenant: SQL; agent: SQL; alvo: SQL } {
-  return { tenant: sql`${tenant_id}`, agent: sql`${agent_id}`, alvo: sql`${agent_turns}` };
+function escopoSql(
+  tenant_id: string,
+  agent_id: string,
+): { tenant: SQL; agent: SQL; alvo: SQL } {
+  return {
+    tenant: sql`${tenant_id}`,
+    agent: sql`${agent_id}`,
+    alvo: sql`${agent_turns}`,
+  };
 }
 
 /**
@@ -2837,7 +2975,8 @@ async function claimWithinStreamExclusion(
   // Presente só quando houve o que recuperar: um campo vazio em todo resultado
   // convidaria o caller a tratar `[]` como evento, e o normal é NÃO haver
   // claim expirado nenhum.
-  const trail = recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
+  const trail =
+    recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
 
   // A CONDIÇÃO DE HEAD-OF-LINE. Uma linha, e é a fatia inteira.
   //
@@ -2853,7 +2992,9 @@ async function claimWithinStreamExclusion(
   // flag off ele seria legitimamente > 0 e o alarme viraria ruído.
   const canario = fifo ? earlierLiveTurnCount(escopo) : sql`0`;
 
-  const result = await tx.execute<ClaimRow & { fifo_anteriores: number | string }>(sql`
+  const result = await tx.execute<
+    ClaimRow & { fifo_anteriores: number | string }
+  >(sql`
     UPDATE ${agent_turns}
        SET status            = 'claimed',
            claimed_by        = ${input.worker_id},
@@ -2904,8 +3045,17 @@ async function claimWithinStreamExclusion(
               ) AS wait_seconds,
               ${canario} AS fifo_anteriores
   `);
-  const row = (result.rows as unknown as Array<ClaimRow & { fifo_anteriores: number | string }>)[0];
-  if (!row) return await explainClaimRejection(tx, { tenant_id, agent_id, fifo, ...input }, trail);
+  const row = (
+    result.rows as unknown as Array<
+      ClaimRow & { fifo_anteriores: number | string }
+    >
+  )[0];
+  if (!row)
+    return await explainClaimRejection(
+      tx,
+      { tenant_id, agent_id, fifo, ...input },
+      trail,
+    );
 
   // PÓS-CONDIÇÃO. `> 0` significa que o claim passou por cima de um turno
   // anterior vivo — a inversão de ordem que a #505 existe para impedir, e um
@@ -2921,7 +3071,9 @@ async function claimWithinStreamExclusion(
   return {
     ok: true,
     ...(anteriores > 0
-      ? { fifo_violation: { stage: 'claim' as const, earlier_live: anteriores } }
+      ? {
+          fifo_violation: { stage: 'claim' as const, earlier_live: anteriores },
+        }
       : {}),
     claim: {
       turn_id: row.id,
@@ -2989,8 +3141,16 @@ async function explainClaimRejection(
   //
   // Custa uma consulta, e só no caminho que JÁ falhou — como o resto deste
   // diagnóstico.
-  const interdito = await tx.execute<{ id: string; blocked_by_turn_id: string; reason: string }>(
-    streamPoisonProbe({ tenant: escopo.tenant, agent: escopo.agent, turn_id: args.turn_id }),
+  const interdito = await tx.execute<{
+    id: string;
+    blocked_by_turn_id: string;
+    reason: string;
+  }>(
+    streamPoisonProbe({
+      tenant: escopo.tenant,
+      agent: escopo.agent,
+      turn_id: args.turn_id,
+    }),
   );
   const bloqueio = (
     interdito.rows as unknown as Array<{
@@ -3010,7 +3170,10 @@ async function explainClaimRejection(
       // a pergunta do operador é a mesma ("quem está segurando esta
       // conversa?"), e o `status` responde a diferença: um bloqueador
       // `dead_letter` só pode ter vindo daqui.
-      head_block: { turn_id: bloqueio.blocked_by_turn_id, status: 'dead_letter' },
+      head_block: {
+        turn_id: bloqueio.blocked_by_turn_id,
+        status: 'dead_letter',
+      },
       ...trail,
     };
   }
@@ -3022,9 +3185,15 @@ async function explainClaimRejection(
   // descreve o que de fato aconteceu.
   if (args.fifo && !isTerminalTurnStatus(encontrado.status as TurnStatus)) {
     const bloqueio = await tx.execute<{ id: string; status: string }>(
-      earlierLiveTurnProbe({ tenant: escopo.tenant, agent: escopo.agent, turn_id: args.turn_id }),
+      earlierLiveTurnProbe({
+        tenant: escopo.tenant,
+        agent: escopo.agent,
+        turn_id: args.turn_id,
+      }),
     );
-    const head = (bloqueio.rows as unknown as Array<{ id: string; status: string }>)[0];
+    const head = (
+      bloqueio.rows as unknown as Array<{ id: string; status: string }>
+    )[0];
     if (head) {
       // `outbound_pending` é a única situação em que NENHUM claim destrava a
       // stream: quem tira um turno dali é o delivery worker do outbox (#506).
@@ -3097,7 +3266,9 @@ async function allocateIngressSeq(
         AND ${agent_stream_sequences}.agent_id = ${agent_id}
     RETURNING last_ingress_seq
   `);
-  const rows = Array.from(result.rows as unknown as Array<{ last_ingress_seq: string | number }>);
+  const rows = Array.from(
+    result.rows as unknown as Array<{ last_ingress_seq: string | number }>,
+  );
   const raw = rows[0]?.last_ingress_seq;
   const seq = typeof raw === 'string' ? Number(raw) : raw;
   if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 1) {
@@ -3115,7 +3286,10 @@ async function allocateIngressSeq(
 async function createTurnForMessage(
   tx: Executor,
   args: {
-    mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>;
+    mensagem: Pick<
+      Mensagem,
+      'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'
+    >;
     deadline_at: Date | null;
     /**
      * #505 — a stream e a posição do ingresso representativo. Ausente para
@@ -3233,29 +3407,9 @@ async function absorberStillOwns(
  * O UPDATE compare-and-swap + (quando terminal) a projeção legada, na MESMA
  * transação. Zero rows -> releitura para classificar o conflito.
  */
-async function runTransition(args: {
-  turn_id: string;
-  to: TurnStatus;
-  outcome: TurnOutcome | null;
-  sources: readonly TurnStatus[];
-  expected_version?: number;
-  expected_claim_token?: string;
-  absorber_fence?: { turn_id: string; claim_token: string };
-  patch: TurnTransitionPatch;
-  /**
-   * #629 — quando presente E a transição é `dead_letter`, a stream é BLOQUEADA
-   * na mesma transação. A DECISÃO não é tomada aqui: ela chega pronta de
-   * `deadLetterTurn` (`src/runtime/turns/lifecycle.ts`), onde a configuração
-   * mora. O repositório continua puro-DB — ele executa a política, nunca a lê.
-   */
-  block_stream?: { category: string; reason: string };
-  /**
-   * #629 — quando `true`, o UPDATE só casa se a ordem da conversa AINDA não
-   * foi comprometida por um turno posterior já terminal. Usado pelo replay
-   * manual, que é a única escrita que pode ressuscitar um turno antigo.
-   */
-  guard_committed_order?: boolean;
-}): Promise<TurnTransitionResult> {
+async function runTransition(
+  args: RunTransitionArgs,
+): Promise<TurnTransitionResult> {
   // O fence desta gravação, numa forma só. `turnWriteConditions` é a fonte
   // ÚNICA do `WHERE` — nada é acrescentado a ele depois desta chamada, e é o
   // que permite a `tests/unit/db/turn-fence-sql.spec.ts` compilar o predicado
@@ -3292,98 +3446,186 @@ async function runTransition(args: {
 }
 
 async function runTransitionTx(
-  args: {
-    turn_id: string;
-    to: TurnStatus;
-    outcome: TurnOutcome | null;
-    sources: readonly TurnStatus[];
-    expected_version?: number;
-    expected_claim_token?: string;
-    absorber_fence?: { turn_id: string; claim_token: string };
-    patch: TurnTransitionPatch;
-    block_stream?: { category: string; reason: string };
-    guard_committed_order?: boolean;
-  },
+  args: RunTransitionArgs,
   fence: TurnWriteFence,
 ): Promise<TurnTransitionResult> {
-  const { tenant_id, agent_id } = scope();
-  const terminal = isTerminalTurnStatus(args.to);
-  return withTx(async (tx) => {
-    const set: Record<string, unknown> = {
-      status: args.to,
-      outcome: args.outcome,
-      state_version: sql`${agent_turns.state_version} + 1`,
-      updated_at: sql`now()`,
-    };
-    const stamp = STATE_TIMESTAMP[args.to];
-    if (stamp) set[stamp] = sql`now()`;
-    if (args.patch.bumpAttempt) set['attempt_count'] = sql`${agent_turns.attempt_count} + 1`;
-    if (args.patch.conversa_id !== undefined) set['conversa_id'] = args.patch.conversa_id;
-    if (args.patch.channel_id !== undefined) set['channel_id'] = args.patch.channel_id;
-    if (args.patch.next_attempt_at !== undefined) {
-      set['next_attempt_at'] = args.patch.next_attempt_at;
-    }
-    if (args.patch.last_error_code !== undefined) {
-      set['last_error_code'] = args.patch.last_error_code;
-    }
-    if (args.patch.last_error_summary !== undefined) {
-      set['last_error_summary'] = args.patch.last_error_summary;
-    }
-    if (args.patch.outbound_message_id !== undefined) {
-      set['outbound_message_id'] = args.patch.outbound_message_id;
-    }
-    if (args.patch.deadline_at !== undefined) set['deadline_at'] = args.patch.deadline_at;
-    if (args.patch.superseded_by_turn_id !== undefined) {
-      set['superseded_by_turn_id'] = args.patch.superseded_by_turn_id;
-    }
-    if (args.patch.clearClaim) {
-      // #504 — a posse morre com a tentativa. `claimed_by` fica para a forense.
-      set['claim_token'] = null;
-      set['lease_expires_at'] = null;
-    }
+  const scoped = scope();
+  const result = await withTx((tx) =>
+    runTransitionOnExecutor(tx, args, fence, scoped),
+  );
+  if (result.ok) recordCommittedTransition(args);
+  return result;
+}
 
-    const updated = await tx
-      .update(agent_turns)
-      .set(set as never)
+function recordCommittedTransition(args: RunTransitionArgs): void {
+  incCounter('maia_turn_transitions_total', {
+    from: args.sources.length === 1 ? args.sources[0]! : 'any',
+    to: args.to,
+    outcome: args.outcome ?? 'none',
+  });
+}
+
+/**
+ * Fecha um turno cujo outbound já convergiu, compartilhando a transação do
+ * recovery. O caller deve bloquear primeiro o turno e todos os seus artefatos;
+ * este UPDATE repete as guardas essenciais (origem, versão e lease expirada)
+ * para que nem um uso futuro incorreto transforme a API em bypass de fencing.
+ */
+export async function completeRecoveredOutboundTurnInTx(
+  tx: TurnTransitionExecutor,
+  input: {
+    turn_id: string;
+    expected_version: number;
+    outcome: 'reply_delivered' | 'fallback_delivered';
+  },
+): Promise<Extract<TurnTransitionResult, { ok: true }>> {
+  assertTurnTransition('outbound_pending', 'completed', input.outcome);
+  const result = await runTransitionOnExecutor(
+    tx,
+    {
+      turn_id: input.turn_id,
+      to: 'completed',
+      outcome: input.outcome,
+      sources: ['outbound_pending'],
+      expected_version: input.expected_version,
+      patch: { next_attempt_at: null, clearClaim: true },
+    },
+    { kind: 'recovery_expired' },
+    scope(),
+  );
+  if (!result.ok) {
+    // Uma primitiva `...InTx` não pode devolver conflito e deixar o caller
+    // comitar as demais escritas. Conflito aqui é rollback obrigatório.
+    throw new Error(
+      `recovered_outbound_turn_transition_conflict:${result.conflict}:${input.turn_id}`,
+    );
+  }
+  return result;
+}
+
+/** Registra a transição somente depois que a transação externa comitou. */
+export function recordRecoveredOutboundTurnCommitted(input: {
+  outcome: 'reply_delivered' | 'fallback_delivered';
+}): void {
+  incCounter('maia_turn_transitions_total', {
+    from: 'outbound_pending',
+    to: 'completed',
+    outcome: input.outcome,
+  });
+}
+
+async function runTransitionOnExecutor(
+  tx: Executor,
+  args: RunTransitionArgs,
+  fence: TurnWriteFence,
+  scoped: { tenant_id: string; agent_id: string },
+): Promise<TurnTransitionResult> {
+  const { tenant_id, agent_id } = scoped;
+  const terminal = isTerminalTurnStatus(args.to);
+  const set: Record<string, unknown> = {
+    status: args.to,
+    outcome: args.outcome,
+    state_version: sql`${agent_turns.state_version} + 1`,
+    updated_at: sql`now()`,
+  };
+  const stamp = STATE_TIMESTAMP[args.to];
+  if (stamp) set[stamp] = sql`now()`;
+  if (args.patch.bumpAttempt)
+    set['attempt_count'] = sql`${agent_turns.attempt_count} + 1`;
+  if (args.patch.conversa_id !== undefined)
+    set['conversa_id'] = args.patch.conversa_id;
+  if (args.patch.channel_id !== undefined)
+    set['channel_id'] = args.patch.channel_id;
+  if (args.patch.next_attempt_at !== undefined) {
+    set['next_attempt_at'] = args.patch.next_attempt_at;
+  }
+  if (args.patch.last_error_code !== undefined) {
+    set['last_error_code'] = args.patch.last_error_code;
+  }
+  if (args.patch.last_error_summary !== undefined) {
+    set['last_error_summary'] = args.patch.last_error_summary;
+  }
+  if (args.patch.outbound_message_id !== undefined) {
+    set['outbound_message_id'] = args.patch.outbound_message_id;
+  }
+  if (args.patch.deadline_at !== undefined)
+    set['deadline_at'] = args.patch.deadline_at;
+  if (args.patch.superseded_by_turn_id !== undefined) {
+    set['superseded_by_turn_id'] = args.patch.superseded_by_turn_id;
+  }
+  if (args.patch.clearClaim) {
+    // #504 — a posse morre com a tentativa. `claimed_by` fica para a forense.
+    set['claim_token'] = null;
+    set['lease_expires_at'] = null;
+  }
+
+  const updated = await tx
+    .update(agent_turns)
+    .set(set as never)
+    .where(
+      and(
+        ...turnWriteConditions({
+          tenant_id,
+          agent_id,
+          turn_id: args.turn_id,
+          sources: args.sources,
+          ...(args.expected_version !== undefined
+            ? { expected_version: args.expected_version }
+            : {}),
+          fence,
+        }),
+        // #629 — A ORDEM JÁ COMPROMETIDA, no `WHERE` e não numa consulta
+        // anterior. É o que torna a garantia ATÔMICA: entre um `SELECT count`
+        // e este `UPDATE`, um sucessor pode concluir — e o replay
+        // atravessaria a ordem tendo acabado de verificar que não a
+        // atravessaria. Aqui não há vão.
+        ...(args.guard_committed_order === true
+          ? [committedOrderNotBroken(escopoSql(tenant_id, agent_id))]
+          : []),
+      ),
+    )
+    .returning();
+
+  const turn = updated[0];
+  if (!turn) {
+    incCounter('maia_turn_state_conflicts_total', {
+      transition: transitionLabel('any', args.to),
+    });
+    const current = await tx
+      .select({
+        status: agent_turns.status,
+        state_version: agent_turns.state_version,
+        claim_token: agent_turns.claim_token,
+        // Avaliado NO BANCO: comparar `lease_expires_at` com o relógio do
+        // processo aqui reintroduziria justamente o clock skew que o fence
+        // existe para eliminar.
+        lease_live: sql<boolean>`(${agent_turns.lease_expires_at} > now())`,
+      })
+      .from(agent_turns)
       .where(
         and(
-          ...turnWriteConditions({
-            tenant_id,
-            agent_id,
-            turn_id: args.turn_id,
-            sources: args.sources,
-            ...(args.expected_version !== undefined
-              ? { expected_version: args.expected_version }
-              : {}),
-            fence,
-          }),
-          // #629 — A ORDEM JÁ COMPROMETIDA, no `WHERE` e não numa consulta
-          // anterior. É o que torna a garantia ATÔMICA: entre um `SELECT count`
-          // e este `UPDATE`, um sucessor pode concluir — e o replay
-          // atravessaria a ordem tendo acabado de verificar que não a
-          // atravessaria. Aqui não há vão.
-          ...(args.guard_committed_order === true
-            ? [committedOrderNotBroken(escopoSql(tenant_id, agent_id))]
-            : []),
+          eq(agent_turns.tenant_id, tenant_id),
+          eq(agent_turns.agent_id, agent_id),
+          eq(agent_turns.id, args.turn_id),
         ),
       )
-      .returning();
-
-    const turn = updated[0];
-    if (!turn) {
-      incCounter('maia_turn_state_conflicts_total', {
-        transition: transitionLabel('any', args.to),
-      });
-      const current = await tx
-        .select({
-          status: agent_turns.status,
-          state_version: agent_turns.state_version,
-          claim_token: agent_turns.claim_token,
-          // Avaliado NO BANCO: comparar `lease_expires_at` com o relógio do
-          // processo aqui reintroduziria justamente o clock skew que o fence
-          // existe para eliminar.
-          lease_live: sql<boolean>`(${agent_turns.lease_expires_at} > now())`,
-        })
+      .limit(1);
+    const row = current[0];
+    if (!row)
+      return {
+        ok: false as const,
+        conflict: 'not_found' as const,
+        to: args.to,
+      };
+    // #629 — o guarda de ORDEM COMPROMETIDA é classificado ANTES do fence e
+    // do `state_mismatch`, e a ordem é a leitura operacional: um replay
+    // recusado por ordem comprometida NÃO deve ser retentado (a recusa é
+    // permanente até alguém decidir reconciliar), enquanto `state_mismatch`
+    // convida a reler e tentar de novo. Dar o código errado aqui mandaria um
+    // operador insistir contra uma recusa que nunca vai ceder.
+    if (args.guard_committed_order === true) {
+      const posteriores = await tx
+        .select({ n: committedOrderAfterCount(escopoSql(tenant_id, agent_id)) })
         .from(agent_turns)
         .where(
           and(
@@ -3393,195 +3635,170 @@ async function runTransitionTx(
           ),
         )
         .limit(1);
-      const row = current[0];
-      if (!row) return { ok: false as const, conflict: 'not_found' as const, to: args.to };
-      // #629 — o guarda de ORDEM COMPROMETIDA é classificado ANTES do fence e
-      // do `state_mismatch`, e a ordem é a leitura operacional: um replay
-      // recusado por ordem comprometida NÃO deve ser retentado (a recusa é
-      // permanente até alguém decidir reconciliar), enquanto `state_mismatch`
-      // convida a reler e tentar de novo. Dar o código errado aqui mandaria um
-      // operador insistir contra uma recusa que nunca vai ceder.
-      if (args.guard_committed_order === true) {
-        const posteriores = await tx
-          .select({ n: committedOrderAfterCount(escopoSql(tenant_id, agent_id)) })
-          .from(agent_turns)
-          .where(
-            and(
-              eq(agent_turns.tenant_id, tenant_id),
-              eq(agent_turns.agent_id, agent_id),
-              eq(agent_turns.id, args.turn_id),
-            ),
-          )
-          .limit(1);
-        const committed_after = Number(posteriores[0]?.n ?? 0);
-        if (committed_after > 0) {
-          return {
-            ok: false as const,
-            conflict: 'order_committed' as const,
-            to: args.to,
-            committed_after,
-          };
-        }
-      }
-      // Classificação do conflito. A ordem importa: quando havia fence e ele
-      // não bate, a causa é a PERDA DE POSSE — mesmo que o status também tenha
-      // andado. Reportar `state_mismatch` aqui faria o caller reler e tentar de
-      // novo, que é a reação exatamente errada para um zumbi.
-      //
-      // Com fence de ABSORVEDOR a pergunta é a mesma, feita na OUTRA linha:
-      // "o turno que mandou absorver ainda tem a posse?". Um `state_mismatch`
-      // aqui mandaria o absorvedor reler o irmão e reinsistir — e insistir é
-      // exatamente o que um zumbi não pode fazer. Custa uma leitura escapada,
-      // só no caminho de fracasso.
-      const selfFenceBroken =
-        args.expected_claim_token !== undefined &&
-        (row.claim_token !== args.expected_claim_token || row.lease_live !== true);
-      const absorberFenceBroken =
-        args.absorber_fence !== undefined &&
-        !(await absorberStillOwns(tx, {
-          tenant_id,
-          agent_id,
-          absorber_turn_id: args.absorber_fence.turn_id,
-          claim_token: args.absorber_fence.claim_token,
-        }));
-      const fenceBroken = selfFenceBroken || absorberFenceBroken;
-      if (fenceBroken) {
-        // NÃO incrementa `maia_turn_fence_rejected_total` aqui, e isso é uma
-        // escolha de DONO, não um esquecimento.
-        //
-        // Uma escrita recusada tem de valer UM incremento. Enquanto esta linha
-        // existia junto com `reportFenceRejection()` (src/runtime/turns/lease.ts),
-        // uma única recusa somava dois — com labels diferentes (`to_completed` vs
-        // `conclude_reply_delivered`), então qualquer agregação por `sum()` (que
-        // é como um SLO e um alerta leem um counter) via o dobro das rejeições
-        // reais.
-        //
-        // O dono do contador é a camada de runtime, por três razões:
-        //   1. é a única que emite os TRÊS fatos juntos (métrica + log
-        //      estruturado + auditoria `turn_fence_rejected`), então "uma
-        //      recusa = uma linha em cada trilha" fica verificável num lugar só;
-        //   2. o label dela é o `operation` do vocabulário da issue
-        //      (`conclude_reply_delivered`, `fail_retryable`, `dead_letter`), e
-        //      não o estado-alvo — que é o que um operador procura;
-        //   3. existem recusas que NUNCA chegam aqui: quando a tentativa já sabe
-        //      que a lease morreu, o guard em memória recusa sem ir ao banco
-        //      (`refuseLostOwnership`). Se o dono do contador fosse este SELECT,
-        //      essas ficariam invisíveis — justamente as mais graves.
-        //
-        // O repositório continua sendo a autoridade sobre a CLASSIFICAÇÃO
-        // (`stale_claim` vs `state_mismatch`); ele só não conta.
+      const committed_after = Number(posteriores[0]?.n ?? 0);
+      if (committed_after > 0) {
         return {
           ok: false as const,
-          conflict: 'stale_claim' as const,
+          conflict: 'order_committed' as const,
           to: args.to,
-          current_status: row.status as TurnStatus,
-          current_state_version: Number(row.state_version),
+          committed_after,
         };
       }
+    }
+    // Classificação do conflito. A ordem importa: quando havia fence e ele
+    // não bate, a causa é a PERDA DE POSSE — mesmo que o status também tenha
+    // andado. Reportar `state_mismatch` aqui faria o caller reler e tentar de
+    // novo, que é a reação exatamente errada para um zumbi.
+    //
+    // Com fence de ABSORVEDOR a pergunta é a mesma, feita na OUTRA linha:
+    // "o turno que mandou absorver ainda tem a posse?". Um `state_mismatch`
+    // aqui mandaria o absorvedor reler o irmão e reinsistir — e insistir é
+    // exatamente o que um zumbi não pode fazer. Custa uma leitura escapada,
+    // só no caminho de fracasso.
+    const selfFenceBroken =
+      args.expected_claim_token !== undefined &&
+      (row.claim_token !== args.expected_claim_token ||
+        row.lease_live !== true);
+    const absorberFenceBroken =
+      args.absorber_fence !== undefined &&
+      !(await absorberStillOwns(tx, {
+        tenant_id,
+        agent_id,
+        absorber_turn_id: args.absorber_fence.turn_id,
+        claim_token: args.absorber_fence.claim_token,
+      }));
+    const fenceBroken = selfFenceBroken || absorberFenceBroken;
+    if (fenceBroken) {
+      // NÃO incrementa `maia_turn_fence_rejected_total` aqui, e isso é uma
+      // escolha de DONO, não um esquecimento.
+      //
+      // Uma escrita recusada tem de valer UM incremento. Enquanto esta linha
+      // existia junto com `reportFenceRejection()` (src/runtime/turns/lease.ts),
+      // uma única recusa somava dois — com labels diferentes (`to_completed` vs
+      // `conclude_reply_delivered`), então qualquer agregação por `sum()` (que
+      // é como um SLO e um alerta leem um counter) via o dobro das rejeições
+      // reais.
+      //
+      // O dono do contador é a camada de runtime, por três razões:
+      //   1. é a única que emite os TRÊS fatos juntos (métrica + log
+      //      estruturado + auditoria `turn_fence_rejected`), então "uma
+      //      recusa = uma linha em cada trilha" fica verificável num lugar só;
+      //   2. o label dela é o `operation` do vocabulário da issue
+      //      (`conclude_reply_delivered`, `fail_retryable`, `dead_letter`), e
+      //      não o estado-alvo — que é o que um operador procura;
+      //   3. existem recusas que NUNCA chegam aqui: quando a tentativa já sabe
+      //      que a lease morreu, o guard em memória recusa sem ir ao banco
+      //      (`refuseLostOwnership`). Se o dono do contador fosse este SELECT,
+      //      essas ficariam invisíveis — justamente as mais graves.
+      //
+      // O repositório continua sendo a autoridade sobre a CLASSIFICAÇÃO
+      // (`stale_claim` vs `state_mismatch`); ele só não conta.
       return {
         ok: false as const,
-        conflict: 'state_mismatch' as const,
+        conflict: 'stale_claim' as const,
         to: args.to,
         current_status: row.status as TurnStatus,
         current_state_version: Number(row.state_version),
       };
     }
-
-    if (terminal) {
-      // Projeção de compatibilidade (§6): TODA transição terminal preenche
-      // `processada_em` das mensagens do turno que ainda estão pendentes, na
-      // MESMA transação do CAS. Estado não-terminal jamais escreve aqui — é o
-      // que faz `retryable` continuar visível para o recovery legado.
-      await tx
-        .update(mensagens)
-        .set({ processada_em: sql`now()` })
-        .where(
-          and(
-            eq(mensagens.tenant_id, tenant_id),
-            eq(mensagens.agent_id, agent_id),
-            isNull(mensagens.processada_em),
-            inArray(
-              mensagens.id,
-              tx
-                .select({ id: agent_turn_inputs.mensagem_id })
-                .from(agent_turn_inputs)
-                .where(
-                  and(
-                    eq(agent_turn_inputs.tenant_id, tenant_id),
-                    eq(agent_turn_inputs.agent_id, agent_id),
-                    eq(agent_turn_inputs.turn_id, args.turn_id),
-                  ),
-                ),
-            ),
-          ),
-        );
-    }
-
-    // #627 (fatia D) — A PROMOÇÃO DO SUCESSOR, na MESMA transação do CAS
-    // terminal. Depois desta linha a decisão está tomada e comitará junto com a
-    // conclusão; quem sinaliza a BullMQ é `src/runtime/turns/stream-promotion.ts`,
-    // com o objeto devolvido aqui, DEPOIS do commit.
-    //
-    // Só transições TERMINAIS promovem: um turno que vai para `running` ou
-    // `retryable` continua ocupando a posição na fila da conversa, e promover
-    // ali seria exatamente a ultrapassagem que a issue-mãe proíbe.
-    //
-    // O fence do predecessor já foi cobrado pelo `WHERE` do UPDATE acima — se a
-    // tentativa fosse stale, o CAS teria devolvido zero linhas e não estaríamos
-    // aqui. É assim que "uma tentativa stale não pode liberar o sucessor" deixa
-    // de depender de uma verificação a mais para depender da estrutura.
-    // #629 (fatia F) — O BLOQUEIO DA STREAM, **ANTES** DA PROMOÇÃO E NA MESMA
-    // TRANSAÇÃO.
-    //
-    // A ordem entre estas duas escritas é a fatia inteira, e ela não é
-    // convencional: a eleição da promoção carrega `streamNotPoisoned` no
-    // `WHERE`, então inserir o bloqueio primeiro faz a promoção VER o bloqueio
-    // que a própria conclusão acabou de criar e devolver `null`. Inverter as
-    // duas produziria o pior estado possível — a conversa bloqueada E o
-    // sucessor acordado — e o defeito seria invisível: o job do sucessor
-    // acordaria, o claim o recusaria com `stream_poisoned`, e o único sintoma
-    // seria um `promoted` que não corresponde a fila nenhuma.
-    //
-    // Na MESMA transação porque as duas escritas são um átomo semântico: "este
-    // turno morreu E esta conversa está interditada". Um commit com a primeira
-    // sem a segunda é a falha nº 5 da issue-mãe pela porta dos fundos — o
-    // sucessor vira head de uma conversa que a política mandou parar, e nenhum
-    // varredor conserta isso porque, do ponto de vista de todo mundo, nada
-    // falhou.
-    const stream_block =
-      terminal && args.to === 'dead_letter' && args.block_stream
-        ? await blockStreamForPoison(tx, {
-            tenant_id,
-            agent_id,
-            turn,
-            category: args.block_stream.category,
-            reason: args.block_stream.reason,
-          })
-        : null;
-
-    const promotion =
-      terminal && promotionEnabled()
-        ? await promoteStreamSuccessor(tx, {
-            tenant_id,
-            agent_id,
-            predecessor_turn_id: args.turn_id,
-          })
-        : null;
-
-    incCounter('maia_turn_transitions_total', {
-      from: args.sources.length === 1 ? args.sources[0]! : 'any',
-      to: args.to,
-      outcome: args.outcome ?? 'none',
-    });
     return {
-      ok: true as const,
-      turn,
-      from: (args.sources.length === 1 ? args.sources[0]! : 'any') as TurnStatus,
+      ok: false as const,
+      conflict: 'state_mismatch' as const,
       to: args.to,
-      ...(promotion ? { promotion } : {}),
-      ...(stream_block ? { stream_block } : {}),
+      current_status: row.status as TurnStatus,
+      current_state_version: Number(row.state_version),
     };
-  });
+  }
+
+  if (terminal) {
+    // Projeção de compatibilidade (§6): TODA transição terminal preenche
+    // `processada_em` das mensagens do turno que ainda estão pendentes, na
+    // MESMA transação do CAS. Estado não-terminal jamais escreve aqui — é o
+    // que faz `retryable` continuar visível para o recovery legado.
+    await tx
+      .update(mensagens)
+      .set({ processada_em: sql`now()` })
+      .where(
+        and(
+          eq(mensagens.tenant_id, tenant_id),
+          eq(mensagens.agent_id, agent_id),
+          isNull(mensagens.processada_em),
+          inArray(
+            mensagens.id,
+            tx
+              .select({ id: agent_turn_inputs.mensagem_id })
+              .from(agent_turn_inputs)
+              .where(
+                and(
+                  eq(agent_turn_inputs.tenant_id, tenant_id),
+                  eq(agent_turn_inputs.agent_id, agent_id),
+                  eq(agent_turn_inputs.turn_id, args.turn_id),
+                ),
+              ),
+          ),
+        ),
+      );
+  }
+
+  // #627 (fatia D) — A PROMOÇÃO DO SUCESSOR, na MESMA transação do CAS
+  // terminal. Depois desta linha a decisão está tomada e comitará junto com a
+  // conclusão; quem sinaliza a BullMQ é `src/runtime/turns/stream-promotion.ts`,
+  // com o objeto devolvido aqui, DEPOIS do commit.
+  //
+  // Só transições TERMINAIS promovem: um turno que vai para `running` ou
+  // `retryable` continua ocupando a posição na fila da conversa, e promover
+  // ali seria exatamente a ultrapassagem que a issue-mãe proíbe.
+  //
+  // O fence do predecessor já foi cobrado pelo `WHERE` do UPDATE acima — se a
+  // tentativa fosse stale, o CAS teria devolvido zero linhas e não estaríamos
+  // aqui. É assim que "uma tentativa stale não pode liberar o sucessor" deixa
+  // de depender de uma verificação a mais para depender da estrutura.
+  // #629 (fatia F) — O BLOQUEIO DA STREAM, **ANTES** DA PROMOÇÃO E NA MESMA
+  // TRANSAÇÃO.
+  //
+  // A ordem entre estas duas escritas é a fatia inteira, e ela não é
+  // convencional: a eleição da promoção carrega `streamNotPoisoned` no
+  // `WHERE`, então inserir o bloqueio primeiro faz a promoção VER o bloqueio
+  // que a própria conclusão acabou de criar e devolver `null`. Inverter as
+  // duas produziria o pior estado possível — a conversa bloqueada E o
+  // sucessor acordado — e o defeito seria invisível: o job do sucessor
+  // acordaria, o claim o recusaria com `stream_poisoned`, e o único sintoma
+  // seria um `promoted` que não corresponde a fila nenhuma.
+  //
+  // Na MESMA transação porque as duas escritas são um átomo semântico: "este
+  // turno morreu E esta conversa está interditada". Um commit com a primeira
+  // sem a segunda é a falha nº 5 da issue-mãe pela porta dos fundos — o
+  // sucessor vira head de uma conversa que a política mandou parar, e nenhum
+  // varredor conserta isso porque, do ponto de vista de todo mundo, nada
+  // falhou.
+  const stream_block =
+    terminal && args.to === 'dead_letter' && args.block_stream
+      ? await blockStreamForPoison(tx, {
+          tenant_id,
+          agent_id,
+          turn,
+          category: args.block_stream.category,
+          reason: args.block_stream.reason,
+        })
+      : null;
+
+  const promotion =
+    terminal && promotionEnabled()
+      ? await promoteStreamSuccessor(tx, {
+          tenant_id,
+          agent_id,
+          predecessor_turn_id: args.turn_id,
+        })
+      : null;
+
+  return {
+    ok: true as const,
+    turn,
+    from: (args.sources.length === 1 ? args.sources[0]! : 'any') as TurnStatus,
+    to: args.to,
+    ...(promotion ? { promotion } : {}),
+    ...(stream_block ? { stream_block } : {}),
+  };
 }
 
 /**

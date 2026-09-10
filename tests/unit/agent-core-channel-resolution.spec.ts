@@ -32,6 +32,7 @@ const {
   buildPromptMock,
   runReActLoopMock,
   probeQueryMock,
+  loadConversationMock,
 } = vi.hoisted(() => {
   const resolveChannelMock = vi.fn();
   const isContextPacketV1EnabledMock = vi.fn();
@@ -58,6 +59,7 @@ const {
   // O caller faz primeiro o `probeMessageForChannel` (1 chamada), depois o
   // `runAgentForMensagemInner` faz outra (1 chamada). Cada teste configura.
   const probeQueryMock = vi.fn();
+  const loadConversationMock = vi.fn();
   return {
     resolveChannelMock,
     isContextPacketV1EnabledMock,
@@ -70,6 +72,7 @@ const {
     buildPromptMock,
     runReActLoopMock,
     probeQueryMock,
+    loadConversationMock,
   };
 });
 
@@ -143,6 +146,29 @@ vi.mock('@/runtime/prompt/build-prompt-from-packet.js', () => ({
 vi.mock('@/runtime/context-packet/decision-packet-stub.js', () => ({
   createDecisionPacketStub: vi.fn(),
 }));
+vi.mock('@/runtime/decision/integration.js', () => ({
+  runDecisionEngineForTurn: vi.fn().mockResolvedValue({
+    engine_ran: true,
+    result: {
+      block: false,
+      packet: {
+        action_mode: 'respond',
+        tool_permissions: {
+          allowed_tools: [],
+          blocked_tools: [],
+          requires_confirmation: [],
+        },
+        risk_profile: {
+          level: 'low',
+          reasons: [],
+          requires_human_review: false,
+        },
+        routing: { agent_id: 'primary', candidate_skill_ids: [] },
+      },
+    },
+  }),
+  DecisionEngineFailClosedError: class DecisionEngineFailClosedError extends Error {},
+}));
 vi.mock('@/runtime/context-packet/production-builder-set.js', () => ({
   getProductionBuilderSet: vi.fn(() => ({ builders: {}, cache: {} })),
 }));
@@ -158,6 +184,7 @@ vi.mock('@/db/repositories.js', () => ({
     findOwnerByIdCrossTenant: findOwnerByIdCrossTenantMock,
   },
   conversasRepo: {
+    byIdWithPessoa: loadConversationMock,
     touch: vi.fn().mockResolvedValue(undefined),
     mergeMetadata: vi.fn().mockResolvedValue(undefined),
   },
@@ -166,9 +193,66 @@ vi.mock('@/db/repositories.js', () => ({
     findById: vi.fn().mockResolvedValue(null),
   },
   procedureDefinitionsRepo: { findById: vi.fn().mockResolvedValue(null) },
-  procedureSelectorDecisionsRepo: { record: vi.fn().mockResolvedValue(undefined) },
-  channelPoliciesRepo: { getByChannelId: vi.fn().mockResolvedValue(null) },
-  rolesRepo: { listActive: vi.fn().mockResolvedValue([]), getById: vi.fn().mockResolvedValue(null) },
+  procedureSelectorDecisionsRepo: {
+    record: vi.fn().mockResolvedValue(undefined),
+  },
+  agentAudienceProfilesRepo: {
+    findByPessoa: vi.fn().mockResolvedValue({
+      id: "aud-1",
+      tenant_id: "primary",
+      agent_id: "primary",
+      pessoa_id: "p1",
+      audience_type: "owner",
+      trust_level: "trusted_internal",
+      status: "active",
+      permission_profile_ids: [],
+      labels: [],
+      metadata: {},
+    }),
+  },
+  channelPoliciesRepo: {
+    getByChannelId: vi.fn(async (channel_id: string) => ({
+      id: "policy-1",
+      tenant_id: "primary",
+      agent_id: "primary",
+      channel_id,
+      default_role_id: "role-default",
+      switch_behavior: "fixed",
+      announce_mode: "never",
+      by_context_guards: {},
+      allowed_role_ids: [],
+    })),
+  },
+  rolesRepo: {
+    listActive: vi.fn().mockResolvedValue([
+      {
+        id: "role-default",
+        tenant_id: "primary",
+        agent_id: "primary",
+        role_key: "default",
+        display_name: "Default",
+        description: null,
+        prompt_addendum: null,
+        granted_packs: [],
+        active: true,
+        is_default: true,
+        metadata: {},
+      },
+    ]),
+    getById: vi.fn().mockResolvedValue({
+      id: "role-default",
+      tenant_id: "primary",
+      agent_id: "primary",
+      role_key: "default",
+      display_name: "Default",
+      description: null,
+      prompt_addendum: null,
+      granted_packs: [],
+      active: true,
+      is_default: true,
+      metadata: {},
+    }),
+  },
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn().mockResolvedValue(null) },
   pessoasRepo: { findById: vi.fn(), findByPhone: vi.fn().mockResolvedValue(null) },
   skillsRepo: {},
@@ -316,6 +400,25 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     // happy-path specs never reach the owner re-check. Race specs override.
     adoptToResolvedTenantMock.mockResolvedValue(true);
     findOwnerByIdCrossTenantMock.mockResolvedValue(null);
+    loadConversationMock.mockResolvedValue({
+      conversa: {
+        id: "c1",
+        pessoa_id: "p1",
+        status: "ativa",
+        metadata: {},
+        channel_id: null,
+      },
+      pessoa: {
+        id: "p1",
+        tenant_id: "primary",
+        agent_id: "primary",
+        telefone_whatsapp: "+5511888888888",
+        nome: "Usr",
+        tipo: "owner",
+        status: "ativa",
+        preferencias: {},
+      },
+    });
 
     findMensagemMock.mockResolvedValue({
       id: 'msg1',
@@ -355,6 +458,12 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       totalTokens: 10,
       outboundText: 'resposta',
       toolsCalled: [],
+      delivery: {
+        dispatched: true,
+        exitReason: 'empty_final_text',
+        persistUnknown: false,
+        sideEffectsCommitted: false,
+      },
     });
   });
 
@@ -389,9 +498,116 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       tenant_id: 'primary',
       agent_id: 'primary',
     });
+    expect(runReActLoopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversa: expect.objectContaining({ channel_id: 'primary-channel-uuid' }),
+      }),
+    );
   });
 
-  it('multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
+  it("bloqueia quando o canal resolvido diverge do canal persistido na conversa", async () => {
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: "primary",
+      agent_id: "primary",
+      channel_id: "ch-resolved",
+    });
+    loadConversationMock.mockResolvedValueOnce({
+      conversa: {
+        id: "c1",
+        pessoa_id: "p1",
+        status: "ativa",
+        metadata: {},
+        channel_id: "ch-other",
+      },
+      pessoa: {
+        id: "p1",
+        tenant_id: "primary",
+        agent_id: "primary",
+        telefone_whatsapp: "+5511888888888",
+        nome: "Usr",
+        tipo: "owner",
+        status: "ativa",
+        preferencias: {},
+      },
+    });
+
+    const { runAgentForMensagem } = await import("@/agent/core.js");
+    await runAgentForMensagem("msg1");
+
+    expect(auditMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: "channel_resolution_failed",
+        metadata: expect.objectContaining({
+          error_code: "channel_scope_mismatch",
+          channel_bindings: {
+            resolver: "ch-resolved",
+            conversation: "ch-other",
+          },
+        }),
+      }),
+    );
+    expect(buildPromptMock).not.toHaveBeenCalled();
+    expect(runReActLoopMock).not.toHaveBeenCalled();
+  });
+
+  it("bloqueia quando o canal persistido no inbound diverge da conversa resolvida", async () => {
+    resolveChannelMock.mockResolvedValueOnce({
+      tenant_id: "primary",
+      agent_id: "primary",
+      channel_id: "ch-resolved",
+    });
+    findMensagemMock.mockResolvedValueOnce({
+      id: "msg1",
+      conversa_id: "c1",
+      channel_id: "ch-inbound",
+      direcao: "in",
+      tipo: "texto",
+      conteudo: "oi",
+      metadata: { telefone: "+5511888888888" },
+      processada_em: null,
+      created_at: new Date(),
+    });
+    loadConversationMock.mockResolvedValueOnce({
+      conversa: {
+        id: "c1",
+        pessoa_id: "p1",
+        status: "ativa",
+        metadata: {},
+        channel_id: "ch-resolved",
+      },
+      pessoa: {
+        id: "p1",
+        tenant_id: "primary",
+        agent_id: "primary",
+        telefone_whatsapp: "+5511888888888",
+        nome: "Usr",
+        tipo: "owner",
+        status: "ativa",
+        preferencias: {},
+      },
+    });
+
+    const { runAgentForMensagem } = await import("@/agent/core.js");
+    await runAgentForMensagem("msg1");
+
+    expect(auditMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: "channel_resolution_failed",
+        metadata: expect.objectContaining({
+          error_code: "channel_scope_mismatch",
+          channel_bindings: {
+            resolver: "ch-resolved",
+            inbound: "ch-inbound",
+            conversation: "ch-resolved",
+          },
+        }),
+      }),
+    );
+    expect(buildPromptMock).not.toHaveBeenCalled();
+    expect(runReActLoopMock).not.toHaveBeenCalled();
+  });
+
+  it("multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext", async () => {
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -687,6 +903,25 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     // Override probe: primeiro call (probeMessageForChannel) retorna mensagem
     // sem telefone na metadata → probe null.
     probeQueryMock.mockResolvedValueOnce([{ metadata: {} }]);
+    loadConversationMock.mockResolvedValueOnce({
+      conversa: {
+        id: "c1",
+        pessoa_id: "p1",
+        status: "ativa",
+        metadata: {},
+        channel_id: "ch-fallback",
+      },
+      pessoa: {
+        id: "p1",
+        tenant_id: "primary",
+        agent_id: "primary",
+        telefone_whatsapp: "+5511888888888",
+        nome: "Usr",
+        tipo: "owner",
+        status: "ativa",
+        preferencias: {},
+      },
+    });
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
     // NÃO propaga erro — probe-null é tratado como turno single-tenant primary/primary.

@@ -36,15 +36,24 @@ import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import { auditTx } from '@/governance/audit.js';
 import { statusList } from './turn-fence-sql.js';
 import {
+  completeRecoveredOutboundTurnInTx,
+  recordRecoveredOutboundTurnCommitted,
+  type TurnTransitionResult,
+} from './turn-repos.js';
+import {
   DELIVERY_CLAIMABLE_STATUSES,
   DELIVERY_TAKEOVER_STATUSES,
 } from '@/runtime/outbound/delivery-contract.js';
 import {
   MANUAL_REARM_SOURCE_STATUSES,
+  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES,
   type OutboundDeadLetterReason,
 } from '@/runtime/outbound/recovery-contract.js';
 import { TERMINAL_TURN_STATUSES } from '@/runtime/turns/contract.js';
-import type { OutboundDeliveryOutcome, OutboundPayloadType } from '@/runtime/outbound/contract.js';
+import type {
+  OutboundDeliveryOutcome,
+  OutboundPayloadType,
+} from '@/runtime/outbound/contract.js';
 
 /**
  * Um par (tenant, agent) com trabalho de recuperação. O dispatcher enumera
@@ -63,6 +72,35 @@ export type RecoveryCandidate = {
   /** Idade da linha em ms, calculada pelo relógio do BANCO. */
   age_ms: number;
 };
+
+/** Turno potencialmente fechável; o método transacional revalida tudo. */
+export type FinalizableTurnCandidate = { turn_id: string };
+
+/** Diagnóstico agregado de turnos finais que não comprovam entrega. */
+export type NoSuccessTurnSummary = { pending_count: number };
+
+type SuccessfulTurnTransition = Extract<TurnTransitionResult, { ok: true }>;
+
+export type OutboundTurnFinalizationResult =
+  | {
+      finalized: false;
+      reason:
+        | 'not_eligible'
+        | 'no_artifacts'
+        | 'artifacts_unresolved'
+        | 'no_success';
+    }
+  | {
+      finalized: true;
+      outcome: 'reply_delivered' | 'fallback_delivered';
+      artifact_count: number;
+      successful_count: number;
+      transition: SuccessfulTurnTransition;
+    };
+
+const FINAL_ARTIFACT_STATUS = new Set<string>(
+  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES,
+);
 
 /**
  * #506 §Auditoria mínima — a correlação devolvida pelos CAS da reconciliação.
@@ -92,7 +130,8 @@ export const outboundRecoveryRepo = {
    * Os pares (tenant, agent) que têm QUALQUER trabalho de recuperação.
    *
    * Roda FORA de contexto de tenant — é o dispatcher. As três pernas do `OR`
-   * são exatamente as três varreduras, e cada uma casa com um índice:
+   * cobrem o trabalho por artefato; a perna `UNION` cobre turnos cujo outbox já
+   * está inteiramente final, inclusive rows `completed` legadas:
    *
    *   - `pending`/`retryable` vencidas   → `idx_outbound_messages_ready` (121);
    *   - claim com lease vencida          → `idx_outbound_messages_expired_claims` (131);
@@ -142,6 +181,164 @@ export const outboundRecoveryRepo = {
       reconciliationStatement(getCurrentTenant(), getCurrentAgent(), limit),
     );
     return mapCandidates(result.rows);
+  },
+
+  /**
+   * Turnos cujo conjunto de artefatos parece convergido. A lista é apenas uma
+   * eleição barata; `finalizeResolvedTurnTx` repete todas as guardas sob locks.
+   */
+  async listFinalizableTurns(
+    limit: number,
+  ): Promise<FinalizableTurnCandidate[]> {
+    const result = await db.execute<FinalizableTurnCandidate>(
+      finalizableTurnsStatement(getCurrentTenant(), getCurrentAgent(), limit),
+    );
+    return Array.from(result.rows as unknown as FinalizableTurnCandidate[]);
+  },
+
+  /**
+   * Quantos turnos estão quiescentes mas não têm nenhum artefato `completed`.
+   *
+   * Isto é diagnóstico, não eleição de trabalho: fica fora do `LIMIT` da
+   * finalização para que um backlog sem política terminal nunca impeça turnos
+   * realmente concluíveis de liberar suas streams.
+   */
+  async countFinalTurnsWithoutSuccess(): Promise<number> {
+    const result = await db.execute<NoSuccessTurnSummary>(
+      noSuccessTurnsSummaryStatement(getCurrentTenant(), getCurrentAgent()),
+    );
+    return Number(
+      (result.rows as unknown as NoSuccessTurnSummary[])[0]?.pending_count ?? 0,
+    );
+  },
+
+  /**
+   * Terminaliza `agent_turns` somente depois de provar quiescência multipart.
+   *
+   * Ordem dos locks: TURNO primeiro, artefatos depois. É a mesma ordem do
+   * commit outbound, que atualiza o turno antes de inserir uma parte. A lease
+   * expirada torna o recovery a nova autoridade; rows sem claim/lease falham
+   * fechado porque não oferecem selo confiável de que o produtor terminou.
+   */
+  async finalizeResolvedTurnTx(
+    turn_id: string,
+  ): Promise<OutboundTurnFinalizationResult> {
+    const tenant_id = getCurrentTenant();
+    const agent_id = getCurrentAgent();
+
+    const result = await withTx(
+      async (tx): Promise<OutboundTurnFinalizationResult> => {
+        const lockedTurn = await tx.execute<{
+          id: string;
+          state_version: number | string;
+          conversa_id: string | null;
+          representative_message_id: string;
+        }>(sql`
+        SELECT id, state_version, conversa_id, representative_message_id
+          FROM ${agent_turns}
+         WHERE tenant_id       = ${tenant_id}
+           AND agent_id        = ${agent_id}
+           AND id              = ${turn_id}::uuid
+           AND status          = 'outbound_pending'
+           AND claim_token     IS NOT NULL
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at <= now()
+         FOR UPDATE SKIP LOCKED
+      `);
+        const turn = Array.from(
+          lockedTurn.rows as unknown as Array<{
+            id: string;
+            state_version: number | string;
+            conversa_id: string | null;
+            representative_message_id: string;
+          }>,
+        )[0];
+        if (!turn) return { finalized: false, reason: 'not_eligible' };
+
+        const lockedArtifacts = await tx.execute<{
+          id: string;
+          status: string;
+          payload_type: string | null;
+        }>(sql`
+        SELECT id, status, payload_type
+          FROM ${outbound_messages}
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND turn_id   = ${turn_id}::uuid
+         ORDER BY sequence_in_turn ASC
+         FOR UPDATE
+      `);
+        const artifacts = Array.from(
+          lockedArtifacts.rows as unknown as Array<{
+            id: string;
+            status: string;
+            payload_type: string | null;
+          }>,
+        );
+        if (artifacts.length === 0)
+          return { finalized: false, reason: 'no_artifacts' };
+        if (
+          artifacts.some(
+            (artifact) => !FINAL_ARTIFACT_STATUS.has(artifact.status),
+          )
+        ) {
+          return { finalized: false, reason: 'artifacts_unresolved' };
+        }
+
+        const successful = artifacts.filter(
+          (artifact) => artifact.status === 'completed',
+        );
+        if (successful.length === 0)
+          return { finalized: false, reason: 'no_success' };
+
+        const outcome = successful.every(
+          (artifact) => artifact.payload_type === 'status_fallback',
+        )
+          ? 'fallback_delivered'
+          : 'reply_delivered';
+        const transition = await completeRecoveredOutboundTurnInTx(tx, {
+          turn_id,
+          expected_version: Number(turn.state_version),
+          outcome,
+        });
+
+        const status_counts = artifacts.reduce<Record<string, number>>(
+          (counts, artifact) => {
+            counts[artifact.status] = (counts[artifact.status] ?? 0) + 1;
+            return counts;
+          },
+          {},
+        );
+        await auditTx(tx, {
+          acao: 'outbound_turn_finalized',
+          ...(turn.conversa_id ? { conversa_id: turn.conversa_id } : {}),
+          mensagem_id: turn.representative_message_id,
+          alvo_id: turn.id,
+          entidade_alvo: 'agent_turns',
+          metadata: {
+            source: 'outbound_recovery',
+            outcome,
+            artifact_count: artifacts.length,
+            successful_count: successful.length,
+            partial_delivery: successful.length < artifacts.length,
+            status_counts,
+          },
+        });
+
+        return {
+          finalized: true,
+          outcome,
+          artifact_count: artifacts.length,
+          successful_count: successful.length,
+          transition,
+        };
+      },
+    );
+
+    if (result.finalized) {
+      recordRecoveredOutboundTurnCommitted({ outcome: result.outcome });
+    }
+    return result;
   },
 
   /**
@@ -238,7 +435,9 @@ export const outboundRecoveryRepo = {
    * `maia_outbound_pending_age_seconds`. Um `reconciling` que envelhece é o
    * alarme — se ele saísse da fila, "escalado" viraria sinônimo de "esquecido".
    */
-  async markReconciling(input: { outbound_id: string }): Promise<{ marked: boolean }> {
+  async markReconciling(input: {
+    outbound_id: string;
+  }): Promise<{ marked: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     // #506 §Auditoria mínima — `outbound.reconciliation_started`, na MESMA
@@ -277,7 +476,8 @@ export const outboundRecoveryRepo = {
           // Por que a plataforma parou: o provedor não deduplica este
           // `payload_type`, então reenviar produziria uma SEGUNDA mensagem.
           // É o fundamento da espera humana, e ele pertence à trilha.
-          escalation_reason: 'provider_idempotency_unavailable_for_payload_type',
+          escalation_reason:
+            'provider_idempotency_unavailable_for_payload_type',
         },
       });
       return { marked: true };
@@ -352,7 +552,14 @@ export const outboundRecoveryRepo = {
    * É a operação da falha #12 da issue-mãe, e o que a torna segura NÃO está
    * aqui: está em `manualRearmRefusal` (recovery-contract.ts), que o chamador
    * (`src/ops/outbound-rearm.ts`) consulta ANTES. O que está aqui é a rede
-   * estrutural — o CAS por lista fechada de origem — e a trilha.
+   * estrutural — o CAS por lista fechada de origem, o fence do turno pai — e a
+   * trilha.
+   *
+   * Para artefatos duráveis, a ordem de locks é a mesma do commit/finalizer:
+   * TURNO primeiro, artefato depois. Rearmar uma parte cujo pai já saiu de
+   * `outbound_pending` seria reabrir entrega depois de o sucessor poder ter
+   * avançado; por isso a operação falha fechado nesse estado. Rows legadas sem
+   * `turn_id` continuam sob o CAS do próprio artefato.
    *
    * O `acknowledged_duplicate_risk` vai para a auditoria mesmo quando é
    * `false`: o que se quer reconstruir depois é "o operador foi avisado e
@@ -372,6 +579,39 @@ export const outboundRecoveryRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     return withTx(async (tx) => {
+      // Leitura sem lock apenas para descobrir a associação. O `turn_id` lido
+      // volta ao WHERE do UPDATE com `IS NOT DISTINCT FROM`, então uma mudança
+      // concorrente da associação não abre um bypass.
+      const associated = await tx.execute<{ turn_id: string | null }>(sql`
+        SELECT turn_id
+          FROM ${outbound_messages}
+         WHERE tenant_id = ${tenant_id}
+           AND agent_id  = ${agent_id}
+           AND id        = ${input.outbound_id}::uuid
+         LIMIT 1
+      `);
+      const association = Array.from(
+        associated.rows as unknown as Array<{ turn_id: string | null }>,
+      )[0];
+      if (!association) return { rearmed: false };
+
+      if (association.turn_id !== null) {
+        // Lock do TURNO antes do artefato. Se o finalizer venceu a corrida, o
+        // predicado é reavaliado após a espera e devolve zero; se o rearme
+        // venceu, ele impede o finalizer de fechar o pai até o artefato virar
+        // `retryable`, que torna o conjunto multipart não resolvido.
+        const parent = await tx.execute<{ id: string }>(sql`
+          SELECT id
+            FROM ${agent_turns}
+           WHERE tenant_id = ${tenant_id}
+             AND agent_id  = ${agent_id}
+             AND id        = ${association.turn_id}::uuid
+             AND status    = 'outbound_pending'
+           FOR UPDATE
+        `);
+        if (parent.rows.length === 0) return { rearmed: false };
+      }
+
       const moved = await tx.execute(sql`
         UPDATE ${outbound_messages}
            SET status           = 'retryable',
@@ -383,7 +623,9 @@ export const outboundRecoveryRepo = {
          WHERE tenant_id = ${tenant_id}
            AND agent_id  = ${agent_id}
            AND id        = ${input.outbound_id}::uuid
+           AND turn_id IS NOT DISTINCT FROM ${association.turn_id}::uuid
            AND status    IN (${statusList(MANUAL_REARM_SOURCE_STATUSES)})
+           AND status    = ${input.from_status}
         RETURNING id
       `);
       if (moved.rows.length === 0) return { rearmed: false };
@@ -460,7 +702,9 @@ export const outboundRecoveryRepo = {
                )
              )
     `);
-    return Number((result.rows as unknown as Array<{ n: string }>)[0]?.n ?? 0) > 0;
+    return (
+      Number((result.rows as unknown as Array<{ n: string }>)[0]?.n ?? 0) > 0
+    );
   },
 
   /**
@@ -559,7 +803,11 @@ export const outboundRecoveryRepo = {
     conversa_id: string;
     in_reply_to: string;
     channel_id: string | null;
-    historico: { tipo: string; conteudo: string; metadata: Record<string, unknown> };
+    historico: {
+      tipo: string;
+      conteudo: string;
+      metadata: Record<string, unknown>;
+    };
   }): Promise<{ completed: boolean; history_message_id: string | null }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -576,7 +824,8 @@ export const outboundRecoveryRepo = {
            AND status    = 'delivered'
         RETURNING id
       `);
-      if (moved.rows.length === 0) return { completed: false, history_message_id: null };
+      if (moved.rows.length === 0)
+        return { completed: false, history_message_id: null };
 
       // `midia_url: null` LITERAL — a política de retenção de #635 §Retenção,
       // estrutural e não por limpeza posterior. Ver `historico.ts`.
@@ -598,7 +847,11 @@ export const outboundRecoveryRepo = {
         // O `where` é o PREDICADO do índice parcial: sem ele o PostgreSQL não
         // infere `mensagens_outbound_history_uq` como alvo do `ON CONFLICT`.
         .onConflictDoNothing({
-          target: [mensagens.tenant_id, mensagens.agent_id, mensagens.outbound_id],
+          target: [
+            mensagens.tenant_id,
+            mensagens.agent_id,
+            mensagens.outbound_id,
+          ],
           where: sql`${mensagens.outbound_id} IS NOT NULL`,
         })
         .returning({ id: mensagens.id });
@@ -728,7 +981,9 @@ export const outboundRecoveryRepo = {
    * entregue" é a que interessa ao operador: tudo que não é `completed` e não é
    * terminal por decisão (`failed_terminal`, `cancelled`, `dead_letter`). Uma
    * `delivered` sem histórico CONTA — a mensagem chegou, mas o ciclo não
-   * fechou, e é isso que a série mede.
+   * fechou. Artefatos finais também contam enquanto o turno pai continuar em
+   * `outbound_pending`: isto mantém visível o caso fail-closed em que nenhuma
+   * parte comprova entrega e ainda não existe política para terminalizar o pai.
    *
    * Zero quando não há nada pendente. Zero e "não medido" são o mesmo ponto
    * aqui de propósito: a série só existe por escopo com linha durável, e um
@@ -738,21 +993,32 @@ export const outboundRecoveryRepo = {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const result = await db.execute<{ age_seconds: string | null }>(sql`
-      SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - created_at))), 0) AS age_seconds
-        FROM ${outbound_messages}
-       WHERE tenant_id = ${tenant_id}
-         AND agent_id  = ${agent_id}
-         AND turn_id IS NOT NULL
-         AND status NOT IN (
-           'completed', 'failed_terminal', 'cancelled', 'dead_letter',
-           -- vocabulário legado da 063: uma row do caminho síncrono antigo não
-           -- pertence a esta série (ela nunca teve turn_id, mas o predicado
-           -- fica explícito para que a série não mude de significado se um dia
-           -- alguém fizer backfill).
-           'sent', 'failed', 'unknown'
+      SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - o.created_at))), 0) AS age_seconds
+        FROM ${outbound_messages} o
+       WHERE o.tenant_id = ${tenant_id}
+         AND o.agent_id  = ${agent_id}
+         AND o.turn_id IS NOT NULL
+         AND (
+           o.status NOT IN (
+             'completed', 'failed_terminal', 'cancelled', 'dead_letter',
+             -- vocabulário legado da 063: uma row do caminho síncrono antigo
+             -- não pertence a esta série, salvo se estiver ligada a um turno
+             -- durável ainda pendente pelo segundo ramo abaixo.
+             'sent', 'failed', 'unknown'
+           )
+           OR EXISTS (
+             SELECT 1
+               FROM ${agent_turns} t
+              WHERE t.tenant_id = o.tenant_id
+                AND t.agent_id  = o.agent_id
+                AND t.id        = o.turn_id
+                AND t.status    = 'outbound_pending'
+           )
          )
     `);
-    const raw = (result.rows as unknown as Array<{ age_seconds: string | null }>)[0];
+    const raw = (
+      result.rows as unknown as Array<{ age_seconds: string | null }>
+    )[0];
     return Math.max(0, Math.round(Number(raw?.age_seconds ?? 0)));
   },
 
@@ -778,7 +1044,10 @@ export const outboundRecoveryRepo = {
   async countTurnOutboundDivergence(): Promise<TurnOutboundDivergence> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const result = await db.execute<{ pending_sem_outbound: string; outbound_sem_turno: string }>(sql`
+    const result = await db.execute<{
+      pending_sem_outbound: string;
+      outbound_sem_turno: string;
+    }>(sql`
       SELECT
         (SELECT count(*)
            FROM ${agent_turns} t
@@ -808,10 +1077,12 @@ export const outboundRecoveryRepo = {
             AND t.status IN (${statusList(TERMINAL_TURN_STATUSES)})
         ) AS outbound_sem_turno
     `);
-    const row = (result.rows as unknown as Array<{
-      pending_sem_outbound: string;
-      outbound_sem_turno: string;
-    }>)[0];
+    const row = (
+      result.rows as unknown as Array<{
+        pending_sem_outbound: string;
+        outbound_sem_turno: string;
+      }>
+    )[0];
     return {
       turn_pending_without_outbound: Number(row?.pending_sem_outbound ?? 0),
       outbound_without_live_turn: Number(row?.outbound_sem_turno ?? 0),
@@ -895,7 +1166,10 @@ export const outboundRecoveryRepo = {
   } | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
-    const result = await db.execute<{ conversa_id: string; in_reply_to: string }>(sql`
+    const result = await db.execute<{
+      conversa_id: string;
+      in_reply_to: string;
+    }>(sql`
       SELECT conversa_id, in_reply_to
         FROM ${outbound_messages}
        WHERE tenant_id = ${tenant_id}
@@ -904,13 +1178,18 @@ export const outboundRecoveryRepo = {
        LIMIT 1
     `);
     return (
-      (result.rows as unknown as Array<{ conversa_id: string; in_reply_to: string }>)[0] ?? null
+      (
+        result.rows as unknown as Array<{
+          conversa_id: string;
+          in_reply_to: string;
+        }>
+      )[0] ?? null
     );
   },
 };
 
 // ---------------------------------------------------------------------------
-// AS TRÊS VARREDURAS, COMO DECLARAÇÕES REUTILIZÁVEIS
+// AS VARREDURAS, COMO DECLARAÇÕES REUTILIZÁVEIS
 //
 // Cada uma existe como FUNÇÃO que devolve o `sql` — e não inline no método —
 // por uma razão só, e é a mesma de `turn-fence-sql.ts` (#504): assim o TESTE
@@ -940,11 +1219,121 @@ export function scopesWithWorkStatement() {
                  AND lease_expires_at <= now())
             OR status IN ('delivery_unknown', 'reconciling', 'delivered')
          )
+      UNION
+      SELECT DISTINCT t.tenant_id, t.agent_id
+        FROM ${agent_turns} t
+       WHERE t.tenant_id       IS NOT NULL
+         AND t.agent_id        IS NOT NULL
+         AND t.status          = 'outbound_pending'
+         AND t.claim_token     IS NOT NULL
+         AND t.lease_expires_at IS NOT NULL
+         AND t.lease_expires_at <= now()
+         AND EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+              AND o.status NOT IN (${statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES)})
+         )
+    `;
+}
+
+/** Turnos escopados que têm sucesso comprovado e podem ser fechados sob lock. */
+export function finalizableTurnsStatement(
+  tenant_id: string,
+  agent_id: string,
+  limit: number,
+) {
+  return sql`
+      SELECT t.id AS turn_id
+        FROM ${agent_turns} t
+       WHERE t.tenant_id       = ${tenant_id}
+         AND t.agent_id        = ${agent_id}
+         AND t.status          = 'outbound_pending'
+         AND t.claim_token     IS NOT NULL
+         AND t.lease_expires_at IS NOT NULL
+         AND t.lease_expires_at <= now()
+         AND EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+              AND o.status    = 'completed'
+         )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+              AND o.status NOT IN (${statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES)})
+         )
+       ORDER BY t.lease_expires_at ASC, t.created_at ASC
+       LIMIT ${limit}
+    `;
+}
+
+/**
+ * Diagnóstico agregado, sem `LIMIT`, dos turnos finais sem entrega comprovada.
+ *
+ * A consulta é separada da eleição acima por justiça: estes turnos não podem
+ * transicionar sem uma política de produto e, portanto, jamais devem ocupar a
+ * janela finita reservada a trabalho que efetivamente progride.
+ */
+export function noSuccessTurnsSummaryStatement(
+  tenant_id: string,
+  agent_id: string,
+) {
+  return sql`
+      SELECT COUNT(*)::int AS pending_count
+        FROM ${agent_turns} t
+       WHERE t.tenant_id        = ${tenant_id}
+         AND t.agent_id         = ${agent_id}
+         AND t.status           = 'outbound_pending'
+         AND t.claim_token      IS NOT NULL
+         AND t.lease_expires_at IS NOT NULL
+         AND t.lease_expires_at <= now()
+         AND EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+              AND o.status NOT IN (${statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES)})
+         )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM ${outbound_messages} o
+            WHERE o.tenant_id = t.tenant_id
+              AND o.agent_id  = t.agent_id
+              AND o.turn_id   = t.id
+              AND o.status    = 'completed'
+         )
     `;
 }
 
 /** A varredura ESCOPADA do trabalho entregável — inclui o TAKEOVER. */
-export function deliverableStatement(tenant_id: string, agent_id: string, limit: number) {
+export function deliverableStatement(
+  tenant_id: string,
+  agent_id: string,
+  limit: number,
+) {
   return sql`
       SELECT id, status, attempt, payload_type, delivery_outcome,
              EXTRACT(EPOCH FROM (now() - created_at)) * 1000 AS age_ms
@@ -965,7 +1354,11 @@ export function deliverableStatement(tenant_id: string, agent_id: string, limit:
 }
 
 /** A varredura ESCOPADA da fila de reconciliação. */
-export function reconciliationStatement(tenant_id: string, agent_id: string, limit: number) {
+export function reconciliationStatement(
+  tenant_id: string,
+  agent_id: string,
+  limit: number,
+) {
   return sql`
       SELECT id, status, attempt, payload_type, delivery_outcome,
              EXTRACT(EPOCH FROM (now() - created_at)) * 1000 AS age_ms
@@ -986,7 +1379,11 @@ export function reconciliationStatement(tenant_id: string, agent_id: string, lim
  * dos dois estar ausente. Isolado, a pergunta "o predicado de takeover é
  * indexado?" tem uma resposta só.
  */
-export function takeoverOnlyStatement(tenant_id: string, agent_id: string, limit: number) {
+export function takeoverOnlyStatement(
+  tenant_id: string,
+  agent_id: string,
+  limit: number,
+) {
   return sql`
       SELECT id, status, attempt
         FROM ${outbound_messages}

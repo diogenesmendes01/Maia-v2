@@ -62,19 +62,16 @@
  * física de saída. Mesmo papel do `LineOutput` falso de
  * `tests/integration/outbound-auditoria-ciclo-real-db.spec.ts`.
  *
- *   POR QUE ELE, e não um `channels` semeado de verdade: `findPrimaryCatchAll
- *   Channel` (`src/db/repositories/channel-repos.ts:250`) trata a existência de
- *   QUALQUER canal ativo de tenant != `primary` como prova de deployment
- *   multi-tenant e desliga o catch-all single-tenant — para a rodada INTEIRA,
- *   não só para este arquivo. No CI o banco de integração é um só para todas as
- *   specs. Semear um canal ativo sob um tenant próprio quebraria suítes
- *   alheias; é o mesmo motivo já registrado em
- *   `tests/integration/turn-claim-core-barrier-real-db.spec.ts`.
- *   O preço: a validação de escopo do `LineOutput` real (triplete, canal ativo)
- *   não é exercida aqui. Ela já é coberta pelas suítes de #631/#632/#633.
+ *   POR QUE ELE, mesmo com a governança do canal semeada: o gate de role exige
+ *   um canal, uma policy e um role reais. O canal desta suíte fica INATIVO para
+ *   não alterar o `findPrimaryCatchAllChannel` da rodada compartilhada; por
+ *   isso ele não pode alimentar o `LineOutput` real. O preço continua o mesmo:
+ *   a validação de escopo do egress (triplete, canal ativo) não é exercida
+ *   aqui. Ela já é coberta pelas suítes de #631/#632/#633.
  *
- * DUBLÊ 3 — `resolveChannel`, pelo mesmo motivo do dublê 2: sem canal semeado
- * não há o que resolver, e o roteamento não é o que estes casos medem.
+ * DUBLÊ 3 — `resolveChannel`: devolve o id REAL do canal inativo semeado para
+ * a policy, sem exigir uma segunda linha ativa nem testar o catch-all. O
+ * roteamento físico não é o que estes casos medem.
  *
  * DUBLÊ 4 — `@/gateway/queue.js` e `@/gateway/baileys.js`: importar
  * `@/agent/core.js` abriria uma Queue da BullMQ e um socket do WhatsApp.
@@ -131,6 +128,7 @@ const envAnterior = vi.hoisted(() => {
 
 const T = 'e703-tenant';
 const A = 'e703-agent';
+const channelFixture = vi.hoisted(() => ({ id: null as string | null }));
 
 // ── DUBLÊ 4: a infraestrutura de transporte ────────────────────────────────
 vi.mock('@/gateway/queue.js', () => ({
@@ -158,7 +156,7 @@ vi.mock('@/gateway/baileys.js', () => ({
 // ── DUBLÊ 3: o roteamento ──────────────────────────────────────────────────
 vi.mock('@/gateway/channel-resolver.js', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
-  resolveChannel: async () => ({ tenant_id: T, agent_id: A, channel_id: null }),
+  resolveChannel: async () => ({ tenant_id: T, agent_id: A, channel_id: channelFixture.id }),
 }));
 
 /**
@@ -177,7 +175,7 @@ vi.mock('@/gateway/line-output.js', async (orig) => {
   return {
     ...actual,
     forCurrentAgentChannel: async () => ({
-      scope: { tenant_id: T, agent_id: A, channel_id: 'e703-linha' },
+      scope: { tenant_id: T, agent_id: A, channel_id: channelFixture.id as string },
       async sendText(jid: string, text: string) {
         linha.enviados.push({ jid, texto: text });
         return `wa-${randomUUID()}`;
@@ -392,6 +390,25 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
       [A, T],
     );
 
+    // Governança explícita do hot path. O canal permanece inativo para não
+    // interferir no catch-all compartilhado; o resolver dublê devolve seu id.
+    const role = await pool.query<{ id: string }>(
+      `INSERT INTO roles(tenant_id, agent_id, role_key, display_name, is_default, active)
+       VALUES ($1,$2,'default','E703 Default',true,true) RETURNING id`,
+      [T, A],
+    );
+    const channel = await pool.query<{ id: string }>(
+      `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp','+5500000000703','Linha E703',false,false) RETURNING id`,
+      [T, A],
+    );
+    channelFixture.id = channel.rows[0]!.id;
+    await pool.query(
+      `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+       VALUES ($1,$2,$3,$4,'free_with_trigger')`,
+      [T, A, channelFixture.id, role.rows[0]!.id],
+    );
+
     // O DONO.
     const p = await pool.query<{ id: string }>(
       `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
@@ -453,6 +470,7 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
   afterAll(async () => {
     vi.restoreAllMocks();
     await limparTenant();
+    channelFixture.id = null;
     for (const [k, v] of Object.entries(envAnterior)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
