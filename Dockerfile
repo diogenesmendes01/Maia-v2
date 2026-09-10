@@ -69,8 +69,8 @@ COPY --from=build /app/tsconfig.json ./tsconfig.json
 # alterar o próprio código). Volumes nomeados NOVOS herdam este chown na
 # primeira montagem; volumes de um deployment root-era precisam de um
 # chown único para uid 1001 — ver docs/runbooks/deploy-prod.md.
-RUN mkdir -p /app/.baileys-auth /app/media \
-  && chown -R maia:maia /app/.baileys-auth /app/media
+RUN mkdir -p /app/.baileys-auth /app/media /app/backups \
+  && chown -R maia:maia /app/.baileys-auth /app/media /app/backups
 ENV TZ=America/Sao_Paulo
 EXPOSE 3000
 USER maia

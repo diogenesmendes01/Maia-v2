@@ -34,7 +34,7 @@ export const CRITICAL_TABLES: readonly string[] = Object.freeze([
   'conversas',
   'mensagens',
   'transacoes',
-  'audit_logs',
+  'audit_log',
   'agent_turns',
   'data_tombstones',
   'backup_runs',
@@ -213,7 +213,7 @@ export const RESTORE_DRILL_PROBES: readonly ProbeSpec[] = Object.freeze([
   {
     id: 'audit_trail_readable',
     required: true,
-    sql: `SELECT count(*)::int AS audit_logs FROM audit_logs`,
+    sql: `SELECT count(*)::int AS audit_logs FROM audit_log`,
     grade(row) {
       if (row === null) return QUERY_FAILED;
       const audit_logs = num(row, 'audit_logs');

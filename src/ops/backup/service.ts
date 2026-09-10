@@ -442,7 +442,12 @@ export async function runVerifiedBackup(
     artifact_ref: evidence.locally_verified ? artifactRef(finalPath) : null,
     size_bytes: digest?.bytes ?? null,
     sha256: digest?.sha256 ?? null,
-    encryption_mode: profile.encryption.mode,
+    // This is the mode of the artifact that was actually produced, not the
+    // requested profile mode. An early failure (for example EACCES while
+    // creating BACKUP_DIR) never reaches encryption and therefore has no key
+    // id. Persisting `envelope_aes256_gcm` with a null key id violates
+    // `backup_runs_encryption_key_chk` and strands the run in `running`.
+    encryption_mode: evidence.encrypted ? profile.encryption.mode : 'none',
     encryption_key_id: keyId,
     destination_kind: upload ? 's3' : 'local',
     destination_locator: upload?.locator ?? null,

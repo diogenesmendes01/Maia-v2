@@ -215,4 +215,10 @@ describe('restore drill probes — the suite goes beyond `transacoes`', () => {
       expect(spec('core_tables_present').sql).toContain(`'${table}'`);
     }
   });
+
+  it('checks the audit table that exists in the production schema', () => {
+    expect(CRITICAL_TABLES).toContain('audit_log');
+    expect(CRITICAL_TABLES).not.toContain('audit_logs');
+    expect(spec('audit_trail_readable').sql).toContain('FROM audit_log');
+  });
 });
