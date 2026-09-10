@@ -183,6 +183,18 @@ function envDoDockerfileBuild(): Record<string, string> {
   return out;
 }
 
+/** Conteúdo de um estágio nomeado do Dockerfile, sem alcançar o próximo FROM. */
+function estagioDoDockerfile(nome: string): string {
+  const linhas = dockerfile.split('\n');
+  const inicio = linhas.findIndex((l) => {
+    const m = /^FROM .* AS ([A-Za-z0-9_-]+)$/.exec(l.trim());
+    return m?.[1] === nome;
+  });
+  if (inicio === -1) throw new Error(`estágio \`${nome}\` não encontrado no Dockerfile`);
+  const fim = linhas.findIndex((l, i) => i > inicio && /^FROM /.test(l.trim()));
+  return linhas.slice(inicio, fim === -1 ? linhas.length : fim).join('\n');
+}
+
 /**
  * O contrato do ARTEFATO, extraído do Dockerfile — que é a fonte da verdade
  * sobre o que roda em produção.
@@ -564,6 +576,23 @@ describe('[declaração] o env de build do CI não pode divergir do Dockerfile',
     // divergirem, o CI passa a medir um build que ninguém faz — e foi
     // divergência assim que deixou o build da imagem quebrado por meses.
     expect(doCi).toEqual(doDocker);
+  });
+});
+
+describe('[declaração] a imagem instala os tipos dos módulos raiz usados pelo console', () => {
+  it('o estágio de dependências raiz não remove devDependencies antes do next build', () => {
+    const stage = estagioDoDockerfile('root-build-deps');
+    const installs = stage
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^RUN npm ci\b/.test(line));
+
+    expect(installs, 'o estágio root-build-deps precisa executar um único npm ci').toHaveLength(1);
+    expect(
+      installs[0],
+      '`next build` verifica TypeScript dos módulos compartilhados da raiz; `--omit=dev` ' +
+        'remove os @types declarados no package.json raiz e quebra a imagem do console',
+    ).not.toMatch(/--omit(?:=|\s+)dev\b/);
   });
 });
 

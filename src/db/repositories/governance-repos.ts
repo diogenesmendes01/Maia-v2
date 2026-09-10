@@ -1,4 +1,4 @@
-import { eq, and, inArray, desc, sql } from 'drizzle-orm';
+import { Param, eq, and, inArray, desc, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
@@ -49,7 +49,11 @@ export const WORKFLOW_OPEN_STATUSES = [
  * na hora da consulta mantém esses specs carregando.
  */
 export function workflowOpenStatusesAny(): SQL {
-  return sql`ANY(${[...WORKFLOW_OPEN_STATUSES]})`;
+  // A bare JS array is expanded by Drizzle into `($1, $2, ...)`, which is a
+  // PostgreSQL row expression rather than an array and makes `ANY(...)` fail
+  // with SQLSTATE 42809. Param keeps the values in one node-postgres array
+  // binding, producing the executable `ANY($1)` form.
+  return sql`ANY(${new Param([...WORKFLOW_OPEN_STATUSES])})`;
 }
 
 export const auditRepo = {
