@@ -43,7 +43,7 @@
 | K-13 | Ordem global de locks controle→stream→turno→run→call/projeções + teste de deadlock | §4.1, §5.6.3 | — | teste de deadlock | não iniciado |
 | K-14 | Shadow OFFLINE, sem segunda row aberta em `engine_runs` | §4.1 | — | T60 | não iniciado |
 | K-15 | `agent_engine_policies` / `agent_execution_limits` versionados com CAS | §4.1 | — | — | não iniciado |
-| K-16 | Normalizador de histórico Maia→Hermes (texto canônico; user_message único removido por ID; recusa formatos não suportados) | §4.1 | — | T07 | não iniciado |
+| K-16 | Normalizador de histórico Maia→Hermes (texto canônico; user_message único removido por ID; recusa formatos não suportados) | §4.1 | `src/integrations/hermes/history.ts` — separa o inbound por POSIÇÃO (a remoção por ID canônico já acontece em `prompt-builder.ts`, no `if (m.id === ctx.inbound.id) continue`), recusa `tool_use`/`tool_result`/`image`, preserva o envelope `<user_message>` e recusa estouro de limite em vez de truncar | `tests/unit/hermes-history-normalizer.spec.ts` (19 casos) + verificação por mutação | **verificado** (unit) |
 | K-17 | Compatibilidade de orçamento (5 iterações / 1024 tokens na fixture local; limites finitos no live) | §4.1 | — | — | não iniciado |
 | K-18 | Revisões de fatos não quebram `ON CONFLICT` de `cost-ledger` (ADR ou tabela especializada) | §4.1, §7.4.3 | — | — | bloqueado (D08: decisão verificável no PR de schema) |
 | K-19 | Manifest `maia-hermes-runtime-manifest/v1` estrito, default vazio, sem `maia_*`/`mcp:*`/`all` | §4.2 | — | T21, T53 | não iniciado |

@@ -62,9 +62,15 @@ configuração de produção): PostgreSQL 16.2 compilado com MinGW, vindo do whe
 checksum para conferência — limitação registrada). O caminho inverso (pgvector do pgserver dentro do
 PostgreSQL do EDB) **não** funciona: `could not load library … unknown error 127`.
 
-### V-005 · Redis
+### V-005 · Redis — **BLOQUEADO** (infraestrutura)
 
-Não há Redis real disponível na máquina. Foi levantado `fakeredis` 2.38.0 (`TcpFakeServer`) em `127.0.0.1:56379` **apenas** para satisfazer o `flushRedis` do `tests/globalSetup.ts`. Isso é um **fake explícito**: nenhum gate que dependa de semântica real de Redis/BullMQ (filas, locks, `turn-job-*-real-redis`) pode ser declarado verificado com ele.
+Não há Redis real na máquina (sem Docker, sem distribuição WSL instalada, sem serviço nativo). A tentativa de usar `fakeredis` 2.38.0 (`TcpFakeServer`, `127.0.0.1:56379`) **falhou**: o `ioredis` manda `INFO` no handshake e o servidor responde `ERR unknown command 'info'`, derrubando a conexão (`connect FALHOU: Connection is closed`). Nem o `flushRedis` do `globalSetup` funciona — e ele falha fechado, por desenho.
+
+Os únicos binários de Redis para Windows que localizei são builds de terceiros (projeto `redis-windows`, pacotes Cygwin/MSYS2 de Redis 8.10.1). **Não instalei**: baixar e executar binário de origem não oficial para servir de infraestrutura é decisão do dono, não minha.
+
+Consequência registrada sem maquiagem: **toda spec que exija semântica real de Redis/BullMQ fica NÃO EXECUTADA** e nenhuma delas conta como verificada. Para as specs que dependem só de Postgres uso o procedimento local de dois passos de `SCRATCH/vitest.integracao-local.config.mts` (o primeiro passo deixa o `globalSetup` do projeto criar e migrar o banco; o segundo roda sem `globalSetup`). Isso **não** substitui a rodada do CI.
+
+**O que destravaria:** um Redis 7 real acessível em `REDIS_URL` (contêiner, serviço gerenciado, ou binário aprovado pelo dono). Sem isso, `tests/integration/*real-redis*`, filas BullMQ, locks distribuídos e o kill switch do circuito de LLM permanecem fora de qualquer alegação de verificação.
 
 ### V-006 · Ambiente Python do Hermes pinado
 
@@ -104,9 +110,65 @@ Tratamento nesta sessão: **não corrigi o runner** (fora do escopo autorizado).
 abri tarefa separada e apliquei contorno LOCAL — `core.autocrlf=false` nesta worktree e conversão
 dos `.sql` da árvore de trabalho para LF, sem alterar o índice nem o conteúdo versionado.
 
-### V-007 · Suíte unitária de baseline
+### V-007 · Suíte unitária de baseline (commit `2bbeefe9`, Node 22, `--maxWorkers=3`, sem `TEST_DB_URL`)
 
-Em execução (`node node_modules/vitest/vitest.mjs run --maxWorkers=3`, sem `TEST_DB_URL`, Node 22). Resultado e contagem executados/falharam/pulados serão registrados aqui; a comparação de qualquer falha futura será feita contra ESTE baseline.
+```
+executados=10092  falharam=54  pulados=1027
+```
+
+Mais dois arquivos que **não carregaram** (hooks estourando 20s por falta de Redis):
+`tests/integration/llm-circuit-kill-switch-redis.spec.ts` e `llm-circuit-reconnect-resync.spec.ts` —
+nenhum caso deles chegou a rodar, e por isso não entram nos contadores acima.
+
+Distribuição das 54 falhas por arquivo (todas **preexistentes**, em código que não toquei):
+`ops/privacy-export-sweeper` 7 · `ops/privacy-export-locator` 7 · `observability/slo-rules` 5 ·
+`reliability/self-tests/process-supervisor` 5 · `observability/runbook-promql` 2 · `media-guard` 2
+(EPERM de symlink no Windows) · `reliability/self-tests/failpoint-transport` 2 ·
+`integration/tool-request-guardrail-real-db` 2 · `integration/llm-settings-invalidation` 2 (Redis) ·
+`tool-request-credencial` 1 · `setup-auth-dir` 1 (drive letter) · `helpers/worktree-scope-concorrencia` 1 ·
+`config/preflight` 1 · `ci/admin-ui-e2e-gate` 1 · `reliability/self-tests/fake-channel-provider` 1.
+
+**É este o baseline de comparação.** Qualquer falha futura só pode ser atribuída ao meu código depois
+de confrontada com esta lista. (A memória do projeto registrava “3 falhas reais” em 2026-07-29; o
+número cresceu no `main` desde então — o que vale é a medição de hoje, no commit base.)
+
+### V-008 · P00.1 — contrato wire (commit `dfc98f50`)
+
+| Gate | Resultado |
+|---|---|
+| `npm run typecheck` | 0 erros |
+| `npx eslint src/integrations tests/unit/hermes-wire-contract.spec.ts` | 0 achados |
+| `vitest run tests/unit/hermes-wire-contract.spec.ts` | `executados=62 falharam=0 pulados=0` |
+| Verificação por mutação (5 mutações no módulo) | todas detectadas |
+
+A primeira rodada de mutação **reprovou o meu próprio teste**: subir `max_frame_bytes` 100× não
+quebrava nada (o caso usava a própria constante para gerar o payload) e remover a regra de `trim` do
+`reply` também não (o caso usava string vazia, barrada antes pelo `min(1)`). Os dois casos foram
+reescritos com valores absolutos e com texto só-de-espaços; depois disso, cada uma das cinco
+mutações derruba pelo menos um caso.
+
+Incidente de processo no mesmo commit: ao ligar `core.autocrlf=false` para contornar o defeito do
+splitter (V-007a), o commit inicial levou `AGENTS.md` e `ARCHITECTURE.md` **inteiros reescritos em
+CRLF** (760 e 411 linhas). Detectado na revisão do próprio diff, corrigido por `--amend`
+reconstruindo os dois arquivos a partir dos bytes versionados e reaplicando só a linha alterada; a
+árvore inteira foi normalizada em seguida (`git checkout -- .`). O commit final mostra
+`AGENTS.md | 2 +-` e `ARCHITECTURE.md | 1 +`.
+
+### V-009 · P00.3 — normalizador de contexto Maia→Hermes
+
+| Gate | Resultado |
+|---|---|
+| `vitest run tests/unit/hermes-history-normalizer.spec.ts` | primeiro vermelho (módulo inexistente), depois `executados=19 falharam=0 pulados=0` |
+| `npm run typecheck` | 0 erros |
+| `npx eslint src/integrations/hermes/history.ts tests/unit/hermes-history-normalizer.spec.ts` | 0 achados |
+| Verificação por mutação (8 mutações) | todas detectadas |
+
+Mutações aplicadas e efeito: teto de mensagens (2 casos caem) · filtro de mensagem vazia (1) ·
+remoção do envelope `<user_message>` (2) · recusa de bloco não textual no histórico (3) · exigência
+de que a última mensagem seja do usuário (1) · recusa de bloco não textual no inbound (1). Duas
+delas exigiram refazer o harness: o delimitador `|` do meu laço cortava a string que contém `||`, e
+um template literal com backticks não casava — sintoma de harness, não do código, mas registrado
+porque uma mutação “NÃO-APLICADA” lida às pressas parece uma mutação sobrevivente.
 
 ## Testes executados / falhos / pulados (acumulado)
 
