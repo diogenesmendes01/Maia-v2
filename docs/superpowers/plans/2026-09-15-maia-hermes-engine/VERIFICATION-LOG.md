@@ -170,6 +170,73 @@ delas exigiram refazer o harness: o delimitador `|` do meu laço cortava a strin
 um template literal com backticks não casava — sintoma de harness, não do código, mas registrado
 porque uma mutação “NÃO-APLICADA” lida às pressas parece uma mutação sobrevivente.
 
+### V-010 · P03.1 — migrations 139/140 no Postgres descartável
+
+| Passo | Resultado |
+|---|---|
+| Reserva de prefixo (`npm run migrate:reserve`) | 139 e 140 registrados em `migrations/RESERVATIONS.md` |
+| Aplicação pelo **runner real** (via `globalSetup`, não por `psql -f`) | `outcome: applied · applied 2 · dirty 0` |
+| Objetos criados | `conversation_controls`, `engine_turn_bindings`, `engine_runs`, `engine_tool_calls`, `engine_run_events`, `engine_projections`; triggers `engine_runs_immutable_trg`, `engine_tool_calls_immutable_trg`, `engine_run_events_append_only_trg`; unique parcial `engine_runs_one_open_turn_uq … WHERE (phase <> 'closed')`; `approval_requests_scope_id_uq` |
+| Ciclo **up → down → up** (gate T69) | down de 140 e 139 executados sem erro; nenhuma tabela do journal restou; up reaplicado e as 6 tabelas voltaram |
+
+Decisão de desenho registrada: a unique de `approval_requests` foi feita SEM `CONCURRENTLY`. A
+alternativa (índice concorrente + `ADD CONSTRAINT … USING INDEX`) exigiria `-- maia:no-transaction`,
+que custaria a atomicidade com a linha do ledger e cairia no divisor por `;` sem parser — o mesmo
+caminho do defeito V-007a. A tabela nasceu na migration 095 e guarda aprovações humanas, não
+tráfego: o bloqueio é de milissegundos.
+
+Desvio consciente em relação ao capítulo 10 da spec, registrado como C11: o SCHEMA de
+`conversation_controls` (capítulo 8 / P04) nasce junto do journal porque `engine_runs` tem FK
+composta para ele e o §5.6.2 manda criar a tabela de controle ANTES dessa FK. O COMPORTAMENTO de
+pausa/retomada continua no P04. As FKs compostas de `conversation_controls` para
+`conversas`/`pessoas`/`channels` **não** entraram: essas tabelas só têm `PRIMARY KEY (id)` hoje
+(conferido no banco), e criar os uniques compostos que faltam significa índice novo em tabela quente
+(`conversas`), que é migration própria com `CONCURRENTLY` na fatia do P04.
+
+### V-011 · Revisão do trabalho do agente P01 (caracterização) — feita por mim, não pelo relatório
+
+O agente entregou `tests/unit/react-loop-characterization.spec.ts` (1397 linhas) e relatou “10
+mutações, 10 detectadas”. **Relatório não é evidência**, então:
+
+1. Li o arquivo inteiro (1397 linhas), não só o resumo.
+2. Reexecutei a suíte por conta própria, na worktree dele: `executados=57 falharam=0 pulados=0`.
+3. Apliquei **três mutações minhas**, escolhidas independentemente das dez dele, em
+   `src/agent/react-loop.ts`, restaurando o arquivo a cada rodada:
+
+   | Minha mutação | Efeito na suíte |
+   |---|---|
+   | `sideEffectsCommitted` deixa de ser marcado na invocação | 2 casos vermelhos |
+   | pendência recém-criada deixa de ser revalidada (`if (true)`) | 3 casos vermelhos |
+   | teto de iterações 5 → 8 | 6 casos vermelhos |
+
+   Restaurado o arquivo, a suíte volta a 57/57. A rede morde.
+4. Conferi que ela PINA o defeito conhecido (`toolSummaries` ausente no ctx de `safeDispatchOutput`)
+   com asserção sobre o conjunto exato de chaves — é o que fará a correção da extração aparecer como
+   diff deliberado, como §5.10.3 pede.
+5. Integrado por `git merge --no-ff` (commit `7058b5fc`); suíte reexecutada na MINHA árvore após o
+   merge: 57/57, typecheck limpo.
+
+Observação de conformidade: o agente registrou na mensagem de commit que NÃO assina trailer de
+coautoria de IA, citando `AGENTS.md` §8 e o gate `commit:trailers:check` — mesma decisão adotada
+aqui (contradição C08 do estado da implementação).
+
+### V-012 · P03.1 — journal contra Postgres real
+
+`tests/integration/hermes-runs-real-db.spec.ts`, 12 casos, executados pelo procedimento local de
+dois passos (V-005): escopo por FK composta, unique parcial de run aberto, unicidade de
+`request_key`, imutabilidade de 9 colunas do run, atribuição única de `remote_run_id`, terminal não
+substituível, monotonicidade de `effect_evidence`, append-only dos eventos, CHECKs de coerência,
+unicidade de `(run, call_id)` e `(run, ordinal)`, e recusa de aprovação de outro tenant.
+
+Dois defeitos **do meu próprio teste** apareceram e foram corrigidos — registrados porque cada um
+teria virado uma conclusão errada sobre o schema:
+
+1. o caso da aprovação cross-tenant usava colunas inexistentes (`requested_by`, `tool_name`): a
+   falha era do INSERT, não da FK. Corrigido conferindo as colunas reais no banco;
+2. o caso do `remote_run_id` usava o literal `'w-1'`, e a unique é
+   `(tenant, agent, remote_instance_id, remote_run_id)` — passou na primeira rodada e colidiu na
+   segunda. Corrigido com ids únicos por rodada, e a spec agora roda duas vezes seguidas verde.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

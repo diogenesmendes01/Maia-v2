@@ -54,9 +54,9 @@
 | PR | Entrega verificável | Estado |
 |---|---|---|
 | P00 | Wire/JSON Schema TS+Python, normalização de histórico, execução sintética real com AIAgent, superfície após compressão e cleanup | **em andamento**: P00.1 (contrato wire TS + canônico + fixtures compartilhadas) concluído e verificado; P00.2 (worker Python), P00.3 (normalizador de histórico) e P00.4 (spike real com `AIAgent`) pendentes |
-| P01 | Caracterização do comportamento local (matriz de delivery, role/pending/report/sensitive, pós-turno) | não iniciado |
-| P02 | `AgentEnginePortV1`, `MaiaEngine`, assembler, output coordinator; default local | não iniciado |
-| P03 | Binding/run/tool journal/eventos/projeções, CAS/constraints/imutabilidade, recovery sem rerun | não iniciado |
+| P01 | Caracterização do comportamento local (matriz de delivery, role/pending/report/sensitive, pós-turno) | **concluído e verificado** — `tests/unit/react-loop-characterization.spec.ts` (57 casos), primeira suíte unitária de `runReActLoop`; 10 mutações do implementador + 3 minhas, independentes, todas detectadas |
+| P02 | `AgentEnginePortV1`, `MaiaEngine`, assembler, output coordinator; default local | **em andamento**: P02.0 (contratos + schemas) concluído e verificado; `MaiaEngine`/assembler/coordinator pendentes |
+| P03 | Binding/run/tool journal/eventos/projeções, CAS/constraints/imutabilidade, recovery sem rerun | **em andamento**: P03.1 (migrations 139/140 + espelho Drizzle + 12 casos contra Postgres real, incluindo triggers de imutabilidade e append-only) concluído; `engine-repos` e recovery pendentes |
 | P04 | Controle humano (pause/pausing/human/resume) com fence em todo egresso | não iniciado |
 | P05 | Broker: binding por canal, manifest efetivo, ACL cliente/recurso, dispatch instrumentado, receipt | não iniciado |
 | P06 | Gateway de inferência fechado, grants, reservas/eventos idempotentes | não iniciado |
@@ -80,10 +80,10 @@
 
 | ID | Gate | PR alvo | Implementação do teste | Estado |
 |---|---|---|---|---|
-| T01 | Extração | P01/P02 | — | não iniciado |
-| T02 | Extração | P01/P02 | — | não iniciado |
-| T03 | Extração | P01/P02 | — | não iniciado |
-| T04 | Extração | P01/P02 | — | não iniciado |
+| T01 | Extração | P01/P02 | `tests/unit/react-loop-characterization.spec.ts` (“T01 — turno comum”) | **verificado na baseline** (falta repetir contra o `MaiaEngine` extraído) |
+| T02 | Extração | P01/P02 | cobertura existente em `agent-core-trace-envelope-fail-closed.spec.ts` e `agent-core-channel-resolution.spec.ts` (gates barram antes do reasoner) | verificado na baseline |
+| T03 | Extração | P01/P02 | caracterização: `reasoner_failed` sem envio inventado; `iteration_cap` sem reexecução | **verificado na baseline** |
+| T04 | Extração | P01/P02 | caracterização: `outboundPrefix` (4 casos) — antes disso, cobertura ZERO no repositório | **verificado na baseline** |
 | T05 | Contrato | P00/P02 | `hermes-wire-contract.spec.ts` “schema estrito” + fixtures `*-com-tenant`, `*-call-id-fornecido` | **verificado** (wire; falta o lado do assembler em P02) |
 | T06 | Contrato | P02 | `hermes-wire-contract.spec.ts` “result não aceita alegação de entrega” + fixture `result-alega-entrega` | **verificado** (wire) |
 | T07 | Contrato | P00 | `hermes-wire-contract.spec.ts` “limites são recusa determinística” (valores absolutos + mutação) | **verificado** |
@@ -148,7 +148,7 @@
 | T66 | Rollback | P07 | — | não iniciado |
 | T67 | Segurança | P05/P06/P07 | — | não iniciado |
 | T68 | Upgrade | P00/P07 | — | não iniciado |
-| T69 | Migração | P03/P04/P06/P09 | — | não iniciado |
+| T69 | Migração | P03/P04/P06/P09 | migrations 139/140 aplicadas pelo runner real + ciclo `down → up` executado no banco descartável; constraints e triggers conferidos no catálogo | **verificado** para esta fatia (novas migrations exigirão repetição) |
 | T70 | Deploy | P00/P07 | — | não iniciado |
 
 ## 6. Gates de expansão (§10.2) e verificação real do motor (§11.3)

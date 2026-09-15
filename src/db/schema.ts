@@ -4203,3 +4203,309 @@ export type OnboardingEventRow = typeof onboarding_events.$inferSelect;
 export type NewOnboardingEventRow = typeof onboarding_events.$inferInsert;
 export type OnboardingStepResultRow = typeof onboarding_step_results.$inferSelect;
 export type NewOnboardingStepResultRow = typeof onboarding_step_results.$inferInsert;
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * JOURNAL DE EXECUÇÃO DO ENGINE + CONTROLE DE CONVERSA (migrations 139/140)
+ *
+ * Espelho das migrations, não a autoridade: os CHECKs de coerência, as FKs
+ * compostas e os TRIGGERS de imutabilidade moram no banco (140), porque o que
+ * eles protegem é justamente a escrita que NÃO passa por este arquivo — um
+ * `UPDATE` de incidente, um backfill, um script. Aqui ficam colunas, uniques e
+ * índices que as consultas precisam conhecer.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Quem pode agir nesta conversa, e desde qual epoch (spec §8.2.1). A unidade é
+ * a STREAM: `conversa_id` pode ser nulo no ingresso, e encerrar uma conversa por
+ * inatividade não pode apagar uma pausa.
+ */
+export const conversation_controls = pgTable(
+  'conversation_controls',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    stream_key: text('stream_key').notNull(),
+    stream_key_version: smallint('stream_key_version').notNull(),
+    channel_id: uuid('channel_id').notNull(),
+    conversa_id: uuid('conversa_id'),
+    pessoa_id: uuid('pessoa_id'),
+    /** `bot` | `pausing` | `human`. `pausing` é estado real: barreira posta, drenagem pendente. */
+    mode: text('mode').notNull().default('bot'),
+    /**
+     * Incrementa no pause E no resume — os dois, para impedir o problema ABA:
+     * um run do epoch antigo não recupera autoridade só porque o modo voltou a
+     * `bot`. `mode: 'bigint'` (e não `number`) porque o contrato serializa
+     * epoch como decimal e um contador de banco não deve depender de 2^53.
+     */
+    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull().default(0n),
+    /** `app_users.id` é text. */
+    owner_app_user_id: text('owner_app_user_id'),
+    reason_code: text('reason_code'),
+    reason_ref: uuid('reason_ref'),
+    paused_at: timestamp('paused_at', { withTimezone: true }),
+    resumed_at: timestamp('resumed_at', { withTimezone: true }),
+    last_command_id: uuid('last_command_id'),
+    resume_after_ingress_seq: bigint('resume_after_ingress_seq', { mode: 'bigint' }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('conversation_controls_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    streamUq: unique('conversation_controls_stream_uq').on(t.tenant_id, t.agent_id, t.stream_key),
+    queueIdx: index('conversation_controls_queue_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.mode,
+      t.updated_at,
+      t.id,
+    ),
+  }),
+);
+
+/** UM motor por turno oficial. O pin não muda em retry (spec §5.6.2). */
+export const engine_turn_bindings = pgTable(
+  'engine_turn_bindings',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    turn_id: uuid('turn_id').notNull(),
+    /** `maia_react` | `hermes` — valor canônico; rótulo de UI não entra aqui. */
+    engine: text('engine').notNull(),
+    adapter_revision: text('adapter_revision').notNull(),
+    configuration_digest: text('configuration_digest').notNull(),
+    protocol_version: integer('protocol_version').notNull(),
+    max_generations: integer('max_generations').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'engine_turn_bindings_pk',
+      columns: [t.tenant_id, t.agent_id, t.turn_id],
+    }),
+  }),
+);
+
+/**
+ * A execução do motor, subordinada ao turno. `phase` é observação do EXECUTOR e
+ * NÃO substitui `agent_turns.status`: um run `closed/handed_to_outbox` convive
+ * com turno `outbound_pending`, e um run `blocked` com turno `dead_letter`.
+ */
+export const engine_runs = pgTable(
+  'engine_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    turn_id: uuid('turn_id').notNull(),
+    generation_no: integer('generation_no').notNull(),
+    origin_turn_attempt: integer('origin_turn_attempt').notNull(),
+    /** Fence de origem. Nunca serializado no pedido nem entregue ao modelo. */
+    origin_claim_token: uuid('origin_claim_token').notNull(),
+    origin_worker_id: text('origin_worker_id').notNull(),
+    control_id: uuid('control_id').notNull(),
+    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull(),
+    mode: text('mode').notNull(),
+    manifest_digest: text('manifest_digest').notNull(),
+    phase: text('phase').notNull(),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(0),
+    request_key: uuid('request_key').notNull(),
+    remote_instance_id: text('remote_instance_id').notNull(),
+    remote_run_id: text('remote_run_id'),
+    request_json: jsonb('request_json').notNull(),
+    request_hash: text('request_hash').notNull(),
+    host_context_json: jsonb('host_context_json').notNull(),
+    host_context_hash: text('host_context_hash').notNull(),
+    deadline_at: timestamp('deadline_at', { withTimezone: true }).notNull(),
+    reconcile_deadline_at: timestamp('reconcile_deadline_at', { withTimezone: true }).notNull(),
+    capabilities_revoked_at: timestamp('capabilities_revoked_at', { withTimezone: true }),
+    submit_count: integer('submit_count').notNull().default(0),
+    poll_count: integer('poll_count').notNull().default(0),
+    next_poll_at: timestamp('next_poll_at', { withTimezone: true }).notNull().defaultNow(),
+    last_observed_at: timestamp('last_observed_at', { withTimezone: true }),
+    terminal_json: jsonb('terminal_json'),
+    terminal_hash: text('terminal_hash'),
+    output_preparation_json: jsonb('output_preparation_json'),
+    adopted_by_turn_attempt: integer('adopted_by_turn_attempt'),
+    closed_reason: text('closed_reason'),
+    closed_at: timestamp('closed_at', { withTimezone: true }),
+    last_error_code: text('last_error_code'),
+    last_event_sequence: bigint('last_event_sequence', { mode: 'bigint' }).notNull().default(0n),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('engine_runs_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    scopeTurnIdUq: unique('engine_runs_scope_turn_id_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.turn_id,
+      t.id,
+    ),
+    generationUq: unique('engine_runs_generation_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.turn_id,
+      t.generation_no,
+    ),
+    requestUq: unique('engine_runs_request_uq').on(t.tenant_id, t.agent_id, t.request_key),
+    /** No máximo UM run não fechado por turno. */
+    oneOpenTurnUq: uniqueIndex('engine_runs_one_open_turn_uq')
+      .on(t.tenant_id, t.agent_id, t.turn_id)
+      .where(sql`phase <> 'closed'`),
+    remoteUq: uniqueIndex('engine_runs_remote_uq')
+      .on(t.tenant_id, t.agent_id, t.remote_instance_id, t.remote_run_id)
+      .where(sql`remote_run_id IS NOT NULL`),
+    dueIdx: index('engine_runs_due_idx')
+      .on(t.tenant_id, t.agent_id, t.next_poll_at, t.id)
+      .where(
+        sql`phase IN ('prepared', 'submitting', 'submission_unknown', 'running', 'cancelling', 'reconciling', 'result_ready')`,
+      ),
+    /** Mesma pergunta SEM tenant no prefixo: o varredor é cross-tenant. */
+    dueDispatchIdx: index('engine_runs_due_dispatch_idx')
+      .on(t.next_poll_at, t.tenant_id, t.agent_id)
+      .where(
+        sql`phase IN ('prepared', 'submitting', 'submission_unknown', 'running', 'cancelling', 'reconciling', 'result_ready')`,
+      ),
+    blockedIdx: index('engine_runs_blocked_idx')
+      .on(t.tenant_id, t.agent_id, t.updated_at, t.id)
+      .where(sql`phase = 'blocked'`),
+  }),
+);
+
+/**
+ * O journal por chamada. `effect_evidence` separa “não houve efeito” de “pode
+ * ter havido” — e timeout nunca prova ausência de efeito (INV-06).
+ */
+export const engine_tool_calls = pgTable(
+  'engine_tool_calls',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    turn_id: uuid('turn_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    /** Derivado pela Maia (`run_id:call_seq`), nunca escolhido pelo modelo. */
+    call_id: text('call_id').notNull(),
+    ordinal: integer('ordinal').notNull(),
+    /** Telemetria opcional; NULL é válido e não deve ser preenchido por padrão. */
+    iteration: integer('iteration'),
+    tool_name: text('tool_name').notNull(),
+    args_json: jsonb('args_json').notNull(),
+    args_hash: text('args_hash').notNull(),
+    normalized_args_json: jsonb('normalized_args_json'),
+    request_id: uuid('request_id').notNull(),
+    state: text('state').notNull(),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(0),
+    dispatch_token: uuid('dispatch_token'),
+    side_effect: text('side_effect'),
+    effect_class: text('effect_class'),
+    sensitive: boolean('sensitive').notNull().default(false),
+    legacy_irreversible_invoked: boolean('legacy_irreversible_invoked').notNull().default(false),
+    effect_evidence: text('effect_evidence').notNull().default('none'),
+    idempotency_key: text('idempotency_key'),
+    idempotency_payload_hash: text('idempotency_payload_hash'),
+    reservation_token: text('reservation_token'),
+    approval_request_id: uuid('approval_request_id'),
+    approval_claim_token: text('approval_claim_token'),
+    result_json: jsonb('result_json'),
+    receipt_json: jsonb('receipt_json'),
+    receipt_hash: text('receipt_hash'),
+    handler_started_at: timestamp('handler_started_at', { withTimezone: true }),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    last_error_code: text('last_error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    callUq: unique('engine_tool_calls_call_uq').on(t.tenant_id, t.agent_id, t.run_id, t.call_id),
+    ordinalUq: unique('engine_tool_calls_ordinal_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.run_id,
+      t.ordinal,
+    ),
+    unsettledIdx: index('engine_tool_calls_unsettled_idx')
+      .on(t.tenant_id, t.agent_id, t.run_id, t.ordinal)
+      .where(sql`state IN ('received', 'dispatching', 'handler_started', 'effect_unknown')`),
+    approvalIdx: index('engine_tool_calls_approval_idx')
+      .on(t.tenant_id, t.agent_id, t.approval_request_id)
+      .where(sql`approval_request_id IS NOT NULL`),
+  }),
+);
+
+/** Append-only por trigger: o ledger que explica uma reconciliação não é reescrito. */
+export const engine_run_events = pgTable(
+  'engine_run_events',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    sequence_no: bigint('sequence_no', { mode: 'bigint' }).notNull(),
+    dedupe_key: text('dedupe_key').notNull(),
+    event_type: text('event_type').notNull(),
+    actor_kind: text('actor_kind').notNull(),
+    actor_turn_attempt: integer('actor_turn_attempt'),
+    /** Só IDs, códigos e hashes — nunca prompt, resultado bruto ou raciocínio. */
+    metadata_json: jsonb('metadata_json').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'engine_run_events_pk',
+      columns: [t.tenant_id, t.agent_id, t.run_id, t.sequence_no],
+    }),
+    dedupeUq: unique('engine_run_events_dedupe_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.run_id,
+      t.dedupe_key,
+    ),
+  }),
+);
+
+/**
+ * Projeções pós-turno. `uncertain` existe porque “começou e não sei se
+ * terminou” é fato diferente de “falhou”, e reexecutar um graph iniciado sem
+ * idempotência por node é o que duplica aprendizado.
+ */
+export const engine_projections = pgTable(
+  'engine_projections',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    projection: text('projection').notNull(),
+    state: text('state').notNull(),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(0),
+    /** Referência FORENSE: sem FK, como `blocked_by_turn_id` da 133. */
+    anchor_message_id: uuid('anchor_message_id'),
+    started_at: timestamp('started_at', { withTimezone: true }),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+    last_error_code: text('last_error_code'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'engine_projections_pk',
+      columns: [t.tenant_id, t.agent_id, t.run_id, t.projection],
+    }),
+    pendingIdx: index('engine_projections_pending_idx')
+      .on(t.tenant_id, t.agent_id, t.created_at, t.run_id)
+      .where(sql`state = 'pending'`),
+  }),
+);
+
+export type ConversationControlRow = typeof conversation_controls.$inferSelect;
+export type NewConversationControlRow = typeof conversation_controls.$inferInsert;
+export type EngineTurnBindingRow = typeof engine_turn_bindings.$inferSelect;
+export type NewEngineTurnBindingRow = typeof engine_turn_bindings.$inferInsert;
+export type EngineRunRow = typeof engine_runs.$inferSelect;
+export type NewEngineRunRow = typeof engine_runs.$inferInsert;
+export type EngineToolCallRow = typeof engine_tool_calls.$inferSelect;
+export type NewEngineToolCallRow = typeof engine_tool_calls.$inferInsert;
+export type EngineRunEventRow = typeof engine_run_events.$inferSelect;
+export type NewEngineRunEventRow = typeof engine_run_events.$inferInsert;
+export type EngineProjectionRow = typeof engine_projections.$inferSelect;
+export type NewEngineProjectionRow = typeof engine_projections.$inferInsert;
