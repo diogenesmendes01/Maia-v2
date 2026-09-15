@@ -72,18 +72,23 @@ sequência P00–P12 do capítulo 10 da spec.
 - `U-ENV`: Node 22.23.2 verificado por SHA256; PostgreSQL 16.2 + pgvector 0.6.2 + pgcrypto/uuid-ossp/btree_gin/pg_trgm rodando em `127.0.0.1:55432`; Redis **fake** (`fakeredis`) em `56379`; venv do Hermes pinado com `uv sync --frozen` e `AIAgent` importando.
 - `U-P00.1`: contrato wire `maia.hermes.worker.v1` (`src/integrations/hermes/protocol.ts`), serialização canônica versionada + digest (`canonical-json.ts`), 62 casos de teste e fixtures compartilhadas com o worker Python. Gates: `typecheck` 0 erros, `lint` 0 achados, teste verde; **verificação por mutação** aplicada (5 mutações, todas detectadas) depois de a primeira rodada revelar duas asserções que não mordiam.
 
+- `U-P00.3` (commit `5694e6d6`): normalizador de contexto Maia→Hermes — separa o inbound por posição (a remoção por ID canônico já é do `prompt-builder`), recusa `tool_use`/`tool_result`/`image`, preserva o envelope `<user_message>` e recusa estouro em vez de truncar. 19 casos, 8 mutações detectadas.
+- `U-P02.0`: contratos da porta de engine (`src/runtime/engines/contracts.ts` + `schemas.ts`) com equivalência schema↔tipo conferida em tempo de compilação. 35 casos, 6 mutações detectadas.
+
 ### Em andamento
-- `U-P00.2` — pacote Python `services/hermes_worker` (protocolo, binding imutável, handlers-closure, bootstrap, cleanup) + pytest contra as fixtures compartilhadas.
-- `U-P01.1` — caracterização de `runReActLoop` (hoje **sem nenhum teste unitário**; só duas specs de integração o exercitam).
+- `U-P00.2` — pacote Python `services/hermes_worker` (agente paralelo, worktree `mh-p00-worker`).
+- `U-P01.1` — caracterização de `runReActLoop` (agente paralelo, worktree `mh-p01-charact`); hoje essa função **não tem nenhum teste unitário**, só duas specs de integração a exercitam.
+- Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
-- Gates que exigem semântica real de Redis/BullMQ (fake explícito em uso).
-- `U-P00.4` (spike com provider real pago) — D02/orçamento.
+- Gates que exigem semântica real de Redis/BullMQ — **sem Redis real na máquina** (ver V-005).
+- `U-P00.4` com provider real pago — D02/orçamento. O spike com stub NÃO é bloqueado.
+- `U-P02.1` (extração do reasoner) — esperando a caracterização do P01 aterrissar, para não mexer em `react-loop.ts` antes de existir a linha de base.
 
 ### Próximo trabalho
-1. `U-P00.3` — normalizador de histórico Maia→Hermes (texto canônico; remoção do inbound por ID já existe em `prompt-builder.ts:1161`).
-2. `U-P00.4` — spike sintético real: `AIAgent` do checkout pinado contra provider **stub** local, verificando superfície efetiva de tools, rotação de sessão por compressão, cancelamento e limpeza do home efêmero.
-3. `U-P02.1` — `AgentEnginePortV1` + `MaiaEngine` atrás do seam de `core.ts:2146-2162`.
+1. `U-P03.1` — migrations do journal de execução (§5.6.2) + `engine-repos`. **Desbloqueado**: o Postgres local aplica as 145 migrations. Atenção à contradição C11 abaixo: o DDL de `engine_runs` tem FK para `conversation_controls`, que o capítulo 8 (P04) introduz — as duas tabelas precisam nascer na mesma fatia de schema, mesmo com o comportamento de pausa/retomada ficando no P04.
+2. `U-P00.4` — spike sintético: `AIAgent` do checkout pinado contra o provider stub, verificando superfície efetiva de tools, rotação de sessão por compressão, cancelamento e limpeza do home efêmero.
+3. `U-P02.1` — `MaiaEngine` atrás do seam de `core.ts:2146-2162`, depois do P01.
 
 ## 7. Decisões pendentes (spec §12.5) — nenhuma preenchida por suposição
 

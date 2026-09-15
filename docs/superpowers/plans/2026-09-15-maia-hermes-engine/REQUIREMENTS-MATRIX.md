@@ -28,7 +28,7 @@
 
 | ID | Requisito | Seção | Implementação | Testes / evidência | Estado |
 |---|---|---|---|---|---|
-| K-01 | `AgentEnginePortV1` como métodos TS internos, sem endpoints | §4.1, §5.3.1 | — | agent-engine-contract | não iniciado |
+| K-01 | `AgentEnginePortV1` como métodos TS internos, sem endpoints | §4.1, §5.3.1 | `src/runtime/engines/contracts.ts` (tipos) + `schemas.ts` (Zod estrito, equivalência schema↔tipo conferida pelo compilador) | `tests/unit/agent-engine-contract.spec.ts` (35 casos) + 6 mutações detectadas | **contrato verificado**; implementações (`MaiaEngine`/`HermesEngine`) pendentes |
 | K-02 | Transporte: filho Python descartável, pipe herdado, protocolo `maia.hermes.worker.v1` | §4.1, §6.4 | `src/integrations/hermes/protocol.ts` (schemas dos 9 frames, limites, direção) | `tests/unit/hermes-wire-contract.spec.ts` (62 casos) + `tests/fixtures/hermes-wire/frames.json` | **contrato verificado**; worker/supervisor ainda não existem |
 | K-03 | `run_id` = `RunBinding.execution_id` (um UUID) | §4.1 | `protocol.ts` (`start.binding.execution_id` + `run_id`) | fixture `start-ok` | implementado não verificado (falta o supervisor produzir o par) |
 | K-04 | `call_seq` inicia em 0; `call_id = run_id:call_seq`; `ordinal = call_seq` | §4.1 | `protocol.ts` (`deriveCallId`, `call_seq` ≥ 0) | `hermes-wire-contract.spec.ts` (bloco “identidade da chamada”) + fixtures `tool-request-*` | **verificado** (unit) |
