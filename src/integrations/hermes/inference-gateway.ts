@@ -276,7 +276,12 @@ export type ParsedInferenceRequest =
       code: 'invalid_request' | 'unsupported_parameter' | 'payload_too_large';
       /** CAMINHO do problema. Nunca o valor: o corpo é conteúdo de conversa. */
       field: string;
-      reason: 'unknown_parameter' | 'reserved_authority' | 'schema' | 'limit';
+      reason:
+        | 'unknown_parameter'
+        | 'reserved_authority'
+        | 'schema'
+        | 'limit'
+        | 'tool_pairing';
     };
 
 const RESERVED = new Set<string>(INFERENCE_RESERVED_AUTHORITY_FIELDS);
@@ -350,7 +355,64 @@ export function parseInferenceRequest(raw: unknown): ParsedInferenceRequest {
       reason: 'schema',
     };
   }
+  // 4. Pares tool_call/tool_result (§9.1 validação 3). Depois do schema porque
+  //    precisa dos dados já tipados, e é a única validação CRUZADA entre
+  //    mensagens — as anteriores olham uma mensagem de cada vez.
+  const orfa = primeiroToolResultOrfao(parsed.data.messages);
+  if (orfa !== null) {
+    return {
+      kind: 'invalid',
+      code: 'invalid_request',
+      field: `messages.${orfa}.tool_call_id`,
+      reason: 'tool_pairing',
+    };
+  }
+
   return { kind: 'ok', request: parsed.data };
+}
+
+/**
+ * Índice do primeiro `tool_result` ÓRFÃO, ou `null` se todos parearem.
+ *
+ * ─── A regra, e só ela ──────────────────────────────────────────────────────
+ *
+ * §9.1 validação 3 manda "validar ... pares de tool call/result". Esta função
+ * decide UMA direção: todo `tool_call_id` de uma mensagem `role:'tool'` tem de
+ * ter sido anunciado por um `tool_calls[].id` de um `assistant` **anterior**.
+ *
+ * "Anterior" é literal — o conjunto só cresce conforme a varredura avança, de
+ * modo que um resultado que aparece ANTES da sua chamada é órfão. Aceitá-lo
+ * trataria como pareado um resultado que o modelo não tinha como ter produzido,
+ * e o §9.1 fala em "pares", não em "ids que existem em algum lugar do corpo".
+ *
+ * ─── O que esta função DELIBERADAMENTE não decide ──────────────────────────
+ *
+ * A direção INVERSA — um `tool_calls[].id` do assistant que fica sem resposta —
+ * **não** é decidida aqui, e a omissão é a decisão. Responder a isso exigiria
+ * saber se um pedido pode legitimamente carregar uma call ainda pendente, e
+ * isso é semântica de sequenciamento do §5.7.4 itens 4-5 (piloto sequencial,
+ * no máximo uma chamada pendente por run, e "callback adiantado" que devolve
+ * `in_progress` sem executar). A leitura plausível — "o cliente não emitiria
+ * nova inferência com uma call em aberto" — é exatamente o tipo de inferência
+ * que vira decisão sem procedência, então fica NOMEADA para o P07 resolver
+ * quando fixar o sequenciamento, em vez de resolvida aqui por conveniência.
+ *
+ * Pela mesma régua, id anunciado duas vezes e id respondido duas vezes dentro
+ * de um mesmo corpo tocam a regra de redelivery do §5.7.4 item 3 e também não
+ * são julgados aqui.
+ */
+function primeiroToolResultOrfao(messages: InferenceRequestV1['messages']): number | null {
+  const anunciadas = new Set<string>();
+  let indice = -1;
+  for (const m of messages) {
+    indice++;
+    if (m.role === 'assistant') {
+      for (const call of m.tool_calls ?? []) anunciadas.add(call.id);
+      continue;
+    }
+    if (m.role === 'tool' && !anunciadas.has(m.tool_call_id)) return indice;
+  }
+  return null;
 }
 
 // ─── grant ──────────────────────────────────────────────────────────────────

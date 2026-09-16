@@ -257,6 +257,91 @@ describe('P06 — o piloto é TEXTUAL (§9.1)', () => {
   });
 });
 
+describe('P06 — pares tool_call/tool_result (§9.1 validação 3)', () => {
+  const chamada = (id: string) => ({
+    role: 'assistant',
+    content: null,
+    tool_calls: [
+      { id, type: 'function', function: { name: 'consultar_saldo', arguments: '{}' } },
+    ],
+  });
+  const resposta = (id: string) => ({ role: 'tool', tool_call_id: id, content: '{}' });
+
+  it('15b. `tool_call_id` que NUNCA foi anunciado é recusado', () => {
+    const r = parseInferenceRequest(
+      req({
+        messages: [{ role: 'user', content: 'oi' }, chamada('call_1'), resposta('call_orfa')],
+      }),
+    );
+    expect(r).toMatchObject({
+      kind: 'invalid',
+      code: 'invalid_request',
+      reason: 'tool_pairing',
+    });
+  });
+
+  it('15c. resultado ANTES da chamada é recusado — a ordem importa', () => {
+    // "um `tool_calls[].id` de um assistant ANTERIOR". Aceitar o par fora de
+    // ordem trataria como pareado um resultado que o modelo não podia ter.
+    const r = parseInferenceRequest(
+      req({
+        messages: [{ role: 'user', content: 'oi' }, resposta('call_1'), chamada('call_1')],
+      }),
+    );
+    expect(r).toMatchObject({ kind: 'invalid', reason: 'tool_pairing' });
+  });
+
+  it('15d. resultado sem NENHUM assistant anterior é recusado', () => {
+    expect(parseInferenceRequest(req({ messages: [resposta('call_1')] }))).toMatchObject({
+      kind: 'invalid',
+      reason: 'tool_pairing',
+    });
+  });
+
+  it('15e. pares casados em sequência passam', () => {
+    expect(
+      parseInferenceRequest(
+        req({
+          messages: [
+            { role: 'user', content: 'oi' },
+            chamada('call_1'),
+            resposta('call_1'),
+            chamada('call_2'),
+            resposta('call_2'),
+          ],
+        }),
+      ).kind,
+    ).toBe('ok');
+  });
+
+  it('15f. duas tool_calls no MESMO assistant, ambas respondidas, passam', () => {
+    const duas = {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        { id: 'a', type: 'function', function: { name: 'consultar_saldo', arguments: '{}' } },
+        { id: 'b', type: 'function', function: { name: 'consultar_saldo', arguments: '{}' } },
+      ],
+    };
+    expect(
+      parseInferenceRequest(
+        req({
+          messages: [{ role: 'user', content: 'oi' }, duas, resposta('a'), resposta('b')],
+        }),
+      ).kind,
+    ).toBe('ok');
+  });
+
+  it('15g. o diagnóstico aponta a MENSAGEM, sem ecoar o id recusado', () => {
+    const r = parseInferenceRequest(
+      req({ messages: [chamada('call_1'), resposta('id_que_veio_do_cliente')] }),
+    );
+    if (r.kind !== 'invalid') throw new Error('esperava recusa');
+    expect(r.field).toContain('messages.1');
+    expect(JSON.stringify(r)).not.toContain('id_que_veio_do_cliente');
+  });
+});
+
 describe('P06 — limites são recusa determinística, nunca truncamento', () => {
   it('16. excesso de mensagens é `payload_too_large`', () => {
     const muitas = Array.from({ length: INFERENCE_LIMITS.max_messages + 1 }, () => ({
