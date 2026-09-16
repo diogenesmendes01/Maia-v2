@@ -1390,6 +1390,84 @@ linhas T09–T16 e T65/T66 da matriz seguem como estavam: o agente marcou todas 
 COBERTO, e declarou **G-LIFE NÃO CUMPRIDO** — o gate exige ledger (banco) e crash (processo), e a fatia
 não toca nenhum dos dois. Reivindicar cobertura que esta branch não tem seria overclaim.
 
+### V-035 · P05 e P06 — validação pessoal, e DOIS defeitos reais que a varredura independente achou
+
+Fecha a primeira rodada de paralelismo. As três frentes entregaram; o V-034 cobriu o P07, este cobre
+P05 e P06. Nenhuma foi integrada a esta branch.
+
+**O que confirmei nas duas, com as minhas mãos e não pelo resumo:** propriedade de arquivos respeitada
+(`git diff --name-only` contra a lista proibida = vazio nas duas), diffs puramente aditivos, zero
+trailers de IA, árvores limpas, e gates reexecutados por mim — P05: `tsc` 0, `eslint` 0, **88/88 com
+zero pulados**; P06: `tsc` 0, `eslint` 0, **91/91 com zero pulados**. Os módulos do P06 são
+verificadamente puros: `cost-accounting.ts` e `cost-reservation.ts` não têm NENHUM import.
+
+**Erro meu, registrado porque quase virou evidência falsa:** na primeira tentativa de verificar o P05
+eu CHUTEI os nomes dos specs (`hermes-manifest.spec.ts` etc.); os reais são
+`hermes-manifest-contract.spec.ts` e `hermes-tool-broker-policy.spec.ts`. O vitest casou **um só**
+arquivo e devolveu 21 casos — eu estava a um passo de registrar "verificado" tendo visto 21 de 88.
+Refeito com os nomes certos: 88/88.
+
+**Varredura de mutação independente, por OPERADOR.** O ponto não é o placar, é que ela cobre o que o
+autor não pensou em olhar — mutante escolhido à mão cobre o que ele já suspeita.
+
+| Frente | Alegado pelo agente | Minha varredura | Sobreviventes |
+|---|---|---|---|
+| P07 | 33 de 33 | 6 de 6 | 0 |
+| P06 | 41 de 41 | 27 de 31 | **4** |
+| P05 | 52 de 52 | 41 de 51 | **10** |
+
+⚠️ Minhas varreduras **corroboram, não replicam** as deles: o gerador é por operador e encontra outro
+conjunto de alvos. Nenhuma das três contagens deles foi reproduzida por mim.
+
+**Dos 14 sobreviventes, 11 se absolvem e 3 eram defeito real.** Classifiquei todos antes de acusar:
+rótulo de erro (`|| 'body'`, `|| 'manifest'`, `|| 'binding'`) não é garantia — provado por mutação
+COMBINADA, que sobreviveu junto, como deve; e guardas de forma redundantes com o zod logo abaixo.
+
+**DEFEITO 1 — P06, `expirou()` (`inference-gateway.ts:446-451`).** Removi a guarda
+`if (Number.isNaN(agora) || Number.isNaN(fim)) return true;` INTEIRA e a suíte continuou passando;
+cada metade isolada também sobreviveu, apesar de 6 casos tocarem `expires_at`. Sem ela,
+`agora > fim` com `NaN` devolve `false`: **um grant com instante corrompido seria tratado como
+válido** — recusa autenticada virando aceite, o oposto exato do T18. Devolvido ao agente.
+**Remediação verificada por mim:** commits `5736e296` (só o spec, 33/0) e `56fdff48` (só o relatório);
+`git diff --numstat -- src/` entre o relatório e o HEAD veio **vazio**, provando que foi cobertura pura
+e o código nunca esteve errado. Reexecutei as minhas três mutações: **as três morrem** (exit=1),
+fonte restaurado byte a byte, controle passando antes e depois. Gates por mim: `tsc` 0, **94/94 zero
+pulados**. O agente obteve o vermelho pondo o defeito vivo (guarda removida) em vez de forjar um teste
+que falhasse contra código correto — é a forma certa quando o defeito é de cobertura.
+
+**DEFEITO 2 — P05, teto de profundidade fail-OPEN.** Quatro sobreviventes caíam no termo
+`profundidade > MAX_*_DEPTH` de dois varredores recursivos. Não classifiquei por leitura: escrevi uma
+sonda que chama as funções REAIS.
+
+```
+screenToolArgs(['dados'], <tenant_id aninhado a N niveis>)
+  N=2,10,14,15 -> reject reserved_argument
+  N=16,17,20,40 -> {"kind":"ok"}          <-- PASSA
+collectResourceRefs(<conversa_id aninhado a N niveis>)
+  N=15 -> [{kind:'conversa', id:'c-de-outro'}]
+  N=16,17,30 -> []                        <-- INVISIVEL
+```
+
+Estourar o teto devolve "nada encontrado" em vez de "fundo demais para afirmar". Como `screenToolArgs`
+só compara chaves de **TOPO** contra as declaradas, uma chave declarada carregando o reservado no fundo
+atravessa as duas peneiras. Atinge **T20/INV-02** ("modelo envia `tenant_id`/`approved` fora do
+schema → rejeição") e **T24/INV-01** (a ACL não pode recusar o id que não enxerga). Devolvido ao
+agente com a exigência de fail-closed — recusar por "fundo demais", **sem subir o teto**, porque 1000
+níveis teria o mesmo defeito mais fundo: o que muda é a postura no limite, não o número.
+
+**Alegações dos agentes que eu verifiquei em vez de transcrever.** C-P05-7 confirmado
+(`_dispatcher.ts:389` é `if (!entity_id) return { error: 'no_entity_in_scope' };` e a varredura por
+`authorization_target|current_subject|current_turn` em `src/tools/` e `src/runtime/` volta vazia — o
+campo é decorativo hoje). C-P05-3 **procede, com o caminho corrigido por mim**: o agente citou
+`src/governance/grant-math.ts`; o arquivo é `src/tools/grant-math.ts`, e `remember_safe_fact` está
+mesmo na linha 114 e em `packs.ts:120`. C-P05-1 procede e **localizei o ponto exato** — ver C27.
+
+**O que continua NÃO cumprido, e os relatórios dizem isso sozinhos:** **G-AUTH** (falta a metade de
+banco), **G-COST** (o §6.12 item 11 exige gateway fake cobrindo chamada principal, SDK retry e
+auxiliares, mais teste com provider real — D02, sem orçamento; nada disso existe), **G-LIFE** (ledger é
+banco, crash é processo). Nenhum dos oito módulos das três frentes tem call site de produção: compilam,
+são testados e estão inertes.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
