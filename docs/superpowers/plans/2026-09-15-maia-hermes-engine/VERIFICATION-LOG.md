@@ -1630,14 +1630,88 @@ transporte e o router tRPC (C23), os fences das dez fronteiras de egresso do §8
 `drain_status='pending'` é o retorno honesto do §8.2.3 — "barreira estabelecida, drenagem pendente",
 que a spec proíbe confundir com drenagem concluída.
 
+### V-039 · P04.4 — a reconciliação, e dois mutantes que eu quase contei como mortos
+
+**A unidade.** `reconcilePauseTx` — a transição `pausing → human` do §8.2.1, decidida pelo
+reconciliador Maia e não por operador. Por isso ela **não** cria linha em
+`conversation_control_commands` (o `kind` daquela tabela só admite `pause` e `resume`): a idempotência
+vem do ESTADO, e um controle já em `human` devolve `idempotent: true` sem reauditar.
+
+**Duas garantias estruturais.** O epoch **não** incrementa — "não incrementa epoch novamente só por
+confirmar a mesma tomada" —, porque incrementar aqui invalidaria claims que a própria pausa já
+fenceou. E a drenagem não é fingida: run aberto, chamada não liquidada, evidência desconhecida ou
+artefato não resolvido mantêm o modo em `pausing` com `reconciliation_required`.
+
+**A evidência é COMPOSTA, e declarada como tal (C42).** O "journal de efeitos/admissão" do §8.2.3 não
+existe; a prova sai de três fontes que existem: fase de run aberto (a definição do próprio banco, via
+`engine_runs_one_open_turn_uq`), os quatro estados do índice parcial
+`engine_tool_calls_unsettled_idx` — reusados, não reinventados — e o conjunto "resolvido" do C18.
+`approval_required` fica de fora por decisão registrada (C44). E o retorno **declara o próprio limite**
+em `drain_scope: 'engine_originated_only'`, porque `outbound_messages` não alcança o controle (C43).
+
+**Vermelho FORTE, e o mais forte da épica:** 11 casos EXECUTARAM e falharam com
+`TypeError: reconcilePauseTx is not a function`, com **zero** erros de fixture. Chegar a esse vermelho
+custou três correções de fixture minhas — `representative_message_id` tem FK para `mensagens`,
+`protocol_version` é NOT NULL com CHECK `= 1`, e `engine_runs_closed_chk` exige `closed_at`,
+`closed_reason` e `capabilities_revoked_at` juntos. Um vermelho por fixture quebrada não mede o que o
+teste afirma medir.
+
+**Mutação, em três rodadas: 14 MORTOS, 3 sobreviventes, 0 sem explicação.**
+
+⚠️ **Dois mutantes foram PULADOS por âncora ambígua, e isso é o achado de método da unidade (C47).**
+`M01` (o gate de epoch) e `CB4` (o escopo do lock) casavam DUAS vezes no arquivo, porque `pauseInTx` e
+`reconcileInTx` moram no mesmo módulo e compartilham vocabulário. A guarda do harness os recusou e
+imprimiu `PULADO` — mas pulado é **indistinguível de morto para quem lê só o placar**. Remedidos com
+âncora única, **os dois morreram** (`M01b`, `CB4b`). Se eu os tivesse somado, teria registrado "15 de
+15" com duas das garantias centrais jamais exercitadas.
+
+**Os 3 sobreviventes foram ATRIBUÍDOS por mutação combinada, não explicados por hipótese.** Tirar
+`tenant_id` e `agent_id` das contagens (CB1, CB2) e do `UPDATE` de modo (CB3) não muda nada — e
+`CB4b`, que tira o escopo do **lock**, MATA. Conclusão medida: o isolamento é enforçado no lock, e os
+predicados nas contagens são defesa em profundidade sobre uma topologia que já escopa (`control_id` +
+FK composto + PK uuid).
+
+**Dois defeitos meus, achados pela varredura e corrigidos com caso próprio.** `epoch_mismatch` estava
+declarado no tipo de retorno e **nunca era produzido** — vocabulário sem emissor, o mesmo defeito que
+o C24 registra contra mim; liguei a conferência (§8.2.3 passo 3) e o caso 12 passou a exigi-la. E a
+contagem de entregas desconhecidas **dobrava** com múltiplas gerações de run no mesmo turno, porque
+`outbound_messages` junta por turno e `one_open_turn_uq` só restringe as ABERTAS; o caso 13 prende o
+`count(DISTINCT o.id)`. Nenhum dos dois era visível no verde de 11 casos.
+
+**Gates:** `tsc` 0, `eslint` 0, `lint` 0 (483 warnings, inalterado), `check:node` 0, `docs:ai:check` 0,
+`config:check:drift` 0, `audit:exceptions:check` 0, `migrate:reservations:check` 0.
+**Real-db: 209/209 em 8 arquivos** (196 da baseline + 13 novos) — nada do journal foi perturbado.
+
+**⚠️ REGRESSÃO: a aritmética NÃO fechou sozinha, e isto fica registrado em vez de arredondado.**
+`51 failed | 10267 passed | 1242 skipped (11560)` contra `50 | 10268 | 1229 (11547)` do V-036.
+Pulados e total sobem exatamente +13 (o spec é de integração e pula na lane unitária), mas **falhas
++1, passados −1 e arquivos em falha 20 → 21**. Atribuído por medição, não por conveniência:
+- o 21º arquivo é `tests/unit/scripts/check-commit-trailers.spec.ts`, **flake sob paralelismo total**
+  — isolado dá **13/13 em 11s, duas vezes**, e na suíte cheia levou 51s e falhou um caso. O fonte
+  prova que ele cria um repositório git PRÓPRIO em temp dir, então não depende da minha branch nem da
+  minha decisão sobre o trailer. Minha primeira hipótese era que fosse meu, e a evidência a desmentiu;
+- `setup-auth-dir` e `tool-request-credencial` falham deterministicamente, mas são **baseline
+  documentada**: constam nominalmente do catálogo do V-007 (linha 128, "`tool-request-credencial` 1 ·
+  `setup-auth-dir` 1 (drive letter)"), e as mensagens confirmam causa de Windows — letra de unidade e
+  separador de caminho. Nenhuma das duas alcança módulo meu.
+
+**Poluição PRE-EMPTADA e um vazamento ANTIGO estancado (C46).** A guarda de aposentadoria manteve a
+fila de outbox em ZERO durante as três rodadas de mutação. E a atribuição por tenant revelou que as 10
+linhas que eu vinha lendo como "baseline 8" eram vazamento do spec **commitado** do P04.1, crescendo 2
+por rodada; a mesma guarda foi aplicada lá e a fila passou a ZERADA.
+
+**O que esta unidade NÃO faz:** o `resume` com `resumePolicy='future_only'`, o serviço puro de
+transporte e o router tRPC (C23), os fences das dez fronteiras de egresso do §8.2.4 e a tabela
+`conversation_handoff_requests`.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10268 | 50 | 1229 | Medido de novo em P04.3b: passados **INALTERADOS** em 10268, pulados 1217 → **1229** e total 11535 → **11547**, **+12 = exatamente os doze casos** do spec de pausa, que pula na lane unitária por ser de INTEGRAÇÃO — aritmética inversa à do P04.3a, e prevista antes de medir. Falhos (50) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.3a: passados 10261 → **10268** e total 11528 → **11535**, **+7 = exatamente os sete casos** do spec do módulo de SQL puro; falhos (50), pulados (1217) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 196 | 0 | — | Agora com `hermes-pause-conversation-real-db` (12 de P04.3b), em 7 arquivos; os 184 anteriores seguem verdes, o que prova que o primeiro escritor de `conversation_controls` não perturbou o journal. Detalhe anterior: | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10267 | 51 | 1242 | Medido de novo em P04.4: pulados 1229 → **1242** e total 11547 → **11560**, +13 = os treze casos do spec de reconciliação, que pula na lane unitária por ser de integração. ⚠️ **Falhas 50 → 51 e passados 10268 → 10267**, com os arquivos em falha indo de 20 a 21 — atribuído e NÃO arredondado: o entrante é `scripts/check-commit-trailers`, flake sob paralelismo (isolado: 13/13 em 11s, duas vezes; na suíte cheia: 51s e uma falha), e o fonte prova que ele cria repositório git próprio em temp dir, logo não depende desta branch. Ver V-039. Histórico de P04.3b: passados **INALTERADOS** em 10268, pulados 1217 → **1229** e total 11535 → **11547**, **+12 = exatamente os doze casos** do spec de pausa, que pula na lane unitária por ser de INTEGRAÇÃO — aritmética inversa à do P04.3a, e prevista antes de medir. Falhos (50) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.3a: passados 10261 → **10268** e total 11528 → **11535**, **+7 = exatamente os sete casos** do spec do módulo de SQL puro; falhos (50), pulados (1217) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 209 | 0 | — | Agora com `hermes-reconcile-pause-real-db` (13 de P04.4), em **8 arquivos**; os 196 anteriores seguem verdes. Detalhe anterior: | Agora com `hermes-pause-conversation-real-db` (12 de P04.3b), em 7 arquivos; os 184 anteriores seguem verdes, o que prova que o primeiro escritor de `conversation_controls` não perturbou o journal. Detalhe anterior: | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |

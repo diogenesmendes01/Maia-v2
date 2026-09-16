@@ -140,6 +140,32 @@ d("conversation_control_commands — caracterização contra Postgres real", () 
   });
 
   afterAll(async () => {
+    // VAZAMENTO ESTANCADO — descoberto depois, medindo, não por leitura.
+    //
+    // `conversation_control_commands_outbox_idx` é PARCIAL e CROSS-TENANT:
+    // `(lease_expires_at, tenant_id, agent_id) WHERE status='accepted' AND
+    // drain_status IS DISTINCT FROM 'complete'`. A coluna líder é o prazo, não
+    // o tenant — a mesma forma dos varredores das migrations 114/131/140.
+    //
+    // Este spec cria 2 comandos `accepted` por rodada e não os retirava: cinco
+    // execuções deixaram 10 linhas na fila, e a contagem só parou de crescer
+    // quando eu a atribuí (os specs de P04.3b, escritos depois com a guarda,
+    // estavam em ZERO com 420 comandos criados). Um varredor de outbox futuro
+    // herdaria esse lixo como trabalho pendente real.
+    //
+    // APOSENTA em vez de apagar: a FK do comando para o controle é
+    // `ON DELETE RESTRICT`, e marcar `drain_status='complete'` é o que tira a
+    // linha do predicado parcial. O histórico fica; o que sai é a fila.
+    if (pool) {
+      await pool.query(
+        `UPDATE conversation_control_commands
+            SET drain_status = 'complete', updated_at = now()
+          WHERE tenant_id = ANY($1::text[])
+            AND status = 'accepted'
+            AND drain_status IS DISTINCT FROM 'complete'`,
+        [[T_A, T_B]],
+      );
+    }
     await pool?.end();
   });
 

@@ -50,6 +50,8 @@ import { sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { getCurrentAgent, getCurrentTenant } from '../tenant-context.js';
 import { lockControlByIdSql } from './conversation-control-sql.js';
+import { statusList } from './turn-fence-sql.js';
+import { OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES } from '@/runtime/outbound/recovery-contract.js';
 import { auditTx } from '@/governance/audit.js';
 import { canonicalDigest } from '@/integrations/hermes/canonical-json.js';
 
@@ -332,6 +334,229 @@ async function pauseInTx(
   };
 }
 
+/** O que a reconciliação devolve, com o limite da contagem DECLARADO. */
+export type ReconcilePauseResult =
+  | {
+      ok: true;
+      idempotent: boolean;
+      control_id: string;
+      mode: string;
+      epoch: string;
+      drain_status: 'complete' | 'reconciliation_required';
+      inflight_effects: number;
+      unknown_deliveries: number;
+      /**
+       * A contagem cobre APENAS egresso de origem engine. `outbound_messages`
+       * alcança o TURNO, não o controle, e nem ela nem `agent_turns` têm
+       * `control_id` — medido no catálogo, registrado em C43. Declarar o escopo
+       * é o que impede o consumidor de ler "0" como "não há efeito em aberto".
+       */
+      drain_scope: 'engine_originated_only';
+      updated_at: Date;
+    }
+  | {
+      ok: false;
+      reason: 'control_not_found' | 'mode_not_allowed' | 'epoch_mismatch';
+      current_mode?: string;
+      current_epoch?: string;
+    };
+
+export type ReconcilePauseInput = {
+  control_id: string;
+  expected_epoch: string;
+  idempotency_key: string;
+  requested_by_app_user_id: string;
+};
+
+/**
+ * Os quatro estados que o índice parcial `engine_tool_calls_unsettled_idx`
+ * define como NÃO liquidada — a mesma definição que `ESTADOS_CONCILIADOS` usa
+ * do outro lado, em `engine-repos.ts`. Reusada, não reinventada: uma terceira
+ * definição de "em aberto" é o defeito que o C18 e o C20 me custaram.
+ *
+ * `approval_required` fica DE FORA deliberadamente (C44): a pergunta do §8.2.1
+ * é "há I/O AUTORIZADO em aberto?", e uma chamada parada esperando humano não
+ * tem autorização. Contá-la prenderia em `pausing` toda conversa com aprovação
+ * pendente.
+ */
+const ESTADOS_EM_VOO = [
+  'received',
+  'dispatching',
+  'handler_started',
+  'effect_unknown',
+] as const;
+
+type DrenagemRow = {
+  runs_abertos: string;
+  calls_em_voo: string;
+  entregas_desconhecidas: string;
+};
+
+async function reconcileInTx(
+  tx: Executor,
+  input: ReconcilePauseInput,
+): Promise<ReconcilePauseResult> {
+  const { tenant_id, agent_id } = scope();
+
+  const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
+    await tx.execute(
+      lockControlByIdSql({ tenant_id, agent_id, control_id: input.control_id }),
+    ),
+  )[0];
+
+  if (!controle) return { ok: false, reason: 'control_not_found' };
+
+  // Epoch ANTES de modo, como na pausa e pela mesma razão: o epoch é o marcador
+  // de AUTORIDADE, e quem chega com epoch velho está agindo sobre uma visão
+  // obsoleta do controle — fato diferente de "a transição não se aplica a este
+  // modo". O §8.2.3 passo 3 lista o epoch entre o que se confere.
+  //
+  // Esta conferência foi ACRESCENTADA depois: a primeira versão declarava
+  // `epoch_mismatch` no tipo de retorno e nunca o produzia — vocabulário sem
+  // emissor, o mesmo defeito que este repositório já registra em C24 e que o
+  // arquivo de ações de auditoria descreve em `llm_circuit_opened/closed`.
+  if (controle.control_epoch !== input.expected_epoch) {
+    return {
+      ok: false,
+      reason: 'epoch_mismatch',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // Já em `human`: a tomada foi confirmada antes. Devolve idempotente e NÃO
+  // audita de novo — a operação não aconteceu de novo.
+  if (controle.mode === 'human') {
+    return {
+      ok: true,
+      idempotent: true,
+      control_id: controle.id,
+      mode: 'human',
+      epoch: controle.control_epoch,
+      drain_status: 'complete',
+      inflight_effects: 0,
+      unknown_deliveries: 0,
+      drain_scope: 'engine_originated_only',
+      updated_at: new Date(),
+    };
+  }
+
+  // `bot` não se reconcilia: não há tomada a confirmar.
+  if (controle.mode !== 'pausing') {
+    return {
+      ok: false,
+      reason: 'mode_not_allowed',
+      current_mode: controle.mode,
+      current_epoch: controle.control_epoch,
+    };
+  }
+
+  // A PROVA DE DRENAGEM — composta, e declarada como composição (C42). O
+  // "journal de efeitos/admissão" que o §8.2.3 pressupõe não existe; estes três
+  // predicados são o que dá para provar hoje sem inventar estrutura.
+  //
+  // O `count(DISTINCT o.id)` da terceira subconsulta NÃO é zelo supérfluo:
+  // `outbound_messages` junta a `engine_runs` por `(tenant, agent, turn_id)`, e
+  // um turno pode ter VÁRIAS gerações de run — `engine_runs_one_open_turn_uq`
+  // só restringe as ABERTAS, então as fechadas se acumulam. Sem o `DISTINCT`,
+  // um mesmo artefato seria contado uma vez por geração e a drenagem
+  // reportaria mais entregas desconhecidas do que existem. As contagens de tool
+  // call não correm esse risco: o join delas usa a chave composta inteira
+  // (`tenant, agent, turn_id, run_id`), então casa exatamente um run.
+  //
+  // Esta explicação mora AQUI, e não dentro do template, porque comentário SQL
+  // com crase dentro de um `sql` do drizzle ENCERRA o template literal — foi
+  // exatamente o que quebrou a compilação deste arquivo numa versão anterior,
+  // com seis `TS1005` em cascata e um sintoma que não apontava para a causa.
+  const d = linhas<DrenagemRow>(
+    await tx.execute(sql`
+      SELECT
+        (SELECT count(*) FROM engine_runs r
+          WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
+            AND r.control_id = ${input.control_id}
+            AND r.phase <> 'closed')::text AS runs_abertos,
+        (SELECT count(*) FROM engine_tool_calls c
+           JOIN engine_runs r
+             ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+            AND r.turn_id = c.turn_id AND r.id = c.run_id
+          WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+            AND r.control_id = ${input.control_id}
+            AND c.state IN (${statusList(ESTADOS_EM_VOO)}))::text AS calls_em_voo,
+        (
+          (SELECT count(*) FROM engine_tool_calls c
+             JOIN engine_runs r
+               ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+              AND r.turn_id = c.turn_id AND r.id = c.run_id
+            WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+              AND r.control_id = ${input.control_id}
+              AND c.effect_evidence = 'unknown')
+        + (SELECT count(DISTINCT o.id) FROM outbound_messages o
+             JOIN engine_runs r
+               ON r.tenant_id = o.tenant_id AND r.agent_id = o.agent_id
+              AND r.turn_id = o.turn_id
+            WHERE o.tenant_id = ${tenant_id} AND o.agent_id = ${agent_id}
+              AND r.control_id = ${input.control_id}
+              AND o.status NOT IN (${statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES)}))
+        )::text AS entregas_desconhecidas`),
+  )[0]!;
+
+  const inflight = Number(d.runs_abertos) + Number(d.calls_em_voo);
+  const desconhecidas = Number(d.entregas_desconhecidas);
+
+  if (inflight > 0 || desconhecidas > 0) {
+    // NÃO finge drenagem concluída — a frase é da spec. O modo fica em
+    // `pausing`, que é estado REAL: barreira posta, drenagem pendente.
+    return {
+      ok: true,
+      idempotent: false,
+      control_id: controle.id,
+      mode: 'pausing',
+      epoch: controle.control_epoch,
+      drain_status: 'reconciliation_required',
+      inflight_effects: inflight,
+      unknown_deliveries: desconhecidas,
+      drain_scope: 'engine_originated_only',
+      updated_at: new Date(),
+    };
+  }
+
+  // Drenado. O epoch NÃO incrementa: confirmar a mesma tomada não é tomada
+  // nova, e incrementar aqui invalidaria claims que a própria pausa já fenceou.
+  const atualizado = linhas<ControleAtualizado>(
+    await tx.execute(sql`
+      UPDATE conversation_controls
+         SET mode = 'human', updated_at = now()
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${input.control_id} AND mode = 'pausing'
+   RETURNING mode, control_epoch::text AS control_epoch, updated_at`),
+  )[0];
+
+  if (!atualizado) return { ok: false, reason: 'control_not_found' };
+
+  await auditTx(tx, {
+    acao: 'conversation_control_acquired',
+    metadata: {
+      control_id: input.control_id,
+      epoch: atualizado.control_epoch,
+      drain_scope: 'engine_originated_only',
+      requested_by: input.requested_by_app_user_id,
+    },
+  });
+
+  return {
+    ok: true,
+    idempotent: false,
+    control_id: controle.id,
+    mode: atualizado.mode,
+    epoch: atualizado.control_epoch,
+    drain_status: 'complete',
+    inflight_effects: 0,
+    unknown_deliveries: 0,
+    drain_scope: 'engine_originated_only',
+    updated_at: atualizado.updated_at,
+  };
+}
+
 export const conversationControlRepo = {
   /**
    * A pausa numa transação própria — o atalho para quem não tem transação em
@@ -355,5 +580,32 @@ export const conversationControlRepo = {
     input: PauseConversationInput,
   ): Promise<PauseConversationResult> {
     return pauseInTx(tx, input);
+  },
+
+  /**
+   * A reconciliação `pausing → human` do §8.2.1, em transação própria.
+   *
+   * NÃO é comando de operador: quem decide é o reconciliador Maia, e por isso
+   * ela não cria linha em `conversation_control_commands` — o `kind` daquela
+   * tabela só admite `pause` e `resume`. A idempotência vem do ESTADO: um
+   * controle já em `human` devolve `idempotent: true` sem reauditar.
+   */
+  async reconcilePauseTx(
+    input: ReconcilePauseInput,
+  ): Promise<ReconcilePauseResult> {
+    return withTx((tx) => reconcileInTx(tx, input));
+  },
+
+  /**
+   * A MESMA reconciliação, na transação de quem chama — mesmo motivo do par da
+   * pausa: um caller que já está numa transação precisa que a confirmação da
+   * tomada entre no mesmo commit da decisão que a autorizou. Os dois
+   * compartilham este corpo, então não há como um divergir do outro.
+   */
+  async reconcilePauseInTx(
+    tx: Executor,
+    input: ReconcilePauseInput,
+  ): Promise<ReconcilePauseResult> {
+    return reconcileInTx(tx, input);
   },
 };
