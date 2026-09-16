@@ -92,14 +92,16 @@ import {
   streamPoisonProbe,
   streamSuccessorCandidate,
 } from './stream-head-sql.js';
-// P04.6 (spec maia-hermes §8.2.4, §8.2.5) — o HOLD de CONTROLE HUMANO, no
-// módulo que é dono de `conversation_controls`. Os QUATRO consumidores neste
-// arquivo — o `WHERE` do claim, o filtro do recovery, o dispatcher cross-tenant
-// e a eleição da promoção — chamam esta função; nenhum monta predicado próprio,
-// pela mesma razão que vale para a regra FIFO e para o poison.
+// P04.6/P04.6b (spec maia-hermes §8.2.4, §8.2.5) — o HOLD de CONTROLE HUMANO,
+// no módulo que é dono de `conversation_controls`. Os SEIS consumidores neste
+// arquivo — o `WHERE` do claim, o filtro do recovery, o dispatcher cross-tenant,
+// a eleição da promoção e, desde o P04.6b, o enumerador de janelas de debounce
+// vencidas e o CAS que as fecha — chamam esta função; nenhum monta predicado
+// próprio, pela mesma razão que vale para a regra FIFO e para o poison.
 // `tests/unit/runtime/conversation-control-claim-contract.spec.ts` conta as
 // chamadas e proíbe que `conversation_controls` seja nomeada aqui dentro.
 import {
+  ESTADOS_DESCARTAVEIS_DO_BACKLOG,
   humanControlProbe,
   streamNotHumanControlled,
 } from './conversation-control-sql.js';
@@ -3663,6 +3665,92 @@ export function recordRecoveredOutboundTurnCommitted(input: {
     to: 'completed',
     outcome: input.outcome,
   });
+}
+
+/**
+ * P04.5b.2b (spec maia-hermes §8.2.5) — descarta administrativamente UM turno
+ * retido, COMPARTILHANDO a transação de quem retoma a conversa.
+ *
+ * É `...InTx` e não operação própria porque o §8.2.5 manda fechar a obrigação
+ * de automação dos turnos retidos como parte do comando de resume, e o
+ * watermark é capturado sob o mesmo lock: se o descarte comitasse sozinho, um
+ * resume que falhasse depois deixaria mensagens descartadas com a conversa
+ * ainda em `human`. Daí também a recusa RUIDOSA — uma primitiva `...InTx` não
+ * pode devolver conflito e deixar o caller comitar o resto, regra que
+ * `completeRecoveredOutboundTurnInTx` já estabelece.
+ *
+ * As origens vêm da constante do módulo de controle, e NÃO de
+ * `sourceStatusesFor('ignored', { manual: true })`: aquela lista devolve também
+ * `running`, porque `running → ignored` é aresta AUTOMÁTICA. Cancelar
+ * administrativamente um turno EM EXECUÇÃO é o oposto do "sem execução/efeito
+ * pendente" que a spec exige, e montar as origens pela função genérica traria
+ * isso junto sem ninguém notar.
+ *
+ * O fence é `none` por ser honesto, não por conveniência: um turno em
+ * `received`/`queued`/`retryable` ainda não tem posse a respeitar. Quem impede
+ * o descarte de um turno já reivindicado é a lista de origens, e o caso 4 do
+ * spec prende exatamente essa ponta.
+ */
+export async function cancelHeldBacklogTurnInTx(
+  tx: TurnTransitionExecutor,
+  input: { turn_id: string; expected_version: number },
+): Promise<Extract<TurnTransitionResult, { ok: true }>> {
+  // Valida o contrato nas TRÊS origens antes de tocar o banco, pela regra do
+  // cabeçalho deste arquivo: nenhum caller escreve `status` direto. Duas delas
+  // só existem pela porta manual (P04.5b.1); `received → ignored` já era
+  // automática, e o modo manual é aditivo.
+  for (const origem of ESTADOS_DESCARTAVEIS_DO_BACKLOG) {
+    assertTurnTransition(origem, 'ignored', 'operator_cancelled', {
+      manual: true,
+    });
+  }
+  const result = await runTransitionOnExecutor(
+    tx,
+    {
+      turn_id: input.turn_id,
+      to: 'ignored',
+      outcome: 'operator_cancelled',
+      sources: [...ESTADOS_DESCARTAVEIS_DO_BACKLOG],
+      expected_version: input.expected_version,
+      // `bumpAttempt` fica de fora DE PROPÓSITO: `attempt_count` conta
+      // EXECUÇÕES, e um descarte administrativo não executou nada. Gastar
+      // tentativa aqui empurraria para a DLQ um turno que a plataforma nunca
+      // chegou a tentar responder.
+      patch: { next_attempt_at: null, clearClaim: true },
+    },
+    { kind: 'none' },
+    scope(),
+  );
+  if (!result.ok) {
+    throw new Error(
+      `held_backlog_cancellation_conflict:${result.conflict}:${input.turn_id}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Registra os descartes somente DEPOIS que a transação externa comitou.
+ *
+ * Emitir dentro da transação faria `maia_turn_transitions_total` contar
+ * descartes que o rollback desfez — a métrica mentiria exatamente no incidente
+ * em que alguém a consultaria.
+ */
+export function recordBacklogCancellationCommitted(input: {
+  cancelados: number;
+}): void {
+  if (input.cancelados <= 0) return;
+  incCounter(
+    'maia_turn_transitions_total',
+    {
+      // `any` porque um mesmo resume descarta turnos de origens diferentes; é o
+      // mesmo rótulo que `recordCommittedTransition` usa quando há mais de uma.
+      from: 'any',
+      to: 'ignored',
+      outcome: 'operator_cancelled',
+    },
+    input.cancelados,
+  );
 }
 
 async function runTransitionOnExecutor(

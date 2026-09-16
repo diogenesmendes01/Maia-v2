@@ -512,6 +512,28 @@ sequência P00–P12 do capítulo 10 da spec.
   ⚠️ **O que esta fatia NÃO faz, dito aqui para não ser lido como mais do que é:** ela barra
   ADMISSÃO, não interrompe execução em voo. Turnos já `claimed`/`running` quando o modo volta seguem
   fora — ver **C55**, que registra o achado da revisão ainda em aberto e mantém o K-12 PARCIAL.
+- `U-P04.5b.2b` — **concluída e verificada**: `cancelHeldBacklogTurnInTx`, a primitiva que descarta
+  UM turno retido compartilhando a transação de quem retoma, e `recordBacklogCancellationCommitted`,
+  o emissor ADIADO da métrica. É `...InTx` pelo precedente de `completeRecoveredOutboundTurnInTx`, e
+  daí vem também a recusa ruidosa: conflito aqui é rollback obrigatório, nunca conflito devolvido com
+  o caller comitando o resto. As origens vêm da constante e **não** de `sourceStatusesFor`, que
+  traria `running` junto — a armadilha que o P04.5b.1 documentou e que o caso 4 prende.
+  ⚠️ **O vermelho inicial passava de graça em 4 dos 10 casos.** Eles usavam `rejects.toThrow()`, e um
+  `TypeError` de função inexistente satisfaz isso: passariam contra implementação nenhuma. Endurecidos
+  para cobrar o conflito ESPECÍFICO, o vermelho virou 10/10.
+  ⚠️ **O lint apontou uma vacuidade, não um estilo:** `inA2`/`inB` sem uso significavam que os casos de
+  isolamento provavam "A não alcança" sem provar que o turno era cancelável. Fechada a outra metade, a
+  advertência sumiu sozinha.
+  ⚠️ **Uma mutação que eu NÃO previa sobreviveu, e a culpa era da asserção.** Emitir o contador dentro
+  da transação passou ileso porque o caso 10 procurava `to="ignored",outcome="operator_cancelled"` e
+  `key()` (`src/lib/metrics.ts:41`) ordena rótulos alfabeticamente — a agulha nunca é produzida, logo
+  a asserção não podia falhar. É a **quinta** ocorrência da família C41, e a primeira em que quem
+  pegou foi a varredura e não a leitura. Corrigida para usar a MESMA agulha nas duas metades.
+  **Rodada final: 9 mutações, 9 mortas, 0 sobreviventes, 0 puladas** (3 âncoras ambíguas remedidas
+  antes, por C47). Gates `tsc`/`eslint` 0; família real-db **337 casos / 13 arquivos / 0 falhas**;
+  regressão EXATA — falhas e passados inalterados, pulados +11, conjunto de arquivos idêntico.
+  **A primitiva nasce INERTE: sem call site de produção.** A fiação no `resumeConversationTx` é a
+  fatia seguinte. Ver V-045.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
