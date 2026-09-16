@@ -67,12 +67,14 @@ import type {
 } from "@/runtime/engines/contracts.js";
 import { engineTerminalProposalV1Schema } from "@/runtime/engines/schemas.js";
 import { OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES } from "@/runtime/outbound/recovery-contract.js";
+import { RECOVERABLE_TURN_STATUSES } from "@/runtime/turns/contract.js";
 import {
   classifyToolCancellation,
   minimumBudgetMs,
   type ToolEffectClass,
 } from "@/tools/effect-class.js";
 import { db, withTx } from "../client.js";
+import { statusList } from "./turn-fence-sql.js";
 import {
   agent_turns,
   conversation_controls,
@@ -836,17 +838,80 @@ const FASES_QUE_ACEITAM_RETRY_SEGURO = new Set<EngineRunPhaseV1>([
   "result_ready",
 ]);
 
-/** Espelha a constante EXPORTADA do contrato de saída (C18), sem redigitar. */
-const LISTA_STATUS_FINAIS = sql.join(
-  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES.map((s) => sql`${s}`),
-  sql`, `,
-);
+/**
+ * Espelha a constante EXPORTADA do contrato de saída (C18), sem redigitar.
+ *
+ * Usa `statusList` da casa (`turn-fence-sql.ts`) em vez de um `sql.join` local:
+ * eu havia reescrito o helper à mão em P03.6b sem saber que ele já existia, e o
+ * docstring dele documenta o motivo de existir — interpolar um array JS num
+ * template do Drizzle não produz array do Postgres, vira RECORD e o banco recusa
+ * em tempo de EXECUÇÃO. Duplicar a forma certa por acaso é pior que reusá-la.
+ */
+const LISTA_STATUS_FINAIS = statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES);
 
 /** Derivada do Set acima — uma fonte só para "chamada conciliada". */
-const LISTA_ESTADOS_CONCILIADOS = sql.join(
-  Array.from(ESTADOS_CONCILIADOS).map((s) => sql`${s}`),
-  sql`, `,
-);
+const LISTA_ESTADOS_CONCILIADOS = statusList(Array.from(ESTADOS_CONCILIADOS));
+
+/**
+ * As fases com trabalho EM ABERTO (§5.6.3, varredura).
+ *
+ * Esta lista tem de ser IDÊNTICA ao predicado parcial de `engine_runs_due_idx`
+ * e `engine_runs_due_dispatch_idx` (140, conferidos no banco). Divergir não
+ * quebra a correção — quebra o PLANO: o índice parcial deixa de casar e a
+ * varredura da tabela mais quente vira seq scan silencioso, exatamente a
+ * armadilha que `OUTBOUND_SELECTABLE_STATUSES` documenta no contrato de saída.
+ */
+const FASES_ABERTAS = [
+  "prepared",
+  "submitting",
+  "submission_unknown",
+  "running",
+  "cancelling",
+  "reconciling",
+  "result_ready",
+] as const;
+const LISTA_FASES_ABERTAS = statusList(FASES_ABERTAS);
+
+/**
+ * Turnos a partir dos quais AINDA se pode rearmar trabalho.
+ *
+ * Reusada do contrato de turnos, não redigitada: `outbound_pending` está
+ * deliberadamente FORA dela ("a resposta já foi comprometida e quem finaliza é
+ * o delivery worker, nunca uma nova execução do reasoner"). O COMPLEMENTO desta
+ * lista é precisamente a condição do §5.8.4 item 1 — turno `outbound_pending`
+ * ou terminal ⇒ só manutenção de metadata, nunca start/gateway/adoção.
+ */
+const LISTA_TURNOS_RECUPERAVEIS = statusList(RECOVERABLE_TURN_STATUSES);
+
+/** Cursor keyset na ordem do índice cross-tenant (C19). Nunca offset. */
+export type DueScopeCursor = {
+  due_at: string;
+  tenant_id: string;
+  agent_id: string;
+};
+
+export type EnumerateDueScopesResult = {
+  /** SÓ o par. Conteúdo de run não atravessa varredura cross-tenant. */
+  scopes: Array<{ tenant_id: string; agent_id: string }>;
+  next_cursor: DueScopeCursor | null;
+};
+
+export type DueRunCursor = { next_poll_at: string; run_id: string };
+
+export type DueRun = {
+  run_id: string;
+  turn_id: string;
+  phase: EngineRunPhaseV1;
+  next_poll_at: string;
+  turn_status: string;
+  /** §5.8.4 item 1: turno já não reivindicável ⇒ só metadata. */
+  maintenance_only: boolean;
+};
+
+export type ListDueRunsResult = {
+  runs: DueRun[];
+  next_cursor: DueRunCursor | null;
+};
 
 export const engineRunsRepo = {
   /**
@@ -3221,6 +3286,140 @@ export const engineRunsRepo = {
         already_closed: false,
       };
     });
+  },
+
+  /**
+   * Quem tem trabalho vencido (§5.6.3 linha 1137). **CROSS-TENANT, sem ALS.**
+   *
+   * É a ÚNICA operação deste módulo que não chama `scope()`, e não pode chamar:
+   * `getCurrentTenant()` LANÇA fora de contexto, e a pergunta "quem tem
+   * trabalho?" não tem tenant para ser feita dentro. Mesmo desenho da varredura
+   * de lease vencida da 114 e de `objectivesRepo.reclaimExpiredTaskLeases` — o
+   * escopo por tenant volta a valer no passo seguinte, quando o chamador entra
+   * em `runWithTenantContext` por par (é o que `briefings.ts` já faz).
+   *
+   * O preço de abrir mão do escopo é NÃO DEVOLVER CONTEÚDO: o retorno é o par e
+   * o cursor, nada mais. Um `turn_id` ou um `request_json` aqui seria dado de um
+   * tenant atravessando uma leitura que nenhum tenant autorizou.
+   *
+   * Cursor é KEYSET na ordem do índice, nunca offset (C19): offset num varredor
+   * concorrente pula linhas quando o conjunto muda entre páginas — e aqui ele
+   * muda por construção, porque a própria manutenção reescreve `next_poll_at`.
+   */
+  async enumerateDueScopes(input: {
+    limit: number;
+    cursor?: DueScopeCursor | null;
+  }): Promise<EnumerateDueScopesResult> {
+    const cursor = input.cursor ?? null;
+    // A comparação é de TUPLA sobre o valor AGREGADO, por isso `HAVING` e não
+    // `WHERE`: o cursor aponta para um par, e o que ordena pares é o menor
+    // vencimento dentro de cada um.
+    const depoisDoCursor = cursor
+      ? sql`HAVING (min(next_poll_at), tenant_id, agent_id)
+              > (${cursor.due_at}::timestamptz, ${cursor.tenant_id}, ${cursor.agent_id})`
+      : sql``;
+
+    const rows = linhas<{
+      tenant_id: string;
+      agent_id: string;
+      due_at: string;
+    }>(
+      await db.execute(sql`
+        SELECT tenant_id, agent_id, min(next_poll_at)::text AS due_at
+          FROM ${engine_runs}
+         WHERE phase IN (${LISTA_FASES_ABERTAS})
+           AND next_poll_at <= clock_timestamp()
+         GROUP BY tenant_id, agent_id
+         ${depoisDoCursor}
+         ORDER BY min(next_poll_at), tenant_id, agent_id
+         LIMIT ${input.limit}`),
+    );
+
+    // Objetos NOVOS com duas chaves: devolver a row do banco deixaria `due_at`
+    // vazar para o chamador, e o §5.6.3 diz "pares escopados e cursor".
+    const scopes = rows.map((r) => ({
+      tenant_id: r.tenant_id,
+      agent_id: r.agent_id,
+    }));
+    const ultimo = rows[rows.length - 1];
+    const next_cursor =
+      rows.length === input.limit && ultimo
+        ? {
+            due_at: ultimo.due_at,
+            tenant_id: ultimo.tenant_id,
+            agent_id: ultimo.agent_id,
+          }
+        : null;
+
+    conta("enumerate_due", "ok");
+    return { scopes, next_cursor };
+  },
+
+  /**
+   * Os runs vencidos DESTE escopo (§5.6.3 linha 1137). **Sob ALS.**
+   *
+   * O contraste com `enumerateDueScopes` é o ponto: o isolamento de que a
+   * varredura cross-tenant abre mão, esta operação tem de garantir. Por isso
+   * `scope()` é chamado e entra no `WHERE` — e por isso ela LANÇA fora de
+   * contexto, em vez de devolver o mundo.
+   *
+   * `maintenance_only` é derivado do COMPLEMENTO de `RECOVERABLE_TURN_STATUSES`
+   * em vez de um literal: quando o contrato de turnos ganhar um estado novo, a
+   * classificação acompanha sozinha. Ele responde à primeira frase do §5.8.4 —
+   * turno `outbound_pending` ou terminal proíbe start, gateway e adoção, e
+   * sobra apenas reconciliação de metadata.
+   */
+  async listDueRuns(input: {
+    limit: number;
+    cursor?: DueRunCursor | null;
+  }): Promise<ListDueRunsResult> {
+    const { tenant_id, agent_id } = scope();
+    const cursor = input.cursor ?? null;
+    const depoisDoCursor = cursor
+      ? sql`AND (r.next_poll_at, r.id)
+              > (${cursor.next_poll_at}::timestamptz, ${cursor.run_id}::uuid)`
+      : sql``;
+
+    const rows = linhas<{
+      run_id: string;
+      turn_id: string;
+      phase: string;
+      next_poll_at: string;
+      turn_status: string;
+      maintenance_only: boolean;
+    }>(
+      await db.execute(sql`
+        SELECT r.id AS run_id, r.turn_id, r.phase,
+               r.next_poll_at::text AS next_poll_at,
+               t.status AS turn_status,
+               (t.status NOT IN (${LISTA_TURNOS_RECUPERAVEIS})) AS maintenance_only
+          FROM ${engine_runs} r
+          JOIN ${agent_turns} t
+            ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id AND t.id = r.turn_id
+         WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
+           AND r.phase IN (${LISTA_FASES_ABERTAS})
+           AND r.next_poll_at <= clock_timestamp()
+           ${depoisDoCursor}
+         ORDER BY r.next_poll_at, r.id
+         LIMIT ${input.limit}`),
+    );
+
+    const runs: DueRun[] = rows.map((r) => ({
+      run_id: r.run_id,
+      turn_id: r.turn_id,
+      phase: r.phase as EngineRunPhaseV1,
+      next_poll_at: r.next_poll_at,
+      turn_status: r.turn_status,
+      maintenance_only: r.maintenance_only === true,
+    }));
+    const ultimo = rows[rows.length - 1];
+    const next_cursor =
+      rows.length === input.limit && ultimo
+        ? { next_poll_at: ultimo.next_poll_at, run_id: ultimo.run_id }
+        : null;
+
+    conta("list_due", "ok");
+    return { runs, next_cursor };
   },
 };
 

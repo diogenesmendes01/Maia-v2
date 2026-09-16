@@ -53,6 +53,8 @@ sequência P00–P12 do capítulo 10 da spec.
 | C18 | O §5.7.2 manda fechar `handed_to_outbox` com "commit outbound comprovado" e `safe_to_retry` só com "ausência de outbound" (invariante 7), mas **não diz quais status de `outbound_messages` contam como prova** | spec §5.7.2, §5.6.2 invariante 7, §5.8.4 item 5; `src/runtime/outbound/recovery-contract.ts:108`; `src/db/repositories/outbound-recovery-repo.ts:282,289`; `migrations/063:107`, `121:276-278` | **Reusar o que a casa já decidiu, em vez de derivar dos comentários de migration.** `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES` (`['completed','failed_terminal','cancelled','dead_letter']`) é exportado e é o predicado de RESOLVIDO — deliberadamente mais estrito que "multipart resolvido", porque `delivered` libera a próxima parte mas não fechou histórico e "não prova convergência". Artefato fora dessa lista = `artifacts_unresolved`, e o run não fecha. **Sucesso é outra pergunta**, e essa a casa não exporta: `finalizeResolvedTurnTx` usa `status === 'completed'` open-coded — então `handed_to_outbox` exige pelo menos um artefato `completed`, e isso fica registrado aqui como decisão minha, não como leitura da spec. ⚠️ **Correção de uma versão anterior deste registro:** eu havia escrito que `sent`/`unknown` (vocabulário LEGADO da 063) eram a prova. Está errado para o caminho durável — o marcador de convergência é `completed`, e `delivered` é intermediário que um CAS promove (`outbound-recovery-repo.ts:817-824`). Fechar por `sent` teria declarado handoff sobre linhas que a casa ainda considera em voo. Consulta sempre escopada por `(tenant_id, agent_id, turn_id)`: a FK da 121 é composta |
 | C12 | O `UPDATE` de exemplo do §5.6.4 (marcar start) inclui `AND r.mode = 'live'`; o modo `shadow` (§5.2, P11) também submete ao motor — ele delibera e só não entrega | spec §5.2, §5.6.4, §10 P11 | O gate de modo NÃO é aplicado no submit: adotá-lo literalmente prenderia todo run `shadow` em `prepared`, tornando P11 inexequível. `mode` é enforcado na adoção/egresso, onde o envio acontece. A confirmar quando P11 aterrissar |
 
+| C19 | O §5.6.3 exige que `enumerateDueScopes` devolva "pares escopados **e cursor**" e o §5.8.4 item 2 manda atribuir "próxima **janela finita** de observação" — mas a spec não define NEM a forma do cursor NEM o tamanho da janela, e a casa não tem precedente: `pessoasRepo.listTenantAgentPairsWithActiveOwner`, o único enumerador cross-tenant de pares, não tem limite nem cursor | spec §5.6.3 linha 1137, §5.8.4 item 2; `src/db/repositories/pessoa-repos.ts:169`; índices REAIS conferidos no banco: `engine_runs_due_dispatch_idx (next_poll_at, tenant_id, agent_id)` e `engine_runs_due_idx (tenant_id, agent_id, next_poll_at, id)` | **Cursor = keyset na ORDEM DO ÍNDICE**, nunca offset: `(next_poll_at, tenant_id, agent_id)` na varredura cross-tenant e `(next_poll_at, id)` sob ALS. Offset num varredor concorrente PULA linhas quando o conjunto muda entre páginas — o defeito clássico, e aqui o conjunto muda por construção, já que a própria manutenção reescreve `next_poll_at`. **A janela entra como PARÂMETRO da chamada**, não como constante deste módulo: a spec não dá o número, e escolhê-lo aqui seria política minha disfarçada de leitura — o mesmo erro que o C18 teve de corrigir. **Consequência para os testes:** o mundo é POLUÍDO (4 escopos e 6447 runs vencidos já no banco local, e `tests/setup.ts` não trunca), então as asserções da varredura cross-tenant são de INCLUSÃO e de invariante de paginação (sem lacuna, sem duplicata), nunca de igualdade de conjunto; `listDueRuns` usa tenant dedicado por caso para ter visão limpa sob ALS |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -174,7 +176,7 @@ sequência P00–P12 do capítulo 10 da spec.
   52 casos no spec de runs; 5 mutantes, todos mortos. Registrado sem maquiagem: o caso 50 **não tem
   mutante** porque o código simplesmente não toca naquela coluna — ele guarda uma regressão futura, e
   contá-lo como "coberto pela varredura" seria inflar o placar.
-- `U-P03.6b` — **concluída e verificada**: `closeRunAfterHandoff`, a ÚNICA operação do módulo que exige
+- `U-P03.6b` (commit `378999e1`) — **concluída e verificada**: `closeRunAfterHandoff`, a ÚNICA operação do módulo que exige
   prova EXTERNA ao journal. O C18 tem dois níveis que a implementação separa: RESOLVIDO é
   `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES` (reusada por `sql.join`, não redigitada) e SUCESSO é
   `completed` — um artefato `cancelled` está resolvido e NÃO é entrega (caso 61). `safe_to_retry` exige
@@ -192,6 +194,22 @@ sequência P00–P12 do capítulo 10 da spec.
   cinco morrem em `loadConfig` por o config local pular o `globalSetup` (controle sob o config do
   projeto: 51/51 verdes) e uma (`turn-context-batch-repos`) fica como **item aberto sem controle em
   HEAD**, não atribuível a esta branch por construção. Ver V-027.
+- `U-P03.7a` — **concluída e verificada**: `enumerateDueScopes` + `listDueRuns`, as duas metades
+  OPOSTAS da varredura, e a oposição é o que as torna corretas juntas. A primeira é a ÚNICA operação
+  do módulo que roda CROSS-TENANT e **sem ALS** — não pode chamar `scope()`, porque
+  `getCurrentTenant()` LANÇA fora de contexto e a pergunta "quem tem trabalho vencido?" não tem tenant
+  para ser feita dentro. O padrão veio de `reclaimExpiredTaskLeases` e da varredura de lease vencida da
+  114, não foi inventado. O preço de abrir mão do escopo é NÃO devolver conteúdo: par e cursor, nada
+  mais — o caso 2 prende isso pelas CHAVES EXATAS do objeto. A segunda roda sob ALS, garante o
+  isolamento (caso 9), lança sem contexto (caso 8) e deriva `maintenance_only` do COMPLEMENTO de
+  `RECOVERABLE_TURN_STATUSES` — reusada e não redigitada, porque é ela que já deixa `outbound_pending`
+  de fora com a razão escrita, que é a primeira frase do §5.8.4.
+  15 casos; **12 mutantes, 12 mortos na PRIMEIRA passada**, zero erros de harness. FM9 morreu pelo
+  caso 15, escrito ANTES da varredura por eu ter previsto que os dois métodos têm predicados de
+  vencimento SEPARADOS e nada obriga os dois a concordarem.
+  Corrigido de quebra um defeito meu do P03.6b: eu havia duplicado à mão o helper `statusList` da casa
+  (`turn-fence-sql.ts:61`); substituído, com P03.6b revalidado em 74/74. `test:leak` reexecutado com
+  perfil IDÊNTICO (mesmos 6 arquivos, `outbound-leak` verde). Ver V-028 e C19.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -202,9 +220,28 @@ sequência P00–P12 do capítulo 10 da spec.
 - `U-P02.1`: `MaiaEngine` — o motor local implementando `AgentEnginePortV1`, com raciocínio injetado (`runReasoning`), registro de execução em memória deliberadamente honesto (`not_found/inconclusive`, nunca prova de não-aceite), conflito de `request_key` como recusa terminal e `cancel` que pede sem afirmar ausência de efeito. 15 casos, 5 mutações detectadas.
 
 ### Próximo trabalho
-1. `U-P02.2` — ligar `runReasoning` ao laço REAL: extrair de `runReActLoop` a parte deliberativa (sem despacho), mantendo `runReActLoop` como fachada com o comportamento de hoje. A rede que protege essa troca é a caracterização do P01 (57 casos) — qualquer divergência aparece lá.
-2. `U-P03.2` — `engine-repos` (CAS de fase, admissão de call, journal) sobre as tabelas da 140, com testes contra o Postgres real.
-3. `U-P00.4` — spike sintético: `AIAgent` do checkout pinado contra o provider stub, verificando superfície efetiva de tools, rotação de sessão por compressão, cancelamento e limpeza do home efêmero (depende do worker Python do agente paralelo).
+
+> Esta seção estava OBSOLETA até P03.6b — listava `U-P02.2`, `U-P03.2` e `U-P00.4`, todas concluídas
+> (`609cc189`, `28b3e739`, `6f372874`). Documentação estragada custa tempo real: os comandos de
+> retomada da seção 9 apontavam para binário, data dir e nome de banco errados e consumiram um desvio
+> inteiro de diagnóstico nesta sessão. Manter esta lista viva é parte do trabalho, não enfeite.
+
+1. `U-P03.7b` — **manutenção** (§5.8.4 itens 2 e 4), agora que a enumeração (7a) está concluída:
+   `reserveMaintenanceObservation`/`recordMaintenanceObservation`. Reserva curta por CAS de
+   `row_version` com `next_poll_at <= clock_timestamp()`, onde **a versão devolvida É o fence e NÃO é
+   claim token de turno**; a gravação só vale com a reserva ainda vigente, uma manutenção atrasada não
+   sobrescreve outra, e falha de CAS exige nova leitura — nunca payload cego. A janela de observação
+   entra como PARÂMETRO (C19). Se houver dono vivo em operação, a manutenção ADIA em vez de disputar.
+   Descrição original da etapa, mantida como contexto: `enumerateDueScopes` (CROSS-TENANT, sem ALS,
+   só pares e cursor, nunca conteúdo — o padrão da casa é `objectivesRepo.reclaimExpiredTaskLeases`,
+   com `db.execute` cru e `FOR UPDATE SKIP LOCKED`), `listDueRuns` (sob ALS, pelo índice parcial
+   `engine_runs_due_idx`), e o par `reserveMaintenanceObservation`/`recordMaintenanceObservation`,
+   onde a `row_version` reservada É o fence e NÃO é claim token de turno. Verificado: não há RLS em
+   nenhuma tabela e `client.ts` não injeta tenant por GUC, então a leitura cross-tenant é viável sem
+   papel especial. A "próxima janela finita de observação" do item 2 entra como PARÂMETRO — a spec não
+   dá o número, e inventá-lo seria política minha disfarçada de leitura.
+2. `U-P03.8` — recovery do journal, fechando o P03.
+3. `P04` — controle humano da conversa e fencing de egresso.
 
 ## 7. Decisões pendentes (spec §12.5) — nenhuma preenchida por suposição
 

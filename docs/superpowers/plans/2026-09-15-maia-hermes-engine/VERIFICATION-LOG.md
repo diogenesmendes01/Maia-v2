@@ -939,15 +939,78 @@ módulo nunca tocava, então pulá-lo seria escolher a opção fácil. Resultado
   minhas fixtures nunca escrevem — o vitest sequer carrega o módulo alterado nessa rodada. **Mas não
   afirmo que seja preexistente: não há controle em HEAD para ela.** Fica como item aberto.
 
+### V-028 · P03.7a — a varredura, e as duas metades OPOSTAS do escopo
+
+`enumerateDueScopes` e `listDueRuns` existem para se contradizer, e é isso que as torna corretas juntas.
+
+A primeira roda **CROSS-TENANT, sem ALS** — a única operação do módulo que não chama `scope()`, e não
+pode chamar: `getCurrentTenant()` LANÇA fora de contexto, e a pergunta "quem tem trabalho vencido?"
+não tem tenant para ser feita dentro. Não inventei o padrão: é o mesmo de
+`objectivesRepo.reclaimExpiredTaskLeases` e da varredura de lease vencida da 114 (`db.execute` cru,
+sem `scope()`), e o consumidor entra em `runWithTenantContext` por par depois, como `briefings.ts`
+já faz. O preço de abrir mão do escopo é NÃO DEVOLVER CONTEÚDO: o retorno é o par e o cursor. O caso 2
+prende isso pelas CHAVES EXATAS do objeto — um `turn_id` ou um `due_at` que vazasse ali seria dado de
+um tenant atravessando uma leitura que nenhum tenant autorizou.
+
+A segunda roda **sob ALS** e garante o isolamento de que a primeira abre mão (caso 9), lançando fora
+de contexto (caso 8). `maintenance_only` é derivado do COMPLEMENTO de `RECOVERABLE_TURN_STATUSES`, e
+não de um literal: a constante já existe no contrato de turnos e já deixa `outbound_pending` FORA com
+a razão escrita ("a resposta já foi comprometida e quem finaliza é o delivery worker, nunca uma nova
+execução do reasoner") — que é exatamente a primeira frase do §5.8.4. Reusá-la faz a classificação
+acompanhar sozinha um estado novo do contrato; os casos 10/11/12 prendem os três lados.
+
+**C19 registrado antes de implementar:** a spec exige "pares escopados **e cursor**" e "próxima
+**janela finita** de observação" sem definir nenhum dos dois, e a casa não tem precedente
+(`listTenantAgentPairsWithActiveOwner` não tem limite nem cursor). Decidi cursor KEYSET na ordem do
+índice parcial REAL (conferido no banco, não só na migration) e a janela como PARÂMETRO — escolher o
+número aqui seria política minha disfarçada de leitura, o mesmo erro que o C18 teve de corrigir.
+Offset está descartado por um motivo concreto: o conjunto muda entre páginas por construção, porque a
+própria manutenção reescreve `next_poll_at`.
+
+**Teste num mundo POLUÍDO, medido e não suposto:** o banco local já tinha 4 escopos e 6447 runs
+vencidos de rodadas anteriores, e `tests/setup.ts` não trunca nada. Asserção de igualdade de conjunto
+ali passaria ou falharia conforme o lixo do dia, então as asserções cross-tenant são de INCLUSÃO e de
+invariante de paginação (sem lacuna, sem duplicata), e `listDueRuns` usa um tenant dedicado por caso.
+
+**Varredura: 12 mutantes, 12 mortos na PRIMEIRA passada**, zero sobreviventes, zero erros de harness,
+arquivo restaurado idêntico. FM9 (a guarda de vencimento de `listDueRuns`) morreu com exatamente 1
+falha — o caso 15, que escrevi ANTES de varrer por tê-lo previsto: as duas operações têm predicados de
+vencimento SEPARADOS e nada obriga os dois a concordarem, então o caso 4 sozinho não o cobriria. Três
+âncoras eram ambíguas (`rows.length === input.limit` nos dois métodos; o predicado de isolamento de
+tenant, que colide com `lockControl` na linha 227) e viraram blocos multi-linha antes de medir.
+
+**Correção de um defeito meu, herdado do P03.6b:** eu havia reescrito à mão um helper que a casa já
+tinha. `statusList` (`turn-fence-sql.ts:61`) é literalmente o `sql.join` que dupliquei, e o docstring
+dele explica por que existe — interpolar array JS num template do Drizzle vira RECORD e o Postgres
+recusa em tempo de EXECUÇÃO. Substituído; P03.6b revalidado em 74/74, e a evidência de mutação segue
+aplicável porque os call sites usam o NOME do constante, que não mudou.
+
+**Estado final:** 15 casos no spec de varredura, verdes. `typecheck`, `lint` (481 warnings, idêntico à
+baseline), `check:node`, `docs:ai:check`, `config:check:drift` e `audit:exceptions:check` todos em
+**exit 0** — desta vez com o nome CERTO do último gate, depois de eu o ter invocado como
+`audit:exceptions` e recebido "Missing script", que não é verde nem vermelho, é gate não executado.
+
+**Regressão:** `50 failed | 10233 passed | 1172 skipped (11455)` contra `50 | 10233 | 1157 (11440)` do
+V-027. Passados e falhos INALTERADOS, os mesmos 20 arquivos; pulados e total sobem exatamente +15, que
+é o spec novo. Nenhuma falha cita meus módulos por nome exato — e registro o quase-erro: meu primeiro
+grep de atribuição incluía a palavra `sweep` e casou com `privacy-export-sweeper`, que é falha de
+ambiente Windows já listada 3× neste log. Conferido por nome exato antes de afirmar.
+
+**`test:leak` reexecutado** (esta unidade adiciona a leitura cross-tenant, o caso mais tenant-sensível
+do módulo): perfil **IDÊNTICO** ao do V-027 — `8 failed | 120 passed | 23 skipped (151)`, os MESMOS 6
+arquivos, e `outbound-leak` passando com 10 casos. Acrescentar uma varredura sem escopo não moveu nada
+na suíte de vazamento. As seis falhas continuam classificadas como em V-027, incluindo
+`turn-context-batch-repos` como item aberto sem controle em HEAD.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1157 | Medido de novo em P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 124 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
-| `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Executado em P03.6b e NÃO verde** — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
+| unit (`npm test`, workers default) | 10233 | 50 | 1172 | Medido de novo em P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 139 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a com perfil IDÊNTICO** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
