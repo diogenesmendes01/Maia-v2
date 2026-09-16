@@ -668,14 +668,59 @@ esse helper não existe e criá-lo mexe em módulo compartilhado; e (c) `Planned
 de MENSAGEM (WhatsApp e afins), não de efeito arbitrário de ferramenta — ou seja, a variante com outbox
 pode estar errada em ESPÉCIE, não só em forma de transação. Nada disso foi decidido ainda.
 
+### V-023 · P03.3d — `settleToolCall`, e o fim da faixa de tool calls
+
+Liquida a call sob duas regras que o `dispatch_token` sozinho não garante:
+
+* **Fence do turno ATUAL** (§5.7.4 item 8). Quem perdeu a posse não liquida — o token da call não
+  autoriza adotar resultado tardio. Um reconciliador autorizado usa operação separada, com o próprio
+  claim/row_version; não esta. O caso 35 isola isso girando SÓ o token do turno.
+* **`cancelled` só para `abort_safe`** (item 9). Nas demais classes, cancelar depois do handler seria
+  afirmar ausência de efeito sobre algo que pode ter acontecido; a operação RECUSA
+  (`cancellation_not_allowed`) e aponta `effect_unknown` como o desfecho honesto — que segue
+  bloqueador mesmo que um HTTP 200 chegue depois.
+
+A evidência de efeito respeita o gatilho monotônico da 140: `completed` em classe com efeito vira
+`committed`, `effect_unknown` vira `unknown` (o `unknown_chk` da tabela exige essa coerência), e
+`abort_safe` fica em `none`. Nada escreve `none` por cima de `possible`.
+
+**Mutação: 8 mutantes, previsão exata pela primeira vez.** Previ DM1-DM6 mortos e DM7 sobrevivente, e
+foi isso. E DM7 **não** era redundância: a validação do hash do receipt existia no código e nenhum
+caso a exercitava — `invalid_receipt` era alcançável e indefeso. O caso 38 fecha. Vale registrar o que
+ele mostra: sem a validação, o `receipt_chk` da 140 ainda barra, mas transformando uma recusa TIPADA
+numa transação que estoura. O banco é a rede de segurança, não a primeira linha.
+
+**O acoplamento que NÃO foi feito, de propósito (C16).** O §5.6.3 pede ligar o completion de
+idempotência ao receipt. Não dá hoje sem reescrever módulo compartilhado:
+`markCompletedWithEffect` abre a PRÓPRIA `withTx`, e como o `withTx` desta casa faz `pool.connect()` +
+`BEGIN`, chamá-la de dentro do settle pegaria outra conexão — "atômico" seria afirmação falsa. O
+próprio §5.7.4 item 8 contempla esse estado: "Até essa ligação existir, recovery pode ler cache
+completo com chave/hash exatos, mas não inferir segurança quando a row já expirou". Entregue assim,
+com a limitação nomeada, em vez de eu mexer em `idempotency-repos.ts` de passagem.
+
+**Estado final:** 38 casos no spec de tool calls, verdes; 8 mutantes, todos mortos.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1111 skipped (11394)`, os MESMOS 20 arquivos, nenhuma falha citando `engine-repos` ou `tool-calls`, e
+os pulados subindo exatamente os 9 casos novos (`↓ 38 tests | 38 skipped`).
+
+**Defeito de checkpoint corrigido junto:** o `IMPLEMENTATION-STATE.md` tinha DOIS bullets reivindicando
+`U-P03.3c` — o correto e um obsoleto, sobrevivente do resplit que o C14 provocou, ainda anunciando o
+acoplamento que o C16 descartou. Removido. Um checkpoint que se contradiz é pior que um checkpoint
+curto.
+
+**O que falta em P03:** varredura/manutenção (`enumerateDueScopes`, `listDueRuns`,
+`reserveMaintenanceObservation`/`recordMaintenanceObservation`), `revokeRunCapabilities`,
+`adoptTerminalResult`, `closeRunAfterHandoff`, `markRunBlocked`/`resolveBlockedRun` e recovery. E
+segue sem teste de concorrência real em todo o módulo.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1102 | Medido de novo em P03.3c: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 69 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (29: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1111 | Medido de novo em P03.3d: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 78 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 

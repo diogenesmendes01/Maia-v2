@@ -1140,4 +1140,310 @@ d("engine-repos — admissão de tool call contra Postgres real", () => {
     // NÃO pode ser `version_conflict`: a versão pedida é a versão corrente.
     if (!r.ok) expect(r.reason).toBe("already_started");
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 30-37 (P03.3d): `settleToolCall`.
+  //
+  // §5.7.4 item 8: exige fence do turno ATUAL além do `dispatch_token` — o token
+  // da call sozinho não autoriza adotar resultado tardio.
+  // §5.7.4 item 9: cancelamento depois do handler segue `classifyToolCancellation`
+  // — `abort_safe` pode ficar `cancelled`, as demais viram `effect_unknown`, e
+  // uma call `effect_unknown` continua bloqueadora mesmo com HTTP 200 depois.
+  //
+  // Os casos 36 e 37 são cirúrgicos DE SAÍDA, escritos antes da varredura: o
+  // cenário "liquidar duas vezes" moveria estado e versão juntos, que é como
+  // BM3/BM4 e CM7 sobreviveram.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Call com handler já iniciado — o estado de onde se liquida. */
+  async function callIniciada(
+    effect_class: "abort_safe" | "non_interruptible" = "non_interruptible",
+  ): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+    call_id: string;
+    dispatch_token: string;
+    row_version: number;
+  }> {
+    const base = await callPronta(effect_class);
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id: base.run_id,
+        turn_id: base.turno.turn_id,
+        origin_claim_token: base.turno.claim_token,
+        call_id: base.call_id,
+        expected_row_version: base.row_version,
+        dispatch_token: base.dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    if (!r.ok) throw new Error("setup: markToolHandlerStarted falhou");
+    const row = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_tool_calls WHERE call_id = $1",
+      [base.call_id],
+    );
+    return { ...base, row_version: Number(row.rows[0]?.row_version) };
+  }
+
+  it("30. `completed` grava resultado e receipt, e a evidência vira `committed`", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada("non_interruptible");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: {
+          kind: "completed",
+          result: { ok: true, eco: "oi" },
+          receipt: { json: { recibo: 1 }, hash: "d".repeat(64) },
+        },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{
+      state: string;
+      finished_at: string | null;
+      result_json: unknown;
+      receipt_hash: string | null;
+      effect_evidence: string;
+    }>(
+      "SELECT state, finished_at, result_json, receipt_hash, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("completed");
+    expect(row.rows[0]?.finished_at).not.toBeNull();
+    expect(row.rows[0]?.result_json).toEqual({ ok: true, eco: "oi" });
+    expect(row.rows[0]?.receipt_hash).toBe("d".repeat(64));
+    // Efeito aconteceu e sabemos disso: a evidência sobe de `possible`.
+    expect(row.rows[0]?.effect_evidence).toBe("committed");
+  });
+
+  it("31. `cancelled` é permitido para `abort_safe`", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada("abort_safe");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "cancelled", result: { cancelado: true } },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ state: string; effect_evidence: string }>(
+      "SELECT state, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("cancelled");
+    expect(row.rows[0]?.effect_evidence).toBe("none");
+  });
+
+  it("32. `cancelled` é RECUSADO para classe com efeito — tem de ser `effect_unknown`", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada("non_interruptible");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "cancelled", result: { cancelado: true } },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("cancellation_not_allowed");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("handler_started");
+  });
+
+  it("33. `effect_unknown` força a evidência para `unknown`", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada("non_interruptible");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "effect_unknown", result: { erro: "timeout" } },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ state: string; effect_evidence: string }>(
+      "SELECT state, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("effect_unknown");
+    // A 140 exige essa coerência; aqui ela é imposta pela operação também.
+    expect(row.rows[0]?.effect_evidence).toBe("unknown");
+  });
+
+  it("34. `dispatch_token` divergente não liquida nada", async () => {
+    const { run_id, turno, call_id, row_version } = await callIniciada();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token: randomUUID(),
+        outcome: { kind: "completed", result: { ok: true }, receipt: null },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("dispatch_token_mismatch");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("handler_started");
+  });
+
+  it("35. fence do turno ATUAL: o token da call sozinho não adota resultado tardio", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada();
+
+    // Só o token do turno gira — a tentativa fica igual, isolando o fence de
+    // origem (§5.7.4 item 8: `dispatch_token` correto NÃO basta).
+    const soToken = randomUUID();
+    await pool.query("UPDATE agent_turns SET claim_token = $2 WHERE id = $1", [
+      turno.turn_id,
+      soToken,
+    ]);
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: soToken,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "completed", result: { ok: true }, receipt: null },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("stale_claim");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("handler_started");
+  });
+
+  it("36. estado errado com a versão CERTA: só a guarda de ESTADO recusa", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada();
+
+    await pool.query(
+      "UPDATE engine_tool_calls SET state = 'dispatching', handler_started_at = NULL WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "completed", result: { ok: true }, receipt: null },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("state_conflict");
+  });
+
+  it("37. versão errada com o estado CERTO: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada();
+
+    await pool.query(
+      "UPDATE engine_tool_calls SET row_version = row_version + 1 WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: { kind: "completed", result: { ok: true }, receipt: null },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(row_version + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("38. receipt com hash malformado é recusado, e nada é gravado", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callIniciada();
+
+    // A varredura de mutação mostrou esta validação SOBREVIVENDO: ela existe no
+    // código e nenhum caso a exercitava. Sem ela, o `receipt_chk` da 140
+    // (`receipt_hash ~ '^[0-9a-f]{64}$'` quando há `receipt_json`) ainda barra —
+    // mas transformando uma recusa TIPADA numa transação que estoura. O banco é
+    // a rede de segurança, não a primeira linha.
+    const r = await noEscopo(() =>
+      engineRunsRepo.settleToolCall({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        outcome: {
+          kind: "completed",
+          result: { ok: true },
+          receipt: { json: { recibo: 1 }, hash: "nao-e-um-sha256" },
+        },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("invalid_receipt");
+
+    const row = await pool.query<{
+      state: string;
+      receipt_hash: string | null;
+    }>("SELECT state, receipt_hash FROM engine_tool_calls WHERE call_id = $1", [
+      call_id,
+    ]);
+    expect(row.rows[0]?.state).toBe("handler_started");
+    expect(row.rows[0]?.receipt_hash).toBeNull();
+  });
 });

@@ -630,6 +630,47 @@ export type HandlerStartedResult =
   | { ok: false; reason: "already_started" }
   | { ok: false; reason: "version_conflict"; current_row_version: number };
 
+/**
+ * Desfecho de uma call, na forma que a 140 aceita.
+ *
+ * `cancelled` NÃO é oferecido como escolha livre: o §5.7.4 item 9 manda seguir
+ * `classifyToolCancellation`, e só `abort_safe` pode terminar cancelada. Para as
+ * demais classes a resposta honesta é `effect_unknown` — e a operação recusa a
+ * tentativa em vez de aceitar uma afirmação de ausência de efeito.
+ */
+export type ToolSettlement =
+  | {
+      kind: "completed";
+      result: Json;
+      receipt: { json: Json; hash: string } | null;
+    }
+  | { kind: "denied"; result: Json }
+  | { kind: "cancelled"; result: Json }
+  | { kind: "effect_unknown"; result: Json };
+
+export type SettleToolCallResult =
+  | {
+      ok: true;
+      state: EngineToolCallStateV1;
+      effect_evidence: string;
+      row_version: number;
+    }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "state_conflict"; current_state: string }
+  | { ok: false; reason: "dispatch_token_mismatch" }
+  | { ok: false; reason: "version_conflict"; current_row_version: number }
+  /** §5.7.4 item 9: só `abort_safe` pode terminar `cancelled`. */
+  | {
+      ok: false;
+      reason: "cancellation_not_allowed";
+      effect_class: string | null;
+      required_outcome: "effect_unknown";
+    }
+  /** Receipt é par: ou os dois campos, ou nenhum (140). */
+  | { ok: false; reason: "invalid_receipt" };
+
 export const engineRunsRepo = {
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
@@ -1998,6 +2039,222 @@ export const engineRunsRepo = {
         ok: true,
         effect_evidence: evidencia,
         row_version: Number(marcado.row_version),
+      };
+    });
+  },
+
+  /**
+   * Liquida a call (§5.6.3, §5.7.4 itens 8-9).
+   *
+   * Duas regras que esta operação existe para impor, e que o `dispatch_token`
+   * sozinho NÃO garante:
+   *
+   *  1. **Fence do turno ATUAL** (§5.7.4 item 8). O token da call não autoriza
+   *     adotar resultado tardio: quem perdeu a posse do turno não liquida. Um
+   *     reconciliador autorizado usa operação separada, com o próprio
+   *     claim/row_version — não esta.
+   *  2. **`cancelled` só para `abort_safe`** (item 9). Para as demais classes,
+   *     cancelar depois do handler é afirmar ausência de efeito sobre algo que
+   *     pode ter acontecido; a resposta honesta é `effect_unknown`, e a call
+   *     continua bloqueadora mesmo que um HTTP 200 chegue depois.
+   *
+   * LIMITE CONHECIDO (C16): o completion de idempotência NÃO é ligado
+   * atomicamente ao receipt aqui. `markCompletedWithEffect` abre a própria
+   * `withTx`, e chamá-la daqui pegaria outra conexão — "atômico" seria falso. O
+   * §5.7.4 item 8 contempla esse estado: até a ligação existir, recovery pode
+   * ler o cache com chave/hash exatos, mas não inferir segurança de uma row
+   * expirada. O helper com executor de TX é unidade própria.
+   */
+  async settleToolCall(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    dispatch_token: string;
+    outcome: ToolSettlement;
+  }): Promise<SettleToolCallResult> {
+    const { tenant_id, agent_id } = scope();
+
+    if (input.outcome.kind === "completed") {
+      const r = input.outcome.receipt;
+      if (r !== null && !/^[0-9a-f]{64}$/.test(r.hash)) {
+        conta("settle", "invalid_receipt");
+        return { ok: false, reason: "invalid_receipt" };
+      }
+    }
+
+    return withTx(async (tx): Promise<SettleToolCallResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("settle", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("settle", fence.reason);
+        return fence;
+      }
+      const rows = linhas<RunSnapshotRow & RunFenceRow>(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS} FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("settle", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("settle", recusa.reason);
+        return recusa;
+      }
+
+      const calls = linhas<{ effect_class: string | null; state: string }>(
+        await tx.execute(sql`
+          SELECT effect_class, state FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+           FOR UPDATE`),
+      );
+      const call = calls[0];
+      if (!call) {
+        conta("settle", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      const classe = call.effect_class as ToolEffectClass;
+      const veredito = classifyToolCancellation(classe);
+      if (
+        input.outcome.kind === "cancelled" &&
+        veredito.outcome !== "cancelled"
+      ) {
+        conta("settle", "cancellation_not_allowed");
+        return {
+          ok: false,
+          reason: "cancellation_not_allowed",
+          effect_class: call.effect_class,
+          required_outcome: "effect_unknown",
+        };
+      }
+
+      // A evidência NUNCA regride (a 140 tem trigger para isso): `completed`
+      // numa classe com efeito sobe para `committed`; `effect_unknown` vai para
+      // `unknown`, que o CHECK da tabela exige; `abort_safe` fica onde está.
+      const comEfeito = veredito.outcome === "effect_unknown";
+      const evidencia =
+        input.outcome.kind === "effect_unknown"
+          ? "unknown"
+          : input.outcome.kind === "completed" && comEfeito
+            ? "committed"
+            : comEfeito
+              ? "possible"
+              : "none";
+
+      const receipt =
+        input.outcome.kind === "completed" ? input.outcome.receipt : null;
+
+      const atualizado = linhas<{ row_version: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_tool_calls}
+             SET state = ${input.outcome.kind},
+                 finished_at = clock_timestamp(),
+                 result_json = ${JSON.stringify(input.outcome.result)}::jsonb,
+                 receipt_json = ${receipt === null ? null : JSON.stringify(receipt.json)}::jsonb,
+                 receipt_hash = ${receipt === null ? null : receipt.hash},
+                 effect_evidence = ${evidencia},
+                 row_version = row_version + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+             AND state = 'handler_started'
+             AND dispatch_token = ${input.dispatch_token}::uuid
+             AND row_version = ${input.expected_row_version}
+           RETURNING row_version`),
+      );
+      const liquidada = atualizado[0];
+      if (!liquidada) {
+        const atual = linhas<{
+          state: string;
+          row_version: string | number;
+          dispatch_token: string | null;
+        }>(
+          await tx.execute(sql`
+            SELECT state, row_version, dispatch_token::text AS dispatch_token
+              FROM ${engine_tool_calls}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
+        );
+        const linha = atual[0];
+        if (!linha) {
+          conta("settle", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (linha.state !== "handler_started") {
+          conta("settle", "state_conflict");
+          return {
+            ok: false,
+            reason: "state_conflict",
+            current_state: linha.state,
+          };
+        }
+        if (linha.dispatch_token !== input.dispatch_token) {
+          conta("settle", "dispatch_token_mismatch");
+          return { ok: false, reason: "dispatch_token_mismatch" };
+        }
+        conta("settle", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(linha.row_version),
+        };
+      }
+
+      const seq = linhas<{ last_event_sequence: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           RETURNING last_event_sequence`),
+      );
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(seq[0]?.last_event_sequence ?? 1),
+        dedupe_key: `tool_state:${input.call_id}:${input.outcome.kind}`,
+        event_type: "tool_state",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: Number(fence.turno.attempt_count),
+        metadata: {
+          call_id: input.call_id,
+          state: input.outcome.kind,
+          effect_class: call.effect_class,
+          effect_evidence: evidencia,
+          has_receipt: receipt !== null,
+          // Quem reconcilia precisa da estratégia sem reinferir a classe.
+          reconciliation:
+            veredito.outcome === "effect_unknown"
+              ? veredito.reconciliation
+              : null,
+        },
+      });
+
+      conta("settle", input.outcome.kind);
+      return {
+        ok: true,
+        state: input.outcome.kind as EngineToolCallStateV1,
+        effect_evidence: evidencia,
+        row_version: Number(liquidada.row_version),
       };
     });
   },
